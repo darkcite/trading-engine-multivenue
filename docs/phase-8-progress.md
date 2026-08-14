@@ -3,6 +3,91 @@
 Working notes per the Stage-1 operating agreement: each entry records
 what is done, what is next, and open issues at a clean boundary.
 
+## 2026-08-14 (sixth entry) — first live all-connector test: 3 wire defects found + fixed; ALL SEVEN CONNECTORS DELIVERING
+
+Operator-ordered live paper run on the Mac (first ever boot of the
+engine against real venues; 8d committed as 576758e beforehand).
+Setup: fresh `.env` from the example (hosts only, no secrets),
+`--polymarket-asset-id` = the "Strait of Hormuz normal by Aug 31"
+YES token (live two-sided book), `--okx-symbols
+BTC-USDT,ETH-USDT,BTC-USDT-SWAP`, `--deribit-symbols
+BTC-PERPETUAL,ETH-PERPETUAL`, `--hl-coins BTC,ETH,SOL`,
+`--polygon-path /` against a keyless public Polygon WSS
+(`polygon-bor-rpc.publicnode.com`) as an Alchemy stand-in.
+
+### Wire defects found live, root-caused, fixed, tests updated
+
+1. **Hyperliquid staleness budget vs real cadence.** Plan §4.3's
+   "l2Book full snapshot every block, ≥ 0.5 s" is wrong on the wire:
+   a probe (14-sub connection) showed pushes are **timer-paced ~1 /
+   3.3 s per coin**, uniform across BTC/ETH/SOL regardless of book
+   activity — the 2 s budget tripped every session by construction
+   (`Stale` loop every ~3 s). `HL_STALENESS_BUDGET_NS` 2 s → **10 s**
+   (≈3× observed period); plan §4.3/§6.2 amended with a dated
+   correction. After the fix: 0 gaps, stable sessions.
+2. **Polymarket endpoint was wrong AND the subscribe was missing.**
+   `.env.example`'s `clob.polymarket.com` is REST-only; the real-time
+   host is `ws-subscriptions-clob.polymarket.com` and the cli's
+   hardcoded `/ws/` path 404s — the market channel lives at
+   `/ws/market`. Worse: the Phase-1 run loop **never sent any
+   subscribe frame** — the venue stays silent without
+   `{"assets_ids":[...],"type":"market"}`. D1 had masked all of it
+   (PM had never once been proven against the venue). Fixed:
+   `.env.example` host corrected; cli path → `/ws/market`;
+   `write_market_subscribe` + queue-at-Steady added to
+   ingress-polymarket (Driver::new now takes the asset id;
+   spawn_polymarket threads it through); PM migrated onto
+   `core_net::IoBuf` per the 8a opportunistic-migration note.
+3. **Polymarket Phase-1 parser format was fictional.** Live wire:
+   `book` events arrive **array-wrapped** with **object levels**
+   (`{"price":"..","size":".."}`) sorted **worst→best** (top-of-book
+   = LAST element), and `price_change` events carry per-row
+   `best_bid`/`best_ask` — top-of-book needs no ladder. The old
+   parser (`"bids":[["px","sz"]]`, first element = top) could never
+   match a real frame. Rewritten: `parse_book_update` (last-level
+   walk, per-event slicing at `{"market":"` for multi-asset frames),
+   new `parse_price_change_row` (touch from the row; touch size only
+   when the changed level IS the touch, else 0 — documented),
+   `scan_venue_seq`; sibling-asset events/rows (the venue groups by
+   market, not token) are skipped silently by design. All fixtures
+   (lib, run_loop, loopback, bench) moved to the live shapes.
+
+### Live counter snapshot (fixed binary, ~90 s, all states Up=2)
+
+| connector | msgs | parse_err | gaps | drops | note |
+|---|---|---|---|---|---|
+| polymarket | 68 | **0** | 0 | 0 | book + price_change → Ticks; strategy fired paper orders off live PM ticks |
+| binance | 16 632 | 0 | 0 | 0 | clean |
+| okx | 9 944 | 0 | 0 | 0 | clean (first live run) |
+| deribit | 3 596 | 48 | 29 | 0 | **~1.3% rejects + trade-seq gaps — open item, needs 8e `--raw-tap`** (probe of the same channels showed no anomalous shapes; heartbeat protocol proven live — 0 reconnects) |
+| hyperliquid | 3 459 | 0 | 0 | 0 | clean after budget fix; HIP-4 sub surface untouched |
+| rpc | 62 | 83 | 0 | 0 | substitute public endpoint's JSON differs from Alchemy's — needs the real `ALCHEMY_HOST`+key for a fair test |
+| rss | up | — | — | — | thread up (dead path by design until 8f) |
+
+### New defect discovered (8e work item)
+
+- **PMLR replay capture is not wired into the shipped `run` path at
+  all** — no PMLR writer is constructed anywhere in cli;
+  `~/multivenue/logs` stays empty after a live run. Plan §6.5's
+  "every parsed slot already flows to PMLR replay logs" is false for
+  the running binary (it holds only in tests/tools). Capture is the
+  8h backtest dataset — wire it in 8e alongside the audit tool.
+  (Also note `MULTIVENUE_LOG_DIR=~/...` is not tilde-expanded by
+  core-config — use an absolute path when wiring it.)
+
+### Open / notes
+
+1. Deribit reject/gap rate (~1.3%) is the one unexplained data-loss
+   signal across all venues — first target for 8e `--raw-tap`.
+2. `.env` (hosts only, chmod 600) now exists on the Mac; RPC needs
+   the operator's Alchemy key for the real endpoint.
+3. 24 h soaks still operator-run, now unblocked on all five
+   market-data venues.
+4. Paper orders fired during the test (latency-arb pairing the PM
+   market vs btcusdt by default sym wiring) — mechanically correct,
+   economically meaningless; strategy configuration is a soak-time
+   concern, not an ingress one.
+
 ## 2026-08-14 (fifth entry) — 8d ingress-hyperliquid: CODE COMPLETE (soak + operator go pending)
 
 ### Delivered

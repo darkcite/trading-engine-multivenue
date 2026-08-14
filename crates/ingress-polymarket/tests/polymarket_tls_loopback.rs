@@ -80,12 +80,19 @@ fn build_101_reply(client_key: &[u8; 24]) -> Vec<u8> {
     out
 }
 
-/// Build an *unmasked* WebSocket text frame (server-side framing).
+/// Build an *unmasked* WebSocket text frame (server-side framing;
+/// short or 16-bit extended length — real-wire book events exceed
+/// 125 B).
 fn build_unmasked_text_frame(payload: &[u8]) -> Vec<u8> {
-    assert!(payload.len() <= 125, "short-form only for this test");
-    let mut out = Vec::with_capacity(payload.len() + 2);
+    let mut out = Vec::with_capacity(payload.len() + 4);
     out.push(0x81); // FIN | Text
-    out.push(payload.len() as u8);
+    if payload.len() <= 125 {
+        out.push(payload.len() as u8);
+    } else {
+        assert!(payload.len() <= u16::MAX as usize);
+        out.push(126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
     out.extend_from_slice(payload);
     out
 }
@@ -145,8 +152,10 @@ fn polymarket_tls_loopback_yields_expected_tick() {
         let reply = build_101_reply(&client_key);
         stream.write_all(&reply).expect("write 101");
 
-        // Send one CLOB book frame (unmasked, server → client).
-        let body = br#"{"event_type":"book","asset_id":"0xABC","timestamp":"1713000000000","bids":[["0.518","100"]],"asks":[["0.520","50"]]}"#;
+        // Send one CLOB book frame (unmasked, server → client) in the
+        // live wire shape (2026-08-14): array-wrapped event, object
+        // levels sorted worst→best.
+        let body = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.517","size":"200"},{"price":"0.518","size":"100"}],"asks":[{"price":"0.521","size":"150"},{"price":"0.520","size":"50"}],"event_type":"book"}]"#;
         let frame = build_unmasked_text_frame(body);
         stream.write_all(&frame).expect("write frame");
         stream.flush().expect("flush stream");
@@ -169,7 +178,7 @@ fn polymarket_tls_loopback_yields_expected_tick() {
     let mut transport =
         TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
 
-    let mut driver = Driver::new(0xDEADBEEF);
+    let mut driver = Driver::new(0xDEADBEEF, b"1234567890");
     let symbol_map =
         SymbolMap::from_pairs(std::iter::once((ASSET_ID.to_vec(), ASSET_SYM)));
     let ring: Arc<Ring<Tick, DEFAULT_TICK_RING_CAP>> = Ring::new();

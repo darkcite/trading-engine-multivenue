@@ -35,7 +35,8 @@
 //! snapshot *by construction*. The monitor is pure staleness
 //! ([`HlStaleness`]): per subscribed coin, the `l2Book` venue `time`
 //! must strictly advance within the configured budget (default
-//! **2 s** = 2× block cadence) or the session is flagged and
+//! **10 s** — live-measured push cadence is ~3.3 s per coin, see
+//! [`HL_STALENESS_BUDGET_NS`]) or the session is flagged and
 //! reconnected. A staleness trip counts into `gaps_total` — the §6.4
 //! counter set has no dedicated stale counter; the pairing
 //! (gap increment + `RunResult::Stale` reconnect) is the documented
@@ -819,8 +820,17 @@ pub fn expected_mask(coins: &HlCoinTable) -> MaskBits {
 // Staleness monitor (§6.2 row: Hyperliquid)
 // ---------------------------------------------------------------
 
-/// Default staleness budget: 2 s = 2× block cadence (plan §4.3).
-pub const HL_STALENESS_BUDGET_NS: u64 = 2_000_000_000;
+/// Default staleness budget: **10 s**.
+///
+/// Plan §4.3 assumed "full snapshot every block, ≥ 0.5 s cadence"
+/// and budgeted 2× block cadence (2 s). Live probe 2026-08-14
+/// (14-sub connection, coins BTC/ETH/SOL): `l2Book` pushes are
+/// **timer-paced per subscription at ~1 push / 3.3 s per coin** —
+/// uniform across coins regardless of book activity, so the 2 s
+/// budget tripped every session by construction. 10 s ≈ 3× the
+/// observed period; still fast enough that a dead subscription is
+/// caught well inside the venue's own 60 s idle cutoff.
+pub const HL_STALENESS_BUDGET_NS: u64 = 10_000_000_000;
 
 /// Per-coin staleness monitor over `l2Book` snapshots. Stateless
 /// snapshots have no chain — the only integrity signal is *the

@@ -314,7 +314,9 @@ fn run(args: RunArgs) -> ExitCode {
     let tls_config = TlsTransport::default_client_config();
 
     // -- Resolve endpoints --
-    let pm_ep = match WssEndpoint::resolve(&cfg.polymarket_clob_host, 443, "/ws/") {
+    // Path fixed 2026-08-14 (8d live test): the real-time host serves the
+    // market channel at `/ws/market`; `/ws/` returns HTTP 404.
+    let pm_ep = match WssEndpoint::resolve(&cfg.polymarket_clob_host, 443, "/ws/market") {
         Ok(e) => e,
         Err(e) => {
             error!(error = ?e, "polymarket DNS failed");
@@ -464,6 +466,7 @@ fn run(args: RunArgs) -> ExitCode {
         pm_ep,
         tls_config.clone(),
         pm_map,
+        args.polymarket_asset_id.clone().into_bytes(),
         pm_prod,
         statuses.polymarket.clone(),
         1,

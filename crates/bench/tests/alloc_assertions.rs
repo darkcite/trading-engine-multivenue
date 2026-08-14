@@ -88,7 +88,7 @@ fn price_scanner_is_zero_alloc() {
 /// Parsing a sample Polymarket book frame 1000x must not allocate.
 #[test]
 fn book_parser_is_zero_alloc() {
-    let buf: &[u8] = br#"{"event_type":"book","asset_id":"0xabc","timestamp":"1713000000000","hash":"deadbeef","bids":[["0.518","100.0"]],"asks":[["0.520","50.0"]]}"#;
+    let buf: &[u8] = br#"[{"market":"0x60c2","asset_id":"0xabc","timestamp":"1713000000000","hash":"deadbeef","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
     let g = AllocGuard::new();
     for _ in 0..1_000u32 {
         let t = ingress_polymarket::parse_book_update(buf, 1, 0);
@@ -222,7 +222,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
     // ---- boot (NOT measured) ----
     let mut transport = TestTransport::with_capacity(128 * 1024);
 
-    let mut driver = Driver::new(0xDEAD_BEEFu64);
+    let mut driver = Driver::new(0xDEAD_BEEFu64, b"1234567890");
     note_transport_ready(&mut driver, core_net::Status::Ready);
     // Ingress health telemetry sink (Phase 8a). Its bumps are relaxed
     // atomics and allocate nothing, but construct it outside the
@@ -278,15 +278,17 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
     .unwrap();
     assert_eq!(driver.state(), State::Steady);
 
-    // Preloaded unmasked Text frame containing a Polymarket book update.
-    // Header: FIN | opcode=Text(0x1) → 0x81, len=<123 (fits short).
-    let payload: &[u8] = br#"{"event_type":"book","asset_id":"0xABC","timestamp":"1713000000000","bids":[["0.518","100"]],"asks":[["0.520","50"]]}"#;
-    assert!(payload.len() <= 125);
+    // Preloaded unmasked Text frame containing a Polymarket book
+    // update in the live wire shape (2026-08-14) — 16-bit extended
+    // length, real book events exceed the 125 B short form.
+    let payload: &[u8] = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100"}],"asks":[{"price":"0.520","size":"50"}],"event_type":"book"}]"#;
+    assert!(payload.len() <= u16::MAX as usize);
     let mut frame = [0u8; 256];
     frame[0] = 0x81;
-    frame[1] = payload.len() as u8;
-    frame[2..2 + payload.len()].copy_from_slice(payload);
-    let frame_len = 2 + payload.len();
+    frame[1] = 126;
+    frame[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame[4..4 + payload.len()].copy_from_slice(payload);
+    let frame_len = 4 + payload.len();
 
     // ---- measurement window ----
     let g = AllocGuard::new();

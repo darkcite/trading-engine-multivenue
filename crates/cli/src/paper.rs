@@ -279,6 +279,7 @@ pub fn spawn_polymarket(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     symbol_map: pwl::SymbolMap,
+    asset_id: Vec<u8>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
@@ -297,7 +298,7 @@ pub fn spawn_polymarket(
                 }
             };
 
-            let mut driver = pwl::Driver::new(now_ns());
+            let mut driver = pwl::Driver::new(now_ns(), &asset_id);
             let mut keepalive = Keepalive::new(PM_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {

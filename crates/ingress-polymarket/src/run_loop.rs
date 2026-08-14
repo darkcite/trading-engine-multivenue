@@ -35,16 +35,18 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
-    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_ping,
-    ws_write_pong, HandshakeResult, Keepalive, KeepaliveAction, Status, Transport, WsOpcode,
-    WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
+    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
+    ws_unmask_in_place, ws_write_ping, ws_write_pong, HandshakeResult, IoBuf, Keepalive,
+    KeepaliveAction, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{NsTs, SymbolId, Tick};
 
-use crate::parse_book_update;
+use crate::{
+    classify, parse_book_update, parse_price_change_row, scan_venue_seq, FrameKind,
+};
 
 // ---------------------------------------------------------------
 // Configuration + sizing
@@ -158,96 +160,13 @@ impl SymbolMap {
 }
 
 // ---------------------------------------------------------------
-// Buffers — cursor-draining byte windows, zero-alloc after construction
-// ---------------------------------------------------------------
-
-/// Fixed-size byte window with a **cursor pair** (head, tail).
-/// Allocation at construction; steady state is zero-alloc. Reads
-/// happen at `head`, writes append at `tail`. `consume(n)` only
-/// bumps `head` (O(1)) — the residual `copy_within` is deferred
-/// to [`free_mut`] and only runs when there's no write space
-/// left at the tail. Replaces the prior left-shift-on-every-
-/// consume pattern that was O(N²) under burst load.
-struct IoBuf {
-    data: Box<[u8]>,
-    head: usize,
-    tail: usize,
-}
-
-impl IoBuf {
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            data: vec![0u8; cap].into_boxed_slice(),
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    /// Read view of the filled region.
-    #[inline]
-    fn filled(&self) -> &[u8] {
-        &self.data[self.head..self.tail]
-    }
-
-    /// Length of the filled region. Equivalent to
-    /// `self.filled().len()` but avoids the borrow.
-    #[inline]
-    fn len(&self) -> usize {
-        self.tail - self.head
-    }
-
-    /// Mutable filled region — used by `ws_unmask_in_place`. Offsets
-    /// the caller passes are relative to `filled()`'s start.
-    #[inline]
-    fn filled_mut(&mut self) -> &mut [u8] {
-        &mut self.data[self.head..self.tail]
-    }
-
-    /// Mutable write tail. Lazily compacts when the tail is at the
-    /// buffer end and there's space to reclaim at the head — that's
-    /// the only time the residual `copy_within` runs.
-    #[inline]
-    fn free_mut(&mut self) -> &mut [u8] {
-        if self.tail == self.data.len() && self.head > 0 {
-            // Shift only the residual `tail - head` bytes — not the
-            // full buffer. After this the head is at 0 and the
-            // tail follows.
-            self.data.copy_within(self.head..self.tail, 0);
-            self.tail -= self.head;
-            self.head = 0;
-        }
-        &mut self.data[self.tail..]
-    }
-
-    #[inline]
-    fn advance(&mut self, n: usize) {
-        debug_assert!(self.tail + n <= self.data.len());
-        self.tail += n;
-    }
-
-    /// O(1) — just bumps the read cursor. No memcpy.
-    #[inline]
-    fn consume(&mut self, n: usize) {
-        debug_assert!(self.head + n <= self.tail);
-        self.head += n;
-        // When the cursors collapse, reset both to 0 so the next
-        // `free_mut` doesn't need to compact at all.
-        if self.head == self.tail {
-            self.head = 0;
-            self.tail = 0;
-        }
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-    }
-}
-
-// ---------------------------------------------------------------
 // State
 // ---------------------------------------------------------------
+//
+// Buffers: this crate migrated its private Phase-1 `IoBuf` onto
+// `core_net::IoBuf` (identical cursor-pair API — 8a lifted it from
+// this very pattern) when the 8d live fix touched these files, per
+// the 8a migration note.
 
 /// Run-loop state. Internal; surfaced to callers only through
 /// [`RunResult`].
@@ -296,6 +215,13 @@ pub struct Driver {
     /// Monotonic counter feeding [`ws_mask_from_counter`] for every
     /// outbound frame. Never wraps during a single session.
     mask_counter: u64,
+    /// The CLOB asset id this connection subscribes to (decimal
+    /// uint256 string; single asset until 8e discovery).
+    asset_id: [u8; crate::PM_ASSET_ID_MAX],
+    /// Live bytes of `asset_id`.
+    asset_id_len: u8,
+    /// Set once the post-upgrade market subscribe has been queued.
+    subscribed: bool,
     /// `!Sync` marker — keeps `Driver: Send` but blocks `&Driver`
     /// from crossing threads.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
@@ -303,9 +229,21 @@ pub struct Driver {
 
 impl Driver {
     /// Allocate rx/tx buffers and seed the opening-handshake nonce.
-    pub fn new(nonce_seed: u64) -> Self {
+    /// `asset_id` is the decimal CLOB token id sent in the
+    /// market-channel subscribe (8d live fix — the venue sends
+    /// nothing without it); must be non-empty and at most
+    /// [`crate::PM_ASSET_ID_MAX`] bytes.
+    pub fn new(nonce_seed: u64, asset_id: &[u8]) -> Self {
+        debug_assert!(
+            !asset_id.is_empty() && asset_id.len() <= crate::PM_ASSET_ID_MAX,
+            "polymarket asset id must be 1..={} bytes",
+            crate::PM_ASSET_ID_MAX
+        );
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        let mut id_buf = [0u8; crate::PM_ASSET_ID_MAX];
+        let id_len = asset_id.len().min(crate::PM_ASSET_ID_MAX);
+        id_buf[..id_len].copy_from_slice(&asset_id[..id_len]);
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -314,6 +252,9 @@ impl Driver {
             expected_accept_val: accept,
             last_activity_ns: 0,
             mask_counter: 0,
+            asset_id: id_buf,
+            asset_id_len: id_len as u8,
+            subscribed: false,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -339,6 +280,7 @@ impl Driver {
         self.expected_accept_val = expected_accept(&self.sec_key);
         self.last_activity_ns = 0;
         self.mask_counter = 0;
+        self.subscribed = false;
     }
 }
 
@@ -391,6 +333,9 @@ pub fn drive_one<T: Transport>(
         }
         State::AwaitingWsUpgrade => {
             advance_ws_upgrade(drv, status)?;
+            if drv.state == State::Steady {
+                queue_market_subscribe(drv)?;
+            }
         }
         State::Steady => {
             drain_ws_frames(drv, producer, symbol_map, status)?;
@@ -463,6 +408,23 @@ fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> 
             Err(e) => return Err(e),
         }
     }
+    Ok(())
+}
+
+/// Queue the market-channel subscribe for the configured asset —
+/// the venue sends nothing until it arrives (8d live fix; see
+/// [`crate::write_market_subscribe`]). Runs exactly once per
+/// connection, on the upgrade→Steady edge.
+fn queue_market_subscribe(drv: &mut Driver) -> io::Result<()> {
+    debug_assert!(!drv.subscribed, "market subscribe must be queued exactly once");
+    let mut scratch = [0u8; crate::PM_ASSET_ID_MAX + 48];
+    let n = crate::write_market_subscribe(
+        &mut scratch,
+        &drv.asset_id[..drv.asset_id_len as usize],
+    )
+    .ok_or_else(|| io::Error::other("polymarket: bad asset id for subscribe"))?;
+    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    drv.subscribed = true;
     Ok(())
 }
 
@@ -600,6 +562,31 @@ fn drain_ws_frames(
     }
 }
 
+/// Push one parsed tick; loss-accounts a full ring (D4) — ring-full
+/// is back-pressure, not an error, but it is never silent.
+#[inline]
+fn push_tick(
+    tick: Tick,
+    producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    status: &IngressStatus,
+) {
+    status.add_msgs(1);
+    if producer.try_push(tick).is_err() {
+        status.inc_ring_drops();
+    }
+}
+
+/// Handle one market-channel text frame (live wire shapes verified
+/// 2026-08-14; see [`crate::FrameKind`]).
+///
+/// * `book` frames are **array-wrapped**, one event per asset in the
+///   market — events are walked at `{"market":"` boundaries; events
+///   for sibling assets we never configured are skipped silently
+///   (the venue groups by market, not by subscribed token — they
+///   are not parse failures).
+/// * `price_change` frames carry rows walked at `"asset_id":"`
+///   markers; the event-level `timestamp` seeds every row's
+///   `venue_seq`. Sibling-asset rows are skipped silently.
 fn handle_text_frame(
     drv: &Driver,
     payload_range: core::ops::Range<usize>,
@@ -608,26 +595,67 @@ fn handle_text_frame(
     status: &IngressStatus,
 ) {
     let payload = &drv.rx.filled()[payload_range];
-    let Some(asset_id) = extract_asset_id(payload) else {
-        // Not a book/price frame (subscription ack, unrelated event) —
-        // neither a message nor a parse error.
-        return;
-    };
-    let Some(sym) = symbol_map.lookup(asset_id) else {
-        return;
-    };
-    let ts_ns = now_ns();
-    match parse_book_update(payload, sym, ts_ns) {
-        Some(tick) => {
-            status.add_msgs(1);
-            // Ring-full is not an error from the run-loop's
-            // perspective; it is back-pressure — but it is no longer
-            // silent (D4): every failed push is loss-accounted.
-            if producer.try_push(tick).is_err() {
-                status.inc_ring_drops();
+    match classify(payload) {
+        FrameKind::BookUpdate => {
+            const MARKER: &[u8] = b"{\"market\":\"";
+            let ts_ns = now_ns();
+            let mut at = 0usize;
+            let mut any = false;
+            while let Some(off) = memchr::memmem::find(&payload[at..], MARKER) {
+                let ev_start = at + off;
+                let next = memchr::memmem::find(&payload[ev_start + MARKER.len()..], MARKER)
+                    .map(|o| ev_start + MARKER.len() + o);
+                let ev_end = next.unwrap_or(payload.len());
+                let ev = &payload[ev_start..ev_end];
+                any = true;
+                match extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
+                    Some(sym) => match parse_book_update(ev, sym, ts_ns) {
+                        Some(tick) => push_tick(tick, producer, status),
+                        None => status.inc_parse_errors(),
+                    },
+                    // Sibling asset in the same market — not ours.
+                    None => {}
+                }
+                at = ev_end;
+            }
+            if !any {
+                // A book frame without a single event envelope is
+                // malformed.
+                status.inc_parse_errors();
             }
         }
-        None => status.inc_parse_errors(),
+        FrameKind::PriceChange => {
+            let Some(venue_seq) = scan_venue_seq(payload) else {
+                status.inc_parse_errors();
+                return;
+            };
+            const ROW: &[u8] = b"\"asset_id\":\"";
+            let ts_ns = now_ns();
+            let mut at = 0usize;
+            while let Some(off) = memchr::memmem::find(&payload[at..], ROW) {
+                let row_start = at + off;
+                let next = memchr::memmem::find(&payload[row_start + ROW.len()..], ROW)
+                    .map(|o| row_start + ROW.len() + o);
+                let row_end = next.unwrap_or(payload.len());
+                let row = &payload[row_start..row_end];
+                match extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
+                    Some(sym) => match parse_price_change_row(row, sym, ts_ns, venue_seq) {
+                        Some(tick) => push_tick(tick, producer, status),
+                        None => status.inc_parse_errors(),
+                    },
+                    // Sibling-asset row — not ours.
+                    None => {}
+                }
+                at = row_end;
+            }
+        }
+        // Recognized market data we deliberately don't tick from yet
+        // (capture formalizes in 8e) — counted as received.
+        FrameKind::LastTrade => status.add_msgs(1),
+        FrameKind::Keepalive => {}
+        // Subscription acks / unrelated events — neither a message
+        // nor a parse error (Phase-1 behavior preserved).
+        FrameKind::Unknown => {}
     }
 }
 
@@ -793,7 +821,7 @@ mod tests {
     use core_ring::Ring;
 
     fn build_driver_with_seed(seed: u64) -> Driver {
-        Driver::new(seed)
+        Driver::new(seed, b"1234567890")
     }
 
     /// Build a server-style HTTP/1.1 `101 Switching Protocols` response
@@ -882,6 +910,26 @@ mod tests {
         assert_eq!(status.state(), IngressState::Up);
         assert!(status.last_activity_ns() > 0);
         assert!(status.bytes_total() > 0);
+
+        // 8d live fix: the upgrade→Steady edge queues the market
+        // subscribe — unmask the client frame and check the payload.
+        let n = t.drain_outgoing(&mut scratch);
+        let buf = &scratch[..n];
+        assert!(buf.len() > 6, "subscribe frame must have been flushed");
+        assert_eq!(buf[0], 0x81, "text frame");
+        let len = (buf[1] & 0x7F) as usize;
+        assert!(buf[1] & 0x80 != 0, "client frames must be masked");
+        let mask = [buf[2], buf[3], buf[4], buf[5]];
+        let mut body = Vec::with_capacity(len);
+        let mut i = 0;
+        while i < len {
+            body.push(buf[6 + i] ^ mask[i & 3]);
+            i += 1;
+        }
+        assert_eq!(
+            &body[..],
+            br#"{"assets_ids":["1234567890"],"type":"market"}"# as &[u8]
+        );
     }
 
     #[test]
@@ -919,29 +967,34 @@ mod tests {
         let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
         let status = IngressStatus::new();
 
-        let payload = br#"{"event_type":"book","asset_id":"0xABC","timestamp":"1713000000000","bids":[["0.518","100.0"]],"asks":[["0.520","50.0"]]}"#;
-        let mut frame_buf = [0u8; 512];
-        // Server frames are unmasked; write a mask-free text frame by
-        // hand since ws_write_text_frame masks for the client direction.
-        // We emit an unmasked text frame directly.
-        assert!(payload.len() <= 125, "test payload must fit short header");
-        frame_buf[0] = 0x81; // FIN + Text
-        frame_buf[1] = payload.len() as u8; // mask=0
-        frame_buf[2..2 + payload.len()].copy_from_slice(payload);
-        let frame_len = 2 + payload.len();
-        t.inject_incoming(&frame_buf[..frame_len]);
+        // Live wire shapes (2026-08-14): array-wrapped book with
+        // worst→best object levels, then a price_change object whose
+        // row carries the touch.
+        let book = br#"[{"market":"0x60c2","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+        inject_unmasked_text(&mut t, book);
+        let pc = br#"{"market":"0x60c2","price_changes":[{"asset_id":"0xABC","price":"0.519","size":"33.0","side":"BUY","hash":"h","best_bid":"0.519","best_ask":"0.520"}],"timestamp":"1713000000456","event_type":"price_change"}"#;
+        inject_unmasked_text(&mut t, pc);
 
         drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
 
-        let tick = cons.try_pop().expect("tick must be pushed");
+        let tick = cons.try_pop().expect("book tick must be pushed");
         assert_eq!(tick.sym, 42);
+        // Worst→best ordering: top-of-book is the LAST level.
         assert_eq!(tick.bid_px.raw(), 518_000);
+        assert_eq!(tick.bid_qty.raw(), 100_000_000);
         assert_eq!(tick.ask_px.raw(), 520_000);
-        // Prove we only queued one tick.
+        assert_eq!(tick.ask_qty.raw(), 50_000_000);
+        let tick2 = cons.try_pop().expect("price_change tick must be pushed");
+        assert_eq!(tick2.sym, 42);
+        assert_eq!(tick2.bid_px.raw(), 519_000);
+        assert_eq!(tick2.bid_qty.raw(), 33_000_000, "BUY row at the touch carries the size");
+        assert_eq!(tick2.ask_px.raw(), 520_000);
+        assert_eq!(tick2.ask_qty.raw(), 0, "far-side size unknown on price_change");
+        assert_eq!(tick2.venue_seq, (1_713_000_000_456u64 & 0xFFFF_FFFF) as u32);
         assert!(cons.try_pop().is_none());
-        // §6.4 accounting: one parsed+dispatched message, frame bytes
+        // §6.4 accounting: two parsed+dispatched messages, frame bytes
         // counted, nothing rejected, nothing dropped.
-        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.msgs_total(), 2);
         assert!(status.bytes_total() > 0);
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
@@ -983,14 +1036,23 @@ mod tests {
         assert_eq!(n, 10);
     }
 
-    /// Inject an unmasked (server-side) short-form text frame.
+    /// Inject an unmasked (server-side) text frame (short or 16-bit
+    /// extended length — real-wire book events exceed 125 B).
     fn inject_unmasked_text(t: &mut TestTransport, payload: &[u8]) {
-        assert!(payload.len() <= 125, "short-form only for tests");
-        let mut frame = [0u8; 128];
+        let mut frame = vec![0u8; payload.len() + 4];
         frame[0] = 0x81; // FIN | Text
-        frame[1] = payload.len() as u8; // mask=0
-        frame[2..2 + payload.len()].copy_from_slice(payload);
-        t.inject_incoming(&frame[..2 + payload.len()]);
+        let n = if payload.len() <= 125 {
+            frame[1] = payload.len() as u8; // mask=0
+            frame[2..2 + payload.len()].copy_from_slice(payload);
+            2 + payload.len()
+        } else {
+            assert!(payload.len() <= u16::MAX as usize);
+            frame[1] = 126;
+            frame[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame[4..4 + payload.len()].copy_from_slice(payload);
+            4 + payload.len()
+        };
+        t.inject_incoming(&frame[..n]);
     }
 
     #[test]
@@ -1005,12 +1067,20 @@ mod tests {
         let status = IngressStatus::new();
 
         // Known asset_id but no timestamp / levels → parser rejection.
-        let bad = br#"{"event_type":"book","asset_id":"0xABC","bids":"nope"}"#;
+        let bad = br#"[{"market":"0x1","asset_id":"0xABC","bids":"nope","event_type":"book"}]"#;
         inject_unmasked_text(&mut t, bad);
         drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
+
+        // A sibling asset's event (venue groups by market) is skipped
+        // silently — neither a message nor a parse error.
+        let sibling = br#"[{"market":"0x1","asset_id":"0xSIBLING","timestamp":"1","bids":[{"price":"0.4","size":"1.0"}],"asks":[{"price":"0.6","size":"1.0"}],"event_type":"book"}]"#;
+        inject_unmasked_text(&mut t, sibling);
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        assert_eq!(status.parse_errors_total(), 1);
+        assert_eq!(status.msgs_total(), 0);
 
         // Fill the ring, then deliver a valid frame: the push must
         // fail and be loss-accounted (D4) while the message still
@@ -1026,7 +1096,7 @@ mod tests {
             core_types::Qty::from_raw(1),
         );
         while prod.try_push(filler).is_ok() {}
-        let good = br#"{"event_type":"book","asset_id":"0xABC","timestamp":"1713000000000","bids":[["0.518","100.0"]],"asks":[["0.520","50.0"]]}"#;
+        let good = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, good);
         drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
         assert_eq!(status.msgs_total(), 1);

@@ -273,9 +273,14 @@ WS `wss://api.hyperliquid.xyz/ws`; REST `POST https://api.hyperliquid.xyz/info`.
   `questionSettled`). `fastAssetCtxs` (DEFLATE-compressed) is skipped in v1 —
   decompression in the hot path is avoidable complexity.
 - **Integrity:** stateless snapshots make gap detection moot — the monitor is
-  pure staleness: the `time` field must advance within `2 × block cadence`
-  (config, default 2 s) per subscribed coin, else flag + reconnect. Missed
-  data during reconnect is recovered by the next snapshot by construction.
+  pure staleness: the `time` field must advance within the configured budget
+  per subscribed coin, else flag + reconnect. Missed data during reconnect is
+  recovered by the next snapshot by construction.
+  **Corrected 2026-08-14 (8d live test):** the docs' "snapshot every block,
+  ≥ 0.5 s" does not describe the wire — a live probe (14-sub connection)
+  showed `l2Book` pushes are timer-paced per subscription at ~1 push / 3.3 s
+  per coin, uniform across coins regardless of book activity. Default budget
+  is therefore **10 s** (≈ 3× observed period), not 2 s.
 - **Keepalive:** `{"method":"ping"}` every 50 s (server cuts at 60 s idle).
 - **Limits:** 10 WS connections/IP, 30 new/min, 1000 subscriptions, 2000
   client→server msgs/min; REST 1200 weight/min (`l2Book`/`meta` weight 2/20).
@@ -423,7 +428,7 @@ configured symbol is absent from the venue universe (fail-fast doctrine).
 |---|---|---|---|
 | OKX | `seqId`/`prevSeqId` chain (books, trades) | `prevSeqId != last_seqId`, honoring reset rule (`seqId < prevSeqId` = maintenance) and idle heartbeats (`prev == seq`) | resubscribe channel; `gaps_total++` |
 | Deribit | `change_id`/`prev_change_id` chain; `trade_seq` monotonic | mismatch / seq gap | resubscribe (official guidance); `gaps_total++` |
-| Hyperliquid | snapshot cadence | `time` not advancing within 2× block cadence per coin | ping, then reconnect; `stale_total++` |
+| Hyperliquid | snapshot cadence | `time` not advancing within the staleness budget per coin (default 10 s; live-measured push period ~3.3 s/coin — corrected 2026-08-14) | reconnect; staleness counts into `gaps_total` |
 | Binance | `u` (updateId) monotonic | regression | count only (gaps are legitimate for bookTicker) |
 | Polymarket | `timestamp` monotonic + periodic CLOB REST book cross-check | regression / divergence beyond tolerance | resync from REST; counters |
 | RPC | block number monotonic via existing 2 s poll | regression/stall | existing reconnect |
