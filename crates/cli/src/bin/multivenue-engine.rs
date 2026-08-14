@@ -7,7 +7,8 @@
 //! Subcommands:
 //! * `run --paper` — spawn the ingress threads (Polymarket, Binance,
 //!   OKX when `--okx-symbols` is set, Deribit when
-//!   `--deribit-symbols` is set, Polygon RPC, RSS), boot the
+//!   `--deribit-symbols` is set, Hyperliquid when `--hl-coins` is
+//!   set, Polygon RPC, RSS), boot the
 //!   real `Engine` with the latency-arb strategy + paper dispatcher,
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
@@ -22,9 +23,9 @@ use clap::Parser;
 use cli::{
     engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
     engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance,
-    spawn_deribit, spawn_okx, spawn_polymarket, spawn_rpc, Consumers, EngineConfig,
-    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair,
-    WssEndpoint, SHUTDOWN,
+    spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, Consumers,
+    EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings,
+    StrategyPair, WssEndpoint, SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -101,6 +102,15 @@ struct RunArgs {
     /// the tick lane.
     #[arg(long, default_value_t = false)]
     deribit_depth: bool,
+    /// Comma-separated Hyperliquid coins (e.g. `BTC,ETH,#330`;
+    /// HIP-4 `#<enc>` outcome coins and spot `@<idx>` pairs are
+    /// ordinary items). The i-th entry (0-based) is allocated
+    /// SymbolId `make_symbol_id(Hyperliquid, i+1)` — flag order is
+    /// id order. Empty / absent = the Hyperliquid ingress thread is
+    /// not started. There is no depth flag: `l2Book` is always
+    /// subscribed — it feeds the §6.2 staleness monitor.
+    #[arg(long)]
+    hl_coins: Option<String>,
     /// Polymarket CLOB asset id (token id) for the market above —
     /// the decimal string from the market's `clobTokenIds`. Required:
     /// without it the PM symbol map is empty and every Polymarket
@@ -376,23 +386,51 @@ fn run(args: RunArgs) -> ExitCode {
         _ => None,
     };
 
+    // -- Hyperliquid boot config (Phase 8d; venue is opt-in) --
+    // Fixed public endpoint; a per-venue host lands in core-config
+    // with the Phase-8e boot coverage audit.
+    const HL_WS_HOST: &str = "api.hyperliquid.xyz";
+    const HL_WS_PORT: u16 = 443;
+    const HL_WS_PATH: &str = "/ws";
+    let hl_boot = match args.hl_coins.as_deref().map(str::trim) {
+        Some(spec) if !spec.is_empty() => {
+            let coins = match cli::build_hl_coin_table(spec) {
+                Ok(t) => t,
+                Err(reason) => {
+                    error!(reason, spec, "bad --hl-coins");
+                    return ExitCode::from(1);
+                }
+            };
+            let hl_ep = match WssEndpoint::resolve(HL_WS_HOST, HL_WS_PORT, HL_WS_PATH) {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = ?e, "hyperliquid DNS failed");
+                    return ExitCode::from(1);
+                }
+            };
+            Some((coins, hl_ep))
+        }
+        _ => None,
+    };
+
     // -- Allocate rings + split into producer/consumer halves --
     //
     // Phase 8a lane layout: rings.tick is indexed by VenueId
     // (0=PM, 1=BN, 2=OKX, 3=Deribit, 4=HL). Lane 2 gains its
-    // producer below when `--okx-symbols` is set (Phase 8b) and
-    // lane 3 when `--deribit-symbols` is set (Phase 8c); lane 4
-    // has no ingress until 8d, so its producer is dropped here,
-    // leaving a permanently-empty ring the engine drains for two
-    // atomic loads per iteration (§3.3). Fill-lane producers
-    // arrive with the venue dispatchers in 8j; paper fills flow
-    // through the engine's dispatcher pump (D3).
+    // producer below when `--okx-symbols` is set (Phase 8b),
+    // lane 3 when `--deribit-symbols` is set (Phase 8c) and
+    // lane 4 when `--hl-coins` is set (Phase 8d); an unspawned
+    // venue's producer is deliberately dropped, leaving a
+    // permanently-empty ring the engine drains for two atomic
+    // loads per iteration (§3.3). Fill-lane producers arrive with
+    // the venue dispatchers in 8j; paper fills flow through the
+    // engine's dispatcher pump (D3).
     let rings = Rings::new();
     let (pm_prod, pm_lane_cons) = rings.tick[0].clone().split();
     let (bn_prod, bn_lane_cons) = rings.tick[1].clone().split();
     let (okx_prod, okx_lane_cons) = rings.tick[2].clone().split();
     let (deribit_prod, deribit_lane_cons) = rings.tick[3].clone().split();
-    let (_hl_prod_unspawned, hl_lane_cons) = rings.tick[4].clone().split();
+    let (hl_prod, hl_lane_cons) = rings.tick[4].clone().split();
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let (rss_prod, rss_cons) = rings.rss_signal.clone().split();
     let fill_lane_cons = {
@@ -462,7 +500,7 @@ fn run(args: RunArgs) -> ExitCode {
     } else {
         info!("--okx-symbols empty / unset; OKX ingress thread not started");
         // Drop the producer side so the lane stays a permanently-
-        // empty ring (same shape as the 8d lane above).
+        // empty ring (the unspawned-venue shape, §3.3).
         drop(okx_prod);
     }
 
@@ -486,8 +524,27 @@ fn run(args: RunArgs) -> ExitCode {
     } else {
         info!("--deribit-symbols empty / unset; Deribit ingress thread not started");
         // Drop the producer side so the lane stays a permanently-
-        // empty ring (same shape as the 8d lane above).
+        // empty ring (the unspawned-venue shape, §3.3).
         drop(deribit_prod);
+    }
+
+    // Hyperliquid rides core 7 per the §9 core map.
+    if let Some((hl_coins, hl_ep)) = hl_boot {
+        info!(coins = hl_coins.len(), "hyperliquid: starting ingress thread");
+        let hl_handle = spawn_hyperliquid(
+            hl_ep,
+            tls_config.clone(),
+            hl_coins,
+            hl_prod,
+            statuses.hyperliquid.clone(),
+            7,
+        );
+        handles.push(hl_handle);
+    } else {
+        info!("--hl-coins empty / unset; Hyperliquid ingress thread not started");
+        // Drop the producer side so the lane stays a permanently-
+        // empty ring (the unspawned-venue shape, §3.3).
+        drop(hl_prod);
     }
 
     if let Some(polygon_path) = args.polygon_path {

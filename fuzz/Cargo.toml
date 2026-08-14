@@ -18,6 +18,7 @@ ingress-rpc        = { path = "../crates/ingress-rpc" }
 ingress-rss        = { path = "../crates/ingress-rss" }
 ingress-okx        = { path = "../crates/ingress-okx" }
 ingress-deribit    = { path = "../crates/ingress-deribit" }
+ingress-hyperliquid = { path = "../crates/ingress-hyperliquid" }
 core-net           = { path = "../crates/core-net" }
 core-parse         = { path = "../crates/core-parse" }
 signer-eip712      = { path = "../crates/signer-eip712" }
@@ -124,6 +125,20 @@ bench  = false
 [[bin]]
 name   = "deribit_book"
 path   = "fuzz_targets/deribit_book.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hl_ws_frame"
+path   = "fuzz_targets/hl_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hl_l2book"
+path   = "fuzz_targets/hl_l2book.rs"
 test   = false
 doc    = false
 bench  = false

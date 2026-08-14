@@ -19,8 +19,9 @@
 //! | T4     | ingress-rss (HTTPS polling) |
 //! | T5     | ingress-okx (v5 public WSS; only with `--okx-symbols`) |
 //! | T6     | ingress-deribit (JSON-RPC WSS; only with `--deribit-symbols`) |
+//! | T7     | ingress-hyperliquid (public WSS; only with `--hl-coins`) |
 //!
-//! Cores 0..=6 are pinned (Linux only) per the §9 core map. On
+//! Cores 0..=7 are pinned (Linux only) per the §9 core map. On
 //! non-Linux we log a single warning and let the OS scheduler do as
 //! it pleases.
 
@@ -47,6 +48,7 @@ use strategy_latency_arb::LatencyArb;
 
 use ingress_binance::run_loop as bwl;
 use ingress_deribit::run_loop as dwl;
+use ingress_hyperliquid::run_loop as hwl;
 use ingress_okx::run_loop as owl;
 use ingress_polymarket::run_loop as pwl;
 use ingress_rpc::run_loop as rwl;
@@ -115,6 +117,13 @@ const DERIBIT_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 20_000_000_000,
     idle_timeout_ns: 30_000_000_000,
 };
+/// Hyperliquid cuts connections that stay silent for 60 s (§4.3);
+/// the venue-specific `{"method":"ping"}` text frame goes out at
+/// 50 s and anything quieter than 60 s is a dead session.
+const HL_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 50_000_000_000,
+    idle_timeout_ns: 60_000_000_000,
+};
 /// Polygon RPC: newHeads every ~2 s + our own 2 s poll → anything
 /// quieter than 30 s is a dead session.
 const RPC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
@@ -173,6 +182,7 @@ const _: () = {
     assert!(bwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(owl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(dwl::TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(hwl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
@@ -227,6 +237,9 @@ pub struct IngressStatusSet {
     /// Deribit WSS thread (Phase 8c). Stays Down when
     /// `--deribit-symbols` is empty and the thread is never spawned.
     pub deribit: Arc<IngressStatus>,
+    /// Hyperliquid WSS thread (Phase 8d). Stays Down when
+    /// `--hl-coins` is empty and the thread is never spawned.
+    pub hyperliquid: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
     /// RSS poller thread.
@@ -234,13 +247,14 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all six slots (boot only).
+    /// Allocate all seven slots (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
             binance: Arc::new(IngressStatus::new()),
             okx: Arc::new(IngressStatus::new()),
             deribit: Arc::new(IngressStatus::new()),
+            hyperliquid: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
             rss: Arc::new(IngressStatus::new()),
         }
@@ -663,6 +677,144 @@ pub fn spawn_deribit(
                 if matches!(res, dwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
+                }
+                if status.msgs_total() > msgs_before {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
+            }
+            status.set_state(IngressState::Down);
+        },
+    )
+}
+
+/// Build the boot-time Hyperliquid `coin → SymbolId` table from
+/// the comma-separated `--hl-coins` value. The i-th coin (0-based)
+/// is allocated `make_symbol_id(VenueId::Hyperliquid, i + 1)` —
+/// ordinals follow flag order, 1-based so ordinal 0 never aliases
+/// an unconfigured id (§3.1; venue REST discovery replaces this
+/// manual allocation in the Phase-8e boot coverage audit). HIP-4
+/// `#<enc>` outcome coins and spot `@<idx>` pairs are ordinary
+/// items — no special syntax.
+///
+/// Fails fast on an empty item, a duplicate coin, an over-long
+/// coin, or more than [`ingress_hyperliquid::HL_MAX_COINS`] coins —
+/// boot refuses to start rather than run with a venue map that
+/// doesn't match the operator's intent.
+pub fn build_hl_coin_table(
+    spec: &str,
+) -> Result<ingress_hyperliquid::HlCoinTable, &'static str> {
+    let mut table = ingress_hyperliquid::HlCoinTable::new();
+    let mut ordinal: u32 = 0;
+    for item in spec.split(',') {
+        let coin = item.trim();
+        if coin.is_empty() {
+            return Err("hl: empty coin in --hl-coins");
+        }
+        if table.lookup(coin.as_bytes()).is_some() {
+            return Err("hl: duplicate coin in --hl-coins");
+        }
+        ordinal += 1;
+        match table.insert(coin.as_bytes(), make_symbol_id(VenueId::Hyperliquid, ordinal)) {
+            Ok(()) => {}
+            Err(ingress_hyperliquid::CoinTableErr::Full) => {
+                return Err("hl: --hl-coins exceeds HL_MAX_COINS coins");
+            }
+            Err(ingress_hyperliquid::CoinTableErr::TooLong) => {
+                return Err("hl: coin in --hl-coins exceeds HL_COIN_MAX bytes");
+            }
+            Err(ingress_hyperliquid::CoinTableErr::Empty) => {
+                return Err("hl: empty coin in --hl-coins");
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Spawn the Hyperliquid public-WS ingress thread (Phase 8d). One
+/// thread covers every configured coin — the driver queues one
+/// subscribe frame per `(channel × coin)` pair (no batch form,
+/// §4.3). There is no depth flag: `l2Book` is always subscribed —
+/// it feeds the §6.2 per-coin staleness monitor.
+pub fn spawn_hyperliquid(
+    ep: WssEndpoint,
+    tls_config: RustlsConfig,
+    coins: ingress_hyperliquid::HlCoinTable,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+) -> JoinHandle<()> {
+    spawn_or_die(
+        thread::Builder::new().name("ingress-hyperliquid".into()),
+        "ingress-hyperliquid",
+        move || {
+            log_pin_outcome("hyperliquid", core_id);
+            let server_name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hyperliquid: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+
+            let mut driver = hwl::Driver::new(
+                now_ns(),
+                coins,
+                ingress_hyperliquid::HL_STALENESS_BUDGET_NS,
+                hwl::HL_SUB_ACK_BUDGET_NS,
+            );
+            let mut keepalive = Keepalive::new(HL_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
+                let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "hyperliquid: connect failed");
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
+                        continue;
+                    }
+                };
+                let (mut poll, mut events, token) = match new_poll() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "hyperliquid: mio init failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                driver.reset_for_reconnect(now_ns());
+                let msgs_before = status.msgs_total();
+
+                let res = hwl::run(
+                    &mut transport,
+                    &mut driver,
+                    ep.host.as_bytes(),
+                    ep.path.as_bytes(),
+                    &mut producer,
+                    &mut poll,
+                    &mut events,
+                    token,
+                    &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
+                );
+                tracing::info!(?res, "hyperliquid: run-loop returned");
+                if matches!(res, hwl::RunResult::Stopped) {
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+                // A staleness trip reconnects exactly like
+                // IdleTimeout (backoff below) — the next snapshot
+                // recovers all state by construction. `gaps_total`
+                // was already incremented inside the run loop; no
+                // double count here.
+                if matches!(res, hwl::RunResult::Stale) {
+                    tracing::warn!("hl: staleness trip — reconnecting for fresh snapshots");
                 }
                 if status.msgs_total() > msgs_before {
                     backoff.reset();
@@ -1264,6 +1416,9 @@ impl Observability {
             let ingress_deribit_state = reg
                 .register_gauge("engine_ingress_deribit_state")
                 .map_err(|_| "register engine_ingress_deribit_state")?;
+            let ingress_hyperliquid_state = reg
+                .register_gauge("engine_ingress_hyperliquid_state")
+                .map_err(|_| "register engine_ingress_hyperliquid_state")?;
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
@@ -1304,6 +1459,7 @@ impl Observability {
             let ingress_binance = register_ingress_counters(&mut reg, "binance")?;
             let ingress_okx = register_ingress_counters(&mut reg, "okx")?;
             let ingress_deribit = register_ingress_counters(&mut reg, "deribit")?;
+            let ingress_hyperliquid = register_ingress_counters(&mut reg, "hyperliquid")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
 
             out.metrics = Some(Arc::new(reg));
@@ -1327,6 +1483,7 @@ impl Observability {
                 ingress_binance_state,
                 ingress_okx_state,
                 ingress_deribit_state,
+                ingress_hyperliquid_state,
                 ingress_rpc_state,
                 ingress_rss_state,
                 max_tick_age_ns,
@@ -1335,6 +1492,7 @@ impl Observability {
                 ingress_binance,
                 ingress_okx,
                 ingress_deribit,
+                ingress_hyperliquid,
                 ingress_rpc,
             });
         }
@@ -1475,6 +1633,8 @@ pub struct EngineCounters {
     pub ingress_okx_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Deribit JSON-RPC WS.
     pub ingress_deribit_state: core_metrics::GaugeId,
+    /// Per-ingress state gauge: Hyperliquid public WS.
+    pub ingress_hyperliquid_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: RSS poller.
@@ -1495,6 +1655,8 @@ pub struct EngineCounters {
     pub ingress_okx: IngressCounterIds,
     /// §6.4 loss-accounting counters, Deribit thread.
     pub ingress_deribit: IngressCounterIds,
+    /// §6.4 loss-accounting counters, Hyperliquid thread.
+    pub ingress_hyperliquid: IngressCounterIds,
     /// §6.4 loss-accounting counters, RPC thread.
     pub ingress_rpc: IngressCounterIds,
 }
@@ -1635,9 +1797,10 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc, deribit) so registry counters get
-    // monotonic deltas.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 5];
+    // (pm, bn, okx, rpc, deribit, hyperliquid) so registry counters
+    // get monotonic deltas. Append-only: existing indices are
+    // load-bearing, new venues go at the end.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 6];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -1712,6 +1875,8 @@ where
                     reg.gauge(ids.ingress_okx_state).set(ing.okx.state() as i64);
                     reg.gauge(ids.ingress_deribit_state)
                         .set(ing.deribit.state() as i64);
+                    reg.gauge(ids.ingress_hyperliquid_state)
+                        .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
                     reg.gauge(ids.ingress_rss_state).set(ing.rss.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
@@ -1736,6 +1901,12 @@ where
                         &ids.ingress_deribit,
                         &ing.deribit,
                         &mut ingress_last[4],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_hyperliquid,
+                        &ing.hyperliquid,
+                        &mut ingress_last[5],
                     );
                 }
 
@@ -2171,6 +2342,68 @@ mod tests {
         assert_eq!(
             build_deribit_symbol_table("BTC.PERPETUAL").err(),
             Some("deribit: instrument in --deribit-symbols must not contain '.'")
+        );
+    }
+
+    /// Happy path: `--hl-coins` items get 1-based, flag-ordered
+    /// ordinals under the Hyperliquid venue byte, with whitespace
+    /// trimmed. A HIP-4 `#<enc>` outcome coin is an ordinary item.
+    #[test]
+    fn hl_coin_table_allocates_flag_ordered_ids() {
+        let t = build_hl_coin_table("BTC, ETH,#330").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(
+            t.lookup(b"BTC"),
+            Some(make_symbol_id(VenueId::Hyperliquid, 1))
+        );
+        assert_eq!(
+            t.lookup(b"ETH"),
+            Some(make_symbol_id(VenueId::Hyperliquid, 2))
+        );
+        assert_eq!(
+            t.lookup(b"#330"),
+            Some(make_symbol_id(VenueId::Hyperliquid, 3))
+        );
+        assert_eq!(t.lookup(b"SOL"), None);
+    }
+
+    /// Failure modes: empty item, duplicate coin, an over-long
+    /// coin, and more than `HL_MAX_COINS` coins all refuse boot.
+    #[test]
+    fn hl_coin_table_rejects_bad_specs() {
+        // Trailing comma ⇒ empty item.
+        assert_eq!(
+            build_hl_coin_table("BTC,").err(),
+            Some("hl: empty coin in --hl-coins")
+        );
+        // Duplicate coin (whitespace doesn't disguise it).
+        assert_eq!(
+            build_hl_coin_table("BTC,ETH, BTC").err(),
+            Some("hl: duplicate coin in --hl-coins")
+        );
+        // A coin longer than HL_COIN_MAX bytes ⇒ TooLong.
+        let long = "C".repeat(ingress_hyperliquid::HL_COIN_MAX + 1);
+        assert_eq!(
+            build_hl_coin_table(&long).err(),
+            Some("hl: coin in --hl-coins exceeds HL_COIN_MAX bytes")
+        );
+        // HL_MAX_COINS + 1 distinct coins ⇒ Full.
+        let mut spec = String::new();
+        for i in 0..=ingress_hyperliquid::HL_MAX_COINS {
+            if i > 0 {
+                spec.push(',');
+            }
+            spec.push_str(&format!("C{i}"));
+        }
+        assert_eq!(
+            build_hl_coin_table(&spec).err(),
+            Some("hl: --hl-coins exceeds HL_MAX_COINS coins")
+        );
+        // Exactly HL_MAX_COINS is still fine.
+        let max_spec = spec.rsplit_once(',').unwrap().0;
+        assert_eq!(
+            build_hl_coin_table(max_spec).unwrap().len(),
+            ingress_hyperliquid::HL_MAX_COINS
         );
     }
 }

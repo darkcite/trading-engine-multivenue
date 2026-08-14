@@ -1724,3 +1724,234 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "deribit run-loop bytes should be zero: saw {bytes}");
 }
+
+// ---------------------------------------------------------------
+// Phase 8d: Hyperliquid ingress hot-path assertions
+// ---------------------------------------------------------------
+
+/// Run classify + every Hyperliquid channel parser (+ coin
+/// extraction and the subscriptionResponse echo parser) over fixed
+/// realistic samples (mirrors the ingress-hyperliquid unit-test
+/// corpus, HIP-4 `#<enc>` coin included) for 10_000 iterations each
+/// — must be zero-alloc.
+#[test]
+fn hl_parsers_are_zero_alloc() {
+    let bbo: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#;
+    let l2book: &[u8] = br#"{"channel":"l2Book","data":{"coin":"BTC","time":1677700000000,"levels":[[{"px":"19900.0","sz":"1.0","n":1},{"px":"19899.0","sz":"2.5","n":2}],[{"px":"20100.0","sz":"1.0","n":1}]]}}"#;
+    let trade: &[u8] = br#"{"coin":"BTC","side":"B","px":"19900.5","sz":"0.5","hash":"0xabc","time":1677700000000,"tid":118906512037719}"#;
+    let ctx: &[u8] = br#"{"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{"funding":"0.0000125","markPx":"14.3161","openInterest":"688.11","oraclePx":"14.32"}}}"#;
+    let mids: &[u8] = br#"{"channel":"allMids","data":{"mids":{"BTC":"29792.0","ETH":"1891.4"}}}"#;
+    let outcome: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"kind":"outcomeCreated","coin":"#330","time":1723600000000}]}"##;
+    let subresp: &[u8] = br##"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"#330"}}}"##;
+    // Venue-namespaced symbol (venue byte 4 = Hyperliquid, ordinal 1).
+    let sym: SymbolId = (4 << 24) | 1;
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..10_000u32 {
+        std::hint::black_box(ingress_hyperliquid::classify(bbo));
+        std::hint::black_box(ingress_hyperliquid::classify(l2book));
+        std::hint::black_box(ingress_hyperliquid::classify(ctx));
+        std::hint::black_box(ingress_hyperliquid::classify(mids));
+        std::hint::black_box(ingress_hyperliquid::classify(outcome));
+        std::hint::black_box(ingress_hyperliquid::classify(subresp));
+        std::hint::black_box(ingress_hyperliquid::extract_coin(bbo));
+        let b = ingress_hyperliquid::parse_bbo(bbo, sym).unwrap();
+        acc = acc.wrapping_add(b.bid_px_1e6);
+        let l = ingress_hyperliquid::parse_l2book_header(l2book, sym).unwrap();
+        acc = acc.wrapping_add(l.best_bid_px_1e6 + l.n_bids as i64);
+        let t = ingress_hyperliquid::parse_trade(trade, sym).unwrap();
+        acc = acc.wrapping_add(t.px_1e6);
+        let c = ingress_hyperliquid::parse_active_asset_ctx(ctx, sym).unwrap();
+        acc = acc.wrapping_add(c.funding_1e9);
+        let m = ingress_hyperliquid::parse_all_mids(mids).unwrap();
+        acc = acc.wrapping_add(m as i64);
+        let o = ingress_hyperliquid::parse_outcome_meta(outcome).unwrap();
+        acc = acc.wrapping_add(o.enc as i64);
+        std::hint::black_box(ingress_hyperliquid::parse_sub_response(subresp));
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "hl parsers allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl parser bytes should be zero: saw {bytes}");
+}
+
+/// Drive the Hyperliquid ingress run-loop through 1 000+
+/// pre-injected steady-state frames (all 9 subscriptionResponse
+/// acks — verification + staleness arming happen **inside** the
+/// window via `session_health` — then cycles of bbo / l2Book /
+/// trades across a perp and a HIP-4 `#<enc>` coin, plus WS protocol
+/// Pings whose pong replies render inside the window) via a
+/// `TestTransport`. Steady state is reached over the real handshake
+/// + per-sub subscribe path; every `drive_one` call must allocate
+/// zero bytes.
+#[test]
+fn hl_run_loop_steady_state_is_zero_alloc() {
+    use ingress_hyperliquid::run_loop as hwl;
+
+    // ---- boot (NOT measured) ----
+    // Capacity must hold the whole scripted stream at once (~170 KiB
+    // for 1 000+ frames): the transport's buffers are fixed-size and
+    // nothing drains them until the measurement loop runs.
+    let mut transport = TestTransport::with_capacity(512 * 1024);
+
+    // Venue-namespaced symbols (venue byte 4 = Hyperliquid).
+    let sym_btc: SymbolId = (4 << 24) | 1;
+    let sym_hip4: SymbolId = (4 << 24) | 2;
+    let mut coins = ingress_hyperliquid::HlCoinTable::new();
+    coins.insert(b"BTC", sym_btc).unwrap();
+    coins.insert(b"#330", sym_hip4).unwrap();
+    // Generous budgets: neither the ack deadline nor staleness may
+    // trip inside the measurement window.
+    let mut driver = hwl::Driver::new(0x0D0Du64, coins, u64::MAX / 4, u64::MAX / 4);
+    hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    // Health telemetry sink — relaxed atomics only; built outside
+    // the measurement window.
+    let status = core_metrics::IngressStatus::new();
+
+    let ring: std::sync::Arc<Ring<Tick, { hwl::TICK_RING_CAP }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+
+    // Send the client GET handshake.
+    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    let mut scratch = [0u8; 16384];
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    // Inject the 101 reply matching the seed.
+    let key = core_net::sec_websocket_key_from_seed(0x0D0Du64);
+    let accept = core_net::expected_accept(&key);
+    let mut resp = [0u8; 256];
+    let mut n = 0;
+    for src in [
+        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
+        &b"Upgrade: websocket\r\n"[..],
+        &b"Connection: Upgrade\r\n"[..],
+        &b"Sec-WebSocket-Accept: "[..],
+        &accept[..],
+        &b"\r\n\r\n"[..],
+    ] {
+        resp[n..n + src.len()].copy_from_slice(src);
+        n += src.len();
+    }
+    transport.inject_incoming(&resp[..n]);
+    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    assert_eq!(driver.state(), hwl::State::Steady);
+    // Drain the 9 per-subscription subscribe frames so the tx buffer
+    // stays empty.
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    // Pre-build + pre-inject the full scripted stream: all 9 acks
+    // (BTC: bbo/l2Book/trades/activeAssetCtx; #330: bbo/l2Book/
+    // trades; global: allMids/outcomeMetaUpdates), then cycles of
+    // [bbo BTC, l2Book BTC, trades BTC ×2 rows, bbo #330,
+    // l2Book #330], then a few WS protocol Pings. Stateless venue —
+    // no chains to maintain; staleness budgets are generous (boot).
+    // `inject_incoming` may compact/copy; all of it happens here,
+    // before the guard.
+    const CYCLES: usize = 199; // 9 acks + 5 × 199 = 1 004 frames
+    const BBO_BTC: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#;
+    const L2_BTC: &[u8] = br#"{"channel":"l2Book","data":{"coin":"BTC","time":1677700000000,"levels":[[{"px":"19900.0","sz":"1.0","n":1},{"px":"19899.0","sz":"2.5","n":2}],[{"px":"20100.0","sz":"1.0","n":1}]]}}"#;
+    const TRADES_BTC: &[u8] = br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1.0","sz":"1.0","hash":"0x1","time":1000,"tid":1},{"coin":"BTC","side":"A","px":"1.1","sz":"2.0","hash":"0x2","time":1001,"tid":2}]}"#;
+    const BBO_HIP4: &[u8] = br##"{"channel":"bbo","data":{"coin":"#330","time":1723600000001,"bbo":[{"px":"0.4","sz":"100.0","n":1},{"px":"0.6","sz":"50.0","n":1}]}}"##;
+    const L2_HIP4: &[u8] = br##"{"channel":"l2Book","data":{"coin":"#330","time":1723600000002,"levels":[[{"px":"0.4","sz":"100.0","n":1}],[{"px":"0.6","sz":"50.0","n":1}]]}}"##;
+    const ACKS: [&[u8]; 9] = [
+        br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#,
+        br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}}"#,
+        br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}}"#,
+        br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}}"#,
+        br##"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"#330"}}}"##,
+        br##"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"#330"}}}"##,
+        br##"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"trades","coin":"#330"}}}"##,
+        br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"allMids"}}}"#,
+        br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"outcomeMetaUpdates"}}}"#,
+    ];
+
+    /// Unmasked (server→client) WS text frame appended to `stream`.
+    fn push_text_frame(stream: &mut Vec<u8>, body: &[u8]) {
+        stream.push(0x81);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            assert!(body.len() <= u16::MAX as usize);
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+
+    let mut stream: Vec<u8> = Vec::with_capacity(256 * 1024);
+    for ack in ACKS {
+        push_text_frame(&mut stream, ack);
+    }
+    for _ in 0..CYCLES {
+        push_text_frame(&mut stream, BBO_BTC);
+        push_text_frame(&mut stream, L2_BTC);
+        push_text_frame(&mut stream, TRADES_BTC);
+        push_text_frame(&mut stream, BBO_HIP4);
+        push_text_frame(&mut stream, L2_HIP4);
+    }
+    // Three server-side WS protocol Pings — the pong replies render
+    // into the tx buffer inside the measurement window.
+    const N_PINGS: usize = 3;
+    for _ in 0..N_PINGS {
+        stream.extend_from_slice(&[0x89, 0x02, b'h', b'l']);
+    }
+    let injected = transport.inject_incoming(&stream);
+    assert_eq!(
+        injected,
+        stream.len(),
+        "transport capacity must hold the full scripted stream"
+    );
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    let mut drives = 0u32;
+    while transport.incoming_len() > 0 {
+        hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        drives += 1;
+        assert!(drives <= 4_096, "scripted stream failed to drain");
+    }
+    // Ack verification + staleness arming — the run()-loop health
+    // check — happens inside the window too.
+    assert_eq!(
+        ingress_hyperliquid::run_loop::session_health(&mut driver, &status, core_time::now_ns()),
+        None
+    );
+    // Drain our pong replies out of the transport (stack scratch).
+    let mut out_scratch = [0u8; 4096];
+    let _ = transport.drain_outgoing(&mut out_scratch);
+    // Drain the bbo ticks — two per cycle. try_pop is zero-alloc
+    // (asserted by the ring test above), so popping inside the guard
+    // keeps the window honest.
+    let mut acc: i64 = 0;
+    let mut popped: usize = 0;
+    while let Some(t) = cons.try_pop() {
+        acc = acc.wrapping_add(t.bid_px.raw());
+        popped += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    // Steady state consumed the whole script: one tick per bbo frame
+    // (both coins — HIP-4 flows the same path), every ack verified,
+    // every frame counted, no losses, no staleness trips.
+    assert_eq!(popped, 2 * CYCLES);
+    assert!(driver.is_verified());
+    // 9 acks + per cycle: bbo(1) + l2Book(1) + trades rows(2) +
+    // bbo(1) + l2Book(1) = 6. WS Pings are activity, not messages.
+    assert_eq!(status.msgs_total(), (9 + 6 * CYCLES) as u64);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.gaps_total(), 0);
+    assert_eq!(status.resubscribes_total(), 0);
+    assert_eq!(status.ring_drops_total(), 0);
+    assert_eq!(
+        allocs, 0,
+        "hl run-loop allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl run-loop bytes should be zero: saw {bytes}");
+}

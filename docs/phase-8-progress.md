@@ -3,6 +3,121 @@
 Working notes per the Stage-1 operating agreement: each entry records
 what is done, what is next, and open issues at a clean boundary.
 
+## 2026-08-14 (fifth entry) — 8d ingress-hyperliquid: CODE COMPLETE (soak + operator go pending)
+
+### Delivered
+
+- **`crates/ingress-hyperliquid`** (new): channels per plan §4.3/§4.4
+  — `bbo` → Tick (`VenueId::Hyperliquid` = 4), `l2Book` header
+  (full-snapshot venue, ≤ 20 levels/side — level counts + touch
+  lifted, every level strictly validated), `trades` multi-row walk
+  (side `B`/`A`, **unquoted** `time`/`tid` — HL sends bare numbers,
+  unlike OKX), `activeAssetCtx` (funding ×1e9 / mark / oracle / OI),
+  `allMids` (entry count), `outcomeMetaUpdates` (HIP-4 lifecycle
+  kinds + optional `#<enc>` + time; deliberately shape-tolerant —
+  schema may grow as permissionless deploys leave testnet) — all
+  `#[repr(C, align(64))]` 64-B PODs. `fastAssetCtxs` skipped v1
+  (DEFLATE in hot path, §4.3).
+- **HIP-4**: outcome coins `#<enc>` flow the ordinary coin path
+  (`HlCoinTable` row like any other — no special surface);
+  `activeAssetCtx` gating skips `#`/`@` coins (`dex:COIN` HIP-3
+  perps not skipped); loopback + bench prove the `#330` → Tick
+  roundtrip end-to-end.
+- **Integrity (§6.2 row)**: stateless snapshots ⇒ no chain —
+  `HlStaleness` per-coin monitor: `l2Book` venue time must
+  **strictly advance** within budget (default 2 s = 2× block
+  cadence) on the local clock; armed only after full ack
+  verification; trip ⇒ `gaps_total`++ (documented: the §6.4 counter
+  set has no dedicated stale counter — gap + `RunResult::Stale` is
+  the staleness signature) ⇒ cli reconnects; missed data recovered
+  by the next snapshot by construction.
+- **Subscribe acks**: one frame per subscription (venue has no batch
+  form; 16 coins ⇒ ≤ 66 frames, far inside 2000 client msgs/min);
+  per-sub `subscriptionResponse` echoes verified through an
+  expected/found **u128 bitmask** (4 per-coin channels × 16 coins +
+  2 global = 66 bits); ack deadline `HL_SUB_ACK_BUDGET_NS` (5 s) ⇒
+  session `Error` **without** debug_assert (ack latency is a venue
+  timing condition, not a code invariant); `{"channel":"error"}` ⇒
+  fail-fast (debug_assert + session error, okx pattern).
+  `session_health` (pub) carries both checks — called from `run`,
+  unit-tested directly.
+- **Keepalive** `{"method":"ping"}` / `{"channel":"pong"}`;
+  oversize-frame guard (rx 256 KiB, okx-sized — snapshots ≈ 2 KiB);
+  tx 16 KiB (all subscribe frames queue in one drive cycle).
+- **Decisions in the crate header**: `Tick.venue_seq` = `time` ms
+  as u32 (same policy as Deribit; wraps ~49.7 d; full-width times
+  live in the monitors); units: px USD ×1e6 (outcome coins:
+  collateral units in [0,1]), **sz base-coin units ×1e6** (unlike
+  Deribit's USD notionals), funding ×1e9; `POST /info` discovery
+  (`meta`/`spotMeta`/`perpDexs`/`outcomeMeta`) deferred to 8e —
+  coins from `--hl-coins` until then.
+- **Tests**: 51 lib/run-loop (happy + failure per public fn incl.
+  `session_health` deadline miss, oversize guard, HIP-4 tick) with
+  4 proptests (bbo roundtrip, l2Book level counts,
+  staleness-never-fires-in-budget model, no-parser-panics); TLS
+  loopback (`tests/hl_tls_loopback.rs`, rcgen): happy path with
+  byte-asserted 9-frame subscribe sequence + HIP-4 roundtrip +
+  verification proof (deterministic ping-sync before close),
+  staleness → `Stale` + gap proof, `{"method":"ping"}` emission +
+  idle timeout, missed-acks → `Error`. Fuzz: `hl_ws_frame` (9
+  parsers, no-panic), `hl_l2book` (render/parse differential +
+  `HlStaleness` shadow-model differential) registered in
+  `fuzz/Cargo.toml`, `cargo check` clean. Bench:
+  `hl_parsers_are_zero_alloc` +
+  `hl_run_loop_steady_state_is_zero_alloc` (1 004-frame steady
+  drain over the real handshake + 9-ack verification path,
+  `session_health` and WS-Ping pong renders inside the measured
+  window, 0 B/op).
+- **cli wiring**: `--hl-coins` (flag order = ordinal;
+  `make_symbol_id(Hyperliquid, i+1)`; **no depth flag** — `l2Book`
+  is always subscribed, it feeds the staleness monitor);
+  `HL_KEEPALIVE` 50 s probe / 60 s idle (venue cuts at 60 s);
+  `spawn_hyperliquid` on core 7 (§9 map); lane-4 producer connected
+  — the last dropped tick lane goes live; `RunResult::Stale` arm
+  reconnects like `IdleTimeout`, logged distinctly, no gap
+  double-count; `engine_ingress_hyperliquid_*` §6.4 counters +
+  state gauge (`ingress_last` grown 5→6, hyperliquid appended —
+  nothing renumbered); `TICK_RING_CAP == TICK_RING_SIZE`
+  const-assert; endpoint consts `api.hyperliquid.xyz:443 /ws`
+  inline (core-config entry rides with 8e); 2 new cli tests
+  (coin-table flag parsing incl. `#330`, bad-spec rejection).
+
+### Verification (both platforms)
+
+- Sandbox (rustc 1.88; reused the orphaned `/tmp/rustup` toolchain
+  read-only — no reinstall): workspace excl. bench **664/0**
+  (607 baseline + 57: 51 lib + 4 loopback + 2 cli); release alloc
+  gate **30/30, 0 B/op** (28 + 2; `CARGO_PROFILE_RELEASE_DEBUG=0`
+  for disk — semantics identical, Mac gate ran the true profile);
+  fuzz `cargo check` clean (own target dir).
+- Mac (nextest via RustRover MCP): **693/693** (634 baseline + 59;
+  the +2 beyond the sandbox delta = the two new HL alloc assertions
+  also running in debug under nextest, which includes the bench
+  crate the sandbox run excludes); release alloc gate **30/30** on
+  the true deploy profile. No spurious debug-parallel alloc
+  failures this run.
+
+### Deferred / notes
+
+1. **HL `POST /info` discovery** (`meta`, `spotMeta`, `perpDexs`,
+   `outcomeMeta`; asset-id scheme capture) deferred to the 8e boot
+   coverage audit, its consumer — same disposition as OKX/Deribit.
+2. TUI `ingest_health` hyperliquid bit — folded into the 8e TUI
+   touch with okx's/deribit's; health fully visible via `/metrics`.
+3. 24 h soak (§12 8d exit: BTC daily outcome streamed via `#<enc>`,
+   `outcomeMetaUpdates` handled) is operator-run; not started. The
+   soak's outcome coin comes from the protocol-run BTC daily
+   (plan §13) — enc via `outcomeMeta` discovery (8e) or supplied
+   directly in `--hl-coins` as `#<enc>`.
+4. Sandbox hygiene for next session: this boot's dirs (`/tmp/ch3`,
+   `/tmp/tt3`, `/tmp/ttf-8d`, `/tmp/l8d`) join the orphan list —
+   pick fresh names. The orphaned `/tmp/rustup` 1.88.0 toolchain is
+   world-executable: **reuse it** (PATH straight to its toolchain
+   `bin/`, skip rustup-init; saves ~700 MB and minutes). Disk floor
+   this session: 395 MB free — survived by deleting the release
+   tree mid-sequence and rebuilding it last after dropping debug.
+5. Everything uncommitted (8d in full); no git ops performed.
+
 ## 2026-08-14 (fourth entry) — 8c ingress-deribit: CODE COMPLETE (soak + operator go pending)
 
 ### Delivered

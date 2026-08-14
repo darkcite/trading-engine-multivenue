@@ -157,6 +157,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+]
+
+[[package]]
 name = "ingress-okx"
 version = "0.1.0"
 dependencies = [
@@ -275,6 +289,7 @@ dependencies = [
  "core-parse",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hyperliquid",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
