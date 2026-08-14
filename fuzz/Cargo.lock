@@ -51,9 +51,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-crypto"
+version = "0.1.0"
+
+[[package]]
+name = "core-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "core-net"
 version = "0.1.0"
 dependencies = [
+ "core-crypto",
  "memchr",
  "mio",
  "rustls",
@@ -123,6 +132,21 @@ dependencies = [
 name = "ingress-binance"
 version = "0.1.0"
 dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+]
+
+[[package]]
+name = "ingress-okx"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
  "core-net",
  "core-parse",
  "core-ring",
@@ -136,6 +160,7 @@ dependencies = [
 name = "ingress-polymarket"
 version = "0.1.0"
 dependencies = [
+ "core-metrics",
  "core-net",
  "core-parse",
  "core-ring",
@@ -149,6 +174,7 @@ dependencies = [
 name = "ingress-rpc"
 version = "0.1.0"
 dependencies = [
+ "core-metrics",
  "core-net",
  "core-parse",
  "core-ring",
@@ -234,6 +260,7 @@ dependencies = [
  "core-net",
  "core-parse",
  "ingress-binance",
+ "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
  "ingress-rss",

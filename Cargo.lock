@@ -139,6 +139,7 @@ dependencies = [
  "dhat",
  "engine",
  "ingress-binance",
+ "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
  "ingress-rss",
@@ -309,6 +310,7 @@ dependencies = [
  "core-types",
  "engine",
  "ingress-binance",
+ "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
  "ingress-rss",
@@ -778,6 +780,23 @@ dependencies = [
 
 [[package]]
 name = "ingress-binance"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-okx"
 version = "0.1.0"
 dependencies = [
  "core-metrics",
@@ -1846,7 +1865,6 @@ dependencies = [
  "core-types",
  "crossterm",
  "ratatui",
- "tracing",
 ]
 
 [[package]]

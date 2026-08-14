@@ -117,11 +117,55 @@ pub fn scan_price_1e6(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
     Some((signed, end))
 }
 
+/// Parse a decimal number like `"0.0000593"` and return it scaled by
+/// `1e9` as `i64`. Same contract as [`scan_price_1e6`]. Added in
+/// Phase 8b for venue *rate* fields (OKX `fundingRate` pushes values
+/// like `0.0000593` whose resolution exceeds 1e-6 — at 1e6 scale
+/// they'd truncate to ~1 count of precision).
+#[inline]
+pub fn scan_price_1e9(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
+    const SCALE: u64 = 1_000_000_000;
+
+    if pos >= buf.len() {
+        return None;
+    }
+    let (negative, start) = if buf[pos] == b'-' {
+        (true, pos + 1)
+    } else {
+        (false, pos)
+    };
+    let (int_part, mid) = scan_u64(buf, start)?;
+
+    let (frac_scaled, end) = if mid < buf.len() && buf[mid] == b'.' {
+        scan_fractional_n(buf, mid + 1, 9)?
+    } else {
+        (0u64, mid)
+    };
+
+    let mag_i64 = int_part
+        .checked_mul(SCALE)
+        .and_then(|x| x.checked_add(frac_scaled))
+        .and_then(|x| i64::try_from(x).ok())?;
+
+    let signed = if negative { -mag_i64 } else { mag_i64 };
+    Some((signed, end))
+}
+
 /// Scan up to six fractional digits and return their value as an
 /// integer scaled to 1e-6. If fewer than six are present we pad with
 /// zeros; if more, we truncate (ingress data sometimes over-specifies).
 #[inline]
 fn scan_fractional_1e6(buf: &[u8], pos: Pos) -> Option<(u64, Pos)> {
+    scan_fractional_n(buf, pos, 6)
+}
+
+/// Scan up to `max_digits` fractional digits and return their value
+/// as an integer scaled to `10^-max_digits`. Shorter fractions are
+/// zero-padded; longer ones truncated. Shared body of the 1e6 / 1e9
+/// scanners — one implementation, two scales.
+#[inline]
+fn scan_fractional_n(buf: &[u8], pos: Pos, max_digits: usize) -> Option<(u64, Pos)> {
+    debug_assert!(max_digits <= 18, "u64 fractional overflow guard");
     let mut i = pos;
     let mut v: u64 = 0;
     let mut digits_seen = 0usize;
@@ -130,7 +174,7 @@ fn scan_fractional_1e6(buf: &[u8], pos: Pos) -> Option<(u64, Pos)> {
         if !b.is_ascii_digit() {
             break;
         }
-        if digits_seen < 6 {
+        if digits_seen < max_digits {
             v = v.wrapping_mul(10).wrapping_add((b - b'0') as u64);
         }
         digits_seen += 1;
@@ -139,8 +183,8 @@ fn scan_fractional_1e6(buf: &[u8], pos: Pos) -> Option<(u64, Pos)> {
     if digits_seen == 0 {
         return None;
     }
-    // Pad to 6 decimal places.
-    let to_pad = 6usize.saturating_sub(digits_seen);
+    // Pad to `max_digits` decimal places.
+    let to_pad = max_digits.saturating_sub(digits_seen);
     let mut p = 0usize;
     while p < to_pad {
         v = v.wrapping_mul(10);
@@ -265,6 +309,32 @@ mod tests {
     fn scan_price_1e6_handles_negative() {
         let (v, _) = scan_price_1e6(b"-0.5", 0).unwrap();
         assert_eq!(v, -500_000);
+    }
+
+    #[test]
+    fn scan_price_1e9_keeps_rate_precision() {
+        // OKX funding rate — the motivating case: 0.0000593 must not
+        // collapse to 59 counts the way it does at 1e6 scale.
+        let (v, p) = scan_price_1e9(b"0.0000593,", 0).unwrap();
+        assert_eq!(v, 59_300);
+        assert_eq!(p, 9);
+    }
+
+    #[test]
+    fn scan_price_1e9_pads_and_truncates() {
+        assert_eq!(scan_price_1e9(b"1.5", 0).unwrap().0, 1_500_000_000);
+        // 12 fractional digits; keep 9.
+        assert_eq!(
+            scan_price_1e9(b"0.123456789123", 0).unwrap().0,
+            123_456_789
+        );
+    }
+
+    #[test]
+    fn scan_price_1e9_handles_negative_and_rejects_garbage() {
+        assert_eq!(scan_price_1e9(b"-0.000001", 0).unwrap().0, -1_000);
+        assert_eq!(scan_price_1e9(b"", 0), None);
+        assert_eq!(scan_price_1e9(b".", 0), None);
     }
 
     #[test]

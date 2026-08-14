@@ -1322,3 +1322,186 @@ fn queued_dispatcher_worker_drain_is_zero_alloc() {
         "queued dispatcher worker drain allocated {allocs} times ({bytes} B)"
     );
 }
+
+// ---------------------------------------------------------------
+// Phase 8b: OKX ingress hot-path assertions
+// ---------------------------------------------------------------
+
+/// Run classify + all five OKX channel parsers over fixed realistic
+/// samples (mirrors the ingress-okx unit-test corpus) for 10_000
+/// iterations each — must be zero-alloc.
+#[test]
+fn okx_parsers_are_zero_alloc() {
+    let bbo: &[u8] = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","55154","0","2"]],"bids":[["111.05","57745","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
+    let trade: &[u8] = br#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"130639474","px":"42219.9","sz":"0.12060306","side":"buy","ts":"1630048897897","count":"3","seqId":123456}]}"#;
+    let mark: &[u8] = br#"{"arg":{"channel":"mark-price","instId":"BTC-USD-SWAP"},"data":[{"instType":"SWAP","instId":"BTC-USD-SWAP","markPx":"42310.6","ts":"1630049455539"}]}"#;
+    let funding: &[u8] = br#"{"arg":{"channel":"funding-rate","instId":"BTC-USD-SWAP"},"data":[{"fundingRate":"0.0000593","fundingTime":"1630051200000","instId":"BTC-USD-SWAP","instType":"SWAP","ts":"1630048897897"}]}"#;
+    let book: &[u8] = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"asks":[["8476.98","415","0","13"]],"bids":[["8476.97","256","0","12"]],"ts":"1597026383085","checksum":0,"prevSeqId":-1,"seqId":123456}]}"#;
+    // Venue-namespaced symbol (venue byte 2 = Okx, ordinal 1).
+    let sym: SymbolId = (2 << 24) | 1;
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..10_000u32 {
+        std::hint::black_box(ingress_okx::classify(bbo));
+        std::hint::black_box(ingress_okx::classify(trade));
+        std::hint::black_box(ingress_okx::classify(mark));
+        std::hint::black_box(ingress_okx::classify(funding));
+        std::hint::black_box(ingress_okx::classify(book));
+        let b = ingress_okx::parse_bbo(bbo, sym).unwrap();
+        acc = acc.wrapping_add(b.bid_px_1e6);
+        let t = ingress_okx::parse_trade(trade, sym).unwrap();
+        acc = acc.wrapping_add(t.px_1e6);
+        let m = ingress_okx::parse_mark_price(mark, sym).unwrap();
+        acc = acc.wrapping_add(m.mark_px_1e6);
+        let f = ingress_okx::parse_funding_rate(funding, sym).unwrap();
+        acc = acc.wrapping_add(f.funding_rate_1e9);
+        let h = ingress_okx::parse_book_header(book, sym).unwrap();
+        acc = acc.wrapping_add(h.seq_id);
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "okx parsers allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "okx parser bytes should be zero: saw {bytes}");
+}
+
+/// Drive the OKX ingress run-loop through 1 000 pre-injected
+/// steady-state frames (bbo-tbt / trades / correctly chained books)
+/// via a `TestTransport`. Steady state is reached over the real
+/// handshake path; the entire scripted stream is injected before the
+/// guard; every `drive_one` call must allocate zero bytes.
+#[test]
+fn okx_run_loop_steady_state_is_zero_alloc() {
+    use ingress_okx::run_loop as owl;
+
+    // ---- boot (NOT measured) ----
+    // Capacity must hold the whole scripted stream at once (~190 KiB
+    // for 1 000 frames): the transport's buffers are fixed-size and
+    // nothing drains them until the measurement loop runs.
+    let mut transport = TestTransport::with_capacity(256 * 1024);
+
+    // Venue-namespaced symbol (venue byte 2 = Okx, ordinal 1).
+    let sym: SymbolId = (2 << 24) | 1;
+    let mut symbols = ingress_okx::OkxSymbolTable::new();
+    symbols.insert(b"BTC-USDT", sym).unwrap();
+    let mut driver = owl::Driver::new(0x0C0Cu64, symbols, true);
+    owl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    // Health telemetry sink — relaxed atomics only; built outside
+    // the measurement window.
+    let status = core_metrics::IngressStatus::new();
+
+    let ring: std::sync::Arc<Ring<Tick, { owl::TICK_RING_CAP }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+
+    // Send the client GET handshake.
+    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    let mut scratch = [0u8; 4096];
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    // Inject the 101 reply matching the seed.
+    let key = core_net::sec_websocket_key_from_seed(0x0C0Cu64);
+    let accept = core_net::expected_accept(&key);
+    let mut resp = [0u8; 256];
+    let mut n = 0;
+    for src in [
+        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
+        &b"Upgrade: websocket\r\n"[..],
+        &b"Connection: Upgrade\r\n"[..],
+        &b"Sec-WebSocket-Accept: "[..],
+        &accept[..],
+        &b"\r\n\r\n"[..],
+    ] {
+        resp[n..n + src.len()].copy_from_slice(src);
+        n += src.len();
+    }
+    transport.inject_incoming(&resp[..n]);
+    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    assert_eq!(driver.state(), owl::State::Steady);
+    // Drain the batched subscribe op so the tx buffer stays empty.
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    // Pre-build + pre-inject the full scripted stream: one books
+    // snapshot, then cycles of [bbo-tbt, trades, books update]. The
+    // updates chain correctly (prevSeqId == prior seqId) so the §6.2
+    // resync path stays cold — no resubscribes fire inside the
+    // measurement window. Trades reuse one seqId (equal ids are
+    // legal). `inject_incoming` may compact/copy; all of it happens
+    // here, before the guard.
+    const CYCLES: usize = 333; // 1 snapshot + 3 × 333 = 1 000 frames
+    const BBO: &[u8] = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","55154","0","2"]],"bids":[["111.05","57745","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
+    const TRADE: &[u8] = br#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"130639474","px":"42219.9","sz":"0.12060306","side":"buy","ts":"1630048897897","count":"3","seqId":123456}]}"#;
+    const BOOK_SNAP: &[u8] = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"asks":[["8476.98","415","0","13"]],"bids":[["8476.97","256","0","12"]],"ts":"1597026383085","checksum":0,"prevSeqId":-1,"seqId":123456}]}"#;
+
+    /// Unmasked (server→client) WS text frame appended to `stream`.
+    fn push_text_frame(stream: &mut Vec<u8>, body: &[u8]) {
+        stream.push(0x81);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            assert!(body.len() <= u16::MAX as usize);
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+
+    let mut stream: Vec<u8> = Vec::with_capacity(220 * 1024);
+    push_text_frame(&mut stream, BOOK_SNAP);
+    let mut seq: i64 = 123_456; // BOOK_SNAP's seqId — chain root
+    for _ in 0..CYCLES {
+        push_text_frame(&mut stream, BBO);
+        push_text_frame(&mut stream, TRADE);
+        let upd = format!(
+            r#"{{"arg":{{"channel":"books","instId":"BTC-USDT"}},"action":"update","data":[{{"asks":[["8476.98","415","0","13"]],"bids":[],"ts":"1597026383217","checksum":0,"prevSeqId":{},"seqId":{}}}]}}"#,
+            seq,
+            seq + 1
+        );
+        push_text_frame(&mut stream, upd.as_bytes());
+        seq += 1;
+    }
+    let injected = transport.inject_incoming(&stream);
+    assert_eq!(
+        injected,
+        stream.len(),
+        "transport capacity must hold the full scripted stream"
+    );
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    let mut drives = 0u32;
+    while transport.incoming_len() > 0 {
+        owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        drives += 1;
+        assert!(drives <= 4_096, "scripted stream failed to drain");
+    }
+    // Drain the bbo ticks — one per cycle. try_pop is zero-alloc
+    // (asserted by the ring test above), so popping inside the guard
+    // keeps the window honest.
+    let mut acc: i64 = 0;
+    let mut popped: usize = 0;
+    while let Some(t) = cons.try_pop() {
+        acc = acc.wrapping_add(t.bid_px.raw());
+        popped += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    // Steady state consumed the whole script: one tick per bbo frame,
+    // every frame counted, no losses, no chain breaks, no resyncs.
+    assert_eq!(popped, CYCLES);
+    assert_eq!(status.msgs_total(), (1 + 3 * CYCLES) as u64);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.gaps_total(), 0);
+    assert_eq!(status.resubscribes_total(), 0);
+    assert_eq!(status.ring_drops_total(), 0);
+    assert_eq!(
+        allocs, 0,
+        "okx run-loop allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "okx run-loop bytes should be zero: saw {bytes}");
+}

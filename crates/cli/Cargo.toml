@@ -35,6 +35,7 @@ core-latency         = { workspace = true }
 tui                  = { workspace = true }
 ingress-polymarket   = { workspace = true }
 ingress-binance      = { workspace = true }
+ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 ingress-rss          = { workspace = true }
 clap                 = { workspace = true }

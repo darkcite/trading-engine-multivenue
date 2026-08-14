@@ -5,10 +5,10 @@
 //! binary.
 //!
 //! Subcommands:
-//! * `run --paper` — spawn all four ingress threads (Polymarket,
-//!   Binance, Polygon RPC, RSS), boot the real `Engine` with the
-//!   latency-arb strategy + paper dispatcher, drain consumers on
-//!   the main thread until SIGINT.
+//! * `run --paper` — spawn the ingress threads (Polymarket, Binance,
+//!   OKX when `--okx-symbols` is set, Polygon RPC, RSS), boot the
+//!   real `Engine` with the latency-arb strategy + paper dispatcher,
+//!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
 //!   (non-secret) config.
 
@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use clap::Parser;
 use cli::{
     engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
-    engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance,
+    engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance, spawn_okx,
     spawn_polymarket, spawn_rpc, Consumers, EngineConfig, EngineLoopResult, LatencyDump,
     LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
 };
@@ -75,6 +75,17 @@ struct RunArgs {
     /// market's asset_id to this same id.
     #[arg(long, default_value_t = 42u32)]
     polymarket_sym_id: u32,
+    /// Comma-separated OKX instIds (e.g. `BTC-USDT,ETH-USD-SWAP`).
+    /// The i-th entry (0-based) is allocated SymbolId
+    /// `make_symbol_id(Okx, i+1)` — flag order is id order. Empty /
+    /// absent = the OKX ingress thread is not started.
+    #[arg(long)]
+    okx_symbols: Option<String>,
+    /// Also subscribe the OKX 400-level `books` channel per
+    /// instrument (capture + integrity only, §4.5). Default OFF —
+    /// `bbo-tbt` alone feeds the tick lane.
+    #[arg(long, default_value_t = false)]
+    okx_depth: bool,
     /// Polymarket CLOB asset id (token id) for the market above —
     /// the decimal string from the market's `clobTokenIds`. Required:
     /// without it the PM symbol map is empty and every Polymarket
@@ -294,19 +305,48 @@ fn run(args: RunArgs) -> ExitCode {
         }
     };
 
+    // -- OKX boot config (Phase 8b; venue is opt-in) --
+    // Fixed public endpoint on the venue's non-443 port; a
+    // per-venue host lands in core-config with the Phase-8e boot
+    // coverage audit.
+    const OKX_WS_HOST: &str = "ws.okx.com";
+    const OKX_WS_PORT: u16 = 8443;
+    const OKX_WS_PATH: &str = "/ws/v5/public";
+    let okx_boot = match args.okx_symbols.as_deref().map(str::trim) {
+        Some(spec) if !spec.is_empty() => {
+            let symbols = match cli::build_okx_symbol_table(spec) {
+                Ok(t) => t,
+                Err(reason) => {
+                    error!(reason, spec, "bad --okx-symbols");
+                    return ExitCode::from(1);
+                }
+            };
+            let okx_ep = match WssEndpoint::resolve(OKX_WS_HOST, OKX_WS_PORT, OKX_WS_PATH) {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = ?e, "okx DNS failed");
+                    return ExitCode::from(1);
+                }
+            };
+            Some((symbols, okx_ep))
+        }
+        _ => None,
+    };
+
     // -- Allocate rings + split into producer/consumer halves --
     //
     // Phase 8a lane layout: rings.tick is indexed by VenueId
-    // (0=PM, 1=BN, 2=OKX, 3=Deribit, 4=HL). Lanes 2..5 have no
-    // ingress until Phases 8b–8d: their producers are dropped here,
-    // leaving permanently-empty rings the engine drains for two
-    // atomic loads per iteration (§3.3). Fill-lane producers arrive
-    // with the venue dispatchers in 8j; paper fills flow through
-    // the engine's dispatcher pump (D3).
+    // (0=PM, 1=BN, 2=OKX, 3=Deribit, 4=HL). Lane 2 gains its
+    // producer below when `--okx-symbols` is set (Phase 8b); lanes
+    // 3..5 have no ingress until 8c–8d, so their producers are
+    // dropped here, leaving permanently-empty rings the engine
+    // drains for two atomic loads per iteration (§3.3). Fill-lane
+    // producers arrive with the venue dispatchers in 8j; paper
+    // fills flow through the engine's dispatcher pump (D3).
     let rings = Rings::new();
     let (pm_prod, pm_lane_cons) = rings.tick[0].clone().split();
     let (bn_prod, bn_lane_cons) = rings.tick[1].clone().split();
-    let (_okx_prod_unspawned, okx_lane_cons) = rings.tick[2].clone().split();
+    let (okx_prod, okx_lane_cons) = rings.tick[2].clone().split();
     let (_der_prod_unspawned, der_lane_cons) = rings.tick[3].clone().split();
     let (_hl_prod_unspawned, hl_lane_cons) = rings.tick[4].clone().split();
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
@@ -357,6 +397,30 @@ fn run(args: RunArgs) -> ExitCode {
         2,
     );
     handles.push(bn_handle);
+
+    // OKX rides core 5 per the §9 core map (rpc keeps 3, ai takes 4).
+    if let Some((okx_symbols, okx_ep)) = okx_boot {
+        info!(
+            instruments = okx_symbols.len(),
+            depth = args.okx_depth,
+            "okx: starting ingress thread"
+        );
+        let okx_handle = spawn_okx(
+            okx_ep,
+            tls_config.clone(),
+            okx_symbols,
+            args.okx_depth,
+            okx_prod,
+            statuses.okx.clone(),
+            5,
+        );
+        handles.push(okx_handle);
+    } else {
+        info!("--okx-symbols empty / unset; OKX ingress thread not started");
+        // Drop the producer side so the lane stays a permanently-
+        // empty ring (same shape as the 8c/8d lanes above).
+        drop(okx_prod);
+    }
 
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {

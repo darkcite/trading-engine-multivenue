@@ -17,9 +17,11 @@
 //! | T2     | ingress-binance (bookTicker WSS) |
 //! | T3     | ingress-rpc (Polygon JSON-RPC WSS) |
 //! | T4     | ingress-rss (HTTPS polling) |
+//! | T5     | ingress-okx (v5 public WSS; only with `--okx-symbols`) |
 //!
-//! Cores 0..=4 are pinned (Linux only). On non-Linux we log a
-//! single warning and let the OS scheduler do as it pleases.
+//! Cores 0..=5 are pinned (Linux only) per the §9 core map. On
+//! non-Linux we log a single warning and let the OS scheduler do as
+//! it pleases.
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -37,12 +39,13 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
-use core_types::{Fill, Signal, SymbolId, Tick};
+use core_types::{make_symbol_id, Fill, Signal, SymbolId, Tick, VenueId};
 use engine::{Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE};
 use rustls_pki_types::ServerName;
 use strategy_latency_arb::LatencyArb;
 
 use ingress_binance::run_loop as bwl;
+use ingress_okx::run_loop as owl;
 use ingress_polymarket::run_loop as pwl;
 use ingress_rpc::run_loop as rwl;
 
@@ -92,6 +95,13 @@ const PM_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
 const BN_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 15_000_000_000,
     idle_timeout_ns: 45_000_000_000,
+};
+/// OKX cuts connections that stay silent for 30 s (plan §4.1); the
+/// venue-literal `ping` text frame goes out at 25 s and anything
+/// quieter than 40 s is a dead session.
+const OKX_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 25_000_000_000,
+    idle_timeout_ns: 40_000_000_000,
 };
 /// Polygon RPC: newHeads every ~2 s + our own 2 s poll → anything
 /// quieter than 30 s is a dead session.
@@ -149,6 +159,7 @@ impl WssEndpoint {
 const _: () = {
     assert!(pwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(bwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(owl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
@@ -197,6 +208,9 @@ pub struct IngressStatusSet {
     pub polymarket: Arc<IngressStatus>,
     /// Binance WSS thread.
     pub binance: Arc<IngressStatus>,
+    /// OKX WSS thread (Phase 8b). Stays Down when `--okx-symbols`
+    /// is empty and the thread is never spawned.
+    pub okx: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
     /// RSS poller thread.
@@ -204,11 +218,12 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all four slots (boot only).
+    /// Allocate all five slots (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
             binance: Arc::new(IngressStatus::new()),
+            okx: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
             rss: Arc::new(IngressStatus::new()),
         }
@@ -374,6 +389,128 @@ pub fn spawn_binance(
                 );
                 tracing::info!(?res, "binance: run-loop returned");
                 if matches!(res, bwl::RunResult::Stopped) {
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+                if status.msgs_total() > msgs_before {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
+            }
+            status.set_state(IngressState::Down);
+        },
+    )
+}
+
+/// Build the boot-time OKX `instId → SymbolId` table from the
+/// comma-separated `--okx-symbols` value. The i-th instrument
+/// (0-based) is allocated `make_symbol_id(VenueId::Okx, i + 1)` —
+/// ordinals follow flag order, 1-based so ordinal 0 never aliases
+/// an unconfigured id (§3.1; venue REST discovery replaces this
+/// manual allocation in the Phase-8e boot coverage audit).
+///
+/// Fails fast on an empty item, a duplicate `instId`, an over-long
+/// `instId`, or more than [`ingress_okx::OKX_MAX_SYMBOLS`]
+/// instruments — boot refuses to start rather than run with a
+/// venue map that doesn't match the operator's intent.
+pub fn build_okx_symbol_table(spec: &str) -> Result<ingress_okx::OkxSymbolTable, &'static str> {
+    let mut table = ingress_okx::OkxSymbolTable::new();
+    let mut ordinal: u32 = 0;
+    for item in spec.split(',') {
+        let inst_id = item.trim();
+        if inst_id.is_empty() {
+            return Err("okx: empty instId in --okx-symbols");
+        }
+        if table.lookup(inst_id.as_bytes()).is_some() {
+            return Err("okx: duplicate instId in --okx-symbols");
+        }
+        ordinal += 1;
+        match table.insert(inst_id.as_bytes(), make_symbol_id(VenueId::Okx, ordinal)) {
+            Ok(()) => {}
+            Err(ingress_okx::SymbolTableErr::Full) => {
+                return Err("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments");
+            }
+            Err(ingress_okx::SymbolTableErr::TooLong) => {
+                return Err("okx: instId in --okx-symbols exceeds OKX_INST_ID_MAX bytes");
+            }
+            Err(ingress_okx::SymbolTableErr::Empty) => {
+                return Err("okx: empty instId in --okx-symbols");
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Spawn the OKX v5 public-WS ingress thread (Phase 8b). One thread
+/// covers every configured instrument — the driver batches all
+/// `(channel × instId)` pairs into a single subscribe op (§4.1).
+/// `depth_enabled` adds the 400-level `books` channel per
+/// instrument (`--okx-depth`; capture + integrity only, §4.5).
+pub fn spawn_okx(
+    ep: WssEndpoint,
+    tls_config: RustlsConfig,
+    symbols: ingress_okx::OkxSymbolTable,
+    depth_enabled: bool,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+) -> JoinHandle<()> {
+    spawn_or_die(
+        thread::Builder::new().name("ingress-okx".into()),
+        "ingress-okx",
+        move || {
+            log_pin_outcome("okx", core_id);
+            let server_name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "okx: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+
+            let mut driver = owl::Driver::new(now_ns(), symbols, depth_enabled);
+            let mut keepalive = Keepalive::new(OKX_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
+                let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "okx: connect failed");
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
+                        continue;
+                    }
+                };
+                let (mut poll, mut events, token) = match new_poll() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "okx: mio init failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                driver.reset_for_reconnect(now_ns());
+                let msgs_before = status.msgs_total();
+
+                let res = owl::run(
+                    &mut transport,
+                    &mut driver,
+                    ep.host.as_bytes(),
+                    ep.path.as_bytes(),
+                    &mut producer,
+                    &mut poll,
+                    &mut events,
+                    token,
+                    &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
+                );
+                tracing::info!(?res, "okx: run-loop returned");
+                if matches!(res, owl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
                 }
@@ -971,6 +1108,9 @@ impl Observability {
             let ingress_binance_state = reg
                 .register_gauge("engine_ingress_binance_state")
                 .map_err(|_| "register engine_ingress_binance_state")?;
+            let ingress_okx_state = reg
+                .register_gauge("engine_ingress_okx_state")
+                .map_err(|_| "register engine_ingress_okx_state")?;
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
@@ -1009,6 +1149,7 @@ impl Observability {
             // ingress (D4). Boot-only; format! is fine here.
             let ingress_polymarket = register_ingress_counters(&mut reg, "polymarket")?;
             let ingress_binance = register_ingress_counters(&mut reg, "binance")?;
+            let ingress_okx = register_ingress_counters(&mut reg, "okx")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
 
             out.metrics = Some(Arc::new(reg));
@@ -1030,12 +1171,14 @@ impl Observability {
                 strategy_rule_tree,
                 ingress_polymarket_state,
                 ingress_binance_state,
+                ingress_okx_state,
                 ingress_rpc_state,
                 ingress_rss_state,
                 max_tick_age_ns,
                 tick_age_ns_per_bucket,
                 ingress_polymarket,
                 ingress_binance,
+                ingress_okx,
                 ingress_rpc,
             });
         }
@@ -1172,6 +1315,8 @@ pub struct EngineCounters {
     pub ingress_polymarket_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Binance bookTicker.
     pub ingress_binance_state: core_metrics::GaugeId,
+    /// Per-ingress state gauge: OKX v5 public WS.
+    pub ingress_okx_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: RSS poller.
@@ -1188,6 +1333,8 @@ pub struct EngineCounters {
     pub ingress_polymarket: IngressCounterIds,
     /// §6.4 loss-accounting counters, Binance thread.
     pub ingress_binance: IngressCounterIds,
+    /// §6.4 loss-accounting counters, OKX thread.
+    pub ingress_okx: IngressCounterIds,
     /// §6.4 loss-accounting counters, RPC thread.
     pub ingress_rpc: IngressCounterIds,
 }
@@ -1328,8 +1475,8 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, rpc) so registry counters get monotonic deltas.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 3];
+    // (pm, bn, okx, rpc) so registry counters get monotonic deltas.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 4];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -1401,6 +1548,7 @@ where
                         .set(ing.polymarket.state() as i64);
                     reg.gauge(ids.ingress_binance_state)
                         .set(ing.binance.state() as i64);
+                    reg.gauge(ids.ingress_okx_state).set(ing.okx.state() as i64);
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
                     reg.gauge(ids.ingress_rss_state).set(ing.rss.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
@@ -1418,7 +1566,8 @@ where
                         &ing.binance,
                         &mut ingress_last[1],
                     );
-                    mirror_ingress_counters(reg, &ids.ingress_rpc, &ing.rpc, &mut ingress_last[2]);
+                    mirror_ingress_counters(reg, &ids.ingress_okx, &ing.okx, &mut ingress_last[2]);
+                    mirror_ingress_counters(reg, &ids.ingress_rpc, &ing.rpc, &mut ingress_last[3]);
                 }
 
                 // Max tick age — surfaces silenced markets.
@@ -1745,5 +1894,56 @@ mod tests {
     #[test]
     fn join_reverse_handles_empty_vec() {
         join_reverse(Vec::new());
+    }
+
+    /// Happy path: `--okx-symbols` items get 1-based, flag-ordered
+    /// ordinals under the Okx venue byte, with whitespace trimmed.
+    #[test]
+    fn okx_symbol_table_allocates_flag_ordered_ids() {
+        let t = build_okx_symbol_table("BTC-USDT, ETH-USD-SWAP").unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            t.lookup(b"BTC-USDT"),
+            Some(make_symbol_id(VenueId::Okx, 1))
+        );
+        assert_eq!(
+            t.lookup(b"ETH-USD-SWAP"),
+            Some(make_symbol_id(VenueId::Okx, 2))
+        );
+        assert_eq!(t.lookup(b"XRP-USDT"), None);
+    }
+
+    /// Failure modes: empty item, duplicate instId, and more than
+    /// `OKX_MAX_SYMBOLS` instruments all refuse boot.
+    #[test]
+    fn okx_symbol_table_rejects_bad_specs() {
+        // Trailing comma ⇒ empty item.
+        assert_eq!(
+            build_okx_symbol_table("BTC-USDT,").err(),
+            Some("okx: empty instId in --okx-symbols")
+        );
+        // Duplicate instId (whitespace doesn't disguise it).
+        assert_eq!(
+            build_okx_symbol_table("BTC-USDT,ETH-USDT, BTC-USDT").err(),
+            Some("okx: duplicate instId in --okx-symbols")
+        );
+        // OKX_MAX_SYMBOLS + 1 distinct instruments ⇒ Full.
+        let mut spec = String::new();
+        for i in 0..=ingress_okx::OKX_MAX_SYMBOLS {
+            if i > 0 {
+                spec.push(',');
+            }
+            spec.push_str(&format!("S{i}-USDT"));
+        }
+        assert_eq!(
+            build_okx_symbol_table(&spec).err(),
+            Some("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments")
+        );
+        // Exactly OKX_MAX_SYMBOLS is still fine.
+        let max_spec = spec.rsplit_once(',').unwrap().0;
+        assert_eq!(
+            build_okx_symbol_table(max_spec).unwrap().len(),
+            ingress_okx::OKX_MAX_SYMBOLS
+        );
     }
 }
