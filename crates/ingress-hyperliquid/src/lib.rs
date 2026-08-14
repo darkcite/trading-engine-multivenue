@@ -99,6 +99,7 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod discovery;
 pub mod run_loop;
 
 pub use run_loop::{

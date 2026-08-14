@@ -37,6 +37,11 @@ cd claude-worker && uv run pytest
 
 # start the engine locally (paper mode)
 cargo run --release -p cli -- run --config ~/multivenue/config.toml --paper
+
+# audit a capture run (every run writes PMLR capture to
+# <MULTIVENUE_LOG_DIR>/run-<epoch_ns>/ — per-venue ticks/events/signals
+# + optional --raw-tap payload tap)
+cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 ```
 
 ## Hard architectural rules (do not violate — the build will fail if you do)
@@ -75,6 +80,8 @@ cargo run --release -p cli -- run --config ~/multivenue/config.toml --paper
 - `PLAN.md` — full architecture, phased roadmap, testing strategy.
 - `crates/core-*/` — OS-agnostic primitives (rings, time, config, alloc, io, net, parse, simd, crypto).
 - `crates/core-crypto/` — handwritten SHA-256 / HMAC-SHA256 / base64 (RFC 4648); no external crypto stacks.
+- `crates/core-io/` — PMLR replay log writer/reader + `PmlrCapture` (per-ingress §6.5 capture sink) + raw tap (`PMRT`).
+- `crates/ingress-*/src/discovery.rs` — per-venue boot REST discovery (8e): instrument universes, tick/lot metadata, coverage audit.
 - `crates/ingress-*/` — one per external source (polymarket, binance, rss, rpc).
 - `crates/strategy-*/` — strategies implementing the `Strategy` trait.
 - `crates/signer-eip712/` — audited-C-backed signer; do not replace with `ethers`.
@@ -100,6 +107,8 @@ cargo run --release -p cli -- run --config ~/multivenue/config.toml --paper
 7. **Proposing to add Prometheus, Grafana, Terraform, AWS SDK, or any cloud service.** Deliberately excluded.
 8. **Proposing to add paid API integrations (X, Benzinga, Blocknative) before Phase 6.** Gated on demonstrated P&L.
 9. **Proposing to skip tests "because it's a small change".** Zero-alloc assertions exist because small changes have regressed them before.
+10. **Trusting `cargo` runs inside the Cowork Linux sandbox.** The mounted-repo fingerprints go stale and produce FALSE GREENS (observed 2026-08-15). Compile and test on the Mac only. Corollary on the Mac: impossible-looking unresolved-import errors right after file edits = stale rmeta — `cargo clean -p <touched crates>` and retry.
+11. **Trusting probe fixtures over live boots.** Venue wire drifts (OKX `preopen` empties, 27-byte XPERP ids, Deribit starbase reorder + sci-notation floats were all caught LIVE in 8e). New parsers get a live smoke run before being declared done; `--raw-tap` exists for exactly this.
 
 ## Preferred Claude models for tasks in this repo
 

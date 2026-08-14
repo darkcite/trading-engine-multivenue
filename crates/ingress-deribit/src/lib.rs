@@ -88,6 +88,7 @@
 )]
 
 pub mod run_loop;
+pub mod discovery;
 
 pub use run_loop::{
     drive_one, note_transport_ready, run, Driver, RunResult, State, StopFlag, PENDING_CAP,
@@ -95,7 +96,7 @@ pub use run_loop::{
 };
 
 use core_net::SubId;
-use core_parse::{find_field, scan_i64, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte};
+use core_parse::{find_field, scan_i64, scan_number_sci_1e6, scan_number_sci_1e9, scan_u64, skip_byte};
 use core_types::{NsTs, SymbolId};
 
 // ---------------------------------------------------------------
@@ -397,14 +398,17 @@ fn scan_ms_field(buf: &[u8], key: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// Parse an unquoted decimal price field ×1e6. `null` (empty side on
-/// `quote`) yields 0.
+/// `quote`) yields 0. Scientific notation is accepted: the first live
+/// raw-tap (2026-08-15) showed Deribit's starbase engine rendering
+/// round floats as exponent forms (`"amount": 1.0e3`) — the strict
+/// decimal scanner rejected ~1.3 % of messages.
 #[inline]
 fn scan_px_field_1e6(buf: &[u8], key: &[u8]) -> Option<i64> {
     let pos = find_field(buf, key)?;
     if buf.get(pos..pos + 4) == Some(b"null") {
         return Some(0);
     }
-    let (v, _) = scan_price_1e6(buf, pos)?;
+    let (v, _) = scan_number_sci_1e6(buf, pos)?;
     Some(v)
 }
 
@@ -446,7 +450,7 @@ pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame>
     let mark_px_1e6 = scan_px_field_1e6(payload, b"\"mark_price\":")?;
     let index_px_1e6 = scan_px_field_1e6(payload, b"\"index_price\":")?;
     let pos = find_field(payload, b"\"current_funding\":")?;
-    let (current_funding_1e9, _) = scan_price_1e9(payload, pos)?;
+    let (current_funding_1e9, _) = scan_number_sci_1e9(payload, pos)?;
     let open_interest_1e6 = scan_px_field_1e6(payload, b"\"open_interest\":")?;
     let min_px_1e6 = scan_px_field_1e6(payload, b"\"min_price\":")?;
     let max_px_1e6 = scan_px_field_1e6(payload, b"\"max_price\":")?;
@@ -472,9 +476,9 @@ pub fn parse_trade(row: &[u8], sym: SymbolId) -> Option<DeribitTradeFrame> {
     let pos = find_field(row, b"\"trade_seq\":")?;
     let (trade_seq, _) = scan_i64(row, pos)?;
     let pos = find_field(row, b"\"price\":")?;
-    let (px_1e6, _) = scan_price_1e6(row, pos)?;
+    let (px_1e6, _) = scan_number_sci_1e6(row, pos)?;
     let pos = find_field(row, b"\"amount\":")?;
-    let (qty_1e6, _) = scan_price_1e6(row, pos)?;
+    let (qty_1e6, _) = scan_number_sci_1e6(row, pos)?;
     let side = if memchr::memmem::find(row, b"\"direction\":\"buy\"").is_some() {
         0u8
     } else if memchr::memmem::find(row, b"\"direction\":\"sell\"").is_some() {

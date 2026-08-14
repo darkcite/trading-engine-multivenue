@@ -27,17 +27,18 @@
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clob_dispatcher::{OrderDispatch, PaperDispatcher};
 // LiveDispatcher is re-exported through cli::paper so the binary
 // doesn't have to depend on clob-dispatcher directly.
 pub use clob_dispatcher::{LiveDispatcher, LiveDispatcherErr};
-use core_metrics::{IngressState, IngressStatus};
+use core_io::{PmlrCapture, TapCfg, TapMode};
+use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
 use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
@@ -168,6 +169,39 @@ impl WssEndpoint {
     }
 }
 
+/// Split a `core_config::Config` host field that may carry an
+/// embedded `:port` (e.g. `okx_ws_host` defaults to
+/// `"ws.okx.com:8443"`) into `(host, port)`. Hosts with no `:` use
+/// `default_port` (8e §9 — REST hosts never carry a port; the OKX WS
+/// host does because the venue's public WS runs on a non-443 port).
+pub fn split_host_port(host_cfg: &str, default_port: u16) -> Result<(&str, u16), &'static str> {
+    match host_cfg.rsplit_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p.parse().map_err(|_| "config: bad :port in host string")?;
+            if h.is_empty() {
+                return Err("config: empty host before :port");
+            }
+            Ok((h, port))
+        }
+        None => Ok((host_cfg, default_port)),
+    }
+}
+
+/// Build `<log_dir>/run-<epoch_ns>` (epoch_ns = wall-clock ns at
+/// boot) and create it. This is the Phase-8e §6.5 capture run
+/// directory — every spawned ingress's `PmlrCapture` files land here.
+/// Boot-only; the caller logs the resulting directory.
+pub fn new_capture_run_dir(log_dir: &str) -> io::Result<(PathBuf, u64)> {
+    let epoch_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut dir = PathBuf::from(log_dir);
+    dir.push(format!("run-{epoch_ns}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok((dir, epoch_ns))
+}
+
 // ---------------------------------------------------------------
 // Ring + Producer/Consumer alias bundles
 // ---------------------------------------------------------------
@@ -273,8 +307,13 @@ impl Default for IngressStatusSet {
 
 /// Spawn the Polymarket CLOB ingress thread. `producer` is the SPSC
 /// producer half of the tick ring; the consumer half stays on the
-/// main thread. Returns a [`JoinHandle`] the caller will join in
-/// reverse boot order during shutdown.
+/// main thread. Opens this venue's `PmlrCapture` (label `"pm"`)
+/// **before** spawning — capture-open failure is a fatal boot error
+/// (§6.5: capture is the Stage-1 product), so the caller sees it via
+/// the returned `Err` rather than a panic deep inside the thread.
+/// Returns a [`JoinHandle`] the caller will join in reverse boot
+/// order during shutdown.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_polymarket(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
@@ -283,8 +322,16 @@ pub fn spawn_polymarket(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = PmlrCapture::open(run_dir, "pm", epoch_ns, tap_cfg)?;
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "pm", VenueId::Polymarket.to_u8())?;
+    }
+    Ok(spawn_or_die(
         thread::Builder::new().name("ingress-polymarket".into()),
         "ingress-polymarket",
         move || {
@@ -336,8 +383,10 @@ pub fn spawn_polymarket(
                     &SHUTDOWN,
                     &status,
                     &mut keepalive,
+                    &mut capture,
                 );
                 tracing::info!(?res, "polymarket: run-loop returned");
+                mirror_capture_metrics(&capture_metrics, &capture);
                 if matches!(res, pwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -351,14 +400,17 @@ pub fn spawn_polymarket(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
+            mirror_capture_metrics(&capture_metrics, &capture);
             status.set_state(IngressState::Down);
         },
-    )
+    ))
 }
 
 /// Spawn the Binance bookTicker ingress thread. One thread per
 /// symbol — caller spawns N of these if they want multi-symbol
-/// coverage.
+/// coverage. See [`spawn_polymarket`] for the capture-open /
+/// fail-fast contract.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_binance(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
@@ -366,8 +418,16 @@ pub fn spawn_binance(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?;
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
+    }
+    Ok(spawn_or_die(
         thread::Builder::new().name(format!("ingress-binance-{sym}")),
         "ingress-binance",
         move || {
@@ -418,8 +478,10 @@ pub fn spawn_binance(
                     &SHUTDOWN,
                     &status,
                     &mut keepalive,
+                    &mut capture,
                 );
                 tracing::info!(?res, "binance: run-loop returned");
+                mirror_capture_metrics(&capture_metrics, &capture);
                 if matches!(res, bwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -431,35 +493,67 @@ pub fn spawn_binance(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
+            mirror_capture_metrics(&capture_metrics, &capture);
             status.set_state(IngressState::Down);
         },
-    )
+    ))
 }
 
 /// Build the boot-time OKX `instId → SymbolId` table from the
-/// comma-separated `--okx-symbols` value. The i-th instrument
-/// (0-based) is allocated `make_symbol_id(VenueId::Okx, i + 1)` —
-/// ordinals follow flag order, 1-based so ordinal 0 never aliases
-/// an unconfigured id (§3.1; venue REST discovery replaces this
-/// manual allocation in the Phase-8e boot coverage audit).
+/// comma-separated `--okx-symbols` value, gated on `discovery` (the
+/// Phase-8e REST instrument table — see `boot_discovery::run_okx`).
+/// The i-th instrument (0-based) is allocated
+/// `make_symbol_id(VenueId::Okx, i + 1)` — ordinals follow flag
+/// order, 1-based so ordinal 0 never aliases an unconfigured id
+/// (§3.1), and ordinal allocation does NOT depend on whether the
+/// venue actually has the instrument: it's computed before the
+/// discovery lookup so it stays stable across venue universe churn.
 ///
-/// Fails fast on an empty item, a duplicate `instId`, an over-long
-/// `instId`, or more than [`ingress_okx::OKX_MAX_SYMBOLS`]
-/// instruments — boot refuses to start rather than run with a
-/// venue map that doesn't match the operator's intent.
-pub fn build_okx_symbol_table(spec: &str) -> Result<ingress_okx::OkxSymbolTable, &'static str> {
+/// A configured `instId` the venue doesn't currently list live is
+/// silently **omitted** from the returned table (not a hard boot
+/// error) — the §6.1 coverage pass in `boot_discovery` already logged
+/// it as MISSING and decided whether that's fatal (live) or a warning
+/// (paper). Every *present* row's [`ingress_okx::OkxInstType`] comes
+/// from the discovered `instType` — the old instId-suffix hack is
+/// gone, so `OkxSymbolTable::insert` cannot succeed without it.
+///
+/// Still fails fast on an empty item, a duplicate `instId` (checked
+/// against the raw configured list, independent of venue liveness),
+/// or more than [`ingress_okx::OKX_MAX_SYMBOLS`] instruments — boot
+/// refuses to start rather than run with a venue map that doesn't
+/// match the operator's intent.
+pub fn build_okx_symbol_table(
+    spec: &str,
+    discovery: &ingress_okx::discovery::OkxDiscovery,
+) -> Result<ingress_okx::OkxSymbolTable, &'static str> {
     let mut table = ingress_okx::OkxSymbolTable::new();
+    // Raw-spec dedupe list, independent of what actually gets
+    // inserted (a MISSING item must still trip the duplicate check).
+    let mut seen: [&str; ingress_okx::OKX_MAX_SYMBOLS] = [""; ingress_okx::OKX_MAX_SYMBOLS];
+    let mut n_seen: usize = 0;
     let mut ordinal: u32 = 0;
     for item in spec.split(',') {
         let inst_id = item.trim();
         if inst_id.is_empty() {
             return Err("okx: empty instId in --okx-symbols");
         }
-        if table.lookup(inst_id.as_bytes()).is_some() {
+        if seen[..n_seen].contains(&inst_id) {
             return Err("okx: duplicate instId in --okx-symbols");
         }
+        if n_seen >= ingress_okx::OKX_MAX_SYMBOLS {
+            return Err("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments");
+        }
+        seen[n_seen] = inst_id;
+        n_seen += 1;
+
         ordinal += 1;
-        match table.insert(inst_id.as_bytes(), make_symbol_id(VenueId::Okx, ordinal)) {
+        let sym = make_symbol_id(VenueId::Okx, ordinal);
+        let Some(row) = discovery.find(inst_id.as_bytes()).filter(|r| r.live) else {
+            // MISSING — already logged by boot_discovery's coverage
+            // pass; the table just doesn't carry a row for it.
+            continue;
+        };
+        match table.insert(inst_id.as_bytes(), sym, row.inst_type) {
             Ok(()) => {}
             Err(ingress_okx::SymbolTableErr::Full) => {
                 return Err("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments");
@@ -479,7 +573,9 @@ pub fn build_okx_symbol_table(spec: &str) -> Result<ingress_okx::OkxSymbolTable,
 /// covers every configured instrument — the driver batches all
 /// `(channel × instId)` pairs into a single subscribe op (§4.1).
 /// `depth_enabled` adds the 400-level `books` channel per
-/// instrument (`--okx-depth`; capture + integrity only, §4.5).
+/// instrument (`--okx-depth`; capture + integrity only, §4.5). See
+/// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_okx(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
@@ -488,8 +584,16 @@ pub fn spawn_okx(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = PmlrCapture::open(run_dir, "okx", epoch_ns, tap_cfg)?;
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "okx", VenueId::Okx.to_u8())?;
+    }
+    Ok(spawn_or_die(
         thread::Builder::new().name("ingress-okx".into()),
         "ingress-okx",
         move || {
@@ -540,8 +644,10 @@ pub fn spawn_okx(
                     &SHUTDOWN,
                     &status,
                     &mut keepalive,
+                    &mut capture,
                 );
                 tracing::info!(?res, "okx: run-loop returned");
+                mirror_capture_metrics(&capture_metrics, &capture);
                 if matches!(res, owl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -553,9 +659,10 @@ pub fn spawn_okx(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
+            mirror_capture_metrics(&capture_metrics, &capture);
             status.set_state(IngressState::Down);
         },
-    )
+    ))
 }
 
 /// Build the boot-time Deribit `instrument_name → SymbolId` table
@@ -612,7 +719,9 @@ pub fn build_deribit_symbol_table(
 /// all `(channel × instrument)` pairs into a single subscribe call
 /// (§4.2 credit budget). `depth_enabled` adds the change_id-chained
 /// `book.{instr}.100ms` channel per instrument (`--deribit-depth`;
-/// capture + integrity only, §4.5).
+/// capture + integrity only, §4.5). See [`spawn_polymarket`] for the
+/// capture-open / fail-fast contract.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_deribit(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
@@ -621,8 +730,16 @@ pub fn spawn_deribit(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = PmlrCapture::open(run_dir, "deribit", epoch_ns, tap_cfg)?;
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "deribit", VenueId::Deribit.to_u8())?;
+    }
+    Ok(spawn_or_die(
         thread::Builder::new().name("ingress-deribit".into()),
         "ingress-deribit",
         move || {
@@ -673,8 +790,10 @@ pub fn spawn_deribit(
                     &SHUTDOWN,
                     &status,
                     &mut keepalive,
+                    &mut capture,
                 );
                 tracing::info!(?res, "deribit: run-loop returned");
+                mirror_capture_metrics(&capture_metrics, &capture);
                 if matches!(res, dwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -686,9 +805,10 @@ pub fn spawn_deribit(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
+            mirror_capture_metrics(&capture_metrics, &capture);
             status.set_state(IngressState::Down);
         },
-    )
+    ))
 }
 
 /// Build the boot-time Hyperliquid `coin → SymbolId` table from
@@ -738,7 +858,9 @@ pub fn build_hl_coin_table(
 /// thread covers every configured coin — the driver queues one
 /// subscribe frame per `(channel × coin)` pair (no batch form,
 /// §4.3). There is no depth flag: `l2Book` is always subscribed —
-/// it feeds the §6.2 per-coin staleness monitor.
+/// it feeds the §6.2 per-coin staleness monitor. See
+/// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_hyperliquid(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
@@ -746,8 +868,16 @@ pub fn spawn_hyperliquid(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?;
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "hl", VenueId::Hyperliquid.to_u8())?;
+    }
+    Ok(spawn_or_die(
         thread::Builder::new().name("ingress-hyperliquid".into()),
         "ingress-hyperliquid",
         move || {
@@ -803,8 +933,10 @@ pub fn spawn_hyperliquid(
                     &SHUTDOWN,
                     &status,
                     &mut keepalive,
+                    &mut capture,
                 );
                 tracing::info!(?res, "hyperliquid: run-loop returned");
+                mirror_capture_metrics(&capture_metrics, &capture);
                 if matches!(res, hwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -824,20 +956,35 @@ pub fn spawn_hyperliquid(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
+            mirror_capture_metrics(&capture_metrics, &capture);
             status.set_state(IngressState::Down);
         },
-    )
+    ))
 }
 
-/// Spawn the Polygon JSON-RPC ingress thread.
+/// Spawn the Polygon JSON-RPC ingress thread. See [`spawn_polymarket`]
+/// for the capture-open / fail-fast contract.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_rpc(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     mut producer: Producer<Signal, { rwl::DEFAULT_SIGNAL_RING_CAP }>,
     status: Arc<IngressStatus>,
     core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    // No `set_tap_venue_byte` call here: RPC (Polygon newHeads) has no
+    // `core_types::VenueId` — it's a `Signal`/`SignalSource::Rpc`
+    // source, not a market-data venue (`VenueId`'s six variants are
+    // PM/BN/OKX/Deribit/HL/Ai — Ai is the distinct, not-yet-spawned
+    // claude-worker command feed). The tap header's venue byte stays
+    // the `0xFF` "unknown" sentinel; `rpc-raw.tap`'s filename already
+    // self-identifies for the offline tooling.
+    let mut capture = PmlrCapture::open(run_dir, "rpc", epoch_ns, tap_cfg)?;
+    Ok(spawn_or_die(
         thread::Builder::new().name("ingress-rpc".into()),
         "ingress-rpc",
         move || {
@@ -888,8 +1035,10 @@ pub fn spawn_rpc(
                     &SHUTDOWN,
                     &status,
                     &mut keepalive,
+                    &mut capture,
                 );
                 tracing::info!(?res, "rpc: run-loop returned");
+                mirror_capture_metrics(&capture_metrics, &capture);
                 if matches!(res, rwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -901,9 +1050,10 @@ pub fn spawn_rpc(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
+            mirror_capture_metrics(&capture_metrics, &capture);
             status.set_state(IngressState::Down);
         },
-    )
+    ))
 }
 
 /// One parsed `RSS_FEEDS` entry. URL is pre-split into host/path
@@ -1030,6 +1180,105 @@ pub fn spawn_rss(
             tracing::info!("rss: ingress thread exiting");
         },
     )
+}
+
+// ---------------------------------------------------------------
+// Raw-tap flag parsing (--raw-tap / --raw-tap-mode / --raw-tap-budget-mb)
+// ---------------------------------------------------------------
+
+/// Per-venue [`TapCfg`], indexed by the same short capture-venue
+/// labels `PmlrCapture::open` uses (`pm`/`bn`/`okx`/`rpc`/`deribit`/
+/// `hl`). Built by [`parse_raw_tap_flags`] from the `run` command's
+/// `--raw-tap*` flags.
+#[derive(Copy, Clone, Debug)]
+pub struct RawTapConfig {
+    /// Tap config for the Polymarket ingress.
+    pub pm: TapCfg,
+    /// Tap config for the Binance ingress.
+    pub bn: TapCfg,
+    /// Tap config for the OKX ingress.
+    pub okx: TapCfg,
+    /// Tap config for the Polygon RPC ingress.
+    pub rpc: TapCfg,
+    /// Tap config for the Deribit ingress.
+    pub deribit: TapCfg,
+    /// Tap config for the Hyperliquid ingress.
+    pub hl: TapCfg,
+}
+
+/// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
+/// `--raw-tap-budget-mb <u64>` into a [`RawTapConfig`]. `raw_tap`
+/// absent/empty ⇒ every venue gets [`TapCfg::off`] (default: none).
+/// `raw_tap` equal (after trim) to the literal `all` enables every
+/// venue; otherwise it's a comma-separated list of venue labels
+/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`), trimmed, non-empty, no
+/// duplicates. Every enabled venue shares the same `mode` +
+/// `budget_mb` (×1 MiB → `TapCfg::budget_bytes`). Unknown venue
+/// labels and a bad `--raw-tap-mode` value both fail fast at parse —
+/// boot refuses to start with a raw-tap flag it can't honor.
+pub fn parse_raw_tap_flags(
+    raw_tap: Option<&str>,
+    mode: &str,
+    budget_mb: u64,
+) -> Result<RawTapConfig, &'static str> {
+    let tap_mode = match mode {
+        "rejects" => TapMode::Rejects,
+        "all" => TapMode::All,
+        _ => return Err("--raw-tap-mode must be 'rejects' or 'all'"),
+    };
+    let budget_bytes = budget_mb.saturating_mul(1024 * 1024);
+    let enabled_cfg = TapCfg { mode: tap_mode, budget_bytes };
+
+    let mut cfg = RawTapConfig {
+        pm: TapCfg::off(),
+        bn: TapCfg::off(),
+        okx: TapCfg::off(),
+        rpc: TapCfg::off(),
+        deribit: TapCfg::off(),
+        hl: TapCfg::off(),
+    };
+
+    let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Ok(cfg),
+    };
+
+    if spec == "all" {
+        cfg.pm = enabled_cfg;
+        cfg.bn = enabled_cfg;
+        cfg.okx = enabled_cfg;
+        cfg.rpc = enabled_cfg;
+        cfg.deribit = enabled_cfg;
+        cfg.hl = enabled_cfg;
+        return Ok(cfg);
+    }
+
+    let mut seen: [&str; 6] = [""; 6];
+    let mut n_seen = 0usize;
+    for item in spec.split(',') {
+        let label = item.trim();
+        if label.is_empty() {
+            return Err("--raw-tap: empty venue label");
+        }
+        if seen[..n_seen].contains(&label) {
+            return Err("--raw-tap: duplicate venue label");
+        }
+        if n_seen >= seen.len() {
+            return Err("--raw-tap: more venue labels than known venues");
+        }
+        seen[n_seen] = label;
+        n_seen += 1;
+        match label {
+            "pm" => cfg.pm = enabled_cfg,
+            "bn" => cfg.bn = enabled_cfg,
+            "okx" => cfg.okx = enabled_cfg,
+            "rpc" => cfg.rpc = enabled_cfg,
+            "deribit" => cfg.deribit = enabled_cfg,
+            "hl" => cfg.hl = enabled_cfg,
+            _ => return Err("--raw-tap: unknown venue label"),
+        }
+    }
+    Ok(cfg)
 }
 
 // ---------------------------------------------------------------
@@ -1463,6 +1712,28 @@ impl Observability {
             let ingress_hyperliquid = register_ingress_counters(&mut reg, "hyperliquid")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
 
+            // §6.5 capture-health gauges, one pair per spawnable
+            // ingress thread (short capture-venue labels — see
+            // `register_capture_gauges` docs). Registered unconditionally
+            // (matches the `register_ingress_counters` convention above)
+            // so the registry surface is stable regardless of which
+            // optional venues get spawned; unspawned venues simply never
+            // get their gauges set past the zero default.
+            let capture_pm = register_capture_gauges(&mut reg, "pm")?;
+            let capture_bn = register_capture_gauges(&mut reg, "bn")?;
+            let capture_okx = register_capture_gauges(&mut reg, "okx")?;
+            let capture_deribit = register_capture_gauges(&mut reg, "deribit")?;
+            let capture_hyperliquid = register_capture_gauges(&mut reg, "hl")?;
+            let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
+
+            // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
+            // only (BN + RPC have no REST discovery, boot_discovery
+            // module docs).
+            let coverage_pm = register_coverage_gauge(&mut reg, "pm")?;
+            let coverage_okx = register_coverage_gauge(&mut reg, "okx")?;
+            let coverage_deribit = register_coverage_gauge(&mut reg, "deribit")?;
+            let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
+
             out.metrics = Some(Arc::new(reg));
             out.counter_ids = Some(EngineCounters {
                 ticks,
@@ -1495,6 +1766,16 @@ impl Observability {
                 ingress_deribit,
                 ingress_hyperliquid,
                 ingress_rpc,
+                capture_pm,
+                capture_bn,
+                capture_okx,
+                capture_deribit,
+                capture_hyperliquid,
+                capture_rpc,
+                coverage_pm,
+                coverage_okx,
+                coverage_deribit,
+                coverage_hyperliquid,
             });
         }
         if enable_tui {
@@ -1660,6 +1941,28 @@ pub struct EngineCounters {
     pub ingress_hyperliquid: IngressCounterIds,
     /// §6.4 loss-accounting counters, RPC thread.
     pub ingress_rpc: IngressCounterIds,
+    /// §6.5 capture-health gauges, Polymarket thread.
+    pub capture_pm: CaptureGaugeIds,
+    /// §6.5 capture-health gauges, Binance thread.
+    pub capture_bn: CaptureGaugeIds,
+    /// §6.5 capture-health gauges, OKX thread.
+    pub capture_okx: CaptureGaugeIds,
+    /// §6.5 capture-health gauges, Deribit thread.
+    pub capture_deribit: CaptureGaugeIds,
+    /// §6.5 capture-health gauges, Hyperliquid thread.
+    pub capture_hyperliquid: CaptureGaugeIds,
+    /// §6.5 capture-health gauges, RPC thread.
+    pub capture_rpc: CaptureGaugeIds,
+    /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
+    pub coverage_pm: GaugeId,
+    /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
+    pub coverage_okx: GaugeId,
+    /// §6.1 boot-discovery coverage gauge, Deribit (0 when
+    /// unconfigured).
+    pub coverage_deribit: GaugeId,
+    /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
+    /// unconfigured).
+    pub coverage_hyperliquid: GaugeId,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -1680,6 +1983,85 @@ pub struct IngressCounterIds {
     pub reconnects: core_metrics::CounterId,
     /// Ring `try_push` failures (D4).
     pub ring_drops: core_metrics::CounterId,
+}
+
+// ---------------------------------------------------------------
+// §6.5 capture metrics — set from inside the spawn wrapper thread
+// ---------------------------------------------------------------
+//
+// `PmlrCapture` is moved into each ingress thread's closure (Part B)
+// and never shared — unlike `IngressStatus`, there is no cross-thread
+// handle the central engine loop could read from to mirror these
+// gauges centrally (see `mirror_ingress_counters`). Each spawn
+// wrapper therefore mirrors its own capture health directly via the
+// registry handle it's handed at spawn time.
+
+/// Registry gauge handles for one ingress thread's §6.5 capture
+/// health: `PmlrCapture::io_errors()` and the summed record count
+/// (`ticks_written + events_written + signals_written + tap_records`).
+#[derive(Copy, Clone, Debug)]
+pub struct CaptureGaugeIds {
+    /// Mirrors `PmlrCapture::io_errors()`. Nonzero ⇒ capture
+    /// sticky-disabled itself (module docs, core-io) — should be
+    /// treated as a soak-verdict red flag even though the market-data
+    /// session itself is unaffected.
+    pub io_errors: GaugeId,
+    /// Mirrors `ticks_written() + events_written() + signals_written()
+    /// + tap_records()` — total records staged since the capture was
+    /// opened (monotonic snapshot, not a delta).
+    pub records: GaugeId,
+}
+
+/// Registry handle + gauge ids for one ingress thread's §6.5 capture
+/// metrics. `None` when `--metrics` (and `--tui`, which implies it)
+/// are both off, in which case the spawn wrapper skips the gauge
+/// writes entirely.
+pub type CaptureMetrics = Option<(Arc<MetricsRegistry>, CaptureGaugeIds)>;
+
+/// Mirror one ingress thread's §6.5 capture health into its two
+/// registry gauges. Called from inside the spawn wrapper thread
+/// itself, right after every `run(...)` return and once more before
+/// the thread exits — see [`CaptureMetrics`] docs for why this can't
+/// be done centrally.
+fn mirror_capture_metrics(metrics: &CaptureMetrics, capture: &PmlrCapture) {
+    if let Some((reg, ids)) = metrics.as_ref() {
+        reg.gauge(ids.io_errors).set(capture.io_errors() as i64);
+        let records = capture.ticks_written()
+            + capture.events_written()
+            + capture.signals_written()
+            + capture.tap_records();
+        reg.gauge(ids.records).set(records as i64);
+    }
+}
+
+/// Register the [`CaptureGaugeIds`] pair for one venue. Boot-only.
+/// Uses the short capture venue label (`pm`/`bn`/`okx`/`rpc`/
+/// `deribit`/`hl` — [`PmlrCapture::open`]'s `venue_label`) rather than
+/// the long form `register_ingress_counters` uses, so a gauge name
+/// and its capture files always agree on the venue string.
+fn register_capture_gauges(
+    reg: &mut MetricsRegistry,
+    venue_label: &str,
+) -> Result<CaptureGaugeIds, &'static str> {
+    let io_errors = reg
+        .register_gauge(&format!("engine_ingress_{venue_label}_capture_io_errors"))
+        .map_err(|_| "register capture io_errors gauge")?;
+    let records = reg
+        .register_gauge(&format!("engine_ingress_{venue_label}_capture_records"))
+        .map_err(|_| "register capture records gauge")?;
+    Ok(CaptureGaugeIds { io_errors, records })
+}
+
+/// Register the `engine_ingress_<venue>_coverage_configured` gauge
+/// for one Phase-8e boot-discovery venue (`pm`/`okx`/`deribit`/`hl` —
+/// BN and RPC have no REST discovery, see `boot_discovery` module
+/// docs). Boot-only.
+fn register_coverage_gauge(
+    reg: &mut MetricsRegistry,
+    venue_label: &str,
+) -> Result<GaugeId, &'static str> {
+    reg.register_gauge(&format!("engine_ingress_{venue_label}_coverage_configured"))
+        .map_err(|_| "register coverage_configured gauge")
 }
 
 /// Last-mirrored cumulative values for one ingress — the registry
@@ -1965,13 +2347,18 @@ where
                 state.p99_ns[2] = eng.ack_p99_ns();
                 // Ingest health from the real status slots (D7):
                 // bit0 = polymarket, bit1 = binance, bit2 = rpc,
-                // bit3 = rss; bit set iff the thread is Up.
+                // bit3 = rss, bit4 = okx, bit5 = deribit, bit6 = hl
+                // (8e — appended; existing bits never renumber); bit
+                // set iff the thread is Up.
                 state.ingest_health = match obs.ingress.as_ref() {
                     Some(ing) => {
                         (u8::from(ing.polymarket.state() == IngressState::Up))
                             | (u8::from(ing.binance.state() == IngressState::Up) << 1)
                             | (u8::from(ing.rpc.state() == IngressState::Up) << 2)
                             | (u8::from(ing.rss.state() == IngressState::Up) << 3)
+                            | (u8::from(ing.okx.state() == IngressState::Up) << 4)
+                            | (u8::from(ing.deribit.state() == IngressState::Up) << 5)
+                            | (u8::from(ing.hyperliquid.state() == IngressState::Up) << 6)
                     }
                     None => 0,
                 };
@@ -2130,6 +2517,547 @@ fn log_pin_outcome(thread_label: &str, core_id: usize) {
 }
 
 // ---------------------------------------------------------------
+// Phase-8e boot REST discovery (plan §6.1)
+// ---------------------------------------------------------------
+
+/// Boot-only venue REST discovery: validates every `--okx-symbols` /
+/// `--deribit-symbols` / `--hl-coins` / `--polymarket-asset-id` entry
+/// against the venue's live instrument universe *before* any ingress
+/// thread spawns, and (OKX only) builds the discovery-gated
+/// [`ingress_okx::OkxSymbolTable`] `build_okx_symbol_table` now
+/// requires.
+///
+/// BN + RPC deliberately have no discovery here: Binance discovery is
+/// out of Phase-8 scope (plan §6.1), and Polygon RPC has no
+/// instrument universe to validate against (it streams block headers,
+/// not a tradable-instrument list).
+///
+/// Network calls (`run_all` and its per-venue helpers) are not unit
+/// tested — they need a live socket. The MISSING-detection decision
+/// logic each of them drives (`okx_missing_reason` /
+/// `deribit_missing_reason` / `hl_missing_reason` / `pm_missing_reason`)
+/// is pure and fully covered by `mod tests` below using tiny inline
+/// fixtures fed through the same `ingest_*` parsers the network path
+/// uses.
+pub mod boot_discovery {
+    use std::ops::Range;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use core_config::Config;
+    use ingress_deribit::discovery::DeribitDiscovery;
+    use ingress_hyperliquid::discovery::HlDiscovery;
+    use ingress_okx::discovery::OkxDiscovery;
+    use ingress_polymarket::discovery::PmDiscovery;
+
+    use super::split_host_port;
+
+    /// UA string for every boot-discovery fetch.
+    const USER_AGENT: &[u8] = b"multivenue-engine/8e";
+    /// Shared body cap — OKX's SPOT page alone is ~1.45 MB live.
+    const MAX_BODY: usize = 8 * 1024 * 1024;
+    /// Per-fetch deadline (connect + TLS + request + full response).
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Why a configured symbol failed venue validation. Always a
+    /// short machine-grep-able token, logged as the `reason` field.
+    pub type MissingReason = &'static str;
+
+    /// Configured / matched / venue-universe counts for one venue's
+    /// coverage line + `..._coverage_configured` gauge.
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct VenueCoverage {
+        /// Symbols the operator configured for this venue.
+        pub configured: u32,
+        /// Of those, how many resolved live on the venue.
+        pub matched: u32,
+        /// Venue universe size (`universe_live()` for okx/deribit,
+        /// `universe_total()` for hl/pm — see each venue's bullet in
+        /// the phase-8e plan §6.1).
+        pub universe: u32,
+    }
+
+    /// Everything [`run_all`] produces, consumed by the cli's `run()`
+    /// before any ingress thread spawns.
+    pub struct Outcome {
+        /// True if ANY configured symbol, across every venue this
+        /// pass touched, failed to validate. The caller's fail-fast
+        /// decision (fatal in `--live`, a warning in `--paper`) is a
+        /// single global check on this flag — not per-venue.
+        pub any_missing: bool,
+        /// Polymarket coverage (discovery always runs — the asset id
+        /// is a required flag).
+        pub pm: VenueCoverage,
+        /// OKX coverage; `None` when `--okx-symbols` is unset.
+        pub okx: Option<VenueCoverage>,
+        /// The discovery-gated OKX symbol table, built here because
+        /// `build_okx_symbol_table` needs the discovered `instType`
+        /// per instrument. `Some` iff `okx` is `Some`.
+        pub okx_table: Option<ingress_okx::OkxSymbolTable>,
+        /// Deribit coverage; `None` when `--deribit-symbols` is unset.
+        /// Deribit's symbol table is still built by
+        /// [`super::build_deribit_symbol_table`] exactly as before —
+        /// unlike OKX it doesn't need discovery data to construct.
+        pub deribit: Option<VenueCoverage>,
+        /// Hyperliquid coverage; `None` when `--hl-coins` is unset.
+        /// Hyperliquid's coin table is still built by
+        /// [`super::build_hl_coin_table`] exactly as before.
+        pub hl: Option<VenueCoverage>,
+    }
+
+    // -----------------------------------------------------------
+    // Pure decision logic — unit tested below, no network involved.
+    // -----------------------------------------------------------
+
+    /// `None` ⇒ `inst_id` is live on OKX. `Some(reason)` ⇒ MISSING.
+    pub fn okx_missing_reason(d: &OkxDiscovery, inst_id: &[u8]) -> Option<MissingReason> {
+        match d.find(inst_id) {
+            None => Some("not_found"),
+            Some(row) if !row.live => Some("not_live"),
+            Some(_) => None,
+        }
+    }
+
+    /// `None` ⇒ `instrument` is live on Deribit. `Some(reason)` ⇒
+    /// MISSING.
+    pub fn deribit_missing_reason(
+        d: &DeribitDiscovery,
+        instrument: &[u8],
+    ) -> Option<MissingReason> {
+        match d.find(instrument) {
+            None => Some("not_found"),
+            Some(row) if !row.live => Some("not_live"),
+            Some(_) => None,
+        }
+    }
+
+    /// `None` ⇒ `coin` resolves on Hyperliquid. `Some(reason)` ⇒
+    /// MISSING. Hyperliquid's `resolve` has no separate liveness flag
+    /// (module docs) — found is live.
+    pub fn hl_missing_reason(d: &HlDiscovery, coin: &[u8]) -> Option<MissingReason> {
+        match d.resolve(coin) {
+            None => Some("not_found"),
+            Some(_) => None,
+        }
+    }
+
+    /// `None` ⇒ `token` (the CLOB asset id) is a tradable market on
+    /// Polymarket. `Some(reason)` ⇒ MISSING, naming which flag failed
+    /// (plan §6.1: "log which flag failed").
+    pub fn pm_missing_reason(d: &PmDiscovery, token: &[u8]) -> Option<MissingReason> {
+        match d.find_by_token(token) {
+            None => Some("not_found"),
+            Some(row) if row.closed => Some("closed"),
+            Some(row) if !row.active => Some("not_active"),
+            Some(row) if !row.accepting_orders => Some("not_accepting_orders"),
+            Some(row) if !row.enable_order_book => Some("no_order_book"),
+            Some(_) => None,
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Network fetch helpers
+    // -----------------------------------------------------------
+
+    fn get(
+        tls: &Arc<rustls::ClientConfig>,
+        host: &str,
+        port: u16,
+        path: &str,
+        buf: &mut Vec<u8>,
+    ) -> Result<Range<usize>, core_net::boot_http::BootHttpErr> {
+        core_net::boot_http::https_get(tls, host, port, path, USER_AGENT, buf, MAX_BODY, FETCH_TIMEOUT)
+    }
+
+    fn post(
+        tls: &Arc<rustls::ClientConfig>,
+        host: &str,
+        port: u16,
+        path: &str,
+        body: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> Result<Range<usize>, core_net::boot_http::BootHttpErr> {
+        core_net::boot_http::https_post(
+            tls,
+            host,
+            port,
+            path,
+            USER_AGENT,
+            b"application/json",
+            body,
+            buf,
+            MAX_BODY,
+            FETCH_TIMEOUT,
+        )
+    }
+
+    // -----------------------------------------------------------
+    // Per-venue orchestration — network + logging; not unit tested.
+    // -----------------------------------------------------------
+
+    fn run_pm(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        asset_id: &str,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<VenueCoverage, &'static str> {
+        let (host, port) = split_host_port(&cfg.polymarket_gamma_host, 443)?;
+        let path = format!("/markets?clob_token_ids={asset_id}");
+        let range = get(tls, host, port, &path, buf).map_err(|e| {
+            tracing::error!(venue = "pm", error = ?e, "discovery: fetch failed");
+            "pm: discovery fetch failed"
+        })?;
+        let mut d = PmDiscovery::new();
+        d.ingest_body(&buf[range]).map_err(|e| {
+            tracing::error!(venue = "pm", error = ?e, "discovery: parse failed");
+            "pm: discovery parse failed"
+        })?;
+
+        let mut matched = 0u32;
+        match pm_missing_reason(&d, asset_id.as_bytes()) {
+            None => {
+                matched = 1;
+                // pm_missing_reason == None guarantees find_by_token hits.
+                if let Some(row) = d.find_by_token(asset_id.as_bytes()) {
+                    let sibling = d
+                        .sibling_of(asset_id.as_bytes())
+                        .map(|s| String::from_utf8_lossy(s).into_owned());
+                    tracing::info!(
+                        venue = "pm",
+                        asset_id,
+                        sibling,
+                        neg_risk = row.neg_risk,
+                        tick_1e9 = row.order_price_min_tick_1e9,
+                        min_size_1e6 = row.order_min_size_1e6,
+                        "discovery: pm market resolved"
+                    );
+                }
+            }
+            Some(reason) => {
+                *any_missing = true;
+                tracing::error!(
+                    venue = "pm",
+                    symbol = asset_id,
+                    reason,
+                    "discovery: configured symbol missing from venue universe"
+                );
+            }
+        }
+        let universe = d.universe_total();
+        tracing::info!(venue = "pm", configured = 1, matched, universe, "discovery: coverage");
+        Ok(VenueCoverage { configured: 1, matched, universe })
+    }
+
+    fn run_okx(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        spec: &str,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<(VenueCoverage, ingress_okx::OkxSymbolTable), &'static str> {
+        let (host, port) = split_host_port(&cfg.okx_rest_host, 443)?;
+        let mut d = OkxDiscovery::new();
+        for (i, page) in ["SPOT", "SWAP", "FUTURES"].iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            let path = format!("/api/v5/public/instruments?instType={page}");
+            let range = get(tls, host, port, &path, buf).map_err(|e| {
+                tracing::error!(venue = "okx", page = %page, error = ?e, "discovery: fetch failed");
+                "okx: discovery fetch failed"
+            })?;
+            d.ingest_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "okx", page = %page, error = ?e, "discovery: parse failed");
+                "okx: discovery parse failed"
+            })?;
+        }
+
+        let configured: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let mut matched = 0u32;
+        for inst in &configured {
+            match okx_missing_reason(&d, inst.as_bytes()) {
+                None => matched += 1,
+                Some(reason) => {
+                    *any_missing = true;
+                    tracing::error!(
+                        venue = "okx",
+                        symbol = *inst,
+                        reason,
+                        "discovery: configured symbol missing from venue universe"
+                    );
+                }
+            }
+        }
+        let universe = d.universe_live();
+        tracing::info!(venue = "okx", configured = configured.len(), matched, universe, "discovery: coverage");
+
+        let table = super::build_okx_symbol_table(spec, &d)?;
+        Ok((VenueCoverage { configured: configured.len() as u32, matched, universe }, table))
+    }
+
+    fn run_deribit(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        spec: &str,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<VenueCoverage, &'static str> {
+        let (host, port) = split_host_port(&cfg.deribit_rest_host, 443)?;
+        let mut d = DeribitDiscovery::new();
+        for (i, ccy) in ["BTC", "ETH", "USDC"].iter().enumerate() {
+            if i > 0 {
+                // Venue rate-limits public/get_instruments to 1 req/s.
+                std::thread::sleep(Duration::from_millis(1050));
+            }
+            let path = format!("/api/v2/public/get_instruments?currency={ccy}&kind=future");
+            let range = get(tls, host, port, &path, buf).map_err(|e| {
+                tracing::error!(venue = "deribit", currency = %ccy, error = ?e, "discovery: fetch failed");
+                "deribit: discovery fetch failed"
+            })?;
+            d.ingest_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "deribit", currency = %ccy, error = ?e, "discovery: parse failed");
+                "deribit: discovery parse failed"
+            })?;
+        }
+
+        let configured: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let mut matched = 0u32;
+        for instr in &configured {
+            match deribit_missing_reason(&d, instr.as_bytes()) {
+                None => matched += 1,
+                Some(reason) => {
+                    *any_missing = true;
+                    tracing::error!(
+                        venue = "deribit",
+                        symbol = *instr,
+                        reason,
+                        "discovery: configured symbol missing from venue universe"
+                    );
+                }
+            }
+        }
+        let universe = d.universe_live();
+        tracing::info!(venue = "deribit", configured = configured.len(), matched, universe, "discovery: coverage");
+        Ok(VenueCoverage { configured: configured.len() as u32, matched, universe })
+    }
+
+    fn run_hl(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        spec: &str,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<VenueCoverage, &'static str> {
+        let (host, port) = split_host_port(&cfg.hyperliquid_api_host, 443)?;
+        let mut d = HlDiscovery::new();
+
+        let requests: [(&str, &[u8]); 4] = [
+            ("meta", br#"{"type":"meta"}"#),
+            ("spotMeta", br#"{"type":"spotMeta"}"#),
+            ("perpDexs", br#"{"type":"perpDexs"}"#),
+            ("outcomeMeta", br#"{"type":"outcomeMeta"}"#),
+        ];
+        for (i, (label, body)) in requests.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let range = post(tls, host, port, "/info", body, buf).map_err(|e| {
+                tracing::error!(venue = "hl", request = %label, error = ?e, "discovery: fetch failed");
+                "hl: discovery fetch failed"
+            })?;
+            let parsed = match *label {
+                "meta" => d.ingest_meta(&buf[range]),
+                "spotMeta" => d.ingest_spot_meta(&buf[range]),
+                "perpDexs" => d.ingest_perp_dexs(&buf[range]),
+                "outcomeMeta" => d.ingest_outcome_meta(&buf[range]),
+                _ => unreachable!("requests array is a fixed literal"),
+            };
+            parsed.map_err(|e| {
+                tracing::error!(venue = "hl", request = %label, error = ?e, "discovery: parse failed");
+                "hl: discovery parse failed"
+            })?;
+        }
+
+        let configured: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let mut matched = 0u32;
+        for coin in &configured {
+            match d.resolve(coin.as_bytes()) {
+                Some(info) => {
+                    matched += 1;
+                    tracing::debug!(
+                        venue = "hl",
+                        coin = *coin,
+                        asset_id = info.asset_id,
+                        kind = ?info.kind,
+                        "discovery: hl asset resolved"
+                    );
+                }
+                None => {
+                    *any_missing = true;
+                    tracing::error!(
+                        venue = "hl",
+                        symbol = *coin,
+                        reason = "not_found",
+                        "discovery: configured symbol missing from venue universe"
+                    );
+                }
+            }
+        }
+        let universe = d.universe_total();
+        tracing::info!(venue = "hl", configured = configured.len(), matched, universe, "discovery: coverage");
+        Ok(VenueCoverage { configured: configured.len() as u32, matched, universe })
+    }
+
+    /// Run the full Phase-8e boot discovery pass: OKX (if
+    /// `okx_spec` is configured), Deribit (if `deribit_spec` is
+    /// configured), Hyperliquid (if `hl_spec` is configured), then
+    /// Polymarket (always). One reused `Vec<u8>` buffer carries every
+    /// fetch's response body. Any fetch/parse failure is FATAL —
+    /// returned as `Err` for the caller to log + exit non-zero; a
+    /// MISSING symbol is not itself an `Err` here (see
+    /// [`Outcome::any_missing`] — the caller decides paper-vs-live).
+    pub fn run_all(
+        cfg: &Config,
+        tls_config: &Arc<rustls::ClientConfig>,
+        okx_spec: Option<&str>,
+        deribit_spec: Option<&str>,
+        hl_spec: Option<&str>,
+        polymarket_asset_id: &str,
+    ) -> Result<Outcome, &'static str> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut any_missing = false;
+
+        let (okx, okx_table) = match okx_spec.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => {
+                let (cov, table) = run_okx(cfg, tls_config, spec, &mut buf, &mut any_missing)?;
+                (Some(cov), Some(table))
+            }
+            None => (None, None),
+        };
+
+        let deribit = match deribit_spec.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => Some(run_deribit(cfg, tls_config, spec, &mut buf, &mut any_missing)?),
+            None => None,
+        };
+
+        let hl = match hl_spec.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(spec) => Some(run_hl(cfg, tls_config, spec, &mut buf, &mut any_missing)?),
+            None => None,
+        };
+
+        let pm = run_pm(cfg, tls_config, polymarket_asset_id, &mut buf, &mut any_missing)?;
+
+        Ok(Outcome { any_missing, pm, okx, okx_table, deribit, hl })
+    }
+
+    // -----------------------------------------------------------
+    // Tests — pure decision logic only, no network (see module docs).
+    // -----------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn okx_fixture() -> OkxDiscovery {
+            let mut d = OkxDiscovery::new();
+            d.ingest_body(
+                br#"{"code":"0","data":[
+                  {"instId":"BTC-USDT","instType":"SPOT","state":"live","tickSz":"0.1","lotSz":"0.01","ctVal":""},
+                  {"instId":"DEAD-USDT","instType":"SPOT","state":"suspend","tickSz":"0.1","lotSz":"0.01","ctVal":""}
+                ],"msg":""}"#,
+            )
+            .unwrap();
+            d
+        }
+
+        #[test]
+        fn okx_missing_reason_covers_found_not_live_and_absent() {
+            let d = okx_fixture();
+            assert_eq!(okx_missing_reason(&d, b"BTC-USDT"), None);
+            assert_eq!(okx_missing_reason(&d, b"DEAD-USDT"), Some("not_live"));
+            assert_eq!(okx_missing_reason(&d, b"NOPE-USDT"), Some("not_found"));
+        }
+
+        fn deribit_fixture() -> DeribitDiscovery {
+            let mut d = DeribitDiscovery::new();
+            d.ingest_body(
+                br#"{"jsonrpc":"2.0","result":[
+                  {"instrument_name":"BTC-PERPETUAL","kind":"future","is_active":true,"state":"open","settlement_period":"perpetual","tick_size":0.5,"contract_size":10.0,"min_trade_amount":10.0},
+                  {"instrument_name":"DEAD-PERPETUAL","kind":"future","is_active":false,"state":"open","settlement_period":"perpetual","tick_size":0.5,"contract_size":10.0,"min_trade_amount":10.0}
+                ],"usIn":1,"usOut":2,"usDiff":1,"testnet":false}"#,
+            )
+            .unwrap();
+            d
+        }
+
+        #[test]
+        fn deribit_missing_reason_covers_found_not_live_and_absent() {
+            let d = deribit_fixture();
+            assert_eq!(deribit_missing_reason(&d, b"BTC-PERPETUAL"), None);
+            assert_eq!(
+                deribit_missing_reason(&d, b"DEAD-PERPETUAL"),
+                Some("not_live")
+            );
+            assert_eq!(
+                deribit_missing_reason(&d, b"NOPE-PERPETUAL"),
+                Some("not_found")
+            );
+        }
+
+        fn hl_fixture() -> HlDiscovery {
+            let mut d = HlDiscovery::new();
+            d.ingest_meta(br#"{"universe":[{"name":"BTC","szDecimals":5}]}"#)
+                .unwrap();
+            d
+        }
+
+        #[test]
+        fn hl_missing_reason_covers_found_and_absent() {
+            let d = hl_fixture();
+            assert_eq!(hl_missing_reason(&d, b"BTC"), None);
+            assert_eq!(hl_missing_reason(&d, b"NOPE"), Some("not_found"));
+        }
+
+        fn pm_fixture() -> PmDiscovery {
+            let mut d = PmDiscovery::new();
+            d.ingest_body(
+                br#"[{"clobTokenIds":"[\"11111111112222222222\"]","conditionId":"0xab","active":true,"closed":false,"acceptingOrders":true,"enableOrderBook":true},
+                     {"clobTokenIds":"[\"33333333334444444444\"]","conditionId":"0xcd","active":false,"closed":false,"acceptingOrders":true,"enableOrderBook":true},
+                     {"clobTokenIds":"[\"55555555556666666666\"]","conditionId":"0xef","active":true,"closed":true,"acceptingOrders":true,"enableOrderBook":true},
+                     {"clobTokenIds":"[\"77777777778888888888\"]","conditionId":"0x12","active":true,"closed":false,"acceptingOrders":false,"enableOrderBook":true},
+                     {"clobTokenIds":"[\"99999999990000000000\"]","conditionId":"0x34","active":true,"closed":false,"acceptingOrders":true,"enableOrderBook":false}]"#,
+            )
+            .unwrap();
+            d
+        }
+
+        #[test]
+        fn pm_missing_reason_covers_every_gating_flag_and_absent() {
+            let d = pm_fixture();
+            assert_eq!(pm_missing_reason(&d, b"11111111112222222222"), None);
+            assert_eq!(
+                pm_missing_reason(&d, b"33333333334444444444"),
+                Some("not_active")
+            );
+            assert_eq!(
+                pm_missing_reason(&d, b"55555555556666666666"),
+                Some("closed")
+            );
+            assert_eq!(
+                pm_missing_reason(&d, b"77777777778888888888"),
+                Some("not_accepting_orders")
+            );
+            assert_eq!(
+                pm_missing_reason(&d, b"99999999990000000000"),
+                Some("no_order_book")
+            );
+            assert_eq!(pm_missing_reason(&d, b"00000000000000000000"), Some("not_found"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
@@ -2237,11 +3165,38 @@ mod tests {
         join_reverse(Vec::new());
     }
 
+    /// Build a tiny [`ingress_okx::discovery::OkxDiscovery`] fixture
+    /// from `(instId, instType, live)` rows — mirrors the fixture
+    /// shape used by `ingress-okx/src/discovery.rs`'s own tests, kept
+    /// inline here so `build_okx_symbol_table` tests never touch the
+    /// network.
+    fn okx_discovery_fixture(rows: &[(&str, &str, bool)]) -> ingress_okx::discovery::OkxDiscovery {
+        let mut body = String::from(r#"{"code":"0","data":["#);
+        for (i, (inst_id, inst_type, live)) in rows.iter().enumerate() {
+            if i > 0 {
+                body.push(',');
+            }
+            let state = if *live { "live" } else { "suspend" };
+            body.push_str(&format!(
+                r#"{{"instId":"{inst_id}","instType":"{inst_type}","state":"{state}","tickSz":"0.1","lotSz":"0.01","ctVal":"0.01"}}"#
+            ));
+        }
+        body.push_str(r#"],"msg":""}"#);
+        let mut d = ingress_okx::discovery::OkxDiscovery::new();
+        d.ingest_body(body.as_bytes()).expect("fixture body must parse");
+        d
+    }
+
     /// Happy path: `--okx-symbols` items get 1-based, flag-ordered
-    /// ordinals under the Okx venue byte, with whitespace trimmed.
+    /// ordinals under the Okx venue byte, with whitespace trimmed,
+    /// and each row's `OkxInstType` comes from discovery.
     #[test]
     fn okx_symbol_table_allocates_flag_ordered_ids() {
-        let t = build_okx_symbol_table("BTC-USDT, ETH-USD-SWAP").unwrap();
+        let d = okx_discovery_fixture(&[
+            ("BTC-USDT", "SPOT", true),
+            ("ETH-USD-SWAP", "SWAP", true),
+        ]);
+        let t = build_okx_symbol_table("BTC-USDT, ETH-USD-SWAP", &d).unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(
             t.lookup(b"BTC-USDT"),
@@ -2252,38 +3207,77 @@ mod tests {
             Some(make_symbol_id(VenueId::Okx, 2))
         );
         assert_eq!(t.lookup(b"XRP-USDT"), None);
+        assert_eq!(
+            t.get(0).map(|(_, _, ty)| ty),
+            Some(ingress_okx::OkxInstType::Spot)
+        );
+        assert_eq!(
+            t.get(1).map(|(_, _, ty)| ty),
+            Some(ingress_okx::OkxInstType::Swap)
+        );
+    }
+
+    /// A configured instrument the venue doesn't list live (either
+    /// absent entirely or `state != "live"`) is skipped rather than
+    /// failing the whole boot — the coverage pass upstream already
+    /// logged it as MISSING. Ordinal allocation still advances past
+    /// it (flag order stays stable regardless of venue availability).
+    #[test]
+    fn okx_symbol_table_skips_symbols_missing_from_discovery() {
+        let d = okx_discovery_fixture(&[
+            ("BTC-USDT", "SPOT", true),
+            ("DEAD-USDT", "SPOT", false), // not live
+            // NOPE-USDT is entirely absent from the fixture.
+        ]);
+        let t = build_okx_symbol_table("BTC-USDT,DEAD-USDT,NOPE-USDT", &d).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            t.lookup(b"BTC-USDT"),
+            Some(make_symbol_id(VenueId::Okx, 1))
+        );
+        assert_eq!(t.lookup(b"DEAD-USDT"), None);
+        assert_eq!(t.lookup(b"NOPE-USDT"), None);
     }
 
     /// Failure modes: empty item, duplicate instId, and more than
-    /// `OKX_MAX_SYMBOLS` instruments all refuse boot.
+    /// `OKX_MAX_SYMBOLS` instruments all refuse boot — independent of
+    /// what discovery knows about (an empty fixture is enough).
     #[test]
     fn okx_symbol_table_rejects_bad_specs() {
         // Trailing comma ⇒ empty item.
+        let empty = okx_discovery_fixture(&[]);
         assert_eq!(
-            build_okx_symbol_table("BTC-USDT,").err(),
+            build_okx_symbol_table("BTC-USDT,", &empty).err(),
             Some("okx: empty instId in --okx-symbols")
         );
-        // Duplicate instId (whitespace doesn't disguise it).
+        // Duplicate instId (whitespace doesn't disguise it) — flagged
+        // even though neither is in the (empty) discovery fixture.
         assert_eq!(
-            build_okx_symbol_table("BTC-USDT,ETH-USDT, BTC-USDT").err(),
+            build_okx_symbol_table("BTC-USDT,ETH-USDT, BTC-USDT", &empty).err(),
             Some("okx: duplicate instId in --okx-symbols")
         );
         // OKX_MAX_SYMBOLS + 1 distinct instruments ⇒ Full.
         let mut spec = String::new();
+        let mut rows: Vec<(String, &str, bool)> = Vec::new();
         for i in 0..=ingress_okx::OKX_MAX_SYMBOLS {
             if i > 0 {
                 spec.push(',');
             }
-            spec.push_str(&format!("S{i}-USDT"));
+            let inst = format!("S{i}-USDT");
+            spec.push_str(&inst);
+            rows.push((inst, "SPOT", true));
         }
+        let rows_ref: Vec<(&str, &str, bool)> =
+            rows.iter().map(|(a, b, c)| (a.as_str(), *b, *c)).collect();
+        let full = okx_discovery_fixture(&rows_ref);
         assert_eq!(
-            build_okx_symbol_table(&spec).err(),
+            build_okx_symbol_table(&spec, &full).err(),
             Some("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments")
         );
         // Exactly OKX_MAX_SYMBOLS is still fine.
         let max_spec = spec.rsplit_once(',').unwrap().0;
         assert_eq!(
-            build_okx_symbol_table(max_spec).unwrap().len(),
+            build_okx_symbol_table(max_spec, &full).unwrap().len(),
             ingress_okx::OKX_MAX_SYMBOLS
         );
     }
@@ -2406,5 +3400,124 @@ mod tests {
             build_hl_coin_table(max_spec).unwrap().len(),
             ingress_hyperliquid::HL_MAX_COINS
         );
+    }
+
+    // -----------------------------------------------------------
+    // parse_raw_tap_flags (Part B.3 — --raw-tap / --raw-tap-mode /
+    // --raw-tap-budget-mb)
+    // -----------------------------------------------------------
+
+    /// No `--raw-tap` ⇒ every venue's tap stays off, regardless of
+    /// the (clap-default) `--raw-tap-mode` / `--raw-tap-budget-mb`.
+    #[test]
+    fn raw_tap_flags_default_to_off() {
+        let cfg = parse_raw_tap_flags(None, "rejects", 64).unwrap();
+        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl] {
+            assert_eq!(c.mode, TapMode::Off);
+            assert_eq!(c.budget_bytes, 0);
+        }
+    }
+
+    /// An empty (or all-whitespace) `--raw-tap` value behaves exactly
+    /// like it being absent.
+    #[test]
+    fn raw_tap_flags_empty_string_is_off() {
+        let cfg = parse_raw_tap_flags(Some("   "), "rejects", 64).unwrap();
+        assert_eq!(cfg.okx.mode, TapMode::Off);
+        assert_eq!(cfg.okx.budget_bytes, 0);
+    }
+
+    /// `--raw-tap all` enables every venue with the shared mode +
+    /// budget.
+    #[test]
+    fn raw_tap_flags_all_enables_every_venue() {
+        let cfg = parse_raw_tap_flags(Some("all"), "all", 8).unwrap();
+        let want_bytes = 8 * 1024 * 1024;
+        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl] {
+            assert_eq!(c.mode, TapMode::All);
+            assert_eq!(c.budget_bytes, want_bytes);
+        }
+    }
+
+    /// A CSV subset enables only the named venues (whitespace
+    /// trimmed); unnamed venues stay off.
+    #[test]
+    fn raw_tap_flags_csv_subset_enables_only_named_venues() {
+        let cfg = parse_raw_tap_flags(Some(" pm, okx "), "rejects", 32).unwrap();
+        let want_bytes = 32 * 1024 * 1024;
+        assert_eq!(cfg.pm.mode, TapMode::Rejects);
+        assert_eq!(cfg.pm.budget_bytes, want_bytes);
+        assert_eq!(cfg.okx.mode, TapMode::Rejects);
+        assert_eq!(cfg.okx.budget_bytes, want_bytes);
+        for c in [cfg.bn, cfg.rpc, cfg.deribit, cfg.hl] {
+            assert_eq!(c.mode, TapMode::Off);
+            assert_eq!(c.budget_bytes, 0);
+        }
+    }
+
+    /// Every known capture-venue label is accepted in one CSV.
+    #[test]
+    fn raw_tap_flags_every_known_venue_label_accepted() {
+        let cfg = parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl"), "all", 1).unwrap();
+        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl] {
+            assert_eq!(c.mode, TapMode::All);
+        }
+    }
+
+    /// `rss` is not a capture-bearing venue label (the RSS ingress
+    /// owns no `PmlrCapture`, §6.5) — it must be rejected like any
+    /// other unknown label, not silently ignored.
+    #[test]
+    fn raw_tap_flags_rejects_rss_label() {
+        assert_eq!(
+            parse_raw_tap_flags(Some("rss"), "rejects", 64).err(),
+            Some("--raw-tap: unknown venue label")
+        );
+    }
+
+    /// Failure modes: unknown label, duplicate label, an empty item
+    /// (trailing comma), and a bad `--raw-tap-mode` value all refuse
+    /// to build a config.
+    #[test]
+    fn raw_tap_flags_rejects_bad_specs() {
+        assert_eq!(
+            parse_raw_tap_flags(Some("bogus"), "rejects", 64).err(),
+            Some("--raw-tap: unknown venue label")
+        );
+        assert_eq!(
+            parse_raw_tap_flags(Some("pm,pm"), "rejects", 64).err(),
+            Some("--raw-tap: duplicate venue label")
+        );
+        assert_eq!(
+            parse_raw_tap_flags(Some("pm,"), "rejects", 64).err(),
+            Some("--raw-tap: empty venue label")
+        );
+        assert_eq!(
+            parse_raw_tap_flags(Some("pm"), "loud", 64).err(),
+            Some("--raw-tap-mode must be 'rejects' or 'all'")
+        );
+    }
+
+    /// More than six comma-separated labels trips the defensive
+    /// capacity guard — there are only six known venues, so this
+    /// branch is a pure defense-in-depth backstop reached here by
+    /// listing all six plus a seventh item.
+    #[test]
+    fn raw_tap_flags_rejects_more_labels_than_known_venues() {
+        assert_eq!(
+            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,pm2"), "rejects", 64).err(),
+            Some("--raw-tap: more venue labels than known venues")
+        );
+    }
+
+    /// `--raw-tap-budget-mb` converts MiB → bytes and saturates
+    /// rather than overflowing on an absurd operator-supplied value.
+    #[test]
+    fn raw_tap_flags_budget_mb_converts_and_saturates() {
+        let cfg = parse_raw_tap_flags(Some("hl"), "all", 2).unwrap();
+        assert_eq!(cfg.hl.budget_bytes, 2 * 1024 * 1024);
+
+        let cfg = parse_raw_tap_flags(Some("hl"), "all", u64::MAX).unwrap();
+        assert_eq!(cfg.hl.budget_bytes, u64::MAX);
     }
 }

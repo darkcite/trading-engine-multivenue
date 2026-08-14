@@ -27,9 +27,22 @@ cargo build --release --workspace
 cargo nextest run --workspace
 cargo test --test alloc_assertions --release   # must show 0 B/op
 
-# 4. Paper-mode run
-cargo run --release -p cli -- run --paper --env-file ./.env
+# 4. Paper-mode run (Phase 8: multivenue — supply per-venue symbols)
+cargo run --release -p cli -- run --paper --env-file ./.env \
+  --polymarket-asset-id <CLOB token id> \
+  --okx-symbols BTC-USDT,BTC-USDT-SWAP \
+  --deribit-symbols BTC-PERPETUAL \
+  --hl-coins BTC,ETH
+
+# 5. Audit a capture run (written to <MULTIVENUE_LOG_DIR>/run-<ns>/)
+cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 ```
+
+Every ingress thread writes PMLR replay capture (per-venue tick /
+event / signal logs + optional `--raw-tap` payload tap) into a
+per-run directory under `MULTIVENUE_LOG_DIR`; `audit-replay` turns a
+run into per-symbol rates, cadence-band checks, integrity
+re-derivations and a venue × channel coverage matrix.
 
 `config.example.toml` ships a non-authoritative example of the
 operational knobs (strategies, symbol pairs, thresholds). The
@@ -43,7 +56,7 @@ operator reference only.
 ```
 crates/
   core-*/           OS-agnostic primitives (rings, time, config, parse, ...)
-  ingress-*/        External source adapters (polymarket, binance, rss, rpc)
+  ingress-*/        External source adapters (polymarket, binance, okx, deribit, hyperliquid, rpc, rss)
   strategy-*/       Strategies implementing `strategy-core::Strategy`
   signer-eip712/    EIP-712 signer (secp256k1 + tiny-keccak, no ethers)
   clob-dispatcher/  Persistent HTTP/2 client w/ preallocated buffers

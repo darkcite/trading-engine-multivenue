@@ -64,7 +64,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Price, Qty, Tick, VenueId};
+use core_types::{Capture, ChannelEvent, ChannelId, Price, Qty, Tick, VenueId};
 
 use crate::{
     classify, extract_instrument, parse_book_header, parse_quote, parse_ticker, parse_trade,
@@ -361,13 +361,14 @@ impl Driver {
 ///   and bumps `IngressStatus::ring_drops`.
 /// * `status`: per-ingress observability slot; this thread is its
 ///   single writer.
-pub fn drive_one<T: Transport>(
+pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     flush_tx(transport, drv)?;
     fill_rx(transport, drv)?;
@@ -385,7 +386,7 @@ pub fn drive_one<T: Transport>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, status)?;
+            drain_ws_frames(drv, producer, status, capture)?;
         }
         State::Closed => {}
     }
@@ -675,7 +676,7 @@ enum Dispatch {
     VenueError { code: i32 },
     /// `quote` push became a Tick.
     Quote { tick: Tick },
-    /// `ticker` push validated (slow-lane data; capture only in 8c).
+    /// `ticker` push validated (slow lane; captured as a §6.5 event).
     Ticker,
     /// `trades` push scanned.
     Trades { sym_idx: u8, scan: TradeScan },
@@ -683,10 +684,11 @@ enum Dispatch {
     Book { sym_idx: u8, action: u8, prev: i64, seq: i64 },
 }
 
-fn drain_ws_frames(
+fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -722,7 +724,7 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_data_frame(drv, payload.start..payload.end, producer, status)?;
+                        handle_data_frame(drv, payload.start..payload.end, producer, status, capture)?;
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -766,21 +768,62 @@ fn drain_ws_frames(
 
 /// Walk the `trades` rows of one push. Rows are sliced at successive
 /// `"trade_seq":` markers; each slice parses independently (every
-/// row field follows its own `trade_seq` within the row).
-fn scan_trades(payload: &[u8], sym: u32) -> TradeScan {
-    const MARKER: &[u8] = b"\"trade_seq\":";
+/// row field follows its own `trade_seq` within the row). Each parsed
+/// row is captured as a `ChannelId::Trade` event (§6.5): `venue_seq` =
+/// `trade_seq`, `venue_time_ms` from the venue ts, `v0` = px ×1e6,
+/// `v1` = amount ×1e6 negated for sell-side prints (Deribit amounts
+/// are USD notionals for perps/futures).
+fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
     let mut scan = TradeScan {
         rows_parsed: 0,
         rows_rejected: 0,
         seqs: [0; MAX_TRADE_ROWS],
         n_seq: 0,
     };
-    let mut at = 0usize;
-    while let Some(off) = memchr::memmem::find(&payload[at..], MARKER) {
-        let row_start = at + off;
-        let next = memchr::memmem::find(&payload[row_start + MARKER.len()..], MARKER)
-            .map(|o| row_start + MARKER.len() + o);
-        let row_end = next.unwrap_or(payload.len());
+    // Rows are the OBJECTS of the `"data":[...]` array, sliced by JSON
+    // object extent. The 8c implementation sliced at `"trade_seq":`
+    // markers instead and broke live on 2026-08-15: Deribit's starbase
+    // rollout moved `trade_seq` mid-row (timestamp/price/direction now
+    // precede it), so a marker-to-marker slice straddled two rows —
+    // single-trade frames lost their head fields entirely (~1.3 %
+    // reject rate) and every reject holed the trade-seq monitor
+    // (the phantom "gaps"). Object-extent slicing + key-matched
+    // per-row parsing is order-tolerant against both wire layouts.
+    let mut i = match core_parse::find_field(payload, b"\"data\":") {
+        Some(p) => p,
+        None => {
+            scan.rows_rejected += 1;
+            capture.parse_reject(now_ns(), payload);
+            return scan;
+        }
+    };
+    i = core_parse::skip_ws(payload, i);
+    if i >= payload.len() || payload[i] != b'[' {
+        scan.rows_rejected += 1;
+        capture.parse_reject(now_ns(), payload);
+        return scan;
+    }
+    i += 1;
+    loop {
+        i = core_parse::skip_ws(payload, i);
+        if i >= payload.len() || payload[i] == b']' {
+            break;
+        }
+        if payload[i] == b',' {
+            i += 1;
+            continue;
+        }
+        let row_start = i;
+        let row_end = match core_parse::skip_json_value(payload, i) {
+            Some(e) if payload[row_start] == b'{' => e,
+            _ => {
+                // Structurally broken remainder — reject it once.
+                scan.rows_rejected += 1;
+                capture.parse_reject(now_ns(), &payload[row_start..]);
+                break;
+            }
+        };
+        i = row_end;
         match parse_trade(&payload[row_start..row_end], sym) {
             Some(t) => {
                 scan.rows_parsed += 1;
@@ -788,24 +831,48 @@ fn scan_trades(payload: &[u8], sym: u32) -> TradeScan {
                     scan.seqs[scan.n_seq as usize] = t.trade_seq;
                     scan.n_seq += 1;
                 }
+                // §6.5 capture: v0 = px ×1e6, v1 = amount ×1e6 (USD
+                // notional), negated when `direction` is sell.
+                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+                capture.event(&ChannelEvent::new(
+                    now_ns(),
+                    VenueId::Deribit,
+                    ChannelId::Trade,
+                    sym,
+                    t.trade_seq as u64,
+                    t.ts_ns / 1_000_000,
+                    t.px_1e6,
+                    signed_qty,
+                ));
             }
-            None => scan.rows_rejected += 1,
+            None => {
+                scan.rows_rejected += 1;
+                // Tap the exact rejected row slice — the §6.5 raw-tap
+                // differential audit consumes these.
+                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
+            }
         }
-        at = row_end;
     }
     scan
 }
 
-fn handle_data_frame(
+fn handle_data_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
+    // Retained for the phase-2 reject re-borrow (Range is not Copy).
+    let reject_range = payload_range.clone();
     // Phase 1: immutable borrow of rx (+ symbols) — classify, resolve
-    // the instrument, pre-parse into a Copy dispatch value.
+    // the instrument, pre-parse into a Copy dispatch value. Capture
+    // hooks that need parsed values fire here (events); the raw tap
+    // sees every data payload pre-classify (heartbeats and acks
+    // included — this venue is the §6.5 raw-tap target).
     let dispatch: Dispatch = {
         let payload = &drv.rx.filled()[payload_range];
+        capture.raw_frame(now_ns(), payload);
         match classify(payload) {
             DeribitMsgKind::Heartbeat => Dispatch::Quiet,
             DeribitMsgKind::TestRequest => Dispatch::TestRequest,
@@ -828,6 +895,9 @@ fn handle_data_frame(
                         .map(|sym| (sym, drv.symbols.index_of(sym)))
                 }) {
                     Some((sym, Some(sym_idx))) => match channel {
+                        // §6.5: no ChannelEvent for quotes — BBO flows
+                        // as `Tick` into the per-venue tick log (see
+                        // the `ChannelId` doc in core-types).
                         DeribitChannel::Quote => match parse_quote(payload, sym) {
                             Some(f) => Dispatch::Quote {
                                 tick: Tick::new(
@@ -846,20 +916,61 @@ fn handle_data_frame(
                             None => Dispatch::Nothing,
                         },
                         DeribitChannel::Ticker => match parse_ticker(payload, sym) {
-                            Some(_) => Dispatch::Ticker,
+                            Some(tk) => {
+                                // §6.5 capture: v0 = mark px ×1e6
+                                // (`mark_px_1e6`), v1 = open interest
+                                // ×1e6 as stored in the parsed POD
+                                // (`open_interest_1e6` — USD notional
+                                // for perps/futures). Tickers carry
+                                // no venue seq.
+                                capture.event(&ChannelEvent::new(
+                                    now_ns(),
+                                    VenueId::Deribit,
+                                    ChannelId::Ticker,
+                                    sym,
+                                    0,
+                                    tk.ts_ns / 1_000_000,
+                                    tk.mark_px_1e6,
+                                    tk.open_interest_1e6,
+                                ));
+                                Dispatch::Ticker
+                            }
                             None => Dispatch::Nothing,
                         },
                         DeribitChannel::Trades => Dispatch::Trades {
                             sym_idx: sym_idx as u8,
-                            scan: scan_trades(payload, sym),
+                            scan: scan_trades(payload, sym, capture),
                         },
                         DeribitChannel::Book => match parse_book_header(payload, sym) {
-                            Some(b) => Dispatch::Book {
-                                sym_idx: sym_idx as u8,
-                                action: b.action,
-                                prev: b.prev_change_id,
-                                seq: b.change_id,
-                            },
+                            Some(b) => {
+                                // §6.5 capture: venue_seq = change_id,
+                                // v0 = prev_change_id (−1 on snapshots
+                                // — the crate's convention for the
+                                // wire-absent field), v1 = levels
+                                // counted (bids + asks, including the
+                                // beyond-DEPTH_CAP excess counts) —
+                                // the offline audit re-derives chain
+                                // breaks from these.
+                                capture.event(&ChannelEvent::new(
+                                    now_ns(),
+                                    VenueId::Deribit,
+                                    ChannelId::Book,
+                                    sym,
+                                    b.change_id as u64,
+                                    b.ts_ns / 1_000_000,
+                                    b.prev_change_id,
+                                    (b.n_bids as i64)
+                                        + (b.n_asks as i64)
+                                        + (b.excess_bids as i64)
+                                        + (b.excess_asks as i64),
+                                ));
+                                Dispatch::Book {
+                                    sym_idx: sym_idx as u8,
+                                    action: b.action,
+                                    prev: b.prev_change_id,
+                                    seq: b.change_id,
+                                }
+                            }
                             None => Dispatch::Nothing,
                         },
                     },
@@ -874,7 +985,12 @@ fn handle_data_frame(
 
     // Phase 2: mutable applies. The rx borrow above has ended.
     match dispatch {
-        Dispatch::Nothing => status.inc_parse_errors(),
+        Dispatch::Nothing => {
+            status.inc_parse_errors();
+            // Tap the rejected payload (re-borrow is safe: dispatch is
+            // Copy and the rx buffer is untouched since phase 1).
+            capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
+        }
         Dispatch::Quiet => status.add_msgs(1),
         Dispatch::TestRequest => {
             // The venue closes the socket on an unanswered
@@ -887,8 +1003,13 @@ fn handle_data_frame(
             match drv.pending.complete(id) {
                 Some(_req) => status.add_msgs(1),
                 // Late/duplicate/foreign response — count, don't
-                // crash: venues do redeliver.
-                None => status.inc_parse_errors(),
+                // crash: venues do redeliver. Tapped like every other
+                // parse_errors site (§6.5); same safe re-borrow as
+                // Dispatch::Nothing.
+                None => {
+                    status.inc_parse_errors();
+                    capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
+                }
             }
         }
         Dispatch::SubscribeResult { id, found, expected } => {
@@ -921,6 +1042,10 @@ fn handle_data_frame(
         }
         Dispatch::Quote { tick } => {
             status.add_msgs(1);
+            // §6.5 capture BEFORE the push — a ring-dropped tick must
+            // still reach the replay log (the audit pairs capture
+            // counts with ring_drops_total).
+            capture.tick(&tick);
             // D4: a full ring is data loss — count it, never block.
             if producer.try_push(tick).is_err() {
                 status.inc_ring_drops();
@@ -1011,7 +1136,7 @@ pub type StopFlag = AtomicBool;
 /// by policy → [`RunResult::IdleTimeout`] — the cli configures the
 /// idle budget at ~2× the 15 s heartbeat interval.
 #[allow(clippy::too_many_arguments)]
-pub fn run<T: Transport>(
+pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
@@ -1023,6 +1148,7 @@ pub fn run<T: Transport>(
     stop: &StopFlag,
     status: &IngressStatus,
     keepalive: &mut Keepalive,
+    capture: &mut C,
 ) -> RunResult {
     let session_start_ns = now_ns();
     keepalive.reset();
@@ -1055,7 +1181,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status).is_err() {
+            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -1065,6 +1191,11 @@ pub fn run<T: Transport>(
                 break;
             }
         }
+
+        // §6.5: staged capture reaches disk within the flush interval
+        // even on quiet feeds (one clock read + one branch per poll
+        // iteration; ~50 ms cadence).
+        capture.maybe_flush(now_ns());
 
         // Keepalive: proactive `public/test` when nothing has been
         // received for the ping interval; venue heartbeats and every
@@ -1112,6 +1243,7 @@ mod tests {
         KeepaliveCfg, TestTransport,
     };
     use core_ring::Ring;
+    use core_types::NullCapture;
 
     /// Venue-namespaced test symbol (venue byte 3 = Deribit, ord 1).
     const SYM_BTC: u32 = (3 << 24) | 1;
@@ -1232,7 +1364,7 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"www.deribit.com", b"/ws/api/v2", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"www.deribit.com", b"/ws/api/v2", &mut prod, &status, &mut NullCapture).unwrap();
         let mut scratch = vec![0u8; 65536];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1241,7 +1373,7 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"www.deribit.com", b"/ws/api/v2", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"www.deribit.com", b"/ws/api/v2", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.session_started);
         assert_eq!(status.state(), IngressState::Up);
@@ -1280,7 +1412,7 @@ mod tests {
         let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms"],"testnet":false}"#;
         inject_text(&mut t, result);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.pending_count(), 0, "subscribe retired");
         // 2 instruments × 3 channels acknowledged.
         assert_eq!(d.sub_count(), 6);
@@ -1308,7 +1440,7 @@ mod tests {
         let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms"]}"#;
         inject_text(&mut t, result);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap_err();
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1323,7 +1455,7 @@ mod tests {
             &mut t,
             br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
 
         // The reply is already flushed (same drive cycle).
         let mut scratch = [0u8; 8192];
@@ -1338,7 +1470,7 @@ mod tests {
 
         // The venue's result then retires the pending slot.
         inject_text(&mut t, br#"{"jsonrpc":"2.0","id":3,"result":{"version":"1.2.26"}}"#);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.pending_count(), 0);
         assert_eq!(status.parse_errors_total(), 0);
     }
@@ -1354,7 +1486,7 @@ mod tests {
             &mut t,
             br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"heartbeat"}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(d.pending_count(), 0, "no reply for a plain heartbeat");
         assert!(status.last_activity_ns() > 0, "heartbeat refreshes the idle clock");
@@ -1372,7 +1504,7 @@ mod tests {
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
         inject_text(&mut t, quote);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1398,7 +1530,7 @@ mod tests {
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.SOL-PERPETUAL","data":{"timestamp":1000,"best_bid_price":1.0,"best_bid_amount":1.0,"best_ask_price":2.0,"best_ask_amount":1.0}}}"#;
         inject_text(&mut t, quote);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert!(cons.try_pop().is_none());
@@ -1419,7 +1551,7 @@ mod tests {
             &mut t,
             br#"{"jsonrpc":"2.0","id":9,"error":{"code":10028,"message":"too_many_requests"}}"#,
         );
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap_err();
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1432,7 +1564,7 @@ mod tests {
 
         let ticker = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
         inject_text(&mut t, ticker);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
         assert!(cons.try_pop().is_none(), "tickers do not enter the Tick lane");
@@ -1448,7 +1580,7 @@ mod tests {
         // Snapshot roots the chain…
         let snap = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1000,"instrument_name":"BTC-PERPETUAL","change_id":10,"bids":[["new",1.0,1.0]],"asks":[],"type":"snapshot"}}}"#;
         inject_text(&mut t, snap);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.gaps_total(), 0);
         let mut scratch = vec![0u8; 16384];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1457,7 +1589,7 @@ mod tests {
         // …then a chain break (prev 99 ≠ last 10).
         let broken = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":2000,"instrument_name":"BTC-PERPETUAL","change_id":100,"prev_change_id":99,"bids":[],"asks":[["delete",1.0,0.0]],"type":"change"}}}"#;
         inject_text(&mut t, broken);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
 
         assert_eq!(status.gaps_total(), 1);
         assert_eq!(status.resubscribes_total(), 1);
@@ -1474,7 +1606,7 @@ mod tests {
         // The fresh snapshot then re-roots without further gaps.
         let fresh = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":3000,"instrument_name":"BTC-PERPETUAL","change_id":200,"bids":[],"asks":[],"type":"snapshot"}}}"#;
         inject_text(&mut t, fresh);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.gaps_total(), 1, "snapshot is not a gap");
     }
 
@@ -1494,7 +1626,7 @@ mod tests {
         inject_text(&mut t, t2);
         inject_text(&mut t, t3);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 3);
         assert_eq!(status.gaps_total(), 2, "one jump + one regression");
         assert_eq!(status.resubscribes_total(), 0, "trades are never resubscribed");
@@ -1511,9 +1643,154 @@ mod tests {
         let multi = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":50,"trade_id":"1","timestamp":1000,"price":1.0,"direction":"buy","amount":1.0},{"trade_seq":51,"trade_id":"2","timestamp":1001,"price":1.1,"direction":"sell","amount":2.0}]}}"#;
         inject_text(&mut t, multi);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 2, "both rows counted");
         assert_eq!(status.gaps_total(), 0, "50 → 51 chains");
+    }
+
+    /// Records every hook invocation — pins the §6.5 capture-site
+    /// semantics without touching the filesystem.
+    #[derive(Default)]
+    struct CountingCapture {
+        ticks: u32,
+        events: u32,
+        raw_frames: u32,
+        rejects: u32,
+        flushes: u32,
+        last_event_channel: u8,
+    }
+
+    /// Records every Trade event's (venue_seq, v0 px, v1 signed qty) —
+    /// pins per-row field pairing for the starbase-order regression.
+    #[derive(Default)]
+    struct TradeRecorder {
+        rows: Vec<(u64, i64, i64)>,
+        rejects: u32,
+    }
+
+    impl core_types::Capture for TradeRecorder {
+        fn event(&mut self, e: &ChannelEvent) {
+            if e.channel == ChannelId::Trade as u8 {
+                self.rows.push((e.venue_seq, e.v0, e.v1));
+            }
+        }
+        fn parse_reject(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.rejects += 1;
+        }
+    }
+
+    /// Live-wire regression (raw-tapped 2026-08-15): Deribit's
+    /// starbase engine reorders trade rows — `timestamp`/`price`/
+    /// `direction` precede `trade_seq`; `amount` (scientific notation
+    /// for round sizes) and `starbase_*` fields follow it. The 8c
+    /// marker slicing straddled rows here; object-extent slicing must
+    /// parse every row with correctly-paired fields.
+    #[test]
+    fn starbase_order_trades_parse_and_pair_correctly() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = TradeRecorder::default();
+
+        // Two-row frame in the NEW field order, distinct px/amount per
+        // row (anti-cross-pairing), row 2 amount in sci notation.
+        let multi = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"timestamp":1786740206308,"price":62863.5,"direction":"buy","instrument_name":"BTC-PERPETUAL","index_price":62860.11,"trade_id":"101","trade_seq":296244199,"amount":250.0,"mark_price":62863.68,"tick_direction":0,"starbase_match_id":214121762240081920,"contracts":25.0,"starbase_timestamp":1786740206308878197},{"timestamp":1786740206309,"price":62864.0,"direction":"sell","instrument_name":"BTC-PERPETUAL","index_price":62860.12,"trade_id":"102","trade_seq":296244200,"amount":1.0e3,"mark_price":62863.70,"tick_direction":1,"starbase_match_id":214121762240081921,"contracts":100.0,"starbase_timestamp":1786740206309878197}]}}"#;
+        // Single-row frame in the new order — the case the marker
+        // slicing could NEVER parse (head fields before trade_seq).
+        let single = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"timestamp":1786740299406,"price":62863.0,"direction":"buy","instrument_name":"BTC-PERPETUAL","trade_id":"103","trade_seq":296244201,"amount":50040.0,"mark_price":62863.13,"tick_direction":0,"starbase_match_id":214122152721395712,"contracts":5004.0,"starbase_timestamp":1786740299406707552}]}}"#;
+        let mut frame = [0u8; 2048];
+        for payload in [&multi[..], &single[..]] {
+            let n = wrap_text_frame(payload, &mut frame);
+            t.inject_incoming(&frame[..n]);
+        }
+
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.rejects, 0, "no rejects on the starbase wire");
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.msgs_total(), 3, "all three rows parsed");
+        assert_eq!(status.gaps_total(), 0, "sequential seqs, no holes");
+        assert_eq!(cap.rows.len(), 3);
+        // Field pairing: each row's px/amount stay together; sell row
+        // negated; sci amount decoded (1.0e3 → 1000 USD ×1e6).
+        assert_eq!(cap.rows[0], (296244199, 62_863_500_000, 250_000_000));
+        assert_eq!(cap.rows[1], (296244200, 62_864_000_000, -1_000_000_000));
+        assert_eq!(cap.rows[2], (296244201, 62_863_000_000, 50_040_000_000));
+    }
+
+    impl core_types::Capture for CountingCapture {
+        fn tick(&mut self, _t: &Tick) {
+            self.ticks += 1;
+        }
+        fn event(&mut self, e: &ChannelEvent) {
+            self.events += 1;
+            self.last_event_channel = e.channel;
+        }
+        fn raw_frame(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.raw_frames += 1;
+        }
+        fn parse_reject(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.rejects += 1;
+        }
+        fn maybe_flush(&mut self, _now_ns: u64) {
+            self.flushes += 1;
+        }
+    }
+
+    #[test]
+    fn capture_hooks_fire_at_documented_sites() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = CountingCapture::default();
+
+        // A ticker alone first — pins the Ticker event channel.
+        let ticker = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
+        inject_text(&mut t, ticker);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.events, 1, "ticker captured as event");
+        assert_eq!(cap.last_event_channel, core_types::ChannelId::Ticker as u8);
+        assert_eq!(cap.ticks, 0, "tickers do not enter the Tick lane");
+
+        // One quote (tick + raw), one trades push with one good + one
+        // broken row (event + row reject + raw), one garbage frame
+        // (frame reject + raw).
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
+        let trades = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":50,"trade_id":"1","timestamp":1000,"price":1.0,"direction":"sell","amount":2.0},{"trade_seq":51,"trade_id":"2","broken":true}]}}"#;
+        let garbage = br#"{"what":"ever"}"#;
+        inject_text(&mut t, quote);
+        inject_text(&mut t, trades);
+        inject_text(&mut t, garbage);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.raw_frames, 4, "every data payload is tapped");
+        assert_eq!(cap.ticks, 1, "quote captured as tick");
+        assert_eq!(cap.events, 2, "one good trade row captured");
+        assert_eq!(cap.last_event_channel, core_types::ChannelId::Trade as u8);
+        assert_eq!(
+            cap.rejects, 2,
+            "broken trade row + garbage frame both tapped as rejects"
+        );
+        assert_eq!(status.parse_errors_total(), 2);
+        // Tick still captured when the ring is full: fill it, resend.
+        while prod.try_push(Tick::new(
+            1,
+            VenueId::Deribit,
+            SYM_BTC,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        ))
+        .is_ok()
+        {}
+        inject_text(&mut t, quote);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.ticks, 2, "ring-dropped tick still captured");
+        assert_eq!(status.ring_drops_total(), 1);
     }
 
     #[test]
@@ -1525,7 +1802,7 @@ mod tests {
 
         // id 55 was never sent by us.
         inject_text(&mut t, br#"{"jsonrpc":"2.0","id":55,"result":"ok"}"#);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
     }
@@ -1546,7 +1823,7 @@ mod tests {
         junk[2..10].copy_from_slice(&declared.to_be_bytes());
         t.inject_incoming(&junk);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap_err();
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1591,7 +1868,7 @@ mod tests {
 
         let res = run(
             &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka,
+            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -1613,7 +1890,7 @@ mod tests {
 
         let res = run(
             &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka,
+            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
         let mut scratch = [0u8; 4096];
@@ -1640,7 +1917,7 @@ mod tests {
 
         let res = run(
             &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka,
+            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
         );
         assert_eq!(res, RunResult::Disconnected);
         assert_eq!(status.bytes_total(), 2);

@@ -76,12 +76,36 @@ pub struct Config {
     pub paper_mode: bool,
     /// Loopback bind for the /metrics endpoint.
     pub metrics_bind: String,
-    /// Directory for replay/HdrHistogram logs.
+    /// Directory for replay/HdrHistogram logs. A leading `~/` (or a
+    /// bare `~`) is expanded against `$HOME` at load time (see
+    /// [`expand_tilde`]) — the value stored here is always a concrete
+    /// path, never a literal `~`.
     pub log_dir: String,
     /// Comma-separated RSS feed URLs (`https://a/rss,https://b/rss`).
     /// Parsed once at boot via [`Config::rss_feeds()`] — no allocations
     /// on the hot path.
     pub rss_feeds_csv: String,
+    /// OKX v5 public WS host, optionally carrying `:port` (the venue's
+    /// public WS is on a non-443 port). Env: `OKX_WS_PUBLIC_HOST`.
+    /// Default: `ws.okx.com:8443`.
+    pub okx_ws_host: String,
+    /// OKX REST host for Phase-8e boot instrument discovery
+    /// (`GET /api/v5/public/instruments`). Env: `OKX_REST_HOST`.
+    /// Default: `www.okx.com`.
+    pub okx_rest_host: String,
+    /// Deribit WS host (JSON-RPC over WS). Env: `DERIBIT_WS_HOST`.
+    /// Default: `www.deribit.com`.
+    pub deribit_ws_host: String,
+    /// Deribit REST host for Phase-8e boot instrument discovery
+    /// (`GET /api/v2/public/get_instruments`). Env: `DERIBIT_REST_HOST`.
+    /// Default: `www.deribit.com`.
+    pub deribit_rest_host: String,
+    /// Hyperliquid public WS host. Env: `HYPERLIQUID_WS_HOST`.
+    /// Default: `api.hyperliquid.xyz`.
+    pub hyperliquid_ws_host: String,
+    /// Hyperliquid `/info` REST host for Phase-8e boot asset discovery.
+    /// Env: `HYPERLIQUID_API_HOST`. Default: `api.hyperliquid.xyz`.
+    pub hyperliquid_api_host: String,
 }
 
 impl Config {
@@ -104,11 +128,21 @@ impl Config {
             alchemy_host: env_req("ALCHEMY_HOST")?,
             paper_mode: env_opt("MULTIVENUE_MODE").as_deref() == Some("paper"),
             metrics_bind: env_opt("METRICS_BIND").unwrap_or_else(|| "127.0.0.1:9191".into()),
-            log_dir: env_opt("MULTIVENUE_LOG_DIR")
-                .unwrap_or_else(|| "~/multivenue/logs".into()),
+            log_dir: expand_tilde(
+                &env_opt("MULTIVENUE_LOG_DIR").unwrap_or_else(|| "~/multivenue/logs".into()),
+            )?,
             // Empty CSV → no RSS thread spawned. Operator opts in by
             // listing real feed URLs in .env.
             rss_feeds_csv: env_opt("RSS_FEEDS").unwrap_or_default(),
+            okx_ws_host: env_opt("OKX_WS_PUBLIC_HOST").unwrap_or_else(|| "ws.okx.com:8443".into()),
+            okx_rest_host: env_opt("OKX_REST_HOST").unwrap_or_else(|| "www.okx.com".into()),
+            deribit_ws_host: env_opt("DERIBIT_WS_HOST").unwrap_or_else(|| "www.deribit.com".into()),
+            deribit_rest_host: env_opt("DERIBIT_REST_HOST")
+                .unwrap_or_else(|| "www.deribit.com".into()),
+            hyperliquid_ws_host: env_opt("HYPERLIQUID_WS_HOST")
+                .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
+            hyperliquid_api_host: env_opt("HYPERLIQUID_API_HOST")
+                .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
         })
     }
 
@@ -129,6 +163,24 @@ fn env_req(k: &'static str) -> Result<String, ConfigError> {
 
 fn env_opt(k: &str) -> Option<String> {
     env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+/// Expand a leading `~/` (or a bare `~`) against the `HOME` env var.
+/// Any other path (including one that merely *contains* a `~` later
+/// in the string) passes through unchanged — only a leading `~` is a
+/// home-directory reference by shell convention.
+///
+/// Returns [`ConfigError::Missing("HOME")`] if the path starts with
+/// `~` and `HOME` is unset in the process environment.
+fn expand_tilde(path: &str) -> Result<String, ConfigError> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = env::var("HOME").map_err(|_| ConfigError::Missing("HOME"))?;
+        Ok(format!("{home}/{rest}"))
+    } else if path == "~" {
+        env::var("HOME").map_err(|_| ConfigError::Missing("HOME"))
+    } else {
+        Ok(path.to_string())
+    }
 }
 
 // ---------------------------------------------------------------
@@ -313,5 +365,117 @@ mod tests {
             mlocked: false,
         };
         drop(s);
+    }
+
+    // -----------------------------------------------------------
+    // expand_tilde / log_dir
+    //
+    // These mutate the process-global `HOME` env var. Safe under
+    // `cargo nextest run` (CLAUDE.md's canonical test runner) because
+    // nextest gives every test its own process; a plain multi-threaded
+    // `cargo test` binary could interleave these with unrelated tests.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn expand_tilde_happy_path_uses_home() {
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("HOME", "/Users/testhome");
+        }
+        assert_eq!(expand_tilde("~/x").unwrap(), "/Users/testhome/x");
+        assert_eq!(expand_tilde("~").unwrap(), "/Users/testhome");
+        // SAFETY: same as above.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn expand_tilde_without_home_is_missing_error() {
+        let saved = std::env::var("HOME").ok();
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        let err = expand_tilde("~/x").unwrap_err();
+        assert!(matches!(err, ConfigError::Missing("HOME")));
+        if let Some(v) = saved {
+            // SAFETY: same as above — restoring the prior value.
+            unsafe {
+                std::env::set_var("HOME", v);
+            }
+        }
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path_passes_through() {
+        assert_eq!(
+            expand_tilde("/var/log/multivenue").unwrap(),
+            "/var/log/multivenue"
+        );
+        // A `~` that isn't a leading-path marker is left alone too.
+        assert_eq!(expand_tilde("a~b").unwrap(), "a~b");
+    }
+
+    // -----------------------------------------------------------
+    // Phase-8e per-venue host fields
+    // -----------------------------------------------------------
+
+    /// Set the four vars `Config::load` requires, for tests that don't
+    /// care about their values.
+    fn set_required_env() {
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("POLYMARKET_CLOB_HOST", "pm.example");
+            std::env::set_var("POLYMARKET_GAMMA_HOST", "gamma.example");
+            std::env::set_var("BINANCE_WS_HOST", "bn.example");
+            std::env::set_var("ALCHEMY_HOST", "alchemy.example");
+            std::env::set_var("HOME", "/Users/testhome");
+        }
+    }
+
+    #[test]
+    fn phase_8e_host_fields_use_defaults_when_unset() {
+        set_required_env();
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("OKX_WS_PUBLIC_HOST");
+            std::env::remove_var("OKX_REST_HOST");
+            std::env::remove_var("DERIBIT_WS_HOST");
+            std::env::remove_var("DERIBIT_REST_HOST");
+            std::env::remove_var("HYPERLIQUID_WS_HOST");
+            std::env::remove_var("HYPERLIQUID_API_HOST");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.okx_ws_host, "ws.okx.com:8443");
+        assert_eq!(cfg.okx_rest_host, "www.okx.com");
+        assert_eq!(cfg.deribit_ws_host, "www.deribit.com");
+        assert_eq!(cfg.deribit_rest_host, "www.deribit.com");
+        assert_eq!(cfg.hyperliquid_ws_host, "api.hyperliquid.xyz");
+        assert_eq!(cfg.hyperliquid_api_host, "api.hyperliquid.xyz");
+    }
+
+    #[test]
+    fn phase_8e_host_fields_honor_env_overrides() {
+        set_required_env();
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("OKX_WS_PUBLIC_HOST", "custom-okx-ws.example:1234");
+            std::env::set_var("OKX_REST_HOST", "custom-okx-rest.example");
+            std::env::set_var("DERIBIT_WS_HOST", "custom-deribit.example");
+            std::env::set_var("HYPERLIQUID_API_HOST", "custom-hl-api.example");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.okx_ws_host, "custom-okx-ws.example:1234");
+        assert_eq!(cfg.okx_rest_host, "custom-okx-rest.example");
+        assert_eq!(cfg.deribit_ws_host, "custom-deribit.example");
+        assert_eq!(cfg.hyperliquid_api_host, "custom-hl-api.example");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("OKX_WS_PUBLIC_HOST");
+            std::env::remove_var("OKX_REST_HOST");
+            std::env::remove_var("DERIBIT_WS_HOST");
+            std::env::remove_var("HYPERLIQUID_API_HOST");
+        }
     }
 }

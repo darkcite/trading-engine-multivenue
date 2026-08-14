@@ -507,6 +507,201 @@ unsafe impl AsBytes for Fill {}
 // SAFETY: Order has the same guarantees as Tick.
 unsafe impl AsBytes for Order {}
 
+// SAFETY: ChannelEvent is `#[repr(C, align(64))]`, `#[derive(Copy)]`,
+// all fields plain integers + explicit `_pad` arrays summing to exactly
+// 64 bytes (checked by `channel_event_layout_is_fully_explicit`); no
+// compiler-inserted padding, every byte initialized.
+unsafe impl AsBytes for ChannelEvent {}
+
+// ---------------------------------------------------------------
+// ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
+// ---------------------------------------------------------------
+
+/// Venue-agnostic channel tag carried by [`ChannelEvent`]. Wire-stable
+/// (PMLR event logs) — never renumber. The BBO channels have no entry
+/// here deliberately: BBO flows as [`Tick`] into the per-venue tick
+/// log; events cover everything else so the §6.5 venue × channel
+/// coverage matrix is reconstructable offline.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChannelId {
+    /// Trade prints (OKX `trades`, Deribit `trades.100ms`, HL `trades`).
+    Trade = 0,
+    /// Depth/book updates — header-level capture (OKX `books`, Deribit
+    /// `book.100ms`, HL `l2Book`).
+    Book = 1,
+    /// Mark price (OKX `mark-price`).
+    Mark = 2,
+    /// Funding rate (OKX `funding-rate`).
+    Funding = 3,
+    /// Composite ticker (Deribit `ticker.100ms`).
+    Ticker = 4,
+    /// Per-asset context (HL `activeAssetCtx`).
+    AssetCtx = 5,
+    /// Whole-venue mid sweep (HL `allMids`).
+    AllMids = 6,
+    /// HIP-4 outcome lifecycle (HL `outcomeMetaUpdates`).
+    OutcomeMeta = 7,
+    /// Polymarket `price_change` rows that did not move the touch (the
+    /// touch-moving ones become Ticks).
+    PriceChange = 8,
+}
+
+impl ChannelId {
+    /// Decode a raw byte from a PMLR event slot. `None` = corrupt log.
+    #[inline]
+    pub const fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Trade),
+            1 => Some(Self::Book),
+            2 => Some(Self::Mark),
+            3 => Some(Self::Funding),
+            4 => Some(Self::Ticker),
+            5 => Some(Self::AssetCtx),
+            6 => Some(Self::AllMids),
+            7 => Some(Self::OutcomeMeta),
+            8 => Some(Self::PriceChange),
+            _ => None,
+        }
+    }
+
+    /// Log/report-friendly name.
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trade => "trade",
+            Self::Book => "book",
+            Self::Mark => "mark",
+            Self::Funding => "funding",
+            Self::Ticker => "ticker",
+            Self::AssetCtx => "asset_ctx",
+            Self::AllMids => "all_mids",
+            Self::OutcomeMeta => "outcome_meta",
+            Self::PriceChange => "price_change",
+        }
+    }
+}
+
+/// One captured non-tick channel event (Phase 8e, plan §6.5). Written
+/// by each ingress thread into its per-venue PMLR event log so the
+/// offline audit (`cli audit-replay`) can compute per-channel message
+/// rates, inter-arrival histograms and gap totals without re-parsing
+/// raw venue frames.
+///
+/// `v0`/`v1` are channel-dependent payloads (documented per
+/// [`ChannelId`] at the capture site): typically price ×1e6 and
+/// qty ×1e6 for `Trade`, level counts for `Book`, rate ×1e9 for
+/// `Funding`. The audit tool primarily consumes
+/// `ts_ns`/`venue`/`channel`/`sym`/`venue_seq`/`venue_time_ms`.
+#[derive(Copy, Clone, Debug)]
+#[repr(C, align(64))]
+pub struct ChannelEvent {
+    /// When the ingress thread finished parsing the event.
+    pub ts_ns: NsTs,
+    /// Venue-namespaced symbol, or `SYMBOL_ID_NONE` for venue-global
+    /// channels (`AllMids`, `OutcomeMeta`).
+    pub sym: SymbolId,
+    /// Producing venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// Channel tag ([`ChannelId`] as raw byte).
+    pub channel: u8,
+    /// Reserved. Always zero.
+    _pad0: [u8; 2],
+    /// Venue-provided sequence (full width — OKX `seqId`, Deribit
+    /// `change_id`/`trade_seq`); 0 where the channel carries none.
+    pub venue_seq: u64,
+    /// Venue-provided timestamp in ms; 0 where absent.
+    pub venue_time_ms: u64,
+    /// Channel-dependent payload 0 (see struct docs).
+    pub v0: i64,
+    /// Channel-dependent payload 1 (see struct docs).
+    pub v1: i64,
+    /// Explicit tail padding (see [`AsBytes`]). Always zero.
+    _pad1: [u8; 16],
+}
+
+impl ChannelEvent {
+    /// Construct a ChannelEvent without naming the private padding.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        channel: ChannelId,
+        sym: SymbolId,
+        venue_seq: u64,
+        venue_time_ms: u64,
+        v0: i64,
+        v1: i64,
+    ) -> Self {
+        Self {
+            ts_ns,
+            sym,
+            venue: venue as u8,
+            channel: channel as u8,
+            _pad0: [0; 2],
+            venue_seq,
+            venue_time_ms,
+            v0,
+            v1,
+            _pad1: [0; 16],
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// Capture — per-ingress replay/tap sink (Phase 8e, §6.5)
+// ---------------------------------------------------------------
+
+/// Sink for everything an ingress thread parses, threaded through the
+/// run loops as a monomorphized generic (`C: Capture` — no `dyn`, per
+/// doctrine). The production impl is `core-io`'s `PmlrCapture`
+/// (per-venue PMLR logs + optional bounded raw tap); tests and
+/// capture-off paths use [`NullCapture`], whose no-op defaults compile
+/// away entirely.
+///
+/// All methods are infallible by design: capture failure must degrade
+/// capture, never the market-data session (the impl owns its error
+/// policy and surfaces loss through counters).
+pub trait Capture {
+    /// One parsed BBO tick (called before the ring `try_push`, so
+    /// ring-dropped ticks are still captured — the offline audit
+    /// compares capture counts against `ring_drops_total`).
+    #[inline(always)]
+    fn tick(&mut self, _t: &Tick) {}
+
+    /// One parsed non-tick channel event.
+    #[inline(always)]
+    fn event(&mut self, _e: &ChannelEvent) {}
+
+    /// One parsed signal (RPC ingress).
+    #[inline(always)]
+    fn signal(&mut self, _s: &Signal) {}
+
+    /// One raw inbound WS/HTTP payload, pre-parse. Only observed when
+    /// the impl's tap mode is `All` — bounded, off in production.
+    #[inline(always)]
+    fn raw_frame(&mut self, _ts_ns: NsTs, _payload: &[u8]) {}
+
+    /// One payload the parser rejected, at the site that increments
+    /// `parse_errors_total`. Only observed in tap modes `Rejects`/`All`.
+    #[inline(always)]
+    fn parse_reject(&mut self, _ts_ns: NsTs, _payload: &[u8]) {}
+
+    /// Time-based flush hook; run loops call this once per outer poll
+    /// iteration so staged bytes reach disk within the flush interval
+    /// even on quiet feeds.
+    #[inline(always)]
+    fn maybe_flush(&mut self, _now_ns: NsTs) {}
+}
+
+/// The do-nothing [`Capture`]: every hook is the trait's empty default,
+/// monomorphizing to nothing at the call sites.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NullCapture;
+
+impl Capture for NullCapture {}
+
 // ---------------------------------------------------------------
 // Static layout assertions — if these ever fire, revisit the
 // cache-line story in PLAN.md §7.
@@ -525,6 +720,7 @@ static_assert_size!(Tick, 64);
 static_assert_size!(Signal, 64);
 static_assert_size!(Fill, 64);
 static_assert_size!(Order, 64);
+static_assert_size!(ChannelEvent, 64);
 
 // ---------------------------------------------------------------
 // Tests
@@ -720,5 +916,103 @@ mod tests {
         assert_eq!(::core::mem::size_of::<Side>(), 1);
         assert_eq!(::core::mem::size_of::<LatencyClass>(), 1);
         assert_eq!(::core::mem::size_of::<MarketFamily>(), 1);
+    }
+}
+
+#[cfg(test)]
+mod channel_event_tests {
+    use super::*;
+
+    #[test]
+    fn channel_event_layout_is_fully_explicit() {
+        // ChannelEvent: 8+4+1+1+2+8+8+8+8+16 = 64 — any compiler-
+        // inserted padding would break the AsBytes contract.
+        assert_eq!(::core::mem::size_of::<ChannelEvent>(), 64);
+        assert_eq!(::core::mem::align_of::<ChannelEvent>(), 64);
+    }
+
+    #[test]
+    fn channel_event_bytes_sit_at_documented_offsets() {
+        // docs/wire-format.md pins venue at offset 12 and channel at
+        // offset 13. Byte-level check through AsBytes.
+        let e = ChannelEvent::new(
+            0x1111_2222_3333_4444,
+            VenueId::Deribit,
+            ChannelId::Ticker,
+            make_symbol_id(VenueId::Deribit, 7),
+            0xAABB_CCDD_EEFF_0011,
+            1_700_000_000_000,
+            42,
+            -42,
+        );
+        // SAFETY: ChannelEvent is AsBytes (repr(C), Copy, fully
+        // initialized); read-only byte view of a live stack value.
+        let b = unsafe {
+            core::slice::from_raw_parts((&e as *const ChannelEvent).cast::<u8>(), 64)
+        };
+        assert_eq!(b[12], VenueId::Deribit.to_u8());
+        assert_eq!(b[13], ChannelId::Ticker as u8);
+        // Reserved + tail padding must be zero.
+        assert_eq!(b[14], 0);
+        assert_eq!(b[15], 0);
+        let mut i = 48;
+        while i < 64 {
+            assert_eq!(b[i], 0);
+            i += 1;
+        }
+        // venue_seq at offset 16, little-endian.
+        let mut seq = [0u8; 8];
+        seq.copy_from_slice(&b[16..24]);
+        assert_eq!(u64::from_le_bytes(seq), 0xAABB_CCDD_EEFF_0011);
+    }
+
+    #[test]
+    fn channel_id_roundtrips_and_rejects_unknown() {
+        let all = [
+            ChannelId::Trade,
+            ChannelId::Book,
+            ChannelId::Mark,
+            ChannelId::Funding,
+            ChannelId::Ticker,
+            ChannelId::AssetCtx,
+            ChannelId::AllMids,
+            ChannelId::OutcomeMeta,
+            ChannelId::PriceChange,
+        ];
+        let mut i = 0;
+        while i < all.len() {
+            let c = all[i];
+            assert_eq!(ChannelId::from_u8(c as u8), Some(c));
+            assert!(!c.as_str().is_empty());
+            i += 1;
+        }
+        assert_eq!(ChannelId::from_u8(9), None);
+        assert_eq!(ChannelId::from_u8(255), None);
+    }
+
+    #[test]
+    fn null_capture_accepts_everything_and_does_nothing() {
+        // Happy-path exercise of every default hook — compiles to
+        // nothing, but pins the trait surface so a signature change
+        // breaks loudly here first.
+        let mut c = NullCapture;
+        let t = Tick::new(
+            1,
+            VenueId::Okx,
+            make_symbol_id(VenueId::Okx, 1),
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        );
+        let e = ChannelEvent::new(1, VenueId::Okx, ChannelId::Trade, 0, 0, 0, 0, 0);
+        let s = Signal::new(1, 0, LatencyClass::Hot, SignalSource::Rpc as u8, [0; 40]);
+        Capture::tick(&mut c, &t);
+        Capture::event(&mut c, &e);
+        Capture::signal(&mut c, &s);
+        Capture::raw_frame(&mut c, 1, b"payload");
+        Capture::parse_reject(&mut c, 1, b"bad");
+        Capture::maybe_flush(&mut c, 2);
     }
 }

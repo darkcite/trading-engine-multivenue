@@ -30,6 +30,7 @@
 )]
 
 pub mod backoff;
+pub mod boot_http;
 pub mod error;
 pub mod http1;
 pub mod iobuf;

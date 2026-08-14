@@ -78,7 +78,11 @@ What survives unchanged from v0.3:
 - **Any secret manager.** `.env` is the only secret mechanism.
 - **Any external observability stack.** No Prometheus, Grafana, Datadog, CloudWatch, etc. TUI + log files + trivial `/metrics` endpoint only.
 - Market-making.
-- Multi-venue execution.
+- ~~Multi-venue execution.~~ **Superseded 2026-08-14 by
+  `docs/phase-8-plan.md`** (operator directive): OKX, Deribit and
+  Hyperliquid (incl. HIP-4 outcome markets) are wired for market data
+  *and* — in Stage 3 — order routing. Stage-1 market-data capture on
+  all venues landed 2026-08-15 (8a–8e).
 - GUI. CLI + ratatui TUI only.
 
 ### 2.3 Hard Constraints
@@ -412,12 +416,21 @@ The signing key bytes live in a single `mlock`'d page and are zeroized on drop. 
 ## 8. External Signal Pipeline (free-tier only)
 
 ### 8.1 Source matrix
+
+*Amended 2026-08-15 (Phase 8e): three venue WS feeds + per-venue boot
+REST discovery added; all live-verified. RSS retires to claude-worker
+in Stage 2 (phase-8-plan §8.1).*
+
 | Source | Tier | Transport | Hot path? | Purpose |
 |---|---|---|---|---|
 | Polymarket CLOB WS | free | WSS | YES | ticks, fills |
 | Binance spot WS (combined streams) | free | WSS | YES | crypto price moves — B.1 primary |
 | Binance futures WS | free | WSS | YES | mark price, liquidations — B.1 primary |
-| Public RSS feeds (crypto + politics + macro) | free | HTTP poll | WARM | headlines — B.2 secondary |
+| OKX public WS v5 (bbo-tbt · trades · mark · funding · books) | free | WSS | YES | multivenue ticks + capture (Phase 8b) |
+| Deribit JSON-RPC WS (quote · ticker · trades · book) | free | WSS | YES | multivenue ticks + capture (Phase 8c) |
+| Hyperliquid WS (bbo · l2Book · trades · ctx · HIP-4 `#enc`) | free | WSS | YES | multivenue ticks + outcome markets (Phase 8d) |
+| Venue REST discovery (OKX instruments · Deribit get_instruments · HL POST /info · Gamma by token) | free | HTTPS, boot-only | NO | instrument universes, tick/lot metadata, §6.1 coverage audit (Phase 8e) |
+| Public RSS feeds (crypto + politics + macro) | free | HTTP poll | WARM | headlines — B.2 secondary (retiring to claude-worker, Stage 2) |
 | Alchemy Polygon WSS | free tier (300M CU/mo) | WSS | COLD/WARM | on-chain event logs — B.3 |
 | QuickNode Polygon WSS | free tier (~10M CU/mo) | WSS | STANDBY | failover only |
 | Gamma REST | free | HTTPS poll | COLD | market catalog refresh, 15-min cadence |

@@ -30,6 +30,48 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-15 — SlotKind 5 (ChannelEvent), capture files, raw tap (Phase 8e)
+
+**What changed**
+
+- New PMLR `slot_kind = 5` — `ChannelEvent` (64 B, layout in
+  `docs/wire-format.md`): non-tick channel capture. `slot_kind = 4`
+  is **reserved** for Stage-2 `AiCmd` (plan §8.4) and still decodes as
+  invalid.
+- PMLR replay capture is now actually wired into the shipped `run`
+  path (the 8e defect fix): each ingress thread writes
+  `<venue>-ticks.pmlr` / `<venue>-events.pmlr` / `<venue>-signals.pmlr`
+  into `<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/`.
+- New sidecar format `<venue>-raw.tap` (`b"PMRT"` v1) — bounded raw
+  payload capture behind `--raw-tap`, off in production.
+- `MULTIVENUE_LOG_DIR` now tilde-expands a leading `~/` at boot.
+
+**Why**
+
+- Plan §6.5: the replay logs are the 8h backtest dataset and the
+  `audit-replay` input; §6.6 G1 soaks are judged from them.
+
+**Impact**
+
+- On-disk formats: existing v2 Tick/Signal/Fill/Order logs unchanged
+  and fully readable. Binaries at or before 8d.1 refuse `slot_kind=5`
+  files (unknown kind = corruption by their rules) — expected.
+- Config keys: `MULTIVENUE_LOG_DIR` semantics extended (tilde
+  expansion); no new keys for capture itself. Tap is flag-driven.
+- Wire formats: ring slots untouched — `ChannelEvent` exists only in
+  PMLR files, never in rings.
+
+**Migration steps**
+
+1. Nothing for existing logs.
+2. Tooling that globs `*.pmlr` should route on the header `slot_kind`
+   byte (0/1/2/3/5) rather than assuming Tick.
+
+**Rollback**
+
+- Delete `run-<epoch_ns>/` capture directories; pre-8e binaries never
+  read them.
+
 ## 2026-08-14 — PMLR v2: venue bytes + explicit padding (Phase 8a)
 
 **What changed**

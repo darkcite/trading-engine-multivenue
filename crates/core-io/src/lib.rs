@@ -21,8 +21,13 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod capture;
 pub mod pmlr;
 pub mod pmlr_reader;
+pub use capture::{
+    PmlrCapture, RawTapReader, RawTapRecord, TapCfg, TapMode, CAPTURE_FLUSH_INTERVAL_NS,
+    DEFAULT_TAP_BUDGET_BYTES, RAW_TAP_FLAG_REJECT,
+};
 pub use pmlr::{PmlrWriter, SlotKind, DEFAULT_STAGING_SIZE, HEADER_SIZE, MAGIC, SLOT_SIZE, VERSION};
 pub use pmlr_reader::{PmlrReadErr, PmlrReader};
 

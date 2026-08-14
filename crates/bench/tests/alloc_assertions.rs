@@ -228,6 +228,22 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
     // atomics and allocate nothing, but construct it outside the
     // measurement window on principle: setup is never measured.
     let status = core_metrics::IngressStatus::new();
+    // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
+    // the measured window below proves the entire capture path (tick +
+    // event appends, tap records, staging flushes) is 0 B/op. Files go
+    // to a temp dir created here (boot side, outside the guard).
+    let cap_dir = std::env::temp_dir().join(format!("pm_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "pm",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
     // Jump the driver straight to Steady via a round-trip through the
     // handshake so we exercise the production path during boot, not
     // the measurement window.
@@ -239,6 +255,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         &mut placeholder_producer(),
         &SymbolMap::from_pairs(std::iter::empty()),
         &status,
+        &mut capture,
     )
     .unwrap();
     // Drain the client's GET request so the test transport's outbound
@@ -274,6 +291,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &symbol_map,
         &status,
+        &mut capture,
     )
     .unwrap();
     assert_eq!(driver.state(), State::Steady);
@@ -309,6 +327,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
             &mut prod,
             &symbol_map,
             &status,
+            &mut capture,
         )
         .unwrap();
 
@@ -316,6 +335,9 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         let t = cons.try_pop().expect("tick should be produced");
         acc = acc.wrapping_add(t.bid_px.raw());
     }
+    // Flush-path inside the window too: staged capture bytes hit disk
+    // via plain write_all (no alloc).
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
@@ -327,6 +349,12 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         bytes, 0,
         "polymarket run-loop bytes should be zero: saw {bytes}"
     );
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.tap_dropped(), 0);
+    assert!(capture.ticks_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
 /// Helper: build a short-lived `Producer` for scratch tests that don't
@@ -362,8 +390,25 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let ring: std::sync::Arc<Ring<Tick, { bwl::DEFAULT_TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
+    // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
+    // the measured window below proves the entire capture path (tick +
+    // event appends, tap records, staging flushes) is 0 B/op. Files go
+    // to a temp dir created here (boot side, outside the guard).
+    let cap_dir = std::env::temp_dir().join(format!("bn_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "bn",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
     // Send the client GET handshake.
-    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -384,7 +429,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     assert_eq!(driver.state(), bwl::State::Steady);
 
     // Canned unmasked Text bookTicker frame.
@@ -404,10 +449,13 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     for _ in 0..1_000u32 {
         let written = transport.inject_incoming(&frame[..frame_len]);
         assert_eq!(written, frame_len);
-        bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
         let t = cons.try_pop().expect("tick should be produced");
         acc = acc.wrapping_add(t.bid_px.raw());
     }
+    // Flush-path inside the window too: staged capture bytes hit disk
+    // via plain write_all (no alloc).
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
@@ -419,6 +467,12 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         bytes, 0,
         "binance run-loop bytes should be zero: saw {bytes}"
     );
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.tap_dropped(), 0);
+    assert!(capture.ticks_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
 /// Drive the RPC ingress run-loop through 1 000 steady-state newHeads
@@ -439,7 +493,24 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
         Ring::new();
     let (mut prod, mut cons) = ring.split();
 
-    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
+    // the measured window below proves the entire capture path (tick +
+    // event appends, tap records, staging flushes) is 0 B/op. Files go
+    // to a temp dir created here (boot side, outside the guard).
+    let cap_dir = std::env::temp_dir().join(format!("rpc_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "rpc",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
+    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -459,7 +530,7 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     assert_eq!(driver.state(), rwl::State::Steady);
     // Drain subscribe request so the tx buffer stays cursor=0.
     let _ = transport.drain_outgoing(&mut scratch);
@@ -493,12 +564,15 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     for _ in 0..1_000u32 {
         let written = transport.inject_incoming(&frame[..frame_len]);
         assert_eq!(written, frame_len);
-        rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
         // Drain the Signal so the ring doesn't fill.
         if let Some(s) = cons.try_pop() {
             acc = acc.wrapping_add(u64::from_le_bytes(s.payload[0..8].try_into().unwrap()));
         }
     }
+    // Flush-path inside the window too: staged capture bytes hit disk
+    // via plain write_all (no alloc).
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
@@ -507,6 +581,12 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
         "rpc run-loop allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "rpc run-loop bytes should be zero: saw {bytes}");
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.tap_dropped(), 0);
+    assert!(capture.signals_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
 /// Parse an RSS body through `parse_body_into_signals` 1 000 times —
@@ -1389,7 +1469,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     // Venue-namespaced symbol (venue byte 2 = Okx, ordinal 1).
     let sym: SymbolId = (2 << 24) | 1;
     let mut symbols = ingress_okx::OkxSymbolTable::new();
-    symbols.insert(b"BTC-USDT", sym).unwrap();
+    symbols.insert(b"BTC-USDT", sym, ingress_okx::OkxInstType::Spot).unwrap();
     let mut driver = owl::Driver::new(0x0C0Cu64, symbols, true);
     owl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
@@ -1399,8 +1479,25 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     let ring: std::sync::Arc<Ring<Tick, { owl::TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
+    // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
+    // the measured window below proves the entire capture path (tick +
+    // event appends, tap records, staging flushes) is 0 B/op. Files go
+    // to a temp dir created here (boot side, outside the guard).
+    let cap_dir = std::env::temp_dir().join(format!("okx_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "okx",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
     // Send the client GET handshake.
-    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -1421,7 +1518,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     assert_eq!(driver.state(), owl::State::Steady);
     // Drain the batched subscribe op so the tx buffer stays empty.
     let _ = transport.drain_outgoing(&mut scratch);
@@ -1477,10 +1574,13 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
 
     let mut drives = 0u32;
     while transport.incoming_len() > 0 {
-        owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
         drives += 1;
         assert!(drives <= 4_096, "scripted stream failed to drain");
     }
+    // Flush-path inside the window too: staged capture bytes hit disk
+    // via plain write_all (no alloc).
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     // Drain the bbo ticks — one per cycle. try_pop is zero-alloc
     // (asserted by the ring test above), so popping inside the guard
     // keeps the window honest.
@@ -1506,6 +1606,18 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         "okx run-loop allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "okx run-loop bytes should be zero: saw {bytes}");
+
+    // Capture accounting: one tick per bbo, one event per trade row +
+    // one per books frame (snapshot + updates), one tap record per
+    // data payload, no I/O errors, nothing dropped.
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.ticks_written(), CYCLES as u64);
+    assert_eq!(capture.events_written(), (2 * CYCLES + 1) as u64);
+    assert_eq!(capture.tap_records(), (1 + 3 * CYCLES) as u64);
+    assert_eq!(capture.tap_dropped(), 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
 // ---------------------------------------------------------------
@@ -1587,8 +1699,25 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     let ring: std::sync::Arc<Ring<Tick, { dwl::TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
+    // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
+    // the measured window below proves the entire capture path (tick +
+    // event appends, tap records, staging flushes) is 0 B/op. Files go
+    // to a temp dir created here (boot side, outside the guard).
+    let cap_dir = std::env::temp_dir().join(format!("deribit_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "deribit",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
     // Send the client GET handshake.
-    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     let mut scratch = [0u8; 8192];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -1609,7 +1738,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     assert_eq!(driver.state(), dwl::State::Steady);
     // Drain the set_heartbeat + batched subscribe calls (ids 1, 2).
     let _ = transport.drain_outgoing(&mut scratch);
@@ -1636,7 +1765,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","book.BTC-PERPETUAL.100ms"]}"#,
     );
     transport.inject_incoming(&boot);
-    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     assert_eq!(driver.pending_count(), 0, "session-start calls retired");
     assert_eq!(driver.sub_count(), 4, "all channels confirmed");
     let boot_msgs = status.msgs_total();
@@ -1690,10 +1819,13 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
 
     let mut drives = 0u32;
     while transport.incoming_len() > 0 {
-        dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
         drives += 1;
         assert!(drives <= 4_096, "scripted stream failed to drain");
     }
+    // Flush-path inside the window too: staged capture bytes hit disk
+    // via plain write_all (no alloc).
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     // Drain the quote ticks — one per cycle. try_pop is zero-alloc
     // (asserted by the ring test above), so popping inside the guard
     // keeps the window honest.
@@ -1725,6 +1857,12 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         "deribit run-loop allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "deribit run-loop bytes should be zero: saw {bytes}");
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.tap_dropped(), 0);
+    assert!(capture.ticks_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
 // ---------------------------------------------------------------
@@ -1818,8 +1956,25 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     let ring: std::sync::Arc<Ring<Tick, { hwl::TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
+    // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
+    // the measured window below proves the entire capture path (tick +
+    // event appends, tap records, staging flushes) is 0 B/op. Files go
+    // to a temp dir created here (boot side, outside the guard).
+    let cap_dir = std::env::temp_dir().join(format!("hl_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "hl",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
     // Send the client GET handshake.
-    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     let mut scratch = [0u8; 16384];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -1840,7 +1995,7 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
     assert_eq!(driver.state(), hwl::State::Steady);
     // Drain the 9 per-subscription subscribe frames so the tx buffer
     // stays empty.
@@ -1914,10 +2069,13 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
 
     let mut drives = 0u32;
     while transport.incoming_len() > 0 {
-        hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
         drives += 1;
         assert!(drives <= 4_096, "scripted stream failed to drain");
     }
+    // Flush-path inside the window too: staged capture bytes hit disk
+    // via plain write_all (no alloc).
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     // Ack verification + staleness arming — the run()-loop health
     // check — happens inside the window too.
     assert_eq!(
@@ -1956,4 +2114,10 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         "hl run-loop allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "hl run-loop bytes should be zero: saw {bytes}");
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.tap_dropped(), 0);
+    assert!(capture.ticks_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }

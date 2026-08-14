@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::Ring;
-use core_types::{SymbolId, Tick, VenueId};
+use core_types::{NullCapture, SymbolId, Tick, VenueId};
 use ingress_hyperliquid::run_loop::{run, Driver, RunResult, StopFlag, TICK_RING_CAP};
 use ingress_hyperliquid::{HlCoinTable, PING_PAYLOAD};
 
@@ -356,6 +356,7 @@ fn happy_path_hip4_coin_roundtrip() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let (subscribes, ping) = server.join().expect("server thread");
@@ -486,6 +487,7 @@ fn staleness_trips_reconnect() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let subscribes = server.join().expect("server thread");
@@ -584,6 +586,7 @@ fn ping_emitted_then_idle_timeout() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let ping = server.join().expect("server thread");
@@ -663,6 +666,7 @@ fn missed_acks_fail_session() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let subscribes = server.join().expect("server thread");

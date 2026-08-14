@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use core_net::{expected_accept, TlsTransport};
 use core_ring::Ring;
-use core_types::{SymbolId, Tick};
+use core_types::{NullCapture, SymbolId, Tick};
 use ingress_binance::run_loop::{
     drive_one, note_transport_ready, Driver, State, DEFAULT_TICK_RING_CAP,
 };
@@ -174,7 +174,7 @@ fn binance_tls_loopback_yields_expected_tick() {
             let status = transport.pump(ev).expect("pump");
             note_transport_ready(&mut driver, status);
         }
-        drive_one(&mut transport, &mut driver, b"localhost", b"/", &mut prod, &status)
+        drive_one(&mut transport, &mut driver, b"localhost", b"/", &mut prod, &status, &mut NullCapture)
             .expect("drive_one");
         got = cons.try_pop();
         transport

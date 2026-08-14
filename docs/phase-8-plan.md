@@ -225,6 +225,13 @@ Docs: `https://www.okx.com/docs-v5/en/`.
   Note: OKX also lists `instType=EVENTS` — prediction-market event contracts
   with a `event-contract-markets` WS channel. Not wired in Phase 8; recorded as
   the natural third prediction venue for Phase 9 (§13).
+  **Landed 2026-08-15 (8e), two live-wire corrections:** pre-listing
+  rows (`state:"preopen"`) carry EMPTY `tickSz`/`lotSz` +
+  `instIdCode:null` (accepted as non-live, excluded from the tradable
+  universe); pre-market futures ids run to 27 bytes
+  (`MOODENG-USD_UM_XPERP-310815`) — `OKX_INST_ID_MAX` is 32. The
+  `instType`-driven channel gating replaced the `-SWAP` suffix hack as
+  planned (mark: Swap|Futures; funding: Swap only).
 - **Parser:** OKX pushes arrays of JSON strings (`["411.8","10","0","4"]`) —
   `core-parse::scan_price_1e6` handles them directly; key-matched field scan
   like `ingress-binance` so field reorder is tolerated.
@@ -246,6 +253,15 @@ Docs: `https://docs.deribit.com/`. JSON-RPC 2.0 over WS:
   book (`type:"snapshot"`, unbounded depth — parse caps levels at
   `DEPTH_CAP = 64`, excess counted not stored). `trades` carry `trade_seq`
   (per-instrument monotonic — gap-checkable).
+  **Corrected 2026-08-15 (8e raw-tap):** the live wire runs Deribit's
+  *starbase* engine — trade rows are REORDERED (`timestamp`/`price`/
+  `direction` precede `trade_seq`; `starbase_match_id`/
+  `starbase_timestamp` follow) and round floats arrive in scientific
+  notation (`"amount": 1.0e3`). This root-caused the 8d.1 sixth-entry
+  "~1.3 % rejects + trade-seq gaps": marker-based row slicing + strict
+  decimal scanning, both ours. Fixed with JSON-object-extent slicing +
+  sci-capable scans; the strictly-sequential `trade_seq` policy is
+  confirmed on the fixed parser (live run: 0 rejects, 0 holes).
 - **Keepalive:** no WS ping; call `public/set_heartbeat {interval: 15}` (min
   10 s); server then emits `test_request` messages that **must** be answered
   with `public/test` or the connection is closed. This is a small JSON-RPC
@@ -450,13 +466,29 @@ counters snapshot), single-writer per ingress thread.
 
 ### 6.5 Capture and offline audit
 
-Every parsed slot already flows to PMLR replay logs; Phase 8 adds `SlotKind`
-values for new types and an **audit tool**: `cli audit-replay --dir <logs>`
-reports per-symbol message rates, inter-arrival histograms vs expected venue
-cadence (10 ms OKX bbo-tbt, 100 ms books/Deribit, ~0.5 s HL blocks), gap/drop
-totals, and a venue × channel coverage matrix. An optional `--raw-tap` mode
-captures raw WS payloads (bounded ring → file, off in prod) for parser-vs-wire
-differential audits.
+**Implemented 2026-08-15 (8e).** The original "every parsed slot already
+flows to PMLR replay logs" claim was FALSE for the shipped binary (sixth
+progress entry); 8e wired it for real: each ingress thread owns a
+`core_io::PmlrCapture` (monomorphized `core_types::Capture` sink — the
+run loops' `C: Capture` parameter) writing
+`<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/<venue>-{ticks,events,signals}.pmlr`.
+Non-tick channels are captured as the new 64-B `ChannelEvent` POD
+(`SlotKind::Event = 5`; 4 stays reserved for `AiCmd`); BBO flows as
+`Tick`. Ticks are captured *before* the ring push so ring-dropped ticks
+remain auditable. Capture I/O errors sticky-disable capture (never the
+session) and surface via `engine_ingress_<venue>_capture_io_errors`.
+The **audit tool** shipped as `multivenue-engine audit-replay --dir`:
+per-symbol message rates, inter-arrival histograms vs expected venue
+cadence — corrected bands: 10 ms-floor OKX bbo-tbt, 100–200 ms OKX
+books/mark + Deribit book, **~3.3 s/coin HL l2Book** (2–6 s band), the
+rest event-driven — integrity re-derivations (book chains honoring
+snapshot/heartbeat/reset; trade holes derived for Deribit only — OKX
+trade seqIds share the book-wide sequence and legitimately jump), and a
+venue × channel coverage matrix. `--raw-tap <venues>` captures raw WS
+payloads (`<venue>-raw.tap`, `PMRT` v1; budget-bounded first-N — a
+documented deviation from the "bounded ring" sketch; rejects-only by
+default, off in prod) for parser-vs-wire differential audits — its
+first use root-caused the Deribit rejects (§4.2 correction).
 
 ### 6.6 Acceptance
 
@@ -800,8 +832,8 @@ this the gating work item; live trading on any new venue is blocked on it.
 | 8b | OKX MD ingress | 24 h soak, seq-chain clean, drops = 0 | 2–3 d |
 | 8c | Deribit MD ingress | same + heartbeat protocol proven | 2–3 d |
 | 8d | Hyperliquid MD + HIP-4 discovery | BTC daily outcome streamed via `#<enc>`; `outcomeMetaUpdates` handled | 3–4 d |
-| 8e | Feed-completeness harness + `audit-replay` | — | 2–3 d (overlaps) |
-| **G1** | **Gate: §6.6 acceptance on ALL five venues** — 24 h soak, zero unexplained gaps, `ring_drops_total == 0`, 100% configured coverage, cadences in-band | **no Stage-2/3 work merges before G1** | — |
+| 8e | Feed-completeness harness + `audit-replay` | **DELIVERED 2026-08-15** — discovery + capture + audit live-verified; Deribit rejects root-caused/fixed (progress log, seventh entry) | 2–3 d (overlaps) |
+| **G1** | **Gate: §6.6 acceptance on ALL five venues** — 24 h soak, zero unexplained gaps, `ring_drops_total == 0`, 100% configured coverage, cadences in-band | **no Stage-2/3 work merges before G1** (operator directive 2026-08-15: first soak shortened to 6 h) | — |
 
 **Stage 2 — AI-Ingress and the research loop** (consumes Stage-1 capture).
 

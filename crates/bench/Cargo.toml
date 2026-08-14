@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 core-alloc = { workspace = true }
+core-io    = { workspace = true }
 core-ring  = { workspace = true }
 core-parse = { workspace = true }
 core-types = { workspace = true }

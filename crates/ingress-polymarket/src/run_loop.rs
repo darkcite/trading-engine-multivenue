@@ -42,7 +42,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{NsTs, SymbolId, Tick};
+use core_types::{Capture, NsTs, SymbolId, Tick};
 
 use crate::{
     classify, parse_book_update, parse_price_change_row, scan_venue_seq, FrameKind,
@@ -307,7 +307,7 @@ impl Driver {
 ///
 /// Any transport error is surfaced. The caller's outer loop should
 /// close and reconnect on `Err`.
-pub fn drive_one<T: Transport>(
+pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
@@ -315,6 +315,7 @@ pub fn drive_one<T: Transport>(
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     // 1. Flush any pending outbound bytes.
     flush_tx(transport, drv)?;
@@ -338,7 +339,7 @@ pub fn drive_one<T: Transport>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, symbol_map, status)?;
+            drain_ws_frames(drv, producer, symbol_map, status, capture)?;
         }
         State::Closed => {}
     }
@@ -471,11 +472,12 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()
     }
 }
 
-fn drain_ws_frames(
+fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -509,6 +511,7 @@ fn drain_ws_frames(
                             producer,
                             symbol_map,
                             status,
+                            capture,
                         );
                     }
                     WsOpcode::Binary => {
@@ -565,12 +568,17 @@ fn drain_ws_frames(
 /// Push one parsed tick; loss-accounts a full ring (D4) — ring-full
 /// is back-pressure, not an error, but it is never silent.
 #[inline]
-fn push_tick(
+fn push_tick<C: Capture>(
     tick: Tick,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) {
     status.add_msgs(1);
+    // §6.5 capture BEFORE the push — a ring-dropped tick must still
+    // reach the replay log (the audit pairs capture counts with
+    // ring_drops_total).
+    capture.tick(&tick);
     if producer.try_push(tick).is_err() {
         status.inc_ring_drops();
     }
@@ -583,18 +591,23 @@ fn push_tick(
 ///   market — events are walked at `{"market":"` boundaries; events
 ///   for sibling assets we never configured are skipped silently
 ///   (the venue groups by market, not by subscribed token — they
-///   are not parse failures).
+///   are not parse failures, and §6.5 deliberately does not tap them
+///   as rejects).
 /// * `price_change` frames carry rows walked at `"asset_id":"`
 ///   markers; the event-level `timestamp` seeds every row's
-///   `venue_seq`. Sibling-asset rows are skipped silently.
-fn handle_text_frame(
+///   `venue_seq`. Sibling-asset rows are skipped silently, same §6.5
+///   carve-out.
+fn handle_text_frame<C: Capture>(
     drv: &Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
     status: &IngressStatus,
+    capture: &mut C,
 ) {
     let payload = &drv.rx.filled()[payload_range];
+    // §6.5 capture: raw tap fires before classification.
+    capture.raw_frame(now_ns(), payload);
     match classify(payload) {
         FrameKind::BookUpdate => {
             const MARKER: &[u8] = b"{\"market\":\"";
@@ -610,10 +623,15 @@ fn handle_text_frame(
                 any = true;
                 match extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
                     Some(sym) => match parse_book_update(ev, sym, ts_ns) {
-                        Some(tick) => push_tick(tick, producer, status),
-                        None => status.inc_parse_errors(),
+                        Some(tick) => push_tick(tick, producer, status, capture),
+                        None => {
+                            status.inc_parse_errors();
+                            capture.parse_reject(now_ns(), ev);
+                        }
                     },
-                    // Sibling asset in the same market — not ours.
+                    // Sibling asset in the same market — not ours, and
+                    // not tapped (§6.5): the venue groups by market, not
+                    // by subscribed token.
                     None => {}
                 }
                 at = ev_end;
@@ -622,11 +640,13 @@ fn handle_text_frame(
                 // A book frame without a single event envelope is
                 // malformed.
                 status.inc_parse_errors();
+                capture.parse_reject(now_ns(), payload);
             }
         }
         FrameKind::PriceChange => {
             let Some(venue_seq) = scan_venue_seq(payload) else {
                 status.inc_parse_errors();
+                capture.parse_reject(now_ns(), payload);
                 return;
             };
             const ROW: &[u8] = b"\"asset_id\":\"";
@@ -640,10 +660,13 @@ fn handle_text_frame(
                 let row = &payload[row_start..row_end];
                 match extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
                     Some(sym) => match parse_price_change_row(row, sym, ts_ns, venue_seq) {
-                        Some(tick) => push_tick(tick, producer, status),
-                        None => status.inc_parse_errors(),
+                        Some(tick) => push_tick(tick, producer, status, capture),
+                        None => {
+                            status.inc_parse_errors();
+                            capture.parse_reject(now_ns(), row);
+                        }
                     },
-                    // Sibling-asset row — not ours.
+                    // Sibling-asset row — not ours, not tapped (§6.5).
                     None => {}
                 }
                 at = row_end;
@@ -654,7 +677,7 @@ fn handle_text_frame(
         FrameKind::LastTrade => status.add_msgs(1),
         FrameKind::Keepalive => {}
         // Subscription acks / unrelated events — neither a message
-        // nor a parse error (Phase-1 behavior preserved).
+        // nor a parse error (Phase-1 behavior preserved); not tapped.
         FrameKind::Unknown => {}
     }
 }
@@ -694,7 +717,8 @@ pub type StopFlag = AtomicBool;
 /// steady-state iteration (D5/D6): it schedules masked protocol-level
 /// pings and declares the connection dead when no inbound bytes arrive
 /// within the idle budget.
-pub fn run<T: Transport>(
+#[allow(clippy::too_many_arguments)]
+pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
@@ -707,6 +731,7 @@ pub fn run<T: Transport>(
     stop: &StopFlag,
     status: &IngressStatus,
     keepalive: &mut Keepalive,
+    capture: &mut C,
 ) -> RunResult {
     let session_start_ns = now_ns();
     keepalive.reset();
@@ -747,7 +772,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if let Err(_e) = drive_one(transport, drv, host, path, producer, symbol_map, status) {
+            if let Err(_e) = drive_one(transport, drv, host, path, producer, symbol_map, status, capture) {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -759,6 +784,11 @@ pub fn run<T: Transport>(
                 break;
             }
         }
+
+        // §6.5: staged capture reaches disk within the flush interval
+        // even on quiet feeds (one clock read + one branch per poll
+        // iteration; ~50 ms cadence).
+        capture.maybe_flush(now_ns());
 
         // D5/D6: keepalive poll, once per steady-state iteration. A
         // connection that never delivered a byte anchors on the
@@ -819,6 +849,7 @@ mod tests {
         ws_write_text_frame, KeepaliveCfg, TestTransport,
     };
     use core_ring::Ring;
+    use core_types::NullCapture;
 
     fn build_driver_with_seed(seed: u64) -> Driver {
         Driver::new(seed, b"1234567890")
@@ -867,11 +898,11 @@ mod tests {
         let status = IngressStatus::new();
 
         // Before Ready — no handshake written.
-        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status, &mut NullCapture).unwrap();
         assert_eq!(t.outgoing_len(), 0);
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status, &mut NullCapture).unwrap();
 
         // We now expect a GET-request in the outbound buffer.
         let mut buf = [0u8; 4096];
@@ -893,7 +924,7 @@ mod tests {
         let status = IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         // drain outbound request so we don't confuse the test.
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
@@ -903,7 +934,7 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         assert_eq!(d.state(), State::Steady);
         // D7: exactly this transition publishes Up, with the 101
         // response bytes accounted as activity (D5).
@@ -942,7 +973,7 @@ mod tests {
         let status = IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -952,7 +983,7 @@ mod tests {
         let resp = build_server_response(&wrong_accept);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap_err();
+        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -975,7 +1006,7 @@ mod tests {
         let pc = br#"{"market":"0x60c2","price_changes":[{"asset_id":"0xABC","price":"0.519","size":"33.0","side":"BUY","hash":"h","best_bid":"0.519","best_ask":"0.520"}],"timestamp":"1713000000456","event_type":"price_change"}"#;
         inject_unmasked_text(&mut t, pc);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
 
         let tick = cons.try_pop().expect("book tick must be pushed");
         assert_eq!(tick.sym, 42);
@@ -1019,7 +1050,7 @@ mod tests {
         frame[2..6].copy_from_slice(b"PING");
         t.inject_incoming(&frame[..6]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         assert!(t.outgoing_len() > 0, "driver should have emitted a pong");
 
         let mut out = [0u8; 64];
@@ -1069,7 +1100,7 @@ mod tests {
         // Known asset_id but no timestamp / levels → parser rejection.
         let bad = br#"[{"market":"0x1","asset_id":"0xABC","bids":"nope","event_type":"book"}]"#;
         inject_unmasked_text(&mut t, bad);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
@@ -1078,7 +1109,7 @@ mod tests {
         // silently — neither a message nor a parse error.
         let sibling = br#"[{"market":"0x1","asset_id":"0xSIBLING","timestamp":"1","bids":[{"price":"0.4","size":"1.0"}],"asks":[{"price":"0.6","size":"1.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, sibling);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
 
@@ -1098,7 +1129,7 @@ mod tests {
         while prod.try_push(filler).is_ok() {}
         let good = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, good);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 1);
         assert_eq!(status.parse_errors_total(), 1);
@@ -1139,6 +1170,7 @@ mod tests {
             &stop,
             &status,
             &mut keepalive,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -1185,6 +1217,7 @@ mod tests {
                 &stop,
                 &status,
                 &mut keepalive,
+                &mut NullCapture,
             );
             assert_eq!(res, RunResult::Stopped);
         });
@@ -1223,5 +1256,89 @@ mod tests {
     fn extract_asset_id_none_when_missing() {
         let p = br#"{"event_type":"book"}"#;
         assert_eq!(extract_asset_id(p), None);
+    }
+
+    /// Records every hook invocation — pins the §6.5 capture-site
+    /// semantics without touching the filesystem. PM never emits
+    /// `ChannelEvent`s in v1 (BBO-only venue: `book` + `price_change`
+    /// both flow as `Tick`), so `event()`/`signal()` are left at the
+    /// trait's no-op defaults.
+    #[derive(Default)]
+    struct CountingCapture {
+        ticks: u32,
+        raw_frames: u32,
+        rejects: u32,
+        flushes: u32,
+    }
+
+    impl core_types::Capture for CountingCapture {
+        fn tick(&mut self, _t: &Tick) {
+            self.ticks += 1;
+        }
+        fn raw_frame(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.raw_frames += 1;
+        }
+        fn parse_reject(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.rejects += 1;
+        }
+        fn maybe_flush(&mut self, _now_ns: u64) {
+            self.flushes += 1;
+        }
+    }
+
+    #[test]
+    fn capture_hooks_fire_at_documented_sites() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let mut cap = CountingCapture::default();
+
+        // Frame 1: one good book event for the known asset → one tick.
+        let good = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1000","bids":[{"price":"0.51","size":"1.0"}],"asks":[{"price":"0.52","size":"1.0"}],"event_type":"book"}]"#;
+        // Frame 2: three events in one push — good (tick), malformed
+        // known-asset (reject), sibling-asset (skipped silently — §6.5
+        // must NOT tap this as a reject: the venue groups events by
+        // market, not by our subscribed token).
+        let mixed = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1000","bids":[{"price":"0.51","size":"1.0"}],"asks":[{"price":"0.52","size":"1.0"}],"event_type":"book"},{"market":"0x1","asset_id":"0xABC","bids":"nope","event_type":"book"},{"market":"0x1","asset_id":"0xSIBLING","timestamp":"1000","bids":[{"price":"0.51","size":"1.0"}],"asks":[{"price":"0.52","size":"1.0"}],"event_type":"book"}]"#;
+        // Frame 3: price_change missing "timestamp" — whole-payload
+        // reject (scan_venue_seq fails before any row is walked).
+        let bad_pc = br#"{"market":"0x1","price_changes":[{"asset_id":"0xABC","price":"0.5","size":"1","side":"BUY","best_bid":"0.5","best_ask":"0.6"}],"event_type":"price_change"}"#;
+
+        for payload in [&good[..], &mixed[..], &bad_pc[..]] {
+            inject_unmasked_text(&mut t, payload);
+        }
+
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.raw_frames, 3, "every data payload is tapped pre-classify");
+        assert_eq!(cap.ticks, 2, "good event in frame 1 + good event in frame 2");
+        assert_eq!(
+            cap.rejects, 2,
+            "malformed known-asset event + timestamp-less price_change; \
+             the sibling-asset event in frame 2 must NOT add a third"
+        );
+        assert_eq!(status.parse_errors_total(), 2);
+
+        // Tick still captured when the ring is full: fill it, resend.
+        let filler = Tick::new(
+            0,
+            core_types::VenueId::Polymarket,
+            42u32,
+            0,
+            core_types::Price::from_raw(1),
+            core_types::Qty::from_raw(1),
+            core_types::Price::from_raw(2),
+            core_types::Qty::from_raw(1),
+        );
+        while prod.try_push(filler).is_ok() {}
+        inject_unmasked_text(&mut t, good);
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap).unwrap();
+        assert_eq!(cap.ticks, 3, "ring-dropped tick still captured");
+        assert_eq!(status.ring_drops_total(), 1);
     }
 }

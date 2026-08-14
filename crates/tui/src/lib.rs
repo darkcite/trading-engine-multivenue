@@ -89,7 +89,8 @@ pub struct DashboardState {
 
     /// Ingest health: each bit = 1 → that ingress thread is in
     /// Steady state. Bit 0 = Polymarket, 1 = Binance, 2 = RPC,
-    /// 3 = RSS.
+    /// 3 = RSS, 4 = OKX, 5 = Deribit, 6 = Hyperliquid (Phase 8e —
+    /// appended; existing bits never renumber).
     pub ingest_health: u8,
     _pad: [u8; 6],
 }
@@ -431,7 +432,15 @@ fn render_ingest_health(
     s: &DashboardState,
 ) {
     use ratatui::widgets::{Block, Borders, Paragraph};
-    let names = ["polymarket", "binance", "rpc", "rss"];
+    let names = [
+        "polymarket",
+        "binance",
+        "rpc",
+        "rss",
+        "okx",
+        "deribit",
+        "hyperliquid",
+    ];
     let lines: Vec<_> = names
         .iter()
         .enumerate()

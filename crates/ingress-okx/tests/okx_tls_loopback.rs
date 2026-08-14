@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::Ring;
-use core_types::{SymbolId, Tick, VenueId};
+use core_types::{NullCapture, SymbolId, Tick, VenueId};
 use ingress_okx::run_loop::{run, Driver, RunResult, StopFlag, TICK_RING_CAP};
-use ingress_okx::OkxSymbolTable;
+use ingress_okx::{OkxInstType, OkxSymbolTable};
 
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -164,7 +164,8 @@ fn read_client_text_frame(stream: &mut Stream<'_, ServerConnection, TcpStream>) 
 
 fn test_symbols() -> OkxSymbolTable {
     let mut t = OkxSymbolTable::new();
-    t.insert(b"BTC-USDT", SYM_BTC).expect("insert symbol");
+    t.insert(b"BTC-USDT", SYM_BTC, OkxInstType::Spot)
+        .expect("insert symbol");
     t
 }
 
@@ -251,6 +252,7 @@ fn okx_tls_loopback_yields_expected_tick() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let subscribe = server.join().expect("server thread");
@@ -358,6 +360,7 @@ fn okx_tls_loopback_books_gap_triggers_resubscribe() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let (subscribe, unsub, resub) = server.join().expect("server thread");
@@ -443,6 +446,7 @@ fn okx_tls_loopback_idle_timeout_sends_literal_ping() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let (subscribe, ping) = server.join().expect("server thread");

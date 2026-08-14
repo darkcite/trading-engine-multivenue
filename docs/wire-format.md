@@ -91,6 +91,55 @@ files predate it (see `docs/migration.md`).
 |     41 |    15 | _pad1       | `[u8; 15]`     | explicit, zeroed                |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed                |
 
+### `ChannelEvent` — 64 bytes (8e; PMLR `slot_kind = 5` only, never rings)
+
+Non-tick channel capture written by each ingress thread into its
+per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
+`Tick` into the tick log.
+
+| offset | bytes | field         | type           | notes                                   |
+| -----: | ----: | ------------- | -------------- | --------------------------------------- |
+|      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete time             |
+|      8 |     4 | sym           | `u32` SymbolId | `SYMBOL_ID_NONE` for venue-global channels |
+|     12 |     1 | venue         | `u8` VenueId   |                                         |
+|     13 |     1 | channel       | `u8` ChannelId | 0=Trade 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta 8=PriceChange |
+|     14 |     2 | _pad0         | `[u8; 2]`      | explicit, zeroed                        |
+|     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none      |
+|     24 |     8 | venue_time_ms | `u64`          | venue timestamp ms; 0 where absent      |
+|     32 |     8 | v0            | `i64`          | channel-dependent (px ×1e6, counts, …)  |
+|     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …) |
+|     48 |    16 | _pad1         | `[u8; 16]`     | explicit, zeroed                        |
+
+## Capture files (8e)
+
+Per-run capture directory `<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/`,
+per-venue files written by the owning ingress thread
+(`core_io::PmlrCapture`): `<venue>-ticks.pmlr` (kind 0),
+`<venue>-events.pmlr` (kind 5), `<venue>-signals.pmlr` (kind 1;
+header-only on venues that emit none), and optionally
+`<venue>-raw.tap`. Staged writes flush at least every 1 s
+(`CAPTURE_FLUSH_INTERVAL_NS`).
+
+### Raw tap — `<venue>-raw.tap`
+
+Bounded byte-exact inbound-payload capture for parser-vs-wire
+differential audits (`--raw-tap`; off in production). Header, 64 B:
+
+| offset | bytes | field    | notes                          |
+| -----: | ----: | -------- | ------------------------------ |
+|      0 |     4 | magic    | `b"PMRT"`                      |
+|      4 |     2 | version  | `u16` — current = 1            |
+|      6 |     1 | venue    | `u8` VenueId; 0xFF = unset     |
+|      7 |     1 | _pad     |                                |
+|      8 |     8 | epoch_ns | wall-clock ns at file open     |
+|     16 |    48 | _reserved|                                |
+
+Records, back-to-back, variable length:
+`[ts_ns u64][len u32][flags u32][payload len B]` — `flags` bit 0 set ⇒
+parser rejected the payload. The file is budget-bounded at capture
+time; a torn final record (crash mid-write) is detected by readers and
+terminates iteration.
+
 ## Replay log
 
 **TODO** — pinned here in Phase 1. Provisional shape:
@@ -105,7 +154,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **2**; readers accept ≤ 2 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=**reserved** (AiCmd, Stage 2 §8.4), 5=ChannelEvent (8e) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |

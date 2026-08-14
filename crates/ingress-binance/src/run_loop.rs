@@ -38,7 +38,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{NsTs, Price, Qty, SymbolId, Tick};
+use core_types::{Capture, NsTs, Price, Qty, SymbolId, Tick};
 
 use crate::parse_book_ticker;
 
@@ -250,13 +250,14 @@ impl Driver {
 ///
 /// Any transport error is surfaced. The caller's outer loop should close
 /// and reconnect on `Err`.
-pub fn drive_one<T: Transport>(
+pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     status: &core_metrics::IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     // 1. Flush any pending outbound bytes.
     flush_tx(transport, drv)?;
@@ -275,7 +276,7 @@ pub fn drive_one<T: Transport>(
             advance_ws_upgrade(drv, status)?;
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, status)?;
+            drain_ws_frames(drv, producer, status, capture)?;
         }
         State::Closed => {}
     }
@@ -387,10 +388,11 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &core_metrics::IngressStatus) ->
     }
 }
 
-fn drain_ws_frames(
+fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     status: &core_metrics::IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -415,7 +417,7 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text => {
-                        handle_text_frame(drv, payload.start..payload.end, producer, status);
+                        handle_text_frame(drv, payload.start..payload.end, producer, status, capture);
                     }
                     WsOpcode::Binary => {
                         // Binance @bookTicker is text-only; drop.
@@ -461,13 +463,16 @@ fn drain_ws_frames(
     }
 }
 
-fn handle_text_frame(
+fn handle_text_frame<C: Capture>(
     drv: &Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     status: &core_metrics::IngressStatus,
+    capture: &mut C,
 ) {
     let payload = &drv.rx.filled()[payload_range];
+    // §6.5 capture: raw tap fires before parsing.
+    capture.raw_frame(now_ns(), payload);
     if let Some(f) = parse_book_ticker(payload, drv.sym) {
         let ts_ns = now_ns();
         // `update_id` fits comfortably in u32 over the lifetime of a
@@ -484,6 +489,10 @@ fn handle_text_frame(
             Price::from_raw(f.ask_px_1e6),
             Qty::from_raw(f.ask_qty_1e6),
         );
+        // §6.5 capture BEFORE the push — a ring-dropped tick must still
+        // reach the replay log (the audit pairs capture counts with
+        // ring_drops_total).
+        capture.tick(&tick);
         // D4: a full ring is data loss — count it, never block on it.
         if producer.try_push(tick).is_err() {
             status.inc_ring_drops();
@@ -491,6 +500,7 @@ fn handle_text_frame(
         status.add_msgs(1);
     } else {
         status.inc_parse_errors();
+        capture.parse_reject(now_ns(), payload);
     }
 }
 
@@ -512,7 +522,7 @@ pub type StopFlag = AtomicBool;
 /// * `keepalive`: proactive-ping + idle-timeout scheduler (D5/D6);
 ///   reset at entry, polled once per loop iteration in `Steady`.
 #[allow(clippy::too_many_arguments)]
-pub fn run<T: Transport>(
+pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
@@ -524,6 +534,7 @@ pub fn run<T: Transport>(
     stop: &StopFlag,
     status: &core_metrics::IngressStatus,
     keepalive: &mut core_net::Keepalive,
+    capture: &mut C,
 ) -> RunResult {
     let session_start_ns = now_ns();
     keepalive.reset();
@@ -559,7 +570,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status).is_err() {
+            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -569,6 +580,11 @@ pub fn run<T: Transport>(
                 break;
             }
         }
+
+        // §6.5: staged capture reaches disk within the flush interval
+        // even on quiet feeds (one clock read + one branch per poll
+        // iteration; ~50 ms cadence).
+        capture.maybe_flush(now_ns());
 
         // D5/D6: keepalive check — once per steady-state iteration,
         // after IO has been processed and before blocking on poll
@@ -626,6 +642,7 @@ mod tests {
         TestTransport,
     };
     use core_ring::Ring;
+    use core_types::NullCapture;
 
     fn build_driver(seed: u64, sym: SymbolId) -> Driver {
         Driver::new(seed, sym)
@@ -671,11 +688,11 @@ mod tests {
         let status = core_metrics::IngressStatus::new();
 
         // Before Ready — no handshake written.
-        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(t.outgoing_len(), 0);
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
 
         let mut buf = [0u8; 4096];
         let n = t.drain_outgoing(&mut buf);
@@ -695,7 +712,7 @@ mod tests {
         let status = core_metrics::IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
         assert_eq!(status.state(), core_metrics::IngressState::Down);
@@ -705,7 +722,7 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.state(), State::Steady);
         // D7: the upgrade transition publishes Up + activity + bytes.
         assert_eq!(status.state(), core_metrics::IngressState::Up);
@@ -722,7 +739,7 @@ mod tests {
         let status = core_metrics::IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -730,7 +747,7 @@ mod tests {
         let resp = build_server_response(&wrong);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap_err();
+        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Failed upgrade must never publish Up.
         assert_eq!(status.state(), core_metrics::IngressState::Down);
@@ -755,7 +772,7 @@ mod tests {
         t.inject_incoming(&frame_buf[..frame_len]);
 
         let status = core_metrics::IngressStatus::new();
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
 
         let tick = cons.try_pop().expect("tick must be pushed");
         assert_eq!(tick.sym, 42);
@@ -787,7 +804,7 @@ mod tests {
         t.inject_incoming(&frame[..6]);
 
         let status = core_metrics::IngressStatus::new();
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert!(t.outgoing_len() > 0);
 
         let mut out = [0u8; 64];
@@ -822,7 +839,7 @@ mod tests {
         t.inject_incoming(&frame[..2 + payload.len()]);
 
         let status = core_metrics::IngressStatus::new();
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert!(cons.try_pop().is_none());
         // Silent drop on the ring, but the rejection is counted.
         assert_eq!(status.parse_errors_total(), 1);
@@ -863,6 +880,7 @@ mod tests {
             &stop,
             &status,
             &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -909,6 +927,7 @@ mod tests {
             &stop,
             &status,
             &mut ka,
+            &mut NullCapture,
         );
         h.join().unwrap();
         assert_eq!(res, RunResult::Stopped);
@@ -921,5 +940,88 @@ mod tests {
         assert_ne!(out[0] & 0x80, 0, "FIN must be set");
         assert_ne!(out[1] & 0x80, 0, "client frames must be masked (RFC 6455 §5.3)");
         assert_eq!(out[1] & 0x7F, 0, "keepalive ping carries an empty payload");
+    }
+
+    /// Records every hook invocation — pins the §6.5 capture-site
+    /// semantics without touching the filesystem. BN never emits
+    /// `ChannelEvent`s in v1 (single-channel `@bookTicker` venue: BBO
+    /// flows as `Tick`), so `event()`/`signal()` are left at the
+    /// trait's no-op defaults.
+    #[derive(Default)]
+    struct CountingCapture {
+        ticks: u32,
+        raw_frames: u32,
+        rejects: u32,
+        flushes: u32,
+    }
+
+    impl core_types::Capture for CountingCapture {
+        fn tick(&mut self, _t: &Tick) {
+            self.ticks += 1;
+        }
+        fn raw_frame(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.raw_frames += 1;
+        }
+        fn parse_reject(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.rejects += 1;
+        }
+        fn maybe_flush(&mut self, _now_ns: u64) {
+            self.flushes += 1;
+        }
+    }
+
+    #[test]
+    fn capture_hooks_fire_at_documented_sites() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver(7, 42);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = CountingCapture::default();
+
+        let good = br#"{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21","a":"25.36520000","A":"40.66"}"#;
+        let bad = b"not-json-not-anything";
+
+        let mut frame = [0u8; 256];
+        frame[0] = 0x81;
+        frame[1] = good.len() as u8;
+        frame[2..2 + good.len()].copy_from_slice(good);
+        t.inject_incoming(&frame[..2 + good.len()]);
+
+        let mut frame2 = [0u8; 64];
+        frame2[0] = 0x81;
+        frame2[1] = bad.len() as u8;
+        frame2[2..2 + bad.len()].copy_from_slice(bad);
+        t.inject_incoming(&frame2[..2 + bad.len()]);
+
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.raw_frames, 2, "every payload tapped pre-parse");
+        assert_eq!(cap.ticks, 1, "good bookTicker captured as tick");
+        assert_eq!(cap.rejects, 1, "garbled payload tapped as reject");
+        assert_eq!(status.parse_errors_total(), 1);
+
+        // Tick still captured when the ring is full: fill it, resend.
+        let filler = Tick::new(
+            0,
+            core_types::VenueId::Binance,
+            42u32,
+            0,
+            core_types::Price::from_raw(1),
+            core_types::Qty::from_raw(1),
+            core_types::Price::from_raw(2),
+            core_types::Qty::from_raw(1),
+        );
+        while prod.try_push(filler).is_ok() {}
+        let mut frame3 = [0u8; 256];
+        frame3[0] = 0x81;
+        frame3[1] = good.len() as u8;
+        frame3[2..2 + good.len()].copy_from_slice(good);
+        t.inject_incoming(&frame3[..2 + good.len()]);
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.ticks, 2, "ring-dropped tick still captured");
+        assert_eq!(status.ring_drops_total(), 1);
     }
 }

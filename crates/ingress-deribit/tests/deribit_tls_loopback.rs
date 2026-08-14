@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::Ring;
-use core_types::{SymbolId, Tick, VenueId};
+use core_types::{NullCapture, SymbolId, Tick, VenueId};
 use ingress_deribit::run_loop::{run, Driver, RunResult, StopFlag, TICK_RING_CAP};
 use ingress_deribit::DeribitSymbolTable;
 
@@ -276,6 +276,7 @@ fn deribit_tls_loopback_yields_tick_and_answers_test_request() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let (set_heartbeat, subscribe, test_answer) = server.join().expect("server thread");
@@ -406,6 +407,7 @@ fn deribit_tls_loopback_book_gap_triggers_resubscribe() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let (subscribe, unsub, resub) = server.join().expect("server thread");
@@ -507,6 +509,7 @@ fn deribit_tls_loopback_idle_timeout_sends_public_test_probe() {
         &stop,
         &status,
         &mut keepalive,
+        &mut NullCapture,
     );
     client_done.store(true, Ordering::Release);
     let (subscribe, probe) = server.join().expect("server thread");

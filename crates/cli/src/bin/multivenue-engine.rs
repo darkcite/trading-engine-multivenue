@@ -51,6 +51,17 @@ enum Cmd {
     Run(RunArgs),
     /// Print resolved configuration and exit — smoke-tests the `.env` loader.
     PrintConfig(ConfigArgs),
+    /// Offline §6.5 capture audit: per-symbol rates, cadence-band
+    /// checks, integrity re-derivations and the venue×channel coverage
+    /// matrix over one capture run directory.
+    AuditReplay(AuditReplayArgs),
+}
+
+#[derive(Debug, Parser)]
+struct AuditReplayArgs {
+    /// Capture run directory (`<MULTIVENUE_LOG_DIR>/run-<ns>`).
+    #[arg(long)]
+    dir: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -169,6 +180,21 @@ struct RunArgs {
     /// `--latency-dump-secs` is non-zero.
     #[arg(long)]
     latency_dump_dir: Option<PathBuf>,
+    /// Comma-separated venue labels (`pm,bn,okx,rpc,deribit,hl`) or
+    /// the literal `all` — enables the §6.5 bounded raw-payload tap
+    /// for those ingress threads. Default: none (tap off everywhere).
+    #[arg(long)]
+    raw_tap: Option<String>,
+    /// Raw-tap recording mode: `rejects` (only parser-rejected
+    /// payloads) or `all` (every inbound payload, rejects included).
+    /// Only meaningful when `--raw-tap` names at least one venue.
+    #[arg(long, default_value = "rejects")]
+    raw_tap_mode: String,
+    /// Raw-tap file budget per venue, in MiB. Once exhausted, further
+    /// tap records are dropped and counted
+    /// (`PmlrCapture::tap_dropped`) rather than growing the file.
+    #[arg(long, default_value_t = 64u64)]
+    raw_tap_budget_mb: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -184,6 +210,20 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Run(args) => run(args),
         Cmd::PrintConfig(args) => print_config(args),
+        Cmd::AuditReplay(args) => audit_replay(args),
+    }
+}
+
+fn audit_replay(args: AuditReplayArgs) -> ExitCode {
+    match cli::audit_replay::run_audit(&args.dir) {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = ?e, dir = %args.dir.display(), "audit-replay failed");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -313,6 +353,64 @@ fn run(args: RunArgs) -> ExitCode {
 
     let tls_config = TlsTransport::default_client_config();
 
+    // -- Raw-tap flags (Phase 8e §6.5; fail-fast on a bad spec) --
+    let raw_tap_cfg = match cli::parse_raw_tap_flags(
+        args.raw_tap.as_deref(),
+        &args.raw_tap_mode,
+        args.raw_tap_budget_mb,
+    ) {
+        Ok(c) => c,
+        Err(reason) => {
+            error!(reason, "bad --raw-tap flags");
+            return ExitCode::from(1);
+        }
+    };
+
+    // -- Capture run directory (Phase 8e §6.5) --
+    // Every spawned ingress's PmlrCapture files land under here; the
+    // directory is created now so the first `PmlrCapture::open` below
+    // never races its own `create_dir_all`.
+    let (run_dir, epoch_ns) = match cli::new_capture_run_dir(&cfg.log_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = ?e, dir = %cfg.log_dir, "capture: run directory create failed");
+            return ExitCode::from(1);
+        }
+    };
+    info!(dir = %run_dir.display(), "capture: run directory");
+
+    // -- Phase-8e boot REST discovery (plan §6.1) --
+    // Runs BEFORE any ingress thread spawns: validates every
+    // configured symbol against the venue's live universe and (OKX
+    // only) builds the discovery-gated symbol table. Any fetch/parse
+    // failure is a fatal boot error in both paper and live mode — a
+    // venue whose REST is down now would fail its WS subscribe anyway.
+    let discovery = match cli::boot_discovery::run_all(
+        &cfg,
+        &tls_config,
+        args.okx_symbols.as_deref(),
+        args.deribit_symbols.as_deref(),
+        args.hl_coins.as_deref(),
+        &args.polymarket_asset_id,
+    ) {
+        Ok(o) => o,
+        Err(reason) => {
+            error!(reason, "boot discovery failed");
+            return ExitCode::from(1);
+        }
+    };
+    if discovery.any_missing {
+        if args.live {
+            error!(
+                "discovery: configured symbol(s) missing from venue universe — refusing to start live"
+            );
+            return ExitCode::from(1);
+        }
+        warn!(
+            "discovery: configured symbol(s) missing from venue universe — continuing in paper mode"
+        );
+    }
+
     // -- Resolve endpoints --
     // Path fixed 2026-08-14 (8d live test): the real-time host serves the
     // market channel at `/ws/market`; `/ws/` returns HTTP 404.
@@ -333,22 +431,21 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- OKX boot config (Phase 8b; venue is opt-in) --
-    // Fixed public endpoint on the venue's non-443 port; a
-    // per-venue host lands in core-config with the Phase-8e boot
-    // coverage audit.
-    const OKX_WS_HOST: &str = "ws.okx.com";
-    const OKX_WS_PORT: u16 = 8443;
+    // Host (+ optional :port) is now `cfg.okx_ws_host` (Phase 8e §9 —
+    // closes the 8b deferral); the WS path stays a cli const. The
+    // symbol table comes straight from `discovery.okx_table` — it's
+    // already discovery-gated (built above).
     const OKX_WS_PATH: &str = "/ws/v5/public";
-    let okx_boot = match args.okx_symbols.as_deref().map(str::trim) {
-        Some(spec) if !spec.is_empty() => {
-            let symbols = match cli::build_okx_symbol_table(spec) {
-                Ok(t) => t,
+    let okx_boot = match discovery.okx_table {
+        Some(symbols) => {
+            let (okx_host, okx_port) = match cli::split_host_port(&cfg.okx_ws_host, 8443) {
+                Ok(v) => v,
                 Err(reason) => {
-                    error!(reason, spec, "bad --okx-symbols");
+                    error!(reason, host = %cfg.okx_ws_host, "bad okx_ws_host");
                     return ExitCode::from(1);
                 }
             };
-            let okx_ep = match WssEndpoint::resolve(OKX_WS_HOST, OKX_WS_PORT, OKX_WS_PATH) {
+            let okx_ep = match WssEndpoint::resolve(okx_host, okx_port, OKX_WS_PATH) {
                 Ok(e) => e,
                 Err(e) => {
                     error!(error = ?e, "okx DNS failed");
@@ -357,14 +454,13 @@ fn run(args: RunArgs) -> ExitCode {
             };
             Some((symbols, okx_ep))
         }
-        _ => None,
+        None => None,
     };
 
     // -- Deribit boot config (Phase 8c; venue is opt-in) --
-    // Fixed public endpoint; a per-venue host lands in core-config
-    // with the Phase-8e boot coverage audit.
-    const DERIBIT_WS_HOST: &str = "www.deribit.com";
-    const DERIBIT_WS_PORT: u16 = 443;
+    // Host is now `cfg.deribit_ws_host` (closes the 8c deferral); WS
+    // path stays a cli const. Symbol table building is unaffected by
+    // discovery (unlike OKX it needs no per-instrument `instType`).
     const DERIBIT_WS_PATH: &str = "/ws/api/v2";
     let deribit_boot = match args.deribit_symbols.as_deref().map(str::trim) {
         Some(spec) if !spec.is_empty() => {
@@ -375,8 +471,16 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            let (deribit_host, deribit_port) =
+                match cli::split_host_port(&cfg.deribit_ws_host, 443) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        error!(reason, host = %cfg.deribit_ws_host, "bad deribit_ws_host");
+                        return ExitCode::from(1);
+                    }
+                };
             let deribit_ep =
-                match WssEndpoint::resolve(DERIBIT_WS_HOST, DERIBIT_WS_PORT, DERIBIT_WS_PATH) {
+                match WssEndpoint::resolve(deribit_host, deribit_port, DERIBIT_WS_PATH) {
                     Ok(e) => e,
                     Err(e) => {
                         error!(error = ?e, "deribit DNS failed");
@@ -389,10 +493,9 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- Hyperliquid boot config (Phase 8d; venue is opt-in) --
-    // Fixed public endpoint; a per-venue host lands in core-config
-    // with the Phase-8e boot coverage audit.
-    const HL_WS_HOST: &str = "api.hyperliquid.xyz";
-    const HL_WS_PORT: u16 = 443;
+    // Host is now `cfg.hyperliquid_ws_host` (closes the 8d deferral);
+    // WS path stays a cli const. Coin table building is unaffected by
+    // discovery (unlike OKX it needs no per-coin metadata).
     const HL_WS_PATH: &str = "/ws";
     let hl_boot = match args.hl_coins.as_deref().map(str::trim) {
         Some(spec) if !spec.is_empty() => {
@@ -403,7 +506,14 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            let hl_ep = match WssEndpoint::resolve(HL_WS_HOST, HL_WS_PORT, HL_WS_PATH) {
+            let (hl_host, hl_port) = match cli::split_host_port(&cfg.hyperliquid_ws_host, 443) {
+                Ok(v) => v,
+                Err(reason) => {
+                    error!(reason, host = %cfg.hyperliquid_ws_host, "bad hyperliquid_ws_host");
+                    return ExitCode::from(1);
+                }
+            };
+            let hl_ep = match WssEndpoint::resolve(hl_host, hl_port, HL_WS_PATH) {
                 Ok(e) => e,
                 Err(e) => {
                     error!(error = ?e, "hyperliquid DNS failed");
@@ -445,14 +555,68 @@ fn run(args: RunArgs) -> ExitCode {
 
     // -- Per-ingress status slots (D7) --
     let statuses = std::sync::Arc::new(cli::IngressStatusSet::new());
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+    // -- Build observability surfaces --
+    // Built here (before any ingress thread spawns) rather than after
+    // — Part B.4's two §6.5 capture gauges are set from inside each
+    // spawn wrapper thread itself, so the registry + gauge ids must
+    // already exist at spawn time.
+    let enable_metrics = args.metrics || args.tui;
+    let enable_tui = args.tui;
+    let obs = match Observability::build(enable_metrics, enable_tui) {
+        Ok(o) => o.with_ingress_statuses(statuses.clone()),
+        Err(reason) => {
+            error!(reason, "observability build failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
+    // Resolve latency-dump destination. Defaults to
+    // `<cfg.log_dir>/latency` so an operator who already set
+    // `MULTIVENUE_LOG_DIR` doesn't need a second flag.
+    let latency_dump_dir = args
+        .latency_dump_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{}/latency", cfg.log_dir)));
+    let obs = obs.with_latency_dump(LatencyDump::from_secs(
+        latency_dump_dir.clone(),
+        args.latency_dump_secs,
+    ));
+    if args.latency_dump_secs > 0 {
+        info!(
+            secs = args.latency_dump_secs,
+            dir = %latency_dump_dir.display(),
+            "latency dump enabled"
+        );
+    }
+
+    // §6.1 boot-discovery coverage gauges — static boot-time counts,
+    // set once (not mirrored on a cadence like the §6.4 counters).
+    if let (Some(reg), Some(ids)) = (obs.metrics.as_ref(), obs.counter_ids.as_ref()) {
+        reg.gauge(ids.coverage_pm).set(discovery.pm.configured as i64);
+        reg.gauge(ids.coverage_okx)
+            .set(discovery.okx.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_deribit)
+            .set(discovery.deribit.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_hyperliquid)
+            .set(discovery.hl.map(|c| c.configured).unwrap_or(0) as i64);
+    }
+
+    // Per-venue (registry, gauge-ids) pair for the §6.5 capture
+    // metrics — `None` end-to-end when `--metrics`/`--tui` are off.
+    let capture_metrics_for = |ids: Option<cli::CaptureGaugeIds>| -> cli::CaptureMetrics {
+        match (obs.metrics.as_ref(), ids) {
+            (Some(reg), Some(ids)) => Some((reg.clone(), ids)),
+            _ => None,
+        }
+    };
 
     // -- Spawn ingress threads --
-    let mut handles = Vec::new();
 
     // D1 fix: the PM symbol map is populated from the configured
     // asset id instead of `std::iter::empty()`. Venue-wide REST
-    // discovery replaces this single-pair config in the Phase-8e
-    // boot coverage audit.
+    // discovery (above) validates it against the live venue.
     let pm_map = ingress_polymarket::run_loop::SymbolMap::from_pairs([(
         args.polymarket_asset_id.clone().into_bytes(),
         args.polymarket_sym_id,
@@ -462,7 +626,7 @@ fn run(args: RunArgs) -> ExitCode {
         sym_id = args.polymarket_sym_id,
         "polymarket: symbol map configured"
     );
-    let pm_handle = spawn_polymarket(
+    let pm_handle = match spawn_polymarket(
         pm_ep,
         tls_config.clone(),
         pm_map,
@@ -470,17 +634,39 @@ fn run(args: RunArgs) -> ExitCode {
         pm_prod,
         statuses.polymarket.clone(),
         1,
-    );
+        &run_dir,
+        epoch_ns,
+        raw_tap_cfg.pm,
+        capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_pm)),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(error = ?e, "polymarket: capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
     handles.push(pm_handle);
 
-    let bn_handle = spawn_binance(
+    let bn_handle = match spawn_binance(
         bn_ep,
         tls_config.clone(),
         args.binance_sym_id,
         bn_prod,
         statuses.binance.clone(),
         2,
-    );
+        &run_dir,
+        epoch_ns,
+        raw_tap_cfg.bn,
+        capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(error = ?e, "binance: capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
     handles.push(bn_handle);
 
     // OKX rides core 5 per the §9 core map (rpc keeps 3, ai takes 4).
@@ -490,7 +676,7 @@ fn run(args: RunArgs) -> ExitCode {
             depth = args.okx_depth,
             "okx: starting ingress thread"
         );
-        let okx_handle = spawn_okx(
+        let okx_handle = match spawn_okx(
             okx_ep,
             tls_config.clone(),
             okx_symbols,
@@ -498,7 +684,18 @@ fn run(args: RunArgs) -> ExitCode {
             okx_prod,
             statuses.okx.clone(),
             5,
-        );
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.okx,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_okx)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "okx: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
         handles.push(okx_handle);
     } else {
         info!("--okx-symbols empty / unset; OKX ingress thread not started");
@@ -514,7 +711,7 @@ fn run(args: RunArgs) -> ExitCode {
             depth = args.deribit_depth,
             "deribit: starting ingress thread"
         );
-        let deribit_handle = spawn_deribit(
+        let deribit_handle = match spawn_deribit(
             deribit_ep,
             tls_config.clone(),
             deribit_symbols,
@@ -522,7 +719,18 @@ fn run(args: RunArgs) -> ExitCode {
             deribit_prod,
             statuses.deribit.clone(),
             6,
-        );
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.deribit,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_deribit)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "deribit: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
         handles.push(deribit_handle);
     } else {
         info!("--deribit-symbols empty / unset; Deribit ingress thread not started");
@@ -534,14 +742,25 @@ fn run(args: RunArgs) -> ExitCode {
     // Hyperliquid rides core 7 per the §9 core map.
     if let Some((hl_coins, hl_ep)) = hl_boot {
         info!(coins = hl_coins.len(), "hyperliquid: starting ingress thread");
-        let hl_handle = spawn_hyperliquid(
+        let hl_handle = match spawn_hyperliquid(
             hl_ep,
             tls_config.clone(),
             hl_coins,
             hl_prod,
             statuses.hyperliquid.clone(),
             7,
-        );
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.hl,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperliquid)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "hyperliquid: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
         handles.push(hl_handle);
     } else {
         info!("--hl-coins empty / unset; Hyperliquid ingress thread not started");
@@ -553,9 +772,24 @@ fn run(args: RunArgs) -> ExitCode {
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
-                let rpc_handle =
-                    spawn_rpc(rpc_ep, tls_config.clone(), rpc_prod, statuses.rpc.clone(), 3);
-                handles.push(rpc_handle);
+                match spawn_rpc(
+                    rpc_ep,
+                    tls_config.clone(),
+                    rpc_prod,
+                    statuses.rpc.clone(),
+                    3,
+                    &run_dir,
+                    epoch_ns,
+                    raw_tap_cfg.rpc,
+                    capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_rpc)),
+                ) {
+                    Ok(h) => handles.push(h),
+                    Err(e) => {
+                        error!(error = ?e, "rpc: capture open failed");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
             }
             Err(e) => {
                 error!(error = ?e, "RPC DNS failed; skipping rpc ingress");
@@ -619,35 +853,9 @@ fn run(args: RunArgs) -> ExitCode {
         cooldown_ns: args.cooldown_ns,
     };
 
-    // -- Build observability surfaces --
-    let enable_metrics = args.metrics || args.tui;
-    let enable_tui = args.tui;
-    let obs = match Observability::build(enable_metrics, enable_tui) {
-        Ok(o) => o.with_ingress_statuses(statuses.clone()),
-        Err(reason) => {
-            error!(reason, "observability build failed");
-            join_reverse(handles);
-            return ExitCode::from(1);
-        }
-    };
-    // Resolve latency-dump destination. Defaults to
-    // `<cfg.log_dir>/latency` so an operator who already set
-    // `MULTIVENUE_LOG_DIR` doesn't need a second flag.
-    let latency_dump_dir = args
-        .latency_dump_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{}/latency", cfg.log_dir)));
-    let obs = obs.with_latency_dump(LatencyDump::from_secs(
-        latency_dump_dir.clone(),
-        args.latency_dump_secs,
-    ));
-    if args.latency_dump_secs > 0 {
-        info!(
-            secs = args.latency_dump_secs,
-            dir = %latency_dump_dir.display(),
-            "latency dump enabled"
-        );
-    }
+    // Observability (`obs`) + latency-dump destination were already
+    // built above, before the ingress spawns (Part B.4 needs the
+    // registry at spawn time).
 
     // Boot the /metrics HTTP server if requested. Owns its own
     // thread; observes the same SHUTDOWN flag.

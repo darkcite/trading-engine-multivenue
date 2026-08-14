@@ -235,6 +235,292 @@ pub fn skip_byte(buf: &[u8], pos: Pos, b: u8) -> Pos {
 }
 
 // ---------------------------------------------------------------
+// Scientific-notation number parsing (Phase 8e — REST discovery)
+// ---------------------------------------------------------------
+
+/// Parse a JSON bare number — `[-]int[.frac][(e|E)[±]exp]` — and return
+/// it scaled by `1e9` as `i64`. Returns `(value, new_pos)`.
+///
+/// Added in Phase 8e for Deribit REST discovery: `get_instruments`
+/// emits **unquoted** floats including scientific notation
+/// (`"tick_size": 1e-05`, `"contract_size": 10.0`). The WS-side
+/// scanners ([`scan_price_1e6`]/[`scan_price_1e9`]) deliberately do not
+/// accept exponents (never seen on the WS wire — an exponent there is
+/// malformed data and must be rejected); this one does.
+///
+/// Integer arithmetic only. Precision below 1e-9 truncates toward zero
+/// (same policy as [`scan_price_1e9`]'s digit truncation). Overflow of
+/// the scaled magnitude returns `None`.
+#[inline]
+pub fn scan_number_sci_1e9(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
+    scan_number_sci_scaled(buf, pos, 9)
+}
+
+/// [`scan_number_sci_1e9`]'s ×1e6 sibling — the trading fixed point.
+///
+/// Added when the first live Deribit raw-tap (2026-08-15) showed the
+/// WS `trades` channel rendering round amounts in scientific notation
+/// (`"amount": 1.0e3` for a 1000-USD print) — the strict
+/// [`scan_price_1e6`] rejected every such row (~1.3 % of Deribit
+/// messages, and the source of its phantom trade-seq gaps). Venues
+/// whose wire never uses exponents keep the strict scanner.
+#[inline]
+pub fn scan_number_sci_1e6(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
+    scan_number_sci_scaled(buf, pos, 6)
+}
+
+/// Shared body of the sci-notation scanners — one implementation, two
+/// output scales.
+#[inline]
+fn scan_number_sci_scaled(buf: &[u8], pos: Pos, out_scale: i32) -> Option<(i64, Pos)> {
+    if pos >= buf.len() {
+        return None;
+    }
+    let (negative, mut i) = if buf[pos] == b'-' {
+        (true, pos + 1)
+    } else {
+        (false, pos)
+    };
+
+    // Mantissa accumulation over int + frac digits; `dec_exp` tracks the
+    // decimal-point shift (one per fractional digit).
+    let mut mantissa: u128 = 0;
+    let mut dec_exp: i32 = 0;
+    let mut int_digits = 0usize;
+    while i < buf.len() && buf[i].is_ascii_digit() {
+        mantissa = mantissa
+            .checked_mul(10)?
+            .checked_add((buf[i] - b'0') as u128)?;
+        int_digits += 1;
+        i += 1;
+    }
+    if int_digits == 0 {
+        return None;
+    }
+    if i < buf.len() && buf[i] == b'.' {
+        i += 1;
+        let mut frac_digits = 0usize;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            mantissa = mantissa
+                .checked_mul(10)?
+                .checked_add((buf[i] - b'0') as u128)?;
+            dec_exp -= 1;
+            frac_digits += 1;
+            i += 1;
+        }
+        if frac_digits == 0 {
+            return None; // "1." is not a JSON number
+        }
+    }
+    let mut exp_val: i32 = 0;
+    if i < buf.len() && (buf[i] == b'e' || buf[i] == b'E') {
+        i += 1;
+        let mut exp_neg = false;
+        if i < buf.len() && (buf[i] == b'+' || buf[i] == b'-') {
+            exp_neg = buf[i] == b'-';
+            i += 1;
+        }
+        let mut exp_digits = 0usize;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            exp_val = exp_val.saturating_mul(10).saturating_add((buf[i] - b'0') as i32);
+            exp_digits += 1;
+            i += 1;
+        }
+        if exp_digits == 0 {
+            return None; // "1e" / "1e-" are not JSON numbers
+        }
+        if exp_neg {
+            exp_val = -exp_val;
+        }
+    }
+
+    // Apply 10^(dec_exp + exp_val) and the requested output scale.
+    let total_exp = dec_exp.saturating_add(exp_val).saturating_add(out_scale);
+    let scaled: u128 = if total_exp >= 0 {
+        if total_exp > 38 {
+            return None; // 10^39 overflows u128 regardless of mantissa
+        }
+        mantissa.checked_mul(10u128.checked_pow(total_exp as u32)?)?
+    } else {
+        let down = -total_exp;
+        if down > 38 {
+            0
+        } else {
+            mantissa / 10u128.pow(down as u32)
+        }
+    };
+    let mag = i64::try_from(scaled).ok()?;
+    Some((if negative { -mag } else { mag }, i))
+}
+
+// ---------------------------------------------------------------
+// JSON value skipping (Phase 8e — REST discovery object walkers)
+// ---------------------------------------------------------------
+
+/// Maximum nesting depth [`skip_json_value`] will traverse. Venue REST
+/// discovery payloads nest ≤ 4 deep; anything past this cap is treated
+/// as malformed.
+pub const SKIP_VALUE_MAX_DEPTH: usize = 16;
+
+/// Skip ASCII JSON whitespace. Returns the first non-whitespace
+/// position (or `buf.len()`).
+#[inline]
+pub fn skip_ws(buf: &[u8], pos: Pos) -> Pos {
+    let mut i = pos;
+    while i < buf.len() && matches!(buf[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Skip a JSON string body. `pos` must point at the first byte **after**
+/// the opening `"`. Returns the position after the closing quote.
+/// Handles `\"` / `\\` (and all other backslash escapes as two-byte
+/// units; `\uXXXX` is four ordinary bytes after the escape pair — no
+/// unescaping is performed, this is a *skipper*).
+#[inline]
+pub fn skip_string(buf: &[u8], pos: Pos) -> Option<Pos> {
+    let mut i = pos;
+    while i < buf.len() {
+        match buf[i] {
+            b'"' => return Some(i + 1),
+            b'\\' => i += 2, // escape pair; may step past end → loop exits
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Skip one complete JSON value starting at `pos` (leading whitespace
+/// tolerated): string, number, object, array, `true`, `false`, `null`.
+/// Returns the position after the value. `None` on malformed input or
+/// nesting deeper than [`SKIP_VALUE_MAX_DEPTH`].
+///
+/// Boot-path helper for the Phase-8e REST discovery parsers (venue
+/// instrument objects carry fields of every JSON type — quoted strings
+/// with escapes, bare numbers, booleans, nested arrays). Iterative —
+/// no recursion; the depth "stack" is only a counter because a skipper
+/// never needs to know *which* container it is inside, just how many
+/// remain open.
+pub fn skip_json_value(buf: &[u8], pos: Pos) -> Option<Pos> {
+    let mut i = skip_ws(buf, pos);
+    let mut depth = 0usize;
+    loop {
+        if i >= buf.len() {
+            return None;
+        }
+        match buf[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > SKIP_VALUE_MAX_DEPTH {
+                    return None;
+                }
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'"' => {
+                i = skip_string(buf, i + 1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b',' | b':' => {
+                if depth == 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b't' => {
+                i = skip_keyword(buf, i, b"true")?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'f' => {
+                i = skip_keyword(buf, i, b"false")?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'n' => {
+                i = skip_keyword(buf, i, b"null")?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                i = skip_number(buf, i)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Skip an exact keyword (`true` / `false` / `null`).
+#[inline]
+fn skip_keyword(buf: &[u8], pos: Pos, kw: &[u8]) -> Option<Pos> {
+    let end = pos.checked_add(kw.len())?;
+    if end <= buf.len() && &buf[pos..end] == kw {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+/// Skip a JSON number (integer / fraction / exponent forms).
+#[inline]
+fn skip_number(buf: &[u8], pos: Pos) -> Option<Pos> {
+    let mut i = pos;
+    if i < buf.len() && buf[i] == b'-' {
+        i += 1;
+    }
+    let d0 = i;
+    while i < buf.len() && buf[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == d0 {
+        return None;
+    }
+    if i < buf.len() && buf[i] == b'.' {
+        i += 1;
+        let f0 = i;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == f0 {
+            return None;
+        }
+    }
+    if i < buf.len() && (buf[i] == b'e' || buf[i] == b'E') {
+        i += 1;
+        if i < buf.len() && (buf[i] == b'+' || buf[i] == b'-') {
+            i += 1;
+        }
+        let e0 = i;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == e0 {
+            return None;
+        }
+    }
+    Some(i)
+}
+
+// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
@@ -447,5 +733,177 @@ mod proptests {
         }
         buf[..n].copy_from_slice(&tmp[..n]);
         &buf[..n]
+    }
+}
+
+#[cfg(test)]
+mod sci_and_skip_tests {
+    use super::*;
+
+    // ---- scan_number_sci_1e9: happy paths -------------------------
+
+    #[test]
+    fn sci_parses_plain_integers_and_floats() {
+        assert_eq!(scan_number_sci_1e9(b"0.5,", 0), Some((500_000_000, 3)));
+        assert_eq!(scan_number_sci_1e9(b"10.0}", 0), Some((10_000_000_000, 4)));
+        assert_eq!(scan_number_sci_1e9(b"1,", 0), Some((1_000_000_000, 1)));
+        assert_eq!(scan_number_sci_1e9(b"-2.5 ", 0), Some((-2_500_000_000, 4)));
+    }
+
+    #[test]
+    fn sci_parses_deribit_wire_shapes() {
+        // Live-probed 2026-08-14: BTC-PERPETUAL tick_size 0.5, USDC
+        // instruments 1e-05, commissions 0.00025, contract_size 10.0.
+        assert_eq!(scan_number_sci_1e9(b"1e-05,", 0), Some((10_000, 5)));
+        assert_eq!(scan_number_sci_1e9(b"0.00025}", 0), Some((250_000, 7)));
+        assert_eq!(scan_number_sci_1e9(b"1E-05", 0), Some((10_000, 5)));
+        assert_eq!(scan_number_sci_1e9(b"2.5e2", 0), Some((250_000_000_000, 5)));
+        assert_eq!(scan_number_sci_1e9(b"5e+1", 0), Some((50_000_000_000, 4)));
+    }
+
+    #[test]
+    fn sci_1e6_parses_the_live_deribit_reject_shapes() {
+        // Real wire values from the 2026-08-15 raw tap: round trade
+        // amounts render as scientific notation.
+        assert_eq!(scan_number_sci_1e6(b"1.0e3,", 0), Some((1_000_000_000, 5)));
+        assert_eq!(scan_number_sci_1e6(b"209.0,", 0), Some((209_000_000, 5)));
+        assert_eq!(scan_number_sci_1e6(b"62863.68,", 0), Some((62_863_680_000, 8)));
+        assert_eq!(scan_number_sci_1e6(b"2.5e-2}", 0), Some((25_000, 6)));
+        assert_eq!(scan_number_sci_1e6(b"1e30", 0), None); // overflow
+        assert_eq!(scan_number_sci_1e6(b"e3", 0), None);
+    }
+
+    #[test]
+    fn sci_truncates_below_1e9_resolution() {
+        // 1e-12 < 1e-9 resolution → truncates toward zero.
+        assert_eq!(scan_number_sci_1e9(b"1e-12", 0), Some((0, 5)));
+        assert_eq!(scan_number_sci_1e9(b"-1e-12", 0), Some((0, 6)));
+    }
+
+    // ---- scan_number_sci_1e9: failure modes -----------------------
+
+    #[test]
+    fn sci_rejects_malformed() {
+        assert_eq!(scan_number_sci_1e9(b"", 0), None);
+        assert_eq!(scan_number_sci_1e9(b"-", 0), None);
+        assert_eq!(scan_number_sci_1e9(b".5", 0), None);
+        assert_eq!(scan_number_sci_1e9(b"1.", 0), None);
+        assert_eq!(scan_number_sci_1e9(b"1e", 0), None);
+        assert_eq!(scan_number_sci_1e9(b"1e-", 0), None);
+        assert_eq!(scan_number_sci_1e9(b"abc", 0), None);
+    }
+
+    #[test]
+    fn sci_rejects_overflow() {
+        // 1e30 × 1e9 scale overflows i64.
+        assert_eq!(scan_number_sci_1e9(b"1e30", 0), None);
+        assert_eq!(scan_number_sci_1e9(b"99999999999999999999e9", 0), None);
+    }
+
+    // ---- skip_string ----------------------------------------------
+
+    #[test]
+    fn skip_string_handles_escapes() {
+        // pos is after the opening quote.
+        assert_eq!(skip_string(b"abc\"X", 0), Some(4));
+        assert_eq!(skip_string(b"a\\\"b\"X", 0), Some(5));
+        assert_eq!(skip_string(b"a\\\\\"X", 0), Some(4));
+        assert_eq!(skip_string(b"never terminated", 0), None);
+        // Trailing lone backslash must not panic (escape steps past end).
+        assert_eq!(skip_string(b"abc\\", 0), None);
+    }
+
+    // ---- skip_json_value: happy paths -----------------------------
+
+    #[test]
+    fn skip_value_covers_all_scalar_kinds() {
+        assert_eq!(skip_json_value(b"\"str\",", 0), Some(5));
+        assert_eq!(skip_json_value(b"-12.5e3,", 0), Some(7));
+        assert_eq!(skip_json_value(b"true,", 0), Some(4));
+        assert_eq!(skip_json_value(b"false]", 0), Some(5));
+        assert_eq!(skip_json_value(b"null}", 0), Some(4));
+        assert_eq!(skip_json_value(b"  42", 0), Some(4));
+    }
+
+    #[test]
+    fn skip_value_covers_nested_containers() {
+        let v = br#"{"a":[1,2,{"b":"x\"y"}],"c":false},NEXT"#;
+        let end = skip_json_value(v, 0).unwrap();
+        assert_eq!(&v[end..end + 5], b",NEXT");
+        let a = br#"[[],[{"k":[true,null]}]] "#;
+        assert_eq!(skip_json_value(a, 0), Some(24));
+    }
+
+    #[test]
+    fn skip_value_real_okx_instrument_object() {
+        // Trimmed live-probe row: quoted strings, bare number
+        // (instIdCode), bare bool, nested array.
+        let v = br#"{"instId":"BTC-USDT-SWAP","instIdCode":10459,"futureSettlement":false,"tradeQuoteCcyList":[],"tickSz":"0.1"},{"#;
+        let end = skip_json_value(v, 0).unwrap();
+        assert_eq!(v[end], b',');
+    }
+
+    // ---- skip_json_value: failure modes ---------------------------
+
+    #[test]
+    fn skip_value_rejects_malformed() {
+        assert_eq!(skip_json_value(b"", 0), None);
+        assert_eq!(skip_json_value(b"   ", 0), None);
+        assert_eq!(skip_json_value(b"{", 0), None);
+        assert_eq!(skip_json_value(b"}", 0), None);
+        assert_eq!(skip_json_value(b"[1,2", 0), None);
+        assert_eq!(skip_json_value(b"\"open", 0), None);
+        assert_eq!(skip_json_value(b"tru", 0), None);
+        assert_eq!(skip_json_value(b"@", 0), None);
+        assert_eq!(skip_json_value(b",", 0), None);
+    }
+
+    #[test]
+    fn skip_value_rejects_depth_bomb() {
+        let mut v = [0u8; SKIP_VALUE_MAX_DEPTH + 2];
+        for b in v.iter_mut() {
+            *b = b'[';
+        }
+        assert_eq!(skip_json_value(&v, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod sci_and_skip_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Panic-free on arbitrary input; returned positions in-bounds
+        /// and strictly advancing.
+        #[test]
+        fn sci_scan_in_bounds(input in proptest::collection::vec(any::<u8>(), 0..256), pos in 0usize..300) {
+            if let Some((_, end)) = scan_number_sci_1e9(&input, pos) {
+                prop_assert!(end <= input.len());
+                prop_assert!(end > pos);
+            }
+        }
+
+        /// skip_json_value never panics; on success the end is in
+        /// bounds and past the start.
+        #[test]
+        fn skip_value_in_bounds(input in proptest::collection::vec(any::<u8>(), 0..512), pos in 0usize..600) {
+            if let Some(end) = skip_json_value(&input, pos) {
+                prop_assert!(end <= input.len());
+                prop_assert!(end > pos);
+            }
+        }
+
+        /// Agreement: any number scan_price_1e9 accepts (no exponent),
+        /// scan_number_sci_1e9 accepts with the identical value.
+        #[test]
+        fn sci_agrees_with_plain_1e9(int_part in 0u64..1_000_000, frac in 0u32..1_000_000_000u32) {
+            let s = format!("{int_part}.{frac:09}");
+            let b = s.as_bytes();
+            let plain = scan_price_1e9(b, 0);
+            let sci = scan_number_sci_1e9(b, 0);
+            prop_assert!(plain.is_some());
+            prop_assert_eq!(plain, sci);
+        }
     }
 }

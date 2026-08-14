@@ -21,3 +21,4 @@ rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rcgen    = { workspace = true }

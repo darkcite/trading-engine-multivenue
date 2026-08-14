@@ -73,6 +73,10 @@ pub enum SlotKind {
     Fill = 2,
     /// [`core_types::Order`].
     Order = 3,
+    // 4 is RESERVED for `AiCmd` (Stage 2, plan §8.4) — do not reuse.
+    /// [`core_types::ChannelEvent`] — non-tick channel capture
+    /// (Phase 8e, plan §6.5).
+    Event = 5,
 }
 
 impl SlotKind {
@@ -83,7 +87,9 @@ impl SlotKind {
     }
 
     /// Decode a byte from a mmap'd header. Returns `None` for unknown
-    /// values — a reader should treat that as file corruption.
+    /// values — a reader should treat that as file corruption. Note
+    /// `4` is reserved (Stage-2 `AiCmd`) and currently decodes to
+    /// `None`.
     #[inline]
     pub const fn from_u8(b: u8) -> Option<Self> {
         match b {
@@ -91,6 +97,7 @@ impl SlotKind {
             1 => Some(Self::Signal),
             2 => Some(Self::Fill),
             3 => Some(Self::Order),
+            5 => Some(Self::Event),
             _ => None,
         }
     }
@@ -244,6 +251,9 @@ mod tests {
         assert_eq!(SlotKind::from_u8(1), Some(SlotKind::Signal));
         assert_eq!(SlotKind::from_u8(2), Some(SlotKind::Fill));
         assert_eq!(SlotKind::from_u8(3), Some(SlotKind::Order));
+        // 4 is reserved for Stage-2 AiCmd — must NOT decode yet.
+        assert_eq!(SlotKind::from_u8(4), None);
+        assert_eq!(SlotKind::from_u8(5), Some(SlotKind::Event));
         assert_eq!(SlotKind::from_u8(42), None);
     }
 

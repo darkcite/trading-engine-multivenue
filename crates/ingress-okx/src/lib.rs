@@ -46,6 +46,7 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod discovery;
 pub mod run_loop;
 
 pub use run_loop::{
@@ -61,13 +62,55 @@ use core_types::{NsTs, SymbolId};
 // Constants
 // ---------------------------------------------------------------
 
-/// Longest OKX `instId` we accept (`BTC-USDT-241227` = 15; margin for
-/// option-style ids). Table rows are fixed at this width.
-pub const OKX_INST_ID_MAX: usize = 24;
+/// Longest OKX `instId` we accept. Live 2026-08-15: pre-market
+/// futures like `MOODENG-USD_UM_XPERP-310815` run to 27 bytes (the
+/// old cap of 24 rejected the FUTURES discovery page); 32 leaves
+/// margin. Table rows are fixed at this width.
+pub const OKX_INST_ID_MAX: usize = 32;
 
 /// Maximum number of configured instruments per connection. Fixed-cap
 /// tables everywhere; boot fails fast beyond this.
 pub const OKX_MAX_SYMBOLS: usize = 16;
+
+/// OKX instrument class, as discovered from the REST instruments
+/// endpoint at boot (8e). Drives WS channel gating: `mark-price`
+/// applies to derivatives (`Swap` | `Futures`); `funding-rate` to
+/// `Swap` only. Replaces the retired `-SWAP` instId-suffix hack.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OkxInstType {
+    /// `instType == "SPOT"`.
+    Spot = 0,
+    /// `instType == "SWAP"` — perpetual swaps (funding applies).
+    Swap = 1,
+    /// `instType == "FUTURES"` — dated futures (mark, no funding).
+    Futures = 2,
+}
+
+impl OkxInstType {
+    /// Decode the venue's `instType` string. Only the three classes
+    /// Phase 8 fetches are legal; anything else (OPTION, MARGIN,
+    /// EVENTS) is a contract violation at this layer.
+    #[inline]
+    pub fn from_bytes(s: &[u8]) -> Option<Self> {
+        match s {
+            b"SPOT" => Some(Self::Spot),
+            b"SWAP" => Some(Self::Swap),
+            b"FUTURES" => Some(Self::Futures),
+            _ => None,
+        }
+    }
+
+    /// Log-friendly name.
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "SPOT",
+            Self::Swap => "SWAP",
+            Self::Futures => "FUTURES",
+        }
+    }
+}
 
 /// Client keepalive probe — OKX wants the **literal text frame**
 /// `ping`, not a WS protocol ping.
@@ -496,7 +539,7 @@ pub enum SymbolTableErr {
 /// two cache lines of ids). Single-owner: built at boot, read by the
 /// ingress thread.
 pub struct OkxSymbolTable {
-    rows: [(u8, [u8; OKX_INST_ID_MAX], SymbolId); OKX_MAX_SYMBOLS],
+    rows: [(u8, [u8; OKX_INST_ID_MAX], SymbolId, OkxInstType); OKX_MAX_SYMBOLS],
     len: usize,
 }
 
@@ -504,13 +547,20 @@ impl OkxSymbolTable {
     /// Empty table.
     pub const fn new() -> Self {
         Self {
-            rows: [(0, [0; OKX_INST_ID_MAX], 0); OKX_MAX_SYMBOLS],
+            rows: [(0, [0; OKX_INST_ID_MAX], 0, OkxInstType::Spot); OKX_MAX_SYMBOLS],
             len: 0,
         }
     }
 
-    /// Register `inst_id → sym`. Boot-time only.
-    pub fn insert(&mut self, inst_id: &[u8], sym: SymbolId) -> Result<(), SymbolTableErr> {
+    /// Register `inst_id → sym` with its discovered instrument class.
+    /// Boot-time only; `inst_type` comes from REST discovery (8e) and
+    /// drives per-instrument channel gating.
+    pub fn insert(
+        &mut self,
+        inst_id: &[u8],
+        sym: SymbolId,
+        inst_type: OkxInstType,
+    ) -> Result<(), SymbolTableErr> {
         if inst_id.is_empty() {
             return Err(SymbolTableErr::Empty);
         }
@@ -524,6 +574,7 @@ impl OkxSymbolTable {
         row.0 = inst_id.len() as u8;
         row.1[..inst_id.len()].copy_from_slice(inst_id);
         row.2 = sym;
+        row.3 = inst_type;
         self.len += 1;
         Ok(())
     }
@@ -544,14 +595,15 @@ impl OkxSymbolTable {
         None
     }
 
-    /// Row accessor for subscribe-batch building: `(inst_id, sym)`.
+    /// Row accessor for subscribe-batch building:
+    /// `(inst_id, sym, inst_type)`.
     #[inline]
-    pub fn get(&self, idx: usize) -> Option<(&[u8], SymbolId)> {
+    pub fn get(&self, idx: usize) -> Option<(&[u8], SymbolId, OkxInstType)> {
         if idx >= self.len {
             return None;
         }
         let row = &self.rows[idx];
-        Some((&row.1[..row.0 as usize], row.2))
+        Some((&row.1[..row.0 as usize], row.2, row.3))
     }
 
     /// Index of `sym` in insertion order (chain-monitor slot index).
@@ -978,31 +1030,56 @@ mod tests {
     #[test]
     fn symbol_table_roundtrip() {
         let mut t = OkxSymbolTable::new();
-        t.insert(b"BTC-USDT", 0x0200_0001).unwrap();
-        t.insert(b"ETH-USDT", 0x0200_0002).unwrap();
+        t.insert(b"BTC-USDT", 0x0200_0001, OkxInstType::Spot).unwrap();
+        t.insert(b"ETH-USDT", 0x0200_0002, OkxInstType::Spot).unwrap();
         assert_eq!(t.lookup(b"BTC-USDT"), Some(0x0200_0001));
         assert_eq!(t.lookup(b"ETH-USDT"), Some(0x0200_0002));
         assert_eq!(t.lookup(b"XRP-USDT"), None);
         assert_eq!(t.index_of(0x0200_0002), Some(1));
         assert_eq!(t.get(0).unwrap().0, b"BTC-USDT");
+        assert_eq!(t.get(0).unwrap().2, OkxInstType::Spot);
         assert_eq!(t.len(), 2);
         assert!(!t.is_empty());
     }
 
     #[test]
+    fn symbol_table_carries_inst_type_per_row() {
+        let mut t = OkxSymbolTable::new();
+        t.insert(b"BTC-USDT", 1, OkxInstType::Spot).unwrap();
+        t.insert(b"BTC-USDT-SWAP", 2, OkxInstType::Swap).unwrap();
+        t.insert(b"BTC-USD-260821", 3, OkxInstType::Futures).unwrap();
+        assert_eq!(t.get(0).unwrap().2, OkxInstType::Spot);
+        assert_eq!(t.get(1).unwrap().2, OkxInstType::Swap);
+        assert_eq!(t.get(2).unwrap().2, OkxInstType::Futures);
+    }
+
+    #[test]
+    fn inst_type_decodes_wire_strings() {
+        assert_eq!(OkxInstType::from_bytes(b"SPOT"), Some(OkxInstType::Spot));
+        assert_eq!(OkxInstType::from_bytes(b"SWAP"), Some(OkxInstType::Swap));
+        assert_eq!(OkxInstType::from_bytes(b"FUTURES"), Some(OkxInstType::Futures));
+        assert_eq!(OkxInstType::from_bytes(b"OPTION"), None);
+        assert_eq!(OkxInstType::from_bytes(b""), None);
+        assert_eq!(OkxInstType::Swap.as_str(), "SWAP");
+    }
+
+    #[test]
     fn symbol_table_rejects_bad_input() {
         let mut t = OkxSymbolTable::new();
-        assert_eq!(t.insert(b"", 1), Err(SymbolTableErr::Empty));
+        assert_eq!(t.insert(b"", 1, OkxInstType::Spot), Err(SymbolTableErr::Empty));
         assert_eq!(
-            t.insert(&[b'A'; OKX_INST_ID_MAX + 1], 1),
+            t.insert(&[b'A'; OKX_INST_ID_MAX + 1], 1, OkxInstType::Spot),
             Err(SymbolTableErr::TooLong)
         );
         let mut i = 0u32;
         while (i as usize) < OKX_MAX_SYMBOLS {
-            t.insert(format!("S{i}").as_bytes(), i).unwrap();
+            t.insert(format!("S{i}").as_bytes(), i, OkxInstType::Spot).unwrap();
             i += 1;
         }
-        assert_eq!(t.insert(b"OVER", 99), Err(SymbolTableErr::Full));
+        assert_eq!(
+            t.insert(b"OVER", 99, OkxInstType::Spot),
+            Err(SymbolTableErr::Full)
+        );
     }
 
     // ---- seq chain -----------------------------------------------

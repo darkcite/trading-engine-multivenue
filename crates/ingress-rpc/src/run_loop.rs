@@ -54,7 +54,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{LatencyClass, NsTs, Signal, SignalSource, SymbolId, SYMBOL_ID_NONE};
+use core_types::{Capture, LatencyClass, NsTs, Signal, SignalSource, SymbolId, SYMBOL_ID_NONE};
 
 use crate::{
     classify_rpc, parse_block_number_result, parse_hex_u64, parse_new_head_notification,
@@ -295,18 +295,21 @@ impl Driver {
 ///   signal and bumps `IngressStatus::ring_drops` (D4).
 /// * `status`: per-ingress observability slot (D4/D5/D7). This ingress
 ///   thread is its single writer.
+/// * `capture`: §6.5 replay/tap sink — raw frames pre-classify,
+///   signals pre-push, parse rejects at the reject site.
 ///
 /// # Errors
 ///
 /// Any transport error is surfaced so the outer scheduler can close +
 /// reconnect.
-pub fn drive_one<T: Transport>(
+pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     flush_tx(transport, drv)?;
     fill_rx(transport, drv)?;
@@ -328,7 +331,7 @@ pub fn drive_one<T: Transport>(
         }
         State::Steady => {
             maybe_queue_block_number_poll(drv)?;
-            drain_ws_frames(drv, producer, status)?;
+            drain_ws_frames(drv, producer, status, capture)?;
         }
         State::Closed => {}
     }
@@ -489,10 +492,11 @@ fn take_pending(drv: &mut Driver, id: u64) -> Option<RpcKind> {
 // Frame drain + dispatch
 // ---------------------------------------------------------------
 
-fn drain_ws_frames(
+fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -517,7 +521,7 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_json_frame(drv, payload.start..payload.end, producer, status);
+                        handle_json_frame(drv, payload.start..payload.end, producer, status, capture);
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -576,16 +580,21 @@ enum Dispatch {
     },
 }
 
-fn handle_json_frame(
+fn handle_json_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) {
+    // Retained for the phase-2 reject re-borrow (Range is not Copy).
+    let reject_range = payload_range.clone();
     // Phase 1: immutable-borrow phase — classify and pre-parse
     // everything we might need. Zero-alloc scanners over `&[u8]`.
+    // The §6.5 raw tap sees every data payload pre-classify.
     let dispatch: Dispatch = {
         let payload = &drv.rx.filled()[payload_range];
+        capture.raw_frame(now_ns(), payload);
         match classify_rpc(payload) {
             RpcFrameKind::Subscription => parse_new_head_notification(payload)
                 .map(Dispatch::EmitNewHead)
@@ -622,17 +631,23 @@ fn handle_json_frame(
     // frame classified/parsed to nothing usable — one parser
     // rejection; every other arm is one handled JSON-RPC envelope.
     match dispatch {
-        Dispatch::Nothing => status.inc_parse_errors(),
+        Dispatch::Nothing => {
+            status.inc_parse_errors();
+            // Tap the rejected payload (re-borrow is safe: dispatch is
+            // Copy and the rx buffer is untouched since phase 1). The
+            // §6.5 raw-tap differential audit consumes these.
+            capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
+        }
         Dispatch::EmitNewHead(head) => {
             status.add_msgs(1);
-            emit_new_head_signal(producer, status, head);
+            emit_new_head_signal(producer, status, head, capture);
         }
         Dispatch::Response { id, block, sub_id } => {
             status.add_msgs(1);
             match take_pending(drv, id) {
                 Some(RpcKind::BlockNumber) => {
                     if let Some(b) = block {
-                        emit_block_number_signal(producer, status, b);
+                        emit_block_number_signal(producer, status, b, capture);
                     }
                 }
                 Some(RpcKind::SubscribeNewHeads) => {
@@ -704,10 +719,11 @@ fn pack_block_number_into_payload(block: u64) -> [u8; 40] {
     out
 }
 
-fn emit_new_head_signal(
+fn emit_new_head_signal<C: Capture>(
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
     head: NewHead,
+    capture: &mut C,
 ) {
     let sig = Signal::new(
         now_ns(),
@@ -716,16 +732,21 @@ fn emit_new_head_signal(
         SignalSource::Rpc as u8,
         pack_new_head_into_payload(head),
     );
+    // §6.5 capture BEFORE the push — a ring-dropped signal must
+    // still reach the signal log (the audit pairs capture
+    // counts with ring_drops_total).
+    capture.signal(&sig);
     // D4: a full ring is data loss — count it, never block.
     if producer.try_push(sig).is_err() {
         status.inc_ring_drops();
     }
 }
 
-fn emit_block_number_signal(
+fn emit_block_number_signal<C: Capture>(
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
     block: u64,
+    capture: &mut C,
 ) {
     let sig = Signal::new(
         now_ns(),
@@ -734,6 +755,10 @@ fn emit_block_number_signal(
         SignalSource::Rpc as u8,
         pack_block_number_into_payload(block),
     );
+    // §6.5 capture BEFORE the push — a ring-dropped signal must
+    // still reach the signal log (the audit pairs capture
+    // counts with ring_drops_total).
+    capture.signal(&sig);
     // D4: a full ring is data loss — count it, never block.
     if producer.try_push(sig).is_err() {
         status.inc_ring_drops();
@@ -799,7 +824,8 @@ pub type StopFlag = AtomicBool;
 /// Phase 8a: `status` is this thread's observability slot (D4/D5/D7);
 /// `keepalive` supplies the idle deadline (D5) — see the comment at
 /// the poll site for the venue-specific ping choice.
-pub fn run<T: Transport>(
+#[allow(clippy::too_many_arguments)]
+pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
@@ -811,6 +837,7 @@ pub fn run<T: Transport>(
     stop: &StopFlag,
     status: &IngressStatus,
     keepalive: &mut Keepalive,
+    capture: &mut C,
 ) -> RunResult {
     // Session base-time for the idle clock (a connection that never
     // delivers a byte must still time out) + fresh ping schedule.
@@ -848,7 +875,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status).is_err() {
+            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -858,6 +885,11 @@ pub fn run<T: Transport>(
                 break;
             }
         }
+
+        // §6.5: staged capture reaches disk within the flush interval
+        // even on quiet feeds (one clock read + one branch per poll
+        // iteration; ~50 ms cadence).
+        capture.maybe_flush(now_ns());
 
         // Keepalive (D5) — venue-specific choice: this feed already
         // runs its own JSON-RPC liveness probe (`eth_blockNumber`
@@ -906,6 +938,7 @@ mod tests {
         KeepaliveCfg, PendingReq, TestTransport,
     };
     use core_ring::Ring;
+    use core_types::NullCapture;
 
     /// Keepalive that never fires within a test's lifetime.
     fn generous_keepalive() -> Keepalive {
@@ -977,7 +1010,7 @@ mod tests {
         let (mut prod, _cons) = ring.split();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status, &mut NullCapture).unwrap();
         // Drain the GET handshake so it doesn't confuse later assertions.
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
@@ -987,7 +1020,7 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.subscribed);
         // D7: entering Steady must publish Up; D5: the 101 response
@@ -1040,7 +1073,7 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.sub_count(), 1);
         assert_eq!(d.pending_count(), 0);
         assert_eq!(d.subs.kind_of(SubId(0xDEADBEEF)), Some(SubKind::NewHeads));
@@ -1068,7 +1101,7 @@ mod tests {
         let n = wrap_text_frame(body, &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1103,7 +1136,7 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
 
         let sig = cons.try_pop().expect("signal must be pushed");
@@ -1136,7 +1169,7 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.pending_count(), 0);
         // A well-formed error envelope is handled, not rejected.
         assert_eq!(status.msgs_total(), 1);
@@ -1232,7 +1265,7 @@ mod tests {
         let (mut prod, _cons) = ring.split();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1240,7 +1273,8 @@ mod tests {
         let resp = build_server_response(&wrong_accept);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap_err();
+        let err =
+            drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // A failed upgrade must never publish Up.
         assert_eq!(status.state(), IngressState::Down);
@@ -1264,7 +1298,7 @@ mod tests {
         let n = wrap_text_frame(b"{\"nonsense\":true}", &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         // The frame still counts as inbound activity (D5).
@@ -1304,6 +1338,7 @@ mod tests {
             &stop,
             &status,
             &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -1338,10 +1373,87 @@ mod tests {
             &stop,
             &status,
             &mut ka,
+            &mut NullCapture,
         );
         // The Close must surface as Disconnected — never IdleTimeout.
         assert_eq!(res, RunResult::Disconnected);
         // D5 accounting saw the 2-byte Close frame.
         assert_eq!(status.bytes_total(), 2);
+    }
+
+    /// Records every hook invocation — pins the §6.5 capture-site
+    /// semantics without touching the filesystem.
+    #[derive(Default)]
+    struct CountingCapture {
+        signals: u32,
+        raw_frames: u32,
+        rejects: u32,
+        flushes: u32,
+        last_source: u8,
+    }
+
+    impl core_types::Capture for CountingCapture {
+        fn signal(&mut self, s: &Signal) {
+            self.signals += 1;
+            self.last_source = s.source;
+        }
+        fn raw_frame(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.raw_frames += 1;
+        }
+        fn parse_reject(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.rejects += 1;
+        }
+        fn maybe_flush(&mut self, _now_ns: u64) {
+            self.flushes += 1;
+        }
+    }
+
+    #[test]
+    fn capture_hooks_fire_at_documented_sites() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
+        let mut cap = CountingCapture::default();
+
+        // One newHeads notification (signal + raw), one garbage frame
+        // (reject + raw).
+        let head = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab","result":{"number":"0x2a","timestamp":"0x65","gasUsed":"0x1"}}}"#;
+        let garbage = br#"{"nonsense":true}"#;
+        let mut frame_buf = [0u8; 512];
+        for payload in [&head[..], &garbage[..]] {
+            let n = wrap_text_frame(payload, &mut frame_buf);
+            t.inject_incoming(&frame_buf[..n]);
+        }
+
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.raw_frames, 2, "every inbound payload tapped pre-classify");
+        assert_eq!(cap.signals, 1, "newHeads captured as signal");
+        assert_eq!(cap.last_source, SignalSource::Rpc as u8);
+        assert_eq!(cap.rejects, 1, "garbage frame tapped as reject");
+        assert_eq!(status.parse_errors_total(), 1);
+        assert_eq!(status.ring_drops_total(), 0);
+        assert_eq!(cap.flushes, 0, "drive_one never flushes; run() owns the cadence");
+
+        // Signal still captured when the ring is full: fill it, resend.
+        let filler = Signal::new(
+            1,
+            RPC_CROSS_SYM,
+            LatencyClass::Warm,
+            SignalSource::Rpc as u8,
+            [0u8; 40],
+        );
+        while prod.try_push(filler).is_ok() {}
+        let n = wrap_text_frame(head, &mut frame_buf);
+        t.inject_incoming(&frame_buf[..n]);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.signals, 2, "ring-dropped signal still captured");
+        assert_eq!(status.ring_drops_total(), 1);
     }
 }

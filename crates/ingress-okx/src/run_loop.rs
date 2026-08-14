@@ -43,13 +43,13 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Price, Qty, Tick, VenueId};
+use core_types::{Capture, ChannelEvent, ChannelId, Price, Qty, Tick, VenueId};
 
 use crate::{
     classify, extract_inst_id, parse_bbo, parse_book_header, parse_trade, sub_id_of,
-    write_subscribe_batch, write_unsubscribe_batch, ChainOutcome, OkxChannel, OkxMsgKind,
-    OkxSeqChain, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome, OKX_MAX_SYMBOLS,
-    PING_PAYLOAD,
+    write_subscribe_batch, write_unsubscribe_batch, ChainOutcome, OkxChannel, OkxInstType,
+    OkxMsgKind, OkxSeqChain, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome,
+    OKX_MAX_SYMBOLS, PING_PAYLOAD,
 };
 
 // ---------------------------------------------------------------
@@ -269,13 +269,14 @@ impl Driver {
 ///   and bumps `IngressStatus::ring_drops`.
 /// * `status`: per-ingress observability slot; this thread is its
 ///   single writer.
-pub fn drive_one<T: Transport>(
+pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     flush_tx(transport, drv)?;
     fill_rx(transport, drv)?;
@@ -293,7 +294,7 @@ pub fn drive_one<T: Transport>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, status)?;
+            drain_ws_frames(drv, producer, status, capture)?;
         }
         State::Closed => {}
     }
@@ -407,9 +408,10 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()
 // ---------------------------------------------------------------
 
 /// Build the full `(channel × instrument)` arg set from the symbol
-/// table. `mark-price`/`funding-rate` only apply to perp swaps —
-/// gated on the `-SWAP` instId suffix until REST discovery carries
-/// `instType` (8e). `books` rides behind `depth_enabled`.
+/// table, gated on the discovered `instType` (8e — replaces the
+/// retired `-SWAP` suffix hack): `mark-price` applies to derivatives
+/// (`Swap` | `Futures`), `funding-rate` to `Swap` only. `books` rides
+/// behind `depth_enabled`.
 fn build_sub_args<'a>(
     symbols: &'a OkxSymbolTable,
     depth_enabled: bool,
@@ -417,14 +419,16 @@ fn build_sub_args<'a>(
 ) -> usize {
     let mut n = 0;
     let mut i = 0;
-    while let Some((inst, _sym)) = symbols.get(i) {
+    while let Some((inst, _sym, inst_type)) = symbols.get(i) {
         out[n] = Some(SubArg { channel: OkxChannel::BboTbt, inst_id: inst });
         n += 1;
         out[n] = Some(SubArg { channel: OkxChannel::Trades, inst_id: inst });
         n += 1;
-        if inst.ends_with(b"-SWAP") {
+        if matches!(inst_type, OkxInstType::Swap | OkxInstType::Futures) {
             out[n] = Some(SubArg { channel: OkxChannel::MarkPrice, inst_id: inst });
             n += 1;
+        }
+        if inst_type == OkxInstType::Swap {
             out[n] = Some(SubArg { channel: OkxChannel::FundingRate, inst_id: inst });
             n += 1;
         }
@@ -467,7 +471,7 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
 /// Queue an unsubscribe+subscribe pair for one `(books, instId)` —
 /// the §6.2 resync action after a chain break (fresh snapshot).
 fn queue_books_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
-    let Some((inst, _sym)) = drv.symbols.get(sym_idx) else {
+    let Some((inst, _sym, _inst_type)) = drv.symbols.get(sym_idx) else {
         debug_assert!(false, "resync for unknown symbol row {sym_idx}");
         return Ok(());
     };
@@ -517,10 +521,11 @@ enum Dispatch {
     Book { sym_idx: u8, prev: i64, seq: i64 },
 }
 
-fn drain_ws_frames(
+fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -545,7 +550,7 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_data_frame(drv, payload.start..payload.end, producer, status)?;
+                        handle_data_frame(drv, payload.start..payload.end, producer, status, capture)?;
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -588,8 +593,11 @@ fn drain_ws_frames(
 
 /// Walk the `trades` rows of one push. Rows are sliced at successive
 /// `"tradeId":"` markers; each slice parses independently (`px`/`sz`/
-/// `side`/`ts`/`seqId` all follow `tradeId` within a row).
-fn scan_trades(payload: &[u8], sym: u32) -> TradeScan {
+/// `side`/`ts`/`seqId` all follow `tradeId` within a row). Each parsed
+/// row is captured as a `ChannelId::Trade` event (§6.5): `venue_seq` =
+/// trade `seqId`, `venue_time_ms` from the venue ts, `v0` = px ×1e6,
+/// `v1` = qty ×1e6 negated for sell-side prints.
+fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
     const MARKER: &[u8] = b"\"tradeId\":\"";
     let mut scan = TradeScan {
         rows_parsed: 0,
@@ -610,24 +618,46 @@ fn scan_trades(payload: &[u8], sym: u32) -> TradeScan {
                     scan.seq_ids[scan.n_seq as usize] = t.seq_id;
                     scan.n_seq += 1;
                 }
+                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+                capture.event(&ChannelEvent::new(
+                    now_ns(),
+                    VenueId::Okx,
+                    ChannelId::Trade,
+                    sym,
+                    t.seq_id as u64,
+                    t.ts_ns / 1_000_000,
+                    t.px_1e6,
+                    signed_qty,
+                ));
             }
-            None => scan.rows_rejected += 1,
+            None => {
+                scan.rows_rejected += 1;
+                // Tap the exact rejected row slice — the §6.5 raw-tap
+                // differential audit consumes these.
+                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
+            }
         }
         at = row_end;
     }
     scan
 }
 
-fn handle_data_frame(
+fn handle_data_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     status: &IngressStatus,
+    capture: &mut C,
 ) -> io::Result<()> {
+    // Retained for the phase-2 reject re-borrow (Range is not Copy).
+    let reject_range = payload_range.clone();
     // Phase 1: immutable borrow of rx (+ symbols) — classify, resolve
-    // the instrument, pre-parse into a Copy dispatch value.
+    // the instrument, pre-parse into a Copy dispatch value. Capture
+    // hooks that need parsed values fire here (events); the raw tap
+    // sees every data payload pre-classify.
     let dispatch: Dispatch = {
         let payload = &drv.rx.filled()[payload_range];
+        capture.raw_frame(now_ns(), payload);
         match classify(payload) {
             OkxMsgKind::Pong => Dispatch::Quiet,
             OkxMsgKind::UnsubAck => Dispatch::Quiet,
@@ -666,24 +696,66 @@ fn handle_data_frame(
                         },
                         OkxChannel::Trades => Dispatch::Trades {
                             sym_idx: sym_idx as u8,
-                            scan: scan_trades(payload, sym),
+                            scan: scan_trades(payload, sym, capture),
                         },
                         OkxChannel::MarkPrice => match crate::parse_mark_price(payload, sym) {
-                            Some(_) => Dispatch::Slow,
+                            Some(m) => {
+                                // §6.5 capture: v0 = mark px ×1e6.
+                                capture.event(&ChannelEvent::new(
+                                    now_ns(),
+                                    VenueId::Okx,
+                                    ChannelId::Mark,
+                                    sym,
+                                    0,
+                                    m.ts_ns / 1_000_000,
+                                    m.mark_px_1e6,
+                                    0,
+                                ));
+                                Dispatch::Slow
+                            }
                             None => Dispatch::Nothing,
                         },
                         OkxChannel::FundingRate => {
                             match crate::parse_funding_rate(payload, sym) {
-                                Some(_) => Dispatch::Slow,
+                                Some(fr) => {
+                                    // §6.5 capture: v0 = rate ×1e9,
+                                    // v1 = next funding time (ms).
+                                    capture.event(&ChannelEvent::new(
+                                        now_ns(),
+                                        VenueId::Okx,
+                                        ChannelId::Funding,
+                                        sym,
+                                        0,
+                                        fr.ts_ns / 1_000_000,
+                                        fr.funding_rate_1e9,
+                                        (fr.funding_time_ns / 1_000_000) as i64,
+                                    ));
+                                    Dispatch::Slow
+                                }
                                 None => Dispatch::Nothing,
                             }
                         }
                         OkxChannel::Books => match parse_book_header(payload, sym) {
-                            Some(b) => Dispatch::Book {
-                                sym_idx: sym_idx as u8,
-                                prev: b.prev_seq_id,
-                                seq: b.seq_id,
-                            },
+                            Some(b) => {
+                                // §6.5 capture: venue_seq = seqId,
+                                // v0 = prevSeqId — the offline audit
+                                // re-derives chain breaks from these.
+                                capture.event(&ChannelEvent::new(
+                                    now_ns(),
+                                    VenueId::Okx,
+                                    ChannelId::Book,
+                                    sym,
+                                    b.seq_id as u64,
+                                    0,
+                                    b.prev_seq_id,
+                                    0,
+                                ));
+                                Dispatch::Book {
+                                    sym_idx: sym_idx as u8,
+                                    prev: b.prev_seq_id,
+                                    seq: b.seq_id,
+                                }
+                            }
                             None => Dispatch::Nothing,
                         },
                     },
@@ -698,7 +770,12 @@ fn handle_data_frame(
 
     // Phase 2: mutable applies. The rx borrow above has ended.
     match dispatch {
-        Dispatch::Nothing => status.inc_parse_errors(),
+        Dispatch::Nothing => {
+            status.inc_parse_errors();
+            // Tap the rejected payload (re-borrow is safe: dispatch is
+            // Copy and the rx buffer is untouched since phase 1).
+            capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
+        }
         Dispatch::Quiet => {}
         Dispatch::SubAck { id, kind } => {
             status.add_msgs(1);
@@ -723,6 +800,10 @@ fn handle_data_frame(
         }
         Dispatch::Bbo { tick } => {
             status.add_msgs(1);
+            // §6.5 capture BEFORE the push — a ring-dropped tick must
+            // still reach the replay log (the audit pairs capture
+            // counts with ring_drops_total).
+            capture.tick(&tick);
             // D4: a full ring is data loss — count it, never block.
             if producer.try_push(tick).is_err() {
                 status.inc_ring_drops();
@@ -800,7 +881,7 @@ pub type StopFlag = AtomicBool;
 /// connections at 30 s; cli configures a 25 s interval); on
 /// `Reconnect` the session is dead by policy → [`RunResult::IdleTimeout`].
 #[allow(clippy::too_many_arguments)]
-pub fn run<T: Transport>(
+pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
@@ -812,6 +893,7 @@ pub fn run<T: Transport>(
     stop: &StopFlag,
     status: &IngressStatus,
     keepalive: &mut Keepalive,
+    capture: &mut C,
 ) -> RunResult {
     let session_start_ns = now_ns();
     keepalive.reset();
@@ -844,7 +926,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status).is_err() {
+            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -854,6 +936,11 @@ pub fn run<T: Transport>(
                 break;
             }
         }
+
+        // §6.5: staged capture reaches disk within the flush interval
+        // even on quiet feeds (one clock read + one branch per poll
+        // iteration; ~50 ms cadence).
+        capture.maybe_flush(now_ns());
 
         // Keepalive: OKX wants a literal `ping` text frame; the
         // venue's `pong` (or any push) refreshes the activity clock.
@@ -903,14 +990,15 @@ mod tests {
         KeepaliveCfg, TestTransport,
     };
     use core_ring::Ring;
+    use core_types::NullCapture;
 
     /// Venue-namespaced test symbol (venue byte 2 = Okx, ordinal 1).
     const SYM_BTC: u32 = (2 << 24) | 1;
 
     fn test_symbols() -> OkxSymbolTable {
         let mut t = OkxSymbolTable::new();
-        t.insert(b"BTC-USDT", SYM_BTC).unwrap();
-        t.insert(b"ETH-USD-SWAP", (2 << 24) | 2).unwrap();
+        t.insert(b"BTC-USDT", SYM_BTC, OkxInstType::Spot).unwrap();
+        t.insert(b"ETH-USD-SWAP", (2 << 24) | 2, OkxInstType::Swap).unwrap();
         t
     }
 
@@ -1013,7 +1101,7 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"ws.okx.com", b"/ws/v5/public", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"ws.okx.com", b"/ws/v5/public", &mut prod, &status, &mut NullCapture).unwrap();
         let mut scratch = vec![0u8; 65536];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1022,7 +1110,7 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"ws.okx.com", b"/ws/v5/public", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"ws.okx.com", b"/ws/v5/public", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.subscribed);
         assert_eq!(status.state(), IngressState::Up);
@@ -1057,7 +1145,7 @@ mod tests {
         let n = wrap_text_frame(ack, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(d.sub_count(), 1);
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
@@ -1079,7 +1167,7 @@ mod tests {
         let n = wrap_text_frame(bbo, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1106,7 +1194,7 @@ mod tests {
         let n = wrap_text_frame(bbo, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert!(cons.try_pop().is_none());
@@ -1129,7 +1217,7 @@ mod tests {
         let n = wrap_text_frame(err, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap_err();
+        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1145,7 +1233,7 @@ mod tests {
         let mut frame = [0u8; 512];
         let n = wrap_text_frame(snap, &mut frame);
         t.inject_incoming(&frame[..n]);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.gaps_total(), 0);
         let mut scratch = vec![0u8; 16384];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1154,7 +1242,7 @@ mod tests {
         let broken = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[["1","1","0","1"]],"bids":[],"ts":"2000","checksum":0,"prevSeqId":99,"seqId":100}]}"#;
         let n = wrap_text_frame(broken, &mut frame);
         t.inject_incoming(&frame[..n]);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
 
         assert_eq!(status.gaps_total(), 1);
         assert_eq!(status.resubscribes_total(), 1);
@@ -1181,7 +1269,7 @@ mod tests {
         let n = wrap_text_frame(t2, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 2);
         assert_eq!(status.gaps_total(), 1, "seq 50 → 40 is a regression");
         assert_eq!(status.parse_errors_total(), 0);
@@ -1199,9 +1287,91 @@ mod tests {
         let n = wrap_text_frame(multi, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 2, "both rows counted");
         assert_eq!(status.gaps_total(), 0);
+    }
+
+    /// Records every hook invocation — pins the §6.5 capture-site
+    /// semantics without touching the filesystem.
+    #[derive(Default)]
+    struct CountingCapture {
+        ticks: u32,
+        events: u32,
+        raw_frames: u32,
+        rejects: u32,
+        flushes: u32,
+        last_event_channel: u8,
+    }
+
+    impl core_types::Capture for CountingCapture {
+        fn tick(&mut self, _t: &Tick) {
+            self.ticks += 1;
+        }
+        fn event(&mut self, e: &ChannelEvent) {
+            self.events += 1;
+            self.last_event_channel = e.channel;
+        }
+        fn raw_frame(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.raw_frames += 1;
+        }
+        fn parse_reject(&mut self, _ts_ns: u64, _payload: &[u8]) {
+            self.rejects += 1;
+        }
+        fn maybe_flush(&mut self, _now_ns: u64) {
+            self.flushes += 1;
+        }
+    }
+
+    #[test]
+    fn capture_hooks_fire_at_documented_sites() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = CountingCapture::default();
+
+        // One bbo (tick + raw), one trades push with one good + one
+        // broken row (event + reject + raw), one garbage frame
+        // (reject + raw).
+        let bbo = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["1.1","5","0","2"]],"bids":[["1.0","7","0","2"]],"ts":"1670324386802","seqId":1}]}"#;
+        let trades = br#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"1","px":"1.0","sz":"2.0","side":"sell","ts":"1000","seqId":50},{"instId":"BTC-USDT","tradeId":"2","broken":true}]}"#;
+        let garbage = br#"{"what":"ever"}"#;
+        let mut frame = [0u8; 1024];
+        for payload in [&bbo[..], &trades[..], &garbage[..]] {
+            let n = wrap_text_frame(payload, &mut frame);
+            t.inject_incoming(&frame[..n]);
+        }
+
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.raw_frames, 3, "every data payload is tapped");
+        assert_eq!(cap.ticks, 1, "bbo captured as tick");
+        assert_eq!(cap.events, 1, "one good trade row captured");
+        assert_eq!(cap.last_event_channel, core_types::ChannelId::Trade as u8);
+        assert_eq!(
+            cap.rejects, 2,
+            "broken trade row + garbage frame both tapped as rejects"
+        );
+        assert_eq!(status.parse_errors_total(), 2);
+        // Tick still captured when the ring is full: fill it, resend.
+        while prod.try_push(Tick::new(
+            1,
+            VenueId::Okx,
+            SYM_BTC,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        ))
+        .is_ok()
+        {}
+        let n = wrap_text_frame(bbo, &mut frame);
+        t.inject_incoming(&frame[..n]);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.ticks, 2, "ring-dropped tick still captured");
+        assert_eq!(status.ring_drops_total(), 1);
     }
 
     #[test]
@@ -1215,7 +1385,7 @@ mod tests {
         let n = wrap_text_frame(b"pong", &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert_eq!(status.msgs_total(), 0);
         assert_eq!(status.parse_errors_total(), 0);
         assert!(status.last_activity_ns() > 0, "pong refreshes the idle clock");
@@ -1252,7 +1422,7 @@ mod tests {
 
         let res = run(
             &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka,
+            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -1274,7 +1444,7 @@ mod tests {
 
         let res = run(
             &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka,
+            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
         let mut scratch = [0u8; 4096];
@@ -1301,7 +1471,7 @@ mod tests {
 
         let res = run(
             &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka,
+            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
         );
         assert_eq!(res, RunResult::Disconnected);
         assert_eq!(status.bytes_total(), 2);

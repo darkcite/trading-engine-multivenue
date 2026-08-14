@@ -122,6 +122,87 @@ pub fn write_get_request(
     Ok(cursor)
 }
 
+/// Write a `POST {path} HTTP/1.1\r\n…` request into `dst`, including the
+/// body. Zero-alloc.
+///
+/// Emits a fixed header set:
+///
+/// ```text
+/// POST {path} HTTP/1.1
+/// Host: {host}
+/// User-Agent: {user_agent}
+/// Accept: */*
+/// Accept-Encoding: identity
+/// Content-Type: {content_type}
+/// Content-Length: {body.len()}
+/// Connection: close
+/// ```
+///
+/// followed by the body bytes. Needed for venue REST endpoints that are
+/// POST-only (Hyperliquid `/info` — plan §8.1). Returns the total number
+/// of bytes written (headers + body). Fails with
+/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request — never
+/// allocates.
+#[inline]
+pub fn write_post_request(
+    dst: &mut [u8],
+    host: &[u8],
+    path: &[u8],
+    user_agent: &[u8],
+    content_type: &[u8],
+    body: &[u8],
+) -> Result<usize, HttpErr> {
+    let mut cursor = 0usize;
+
+    push(dst, &mut cursor, b"POST ")?;
+    push(dst, &mut cursor, path)?;
+    push(dst, &mut cursor, b" HTTP/1.1\r\n")?;
+
+    push(dst, &mut cursor, b"Host: ")?;
+    push(dst, &mut cursor, host)?;
+    push(dst, &mut cursor, b"\r\n")?;
+
+    push(dst, &mut cursor, b"User-Agent: ")?;
+    push(dst, &mut cursor, user_agent)?;
+    push(dst, &mut cursor, b"\r\n")?;
+
+    push(dst, &mut cursor, b"Accept: */*\r\n")?;
+    push(dst, &mut cursor, b"Accept-Encoding: identity\r\n")?;
+
+    push(dst, &mut cursor, b"Content-Type: ")?;
+    push(dst, &mut cursor, content_type)?;
+    push(dst, &mut cursor, b"\r\n")?;
+
+    push(dst, &mut cursor, b"Content-Length: ")?;
+    // u64 → ASCII into a stack scratch; 20 digits max.
+    let mut len_buf = [0u8; 20];
+    let len_ascii = fmt_u64_ascii(body.len() as u64, &mut len_buf);
+    push(dst, &mut cursor, len_ascii)?;
+    push(dst, &mut cursor, b"\r\n")?;
+
+    push(dst, &mut cursor, b"Connection: close\r\n\r\n")?;
+
+    push(dst, &mut cursor, body)?;
+
+    Ok(cursor)
+}
+
+/// Render `v` as decimal ASCII into the tail of `scratch`, returning the
+/// written subslice. Zero-alloc; `scratch` must be ≥ 20 bytes (max u64).
+#[inline]
+fn fmt_u64_ascii(mut v: u64, scratch: &mut [u8; 20]) -> &[u8] {
+    let mut i = scratch.len();
+    loop {
+        i -= 1;
+        scratch[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &scratch[i..]
+}
+
 #[inline]
 fn push(dst: &mut [u8], cursor: &mut usize, src: &[u8]) -> Result<(), HttpErr> {
     let end = cursor
@@ -452,6 +533,55 @@ mod tests {
     }
 
     #[test]
+    fn write_post_request_emits_expected_bytes() {
+        let mut buf = [0u8; 512];
+        let n = write_post_request(
+            &mut buf,
+            b"api.hyperliquid.xyz",
+            b"/info",
+            b"pm/0.1",
+            b"application/json",
+            b"{\"type\":\"meta\"}",
+        )
+        .unwrap();
+        let got = &buf[..n];
+        let expected: &[u8] = b"POST /info HTTP/1.1\r\nHost: api.hyperliquid.xyz\r\nUser-Agent: pm/0.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"type\":\"meta\"}";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn write_post_request_empty_body_has_zero_content_length() {
+        let mut buf = [0u8; 256];
+        let n = write_post_request(&mut buf, b"h", b"/", b"ua", b"text/plain", b"").unwrap();
+        let got = &buf[..n];
+        assert!(
+            memchr::memmem::find(got, b"Content-Length: 0\r\n").is_some(),
+            "missing zero content-length: {}",
+            String::from_utf8_lossy(got)
+        );
+        assert!(got.ends_with(b"\r\n\r\n"));
+    }
+
+    #[test]
+    fn write_post_request_rejects_tiny_buffer() {
+        let mut buf = [0u8; 16];
+        assert!(matches!(
+            write_post_request(&mut buf, b"h", b"/", b"ua", b"a/b", b"xyz"),
+            Err(HttpErr::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn fmt_u64_ascii_renders_digits() {
+        let mut s = [0u8; 20];
+        assert_eq!(fmt_u64_ascii(0, &mut s), b"0");
+        let mut s = [0u8; 20];
+        assert_eq!(fmt_u64_ascii(15, &mut s), b"15");
+        let mut s = [0u8; 20];
+        assert_eq!(fmt_u64_ascii(u64::MAX, &mut s), b"18446744073709551615");
+    }
+
+    #[test]
     fn read_response_incomplete_before_headers_terminate() {
         let r = read_response(b"HTTP/1.1 200 OK\r\nHost: x\r\n");
         assert_eq!(r, HttpResult::Incomplete);
@@ -639,6 +769,39 @@ mod proptests {
             let res = write_get_request(&mut buf, host.as_bytes(), path.as_bytes(), ua.as_bytes());
             match res {
                 Ok(n) => prop_assert!(n <= buf.len()),
+                Err(HttpErr::BufferTooSmall) => {}
+            }
+        }
+
+        /// `write_post_request` is panic-free, bounded, and on success
+        /// the declared `Content-Length` matches the appended body,
+        /// with the body occupying the exact tail of the request.
+        #[test]
+        fn write_post_request_bounded_and_consistent(
+            host in "[a-z0-9.-]{1,64}",
+            path in "/[a-zA-Z0-9/_-]{0,64}",
+            ua in "[a-zA-Z0-9./_+-]{1,16}",
+            body in proptest::collection::vec(any::<u8>(), 0..256),
+            buf_size in 64usize..2048,
+        ) {
+            let mut buf = vec![0u8; buf_size];
+            let res = write_post_request(
+                &mut buf,
+                host.as_bytes(),
+                path.as_bytes(),
+                ua.as_bytes(),
+                b"application/json",
+                &body,
+            );
+            match res {
+                Ok(n) => {
+                    prop_assert!(n <= buf.len());
+                    prop_assert!(buf[..n].ends_with(&body));
+                    // Headers region terminates with the blank line right
+                    // before the body.
+                    let header_len = n - body.len();
+                    prop_assert!(buf[..header_len].ends_with(b"\r\n\r\n"));
+                }
                 Err(HttpErr::BufferTooSmall) => {}
             }
         }

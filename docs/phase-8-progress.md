@@ -3,6 +3,163 @@
 Working notes per the Stage-1 operating agreement: each entry records
 what is done, what is next, and open issues at a clean boundary.
 
+## 2026-08-15 (seventh entry) — 8e COMPLETE: discovery + capture + audit-replay live-verified; Deribit ~1.3% ROOT-CAUSED AND FIXED (zero rejects, zero gaps)
+
+Stage-1's last code phase. Everything below is uncommitted (no git ops
+per standing rule); tree state = 4ca8ca1 + the full 8e diff (≈50
+files). G1 24 h soaks are now unblocked and operator-run.
+
+### Delivered
+
+- **Probes first (house pattern, again paid for itself)**: real
+  response shapes of all four discovery endpoints captured before any
+  parser was written (`/tmp/8e-probe/*.json`). Live facts the docs
+  don't carry: Deribit REST emits bare floats incl. scientific
+  notation (`"tick_size": 1e-05`); HL `perpDexs[0]` is `null` (native
+  dex slot); PM Gamma `clobTokenIds` is a double-encoded JSON string;
+  OKX rows mix quoted decimals with bare numbers/bools/arrays.
+- **core-net**: `http1::write_post_request` (HL `/info` is POST) +
+  proptest; new `boot_http` module — boot-only blocking HTTPS/1.1
+  fetcher over rustls (documented alloc exception; body as
+  `Range<usize>` into the caller's buffer; Content-Length early-exit,
+  in-place dechunk, budget + deadline), TLS-loopback tested (8 tests).
+- **core-parse**: `scan_number_sci_1e9`/`scan_number_sci_1e6` (shared
+  scaled body — sci-notation numerics), `skip_ws`/`skip_string`/
+  `skip_json_value` (iterative, depth-capped structural skipper).
+  Unit + proptests.
+- **Boot REST discovery, all four venues** (`discovery.rs` per ingress
+  crate; boot-only fixed-cap tables; every parser proptested + fuzzed:
+  `okx_instruments`, `deribit_instruments`, `hl_info`,
+  `pm_gamma_markets` registered in fuzz/Cargo.toml):
+  - OKX: 3 instType pages; `tickSz`/`lotSz`/`ctVal` ×1e9 captured;
+    `OkxSymbolTable` rows now carry `OkxInstType` — **the `-SWAP`
+    suffix hack is deleted**; mark-price gates on Swap|Futures,
+    funding on Swap only.
+  - Deribit: BTC+ETH+USDC `kind=future` (options excluded v1);
+    `tick_size` + `tick_size_steps` (≤4) + `contract_size` +
+    `min_trade_amount` ×1e9; dotted-name invariant enforced.
+  - HL: meta/spotMeta/perpDexs/outcomeMeta; full asset-id scheme
+    (perp = universe index; spot `@N` = 10000+N; HIP-3 `dex:COIN`
+    name-validated, per-dex meta deferred; HIP-4 `#enc` =
+    100_000_000+enc with side-count validation). Closes the 8d
+    deferral.
+  - PM: Gamma by `clob_token_ids` — completes D1 venue-side: flags
+    (active/acceptingOrders/enableOrderBook/closed/negRisk), tick +
+    min-size, sibling (No-side) token via `sibling_of`.
+  - cli boot sequence (rate-paced 150 ms / 1.05 s / 250 ms), §6.1
+    coverage log line + `engine_ingress_<venue>_coverage_configured`
+    gauge per venue; any fetch/parse failure fatal in BOTH modes;
+    missing configured symbol fatal in `--live`, warned in paper.
+    BN/RPC: no discovery (documented).
+- **PMLR capture wired into the shipped run path (the sixth-entry
+  defect, fixed)**: new `core_types::{Capture, NullCapture,
+  ChannelEvent, ChannelId}` (64-B POD, `SlotKind::Event = 5`; 4 stays
+  reserved for AiCmd), `core_io::PmlrCapture` (per-venue
+  `<label>-{ticks,events,signals}.pmlr` + optional bounded
+  `<label>-raw.tap`, 1 s flush cadence, sticky-disable-on-io-error
+  policy documented, `Drop` drains). Every ingress run loop takes a
+  monomorphized `capture: &mut C` (no dyn) with hooks: tick-before-
+  push (ring-dropped ticks still captured), per-channel events,
+  parse_reject at every parse-error site, raw_frame pre-classify,
+  maybe_flush per poll. `MULTIVENUE_LOG_DIR` tilde-expands; run dir =
+  `<log_dir>/run-<epoch_ns>`. Gauges:
+  `engine_ingress_<venue>_capture_{io_errors,records}`.
+  wire-format.md + migration.md updated (ChannelEvent layout, tap
+  format `PMRT` v1, SlotKind table).
+- **`--raw-tap <csv|all>` / `--raw-tap-mode <rejects|all>` /
+  `--raw-tap-budget-mb`** on `run` (off by default; budget-bounded
+  first-N capture — documented deviation from §6.5's ring sketch).
+- **`audit-replay --dir`** subcommand: venue×channel coverage matrix,
+  per-symbol rates + inter-arrival histograms vs CORRECTED cadence
+  bands (okx bbo 10 ms floor, okx books/mark + deribit book 100–200 ms,
+  HL l2Book 2–6 s band around the measured ~3.3 s, event-driven = no
+  band), integrity re-derivations (tick seq regressions; book chain
+  breaks honoring snapshot/heartbeat/reset rules; **trade holes
+  derived for Deribit only** — OKX trade seqIds share the book-wide
+  sequence and legitimately jump), raw-tap reject previews. Golden
+  synthesized-run tests.
+- **Deferred small items closed**: TUI `ingest_health` bits 4/5/6 =
+  okx/deribit/hl (appended, never renumbered); okx/deribit/hl WS+REST
+  hosts moved from inline cli consts to core-config env keys with
+  defaults (`OKX_WS_PUBLIC_HOST`, `OKX_REST_HOST`, `DERIBIT_WS_HOST`,
+  `DERIBIT_REST_HOST`, `HYPERLIQUID_WS_HOST`, `HYPERLIQUID_API_HOST`;
+  .env.example updated).
+- **Bench**: all six run-loop steady-state alloc assertions now run
+  with a REAL `PmlrCapture` (tap `All`) — the whole capture path is
+  proven **0 B/op** in-window, incl. staging flushes; okx pins exact
+  capture counts.
+
+### Live-wire finds (three boots against real venues during 8e)
+
+1. **OKX pre-listing rows**: `state:"preopen"` instruments (caught on
+   `JP225-USDT-SWAP` the day before listing) carry EMPTY
+   `tickSz`/`lotSz` and `instIdCode:null`. Parser now accepts empty
+   numerics on non-live rows only (live rows without tick/lot =
+   BadRow); preopen is excluded from the live universe.
+2. **OKX long instIds**: FUTURES page now lists pre-market perps like
+   `MOODENG-USD_UM_XPERP-310815` (27 bytes) — `OKX_INST_ID_MAX`
+   raised 24 → 32.
+3. **Deribit ~1.3% ROOT-CAUSED — two parser defects, zero venue
+   fault** (first `--raw-tap deribit` run captured 7 reject payloads):
+   (a) the starbase engine rollout **reordered trade rows**
+   (`timestamp`/`price`/`direction` now precede `trade_seq`; new
+   `starbase_match_id`/`starbase_timestamp` fields follow) — 8c's
+   `"trade_seq":`-marker row slicing straddled two rows, so
+   single-trade frames lost their head fields (the rejects) and every
+   reject holed the monitor (the phantom trade-seq gaps);
+   (b) round amounts arrive in **scientific notation**
+   (`"amount": 1.0e3`) which the strict decimal scanner rejected.
+   Fixed: object-extent row slicing (order-tolerant both wire
+   layouts) + sci-capable numeric scans across the Deribit parsers;
+   regression test uses the real tapped bytes. **DeribitTradeSeq's
+   strictly-sequential policy stands, now evidence-based**: the final
+   run's 158 trades re-derived offline show holes=0.
+
+### Verification
+
+- Mac gates (authoritative): `cargo nextest run --workspace`
+  **824/824** (697 baseline + 127 added by 8e); release alloc gate
+  **30/30, 0 B/op** — all six ingress steady-state fns with live
+  capture + tap. Fuzz `cargo check` clean (4 new targets).
+- **Final live confirmation run** (~3 min, all seven connectors, tap
+  on deribit): coverage okx 3/3 of 1951 · deribit 2/2 of 92 · hl 3/3
+  of 572 (= 232 perps + 324 spot + 8×2 outcomes, exact) · pm 1/1;
+  every parse_errors/gaps/ring_drops/capture_io_errors counter **0**
+  across all venues; deribit 1664+ msgs **0 rejects 0 gaps** (was
+  ~1.3% + gaps); deribit-raw.tap = header only (zero rejects all
+  run); capture run dir fully populated (18 pmlr files + tap);
+  `audit-replay` over it: all okx tick/mark verdicts IN-BAND, all
+  chain_breaks=0, holes=0.
+
+### Open / notes for the operator
+
+1. **RPC stays open** pending the real `ALCHEMY_HOST`+key: the
+   stand-in's `eth_subscription` newHeads (nulled blob fields etc.)
+   are now raw-tapped (`--raw-tap rpc`) — first run with the real
+   endpoint will confirm or give us the exact diff in one pass.
+2. G1 §6.6 soaks: run per-venue + all-venue 24 h with capture on
+   (always on now) and judge with
+   `multivenue-engine audit-replay --dir <run dir>`; add
+   `--raw-tap deribit` if any deribit counter moves.
+3. OKX trades still use `"tradeId":`-marker row slicing (its needed
+   fields all sit after the marker on today's wire — live-verified
+   clean) — same latent fragility class as the Deribit find;
+   candidate for object-extent slicing in a later pass.
+4. Binance REST discovery deliberately out of Phase-8 scope
+   (plan §4 has no BN discovery bullet).
+5. HIP-3 per-dex meta (`{"type":"meta","dex":...}`) not fetched v1 —
+   a configured `dex:COIN` validates the dex name only (market-data
+   subscribe keys on the coin string, so Stage-1 correctness holds).
+6. Session facts for the next session: the Cowork-sandbox mount now
+   gives cargo FALSE GREENS (stale-fingerprint skips) — compile/test
+   ONLY on the Mac; after file edits, impossible-looking unresolved-
+   import errors on the Mac = stale rmeta → `cargo clean -p <crates>`
+   and retry. The engine stops on SIGINT (a doubled signal was needed
+   once — likely a racing command, not a defect; watch it).
+7. Paper orders again fired off live PM ticks (latency-arb default
+   pairing) — mechanically fine, economically meaningless; strategy
+   config remains a soak-time concern.
+
 ## 2026-08-14 (sixth entry) — first live all-connector test: 3 wire defects found + fixed; ALL SEVEN CONNECTORS DELIVERING
 
 Operator-ordered live paper run on the Mac (first ever boot of the

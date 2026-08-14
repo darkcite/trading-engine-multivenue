@@ -142,3 +142,31 @@ path   = "fuzz_targets/hl_l2book.rs"
 test   = false
 doc    = false
 bench  = false
+
+[[bin]]
+name   = "okx_instruments"
+path   = "fuzz_targets/okx_instruments.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "deribit_instruments"
+path   = "fuzz_targets/deribit_instruments.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hl_info"
+path   = "fuzz_targets/hl_info.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "pm_gamma_markets"
+path   = "fuzz_targets/pm_gamma_markets.rs"
+test   = false
+doc    = false
+bench  = false

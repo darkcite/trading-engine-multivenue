@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, TlsTransport};
 use core_ring::Ring;
-use core_types::{SymbolId, Tick};
+use core_types::{NullCapture, SymbolId, Tick};
 use ingress_polymarket::run_loop::{
     drive_one, note_transport_ready, Driver, State, SymbolMap, DEFAULT_TICK_RING_CAP,
 };
@@ -213,6 +213,7 @@ fn polymarket_tls_loopback_yields_expected_tick() {
             &mut prod,
             &symbol_map,
             &status,
+            &mut NullCapture,
         )
         .expect("drive_one");
         got = cons.try_pop();
