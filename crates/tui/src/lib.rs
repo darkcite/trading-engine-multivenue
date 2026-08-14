@@ -15,11 +15,17 @@
 //! 3. On SIGINT the engine drops the snapshot, the TUI sees `stop`
 //!    flip, restores the terminal, and exits.
 //!
-//! The cell is a `Mutex<DashboardState>` for v1. The mutex is held
-//! only for the duration of a memcpy (a few hundred bytes) and is
-//! never contested by the engine outside the publish call. Phase 5
-//! may swap this for a seqlock-style atomic ptr if profile-guided
-//! benchmarks demand it.
+//! The cell is a single-writer **seqlock**: a version counter
+//! (odd = write in flight) bracketing a plain `DashboardState`
+//! slot. The engine's `publish` is wait-free (two atomic stores +
+//! one POD copy); the TUI's `read` retries only if it observed a
+//! concurrent write. Chosen over `std::sync::Mutex` in Phase 8a:
+//! on Darwin, std's `Mutex` falls back to the pthread
+//! implementation, which lazily heap-allocates its 64-byte
+//! `pthread_mutex_t` on first lock — a hidden allocation on the
+//! engine thread that broke the zero-alloc gate on macOS. The
+//! seqlock has no OS object, no poisoning, and identical behaviour
+//! on every platform.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -31,9 +37,9 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+use std::cell::UnsafeCell;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use book_builder::TopOfBook;
@@ -119,48 +125,101 @@ impl Default for DashboardState {
 }
 
 /// Cross-thread snapshot pump. The engine calls `publish`; the TUI
-/// calls `read`. Both are non-allocating once constructed.
+/// calls `read`. Single-writer seqlock — zero allocation, no OS
+/// lock object, on every platform.
+///
+/// Protocol: `seq` even = slot stable, odd = writer mid-copy. The
+/// writer brackets its copy with an Acquire RMW (odd) and a Release
+/// store (even); readers copy the slot and revalidate the version,
+/// discarding any copy that overlapped a write.
+///
+/// **Single-writer contract:** exactly one thread (the engine
+/// thread) may call `publish`. Enforced by `debug_assert!` only —
+/// a second publisher is a design error upstream.
+#[repr(C, align(64))]
 pub struct SnapshotCell {
-    inner: Mutex<DashboardState>,
+    /// Version counter. Even = stable; odd = write in flight.
+    /// `DashboardState` is `#[repr(align(64))]`, so `data` starts
+    /// on its own cache line and reader version-polling does not
+    /// false-share with the payload copy.
+    seq: AtomicU64,
+    data: UnsafeCell<DashboardState>,
 }
+
+// SAFETY: all cross-thread access to `data` is mediated by the
+// seqlock protocol on `seq`. The single writer (contract above)
+// brackets its non-atomic copy with an odd version (Acquire RMW —
+// the copy cannot be reordered before the odd version is visible)
+// and an even version (Release store — the copy is visible before
+// the new version). Readers copy `data` and then revalidate `seq`
+// behind an Acquire fence, so any copy that overlapped a write is
+// discarded and retried; a torn copy of the `Copy`-POD
+// `DashboardState` (no invalid bit patterns, no pointers) is
+// materialized at most transiently and never returned.
+unsafe impl Sync for SnapshotCell {}
 
 impl SnapshotCell {
     /// Build an empty cell.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            inner: Mutex::new(DashboardState::empty()),
+            seq: AtomicU64::new(0),
+            data: UnsafeCell::new(DashboardState::empty()),
         }
     }
 
-    /// Publish the latest snapshot. O(1) memcpy under a short-held
-    /// lock; uncontested in practice. Poisoned-lock recovery: the
-    /// previous publisher panicked mid-write, but `DashboardState`
-    /// is `Copy` + POD — the half-updated state is structurally
-    /// valid garbage rather than torn-pointer UB. Recover via
-    /// `into_inner`, log a warn, and overwrite.
+    /// Publish the latest snapshot. Wait-free for the (single)
+    /// writer: one Acquire RMW, one POD copy, one Release store.
+    /// Never allocates, never blocks, cannot poison.
     pub fn publish(&self, s: DashboardState) {
-        match self.inner.lock() {
-            Ok(mut g) => *g = s,
-            Err(poison) => {
-                tracing::warn!(
-                    "SnapshotCell: recovering from poisoned mutex on publish — previous panic discarded"
-                );
-                let mut g = poison.into_inner();
-                *g = s;
-            }
-        }
+        let seq0 = self.seq.load(Ordering::Relaxed);
+        debug_assert_eq!(
+            seq0 & 1,
+            0,
+            "SnapshotCell: odd version on publish entry — second concurrent publisher"
+        );
+        // Enter the write section. The Acquire RMW forbids the
+        // payload copy below from being reordered before the odd
+        // version becomes visible (pairs with the readers'
+        // Acquire fence + revalidation).
+        let _prev = self.seq.swap(seq0.wrapping_add(1), Ordering::Acquire);
+        debug_assert_eq!(_prev, seq0, "SnapshotCell: version moved under the writer");
+        // SAFETY: single-writer contract — no concurrent writes to
+        // `data` exist. Concurrent readers may race this non-atomic
+        // copy, but the version bracket makes them discard any copy
+        // that overlapped it (see `Sync` impl note). The pointer is
+        // valid, aligned, and owned by `self`.
+        unsafe { *self.data.get() = s };
+        // Exit the write section: publish the copy to any reader
+        // that observes the new even version.
+        self.seq.store(seq0.wrapping_add(2), Ordering::Release);
     }
 
-    /// Read the most recent snapshot. Cheap. Same poisoning
-    /// recovery shape as `publish`.
+    /// Read the most recent snapshot. Lock-free: retries only while
+    /// a write is in flight (the writer publishes every ~10 ms and
+    /// copies a few hundred bytes — retries are vanishingly rare at
+    /// the TUI's 30 Hz). Never allocates.
     pub fn read(&self) -> DashboardState {
-        match self.inner.lock() {
-            Ok(g) => *g,
-            Err(poison) => {
-                tracing::warn!(
-                    "SnapshotCell: recovering from poisoned mutex on read — returning last good snapshot"
-                );
-                *poison.into_inner()
+        loop {
+            let seq1 = self.seq.load(Ordering::Acquire);
+            if seq1 & 1 != 0 {
+                // Writer mid-copy — spin briefly.
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: this volatile copy may race the writer's
+            // non-atomic copy; the revalidation below discards any
+            // result that overlapped a write, and a transient torn
+            // copy of the `Copy`-POD `DashboardState` is harmless
+            // (no invalid bit patterns, no pointers). Volatile
+            // forces the copy to complete before the version
+            // re-check. Pointer valid + aligned by construction.
+            let val = unsafe { core::ptr::read_volatile(self.data.get()) };
+            // Pairs with the writer's bracket: if the copy above
+            // overlapped a write, the version has moved (odd or
+            // advanced) and we retry.
+            fence(Ordering::Acquire);
+            if self.seq.load(Ordering::Relaxed) == seq1 {
+                return val;
             }
         }
     }
@@ -462,6 +521,42 @@ mod tests {
         b.orders_emitted = 9;
         cell.publish(b);
         assert_eq!(cell.read().orders_emitted, 9);
+    }
+
+    /// Failure-mode coverage for the seqlock: hammer `publish` from
+    /// one thread while another reads continuously; every observed
+    /// snapshot must be internally consistent (all mirrored fields
+    /// equal), i.e. torn reads are never returned.
+    #[test]
+    fn snapshot_cell_concurrent_reads_never_tear() {
+        const PUBLISHES: u64 = 100_000;
+        let cell = SnapshotCell::new();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let mut s = DashboardState::empty();
+                for i in 0..PUBLISHES {
+                    // Mirror `i` across four fields; a torn read
+                    // shows up as a mismatch between them.
+                    s.iterations = i;
+                    s.ticks_dispatched = i;
+                    s.orders_emitted = i;
+                    s.fills_seen = i;
+                    cell.publish(s);
+                }
+            });
+            let mut last = 0u64;
+            while !writer.is_finished() {
+                let got = cell.read();
+                assert_eq!(got.iterations, got.ticks_dispatched, "torn read");
+                assert_eq!(got.iterations, got.orders_emitted, "torn read");
+                assert_eq!(got.iterations, got.fills_seen, "torn read");
+                assert!(got.iterations >= last, "snapshot went backwards");
+                last = got.iterations;
+            }
+            writer.join().expect("writer thread panicked");
+        });
+        let last_published = cell.read();
+        assert_eq!(last_published.iterations, PUBLISHES - 1);
     }
 
     #[test]

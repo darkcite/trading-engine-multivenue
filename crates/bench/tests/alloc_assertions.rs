@@ -856,8 +856,14 @@ fn latency_record_is_zero_alloc() {
 }
 
 /// 10 000 snapshot publish + read round-trips through SnapshotCell
-/// must be zero-alloc. The cell is a `Mutex<DashboardState>`;
-/// `Mutex::lock` returns an RAII guard but doesn't allocate.
+/// must be zero-alloc. The cell is a single-writer seqlock
+/// (version counter + POD slot) — no OS lock object exists at all.
+/// History: the v1 `Mutex<DashboardState>` cell failed this
+/// assertion on macOS, where std's pthread-backed `Mutex` lazily
+/// heap-allocates its 64-byte `pthread_mutex_t` on first lock
+/// (Linux's futex `Mutex` never allocates, so only the Mac gate
+/// caught it). The seqlock is allocation-free by construction on
+/// every platform.
 #[test]
 fn dashboard_snapshot_read_is_zero_alloc() {
     use tui::{DashboardState, SnapshotCell};

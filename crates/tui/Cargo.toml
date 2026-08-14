@@ -16,4 +16,3 @@ core-types   = { workspace = true }
 book-builder = { workspace = true }
 ratatui      = { workspace = true }
 crossterm    = { workspace = true }
-tracing      = { workspace = true }
