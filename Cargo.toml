@@ -18,6 +18,7 @@ members = [
 
     # --- ingress adapters (one per external source) ---
     "crates/ingress-binance",
+    "crates/ingress-deribit",
     "crates/ingress-okx",
     "crates/ingress-polymarket",
     "crates/ingress-rpc",
@@ -137,6 +138,7 @@ core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 
 ingress-binance    = { path = "crates/ingress-binance" }
+ingress-deribit    = { path = "crates/ingress-deribit" }
 ingress-okx        = { path = "crates/ingress-okx" }
 ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }

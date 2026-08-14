@@ -6,7 +6,8 @@
 //!
 //! Subcommands:
 //! * `run --paper` — spawn the ingress threads (Polymarket, Binance,
-//!   OKX when `--okx-symbols` is set, Polygon RPC, RSS), boot the
+//!   OKX when `--okx-symbols` is set, Deribit when
+//!   `--deribit-symbols` is set, Polygon RPC, RSS), boot the
 //!   real `Engine` with the latency-arb strategy + paper dispatcher,
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
@@ -20,9 +21,10 @@ use std::sync::atomic::AtomicBool;
 use clap::Parser;
 use cli::{
     engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
-    engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance, spawn_okx,
-    spawn_polymarket, spawn_rpc, Consumers, EngineConfig, EngineLoopResult, LatencyDump,
-    LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
+    engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance,
+    spawn_deribit, spawn_okx, spawn_polymarket, spawn_rpc, Consumers, EngineConfig,
+    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair,
+    WssEndpoint, SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -86,6 +88,19 @@ struct RunArgs {
     /// `bbo-tbt` alone feeds the tick lane.
     #[arg(long, default_value_t = false)]
     okx_depth: bool,
+    /// Comma-separated Deribit instruments (e.g.
+    /// `BTC-PERPETUAL,ETH-PERPETUAL`). The i-th entry (0-based) is
+    /// allocated SymbolId `make_symbol_id(Deribit, i+1)` — flag
+    /// order is id order. Empty / absent = the Deribit ingress
+    /// thread is not started.
+    #[arg(long)]
+    deribit_symbols: Option<String>,
+    /// Also subscribe the Deribit change_id-chained
+    /// `book.{instr}.100ms` channel per instrument (capture +
+    /// integrity only, §4.5). Default OFF — `quote` alone feeds
+    /// the tick lane.
+    #[arg(long, default_value_t = false)]
+    deribit_depth: bool,
     /// Polymarket CLOB asset id (token id) for the market above —
     /// the decimal string from the market's `clobTokenIds`. Required:
     /// without it the PM symbol map is empty and every Polymarket
@@ -333,21 +348,50 @@ fn run(args: RunArgs) -> ExitCode {
         _ => None,
     };
 
+    // -- Deribit boot config (Phase 8c; venue is opt-in) --
+    // Fixed public endpoint; a per-venue host lands in core-config
+    // with the Phase-8e boot coverage audit.
+    const DERIBIT_WS_HOST: &str = "www.deribit.com";
+    const DERIBIT_WS_PORT: u16 = 443;
+    const DERIBIT_WS_PATH: &str = "/ws/api/v2";
+    let deribit_boot = match args.deribit_symbols.as_deref().map(str::trim) {
+        Some(spec) if !spec.is_empty() => {
+            let symbols = match cli::build_deribit_symbol_table(spec) {
+                Ok(t) => t,
+                Err(reason) => {
+                    error!(reason, spec, "bad --deribit-symbols");
+                    return ExitCode::from(1);
+                }
+            };
+            let deribit_ep =
+                match WssEndpoint::resolve(DERIBIT_WS_HOST, DERIBIT_WS_PORT, DERIBIT_WS_PATH) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!(error = ?e, "deribit DNS failed");
+                        return ExitCode::from(1);
+                    }
+                };
+            Some((symbols, deribit_ep))
+        }
+        _ => None,
+    };
+
     // -- Allocate rings + split into producer/consumer halves --
     //
     // Phase 8a lane layout: rings.tick is indexed by VenueId
     // (0=PM, 1=BN, 2=OKX, 3=Deribit, 4=HL). Lane 2 gains its
-    // producer below when `--okx-symbols` is set (Phase 8b); lanes
-    // 3..5 have no ingress until 8c–8d, so their producers are
-    // dropped here, leaving permanently-empty rings the engine
-    // drains for two atomic loads per iteration (§3.3). Fill-lane
-    // producers arrive with the venue dispatchers in 8j; paper
-    // fills flow through the engine's dispatcher pump (D3).
+    // producer below when `--okx-symbols` is set (Phase 8b) and
+    // lane 3 when `--deribit-symbols` is set (Phase 8c); lane 4
+    // has no ingress until 8d, so its producer is dropped here,
+    // leaving a permanently-empty ring the engine drains for two
+    // atomic loads per iteration (§3.3). Fill-lane producers
+    // arrive with the venue dispatchers in 8j; paper fills flow
+    // through the engine's dispatcher pump (D3).
     let rings = Rings::new();
     let (pm_prod, pm_lane_cons) = rings.tick[0].clone().split();
     let (bn_prod, bn_lane_cons) = rings.tick[1].clone().split();
     let (okx_prod, okx_lane_cons) = rings.tick[2].clone().split();
-    let (_der_prod_unspawned, der_lane_cons) = rings.tick[3].clone().split();
+    let (deribit_prod, deribit_lane_cons) = rings.tick[3].clone().split();
     let (_hl_prod_unspawned, hl_lane_cons) = rings.tick[4].clone().split();
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let (rss_prod, rss_cons) = rings.rss_signal.clone().split();
@@ -418,8 +462,32 @@ fn run(args: RunArgs) -> ExitCode {
     } else {
         info!("--okx-symbols empty / unset; OKX ingress thread not started");
         // Drop the producer side so the lane stays a permanently-
-        // empty ring (same shape as the 8c/8d lanes above).
+        // empty ring (same shape as the 8d lane above).
         drop(okx_prod);
+    }
+
+    // Deribit rides core 6 per the §9 core map.
+    if let Some((deribit_symbols, deribit_ep)) = deribit_boot {
+        info!(
+            instruments = deribit_symbols.len(),
+            depth = args.deribit_depth,
+            "deribit: starting ingress thread"
+        );
+        let deribit_handle = spawn_deribit(
+            deribit_ep,
+            tls_config.clone(),
+            deribit_symbols,
+            args.deribit_depth,
+            deribit_prod,
+            statuses.deribit.clone(),
+            6,
+        );
+        handles.push(deribit_handle);
+    } else {
+        info!("--deribit-symbols empty / unset; Deribit ingress thread not started");
+        // Drop the producer side so the lane stays a permanently-
+        // empty ring (same shape as the 8d lane above).
+        drop(deribit_prod);
     }
 
     if let Some(polygon_path) = args.polygon_path {
@@ -474,7 +542,7 @@ fn run(args: RunArgs) -> ExitCode {
             pm_lane_cons,
             bn_lane_cons,
             okx_lane_cons,
-            der_lane_cons,
+            deribit_lane_cons,
             hl_lane_cons,
         ],
         rpc_signal: rpc_cons,

@@ -1505,3 +1505,222 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "okx run-loop bytes should be zero: saw {bytes}");
 }
+
+// ---------------------------------------------------------------
+// Phase 8c: Deribit ingress hot-path assertions
+// ---------------------------------------------------------------
+
+/// Run classify + all four Deribit channel parsers (+ instrument
+/// extraction) over fixed realistic samples (mirrors the
+/// ingress-deribit unit-test corpus) for 10_000 iterations each —
+/// must be zero-alloc.
+#[test]
+fn deribit_parsers_are_zero_alloc() {
+    let quote: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
+    let ticker: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
+    let trade_row: &[u8] = br#""trade_seq":30289442,"trade_id":"48079269","timestamp":1590484512188,"tick_direction":2,"price":8950.0,"mark_price":8948.9,"instrument_name":"BTC-PERPETUAL","index_price":8955.88,"direction":"sell","amount":10.0}"#;
+    let book: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":297217105,"bids":[["new",5042.34,30.0],["new",5041.94,20.0]],"asks":[["new",5042.64,40.0]],"type":"snapshot"}}}"#;
+    let test_req: &[u8] = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
+    // Venue-namespaced symbol (venue byte 3 = Deribit, ordinal 1).
+    let sym: SymbolId = (3 << 24) | 1;
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..10_000u32 {
+        std::hint::black_box(ingress_deribit::classify(quote));
+        std::hint::black_box(ingress_deribit::classify(ticker));
+        std::hint::black_box(ingress_deribit::classify(book));
+        std::hint::black_box(ingress_deribit::classify(test_req));
+        std::hint::black_box(ingress_deribit::extract_instrument(
+            quote,
+            ingress_deribit::DeribitChannel::Quote,
+        ));
+        let q = ingress_deribit::parse_quote(quote, sym).unwrap();
+        acc = acc.wrapping_add(q.bid_px_1e6);
+        let k = ingress_deribit::parse_ticker(ticker, sym).unwrap();
+        acc = acc.wrapping_add(k.mark_px_1e6);
+        let t = ingress_deribit::parse_trade(trade_row, sym).unwrap();
+        acc = acc.wrapping_add(t.px_1e6);
+        let b = ingress_deribit::parse_book_header(book, sym).unwrap();
+        acc = acc.wrapping_add(b.change_id);
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "deribit parsers allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "deribit parser bytes should be zero: saw {bytes}");
+}
+
+/// Drive the Deribit ingress run-loop through 1 000+ pre-injected
+/// steady-state frames (quotes / trade_seq-chained trades /
+/// change_id-chained books / a sprinkling of heartbeat test_requests
+/// whose `public/test` answers are rendered inside the window) via a
+/// `TestTransport`. Steady state is reached over the real handshake +
+/// set_heartbeat + batched-subscribe + subscribe-result path; the
+/// entire scripted stream is injected before the guard; every
+/// `drive_one` call must allocate zero bytes.
+#[test]
+fn deribit_run_loop_steady_state_is_zero_alloc() {
+    use ingress_deribit::run_loop as dwl;
+
+    // ---- boot (NOT measured) ----
+    // Capacity must hold the whole scripted stream at once (~330 KiB
+    // for 1 000 frames): the transport's buffers are fixed-size and
+    // nothing drains them until the measurement loop runs.
+    let mut transport = TestTransport::with_capacity(512 * 1024);
+
+    // Venue-namespaced symbol (venue byte 3 = Deribit, ordinal 1).
+    let sym: SymbolId = (3 << 24) | 1;
+    let mut symbols = ingress_deribit::DeribitSymbolTable::new();
+    symbols.insert(b"BTC-PERPETUAL", sym).unwrap();
+    let mut driver = dwl::Driver::new(0x0D0Du64, symbols, true);
+    dwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    // Health telemetry sink — relaxed atomics only; built outside
+    // the measurement window.
+    let status = core_metrics::IngressStatus::new();
+
+    let ring: std::sync::Arc<Ring<Tick, { dwl::TICK_RING_CAP }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+
+    // Send the client GET handshake.
+    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    let mut scratch = [0u8; 8192];
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    // Inject the 101 reply matching the seed.
+    let key = core_net::sec_websocket_key_from_seed(0x0D0Du64);
+    let accept = core_net::expected_accept(&key);
+    let mut resp = [0u8; 256];
+    let mut n = 0;
+    for src in [
+        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
+        &b"Upgrade: websocket\r\n"[..],
+        &b"Connection: Upgrade\r\n"[..],
+        &b"Sec-WebSocket-Accept: "[..],
+        &accept[..],
+        &b"\r\n\r\n"[..],
+    ] {
+        resp[n..n + src.len()].copy_from_slice(src);
+        n += src.len();
+    }
+    transport.inject_incoming(&resp[..n]);
+    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    assert_eq!(driver.state(), dwl::State::Steady);
+    // Drain the set_heartbeat + batched subscribe calls (ids 1, 2).
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    /// Unmasked (server→client) WS text frame appended to `stream`.
+    fn push_text_frame(stream: &mut Vec<u8>, body: &[u8]) {
+        stream.push(0x81);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            assert!(body.len() <= u16::MAX as usize);
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+
+    // Retire the session-start calls: set_heartbeat "ok" + the
+    // subscribe result echoing every configured channel (depth on).
+    let mut boot: Vec<u8> = Vec::with_capacity(1024);
+    push_text_frame(&mut boot, br#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#);
+    push_text_frame(
+        &mut boot,
+        br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","book.BTC-PERPETUAL.100ms"]}"#,
+    );
+    transport.inject_incoming(&boot);
+    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+    assert_eq!(driver.pending_count(), 0, "session-start calls retired");
+    assert_eq!(driver.sub_count(), 4, "all channels confirmed");
+    let boot_msgs = status.msgs_total();
+
+    // Pre-build + pre-inject the full scripted stream: one book
+    // snapshot, then cycles of [quote, trades, book change], plus a
+    // heartbeat test_request every 100 cycles (its `public/test`
+    // answer renders + flushes INSIDE the measurement window — the
+    // heartbeat path must be zero-alloc too). Books chain
+    // (prev_change_id == prior change_id) and trades increment
+    // trade_seq by exactly 1, so the §6.2 resync path stays cold.
+    const CYCLES: usize = 333; // 1 snapshot + 3 × 333 + test_requests
+    const QUOTE: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
+    const TEST_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
+    const BOOK_SNAP: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":1000,"bids":[["new",5042.34,30.0]],"asks":[["new",5042.64,40.0]],"type":"snapshot"}}}"#;
+
+    let mut stream: Vec<u8> = Vec::with_capacity(400 * 1024);
+    push_text_frame(&mut stream, BOOK_SNAP);
+    let mut change_id: i64 = 1_000; // BOOK_SNAP's change_id — chain root
+    let mut trade_seq: i64 = 50_000;
+    let mut test_reqs: u64 = 0;
+    for c in 0..CYCLES {
+        push_text_frame(&mut stream, QUOTE);
+        let trade = format!(
+            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"trades.BTC-PERPETUAL.100ms","data":[{{"trade_seq":{},"trade_id":"9","timestamp":1000,"price":8950.0,"direction":"buy","amount":10.0}}]}}}}"#,
+            trade_seq
+        );
+        push_text_frame(&mut stream, trade.as_bytes());
+        trade_seq += 1;
+        let upd = format!(
+            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"book.BTC-PERPETUAL.100ms","data":{{"timestamp":2000,"instrument_name":"BTC-PERPETUAL","change_id":{},"prev_change_id":{},"bids":[["change",5042.34,31.0]],"asks":[],"type":"change"}}}}}}"#,
+            change_id + 1,
+            change_id
+        );
+        push_text_frame(&mut stream, upd.as_bytes());
+        change_id += 1;
+        if c % 100 == 99 {
+            push_text_frame(&mut stream, TEST_REQ);
+            test_reqs += 1;
+        }
+    }
+    let injected = transport.inject_incoming(&stream);
+    assert_eq!(
+        injected,
+        stream.len(),
+        "transport capacity must hold the full scripted stream"
+    );
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    let mut drives = 0u32;
+    while transport.incoming_len() > 0 {
+        dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
+        drives += 1;
+        assert!(drives <= 4_096, "scripted stream failed to drain");
+    }
+    // Drain the quote ticks — one per cycle. try_pop is zero-alloc
+    // (asserted by the ring test above), so popping inside the guard
+    // keeps the window honest.
+    let mut acc: i64 = 0;
+    let mut popped: usize = 0;
+    while let Some(t) = cons.try_pop() {
+        acc = acc.wrapping_add(t.bid_px.raw());
+        popped += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    // Steady state consumed the whole script: one tick per quote,
+    // every frame counted, no losses, no chain breaks, no resyncs,
+    // and every test_request answered (in-flight `public/test` calls
+    // occupy exactly `test_reqs` pending slots).
+    assert_eq!(popped, CYCLES);
+    assert_eq!(
+        status.msgs_total() - boot_msgs,
+        (1 + 3 * CYCLES) as u64 + test_reqs
+    );
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.gaps_total(), 0);
+    assert_eq!(status.resubscribes_total(), 0);
+    assert_eq!(status.ring_drops_total(), 0);
+    assert_eq!(driver.pending_count(), test_reqs as usize);
+    assert_eq!(
+        allocs, 0,
+        "deribit run-loop allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "deribit run-loop bytes should be zero: saw {bytes}");
+}

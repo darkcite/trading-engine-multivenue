@@ -18,8 +18,9 @@
 //! | T3     | ingress-rpc (Polygon JSON-RPC WSS) |
 //! | T4     | ingress-rss (HTTPS polling) |
 //! | T5     | ingress-okx (v5 public WSS; only with `--okx-symbols`) |
+//! | T6     | ingress-deribit (JSON-RPC WSS; only with `--deribit-symbols`) |
 //!
-//! Cores 0..=5 are pinned (Linux only) per the §9 core map. On
+//! Cores 0..=6 are pinned (Linux only) per the §9 core map. On
 //! non-Linux we log a single warning and let the OS scheduler do as
 //! it pleases.
 
@@ -45,6 +46,7 @@ use rustls_pki_types::ServerName;
 use strategy_latency_arb::LatencyArb;
 
 use ingress_binance::run_loop as bwl;
+use ingress_deribit::run_loop as dwl;
 use ingress_okx::run_loop as owl;
 use ingress_polymarket::run_loop as pwl;
 use ingress_rpc::run_loop as rwl;
@@ -103,6 +105,16 @@ const OKX_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 25_000_000_000,
     idle_timeout_ns: 40_000_000_000,
 };
+/// Deribit has no WS-level ping: the run loop arms
+/// `public/set_heartbeat {"interval":15}` and answers venue
+/// `test_request`s with `public/test`; the venue closes the socket
+/// on an unanswered test_request, so the idle budget is ~2× the
+/// 15 s heartbeat interval. `SendPing` fires a proactive
+/// `public/test` probe at 20 s of silence.
+const DERIBIT_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 20_000_000_000,
+    idle_timeout_ns: 30_000_000_000,
+};
 /// Polygon RPC: newHeads every ~2 s + our own 2 s poll → anything
 /// quieter than 30 s is a dead session.
 const RPC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
@@ -160,6 +172,7 @@ const _: () = {
     assert!(pwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(bwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(owl::TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(dwl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
@@ -211,6 +224,9 @@ pub struct IngressStatusSet {
     /// OKX WSS thread (Phase 8b). Stays Down when `--okx-symbols`
     /// is empty and the thread is never spawned.
     pub okx: Arc<IngressStatus>,
+    /// Deribit WSS thread (Phase 8c). Stays Down when
+    /// `--deribit-symbols` is empty and the thread is never spawned.
+    pub deribit: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
     /// RSS poller thread.
@@ -218,12 +234,13 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all five slots (boot only).
+    /// Allocate all six slots (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
             binance: Arc::new(IngressStatus::new()),
             okx: Arc::new(IngressStatus::new()),
+            deribit: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
             rss: Arc::new(IngressStatus::new()),
         }
@@ -511,6 +528,139 @@ pub fn spawn_okx(
                 );
                 tracing::info!(?res, "okx: run-loop returned");
                 if matches!(res, owl::RunResult::Stopped) {
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+                if status.msgs_total() > msgs_before {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
+            }
+            status.set_state(IngressState::Down);
+        },
+    )
+}
+
+/// Build the boot-time Deribit `instrument_name → SymbolId` table
+/// from the comma-separated `--deribit-symbols` value. The i-th
+/// instrument (0-based) is allocated
+/// `make_symbol_id(VenueId::Deribit, i + 1)` — ordinals follow flag
+/// order, 1-based so ordinal 0 never aliases an unconfigured id
+/// (§3.1; venue REST discovery replaces this manual allocation in
+/// the Phase-8e boot coverage audit).
+///
+/// Fails fast on an empty item, a duplicate instrument, an over-long
+/// instrument, an instrument containing `.` (would corrupt channel-
+/// name parsing), or more than
+/// [`ingress_deribit::DERIBIT_MAX_SYMBOLS`] instruments — boot
+/// refuses to start rather than run with a venue map that doesn't
+/// match the operator's intent.
+pub fn build_deribit_symbol_table(
+    spec: &str,
+) -> Result<ingress_deribit::DeribitSymbolTable, &'static str> {
+    let mut table = ingress_deribit::DeribitSymbolTable::new();
+    let mut ordinal: u32 = 0;
+    for item in spec.split(',') {
+        let instrument = item.trim();
+        if instrument.is_empty() {
+            return Err("deribit: empty instrument in --deribit-symbols");
+        }
+        if table.lookup(instrument.as_bytes()).is_some() {
+            return Err("deribit: duplicate instrument in --deribit-symbols");
+        }
+        ordinal += 1;
+        match table.insert(instrument.as_bytes(), make_symbol_id(VenueId::Deribit, ordinal)) {
+            Ok(()) => {}
+            Err(ingress_deribit::SymbolTableErr::Full) => {
+                return Err("deribit: --deribit-symbols exceeds DERIBIT_MAX_SYMBOLS instruments");
+            }
+            Err(ingress_deribit::SymbolTableErr::TooLong) => {
+                return Err(
+                    "deribit: instrument in --deribit-symbols exceeds DERIBIT_INSTR_MAX bytes",
+                );
+            }
+            Err(ingress_deribit::SymbolTableErr::Empty) => {
+                return Err("deribit: empty instrument in --deribit-symbols");
+            }
+            Err(ingress_deribit::SymbolTableErr::HasDot) => {
+                return Err("deribit: instrument in --deribit-symbols must not contain '.'");
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Spawn the Deribit JSON-RPC/WS ingress thread (Phase 8c). One
+/// thread covers every configured instrument — the driver batches
+/// all `(channel × instrument)` pairs into a single subscribe call
+/// (§4.2 credit budget). `depth_enabled` adds the change_id-chained
+/// `book.{instr}.100ms` channel per instrument (`--deribit-depth`;
+/// capture + integrity only, §4.5).
+pub fn spawn_deribit(
+    ep: WssEndpoint,
+    tls_config: RustlsConfig,
+    symbols: ingress_deribit::DeribitSymbolTable,
+    depth_enabled: bool,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+) -> JoinHandle<()> {
+    spawn_or_die(
+        thread::Builder::new().name("ingress-deribit".into()),
+        "ingress-deribit",
+        move || {
+            log_pin_outcome("deribit", core_id);
+            let server_name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "deribit: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+
+            let mut driver = dwl::Driver::new(now_ns(), symbols, depth_enabled);
+            let mut keepalive = Keepalive::new(DERIBIT_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
+                let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "deribit: connect failed");
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
+                        continue;
+                    }
+                };
+                let (mut poll, mut events, token) = match new_poll() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "deribit: mio init failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                driver.reset_for_reconnect(now_ns());
+                let msgs_before = status.msgs_total();
+
+                let res = dwl::run(
+                    &mut transport,
+                    &mut driver,
+                    ep.host.as_bytes(),
+                    ep.path.as_bytes(),
+                    &mut producer,
+                    &mut poll,
+                    &mut events,
+                    token,
+                    &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
+                );
+                tracing::info!(?res, "deribit: run-loop returned");
+                if matches!(res, dwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
                 }
@@ -1111,6 +1261,9 @@ impl Observability {
             let ingress_okx_state = reg
                 .register_gauge("engine_ingress_okx_state")
                 .map_err(|_| "register engine_ingress_okx_state")?;
+            let ingress_deribit_state = reg
+                .register_gauge("engine_ingress_deribit_state")
+                .map_err(|_| "register engine_ingress_deribit_state")?;
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
@@ -1150,6 +1303,7 @@ impl Observability {
             let ingress_polymarket = register_ingress_counters(&mut reg, "polymarket")?;
             let ingress_binance = register_ingress_counters(&mut reg, "binance")?;
             let ingress_okx = register_ingress_counters(&mut reg, "okx")?;
+            let ingress_deribit = register_ingress_counters(&mut reg, "deribit")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
 
             out.metrics = Some(Arc::new(reg));
@@ -1172,6 +1326,7 @@ impl Observability {
                 ingress_polymarket_state,
                 ingress_binance_state,
                 ingress_okx_state,
+                ingress_deribit_state,
                 ingress_rpc_state,
                 ingress_rss_state,
                 max_tick_age_ns,
@@ -1179,6 +1334,7 @@ impl Observability {
                 ingress_polymarket,
                 ingress_binance,
                 ingress_okx,
+                ingress_deribit,
                 ingress_rpc,
             });
         }
@@ -1317,6 +1473,8 @@ pub struct EngineCounters {
     pub ingress_binance_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: OKX v5 public WS.
     pub ingress_okx_state: core_metrics::GaugeId,
+    /// Per-ingress state gauge: Deribit JSON-RPC WS.
+    pub ingress_deribit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: RSS poller.
@@ -1335,6 +1493,8 @@ pub struct EngineCounters {
     pub ingress_binance: IngressCounterIds,
     /// §6.4 loss-accounting counters, OKX thread.
     pub ingress_okx: IngressCounterIds,
+    /// §6.4 loss-accounting counters, Deribit thread.
+    pub ingress_deribit: IngressCounterIds,
     /// §6.4 loss-accounting counters, RPC thread.
     pub ingress_rpc: IngressCounterIds,
 }
@@ -1475,8 +1635,9 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc) so registry counters get monotonic deltas.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 4];
+    // (pm, bn, okx, rpc, deribit) so registry counters get
+    // monotonic deltas.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 5];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -1549,6 +1710,8 @@ where
                     reg.gauge(ids.ingress_binance_state)
                         .set(ing.binance.state() as i64);
                     reg.gauge(ids.ingress_okx_state).set(ing.okx.state() as i64);
+                    reg.gauge(ids.ingress_deribit_state)
+                        .set(ing.deribit.state() as i64);
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
                     reg.gauge(ids.ingress_rss_state).set(ing.rss.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
@@ -1568,6 +1731,12 @@ where
                     );
                     mirror_ingress_counters(reg, &ids.ingress_okx, &ing.okx, &mut ingress_last[2]);
                     mirror_ingress_counters(reg, &ids.ingress_rpc, &ing.rpc, &mut ingress_last[3]);
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_deribit,
+                        &ing.deribit,
+                        &mut ingress_last[4],
+                    );
                 }
 
                 // Max tick age — surfaces silenced markets.
@@ -1944,6 +2113,64 @@ mod tests {
         assert_eq!(
             build_okx_symbol_table(max_spec).unwrap().len(),
             ingress_okx::OKX_MAX_SYMBOLS
+        );
+    }
+
+    /// Happy path: `--deribit-symbols` items get 1-based,
+    /// flag-ordered ordinals under the Deribit venue byte, with
+    /// whitespace trimmed.
+    #[test]
+    fn deribit_symbol_table_allocates_flag_ordered_ids() {
+        let t = build_deribit_symbol_table("BTC-PERPETUAL, ETH-PERPETUAL").unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            t.lookup(b"BTC-PERPETUAL"),
+            Some(make_symbol_id(VenueId::Deribit, 1))
+        );
+        assert_eq!(
+            t.lookup(b"ETH-PERPETUAL"),
+            Some(make_symbol_id(VenueId::Deribit, 2))
+        );
+        assert_eq!(t.lookup(b"SOL-PERPETUAL"), None);
+    }
+
+    /// Failure modes: empty item, duplicate instrument, more than
+    /// `DERIBIT_MAX_SYMBOLS` instruments, and a dotted instrument
+    /// all refuse boot.
+    #[test]
+    fn deribit_symbol_table_rejects_bad_specs() {
+        // Trailing comma ⇒ empty item.
+        assert_eq!(
+            build_deribit_symbol_table("BTC-PERPETUAL,").err(),
+            Some("deribit: empty instrument in --deribit-symbols")
+        );
+        // Duplicate instrument (whitespace doesn't disguise it).
+        assert_eq!(
+            build_deribit_symbol_table("BTC-PERPETUAL,ETH-PERPETUAL, BTC-PERPETUAL").err(),
+            Some("deribit: duplicate instrument in --deribit-symbols")
+        );
+        // DERIBIT_MAX_SYMBOLS + 1 distinct instruments ⇒ Full.
+        let mut spec = String::new();
+        for i in 0..=ingress_deribit::DERIBIT_MAX_SYMBOLS {
+            if i > 0 {
+                spec.push(',');
+            }
+            spec.push_str(&format!("S{i}-PERPETUAL"));
+        }
+        assert_eq!(
+            build_deribit_symbol_table(&spec).err(),
+            Some("deribit: --deribit-symbols exceeds DERIBIT_MAX_SYMBOLS instruments")
+        );
+        // Exactly DERIBIT_MAX_SYMBOLS is still fine.
+        let max_spec = spec.rsplit_once(',').unwrap().0;
+        assert_eq!(
+            build_deribit_symbol_table(max_spec).unwrap().len(),
+            ingress_deribit::DERIBIT_MAX_SYMBOLS
+        );
+        // A dotted instrument would corrupt channel-name parsing.
+        assert_eq!(
+            build_deribit_symbol_table("BTC.PERPETUAL").err(),
+            Some("deribit: instrument in --deribit-symbols must not contain '.'")
         );
     }
 }

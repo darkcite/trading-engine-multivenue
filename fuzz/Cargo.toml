@@ -17,6 +17,7 @@ ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
 ingress-rss        = { path = "../crates/ingress-rss" }
 ingress-okx        = { path = "../crates/ingress-okx" }
+ingress-deribit    = { path = "../crates/ingress-deribit" }
 core-net           = { path = "../crates/core-net" }
 core-parse         = { path = "../crates/core-parse" }
 signer-eip712      = { path = "../crates/signer-eip712" }
@@ -109,6 +110,20 @@ bench  = false
 [[bin]]
 name   = "okx_book_seq"
 path   = "fuzz_targets/okx_book_seq.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "deribit_jsonrpc_frame"
+path   = "fuzz_targets/deribit_jsonrpc_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "deribit_book"
+path   = "fuzz_targets/deribit_book.rs"
 test   = false
 doc    = false
 bench  = false

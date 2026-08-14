@@ -3,6 +3,112 @@
 Working notes per the Stage-1 operating agreement: each entry records
 what is done, what is next, and open issues at a clean boundary.
 
+## 2026-08-14 (fourth entry) — 8c ingress-deribit: CODE COMPLETE (soak + operator go pending)
+
+### Delivered
+
+- **`crates/ingress-deribit`** (new): JSON-RPC 2.0 over WS per plan
+  §4.2. Classifier + byte-scanner parsers (`quote` → Tick,
+  `ticker.100ms` — mark/index/`current_funding`×1e9/OI/price limits
+  in one 64-B frame, `trades.100ms` multi-row, `book.100ms` header
+  with `DEPTH_CAP=64` level counting — excess counted not stored),
+  all `#[repr(C, align(64))]` 64-B PODs; fixed-cap
+  `DeribitSymbolTable` (rejects dotted names — channel-name parsing
+  invariant); `DeribitBookChain` (snapshot always re-roots; change
+  must link `prev_change_id == last`; anything else Gap + re-arm;
+  documented `i64::MIN` sentinel-collision note, unreachable on
+  wire); `DeribitTradeSeq` **strictly sequential** (`last+1` chains;
+  jump = Gap, repeat/backwards = Regression — stronger than OKX's
+  monotonic rule); JSON-RPC writers (`write_subscribe_all` — ONE
+  batched call, subscribe costs 3000 of 30 000 credits;
+  `write_set_heartbeat`, `write_test`, `write_book_op`) rendering
+  into stack scratch via fixed `fmt_u64`.
+- **Heartbeat protocol** (8c exit criterion): no WS ping — on
+  upgrade→Steady the driver queues `public/set_heartbeat
+  {"interval":15}` then the batched subscribe, both correlated
+  through `core_net::subs::PendingTable` (monotonic ids from 1);
+  venue `test_request` heartbeats answered with `public/test` in the
+  same drive cycle; `KeepaliveAction::SendPing` = proactive
+  `public/test` probe. Subscribe **result verification**: expected
+  vs found channel-name bitmask (u64, 16 syms × 4 channels); any
+  configured channel missing from the result echo ⇒ session error
+  (fail-fast).
+- **run_loop** on the 8a contract: `run(..., status, keepalive)`
+  final params, Up exactly at upgrade→Steady, try_push fail ⇒
+  ring_drops, idle ⇒ IdleTimeout; book Gap ⇒ unsubscribe+subscribe
+  resync (fresh ids, pending-tracked) + gaps/resubscribes counters;
+  trades gaps counted, deliberately never resubscribed (venue does
+  not replay); venue `error` responses fail the session; two-phase
+  borrow dispatch throughout; **oversize-frame guard**: rx full +
+  frame incomplete ⇒ session error (book snapshots are unbounded;
+  RX_BUF 4 MiB ≈ 2× deepest observed book) — no livelock possible.
+- **Decisions documented in the crate header**: `Tick.venue_seq` =
+  quote `timestamp_ms as u32` (quotes carry no seq; monotonic across
+  reconnects, wraps ~49.7 d; same-ms quotes collapse at TopOfBook —
+  full-width ids live in the monitors, u32 truncation only at the
+  Tick boundary, same as OKX); amounts are **USD notional** for
+  perps/futures ⇒ `Qty(1e6)` carries USD×1e6; `tick_size_steps` /
+  `contract_size` arrive with 8e REST discovery — capture does not
+  quantize.
+- **Tests**: 44 unit/run-loop + 3 proptests (incl. book-chain
+  never-chains-across-a-break model test); TLS loopback
+  (`tests/deribit_tls_loopback.rs`, rcgen): happy path with
+  server-side **heartbeat proof** (test_request answered by
+  `public/test`, id increment asserted), book gap ⇒
+  unsubscribe→subscribe observed server-side in order, idle timeout
+  with proactive-probe assertion. Fuzz: `deribit_jsonrpc_frame`
+  (all parsers), `deribit_book` (chain-model differential)
+  registered in `fuzz/Cargo.toml`, `cargo check` clean. Bench:
+  `deribit_parsers_are_zero_alloc` +
+  `deribit_run_loop_steady_state_is_zero_alloc` (1000+-frame steady
+  drain over the real handshake + set_heartbeat + subscribe-result
+  path, **test_request answers rendered inside the measured
+  window**, 0 B/op).
+- **cli wiring**: `--deribit-symbols` (flag order = ordinal;
+  `make_symbol_id(Deribit, i+1)`), `--deribit-depth`;
+  `DERIBIT_KEEPALIVE` 20 s probe / 30 s idle (~2× the 15 s heartbeat
+  interval — venue closes on unanswered test_request); `spawn_deribit`
+  on core 6 (§9 map); VenueId::Deribit lane 3 producer connected
+  (unspawned ⇒ dropped-producer); `engine_ingress_deribit_*` §6.4
+  counters + state gauge (ingress_last grown 4→5, deribit appended);
+  `TICK_RING_CAP == TICK_RING_SIZE` const-assert. Endpoint consts
+  `www.deribit.com:443 /ws/api/v2` inline (core-config entry rides
+  with 8e, same as OKX).
+
+### Verification (both platforms)
+
+- Sandbox (rustc 1.88): workspace excl. bench **607/0** (555 + 52);
+  release alloc gate **28/28, 0 B/op** (26 + 2; sandbox release run
+  used `CARGO_PROFILE_RELEASE_DEBUG=0` for disk — semantics
+  identical, Mac gate ran the true profile); fuzz `cargo check`
+  clean.
+- Mac (nextest): **634/634** (580 + 54; "2 leaky" flagged on the TLS
+  loopback server threads — pass status unaffected); release alloc
+  gate **28/28** on the true deploy profile. One spurious
+  debug-parallel failure of the pre-existing
+  `latency_arb_on_tick_is_zero_alloc` under full-workspace load;
+  passes repeatedly in isolation — the release gate (authoritative)
+  is clean.
+
+### Deferred / notes
+
+1. **Deribit REST `get_instruments` discovery** (tick_size +
+   `tick_size_steps`, contract_size, min_trade_amount capture; BTC +
+   ETH + USDC futures/perps, options excluded v1) deferred to the 8e
+   boot-coverage audit, its consumer — same disposition as OKX.
+2. `book.{instr}.raw` / `trades.{instr}.raw` (auth-gated cadence)
+   ride with the 8j dispatcher's authenticated socket.
+3. TUI `ingest_health` deribit bit — folded into the 8e TUI touch
+   with okx's; health fully visible via `/metrics`.
+4. 24 h soak (§12 8c exit: chain clean + heartbeat protocol proven
+   live) is operator-run; not started.
+5. Sandbox hygiene for next session: the previous sandbox's caches
+   (`/tmp/tt`, `/tmp/ch`, `/tmp/ttf`, `/tmp/ws-test.log`) are
+   uid-orphaned (`nobody`) and unremovable — use fresh dirs
+   (`/tmp/tt2`, `/tmp/ch2`, `/tmp/ttf-8c`, `/tmp/l8c`). Disk at 87%
+   after full debug+release builds.
+6. Everything uncommitted (8c in full); no git ops performed.
+
 ## 2026-08-14 (third entry) — 8b ingress-okx: CODE COMPLETE (soak + operator go pending)
 
 ### Delivered

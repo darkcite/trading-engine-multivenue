@@ -1,0 +1,27 @@
+[package]
+name         = "ingress-deribit"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Deribit JSON-RPC 2.0 public WebSocket ingress: quote / ticker.100ms / trades.100ms (+ book.100ms behind --deribit-depth). Byte-scanner parsers, change_id chain + trade_seq monitors, heartbeat (set_heartbeat / test_request -> public/test) state machine, zero-alloc steady state."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-types   = { workspace = true }
+core-parse   = { workspace = true }
+core-net     = { workspace = true }
+core-ring    = { workspace = true }
+core-metrics = { workspace = true }
+core-time    = { workspace = true }
+memchr       = { workspace = true }
+mio          = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rcgen    = { workspace = true }
+rustls   = { workspace = true }
