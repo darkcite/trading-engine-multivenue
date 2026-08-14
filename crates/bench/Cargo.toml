@@ -1,0 +1,47 @@
+[package]
+name         = "bench"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Criterion + dhat benches and allocation-assertion harness. Never linked into production binaries."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-alloc = { workspace = true }
+core-ring  = { workspace = true }
+core-parse = { workspace = true }
+core-types = { workspace = true }
+dhat       = { workspace = true }
+
+[dev-dependencies]
+criterion            = { workspace = true }
+# Pulled in ONLY by the alloc_assertions integration test so we can
+# round-trip real frames through the zero-alloc path.
+ingress-polymarket   = { workspace = true }
+ingress-binance      = { workspace = true }
+ingress-rpc          = { workspace = true }
+ingress-rss          = { workspace = true }
+core-net             = { workspace = true }
+core-time            = { workspace = true }
+book-builder         = { workspace = true }
+strategy-core        = { workspace = true }
+strategy-latency-arb = { workspace = true }
+strategy-ev          = { workspace = true }
+strategy-cross-arb   = { workspace = true }
+strategy-rule-tree   = { workspace = true }
+research-artifacts   = { workspace = true }
+engine               = { workspace = true }
+signer-eip712        = { workspace = true }
+clob-dispatcher      = { workspace = true }
+core-metrics         = { workspace = true }
+core-latency         = { workspace = true }
+tui                  = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false

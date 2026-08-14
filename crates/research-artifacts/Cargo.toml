@@ -1,0 +1,15 @@
+[package]
+name         = "research-artifacts"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Loads claude-worker NDJSON tags + JSON rules at boot into preallocated POD tables. Zero-alloc query path."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+memchr = { workspace = true }

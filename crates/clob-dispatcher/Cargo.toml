@@ -1,0 +1,28 @@
+[package]
+name         = "clob-dispatcher"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "HTTP/1.1 dispatcher to the Polymarket CLOB. EIP-712 signing + zero-alloc JSON serialization on the hot path. Synchronous POST via TlsTransport."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-net      = { workspace = true }
+core-parse    = { workspace = true }
+core-ring     = { workspace = true }
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+signer-eip712 = { workspace = true }
+memchr        = { workspace = true }
+mio           = { workspace = true }
+rustls        = { workspace = true }
+
+[dev-dependencies]
+rcgen        = { workspace = true }
+proptest     = { workspace = true }
+webpki-roots = { workspace = true }

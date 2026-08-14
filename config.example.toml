@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------
+# Polymarket Latency-Arb Engine — config.example.toml
+#
+# REFERENCE ONLY. The binary is driven by env vars (.env) + CLI
+# flags; this TOML is *not parsed* by `polymarket-engine`. It
+# exists so an operator has one place to see every meaningful knob
+# in one shape.
+#
+# To run a real paper session, edit `.env` (which IS parsed) and:
+#
+#     cargo run --release -p cli -- run --paper --env-file ./.env \
+#         --binance-symbol btcusdt \
+#         --binance-sym-id 7 \
+#         --polymarket-sym-id 42 \
+#         --threshold-1e6 20000 \
+#         --qty-1e6 10000000 \
+#         --cooldown-ns 250000000 \
+#         --metrics
+#
+# Run `cargo run --release -p cli -- run --help` for the full
+# flag list.
+# ---------------------------------------------------------------
+
+[runtime]
+# Paper mode is default ON until the operator explicitly passes
+# --live. --paper and --live are mutually exclusive at the clap
+# layer.
+mode = "paper"
+
+# Bind for the /metrics text-format Prometheus endpoint. MUST be
+# loopback in v1; the server has no auth.
+metrics_bind = "127.0.0.1:9191"
+
+# HdrHistogram dump cadence (seconds). 0 disables; > 0 writes a
+# fresh `latency_<unix_ns>.hgrm` to `<log_dir>/latency/` every N
+# seconds.
+latency_dump_secs = 60
+
+# Engine logs + replay + HdrHistogram dumps go under here.
+log_dir = "~/polymarket/logs"
+
+[endpoints]
+# WSS hosts. Resolved once at boot — no DNS on the hot path.
+polymarket_clob_host = "clob.polymarket.com"
+polymarket_gamma_host = "gamma-api.polymarket.com"
+binance_ws_host = "stream.binance.com"
+alchemy_host = "polygon-mainnet.g.alchemy.com"
+
+# Alchemy WSS path. The cli accepts this via --polygon-path; an
+# operator who omits it boots the engine without the RPC ingress
+# thread (newHead signals).
+# polygon_path = "/v2/<ALCHEMY_API_KEY>"
+
+[strategy.latency_arb]
+# Per-pair threshold in 1e6 fixed-point — `20000` = $0.02 mid-vs-mid.
+threshold_1e6 = 20000
+
+# Per-order quantity in 1e6 fixed-point — `10000000` = $10.
+qty_1e6 = 10000000
+
+# Cooldown between emits per market (nanoseconds).
+cooldown_ns = 250000000
+
+[strategy.cross_arb]
+# Comma-separated group spec: ";"-delimited groups, ","-delimited
+# member SymbolIds inside each group. Forwarded as
+# `--groups "10,11,12;20,21,22"`.
+# groups = "10,11,12;20,21,22"
+
+[strategy.ev]
+# Path to claude-worker-emitted NDJSON tag artifacts. Required
+# when `--strategy ev`.
+# artifacts_path = "~/polymarket/artifacts/tags.ndjson"
+
+[strategy.rule_tree]
+# Path to claude-worker-emitted JSON rule artifacts. Required
+# when `--strategy rule-tree`.
+# rules_path = "~/polymarket/artifacts/rules.json"
+
+[risk]
+# All of the below are enforced by `docs/risk-policy.md`. The
+# kill-switch in the engine reads them at boot via env vars (TODO
+# Phase 7: wire from this file). v1 operator changes the env or
+# rebuilds.
+max_open_orders = 8
+max_notional_usd = 100
+daily_loss_stop_usd = 50

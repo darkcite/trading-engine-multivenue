@@ -1,0 +1,20 @@
+[package]
+name         = "engine"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Engine<S: Strategy>. Compile-time-monomorphized main loop. Drains tick/signal/fill rings and dispatches to the strategy. Single writer."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-ring       = { workspace = true }
+core-time       = { workspace = true }
+core-types      = { workspace = true }
+core-latency    = { workspace = true }
+strategy-core   = { workspace = true }
+clob-dispatcher = { workspace = true }

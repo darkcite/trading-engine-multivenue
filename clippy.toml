@@ -1,0 +1,6 @@
+# Hot-path friendliness: we accept complex single-letter-heavy code in
+# SIMD shims and zero-alloc scanners. Tune these as real code lands.
+too-many-arguments-threshold = 10
+type-complexity-threshold    = 512
+cognitive-complexity-threshold = 60
+avoid-breaking-exported-api  = false

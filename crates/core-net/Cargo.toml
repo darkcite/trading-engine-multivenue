@@ -1,0 +1,22 @@
+[package]
+name         = "core-net"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Socket + TLS primitives shared by ingress adapters and the CLOB dispatcher. Preallocated buffers, zero-copy parse over &[u8]."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+memchr           = { workspace = true }
+mio              = { workspace = true }
+rustls           = { workspace = true }
+webpki-roots     = { workspace = true }
+rustls-pki-types = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

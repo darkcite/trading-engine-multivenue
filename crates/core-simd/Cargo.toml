@@ -1,0 +1,12 @@
+[package]
+name         = "core-simd"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "CPU-specific SIMD helpers (AVX2 on x86_64, NEON on aarch64). Feature-detected at runtime, dispatched at compile time."
+
+[lib]
+path = "src/lib.rs"

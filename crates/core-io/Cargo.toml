@@ -1,0 +1,24 @@
+[package]
+name         = "core-io"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "File I/O primitives used outside the hot path (replay log writer via pwrite, preallocated file-backed buffers)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-types = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+strategy-core        = { workspace = true }
+strategy-latency-arb = { workspace = true }
+clob-dispatcher      = { workspace = true }
+core-time            = { workspace = true }

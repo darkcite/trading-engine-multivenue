@@ -1,0 +1,18 @@
+[package]
+name         = "core-ring"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "SPSC lock-free ring buffer, fixed-capacity, cache-line-padded atomic indices, unsafe get_unchecked in hot path. Single-writer design."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# No heap deps. Const generic N; unsafe get_unchecked_mut; cache-line padding.
+
+[dev-dependencies]
+proptest = { workspace = true }

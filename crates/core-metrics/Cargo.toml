@@ -1,0 +1,12 @@
+[package]
+name         = "core-metrics"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Preallocated counter + gauge registry with a tiny Prometheus text-format HTTP/1.1 server. Zero-alloc record path; std::net listener; no tokio."
+
+[lib]
+path = "src/lib.rs"

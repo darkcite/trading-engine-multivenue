@@ -1,0 +1,186 @@
+[workspace]
+resolver = "2"
+
+members = [
+    # --- core primitives (OS-agnostic) ---
+    "crates/core-alloc",
+    "crates/core-config",
+    "crates/core-io",
+    "crates/core-latency",
+    "crates/core-metrics",
+    "crates/core-net",
+    "crates/core-parse",
+    "crates/core-ring",
+    "crates/core-simd",
+    "crates/core-time",
+    "crates/core-types",
+
+    # --- ingress adapters (one per external source) ---
+    "crates/ingress-binance",
+    "crates/ingress-polymarket",
+    "crates/ingress-rpc",
+    "crates/ingress-rss",
+
+    # --- book + strategies ---
+    "crates/book-builder",
+    "crates/research-artifacts",
+    "crates/strategy-core",
+    "crates/strategy-cross-arb",
+    "crates/strategy-ev",
+    "crates/strategy-latency-arb",
+    "crates/strategy-rule-tree",
+    # NOTE: `crates/strategy-news/` exists on-disk but is no longer
+    # part of the workspace — Strategy D (rule-tree) covers the
+    # news-driven path. Files are retained for git history; the
+    # bind-mounted FS does not permit removal from this session.
+
+    # --- execution ---
+    "crates/clob-dispatcher",
+    "crates/signer-eip712",
+
+    # --- engine + UI ---
+    "crates/engine",
+    "crates/cli",
+    "crates/tui",
+
+    # --- bench/alloc harness ---
+    "crates/bench",
+]
+
+# Fuzz targets live in fuzz/Cargo.toml (cargo-fuzz convention) and are NOT
+# part of the main workspace.
+exclude = ["fuzz", "claude-worker"]
+
+# ---------------------------------------------------------------
+# Shared dependency versions pinned at the workspace level.
+# Individual crates inherit with `dep.workspace = true`.
+# ---------------------------------------------------------------
+[workspace.package]
+edition      = "2021"
+rust-version = "1.83"
+license      = "Apache-2.0"
+publish      = false
+authors      = ["Polymarket Latency-Arb Team"]
+
+[workspace.dependencies]
+# --- allocation / zero-alloc infra ---
+# dhat only used in bench + alloc_assertions, never in hot path.
+dhat = "0.3"
+
+# --- time ---
+# Monotonic clock via platform syscall; no chrono in hot path.
+
+# --- parsing ---
+memchr       = "2.7"
+aho-corasick = "1.1"
+phf          = { version = "0.11", features = ["macros"] }
+
+# --- crypto (for signer-eip712) ---
+# Explicit, minimal deps — not `ethers` or `alloy`.
+secp256k1   = { version = "0.29", features = ["recovery", "lowmemory"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# --- http/2 client (clob-dispatcher) ---
+# hyper + rustls only, no reqwest.
+hyper   = { version = "1.3", features = ["http2", "client"] }
+rustls  = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+http    = "1.1"
+
+# --- ws ingress ---
+# handwritten WebSocket framing on top of mio; no tokio-tungstenite.
+mio = { version = "0.8", features = ["os-poll", "net"] }
+
+# --- TLS trust anchors ---
+# compiled-in Mozilla CA roots; no runtime filesystem scan of the system trust store
+# until we ship a production binary.
+webpki-roots      = "0.26"
+rustls-pki-types  = "1.14"
+
+# --- env loader (boot only) ---
+dotenvy = "0.15"
+
+# --- zeroize ---
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+# --- logging (outside hot path only) ---
+# zerolog-style: tracing for boot + bench; never on hot path.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- CLI parsing ---
+clap = { version = "4.5", features = ["derive"] }
+
+# --- TUI ---
+ratatui  = "0.28"
+crossterm = "0.28"
+
+# --- testing ---
+proptest  = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+# rcgen: minimal self-signed cert generation for TLS-loopback
+# integration tests. Test-only — never linked into release.
+rcgen     = "0.13"
+
+# --- internal crates ---
+core-alloc   = { path = "crates/core-alloc" }
+core-config  = { path = "crates/core-config" }
+core-io      = { path = "crates/core-io" }
+core-latency = { path = "crates/core-latency" }
+core-metrics = { path = "crates/core-metrics" }
+core-net     = { path = "crates/core-net" }
+core-parse   = { path = "crates/core-parse" }
+core-ring    = { path = "crates/core-ring" }
+core-simd    = { path = "crates/core-simd" }
+core-time    = { path = "crates/core-time" }
+core-types   = { path = "crates/core-types" }
+
+ingress-binance    = { path = "crates/ingress-binance" }
+ingress-polymarket = { path = "crates/ingress-polymarket" }
+ingress-rpc        = { path = "crates/ingress-rpc" }
+ingress-rss        = { path = "crates/ingress-rss" }
+
+book-builder          = { path = "crates/book-builder" }
+research-artifacts    = { path = "crates/research-artifacts" }
+strategy-core         = { path = "crates/strategy-core" }
+strategy-cross-arb    = { path = "crates/strategy-cross-arb" }
+strategy-ev           = { path = "crates/strategy-ev" }
+strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
+strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
+
+clob-dispatcher = { path = "crates/clob-dispatcher" }
+signer-eip712   = { path = "crates/signer-eip712" }
+
+engine = { path = "crates/engine" }
+tui    = { path = "crates/tui" }
+
+# ---------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------
+[profile.release]
+# Fail-fast on the hot path: release never unwinds.
+panic           = "abort"
+lto             = "fat"
+codegen-units   = 1
+opt-level       = 3
+debug           = 1          # keep line-number info for crash logs
+strip           = "debuginfo"
+overflow-checks = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug    = true
+strip    = "none"
+
+[profile.bench]
+inherits = "release"
+
+[profile.dev]
+opt-level     = 0
+debug         = true
+panic         = "unwind"     # dev builds may use #[should_panic] tests
+
+# Tests run the same optimizer as release when we care about alloc
+# counts or NEON codegen. Invoke with `cargo test --release` for those.
+[profile.test]
+opt-level = 0
+debug     = true

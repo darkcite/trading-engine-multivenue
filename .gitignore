@@ -1,0 +1,55 @@
+# --- secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Rust ---
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# fuzz corpus/artifacts we don't want to vendor
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/
+
+# criterion output
+criterion/
+
+# dhat profiling output
+dhat-heap.json
+dhat-*.json
+
+# --- Python / claude-worker ---
+claude-worker/.venv/
+claude-worker/__pycache__/
+claude-worker/**/__pycache__/
+claude-worker/**/*.pyc
+claude-worker/.pytest_cache/
+claude-worker/.ruff_cache/
+claude-worker/.mypy_cache/
+claude-worker/dist/
+claude-worker/build/
+claude-worker/*.egg-info/
+claude-worker/uv.lock.bak
+
+# --- runtime data ---
+~/polymarket/
+logs/
+*.log
+*.hgrm
+replay/
+snapshots/
+
+# --- editor / OS ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+.nvimrc.local
+
+# --- Claude local session scratch ---
+.claude/cache/
+.claude/local/

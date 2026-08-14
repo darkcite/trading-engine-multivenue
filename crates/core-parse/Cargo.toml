@@ -1,0 +1,19 @@
+[package]
+name         = "core-parse"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Zero-alloc byte scanner primitives over &[u8]. Parse integers/floats/JSON-ish fragments without ever touching the allocator."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+memchr       = { workspace = true }
+aho-corasick = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

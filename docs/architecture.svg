@@ -1,0 +1,135 @@
+<svg viewBox="0 0 980 655" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d" font-family="ui-sans-serif, system-ui, sans-serif">
+  <title id="t">Polymarket latency-arb engine architecture</title>
+  <desc id="d">Four external sources flow through per-venue ingress threads into lock-free SPSC rings, drained by a single-writer engine that is generic over a Strategy trait and an OrderDispatch trait; orders go out through a signer to the CLOB, with observability and an offline Claude worker off the hot path.</desc>
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8a86"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="980" height="655" fill="#ffffff"/>
+
+  <!-- order return path (top lane) -->
+  <path d="M 624 497 L 952 497 L 952 18 L 149 18 L 149 30" fill="none" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <text x="550" y="13" font-size="10" fill="#8a8a86" text-anchor="middle">signed orders → CLOB REST</text>
+
+  <!-- Tier 1: external sources -->
+  <g>
+    <rect x="44" y="34" width="210" height="46" rx="6" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="149" y="53" font-size="12.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Polymarket CLOB</text>
+    <text x="149" y="69" font-size="10.5" fill="#8a8a86" text-anchor="middle">WSS book frames</text>
+
+    <rect x="270" y="34" width="210" height="46" rx="6" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="375" y="53" font-size="12.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Binance</text>
+    <text x="375" y="69" font-size="10.5" fill="#8a8a86" text-anchor="middle">WSS bookTicker</text>
+
+    <rect x="496" y="34" width="210" height="46" rx="6" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="601" y="53" font-size="12.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Polygon RPC</text>
+    <text x="601" y="69" font-size="10.5" fill="#8a8a86" text-anchor="middle">WSS newHeads</text>
+
+    <rect x="722" y="34" width="210" height="46" rx="6" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="827" y="53" font-size="12.5" font-weight="600" fill="#1a1a18" text-anchor="middle">RSS feeds</text>
+    <text x="827" y="69" font-size="10.5" fill="#8a8a86" text-anchor="middle">HTTP/1.1 polls</text>
+  </g>
+
+  <line x1="149" y1="80" x2="149" y2="101" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="375" y1="80" x2="375" y2="101" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="601" y1="80" x2="601" y2="101" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="827" y1="80" x2="827" y2="101" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+
+  <!-- Tier 2: ingress (connector seam) -->
+  <rect x="36" y="104" width="904" height="68" rx="8" fill="none" stroke="#b45309" stroke-width="1.3"/>
+  <text x="48" y="117" font-size="9.5" font-weight="600" fill="#b45309">VENUE CONNECTORS — one crate per source</text>
+  <g>
+    <rect x="52" y="122" width="196" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="150" y="139" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">ingress-polymarket</text>
+    <text x="150" y="154" font-size="10" fill="#8a8a86" text-anchor="middle">pinned thread · byte scanner</text>
+    <rect x="278" y="122" width="196" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="376" y="139" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">ingress-binance</text>
+    <text x="376" y="154" font-size="10" fill="#8a8a86" text-anchor="middle">pinned thread · byte scanner</text>
+    <rect x="504" y="122" width="196" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="602" y="139" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">ingress-rpc</text>
+    <text x="602" y="154" font-size="10" fill="#8a8a86" text-anchor="middle">mio + rustls · no tokio</text>
+    <rect x="730" y="122" width="196" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="828" y="139" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">ingress-rss</text>
+    <text x="828" y="154" font-size="10" fill="#8a8a86" text-anchor="middle">poller · SeenRing dedupe</text>
+  </g>
+
+  <line x1="149" y1="172" x2="149" y2="194" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="375" y1="172" x2="375" y2="194" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="601" y1="172" x2="601" y2="194" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="827" y1="172" x2="655" y2="194" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+
+  <!-- Tier 3: SPSC rings -->
+  <g>
+    <rect x="44" y="198" width="210" height="38" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="149" y="214" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Tick ring · 16384</text>
+    <text x="149" y="228" font-size="10" fill="#8a8a86" text-anchor="middle">SPSC · POD · 64B-aligned</text>
+    <rect x="270" y="198" width="210" height="38" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="375" y="214" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Tick ring · 8192</text>
+    <text x="375" y="228" font-size="10" fill="#8a8a86" text-anchor="middle">SPSC · POD · 64B-aligned</text>
+    <rect x="496" y="198" width="210" height="38" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="601" y="214" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Signal ring · 1024</text>
+    <text x="601" y="228" font-size="10" fill="#8a8a86" text-anchor="middle">RPC + RSS signals</text>
+  </g>
+
+  <line x1="149" y1="236" x2="149" y2="266" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="375" y1="236" x2="375" y2="266" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="601" y1="236" x2="601" y2="266" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+
+  <!-- Tier 4: engine -->
+  <rect x="44" y="270" width="888" height="120" rx="8" fill="#f6f6f4" stroke="#d0d0cc" stroke-width="1.3"/>
+  <text x="64" y="292" font-size="13" font-weight="700" fill="#1a1a18">Engine&lt;S: Strategy, D: OrderDispatch&gt;</text>
+  <text x="64" y="308" font-size="10.5" fill="#8a8a86">single-writer sync loop · monomorphized · no locks · 0 alloc steady-state</text>
+  <g>
+    <rect x="64" y="320" width="360" height="54" rx="5" fill="#ffffff" stroke="#b45309" stroke-width="1.3"/>
+    <text x="244" y="340" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">Strategy trait — plug-in seam</text>
+    <text x="244" y="356" font-size="10" fill="#8a8a86" text-anchor="middle">latency-arb · ev · cross-arb · rule-tree</text>
+    <rect x="444" y="320" width="220" height="54" rx="5" fill="#ffffff" stroke="#d0d0cc"/>
+    <text x="554" y="340" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">book-builder</text>
+    <text x="554" y="356" font-size="10" fill="#8a8a86" text-anchor="middle">MultiBook · top-of-book slots</text>
+    <rect x="684" y="320" width="228" height="54" rx="5" fill="#ffffff" stroke="#d0d0cc"/>
+    <text x="798" y="340" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">timers · latency trackers</text>
+    <text x="798" y="356" font-size="10" fill="#8a8a86" text-anchor="middle">ingest / decide / ack HDR</text>
+  </g>
+
+  <line x1="344" y1="390" x2="344" y2="421" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <text x="336" y="410" font-size="10" fill="#8a8a86" text-anchor="end">submit(&amp;Order)</text>
+  <line x1="560" y1="424" x2="560" y2="394" stroke="#8a8a86" stroke-width="1.2" marker-end="url(#ar)"/>
+  <text x="568" y="412" font-size="10" fill="#8a8a86">Fill ring</text>
+  <line x1="798" y1="390" x2="798" y2="421" stroke="#8a8a86" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+
+  <!-- Tier 5: dispatch + observability -->
+  <rect x="44" y="424" width="600" height="112" rx="8" fill="none" stroke="#b45309" stroke-width="1.3"/>
+  <text x="56" y="442" font-size="11" font-weight="600" fill="#b45309">OrderDispatch trait — plug-in seam</text>
+  <g>
+    <rect x="60" y="452" width="180" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="150" y="474" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">PaperDispatcher</text>
+    <text x="150" y="490" font-size="10" fill="#8a8a86" text-anchor="middle">simulated fills, no network</text>
+    <rect x="252" y="452" width="180" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="342" y="474" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">QueuedDispatcher</text>
+    <text x="342" y="490" font-size="10" fill="#8a8a86" text-anchor="middle">order ring → worker thread</text>
+    <rect x="444" y="452" width="180" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="534" y="474" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">LiveDispatcher</text>
+    <text x="534" y="490" font-size="10" fill="#8a8a86" text-anchor="middle">signer-eip712 · HTTP/1.1 TLS</text>
+  </g>
+
+  <rect x="664" y="424" width="268" height="112" rx="8" fill="none" stroke="#d0d0cc" stroke-dasharray="5 4"/>
+  <text x="798" y="452" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">Observability — off hot path</text>
+  <text x="798" y="474" font-size="10.5" fill="#8a8a86" text-anchor="middle">/metrics 127.0.0.1:9191 · ratatui TUI</text>
+  <text x="798" y="491" font-size="10.5" fill="#8a8a86" text-anchor="middle">HdrHistogram dumps · PMLR replay log</text>
+
+  <!-- Tier 6: offline research + legend -->
+  <path d="M 44 594 L 30 594 L 30 332 L 41 332" fill="none" stroke="#8a8a86" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+  <text x="22" y="470" font-size="9.5" fill="#8a8a86" transform="rotate(-90 22 470)" text-anchor="middle">NDJSON artifacts · loaded at boot</text>
+
+  <rect x="44" y="568" width="340" height="52" rx="6" fill="none" stroke="#d0d0cc" stroke-dasharray="5 4"/>
+  <text x="214" y="589" font-size="12" font-weight="600" fill="#1a1a18" text-anchor="middle">claude-worker (Python · offline)</text>
+  <text x="214" y="606" font-size="10" fill="#8a8a86" text-anchor="middle">Claude API → topic tags · rules · model probabilities</text>
+
+  <g>
+    <rect x="672" y="576" width="12" height="12" rx="2" fill="none" stroke="#b45309" stroke-width="1.3"/>
+    <text x="692" y="586" font-size="10.5" fill="#8a8a86">plug-in seam (trait / crate boundary)</text>
+    <rect x="672" y="598" width="12" height="12" rx="2" fill="none" stroke="#d0d0cc" stroke-dasharray="3 2"/>
+    <text x="692" y="608" font-size="10.5" fill="#8a8a86">off hot path / boot-time only</text>
+  </g>
+</svg>

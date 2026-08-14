@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "description": "Claude Code settings for the Polymarket latency-arb engine. Enforces model routing, permissions, and hook scripts that match CLAUDE.md's hard rules.",
+
+  "model": "claude-opus-4-6",
+
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(cargo check*)",
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo nextest*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo bench*)",
+      "Bash(cargo fuzz*)",
+      "Bash(cargo run --release*)",
+      "Bash(cargo run -p cli*)",
+      "Bash(make *)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git show*)",
+      "Bash(rg *)",
+      "Bash(fd *)",
+      "Bash(uv run *)",
+      "Bash(uv sync*)",
+      "Bash(uv pip list*)",
+      "Bash(python -m pytest*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(tree *)",
+      "Bash(file *)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:docs.claude.com)",
+      "WebFetch(domain:binance-docs.github.io)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push*)",
+      "Bash(git reset --hard*)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(sudo *)",
+      "Bash(pip install *)",
+      "Bash(cargo publish*)",
+      "Bash(npm *)",
+      "Bash(yarn *)",
+      "Write(./.env)",
+      "Read(./.env)"
+    ]
+  },
+
+  "env": {
+    "CARGO_TERM_COLOR": "always",
+    "RUSTFLAGS": "-C target-cpu=native",
+    "RUST_BACKTRACE": "1"
+  },
+
+  "statusLine": {
+    "type": "static",
+    "value": "polymarket-arb • opus-4-6"
+  },
+
+  "outputStyle": "default",
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./.claude/hooks/no-forbidden-crates.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./.claude/hooks/post-edit-fmt.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

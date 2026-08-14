@@ -1,0 +1,12 @@
+[package]
+name         = "core-latency"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Log-linear latency histogram + zero-alloc record path. Atomic buckets, percentile reads, periodic textual dump (.hgrm-like)."
+
+[lib]
+path = "src/lib.rs"

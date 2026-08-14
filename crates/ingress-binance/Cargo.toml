@@ -1,0 +1,26 @@
+[package]
+name         = "ingress-binance"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Binance WS ingress (spot + futures). Handwritten byte-scanner parser. Emits Signals onto the signal ring."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-net   = { workspace = true }
+core-parse = { workspace = true }
+core-ring  = { workspace = true }
+core-time  = { workspace = true }
+core-types = { workspace = true }
+memchr     = { workspace = true }
+mio        = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rcgen    = { workspace = true }
+rustls   = { workspace = true }

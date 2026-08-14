@@ -1,0 +1,17 @@
+{
+  "_comment": "Hot-path criterion baseline. Numbers from 2026-05-19 post-fix run on Linux aarch64 sandbox. Each entry: median ns. Re-baseline by running `make bench` and updating this file when the regression is intentional (e.g. a new feature on the hot path).",
+  "_source": "docs/hot-path-latency.md",
+  "tolerance_pct": 15,
+  "samples": {
+    "clock/now_ns": 13.7,
+    "ring/push_pop_tick": 5.25,
+    "latency/record_1us": 2.65,
+    "latency/record_1ms": 2.68,
+    "metrics/counter_inc_1": 1.58,
+    "book/apply_n8_middle": 0.94,
+    "cooldown/allow": 0.51,
+    "dispatcher/queued_submit": 1.54,
+    "strategy/latency_arb_on_tick_no_fire": 1.66,
+    "signer/sign_order_full_ns": 20490
+  }
+}

@@ -1,0 +1,20 @@
+[package]
+name         = "book-builder"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Consumes Polymarket book deltas + trades, maintains a fixed-depth order book per market. InlineArray price ladders, no allocation after init."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-ring  = { workspace = true }
+core-time  = { workspace = true }
+core-types = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

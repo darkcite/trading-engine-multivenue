@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------
+# Cargo build config — tuned for the latency-arb engine.
+#
+# - Release builds use `panic = "abort"` (fail-fast on the hot path).
+# - Native codegen per host; overridable via CARGO_BUILD_TARGET.
+# - LTO + single codegen-unit for release (fewer indirect branches,
+#   better inlining at the cost of build time).
+# ---------------------------------------------------------------
+
+[build]
+# Default to native host target. For cross-compile to Linux from M4,
+# set CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu and use cargo-zigbuild.
+
+# Keep incremental off for release; allow for debug.
+incremental = false
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    # -C target-cpu=apple-m1 so NEON+advanced instructions land.
+    "-C", "target-cpu=apple-m1",
+    # Deny warnings so CI fails loud; comment out locally when hacking.
+    # "-D", "warnings",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # znver3 is a reasonable baseline for AWS hpc6a-ish boxes.
+    # Override to `native` if building on the exact prod CPU.
+    "-C", "target-cpu=znver3",
+]
+
+# ---- Profiles ----
+# The `profile` section cannot live in .cargo/config.toml; it lives in
+# the root Cargo.toml. Left here as a reminder.

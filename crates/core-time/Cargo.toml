@@ -1,0 +1,18 @@
+[package]
+name         = "core-time"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Monotonic nanosecond clock. Thin wrapper around the platform syscall. Zero-alloc, branch-light."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# std only. Platform specifics are cfg-gated inside lib.rs.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

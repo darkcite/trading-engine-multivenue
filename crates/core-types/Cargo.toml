@@ -1,0 +1,15 @@
+[package]
+name         = "core-types"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "POD value types shared across the workspace: SymbolId, Price, Qty, Tick, Signal, Fill, Side."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# No heap deps. #[repr(C)] + Copy structs only.

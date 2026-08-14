@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so that every contributor, CI runner, and benchmark lands on the
+# exact same codegen/optimizer. Bump deliberately, never as a drive-by.
+channel     = "1.88.0"
+components  = ["rustfmt", "clippy", "rust-src"]
+targets     = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+profile     = "minimal"

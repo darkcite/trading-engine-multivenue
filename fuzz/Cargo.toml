@@ -1,0 +1,99 @@
+[package]
+name    = "polymarket-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# cargo-fuzz runtime.
+libfuzzer-sys = "0.4"
+
+# Workspace crates under test.
+ingress-polymarket = { path = "../crates/ingress-polymarket" }
+ingress-binance    = { path = "../crates/ingress-binance" }
+ingress-rpc        = { path = "../crates/ingress-rpc" }
+ingress-rss        = { path = "../crates/ingress-rss" }
+core-net           = { path = "../crates/core-net" }
+core-parse         = { path = "../crates/core-parse" }
+signer-eip712      = { path = "../crates/signer-eip712" }
+clob-dispatcher    = { path = "../crates/clob-dispatcher" }
+
+[[bin]]
+name   = "polymarket_clob_frame"
+path   = "fuzz_targets/polymarket_clob_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "binance_agg_trade"
+path   = "fuzz_targets/binance_agg_trade.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "binance_book_ticker"
+path   = "fuzz_targets/binance_book_ticker.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ws_frame"
+path   = "fuzz_targets/ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ws_handshake"
+path   = "fuzz_targets/ws_handshake.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "rpc_response"
+path   = "fuzz_targets/rpc_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "rss_item"
+path   = "fuzz_targets/rss_item.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "core_parse_price"
+path   = "fuzz_targets/core_parse_price.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "http1_response"
+path   = "fuzz_targets/http1_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "rpc_subscribe_envelope"
+path   = "fuzz_targets/rpc_subscribe_envelope.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "signer_eip712_encode"
+path   = "fuzz_targets/signer_eip712_encode.rs"
+test   = false
+doc    = false
+bench  = false

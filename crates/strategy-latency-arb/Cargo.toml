@@ -1,0 +1,18 @@
+[package]
+name         = "strategy-latency-arb"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Strategy B: Binance price movement → Polymarket crypto market. Primary v1 edge. Compile-time via Engine<S>."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+strategy-core = { workspace = true }
+core-types    = { workspace = true }
+core-time     = { workspace = true }
+book-builder  = { workspace = true }

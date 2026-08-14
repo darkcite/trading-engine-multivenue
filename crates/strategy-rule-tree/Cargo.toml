@@ -1,0 +1,20 @@
+[package]
+name         = "strategy-rule-tree"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Strategy D: claude-worker rule-tree consumer. Matches incoming Signal payloads against per-rule triggers and emits orders when high-confidence rules fire."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+strategy-core      = { workspace = true }
+core-types         = { workspace = true }
+core-time          = { workspace = true }
+book-builder       = { workspace = true }
+research-artifacts = { workspace = true }
+memchr             = { workspace = true }

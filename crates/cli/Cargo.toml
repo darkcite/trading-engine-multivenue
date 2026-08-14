@@ -1,0 +1,46 @@
+[package]
+name         = "cli"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Main binary. Parses CLI args, loads config via core-config, wires together ingress + engine + strategy + dispatcher."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "polymarket-engine"
+path = "src/bin/polymarket-engine.rs"
+
+[dependencies]
+core-config          = { workspace = true }
+core-net             = { workspace = true }
+core-ring            = { workspace = true }
+core-time            = { workspace = true }
+core-types           = { workspace = true }
+engine               = { workspace = true }
+strategy-core        = { workspace = true }
+strategy-latency-arb = { workspace = true }
+strategy-ev          = { workspace = true }
+strategy-cross-arb   = { workspace = true }
+strategy-rule-tree   = { workspace = true }
+research-artifacts   = { workspace = true }
+clob-dispatcher      = { workspace = true }
+book-builder         = { workspace = true }
+core-metrics         = { workspace = true }
+core-latency         = { workspace = true }
+tui                  = { workspace = true }
+ingress-polymarket   = { workspace = true }
+ingress-binance      = { workspace = true }
+ingress-rpc          = { workspace = true }
+ingress-rss          = { workspace = true }
+clap                 = { workspace = true }
+tracing              = { workspace = true }
+tracing-subscriber   = { workspace = true }
+mio                  = { workspace = true }
+rustls               = { workspace = true }
+rustls-pki-types     = { workspace = true }
+libc                 = "0.2"
