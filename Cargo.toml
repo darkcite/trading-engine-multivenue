@@ -5,6 +5,7 @@ members = [
     # --- core primitives (OS-agnostic) ---
     "crates/core-alloc",
     "crates/core-config",
+    "crates/core-crypto",
     "crates/core-io",
     "crates/core-latency",
     "crates/core-metrics",

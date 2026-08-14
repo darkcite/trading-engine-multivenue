@@ -33,10 +33,12 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
 
+use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
-    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong,
-    HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
+    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_ping,
+    ws_write_pong, HandshakeResult, Keepalive, KeepaliveAction, Status, Transport, WsOpcode,
+    WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
@@ -270,6 +272,9 @@ pub enum RunResult {
     Stopped,
     /// Peer closed the connection (clean or not). Caller reconnects.
     Disconnected,
+    /// No inbound bytes within the keepalive idle budget (D5) — caller
+    /// reconnects.
+    IdleTimeout,
     /// Fatal transport error.
     Error,
 }
@@ -350,9 +355,11 @@ impl Driver {
 /// * `transport`: any [`Transport`] implementation.
 /// * `drv`: per-connection driver state.
 /// * `host`, `path`: sent verbatim into the `GET` line + `Host:` header.
-/// * `producer`: tick ring producer. A full ring drops ticks silently
-///   (fail-fast + metric at the engine layer; no allocation here).
+/// * `producer`: tick ring producer. A full ring drops the tick and
+///   counts it on `status` (D4); no allocation here.
 /// * `symbol_map`: asset_id → SymbolId resolver.
+/// * `status`: per-ingress observability slot (D4/D5/D7). This thread
+///   is its only writer; counter bumps are `Relaxed` atomics.
 ///
 /// # Errors
 ///
@@ -365,6 +372,7 @@ pub fn drive_one<T: Transport>(
     path: &[u8],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
+    status: &IngressStatus,
 ) -> io::Result<()> {
     // 1. Flush any pending outbound bytes.
     flush_tx(transport, drv)?;
@@ -382,10 +390,10 @@ pub fn drive_one<T: Transport>(
             drv.state = State::AwaitingWsUpgrade;
         }
         State::AwaitingWsUpgrade => {
-            advance_ws_upgrade(drv)?;
+            advance_ws_upgrade(drv, status)?;
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, symbol_map)?;
+            drain_ws_frames(drv, producer, symbol_map, status)?;
         }
         State::Closed => {}
     }
@@ -466,7 +474,7 @@ fn write_handshake_to_tx(drv: &mut Driver, host: &[u8], path: &[u8]) -> io::Resu
     Ok(())
 }
 
-fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
+fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()> {
     match read_server_handshake(drv.rx.filled()) {
         HandshakeResult::Incomplete => Ok(()),
         HandshakeResult::Upgraded {
@@ -485,7 +493,13 @@ fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
             }
             drv.rx.consume(header_end);
             drv.state = State::Steady;
-            drv.last_activity_ns = now_ns();
+            // D7: the one WS-upgrade → Steady transition per session.
+            status.set_state(IngressState::Up);
+            // D5: the 101 response bytes count as inbound activity.
+            let now = now_ns();
+            drv.last_activity_ns = now;
+            status.touch_activity(now);
+            status.add_bytes(header_end as u64);
             Ok(())
         }
         HandshakeResult::Malformed => Err(io::Error::new(
@@ -499,6 +513,7 @@ fn drain_ws_frames(
     drv: &mut Driver,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
+    status: &IngressStatus,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -526,7 +541,13 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text => {
-                        handle_text_frame(drv, payload.start..payload.end, producer, symbol_map);
+                        handle_text_frame(
+                            drv,
+                            payload.start..payload.end,
+                            producer,
+                            symbol_map,
+                            status,
+                        );
                     }
                     WsOpcode::Binary => {
                         // Polymarket CLOB is text-only; drop silently.
@@ -564,7 +585,11 @@ fn drain_ws_frames(
                     }
                 }
 
-                drv.last_activity_ns = now_ns();
+                // D5: every complete inbound frame is activity.
+                let now = now_ns();
+                drv.last_activity_ns = now;
+                status.touch_activity(now);
+                status.add_bytes(total as u64);
                 drv.rx.consume(total);
 
                 if drv.state == State::Closed {
@@ -580,19 +605,29 @@ fn handle_text_frame(
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
+    status: &IngressStatus,
 ) {
     let payload = &drv.rx.filled()[payload_range];
     let Some(asset_id) = extract_asset_id(payload) else {
+        // Not a book/price frame (subscription ack, unrelated event) —
+        // neither a message nor a parse error.
         return;
     };
     let Some(sym) = symbol_map.lookup(asset_id) else {
         return;
     };
     let ts_ns = now_ns();
-    if let Some(tick) = parse_book_update(payload, sym, ts_ns) {
-        // Ring-full is not an error from the run-loop's perspective;
-        // it is back-pressure the consumer will see and metric on.
-        let _ = producer.try_push(tick);
+    match parse_book_update(payload, sym, ts_ns) {
+        Some(tick) => {
+            status.add_msgs(1);
+            // Ring-full is not an error from the run-loop's
+            // perspective; it is back-pressure — but it is no longer
+            // silent (D4): every failed push is loss-accounted.
+            if producer.try_push(tick).is_err() {
+                status.inc_ring_drops();
+            }
+        }
+        None => status.inc_parse_errors(),
     }
 }
 
@@ -614,16 +649,23 @@ fn extract_asset_id(payload: &[u8]) -> Option<&[u8]> {
 /// shutdown. The run-loop checks it between mio poll cycles.
 pub type StopFlag = AtomicBool;
 
-/// Run the Polymarket ingress loop until `stop` is set or the transport
-/// fails. Reconnect is the caller's responsibility — this function
-/// returns [`RunResult::Disconnected`] so the outer scheduler can sleep
-/// + retry.
+/// Run the Polymarket ingress loop until `stop` is set, the transport
+/// fails, or the keepalive idle budget is exhausted. Reconnect is the
+/// caller's responsibility — this function returns
+/// [`RunResult::Disconnected`] / [`RunResult::IdleTimeout`] so the
+/// outer scheduler can sleep + retry.
 ///
 /// Bounded stack use: all buffers live inside `drv`, which was
 /// preallocated. `events` is an mio `Events` buffer the caller owns.
 ///
 /// The first argument is any [`Transport`] implementation; in production
 /// this is `TlsTransport`, in integration tests it is `TestTransport`.
+///
+/// `status` is this session's observability slot (D4/D5/D7); this
+/// thread is its only writer. `keepalive` is polled once per
+/// steady-state iteration (D5/D6): it schedules masked protocol-level
+/// pings and declares the connection dead when no inbound bytes arrive
+/// within the idle budget.
 pub fn run<T: Transport>(
     transport: &mut T,
     drv: &mut Driver,
@@ -635,7 +677,11 @@ pub fn run<T: Transport>(
     events: &mut mio::Events,
     token: mio::Token,
     stop: &StopFlag,
+    status: &IngressStatus,
+    keepalive: &mut Keepalive,
 ) -> RunResult {
+    let session_start_ns = now_ns();
+    keepalive.reset();
     if let Err(_e) = transport.register(poll.registry(), token) {
         return RunResult::Error;
     }
@@ -673,7 +719,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if let Err(_e) = drive_one(transport, drv, host, path, producer, symbol_map) {
+            if let Err(_e) = drive_one(transport, drv, host, path, producer, symbol_map, status) {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -683,6 +729,41 @@ pub fn run<T: Transport>(
             // driver's state machine forward.
             if producer.len() == n_before && drv.state() == state_before {
                 break;
+            }
+        }
+
+        // D5/D6: keepalive poll, once per steady-state iteration. A
+        // connection that never delivered a byte anchors on the
+        // session start so it still times out (`last_activity_ns` is
+        // only 0 before the upgrade completes).
+        if drv.state() == State::Steady {
+            let now = now_ns();
+            let act = if drv.last_activity_ns == 0 {
+                session_start_ns
+            } else {
+                drv.last_activity_ns
+            };
+            match keepalive.poll(now, act) {
+                KeepaliveAction::SendPing => {
+                    // Masked protocol-level ping, empty payload —
+                    // mirrors the pong tx path (RFC 6455 §5.3: clients
+                    // mask every frame).
+                    let mask = ws_mask_from_counter(drv.mask_counter);
+                    drv.mask_counter = drv.mask_counter.wrapping_add(1);
+                    let dst = drv.tx.free_mut();
+                    if let Ok(n) = ws_write_ping(dst, &[], mask) {
+                        drv.tx.advance(n);
+                    }
+                    keepalive.mark_ping_sent(now);
+                    // Push the ping onto the wire through the existing
+                    // flush path instead of waiting for the next
+                    // readiness event.
+                    if flush_tx(transport, drv).is_err() {
+                        return RunResult::Error;
+                    }
+                }
+                KeepaliveAction::Reconnect => return RunResult::IdleTimeout,
+                KeepaliveAction::None => {}
             }
         }
 
@@ -707,7 +788,7 @@ mod tests {
     use super::*;
     use core_net::{
         expected_accept as expected_accept_pub, sec_websocket_key_from_seed as sec_key_pub,
-        ws_write_text_frame, TestTransport,
+        ws_write_text_frame, KeepaliveCfg, TestTransport,
     };
     use core_ring::Ring;
 
@@ -755,13 +836,14 @@ mod tests {
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
         let map = SymbolMap::from_pairs(std::iter::empty());
+        let status = IngressStatus::new();
 
         // Before Ready — no handshake written.
-        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status).unwrap();
         assert_eq!(t.outgoing_len(), 0);
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status).unwrap();
 
         // We now expect a GET-request in the outbound buffer.
         let mut buf = [0u8; 4096];
@@ -780,9 +862,10 @@ mod tests {
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
         let map = SymbolMap::from_pairs(std::iter::empty());
+        let status = IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
         // drain outbound request so we don't confuse the test.
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
@@ -792,8 +875,13 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
         assert_eq!(d.state(), State::Steady);
+        // D7: exactly this transition publishes Up, with the 101
+        // response bytes accounted as activity (D5).
+        assert_eq!(status.state(), IngressState::Up);
+        assert!(status.last_activity_ns() > 0);
+        assert!(status.bytes_total() > 0);
     }
 
     #[test]
@@ -803,9 +891,10 @@ mod tests {
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
         let map = SymbolMap::from_pairs(std::iter::empty());
+        let status = IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -815,7 +904,7 @@ mod tests {
         let resp = build_server_response(&wrong_accept);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map).unwrap_err();
+        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -828,6 +917,7 @@ mod tests {
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();
         let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
 
         let payload = br#"{"event_type":"book","asset_id":"0xABC","timestamp":"1713000000000","bids":[["0.518","100.0"]],"asks":[["0.520","50.0"]]}"#;
         let mut frame_buf = [0u8; 512];
@@ -841,7 +931,7 @@ mod tests {
         let frame_len = 2 + payload.len();
         t.inject_incoming(&frame_buf[..frame_len]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
 
         let tick = cons.try_pop().expect("tick must be pushed");
         assert_eq!(tick.sym, 42);
@@ -849,6 +939,12 @@ mod tests {
         assert_eq!(tick.ask_px.raw(), 520_000);
         // Prove we only queued one tick.
         assert!(cons.try_pop().is_none());
+        // §6.4 accounting: one parsed+dispatched message, frame bytes
+        // counted, nothing rejected, nothing dropped.
+        assert_eq!(status.msgs_total(), 1);
+        assert!(status.bytes_total() > 0);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.ring_drops_total(), 0);
         let _ = ws_write_text_frame; // quiet unused-import lint on tests that don't call it
     }
 
@@ -861,6 +957,7 @@ mod tests {
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
         let map = SymbolMap::from_pairs(std::iter::empty());
+        let status = IngressStatus::new();
 
         // Unmasked Ping with a 4-byte payload.
         let mut frame = [0u8; 16];
@@ -869,7 +966,7 @@ mod tests {
         frame[2..6].copy_from_slice(b"PING");
         t.inject_incoming(&frame[..6]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
         assert!(t.outgoing_len() > 0, "driver should have emitted a pong");
 
         let mut out = [0u8; 64];
@@ -884,6 +981,151 @@ mod tests {
         }
         assert_eq!(&unmasked, b"PING");
         assert_eq!(n, 10);
+    }
+
+    /// Inject an unmasked (server-side) short-form text frame.
+    fn inject_unmasked_text(t: &mut TestTransport, payload: &[u8]) {
+        assert!(payload.len() <= 125, "short-form only for tests");
+        let mut frame = [0u8; 128];
+        frame[0] = 0x81; // FIN | Text
+        frame[1] = payload.len() as u8; // mask=0
+        frame[2..2 + payload.len()].copy_from_slice(payload);
+        t.inject_incoming(&frame[..2 + payload.len()]);
+    }
+
+    #[test]
+    fn steady_state_counts_parse_errors_and_ring_drops() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+
+        // Known asset_id but no timestamp / levels → parser rejection.
+        let bad = br#"{"event_type":"book","asset_id":"0xABC","bids":"nope"}"#;
+        inject_unmasked_text(&mut t, bad);
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        assert_eq!(status.parse_errors_total(), 1);
+        assert_eq!(status.msgs_total(), 0);
+        assert_eq!(status.ring_drops_total(), 0);
+
+        // Fill the ring, then deliver a valid frame: the push must
+        // fail and be loss-accounted (D4) while the message still
+        // counts as parsed.
+        let filler = Tick::new(
+            0,
+            core_types::VenueId::Polymarket,
+            42u32,
+            0,
+            core_types::Price::from_raw(1),
+            core_types::Qty::from_raw(1),
+            core_types::Price::from_raw(2),
+            core_types::Qty::from_raw(1),
+        );
+        while prod.try_push(filler).is_ok() {}
+        let good = br#"{"event_type":"book","asset_id":"0xABC","timestamp":"1713000000000","bids":[["0.518","100.0"]],"asks":[["0.520","50.0"]]}"#;
+        inject_unmasked_text(&mut t, good);
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status).unwrap();
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.ring_drops_total(), 1);
+        assert_eq!(status.parse_errors_total(), 1);
+    }
+
+    #[test]
+    fn run_returns_idle_timeout_on_silent_steady_transport() {
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::empty());
+        let status = IngressStatus::new();
+        // Tiny idle budget: the silent transport must trip it on the
+        // first steady-state iteration, anchored on the session start
+        // because no byte ever arrives (D5).
+        let mut keepalive = Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: 1,
+            idle_timeout_ns: 2,
+        });
+
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let stop = StopFlag::new(false);
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &mut poll,
+            &mut events,
+            mio::Token(0),
+            &stop,
+            &status,
+            &mut keepalive,
+        );
+        assert_eq!(res, RunResult::IdleTimeout);
+    }
+
+    #[test]
+    fn run_sends_masked_ws_ping_when_interval_elapses() {
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::empty());
+        let status = IngressStatus::new();
+        // Tiny ping interval + huge idle budget: the loop must queue
+        // pings (D6) but never trip the idle reconnect.
+        let mut keepalive = Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: 1,
+            idle_timeout_ns: u64::MAX / 2,
+        });
+
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let stop = StopFlag::new(false);
+
+        // `run` borrows the transport for its whole lifetime, so raise
+        // the stop flag from a helper thread after a few 50 ms poll
+        // cycles — the first cycle already queues + flushes a ping.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                stop.store(true, Ordering::Relaxed);
+            });
+            let res = run(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &map,
+                &mut poll,
+                &mut events,
+                mio::Token(0),
+                &stop,
+                &status,
+                &mut keepalive,
+            );
+            assert_eq!(res, RunResult::Stopped);
+        });
+
+        let mut out = [0u8; 256];
+        let n = t.drain_outgoing(&mut out);
+        // Empty-payload masked ping = 2 header bytes + 4 mask bytes.
+        assert!(n >= 6, "a ping frame must have reached the transport");
+        assert_eq!(out[0] & 0x0F, 0x9, "opcode must be Ping");
+        assert_ne!(out[1] & 0x80, 0, "client frames must be masked");
+        assert_eq!(out[1] & 0x7F, 0, "keepalive ping payload is empty");
     }
 
     #[test]

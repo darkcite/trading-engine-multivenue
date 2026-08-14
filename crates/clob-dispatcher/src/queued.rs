@@ -164,12 +164,13 @@ impl<D: OrderDispatch + Send + 'static> DispatcherWorker<D> {
 mod tests {
     use super::*;
     use crate::PaperDispatcher;
-    use core_types::{Price, Qty, Side};
+    use core_types::{Price, Qty, Side, VenueId};
     use std::time::Instant;
 
     fn mk_order(oid: u64) -> Order {
         Order::new(
             0,
+            VenueId::Polymarket,
             1,
             Side::Bid,
             0,

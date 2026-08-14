@@ -21,14 +21,20 @@
 //!   Polymarket.
 //!
 //! All steady-state work after the WS upgrade is zero-alloc.
+//!
+//! Phase 8a wires in observability + liveness (D4/D5/D6/D7): the loop
+//! publishes into a shared [`core_metrics::IngressStatus`] slot
+//! (relaxed atomics only — still zero-alloc) and drives a
+//! [`core_net::Keepalive`] that emits proactive WS protocol pings and
+//! forces a reconnect when the connection goes silent.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
 
 use core_net::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
-    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong,
-    HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
+    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_ping,
+    ws_write_pong, HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
@@ -51,7 +57,7 @@ pub const TX_BUF_SIZE: usize = 4 * 1024;
 /// Default Binance tick-ring capacity. Must be a power of two (the
 /// ring enforces this at construction); 8192 is plenty for a single
 /// symbol at Binance cadence.
-pub const DEFAULT_TICK_RING_CAP: usize = 8192;
+pub const DEFAULT_TICK_RING_CAP: usize = 16_384;
 
 // ---------------------------------------------------------------
 // Buffers — cursor-draining byte windows, zero-alloc after construction
@@ -152,6 +158,9 @@ pub enum RunResult {
     Disconnected,
     /// Fatal transport error.
     Error,
+    /// No inbound bytes within the keepalive idle budget (D5) — caller
+    /// reconnects.
+    IdleTimeout,
 }
 
 /// Mutable per-connection state owned by the run-loop. Preallocated at
@@ -232,7 +241,10 @@ impl Driver {
 /// * `transport`: any [`Transport`] implementation.
 /// * `drv`: per-connection driver state.
 /// * `host`, `path`: sent verbatim into the `GET` line + `Host:` header.
-/// * `producer`: tick ring producer. A full ring drops ticks silently.
+/// * `producer`: tick ring producer. A full ring drops the tick and
+///   counts it on `status` (D4).
+/// * `status`: shared per-ingress observability slot (relaxed atomics
+///   only; this thread is the sole writer).
 ///
 /// # Errors
 ///
@@ -244,6 +256,7 @@ pub fn drive_one<T: Transport>(
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    status: &core_metrics::IngressStatus,
 ) -> io::Result<()> {
     // 1. Flush any pending outbound bytes.
     flush_tx(transport, drv)?;
@@ -259,10 +272,10 @@ pub fn drive_one<T: Transport>(
             drv.state = State::AwaitingWsUpgrade;
         }
         State::AwaitingWsUpgrade => {
-            advance_ws_upgrade(drv)?;
+            advance_ws_upgrade(drv, status)?;
         }
         State::Steady => {
-            drain_ws_frames(drv, producer)?;
+            drain_ws_frames(drv, producer, status)?;
         }
         State::Closed => {}
     }
@@ -339,7 +352,7 @@ fn write_handshake_to_tx(drv: &mut Driver, host: &[u8], path: &[u8]) -> io::Resu
     Ok(())
 }
 
-fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
+fn advance_ws_upgrade(drv: &mut Driver, status: &core_metrics::IngressStatus) -> io::Result<()> {
     match read_server_handshake(drv.rx.filled()) {
         HandshakeResult::Incomplete => Ok(()),
         HandshakeResult::Upgraded {
@@ -358,7 +371,13 @@ fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
             }
             drv.rx.consume(header_end);
             drv.state = State::Steady;
-            drv.last_activity_ns = now_ns();
+            // D7: the one Connecting → Steady transition this session —
+            // publish `Up` exactly once, at the transition.
+            status.set_state(core_metrics::IngressState::Up);
+            let now = now_ns();
+            drv.last_activity_ns = now;
+            status.touch_activity(now);
+            status.add_bytes(header_end as u64);
             Ok(())
         }
         HandshakeResult::Malformed => Err(io::Error::new(
@@ -371,6 +390,7 @@ fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
 fn drain_ws_frames(
     drv: &mut Driver,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    status: &core_metrics::IngressStatus,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -395,7 +415,7 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text => {
-                        handle_text_frame(drv, payload.start..payload.end, producer);
+                        handle_text_frame(drv, payload.start..payload.end, producer, status);
                     }
                     WsOpcode::Binary => {
                         // Binance @bookTicker is text-only; drop.
@@ -425,7 +445,12 @@ fn drain_ws_frames(
                     }
                 }
 
-                drv.last_activity_ns = now_ns();
+                // D5: record inbound liveness + byte accounting on the
+                // shared status slot alongside the driver-local stamp.
+                let now = now_ns();
+                drv.last_activity_ns = now;
+                status.touch_activity(now);
+                status.add_bytes(total as u64);
                 drv.rx.consume(total);
 
                 if drv.state == State::Closed {
@@ -440,6 +465,7 @@ fn handle_text_frame(
     drv: &Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    status: &core_metrics::IngressStatus,
 ) {
     let payload = &drv.rx.filled()[payload_range];
     if let Some(f) = parse_book_ticker(payload, drv.sym) {
@@ -450,6 +476,7 @@ fn handle_text_frame(
         let venue_seq = (f.update_id & 0xFFFF_FFFF) as u32;
         let tick = Tick::new(
             ts_ns,
+            core_types::VenueId::Binance,
             f.sym,
             venue_seq,
             Price::from_raw(f.bid_px_1e6),
@@ -457,7 +484,13 @@ fn handle_text_frame(
             Price::from_raw(f.ask_px_1e6),
             Qty::from_raw(f.ask_qty_1e6),
         );
-        let _ = producer.try_push(tick);
+        // D4: a full ring is data loss — count it, never block on it.
+        if producer.try_push(tick).is_err() {
+            status.inc_ring_drops();
+        }
+        status.add_msgs(1);
+    } else {
+        status.inc_parse_errors();
     }
 }
 
@@ -469,8 +502,16 @@ fn handle_text_frame(
 /// shutdown.
 pub type StopFlag = AtomicBool;
 
-/// Run the Binance ingress loop until `stop` is set or the transport
-/// fails. Reconnect is the caller's responsibility.
+/// Run the Binance ingress loop until `stop` is set, the transport
+/// fails, or the keepalive declares the connection dead
+/// ([`RunResult::IdleTimeout`]). Reconnect is the caller's
+/// responsibility.
+///
+/// * `status`: shared per-ingress observability slot (D4/D5/D7); this
+///   thread is the sole writer.
+/// * `keepalive`: proactive-ping + idle-timeout scheduler (D5/D6);
+///   reset at entry, polled once per loop iteration in `Steady`.
+#[allow(clippy::too_many_arguments)]
 pub fn run<T: Transport>(
     transport: &mut T,
     drv: &mut Driver,
@@ -481,7 +522,11 @@ pub fn run<T: Transport>(
     events: &mut mio::Events,
     token: mio::Token,
     stop: &StopFlag,
+    status: &core_metrics::IngressStatus,
+    keepalive: &mut core_net::Keepalive,
 ) -> RunResult {
+    let session_start_ns = now_ns();
+    keepalive.reset();
     if transport.register(poll.registry(), token).is_err() {
         return RunResult::Error;
     }
@@ -501,11 +546,12 @@ pub fn run<T: Transport>(
             if ev.token() != token {
                 continue;
             }
-            let status = match transport.pump(ev) {
+            // Named to avoid shadowing the `status` metrics slot.
+            let transport_status = match transport.pump(ev) {
                 Ok(s) => s,
                 Err(_e) => return RunResult::Error,
             };
-            note_transport_ready(drv, status);
+            note_transport_ready(drv, transport_status);
         }
 
         // I-3: tight inner drain loop. See ingress-polymarket for
@@ -513,7 +559,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer).is_err() {
+            if drive_one(transport, drv, host, path, producer, status).is_err() {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -521,6 +567,38 @@ pub fn run<T: Transport>(
             }
             if producer.len() == n_before && drv.state() == state_before {
                 break;
+            }
+        }
+
+        // D5/D6: keepalive check — once per steady-state iteration,
+        // after IO has been processed and before blocking on poll
+        // again. Two relaxed loads + integer compares when idle.
+        if drv.state() == State::Steady {
+            let now = now_ns();
+            let act = if drv.last_activity_ns == 0 {
+                session_start_ns
+            } else {
+                drv.last_activity_ns
+            };
+            match keepalive.poll(now, act) {
+                core_net::KeepaliveAction::SendPing => {
+                    // Masked WS protocol ping, empty payload — mirrors
+                    // the pong path in `drain_ws_frames`.
+                    let mask = ws_mask_from_counter(drv.mask_counter);
+                    drv.mask_counter = drv.mask_counter.wrapping_add(1);
+                    let dst = drv.tx.free_mut();
+                    if let Ok(n) = ws_write_ping(dst, &[], mask) {
+                        drv.tx.advance(n);
+                    }
+                    keepalive.mark_ping_sent(now);
+                    // Flush in this iteration via the existing write
+                    // path rather than waiting for the next drive_one.
+                    if flush_tx(transport, drv).is_err() {
+                        return RunResult::Error;
+                    }
+                }
+                core_net::KeepaliveAction::Reconnect => return RunResult::IdleTimeout,
+                core_net::KeepaliveAction::None => {}
             }
         }
 
@@ -590,13 +668,14 @@ mod tests {
         let mut d = build_driver(1, 42);
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
 
         // Before Ready — no handshake written.
-        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status).unwrap();
         assert_eq!(t.outgoing_len(), 0);
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status).unwrap();
 
         let mut buf = [0u8; 4096];
         let n = t.drain_outgoing(&mut buf);
@@ -613,19 +692,25 @@ mod tests {
         let mut d = build_driver(42, 1);
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
+        assert_eq!(status.state(), core_metrics::IngressState::Down);
 
         let key = sec_key_pub(42);
         let accept = expected_accept_pub(&key);
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
         assert_eq!(d.state(), State::Steady);
+        // D7: the upgrade transition publishes Up + activity + bytes.
+        assert_eq!(status.state(), core_metrics::IngressState::Up);
+        assert!(status.last_activity_ns() > 0);
+        assert_eq!(status.bytes_total(), resp.len() as u64);
     }
 
     #[test]
@@ -634,9 +719,10 @@ mod tests {
         let mut d = build_driver(1, 0);
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -644,8 +730,10 @@ mod tests {
         let resp = build_server_response(&wrong);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap_err();
+        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Failed upgrade must never publish Up.
+        assert_eq!(status.state(), core_metrics::IngressState::Down);
     }
 
     #[test]
@@ -666,7 +754,8 @@ mod tests {
         let frame_len = 2 + payload.len();
         t.inject_incoming(&frame_buf[..frame_len]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap();
+        let status = core_metrics::IngressStatus::new();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
 
         let tick = cons.try_pop().expect("tick must be pushed");
         assert_eq!(tick.sym, 42);
@@ -674,6 +763,12 @@ mod tests {
         assert_eq!(tick.ask_px.raw(), 25_365_200);
         assert_eq!(tick.venue_seq, 400_900_217u32);
         assert!(cons.try_pop().is_none());
+        // D5 accounting: one parsed message, whole frame counted.
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.bytes_total(), frame_len as u64);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.ring_drops_total(), 0);
+        assert!(status.last_activity_ns() > 0);
     }
 
     #[test]
@@ -691,7 +786,8 @@ mod tests {
         frame[2..6].copy_from_slice(b"PING");
         t.inject_incoming(&frame[..6]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap();
+        let status = core_metrics::IngressStatus::new();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
         assert!(t.outgoing_len() > 0);
 
         let mut out = [0u8; 64];
@@ -725,7 +821,105 @@ mod tests {
         frame[2..2 + payload.len()].copy_from_slice(payload);
         t.inject_incoming(&frame[..2 + payload.len()]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod).unwrap();
+        let status = core_metrics::IngressStatus::new();
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status).unwrap();
         assert!(cons.try_pop().is_none());
+        // Silent drop on the ring, but the rejection is counted.
+        assert_eq!(status.parse_errors_total(), 1);
+        assert_eq!(status.msgs_total(), 0);
+    }
+
+    #[test]
+    fn run_returns_idle_timeout_when_transport_stays_silent() {
+        // D5: a steady-state connection that never delivers a byte must
+        // be torn down once the keepalive idle budget is exhausted.
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = build_driver(3, 9);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let stop = StopFlag::new(false);
+        let status = core_metrics::IngressStatus::new();
+        // Tiny idle budget: the first keepalive check after the first
+        // poll wakeup is already past it.
+        let mut ka = core_net::Keepalive::new(core_net::KeepaliveCfg {
+            ping_interval_ns: 0,
+            idle_timeout_ns: 1,
+        });
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(0),
+            &stop,
+            &status,
+            &mut ka,
+        );
+        assert_eq!(res, RunResult::IdleTimeout);
+    }
+
+    #[test]
+    fn run_emits_masked_protocol_ping_when_interval_elapses() {
+        // D6: with a tiny ping interval and a huge idle budget the loop
+        // must proactively queue + flush a masked, empty WS ping.
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = build_driver(4, 9);
+        d.set_state(State::Steady);
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let stop = std::sync::Arc::new(StopFlag::new(false));
+        let status = core_metrics::IngressStatus::new();
+        let mut ka = core_net::Keepalive::new(core_net::KeepaliveCfg {
+            ping_interval_ns: 1,
+            idle_timeout_ns: u64::MAX / 2,
+        });
+
+        // `run` blocks on this thread (50 ms poll timeout per
+        // iteration); a helper thread raises `stop` after a couple of
+        // iterations. The ping is queued *and* flushed inside the
+        // first iteration, so any exit after one full pass suffices.
+        let stopper = stop.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            stopper.store(true, Ordering::Relaxed);
+        });
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(0),
+            &stop,
+            &status,
+            &mut ka,
+        );
+        h.join().unwrap();
+        assert_eq!(res, RunResult::Stopped);
+
+        let mut out = [0u8; 512];
+        let n = t.drain_outgoing(&mut out);
+        // Empty-payload client ping = 2 header bytes + 4 mask bytes.
+        assert!(n >= 6, "at least one ping frame must reach the wire");
+        assert_eq!(out[0] & 0x0F, 0x9, "opcode must be Ping");
+        assert_ne!(out[0] & 0x80, 0, "FIN must be set");
+        assert_ne!(out[1] & 0x80, 0, "client frames must be masked (RFC 6455 §5.3)");
+        assert_eq!(out[1] & 0x7F, 0, "keepalive ping carries an empty payload");
     }
 }

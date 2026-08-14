@@ -32,17 +32,25 @@
 //!    * [`RpcFrameKind::Unknown`] — logged and dropped.
 //!
 //! Everything after the handshake is zero-alloc: rx/tx are owned by
-//! `Driver`; the pending/sub tables are `[...; N]` arrays; the signal
-//! ring is caller-owned and preallocated at engine boot.
+//! `Driver`; the pending/sub tables are the fixed-capacity `core_net`
+//! tables (lifted out of this file in Phase 8a); the signal ring is
+//! caller-owned and preallocated at engine boot.
+//!
+//! Phase 8a observability: the loop publishes into a caller-owned
+//! [`core_metrics::IngressStatus`] slot (D4 ring drops, D5 activity /
+//! byte accounting, D7 connection state) and enforces an idle deadline
+//! via [`core_net::Keepalive`] (D5) — see [`run`] for the
+//! venue-specific ping choice.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
 
+use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
-    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place,
-    ws_write_binary_frame, ws_write_pong, HandshakeResult, Status, Transport, WsOpcode,
-    WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_binary_frame, read_server_handshake,
+    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
+    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
+    PendingTable, ReqKind, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
@@ -89,7 +97,8 @@ pub const RPC_POLL_NS: u64 = 2_000_000_000;
 const RPC_CROSS_SYM: SymbolId = SYMBOL_ID_NONE;
 
 // ---------------------------------------------------------------
-// Pending-request map
+// Request / subscription kinds — venue tags for the core-net
+// PendingTable / SubTable machinery (lifted in Phase 8a)
 // ---------------------------------------------------------------
 
 /// Kind of request we fired — determines how the response is handled.
@@ -106,41 +115,9 @@ pub enum RpcKind {
     None = 255,
 }
 
-/// One pending-request slot. 24 bytes.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct Pending {
-    /// Allocated JSON-RPC id. `0` means "slot free".
-    pub id: u64,
-    /// When the request left the wire (for metrics / staleness checks).
-    pub created_at_ns: u64,
-    /// Request shape.
-    pub kind: RpcKind,
-    _pad: [u8; 7],
+impl ReqKind for RpcKind {
+    const FREE: Self = RpcKind::None;
 }
-
-impl Pending {
-    /// Empty slot sentinel — all zeros, kind = None.
-    #[inline(always)]
-    pub const fn empty() -> Self {
-        Self {
-            id: 0,
-            created_at_ns: 0,
-            kind: RpcKind::None,
-            _pad: [0; 7],
-        }
-    }
-
-    /// Whether the slot is currently in use.
-    #[inline(always)]
-    pub const fn is_used(&self) -> bool {
-        !matches!(self.kind, RpcKind::None)
-    }
-}
-
-// ---------------------------------------------------------------
-// Subscription table
-// ---------------------------------------------------------------
 
 /// What a subscription id streams to us.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -152,88 +129,16 @@ pub enum SubKind {
     None = 255,
 }
 
-/// Zero-copy subscription id. Polygon subscription ids are `0x`-prefixed
-/// 16-hex-digit lowercase strings (`0x%016x`). We store them as raw u64
+impl ReqKind for SubKind {
+    const FREE: Self = SubKind::None;
+}
+
+/// Venue subscription id — re-exported from `core_net` (Phase 8a
+/// lift) so `ingress_rpc::run_loop::SubId` and the crate-root path
+/// stay stable. Polygon subscription ids are `0x`-prefixed
+/// 16-hex-digit lowercase strings (`0x%016x`) stored as a raw u64
 /// for O(1) compare.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct SubId(pub u64);
-
-impl SubId {
-    /// Sentinel "unused".
-    pub const NONE: SubId = SubId(0);
-}
-
-// ---------------------------------------------------------------
-// IoBuf — same cursor-draining pattern as the other ingress crates
-// ---------------------------------------------------------------
-
-/// Fixed-size byte window with a **cursor pair** (head, tail).
-/// O(1) `consume` — the residual compaction only runs in
-/// [`free_mut`] when the tail hits the buffer end. See
-/// ingress-polymarket for the rationale.
-struct IoBuf {
-    data: Box<[u8]>,
-    head: usize,
-    tail: usize,
-}
-
-impl IoBuf {
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            data: vec![0u8; cap].into_boxed_slice(),
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    #[inline]
-    fn filled(&self) -> &[u8] {
-        &self.data[self.head..self.tail]
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.tail - self.head
-    }
-
-    #[inline]
-    fn filled_mut(&mut self) -> &mut [u8] {
-        &mut self.data[self.head..self.tail]
-    }
-
-    #[inline]
-    fn free_mut(&mut self) -> &mut [u8] {
-        if self.tail == self.data.len() && self.head > 0 {
-            self.data.copy_within(self.head..self.tail, 0);
-            self.tail -= self.head;
-            self.head = 0;
-        }
-        &mut self.data[self.tail..]
-    }
-
-    #[inline]
-    fn advance(&mut self, n: usize) {
-        debug_assert!(self.tail + n <= self.data.len());
-        self.tail += n;
-    }
-
-    #[inline]
-    fn consume(&mut self, n: usize) {
-        debug_assert!(self.head + n <= self.tail);
-        self.head += n;
-        if self.head == self.tail {
-            self.head = 0;
-            self.tail = 0;
-        }
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-    }
-}
+pub use core_net::SubId;
 
 // ---------------------------------------------------------------
 // State + outer result
@@ -261,6 +166,9 @@ pub enum RunResult {
     Stopped,
     /// Peer closed the connection.
     Disconnected,
+    /// No inbound bytes within the keepalive idle budget (D5) —
+    /// caller reconnects.
+    IdleTimeout,
     /// Fatal transport error.
     Error,
 }
@@ -291,9 +199,9 @@ pub struct Driver {
     /// JSON-RPC id allocator. Monotonic; never wraps within a session.
     ids: RequestIds,
     /// Pending-request table, indexed by `id & (PENDING_CAP - 1)`.
-    pending: [Pending; PENDING_CAP],
+    pending: PendingTable<RpcKind, PENDING_CAP>,
     /// Subscription table. `NONE`-padded.
-    subs: [(SubId, SubKind); SUB_CAP],
+    subs: SubTable<SubKind, SUB_CAP>,
     /// Wall-clock nanosecond deadline for the next liveness poll.
     next_poll_at_ns: u64,
     /// Have we issued the initial `eth_subscribe` for this session?
@@ -316,8 +224,8 @@ impl Driver {
             last_activity_ns: 0,
             mask_counter: 0,
             ids: RequestIds::new(),
-            pending: [Pending::empty(); PENDING_CAP],
-            subs: [(SubId::NONE, SubKind::None); SUB_CAP],
+            pending: PendingTable::new(),
+            subs: SubTable::new(),
             next_poll_at_ns: 0,
             subscribed: false,
             _not_sync: ::core::marker::PhantomData,
@@ -346,29 +254,13 @@ impl Driver {
     /// Number of live subscription rows.
     #[inline]
     pub fn sub_count(&self) -> usize {
-        let mut n = 0;
-        let mut i = 0;
-        while i < SUB_CAP {
-            if !matches!(self.subs[i].1, SubKind::None) {
-                n += 1;
-            }
-            i += 1;
-        }
-        n
+        self.subs.count()
     }
 
     /// Number of live pending-request rows.
     #[inline]
     pub fn pending_count(&self) -> usize {
-        let mut n = 0;
-        let mut i = 0;
-        while i < PENDING_CAP {
-            if self.pending[i].is_used() {
-                n += 1;
-            }
-            i += 1;
-        }
-        n
+        self.pending.count()
     }
 
     /// Reset buffers + state for a reconnect. Cheap — only cursor bumps
@@ -382,16 +274,8 @@ impl Driver {
         self.last_activity_ns = 0;
         self.mask_counter = 0;
         self.ids = RequestIds::new();
-        let mut i = 0;
-        while i < PENDING_CAP {
-            self.pending[i] = Pending::empty();
-            i += 1;
-        }
-        let mut j = 0;
-        while j < SUB_CAP {
-            self.subs[j] = (SubId::NONE, SubKind::None);
-            j += 1;
-        }
+        self.pending.clear();
+        self.subs.clear();
         self.next_poll_at_ns = 0;
         self.subscribed = false;
     }
@@ -408,8 +292,9 @@ impl Driver {
 /// * `drv`: per-connection driver state.
 /// * `host`, `path`: sent verbatim into the `GET` + `Host:` line.
 /// * `producer`: warm-class Signal ring producer. A full ring drops the
-///   signal silently (back-pressure metric is emitted at the engine
-///   layer).
+///   signal and bumps `IngressStatus::ring_drops` (D4).
+/// * `status`: per-ingress observability slot (D4/D5/D7). This ingress
+///   thread is its single writer.
 ///
 /// # Errors
 ///
@@ -421,6 +306,7 @@ pub fn drive_one<T: Transport>(
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
 ) -> io::Result<()> {
     flush_tx(transport, drv)?;
     fill_rx(transport, drv)?;
@@ -432,7 +318,7 @@ pub fn drive_one<T: Transport>(
             drv.state = State::AwaitingWsUpgrade;
         }
         State::AwaitingWsUpgrade => {
-            advance_ws_upgrade(drv)?;
+            advance_ws_upgrade(drv, status)?;
             if drv.state == State::Steady {
                 // First thing after upgrade: subscribe to newHeads.
                 queue_subscribe_new_heads(drv)?;
@@ -442,7 +328,7 @@ pub fn drive_one<T: Transport>(
         }
         State::Steady => {
             maybe_queue_block_number_poll(drv)?;
-            drain_ws_frames(drv, producer)?;
+            drain_ws_frames(drv, producer, status)?;
         }
         State::Closed => {}
     }
@@ -516,7 +402,7 @@ fn write_handshake_to_tx(drv: &mut Driver, host: &[u8], path: &[u8]) -> io::Resu
     Ok(())
 }
 
-fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
+fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()> {
     match read_server_handshake(drv.rx.filled()) {
         HandshakeResult::Incomplete => Ok(()),
         HandshakeResult::Upgraded {
@@ -535,7 +421,13 @@ fn advance_ws_upgrade(drv: &mut Driver) -> io::Result<()> {
             }
             drv.rx.consume(header_end);
             drv.state = State::Steady;
-            drv.last_activity_ns = now_ns();
+            // D7: publish the transition the moment it happens.
+            status.set_state(IngressState::Up);
+            // D5: the 101 response counts as inbound activity.
+            let now = now_ns();
+            drv.last_activity_ns = now;
+            status.touch_activity(now);
+            status.add_bytes(header_end as u64);
             Ok(())
         }
         HandshakeResult::Malformed => Err(io::Error::new(
@@ -557,7 +449,7 @@ fn queue_subscribe_new_heads(drv: &mut Driver) -> io::Result<()> {
     let mut scratch = [0u8; 96];
     let n = write_request_subscribe_new_heads(&mut scratch, id)
         .map_err(|_| io::Error::other("subscribe request buffer too small"))?;
-    queue_ws_binary_frame(drv, &scratch[..n])?;
+    queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
     drv.subscribed = true;
     Ok(())
 }
@@ -573,51 +465,24 @@ fn maybe_queue_block_number_poll(drv: &mut Driver) -> io::Result<()> {
     let mut scratch = [0u8; 96];
     let n = write_request_eth_block_number(&mut scratch, id)
         .map_err(|_| io::Error::other("blockNumber request buffer too small"))?;
-    queue_ws_binary_frame(drv, &scratch[..n])
+    queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])
 }
 
 fn record_pending(drv: &mut Driver, id: u64, kind: RpcKind) -> io::Result<()> {
-    let slot = (id as usize) & (PENDING_CAP - 1);
-    let entry = &mut drv.pending[slot];
-    // Fail-fast: our allocator should never collide within PENDING_CAP.
-    debug_assert!(
-        !entry.is_used(),
-        "pending slot {slot} still holds id {} — collision with id {id}",
-        entry.id
-    );
-    if entry.is_used() {
-        return Err(io::Error::other("pending-request slot collision"));
+    match drv.pending.record(id, kind, now_ns()) {
+        Ok(()) => Ok(()),
+        Err(_e) => {
+            // Fail-fast: our allocator starts at 1 and should never
+            // collide within PENDING_CAP.
+            debug_assert!(false, "pending-request table rejected id {id}: {_e:?}");
+            Err(io::Error::other("pending-request slot collision"))
+        }
     }
-    *entry = Pending {
-        id,
-        created_at_ns: now_ns(),
-        kind,
-        _pad: [0; 7],
-    };
-    Ok(())
 }
 
 #[inline]
 fn take_pending(drv: &mut Driver, id: u64) -> Option<RpcKind> {
-    let slot = (id as usize) & (PENDING_CAP - 1);
-    let entry = &mut drv.pending[slot];
-    if entry.is_used() && entry.id == id {
-        let kind = entry.kind;
-        *entry = Pending::empty();
-        Some(kind)
-    } else {
-        None
-    }
-}
-
-fn queue_ws_binary_frame(drv: &mut Driver, payload: &[u8]) -> io::Result<()> {
-    let mask = ws_mask_from_counter(drv.mask_counter);
-    drv.mask_counter = drv.mask_counter.wrapping_add(1);
-    let dst = drv.tx.free_mut();
-    let n = ws_write_binary_frame(dst, payload, mask)
-        .map_err(|_| io::Error::other("ws binary frame buffer too small"))?;
-    drv.tx.advance(n);
-    Ok(())
+    drv.pending.complete(id).map(|req| req.kind)
 }
 
 // ---------------------------------------------------------------
@@ -627,6 +492,7 @@ fn queue_ws_binary_frame(drv: &mut Driver, payload: &[u8]) -> io::Result<()> {
 fn drain_ws_frames(
     drv: &mut Driver,
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
 ) -> io::Result<()> {
     loop {
         let read_result = ws_read_frame(drv.rx.filled());
@@ -651,7 +517,7 @@ fn drain_ws_frames(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_json_frame(drv, payload.start..payload.end, producer);
+                        handle_json_frame(drv, payload.start..payload.end, producer, status);
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -678,7 +544,11 @@ fn drain_ws_frames(
                     }
                 }
 
-                drv.last_activity_ns = now_ns();
+                // D5: every completed frame is inbound activity.
+                let now = now_ns();
+                drv.last_activity_ns = now;
+                status.touch_activity(now);
+                status.add_bytes(total as u64);
                 drv.rx.consume(total);
 
                 if drv.state == State::Closed {
@@ -710,6 +580,7 @@ fn handle_json_frame(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
 ) {
     // Phase 1: immutable-borrow phase — classify and pre-parse
     // everything we might need. Zero-alloc scanners over `&[u8]`.
@@ -747,26 +618,35 @@ fn handle_json_frame(
     };
 
     // Phase 2: mutable-borrow phase — apply the dispatch result. The
-    // immutable borrow above is already released.
+    // immutable borrow above is already released. `Nothing` means the
+    // frame classified/parsed to nothing usable — one parser
+    // rejection; every other arm is one handled JSON-RPC envelope.
     match dispatch {
-        Dispatch::Nothing => {}
-        Dispatch::EmitNewHead(head) => emit_new_head_signal(producer, head),
-        Dispatch::Response { id, block, sub_id } => match take_pending(drv, id) {
-            Some(RpcKind::BlockNumber) => {
-                if let Some(b) = block {
-                    emit_block_number_signal(producer, b);
+        Dispatch::Nothing => status.inc_parse_errors(),
+        Dispatch::EmitNewHead(head) => {
+            status.add_msgs(1);
+            emit_new_head_signal(producer, status, head);
+        }
+        Dispatch::Response { id, block, sub_id } => {
+            status.add_msgs(1);
+            match take_pending(drv, id) {
+                Some(RpcKind::BlockNumber) => {
+                    if let Some(b) = block {
+                        emit_block_number_signal(producer, status, b);
+                    }
+                }
+                Some(RpcKind::SubscribeNewHeads) => {
+                    if let Some(sid) = sub_id {
+                        register_subscription(drv, sid, SubKind::NewHeads);
+                    }
+                }
+                Some(RpcKind::None) | None => {
+                    // Unexpected / already retired; drop.
                 }
             }
-            Some(RpcKind::SubscribeNewHeads) => {
-                if let Some(sid) = sub_id {
-                    register_subscription(drv, sid, SubKind::NewHeads);
-                }
-            }
-            Some(RpcKind::None) | None => {
-                // Unexpected / already retired; drop.
-            }
-        },
+        }
         Dispatch::Error { id } => {
+            status.add_msgs(1);
             if let Some(id) = id {
                 let _ = take_pending(drv, id);
             }
@@ -779,18 +659,19 @@ fn handle_json_frame(
 // ---------------------------------------------------------------
 
 fn register_subscription(drv: &mut Driver, id: SubId, kind: SubKind) {
-    let mut i = 0;
-    while i < SUB_CAP {
-        if matches!(drv.subs[i].1, SubKind::None) {
-            drv.subs[i] = (id, kind);
-            return;
+    match drv.subs.insert(id, kind) {
+        Ok(()) => {}
+        // Server handed us the reserved all-zero id — nothing usable
+        // to track. Production sees "no sub tracking"; not fatal.
+        Err(SubErr::ReservedId) => {}
+        // Table full: debug-assert and drop. Production code will see
+        // this as "no sub tracking" — not fatal, but we want the test
+        // harness to notice if we ever register more than SUB_CAP
+        // subscriptions.
+        Err(SubErr::Full) => {
+            debug_assert!(false, "subscription table full at SUB_CAP={SUB_CAP}");
         }
-        i += 1;
     }
-    // Table full: debug-assert and drop. Production code will see this
-    // as "no sub tracking" — not fatal, but we want the test harness to
-    // notice if we ever register more than SUB_CAP subscriptions.
-    debug_assert!(false, "subscription table full at SUB_CAP={SUB_CAP}");
 }
 
 // ---------------------------------------------------------------
@@ -825,6 +706,7 @@ fn pack_block_number_into_payload(block: u64) -> [u8; 40] {
 
 fn emit_new_head_signal(
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
     head: NewHead,
 ) {
     let sig = Signal::new(
@@ -834,11 +716,15 @@ fn emit_new_head_signal(
         SignalSource::Rpc as u8,
         pack_new_head_into_payload(head),
     );
-    let _ = producer.try_push(sig);
+    // D4: a full ring is data loss — count it, never block.
+    if producer.try_push(sig).is_err() {
+        status.inc_ring_drops();
+    }
 }
 
 fn emit_block_number_signal(
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
     block: u64,
 ) {
     let sig = Signal::new(
@@ -848,7 +734,10 @@ fn emit_block_number_signal(
         SignalSource::Rpc as u8,
         pack_block_number_into_payload(block),
     );
-    let _ = producer.try_push(sig);
+    // D4: a full ring is data loss — count it, never block.
+    if producer.try_push(sig).is_err() {
+        status.inc_ring_drops();
+    }
 }
 
 // ---------------------------------------------------------------
@@ -904,7 +793,12 @@ pub type StopFlag = AtomicBool;
 
 /// Run the RPC ingress loop until `stop` is set or the transport fails.
 /// Reconnect is the caller's responsibility — this function returns
-/// [`RunResult::Disconnected`] so the outer scheduler can sleep + retry.
+/// [`RunResult::Disconnected`] / [`RunResult::IdleTimeout`] so the
+/// outer scheduler can sleep + retry.
+///
+/// Phase 8a: `status` is this thread's observability slot (D4/D5/D7);
+/// `keepalive` supplies the idle deadline (D5) — see the comment at
+/// the poll site for the venue-specific ping choice.
 pub fn run<T: Transport>(
     transport: &mut T,
     drv: &mut Driver,
@@ -915,7 +809,14 @@ pub fn run<T: Transport>(
     events: &mut mio::Events,
     token: mio::Token,
     stop: &StopFlag,
+    status: &IngressStatus,
+    keepalive: &mut Keepalive,
 ) -> RunResult {
+    // Session base-time for the idle clock (a connection that never
+    // delivers a byte must still time out) + fresh ping schedule.
+    let session_start_ns = now_ns();
+    keepalive.reset();
+
     if transport.register(poll.registry(), token).is_err() {
         return RunResult::Error;
     }
@@ -935,11 +836,11 @@ pub fn run<T: Transport>(
             if ev.token() != token {
                 continue;
             }
-            let status = match transport.pump(ev) {
+            let transport_status = match transport.pump(ev) {
                 Ok(s) => s,
                 Err(_e) => return RunResult::Error,
             };
-            note_transport_ready(drv, status);
+            note_transport_ready(drv, transport_status);
         }
 
         // I-3: tight inner drain loop. See ingress-polymarket
@@ -947,7 +848,7 @@ pub fn run<T: Transport>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer).is_err() {
+            if drive_one(transport, drv, host, path, producer, status).is_err() {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -955,6 +856,29 @@ pub fn run<T: Transport>(
             }
             if producer.len() == n_before && drv.state() == state_before {
                 break;
+            }
+        }
+
+        // Keepalive (D5) — venue-specific choice: this feed already
+        // runs its own JSON-RPC liveness probe (`eth_blockNumber`
+        // every RPC_POLL_NS ≈ 2 s) whose response is inbound traffic
+        // whenever the venue is healthy, so `Keepalive` supplies only
+        // the idle deadline. On `SendPing` we do NOT queue a WS ping
+        // (the eth_blockNumber poll is this venue's probe) — we just
+        // advance the schedule. On `Reconnect` the session is dead by
+        // policy (half-open TCP / unanswered probes): hand the
+        // reconnect decision to the caller.
+        if drv.state() == State::Steady {
+            let now = now_ns();
+            let last = if drv.last_activity_ns == 0 {
+                session_start_ns
+            } else {
+                drv.last_activity_ns
+            };
+            match keepalive.poll(now, last) {
+                KeepaliveAction::None => {}
+                KeepaliveAction::SendPing => keepalive.mark_ping_sent(now),
+                KeepaliveAction::Reconnect => return RunResult::IdleTimeout,
             }
         }
 
@@ -979,9 +903,17 @@ mod tests {
     use super::*;
     use core_net::{
         expected_accept as expected_accept_pub, sec_websocket_key_from_seed as sec_key_pub,
-        TestTransport,
+        KeepaliveCfg, PendingReq, TestTransport,
     };
     use core_ring::Ring;
+
+    /// Keepalive that never fires within a test's lifetime.
+    fn generous_keepalive() -> Keepalive {
+        Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: u64::MAX / 4,
+            idle_timeout_ns: u64::MAX / 2,
+        })
+    }
 
     fn build_server_response(accept: &[u8; 28]) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(256);
@@ -1040,11 +972,12 @@ mod tests {
     fn handshake_completes_and_subscribe_is_emitted() {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = Driver::new(42);
+        let status = IngressStatus::new();
         let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status).unwrap();
         // Drain the GET handshake so it doesn't confuse later assertions.
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1054,9 +987,14 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status).unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.subscribed);
+        // D7: entering Steady must publish Up; D5: the 101 response
+        // counts as activity + bytes.
+        assert_eq!(status.state(), IngressState::Up);
+        assert!(status.last_activity_ns() > 0);
+        assert_eq!(status.bytes_total(), resp.len() as u64);
         // One pending slot for the subscribe; the liveness poll may also
         // have fired if wall-clock already reached the next deadline.
         assert!(d.pending_count() >= 1);
@@ -1093,6 +1031,7 @@ mod tests {
 
         let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
 
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":{id},"result":"0x00000000deadbeef"}}"#,
@@ -1101,11 +1040,14 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
         assert_eq!(d.sub_count(), 1);
         assert_eq!(d.pending_count(), 0);
-        assert_eq!(d.subs[0].0, SubId(0xDEADBEEF));
-        assert!(matches!(d.subs[0].1, SubKind::NewHeads));
+        assert_eq!(d.subs.kind_of(SubId(0xDEADBEEF)), Some(SubKind::NewHeads));
+        // One handled envelope, no rejections.
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.bytes_total(), n as u64);
     }
 
     #[test]
@@ -1118,6 +1060,7 @@ mod tests {
 
         let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();
+        let status = IngressStatus::new();
 
         // Inject a newHeads notification.
         let body = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab","result":{"number":"0x2a","timestamp":"0x65","gasUsed":"0x1"}}}"#;
@@ -1125,7 +1068,9 @@ mod tests {
         let n = wrap_text_frame(body, &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.ring_drops_total(), 0);
 
         let sig = cons.try_pop().expect("signal must be pushed");
         assert_eq!(sig.sym, SYMBOL_ID_NONE);
@@ -1151,13 +1096,15 @@ mod tests {
 
         let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();
+        let status = IngressStatus::new();
 
         let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":"0x1a2b3c"}}"#);
         let mut frame_buf = [0u8; 256];
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        assert_eq!(status.msgs_total(), 1);
 
         let sig = cons.try_pop().expect("signal must be pushed");
         assert!(matches!(sig.class, LatencyClass::Warm));
@@ -1178,6 +1125,7 @@ mod tests {
 
         let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
 
         // Fake an RPC error frame reusing the same id.
         let mut t = TestTransport::with_capacity(4096);
@@ -1188,8 +1136,11 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
         assert_eq!(d.pending_count(), 0);
+        // A well-formed error envelope is handled, not rejected.
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.parse_errors_total(), 0);
     }
 
     #[test]
@@ -1245,13 +1196,12 @@ mod tests {
 
     #[test]
     fn pending_empty_and_kind_markers_roundtrip() {
-        let p = Pending::empty();
+        let p: PendingReq<RpcKind> = PendingReq::empty();
         assert!(!p.is_used());
-        let used = Pending {
+        let used = PendingReq {
             id: 5,
             created_at_ns: 0,
             kind: RpcKind::BlockNumber,
-            _pad: [0; 7],
         };
         assert!(used.is_used());
     }
@@ -1277,11 +1227,12 @@ mod tests {
     fn rejects_wrong_accept_value() {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = Driver::new(1);
+        let status = IngressStatus::new();
         let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1289,7 +1240,108 @@ mod tests {
         let resp = build_server_response(&wrong_accept);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"h", b"/", &mut prod).unwrap_err();
+        let err = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // A failed upgrade must never publish Up.
+        assert_eq!(status.state(), IngressState::Down);
+    }
+
+    #[test]
+    fn unclassifiable_frame_counts_parse_error() {
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
+
+        // Valid WS text frame, but the body is no JSON-RPC shape we
+        // know — classify_rpc returns Unknown → one rejection.
+        let mut frame_buf = [0u8; 64];
+        let n = wrap_text_frame(b"{\"nonsense\":true}", &mut frame_buf);
+        t.inject_incoming(&frame_buf[..n]);
+
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status).unwrap();
+        assert_eq!(status.parse_errors_total(), 1);
+        assert_eq!(status.msgs_total(), 0);
+        // The frame still counts as inbound activity (D5).
+        assert_eq!(status.bytes_total(), n as u64);
+    }
+
+    #[test]
+    fn steady_idle_timeout_returns_idle_timeout() {
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = Driver::new(9);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
+        let stop = StopFlag::new(false);
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        // Tiny idle budget: the first Steady iteration (≈50 ms mio
+        // wait) is already far past 2 ns of silence.
+        let mut ka = Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: 1,
+            idle_timeout_ns: 2,
+        });
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+        );
+        assert_eq!(res, RunResult::IdleTimeout);
+    }
+
+    #[test]
+    fn run_disconnects_on_close_and_generous_keepalive_stays_quiet() {
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = Driver::new(9);
+        d.set_state(State::Steady);
+        d.suppress_polling_for_test();
+        d.subscribed = true;
+        // Server-side Close frame (unmasked, empty payload).
+        t.inject_incoming(&[0x88, 0x00]);
+
+        let ring = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = IngressStatus::new();
+        let stop = StopFlag::new(false);
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let mut ka = generous_keepalive();
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+        );
+        // The Close must surface as Disconnected — never IdleTimeout.
+        assert_eq!(res, RunResult::Disconnected);
+        // D5 accounting saw the 2-byte Close frame.
+        assert_eq!(status.bytes_total(), 2);
     }
 }

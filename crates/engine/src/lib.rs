@@ -5,11 +5,12 @@
 //! fill rings in priority order and dispatches to the strategy's
 //! callbacks.
 //!
-//! Phase 2 expands the tick path: **two** tick consumers
-//! (Polymarket + Binance) instead of one. The strategy sees a
-//! merged stream and routes internally by `tick.sym`. Sizes match
-//! the per-ingress crate's `DEFAULT_TICK_RING_CAP` so the engine
-//! never reallocates and the consumer-end type is fixed.
+//! Phase 8a generalizes the fan-in: instead of one hardwired
+//! consumer field + drain arm per venue, the engine owns **lane
+//! arrays** indexed by `VenueId` — five tick lanes and four fill
+//! lanes. Unspawned venues hand the engine a permanently-empty ring
+//! (a `try_pop() → None` is two atomic loads — negligible), which
+//! makes venues 4..N mechanical instead of structural.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -25,31 +26,50 @@ use clob_dispatcher::OrderDispatch;
 use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
-use core_types::{Fill, Order, Signal, Tick};
+use core_types::{Fill, Order, Signal, Tick, VenueId};
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
 
 // ---------------------------------------------------------------
-// Compile-time ring sizes
+// Compile-time ring sizes + lane geometry
 // ---------------------------------------------------------------
 
-/// Polymarket tick ring capacity. Matches
-/// `ingress_polymarket::run_loop::DEFAULT_TICK_RING_CAP` so the
-/// consumer type lines up without a re-allocate.
-pub const PM_TICK_RING_SIZE: usize = 16_384;
-/// Binance tick ring capacity. Matches
-/// `ingress_binance::run_loop::DEFAULT_TICK_RING_CAP`.
-pub const BN_TICK_RING_SIZE: usize = 8_192;
+/// Capacity of **every** venue tick ring (Phase 8a §3.3: one
+/// standardized size so the lane array has a single consumer type).
+/// 64 B × 16 384 = 1 MiB per ring; five rings = 5 MiB.
+/// Ingress crates' `DEFAULT_TICK_RING_CAP` must equal this — the cli
+/// const-asserts it.
+pub const TICK_RING_SIZE: usize = 16_384;
 /// Signal ring capacity. Matches
 /// `ingress_rpc::run_loop::DEFAULT_SIGNAL_RING_CAP` so the
 /// consumer type lines up without a re-allocate.
 pub const SIGNAL_RING_SIZE: usize = 1_024;
-/// Fill ring capacity.
+/// Fill ring capacity (per lane).
 pub const FILL_RING_SIZE: usize = 1_024;
 
-/// Legacy alias kept for callers that still want a single
-/// `TICK_RING_SIZE`. New code should pick `PM_TICK_RING_SIZE`
-/// or `BN_TICK_RING_SIZE` explicitly.
-pub const TICK_RING_SIZE: usize = PM_TICK_RING_SIZE;
+/// Number of tick lanes, indexed by `VenueId as usize`:
+/// 0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
+/// 4 = Hyperliquid. (`VenueId::Ai` has no tick lane — AI commands
+/// arrive on their own ring in Phase 8f.)
+pub const NUM_TICK_LANES: usize = 5;
+
+/// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
+/// Binance is market-data-only, so it has no fill lane.
+pub const NUM_FILL_LANES: usize = 4;
+
+/// Fill-lane index for an execution venue. `None` for venues that
+/// cannot produce fills (Binance = data-only, Ai = command feed).
+/// Cold-path helper for dispatcher wiring — not used in the drain
+/// loop, which walks all lanes unconditionally.
+#[inline]
+pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
+    match venue {
+        VenueId::Polymarket => Some(0),
+        VenueId::Okx => Some(1),
+        VenueId::Deribit => Some(2),
+        VenueId::Hyperliquid => Some(3),
+        VenueId::Binance | VenueId::Ai => None,
+    }
+}
 
 // ---------------------------------------------------------------
 // Engine
@@ -60,18 +80,19 @@ pub const TICK_RING_SIZE: usize = PM_TICK_RING_SIZE;
 pub struct Engine<S: Strategy, D: OrderDispatch> {
     strat: S,
     disp: D,
-    pm_tick_cons: Consumer<Tick, PM_TICK_RING_SIZE>,
-    bn_tick_cons: Consumer<Tick, BN_TICK_RING_SIZE>,
+    /// Tick lanes indexed by `VenueId as usize` (§3.3).
+    tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
-    fill_cons: Consumer<Fill, FILL_RING_SIZE>,
+    /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
+    fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     last_timer_ns: NsTs,
     /// Number of iterations completed (wraps on u64; for paper-mode stats).
     pub iterations: u64,
-    /// Cumulative ticks dispatched (Polymarket + Binance combined).
+    /// Cumulative ticks dispatched (all lanes combined).
     pub ticks_dispatched: u64,
     /// Cumulative signals dispatched.
     pub signals_dispatched: u64,
-    /// Cumulative fills dispatched.
+    /// Cumulative fills dispatched (fill lanes + dispatcher pump).
     pub fills_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
@@ -85,20 +106,20 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     // — gap between the order's `ts_ns` (strategy stamped it when
     // it decided) and `now_ns()` at the dispatcher boundary.
     //
-    // `submit_to_ack` is reserved for Phase 7 when fills land via
-    // the Polymarket WS order channel.
+    // `submit_to_ack` is recorded on every consumed fill.
     ingest_lat: LatencyTracker<24>,
     decide_lat: LatencyTracker<24>,
     ack_lat: LatencyTracker<24>,
 
     /// Per-bucket last-tick timestamps. Each bucket holds the
-    /// `now_ns()` of the most recent tick whose `tick.sym % SYMS`
-    /// hashed to it. Stale buckets surface as a high
+    /// `now_ns()` of the most recent tick whose mixed symbol hash
+    /// (see `core_types::symbol_bucket_mix` — venue byte folded into
+    /// the low bits) landed in it. Stale buckets surface as a high
     /// `max_tick_age_ns()` — useful for detecting a silenced
     /// market mid-soak.
     ///
     /// 64 buckets covers any realistic symbol set with low
-    /// collision; collisions just mean two sym hash to the same
+    /// collision; collisions just mean two syms hash to the same
     /// bucket and refresh each other, which is conservative (no
     /// false-positive staleness).
     last_tick_ns_per_sym: [u64; SYM_BUCKETS],
@@ -113,22 +134,22 @@ pub const SYM_BUCKETS: usize = 64;
 
 impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// Construct an engine that owns the strategy, dispatcher, and
-    /// four consumer handles for the shared rings.
+    /// the consumer ends of every lane. Unspawned venues pass the
+    /// consumer half of a ring whose producer was dropped — it reads
+    /// empty forever at the cost of two atomic loads per iteration.
     pub fn new(
         strat: S,
         disp: D,
-        pm_tick_cons: Consumer<Tick, PM_TICK_RING_SIZE>,
-        bn_tick_cons: Consumer<Tick, BN_TICK_RING_SIZE>,
+        tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
-        fill_cons: Consumer<Fill, FILL_RING_SIZE>,
+        fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     ) -> Self {
         Self {
             strat,
             disp,
-            pm_tick_cons,
-            bn_tick_cons,
+            tick_lanes,
             sig_cons,
-            fill_cons,
+            fill_lanes,
             last_timer_ns: 0,
             iterations: 0,
             ticks_dispatched: 0,
@@ -152,14 +173,17 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.strat.on_start(&mut ctx)
     }
 
-    /// Drain each ring once (up to `max_per_ring` items per ring).
-    /// This is the single-writer hot path body — real run loop
+    /// Drain each lane once (up to `max_per_ring` items per lane).
+    /// This is the single-writer hot path body — the real run loop
     /// calls this in a tight `loop { ... }`.
     ///
-    /// Tick rings are drained in **Polymarket then Binance** order
-    /// so the strategy sees the book update before the cross-venue
-    /// trigger for any given iteration. Within one Phase 2 tick
-    /// either ring can dominate; size caps prevent starvation.
+    /// Tick lanes drain in **fixed `VenueId` order** (Polymarket,
+    /// Binance, OKX, Deribit, Hyperliquid) so the venue book update
+    /// precedes any cross-venue trigger within one iteration; the
+    /// per-lane budget prevents starvation. Then signals, then fill
+    /// lanes, then the dispatcher's own fill queue (D3 fix — paper
+    /// and queued dispatchers surface fills via `try_next_fill`,
+    /// live venue dispatchers via their fill lane).
     ///
     /// **Latency recording.** Every drained tick samples the
     /// `now - tick.ts_ns` gap into the `ingest_lat` tracker. Every
@@ -170,52 +194,32 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn tick(&mut self, max_per_ring: usize) {
         self.iterations = self.iterations.wrapping_add(1);
 
-        // --- Polymarket ticks ---
-        // E-2: per-item clock sample. The old code captured `now`
-        // once at the top of `tick()` so a burst of 64 ticks
-        // measured ingest-latency against the *first* tick's
-        // observed-at time, biasing every record after the first
-        // toward zero. Now each pop re-samples — costs ~14 ns/tick
-        // but the latency histogram tells the truth.
-        let mut i = 0;
-        while i < max_per_ring {
-            match self.pm_tick_cons.try_pop() {
-                Some(t) => {
-                    let now = now_ns();
-                    self.ingest_lat.record(now.saturating_sub(t.ts_ns));
-                    self.touch_sym_bucket(t.sym, now);
-                    let mut ctx = EngineCtx {
-                        disp: &mut self.disp,
-                        decide_lat: &self.decide_lat,
-                        now,
-                    };
-                    self.strat.on_tick(&t, &mut ctx);
-                    self.ticks_dispatched = self.ticks_dispatched.wrapping_add(1);
+        // --- tick lanes, fixed VenueId order ---
+        // E-2: per-item clock sample. Capturing `now` once per batch
+        // would bias every record after the first toward zero; each
+        // pop re-samples — ~14 ns/tick for a truthful histogram.
+        let mut lane = 0;
+        while lane < NUM_TICK_LANES {
+            let mut i = 0;
+            while i < max_per_ring {
+                match self.tick_lanes[lane].try_pop() {
+                    Some(t) => {
+                        let now = now_ns();
+                        self.ingest_lat.record(now.saturating_sub(t.ts_ns));
+                        self.touch_sym_bucket(t.sym, now);
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            now,
+                        };
+                        self.strat.on_tick(&t, &mut ctx);
+                        self.ticks_dispatched = self.ticks_dispatched.wrapping_add(1);
+                    }
+                    None => break,
                 }
-                None => break,
+                i += 1;
             }
-            i += 1;
-        }
-
-        // --- Binance ticks ---
-        let mut i = 0;
-        while i < max_per_ring {
-            match self.bn_tick_cons.try_pop() {
-                Some(t) => {
-                    let now = now_ns();
-                    self.ingest_lat.record(now.saturating_sub(t.ts_ns));
-                    self.touch_sym_bucket(t.sym, now);
-                    let mut ctx = EngineCtx {
-                        disp: &mut self.disp,
-                        decide_lat: &self.decide_lat,
-                        now,
-                    };
-                    self.strat.on_tick(&t, &mut ctx);
-                    self.ticks_dispatched = self.ticks_dispatched.wrapping_add(1);
-                }
-                None => break,
-            }
-            i += 1;
+            lane += 1;
         }
 
         // --- signals ---
@@ -238,10 +242,38 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             i += 1;
         }
 
-        // --- fills ---
+        // --- fill lanes ---
+        let mut lane = 0;
+        while lane < NUM_FILL_LANES {
+            let mut i = 0;
+            while i < max_per_ring {
+                match self.fill_lanes[lane].try_pop() {
+                    Some(f) => {
+                        let now = now_ns();
+                        self.ack_lat.record(now.saturating_sub(f.ts_ns));
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            now,
+                        };
+                        self.strat.on_fill(&f, &mut ctx);
+                        self.fills_dispatched = self.fills_dispatched.wrapping_add(1);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
+            lane += 1;
+        }
+
+        // --- dispatcher fill pump (D3) ---
+        // `try_next_fill` was declared in Phase 1 and never called:
+        // fills from the paper/queued dispatchers were unreachable
+        // and `Strategy::on_fill` was dead code. Budgeted like every
+        // other source.
         let mut i = 0;
         while i < max_per_ring {
-            match self.fill_cons.try_pop() {
+            match self.disp.try_next_fill() {
                 Some(f) => {
                     let now = now_ns();
                     self.ack_lat.record(now.saturating_sub(f.ts_ns));
@@ -294,8 +326,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn decide_p99_ns(&self) -> u64 {
         self.decide_lat.percentile(0.99)
     }
-    /// p50 submit→ack latency (populated only when fill ring sees
-    /// data — Phase 7).
+    /// p50 submit→ack latency (populated whenever any fill source
+    /// delivers).
     #[inline]
     pub fn ack_p50_ns(&self) -> u64 {
         self.ack_lat.percentile(0.50)
@@ -306,10 +338,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.ack_lat.percentile(0.99)
     }
 
-    /// Touch the per-symbol last-tick bucket. Zero-alloc.
+    /// Touch the per-symbol last-tick bucket. Zero-alloc. The venue
+    /// byte is mixed into the bucket index (Phase 8a §3.1) so two
+    /// venues' ordinal-0 symbols do not collide on low bits.
     #[inline(always)]
     fn touch_sym_bucket(&mut self, sym: core_types::SymbolId, now: NsTs) {
-        let bucket = (sym as usize) & (SYM_BUCKETS - 1);
+        let bucket = (core_types::symbol_bucket_mix(sym) as usize) & (SYM_BUCKETS - 1);
         // Bit `bucket` flagged in `sym_populated` so
         // `max_tick_age_ns` only inspects buckets we've actually
         // touched.
@@ -433,8 +467,8 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clob_dispatcher::PaperDispatcher;
-    use core_ring::Ring;
+    use clob_dispatcher::{DispatchError, DispatchStats, PaperDispatcher};
+    use core_ring::{Producer, Ring};
     use core_types::{Price, Qty, Side};
 
     struct Counter {
@@ -465,22 +499,56 @@ mod tests {
         fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
     }
 
+    fn mk_tick(venue: VenueId, sym: u32, seq: u32) -> Tick {
+        Tick::new(
+            0,
+            venue,
+            sym,
+            seq,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            Price::from_raw(0),
+            Qty::from_raw(0),
+        )
+    }
+
+    fn split_tick_lanes() -> (
+        [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+        [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+    ) {
+        let (p0, c0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        let (p1, c1) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        let (p2, c2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        let (p3, c3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        let (p4, c4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3, p4], [c0, c1, c2, c3, c4])
+    }
+
+    fn split_fill_lanes() -> (
+        [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+        [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+    ) {
+        let (p0, c0) = Ring::<Fill, FILL_RING_SIZE>::new().split();
+        let (p1, c1) = Ring::<Fill, FILL_RING_SIZE>::new().split();
+        let (p2, c2) = Ring::<Fill, FILL_RING_SIZE>::new().split();
+        let (p3, c3) = Ring::<Fill, FILL_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3], [c0, c1, c2, c3])
+    }
+
+    /// Build an engine plus producer halves for every lane. Tick
+    /// producers are indexed by `VenueId as usize`, fill producers
+    /// by [`fill_lane_of`].
+    #[allow(clippy::type_complexity)]
     fn build_engine() -> (
         Engine<Counter, PaperDispatcher>,
-        core_ring::Producer<Tick, PM_TICK_RING_SIZE>,
-        core_ring::Producer<Tick, BN_TICK_RING_SIZE>,
-        core_ring::Producer<Signal, SIGNAL_RING_SIZE>,
-        core_ring::Producer<Fill, FILL_RING_SIZE>,
+        [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+        Producer<Signal, SIGNAL_RING_SIZE>,
+        [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     ) {
-        let pm_ring: std::sync::Arc<Ring<Tick, PM_TICK_RING_SIZE>> = Ring::new();
-        let bn_ring: std::sync::Arc<Ring<Tick, BN_TICK_RING_SIZE>> = Ring::new();
+        let (tp, tc) = split_tick_lanes();
         let sig_ring: std::sync::Arc<Ring<Signal, SIGNAL_RING_SIZE>> = Ring::new();
-        let fill_ring: std::sync::Arc<Ring<Fill, FILL_RING_SIZE>> = Ring::new();
-
-        let (pm_p, pm_c) = pm_ring.split();
-        let (bn_p, bn_c) = bn_ring.split();
         let (sp, sc) = sig_ring.split();
-        let (fp, fc) = fill_ring.split();
+        let (fp, fc) = split_fill_lanes();
 
         let strat = Counter {
             ticks: 0,
@@ -488,25 +556,18 @@ mod tests {
             fills: 0,
         };
         let disp = PaperDispatcher::new();
-        let eng = Engine::new(strat, disp, pm_c, bn_c, sc, fc);
-        (eng, pm_p, bn_p, sp, fp)
+        let eng = Engine::new(strat, disp, tc, sc, fc);
+        (eng, tp, sp, fp)
     }
 
     #[test]
-    fn engine_drains_polymarket_tick_ring() {
-        let (mut eng, mut pm_p, _bn_p, _sp, _fp) = build_engine();
+    fn engine_drains_polymarket_tick_lane() {
+        let (mut eng, mut tp, _sp, _fp) = build_engine();
         eng.start().unwrap();
         for i in 0..3u32 {
-            pm_p.try_push(Tick::new(
-                0,
-                1,
-                i + 1,
-                Price::from_raw(0),
-                Qty::from_raw(0),
-                Price::from_raw(0),
-                Qty::from_raw(0),
-            ))
-            .unwrap();
+            tp[VenueId::Polymarket as usize]
+                .try_push(mk_tick(VenueId::Polymarket, 1, i + 1))
+                .unwrap();
         }
         eng.tick(16);
         assert_eq!(eng.iterations, 1);
@@ -514,141 +575,169 @@ mod tests {
     }
 
     #[test]
-    fn engine_drains_both_tick_rings_per_iteration() {
-        let (mut eng, mut pm_p, mut bn_p, _sp, _fp) = build_engine();
+    fn engine_drains_every_lane_per_iteration() {
+        let (mut eng, mut tp, _sp, _fp) = build_engine();
         eng.start().unwrap();
-        for i in 0..2u32 {
-            pm_p.try_push(Tick::new(
-                0,
-                1,
-                i + 1,
-                Price::from_raw(0),
-                Qty::from_raw(0),
-                Price::from_raw(0),
-                Qty::from_raw(0),
-            ))
-            .unwrap();
-            bn_p.try_push(Tick::new(
-                0,
-                2,
-                i + 1,
-                Price::from_raw(0),
-                Qty::from_raw(0),
-                Price::from_raw(0),
-                Qty::from_raw(0),
-            ))
-            .unwrap();
+        let venues = [
+            VenueId::Polymarket,
+            VenueId::Binance,
+            VenueId::Okx,
+            VenueId::Deribit,
+            VenueId::Hyperliquid,
+        ];
+        let mut i = 0;
+        while i < venues.len() {
+            let v = venues[i];
+            tp[v as usize]
+                .try_push(mk_tick(v, core_types::make_symbol_id(v, 1), 1))
+                .unwrap();
+            i += 1;
         }
         eng.tick(16);
-        assert_eq!(eng.ticks_dispatched, 4);
+        assert_eq!(eng.ticks_dispatched, 5, "one tick per venue lane");
     }
 
     #[test]
-    fn engine_respects_max_per_ring_cap() {
-        let (mut eng, mut pm_p, _bn_p, _sp, _fp) = build_engine();
+    fn engine_respects_max_per_ring_cap_per_lane() {
+        let (mut eng, mut tp, _sp, _fp) = build_engine();
         eng.start().unwrap();
         for i in 0..10u32 {
-            pm_p.try_push(Tick::new(
-                0,
-                1,
-                i + 1,
-                Price::from_raw(0),
-                Qty::from_raw(0),
-                Price::from_raw(0),
-                Qty::from_raw(0),
-            ))
-            .unwrap();
+            tp[0].try_push(mk_tick(VenueId::Polymarket, 1, i + 1)).unwrap();
+            tp[2].try_push(mk_tick(VenueId::Okx, 2, i + 1)).unwrap();
         }
         eng.tick(3);
-        // Only 3 drained on this iteration; the rest stay in the ring.
-        assert_eq!(eng.ticks_dispatched, 3);
+        // 3 drained per lane on this iteration; the rest stay queued.
+        assert_eq!(eng.ticks_dispatched, 6);
         eng.tick(16);
-        assert_eq!(eng.ticks_dispatched, 10);
+        assert_eq!(eng.ticks_dispatched, 20);
+    }
+
+    #[test]
+    fn engine_drains_fill_lanes() {
+        let (mut eng, _tp, _sp, mut fp) = build_engine();
+        eng.start().unwrap();
+        let f = Fill::new(
+            10,
+            7,
+            Side::Bid,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            99,
+        );
+        fp[0].try_push(f).unwrap(); // Polymarket fill lane
+        fp[3].try_push(f).unwrap(); // Hyperliquid fill lane
+        eng.tick(16);
+        assert_eq!(eng.fills_dispatched, 2);
+        assert_eq!(eng.strategy().fills, 2);
+    }
+
+    /// Dispatcher that emits one queued fill — proves the D3 pump.
+    struct OneFillDispatcher {
+        fill: Option<Fill>,
+        stats: DispatchStats,
+    }
+
+    impl OrderDispatch for OneFillDispatcher {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            self.fill.take()
+        }
+        fn stats(&self) -> DispatchStats {
+            self.stats
+        }
+    }
+
+    #[test]
+    fn engine_pumps_dispatcher_fills_d3() {
+        let (_tp, tc) = split_tick_lanes();
+        let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let disp = OneFillDispatcher {
+            fill: Some(Fill::new(
+                5,
+                3,
+                Side::Ask,
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                42,
+            )),
+            stats: DispatchStats::default(),
+        };
+        let strat = Counter {
+            ticks: 0,
+            signals: 0,
+            fills: 0,
+        };
+        let mut eng = Engine::new(strat, disp, tc, sc, fc);
+        eng.start().unwrap();
+        eng.tick(16);
+        assert_eq!(eng.fills_dispatched, 1, "dispatcher fill must reach on_fill");
+        assert_eq!(eng.strategy().fills, 1);
+    }
+
+    #[test]
+    fn fill_lane_map_matches_layout() {
+        assert_eq!(fill_lane_of(VenueId::Polymarket), Some(0));
+        assert_eq!(fill_lane_of(VenueId::Okx), Some(1));
+        assert_eq!(fill_lane_of(VenueId::Deribit), Some(2));
+        assert_eq!(fill_lane_of(VenueId::Hyperliquid), Some(3));
+        assert_eq!(fill_lane_of(VenueId::Binance), None);
+        assert_eq!(fill_lane_of(VenueId::Ai), None);
     }
 
     #[test]
     fn engine_dispatcher_starts_with_zero_accepted() {
-        let (eng, _pm_p, _bn_p, _sp, _fp) = build_engine();
+        let (eng, _tp, _sp, _fp) = build_engine();
         assert_eq!(eng.dispatcher().stats().accepted, 0);
     }
 
     #[test]
     fn max_tick_age_zero_before_any_tick() {
-        let (eng, _pm_p, _bn_p, _sp, _fp) = build_engine();
+        let (eng, _tp, _sp, _fp) = build_engine();
         assert_eq!(eng.populated_sym_count(), 0);
         assert_eq!(eng.max_tick_age_ns(1_000_000), 0);
     }
 
     #[test]
     fn max_tick_age_tracks_freshest_per_bucket() {
-        let (mut eng, mut pm_p, _bn_p, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp) = build_engine();
         eng.start().unwrap();
-        pm_p.try_push(Tick::new(
-            1_000,
-            7,
-            1,
-            Price::from_raw(0),
-            Qty::from_raw(0),
-            Price::from_raw(0),
-            Qty::from_raw(0),
-        ))
-        .unwrap();
-        pm_p.try_push(Tick::new(
-            2_000,
-            11,
-            1,
-            Price::from_raw(0),
-            Qty::from_raw(0),
-            Price::from_raw(0),
-            Qty::from_raw(0),
-        ))
-        .unwrap();
+        tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
+        tp[0].try_push(mk_tick(VenueId::Polymarket, 11, 1)).unwrap();
         eng.tick(16);
-        // Two distinct symbols → two populated buckets (no hash
-        // collision at 7 % 64 vs 11 % 64).
+        // Two distinct symbols → two populated buckets (no mix
+        // collision for venue-0 syms 7 and 11).
         assert_eq!(eng.populated_sym_count(), 2);
-        // Probe age with `now` set well past any plausible
-        // wallclock — the result must be strictly positive when at
-        // least one symbol has been recorded.
         let far_future = core_time::now_ns().saturating_add(1_000_000_000);
         let age = eng.max_tick_age_ns(far_future);
         assert!(age > 0, "expected non-zero age, got {age}");
-        // And `populated_sym_count` should fit inside the bucket
-        // bitmask.
         assert!(eng.populated_sym_count() <= SYM_BUCKETS as u32);
     }
 
     #[test]
-    fn max_tick_age_handles_now_before_recorded() {
-        let (mut eng, mut pm_p, _bn_p, _sp, _fp) = build_engine();
+    fn same_ordinal_on_two_venues_lands_in_two_buckets() {
+        // The §3.1 regression the mixed bucket exists to prevent:
+        // ordinal 0 on every venue used to collapse into bucket 0.
+        let (mut eng, mut tp, _sp, _fp) = build_engine();
         eng.start().unwrap();
-        pm_p.try_push(Tick::new(
-            1_000,
-            7,
-            1,
-            Price::from_raw(0),
-            Qty::from_raw(0),
-            Price::from_raw(0),
-            Qty::from_raw(0),
-        ))
-        .unwrap();
+        let pm = core_types::make_symbol_id(VenueId::Polymarket, 0);
+        let okx = core_types::make_symbol_id(VenueId::Okx, 0);
+        tp[0].try_push(mk_tick(VenueId::Polymarket, pm, 1)).unwrap();
+        tp[2].try_push(mk_tick(VenueId::Okx, okx, 1)).unwrap();
+        eng.tick(16);
+        assert_eq!(eng.populated_sym_count(), 2);
+    }
+
+    #[test]
+    fn max_tick_age_handles_now_before_recorded() {
+        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        eng.start().unwrap();
+        tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         eng.tick(16);
         // `now` < last_touched → saturating_sub returns 0, not
         // wrapping nonsense.
         assert_eq!(eng.max_tick_age_ns(0), 0);
-    }
-
-    // Silence unused_imports warnings in the test module.
-    #[allow(dead_code)]
-    fn _touch_side_order() {
-        let _ = Order::new(
-            0,
-            0,
-            Side::Bid,
-            0,
-            Price::from_raw(0),
-            Qty::from_raw(0),
-            0,
-        );
     }
 }

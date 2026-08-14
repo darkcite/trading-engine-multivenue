@@ -17,9 +17,10 @@
 //!
 //! ## Capacity
 //!
-//! `MAX_COUNTERS` and `MAX_GAUGES` are fixed at 64 each — more than
-//! enough for v1 (we have ~12 hot-path counters and ~8 gauges).
-//! Raising them is a const change + recompile.
+//! `MAX_COUNTERS = 256` / `MAX_GAUGES = 384` (Phase 8a headroom for
+//! five venues' loss-accounting counters and per-bucket gauges).
+//! Still fixed arrays, still lock-free; raising further is a const
+//! change + recompile.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -31,9 +32,11 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod ingress_status;
 pub mod registry;
 pub mod server;
 
+pub use ingress_status::{IngressState, IngressStatus};
 pub use registry::{
     Counter, CounterId, EncodeErr, Gauge, GaugeId, MetricsRegistry, RegErr, MAX_COUNTERS,
     MAX_GAUGES, NAME_MAX,

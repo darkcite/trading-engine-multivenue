@@ -105,6 +105,7 @@ pub fn parse_book_update(buf: &[u8], sym: SymbolId, ts_ns: NsTs) -> Option<Tick>
 
     Some(Tick::new(
         ts_ns,
+        core_types::VenueId::Polymarket,
         sym,
         venue_seq,
         Price::from_raw(bid_px),

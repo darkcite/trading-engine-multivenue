@@ -379,6 +379,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-crypto"
+version = "0.1.0"
+
+[[package]]
 name = "core-io"
 version = "0.1.0"
 dependencies = [
@@ -402,6 +406,7 @@ version = "0.1.0"
 name = "core-net"
 version = "0.1.0"
 dependencies = [
+ "core-crypto",
  "memchr",
  "mio 0.8.11",
  "proptest",
@@ -775,6 +780,7 @@ dependencies = [
 name = "ingress-binance"
 version = "0.1.0"
 dependencies = [
+ "core-metrics",
  "core-net",
  "core-parse",
  "core-ring",
@@ -791,6 +797,7 @@ dependencies = [
 name = "ingress-polymarket"
 version = "0.1.0"
 dependencies = [
+ "core-metrics",
  "core-net",
  "core-parse",
  "core-ring",
@@ -807,6 +814,7 @@ dependencies = [
 name = "ingress-rpc"
 version = "0.1.0"
 dependencies = [
+ "core-metrics",
  "core-net",
  "core-parse",
  "core-ring",

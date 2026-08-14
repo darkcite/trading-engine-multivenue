@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, TlsTransport};
 use core_ring::Ring;
 use core_types::{SymbolId, Tick};
@@ -173,6 +174,7 @@ fn polymarket_tls_loopback_yields_expected_tick() {
         SymbolMap::from_pairs(std::iter::once((ASSET_ID.to_vec(), ASSET_SYM)));
     let ring: Arc<Ring<Tick, DEFAULT_TICK_RING_CAP>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
+    let status = IngressStatus::new();
 
     // Drive the run-loop via mio until we either see Steady + one
     // tick or hit the deadline.
@@ -201,6 +203,7 @@ fn polymarket_tls_loopback_yields_expected_tick() {
             b"/",
             &mut prod,
             &symbol_map,
+            &status,
         )
         .expect("drive_one");
         got = cons.try_pop();
@@ -217,4 +220,12 @@ fn polymarket_tls_loopback_yields_expected_tick() {
     // Prices are scaled 1e6 — 0.518 → 518_000; 0.520 → 520_000.
     assert_eq!(tick.bid_px.raw(), 518_000);
     assert_eq!(tick.ask_px.raw(), 520_000);
+    // D5/D7 through the real TLS path: the upgrade published Up, the
+    // book frame was counted, nothing was rejected or dropped.
+    assert_eq!(status.state(), IngressState::Up);
+    assert!(status.last_activity_ns() > 0);
+    assert!(status.bytes_total() > 0);
+    assert_eq!(status.msgs_total(), 1);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.ring_drops_total(), 0);
 }

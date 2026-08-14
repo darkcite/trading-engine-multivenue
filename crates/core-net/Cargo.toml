@@ -12,6 +12,7 @@ description  = "Socket + TLS primitives shared by ingress adapters and the CLOB 
 path = "src/lib.rs"
 
 [dependencies]
+core-crypto      = { path = "../core-crypto" }
 memchr           = { workspace = true }
 mio              = { workspace = true }
 rustls           = { workspace = true }

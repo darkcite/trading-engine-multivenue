@@ -37,9 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod run_loop;
 
 pub use run_loop::{
-    drive_one, note_transport_ready, run, Driver, Pending, RpcKind, RunResult, State, StopFlag,
-    SubId, SubKind, DEFAULT_SIGNAL_RING_CAP, PENDING_CAP, RPC_POLL_NS, RX_BUF_SIZE, SUB_CAP,
-    TX_BUF_SIZE,
+    drive_one, note_transport_ready, run, Driver, RpcKind, RunResult, State, StopFlag, SubId,
+    SubKind, DEFAULT_SIGNAL_RING_CAP, PENDING_CAP, RPC_POLL_NS, RX_BUF_SIZE, SUB_CAP, TX_BUF_SIZE,
 };
 
 // ---------------------------------------------------------------

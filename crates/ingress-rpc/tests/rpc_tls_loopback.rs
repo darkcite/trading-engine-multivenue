@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, TlsTransport};
 use core_ring::Ring;
 use core_types::Signal;
@@ -153,6 +154,7 @@ fn rpc_tls_loopback_yields_expected_signal() {
         TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
 
     let mut driver = Driver::new(0xCAFE);
+    let status = IngressStatus::new();
     let ring: Arc<Ring<Signal, DEFAULT_SIGNAL_RING_CAP>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
@@ -174,8 +176,15 @@ fn rpc_tls_loopback_yields_expected_signal() {
             let status = transport.pump(ev).expect("pump");
             note_transport_ready(&mut driver, status);
         }
-        drive_one(&mut transport, &mut driver, b"localhost", b"/v2/key", &mut prod)
-            .expect("drive_one");
+        drive_one(
+            &mut transport,
+            &mut driver,
+            b"localhost",
+            b"/v2/key",
+            &mut prod,
+            &status,
+        )
+        .expect("drive_one");
         got = cons.try_pop();
         transport
             .reregister(poll.registry(), token)
@@ -186,6 +195,13 @@ fn rpc_tls_loopback_yields_expected_signal() {
 
     let sig = got.expect("signal must arrive within 5 s");
     assert_eq!(driver.state(), State::Steady);
+    // Phase-8a observability: the upgrade published Up (D7) and the
+    // notification was counted as one handled envelope (D5/§6.4).
+    assert_eq!(status.state(), IngressState::Up);
+    assert!(status.last_activity_ns() > 0);
+    assert!(status.msgs_total() >= 1);
+    assert!(status.bytes_total() > 0);
+    assert_eq!(status.ring_drops_total(), 0);
     // Payload layout: number[0..8] LE u64 | ts_sec[8..16] | gas[16..24] | zero[24..40]
     let number = u64::from_le_bytes(sig.payload[0..8].try_into().unwrap());
     let ts = u64::from_le_bytes(sig.payload[8..16].try_into().unwrap());

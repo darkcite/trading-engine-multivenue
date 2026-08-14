@@ -12,13 +12,14 @@ description  = "Polymarket CLOB WebSocket + REST ingress. Handwritten byte-scann
 path = "src/lib.rs"
 
 [dependencies]
-core-net   = { workspace = true }
-core-parse = { workspace = true }
-core-ring  = { workspace = true }
-core-time  = { workspace = true }
-core-types = { workspace = true }
-memchr     = { workspace = true }
-mio        = { workspace = true }
+core-metrics = { path = "../core-metrics" }
+core-net     = { workspace = true }
+core-parse   = { workspace = true }
+core-ring    = { workspace = true }
+core-time    = { workspace = true }
+core-types   = { workspace = true }
+memchr       = { workspace = true }
+mio          = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

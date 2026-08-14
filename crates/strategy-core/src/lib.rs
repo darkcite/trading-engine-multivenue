@@ -277,6 +277,7 @@ mod tests {
 
         let t = Tick::new(
             0,
+            core_types::VenueId::Polymarket,
             1,
             1,
             core_types::Price::from_raw(0),

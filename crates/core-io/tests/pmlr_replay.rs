@@ -12,7 +12,7 @@
 use clob_dispatcher::PaperDispatcher;
 use core_io::{PmlrReader, PmlrWriter, SlotKind};
 use core_time::now_ns;
-use core_types::{Price, Qty, SymbolId, Tick};
+use core_types::{Price, Qty, SymbolId, Tick, VenueId};
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 use strategy_latency_arb::LatencyArb;
 
@@ -57,6 +57,7 @@ impl Ctx for NoopCtx {
 fn mk_tick(seq: u32, sym: SymbolId) -> Tick {
     Tick::new(
         seq as u64 * 1_000,
+        VenueId::Polymarket,
         sym,
         seq,
         Price::from_raw(500_000 + seq as i64),

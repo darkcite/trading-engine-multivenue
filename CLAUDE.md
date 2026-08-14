@@ -73,7 +73,8 @@ cargo run --release -p cli -- run --config ~/multivenue/config.toml --paper
 ## Directory guide
 
 - `PLAN.md` — full architecture, phased roadmap, testing strategy.
-- `crates/core-*/` — OS-agnostic primitives (rings, time, config, alloc, io, net, parse, simd).
+- `crates/core-*/` — OS-agnostic primitives (rings, time, config, alloc, io, net, parse, simd, crypto).
+- `crates/core-crypto/` — handwritten SHA-256 / HMAC-SHA256 / base64 (RFC 4648); no external crypto stacks.
 - `crates/ingress-*/` — one per external source (polymarket, binance, rss, rpc).
 - `crates/strategy-*/` — strategies implementing the `Strategy` trait.
 - `crates/signer-eip712/` — audited-C-backed signer; do not replace with `ethers`.

@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clob_dispatcher::{DispatchError, DispatchStats, LiveDispatcher, OrderDispatch};
-use core_types::{Order, Price, Qty, Side};
+use core_types::{Order, Price, Qty, Side, VenueId};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConnection;
@@ -141,6 +141,7 @@ fn canned_key() -> [u8; 32] {
 fn canned_order() -> Order {
     Order::new(
         0,
+        VenueId::Polymarket,
         42,
         Side::Bid,
         0,

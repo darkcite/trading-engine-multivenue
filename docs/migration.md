@@ -30,6 +30,50 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-14 — PMLR v2: venue bytes + explicit padding (Phase 8a)
+
+**What changed**
+
+- `PMLR VERSION` bumped 1 → 2.
+- `Tick` gains `venue: u8` at offset 48 (was implicit padding);
+  `Order` gains `venue: u8` at offset 40 (was `_pad1[0]`). Values are
+  `VenueId`: Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4,
+  Ai=5.
+- All padding in all four slots is now explicit and zeroed. v1 writers
+  emitted 8 undefined tail-padding bytes per slot (D9).
+- `SymbolId` is venue-namespaced: bits 31..24 = venue, bits 23..0 =
+  per-venue ordinal.
+
+**Why**
+
+- Phase 8 multivenue expansion needs venue identity on every tick and
+  order; the `AsBytes` zero-copy log contract requires fully
+  initialized slots.
+
+**Impact**
+
+- On-disk formats: v1 logs remain readable (`PmlrReader` accepts
+  version ≤ 2, exposes `version()`). v1 files are **venue-less**: the
+  byte at Tick offset 48 / Order offset 40 is undefined garbage in v1
+  and must be ignored when `version() == 1`. Venue cannot be inferred
+  from v1 slots (slot kind + sym do not disambiguate Polymarket vs
+  Binance ticks).
+- Config keys: none in this entry (per-venue symbol flags land with
+  the venue ingress phases).
+- Wire formats: ring slots and PMLR slots share the new layout;
+  `docs/wire-format.md` is the byte-level source of truth.
+
+**Migration steps**
+
+1. Nothing to do for live capture — new logs are v2 automatically.
+2. Backtests mixing v1 + v2 logs must branch on `PmlrReader::version()`
+   and treat v1 venue bytes as absent.
+
+**Rollback**
+
+- Binaries at or before Phase 7 refuse v2 logs (`version > 1`); keep
+  v1 archives if a rollback below Phase 8a is contemplated.
+
 ## 2026-04-19 — Phase 0 scaffold initial wire format
 
 **What changed**

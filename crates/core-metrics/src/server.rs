@@ -30,7 +30,10 @@ pub enum MetricsServerErr {
 }
 
 const REQ_BUF_SIZE: usize = 4 * 1024;
-const RESP_BUF_SIZE: usize = 64 * 1024;
+// 256 counters + 384 gauges × (63-byte name + value + newline) can
+// approach 64 KiB; 128 KiB keeps the single boot-time allocation
+// comfortably ahead of the registry's worst case.
+const RESP_BUF_SIZE: usize = 128 * 1024;
 const ACCEPT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Run the metrics server until `stop` is raised. Blocking; spawn

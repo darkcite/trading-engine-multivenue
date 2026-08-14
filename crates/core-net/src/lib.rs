@@ -29,13 +29,24 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod backoff;
 pub mod error;
 pub mod http1;
+pub mod iobuf;
+pub mod keepalive;
+pub mod subs;
 pub mod transport;
 pub mod ws_frame;
 pub mod ws_handshake;
 
+pub use backoff::{Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS};
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
+pub use iobuf::IoBuf;
+pub use keepalive::{Keepalive, KeepaliveAction, KeepaliveCfg};
+pub use subs::{
+    queue_masked_binary_frame, queue_masked_text_frame, PendingErr, PendingReq, PendingTable,
+    ReqKind, SubErr, SubId, SubTable,
+};
 
 pub use http1::{
     dechunk_in_place, read_response, write_get_request, BodyFraming, DechunkResult, HttpErr,
@@ -51,7 +62,7 @@ pub use ws_frame::{
 };
 pub use ws_handshake::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
-    write_client_handshake, HandshakeErr, HandshakeResult,
+    write_client_handshake, write_client_handshake_with_headers, HandshakeErr, HandshakeResult,
 };
 
 /// A fixed-capacity byte buffer with a cursor. The ingress adapters

@@ -1,0 +1,15 @@
+[package]
+name         = "core-crypto"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Handwritten SHA-256 / HMAC-SHA256 / base64 (RFC 4648). Zero-alloc, zero-dependency; NIST/RFC const-vector tested."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Deliberately empty — no external crypto stacks (house rule).

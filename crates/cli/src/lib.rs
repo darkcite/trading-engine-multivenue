@@ -38,8 +38,8 @@ pub use paper::{
     engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full, engine_loop_with,
     join_reverse, signal_shutdown, spawn_binance, spawn_polymarket, spawn_rpc, spawn_rss,
     Consumers, DrainCounters, EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats,
-    LatencyDump, LiveDispatcher, LiveDispatcherErr, Observability, Rings, RssFeed, StrategyPair,
-    WssEndpoint, STRATEGY_SLOTS,
+    IngressCounterIds, IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr,
+    Observability, Rings, RssFeed, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

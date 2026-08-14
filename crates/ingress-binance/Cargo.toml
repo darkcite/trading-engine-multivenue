@@ -12,6 +12,7 @@ description  = "Binance WS ingress (spot + futures). Handwritten byte-scanner pa
 path = "src/lib.rs"
 
 [dependencies]
+core-metrics = { path = "../core-metrics" }
 core-net   = { workspace = true }
 core-parse = { workspace = true }
 core-ring  = { workspace = true }

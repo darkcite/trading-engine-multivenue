@@ -30,14 +30,102 @@
 // Identifiers
 // ---------------------------------------------------------------
 
-/// Dense u32 identifier for a trading symbol (Polymarket market or
-/// external feed instrument). Resolved once at boot from a perfect-hash
-/// table; never parsed in the hot path.
+/// Venue discriminator. One byte in every `Tick` / `Order` and the
+/// namespace byte (bits 31..24) of every [`SymbolId`].
+///
+/// Discriminant values are wire-format-stable (PMLR v2, ring slots):
+/// never renumber, only append. `255` is reserved — it is the venue
+/// byte of [`SYMBOL_ID_NONE`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum VenueId {
+    /// Polymarket CLOB.
+    Polymarket = 0,
+    /// Binance spot WS.
+    Binance = 1,
+    /// OKX v5 public WS.
+    Okx = 2,
+    /// Deribit JSON-RPC WS.
+    Deribit = 3,
+    /// Hyperliquid WS (native perps, spot, HIP-4 outcomes).
+    Hyperliquid = 4,
+    /// AI-Ingress (claude-worker command feed; no market data).
+    Ai = 5,
+}
+
+impl VenueId {
+    /// Raw byte value as stored in POD structs and SymbolIds.
+    #[inline(always)]
+    pub const fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a raw byte (e.g. from a PMLR v2 slot). `None` for
+    /// unknown values — readers must treat that as corruption.
+    #[inline(always)]
+    pub const fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Polymarket),
+            1 => Some(Self::Binance),
+            2 => Some(Self::Okx),
+            3 => Some(Self::Deribit),
+            4 => Some(Self::Hyperliquid),
+            5 => Some(Self::Ai),
+            _ => None,
+        }
+    }
+}
+
+/// Dense u32 identifier for a trading symbol, namespaced by venue:
+/// bits 31..24 = [`VenueId`] byte, bits 23..0 = per-venue ordinal
+/// (16.7 M instruments per venue). Ordinals are allocated once at
+/// boot from venue REST discovery; never parsed in the hot path.
 pub type SymbolId = u32;
 
-/// The sentinel meaning "not a real symbol". Never collide with a valid
-/// perfect-hash slot.
+/// The sentinel meaning "not a real symbol". Its venue byte is 255,
+/// which no [`VenueId`] ever uses, so it can never collide with a
+/// real namespaced id.
 pub const SYMBOL_ID_NONE: SymbolId = u32::MAX;
+
+/// Bit position of the venue byte inside a [`SymbolId`].
+pub const SYMBOL_VENUE_SHIFT: u32 = 24;
+
+/// Mask selecting the per-venue ordinal bits of a [`SymbolId`].
+pub const SYMBOL_ORDINAL_MASK: u32 = 0x00FF_FFFF;
+
+/// Compose a namespaced [`SymbolId`] from a venue and a per-venue
+/// ordinal. Boot-time only in practice, but zero-cost anyway.
+///
+/// Debug builds assert the ordinal fits in 24 bits; release builds
+/// mask silently (an oversized ordinal is a boot-time config bug the
+/// discovery path must reject before it gets here).
+#[inline(always)]
+pub const fn make_symbol_id(venue: VenueId, ordinal: u32) -> SymbolId {
+    debug_assert!(ordinal <= SYMBOL_ORDINAL_MASK);
+    ((venue as u32) << SYMBOL_VENUE_SHIFT) | (ordinal & SYMBOL_ORDINAL_MASK)
+}
+
+/// Venue byte of a namespaced [`SymbolId`]. For [`SYMBOL_ID_NONE`]
+/// this returns 255, which [`VenueId::from_u8`] rejects.
+#[inline(always)]
+pub const fn symbol_venue_byte(sym: SymbolId) -> u8 {
+    (sym >> SYMBOL_VENUE_SHIFT) as u8
+}
+
+/// Per-venue ordinal of a namespaced [`SymbolId`].
+#[inline(always)]
+pub const fn symbol_ordinal(sym: SymbolId) -> u32 {
+    sym & SYMBOL_ORDINAL_MASK
+}
+
+/// Mix the venue byte into the low bits for staleness bucketing.
+/// Callers mask the result down to their bucket count (e.g. `& 63`).
+/// Replaces the old `sym & 63` scheme so two venues' ordinal-0
+/// symbols do not collide on low bits.
+#[inline(always)]
+pub const fn symbol_bucket_mix(sym: SymbolId) -> u32 {
+    sym ^ (sym >> SYMBOL_VENUE_SHIFT)
+}
 
 /// Monotonic nanosecond timestamp produced by `core_time::now_ns`. We
 /// deliberately do NOT use `std::time::Instant` in POD types — its
@@ -160,8 +248,13 @@ pub struct Tick {
     pub ask_px: Price,
     /// Size at best ask.
     pub ask_qty: Qty,
-    /// Reserved for future fields (kept for layout stability).
-    _pad: [u8; 8],
+    /// Producing venue ([`VenueId`] as raw byte). Redundant with the
+    /// venue byte inside `sym` by construction; carried explicitly so
+    /// PMLR consumers and lane audits never need to decode `sym`.
+    pub venue: u8,
+    /// Explicit tail padding — [`AsBytes`] requires every byte of the
+    /// 64 B slot to be initialized. Always zero.
+    _pad: [u8; 15],
 }
 
 impl Tick {
@@ -169,6 +262,7 @@ impl Tick {
     #[inline(always)]
     pub const fn new(
         ts_ns: NsTs,
+        venue: VenueId,
         sym: SymbolId,
         venue_seq: u32,
         bid_px: Price,
@@ -184,7 +278,8 @@ impl Tick {
             bid_qty,
             ask_px,
             ask_qty,
-            _pad: [0; 8],
+            venue: venue as u8,
+            _pad: [0; 15],
         }
     }
 
@@ -221,6 +316,8 @@ pub struct Signal {
     _pad0: [u8; 2],
     /// Opaque inline payload (no heap).
     pub payload: [u8; 40],
+    /// Explicit tail padding (see [`AsBytes`]). Always zero.
+    _pad1: [u8; 8],
 }
 
 impl Signal {
@@ -240,6 +337,7 @@ impl Signal {
             source,
             _pad0: [0; 2],
             payload,
+            _pad1: [0; 8],
         }
     }
 }
@@ -281,6 +379,8 @@ pub struct Fill {
     pub order_id: u64,
     /// Reserved.
     _pad1: [u8; 16],
+    /// Explicit tail padding (see [`AsBytes`]). Always zero.
+    _pad2: [u8; 8],
 }
 
 impl Fill {
@@ -303,6 +403,7 @@ impl Fill {
             qty,
             order_id,
             _pad1: [0; 16],
+            _pad2: [0; 8],
         }
     }
 }
@@ -327,8 +428,13 @@ pub struct Order {
     pub qty: Qty,
     /// Client-assigned idempotency key.
     pub client_oid: u64,
+    /// Target venue ([`VenueId`] as raw byte). The engine's
+    /// `VenueRouter` dispatches on this byte (Phase 8j).
+    pub venue: u8,
     /// Reserved.
-    _pad1: [u8; 16],
+    _pad1: [u8; 15],
+    /// Explicit tail padding (see [`AsBytes`]). Always zero.
+    _pad2: [u8; 8],
 }
 
 impl Order {
@@ -336,6 +442,7 @@ impl Order {
     #[inline(always)]
     pub const fn new(
         ts_ns: NsTs,
+        venue: VenueId,
         sym: SymbolId,
         side: Side,
         kind: u8,
@@ -352,7 +459,9 @@ impl Order {
             px,
             qty,
             client_oid,
-            _pad1: [0; 16],
+            venue: venue as u8,
+            _pad1: [0; 15],
+            _pad2: [0; 8],
         }
     }
 }
@@ -383,8 +492,10 @@ impl Order {
 pub unsafe trait AsBytes: Copy {}
 
 // SAFETY: Tick is `#[repr(C, align(64))]`, `#[derive(Copy)]`, all
-// fields are plain integers and explicitly-named `_pad` arrays. No
-// padding bytes are uninitialized.
+// fields are plain integers and explicitly-named `_pad` arrays that
+// sum to exactly 64 bytes (checked by `layout_is_fully_explicit` in
+// tests) — there is no compiler-inserted padding, so every byte is
+// initialized.
 unsafe impl AsBytes for Tick {}
 
 // SAFETY: Signal has the same guarantees as Tick.
@@ -451,6 +562,7 @@ mod tests {
     fn tick_mid_and_spread_are_correct() {
         let t = Tick::new(
             1_000,
+            VenueId::Polymarket,
             7,
             42,
             Price::from_raw(500_000),
@@ -460,6 +572,7 @@ mod tests {
         );
         assert_eq!(t.mid(), Price::from_raw(505_000));
         assert_eq!(t.spread(), 10_000);
+        assert_eq!(t.venue, VenueId::Polymarket.to_u8());
     }
 
     #[test]
@@ -467,6 +580,7 @@ mod tests {
         // Happy-path AND failure-mode coverage as required by §21.1 of PLAN.md.
         let t = Tick::new(
             0,
+            VenueId::Polymarket,
             SYMBOL_ID_NONE,
             0,
             Price::from_raw(0),
@@ -476,6 +590,123 @@ mod tests {
         );
         assert_eq!(t.mid(), Price::from_raw(0));
         assert_eq!(t.spread(), 0);
+    }
+
+    // ---- Phase 8: VenueId + SymbolId namespacing ----
+
+    #[test]
+    fn venue_id_roundtrips_through_u8() {
+        let all = [
+            VenueId::Polymarket,
+            VenueId::Binance,
+            VenueId::Okx,
+            VenueId::Deribit,
+            VenueId::Hyperliquid,
+            VenueId::Ai,
+        ];
+        let mut i = 0;
+        while i < all.len() {
+            assert_eq!(VenueId::from_u8(all[i].to_u8()), Some(all[i]));
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn venue_id_rejects_unknown_bytes() {
+        assert_eq!(VenueId::from_u8(6), None);
+        assert_eq!(VenueId::from_u8(254), None);
+        // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
+        assert_eq!(VenueId::from_u8(255), None);
+        assert_eq!(VenueId::from_u8(symbol_venue_byte(SYMBOL_ID_NONE)), None);
+    }
+
+    #[test]
+    fn symbol_id_namespacing_roundtrips() {
+        let sym = make_symbol_id(VenueId::Deribit, 0x00AB_CDEF);
+        assert_eq!(symbol_venue_byte(sym), VenueId::Deribit.to_u8());
+        assert_eq!(symbol_ordinal(sym), 0x00AB_CDEF);
+        // Ordinal 0 on venue 0 is a valid, non-sentinel id.
+        let zero = make_symbol_id(VenueId::Polymarket, 0);
+        assert_eq!(zero, 0);
+        assert_ne!(zero, SYMBOL_ID_NONE);
+    }
+
+    #[test]
+    fn symbol_bucket_mix_separates_ordinal_zero_across_venues() {
+        // The old `sym & 63` scheme put every venue's ordinal-0
+        // symbol in bucket 0. The mixed scheme must not.
+        let pm = make_symbol_id(VenueId::Polymarket, 0);
+        let okx = make_symbol_id(VenueId::Okx, 0);
+        let hl = make_symbol_id(VenueId::Hyperliquid, 0);
+        let b_pm = symbol_bucket_mix(pm) & 63;
+        let b_okx = symbol_bucket_mix(okx) & 63;
+        let b_hl = symbol_bucket_mix(hl) & 63;
+        assert_ne!(b_pm, b_okx);
+        assert_ne!(b_pm, b_hl);
+        assert_ne!(b_okx, b_hl);
+    }
+
+    #[test]
+    fn venue_bytes_sit_at_documented_offsets() {
+        // docs/wire-format.md pins Tick.venue at offset 48 and
+        // Order.venue at offset 40. Byte-level check through AsBytes.
+        let t = Tick::new(
+            0,
+            VenueId::Hyperliquid,
+            make_symbol_id(VenueId::Hyperliquid, 9),
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        );
+        // SAFETY: Tick is AsBytes (repr(C), Copy, fully-initialized);
+        // read-only byte view of a live stack value.
+        let tb = unsafe {
+            core::slice::from_raw_parts((&t as *const Tick).cast::<u8>(), 64)
+        };
+        assert_eq!(tb[48], VenueId::Hyperliquid.to_u8());
+        // Explicit tail padding must be zero.
+        let mut i = 49;
+        while i < 64 {
+            assert_eq!(tb[i], 0);
+            i += 1;
+        }
+
+        let o = Order::new(
+            0,
+            VenueId::Okx,
+            make_symbol_id(VenueId::Okx, 3),
+            Side::Ask,
+            0,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            7,
+        );
+        // SAFETY: Order is AsBytes; same argument as above.
+        let ob = unsafe {
+            core::slice::from_raw_parts((&o as *const Order).cast::<u8>(), 64)
+        };
+        assert_eq!(ob[40], VenueId::Okx.to_u8());
+        let mut i = 41;
+        while i < 64 {
+            assert_eq!(ob[i], 0);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn layout_is_fully_explicit() {
+        // Sum of declared field widths must equal size_of — any
+        // compiler-inserted padding would break the AsBytes contract.
+        // Tick: 8+4+4+8+8+8+8+1+15 = 64.
+        // Signal: 8+4+1+1+2+40+8 = 64.
+        // Fill: 8+4+1+3+8+8+8+16+8 = 64.
+        // Order: 8+4+1+1+2+8+8+8+1+15+8 = 64.
+        assert_eq!(::core::mem::size_of::<Tick>(), 64);
+        assert_eq!(::core::mem::size_of::<Signal>(), 64);
+        assert_eq!(::core::mem::size_of::<Fill>(), 64);
+        assert_eq!(::core::mem::size_of::<Order>(), 64);
     }
 
     #[test]

@@ -154,6 +154,7 @@ fn binance_tls_loopback_yields_expected_tick() {
     let mut driver = Driver::new(0xBA07, SYMBOL);
     let ring: Arc<Ring<Tick, DEFAULT_TICK_RING_CAP>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
+    let status = core_metrics::IngressStatus::new();
 
     let mut poll = mio::Poll::new().expect("mio poll");
     let mut events = mio::Events::with_capacity(16);
@@ -173,7 +174,7 @@ fn binance_tls_loopback_yields_expected_tick() {
             let status = transport.pump(ev).expect("pump");
             note_transport_ready(&mut driver, status);
         }
-        drive_one(&mut transport, &mut driver, b"localhost", b"/", &mut prod)
+        drive_one(&mut transport, &mut driver, b"localhost", b"/", &mut prod, &status)
             .expect("drive_one");
         got = cons.try_pop();
         transport
@@ -187,6 +188,11 @@ fn binance_tls_loopback_yields_expected_tick() {
 
     let tick = got.expect("tick must arrive within 5 s");
     assert_eq!(driver.state(), State::Steady);
+    // Phase 8a observability: the upgrade published Up and the frame
+    // was counted.
+    assert_eq!(status.state(), core_metrics::IngressState::Up);
+    assert_eq!(status.msgs_total(), 1);
+    assert!(status.last_activity_ns() > 0);
     assert_eq!(tick.sym, SYMBOL);
     // 65000.01 * 1e6 = 65_000_010_000.
     assert_eq!(tick.bid_px.raw(), 65_000_010_000);

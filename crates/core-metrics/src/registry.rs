@@ -3,16 +3,15 @@
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Maximum number of counters per registry. Bump and recompile.
-pub const MAX_COUNTERS: usize = 64;
-// SAFETY: the registry's internal arrays are sized at compile time
-// from these constants. Bumping doesn't affect hot-path behavior;
-// each counter/gauge is still 64-byte aligned.
-/// Maximum number of gauges per registry.
-/// Max registrable gauges. Bumped to 128 in Phase 7-prep so we
-/// can carry per-bucket tick-age gauges (one per
-/// `engine::SYM_BUCKETS`) alongside the ~18 engine-wide gauges
-/// without running out of slots.
-pub const MAX_GAUGES: usize = 128;
+/// 64 → 256 in Phase 8a: five venues × the §6.4 loss-accounting
+/// counter set (msgs/bytes/parse_errors/gaps/resubscribes/
+/// reconnects/ring_drops) plus dispatcher counters need the room.
+pub const MAX_COUNTERS: usize = 256;
+/// Maximum number of gauges per registry. 128 → 384 in Phase 8a:
+/// per-bucket tick-age gauges (one per `engine::SYM_BUCKETS`),
+/// per-venue ingress state + coverage gauges, and headroom for the
+/// Phase-8e completeness harness.
+pub const MAX_GAUGES: usize = 384;
 /// Maximum metric-name length (bytes). 63 ASCII + a NUL terminator
 /// keeps `[u8; 64]` aligned on cache lines.
 pub const NAME_MAX: usize = 63;

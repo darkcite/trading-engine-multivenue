@@ -47,7 +47,13 @@ pub const HEADER_SIZE: usize = 64;
 pub const MAGIC: [u8; 4] = *b"PMLR";
 
 /// Wire format version. Bumped on any slot-layout change.
-pub const VERSION: u16 = 1;
+///
+/// * v1 — Phase 1 layouts: no venue byte, implicit tail padding
+///   (contents of those 8 bytes are undefined in v1 files).
+/// * v2 — Phase 8a: `Tick.venue` at offset 48, `Order.venue` at
+///   offset 40, all padding explicit and zeroed. v1 files remain
+///   readable but are venue-less; see `docs/migration.md`.
+pub const VERSION: u16 = 2;
 
 /// Default staging buffer size. 64 KiB == 1024 slots — amortises the
 /// `write_all` syscall rate over ~65k records at steady state.
@@ -215,7 +221,7 @@ impl PmlrWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{Fill, LatencyClass, Order, Price, Qty, Side, Signal, SignalSource, Tick};
+    use core_types::{Fill, LatencyClass, Order, Price, Qty, Side, Signal, SignalSource, Tick, VenueId};
     use std::fs::File;
     use std::io::Read;
 
@@ -270,6 +276,7 @@ mod tests {
 
         let t = Tick::new(
             1_000,
+            VenueId::Polymarket,
             7,
             42,
             Price::from_raw(518_000),
@@ -351,6 +358,7 @@ mod tests {
         let mut w = PmlrWriter::open(&p, SlotKind::Order, 0).unwrap();
         let o = Order::new(
             200,
+            VenueId::Polymarket,
             11,
             Side::Ask,
             0,

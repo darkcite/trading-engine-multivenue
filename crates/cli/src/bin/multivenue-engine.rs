@@ -75,6 +75,13 @@ struct RunArgs {
     /// market's asset_id to this same id.
     #[arg(long, default_value_t = 42u32)]
     polymarket_sym_id: u32,
+    /// Polymarket CLOB asset id (token id) for the market above —
+    /// the decimal string from the market's `clobTokenIds`. Required:
+    /// without it the PM symbol map is empty and every Polymarket
+    /// frame fails lookup (defect D1 — zero PM ticks). Boot refuses
+    /// to start rather than run venue-blind.
+    #[arg(long)]
+    polymarket_asset_id: String,
     /// Trigger threshold in 1e6 fixed-point units (e.g. `20000` is
     /// $0.02).
     #[arg(long, default_value_t = 20_000i64)]
@@ -288,31 +295,74 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- Allocate rings + split into producer/consumer halves --
+    //
+    // Phase 8a lane layout: rings.tick is indexed by VenueId
+    // (0=PM, 1=BN, 2=OKX, 3=Deribit, 4=HL). Lanes 2..5 have no
+    // ingress until Phases 8b–8d: their producers are dropped here,
+    // leaving permanently-empty rings the engine drains for two
+    // atomic loads per iteration (§3.3). Fill-lane producers arrive
+    // with the venue dispatchers in 8j; paper fills flow through
+    // the engine's dispatcher pump (D3).
     let rings = Rings::new();
-    let (pm_prod, pm_cons) = rings.polymarket_tick.split();
-    let (bn_prod, bn_cons) = rings.binance_tick.split();
-    let (rpc_prod, rpc_cons) = rings.rpc_signal.split();
-    let (rss_prod, rss_cons) = rings.rss_signal.split();
+    let (pm_prod, pm_lane_cons) = rings.tick[0].clone().split();
+    let (bn_prod, bn_lane_cons) = rings.tick[1].clone().split();
+    let (_okx_prod_unspawned, okx_lane_cons) = rings.tick[2].clone().split();
+    let (_der_prod_unspawned, der_lane_cons) = rings.tick[3].clone().split();
+    let (_hl_prod_unspawned, hl_lane_cons) = rings.tick[4].clone().split();
+    let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
+    let (rss_prod, rss_cons) = rings.rss_signal.clone().split();
+    let fill_lane_cons = {
+        let (_f0p, f0) = rings.fill[0].clone().split();
+        let (_f1p, f1) = rings.fill[1].clone().split();
+        let (_f2p, f2) = rings.fill[2].clone().split();
+        let (_f3p, f3) = rings.fill[3].clone().split();
+        [f0, f1, f2, f3]
+    };
+
+    // -- Per-ingress status slots (D7) --
+    let statuses = std::sync::Arc::new(cli::IngressStatusSet::new());
 
     // -- Spawn ingress threads --
     let mut handles = Vec::new();
 
+    // D1 fix: the PM symbol map is populated from the configured
+    // asset id instead of `std::iter::empty()`. Venue-wide REST
+    // discovery replaces this single-pair config in the Phase-8e
+    // boot coverage audit.
+    let pm_map = ingress_polymarket::run_loop::SymbolMap::from_pairs([(
+        args.polymarket_asset_id.clone().into_bytes(),
+        args.polymarket_sym_id,
+    )]);
+    info!(
+        asset_id = %args.polymarket_asset_id,
+        sym_id = args.polymarket_sym_id,
+        "polymarket: symbol map configured"
+    );
     let pm_handle = spawn_polymarket(
         pm_ep,
         tls_config.clone(),
-        ingress_polymarket::run_loop::SymbolMap::from_pairs(std::iter::empty()),
+        pm_map,
         pm_prod,
+        statuses.polymarket.clone(),
         1,
     );
     handles.push(pm_handle);
 
-    let bn_handle = spawn_binance(bn_ep, tls_config.clone(), args.binance_sym_id, bn_prod, 2);
+    let bn_handle = spawn_binance(
+        bn_ep,
+        tls_config.clone(),
+        args.binance_sym_id,
+        bn_prod,
+        statuses.binance.clone(),
+        2,
+    );
     handles.push(bn_handle);
 
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
-                let rpc_handle = spawn_rpc(rpc_ep, tls_config.clone(), rpc_prod, 3);
+                let rpc_handle =
+                    spawn_rpc(rpc_ep, tls_config.clone(), rpc_prod, statuses.rpc.clone(), 3);
                 handles.push(rpc_handle);
             }
             Err(e) => {
@@ -344,16 +394,28 @@ fn run(args: RunArgs) -> ExitCode {
         drop(rss_prod);
     } else {
         info!(feeds = rss_feeds.len(), "rss: starting ingress thread");
-        let rss_handle = cli::spawn_rss(rss_feeds, tls_config.clone(), rss_prod, 4);
+        let rss_handle = cli::spawn_rss(
+            rss_feeds,
+            tls_config.clone(),
+            rss_prod,
+            statuses.rss.clone(),
+            4,
+        );
         handles.push(rss_handle);
     }
 
     // -- Main thread: real engine loop until SIGINT --
     let cons = Consumers {
-        polymarket_tick: pm_cons,
-        binance_tick: bn_cons,
+        tick_lanes: [
+            pm_lane_cons,
+            bn_lane_cons,
+            okx_lane_cons,
+            der_lane_cons,
+            hl_lane_cons,
+        ],
         rpc_signal: rpc_cons,
         rss_signal: rss_cons,
+        fill_lanes: fill_lane_cons,
     };
     let engine_cfg = EngineConfig {
         pairs: vec![StrategyPair {
@@ -369,7 +431,7 @@ fn run(args: RunArgs) -> ExitCode {
     let enable_metrics = args.metrics || args.tui;
     let enable_tui = args.tui;
     let obs = match Observability::build(enable_metrics, enable_tui) {
-        Ok(o) => o,
+        Ok(o) => o.with_ingress_statuses(statuses.clone()),
         Err(reason) => {
             error!(reason, "observability build failed");
             join_reverse(handles);

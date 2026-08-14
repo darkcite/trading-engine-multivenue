@@ -21,7 +21,7 @@ use core_latency::LatencyTracker;
 use core_metrics::MetricsRegistry;
 use core_ring::Ring;
 use core_time::now_ns;
-use core_types::{Order, Price, Qty, Side, Tick};
+use core_types::{Order, Price, Qty, Side, Tick, VenueId};
 use strategy_core::{CooldownGate, Ctx, Strategy, SubmitErr};
 use strategy_latency_arb::LatencyArb;
 
@@ -47,6 +47,7 @@ fn bench_ring(c: &mut Criterion) {
     let (mut prod, mut cons) = ring.split();
     let t = Tick::new(
         0,
+        VenueId::Polymarket,
         7,
         1,
         Price::from_raw(500_000),
@@ -108,6 +109,7 @@ fn bench_book_apply(c: &mut Criterion) {
     // Mid-of-table sym — typical not best/worst case for linear scan.
     let t = Tick::new(
         0,
+        VenueId::Polymarket,
         4,
         1,
         Price::from_raw(500_000),
@@ -148,6 +150,7 @@ fn bench_queued_dispatcher_submit(c: &mut Criterion) {
     let (mut queued, _worker) = QueuedDispatcher::new(PaperDispatcher::new());
     let order = Order::new(
         now_ns(),
+        VenueId::Polymarket,
         7,
         Side::Bid,
         0,
@@ -200,6 +203,7 @@ fn bench_latency_arb_on_tick(c: &mut Criterion) {
     // no order emits.
     let pm = Tick::new(
         0,
+        VenueId::Polymarket,
         7,
         1,
         Price::from_raw(500_000),
@@ -209,6 +213,7 @@ fn bench_latency_arb_on_tick(c: &mut Criterion) {
     );
     let bn = Tick::new(
         0,
+        VenueId::Binance,
         13,
         1,
         Price::from_raw(500_000),

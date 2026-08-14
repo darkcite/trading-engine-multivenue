@@ -33,11 +33,12 @@ use clob_dispatcher::{OrderDispatch, PaperDispatcher};
 // LiveDispatcher is re-exported through cli::paper so the binary
 // doesn't have to depend on clob-dispatcher directly.
 pub use clob_dispatcher::{LiveDispatcher, LiveDispatcherErr};
-use core_net::TlsTransport;
+use core_metrics::{IngressState, IngressStatus};
+use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{Fill, Signal, SymbolId, Tick};
-use engine::{Engine, FILL_RING_SIZE, SIGNAL_RING_SIZE};
+use engine::{Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE};
 use rustls_pki_types::ServerName;
 use strategy_latency_arb::LatencyArb;
 
@@ -77,9 +78,27 @@ type RustlsConfig = std::sync::Arc<rustls::ClientConfig>;
 /// Cadence at which the main-thread drain loop logs ring counters.
 const REPORT_PERIOD_NS: u64 = 5_000_000_000;
 
-/// Sleep between reconnect attempts when the transport fails. Keeps
-/// failure storms from hammering the upstream during outages.
-const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+/// Keepalive policy per WSS ingress (D5/D6). Ping intervals sit
+/// well under each venue's idle cutoff; idle timeouts catch
+/// half-open TCP that `Ok(0)` never surfaces. The RPC feed's probe
+/// is its own 2 s `eth_blockNumber` poll — keepalive only supplies
+/// the reconnect deadline there.
+const PM_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 10_000_000_000,
+    idle_timeout_ns: 30_000_000_000,
+};
+/// Binance server-pings every ~20 s; our proactive ping is a cheap
+/// second line of defense.
+const BN_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 15_000_000_000,
+    idle_timeout_ns: 45_000_000_000,
+};
+/// Polygon RPC: newHeads every ~2 s + our own 2 s poll → anything
+/// quieter than 30 s is a dead session.
+const RPC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 10_000_000_000,
+    idle_timeout_ns: 30_000_000_000,
+};
 
 /// Maximum number of items the main thread drains per ring per
 /// iteration. Bounded so a backed-up ring can't starve the others.
@@ -125,44 +144,78 @@ impl WssEndpoint {
 /// Every ring the cli owns at boot. Sizes are pulled from the
 /// ingress + engine crates so the cli doesn't restate them; the
 /// `const` equality below is structural — the compiler enforces
-/// that the engine and ingress agree.
+/// that the engine and ingress agree on the single Phase-8a
+/// standardized tick capacity (§3.3).
 const _: () = {
-    assert!(pwl::DEFAULT_TICK_RING_CAP == engine::PM_TICK_RING_SIZE);
-    assert!(bwl::DEFAULT_TICK_RING_CAP == engine::BN_TICK_RING_SIZE);
+    assert!(pwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(bwl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
 /// All preallocated rings the engine + cli touch.
 pub struct Rings {
-    /// Tick ring for the Polymarket CLOB.
-    pub polymarket_tick: Arc<Ring<Tick, { pwl::DEFAULT_TICK_RING_CAP }>>,
-    /// Tick ring for Binance bookTicker.
-    pub binance_tick: Arc<Ring<Tick, { bwl::DEFAULT_TICK_RING_CAP }>>,
+    /// One tick ring per venue lane, indexed by `VenueId as usize`
+    /// (0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
+    /// 4 = Hyperliquid). Lanes without a spawned ingress simply
+    /// never see a producer push — the engine drains them empty.
+    pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
     /// Signal ring for Polygon newHeads — feeds the engine.
     pub rpc_signal: Arc<Ring<Signal, SIGNAL_RING_SIZE>>,
-    /// Signal ring for RSS news items — drained at cli level (the
-    /// strategy doesn't react to RSS in Phase 2).
+    /// Signal ring for RSS news items — drained at cli level.
+    /// Stays in place untouched until Stage 2 (RSS retirement, §8.1).
     pub rss_signal: Arc<Ring<Signal, 1024>>,
-    /// Fill ring — the paper dispatcher never produces fills in
-    /// Phase 2 but the engine still consumes one so the structural
-    /// shape matches the live-trading path.
-    pub fill: Arc<Ring<Fill, FILL_RING_SIZE>>,
+    /// One fill ring per execution lane (`engine::fill_lane_of`).
+    /// Live dispatchers gain producers in Phase 8j; until then the
+    /// engine's dispatcher fill pump (D3) is the only fill source.
+    pub fill: [Arc<Ring<Fill, FILL_RING_SIZE>>; NUM_FILL_LANES],
 }
 
 impl Rings {
     /// Allocate all rings. Single call; never used on hot path.
     pub fn new() -> Self {
         Self {
-            polymarket_tick: Ring::new(),
-            binance_tick: Ring::new(),
+            tick: [Ring::new(), Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             rpc_signal: Ring::new(),
             rss_signal: Ring::new(),
-            fill: Ring::new(),
+            fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
         }
     }
 }
 
 impl Default for Rings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One [`IngressStatus`] slot per ingress thread (D7). Allocated at
+/// boot, cloned into the spawn wrappers (writers) and into
+/// [`Observability`] (reader). RSS gets a slot for uniformity even
+/// though its thread only reports coarse Up/Down.
+pub struct IngressStatusSet {
+    /// Polymarket WSS thread.
+    pub polymarket: Arc<IngressStatus>,
+    /// Binance WSS thread.
+    pub binance: Arc<IngressStatus>,
+    /// Polygon RPC WSS thread.
+    pub rpc: Arc<IngressStatus>,
+    /// RSS poller thread.
+    pub rss: Arc<IngressStatus>,
+}
+
+impl IngressStatusSet {
+    /// Allocate all four slots (boot only).
+    pub fn new() -> Self {
+        Self {
+            polymarket: Arc::new(IngressStatus::new()),
+            binance: Arc::new(IngressStatus::new()),
+            rpc: Arc::new(IngressStatus::new()),
+            rss: Arc::new(IngressStatus::new()),
+        }
+    }
+}
+
+impl Default for IngressStatusSet {
     fn default() -> Self {
         Self::new()
     }
@@ -180,7 +233,8 @@ pub fn spawn_polymarket(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     symbol_map: pwl::SymbolMap,
-    mut producer: Producer<Tick, { pwl::DEFAULT_TICK_RING_CAP }>,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
     core_id: usize,
 ) -> JoinHandle<()> {
     spawn_or_die(
@@ -192,17 +246,22 @@ pub fn spawn_polymarket(
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(error = ?e, "polymarket: bad server name");
+                    status.set_state(IngressState::Down);
                     return;
                 }
             };
 
             let mut driver = pwl::Driver::new(now_ns());
+            let mut keepalive = Keepalive::new(PM_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
                 let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!(error = ?e, "polymarket: connect failed");
-                        backoff();
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
                         continue;
                     }
                 };
@@ -210,10 +269,12 @@ pub fn spawn_polymarket(
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!(error = ?e, "polymarket: mio init failed");
+                        status.set_state(IngressState::Down);
                         return;
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
+                let msgs_before = status.msgs_total();
 
                 let res = pwl::run(
                     &mut transport,
@@ -226,13 +287,24 @@ pub fn spawn_polymarket(
                     &mut events,
                     token,
                     &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
                 );
                 tracing::info!(?res, "polymarket: run-loop returned");
                 if matches!(res, pwl::RunResult::Stopped) {
+                    status.set_state(IngressState::Down);
                     return;
                 }
-                backoff();
+                // A session that moved data restarts the schedule;
+                // a flapping endpoint keeps escalating (D8).
+                if status.msgs_total() > msgs_before {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
             }
+            status.set_state(IngressState::Down);
         },
     )
 }
@@ -244,7 +316,8 @@ pub fn spawn_binance(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     sym: core_types::SymbolId,
-    mut producer: Producer<Tick, { bwl::DEFAULT_TICK_RING_CAP }>,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
     core_id: usize,
 ) -> JoinHandle<()> {
     spawn_or_die(
@@ -256,17 +329,22 @@ pub fn spawn_binance(
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(error = ?e, "binance: bad server name");
+                    status.set_state(IngressState::Down);
                     return;
                 }
             };
 
             let mut driver = bwl::Driver::new(now_ns(), sym);
+            let mut keepalive = Keepalive::new(BN_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
                 let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!(error = ?e, "binance: connect failed");
-                        backoff();
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
                         continue;
                     }
                 };
@@ -274,10 +352,12 @@ pub fn spawn_binance(
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!(error = ?e, "binance: mio init failed");
+                        status.set_state(IngressState::Down);
                         return;
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
+                let msgs_before = status.msgs_total();
 
                 let res = bwl::run(
                     &mut transport,
@@ -289,13 +369,22 @@ pub fn spawn_binance(
                     &mut events,
                     token,
                     &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
                 );
                 tracing::info!(?res, "binance: run-loop returned");
                 if matches!(res, bwl::RunResult::Stopped) {
+                    status.set_state(IngressState::Down);
                     return;
                 }
-                backoff();
+                if status.msgs_total() > msgs_before {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
             }
+            status.set_state(IngressState::Down);
         },
     )
 }
@@ -305,6 +394,7 @@ pub fn spawn_rpc(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     mut producer: Producer<Signal, { rwl::DEFAULT_SIGNAL_RING_CAP }>,
+    status: Arc<IngressStatus>,
     core_id: usize,
 ) -> JoinHandle<()> {
     spawn_or_die(
@@ -316,17 +406,22 @@ pub fn spawn_rpc(
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(error = ?e, "rpc: bad server name");
+                    status.set_state(IngressState::Down);
                     return;
                 }
             };
 
             let mut driver = rwl::Driver::new(now_ns());
+            let mut keepalive = Keepalive::new(RPC_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
                 let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!(error = ?e, "rpc: connect failed");
-                        backoff();
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
                         continue;
                     }
                 };
@@ -334,10 +429,12 @@ pub fn spawn_rpc(
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!(error = ?e, "rpc: mio init failed");
+                        status.set_state(IngressState::Down);
                         return;
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
+                let msgs_before = status.msgs_total();
 
                 let res = rwl::run(
                     &mut transport,
@@ -349,13 +446,22 @@ pub fn spawn_rpc(
                     &mut events,
                     token,
                     &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
                 );
                 tracing::info!(?res, "rpc: run-loop returned");
                 if matches!(res, rwl::RunResult::Stopped) {
+                    status.set_state(IngressState::Down);
                     return;
                 }
-                backoff();
+                if status.msgs_total() > msgs_before {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
             }
+            status.set_state(IngressState::Down);
         },
     )
 }
@@ -406,6 +512,7 @@ pub fn spawn_rss(
     feeds: Vec<RssFeed>,
     tls_config: RustlsConfig,
     mut producer: Producer<Signal, 1024>,
+    status: Arc<IngressStatus>,
     core_id: usize,
 ) -> JoinHandle<()> {
     spawn_or_die(
@@ -415,8 +522,14 @@ pub fn spawn_rss(
             log_pin_outcome("rss", core_id);
             if feeds.is_empty() {
                 tracing::info!("rss: no feeds configured — thread exiting");
+                status.set_state(IngressState::Down);
                 return;
             }
+            // Coarse status only: the poller owns its own schedule
+            // and connection lifecycle (request/response at minutes
+            // cadence), so Up-while-running / Down-on-exit is the
+            // honest granularity. RSS retires entirely in Stage 2.
+            status.set_state(IngressState::Up);
             // Build FeedCfg slice once. `feeds` is owned by this
             // closure so the &[u8] borrows live the whole thread.
             let cfgs: Vec<ingress_rss::poller::FeedCfg<'_>> = feeds
@@ -473,6 +586,7 @@ pub fn spawn_rss(
             ) {
                 tracing::error!(error = ?e, "rss: poller::run returned error");
             }
+            status.set_state(IngressState::Down);
             tracing::info!("rss: ingress thread exiting");
         },
     )
@@ -485,10 +599,13 @@ pub fn spawn_rss(
 /// Per-ring observed counters reset every 5 s.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DrainCounters {
-    /// Polymarket ticks observed.
+    /// Polymarket ticks observed (lane 0).
     pub polymarket_ticks: u64,
-    /// Binance ticks observed.
+    /// Binance ticks observed (lane 1).
     pub binance_ticks: u64,
+    /// Ticks observed on the OKX/Deribit/Hyperliquid lanes (2..5).
+    /// Zero until those ingresses exist (Phases 8b–8d).
+    pub other_venue_ticks: u64,
     /// RPC signals observed.
     pub rpc_signals: u64,
     /// RSS signals observed.
@@ -501,22 +618,25 @@ impl DrainCounters {
     pub fn add(&mut self, other: &Self) {
         self.polymarket_ticks += other.polymarket_ticks;
         self.binance_ticks += other.binance_ticks;
+        self.other_venue_ticks += other.other_venue_ticks;
         self.rpc_signals += other.rpc_signals;
         self.rss_signals += other.rss_signals;
     }
 }
 
-/// Consumer-side handles passed to the drain loop. Created from
-/// `Ring::split()`; the producer ends went to ingress threads.
+/// Consumer-side handles passed to the drain loop / engine. Created
+/// from `Ring::split()`; the producer ends went to ingress threads.
 pub struct Consumers {
-    /// Polymarket tick consumer.
-    pub polymarket_tick: Consumer<Tick, { pwl::DEFAULT_TICK_RING_CAP }>,
-    /// Binance tick consumer.
-    pub binance_tick: Consumer<Tick, { bwl::DEFAULT_TICK_RING_CAP }>,
+    /// Tick-lane consumers, indexed by `VenueId as usize` (§3.3).
+    pub tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
-    /// RSS signal consumer (cli-level drain).
+    /// RSS signal consumer (cli-level drain; Stage-2 retirement).
     pub rss_signal: Consumer<Signal, 1024>,
+    /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
+    /// arrive with the venue dispatchers in Phase 8j; paper-mode
+    /// fills flow through the engine's dispatcher pump (D3).
+    pub fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
 }
 
 /// Drain-and-count loop. Runs on the main thread until
@@ -530,21 +650,22 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
     let mut next_report = now_ns() + REPORT_PERIOD_NS;
 
     while !shutdown_requested() {
-        // Drain each ring in fixed-size batches; bounded so one ring
-        // can't monopolise the main thread.
-        for _ in 0..DRAIN_BATCH {
-            if cons.polymarket_tick.try_pop().is_some() {
-                period.polymarket_ticks += 1;
-            } else {
-                break;
+        // Drain each lane in fixed-size batches; bounded so one ring
+        // can't monopolise the main thread. Lane order = VenueId.
+        let mut lane = 0;
+        while lane < NUM_TICK_LANES {
+            for _ in 0..DRAIN_BATCH {
+                if cons.tick_lanes[lane].try_pop().is_some() {
+                    match lane {
+                        0 => period.polymarket_ticks += 1,
+                        1 => period.binance_ticks += 1,
+                        _ => period.other_venue_ticks += 1,
+                    }
+                } else {
+                    break;
+                }
             }
-        }
-        for _ in 0..DRAIN_BATCH {
-            if cons.binance_tick.try_pop().is_some() {
-                period.binance_ticks += 1;
-            } else {
-                break;
-            }
+            lane += 1;
         }
         for _ in 0..DRAIN_BATCH {
             if cons.rpc_signal.try_pop().is_some() {
@@ -567,6 +688,7 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
             tracing::info!(
                 pm_ticks = period.polymarket_ticks,
                 bn_ticks = period.binance_ticks,
+                other_ticks = period.other_venue_ticks,
                 rpc_sigs = period.rpc_signals,
                 rss_sigs = period.rss_signals,
                 "5s ring summary"
@@ -883,6 +1005,12 @@ impl Observability {
                     .register_gauge(name)
                     .map_err(|_| "register engine_tick_age_ns_bNN")?;
             }
+            // §6.4 loss-accounting counters, one set per WSS
+            // ingress (D4). Boot-only; format! is fine here.
+            let ingress_polymarket = register_ingress_counters(&mut reg, "polymarket")?;
+            let ingress_binance = register_ingress_counters(&mut reg, "binance")?;
+            let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
+
             out.metrics = Some(Arc::new(reg));
             out.counter_ids = Some(EngineCounters {
                 ticks,
@@ -906,6 +1034,9 @@ impl Observability {
                 ingress_rss_state,
                 max_tick_age_ns,
                 tick_age_ns_per_bucket,
+                ingress_polymarket,
+                ingress_binance,
+                ingress_rpc,
             });
         }
         if enable_tui {
@@ -913,6 +1044,27 @@ impl Observability {
         }
         Ok(out)
     }
+}
+
+/// Register the seven §6.4 counters for one ingress. Boot-only.
+fn register_ingress_counters(
+    reg: &mut core_metrics::MetricsRegistry,
+    venue: &str,
+) -> Result<IngressCounterIds, &'static str> {
+    let mut one = |metric: &str| -> Result<core_metrics::CounterId, &'static str> {
+        let name = format!("engine_ingress_{venue}_{metric}_total");
+        reg.register_counter(&name)
+            .map_err(|_| "register ingress counter")
+    };
+    Ok(IngressCounterIds {
+        msgs: one("msgs")?,
+        bytes: one("bytes")?,
+        parse_errors: one("parse_errors")?,
+        gaps: one("gaps")?,
+        resubscribes: one("resubscribes")?,
+        reconnects: one("reconnects")?,
+        ring_drops: one("ring_drops")?,
+    })
 }
 
 /// Periodic HdrHistogram dump config. When wired into
@@ -961,6 +1113,9 @@ pub struct Observability {
     pub snapshot: Option<Arc<tui::SnapshotCell>>,
     /// Periodic HdrHistogram dump config. `None` disables dumping.
     pub latency_dump: Option<LatencyDump>,
+    /// Per-ingress status slots (D7). `None` only in tests that
+    /// exercise the loop without spawned ingresses.
+    pub ingress: Option<Arc<IngressStatusSet>>,
 }
 
 impl Observability {
@@ -969,6 +1124,12 @@ impl Observability {
     /// be chained.
     pub fn with_latency_dump(mut self, dump: Option<LatencyDump>) -> Self {
         self.latency_dump = dump;
+        self
+    }
+
+    /// Attach the per-ingress status slots (reader side). Boot-only.
+    pub fn with_ingress_statuses(mut self, set: Arc<IngressStatusSet>) -> Self {
+        self.ingress = Some(set);
         self
     }
 }
@@ -1018,10 +1179,82 @@ pub struct EngineCounters {
     /// Maximum tick age across every observed symbol (ns).
     /// Spikes here surface a silenced market.
     pub max_tick_age_ns: core_metrics::GaugeId,
-    /// Per-bucket tick-age gauges. Bucket index = `sym & (SYM_BUCKETS-1)`.
+    /// Per-bucket tick-age gauges. Bucket index =
+    /// `symbol_bucket_mix(sym) & (SYM_BUCKETS-1)` (§3.1).
     /// Operators can pinpoint which exact bucket went silent
     /// instead of only seeing the across-buckets max.
     pub tick_age_ns_per_bucket: [core_metrics::GaugeId; engine::SYM_BUCKETS],
+    /// §6.4 loss-accounting counters, Polymarket thread.
+    pub ingress_polymarket: IngressCounterIds,
+    /// §6.4 loss-accounting counters, Binance thread.
+    pub ingress_binance: IngressCounterIds,
+    /// §6.4 loss-accounting counters, RPC thread.
+    pub ingress_rpc: IngressCounterIds,
+}
+
+/// Registry counter handles for one ingress thread's §6.4 loss
+/// accounting (D4: `ring_drops` is the headline).
+#[derive(Copy, Clone, Debug)]
+pub struct IngressCounterIds {
+    /// Parsed messages.
+    pub msgs: core_metrics::CounterId,
+    /// Payload bytes received.
+    pub bytes: core_metrics::CounterId,
+    /// Parser rejections.
+    pub parse_errors: core_metrics::CounterId,
+    /// Sequence gaps.
+    pub gaps: core_metrics::CounterId,
+    /// Integrity-driven resubscribes.
+    pub resubscribes: core_metrics::CounterId,
+    /// Transport reconnects.
+    pub reconnects: core_metrics::CounterId,
+    /// Ring `try_push` failures (D4).
+    pub ring_drops: core_metrics::CounterId,
+}
+
+/// Last-mirrored cumulative values for one ingress — the registry
+/// wants monotonic increments, the status slot exposes cumulative
+/// totals; the delta lives here.
+#[derive(Copy, Clone, Debug, Default)]
+struct IngressCountersSnapshot {
+    msgs: u64,
+    bytes: u64,
+    parse_errors: u64,
+    gaps: u64,
+    resubscribes: u64,
+    reconnects: u64,
+    ring_drops: u64,
+}
+
+/// Mirror one ingress status slot into its registry counters as
+/// deltas since the previous publish tick. 5 s cadence — cold path.
+fn mirror_ingress_counters(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &IngressCounterIds,
+    st: &IngressStatus,
+    last: &mut IngressCountersSnapshot,
+) {
+    let cur = IngressCountersSnapshot {
+        msgs: st.msgs_total(),
+        bytes: st.bytes_total(),
+        parse_errors: st.parse_errors_total(),
+        gaps: st.gaps_total(),
+        resubscribes: st.resubscribes_total(),
+        reconnects: st.reconnects_total(),
+        ring_drops: st.ring_drops_total(),
+    };
+    reg.counter(ids.msgs).inc(cur.msgs.saturating_sub(last.msgs));
+    reg.counter(ids.bytes).inc(cur.bytes.saturating_sub(last.bytes));
+    reg.counter(ids.parse_errors)
+        .inc(cur.parse_errors.saturating_sub(last.parse_errors));
+    reg.counter(ids.gaps).inc(cur.gaps.saturating_sub(last.gaps));
+    reg.counter(ids.resubscribes)
+        .inc(cur.resubscribes.saturating_sub(last.resubscribes));
+    reg.counter(ids.reconnects)
+        .inc(cur.reconnects.saturating_sub(last.reconnects));
+    reg.counter(ids.ring_drops)
+        .inc(cur.ring_drops.saturating_sub(last.ring_drops));
+    *last = cur;
 }
 
 /// Generic engine loop: pass in any `OrderDispatch`. The `--live`
@@ -1071,22 +1304,18 @@ where
     S: strategy_core::Strategy,
     D: OrderDispatch,
 {
-    let mut cons = cons;
-    // The engine consumes Polymarket ticks, Binance ticks, RPC
-    // signals, and a fill ring. Fills are emitted only by the live
-    // dispatcher; we still need the consumer end so the type
-    // shape matches.
-    let fill_ring: Arc<Ring<Fill, FILL_RING_SIZE>> = Ring::new();
-    let (_fill_prod, fill_cons) = fill_ring.split();
-
-    let mut eng = Engine::new(
-        strat,
-        disp,
-        cons.polymarket_tick,
-        cons.binance_tick,
-        cons.rpc_signal,
-        fill_cons,
-    );
+    // Phase 8a lane engine: five tick lanes + one signal lane + four
+    // fill lanes. The signal lane is bound to the RPC ring — the D2
+    // disposition for Stage 1 (per §3.3; RSS retires in Stage 2 §8).
+    // Fills flow from the dispatcher pump (D3) until 8j wires the
+    // per-venue fill-lane producers.
+    let Consumers {
+        tick_lanes,
+        rpc_signal,
+        mut rss_signal,
+        fill_lanes,
+    } = cons;
+    let mut eng = Engine::new(strat, disp, tick_lanes, rpc_signal, fill_lanes);
     if let Err(e) = eng.start() {
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
@@ -1098,6 +1327,9 @@ where
     let mut last_ticks = 0u64;
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
+    // Last-mirrored snapshots for the §6.4 ingress counters
+    // (pm, bn, rpc) so registry counters get monotonic deltas.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 3];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -1108,9 +1340,9 @@ where
     while !shutdown_requested() {
         eng.tick(DRAIN_BATCH);
 
-        // RSS drain — cli-level only.
+        // RSS drain — cli-level only (Stage-2 retirement, §8.1).
         for _ in 0..DRAIN_BATCH {
-            if cons.rss_signal.try_pop().is_some() {
+            if rss_signal.try_pop().is_some() {
                 rss_seen_period += 1;
             } else {
                 break;
@@ -1161,17 +1393,33 @@ where
                 reg.gauge(ids.strategy_rule_tree)
                     .set(if kind == "rule-tree" { 1 } else { 0 });
 
-                // Per-ingress connection state — v1 heuristic:
-                // assume up if iterations is advancing (consumer
-                // is being driven). Phase 7 wires real per-thread
-                // status. RSS is "up" once we've drained at least
-                // one period of items.
-                let up = i64::from(eng.iterations > 0);
-                reg.gauge(ids.ingress_polymarket_state).set(up);
-                reg.gauge(ids.ingress_binance_state).set(up);
-                reg.gauge(ids.ingress_rpc_state).set(up);
-                reg.gauge(ids.ingress_rss_state)
-                    .set(i64::from(rss_seen_total > 0 || rss_seen_period > 0));
+                // Per-ingress connection state — real per-thread
+                // status slots (D7 fix). Gauge value = IngressState:
+                // 0=Down, 1=Connecting, 2=Up, 3=Backoff.
+                if let Some(ing) = obs.ingress.as_ref() {
+                    reg.gauge(ids.ingress_polymarket_state)
+                        .set(ing.polymarket.state() as i64);
+                    reg.gauge(ids.ingress_binance_state)
+                        .set(ing.binance.state() as i64);
+                    reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
+                    reg.gauge(ids.ingress_rss_state).set(ing.rss.state() as i64);
+                    // §6.4 loss accounting: mirror the per-thread
+                    // cumulative counters into the registry as
+                    // monotonic deltas (D4: ring_drops included).
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_polymarket,
+                        &ing.polymarket,
+                        &mut ingress_last[0],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_binance,
+                        &ing.binance,
+                        &mut ingress_last[1],
+                    );
+                    mirror_ingress_counters(reg, &ids.ingress_rpc, &ing.rpc, &mut ingress_last[2]);
+                }
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)
@@ -1225,9 +1473,18 @@ where
                 state.p99_ns[1] = eng.decide_p99_ns();
                 state.p50_ns[2] = eng.ack_p50_ns();
                 state.p99_ns[2] = eng.ack_p99_ns();
-                // Ingest health is best-effort for now: all four
-                // threads assumed up if iterations is advancing.
-                state.ingest_health = if eng.iterations > 0 { 0b1111 } else { 0 };
+                // Ingest health from the real status slots (D7):
+                // bit0 = polymarket, bit1 = binance, bit2 = rpc,
+                // bit3 = rss; bit set iff the thread is Up.
+                state.ingest_health = match obs.ingress.as_ref() {
+                    Some(ing) => {
+                        (u8::from(ing.polymarket.state() == IngressState::Up))
+                            | (u8::from(ing.binance.state() == IngressState::Up) << 1)
+                            | (u8::from(ing.rpc.state() == IngressState::Up) << 2)
+                            | (u8::from(ing.rss.state() == IngressState::Up) << 3)
+                    }
+                    None => 0,
+                };
                 cell.publish(state);
             }
 
@@ -1355,8 +1612,13 @@ fn new_poll() -> io::Result<(mio::Poll, mio::Events, mio::Token)> {
     Ok((poll, events, mio::Token(0)))
 }
 
-fn backoff() {
-    thread::sleep(RECONNECT_BACKOFF);
+/// Sleep for the next capped-exponential delay (D8). The schedule
+/// lives in the caller's per-thread [`Backoff`]; a healthy session
+/// resets it (see the spawn loops).
+fn sleep_backoff(b: &mut Backoff) {
+    let delay = Duration::from_nanos(b.next_delay_ns());
+    tracing::debug!(?delay, attempt = b.attempt(), "reconnect backoff");
+    thread::sleep(delay);
 }
 
 fn log_pin_outcome(thread_label: &str, core_id: usize) {
@@ -1389,13 +1651,43 @@ mod tests {
     /// large (~MB scale) so this also exercises the
     /// `Box::new_uninit()` + `addr_of_mut!` invariant from
     /// `core-ring`.
+    /// Split every ring in `Rings` into its producer/consumer
+    /// halves, dropping the producers (the "unspawned venue"
+    /// shape). Returns engine-ready `Consumers`.
+    fn split_all_consumers(rings: &Rings) -> Consumers {
+        let tick_lanes = {
+            let mut it = rings.tick.iter().map(|r| r.clone().split().1);
+            [
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+            ]
+        };
+        let fill_lanes = {
+            let mut it = rings.fill.iter().map(|r| r.clone().split().1);
+            [
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+            ]
+        };
+        Consumers {
+            tick_lanes,
+            rpc_signal: rings.rpc_signal.clone().split().1,
+            rss_signal: rings.rss_signal.clone().split().1,
+            fill_lanes,
+        }
+    }
+
     #[test]
     fn rings_allocate_and_split() {
         let rings = Rings::new();
-        let (_pt_p, _pt_c) = rings.polymarket_tick.split();
-        let (_bt_p, _bt_c) = rings.binance_tick.split();
-        let (_rpc_p, _rpc_c) = rings.rpc_signal.split();
-        let (_rss_p, _rss_c) = rings.rss_signal.split();
+        let cons = split_all_consumers(&rings);
+        assert_eq!(cons.tick_lanes.len(), NUM_TICK_LANES);
+        assert_eq!(cons.fill_lanes.len(), NUM_FILL_LANES);
     }
 
     #[test]
@@ -1403,18 +1695,21 @@ mod tests {
         let mut a = DrainCounters {
             polymarket_ticks: 1,
             binance_ticks: 2,
+            other_venue_ticks: 0,
             rpc_signals: 3,
             rss_signals: 4,
         };
         let b = DrainCounters {
             polymarket_ticks: 10,
             binance_ticks: 20,
+            other_venue_ticks: 5,
             rpc_signals: 30,
             rss_signals: 40,
         };
         a.add(&b);
         assert_eq!(a.polymarket_ticks, 11);
         assert_eq!(a.binance_ticks, 22);
+        assert_eq!(a.other_venue_ticks, 5);
         assert_eq!(a.rpc_signals, 33);
         assert_eq!(a.rss_signals, 44);
     }
@@ -1427,16 +1722,7 @@ mod tests {
         SHUTDOWN.store(false, Ordering::Release);
 
         let rings = Rings::new();
-        let (_p1, c1) = rings.polymarket_tick.split();
-        let (_p2, c2) = rings.binance_tick.split();
-        let (_p3, c3) = rings.rpc_signal.split();
-        let (_p4, c4) = rings.rss_signal.split();
-        let cons = Consumers {
-            polymarket_tick: c1,
-            binance_tick: c2,
-            rpc_signal: c3,
-            rss_signal: c4,
-        };
+        let cons = split_all_consumers(&rings);
 
         // Flip shutdown from a sibling thread after a brief delay,
         // then assert the drain loop returns.

@@ -26,7 +26,7 @@ use core_net::{
 };
 use core_parse::scan_price_1e6;
 use core_ring::Ring;
-use core_types::{Price, Qty, SymbolId, Tick};
+use core_types::{Price, Qty, SymbolId, Tick, VenueId};
 use ingress_binance::parse_book_ticker;
 use ingress_polymarket::run_loop::{
     drive_one, note_transport_ready, Driver, State, SymbolMap, DEFAULT_TICK_RING_CAP,
@@ -49,6 +49,7 @@ fn ring_push_pop_is_zero_alloc() {
     for i in 0..10_000u32 {
         let t = Tick::new(
             0,
+            VenueId::Polymarket,
             1,
             i + 1,
             Price::from_raw(500_000),
@@ -223,6 +224,10 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
 
     let mut driver = Driver::new(0xDEAD_BEEFu64);
     note_transport_ready(&mut driver, core_net::Status::Ready);
+    // Ingress health telemetry sink (Phase 8a). Its bumps are relaxed
+    // atomics and allocate nothing, but construct it outside the
+    // measurement window on principle: setup is never measured.
+    let status = core_metrics::IngressStatus::new();
     // Jump the driver straight to Steady via a round-trip through the
     // handshake so we exercise the production path during boot, not
     // the measurement window.
@@ -233,6 +238,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         b"/",
         &mut placeholder_producer(),
         &SymbolMap::from_pairs(std::iter::empty()),
+        &status,
     )
     .unwrap();
     // Drain the client's GET request so the test transport's outbound
@@ -267,6 +273,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         b"/",
         &mut prod,
         &symbol_map,
+        &status,
     )
     .unwrap();
     assert_eq!(driver.state(), State::Steady);
@@ -299,6 +306,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
             b"/",
             &mut prod,
             &symbol_map,
+            &status,
         )
         .unwrap();
 
@@ -345,12 +353,15 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let sym: SymbolId = 7;
     let mut driver = bwl::Driver::new(0xBA07u64, sym);
     bwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    // Health telemetry sink — relaxed atomics only; built outside
+    // the measurement window.
+    let status = core_metrics::IngressStatus::new();
 
     let ring: std::sync::Arc<Ring<Tick, { bwl::DEFAULT_TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
     // Send the client GET handshake.
-    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod).unwrap();
+    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -371,7 +382,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod).unwrap();
+    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
     assert_eq!(driver.state(), bwl::State::Steady);
 
     // Canned unmasked Text bookTicker frame.
@@ -391,7 +402,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     for _ in 0..1_000u32 {
         let written = transport.inject_incoming(&frame[..frame_len]);
         assert_eq!(written, frame_len);
-        bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod).unwrap();
+        bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
         let t = cons.try_pop().expect("tick should be produced");
         acc = acc.wrapping_add(t.bid_px.raw());
     }
@@ -418,12 +429,15 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     let mut transport = TestTransport::with_capacity(128 * 1024);
     let mut driver = rwl::Driver::new(0xCAFEu64);
     rwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    // Health telemetry sink — relaxed atomics only; built outside
+    // the measurement window.
+    let status = core_metrics::IngressStatus::new();
 
     let ring: std::sync::Arc<Ring<core_types::Signal, { rwl::DEFAULT_SIGNAL_RING_CAP }>> =
         Ring::new();
     let (mut prod, mut cons) = ring.split();
 
-    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod).unwrap();
+    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -443,7 +457,7 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod).unwrap();
+    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
     assert_eq!(driver.state(), rwl::State::Steady);
     // Drain subscribe request so the tx buffer stays cursor=0.
     let _ = transport.drain_outgoing(&mut scratch);
@@ -477,7 +491,7 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     for _ in 0..1_000u32 {
         let written = transport.inject_incoming(&frame[..frame_len]);
         assert_eq!(written, frame_len);
-        rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod).unwrap();
+        rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status).unwrap();
         // Drain the Signal so the ring doesn't fill.
         if let Some(s) = cons.try_pop() {
             acc = acc.wrapping_add(u64::from_le_bytes(s.payload[0..8].try_into().unwrap()));
@@ -549,6 +563,7 @@ fn multi_book_apply_is_zero_alloc() {
     let tick = |sym: SymbolId, seq: u32| -> Tick {
         Tick::new(
             0,
+            VenueId::Polymarket,
             sym,
             seq,
             Price::from_raw(500_000),
@@ -613,6 +628,7 @@ fn latency_arb_on_tick_is_zero_alloc() {
     // Prime the Binance reference mid.
     let bn_tick = Tick::new(
         0,
+        VenueId::Binance,
         200,
         1,
         Price::from_raw(499_000),
@@ -624,6 +640,7 @@ fn latency_arb_on_tick_is_zero_alloc() {
     // Prime the PM book.
     let pm_tick = Tick::new(
         0,
+        VenueId::Polymarket,
         100,
         1,
         Price::from_raw(599_000),
@@ -641,6 +658,7 @@ fn latency_arb_on_tick_is_zero_alloc() {
         let t = if i % 2 == 0 {
             Tick::new(
                 0,
+                VenueId::Polymarket,
                 100,
                 2 + i,
                 Price::from_raw(599_000),
@@ -651,6 +669,7 @@ fn latency_arb_on_tick_is_zero_alloc() {
         } else {
             Tick::new(
                 0,
+                VenueId::Binance,
                 200,
                 2 + i,
                 Price::from_raw(499_000),
@@ -901,6 +920,7 @@ fn ev_strategy_on_tick_is_zero_alloc() {
     // Prime by feeding one tick.
     let prime = Tick::new(
         0,
+        VenueId::Polymarket,
         PM,
         1,
         Price::from_raw(690_000),
@@ -914,6 +934,7 @@ fn ev_strategy_on_tick_is_zero_alloc() {
     for i in 0..10_000u32 {
         let t = Tick::new(
             0,
+            VenueId::Polymarket,
             PM,
             2 + i,
             Price::from_raw(690_000),
@@ -968,6 +989,7 @@ fn cross_arb_on_tick_is_zero_alloc() {
         s.on_tick(
             &Tick::new(
                 0,
+                VenueId::Polymarket,
                 sym,
                 1,
                 Price::from_raw(333_330),
@@ -988,6 +1010,7 @@ fn cross_arb_on_tick_is_zero_alloc() {
         };
         let t = Tick::new(
             0,
+            VenueId::Polymarket,
             sym,
             2 + i,
             Price::from_raw(333_330),
@@ -1055,6 +1078,7 @@ fn rule_tree_on_signal_is_zero_alloc() {
     s.on_tick(
         &Tick::new(
             0,
+            VenueId::Polymarket,
             42,
             1,
             Price::from_raw(290_000),
@@ -1094,8 +1118,15 @@ fn rule_tree_on_signal_is_zero_alloc() {
 #[test]
 fn engine_tick_with_latency_record_is_zero_alloc() {
     use clob_dispatcher::PaperDispatcher;
-    use engine::{Engine, BN_TICK_RING_SIZE, FILL_RING_SIZE, PM_TICK_RING_SIZE, SIGNAL_RING_SIZE};
+    use engine::{
+        Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
+    };
     use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+
+    // The lane arrays below are written out for the Phase 8a
+    // geometry (five tick lanes in VenueId order, four fill lanes);
+    // break the build loudly if that drifts.
+    const _: () = assert!(NUM_TICK_LANES == 5 && NUM_FILL_LANES == 4);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1116,23 +1147,36 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // unused inside this test fixture.
     let _ = std::marker::PhantomData::<SubmitErr>;
 
-    let pm: std::sync::Arc<Ring<Tick, PM_TICK_RING_SIZE>> = Ring::new();
-    let bn: std::sync::Arc<Ring<Tick, BN_TICK_RING_SIZE>> = Ring::new();
-    let sig: std::sync::Arc<Ring<core_types::Signal, SIGNAL_RING_SIZE>> = Ring::new();
-    let fill: std::sync::Arc<Ring<core_types::Fill, FILL_RING_SIZE>> = Ring::new();
+    // Phase 8a lane arrays: five tick lanes (VenueId order:
+    // Polymarket, Binance, OKX, Deribit, Hyperliquid) + four fill
+    // lanes. Only lane 0 (Polymarket) gets a live producer here;
+    // the unused producer halves stay alive until end of scope, and
+    // their lanes simply read empty every iteration.
+    let (mut pm_p, t0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t1p, t1) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t2p, t2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
+    let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
 
-    let (mut pm_p, pm_c) = pm.split();
-    let (_bn_p, bn_c) = bn.split();
-    let (_sp, sc) = sig.split();
-    let (_fp, fc) = fill.split();
-
-    let mut eng = Engine::new(NoopStrat, PaperDispatcher::new(), pm_c, bn_c, sc, fc);
+    let mut eng = Engine::new(
+        NoopStrat,
+        PaperDispatcher::new(),
+        [t0, t1, t2, t3, t4],
+        sc,
+        [f0, f1, f2, f3],
+    );
     eng.start().unwrap();
 
     // Prime + drain a few ticks outside the measurement window.
     for i in 0..16u32 {
         pm_p.try_push(Tick::new(
             i as u64,
+            VenueId::Polymarket,
             1,
             i + 1,
             Price::from_raw(0),
@@ -1150,6 +1194,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         // Push one tick + drain one.
         pm_p.try_push(Tick::new(
             (i as u64) * 1000,
+            VenueId::Polymarket,
             1,
             i + 100,
             Price::from_raw(0),
@@ -1223,6 +1268,7 @@ fn queued_dispatcher_worker_drain_is_zero_alloc() {
     // least one cycle before we open the AllocGuard.
     let o = Order::new(
         0,
+        VenueId::Polymarket,
         1,
         Side::Bid,
         0,
@@ -1242,6 +1288,7 @@ fn queued_dispatcher_worker_drain_is_zero_alloc() {
     for i in 0..1000u64 {
         let o = Order::new(
             0,
+            VenueId::Polymarket,
             1,
             Side::Bid,
             0,

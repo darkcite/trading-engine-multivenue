@@ -5,9 +5,9 @@
 //! caller-owned buffer and parse the server's `101 Switching Protocols`
 //! response out of a caller-owned buffer.
 //!
-//! Everything that could require a heap (SHA-1, base64) is inlined
-//! against stack memory. The module has no dependencies beyond `core`
-//! and the parent crate's ws_frame types.
+//! Everything that could require a heap works against stack memory:
+//! SHA-1 is inlined here (RFC-6455-only primitive), base64 comes from
+//! `core-crypto` (shared with OKX login signing since Phase 8a).
 //!
 //! ## Scope
 //!
@@ -26,6 +26,8 @@
 //! We use a constant-time compare for the accept check so a malicious
 //! server cannot time-oracle the key out of us, even though the key
 //! has no secrecy value.
+
+use core_crypto::base64_encode as b64_encode;
 
 // ---------------------------------------------------------------
 // Errors
@@ -244,55 +246,10 @@ fn sha1_concat(a: &[u8], b: &[u8]) -> [u8; 20] {
     s.finalize()
 }
 
-// ---------------------------------------------------------------
-// Base64 (RFC 4648, standard alphabet)
-// ---------------------------------------------------------------
-
-const B64_ALPHA: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Encode `input` into `dst`, returning the number of bytes written.
-/// `dst` must be at least `((input.len() + 2) / 3) * 4` bytes. Pads
-/// with `'='` to a multiple of 4.
-///
-/// Zero-alloc.
-#[inline]
-fn b64_encode(input: &[u8], dst: &mut [u8]) -> usize {
-    let mut i = 0usize;
-    let mut o = 0usize;
-    while i + 3 <= input.len() {
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
-        let b2 = input[i + 2] as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
-        dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
-        dst[o + 2] = B64_ALPHA[((n >> 6) & 0x3F) as usize];
-        dst[o + 3] = B64_ALPHA[(n & 0x3F) as usize];
-        i += 3;
-        o += 4;
-    }
-    let rem = input.len() - i;
-    if rem == 1 {
-        let b0 = input[i] as u32;
-        let n = b0 << 16;
-        dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
-        dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
-        dst[o + 2] = b'=';
-        dst[o + 3] = b'=';
-        o += 4;
-    } else if rem == 2 {
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
-        let n = (b0 << 16) | (b1 << 8);
-        dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
-        dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
-        dst[o + 2] = B64_ALPHA[((n >> 6) & 0x3F) as usize];
-        dst[o + 3] = b'=';
-        o += 4;
-    }
-    o
-}
+// Base64 (RFC 4648, standard alphabet) is provided by `core-crypto`
+// — imported as `b64_encode` at the top of this module. Extracted in
+// Phase 8a so OKX login signing and the WS handshake share one
+// implementation.
 
 // ---------------------------------------------------------------
 // Key generation + accept value
@@ -370,8 +327,25 @@ pub fn write_client_handshake(
     path: &[u8],
     sec_key: &[u8; 24],
 ) -> Result<usize, HandshakeErr> {
+    write_client_handshake_with_headers(dst, host, path, sec_key, &[])
+}
+
+/// [`write_client_handshake`] plus caller-supplied extra headers,
+/// written verbatim as `name: value\r\n` lines before the final
+/// CRLF. Needed by header-auth venues (Phase 8a §3.4). The caller
+/// owns header-name/value validity (no CR/LF injection — inputs are
+/// compile-time literals or `.env`-sourced credentials, asserted in
+/// debug).
+pub fn write_client_handshake_with_headers(
+    dst: &mut [u8],
+    host: &[u8],
+    path: &[u8],
+    sec_key: &[u8; 24],
+    extra: &[(&[u8], &[u8])],
+) -> Result<usize, HandshakeErr> {
     // Minimum width: 4 + path + 9 + 2 + 6 + host + 2 + 19 + 2 + 19 + 2
-    //              + 18 + 24 + 2 + 22 + 2 + 2 (final CRLF)
+    //              + 18 + 24 + 2 + 22 + 2 + per-header (k + 2 + v + 2)
+    //              + 2 (final CRLF)
     // Compute cheaply via running cursor.
     let mut o = 0usize;
 
@@ -387,8 +361,34 @@ pub fn write_client_handshake(
     write_slice(dst, &mut o, sec_key)?;
     write_slice(dst, &mut o, b"\r\n")?;
     write_slice(dst, &mut o, b"Sec-WebSocket-Version: 13\r\n")?;
+    let mut i = 0;
+    while i < extra.len() {
+        let (name, value) = extra[i];
+        debug_assert!(
+            !contains_crlf(name) && !contains_crlf(value),
+            "header injection: extra headers must not contain CR/LF"
+        );
+        write_slice(dst, &mut o, name)?;
+        write_slice(dst, &mut o, b": ")?;
+        write_slice(dst, &mut o, value)?;
+        write_slice(dst, &mut o, b"\r\n")?;
+        i += 1;
+    }
     write_slice(dst, &mut o, b"\r\n")?;
     Ok(o)
+}
+
+/// CR/LF scan for the debug-build injection assert above.
+#[inline]
+fn contains_crlf(s: &[u8]) -> bool {
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'\r' || s[i] == b'\n' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 #[inline]
@@ -702,6 +702,47 @@ mod tests {
             let n = b64_encode(input, &mut buf);
             assert_eq!(&buf[..n], *want, "input={input:?}");
         }
+    }
+
+    #[test]
+    fn with_headers_appends_extra_before_final_crlf() {
+        let mut buf = [0u8; 512];
+        let key = sec_websocket_key_from_seed(42);
+        let n = write_client_handshake_with_headers(
+            &mut buf,
+            b"ws.okx.com",
+            b"/ws/v5/public",
+            &key,
+            &[(b"OK-ACCESS-KEY", b"abc123"), (b"X-Custom", b"1")],
+        )
+        .unwrap();
+        let body = &buf[..n];
+        assert!(body.ends_with(b"\r\n\r\n"));
+        let text = core::str::from_utf8(body).unwrap();
+        assert!(text.contains("OK-ACCESS-KEY: abc123\r\n"));
+        assert!(text.contains("X-Custom: 1\r\n"));
+        // Extra headers must precede the terminating blank line.
+        let blank = text.find("\r\n\r\n").unwrap();
+        assert!(text.find("OK-ACCESS-KEY").unwrap() < blank);
+        // Empty extra slice must produce byte-identical output to the
+        // plain writer.
+        let mut plain = [0u8; 512];
+        let m = write_client_handshake(&mut plain, b"ws.okx.com", b"/ws/v5/public", &key).unwrap();
+        let mut with_none = [0u8; 512];
+        let k =
+            write_client_handshake_with_headers(&mut with_none, b"ws.okx.com", b"/ws/v5/public", &key, &[])
+                .unwrap();
+        assert_eq!(&plain[..m], &with_none[..k]);
+    }
+
+    #[test]
+    fn with_headers_propagates_buffer_too_small() {
+        let mut tiny = [0u8; 32];
+        let key = sec_websocket_key_from_seed(1);
+        assert_eq!(
+            write_client_handshake_with_headers(&mut tiny, b"h", b"/", &key, &[(b"A", b"B")]),
+            Err(HandshakeErr::BufferTooSmall)
+        );
     }
 
     #[test]

@@ -298,13 +298,14 @@ impl OrderDispatch for PaperDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{Price, Qty, Side};
+    use core_types::{Price, Qty, Side, VenueId};
 
     #[test]
     fn paper_dispatcher_counts_submissions() {
         let mut d = PaperDispatcher::new();
         let o = Order::new(
             0,
+            VenueId::Polymarket,
             1,
             Side::Bid,
             0,

@@ -41,7 +41,7 @@
 
 use book_builder::{BookErr, MultiBook};
 use core_time::NsTs;
-use core_types::{Fill, Order, Price, Qty, Side, Signal, SymbolId, Tick, SYMBOL_ID_NONE};
+use core_types::{Fill, Order, Price, Qty, Side, Signal, SymbolId, Tick, VenueId, SYMBOL_ID_NONE};
 use research_artifacts::{Rule, RulesTable};
 use strategy_core::{CooldownGate, Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
@@ -306,6 +306,7 @@ impl<const N: usize> Strategy for RuleTree<N> {
             };
             let order = Order::new(
                 now,
+                VenueId::Polymarket,
                 slot.sym,
                 side,
                 ORDER_KIND_POST_ONLY,
@@ -422,6 +423,7 @@ mod tests {
     fn mk_tick(sym: SymbolId, bid: i64, ask: i64) -> Tick {
         Tick::new(
             0,
+            VenueId::Polymarket,
             sym,
             1,
             Price::from_raw(bid),

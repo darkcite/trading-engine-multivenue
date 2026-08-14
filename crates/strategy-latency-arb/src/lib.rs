@@ -46,7 +46,7 @@
 
 use book_builder::MultiBook;
 use core_time::NsTs;
-use core_types::{Fill, Order, Price, Qty, Side, Signal, SymbolId, Tick, SYMBOL_ID_NONE};
+use core_types::{Fill, Order, Price, Qty, Side, Signal, SymbolId, Tick, VenueId, SYMBOL_ID_NONE};
 use strategy_core::{CooldownGate, Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
 // ---------------------------------------------------------------
@@ -386,6 +386,7 @@ impl<const N: usize> LatencyArb<N> {
         let side = if delta > 0 { Side::Ask } else { Side::Bid };
         let order = Order::new(
             now,
+            VenueId::Polymarket,
             pm,
             side,
             ORDER_KIND_POST_ONLY,
@@ -542,6 +543,7 @@ mod tests {
     fn mk_tick(sym: SymbolId, bid: i64, ask: i64) -> Tick {
         Tick::new(
             0,
+            VenueId::Polymarket,
             sym,
             1,
             Price::from_raw(bid),

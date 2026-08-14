@@ -97,6 +97,7 @@ pub struct PmlrReader<R: AsBytes> {
     fd: libc::c_int,
     slot_kind: SlotKind,
     epoch_ns: u64,
+    version: u16,
     record_count: usize,
     _marker: PhantomData<R>,
 }
@@ -222,6 +223,7 @@ impl<R: AsBytes> PmlrReader<R> {
             ptr,
             len,
             fd,
+            version: ver,
             slot_kind,
             epoch_ns,
             record_count: payload_len / SLOT_SIZE,
@@ -233,6 +235,15 @@ impl<R: AsBytes> PmlrReader<R> {
     #[inline]
     pub fn slot_kind(&self) -> SlotKind {
         self.slot_kind
+    }
+
+    /// PMLR header version of the opened file. v1 files are readable
+    /// but venue-less (`Tick.venue`/`Order.venue` bytes fall inside
+    /// what v1 wrote as undefined implicit padding — consumers must
+    /// treat them as garbage when `version() == 1`).
+    #[inline]
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     /// Wall-clock epoch (ns) written at file creation.
@@ -335,7 +346,7 @@ unsafe impl<R: AsBytes + Sync> Sync for PmlrReader<R> {}
 mod tests {
     use super::*;
     use crate::PmlrWriter;
-    use core_types::{LatencyClass, NsTs, Price, Qty, Signal, SignalSource, Tick};
+    use core_types::{LatencyClass, NsTs, Price, Qty, Signal, SignalSource, Tick, VenueId};
 
     fn unique_path(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir();
@@ -357,6 +368,7 @@ mod tests {
         let mut w = PmlrWriter::open(&p, SlotKind::Tick, 0xDEADBEEF).unwrap();
         let t1 = Tick::new(
             1_000 as NsTs,
+            VenueId::Polymarket,
             7,
             42,
             Price::from_raw(500_000),
@@ -366,6 +378,7 @@ mod tests {
         );
         let t2 = Tick::new(
             2_000 as NsTs,
+            VenueId::Polymarket,
             7,
             43,
             Price::from_raw(505_000),
