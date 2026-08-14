@@ -1,4 +1,4 @@
-//! # polymarket-engine — main entrypoint
+//! # multivenue-engine — main entrypoint
 //!
 //! Thin dispatch shim. All orchestration logic lives in the `cli`
 //! library so that it can be unit-tested without spawning a real
@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 /// Top-level CLI.
 #[derive(Debug, Parser)]
-#[command(name = "polymarket-engine", version)]
+#[command(name = "multivenue-engine", version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -122,7 +122,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 0u64)]
     latency_dump_secs: u64,
     /// Destination directory for HdrHistogram dumps. Defaults to
-    /// `<POLYMARKET_LOG_DIR>/latency`. Only consulted when
+    /// `<MULTIVENUE_LOG_DIR>/latency`. Only consulted when
     /// `--latency-dump-secs` is non-zero.
     #[arg(long)]
     latency_dump_dir: Option<PathBuf>,
@@ -378,7 +378,7 @@ fn run(args: RunArgs) -> ExitCode {
     };
     // Resolve latency-dump destination. Defaults to
     // `<cfg.log_dir>/latency` so an operator who already set
-    // `POLYMARKET_LOG_DIR` doesn't need a second flag.
+    // `MULTIVENUE_LOG_DIR` doesn't need a second flag.
     let latency_dump_dir = args
         .latency_dump_dir
         .clone()

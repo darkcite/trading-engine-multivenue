@@ -63,8 +63,8 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
 #[test]
 fn metrics_endpoint_returns_registered_counters() {
     let mut reg = MetricsRegistry::new();
-    let ticks = reg.register_counter("polymarket_ticks_total").unwrap();
-    let mid = reg.register_gauge("polymarket_book_mid").unwrap();
+    let ticks = reg.register_counter("engine_ticks_total").unwrap();
+    let mid = reg.register_gauge("engine_book_mid").unwrap();
     let reg = Arc::new(reg);
     reg.counter(ticks).inc(42);
     reg.gauge(mid).set(500_000);
@@ -76,11 +76,11 @@ fn metrics_endpoint_returns_registered_counters() {
 
     assert_eq!(status, 200);
     assert!(
-        body.contains("polymarket_ticks_total 42"),
+        body.contains("engine_ticks_total 42"),
         "missing ticks counter; body={body}"
     );
     assert!(
-        body.contains("polymarket_book_mid 500000"),
+        body.contains("engine_book_mid 500000"),
         "missing mid gauge; body={body}"
     );
 }

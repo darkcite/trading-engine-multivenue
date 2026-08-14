@@ -1,4 +1,4 @@
-# AGENTS.md — Polymarket Latency-Arb Engine
+# AGENTS.md — Multivenue Trading Engine
 
 Tool-agnostic brief for any AI coding agent (Claude, Cursor, Codex, etc.) working in this repository. If you are Claude, also read `CLAUDE.md` for the richer context.
 

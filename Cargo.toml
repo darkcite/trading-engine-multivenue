@@ -60,7 +60,7 @@ edition      = "2021"
 rust-version = "1.83"
 license      = "Apache-2.0"
 publish      = false
-authors      = ["Polymarket Latency-Arb Team"]
+authors      = ["Multivenue Trading Engine Team"]
 
 [workspace.dependencies]
 # --- allocation / zero-alloc infra ---

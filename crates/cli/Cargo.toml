@@ -12,8 +12,8 @@ description  = "Main binary. Parses CLI args, loads config via core-config, wire
 path = "src/lib.rs"
 
 [[bin]]
-name = "polymarket-engine"
-path = "src/bin/polymarket-engine.rs"
+name = "multivenue-engine"
+path = "src/bin/multivenue-engine.rs"
 
 [dependencies]
 core-config          = { workspace = true }

@@ -275,7 +275,7 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &Da
         )),
     ];
     let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" polymarket-engine "));
+        .block(Block::default().borders(Borders::ALL).title(" multivenue-engine "));
     f.render_widget(p, area);
 }
 

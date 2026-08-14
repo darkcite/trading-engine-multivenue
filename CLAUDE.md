@@ -1,4 +1,4 @@
-# CLAUDE.md — Polymarket Latency-Arb Engine
+# CLAUDE.md — Multivenue Trading Engine
 
 This file front-loads context for any Claude session working in this repo. Read `PLAN.md` for the full architecture.
 
@@ -36,7 +36,7 @@ cargo bench --workspace
 cd claude-worker && uv run pytest
 
 # start the engine locally (paper mode)
-cargo run --release -p cli -- run --config ~/polymarket/config.toml --paper
+cargo run --release -p cli -- run --config ~/multivenue/config.toml --paper
 ```
 
 ## Hard architectural rules (do not violate — the build will fail if you do)

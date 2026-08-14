@@ -34,7 +34,7 @@ claude-worker/*.egg-info/
 claude-worker/uv.lock.bak
 
 # --- runtime data ---
-~/polymarket/
+~/multivenue/
 logs/
 *.log
 *.hgrm

@@ -55,4 +55,4 @@ Each entry is atomic: one version bump per section. Do not batch.
 
 **Rollback**
 
-- Remove `~/polymarket/replay/` and `~/polymarket/artifacts/`.
+- Remove `~/multivenue/replay/` and `~/multivenue/artifacts/`.

@@ -25,7 +25,7 @@ latency, and can't tell when a market disconnects.
   * `LatencyTracker<const N: usize>` — fixed-capacity HdrHistogram-
     style buckets (log-linear) for per-stage latency. Zero-alloc
     record path.
-  * Periodic dump to `~/polymarket/logs/latency/*.hgrm` (textual,
+  * Periodic dump to `~/multivenue/logs/latency/*.hgrm` (textual,
     not the real HDR binary format — much simpler to read).
 * `crates/tui` — promote from stub:
   * `DashboardState` extended with per-symbol top-of-book + recent
@@ -114,7 +114,7 @@ pub fn serve_metrics(addr: SocketAddr, registry: Arc<MetricsRegistry>, stop: &At
 Boot pattern from the cli:
 ```rust
 let metrics = Arc::new(MetricsRegistry::new());
-let pm_ticks_id = metrics.register_counter("polymarket_ticks_total")?;
+let pm_ticks_id = metrics.register_counter("engine_ticks_total")?;
 // ...
 thread::spawn(move || serve_metrics("127.0.0.1:9191".parse()?, metrics, &SHUTDOWN));
 ```

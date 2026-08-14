@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "description": "Claude Code settings for the Polymarket latency-arb engine. Enforces model routing, permissions, and hook scripts that match CLAUDE.md's hard rules.",
+  "description": "Claude Code settings for the multivenue trading engine. Enforces model routing, permissions, and hook scripts that match CLAUDE.md's hard rules.",
 
   "model": "claude-opus-4-6",
 
@@ -68,7 +68,7 @@
 
   "statusLine": {
     "type": "static",
-    "value": "polymarket-arb • opus-4-6"
+    "value": "multivenue • opus-4-6"
   },
 
   "outputStyle": "default",

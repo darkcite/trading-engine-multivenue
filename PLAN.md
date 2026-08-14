@@ -1,4 +1,4 @@
-# Polymarket Latency-Arbitrage Engine — Architecture & Plan
+# Multivenue Trading Engine — Architecture & Plan
 
 **Version:** 0.5 (`.env` secrets, no observability stack, testing pyramid added)
 **Author:** Anton
@@ -166,7 +166,7 @@ These gaps are expected; the point of v1 is to prove strategy logic, not latency
 |                              +---------------------------------+ |
 |                                                                  |
 |  [replay_writer] SPSC byte ring -> pwrite() on dedicated thread  |
-|                  -> ~/polymarket/replay/ on internal SSD         |
+|                  -> ~/multivenue/replay/ on internal SSD         |
 |  [metrics] HdrHistogram snapshotted each 1 s -> localhost Prom   |
 |  [research_bridge] UDS -> claude_worker (separate process)       |
 +------------------------------------------------------------------+
@@ -345,7 +345,7 @@ Multiple strategies = multiple monomorphized `Engine<_>` instances, one per best
 - **Data API / subgraph** — backtests only, cold path.
 
 ### 7.2 Signer key and all other secrets — `.env` file
-All secrets live in a single `.env` file at the project root (and a deployment-time copy at `~/polymarket/.env`). `chmod 600`, owner-only, git-ignored. The `.env.example` is committed with placeholder values.
+All secrets live in a single `.env` file at the project root (and a deployment-time copy at `~/multivenue/.env`). `chmod 600`, owner-only, git-ignored. The `.env.example` is committed with placeholder values.
 
 `.env.example`:
 ```
@@ -359,10 +359,10 @@ QUICKNODE_API_KEY=CHANGEME
 BINANCE_API_KEY=                  # optional; leave blank for public streams
 
 # Runtime config
-POLYMARKET_REPLAY_DIR=/Users/anton/polymarket/replay
-POLYMARKET_ARTIFACTS_DIR=/Users/anton/polymarket/artifacts
-POLYMARKET_CACHE_DIR=/Users/anton/polymarket/cache
-POLYMARKET_LOG_DIR=/Users/anton/Library/Logs/polymarket
+MULTIVENUE_REPLAY_DIR=/Users/anton/multivenue/replay
+MULTIVENUE_ARTIFACTS_DIR=/Users/anton/multivenue/artifacts
+MULTIVENUE_CACHE_DIR=/Users/anton/multivenue/cache
+MULTIVENUE_LOG_DIR=/Users/anton/Library/Logs/polymarket
 ```
 
 At boot, the `core-config` crate loads `.env` via `dotenvy` into the process environment, then reads typed values:
@@ -643,7 +643,7 @@ All of these are abstracted behind traits in `core-io`, `core-time`, etc., so th
 - Target ambient: cool room; thermal throttling shows up in latency histograms.
 
 ### 11.6 Secrets in dev == prod
-- Single `.env` file at the project root during dev and at `~/polymarket/.env` for the deployed binary.
+- Single `.env` file at the project root during dev and at `~/multivenue/.env` for the deployed binary.
 - `chmod 600 .env`.
 - `.env` is in `.gitignore`; `.env.example` (placeholders only) **is** committed.
 - No Keychain, no KMS, no Vault, no 1Password CLI hook. One file, owner-read, loaded by `dotenvy` at boot.
@@ -655,12 +655,12 @@ All of these are abstracted behind traits in `core-io`, `core-time`, etc., so th
 ### 12.1 File layout on disk
 | Path | Size cap | Purpose |
 |---|---|---|
-| `~/polymarket/bin/` | <100 MB | release binary |
-| `~/polymarket/.env` | <4 KB | secrets, `chmod 600` |
-| `~/polymarket/config.toml` | <4 KB | non-secret runtime config (strategy caps, feed URLs) |
-| `~/polymarket/replay/` | 50 GB | binary replay log, rolled hourly, retention 7 days |
-| `~/polymarket/artifacts/` | 5 GB | Claude-generated JSON |
-| `~/polymarket/cache/` | 5 GB | SQLite prompt cache, gamma snapshots |
+| `~/multivenue/bin/` | <100 MB | release binary |
+| `~/multivenue/.env` | <4 KB | secrets, `chmod 600` |
+| `~/multivenue/config.toml` | <4 KB | non-secret runtime config (strategy caps, feed URLs) |
+| `~/multivenue/replay/` | 50 GB | binary replay log, rolled hourly, retention 7 days |
+| `~/multivenue/artifacts/` | 5 GB | Claude-generated JSON |
+| `~/multivenue/cache/` | 5 GB | SQLite prompt cache, gamma snapshots |
 | `~/Library/Logs/polymarket/` | 1 GB | log files (HdrHistogram dumps, events) |
 | project repo (Rust + Python) | 10–20 GB | source + `target/` |
 
@@ -677,10 +677,10 @@ Total footprint: **~70–80 GB**. Fits comfortably on 500 GB SSD.
     <key>Label</key>                 <string>com.polymarket.engine</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/anton/polymarket/bin/polymarket-cli</string>
+        <string>/Users/anton/multivenue/bin/polymarket-cli</string>
         <string>run</string>
         <string>--config</string>
-        <string>/Users/anton/polymarket/config.toml</string>
+        <string>/Users/anton/multivenue/config.toml</string>
     </array>
     <key>RunAtLoad</key>             <true/>
     <key>KeepAlive</key>
@@ -700,7 +700,7 @@ Total footprint: **~70–80 GB**. Fits comfortably on 500 GB SSD.
 </plist>
 ```
 
-The binary itself calls `dotenvy::dotenv()` at startup to load `/Users/anton/polymarket/.env` into the process environment — no shell wrapper, no `envsubst`, no `direnv` integration needed.
+The binary itself calls `dotenvy::dotenv()` at startup to load `/Users/anton/multivenue/.env` into the process environment — no shell wrapper, no `envsubst`, no `direnv` integration needed.
 
 Load: `launchctl load -w ~/Library/LaunchAgents/com.polymarket.engine.plist`.
 A second plist starts `claude-worker` similarly.
@@ -781,7 +781,7 @@ Unchanged:
 - `ingress-binance`, `ingress-rss`, `ingress-rpc` (Alchemy + QuickNode failover).
 - `claude-worker/topic_tagger.py` (Haiku) + `rule_parser.py` (Sonnet) producing artifacts for ~500 markets.
 - `strategy-latency-arb` in paper mode (writes would-be orders to replay log).
-- TUI (`ratatui`) live dashboard wired up; HdrHistogram dumps to `~/polymarket/logs/latency/*.hgrm`; `/metrics` endpoint on `127.0.0.1:9191` exposing counters in Prometheus text format (no scraper consuming it).
+- TUI (`ratatui`) live dashboard wired up; HdrHistogram dumps to `~/multivenue/logs/latency/*.hgrm`; `/metrics` endpoint on `127.0.0.1:9191` exposing counters in Prometheus text format (no scraper consuming it).
 
 ### Phase 2 — Tiny live trading on Mac (2 weeks)
 - `signer-eip712`, `clob-dispatcher`.

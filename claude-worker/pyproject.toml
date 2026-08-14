@@ -1,7 +1,7 @@
 [project]
 name            = "claude-worker"
 version         = "0.1.0"
-description     = "Offline Claude strategy researcher for Polymarket latency-arb engine"
+description     = "Offline Claude strategy researcher for multivenue trading engine"
 readme          = "README.md"
 requires-python = ">=3.12"
 license         = { text = "Apache-2.0" }

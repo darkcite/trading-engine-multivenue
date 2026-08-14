@@ -222,10 +222,10 @@ impl MetricsRegistry {
     ///
     /// Prometheus shape:
     /// ```text
-    /// # TYPE polymarket_ticks_total counter
-    /// polymarket_ticks_total 12345
-    /// # TYPE polymarket_book_mid gauge
-    /// polymarket_book_mid 500000
+    /// # TYPE engine_ticks_total counter
+    /// engine_ticks_total 12345
+    /// # TYPE engine_book_mid gauge
+    /// engine_book_mid 500000
     /// ```
     pub fn encode_prometheus(&self, dst: &mut [u8]) -> Result<usize, EncodeErr> {
         let mut c = Cursor::new(dst);
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn register_counter_then_inc_and_read() {
         let mut r = MetricsRegistry::new();
-        let id = r.register_counter("polymarket_ticks_total").unwrap();
+        let id = r.register_counter("engine_ticks_total").unwrap();
         r.counter(id).inc(3);
         r.counter(id).inc(2);
         assert_eq!(r.counter(id).get(), 5);
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn register_gauge_then_set_and_read() {
         let mut r = MetricsRegistry::new();
-        let id = r.register_gauge("polymarket_book_mid").unwrap();
+        let id = r.register_gauge("engine_book_mid").unwrap();
         r.gauge(id).set(-42);
         assert_eq!(r.gauge(id).get(), -42);
     }
@@ -370,18 +370,18 @@ mod tests {
     #[test]
     fn encode_prometheus_emits_canonical_format() {
         let mut r = MetricsRegistry::new();
-        let c = r.register_counter("polymarket_ticks_total").unwrap();
-        let g = r.register_gauge("polymarket_book_mid").unwrap();
+        let c = r.register_counter("engine_ticks_total").unwrap();
+        let g = r.register_gauge("engine_book_mid").unwrap();
         r.counter(c).inc(42);
         r.gauge(g).set(500_000);
 
         let mut buf = [0u8; 4096];
         let n = r.encode_prometheus(&mut buf).unwrap();
         let s = std::str::from_utf8(&buf[..n]).unwrap();
-        assert!(s.contains("# TYPE polymarket_ticks_total counter\n"));
-        assert!(s.contains("polymarket_ticks_total 42\n"));
-        assert!(s.contains("# TYPE polymarket_book_mid gauge\n"));
-        assert!(s.contains("polymarket_book_mid 500000\n"));
+        assert!(s.contains("# TYPE engine_ticks_total counter\n"));
+        assert!(s.contains("engine_ticks_total 42\n"));
+        assert!(s.contains("# TYPE engine_book_mid gauge\n"));
+        assert!(s.contains("engine_book_mid 500000\n"));
     }
 
     #[test]

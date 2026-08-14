@@ -1,6 +1,6 @@
 //! # cli
 //!
-//! Orchestration glue for the Polymarket latency-arb engine in
+//! Orchestration glue for the multivenue trading engine in
 //! `--paper` mode. Spawns one ingress thread per external source
 //! (Polymarket WSS, Binance WSS, Polygon JSON-RPC WSS, RSS HTTPS),
 //! pins each to a dedicated CPU core, installs a SIGINT handler that
@@ -16,7 +16,7 @@
 //! ## Why this lives in a lib (not just the binary)
 //!
 //! The thread-spawn / pin / SIGINT / drain logic has tests. The
-//! binary `polymarket-engine` is a 30-line dispatch shim that calls
+//! binary `multivenue-engine` is a 30-line dispatch shim that calls
 //! into here.
 
 #![forbid(unsafe_op_in_unsafe_fn)]

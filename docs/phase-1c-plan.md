@@ -211,7 +211,7 @@ applies to the *steady body-parse path*.
 
 ### 2.4 `cli` — paper-mode boot
 
-The `cli run --paper --config ~/polymarket/config.toml` binary must:
+The `cli run --paper --config ~/multivenue/config.toml` binary must:
 
 1. Parse config via `core-config` (already shipped).
 2. Preallocate every ring at boot:

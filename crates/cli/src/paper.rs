@@ -799,67 +799,67 @@ impl Observability {
         if enable_metrics {
             let mut reg = core_metrics::MetricsRegistry::new();
             let ticks = reg
-                .register_counter("polymarket_ticks_total")
-                .map_err(|_| "register polymarket_ticks_total")?;
+                .register_counter("engine_ticks_total")
+                .map_err(|_| "register engine_ticks_total")?;
             let signals = reg
-                .register_counter("polymarket_signals_total")
-                .map_err(|_| "register polymarket_signals_total")?;
+                .register_counter("engine_signals_total")
+                .map_err(|_| "register engine_signals_total")?;
             let orders_emitted = reg
-                .register_counter("polymarket_orders_emitted_total")
-                .map_err(|_| "register polymarket_orders_emitted_total")?;
+                .register_counter("engine_orders_emitted_total")
+                .map_err(|_| "register engine_orders_emitted_total")?;
             let orders_dropped = reg
-                .register_counter("polymarket_orders_dropped_total")
-                .map_err(|_| "register polymarket_orders_dropped_total")?;
+                .register_counter("engine_orders_dropped_total")
+                .map_err(|_| "register engine_orders_dropped_total")?;
             let rss_signals = reg
-                .register_counter("polymarket_rss_signals_total")
-                .map_err(|_| "register polymarket_rss_signals_total")?;
+                .register_counter("engine_rss_signals_total")
+                .map_err(|_| "register engine_rss_signals_total")?;
             let ingest_p50_ns = reg
-                .register_gauge("polymarket_latency_ingest_p50_ns")
-                .map_err(|_| "register polymarket_latency_ingest_p50_ns")?;
+                .register_gauge("engine_latency_ingest_p50_ns")
+                .map_err(|_| "register engine_latency_ingest_p50_ns")?;
             let ingest_p99_ns = reg
-                .register_gauge("polymarket_latency_ingest_p99_ns")
-                .map_err(|_| "register polymarket_latency_ingest_p99_ns")?;
+                .register_gauge("engine_latency_ingest_p99_ns")
+                .map_err(|_| "register engine_latency_ingest_p99_ns")?;
             let decide_p50_ns = reg
-                .register_gauge("polymarket_latency_decide_p50_ns")
-                .map_err(|_| "register polymarket_latency_decide_p50_ns")?;
+                .register_gauge("engine_latency_decide_p50_ns")
+                .map_err(|_| "register engine_latency_decide_p50_ns")?;
             let decide_p99_ns = reg
-                .register_gauge("polymarket_latency_decide_p99_ns")
-                .map_err(|_| "register polymarket_latency_decide_p99_ns")?;
+                .register_gauge("engine_latency_decide_p99_ns")
+                .map_err(|_| "register engine_latency_decide_p99_ns")?;
             let ack_p50_ns = reg
-                .register_gauge("polymarket_latency_ack_p50_ns")
-                .map_err(|_| "register polymarket_latency_ack_p50_ns")?;
+                .register_gauge("engine_latency_ack_p50_ns")
+                .map_err(|_| "register engine_latency_ack_p50_ns")?;
             let ack_p99_ns = reg
-                .register_gauge("polymarket_latency_ack_p99_ns")
-                .map_err(|_| "register polymarket_latency_ack_p99_ns")?;
+                .register_gauge("engine_latency_ack_p99_ns")
+                .map_err(|_| "register engine_latency_ack_p99_ns")?;
             let strategy_latency_arb = reg
-                .register_gauge("polymarket_strategy_latency_arb_active")
-                .map_err(|_| "register polymarket_strategy_latency_arb_active")?;
+                .register_gauge("engine_strategy_latency_arb_active")
+                .map_err(|_| "register engine_strategy_latency_arb_active")?;
             let strategy_ev = reg
-                .register_gauge("polymarket_strategy_ev_active")
-                .map_err(|_| "register polymarket_strategy_ev_active")?;
+                .register_gauge("engine_strategy_ev_active")
+                .map_err(|_| "register engine_strategy_ev_active")?;
             let strategy_cross_arb = reg
-                .register_gauge("polymarket_strategy_cross_arb_active")
-                .map_err(|_| "register polymarket_strategy_cross_arb_active")?;
+                .register_gauge("engine_strategy_cross_arb_active")
+                .map_err(|_| "register engine_strategy_cross_arb_active")?;
             let strategy_rule_tree = reg
-                .register_gauge("polymarket_strategy_rule_tree_active")
-                .map_err(|_| "register polymarket_strategy_rule_tree_active")?;
+                .register_gauge("engine_strategy_rule_tree_active")
+                .map_err(|_| "register engine_strategy_rule_tree_active")?;
             let ingress_polymarket_state = reg
-                .register_gauge("polymarket_ingress_polymarket_state")
-                .map_err(|_| "register polymarket_ingress_polymarket_state")?;
+                .register_gauge("engine_ingress_polymarket_state")
+                .map_err(|_| "register engine_ingress_polymarket_state")?;
             let ingress_binance_state = reg
-                .register_gauge("polymarket_ingress_binance_state")
-                .map_err(|_| "register polymarket_ingress_binance_state")?;
+                .register_gauge("engine_ingress_binance_state")
+                .map_err(|_| "register engine_ingress_binance_state")?;
             let ingress_rpc_state = reg
-                .register_gauge("polymarket_ingress_rpc_state")
-                .map_err(|_| "register polymarket_ingress_rpc_state")?;
+                .register_gauge("engine_ingress_rpc_state")
+                .map_err(|_| "register engine_ingress_rpc_state")?;
             let ingress_rss_state = reg
-                .register_gauge("polymarket_ingress_rss_state")
-                .map_err(|_| "register polymarket_ingress_rss_state")?;
+                .register_gauge("engine_ingress_rss_state")
+                .map_err(|_| "register engine_ingress_rss_state")?;
             let max_tick_age_ns = reg
-                .register_gauge("polymarket_max_tick_age_ns")
-                .map_err(|_| "register polymarket_max_tick_age_ns")?;
+                .register_gauge("engine_max_tick_age_ns")
+                .map_err(|_| "register engine_max_tick_age_ns")?;
             // Per-bucket tick-age gauges. Names follow the
-            // `polymarket_tick_age_ns_b<NN>` pattern — Prometheus-
+            // `engine_tick_age_ns_b<NN>` pattern — Prometheus-
             // compatible identifiers (no labels in v1; the
             // registry's name table is fixed-size byte arrays, no
             // label support yet).
@@ -867,10 +867,10 @@ impl Observability {
                 [core_metrics::GaugeId::default(); engine::SYM_BUCKETS];
             let mut name_buf = [0u8; 64];
             for (b, slot) in tick_age_ns_per_bucket.iter_mut().enumerate() {
-                // Format `polymarket_tick_age_ns_bNN` into a stack
+                // Format `engine_tick_age_ns_bNN` into a stack
                 // buffer; no heap allocation. Two-digit zero pad
                 // keeps Prometheus label-order stable when listed.
-                let prefix = b"polymarket_tick_age_ns_b";
+                let prefix = b"engine_tick_age_ns_b";
                 name_buf[..prefix.len()].copy_from_slice(prefix);
                 let tens = (b / 10) as u8;
                 let ones = (b % 10) as u8;
@@ -881,7 +881,7 @@ impl Observability {
                     .map_err(|_| "tick_age_ns_b name utf8")?;
                 *slot = reg
                     .register_gauge(name)
-                    .map_err(|_| "register polymarket_tick_age_ns_bNN")?;
+                    .map_err(|_| "register engine_tick_age_ns_bNN")?;
             }
             out.metrics = Some(Arc::new(reg));
             out.counter_ids = Some(EngineCounters {

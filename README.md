@@ -1,4 +1,4 @@
-# Polymarket Latency-Arb Engine
+# Multivenue Trading Engine
 
 Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine
 that executes latency-arbitrage trades on Polymarket's CLOB.

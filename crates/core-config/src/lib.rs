@@ -102,10 +102,10 @@ impl Config {
             polymarket_gamma_host: env_req("POLYMARKET_GAMMA_HOST")?,
             binance_ws_host: env_req("BINANCE_WS_HOST")?,
             alchemy_host: env_req("ALCHEMY_HOST")?,
-            paper_mode: env_opt("POLYMARKET_MODE").as_deref() == Some("paper"),
+            paper_mode: env_opt("MULTIVENUE_MODE").as_deref() == Some("paper"),
             metrics_bind: env_opt("METRICS_BIND").unwrap_or_else(|| "127.0.0.1:9191".into()),
-            log_dir: env_opt("POLYMARKET_LOG_DIR")
-                .unwrap_or_else(|| "~/polymarket/logs".into()),
+            log_dir: env_opt("MULTIVENUE_LOG_DIR")
+                .unwrap_or_else(|| "~/multivenue/logs".into()),
             // Empty CSV → no RSS thread spawned. Operator opts in by
             // listing real feed URLs in .env.
             rss_feeds_csv: env_opt("RSS_FEEDS").unwrap_or_default(),

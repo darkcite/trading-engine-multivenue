@@ -179,9 +179,9 @@ serializer, not a parser, so we hand-roll it.
 ### 3.3 `cli` — `--live` gate
 
 ```text
-$ polymarket-engine run --paper      # default — PaperDispatcher
-$ polymarket-engine run --live       # requires .env Secrets present
-$ POLYMARKET_MODE=paper polymarket-engine run --live   # ERROR — env conflict
+$ multivenue-engine run --paper      # default — PaperDispatcher
+$ multivenue-engine run --live       # requires .env Secrets present
+$ MULTIVENUE_MODE=paper multivenue-engine run --live   # ERROR — env conflict
 ```
 
 * `--live` mutually exclusive with `--paper`.

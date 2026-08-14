@@ -203,7 +203,7 @@ Add seeds to `fuzz/corpus/` for each new target:
 - TCP reconnect with exponential backoff
 - `ratatui` live dashboard
 - `/metrics` Prometheus text-format endpoint
-- HdrHistogram dumps to `~/polymarket/logs/latency/*.hgrm`
+- HdrHistogram dumps to `~/multivenue/logs/latency/*.hgrm`
 - `strategy-latency-arb` paper-mode writer
 - `claude-worker` live API calls (Phase 0 scaffold remains)
 

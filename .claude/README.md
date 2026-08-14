@@ -1,6 +1,6 @@
 # .claude/
 
-Project-local Claude Code config for the Polymarket latency-arb engine.
+Project-local Claude Code config for the multivenue trading engine.
 
 ## Layout
 

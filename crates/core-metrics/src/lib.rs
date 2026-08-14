@@ -1,7 +1,7 @@
 //! # core-metrics
 //!
 //! Preallocated counter + gauge registry with a tiny Prometheus
-//! text-format HTTP/1.1 server. Designed for the polymarket-engine
+//! text-format HTTP/1.1 server. Designed for the multivenue-engine
 //! `/metrics` endpoint that ships in Phase 4.
 //!
 //! ## Properties

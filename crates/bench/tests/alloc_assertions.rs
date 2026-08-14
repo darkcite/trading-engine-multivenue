@@ -795,7 +795,7 @@ fn signer_sign_order_per_call_budget_holds() {
 fn metrics_counter_inc_is_zero_alloc() {
     use core_metrics::MetricsRegistry;
     let mut reg = MetricsRegistry::new();
-    let id = reg.register_counter("polymarket_ticks_total").unwrap();
+    let id = reg.register_counter("engine_ticks_total").unwrap();
     let c = reg.counter(id);
 
     let g = AllocGuard::new();

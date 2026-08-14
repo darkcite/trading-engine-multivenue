@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------
-# Polymarket Latency-Arb Engine — config.example.toml
+# Multivenue Trading Engine — config.example.toml
 #
 # REFERENCE ONLY. The binary is driven by env vars (.env) + CLI
-# flags; this TOML is *not parsed* by `polymarket-engine`. It
+# flags; this TOML is *not parsed* by `multivenue-engine`. It
 # exists so an operator has one place to see every meaningful knob
 # in one shape.
 #
@@ -37,7 +37,7 @@ metrics_bind = "127.0.0.1:9191"
 latency_dump_secs = 60
 
 # Engine logs + replay + HdrHistogram dumps go under here.
-log_dir = "~/polymarket/logs"
+log_dir = "~/multivenue/logs"
 
 [endpoints]
 # WSS hosts. Resolved once at boot — no DNS on the hot path.
@@ -70,12 +70,12 @@ cooldown_ns = 250000000
 [strategy.ev]
 # Path to claude-worker-emitted NDJSON tag artifacts. Required
 # when `--strategy ev`.
-# artifacts_path = "~/polymarket/artifacts/tags.ndjson"
+# artifacts_path = "~/multivenue/artifacts/tags.ndjson"
 
 [strategy.rule_tree]
 # Path to claude-worker-emitted JSON rule artifacts. Required
 # when `--strategy rule-tree`.
-# rules_path = "~/polymarket/artifacts/rules.json"
+# rules_path = "~/multivenue/artifacts/rules.json"
 
 [risk]
 # All of the below are enforced by `docs/risk-policy.md`. The

@@ -70,14 +70,14 @@ graceful shutdown.
 
 By convention:
 
-- `~/polymarket/logs/engine/` — engine text logs (rotated daily).
-- `~/polymarket/logs/latency/*.hgrm` — HdrHistogram dumps.
-- `~/polymarket/logs/worker/` — claude-worker logs.
-- `~/polymarket/artifacts/` — claude-worker output artifacts
+- `~/multivenue/logs/engine/` — engine text logs (rotated daily).
+- `~/multivenue/logs/latency/*.hgrm` — HdrHistogram dumps.
+- `~/multivenue/logs/worker/` — claude-worker logs.
+- `~/multivenue/artifacts/` — claude-worker output artifacts
   (topic tags, parsed rules) consumed by the engine at boot.
-- `~/polymarket/replay/` — on-disk replay log (see `docs/wire-format.md`).
+- `~/multivenue/replay/` — on-disk replay log (see `docs/wire-format.md`).
 
-Nothing is written outside `~/polymarket/` or the project directory.
+Nothing is written outside `~/multivenue/` or the project directory.
 
 ## Troubleshooting
 
