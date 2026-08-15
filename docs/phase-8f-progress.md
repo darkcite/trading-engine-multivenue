@@ -1136,3 +1136,221 @@ state, resume point, S7 kickoff for items 16–17) to
 docs/phase-8f-progress.md. If context runs short: write interim
 state + exact resume point + relaunch prompt there, then tell me.
 ```
+
+## 2026-08-15 — Session S6 (items 12–15: operator verbs + ai-session.md + ruleset side-path stub + docs sweep)
+
+### Operator answers at kickoff (S5 open questions — RESOLVED)
+
+1. **`strategist.py`: DEFERRED to 8h.** S6 stayed items 12–15; the
+   daemon still composes no strategist/backtest cadence (no dead
+   code). Fable 5 model const + docs rows landed via item 15.
+2. **Market map + HIP-4 pairs: env-keyed JSON file.** New key
+   `CLAUDE_WORKER_MARKET_MAP` (BaseConfig, default
+   `~/multivenue/worker/market-map.json`), one operator-editable file
+   `{"markets": {name: SymbolId}, "hip4_pairs": [[yes,no],…]}`;
+   missing file = empty map (triage-only serve, no netting view);
+   malformed = exit 2 (strict bool-rejecting parse, `cli.py`
+   `load_market_map`). serve reads `markets`; `push --symbol`
+   resolves through it; `positions` reads `hip4_pairs`.
+
+### S6 CLOSED — §12.2 handoff
+
+**1. Status.** Items 12–15 of design §12 complete, five commits on
+`main` (item 12 split 12a/12b as authorized), gates green on the Mac
+before each:
+
+| item | commit | content |
+|---|---|---|
+| 12a | `3097e81` | `cli.py` verbs core (serve/fetch/backtest/push), exit codes 0/2/3/4/5/1, market-map loader, `[project.scripts]` entry point, `StateError`, `collect_run(syms=)`; 51 tests |
+| 12b | `795d99c` | stage-ruleset/commit-ruleset/positions complete the EXACT §6 surface; gate binding in `backtest.py` (the only Stage/Commit path); registry consumers in `state.py`; no-override + exit-3 matrix + positions golden-fills tests |
+| 13 | `99b1bb3` | `docs/prompts/ai-session.md` (§8 outline in full) + `test_session_scripted.py` (§11): subprocess verbs vs fake UDS + fake PATH harness; zero SDK construction proven |
+| 14 | `70d4dbb` | Rust: `ingress-ai/src/ruleset.rs` side-path stub behind the S2 seam; `engine_ai_ruleset_{staged,committed,rejected}_total`; core-config `ai_ruleset_dir`; `spawn_ai(ruleset_dir=…)` |
+| 15 | `495ba13` | docs sweep §9.2: local-setup, architecture AI-plane rewrite, CLAUDE.md worker line + Fable 5 model row, PLAN §10.3 serve invocation, `.env.example` 8f blocks, config.example.toml `[ai]` reference block |
+
+Gates at close (Mac): claude-worker `uv run pytest` **202/202**
+(131 → 182 → 200 → 202), `ruff format` + `ruff check` + `mypy
+--strict` clean before every Python commit. Rust (item 14): `cargo
+check --workspace` clean; targeted `cargo nextest run -p ingress-ai
+-p core-config -p cli -p engine` **111/111**; release alloc
+assertions `--test-threads=1` **35/35, 0 B/op** (admit-path gate
+untouched by the side path); fuzz `cargo check` clean. NOT run
+(item-17 gates): full workspace nextest, fuzz time-boxed runs.
+
+**2. Interim state / deviations (all recorded for review):**
+
+- **Verb⇄socket policy (interpretation of the §6 preamble):** only
+  frame-SENDING verbs (`push`, `stage-ruleset`, `commit-ruleset`)
+  open the UDS and send the implicit Heartbeat; `fetch`/`backtest`/
+  `positions` never touch the socket — a data pull must not signal
+  AI liveness (§5.4; the §6 positions row and the kickoff's
+  "Heartbeat before every verb PUSH" wording support this reading).
+- **`push --kind heartbeat` sends exactly ONE frame** — it is its
+  own implicit heartbeat; two identical frames would only burn a seq.
+- **push strictness:** per-kind required AND allowed option sets
+  (§3 table as data); anything outside the kind's set = exit 2
+  BEFORE state/socket work (validation precedes transport — pinned
+  by running the refusal matrix with no listener; bad args burn no
+  seq). `order-intent` pins `strategy_id = 4` and REFUSES an
+  explicit `--strategy`; `--venue ai` refused; `--ttl-s` that
+  rounds to 0 ns refused (0 = no-expiry inversion).
+- **`fetch --no-rest` is a parsed no-op:** RestBudget mechanics are
+  S5 surface, but venue REST URL consumers are 8h — with or without
+  the flag there is nothing to fetch yet (documented in the verb).
+- **`collect_run` gained an additive `syms=` filter** (backward
+  compatible) for `fetch --symbols`; marks still cover all symbols.
+- **`StateError(RuntimeError)`** introduced in `state.py` for the
+  §6 exit-5 mapping (WAL failure, missing seq row, missing registry
+  row on commit-mark); `sqlite3.Error` maps to 5 as well.
+- **stage-ruleset ordering is §6-literal:** connect → heartbeat →
+  bind-check → record row → send Stage. A binding refusal therefore
+  leaves a lone heartbeat on the wire (legal per §5.4) and exits 3;
+  with the engine DOWN the same invocation is exit 4 (transport
+  precedes the gate check — §6 preamble order). Commit is
+  check-row → send → mark committed_ts (send-then-record: a failed
+  send leaves no phantom commit).
+- **Registry semantics:** re-staging a hash refreshes `staged_ts`
+  and CLEARS `committed_ts` — a new Stage supersedes an old Commit.
+  The Rust stub implements the same machine (its `committed` state
+  clears on a successful Stage).
+- **NEW convention pinned (S6): ruleset artifact filename** =
+  `AI_RULESET_DIR/<hash128-hex>.json`, hash128-hex = FIRST 32 hex
+  chars of the full sha256 (= first 16 bytes). Forced by §13-d5:
+  the frame carries only hash128, so the engine can only resolve a
+  name derivable from it. Taught in `ai-session.md` §4 step 5
+  (install cp before staging), implemented by `ruleset.rs`,
+  documented in `.env.example`/config.example.toml.
+- **Item 14 scope vs design §7:** the JSON bounds-check (≤256 rows,
+  symbols exist, caps ≤ risk-policy) and the double-buffered table
+  flip are DEFERRED to 8g per the S6 kickoff item-14 scope (kickoff
+  supersedes the fuller §7 paragraph). 8f stub = filename resolve +
+  full-sha256 recompute + first-16-bytes equality + staged/committed
+  state + counters; validated bytes are dropped at the documented
+  8g table-fill point. Side-path allocation (`fs::read`,
+  `PathBuf::join`) is documented control-plane: ruleset kinds only,
+  after capture+push; the 0 B/op admit gate is unaffected.
+- **`engine_ai_ruleset_*` counters live in `AiIngressStatus`**
+  (writer: ingress thread — the seam runs on it; per-field
+  single-writer discipline holds) and mirror through the existing
+  ai-family delta machinery in cli.
+- **`commit-ruleset --hash` takes the FULL sha256 (64 hex)** —
+  "HEX32" read as 32 bytes; matches the registry PK and the
+  stage-ruleset stdout. `--by session|auto` exists on stage-ruleset
+  per the §6 attribution text (default `session`; refuses others).
+- **`market_map_path` joined `BaseConfig`** (all modes) —
+  `ServeConfig` construction sites in tests updated; two config
+  tests added.
+- **core-config gained `ai_ruleset_dir`** (`AI_RULESET_DIR`,
+  tilde-expanded, default `~/multivenue/artifacts/rulesets`);
+  `spawn_ai` signature grew `ruleset_dir: PathBuf` (boot log prints
+  it; `#[allow(clippy::too_many_arguments)]` per the boot-wiring
+  pattern).
+- **Toolchain note: Typer 0.27 is click-free** — no `click` module
+  in the venv; `typer.testing.Result` is the invoke result type.
+  The `[project.scripts]` entry point (deferred from item 2) is
+  installed by uv and exercised as a real subprocess by the
+  scripted session test.
+- **Docs sweep delta:** `phase-8-architecture.svg` and the PLAN.md
+  `3.12` mentions were ALREADY 3.14 on main (remediation-era
+  edits) — no touch. PLAN §10.3 worker line gained the
+  `claude-worker serve` launchd invocation instead (§9.2's launchd
+  note). Historical records untouched.
+- **Push anomaly CONTINUES (operator attention):** local
+  `origin/main` ref reads `38e599b` (the S5 handoff commit) — i.e.
+  origin advanced past mid-S5 `a45db8a` at some point; this session
+  performed NO pushes and NO fetches (none authorized). At close,
+  `main` is locally ahead of that ref by the five S6 commits.
+  Recorded, not acted on (S4/S5 doctrine).
+- `.env` untouched. No push/rebase/branch/history ops. Open
+  defects: none known.
+
+**3. Exact resume point.** Design §12 **item 16 — RSS removal**
+(S7, sequenced LAST deliberately, ONE commit): the §9.3 blast-radius
+sweep — delete `crates/ingress-rss/` + `crates/strategy-news/`
+(corpse), `fuzz/fuzz_targets/rss_item.rs` + its `fuzz/Cargo.toml`
+entry, the 2 RSS bench alloc-assertions, the ~76 `paper.rs` refs
+(`Rings.rss_signal`/`Consumers.rss_signal`/`spawn_rss`/`RssFeed`/
+`engine_rss_*`), `core-config` `rss_feeds_csv` + `RSS_FEEDS` engine
+key (worker annotation already in `.env.example` from item 15),
+CPU core 4 → `ingress-ai` (un-comment the pin in `spawn_ai` — the
+"unpinned until item 16" note dies), `.claude/agents/
+parser-property-tester.md` scope line, `SignalSource::Rss = 1`
+STAYS reserved. Workspace must be green after the single commit.
+Then **item 17 — final gates**: full `cargo nextest run
+--workspace`, release alloc assertions `--test-threads=1` 0 B/op,
+fuzz targets `cargo check` (+ time-boxed runs if the operator
+wants the CI default), `uv run pytest`, and the phase-8f closing
+progress entry.
+
+**4. S7 kickoff prompt (ready to paste):**
+
+```
+Stage 2 — 8f AI-Ingress, SESSION S7 (checklist items 16–17: RSS
+removal + final gates), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue; item 16 is ONE commit,
+item 17 is gates + the closing progress entry. NO push, NO rebase,
+NO history rewrite, NO new branches. Do NOT touch .env. Do NOT
+write phase-8-progress.md.
+Verify get_project_modules against the main checkout FIRST; if the
+MCP won't attach, stop.
+AUTHORITY: docs/phase-8f-design.md (§13 LOCKED, §3/§13.1 capture
+amendment in force) + latest phase-8f-progress.md entries (S6
+handoff: verb⇄socket policy, hash128 filename convention, item-14
+8g deferrals, push anomaly) supersede the committed plan.
+REQUIRED READING, in order:
+1. docs/phase-8f-progress.md — S6 handoff (deviations, resume
+   point, this prompt)
+2. docs/phase-8f-design.md §9.3 (RSS blast radius — the exact
+   sweep list), §12 items 16–17, §1 exit criteria
+3. CLAUDE.md (pitfalls #10/#11)
+S7 SCOPE:
+item 16 (ONE commit): delete crates/ingress-rss +
+crates/strategy-news + fuzz/fuzz_targets/rss_item.rs (+ its
+fuzz/Cargo.toml entry) + the 2 RSS bench alloc-assertions; sweep
+paper.rs (~76 refs: Rings.rss_signal, Consumers.rss_signal,
+spawn_rss, RssFeed, engine_rss_* metrics, workspace Cargo.toml
+members/deps); core-config: drop rss_feeds_csv + the engine
+RSS_FEEDS read (worker keeps the env key — .env.example already
+annotated in item 15; do NOT touch the worker); cli: pin
+ingress-ai to core 4 (the "RSS owns core 4" note dies —
+spawn_ai's unpinned comment + log_pin_outcome pattern);
+.claude/agents/parser-property-tester.md scope ingress-rss →
+ingress-ai; SignalSource::Rss = 1 STAYS reserved (wire-format.md
+already marks it retired). Workspace green after the single
+commit: cargo check --workspace + targeted nextest (cli, engine,
+core-config, bench, strategy-set if touched) before declaring it.
+item 17: final gates on the Mac — cargo nextest run --workspace;
+release alloc assertions --test-threads=1 (0 B/op; count DROPS by
+the 2 removed RSS gates — record the new total); fuzz cargo check
+(time-boxed runs only on operator go); claude-worker uv run
+pytest + ruff format + ruff check + mypy strict; then append the
+8f CLOSING entry to docs/phase-8f-progress.md (§12 exit criteria
+status: both modes proven in tests; live demo stays
+operator-gated) and STOP — the live AI-cmd demo happens only on
+explicit operator go with pgrep clean.
+Cargo on the Mac ONLY (pitfall #10; sandbox = greps only);
+stale-rmeta playbook incl. the S4 post-merge addendum (after the
+RSS tree-ectomy expect stale rmeta — clean ALL workspace-local
+crates on impossible errors). Python untouched in item 16 —
+worker RSS surface (feeds.py) STAYS.
+Test hygiene: sockets via tests/conftest.short_sock_dir()
+(/tmp/cw-ai-<pid>-*/); METRICS_BIND test-local (NEVER 9191);
+MULTIVENUE_LOG_DIR test-local (NEVER ~/multivenue/logs); NEVER
+run `multivenue-engine run` or connect live venues (8f live demo
+stays operator-gated); no kill/pkill by name (by-PID of own test
+processes only, after diagnosis).
+SESSION FACTS: RustRover MCP execute_terminal_command MUST
+executeInShell=true, ≤45 s per call — long runs via
+nohup > /tmp/8f-build.log & then poll; projectPath =
+/Users/darkcite/trading-engine-multivenue. macOS landmines:
+AF_UNIX sun_path cap (short_sock_dir), SO_RCVTIMEO EINVAL on
+peer-closed UDS, std::thread::scope panic hangs without
+StopOnDrop, `sample <pid>` for hang diagnosis. Push anomaly is
+KNOWN (S4–S6): origin may advance without session pushes —
+record, never act. One-line status after each commit; ask before
+anything ambiguous.
+STOP after item 17: the closing entry doubles as the §12.2
+handoff (status, exit-criteria checklist, anything left for the
+operator-gated live demo). If context runs short: write interim
+state + exact resume point + relaunch prompt into
+docs/phase-8f-progress.md, then tell me.
+```
