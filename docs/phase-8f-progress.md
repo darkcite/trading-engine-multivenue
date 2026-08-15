@@ -892,3 +892,247 @@ state, resume point, S6 kickoff for items 12–15) to
 docs/phase-8f-progress.md. If context runs short: write interim
 state + exact resume point + relaunch prompt there, then tell me.
 ```
+
+## 2026-08-15 — Session S5 (items 10–11: worker core II + daemon/serve)
+
+### S5 CLOSED — §12.2 handoff
+
+**1. Status.** Items 10 and 11 of design §12 complete, four commits on
+`main` (item 10 split by module group as authorized), all gates green
+on the Mac before each:
+
+| item | commit | content |
+|---|---|---|
+| 10a | `a45db8a` | data plane: `pmlr.py` (mmap v1/v2 reader, torn-tail tolerance) + `features.py` (tick features → per-sym JSON, marks, RestBudget, positions/P&L from `engine-fills.pmlr`, HIP-4 netting) + Rust-writer golden fixtures |
+| 10b | `cf8925b` | news plane: `labeling.py` (§9.1 vocab + strict parsers) + `feeds.py` (httpx RSS/Atom, dedupe, jittered cadence, triage→escalate over injected `complete_fn`) + `state.py` prompt-cache consumers (`cached_complete`) |
+| 10c | `f5db691` | action plane: `backtest.py` (mockable subprocess seam, STRICT harness contract, §5.1 gates in code, report written pass AND fail) + `commander.py` (labels→SetBias, TTL from half-life clamped, 5 s heartbeat cadence) |
+| 11 | `163e9f9` | `llm.py` (THE SDK seam, serve-only construction) + `daemon.py` (single-threaded serve loop, signal-clean shutdown) + conftest `FakeClient`; §11 serve-loop test (dedupe ✓ cache-hit ✓ heartbeat ✓ SIGTERM ✓) |
+
+Gates at close (Mac): claude-worker `uv run pytest` **131/131**
+(40 → 72 → 100 → 124 → 131), `ruff format` + `ruff check` + `mypy
+--strict` clean before every commit. Rust gates NOT run — **zero Rust
+files touched** (per the S5 prompt); the only cargo invocation was the
+scratch fixture generator in `/tmp` (never the workspace target dir).
+`.env` untouched. No push/rebase/branch ops.
+
+**2. Interim state / deviations (all within design intent, recorded
+for review):**
+
+- **PMLR golden fixtures** (`claude-worker/tests/fixtures/pmlr/`):
+  bytes produced by the REAL `core-io::PmlrWriter` via a scratch crate
+  OUTSIDE the workspace (unused-code rule keeps throwaway Rust out of
+  the tree); generator source checked in verbatim as
+  `generator.rs.txt` + regen steps in the fixture README. The **v1
+  fixture** is the v2 writer's bytes with the header version patched
+  to 1 and bytes 48..64 of every slot filled `0xAA` (v1's undefined
+  padding) — the same crafted-v1 pattern `core-io`'s own reader tests
+  use; no v1 writer exists to invoke.
+- **`pmlr.py` torn-tail tolerance is a DOCUMENTED divergence** from
+  `core-io::PmlrReader` (which rejects ragged payloads): the worker
+  tails files the engine is still flushing (§11 positions row —
+  "reader stops cleanly mid-flush"), so a trailing partial slot is
+  ignored and surfaced as `Reader.torn`. Rust auditor semantics are
+  unchanged.
+- **HIP-4 pairing interpretation call**: SymbolId ordinals are
+  boot-allocation order, NOT HIP-4 encodings — yes/no pairing is not
+  derivable from the fill log. `features.hip4_pair_views` takes
+  EXPLICIT `(yes_sym, no_sym)` pairs; netting mirror = `|yes − no|`
+  marked at the yes leg, `flattened_qty = min(yes, no)` when both
+  long. The pairs' config source is an **open item-12 wiring
+  question** (below).
+- **Positions math**: integer 1e12 cost-basis accounting; closes
+  remove basis pro-rata by floor division with the remainder RETAINED
+  in open cost — value is conserved exactly (pinned by
+  `test_position_rounding_conserves_value`); full closes zero the
+  basis exactly. No-mark symbols are carried at cost (unrealized 0,
+  exposure |basis|) — no phantom P&L from truncated averages.
+- **v1 tick files pin venue 0** in features (Phase-1 capture was
+  Polymarket-only; v1 slots carry no venue byte).
+- **Commander policy v1 doctrine**: labels are directional PRESSURE →
+  `SetBias` only (the signed channel); bias = `bias_scale_1e6 ×
+  confidence` signed by direction (default scale 20 000 = 2 ¢ at
+  conf 1.0); TTL = half-life clamped to [1 s, 3600 s]; below
+  `min_confidence` 0.7 ⇒ refused + counted, never sent;
+  `expire_on_silence` default ON; SetBias row per §3: strategy_id/side
+  0xFF, param_id 0, venue Ai. Commander holds no socket state;
+  `UdsError` bubbles to the daemon (reconnect owner);
+  `reset_cadence()` on fresh connections.
+- **Backtest harness stdout contract defined NOW** (the 8h binary must
+  conform): JSON with `schema_version = 1`, `ruleset_hash` REQUIRED
+  equal to the worker's own sha256 of the ruleset file (anti-drift
+  bind), `split`, `oos{net_pnl_usd,trades,trading_days,
+  max_drawdown_usd}`, `bounds{max_order/symbol/total_notional_usd}`.
+  Untrustworthy output (bad schema/hash/types) ⇒ `BacktestError`,
+  NOTHING written; gate fail ⇒ worker report still written next to R
+  (`R.report.json`) with `gates.all_passed = false` (verb maps to
+  exit 3, item 12). **DD-cap default $200** taken from risk-policy's
+  max-realized-loss-per-day line; bounds defaults 100/250/1000 per
+  risk-policy. `ruleset_hashes()` also returns hash128 = sha256[..16]
+  for §13-d5 Stage/Commit frames.
+- **Daemon calls**: labels produced while the engine socket is down
+  are DROPPED + counted (`labels_dropped_disconnected`) — TTL'd news
+  pressure must not queue for a returning engine (§5.4 fail-safe
+  reasoning). `symbol_map` (market name → SymbolId) is a `serve()`
+  parameter; empty map = valid triage-only degraded mode. **Operator
+  wiring for the market map is an open item-12 question** (below).
+  `iterations=` bound exists for tests only; prod runs unbounded.
+- **`cli.py` deliberately NOT created**: the §11 serve-loop test
+  drives `daemon.serve` directly; the full verb surface is item 12
+  (do-not-build-early rule held).
+- **prompt_cache consumers** (first ever): `State.cache_get/cache_put`
+  + `cached_complete(model, prompt_version, prompt, complete_fn)` —
+  the single LLM-call gate; key = (model, sha256(version),
+  sha256(content)) so template bumps invalidate cleanly. Serve-loop
+  test proves a cache hit costs zero SDK calls.
+- **conftest `FakeClient`** (§9.1 pattern) returns REAL
+  `anthropic.types.TextBlock` instances so `llm.complete`'s isinstance
+  narrowing is honest; no SDK network anywhere (client construction in
+  `test_llm.py` is offline by SDK design).
+- **Toolchain notes**: ruff format under `target-version = py314`
+  now applies **PEP 758 unparenthesized multi-except** — expect
+  `except ValueError, TypeError:` shapes; they are valid 3.14. The
+  Cowork sandbox's repo mount went stale again mid-session
+  (pitfall #10 corollary held: greps only, all gates on the Mac).
+- **Push anomaly CONTINUES (operator attention)**: `origin/main`
+  advanced to `a45db8a` (item 10a) mid-session — this session
+  performed NO pushes (none authorized). Same signature as the S4
+  anomaly (operator following along, or IDE auto-push). At close,
+  `main` is ahead of origin by 10b/10c/11 + this handoff commit.
+- **OPEN QUESTIONS for the operator (answer before/at S6 kickoff):**
+  1. **`strategist.py` has NO §12 checklist item** (it exists only in
+     the §2 file tree). Scope call: build strategist + its serve
+     cadence + backtest-cadence composition in S6, or defer to 8h?
+     Until then the daemon deliberately does not compose a
+     strategist/backtest cadence (no dead code).
+  2. **Market-map + HIP-4-pairs config source** for serve and the
+     verbs (labeling universe `{market name → SymbolId}`, and
+     `(yes,no)` pairs for the positions netting view): file format /
+     env key / CLI flag? Item 12 needs the decision to wire `fetch`,
+     `positions`, and serve.
+- Open defects: none known.
+
+**3. Exact resume point.** Design §12 **item 12 — operator verbs in
+`cli.py`** (S6): Typer app per the §6 EXACT surface (`serve`, `fetch
+[--replay-dir|--symbols|--no-rest|--news]`, `backtest --ruleset
+[--replay-dir|--split]`, `push --kind …` with per-kind §3 required-arg
+validation and 1e6 float scaling, `positions [--run-dir|latest]
+[--json]` read-only (no UDS, no heartbeat, no seq), `stage-ruleset
+--ruleset --report` (GATE BINDING: recompute sha256, require
+`REP.ruleset_hash` match + `gates.all_passed` + our schema version;
+record in `rulesets` with author_mode; send RulesetStage{hash128}; NO
+OVERRIDE FLAG EXISTS), `commit-ruleset --hash|--ruleset`); global exit
+codes 0/2/3/4/5/1; every verb: BaseConfig (never the key), SQLite,
+UDS, Heartbeat-precedes-payload, close. First actions: read design §6
+in full + the item-10 surfaces (`backtest.report_path_for`,
+`ruleset_hashes`, `features.position_views/hip4_pair_views`,
+`feeds.fetch_feed/dedupe_items`), get the two operator answers above,
+then build `cli.py` + per-verb tests (fake UDS, canned reports,
+`--help`-parse no-override assertion, ANTHROPIC_API_KEY-unset
+invariant). Items 13 (ai-session.md + scripted subprocess session
+test), 14 (Rust: ingress-ai ruleset side-path stub — Rust gates
+apply), 15 (docs sweep §9.2 + .env.example) follow in-session if
+context allows.
+
+**4. S6 kickoff prompt (ready to paste):**
+
+```
+Stage 2 — 8f AI-Ingress, SESSION S6 (checklist items 12–15: operator
+verbs + ai-session.md + ruleset side-path stub + docs sweep), MAIN
+CHECKOUT /Users/darkcite/trading-engine-multivenue; small commits
+directly on main, one per (sub-)item, tests green on the Mac before
+the next. NO push, NO rebase, NO history rewrite, NO new branches.
+Do NOT touch .env. Do NOT write phase-8-progress.md.
+Verify get_project_modules against the main checkout FIRST; if the
+MCP won't attach, stop.
+OPERATOR ANSWERS REQUIRED AT KICKOFF (S5 open questions): (1)
+strategist.py scope (build in S6 vs defer to 8h — no §12 item
+exists); (2) market-map + HIP-4-pairs config source (file/env/flag)
+for serve, fetch, positions. If unanswered, ASK before item 12
+wiring.
+AUTHORITY: docs/phase-8f-design.md (§13 LOCKED, §3/§13.1 capture
+amendment in force) + latest phase-8f-progress.md entries (S5
+handoff: harness stdout contract, commander SetBias doctrine,
+torn-tail divergence, HIP-4 explicit pairs) supersede the committed
+plan.
+REQUIRED READING, in order:
+1. docs/phase-8f-progress.md — S5 handoff (deviations, contracts,
+   open questions, push anomaly)
+2. docs/phase-8f-design.md §6 (EXACT verb surface + exit codes +
+   notes), §5.2 (dual-mode invariant), §7 "8f ruleset side-path
+   (stub scope)" + §8 (ai-session.md outline — item 13 deliverable),
+   §9.2 (docs-sweep list — item 15), §11 (gate binding, CLI-surface
+   no-override test, scripted semi-manual session test, positions
+   golden-fills row), §13 decisions 2/5
+3. CLAUDE.md (pitfalls #6/#10/#11)
+Committed S5 surface to build on: claude_worker.pmlr (Reader v1/v2,
+torn flag), features (collect_run, read_fills, position_views,
+hip4_pair_views, total_exposure, RestBudget), labeling (prompts +
+strict parsers), feeds (fetch_feed, dedupe_items, NewsWatcher),
+state (cached_complete, cache_get/put + item-9 surface), backtest
+(run_backtest w/ injected run_fn, GateThresholds, ruleset_hashes,
+report_path_for, REPORT_SCHEMA_VERSION=1, harness contract in the
+S5 log), commander (Commander, Policy, HEARTBEAT_INTERVAL_NS),
+llm (make_client/complete/complete_fn_for), daemon (serve with
+iterations/stats injection), conftest (FakeUdsServer, FakeClient,
+short_sock_dir, TEST_KEY), fixtures pmlr/ + ai_frame_golden.txt.
+S6 SCOPE — items 12→13→14→15, one commit each (12 may split
+12a verbs-core / 12b gate-binding+positions):
+item 12: cli.py Typer verbs per §6 EXACTLY (serve/fetch/backtest/
+push/positions/stage-ruleset/commit-ruleset), exit codes 0/2/3/4/5/1,
+BaseConfig-only for verbs (ANTHROPIC_API_KEY never read — asserted),
+implicit Heartbeat before every verb push (uds.py enforces),
+per-kind §3 required-args in push (floats ×1e6 at pack), positions
+read-only (tail engine-fills.pmlr + marks from CURRENT run dir,
+HIP-4 netting via the answered config source, --json), stage-ruleset
+GATE BINDING (sha256 recompute, REP match, gates_passed, schema
+version, rulesets row author_mode session/auto, RulesetStage
+hash128 frame), commit-ruleset (staged+passed row required);
+[project.scripts] entry point added NOW (deferred from item 2);
+tests per §11: every verb against fake UDS + canned reports,
+gate-refusal exit 3 matrix, no-override --help parse test,
+single-client interlock exit 4, key-unset invariant, positions
+golden fills incl. torn tail + latest resolution.
+item 13: docs/prompts/ai-session.md per §8 outline + scripted
+semi-manual session test (§11): subprocess verbs against fake UDS +
+canned reports: fetch → backtest pass → stage → commit → push
+disable; refusal path: failing report → stage exit 3, commit of
+unstaged hash exit 3; zero SDK construction proven.
+item 14 (RUST): ingress-ai ruleset stage/commit side-path stub per
+§7/§8: hash128 recompute from AI_RULESET_DIR file, table-fill stub
+(8g), engine_ai_ruleset_{staged,committed,rejected}_total metrics,
+seam already exists (S2 no-op closure). Rust gates apply: targeted
+cargo nextest (ingress-ai + touched), cargo check --workspace,
+release alloc assertions --test-threads=1 (0 B/op), fuzz cargo
+check. Cargo on the Mac ONLY; stale-rmeta playbook incl. S4
+post-merge addendum.
+item 15: docs sweep per §9.2 exact list (local-setup, architecture,
+CLAUDE.md worker lines + model table w/ Fable 5 strategist,
+phase-8-architecture.svg 3.12→3.14 text node, PLAN.md two 3.12
+mentions, .env.example new keys + RSS_FEEDS worker-only annotation)
++ config.example.toml reference block. Minimal touches; historical
+records untouched.
+Python: 3.14.7 via uv 0.12.5 (/opt/homebrew/bin/uv); full
+`import x` only; ruff format + check + mypy strict + pytest green
+before each commit; no live SDK calls, no live feeds, no live
+engine; py314 note: ruff format applies PEP 758 unparenthesized
+except.
+Test hygiene: sockets via tests/conftest.short_sock_dir()
+(/tmp/cw-ai-<pid>-*/); METRICS_BIND test-local (NEVER 9191);
+MULTIVENUE_LOG_DIR test-local (NEVER ~/multivenue/logs); NEVER run
+`multivenue-engine run` or connect live venues (8f live demo stays
+operator-gated); no kill/pkill by name (by-PID of own test
+processes only, after diagnosis).
+SESSION FACTS: RustRover MCP execute_terminal_command MUST
+executeInShell=true, ≤45 s per call — long runs via
+nohup > /tmp/8f-build.log & then poll; projectPath =
+/Users/darkcite/trading-engine-multivenue. macOS landmines: AF_UNIX
+sun_path cap (short_sock_dir), SO_RCVTIMEO EINVAL on peer-closed
+UDS, std::thread::scope panic hangs without StopOnDrop, `sample
+<pid>` for hang diagnosis. Push anomaly is KNOWN (S4/S5): origin
+may advance without session pushes — record, never act. One-line
+status after each commit; ask before anything ambiguous.
+STOP after item 15: append the §12.2 handoff (status, interim
+state, resume point, S7 kickoff for items 16–17) to
+docs/phase-8f-progress.md. If context runs short: write interim
+state + exact resume point + relaunch prompt there, then tell me.
+```
