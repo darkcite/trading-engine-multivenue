@@ -19,7 +19,10 @@ _SEARCH_DIRS: tuple[pathlib.Path, ...] = (
     _ROOT / "tests",
 )
 # Fewer scanned files than this means the scan itself is broken.
-_MIN_EXPECTED_PY_FILES: int = 4
+# Item 9 grew the tree: src {__init__, config, frames, uds, state} +
+# tests {__init__, conftest, test_config, test_imports_are_full,
+# test_frames, test_uds, test_state}.
+_MIN_EXPECTED_PY_FILES: int = 10
 
 
 def _all_py_files() -> list[pathlib.Path]:

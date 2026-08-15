@@ -50,6 +50,11 @@ ignore = []
 # Ban relative imports entirely.
 ban-relative-imports = "all"
 
+[tool.ruff.lint.per-file-ignores]
+# Tests assert against literal wire values (seqs, prices, offsets) by
+# design — naming each literal would obscure the golden fixtures.
+"tests/*" = ["PLR2004"]
+
 [tool.ruff.lint.isort]
 # Disallow `from ... import ...` style by forcing single-line full-module imports.
 force-single-line     = true
