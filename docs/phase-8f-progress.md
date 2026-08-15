@@ -1,7 +1,10 @@
-# Phase 8f — Progress log (stage2/8f-ai-ingress worktree)
+# Phase 8f — Progress log (stage2/8f-ai-ingress worktree → main)
 
-Session notes for the Stage-2 worktree ONLY. `docs/phase-8-progress.md`
-belongs to the Stage-1/soak session — never write there from here.
+Session notes for Phase 8f ONLY. `docs/phase-8-progress.md` is closed
+soak history — never write there. As of S4 (2026-08-15) the worktree
+isolation era is over: `stage2/8f-ai-ingress` merged to `main` and all
+8f work continues in the main checkout
+`/Users/darkcite/trading-engine-multivenue`.
 
 ## 2026-08-15 (first entry) — Phase 0 COMPLETE: design written, reviewed, decisions locked; no code
 
@@ -611,3 +614,64 @@ other session. If context runs short: write interim state + exact
 resume point + relaunch prompt into phase-8f-progress.md, then
 tell me.
 ```
+
+## 2026-08-15 — Session S4 (PHASE 0: merge to main; then items 8–9)
+
+### Phase 0 — MERGE COMPLETE: stage2/8f-ai-ingress → main
+
+Operator amendment (recorded at `ab46ee4`) supersedes the stored S4
+prompt: S4 opens by merging the stage2 branch into main; the worktree
+isolation era ends; all further 8f work happens in the main checkout.
+
+- **Preconditions verified**: `pgrep -fl multivenue-engine` empty; main
+  clean at `518679d` (G1 BLESSED — exactly the required minimum);
+  worktree clean at `ab46ee4` on `stage2/8f-ai-ingress`.
+- **Divergence at merge time** (merge base `b931c59`, the 8e commit):
+  - `main..stage2/8f-ai-ingress`: **14 commits** — `d2b0be2` (Phase 0
+    docs), `8feab93`/`4f086f3` (items 1–2), `71bbcae`/`0984b79`
+    (items 3–4), `6e42132` (S1 handoff), `a43f87f`/`10fc7c8` (item 5),
+    `0acb74a` (S2 handoff), `bb70c46`/`e80bf1d` (item 6), `1a45165`
+    (item 7), `e124298` (S3 handoff), `ab46ee4` (amendment).
+  - `stage2/8f-ai-ingress..main`: **2 commits** — `9d473ca` (G1
+    remediation) + `518679d` (G1 BLESSED, progress-log only).
+- **Merge commit**: `0ed0bfe`
+  (`git merge --no-ff stage2/8f-ai-ingress`).
+- **Conflicts (2, both mechanical; no hot-path/CLAUDE.md/design-doc
+  conflicts — resolved without operator escalation per the conflict
+  policy):**
+  1. `crates/cli/src/paper.rs` — import block only. Both sides
+     appended to the same `use` lines: main (`9d473ca`) added
+     `Capture, ChannelEvent, NsTs` to the `core_types` import; stage2
+     added `AiCmd, AI_RING_SIZE` + the `core_io::{SlotCapture,
+     SlotKind}` / expanded `engine` / `ingress_ai` imports.
+     Resolution: **union** (multiline `core_types` import carrying
+     both sides' additions; stage2's other lines verbatim).
+  2. `claude-worker/README.md` — main's remediation-era edit was a
+     `3.12`→`3.14` version bump inside the old intro paragraph; the
+     stage2 8f rewrite (item 2) replaced that paragraph wholesale.
+     Resolution: **stage2 side** (the rewrite is authoritative;
+     nothing of main's edit survives to lose — the rewritten worker
+     is 3.14-native).
+- **Stale-rmeta incident #4 (new failure mode — post-merge):** first
+  post-merge `cargo check --workspace` failed in `ingress-ai` (11
+  errors) + `strategy-set` (7) with E0425/E0432/E0599. First clean
+  pass (`cargo clean -p` over the ten crates the merge obviously
+  touched) still failed — `ingress-ai` down to 4 errors: `cannot find
+  hmac_sha256_tag16 / ct_eq / HMAC_TAG16_LEN in core_crypto` while
+  the merged source plainly contains them. Cause: `core-crypto` (and
+  friends) kept pre-merge fingerprints. Playbook addendum: **after a
+  merge, clean every workspace-local crate**, not just the visibly
+  touched ones (`for d in crates/*/; do cargo clean -p $(basename
+  $d); done`). Second run clean.
+- **Post-merge gates — ALL GREEN on the Mac:**
+  - `cargo check --workspace` clean
+  - `cargo nextest run --workspace` **926/926**
+  - `cargo test -p bench --test alloc_assertions --release --
+    --test-threads=1` **33/33, 0 B/op**
+  - fuzz `cargo check` clean
+  - `claude-worker` `uv run pytest` **18/18**
+- `.env` untouched in both checkouts. stage2 worktree left in place
+  (operator decides its removal at session end).
+
+From here: small commits directly on `main`, one per (sub-)item,
+gates green before the next. Items 8–9 follow.
