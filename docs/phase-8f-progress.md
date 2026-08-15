@@ -386,3 +386,220 @@ belongs to the other session. If context runs short: write interim
 state + exact resume point + relaunch prompt into
 phase-8f-progress.md, then tell me.
 ```
+
+## 2026-08-15 — Session S3 (items 6–7: engine AI lane + strategy-set)
+
+### S3 CLOSED — §12.2 handoff
+
+**1. Status.** Items 6 and 7 of design §12 complete, three commits,
+all gates green on the Mac:
+
+| item | commit | content |
+|---|---|---|
+| 6a | `bb70c46` | engine `ai_cons` lane: budgeted drain in `Engine::tick()` (`AI_DRAIN_BUDGET = 8`, after fills / before timer), TTL-on-pop vs engine-monotonic `ts_ns` (⇒ `AiIngressStatus::inc_expired`), drain-site shape re-check counter, `Strategy::on_ai` defaulted method; `Rings`/`Consumers` carry the AI lane + status slot |
+| 6b | `e80bf1d` | `core_io::SlotCapture<R>` hoisted (S2 note honored), `AiCmdCapture` ported (API unchanged); engine fills capture `engine-fills.pmlr` on both fill paths; cli `spawn_ai` + env keys + full `engine_ingress_ai_*` mirror + `engine_fills_capture_*` pair; alloc gate fills-append 0 B/op |
+| 7 | `1a45165` | new crate `strategy-set` per §7: slots 0–3 built, bits 4/5 reserved consts (no dead members), Enable/Disable/Halt semantics, `mask_for_name`, cli `--strategy all` → `engine_loop_set_full`; `engine_ai_enable_refused_total` via new defaulted `StrategyCounters::ai_enable_refused`; alloc gate fan-out 0 B/op |
+
+Gates last run: targeted `cargo nextest run` over core-io / ingress-ai /
+engine / strategy-core / strategy-set / core-config / cli / core-types /
+bench **215/215**; `cargo check --workspace` clean; fuzz `cargo check`
+clean; release alloc assertions `--test-threads=1` **33/33, 0 B/op**
+(31 prior + `engine_fills_capture_append` + `strategy_set_fanout`;
+`engine_tick_with_latency_record` now includes the empty AI lane).
+NOT run (item-17 gates): full workspace nextest, fuzz time-boxed runs,
+pytest.
+
+**2. Interim state / deviations (all within design intent):**
+
+- **`AI_DRAIN_BUDGET = 8`, its own const** (design §2 named no number):
+  bounds worst-case tick contribution; drains a full 1024 ring in 128
+  iterations. Drain sits after the fill pump, before the timer —
+  control plane yields to market data within an iteration.
+- **Drain-site malformed re-check** counts into an engine-local field
+  (`Engine::ai_drain_malformed`, mirrored as
+  `engine_ai_drain_malformed_total`), NOT into
+  `AiIngressStatus::malformed_total` — preserves the per-field
+  single-writer discipline documented in `status.rs`. Deliberately no
+  `debug_assert` on that branch: §11 requires the "malformed rejected"
+  drain test, and the asserting boundary is the ingress.
+- **engine deps grew**: `ingress-ai` (the status-slot type; drain site
+  is the designated `expired_total` writer) and `core-io`
+  (`SlotCapture<Fill>`). mio rides along compile-time only.
+- **Fills capture semantics**: fills stage BEFORE `on_fill` (a strategy
+  panic cannot lose the record); flush cadence is the cli 5 s report
+  tick (`Engine::maybe_flush_fill_capture`, called outside the metrics
+  gate) + unconditional drain in `stop()`; `Observability` carries the
+  sink to the engine loop (`Option::take` at boot). Registry pair
+  `engine_fills_capture_{io_errors,records}` is mirrored centrally —
+  the engine owns this capture, unlike per-thread venue sinks.
+- **AI capture pair** (`engine_ingress_ai_capture_*`) mirrors from
+  inside the spawn wrapper only after `run()` returns / on rebind /
+  at exit — venue-wrapper parity; stale mid-run by design (live AI
+  health = the centrally mirrored status counters).
+- **Heartbeat-age sentinel picked**: gauge = `now − last_heartbeat_ns`;
+  `last_heartbeat_ns == 0` ⇒ **-1** ("no heartbeat ever") — a literal
+  0 would read as maximally fresh. Documented on the field.
+- **Key handling**: `AI_INGRESS_HMAC_KEY` absent/empty ⇒ ingress-ai not
+  spawned (info log, producer dropped — §3.3 unspawned shape);
+  present-but-invalid ⇒ **fatal boot error** (typo ≠ absence). Parsed
+  in cli (`parse_ai_hmac_key`, error strings carry no key material);
+  deliberately NOT a `core_config::Config` field (`print-config`
+  debug-prints Config). `AI_INGRESS_SOCK` IS a Config field
+  (tilde-expanded like `log_dir`).
+- **`spawn_ai` runs unpinned** — core 4 note honored: RSS owns core 4
+  until item 16; rebind-on-error loop with 500 ms backoff; ruleset
+  seam is a documented no-op closure until item 14.
+- **`Consumers` carries `ai_cmds` + `ai_status`** — one struct change
+  instead of a 7-wrapper signature ripple; documented on the field.
+- **StrategySet interpretation calls** (all from §7 text, recorded for
+  review): member sizes per the §7 sketch (`LatencyArb<64>`, ev 8,
+  cross-arb 8×8, rule-tree 8); `on_start` validates
+  **initially-enabled members only** (fail-fast preserved; members
+  outside the mask boot unvalidated + inert — safe because all four
+  have validation-only `on_start`; rustdoc'd invariant);
+  **HaltRequest clears the enable mask** in addition to setting the
+  sticky flag (kill-switch reading; no wire Resume);
+  `enable_refused` counts BOTH halted refusals and reserved/unknown-
+  slot enables (one counter per spec; capture stream disambiguates);
+  `--strategy all` = requested ∩ **configured** mask (latency-arb from
+  mandatory pairs; ev/cross-arb/rule-tree only when their flags are
+  present) — every enabled member still validates; composed set is
+  **paper-only until 8i**; single-name `--strategy` values keep their
+  existing monomorphized paths (back-compat per §7).
+- **`StrategyCounters::ai_enable_refused`** added as a defaulted trait
+  method (0 for plain strategies) so the generic engine loop mirrors
+  `engine_ai_enable_refused_total` without set-specific plumbing;
+  `engine_strategy_set_active` gauge added so kind `"set"` is visible
+  in the active-strategy family.
+- **Config-helper dedup**: `configure_{latency_arb,ev,cross_arb,
+  rule_tree}` extracted in `paper.rs`; the four standalone
+  `engine_loop_*` fns and the set builder share them (no third copy of
+  the ev loader exists).
+- **Stale-rmeta incidents: 3** (strategy-core after the `on_ai` trait
+  addition, core-io→engine after the `SlotCapture` hoist,
+  strategy-core again after `ai_enable_refused`) — all cleared with
+  `cargo clean -p <crate>` + retry per CLAUDE.md pitfall #10 corollary;
+  no false greens (sandbox never used for cargo).
+- Open defects: none known.
+
+**3. Exact resume point.** Design §12 **item 8 —
+`strategy-ai-exec`** (S4). First actions: read design §7
+`strategy-ai-exec` paragraph + §5.4 staleness semantics; then new
+crate `strategy-ai-exec`: fixed `[FairEntry; 64]` keyed by sym
+(open-addressed linear probe, no hashing), entries
+`{px_1e6, set_ns, ttl_ns, bias_1e6}` fed by SetFairValue/SetBias via
+`on_ai`; deviation quoting vs venue book beyond edge param;
+OrderIntent honor (paper; slot 4 target enforced by the shape table);
+staleness = `now - last_accepted_frame_ns > 15 s` ⇒ pull quotes +
+refuse intents (heartbeat liveness derived at the consumer, §4.3;
+compile-time consts per §13 d6); `expire_on_silence` flag ties
+entries to heartbeat liveness. Then wire it into `strategy-set` as
+the slot-4 member (BIT_AI_EXEC becomes built; `--strategy` name
+`ai-exec`?— check §7/§6 for the operator-facing name before
+inventing one) + bench alloc gates ai-exec `on_tick`/`on_ai`. Item 9
+(worker core I: frames.py/uds.py/state.py + fake UDS fixture +
+golden vectors shared with Rust) follows in the same session if
+context allows.
+
+**4. S4 kickoff prompt (ready to paste):**
+
+```
+Stage 2 — 8f AI-Ingress, IMPLEMENTATION SESSION S4 (checklist items
+8–9: strategy-ai-exec + worker core I), ISOLATED WORKTREE, parallel
+to the soak/remediation session. NEVER touch
+/Users/darkcite/trading-engine-multivenue.
+WORKTREE: /Users/darkcite/trading-engine-stage2, branch
+stage2/8f-ai-ingress (now at 1a45165 + the S3 handoff commit).
+Verify get_project_modules against the worktree path FIRST; if the
+MCP won't attach, stop.
+AUTHORITY: docs/phase-8f-design.md (§13 LOCKED, §3/§13.1 capture
+amendment in force) + latest phase-8f-progress.md entry (S3 handoff)
+supersede the committed plan.
+REQUIRED READING, in order:
+1. docs/phase-8f-progress.md — S3 handoff (state, deviations,
+   StrategySet interpretation calls, this prompt)
+2. docs/phase-8f-design.md §2 (ai-exec row), §3 (per-kind table:
+   SetFairValue/SetBias/OrderIntent rows, expire_on_silence flag),
+   §5.1+§5.3 (worker subsystems for item 9), §5.4 (staleness — BOTH
+   sides), §7 (ai-exec paragraph), §10, §11 (ai-exec + Python rows),
+   §13 decisions 1/2/6
+3. CLAUDE.md (pitfalls #6/#10/#11)
+Committed S3 surface to build on: engine ai lane
+(Strategy::on_ai, AI_DRAIN_BUDGET, ai_status getter, fills capture,
+ENGINE_FILLS_FILE), strategy_set::{StrategySet, mask_for_name,
+BIT_*/SLOT_* consts, *_mut accessors, enable_refused_total},
+StrategyCounters::ai_enable_refused, cli::{spawn_ai,
+parse_ai_hmac_key, open_fills_capture, engine_loop_set_full},
+core_io::SlotCapture, core-config ai_ingress_sock; S1/S2 surfaces
+unchanged.
+S4 SCOPE — item 8 then item 9, one commit each (8 may split
+8a crate / 8b set+cli wiring):
+item 8: new crate strategy-ai-exec per §7: [FairEntry; 64] fair
+table keyed by sym, open-addressed LINEAR PROBE (no hashing in hot
+path), entries {px_1e6, set_ns, ttl_ns, bias_1e6}; on_ai consumes
+SetFairValue/SetBias (slot-4-agnostic kinds fan in via StrategySet)
++ OrderIntent (honor in paper: submit via ctx at intent px/qty/side/
+venue; strategy_id already validated = 4 by the shape table);
+deviation quoting: quote/take when venue book deviates beyond edge
+param vs fair±bias; TTL per entry (engine-monotonic ts_ns base,
+decision 1); staleness per §5.4: now − last_accepted_frame_ns >
+15 s ⇒ pull AI quotes + refuse intents, recover on next valid
+frame (heartbeat/any-frame liveness derived from popped frames —
+NO extra atomics, §4.3; 5 s/15 s compile-time consts, env-tunable
+in tests only, decision 6); expire_on_silence flag (bit 0) ties
+entries to heartbeat liveness in addition to their TTL; then wire
+as the slot-4 member of StrategySet (BIT_AI_EXEC becomes built,
+mask_for_name gains the member name — take the operator-facing
+name from the design, do not invent), --strategy all picks it up;
+unit suite per §11 row (fair-table TTL, staleness pull 15 s,
+expire_on_silence, OrderIntent paper flow) + bench alloc gates
+ai-exec on_tick AND on_ai 0 B/op (release, --test-threads=1).
+item 9: worker core I per §5.1/§5.3: claude-worker/src/
+claude_worker/{frames.py, uds.py, state.py} — frames.py: AiCmd
+pack (struct.pack_into into ONE preallocated 82-B bytearray per
+connection), kinds, HMAC tag16, seq alloc via state.py; uds.py:
+UDS client, connect, heartbeat-precedes-payload, send_frame,
+single-writer; state.py: SQLite WAL (dedupe, seq allocator
+surviving reconnects, event log incl. send timestamps — the
+capture amendment made this the only structured send-time record);
+tests: fake UDS server fixture (accept, len check, HMAC verify
+with test key, record frames), golden frame vectors CHECKED IN and
+shared with Rust (fixture bytes + test key; add a Rust-side test
+in ingress-ai consuming the same fixture file so the two packers
+cannot drift), imports-are-full test extended. Python: 3.14.7 via
+uv 0.12.5 (/opt/homebrew/bin/uv), full `import x` only, no live
+SDK calls (llm.py does not exist yet — item 11).
+Tests: cargo on the Mac ONLY (pitfall #10; sandbox = greps only);
+stale-rmeta playbook: 3 incidents in S3 — impossible unresolved-
+import/method errors after edits ⇒ cargo clean -p <touched> and
+retry. uv run pytest for claude-worker.
+Hot-path rules absolute: zero alloc, no dyn, no tokio, no
+serde_json. Tests override AI_INGRESS_SOCK under
+/tmp/stage2-ai-<pid>/ (OWN parent dir — bind_uds force-chmods the
+parent 0700), METRICS_BIND stage2-local (never 9191),
+MULTIVENUE_LOG_DIR stage2-local; never ~/multivenue/logs, never
+/tmp/soak*; no kill/pkill by name (by-PID of own test processes
+only, after diagnosis).
+HARD ISOLATION unchanged: all work ONLY under
+/Users/darkcite/trading-engine-stage2; NEVER run `multivenue-engine
+run`, bind 127.0.0.1:9191, or connect live venues. Git: small
+commits ONLY on stage2/8f-ai-ingress inside the worktree; NO
+merge/rebase/push; no git ops in the main checkout.
+SESSION FACTS: RustRover MCP execute_terminal_command MUST
+executeInShell=true, ≤45 s per call — long builds via
+nohup > /tmp/stage2-build.log & then poll; projectPath = the
+worktree. macOS test landmines (S2): SO_RCVTIMEO EINVAL on
+peer-closed UDS (nonblocking EOF probes); std::thread::scope +
+panicking scenario hangs without a StopOnDrop guard (pattern in
+crates/ingress-ai/tests/uds_loopback.rs); `sample <pid>` is the
+hang diagnostic. One commit per (sub-)item, tests green on the Mac
+before the next, one-line status after each; ask before anything
+ambiguous.
+STOP after item 9: append §12.2 handoff (status, interim state,
+resume point, S5 kickoff for items 10–11) to
+docs/phase-8f-progress.md. All session notes to
+phase-8f-progress.md ONLY — phase-8-progress.md belongs to the
+other session. If context runs short: write interim state + exact
+resume point + relaunch prompt into phase-8f-progress.md, then
+tell me.
+```
