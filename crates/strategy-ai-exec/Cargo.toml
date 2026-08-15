@@ -1,0 +1,18 @@
+[package]
+name         = "strategy-ai-exec"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "AiExec: AI-driven fair-value/deviation strategy — fixed fair table (linear probe, TTL), staleness fail-safe, paper OrderIntent honor (Phase 8f §7)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+book-builder  = { workspace = true }
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }
