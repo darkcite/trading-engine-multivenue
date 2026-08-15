@@ -61,6 +61,7 @@ def _cfg(sock: pathlib.Path, tmp_path: pathlib.Path) -> claude_worker.config.Ser
         replay_dir=tmp_path / "replay",
         db_path=tmp_path / "state.db",
         features_dir=tmp_path / "features",
+        market_map_path=tmp_path / "market-map.json",
         rss_feeds=(FEED_URL,),
         anthropic_api_key="sk-ant-test-000",
     )

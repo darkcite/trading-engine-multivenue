@@ -29,6 +29,7 @@ them in item 12+).
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import collections.abc
 import dataclasses
 import json
 import pathlib
@@ -189,10 +190,16 @@ class CollectResult(typing.NamedTuple):
     torn_files: list[str]
 
 
-def collect_run(run_dir: pathlib.Path, features_dir: pathlib.Path) -> CollectResult:
+def collect_run(
+    run_dir: pathlib.Path,
+    features_dir: pathlib.Path,
+    syms: collections.abc.Container[int] | None = None,
+) -> CollectResult:
     """Feature-extract every ``*-ticks.pmlr`` in one run dir and write the
     per-symbol files. The replay log is the primary data source (§5.1);
-    REST never participates here."""
+    REST never participates here. ``syms`` (item 12, ``fetch --symbols``)
+    restricts which per-symbol files are WRITTEN; marks are always
+    collected for every symbol (the positions view needs full coverage)."""
     feats: dict[int, SymbolFeatures] = {}
     marks: dict[int, int] = {}
     torn: list[str] = []
@@ -202,6 +209,12 @@ def collect_run(run_dir: pathlib.Path, features_dir: pathlib.Path) -> CollectRes
             collect_marks(reader, into=marks)
             if reader.torn:
                 torn.append(path.name)
+    if syms is not None:
+        selected: dict[int, SymbolFeatures] = {}
+        for sym, entry in feats.items():
+            if sym in syms:
+                selected[sym] = entry
+        feats = selected
     paths = write_feature_files(features_dir, run_dir.name, feats)
     return CollectResult(feature_paths=paths, marks=marks, torn_files=torn)
 

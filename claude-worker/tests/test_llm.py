@@ -51,6 +51,7 @@ def test_make_client_uses_serve_config_key(tmp_path: pathlib.Path) -> None:
         replay_dir=tmp_path / "replay",
         db_path=tmp_path / "state.db",
         features_dir=tmp_path / "features",
+        market_map_path=tmp_path / "market-map.json",
         rss_feeds=(),
         anthropic_api_key="sk-ant-test-not-a-real-key",
     )

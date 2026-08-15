@@ -75,6 +75,12 @@ _SCHEMA: tuple[str, ...] = (
 EVENT_FRAME_SENT: str = "frame_sent"
 
 
+class StateError(RuntimeError):
+    """State-layer failure (corrupted/unavailable database). The verb
+    layer maps this to §6 exit code 5. Subclasses RuntimeError so
+    pre-item-12 callers' expectations hold."""
+
+
 class State:
     """Open handle on the worker database. Boot-time construction; verbs
     and the serve loop hold exactly one for their lifetime."""
@@ -85,7 +91,7 @@ class State:
         mode = self._conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
         if str(mode).lower() != "wal":
             self._conn.close()
-            raise RuntimeError(f"SQLite WAL mode unavailable for {db_path}: got {mode!r}")
+            raise StateError(f"SQLite WAL mode unavailable for {db_path}: got {mode!r}")
         with self._conn:
             for i in range(len(_SCHEMA)):
                 self._conn.execute(_SCHEMA[i])
@@ -113,14 +119,14 @@ class State:
                 "UPDATE ai_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq"
             ).fetchone()
         if row is None:
-            raise RuntimeError("ai_seq row missing — state database corrupted")
+            raise StateError("ai_seq row missing — state database corrupted")
         return int(row[0]) - 1
 
     def peek_seq(self) -> int:
         """Next value ``next_seq`` would return (test/diagnostic surface)."""
         row = self._conn.execute("SELECT next_seq FROM ai_seq WHERE id = 1").fetchone()
         if row is None:
-            raise RuntimeError("ai_seq row missing — state database corrupted")
+            raise StateError("ai_seq row missing — state database corrupted")
         return int(row[0])
 
     # ---- dedupe (§5.3) ----
@@ -198,7 +204,7 @@ class State:
             )
         rowid = cur.lastrowid
         if rowid is None:
-            raise RuntimeError("events insert returned no rowid")
+            raise StateError("events insert returned no rowid")
         return int(rowid)
 
     def record_frame_sent(self, seq: int, kind: int, send_ts_ns: int) -> int:

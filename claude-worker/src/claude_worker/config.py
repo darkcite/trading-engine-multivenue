@@ -40,6 +40,7 @@ class BaseConfig:
     replay_dir: pathlib.Path
     db_path: pathlib.Path
     features_dir: pathlib.Path
+    market_map_path: pathlib.Path
     rss_feeds: tuple[str, ...]
 
     def assert_complete(self) -> None:
@@ -56,6 +57,8 @@ class BaseConfig:
             raise ValueError(f"CLAUDE_WORKER_DB must be absolute: {self.db_path}")
         if not self.features_dir.is_absolute():
             raise ValueError(f"CLAUDE_WORKER_FEATURES_DIR must be absolute: {self.features_dir}")
+        if not self.market_map_path.is_absolute():
+            raise ValueError(f"CLAUDE_WORKER_MARKET_MAP must be absolute: {self.market_map_path}")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -132,6 +135,13 @@ def load_base_from_env(env: collections.abc.Mapping[str, str] | None = None) -> 
         features_dir=_path_from(
             source, "CLAUDE_WORKER_FEATURES_DIR", str(home / "multivenue/worker/features")
         ),
+        # S6 operator decision (S5 open question 2): the labeling universe
+        # ({market name -> SymbolId}) and the HIP-4 (yes,no) pairs live in ONE
+        # operator-editable JSON file. Missing file = empty map (valid
+        # degraded mode: triage-only serve, no netting view).
+        market_map_path=_path_from(
+            source, "CLAUDE_WORKER_MARKET_MAP", str(home / "multivenue/worker/market-map.json")
+        ),
         rss_feeds=_parse_rss_feeds(source.get("RSS_FEEDS", "")),
     )
     cfg.assert_complete()
@@ -150,6 +160,7 @@ def load_serve_from_env(env: collections.abc.Mapping[str, str] | None = None) ->
         replay_dir=base.replay_dir,
         db_path=base.db_path,
         features_dir=base.features_dir,
+        market_map_path=base.market_map_path,
         rss_feeds=base.rss_feeds,
         anthropic_api_key=source.get("ANTHROPIC_API_KEY", ""),
     )

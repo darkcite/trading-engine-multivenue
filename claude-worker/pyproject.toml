@@ -17,6 +17,11 @@ dependencies = [
     "structlog>=26.1.0",
 ]
 
+# Deferred from item 2 by design (no dangling entry point before cli.py
+# existed); added with the verb surface in item 12.
+[project.scripts]
+claude-worker = "claude_worker.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",

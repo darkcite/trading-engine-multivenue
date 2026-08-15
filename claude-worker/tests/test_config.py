@@ -46,7 +46,23 @@ def test_load_base_defaults_applied() -> None:
     assert cfg.ai_ruleset_dir == home / "multivenue/artifacts/rulesets"
     assert cfg.db_path == home / "multivenue/worker/state.db"
     assert cfg.features_dir == home / "multivenue/worker/features"
+    assert cfg.market_map_path == home / "multivenue/worker/market-map.json"
     assert cfg.rss_feeds == ()
+
+
+def test_load_base_market_map_key_respected() -> None:
+    """CLAUDE_WORKER_MARKET_MAP (S6 operator decision, S5 open question 2)."""
+    env = dict(_BASE_ENV)
+    env["CLAUDE_WORKER_MARKET_MAP"] = "/tmp/stage2-test/mm.json"
+    cfg = claude_worker.config.load_base_from_env(env=env)
+    assert cfg.market_map_path == pathlib.Path("/tmp/stage2-test/mm.json")
+
+
+def test_load_base_relative_market_map_fails_fast() -> None:
+    env = dict(_BASE_ENV)
+    env["CLAUDE_WORKER_MARKET_MAP"] = "relative/mm.json"
+    with pytest.raises(ValueError, match="CLAUDE_WORKER_MARKET_MAP"):
+        claude_worker.config.load_base_from_env(env=env)
 
 
 def test_load_base_expands_tilde() -> None:
