@@ -3,6 +3,136 @@
 Working notes per the Stage-1 operating agreement: each entry records
 what is done, what is next, and open issues at a clean boundary.
 
+## 2026-08-15 (ninth entry) — G1 re-soak (4 h per operator pick) on 9d473ca: deribit monitor FIXED — gaps_total=0 across 453 k msgs through two weather windows; §6.6 pairing letter now mechanical and PASS (0==0); the run's one real loss (11 trades in a dying session) caught OFFLINE and paired with the logged reconnect; metrics + gauge fixes validated live
+
+Operator-run validation soak per the G1 remediation work order. Tree
+committed at 9d473ca before launch (operator word: fix + eighth entry
++ work order in one commit); binary built post-commit
+(fingerprint-clean). No code changes during the soak; no further git
+ops; this entry left uncommitted.
+
+### Setup
+
+- Launch 2026-08-15T07:44:50Z → SIGINT ≈11:52:14Z (samples ran the
+  cadence a few minutes long): single pid 28739 throughout, clean
+  exit — all six run-loops `res=Stopped` within ~32 ms of ONE SIGINT.
+- CLI: same shape as the first soak — `run --paper` · PM Xi-2027 YES
+  token · okx BTC-USDT,ETH-USDT,BTC-USDT-SWAP · deribit
+  BTC/ETH-PERPETUAL · hl `BTC,ETH,SOL,#10890` · `--polygon-path /` ·
+  `--raw-tap deribit,rpc`.
+- HIP-4 re-probe before launch (house rule: never reuse an outcome
+  id): BTC 1d priceBinary = **outcome 1089** (targetPrice 63069,
+  expiry 20260816-0600) → Yes coin `#10890` — successor of the
+  settled 1081/#10810, as the eighth entry predicted.
+- Boot <10 s: run dir `run-1786779891499577000`; coverage okx 3/3 of
+  1951 · deribit 2/2 of 92 · hl 4/4 of 572 · pm 1/1; zero boot ERRORs.
+- Timing: operator chose "4 h now" over waiting for the 03:00–04:30Z
+  Aug 16 window; the 06:00Z settlement therefore lands outside this
+  soak by construction — HIP-4 lifecycle observation stays open for
+  the 24 h run.
+- RPC leg: still the keyless stand-in; parse errors EXPECTED + tapped.
+
+### Samples (11 over 4 h; raw table in /tmp/soak2-notes.md)
+
+T+4h counters: msgs pm 3 508 · bn 316 169 · okx 342 740 · deribit
+453 392 · hl 218 001 · rpc 7 316 (Σ ≈ 1.34 M). reconnects pm 1 ·
+bn 2 · okx 7 · **deribit 1** · hl 39 · rpc 1; resubscribes 0
+everywhere. gaps_total: **deribit 0**, hl 5 (staleness class — see
+below), all other venues 0. ring_drops_total 0 everywhere all run;
+capture_io_errors 0; disk 55→53 Gi; capture dir 96 MB/4 h (in band
+vs 142 MB/6 h).
+
+Remediation items validated live:
+
+1. **Item 1 (the blocker)**: deribit gaps_total stayed 0 for the
+   entire run — including two reconnect-cluster weather windows
+   (~T+50–75, +12 reconnects; ~T+200–225, +11) — exactly the
+   condition class that minted 67 false positives in 6 h on the old
+   16-row-capped monitor. Zero `seq gap` WARN lines (consistent: no
+   increments).
+2. **Item 2**: zero scrape failures across all 11 samples + retries
+   never armed (first soak: 2 EAGAIN failures in 6 h); zero raw
+   untimestamped `metrics:` lines (the eprintln path is gone).
+3. **Item 3**: capture_records gauges nonzero for ALL six venues at
+   T+90 s with zero run-loop exits (first soak: frozen at 0 /
+   first-cycle values), advancing at every sample thereafter.
+
+### audit-replay (full output /tmp/soak2-audit.txt)
+
+- Coverage matrix: every configured venue×channel stream present,
+  including the outcome coin (hl sym 0x04000004 = #10890): ticks
+  1 471, book 2 755 IN-BAND, trades 1 892.
+- Integrity: regr/holes/missing/chain_breaks = 0 on every stream —
+  except deribit BTC-PERPETUAL trades: **holes=1, missing=11** (next
+  bullet). okx ticks ×3 + mark IN-BAND; hl book ×4 IN-BAND. hl trade
+  `regr≈n/2` equal-timestamp display trait persists (cosmetic note
+  still open).
+- **NEW pairing section (first live use)**:
+  `deribit: gap_events_total=0 (trade=0 book=0) — must equal the
+  run's final gaps_total` → runtime gaps_total = 0. **0 == 0: the
+  §6.6 letter is now a one-number-vs-one-number check, and it
+  passes.**
+- **The one real loss, localized and explained**: seqs
+  296257792 → 296257804 (11 trades missing), capture wall time
+  ~11:17:48Z → 11:18:49Z — exactly the final minute of the run's
+  single deribit session, which died with `res=Error` at
+  11:18:56.59Z (supervisor reconnected; venue does not replay
+  trades). The runtime monitor re-arms AWAITING per session BY
+  DESIGN (8c decision), so cross-session deltas are exactly the
+  offline audit's job — and the audit caught one on its first
+  deployment. This is loss-during-disconnect, the §6.2
+  expected-and-unrecoverable class; it is *paired with a logged
+  venue event* (the reconnect), i.e. explained under §6.6's own
+  wording.
+- Raw taps: deribit tap 64 B header-only — **ZERO rejects across
+  453 392 msgs** (starbase parsing regression-clean again). rpc tap
+  records=9 879 rejects=9 879 — the known keyless-stand-in
+  `eth_subscription` newHeads shape, byte-for-byte the seventh-entry
+  diagnosis.
+
+### §6.6 verdict (amended 4–6 h basis + the new pairing check)
+
+- `ring_drops_total == 0` everywhere: **PASS**.
+- Coverage = 100 % of configured symbols (boot + audit matrix): **PASS**.
+- Cadence verdicts IN-BAND (okx ticks/mark, hl book incl. #10890): **PASS**.
+- Deribit tap rejects == 0 across the full run: **PASS**.
+- capture_io_errors == 0: **PASS**.
+- rpc rejects: expected-nonzero per keyless stand-in: **PASS (as-expected)**.
+- **Zero unexplained gaps — substance AND letter: PASS.** deribit
+  gaps_total=0 == TradeGap/BookGap events 0 (mechanical); hl
+  gaps_total=5 == 5 logged `Stale` lines + reconnects (the §6.2
+  staleness signature, by design); the offline-only deribit hole is
+  paired with the logged 11:18:56Z session error. Nothing is
+  unexplained.
+- The first soak's monitor-defect class (67 false positives):
+  **EXTINCT** under live weather.
+- Overall: **G1 criteria met on the operator-amended basis** —
+  and **G1 BLESSED by the operator the same day (2026-08-15)**:
+  Stage 2 is unblocked (plan §12 G1 row updated; overview note in
+  phase-8-plan.md header).
+
+### Open items
+
+1. HIP-4 settlement lifecycle (outcomeMetaUpdates + successor id)
+   still unobserved live — every window so far missed 06:00Z; the
+   24 h gate run covers it by construction. Re-probe before ANY
+   launch remains mandatory (this run: 1081 → 1089 confirmed).
+2. ALCHEMY_HOST + key still pending — rpc leg stays expected-reject.
+3. OKX still carries its own `MAX_TRADE_ROWS = 16` seq-check cap —
+   the same latent pattern class just fixed on deribit (different
+   wire semantics: book-wide seqIds, forward jumps legitimate, so
+   the phantom mechanism differs) — fold into the deferred OKX
+   object-extent trade-slicing hardening (post-G1).
+4. hl equal-timestamp trade-batch `regr≈n/2` audit display note
+   (cosmetic) still open.
+5. Audit nicety (new): annotate derived holes that coincide with
+   session boundaries — this run's hole↔reconnect pairing was
+   trivial but hand-done.
+6. With G1 blessed on the amended basis, the full 24 h all-venue
+   soak is no longer a gate blocker — it stands as the §11
+   system-test row and naturally rides an 8h backtest capture
+   window.
+
 ## 2026-08-15 (eighth entry) — G1 first soak (6 h per operator directive): data completeness PROVEN from capture; deribit runtime gap monitor over-counts (67 counted, zero lost); HIP-4 #enc streamed all 6 h
 
 Operator-run observation soak per §12 G1 row (24 h → 6 h, operator

@@ -23,6 +23,8 @@ Staging (operator directive): **Stage 1 — prove the code successfully captures
 ALL public market data from ALL venues** (8a–8e; gate G1 = §6.6 acceptance on
 every venue). No Stage-2/3 work merges before G1 passes. Stage 2 — AI-Ingress +
 research loop (8f–8h). Stage 3 — risk, execution, live (8i–8k). Details in §12.
+**G1 BLESSED by operator 2026-08-15** on the amended 4–6 h basis (§12 G1 row;
+progress log eighth + ninth entries) — Stage-2 work is unblocked.
 
 ---
 
@@ -892,7 +894,7 @@ this the gating work item; live trading on any new venue is blocked on it.
 | 8c | Deribit MD ingress | same + heartbeat protocol proven | 2–3 d |
 | 8d | Hyperliquid MD + HIP-4 discovery | BTC daily outcome streamed via `#<enc>`; `outcomeMetaUpdates` handled | 3–4 d |
 | 8e | Feed-completeness harness + `audit-replay` | **DELIVERED 2026-08-15** — discovery + capture + audit live-verified; Deribit rejects root-caused/fixed (progress log, seventh entry) | 2–3 d (overlaps) |
-| **G1** | **Gate: §6.6 acceptance on ALL five venues** — 24 h soak, zero unexplained gaps, `ring_drops_total == 0`, 100% configured coverage, cadences in-band | **no Stage-2/3 work merges before G1** (operator directive 2026-08-15: first soak shortened to 6 h) | — |
+| **G1** | **Gate: §6.6 acceptance on ALL five venues** — 24 h soak, zero unexplained gaps, `ring_drops_total == 0`, 100% configured coverage, cadences in-band | **PASSED — operator blessing 2026-08-15**, on the operator-amended 4–6 h basis (directives 2026-08-15: first soak 6 h; re-soak 4 h). Evidence: first 6 h soak proved completeness from capture with one monitor defect (eighth entry); remediation commit 9d473ca (monitor fix + 1:1 gap-event pairing + audit pairing section) + 4 h re-soak passed every criterion including the now-mechanical pairing letter, gaps_total==gap_events==0 (ninth entry). **Stage-2/3 merges unblocked.** The full 24 h all-venue soak remains listed as the §11 system-test row (naturally rides an 8h backtest capture window) | — |
 
 **Stage 2 — AI-Ingress and the research loop** (consumes Stage-1 capture).
 

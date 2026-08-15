@@ -1,5 +1,16 @@
 # G1 remediation + re-soak plan (post first 6 h soak)
 
+**STATUS 2026-08-15: CLOSED — G1 BLESSED.** All three work items
+shipped in commit 9d473ca (every-row trade-seq checking, 1:1
+TradeGap/BookGap pairing events + audit-replay pairing section,
+metrics accept nonblocking-inherit fix via event sink → tracing,
+capture_records gauge on the 1 s flush cadence; gates 836/836 +
+30/30 alloc 0 B/op). The 4 h re-soak (run-1786779891499577000)
+passed every §6.6 criterion on the amended basis — deribit
+gaps_total==gap_events==0 across 453 k msgs — and the operator
+blessed G1 the same day (ninth progress entry; plan §12 G1 row).
+Kept as the work-order record.
+
 2026-08-15. Basis: eighth progress entry; capture
 `~/multivenue/logs/run-1786742370972151000` (142 MB, keep — it is the
 regression-fixture source). Operator decisions baked in: Alchemy key
