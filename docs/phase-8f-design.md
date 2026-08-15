@@ -119,10 +119,18 @@ ttl_ns` is not storable in the slot, so the engine checks TTL at the drain
 site against ring-residency: `now_ns - ingress_recv_ns > ttl_ns ⇒ drop +
 `engine_ingress_ai_expired_total``. Implementation: `ingress-ai` rewrites
 `ts_ns` to its own `now_ns` at accept time (after HMAC verify, before ring
-push) — the original worker send time is preserved in the PMLR capture record
-only. This keeps the slot self-contained and clock-coherent.* If the operator
+push). This keeps the slot self-contained and clock-coherent.* If the operator
 prefers the plan's literal reading (trust worker ts), flip one line; flagged
 as review question Q1.
+
+> **AMENDED 2026-08-15 (S2, operator decision):** the PMLR capture record
+> carries the **rewritten** slot — byte-identical to what the ring consumer
+> sees (literal §4.4 step-6 ordering: rewrite, then capture, then push). The
+> worker's original send time is NOT preserved in the PMLR capture; it
+> survives only in the optional `--raw-tap` payload capture. The earlier
+> "preserved in the PMLR capture record only" wording here and in §13.1 is
+> dead. Worker-side send times remain reconstructable from the worker's own
+> SQLite event log (item 9).
 
 **Kinds:** `Heartbeat=0, EnableStrategy=1, DisableStrategy=2, SetFairValue=3,
 SetBias=4, SetParam=5, OrderIntent=6, RulesetStage=7, RulesetCommit=8,
@@ -218,7 +226,9 @@ Multiple commands = back-to-back frames on the stream.
 5. seq check vs last: `seq <= last` ⇒ `seq_regress_total`, discard;
    gap > 1 ⇒ `seq_gap_total`, accept (§6 monitors apply to the AI feed too)
 6. `ts_ns := now_ns()` rewrite (§3); PMLR capture (`SlotKind::AiCmd = 4`) —
-   capture BEFORE push so ring-dropped commands remain auditable (8e pattern)
+   capture BEFORE push so ring-dropped commands remain auditable (8e pattern).
+   The captured slot is the rewritten slot (operator decision 2026-08-15 —
+   see the §3 amendment)
 7. `try_push` → full ⇒ `ring_drops_total`
 8. Stage/Commit additionally routed to the side-path validator (§8)
 
@@ -697,7 +707,10 @@ operator to relaunch with the generated prompt.
 
 1. **AiCmd TTL clock base**: `ingress-ai` rewrites `ts_ns` to engine
    monotonic at accept (after HMAC verify, before ring push); TTL is
-   clock-coherent; worker send time preserved in PMLR capture only (§3).
+   clock-coherent. ~~Worker send time preserved in PMLR capture only~~
+   **AMENDED 2026-08-15 (S2, operator decision):** capture carries the
+   rewritten slot; worker send time survives only via `--raw-tap` (§3
+   amendment).
 2. **`push --kind order-intent`**: available in semi-manual from day one,
    paper-only; RiskGate clamp arrives with 8i. No config allowlist.
 3. **StrategySet home**: new crate `strategy-set`; `strategy-core` stays

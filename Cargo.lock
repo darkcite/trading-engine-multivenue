@@ -786,6 +786,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-ai"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-io",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "libc",
+ "mio 0.8.11",
+ "proptest",
+]
+
+[[package]]
 name = "ingress-binance"
 version = "0.1.0"
 dependencies = [

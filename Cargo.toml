@@ -17,6 +17,7 @@ members = [
     "crates/core-types",
 
     # --- ingress adapters (one per external source) ---
+    "crates/ingress-ai",
     "crates/ingress-binance",
     "crates/ingress-deribit",
     "crates/ingress-hyperliquid",
@@ -128,6 +129,7 @@ rcgen     = "0.13"
 # --- internal crates ---
 core-alloc   = { path = "crates/core-alloc" }
 core-config  = { path = "crates/core-config" }
+core-crypto  = { path = "crates/core-crypto" }
 core-io      = { path = "crates/core-io" }
 core-latency = { path = "crates/core-latency" }
 core-metrics = { path = "crates/core-metrics" }
@@ -138,6 +140,7 @@ core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 
+ingress-ai         = { path = "crates/ingress-ai" }
 ingress-binance    = { path = "crates/ingress-binance" }
 ingress-deribit    = { path = "crates/ingress-deribit" }
 ingress-hyperliquid = { path = "crates/ingress-hyperliquid" }

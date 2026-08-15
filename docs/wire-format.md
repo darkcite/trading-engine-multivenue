@@ -98,8 +98,10 @@ as the payload of an 82-byte HMAC-tagged UDS frame
 (`[len u16 = 80][AiCmd 64 B][tag 16 B]`), materialized and shape-checked
 by `ingress-ai`, captured to PMLR, pushed onto `Ring<AiCmd, 1024>`.
 `ts_ns` is rewritten to engine-monotonic time at accept (after HMAC
-verify, before ring push) — the worker's send time survives only in the
-capture record (design §13.1). Per-kind field shapes ("unused fields
+verify, before ring push) — the capture record carries the rewritten
+slot, byte-identical to what the ring consumer sees; the worker's send
+time survives only in the optional raw tap (design §3/§13.1 as amended
+2026-08-15). Per-kind field shapes ("unused fields
 MUST be zero / `SYMBOL_ID_NONE` / `0xFF`") are pinned in
 `docs/phase-8f-design.md` §3 and enforced by
 `core_types::AiCmd::validate_shape`.

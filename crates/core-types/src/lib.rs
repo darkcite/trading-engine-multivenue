@@ -796,8 +796,10 @@ pub enum AiCmdShapeError {
 ///
 /// `ts_ns` is rewritten by `ingress-ai` to engine-monotonic time at
 /// accept (after HMAC verify, before ring push) so TTL arithmetic never
-/// crosses clock domains — design §13 decision 1. The worker's original
-/// send time survives only in the PMLR capture record.
+/// crosses clock domains — design §13 decision 1. The PMLR capture
+/// record carries the rewritten slot (byte-identical to what the ring
+/// consumer sees — operator decision 2026-08-15); the worker's original
+/// send time survives only in the optional raw tap.
 #[derive(Copy, Clone, Debug)]
 #[repr(C, align(64))]
 pub struct AiCmd {
