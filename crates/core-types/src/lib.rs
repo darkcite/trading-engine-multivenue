@@ -513,6 +513,13 @@ unsafe impl AsBytes for Order {}
 // compiler-inserted padding, every byte initialized.
 unsafe impl AsBytes for ChannelEvent {}
 
+// SAFETY: AiCmd is `#[repr(C, align(64))]`, `#[derive(Copy)]`, all
+// fields plain integers + an explicit `_pad` array summing to exactly
+// 64 bytes (checked by the compile-time offset asserts below and
+// `ai_cmd_layout_is_fully_explicit`); no compiler-inserted padding,
+// every byte initialized.
+unsafe impl AsBytes for AiCmd {}
+
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
 // ---------------------------------------------------------------
@@ -650,6 +657,438 @@ impl ChannelEvent {
 }
 
 // ---------------------------------------------------------------
+// AiCmd — AI-ingress command slot (Phase 8f, plan §8.4)
+// ---------------------------------------------------------------
+
+// The AiCmd wire layout equals its in-memory layout only on
+// little-endian targets — the only targets this workspace supports
+// (docs/wire-format.md pins native-endian == LE).
+#[cfg(not(target_endian = "little"))]
+compile_error!("AiCmd wire format assumes little-endian (see docs/wire-format.md)");
+
+/// Command kind carried by [`AiCmd`]. Wire-stable (UDS frames, PMLR
+/// `slot_kind = 4`) — never renumber, only append.
+///
+/// There is deliberately **no `Resume` kind**: halt is sticky and
+/// requires a manual engine restart (docs/risk-policy.md), so the
+/// command cannot even be expressed on the wire.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AiCmdKind {
+    /// Liveness beacon (serve: every 5 s; verbs: one before payload).
+    Heartbeat = 0,
+    /// Set a strategy-set slot enable bit. Refused while halted.
+    EnableStrategy = 1,
+    /// Clear a strategy-slot enable bit. Always honored.
+    DisableStrategy = 2,
+    /// Publish a fair value for `sym` into the ai-exec table (TTL'd).
+    SetFairValue = 3,
+    /// Publish a signed bias for `sym` into the ai-exec table (TTL'd).
+    SetBias = 4,
+    /// Set a per-strategy numeric parameter (`param_id` selects).
+    SetParam = 5,
+    /// Paper-only order intent for the ai-exec strategy (8i clamps).
+    OrderIntent = 6,
+    /// Stage a validated ruleset by content hash (gates bound upstream).
+    RulesetStage = 7,
+    /// Commit a previously staged ruleset hash.
+    RulesetCommit = 8,
+    /// Request a sticky engine halt. No wire-expressible resume.
+    HaltRequest = 9,
+}
+
+impl AiCmdKind {
+    /// Raw byte value as stored in [`AiCmd::kind`].
+    #[inline(always)]
+    pub const fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a raw byte from a UDS frame or PMLR slot. `None` for
+    /// unknown values — the accept path counts these as malformed.
+    #[inline(always)]
+    pub const fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Heartbeat),
+            1 => Some(Self::EnableStrategy),
+            2 => Some(Self::DisableStrategy),
+            3 => Some(Self::SetFairValue),
+            4 => Some(Self::SetBias),
+            5 => Some(Self::SetParam),
+            6 => Some(Self::OrderIntent),
+            7 => Some(Self::RulesetStage),
+            8 => Some(Self::RulesetCommit),
+            9 => Some(Self::HaltRequest),
+            _ => None,
+        }
+    }
+}
+
+/// Capacity of the AI command SPSC ring (design §4.3). Power of two,
+/// like every `core-ring` capacity.
+pub const AI_RING_SIZE: usize = 1024;
+
+/// `AiCmd::flags` bit 0: the ai-exec fair-table entry this command
+/// creates additionally expires when worker heartbeats go stale,
+/// not only when its own TTL lapses. Valid on `SetFairValue` /
+/// `SetBias` only.
+pub const AI_CMD_FLAG_EXPIRE_ON_SILENCE: u16 = 1 << 0;
+
+/// `AiCmd::strategy_id` sentinel meaning "no strategy slot".
+pub const STRATEGY_SLOT_NONE: u8 = 0xFF;
+
+/// Hard ceiling on strategy-set slots. The runtime enable mask is a
+/// `u8` bitmask (design §7), so slot indices are wire-bounded to 0..8
+/// forever.
+pub const MAX_STRATEGY_SLOTS: u8 = 8;
+
+/// Strategy-set slot of `strategy-ai-exec` (design §7). `OrderIntent`
+/// commands must target exactly this slot.
+pub const STRATEGY_SLOT_AI_EXEC: u8 = 4;
+
+/// Strategy-set slot reserved for `strategy-vm` (8g). `RulesetStage` /
+/// `RulesetCommit` commands must target exactly this slot.
+pub const STRATEGY_SLOT_VM: u8 = 5;
+
+/// `AiCmd::side` sentinel meaning "no side" (every kind except
+/// `OrderIntent`).
+pub const AI_SIDE_NONE: u8 = 0xFF;
+
+/// Why an [`AiCmd`] failed [`AiCmd::validate_shape`]. Each variant maps
+/// to one violated row/column of the per-kind shape table in
+/// `docs/phase-8f-design.md` §3; the accept path folds all of them into
+/// `engine_ingress_ai_malformed_total` and keeps the frame in the PMLR
+/// capture for offline audit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AiCmdShapeError {
+    /// `kind` byte is not a known [`AiCmdKind`].
+    UnknownKind(u8),
+    /// Explicit tail padding contains a non-zero byte.
+    NonZeroPad,
+    /// `venue` byte is wrong for this kind (engine-directed kinds
+    /// require `VenueId::Ai`; `OrderIntent` requires a real market
+    /// venue).
+    BadVenue(u8),
+    /// `sym` violates the kind's required/forbidden rule.
+    BadSym(SymbolId),
+    /// `px` violates the kind's rule (must-be-zero, or sign/range).
+    BadPx(i64),
+    /// `qty` violates the kind's rule.
+    BadQty(i64),
+    /// `ttl_ns` violates the kind's required(>0)/must-be-zero rule.
+    BadTtl(u64),
+    /// `strategy_id` violates the kind's slot rule.
+    BadStrategySlot(u8),
+    /// `side` violates the kind's rule (`Side` byte or `0xFF`).
+    BadSide(u8),
+    /// `param_id` must be zero for every kind except `SetParam`.
+    BadParamId(u16),
+    /// `flags` carries bits the kind does not define.
+    BadFlags(u16),
+}
+
+/// AI-ingress command — 64 bytes, one cache line (Phase 8f, plan §8.4;
+/// byte layout pinned in `docs/wire-format.md`). Produced by
+/// `claude-worker` as the payload of an 82-byte HMAC-tagged UDS frame,
+/// materialized by `ingress-ai`, captured to PMLR (`slot_kind = 4`) and
+/// pushed onto the `Ring<AiCmd, AI_RING_SIZE>` consumed in
+/// `Engine::tick()`.
+///
+/// `ts_ns` is rewritten by `ingress-ai` to engine-monotonic time at
+/// accept (after HMAC verify, before ring push) so TTL arithmetic never
+/// crosses clock domains — design §13 decision 1. The worker's original
+/// send time survives only in the PMLR capture record.
+#[derive(Copy, Clone, Debug)]
+#[repr(C, align(64))]
+pub struct AiCmd {
+    /// Engine-monotonic accept time (see struct docs; worker send time
+    /// pre-rewrite).
+    pub ts_ns: NsTs,
+    /// Strictly increasing per worker session. Gaps are counted, never
+    /// fatal; regressions are discarded.
+    pub seq: u32,
+    /// Venue-namespaced [`SymbolId`], or [`SYMBOL_ID_NONE`] where the
+    /// kind carries no symbol.
+    pub sym: SymbolId,
+    /// Fixed-point ×1e6: fair value / intent price / param value /
+    /// ruleset hash bytes 0..8 LE.
+    pub px: i64,
+    /// Fixed-point ×1e6: intent quantity / ruleset hash bytes 8..16 LE.
+    pub qty: i64,
+    /// Expiry relative to `ts_ns` (engine clock after rewrite); 0 = no
+    /// expiry where the kind's shape allows it.
+    pub ttl_ns: u64,
+    /// [`AiCmdKind`] as raw byte.
+    pub kind: u8,
+    /// [`VenueId`] as raw byte: `Ai` for engine-directed commands, the
+    /// target market venue for `OrderIntent`.
+    pub venue: u8,
+    /// Strategy-set slot index, or [`STRATEGY_SLOT_NONE`].
+    pub strategy_id: u8,
+    /// [`Side`] as raw byte, or [`AI_SIDE_NONE`].
+    pub side: u8,
+    /// `SetParam` selector; 0 for every other kind.
+    pub param_id: u16,
+    /// Bit 0 = [`AI_CMD_FLAG_EXPIRE_ON_SILENCE`]; all other bits must
+    /// be zero.
+    pub flags: u16,
+    /// Explicit tail padding — [`AsBytes`] requires every byte of the
+    /// 64 B slot to be initialized. Always zero; enforced by
+    /// [`Self::validate_shape`] so captured frames stay canonical.
+    _pad: [u8; 16],
+}
+
+impl AiCmd {
+    /// Construct an `AiCmd` without naming the private padding field.
+    /// Production Rust only *parses* commands ([`Self::read_le`]); this
+    /// constructor serves tests and loopback clients.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        ts_ns: NsTs,
+        seq: u32,
+        sym: SymbolId,
+        px: i64,
+        qty: i64,
+        ttl_ns: u64,
+        kind: AiCmdKind,
+        venue: VenueId,
+        strategy_id: u8,
+        side: u8,
+        param_id: u16,
+        flags: u16,
+    ) -> Self {
+        Self {
+            ts_ns,
+            seq,
+            sym,
+            px,
+            qty,
+            ttl_ns,
+            kind: kind.to_u8(),
+            venue: venue.to_u8(),
+            strategy_id,
+            side,
+            param_id,
+            flags,
+            _pad: [0; 16],
+        }
+    }
+
+    /// Decoded [`AiCmdKind`], or `None` for an unknown `kind` byte.
+    #[inline(always)]
+    pub const fn kind(&self) -> Option<AiCmdKind> {
+        AiCmdKind::from_u8(self.kind)
+    }
+
+    /// Materialize an `AiCmd` from 64 wire bytes (little-endian, i.e.
+    /// native — compile-guarded above).
+    ///
+    /// Zero-copy accounting (doctrine): UDS frames sit at arbitrary
+    /// offsets in the rx buffer, so a 64-alignment-free view is
+    /// impossible; this is the **one documented copy** that materializes
+    /// the slot onto the stack (a handful of vector moves). The
+    /// subsequent ring `try_push` copy is ownership transfer, identical
+    /// to every other ingress.
+    #[inline(always)]
+    pub fn read_le(bytes: &[u8; 64]) -> Self {
+        // SAFETY: the source is a valid, initialized 64-byte buffer;
+        // `AiCmd` is `#[repr(C)]`, `Copy`, exactly 64 bytes (static
+        // asserts below), and every field is a plain integer type, so
+        // any bit pattern is a valid `AiCmd`. `read_unaligned` imposes
+        // no alignment requirement on the source.
+        unsafe { bytes.as_ptr().cast::<AiCmd>().read_unaligned() }
+    }
+
+    /// Validate kind range and the full per-kind field-shape table of
+    /// `docs/phase-8f-design.md` §3 ("unused fields MUST be zero /
+    /// `SYMBOL_ID_NONE` / `0xFF`"). Run by `ingress-ai` at accept
+    /// (§4.4 step 4) and by the engine drain site; failures increment
+    /// `engine_ingress_ai_malformed_total`.
+    pub fn validate_shape(&self) -> Result<(), AiCmdShapeError> {
+        let kind = match AiCmdKind::from_u8(self.kind) {
+            Some(k) => k,
+            None => return Err(AiCmdShapeError::UnknownKind(self.kind)),
+        };
+
+        // Canonical-bytes rule: explicit padding must be zero.
+        let mut i = 0;
+        while i < self._pad.len() {
+            if self._pad[i] != 0 {
+                return Err(AiCmdShapeError::NonZeroPad);
+            }
+            i += 1;
+        }
+
+        // Venue column: `Ai` for engine-directed kinds, a real market
+        // venue for intents.
+        match kind {
+            AiCmdKind::OrderIntent => match VenueId::from_u8(self.venue) {
+                Some(VenueId::Ai) | None => return Err(AiCmdShapeError::BadVenue(self.venue)),
+                Some(_) => {}
+            },
+            _ => {
+                if self.venue != VenueId::Ai.to_u8() {
+                    return Err(AiCmdShapeError::BadVenue(self.venue));
+                }
+            }
+        }
+
+        // Remaining columns, one arm per row of the §3 table.
+        match kind {
+            AiCmdKind::Heartbeat | AiCmdKind::HaltRequest => {
+                if self.sym != SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.px != 0 {
+                    return Err(AiCmdShapeError::BadPx(self.px));
+                }
+                if self.qty != 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns != 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_NONE {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id != 0 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::EnableStrategy | AiCmdKind::DisableStrategy => {
+                if self.sym != SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.px != 0 {
+                    return Err(AiCmdShapeError::BadPx(self.px));
+                }
+                if self.qty != 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns != 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id >= MAX_STRATEGY_SLOTS {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id != 0 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::SetFairValue | AiCmdKind::SetBias => {
+                if self.sym == SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                // Fair values are prices (non-negative); biases are
+                // signed by design.
+                if matches!(kind, AiCmdKind::SetFairValue) && self.px < 0 {
+                    return Err(AiCmdShapeError::BadPx(self.px));
+                }
+                if self.qty != 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns == 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_NONE {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id != 0 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags & !AI_CMD_FLAG_EXPIRE_ON_SILENCE != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::SetParam => {
+                // `sym` may be SYMBOL_ID_NONE (set-level) or a real
+                // symbol; `px` is the raw parameter value — both
+                // unconstrained here.
+                if self.qty != 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns != 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id >= MAX_STRATEGY_SLOTS {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::OrderIntent => {
+                if self.sym == SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.px <= 0 {
+                    return Err(AiCmdShapeError::BadPx(self.px));
+                }
+                if self.qty <= 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns == 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_AI_EXEC {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != Side::Bid as u8 && self.side != Side::Ask as u8 {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id != 0 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::RulesetStage | AiCmdKind::RulesetCommit => {
+                // `px`/`qty` carry hash128 halves — any bit pattern.
+                if self.sym != SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.ttl_ns != 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_VM {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id != 0 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------
 // Capture — per-ingress replay/tap sink (Phase 8e, §6.5)
 // ---------------------------------------------------------------
 
@@ -721,6 +1160,28 @@ static_assert_size!(Signal, 64);
 static_assert_size!(Fill, 64);
 static_assert_size!(Order, 64);
 static_assert_size!(ChannelEvent, 64);
+static_assert_size!(AiCmd, 64);
+
+// AiCmd byte layout is a cross-process wire contract (Python packs it,
+// docs/wire-format.md pins it) — every field offset is asserted at
+// compile time, same spirit as the `Tick` offset checks in tests but
+// build-breaking.
+const _: () = {
+    assert!(::core::mem::offset_of!(AiCmd, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(AiCmd, seq) == 8);
+    assert!(::core::mem::offset_of!(AiCmd, sym) == 12);
+    assert!(::core::mem::offset_of!(AiCmd, px) == 16);
+    assert!(::core::mem::offset_of!(AiCmd, qty) == 24);
+    assert!(::core::mem::offset_of!(AiCmd, ttl_ns) == 32);
+    assert!(::core::mem::offset_of!(AiCmd, kind) == 40);
+    assert!(::core::mem::offset_of!(AiCmd, venue) == 41);
+    assert!(::core::mem::offset_of!(AiCmd, strategy_id) == 42);
+    assert!(::core::mem::offset_of!(AiCmd, side) == 43);
+    assert!(::core::mem::offset_of!(AiCmd, param_id) == 44);
+    assert!(::core::mem::offset_of!(AiCmd, flags) == 46);
+    assert!(::core::mem::offset_of!(AiCmd, _pad) == 48);
+    assert!(AI_RING_SIZE.is_power_of_two());
+};
 
 // ---------------------------------------------------------------
 // Tests
@@ -1014,5 +1475,428 @@ mod channel_event_tests {
         Capture::raw_frame(&mut c, 1, b"payload");
         Capture::parse_reject(&mut c, 1, b"bad");
         Capture::maybe_flush(&mut c, 2);
+    }
+}
+
+#[cfg(test)]
+mod ai_cmd_tests {
+    use super::*;
+
+    /// Canonical valid command per kind — the §3 table's happy rows.
+    /// Failure tests mutate one field at a time off these.
+    fn valid(kind: AiCmdKind) -> AiCmd {
+        let sym = make_symbol_id(VenueId::Polymarket, 7);
+        match kind {
+            AiCmdKind::Heartbeat | AiCmdKind::HaltRequest => AiCmd::new(
+                1,
+                1,
+                SYMBOL_ID_NONE,
+                0,
+                0,
+                0,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_NONE,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
+            AiCmdKind::EnableStrategy | AiCmdKind::DisableStrategy => AiCmd::new(
+                1,
+                1,
+                SYMBOL_ID_NONE,
+                0,
+                0,
+                0,
+                kind,
+                VenueId::Ai,
+                2,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
+            AiCmdKind::SetFairValue => AiCmd::new(
+                1,
+                1,
+                sym,
+                500_000,
+                0,
+                5_000_000_000,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_NONE,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
+            AiCmdKind::SetBias => AiCmd::new(
+                1,
+                1,
+                sym,
+                -25_000,
+                0,
+                5_000_000_000,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_NONE,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
+            AiCmdKind::SetParam => AiCmd::new(
+                1,
+                1,
+                SYMBOL_ID_NONE,
+                42_000_000,
+                0,
+                0,
+                kind,
+                VenueId::Ai,
+                1,
+                AI_SIDE_NONE,
+                7,
+                0,
+            ),
+            AiCmdKind::OrderIntent => AiCmd::new(
+                1,
+                1,
+                sym,
+                480_000,
+                10_000_000,
+                2_000_000_000,
+                kind,
+                VenueId::Polymarket,
+                STRATEGY_SLOT_AI_EXEC,
+                Side::Bid as u8,
+                0,
+                0,
+            ),
+            AiCmdKind::RulesetStage | AiCmdKind::RulesetCommit => AiCmd::new(
+                1,
+                1,
+                SYMBOL_ID_NONE,
+                0x0123_4567_89AB_CDEFu64 as i64,
+                -42,
+                0,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_VM,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
+        }
+    }
+
+    const ALL_KINDS: [AiCmdKind; 10] = [
+        AiCmdKind::Heartbeat,
+        AiCmdKind::EnableStrategy,
+        AiCmdKind::DisableStrategy,
+        AiCmdKind::SetFairValue,
+        AiCmdKind::SetBias,
+        AiCmdKind::SetParam,
+        AiCmdKind::OrderIntent,
+        AiCmdKind::RulesetStage,
+        AiCmdKind::RulesetCommit,
+        AiCmdKind::HaltRequest,
+    ];
+
+    #[test]
+    fn ai_cmd_size_is_one_cache_line() {
+        assert_eq!(::core::mem::size_of::<AiCmd>(), 64);
+        assert_eq!(::core::mem::align_of::<AiCmd>(), 64);
+    }
+
+    #[test]
+    fn ai_cmd_layout_is_fully_explicit() {
+        // AiCmd: 8+4+4+8+8+8+1+1+1+1+2+2+16 = 64 — any compiler-
+        // inserted padding would break the AsBytes contract.
+        assert_eq!(::core::mem::size_of::<AiCmd>(), 64);
+    }
+
+    #[test]
+    fn ai_cmd_bytes_sit_at_documented_offsets() {
+        // docs/wire-format.md pins the AiCmd layout; the Python packer
+        // (claude-worker frames.py) depends on these exact positions.
+        let c = AiCmd::new(
+            0x1111_2222_3333_4444,
+            0xAABB_CCDD,
+            0x0500_0007,
+            0x0102_0304_0506_0708,
+            -1,
+            0x2222_0000_1111_0000,
+            AiCmdKind::SetParam,
+            VenueId::Ai,
+            1,
+            AI_SIDE_NONE,
+            0xBEEF,
+            0,
+        );
+        // SAFETY: AiCmd is AsBytes (repr(C), Copy, fully initialized);
+        // read-only byte view of a live stack value.
+        let b = unsafe { core::slice::from_raw_parts((&c as *const AiCmd).cast::<u8>(), 64) };
+        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 0x1111_2222_3333_4444);
+        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 0xAABB_CCDD);
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 0x0500_0007);
+        assert_eq!(
+            i64::from_le_bytes(b[16..24].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(i64::from_le_bytes(b[24..32].try_into().unwrap()), -1);
+        assert_eq!(
+            u64::from_le_bytes(b[32..40].try_into().unwrap()),
+            0x2222_0000_1111_0000
+        );
+        assert_eq!(b[40], AiCmdKind::SetParam.to_u8());
+        assert_eq!(b[41], VenueId::Ai.to_u8());
+        assert_eq!(b[42], 1);
+        assert_eq!(b[43], AI_SIDE_NONE);
+        assert_eq!(u16::from_le_bytes([b[44], b[45]]), 0xBEEF);
+        assert_eq!(u16::from_le_bytes([b[46], b[47]]), 0);
+        // Explicit tail padding must be zero.
+        let mut i = 48;
+        while i < 64 {
+            assert_eq!(b[i], 0);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn ai_cmd_kind_roundtrips_and_rejects_unknown() {
+        let mut i = 0;
+        while i < ALL_KINDS.len() {
+            let k = ALL_KINDS[i];
+            assert_eq!(AiCmdKind::from_u8(k.to_u8()), Some(k));
+            i += 1;
+        }
+        // 10 would be `Resume` if it existed. It must not: halt is
+        // sticky by design (risk-policy) — the wire cannot express it.
+        assert_eq!(AiCmdKind::from_u8(10), None);
+        assert_eq!(AiCmdKind::from_u8(0xFF), None);
+    }
+
+    #[test]
+    fn ai_cmd_read_le_roundtrips() {
+        let src = valid(AiCmdKind::OrderIntent);
+        // SAFETY: AiCmd is AsBytes; read-only byte view of a live value.
+        let b = unsafe { core::slice::from_raw_parts((&src as *const AiCmd).cast::<u8>(), 64) };
+        let arr: &[u8; 64] = b.try_into().unwrap();
+        let got = AiCmd::read_le(arr);
+        assert_eq!(got.ts_ns, src.ts_ns);
+        assert_eq!(got.seq, src.seq);
+        assert_eq!(got.sym, src.sym);
+        assert_eq!(got.px, src.px);
+        assert_eq!(got.qty, src.qty);
+        assert_eq!(got.ttl_ns, src.ttl_ns);
+        assert_eq!(got.kind, src.kind);
+        assert_eq!(got.venue, src.venue);
+        assert_eq!(got.strategy_id, src.strategy_id);
+        assert_eq!(got.side, src.side);
+        assert_eq!(got.param_id, src.param_id);
+        assert_eq!(got.flags, src.flags);
+        assert!(got.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn ai_cmd_read_le_handles_unaligned_source() {
+        // UDS frames sit at arbitrary rx-buffer offsets; read_le must
+        // not require alignment. Stage the bytes at offset 1.
+        let src = valid(AiCmdKind::SetFairValue);
+        // SAFETY: AiCmd is AsBytes; read-only byte view of a live value.
+        let b = unsafe { core::slice::from_raw_parts((&src as *const AiCmd).cast::<u8>(), 64) };
+        let mut staged = [0u8; 80];
+        staged[1..65].copy_from_slice(b);
+        let arr: &[u8; 64] = (&staged[1..65]).try_into().unwrap();
+        let got = AiCmd::read_le(arr);
+        assert_eq!(got.sym, src.sym);
+        assert_eq!(got.px, src.px);
+        assert_eq!(got.ttl_ns, src.ttl_ns);
+        assert!(got.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn every_kind_has_a_valid_shape() {
+        let mut i = 0;
+        while i < ALL_KINDS.len() {
+            let c = valid(ALL_KINDS[i]);
+            assert_eq!(c.validate_shape(), Ok(()), "kind {:?}", ALL_KINDS[i]);
+            assert_eq!(c.kind(), Some(ALL_KINDS[i]));
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn expire_on_silence_flag_is_legal_on_fair_value_and_bias_only() {
+        let mut fv = valid(AiCmdKind::SetFairValue);
+        fv.flags = AI_CMD_FLAG_EXPIRE_ON_SILENCE;
+        assert_eq!(fv.validate_shape(), Ok(()));
+
+        let mut bias = valid(AiCmdKind::SetBias);
+        bias.flags = AI_CMD_FLAG_EXPIRE_ON_SILENCE;
+        assert_eq!(bias.validate_shape(), Ok(()));
+
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.flags = AI_CMD_FLAG_EXPIRE_ON_SILENCE;
+        assert_eq!(hb.validate_shape(), Err(AiCmdShapeError::BadFlags(1)));
+
+        // Undefined bit — rejected even where bit 0 is legal.
+        fv.flags = 0b10;
+        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadFlags(0b10)));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_kind_byte() {
+        let mut c = valid(AiCmdKind::Heartbeat);
+        c.kind = 10;
+        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(10)));
+    }
+
+    #[test]
+    fn validate_rejects_nonzero_padding() {
+        let mut c = valid(AiCmdKind::Heartbeat);
+        c._pad[3] = 1;
+        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::NonZeroPad));
+    }
+
+    #[test]
+    fn validate_rejects_wrong_venue() {
+        // Engine-directed kinds must carry VenueId::Ai.
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.venue = VenueId::Binance.to_u8();
+        assert_eq!(
+            hb.validate_shape(),
+            Err(AiCmdShapeError::BadVenue(VenueId::Binance.to_u8()))
+        );
+        // Intents must carry a real market venue — never Ai...
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.venue = VenueId::Ai.to_u8();
+        assert_eq!(
+            oi.validate_shape(),
+            Err(AiCmdShapeError::BadVenue(VenueId::Ai.to_u8()))
+        );
+        // ...and never an undecodable byte.
+        oi.venue = 200;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadVenue(200)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_sym() {
+        // Symbol forbidden on heartbeat.
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.sym = make_symbol_id(VenueId::Polymarket, 1);
+        assert_eq!(hb.validate_shape(), Err(AiCmdShapeError::BadSym(hb.sym)));
+        // Symbol required on fair value / intents.
+        let mut fv = valid(AiCmdKind::SetFairValue);
+        fv.sym = SYMBOL_ID_NONE;
+        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE)));
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.sym = SYMBOL_ID_NONE;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_px() {
+        // px must be zero where unused.
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.px = 1;
+        assert_eq!(hb.validate_shape(), Err(AiCmdShapeError::BadPx(1)));
+        // Fair values are prices — negative is malformed (bias is the
+        // signed channel).
+        let mut fv = valid(AiCmdKind::SetFairValue);
+        fv.px = -1;
+        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadPx(-1)));
+        // Intent price must be strictly positive.
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.px = 0;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadPx(0)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_qty() {
+        let mut en = valid(AiCmdKind::EnableStrategy);
+        en.qty = 1;
+        assert_eq!(en.validate_shape(), Err(AiCmdShapeError::BadQty(1)));
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.qty = 0;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadQty(0)));
+        oi.qty = -5;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadQty(-5)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_ttl() {
+        // TTL required (>0) on fair value / bias / intents.
+        let mut fv = valid(AiCmdKind::SetFairValue);
+        fv.ttl_ns = 0;
+        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadTtl(0)));
+        // TTL forbidden elsewhere.
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.ttl_ns = 1;
+        assert_eq!(hb.validate_shape(), Err(AiCmdShapeError::BadTtl(1)));
+        let mut st = valid(AiCmdKind::RulesetStage);
+        st.ttl_ns = 1;
+        assert_eq!(st.validate_shape(), Err(AiCmdShapeError::BadTtl(1)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_strategy_slot() {
+        // Enable/Disable/SetParam: slot must be < MAX_STRATEGY_SLOTS.
+        let mut en = valid(AiCmdKind::EnableStrategy);
+        en.strategy_id = MAX_STRATEGY_SLOTS;
+        assert_eq!(
+            en.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(MAX_STRATEGY_SLOTS))
+        );
+        en.strategy_id = STRATEGY_SLOT_NONE;
+        assert_eq!(
+            en.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(STRATEGY_SLOT_NONE))
+        );
+        // Kinds with no slot must carry the sentinel.
+        let mut fv = valid(AiCmdKind::SetFairValue);
+        fv.strategy_id = 0;
+        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadStrategySlot(0)));
+        // Intents are pinned to the ai-exec slot...
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.strategy_id = STRATEGY_SLOT_VM;
+        assert_eq!(
+            oi.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(STRATEGY_SLOT_VM))
+        );
+        // ...and ruleset commands to the vm slot.
+        let mut st = valid(AiCmdKind::RulesetCommit);
+        st.strategy_id = STRATEGY_SLOT_AI_EXEC;
+        assert_eq!(
+            st.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(STRATEGY_SLOT_AI_EXEC))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_side() {
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.side = Side::Bid as u8;
+        assert_eq!(hb.validate_shape(), Err(AiCmdShapeError::BadSide(0)));
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.side = 2;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadSide(2)));
+        oi.side = AI_SIDE_NONE;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadSide(AI_SIDE_NONE)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_param_id() {
+        let mut hb = valid(AiCmdKind::Heartbeat);
+        hb.param_id = 1;
+        assert_eq!(hb.validate_shape(), Err(AiCmdShapeError::BadParamId(1)));
+        let mut oi = valid(AiCmdKind::OrderIntent);
+        oi.param_id = 3;
+        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadParamId(3)));
+    }
+
+    #[test]
+    fn ai_ring_size_is_locked() {
+        assert_eq!(AI_RING_SIZE, 1024);
+        assert!(AI_RING_SIZE.is_power_of_two());
     }
 }

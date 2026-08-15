@@ -91,6 +91,35 @@ files predate it (see `docs/migration.md`).
 |     41 |    15 | _pad1       | `[u8; 15]`     | explicit, zeroed                |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed                |
 
+### `AiCmd` — 64 bytes (8f; `ingress-ai` ring + PMLR `slot_kind = 4`)
+
+AI-ingress command (plan §8.4). Packed by `claude-worker` (`frames.py`)
+as the payload of an 82-byte HMAC-tagged UDS frame
+(`[len u16 = 80][AiCmd 64 B][tag 16 B]`), materialized and shape-checked
+by `ingress-ai`, captured to PMLR, pushed onto `Ring<AiCmd, 1024>`.
+`ts_ns` is rewritten to engine-monotonic time at accept (after HMAC
+verify, before ring push) — the worker's send time survives only in the
+capture record (design §13.1). Per-kind field shapes ("unused fields
+MUST be zero / `SYMBOL_ID_NONE` / `0xFF`") are pinned in
+`docs/phase-8f-design.md` §3 and enforced by
+`core_types::AiCmd::validate_shape`.
+
+| offset | bytes | field       | type           | notes                                   |
+| -----: | ----: | ----------- | -------------- | --------------------------------------- |
+|      0 |     8 | ts_ns       | `u64` NsTs     | engine accept time (rewritten; see above) |
+|      8 |     4 | seq         | `u32`          | strictly increasing per session; gap = counter, regress = discard |
+|     12 |     4 | sym         | `u32` SymbolId | venue-namespaced or `SYMBOL_ID_NONE`    |
+|     16 |     8 | px          | `i64`          | ×1e6: fair value / intent px / param value / ruleset hash\[0..8\] LE |
+|     24 |     8 | qty         | `i64`          | ×1e6: intent qty / ruleset hash\[8..16\] LE |
+|     32 |     8 | ttl_ns      | `u64`          | expiry relative to `ts_ns`; 0 = none    |
+|     40 |     1 | kind        | `u8` AiCmdKind | 0=Heartbeat 1=EnableStrategy 2=DisableStrategy 3=SetFairValue 4=SetBias 5=SetParam 6=OrderIntent 7=RulesetStage 8=RulesetCommit 9=HaltRequest — **no Resume exists** (halt is sticky) |
+|     41 |     1 | venue       | `u8` VenueId   | `Ai=5` for engine-directed cmds; target venue for intents |
+|     42 |     1 | strategy_id | `u8`           | strategy-set slot; `0xFF` = none; intents pin 4 (ai-exec), ruleset cmds pin 5 (vm) |
+|     43 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1) or `0xFF`         |
+|     44 |     2 | param_id    | `u16`          | `SetParam` selector; else 0             |
+|     46 |     2 | flags       | `u16`          | bit0 = expire_on_silence (SetFairValue/SetBias only); others must be 0 |
+|     48 |    16 | _pad        | `[u8; 16]`     | explicit, zeroed (enforced by shape check) |
+
 ### `ChannelEvent` — 64 bytes (8e; PMLR `slot_kind = 5` only, never rings)
 
 Non-tick channel capture written by each ingress thread into its
@@ -154,7 +183,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **2**; readers accept ≤ 2 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=**reserved** (AiCmd, Stage 2 §8.4), 5=ChannelEvent (8e) |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |
