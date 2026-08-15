@@ -387,6 +387,14 @@ state + exact resume point + relaunch prompt into
 phase-8f-progress.md, then tell me.
 ```
 
+> **AMENDED 2026-08-15 (post-S3, operator directive):** the S4 kickoff
+> prompt stored at the end of this entry is **superseded**. S4 begins
+> by MERGING `stage2/8f-ai-ingress` into `main` and continues items
+> 8–9 in the main checkout `/Users/darkcite/trading-engine-multivenue`
+> — the stage2 worktree isolation era ends. The operative S4 prompt
+> was issued in chat; its merge preconditions: no running engine, both
+> trees clean, divergence surveyed, conflicts beyond mechanical ⇒ ask.
+
 ## 2026-08-15 — Session S3 (items 6–7: engine AI lane + strategy-set)
 
 ### S3 CLOSED — §12.2 handoff
