@@ -1,0 +1,69 @@
+// One-shot golden-fixture generator for claude-worker pmlr.py (8f item 10).
+// Bytes come from the REAL core-io PmlrWriter so the Python reader is pinned
+// to the Rust writer. The v1 flavor is the v2 writer's bytes with the header
+// version patched to 1 and per-slot venue/tail-pad bytes filled with 0xAA —
+// modeling v1's undefined padding (no v1 writer exists anymore; this mirrors
+// the core-io reader-test pattern).
+use core_types::{make_symbol_id, Fill, Price, Qty, Side, Tick, VenueId};
+
+fn main() {
+    let out = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: gen <outdir>"));
+    std::fs::create_dir_all(&out).unwrap();
+    let epoch_ns: u64 = 1_755_216_000_000_000_000;
+
+    let pm7 = make_symbol_id(VenueId::Polymarket, 7);
+    let hl_yes = make_symbol_id(VenueId::Hyperliquid, 10_810);
+    let hl_no = make_symbol_id(VenueId::Hyperliquid, 10_811);
+
+    // ---- ticks_v2.pmlr (SlotKind::Tick = 0) ----
+    {
+        let mut w =
+            core_io::PmlrWriter::open(out.join("ticks_v2.pmlr"), core_io::SlotKind::Tick, epoch_ns)
+                .unwrap();
+        let ticks = [
+            Tick::new(1_000_000_000, VenueId::Polymarket, pm7, 1, Price(490_000), Qty(100_000_000), Price(510_000), Qty(50_000_000)),
+            Tick::new(2_000_000_000, VenueId::Polymarket, pm7, 2, Price(500_000), Qty(90_000_000), Price(520_000), Qty(40_000_000)),
+            Tick::new(2_500_000_000, VenueId::Hyperliquid, hl_yes, 11, Price(600_000), Qty(10_000_000), Price(620_000), Qty(10_000_000)),
+            Tick::new(3_000_000_000, VenueId::Hyperliquid, hl_no, 12, Price(380_000), Qty(10_000_000), Price(400_000), Qty(10_000_000)),
+        ];
+        for i in 0..ticks.len() {
+            w.append(&ticks[i]).unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    // ---- fills_v2.pmlr (SlotKind::Fill = 2) ----
+    {
+        let mut w =
+            core_io::PmlrWriter::open(out.join("fills_v2.pmlr"), core_io::SlotKind::Fill, epoch_ns)
+                .unwrap();
+        let fills = [
+            Fill::new(1_100_000_000, pm7, Side::Bid, Price(480_000), Qty(20_000_000), 101),
+            Fill::new(1_200_000_000, pm7, Side::Bid, Price(500_000), Qty(10_000_000), 102),
+            Fill::new(1_300_000_000, pm7, Side::Ask, Price(520_000), Qty(15_000_000), 103),
+            Fill::new(2_600_000_000, hl_yes, Side::Bid, Price(600_000), Qty(8_000_000), 104),
+            Fill::new(3_100_000_000, hl_no, Side::Bid, Price(390_000), Qty(5_000_000), 105),
+        ];
+        for i in 0..fills.len() {
+            w.append(&fills[i]).unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    // ---- ticks_v1.pmlr: v2 writer bytes, header version -> 1, v1-garbage bytes ----
+    {
+        let mut bytes = std::fs::read(out.join("ticks_v2.pmlr")).unwrap();
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let n = (bytes.len() - 64) / 64;
+        for i in 0..n {
+            let base = 64 + i * 64;
+            // Tick offsets 48 (venue, v2-only) .. 64 (tail pad): undefined in v1.
+            for b in &mut bytes[base + 48..base + 64] {
+                *b = 0xAA;
+            }
+        }
+        std::fs::write(out.join("ticks_v1.pmlr"), &bytes).unwrap();
+    }
+
+    println!("fixtures written to {}", out.display());
+}
