@@ -36,3 +36,33 @@ First act: commit the two Phase-0 docs on `stage2/8f-ai-ingress`
 (authorized). Then item 1: `uv python install 3.14` + SDK/tooling import
 check (no live calls). Kickoff prompt for S1 issued to operator in chat
 per §12.2.
+
+## 2026-08-15 — Session S1 (items 1–4)
+
+Phase-0 docs committed: `d2b0be2` ("8f Phase 0: design + progress log").
+
+### Item 1 — Python 3.14 toolchain: VERIFIED
+
+- `uv` was **absent from the Mac** (CLAUDE.md assumed it); operator
+  installed it manually mid-session: **uv 0.12.5** (Homebrew,
+  `/opt/homebrew/bin/uv`).
+- `uv python install 3.14` → **CPython 3.14.7**
+  (`cpython-3.14.7-macos-aarch64-none`, uv-managed).
+- Scratch venv `/tmp/stage2-py314-check`; all imports clean under 3.14.7,
+  **no live calls** (import + `__version__` only). Exact versions:
+
+| package | version |
+|---|---|
+| anthropic | 0.122.0 |
+| httpx | 0.28.1 |
+| typer | 0.27.1 |
+| structlog | 26.1.0 |
+| pytest | 9.1.1 |
+| ruff | 0.16.3 |
+| mypy | 2.3.1 |
+
+- ruff accepts `--target-version py314`; mypy accepts
+  `--python-version 3.14` — **no version pinning workaround needed**
+  (design §5.5 contingency unused). Typer imports and runs under 3.14 —
+  decision Q4's argparse fallback not needed.
+- Scratch venv deleted after verification (disposable per design).
