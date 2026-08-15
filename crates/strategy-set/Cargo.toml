@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 core-time            = { workspace = true }
 core-types           = { workspace = true }
+strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }

@@ -2389,3 +2389,246 @@ fn engine_fills_capture_append_is_zero_alloc() {
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
+
+/// Phase 8f item 8: `strategy-ai-exec`'s tick path (fair-table probe
+/// + lazy-tracked book apply + deviation quote) must be zero-alloc in
+/// steady state — it runs inside `Engine::tick()` for every market
+/// tick when the member is enabled.
+#[test]
+fn ai_exec_on_tick_is_zero_alloc() {
+    use core_types::{make_symbol_id, AiCmd, AiCmdKind, Order, AI_SIDE_NONE, STRATEGY_SLOT_NONE};
+    use strategy_ai_exec::AiExec;
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    struct CountCtx {
+        submitted: u64,
+        now: u64,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            self.submitted += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const T0: u64 = 1_000_000_000_000;
+    let pm = make_symbol_id(VenueId::Polymarket, 7);
+    let other = make_symbol_id(VenueId::Binance, 9);
+
+    // Boot (allocation allowed): fair entry + first tick claims the
+    // lazy book slot.
+    let mut s: AiExec<64> = AiExec::new();
+    s.set_cooldown_ns(0);
+    let mut ctx = CountCtx { submitted: 0, now: T0 };
+    s.on_start(&mut ctx).unwrap();
+    let fair = AiCmd::new(
+        T0,
+        1,
+        pm,
+        500_000,
+        0,
+        3_600_000_000_000,
+        AiCmdKind::SetFairValue,
+        VenueId::Ai,
+        STRATEGY_SLOT_NONE,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+    s.on_ai(&fair, &mut ctx);
+    let quote_tick = Tick::new(
+        0,
+        VenueId::Polymarket,
+        pm,
+        1,
+        Price::from_raw(690_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(710_000),
+        Qty::from_raw(1_000_000),
+    );
+    let ignored_tick = Tick::new(
+        0,
+        VenueId::Binance,
+        other,
+        1,
+        Price::from_raw(490_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(510_000),
+        Qty::from_raw(1_000_000),
+    );
+    s.on_tick(&quote_tick, &mut ctx); // lazy track happens here
+
+    const CYCLES: u32 = 10_000;
+    let g = AllocGuard::new();
+    let mut i = 0u32;
+    while i < CYCLES {
+        ctx.now += 1;
+        s.on_tick(&quote_tick, &mut ctx); // quote path
+        s.on_tick(&ignored_tick, &mut ctx); // no-fair-entry path
+        i += 1;
+    }
+    std::hint::black_box(ctx.submitted);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(
+        ctx.submitted >= u64::from(CYCLES),
+        "deviation quote must fire every cycle"
+    );
+    assert_eq!(
+        allocs, 0,
+        "ai-exec on_tick allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ai-exec on_tick bytes should be zero: saw {bytes}");
+}
+
+/// Phase 8f item 8: `strategy-ai-exec`'s AI-lane path (fair/bias
+/// upserts, heartbeat liveness, intent honor AND stale-refusal incl.
+/// the silence sweep) must be zero-alloc — it runs inside the
+/// engine's budgeted AI drain.
+#[test]
+fn ai_exec_on_ai_is_zero_alloc() {
+    use core_types::{
+        make_symbol_id, AiCmd, AiCmdKind, Order, Side, AI_CMD_FLAG_EXPIRE_ON_SILENCE,
+        AI_SIDE_NONE, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_NONE,
+    };
+    use strategy_ai_exec::AiExec;
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    struct CountCtx {
+        submitted: u64,
+        now: u64,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            self.submitted += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    fn fair(ts: u64, sym: core_types::SymbolId, eos: u16) -> AiCmd {
+        AiCmd::new(
+            ts,
+            1,
+            sym,
+            500_000,
+            0,
+            3_600_000_000_000,
+            AiCmdKind::SetFairValue,
+            VenueId::Ai,
+            STRATEGY_SLOT_NONE,
+            AI_SIDE_NONE,
+            0,
+            eos,
+        )
+    }
+
+    const T0: u64 = 1_000_000_000_000;
+    // Past the 15 s staleness window each cycle — exercises the
+    // sweep + intent-refusal branches without any wall time.
+    const GAP: u64 = strategy_ai_exec::AI_STALENESS_NS + 1_000;
+    let pm = make_symbol_id(VenueId::Polymarket, 7);
+
+    let mut s: AiExec<64> = AiExec::new();
+    let mut ctx = CountCtx { submitted: 0, now: T0 };
+    s.on_start(&mut ctx).unwrap();
+    s.on_ai(&fair(T0, pm, 0), &mut ctx); // boot upsert
+
+    const CYCLES: u32 = 10_000;
+    let g = AllocGuard::new();
+    let mut ts = T0;
+    let mut i = 0u32;
+    while i < CYCLES {
+        // Silence window closes: this intent is REFUSED (stale) and
+        // the expire_on_silence sweep runs.
+        ts += GAP;
+        let refused = AiCmd::new(
+            ts,
+            1,
+            pm,
+            430_000,
+            2_000_000,
+            1_000_000_000,
+            AiCmdKind::OrderIntent,
+            VenueId::Polymarket,
+            STRATEGY_SLOT_AI_EXEC,
+            Side::Bid as u8,
+            0,
+            0,
+        );
+        s.on_ai(&refused, &mut ctx);
+        // Live sequence: heartbeat, upserts (one flagged for the next
+        // sweep), honored intent.
+        ts += 1;
+        let hb = AiCmd::new(
+            ts,
+            1,
+            core_types::SYMBOL_ID_NONE,
+            0,
+            0,
+            0,
+            AiCmdKind::Heartbeat,
+            VenueId::Ai,
+            STRATEGY_SLOT_NONE,
+            AI_SIDE_NONE,
+            0,
+            0,
+        );
+        s.on_ai(&hb, &mut ctx);
+        ts += 1;
+        s.on_ai(&fair(ts, pm, 1), &mut ctx);
+        ts += 1;
+        // Flag carried on the bias too — upserts are last-writer-wins
+        // for the entry policy, and the next cycle's sweep must find
+        // the entry flagged.
+        let bias = AiCmd::new(
+            ts,
+            1,
+            pm,
+            -10_000,
+            0,
+            3_600_000_000_000,
+            AiCmdKind::SetBias,
+            VenueId::Ai,
+            STRATEGY_SLOT_NONE,
+            AI_SIDE_NONE,
+            0,
+            AI_CMD_FLAG_EXPIRE_ON_SILENCE,
+        );
+        s.on_ai(&bias, &mut ctx);
+        ts += 1;
+        let honored = AiCmd::new(
+            ts,
+            1,
+            pm,
+            430_000,
+            2_000_000,
+            1_000_000_000,
+            AiCmdKind::OrderIntent,
+            VenueId::Polymarket,
+            STRATEGY_SLOT_AI_EXEC,
+            Side::Bid as u8,
+            0,
+            0,
+        );
+        s.on_ai(&honored, &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.submitted);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(s.intents_refused_stale, u64::from(CYCLES));
+    assert_eq!(s.intents_honored, u64::from(CYCLES));
+    assert_eq!(ctx.submitted, u64::from(CYCLES));
+    assert!(s.silence_expired >= 1, "sweep must have run");
+    assert_eq!(
+        allocs, 0,
+        "ai-exec on_ai allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ai-exec on_ai bytes should be zero: saw {bytes}");
+}

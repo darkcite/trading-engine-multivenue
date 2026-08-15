@@ -154,8 +154,12 @@ struct RunArgs {
     /// Strategy selector. `latency-arb` (default) uses Binance →
     /// Polymarket cross-venue arbitrage. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
-    /// `all` (Phase 8f) runs the composed StrategySet: every built
-    /// member whose config flags are present, AI-toggleable at
+    /// `ai-exec` (Phase 8f item 8) runs the AI-driven fair-value/
+    /// intent strategy alone via the set path (no boot symbol
+    /// config — the AI publishes the universe over UDS); paper-only
+    /// until 8i. `all` (Phase 8f) runs the composed StrategySet:
+    /// every built member whose config flags are present (ai-exec
+    /// needs none and is always included), AI-toggleable at
     /// runtime; paper-only until 8i.
     #[arg(long, default_value = "latency-arb")]
     strategy: String,
@@ -1073,15 +1077,19 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        ("all", _live) => {
+        (name @ ("all" | "ai-exec"), _live) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
             // latency-arb from the mandatory pair flags, ev/cross-arb/
-            // rule-tree only when their config flags are present
+            // rule-tree only when their config flags are present,
+            // ai-exec unconditionally (it has no boot config; item 8)
             // (members without config boot inert; see
-            // engine_loop_set_full docs). PAPER-only until the 8i
-            // RiskGate lands — the composed set has no live arm.
-            let requested = strategy_set::mask_for_name("all").expect("'all' is a valid mask name");
+            // engine_loop_set_full docs). `ai-exec` (item 8b) is the
+            // single-bit set per §7 "single name = single bit" — no
+            // pre-8f standalone path existed for it. PAPER-only until
+            // the 8i RiskGate lands — the set has no live arm.
+            let requested =
+                strategy_set::mask_for_name(name).expect("matched names are valid mask names");
             let ev_path = args.artifacts_path.clone();
             let owned_groups: Vec<Vec<core_types::SymbolId>> = match args.groups.as_deref() {
                 Some(spec) => spec

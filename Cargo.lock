@@ -149,6 +149,7 @@ dependencies = [
  "ingress-rss",
  "research-artifacts",
  "signer-eip712",
+ "strategy-ai-exec",
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
@@ -1762,6 +1763,7 @@ version = "0.1.0"
 dependencies = [
  "core-time",
  "core-types",
+ "strategy-ai-exec",
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",

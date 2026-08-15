@@ -34,6 +34,7 @@ ingress-rss          = { workspace = true }
 core-net             = { workspace = true }
 core-time            = { workspace = true }
 book-builder         = { workspace = true }
+strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
