@@ -675,3 +675,220 @@ isolation era ends; all further 8f work happens in the main checkout.
 
 From here: small commits directly on `main`, one per (sub-)item,
 gates green before the next. Items 8–9 follow.
+
+### S4 CLOSED — §12.2 handoff
+
+**1. Status.** Phase 0 (merge) + items 8 and 9 of design §12 complete,
+five commits on `main` (the worktree isolation era is over):
+
+| step | commit | content |
+|---|---|---|
+| merge | `0ed0bfe` | `--no-ff` stage2/8f-ai-ingress → main (14 commits; 2 mechanical conflicts, §above) |
+| record | `4ed29a3` | S4 Phase-0 progress entry |
+| 8a | `3e0bace` | `strategy-ai-exec` crate: `AiExec<N>` fair table + staleness + intents, 24-test suite |
+| 8b | `4ab1771` + `8b10ee4` | slot-4 wiring (BIT_AI_EXEC built, `mask_for_name` "ai-exec", cli `--strategy ai-exec`/`all`), bench alloc gates; follow-up pins last-writer-wins flag policy (missed the 8b add; no amend per session git rules) |
+| 9 | `36ea4da` | worker core I: `frames.py`/`uds.py`/`state.py`, fake UDS server, golden vectors shared with Rust (`ingress-ai/tests/golden_frames.rs`) |
+
+Gates at close (all on the Mac): `cargo check --workspace` clean;
+`cargo nextest run --workspace` green (958 pre-item-9; final run
+includes ingress-ai 37/37 with the 3 golden tests); release alloc
+assertions `--test-threads=1` **35/35, 0 B/op** (33 + `ai_exec_on_tick`
++ `ai_exec_on_ai`); fuzz `cargo check` clean; claude-worker
+`uv run pytest` **40/40** + ruff check + ruff format + mypy strict
+clean.
+
+**2. Interim state / deviations (all within design intent, recorded
+for review):**
+
+- **Item 8 staleness mechanics** (§5.4 + §4.3 + decision 1):
+  `last_frame_ns` is fed by `cmd.ts_ns` — the ingress accept stamp —
+  not the drain-time clock; before the first frame ever the strategy
+  is stale by definition (fail-safe; table necessarily empty). The
+  frame that ENDS a silence window is itself evaluated against the
+  pre-frame gap: an `OrderIntent` in that position is **refused**
+  (counted `intents_refused_stale`) yet still restores liveness —
+  which is precisely why §5.4's heartbeat-precedes-payload exists;
+  a well-behaved worker never hits the branch. The
+  `expire_on_silence` sweep runs once, on the recovery frame (cold,
+  bounded at N); while stale, quoting is pulled globally, so
+  sweep-at-recovery is sufficient — no timer scan exists.
+- **`expire_on_silence` is PERMANENT** once a silence window closes:
+  flagged entries do not resurrect on recovery (unflagged ones do,
+  TTL permitting); only a fresh upsert revives the symbol. Upserts
+  are **last-writer-wins for the whole entry policy** (`set_ns`,
+  `ttl_ns`, the flag): a follow-up unflagged SetBias clears the
+  flag. Pinned by `upsert_flag_is_last_writer_wins` after the
+  ai_exec_on_ai alloc gate caught exactly that interaction on its
+  first run ("sweep must have run").
+- **Fair table**: one TTL per entry, refreshed by either kind (§7
+  sketch has one `set_ns`/`ttl_ns`); bias-only entries are held but
+  never quote (no fair to deviate from); quote target =
+  `fair + bias`, `target <= 0` ⇒ skip; probe home = `sym % N`,
+  upsert scans the full chain before claiming a reusable slot, dead
+  slots are re-keyed (never emptied) so probe chains cannot shorten
+  — invariants rustdoc'd, collision/reuse/full covered by tests.
+- **No boot symbol config for ai-exec**: MultiBook slots are claimed
+  lazily on the first tick of a symbol with an upsert-live fair
+  entry (the AI publishes the universe); `book_track_failed`
+  counter when N=64 is exhausted. `on_start` validates parameters
+  only (edge > 0, qty > 0) — the set's late-enable invariant holds.
+  Consequently `engine_loop_set_full` marks ai-exec **configured
+  unconditionally** and `--strategy all` now includes it;
+  `--strategy ai-exec` is the single-bit set path (no pre-8f
+  standalone arm existed; §7 "single name = single bit"); both
+  paper-only until 8i.
+- **Decision 6 reading**: `AI_STALENESS_NS = 15 s` is a compile-time
+  const with NO runtime/env knob at all — tests exercise it with
+  synthetic clocks (frame `ts_ns` and `ctx.now_ns()` are test
+  inputs), which is stronger than "env-tunable in tests only".
+- **Quoting style**: ev-convention post-only at mid,
+  `DEFAULT_EDGE_1E6 = 20_000`, `DEFAULT_QTY = 10`, 250 ms
+  `CooldownGate` keyed by book slot.
+- **Naming**: operator-facing name `ai-exec` taken from the §7 slot
+  enumeration — the same list the four existing `mask_for_name`
+  names come from; no invention needed. `BIT_AI_EXEC_RESERVED` →
+  `BIT_AI_EXEC` (grep-verified no external users).
+- **Item 9**: `frames.py` packs verbatim — per-kind §3 argument
+  validation belongs to the push verb (item 12) and,
+  authoritatively, the engine accept path. Heartbeat-precedes-
+  payload is enforced in code per connection (`send_cmd` refuses
+  until a heartbeat succeeded on THIS connection; resets on
+  reconnect). A seq allocated for a frame whose `sendall` fails is
+  burned — the engine counts a gap, never faults (§3 semantics).
+  `events.ts` carries the wall-clock send stamp, detail
+  `seq=<n> kind=<k>` — the only structured send-time record (§3
+  capture amendment). Full §5.3 schema created up front (items
+  10–12 add consumers, not migrations); `ai_seq` reseeds on open if
+  the row vanished. Ruff: tests-only PLR2004 ignore + inline
+  PLR0913 noqas on the three 12-field wire functions.
+- **Golden vectors**: `claude-worker/tests/fixtures/`
+  `ai_frame_golden.txt` — 10 vectors, one per kind (negative px,
+  eos flag, hash128 halves included), fixture-only key, format
+  documented in-file; consumed by `test_frames.py` (pack
+  byte-identity, buffer reuse, pad re-zeroing) AND
+  `crates/ingress-ai/tests/golden_frames.rs` (kind coverage, pack
+  byte-identity, parse round-trip) — the packers cannot drift
+  silently.
+- **Stale-rmeta incident #4** (Phase 0 above): post-merge, clean
+  EVERY workspace-local crate, not just visibly-touched ones.
+- **macOS landmine (NEW, S4)**: `AF_UNIX` `sun_path` caps at ~104
+  bytes — pytest `tmp_path` socket paths overflow it
+  ("AF_UNIX path too long"). Fixture sockets live in short
+  `/tmp/cw-ai-<pid>-*/` dirs (`tests/conftest.py::short_sock_dir`,
+  0700, hygiene-compliant). Joins the S2 list (SO_RCVTIMEO EINVAL,
+  scope-hang StopOnDrop).
+- **Push anomaly (operator attention)**: `origin/main`
+  (github.com/darkcite/trading-engine-multivenue) advanced to
+  `4ed29a3` mid-session. This session performed NO pushes (none are
+  authorized). Most likely the operator pushed while following
+  along, or an IDE auto-push fired. Nothing was done about it here;
+  commits after `4ed29a3` (8a/8b/9) were local-ahead at close.
+- `.env` untouched in both checkouts; stage2 worktree still in
+  place (operator decision pending at session end).
+- Open defects: none known.
+
+**3. Exact resume point.** Design §12 **item 10 — worker core II**
+(S5): `claude-worker/src/claude_worker/{pmlr.py, features.py,
+feeds.py, labeling.py, backtest.py, commander.py}` per §5.1, all
+tests with the LLM mocked at the (not-yet-existing) `llm.py` seam via
+injected `complete_fn`, canned feeds/reports per §11. First actions:
+read §5.1 subsystem specs + §9.1 carried patterns (tagger vocab,
+rule-extractor schema, FakeClient conftest pattern) + §11 Python
+rows (pmlr golden fixture FROM THE RUST WRITER — generate with
+core-io, check in; canned pass/fail backtest reports; fetch --news
+httpx-mock transport). `commander.py` drives `uds.py`/`state.py`
+from item 9 — the fake UDS server fixture and golden vectors are
+already in place. Item 11 (`daemon.py` + `serve` + `llm.py` seam +
+serve-loop test) follows in-session if context allows.
+
+**4. S5 kickoff prompt (ready to paste):**
+
+```
+Stage 2 — 8f AI-Ingress, SESSION S5 (checklist items 10–11: worker
+core II + daemon/serve), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue — the worktree isolation
+era ended in S4 (merge 0ed0bfe); small commits directly on main,
+one per (sub-)item, tests green on the Mac before the next. NO
+push, NO rebase, NO history rewrite, NO new branches. Do NOT touch
+.env. Do NOT write phase-8-progress.md (closed soak history).
+Verify get_project_modules against the main checkout FIRST; if the
+MCP won't attach, stop.
+AUTHORITY: docs/phase-8f-design.md (§13 LOCKED, §3/§13.1 capture
+amendment in force) + latest phase-8f-progress.md entries (S4
+handoff) supersede the committed plan.
+REQUIRED READING, in order:
+1. docs/phase-8f-progress.md — S4 handoff (state, deviations incl.
+   staleness/eos interpretation calls, landmines, push anomaly)
+2. docs/phase-8f-design.md §5.1 (all six subsystems), §5.2, §5.3
+   (prompt_cache consumers arrive now), §6 (verb surface — context
+   for commander/backtest gates), §9.1 (carried patterns: tagger
+   vocab, rule-extractor schema, FakeClient), §11 Python rows
+   (pmlr golden fixture from the RUST writer, canned backtest
+   reports, fetch --news httpx-mock, serve-loop test is item 11)
+3. CLAUDE.md (pitfalls #6/#10/#11)
+Committed S4 surface to build on: strategy_ai_exec::AiExec (slot-4
+member, BIT_AI_EXEC built, --strategy ai-exec/all), worker item-9
+core: claude_worker.frames (pack_frame/tag16/kind+sentinel consts),
+claude_worker.uds (UdsClient, heartbeat-precedes-payload enforced,
+UdsError), claude_worker.state (State: next_seq/mark_seen/
+record_event/record_frame_sent/events; full §5.3 schema),
+tests/conftest.py (FakeUdsServer + short_sock_dir + TEST_KEY),
+tests/fixtures/ai_frame_golden.txt (+ Rust twin test in
+ingress-ai/tests/golden_frames.rs — extend BOTH sides if frames
+change).
+S5 SCOPE — item 10 then item 11, one commit each (10 may split by
+module group):
+item 10: pmlr.py (read-only mmap PMLR v1/v2 reader; golden fixture
+bytes produced by the Rust core-io writer, checked in), features.py
+(replay-log features + rate-budgeted REST secondary; positions/P&L
+reconstruction from engine-fills.pmlr per §2/§5.1 — 8f emits fill
+data + fetch position summary only), feeds.py (httpx RSS/Atom
+poll, dedupe via state.mark_seen, triage→escalate via INJECTED
+complete_fn — llm.py does not exist until item 11), labeling.py
+(Sonnet labeling prompt + strict parse, §9.1 schema), backtest.py
+(subprocess seam to `multivenue-engine backtest` — mockable, canned
+reports; GATES per §5.1 with thresholds in worker config),
+commander.py (labeled events + policy → AiCmd frames via item-9
+frames/uds; TTL from half-life; Heartbeat cadence 5 s in serve).
+Tests: all LLM calls mocked (injected complete_fn / FakeClient
+pattern), fake UDS server for commander, canned feed XML, canned
+pass/fail reports, pmlr golden fixture v1+v2, dedupe against
+pre-seeded SQLite.
+item 11: llm.py (THE SDK seam: make_client()/complete(); serve-only
+construction), daemon.py (serve composition loop: cadences off a
+monotonic clock, single-threaded, SIGTERM/SIGINT → flush SQLite,
+close UDS, exit 0), `serve` frontend in a minimal cli.py entry IF
+required by the serve-loop test (full verb surface is item 12 —
+do not build verbs early); serve-loop test: one composed iteration
+with canned feeds + mocked LLM + fake UDS (dedupe honored, cache
+hit on second identical prompt, heartbeat emitted, clean SIGTERM).
+ANTHROPIC_API_KEY read in ServeConfig ONLY; verbs never construct
+clients (asserted by existing config split).
+Python: 3.14.7 via uv 0.12.5 (/opt/homebrew/bin/uv); full
+`import x` only (no aliases); ruff format + check + mypy strict +
+pytest green before each commit; no live SDK calls, no live feeds
+(httpx mocked), no live engine.
+Rust gates only if Rust files are touched (none expected in 10–11).
+Cargo on the Mac ONLY (pitfall #10; sandbox = greps only);
+stale-rmeta playbook incl. the S4 post-merge addendum (clean ALL
+workspace-local crates after big tree rewrites).
+Test hygiene: sockets via tests/conftest.short_sock_dir()
+(/tmp/cw-ai-<pid>-*/ — macOS sun_path ~104-B cap, S4 landmine);
+METRICS_BIND test-local (NEVER 9191); MULTIVENUE_LOG_DIR test-local
+(NEVER ~/multivenue/logs); NEVER run `multivenue-engine run` or
+connect live venues (8f live demo stays operator-gated); no
+kill/pkill by name (by-PID of own test processes only, after
+diagnosis).
+SESSION FACTS: RustRover MCP execute_terminal_command MUST
+executeInShell=true, ≤45 s per call — long runs via
+nohup > /tmp/8f-build.log & then poll; projectPath =
+/Users/darkcite/trading-engine-multivenue. macOS landmines: AF_UNIX
+sun_path cap (short_sock_dir), SO_RCVTIMEO EINVAL on peer-closed
+UDS, std::thread::scope panic hangs without StopOnDrop, `sample
+<pid>` for hang diagnosis. One-line status after each commit; ask
+before anything ambiguous.
+STOP after item 11: append the §12.2 handoff (status, interim
+state, resume point, S6 kickoff for items 12–15) to
+docs/phase-8f-progress.md. If context runs short: write interim
+state + exact resume point + relaunch prompt there, then tell me.
+```
