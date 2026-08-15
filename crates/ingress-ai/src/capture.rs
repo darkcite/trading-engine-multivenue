@@ -22,15 +22,15 @@
 //! `--raw-tap` payload capture, which the AI ingress does not host in
 //! 8f.
 //!
-//! If item 6's engine-fills capture wants the same shape, hoist this
-//! into core-io then (flagged in the S2 handoff) — not speculatively
-//! now.
+//! Since item 6 this is a thin wrapper over the hoisted
+//! `core_io::SlotCapture` (the S2 handoff flagged the hoist for the
+//! moment a second single-file user appeared — the engine fills
+//! capture is that user). Public API and policy are unchanged.
 
 use std::io;
 use std::path::Path;
 
-use core_io::capture::CAPTURE_FLUSH_INTERVAL_NS;
-use core_io::{PmlrWriter, SlotKind};
+use core_io::{SlotCapture, SlotKind};
 use core_types::AiCmd;
 
 /// File name of the AI-command capture inside the per-run capture
@@ -39,10 +39,7 @@ pub const AI_CMDS_FILE: &str = "ai-cmds.pmlr";
 
 /// Single-file capture sink for [`AiCmd`] slots. See module docs.
 pub struct AiCmdCapture {
-    w: PmlrWriter,
-    enabled: bool,
-    io_errors: u64,
-    last_flush_ns: u64,
+    inner: SlotCapture<AiCmd>,
 }
 
 impl AiCmdCapture {
@@ -52,80 +49,46 @@ impl AiCmdCapture {
     pub fn open<P: AsRef<Path>>(dir: P, epoch_ns: u64) -> io::Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        let w = PmlrWriter::open(dir.join(AI_CMDS_FILE), SlotKind::AiCmd, epoch_ns)?;
-        Ok(Self {
-            w,
-            enabled: true,
-            io_errors: 0,
-            last_flush_ns: 0,
-        })
+        let inner = SlotCapture::open(dir.join(AI_CMDS_FILE), SlotKind::AiCmd, epoch_ns)?;
+        Ok(Self { inner })
     }
 
     /// Stage one accepted command (§4.4 step 6 — called BEFORE the
     /// ring `try_push`, so ring-dropped commands remain auditable).
     #[inline]
     pub fn append(&mut self, cmd: &AiCmd) {
-        if !self.enabled {
-            return;
-        }
-        if self.w.append(cmd).is_err() {
-            self.note_io_error();
-        }
+        self.inner.append(cmd);
     }
 
     /// Drain staging to disk if the flush interval has elapsed.
     #[inline]
     pub fn maybe_flush(&mut self, now_ns: u64) {
-        if !self.enabled {
-            return;
-        }
-        if now_ns.wrapping_sub(self.last_flush_ns) < CAPTURE_FLUSH_INTERVAL_NS {
-            return;
-        }
-        self.last_flush_ns = now_ns;
-        if self.w.flush().is_err() {
-            self.note_io_error();
-        }
+        self.inner.maybe_flush(now_ns);
     }
 
     /// Unconditional drain — orderly shutdown path.
     pub fn flush_all(&mut self) -> io::Result<()> {
-        self.w.flush()
+        self.inner.flush_all()
     }
 
     /// Slots staged since open (mirrored into
     /// `engine_ingress_ai_capture_records` by the cli, item 6).
     #[inline]
     pub fn records(&self) -> u64 {
-        self.w.records_written()
+        self.inner.records()
     }
 
     /// I/O errors observed (first one sticky-disables; mirrored into
     /// `engine_ingress_ai_capture_io_errors`).
     #[inline]
     pub fn io_errors(&self) -> u64 {
-        self.io_errors
+        self.inner.io_errors()
     }
 
     /// True once an I/O error has sticky-disabled this sink.
     #[inline]
     pub fn is_disabled(&self) -> bool {
-        !self.enabled
-    }
-
-    /// Sticky-disable on error (core-io PmlrCapture policy).
-    #[cold]
-    fn note_io_error(&mut self) {
-        self.io_errors += 1;
-        self.enabled = false;
-        debug_assert!(false, "ai capture I/O error — sticky-disabled");
-    }
-}
-
-impl Drop for AiCmdCapture {
-    fn drop(&mut self) {
-        // Best-effort final drain; the process is tearing down.
-        let _ = self.flush_all();
+        self.inner.is_disabled()
     }
 }
 
@@ -136,6 +99,7 @@ impl Drop for AiCmdCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_io::capture::CAPTURE_FLUSH_INTERVAL_NS;
     use core_io::PmlrReader;
     use core_types::{AiCmdKind, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE};
 

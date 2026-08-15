@@ -43,7 +43,12 @@ use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{make_symbol_id, AiCmd, Fill, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE};
-use engine::{Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE};
+use core_io::{SlotCapture, SlotKind};
+use engine::{
+    Engine, ENGINE_FILLS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE,
+    TICK_RING_SIZE,
+};
+use ingress_ai::{AiCmdCapture, AiIngressCfg};
 // Re-exported (lib.rs) so the binary reaches the AI status slot type
 // through `cli::` like every other paper-mode surface.
 pub use ingress_ai::AiIngressStatus;
@@ -1100,6 +1105,109 @@ impl RssFeed {
     }
 }
 
+/// Open the Phase-8f engine-thread fills capture
+/// (`<run_dir>/engine-fills.pmlr`, `SlotKind::Fill`). Boot-only; the
+/// bin hands the result to [`Observability::with_fills_capture`] and
+/// the engine loop takes ownership from there.
+pub fn open_fills_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapture<Fill>> {
+    SlotCapture::open(run_dir.join(ENGINE_FILLS_FILE), SlotKind::Fill, epoch_ns)
+}
+
+/// Parse `AI_INGRESS_HMAC_KEY` (64 hex chars) into the 32-byte HMAC
+/// key (Phase 8f §4.1). The error strings deliberately carry **no key
+/// material** — this value must never reach a log. Returns `Err` on
+/// wrong length or a non-hex nibble; absence is the *caller's*
+/// decision (unset ⇒ ingress-ai not spawned, see the bin wiring).
+pub fn parse_ai_hmac_key(hex: &str) -> Result<[u8; 32], &'static str> {
+    let b = hex.trim().as_bytes();
+    if b.len() != 64 {
+        return Err("AI_INGRESS_HMAC_KEY must be exactly 64 hex chars");
+    }
+    let nibble = |c: u8| -> Result<u8, &'static str> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err("AI_INGRESS_HMAC_KEY contains a non-hex character"),
+        }
+    };
+    let mut key = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        key[i] = (nibble(b[i * 2])? << 4) | nibble(b[i * 2 + 1])?;
+        i += 1;
+    }
+    Ok(key)
+}
+
+/// Mirror the AI ingress thread's capture health into its two registry
+/// gauges (`engine_ingress_ai_capture_{io_errors,records}`). Same
+/// constraint as [`mirror_capture_metrics`]: the capture is owned by
+/// the spawned thread, so the thread itself mirrors — after every
+/// `run` return and once before exit. Between those points the pair
+/// is stale by design (venue-wrapper parity); live AI health comes
+/// from the centrally mirrored [`AiIngressStatus`] counters.
+fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
+    if let Some((reg, ids)) = metrics.as_ref() {
+        reg.gauge(ids.io_errors).set(capture.io_errors() as i64);
+        reg.gauge(ids.records).set(capture.records() as i64);
+    }
+}
+
+/// Spawn the AI-command ingress thread (Phase 8f §4). Opens the
+/// `ai-cmds.pmlr` capture **before** spawning — capture-open failure
+/// is a fatal boot error, matching every venue wrapper. The thread
+/// binds `sock_path`, serves the single `claude-worker` client, and
+/// rebinds after transport-fatal errors until shutdown.
+///
+/// **Core pinning:** core 4 belongs to this thread per the §9 core
+/// map, but RSS still owns core 4 until item 16 removes it — this
+/// thread runs unpinned until then (control-plane cadence of ~1 cmd/s
+/// makes scheduler placement irrelevant in the interim).
+///
+/// `key` is moved into the thread and never logged.
+pub fn spawn_ai(
+    sock_path: PathBuf,
+    key: [u8; 32],
+    producer: Producer<AiCmd, AI_RING_SIZE>,
+    status: Arc<AiIngressStatus>,
+    run_dir: &Path,
+    epoch_ns: u64,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = AiCmdCapture::open(run_dir, epoch_ns)?;
+    let builder = thread::Builder::new().name("ingress-ai".to_string());
+    Ok(spawn_or_die(builder, "ingress-ai", move || {
+        let cfg = AiIngressCfg { sock_path };
+        let mut producer = producer;
+        // Ruleset side-path seam (§4.4 step 8): the validation stub
+        // arrives with item 14; until then Stage/Commit reach the
+        // ring only and the seam is a no-op.
+        let mut seam = |_c: &AiCmd| {};
+        while !shutdown_requested() {
+            match ingress_ai::run(
+                &cfg,
+                &key,
+                &mut producer,
+                &mut capture,
+                &status,
+                &mut seam,
+                &SHUTDOWN,
+            ) {
+                // Stop flag flipped — the while condition exits.
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(error = ?e, "ingress-ai: run loop error; rebinding");
+                    mirror_ai_capture_metrics(&capture_metrics, &capture);
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        mirror_ai_capture_metrics(&capture_metrics, &capture);
+        tracing::info!("ingress-ai: thread exiting");
+    }))
+}
+
 /// Spawn the RSS ingress thread. Polls each `feeds` entry on its
 /// own schedule and pushes `Signal`s onto `producer`.
 ///
@@ -1752,6 +1860,23 @@ impl Observability {
             let coverage_deribit = register_coverage_gauge(&mut reg, "deribit")?;
             let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
 
+            // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
+            // (mirrored centrally from the shared status slot), the
+            // AI thread's capture pair (mirrored from inside the
+            // spawn wrapper, venue pattern), and the engine-thread
+            // fills-capture pair (mirrored centrally).
+            let ingress_ai = register_ai_counters(&mut reg)?;
+            let capture_ai = register_capture_gauges(&mut reg, "ai")?;
+            let fills_capture = {
+                let io_errors = reg
+                    .register_gauge("engine_fills_capture_io_errors")
+                    .map_err(|_| "register engine_fills_capture_io_errors")?;
+                let records = reg
+                    .register_gauge("engine_fills_capture_records")
+                    .map_err(|_| "register engine_fills_capture_records")?;
+                CaptureGaugeIds { io_errors, records }
+            };
+
             out.metrics = Some(Arc::new(reg));
             out.counter_ids = Some(EngineCounters {
                 ticks,
@@ -1794,6 +1919,9 @@ impl Observability {
                 coverage_okx,
                 coverage_deribit,
                 coverage_hyperliquid,
+                ingress_ai,
+                capture_ai,
+                fills_capture,
             });
         }
         if enable_tui {
@@ -1873,6 +2001,12 @@ pub struct Observability {
     /// Per-ingress status slots (D7). `None` only in tests that
     /// exercise the loop without spawned ingresses.
     pub ingress: Option<Arc<IngressStatusSet>>,
+    /// Phase-8f engine-thread fills capture (`engine-fills.pmlr`),
+    /// opened by the bin inside the per-run capture directory and
+    /// **taken** by the engine loop at boot (`Option::take` — the
+    /// engine thread owns it from then on). `None` in tests and in
+    /// tools that replay rather than run.
+    pub fills_capture: Option<SlotCapture<Fill>>,
 }
 
 impl Observability {
@@ -1881,6 +2015,14 @@ impl Observability {
     /// be chained.
     pub fn with_latency_dump(mut self, dump: Option<LatencyDump>) -> Self {
         self.latency_dump = dump;
+        self
+    }
+
+    /// Attach the engine-thread fills capture (Phase 8f item 6).
+    /// Boot-only; called from the bin after the per-run capture
+    /// directory exists.
+    pub fn with_fills_capture(mut self, cap: SlotCapture<Fill>) -> Self {
+        self.fills_capture = Some(cap);
         self
     }
 
@@ -1981,6 +2123,17 @@ pub struct EngineCounters {
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
+    /// Phase-8f AI ingress family (`engine_ingress_ai_*` + the engine
+    /// drain-site counter + heartbeat-age gauge).
+    pub ingress_ai: AiIngressCounterIds,
+    /// Phase-8f capture-health gauges, AI ingress thread
+    /// (`engine_ingress_ai_capture_{io_errors,records}`).
+    pub capture_ai: CaptureGaugeIds,
+    /// Phase-8f capture-health gauges, engine-thread fills capture
+    /// (`engine_fills_capture_{io_errors,records}`). Mirrored
+    /// centrally from the engine loop (unlike the per-thread venue
+    /// pairs — the engine owns this capture).
+    pub fills_capture: CaptureGaugeIds,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -2001,6 +2154,138 @@ pub struct IngressCounterIds {
     pub reconnects: core_metrics::CounterId,
     /// Ring `try_push` failures (D4).
     pub ring_drops: core_metrics::CounterId,
+}
+
+/// Registry handles for the Phase-8f AI ingress family
+/// (`engine_ingress_ai_*` — design §4.4) plus the engine drain-site
+/// defense-in-depth counter. Counters are mirrored centrally from the
+/// shared [`AiIngressStatus`] slot as deltas (unlike the venue §6.4
+/// counters there is no per-thread snapshot problem — the slot is
+/// `Arc`-shared); the heartbeat gauge is derived at mirror time.
+#[derive(Copy, Clone, Debug)]
+pub struct AiIngressCounterIds {
+    /// `engine_ingress_ai_cmds_total`.
+    pub cmds: core_metrics::CounterId,
+    /// `engine_ingress_ai_hmac_fail_total`.
+    pub hmac_fail: core_metrics::CounterId,
+    /// `engine_ingress_ai_protocol_err_total`.
+    pub protocol_err: core_metrics::CounterId,
+    /// `engine_ingress_ai_malformed_total`.
+    pub malformed: core_metrics::CounterId,
+    /// `engine_ingress_ai_seq_gap_total`.
+    pub seq_gap: core_metrics::CounterId,
+    /// `engine_ingress_ai_seq_regress_total`.
+    pub seq_regress: core_metrics::CounterId,
+    /// `engine_ingress_ai_ring_drops_total`.
+    pub ring_drops: core_metrics::CounterId,
+    /// `engine_ingress_ai_expired_total` (writer: engine drain site).
+    pub expired: core_metrics::CounterId,
+    /// `engine_ingress_ai_rejected_conns_total`.
+    pub rejected_conns: core_metrics::CounterId,
+    /// `engine_ai_drain_malformed_total` — the engine drain-site shape
+    /// re-check (defense in depth; distinct from the ingress-side
+    /// `malformed_total`).
+    pub drain_malformed: core_metrics::CounterId,
+    /// `engine_ingress_ai_last_heartbeat_age_ns` gauge. Derived as
+    /// `now - last_heartbeat_ns` at mirror time; **-1 is the sentinel
+    /// for "no heartbeat ever accepted"** (`last_heartbeat_ns == 0`) —
+    /// a literal 0 would read as "heartbeat this instant", which is
+    /// the opposite of the truth at boot.
+    pub last_heartbeat_age_ns: GaugeId,
+}
+
+/// Last-mirrored cumulative [`AiIngressStatus`] values + the engine
+/// drain-site counter — same delta bookkeeping as
+/// [`IngressCountersSnapshot`].
+#[derive(Copy, Clone, Debug, Default)]
+struct AiCountersSnapshot {
+    cmds: u64,
+    hmac_fail: u64,
+    protocol_err: u64,
+    malformed: u64,
+    seq_gap: u64,
+    seq_regress: u64,
+    ring_drops: u64,
+    expired: u64,
+    rejected_conns: u64,
+    drain_malformed: u64,
+}
+
+/// Mirror the AI status slot (+ the engine drain-site counter) into
+/// registry counters as deltas, and derive the heartbeat-age gauge.
+/// 5 s cadence — cold path.
+fn mirror_ai_counters(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &AiIngressCounterIds,
+    st: &AiIngressStatus,
+    engine_drain_malformed: u64,
+    now: u64,
+    last: &mut AiCountersSnapshot,
+) {
+    let cur = AiCountersSnapshot {
+        cmds: st.cmds(),
+        hmac_fail: st.hmac_fail(),
+        protocol_err: st.protocol_err(),
+        malformed: st.malformed(),
+        seq_gap: st.seq_gap(),
+        seq_regress: st.seq_regress(),
+        ring_drops: st.ring_drops(),
+        expired: st.expired(),
+        rejected_conns: st.rejected_conns(),
+        drain_malformed: engine_drain_malformed,
+    };
+    reg.counter(ids.cmds).inc(cur.cmds.saturating_sub(last.cmds));
+    reg.counter(ids.hmac_fail)
+        .inc(cur.hmac_fail.saturating_sub(last.hmac_fail));
+    reg.counter(ids.protocol_err)
+        .inc(cur.protocol_err.saturating_sub(last.protocol_err));
+    reg.counter(ids.malformed)
+        .inc(cur.malformed.saturating_sub(last.malformed));
+    reg.counter(ids.seq_gap)
+        .inc(cur.seq_gap.saturating_sub(last.seq_gap));
+    reg.counter(ids.seq_regress)
+        .inc(cur.seq_regress.saturating_sub(last.seq_regress));
+    reg.counter(ids.ring_drops)
+        .inc(cur.ring_drops.saturating_sub(last.ring_drops));
+    reg.counter(ids.expired)
+        .inc(cur.expired.saturating_sub(last.expired));
+    reg.counter(ids.rejected_conns)
+        .inc(cur.rejected_conns.saturating_sub(last.rejected_conns));
+    reg.counter(ids.drain_malformed)
+        .inc(cur.drain_malformed.saturating_sub(last.drain_malformed));
+    // Heartbeat age: -1 sentinel for "never" (see the field docs).
+    let hb = st.last_heartbeat_ns();
+    reg.gauge(ids.last_heartbeat_age_ns).set(if hb == 0 {
+        -1
+    } else {
+        now.saturating_sub(hb) as i64
+    });
+    *last = cur;
+}
+
+/// Register the Phase-8f AI ingress metric family. Boot-only.
+fn register_ai_counters(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<AiIngressCounterIds, &'static str> {
+    let last_heartbeat_age_ns = reg
+        .register_gauge("engine_ingress_ai_last_heartbeat_age_ns")
+        .map_err(|_| "register engine_ingress_ai_last_heartbeat_age_ns")?;
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name).map_err(|_| "register ai counter")
+    };
+    Ok(AiIngressCounterIds {
+        cmds: one("engine_ingress_ai_cmds_total")?,
+        hmac_fail: one("engine_ingress_ai_hmac_fail_total")?,
+        protocol_err: one("engine_ingress_ai_protocol_err_total")?,
+        malformed: one("engine_ingress_ai_malformed_total")?,
+        seq_gap: one("engine_ingress_ai_seq_gap_total")?,
+        seq_regress: one("engine_ingress_ai_seq_regress_total")?,
+        ring_drops: one("engine_ingress_ai_ring_drops_total")?,
+        expired: one("engine_ingress_ai_expired_total")?,
+        rejected_conns: one("engine_ingress_ai_rejected_conns_total")?,
+        drain_malformed: one("engine_ai_drain_malformed_total")?,
+        last_heartbeat_age_ns,
+    })
 }
 
 // ---------------------------------------------------------------
@@ -2187,7 +2472,14 @@ where
         ai_cmds,
         ai_status,
     } = cons;
+    let mut obs = obs;
     let mut eng = Engine::new(strat, disp, tick_lanes, rpc_signal, fill_lanes, ai_cmds, ai_status);
+    // Phase 8f: the fills capture is opened by the bin (per-run
+    // capture directory) and rides in via Observability; the engine
+    // thread owns it from here.
+    if let Some(cap) = obs.fills_capture.take() {
+        eng.set_fill_capture(cap);
+    }
     if let Err(e) = eng.start() {
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
@@ -2204,6 +2496,8 @@ where
     // get monotonic deltas. Append-only: existing indices are
     // load-bearing, new venues go at the end.
     let mut ingress_last = [IngressCountersSnapshot::default(); 6];
+    // Phase-8f AI-family delta snapshot (same bookkeeping).
+    let mut ai_last = AiCountersSnapshot::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -2225,6 +2519,12 @@ where
 
         let now = now_ns();
         if now >= next_report {
+            // Phase 8f: bound fills-capture staging staleness to one
+            // report period even when no further fills arrive.
+            // Independent of the metrics gate — capture durability is
+            // not an observability option.
+            eng.maybe_flush_fill_capture(now);
+
             let ticks = eng.ticks_dispatched;
             let signals = eng.signals_dispatched;
             let orders = strategy_core::StrategyCounters::orders_emitted(eng.strategy());
@@ -2312,6 +2612,26 @@ where
                         &mut ingress_last[5],
                     );
                 }
+
+                // Phase-8f AI family: §4.4 counter deltas from the
+                // shared status slot (incl. the engine-written
+                // `expired`), the drain-site re-check counter, and
+                // the derived heartbeat-age gauge (-1 = never).
+                mirror_ai_counters(
+                    reg,
+                    &ids.ingress_ai,
+                    eng.ai_status(),
+                    eng.ai_drain_malformed,
+                    now,
+                    &mut ai_last,
+                );
+                // Engine-thread fills-capture pair — mirrored
+                // centrally (the engine owns this capture, unlike the
+                // per-thread venue sinks).
+                reg.gauge(ids.fills_capture.io_errors)
+                    .set(eng.fill_capture_io_errors() as i64);
+                reg.gauge(ids.fills_capture.records)
+                    .set(eng.fill_capture_records() as i64);
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)
@@ -3128,6 +3448,28 @@ mod tests {
         let cons = split_all_consumers(&rings);
         assert_eq!(cons.tick_lanes.len(), NUM_TICK_LANES);
         assert_eq!(cons.fill_lanes.len(), NUM_FILL_LANES);
+    }
+
+    #[test]
+    fn ai_hmac_key_parses_64_hex_chars() {
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let key = parse_ai_hmac_key(hex).unwrap();
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x01);
+        assert_eq!(key[31], 0x1f);
+        // Mixed case + surrounding whitespace are tolerated.
+        let key2 = parse_ai_hmac_key(" 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F\n").unwrap();
+        assert_eq!(key, key2);
+    }
+
+    #[test]
+    fn ai_hmac_key_rejects_bad_length_and_bad_nibble() {
+        assert!(parse_ai_hmac_key("").is_err());
+        assert!(parse_ai_hmac_key("abcd").is_err(), "too short");
+        let long = "00".repeat(33);
+        assert!(parse_ai_hmac_key(&long).is_err(), "too long");
+        let bad = "0g0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert!(parse_ai_hmac_key(bad).is_err(), "non-hex nibble");
     }
 
     #[test]

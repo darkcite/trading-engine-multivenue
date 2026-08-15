@@ -553,11 +553,11 @@ fn run(args: RunArgs) -> ExitCode {
         [f0, f1, f2, f3]
     };
     // AI command lane (Phase 8f). The producer half feeds the
-    // `ingress-ai` thread; until that thread is spawned (item 6b
-    // wiring, gated on AI_INGRESS_HMAC_KEY) dropping it leaves the
-    // engine's AI lane permanently empty — the §3.3 unspawned shape.
+    // `ingress-ai` thread (spawned below, gated on
+    // AI_INGRESS_HMAC_KEY); when the key is absent the producer is
+    // dropped and the engine's AI lane reads permanently empty — the
+    // §3.3 unspawned shape.
     let (ai_prod, ai_lane_cons) = rings.ai.clone().split();
-    drop(ai_prod); // spawn_ai arrives with item 6b
     let ai_status = std::sync::Arc::new(cli::AiIngressStatus::new());
 
     // -- Per-ingress status slots (D7) --
@@ -836,6 +836,60 @@ fn run(args: RunArgs) -> ExitCode {
         );
         handles.push(rss_handle);
     }
+
+    // -- AI-command ingress (Phase 8f; opt-in via AI_INGRESS_HMAC_KEY
+    // in .env) --
+    // Key semantics: ABSENT/empty ⇒ thread not started (back-compat
+    // with pre-8f .env files); PRESENT but unparseable ⇒ fatal boot
+    // error — a typo'd key must never silently disable the AI lane.
+    // The parsed key is moved into the thread and never logged.
+    match std::env::var("AI_INGRESS_HMAC_KEY") {
+        Ok(hex) if !hex.trim().is_empty() => match cli::parse_ai_hmac_key(&hex) {
+            Ok(key) => {
+                info!(sock = %cfg.ai_ingress_sock, "ingress-ai: starting thread");
+                let ai_handle = match cli::spawn_ai(
+                    PathBuf::from(&cfg.ai_ingress_sock),
+                    key,
+                    ai_prod,
+                    ai_status.clone(),
+                    &run_dir,
+                    epoch_ns,
+                    capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_ai)),
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(error = ?e, "ingress-ai: capture open failed");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                };
+                handles.push(ai_handle);
+            }
+            Err(reason) => {
+                // `reason` is a static description; no key material.
+                error!(reason, "AI_INGRESS_HMAC_KEY present but invalid — refusing to boot");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        },
+        _ => {
+            info!("AI_INGRESS_HMAC_KEY unset; ingress-ai thread not started");
+            drop(ai_prod);
+        }
+    }
+
+    // -- Engine-thread fills capture (Phase 8f item 6) --
+    // engine-fills.pmlr in the per-run capture directory: the
+    // positions/P&L feed for the research loop. Open failure is a
+    // fatal boot error (§6.5 stance: capture is the product).
+    let obs = match cli::open_fills_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_fills_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "fills capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
 
     // -- Main thread: real engine loop until SIGINT --
     let cons = Consumers {

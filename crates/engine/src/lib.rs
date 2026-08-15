@@ -25,12 +25,20 @@
 use std::sync::Arc;
 
 use clob_dispatcher::OrderDispatch;
+use core_io::SlotCapture;
 use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{AiCmd, Fill, Order, Signal, Tick, VenueId, AI_RING_SIZE};
 use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
+
+/// File name of the engine-thread fills capture inside the per-run
+/// capture directory (Phase 8f item 6). `SlotKind::Fill` slots: paper
+/// fills now, venue fills ride the same path post-8j. This file is
+/// the positions/P&L feed for the offline research loop — the AI sees
+/// open positions via replay, never via a new IPC channel (design §2).
+pub const ENGINE_FILLS_FILE: &str = "engine-fills.pmlr";
 
 // ---------------------------------------------------------------
 // Compile-time ring sizes + lane geometry
@@ -117,6 +125,15 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// defense in depth, mirrored to
     /// `engine_ai_drain_malformed_total` by the cli.
     pub ai_drain_malformed: u64,
+    /// Engine-thread fills capture → [`ENGINE_FILLS_FILE`] (Phase 8f
+    /// item 6). `None` when the cli did not wire one (tests, replay
+    /// tooling). Every fill dispatched to `Strategy::on_fill` — fill
+    /// lanes and dispatcher pump alike — is staged BEFORE the
+    /// strategy callback runs, so a strategy panic cannot lose the
+    /// record. Flush cadence is caller-driven:
+    /// [`Self::maybe_flush_fill_capture`] from the cli report tick +
+    /// an unconditional drain in [`Self::stop`].
+    fill_capture: Option<SlotCapture<Fill>>,
     last_timer_ns: NsTs,
     /// Number of iterations completed (wraps on u64; for paper-mode stats).
     pub iterations: u64,
@@ -188,6 +205,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             ai_status,
             ai_dispatched: 0,
             ai_drain_malformed: 0,
+            fill_capture: None,
             last_timer_ns: 0,
             iterations: 0,
             ticks_dispatched: 0,
@@ -289,6 +307,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     Some(f) => {
                         let now = now_ns();
                         self.ack_lat.record(now.saturating_sub(f.ts_ns));
+                        // Phase 8f: stage the fill to
+                        // engine-fills.pmlr before the strategy sees
+                        // it (audit completeness over callback order).
+                        if let Some(cap) = self.fill_capture.as_mut() {
+                            cap.append(&f);
+                        }
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
@@ -315,6 +339,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 Some(f) => {
                     let now = now_ns();
                     self.ack_lat.record(now.saturating_sub(f.ts_ns));
+                    // Phase 8f: paper/queued fills are captured on
+                    // the same path as venue fills (design §2 row —
+                    // one file, both sources).
+                    if let Some(cap) = self.fill_capture.as_mut() {
+                        cap.append(&f);
+                    }
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
@@ -502,7 +532,49 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         Ok(())
     }
 
-    /// Call `on_stop` on the owned strategy.
+    /// Attach the engine-thread fills capture (boot-only, before
+    /// [`Self::start`]). The cli opens [`ENGINE_FILLS_FILE`] inside
+    /// the per-run capture directory and hands it over here.
+    pub fn set_fill_capture(&mut self, cap: SlotCapture<Fill>) {
+        self.fill_capture = Some(cap);
+    }
+
+    /// Drain staged fills to disk if the capture flush interval has
+    /// elapsed. Called from the cli's 5 s report tick — off the hot
+    /// path — so staged fills reach disk within one report period
+    /// even when no further fills arrive. No-op without a capture.
+    #[inline]
+    pub fn maybe_flush_fill_capture(&mut self, now_ns: u64) {
+        if let Some(cap) = self.fill_capture.as_mut() {
+            cap.maybe_flush(now_ns);
+        }
+    }
+
+    /// Fills staged to the capture since boot (0 without a capture).
+    /// Mirrored into the `engine_fills_capture_records` gauge.
+    #[inline]
+    pub fn fill_capture_records(&self) -> u64 {
+        match self.fill_capture.as_ref() {
+            Some(cap) => cap.records(),
+            None => 0,
+        }
+    }
+
+    /// Capture I/O errors (first one sticky-disables the sink; 0
+    /// without a capture). Mirrored into the
+    /// `engine_fills_capture_io_errors` gauge — nonzero is a soak
+    /// red flag even though trading continues.
+    #[inline]
+    pub fn fill_capture_io_errors(&self) -> u64 {
+        match self.fill_capture.as_ref() {
+            Some(cap) => cap.io_errors(),
+            None => 0,
+        }
+    }
+
+    /// Call `on_stop` on the owned strategy, then drain the fills
+    /// capture (orderly-shutdown path; drop would also drain, but an
+    /// explicit flush surfaces the I/O error counter first).
     pub fn stop(&mut self) {
         let mut ctx = EngineCtx {
             disp: &mut self.disp,
@@ -510,6 +582,11 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             now: now_ns(),
         };
         self.strat.on_stop(&mut ctx);
+        if let Some(cap) = self.fill_capture.as_mut() {
+            // Sticky-disable policy: errors here are counted by the
+            // sink itself; nothing to propagate at teardown.
+            let _ = cap.flush_all();
+        }
     }
 
     /// Borrow the dispatcher (for paper-mode stats reads).
@@ -829,6 +906,79 @@ mod tests {
         tp[2].try_push(mk_tick(VenueId::Okx, okx, 1)).unwrap();
         eng.tick(16);
         assert_eq!(eng.populated_sym_count(), 2);
+    }
+
+    // ---------------- fills capture (Phase 8f item 6) ----------------
+
+    #[test]
+    fn fills_capture_stages_lane_and_dispatcher_fills() {
+        let dir = std::env::temp_dir().join(format!(
+            "stage2_engine_fills_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ENGINE_FILLS_FILE);
+
+        // Dispatcher-pump source: one queued fill (D3 shape).
+        let (_tp, tc) = split_tick_lanes();
+        let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (mut fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let disp = OneFillDispatcher {
+            fill: Some(Fill::new(
+                5,
+                3,
+                Side::Ask,
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                42,
+            )),
+            stats: DispatchStats::default(),
+        };
+        let strat = Counter {
+            ticks: 0,
+            signals: 0,
+            fills: 0,
+            ai_cmds: 0,
+        };
+        let mut eng = Engine::new(strat, disp, tc, sc, fc, ac, Arc::new(AiIngressStatus::new()));
+        eng.set_fill_capture(
+            core_io::SlotCapture::open(&path, core_io::SlotKind::Fill, 7).unwrap(),
+        );
+        eng.start().unwrap();
+
+        // Fill-lane source: one Polymarket fill.
+        fp[0]
+            .try_push(Fill::new(
+                10,
+                7,
+                Side::Bid,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                99,
+            ))
+            .unwrap();
+        eng.tick(16);
+        assert_eq!(eng.fills_dispatched, 2);
+        assert_eq!(eng.fill_capture_records(), 2, "both fill sources captured");
+        assert_eq!(eng.fill_capture_io_errors(), 0);
+        eng.stop(); // drains staging
+
+        let r = core_io::PmlrReader::<Fill>::open(&path).unwrap();
+        assert_eq!(r.slot_kind(), core_io::SlotKind::Fill);
+        assert_eq!(r.len(), 2);
+        // Lane fills drain before the dispatcher pump within tick().
+        assert_eq!(r.records()[0].ts_ns, 10);
+        assert_eq!(r.records()[1].ts_ns, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fills_capture_getters_zero_without_capture() {
+        let (eng, _tp, _sp, _fp, _ap) = build_engine();
+        assert_eq!(eng.fill_capture_records(), 0);
+        assert_eq!(eng.fill_capture_io_errors(), 0);
     }
 
     // ---------------- AI command lane (Phase 8f §11) ----------------

@@ -2214,3 +2214,54 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
+
+/// Phase 8f item 6: the engine-thread fills capture
+/// (`SlotCapture<Fill>` → engine-fills.pmlr) must stage + flush with
+/// zero allocations after boot — it sits on the engine thread's fill
+/// dispatch path.
+#[test]
+fn engine_fills_capture_append_is_zero_alloc() {
+    use core_io::{SlotCapture, SlotKind};
+    use core_types::{Fill, Side};
+
+    let cap_dir = std::env::temp_dir().join(format!(
+        "stage2_alloc_fills_capture_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    std::fs::create_dir_all(&cap_dir).unwrap();
+    let path = cap_dir.join(engine::ENGINE_FILLS_FILE);
+    let mut capture: SlotCapture<Fill> = SlotCapture::open(&path, SlotKind::Fill, 1).unwrap();
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        let f = Fill::new(
+            i,
+            7,
+            Side::Bid,
+            Price::from_raw(500_000),
+            Qty::from_raw(1_000_000),
+            i,
+        );
+        capture.append(&f);
+        // Exercise the periodic-drain branch inside the window too —
+        // interval elapsed on every call (last_flush starts at 0 and
+        // the interval is < the synthetic clock we feed).
+        capture.maybe_flush(i.wrapping_mul(10_000_000_000));
+        i += 1;
+    }
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(capture.records(), CYCLES);
+    assert_eq!(capture.io_errors(), 0);
+    assert!(!capture.is_disabled());
+    assert_eq!(
+        allocs, 0,
+        "fills capture path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "fills capture path bytes should be zero: saw {bytes}");
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
+}

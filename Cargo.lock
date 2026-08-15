@@ -625,6 +625,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "clob-dispatcher",
+ "core-io",
  "core-latency",
  "core-ring",
  "core-time",

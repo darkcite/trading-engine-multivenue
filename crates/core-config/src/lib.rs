@@ -106,6 +106,13 @@ pub struct Config {
     /// Hyperliquid `/info` REST host for Phase-8e boot asset discovery.
     /// Env: `HYPERLIQUID_API_HOST`. Default: `api.hyperliquid.xyz`.
     pub hyperliquid_api_host: String,
+    /// AI-command UDS path (Phase 8f §4.2). Env: `AI_INGRESS_SOCK`.
+    /// Default: `~/multivenue/run/ai.sock` (tilde expanded at load,
+    /// like `log_dir`). The companion secret `AI_INGRESS_HMAC_KEY` is
+    /// deliberately NOT part of `Config` — `print-config` debug-prints
+    /// this struct, and the key must never reach a log; the cli binary
+    /// loads it straight from the (already-dotenv-loaded) environment.
+    pub ai_ingress_sock: String,
 }
 
 impl Config {
@@ -143,6 +150,9 @@ impl Config {
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
             hyperliquid_api_host: env_opt("HYPERLIQUID_API_HOST")
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
+            ai_ingress_sock: expand_tilde(
+                &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
+            )?,
         })
     }
 
@@ -355,6 +365,38 @@ mod tests {
         assert_eq!(decode_hex_nibble(b'0'), Some(0));
         assert_eq!(decode_hex_nibble(b'f'), Some(15));
         assert_eq!(decode_hex_nibble(b'A'), Some(10));
+    }
+
+    #[test]
+    fn ai_ingress_sock_defaults_under_home() {
+        // SAFETY: test-only env mutation; same pattern as the
+        // expand_tilde tests below.
+        unsafe {
+            std::env::set_var("HOME", "/Users/testhome");
+            std::env::remove_var("AI_INGRESS_SOCK");
+        }
+        let got = expand_tilde(
+            &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(got, "/Users/testhome/multivenue/run/ai.sock");
+    }
+
+    #[test]
+    fn ai_ingress_sock_env_override_passes_through() {
+        // SAFETY: test-only env mutation (module convention).
+        unsafe {
+            std::env::set_var("AI_INGRESS_SOCK", "/tmp/stage2-ai-test/ai.sock");
+        }
+        let got = expand_tilde(
+            &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(got, "/tmp/stage2-ai-test/ai.sock");
+        // SAFETY: restore for sibling tests.
+        unsafe {
+            std::env::remove_var("AI_INGRESS_SOCK");
+        }
     }
 
     #[test]
