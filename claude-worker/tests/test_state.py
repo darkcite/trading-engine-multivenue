@@ -114,3 +114,40 @@ def test_missing_seq_row_reseeded_on_open(tmp_path: pathlib.Path) -> None:
     # Re-seeding on open restores the invariant rather than limping.
     assert st2.next_seq() == 1
     st2.close()
+
+
+# ---- prompt cache (§5.3; consumers arrive in item 10) ----
+
+
+def test_cache_roundtrip_and_miss(tmp_path: pathlib.Path) -> None:
+    st = claude_worker.state.State(tmp_path / "state.db")
+    assert st.cache_get("m", "v", "c") is None
+    st.cache_put("m", "v", "c", "resp", ts=123)
+    assert st.cache_get("m", "v", "c") == "resp"
+    assert st.cache_get("other-model", "v", "c") is None
+    st.cache_put("m", "v", "c", "resp2", ts=124)  # idempotent overwrite
+    assert st.cache_get("m", "v", "c") == "resp2"
+    st.close()
+
+
+def test_cached_complete_hit_and_scoping(tmp_path: pathlib.Path) -> None:
+    st = claude_worker.state.State(tmp_path / "state.db")
+    calls: list[tuple[str, str]] = []
+
+    def fake(model: str, prompt: str) -> str:
+        calls.append((model, prompt))
+        return f"resp-{len(calls)}"
+
+    first, hit1 = st.cached_complete("m", "tpl-v1", "same prompt", fake)
+    assert (first, hit1) == ("resp-1", False)
+    second, hit2 = st.cached_complete("m", "tpl-v1", "same prompt", fake)
+    assert (second, hit2) == ("resp-1", True)
+    assert len(calls) == 1, "identical prompt served from cache"
+
+    # A prompt-template version bump invalidates without touching rows.
+    third, hit3 = st.cached_complete("m", "tpl-v2", "same prompt", fake)
+    assert (third, hit3) == ("resp-2", False)
+    # Model scoping: same version+prompt, different model = distinct entry.
+    fourth, hit4 = st.cached_complete("m2", "tpl-v1", "same prompt", fake)
+    assert (fourth, hit4) == ("resp-3", False)
+    st.close()

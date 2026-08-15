@@ -18,9 +18,11 @@ created up front so items 10-12 add consumers, not migrations.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import hashlib
 import pathlib
 import sqlite3
 import time
+import typing
 
 _SCHEMA: tuple[str, ...] = (
     """
@@ -131,6 +133,57 @@ class State:
                 (feed, guid, first_ts),
             )
         return cur.rowcount == 1
+
+    # ---- prompt cache (§5.3; PLAN §10.2 — first consumers in item 10) ----
+
+    def cache_get(self, model: str, prompt_version_hash: str, content_hash: str) -> str | None:
+        """Cached response for the exact (model, prompt-version, content)
+        triple, or None."""
+        row = self._conn.execute(
+            "SELECT response FROM prompt_cache"
+            " WHERE model = ? AND prompt_version_hash = ? AND content_hash = ?",
+            (model, prompt_version_hash, content_hash),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def cache_put(
+        self,
+        model: str,
+        prompt_version_hash: str,
+        content_hash: str,
+        response: str,
+        ts: int | None = None,
+    ) -> None:
+        """Store one response (idempotent overwrite on replay)."""
+        stamp = int(time.time()) if ts is None else ts
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO prompt_cache"
+                " (model, prompt_version_hash, content_hash, response, created_ts)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (model, prompt_version_hash, content_hash, response, stamp),
+            )
+
+    def cached_complete(
+        self,
+        model: str,
+        prompt_version: str,
+        prompt: str,
+        complete_fn: typing.Callable[[str, str], str],
+    ) -> tuple[str, bool]:
+        """The single LLM-call gate: consult the prompt cache, invoke
+        ``complete_fn(model, prompt)`` only on a miss, store the result.
+        Returns ``(response, cache_hit)``. The version string is hashed
+        separately from the content so a prompt-template bump invalidates
+        without touching stored rows (§5.3 key design)."""
+        version_hash = hashlib.sha256(prompt_version.encode()).hexdigest()
+        content_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        cached = self.cache_get(model, version_hash, content_hash)
+        if cached is not None:
+            return cached, True
+        response = complete_fn(model, prompt)
+        self.cache_put(model, version_hash, content_hash, response)
+        return response, False
 
     # ---- event log (§5.3 + §3 capture amendment) ----
 
