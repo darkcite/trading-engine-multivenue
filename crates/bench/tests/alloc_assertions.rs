@@ -34,6 +34,7 @@ use ingress_polymarket::run_loop::{
 use ingress_rpc::{
     parse_block_number_result, parse_new_head_notification, write_request_eth_block_number,
 };
+use ingress_ai::{admit_frame, pack_frame, AiCmdCapture, AiIngressStatus, FrameVerdict, SeqPolicy};
 use ingress_rss::{feed_items, fnv1a_64, SeenRing};
 
 /// Push/pop a Tick through the SPSC ring 10_000 times — must not
@@ -2118,6 +2119,92 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     assert_eq!(capture.io_errors(), 0);
     assert_eq!(capture.tap_dropped(), 0);
     assert!(capture.ticks_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
+}
+
+/// 8f item 5 (design §11 alloc gate): the full AI-ingress frame path —
+/// pack (client side of the loopback), then accept → HMAC verify →
+/// shape check → seq policy → ts rewrite → capture → try_push — must
+/// allocate ZERO bytes per frame after boot. 10 000 frames; consumer
+/// pops in lockstep so the ring never saturates (`ring_drops` stays 0
+/// and the push path is exercised end-to-end).
+#[test]
+fn ai_ingress_admit_frame_is_zero_alloc() {
+    use core_types::{
+        AiCmd, AiCmdKind, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE,
+    };
+
+    // Boot (allocation allowed): ring, capture sink, status slot.
+    let ring: std::sync::Arc<Ring<AiCmd, { core_types::AI_RING_SIZE }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let cap_dir = std::env::temp_dir().join(format!(
+        "stage2_alloc_ai_ingress_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = AiCmdCapture::open(&cap_dir, 1).unwrap();
+    let status = AiIngressStatus::new();
+    let mut seq = SeqPolicy::new();
+    let key = [0x77u8; 32];
+    let mut frame = [0u8; ingress_ai::FRAME_LEN];
+    let mut seam_hits = 0u64;
+    let mut seam = |_c: &AiCmd| seam_hits += 1;
+
+    const CYCLES: u32 = 10_000;
+    let mut acc: u64 = 0;
+
+    let g = AllocGuard::new();
+    let mut i = 1u32;
+    while i <= CYCLES {
+        let cmd = AiCmd::new(
+            u64::from(i), // worker ts — rewritten on accept
+            i,
+            SYMBOL_ID_NONE,
+            0,
+            0,
+            0,
+            AiCmdKind::Heartbeat,
+            VenueId::Ai,
+            STRATEGY_SLOT_NONE,
+            AI_SIDE_NONE,
+            0,
+            0,
+        );
+        pack_frame(&key, &cmd, &mut frame);
+        let v = admit_frame(
+            &frame,
+            &key,
+            &mut seq,
+            &mut prod,
+            &mut capture,
+            &status,
+            &mut seam,
+            u64::from(i) + 1_000_000,
+        );
+        assert!(matches!(v, FrameVerdict::Accepted));
+        let popped = cons.try_pop().unwrap();
+        acc = acc.wrapping_add(popped.ts_ns);
+        i += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(status.cmds(), u64::from(CYCLES));
+    assert_eq!(status.hmac_fail(), 0);
+    assert_eq!(status.protocol_err(), 0);
+    assert_eq!(status.malformed(), 0);
+    assert_eq!(status.seq_gap(), 0);
+    assert_eq!(status.seq_regress(), 0);
+    assert_eq!(status.ring_drops(), 0);
+    assert_eq!(seam_hits, 0);
+    assert_eq!(capture.records(), u64::from(CYCLES));
+    assert!(!capture.is_disabled());
+    assert_eq!(
+        allocs, 0,
+        "ai ingress frame path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ai ingress frame path bytes should be zero: saw {bytes}");
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }

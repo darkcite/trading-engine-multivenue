@@ -139,6 +139,7 @@ dependencies = [
  "criterion",
  "dhat",
  "engine",
+ "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
  "ingress-hyperliquid",

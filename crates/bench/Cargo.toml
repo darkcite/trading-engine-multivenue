@@ -23,6 +23,7 @@ dhat       = { workspace = true }
 criterion            = { workspace = true }
 # Pulled in ONLY by the alloc_assertions integration test so we can
 # round-trip real frames through the zero-alloc path.
+ingress-ai           = { workspace = true }
 ingress-polymarket   = { workspace = true }
 ingress-binance      = { workspace = true }
 ingress-deribit      = { workspace = true }
