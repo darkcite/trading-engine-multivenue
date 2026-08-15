@@ -23,9 +23,11 @@
 //! One entry per symbol carrying `{px_1e6, bias_1e6, set_ns, ttl_ns}`
 //! (§7). `SetFairValue` upserts the fair price; `SetBias` upserts the
 //! signed bias. **Either kind refreshes the entry's single
-//! `set_ns`/`ttl_ns`** — the entry has one TTL, not one per field
-//! (§7 sketch). A bias-only entry (`SetBias` before any
-//! `SetFairValue`) is held but never quotes until a fair arrives.
+//! `set_ns`/`ttl_ns` AND its `expire_on_silence` flag** — the entry
+//! has one TTL and one policy, not one per field (§7 sketch);
+//! last-writer-wins, so a follow-up upsert without the flag clears
+//! it. A bias-only entry (`SetBias` before any `SetFairValue`) is
+//! held but never quotes until a fair arrives.
 //! Entry liveness is evaluated at read time (`now − set_ns >
 //! ttl_ns` ⇒ dead) — expiry never writes.
 //!
@@ -1072,6 +1074,20 @@ mod tests {
     }
 
     // ---------------- fair table probe mechanics ----------------
+
+    #[test]
+    fn upsert_flag_is_last_writer_wins() {
+        // Every upsert rewrites the entry policy (set_ns/ttl_ns AND
+        // expire_on_silence) — a bias without the flag clears it.
+        let (mut s, mut c) = primed();
+        s.on_ai(&set_fair(T0 + 1, PM, 500_000, 60_000_000_000, true), &mut c);
+        assert!(s.fair_snapshot(PM).unwrap().expire_on_silence);
+        s.on_ai(&set_bias(T0 + 2, PM, 10_000, 60_000_000_000), &mut c);
+        assert!(
+            !s.fair_snapshot(PM).unwrap().expire_on_silence,
+            "unflagged upsert clears the flag (last writer wins)"
+        );
+    }
 
     #[test]
     fn upsert_updates_in_place_and_preserves_bias() {
