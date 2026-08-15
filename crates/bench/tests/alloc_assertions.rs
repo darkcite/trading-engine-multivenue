@@ -2215,6 +2215,130 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
+/// Phase 8f item 7: StrategySet fan-out steady state — mask-gated
+/// member dispatch (ticks through a configured latency-arb member,
+/// AI heartbeat fan-out, an Enable/Disable round trip) must allocate
+/// nothing after boot. The ai-exec on_tick/on_ai gate arrives with
+/// item 8.
+#[test]
+fn strategy_set_fanout_is_zero_alloc() {
+    use core_types::{
+        AiCmd, AiCmdKind, Order, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE,
+    };
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_set::{StrategySet, BIT_LATENCY_ARB, SLOT_LATENCY_ARB};
+
+    struct CountCtx {
+        submitted: u64,
+        now: u64,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            self.submitted += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    // Boot (allocation allowed): configure the latency-arb member.
+    let mut set = StrategySet::new(BIT_LATENCY_ARB);
+    set.latency_arb_mut().add_pair(11, 22).unwrap();
+    set.latency_arb_mut().set_cooldown_ns(0);
+    let mut ctx = CountCtx {
+        submitted: 0,
+        now: 1_000_000_000_000,
+    };
+    set.on_start(&mut ctx).unwrap();
+
+    let bn = Tick::new(
+        0,
+        VenueId::Binance,
+        22,
+        1,
+        Price::from_raw(490_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(510_000),
+        Qty::from_raw(1_000_000),
+    );
+    let pm = Tick::new(
+        0,
+        VenueId::Polymarket,
+        11,
+        1,
+        Price::from_raw(390_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(410_000),
+        Qty::from_raw(1_000_000),
+    );
+    let hb = AiCmd::new(
+        1,
+        1,
+        SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        AiCmdKind::Heartbeat,
+        VenueId::Ai,
+        STRATEGY_SLOT_NONE,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+    let disable = AiCmd::new(
+        1,
+        2,
+        SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        AiCmdKind::DisableStrategy,
+        VenueId::Ai,
+        SLOT_LATENCY_ARB,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+    let enable = AiCmd::new(
+        1,
+        3,
+        SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        AiCmdKind::EnableStrategy,
+        VenueId::Ai,
+        SLOT_LATENCY_ARB,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+
+    const CYCLES: u32 = 10_000;
+    let g = AllocGuard::new();
+    let mut i = 0u32;
+    while i < CYCLES {
+        set.on_tick(&bn, &mut ctx);
+        set.on_tick(&pm, &mut ctx);
+        set.on_ai(&hb, &mut ctx);
+        set.on_ai(&disable, &mut ctx);
+        set.on_ai(&enable, &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.submitted);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(ctx.submitted >= u64::from(CYCLES), "trigger must fire every cycle");
+    assert_eq!(set.enabled_mask(), BIT_LATENCY_ARB);
+    assert_eq!(set.enable_refused_total(), 0);
+    assert_eq!(
+        allocs, 0,
+        "strategy-set fan-out allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "strategy-set fan-out bytes should be zero: saw {bytes}");
+}
+
 /// Phase 8f item 6: the engine-thread fills capture
 /// (`SlotCapture<Fill>` → engine-fills.pmlr) must stage + flush with
 /// zero allocations after boot — it sits on the engine thread's fill

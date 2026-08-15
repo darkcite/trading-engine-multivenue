@@ -22,9 +22,9 @@ use std::sync::atomic::AtomicBool;
 use clap::Parser;
 use cli::{
     engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
-    engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance,
-    spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, Consumers,
-    EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings,
+    engine_loop_rule_tree_full, engine_loop_set_full, install_sigint_handler, join_reverse,
+    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
+    Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings,
     StrategyPair, WssEndpoint, SHUTDOWN,
 };
 use core_config::{Config, Secrets};
@@ -154,6 +154,9 @@ struct RunArgs {
     /// Strategy selector. `latency-arb` (default) uses Binance →
     /// Polymarket cross-venue arbitrage. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
+    /// `all` (Phase 8f) runs the composed StrategySet: every built
+    /// member whose config flags are present, AI-toggleable at
+    /// runtime; paper-only until 8i.
     #[arg(long, default_value = "latency-arb")]
     strategy: String,
     /// Path to claude-worker NDJSON tag artifacts. Required when
@@ -1055,6 +1058,52 @@ fn run(args: RunArgs) -> ExitCode {
                     path,
                 )
             }
+        }
+        ("all", _live) => {
+            // Phase 8f item 7: the composed StrategySet. `all` means
+            // "every built member the given flags can boot" —
+            // latency-arb from the mandatory pair flags, ev/cross-arb/
+            // rule-tree only when their config flags are present
+            // (members without config boot inert; see
+            // engine_loop_set_full docs). PAPER-only until the 8i
+            // RiskGate lands — the composed set has no live arm.
+            let requested = strategy_set::mask_for_name("all").expect("'all' is a valid mask name");
+            let ev_path = args.artifacts_path.clone();
+            let owned_groups: Vec<Vec<core_types::SymbolId>> = match args.groups.as_deref() {
+                Some(spec) => spec
+                    .split(';')
+                    .map(|grp| {
+                        grp.split(',')
+                            .filter_map(|s| s.trim().parse::<u32>().ok())
+                            .collect()
+                    })
+                    .filter(|v: &Vec<u32>| !v.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
+            let groups_ref: Vec<&[core_types::SymbolId]> =
+                owned_groups.iter().map(|v| v.as_slice()).collect();
+            // Rule mapping: same v1 shape as the standalone rule-tree
+            // arm (every rule → --polymarket-sym-id, "halving" kw).
+            let mut kw = [0u8; 16];
+            let n = b"halving".len().min(16);
+            kw[..n].copy_from_slice(&b"halving"[..n]);
+            let mapping = vec![(args.polymarket_sym_id, kw, n as u8)];
+            let rules = args
+                .rules_path
+                .as_deref()
+                .map(|rp| (rp, mapping.as_slice()));
+            info!("running strategy-set PAPER — no orders will be submitted");
+            engine_loop_set_full(
+                cons,
+                engine_cfg,
+                clob_dispatcher::PaperDispatcher::new(),
+                obs,
+                requested,
+                ev_path.as_deref(),
+                &groups_ref,
+                rules,
+            )
         }
         (other, _) => {
             error!(strategy = other, "unknown --strategy value");

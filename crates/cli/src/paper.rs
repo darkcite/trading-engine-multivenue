@@ -1586,25 +1586,40 @@ pub fn engine_loop_ev_paper(
     engine_loop_ev_full(cons, cfg, disp, Observability::default(), artifact_path)
 }
 
-/// EV strategy with observability and a caller-chosen dispatcher.
-/// Pairs in [`EngineConfig`] are interpreted as Polymarket symbols
-/// only; the Binance leg is ignored.
-pub fn engine_loop_ev_full<D: OrderDispatch>(
-    cons: Consumers,
-    cfg: EngineConfig,
-    disp: D,
-    obs: Observability,
-    artifact_path: &std::path::Path,
-) -> EngineLoopResult {
-    if cfg.pairs.is_empty() {
-        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
+/// Configure a latency-arb instance from [`EngineConfig`] (threshold,
+/// qty, cooldown, pairs). Shared by the standalone path and the
+/// Phase-8f [`engine_loop_set_full`] builder — do not duplicate.
+fn configure_latency_arb<const N: usize>(
+    strat: &mut LatencyArb<N>,
+    cfg: &EngineConfig,
+) -> Result<(), &'static str> {
+    strat.set_threshold(cfg.threshold_1e6);
+    strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
+    strat.set_cooldown_ns(cfg.cooldown_ns);
+    for p in &cfg.pairs {
+        if let Err(e) = strat.add_pair(p.polymarket, p.binance) {
+            tracing::error!(error = ?e, pm = p.polymarket, bn = p.binance, "add_pair failed");
+            return Err("engine_loop: add_pair rejected");
+        }
     }
+    Ok(())
+}
+
+/// Load + configure an EV instance (artifact table, params, symbol
+/// registration). Pairs are interpreted as Polymarket symbols only —
+/// the Binance leg is ignored. Shared by the standalone path and the
+/// Phase-8f set builder.
+fn configure_ev<const N: usize>(
+    strat: &mut strategy_ev::EvStrategy<N>,
+    cfg: &EngineConfig,
+    artifact_path: &std::path::Path,
+) -> Result<(), &'static str> {
     let (table, skipped) =
-        match research_artifacts::ArtifactTable::<STRATEGY_SLOTS>::load_ndjson(artifact_path) {
+        match research_artifacts::ArtifactTable::<N>::load_ndjson(artifact_path) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, path = %artifact_path.display(), "ev: load_ndjson failed");
-                return EngineLoopResult::Failed("engine_loop_ev: artifact load failed");
+                return Err("engine_loop_ev: artifact load failed");
             }
         };
     tracing::info!(
@@ -1613,8 +1628,6 @@ pub fn engine_loop_ev_full<D: OrderDispatch>(
         path = %artifact_path.display(),
         "ev: loaded artifact table"
     );
-
-    let mut strat: strategy_ev::EvStrategy<STRATEGY_SLOTS> = strategy_ev::EvStrategy::new();
     strat.set_threshold(cfg.threshold_1e6);
     strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
     strat.set_cooldown_ns(cfg.cooldown_ns);
@@ -1629,10 +1642,29 @@ pub fn engine_loop_ev_full<D: OrderDispatch>(
         let n = format_u64_into(&mut buf, p.polymarket as u64);
         if let Err(e) = strat.register(p.polymarket, n) {
             tracing::error!(error = ?e, sym = p.polymarket, "ev: register failed");
-            return EngineLoopResult::Failed("engine_loop_ev: register rejected");
+            return Err("engine_loop_ev: register rejected");
         }
     }
+    Ok(())
+}
 
+/// EV strategy with observability and a caller-chosen dispatcher.
+/// Pairs in [`EngineConfig`] are interpreted as Polymarket symbols
+/// only; the Binance leg is ignored.
+pub fn engine_loop_ev_full<D: OrderDispatch>(
+    cons: Consumers,
+    cfg: EngineConfig,
+    disp: D,
+    obs: Observability,
+    artifact_path: &std::path::Path,
+) -> EngineLoopResult {
+    if cfg.pairs.is_empty() {
+        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
+    }
+    let mut strat: strategy_ev::EvStrategy<STRATEGY_SLOTS> = strategy_ev::EvStrategy::new();
+    if let Err(reason) = configure_ev(&mut strat, &cfg, artifact_path) {
+        return EngineLoopResult::Failed(reason);
+    }
     run_engine_loop(cons, disp, strat, obs)
 }
 
@@ -1650,17 +1682,30 @@ pub fn engine_loop_cross_arb_full<D: OrderDispatch>(
         return EngineLoopResult::Failed("engine_loop_cross_arb: no groups configured");
     }
     let mut strat: strategy_cross_arb::CrossArb<8, 8> = strategy_cross_arb::CrossArb::new();
+    if let Err(reason) = configure_cross_arb(&mut strat, &cfg, groups) {
+        return EngineLoopResult::Failed(reason);
+    }
+    run_engine_loop(cons, disp, strat, obs)
+}
+
+/// Configure a cross-arb instance (params + groups). Shared by the
+/// standalone path and the Phase-8f set builder.
+fn configure_cross_arb<const N: usize, const M: usize>(
+    strat: &mut strategy_cross_arb::CrossArb<N, M>,
+    cfg: &EngineConfig,
+    groups: &[&[core_types::SymbolId]],
+) -> Result<(), &'static str> {
     strat.set_threshold(cfg.threshold_1e6);
     strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
     strat.set_cooldown_ns(cfg.cooldown_ns);
     for g in groups {
         if let Err(e) = strat.register_group(g) {
             tracing::error!(error = ?e, "cross-arb: register_group failed");
-            return EngineLoopResult::Failed("engine_loop_cross_arb: register rejected");
+            return Err("engine_loop_cross_arb: register rejected");
         }
     }
     tracing::info!(groups = groups.len(), "cross-arb: registered groups");
-    run_engine_loop(cons, disp, strat, obs)
+    Ok(())
 }
 
 /// Run Strategy D (rule-tree). `rules_path` points at a JSON-
@@ -1676,11 +1721,27 @@ pub fn engine_loop_rule_tree_full<D: OrderDispatch>(
     rules_path: &std::path::Path,
     sym_for_rule: &[(core_types::SymbolId, [u8; 16], u8)],
 ) -> EngineLoopResult {
-    let (rules, skipped) = match research_artifacts::RulesTable::<8>::load_json(rules_path) {
+    let mut strat: strategy_rule_tree::RuleTree<8> = strategy_rule_tree::RuleTree::new();
+    if let Err(reason) = configure_rule_tree(&mut strat, &cfg, rules_path, sym_for_rule) {
+        return EngineLoopResult::Failed(reason);
+    }
+    run_engine_loop(cons, disp, strat, obs)
+}
+
+/// Load + configure a rule-tree instance (rules file, params, symbol
+/// mapping). Shared by the standalone path and the Phase-8f set
+/// builder.
+fn configure_rule_tree<const N: usize>(
+    strat: &mut strategy_rule_tree::RuleTree<N>,
+    cfg: &EngineConfig,
+    rules_path: &std::path::Path,
+    sym_for_rule: &[(core_types::SymbolId, [u8; 16], u8)],
+) -> Result<(), &'static str> {
+    let (rules, skipped) = match research_artifacts::RulesTable::<N>::load_json(rules_path) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, path = %rules_path.display(), "rule-tree: load failed");
-            return EngineLoopResult::Failed("engine_loop_rule_tree: rules load failed");
+            return Err("engine_loop_rule_tree: rules load failed");
         }
     };
     tracing::info!(
@@ -1690,12 +1751,11 @@ pub fn engine_loop_rule_tree_full<D: OrderDispatch>(
         "rule-tree: loaded rules"
     );
     if rules.is_empty() {
-        return EngineLoopResult::Failed("engine_loop_rule_tree: rules file is empty");
+        return Err("engine_loop_rule_tree: rules file is empty");
     }
     if sym_for_rule.is_empty() {
-        return EngineLoopResult::Failed("engine_loop_rule_tree: no symbol mapping provided");
+        return Err("engine_loop_rule_tree: no symbol mapping provided");
     }
-    let mut strat: strategy_rule_tree::RuleTree<8> = strategy_rule_tree::RuleTree::new();
     strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
     strat.set_cooldown_ns(cfg.cooldown_ns);
 
@@ -1706,11 +1766,81 @@ pub fn engine_loop_rule_tree_full<D: OrderDispatch>(
         let (sym, kw, kw_len) = sym_for_rule[mapping_idx];
         if let Err(e) = strat.add_rule(*r, sym, &kw[..kw_len as usize]) {
             tracing::error!(error = ?e, "rule-tree: add_rule failed");
-            return EngineLoopResult::Failed("engine_loop_rule_tree: add_rule rejected");
+            return Err("engine_loop_rule_tree: add_rule rejected");
         }
     }
+    Ok(())
+}
 
-    run_engine_loop(cons, disp, strat, obs)
+/// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
+/// The initial mask enables exactly the members whose configuration
+/// was provided — latency-arb always (pairs are mandatory), ev with
+/// `--artifacts-path`, cross-arb with `--groups`, rule-tree with
+/// `--rules-path`. `requested_mask` (from
+/// [`strategy_set::mask_for_name`]) is intersected with that
+/// configured mask, so `--strategy all` means "all built members the
+/// given flags can boot" — every enabled member still validates
+/// fail-fast in `on_start`. An AI `EnableStrategy` may later switch
+/// on a member that booted unconfigured; it stays inert (registers
+/// nothing, so it never fires) — documented in `strategy-set`.
+#[allow(clippy::too_many_arguments)]
+pub fn engine_loop_set_full<D: OrderDispatch>(
+    cons: Consumers,
+    cfg: EngineConfig,
+    disp: D,
+    obs: Observability,
+    requested_mask: u8,
+    ev_artifacts: Option<&std::path::Path>,
+    cross_groups: &[&[core_types::SymbolId]],
+    rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
+) -> EngineLoopResult {
+    if cfg.pairs.is_empty() {
+        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
+    }
+    let mut configured = strategy_set::BIT_LATENCY_ARB;
+    if ev_artifacts.is_some() {
+        configured |= strategy_set::BIT_EV;
+    }
+    if !cross_groups.is_empty() {
+        configured |= strategy_set::BIT_CROSS_ARB;
+    }
+    if rules.is_some() {
+        configured |= strategy_set::BIT_RULE_TREE;
+    }
+    let mask = requested_mask & configured;
+    if mask == 0 {
+        return EngineLoopResult::Failed("engine_loop_set: no requested member is configured");
+    }
+
+    let mut set = strategy_set::StrategySet::new(mask);
+    if let Err(reason) = configure_latency_arb(set.latency_arb_mut(), &cfg) {
+        return EngineLoopResult::Failed(reason);
+    }
+    if let Some(path) = ev_artifacts {
+        if let Err(reason) = configure_ev(set.ev_mut(), &cfg, path) {
+            return EngineLoopResult::Failed(reason);
+        }
+    }
+    if !cross_groups.is_empty() {
+        if let Err(reason) = configure_cross_arb(set.cross_arb_mut(), &cfg, cross_groups) {
+            return EngineLoopResult::Failed(reason);
+        }
+    }
+    if let Some((rules_path, sym_for_rule)) = rules {
+        if let Err(reason) = configure_rule_tree(set.rule_tree_mut(), &cfg, rules_path, sym_for_rule)
+        {
+            return EngineLoopResult::Failed(reason);
+        }
+    }
+    tracing::info!(
+        mask,
+        latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
+        ev = mask & strategy_set::BIT_EV != 0,
+        cross_arb = mask & strategy_set::BIT_CROSS_ARB != 0,
+        rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
+        "strategy-set: composed"
+    );
+    run_engine_loop(cons, disp, set, obs)
 }
 
 fn format_u64_into(buf: &mut [u8; 32], mut v: u64) -> &[u8] {
@@ -1780,6 +1910,9 @@ impl Observability {
             let strategy_rule_tree = reg
                 .register_gauge("engine_strategy_rule_tree_active")
                 .map_err(|_| "register engine_strategy_rule_tree_active")?;
+            let strategy_set = reg
+                .register_gauge("engine_strategy_set_active")
+                .map_err(|_| "register engine_strategy_set_active")?;
             let ingress_polymarket_state = reg
                 .register_gauge("engine_ingress_polymarket_state")
                 .map_err(|_| "register engine_ingress_polymarket_state")?;
@@ -1894,6 +2027,7 @@ impl Observability {
                 strategy_ev,
                 strategy_cross_arb,
                 strategy_rule_tree,
+                strategy_set,
                 ingress_polymarket_state,
                 ingress_binance_state,
                 ingress_okx_state,
@@ -2067,6 +2201,8 @@ pub struct EngineCounters {
     pub strategy_cross_arb: core_metrics::GaugeId,
     /// Active-strategy indicator — rule-tree (D).
     pub strategy_rule_tree: core_metrics::GaugeId,
+    /// Active-strategy indicator — the Phase-8f composed set.
+    pub strategy_set: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polymarket WSS.
     pub ingress_polymarket_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Binance bookTicker.
@@ -2186,6 +2322,12 @@ pub struct AiIngressCounterIds {
     /// re-check (defense in depth; distinct from the ingress-side
     /// `malformed_total`).
     pub drain_malformed: core_metrics::CounterId,
+    /// `engine_ai_enable_refused_total` — `EnableStrategy` commands
+    /// the strategy set refused (halted, or reserved/unknown slot).
+    /// Mirrored generically via
+    /// `StrategyCounters::ai_enable_refused` (0 for plain
+    /// strategies).
+    pub enable_refused: core_metrics::CounterId,
     /// `engine_ingress_ai_last_heartbeat_age_ns` gauge. Derived as
     /// `now - last_heartbeat_ns` at mirror time; **-1 is the sentinel
     /// for "no heartbeat ever accepted"** (`last_heartbeat_ns == 0`) —
@@ -2209,6 +2351,7 @@ struct AiCountersSnapshot {
     expired: u64,
     rejected_conns: u64,
     drain_malformed: u64,
+    enable_refused: u64,
 }
 
 /// Mirror the AI status slot (+ the engine drain-site counter) into
@@ -2219,6 +2362,7 @@ fn mirror_ai_counters(
     ids: &AiIngressCounterIds,
     st: &AiIngressStatus,
     engine_drain_malformed: u64,
+    strategy_enable_refused: u64,
     now: u64,
     last: &mut AiCountersSnapshot,
 ) {
@@ -2233,6 +2377,7 @@ fn mirror_ai_counters(
         expired: st.expired(),
         rejected_conns: st.rejected_conns(),
         drain_malformed: engine_drain_malformed,
+        enable_refused: strategy_enable_refused,
     };
     reg.counter(ids.cmds).inc(cur.cmds.saturating_sub(last.cmds));
     reg.counter(ids.hmac_fail)
@@ -2253,6 +2398,8 @@ fn mirror_ai_counters(
         .inc(cur.rejected_conns.saturating_sub(last.rejected_conns));
     reg.counter(ids.drain_malformed)
         .inc(cur.drain_malformed.saturating_sub(last.drain_malformed));
+    reg.counter(ids.enable_refused)
+        .inc(cur.enable_refused.saturating_sub(last.enable_refused));
     // Heartbeat age: -1 sentinel for "never" (see the field docs).
     let hb = st.last_heartbeat_ns();
     reg.gauge(ids.last_heartbeat_age_ns).set(if hb == 0 {
@@ -2284,6 +2431,7 @@ fn register_ai_counters(
         expired: one("engine_ingress_ai_expired_total")?,
         rejected_conns: one("engine_ingress_ai_rejected_conns_total")?,
         drain_malformed: one("engine_ai_drain_malformed_total")?,
+        enable_refused: one("engine_ai_enable_refused_total")?,
         last_heartbeat_age_ns,
     })
 }
@@ -2566,6 +2714,8 @@ where
                     .set(if kind == "cross-arb" { 1 } else { 0 });
                 reg.gauge(ids.strategy_rule_tree)
                     .set(if kind == "rule-tree" { 1 } else { 0 });
+                reg.gauge(ids.strategy_set)
+                    .set(if kind == "set" { 1 } else { 0 });
 
                 // Per-ingress connection state — real per-thread
                 // status slots (D7 fix). Gauge value = IngressState:
@@ -2622,6 +2772,7 @@ where
                     &ids.ingress_ai,
                     eng.ai_status(),
                     eng.ai_drain_malformed,
+                    strategy_core::StrategyCounters::ai_enable_refused(eng.strategy()),
                     now,
                     &mut ai_last,
                 );

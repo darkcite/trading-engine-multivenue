@@ -93,10 +93,20 @@ pub trait StrategyCounters {
     ///
     /// Implementors should return a stable static string. Each
     /// in-tree strategy overrides this — `"latency-arb"`, `"ev"`,
-    /// `"cross-arb"`, `"rule-tree"`.
+    /// `"cross-arb"`, `"rule-tree"`, `"set"`.
     #[inline]
     fn strategy_kind(&self) -> &'static str {
         "unknown"
+    }
+
+    /// Cumulative refused AI `EnableStrategy` commands (Phase 8f §7).
+    /// Only `strategy-set` refuses enables, so the default is 0 for
+    /// every plain strategy; the cli mirrors this into
+    /// `engine_ai_enable_refused_total` generically (monomorphized —
+    /// no set-specific plumbing in the engine loop).
+    #[inline]
+    fn ai_enable_refused(&self) -> u64 {
+        0
     }
 }
 

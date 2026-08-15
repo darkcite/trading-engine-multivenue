@@ -34,6 +34,7 @@ members = [
     "crates/strategy-ev",
     "crates/strategy-latency-arb",
     "crates/strategy-rule-tree",
+    "crates/strategy-set",
     # NOTE: `crates/strategy-news/` exists on-disk but is no longer
     # part of the workspace — Strategy D (rule-tree) covers the
     # news-driven path. Files are retained for git history; the
@@ -156,6 +157,7 @@ strategy-cross-arb    = { path = "crates/strategy-cross-arb" }
 strategy-ev           = { path = "crates/strategy-ev" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
+strategy-set          = { path = "crates/strategy-set" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 signer-eip712   = { path = "crates/signer-eip712" }

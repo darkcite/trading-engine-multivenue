@@ -154,6 +154,7 @@ dependencies = [
  "strategy-ev",
  "strategy-latency-arb",
  "strategy-rule-tree",
+ "strategy-set",
  "tui",
 ]
 
@@ -332,6 +333,7 @@ dependencies = [
  "strategy-ev",
  "strategy-latency-arb",
  "strategy-rule-tree",
+ "strategy-set",
  "tracing",
  "tracing-subscriber",
  "tui",
@@ -1742,6 +1744,19 @@ dependencies = [
  "memchr",
  "research-artifacts",
  "strategy-core",
+]
+
+[[package]]
+name = "strategy-set"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "core-types",
+ "strategy-core",
+ "strategy-cross-arb",
+ "strategy-ev",
+ "strategy-latency-arb",
+ "strategy-rule-tree",
 ]
 
 [[package]]

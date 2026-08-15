@@ -1,0 +1,21 @@
+[package]
+name         = "strategy-set"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "StrategySet: static bitmask fan-out over the in-tree strategies with AI Enable/Disable/Halt semantics (Phase 8f §7)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-time            = { workspace = true }
+core-types           = { workspace = true }
+strategy-core        = { workspace = true }
+strategy-latency-arb = { workspace = true }
+strategy-ev          = { workspace = true }
+strategy-cross-arb   = { workspace = true }
+strategy-rule-tree   = { workspace = true }
