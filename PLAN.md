@@ -178,7 +178,7 @@ These gaps are expected; the point of v1 is to prove strategy logic, not latency
                          | unix domain socket + files
                          v
 +------------------------------------------------------------------+
-| claude_worker (Python 3.12, cold path)                           |
+| claude_worker (Python 3.14, cold path)                           |
 |   - rule parser (Sonnet 4.6)                                     |
 |   - topic tagger (Haiku 4.5, bulk)                               |
 |   - news labeler (Sonnet, warm, 500 ms timeout fallthrough)      |
@@ -249,7 +249,7 @@ polymarket/
 │   └── bench/                    criterion benches (`hot_path`) + dhat alloc
 │                                  assertions (23/23 zero-alloc + budgeted)
 ├── fuzz/                         cargo-fuzz targets for parsers (§21)
-├── claude-worker/                Python 3.12 (uv-managed venv)
+├── claude-worker/                Python 3.14 (uv-managed venv)
 │   ├── pyproject.toml
 │   ├── src/
 │   │   ├── anthropic_client.py
@@ -526,7 +526,7 @@ Same as v0.3 core risks, plus local-deployment and free-tier specifics:
 - Realistic monthly API cost at v1 scope (few hundred active markets): expected single-digit dollars.
 
 ### 10.3 Process model
-- `claude-worker` is a Python 3.12 process started by `launchd`.
+- `claude-worker` is a Python 3.14 process started by `launchd`.
 - UDS for on-demand requests from Rust engine; filesystem for artifacts.
 - Hot path never waits on Claude. Warm news-labeler has a strict 500 ms timeout; on timeout the engine proceeds on keyword heuristics alone.
 
@@ -569,7 +569,7 @@ For v1 the Mac **is** production. Same toolchain runs dev and live trading.
 
 ```sh
 # toolchains
-brew install rustup-init git cmake pkg-config openssl@3 libgit2 uv python@3.12
+brew install rustup-init git cmake pkg-config openssl@3 libgit2 uv python@3.14
 rustup-init -y --default-toolchain 1.85.0 --profile default
 rustup component add rust-src clippy rustfmt llvm-tools-preview
 rustup target add aarch64-apple-darwin
@@ -897,7 +897,7 @@ brew "pkg-config"
 brew "openssl@3"
 brew "libgit2"
 brew "uv"
-brew "python@3.12"
+brew "python@3.14"
 brew "zig"
 brew "jq"
 brew "ripgrep"
@@ -906,7 +906,7 @@ brew "pv"
 ```
 
 ### 17.3 Python (`claude-worker`)
-- Python 3.12 (uv-managed).
+- Python 3.14 (uv-managed).
 - `anthropic` — Anthropic SDK.
 - `httpx` — for Gamma REST (cold).
 - `pydantic` 2 — artifact schema validation.

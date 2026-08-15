@@ -42,7 +42,7 @@ use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
 use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
-use core_types::{make_symbol_id, Fill, Signal, SymbolId, Tick, VenueId};
+use core_types::{make_symbol_id, Capture, ChannelEvent, Fill, NsTs, Signal, SymbolId, Tick, VenueId};
 use engine::{Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE};
 use rustls_pki_types::ServerName;
 use strategy_latency_arb::LatencyArb;
@@ -327,7 +327,8 @@ pub fn spawn_polymarket(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture = PmlrCapture::open(run_dir, "pm", epoch_ns, tap_cfg)?;
+    let mut capture =
+        GaugedCapture::new(PmlrCapture::open(run_dir, "pm", epoch_ns, tap_cfg)?, capture_metrics);
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "pm", VenueId::Polymarket.to_u8())?;
     }
@@ -386,7 +387,7 @@ pub fn spawn_polymarket(
                     &mut capture,
                 );
                 tracing::info!(?res, "polymarket: run-loop returned");
-                mirror_capture_metrics(&capture_metrics, &capture);
+                capture.mirror_now();
                 if matches!(res, pwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -400,7 +401,7 @@ pub fn spawn_polymarket(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
-            mirror_capture_metrics(&capture_metrics, &capture);
+            capture.mirror_now();
             status.set_state(IngressState::Down);
         },
     ))
@@ -423,7 +424,8 @@ pub fn spawn_binance(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture = PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?;
+    let mut capture =
+        GaugedCapture::new(PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?, capture_metrics);
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
     }
@@ -481,7 +483,7 @@ pub fn spawn_binance(
                     &mut capture,
                 );
                 tracing::info!(?res, "binance: run-loop returned");
-                mirror_capture_metrics(&capture_metrics, &capture);
+                capture.mirror_now();
                 if matches!(res, bwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -493,7 +495,7 @@ pub fn spawn_binance(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
-            mirror_capture_metrics(&capture_metrics, &capture);
+            capture.mirror_now();
             status.set_state(IngressState::Down);
         },
     ))
@@ -589,7 +591,8 @@ pub fn spawn_okx(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture = PmlrCapture::open(run_dir, "okx", epoch_ns, tap_cfg)?;
+    let mut capture =
+        GaugedCapture::new(PmlrCapture::open(run_dir, "okx", epoch_ns, tap_cfg)?, capture_metrics);
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "okx", VenueId::Okx.to_u8())?;
     }
@@ -647,7 +650,7 @@ pub fn spawn_okx(
                     &mut capture,
                 );
                 tracing::info!(?res, "okx: run-loop returned");
-                mirror_capture_metrics(&capture_metrics, &capture);
+                capture.mirror_now();
                 if matches!(res, owl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -659,7 +662,7 @@ pub fn spawn_okx(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
-            mirror_capture_metrics(&capture_metrics, &capture);
+            capture.mirror_now();
             status.set_state(IngressState::Down);
         },
     ))
@@ -735,7 +738,10 @@ pub fn spawn_deribit(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture = PmlrCapture::open(run_dir, "deribit", epoch_ns, tap_cfg)?;
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "deribit", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "deribit", VenueId::Deribit.to_u8())?;
     }
@@ -793,7 +799,7 @@ pub fn spawn_deribit(
                     &mut capture,
                 );
                 tracing::info!(?res, "deribit: run-loop returned");
-                mirror_capture_metrics(&capture_metrics, &capture);
+                capture.mirror_now();
                 if matches!(res, dwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -805,7 +811,7 @@ pub fn spawn_deribit(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
-            mirror_capture_metrics(&capture_metrics, &capture);
+            capture.mirror_now();
             status.set_state(IngressState::Down);
         },
     ))
@@ -873,7 +879,8 @@ pub fn spawn_hyperliquid(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture = PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?;
+    let mut capture =
+        GaugedCapture::new(PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?, capture_metrics);
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "hl", VenueId::Hyperliquid.to_u8())?;
     }
@@ -936,7 +943,7 @@ pub fn spawn_hyperliquid(
                     &mut capture,
                 );
                 tracing::info!(?res, "hyperliquid: run-loop returned");
-                mirror_capture_metrics(&capture_metrics, &capture);
+                capture.mirror_now();
                 if matches!(res, hwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -956,7 +963,7 @@ pub fn spawn_hyperliquid(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
-            mirror_capture_metrics(&capture_metrics, &capture);
+            capture.mirror_now();
             status.set_state(IngressState::Down);
         },
     ))
@@ -983,7 +990,8 @@ pub fn spawn_rpc(
     // claude-worker command feed). The tap header's venue byte stays
     // the `0xFF` "unknown" sentinel; `rpc-raw.tap`'s filename already
     // self-identifies for the offline tooling.
-    let mut capture = PmlrCapture::open(run_dir, "rpc", epoch_ns, tap_cfg)?;
+    let mut capture =
+        GaugedCapture::new(PmlrCapture::open(run_dir, "rpc", epoch_ns, tap_cfg)?, capture_metrics);
     Ok(spawn_or_die(
         thread::Builder::new().name("ingress-rpc".into()),
         "ingress-rpc",
@@ -1038,7 +1046,7 @@ pub fn spawn_rpc(
                     &mut capture,
                 );
                 tracing::info!(?res, "rpc: run-loop returned");
-                mirror_capture_metrics(&capture_metrics, &capture);
+                capture.mirror_now();
                 if matches!(res, rwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
@@ -1050,7 +1058,7 @@ pub fn spawn_rpc(
                 status.set_state(IngressState::Backoff);
                 sleep_backoff(&mut backoff);
             }
-            mirror_capture_metrics(&capture_metrics, &capture);
+            capture.mirror_now();
             status.set_state(IngressState::Down);
         },
     ))
@@ -2018,11 +2026,92 @@ pub struct CaptureGaugeIds {
 /// writes entirely.
 pub type CaptureMetrics = Option<(Arc<MetricsRegistry>, CaptureGaugeIds)>;
 
+/// §6.5 capture wrapped with its own gauge mirror on the 1 s flush
+/// cadence (G1 remediation item 3, 2026-08-15). The first 6 h soak
+/// showed `capture_records` gauges frozen at their last run-loop-exit
+/// value (venues that never cycled reported 0 against growing pmlr
+/// files) because mirroring only happened in the spawn wrappers after
+/// `run(...)` returned. The run loops already call
+/// `Capture::maybe_flush` once per poll; this wrapper piggybacks the
+/// mirror onto that hook, rate-limited to the same 1 s the inner
+/// flush uses, so gauges advance within ~2 s in steady state.
+///
+/// Zero-alloc on the hot path: the added work is one branch per poll
+/// and, at most once a second, eight relaxed atomic stores
+/// ([`MetricsRegistry`] gauges are preallocated slots). Monomorphized
+/// like every other `Capture` impl — no `dyn`.
+pub struct GaugedCapture {
+    inner: PmlrCapture,
+    metrics: CaptureMetrics,
+    last_pub_ns: u64,
+}
+
+impl GaugedCapture {
+    /// Wrap an opened capture with its (optional) gauge handles.
+    pub fn new(inner: PmlrCapture, metrics: CaptureMetrics) -> Self {
+        Self { inner, metrics, last_pub_ns: 0 }
+    }
+
+    /// Mirror immediately — the spawn wrappers call this after every
+    /// `run(...)` return and once more before the thread exits, so
+    /// final values land even if the last second went unmirrored.
+    pub fn mirror_now(&self) {
+        mirror_capture_metrics(&self.metrics, &self.inner);
+    }
+
+    /// Boot-time delegate of [`PmlrCapture::set_tap_venue_byte`] (the
+    /// spawn wrappers stamp the tap header right after open).
+    pub fn set_tap_venue_byte(
+        &mut self,
+        dir: &Path,
+        venue_label: &str,
+        venue: u8,
+    ) -> io::Result<()> {
+        self.inner.set_tap_venue_byte(dir, venue_label, venue)
+    }
+}
+
+impl Capture for GaugedCapture {
+    #[inline(always)]
+    fn tick(&mut self, t: &Tick) {
+        self.inner.tick(t);
+    }
+
+    #[inline(always)]
+    fn event(&mut self, e: &ChannelEvent) {
+        self.inner.event(e);
+    }
+
+    #[inline(always)]
+    fn signal(&mut self, s: &Signal) {
+        self.inner.signal(s);
+    }
+
+    #[inline(always)]
+    fn raw_frame(&mut self, ts_ns: NsTs, payload: &[u8]) {
+        self.inner.raw_frame(ts_ns, payload);
+    }
+
+    #[inline(always)]
+    fn parse_reject(&mut self, ts_ns: NsTs, payload: &[u8]) {
+        self.inner.parse_reject(ts_ns, payload);
+    }
+
+    #[inline(always)]
+    fn maybe_flush(&mut self, now_ns: NsTs) {
+        self.inner.maybe_flush(now_ns);
+        if now_ns.wrapping_sub(self.last_pub_ns) >= 1_000_000_000 {
+            self.last_pub_ns = now_ns;
+            mirror_capture_metrics(&self.metrics, &self.inner);
+        }
+    }
+}
+
 /// Mirror one ingress thread's §6.5 capture health into its two
-/// registry gauges. Called from inside the spawn wrapper thread
-/// itself, right after every `run(...)` return and once more before
-/// the thread exits — see [`CaptureMetrics`] docs for why this can't
-/// be done centrally.
+/// registry gauges. Called from [`GaugedCapture`]: on the 1 s
+/// `maybe_flush` cadence in steady state plus immediately after every
+/// `run(...)` return / before thread exit (`mirror_now`) — see
+/// [`CaptureMetrics`] docs for why this can't be done centrally.
 fn mirror_capture_metrics(metrics: &CaptureMetrics, capture: &PmlrCapture) {
     if let Some((reg, ids)) = metrics.as_ref() {
         reg.gauge(ids.io_errors).set(capture.io_errors() as i64);
@@ -3064,6 +3153,81 @@ pub mod boot_discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_capture_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gauged_capture_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// G1 remediation item 3: the records gauge must advance on the
+    /// 1 s `maybe_flush` cadence WITHOUT a run-loop exit — the first
+    /// 6 h soak showed it frozen at run-loop-exit values.
+    #[test]
+    fn gauged_capture_publishes_on_flush_cadence() {
+        let dir = temp_capture_dir("cadence");
+        let mut reg = MetricsRegistry::new();
+        let ids = register_capture_gauges(&mut reg, "deribit").unwrap();
+        let reg = Arc::new(reg);
+        let inner = PmlrCapture::open(&dir, "deribit", 7, TapCfg::off()).unwrap();
+        let mut cap = GaugedCapture::new(inner, Some((reg.clone(), ids)));
+
+        let t0 = 10_000_000_000u64;
+        cap.tick(&Tick::new(
+            t0,
+            VenueId::Deribit,
+            make_symbol_id(VenueId::Deribit, 1),
+            1,
+            core_types::Price::from_raw(1_000_000),
+            core_types::Qty::from_raw(1_000_000),
+            core_types::Price::from_raw(1_001_000),
+            core_types::Qty::from_raw(1_000_000),
+        ));
+        // Inside the first second: mirrored once at the first poll
+        // (last_pub_ns starts at 0 → t0 - 0 ≥ 1 s), then quiet.
+        cap.maybe_flush(t0);
+        assert_eq!(reg.gauge(ids.records).get(), 1, "first poll mirrors");
+        cap.tick(&Tick::new(
+            t0 + 1,
+            VenueId::Deribit,
+            make_symbol_id(VenueId::Deribit, 1),
+            2,
+            core_types::Price::from_raw(1_000_000),
+            core_types::Qty::from_raw(1_000_000),
+            core_types::Price::from_raw(1_001_000),
+            core_types::Qty::from_raw(1_000_000),
+        ));
+        cap.maybe_flush(t0 + 500_000_000);
+        assert_eq!(reg.gauge(ids.records).get(), 1, "rate-limited inside 1 s");
+        // Past the interval: the new record shows without any
+        // run-loop exit / mirror_now.
+        cap.maybe_flush(t0 + 1_000_000_000);
+        assert_eq!(reg.gauge(ids.records).get(), 2, "advances on the 1 s cadence");
+        assert_eq!(reg.gauge(ids.io_errors).get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Metrics off (`CaptureMetrics = None`): every hook must stay a
+    /// pure delegate — no panics, capture still records.
+    #[test]
+    fn gauged_capture_without_metrics_is_a_pure_delegate() {
+        let dir = temp_capture_dir("nometrics");
+        let inner = PmlrCapture::open(&dir, "deribit", 7, TapCfg::off()).unwrap();
+        let mut cap = GaugedCapture::new(inner, None);
+        cap.tick(&Tick::new(
+            5,
+            VenueId::Deribit,
+            make_symbol_id(VenueId::Deribit, 1),
+            1,
+            core_types::Price::from_raw(1_000_000),
+            core_types::Qty::from_raw(1_000_000),
+            core_types::Price::from_raw(1_001_000),
+            core_types::Qty::from_raw(1_000_000),
+        ));
+        cap.maybe_flush(2_000_000_000);
+        cap.mirror_now();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `Rings::new()` must succeed without panicking. The rings are
     /// large (~MB scale) so this also exercises the

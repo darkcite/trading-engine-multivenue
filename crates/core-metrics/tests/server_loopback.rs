@@ -20,7 +20,7 @@ fn boot_server(registry: Arc<MetricsRegistry>) -> (u16, Arc<AtomicBool>, thread:
 
     let stop_clone = stop.clone();
     let handle = thread::spawn(move || {
-        let _ = serve_metrics(addr, registry, &stop_clone);
+        let _ = serve_metrics(addr, registry, &stop_clone, |_ev| {});
     });
 
     // Wait until the server is ready to accept (poll the port).
@@ -104,4 +104,82 @@ fn unknown_path_returns_404() {
     stop.store(true, Ordering::Release);
     handle.join().unwrap();
     assert_eq!(status, 404);
+}
+
+/// G1 remediation item 2 regression (macOS EAGAIN, "os error 35"):
+/// sockets accepted from a nonblocking listener inherit nonblocking
+/// mode on BSD/macOS, so a scrape whose request bytes arrive after
+/// `accept()` returned made `read()` fail EAGAIN immediately — the
+/// two single-scrape failures of the first 6 h soak. With the socket
+/// restored to blocking, a slow-arriving request must be served.
+#[test]
+fn slow_request_after_connect_is_served_not_eagain() {
+    let mut reg = MetricsRegistry::new();
+    let ticks = reg.register_counter("engine_slow_total").unwrap();
+    let reg = Arc::new(reg);
+    reg.counter(ticks).inc(7);
+
+    let (port, stop, handle) = boot_server(reg);
+    // Connect first, let the server accept an idle socket, THEN send.
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    sock.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 1024];
+    while let Ok(n) = sock.read(&mut tmp) {
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+
+    let s = String::from_utf8_lossy(&buf);
+    assert!(s.starts_with("HTTP/1.1 200"), "slow request must be served; got: {s}");
+    assert!(s.contains("engine_slow_total 7"), "{s}");
+}
+
+/// Scrape hammer (acceptance for item 2): rapid sequential scrapes
+/// must all succeed and the error sink must stay silent.
+#[test]
+fn scrape_hammer_all_succeed_without_conn_errors() {
+    use std::sync::atomic::AtomicU32;
+
+    let mut reg = MetricsRegistry::new();
+    let ticks = reg.register_counter("engine_hammer_total").unwrap();
+    let reg = Arc::new(reg);
+    reg.counter(ticks).inc(1);
+
+    // Local boot with a counting sink (boot_server discards events).
+    let errors = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+    let (stop_clone, errs_clone, reg_clone) = (stop.clone(), errors.clone(), reg.clone());
+    let handle = thread::spawn(move || {
+        let _ = serve_metrics(addr, reg_clone, &stop_clone, |_ev| {
+            errs_clone.fetch_add(1, Ordering::Relaxed);
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
+            break;
+        }
+        assert!(Instant::now() <= deadline, "metrics server did not come up");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    for i in 0..50 {
+        let (status, body) = http_get(addr.port(), "/metrics");
+        assert_eq!(status, 200, "scrape {i} failed; body={body}");
+        assert!(body.contains("engine_hammer_total 1"), "scrape {i}: {body}");
+    }
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+    assert_eq!(errors.load(Ordering::Relaxed), 0, "no connection errors under hammer");
 }

@@ -38,7 +38,21 @@
 //! [`crate::DeribitBookChain`] (gap ⇒ unsubscribe+subscribe resync of
 //! that channel + `gaps_total`); `trades.*` sequential `trade_seq`
 //! through [`crate::DeribitTradeSeq`] (gap/regression ⇒ `gaps_total`,
-//! no resubscribe — the venue does not replay trades).
+//! no resubscribe — the venue does not replay trades). EVERY row of a
+//! `trades` push is seq-checked (2026-08-15 — the earlier 16-row
+//! sample produced one phantom gap per burst-coalesced frame): the
+//! phase-1 walk checks row-to-row inside the frame, phase 2 checks
+//! the frame edge against the monitor's persistent tail.
+//!
+//! ## §6.6 pairing (G1 remediation)
+//!
+//! Every `gaps_total` increment emits exactly one paired capture
+//! event — [`ChannelId::TradeGap`] / [`ChannelId::BookGap`] carrying
+//! expected vs observed seq — plus a rate-limited
+//! (1 s) `WARN ingress-deribit: seq gap ...` stderr line. The
+//! `audit-replay` pairing section cross-checks the events against the
+//! re-derived capture stream, making "every increment paired with a
+//! logged venue event" mechanically checkable offline.
 //!
 //! ## Oversize-frame guard
 //!
@@ -113,10 +127,11 @@ const SUBSCRIBE_SCRATCH: usize = 8 * 1024;
 /// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
 const CHANNEL_NAME_SCRATCH: usize = 64;
 
-/// Max `trades` rows whose `trade_seq` is chain-checked per push;
-/// rows beyond this are still counted as messages (a 100 ms window
-/// rarely batches more — 16 is generous).
-pub const MAX_TRADE_ROWS: usize = 16;
+/// Minimum interval between emitted gap log lines (operator-terminal
+/// budget; increments beyond it are counted into `suppressed=` on the
+/// next emitted line — the 1:1 evidence channel is the paired
+/// `TradeGap`/`BookGap` capture events, not the log).
+const GAP_LOG_INTERVAL_NS: u64 = 1_000_000_000;
 
 // ---------------------------------------------------------------
 // Request / subscription kinds for the core-net tables
@@ -258,6 +273,13 @@ pub struct Driver {
     trade_seqs: [DeribitTradeSeq; DERIBIT_MAX_SYMBOLS],
     /// Set once the session-start calls have been queued.
     session_started: bool,
+    /// Wall clock of the last emitted gap log line (rate limit:
+    /// [`GAP_LOG_INTERVAL_NS`]). Deliberately NOT reset per session —
+    /// the limit is an operator-terminal budget, not session state.
+    gap_log_last_ns: u64,
+    /// Gap increments swallowed by the rate limit since the last
+    /// emitted line (carried into that next line as `suppressed=`).
+    gap_log_suppressed: u32,
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -286,6 +308,8 @@ impl Driver {
             book_chains: [crate::DeribitBookChain::new(); DERIBIT_MAX_SYMBOLS],
             trade_seqs: [DeribitTradeSeq::new(); DERIBIT_MAX_SYMBOLS],
             session_started: false,
+            gap_log_last_ns: 0,
+            gap_log_suppressed: 0,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -649,12 +673,36 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
 // ---------------------------------------------------------------
 
 /// Per-push `trades` scan result (phase-1 output; `Copy`).
+///
+/// 2026-08-15 (G1 remediation): replaced the fixed `seqs: [i64; 16]`
+/// sample — EVERY row is now seq-checked. Within-frame discontinuities
+/// are classified during the phase-1 walk (their paired `TradeGap`
+/// events are emitted right there, where expected/observed are at
+/// hand); the frame edge is checked in phase 2 via
+/// [`DeribitTradeSeq::apply_frame`] against the persistent monitor.
 #[derive(Copy, Clone)]
 struct TradeScan {
     rows_parsed: u32,
     rows_rejected: u32,
-    seqs: [i64; MAX_TRADE_ROWS],
-    n_seq: u8,
+    /// Rows that carried a parsed `trade_seq` (== `rows_parsed`; kept
+    /// separate so the phase-2 arm reads as intent, not inference).
+    n_seq: u32,
+    /// First parsed row's seq (valid when `n_seq > 0`).
+    first_seq: i64,
+    /// Last parsed row's seq — the frame's true tail, adopted by the
+    /// monitor regardless of interior breaks.
+    last_seq: i64,
+    /// First parsed row's venue timestamp (ms) — `venue_time_ms` of a
+    /// frame-edge `TradeGap` event.
+    first_ts_ms: u64,
+    /// Within-frame breaks (jump or regression between adjacent rows).
+    /// Their `TradeGap` events were already emitted by the walk; phase
+    /// 2 adds exactly this many `gaps_total` increments.
+    intra_breaks: u32,
+    /// expected/observed of the LAST within-frame break (log-line
+    /// substance; every break's full detail is in its capture event).
+    intra_last_expected: i64,
+    intra_last_observed: i64,
 }
 
 /// Phase-1 dispatch outcome — everything pre-parsed while the rx
@@ -678,10 +726,12 @@ enum Dispatch {
     Quote { tick: Tick },
     /// `ticker` push validated (slow lane; captured as a §6.5 event).
     Ticker,
-    /// `trades` push scanned.
-    Trades { sym_idx: u8, scan: TradeScan },
-    /// `book` push header.
-    Book { sym_idx: u8, action: u8, prev: i64, seq: i64 },
+    /// `trades` push scanned (`sym` rides along for phase-2 gap
+    /// events — resolving it again would re-borrow `drv.symbols`).
+    Trades { sym: u32, sym_idx: u8, scan: TradeScan },
+    /// `book` push header (`ts_ms` rides along for the phase-2
+    /// `BookGap` event's `venue_time_ms`).
+    Book { sym: u32, sym_idx: u8, ts_ms: u64, action: u8, prev: i64, seq: i64 },
 }
 
 fn drain_ws_frames<C: Capture>(
@@ -777,8 +827,13 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
     let mut scan = TradeScan {
         rows_parsed: 0,
         rows_rejected: 0,
-        seqs: [0; MAX_TRADE_ROWS],
         n_seq: 0,
+        first_seq: 0,
+        last_seq: 0,
+        first_ts_ms: 0,
+        intra_breaks: 0,
+        intra_last_expected: 0,
+        intra_last_observed: 0,
     };
     // Rows are the OBJECTS of the `"data":[...]` array, sliced by JSON
     // object extent. The 8c implementation sliced at `"trade_seq":`
@@ -827,10 +882,30 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
         match parse_trade(&payload[row_start..row_end], sym) {
             Some(t) => {
                 scan.rows_parsed += 1;
-                if (scan.n_seq as usize) < MAX_TRADE_ROWS {
-                    scan.seqs[scan.n_seq as usize] = t.trade_seq;
-                    scan.n_seq += 1;
+                if scan.n_seq == 0 {
+                    scan.first_seq = t.trade_seq;
+                    scan.first_ts_ms = t.ts_ns / 1_000_000;
+                } else if t.trade_seq != scan.last_seq.wrapping_add(1) {
+                    // Within-frame discontinuity. §6.6 pairing: the
+                    // increment this row will cause in phase 2 gets
+                    // its ChannelEvent HERE, where expected/observed
+                    // are both at hand (v0 = expected, v1 = observed).
+                    scan.intra_breaks += 1;
+                    scan.intra_last_expected = scan.last_seq.wrapping_add(1);
+                    scan.intra_last_observed = t.trade_seq;
+                    capture.event(&ChannelEvent::new(
+                        now_ns(),
+                        VenueId::Deribit,
+                        ChannelId::TradeGap,
+                        sym,
+                        t.trade_seq as u64,
+                        t.ts_ns / 1_000_000,
+                        scan.last_seq.wrapping_add(1),
+                        t.trade_seq,
+                    ));
                 }
+                scan.last_seq = t.trade_seq;
+                scan.n_seq += 1;
                 // §6.5 capture: v0 = px ×1e6, v1 = amount ×1e6 (USD
                 // notional), negated when `direction` is sell.
                 let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
@@ -938,6 +1013,7 @@ fn handle_data_frame<C: Capture>(
                             None => Dispatch::Nothing,
                         },
                         DeribitChannel::Trades => Dispatch::Trades {
+                            sym,
                             sym_idx: sym_idx as u8,
                             scan: scan_trades(payload, sym, capture),
                         },
@@ -965,7 +1041,9 @@ fn handle_data_frame<C: Capture>(
                                         + (b.excess_asks as i64),
                                 ));
                                 Dispatch::Book {
+                                    sym,
                                     sym_idx: sym_idx as u8,
+                                    ts_ms: b.ts_ns / 1_000_000,
                                     action: b.action,
                                     prev: b.prev_change_id,
                                     seq: b.change_id,
@@ -1052,30 +1130,80 @@ fn handle_data_frame<C: Capture>(
             }
         }
         Dispatch::Ticker => status.add_msgs(1),
-        Dispatch::Trades { sym_idx, scan } => {
+        Dispatch::Trades { sym, sym_idx, scan } => {
             status.add_msgs(scan.rows_parsed as u64);
             let mut r = 0;
             while r < scan.rows_rejected {
                 status.inc_parse_errors();
                 r += 1;
             }
-            let mut i = 0;
-            while i < scan.n_seq as usize {
-                match drv.trade_seqs[sym_idx as usize].apply(scan.seqs[i]) {
+            // Within-frame breaks: their paired TradeGap events were
+            // emitted by the phase-1 walk; count them here where the
+            // counter lives (1:1 with the events, §6.6 letter).
+            let mut k = 0;
+            while k < scan.intra_breaks {
+                status.inc_gaps();
+                k += 1;
+            }
+            if scan.intra_breaks > 0 {
+                log_gap_rate_limited(
+                    drv,
+                    b"trades",
+                    sym,
+                    scan.intra_last_expected,
+                    scan.intra_last_observed,
+                    scan.intra_breaks,
+                );
+            }
+            // Frame edge vs the persistent monitor. Checks the first
+            // row against the previous frame's TRUE tail — every row
+            // of every frame is seq-checked since 2026-08-15 (the
+            // 16-row sample cap produced one phantom gap per
+            // burst-coalesced frame; 67 across the first 6 h soak).
+            if scan.n_seq > 0 {
+                let expected = drv.trade_seqs[sym_idx as usize].next_expected();
+                match drv.trade_seqs[sym_idx as usize].apply_frame(scan.first_seq, scan.last_seq) {
                     TradeSeqOutcome::Ok => {}
                     // Missed or replayed trades — counted; no
                     // resubscribe (Deribit does not replay trades).
-                    TradeSeqOutcome::Gap | TradeSeqOutcome::Regression => status.inc_gaps(),
+                    TradeSeqOutcome::Gap | TradeSeqOutcome::Regression => {
+                        status.inc_gaps();
+                        capture.event(&ChannelEvent::new(
+                            now_ns(),
+                            VenueId::Deribit,
+                            ChannelId::TradeGap,
+                            sym,
+                            scan.first_seq as u64,
+                            scan.first_ts_ms,
+                            expected,
+                            scan.first_seq,
+                        ));
+                        log_gap_rate_limited(drv, b"trades", sym, expected, scan.first_seq, 1);
+                    }
                 }
-                i += 1;
             }
         }
-        Dispatch::Book { sym_idx, action, prev, seq } => {
+        Dispatch::Book { sym, sym_idx, ts_ms, action, prev, seq } => {
             status.add_msgs(1);
+            let expected_prev = drv.book_chains[sym_idx as usize].last_change_id();
             match drv.book_chains[sym_idx as usize].apply(action, prev, seq) {
                 ChainOutcome::Init | ChainOutcome::Chained => {}
                 ChainOutcome::Gap => {
                     status.inc_gaps();
+                    // §6.6 pairing: v0 = expected prev (i64::MIN =
+                    // the monitor was still awaiting a snapshot),
+                    // v1 = observed prev.
+                    capture.event(&ChannelEvent::new(
+                        now_ns(),
+                        VenueId::Deribit,
+                        ChannelId::BookGap,
+                        sym,
+                        seq as u64,
+                        ts_ms,
+                        expected_prev,
+                        prev,
+                    ));
+                    log_gap_rate_limited(drv, b"book", sym, expected_prev, prev, 1);
                     status.inc_resubscribes();
                     queue_book_resync(drv, sym_idx as usize)?;
                 }
@@ -1083,6 +1211,109 @@ fn handle_data_frame<C: Capture>(
         }
     }
     Ok(())
+}
+
+/// Rate-limited (1 line / [`GAP_LOG_INTERVAL_NS`]) gap log line —
+/// operator visibility for every `gaps_total` increment class; the
+/// 1:1 evidence record is the paired capture event, not this line.
+///
+/// Zero-alloc: rendered into stack scratch with the crate's fixed
+/// formatters and written to stderr in one `write_all` (single
+/// syscall; interleaves with the cli's tracing lines at line
+/// granularity). Increments inside the rate-limit window are counted
+/// and surface as `suppressed=` on the next emitted line.
+/// Timestamp is raw unix nanos (`ts_ns=`) — the offline pairing
+/// section and the capture events carry the same clock.
+fn log_gap_rate_limited(
+    drv: &mut Driver,
+    channel: &[u8],
+    sym: u32,
+    expected: i64,
+    observed: i64,
+    increments: u32,
+) {
+    let now = now_ns();
+    if now.wrapping_sub(drv.gap_log_last_ns) < GAP_LOG_INTERVAL_NS {
+        drv.gap_log_suppressed = drv.gap_log_suppressed.saturating_add(increments);
+        return;
+    }
+    let suppressed = drv.gap_log_suppressed;
+    drv.gap_log_last_ns = now;
+    drv.gap_log_suppressed = 0;
+
+    // `WARN ingress-deribit: seq gap channel=<c> sym=<hex> expected=<i64>
+    //  observed=<i64> increments=<n> suppressed=<n> ts_ns=<n>\n`
+    let mut buf = [0u8; 224];
+    let mut digits = [0u8; 20];
+    let mut n = 0usize;
+    let mut ok = true;
+    let put = |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| {
+        match crate::push_bytes(&mut buf[..], *n, src) {
+            Some(e) => *n = e,
+            None => *ok = false,
+        }
+    };
+    put(&mut buf, &mut n, &mut ok, b"WARN ingress-deribit: seq gap channel=");
+    put(&mut buf, &mut n, &mut ok, channel);
+    put(&mut buf, &mut n, &mut ok, b" sym=");
+    put(&mut buf, &mut n, &mut ok, fmt_hex_u32(sym, &mut digits));
+    put(&mut buf, &mut n, &mut ok, b" expected=");
+    let mut d2 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, fmt_i64(expected, &mut d2));
+    put(&mut buf, &mut n, &mut ok, b" observed=");
+    let mut d3 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, fmt_i64(observed, &mut d3));
+    put(&mut buf, &mut n, &mut ok, b" increments=");
+    let mut d4 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, crate::fmt_u64(increments as u64, &mut d4));
+    put(&mut buf, &mut n, &mut ok, b" suppressed=");
+    let mut d5 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, crate::fmt_u64(suppressed as u64, &mut d5));
+    put(&mut buf, &mut n, &mut ok, b" ts_ns=");
+    let mut d6 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, crate::fmt_u64(now, &mut d6));
+    put(&mut buf, &mut n, &mut ok, b"\n");
+    debug_assert!(ok, "gap log scratch sized for the worst case");
+    if ok {
+        // Best-effort: a torn/failed stderr write must never affect
+        // the session (the counter + capture event already landed).
+        let mut err = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut err, &buf[..n]);
+    }
+}
+
+/// Render `v` as `0x`-prefixed lowercase hex (SymbolId display form —
+/// matches the audit tool's `sym=0x...` rendering).
+#[inline]
+fn fmt_hex_u32(v: u32, scratch: &mut [u8; 20]) -> &[u8] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    scratch[0] = b'0';
+    scratch[1] = b'x';
+    let mut i = 2;
+    let mut shift = 32;
+    while shift > 0 {
+        shift -= 4;
+        scratch[i] = HEX[((v >> shift) & 0xF) as usize];
+        i += 1;
+    }
+    &scratch[..10]
+}
+
+/// Render `v` as decimal ASCII, `-`-prefixed when negative
+/// (`i64::MIN` renders via u64 magnitude — no overflow branch).
+#[inline]
+fn fmt_i64(v: i64, scratch: &mut [u8; 20]) -> &[u8] {
+    if v >= 0 {
+        return crate::fmt_u64(v as u64, scratch);
+    }
+    // Magnitude fits u64 for every negative i64 incl. MIN.
+    let mag = (v as i128).unsigned_abs() as u64;
+    let digits = crate::fmt_u64(mag, scratch);
+    let len = digits.len();
+    let start = scratch.len() - len;
+    debug_assert!(start >= 1, "20-digit scratch always leaves sign room");
+    scratch[start - 1] = b'-';
+    &scratch[start - 1..]
 }
 
 /// After a verified subscribe result: mark every configured channel
@@ -1576,11 +1807,12 @@ mod tests {
         let mut d = steady_driver(true);
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
+        let mut cap = GapEventRecorder::default();
 
         // Snapshot roots the chain…
         let snap = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1000,"instrument_name":"BTC-PERPETUAL","change_id":10,"bids":[["new",1.0,1.0]],"asks":[],"type":"snapshot"}}}"#;
         inject_text(&mut t, snap);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(status.gaps_total(), 0);
         let mut scratch = vec![0u8; 16384];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1589,10 +1821,19 @@ mod tests {
         // …then a chain break (prev 99 ≠ last 10).
         let broken = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":2000,"instrument_name":"BTC-PERPETUAL","change_id":100,"prev_change_id":99,"bids":[],"asks":[["delete",1.0,0.0]],"type":"change"}}}"#;
         inject_text(&mut t, broken);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
 
         assert_eq!(status.gaps_total(), 1);
         assert_eq!(status.resubscribes_total(), 1);
+        // §6.6 pairing: the increment must have exactly one BookGap
+        // event carrying expected (chain last = 10) vs observed (99).
+        assert_eq!(cap.gaps.len(), 1, "1:1 event pairing");
+        let g = cap.gaps[0];
+        assert_eq!(g.0, ChannelId::BookGap as u8);
+        assert_eq!(g.2, 100, "venue_seq = the message change_id");
+        assert_eq!(g.3, 2000, "venue_time_ms from the broken frame");
+        assert_eq!(g.4, 10, "v0 = expected prev_change_id");
+        assert_eq!(g.5, 99, "v1 = observed prev_change_id");
         assert_eq!(d.pending_count(), pending_before + 2, "unsub + sub in flight");
         let n = t.drain_outgoing(&mut scratch);
         let body = unmask_client_frames(&scratch[..n]);
@@ -1606,8 +1847,164 @@ mod tests {
         // The fresh snapshot then re-roots without further gaps.
         let fresh = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":3000,"instrument_name":"BTC-PERPETUAL","change_id":200,"bids":[],"asks":[],"type":"snapshot"}}}"#;
         inject_text(&mut t, fresh);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(status.gaps_total(), 1, "snapshot is not a gap");
+        assert_eq!(cap.gaps.len(), 1, "no event without an increment");
+    }
+
+    /// Records every `TradeGap`/`BookGap` capture event:
+    /// `(channel, sym, venue_seq, venue_time_ms, v0 expected, v1
+    /// observed)` — pins the §6.6 1:1 increment↔event pairing.
+    #[derive(Default)]
+    struct GapEventRecorder {
+        gaps: Vec<(u8, u32, u64, u64, i64, i64)>,
+        trade_rows: u32,
+    }
+
+    impl core_types::Capture for GapEventRecorder {
+        fn event(&mut self, e: &ChannelEvent) {
+            if e.channel == ChannelId::TradeGap as u8 || e.channel == ChannelId::BookGap as u8 {
+                self.gaps.push((e.channel, e.sym, e.venue_seq, e.venue_time_ms, e.v0, e.v1));
+            } else if e.channel == ChannelId::Trade as u8 {
+                self.trade_rows += 1;
+            }
+        }
+    }
+
+    /// THE G1-remediation regression (first 6 h soak, 2026-08-15):
+    /// burst-coalesced `trades` frames bigger than the old 16-row
+    /// seq-check cap produced one phantom gap each — 67 across the
+    /// soak (41 BTC + 26 ETH), every one refuted by capture. Fixture
+    /// sequences are the REAL ones from
+    /// `run-1786742370972151000/deribit-events.pmlr`: the largest BTC
+    /// burst frame (59 rows, seqs 296247098..=296247156, venue ts
+    /// 1786752386548) followed by the real next frame head
+    /// (seq 296247157). Raw frame bytes were not tapped (tap ran
+    /// rejects-only), so rows are re-rendered in the live starbase
+    /// field order around those sequences.
+    #[test]
+    fn burst_frame_all_rows_seq_checked_no_phantom_gap() {
+        const FIRST: i64 = 296_247_098;
+        const LAST: i64 = 296_247_156; // 59 rows
+        const NEXT: i64 = 296_247_157;
+
+        // Shadow of the PRE-FIX semantics (16-row sample + per-row
+        // apply): documents that this fixture is discriminating — it
+        // fails the old algorithm (the "red" of red→green) without
+        // resurrecting it in the shipped code.
+        {
+            let mut m = DeribitTradeSeq::new();
+            let mut s = FIRST;
+            while s < FIRST + 16 {
+                assert_eq!(m.apply(s), TradeSeqOutcome::Ok);
+                s += 1;
+            }
+            assert_eq!(
+                m.apply(NEXT),
+                TradeSeqOutcome::Gap,
+                "old cap-16 semantics: phantom gap on the next frame"
+            );
+        }
+
+        let mut t = TestTransport::with_capacity(65536);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = GapEventRecorder::default();
+
+        // 59-row burst frame in live starbase field order.
+        let mut burst = String::from(
+            r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":["#,
+        );
+        let mut seq = FIRST;
+        while seq <= LAST {
+            if seq != FIRST {
+                burst.push(',');
+            }
+            burst.push_str(&format!(
+                r#"{{"timestamp":1786752386548,"price":62959.5,"direction":"sell","instrument_name":"BTC-PERPETUAL","index_price":62955.01,"trade_id":"{}","trade_seq":{seq},"amount":2500.0,"mark_price":62959.0,"tick_direction":1,"starbase_match_id":214172482240081920,"contracts":250.0,"starbase_timestamp":1786752386548878197}}"#,
+                seq - FIRST + 1
+            ));
+            seq += 1;
+        }
+        burst.push_str("]}}");
+        inject_text(&mut t, burst.as_bytes());
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.msgs_total(), 59, "every row counted");
+        assert_eq!(status.gaps_total(), 0, "contiguous burst: no gaps");
+
+        // The real next frame chains off the burst's TRUE tail.
+        let next = format!(
+            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"trades.BTC-PERPETUAL.100ms","data":[{{"timestamp":1786752410291,"price":62941.5,"direction":"buy","instrument_name":"BTC-PERPETUAL","trade_id":"60","trade_seq":{NEXT},"amount":100.0,"mark_price":62941.0,"tick_direction":0,"starbase_match_id":214172482240081999,"contracts":10.0,"starbase_timestamp":1786752410291707552}}]}}}}"#
+        );
+        inject_text(&mut t, next.as_bytes());
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(status.msgs_total(), 60);
+        assert_eq!(status.gaps_total(), 0, "NO phantom gap on the frame edge");
+        assert_eq!(cap.gaps.len(), 0, "no increment ⇒ no gap event");
+        assert_eq!(cap.trade_rows, 60, "capture still records every row");
+    }
+
+    /// A REAL inter-frame hole must still be caught — and must carry
+    /// exactly one paired `TradeGap` event with expected vs observed.
+    #[test]
+    fn inter_frame_real_gap_pairs_one_trade_gap_event() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = GapEventRecorder::default();
+
+        let f1 = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":50,"trade_id":"1","timestamp":1000,"price":1.0,"direction":"buy","amount":1.0},{"trade_seq":51,"trade_id":"2","timestamp":1001,"price":1.0,"direction":"sell","amount":1.0}]}}"#;
+        inject_text(&mut t, f1);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.gaps_total(), 0);
+
+        // Frame edge jumps 51 → 53: one missed trade.
+        let f2 = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":53,"trade_id":"3","timestamp":2000,"price":1.0,"direction":"buy","amount":1.0}]}}"#;
+        inject_text(&mut t, f2);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(status.gaps_total(), 1, "real hole caught at the frame edge");
+        assert_eq!(cap.gaps.len(), 1, "1:1 event pairing");
+        let g = cap.gaps[0];
+        assert_eq!(g.0, ChannelId::TradeGap as u8);
+        assert_eq!(g.2, 53, "venue_seq = observed");
+        assert_eq!(g.3, 2000, "venue_time_ms from the gapped frame head");
+        assert_eq!(g.4, 52, "v0 = expected");
+        assert_eq!(g.5, 53, "v1 = observed");
+    }
+
+    /// A discontinuity INSIDE one frame: counted once, paired once
+    /// (event emitted by the phase-1 walk), and the monitor adopts the
+    /// frame tail so the next contiguous frame chains cleanly.
+    #[test]
+    fn intra_frame_break_pairs_event_and_monitor_adopts_tail() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = GapEventRecorder::default();
+
+        // 50 then 52 in ONE frame — break between adjacent rows.
+        let f1 = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":50,"trade_id":"1","timestamp":1000,"price":1.0,"direction":"buy","amount":1.0},{"trade_seq":52,"trade_id":"2","timestamp":1001,"price":1.0,"direction":"sell","amount":1.0}]}}"#;
+        inject_text(&mut t, f1);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(status.gaps_total(), 1, "intra-frame break counted once");
+        assert_eq!(cap.gaps.len(), 1, "1:1 event pairing");
+        let g = cap.gaps[0];
+        assert_eq!(g.0, ChannelId::TradeGap as u8);
+        assert_eq!(g.4, 51, "v0 = expected (prev row + 1)");
+        assert_eq!(g.5, 52, "v1 = observed");
+
+        // Tail adopted: 53 chains without a second count.
+        let f2 = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":53,"trade_id":"3","timestamp":2000,"price":1.0,"direction":"buy","amount":1.0}]}}"#;
+        inject_text(&mut t, f2);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.gaps_total(), 1, "52 → 53 chains off the adopted tail");
+        assert_eq!(cap.gaps.len(), 1);
     }
 
     #[test]
@@ -1626,11 +2023,16 @@ mod tests {
         inject_text(&mut t, t2);
         inject_text(&mut t, t3);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        let mut cap = GapEventRecorder::default();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(status.msgs_total(), 3);
         assert_eq!(status.gaps_total(), 2, "one jump + one regression");
         assert_eq!(status.resubscribes_total(), 0, "trades are never resubscribed");
         assert_eq!(status.parse_errors_total(), 0);
+        // §6.6 pairing: both increments carry TradeGap events.
+        assert_eq!(cap.gaps.len(), 2, "1:1 event pairing");
+        assert_eq!((cap.gaps[0].4, cap.gaps[0].5), (51, 52), "jump: expected 51, observed 52");
+        assert_eq!((cap.gaps[1].4, cap.gaps[1].5), (53, 40), "regression: expected 53, observed 40");
     }
 
     #[test]

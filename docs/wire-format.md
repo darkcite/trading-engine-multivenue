@@ -102,7 +102,7 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete time             |
 |      8 |     4 | sym           | `u32` SymbolId | `SYMBOL_ID_NONE` for venue-global channels |
 |     12 |     1 | venue         | `u8` VenueId   |                                         |
-|     13 |     1 | channel       | `u8` ChannelId | 0=Trade 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta 8=PriceChange |
+|     13 |     1 | channel       | `u8` ChannelId | 0=Trade 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) |
 |     14 |     2 | _pad0         | `[u8; 2]`      | explicit, zeroed                        |
 |     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none      |
 |     24 |     8 | venue_time_ms | `u64`          | venue timestamp ms; 0 where absent      |

@@ -3,6 +3,132 @@
 Working notes per the Stage-1 operating agreement: each entry records
 what is done, what is next, and open issues at a clean boundary.
 
+## 2026-08-15 (eighth entry) — G1 first soak (6 h per operator directive): data completeness PROVEN from capture; deribit runtime gap monitor over-counts (67 counted, zero lost); HIP-4 #enc streamed all 6 h
+
+Operator-run observation soak per §12 G1 row (24 h → 6 h, operator
+directive). No code changes; no git ops; tree clean at b931c59; this
+entry left uncommitted.
+
+### Setup
+
+- Launch 2026-08-14T21:19:30Z → SIGINT 2026-08-15T03:19:30Z: exactly
+  6 h 0 m, single pid throughout, clean exit — all six run-loops
+  `res=Stopped` within 36 ms of ONE SIGINT (the once-observed doubled
+  signal was not needed).
+- CLI: `run --paper` · PM Xi-2027 YES token (8e-validated id) · okx
+  BTC-USDT,ETH-USDT,BTC-USDT-SWAP · deribit BTC/ETH-PERPETUAL · hl
+  `BTC,ETH,SOL,#10810` · `--polygon-path /` · `--raw-tap deribit,rpc`.
+- HIP-4 pre-launch probe (outcomeMeta): BTC 1d priceBinary =
+  outcome 1081 (targetPrice 63385, expiry 20260815-0600) → Yes coin
+  `#10810`; boot coverage hl 4/4 of 572 · okx 3/3 of 1951 ·
+  deribit 2/2 of 92 · pm 1/1; zero boot ERRORs.
+- RPC leg: still the keyless stand-in
+  (`polygon-bor-rpc.publicnode.com`) — parse errors EXPECTED + tapped.
+- Binary currency: mtime predates b931c59 (commit followed the build);
+  `cargo build --release -p cli` no-op ("Finished 0.19s") = fingerprint
+  proof the binary matches committed sources.
+
+### Samples (16 over 6 h; raw table in /tmp/soak-6h-notes.md)
+
+T+6h counters: msgs pm 6 021 · bn 710 775 · okx 568 502 · deribit
+356 387 · hl 361 640 · rpc 10 591 (Σ ≈ 2.01 M). reconnects bn 9 ·
+okx 10 · hl 38 · deribit 0 · pm 0 · rpc 0; resubscribes 0 everywhere.
+gaps_total: deribit 67, all other venues 0. ring_drops_total 0
+everywhere all run; capture_io_errors 0; engine `dropped=0` on every
+5 s summary; HL `Stale` lines: 0 (8d.1 budget fix holds); disk steady
+52 Gi free; capture dir 142 MB (inside the predicted 100–200 MB band).
+
+### audit-replay (full output /tmp/soak-6h-audit.txt)
+
+- Coverage matrix: every configured venue×channel stream present,
+  including the outcome coin (hl sym 0x04000004 = #10810): ticks 1 343,
+  book 4 056, trades 1 353.
+- Integrity totals — ALL SIX venues: tick_seq_regressions=0
+  trade_holes=0 trade_ids_missing=0 book_chain_breaks=0. Per-stream
+  regr/holes/missing/chain_breaks = 0 on every seq-bearing stream.
+- Cadence: every emitted verdict IN-BAND — okx ticks ×3, okx mark,
+  hl book ×4 (≈5.3 s period vs 2–6 s band; 4 029/4 056 in-bucket —
+  outcome coin included).
+- Raw taps: deribit tap 64 B header-only — ZERO rejects across 356 k
+  msgs / 6 h (starbase fix regression-clean; §6.6 deribit
+  trade_holes==0 met). rpc tap records=14 395 rejects=14 395; previews
+  are `eth_subscription` newHeads with `"blobGasUsed":null` etc. —
+  exactly the stand-in shape diagnosed in the seventh entry.
+
+### Incidents (observed only; no interventions, engine never restarted by hand)
+
+1. **Network weather, two episodes** (21:43–21:51, 23:32–23:49 UTC)
+   plus scattered singles: clustered multi-venue loop exits (okx+hl
+   within 3 s at 23:41; okx ×3 in 31 s at 23:48–:49) — shared-local-
+   path signature, not venue faults. Supervisor recovered every one;
+   no state ever stuck (>15 min rule never approached). The ~7
+   per-coin hl book inter-arrivals in the 6–10 s bucket line up with
+   reconnect instants — reconnects are paired with visible, benign
+   stream effects.
+2. **deribit gaps_total=67 is a runtime-monitor over-count, not data
+   loss**: zero rejects, zero deribit disconnects/resubscribes, and
+   the offline re-derivation shows holes=0/chain_breaks=0 on both
+   instruments. Increments arrived in bursts inside the weather
+   windows. Suspect: cross-stream trade_seq comparison (ticker-implied
+   vs trade-channel) during stalls, and/or gap increments lack a
+   paired ChannelEvent/log line. Filed as the run's one real defect —
+   in the MONITOR, not the feed. No code touched (operator rule).
+3. **Metrics endpoint**: two single-scrape accept failures
+   ("connection error: Resource temporarily unavailable (os error
+   35)" ~01:23:22, ~01:46) — unhandled EAGAIN in the accept path;
+   recovered on next request; the error line prints without
+   timestamp/target prefix. Robustness nit.
+4. **capture_records gauges publish only after a run-loop exit**:
+   venues that never cycled report 0 despite growing pmlr files; okx
+   froze at its first-cycle value until later cycles. Cosmetic;
+   io_errors=0 + file growth + audit are the real signal.
+5. Runbook nit: live metric names carry `_total`; the monitoring
+   grep from the soak directive silently missed the error-class
+   counters — corrected during the run.
+
+### HIP-4 observations
+
+`#10810` streamed the entire 6 h (numbers above; book IN-BAND).
+outcomeMeta events: 0 — expected: the 06:00 UTC settlement fell 2.7 h
+after window end; operator chose strict 6 h over shifting/extending,
+so the 8d lifecycle observation (settlement + successor id) remains
+open. hl trade `regr≈n/2` on all four coins (e.g. 17 094/34 214) =
+equal-timestamp batch siblings; excluded from integrity totals;
+benign wire trait — audit-tool display note filed.
+
+### §6.6 verdict (6 h basis)
+
+- `ring_drops_total == 0` everywhere: **PASS**.
+- Coverage = 100 % of configured symbols (boot + audit matrix): **PASS**.
+- Cadence verdicts IN-BAND (okx ticks/mark, hl book): **PASS**.
+- deribit trade_holes == 0 + zero tap rejects (starbase regression
+  check): **PASS**.
+- capture_io_errors == 0: **PASS**.
+- rpc tap rejects: expected-nonzero per keyless stand-in: **PASS
+  (as-expected)**.
+- Zero unexplained gaps: **QUALIFIED** — substance PASS (offline
+  re-derivation proves nothing was lost anywhere), letter FAIL (the
+  67 deribit increments have no paired logged venue event to point
+  to). Operator ruling requested: bless on substance, or require the
+  monitor pairing fix and re-run.
+- Overall: **feed completeness demonstrated** — the question "are we
+  getting all the data?" answers YES from capture evidence; one
+  monitor defect + two metrics nits to fix before/alongside the 24 h
+  gate run.
+
+### Open items
+
+1. Deribit gap-monitor false positives: root-cause the counting site;
+   add per-increment ChannelEvent/log pairing so §6.6's letter is
+   mechanically checkable; then re-soak.
+2. ALCHEMY_HOST + key still pending — rpc leg stays expected-reject.
+3. HIP-4 settlement lifecycle unobserved — next soak window must span
+   06:00 UTC (a 24 h run covers it by construction).
+4. Metrics accept-loop EAGAIN handling; capture_records gauge
+   publish cadence; audit display note for hl equal-timestamp trade
+   batches.
+5. The full 24 h §6.6 soak remains required for G1 as written.
+
 ## 2026-08-15 (seventh entry) — 8e COMPLETE: discovery + capture + audit-replay live-verified; Deribit ~1.3% ROOT-CAUSED AND FIXED (zero rejects, zero gaps)
 
 Stage-1's last code phase. Everything below is uncommitted (no git ops

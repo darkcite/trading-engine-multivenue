@@ -746,6 +746,15 @@ impl DeribitBookChain {
         self.last_change_id = AWAITING;
     }
 
+    /// The chain's current tail (`i64::MIN` = awaiting a snapshot).
+    /// Read by the run loop *before* [`Self::apply`] so a Gap verdict
+    /// can pair its `gaps_total` increment with a `ChannelId::BookGap`
+    /// event carrying expected vs observed `prev_change_id`.
+    #[inline]
+    pub const fn last_change_id(&self) -> i64 {
+        self.last_change_id
+    }
+
     /// Advance the chain with one message's
     /// `(action, prev_change_id, change_id)`.
     #[inline]
@@ -800,6 +809,15 @@ impl DeribitTradeSeq {
         Self { last_seq: AWAITING }
     }
 
+    /// The next `trade_seq` this monitor expects (`last + 1`).
+    /// Meaningless before the first observation (sentinel + 1) — the
+    /// caller only reads it when [`Self::apply_frame`] returned a
+    /// non-`Ok` outcome, which the first observation never does.
+    #[inline]
+    pub const fn next_expected(&self) -> i64 {
+        self.last_seq.wrapping_add(1)
+    }
+
     /// Advance with one row's `trade_seq`.
     #[inline]
     pub fn apply(&mut self, seq: i64) -> TradeSeqOutcome {
@@ -812,6 +830,26 @@ impl DeribitTradeSeq {
             return TradeSeqOutcome::Gap;
         }
         TradeSeqOutcome::Regression
+    }
+
+    /// Advance with one whole `trades` push: `first`/`last` are the
+    /// frame's first and last row seqs. Equivalent to row-by-row
+    /// [`Self::apply`] over the frame edge (`first` vs the previous
+    /// frame's true tail) with the interior rows checked by the
+    /// caller's intra-frame walk — the monitor adopts `last` as its
+    /// new tail unconditionally.
+    ///
+    /// This replaced per-row applies capped at 16 rows/frame on
+    /// 2026-08-15: burst-coalesced frames (59 rows observed live)
+    /// left rows 17+ unchecked, so every oversized frame produced one
+    /// phantom Gap on the next frame's first row — the first 6 h
+    /// soak's 67 false positives, exactly (41 BTC + 26 ETH oversized
+    /// frames re-derived from capture).
+    #[inline]
+    pub fn apply_frame(&mut self, first: i64, last: i64) -> TradeSeqOutcome {
+        let out = self.apply(first);
+        self.last_seq = last;
+        out
     }
 }
 
@@ -826,7 +864,7 @@ impl Default for DeribitTradeSeq {
 // ---------------------------------------------------------------
 
 #[inline]
-fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
+pub(crate) fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
     let end = at.checked_add(src.len())?;
     dst.get_mut(at..end)?.copy_from_slice(src);
     Some(end)
@@ -835,7 +873,7 @@ fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
 /// Render `v` as decimal ASCII into `scratch`, returning the digit
 /// slice (right-aligned internally; no allocation).
 #[inline]
-fn fmt_u64(v: u64, scratch: &mut [u8; 20]) -> &[u8] {
+pub(crate) fn fmt_u64(v: u64, scratch: &mut [u8; 20]) -> &[u8] {
     let mut i = scratch.len();
     let mut v = v;
     loop {
@@ -1258,6 +1296,42 @@ mod tests {
         assert_eq!(m.apply(11), TradeSeqOutcome::Ok);
         assert_eq!(m.apply(3), TradeSeqOutcome::Regression);
         assert_eq!(m.apply(4), TradeSeqOutcome::Ok);
+    }
+
+    #[test]
+    fn trade_seq_apply_frame_checks_edge_and_adopts_tail() {
+        let mut m = DeribitTradeSeq::new();
+        // First frame: no prior state — Ok regardless of size.
+        assert_eq!(m.apply_frame(100, 158), TradeSeqOutcome::Ok, "59-row frame");
+        assert_eq!(m.next_expected(), 159);
+        // Contiguous next frame chains off the TRUE tail (the
+        // pre-2026-08-15 16-row sample would have flagged this).
+        assert_eq!(m.apply_frame(159, 159), TradeSeqOutcome::Ok);
+        // Single-row frame ≡ apply.
+        assert_eq!(m.apply_frame(160, 160), TradeSeqOutcome::Ok);
+    }
+
+    #[test]
+    fn trade_seq_apply_frame_flags_edge_gap_and_regression() {
+        let mut m = DeribitTradeSeq::new();
+        assert_eq!(m.apply_frame(10, 12), TradeSeqOutcome::Ok);
+        // Edge jump 12 → 14: a real hole.
+        assert_eq!(m.next_expected(), 13);
+        assert_eq!(m.apply_frame(14, 15), TradeSeqOutcome::Gap);
+        // Edge regression 15 → 9; tail adoption still moves to the
+        // frame's last row so the following frame is judged off it.
+        assert_eq!(m.apply_frame(9, 20), TradeSeqOutcome::Regression);
+        assert_eq!(m.apply_frame(21, 21), TradeSeqOutcome::Ok, "tail = 20 adopted");
+    }
+
+    #[test]
+    fn book_chain_exposes_last_change_id_for_pairing() {
+        let mut c = DeribitBookChain::new();
+        assert_eq!(c.last_change_id(), i64::MIN, "awaiting-snapshot sentinel");
+        assert_eq!(c.apply(BOOK_ACTION_SNAPSHOT, -1, 42), ChainOutcome::Init);
+        assert_eq!(c.last_change_id(), 42);
+        assert_eq!(c.apply(BOOK_ACTION_CHANGE, 42, 43), ChainOutcome::Chained);
+        assert_eq!(c.last_change_id(), 43, "reads as the expected prev for the next change");
     }
 
     // ---- request writers -----------------------------------------

@@ -208,7 +208,7 @@
 <path d="M1090,108V184" class="lb" marker-end="url(#mB)"/>
 <path d="M1292,108V146" class="lp" stroke-dasharray="4 3" marker-end="url(#mP)"/>
 <rect x="1000" y="150" width="390" height="480" rx="12" fill="rgba(139,92,246,0.05)" stroke="#8b5cf6" stroke-opacity="0.55" stroke-width="1.2"/>
-<text x="1012" y="170" font-size="11" font-weight="700" class="t1">claude-worker <tspan font-weight="400" class="t2">— Python 3.12 · serve daemon (8f–8h) · offline process</tspan></text>
+<text x="1012" y="170" font-size="11" font-weight="700" class="t1">claude-worker <tspan font-weight="400" class="t2">— Python 3.14 · serve daemon (8f–8h) · offline process</tspan></text>
 <g font-size="8">
 <rect x="1016" y="188" width="358" height="54" rx="8" class="bx"/>
 <text x="1195" y="206" text-anchor="middle" font-size="10" font-weight="700" class="t1">news_watcher</text>

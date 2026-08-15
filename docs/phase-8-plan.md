@@ -504,7 +504,7 @@ audit tool's observed rates within expected cadence bands.
 Recorded so the redesign has a truthful baseline; PLAN.md §4/§10 describe a
 system that is mostly unbuilt.
 
-**Runtime agents (`claude-worker/`, Python 3.12, ~450 lines):** a single Typer
+**Runtime agents (`claude-worker/`, Python 3.14, ~450 lines):** a single Typer
 CLI (`claude-worker`) with two one-shot, synchronous subcommands. There is no
 daemon, no scheduler, no network input — the operator runs it by hand.
 
@@ -571,7 +571,26 @@ removal is total, in one commit, after 8f cutover:
 
 ### 8.2 claude-worker becomes a daemon
 
-New subcommand `claude-worker serve` (alongside the existing one-shots):
+> **Operator directive 2026-08-15:** the existing `claude-worker/` (one-shot
+> Typer CLI) does NOT fit this design and will NOT be incrementally migrated.
+> Delete it completely and reimplement from scratch per §8.2–§8.3
+> (Python 3.14, daemon-first). Old code is read-only reference (SDK usage,
+> prompt/rule formats); no wholesale porting; tests written fresh against the
+> new design. 8f exit criteria gain: old claude-worker fully deleted.
+
+> **Operator directive 2026-08-15 (dual-mode amendment):** the worker must
+> operate in either of two modes over ONE code path:
+> **(a) full-auto** — `claude-worker serve`, the daemon loop below, LLM calls
+> via the Anthropic SDK (`ANTHROPIC_API_KEY`);
+> **(b) semi-manual** — no daemon: the operator opens a Claude session with
+> the predefined prompt `docs/prompts/ai-session.md`; the session performs
+> the reasoning (triage / labeling / strategist) itself and drives the same
+> pipeline through the operator verbs (§8.2.1), pushing to ingress-ai over
+> the same UDS. Mode is chosen by invocation — no mode flag, no divergent
+> logic; the SDK client is constructed only by `serve`.
+
+Entrypoint `claude-worker serve` (the rewritten worker's only **daemon**
+mode; semi-manual operator verbs in §8.2.1):
 
 - **news_watcher** — polls the RSS/Atom allowlist (httpx, 15–60 s cadence per
   PLAN §8.3), dedupes by `(feed, guid)` in SQLite, triages headlines with
@@ -597,6 +616,41 @@ New subcommand `claude-worker serve` (alongside the existing one-shots):
   (PLAN §10.2) finally gets built — a polling daemon without it burns budget.
 - House rules hold: full `import x` only, SDK mocked at the boundary in tests,
   `httpx` added to `pyproject.toml` (PLAN §17.3 already lists it).
+
+### 8.2.1 Semi-manual mode — operator session drives the verbs
+
+No background process. The CLI exposes the daemon's pipeline stages as
+one-shot **operator verbs**, each a thin wrapper over the same functions the
+`serve` loop calls (one code path, both modes; the daemon subsystems are the
+library, `serve` and the verbs are two frontends):
+
+- `claude-worker fetch` — data_fetcher one-shot: replay logs + rate-budgeted
+  venue REST → per-symbol feature files; prints the paths for the session to
+  read.
+- `claude-worker backtest --ruleset r.json` — drives `cli backtest` (§8.7.3)
+  over the replay logs and writes the machine-readable gate report.
+- `claude-worker push --kind <AiCmdKind> [--sym S --px P --qty Q ...]` —
+  frames a single `AiCmd` (toggles, SetFairValue, SetParam, OrderIntent,
+  HaltRequest) with HMAC onto the UDS; a Heartbeat frame precedes every
+  verb-initiated push.
+- `claude-worker stage-ruleset r.json --report rep.json` /
+  `claude-worker commit-ruleset --hash H` — the §8.6 double-buffer pair.
+  **Gates bind in code in both modes:** `stage-ruleset` refuses any ruleset
+  not hash-linked to a passing backtest report; there is deliberately no
+  override flag (operator directive: same gates, both modes — retune
+  thresholds in worker config instead).
+
+The session's reasoning replaces the SDK: in semi-manual mode
+`ANTHROPIC_API_KEY` is not required and never read — the verbs never
+construct the SDK client. Heartbeats exist only around verb invocations; when
+the session ends, ai-exec's staleness fail-safe (> 15 s, §8.5) plus per-command
+`ttl_ns` expire AI-derived state. Silence fails safe in both modes, by design.
+
+Deliverable with 8f: `docs/prompts/ai-session.md` — the predefined session
+kickoff prompt (required reading list, verb cheatsheet, gate rules, AiCmd
+field semantics, worked examples). It is part of the test surface: a scripted
+"session" (shell driving the verbs against the fake UDS server from the test
+suite) proves the semi-manual path end-to-end without any live model call.
 
 ### 8.3 Transport: UDS at the process boundary, SPSC ring inside
 
@@ -718,7 +772,10 @@ state rather than freezing it in.
 
 ### 8.7 Autonomous research loop (8h): fetch → analyze (Fable 5) → backtest → push
 
-The full loop, run by `claude-worker serve` on a configurable cadence:
+The full loop, run by `claude-worker serve` on a configurable cadence in
+full-auto mode; in semi-manual mode the operator's Claude session executes
+the same stages through the §8.2.1 verbs (reasoning in-session, gates
+unchanged):
 
 1. **Fetch** (data_fetcher, §8.2): PMLR replay logs are the primary dataset —
    they contain exactly what the engine saw, at zero API cost. Venue REST
@@ -773,6 +830,8 @@ OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE
 DERIBIT_WS_HOST / DERIBIT_CLIENT_ID / DERIBIT_CLIENT_SECRET
 HYPERLIQUID_WS_HOST / HYPERLIQUID_API_HOST / HYPERLIQUID_AGENT_KEY   (mlock'd)
 AI_INGRESS_SOCK (default ~/multivenue/run/ai.sock) / AI_INGRESS_HMAC_KEY
+ANTHROPIC_API_KEY   (full-auto mode only — read by `claude-worker serve`;
+                     the §8.2.1 operator verbs never load the SDK)
 ```
 
 `RSS_FEEDS` moves to claude-worker's environment. Per-venue symbol config
@@ -839,7 +898,7 @@ this the gating work item; live trading on any new venue is blocked on it.
 
 | Phase | Content | Exit criteria | Est. |
 |---|---|---|---|
-| 8f | AI-Ingress + RSS removal + StrategySet + `strategy-ai-exec` + worker daemon | AI cmd → strategy toggle observed live; RSS fully deleted; heartbeat/staleness proven | 5–7 d |
+| 8f | AI-Ingress + RSS removal + StrategySet + `strategy-ai-exec` + worker daemon, dual-mode (from-scratch rewrite — old claude-worker deleted, §8.2 directive; §8.2.1 verbs + `docs/prompts/ai-session.md`) | AI cmd → strategy toggle observed live; RSS fully deleted; old claude-worker fully deleted; heartbeat/staleness proven; both modes proven (auto loop with mocked SDK; scripted semi-manual verb session vs fake UDS) | 5–7 d |
 | 8g | `strategy-vm` (Tier 1) | hand-authored ruleset staged, committed, trading in paper | 4–6 d |
 | 8h | Research loop (§8.7): data_fetcher + strategist (Fable 5) + `cli backtest` + gates + rollback | Fable-5-authored ruleset auto-promoted after passing backtest, trading in paper; forced-underperformance rollback demonstrated | 5–7 d |
 

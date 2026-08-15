@@ -65,7 +65,7 @@ crates/
   tui/              ratatui dashboard (read-only)
   bench/            criterion + dhat + alloc assertions
 fuzz/               cargo-fuzz targets
-claude-worker/      Python 3.12, offline Claude researcher (no hot path)
+claude-worker/      Python 3.14, offline Claude researcher (no hot path)
 .claude/            Subagents, slash commands, settings
 docs/               Architecture notes
 ```

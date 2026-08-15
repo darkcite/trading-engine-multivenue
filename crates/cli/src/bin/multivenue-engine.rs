@@ -871,7 +871,21 @@ fn run(args: RunArgs) -> ExitCode {
                 .name("metrics-http".into())
                 .spawn(move || {
                     info!(%bind, "metrics: HTTP server starting");
-                    if let Err(e) = core_metrics::serve_metrics(bind, reg, stop_ref) {
+                    // Non-fatal serve events land here so they carry
+                    // the standard tracing timestamp (G1 remediation
+                    // item 2 — the old in-crate eprintln had neither
+                    // timestamp nor level). WARN, not ERROR: scrape
+                    // clients retry; the soak "no ERROR" grep must not
+                    // trip on a benign scrape hiccup.
+                    let on_event = |ev: core_metrics::MetricsServeEvent<'_>| match ev {
+                        core_metrics::MetricsServeEvent::ConnError(e) => {
+                            warn!(error = %e, "metrics: connection error")
+                        }
+                        core_metrics::MetricsServeEvent::AcceptError(e) => {
+                            warn!(error = %e, "metrics: accept error")
+                        }
+                    };
+                    if let Err(e) = core_metrics::serve_metrics(bind, reg, stop_ref, on_event) {
                         error!(error = ?e, "metrics: serve_metrics returned error");
                     }
                 })

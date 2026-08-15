@@ -1,6 +1,6 @@
 # claude-worker
 
-Offline Python 3.12 process that uses the Anthropic SDK to do **non-hot-path**
+Offline Python 3.14 process that uses the Anthropic SDK to do **non-hot-path**
 strategy-research work for the Rust latency-arb engine. This process is
 **never** invoked from the engine's hot path. All interaction with the engine
 happens via files on disk (artifacts produced here are consumed at engine boot).

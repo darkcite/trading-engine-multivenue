@@ -16,9 +16,9 @@ run the engine locally in paper mode. No cloud, no managed services.
 # Rust, pinned via rust-toolchain.toml (1.83.0 at time of writing).
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Python 3.12 via uv.
+# Python 3.14 via uv.
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv python install 3.12
+uv python install 3.14
 
 # cargo-nextest for faster test runs.
 cargo install cargo-nextest --locked

@@ -92,7 +92,7 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 - Integration tests live per-crate under each crate's `tests/` directory.
   No workspace-level `tests/` is used.
 - `fuzz/` — cargo-fuzz targets.
-- `claude-worker/` — Python 3.12 process, Anthropic SDK, offline only.
+- `claude-worker/` — Python 3.14 process, Anthropic SDK, offline only.
 - `docs/` — wire formats, risk policy, local setup, migration.
 - `.claude/` — subagents, slash commands, settings.
 

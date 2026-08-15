@@ -545,6 +545,18 @@ pub enum ChannelId {
     /// Polymarket `price_change` rows that did not move the touch (the
     /// touch-moving ones become Ticks).
     PriceChange = 8,
+    /// Runtime trade-seq monitor increment (G1 remediation, 2026-08-15):
+    /// emitted 1:1 with every trades-channel `gaps_total` increment so
+    /// §6.6's "every increment paired with a logged venue event" is
+    /// mechanically checkable offline. `venue_seq` = observed seq,
+    /// `v0` = expected seq, `v1` = observed seq.
+    TradeGap = 9,
+    /// Runtime book-chain monitor increment, same pairing contract as
+    /// [`ChannelId::TradeGap`]. `venue_seq` = the message `change_id`,
+    /// `v0` = expected `prev_change_id` (the chain's last; `i64::MIN`
+    /// = monitor was awaiting a snapshot), `v1` = observed
+    /// `prev_change_id`.
+    BookGap = 10,
 }
 
 impl ChannelId {
@@ -561,6 +573,8 @@ impl ChannelId {
             6 => Some(Self::AllMids),
             7 => Some(Self::OutcomeMeta),
             8 => Some(Self::PriceChange),
+            9 => Some(Self::TradeGap),
+            10 => Some(Self::BookGap),
             _ => None,
         }
     }
@@ -578,6 +592,8 @@ impl ChannelId {
             Self::AllMids => "all_mids",
             Self::OutcomeMeta => "outcome_meta",
             Self::PriceChange => "price_change",
+            Self::TradeGap => "trade_gap",
+            Self::BookGap => "book_gap",
         }
     }
 }
@@ -978,6 +994,8 @@ mod channel_event_tests {
             ChannelId::AllMids,
             ChannelId::OutcomeMeta,
             ChannelId::PriceChange,
+            ChannelId::TradeGap,
+            ChannelId::BookGap,
         ];
         let mut i = 0;
         while i < all.len() {
@@ -986,7 +1004,7 @@ mod channel_event_tests {
             assert!(!c.as_str().is_empty());
             i += 1;
         }
-        assert_eq!(ChannelId::from_u8(9), None);
+        assert_eq!(ChannelId::from_u8(11), None);
         assert_eq!(ChannelId::from_u8(255), None);
     }
 

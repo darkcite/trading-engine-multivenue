@@ -29,6 +29,23 @@ pub enum MetricsServerErr {
     Config(io::Error),
 }
 
+/// Non-fatal serve-loop events handed to the caller's `on_event` sink
+/// (2026-08-15, G1 remediation item 2). This crate is deliberately
+/// dependency-free, so it cannot emit `tracing` lines itself — the
+/// caller owns the log format (the cli routes these through
+/// `tracing::warn!`, giving them the engine's standard timestamped
+/// shape; the old raw `eprintln!` printed with neither timestamp nor
+/// target). Monomorphized `Fn` — no `dyn`, no allocation.
+#[derive(Debug)]
+pub enum MetricsServeEvent<'a> {
+    /// One connection failed after accept (read/write/timeout). The
+    /// server keeps accepting — scrape clients simply retry.
+    ConnError(&'a io::Error),
+    /// `accept()` itself failed with something other than
+    /// `WouldBlock` (which is the idle-poll path, handled silently).
+    AcceptError(&'a io::Error),
+}
+
 const REQ_BUF_SIZE: usize = 4 * 1024;
 // 256 counters + 384 gauges × (63-byte name + value + newline) can
 // approach 64 KiB; 128 KiB keeps the single boot-time allocation
@@ -37,11 +54,13 @@ const RESP_BUF_SIZE: usize = 128 * 1024;
 const ACCEPT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Run the metrics server until `stop` is raised. Blocking; spawn
-/// this in its own `std::thread`.
-pub fn serve_metrics(
+/// this in its own `std::thread`. Non-fatal per-connection/accept
+/// errors are reported through `on_event` (see [`MetricsServeEvent`]).
+pub fn serve_metrics<E: Fn(MetricsServeEvent<'_>)>(
     addr: SocketAddr,
     registry: Arc<MetricsRegistry>,
     stop: &AtomicBool,
+    on_event: E,
 ) -> Result<(), MetricsServerErr> {
     let listener = TcpListener::bind(addr).map_err(MetricsServerErr::Bind)?;
     listener
@@ -56,17 +75,28 @@ pub fn serve_metrics(
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((sock, _peer)) => {
+                // BSD/macOS semantics: sockets accepted from a
+                // nonblocking listener INHERIT nonblocking mode, and
+                // `set_read_timeout` has no effect on a nonblocking
+                // socket — `read()` before the request bytes arrive
+                // returned EAGAIN ("os error 35", observed twice in
+                // the first 6 h soak). Restore blocking so the
+                // read/write timeouts below govern the connection.
+                if let Err(e) = sock.set_nonblocking(false) {
+                    on_event(MetricsServeEvent::ConnError(&e));
+                    continue;
+                }
                 if let Err(e) = handle_one(sock, &registry, &mut req, &mut resp) {
-                    // Per-connection errors are non-fatal; log via
-                    // stderr only.
-                    eprintln!("metrics: connection error: {e}");
+                    // Per-connection errors are non-fatal — report and
+                    // keep accepting.
+                    on_event(MetricsServeEvent::ConnError(&e));
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_TIMEOUT);
             }
             Err(e) => {
-                eprintln!("metrics: accept error: {e}");
+                on_event(MetricsServeEvent::AcceptError(&e));
                 std::thread::sleep(ACCEPT_TIMEOUT);
             }
         }
@@ -83,13 +113,19 @@ fn handle_one(
     sock.set_read_timeout(Some(Duration::from_secs(2)))?;
     sock.set_write_timeout(Some(Duration::from_secs(2)))?;
 
-    // Read until `\r\n\r\n`.
+    // Read until `\r\n\r\n`. `Interrupted` retries; `WouldBlock` here
+    // means the SO_RCVTIMEO deadline expired on the (blocking) socket
+    // — surfaced as the connection error it is.
     let mut total = 0usize;
     loop {
         if total >= req.len() {
             return write_response(&mut sock, 413, b"", b"Payload Too Large", resp);
         }
-        let n = sock.read(&mut req[total..])?;
+        let n = match sock.read(&mut req[total..]) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             break;
         }

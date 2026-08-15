@@ -133,6 +133,13 @@ struct SymStat {
     last_seq: Option<u64>,
     /// v0 of the previous book event (chain re-check needs prev field).
     last_book_seq: Option<i64>,
+    /// Deribit trades: the derived holes as inclusive missing-id
+    /// ranges — pairing corroboration checks each `TradeGap` event's
+    /// claimed range against these.
+    hole_ranges: Vec<(u64, u64)>,
+    /// Deribit trades: observed seq at each derived regression point
+    /// (pairing corroboration for backwards/duplicate `TradeGap`s).
+    regr_at: Vec<u64>,
 }
 
 impl SymStat {
@@ -149,6 +156,8 @@ impl SymStat {
             chain_breaks: 0,
             last_seq: None,
             last_book_seq: None,
+            hole_ranges: Vec::new(),
+            regr_at: Vec::new(),
         }
     }
 
@@ -228,6 +237,14 @@ struct VenueAudit {
     tap_rejects: u64,
     tap_reject_previews: Vec<String>,
     files_seen: u32,
+    /// Runtime gap-monitor pairing events (G1 remediation): every
+    /// `gaps_total` increment writes one `TradeGap`/`BookGap` event —
+    /// collected raw as `(channel, sym, venue_seq, v0 expected,
+    /// v1 observed)` and cross-checked against the re-derived stream
+    /// in the pairing section. Kept out of the coverage matrix and
+    /// per-stream blocks: they are monitor meta-events, not venue
+    /// data channels.
+    gap_events: Vec<(ChannelId, u32, u64, i64, i64)>,
 }
 
 impl VenueAudit {
@@ -277,6 +294,10 @@ fn audit_events(venue: &str, r: &PmlrReader<ChannelEvent>, out: &mut VenueAudit)
         let Some(ch) = ChannelId::from_u8(e.channel) else {
             continue; // corrupt byte — counted implicitly by absence
         };
+        if matches!(ch, ChannelId::TradeGap | ChannelId::BookGap) {
+            out.gap_events.push((ch, e.sym, e.venue_seq, e.v0, e.v1));
+            continue;
+        }
         let stats = out.events_for(ch);
         let s = stat_for(stats, e.sym);
         s.note_ts(e.ts_ns);
@@ -291,9 +312,20 @@ fn audit_events(venue: &str, r: &PmlrReader<ChannelEvent>, out: &mut VenueAudit)
                 if let Some(last) = s.last_seq {
                     if e.venue_seq < last {
                         s.seq_regressions += 1;
+                        if venue == "deribit" {
+                            s.regr_at.push(e.venue_seq);
+                        }
+                    } else if venue == "deribit" && e.venue_seq == last {
+                        // Duplicate delivery: NOT an offline stream
+                        // regression (display counters unchanged) but
+                        // the runtime monitor counts repeats as
+                        // Regression (§6.2 strictly-sequential rule) —
+                        // record it so its TradeGap event corroborates.
+                        s.regr_at.push(e.venue_seq);
                     } else if venue == "deribit" && e.venue_seq > last + 1 {
                         s.seq_holes += 1;
                         s.seq_missing += e.venue_seq - last - 1;
+                        s.hole_ranges.push((last + 1, e.venue_seq - 1));
                     }
                 }
                 s.last_seq = Some(e.venue_seq);
@@ -560,6 +592,9 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
     }
     report.push_str("  note: ring_drops/parse_errors are engine counters (/metrics), not derivable from capture files.\n");
 
+    // ---- gap pairing (§6.6 letter, G1 remediation) ----------------
+    render_pairing(&mut report, &audits);
+
     // ---- raw taps -------------------------------------------------
     let mut any_tap = false;
     for (label, a) in &audits {
@@ -579,6 +614,120 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
     }
 
     Ok(report)
+}
+
+/// Render the §6.6 pairing section: every runtime `gaps_total`
+/// increment writes one `TradeGap`/`BookGap` capture event (2026-08-15
+/// G1 remediation), so `gap_events_total` here must equal the run's
+/// final `engine_ingress_<venue>_gaps_total` — that comparison (one
+/// number against one number) is the "every increment paired with a
+/// logged venue event" letter, made mechanical.
+///
+/// Each `TradeGap` is additionally cross-checked against the
+/// re-derived trade stream:
+/// * forward gap (observed > expected): CORROBORATED iff the claimed
+///   missing ids are also missing from capture, REFUTED-BY-CAPTURE
+///   iff capture has them (a monitor artifact — the pre-remediation
+///   false-positive class);
+/// * regression (observed < expected): CORROBORATED iff the derived
+///   stream regressed at the same observed seq.
+///
+/// `BookGap`s are checked in aggregate per symbol against derived
+/// chain breaks; `v0 == i64::MIN` marks a join-before-snapshot gap,
+/// which has no offline counterpart by construction (the re-derived
+/// stream starts at the first captured event) and is reported as its
+/// own class.
+fn render_pairing(report: &mut String, audits: &[(&str, VenueAudit)]) {
+    let mut any = false;
+    for (label, a) in audits {
+        let venue_has_deribit_trades =
+            *label == "deribit" && a.events.iter().any(|(c, _)| *c == ChannelId::Trade);
+        if a.gap_events.is_empty() && !venue_has_deribit_trades {
+            continue;
+        }
+        if !any {
+            report.push_str("\n== gap pairing (runtime gaps_total vs gap ChannelEvents) ==\n");
+            any = true;
+        }
+        let trade_stats: &[SymStat] = a
+            .events
+            .iter()
+            .find(|(c, _)| *c == ChannelId::Trade)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[]);
+        let book_stats: &[SymStat] = a
+            .events
+            .iter()
+            .find(|(c, _)| *c == ChannelId::Book)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[]);
+
+        let mut trade_events = 0u64;
+        let mut corroborated = 0u64;
+        let mut refuted = 0u64;
+        let mut unmatched_regr = 0u64;
+        let mut book_events = 0u64;
+        let mut book_join = 0u64;
+        for (ch, sym, _seq, v0, v1) in &a.gap_events {
+            match ch {
+                ChannelId::TradeGap => {
+                    trade_events += 1;
+                    let st = trade_stats.iter().find(|s| s.sym == *sym);
+                    if v1 > v0 {
+                        // Forward gap: expected..=observed-1 missing?
+                        let (e, o1) = (*v0 as u64, (*v1 - 1) as u64);
+                        let hit = st.is_some_and(|s| {
+                            s.hole_ranges.iter().any(|(from, to)| *from <= e && o1 <= *to)
+                        });
+                        if hit {
+                            corroborated += 1;
+                        } else {
+                            refuted += 1;
+                            report.push_str(&format!(
+                                "  {label} REFUTED-BY-CAPTURE: trade_gap sym={:#010x} expected={v0} observed={v1} — capture stream has these ids (monitor artifact)\n",
+                                sym
+                            ));
+                        }
+                    } else {
+                        // Regression/duplicate.
+                        let hit =
+                            st.is_some_and(|s| s.regr_at.iter().any(|r| *r == *v1 as u64));
+                        if hit {
+                            corroborated += 1;
+                        } else {
+                            unmatched_regr += 1;
+                            report.push_str(&format!(
+                                "  {label} UNMATCHED: trade_gap regression sym={:#010x} expected={v0} observed={v1} — no derived regression at that seq\n",
+                                sym
+                            ));
+                        }
+                    }
+                }
+                ChannelId::BookGap => {
+                    book_events += 1;
+                    if *v0 == i64::MIN {
+                        book_join += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let derived_breaks: u64 = book_stats.iter().map(|s| s.chain_breaks).sum();
+        report.push_str(&format!(
+            "  {label}: gap_events_total={} (trade={trade_events} book={book_events}) — must equal the run's final gaps_total\n",
+            trade_events + book_events
+        ));
+        if trade_events > 0 {
+            report.push_str(&format!(
+                "  {label}: trade_gap verdicts: corroborated={corroborated} refuted_by_capture={refuted} unmatched_regression={unmatched_regr}\n"
+            ));
+        }
+        if book_events > 0 {
+            report.push_str(&format!(
+                "  {label}: book_gap events={book_events} (join_before_snapshot={book_join}) vs derived chain_breaks={derived_breaks}\n"
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -772,6 +921,142 @@ mod tests {
         assert!(report.contains("rejects=1"), "{report}");
         assert!(report.contains("weird"), "{report}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Golden pairing section (G1 remediation): gap ChannelEvents are
+    /// totalled for the gaps_total comparison and each `TradeGap` is
+    /// corroborated or refuted against the re-derived stream; a
+    /// `BookGap` with `v0 == i64::MIN` reports as join-before-snapshot.
+    #[test]
+    fn pairing_section_corroborates_and_refutes_gap_events() {
+        let dir = temp_run_dir("pairing");
+        {
+            let mut c = PmlrCapture::open(&dir, "deribit", 7, TapCfg::off()).unwrap();
+            let sym = core_types::make_symbol_id(VenueId::Deribit, 1);
+            let mut ts = 1_000_000_000u64;
+            // Stream 100,101,105,105: derived hole (102..=104) + one
+            // regression at the duplicate 105.
+            for s in [100u64, 101, 105, 105] {
+                c.event(&ChannelEvent::new(
+                    ts,
+                    VenueId::Deribit,
+                    ChannelId::Trade,
+                    sym,
+                    s,
+                    1,
+                    1_000_000,
+                    2_000_000,
+                ));
+                ts += 1_000_000;
+            }
+            // CORROBORATED forward gap: runtime saw the same hole.
+            c.event(&ChannelEvent::new(
+                ts,
+                VenueId::Deribit,
+                ChannelId::TradeGap,
+                sym,
+                105,
+                2,
+                102,
+                105,
+            ));
+            ts += 1_000_000;
+            // REFUTED forward gap: capture has no such hole — the
+            // pre-remediation phantom class.
+            c.event(&ChannelEvent::new(
+                ts,
+                VenueId::Deribit,
+                ChannelId::TradeGap,
+                sym,
+                52,
+                3,
+                51,
+                52,
+            ));
+            ts += 1_000_000;
+            // CORROBORATED regression: derived stream regressed at 105.
+            c.event(&ChannelEvent::new(
+                ts,
+                VenueId::Deribit,
+                ChannelId::TradeGap,
+                sym,
+                105,
+                4,
+                106,
+                105,
+            ));
+            ts += 1_000_000;
+            // Join-before-snapshot book gap (v0 = i64::MIN sentinel).
+            c.event(&ChannelEvent::new(
+                ts,
+                VenueId::Deribit,
+                ChannelId::BookGap,
+                sym,
+                7,
+                5,
+                i64::MIN,
+                6,
+            ));
+            c.flush_all().unwrap();
+        }
+        let report = run_audit(&dir).unwrap();
+        assert!(
+            report.contains("== gap pairing (runtime gaps_total vs gap ChannelEvents) =="),
+            "{report}"
+        );
+        assert!(
+            report.contains("deribit: gap_events_total=4 (trade=3 book=1)"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "trade_gap verdicts: corroborated=2 refuted_by_capture=1 unmatched_regression=0"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "REFUTED-BY-CAPTURE: trade_gap sym=0x03000001 expected=51 observed=52"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("book_gap events=1 (join_before_snapshot=1) vs derived chain_breaks=0"),
+            "{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gap-event-free deribit run still gets the totals line — the
+    /// operator's `gaps_total == 0` comparison needs the explicit 0.
+    #[test]
+    fn pairing_section_prints_zero_totals_without_events() {
+        let dir = temp_run_dir("pairing_zero");
+        {
+            let mut c = PmlrCapture::open(&dir, "deribit", 7, TapCfg::off()).unwrap();
+            let sym = core_types::make_symbol_id(VenueId::Deribit, 1);
+            let mut ts = 1_000_000_000u64;
+            for s in [100u64, 101, 102] {
+                c.event(&ChannelEvent::new(
+                    ts,
+                    VenueId::Deribit,
+                    ChannelId::Trade,
+                    sym,
+                    s,
+                    1,
+                    1_000_000,
+                    2_000_000,
+                ));
+                ts += 1_000_000;
+            }
+            c.flush_all().unwrap();
+        }
+        let report = run_audit(&dir).unwrap();
+        assert!(
+            report.contains("deribit: gap_events_total=0 (trade=0 book=0)"),
+            "{report}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
