@@ -526,7 +526,9 @@ Same as v0.3 core risks, plus local-deployment and free-tier specifics:
 - Realistic monthly API cost at v1 scope (few hundred active markets): expected single-digit dollars.
 
 ### 10.3 Process model
-- `claude-worker` is a Python 3.14 process started by `launchd`.
+- `claude-worker` is a Python 3.14 process started by `launchd`; the
+  unit invokes `claude-worker serve` (the 8f full-auto daemon —
+  operator verbs run ad hoc, no daemon).
 - UDS for on-demand requests from Rust engine; filesystem for artifacts.
 - Hot path never waits on Claude. Warm news-labeler has a strict 500 ms timeout; on timeout the engine proceeds on keyword heuristics alone.
 

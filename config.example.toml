@@ -85,3 +85,26 @@ cooldown_ns = 250000000
 max_open_orders = 8
 max_notional_usd = 100
 daily_loss_stop_usd = 50
+
+[ai]
+# Phase-8f AI ingress — REFERENCE ONLY, like everything in this
+# file: these knobs live in `.env` (engine side: `core-config`;
+# worker side: `claude-worker` BaseConfig), not in this TOML.
+#
+# Engine + worker (shared):
+#   AI_INGRESS_SOCK      = "~/multivenue/run/ai.sock"
+#   AI_INGRESS_HMAC_KEY  = 64 hex chars (absent = AI lane off;
+#                          invalid = fatal boot error; never logged)
+#   AI_RULESET_DIR       = "~/multivenue/artifacts/rulesets"
+#                          (artifacts named <hash128-hex>.json)
+# Worker only:
+#   CLAUDE_WORKER_REPLAY_DIR   = engine MULTIVENUE_LOG_DIR (required)
+#   CLAUDE_WORKER_DB           = "~/multivenue/worker/state.db"
+#   CLAUDE_WORKER_FEATURES_DIR = "~/multivenue/worker/features"
+#   CLAUDE_WORKER_MARKET_MAP   = "~/multivenue/worker/market-map.json"
+#   RSS_FEEDS                  = worker-only news allowlist (the
+#                                engine key dies with item 16)
+#   ANTHROPIC_API_KEY          = `claude-worker serve` ONLY
+#
+# Heartbeat/staleness are compile-time constants (5 s / 15 s, design
+# §13 decision 6) — deliberately NOT configurable in prod.

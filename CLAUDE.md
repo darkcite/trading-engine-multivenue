@@ -92,7 +92,9 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 - Integration tests live per-crate under each crate's `tests/` directory.
   No workspace-level `tests/` is used.
 - `fuzz/` — cargo-fuzz targets.
-- `claude-worker/` — Python 3.14 process, Anthropic SDK, offline only.
+- `claude-worker/` — Python 3.14 worker: `serve` daemon + operator verbs
+  (fetch/backtest/push/positions/stage-ruleset/commit-ruleset); Anthropic
+  SDK constructed inside `serve` only; never in the hot path.
 - `docs/` — wire formats, risk policy, local setup, migration.
 - `.claude/` — subagents, slash commands, settings.
 
@@ -114,6 +116,8 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 
 - **Bulk artifact generation** (topic tagging): Haiku 4.5.
 - **Reasoning** (rule parsing, news labeling): Sonnet 4.6.
+- **Strategy proposals** (`claude-worker` serve strategist, ruleset
+  drafts): Fable 5 (`MODEL_STRATEGIST = "claude-fable-5"`).
 - **Hard work** (backtest review, architectural changes): Opus 4.6.
 
 ## When in doubt, read
