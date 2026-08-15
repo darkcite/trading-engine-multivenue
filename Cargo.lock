@@ -314,6 +314,7 @@ dependencies = [
  "core-time",
  "core-types",
  "engine",
+ "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
  "ingress-hyperliquid",
@@ -628,6 +629,7 @@ dependencies = [
  "core-ring",
  "core-time",
  "core-types",
+ "ingress-ai",
  "strategy-core",
 ]
 

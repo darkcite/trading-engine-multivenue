@@ -1251,6 +1251,10 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    // Phase 8f: the AI lane rides in every engine; producer-dropped
+    // here so it reads empty (two atomic loads per iteration inside
+    // the measured window — part of the real tick cost).
+    let (_aip, ai_c) = Ring::<core_types::AiCmd, { core_types::AI_RING_SIZE }>::new().split();
 
     let mut eng = Engine::new(
         NoopStrat,
@@ -1258,6 +1262,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         [t0, t1, t2, t3, t4],
         sc,
         [f0, f1, f2, f3],
+        ai_c,
+        std::sync::Arc::new(AiIngressStatus::new()),
     );
     eng.start().unwrap();
 

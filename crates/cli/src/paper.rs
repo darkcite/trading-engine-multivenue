@@ -42,8 +42,11 @@ use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
 use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
-use core_types::{make_symbol_id, Fill, Signal, SymbolId, Tick, VenueId};
+use core_types::{make_symbol_id, AiCmd, Fill, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE};
 use engine::{Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE};
+// Re-exported (lib.rs) so the binary reaches the AI status slot type
+// through `cli::` like every other paper-mode surface.
+pub use ingress_ai::AiIngressStatus;
 use rustls_pki_types::ServerName;
 use strategy_latency_arb::LatencyArb;
 
@@ -236,6 +239,11 @@ pub struct Rings {
     /// Live dispatchers gain producers in Phase 8j; until then the
     /// engine's dispatcher fill pump (D3) is the only fill source.
     pub fill: [Arc<Ring<Fill, FILL_RING_SIZE>>; NUM_FILL_LANES],
+    /// AI command ring (Phase 8f §4.3). Producer half goes to the
+    /// `ingress-ai` thread when `AI_INGRESS_HMAC_KEY` is configured;
+    /// otherwise it is dropped and the engine's AI lane reads empty
+    /// forever (the unspawned-venue shape, §3.3).
+    pub ai: Arc<Ring<AiCmd, AI_RING_SIZE>>,
 }
 
 impl Rings {
@@ -246,6 +254,7 @@ impl Rings {
             rpc_signal: Ring::new(),
             rss_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
+            ai: Ring::new(),
         }
     }
 }
@@ -1326,6 +1335,15 @@ pub struct Consumers {
     /// arrive with the venue dispatchers in Phase 8j; paper-mode
     /// fills flow through the engine's dispatcher pump (D3).
     pub fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+    /// AI command lane consumer (Phase 8f). Reads empty forever when
+    /// `ingress-ai` is not spawned (producer dropped).
+    pub ai_cmds: Consumer<AiCmd, AI_RING_SIZE>,
+    /// Shared AI-ingress status slot. Rides in `Consumers` because it
+    /// must reach `Engine::new` alongside the AI lane — the engine
+    /// drain site is the designated writer of its `expired_total`
+    /// field; the metrics mirror reads the rest through
+    /// `Engine::ai_status()`.
+    pub ai_status: Arc<AiIngressStatus>,
 }
 
 /// Drain-and-count loop. Runs on the main thread until
@@ -2166,8 +2184,10 @@ where
         rpc_signal,
         mut rss_signal,
         fill_lanes,
+        ai_cmds,
+        ai_status,
     } = cons;
-    let mut eng = Engine::new(strat, disp, tick_lanes, rpc_signal, fill_lanes);
+    let mut eng = Engine::new(strat, disp, tick_lanes, rpc_signal, fill_lanes, ai_cmds, ai_status);
     if let Err(e) = eng.start() {
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
@@ -3097,6 +3117,8 @@ mod tests {
             rpc_signal: rings.rpc_signal.clone().split().1,
             rss_signal: rings.rss_signal.clone().split().1,
             fill_lanes,
+            ai_cmds: rings.ai.clone().split().1,
+            ai_status: Arc::new(AiIngressStatus::new()),
         }
     }
 

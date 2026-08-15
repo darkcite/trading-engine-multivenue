@@ -43,10 +43,10 @@ pub use paper::{
     engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full, engine_loop_with,
     join_reverse, new_capture_run_dir, parse_raw_tap_flags, signal_shutdown, spawn_binance,
     spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, spawn_rss,
-    split_host_port, CaptureGaugeIds, CaptureMetrics, Consumers, DrainCounters, EngineConfig,
-    EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds, IngressStatusSet,
-    LatencyDump, LiveDispatcher, LiveDispatcherErr, Observability, RawTapConfig, Rings, RssFeed,
-    StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    split_host_port, AiIngressStatus, CaptureGaugeIds, CaptureMetrics, Consumers, DrainCounters,
+    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds,
+    IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, Observability, RawTapConfig,
+    Rings, RssFeed, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

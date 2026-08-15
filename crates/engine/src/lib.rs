@@ -22,11 +22,14 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+use std::sync::Arc;
+
 use clob_dispatcher::OrderDispatch;
 use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
-use core_types::{Fill, Order, Signal, Tick, VenueId};
+use core_types::{AiCmd, Fill, Order, Signal, Tick, VenueId, AI_RING_SIZE};
+use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
 
 // ---------------------------------------------------------------
@@ -55,6 +58,16 @@ pub const NUM_TICK_LANES: usize = 5;
 /// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
 /// Binance is market-data-only, so it has no fill lane.
 pub const NUM_FILL_LANES: usize = 4;
+
+/// Per-iteration drain budget for the AI command lane (Phase 8f §4.3).
+///
+/// Deliberately its own constant rather than reusing `max_per_ring`:
+/// AI commands are control-plane traffic at ~1 cmd/s steady state, so
+/// the lane is almost always empty; a small fixed budget bounds the
+/// worst-case tick-time contribution while still draining a fully
+/// backed-up `AI_RING_SIZE` (1024) ring within 128 iterations of an
+/// engine loop that spins far faster than the producer can refill.
+pub const AI_DRAIN_BUDGET: usize = 8;
 
 /// Fill-lane index for an execution venue. `None` for venues that
 /// cannot produce fills (Binance = data-only, Ai = command feed).
@@ -85,6 +98,25 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+    /// AI command lane (Phase 8f §4.3). Sole consumer of the
+    /// `Ring<AiCmd, AI_RING_SIZE>` produced by the `ingress-ai`
+    /// thread. When `ingress-ai` is not spawned the producer half is
+    /// dropped and this lane reads empty forever (§3.3 pattern).
+    ai_cons: Consumer<AiCmd, AI_RING_SIZE>,
+    /// Shared AI-ingress status slot. The engine writes exactly one
+    /// field — `expired_total` via `inc_expired()` (TTL-expiry is
+    /// observable at pop, not at accept; per-field single-writer
+    /// discipline documented in `ingress-ai::status`).
+    ai_status: Arc<AiIngressStatus>,
+    /// AI commands dispatched to `Strategy::on_ai` (post TTL + shape
+    /// checks). Read by paper-mode stats and tests.
+    pub ai_dispatched: u64,
+    /// AI commands dropped by the drain-site shape re-check. The
+    /// ingress already rejects malformed frames (§4.4 step 4), so a
+    /// nonzero value means a producer bug or ring corruption —
+    /// defense in depth, mirrored to
+    /// `engine_ai_drain_malformed_total` by the cli.
+    pub ai_drain_malformed: u64,
     last_timer_ns: NsTs,
     /// Number of iterations completed (wraps on u64; for paper-mode stats).
     pub iterations: u64,
@@ -143,6 +175,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
         fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+        ai_cons: Consumer<AiCmd, AI_RING_SIZE>,
+        ai_status: Arc<AiIngressStatus>,
     ) -> Self {
         Self {
             strat,
@@ -150,6 +184,10 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             tick_lanes,
             sig_cons,
             fill_lanes,
+            ai_cons,
+            ai_status,
+            ai_dispatched: 0,
+            ai_drain_malformed: 0,
             last_timer_ns: 0,
             iterations: 0,
             ticks_dispatched: 0,
@@ -284,6 +322,52 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     };
                     self.strat.on_fill(&f, &mut ctx);
                     self.fills_dispatched = self.fills_dispatched.wrapping_add(1);
+                }
+                None => break,
+            }
+            i += 1;
+        }
+
+        // --- AI command lane (Phase 8f §4.3) ---
+        // Drained LAST among event sources: AI commands are control
+        // plane; market data and fills keep priority within an
+        // iteration. Budget is [`AI_DRAIN_BUDGET`], not
+        // `max_per_ring` — see the constant's docs.
+        let mut i = 0;
+        while i < AI_DRAIN_BUDGET {
+            match self.ai_cons.try_pop() {
+                Some(cmd) => {
+                    // Per-item clock sample (E-2 pattern): TTL
+                    // arithmetic needs the pop-time clock, and a
+                    // batch-captured `now` would misclassify
+                    // commands expiring mid-batch.
+                    let now = now_ns();
+                    // TTL-on-pop (§3, §13 decision 1): `ts_ns` is
+                    // engine-monotonic since the accept-time rewrite,
+                    // so residency = now - ts_ns with no cross-clock
+                    // term. `ttl_ns == 0` means no expiry.
+                    if cmd.ttl_ns != 0 && now.saturating_sub(cmd.ts_ns) > cmd.ttl_ns {
+                        // Designated drain-site write into the shared
+                        // status slot (its only engine-written field).
+                        self.ai_status.inc_expired();
+                    } else if cmd.validate_shape().is_err() {
+                        // Defense in depth: the ingress already
+                        // shape-checked at accept (§4.4 step 4), so
+                        // this fires only on a producer bug or ring
+                        // corruption. Counted, not asserted — the §11
+                        // "malformed rejected" drain test exercises
+                        // this path, and the asserting boundary is
+                        // the ingress.
+                        self.ai_drain_malformed = self.ai_drain_malformed.wrapping_add(1);
+                    } else {
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            now,
+                        };
+                        self.strat.on_ai(&cmd, &mut ctx);
+                        self.ai_dispatched = self.ai_dispatched.wrapping_add(1);
+                    }
                 }
                 None => break,
             }
@@ -439,6 +523,14 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn strategy(&self) -> &S {
         &self.strat
     }
+
+    /// Borrow the shared AI-ingress status slot (cli metrics mirror +
+    /// tests). The engine's own write into it is `inc_expired` at the
+    /// drain site; everything else is read-only from here.
+    #[inline]
+    pub fn ai_status(&self) -> &AiIngressStatus {
+        &self.ai_status
+    }
 }
 
 /// Concrete `Ctx` passed into strategy callbacks.
@@ -475,6 +567,7 @@ mod tests {
         ticks: u32,
         signals: u32,
         fills: u32,
+        ai_cmds: u32,
     }
 
     impl strategy_core::StrategyCounters for Counter {}
@@ -491,6 +584,9 @@ mod tests {
         }
         fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {
             self.fills += 1;
+        }
+        fn on_ai<C: Ctx>(&mut self, _cmd: &AiCmd, _ctx: &mut C) {
+            self.ai_cmds += 1;
         }
         fn on_timer<C: Ctx>(&mut self, _n: NsTs, _ctx: &mut C) {}
         fn timer_period_ns(&self) -> u64 {
@@ -544,25 +640,28 @@ mod tests {
         [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         Producer<Signal, SIGNAL_RING_SIZE>,
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+        Producer<AiCmd, AI_RING_SIZE>,
     ) {
         let (tp, tc) = split_tick_lanes();
         let sig_ring: std::sync::Arc<Ring<Signal, SIGNAL_RING_SIZE>> = Ring::new();
         let (sp, sc) = sig_ring.split();
         let (fp, fc) = split_fill_lanes();
+        let (ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
 
         let strat = Counter {
             ticks: 0,
             signals: 0,
             fills: 0,
+            ai_cmds: 0,
         };
         let disp = PaperDispatcher::new();
-        let eng = Engine::new(strat, disp, tc, sc, fc);
-        (eng, tp, sp, fp)
+        let eng = Engine::new(strat, disp, tc, sc, fc, ac, Arc::new(AiIngressStatus::new()));
+        (eng, tp, sp, fp, ap)
     }
 
     #[test]
     fn engine_drains_polymarket_tick_lane() {
-        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
         eng.start().unwrap();
         for i in 0..3u32 {
             tp[VenueId::Polymarket as usize]
@@ -576,7 +675,7 @@ mod tests {
 
     #[test]
     fn engine_drains_every_lane_per_iteration() {
-        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
         eng.start().unwrap();
         let venues = [
             VenueId::Polymarket,
@@ -599,7 +698,7 @@ mod tests {
 
     #[test]
     fn engine_respects_max_per_ring_cap_per_lane() {
-        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
         eng.start().unwrap();
         for i in 0..10u32 {
             tp[0].try_push(mk_tick(VenueId::Polymarket, 1, i + 1)).unwrap();
@@ -614,7 +713,7 @@ mod tests {
 
     #[test]
     fn engine_drains_fill_lanes() {
-        let (mut eng, _tp, _sp, mut fp) = build_engine();
+        let (mut eng, _tp, _sp, mut fp, _ap) = build_engine();
         eng.start().unwrap();
         let f = Fill::new(
             10,
@@ -669,8 +768,10 @@ mod tests {
             ticks: 0,
             signals: 0,
             fills: 0,
+            ai_cmds: 0,
         };
-        let mut eng = Engine::new(strat, disp, tc, sc, fc);
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let mut eng = Engine::new(strat, disp, tc, sc, fc, ac, Arc::new(AiIngressStatus::new()));
         eng.start().unwrap();
         eng.tick(16);
         assert_eq!(eng.fills_dispatched, 1, "dispatcher fill must reach on_fill");
@@ -689,20 +790,20 @@ mod tests {
 
     #[test]
     fn engine_dispatcher_starts_with_zero_accepted() {
-        let (eng, _tp, _sp, _fp) = build_engine();
+        let (eng, _tp, _sp, _fp, _ap) = build_engine();
         assert_eq!(eng.dispatcher().stats().accepted, 0);
     }
 
     #[test]
     fn max_tick_age_zero_before_any_tick() {
-        let (eng, _tp, _sp, _fp) = build_engine();
+        let (eng, _tp, _sp, _fp, _ap) = build_engine();
         assert_eq!(eng.populated_sym_count(), 0);
         assert_eq!(eng.max_tick_age_ns(1_000_000), 0);
     }
 
     #[test]
     fn max_tick_age_tracks_freshest_per_bucket() {
-        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
         eng.start().unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 11, 1)).unwrap();
@@ -720,7 +821,7 @@ mod tests {
     fn same_ordinal_on_two_venues_lands_in_two_buckets() {
         // The §3.1 regression the mixed bucket exists to prevent:
         // ordinal 0 on every venue used to collapse into bucket 0.
-        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
         eng.start().unwrap();
         let pm = core_types::make_symbol_id(VenueId::Polymarket, 0);
         let okx = core_types::make_symbol_id(VenueId::Okx, 0);
@@ -730,9 +831,122 @@ mod tests {
         assert_eq!(eng.populated_sym_count(), 2);
     }
 
+    // ---------------- AI command lane (Phase 8f §11) ----------------
+
+    /// Well-formed Heartbeat with a caller-chosen accept time + TTL.
+    /// Shape rules (§3 table): Heartbeat carries no sym/px/qty/ttl —
+    /// so for TTL tests we use SetFairValue, which REQUIRES ttl > 0.
+    fn mk_heartbeat(ts_ns: u64, seq: u32) -> AiCmd {
+        AiCmd::new(
+            ts_ns,
+            seq,
+            core_types::SYMBOL_ID_NONE,
+            0,
+            0,
+            0,
+            core_types::AiCmdKind::Heartbeat,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_NONE,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        )
+    }
+
+    /// Well-formed SetFairValue whose expiry is fully caller-driven:
+    /// `ts_ns` is the (simulated) engine accept time, `ttl_ns` the
+    /// allowed ring residency.
+    fn mk_fair_value(ts_ns: u64, seq: u32, ttl_ns: u64) -> AiCmd {
+        AiCmd::new(
+            ts_ns,
+            seq,
+            core_types::make_symbol_id(VenueId::Polymarket, 1),
+            500_000,
+            0,
+            ttl_ns,
+            core_types::AiCmdKind::SetFairValue,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_NONE,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn ai_lane_dispatches_to_on_ai() {
+        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        eng.start().unwrap();
+        // ts = now, no TTL → never expires; heartbeat has no shape
+        // surprises.
+        ap.try_push(mk_heartbeat(now_ns(), 1)).unwrap();
+        eng.tick(16);
+        assert_eq!(eng.ai_dispatched, 1);
+        assert_eq!(eng.strategy().ai_cmds, 1);
+        assert_eq!(eng.ai_status().expired(), 0);
+        assert_eq!(eng.ai_drain_malformed, 0);
+    }
+
+    #[test]
+    fn ai_lane_ttl_expires_on_pop() {
+        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        eng.start().unwrap();
+        let now = now_ns();
+        // Accepted 10 ms ago with a 1 ms TTL → expired at pop.
+        ap.try_push(mk_fair_value(now.saturating_sub(10_000_000), 1, 1_000_000))
+            .unwrap();
+        // Accepted now with a generous TTL → dispatched.
+        ap.try_push(mk_fair_value(now, 2, 60_000_000_000)).unwrap();
+        eng.tick(16);
+        assert_eq!(eng.ai_status().expired(), 1, "stale command dropped at pop");
+        assert_eq!(eng.ai_dispatched, 1, "fresh command still dispatched");
+        assert_eq!(eng.strategy().ai_cmds, 1);
+    }
+
+    #[test]
+    fn ai_lane_respects_drain_budget() {
+        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        eng.start().unwrap();
+        let n = (AI_DRAIN_BUDGET * 2 + 3) as u32;
+        for i in 0..n {
+            ap.try_push(mk_heartbeat(now_ns(), i + 1)).unwrap();
+        }
+        eng.tick(16);
+        assert_eq!(
+            eng.ai_dispatched,
+            AI_DRAIN_BUDGET as u64,
+            "one iteration must drain at most AI_DRAIN_BUDGET commands"
+        );
+        eng.tick(16);
+        eng.tick(16);
+        assert_eq!(eng.ai_dispatched, n as u64, "backlog drains across iterations");
+    }
+
+    #[test]
+    fn ai_lane_recheck_rejects_malformed_at_drain() {
+        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        eng.start().unwrap();
+        // Bypass the ingress (the ring producer is ours) and push a
+        // shape violation: Heartbeat must not carry px.
+        let mut bad = mk_heartbeat(now_ns(), 1);
+        bad.px = 1;
+        assert!(bad.validate_shape().is_err(), "fixture must be malformed");
+        ap.try_push(bad).unwrap();
+        ap.try_push(mk_heartbeat(now_ns(), 2)).unwrap();
+        eng.tick(16);
+        assert_eq!(eng.ai_drain_malformed, 1, "malformed slot counted, not dispatched");
+        assert_eq!(eng.ai_dispatched, 1);
+        assert_eq!(eng.strategy().ai_cmds, 1);
+        assert_eq!(
+            eng.ai_status().malformed(),
+            0,
+            "ingress-side malformed counter must NOT move from the drain site"
+        );
+    }
+
     #[test]
     fn max_tick_age_handles_now_before_recorded() {
-        let (mut eng, mut tp, _sp, _fp) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
         eng.start().unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         eng.tick(16);

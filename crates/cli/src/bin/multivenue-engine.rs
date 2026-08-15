@@ -552,6 +552,13 @@ fn run(args: RunArgs) -> ExitCode {
         let (_f3p, f3) = rings.fill[3].clone().split();
         [f0, f1, f2, f3]
     };
+    // AI command lane (Phase 8f). The producer half feeds the
+    // `ingress-ai` thread; until that thread is spawned (item 6b
+    // wiring, gated on AI_INGRESS_HMAC_KEY) dropping it leaves the
+    // engine's AI lane permanently empty — the §3.3 unspawned shape.
+    let (ai_prod, ai_lane_cons) = rings.ai.clone().split();
+    drop(ai_prod); // spawn_ai arrives with item 6b
+    let ai_status = std::sync::Arc::new(cli::AiIngressStatus::new());
 
     // -- Per-ingress status slots (D7) --
     let statuses = std::sync::Arc::new(cli::IngressStatusSet::new());
@@ -842,6 +849,8 @@ fn run(args: RunArgs) -> ExitCode {
         rpc_signal: rpc_cons,
         rss_signal: rss_cons,
         fill_lanes: fill_lane_cons,
+        ai_cmds: ai_lane_cons,
+        ai_status,
     };
     let engine_cfg = EngineConfig {
         pairs: vec![StrategyPair {
