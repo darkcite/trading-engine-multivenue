@@ -32,6 +32,10 @@ import subprocess
 import time
 import typing
 
+import claude_worker.frames
+import claude_worker.state
+import claude_worker.uds
+
 # The engine binary name (PATH-resolved by default; absolute in prod .env
 # wiring arrives with the 8h harness).
 ENGINE_BINARY: str = "multivenue-engine"
@@ -49,6 +53,12 @@ class BacktestError(Exception):
     """Harness failure or contract violation: bad exit, garbage stdout,
     schema/hash mismatch. Fail-fast — a report we cannot trust must never
     reach the gates."""
+
+
+class GateRefused(Exception):
+    """Stage/commit binding refusal (§6 exit 3). FINAL by design: no
+    override flag exists anywhere in the CLI surface — fix the ruleset,
+    don't fight the gate."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -226,6 +236,104 @@ def write_report(
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return path
+
+
+# ---- stage/commit gate binding (§6; the ONLY path to Stage/Commit frames)
+
+
+def check_stage_binding(ruleset_path: pathlib.Path, report_path: pathlib.Path) -> tuple[str, bytes]:
+    """The §6 GATE BINDING SITE: recompute sha256 over the ruleset file,
+    require the worker report to (a) exist, (b) carry our schema version,
+    (c) carry exactly that hash, (d) say ``gates.all_passed``. Any
+    violation is [`GateRefused`] (exit 3 — §11 lists report-missing here
+    too). Returns ``(full_hash_hex, hash128)`` on success."""
+    full_hash, hash128 = ruleset_hashes(ruleset_path)
+    if not report_path.is_file():
+        raise GateRefused(f"report missing: {report_path}")
+    try:
+        raw = json.loads(report_path.read_text())
+    except ValueError as exc:
+        raise GateRefused(f"report is not JSON: {report_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise GateRefused(f"report is not a JSON object: {report_path}")
+    obj = typing.cast(dict[str, object], raw)
+    version = obj.get("schema_version")
+    if version != REPORT_SCHEMA_VERSION:
+        raise GateRefused(f"report schema_version {version!r} != {REPORT_SCHEMA_VERSION}")
+    if obj.get("ruleset_hash") != full_hash:
+        raise GateRefused("report ruleset_hash does not match the ruleset file (recomputed)")
+    gates = obj.get("gates")
+    if (
+        not isinstance(gates, dict)
+        or typing.cast(dict[str, object], gates).get("all_passed") is not True
+    ):
+        raise GateRefused("report gates.all_passed is not true")
+    return full_hash, hash128
+
+
+def hash128_wire(hash128: bytes) -> tuple[int, int]:
+    """hash128 -> (px, qty) i64 halves, little-endian signed (§13
+    decision 5; byte convention pinned by the shared golden vectors)."""
+    if len(hash128) != HASH128_LEN:
+        raise ValueError(f"hash128 must be {HASH128_LEN} bytes, got {len(hash128)}")
+    px = int.from_bytes(hash128[0:8], "little", signed=True)
+    qty = int.from_bytes(hash128[8:16], "little", signed=True)
+    return px, qty
+
+
+def _send_ruleset_frame(client: claude_worker.uds.UdsClient, kind: int, hash128: bytes) -> int:
+    px, qty = hash128_wire(hash128)
+    return client.send_cmd(
+        sym=claude_worker.frames.SYMBOL_ID_NONE,
+        px=px,
+        qty=qty,
+        ttl_ns=0,
+        kind=kind,
+        venue=claude_worker.frames.VENUE_AI,
+        strategy_id=claude_worker.frames.STRATEGY_SLOT_VM,
+        side=claude_worker.frames.SIDE_NONE,
+        param_id=0,
+        flags=0,
+    )
+
+
+def stage_ruleset(
+    state: claude_worker.state.State,
+    client: claude_worker.uds.UdsClient,
+    ruleset_path: pathlib.Path,
+    report_path: pathlib.Path,
+    author_mode: str,
+) -> tuple[int, str]:
+    """Bind gates -> record the registry row -> send RulesetStage{hash128}
+    (§6 order: record, then send). ``client`` must be connected with the
+    heartbeat already sent. Both modes route here — serve's commander path
+    (8h strategist) calls this same function, so gates bind in code
+    everywhere. Returns ``(seq, full_hash_hex)``."""
+    full_hash, hash128 = check_stage_binding(ruleset_path, report_path)
+    state.stage_ruleset(full_hash, str(ruleset_path), str(report_path), author_mode)
+    seq = _send_ruleset_frame(client, claude_worker.frames.KIND_RULESET_STAGE, hash128)
+    return seq, full_hash
+
+
+def commit_ruleset(
+    state: claude_worker.state.State,
+    client: claude_worker.uds.UdsClient,
+    full_hash: str,
+) -> int:
+    """Require a STAGED, gates-passed registry row for ``full_hash``; send
+    RulesetCommit{hash128}; stamp ``committed_ts`` (send-then-record: a
+    failed send leaves no phantom commit). Unknown/unstaged/failed hash ⇒
+    [`GateRefused`] (exit 3). Returns the seq used."""
+    row = state.ruleset_row(full_hash)
+    if row is None:
+        raise GateRefused(f"no staged ruleset for hash {full_hash}")
+    _hash, _path, _report, gates_passed, _mode, staged_ts, _committed = row
+    if staged_ts is None or not gates_passed:
+        raise GateRefused(f"ruleset {full_hash} is not a staged, gates-passed row")
+    hash128 = bytes.fromhex(full_hash)[:HASH128_LEN]
+    seq = _send_ruleset_frame(client, claude_worker.frames.KIND_RULESET_COMMIT, hash128)
+    state.mark_ruleset_committed(full_hash)
+    return seq
 
 
 def default_run_fn(argv: list[str]) -> str:

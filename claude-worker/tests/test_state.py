@@ -6,6 +6,8 @@ Convention: full ``import x`` only. No ``from x import y``.
 import pathlib
 import sqlite3
 
+import pytest
+
 import claude_worker.state
 
 
@@ -150,4 +152,39 @@ def test_cached_complete_hit_and_scoping(tmp_path: pathlib.Path) -> None:
     # Model scoping: same version+prompt, different model = distinct entry.
     fourth, hit4 = st.cached_complete("m2", "tpl-v1", "same prompt", fake)
     assert (fourth, hit4) == ("resp-3", False)
+    st.close()
+
+
+# ---- ruleset registry (item-12 consumers) ----
+
+
+def test_ruleset_stage_commit_lifecycle(tmp_path: pathlib.Path) -> None:
+    st = claude_worker.state.State(tmp_path / "state.db")
+    full_hash = "ab" * 32
+    assert st.ruleset_row(full_hash) is None
+    st.stage_ruleset(full_hash, "rs.json", "rs.report.json", "session", ts=100)
+    row = st.ruleset_row(full_hash)
+    assert row == (full_hash, "rs.json", "rs.report.json", True, "session", 100, None)
+    st.mark_ruleset_committed(full_hash, ts=200)
+    row = st.ruleset_row(full_hash)
+    assert row is not None and row[6] == 200
+    # Re-staging refreshes staged_ts and CLEARS committed_ts (a new Stage
+    # supersedes an old Commit — mirrors the engine stub's state machine).
+    st.stage_ruleset(full_hash, "rs.json", "rs.report.json", "auto", ts=300)
+    row = st.ruleset_row(full_hash)
+    assert row == (full_hash, "rs.json", "rs.report.json", True, "auto", 300, None)
+    st.close()
+
+
+def test_ruleset_commit_without_row_raises(tmp_path: pathlib.Path) -> None:
+    st = claude_worker.state.State(tmp_path / "state.db")
+    with pytest.raises(claude_worker.state.StateError):
+        st.mark_ruleset_committed("cd" * 32)
+    st.close()
+
+
+def test_ruleset_stage_bad_author_mode_raises(tmp_path: pathlib.Path) -> None:
+    st = claude_worker.state.State(tmp_path / "state.db")
+    with pytest.raises(claude_worker.state.StateError):
+        st.stage_ruleset("ee" * 32, "rs.json", "r.json", "operator")
     st.close()

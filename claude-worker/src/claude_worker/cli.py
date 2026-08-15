@@ -48,6 +48,7 @@ import claude_worker.daemon
 import claude_worker.features
 import claude_worker.feeds
 import claude_worker.frames
+import claude_worker.pmlr
 import claude_worker.state
 import claude_worker.uds
 
@@ -86,6 +87,9 @@ def _guarded(fn: collections.abc.Callable[[], int]) -> typing.NoReturn:
     except claude_worker.uds.UdsError as exc:
         typer.echo(f"transport: {exc}", err=True)
         raise typer.Exit(EXIT_TRANSPORT) from exc
+    except claude_worker.backtest.GateRefused as exc:
+        typer.echo(f"gate refused (final — no override exists): {exc}", err=True)
+        raise typer.Exit(EXIT_GATE) from exc
     except (claude_worker.state.StateError, sqlite3.Error) as exc:
         typer.echo(f"state: {exc}", err=True)
         raise typer.Exit(EXIT_STATE) from exc
@@ -669,6 +673,236 @@ def push(  # noqa: PLR0913, PLR0917 — one parameter per §6 push option, delib
         finally:
             state.close()
         typer.echo(f"sent kind={kind} seq={seq}")
+        return EXIT_OK
+
+    _guarded(run)
+
+
+# ---- positions -----------------------------------------------------------
+
+
+def _resolve_run_dir(cfg: claude_worker.config.BaseConfig, run_dir: str | None) -> pathlib.Path:
+    if run_dir is None or run_dir == "latest":
+        resolved = claude_worker.features.latest_run_dir(cfg.replay_dir)
+        _require(resolved is not None, f"no run-* dirs under {cfg.replay_dir}")
+        return typing.cast(pathlib.Path, resolved)
+    path = pathlib.Path(run_dir).expanduser()
+    _require(path.is_dir(), f"--run-dir: no such directory: {path}")
+    return path
+
+
+def _collect_run_marks(run_dir: pathlib.Path) -> tuple[dict[int, int], list[str]]:
+    """Latest tick marks from the CURRENT run dir (read-only; nothing is
+    written — this is the ``positions`` view, not ``fetch``)."""
+    marks: dict[int, int] = {}
+    torn: list[str] = []
+    for path in sorted(run_dir.glob("*-ticks.pmlr")):
+        with claude_worker.pmlr.Reader(path) as reader:
+            claude_worker.features.collect_marks(reader, into=marks)
+            if reader.torn:
+                torn.append(path.name)
+    return marks, torn
+
+
+def _positions_payload(
+    run_dir: pathlib.Path,
+    torn: tuple[bool, list[str]],  # (fills file torn, torn tick-file names)
+    views: dict[int, "claude_worker.features.PositionView"],
+    pair_views: list["claude_worker.features.Hip4PairView"],
+    total: int,
+) -> dict[str, object]:
+    fills_torn, ticks_torn = torn
+    to_usd = claude_worker.features.to_usd
+    positions_out: list[dict[str, object]] = []
+    for sym in sorted(views):
+        view = views[sym]
+        positions_out.append(
+            {
+                "sym": view.sym,
+                "net_qty": view.net_qty / _PX_QTY_SCALE,
+                "avg_px": view.avg_px / _PX_QTY_SCALE,
+                "mark_px": view.mark_px / _PX_QTY_SCALE,
+                "realized_usd": to_usd(view.realized),
+                "unrealized_usd": to_usd(view.unrealized),
+                "exposure_usd": to_usd(view.exposure),
+            }
+        )
+    pairs_out: list[dict[str, object]] = []
+    for pv in pair_views:
+        pairs_out.append(
+            {
+                "yes_sym": pv.yes_sym,
+                "no_sym": pv.no_sym,
+                "net_qty": pv.net_qty / _PX_QTY_SCALE,
+                "flattened_qty": pv.flattened_qty / _PX_QTY_SCALE,
+                "exposure_usd": to_usd(pv.exposure),
+            }
+        )
+    return {
+        "run_dir": str(run_dir),
+        "fills_torn": fills_torn,
+        "ticks_torn": ticks_torn,
+        "positions": positions_out,
+        "hip4_pairs": pairs_out,
+        "total_exposure_usd": to_usd(total),
+    }
+
+
+def _echo_positions_human(payload: dict[str, object]) -> None:
+    typer.echo(f"run {payload['run_dir']}")
+    if payload["fills_torn"]:
+        typer.echo("fills: torn tail (engine mid-flush) — last partial record ignored", err=True)
+    for name in typing.cast(list[str], payload["ticks_torn"]):
+        typer.echo(f"ticks: torn tail (engine mid-flush): {name}", err=True)
+    for pos in typing.cast(list[dict[str, object]], payload["positions"]):
+        typer.echo(
+            f"sym {pos['sym']}  net {pos['net_qty']:.6f}  avg {pos['avg_px']:.6f}"
+            f"  mark {pos['mark_px']:.6f}  realized {pos['realized_usd']:.2f}"
+            f"  unrealized {pos['unrealized_usd']:.2f}  exposure {pos['exposure_usd']:.2f}"
+        )
+    for pair in typing.cast(list[dict[str, object]], payload["hip4_pairs"]):
+        typer.echo(
+            f"hip4 {pair['yes_sym']}/{pair['no_sym']}  net {pair['net_qty']:.6f}"
+            f"  flattened {pair['flattened_qty']:.6f}  exposure {pair['exposure_usd']:.2f}"
+        )
+    typer.echo(f"total exposure: {typing.cast(float, payload['total_exposure_usd']):.2f} USD")
+
+
+@app.command()
+def positions(
+    run_dir: typing.Annotated[
+        str | None,
+        typer.Option("--run-dir", help="Run dir path, or 'latest' (the default)."),
+    ] = None,
+    json_out: typing.Annotated[
+        bool, typer.Option("--json", help="Machine-readable output.")
+    ] = False,
+) -> None:
+    """Read-only live-state view (§6): tail engine-fills.pmlr + latest
+    tick marks from the CURRENT run dir. No UDS, no heartbeat, no seq —
+    the engine is a producer, never a server."""
+
+    def run() -> int:
+        cfg = claude_worker.config.load_base_from_env()
+        market_map = load_market_map(cfg.market_map_path)
+        resolved = _resolve_run_dir(cfg, run_dir)
+        fills, fills_torn = claude_worker.features.read_fills(resolved)
+        reconstructed = claude_worker.features.reconstruct_positions(fills)
+        marks, ticks_torn = _collect_run_marks(resolved)
+        views = claude_worker.features.position_views(reconstructed, marks)
+        pair_views = claude_worker.features.hip4_pair_views(views, market_map.hip4_pairs)
+        total = claude_worker.features.total_exposure(views, pair_views)
+        payload = _positions_payload(resolved, (fills_torn, ticks_torn), views, pair_views, total)
+        if json_out:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            _echo_positions_human(payload)
+        return EXIT_OK
+
+    _guarded(run)
+
+
+# ---- stage-ruleset / commit-ruleset --------------------------------------
+
+_FULL_HASH_HEX_LEN: int = 64  # sha256 hex
+
+
+def _parse_full_hash(raw: str) -> str:
+    value = raw.lower()
+    _require(
+        len(value) == _FULL_HASH_HEX_LEN,
+        f"--hash must be {_FULL_HASH_HEX_LEN} hex chars (full sha256)",
+    )
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError("--hash is not valid hex") from exc
+    return value
+
+
+@app.command("stage-ruleset")
+def stage_ruleset(
+    ruleset: typing.Annotated[
+        pathlib.Path, typer.Option("--ruleset", help="Ruleset JSON artifact.")
+    ],
+    report: typing.Annotated[
+        pathlib.Path, typer.Option("--report", help="Worker backtest report (R.report.json).")
+    ],
+    by: typing.Annotated[
+        str,
+        typer.Option("--by", help="Attribution: session (default for verbs) or auto."),
+    ] = "session",
+) -> None:
+    """GATE BINDING SITE (§6): recompute sha256(R), require the report to
+    match hash + schema + gates.all_passed; record the registry row; send
+    RulesetStage{hash128}. Any mismatch is exit 3. NO OVERRIDE EXISTS."""
+
+    def run() -> int:
+        cfg = claude_worker.config.load_base_from_env()
+        _require(by in ("session", "auto"), f"--by must be session|auto: got {by!r}")
+        _require(ruleset.is_file(), f"--ruleset: no such file: {ruleset}")
+        state = claude_worker.state.State(cfg.db_path)
+        try:
+            client = claude_worker.uds.UdsClient(
+                cfg.ai_ingress_sock, cfg.ai_ingress_hmac_key, state
+            )
+            client.connect()
+            try:
+                client.send_heartbeat()
+                seq, full_hash = claude_worker.backtest.stage_ruleset(
+                    state, client, ruleset, report, by
+                )
+            finally:
+                client.close()
+        finally:
+            state.close()
+        typer.echo(f"staged {full_hash}")
+        typer.echo(f"sent kind=ruleset-stage seq={seq}")
+        return EXIT_OK
+
+    _guarded(run)
+
+
+@app.command("commit-ruleset")
+def commit_ruleset(
+    hash_hex: typing.Annotated[
+        str | None, typer.Option("--hash", help="Full sha256 hex (64 chars).")
+    ] = None,
+    ruleset: typing.Annotated[
+        pathlib.Path | None,
+        typer.Option("--ruleset", help="Ruleset file (hash recomputed from bytes)."),
+    ] = None,
+) -> None:
+    """Send RulesetCommit for a STAGED, gates-passed hash (§6). An
+    unstaged or gate-failed hash is exit 3."""
+
+    def run() -> int:
+        cfg = claude_worker.config.load_base_from_env()
+        _require(
+            (hash_hex is None) != (ruleset is None),
+            "give exactly one of --hash / --ruleset",
+        )
+        if hash_hex is not None:
+            full_hash = _parse_full_hash(hash_hex)
+        else:
+            assert ruleset is not None  # narrowed by the exactly-one check
+            _require(ruleset.is_file(), f"--ruleset: no such file: {ruleset}")
+            full_hash, _hash128 = claude_worker.backtest.ruleset_hashes(ruleset)
+        state = claude_worker.state.State(cfg.db_path)
+        try:
+            client = claude_worker.uds.UdsClient(
+                cfg.ai_ingress_sock, cfg.ai_ingress_hmac_key, state
+            )
+            client.connect()
+            try:
+                client.send_heartbeat()
+                seq = claude_worker.backtest.commit_ruleset(state, client, full_hash)
+            finally:
+                client.close()
+        finally:
+            state.close()
+        typer.echo(f"committed {full_hash}")
+        typer.echo(f"sent kind=ruleset-commit seq={seq}")
         return EXIT_OK
 
     _guarded(run)

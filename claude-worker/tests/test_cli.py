@@ -13,6 +13,7 @@ import collections.abc
 import json
 import pathlib
 import shutil
+import sqlite3
 import time
 
 import httpx
@@ -598,3 +599,313 @@ def test_market_map_malformed_raises(tmp_path: pathlib.Path, payload: str) -> No
     path.write_text(payload)
     with pytest.raises(ValueError):
         claude_worker.cli.load_market_map(path)
+
+
+# ------------------------------------------------------- CLI surface (§11)
+
+
+def _command_names() -> set[str]:
+    names: set[str] = set()
+    for info in claude_worker.cli.app.registered_commands:
+        name = info.name
+        if name is None:
+            assert info.callback is not None
+            name = info.callback.__name__.replace("_", "-")
+        names.add(name)
+    return names
+
+
+def test_verb_surface_is_exactly_section_6() -> None:
+    assert _command_names() == {
+        "serve",
+        "fetch",
+        "backtest",
+        "push",
+        "positions",
+        "stage-ruleset",
+        "commit-ruleset",
+    }
+
+
+_OVERRIDE_TOKENS = ("--override", "--force", "--skip-gates", "--no-gates", "--bypass", "--unsafe")
+
+
+def test_no_override_flag_parses_anywhere() -> None:
+    """§11: the CLI-surface test — no override-shaped option exists on any
+    verb's parsed surface, and an explicit --override does not parse."""
+    for name in sorted(_command_names()):
+        result = _invoke(name, "--help")
+        assert result.exit_code == 0, (name, result.output)
+        for token in _OVERRIDE_TOKENS:
+            assert token not in result.output, (name, token)
+
+
+def test_stage_ruleset_override_flag_is_rejected(cli_env: pathlib.Path) -> None:
+    ruleset, _full = _mk_ruleset(cli_env)
+    result = _invoke("stage-ruleset", "--ruleset", str(ruleset), "--report", "r.json", "--override")
+    assert result.exit_code == 2, result.output
+
+
+# ------------------------------------------- stage-ruleset / commit-ruleset
+
+
+def _mk_passing_pair(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
+    """Ruleset + a gates-PASSED worker report written by the real
+    backtest library (canned harness stdout)."""
+    ruleset, full_hash = _mk_ruleset(tmp_path)
+    outcome = claude_worker.backtest.run_backtest(
+        ruleset, tmp_path, run_fn=lambda argv: _canned_report(full_hash)
+    )
+    assert outcome.all_passed
+    return ruleset, outcome.report_path, full_hash
+
+
+def _hash128_halves(full_hash: str) -> tuple[int, int]:
+    h128 = bytes.fromhex(full_hash)[:16]
+    px = int.from_bytes(h128[0:8], "little", signed=True)
+    qty = int.from_bytes(h128[8:16], "little", signed=True)
+    return px, qty
+
+
+def test_stage_ruleset_happy_records_and_sends_hash128(
+    uds_env: tests.conftest.FakeUdsServer, cli_env: pathlib.Path
+) -> None:
+    ruleset, report, full_hash = _mk_passing_pair(cli_env)
+    result = _invoke("stage-ruleset", "--ruleset", str(ruleset), "--report", str(report))
+    assert result.exit_code == 0, result.output
+    _wait_for_frames(uds_env, 2)
+    assert uds_env.cmd_field(0, "kind") == claude_worker.frames.KIND_HEARTBEAT
+    assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_RULESET_STAGE
+    px, qty = _hash128_halves(full_hash)
+    assert uds_env.cmd_field(1, "px") == px
+    assert uds_env.cmd_field(1, "qty") == qty
+    assert uds_env.cmd_field(1, "strategy_id") == claude_worker.frames.STRATEGY_SLOT_VM
+    assert uds_env.cmd_field(1, "venue") == claude_worker.frames.VENUE_AI
+    assert uds_env.cmd_field(1, "sym") == claude_worker.frames.SYMBOL_ID_NONE
+    assert f"staged {full_hash}" in result.output
+    state = claude_worker.state.State(cli_env / "state.db")
+    try:
+        row = state.ruleset_row(full_hash)
+    finally:
+        state.close()
+    assert row is not None
+    assert row[3] is True  # gates_passed
+    assert row[4] == "session"  # §8.7 attribution default for verbs
+    assert row[5] is not None  # staged_ts
+    assert row[6] is None  # not committed
+
+
+def test_stage_refusals_are_exit_3_and_send_no_payload(
+    uds_env: tests.conftest.FakeUdsServer, cli_env: pathlib.Path
+) -> None:
+    """§11 gate-refusal matrix: report missing / gates failed / schema
+    wrong / hash mismatch. Every case: exit 3, heartbeat only (no Stage
+    frame), no registry row."""
+    ruleset, full_hash = _mk_ruleset(cli_env)
+
+    # 1. report missing
+    result = _invoke(
+        "stage-ruleset", "--ruleset", str(ruleset), "--report", str(cli_env / "nope.json")
+    )
+    assert result.exit_code == 3, result.output
+
+    # 2. gates failed (real library-written failing report)
+    fail_outcome = claude_worker.backtest.run_backtest(
+        ruleset, cli_env, run_fn=lambda argv: _canned_report(full_hash, pnl=-5.0)
+    )
+    assert not fail_outcome.all_passed
+    result = _invoke(
+        "stage-ruleset", "--ruleset", str(ruleset), "--report", str(fail_outcome.report_path)
+    )
+    assert result.exit_code == 3, result.output
+
+    # 3. schema version wrong
+    bad_schema = cli_env / "bad-schema.json"
+    bad_schema.write_text(
+        json.dumps({"schema_version": 99, "ruleset_hash": full_hash, "gates": {"all_passed": True}})
+    )
+    result = _invoke("stage-ruleset", "--ruleset", str(ruleset), "--report", str(bad_schema))
+    assert result.exit_code == 3, result.output
+
+    # 4. hash mismatch: valid report, then the ruleset file changes
+    _ruleset2, report2, _full2 = _mk_passing_pair(cli_env)
+    with (cli_env / "rs.json").open("a") as fh:
+        fh.write("\n")
+    result = _invoke("stage-ruleset", "--ruleset", str(ruleset), "--report", str(report2))
+    assert result.exit_code == 3, result.output
+
+    time.sleep(0.05)  # any stray payload frame would still be in flight
+    kinds = {uds_env.cmd_field(i, "kind") for i in range(len(uds_env.frames))}
+    assert kinds == {claude_worker.frames.KIND_HEARTBEAT}  # heartbeats only
+    state = claude_worker.state.State(cli_env / "state.db")
+    try:
+        assert state.ruleset_row(full_hash) is None  # nothing was recorded
+    finally:
+        state.close()
+
+
+def test_stage_ruleset_bad_by_is_exit_2(cli_env: pathlib.Path) -> None:
+    ruleset, _full = _mk_ruleset(cli_env)
+    result = _invoke(
+        "stage-ruleset", "--ruleset", str(ruleset), "--report", "r.json", "--by", "operator"
+    )
+    assert result.exit_code == 2, result.output
+
+
+def test_commit_ruleset_happy_by_hash_then_by_file(
+    uds_env: tests.conftest.FakeUdsServer, cli_env: pathlib.Path
+) -> None:
+    ruleset, report, full_hash = _mk_passing_pair(cli_env)
+    assert (
+        _invoke("stage-ruleset", "--ruleset", str(ruleset), "--report", str(report)).exit_code == 0
+    )
+    result = _invoke("commit-ruleset", "--hash", full_hash)
+    assert result.exit_code == 0, result.output
+    _wait_for_frames(uds_env, 4)
+    assert uds_env.cmd_field(3, "kind") == claude_worker.frames.KIND_RULESET_COMMIT
+    px, qty = _hash128_halves(full_hash)
+    assert uds_env.cmd_field(3, "px") == px
+    assert uds_env.cmd_field(3, "qty") == qty
+    state = claude_worker.state.State(cli_env / "state.db")
+    try:
+        row = state.ruleset_row(full_hash)
+    finally:
+        state.close()
+    assert row is not None and row[6] is not None  # committed_ts stamped
+    # --ruleset variant resolves the same hash from file bytes.
+    result = _invoke("commit-ruleset", "--ruleset", str(ruleset))
+    assert result.exit_code == 0, result.output
+
+
+def test_commit_unstaged_hash_is_exit_3(
+    uds_env: tests.conftest.FakeUdsServer, cli_env: pathlib.Path
+) -> None:
+    result = _invoke("commit-ruleset", "--hash", "ab" * 32)
+    assert result.exit_code == 3, result.output
+    time.sleep(0.05)
+    kinds = {uds_env.cmd_field(i, "kind") for i in range(len(uds_env.frames))}
+    assert kinds <= {claude_worker.frames.KIND_HEARTBEAT}  # no Commit frame
+
+
+def test_commit_gates_failed_row_is_exit_3(
+    uds_env: tests.conftest.FakeUdsServer, cli_env: pathlib.Path
+) -> None:
+    """A staged-but-failed row cannot exist via the library (stage refuses
+    first) — simulate a corrupted registry with raw SQL and prove commit
+    still refuses."""
+    full_hash = "cd" * 32
+    claude_worker.state.State(cli_env / "state.db").close()  # create schema
+    conn = sqlite3.connect(str(cli_env / "state.db"))
+    with conn:
+        conn.execute(
+            "INSERT INTO rulesets (hash, path, gates_passed, author_mode, staged_ts)"
+            " VALUES (?, 'x.json', 0, 'session', 1)",
+            (full_hash,),
+        )
+    conn.close()
+    result = _invoke("commit-ruleset", "--hash", full_hash)
+    assert result.exit_code == 3, result.output
+
+
+def test_commit_arg_validation(cli_env: pathlib.Path) -> None:
+    assert _invoke("commit-ruleset").exit_code == 2
+    ruleset, _full = _mk_ruleset(cli_env)
+    assert _invoke("commit-ruleset", "--hash", "ab" * 32, "--ruleset", str(ruleset)).exit_code == 2
+    assert _invoke("commit-ruleset", "--hash", "zz").exit_code == 2
+
+
+# ---------------------------------------------------------------- positions
+
+
+def _mk_positions_run(
+    tmp_path: pathlib.Path, name: str = _RUN_NAME, truncate_fills: int = 0
+) -> pathlib.Path:
+    run_dir = _mk_run(tmp_path, name=name)
+    fills = _FIXTURES / "fills_v2.pmlr"
+    target = run_dir / "engine-fills.pmlr"
+    data = fills.read_bytes()
+    target.write_bytes(data[: len(data) - truncate_fills] if truncate_fills else data)
+    return run_dir
+
+
+def test_positions_golden_fills_json(cli_env: pathlib.Path) -> None:
+    """§11 positions row: golden fills fixture (Rust-writer bytes incl. a
+    HIP-4 yes/no pair) -> known positions/exposure/P&L."""
+    _mk_positions_run(cli_env)
+    _write_market_map(cli_env, pairs=[[67119674, 67119675]])
+    result = _invoke("positions", "--json")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["fills_torn"] is False
+    assert data["ticks_torn"] == []
+    positions_by_sym = {p["sym"]: p for p in data["positions"]}
+    assert sorted(positions_by_sym) == [7, 67119674, 67119675]
+    p7 = positions_by_sym[7]
+    assert p7["net_qty"] == pytest.approx(15.0)
+    assert p7["avg_px"] == pytest.approx(0.486667, abs=1e-6)
+    assert p7["mark_px"] == pytest.approx(0.51)
+    assert p7["realized_usd"] == pytest.approx(0.50)
+    assert p7["unrealized_usd"] == pytest.approx(0.35)
+    assert p7["exposure_usd"] == pytest.approx(7.65)
+    yes = positions_by_sym[67119674]
+    assert yes["net_qty"] == pytest.approx(8.0)
+    assert yes["unrealized_usd"] == pytest.approx(0.08)
+    assert yes["exposure_usd"] == pytest.approx(4.88)
+    assert len(data["hip4_pairs"]) == 1
+    pair = data["hip4_pairs"][0]
+    assert pair["yes_sym"] == 67119674 and pair["no_sym"] == 67119675
+    assert pair["net_qty"] == pytest.approx(3.0)
+    assert pair["flattened_qty"] == pytest.approx(5.0)
+    assert pair["exposure_usd"] == pytest.approx(1.83)
+    # HIP-4 netting: paired legs contribute the net-leg exposure only.
+    assert data["total_exposure_usd"] == pytest.approx(7.65 + 1.83)
+
+
+def test_positions_torn_fills_tail_tolerated(cli_env: pathlib.Path) -> None:
+    """Reader stops cleanly mid-flush (§11): a truncated final fill (the
+    no-leg buy) is ignored and flagged; the pair view degrades to a bare
+    yes leg."""
+    _mk_positions_run(cli_env, truncate_fills=10)
+    _write_market_map(cli_env, pairs=[[67119674, 67119675]])
+    result = _invoke("positions", "--json")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["fills_torn"] is True
+    positions_by_sym = {p["sym"]: p for p in data["positions"]}
+    assert sorted(positions_by_sym) == [7, 67119674]  # no-leg fill lost
+    pair = data["hip4_pairs"][0]
+    assert pair["net_qty"] == pytest.approx(8.0)
+    assert pair["flattened_qty"] == pytest.approx(0.0)
+    assert pair["exposure_usd"] == pytest.approx(4.88)
+    assert data["total_exposure_usd"] == pytest.approx(7.65 + 4.88)
+
+
+def test_positions_latest_and_explicit_run_dir(cli_env: pathlib.Path) -> None:
+    _mk_run(cli_env, name="run-1755216000000000000")  # older: ticks only
+    newer = _mk_positions_run(cli_env, name="run-1755216000000000001")
+    result = _invoke("positions", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["run_dir"] == str(newer)
+    result = _invoke("positions", "--run-dir", "latest", "--json")
+    assert json.loads(result.output)["run_dir"] == str(newer)
+    older = cli_env / "logs" / "run-1755216000000000000"
+    result = _invoke("positions", "--run-dir", str(older), "--json")
+    data = json.loads(result.output)
+    assert data["run_dir"] == str(older)
+    assert data["positions"] == []  # ticks-only run: no fills file
+    result = _invoke("positions", "--run-dir", str(cli_env / "missing"))
+    assert result.exit_code == 2
+
+
+def test_positions_human_output(cli_env: pathlib.Path) -> None:
+    _mk_positions_run(cli_env)
+    _write_market_map(cli_env, pairs=[[67119674, 67119675]])
+    result = _invoke("positions")
+    assert result.exit_code == 0, result.output
+    assert "sym 7  net 15.000000" in result.output
+    assert "hip4 67119674/67119675  net 3.000000" in result.output
+    assert "total exposure: 9.48 USD" in result.output
+
+
+def test_positions_no_runs_is_exit_2(cli_env: pathlib.Path) -> None:
+    assert _invoke("positions").exit_code == 2

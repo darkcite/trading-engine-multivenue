@@ -191,6 +191,76 @@ class State:
         self.cache_put(model, version_hash, content_hash, response)
         return response, False
 
+    # ---- ruleset registry (§5.3; consumers arrive with item 12) ----
+
+    def stage_ruleset(
+        self,
+        full_hash: str,
+        path: str,
+        report_path: str,
+        author_mode: str,
+        ts: int | None = None,
+    ) -> None:
+        """Record a gate-passed ruleset as STAGED (§6 stage-ruleset).
+
+        Caller (``backtest.stage_ruleset`` — the only path to a Stage
+        frame) has already enforced the gate binding; this row is the
+        worker-side registry entry. Re-staging the same hash refreshes
+        ``staged_ts`` and clears any earlier ``committed_ts`` (the engine
+        stub's staged/committed state machine mirrors this: a new Stage
+        supersedes an old Commit). ``author_mode`` rides the §8.7
+        attribution column ('session' from verbs, 'auto' from serve).
+        """
+        if author_mode not in ("auto", "session"):
+            raise StateError(f"author_mode must be 'auto' or 'session': {author_mode!r}")
+        stamp = int(time.time()) if ts is None else ts
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO rulesets"
+                " (hash, path, report_path, gates_passed, author_mode, staged_ts, committed_ts)"
+                " VALUES (?, ?, ?, 1, ?, ?, NULL)"
+                " ON CONFLICT(hash) DO UPDATE SET"
+                " path = excluded.path, report_path = excluded.report_path,"
+                " gates_passed = 1, author_mode = excluded.author_mode,"
+                " staged_ts = excluded.staged_ts, committed_ts = NULL",
+                (full_hash, path, report_path, author_mode, stamp),
+            )
+
+    def ruleset_row(
+        self, full_hash: str
+    ) -> tuple[str, str, str | None, bool, str | None, int | None, int | None] | None:
+        """One registry row as ``(hash, path, report_path, gates_passed,
+        author_mode, staged_ts, committed_ts)``, or None."""
+        row = self._conn.execute(
+            "SELECT hash, path, report_path, gates_passed, author_mode,"
+            " staged_ts, committed_ts FROM rulesets WHERE hash = ?",
+            (full_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row[0]),
+            str(row[1]),
+            None if row[2] is None else str(row[2]),
+            bool(row[3]),
+            None if row[4] is None else str(row[4]),
+            None if row[5] is None else int(row[5]),
+            None if row[6] is None else int(row[6]),
+        )
+
+    def mark_ruleset_committed(self, full_hash: str, ts: int | None = None) -> None:
+        """Stamp ``committed_ts`` on an existing row (after the Commit
+        frame went out — send-then-record, so a failed send never leaves
+        a phantom commit in the registry)."""
+        stamp = int(time.time()) if ts is None else ts
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE rulesets SET committed_ts = ? WHERE hash = ?",
+                (stamp, full_hash),
+            )
+        if cur.rowcount != 1:
+            raise StateError(f"mark_ruleset_committed: no registry row for {full_hash}")
+
     # ---- event log (§5.3 + §3 capture amendment) ----
 
     def record_event(self, kind: str, detail: str, ts_ns: int | None = None) -> int:
