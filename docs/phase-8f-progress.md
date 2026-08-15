@@ -1354,3 +1354,122 @@ operator-gated live demo). If context runs short: write interim
 state + exact resume point + relaunch prompt into
 docs/phase-8f-progress.md, then tell me.
 ```
+
+## 2026-08-15 — Session S7 (items 16–17: RSS removal + final gates) — 8f CLOSING ENTRY
+
+### Item 16 — RSS removal: DONE (ONE commit, `d9da2b1`)
+
+The §9.3 sweep, executed exactly; workspace green before the commit:
+
+- Deleted `crates/ingress-rss/` (5 files incl. proptest-regressions),
+  `crates/strategy-news/` (corpse — was already not a workspace member;
+  the root-Cargo.toml explanatory NOTE about it dies too), and
+  `fuzz/fuzz_targets/rss_item.rs` + its `fuzz/Cargo.toml` `[[bin]]` +
+  dep entries. Both Cargo.locks pruned in the same commit (fuzz lock
+  via `cargo check` inside `fuzz/`).
+- `paper.rs` (the ~76-ref surface; grep's "94" included nine
+  `Counte(rsS)napshot` case-insensitive false-positives):
+  `Rings.rss_signal` + init, `Consumers.rss_signal` + engine-loop
+  destructure, `spawn_rss` + `RssFeed` (struct + `parse`),
+  `IngressStatusSet.rss` (doc: seven → six slots),
+  `DrainCounters.rss_signals` (+ `add`, cli drain block, 5s-summary
+  field, unit tests), engine-loop RSS drain + `rss_seen_*` accounting,
+  `engine_rss_signals_total` counter + `engine_ingress_rss_state`
+  gauge (registration + ids-struct fields + mirror sites),
+  `EngineLoopStats.rss_signals_drained`, thread-table T4 row →
+  `ingress-ai`.
+- `core-config`: `rss_feeds_csv` field + doc, the `RSS_FEEDS` boot
+  read, and the `rss_feeds()` iterator — gone. The worker keeps the
+  env key; `.env.example` / `config.example.toml` untouched (item-15
+  annotations already forward-referenced this commit).
+- bin (`multivenue-engine.rs`): RSS boot block, ring split,
+  `Consumers` wiring, module-doc mention — gone.
+- **Core 4 → `ingress-ai`**: `spawn_ai` gained `core_id: usize`
+  (venue-wrapper parameter order; bin passes literal `4`, matching the
+  old `spawn_rss` call style) and `log_pin_outcome("ai", core_id)` as
+  the first on-thread statement; the "unpinned until item 16" doc
+  paragraph is now "core 4 per the §9 core map (freed by the 8f
+  item-16 RSS removal)".
+- `.claude/agents/parser-property-tester.md` scope: `ingress-rss` →
+  `ingress-ai` (in-place token swap).
+- Reservations honored: `SignalSource::Rss = 1` stays; snapshot
+  `ingest_health` bit 3 stays reserved (comment marks it retired /
+  always 0; OKX/Deribit/HL keep bits 4–6 — bits never renumber);
+  `raw_tap_flags_rejects_rss_label` kept, reworded as a retired-label
+  regression guard.
+
+### S7 deviations (recorded for review)
+
+1. **CLAUDE.md + README one-word fixes (outside the §9.3 list):**
+   both directory guides enumerated `rss` in their ingress-crate
+   lists; leaving a deleted crate named in the repo guides, inside the
+   very commit that deletes it, seemed worse than the scope stretch.
+   Two tokens dropped; recorded here and in the commit message.
+2. **Comment-only mentions left in place (§9.3 scope discipline; 8g
+   tidy candidates):** `core-net` (http1/lib/transport docs;
+   `NetworkSource::Rss = 3` — append-only ABI, same reservation logic
+   as `SignalSource`), `core-parse` module doc, `core-types`
+   Slow-class/Signal docs, `tui` (bit-3 doc + per-bit label array —
+   bits never renumber; a retired `rss` row rendering Down is honest),
+   `strategy-latency-arb` `on_signal` doc, `ingress-polymarket` fnv
+   comment.
+3. **False-green guard:** the first post-edit `cargo check
+   --workspace` "finished" in 0.93 s because RustRover's background
+   check had already consumed the earlier edits incrementally. Treated
+   per pitfall #10's spirit: `cargo clean -p cli -p core-config -p
+   bench`, then full re-check + targeted nextest from cold for the
+   touched crates before declaring green. Notably, NO stale-rmeta
+   errors surfaced this session despite the tree-ectomy.
+4. **`fuzz/Cargo.lock` regenerated inside item 16** (not deferred to
+   item 17) so the single commit leaves the fuzz workspace consistent.
+
+### Item 17 — final gates: ALL GREEN (Mac, on `d9da2b1`)
+
+| gate | result |
+|---|---|
+| `cargo nextest run --workspace` | **942/942** passed, 0 skipped |
+| release alloc assertions `--test-threads=1` | **33/33**, 0 B/op — count dropped 35 → 33, exactly the 2 removed RSS gates |
+| fuzz targets `cargo check` | clean (time-boxed runs remain on operator go) |
+| `claude-worker` `uv run pytest` | **202/202** (worker RSS surface `feeds.py` untouched, as scoped) |
+| `ruff format --check` / `ruff check` / `mypy src tests` (strict via pyproject) | 33 files formatted / all checks passed / 31 source files clean |
+
+### §1 / §12 exit-criteria status
+
+- [x] **RSS fully deleted** — `d9da2b1`.
+- [x] **Both modes proven in tests** — full-auto serve loop (item-11
+  serve-loop test) and scripted semi-manual verb session (item-13
+  `test_session_scripted.py`), each against the fake UDS server; zero
+  SDK construction outside `serve`.
+- [x] **Heartbeat/staleness proven** — §5.4 semantics: worker
+  heartbeat cadence + verb implicit heartbeats (S5/S6 suites),
+  engine-side TTL-on-pop + staleness fail-safe (item-6 engine tests) —
+  all re-run green today inside the workspace gate.
+- [ ] **AI cmd → strategy toggle observed live** — DELIBERATELY OPEN:
+  operator-gated (explicit go + `pgrep` clean, after the soak).
+  Everything short of the live socket is proven.
+
+### Push anomaly (S4–S7)
+
+Local `origin/main` still reads `38e599b` (unchanged since the S6
+reading); no pushes and no fetches this session. `main` is locally
+ahead by the five S6 commits + `d9da2b1` + this closing commit.
+Recorded, never acted on.
+
+### Resume point / what's left (this doubles as the §12.2 handoff)
+
+**Phase 8f is code-complete and gate-green.** Remaining, in order:
+
+1. **Operator-gated live AI-cmd demo** (runbook, NOT run this
+   session): `pgrep -fl multivenue-engine` clean → boot paper mode
+   with `AI_INGRESS_HMAC_KEY` set → drive the §6 strategy
+   enable/disable push verb from `claude-worker` → observe
+   `engine_ai_*` counters + the strategy-mask flip → SIGINT →
+   `audit-replay` the run's `ai-cmds.pmlr`. Only on explicit operator
+   go.
+2. **8g kickoff** needs its own design pass first: ruleset JSON
+   bounds-check + double-buffered table flip (item-14 deferrals),
+   `strategy-vm` evaluation, plus the comment-tidy list in deviation
+   2 above.
+
+No open defects. `.env` untouched; no push / rebase / branch /
+history ops; Python worker untouched in item 16.
