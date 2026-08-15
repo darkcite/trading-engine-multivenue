@@ -22,7 +22,10 @@ import shutil
 import socket
 import tempfile
 import threading
+import types
+import typing
 
+import anthropic.types
 import pytest
 
 import claude_worker.frames
@@ -129,6 +132,44 @@ class FakeUdsServer:
         }
         off, size, signed = offsets[name]
         return int.from_bytes(cmd[off : off + size], "little", signed=signed)
+
+
+class _FakeMessages:
+    """Programmed ``messages.create`` double (§9.1 carried pattern)."""
+
+    def __init__(self, respond: typing.Callable[[str, str], str]) -> None:
+        self._respond = respond
+        self.calls: list[tuple[str, str]] = []
+
+    def create(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        messages: list[dict[str, str]],
+    ) -> types.SimpleNamespace:
+        del max_tokens
+        prompt = messages[0]["content"]
+        self.calls.append((model, prompt))
+        block = anthropic.types.TextBlock(
+            type="text", text=self._respond(model, prompt), citations=None
+        )
+        return types.SimpleNamespace(content=[block])
+
+
+class FakeClient:
+    """SDK-shaped double for the ``llm.py`` seam: tests monkeypatch
+    ``claude_worker.llm.make_client`` to return one of these. Real
+    ``anthropic.types.TextBlock`` instances keep ``llm.complete``'s
+    isinstance narrowing honest; no network anywhere."""
+
+    def __init__(self, respond: typing.Callable[[str, str], str]) -> None:
+        self.messages = _FakeMessages(respond)
+
+    @property
+    def calls(self) -> list[tuple[str, str]]:
+        """(model, prompt) pairs, in call order."""
+        return self.messages.calls
 
 
 def short_sock_dir() -> pathlib.Path:
