@@ -28,6 +28,7 @@ strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-cross-arb   = { workspace = true }
 strategy-rule-tree   = { workspace = true }
+strategy-set         = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
 book-builder         = { workspace = true }
@@ -41,6 +42,7 @@ ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-rpc          = { workspace = true }
 ingress-rss          = { workspace = true }
+ingress-ai           = { workspace = true }
 clap                 = { workspace = true }
 tracing              = { workspace = true }
 tracing-subscriber   = { workspace = true }

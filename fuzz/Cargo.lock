@@ -55,6 +55,14 @@ name = "core-crypto"
 version = "0.1.0"
 
 [[package]]
+name = "core-io"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+ "libc",
+]
+
+[[package]]
 name = "core-metrics"
 version = "0.1.0"
 
@@ -126,6 +134,19 @@ dependencies = [
  "libc",
  "r-efi",
  "wasip2",
+]
+
+[[package]]
+name = "ingress-ai"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-io",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "libc",
+ "mio",
 ]
 
 [[package]]
@@ -287,6 +308,8 @@ dependencies = [
  "clob-dispatcher",
  "core-net",
  "core-parse",
+ "core-types",
+ "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
  "ingress-hyperliquid",

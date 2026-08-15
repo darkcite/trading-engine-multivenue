@@ -12,6 +12,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 
 # Workspace crates under test.
+ingress-ai         = { path = "../crates/ingress-ai" }
+core-types         = { path = "../crates/core-types" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
 ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
@@ -23,6 +25,13 @@ core-net           = { path = "../crates/core-net" }
 core-parse         = { path = "../crates/core-parse" }
 signer-eip712      = { path = "../crates/signer-eip712" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
+
+[[bin]]
+name   = "ai_cmd_frame"
+path   = "fuzz_targets/ai_cmd_frame.rs"
+test   = false
+doc    = false
+bench  = false
 
 [[bin]]
 name   = "polymarket_clob_frame"

@@ -445,6 +445,64 @@ mod tests {
     }
 
     #[test]
+    fn reader_roundtrips_ai_cmds() {
+        // 8f: SlotKind::AiCmd = 4 decodes end-to-end — write two
+        // shape-valid commands, mmap them back, revalidate.
+        let p = unique_path("aicmds");
+        let _ = std::fs::remove_file(&p);
+
+        let mut w = PmlrWriter::open(&p, SlotKind::AiCmd, 7).unwrap();
+        let hb = core_types::AiCmd::new(
+            1_000,
+            1,
+            core_types::SYMBOL_ID_NONE,
+            0,
+            0,
+            0,
+            core_types::AiCmdKind::Heartbeat,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_NONE,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        );
+        let fv = core_types::AiCmd::new(
+            2_000,
+            2,
+            core_types::make_symbol_id(VenueId::Polymarket, 9),
+            750_000,
+            0,
+            5_000_000_000,
+            core_types::AiCmdKind::SetFairValue,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_NONE,
+            core_types::AI_SIDE_NONE,
+            0,
+            core_types::AI_CMD_FLAG_EXPIRE_ON_SILENCE,
+        );
+        w.append(&hb).unwrap();
+        w.append(&fv).unwrap();
+        w.flush().unwrap();
+        drop(w);
+
+        let r = PmlrReader::<core_types::AiCmd>::open(&p).unwrap();
+        assert_eq!(r.slot_kind(), SlotKind::AiCmd);
+        assert_eq!(r.epoch_ns(), 7);
+        assert_eq!(r.len(), 2);
+        let got = r.records();
+        assert_eq!(got[0].kind(), Some(core_types::AiCmdKind::Heartbeat));
+        assert_eq!(got[0].seq, 1);
+        assert_eq!(got[0].validate_shape(), Ok(()));
+        assert_eq!(got[1].kind(), Some(core_types::AiCmdKind::SetFairValue));
+        assert_eq!(got[1].px, 750_000);
+        assert_eq!(got[1].ttl_ns, 5_000_000_000);
+        assert_eq!(got[1].flags, core_types::AI_CMD_FLAG_EXPIRE_ON_SILENCE);
+        assert_eq!(got[1].validate_shape(), Ok(()));
+        drop(r);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn reader_rejects_bad_magic() {
         let p = unique_path("badmagic");
         let _ = std::fs::remove_file(&p);

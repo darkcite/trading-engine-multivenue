@@ -27,7 +27,7 @@
 )]
 
 use core_time::NsTs;
-use core_types::{Fill, Order, Signal, Tick};
+use core_types::{AiCmd, Fill, Order, Signal, Tick};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -93,10 +93,20 @@ pub trait StrategyCounters {
     ///
     /// Implementors should return a stable static string. Each
     /// in-tree strategy overrides this — `"latency-arb"`, `"ev"`,
-    /// `"cross-arb"`, `"rule-tree"`.
+    /// `"cross-arb"`, `"rule-tree"`, `"set"`.
     #[inline]
     fn strategy_kind(&self) -> &'static str {
         "unknown"
+    }
+
+    /// Cumulative refused AI `EnableStrategy` commands (Phase 8f §7).
+    /// Only `strategy-set` refuses enables, so the default is 0 for
+    /// every plain strategy; the cli mirrors this into
+    /// `engine_ai_enable_refused_total` generically (monomorphized —
+    /// no set-specific plumbing in the engine loop).
+    #[inline]
+    fn ai_enable_refused(&self) -> u64 {
+        0
     }
 }
 
@@ -213,6 +223,20 @@ pub trait Strategy: StrategyCounters {
 
     /// Called once per Fill popped from the fill ring.
     fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C);
+
+    /// Called once per accepted [`AiCmd`] popped from the AI command
+    /// ring (Phase 8f §4.3). The engine has already dropped
+    /// TTL-expired commands and re-validated the shape at the drain
+    /// site, so implementations may trust `cmd` structurally.
+    ///
+    /// Defaulted to a no-op so existing strategies compile and behave
+    /// unchanged; `strategy-set` (item 7) consumes Enable/Disable/
+    /// Halt at the set level and `strategy-ai-exec` (item 8) consumes
+    /// the rest. Monomorphized like every other callback — no `dyn`.
+    #[inline]
+    fn on_ai<C: Ctx>(&mut self, cmd: &AiCmd, ctx: &mut C) {
+        let _ = (cmd, ctx);
+    }
 
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.

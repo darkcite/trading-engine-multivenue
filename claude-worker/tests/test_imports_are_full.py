@@ -1,11 +1,11 @@
 """Enforces the codebase rule: full ``import x`` only — never ``from x import y``.
 
-This test walks every .py file under ``src/claude_worker/`` and ``tests/``,
-tokenizes it, and fails if it sees a ``from X import Y`` statement.
+Walks every .py file under ``src/claude_worker/`` and ``tests/``, parses it,
+and fails on any ``from X import Y`` statement. The only exception is
+``from __future__ import annotations`` (a compiler directive, not an import).
 
-The only exceptions allowed are ``from __future__ import annotations``
-(which is a compiler directive, not a real import). There are none today,
-but the check allows it so it doesn't silently break later.
+Carried forward in spirit from the pre-8f worker (design §9.1), including
+the dir-exists guard against silently scanning nothing.
 
 Convention: full ``import x`` only. No ``from x import y``.
 """
@@ -13,12 +13,13 @@ Convention: full ``import x`` only. No ``from x import y``.
 import ast
 import pathlib
 
-
 _ROOT: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
 _SEARCH_DIRS: tuple[pathlib.Path, ...] = (
     _ROOT / "src" / "claude_worker",
     _ROOT / "tests",
 )
+# Fewer scanned files than this means the scan itself is broken.
+_MIN_EXPECTED_PY_FILES: int = 4
 
 
 def _all_py_files() -> list[pathlib.Path]:
@@ -56,4 +57,4 @@ def test_search_dirs_actually_exist() -> None:
     """Guard against the import-style test silently passing because no files
     exist to scan (e.g. after a directory rename)."""
     found = _all_py_files()
-    assert len(found) >= 4, f"expected to find Python files, got {found}"
+    assert len(found) >= _MIN_EXPECTED_PY_FILES, f"expected to find Python files, got {found}"

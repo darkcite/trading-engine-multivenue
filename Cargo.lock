@@ -139,6 +139,7 @@ dependencies = [
  "criterion",
  "dhat",
  "engine",
+ "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
  "ingress-hyperliquid",
@@ -153,6 +154,7 @@ dependencies = [
  "strategy-ev",
  "strategy-latency-arb",
  "strategy-rule-tree",
+ "strategy-set",
  "tui",
 ]
 
@@ -313,6 +315,7 @@ dependencies = [
  "core-time",
  "core-types",
  "engine",
+ "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
  "ingress-hyperliquid",
@@ -330,6 +333,7 @@ dependencies = [
  "strategy-ev",
  "strategy-latency-arb",
  "strategy-rule-tree",
+ "strategy-set",
  "tracing",
  "tracing-subscriber",
  "tui",
@@ -623,10 +627,12 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "clob-dispatcher",
+ "core-io",
  "core-latency",
  "core-ring",
  "core-time",
  "core-types",
+ "ingress-ai",
  "strategy-core",
 ]
 
@@ -783,6 +789,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "ingress-ai"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "core-io",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "libc",
+ "mio 0.8.11",
+ "proptest",
 ]
 
 [[package]]
@@ -1724,6 +1744,19 @@ dependencies = [
  "memchr",
  "research-artifacts",
  "strategy-core",
+]
+
+[[package]]
+name = "strategy-set"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "core-types",
+ "strategy-core",
+ "strategy-cross-arb",
+ "strategy-ev",
+ "strategy-latency-arb",
+ "strategy-rule-tree",
 ]
 
 [[package]]

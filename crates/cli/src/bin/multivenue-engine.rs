@@ -22,9 +22,9 @@ use std::sync::atomic::AtomicBool;
 use clap::Parser;
 use cli::{
     engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
-    engine_loop_rule_tree_full, install_sigint_handler, join_reverse, spawn_binance,
-    spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, Consumers,
-    EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings,
+    engine_loop_rule_tree_full, engine_loop_set_full, install_sigint_handler, join_reverse,
+    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
+    Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings,
     StrategyPair, WssEndpoint, SHUTDOWN,
 };
 use core_config::{Config, Secrets};
@@ -154,6 +154,9 @@ struct RunArgs {
     /// Strategy selector. `latency-arb` (default) uses Binance →
     /// Polymarket cross-venue arbitrage. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
+    /// `all` (Phase 8f) runs the composed StrategySet: every built
+    /// member whose config flags are present, AI-toggleable at
+    /// runtime; paper-only until 8i.
     #[arg(long, default_value = "latency-arb")]
     strategy: String,
     /// Path to claude-worker NDJSON tag artifacts. Required when
@@ -552,6 +555,13 @@ fn run(args: RunArgs) -> ExitCode {
         let (_f3p, f3) = rings.fill[3].clone().split();
         [f0, f1, f2, f3]
     };
+    // AI command lane (Phase 8f). The producer half feeds the
+    // `ingress-ai` thread (spawned below, gated on
+    // AI_INGRESS_HMAC_KEY); when the key is absent the producer is
+    // dropped and the engine's AI lane reads permanently empty — the
+    // §3.3 unspawned shape.
+    let (ai_prod, ai_lane_cons) = rings.ai.clone().split();
+    let ai_status = std::sync::Arc::new(cli::AiIngressStatus::new());
 
     // -- Per-ingress status slots (D7) --
     let statuses = std::sync::Arc::new(cli::IngressStatusSet::new());
@@ -830,6 +840,60 @@ fn run(args: RunArgs) -> ExitCode {
         handles.push(rss_handle);
     }
 
+    // -- AI-command ingress (Phase 8f; opt-in via AI_INGRESS_HMAC_KEY
+    // in .env) --
+    // Key semantics: ABSENT/empty ⇒ thread not started (back-compat
+    // with pre-8f .env files); PRESENT but unparseable ⇒ fatal boot
+    // error — a typo'd key must never silently disable the AI lane.
+    // The parsed key is moved into the thread and never logged.
+    match std::env::var("AI_INGRESS_HMAC_KEY") {
+        Ok(hex) if !hex.trim().is_empty() => match cli::parse_ai_hmac_key(&hex) {
+            Ok(key) => {
+                info!(sock = %cfg.ai_ingress_sock, "ingress-ai: starting thread");
+                let ai_handle = match cli::spawn_ai(
+                    PathBuf::from(&cfg.ai_ingress_sock),
+                    key,
+                    ai_prod,
+                    ai_status.clone(),
+                    &run_dir,
+                    epoch_ns,
+                    capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_ai)),
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(error = ?e, "ingress-ai: capture open failed");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                };
+                handles.push(ai_handle);
+            }
+            Err(reason) => {
+                // `reason` is a static description; no key material.
+                error!(reason, "AI_INGRESS_HMAC_KEY present but invalid — refusing to boot");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        },
+        _ => {
+            info!("AI_INGRESS_HMAC_KEY unset; ingress-ai thread not started");
+            drop(ai_prod);
+        }
+    }
+
+    // -- Engine-thread fills capture (Phase 8f item 6) --
+    // engine-fills.pmlr in the per-run capture directory: the
+    // positions/P&L feed for the research loop. Open failure is a
+    // fatal boot error (§6.5 stance: capture is the product).
+    let obs = match cli::open_fills_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_fills_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "fills capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
+
     // -- Main thread: real engine loop until SIGINT --
     let cons = Consumers {
         tick_lanes: [
@@ -842,6 +906,8 @@ fn run(args: RunArgs) -> ExitCode {
         rpc_signal: rpc_cons,
         rss_signal: rss_cons,
         fill_lanes: fill_lane_cons,
+        ai_cmds: ai_lane_cons,
+        ai_status,
     };
     let engine_cfg = EngineConfig {
         pairs: vec![StrategyPair {
@@ -1006,6 +1072,52 @@ fn run(args: RunArgs) -> ExitCode {
                     path,
                 )
             }
+        }
+        ("all", _live) => {
+            // Phase 8f item 7: the composed StrategySet. `all` means
+            // "every built member the given flags can boot" —
+            // latency-arb from the mandatory pair flags, ev/cross-arb/
+            // rule-tree only when their config flags are present
+            // (members without config boot inert; see
+            // engine_loop_set_full docs). PAPER-only until the 8i
+            // RiskGate lands — the composed set has no live arm.
+            let requested = strategy_set::mask_for_name("all").expect("'all' is a valid mask name");
+            let ev_path = args.artifacts_path.clone();
+            let owned_groups: Vec<Vec<core_types::SymbolId>> = match args.groups.as_deref() {
+                Some(spec) => spec
+                    .split(';')
+                    .map(|grp| {
+                        grp.split(',')
+                            .filter_map(|s| s.trim().parse::<u32>().ok())
+                            .collect()
+                    })
+                    .filter(|v: &Vec<u32>| !v.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
+            let groups_ref: Vec<&[core_types::SymbolId]> =
+                owned_groups.iter().map(|v| v.as_slice()).collect();
+            // Rule mapping: same v1 shape as the standalone rule-tree
+            // arm (every rule → --polymarket-sym-id, "halving" kw).
+            let mut kw = [0u8; 16];
+            let n = b"halving".len().min(16);
+            kw[..n].copy_from_slice(&b"halving"[..n]);
+            let mapping = vec![(args.polymarket_sym_id, kw, n as u8)];
+            let rules = args
+                .rules_path
+                .as_deref()
+                .map(|rp| (rp, mapping.as_slice()));
+            info!("running strategy-set PAPER — no orders will be submitted");
+            engine_loop_set_full(
+                cons,
+                engine_cfg,
+                clob_dispatcher::PaperDispatcher::new(),
+                obs,
+                requested,
+                ev_path.as_deref(),
+                &groups_ref,
+                rules,
+            )
         }
         (other, _) => {
             error!(strategy = other, "unknown --strategy value");

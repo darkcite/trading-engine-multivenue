@@ -1,0 +1,23 @@
+[package]
+name         = "ingress-ai"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "AI-command UDS ingress: mio listener, HMAC-tagged 82-B frames, SPSC ring producer (Phase 8f §4)"
+
+[dependencies]
+core-types  = { workspace = true }
+core-crypto = { workspace = true }
+core-io     = { workspace = true }
+core-ring   = { workspace = true }
+core-time   = { workspace = true }
+mio         = { workspace = true }
+# Peer-credential getsockopt (LOCAL_PEERCRED / SO_PEERCRED) + geteuid.
+# Same individual pin as core-time / core-io / cli.
+libc = "0.2"
+
+[dev-dependencies]
+proptest = { workspace = true }

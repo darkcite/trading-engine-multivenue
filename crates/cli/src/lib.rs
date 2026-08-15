@@ -40,13 +40,15 @@ pub mod sigint;
 pub use paper::{
     boot_discovery, build_deribit_symbol_table, build_hl_coin_table, build_okx_symbol_table,
     drain_and_count_loop, engine_loop, engine_loop_cross_arb_full, engine_loop_ev_full,
-    engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full, engine_loop_with,
-    join_reverse, new_capture_run_dir, parse_raw_tap_flags, signal_shutdown, spawn_binance,
-    spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, spawn_rss,
-    split_host_port, CaptureGaugeIds, CaptureMetrics, Consumers, DrainCounters, EngineConfig,
-    EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds, IngressStatusSet,
-    LatencyDump, LiveDispatcher, LiveDispatcherErr, Observability, RawTapConfig, Rings, RssFeed,
-    StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full, engine_loop_set_full,
+    engine_loop_with,
+    join_reverse, new_capture_run_dir, open_fills_capture, parse_ai_hmac_key, parse_raw_tap_flags,
+    signal_shutdown, spawn_ai, spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx,
+    spawn_polymarket, spawn_rpc, spawn_rss, split_host_port, AiIngressCounterIds, AiIngressStatus,
+    CaptureGaugeIds, CaptureMetrics, Consumers, DrainCounters,
+    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds,
+    IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, Observability, RawTapConfig,
+    Rings, RssFeed, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

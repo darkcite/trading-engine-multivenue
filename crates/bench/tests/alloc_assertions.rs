@@ -34,6 +34,7 @@ use ingress_polymarket::run_loop::{
 use ingress_rpc::{
     parse_block_number_result, parse_new_head_notification, write_request_eth_block_number,
 };
+use ingress_ai::{admit_frame, pack_frame, AiCmdCapture, AiIngressStatus, FrameVerdict, SeqPolicy};
 use ingress_rss::{feed_items, fnv1a_64, SeenRing};
 
 /// Push/pop a Tick through the SPSC ring 10_000 times — must not
@@ -1250,6 +1251,10 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    // Phase 8f: the AI lane rides in every engine; producer-dropped
+    // here so it reads empty (two atomic loads per iteration inside
+    // the measured window — part of the real tick cost).
+    let (_aip, ai_c) = Ring::<core_types::AiCmd, { core_types::AI_RING_SIZE }>::new().split();
 
     let mut eng = Engine::new(
         NoopStrat,
@@ -1257,6 +1262,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         [t0, t1, t2, t3, t4],
         sc,
         [f0, f1, f2, f3],
+        ai_c,
+        std::sync::Arc::new(AiIngressStatus::new()),
     );
     eng.start().unwrap();
 
@@ -2118,6 +2125,267 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     assert_eq!(capture.io_errors(), 0);
     assert_eq!(capture.tap_dropped(), 0);
     assert!(capture.ticks_written() > 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
+}
+
+/// 8f item 5 (design §11 alloc gate): the full AI-ingress frame path —
+/// pack (client side of the loopback), then accept → HMAC verify →
+/// shape check → seq policy → ts rewrite → capture → try_push — must
+/// allocate ZERO bytes per frame after boot. 10 000 frames; consumer
+/// pops in lockstep so the ring never saturates (`ring_drops` stays 0
+/// and the push path is exercised end-to-end).
+#[test]
+fn ai_ingress_admit_frame_is_zero_alloc() {
+    use core_types::{
+        AiCmd, AiCmdKind, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE,
+    };
+
+    // Boot (allocation allowed): ring, capture sink, status slot.
+    let ring: std::sync::Arc<Ring<AiCmd, { core_types::AI_RING_SIZE }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let cap_dir = std::env::temp_dir().join(format!(
+        "stage2_alloc_ai_ingress_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = AiCmdCapture::open(&cap_dir, 1).unwrap();
+    let status = AiIngressStatus::new();
+    let mut seq = SeqPolicy::new();
+    let key = [0x77u8; 32];
+    let mut frame = [0u8; ingress_ai::FRAME_LEN];
+    let mut seam_hits = 0u64;
+    let mut seam = |_c: &AiCmd| seam_hits += 1;
+
+    const CYCLES: u32 = 10_000;
+    let mut acc: u64 = 0;
+
+    let g = AllocGuard::new();
+    let mut i = 1u32;
+    while i <= CYCLES {
+        let cmd = AiCmd::new(
+            u64::from(i), // worker ts — rewritten on accept
+            i,
+            SYMBOL_ID_NONE,
+            0,
+            0,
+            0,
+            AiCmdKind::Heartbeat,
+            VenueId::Ai,
+            STRATEGY_SLOT_NONE,
+            AI_SIDE_NONE,
+            0,
+            0,
+        );
+        pack_frame(&key, &cmd, &mut frame);
+        let v = admit_frame(
+            &frame,
+            &key,
+            &mut seq,
+            &mut prod,
+            &mut capture,
+            &status,
+            &mut seam,
+            u64::from(i) + 1_000_000,
+        );
+        assert!(matches!(v, FrameVerdict::Accepted));
+        let popped = cons.try_pop().unwrap();
+        acc = acc.wrapping_add(popped.ts_ns);
+        i += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(status.cmds(), u64::from(CYCLES));
+    assert_eq!(status.hmac_fail(), 0);
+    assert_eq!(status.protocol_err(), 0);
+    assert_eq!(status.malformed(), 0);
+    assert_eq!(status.seq_gap(), 0);
+    assert_eq!(status.seq_regress(), 0);
+    assert_eq!(status.ring_drops(), 0);
+    assert_eq!(seam_hits, 0);
+    assert_eq!(capture.records(), u64::from(CYCLES));
+    assert!(!capture.is_disabled());
+    assert_eq!(
+        allocs, 0,
+        "ai ingress frame path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ai ingress frame path bytes should be zero: saw {bytes}");
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
+}
+
+/// Phase 8f item 7: StrategySet fan-out steady state — mask-gated
+/// member dispatch (ticks through a configured latency-arb member,
+/// AI heartbeat fan-out, an Enable/Disable round trip) must allocate
+/// nothing after boot. The ai-exec on_tick/on_ai gate arrives with
+/// item 8.
+#[test]
+fn strategy_set_fanout_is_zero_alloc() {
+    use core_types::{
+        AiCmd, AiCmdKind, Order, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE,
+    };
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_set::{StrategySet, BIT_LATENCY_ARB, SLOT_LATENCY_ARB};
+
+    struct CountCtx {
+        submitted: u64,
+        now: u64,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            self.submitted += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    // Boot (allocation allowed): configure the latency-arb member.
+    let mut set = StrategySet::new(BIT_LATENCY_ARB);
+    set.latency_arb_mut().add_pair(11, 22).unwrap();
+    set.latency_arb_mut().set_cooldown_ns(0);
+    let mut ctx = CountCtx {
+        submitted: 0,
+        now: 1_000_000_000_000,
+    };
+    set.on_start(&mut ctx).unwrap();
+
+    let bn = Tick::new(
+        0,
+        VenueId::Binance,
+        22,
+        1,
+        Price::from_raw(490_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(510_000),
+        Qty::from_raw(1_000_000),
+    );
+    let pm = Tick::new(
+        0,
+        VenueId::Polymarket,
+        11,
+        1,
+        Price::from_raw(390_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(410_000),
+        Qty::from_raw(1_000_000),
+    );
+    let hb = AiCmd::new(
+        1,
+        1,
+        SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        AiCmdKind::Heartbeat,
+        VenueId::Ai,
+        STRATEGY_SLOT_NONE,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+    let disable = AiCmd::new(
+        1,
+        2,
+        SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        AiCmdKind::DisableStrategy,
+        VenueId::Ai,
+        SLOT_LATENCY_ARB,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+    let enable = AiCmd::new(
+        1,
+        3,
+        SYMBOL_ID_NONE,
+        0,
+        0,
+        0,
+        AiCmdKind::EnableStrategy,
+        VenueId::Ai,
+        SLOT_LATENCY_ARB,
+        AI_SIDE_NONE,
+        0,
+        0,
+    );
+
+    const CYCLES: u32 = 10_000;
+    let g = AllocGuard::new();
+    let mut i = 0u32;
+    while i < CYCLES {
+        set.on_tick(&bn, &mut ctx);
+        set.on_tick(&pm, &mut ctx);
+        set.on_ai(&hb, &mut ctx);
+        set.on_ai(&disable, &mut ctx);
+        set.on_ai(&enable, &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.submitted);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(ctx.submitted >= u64::from(CYCLES), "trigger must fire every cycle");
+    assert_eq!(set.enabled_mask(), BIT_LATENCY_ARB);
+    assert_eq!(set.enable_refused_total(), 0);
+    assert_eq!(
+        allocs, 0,
+        "strategy-set fan-out allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "strategy-set fan-out bytes should be zero: saw {bytes}");
+}
+
+/// Phase 8f item 6: the engine-thread fills capture
+/// (`SlotCapture<Fill>` → engine-fills.pmlr) must stage + flush with
+/// zero allocations after boot — it sits on the engine thread's fill
+/// dispatch path.
+#[test]
+fn engine_fills_capture_append_is_zero_alloc() {
+    use core_io::{SlotCapture, SlotKind};
+    use core_types::{Fill, Side};
+
+    let cap_dir = std::env::temp_dir().join(format!(
+        "stage2_alloc_fills_capture_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    std::fs::create_dir_all(&cap_dir).unwrap();
+    let path = cap_dir.join(engine::ENGINE_FILLS_FILE);
+    let mut capture: SlotCapture<Fill> = SlotCapture::open(&path, SlotKind::Fill, 1).unwrap();
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        let f = Fill::new(
+            i,
+            7,
+            Side::Bid,
+            Price::from_raw(500_000),
+            Qty::from_raw(1_000_000),
+            i,
+        );
+        capture.append(&f);
+        // Exercise the periodic-drain branch inside the window too —
+        // interval elapsed on every call (last_flush starts at 0 and
+        // the interval is < the synthetic clock we feed).
+        capture.maybe_flush(i.wrapping_mul(10_000_000_000));
+        i += 1;
+    }
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(capture.records(), CYCLES);
+    assert_eq!(capture.io_errors(), 0);
+    assert!(!capture.is_disabled());
+    assert_eq!(
+        allocs, 0,
+        "fills capture path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "fills capture path bytes should be zero: saw {bytes}");
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }

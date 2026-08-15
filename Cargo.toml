@@ -17,6 +17,7 @@ members = [
     "crates/core-types",
 
     # --- ingress adapters (one per external source) ---
+    "crates/ingress-ai",
     "crates/ingress-binance",
     "crates/ingress-deribit",
     "crates/ingress-hyperliquid",
@@ -33,6 +34,7 @@ members = [
     "crates/strategy-ev",
     "crates/strategy-latency-arb",
     "crates/strategy-rule-tree",
+    "crates/strategy-set",
     # NOTE: `crates/strategy-news/` exists on-disk but is no longer
     # part of the workspace — Strategy D (rule-tree) covers the
     # news-driven path. Files are retained for git history; the
@@ -128,6 +130,7 @@ rcgen     = "0.13"
 # --- internal crates ---
 core-alloc   = { path = "crates/core-alloc" }
 core-config  = { path = "crates/core-config" }
+core-crypto  = { path = "crates/core-crypto" }
 core-io      = { path = "crates/core-io" }
 core-latency = { path = "crates/core-latency" }
 core-metrics = { path = "crates/core-metrics" }
@@ -138,6 +141,7 @@ core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 
+ingress-ai         = { path = "crates/ingress-ai" }
 ingress-binance    = { path = "crates/ingress-binance" }
 ingress-deribit    = { path = "crates/ingress-deribit" }
 ingress-hyperliquid = { path = "crates/ingress-hyperliquid" }
@@ -153,6 +157,7 @@ strategy-cross-arb    = { path = "crates/strategy-cross-arb" }
 strategy-ev           = { path = "crates/strategy-ev" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
+strategy-set          = { path = "crates/strategy-set" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 signer-eip712   = { path = "crates/signer-eip712" }

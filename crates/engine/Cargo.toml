@@ -18,3 +18,9 @@ core-types      = { workspace = true }
 core-latency    = { workspace = true }
 strategy-core   = { workspace = true }
 clob-dispatcher = { workspace = true }
+# AiIngressStatus only: the engine drain site is the designated writer
+# of `expired_total` (Phase 8f §4.4 / status.rs writer discipline).
+ingress-ai      = { workspace = true }
+# SlotCapture<Fill> only: the engine thread stages every dispatched
+# fill to engine-fills.pmlr (Phase 8f item 6 — the positions/P&L feed).
+core-io         = { workspace = true }
