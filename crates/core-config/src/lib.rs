@@ -113,6 +113,13 @@ pub struct Config {
     /// this struct, and the key must never reach a log; the cli binary
     /// loads it straight from the (already-dotenv-loaded) environment.
     pub ai_ingress_sock: String,
+    /// Ruleset artifact directory the ingress-ai side path resolves
+    /// Stage/Commit hashes against (Phase 8f §7, item 14). Env:
+    /// `AI_RULESET_DIR`. Default: `~/multivenue/artifacts/rulesets`
+    /// (tilde expanded at load). Artifacts are named
+    /// `<hash128-hex>.json` — the first 32 hex chars of the full
+    /// SHA-256 (`docs/prompts/ai-session.md` §4).
+    pub ai_ruleset_dir: String,
 }
 
 impl Config {
@@ -152,6 +159,10 @@ impl Config {
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
             ai_ingress_sock: expand_tilde(
                 &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
+            )?,
+            ai_ruleset_dir: expand_tilde(
+                &env_opt("AI_RULESET_DIR")
+                    .unwrap_or_else(|| "~/multivenue/artifacts/rulesets".into()),
             )?,
         })
     }
@@ -380,6 +391,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, "/Users/testhome/multivenue/run/ai.sock");
+    }
+
+    #[test]
+    fn ai_ruleset_dir_defaults_under_home() {
+        // SAFETY: test-only env mutation (module convention).
+        unsafe {
+            std::env::set_var("HOME", "/Users/testhome");
+            std::env::remove_var("AI_RULESET_DIR");
+        }
+        let got = expand_tilde(
+            &env_opt("AI_RULESET_DIR").unwrap_or_else(|| "~/multivenue/artifacts/rulesets".into()),
+        )
+        .unwrap();
+        assert_eq!(got, "/Users/testhome/multivenue/artifacts/rulesets");
+    }
+
+    #[test]
+    fn ai_ruleset_dir_env_override_passes_through() {
+        // SAFETY: test-only env mutation (module convention).
+        unsafe {
+            std::env::set_var("AI_RULESET_DIR", "/tmp/stage2-ai-test/rulesets");
+        }
+        let got = expand_tilde(
+            &env_opt("AI_RULESET_DIR").unwrap_or_else(|| "~/multivenue/artifacts/rulesets".into()),
+        )
+        .unwrap();
+        assert_eq!(got, "/tmp/stage2-ai-test/rulesets");
     }
 
     #[test]

@@ -51,7 +51,7 @@ use engine::{
     Engine, ENGINE_FILLS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE,
     TICK_RING_SIZE,
 };
-use ingress_ai::{AiCmdCapture, AiIngressCfg};
+use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
 // Re-exported (lib.rs) so the binary reaches the AI status slot type
 // through `cli::` like every other paper-mode surface.
 pub use ingress_ai::AiIngressStatus;
@@ -1177,8 +1177,10 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// makes scheduler placement irrelevant in the interim).
 ///
 /// `key` is moved into the thread and never logged.
+#[allow(clippy::too_many_arguments)] // one parameter per boot-wired resource
 pub fn spawn_ai(
     sock_path: PathBuf,
+    ruleset_dir: PathBuf,
     key: [u8; 32],
     producer: Producer<AiCmd, AI_RING_SIZE>,
     status: Arc<AiIngressStatus>,
@@ -1191,10 +1193,13 @@ pub fn spawn_ai(
     Ok(spawn_or_die(builder, "ingress-ai", move || {
         let cfg = AiIngressCfg { sock_path };
         let mut producer = producer;
-        // Ruleset side-path seam (§4.4 step 8): the validation stub
-        // arrives with item 14; until then Stage/Commit reach the
-        // ring only and the seam is a no-op.
-        let mut seam = |_c: &AiCmd| {};
+        // Ruleset side-path (§4.4 step 8, item 14): Stage/Commit kinds
+        // are validated against `AI_RULESET_DIR/<hash128-hex>.json`
+        // (full-SHA-256 recompute) and recorded as staged/committed
+        // state + `engine_ai_ruleset_*_total` counters. Control-plane
+        // only — the frame pump stays allocation-free.
+        let mut side_path = RulesetSidePath::new(ruleset_dir, Arc::clone(&status));
+        let mut seam = |c: &AiCmd| side_path.on_cmd(c);
         while !shutdown_requested() {
             match ingress_ai::run(
                 &cfg,
@@ -2342,6 +2347,15 @@ pub struct AiIngressCounterIds {
     /// `StrategyCounters::ai_enable_refused` (0 for plain
     /// strategies).
     pub enable_refused: core_metrics::CounterId,
+    /// `engine_ai_ruleset_staged_total` — item-14 side path: Stage
+    /// frames whose artifact resolved and hash-verified.
+    pub ruleset_staged: core_metrics::CounterId,
+    /// `engine_ai_ruleset_committed_total` — Commits accepted for the
+    /// currently staged hash (the 8f "state flag" observable).
+    pub ruleset_committed: core_metrics::CounterId,
+    /// `engine_ai_ruleset_rejected_total` — Stage/Commit refusals
+    /// (artifact missing/unreadable, hash mismatch, unstaged commit).
+    pub ruleset_rejected: core_metrics::CounterId,
     /// `engine_ingress_ai_last_heartbeat_age_ns` gauge. Derived as
     /// `now - last_heartbeat_ns` at mirror time; **-1 is the sentinel
     /// for "no heartbeat ever accepted"** (`last_heartbeat_ns == 0`) —
@@ -2366,6 +2380,9 @@ struct AiCountersSnapshot {
     rejected_conns: u64,
     drain_malformed: u64,
     enable_refused: u64,
+    ruleset_staged: u64,
+    ruleset_committed: u64,
+    ruleset_rejected: u64,
 }
 
 /// Mirror the AI status slot (+ the engine drain-site counter) into
@@ -2392,6 +2409,9 @@ fn mirror_ai_counters(
         rejected_conns: st.rejected_conns(),
         drain_malformed: engine_drain_malformed,
         enable_refused: strategy_enable_refused,
+        ruleset_staged: st.ruleset_staged(),
+        ruleset_committed: st.ruleset_committed(),
+        ruleset_rejected: st.ruleset_rejected(),
     };
     reg.counter(ids.cmds).inc(cur.cmds.saturating_sub(last.cmds));
     reg.counter(ids.hmac_fail)
@@ -2414,6 +2434,12 @@ fn mirror_ai_counters(
         .inc(cur.drain_malformed.saturating_sub(last.drain_malformed));
     reg.counter(ids.enable_refused)
         .inc(cur.enable_refused.saturating_sub(last.enable_refused));
+    reg.counter(ids.ruleset_staged)
+        .inc(cur.ruleset_staged.saturating_sub(last.ruleset_staged));
+    reg.counter(ids.ruleset_committed)
+        .inc(cur.ruleset_committed.saturating_sub(last.ruleset_committed));
+    reg.counter(ids.ruleset_rejected)
+        .inc(cur.ruleset_rejected.saturating_sub(last.ruleset_rejected));
     // Heartbeat age: -1 sentinel for "never" (see the field docs).
     let hb = st.last_heartbeat_ns();
     reg.gauge(ids.last_heartbeat_age_ns).set(if hb == 0 {
@@ -2446,6 +2472,9 @@ fn register_ai_counters(
         rejected_conns: one("engine_ingress_ai_rejected_conns_total")?,
         drain_malformed: one("engine_ai_drain_malformed_total")?,
         enable_refused: one("engine_ai_enable_refused_total")?,
+        ruleset_staged: one("engine_ai_ruleset_staged_total")?,
+        ruleset_committed: one("engine_ai_ruleset_committed_total")?,
+        ruleset_rejected: one("engine_ai_ruleset_rejected_total")?,
         last_heartbeat_age_ns,
     })
 }

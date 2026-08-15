@@ -48,6 +48,17 @@ pub struct AiIngressStatus {
     /// The `engine_ingress_ai_last_heartbeat_age_ns` gauge is derived
     /// by readers as `now_ns - last_heartbeat_ns` (item 6 mirrors).
     last_heartbeat_ns: AtomicU64,
+    /// Ruleset side-path (item 14): Stage frames whose artifact
+    /// resolved AND hash-verified (`engine_ai_ruleset_staged_total`).
+    /// Writer: ingress thread (the seam runs on it).
+    ruleset_staged_total: AtomicU64,
+    /// Ruleset side-path: Commits accepted for the currently staged
+    /// hash (`engine_ai_ruleset_committed_total`).
+    ruleset_committed_total: AtomicU64,
+    /// Ruleset side-path: Stage/Commit refusals — artifact missing,
+    /// unreadable, hash mismatch, or commit of a non-staged hash
+    /// (`engine_ai_ruleset_rejected_total`).
+    ruleset_rejected_total: AtomicU64,
 }
 
 impl AiIngressStatus {
@@ -64,6 +75,9 @@ impl AiIngressStatus {
             expired_total: AtomicU64::new(0),
             rejected_conns_total: AtomicU64::new(0),
             last_heartbeat_ns: AtomicU64::new(0),
+            ruleset_staged_total: AtomicU64::new(0),
+            ruleset_committed_total: AtomicU64::new(0),
+            ruleset_rejected_total: AtomicU64::new(0),
         }
     }
 
@@ -129,6 +143,24 @@ impl AiIngressStatus {
         self.last_heartbeat_ns.store(now_ns, Ordering::Relaxed);
     }
 
+    /// Count one successfully staged ruleset (item-14 side path).
+    #[inline(always)]
+    pub fn inc_ruleset_staged(&self) {
+        self.ruleset_staged_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one committed ruleset (item-14 side path).
+    #[inline(always)]
+    pub fn inc_ruleset_committed(&self) {
+        self.ruleset_committed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one rejected Stage/Commit (item-14 side path).
+    #[inline(always)]
+    pub fn inc_ruleset_rejected(&self) {
+        self.ruleset_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     // ---- reader side (cli mirror / TUI / tests) ----
 
     /// Accepted commands.
@@ -190,6 +222,24 @@ impl AiIngressStatus {
     pub fn last_heartbeat_ns(&self) -> u64 {
         self.last_heartbeat_ns.load(Ordering::Relaxed)
     }
+
+    /// Staged rulesets.
+    #[inline]
+    pub fn ruleset_staged(&self) -> u64 {
+        self.ruleset_staged_total.load(Ordering::Relaxed)
+    }
+
+    /// Committed rulesets.
+    #[inline]
+    pub fn ruleset_committed(&self) -> u64 {
+        self.ruleset_committed_total.load(Ordering::Relaxed)
+    }
+
+    /// Rejected Stage/Commit commands.
+    #[inline]
+    pub fn ruleset_rejected(&self) -> u64 {
+        self.ruleset_rejected_total.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for AiIngressStatus {
@@ -216,6 +266,9 @@ mod tests {
         s.inc_expired();
         s.inc_rejected_conns();
         s.set_last_heartbeat_ns(99);
+        s.inc_ruleset_staged();
+        s.inc_ruleset_committed();
+        s.inc_ruleset_rejected();
         assert_eq!(s.cmds(), 2);
         assert_eq!(s.hmac_fail(), 1);
         assert_eq!(s.protocol_err(), 1);
@@ -226,6 +279,9 @@ mod tests {
         assert_eq!(s.expired(), 1);
         assert_eq!(s.rejected_conns(), 1);
         assert_eq!(s.last_heartbeat_ns(), 99);
+        assert_eq!(s.ruleset_staged(), 1);
+        assert_eq!(s.ruleset_committed(), 1);
+        assert_eq!(s.ruleset_rejected(), 1);
     }
 
     #[test]

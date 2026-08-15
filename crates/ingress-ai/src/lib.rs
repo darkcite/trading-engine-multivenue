@@ -65,6 +65,7 @@
 pub mod capture;
 pub mod frame;
 pub mod listener;
+pub mod ruleset;
 pub mod status;
 
 pub use capture::{AiCmdCapture, AI_CMDS_FILE};
@@ -75,4 +76,5 @@ pub use frame::{
 pub use listener::{
     admit_frame, bind_uds, run, AiIngressCfg, FrameVerdict, POLL_TIMEOUT, RX_BUF_SIZE,
 };
+pub use ruleset::RulesetSidePath;
 pub use status::AiIngressStatus;

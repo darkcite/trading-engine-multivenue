@@ -853,9 +853,14 @@ fn run(args: RunArgs) -> ExitCode {
     match std::env::var("AI_INGRESS_HMAC_KEY") {
         Ok(hex) if !hex.trim().is_empty() => match cli::parse_ai_hmac_key(&hex) {
             Ok(key) => {
-                info!(sock = %cfg.ai_ingress_sock, "ingress-ai: starting thread");
+                info!(
+                    sock = %cfg.ai_ingress_sock,
+                    ruleset_dir = %cfg.ai_ruleset_dir,
+                    "ingress-ai: starting thread"
+                );
                 let ai_handle = match cli::spawn_ai(
                     PathBuf::from(&cfg.ai_ingress_sock),
+                    PathBuf::from(&cfg.ai_ruleset_dir),
                     key,
                     ai_prod,
                     ai_status.clone(),
