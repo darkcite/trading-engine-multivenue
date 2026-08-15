@@ -196,3 +196,193 @@ slot carries engine time, and the worker send time survives nowhere
 structured. S2 must reconcile (likely: capture the pre-rewrite slot,
 push the rewritten one — zero extra copies, both truths kept) and ask
 the operator if the reconciliation changes observable behavior.
+→ RESOLVED in S2, see below: operator chose the literal §4.4 ordering.
+
+## 2026-08-15 — Session S2 (item 5: `ingress-ai`)
+
+### S1 open question RESOLVED — operator decision (same day)
+
+Asked before coding the rewrite/capture lines, as flagged. Options
+presented: (a) capture the pre-rewrite slot (worker ts in capture,
+§13.1 verbatim) vs (b) literal §4.4 step-6 sequence (rewrite → capture
+→ push; capture byte-identical to the pushed slot). **Operator chose
+(b).** Consequences, now in force:
+
+- PMLR capture (`ai-cmds.pmlr`, kind 4) carries the **rewritten** slot
+  — engine-clock coherent, byte-identical to what the ring consumer
+  sees.
+- The worker's original send time survives ONLY in the optional
+  `--raw-tap` payload capture (which `ingress-ai` does not host in
+  8f); structured recovery of send times = the worker's own SQLite
+  event log (item 9).
+- Docs amended in the 5a commit: design §3 (dated amendment block),
+  §4.4 step 6 (clarifying note), §13.1 (strikethrough + amendment),
+  wire-format.md AiCmd section, `core-types` AiCmd rustdoc.
+
+### Item 5 — `ingress-ai`: DONE (two commits)
+
+| commit | content |
+|---|---|
+| `a43f87f` | 5a: crate (workspace member + `core-crypto`/`ingress-ai` added to workspace deps); `frame.rs` (82-B frame consts/parse/pack, `SeqPolicy`), `capture.rs` (`AiCmdCapture` single-file PMLR sink, sticky-disable), `status.rs` (`AiIngressStatus` D7-pattern slot), `listener.rs` (`bind_uds` 0700/0600/stale-unlink, `peer_euid` LOCAL_PEERCRED/SO_PEERCRED, mio run loop, `admit_frame` §4.4 hot core, Stage/Commit seam hook); doc amendments above; 26 unit+prop tests |
+| `10fc7c8` | 5b: `tests/uds_loopback.rs` (8 scenarios: good/batched frames, bad HMAC, short+oversize len, torn frame, seq regress/gap, second-conn reject, malformed-keeps-conn, heartbeat cadence, Stage+Commit seam; FULL counter vector asserted incl. zeros); `ai_cmd_frame` fuzz target (raw-frame, valid-tag→shape, seq-policy paths) in `fuzz/Cargo.toml`; `ai_ingress_admit_frame_is_zero_alloc` in bench (10 000 frames pack→accept→verify→capture→push) |
+
+**Gates last run (all on the Mac):** `cargo nextest run -p ingress-ai`
+34/34; targeted sweep `-p ingress-ai -p core-types -p core-io
+-p core-crypto -p bench` 148/148; `cargo check --workspace` clean;
+fuzz `cargo check` clean; `cargo test -p bench --test alloc_assertions
+--release -- --test-threads=1` **31/31, new AI path 0 B/op**. NOT run
+(item-17 gates): full workspace nextest, fuzz time-boxed runs, pytest.
+
+### Interim state / deviations (all recorded for review)
+
+- **Capture sink shape:** `PmlrCapture` (core-io) is the 3-file venue
+  sink; AI needs one file, so `AiCmdCapture` lives in `ingress-ai`
+  wrapping `PmlrWriter` with the same sticky-disable/flush-cadence
+  policy. If item 6's `engine-fills.pmlr` capture wants the same
+  shape, hoist a generic single-file sink into core-io THEN (do not
+  duplicate a third time).
+- **`expired_total` writer:** lives in `AiIngressStatus` so the whole
+  `engine_ingress_ai_*` family mirrors from one slot, but its writer
+  is the ENGINE drain site (`inc_expired`, item 6) — per-field single
+  writer, documented in the struct.
+- **Metrics exposition** (registry names, heartbeat AGE gauge derived
+  as `now - last_heartbeat_ns`) is deliberately left to the cli
+  mirror in item 6 — the crate exposes the status slot + capture-pair
+  getters only (IngressStatus/D7 pattern; no core-metrics dep).
+- **SeqPolicy:** primes on the FIRST frame of each connection without
+  counting a gap (handles both worker schemes: restart-at-1 and the
+  persistent SQLite allocator surviving reconnects); per-connection
+  reset; `seq_gap_total` counts gap EVENTS, not missing frames;
+  regress does not move the high-water mark.
+- **Counter semantics pinned:** `cmds_total` = frames passing
+  len+HMAC+shape+seq (ring-dropped still counted; `ring_drops_total`
+  separate). Malformed/regressed frames are NOT captured. Torn-frame
+  residue at EOF/transport-error counts `protocol_err_total`.
+  `rejected_conns_total` covers second-conn AND peer-cred mismatch
+  (the euid-negative path needs a second uid — not testable
+  in-process; it shares the tested reject code path).
+- **Seam order:** side-path seam invoked AFTER `try_push` (literal
+  §4.4 step order; `AiCmd` is Copy so the push doesn't consume it).
+- **`bind_uds` chmods the parent dir 0700 unconditionally** — fails
+  fast on a shared parent like `/tmp` (correct for production
+  `~/multivenue/run/`). Tests therefore use
+  `/tmp/stage2-ai-<pid>/<tag>.sock` (own parent dir; still inside the
+  stage2 namespace).
+- **macOS landmines (cost ~30 min, now encoded in tests):**
+  (1) `setsockopt(SO_RCVTIMEO)` returns EINVAL on a UDS whose peer
+  already closed — the loopback EOF probe uses `set_nonblocking` +
+  bounded read poll instead of `set_read_timeout`.
+  (2) `std::thread::scope` + a panicking scenario = 60 s+ hang (scope
+  joins the still-running ingress thread; the real assert never
+  prints). Fixed with a `StopOnDrop` guard that flips the stop flag
+  during unwind. Diagnosed live with `sample <pid>`; the three stuck
+  test PIDs were killed by PID (never by name).
+- No stale-rmeta incidents. Open defects: none known.
+
+### Exact resume point
+
+Design §12 **items 6–7** (S3). Item 6 first actions: read
+`crates/engine` tick loop + `strategy-core::Strategy` trait, then add
+the `ai_cons: Consumer<AiCmd, AI_RING_SIZE>` lane — budgeted drain in
+`Engine::tick()`, TTL-on-pop (`now - cmd.ts_ns > ttl_ns ⇒ drop +
+status.inc_expired()` — ts_ns is engine-monotonic since accept,
+decision 1), `Strategy::on_ai` defaulted method; then engine-thread
+fills capture (`engine-fills.pmlr`, kind 2 — decide the core-io hoist
+here); then cli wiring (spawn `ingress-ai` thread with
+`Ring::new().split()`, env `AI_INGRESS_SOCK` + `AI_INGRESS_HMAC_KEY`
+64-hex→32 B, core-4 pin note, mirror `AiIngressStatus` + capture pair
+into the metrics registry incl. the heartbeat-age gauge). Item 7:
+new crate `strategy-set` per §7 (§13 decision 3).
+
+### S3 kickoff prompt (ready to paste)
+
+```
+Stage 2 — 8f AI-Ingress, IMPLEMENTATION SESSION S3 (checklist items
+6–7: engine AI lane + strategy-set), ISOLATED WORKTREE, parallel to
+the soak/remediation session. NEVER touch
+/Users/darkcite/trading-engine-multivenue.
+WORKTREE: /Users/darkcite/trading-engine-stage2, branch
+stage2/8f-ai-ingress (now at 10fc7c8 + the S2 handoff commit). Verify
+get_project_modules against the worktree path FIRST; if the MCP won't
+attach, stop.
+AUTHORITY: docs/phase-8f-design.md (§13 LOCKED, §3/§13.1 capture
+amendment 2026-08-15 in force: capture carries the REWRITTEN slot;
+worker send time via --raw-tap only) + latest phase-8f-progress.md
+entry (S2 handoff) supersede the committed plan.
+REQUIRED READING, in order:
+1. docs/phase-8f-progress.md — S2 handoff (state, deviations, this
+   prompt)
+2. docs/phase-8f-design.md §2 (engine/strategy-set/fills-capture/cli
+   rows), §3 (TTL drain paragraph + amendment), §4.3–4.4 (consumer
+   side), §5.4, §7 (ALL — StrategySet semantics), §10, §11 (engine
+   drain + StrategySet rows), §13 decisions 1/3/6
+3. CLAUDE.md (pitfalls #10/#11)
+Committed S2 surface to build on: ingress_ai::{run, AiIngressCfg,
+AiIngressStatus (incl. inc_expired for the drain site), AiCmdCapture,
+admit_frame, pack_frame, parse_frame, SeqPolicy, FRAME_LEN,
+AI_CMDS_FILE}; S1 surface unchanged (core_types::AiCmd etc.).
+Reference (do not modify): ingress-ai internals, core-ring, existing
+engine tick loop shape, cli spawn wrappers for venue ingresses.
+S3 SCOPE — item 6 then item 7, one commit each (6 may split
+6a drain / 6b fills-capture+cli):
+item 6: engine `ai_cons` lane — budgeted drain in Engine::tick()
+(budget per tick, design §2 row), TTL-on-pop vs engine-monotonic
+ts_ns (drop ⇒ AiIngressStatus::inc_expired — the slot's designated
+drain-side writer), malformed re-check at drain (defense in depth,
+counter), Strategy::on_ai defaulted method (monomorphized, no dyn);
+engine-thread fills capture engine-fills.pmlr (SlotKind::Fill = 2,
+alloc-asserted; consider hoisting a generic single-file PMLR sink
+into core-io and porting AiCmdCapture onto it — S2 deviation note);
+cli spawn wiring: ingress-ai thread (core 4 note — RSS still owns its
+core until item 16), env keys AI_INGRESS_SOCK /
+AI_INGRESS_HMAC_KEY (64 hex → 32 B, .env only, never logged),
+metrics mirror for AiIngressStatus + capture pair +
+engine_ingress_ai_last_heartbeat_age_ns gauge (= now −
+last_heartbeat_ns, 0 ⇒ report absent-or-sentinel, pick and document).
+item 7: new crate strategy-set per §7: static members
+latency-arb/ev/cross-arb/rule-tree/ai-exec-placeholder? NO — ai-exec
+is item 8; wire the slot indices (0–5, 4=ai-exec bit reserved until
+item 8, 5=vm bit reserved for 8g) WITHOUT dead members (unused-code
+rule: only built members exist as fields; mask bits for 4/5 are
+reserved constants). Enable refused while halted (sticky halt flag
+from HaltRequest until 8i), Disable always honored,
+engine_ai_enable_refused_total, --strategy → initial mask; unit
+suite + alloc assertion (fan-out steady state).
+Tests per §11 rows: engine drain (TTL-expiry-on-pop, budget
+respected, malformed rejected); StrategySet (mask fan-out,
+enable-while-halted refused, disable always, initial mask). Alloc
+gates in bench: StrategySet fan-out steady state (ai-exec on_tick
+gate arrives with item 8).
+Hot-path rules absolute: zero alloc, no dyn, no tokio, no
+serde_json. Tests override AI_INGRESS_SOCK under
+/tmp/stage2-ai-<pid>/ (OWN parent dir — bind_uds force-chmods the
+parent to 0700 and must not touch shared /tmp), METRICS_BIND
+stage2-local (never 9191), MULTIVENUE_LOG_DIR stage2-local; never
+~/multivenue/logs, never /tmp/soak*; no kill/pkill by name (by-PID
+of own test processes only, after diagnosis).
+HARD ISOLATION unchanged (S1/S2 prompt rules): all work ONLY under
+/Users/darkcite/trading-engine-stage2; NEVER run `multivenue-engine
+run`, bind 127.0.0.1:9191, or connect live venues. Git: small
+commits ONLY on stage2/8f-ai-ingress inside the worktree; NO
+merge/rebase/push; no git ops in the main checkout.
+Cargo on the Mac ONLY (CLAUDE.md pitfall #10; sandbox = greps only).
+Stale-rmeta pitfall: impossible unresolved-import errors after edits
+= cargo clean -p <touched crates> and retry.
+SESSION FACTS: RustRover MCP execute_terminal_command MUST
+executeInShell=true, ≤45 s per call — long builds via
+nohup > /tmp/stage2-build.log & then poll; projectPath = the
+worktree. macOS test landmines from S2: SO_RCVTIMEO EINVAL on
+peer-closed UDS (use nonblocking EOF probes); std::thread::scope +
+panicking scenario hangs unless a StopOnDrop guard flips the stop
+flag (pattern in crates/ingress-ai/tests/uds_loopback.rs); `sample
+<pid>` is the hang diagnostic. uv 0.12.5 at /opt/homebrew/bin/uv
+(Python 3.14.7) — not needed for items 6–7. One commit per
+(sub-)item, tests green on the Mac before the next, one-line status
+after each; ask before anything ambiguous.
+STOP after item 7: append §12.2 handoff (status, interim state,
+resume point, S4 kickoff for items 8–9) to docs/phase-8f-progress.md.
+All session notes to phase-8f-progress.md ONLY — phase-8-progress.md
+belongs to the other session. If context runs short: write interim
+state + exact resume point + relaunch prompt into
+phase-8f-progress.md, then tell me.
+```
