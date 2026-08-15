@@ -81,10 +81,6 @@ pub struct Config {
     /// [`expand_tilde`]) — the value stored here is always a concrete
     /// path, never a literal `~`.
     pub log_dir: String,
-    /// Comma-separated RSS feed URLs (`https://a/rss,https://b/rss`).
-    /// Parsed once at boot via [`Config::rss_feeds()`] — no allocations
-    /// on the hot path.
-    pub rss_feeds_csv: String,
     /// OKX v5 public WS host, optionally carrying `:port` (the venue's
     /// public WS is on a non-443 port). Env: `OKX_WS_PUBLIC_HOST`.
     /// Default: `ws.okx.com:8443`.
@@ -145,9 +141,6 @@ impl Config {
             log_dir: expand_tilde(
                 &env_opt("MULTIVENUE_LOG_DIR").unwrap_or_else(|| "~/multivenue/logs".into()),
             )?,
-            // Empty CSV → no RSS thread spawned. Operator opts in by
-            // listing real feed URLs in .env.
-            rss_feeds_csv: env_opt("RSS_FEEDS").unwrap_or_default(),
             okx_ws_host: env_opt("OKX_WS_PUBLIC_HOST").unwrap_or_else(|| "ws.okx.com:8443".into()),
             okx_rest_host: env_opt("OKX_REST_HOST").unwrap_or_else(|| "www.okx.com".into()),
             deribit_ws_host: env_opt("DERIBIT_WS_HOST").unwrap_or_else(|| "www.deribit.com".into()),
@@ -165,16 +158,6 @@ impl Config {
                     .unwrap_or_else(|| "~/multivenue/artifacts/rulesets".into()),
             )?,
         })
-    }
-
-    /// Iterator over the configured RSS feed URLs (each `&str`
-    /// borrows from `rss_feeds_csv`). Empty when `RSS_FEEDS` is
-    /// unset / empty.
-    pub fn rss_feeds(&self) -> impl Iterator<Item = &str> {
-        self.rss_feeds_csv
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
     }
 }
 

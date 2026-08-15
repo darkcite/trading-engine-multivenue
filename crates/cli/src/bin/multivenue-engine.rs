@@ -8,7 +8,7 @@
 //! * `run --paper` — spawn the ingress threads (Polymarket, Binance,
 //!   OKX when `--okx-symbols` is set, Deribit when
 //!   `--deribit-symbols` is set, Hyperliquid when `--hl-coins` is
-//!   set, Polygon RPC, RSS), boot the
+//!   set, Polygon RPC), boot the
 //!   real `Engine` with the latency-arb strategy + paper dispatcher,
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
@@ -551,7 +551,6 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_prod, deribit_lane_cons) = rings.tick[3].clone().split();
     let (hl_prod, hl_lane_cons) = rings.tick[4].clone().split();
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
-    let (rss_prod, rss_cons) = rings.rss_signal.clone().split();
     let fill_lane_cons = {
         let (_f0p, f0) = rings.fill[0].clone().split();
         let (_f1p, f1) = rings.fill[1].clone().split();
@@ -813,37 +812,6 @@ fn run(args: RunArgs) -> ExitCode {
         warn!("--polygon-path not provided; RPC ingress thread not started");
     }
 
-    // -- RSS ingress (optional; opt-in via RSS_FEEDS in .env) --
-    // Default poll interval: 5 min — RSS feeds explicitly Slow-class
-    // signals; tighter polling would burn the publisher's free tier
-    // and yield no statistical advantage.
-    const RSS_POLL_NS: u64 = 5 * 60 * 1_000_000_000;
-    let mut rss_feeds: Vec<cli::RssFeed> = Vec::new();
-    for url in cfg.rss_feeds() {
-        match cli::RssFeed::parse(url, RSS_POLL_NS) {
-            Ok(f) => rss_feeds.push(f),
-            Err(reason) => {
-                warn!(url, reason, "rss: rejecting feed URL");
-            }
-        }
-    }
-    if rss_feeds.is_empty() {
-        info!("RSS_FEEDS empty / unset; RSS ingress thread not started");
-        // Drop the producer side so the engine's consumer doesn't
-        // park forever waiting on a ring nothing pushes to.
-        drop(rss_prod);
-    } else {
-        info!(feeds = rss_feeds.len(), "rss: starting ingress thread");
-        let rss_handle = cli::spawn_rss(
-            rss_feeds,
-            tls_config.clone(),
-            rss_prod,
-            statuses.rss.clone(),
-            4,
-        );
-        handles.push(rss_handle);
-    }
-
     // -- AI-command ingress (Phase 8f; opt-in via AI_INGRESS_HMAC_KEY
     // in .env) --
     // Key semantics: ABSENT/empty ⇒ thread not started (back-compat
@@ -864,6 +832,7 @@ fn run(args: RunArgs) -> ExitCode {
                     key,
                     ai_prod,
                     ai_status.clone(),
+                    4,
                     &run_dir,
                     epoch_ns,
                     capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_ai)),
@@ -913,7 +882,6 @@ fn run(args: RunArgs) -> ExitCode {
             hl_lane_cons,
         ],
         rpc_signal: rpc_cons,
-        rss_signal: rss_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,

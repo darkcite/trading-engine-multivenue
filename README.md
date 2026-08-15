@@ -56,7 +56,7 @@ operator reference only.
 ```
 crates/
   core-*/           OS-agnostic primitives (rings, time, config, parse, ...)
-  ingress-*/        External source adapters (polymarket, binance, okx, deribit, hyperliquid, rpc, rss)
+  ingress-*/        External source adapters (polymarket, binance, okx, deribit, hyperliquid, rpc)
   strategy-*/       Strategies implementing `strategy-core::Strategy`
   signer-eip712/    EIP-712 signer (secp256k1 + tiny-keccak, no ethers)
   clob-dispatcher/  Persistent HTTP/2 client w/ preallocated buffers

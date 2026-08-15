@@ -17,7 +17,6 @@ core-types         = { path = "../crates/core-types" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
 ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
-ingress-rss        = { path = "../crates/ingress-rss" }
 ingress-okx        = { path = "../crates/ingress-okx" }
 ingress-deribit    = { path = "../crates/ingress-deribit" }
 ingress-hyperliquid = { path = "../crates/ingress-hyperliquid" }
@@ -71,13 +70,6 @@ bench  = false
 [[bin]]
 name   = "rpc_response"
 path   = "fuzz_targets/rpc_response.rs"
-test   = false
-doc    = false
-bench  = false
-
-[[bin]]
-name   = "rss_item"
-path   = "fuzz_targets/rss_item.rs"
 test   = false
 doc    = false
 bench  = false

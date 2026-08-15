@@ -82,7 +82,7 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 - `crates/core-crypto/` — handwritten SHA-256 / HMAC-SHA256 / base64 (RFC 4648); no external crypto stacks.
 - `crates/core-io/` — PMLR replay log writer/reader + `PmlrCapture` (per-ingress §6.5 capture sink) + raw tap (`PMRT`).
 - `crates/ingress-*/src/discovery.rs` — per-venue boot REST discovery (8e): instrument universes, tick/lot metadata, coverage audit.
-- `crates/ingress-*/` — one per external source (polymarket, binance, rss, rpc).
+- `crates/ingress-*/` — one per external source (polymarket, binance, rpc).
 - `crates/strategy-*/` — strategies implementing the `Strategy` trait.
 - `crates/signer-eip712/` — audited-C-backed signer; do not replace with `ethers`.
 - `crates/clob-dispatcher/` — persistent H/2 client; preallocated buffers.

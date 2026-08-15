@@ -24,7 +24,6 @@ members = [
     "crates/ingress-okx",
     "crates/ingress-polymarket",
     "crates/ingress-rpc",
-    "crates/ingress-rss",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -36,10 +35,6 @@ members = [
     "crates/strategy-latency-arb",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
-    # NOTE: `crates/strategy-news/` exists on-disk but is no longer
-    # part of the workspace — Strategy D (rule-tree) covers the
-    # news-driven path. Files are retained for git history; the
-    # bind-mounted FS does not permit removal from this session.
 
     # --- execution ---
     "crates/clob-dispatcher",
@@ -149,7 +144,6 @@ ingress-hyperliquid = { path = "crates/ingress-hyperliquid" }
 ingress-okx        = { path = "crates/ingress-okx" }
 ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }
-ingress-rss        = { path = "crates/ingress-rss" }
 
 book-builder          = { path = "crates/book-builder" }
 research-artifacts    = { path = "crates/research-artifacts" }

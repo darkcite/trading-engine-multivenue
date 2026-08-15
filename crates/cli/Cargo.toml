@@ -41,7 +41,6 @@ ingress-okx          = { workspace = true }
 ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-rpc          = { workspace = true }
-ingress-rss          = { workspace = true }
 ingress-ai           = { workspace = true }
 clap                 = { workspace = true }
 tracing              = { workspace = true }

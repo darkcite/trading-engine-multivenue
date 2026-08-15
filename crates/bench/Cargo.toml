@@ -30,7 +30,6 @@ ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
-ingress-rss          = { workspace = true }
 core-net             = { workspace = true }
 core-time            = { workspace = true }
 book-builder         = { workspace = true }

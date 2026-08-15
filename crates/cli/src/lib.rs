@@ -5,7 +5,7 @@
 //! (Polymarket WSS, Binance WSS, OKX WSS when `--okx-symbols` is
 //! set, Deribit WSS when `--deribit-symbols` is set, Hyperliquid
 //! WSS when `--hl-coins` is set, Polygon
-//! JSON-RPC WSS, RSS HTTPS), pins each to a dedicated
+//! JSON-RPC WSS), pins each to a dedicated
 //! CPU core, installs a SIGINT handler that cooperatively shuts the
 //! rings down, and drives a drain-and-count consumer on the main
 //! thread.
@@ -44,11 +44,11 @@ pub use paper::{
     engine_loop_with,
     join_reverse, new_capture_run_dir, open_fills_capture, parse_ai_hmac_key, parse_raw_tap_flags,
     signal_shutdown, spawn_ai, spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx,
-    spawn_polymarket, spawn_rpc, spawn_rss, split_host_port, AiIngressCounterIds, AiIngressStatus,
+    spawn_polymarket, spawn_rpc, split_host_port, AiIngressCounterIds, AiIngressStatus,
     CaptureGaugeIds, CaptureMetrics, Consumers, DrainCounters,
     EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, Observability, RawTapConfig,
-    Rings, RssFeed, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
+    Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

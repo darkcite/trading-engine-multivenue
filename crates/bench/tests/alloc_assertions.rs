@@ -35,7 +35,6 @@ use ingress_rpc::{
     parse_block_number_result, parse_new_head_notification, write_request_eth_block_number,
 };
 use ingress_ai::{admit_frame, pack_frame, AiCmdCapture, AiIngressStatus, FrameVerdict, SeqPolicy};
-use ingress_rss::{feed_items, fnv1a_64, SeenRing};
 
 /// Push/pop a Tick through the SPSC ring 10_000 times — must not
 /// allocate on any iteration after the initial ring construction.
@@ -588,42 +587,6 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     assert!(capture.signals_written() > 0);
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
-}
-
-/// Parse an RSS body through `parse_body_into_signals` 1 000 times —
-/// must be zero-alloc after the SeenRing is primed.
-#[test]
-fn rss_poller_body_parse_is_zero_alloc() {
-    use ingress_rss::poller as rsp;
-
-    const BODY: &[u8] = br#"<rss><channel>
-<item><title>one</title><link>https://a.example/1</link></item>
-<item><title>two</title><link>https://a.example/2</link></item>
-</channel></rss>"#;
-
-    let feed = rsp::FeedCfg::new(b"a.example", b"/feed", 60_000_000_000);
-    let mut seen: SeenRing<64> = SeenRing::new();
-    let ring: std::sync::Arc<Ring<core_types::Signal, 128>> = Ring::new();
-    let (mut prod, mut cons) = ring.split();
-
-    // Prime the seen-ring so every subsequent loop iteration dedupes
-    // rather than emits — keeps the measurement focused on parse cost.
-    let _ = rsp::parse_body_into_signals(BODY, &feed, &mut seen, &mut prod);
-    while cons.try_pop().is_some() {}
-
-    let g = AllocGuard::new();
-    let mut acc: usize = 0;
-    for _ in 0..1_000u32 {
-        let emitted = rsp::parse_body_into_signals(BODY, &feed, &mut seen, &mut prod);
-        acc = acc.wrapping_add(emitted);
-    }
-    std::hint::black_box(acc);
-
-    let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(
-        allocs, 0,
-        "rss poller parse_body_into_signals allocated {allocs} times ({bytes} B)"
-    );
 }
 
 // ---------------------------------------------------------------
@@ -1309,39 +1272,6 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         "engine.tick() with latency record allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0);
-}
-
-/// Exercise the RSS iterator + FNV-1a + SeenRing dedupe for 1000
-/// iterations over a two-item feed. Must be zero-alloc.
-#[test]
-fn rss_items_and_fnv_is_zero_alloc() {
-    let buf: &[u8] = br#"<rss><channel>
-<item><title>one</title><link>https://a.example/1</link></item>
-<item><title>two</title><link>https://a.example/2</link></item>
-</channel></rss>"#;
-
-    let mut seen: SeenRing<64> = SeenRing::new();
-
-    let g = AllocGuard::new();
-
-    let mut acc: u64 = 0;
-    for _ in 0..1_000u32 {
-        // Iterator is stack-allocated; holds only (&buf, pos).
-        // `for` over an iterator monomorphises to the same tight loop as
-        // `while let Some(..) = iter.next()` and doesn't allocate.
-        for item in feed_items(buf) {
-            let h = fnv1a_64(item.link);
-            let _inserted = seen.insert(h);
-            acc = acc.wrapping_add(h);
-        }
-    }
-    std::hint::black_box(acc);
-
-    let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(
-        allocs, 0,
-        "rss + fnv + SeenRing allocated {allocs} times ({bytes} B)"
-    );
 }
 
 /// QueuedDispatcher worker drain — engine pushes 1000 orders into

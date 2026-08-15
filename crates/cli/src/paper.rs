@@ -16,7 +16,7 @@
 //! | T1     | ingress-polymarket (CLOB WSS) |
 //! | T2     | ingress-binance (bookTicker WSS) |
 //! | T3     | ingress-rpc (Polygon JSON-RPC WSS) |
-//! | T4     | ingress-rss (HTTPS polling) |
+//! | T4     | ingress-ai (UDS command listener; only with `AI_INGRESS_HMAC_KEY`) |
 //! | T5     | ingress-okx (v5 public WSS; only with `--okx-symbols`) |
 //! | T6     | ingress-deribit (JSON-RPC WSS; only with `--deribit-symbols`) |
 //! | T7     | ingress-hyperliquid (public WSS; only with `--hl-coins`) |
@@ -240,9 +240,6 @@ pub struct Rings {
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
     /// Signal ring for Polygon newHeads — feeds the engine.
     pub rpc_signal: Arc<Ring<Signal, SIGNAL_RING_SIZE>>,
-    /// Signal ring for RSS news items — drained at cli level.
-    /// Stays in place untouched until Stage 2 (RSS retirement, §8.1).
-    pub rss_signal: Arc<Ring<Signal, 1024>>,
     /// One fill ring per execution lane (`engine::fill_lane_of`).
     /// Live dispatchers gain producers in Phase 8j; until then the
     /// engine's dispatcher fill pump (D3) is the only fill source.
@@ -260,7 +257,6 @@ impl Rings {
         Self {
             tick: [Ring::new(), Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             rpc_signal: Ring::new(),
-            rss_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
         }
@@ -275,8 +271,7 @@ impl Default for Rings {
 
 /// One [`IngressStatus`] slot per ingress thread (D7). Allocated at
 /// boot, cloned into the spawn wrappers (writers) and into
-/// [`Observability`] (reader). RSS gets a slot for uniformity even
-/// though its thread only reports coarse Up/Down.
+/// [`Observability`] (reader).
 pub struct IngressStatusSet {
     /// Polymarket WSS thread.
     pub polymarket: Arc<IngressStatus>,
@@ -293,12 +288,10 @@ pub struct IngressStatusSet {
     pub hyperliquid: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
-    /// RSS poller thread.
-    pub rss: Arc<IngressStatus>,
 }
 
 impl IngressStatusSet {
-    /// Allocate all seven slots (boot only).
+    /// Allocate all six slots (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -307,7 +300,6 @@ impl IngressStatusSet {
             deribit: Arc::new(IngressStatus::new()),
             hyperliquid: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
-            rss: Arc::new(IngressStatus::new()),
         }
     }
 }
@@ -1081,41 +1073,6 @@ pub fn spawn_rpc(
     ))
 }
 
-/// One parsed `RSS_FEEDS` entry. URL is pre-split into host/path
-/// at boot so the RSS thread never needs to re-tokenise.
-#[derive(Debug, Clone)]
-pub struct RssFeed {
-    /// DNS name. Owned so the spawned thread outlives the cli.
-    pub host: String,
-    /// HTTP request path (e.g. `/rss`).
-    pub path: String,
-    /// Poll interval between fetches (nanoseconds).
-    pub poll_interval_ns: u64,
-}
-
-impl RssFeed {
-    /// Parse an `https://host/path` URL into `RssFeed`. The poller is
-    /// HTTPS-only; non-`https` schemes are rejected.
-    pub fn parse(url: &str, poll_interval_ns: u64) -> Result<Self, &'static str> {
-        let trimmed = url.trim();
-        let rest = trimmed
-            .strip_prefix("https://")
-            .ok_or("rss feed URL must be https://")?;
-        let (host, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        if host.is_empty() {
-            return Err("rss feed URL has empty host");
-        }
-        Ok(Self {
-            host: host.to_string(),
-            path: path.to_string(),
-            poll_interval_ns,
-        })
-    }
-}
-
 /// Open the Phase-8f engine-thread fills capture
 /// (`<run_dir>/engine-fills.pmlr`, `SlotKind::Fill`). Boot-only; the
 /// bin hands the result to [`Observability::with_fills_capture`] and
@@ -1171,10 +1128,8 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// binds `sock_path`, serves the single `claude-worker` client, and
 /// rebinds after transport-fatal errors until shutdown.
 ///
-/// **Core pinning:** core 4 belongs to this thread per the §9 core
-/// map, but RSS still owns core 4 until item 16 removes it — this
-/// thread runs unpinned until then (control-plane cadence of ~1 cmd/s
-/// makes scheduler placement irrelevant in the interim).
+/// **Core pinning:** core 4 per the §9 core map (freed by the 8f
+/// item-16 RSS removal).
 ///
 /// `key` is moved into the thread and never logged.
 #[allow(clippy::too_many_arguments)] // one parameter per boot-wired resource
@@ -1184,6 +1139,7 @@ pub fn spawn_ai(
     key: [u8; 32],
     producer: Producer<AiCmd, AI_RING_SIZE>,
     status: Arc<AiIngressStatus>,
+    core_id: usize,
     run_dir: &Path,
     epoch_ns: u64,
     capture_metrics: CaptureMetrics,
@@ -1191,6 +1147,7 @@ pub fn spawn_ai(
     let mut capture = AiCmdCapture::open(run_dir, epoch_ns)?;
     let builder = thread::Builder::new().name("ingress-ai".to_string());
     Ok(spawn_or_die(builder, "ingress-ai", move || {
+        log_pin_outcome("ai", core_id);
         let cfg = AiIngressCfg { sock_path };
         let mut producer = producer;
         // Ruleset side-path (§4.4 step 8, item 14): Stage/Commit kinds
@@ -1224,96 +1181,6 @@ pub fn spawn_ai(
     }))
 }
 
-/// Spawn the RSS ingress thread. Polls each `feeds` entry on its
-/// own schedule and pushes `Signal`s onto `producer`.
-///
-/// Unlike the WSS ingresses each fetch opens a fresh TLS
-/// connection — the RSS protocol is request/response so there's
-/// no long-lived socket to hold. The connect-cost per fetch is
-/// fine because polls happen at minutes-scale, not microseconds.
-pub fn spawn_rss(
-    feeds: Vec<RssFeed>,
-    tls_config: RustlsConfig,
-    mut producer: Producer<Signal, 1024>,
-    status: Arc<IngressStatus>,
-    core_id: usize,
-) -> JoinHandle<()> {
-    spawn_or_die(
-        thread::Builder::new().name("ingress-rss".into()),
-        "ingress-rss",
-        move || {
-            log_pin_outcome("rss", core_id);
-            if feeds.is_empty() {
-                tracing::info!("rss: no feeds configured — thread exiting");
-                status.set_state(IngressState::Down);
-                return;
-            }
-            // Coarse status only: the poller owns its own schedule
-            // and connection lifecycle (request/response at minutes
-            // cadence), so Up-while-running / Down-on-exit is the
-            // honest granularity. RSS retires entirely in Stage 2.
-            status.set_state(IngressState::Up);
-            // Build FeedCfg slice once. `feeds` is owned by this
-            // closure so the &[u8] borrows live the whole thread.
-            let cfgs: Vec<ingress_rss::poller::FeedCfg<'_>> = feeds
-                .iter()
-                .map(|f| {
-                    ingress_rss::poller::FeedCfg::new(
-                        f.host.as_bytes(),
-                        f.path.as_bytes(),
-                        f.poll_interval_ns,
-                    )
-                })
-                .collect();
-            let mut schedules: Vec<ingress_rss::poller::FeedSchedule> =
-                cfgs.iter()
-                    .map(|_| ingress_rss::poller::FeedSchedule::immediate())
-                    .collect();
-            let mut drv = ingress_rss::poller::FetchDriver::new();
-            let mut seen: ingress_rss::SeenRing<256> = ingress_rss::SeenRing::new();
-
-            // Per-fetch TLS connect closure. DNS resolution happens
-            // every fetch — acceptable at minutes cadence.
-            let tls_cfg = tls_config.clone();
-            let connect = move |cfg: &ingress_rss::poller::FeedCfg<'_>| -> std::io::Result<TlsTransport> {
-                let host = match std::str::from_utf8(cfg.host) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return Err(std::io::Error::other("rss: feed host not valid UTF-8"));
-                    }
-                };
-                let addr = match (host, 443u16).to_socket_addrs() {
-                    Ok(mut it) => match it.next() {
-                        Some(a) => a,
-                        None => {
-                            return Err(std::io::Error::other(format!(
-                                "rss: dns: no records for {host}"
-                            )));
-                        }
-                    },
-                    Err(e) => return Err(e),
-                };
-                let server_name = TlsTransport::server_name_from_host(host)
-                    .map_err(|_| std::io::Error::other("rss: bad server name"))?;
-                TlsTransport::connect(addr, server_name, tls_cfg.clone())
-            };
-
-            if let Err(e) = ingress_rss::poller::run::<TlsTransport, _, 256, 1024>(
-                connect,
-                &cfgs,
-                &mut schedules,
-                &mut drv,
-                &mut seen,
-                &mut producer,
-                &SHUTDOWN,
-            ) {
-                tracing::error!(error = ?e, "rss: poller::run returned error");
-            }
-            status.set_state(IngressState::Down);
-            tracing::info!("rss: ingress thread exiting");
-        },
-    )
-}
 
 // ---------------------------------------------------------------
 // Raw-tap flag parsing (--raw-tap / --raw-tap-mode / --raw-tap-budget-mb)
@@ -1430,8 +1297,6 @@ pub struct DrainCounters {
     pub other_venue_ticks: u64,
     /// RPC signals observed.
     pub rpc_signals: u64,
-    /// RSS signals observed.
-    pub rss_signals: u64,
 }
 
 impl DrainCounters {
@@ -1442,7 +1307,6 @@ impl DrainCounters {
         self.binance_ticks += other.binance_ticks;
         self.other_venue_ticks += other.other_venue_ticks;
         self.rpc_signals += other.rpc_signals;
-        self.rss_signals += other.rss_signals;
     }
 }
 
@@ -1453,8 +1317,6 @@ pub struct Consumers {
     pub tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
-    /// RSS signal consumer (cli-level drain; Stage-2 retirement).
-    pub rss_signal: Consumer<Signal, 1024>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
     /// arrive with the venue dispatchers in Phase 8j; paper-mode
     /// fills flow through the engine's dispatcher pump (D3).
@@ -1505,13 +1367,6 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 break;
             }
         }
-        for _ in 0..DRAIN_BATCH {
-            if cons.rss_signal.try_pop().is_some() {
-                period.rss_signals += 1;
-            } else {
-                break;
-            }
-        }
 
         let now = now_ns();
         if now >= next_report {
@@ -1521,7 +1376,6 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 bn_ticks = period.binance_ticks,
                 other_ticks = period.other_venue_ticks,
                 rpc_sigs = period.rpc_signals,
-                rss_sigs = period.rss_signals,
                 "5s ring summary"
             );
             period = DrainCounters::default();
@@ -1896,9 +1750,6 @@ impl Observability {
             let orders_dropped = reg
                 .register_counter("engine_orders_dropped_total")
                 .map_err(|_| "register engine_orders_dropped_total")?;
-            let rss_signals = reg
-                .register_counter("engine_rss_signals_total")
-                .map_err(|_| "register engine_rss_signals_total")?;
             let ingest_p50_ns = reg
                 .register_gauge("engine_latency_ingest_p50_ns")
                 .map_err(|_| "register engine_latency_ingest_p50_ns")?;
@@ -1950,9 +1801,6 @@ impl Observability {
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
-            let ingress_rss_state = reg
-                .register_gauge("engine_ingress_rss_state")
-                .map_err(|_| "register engine_ingress_rss_state")?;
             let max_tick_age_ns = reg
                 .register_gauge("engine_max_tick_age_ns")
                 .map_err(|_| "register engine_max_tick_age_ns")?;
@@ -2035,7 +1883,6 @@ impl Observability {
                 signals,
                 orders_emitted,
                 orders_dropped,
-                rss_signals,
                 ingest_p50_ns,
                 ingest_p99_ns,
                 decide_p50_ns,
@@ -2053,7 +1900,6 @@ impl Observability {
                 ingress_deribit_state,
                 ingress_hyperliquid_state,
                 ingress_rpc_state,
-                ingress_rss_state,
                 max_tick_age_ns,
                 tick_age_ns_per_bucket,
                 ingress_polymarket,
@@ -2198,8 +2044,6 @@ pub struct EngineCounters {
     pub orders_emitted: core_metrics::CounterId,
     /// Orders the dispatcher rejected.
     pub orders_dropped: core_metrics::CounterId,
-    /// RSS items drained at the cli level.
-    pub rss_signals: core_metrics::CounterId,
     /// p50 ingest→strategy latency (ns).
     pub ingest_p50_ns: core_metrics::GaugeId,
     /// p99 ingest→strategy latency (ns).
@@ -2234,8 +2078,6 @@ pub struct EngineCounters {
     pub ingress_hyperliquid_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
-    /// Per-ingress state gauge: RSS poller.
-    pub ingress_rss_state: core_metrics::GaugeId,
     /// Maximum tick age across every observed symbol (ns).
     /// Spikes here surface a silenced market.
     pub max_tick_age_ns: core_metrics::GaugeId,
@@ -2733,13 +2575,12 @@ where
 {
     // Phase 8a lane engine: five tick lanes + one signal lane + four
     // fill lanes. The signal lane is bound to the RPC ring — the D2
-    // disposition for Stage 1 (per §3.3; RSS retires in Stage 2 §8).
+    // disposition for Stage 1 (per §3.3).
     // Fills flow from the dispatcher pump (D3) until 8j wires the
     // per-venue fill-lane producers.
     let Consumers {
         tick_lanes,
         rpc_signal,
-        mut rss_signal,
         fill_lanes,
         ai_cmds,
         ai_status,
@@ -2758,8 +2599,6 @@ where
     }
 
     let mut next_report = now_ns() + REPORT_PERIOD_NS;
-    let mut rss_seen_period: u64 = 0;
-    let mut rss_seen_total: u64 = 0;
     let mut last_ticks = 0u64;
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
@@ -2780,15 +2619,6 @@ where
     while !shutdown_requested() {
         eng.tick(DRAIN_BATCH);
 
-        // RSS drain — cli-level only (Stage-2 retirement, §8.1).
-        for _ in 0..DRAIN_BATCH {
-            if rss_signal.try_pop().is_some() {
-                rss_seen_period += 1;
-            } else {
-                break;
-            }
-        }
-
         let now = now_ns();
         if now >= next_report {
             // Phase 8f: bound fills-capture staging staleness to one
@@ -2804,7 +2634,6 @@ where
             tracing::info!(
                 pm_bn_ticks = ticks - last_ticks,
                 rpc_sigs = signals - last_signals,
-                rss_sigs = rss_seen_period,
                 orders = orders - last_orders,
                 dropped,
                 iter = eng.iterations,
@@ -2819,7 +2648,6 @@ where
                 reg.counter(ids.orders_emitted).inc(orders - last_orders);
                 let total_dropped = dropped;
                 let _ = total_dropped;
-                reg.counter(ids.rss_signals).inc(rss_seen_period);
                 // Latency gauges are full snapshots, not deltas.
                 reg.gauge(ids.ingest_p50_ns).set(eng.ingest_p50_ns() as i64);
                 reg.gauge(ids.ingest_p99_ns).set(eng.ingest_p99_ns() as i64);
@@ -2855,7 +2683,6 @@ where
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
-                    reg.gauge(ids.ingress_rss_state).set(ing.rss.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
                     // monotonic deltas (D4: ring_drops included).
@@ -2962,15 +2789,15 @@ where
                 state.p99_ns[2] = eng.ack_p99_ns();
                 // Ingest health from the real status slots (D7):
                 // bit0 = polymarket, bit1 = binance, bit2 = rpc,
-                // bit3 = rss, bit4 = okx, bit5 = deribit, bit6 = hl
-                // (8e — appended; existing bits never renumber); bit
+                // bit3 = rss (retired 8f — reserved, always 0),
+                // bit4 = okx, bit5 = deribit, bit6 = hl (8e —
+                // appended; existing bits never renumber); bit
                 // set iff the thread is Up.
                 state.ingest_health = match obs.ingress.as_ref() {
                     Some(ing) => {
                         (u8::from(ing.polymarket.state() == IngressState::Up))
                             | (u8::from(ing.binance.state() == IngressState::Up) << 1)
                             | (u8::from(ing.rpc.state() == IngressState::Up) << 2)
-                            | (u8::from(ing.rss.state() == IngressState::Up) << 3)
                             | (u8::from(ing.okx.state() == IngressState::Up) << 4)
                             | (u8::from(ing.deribit.state() == IngressState::Up) << 5)
                             | (u8::from(ing.hyperliquid.state() == IngressState::Up) << 6)
@@ -2983,8 +2810,6 @@ where
             last_ticks = ticks;
             last_signals = signals;
             last_orders = orders;
-            rss_seen_total = rss_seen_total.wrapping_add(rss_seen_period);
-            rss_seen_period = 0;
             next_report = now + REPORT_PERIOD_NS;
         }
 
@@ -3005,7 +2830,6 @@ where
         iterations: eng.iterations,
         ticks_dispatched: eng.ticks_dispatched,
         signals_dispatched: eng.signals_dispatched,
-        rss_signals_drained: rss_seen_total.wrapping_add(rss_seen_period),
         orders_emitted: strategy_core::StrategyCounters::orders_emitted(eng.strategy()),
         orders_dropped: strategy_core::StrategyCounters::orders_dropped(eng.strategy()),
         dispatcher_accepted: eng.dispatcher().stats().accepted,
@@ -3022,8 +2846,6 @@ pub struct EngineLoopStats {
     pub ticks_dispatched: u64,
     /// RPC signals the engine dispatched.
     pub signals_dispatched: u64,
-    /// RSS signals drained at the cli level.
-    pub rss_signals_drained: u64,
     /// Orders the strategy emitted via `ctx.submit`.
     pub orders_emitted: u64,
     /// Orders the dispatcher rejected (ring-full).
@@ -3785,7 +3607,6 @@ mod tests {
         Consumers {
             tick_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
-            rss_signal: rings.rss_signal.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
             ai_status: Arc::new(AiIngressStatus::new()),
@@ -3829,21 +3650,18 @@ mod tests {
             binance_ticks: 2,
             other_venue_ticks: 0,
             rpc_signals: 3,
-            rss_signals: 4,
         };
         let b = DrainCounters {
             polymarket_ticks: 10,
             binance_ticks: 20,
             other_venue_ticks: 5,
             rpc_signals: 30,
-            rss_signals: 40,
         };
         a.add(&b);
         assert_eq!(a.polymarket_ticks, 11);
         assert_eq!(a.binance_ticks, 22);
         assert_eq!(a.other_venue_ticks, 5);
         assert_eq!(a.rpc_signals, 33);
-        assert_eq!(a.rss_signals, 44);
     }
 
     /// Drain loop must exit promptly when `SHUTDOWN` is set, and
@@ -3868,7 +3686,6 @@ mod tests {
         assert_eq!(counters.polymarket_ticks, 0);
         assert_eq!(counters.binance_ticks, 0);
         assert_eq!(counters.rpc_signals, 0);
-        assert_eq!(counters.rss_signals, 0);
 
         // Reset for downstream tests.
         SHUTDOWN.store(false, Ordering::Release);
@@ -4178,9 +3995,9 @@ mod tests {
         }
     }
 
-    /// `rss` is not a capture-bearing venue label (the RSS ingress
-    /// owns no `PmlrCapture`, §6.5) — it must be rejected like any
-    /// other unknown label, not silently ignored.
+    /// `rss` is a retired ingress label (8f item 16) that was never
+    /// capture-bearing (§6.5) — it must stay rejected like any other
+    /// unknown label, not silently ignored.
     #[test]
     fn raw_tap_flags_rejects_rss_label() {
         assert_eq!(

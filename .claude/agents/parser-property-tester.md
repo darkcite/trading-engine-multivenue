@@ -1,6 +1,6 @@
 ---
 name: parser-property-tester
-description: Adversarial property-test author for byte-scanner parsers (crates/core-parse, crates/ingress-polymarket, crates/ingress-binance, crates/ingress-rss, crates/ingress-rpc). Use when a new parser is added, or when an existing parser's surface area grows. Writes proptest cases and a matching cargo-fuzz target. Enforces the invariant "the parser must never panic, never read out of bounds, never allocate unboundedly, regardless of input."
+description: Adversarial property-test author for byte-scanner parsers (crates/core-parse, crates/ingress-polymarket, crates/ingress-binance, crates/ingress-ai, crates/ingress-rpc). Use when a new parser is added, or when an existing parser's surface area grows. Writes proptest cases and a matching cargo-fuzz target. Enforces the invariant "the parser must never panic, never read out of bounds, never allocate unboundedly, regardless of input."
 tools: Read, Grep, Glob, Write, Edit, Bash
 model: sonnet
 ---
