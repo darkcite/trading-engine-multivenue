@@ -7,8 +7,10 @@
 //!
 //! * OKX private/login signing: `Base64(HMAC-SHA256(ts + method + path,
 //!   secret))` (Phase 8 §5.1).
-//! * AI-Ingress frame authentication: `HMAC-SHA256` tag per frame
-//!   (Phase 8 §8.4).
+//! * AI-Ingress frame authentication (Phase 8 §8.4 / 8f §4.1): 16-byte
+//!   truncated `HMAC-SHA256` tag per 82-byte UDS frame
+//!   ([`hmac_sha256_tag16`]), verified with the constant-time compare
+//!   ([`ct_eq`]).
 //! * `core-net` WS handshake key/accept encoding (base64 lives here;
 //!   the WS-specific SHA-1 stays in `core-net::ws_handshake`).
 //!
@@ -288,6 +290,44 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_LEN] {
     outer.finalize()
 }
 
+/// Truncated-MAC width used by the AI-ingress frame protocol
+/// (design 8f §4.1): `tag = HMAC-SHA256(key, cmd)[0..16]`.
+pub const HMAC_TAG16_LEN: usize = 16;
+
+/// HMAC-SHA256 truncated to its leftmost 16 bytes (RFC 2104 §5
+/// truncation; 128-bit tag). The AI-ingress frame tag. Zero-alloc.
+#[inline]
+pub fn hmac_sha256_tag16(key: &[u8], msg: &[u8]) -> [u8; HMAC_TAG16_LEN] {
+    let full = hmac_sha256(key, msg);
+    let mut out = [0u8; HMAC_TAG16_LEN];
+    out.copy_from_slice(&full[..HMAC_TAG16_LEN]);
+    out
+}
+
+/// Constant-time byte-slice equality for MAC verification.
+///
+/// Accumulates XOR differences across the **entire** common width with
+/// no data-dependent branch, so the comparison time is independent of
+/// where the first mismatch sits — the property that defeats
+/// byte-at-a-time tag-forgery timing probes. [`core::hint::black_box`]
+/// pins the accumulator against compiler shortcuts.
+///
+/// Length mismatch returns `false` immediately: lengths are protocol
+/// constants here (16-byte tags in 82-byte frames), never secrets.
+#[inline]
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    let mut i = 0;
+    while i < a.len() {
+        diff = core::hint::black_box(diff | (a[i] ^ b[i]));
+        i += 1;
+    }
+    diff == 0
+}
+
 // ---------------------------------------------------------------
 // Base64 (RFC 4648 §4, standard alphabet, '=' padding)
 // ---------------------------------------------------------------
@@ -471,6 +511,90 @@ mod tests {
             )),
             "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
         );
+    }
+
+    // ---- truncated tag (RFC 4231 case 5 is THE 128-bit KAT) ----
+
+    #[test]
+    fn hmac_tag16_rfc4231_case_5_truncated_vector() {
+        // RFC 4231 test case 5: the only official HMAC-SHA-256 vector
+        // published in truncated-to-128-bits form.
+        let key = [0x0cu8; 20];
+        let tag = hmac_sha256_tag16(&key, b"Test With Truncation");
+        assert_eq!(hex(&tag), "a3b6167473100ee06e0c796c2955552b");
+    }
+
+    #[test]
+    fn hmac_tag16_is_prefix_of_full_mac() {
+        // RFC 2104 §5: truncation keeps the leftmost bytes. Pin against
+        // the case-2 full vector so prefix + KAT agree.
+        let tag = hmac_sha256_tag16(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(hex(&tag), "5bdcc146bf60754e6a042426089575c7");
+        let full = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(tag[..], full[..HMAC_TAG16_LEN]);
+    }
+
+    #[test]
+    fn hmac_tag16_differs_across_keys_and_messages() {
+        // Failure-mode: a wrong key or a flipped message byte must not
+        // verify. (Exercises exactly what the ingress accept path does.)
+        let key = [0xabu8; 32];
+        let msg = [0x11u8; 64];
+        let tag = hmac_sha256_tag16(&key, &msg);
+
+        let mut wrong_key = key;
+        wrong_key[0] ^= 1;
+        assert_ne!(tag, hmac_sha256_tag16(&wrong_key, &msg));
+
+        let mut wrong_msg = msg;
+        wrong_msg[63] ^= 1;
+        assert_ne!(tag, hmac_sha256_tag16(&key, &wrong_msg));
+    }
+
+    // ---- constant-time compare ----
+
+    #[test]
+    fn ct_eq_accepts_equal_slices() {
+        let a = [0x5au8; HMAC_TAG16_LEN];
+        let b = [0x5au8; HMAC_TAG16_LEN];
+        assert!(ct_eq(&a, &b));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn ct_eq_rejects_any_difference() {
+        let a = [0x5au8; HMAC_TAG16_LEN];
+        // First, middle, and last byte — the accumulate-OR must catch
+        // a mismatch at every position.
+        let mut b = a;
+        b[0] ^= 0x01;
+        assert!(!ct_eq(&a, &b));
+        let mut c = a;
+        c[7] ^= 0x80;
+        assert!(!ct_eq(&a, &c));
+        let mut d = a;
+        d[HMAC_TAG16_LEN - 1] ^= 0xFF;
+        assert!(!ct_eq(&a, &d));
+    }
+
+    #[test]
+    fn ct_eq_rejects_length_mismatch() {
+        let a = [0u8; 16];
+        let b = [0u8; 15];
+        assert!(!ct_eq(&a, &b));
+    }
+
+    #[test]
+    fn ct_eq_verifies_a_real_frame_tag() {
+        // End-to-end shape of the 8f accept path: tag over 64 cmd
+        // bytes, verify good, reject forged.
+        let key = [0x42u8; 32];
+        let cmd = [0x07u8; 64];
+        let tag = hmac_sha256_tag16(&key, &cmd);
+        assert!(ct_eq(&tag, &hmac_sha256_tag16(&key, &cmd)));
+        let mut forged = tag;
+        forged[3] ^= 0x10;
+        assert!(!ct_eq(&tag, &forged));
     }
 
     // ---- base64 (RFC 4648 §10) ----
