@@ -1,33 +1,28 @@
 [project]
 name            = "claude-worker"
-version         = "0.1.0"
-description     = "Offline Claude strategy researcher for multivenue trading engine"
+version         = "0.2.0"
+description     = "AI-ingress worker for the multivenue trading engine: serve daemon + operator verbs (8f rewrite)"
 readme          = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 license         = { text = "Apache-2.0" }
 
 dependencies = [
-    # Anthropic SDK — used only in the offline worker, never in hot path.
-    "anthropic>=0.40.0",
-    # Structured logging — offline-only.
-    "structlog>=24.1.0",
-    # CLI entry.
-    "typer>=0.12.0",
-    # TOML config parsing (stdlib `tomllib` is read-only; tomli-w for round-trip).
-    "tomli-w>=1.0.0",
+    # Anthropic SDK — constructed inside `serve` (llm.py seam) ONLY; verbs never touch it.
+    "anthropic>=0.122.0",
+    # HTTP client for news_watcher feed polling + rate-budgeted venue REST.
+    "httpx>=0.28.1",
+    # CLI: serve + operator verbs (design §13 Q4 — Typer verified under 3.14).
+    "typer>=0.27.1",
+    # Structured logging — offline-only, never in any engine hot path.
+    "structlog>=26.1.0",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=5.0.0",
-    "ruff>=0.6.0",
-    "mypy>=1.11.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.3",
+    "mypy>=2.3.1",
 ]
-
-[project.scripts]
-claude-worker = "claude_worker.cli:main"
 
 [build-system]
 requires      = ["hatchling"]
@@ -38,7 +33,7 @@ packages = ["src/claude_worker"]
 
 [tool.ruff]
 line-length    = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 # Enforce codebase rule: "Full `import x` only. Never `from x import y`."
@@ -61,7 +56,7 @@ force-single-line     = true
 force-sort-within-sections = true
 
 [tool.pytest.ini_options]
-minversion = "8.0"
+minversion = "9.0"
 addopts    = "-ra --strict-markers --strict-config"
 testpaths  = ["tests"]
 markers    = [
@@ -70,7 +65,7 @@ markers    = [
 ]
 
 [tool.mypy]
-python_version       = "3.12"
-strict               = true
-warn_unused_ignores  = true
+python_version        = "3.14"
+strict                = true
+warn_unused_ignores   = true
 disallow_any_generics = true

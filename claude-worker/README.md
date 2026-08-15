@@ -1,33 +1,18 @@
 # claude-worker
 
-Offline Python 3.12 process that uses the Anthropic SDK to do **non-hot-path**
-strategy-research work for the Rust latency-arb engine. This process is
-**never** invoked from the engine's hot path. All interaction with the engine
-happens via files on disk (artifacts produced here are consumed at engine boot).
+AI-ingress worker for the multivenue trading engine (Phase 8f rewrite).
+One library core, two frontends over the same code path:
 
-## What it does
+- **`claude-worker serve`** — the only daemon mode (full-auto): news watcher,
+  strategist, backtester, commander on cadences. The only mode that reads
+  `ANTHROPIC_API_KEY` and constructs an SDK client.
+- **Operator verbs** (semi-manual) — `fetch`, `backtest`, `push`, `positions`,
+  `stage-ruleset`, `commit-ruleset`. No daemon, no SDK client; a Claude
+  session (primed by `docs/prompts/ai-session.md`) is the reasoning brain.
 
-- **Bulk topic tagging** of historical ticks / news payloads using `claude-haiku-4-5`.
-- **Rule parsing** — turning natural-language research notes into structured
-  strategy rules — using `claude-sonnet-4-6`.
-- **Backtest review** (Phase 6+) using `claude-opus-4-6`.
+Frames go to the engine over a UDS socket as 82-byte HMAC-tagged `AiCmd`
+frames; gates for ruleset stage/commit live in code, not prompts, and bind
+identically in both modes. See `docs/phase-8f-design.md` for the authority.
 
-## What it does NOT do
-
-- No live Anthropic calls in tests (all calls are mocked at the SDK boundary).
-- No network from the engine's hot path.
-- No `from x import y` — codebase rule. Use full `import x` only.
-
-## Setup
-
-```sh
-uv sync            # install deps + dev deps
-uv run pytest      # run the test suite
-uv run ruff check  # lint
-uv run mypy src    # type-check
-```
-
-## Configuration
-
-Secrets come from the project-root `.env` file. The worker reads
-`ANTHROPIC_API_KEY` at startup and fails fast if it is missing.
+Python 3.14, uv-managed. Run tests: `uv run pytest`.
+Convention: full `import x` only — never `from x import y` (enforced by test).

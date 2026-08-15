@@ -1,7 +1,7 @@
-"""claude-worker — offline strategy researcher.
+"""claude_worker — AI-ingress worker for the multivenue trading engine (8f).
 
-This package is intentionally kept small. All modules follow the codebase rule:
-**full `import x` only — never `from x import y`**.
+Library core + two frontends (serve daemon, operator verbs) over the same
+code path. Offline only: never in the engine hot path.
+
+Convention: full ``import x`` only. No ``from x import y``.
 """
-
-__version__ = "0.1.0"
