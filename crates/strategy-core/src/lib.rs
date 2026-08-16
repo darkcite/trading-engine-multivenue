@@ -108,6 +108,65 @@ pub trait StrategyCounters {
     fn ai_enable_refused(&self) -> u64 {
         0
     }
+
+    // ---- Phase 8g §9 observability family ------------------------
+    //
+    // Set-level values reach the cli's generic 5 s mirror the same
+    // way `ai_enable_refused` does: a default-0 accessor here,
+    // overridden by `strategy-set` — never set-specific engine
+    // plumbing. Bare strategies report 0 on every row, mirroring how
+    // they swallow AI cmds and ruleset tables via the trait defaults.
+    //
+    // NOTE on `enabled_mask`: `StrategySet` also has an *inherent*
+    // `enabled_mask(&self) -> u8`; method-call syntax on the concrete
+    // type resolves to the inherent one, so the cli reads this via
+    // UFCS (`StrategyCounters::enabled_mask(...)`) exactly like the
+    // other rows.
+
+    /// Live strategy-set enable mask (`engine_strategy_enabled_mask`
+    /// gauge — the G0 demo finding: this observable did not exist).
+    /// 0 for plain strategies, which have no mask.
+    #[inline]
+    fn enabled_mask(&self) -> u64 {
+        0
+    }
+    /// vm member: active-table row count (`engine_vm_rows_active`
+    /// gauge; 0 = inert).
+    #[inline]
+    fn vm_rows_active(&self) -> u64 {
+        0
+    }
+    /// vm member: active-table epoch (`engine_vm_table_epoch` gauge;
+    /// 0 = none ever committed).
+    #[inline]
+    fn vm_table_epoch(&self) -> u64 {
+        0
+    }
+    /// vm member: rows whose trigger fired, pre-clamp
+    /// (`engine_vm_fires_total`).
+    #[inline]
+    fn vm_fires(&self) -> u64 {
+        0
+    }
+    /// vm member: orders accepted by the dispatcher
+    /// (`engine_vm_orders_emitted_total` — the kind="vm"
+    /// `StrategyCounters` value, isolated from the set aggregate).
+    #[inline]
+    fn vm_orders_emitted(&self) -> u64 {
+        0
+    }
+    /// vm member: orders rejected by the dispatcher
+    /// (`engine_vm_orders_dropped_total` — kind="vm" value).
+    #[inline]
+    fn vm_orders_dropped(&self) -> u64 {
+        0
+    }
+    /// vm member: in-stream Commits dropped — nothing staged or hash
+    /// mismatch (`engine_vm_commit_dropped_total`, §6).
+    #[inline]
+    fn vm_commit_dropped(&self) -> u64 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------
@@ -358,6 +417,64 @@ mod tests {
         table.len = u32::MAX;
         s.on_ruleset_table(&table);
         assert_eq!(s.ticks, 0);
+    }
+
+    #[test]
+    fn observability_defaults_are_all_zero() {
+        // 8g §9 bare-strategy posture: a strategy that overrides
+        // nothing reports 0 on every observability row — the cli's
+        // generic mirror renders an inert vm family on non-set boots.
+        let s = NoopStrat { started: false, ticks: 0 };
+        assert_eq!(StrategyCounters::enabled_mask(&s), 0);
+        assert_eq!(s.vm_rows_active(), 0);
+        assert_eq!(s.vm_table_epoch(), 0);
+        assert_eq!(s.vm_fires(), 0);
+        assert_eq!(s.vm_orders_emitted(), 0);
+        assert_eq!(s.vm_orders_dropped(), 0);
+        assert_eq!(s.vm_commit_dropped(), 0);
+    }
+
+    #[test]
+    fn observability_overrides_flow_through_the_trait() {
+        // The `ai_enable_refused` route generalized: an overriding
+        // implementor's values reach a generic reader through the
+        // trait (UFCS — the cli never names the concrete type).
+        struct Rich;
+        impl StrategyCounters for Rich {
+            fn enabled_mask(&self) -> u64 {
+                0b10_0011
+            }
+            fn vm_rows_active(&self) -> u64 {
+                7
+            }
+            fn vm_table_epoch(&self) -> u64 {
+                3
+            }
+            fn vm_fires(&self) -> u64 {
+                41
+            }
+            fn vm_orders_emitted(&self) -> u64 {
+                11
+            }
+            fn vm_orders_dropped(&self) -> u64 {
+                2
+            }
+            fn vm_commit_dropped(&self) -> u64 {
+                5
+            }
+        }
+        fn read<S: StrategyCounters>(s: &S) -> [u64; 7] {
+            [
+                StrategyCounters::enabled_mask(s),
+                s.vm_rows_active(),
+                s.vm_table_epoch(),
+                s.vm_fires(),
+                s.vm_orders_emitted(),
+                s.vm_orders_dropped(),
+                s.vm_commit_dropped(),
+            ]
+        }
+        assert_eq!(read(&Rich), [0b10_0011, 7, 3, 41, 11, 2, 5]);
     }
 
     // ---------------- CooldownGate ----------------

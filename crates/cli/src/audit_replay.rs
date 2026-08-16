@@ -29,7 +29,8 @@ use std::io;
 use std::path::Path;
 
 use core_io::{PmlrReader, RawTapReader, SlotKind};
-use core_types::{ChannelEvent, ChannelId, Signal, Tick};
+use core_types::{AiCmd, AiCmdKind, ChannelEvent, ChannelId, Signal, Tick};
+use ingress_ai::AI_CMDS_FILE;
 
 /// Venue labels in capture-file order (`<label>-ticks.pmlr`, …).
 /// Mirrors the cli spawn labels exactly.
@@ -385,6 +386,171 @@ fn preview(payload: &[u8]) -> String {
     s
 }
 
+// ---------------------------------------------------------------
+// AI-command audit (Phase 8g §9 — `slot_kind = 4`)
+// ---------------------------------------------------------------
+
+/// Short per-kind labels, index = `AiCmd::kind` byte (wire-format §3
+/// order). Unknown bytes are counted separately.
+const AI_KIND_LABELS: [&str; 10] = [
+    "HB", "Enable", "Disable", "SetFair", "SetBias", "SetParam", "Intent", "Stage", "Commit",
+    "Halt",
+];
+
+/// Cap on rendered TTL'd-at-pop previews (tap-preview convention).
+const MAX_TTL_PREVIEWS: usize = 8;
+
+/// Audited `ai-cmds.pmlr` (the G0 runbook gap: `audit-replay` never
+/// read the file — G0 verified the capture by direct byte decode).
+#[derive(Default)]
+struct AiCmdAudit {
+    total: u64,
+    per_kind: [u64; 10],
+    unknown_kinds: u64,
+    first_seq: Option<u32>,
+    last_seq: Option<u32>,
+    /// Forward seq holes (jump > +1) and total ids skipped. The
+    /// ingress accepts gapped cmds (counted, never fatal), so holes
+    /// survive into capture — worker restarts and lost frames.
+    seq_gaps: u64,
+    seq_missing: u64,
+    /// `seq ≤ last`. The ingress discards regressions/duplicates
+    /// pre-capture, so any here means a mid-run session restart.
+    seq_regressions: u64,
+    /// Inter-arrival histogram over consecutive Heartbeat slots
+    /// (serve cadence: 5 s → the 2-6 s bucket).
+    hb_hist: Hist,
+    hb_count: u64,
+    /// Rendered Stage/Commit rows (hash128 hex from the px/qty
+    /// halves — the §6 identity pairing).
+    stage_commit_rows: Vec<String>,
+    /// TTL'd-at-pop annotation count + bounded previews. See
+    /// [`audit_ai_cmds`] for the exact (capture-relative) semantic.
+    ttl_flagged: u64,
+    ttl_previews: Vec<String>,
+}
+
+/// Audit the run's `ai-cmds.pmlr` records.
+///
+/// **TTL'd-at-pop semantic (capture-relative, documented 8g G6):**
+/// capture records accept time only — the engine's pop instant is not
+/// in the file. A slot is annotated when `ttl_ns != 0` and its
+/// deadline (`ts_ns + ttl_ns`) precedes the capture's last observed
+/// `ts_ns`: the validity window provably closed while the session was
+/// still accepting traffic, so a pop from then on would have dropped
+/// it (`engine drain rule: now - ts_ns > ttl_ns`). Actual drops are
+/// the run's `engine_ingress_ai_expired_total` — the report prints
+/// both so the operator compares one number against one number, like
+/// the gap-pairing section. `ttl_ns == 0` (ruleset frames, §13) never
+/// flags.
+fn audit_ai_cmds(r: &PmlrReader<AiCmd>) -> AiCmdAudit {
+    let mut out = AiCmdAudit::default();
+    let recs = r.records();
+    let last_ts = recs.iter().map(|c| c.ts_ns).max().unwrap_or(0);
+    let mut last_hb_ts: Option<u64> = None;
+    for c in recs {
+        out.total += 1;
+        match AiCmdKind::from_u8(c.kind) {
+            Some(k) => out.per_kind[k.to_u8() as usize] += 1,
+            None => out.unknown_kinds += 1,
+        }
+        if out.first_seq.is_none() {
+            out.first_seq = Some(c.seq);
+        }
+        if let Some(last) = out.last_seq {
+            if c.seq <= last {
+                out.seq_regressions += 1;
+            } else if c.seq > last + 1 {
+                out.seq_gaps += 1;
+                out.seq_missing += u64::from(c.seq - last - 1);
+            }
+        }
+        out.last_seq = Some(c.seq);
+
+        let ttl_flagged = c.ttl_ns != 0 && c.ts_ns.saturating_add(c.ttl_ns) < last_ts;
+        if ttl_flagged {
+            out.ttl_flagged += 1;
+            if out.ttl_previews.len() < MAX_TTL_PREVIEWS {
+                let label = AiCmdKind::from_u8(c.kind)
+                    .map(|k| AI_KIND_LABELS[k.to_u8() as usize])
+                    .unwrap_or("?");
+                out.ttl_previews.push(format!(
+                    "{label} seq={} ts={} ttl_ns={} (deadline {} < last capture ts {last_ts})",
+                    c.seq,
+                    c.ts_ns,
+                    c.ttl_ns,
+                    c.ts_ns.saturating_add(c.ttl_ns),
+                ));
+            }
+        }
+
+        match AiCmdKind::from_u8(c.kind) {
+            Some(AiCmdKind::Heartbeat) => {
+                out.hb_count += 1;
+                if let Some(prev) = last_hb_ts {
+                    if c.ts_ns >= prev {
+                        out.hb_hist.push(c.ts_ns - prev);
+                    }
+                }
+                last_hb_ts = Some(c.ts_ns);
+            }
+            Some(k @ (AiCmdKind::RulesetStage | AiCmdKind::RulesetCommit)) => {
+                let h = c.ruleset_hash128();
+                let mut hex = String::with_capacity(32);
+                for b in h {
+                    hex.push_str(&format!("{b:02x}"));
+                }
+                out.stage_commit_rows.push(format!(
+                    "{} seq={} ts={} hash128={hex}{}",
+                    AI_KIND_LABELS[k.to_u8() as usize],
+                    c.seq,
+                    c.ts_ns,
+                    if ttl_flagged { " TTL'D-AT-POP" } else { "" },
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Render the §9 AI-command section.
+fn render_ai_cmds(report: &mut String, a: &AiCmdAudit) {
+    report.push_str("\n== ai commands (ai-cmds.pmlr, slot_kind = 4) ==\n");
+    report.push_str(&format!(
+        "  ai: cmds={} unknown_kinds={}\n",
+        a.total, a.unknown_kinds
+    ));
+    report.push_str("  per-kind:");
+    for (i, label) in AI_KIND_LABELS.iter().enumerate() {
+        report.push_str(&format!(" {label}={}", a.per_kind[i]));
+    }
+    report.push('\n');
+    report.push_str(&format!(
+        "  seq: first={} last={} gaps={} missing={} regressions={}\n",
+        a.first_seq.map_or("-".to_string(), |s| s.to_string()),
+        a.last_seq.map_or("-".to_string(), |s| s.to_string()),
+        a.seq_gaps,
+        a.seq_missing,
+        a.seq_regressions,
+    ));
+    report.push_str(&format!(
+        "  heartbeats n={} | {}\n",
+        a.hb_count,
+        a.hb_hist.render()
+    ));
+    for row in &a.stage_commit_rows {
+        report.push_str(&format!("  {row}\n"));
+    }
+    report.push_str(&format!(
+        "  ttl'd-at-pop (capture-relative): flagged={} — cross-check the run's engine_ingress_ai_expired_total\n",
+        a.ttl_flagged
+    ));
+    for (i, p) in a.ttl_previews.iter().enumerate() {
+        report.push_str(&format!("    ttl[{i}]: {p}\n"));
+    }
+}
+
 /// Audit one venue's raw tap.
 fn audit_tap(path: &Path, out: &mut VenueAudit) -> io::Result<()> {
     let mut r = match RawTapReader::open(path) {
@@ -518,12 +684,30 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
         }
     }
 
-    if audits.is_empty() {
+    // Phase 8g §9: the run's AI-command capture (single file, not a
+    // venue triple — G0 finding 4: this file was never read here).
+    let ai_path = dir.join(AI_CMDS_FILE);
+    let ai_audit = if ai_path.exists() {
+        let r = PmlrReader::<AiCmd>::open(&ai_path)?;
+        if r.slot_kind() != SlotKind::AiCmd {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not an ai-cmd log", ai_path.display()),
+            ));
+        }
+        Some(audit_ai_cmds(&r))
+    } else {
+        None
+    };
+
+    if audits.is_empty() && ai_audit.is_none() {
         report.push_str("no capture files found\n");
         return Ok(report);
     }
 
     // ---- coverage matrix ------------------------------------------
+    // Venue-driven sections render only when venue files exist — an
+    // ai-cmds-only run (8g §9) skips straight to its own section.
     const MATRIX_CHANNELS: [ChannelId; 9] = [
         ChannelId::Trade,
         ChannelId::Book,
@@ -535,62 +719,64 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
         ChannelId::OutcomeMeta,
         ChannelId::PriceChange,
     ];
-    report.push_str("\n== venue x channel coverage (message counts) ==\n");
-    report.push_str(&format!("  {:<8} {:>10} {:>10}", "venue", "ticks", "signals"));
-    for ch in MATRIX_CHANNELS {
-        report.push_str(&format!(" {:>12}", ch.as_str()));
-    }
-    report.push('\n');
-    for (label, a) in &audits {
-        report.push_str(&format!(
-            "  {:<8} {:>10} {:>10}",
-            label,
-            a.ticks_total(),
-            a.signals_count
-        ));
+    if !audits.is_empty() {
+        report.push_str("\n== venue x channel coverage (message counts) ==\n");
+        report.push_str(&format!("  {:<8} {:>10} {:>10}", "venue", "ticks", "signals"));
         for ch in MATRIX_CHANNELS {
-            report.push_str(&format!(" {:>12}", a.channel_total(ch)));
+            report.push_str(&format!(" {:>12}", ch.as_str()));
         }
         report.push('\n');
-    }
-
-    // ---- per-venue detail -----------------------------------------
-    report.push_str("\n== per-symbol streams (rates, integrity, cadence) ==\n");
-    for (label, a) in &audits {
-        render_stream(&mut report, label, Stream::Ticks, &a.ticks);
-        for (ch, stats) in &a.events {
-            render_stream(&mut report, label, Stream::Event(*ch), stats);
-        }
-        if a.signals_count > 0 {
+        for (label, a) in &audits {
             report.push_str(&format!(
-                "  {} {:<12} n={} | {}\n",
+                "  {:<8} {:>10} {:>10}",
                 label,
-                "signals",
-                a.signals_count,
-                a.signals_hist.render()
+                a.ticks_total(),
+                a.signals_count
             ));
+            for ch in MATRIX_CHANNELS {
+                report.push_str(&format!(" {:>12}", a.channel_total(ch)));
+            }
+            report.push('\n');
         }
-    }
 
-    // ---- integrity totals -----------------------------------------
-    report.push_str("\n== integrity totals ==\n");
-    for (label, a) in &audits {
-        let regr: u64 = a.ticks.iter().map(|s| s.seq_regressions).sum();
-        let mut holes = 0u64;
-        let mut missing = 0u64;
-        let mut breaks = 0u64;
-        for (_, stats) in &a.events {
-            for s in stats {
-                holes += s.seq_holes;
-                missing += s.seq_missing;
-                breaks += s.chain_breaks;
+        // ---- per-venue detail -------------------------------------
+        report.push_str("\n== per-symbol streams (rates, integrity, cadence) ==\n");
+        for (label, a) in &audits {
+            render_stream(&mut report, label, Stream::Ticks, &a.ticks);
+            for (ch, stats) in &a.events {
+                render_stream(&mut report, label, Stream::Event(*ch), stats);
+            }
+            if a.signals_count > 0 {
+                report.push_str(&format!(
+                    "  {} {:<12} n={} | {}\n",
+                    label,
+                    "signals",
+                    a.signals_count,
+                    a.signals_hist.render()
+                ));
             }
         }
-        report.push_str(&format!(
-            "  {label}: tick_seq_regressions={regr} trade_holes={holes} trade_ids_missing={missing} book_chain_breaks={breaks}\n"
-        ));
+
+        // ---- integrity totals -------------------------------------
+        report.push_str("\n== integrity totals ==\n");
+        for (label, a) in &audits {
+            let regr: u64 = a.ticks.iter().map(|s| s.seq_regressions).sum();
+            let mut holes = 0u64;
+            let mut missing = 0u64;
+            let mut breaks = 0u64;
+            for (_, stats) in &a.events {
+                for s in stats {
+                    holes += s.seq_holes;
+                    missing += s.seq_missing;
+                    breaks += s.chain_breaks;
+                }
+            }
+            report.push_str(&format!(
+                "  {label}: tick_seq_regressions={regr} trade_holes={holes} trade_ids_missing={missing} book_chain_breaks={breaks}\n"
+            ));
+        }
+        report.push_str("  note: ring_drops/parse_errors are engine counters (/metrics), not derivable from capture files.\n");
     }
-    report.push_str("  note: ring_drops/parse_errors are engine counters (/metrics), not derivable from capture files.\n");
 
     // ---- gap pairing (§6.6 letter, G1 remediation) ----------------
     render_pairing(&mut report, &audits);
@@ -611,6 +797,11 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
                 report.push_str(&format!("    reject[{i}]: {p}\n"));
             }
         }
+    }
+
+    // ---- ai commands (8g §9, slot_kind = 4) -----------------------
+    if let Some(a) = ai_audit.as_ref() {
+        render_ai_cmds(&mut report, a);
     }
 
     Ok(report)
@@ -1097,5 +1288,215 @@ mod tests {
 
         let missing = temp_run_dir("missing");
         assert!(run_audit(&missing).is_err());
+    }
+
+    // ------------- ai commands (8g §9, slot_kind = 4) -------------
+
+    /// Production-like base clock (house rule for synthetic drives).
+    const AI_T0: u64 = 100_000_000_000_000_000;
+
+    /// One 64-B AiCmd slot for fixtures; `hash` rides the px/qty
+    /// halves exactly as the §6 identity pairing defines.
+    fn ai_slot(kind: AiCmdKind, seq: u32, ts: u64, ttl_ns: u64, hash: Option<[u8; 16]>) -> AiCmd {
+        let (px, qty) = match hash {
+            Some(h) => (
+                i64::from_le_bytes(h[..8].try_into().unwrap()),
+                i64::from_le_bytes(h[8..].try_into().unwrap()),
+            ),
+            None => (0, 0),
+        };
+        AiCmd::new(
+            ts,
+            seq,
+            core_types::SYMBOL_ID_NONE,
+            px,
+            qty,
+            ttl_ns,
+            kind,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_NONE,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        )
+    }
+
+    /// Write `ai-cmds.pmlr` with the core-io single-file writer (the
+    /// exact production sink under `AiCmdCapture`).
+    fn write_ai_cmds(dir: &Path, cmds: &[AiCmd]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut c = core_io::SlotCapture::<AiCmd>::open(
+            dir.join(AI_CMDS_FILE),
+            SlotKind::AiCmd,
+            7,
+        )
+        .unwrap();
+        for cmd in cmds {
+            c.append(cmd);
+        }
+        c.flush_all().unwrap();
+    }
+
+    /// §9 happy path over an ai-cmds-only run dir: per-kind counts,
+    /// seq continuity (a forward gap), the heartbeat cadence
+    /// histogram, and Stage/Commit rows with hash128 hex — the run
+    /// shape the G0 runbook could not audit (finding 4).
+    #[test]
+    fn ai_cmds_section_counts_seq_heartbeats_and_hashes() {
+        let dir = temp_run_dir("ai_full");
+        let h: [u8; 16] = [0xAB; 16];
+        write_ai_cmds(
+            &dir,
+            &[
+                ai_slot(AiCmdKind::Heartbeat, 1, AI_T0, 0, None),
+                ai_slot(AiCmdKind::Heartbeat, 2, AI_T0 + 5_000_000_000, 0, None),
+                ai_slot(AiCmdKind::RulesetStage, 3, AI_T0 + 6_000_000_000, 0, Some(h)),
+                ai_slot(AiCmdKind::RulesetCommit, 4, AI_T0 + 7_000_000_000, 0, Some(h)),
+                // 4 → 7: one hole, two ids missing (worker restart /
+                // lost-frame shape — accepted gapped, §4.4).
+                ai_slot(AiCmdKind::Heartbeat, 7, AI_T0 + 10_000_000_000, 0, None),
+            ],
+        );
+        let report = run_audit(&dir).unwrap();
+        assert!(
+            report.contains("== ai commands (ai-cmds.pmlr, slot_kind = 4) =="),
+            "{report}"
+        );
+        assert!(report.contains("ai: cmds=5 unknown_kinds=0"), "{report}");
+        assert!(
+            report.contains("per-kind: HB=3 Enable=0 Disable=0 SetFair=0 SetBias=0 SetParam=0 Intent=0 Stage=1 Commit=1 Halt=0"),
+            "{report}"
+        );
+        assert!(
+            report.contains("seq: first=1 last=7 gaps=1 missing=2 regressions=0"),
+            "{report}"
+        );
+        // Serve-cadence heartbeats: both 5 s inter-arrivals land in
+        // the 2-6 s bucket.
+        assert!(report.contains("heartbeats n=3 | 2-6s:2"), "{report}");
+        let hex = "ab".repeat(16);
+        assert!(
+            report.contains(&format!("Stage seq=3 ts={} hash128={hex}", AI_T0 + 6_000_000_000)),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("Commit seq=4 ts={} hash128={hex}", AI_T0 + 7_000_000_000)),
+            "{report}"
+        );
+        // Ruleset frames ride ttl_ns = 0 (§13): nothing flags.
+        assert!(
+            report.contains("ttl'd-at-pop (capture-relative): flagged=0"),
+            "{report}"
+        );
+        // An ai-only run renders WITHOUT venue sections and is not
+        // "no capture files found".
+        assert!(!report.contains("no capture files found"), "{report}");
+        assert!(!report.contains("== venue x channel coverage"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TTL'd-at-pop fixture + seq regression: slots whose validity
+    /// window provably closed inside the capture's own timeline flag
+    /// (capture-relative semantic — pop time is not in the file);
+    /// `ttl_ns = 0` and deadlines past the last record never flag. A
+    /// ttl'd Stage row carries the inline annotation — a §13
+    /// anomaly made visible.
+    #[test]
+    fn ai_cmds_ttl_flagged_at_pop_and_regressions() {
+        let dir = temp_run_dir("ai_ttl");
+        let h: [u8; 16] = [0x11; 16];
+        write_ai_cmds(
+            &dir,
+            &[
+                // Deadline AI_T0+1s — closed long before the last
+                // record → flagged.
+                ai_slot(AiCmdKind::SetFairValue, 1, AI_T0, 1_000_000_000, None),
+                // Anomalous ttl'd Stage (rulesets ride ttl 0):
+                // deadline AI_T0+3s → flagged, row annotated.
+                ai_slot(
+                    AiCmdKind::RulesetStage,
+                    2,
+                    AI_T0 + 1_000_000_000,
+                    2_000_000_000,
+                    Some(h),
+                ),
+                ai_slot(AiCmdKind::Heartbeat, 3, AI_T0 + 5_000_000_000, 0, None),
+                // Regression (1 ≤ 3) + a deadline far past the file
+                // end — regressions count, no TTL flag.
+                ai_slot(
+                    AiCmdKind::SetBias,
+                    1,
+                    AI_T0 + 6_000_000_000,
+                    3_600_000_000_000,
+                    None,
+                ),
+            ],
+        );
+        let report = run_audit(&dir).unwrap();
+        assert!(report.contains("seq: first=1 last=1 gaps=0 missing=0 regressions=1"), "{report}");
+        assert!(
+            report.contains("ttl'd-at-pop (capture-relative): flagged=2"),
+            "{report}"
+        );
+        assert!(report.contains("ttl[0]: SetFair seq=1"), "{report}");
+        assert!(report.contains("ttl[1]: Stage seq=2"), "{report}");
+        let hex = "11".repeat(16);
+        assert!(
+            report.contains(&format!(
+                "Stage seq=2 ts={} hash128={hex} TTL'D-AT-POP",
+                AI_T0 + 1_000_000_000
+            )),
+            "{report}"
+        );
+        // The cross-check pointer the runbook pairs with /metrics.
+        assert!(
+            report.contains("cross-check the run's engine_ingress_ai_expired_total"),
+            "{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Failure mode: a file named `ai-cmds.pmlr` whose header carries
+    /// a different slot kind is structurally corrupt for this audit —
+    /// hard error, exactly like the venue logs.
+    #[test]
+    fn ai_cmds_wrong_slot_kind_errors() {
+        let dir = temp_run_dir("ai_wrong_kind");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut c = core_io::SlotCapture::<Tick>::open(
+                dir.join(AI_CMDS_FILE),
+                SlotKind::Tick,
+                7,
+            )
+            .unwrap();
+            c.append(&tick(AI_T0, 1, 1));
+            c.flush_all().unwrap();
+        }
+        let err = run_audit(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A venue + ai mixed run renders both halves — the 8h+ demo
+    /// runbook shape (venue captures AND the cmd stream in one dir).
+    #[test]
+    fn ai_cmds_section_coexists_with_venue_sections() {
+        let dir = temp_run_dir("ai_mixed");
+        {
+            let mut c = PmlrCapture::open(&dir, "okx", 7, TapCfg::off()).unwrap();
+            let sym = core_types::make_symbol_id(VenueId::Okx, 1);
+            c.tick(&tick(AI_T0, sym, 1));
+            c.flush_all().unwrap();
+        }
+        write_ai_cmds(&dir, &[ai_slot(AiCmdKind::Heartbeat, 1, AI_T0, 0, None)]);
+        let report = run_audit(&dir).unwrap();
+        assert!(report.contains("== venue x channel coverage"), "{report}");
+        assert!(
+            report.contains("== ai commands (ai-cmds.pmlr, slot_kind = 4) =="),
+            "{report}"
+        );
+        assert!(report.contains("ai: cmds=1 unknown_kinds=0"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

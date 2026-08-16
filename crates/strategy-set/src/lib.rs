@@ -333,6 +333,45 @@ impl StrategyCounters for StrategySet {
     fn ai_enable_refused(&self) -> u64 {
         self.enable_refused
     }
+
+    // ---- Phase 8g §9 family (cli 5 s mirror reads via UFCS) ------
+    //
+    // Same route as `ai_enable_refused`: set-level values cross the
+    // generic engine boundary through these overrides — the loop
+    // never names `StrategySet`. The vm rows isolate the vm member
+    // (kind="vm" counters), NOT the set aggregates above.
+
+    /// Live enable mask (`engine_strategy_enabled_mask`). Shadowed by
+    /// the inherent u8 accessor on method-call syntax — see the trait
+    /// docs; readers use UFCS.
+    #[inline]
+    fn enabled_mask(&self) -> u64 {
+        u64::from(self.enabled)
+    }
+    #[inline]
+    fn vm_rows_active(&self) -> u64 {
+        u64::from(self.vm.rows_active())
+    }
+    #[inline]
+    fn vm_table_epoch(&self) -> u64 {
+        u64::from(self.vm.active_epoch())
+    }
+    #[inline]
+    fn vm_fires(&self) -> u64 {
+        self.vm.fires
+    }
+    #[inline]
+    fn vm_orders_emitted(&self) -> u64 {
+        self.vm.orders_emitted()
+    }
+    #[inline]
+    fn vm_orders_dropped(&self) -> u64 {
+        self.vm.orders_dropped()
+    }
+    #[inline]
+    fn vm_commit_dropped(&self) -> u64 {
+        self.vm.commits_dropped
+    }
 }
 
 impl Strategy for StrategySet {
@@ -1069,6 +1108,47 @@ mod tests {
         assert_eq!(s.vm().commits_applied, 0, "bit off → frame never arrives");
         assert_eq!(s.vm().commits_dropped, 0);
         assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A));
+    }
+
+    /// 8g §9: the observability overrides surface live set/vm state
+    /// through the `StrategyCounters` trait (UFCS — the cli's generic
+    /// mirror route). Happy path: mask + the whole vm family after a
+    /// stage → commit → fire cycle; the vm rows isolate the member
+    /// from the set aggregate.
+    #[test]
+    fn observability_overrides_surface_vm_state() {
+        let mut s = StrategySet::new(BIT_VM);
+        let mut c = vm_ctx();
+        s.on_start(&mut c).unwrap();
+        assert_eq!(StrategyCounters::enabled_mask(&s), u64::from(BIT_VM));
+        assert_eq!(StrategyCounters::vm_rows_active(&s), 0, "inert boot");
+        assert_eq!(StrategyCounters::vm_table_epoch(&s), 0);
+
+        // Mask reads move with enable/disable (the G0 demo gap: the
+        // flip becomes directly observable, not order-flow-inferred).
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_LATENCY_ARB), &mut c);
+        assert_eq!(
+            StrategyCounters::enabled_mask(&s),
+            u64::from(BIT_VM | BIT_LATENCY_ARB)
+        );
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB), &mut c);
+        assert_eq!(StrategyCounters::enabled_mask(&s), u64::from(BIT_VM));
+
+        // Mismatched Commit → vm_commit_dropped through the trait.
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_B), &mut c);
+        assert_eq!(StrategyCounters::vm_commit_dropped(&s), 1);
+
+        // Stage → Commit → tick-fire; every §9 row goes live.
+        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut c);
+        s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut c);
+        assert_eq!(StrategyCounters::vm_rows_active(&s), 1);
+        assert_eq!(StrategyCounters::vm_table_epoch(&s), 1);
+        assert_eq!(StrategyCounters::vm_fires(&s), 1);
+        assert_eq!(StrategyCounters::vm_orders_emitted(&s), 1);
+        assert_eq!(StrategyCounters::vm_orders_dropped(&s), 0);
+        assert_eq!(s.vm().fires, StrategyCounters::vm_fires(&s), "trait == member");
     }
 
     // ------------- engine table-pop seam (8g item 7) -------------

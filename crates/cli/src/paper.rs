@@ -1957,6 +1957,12 @@ impl Observability {
             // fills-capture pair (mirrored centrally).
             let ingress_ai = register_ai_counters(&mut reg)?;
             let capture_ai = register_capture_gauges(&mut reg, "ai")?;
+            // Phase-8g §9: the enable-mask gauge + the vm family
+            // (mirrored centrally via the StrategyCounters defaults).
+            let strategy_enabled_mask = reg
+                .register_gauge("engine_strategy_enabled_mask")
+                .map_err(|_| "register engine_strategy_enabled_mask")?;
+            let vm = register_vm_metrics(&mut reg)?;
             let fills_capture = {
                 let io_errors = reg
                     .register_gauge("engine_fills_capture_io_errors")
@@ -2011,6 +2017,8 @@ impl Observability {
                 ingress_ai,
                 capture_ai,
                 fills_capture,
+                strategy_enabled_mask,
+                vm,
             });
         }
         if enable_tui {
@@ -2221,6 +2229,14 @@ pub struct EngineCounters {
     /// centrally from the engine loop (unlike the per-thread venue
     /// pairs — the engine owns this capture).
     pub fills_capture: CaptureGaugeIds,
+    /// Phase-8g §9: the set's live enable mask
+    /// (`engine_strategy_enabled_mask` — the G0 demo finding: the
+    /// flip was only inferable from order-flow deltas). Read via the
+    /// `StrategyCounters` default route; 0 on bare-strategy boots.
+    pub strategy_enabled_mask: GaugeId,
+    /// Phase-8g §9 vm-member family (`engine_vm_*`), mirrored
+    /// centrally on the 5 s cadence.
+    pub vm: VmMetricIds,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -2288,6 +2304,12 @@ pub struct AiIngressCounterIds {
     /// `engine_ai_ruleset_rejected_total` — Stage/Commit refusals
     /// (artifact missing/unreadable, hash mismatch, unstaged commit).
     pub ruleset_rejected: core_metrics::CounterId,
+    /// `engine_ai_table_push_fail_total` — 8g §9: Stages that passed
+    /// the §4.2 validator but were REJECTED at the table-ring
+    /// `try_push` (§5 push-full; isolates the cause inside
+    /// `ruleset_rejected`). Unreachable at operator cadence against a
+    /// running engine since item 7 — it counts engine-down staging.
+    pub table_push_fail: core_metrics::CounterId,
     /// `engine_ingress_ai_last_heartbeat_age_ns` gauge. Derived as
     /// `now - last_heartbeat_ns` at mirror time; **-1 is the sentinel
     /// for "no heartbeat ever accepted"** (`last_heartbeat_ns == 0`) —
@@ -2315,6 +2337,7 @@ struct AiCountersSnapshot {
     ruleset_staged: u64,
     ruleset_committed: u64,
     ruleset_rejected: u64,
+    table_push_fail: u64,
 }
 
 /// Mirror the AI status slot (+ the engine drain-site counter) into
@@ -2344,6 +2367,7 @@ fn mirror_ai_counters(
         ruleset_staged: st.ruleset_staged(),
         ruleset_committed: st.ruleset_committed(),
         ruleset_rejected: st.ruleset_rejected(),
+        table_push_fail: st.table_push_fail(),
     };
     reg.counter(ids.cmds).inc(cur.cmds.saturating_sub(last.cmds));
     reg.counter(ids.hmac_fail)
@@ -2372,6 +2396,8 @@ fn mirror_ai_counters(
         .inc(cur.ruleset_committed.saturating_sub(last.ruleset_committed));
     reg.counter(ids.ruleset_rejected)
         .inc(cur.ruleset_rejected.saturating_sub(last.ruleset_rejected));
+    reg.counter(ids.table_push_fail)
+        .inc(cur.table_push_fail.saturating_sub(last.table_push_fail));
     // Heartbeat age: -1 sentinel for "never" (see the field docs).
     let hb = st.last_heartbeat_ns();
     reg.gauge(ids.last_heartbeat_age_ns).set(if hb == 0 {
@@ -2407,7 +2433,97 @@ fn register_ai_counters(
         ruleset_staged: one("engine_ai_ruleset_staged_total")?,
         ruleset_committed: one("engine_ai_ruleset_committed_total")?,
         ruleset_rejected: one("engine_ai_ruleset_rejected_total")?,
+        table_push_fail: one("engine_ai_table_push_fail_total")?,
         last_heartbeat_age_ns,
+    })
+}
+
+// ---------------------------------------------------------------
+// Phase 8g §9 — set/vm observability (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// Registry handles for the 8g §9 vm-member family (`engine_vm_*`).
+/// Values cross the generic engine boundary via the
+/// `StrategyCounters` default accessors (the `ai_enable_refused`
+/// route — no set-specific plumbing in the loop); bare-strategy
+/// boots mirror an all-zero family from the trait defaults.
+#[derive(Copy, Clone, Debug)]
+pub struct VmMetricIds {
+    /// `engine_vm_rows_active` — active-table `len` (0 = inert).
+    pub rows_active: GaugeId,
+    /// `engine_vm_table_epoch` — active-table `epoch` (0 = none
+    /// ever).
+    pub table_epoch: GaugeId,
+    /// `engine_vm_fires_total` — rows fired (pre-clamp).
+    pub fires: core_metrics::CounterId,
+    /// `engine_vm_orders_emitted_total` — via StrategyCounters
+    /// kind="vm" (the vm member's own count, not the set aggregate).
+    pub orders_emitted: core_metrics::CounterId,
+    /// `engine_vm_orders_dropped_total` — kind="vm" value.
+    pub orders_dropped: core_metrics::CounterId,
+    /// `engine_vm_commit_dropped_total` — in-stream Commit with
+    /// no/mismatched staged table (§6).
+    pub commit_dropped: core_metrics::CounterId,
+}
+
+/// Last-mirrored cumulative vm-member counter values — same delta
+/// bookkeeping as [`AiCountersSnapshot`] (registry counters get
+/// monotonic deltas; the sources are cumulative strategy counters).
+#[derive(Copy, Clone, Debug, Default)]
+struct VmCountersSnapshot {
+    fires: u64,
+    orders_emitted: u64,
+    orders_dropped: u64,
+    commit_dropped: u64,
+}
+
+/// Mirror the §9 vm family: gauges as sets, counters as monotonic
+/// deltas. Generic over the strategy — the trait defaults make this
+/// a zero-mirror on bare-strategy boots. 5 s cadence — cold path.
+fn mirror_vm_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &VmMetricIds,
+    strat: &S,
+    last: &mut VmCountersSnapshot,
+) {
+    reg.gauge(ids.rows_active).set(strat.vm_rows_active() as i64);
+    reg.gauge(ids.table_epoch).set(strat.vm_table_epoch() as i64);
+    let cur = VmCountersSnapshot {
+        fires: strat.vm_fires(),
+        orders_emitted: strat.vm_orders_emitted(),
+        orders_dropped: strat.vm_orders_dropped(),
+        commit_dropped: strat.vm_commit_dropped(),
+    };
+    reg.counter(ids.fires).inc(cur.fires.saturating_sub(last.fires));
+    reg.counter(ids.orders_emitted)
+        .inc(cur.orders_emitted.saturating_sub(last.orders_emitted));
+    reg.counter(ids.orders_dropped)
+        .inc(cur.orders_dropped.saturating_sub(last.orders_dropped));
+    reg.counter(ids.commit_dropped)
+        .inc(cur.commit_dropped.saturating_sub(last.commit_dropped));
+    *last = cur;
+}
+
+/// Register the §9 vm-member family. Boot-only.
+fn register_vm_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<VmMetricIds, &'static str> {
+    let rows_active = reg
+        .register_gauge("engine_vm_rows_active")
+        .map_err(|_| "register engine_vm_rows_active")?;
+    let table_epoch = reg
+        .register_gauge("engine_vm_table_epoch")
+        .map_err(|_| "register engine_vm_table_epoch")?;
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name).map_err(|_| "register vm counter")
+    };
+    Ok(VmMetricIds {
+        fires: one("engine_vm_fires_total")?,
+        orders_emitted: one("engine_vm_orders_emitted_total")?,
+        orders_dropped: one("engine_vm_orders_dropped_total")?,
+        commit_dropped: one("engine_vm_commit_dropped_total")?,
+        rows_active,
+        table_epoch,
     })
 }
 
@@ -2709,6 +2825,8 @@ where
     let mut ingress_last = [IngressCountersSnapshot::default(); 6];
     // Phase-8f AI-family delta snapshot (same bookkeeping).
     let mut ai_last = AiCountersSnapshot::default();
+    // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
+    let mut vm_last = VmCountersSnapshot::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -2768,6 +2886,14 @@ where
                     .set(if kind == "rule-tree" { 1 } else { 0 });
                 reg.gauge(ids.strategy_set)
                     .set(if kind == "set" { 1 } else { 0 });
+
+                // Phase-8g §9: live enable mask (the G0 demo
+                // finding) + the vm family. Both ride the
+                // StrategyCounters-default route (UFCS — the set
+                // overrides, bare strategies mirror zeros).
+                reg.gauge(ids.strategy_enabled_mask)
+                    .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
+                mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
 
                 // Per-ingress connection state — real per-thread
                 // status slots (D7 fix). Gauge value = IngressState:
@@ -4208,5 +4334,202 @@ mod tests {
 
         let cfg = parse_raw_tap_flags(Some("hl"), "all", u64::MAX).unwrap();
         assert_eq!(cfg.hl.budget_bytes, u64::MAX);
+    }
+
+    // ------------- Phase 8g §9 — set/vm observability -------------
+
+    /// Production-like clock for synthetic vm drives (the G3 lesson:
+    /// cooldown first-window semantics need `now` ≥ horizon, which
+    /// wallclock ns trivially satisfies).
+    const VM_T0: NsTs = 100_000_000_000_000_000;
+    const VM_HASH: [u8; 16] = [0x5A; 16];
+    const VM_PM: SymbolId = 11;
+    const VM_BN: SymbolId = 22;
+
+    struct VmMirrorCtx {
+        now: NsTs,
+    }
+
+    impl strategy_core::Ctx for VmMirrorCtx {
+        fn submit(&mut self, _order: core_types::Order) -> Result<(), strategy_core::SubmitErr> {
+            Ok(())
+        }
+        fn now_ns(&self) -> NsTs {
+            self.now
+        }
+    }
+
+    fn vm_mirror_table() -> core_types::RuleTable {
+        let mut t = core_types::RuleTable::EMPTY;
+        t.rows[0] = core_types::RuleRow::new(
+            VM_PM,
+            VM_BN,
+            20,
+            0,
+            0,
+            1_000_000,
+            core_types::fnv1a_64(b"g6-mirror"),
+            core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
+            core_types::RuleRow::SIDE_BOTH,
+            0,
+        );
+        t.len = 1;
+        t.epoch = 3;
+        t.hash128 = VM_HASH;
+        t
+    }
+
+    fn vm_mirror_tick(venue: VenueId, sym: SymbolId, bid_1e6: i64, ask_1e6: i64) -> Tick {
+        Tick::new(
+            VM_T0,
+            venue,
+            sym,
+            1,
+            core_types::Price::from_raw(bid_1e6),
+            core_types::Qty::from_raw(1_000_000),
+            core_types::Price::from_raw(ask_1e6),
+            core_types::Qty::from_raw(1_000_000),
+        )
+    }
+
+    /// §9 happy path: gauges mirror as sets and counters as monotonic
+    /// deltas through the StrategyCounters route, against a real
+    /// `StrategySet` driven stage → commit → fire at `VM_T0`.
+    #[test]
+    fn vm_metrics_mirror_deltas_and_gauges() {
+        let mut reg = MetricsRegistry::new();
+        let mask_id = reg.register_gauge("engine_strategy_enabled_mask").unwrap();
+        let ids = register_vm_metrics(&mut reg).unwrap();
+        let mut last = VmCountersSnapshot::default();
+
+        let mut s = strategy_set::StrategySet::new(strategy_set::BIT_VM);
+        let mut c = VmMirrorCtx { now: VM_T0 };
+        strategy_core::Strategy::on_start(&mut s, &mut c).unwrap();
+
+        // Inert boot mirrors zeros (and the mask gauge reads the live
+        // bit through UFCS — the G0 demo observable).
+        reg.gauge(mask_id)
+            .set(strategy_core::StrategyCounters::enabled_mask(&s) as i64);
+        mirror_vm_metrics(&reg, &ids, &s, &mut last);
+        assert_eq!(reg.gauge(mask_id).get(), i64::from(strategy_set::BIT_VM));
+        assert_eq!(reg.gauge(ids.rows_active).get(), 0);
+        assert_eq!(reg.gauge(ids.table_epoch).get(), 0);
+        assert_eq!(reg.counter(ids.fires).get(), 0);
+
+        // Mismatched Commit first (nothing staged) → commit_dropped.
+        let bad = core_types::AiCmd::new(
+            VM_T0,
+            1,
+            core_types::SYMBOL_ID_NONE,
+            0,
+            0,
+            0,
+            core_types::AiCmdKind::RulesetCommit,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_VM,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        );
+        strategy_core::Strategy::on_ai(&mut s, &bad, &mut c);
+
+        // Stage → Commit → diverged books → fire.
+        s.vm_mut().receive_table(&vm_mirror_table());
+        let commit = core_types::AiCmd::new(
+            VM_T0,
+            2,
+            core_types::SYMBOL_ID_NONE,
+            i64::from_le_bytes(VM_HASH[..8].try_into().unwrap()),
+            i64::from_le_bytes(VM_HASH[8..].try_into().unwrap()),
+            0,
+            core_types::AiCmdKind::RulesetCommit,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_VM,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        );
+        strategy_core::Strategy::on_ai(&mut s, &commit, &mut c);
+        strategy_core::Strategy::on_tick(&mut s, &vm_mirror_tick(VenueId::Binance, VM_BN, 490_000, 510_000), &mut c);
+        strategy_core::Strategy::on_tick(&mut s, &vm_mirror_tick(VenueId::Polymarket, VM_PM, 390_000, 410_000), &mut c);
+
+        mirror_vm_metrics(&reg, &ids, &s, &mut last);
+        assert_eq!(reg.gauge(ids.rows_active).get(), 1, "gauge is a set");
+        assert_eq!(reg.gauge(ids.table_epoch).get(), 3, "fixture epoch");
+        assert_eq!(reg.counter(ids.fires).get(), 1);
+        assert_eq!(reg.counter(ids.orders_emitted).get(), 1);
+        assert_eq!(reg.counter(ids.orders_dropped).get(), 0);
+        assert_eq!(reg.counter(ids.commit_dropped).get(), 1);
+
+        // Steady state: a third mirror with no strategy motion adds
+        // zero deltas — the counters stay put (monotonic, no double
+        // counting of cumulative sources).
+        mirror_vm_metrics(&reg, &ids, &s, &mut last);
+        assert_eq!(reg.counter(ids.fires).get(), 1);
+        assert_eq!(reg.counter(ids.orders_emitted).get(), 1);
+        assert_eq!(reg.counter(ids.commit_dropped).get(), 1);
+    }
+
+    /// §9 failure modes: bare strategies mirror an all-zero family
+    /// (trait defaults), and a source regression (fresh strategy
+    /// against a stale snapshot — the restart shape) saturates to a
+    /// zero delta instead of underflowing.
+    #[test]
+    fn vm_metrics_mirror_bare_default_and_saturation() {
+        struct Bare;
+        impl strategy_core::StrategyCounters for Bare {}
+
+        let mut reg = MetricsRegistry::new();
+        let ids = register_vm_metrics(&mut reg).unwrap();
+
+        let mut last = VmCountersSnapshot::default();
+        mirror_vm_metrics(&reg, &ids, &Bare, &mut last);
+        assert_eq!(reg.gauge(ids.rows_active).get(), 0);
+        assert_eq!(reg.gauge(ids.table_epoch).get(), 0);
+        assert_eq!(reg.counter(ids.fires).get(), 0);
+        assert_eq!(reg.counter(ids.orders_emitted).get(), 0);
+        assert_eq!(reg.counter(ids.orders_dropped).get(), 0);
+        assert_eq!(reg.counter(ids.commit_dropped).get(), 0);
+        assert_eq!(
+            strategy_core::StrategyCounters::enabled_mask(&Bare),
+            0,
+            "bare boots read mask 0"
+        );
+
+        // Stale snapshot ahead of the (zero) sources: saturating_sub
+        // yields 0-deltas, counters unmoved.
+        let mut stale = VmCountersSnapshot {
+            fires: 100,
+            orders_emitted: 100,
+            orders_dropped: 100,
+            commit_dropped: 100,
+        };
+        mirror_vm_metrics(&reg, &ids, &Bare, &mut stale);
+        assert_eq!(reg.counter(ids.fires).get(), 0, "regression saturates");
+        assert_eq!(stale.fires, 0, "snapshot re-bases to the source");
+    }
+
+    /// Boot-surface pin: `Observability::build(true, _)` registers
+    /// every §9 row under its verbatim design name (plus the AI-side
+    /// `table_push_fail`), and the registry encodes them.
+    #[test]
+    fn observability_build_registers_section9_rows() {
+        let obs = Observability::build(true, false).unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        for name in [
+            "engine_strategy_enabled_mask",
+            "engine_vm_rows_active",
+            "engine_vm_table_epoch",
+            "engine_vm_fires_total",
+            "engine_vm_orders_emitted_total",
+            "engine_vm_orders_dropped_total",
+            "engine_vm_commit_dropped_total",
+            "engine_ai_table_push_fail_total",
+        ] {
+            assert!(text.contains(name), "missing §9 row {name}");
+        }
     }
 }
