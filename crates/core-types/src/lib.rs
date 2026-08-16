@@ -1162,6 +1162,181 @@ pub struct NullCapture;
 impl Capture for NullCapture {}
 
 // ---------------------------------------------------------------
+// RuleRow / RuleTable — operator-committed ruleset (Phase 8g, §3)
+// ---------------------------------------------------------------
+
+/// FNV-1a 64 over raw bytes. Pins the [`RuleRow::name_h`] identity
+/// (8g design §3): offline correlation between hot-table rows and the
+/// row names that live only in the JSON artifact + the worker
+/// registry. `const` so fixtures can hash at compile time; two lines
+/// by design — no external crate.
+#[inline]
+pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        i += 1;
+    }
+    h
+}
+
+/// Row capacity of a [`RuleTable`] — the §4.2 rule-4 upper cap.
+pub const RULE_TABLE_ROWS: usize = 256;
+
+/// One validated rule — 64 bytes, exactly one cache line; no row
+/// straddles a line (8g design §3; byte layout pinned in
+/// `docs/wire-format.md`).
+///
+/// POD; every field fixed-width. Strings never reach the hot table:
+/// row names live only in the JSON artifact + the worker registry;
+/// [`Self::name_h`] carries the FNV-1a 64 of the name bytes for
+/// offline correlation. Rows are **built** by the `ingress-ai`
+/// validator (§4.2), never parsed from wire bytes — hence no
+/// `AsBytes` impl, no serialization, no shape validator: the builder
+/// upholds the invariants and the table never crosses a process
+/// boundary (identity is the table's `hash128`; the JSON artifact is
+/// the durable form).
+#[derive(Copy, Clone)]
+#[repr(C, align(64))]
+pub struct RuleRow {
+    /// Action-leg [`SymbolId`], validated against the boot universe
+    /// snapshot (§4.3).
+    pub sym: SymbolId,
+    /// `cross_deviation` reference leg; [`SYMBOL_ID_NONE`] for
+    /// `level_breach`. D2 as amended: any asset on any boot-universe
+    /// venue — no venue restriction on either leg.
+    pub ref_sym: SymbolId,
+    /// Trigger threshold, basis points (§4.2 rule 3: ≤ 10 000).
+    pub edge_bps: u32,
+    /// Re-arm horizon (cooldown), ms (§4.2 rule 3: clamped
+    /// `[10, 86_400_000]`).
+    pub horizon_ms: u32,
+    /// `level_breach` threshold px ×1e6; 0 for `cross_deviation`
+    /// (§4.2 rule 3: `[0, 1_000_000]` — Polymarket price domain).
+    pub level_1e6: i64,
+    /// Per-row notional cap ×1e6 (§4.2 rule 7: ≤ the risk-policy
+    /// single-order cap; tighten-only).
+    pub max_risk_1e6: i64,
+    /// FNV-1a 64 of the row's `name` bytes ([`fnv1a_64`]).
+    pub name_h: u64,
+    /// [`Self::TRIGGER_CROSS_DEVIATION`] or
+    /// [`Self::TRIGGER_LEVEL_BREACH`] (§4.2, D2).
+    pub trigger: u8,
+    /// [`Side`] as raw byte (0/1) or [`Self::SIDE_BOTH`].
+    pub side: u8,
+    /// [`MarketFamily`] as raw byte — reporting only, never gates
+    /// evaluation.
+    pub family: u8,
+    /// Explicit tail padding — always zero. Design §3's `[u8; 13]`
+    /// was amended to 21 in G1 (operator-confirmed): declared fields
+    /// sum to 43 B, and house doctrine forbids implicit compiler
+    /// padding in pinned layouts.
+    _pad: [u8; 21],
+}
+
+impl RuleRow {
+    /// `trigger` byte — fire when |mid(sym) − mid(ref_sym)| in bps
+    /// ≥ `edge_bps`.
+    pub const TRIGGER_CROSS_DEVIATION: u8 = 0;
+    /// `trigger` byte — fire when best px crosses `level_1e6` on the
+    /// row's side.
+    pub const TRIGGER_LEVEL_BREACH: u8 = 1;
+    /// `side` byte meaning "both sides".
+    pub const SIDE_BOTH: u8 = 0xFF;
+
+    /// The all-zero row — inert filler for `rows[len..]`; never
+    /// evaluated (the vm scan stops at `len`).
+    pub const ZERO: Self = Self {
+        sym: 0,
+        ref_sym: 0,
+        edge_bps: 0,
+        horizon_ms: 0,
+        level_1e6: 0,
+        max_risk_1e6: 0,
+        name_h: 0,
+        trigger: 0,
+        side: 0,
+        family: 0,
+        _pad: [0; 21],
+    };
+
+    /// Construct a row without naming the private padding field. The
+    /// §4.2 validator is the only production builder; tests build
+    /// fixtures through it too.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        sym: SymbolId,
+        ref_sym: SymbolId,
+        edge_bps: u32,
+        horizon_ms: u32,
+        level_1e6: i64,
+        max_risk_1e6: i64,
+        name_h: u64,
+        trigger: u8,
+        side: u8,
+        family: u8,
+    ) -> Self {
+        Self {
+            sym,
+            ref_sym,
+            edge_bps,
+            horizon_ms,
+            level_1e6,
+            max_risk_1e6,
+            name_h,
+            trigger,
+            side,
+            family,
+            _pad: [0; 21],
+        }
+    }
+}
+
+/// The engine-facing rule table — 16 KiB of rows plus one trailing
+/// metadata cache line, 16 448 B total (8g design §3; layout pinned
+/// in `docs/wire-format.md`).
+///
+/// In-memory POD only: the table never crosses a process or
+/// byte-order boundary, so no serialization is defined and none is
+/// captured — identity is [`Self::hash128`]; the JSON artifact is the
+/// durable form. Ferried ingress→engine **by value** via
+/// `Ring<RuleTableSlot, 2>` (§6 — the two documented 16 KiB copies,
+/// operator cadence only).
+#[derive(Copy, Clone)]
+#[repr(C, align(64))]
+pub struct RuleTable {
+    /// Row storage; only `rows[..len as usize]` is meaningful.
+    pub rows: [RuleRow; RULE_TABLE_ROWS],
+    /// Validated row count ≤ [`RULE_TABLE_ROWS`].
+    pub len: u32,
+    /// Side-path monotonic stage counter (diagnostics).
+    pub epoch: u32,
+    /// Identity — the d5 truncated sha256 (first 16 bytes of the full
+    /// SHA-256 of the JSON artifact bytes).
+    pub hash128: [u8; 16],
+    /// Explicit tail padding — always zero.
+    _pad: [u8; 40],
+}
+
+impl RuleTable {
+    /// The empty table: no rows, epoch 0, zero hash. Boot/scratch
+    /// preallocation value — built once, reused forever.
+    pub const EMPTY: Self = Self {
+        rows: [RuleRow::ZERO; RULE_TABLE_ROWS],
+        len: 0,
+        epoch: 0,
+        hash128: [0; 16],
+        _pad: [0; 40],
+    };
+}
+
+/// Ring slot ferrying a staged table ingress→engine (§6).
+pub type RuleTableSlot = RuleTable;
+
+// ---------------------------------------------------------------
 // Static layout assertions — if these ever fire, revisit the
 // cache-line story in PLAN.md §7.
 // ---------------------------------------------------------------
@@ -1181,6 +1356,8 @@ static_assert_size!(Fill, 64);
 static_assert_size!(Order, 64);
 static_assert_size!(ChannelEvent, 64);
 static_assert_size!(AiCmd, 64);
+static_assert_size!(RuleRow, 64);
+static_assert_size!(RuleTable, 16 * 1024 + 64);
 
 // AiCmd byte layout is a cross-process wire contract (Python packs it,
 // docs/wire-format.md pins it) — every field offset is asserted at
@@ -1201,6 +1378,29 @@ const _: () = {
     assert!(::core::mem::offset_of!(AiCmd, flags) == 46);
     assert!(::core::mem::offset_of!(AiCmd, _pad) == 48);
     assert!(AI_RING_SIZE.is_power_of_two());
+};
+
+// RuleRow / RuleTable layout is pinned in `docs/wire-format.md` (8g
+// §3) — offsets asserted build-breaking, same spirit as AiCmd above
+// (in-process only, but the vm evaluator and the wire-format doc both
+// cite these offsets).
+const _: () = {
+    assert!(::core::mem::offset_of!(RuleRow, sym) == 0);
+    assert!(::core::mem::offset_of!(RuleRow, ref_sym) == 4);
+    assert!(::core::mem::offset_of!(RuleRow, edge_bps) == 8);
+    assert!(::core::mem::offset_of!(RuleRow, horizon_ms) == 12);
+    assert!(::core::mem::offset_of!(RuleRow, level_1e6) == 16);
+    assert!(::core::mem::offset_of!(RuleRow, max_risk_1e6) == 24);
+    assert!(::core::mem::offset_of!(RuleRow, name_h) == 32);
+    assert!(::core::mem::offset_of!(RuleRow, trigger) == 40);
+    assert!(::core::mem::offset_of!(RuleRow, side) == 41);
+    assert!(::core::mem::offset_of!(RuleRow, family) == 42);
+    assert!(::core::mem::offset_of!(RuleRow, _pad) == 43);
+    assert!(::core::mem::offset_of!(RuleTable, rows) == 0);
+    assert!(::core::mem::offset_of!(RuleTable, len) == 16 * 1024);
+    assert!(::core::mem::offset_of!(RuleTable, epoch) == 16 * 1024 + 4);
+    assert!(::core::mem::offset_of!(RuleTable, hash128) == 16 * 1024 + 8);
+    assert!(::core::mem::offset_of!(RuleTable, _pad) == 16 * 1024 + 24);
 };
 
 // ---------------------------------------------------------------
@@ -1920,5 +2120,106 @@ mod ai_cmd_tests {
     fn ai_ring_size_is_locked() {
         assert_eq!(AI_RING_SIZE, 1024);
         assert!(AI_RING_SIZE.is_power_of_two());
+    }
+
+    // -----------------------------------------------------------
+    // RuleRow / RuleTable (Phase 8g §3)
+    // -----------------------------------------------------------
+
+    #[test]
+    fn rule_row_size_is_one_cache_line() {
+        assert_eq!(::core::mem::size_of::<RuleRow>(), 64);
+        assert_eq!(::core::mem::align_of::<RuleRow>(), 64);
+    }
+
+    #[test]
+    fn rule_table_size_is_rows_plus_one_line() {
+        assert_eq!(::core::mem::size_of::<RuleTable>(), 16 * 1024 + 64);
+        assert_eq!(::core::mem::align_of::<RuleTable>(), 64);
+        // `RuleTableSlot` is the same type by definition (§6 slot).
+        assert_eq!(
+            ::core::mem::size_of::<RuleTableSlot>(),
+            ::core::mem::size_of::<RuleTable>()
+        );
+    }
+
+    #[test]
+    fn rule_row_layout_is_fully_explicit() {
+        // Sum of declared field widths must equal size_of — any
+        // implicit compiler padding breaks this (§3 pad amended
+        // 13 → 21 in G1, operator-confirmed).
+        let declared = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 1 + 1 + 21;
+        assert_eq!(declared, ::core::mem::size_of::<RuleRow>());
+    }
+
+    #[test]
+    fn rule_table_layout_is_fully_explicit() {
+        let declared = 64 * RULE_TABLE_ROWS + 4 + 4 + 16 + 40;
+        assert_eq!(declared, ::core::mem::size_of::<RuleTable>());
+    }
+
+    #[test]
+    fn rule_row_new_roundtrips_and_zeroes_padding() {
+        let r = RuleRow::new(
+            make_symbol_id(VenueId::Polymarket, 42),
+            make_symbol_id(VenueId::Binance, 7),
+            80,
+            1_500,
+            0,
+            50_000_000,
+            fnv1a_64(b"btc-pm-lag"),
+            RuleRow::TRIGGER_CROSS_DEVIATION,
+            Side::Bid as u8,
+            MarketFamily::Crypto as u8,
+        );
+        assert_eq!(r.sym, make_symbol_id(VenueId::Polymarket, 42));
+        assert_eq!(r.ref_sym, make_symbol_id(VenueId::Binance, 7));
+        assert_eq!(r.edge_bps, 80);
+        assert_eq!(r.horizon_ms, 1_500);
+        assert_eq!(r.level_1e6, 0);
+        assert_eq!(r.max_risk_1e6, 50_000_000);
+        assert_eq!(r.name_h, fnv1a_64(b"btc-pm-lag"));
+        assert_eq!(r.trigger, RuleRow::TRIGGER_CROSS_DEVIATION);
+        assert_eq!(r.side, Side::Bid as u8);
+        assert_eq!(r.family, MarketFamily::Crypto as u8);
+        let mut i = 0;
+        while i < r._pad.len() {
+            assert_eq!(r._pad[i], 0);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn rule_table_empty_is_inert() {
+        let t = RuleTable::EMPTY;
+        assert_eq!(t.len, 0);
+        assert_eq!(t.epoch, 0);
+        assert_eq!(t.hash128, [0u8; 16]);
+        assert_eq!(t.rows[0].sym, 0);
+        assert_eq!(t.rows[RULE_TABLE_ROWS - 1].name_h, 0);
+        let mut i = 0;
+        while i < t._pad.len() {
+            assert_eq!(t._pad[i], 0);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn fnv1a_64_matches_published_vectors() {
+        // Offset basis — the hash of the empty input.
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        // Published FNV-1a 64 test vectors.
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn fnv1a_64_distinct_names_hash_apart() {
+        // The §4.2 rule-5 uniqueness reject leans on name_h
+        // inequality for distinct names (failure-mode guard: a
+        // degenerate hash would collapse these).
+        assert_ne!(fnv1a_64(b"btc-pm-lag"), fnv1a_64(b"hormuz-floor"));
+        assert_ne!(fnv1a_64(b"a"), fnv1a_64(b"b"));
+        assert_ne!(fnv1a_64(b""), fnv1a_64(b"\0"));
     }
 }

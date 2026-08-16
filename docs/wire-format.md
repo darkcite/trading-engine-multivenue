@@ -141,6 +141,47 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …) |
 |     48 |    16 | _pad1         | `[u8; 16]`     | explicit, zeroed                        |
 
+### `RuleRow` — 64 bytes (8g; row of `RuleTable`, in-process only)
+
+One validated rule of an operator-committed ruleset (8g design §3).
+**Built** by the `ingress-ai` validator from the JSON artifact — never
+parsed from wire bytes, never captured to PMLR (no `AsBytes`; the JSON
+artifact is the durable form, identity is the table's `hash128`).
+Offsets are compile-time asserted in `core-types`. The §3 pad count
+was amended 13 → 21 in G1 (operator-confirmed): declared fields sum to
+43 B and padding must be fully explicit.
+
+| offset | bytes | field        | type           | notes                                        |
+| -----: | ----: | ------------ | -------------- | -------------------------------------------- |
+|      0 |     4 | sym          | `u32` SymbolId | action leg; validated against boot universe  |
+|      4 |     4 | ref_sym      | `u32` SymbolId | `cross_deviation` reference leg; `SYMBOL_ID_NONE` for `level_breach`. D2 as amended: either leg = any asset on any boot-universe venue |
+|      8 |     4 | edge_bps     | `u32`          | trigger threshold, bps; ≤ 10 000             |
+|     12 |     4 | horizon_ms   | `u32`          | re-arm cooldown, ms; \[10, 86 400 000\]      |
+|     16 |     8 | level_1e6    | `i64`          | `level_breach` px ×1e6, \[0, 1 000 000\]; 0 for `cross_deviation` |
+|     24 |     8 | max_risk_1e6 | `i64`          | per-row notional cap ×1e6; ≤ risk-policy single-order cap (tighten-only) |
+|     32 |     8 | name_h       | `u64`          | FNV-1a 64 of the row name (`core_types::fnv1a_64`); names live only in the artifact + worker registry |
+|     40 |     1 | trigger      | `u8`           | 0 = cross_deviation, 1 = level_breach        |
+|     41 |     1 | side         | `u8`           | `Side` (0/1) or `0xFF` = both                |
+|     42 |     1 | family       | `u8`           | `MarketFamily` byte — reporting only         |
+|     43 |    21 | _pad         | `[u8; 21]`     | explicit, zeroed                             |
+
+### `RuleTable` / `RuleTableSlot` — 16 448 bytes (8g; `Ring<RuleTableSlot, 2>` only, never captured)
+
+The engine-facing table: 256 rows (16 KiB) + one trailing metadata
+cache line. `#[repr(C, align(64))]`, Copy. Ferried ingress→engine by
+value at operator cadence (the two documented 16 KiB copies, design
+§6); all fields native-endian in-process POD — the table never
+crosses a process or byte-order boundary, so no serialization is
+defined and none is captured.
+
+| offset | bytes | field   | type              | notes                                  |
+| -----: | ----: | ------- | ----------------- | -------------------------------------- |
+|      0 | 16384 | rows    | `[RuleRow; 256]`  | only `rows[..len]` is meaningful       |
+|  16384 |     4 | len     | `u32`             | validated row count, \[1, 256\] staged (0 = `EMPTY` boot value) |
+|  16388 |     4 | epoch   | `u32`             | side-path monotonic stage counter      |
+|  16392 |    16 | hash128 | `[u8; 16]`        | identity — first 16 B of the artifact's full SHA-256 (d5 filename convention) |
+|  16408 |    40 | _pad    | `[u8; 40]`        | explicit, zeroed                       |
+
 ## Capture files (8e)
 
 Per-run capture directory `<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/`,
