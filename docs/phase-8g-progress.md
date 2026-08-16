@@ -599,3 +599,143 @@ Commit flip already lands via the set fan-out, §11 integration tests
 8+ (§9 observability + audit-replay `slot_kind = 4`, final gates +
 operator-gated live smoke) stay G6+.
 
+---
+
+## 2026-08-16 — Session G5 (checklist item 7 ONLY) — CLOSED
+
+One scope commit, green on the Mac before committing (§12
+discipline), plus this log commit:
+
+| item | commit | scope |
+|---|---|---|
+| 7 | `84ef354` | Engine table-ring consumer (§6, D1a pop half): `_ruleset_table_cons` unparked into `Consumers.ruleset_tables` → `Engine::new` 8th lane (always-present consumer, §3.3 empty-forever shape — NOT an `Option`); `Engine::tick` pops `Ring<RuleTableSlot, 2>` IMMEDIATELY before the AI-cmd drain every iteration (while-let drain, bounded by cap 2; empty lane = one acquire load) and hands each slot to the NEW `Strategy::on_ruleset_table` default-no-op hook (monomorphized, no `Ctx`, no `dyn`); `StrategySet` overrides it → `vm.receive_table` (§6 copy #2 — the seam exactly as documented). §11 integration tests land in NEW `crates/cli/tests/ruleset_engine_wiring.rs` (per-crate `tests/`, no sockets): real `RulesetSidePath::stage` → ring → `Engine<StrategySet>` pop → in-stream Commit flip → committed `level_breach` row FIRES to `PaperDispatcher`. Engine unit pins: pop-precedes-AI-drain recorder, drain-all-in-order, empty-lane no-op. Gate `engine_tick_with_latency_record_is_zero_alloc` extended IN PLACE (producer-dropped table lane inside the measured window); NO new gate number — §10 read as expected (gates 34–36 only), baseline stays 36. cli gains dev-dep `core-crypto` (integration harness hashes real artifacts); root `Cargo.lock` edge same commit. |
+
+### Documented interpretations (item 7 — flag on G6 review)
+
+- **The pre-AI-drain hook is a `Strategy` trait method**
+  (`on_ruleset_table`, default no-op, in `strategy-core`): the engine
+  is generic over `S: Strategy` and cannot name `StrategySet`, so §6's
+  "pop → `set.vm_mut().receive_table`" is realized as the set's
+  override forwarding to the vm member — same seam, one generic
+  dispatch away, house doctrine (monomorphized, not virtual)
+  preserved. Precedent: `on_ai` (8f) is exactly this shape.
+- **`on_ruleset_table` is deliberately NOT mask-gated** in the set
+  (every other member callback is): staging is control plane and a
+  staged table is inert until the in-stream Commit, which IS
+  mask-gated — so stage-while-disabled → enable → commit works
+  without restaging (pinned:
+  `on_ruleset_table_stages_even_when_vm_disabled`). Mask-gating the
+  hook would silently discard operator staging during a disabled
+  window for no safety gain.
+- **Pop semantics match gate 35 literally**: while-let drain of every
+  queued slot, each delivered in ring order to `receive_table`, whose
+  staged-buffer overwrite IS the restage-supersede (no engine-side
+  skip-to-newest logic — the receiver keeps the newest by
+  construction). The pop's by-value move is the documented copy #2;
+  no third copy was added.
+- **Bare-strategy boots consume tables into the default no-op**: on
+  non-set paths (`--strategy latency-arb` etc.) pops land on the
+  trait default and vanish, mirroring how bare strategies already
+  swallow AiCmds via the `on_ai` default. AI-cmd work requires the
+  set path (G0/G4 doctrine), so this is posture-consistent; noted in
+  `Consumers.ruleset_tables` docs.
+- **The lane rides `Consumers`/`Engine::new`, not a setter**: it is a
+  lane (like the AI ring), not an optional facility (like the fills
+  capture) — key-unset boots drop the producer and the engine eats
+  one acquire load per iteration (now measured: see gates).
+
+### Wiring state after G5 (for items 8/9)
+
+- The §6 pipeline is COMPLETE end to end: Stage (validate → push,
+  copy #1) → engine pop (pre-AI-drain, copy #2) → in-stream Commit
+  flip → rows fire through `on_tick`. **Tables no longer accumulate
+  undrained** — the ring is emptied every engine iteration, so the
+  §5 push-full reject is now truly unreachable at operator cadence
+  against a running engine (it remains counted for engine-down
+  staging).
+- No §9 observability yet: `engine_vm_*` gauges,
+  `engine_strategy_enabled_mask`, `engine_ai_table_push_fail_total`
+  registration, audit-replay `slot_kind = 4` are item 8 (G6). The
+  data sources all exist (`vm()` accessors, `AiIngressStatus`,
+  engine counters).
+- Worker untouched (frozen §6 surface) — 202-test suite not in the
+  blast radius; nothing in `claude-worker/` changed.
+
+### Live-boot behavior delta (recorded per §8 / G0 finding 6)
+
+- On set boots (`--strategy vm|all`), a Stage now lands in the vm
+  member's staged buffer within one engine iteration and
+  `RulesetCommit` flips it live — the first boot shape where the
+  full 8g pipeline runs. Two-stages-then-reject can no longer be
+  provoked against a running engine (drain wins); it still guards
+  engine-down staging.
+- On bare-strategy boots, staged tables are consumed and ignored
+  (default hook) instead of accumulating ≤ 2 in the ring — the
+  side-path counters still record the Stage; nothing engine-side
+  observes it (as with all AI cmds on bare strategies).
+- No live boot was performed in G5 (none planned: no live venues, no
+  engine run — G0 law applies before the NEXT live boot; the release
+  `-p cli` rebuild is that boot's first step, not this session's).
+
+### Gates at close (all Mac)
+
+- workspace `cargo nextest run`: **1019/1019** (1008 at G4 close;
+  +11 = 2 strategy-core hook-default tests, 3 engine lane tests
+  (ordering recorder, drain-all-in-order + cap-2 reject + re-accept,
+  empty no-op), 2 strategy-set seam tests (forward + supersede;
+  stage-while-disabled), 4 cli `ruleset_engine_wiring` integration
+  tests (same-batch flip + fire; commit-no-staged; mismatch +
+  staged-survives + recovery; restage-supersede with the B-not-A
+  threshold proof)).
+- release alloc assertions `--test-threads=1`: **36/36, 0 B/op** —
+  `engine_tick_with_latency_record_is_zero_alloc` now measures the
+  empty table-lane pop inside its window (extended in place, NO new
+  gate number per §10); gates 35/36 + `strategy_set_fanout`
+  unchanged and confirmed by name; `Compiling
+  strategy-core/engine/strategy-set/bench` in the run log — no false
+  green.
+- `cargo check --workspace --all-targets` real green after
+  `cargo clean -p` of all five touched crates: 12 "Checking" lines —
+  the strategy-core-rooted cone (6 strategy crates + engine + set +
+  cli + bench + a core-io fingerprint refresh), zero warnings.
+- Engine-loop clock note honored: integration tests run on the
+  engine's real `now_ns()` wallclock (≥ 1e17 trivially — the G3
+  first-window lesson needs no synthetic `T0` here); set-level unit
+  tests keep `VM_T0 = 1e17`.
+
+### Hygiene / anomalies
+
+- Git: one scope commit (`84ef354`) + this log commit; no push, no
+  fetch, no branch, no history ops. Push anomaly unchanged
+  (origin/main local ref `38e599b`): recorded, not acted on.
+- `.env` untouched. No live boots, no engine runs, no live venues,
+  no sockets (the §11 item-7 rows are ringside — the UDS/listener
+  half already has its 8f/G1-G2 suites; `short_sock_dir` not needed).
+  Test ruleset dirs under `temp_dir()/cw-ai-g5-wiring-<pid>-*`,
+  removed on drop.
+- Sandbox: greps only; all cargo/git on the Mac via RustRover MCP
+  (`executeInShell=true`, nohup + poll for every long run).
+- Stale-rmeta playbook invoked once: phantom "Engine::new takes 7
+  arguments" + "no field `ruleset_tables`" in cli bin/lib tests
+  immediately after the engine signature change ⇒ `cargo clean -p
+  strategy-core -p engine -p strategy-set -p cli -p bench`, re-check
+  → real errors only (a genuinely missing `OrderDispatch` import in
+  the new test file, fixed).
+- False-green guard invoked once: a 1.1 s / 3-"Checking"-line green
+  after the engine-only test fix ⇒ clean touched crates + recount →
+  12 "Checking" lines, still green (accepted as real).
+
+### Resume point
+
+G5 (item 7) CLOSED. Next session is **G6 = item 8** (design §12/§9):
+observability — register `engine_strategy_enabled_mask`,
+`engine_vm_rows_active` / `engine_vm_table_epoch` /
+`engine_vm_fires_total` / `engine_vm_orders_emitted_total` /
+`_dropped_total` / `engine_vm_commit_dropped_total` /
+`engine_ai_table_push_fail_total` in `paper.rs` (5 s mirror cadence),
+plus the `audit-replay` `slot_kind = 4` AiCmd section (per-kind
+counts, seq continuity, heartbeat cadence histogram, Stage/Commit
+hash128 hex rows, TTL'd-at-pop annotations — closes the G0 runbook
+gap). Item 9 (final gates: full nextest + alloc + fuzz check + worker
+pytest + operator-gated live smoke + closing entry) stays after it.
+
