@@ -2562,3 +2562,114 @@ fn ai_exec_on_ai_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "ai-exec on_ai bytes should be zero: saw {bytes}");
 }
+
+/// Gate 34 (8g §10): the §4.2 ruleset validator seam — a max-size
+/// (256-row) VALID ruleset AND a battery of per-rule rejects, scanned
+/// over `&[u8]` into a prewarmed scratch table, must be 0 B/op. The
+/// `fs::read` that produces the bytes in production is the documented
+/// operator-cadence copy #0 and sits OUTSIDE this seam (fixtures are
+/// built before the guard).
+#[test]
+fn ruleset_validator_is_zero_alloc() {
+    fn hash128_of(bytes: &[u8]) -> [u8; 16] {
+        let digest = core_crypto::sha256(bytes);
+        let mut h = [0u8; 16];
+        h.copy_from_slice(&digest[..16]);
+        h
+    }
+
+    // Sorted universe: 256 action syms (3, 6, ..768) + reference 1000.
+    let mut universe: Vec<u32> = (1..=256u32).map(|i| i * 3).collect();
+    universe.push(1_000);
+
+    // Max-size valid ruleset: 256 cross_deviation rows, distinct syms
+    // and names; $3.90/row ⇒ Σ $998.40 ≤ $1 000, per-sym $3.90 ≤ $250.
+    let mut json = String::from(r#"{"rows":["#);
+    for i in 0..256u32 {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            r#"{{"name":"r{i:03}","family":"crypto","trigger":{{"type":"cross_deviation","ref":1000}},"sym":{},"side":"both","edge_bps":80,"horizon_ms":1500,"max_risk_usd":3.9}}"#,
+            (i + 1) * 3
+        ));
+    }
+    json.push_str("]}");
+    let valid_bytes = json.into_bytes();
+    let valid_hash = hash128_of(&valid_bytes);
+
+    // Reject battery — one reachable fixture per §4.2 rule. Rule 1
+    // reuses the valid bytes under a wrong hash.
+    let wrong_hash = [0xEEu8; 16];
+    let row = |name: &str, trig: &str, sym: &str, risk: &str| {
+        format!(
+            r#"{{"name":"{name}","family":"crypto","trigger":{trig},"sym":{sym},"side":"bid","edge_bps":80,"horizon_ms":1500,"max_risk_usd":{risk}}}"#
+        )
+    };
+    let cd = r#"{"type":"cross_deviation","ref":1000}"#;
+    let reject_bodies: Vec<Vec<u8>> = vec![
+        // Rule 2: unknown row key.
+        format!(r#"{{"rows":[{}]}}"#, row("j2", cd, "3", "3.9").replace(r#""side""#, r#""bogus":1,"side""#)).into_bytes(),
+        // Rule 3: exponent.
+        format!(r#"{{"rows":[{}]}}"#, row("j3", cd, "3", "5e1")).into_bytes(),
+        // Rule 4: empty rows.
+        br#"{"rows":[]}"#.to_vec(),
+        // Rule 5: duplicate name (levels differ so rule 8 stays out).
+        format!(
+            r#"{{"rows":[{},{}]}}"#,
+            row("dup", r#"{"type":"level_breach","level":0.01}"#, "3", "3.9"),
+            row("dup", r#"{"type":"level_breach","level":0.02}"#, "3", "3.9"),
+        )
+        .into_bytes(),
+        // Rule 6: sym outside the universe.
+        format!(r#"{{"rows":[{}]}}"#, row("j6", cd, "4", "3.9")).into_bytes(),
+        // Rule 7: per-row cap breach.
+        format!(r#"{{"rows":[{}]}}"#, row("j7", cd, "3", "100.01")).into_bytes(),
+        // Rule 8: exact duplicate row.
+        format!(r#"{{"rows":[{},{}]}}"#, row("j8a", cd, "3", "3.9"), row("j8b", cd, "3", "3.9"))
+            .into_bytes(),
+    ];
+    let rejects: Vec<(Vec<u8>, [u8; 16])> = reject_bodies
+        .into_iter()
+        .map(|b| {
+            let h = hash128_of(&b);
+            (b, h)
+        })
+        .collect();
+
+    let mut scratch = Box::new(core_types::RuleTable::EMPTY);
+    // Prewarm + prove the fixtures behave before measuring.
+    ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &mut scratch)
+        .expect("max-size ruleset must validate");
+    assert_eq!(scratch.len, 256);
+    assert!(
+        ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &mut scratch).is_err()
+    );
+    for (b, h) in &rejects {
+        assert!(ingress_ai::validate_ruleset(b, h, &universe, &mut scratch).is_err());
+    }
+
+    let g = AllocGuard::new();
+    for _ in 0..50u32 {
+        let ok = ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &mut scratch);
+        std::hint::black_box(ok.is_ok());
+        std::hint::black_box(&scratch.len);
+        // Rule 1 reject on the same bytes.
+        let r1 = ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &mut scratch);
+        std::hint::black_box(r1.is_err());
+        // Rules 2–8 rejects.
+        let mut k = 0usize;
+        while k < rejects.len() {
+            let (b, h) = &rejects[k];
+            let r = ingress_ai::validate_ruleset(b, h, &universe, &mut scratch);
+            std::hint::black_box(r.is_err());
+            k += 1;
+        }
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "ruleset validator allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ruleset validator bytes should be zero: saw {bytes}");
+}

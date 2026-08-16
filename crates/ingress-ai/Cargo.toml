@@ -12,6 +12,8 @@ description  = "AI-command UDS ingress: mio listener, HMAC-tagged 82-B frames, S
 core-types  = { workspace = true }
 core-crypto = { workspace = true }
 core-io     = { workspace = true }
+# §4.2 ruleset validator: canonical 1e6 fixed-point + integer scanners.
+core-parse  = { workspace = true }
 core-ring   = { workspace = true }
 core-time   = { workspace = true }
 mio         = { workspace = true }

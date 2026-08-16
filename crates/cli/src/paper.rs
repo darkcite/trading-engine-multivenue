@@ -1150,12 +1150,22 @@ pub fn spawn_ai(
         log_pin_outcome("ai", core_id);
         let cfg = AiIngressCfg { sock_path };
         let mut producer = producer;
-        // Ruleset side-path (§4.4 step 8, item 14): Stage/Commit kinds
-        // are validated against `AI_RULESET_DIR/<hash128-hex>.json`
-        // (full-SHA-256 recompute) and recorded as staged/committed
-        // state + `engine_ai_ruleset_*_total` counters. Control-plane
-        // only — the frame pump stays allocation-free.
-        let mut side_path = RulesetSidePath::new(ruleset_dir, Arc::clone(&status));
+        // Ruleset side-path (§4.4 step 8): Stage/Commit kinds run the
+        // full 8g §4.2 validator against `AI_RULESET_DIR/
+        // <hash128-hex>.json` (rule 1 full-SHA-256 recompute, rules
+        // 2–8 byte scan into the preallocated scratch table) and are
+        // recorded as staged/committed state + the
+        // `engine_ai_ruleset_*_total` counters. Control-plane only —
+        // the frame pump stays allocation-free.
+        //
+        // G1 (8g item 3): the validator's §4.3 boot-universe snapshot
+        // is wired EMPTY here — fail-closed: every row-bearing
+        // ruleset rejects at §4.2 rule 6 until item 4 (G2) threads
+        // the real sorted discovery universe through `spawn_ai`
+        // alongside the table-ring producer.
+        let empty_universe: Arc<[u32]> = Arc::new([]);
+        let mut side_path =
+            RulesetSidePath::new(ruleset_dir, Arc::clone(&status), empty_universe);
         let mut seam = |c: &AiCmd| side_path.on_cmd(c);
         while !shutdown_requested() {
             match ingress_ai::run(
