@@ -2,9 +2,9 @@
 //!
 //! Zero-allocation byte-scanner primitives over `&[u8]`.
 //!
-//! Every ingress parser (Polymarket WS, Binance WS, RSS, Alchemy JSON-
-//! RPC) is handwritten on top of these helpers. `serde_json` and
-//! friends are explicitly out of the hot path.
+//! Every ingress parser (Polymarket WS, Binance WS, OKX / Deribit /
+//! Hyperliquid WS, Alchemy JSON-RPC) is handwritten on top of these
+//! helpers. `serde_json` and friends are explicitly out of the hot path.
 //!
 //! The helpers are deliberately small — integer parsing, float parsing,
 //! field-lookup on JSON-shaped bytes, `memchr`-based substring scans.

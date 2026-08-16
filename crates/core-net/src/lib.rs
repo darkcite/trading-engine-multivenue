@@ -16,8 +16,9 @@
 //!
 //! Phase 1c adds the [`http1`] module — a minimal HTTP/1.1 client codec
 //! (GET request writer + response parser with `Content-Length` /
-//! chunked / close-delimited framing). Used by the RSS poller; not the
-//! CLOB dispatcher (that path keeps `hyper` + HTTP/2).
+//! chunked / close-delimited framing). Consumers today: the boot-time
+//! REST discovery path ([`boot_http`], 8e) and the CLOB dispatcher's
+//! POST path (its original consumer, the RSS poller, was retired in 8f).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(

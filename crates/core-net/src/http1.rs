@@ -1,13 +1,15 @@
 //! # HTTP/1.1 minimal codec
 //!
-//! Zero-alloc, pure-byte-scanner HTTP/1.1 client codec used by the RSS
-//! poller. No cookies, no compression (the request hard-codes
+//! Zero-alloc, pure-byte-scanner HTTP/1.1 client codec used by the
+//! boot-time REST discovery path (`boot_http`) and the CLOB
+//! dispatcher. No cookies, no compression (the request hard-codes
 //! `Accept-Encoding: identity`), no automatic redirect chasing.
 //!
 //! ## Why hand-roll?
 //!
 //! The workspace bans `reqwest`, `hyper`'s client by default, and any
-//! dependency that pulls tokio. The RSS feed shape is small enough that
+//! dependency that pulls tokio. The consumers' payload shapes are
+//! small enough that
 //! a ~150-line handwritten codec fits the doctrine: all work is over
 //! `&[u8]` / `&mut [u8]`; the caller owns buffers; body extraction is
 //! zero-copy (a `Range<usize>` into the caller's buffer).
@@ -24,7 +26,8 @@
 //! * HTTP/2 (clob-dispatcher uses `hyper` for that, not this module).
 //! * Gzip / brotli bodies.
 //! * Redirects (`3xx` is reported as [`HttpResult::Malformed`]).
-//! * Keep-alive reuse — the RSS poller closes between fetches.
+//! * Keep-alive reuse — the codec is pure functions over buffers;
+//!   connection lifetime belongs to the transport-owning callers.
 
 // ---------------------------------------------------------------
 // Errors + result types

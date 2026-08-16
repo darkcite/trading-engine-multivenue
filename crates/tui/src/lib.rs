@@ -89,8 +89,9 @@ pub struct DashboardState {
 
     /// Ingest health: each bit = 1 → that ingress thread is in
     /// Steady state. Bit 0 = Polymarket, 1 = Binance, 2 = RPC,
-    /// 3 = RSS, 4 = OKX, 5 = Deribit, 6 = Hyperliquid (Phase 8e —
-    /// appended; existing bits never renumber).
+    /// 3 = RSS (retired 8f — always 0), 4 = OKX, 5 = Deribit,
+    /// 6 = Hyperliquid (Phase 8e — appended; existing bits never
+    /// renumber, retired bits are never reused).
     pub ingest_health: u8,
     _pad: [u8; 6],
 }
@@ -432,6 +433,9 @@ fn render_ingest_health(
     s: &DashboardState,
 ) {
     use ratatui::widgets::{Block, Borders, Paragraph};
+    // Per-bit labels, index = ingest_health bit position. Bits never
+    // renumber: the retired "rss" row (bit 3, 8f) stays and honestly
+    // renders [DOWN] forever.
     let names = [
         "polymarket",
         "binance",

@@ -470,10 +470,10 @@ impl<const N: usize> Strategy for LatencyArb<N> {
     #[inline(always)]
     fn on_signal<C: Ctx>(&mut self, _signal: &Signal, _ctx: &mut C) {
         self.signals_seen = self.signals_seen.wrapping_add(1);
-        // Phase 2 doesn't react to signals — RPC newHeads and RSS
-        // news arrive too slowly to drive trade decisions for
-        // strategy B. The counter exists so paper-mode UIs can
-        // surface ingest health.
+        // Phase 2 doesn't react to signals — slow-lane sources (RPC
+        // newHeads; formerly RSS news, retired 8f) arrive too slowly
+        // to drive trade decisions for strategy B. The counter exists
+        // so paper-mode UIs can surface ingest health.
     }
 
     #[inline(always)]

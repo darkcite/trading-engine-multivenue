@@ -199,7 +199,7 @@ pub enum LatencyClass {
     Hot = 0,
     /// Millisecond-class (RPC event feeds).
     Warm = 1,
-    /// Seconds-to-minutes (RSS, Claude artifacts).
+    /// Seconds-to-minutes (Claude artifacts, operator-cadence sources).
     Slow = 2,
 }
 
@@ -296,7 +296,7 @@ impl Tick {
     }
 }
 
-/// External signal (Binance price move, RSS headline, mempool tx, ...).
+/// External signal (Binance price move, mempool tx, ...).
 ///
 /// `payload` is a caller-chosen 32-byte inline blob — typically a
 /// fixed-point price delta, or an indexed reference into a preallocated
@@ -310,7 +310,8 @@ pub struct Signal {
     pub sym: SymbolId,
     /// Latency budget tag — routes slow-path news differently from hot-path price moves.
     pub class: LatencyClass,
-    /// Source identifier (0=binance, 1=rss, 2=rpc, ...). See `SignalSource`.
+    /// Source identifier (0=binance, 2=rpc, ...; 1 = retired RSS,
+    /// reserved). See `SignalSource`.
     pub source: u8,
     /// Reserved.
     _pad0: [u8; 2],
@@ -348,7 +349,8 @@ impl Signal {
 pub enum SignalSource {
     /// Binance WS.
     Binance = 0,
-    /// RSS feeds.
+    /// Retired 8f (`ingress-rss` deleted). Wire value reserved —
+    /// append-only ABI: never renumbered, never reused.
     Rss = 1,
     /// Polygon RPC event feed (Alchemy / QuickNode).
     Rpc = 2,

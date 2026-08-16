@@ -430,10 +430,10 @@ impl fmt::Debug for TlsTransport {
 /// against a `127.0.0.1` server — production paths always go through
 /// [`TlsTransport`].
 ///
-/// Why this exists: the four ingress run-loops are generic over
+/// Why this exists: the ingress run-loops are generic over
 /// [`Transport`] and we want to exercise their full mio + state-machine
 /// path against a real socket. For HTTPS endpoints we'd need rcgen and
-/// a custom rustls server; for the RSS poller (plain HTTP/1.1) this
+/// a custom rustls server; for plain-HTTP/1.1 loopback servers this
 /// adapter is enough on its own.
 pub struct PlainTcpTransport {
     sock: TcpStream,

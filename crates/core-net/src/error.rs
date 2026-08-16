@@ -1,6 +1,6 @@
 //! Cross-crate boundary error type.
 //!
-//! The four ingress crates (polymarket, binance, rpc, rss) and the
+//! The ingress crates (polymarket, binance, rpc, ...) and the
 //! `clob-dispatcher` carry their own granular error enums for
 //! source-level debugging. This module adds a single shared
 //! [`NetworkErr`] type so the cli / engine can match on a
@@ -57,7 +57,9 @@ pub enum NetworkSource {
     Binance = 1,
     /// `ingress-rpc` Polygon WSS feed.
     Rpc = 2,
-    /// `ingress-rss` HTTPS poller.
+    /// Retired 8f (`ingress-rss` deleted). Wire value reserved —
+    /// append-only ABI: never renumbered, never reused. Same
+    /// reservation logic as `SignalSource::Rss`.
     Rss = 3,
     /// `clob-dispatcher` outbound POST.
     Clob = 4,

@@ -36,7 +36,13 @@ cargo bench --workspace
 cd claude-worker && uv run pytest
 
 # start the engine locally (paper mode)
-cargo run --release -p cli -- run --config ~/multivenue/config.toml --paper
+# G0 law: test gates build rlibs/test bins but NEVER relink the release
+# binary — ALWAYS `cargo build --release -p cli` before any live boot.
+# --polymarket-asset-id is REQUIRED (the market's clobTokenIds decimal
+# string; boot refuses to start venue-blind). For AI-cmd work use the
+# set path: --strategy all (bare latency-arb can't express AI toggles).
+cargo build --release -p cli
+cargo run --release -p cli -- run --paper --polymarket-asset-id <TOKEN_ID>
 
 # audit a capture run (every run writes PMLR capture to
 # <MULTIVENUE_LOG_DIR>/run-<epoch_ns>/ — per-venue ticks/events/signals

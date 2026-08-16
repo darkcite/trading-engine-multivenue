@@ -91,8 +91,8 @@ struct SymbolEntry {
     sym: SymbolId,
 }
 
-/// FNV-1a 64. Same hash core-types/ingress-rss use elsewhere; kept
-/// local so we don't pull a dependency for two lines.
+/// FNV-1a 64. Same hash core-types uses elsewhere; kept local so we
+/// don't pull a dependency for two lines.
 #[inline]
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
