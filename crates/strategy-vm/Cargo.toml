@@ -1,0 +1,18 @@
+[package]
+name         = "strategy-vm"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Ruleset-VM strategy: zero-alloc evaluation of the operator-committed RuleTable (Phase 8g §7)"
+
+[dependencies]
+book-builder  = { workspace = true }
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

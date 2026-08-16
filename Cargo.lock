@@ -156,6 +156,7 @@ dependencies = [
  "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
+ "strategy-vm",
  "tui",
 ]
 
@@ -1756,6 +1757,17 @@ dependencies = [
  "strategy-ev",
  "strategy-latency-arb",
  "strategy-rule-tree",
+]
+
+[[package]]
+name = "strategy-vm"
+version = "0.1.0"
+dependencies = [
+ "book-builder",
+ "core-time",
+ "core-types",
+ "proptest",
+ "strategy-core",
 ]
 
 [[package]]

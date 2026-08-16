@@ -2675,13 +2675,28 @@ fn ruleset_validator_is_zero_alloc() {
 }
 
 /// Gate 35 (8g §10): the §6 table-handoff seam — ring push (documented
-/// copy #1, scratch → slot) and pop (copy #2, slot → consumer),
-/// including the §5 push-full reject path, must be 0 B/op: the copies
-/// move 16 KiB + 64 of bytes, never the heap. The Commit-flip third of
-/// the §10 row joins with the vm member (item 5+); ring construction
-/// (`Box::new_uninit`) is boot-time and sits outside the guard.
+/// copy #1, scratch → slot), pop + member receive (copy #2, slot →
+/// staged buffer via `VmStrategy::receive_table`), the §5 push-full
+/// reject path AND the Commit flip (index swap, no copy) must be
+/// 0 B/op: the copies move 16 KiB + 64 of bytes, never the heap. The
+/// Commit-flip third joined with the vm member (§12 item 5, this
+/// gate's original parenthetical); ring + vm construction is
+/// boot-time and sits outside the guard.
 #[test]
 fn ruleset_table_handoff_is_zero_alloc() {
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_vm::VmStrategy;
+
+    struct Noop;
+    impl Ctx for Noop {
+        fn submit(&mut self, _order: core_types::Order) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn now_ns(&self) -> core_time::NsTs {
+            1_000_000
+        }
+    }
+
     // Full-size table so every copy moves the entire body (contents
     // are immaterial to the seam).
     let mut table = Box::new(core_types::RuleTable::EMPTY);
@@ -2692,10 +2707,33 @@ fn ruleset_table_handoff_is_zero_alloc() {
     > = Ring::new();
     let (mut prod, mut cons) = ring.split();
 
-    // Prewarm: one full round trip before the measurement window.
+    // The flip consumer + the in-stream Commit (px/qty = the [0xA5;16]
+    // identity halves, the shared `ruleset_hash128` pairing).
+    let mut vm: Box<VmStrategy<8>> = Box::new(VmStrategy::new());
+    let mut ctx = Noop;
+    let commit = core_types::AiCmd::new(
+        1,
+        1,
+        core_types::SYMBOL_ID_NONE,
+        i64::from_le_bytes([0xA5; 8]),
+        i64::from_le_bytes([0xA5; 8]),
+        0,
+        core_types::AiCmdKind::RulesetCommit,
+        VenueId::Ai,
+        core_types::STRATEGY_SLOT_VM,
+        core_types::AI_SIDE_NONE,
+        0,
+        0,
+    );
+
+    // Prewarm: one full round trip incl. receive + flip before the
+    // measurement window.
     table.epoch = 0;
     assert!(prod.try_push(*table).is_ok());
-    assert!(cons.try_pop().is_some());
+    let warm = cons.try_pop().expect("prewarm pop");
+    vm.receive_table(&warm);
+    vm.on_ai(&commit, &mut ctx);
+    assert_eq!(vm.commits_applied, 1, "prewarm flip must land");
 
     let mut ok_pushes = 0u32;
     let mut full_rejects = 0u32;
@@ -2712,17 +2750,205 @@ fn ruleset_table_handoff_is_zero_alloc() {
         full_rejects += u32::from(prod.try_push(*table).is_err());
         while let Some(t) = cons.try_pop() {
             std::hint::black_box(t.epoch);
+            // Copy #2: popped slot → member staged buffer. The second
+            // pop of the pair overwrites the first — the engine-side
+            // restage-supersedes mirror, measured too.
+            vm.receive_table(&t);
             pops += 1;
         }
+        // Commit flip third (§10): hash match ⇒ index swap, no copy.
+        vm.on_ai(&commit, &mut ctx);
         i += 1;
     }
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(ok_pushes, 100);
     assert_eq!(full_rejects, 50, "cap-2 ring must reject the third stage");
     assert_eq!(pops, 100);
+    assert_eq!(vm.commits_applied, 51, "every in-window Commit must flip");
+    assert_eq!(vm.commits_dropped, 0);
+    assert_eq!(vm.active_epoch(), 100, "last flip exposes the last pop");
     assert_eq!(
         allocs, 0,
         "ruleset table handoff allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "ruleset table handoff bytes should be zero: saw {bytes}");
+}
+
+/// Gate 36 (8g §10): `VmStrategy::on_tick` steady state — a full-table
+/// (256-row) tick storm including fires, cooldown re-arms and clamped
+/// submits into a placeholder order ring — must be 0 B/op. The storm
+/// covers every hot branch: level_breach + cross_deviation fires, the
+/// policy re-clamp (a hand-built over-cap row), the qty-floor
+/// clamp-to-zero path, ref-leg book refreshes, the irrelevant-sym
+/// relevance-scan miss, and sleeping rows. Construction + book
+/// tracking are boot-time (prewarmed) and sit outside the guard.
+#[test]
+fn vm_on_tick_steady_state_is_zero_alloc() {
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_vm::VmStrategy;
+
+    /// Placeholder order ring behind the ctx: submits land in a real
+    /// SPSC ring, drained by the test loop like the engine would.
+    struct RingCtx {
+        prod: core_ring::Producer<core_types::Order, 1024>,
+        now: u64,
+    }
+    impl Ctx for RingCtx {
+        fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
+            self.prod.try_push(order).map_err(|_| SubmitErr::RingFull)
+        }
+        fn now_ns(&self) -> core_time::NsTs {
+            self.now
+        }
+    }
+
+    const REF_SYM: u32 = 1_000;
+    const IRRELEVANT_SYM: u32 = 5_000;
+
+    // 256 rows over 256 distinct action syms (venue byte 0 =
+    // Polymarket — raw-id style, like the §4.3 universe's raw ids):
+    //   syms 1..=128   level_breach Bid @ 0.50, $1 cap, 10 ms horizon
+    //   syms 129..=256 cross_deviation both vs REF_SYM, 80 bps, $1
+    // Special rows for branch coverage (validator-illegal, hand-built
+    // on purpose — the emit-time layer must stand alone):
+    //   sym 1  carries a $500 cap ⇒ policy-clamps to $100
+    //   sym 128 is Ask-side with a 1-micro-$ cap and ticks at a $2
+    //   mid ⇒ fires (bid ≥ level) but qty floors to zero
+    let mut table = Box::new(core_types::RuleTable::EMPTY);
+    for k in 0..128u32 {
+        let risk = if k == 0 {
+            500_000_000 // policy re-clamp branch
+        } else if k == 127 {
+            1 // qty-floor clamp-to-zero branch
+        } else {
+            1_000_000
+        };
+        let side = if k == 127 { 1 } else { 0 }; // Ask / Bid
+        table.rows[k as usize] = core_types::RuleRow::new(
+            k + 1,
+            core_types::SYMBOL_ID_NONE,
+            0,
+            10,
+            500_000,
+            risk,
+            k as u64,
+            core_types::RuleRow::TRIGGER_LEVEL_BREACH,
+            side,
+            0,
+        );
+    }
+    for k in 0..128u32 {
+        table.rows[(128 + k) as usize] = core_types::RuleRow::new(
+            129 + k,
+            REF_SYM,
+            80,
+            10,
+            0,
+            1_000_000,
+            (128 + k) as u64,
+            core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
+            core_types::RuleRow::SIDE_BOTH,
+            0,
+        );
+    }
+    table.len = core_types::RULE_TABLE_ROWS as u32;
+    table.epoch = 1;
+    table.hash128 = [0x36; 16];
+
+    let ring: std::sync::Arc<Ring<core_types::Order, 1024>> = Ring::new();
+    let (prod, mut cons) = ring.split();
+    let mut vm: Box<VmStrategy<512>> = Box::new(VmStrategy::new());
+    let mut ctx = RingCtx {
+        prod,
+        now: 1_000_000_000,
+    };
+    vm.on_start(&mut ctx).unwrap();
+    vm.receive_table(&table);
+    let commit = core_types::AiCmd::new(
+        1,
+        1,
+        core_types::SYMBOL_ID_NONE,
+        i64::from_le_bytes([0x36; 8]),
+        i64::from_le_bytes([0x36; 8]),
+        0,
+        core_types::AiCmdKind::RulesetCommit,
+        VenueId::Ai,
+        core_types::STRATEGY_SLOT_VM,
+        core_types::AI_SIDE_NONE,
+        0,
+        0,
+    );
+    vm.on_ai(&commit, &mut ctx);
+    assert_eq!(vm.rows_active(), 256);
+
+    // One storm iteration = one tick. Phase cycle: 256 action syms,
+    // then the ref leg, then an irrelevant sym (relevance-scan miss).
+    fn storm_tick(i: u32) -> Tick {
+        let phase = i % 258;
+        let (sym, bid, ask) = if phase < 128 {
+            // ask 0.49 ≤ level 0.50 ⇒ Bid fire. Sym 128 (Ask row):
+            // bid $1.99 ≥ level ⇒ fires, but the $2 mid floors the
+            // 1-micro-cap qty to zero — the clamp-to-zero branch.
+            if phase == 127 {
+                (phase + 1, 1_990_000, 2_010_000)
+            } else {
+                (phase + 1, 470_000, 490_000)
+            }
+        } else if phase < 256 {
+            // mid 0.70 vs ref mid 0.50 ⇒ 4_000 bps ≥ 80 ⇒ Ask fire.
+            (phase + 1, 690_000, 710_000)
+        } else if phase == 256 {
+            (REF_SYM, 490_000, 510_000)
+        } else {
+            (IRRELEVANT_SYM, 400_000, 420_000)
+        };
+        Tick::new(
+            0,
+            VenueId::Polymarket,
+            sym,
+            i + 1, // globally increasing ⇒ per-sym increasing
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        )
+    }
+
+    // Prewarm: one full cycle tracks every book slot and exercises
+    // every branch once before the measurement window.
+    let mut i = 0u32;
+    while i < 258 {
+        vm.on_tick(&storm_tick(i), &mut ctx);
+        ctx.now += 1_000_000; // 1 ms per tick ⇒ 10 ms horizons re-arm
+        while let Some(o) = cons.try_pop() {
+            std::hint::black_box(o.client_oid);
+        }
+        i += 1;
+    }
+    let warm_fires = vm.fires;
+    let warm_emitted = vm.orders_emitted;
+    assert!(warm_fires > 0 && warm_emitted > 0, "prewarm must exercise the emit path");
+
+    let g = AllocGuard::new();
+    while i < 258 + 10_000 {
+        vm.on_tick(&storm_tick(i), &mut ctx);
+        ctx.now += 1_000_000;
+        while let Some(o) = cons.try_pop() {
+            std::hint::black_box(o.client_oid);
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(vm.fires > warm_fires, "storm must keep firing");
+    assert!(vm.orders_emitted > warm_emitted, "storm must keep emitting");
+    assert!(
+        vm.fires > vm.orders_emitted + vm.orders_dropped,
+        "the clamp-to-zero row must fire without emitting"
+    );
+    assert_eq!(vm.book_track_failed, 0);
+    assert_eq!(
+        allocs, 0,
+        "vm on_tick steady state allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "vm on_tick bytes should be zero: saw {bytes}");
 }

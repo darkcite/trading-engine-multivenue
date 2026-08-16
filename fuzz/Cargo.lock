@@ -142,6 +142,7 @@ version = "0.1.0"
 dependencies = [
  "core-crypto",
  "core-io",
+ "core-parse",
  "core-ring",
  "core-time",
  "core-types",
@@ -294,6 +295,7 @@ name = "polymarket-fuzz"
 version = "0.0.0"
 dependencies = [
  "clob-dispatcher",
+ "core-crypto",
  "core-net",
  "core-parse",
  "core-types",

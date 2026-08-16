@@ -14,6 +14,9 @@ libfuzzer-sys = "0.4"
 # Workspace crates under test.
 ingress-ai         = { path = "../crates/ingress-ai" }
 core-types         = { path = "../crates/core-types" }
+# ruleset_json: honest-hash pass needs the same sha256 the validator
+# checks against (§4.2 rule 1).
+core-crypto        = { path = "../crates/core-crypto" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
 ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
@@ -28,6 +31,13 @@ clob-dispatcher    = { path = "../crates/clob-dispatcher" }
 [[bin]]
 name   = "ai_cmd_frame"
 path   = "fuzz_targets/ai_cmd_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ruleset_json"
+path   = "fuzz_targets/ruleset_json.rs"
 test   = false
 doc    = false
 bench  = false

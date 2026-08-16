@@ -23,3 +23,6 @@ libc = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
+# ruleset_proptest.rs hashes its generated artifacts (§4.2 rule 1) —
+# integration tests cannot reach the lib's own core-crypto dep.
+core-crypto = { workspace = true }

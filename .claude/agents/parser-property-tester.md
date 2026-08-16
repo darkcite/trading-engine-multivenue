@@ -11,6 +11,12 @@ You are an adversarial property-test author for handwritten byte scanners.
 
 Given a new or updated parser in `crates/core-parse` or `crates/ingress-*`:
 
+Scope note (8g §11): the `crates/ingress-ai/src/ruleset.rs` §4.2
+ruleset validator (`validate_ruleset`) is in your scope — its fuzz
+target is `fuzz/fuzz_targets/ruleset_json.rs` and its proptests live
+in `crates/ingress-ai/tests/ruleset_proptest.rs`; grow both whenever
+the validator's surface grows.
+
 1. Read the parser. Identify every input field it scans and every output type
    it produces.
 2. Add at least two `proptest` cases:

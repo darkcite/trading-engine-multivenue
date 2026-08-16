@@ -901,6 +901,28 @@ impl AiCmd {
         AiCmdKind::from_u8(self.kind)
     }
 
+    /// Reassemble the ruleset identity hash128 carried by
+    /// `RulesetStage` / `RulesetCommit` frames from the `px` + `qty`
+    /// halves (`px` = bytes 0..8 LE, `qty` = bytes 8..16 LE — the
+    /// field-doc convention above). THE shared helper of 8g §6: the
+    /// ingress-ai side path and the `strategy-vm` Commit flip must
+    /// reassemble identically or the two state machines desynchronize,
+    /// so the pairing lives here, next to the fields that define it.
+    /// Meaningless for other kinds (there `px`/`qty` are prices).
+    #[inline(always)]
+    pub const fn ruleset_hash128(&self) -> [u8; 16] {
+        let px = self.px.to_le_bytes();
+        let qty = self.qty.to_le_bytes();
+        let mut h = [0u8; 16];
+        let mut i = 0;
+        while i < 8 {
+            h[i] = px[i];
+            h[8 + i] = qty[i];
+            i += 1;
+        }
+        h
+    }
+
     /// Materialize an `AiCmd` from 64 wire bytes (little-endian, i.e.
     /// native — compile-guarded above).
     ///
@@ -1838,6 +1860,38 @@ mod ai_cmd_tests {
     fn ai_cmd_size_is_one_cache_line() {
         assert_eq!(::core::mem::size_of::<AiCmd>(), 64);
         assert_eq!(::core::mem::align_of::<AiCmd>(), 64);
+    }
+
+    #[test]
+    fn ruleset_hash128_reassembles_px_qty_halves() {
+        // Happy path: the golden pairing — px = bytes 0..8 LE,
+        // qty = bytes 8..16 LE. Vector chosen with distinct bytes so
+        // any half-swap or endianness slip fails.
+        let h: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let px = i64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+        let qty = i64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+        let cmd = valid(AiCmdKind::RulesetCommit);
+        let mut cmd = cmd;
+        cmd.px = px;
+        cmd.qty = qty;
+        assert_eq!(cmd.ruleset_hash128(), h);
+    }
+
+    #[test]
+    fn ruleset_hash128_differs_when_either_half_differs() {
+        // Failure mode: perturbing either half must change the
+        // reassembled identity (no half is ignored).
+        let base = valid(AiCmdKind::RulesetStage);
+        let h0 = base.ruleset_hash128();
+        let mut px_flip = base;
+        px_flip.px ^= 1;
+        assert_ne!(px_flip.ruleset_hash128(), h0);
+        let mut qty_flip = base;
+        qty_flip.qty ^= 1;
+        assert_ne!(qty_flip.ruleset_hash128(), h0);
     }
 
     #[test]

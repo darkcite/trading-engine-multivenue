@@ -815,15 +815,14 @@ impl RulesetSidePath {
         &self.scratch
     }
 
-    /// Reassemble the wire hash128 from the `px`+`qty` halves
-    /// (little-endian signed halves; byte convention pinned by the
-    /// shared golden vectors).
+    /// Reassemble the wire hash128 from the `px`+`qty` halves —
+    /// delegates to [`AiCmd::ruleset_hash128`], THE shared §6 helper
+    /// (8g item 5 moved it to `core-types` so the `strategy-vm`
+    /// Commit flip reassembles through the same code path; a local
+    /// copy here would let the two state machines drift).
     #[inline]
     fn cmd_hash128(cmd: &AiCmd) -> [u8; HASH128_LEN] {
-        let mut h = [0u8; HASH128_LEN];
-        h[..8].copy_from_slice(&cmd.px.to_le_bytes());
-        h[8..].copy_from_slice(&cmd.qty.to_le_bytes());
-        h
+        cmd.ruleset_hash128()
     }
 
     /// `<hash128-hex>.json` as a fixed stack buffer (37 ASCII bytes).

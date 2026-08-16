@@ -35,6 +35,7 @@ members = [
     "crates/strategy-latency-arb",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
+    "crates/strategy-vm",
 
     # --- execution ---
     "crates/clob-dispatcher",
@@ -154,6 +155,7 @@ strategy-ev           = { path = "crates/strategy-ev" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
+strategy-vm           = { path = "crates/strategy-vm" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 signer-eip712   = { path = "crates/signer-eip712" }
