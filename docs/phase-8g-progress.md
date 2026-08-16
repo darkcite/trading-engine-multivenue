@@ -183,3 +183,102 @@ before anything ambiguous. If context runs short: write interim state
 + exact resume point + relaunch prompt into
 docs/phase-8g-progress.md, then tell me.
 ```
+
+---
+
+## 2026-08-16 — Session G1 (checklist items 1–3) — CLOSED
+
+Three commits, each gated green on the Mac before the next
+(§12 discipline):
+
+| item | commit | scope |
+|---|---|---|
+| 1 (D4a) | `4690c06` | docs-only tidy: S7 deviation-2 six-file list + CLAUDE.md run quick-ref (stale `--config` dies; REQUIRED `--polymarket-asset-id`; `--strategy all` note; release-relink law) + **both G0 docs folded in** (operator answer this session). Zero code motion — grep-verified every changed `crates/` line is a comment. |
+| 2 | `f21ac14` | `core-types`: `RuleRow`/`RuleTable`/`RuleTableSlot` per §3 + `fnv1a_64` (pub const fn, pins `name_h` next to the type) + `RULE_TABLE_ROWS` + `RuleRow` trigger/side consts + `ZERO`/`EMPTY` + size AND offset compile-time asserts + 8 unit tests; wire-format.md gains both offset tables (between ChannelEvent and Capture files, marked in-process-only / never captured). |
+| 3 | `600a213` | `ingress-ai`: `validate_ruleset` (§4.2 rules 1–8, flat byte scanner, no serde_json, zero auxiliary storage — cross-row rules recomputed against the admitted prefix), `RulesetReject` per-rule enum, side path gains sorted `Arc<[u32]>` universe + `Box<RuleTable>` scratch (one documented boot alloc) + epoch stamp + `staged_table()` diagnostic; stub tests upgraded (`{"rows":[]}` = canonical rule-4 reject) + one test per rule; **gate 34** `ruleset_validator_is_zero_alloc` (baseline 33 → 34). |
+
+### Operator decisions taken in-session
+
+1. **G0 docs → commit 1** (fold, not separate/parked).
+2. **§3 `RuleRow._pad` amended `[u8; 13]` → `[u8; 21]`.** Declared
+   fields sum to 43 B; 13 left 8 *implicit* compiler tail bytes —
+   size assert alone can't catch it (align(64) pads to 64 either
+   way), the explicit-zeroed-padding doctrine and the
+   fully-explicit-layout test can. Recorded in the struct doc,
+   wire-format.md, and the item-2 commit message.
+
+### Documented interpretations (validator, item 3 — flag on G2 review)
+
+- **"Trailing bytes ⇒ reject" = trailing NON-whitespace.** ASCII
+  ws after the closing brace is tolerated: JSON-insignificant, and
+  the hash already pins content byte-exactly (rejecting a trailing
+  newline buys no integrity). Non-ws trailing byte ⇒ Grammar.
+- **"First failure wins" = streaming.** Rules apply in §4.2 order at
+  each scan position; across positions the earliest-position failure
+  wins (single pass, no row storage beyond the table — the
+  whole-file phase model would need multi-pass for zero gain).
+  Rule 4 lower fires after grammar completes (order 2 < 4); upper
+  fires the moment a 257th row opens.
+- **`max_risk_usd` must be > 0** — classified rule 3 (a non-positive
+  notional cap is meaningless); the ≤ $100 check stays rule 7.
+- **`ref`-present-on-`level_breach` ⇒ Symbol (rule 6)** per the
+  design's own wording; `level`-present-on-`cross_deviation` ⇒
+  Grammar (§4.1 shape). Asymmetric, design-literal.
+- **`scan_u64` wrap closed** with a 10-digit literal cap on u32
+  fields (wrapping scanner is fine for venue feeds, not for
+  untrusted config).
+- **Failed restage clears the parked scratch** (discard-on-reject
+  wipes `len`) while `staged()` keeps the prior hash — pinned in
+  test + `staged_table` docs; harmless because the item-4 ring copy
+  at stage time is the durable handoff. The parked scratch is a G1
+  diagnostic only.
+- **`fnv1a_64` lives in `core-types`** (not ingress-ai): §3 defines
+  `name_h` as FNV-1a 64, so the hash sits next to the type; also
+  makes the item-1-tidied ingress-polymarket comment ("same hash
+  core-types uses") true — it was aspirational for one commit.
+
+### Wiring state after G1 (for item 4)
+
+- `RulesetSidePath::new` now takes `universe: Arc<[u32]>`;
+  `cli/paper.rs::spawn_ai` passes an **empty placeholder** —
+  fail-closed: every row-bearing ruleset rejects at rule 6 until
+  item 4 threads the real sorted discovery snapshot through
+  `spawn_ai` alongside the `Ring<RuleTableSlot, 2>` producer. The
+  `try_push` seam is marked in `stage()` ("Item 4 (G2) … lands
+  HERE").
+- Live-boot behavior delta (no live boots ran in G1): the 8f stub
+  STAGED any hash-matching artifact; HEAD rejects invalid content
+  and — until item 4 — rejects all row-bearing content (empty
+  universe). Correct-conservative mid-phase.
+
+### Gates at close (all Mac)
+
+- workspace `cargo nextest run`: **963/963** (942 at 8f close).
+- release alloc assertions `--test-threads=1`: **34/34, 0 B/op**
+  (gate 34 confirmed by name in the run log).
+- `cargo check --workspace` clean at every step; item-2 check
+  verified as a REAL green (22 dependent crates rechecked, not a
+  warm-fingerprint no-op).
+- ingress-ai suite 56/56 (uds_loopback seam tests use a counting
+  closure — routing-only, unaffected by validator semantics).
+
+### Hygiene / anomalies
+
+- Git: exactly the three scope commits + this log commit; no push,
+  no fetch, no branch, no history ops. Push anomaly unchanged
+  (origin/main local ref `38e599b`): recorded, not acted on.
+- `.env` untouched. No engine run, no live venues, no sockets
+  beyond the existing test suites' own fixtures.
+- Sandbox: greps only; all cargo/git on the Mac via RustRover MCP
+  (nohup + poll for every long run).
+
+### Resume point
+
+G1 items 1–3 CLOSED. Next session is **G2 = item 4** (design §12):
+bin builds `Ring<RuleTableSlot, 2>`; `spawn_ai` gains producer +
+real universe (replace the paper.rs empty placeholder); side-path
+push per §5 (push-full ⇒ reject, counted;
+`engine_ai_table_push_fail_total`); gate 35
+`ruleset_table_handoff_is_zero_alloc` (push/pop halves; baseline
+34 → 35). Items 5+ (strategy-vm crate, proptest + fuzz) stay G3+.
+
