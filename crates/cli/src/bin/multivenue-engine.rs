@@ -582,13 +582,14 @@ fn run(args: RunArgs) -> ExitCode {
     // §3.3 unspawned shape.
     let (ai_prod, ai_lane_cons) = rings.ai.clone().split();
     let ai_status = std::sync::Arc::new(cli::AiIngressStatus::new());
-    // Ruleset-table handoff ring (Phase 8g §6, D1a): the producer
+    // Ruleset-table handoff ring (Phase 8g §6, item 7): the producer
     // half rides with the AI lane into `spawn_ai`; the consumer half
-    // PARKS here — the `_`-prefixed binding keeps it alive for the
-    // process lifetime without wiring it. Item 7 hands it to the
-    // engine's pre-AI-drain pop; until then the ring holds at most
-    // 2 staged tables and the side path counts push-full rejects.
-    let (ruleset_table_prod, _ruleset_table_cons) = rings.ruleset_tables.clone().split();
+    // rides in `Consumers` to the engine, which pops it immediately
+    // before the AI-cmd drain each iteration and hands slots to the
+    // strategy's `on_ruleset_table` hook (→ the set's vm member —
+    // documented copy #2). Key-unset boots drop the producer and the
+    // lane reads empty forever (§3.3 unspawned shape).
+    let (ruleset_table_prod, ruleset_table_cons) = rings.ruleset_tables.clone().split();
 
     // -- Per-ingress status slots (D7) --
     let statuses = std::sync::Arc::new(cli::IngressStatusSet::new());
@@ -914,6 +915,7 @@ fn run(args: RunArgs) -> ExitCode {
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,
+        ruleset_tables: ruleset_table_cons,
     };
     let engine_cfg = EngineConfig {
         pairs: vec![StrategyPair {

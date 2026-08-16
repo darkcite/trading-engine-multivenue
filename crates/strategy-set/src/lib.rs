@@ -75,7 +75,7 @@
 
 use core_time::NsTs;
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Signal, Tick, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
+    AiCmd, AiCmdKind, Fill, RuleTable, Signal, Tick, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError};
@@ -468,6 +468,19 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm.on_ai(cmd, ctx);
         }
+    }
+
+    /// 8g §6 item 7: the engine's pre-AI-drain table pop lands here,
+    /// forwarded to the slot-5 vm member
+    /// ([`VmStrategy::receive_table`] — documented copy #2).
+    /// Deliberately NOT mask-gated: staging is control plane and a
+    /// staged table is inert until an in-stream `RulesetCommit`,
+    /// which IS mask-gated through [`Strategy::on_ai`] — so an
+    /// operator may stage while slot 5 is disabled and enable before
+    /// committing without losing the table.
+    #[inline]
+    fn on_ruleset_table(&mut self, table: &RuleTable) {
+        self.vm.receive_table(table);
     }
 
     #[inline(always)]
@@ -1056,5 +1069,59 @@ mod tests {
         assert_eq!(s.vm().commits_applied, 0, "bit off → frame never arrives");
         assert_eq!(s.vm().commits_dropped, 0);
         assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A));
+    }
+
+    // ------------- engine table-pop seam (8g item 7) -------------
+
+    /// Item-7 happy path: the engine's pop arrives via the
+    /// `Strategy::on_ruleset_table` hook and lands in the vm member's
+    /// staged buffer (§6 copy #2); a second delivery supersedes the
+    /// first (engine-side restage mirror), and the in-stream Commit
+    /// of the LAST delivery flips.
+    #[test]
+    fn on_ruleset_table_forwards_to_vm_seam() {
+        let mut s = StrategySet::new(BIT_VM);
+        let mut c = vm_ctx();
+        s.on_start(&mut c).unwrap();
+
+        Strategy::on_ruleset_table(&mut s, &vm_table(VM_HASH_A));
+        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A), "hook stages via the seam");
+
+        Strategy::on_ruleset_table(&mut s, &vm_table(VM_HASH_B));
+        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_B), "later delivery supersedes");
+
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_dropped, 1, "superseded hash must not commit");
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_B), &mut c);
+        assert_eq!(s.vm().commits_applied, 1);
+        assert_eq!(s.vm().rows_active(), 1);
+    }
+
+    /// Item-7 gating pin: the table hook is deliberately NOT
+    /// mask-gated (staging is control plane, inert until the
+    /// mask-gated Commit) — stage-while-disabled → enable → commit
+    /// must work without restaging.
+    #[test]
+    fn on_ruleset_table_stages_even_when_vm_disabled() {
+        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut c = vm_ctx();
+        s.on_start(&mut c).unwrap();
+
+        Strategy::on_ruleset_table(&mut s, &vm_table(VM_HASH_A));
+        assert_eq!(
+            s.vm().staged_hash128(),
+            Some(VM_HASH_A),
+            "hook stages even with bit 5 off (not mask-gated by design)"
+        );
+        // Commit while disabled: frame never arrives (mask-gated).
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_applied, 0);
+        assert_eq!(s.vm().commits_dropped, 0);
+
+        // Enable slot 5, re-commit: the staged table was not lost.
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, STRATEGY_SLOT_VM), &mut c);
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_applied, 1, "staged survived the disabled window");
+        assert_eq!(s.vm().rows_active(), 1);
     }
 }

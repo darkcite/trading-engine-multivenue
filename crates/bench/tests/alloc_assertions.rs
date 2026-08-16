@@ -1218,6 +1218,13 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // here so it reads empty (two atomic loads per iteration inside
     // the measured window — part of the real tick cost).
     let (_aip, ai_c) = Ring::<core_types::AiCmd, { core_types::AI_RING_SIZE }>::new().split();
+    // Phase 8g item 7: the ruleset table lane rides in every engine
+    // too; producer-dropped so its pre-AI-drain pop reads empty (one
+    // acquire load per iteration inside the measured window — the §6
+    // steady-state cost of the lane; the loaded pop→receive_table
+    // path is gate 35's seam).
+    let (_tblp, tbl_c) = Ring::<core_types::RuleTableSlot, { core_types::RULE_TABLE_RING_SLOTS }>::new()
+        .split();
 
     let mut eng = Engine::new(
         NoopStrat,
@@ -1227,6 +1234,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         [f0, f1, f2, f3],
         ai_c,
         std::sync::Arc::new(AiIngressStatus::new()),
+        tbl_c,
     );
     eng.start().unwrap();
 

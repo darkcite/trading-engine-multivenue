@@ -27,7 +27,7 @@
 )]
 
 use core_time::NsTs;
-use core_types::{AiCmd, Fill, Order, Signal, Tick};
+use core_types::{AiCmd, Fill, Order, RuleTable, Signal, Tick};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -238,6 +238,23 @@ pub trait Strategy: StrategyCounters {
         let _ = (cmd, ctx);
     }
 
+    /// Called once per [`RuleTable`] slot popped from the ruleset
+    /// table-handoff ring (Phase 8g §6), IMMEDIATELY before the AI-cmd
+    /// drain of the same engine iteration — so a table Staged and
+    /// Commit'd in one batch is received before the Commit dispatches
+    /// through [`Self::on_ai`]. Control-plane, operator cadence.
+    ///
+    /// Defaulted to a no-op: only `strategy-set` forwards the table to
+    /// its slot-5 vm member (`vm_mut().receive_table` — the §6 copy-#2
+    /// seam); bare strategies ignore tables by design, mirroring how
+    /// the `on_ai` default swallows commands on non-set boots.
+    /// Monomorphized like every other callback — no `dyn`. No `Ctx`:
+    /// receiving a table stages state and never submits.
+    #[inline]
+    fn on_ruleset_table(&mut self, table: &RuleTable) {
+        let _ = table;
+    }
+
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C);
@@ -311,6 +328,36 @@ mod tests {
         );
         s.on_tick(&t, &mut ctx);
         assert_eq!(s.ticks, 1);
+    }
+
+    #[test]
+    fn on_ruleset_table_defaults_to_noop() {
+        // Happy path for the 8g §6 default: a strategy that does not
+        // override the hook compiles and its state is untouched by a
+        // delivered table.
+        let mut ctx = NoopCtx { submitted: 0, now: 0 };
+        let mut s = NoopStrat { started: false, ticks: 0 };
+        s.on_start(&mut ctx).unwrap();
+        let mut table = RuleTable::EMPTY;
+        table.len = 1;
+        s.on_ruleset_table(&table);
+        assert!(s.started);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook cannot submit (no Ctx)");
+    }
+
+    #[test]
+    fn on_ruleset_table_default_ignores_oversized_len() {
+        // Failure-mode shape: even a table whose `len` exceeds
+        // RULE_TABLE_ROWS (impossible through the §4.2 validator) is
+        // inert through the default hook — clamping is the concrete
+        // receiver's job (`VmStrategy::receive_table`), not the
+        // trait's.
+        let mut s = NoopStrat { started: false, ticks: 0 };
+        let mut table = RuleTable::EMPTY;
+        table.len = u32::MAX;
+        s.on_ruleset_table(&table);
+        assert_eq!(s.ticks, 0);
     }
 
     // ---------------- CooldownGate ----------------

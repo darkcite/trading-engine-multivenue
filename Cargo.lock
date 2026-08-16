@@ -309,6 +309,7 @@ dependencies = [
  "clap",
  "clob-dispatcher",
  "core-config",
+ "core-crypto",
  "core-io",
  "core-latency",
  "core-metrics",

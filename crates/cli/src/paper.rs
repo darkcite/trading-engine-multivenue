@@ -1408,6 +1408,14 @@ pub struct Consumers {
     /// field; the metrics mirror reads the rest through
     /// `Engine::ai_status()`.
     pub ai_status: Arc<AiIngressStatus>,
+    /// Ruleset table-handoff lane (8g §6, item 7). The engine pops it
+    /// immediately before the AI-cmd drain each iteration and hands
+    /// slots to `Strategy::on_ruleset_table` (→ the set's vm member,
+    /// documented copy #2). Reads empty forever when `ingress-ai` is
+    /// not spawned (producer dropped — §3.3 unspawned shape); on
+    /// non-set strategy paths the pops land on the trait's default
+    /// no-op, mirroring how `on_ai` behaves on bare strategies.
+    pub ruleset_tables: Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
 }
 
 /// Drain-and-count loop. Runs on the main thread until
@@ -2666,9 +2674,19 @@ where
         fill_lanes,
         ai_cmds,
         ai_status,
+        ruleset_tables,
     } = cons;
     let mut obs = obs;
-    let mut eng = Engine::new(strat, disp, tick_lanes, rpc_signal, fill_lanes, ai_cmds, ai_status);
+    let mut eng = Engine::new(
+        strat,
+        disp,
+        tick_lanes,
+        rpc_signal,
+        fill_lanes,
+        ai_cmds,
+        ai_status,
+        ruleset_tables,
+    );
     // Phase 8f: the fills capture is opened by the bin (per-run
     // capture directory) and rides in via Observability; the engine
     // thread owns it from here.
@@ -3692,6 +3710,7 @@ mod tests {
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
             ai_status: Arc::new(AiIngressStatus::new()),
+            ruleset_tables: rings.ruleset_tables.clone().split().1,
         }
     }
 

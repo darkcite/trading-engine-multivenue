@@ -49,3 +49,8 @@ mio                  = { workspace = true }
 rustls               = { workspace = true }
 rustls-pki-types     = { workspace = true }
 libc                 = "0.2"
+
+[dev-dependencies]
+# ruleset_engine_wiring integration tests hash real artifacts the way
+# the operator install step does (sha256 → hash128 filename prefix).
+core-crypto          = { workspace = true }

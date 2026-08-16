@@ -29,7 +29,9 @@ use core_io::SlotCapture;
 use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
-use core_types::{AiCmd, Fill, Order, Signal, Tick, VenueId, AI_RING_SIZE};
+use core_types::{
+    AiCmd, Fill, Order, RuleTableSlot, Signal, Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
+};
 use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
 
@@ -116,6 +118,15 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// observable at pop, not at accept; per-field single-writer
     /// discipline documented in `ingress-ai::status`).
     ai_status: Arc<AiIngressStatus>,
+    /// Ruleset table-handoff lane (Phase 8g §6, item 7). Sole
+    /// consumer of the `Ring<RuleTableSlot, 2>` the ingress-ai side
+    /// path pushes validated tables into at Stage time. Popped
+    /// IMMEDIATELY before the AI-cmd drain each iteration and handed
+    /// to `Strategy::on_ruleset_table` (→ the set's vm member —
+    /// documented copy #2). When `ingress-ai` is not spawned the
+    /// producer half is dropped and this lane reads empty forever
+    /// (§3.3 pattern — one acquire load per iteration).
+    table_cons: Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     /// AI commands dispatched to `Strategy::on_ai` (post TTL + shape
     /// checks). Read by paper-mode stats and tests.
     pub ai_dispatched: u64,
@@ -194,6 +205,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         ai_cons: Consumer<AiCmd, AI_RING_SIZE>,
         ai_status: Arc<AiIngressStatus>,
+        table_cons: Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     ) -> Self {
         Self {
             strat,
@@ -203,6 +215,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             fill_lanes,
             ai_cons,
             ai_status,
+            table_cons,
             ai_dispatched: 0,
             ai_drain_malformed: 0,
             fill_capture: None,
@@ -239,7 +252,9 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// per-lane budget prevents starvation. Then signals, then fill
     /// lanes, then the dispatcher's own fill queue (D3 fix — paper
     /// and queued dispatchers surface fills via `try_next_fill`,
-    /// live venue dispatchers via their fill lane).
+    /// live venue dispatchers via their fill lane), then the ruleset
+    /// table pop (8g §6 — always immediately before the AI-cmd
+    /// drain), then the AI command lane.
     ///
     /// **Latency recording.** Every drained tick samples the
     /// `now - tick.ts_ns` gap into the `ingest_lat` tracker. Every
@@ -356,6 +371,24 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 None => break,
             }
             i += 1;
+        }
+
+        // --- ruleset table lane (Phase 8g §6, item 7) ---
+        // Popped IMMEDIATELY before the AI-cmd drain, every
+        // iteration: a table Staged and Commit'd in the same batch
+        // must land in the vm member's staged buffer BEFORE the
+        // Commit AiCmd dispatches through `on_ai` (§6 in-stream flip
+        // ordering). Drain-to-newest with gate-35 semantics: every
+        // popped slot is delivered in ring order and the receiver's
+        // staged buffer keeps the last one (restage supersedes —
+        // `VmStrategy::receive_table` overwrites). The while-let is
+        // bounded by construction (RULE_TABLE_RING_SLOTS = 2); an
+        // empty lane costs one acquire load (§3.3 unspawned shape).
+        // The pop moves the 16 KiB slot by value into the callee —
+        // that is documented copy #2 (§6), operator cadence, bytes
+        // not heap.
+        while let Some(t) = self.table_cons.try_pop() {
+            self.strat.on_ruleset_table(&t);
         }
 
         // --- AI command lane (Phase 8f §4.3) ---
@@ -640,11 +673,20 @@ mod tests {
     use core_ring::{Producer, Ring};
     use core_types::{Price, Qty, Side};
 
+    #[derive(Default)]
     struct Counter {
         ticks: u32,
         signals: u32,
         fills: u32,
         ai_cmds: u32,
+        /// Ruleset tables delivered via `on_ruleset_table` (8g §6).
+        tables: u32,
+        /// Epoch of the most recent delivered table — pins in-ring
+        /// delivery order (the receiver keeps the last = supersede).
+        last_table_epoch: u32,
+        /// `tables` observed when the FIRST AiCmd dispatched — pins
+        /// the §6 pop-precedes-AI-drain same-iteration ordering.
+        tables_at_first_ai: u32,
     }
 
     impl strategy_core::StrategyCounters for Counter {}
@@ -663,7 +705,14 @@ mod tests {
             self.fills += 1;
         }
         fn on_ai<C: Ctx>(&mut self, _cmd: &AiCmd, _ctx: &mut C) {
+            if self.ai_cmds == 0 {
+                self.tables_at_first_ai = self.tables;
+            }
             self.ai_cmds += 1;
+        }
+        fn on_ruleset_table(&mut self, table: &core_types::RuleTable) {
+            self.tables += 1;
+            self.last_table_epoch = table.epoch;
         }
         fn on_timer<C: Ctx>(&mut self, _n: NsTs, _ctx: &mut C) {}
         fn timer_period_ns(&self) -> u64 {
@@ -710,7 +759,8 @@ mod tests {
 
     /// Build an engine plus producer halves for every lane. Tick
     /// producers are indexed by `VenueId as usize`, fill producers
-    /// by [`fill_lane_of`].
+    /// by [`fill_lane_of`]; the last producer feeds the 8g ruleset
+    /// table lane.
     #[allow(clippy::type_complexity)]
     fn build_engine() -> (
         Engine<Counter, PaperDispatcher>,
@@ -718,27 +768,33 @@ mod tests {
         Producer<Signal, SIGNAL_RING_SIZE>,
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         Producer<AiCmd, AI_RING_SIZE>,
+        Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     ) {
         let (tp, tc) = split_tick_lanes();
         let sig_ring: std::sync::Arc<Ring<Signal, SIGNAL_RING_SIZE>> = Ring::new();
         let (sp, sc) = sig_ring.split();
         let (fp, fc) = split_fill_lanes();
         let (ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
 
-        let strat = Counter {
-            ticks: 0,
-            signals: 0,
-            fills: 0,
-            ai_cmds: 0,
-        };
+        let strat = Counter::default();
         let disp = PaperDispatcher::new();
-        let eng = Engine::new(strat, disp, tc, sc, fc, ac, Arc::new(AiIngressStatus::new()));
-        (eng, tp, sp, fp, ap)
+        let eng = Engine::new(
+            strat,
+            disp,
+            tc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        (eng, tp, sp, fp, ap, tblp)
     }
 
     #[test]
     fn engine_drains_polymarket_tick_lane() {
-        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..3u32 {
             tp[VenueId::Polymarket as usize]
@@ -752,7 +808,7 @@ mod tests {
 
     #[test]
     fn engine_drains_every_lane_per_iteration() {
-        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let venues = [
             VenueId::Polymarket,
@@ -775,7 +831,7 @@ mod tests {
 
     #[test]
     fn engine_respects_max_per_ring_cap_per_lane() {
-        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..10u32 {
             tp[0].try_push(mk_tick(VenueId::Polymarket, 1, i + 1)).unwrap();
@@ -790,7 +846,7 @@ mod tests {
 
     #[test]
     fn engine_drains_fill_lanes() {
-        let (mut eng, _tp, _sp, mut fp, _ap) = build_engine();
+        let (mut eng, _tp, _sp, mut fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let f = Fill::new(
             10,
@@ -841,14 +897,19 @@ mod tests {
             )),
             stats: DispatchStats::default(),
         };
-        let strat = Counter {
-            ticks: 0,
-            signals: 0,
-            fills: 0,
-            ai_cmds: 0,
-        };
+        let strat = Counter::default();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
-        let mut eng = Engine::new(strat, disp, tc, sc, fc, ac, Arc::new(AiIngressStatus::new()));
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            strat,
+            disp,
+            tc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
         eng.start().unwrap();
         eng.tick(16);
         assert_eq!(eng.fills_dispatched, 1, "dispatcher fill must reach on_fill");
@@ -867,20 +928,20 @@ mod tests {
 
     #[test]
     fn engine_dispatcher_starts_with_zero_accepted() {
-        let (eng, _tp, _sp, _fp, _ap) = build_engine();
+        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.dispatcher().stats().accepted, 0);
     }
 
     #[test]
     fn max_tick_age_zero_before_any_tick() {
-        let (eng, _tp, _sp, _fp, _ap) = build_engine();
+        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.populated_sym_count(), 0);
         assert_eq!(eng.max_tick_age_ns(1_000_000), 0);
     }
 
     #[test]
     fn max_tick_age_tracks_freshest_per_bucket() {
-        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 11, 1)).unwrap();
@@ -898,7 +959,7 @@ mod tests {
     fn same_ordinal_on_two_venues_lands_in_two_buckets() {
         // The §3.1 regression the mixed bucket exists to prevent:
         // ordinal 0 on every venue used to collapse into bucket 0.
-        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let pm = core_types::make_symbol_id(VenueId::Polymarket, 0);
         let okx = core_types::make_symbol_id(VenueId::Okx, 0);
@@ -936,13 +997,18 @@ mod tests {
             )),
             stats: DispatchStats::default(),
         };
-        let strat = Counter {
-            ticks: 0,
-            signals: 0,
-            fills: 0,
-            ai_cmds: 0,
-        };
-        let mut eng = Engine::new(strat, disp, tc, sc, fc, ac, Arc::new(AiIngressStatus::new()));
+        let strat = Counter::default();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            strat,
+            disp,
+            tc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
         eng.set_fill_capture(
             core_io::SlotCapture::open(&path, core_io::SlotKind::Fill, 7).unwrap(),
         );
@@ -976,7 +1042,7 @@ mod tests {
 
     #[test]
     fn fills_capture_getters_zero_without_capture() {
-        let (eng, _tp, _sp, _fp, _ap) = build_engine();
+        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.fill_capture_records(), 0);
         assert_eq!(eng.fill_capture_io_errors(), 0);
     }
@@ -1025,7 +1091,7 @@ mod tests {
 
     #[test]
     fn ai_lane_dispatches_to_on_ai() {
-        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         // ts = now, no TTL → never expires; heartbeat has no shape
         // surprises.
@@ -1039,7 +1105,7 @@ mod tests {
 
     #[test]
     fn ai_lane_ttl_expires_on_pop() {
-        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         let now = now_ns();
         // Accepted 10 ms ago with a 1 ms TTL → expired at pop.
@@ -1055,7 +1121,7 @@ mod tests {
 
     #[test]
     fn ai_lane_respects_drain_budget() {
-        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         let n = (AI_DRAIN_BUDGET * 2 + 3) as u32;
         for i in 0..n {
@@ -1074,7 +1140,7 @@ mod tests {
 
     #[test]
     fn ai_lane_recheck_rejects_malformed_at_drain() {
-        let (mut eng, _tp, _sp, _fp, mut ap) = build_engine();
+        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         // Bypass the ingress (the ring producer is ours) and push a
         // shape violation: Heartbeat must not carry px.
@@ -1094,9 +1160,75 @@ mod tests {
         );
     }
 
+    // ------------- ruleset table lane (Phase 8g §6, item 7) -------------
+
+    /// Table slot with a recognizable epoch (contents immaterial to
+    /// the engine — it moves slots, never reads rows).
+    fn mk_table(epoch: u32) -> RuleTableSlot {
+        let mut t = core_types::RuleTable::EMPTY;
+        t.epoch = epoch;
+        t
+    }
+
+    /// §6 ordering invariant, engine-level: a table pushed and an
+    /// AiCmd (the in-stream Commit's lane) arriving in the SAME batch
+    /// are delivered table-first within ONE `tick()` — the pop runs
+    /// immediately before the AI-cmd drain.
+    #[test]
+    fn ruleset_table_pop_precedes_ai_drain_same_iteration() {
+        let (mut eng, _tp, _sp, _fp, mut ap, mut tblp) = build_engine();
+        eng.start().unwrap();
+        assert!(tblp.try_push(mk_table(7)).is_ok());
+        ap.try_push(mk_heartbeat(now_ns(), 1)).unwrap();
+        eng.tick(16);
+        assert_eq!(eng.strategy().tables, 1, "table delivered in the same iteration");
+        assert_eq!(eng.strategy().ai_cmds, 1);
+        assert_eq!(
+            eng.strategy().tables_at_first_ai,
+            1,
+            "pop must precede the AI-cmd drain within one iteration (§6)"
+        );
+        assert_eq!(eng.strategy().last_table_epoch, 7);
+    }
+
+    /// Drain-to-newest (gate-35 semantics): both queued slots are
+    /// delivered in ring order in one iteration; the receiver keeps
+    /// the last (restage supersedes — pinned here via epoch order).
+    #[test]
+    fn ruleset_table_lane_drains_all_slots_in_order() {
+        let (mut eng, _tp, _sp, _fp, _ap, mut tblp) = build_engine();
+        eng.start().unwrap();
+        assert!(tblp.try_push(mk_table(1)).is_ok());
+        assert!(tblp.try_push(mk_table(2)).is_ok());
+        assert!(
+            tblp.try_push(mk_table(3)).is_err(),
+            "cap-2 ring must reject the third undrained stage (§5)"
+        );
+        eng.tick(16);
+        assert_eq!(eng.strategy().tables, 2, "both slots delivered in one iteration");
+        assert_eq!(eng.strategy().last_table_epoch, 2, "in-ring order: newest last");
+        // Ring drained ⇒ the lane accepts stages again.
+        assert!(tblp.try_push(mk_table(4)).is_ok());
+        eng.tick(16);
+        assert_eq!(eng.strategy().tables, 3);
+        assert_eq!(eng.strategy().last_table_epoch, 4);
+    }
+
+    /// Failure-mode shape: an unwired/empty lane is a per-iteration
+    /// no-op (the §3.3 unspawned pattern — the hook never fires).
+    #[test]
+    fn ruleset_table_lane_empty_is_noop() {
+        let (mut eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        eng.start().unwrap();
+        eng.tick(16);
+        eng.tick(16);
+        assert_eq!(eng.strategy().tables, 0);
+        assert_eq!(eng.strategy().tables_at_first_ai, 0);
+    }
+
     #[test]
     fn max_tick_age_handles_now_before_recorded() {
-        let (mut eng, mut tp, _sp, _fp, _ap) = build_engine();
+        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         eng.tick(16);
