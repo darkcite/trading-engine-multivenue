@@ -507,3 +507,95 @@ pop/flip wiring + integration tests, §9 observability +
 audit-replay slot_kind 4, final gates + operator-gated live smoke)
 stay G5+.
 
+---
+
+## 2026-08-16 — Session G4 (checklist item 6 ONLY) — CLOSED
+
+One scope commit, green on the Mac before committing (§12
+discipline), plus this log commit:
+
+| item | commit | scope |
+|---|---|---|
+| 6 | `bb3e5a3` | `strategy-set` slot-5 member per §8: `vm: VmStrategy<512>` (`SET_VM_SLOTS = 512` — §7: 256 rows × 2 legs), `BUILT_MASK \|= 1 << 5`, `SLOT_VM`/`BIT_VM` consts replace `BIT_VM_RESERVED`, `mask_for_name("vm")`, `vm()`/`vm_mut()` accessors (the `vm_mut().receive_table` seam is now reachable through the set), vm on EVERY callback fan-out (`on_start` initial-mask gated, tick/signal/fill/ai/timer mask-gated, stop unconditional, `timer_period_ns` min, orders counter aggregation). Module-doc "slot 5 exists ONLY as a reserved mask bit" sentence dies; refusal semantics documented + enforced for slots 6–7 only; Enable(5) now sets the bit. Refusal tests migrated to slots 6/7; new tests: slot-5 enable/disable round trip, Commit-through-set flip (⇒ `commits_applied` ticks + committed row fires through set `on_tick`, counters aggregate), mismatch-drop with staged-survives, disabled-bit gating (frame never arrives). cli: `vm` joins `--strategy` (help + set-path match arm; `all` composes it via `BUILT_MASK`; `engine_loop_set_full` marks vm configured unconditionally — no boot config, §7.3 inert boot is normal; composed-log gains `vm` flag). Gate `strategy_set_fanout_is_zero_alloc` extended in place (vm member: boot receive+Commit flip, per-cycle fire+re-arm through the set + per-cycle commit-dropped leg, `T0 = 1e17` production-like clock per the G3 lesson) — NO new gate number, baseline stays 36. `core-types` `STRATEGY_SLOT_VM` doc de-reserved (one line). |
+
+### G3 interpretations reviewed (G3 flagged them "flag on G4 review")
+
+No objections — all seven stand as documented. None conflicts with §8
+wiring; the set-level tests lean directly on two of them (stamp-reset
+on flip via the production-like clock; `receive_table` as the single
+mutation entry point).
+
+### Live-boot behavior delta (recorded per §8 / G0 finding 6)
+
+- Post-item-6 `enable --strategy 5` **SUCCEEDS** — the G0 demo's
+  reserved-slot refusal probe flips meaning exactly as design §8
+  predicted; any future runbook probe uses slot 6.
+- `--strategy vm` boots the set with only vm enabled — inert until a
+  table commits (§7.3, normal). `--strategy all` now composes six
+  members. No live boot was performed in G4 (none planned: no live
+  venues, no engine run, so no `cargo build --release -p cli` was
+  required either — G0 law applies before the NEXT live boot).
+
+### Wiring state after G4 (for item 7)
+
+- vm is IN the set at slot 5; `RulesetCommit` reaches it through the
+  generic `on_ai` fan-out (Stage reaches it too and is ignored by
+  design). Enable/Disable/Halt stay set-level; `SetParam` gains no vm
+  ids (v1).
+- The bin still does NOT pop the table ring: `_ruleset_table_cons`
+  stays parked; staged tables still accumulate in the ring (≤ 2,
+  restage supersedes) exactly as after G2/G3. Item 7 wires the
+  engine's pre-AI-drain pop → `set.vm_mut().receive_table` (§6
+  copy #2 — the seam is now one accessor away).
+- No §9 observability yet: `engine_vm_*` gauges/counters,
+  `engine_strategy_enabled_mask`, audit-replay `slot_kind = 4` are
+  item 8.
+
+### Gates at close (all Mac)
+
+- workspace `cargo nextest run`: **1008/1008** (1004 at G3 close; +4
+  strategy-set vm tests: `enable_vm_slot_round_trips`,
+  `ruleset_commit_fanout_reaches_vm`,
+  `ruleset_commit_mismatch_dropped_staged_survives`,
+  `disabled_vm_never_sees_commit`) — migrated
+  `enable_reserved_or_unknown_slot_refused` (slots 6/7) green in
+  place.
+- release alloc assertions `--test-threads=1`: **36/36, 0 B/op** —
+  extended `strategy_set_fanout_is_zero_alloc` and gate 36 both
+  confirmed by name; `Compiling strategy-vm`/`bench`/`strategy-set`
+  in the run log — no false green.
+- `cargo check --workspace`: 24 "Checking" lines from `core-types`
+  up, zero warnings (real-green signature; test targets compiled
+  fresh under nextest).
+- Migration sweep result: `strategy-set` was the ONLY code site
+  pinning Enable(5)-refused (engine, ingress-ai, cli, claude-worker,
+  bench, tui, docs all grepped). `docs/prompts/ai-session.md` needed
+  nothing (its `enable_refused` line was already halted-only wording;
+  its slot-5 line is the rollback `disable`, which is correct
+  post-item-6); `wire-format.md` already reads "ruleset cmds pin 5
+  (vm)". The demo-probe semantics change was already recorded as G0
+  finding 6; this entry is the promised runbook note.
+
+### Hygiene / anomalies
+
+- Git: one scope commit (`bb3e5a3`) + this log commit; no push, no
+  fetch, no branch, no history ops. Push anomaly unchanged
+  (origin/main local ref `38e599b`): recorded, not acted on.
+- `.env` untouched. No live boots, no engine runs, no live venues, no
+  sockets (unit + gate fixtures only). Sandbox: greps only; all
+  cargo/git on the Mac via RustRover MCP (`executeInShell=true`,
+  nohup + poll for every long run).
+- Root `Cargo.lock` gains the strategy-set → strategy-vm edge (same
+  commit as the code, house rule); fuzz lock untouched (strategy-set
+  is not in the fuzz graph).
+
+### Resume point
+
+G4 (item 6) CLOSED. Next session is **G5 = item 7** (design §12):
+engine table-ring consumer — unpark `_ruleset_table_cons` in the bin,
+pre-AI-drain pop → `set.vm_mut().receive_table` (documented copy #2),
+Commit flip already lands via the set fan-out, §11 integration tests
+(stage → push → pop → commit → fire through the engine loop). Items
+8+ (§9 observability + audit-replay `slot_kind = 4`, final gates +
+operator-gated live smoke) stay G6+.
+
