@@ -59,6 +59,13 @@ pub struct AiIngressStatus {
     /// unreadable, hash mismatch, or commit of a non-staged hash
     /// (`engine_ai_ruleset_rejected_total`).
     ruleset_rejected_total: AtomicU64,
+    /// Ruleset side-path (8g item 4): Stages that passed the §4.2
+    /// validator but were REJECTED at the table-ring `try_push` —
+    /// 2 undrained stages, §5 push-full. Every such event also
+    /// increments `ruleset_rejected_total`; this counter isolates the
+    /// cause (`engine_ai_table_push_fail_total`, §9 — /metrics
+    /// registration lands with item 8).
+    table_push_fail_total: AtomicU64,
 }
 
 impl AiIngressStatus {
@@ -78,6 +85,7 @@ impl AiIngressStatus {
             ruleset_staged_total: AtomicU64::new(0),
             ruleset_committed_total: AtomicU64::new(0),
             ruleset_rejected_total: AtomicU64::new(0),
+            table_push_fail_total: AtomicU64::new(0),
         }
     }
 
@@ -161,6 +169,12 @@ impl AiIngressStatus {
         self.ruleset_rejected_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one table-ring push-full Stage reject (8g item 4, §5).
+    #[inline(always)]
+    pub fn inc_table_push_fail(&self) {
+        self.table_push_fail_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     // ---- reader side (cli mirror / TUI / tests) ----
 
     /// Accepted commands.
@@ -240,6 +254,12 @@ impl AiIngressStatus {
     pub fn ruleset_rejected(&self) -> u64 {
         self.ruleset_rejected_total.load(Ordering::Relaxed)
     }
+
+    /// Table-ring push-full Stage rejects (8g item 4, §5).
+    #[inline]
+    pub fn table_push_fail(&self) -> u64 {
+        self.table_push_fail_total.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for AiIngressStatus {
@@ -269,6 +289,7 @@ mod tests {
         s.inc_ruleset_staged();
         s.inc_ruleset_committed();
         s.inc_ruleset_rejected();
+        s.inc_table_push_fail();
         assert_eq!(s.cmds(), 2);
         assert_eq!(s.hmac_fail(), 1);
         assert_eq!(s.protocol_err(), 1);
@@ -282,6 +303,7 @@ mod tests {
         assert_eq!(s.ruleset_staged(), 1);
         assert_eq!(s.ruleset_committed(), 1);
         assert_eq!(s.ruleset_rejected(), 1);
+        assert_eq!(s.table_push_fail(), 1);
     }
 
     #[test]

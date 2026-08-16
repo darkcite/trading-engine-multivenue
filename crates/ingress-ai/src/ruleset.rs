@@ -13,10 +13,14 @@
 //!   read the file and run the §4.2 validator ([`validate_ruleset`]):
 //!   rule 1 recomputes the FULL SHA-256 (`core-crypto`) and requires
 //!   its first 16 bytes to equal the frame's hash128, then rules 2–8
-//!   scan the bytes into the side-path scratch table. Pass ⇒ staged
-//!   state + `engine_ai_ruleset_staged_total` (+ epoch stamp); any
-//!   failure ⇒ `engine_ai_ruleset_rejected_total`. Item 4 (G2) adds
-//!   the `Ring<RuleTableSlot, 2>` push of the validated scratch here.
+//!   scan the bytes into the side-path scratch table. Pass ⇒ stamp
+//!   the candidate epoch and `try_push` the scratch into the §6
+//!   `Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>` (8g item 4);
+//!   push ok ⇒ staged state + `engine_ai_ruleset_staged_total`;
+//!   push-full ⇒ REJECT (`engine_ai_ruleset_rejected_total` + the
+//!   dedicated `engine_ai_table_push_fail_total`), staged/committed
+//!   unchanged (§5). Any validator failure ⇒
+//!   `engine_ai_ruleset_rejected_total`, nothing pushed.
 //! * **Commit**: valid only for the currently staged hash ⇒ committed
 //!   state flag (observable via `engine_ai_ruleset_committed_total`);
 //!   anything else ⇒ rejected. A later successful Stage supersedes a
@@ -51,14 +55,22 @@
 //! 0 B/op into the scratch table preallocated at construction (alloc
 //! gate 34, `bench/tests/alloc_assertions.rs`); the admit→verify→
 //! capture→push pump keeps its own 0 B/op gate.
+//!
+//! The stage-time table handoff is **documented copy #1** (§6):
+//! scratch → ring slot via `try_push`, 16 KiB + 64 by value, once per
+//! successful Stage — operator cadence, moves bytes, never the heap
+//! (alloc gate 35). Copy #2 (ring slot → the vm member's staged
+//! buffer at the engine pop) lands with item 7.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use core_crypto::sha256;
 use core_parse::{scan_price_1e6, scan_u64};
+use core_ring::Producer;
 use core_types::{
-    fnv1a_64, AiCmd, AiCmdKind, RuleRow, RuleTable, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
+    fnv1a_64, AiCmd, AiCmdKind, RuleRow, RuleTable, RuleTableSlot, RULE_TABLE_RING_SLOTS,
+    RULE_TABLE_ROWS, SYMBOL_ID_NONE,
 };
 
 use crate::status::AiIngressStatus;
@@ -727,9 +739,15 @@ pub struct RulesetSidePath {
     /// membership is a boot-time fact; a symbol that later loses its
     /// feed still validates (the row just never triggers).
     universe: Arc<[u32]>,
+    /// Producer half of the §6 table-handoff ring (D1a). One
+    /// `try_push` per validated Stage — documented copy #1; the
+    /// engine owns the consumer half (parked at boot until item 7
+    /// wires the pre-AI-drain pop).
+    producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     scratch: Box<RuleTable>,
     /// Monotonic successful-stage counter, stamped into
-    /// `scratch.epoch` (diagnostics, §3).
+    /// `scratch.epoch` (diagnostics, §3). Advanced only when the
+    /// ring push lands, so consumer-visible epochs are gapless.
     epoch: u32,
     staged: Option<[u8; HASH128_LEN]>,
     committed: Option<[u8; HASH128_LEN]>,
@@ -740,7 +758,15 @@ impl RulesetSidePath {
     /// expanded by config). The directory is not required to exist at
     /// boot — a Stage against a missing dir is just a rejected stage.
     /// `universe` MUST be sorted ascending (binary-searched per row).
-    pub fn new(dir: PathBuf, status: Arc<AiIngressStatus>, universe: Arc<[u32]>) -> Self {
+    /// `producer` is the push half of the §6 table-handoff ring; the
+    /// bin parks the consumer half until item 7 wires the engine
+    /// drain.
+    pub fn new(
+        dir: PathBuf,
+        status: Arc<AiIngressStatus>,
+        universe: Arc<[u32]>,
+        producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
+    ) -> Self {
         #[cfg(debug_assertions)]
         {
             let mut i = 1usize;
@@ -756,6 +782,7 @@ impl RulesetSidePath {
             dir,
             status,
             universe,
+            producer,
             // Documented boot-time allocation: the reusable scratch.
             scratch: Box::new(RuleTable::EMPTY),
             epoch: 0,
@@ -778,12 +805,11 @@ impl RulesetSidePath {
 
     /// The scratch table — meaningful (`len > 0`, epoch stamped) only
     /// after a successful [`Self::staged`] Stage. Test/diagnostic
-    /// surface; item 4 (G2) pushes this table into
-    /// `Ring<RuleTableSlot, 2>` instead of leaving it parked here.
-    /// Note: a later REJECTED Stage clears it (discard-on-reject
-    /// wipes `len`) even though `staged()` keeps the prior hash —
-    /// the ring copy at stage time (item 4) is the durable handoff;
-    /// the parked scratch is not a state guarantee.
+    /// surface ONLY: the ring push at stage time (copy #1, §6) is the
+    /// durable handoff; this is the parked source copy. A later
+    /// REJECTED Stage — validator failure OR §5 push-full — clears it
+    /// (discard-on-reject wipes `len`) even though `staged()` keeps
+    /// the prior hash; the parked scratch is not a state guarantee.
     #[inline]
     pub fn staged_table(&self) -> &RuleTable {
         &self.scratch
@@ -835,25 +861,50 @@ impl RulesetSidePath {
         match std::fs::read(&file) {
             Ok(bytes) => {
                 match validate_ruleset(&bytes, &hash128, &self.universe, &mut self.scratch) {
-                    Ok(()) => {
-                        // Stamp the side-path stage counter (§3 epoch —
-                        // diagnostics; wraps are harmless).
-                        self.epoch = self.epoch.wrapping_add(1);
-                        self.scratch.epoch = self.epoch;
-                        // Item 4 (G2): `try_push` of the scratch table
-                        // into `Ring<RuleTableSlot, 2>` lands HERE
-                        // (design §5); until then the validated table
-                        // parks in the scratch (`staged_table`).
-                        self.staged = Some(hash128);
-                        // A new Stage supersedes any previous Commit —
-                        // the worker registry mirrors this (state.py).
-                        self.committed = None;
-                        self.status.inc_ruleset_staged();
-                    }
+                    Ok(()) => self.push_staged(hash128),
                     Err(_) => self.status.inc_ruleset_rejected(),
                 }
             }
             Err(_) => self.status.inc_ruleset_rejected(),
+        }
+    }
+
+    /// §5 stage handoff (8g item 4): stamp the candidate epoch and
+    /// `try_push` the validated scratch into the §6 table ring —
+    /// **documented copy #1** (16 KiB + 64 by value, once per Stage,
+    /// operator cadence; moves bytes, never the heap — gate 35).
+    ///
+    /// Push ok ⇒ staged; a new Stage supersedes any previous Commit
+    /// (the worker registry mirrors this — `state.py`), and a restage
+    /// is simply a SECOND push: the engine's later pop overwrites its
+    /// staged buffer (§6 engine-side supersede mirror).
+    ///
+    /// Push-full (2 undrained stages — impossible at operator cadence
+    /// against a µs-drain engine loop, counted honestly anyway) ⇒
+    /// REJECT: `ruleset_rejected` + the dedicated `table_push_fail`
+    /// counter, staged/committed UNCHANGED (§5 — only a successful
+    /// Stage supersedes a Commit), scratch discarded (the
+    /// discard-on-reject contract; the never-staged table must not
+    /// linger in the diagnostic surface).
+    fn push_staged(&mut self, hash128: [u8; HASH128_LEN]) {
+        // Candidate epoch: committed to `self.epoch` only if the push
+        // lands, so consumer-visible epochs stay gapless-monotonic
+        // (§3 "successful-stage counter"; wraps are harmless).
+        let epoch = self.epoch.wrapping_add(1);
+        self.scratch.epoch = epoch;
+        // Documented copy #1 (§6): scratch → ring slot, by value.
+        match self.producer.try_push(*self.scratch) {
+            Ok(()) => {
+                self.epoch = epoch;
+                self.staged = Some(hash128);
+                self.committed = None;
+                self.status.inc_ruleset_staged();
+            }
+            Err(_) => {
+                self.scratch.len = 0;
+                self.status.inc_ruleset_rejected();
+                self.status.inc_table_push_fail();
+            }
         }
     }
 
@@ -929,8 +980,34 @@ mod tests {
         )
     }
 
-    fn side_path(dir: &PathBuf, status: &Arc<AiIngressStatus>) -> RulesetSidePath {
-        RulesetSidePath::new(dir.clone(), Arc::clone(status), arc_universe())
+    /// Side path + the consumer half of its table ring (kept so tests
+    /// can pop what Stage pushed; dropping it is also legal — pushes
+    /// only see head/tail).
+    fn side_path(
+        dir: &PathBuf,
+        status: &Arc<AiIngressStatus>,
+    ) -> (RulesetSidePath, core_ring::Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>) {
+        let (prod, cons) =
+            core_ring::Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        (
+            RulesetSidePath::new(dir.clone(), Arc::clone(status), arc_universe(), prod),
+            cons,
+        )
+    }
+
+    /// Raw byte view for the byte-identical handoff assertions —
+    /// well-defined because `RuleTable` is `#[repr(C)]` POD with all
+    /// padding explicitly declared and zeroed (§3, G1 pad amendment).
+    fn table_bytes(t: &RuleTable) -> &[u8] {
+        // SAFETY: `t` is a fully initialized `#[repr(C)]` POD with no
+        // uninitialized (implicit) padding bytes; the slice borrows
+        // `t` for its own lifetime and never outlives it.
+        unsafe {
+            core::slice::from_raw_parts(
+                (t as *const RuleTable).cast::<u8>(),
+                core::mem::size_of::<RuleTable>(),
+            )
+        }
     }
 
     /// Direct validator harness: hash always matches `bytes`.
@@ -980,7 +1057,7 @@ mod tests {
     fn stage_then_commit_happy_path() {
         let dir = temp_dir("happy");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
         let h = install(&dir, valid_json("happy-row").as_bytes());
 
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h));
@@ -1016,7 +1093,7 @@ mod tests {
     fn stage_missing_file_is_rejected() {
         let dir = temp_dir("missing");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
 
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, [0x11; HASH128_LEN]));
         assert_eq!(status.ruleset_staged(), 0);
@@ -1030,7 +1107,7 @@ mod tests {
     fn stage_hash_mismatch_is_rejected() {
         let dir = temp_dir("mismatch");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
         // File exists under the claimed name but its bytes hash
         // differently — a tampered/mis-installed artifact (§4.2
         // rule 1, now inside the validator).
@@ -1055,7 +1132,7 @@ mod tests {
         // (rule 4).
         let dir = temp_dir("invalid");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
         let h = install(&dir, br#"{"rows":[]}"#);
 
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h));
@@ -1071,7 +1148,7 @@ mod tests {
     fn commit_unstaged_or_wrong_hash_is_rejected() {
         let dir = temp_dir("commit-reject");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
 
         // Nothing staged at all.
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetCommit, [0x22; HASH128_LEN]));
@@ -1093,7 +1170,7 @@ mod tests {
     fn restage_supersedes_commit() {
         let dir = temp_dir("restage");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, mut cons) = side_path(&dir, &status);
         let h1 = install(&dir, valid_json("restage-one").as_bytes());
         let h2 = install(&dir, valid_json("restage-two").as_bytes());
 
@@ -1112,6 +1189,19 @@ mod tests {
         assert_eq!(side.staged_table().hash128, h2);
         assert_eq!(side.staged_table().rows[0].name_h, fnv1a_64(b"restage-two"));
 
+        // §5/§6: the restage is a SECOND push — the engine-side
+        // supersede works because a later pop overwrites the staged
+        // buffer. FIFO order with gapless epochs at the consumer.
+        let t1 = cons.try_pop().expect("first Stage pushed a table");
+        assert_eq!(t1.hash128, h1);
+        assert_eq!(t1.epoch, 1);
+        assert_eq!(t1.rows[0].name_h, fnv1a_64(b"restage-one"));
+        let t2 = cons.try_pop().expect("restage pushed a second table");
+        assert_eq!(t2.hash128, h2);
+        assert_eq!(t2.epoch, 2);
+        assert_eq!(t2.rows[0].name_h, fnv1a_64(b"restage-two"));
+        assert!(cons.try_pop().is_none(), "exactly one push per Stage");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1120,7 +1210,7 @@ mod tests {
         // §5: "any fail ⇒ inc rejected (staged/committed unchanged)".
         let dir = temp_dir("keep-staged");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
         let h1 = install(&dir, valid_json("keeper").as_bytes());
         let h2 = install(&dir, br#"{"rows":[]}"#);
 
@@ -1130,10 +1220,129 @@ mod tests {
         assert_eq!(status.ruleset_rejected(), 1);
         assert_eq!(side.staged(), Some(h1), "staged state survives a rejected restage");
         // The scratch itself is discard-on-reject (len 0) — pinned
-        // deliberately: the ring push (item 4) copies the table out at
-        // stage time, so the parked scratch is a G1 diagnostic, not a
-        // state guarantee (see `staged_table` docs).
+        // deliberately: the ring push copies the table out at stage
+        // time (copy #1), so the parked scratch is a diagnostic, not
+        // a state guarantee (see `staged_table` docs).
         assert_eq!(side.staged_table().len, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage_pushes_table_byte_identical_at_consumer() {
+        // §6 copy #1 moves bytes, not meaning: the popped slot is
+        // byte-for-byte the validated (epoch-stamped) table.
+        let dir = temp_dir("push-bytes");
+        let status = Arc::new(AiIngressStatus::new());
+        let (mut side, mut cons) = side_path(&dir, &status);
+        let h = install(&dir, valid_json("push-bytes-row").as_bytes());
+
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h));
+        assert_eq!(status.ruleset_staged(), 1);
+
+        let popped = cons.try_pop().expect("Stage must push one table");
+        assert_eq!(popped.len, 1);
+        assert_eq!(popped.epoch, 1);
+        assert_eq!(popped.hash128, h);
+        assert_eq!(popped.rows[0].name_h, fnv1a_64(b"push-bytes-row"));
+        // The parked scratch is the push's source copy — the full
+        // 16 KiB + 64 must match, padding included.
+        assert_eq!(table_bytes(&popped), table_bytes(side.staged_table()));
+        assert!(cons.try_pop().is_none(), "exactly one push per Stage");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn push_full_rejects_stage_and_keeps_state() {
+        // §5: push-full (2 undrained stages) ⇒ REJECT — staged and
+        // committed unchanged, `ruleset_rejected` AND the dedicated
+        // `table_push_fail` counter increment, scratch discarded, the
+        // undrained ring contents untouched.
+        let dir = temp_dir("push-full");
+        let status = Arc::new(AiIngressStatus::new());
+        let (mut side, mut cons) = side_path(&dir, &status);
+        let h1 = install(&dir, valid_json("full-one").as_bytes());
+        let h2 = install(&dir, valid_json("full-two").as_bytes());
+        let h3 = install(&dir, valid_json("full-three").as_bytes());
+
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h1));
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h2));
+        assert_eq!(status.ruleset_staged(), 2);
+        assert_eq!(status.table_push_fail(), 0);
+
+        // Ring capacity RULE_TABLE_RING_SLOTS = 2, nothing drained:
+        // the third Stage validates fine, then rejects at the push.
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h3));
+        assert_eq!(status.ruleset_staged(), 2, "no stage counted on push-full");
+        assert_eq!(status.ruleset_rejected(), 1);
+        assert_eq!(status.table_push_fail(), 1);
+        assert_eq!(side.staged(), Some(h2), "staged unchanged (§5)");
+        assert_eq!(side.committed(), None, "committed unchanged (§5)");
+        assert_eq!(side.staged_table().len, 0, "discard-on-reject");
+
+        // The two undrained stages are intact — FIFO h1 then h2, and
+        // the rejected stage pushed nothing.
+        assert_eq!(cons.try_pop().expect("first stage").hash128, h1);
+        assert_eq!(cons.try_pop().expect("second stage").hash128, h2);
+        assert!(cons.try_pop().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn push_full_reject_does_not_supersede_commit() {
+        // §5 "staged/committed unchanged" with a live Commit: only a
+        // SUCCESSFUL Stage supersedes it — a push-full reject must
+        // leave the committed state standing.
+        let dir = temp_dir("push-full-commit");
+        let status = Arc::new(AiIngressStatus::new());
+        let (mut side, _cons) = side_path(&dir, &status);
+        let h1 = install(&dir, valid_json("fc-one").as_bytes());
+        let h2 = install(&dir, valid_json("fc-two").as_bytes());
+        let h3 = install(&dir, valid_json("fc-three").as_bytes());
+
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h1));
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h2));
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetCommit, h2));
+        assert_eq!(side.committed(), Some(h2));
+
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h3));
+        assert_eq!(status.table_push_fail(), 1);
+        assert_eq!(side.staged(), Some(h2));
+        assert_eq!(side.committed(), Some(h2), "reject does not supersede");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn epoch_is_gapless_monotonic_across_push_full_rejects() {
+        // The candidate epoch commits only on a successful push — a
+        // push-full reject burns nothing, so consumer-visible epochs
+        // run 1, 2, 3, … with no gap.
+        let dir = temp_dir("epoch-mono");
+        let status = Arc::new(AiIngressStatus::new());
+        let (mut side, mut cons) = side_path(&dir, &status);
+        let h1 = install(&dir, valid_json("epoch-one").as_bytes());
+        let h2 = install(&dir, valid_json("epoch-two").as_bytes());
+        let h3 = install(&dir, valid_json("epoch-three").as_bytes());
+
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h1));
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h2));
+        // Full — rejected; the candidate epoch 3 is NOT consumed.
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h3));
+        assert_eq!(status.table_push_fail(), 1);
+
+        assert_eq!(cons.try_pop().expect("epoch 1").epoch, 1);
+        assert_eq!(cons.try_pop().expect("epoch 2").epoch, 2);
+
+        // Drained — the retried Stage lands with the gapless next
+        // epoch.
+        side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h3));
+        assert_eq!(status.ruleset_staged(), 3);
+        let t = cons.try_pop().expect("epoch 3");
+        assert_eq!(t.epoch, 3);
+        assert_eq!(t.hash128, h3);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1142,7 +1351,7 @@ mod tests {
     fn non_ruleset_kind_is_a_no_op() {
         let dir = temp_dir("noop");
         let status = Arc::new(AiIngressStatus::new());
-        let mut side = side_path(&dir, &status);
+        let (mut side, _cons) = side_path(&dir, &status);
         let cmd = AiCmd::new(
             11,
             1,
@@ -1499,8 +1708,9 @@ mod tests {
         );
         assert_eq!(check(wrap_rows(&[r]).as_bytes()), Ok(()));
         // Fail-closed: an empty universe rejects every row-bearing
-        // ruleset (the paper.rs placeholder until item 4 wires the
-        // real snapshot).
+        // ruleset. (No boot wires one since item 4 threads the real
+        // discovery snapshot through `spawn_ai`; the property is kept
+        // pinned so any future mis-wired boot stays closed.)
         let bytes = valid_json("s6").into_bytes();
         let digest = sha256(&bytes);
         let mut h = [0u8; HASH128_LEN];

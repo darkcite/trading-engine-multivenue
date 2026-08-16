@@ -43,8 +43,8 @@ use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
-    make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, Signal, SymbolId, Tick, VenueId,
-    AI_RING_SIZE,
+    make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, RuleTableSlot, Signal, SymbolId,
+    Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use core_io::{SlotCapture, SlotKind};
 use engine::{
@@ -249,6 +249,14 @@ pub struct Rings {
     /// otherwise it is dropped and the engine's AI lane reads empty
     /// forever (the unspawned-venue shape, §3.3).
     pub ai: Arc<Ring<AiCmd, AI_RING_SIZE>>,
+    /// Ruleset-table handoff ring (Phase 8g §6, D1a): SPSC, one
+    /// validated table per Stage at operator cadence. Producer half
+    /// rides with the AI lane into `spawn_ai`; the consumer half
+    /// PARKS in the bin's boot plumbing until item 7 wires the
+    /// engine's pre-AI-drain pop. Unspawned shape mirrors `ai`: no
+    /// `AI_INGRESS_HMAC_KEY` ⇒ producer dropped, ring reads empty
+    /// forever.
+    pub ruleset_tables: Arc<Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>>,
 }
 
 impl Rings {
@@ -259,6 +267,7 @@ impl Rings {
             rpc_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
+            ruleset_tables: Ring::new(),
         }
     }
 }
@@ -1122,6 +1131,57 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
     }
 }
 
+/// Build the §4.3 boot-universe snapshot for the ruleset validator:
+/// every SymbolId the boot wired into a venue ingress — the PM/BN
+/// pair flags plus each discovery-gated venue table — **sorted
+/// strict-ascending and deduped** (binary-searched per §4.2 rule-6
+/// check; `RulesetSidePath::new` debug-asserts the ordering).
+///
+/// Universe membership is a boot-time fact: a symbol that later
+/// loses its feed still validates — the row just never triggers
+/// (§4.3, mirroring how every other consumer treats SymbolMap).
+/// Called ONCE in the bin, after 8e discovery gates the venue
+/// tables and before any thread spawns; boot-time allocation.
+pub fn build_ai_universe(
+    polymarket_sym: SymbolId,
+    binance_sym: SymbolId,
+    okx: Option<&ingress_okx::OkxSymbolTable>,
+    deribit: Option<&ingress_deribit::DeribitSymbolTable>,
+    hl: Option<&ingress_hyperliquid::HlCoinTable>,
+) -> Arc<[u32]> {
+    let mut v: Vec<u32> = Vec::with_capacity(
+        2 + okx.map_or(0, |t| t.len())
+            + deribit.map_or(0, |t| t.len())
+            + hl.map_or(0, |t| t.len()),
+    );
+    v.push(polymarket_sym);
+    v.push(binance_sym);
+    if let Some(t) = okx {
+        let mut i = 0usize;
+        while let Some((_, sym, _)) = t.get(i) {
+            v.push(sym);
+            i += 1;
+        }
+    }
+    if let Some(t) = deribit {
+        let mut i = 0usize;
+        while let Some((_, sym)) = t.get(i) {
+            v.push(sym);
+            i += 1;
+        }
+    }
+    if let Some(t) = hl {
+        let mut i = 0usize;
+        while let Some((_, sym)) = t.get(i) {
+            v.push(sym);
+            i += 1;
+        }
+    }
+    v.sort_unstable();
+    v.dedup();
+    Arc::from(v)
+}
+
 /// Spawn the AI-command ingress thread (Phase 8f §4). Opens the
 /// `ai-cmds.pmlr` capture **before** spawning — capture-open failure
 /// is a fatal boot error, matching every venue wrapper. The thread
@@ -1132,12 +1192,18 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// item-16 RSS removal).
 ///
 /// `key` is moved into the thread and never logged.
+///
+/// 8g item 4: `table_producer` is the push half of the §6 ruleset
+/// table-handoff ring and `universe` the §4.3 boot snapshot from
+/// [`build_ai_universe`] — both feed the [`RulesetSidePath`].
 #[allow(clippy::too_many_arguments)] // one parameter per boot-wired resource
 pub fn spawn_ai(
     sock_path: PathBuf,
     ruleset_dir: PathBuf,
     key: [u8; 32],
     producer: Producer<AiCmd, AI_RING_SIZE>,
+    table_producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
+    universe: Arc<[u32]>,
     status: Arc<AiIngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1158,14 +1224,16 @@ pub fn spawn_ai(
         // `engine_ai_ruleset_*_total` counters. Control-plane only —
         // the frame pump stays allocation-free.
         //
-        // G1 (8g item 3): the validator's §4.3 boot-universe snapshot
-        // is wired EMPTY here — fail-closed: every row-bearing
-        // ruleset rejects at §4.2 rule 6 until item 4 (G2) threads
-        // the real sorted discovery universe through `spawn_ai`
-        // alongside the table-ring producer.
-        let empty_universe: Arc<[u32]> = Arc::new([]);
+        // 8g item 4: the §4.3 boot-universe snapshot is the REAL
+        // sorted discovery-derived set (`build_ai_universe`, built in
+        // the bin before threads spawn), and a validated Stage hands
+        // its table to the engine through the §6 ring — `try_push` of
+        // the scratch (documented 16 KiB copy #1, operator cadence);
+        // push-full ⇒ reject, counted (`table_push_fail`). The
+        // consumer half parks in the bin until item 7 wires the
+        // engine drain.
         let mut side_path =
-            RulesetSidePath::new(ruleset_dir, Arc::clone(&status), empty_universe);
+            RulesetSidePath::new(ruleset_dir, Arc::clone(&status), universe, table_producer);
         let mut seam = |c: &AiCmd| side_path.on_cmd(c);
         while !shutdown_requested() {
             match ingress_ai::run(
@@ -3629,6 +3697,63 @@ mod tests {
         let cons = split_all_consumers(&rings);
         assert_eq!(cons.tick_lanes.len(), NUM_TICK_LANES);
         assert_eq!(cons.fill_lanes.len(), NUM_FILL_LANES);
+        // 8g item 4: the ruleset-table handoff ring splits like every
+        // other ring and round-trips a slot.
+        let (mut tp, mut tc) = rings.ruleset_tables.clone().split();
+        assert_eq!(rings.ruleset_tables.capacity(), RULE_TABLE_RING_SLOTS);
+        assert!(tp.try_push(core_types::RuleTable::EMPTY).is_ok());
+        assert!(tc.try_pop().is_some());
+        assert!(tc.try_pop().is_none());
+    }
+
+    /// 8g §4.3: the boot-universe snapshot is the PM/BN pair plus
+    /// every discovery-gated venue-table id, sorted strict-ascending
+    /// and deduped — the shape `RulesetSidePath::new` debug-asserts.
+    #[test]
+    fn ai_universe_is_sorted_deduped_union_of_boot_tables() {
+        let d = okx_discovery_fixture(&[
+            ("BTC-USDT", "SPOT", true),
+            ("ETH-USD-SWAP", "SWAP", true),
+        ]);
+        let okx = build_okx_symbol_table("BTC-USDT,ETH-USD-SWAP", &d).unwrap();
+        let deribit = build_deribit_symbol_table("BTC-PERPETUAL").unwrap();
+        let hl = build_hl_coin_table("BTC,ETH").unwrap();
+
+        let u = build_ai_universe(42, 7, Some(&okx), Some(&deribit), Some(&hl));
+        let expect: Vec<u32> = {
+            let mut v = vec![
+                42,
+                7,
+                make_symbol_id(VenueId::Okx, 1),
+                make_symbol_id(VenueId::Okx, 2),
+                make_symbol_id(VenueId::Deribit, 1),
+                make_symbol_id(VenueId::Hyperliquid, 1),
+                make_symbol_id(VenueId::Hyperliquid, 2),
+            ];
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(&u[..], &expect[..]);
+        // Strict-ascending (sorted AND deduped) — the side-path
+        // debug_assert's exact invariant.
+        let mut i = 1usize;
+        while i < u.len() {
+            assert!(u[i - 1] < u[i], "strict ascending at {i}");
+            i += 1;
+        }
+    }
+
+    /// Failure-shape coverage: duplicate ids across sources collapse
+    /// (dedup), and absent venues leave exactly the PM/BN pair.
+    #[test]
+    fn ai_universe_dedups_and_handles_absent_venues() {
+        // PM and BN misconfigured to the same id: one survivor.
+        let u = build_ai_universe(7, 7, None, None, None);
+        assert_eq!(&u[..], &[7]);
+
+        // No optional venues: exactly the sorted pair.
+        let u = build_ai_universe(42, 7, None, None, None);
+        assert_eq!(&u[..], &[7, 42]);
     }
 
     #[test]

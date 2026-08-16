@@ -532,6 +532,20 @@ fn run(args: RunArgs) -> ExitCode {
         _ => None,
     };
 
+    // -- 8g §4.3: boot-universe snapshot for the ruleset validator --
+    // Built ONCE here — after 8e discovery gated the venue tables,
+    // before any ingress thread spawns (the tables move into their
+    // spawn calls below). Sorted strict-ascending, deduped; feeds
+    // `spawn_ai` → `RulesetSidePath` (§4.2 rule-6 membership checks).
+    let ai_universe = cli::build_ai_universe(
+        args.polymarket_sym_id,
+        args.binance_sym_id,
+        okx_boot.as_ref().map(|(t, _)| t),
+        deribit_boot.as_ref().map(|(t, _)| t),
+        hl_boot.as_ref().map(|(t, _)| t),
+    );
+    info!(symbols = ai_universe.len(), "ai: ruleset boot-universe snapshot built");
+
     // -- Allocate rings + split into producer/consumer halves --
     //
     // Phase 8a lane layout: rings.tick is indexed by VenueId
@@ -565,6 +579,13 @@ fn run(args: RunArgs) -> ExitCode {
     // §3.3 unspawned shape.
     let (ai_prod, ai_lane_cons) = rings.ai.clone().split();
     let ai_status = std::sync::Arc::new(cli::AiIngressStatus::new());
+    // Ruleset-table handoff ring (Phase 8g §6, D1a): the producer
+    // half rides with the AI lane into `spawn_ai`; the consumer half
+    // PARKS here — the `_`-prefixed binding keeps it alive for the
+    // process lifetime without wiring it. Item 7 hands it to the
+    // engine's pre-AI-drain pop; until then the ring holds at most
+    // 2 staged tables and the side path counts push-full rejects.
+    let (ruleset_table_prod, _ruleset_table_cons) = rings.ruleset_tables.clone().split();
 
     // -- Per-ingress status slots (D7) --
     let statuses = std::sync::Arc::new(cli::IngressStatusSet::new());
@@ -831,6 +852,8 @@ fn run(args: RunArgs) -> ExitCode {
                     PathBuf::from(&cfg.ai_ruleset_dir),
                     key,
                     ai_prod,
+                    ruleset_table_prod,
+                    ai_universe,
                     ai_status.clone(),
                     4,
                     &run_dir,
@@ -856,6 +879,9 @@ fn run(args: RunArgs) -> ExitCode {
         _ => {
             info!("AI_INGRESS_HMAC_KEY unset; ingress-ai thread not started");
             drop(ai_prod);
+            // Same unspawned shape for the table ring: no producer,
+            // the parked consumer reads empty forever.
+            drop(ruleset_table_prod);
         }
     }
 

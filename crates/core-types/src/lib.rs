@@ -1336,6 +1336,16 @@ impl RuleTable {
 /// Ring slot ferrying a staged table ingress→engine (§6).
 pub type RuleTableSlot = RuleTable;
 
+/// Capacity (slots) of the §6 table-handoff ring
+/// `Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>` — SPSC, ingress-ai
+/// side path → engine, one push per validated Stage (operator
+/// cadence). 2 slots: one staged table in flight plus one
+/// restage-supersede; a third undrained stage is a §5 push-full
+/// REJECT at the side path (counted — impossible at operator cadence
+/// against a µs-drain engine loop, counted honestly anyway). Power
+/// of two per the `core-ring` contract.
+pub const RULE_TABLE_RING_SLOTS: usize = 2;
+
 // ---------------------------------------------------------------
 // Static layout assertions — if these ever fire, revisit the
 // cache-line story in PLAN.md §7.
@@ -1401,6 +1411,7 @@ const _: () = {
     assert!(::core::mem::offset_of!(RuleTable, epoch) == 16 * 1024 + 4);
     assert!(::core::mem::offset_of!(RuleTable, hash128) == 16 * 1024 + 8);
     assert!(::core::mem::offset_of!(RuleTable, _pad) == 16 * 1024 + 24);
+    assert!(RULE_TABLE_RING_SLOTS.is_power_of_two());
 };
 
 // ---------------------------------------------------------------
@@ -2120,6 +2131,14 @@ mod ai_cmd_tests {
     fn ai_ring_size_is_locked() {
         assert_eq!(AI_RING_SIZE, 1024);
         assert!(AI_RING_SIZE.is_power_of_two());
+    }
+
+    #[test]
+    fn rule_table_ring_slots_is_locked() {
+        // §6 (D1a): one staged table in flight + one restage-
+        // supersede; a third undrained stage is a §5 push-full reject.
+        assert_eq!(RULE_TABLE_RING_SLOTS, 2);
+        assert!(RULE_TABLE_RING_SLOTS.is_power_of_two());
     }
 
     // -----------------------------------------------------------

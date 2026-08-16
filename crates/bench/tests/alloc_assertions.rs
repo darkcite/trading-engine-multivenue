@@ -2673,3 +2673,56 @@ fn ruleset_validator_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "ruleset validator bytes should be zero: saw {bytes}");
 }
+
+/// Gate 35 (8g §10): the §6 table-handoff seam — ring push (documented
+/// copy #1, scratch → slot) and pop (copy #2, slot → consumer),
+/// including the §5 push-full reject path, must be 0 B/op: the copies
+/// move 16 KiB + 64 of bytes, never the heap. The Commit-flip third of
+/// the §10 row joins with the vm member (item 5+); ring construction
+/// (`Box::new_uninit`) is boot-time and sits outside the guard.
+#[test]
+fn ruleset_table_handoff_is_zero_alloc() {
+    // Full-size table so every copy moves the entire body (contents
+    // are immaterial to the seam).
+    let mut table = Box::new(core_types::RuleTable::EMPTY);
+    table.len = core_types::RULE_TABLE_ROWS as u32;
+    table.hash128 = [0xA5; 16];
+    let ring: std::sync::Arc<
+        Ring<core_types::RuleTableSlot, { core_types::RULE_TABLE_RING_SLOTS }>,
+    > = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+
+    // Prewarm: one full round trip before the measurement window.
+    table.epoch = 0;
+    assert!(prod.try_push(*table).is_ok());
+    assert!(cons.try_pop().is_some());
+
+    let mut ok_pushes = 0u32;
+    let mut full_rejects = 0u32;
+    let mut pops = 0u32;
+    let g = AllocGuard::new();
+    let mut i = 0u32;
+    while i < 50 {
+        // Two stages fill the RULE_TABLE_RING_SLOTS = 2 ring …
+        table.epoch = 2 * i + 1;
+        ok_pushes += u32::from(prod.try_push(*table).is_ok());
+        table.epoch = 2 * i + 2;
+        ok_pushes += u32::from(prod.try_push(*table).is_ok());
+        // … the third is the §5 push-full reject path.
+        full_rejects += u32::from(prod.try_push(*table).is_err());
+        while let Some(t) = cons.try_pop() {
+            std::hint::black_box(t.epoch);
+            pops += 1;
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(ok_pushes, 100);
+    assert_eq!(full_rejects, 50, "cap-2 ring must reject the third stage");
+    assert_eq!(pops, 100);
+    assert_eq!(
+        allocs, 0,
+        "ruleset table handoff allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ruleset table handoff bytes should be zero: saw {bytes}");
+}
