@@ -385,3 +385,125 @@ WITH the crate, before set integration. Items 6+ (set slot 5 +
 refusal-test migration to slot 6, engine flip, §9 observability,
 final gates) stay G4+.
 
+---
+
+## 2026-08-16 — Session G3 (checklist item 5 ONLY) — CLOSED
+
+One scope commit, green on the Mac before committing (§12
+discipline), plus this log commit:
+
+| item | commit | scope |
+|---|---|---|
+| 5 | `a07535e` | NEW `crates/strategy-vm`: `VmStrategy<N>` implements `Strategy` (monomorphized; `on_start` = Ok, nothing allocated — tables are inline fields). §7.1 `on_tick`: lazy `MultiBook<N>` tracking of table-referenced legs, two-sided-book guard, linear row scan (`get_unchecked` in safe wrappers), cross_deviation + level_breach trigger math, per-row lazy cooldown stamps, per-order emit re-clamp, post-only orders at action mid. §6 `on_ai`: RulesetCommit-only ping-pong flip via the NEW `AiCmd::ruleset_hash128` (moved to `core-types` — THE shared helper; `ruleset.rs::cmd_hash128` now delegates); `receive_table` pub seam = documented copy #2. Counters kind="vm" (evals/fires/emitted/dropped/commits_applied/commits_dropped + book_track_failed). §11 proptests 1–3 (`ingress-ai/tests/ruleset_proptest.rs` roundtrip + mutation robustness; `strategy-vm/tests/caps_proptest.rs` cap composition) + `fuzz/fuzz_targets/ruleset_json.rs` + parser-property-tester scope note. Gate 36 + gate-35 Commit-flip third (35 → 36). Workspace members + BOTH Cargo.locks (root + fuzz) same commit. |
+
+### Documented interpretations (item 5 — flag on G4 review)
+
+- **Emit-time re-clamp is PER-ORDER only:** `notional ≤
+  min(row.max_risk_1e6, $100)` (`POLICY_SINGLE_ORDER_CAP_1E6`). A
+  cumulative gross-exposure ledger was drafted and DISCARDED: it
+  makes every row one-shot (a single fire exhausts a 1-row sym
+  budget), contradicting §7.1 re-arm semantics and gate 36's
+  "steady state … fires + re-arms + clamped submits", and §15 says
+  the risk-policy per-sym/total NET caps are position caps — they
+  need fill feedback and are 8i RiskGate's job (engine open-order
+  caps bound in-flight count meanwhile). What §11 proptest 3 pins is
+  the per-PASS composition: one evaluation pass emits ≤ 1 order per
+  row, so Σ notional per sym per pass ≤ the rule-7-validated per-sym
+  budget (and ≤ the table budget).
+- **cross_deviation math:** bps base is `mid(ref)` —
+  `|mid(sym) − mid(ref)| × 10_000 ≥ edge_bps × mid(ref)` (i128,
+  overflow-free; ≥ = at-edge fires). Direction is mean-reverting
+  (ai-exec convention): sym rich ⇒ Ask, cheap ⇒ Bid; `row.side` is a
+  FILTER (bid/ask rows fire only on the matching direction; `both`
+  takes either).
+- **level_breach:** the row's side IS the emitted side; the trigger
+  watches the price you would transact at — `bid` rows fire on best
+  ask ≤ `level_1e6`, `ask` rows on best bid ≥ `level_1e6`. "Crosses"
+  is realized as level-attained + horizon re-arm (a holding level
+  refires once per horizon; no prev-px state). `both` = bid leg
+  first, deterministic, ≤ 1 emission per row per tick.
+- **Two-sided-book guard on every trigger** (action leg, and ref leg
+  for cross_deviation): `bid_px > 0 && ask_px > 0` — 8e
+  preopen/one-sided books can never fire; emit px = action mid
+  (house pattern: post-only at mid, as rule-tree/ai-exec).
+- **Cooldown:** stamp recorded ONLY on accepted submit
+  (`CooldownGate::record_emit` doctrine — RingFull leaves the row
+  armed); Commit flip resets all stamps (a fresh table boots fully
+  armed); shared-gate first-window semantic applies (stamps 0 arm
+  once `now ≥ horizon_ns` — production wallclock trivially clears
+  it; TESTS MUST USE A PRODUCTION-LIKE CLOCK, `T0 = 1e17` in-crate;
+  two G3 test failures taught this).
+- **`AiCmd::ruleset_hash128` lives in `core-types`** (§6 "same
+  helper as the side path" is a MANDATE, and `strategy-vm` must not
+  dep an ingress crate — layering): the px/qty pairing sits next to
+  the fields that define it; `ruleset.rs` delegates; golden vectors
+  in core-types tests.
+- **`receive_table` clamps `len > 256`** (debug_assert + clamp) —
+  the single mutation entry point upholds the hot loop's
+  `get_unchecked` bound (safe-wrapper doctrine). A mismatched Commit
+  drops the COMMIT, not the staged table (staged survives for a
+  later correct Commit).
+- **Policy cap const duplicated vm-side** (vs ingress-ai's
+  `RULE_ROW_MAX_RISK_1E6`): deliberate — two INDEPENDENT enforcement
+  layers (a hand-built table that never met the validator is still
+  policy-clamped; unit-pinned); risk-reviewer keeps doc + both sites
+  in sync.
+
+### Wiring state after G3 (for items 6/7)
+
+- The crate exists but is NOT in the set: slot 5 is still a
+  reserved mask bit; `Enable(5)` still refuses (item 6 flips that +
+  migrates refusal tests to slot 6 per §8). No engine/cli/set line
+  was touched.
+- `receive_table(&RuleTableSlot)` is the §6 copy-#2 seam the
+  engine's pre-AI-drain pop calls in item 7 (`_ruleset_table_cons`
+  is still parked in the bin from G2). Until items 6+7, `on_ai` and
+  `receive_table` are reachable only from tests and gate 35.
+- Live-boot behavior delta: none (no wiring). Staged tables still
+  accumulate in the ring (≤ 2) exactly as after G2.
+
+### Gates at close (all Mac)
+
+- workspace `cargo nextest run`: **1004/1004** (971 at G2 close;
+  +33 = 27 strategy-vm unit, 1 vm caps proptest, 2 ingress-ai
+  ruleset proptests, 2 core-types hash-helper tests, gate 36).
+- release alloc assertions `--test-threads=1`: **36/36, 0 B/op** —
+  gate 36 `vm_on_tick_steady_state_is_zero_alloc` (256-row storm:
+  fires + re-arms + policy-clamp + qty-floor clamp-to-zero +
+  ref-leg + irrelevant-sym paths, placeholder order ring drained
+  in-loop) and the extended gate 35 (push + pop→`receive_table`
+  copy #2 + restage-supersede + Commit flip ×50) both confirmed by
+  name; both freshly compiled in-run (`Compiling bench`,
+  `Compiling strategy-vm` in the log — no false green).
+- `cargo check --workspace` real green: 24 "Checking" lines from
+  `core-types` up (G2's cone + strategy-vm), zero warnings.
+- fuzz package `cargo check` clean with `ruleset_json` registered
+  (the fuzz RUN stays in item 9's final gates per §12).
+- Stale-rmeta playbook invoked once: `ruleset_hash128` "method not
+  found" right after the core-types edit ⇒ `cargo clean -p
+  core-types -p strategy-vm -p ingress-ai -p bench`, re-check, real
+  green (pitfall #10 corollary, as documented).
+
+### Hygiene / anomalies
+
+- Git: one scope commit (`a07535e`) + this log commit; no push, no
+  fetch, no branch, no history ops. Push anomaly unchanged
+  (origin/main local ref `38e599b`): recorded, not acted on.
+- `.env` untouched. No live boots, no engine runs, no live venues,
+  no sockets (none planned in G3; unit/proptest fixtures only).
+- Sandbox: greps only; all cargo/git on the Mac via RustRover MCP
+  (`executeInShell=true`, nohup + poll for every long run).
+
+### Resume point
+
+G3 (item 5) CLOSED. Next session is **G4 = item 6** (design §12/§8):
+`strategy-set` slot-5 member (`vm: VmStrategy<512>`), `BUILT_MASK |=
+1 << 5`, `mask_for_name("vm")`, bin help/run docs, the module-doc
+"reserved mask bit" sentence dies, and EVERY reserved-slot refusal
+test migrates to slot 6 (§8 — including the demo-runbook probe
+semantics change G0 recorded). RulesetCommit fan-out reaches vm
+through the set's generic member fan-out. Items 7+ (engine
+pop/flip wiring + integration tests, §9 observability +
+audit-replay slot_kind 4, final gates + operator-gated live smoke)
+stay G5+.
+
