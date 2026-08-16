@@ -285,3 +285,103 @@ push per §5 (push-full ⇒ reject, counted;
 `ruleset_table_handoff_is_zero_alloc` (push/pop halves; baseline
 34 → 35). Items 5+ (strategy-vm crate, proptest + fuzz) stay G3+.
 
+---
+
+## 2026-08-16 — Session G2 (checklist item 4 ONLY) — CLOSED
+
+One scope commit, green on the Mac before committing (§12
+discipline), plus this log commit:
+
+| item | commit | scope |
+|---|---|---|
+| 4 | `0e2f68c` | Table-handoff ring wiring (§5/§6, D1a push half): `core-types` `RULE_TABLE_RING_SLOTS = 2` (pow2 const-asserted, next to `AI_RING_SIZE`); `RulesetSidePath` gains the `Ring<RuleTableSlot, 2>` producer and `stage()` runs the §5 flow (validate → candidate-epoch stamp → `try_push` scratch = documented 16 KiB copy #1 → ok ⇒ staged/committed-cleared/inc staged; push-full ⇒ reject + NEW `AiIngressStatus::table_push_fail` counter); `cli::build_ai_universe` builds the REAL §4.3 snapshot (PM/BN pair flags + discovery-gated okx/deribit/hl table ids, sorted strict-ascending, deduped) once in the bin after discovery, before spawns — the G1 empty-universe fail-closed placeholder is GONE; `Rings.ruleset_tables` + bin split, consumer parked; gate 35 (34 → 35). |
+
+### Documented interpretations (item 4 — flag on G3 review)
+
+- **Candidate epoch ⇒ gapless consumer epochs.** "Stamp epoch →
+  try_push" is kept literally (`scratch.epoch` is stamped before the
+  push), but `self.epoch` commits only when the push lands — a
+  push-full reject burns nothing, so consumer-visible epochs run
+  1, 2, 3, … with no gap (the §3 "successful-stage counter" reading;
+  pinned in `epoch_is_gapless_monotonic_across_push_full_rejects`).
+- **Push-full also discards the scratch** (`len = 0`) — G1's
+  discard-on-reject contract extended to the push reject: a
+  never-staged table must not linger in the diagnostic surface, while
+  `staged()`/`committed()` keep their prior values per §5 (pinned:
+  only a SUCCESSFUL Stage supersedes a Commit —
+  `push_full_reject_does_not_supersede_commit`).
+- **`table_push_fail` increments IN ADDITION to `ruleset_rejected`**
+  (§5 says "inc rejected"; the dedicated counter isolates the cause).
+  Total-vs-cause pairing documented on the field; §9 /metrics
+  registration stays item 8.
+- **`RULE_TABLE_RING_SLOTS` lives in `core-types`** next to
+  `AI_RING_SIZE` (shared by ingress-ai, cli, bench; the slot type
+  `RuleTableSlot` already lives there).
+- **Universe builder is `cli::build_ai_universe`, a pub fn** (not
+  bin-inline) so the sorted/strict-ascending/deduped contract is
+  unit-tested against the real venue tables; the bin calls it once.
+  RPC contributes nothing (streams block headers — no instrument
+  universe, per its 8e discovery note). Ids enter verbatim as wired:
+  raw `--polymarket-sym-id`/`--binance-sym-id` + namespaced
+  `make_symbol_id` venue-table ids.
+- **Byte-identical handoff is proven by raw-byte compare** of the
+  popped slot vs the parked scratch — well-defined precisely because
+  of the G1 §3 pad amendment (`repr(C)` + all padding explicit and
+  zeroed).
+
+### Wiring state after G2 (for items 5+/7)
+
+- Ring: `Rings.ruleset_tables` (`Arc<Ring<RuleTableSlot, 2>>`),
+  split in the bin next to the AI lane. Producer half → `spawn_ai` →
+  `RulesetSidePath` (ingress-ai thread). Consumer half **parked** in
+  the bin as `_ruleset_table_cons` — alive for the process lifetime,
+  never popped; item 7 hands it to the engine's pre-AI-drain pop.
+  Key-unset boots drop the producer (the `ai`-lane unspawned shape).
+- Live-boot behavior delta: none observable yet — staged tables now
+  accumulate in the ring (≤ 2) instead of parking only in the
+  scratch; nothing consumes them until item 7. Two live stages
+  without an engine drain now reject the third
+  (`table_push_fail`) — correct-conservative mid-phase, impossible
+  at operator cadence once the drain exists.
+- `spawn_ai` signature: `+ table_producer: Producer<RuleTableSlot,
+  RULE_TABLE_RING_SLOTS>`, `+ universe: Arc<[u32]>` (from
+  `build_ai_universe`, logged at boot as
+  "ai: ruleset boot-universe snapshot built").
+
+### Gates at close (all Mac)
+
+- workspace `cargo nextest run`: **971/971** (963 at G1 close; +8 =
+  4 ingress-ai side-path tests, 2 cli universe tests, 1 core-types
+  ring-slots lock, gate 35).
+- release alloc assertions `--test-threads=1`: **35/35, 0 B/op**
+  (gate 35 `ruleset_table_handoff_is_zero_alloc` confirmed by name —
+  push + pop halves + push-full reject path; the Commit-flip third
+  joins with the vm member per the §12 item-4 parenthetical).
+- `cargo check --workspace` clean — real green per the false-green
+  guard (23 "Checking" lines from `core-types` up, zero warnings).
+- No Cargo.lock delta (no dependency changes; the G1 747c1a8 lesson
+  checked explicitly).
+
+### Hygiene / anomalies
+
+- Git: one scope commit (`0e2f68c`) + this log commit; no push, no
+  fetch, no branch, no history ops. Push anomaly unchanged
+  (origin/main local ref `38e599b`): recorded, not acted on.
+- `.env` untouched. No live boots, no engine runs, no live venues
+  (none planned in G2); test sockets only via the existing suites'
+  fixtures.
+- Sandbox: greps only; all cargo/git on the Mac via RustRover MCP
+  (`executeInShell=true`, nohup + poll for every long run).
+
+### Resume point
+
+G2 (item 4) CLOSED. Next session is **G3 = item 5** (design §12):
+`crates/strategy-vm` — eval (§7: cross_deviation/level_breach
+trigger math, cooldown re-arm via lazy stamps, emit-time cap clamp,
+StrategyCounters kind="vm") + gate 36
+`vm_on_tick_steady_state_is_zero_alloc` (baseline 35 → 36) +
+proptest + fuzz target (`fuzz/fuzz_targets/ruleset_json.rs`) land
+WITH the crate, before set integration. Items 6+ (set slot 5 +
+refusal-test migration to slot 6, engine flip, §9 observability,
+final gates) stay G4+.
+
