@@ -868,3 +868,127 @@ demo market, `--raw-tap` on, `cargo build --release -p cli` FIRST
 per G0 law), and the 8g closing entry. G6's interpretations above
 are flagged for the G7 review pass.
 
+---
+
+## 2026-08-16 — Session G7 (checklist item 9 ONLY: final gates + live smoke) — CLOSED · **PHASE 8g CLOSED**
+
+No scope commits (item 9 is gates + smoke + this entry); this log
+commit closes the phase. HEAD at session start `1d4806a` (G6 close);
+tree clean throughout; MCP attached to the main checkout first, per
+brief.
+
+### Final gates (all Mac, brief order, each green before the next)
+
+| gate | result |
+|---|---|
+| workspace `cargo nextest run` | **1029/1029** (11.0 s wall; one `LEAK` annotation: `bench::alloc_assertions engine_fills_capture_append_is_zero_alloc` — PASSED, nextest child-handle cleanup note, not a failure; recorded, not chased) |
+| release alloc assertions `--test-threads=1` | **36/36, 0 B/op** — the first run was fully warm (zero `Compiling` lines), so the false-green guard was applied even on a clean tree: `cargo clean -p bench --release` + rerun ⇒ `Compiling bench` in-log, 36/36 again. Gates 34 (`ruleset_validator_is_zero_alloc`), 35 (`ruleset_table_handoff_is_zero_alloc`), 36 (`vm_on_tick_steady_state_is_zero_alloc`) confirmed by name, plus both extended-in-place gates (`strategy_set_fanout_is_zero_alloc`, `engine_tick_with_latency_record_is_zero_alloc`) |
+| fuzz RUN (deferred from G3 per §12) | `ruleset_json`: **72,330,087 runs / 301 s, zero crashes**; `fuzz/artifacts/ruleset_json/` empty; fuzz package `cargo +nightly check` clean (fresh `Checking` lines). TOOLING: cargo-fuzz was NOT installed on this Mac — operator OK'd `cargo install cargo-fuzz` (v0.13.2). In-repo install trips the 1.88.0 toolchain pin (cargo-platform MSRV 1.91): installed `+stable` (1.96.0) from `$HOME`, ran via `+nightly` (sanitizer flags) |
+| worker pytest | **202 passed** in 6.4 s — untouched-green; 8g did not leak into the worker |
+
+**§10 baseline recorded, 8f-style: 33 → 36 alloc gates** (34/35/36
+added by G1/G2/G3; G4–G6 extended existing gates in place, no new
+numbers — per the G6 §10 read-back).
+
+### Operator-gated live smoke (§11; GO given this session)
+
+G0 law first: `cargo build --release -p cli` — 19.5 s relink, binary
+now HEAD `1d4806a`. Market (operator chose Gamma-fetch): **"Strait
+of Hormuz traffic returns to normal by September 30?"** YES token
+`23545…9195` (full decimal id in the boot log) — the G0 demo
+market's own series, one month out; two-sided 0.12/0.13, ~$80.5k
+vol24h at selection. Run dir
+`~/multivenue/logs/run-1786874540193462000`; `--paper --strategy all
+--raw-tap all`; ephemeral 64-hex HMAC key (generated to `/tmp`,
+exported per-process, removed after SIGINT — **`.env` untouched**).
+
+| step | observed |
+|---|---|
+| boot | universe snapshot `symbols=2` (42 PM + 7 BN); PM map `sym_id=42`; AI listener on `~/multivenue/run/ai.sock`; ticks flowing (695 at first probe) |
+| §9 rows, first LIVE render | `enabled_mask` **49** = bits 0/4/5 (latency-arb + ai-exec + vm): `--strategy all` composes only config-present members (ev/cross-arb/rule-tree had no boot flags); vm family all 0; `table_push_fail` 0 |
+| backtest (shim seam) | real harness is 8h (§15) — no `backtest` subcommand exists at HEAD; operator chose the scripted-test pattern (`test_session_scripted._FAKE_HARNESS`): fake `multivenue-engine` first on PATH for this one invocation, computing the REAL sha256 of the REAL ruleset and emitting the pinned schema-1 stdout; the REAL verb parsed it and wrote the report — gates all PASS, exit 0 |
+| artifact install | `$AI_RULESET_DIR/9f6440936d71a40a3841dbf956ce186a.json` (dir did not exist pre-session — no 8f-era flow ever installed one; created) |
+| `stage-ruleset` | exit 0, seq 10 — `cmds_total` 2 (HB+Stage), `ruleset_staged_total` 1, `rejected` 0, `table_push_fail` 0, `hmac_fail`/`malformed`/`seq_gap` all 0: the §4.2 validator admitted a real artifact against the real boot universe |
+| `commit-ruleset` | exit 0, seq 12 — `committed_total` 1, `vm_table_epoch` 0→**1**, `vm_rows_active` 0→**1**; within 8 s `vm_fires_total` **1**, `vm_orders_emitted_total` **1** (dropped 0, `commit_dropped` 0) — the committed `level_breach` row (`g7-smoke-floor`: sym 42, ask, level 0.012, $5 cap, 60 s horizon) fired on a live PM tick and emitted one clamped paper order. **Design §1 exit criterion observed live.** |
+| rollback | `push --kind disable --strategy 5` exit 0, seq 14 — `enabled_mask` 49→**17** (bit 5 cleared); `rows_active`/`epoch` HOLD at 1 (D3a: table persists, mask gates evaluation); `fires_total` frozen at 1 across a >60 s window (past the row's horizon; 4846 ticks by shutdown) — no re-fire while disabled |
+| shutdown | SIGINT by PID → venue threads joined → `clean shutdown`; process gone |
+| audit-replay | ai section, first LIVE run (G0 finding 4 closed for real): `cmds=6 unknown_kinds=0`; per-kind HB=3 Stage=1 Commit=1 Disable=1; seq `first=9 last=14 gaps=0 missing=0 regressions=0`; **Stage seq=10 and Commit seq=12 both `hash128=9f6440936d71a40a3841dbf956ce186a`** — byte-equal to the artifact name; HB histogram `>10s:2` (semi-manual verb cadence — implicit HB per verb; serve's 2–6 s band applies only to the daemon); `ttl'd-at-pop flagged=0` vs `engine_ingress_ai_expired_total` 0 — the documented cross-check pair agrees. Venue sections clean (no integrity errors, no tap rejects) |
+
+Worker seq namespace: `first=9` continues the 8f demo's `state.db`
+(ended at seq 8) — cross-boot contiguity is the registry/seq design
+working, and the audit rendered it with zero false anomalies.
+
+### G5 interpretations — verdicts (G6 read them without recording; both sets pass G4-style here)
+
+All five stand, no objections: (1) the `on_ruleset_table` trait-hook
+shape is exactly what G6's §9 route generalized and what this smoke
+drove end to end; (2) not-mask-gated staging — untouched by G6/G7
+surfaces, pinned in tests, stands (the smoke staged while enabled;
+the disabled-window case stays test-covered); (3) while-let pop
+drain — live: the Stage landed in the vm member within one engine
+iteration, `table_push_fail` 0 forever; (4) bare-boot default-hook
+swallow — posture unchanged; (5) the lane as `Engine::new`'s 8th
+arg — unchanged (the G7 brief's landmine list leans on it).
+
+### G6 interpretations — verdicts
+
+All six stand; three are now LIVE-proven: (1) the whole-family
+StrategyCounters-default route — all 8 §9 rows mirrored correct
+values on a real boot; (2) `enabled_mask` UFCS/shadowing — gauge
+rendered 49/17 correctly through enable state changes; (3) vm
+member-isolation of the order rows — `vm_orders_emitted_total`
+stayed exactly 1 on a composed set whose latency-arb member traded
+the same book concurrently; (4) `table_push_fail` on the status
+route — mirrored 0 all session beside its `AiIngressStatus`
+siblings; (5) capture-relative TTL'd-at-pop — `flagged=0` vs
+`expired_total` 0: the cross-check pair agreed on its first live
+outing; (6) audit seq semantics — a mid-stream capture base
+(`first=9`) rendered clean, no false regression flag.
+
+### Live-boot behavior delta (the 8g phase delta, now observed)
+
+Pre-8g a Stage was hash-checked and dropped and Enable(5) was
+refused. At 8g close: Stage validates content against the boot
+universe, ferries a 16 KiB table through ring + member (the two
+documented copies), the in-stream Commit flips it live, committed
+rows fire on real venue ticks with per-order clamps, disable-5 rolls
+evaluation back while the table persists (D3a), and the whole
+exchange is capture-audited offline including hash identity. Runbook
+fact for 8h+: an `--strategy all` boot with no ev/cross-arb/
+rule-tree flags shows `enabled_mask` **49**, not 63 —
+compose-if-configured.
+
+### Hygiene / anomalies
+
+- Git: zero commits before this log commit (item 9 has no scope
+  commit); tree clean at `1d4806a` end to end. No push, no fetch, no
+  branch, no history ops. Push anomaly unchanged (origin/main local
+  ref `38e599b`): recorded, not acted on.
+- `.env` untouched (ephemeral key per-process, removed post-SIGINT).
+  `~/multivenue/worker/market-map.json` still absent — not needed
+  here (rulesets carry numeric syms); flagged for 8h name
+  resolution.
+- Mac-side installs this session (operator-approved): cargo-fuzz
+  v0.13.2. Smoke leftovers: `/tmp/8g-smoke/` (ruleset + report +
+  shim; key REMOVED), the installed artifact, empty
+  `~/multivenue/worker/features/`, the run dir. `ai.sock` leftover
+  per G0 — harmless, recreated per boot.
+- Sandbox: greps/file-reads only; every cargo/git/process action on
+  the Mac via RustRover MCP (`executeInShell=true`, nohup + poll for
+  nextest/alloc/fuzz/pytest/relink/boot).
+
+### PHASE 8g — CLOSED
+
+§12 checklist 1–9 all green; §1 exit criteria met: a gates-passed
+ruleset authored per `ai-session.md` §4 staged, committed, and
+EVALUATED live in paper mode — rows triggered, orders clamped,
+`disable --strategy 5` rolled it back — with 33 → 36 alloc gates at
+0 B/op, proptest + fuzz on the validator, and `audit-replay`
+rendering the run's `ai-cmds.pmlr`. Resume pointer: next phase is
+**8h** (design §15 non-goals become scope: `strategist.py` cadence,
+the REAL `cli backtest` harness — retiring the §5.1 shim seam this
+smoke used — and venue REST consumers), on explicit operator go with
+its own design doc; 8i (risk) / 8j (live fills) stay phase-gated
+behind it. The slot-6 refusal-probe doctrine and the mask-49 boot
+fact above belong in any 8h runbook draft.
+
