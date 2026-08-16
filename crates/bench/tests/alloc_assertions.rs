@@ -2148,15 +2148,19 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
 /// Phase 8f item 7: StrategySet fan-out steady state — mask-gated
 /// member dispatch (ticks through a configured latency-arb member,
 /// AI heartbeat fan-out, an Enable/Disable round trip) must allocate
-/// nothing after boot. The ai-exec on_tick/on_ai gate arrives with
-/// item 8.
+/// nothing after boot. 8g item 6: the vm member joins the set it
+/// measures — a committed one-row table fires + re-arms on every PM
+/// tick through the set's fan-out, and a per-cycle `RulesetCommit`
+/// with nothing staged exercises the commit-dropped path (same gate,
+/// baseline stays 36).
 #[test]
 fn strategy_set_fanout_is_zero_alloc() {
     use core_types::{
-        AiCmd, AiCmdKind, Order, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE,
+        fnv1a_64, AiCmd, AiCmdKind, Order, RuleRow, RuleTable, AI_SIDE_NONE, STRATEGY_SLOT_NONE,
+        STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
     };
     use strategy_core::{Ctx, Strategy, SubmitErr};
-    use strategy_set::{StrategySet, BIT_LATENCY_ARB, SLOT_LATENCY_ARB};
+    use strategy_set::{StrategySet, BIT_LATENCY_ARB, BIT_VM, SLOT_LATENCY_ARB};
 
     struct CountCtx {
         submitted: u64,
@@ -2172,15 +2176,57 @@ fn strategy_set_fanout_is_zero_alloc() {
         }
     }
 
-    // Boot (allocation allowed): configure the latency-arb member.
-    let mut set = StrategySet::new(BIT_LATENCY_ARB);
+    // Boot (allocation allowed): configure the latency-arb member
+    // and commit a one-row vm table on the same (PM=11, BN=22) pair.
+    // Clock is production-like (G3 lesson: fresh cooldown stamps arm
+    // only once `now ≥ horizon_ns`).
+    let mut set = StrategySet::new(BIT_LATENCY_ARB | BIT_VM);
     set.latency_arb_mut().add_pair(11, 22).unwrap();
     set.latency_arb_mut().set_cooldown_ns(0);
     let mut ctx = CountCtx {
         submitted: 0,
-        now: 1_000_000_000_000,
+        now: 100_000_000_000_000_000,
     };
     set.on_start(&mut ctx).unwrap();
+
+    let vm_hash: [u8; 16] = [0xAB; 16];
+    let mut table = RuleTable::EMPTY;
+    table.rows[0] = RuleRow::new(
+        11,
+        22,
+        20,
+        0,
+        0,
+        1_000_000,
+        fnv1a_64(b"g4-gate"),
+        RuleRow::TRIGGER_CROSS_DEVIATION,
+        RuleRow::SIDE_BOTH,
+        0,
+    );
+    table.len = 1;
+    table.epoch = 1;
+    table.hash128 = vm_hash;
+    set.vm_mut().receive_table(&table);
+    let commit = {
+        let px = i64::from_le_bytes(vm_hash[..8].try_into().expect("8 bytes"));
+        let qty = i64::from_le_bytes(vm_hash[8..].try_into().expect("8 bytes"));
+        AiCmd::new(
+            1,
+            4,
+            SYMBOL_ID_NONE,
+            px,
+            qty,
+            0,
+            AiCmdKind::RulesetCommit,
+            VenueId::Ai,
+            STRATEGY_SLOT_VM,
+            AI_SIDE_NONE,
+            0,
+            0,
+        )
+    };
+    set.on_ai(&commit, &mut ctx);
+    assert_eq!(set.vm().commits_applied, 1, "boot flip applied");
 
     let bn = Tick::new(
         0,
@@ -2254,14 +2300,23 @@ fn strategy_set_fanout_is_zero_alloc() {
         set.on_ai(&hb, &mut ctx);
         set.on_ai(&disable, &mut ctx);
         set.on_ai(&enable, &mut ctx);
+        // Nothing staged after the boot flip: every in-loop Commit
+        // exercises the vm commit-dropped path through the fan-out.
+        set.on_ai(&commit, &mut ctx);
         i += 1;
     }
     std::hint::black_box(ctx.submitted);
 
     let (allocs, bytes, _deallocs) = g.delta();
-    assert!(ctx.submitted >= u64::from(CYCLES), "trigger must fire every cycle");
-    assert_eq!(set.enabled_mask(), BIT_LATENCY_ARB);
+    assert!(
+        ctx.submitted >= 2 * u64::from(CYCLES),
+        "latency-arb and the vm row must both fire every cycle"
+    );
+    assert_eq!(set.enabled_mask(), BIT_LATENCY_ARB | BIT_VM);
     assert_eq!(set.enable_refused_total(), 0);
+    assert_eq!(set.vm().commits_applied, 1, "no further flip in-loop");
+    assert_eq!(set.vm().commits_dropped, u64::from(CYCLES));
+    assert!(set.vm().orders_emitted >= u64::from(CYCLES));
     assert_eq!(
         allocs, 0,
         "strategy-set fan-out allocated {allocs} times ({bytes} B)"

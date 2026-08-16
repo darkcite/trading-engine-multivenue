@@ -1724,9 +1724,11 @@ fn configure_rule_tree<const N: usize>(
 /// The initial mask enables exactly the members whose configuration
 /// was provided — latency-arb always (pairs are mandatory), ev with
 /// `--artifacts-path`, cross-arb with `--groups`, rule-tree with
-/// `--rules-path`, **ai-exec unconditionally** (item 8: it has no
-/// boot config — the AI publishes its universe over UDS at runtime;
-/// its `on_start` validates parameters only). `requested_mask` (from
+/// `--rules-path`, **ai-exec and vm unconditionally** (neither has
+/// boot config: ai-exec's universe arrives over UDS at runtime and
+/// its `on_start` validates parameters only; vm boots inert until a
+/// ruleset table is staged + committed — 8g §7.3, normal, not an
+/// error). `requested_mask` (from
 /// [`strategy_set::mask_for_name`]) is intersected with that
 /// configured mask, so `--strategy all` means "all built members the
 /// given flags can boot" — every enabled member still validates
@@ -1747,7 +1749,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if cfg.pairs.is_empty() {
         return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
     }
-    let mut configured = strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC;
+    let mut configured =
+        strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if ev_artifacts.is_some() {
         configured |= strategy_set::BIT_EV;
     }
@@ -1789,6 +1792,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         cross_arb = mask & strategy_set::BIT_CROSS_ARB != 0,
         rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
+        vm = mask & strategy_set::BIT_VM != 0,
         "strategy-set: composed"
     );
     run_engine_loop(cons, disp, set, obs)

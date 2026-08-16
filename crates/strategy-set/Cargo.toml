@@ -20,3 +20,4 @@ strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-cross-arb   = { workspace = true }
 strategy-rule-tree   = { workspace = true }
+strategy-vm          = { workspace = true }

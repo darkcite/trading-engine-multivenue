@@ -764,8 +764,9 @@ pub const MAX_STRATEGY_SLOTS: u8 = 8;
 /// commands must target exactly this slot.
 pub const STRATEGY_SLOT_AI_EXEC: u8 = 4;
 
-/// Strategy-set slot reserved for `strategy-vm` (8g). `RulesetStage` /
-/// `RulesetCommit` commands must target exactly this slot.
+/// Strategy-set slot of `strategy-vm` (built in 8g item 6).
+/// `RulesetStage` / `RulesetCommit` commands must target exactly
+/// this slot.
 pub const STRATEGY_SLOT_VM: u8 = 5;
 
 /// `AiCmd::side` sentinel meaning "no side" (every kind except

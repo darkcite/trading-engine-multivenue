@@ -1757,6 +1757,7 @@ dependencies = [
  "strategy-ev",
  "strategy-latency-arb",
  "strategy-rule-tree",
+ "strategy-vm",
 ]
 
 [[package]]

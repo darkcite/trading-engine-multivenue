@@ -18,12 +18,12 @@
 //! | 2 | `strategy-cross-arb` | built |
 //! | 3 | `strategy-rule-tree` | built |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
-//! | 5 | `strategy-vm` | **reserved** — member lands in 8g |
+//! | 5 | `strategy-vm` | built (8g item 6) |
 //!
-//! Slot 5 exists ONLY as a reserved mask bit
-//! ([`core_types::STRATEGY_SLOT_VM`]): per the unused-code rule there
-//! is no dead member field behind it, and an `EnableStrategy`
-//! targeting it is refused (counted) until the member exists.
+//! Slots 6–7 are the only reserved values: no member exists behind
+//! them, no bit constant is defined (the cli cannot express them via
+//! [`mask_for_name`]), and an `EnableStrategy` targeting them is
+//! refused (counted).
 //!
 //! ## AI command routing (`on_ai`, §7)
 //!
@@ -40,11 +40,15 @@
 //!   real risk state machine.
 //! * Everything else (`SetFairValue`/`SetBias`/`SetParam`/
 //!   `OrderIntent`/`Heartbeat`/`RulesetStage`/`RulesetCommit`) fans
-//!   out to enabled members. `strategy-ai-exec` (slot 4) is the
-//!   primary consumer — fair-table upserts, paper intents, and
-//!   frame-derived liveness; the other members inherit the default
-//!   no-op `on_ai`. No set-level `SetParam` ids are defined in 8f —
-//!   §7's "SetParam(set-level)" clause activates when one exists.
+//!   out to enabled members. `strategy-ai-exec` (slot 4) consumes
+//!   fair-table upserts, paper intents, and frame-derived liveness;
+//!   `strategy-vm` (slot 5) consumes `RulesetCommit` — the generic
+//!   fan-out delivers `RulesetStage` to it too and vm ignores it by
+//!   design (staging is the ingress side path's state machine, 8g
+//!   §6/§8); the other members inherit the default no-op `on_ai`.
+//!   No set-level `SetParam` ids are defined (none for vm in v1
+//!   either) — §7's "SetParam(set-level)" clause activates when one
+//!   exists.
 //!
 //! ## Boot semantics
 //!
@@ -79,6 +83,7 @@ use strategy_cross_arb::CrossArb;
 use strategy_ev::EvStrategy;
 use strategy_latency_arb::LatencyArb;
 use strategy_rule_tree::RuleTree;
+use strategy_vm::VmStrategy;
 
 // ---------------------------------------------------------------
 // Slot / mask constants
@@ -95,6 +100,9 @@ pub const SLOT_RULE_TREE: u8 = 3;
 /// Slot index of the ai-exec member (wire value pinned in
 /// `core-types` — `OrderIntent` shape enforcement depends on it).
 pub const SLOT_AI_EXEC: u8 = STRATEGY_SLOT_AI_EXEC;
+/// Slot index of the vm member (wire value pinned in `core-types` —
+/// `RulesetStage`/`RulesetCommit` shape enforcement depends on it).
+pub const SLOT_VM: u8 = STRATEGY_SLOT_VM;
 
 /// Enable-mask bit for the latency-arb member.
 pub const BIT_LATENCY_ARB: u8 = 1 << SLOT_LATENCY_ARB;
@@ -106,14 +114,12 @@ pub const BIT_CROSS_ARB: u8 = 1 << SLOT_CROSS_ARB;
 pub const BIT_RULE_TREE: u8 = 1 << SLOT_RULE_TREE;
 /// Enable-mask bit for the ai-exec member (item 8).
 pub const BIT_AI_EXEC: u8 = 1 << SLOT_AI_EXEC;
+/// Enable-mask bit for the vm member (8g item 6).
+pub const BIT_VM: u8 = 1 << SLOT_VM;
 
-/// Mask bit reserved for `strategy-vm` (slot 5, 8g). No member exists
-/// behind it in 8f — Enable is refused.
-pub const BIT_VM_RESERVED: u8 = 1 << STRATEGY_SLOT_VM;
-
-/// Every built member's bit (8f: slots 0–4).
+/// Every built member's bit (8g: slots 0–5).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_EV | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC;
+    BIT_LATENCY_ARB | BIT_EV | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM;
 
 /// Latency-arb slot capacity inside the set (design §7 sketch).
 pub const SET_LATENCY_ARB_SLOTS: usize = 64;
@@ -128,6 +134,10 @@ pub const SET_RULE_TREE_SLOTS: usize = 8;
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
 pub const SET_AI_EXEC_SLOTS: usize = 64;
+/// Vm book capacity inside the set (design §7: `VmStrategy<512>` —
+/// the book table must cover every distinct action + reference leg
+/// the active table can name: 256 rows × 2 legs).
+pub const SET_VM_SLOTS: usize = 512;
 
 /// Map a `--strategy` value to an initial enable mask (design §7:
 /// single name = single bit, back-compatible; `all` = all built
@@ -140,6 +150,7 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
         "cross-arb" => Some(BIT_CROSS_ARB),
         "rule-tree" => Some(BIT_RULE_TREE),
         "ai-exec" => Some(BIT_AI_EXEC),
+        "vm" => Some(BIT_VM),
         "all" => Some(BUILT_MASK),
         _ => None,
     }
@@ -157,6 +168,7 @@ pub struct StrategySet {
     cross_arb: CrossArb<SET_CROSS_ARB_GROUPS, SET_CROSS_ARB_MEMBERS>,
     rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
+    vm: VmStrategy<SET_VM_SLOTS>,
     /// Runtime enable mask (bits per the slot map). Only built bits
     /// are ever set — Enable of a reserved slot is refused.
     enabled: u8,
@@ -186,6 +198,7 @@ impl StrategySet {
             cross_arb: CrossArb::new(),
             rule_tree: RuleTree::new(),
             ai_exec: AiExec::new(),
+            vm: VmStrategy::new(),
             enabled: m,
             initial: m,
             halted: false,
@@ -242,6 +255,22 @@ impl StrategySet {
         &mut self.ai_exec
     }
 
+    /// Read the vm member (§9 gauges read rows_active/epoch/hash
+    /// through this in item 8; tests observe counters).
+    #[inline]
+    pub fn vm(&self) -> &VmStrategy<SET_VM_SLOTS> {
+        &self.vm
+    }
+
+    /// Mutate the vm member. The engine's table-ring pop (item 7)
+    /// hands popped slots to `vm_mut().receive_table` — the §6
+    /// copy-#2 seam; there is no boot config (§7.3: booting inert is
+    /// normal).
+    #[inline]
+    pub fn vm_mut(&mut self) -> &mut VmStrategy<SET_VM_SLOTS> {
+        &mut self.vm
+    }
+
     /// Set-level `EnableStrategy` handling. See module docs.
     #[inline]
     fn enable_slot(&mut self, slot: u8) {
@@ -255,8 +284,9 @@ impl StrategySet {
             SLOT_CROSS_ARB => BIT_CROSS_ARB,
             SLOT_RULE_TREE => BIT_RULE_TREE,
             SLOT_AI_EXEC => BIT_AI_EXEC,
-            // Reserved (5) and unknown (6/7) slots: no member in
-            // 8f — refuse and count.
+            SLOT_VM => BIT_VM,
+            // Reserved slots (6/7): no member behind them — refuse
+            // and count.
             _ => {
                 self.enable_refused = self.enable_refused.wrapping_add(1);
                 return;
@@ -284,6 +314,7 @@ impl StrategyCounters for StrategySet {
             + self.cross_arb.orders_emitted()
             + self.rule_tree.orders_emitted()
             + self.ai_exec.orders_emitted()
+            + self.vm.orders_emitted()
     }
     #[inline]
     fn orders_dropped(&self) -> u64 {
@@ -292,6 +323,7 @@ impl StrategyCounters for StrategySet {
             + self.cross_arb.orders_dropped()
             + self.rule_tree.orders_dropped()
             + self.ai_exec.orders_dropped()
+            + self.vm.orders_dropped()
     }
     #[inline]
     fn strategy_kind(&self) -> &'static str {
@@ -323,6 +355,9 @@ impl Strategy for StrategySet {
         if self.initial & BIT_AI_EXEC != 0 {
             self.ai_exec.on_start(ctx)?;
         }
+        if self.initial & BIT_VM != 0 {
+            self.vm.on_start(ctx)?;
+        }
         Ok(())
     }
 
@@ -343,6 +378,9 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec.on_tick(tick, ctx);
         }
+        if self.enabled & BIT_VM != 0 {
+            self.vm.on_tick(tick, ctx);
+        }
     }
 
     #[inline(always)]
@@ -362,6 +400,9 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec.on_signal(signal, ctx);
         }
+        if self.enabled & BIT_VM != 0 {
+            self.vm.on_signal(signal, ctx);
+        }
     }
 
     #[inline(always)]
@@ -380,6 +421,9 @@ impl Strategy for StrategySet {
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec.on_fill(fill, ctx);
+        }
+        if self.enabled & BIT_VM != 0 {
+            self.vm.on_fill(fill, ctx);
         }
     }
 
@@ -421,6 +465,9 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec.on_ai(cmd, ctx);
         }
+        if self.enabled & BIT_VM != 0 {
+            self.vm.on_ai(cmd, ctx);
+        }
     }
 
     #[inline(always)]
@@ -440,11 +487,14 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec.on_timer(now_ns, ctx);
         }
+        if self.enabled & BIT_VM != 0 {
+            self.vm.on_timer(now_ns, ctx);
+        }
     }
 
     /// Minimum over the BUILT members (mask-independent so the
     /// engine's timer arming is stable across runtime Enable/Disable;
-    /// `on_timer` itself fans out to enabled members only). All five
+    /// `on_timer` itself fans out to enabled members only). All six
     /// members currently return `u64::MAX` (disabled).
     fn timer_period_ns(&self) -> u64 {
         let mut min = self.latency_arb.timer_period_ns();
@@ -464,18 +514,23 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
+        let v = self.vm.timer_period_ns();
+        if v < min {
+            min = v;
+        }
         min
     }
 
     fn on_stop<C: Ctx>(&mut self, ctx: &mut C) {
         // Stop is unconditional — even disabled members get the
         // teardown callback (they may hold capture-worthy state some
-        // day; today all five are no-ops).
+        // day; today all six are no-ops).
         self.latency_arb.on_stop(ctx);
         self.ev.on_stop(ctx);
         self.cross_arb.on_stop(ctx);
         self.rule_tree.on_stop(ctx);
         self.ai_exec.on_stop(ctx);
+        self.vm.on_stop(ctx);
     }
 }
 
@@ -574,8 +629,11 @@ mod tests {
         assert_eq!(mask_for_name("cross-arb"), Some(BIT_CROSS_ARB));
         assert_eq!(mask_for_name("rule-tree"), Some(BIT_RULE_TREE));
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
+        assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
         assert!(BUILT_MASK & BIT_AI_EXEC != 0, "`all` includes ai-exec");
+        assert!(BUILT_MASK & BIT_VM != 0, "`all` composes vm (8g item 6)");
+        assert_eq!(BIT_VM, 1 << STRATEGY_SLOT_VM, "wire slot pinned");
         assert_eq!(mask_for_name("nope"), None);
         assert_eq!(mask_for_name(""), None);
     }
@@ -584,10 +642,12 @@ mod tests {
     fn new_clamps_reserved_bits_to_built_mask() {
         let s = StrategySet::new(0xFF);
         assert_eq!(s.enabled_mask(), BUILT_MASK);
-        let s = StrategySet::new(BIT_VM_RESERVED);
-        assert_eq!(s.enabled_mask(), 0);
+        let s = StrategySet::new(0b1100_0000);
+        assert_eq!(s.enabled_mask(), 0, "reserved bits 6/7 cleared");
         let s = StrategySet::new(BIT_AI_EXEC);
         assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built now");
+        let s = StrategySet::new(BIT_VM);
+        assert_eq!(s.enabled_mask(), BIT_VM, "slot 5 is built now (8g)");
     }
 
     #[test]
@@ -684,12 +744,14 @@ mod tests {
         assert_eq!(s.enable_refused_total(), 2);
     }
 
+    /// Migrated from slot 5 in 8g item 6 (§8): the vm member is built
+    /// now, so the reserved-slot refusal probes are 6 and 7.
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
         let mut s = set_with_latency_arb(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, STRATEGY_SLOT_VM), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 6), &mut c);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 7), &mut c);
         assert_eq!(s.enabled_mask(), 0);
         assert_eq!(s.enable_refused_total(), 2);
@@ -707,6 +769,21 @@ mod tests {
         );
         assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built in item 8");
         assert_eq!(s.enable_refused_total(), 0);
+    }
+
+    /// 8g item 6: the G0 demo probe `enable --strategy 5` now
+    /// SUCCEEDS (§8 semantics change) — and Disable round-trips it.
+    #[test]
+    fn enable_vm_slot_round_trips() {
+        let mut s = set_with_latency_arb(0);
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, STRATEGY_SLOT_VM), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_VM, "slot 5 is built in 8g item 6");
+        assert_eq!(s.enable_refused_total(), 0);
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, STRATEGY_SLOT_VM), &mut c);
+        assert_eq!(s.enabled_mask(), 0);
+        assert!(!s.is_halted());
     }
 
     #[test]
@@ -753,7 +830,7 @@ mod tests {
     #[test]
     fn timer_period_is_min_over_built_members() {
         let s = StrategySet::new(BUILT_MASK);
-        // All five members currently disable their timers.
+        // All six members currently disable their timers.
         assert_eq!(s.timer_period_ns(), u64::MAX);
     }
 
@@ -847,5 +924,137 @@ mod tests {
         let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
         s.ai_exec_mut().set_edge_1e6(0);
         assert!(s.on_start(&mut ctx()).is_ok());
+    }
+
+    // ------------- vm member integration (8g item 6) -------------
+
+    use core_types::{fnv1a_64, RuleRow, RuleTable};
+
+    /// Production-like clock for any test driving `VmStrategy` (G3
+    /// lesson: fresh cooldown stamps (0) arm only once
+    /// `now ≥ horizon_ns` — small synthetic clocks never clear the
+    /// first window).
+    const VM_T0: NsTs = 100_000_000_000_000_000;
+    const VM_HASH_A: [u8; 16] = [0xAB; 16];
+    const VM_HASH_B: [u8; 16] = [0xCD; 16];
+
+    fn vm_ctx() -> CountCtx {
+        CountCtx {
+            submitted: 0,
+            now: VM_T0,
+        }
+    }
+
+    /// One cross_deviation row on the (PM, BN) pair the latency-arb
+    /// fixtures already use; horizon 0 keeps every eval armed.
+    fn vm_table(hash128: [u8; 16]) -> RuleTable {
+        let mut t = RuleTable::EMPTY;
+        t.rows[0] = RuleRow::new(
+            PM,
+            BN,
+            20,
+            0,
+            0,
+            1_000_000,
+            fnv1a_64(b"g4-set"),
+            RuleRow::TRIGGER_CROSS_DEVIATION,
+            RuleRow::SIDE_BOTH,
+            0,
+        );
+        t.len = 1;
+        t.epoch = 1;
+        t.hash128 = hash128;
+        t
+    }
+
+    /// Ruleset Stage/Commit frame targeting slot 5 — hash128 rides
+    /// the px/qty pair (`AiCmd::ruleset_hash128`).
+    fn ruleset_cmd(kind: AiCmdKind, hash128: [u8; 16]) -> AiCmd {
+        let px = i64::from_le_bytes(hash128[..8].try_into().expect("8 bytes"));
+        let qty = i64::from_le_bytes(hash128[8..].try_into().expect("8 bytes"));
+        AiCmd::new(
+            1,
+            1,
+            SYMBOL_ID_NONE,
+            px,
+            qty,
+            0,
+            kind,
+            VenueId::Ai,
+            STRATEGY_SLOT_VM,
+            AI_SIDE_NONE,
+            0,
+            0,
+        )
+    }
+
+    /// §8 happy path: `receive_table` through the seam, Commit
+    /// through the set's generic `on_ai` fan-out ⇒ the flip lands,
+    /// and the committed table fires through the set's `on_tick`
+    /// fan-out (counters aggregate the vm member).
+    #[test]
+    fn ruleset_commit_fanout_reaches_vm() {
+        let mut s = StrategySet::new(BIT_VM);
+        let mut c = vm_ctx();
+        s.on_start(&mut c).unwrap();
+
+        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A));
+        assert_eq!(s.vm().rows_active(), 0, "staged ≠ active");
+
+        // Stage frames reach vm through the same fan-out and are
+        // ignored by design (§8 — staging is the side path's state
+        // machine).
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetStage, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_applied, 0);
+        assert_eq!(s.vm().rows_active(), 0);
+
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_applied, 1, "flip applied via set fan-out");
+        assert_eq!(s.vm().rows_active(), 1);
+        assert_eq!(s.vm().active_epoch(), 1);
+
+        // The committed row fires through the set's on_tick fan-out:
+        // BN ref then diverged PM book (2000 bps ≥ 20 bps edge).
+        s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut c);
+        s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut c);
+        assert_eq!(c.submitted, 1, "vm order submitted via ctx");
+        assert_eq!(s.orders_emitted(), 1, "set aggregates vm orders");
+    }
+
+    /// Failure legs: a Commit whose hash matches nothing staged is
+    /// dropped (staged table survives for a later correct Commit),
+    /// and a Commit with nothing staged at all is dropped too.
+    #[test]
+    fn ruleset_commit_mismatch_dropped_staged_survives() {
+        let mut s = StrategySet::new(BIT_VM);
+        let mut c = vm_ctx();
+        s.on_start(&mut c).unwrap();
+
+        // Nothing staged: dropped.
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_dropped, 1);
+
+        // Staged HASH_A, committed HASH_B: dropped, staged survives.
+        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_B), &mut c);
+        assert_eq!(s.vm().commits_dropped, 2);
+        assert_eq!(s.vm().commits_applied, 0);
+        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A), "staged survives");
+        assert_eq!(s.vm().rows_active(), 0, "no flip");
+    }
+
+    /// Mask gating (§8): with bit 5 off the member never sees the
+    /// frame — the Commit neither applies nor counts as dropped.
+    #[test]
+    fn disabled_vm_never_sees_commit() {
+        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut c = vm_ctx();
+        s.on_start(&mut c).unwrap();
+        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
+        assert_eq!(s.vm().commits_applied, 0, "bit off → frame never arrives");
+        assert_eq!(s.vm().commits_dropped, 0);
+        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A));
     }
 }
