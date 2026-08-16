@@ -739,3 +739,132 @@ hash128 hex rows, TTL'd-at-pop annotations — closes the G0 runbook
 gap). Item 9 (final gates: full nextest + alloc + fuzz check + worker
 pytest + operator-gated live smoke + closing entry) stays after it.
 
+---
+
+## 2026-08-16 — Session G6 (checklist item 8 ONLY) — CLOSED
+
+One scope commit, green on the Mac before committing (§12
+discipline), plus this log commit:
+
+| item | commit | scope |
+|---|---|---|
+| 8 | `ddc9f8c` | §9 observability, both halves. **Metrics:** all 8 rows registered in `paper.rs` under their verbatim §9 names and mirrored on the existing 5 s cadence — `engine_strategy_enabled_mask` gauge (the G0 demo finding), `engine_vm_rows_active`/`engine_vm_table_epoch` gauges (sets), `engine_vm_fires_total`/`engine_vm_orders_emitted_total`/`engine_vm_orders_dropped_total`/`engine_vm_commit_dropped_total` counters (monotonic saturating deltas via new `VmCountersSnapshot`, the `AiCountersSnapshot` bookkeeping), `engine_ai_table_push_fail_total` riding the existing `AiIngressCounterIds`/`mirror_ai_counters` status-slot route. New `VmMetricIds` + `register_vm_metrics` + `mirror_vm_metrics<S: StrategyCounters>`; loop wiring is two statements next to the strategy-indicator gauges. **audit-replay:** `slot_kind = 4` section (G0 finding 4 closed — `ai-cmds.pmlr` is finally read): per-kind counts (10 labels + unknown), seq continuity (gaps/missing/regressions), heartbeat cadence histogram (existing `Hist` buckets — serve's 5 s lands in 2-6 s), Stage/Commit rows with hash128 hex reassembled from the px/qty halves (`AiCmd::ruleset_hash128`), TTL'd-at-pop annotations (count + ≤ 8 previews + inline row suffix). ai-cmds-only run dirs render (venue-driven sections now guarded on non-empty venue audits); mixed dirs render both halves; a wrong-kind `ai-cmds.pmlr` hard-errors `InvalidData` like the venue logs. Tests: strategy-core default/override pins (2), strategy-set trait-read pin (1), cli mirror pins (delta/set semantics, bare-default + saturation, `Observability::build` registration sweep — 3), audit fixtures written with the core-io `SlotCapture` writer (happy incl. seq-gap, TTL'd + regression, wrong-kind error, ai-only + mixed-dir rendering — 4). |
+
+### Documented interpretations (item 8 — flag on G7 review)
+
+- **The WHOLE §9 set/vm family rides the StrategyCounters-default
+  route** — the `ai_enable_refused` precedent generalized, exactly as
+  the session brief predicted for `enabled_mask` and necessarily
+  extended to all six vm rows: the loop is generic over
+  `S: Strategy` and cannot name `StrategySet`, so `strategy-core`
+  gains default-0 accessors (`enabled_mask`, `vm_rows_active`,
+  `vm_table_epoch`, `vm_fires`, `vm_orders_emitted`,
+  `vm_orders_dropped`, `vm_commit_dropped`) and the set overrides
+  them; the cli reads via UFCS. Bare-strategy boots mirror an
+  all-zero family — posture-consistent with how they swallow AiCmds
+  and tables via trait defaults.
+- **`enabled_mask` name shadowing is deliberate:** `StrategySet`
+  keeps its inherent `enabled_mask() -> u8` (method-call syntax
+  resolves there); the trait accessor returns u64 and is reached by
+  UFCS only. Documented on both the trait and the override.
+- **`engine_vm_orders_emitted_total`/`_dropped_total` isolate the vm
+  MEMBER** (§9 "via StrategyCounters kind=vm" read as: the member's
+  own kind="vm" counter values), NOT the set-aggregate
+  `orders_emitted()` — the set override delegates to
+  `StrategyCounters::orders_emitted(&self.vm)`.
+- **`table_push_fail` is an ingress-status row, not a vm row:** it
+  mirrors through `AiIngressCounterIds`/`AiCountersSnapshot` beside
+  the other `AiIngressStatus` counters (same Arc-shared slot, same
+  delta pass), keeping the vm family purely strategy-sourced.
+- **TTL'd-at-pop is CAPTURE-RELATIVE** (the §9 phrase needed a
+  decidable offline semantic — capture records accept time only; the
+  engine's pop instant is not in the file): a slot flags iff
+  `ttl_ns != 0 && ts_ns + ttl_ns < last captured ts_ns` — its
+  validity window provably closed while the session was still
+  accepting traffic (engine drain rule `now − ts_ns > ttl_ns` with
+  `now :=` the latest instant the capture can witness). `ttl_ns = 0`
+  (ruleset frames, §13) never flags; the final record can never flag
+  (no later evidence). Actual drops remain the run's
+  `engine_ingress_ai_expired_total`; the section prints the
+  cross-check pointer so the operator compares one number against
+  one number, gap-pairing style. A ttl'd Stage/Commit row carries an
+  inline `TTL'D-AT-POP` suffix — a §13 anomaly made visible.
+- **Audit seq semantics:** the ingress accepts gapped seqs (counted,
+  never fatal) but discards regressions/duplicates pre-capture — so
+  capture-derived `gaps/missing` mean worker restarts or lost
+  frames, and any capture-derived `regression` means a mid-run
+  worker session restart (seq restarted from a new session's base).
+  Rendered as `first/last/gaps/missing/regressions`.
+
+### §10 read-back (the brief asked for an explicit flag)
+
+Read exactly as expected: item 8 is cold-path (5 s mirror + offline
+audit), NO new gate number, NO gate extension. Nothing under
+`bench/tests/alloc_assertions.rs` was touched; baseline stays 36.
+No TUI rows added (§13 pinned: pane deferred).
+
+### Gates at close (all Mac)
+
+- workspace `cargo nextest run`: **1029/1029** (1019 at G5 close;
+  +10 = 2 strategy-core observability pins, 1 strategy-set
+  `observability_overrides_surface_vm_state`, 3 cli paper mirror
+  pins (`vm_metrics_mirror_deltas_and_gauges`,
+  `vm_metrics_mirror_bare_default_and_saturation`,
+  `observability_build_registers_section9_rows`), 4 cli audit pins
+  (`ai_cmds_section_counts_seq_heartbeats_and_hashes`,
+  `ai_cmds_ttl_flagged_at_pop_and_regressions`,
+  `ai_cmds_wrong_slot_kind_errors`,
+  `ai_cmds_section_coexists_with_venue_sections`)).
+- release alloc assertions `--test-threads=1`: **36/36, 0 B/op** —
+  10 `Compiling` lines in the run log (bench + deps rebuilt fresh, no
+  false green); gates 35/36 confirmed by name in the tail.
+- `cargo check --workspace --all-targets`: 12 "Checking" lines
+  (the strategy-core cone G5 measured), zero warnings.
+- False-green guard invoked once: post-edit 1.24 s/12-line green ⇒
+  `cargo clean -p strategy-core -p strategy-set -p cli` + recount ⇒
+  12 lines again, deterministic — accepted as real (the follow-up
+  nextest compiled every touched test bin fresh and agreed).
+- Stale-rmeta playbook: not needed this session (no impossible
+  errors surfaced).
+
+### Test hygiene (per the session brief)
+
+- Per-crate tests only (in-module `mod tests`, the audit_replay and
+  paper precedent; no workspace-level `tests/`). Fixture pmlr files
+  written with the core-io `SlotCapture` writer — the exact
+  production sink under `AiCmdCapture` — into
+  `temp_dir()/audit_replay_*_<pid>` dirs, removed per test.
+- `METRICS_BIND` untouched (registry-object tests only — no server
+  bind, 9191 never referenced); `MULTIVENUE_LOG_DIR` untouched
+  (fixtures never route through it).
+- Synthetic strategy drives use `VM_T0 = 1e17` (paper mirror test
+  and the audit fixtures' base clock) per the G3 first-window
+  lesson.
+- No sockets, no UDS, no live boots, no engine runs, no live venues
+  (G0 law not triggered — release `-p cli` rebuild belongs to the
+  next live boot, which is G7's operator-gated smoke).
+
+### Hygiene / anomalies
+
+- Git: one scope commit (`ddc9f8c`) + this log commit; no push, no
+  fetch, no branch, no history ops. Push anomaly unchanged
+  (origin/main local ref `38e599b`): recorded, not acted on.
+- `.env` untouched. Worker untouched (frozen §6 surface — the
+  202-test suite stays out of the blast radius until G7 runs it as
+  a final gate).
+- Sandbox: greps/file-reads only; all cargo/git on the Mac via
+  RustRover MCP (`executeInShell=true`, nohup + poll for every long
+  run).
+
+### Resume point
+
+G6 (item 8) CLOSED. Next session is **G7 = item 9** (design §12):
+final gates — full workspace nextest, release alloc assertions
+(36/36, 0 B/op, `--test-threads=1`), fuzz check (`ruleset_json`
+target — the RUN deferred here per §12 lands now), worker pytest
+untouched-green (202 tests), the operator-gated live smoke (§11:
+one paper boot staging+committing a real 1-row ruleset against the
+demo market, `--raw-tap` on, `cargo build --release -p cli` FIRST
+per G0 law), and the 8g closing entry. G6's interpretations above
+are flagged for the G7 review pass.
+
