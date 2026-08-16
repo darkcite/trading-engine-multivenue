@@ -264,9 +264,12 @@ Three commits, each gated green on the Mac before the next
 
 ### Hygiene / anomalies
 
-- Git: exactly the three scope commits + this log commit; no push,
-  no fetch, no branch, no history ops. Push anomaly unchanged
-  (origin/main local ref `38e599b`): recorded, not acted on.
+- Git: the three scope commits + this log commit + one follow-up
+  (`747c1a8`: Cargo.lock for the item-3 dep additions, missed in
+  `600a213` — committed separately, NOT amended, per the
+  no-history-rewrite rule); no push, no fetch, no branch, no
+  history ops. Push anomaly unchanged (origin/main local ref
+  `38e599b`): recorded, not acted on.
 - `.env` untouched. No engine run, no live venues, no sockets
   beyond the existing test suites' own fixtures.
 - Sandbox: greps only; all cargo/git on the Mac via RustRover MCP
