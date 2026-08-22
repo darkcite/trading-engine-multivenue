@@ -98,8 +98,10 @@ use crate::{
 pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tx buffer: handshake + set_heartbeat + one batched subscribe
-/// (~30 B/channel × [`MAX_CHANNELS`]) + resync pairs + test replies.
-pub const TX_BUF_SIZE: usize = 8 * 1024;
+/// (≤ ~48 B/channel × [`MAX_CHANNELS`] ≈ 6.1 KiB with a full M2.1
+/// options block) + resync pairs + test replies. 16 KiB keeps ≥2×
+/// margin (boot-time allocation).
+pub const TX_BUF_SIZE: usize = 16 * 1024;
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
@@ -108,20 +110,29 @@ pub const TICK_RING_CAP: usize = 16_384;
 /// In-flight JSON-RPC request cap (power of two, `PendingTable`).
 pub const PENDING_CAP: usize = 64;
 
-/// Channels per instrument (quote, ticker, trades, book).
+/// Channels per STATIC instrument (quote, ticker, trades, book).
+/// M2.1 option rows subscribe QUOTE only (1 channel).
 pub const CHANNELS_PER_INSTR: usize = 4;
 
-/// Upper bound on subscribed channels:
-/// [`CHANNELS_PER_INSTR`] × [`DERIBIT_MAX_SYMBOLS`] = 64 — exactly the
-/// width of the subscribe-verification bitmask (u64).
-pub const MAX_CHANNELS: usize = CHANNELS_PER_INSTR * DERIBIT_MAX_SYMBOLS;
+/// Bits reserved for the static block in the verification bitmask:
+/// [`CHANNELS_PER_INSTR`] × [`crate::DERIBIT_STATIC_MAX`] = 64.
+const STATIC_MASK_BITS: usize = CHANNELS_PER_INSTR * crate::DERIBIT_STATIC_MAX;
+
+/// Upper bound on subscribed channels: the static block
+/// ([`CHANNELS_PER_INSTR`] × [`crate::DERIBIT_STATIC_MAX`] = 64) +
+/// one quote channel per option row ([`crate::DERIBIT_OPT_MAX`] = 64)
+/// = 128 — exactly the width of the subscribe-verification bitmask
+/// (u128 since M2.1; the mask is connection-establishment state, not
+/// hot-path).
+pub const MAX_CHANNELS: usize =
+    CHANNELS_PER_INSTR * crate::DERIBIT_STATIC_MAX + crate::DERIBIT_OPT_MAX;
 
 /// Subscription-table capacity (≥ [`MAX_CHANNELS`]).
 pub const SUB_CAP: usize = MAX_CHANNELS;
 
-/// Stack scratch for one rendered subscribe batch (~40 B/channel ×
-/// 64 channels ≈ 2.6 KiB; tripled for margin).
-const SUBSCRIBE_SCRATCH: usize = 8 * 1024;
+/// Stack scratch for one rendered subscribe batch (≤ ~48 B/channel ×
+/// 128 channels ≈ 6.1 KiB; doubled for margin).
+const SUBSCRIBE_SCRATCH: usize = 12 * 1024;
 
 /// Stack scratch for one rendered channel name
 /// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
@@ -611,21 +622,55 @@ fn queue_book_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
 // Subscribe-result verification
 // ---------------------------------------------------------------
 
-/// Bit for `(sym_idx, channel)` in the verification masks.
+/// Bit for `(static sym_idx, channel)` in the verification masks.
+/// Static rows occupy bits `0..64`; option rows (M2.1, quote-only)
+/// occupy bits `64..128` via [`option_bit`].
 #[inline]
-const fn channel_bit(sym_idx: usize, ch: usize) -> u64 {
-    1u64 << (sym_idx * CHANNELS_PER_INSTR + ch)
+const fn channel_bit(sym_idx: usize, ch: usize) -> u128 {
+    1u128 << (sym_idx * CHANNELS_PER_INSTR + ch)
+}
+
+/// Bit for option row `sym_idx` (table index; the row's single quote
+/// channel).
+#[inline]
+const fn option_bit(sym_idx: usize, static_len: usize) -> u128 {
+    1u128 << (STATIC_MASK_BITS + (sym_idx - static_len))
+}
+
+/// Channels a table row subscribes: options quote-only, static rows
+/// the full set (minus book without depth).
+#[inline]
+fn row_channels(symbols: &DeribitSymbolTable, idx: usize, depth_enabled: bool) -> usize {
+    if symbols.is_option_row(idx) {
+        1
+    } else if depth_enabled {
+        CHANNELS_PER_INSTR
+    } else {
+        CHANNELS_PER_INSTR - 1
+    }
+}
+
+/// Verification-mask bit for `(row, channel)` under the M2.1
+/// partition law.
+#[inline]
+fn row_bit(symbols: &DeribitSymbolTable, idx: usize, ch: usize) -> u128 {
+    if symbols.is_option_row(idx) {
+        debug_assert!(ch == 0, "option rows have exactly the quote channel");
+        option_bit(idx, symbols.static_len())
+    } else {
+        channel_bit(idx, ch)
+    }
 }
 
 /// Expected-channel mask for the configured table (+depth flag).
-fn expected_mask(symbols: &DeribitSymbolTable, depth_enabled: bool) -> u64 {
-    let n_ch = if depth_enabled { CHANNELS_PER_INSTR } else { CHANNELS_PER_INSTR - 1 };
-    let mut m = 0u64;
+fn expected_mask(symbols: &DeribitSymbolTable, depth_enabled: bool) -> u128 {
+    let mut m = 0u128;
     let mut i = 0;
     while i < symbols.len() {
+        let n_ch = row_channels(symbols, i, depth_enabled);
         let mut c = 0;
         while c < n_ch {
-            m |= channel_bit(i, c);
+            m |= row_bit(symbols, i, c);
             c += 1;
         }
         i += 1;
@@ -636,11 +681,11 @@ fn expected_mask(symbols: &DeribitSymbolTable, depth_enabled: bool) -> u64 {
 /// Scan a subscribe **result** payload for every expected channel
 /// name (rendered with surrounding quotes so `quote.BTC-PERP` can
 /// never alias `quote.BTC-PERPETUAL`). Returns the found-bit mask.
-fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool) -> u64 {
-    let n_ch = if depth_enabled { CHANNELS_PER_INSTR } else { CHANNELS_PER_INSTR - 1 };
-    let mut m = 0u64;
+fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool) -> u128 {
+    let mut m = 0u128;
     let mut i = 0;
     while let Some((instr, _sym)) = symbols.get(i) {
+        let n_ch = row_channels(symbols, i, depth_enabled);
         let mut c = 0;
         while c < n_ch {
             let ch = CHANNEL_ORDER[c];
@@ -659,7 +704,7 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
             name[n] = b'"';
             n += 1;
             if memchr::memmem::find(payload, &name[..n]).is_some() {
-                m |= channel_bit(i, c);
+                m |= row_bit(symbols, i, c);
             }
             c += 1;
         }
@@ -719,7 +764,7 @@ enum Dispatch {
     RpcOk { id: u64 },
     /// The session subscribe result, pre-verified against the
     /// configured channel set.
-    SubscribeResult { id: u64, found: u64, expected: u64 },
+    SubscribeResult { id: u64, found: u128, expected: u128 },
     /// Venue `error` response — fatal (fail-fast).
     VenueError { code: i32 },
     /// `quote` push became a Tick.
@@ -1319,9 +1364,9 @@ fn fmt_i64(v: i64, scratch: &mut [u8; 20]) -> &[u8] {
 /// After a verified subscribe result: mark every configured channel
 /// acknowledged in the `SubTable`.
 fn register_confirmed_subs(drv: &mut Driver) {
-    let n_ch = if drv.depth_enabled { CHANNELS_PER_INSTR } else { CHANNELS_PER_INSTR - 1 };
     let mut i = 0;
     while i < drv.symbols.len() {
+        let n_ch = row_channels(&drv.symbols, i, drv.depth_enabled);
         // Instrument bytes copied to end the immutable table borrow
         // before the mutable subs borrow (two-phase pattern).
         let mut instr_buf = [0u8; crate::DERIBIT_INSTR_MAX];
@@ -2338,5 +2383,27 @@ mod tests {
         let payload = br#"["quote.BTC-PERPETUAL","trades.ETH-PERPETUAL.100ms"]"#;
         let f = found_mask(payload, &syms, false);
         assert_eq!(f, channel_bit(0, 0) | channel_bit(1, 2));
+    }
+
+    #[test]
+    fn masks_put_option_rows_in_the_high_block_quote_only() {
+        // M2.1 partition law: static rows bits 0..64, option rows one
+        // quote bit each at 64 + opt_idx — depth never touches them.
+        let mut syms = test_symbols(); // 2 static rows
+        syms.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
+        syms.insert_option(b"BTC-27MAR26-100000-P", 514).unwrap();
+        let e = expected_mask(&syms, false);
+        let static_part: u128 = 0b0111 | (0b0111 << 4);
+        let opt_part: u128 = (1u128 << STATIC_MASK_BITS) | (1u128 << (STATIC_MASK_BITS + 1));
+        assert_eq!(e, static_part | opt_part);
+        // Depth adds book bits for STATIC rows only.
+        let e_depth = expected_mask(&syms, true);
+        assert_eq!(e_depth, (0b1111u128 | (0b1111 << 4)) | opt_part);
+        // A subscribe ack listing one option quote sets exactly its
+        // high-block bit; the option's ticker name must NOT count.
+        let payload =
+            br#"["quote.BTC-27MAR26-100000-P","ticker.BTC-27MAR26-100000-C.100ms"]"#;
+        let f = found_mask(payload, &syms, false);
+        assert_eq!(f, 1u128 << (STATIC_MASK_BITS + 1));
     }
 }

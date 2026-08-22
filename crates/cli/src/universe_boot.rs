@@ -71,6 +71,15 @@ pub struct BootUniverse {
     pub okx_depth: bool,
     /// Effective Deribit depth-channel toggle (flag OR config).
     pub deribit_depth: bool,
+    /// M2.1 capped options-chain policy for Deribit (config-file
+    /// only; disabled by default — legacy boots stay byte-identical).
+    /// An explicit `--deribit-symbols` override replaces the whole
+    /// `[deribit]` section per the M1a override law, dropping the
+    /// policy (see [`BootUniverse::deribit_options_dropped`]).
+    pub deribit_options: universe::OptionsPolicy,
+    /// True when `--deribit-symbols` dropped an ENABLED config
+    /// options policy — the bin logs the consequence.
+    pub deribit_options_dropped: bool,
     /// True when a universe config file drove this resolution.
     pub from_config: bool,
 }
@@ -141,6 +150,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 hl_spec: flag_spec(f.hl_coins),
                 okx_depth: f.okx_depth,
                 deribit_depth: f.deribit_depth,
+                deribit_options: universe::OptionsPolicy::default(),
+                deribit_options_dropped: false,
                 from_config: false,
             }
         }
@@ -179,13 +190,26 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             let allocated = universe::allocate_with_anchors(&u, pm_anchor, bn_anchor)
                 .map_err(|e| e.to_string())?;
             universe::assert_bootable(&allocated).map_err(|e| e.to_string())?;
+            // M1a override law extended (M2.1): an explicit
+            // --deribit-symbols replaces the whole [deribit] section,
+            // options policy included.
+            let deribit_flag = flag_spec(f.deribit_symbols);
+            let (deribit_options, deribit_options_dropped) = if deribit_flag.is_some() {
+                (
+                    universe::OptionsPolicy::default(),
+                    u.deribit_options.enabled(),
+                )
+            } else {
+                (u.deribit_options.clone(), false)
+            };
             BootUniverse {
                 okx_spec: flag_spec(f.okx_symbols).or_else(|| join_or_none(&u.okx_instruments)),
-                deribit_spec: flag_spec(f.deribit_symbols)
-                    .or_else(|| join_or_none(&u.deribit_instruments)),
+                deribit_spec: deribit_flag.or_else(|| join_or_none(&u.deribit_instruments)),
                 hl_spec: flag_spec(f.hl_coins).or_else(|| join_or_none(&u.hl_coins)),
                 okx_depth: f.okx_depth || u.okx_depth,
                 deribit_depth: f.deribit_depth || u.deribit_depth,
+                deribit_options,
+                deribit_options_dropped,
                 allocated,
                 from_config: true,
             }
@@ -373,5 +397,72 @@ mod tests {
         let e = read_universe_source(Some(Path::new("/nonexistent/m1-universe.toml")))
             .unwrap_err();
         assert!(e.contains("--universe"), "{e}");
+    }
+
+    // ---- M2.1 options policy through the resolver ------------------
+
+    fn cfg_src_with_options() -> String {
+        format!(
+            "{}[deribit]\ninstruments = [\"BTC-PERPETUAL\"]\n\
+             options_underlyings = [\"BTC\", \"ETH\"]\n\
+             options_expiries = 2\noptions_strikes = 8\n",
+            cfg_src_no_deribit()
+        )
+    }
+
+    fn cfg_src_no_deribit() -> String {
+        format!(
+            "[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n"
+        )
+    }
+
+    #[test]
+    fn config_options_policy_carried_through() {
+        let src = cfg_src_with_options();
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert!(b.deribit_options.enabled());
+        assert_eq!(b.deribit_options.underlyings, vec!["BTC", "ETH"]);
+        assert_eq!(b.deribit_options.expiries, 2);
+        assert_eq!(b.deribit_options.strikes, 8);
+        assert!(!b.deribit_options_dropped);
+        assert_eq!(b.deribit_spec.as_deref(), Some("BTC-PERPETUAL"));
+    }
+
+    #[test]
+    fn deribit_flag_override_drops_config_options_policy() {
+        let src = cfg_src_with_options();
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            deribit_symbols: Some("ETH-PERPETUAL"),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert!(!b.deribit_options.enabled());
+        assert!(b.deribit_options_dropped); // bin logs the consequence
+        assert_eq!(b.deribit_spec.as_deref(), Some("ETH-PERPETUAL"));
+        // Flag override with NO enabled config policy: nothing to drop.
+        let src2 = format!("{}[deribit]\ninstruments = [\"BTC-PERPETUAL\"]\n", cfg_src_no_deribit());
+        let f2 = UniverseFlags {
+            config_src: Some(&src2),
+            deribit_symbols: Some("ETH-PERPETUAL"),
+            ..UniverseFlags::default()
+        };
+        let b2 = resolve_boot_universe(&f2).expect("resolves");
+        assert!(!b2.deribit_options_dropped);
+    }
+
+    #[test]
+    fn legacy_boot_options_policy_disabled() {
+        let f = UniverseFlags {
+            pm_asset_id: Some(T1),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert!(!b.deribit_options.enabled());
+        assert!(!b.deribit_options_dropped);
     }
 }

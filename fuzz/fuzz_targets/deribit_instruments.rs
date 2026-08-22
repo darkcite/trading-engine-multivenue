@@ -51,4 +51,24 @@ fuzz_target!(|data: &[u8]| {
         let key_len = data.len().min(64);
         let _ = d2.find(&data[..key_len]);
     }
+
+    // M2.1: the options walker shares the row machinery but carries
+    // its own contract (kind=option + option_type/strike/
+    // expiration_timestamp required) and its own cap; fuzz it on the
+    // same input, then drive the capped-chain selection over whatever
+    // parsed — the selection must uphold its ≤ E×K×2 cap and never
+    // panic on any parsed table.
+    let mut od = ingress_deribit::discovery::DeribitDiscovery::new();
+    if let Ok(n) = od.ingest_options_body(data) {
+        assert_eq!(n, od.universe_total());
+        assert!(od.universe_live() <= od.universe_total());
+        let sel =
+            ingress_deribit::discovery::select_capped_chain(od.rows(), 1_000_000_000, 2, 8, 0);
+        assert!(sel.len() as u32 <= 2 * 8 * 2);
+    }
+
+    // M2.1: the index-price parser also rides this corpus (its
+    // dedicated target is deribit_index_price; double coverage is
+    // free here).
+    let _ = ingress_deribit::discovery::parse_index_price(data);
 });

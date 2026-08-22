@@ -810,9 +810,11 @@ pub fn spawn_okx(
 /// Fails fast on an empty item, a duplicate instrument, an over-long
 /// instrument, an instrument containing `.` (would corrupt channel-
 /// name parsing), or more than
-/// [`ingress_deribit::DERIBIT_MAX_SYMBOLS`] instruments — boot
+/// [`ingress_deribit::DERIBIT_STATIC_MAX`] instruments — boot
 /// refuses to start rather than run with a venue map that doesn't
-/// match the operator's intent.
+/// match the operator's intent. (M2.1: discovered options rows join
+/// the table AFTER this via `insert_option` — the bin's
+/// options-chain arm.)
 pub fn build_deribit_symbol_table(
     spec: &str,
 ) -> Result<ingress_deribit::DeribitSymbolTable, &'static str> {
@@ -830,7 +832,7 @@ pub fn build_deribit_symbol_table(
         match table.insert(instrument.as_bytes(), make_symbol_id(VenueId::Deribit, ordinal)) {
             Ok(()) => {}
             Err(ingress_deribit::SymbolTableErr::Full) => {
-                return Err("deribit: --deribit-symbols exceeds DERIBIT_MAX_SYMBOLS instruments");
+                return Err("deribit: --deribit-symbols exceeds DERIBIT_STATIC_MAX instruments");
             }
             Err(ingress_deribit::SymbolTableErr::TooLong) => {
                 return Err(
@@ -843,9 +845,55 @@ pub fn build_deribit_symbol_table(
             Err(ingress_deribit::SymbolTableErr::HasDot) => {
                 return Err("deribit: instrument in --deribit-symbols must not contain '.'");
             }
+            Err(ingress_deribit::SymbolTableErr::StaticAfterOptions) => {
+                // This builder only performs static inserts, before
+                // any option insert — unreachable by construction.
+                debug_assert!(false, "static-only builder saw StaticAfterOptions");
+                return Err("deribit: internal symbol-table build-order violation");
+            }
         }
     }
     Ok(table)
+}
+
+/// M2.1: append the discovered capped options chain to a Deribit
+/// symbol table (after every static insert; quote-only subscription
+/// rows). `pairs` comes from `boot_discovery::Outcome::deribit_options`
+/// — already deterministic-ordered and ordinal-allocated. Fails fast
+/// on duplicates (a chain listing an instrument twice is a venue
+/// contract violation) and on the options-block cap.
+pub fn extend_deribit_table_with_options(
+    table: &mut ingress_deribit::DeribitSymbolTable,
+    pairs: &[(String, core_types::SymbolId)],
+) -> Result<(), &'static str> {
+    for (name, sym) in pairs {
+        if table.lookup(name.as_bytes()).is_some() {
+            return Err("deribit: duplicate instrument in discovered options chain");
+        }
+        match table.insert_option(name.as_bytes(), *sym) {
+            Ok(()) => {}
+            Err(ingress_deribit::SymbolTableErr::Full) => {
+                return Err(
+                    "deribit: options chain exceeds DERIBIT_OPT_MAX — shrink \
+                     options_underlyings/options_expiries/options_strikes",
+                );
+            }
+            Err(ingress_deribit::SymbolTableErr::TooLong) => {
+                return Err("deribit: discovered option instrument exceeds DERIBIT_INSTR_MAX");
+            }
+            Err(ingress_deribit::SymbolTableErr::Empty) => {
+                return Err("deribit: empty discovered option instrument");
+            }
+            Err(ingress_deribit::SymbolTableErr::HasDot) => {
+                return Err("deribit: discovered option instrument must not contain '.'");
+            }
+            Err(ingress_deribit::SymbolTableErr::StaticAfterOptions) => {
+                debug_assert!(false, "insert_option never reports StaticAfterOptions");
+                return Err("deribit: internal symbol-table build-order violation");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Spawn the Deribit JSON-RPC/WS ingress thread (Phase 8c). One
@@ -2065,6 +2113,11 @@ impl Observability {
             let coverage_deribit = register_coverage_gauge(&mut reg, "deribit")?;
             let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
             let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
+            // M2.1: how many capped-chain option instruments this boot
+            // selected + subscribed (0 = options lane off).
+            let deribit_options_selected = reg
+                .register_gauge("engine_ingress_deribit_options_selected")
+                .map_err(|_| "register engine_ingress_deribit_options_selected")?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -2131,6 +2184,7 @@ impl Observability {
                 coverage_deribit,
                 coverage_hyperliquid,
                 coverage_binance,
+                deribit_options_selected,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -2332,6 +2386,9 @@ pub struct EngineCounters {
     /// §6.1 boot-discovery coverage gauge, Deribit (0 when
     /// unconfigured).
     pub coverage_deribit: GaugeId,
+    /// M2.1: selected capped-chain option instrument count
+    /// (`engine_ingress_deribit_options_selected`; 0 = lane off).
+    pub deribit_options_selected: GaugeId,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -3327,9 +3384,11 @@ pub mod boot_discovery {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use core_config::universe::{OptionsPolicy, OPT_ORDINAL_BASE};
     use core_config::Config;
+    use core_types::{make_symbol_id, SymbolId, VenueId};
     use ingress_binance::discovery::BnDiscovery;
-    use ingress_deribit::discovery::DeribitDiscovery;
+    use ingress_deribit::discovery::{parse_index_price, select_capped_chain, DeribitDiscovery};
     use ingress_hyperliquid::discovery::HlDiscovery;
     use ingress_okx::discovery::OkxDiscovery;
     use ingress_polymarket::discovery::PmDiscovery;
@@ -3383,6 +3442,14 @@ pub mod boot_discovery {
         /// [`super::build_deribit_symbol_table`] exactly as before —
         /// unlike OKX it doesn't need discovery data to construct.
         pub deribit: Option<VenueCoverage>,
+        /// M2.1: the selected capped options chain — `(instrument,
+        /// sym)` pairs in the DETERMINISTIC allocation order
+        /// (underlyings in config order; per underlying: expiry asc →
+        /// strike asc → call before put; ordinals from
+        /// [`OPT_ORDINAL_BASE`]). Empty when the policy is disabled.
+        /// The bin appends these to the deribit symbol table via
+        /// `insert_option` (quote-only subscription).
+        pub deribit_options: Vec<(String, SymbolId)>,
         /// Hyperliquid coverage; `None` when `--hl-coins` is unset.
         /// Hyperliquid's coin table is still built by
         /// [`super::build_hl_coin_table`] exactly as before.
@@ -3662,6 +3729,111 @@ pub mod boot_discovery {
         Ok(VenueCoverage { configured: configured.len() as u32, matched, universe })
     }
 
+    /// M2.1: fetch + select the capped Deribit options chain
+    /// (docs/m2-progress.md design entry). Per configured underlying:
+    /// ONE `get_index_price` fetch (the ATM reference) + ONE
+    /// `kind=option` `get_instruments` page into a FRESH table, then
+    /// [`select_capped_chain`] (nearest-E expiries × K nearest-ATM
+    /// strikes, calls+puts). Ordinals are allocated HERE, in selection
+    /// order, from [`OPT_ORDINAL_BASE`] — disjoint from every
+    /// file-order ordinal by construction. Fetch/parse failures are
+    /// FATAL (index price included — no silent options-less boot); an
+    /// underlying whose selection comes back EMPTY is MISSING
+    /// semantics (`any_missing`, reason `no_chain`) — paper warns,
+    /// live refuses, exactly like a missing configured symbol.
+    fn run_deribit_options(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        policy: &OptionsPolicy,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<Vec<(String, SymbolId)>, &'static str> {
+        let (host, port) = split_host_port(&cfg.deribit_rest_host, 443)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut out: Vec<(String, SymbolId)> = Vec::new();
+        let mut k = 0u32;
+        for ccy in &policy.underlyings {
+            // Venue rate-limits public/get_* to 1 req/s — pace before
+            // EVERY options-lane fetch (the futures lane may have just
+            // finished its own paced sequence).
+            std::thread::sleep(Duration::from_millis(1050));
+            let idx_name = ingress_deribit::discovery::index_name(ccy);
+            let idx_path = format!("/api/v2/public/get_index_price?index_name={idx_name}");
+            let range = get(tls, host, port, &idx_path, buf).map_err(|e| {
+                tracing::error!(venue = "deribit", underlying = %ccy, error = ?e, "discovery: index-price fetch failed");
+                "deribit: options index-price fetch failed"
+            })?;
+            let index_px_1e9 = parse_index_price(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "deribit", underlying = %ccy, error = ?e, "discovery: index-price parse failed");
+                "deribit: options index-price parse failed"
+            })?;
+
+            std::thread::sleep(Duration::from_millis(1050));
+            let path = format!("/api/v2/public/get_instruments?currency={ccy}&kind=option");
+            let range = get(tls, host, port, &path, buf).map_err(|e| {
+                tracing::error!(venue = "deribit", underlying = %ccy, error = ?e, "discovery: options fetch failed");
+                "deribit: options discovery fetch failed"
+            })?;
+            let mut d = DeribitDiscovery::new();
+            d.ingest_options_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "deribit", underlying = %ccy, error = ?e, "discovery: options parse failed");
+                "deribit: options discovery parse failed"
+            })?;
+
+            let sel = select_capped_chain(
+                d.rows(),
+                index_px_1e9,
+                policy.expiries,
+                policy.strikes,
+                now_ms,
+            );
+            if sel.is_empty() {
+                *any_missing = true;
+                tracing::error!(
+                    venue = "deribit",
+                    underlying = %ccy,
+                    reason = "no_chain",
+                    chain_total = d.universe_total(),
+                    "discovery: options underlying selected no instruments"
+                );
+            }
+            for row in &sel {
+                let name = core::str::from_utf8(row.instrument_name())
+                    .map_err(|_| "deribit: non-utf8 option instrument name")?;
+                let sym = make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + k + 1);
+                k += 1;
+                out.push((name.to_string(), sym));
+            }
+            tracing::info!(
+                venue = "deribit",
+                underlying = %ccy,
+                index_px_1e9,
+                expiries = policy.expiries,
+                strikes = policy.strikes,
+                chain_total = d.universe_total(),
+                chain_live = d.universe_live(),
+                selected = sel.len(),
+                "discovery: options chain"
+            );
+        }
+        if out.len() > ingress_deribit::DERIBIT_OPT_MAX {
+            tracing::error!(
+                venue = "deribit",
+                selected = out.len(),
+                cap = ingress_deribit::DERIBIT_OPT_MAX,
+                "discovery: selected options chain exceeds the per-connection cap"
+            );
+            return Err(
+                "deribit: selected options chain exceeds DERIBIT_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes",
+            );
+        }
+        Ok(out)
+    }
+
     fn run_hl(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
@@ -3837,6 +4009,7 @@ pub mod boot_discovery {
         tls_config: &Arc<rustls::ClientConfig>,
         okx_spec: Option<&str>,
         deribit_spec: Option<&str>,
+        deribit_options_policy: &OptionsPolicy,
         hl_spec: Option<&str>,
         binance: Option<(&[String], &[String])>,
         polymarket_asset_ids: &[String],
@@ -3857,6 +4030,14 @@ pub mod boot_discovery {
             None => None,
         };
 
+        // M2.1: the capped options chain (config-file policy; legacy
+        // boots carry a disabled default and skip this entirely).
+        let deribit_options = if deribit_options_policy.enabled() {
+            run_deribit_options(cfg, tls_config, deribit_options_policy, &mut buf, &mut any_missing)?
+        } else {
+            Vec::new()
+        };
+
         let hl = match hl_spec.map(str::trim).filter(|s| !s.is_empty()) {
             Some(spec) => Some(run_hl(cfg, tls_config, spec, &mut buf, &mut any_missing)?),
             None => None,
@@ -3871,7 +4052,7 @@ pub mod boot_discovery {
 
         let pm = run_pm(cfg, tls_config, polymarket_asset_ids, &mut buf, &mut any_missing)?;
 
-        Ok(Outcome { any_missing, pm, okx, okx_table, deribit, hl, bn })
+        Ok(Outcome { any_missing, pm, okx, okx_table, deribit, deribit_options, hl, bn })
     }
 
     // -----------------------------------------------------------
@@ -4408,7 +4589,7 @@ mod tests {
     }
 
     /// Failure modes: empty item, duplicate instrument, more than
-    /// `DERIBIT_MAX_SYMBOLS` instruments, and a dotted instrument
+    /// `DERIBIT_STATIC_MAX` instruments, and a dotted instrument
     /// all refuse boot.
     #[test]
     fn deribit_symbol_table_rejects_bad_specs() {
@@ -4422,9 +4603,9 @@ mod tests {
             build_deribit_symbol_table("BTC-PERPETUAL,ETH-PERPETUAL, BTC-PERPETUAL").err(),
             Some("deribit: duplicate instrument in --deribit-symbols")
         );
-        // DERIBIT_MAX_SYMBOLS + 1 distinct instruments ⇒ Full.
+        // DERIBIT_STATIC_MAX + 1 distinct instruments ⇒ Full.
         let mut spec = String::new();
-        for i in 0..=ingress_deribit::DERIBIT_MAX_SYMBOLS {
+        for i in 0..=ingress_deribit::DERIBIT_STATIC_MAX {
             if i > 0 {
                 spec.push(',');
             }
@@ -4432,19 +4613,68 @@ mod tests {
         }
         assert_eq!(
             build_deribit_symbol_table(&spec).err(),
-            Some("deribit: --deribit-symbols exceeds DERIBIT_MAX_SYMBOLS instruments")
+            Some("deribit: --deribit-symbols exceeds DERIBIT_STATIC_MAX instruments")
         );
-        // Exactly DERIBIT_MAX_SYMBOLS is still fine.
+        // Exactly DERIBIT_STATIC_MAX is still fine.
         let max_spec = spec.rsplit_once(',').unwrap().0;
         assert_eq!(
             build_deribit_symbol_table(max_spec).unwrap().len(),
-            ingress_deribit::DERIBIT_MAX_SYMBOLS
+            ingress_deribit::DERIBIT_STATIC_MAX
         );
         // A dotted instrument would corrupt channel-name parsing.
         assert_eq!(
             build_deribit_symbol_table("BTC.PERPETUAL").err(),
             Some("deribit: instrument in --deribit-symbols must not contain '.'")
         );
+    }
+
+    /// M2.1: the discovered options chain appends to the table after
+    /// the static block, under the OPT_ORDINAL_BASE id law; dupes and
+    /// the options-block cap refuse boot.
+    #[test]
+    fn deribit_table_extends_with_options_chain() {
+        use core_config::universe::OPT_ORDINAL_BASE;
+        let mut t = build_deribit_symbol_table("BTC-PERPETUAL").unwrap();
+        let pairs = vec![
+            (
+                "BTC-27MAR26-100000-C".to_string(),
+                make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 1),
+            ),
+            (
+                "BTC-27MAR26-100000-P".to_string(),
+                make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 2),
+            ),
+        ];
+        extend_deribit_table_with_options(&mut t, &pairs).unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.static_len(), 1);
+        assert_eq!(t.n_options(), 2);
+        assert_eq!(
+            t.lookup(b"BTC-27MAR26-100000-C"),
+            Some(make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 1))
+        );
+        // Disjointness law: options ids can never collide with the
+        // static block (ordinals 1.. ≤ 500 < 512).
+        assert_ne!(
+            t.lookup(b"BTC-27MAR26-100000-C"),
+            t.lookup(b"BTC-PERPETUAL")
+        );
+        // Duplicate chain instrument refuses boot.
+        let dup = vec![pairs[0].clone()];
+        assert_eq!(
+            extend_deribit_table_with_options(&mut t, &dup).err(),
+            Some("deribit: duplicate instrument in discovered options chain")
+        );
+        // Options-block cap refuses boot with the actionable message.
+        let mut big: Vec<(String, core_types::SymbolId)> = Vec::new();
+        for i in 0..ingress_deribit::DERIBIT_OPT_MAX {
+            big.push((
+                format!("X{i}-C"),
+                make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 100 + i as u32),
+            ));
+        }
+        let e = extend_deribit_table_with_options(&mut t, &big).err().unwrap();
+        assert!(e.contains("DERIBIT_OPT_MAX"), "{e}");
     }
 
     /// Happy path: `--hl-coins` items get 1-based, flag-ordered

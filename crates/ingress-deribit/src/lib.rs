@@ -108,9 +108,25 @@ use core_types::{NsTs, SymbolId};
 /// combo-style names). Table rows are fixed at this width.
 pub const DERIBIT_INSTR_MAX: usize = 32;
 
-/// Maximum configured instruments per connection. Fixed-cap tables
-/// everywhere; boot fails fast beyond this.
-pub const DERIBIT_MAX_SYMBOLS: usize = 16;
+/// Maximum CONFIGURED (static) instruments per connection — the
+/// pre-M2 law, unchanged: these subscribe the full channel set
+/// (quote + ticker + trades [+ book]). Fixed-cap tables everywhere;
+/// boot fails fast beyond this.
+pub const DERIBIT_STATIC_MAX: usize = 16;
+
+/// Maximum boot-DISCOVERED capped-chain OPTION instruments per
+/// connection (M2.1, docs/m2-progress.md design entry). Options
+/// subscribe QUOTE ONLY (mark/IV `ticker` arrives at M2.3). Sized so
+/// the default policy (2 underlyings × E2 × K8 × C/P = 64) fits
+/// exactly; a larger configured policy fails fast at table build with
+/// an actionable message.
+pub const DERIBIT_OPT_MAX: usize = 64;
+
+/// Total symbol-table capacity: the static block + the options block.
+/// Kept as the single sizing constant for per-row state arrays
+/// (book chains / trade seqs — options rows never use them, but
+/// row-indexed arrays stay uniform).
+pub const DERIBIT_MAX_SYMBOLS: usize = DERIBIT_STATIC_MAX + DERIBIT_OPT_MAX;
 
 /// Book snapshot level cap per side — levels beyond this are counted
 /// ([`DeribitBookFrame::excess_bids`]/`excess_asks`), not stored.
@@ -588,7 +604,8 @@ pub fn parse_book_header(payload: &[u8], sym: SymbolId) -> Option<DeribitBookFra
 /// Why a [`DeribitSymbolTable::insert`] failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SymbolTableErr {
-    /// All [`DERIBIT_MAX_SYMBOLS`] rows in use (boot misconfiguration).
+    /// The addressed block is full ([`DERIBIT_STATIC_MAX`] static rows
+    /// / [`DERIBIT_OPT_MAX`] option rows) — boot misconfiguration.
     Full,
     /// Instrument longer than [`DERIBIT_INSTR_MAX`].
     TooLong,
@@ -597,13 +614,24 @@ pub enum SymbolTableErr {
     /// Instrument contains `.` — impossible on Deribit and would
     /// corrupt channel-name parsing ([`extract_instrument`]).
     HasDot,
+    /// A static `insert` after the first `insert_option` (M2.1): the
+    /// table is partitioned `[static | options]`; build order is
+    /// static first, options after.
+    StaticAfterOptions,
 }
 
-/// Fixed-capacity `instrument_name → SymbolId` map. Linear scan
-/// (N ≤ 16). Single-owner: built at boot, read by the ingress thread.
+/// Fixed-capacity `instrument_name → SymbolId` map, PARTITIONED
+/// (M2.1): rows `[0..static_len)` are configured instruments (full
+/// channel set), rows `[static_len..len)` are discovered capped-chain
+/// options (quote-only). Linear scan (static N ≤ 16; with a full
+/// options block N ≤ 80 — measured trivial at Deribit's per-message
+/// cadence, noted in docs/hot-path-latency.md at the M2.1 slice).
+/// Single-owner: built at boot, read by the ingress thread.
 pub struct DeribitSymbolTable {
     rows: [(u8, [u8; DERIBIT_INSTR_MAX], SymbolId); DERIBIT_MAX_SYMBOLS],
     len: usize,
+    /// First options row (== `len` while no option was inserted).
+    static_len: usize,
 }
 
 impl DeribitSymbolTable {
@@ -612,11 +640,11 @@ impl DeribitSymbolTable {
         Self {
             rows: [(0, [0; DERIBIT_INSTR_MAX], 0); DERIBIT_MAX_SYMBOLS],
             len: 0,
+            static_len: 0,
         }
     }
 
-    /// Register `instrument → sym`. Boot-time only.
-    pub fn insert(&mut self, instrument: &[u8], sym: SymbolId) -> Result<(), SymbolTableErr> {
+    fn validate(instrument: &[u8]) -> Result<(), SymbolTableErr> {
         if instrument.is_empty() {
             return Err(SymbolTableErr::Empty);
         }
@@ -626,15 +654,64 @@ impl DeribitSymbolTable {
         if memchr::memchr(b'.', instrument).is_some() {
             return Err(SymbolTableErr::HasDot);
         }
-        if self.len >= DERIBIT_MAX_SYMBOLS {
-            return Err(SymbolTableErr::Full);
-        }
+        Ok(())
+    }
+
+    fn push_row(&mut self, instrument: &[u8], sym: SymbolId) {
         let row = &mut self.rows[self.len];
         row.0 = instrument.len() as u8;
         row.1[..instrument.len()].copy_from_slice(instrument);
         row.2 = sym;
         self.len += 1;
+    }
+
+    /// Register a CONFIGURED `instrument → sym` (full channel set).
+    /// Boot-time only; must precede every [`Self::insert_option`].
+    pub fn insert(&mut self, instrument: &[u8], sym: SymbolId) -> Result<(), SymbolTableErr> {
+        Self::validate(instrument)?;
+        if self.static_len != self.len {
+            return Err(SymbolTableErr::StaticAfterOptions);
+        }
+        if self.static_len >= DERIBIT_STATIC_MAX {
+            return Err(SymbolTableErr::Full);
+        }
+        self.push_row(instrument, sym);
+        self.static_len += 1;
         Ok(())
+    }
+
+    /// Register a DISCOVERED capped-chain option `instrument → sym`
+    /// (quote-only subscription; M2.1). Boot-time only.
+    pub fn insert_option(
+        &mut self,
+        instrument: &[u8],
+        sym: SymbolId,
+    ) -> Result<(), SymbolTableErr> {
+        Self::validate(instrument)?;
+        if self.len - self.static_len >= DERIBIT_OPT_MAX {
+            return Err(SymbolTableErr::Full);
+        }
+        debug_assert!(self.len < DERIBIT_MAX_SYMBOLS, "blocks sum to capacity");
+        self.push_row(instrument, sym);
+        Ok(())
+    }
+
+    /// Number of static (configured, full-channel-set) rows.
+    #[inline]
+    pub fn static_len(&self) -> usize {
+        self.static_len
+    }
+
+    /// Number of option (quote-only) rows.
+    #[inline]
+    pub fn n_options(&self) -> usize {
+        self.len - self.static_len
+    }
+
+    /// True when row `idx` is an option row (quote-only).
+    #[inline]
+    pub fn is_option_row(&self, idx: usize) -> bool {
+        idx >= self.static_len && idx < self.len
     }
 
     /// Resolve an instrument to its symbol. Hot path: length gate
@@ -919,10 +996,12 @@ fn write_channel_name(
 
 /// Serialize the single batched `public/subscribe` covering every
 /// configured `(channel × instrument)` pair: `quote` + `ticker.100ms`
-/// + `trades.100ms` per instrument, `book.100ms` when
-/// `depth_enabled`. **One call** — subscribe costs 3000 of 30 000
-/// credits (§4.2), so batching is mandatory. Returns the byte length,
-/// `None` if `dst` is too small.
+/// + `trades.100ms` per STATIC instrument, `book.100ms` when
+/// `depth_enabled`; OPTION rows (M2.1 capped chain) subscribe `quote`
+/// ONLY — an option book is a book, the BBO rides the existing tick
+/// lane; the mark/IV `ticker` stream arrives at M2.3. **One call** —
+/// subscribe costs 3000 of 30 000 credits (§4.2), so batching is
+/// mandatory. Returns the byte length, `None` if `dst` is too small.
 #[inline]
 pub fn write_subscribe_all(
     dst: &mut [u8],
@@ -941,7 +1020,13 @@ pub fn write_subscribe_all(
             DeribitChannel::Trades,
             DeribitChannel::Book,
         ];
-        let n_ch = if depth_enabled { 4 } else { 3 };
+        let n_ch = if symbols.is_option_row(i) {
+            1 // quote only (M2.1)
+        } else if depth_enabled {
+            4
+        } else {
+            3
+        };
         let mut c = 0;
         while c < n_ch {
             if !first {
@@ -1246,11 +1331,68 @@ mod tests {
         );
         assert_eq!(t.insert(b"BTC.WEIRD", 1), Err(SymbolTableErr::HasDot));
         let mut i = 0u32;
-        while (i as usize) < DERIBIT_MAX_SYMBOLS {
+        while (i as usize) < DERIBIT_STATIC_MAX {
             t.insert(format!("S{i}").as_bytes(), i).unwrap();
             i += 1;
         }
         assert_eq!(t.insert(b"OVER", 99), Err(SymbolTableErr::Full));
+    }
+
+    #[test]
+    fn symbol_table_options_partition_law() {
+        // Static rows first, options after; both blocks fixed-cap;
+        // static-after-options is a build-order violation (M2.1).
+        let mut t = DeribitSymbolTable::new();
+        t.insert(b"BTC-PERPETUAL", 1).unwrap();
+        t.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
+        t.insert_option(b"BTC-27MAR26-100000-P", 514).unwrap();
+        assert_eq!(t.static_len(), 1);
+        assert_eq!(t.n_options(), 2);
+        assert_eq!(t.len(), 3);
+        assert!(!t.is_option_row(0));
+        assert!(t.is_option_row(1) && t.is_option_row(2));
+        assert!(!t.is_option_row(3)); // out of range
+        assert_eq!(
+            t.insert(b"ETH-PERPETUAL", 2),
+            Err(SymbolTableErr::StaticAfterOptions)
+        );
+        // Lookup spans both blocks.
+        assert_eq!(t.lookup(b"BTC-27MAR26-100000-P"), Some(514));
+        assert_eq!(t.lookup(b"BTC-PERPETUAL"), Some(1));
+        // Options block cap.
+        let mut i = 2u32;
+        while (i as usize) < DERIBIT_OPT_MAX {
+            t.insert_option(format!("O{i}").as_bytes(), 512 + i).unwrap();
+            i += 1;
+        }
+        assert_eq!(t.insert_option(b"OVER", 999), Err(SymbolTableErr::Full));
+        // Validation applies to option inserts too.
+        assert_eq!(t.insert_option(b"", 1), Err(SymbolTableErr::Empty));
+        assert_eq!(t.insert_option(b"BTC.X", 1), Err(SymbolTableErr::HasDot));
+    }
+
+    #[test]
+    fn subscribe_all_options_rows_are_quote_only() {
+        let mut t = DeribitSymbolTable::new();
+        t.insert(b"BTC-PERPETUAL", 1).unwrap();
+        t.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = write_subscribe_all(&mut buf, 5, &t, false).expect("fits");
+        let s = core::str::from_utf8(&buf[..n]).unwrap();
+        // Static row: full non-depth set.
+        assert!(s.contains("\"quote.BTC-PERPETUAL\""));
+        assert!(s.contains("\"ticker.BTC-PERPETUAL.100ms\""));
+        assert!(s.contains("\"trades.BTC-PERPETUAL.100ms\""));
+        // Option row: quote only — no ticker/trades/book.
+        assert!(s.contains("\"quote.BTC-27MAR26-100000-C\""));
+        assert!(!s.contains("ticker.BTC-27MAR26-100000-C"));
+        assert!(!s.contains("trades.BTC-27MAR26-100000-C"));
+        assert!(!s.contains("book.BTC-27MAR26-100000-C"));
+        // Depth on: static gains book, option still quote-only.
+        let n2 = write_subscribe_all(&mut buf, 6, &t, true).expect("fits");
+        let s2 = core::str::from_utf8(&buf[..n2]).unwrap();
+        assert!(s2.contains("\"book.BTC-PERPETUAL.100ms\""));
+        assert!(!s2.contains("book.BTC-27MAR26-100000-C"));
     }
 
     // ---- book chain ----------------------------------------------

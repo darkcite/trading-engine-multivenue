@@ -417,7 +417,9 @@ live smoke with --raw-tap (pitfall #11) before "done". **(2) OKX
 OPTIONS (2–3d):** same v5 WS stack — discovery instType=OPTION,
 bbo-tbt subscriptions, same policy keys, live smoke. **(3) MARK/IV
 CHANNEL (3–4d; starts ONLY after M3's capture-catalog first commit —
-check their log):** ONE new PMLR capture record (mark px, mark IV,
+the tell is the "CATALOG LANDED — M2.3 UNBLOCKED" line in
+docs/m3-progress.md; the M3 session also notifies the operator, and
+`git log --oneline | grep "M3:"` cross-checks):** ONE new PMLR capture record (mark px, mark IV,
 greeks, OI, underlying px — options-plan §3 deltas) fed by Deribit
 `ticker` + OKX `opt-summary`; docs/wire-format.md + docs/migration.md
 entries (reader-compat notes; capture stays append-only); every new
@@ -480,7 +482,12 @@ map, run-dir sizes, "backtestable window" report (surface the
 harness's span/stats logic + the monitor's window arithmetic); JSON
 + human summary, deterministic; per-crate tests; PMLR v2 as-is
 (M2.3 adds a channel later — whoever lands second extends). **LAND
-THE FIRST COMMIT EARLY.** **(2) LAUNCHD ALWAYS-ON:** KeepAlive'd
+THE FIRST COMMIT EARLY, and the moment it lands you have a VERBATIM
+NOTIFICATION DUTY: write the line "CATALOG LANDED — M2.3 UNBLOCKED
+(commit <hash>)" at the top of your next docs/m3-progress.md entry
+AND tell the operator explicitly: "The capture-catalog first commit
+is in — M2.3 is unblocked."** (That log line is the tell the M2
+session greps for; the operator message is the human signal.) **(2) LAUNCHD ALWAYS-ON:** KeepAlive'd
 paper engine on the full universe (~/Library/LaunchAgents plist +
 docs/local-setup.md runbook; caffeinate/power settings so the Mac
 never sleeps it); DAILY GRACEFUL RESTART (SIGTERM drain — proven

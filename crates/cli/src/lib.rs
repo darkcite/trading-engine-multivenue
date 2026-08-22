@@ -42,7 +42,7 @@ pub mod universe_boot;
 
 pub use paper::{
     boot_discovery, build_ai_universe, build_deribit_symbol_table, build_hl_coin_table,
-    build_okx_symbol_table,
+    build_okx_symbol_table, extend_deribit_table_with_options,
     drain_and_count_loop, engine_loop, engine_loop_cross_arb_full, engine_loop_ev_full,
     engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full, engine_loop_set_full,
     engine_loop_with,

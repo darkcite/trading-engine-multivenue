@@ -615,11 +615,21 @@ fn run(args: RunArgs) -> ExitCode {
     } else {
         None
     };
+    // M2.1: an explicit --deribit-symbols override replaced the whole
+    // [deribit] section — an enabled config options policy was dropped
+    // with it (M1a override law). Say so loudly.
+    if boot.deribit_options_dropped {
+        warn!(
+            "--deribit-symbols override active — the universe config's deribit options \
+             policy is DROPPED for this boot (flag replaces the venue section)"
+        );
+    }
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
         boot.okx_spec.as_deref(),
         boot.deribit_spec.as_deref(),
+        &boot.deribit_options,
         boot.hl_spec.as_deref(),
         bn_discovery_arg,
         &pm_ids,
@@ -687,34 +697,56 @@ fn run(args: RunArgs) -> ExitCode {
     // path stays a cli const. Symbol table building is unaffected by
     // discovery (unlike OKX it needs no per-instrument `instType`).
     const DERIBIT_WS_PATH: &str = "/ws/api/v2";
-    let deribit_boot = match boot.deribit_spec.as_deref().map(str::trim) {
-        Some(spec) if !spec.is_empty() => {
-            let symbols = match cli::build_deribit_symbol_table(spec) {
+    // M2.1: the venue boots when EITHER static instruments are
+    // configured OR the discovered options chain is non-empty (an
+    // options-only [deribit] section is a valid universe).
+    let deribit_spec_trim = boot
+        .deribit_spec
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let deribit_boot = if deribit_spec_trim.is_some() || !discovery.deribit_options.is_empty() {
+        let mut symbols = match deribit_spec_trim {
+            Some(spec) => match cli::build_deribit_symbol_table(spec) {
                 Ok(t) => t,
                 Err(reason) => {
                     error!(reason, spec, "bad --deribit-symbols");
                     return ExitCode::from(1);
                 }
-            };
-            let (deribit_host, deribit_port) =
-                match cli::split_host_port(&cfg.deribit_ws_host, 443) {
-                    Ok(v) => v,
-                    Err(reason) => {
-                        error!(reason, host = %cfg.deribit_ws_host, "bad deribit_ws_host");
-                        return ExitCode::from(1);
-                    }
-                };
-            let deribit_ep =
-                match WssEndpoint::resolve(deribit_host, deribit_port, DERIBIT_WS_PATH) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        error!(error = ?e, "deribit DNS failed");
-                        return ExitCode::from(1);
-                    }
-                };
-            Some((symbols, deribit_ep))
+            },
+            None => ingress_deribit::DeribitSymbolTable::new(),
+        };
+        // Discovered capped chain appends AFTER the static block
+        // (quote-only rows; ordinals already allocated in discovery).
+        if let Err(reason) =
+            cli::extend_deribit_table_with_options(&mut symbols, &discovery.deribit_options)
+        {
+            error!(
+                reason,
+                selected = discovery.deribit_options.len(),
+                "deribit options chain table build failed"
+            );
+            return ExitCode::from(1);
         }
-        _ => None,
+        let (deribit_host, deribit_port) = match cli::split_host_port(&cfg.deribit_ws_host, 443)
+        {
+            Ok(v) => v,
+            Err(reason) => {
+                error!(reason, host = %cfg.deribit_ws_host, "bad deribit_ws_host");
+                return ExitCode::from(1);
+            }
+        };
+        let deribit_ep = match WssEndpoint::resolve(deribit_host, deribit_port, DERIBIT_WS_PATH)
+        {
+            Ok(e) => e,
+            Err(e) => {
+                error!(error = ?e, "deribit DNS failed");
+                return ExitCode::from(1);
+            }
+        };
+        Some((symbols, deribit_ep))
+    } else {
+        None
     };
 
     // -- Hyperliquid boot config (Phase 8d; venue is opt-in) --
@@ -867,6 +899,9 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.hl.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_binance)
             .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
+        // M2.1: capped options chain size this boot (0 = lane off).
+        reg.gauge(ids.deribit_options_selected)
+            .set(discovery.deribit_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture

@@ -16,7 +16,10 @@
 //!   `"#330"` — never starts a comment);
 //! - `[section]` headers — known sections only;
 //! - `key = value` where value is a quoted string array (single-line
-//!   or multiline, trailing comma allowed) or a bare `true`/`false`;
+//!   or multiline, trailing comma allowed), a bare `true`/`false`, or
+//!   a bare non-negative decimal integer (M2.1 grammar extension for
+//!   the options-policy knobs: no sign, no `_` separators, no leading
+//!   zeros, ≤ 7 digits);
 //! - strings are plain `"…"` with NO escape sequences (a `\` inside a
 //!   string is an error — token ids and venue symbols never need one).
 //!
@@ -45,6 +48,39 @@ pub const VENUE_LIST_MAX: usize = 500;
 /// futures ordinals disjoint from spot ordinals by construction.
 pub const BN_USDM_ORDINAL_BASE: u32 = 512;
 
+/// Ordinal base for boot-DISCOVERED capped-chain options instruments
+/// (M2.1 design entry, `docs/m2-progress.md` 2026-08-22):
+/// `make_symbol_id(venue, OPT_ORDINAL_BASE + k + 1)` on Deribit (and
+/// OKX at M2.2). Static lists cap at [`VENUE_LIST_MAX`] = 500 < 512,
+/// so discovered options ordinals are disjoint from file-order
+/// ordinals by construction — the [`BN_USDM_ORDINAL_BASE`] precedent.
+/// Binance eapi (M2.4) uses [`BN_OPT_ORDINAL_BASE`] instead: its
+/// 512-block already belongs to usdm.
+pub const OPT_ORDINAL_BASE: u32 = 512;
+
+/// Binance-only options ordinal base (M2.4 eapi): spot ordinals stay
+/// ≤ 500 < 512, the usdm block ends at 512 + 500 + 1 = 1013 < 1024.
+pub const BN_OPT_ORDINAL_BASE: u32 = 1024;
+
+/// Default E — nearest expiries per options underlying (mvp-plan §8
+/// proposal, adopted in the M2 design entry).
+pub const OPT_EXPIRIES_DEFAULT: u32 = 2;
+
+/// Default K — strikes nearest ATM per expiry (K/2 at-or-below + K/2
+/// above the venue index price; mvp-plan §8 "ATM±4").
+pub const OPT_STRIKES_DEFAULT: u32 = 8;
+
+/// Backstop cap for `options_expiries` (config-rejected above).
+pub const OPT_EXPIRIES_MAX: u32 = 4;
+
+/// Backstop cap for `options_strikes`; K must also be EVEN (the
+/// K/2 + K/2 split around ATM). Worst-case per-underlying working set
+/// at the caps: E × K × 2 = 256 instruments.
+pub const OPT_STRIKES_MAX: u32 = 32;
+
+/// Max configured options underlyings per venue.
+pub const OPT_UNDERLYINGS_MAX: usize = 16;
+
 /// Legacy flat id for the FIRST Polymarket token (pre-8e convention;
 /// preserves the H6 demo lineage, worker-map seeds and latency-arb
 /// defaults). Every later PM token gets a namespaced id.
@@ -60,6 +96,7 @@ const PM_TOKEN_LEN_MAX: usize = 80;
 const BN_SYMBOL_LEN_MAX: usize = 32;
 const INSTRUMENT_LEN_MAX: usize = 48;
 const HL_COIN_LEN_MAX: usize = 32;
+const OPT_UNDERLYING_LEN_MAX: usize = 24;
 
 // ---------------------------------------------------------------
 // Error type
@@ -124,6 +161,48 @@ impl PmMarket {
     }
 }
 
+/// Capped-universe options policy for ONE venue (M2 design entry,
+/// `docs/m2-progress.md` 2026-08-22; mvp-plan §4-M2/§8): the nearest
+/// `expiries` expiries × the `strikes` strikes nearest ATM (K/2
+/// at-or-below + K/2 above the venue index price), calls AND puts ⇒
+/// at most `E × K × 2` instruments per underlying. Instruments are
+/// boot-DISCOVERED under the 8e snapshot doctrine — never listed in
+/// the file; a chain roll enters at the next boot (M3's daily
+/// restart). Empty `underlyings` = options lane OFF for the venue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionsPolicy {
+    /// Venue-native underlying families exactly as configured
+    /// (Deribit currency `"BTC"`; OKX uly `"BTC-USD"` at M2.2).
+    pub underlyings: Vec<String>,
+    /// E — nearest expiries (1..=[`OPT_EXPIRIES_MAX`]).
+    pub expiries: u32,
+    /// K — strikes nearest ATM per expiry (EVEN,
+    /// 2..=[`OPT_STRIKES_MAX`]).
+    pub strikes: u32,
+}
+
+impl Default for OptionsPolicy {
+    fn default() -> Self {
+        Self {
+            underlyings: Vec::new(),
+            expiries: OPT_EXPIRIES_DEFAULT,
+            strikes: OPT_STRIKES_DEFAULT,
+        }
+    }
+}
+
+impl OptionsPolicy {
+    /// The lane is ON iff at least one underlying is configured.
+    pub fn enabled(&self) -> bool {
+        !self.underlyings.is_empty()
+    }
+
+    /// Hard per-underlying instrument cap: `E × K × 2` (calls+puts).
+    pub fn per_underlying_cap(&self) -> u32 {
+        self.expiries * self.strikes * 2
+    }
+}
+
 /// The parsed universe file. Empty lists are valid at PARSE level —
 /// the boot refusal law (`assert_bootable`) is applied by the caller
 /// after allocation, so tests and tooling can parse partial files.
@@ -143,6 +222,10 @@ pub struct Universe {
     pub deribit_instruments: Vec<String>,
     /// `[deribit] depth` — subscribe the change_id-chained book (§4.5).
     pub deribit_depth: bool,
+    /// `[deribit] options_underlyings` / `options_expiries` /
+    /// `options_strikes` — the M2.1 capped options-chain policy
+    /// (see [`OptionsPolicy`]; instruments are boot-discovered).
+    pub deribit_options: OptionsPolicy,
     /// `[hyperliquid] coins` — coin names (HIP-4 `#<enc>` and spot
     /// `@<idx>` forms are ordinary items) in file order.
     pub hl_coins: Vec<String>,
@@ -248,6 +331,9 @@ enum Slot {
     OkxDepth,
     DeribitInstr,
     DeribitDepth,
+    DeribitOptUnderlyings,
+    DeribitOptExpiries,
+    DeribitOptStrikes,
     HlCoins,
     PairsMap,
 }
@@ -259,6 +345,7 @@ enum ElemKind {
     BnSymbol,
     Instrument,
     HlCoin,
+    OptUnderlying,
     PairRef,
 }
 
@@ -282,6 +369,9 @@ struct Builder {
     okx_depth: Option<bool>,
     deribit_instr: Option<Vec<String>>,
     deribit_depth: Option<bool>,
+    deribit_opt_underlyings: Option<Vec<String>>,
+    deribit_opt_expiries: Option<u32>,
+    deribit_opt_strikes: Option<u32>,
     hl_coins: Option<Vec<String>>,
     pairs_map: Option<Vec<String>>,
 }
@@ -357,6 +447,10 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 };
                 store_bool(&mut b, slot, v, line_no)?;
             }
+            Slot::DeribitOptExpiries | Slot::DeribitOptStrikes => {
+                let v = parse_uint(key, value, line_no)?;
+                store_int(&mut b, slot, v, line_no)?;
+            }
             _ => {
                 let Some(after_bracket) = value.strip_prefix('[') else {
                     return Err(err(
@@ -415,6 +509,9 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Okx, "depth") => Some(Slot::OkxDepth),
         (Section::Deribit, "instruments") => Some(Slot::DeribitInstr),
         (Section::Deribit, "depth") => Some(Slot::DeribitDepth),
+        (Section::Deribit, "options_underlyings") => Some(Slot::DeribitOptUnderlyings),
+        (Section::Deribit, "options_expiries") => Some(Slot::DeribitOptExpiries),
+        (Section::Deribit, "options_strikes") => Some(Slot::DeribitOptStrikes),
         (Section::Hyperliquid, "coins") => Some(Slot::HlCoins),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
         _ => None,
@@ -434,8 +531,11 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
         Slot::OkxInstr | Slot::DeribitInstr => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
+        Slot::DeribitOptUnderlyings => ElemKind::OptUnderlying,
         Slot::PairsMap => ElemKind::PairRef,
-        Slot::OkxDepth | Slot::DeribitDepth => unreachable!("bool slots have no elements"),
+        Slot::OkxDepth | Slot::DeribitDepth | Slot::DeribitOptExpiries | Slot::DeribitOptStrikes => {
+            unreachable!("bool/int slots have no elements")
+        }
     }
 }
 
@@ -533,6 +633,9 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::BnSymbol => validate_bn_symbol(s, line_no),
         ElemKind::Instrument => validate_name(s, INSTRUMENT_LEN_MAX, "instrument", line_no),
         ElemKind::HlCoin => validate_name(s, HL_COIN_LEN_MAX, "coin", line_no),
+        ElemKind::OptUnderlying => {
+            validate_name(s, OPT_UNDERLYING_LEN_MAX, "options underlying", line_no)
+        }
         ElemKind::PairRef => validate_pair_ref(s, line_no).map(|_| ()),
     }
 }
@@ -664,6 +767,11 @@ fn store_array(
                 return Err(dup("instruments"));
             }
         }
+        Slot::DeribitOptUnderlyings => {
+            if b.deribit_opt_underlyings.replace(items).is_some() {
+                return Err(dup("options_underlyings"));
+            }
+        }
         Slot::HlCoins => {
             if b.hl_coins.replace(items).is_some() {
                 return Err(dup("coins"));
@@ -674,7 +782,9 @@ fn store_array(
                 return Err(dup("map"));
             }
         }
-        Slot::OkxDepth | Slot::DeribitDepth => unreachable!("bool slots never store arrays"),
+        Slot::OkxDepth | Slot::DeribitDepth | Slot::DeribitOptExpiries | Slot::DeribitOptStrikes => {
+            unreachable!("bool/int slots never store arrays")
+        }
     }
     Ok(())
 }
@@ -692,6 +802,46 @@ fn store_bool(b: &mut Builder, slot: Slot, v: bool, line_no: usize) -> Result<()
             }
         }
         _ => unreachable!("array slots never store bools"),
+    }
+    Ok(())
+}
+
+/// Parse a bare non-negative decimal integer value (M2.1 grammar
+/// extension): ASCII digits only — no sign, no `_` separators, no
+/// leading zeros (except `0` itself), at most 7 digits (always fits
+/// `u32`).
+fn parse_uint(key: &str, value: &str, line_no: usize) -> Result<u32, UniverseError> {
+    let bytes = value.as_bytes();
+    let ok = !bytes.is_empty()
+        && bytes.len() <= 7
+        && bytes.iter().all(|b| b.is_ascii_digit())
+        && !(bytes.len() > 1 && bytes[0] == b'0');
+    if !ok {
+        return Err(err(
+            line_no,
+            format!(
+                "`{key}` expects a bare decimal integer (no sign/`_`/leading zeros), got `{value}`"
+            ),
+        ));
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| err(line_no, format!("`{key}` integer `{value}` out of range")))
+}
+
+fn store_int(b: &mut Builder, slot: Slot, v: u32, line_no: usize) -> Result<(), UniverseError> {
+    match slot {
+        Slot::DeribitOptExpiries => {
+            if b.deribit_opt_expiries.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `options_expiries`"));
+            }
+        }
+        Slot::DeribitOptStrikes => {
+            if b.deribit_opt_strikes.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `options_strikes`"));
+            }
+        }
+        _ => unreachable!("non-integer slots never store integers"),
     }
     Ok(())
 }
@@ -732,6 +882,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let binance_usdm = b.bn_usdm.unwrap_or_default();
     let okx_instruments = b.okx_instr.unwrap_or_default();
     let deribit_instruments = b.deribit_instr.unwrap_or_default();
+    let deribit_opt_underlyings = b.deribit_opt_underlyings.clone().unwrap_or_default();
     let hl_coins = b.hl_coins.unwrap_or_default();
 
     // Caps.
@@ -740,6 +891,11 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_cap(binance_usdm.len(), VENUE_LIST_MAX, "Binance usdm symbols")?;
     check_cap(okx_instruments.len(), VENUE_LIST_MAX, "OKX instruments")?;
     check_cap(deribit_instruments.len(), VENUE_LIST_MAX, "Deribit instruments")?;
+    check_cap(
+        deribit_opt_underlyings.len(),
+        OPT_UNDERLYINGS_MAX,
+        "Deribit options underlyings",
+    )?;
     check_cap(hl_coins.len(), VENUE_LIST_MAX, "Hyperliquid coins")?;
 
     // Within-list duplicates (a duplicate = double subscribe + two
@@ -759,7 +915,37 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&binance_usdm, "Binance usdm symbol")?;
     check_unique(&okx_instruments, "OKX instrument")?;
     check_unique(&deribit_instruments, "Deribit instrument")?;
+    check_unique(&deribit_opt_underlyings, "Deribit options underlying")?;
     check_unique(&hl_coins, "Hyperliquid coin")?;
+
+    // Options policy (M2.1): integer knobs are meaningless without
+    // underlyings — reject silently-ignored config (fail-fast law).
+    if deribit_opt_underlyings.is_empty()
+        && (b.deribit_opt_expiries.is_some() || b.deribit_opt_strikes.is_some())
+    {
+        return Err(err(
+            0,
+            "deribit `options_expiries`/`options_strikes` set but `options_underlyings` \
+             is empty — remove the knobs or configure underlyings",
+        ));
+    }
+    let opt_expiries = b.deribit_opt_expiries.unwrap_or(OPT_EXPIRIES_DEFAULT);
+    let opt_strikes = b.deribit_opt_strikes.unwrap_or(OPT_STRIKES_DEFAULT);
+    if opt_expiries == 0 || opt_expiries > OPT_EXPIRIES_MAX {
+        return Err(err(
+            0,
+            format!("`options_expiries` {opt_expiries} out of range 1..={OPT_EXPIRIES_MAX}"),
+        ));
+    }
+    if opt_strikes < 2 || opt_strikes > OPT_STRIKES_MAX || opt_strikes % 2 != 0 {
+        return Err(err(
+            0,
+            format!(
+                "`options_strikes` {opt_strikes} must be EVEN and in 2..={OPT_STRIKES_MAX} \
+                 (K/2 strikes each side of ATM)"
+            ),
+        ));
+    }
 
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -792,6 +978,11 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         okx_depth: b.okx_depth.unwrap_or(false),
         deribit_instruments,
         deribit_depth: b.deribit_depth.unwrap_or(false),
+        deribit_options: OptionsPolicy {
+            underlyings: deribit_opt_underlyings,
+            expiries: opt_expiries,
+            strikes: opt_strikes,
+        },
         hl_coins,
         pairs,
     })
@@ -817,6 +1008,9 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
 ///   sizes — the check makes it impossible SILENTLY).
 /// - Empty `[pairs]` with both sides non-empty injects the default
 ///   pair (market 0 × spot 0).
+/// - Boot-DISCOVERED options instruments are NOT allocated here — the
+///   cli allocates them post-discovery from [`OPT_ORDINAL_BASE`]
+///   (M2.1c), disjoint from every file-order ordinal by construction.
 pub fn allocate(u: &Universe) -> Result<AllocatedUniverse, UniverseError> {
     allocate_with_anchors(u, LEGACY_PM_ANCHOR_SYM, LEGACY_BN_ANCHOR_SYM)
 }
@@ -1011,6 +1205,9 @@ depth = false
 [deribit]
 instruments = ["BTC-PERPETUAL"]
 depth = true
+options_underlyings = ["BTC", "ETH"]
+options_expiries = 2
+options_strikes = 8
 
 [hyperliquid]
 coins = ["BTC", "#330"]
@@ -1039,6 +1236,11 @@ map = ["0:0", "1:1"]
         assert!(!u.okx_depth);
         assert_eq!(u.deribit_instruments, vec!["BTC-PERPETUAL"]);
         assert!(u.deribit_depth);
+        assert_eq!(u.deribit_options.underlyings, vec!["BTC", "ETH"]);
+        assert_eq!(u.deribit_options.expiries, 2);
+        assert_eq!(u.deribit_options.strikes, 8);
+        assert!(u.deribit_options.enabled());
+        assert_eq!(u.deribit_options.per_underlying_cap(), 32);
         assert_eq!(u.hl_coins, vec!["BTC", "#330"]);
         assert_eq!(u.pairs, vec![(0, 0), (1, 1)]);
     }
@@ -1283,6 +1485,151 @@ map = ["0:0", "1:1"]
     }
 
     // -----------------------------------------------------------
+    // M2.1 options-policy keys (integer grammar + validation)
+    // -----------------------------------------------------------
+
+    #[test]
+    fn opt_defaults_apply_when_int_keys_absent() {
+        let u = parse("[deribit]\noptions_underlyings = [\"BTC\"]\n").expect("parses");
+        assert_eq!(u.deribit_options.underlyings, vec!["BTC"]);
+        assert_eq!(u.deribit_options.expiries, OPT_EXPIRIES_DEFAULT);
+        assert_eq!(u.deribit_options.strikes, OPT_STRIKES_DEFAULT);
+        assert!(u.deribit_options.enabled());
+        assert_eq!(u.deribit_options.per_underlying_cap(), 32);
+    }
+
+    #[test]
+    fn opt_lane_off_when_keys_absent() {
+        let u = parse("[deribit]\ninstruments = [\"BTC-PERPETUAL\"]\n").expect("parses");
+        assert!(!u.deribit_options.enabled());
+        assert_eq!(u.deribit_options, OptionsPolicy::default());
+    }
+
+    #[test]
+    fn opt_int_keys_without_underlyings_fatal() {
+        for src in [
+            "[deribit]\noptions_expiries = 2\n",
+            "[deribit]\noptions_strikes = 8\n",
+            "[deribit]\noptions_underlyings = []\noptions_expiries = 2\n",
+        ] {
+            let e = parse(src).unwrap_err();
+            assert!(e.msg.contains("options_underlyings"), "{src} → {e}");
+        }
+    }
+
+    #[test]
+    fn opt_expiries_range_enforced() {
+        for bad in ["0", "5", "4000000"] {
+            let src =
+                format!("[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = {bad}\n");
+            let e = parse(&src).unwrap_err();
+            assert!(e.msg.contains("options_expiries"), "{bad} → {e}");
+        }
+        let src = "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = 4\n";
+        assert_eq!(parse(src).expect("max is valid").deribit_options.expiries, 4);
+    }
+
+    #[test]
+    fn opt_strikes_even_and_range_enforced() {
+        for bad in ["0", "1", "7", "33", "34"] {
+            let src =
+                format!("[deribit]\noptions_underlyings = [\"BTC\"]\noptions_strikes = {bad}\n");
+            let e = parse(&src).unwrap_err();
+            assert!(e.msg.contains("options_strikes"), "{bad} → {e}");
+        }
+        let src = "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_strikes = 32\n";
+        assert_eq!(parse(src).expect("max even is valid").deribit_options.strikes, 32);
+    }
+
+    #[test]
+    fn opt_bad_int_literals_rejected() {
+        for bad in ["2.5", "-1", "+2", "007", "2_000", "abc", "12345678", "\"2\"", "true"] {
+            let src =
+                format!("[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = {bad}\n");
+            let e = parse(&src).unwrap_err();
+            assert!(
+                e.msg.contains("bare decimal integer"),
+                "literal `{bad}` must be rejected as a bad integer, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn opt_int_with_trailing_comment_parses() {
+        let src = "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = 3 # E\n";
+        assert_eq!(parse(src).expect("comment after int").deribit_options.expiries, 3);
+    }
+
+    #[test]
+    fn opt_duplicate_keys_rejected() {
+        let e = parse(
+            "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = 2\noptions_expiries = 3\n",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("duplicate key `options_expiries`"), "{e}");
+        let e = parse(
+            "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_underlyings = [\"ETH\"]\n",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("duplicate key `options_underlyings`"), "{e}");
+    }
+
+    #[test]
+    fn opt_underlyings_dup_and_cap_enforced() {
+        let e = parse("[deribit]\noptions_underlyings = [\"BTC\", \"BTC\"]\n").unwrap_err();
+        assert!(e.msg.contains("duplicate Deribit options underlying"), "{e}");
+        let mut src = String::from("[deribit]\noptions_underlyings = [\n");
+        for i in 0..(OPT_UNDERLYINGS_MAX + 1) {
+            src.push_str(&format!("\"U{i}\",\n"));
+        }
+        src.push_str("]\n");
+        let e = parse(&src).unwrap_err();
+        assert!(e.msg.contains("too many Deribit options underlyings"), "{e}");
+    }
+
+    #[test]
+    fn opt_keys_are_deribit_only_in_m2_1() {
+        // The M2.1 scope pin: options keys exist ONLY under [deribit]
+        // until M2.2 (okx) / M2.4 (binance) land their consumers.
+        for src in [
+            "[okx]\noptions_underlyings = [\"BTC-USD\"]\n",
+            "[binance]\noptions_expiries = 2\n",
+            "[polymarket]\noptions_strikes = 8\n",
+        ] {
+            let e = parse(src).unwrap_err();
+            assert!(e.msg.contains("unknown key"), "{src} → {e}");
+        }
+    }
+
+    #[test]
+    fn opt_type_mismatches_rejected() {
+        // Integer on an array key.
+        let e = parse("[deribit]\ninstruments = 2\n").unwrap_err();
+        assert!(e.msg.contains("string array"), "{e}");
+        // Array on an integer key.
+        let e = parse(
+            "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = [\"2\"]\n",
+        )
+        .unwrap_err();
+        assert!(e.msg.contains("bare decimal integer"), "{e}");
+        // Bad underlying element (embedded space).
+        let e = parse("[deribit]\noptions_underlyings = [\"B TC\"]\n").unwrap_err();
+        assert!(e.msg.contains("bad options underlying"), "{e}");
+    }
+
+    #[test]
+    fn opt_policy_does_not_touch_allocation() {
+        // Options are boot-discovered and cli-allocated (base 512) —
+        // file allocation must be byte-identical with the policy set.
+        let a = allocate(&parse(&full_src()).unwrap()).expect("allocates");
+        assert_eq!(a.deribit.len(), 1);
+        assert_eq!(a.deribit[0].sym, make_symbol_id(VenueId::Deribit, 1));
+        let mut no_opt = parse(&full_src()).unwrap();
+        no_opt.deribit_options = OptionsPolicy::default();
+        assert_eq!(allocate(&no_opt).expect("allocates"), a);
+    }
+
+    // -----------------------------------------------------------
     // Property tests (house rule §21.3: every parser gets one)
     // -----------------------------------------------------------
 
@@ -1310,11 +1657,15 @@ map = ["0:0", "1:1"]
                 usdm in proptest::collection::vec("[a-z0-9]{3,12}", 0..6),
                 okx in proptest::collection::vec("[A-Z0-9-]{3,20}", 0..6),
                 depth in proptest::bool::ANY,
+                ulys in proptest::collection::vec("[A-Z]{2,6}", 0..3),
+                e in 1..=4u32,
+                k_half in 1..=16u32,
             ) {
                 let pm = dedup(pm);
                 let spot = dedup(spot);
                 let usdm = dedup(usdm);
                 let okx = dedup(okx);
+                let ulys = dedup(ulys);
                 let mut src = String::new();
                 src.push_str("[polymarket]\nmarkets = [\n");
                 for t in &pm { src.push_str(&format!("  \"{t}\", # id\n")); }
@@ -1325,7 +1676,20 @@ map = ["0:0", "1:1"]
                     usdm.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")));
                 src.push_str(&format!("[okx]\ninstruments = [{}]\ndepth = {depth}\n",
                     okx.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")));
+                if !ulys.is_empty() {
+                    src.push_str(&format!("[deribit]\noptions_underlyings = [{}]\n",
+                        ulys.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")));
+                    src.push_str(&format!(
+                        "options_expiries = {e}\noptions_strikes = {}\n", k_half * 2));
+                }
                 let u = parse(&src).expect("generated config must parse");
+                if ulys.is_empty() {
+                    prop_assert!(!u.deribit_options.enabled());
+                } else {
+                    prop_assert_eq!(u.deribit_options.underlyings.clone(), ulys);
+                    prop_assert_eq!(u.deribit_options.expiries, e);
+                    prop_assert_eq!(u.deribit_options.strikes, k_half * 2);
+                }
                 prop_assert_eq!(u.binance_spot.clone(), spot);
                 prop_assert_eq!(u.binance_usdm.clone(), usdm);
                 prop_assert_eq!(u.okx_instruments.clone(), okx);

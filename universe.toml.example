@@ -6,8 +6,10 @@
 #
 # Grammar is a strict TOML subset (core-config::universe): [sections],
 # key = ["string", …] arrays (multiline ok, trailing comma ok),
-# key = true|false. Unknown sections/keys are fatal. No escapes in
-# strings. A `#` inside a string (e.g. HIP-4 "#330") is literal.
+# key = true|false, key = <bare decimal integer> (M2.1: options knobs
+# — no sign, no `_`, no leading zeros). Unknown sections/keys are
+# fatal. No escapes in strings. A `#` inside a string (e.g. HIP-4
+# "#330") is literal.
 
 [polymarket]
 # M1-R1 (operator ruling): crypto up/down binary markets ONLY.
@@ -37,6 +39,17 @@ depth = false
 [deribit]
 instruments = []
 depth = false
+# M2.1 capped options chain (docs/m2-progress.md design entry): boot
+# DISCOVERS the nearest `options_expiries` expiries × the
+# `options_strikes` strikes nearest ATM (K/2 either side of the index
+# price, calls+puts ⇒ ≤ E×K×2 instruments per underlying) for each
+# listed underlying currency. Empty/absent list = options lane OFF.
+# Chains roll at the NEXT boot (M3's daily restart refreshes). The
+# integer knobs are only legal when underlyings are configured;
+# E 1..=4 (default 2), K even 2..=32 (default 8 = ATM±4).
+options_underlyings = []   # e.g. ["BTC", "ETH"]
+# options_expiries = 2
+# options_strikes = 8
 
 [hyperliquid]
 # Coins; HIP-4 "#<enc>" outcome coins and spot "@<idx>" pairs are
