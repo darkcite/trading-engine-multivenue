@@ -1808,3 +1808,317 @@ relaunch prompt into docs/phase-8h-progress.md, then tell me. AT
 CLOSE, VERBATIM DUTY: tell the operator "Stage 2 is fully
 implemented", list the demonstrated §12 exit criteria, and WAIT — no
 Stage-3 word until he says so.
+
+---
+
+## 2026-08-22 — Session H6a (design §13 item 6, OPERATOR-RESCOPED partial: final gates + live demo, promotion lane + §6.1 fetch smoke) — PHASE REMAINS OPEN, H6b OWED
+
+Authority: the H6 kickoff above + design (LOCKED) + THREE operator
+rulings taken live this session (AskUserQuestion, recorded verbatim in
+intent): **(R1) no Anthropic key tonight — semi-manual mode** (the
+ai-session §4 operator-verb lane; `ServeConfig.assert_complete` refuses
+serve without a `sk-ant-*` key, so §13.6's "one real Fable-5 serve
+cycle" is mechanically impossible tonight); **(R2) skip the rollback
+demo tonight** (the dummy-key-serve middle path — real §8.3 monitor at
+zero spend — was offered and declined); **(R3) H6a now, H6b owed** —
+tonight runs everything the rulings allow, the PHASE STAYS OPEN, and
+the Stage-2 completion notification is DEFERRED to H6b (the CLAUDE.md
+hard requirement fires when the §12 exit criteria are demonstrated,
+which requires H6b's keyed serve cycle + rollback). Boot market
+(operator-selected from a live Gamma liquidity query): "Will the Fed
+decrease interest rates by 25 bps after the September 2026 meeting?" —
+YES token 57748138085022719760345772310040703848567377822400132842014290209986511882046
+(vol24h $1.5M at selection; the same-day-resolving alternatives were
+rejected as mid-demo resolution hazards). Session-start HEAD `0e47429`
+(the H5 commit), tree clean; RustRover attach verified first.
+
+### H5 interpretation review — all FOURTEEN UPHELD (kickoff first task)
+
+Verdicts explicit, with tonight's live evidence noted where the demo
+touched them: #1 (cadence collapse — monitor at every cycle end) —
+upheld; serve did not run tonight (R1/R2), remains E2E-test-pinned for
+H6b's live proof. #2 (run-granular window spans) — upheld; tonight's
+REAL-capture window analysis (below) independently confirms the
+gap-preserving virtual clock the design implies. #3 (symlink window
+dir) — upheld; the harness consumed a 9-run SYMLINK root tonight at
+the binary level (the H5 hygiene note's owed proof: symlinked run dirs
+resolve through macOS `read_dir` into PmlrReader identically — 2.73M
+ticks merged, zero read errors). #4 (report-clobber active-copy) —
+upheld, untouched tonight (no monitor run). #5 (active/prior ledger
+resolution) — upheld; tonight's semi-manual commit is an
+operator-lane row (no `promotion` event), which is EXACTLY the
+registry-order fallback shape #5 anticipates — H6b's monitor must
+resolve active=d8aea5f4… through registry order alone. #6
+(trigger-time event) / #7 (three no-prior shapes) / #8 (dark guard) /
+#9 (no auto re-enable) / #10 (BacktestError skip) — upheld, untouched
+tonight. #11 (§7.1 performance seam) — upheld, untouched. #12
+(placement) — upheld. #13 (inclusive arms) — upheld. #14 (empty
+registry silent no-op) — upheld; note the registry is NOT empty
+tonight (two committed rows), so H6b's monitor will score, not no-op.
+One prior-entry correction, none: the H5 entry's numbers re-verified
+exactly (354 collected, 21+7 split confirmed by tonight's green run).
+
+### Final gates at H6a (all on the Mac; single nohup chain, /tmp/8h-h6-gates.log)
+
+- worker pytest **354 green, 0 skipped** (release binary on PATH; the
+  2 real-harness tests RAN) — 11.82 s.
+- workspace nextest **1081/1081, 1 skipped** (the `#[ignore]` regen) —
+  11.23 s.
+- release alloc **36/36, 0 B/op, `--test-threads=1`** — corrected
+  guard honored: `cargo clean -p bench --release` then a fresh
+  `Compiling bench` verified in-log before the run.
+- `cargo build --release -p cli` — G0 relink BEFORE any boot (exit 0).
+- Fuzz untouched: H6a adds no parser on either side (nothing new
+  parses untrusted bytes; the demo generator WRITES PMLR, consumed by
+  the already-hardened readers).
+
+### Demo as run — evidence chain
+
+**(a) Paper boot, real market.** Two boots. Boot-1 08:32:56Z exposed a
+provisioning gap: `.env` carries no `AI_INGRESS_HMAC_KEY`, so the
+ingress-ai thread refused to start (engine log verbatim:
+"AI_INGRESS_HMAC_KEY unset; ingress-ai thread not started").
+Operator delegated key provisioning to the session: a DEMO-SCOPED key
+was minted (`openssl rand -hex 32` → /tmp/8h-h6-hmac.key, chmod 600,
+sourced into both the engine boot env and every worker verb env;
+`.env` NEVER read or written — the key exists only in /tmp and dies
+with it). Boot-2 08:40:23Z PID 57765: `ingress-ai: starting thread
+sock=~/multivenue/run/ai.sock`, `strategy-set: composed mask=49
+latency_arb=true ai_exec=true vm=true`, `ai: ruleset boot-universe
+snapshot built symbols=2` (syms 42+7), metrics 127.0.0.1:9191 live,
+capture run-1787388023015013000 accumulating (~344 pm+bn ticks/5 s at
+boot). Clean-slate ai metrics baseline verified: cmds=0 staged=0
+committed=0 rejected=0 heartbeat=-1.
+
+**(b′) The REAL harness refused a real-capture ruleset — the gate
+spoke.** R1 (2 rows: cross_deviation ref-7→sym-42 + level_breach
+0.05, $25 caps) over a 9-run symlink root of ALL real capture
+(3 fat G1-soak runs + Aug-16 quartet + tonight's boot-1): exit 3,
+`gates: pnl_positive=False min_trades=False min_days=False
+max_drawdown=True bounds=False -> FAIL`. Harness stderr (the §5 human
+summary) recorded the structural finding: capture = 9 runs, 2,729,136
+merged ticks, universe 11 syms, 4 UTC days spanned; virt window
+[1e17, 1e17+6.479e14] — **the virtual clock PRESERVES inter-run wall
+gaps**, so the 70/30 boundary (virt 100453548007102050) lands INSIDE
+the Aug-16→Aug-22 dark gap and the OOS window is exactly tonight's
+63,056-tick capture: a frozen penny-wide Fed book (constant 0.010/
+0.012) that NEVER trades through — strict-cross maker fills = 0, OOS
+trades 0, days 0. vm fired 7,241 times; 7,229 emits died on the
+4/sym open-order cap (unfilled bids pinning the table) — the §4.1 cap
+model working as specified. Bounds $280.90 > $250 (the $25 rows stack
+inventory in IS). STANDING FACT for future capture ops: with min_days
+= 2 (fills on two distinct OOS UTC days) no capture set on this box —
+single-day churny G1 material + a quiet single-evening market — can
+pass the frozen gates on any subset; a passing real-capture promotion
+needs ≥2 days of genuinely churny capture, which does not exist yet.
+
+**(b″) Crafted capture A per design §8.5 (the sanctioned worst case:
+"a crafted synthetic capture … the golden-fixture machinery doubles
+as the demo generator").** Generator: demo-scoped Python
+(gen_capA.py, NOT in the repo; persisted below) writing v2 PMLR via
+`claude_worker.pmlr`'s own reader structs (tests/craft.py precedent —
+the same bytes the Rust PmlrReader validates). Shape = the committed
+golden fixture (`build_pnl_capture`) scaled: run-1000000000 = the
+golden IS warmup byte-shapes; run-172760000000000 (epoch 40 s before
+the wall day-2 UTC midnight) = 30 buy/sell round-trips at 2.4 s
+cadence, trips 0–14 finishing pre-midnight, 15–29 post (6 ticks per
+trip: neutral 0.55/0.58 → dip through the 0.42 level → deep-ask
+trade-through fill → recover → rip through the 0.60 level →
+high-bid trade-through fill; closing two-sided mark 0.50/0.52).
+Harness verdict on R2 (below): OOS net **+$60.71** (realized 51.15 +
+markout 9.56), **65 trades**, **trading_days 2** (midnight straddle),
+DD $41.13, bounds 10.0/80.99/80.99, `EXIT=0` — every number the §4
+model's own arithmetic over legitimately-crossing books; no gate was
+touched, bypassed, or loosened.
+
+**(b‴) Fable-5-authored candidate, promoted through the frozen verb
+lane on the LIVE engine.** R2 authored in-session by Fable 5 (this
+session's model IS `claude-fable-5`; the semi-manual lane per R1):
+2 level_breach rows in the golden shape, h6-dip-fade (bid, level
+0.42) + h6-rip-fade (ask, level 0.60), edge 80 bps, horizon 1500 ms,
+max_risk $10 each — full hash
+d8aea5f4163c0ad312cc494edaef169daa7437d4234235d904dab8ba846e26dd.
+ai-session §4 executed verb-by-verb: worker backtest exit 0 (`gates:
+… -> PASS`, report beside the ruleset); positions consulted (flat
+book, exit 0); artifact installed to
+$AI_RULESET_DIR/d8aea5f4163c0ad312cc494edaef169d.json; stage-ruleset
+exit 0 → `staged d8aea5f4… / sent kind=ruleset-stage seq=16`;
+commit-ruleset exit 0 → `committed d8aea5f4… / sent
+kind=ruleset-commit seq=18`. LIVE metrics walk: cmds 0→2→4 (2 HB +
+Stage + Commit), staged_total 0→1, committed_total 0→1,
+rejected_total 0 throughout (hmac_fail/protocol_err/malformed/
+seq_gap/seq_regress/ring_drops/expired/rejected_conns ALL 0),
+vm_rows_active 0→**2**, vm_table_epoch 0→**1**, enabled_mask 49
+throughout, and **vm_fires_total 0→1 — the committed table FIRED on
+the live Fed book: trading in paper, observed.** Heartbeat-age gaps
+between verbs are the §5.4 TTL fail-safe by design. Registry row:
+(d8aea5f4…, staged_ts 1787388645, committed_ts 1787388675,
+gates_passed 1, author_mode `session`); events ledger frame_sent=18;
+ai_seq next 19. Engine ran ~12 min with the table live, then SIGTERM
+— clean drain, capture flushed.
+
+**(c) Rollback — NOT run tonight (ruling R2).** Deferred whole to
+H6b; the H5 E2E suite remains its only proof. No serve process ran;
+modes never interleaved (every verb hit the socket solo).
+
+**(d) The owed H3 §6.1 live fetch smoke — CLOSED.** First
+`fetch --no-rest` bootstrapped market-map.json live (added=1 the
+binance:btcusdt↔7 mirror; unresolved=1 sym 42 with the name-format
+hint — §6.2 verbatim). Map seeded with the Fed token id (the
+operator-entry lane, delegated), then FULL `claude-worker fetch`:
+`rest polymarket: requested=1 fetched=1 budget_skipped=0 failed=0
+malformed=0 skipped_total=0` — a REAL RestBudget-gated Gamma call;
+42-meta.json written (question + slug + BOTH clobTokenIds + outcomes
+resolved from the live API); `market map refreshed: added=2
+conflicts=0 unresolved=0` (question + slug names, additive). SCOPE
+NOTE: only the Gamma consumer was live-exercised — the observed
+universe of the latest run is syms 7/42, so the OKX/Deribit/HL candle
+consumers had no targets (binance excluded by design) and remain
+MockTransport-proven only.
+
+**(e) audit-replay verification.** Over run-1787388023015013000
+(engine stopped): pm 191 ticks / bn 99,532 ticks, ZERO integrity
+violations (regr/holes/missing/chain_breaks all 0 both venues); ai
+section verbatim: `cmds=4 unknown_kinds=0`, `per-kind: HB=2 …
+Stage=1 Commit=1`, `seq: first=15 last=18 gaps=0 missing=0
+regressions=0`, `Stage seq=16 ts=2162404300177166
+hash128=d8aea5f4163c0ad312cc494edaef169d`, `Commit seq=18
+ts=2162434103921791 hash128=d8aea5f4…` — the promotion renders from
+capture by construction.
+
+### §12 exit-criteria checklist — HONEST STATUS (phase OPEN)
+
+- "Fable-5-authored ruleset": **DEMONSTRATED** (authored in-session by
+  Fable 5 through the semi-manual lane; the API-called authorship
+  rides H6b).
+- "auto-promoted after passing backtest": **PARTIAL** — the REAL
+  harness passed the candidate and the FROZEN stage/commit lane
+  applied it to the live engine (counters + capture prove it), but
+  §8.1 AUTO-promotion (serve's install→stage→commit with no operator
+  verbs) remains E2E-test-proven only; live at H6b.
+- "trading in paper": **DEMONSTRATED** (vm_rows_active=2,
+  table_epoch=1, vm_fires_total=1 on the live Fed book, paper mode).
+- "forced-underperformance rollback demonstrated": **NOT RUN**
+  (ruling R2); H6b.
+
+### Hygiene
+
+- Repo diff this session: docs ONLY (this file + CLAUDE.md CURRENT
+  STATE). Zero code changes anywhere: engine/strategy-vm/ingress/
+  core/cli crates untouched; `backtest.py` + `cli.py` byte-untouched
+  (now FOUR sessions); 7-verb surface frozen; conftest + frozen tests
+  untouched; the 202/354 pytest baseline untouched-green.
+- `.env` never read or written. The demo HMAC key is session-minted,
+  /tmp-scoped (0600), and appears in no committed file. ANTHROPIC key:
+  none used, none present.
+- Cargo/pytest on the Mac only (pitfall #10); all long-runners
+  nohup+poll through the MCP terminal (pitfall #12); paper only; no
+  git ops until the authorized closing commit; push anomaly posture
+  unchanged (record, never act).
+- Demo artifacts persisted OUTSIDE the repo at
+  `~/multivenue/worker/demo-h6a/` (demo/: gen_capA.py, R1.json,
+  R2.json + reports; capA/: the two crafted runs). The /tmp originals
+  (8h-h6-demo, 8h-h6-capA, 8h-h6-window, gates/boot logs, hmac key,
+  env.sh) are DISPOSABLE. NOTE for H6b: the registry row's
+  ruleset_path/report_path point at /tmp/8h-h6-demo/* — if /tmp has
+  cleared, refresh the row FIRST via a supersede re-stage/commit of
+  the persistent copies (the frozen verbs, same hash) so the prior
+  BINDS for restage; else the monitor correctly takes the no-prior
+  arm.
+
+### Resume point
+
+Item 6 is HALF-DONE by operator ruling: gates ✓, demo (a)(b′)(b″)
+(b‴)(d)(e) ✓, (§8.1 auto + §8.5 rollback + phase close) = **H6b**,
+gated on an ANTHROPIC key existing in `.env`. The H6b kickoff below
+is ready to paste. The Stage-2 completion notification fires ONLY at
+H6b close.
+
+---
+
+## H6b kickoff prompt (paste verbatim into a fresh session)
+
+8h implementation — SESSION H6b (design §13 item 6 REMAINDER: the
+close — one REAL keyed Fable-5 serve cycle with §8.1 auto-promotion
+observed live, the §8.5 forced-underperformance rollback observed
+live, audit-replay verification, the PHASE-CLOSING entry; NO new
+feature code), MAIN CHECKOUT /Users/darkcite/trading-engine-multivenue.
+Stage-2 status: 8f/8g CLOSED; 8h H0 LOCKED, H1–H5 CLOSED, **H6a
+CLOSED** (this commit): semi-manual Fable-5 promotion demonstrated
+live (hash d8aea5f4…, registry author_mode=session, audit-replay
+Stage seq=16/Commit seq=18 over run-1787388023015013000), §6.1 fetch
+smoke closed (Gamma live, map additive), real-capture min_days
+finding recorded, rollback + auto-promotion deferred HERE. Baselines:
+worker pytest 354 green 0 skipped on-PATH, nextest 1081/1081 (+1
+ignored), release alloc 36/36 0 B/op corrected guard, fuzz
+`ruleset_json` 72.3M untouched. PREREQUISITES (confirm with the
+operator BEFORE anything): (1) `ANTHROPIC_API_KEY` present in `.env`
+(operator's hand; Claude NEVER reads .env) and the daily-cap budget
+law confirmed — one cycle, ≤2 Fable-5 calls, serve stopped after; (2)
+`AI_INGRESS_HMAC_KEY` provisioning — the H6a demo key was /tmp-scoped
+and is GONE after a /tmp clear; either the operator adds a key to
+`.env` or a fresh session-minted key rides both the boot env and
+every verb env (H6a pattern, recorded); (3) if /tmp cleared, refresh
+the d8aea5f4… registry row via supersede stage-ruleset +
+commit-ruleset from `~/multivenue/worker/demo-h6a/demo/R2.json` +
+its report (same hash, frozen lane) so the PRIOR binds for restage.
+SESSION SHAPE: attach `get_project_modules` FIRST (stop if no
+attach); re-run the four gates (nohup chain, corrected alloc guard);
+G0 relink; boot paper `--strategy all` on an operator-confirmed
+market (H6a used the Fed −25bps Sept market, token
+57748138085022719760345772310040703848567377822400132842014290209986511882046
+— reuse unless the operator repicks; venue-blind boot refuses);
+verify the ai metrics clean slate; THEN the keyed serve cycle:
+operator exports/holds the key, `CLAUDE_WORKER_STRATEGIST_INTERVAL_S`
+low + `CLAUDE_WORKER_REPLAY_DIR` pointed at a window the strategist
+can WIN on (capA at ~/multivenue/worker/demo-h6a/capA/ is the proven
+gates-passable window; the strategist's digest rides the features/
+news it finds — a gates-FAIL cycle is a VALID gate demo, record and
+iterate at operator discretion), nohup serve + poll; observe ONE full
+cycle: strategist_call ledger row (usage tokens, cache flag),
+candidate file, REAL backtest, gates, and on PASS the §8.1
+auto-install + Stage + Commit with NO operator verbs — metrics
+staged/committed increment, registry row author_mode=auto with
+model/thesis attribution, `promotion` event. THEN §8.5 rollback:
+generate capture B by inverting the H6a generator (persisted
+gen_capA.py: flip the trip so the active ruleset's fills LOSE ≥$100
+net or draw ≥$200 on the trailing window — e.g. buy fills at highs,
+mark collapse; keep ≥6 h coverage per the monitor floor and remember
+the window is run-granular, anchored at capture end), point serve's
+CLAUDE_WORKER_REPLAY_DIR at it, let the monitor's cycle-end run
+breach ⇒ observe LIVE: `rollback_triggered` event with metrics,
+Disable-5 frame (enabled_mask 49→17), FROZEN restage pair on the
+prior (staged/committed +1 each, attribution COALESCE-preserved),
+active resolves to the prior on the next cycle with NO re-trigger;
+a no-prior fallback (disable-only + `rollback_no_prior` + dark
+guard) is a VALID §8.3 demo of that arm if the prior fails to bind —
+record whichever arm fired. Stop serve. audit-replay the run dir:
+ai section must render Stage/Commit (auto) and Disable/Stage/Commit
+(rollback) in seq order. GREEN GATES to close: pytest 354 (+ any
+demo-scoped additions) / nextest 1081 / alloc 36/36 / fuzz untouched
+/ release cli relinked. THEN: the PHASE-CLOSING entry in
+docs/phase-8h-progress.md — demo transcript facts (counters, event
+rows, frame seqs, audit-replay lines, ledger rows with token usage),
+the FULL §12 exit-criteria checklist with observed evidence (all
+four arms DEMONSTRATED), uphold-or-amend review of H6a's
+interpretation verdicts, hygiene, the Stage-2 closure statement;
+CLAUDE.md CURRENT STATE refresh to CLOSED; ONE closing commit
+(authorized), one-line status. LANDMINES: Mac-only cargo/pytest
+(pitfall #10); MCP terminal ≤45 s — nohup > /tmp/8h-h6b-*.log & and
+poll, kill by pid file; zsh eats bare ===; serve OWNS the UDS — no
+operator verbs while it runs (exit 4 = modes interleaved; stop serve
+first); live Fable-5 calls CO$T — the confirmed cap + one-cycle
+scope is law; paper only (no --live anywhere); full `import x` only;
+engine/strategy-vm/ingress/core/cli crates READ-ONLY; backtest.py +
+cli.py byte-untouched; 7-verb surface FROZEN; conftest + frozen
+tests untouchable; `.env` NEVER read or written by Claude. SESSION
+FACTS: metrics 127.0.0.1:9191 (engine_ai_* per ai-session §2;
+enabled_mask 49→17 on disable-5 is the rollback tell); AF_UNIX
+sun_path cap; SO_RCVTIMEO EINVAL on peer-closed UDS; push anomaly
+KNOWN — record, never act; market-map.json now EXISTS (Fed market
+seeded + Gamma-refreshed). If context runs short: interim state +
+resume point + relaunch prompt into docs/phase-8h-progress.md, then
+tell the operator. AT CLOSE, VERBATIM DUTY: tell the operator
+**"Stage 2 is fully implemented."**, list the demonstrated §12 exit
+criteria, and WAIT — no Stage-3 word (code, plans, or designs) until
+he says so.
