@@ -190,3 +190,10 @@ path   = "fuzz_targets/universe_toml.rs"
 test   = false
 doc    = false
 bench  = false
+
+[[bin]]
+name   = "binance_exchange_info"
+path   = "fuzz_targets/binance_exchange_info.rs"
+test   = false
+doc    = false
+bench  = false

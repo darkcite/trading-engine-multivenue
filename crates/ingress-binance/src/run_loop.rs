@@ -631,6 +631,225 @@ pub fn run<T: Transport, C: Capture>(
 }
 
 // ---------------------------------------------------------------
+// run_multi — N single-stream connections, ONE thread, ONE producer
+// (M1: Binance multi-symbol spot + USDS-M futures)
+// ---------------------------------------------------------------
+
+/// One connection slot for [`run_multi`]: endpoint bytes + per-
+/// connection driver/keepalive/backoff, owned by the single venue
+/// thread. **Single-writer law:** N sockets, one thread, one tick
+/// producer — the slots never leave the thread.
+///
+/// Boot-time construction (allocations fine); steady state is the
+/// same zero-alloc [`drive_one`] the single-connection path runs.
+pub struct MultiConn<T: Transport> {
+    /// Live transport; `None` while the slot awaits a reconnect.
+    transport: Option<T>,
+    /// Per-connection WS state machine (sym pinned inside).
+    drv: Driver,
+    /// Host bytes for the `Host:` header (spot vs USDS-M hosts
+    /// differ — each slot carries its own).
+    host: Vec<u8>,
+    /// Request path (`/ws/<symbol>@bookTicker`).
+    path: Vec<u8>,
+    keepalive: core_net::Keepalive,
+    backoff: core_net::Backoff,
+    /// Monotonic ns before which no reconnect is attempted.
+    next_attempt_ns: NsTs,
+    /// Session start for the keepalive activity fallback.
+    session_start_ns: NsTs,
+    /// Interest bitmask at the last (re)registration — skip the
+    /// syscall when unchanged (same rationale as `run()`).
+    last_interest: Option<mio::Interest>,
+}
+
+impl<T: Transport> MultiConn<T> {
+    /// New slot, initially disconnected (the loop's reconnect pass
+    /// dials it; `next_attempt_ns` 0 = due immediately).
+    pub fn new(
+        drv: Driver,
+        host: &[u8],
+        path: &[u8],
+        keepalive: core_net::Keepalive,
+        backoff: core_net::Backoff,
+    ) -> Self {
+        Self {
+            transport: None,
+            drv,
+            host: host.to_vec(),
+            path: path.to_vec(),
+            keepalive,
+            backoff,
+            next_attempt_ns: 0,
+            session_start_ns: 0,
+            last_interest: None,
+        }
+    }
+
+    /// Tear down the slot's transport (socket closes on drop; kqueue/
+    /// epoll deregister closed fds) and schedule the next attempt.
+    /// A session that saw inbound activity resets the backoff first —
+    /// the D8 flap-vs-healthy distinction the single-connection
+    /// wrapper makes in the cli.
+    fn kill(&mut self, now: NsTs, status: &core_metrics::IngressStatus) {
+        if self.transport.take().is_some() {
+            status.inc_reconnects();
+            if self.drv.last_activity_ns > self.session_start_ns {
+                self.backoff.reset();
+            }
+        }
+        self.next_attempt_ns = now + self.backoff.next_delay_ns();
+    }
+}
+
+/// Drive N single-stream connections on one thread with one producer
+/// until `stop` is set. Per-slot failures (transport error, WS close,
+/// idle timeout) never end the loop — the slot is torn down and
+/// re-dialed via `connect` with jittered backoff, **at most one
+/// blocking dial per poll iteration** so a flapping endpoint cannot
+/// starve the live slots. Returns [`RunResult::Stopped`] on the stop
+/// flag; [`RunResult::Error`] only on poll-infrastructure failure.
+///
+/// `connect(i)` dials slot `i` (blocking, bounded by the caller's
+/// connect timeout) and returns `None` on failure.
+#[allow(clippy::too_many_arguments)]
+pub fn run_multi<T: Transport, C: Capture>(
+    conns: &mut [MultiConn<T>],
+    producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    poll: &mut mio::Poll,
+    events: &mut mio::Events,
+    stop: &StopFlag,
+    status: &core_metrics::IngressStatus,
+    capture: &mut C,
+    mut connect: impl FnMut(usize) -> Option<T>,
+) -> RunResult {
+    while !stop.load(Ordering::Relaxed) {
+        // 1. Reconnect pass — one dial per iteration, oldest-due first.
+        let now = now_ns();
+        let mut due: Option<usize> = None;
+        for i in 0..conns.len() {
+            if conns[i].transport.is_none() && now >= conns[i].next_attempt_ns {
+                let better = match due {
+                    None => true,
+                    Some(j) => conns[i].next_attempt_ns < conns[j].next_attempt_ns,
+                };
+                if better {
+                    due = Some(i);
+                }
+            }
+        }
+        if let Some(i) = due {
+            match connect(i) {
+                Some(mut t) => {
+                    if t.register(poll.registry(), mio::Token(i)).is_err() {
+                        conns[i].kill(now, status);
+                    } else {
+                        conns[i].last_interest = Some(t.interest());
+                        conns[i].drv.reset_for_reconnect(now);
+                        conns[i].keepalive.reset();
+                        conns[i].session_start_ns = now;
+                        conns[i].transport = Some(t);
+                    }
+                }
+                None => conns[i].kill(now, status),
+            }
+        }
+
+        if poll
+            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .is_err()
+        {
+            return RunResult::Error;
+        }
+
+        // 2. Readiness → per-slot pump.
+        for ev in events.iter() {
+            let i = ev.token().0;
+            if i >= conns.len() {
+                continue;
+            }
+            let c = &mut conns[i];
+            let Some(t) = c.transport.as_mut() else { continue };
+            match t.pump(ev) {
+                Ok(s) => note_transport_ready(&mut c.drv, s),
+                Err(_e) => c.kill(now_ns(), status),
+            }
+        }
+
+        // 3. Drain every live slot (I-3 bounded no-progress loop).
+        for i in 0..conns.len() {
+            let c = &mut conns[i];
+            let Some(t) = c.transport.as_mut() else { continue };
+            loop {
+                let n_before = producer.len();
+                let state_before = c.drv.state();
+                if drive_one(t, &mut c.drv, &c.host, &c.path, producer, status, capture).is_err() {
+                    c.kill(now_ns(), status);
+                    break;
+                }
+                if c.drv.state() == State::Closed {
+                    c.kill(now_ns(), status);
+                    break;
+                }
+                if producer.len() == n_before && c.drv.state() == state_before {
+                    break;
+                }
+            }
+        }
+
+        // 4. §6.5 capture flush cadence (one clock read per iteration).
+        capture.maybe_flush(now_ns());
+
+        // 5. Keepalive per steady slot (D5/D6).
+        for i in 0..conns.len() {
+            let c = &mut conns[i];
+            if c.drv.state() != State::Steady {
+                continue;
+            }
+            let Some(t) = c.transport.as_mut() else { continue };
+            let now = now_ns();
+            let act = if c.drv.last_activity_ns == 0 {
+                c.session_start_ns
+            } else {
+                c.drv.last_activity_ns
+            };
+            match c.keepalive.poll(now, act) {
+                core_net::KeepaliveAction::SendPing => {
+                    let mask = ws_mask_from_counter(c.drv.mask_counter);
+                    c.drv.mask_counter = c.drv.mask_counter.wrapping_add(1);
+                    let dst = c.drv.tx.free_mut();
+                    if let Ok(n) = ws_write_ping(dst, &[], mask) {
+                        c.drv.tx.advance(n);
+                    }
+                    c.keepalive.mark_ping_sent(now);
+                    if flush_tx(t, &mut c.drv).is_err() {
+                        c.kill(now, status);
+                    }
+                }
+                core_net::KeepaliveAction::Reconnect => c.kill(now, status),
+                core_net::KeepaliveAction::None => {}
+            }
+        }
+
+        // 6. Interest re-registration per live slot — only when the
+        // bitmask actually changed (see run()'s rationale).
+        for i in 0..conns.len() {
+            let c = &mut conns[i];
+            let Some(t) = c.transport.as_mut() else { continue };
+            let cur = t.interest();
+            if c.last_interest != Some(cur) {
+                if t.reregister(poll.registry(), mio::Token(i)).is_err() {
+                    c.kill(now_ns(), status);
+                } else {
+                    c.last_interest = Some(cur);
+                }
+            }
+        }
+    }
+    RunResult::Stopped
+}
+
+// ---------------------------------------------------------------
 // Tests — TestTransport-driven
 // ---------------------------------------------------------------
 
@@ -751,6 +970,128 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Failed upgrade must never publish Up.
         assert_eq!(status.state(), core_metrics::IngressState::Down);
+    }
+
+    fn huge_keepalive() -> core_net::Keepalive {
+        core_net::Keepalive::new(core_net::KeepaliveCfg {
+            ping_interval_ns: u64::MAX / 4,
+            idle_timeout_ns: u64::MAX / 2,
+        })
+    }
+
+    fn test_backoff(seed: u64) -> core_net::Backoff {
+        core_net::Backoff::new(1_000_000, 1_000_000_000, seed)
+    }
+
+    fn ws_text_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= 125);
+        let mut f = Vec::with_capacity(2 + payload.len());
+        f.push(0x81);
+        f.push(payload.len() as u8);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// M1 core guarantee: N connections, ONE thread, ONE producer —
+    /// ticks from both slots land in the same ring with their pinned
+    /// syms; per-slot state machines stay independent.
+    #[test]
+    fn run_multi_drains_two_steady_slots_into_one_producer() {
+        let mut t_a = TestTransport::with_capacity(16 * 1024);
+        let mut t_b = TestTransport::with_capacity(16 * 1024);
+        let payload_a = br#"{"u":1,"s":"BTCUSDT","b":"25.10","B":"1.0","a":"25.20","A":"1.0"}"#;
+        let payload_b = br#"{"u":2,"s":"ETHUSDT","b":"3.10","B":"1.0","a":"3.20","A":"1.0"}"#;
+        t_a.inject_incoming(&ws_text_frame(payload_a));
+        t_b.inject_incoming(&ws_text_frame(payload_b));
+
+        let mut d_a = build_driver(1, 42);
+        d_a.set_state(State::Steady);
+        let mut d_b = build_driver(2, 7);
+        d_b.set_state(State::Steady);
+
+        let mut c_a = MultiConn::new(d_a, b"spot.example", b"/ws/a", huge_keepalive(), test_backoff(1));
+        c_a.transport = Some(t_a);
+        let mut c_b = MultiConn::new(d_b, b"fut.example", b"/ws/b", huge_keepalive(), test_backoff(2));
+        c_b.transport = Some(t_b);
+        let mut conns = [c_a, c_b];
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(8);
+        let stop = StopFlag::new(false);
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                stop.store(true, Ordering::Relaxed);
+            });
+            let res = run_multi(
+                &mut conns,
+                &mut prod,
+                &mut poll,
+                &mut events,
+                &stop,
+                &status,
+                &mut NullCapture,
+                |_i| None,
+            );
+            assert_eq!(res, RunResult::Stopped);
+        });
+
+        let mut syms = [cons.try_pop().unwrap().sym, cons.try_pop().unwrap().sym];
+        syms.sort_unstable();
+        assert_eq!(syms, [7, 42]);
+        assert!(cons.try_pop().is_none());
+        assert_eq!(status.msgs_total(), 2);
+        // No kills: both transports still installed, zero reconnects.
+        assert!(conns[0].transport.is_some());
+        assert!(conns[1].transport.is_some());
+        assert_eq!(status.reconnects_total(), 0);
+    }
+
+    /// Reconnect pacing: at most ONE dial per poll iteration; failed
+    /// dials schedule jittered retries; the loop exits only on stop.
+    #[test]
+    fn run_multi_paces_one_reconnect_attempt_per_iteration() {
+        let d_a = build_driver(1, 42);
+        let d_b = build_driver(2, 7);
+        let conns_init = [
+            MultiConn::new(d_a, b"h", b"/a", huge_keepalive(), test_backoff(3)),
+            MultiConn::new(d_b, b"h", b"/b", huge_keepalive(), test_backoff(4)),
+        ];
+        let mut conns = conns_init;
+
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(8);
+        let stop = StopFlag::new(false);
+
+        let calls = std::cell::Cell::new(0u32);
+        let res = run_multi(
+            &mut conns,
+            &mut prod,
+            &mut poll,
+            &mut events,
+            &stop,
+            &status,
+            &mut NullCapture,
+            |_i| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n >= 3 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                None::<TestTransport>
+            },
+        );
+        assert_eq!(res, RunResult::Stopped);
+        assert_eq!(calls.get(), 3, "exactly one dial per iteration");
+        assert!(conns[0].next_attempt_ns > 0, "slot 0 got scheduled");
+        assert!(conns[1].next_attempt_ns > 0, "slot 1 got scheduled");
     }
 
     #[test]

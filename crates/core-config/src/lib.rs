@@ -70,8 +70,19 @@ pub struct Config {
     pub polymarket_clob_host: String,
     /// Polymarket Gamma host (metadata).
     pub polymarket_gamma_host: String,
-    /// Binance WS host.
+    /// Binance spot WS host.
     pub binance_ws_host: String,
+    /// Binance USDS-M futures WS host (M1 multi-symbol). Env:
+    /// `BINANCE_FUT_WS_HOST`. Default: `fstream.binance.com`.
+    pub binance_fut_ws_host: String,
+    /// Binance spot REST host for M1 boot discovery
+    /// (`GET /api/v3/exchangeInfo?symbol=…`). Env: `BINANCE_REST_HOST`.
+    /// Default: `api.binance.com`.
+    pub binance_rest_host: String,
+    /// Binance USDS-M REST host for M1 boot discovery
+    /// (`GET /fapi/v1/exchangeInfo`). Env: `BINANCE_FUT_REST_HOST`.
+    /// Default: `fapi.binance.com`.
+    pub binance_fut_rest_host: String,
     /// Alchemy RPC host.
     pub alchemy_host: String,
     /// Paper-mode toggle.
@@ -137,6 +148,12 @@ impl Config {
             polymarket_clob_host: env_req("POLYMARKET_CLOB_HOST")?,
             polymarket_gamma_host: env_req("POLYMARKET_GAMMA_HOST")?,
             binance_ws_host: env_req("BINANCE_WS_HOST")?,
+            binance_fut_ws_host: env_opt("BINANCE_FUT_WS_HOST")
+                .unwrap_or_else(|| "fstream.binance.com".into()),
+            binance_rest_host: env_opt("BINANCE_REST_HOST")
+                .unwrap_or_else(|| "api.binance.com".into()),
+            binance_fut_rest_host: env_opt("BINANCE_FUT_REST_HOST")
+                .unwrap_or_else(|| "fapi.binance.com".into()),
             alchemy_host: env_req("ALCHEMY_HOST")?,
             paper_mode: env_opt("MULTIVENUE_MODE").as_deref() == Some("paper"),
             metrics_bind: env_opt("METRICS_BIND").unwrap_or_else(|| "127.0.0.1:9191".into()),

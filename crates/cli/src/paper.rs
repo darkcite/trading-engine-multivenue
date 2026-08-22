@@ -524,6 +524,114 @@ pub fn spawn_binance(
     ))
 }
 
+/// One resolved Binance connection spec for [`spawn_binance_multi`]:
+/// host + path + pinned sym. Spot and USDS-M futures slots mix
+/// freely — each slot carries its own host (M1 design).
+pub struct BinanceConnSpec {
+    /// WS host (spot: `BINANCE_WS_HOST`; USDS-M: `BINANCE_FUT_WS_HOST`).
+    pub host: String,
+    /// Stream path `/ws/<symbol>@bookTicker`.
+    pub path: String,
+    /// Pinned SymbolId (the M1 allocation law).
+    pub sym: core_types::SymbolId,
+}
+
+/// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
+/// connections (ONE per instrument — the parser stays byte-frozen),
+/// ONE thread, ONE producer (single-writer law), one `"bn"` capture.
+/// `ingress_binance::run_multi` owns the in-thread reconnect pacing
+/// (one dial per poll iteration, jittered per-slot backoff). See
+/// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_binance_multi(
+    specs: Vec<BinanceConnSpec>,
+    tls_config: RustlsConfig,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture =
+        GaugedCapture::new(PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?, capture_metrics);
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
+    }
+    Ok(spawn_or_die(
+        thread::Builder::new().name(format!("ingress-binance-x{}", specs.len())),
+        "ingress-binance",
+        move || {
+            log_pin_outcome("binance", core_id);
+            // Resolve every endpoint + server name up front; failure is
+            // fatal for the venue thread (the single-connection
+            // wrapper's bad-server-name posture, applied per slot).
+            let mut eps: Vec<WssEndpoint> = Vec::with_capacity(specs.len());
+            let mut names: Vec<ServerName> = Vec::with_capacity(specs.len());
+            for i in 0..specs.len() {
+                let ep = match WssEndpoint::resolve(&specs[i].host, 443, &specs[i].path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!(error = ?e, host = %specs[i].host, "binance: DNS failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                let name = match TlsTransport::server_name_from_host(&ep.host) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "binance: bad server name");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                eps.push(ep);
+                names.push(name);
+            }
+            let (mut poll, mut events, _token) = match new_poll() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, "binance: mio init failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut conns: Vec<bwl::MultiConn<TlsTransport>> = Vec::with_capacity(specs.len());
+            for i in 0..specs.len() {
+                let drv = bwl::Driver::new(now_ns().wrapping_add(i as u64), specs[i].sym);
+                conns.push(bwl::MultiConn::new(
+                    drv,
+                    eps[i].host.as_bytes(),
+                    eps[i].path.as_bytes(),
+                    Keepalive::new(BN_KEEPALIVE),
+                    Backoff::default_for_ingress(core_id as u64 + 1 + i as u64),
+                ));
+            }
+            status.set_state(IngressState::Connecting);
+            let res = bwl::run_multi(
+                &mut conns,
+                &mut producer,
+                &mut poll,
+                &mut events,
+                &SHUTDOWN,
+                &status,
+                &mut capture,
+                |i| match connect_tls(&eps[i], &names[i], &tls_config) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, host = %eps[i].host, slot = i, "binance: connect failed");
+                        None
+                    }
+                },
+            );
+            tracing::info!(?res, "binance: multi run-loop returned");
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    ))
+}
+
 /// Build the boot-time OKX `instId → SymbolId` table from the
 /// comma-separated `--okx-symbols` value, gated on `discovery` (the
 /// Phase-8e REST instrument table — see `boot_discovery::run_okx`).
@@ -1950,12 +2058,13 @@ impl Observability {
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
-            // only (BN + RPC have no REST discovery, boot_discovery
-            // module docs).
+            // + Binance since M1 (exchangeInfo audit); RPC alone has
+            // no REST discovery (boot_discovery module docs).
             let coverage_pm = register_coverage_gauge(&mut reg, "pm")?;
             let coverage_okx = register_coverage_gauge(&mut reg, "okx")?;
             let coverage_deribit = register_coverage_gauge(&mut reg, "deribit")?;
             let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
+            let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -2021,6 +2130,7 @@ impl Observability {
                 coverage_okx,
                 coverage_deribit,
                 coverage_hyperliquid,
+                coverage_binance,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -2225,6 +2335,9 @@ pub struct EngineCounters {
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
+    /// M1 boot-discovery coverage gauge, Binance exchangeInfo audit
+    /// (0 when skipped — legacy flag boots).
+    pub coverage_binance: GaugeId,
     /// Phase-8f AI ingress family (`engine_ingress_ai_*` + the engine
     /// drain-site counter + heartbeat-age gauge).
     pub ingress_ai: AiIngressCounterIds,
@@ -2683,9 +2796,9 @@ fn register_capture_gauges(
 }
 
 /// Register the `engine_ingress_<venue>_coverage_configured` gauge
-/// for one Phase-8e boot-discovery venue (`pm`/`okx`/`deribit`/`hl` —
-/// BN and RPC have no REST discovery, see `boot_discovery` module
-/// docs). Boot-only.
+/// for one boot-discovery venue (`pm`/`okx`/`deribit`/`hl`, plus
+/// `bn` since the M1 exchangeInfo audit — RPC alone has no REST
+/// discovery, see `boot_discovery` module docs). Boot-only.
 fn register_coverage_gauge(
     reg: &mut MetricsRegistry,
     venue_label: &str,
@@ -3215,6 +3328,7 @@ pub mod boot_discovery {
     use std::time::Duration;
 
     use core_config::Config;
+    use ingress_binance::discovery::BnDiscovery;
     use ingress_deribit::discovery::DeribitDiscovery;
     use ingress_hyperliquid::discovery::HlDiscovery;
     use ingress_okx::discovery::OkxDiscovery;
@@ -3273,6 +3387,10 @@ pub mod boot_discovery {
         /// Hyperliquid's coin table is still built by
         /// [`super::build_hl_coin_table`] exactly as before.
         pub hl: Option<VenueCoverage>,
+        /// Binance coverage (M1 exchangeInfo audit); `None` when the
+        /// caller skipped it (legacy flag boots keep their historical
+        /// zero-REST Binance behavior — config boots audit).
+        pub bn: Option<VenueCoverage>,
     }
 
     // -----------------------------------------------------------
@@ -3309,6 +3427,28 @@ pub mod boot_discovery {
             None => Some("not_found"),
             Some(_) => None,
         }
+    }
+
+    /// `None` ⇒ `symbol_upper` is a TRADING Binance symbol in the
+    /// ingested exchangeInfo table. `Some(reason)` ⇒ MISSING.
+    pub fn bn_missing_reason(d: &BnDiscovery, symbol_upper: &[u8]) -> Option<MissingReason> {
+        match d.find(symbol_upper) {
+            None => Some("not_found"),
+            Some(row) if !row.trading => Some("not_trading"),
+            Some(_) => None,
+        }
+    }
+
+    /// Uppercase a configured (lowercase) stream symbol into a stack
+    /// buffer for exchangeInfo lookup. Returns the buffer + length.
+    fn upper_symbol(s: &str) -> ([u8; 32], usize) {
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(32);
+        let mut out = [0u8; 32];
+        for i in 0..n {
+            out[i] = bytes[i].to_ascii_uppercase();
+        }
+        (out, n)
     }
 
     /// `None` ⇒ `token` (the CLOB asset id) is a tradable market on
@@ -3589,11 +3729,106 @@ pub mod boot_discovery {
         Ok(VenueCoverage { configured: configured.len() as u32, matched, universe })
     }
 
-    /// Run the full Phase-8e boot discovery pass: OKX (if
-    /// `okx_spec` is configured), Deribit (if `deribit_spec` is
-    /// configured), Hyperliquid (if `hl_spec` is configured), then
-    /// Polymarket (always). One reused `Vec<u8>` buffer carries every
-    /// fetch's response body. Any fetch/parse failure is FATAL —
+    fn run_bn(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        spot: &[String],
+        usdm: &[String],
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<VenueCoverage, &'static str> {
+        let mut d = BnDiscovery::new();
+        let mut matched = 0u32;
+
+        // Spot: one `?symbol=` probe per configured symbol. The venue
+        // 400s unknown symbols — mapped to MISSING (not fatal), every
+        // other transport/parse failure stays fatal. 150 ms spacing
+        // mirrors the OKX page pacing.
+        let (spot_host, spot_port) = split_host_port(&cfg.binance_rest_host, 443)?;
+        for (i, sym) in spot.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            let (up, up_len) = upper_symbol(sym);
+            let upper = core::str::from_utf8(&up[..up_len]).unwrap_or("");
+            let path = format!("/api/v3/exchangeInfo?symbol={upper}");
+            match get(tls, spot_host, spot_port, &path, buf) {
+                Ok(range) => {
+                    d.ingest_body(&buf[range]).map_err(|e| {
+                        tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: parse failed");
+                        "bn: discovery parse failed"
+                    })?;
+                    match bn_missing_reason(&d, &up[..up_len]) {
+                        None => matched += 1,
+                        Some(reason) => {
+                            *any_missing = true;
+                            tracing::error!(
+                                venue = "bn",
+                                symbol = sym.as_str(),
+                                reason,
+                                "discovery: configured symbol missing from venue universe"
+                            );
+                        }
+                    }
+                }
+                Err(core_net::boot_http::BootHttpErr::Status(400)) => {
+                    *any_missing = true;
+                    tracing::error!(
+                        venue = "bn",
+                        symbol = sym.as_str(),
+                        reason = "not_found",
+                        "discovery: configured symbol missing from venue universe (HTTP 400)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: fetch failed");
+                    return Err("bn: discovery fetch failed");
+                }
+            }
+        }
+
+        // USDS-M: one full exchangeInfo page, membership-checked.
+        if !usdm.is_empty() {
+            let (fut_host, fut_port) = split_host_port(&cfg.binance_fut_rest_host, 443)?;
+            let range = get(tls, fut_host, fut_port, "/fapi/v1/exchangeInfo", buf).map_err(|e| {
+                tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: fetch failed");
+                "bn: discovery fetch failed"
+            })?;
+            d.ingest_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: parse failed");
+                "bn: discovery parse failed"
+            })?;
+            for sym in usdm {
+                let (up, up_len) = upper_symbol(sym);
+                match bn_missing_reason(&d, &up[..up_len]) {
+                    None => matched += 1,
+                    Some(reason) => {
+                        *any_missing = true;
+                        tracing::error!(
+                            venue = "bn",
+                            symbol = sym.as_str(),
+                            market = "usdm",
+                            reason,
+                            "discovery: configured symbol missing from venue universe"
+                        );
+                    }
+                }
+            }
+        }
+
+        let configured = (spot.len() + usdm.len()) as u32;
+        let universe = d.universe_trading();
+        tracing::info!(venue = "bn", configured, matched, universe, "discovery: coverage");
+        Ok(VenueCoverage { configured, matched, universe })
+    }
+
+    /// Run the full boot discovery pass: OKX (if `okx_spec` is
+    /// configured), Deribit (if `deribit_spec` is configured),
+    /// Hyperliquid (if `hl_spec` is configured), Binance (M1 — if the
+    /// caller passes the spot/usdm lists; legacy flag boots pass
+    /// `None` and keep their historical zero-REST Binance behavior),
+    /// then Polymarket (always). One reused `Vec<u8>` buffer carries
+    /// every fetch's response body. Any fetch/parse failure is FATAL —
     /// returned as `Err` for the caller to log + exit non-zero; a
     /// MISSING symbol is not itself an `Err` here (see
     /// [`Outcome::any_missing`] — the caller decides paper-vs-live).
@@ -3603,6 +3838,7 @@ pub mod boot_discovery {
         okx_spec: Option<&str>,
         deribit_spec: Option<&str>,
         hl_spec: Option<&str>,
+        binance: Option<(&[String], &[String])>,
         polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
@@ -3626,9 +3862,16 @@ pub mod boot_discovery {
             None => None,
         };
 
+        let bn = match binance {
+            Some((spot, usdm)) if !spot.is_empty() || !usdm.is_empty() => {
+                Some(run_bn(cfg, tls_config, spot, usdm, &mut buf, &mut any_missing)?)
+            }
+            _ => None,
+        };
+
         let pm = run_pm(cfg, tls_config, polymarket_asset_ids, &mut buf, &mut any_missing)?;
 
-        Ok(Outcome { any_missing, pm, okx, okx_table, deribit, hl })
+        Ok(Outcome { any_missing, pm, okx, okx_table, deribit, hl, bn })
     }
 
     // -----------------------------------------------------------
@@ -3638,6 +3881,34 @@ pub mod boot_discovery {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn bn_fixture() -> BnDiscovery {
+            let mut d = BnDiscovery::new();
+            d.ingest_body(
+                br#"{"symbols":[
+                  {"symbol":"BTCUSDT","status":"TRADING"},
+                  {"symbol":"OLDUSDT","status":"BREAK"}
+                ]}"#,
+            )
+            .unwrap();
+            d
+        }
+
+        #[test]
+        fn bn_missing_reason_covers_found_not_trading_and_absent() {
+            let d = bn_fixture();
+            assert_eq!(bn_missing_reason(&d, b"BTCUSDT"), None);
+            assert_eq!(bn_missing_reason(&d, b"OLDUSDT"), Some("not_trading"));
+            assert_eq!(bn_missing_reason(&d, b"NOPEUSDT"), Some("not_found"));
+        }
+
+        #[test]
+        fn upper_symbol_uppercases_into_stack_buffer() {
+            let (buf, n) = upper_symbol("btcusdt");
+            assert_eq!(&buf[..n], b"BTCUSDT");
+            let (buf2, n2) = upper_symbol("btcusdt_260327");
+            assert_eq!(&buf2[..n2], b"BTCUSDT_260327");
+        }
 
         fn okx_fixture() -> OkxDiscovery {
             let mut d = OkxDiscovery::new();

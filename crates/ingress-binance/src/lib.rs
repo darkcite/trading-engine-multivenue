@@ -25,11 +25,12 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod discovery;
 pub mod run_loop;
 
 pub use run_loop::{
-    drive_one, note_transport_ready, run, Driver, RunResult, State, StopFlag,
-    DEFAULT_TICK_RING_CAP, RX_BUF_SIZE, TX_BUF_SIZE,
+    drive_one, note_transport_ready, run, run_multi, Driver, MultiConn, RunResult, State,
+    StopFlag, DEFAULT_TICK_RING_CAP, RX_BUF_SIZE, TX_BUF_SIZE,
 };
 
 use core_parse::{find_field, scan_price_1e6, scan_u64, skip_byte};

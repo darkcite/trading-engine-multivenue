@@ -230,12 +230,58 @@ findings**. `universe.toml.example` committed at repo root.
   guard; release cli relinked. Worker pytest deliberately deferred to
   M1d (no worker-side change yet).
 
-**Interim state / next:** M1c = BN `run_multi` (one thread, N
-connections, per-connection keepalive+reconnect, one producer),
-`BINANCE_FUT_WS_HOST` (+ `.env.example`), BN discovery arm
-(exchangeInfo spot+fapi, byte-scanner + proptest + fuzz per house
-rule), spawn integration + ai-universe widening to the full BN set.
-M1d = worker fetch-seam seeding (`CLAUDE_WORKER_UNIVERSE_FILE`, no
-BaseConfig field — H3 seam precedent) + PM multi-market LIVE smoke
-(pitfall #11 — the multi-id subscribe has NOT yet seen the real
-venue) + full-universe boot + audit-replay + gates + M1 close entry.
+### M1c results (landed this session, all gates green)
+
+**Binance multi-symbol spot + USDS-M futures — code-complete.**
+- `ingress-binance::run_multi` + `MultiConn` (NEW): N single-stream
+  connections on ONE thread with ONE producer (single-writer law) —
+  per-slot Driver/keepalive/backoff, in-loop reconnects **due-time
+  paced at ONE blocking dial per poll iteration** (a flapping
+  endpoint cannot starve live slots; oldest-due first), per-slot
+  interest cache (no redundant `epoll_ctl`/`kevent`), D8
+  flap-vs-healthy backoff reset on activity, kill = drop socket +
+  jittered retry. The loop exits only on the stop flag; per-slot
+  failures never end the venue. Parser/`drive_one` byte-untouched.
+  Tests: two-steady-slots-one-producer (syms 42+7 through one ring)
+  + reconnect-pacing (exactly one dial per iteration, both slots
+  scheduled).
+- `cli::spawn_binance_multi` + `BinanceConnSpec` (NEW): resolves
+  every endpoint up front (spot host vs `BINANCE_FUT_WS_HOST`,
+  default `fstream.binance.com`; `.env.example` updated), builds the
+  slots, dials via `connect_tls` in the run_multi callback. The bin
+  picks the lane: **>1 BN instrument (or any usdm) ⇒ multi;
+  one-symbol boots keep the soak-proven single-stream lane
+  byte-identical** (both lanes live, no dead code; M3's always-on
+  soak can unify later).
+- **BN discovery arm** (mvp-plan "discovery audit"):
+  `ingress-binance::discovery::BnDiscovery` (NEW) — byte-scanner over
+  `exchangeInfo` bodies (spot `?symbol=` probes + the full
+  `/fapi/v1/exchangeInfo` page share one `"symbols":[…]` walker;
+  field-order-free, nested filters skipped structurally, escapes
+  rejected, rows cap 8192), 8 units + never-panics proptest + **NEW
+  fuzz target `binance_exchange_info` — 4.48 M execs / 60 s clean**.
+  `boot_discovery::run_bn`: spot per-symbol probe (HTTP 400 ⇒
+  MISSING `not_found`, not fatal — the venue 400s unknown symbols;
+  all other failures fatal), usdm membership+TRADING check against
+  the fapi page, 150 ms pacing; `run_all` gains the
+  `binance: Option<(&[String],&[String])>` arg — **config boots get
+  the audit, legacy flag boots keep their historical zero-REST BN
+  behavior** (`None`). Coverage gauge `bn` registered + set;
+  `engine_ingress_bn_coverage_configured` joins the §6.1 family.
+  New REST hosts in core-config: `BINANCE_REST_HOST`
+  (api.binance.com) / `BINANCE_FUT_REST_HOST` (fapi.binance.com).
+- ai-universe now spawn-aligned to the FULL BN set (spot + usdm).
+- Gates after M1c: workspace nextest **1139/1139** (+1 ignored);
+  release alloc **36/36 0 B/op** corrected guard; release cli
+  relinked; fuzz `binance_exchange_info` 4.48 M clean +
+  `universe_toml` 34.9 M clean (both this session);
+  `ruleset_json` 72.3 M standing untouched.
+
+**Remaining = M1d:** worker fetch-seam seeding
+(`CLAUDE_WORKER_UNIVERSE_FILE`, no BaseConfig field — H3 seam
+precedent; `import tomllib`) + worker pytest stay-green; then the
+pitfall-#11 LIVE smokes — the PM multi-id subscribe and the BN
+multi-connection lane (spot+usdm hosts) have NOT yet seen the real
+venues — via the full-universe boot on a real `universe.toml`;
+audit-replay every-venue-ticking check; market-map resolution for
+every observed sym; full gates; M1 close entry.

@@ -508,15 +508,6 @@ fn run(args: RunArgs) -> ExitCode {
         pairs = boot.allocated.pairs.len(),
         "universe resolved"
     );
-    // M1b interim: the multi-connection Binance lane lands in M1c —
-    // this build boots spot[0] only and says so loudly.
-    if boot.allocated.bn_spot.len() > 1 || !boot.allocated.bn_usdm.is_empty() {
-        warn!(
-            spot = boot.allocated.bn_spot.len(),
-            usdm = boot.allocated.bn_usdm.len(),
-            "binance multi-symbol/futures land in M1c; booting spot[0] only this build"
-        );
-    }
     let pm_ids: Vec<String> = boot
         .allocated
         .pm_tokens
@@ -556,12 +547,32 @@ fn run(args: RunArgs) -> ExitCode {
     // only) builds the discovery-gated symbol table. Any fetch/parse
     // failure is a fatal boot error in both paper and live mode — a
     // venue whose REST is down now would fail its WS subscribe anyway.
+    // M1: config-driven boots get the Binance exchangeInfo audit;
+    // legacy flag boots keep their historical zero-REST BN behavior.
+    let bn_spot_names: Vec<String> = boot
+        .allocated
+        .bn_spot
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_usdm_names: Vec<String> = boot
+        .allocated
+        .bn_usdm
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_discovery_arg: Option<(&[String], &[String])> = if boot.from_config {
+        Some((&bn_spot_names, &bn_usdm_names))
+    } else {
+        None
+    };
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
         boot.okx_spec.as_deref(),
         boot.deribit_spec.as_deref(),
         boot.hl_spec.as_deref(),
+        bn_discovery_arg,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -592,14 +603,8 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let bn_path = format!("/ws/{}@bookTicker", boot.allocated.bn_spot[0].name);
-    let bn_ep = match WssEndpoint::resolve(&cfg.binance_ws_host, 443, &bn_path) {
-        Ok(e) => e,
-        Err(e) => {
-            error!(error = ?e, "binance DNS failed");
-            return ExitCode::from(1);
-        }
-    };
+    // (Binance endpoint resolution happens at spawn below — the M1
+    // multi lane resolves per slot inside its thread.)
 
     // -- OKX boot config (Phase 8b; venue is opt-in) --
     // Host (+ optional :port) is now `cfg.okx_ws_host` (Phase 8e §9 —
@@ -701,11 +706,17 @@ fn run(args: RunArgs) -> ExitCode {
     // before any ingress thread spawns (the tables move into their
     // spawn calls below). Sorted strict-ascending, deduped; feeds
     // `spawn_ai` → `RulesetSidePath` (§4.2 rule-6 membership checks).
-    // M1b: spawn-aligned — every PM token + the Binance symbol this
-    // build actually boots (spot[0]; M1c widens to the full BN set).
+    // M1: spawn-aligned — every PM token + every Binance instrument
+    // (spot + USDS-M) this boot wires.
     let pm_syms: Vec<core_types::SymbolId> =
         boot.allocated.pm_tokens.iter().map(|t| t.sym).collect();
-    let bn_syms: Vec<core_types::SymbolId> = vec![boot.allocated.bn_spot[0].sym];
+    let bn_syms: Vec<core_types::SymbolId> = boot
+        .allocated
+        .bn_spot
+        .iter()
+        .chain(boot.allocated.bn_usdm.iter())
+        .map(|i| i.sym)
+        .collect();
     let ai_universe = cli::build_ai_universe(
         &pm_syms,
         &bn_syms,
@@ -805,6 +816,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.deribit.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_hyperliquid)
             .set(discovery.hl.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_binance)
+            .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
@@ -860,23 +873,78 @@ fn run(args: RunArgs) -> ExitCode {
     };
     handles.push(pm_handle);
 
-    let bn_handle = match spawn_binance(
-        bn_ep,
-        tls_config.clone(),
-        boot.allocated.bn_spot[0].sym,
-        bn_prod,
-        statuses.binance.clone(),
-        2,
-        &run_dir,
-        epoch_ns,
-        raw_tap_cfg.bn,
-        capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            error!(error = ?e, "binance: capture open failed");
-            join_reverse(handles);
-            return ExitCode::from(1);
+    // Binance: the legacy single-stream lane for one-symbol boots
+    // (byte-identical pre-M1, soak-proven), the M1 multi-connection
+    // lane whenever the universe wires more than one BN instrument.
+    let bn_total = boot.allocated.bn_spot.len() + boot.allocated.bn_usdm.len();
+    let bn_handle = if bn_total > 1 {
+        let mut specs: Vec<cli::BinanceConnSpec> = Vec::with_capacity(bn_total);
+        for inst in &boot.allocated.bn_spot {
+            specs.push(cli::BinanceConnSpec {
+                host: cfg.binance_ws_host.clone(),
+                path: format!("/ws/{}@bookTicker", inst.name),
+                sym: inst.sym,
+            });
+        }
+        for inst in &boot.allocated.bn_usdm {
+            specs.push(cli::BinanceConnSpec {
+                host: cfg.binance_fut_ws_host.clone(),
+                path: format!("/ws/{}@bookTicker", inst.name),
+                sym: inst.sym,
+            });
+        }
+        info!(
+            conns = specs.len(),
+            spot = boot.allocated.bn_spot.len(),
+            usdm = boot.allocated.bn_usdm.len(),
+            "binance: M1 multi-connection lane"
+        );
+        match cli::spawn_binance_multi(
+            specs,
+            tls_config.clone(),
+            bn_prod,
+            statuses.binance.clone(),
+            2,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.bn,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "binance: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        let bn_path = format!("/ws/{}@bookTicker", boot.allocated.bn_spot[0].name);
+        let bn_ep = match WssEndpoint::resolve(&cfg.binance_ws_host, 443, &bn_path) {
+            Ok(e) => e,
+            Err(e) => {
+                error!(error = ?e, "binance DNS failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
+        match spawn_binance(
+            bn_ep,
+            tls_config.clone(),
+            boot.allocated.bn_spot[0].sym,
+            bn_prod,
+            statuses.binance.clone(),
+            2,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.bn,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "binance: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
         }
     };
     handles.push(bn_handle);
