@@ -1052,3 +1052,411 @@ is OWED at operator discretion (not blocking); market-map.json still
 absent on the box (bootstraps on first live fetch). If context runs
 short: write interim state + exact resume point + relaunch prompt into
 docs/phase-8h-progress.md, then tell me.
+
+---
+
+## 2026-08-22 — Session H4 (design §13 item 4: strategist §7 in full + §8.1/§8.2 auto-promotion) — CLOSED
+
+Authority: the H4 kickoff above + design (LOCKED). RustRover MCP attached
+FIRST (`get_project_modules` OK). Session-start HEAD `76680db` (the H3
+commit), tree clean. Diff scope is exactly:
+`claude-worker/src/claude_worker/strategist.py` (NEW),
+`claude-worker/src/claude_worker/llm.py` (§7.2 surface growth),
+`claude-worker/src/claude_worker/daemon.py` (`ResearchCycle` + serve
+composition), `claude-worker/src/claude_worker/state.py`
+(`stage_ruleset` additive `model=`/`thesis=` + new
+`ruleset_attribution`), `claude-worker/tests/test_strategist.py` (NEW),
+`claude-worker/tests/test_research_cycle.py` (NEW), `CLAUDE.md`
+(operator-directed edit, below), this file. **`backtest.py` and
+`cli.py` are byte-untouched**; engine/strategy-vm/ingress/core/cli
+crates untouched (read-only law held); `conftest.py` and every frozen
+test file untouched; the committed backtest-real fixture untouched;
+`.env` untouched (`.env.example` already carried the §7.5 keys from H3
+— nothing to add).
+
+### NEW HARD OPERATOR REQUIREMENT (given in the H4 kickoff message)
+
+**When Stage 2 (8f + 8g + 8h) is FULLY implemented — at 8h/H6 close
+with the §12 exit criteria demonstrated — Claude must explicitly notify
+the operator that Stage 2 is complete, and must NOT start ANY Stage-3
+work (executor, risk/8i+, venue dispatchers, live ramp — no code, no
+plans, no designs) without his explicit confirmation.** Recorded here,
+in CLAUDE.md's CURRENT STATE, and in Claude's persistent memory; the H5
+and H6 kickoff prompts carry it forward.
+
+### H3 interpretation review — all TWELVE UPHELD (kickoff first task)
+
+The twelve H3 calls concern fetchers/map ownership; H4 consumes them
+read-only. Specifically upheld by use: #1 (descriptors = map names —
+the strategist digest lists map names verbatim), #2 (config-seam env
+reads — the two strategist keys follow the same seam pattern, NOT
+BaseConfig fields), #5 (lazy client — untouched), #9 (feature-file
+names — the digest globs `<run>/*.json`, which picks up `-ohlcv`/`-meta`
+beside replay-derived files by construction). None amended.
+
+### What was built
+
+- **`llm.py` (§7.2 growth, additive):** `Completion` NamedTuple (text +
+  `message.usage` token fields), `complete_message(client, model,
+  prompt, *, max_tokens, system=None)` — `system` content blocks are
+  passed to the SDK ONLY when provided, so every pre-8h call shape (and
+  the conftest FakeClient's keyword-only `create(model=, max_tokens=,
+  messages=)`) is untouched by construction; absent/bool/negative usage
+  fields read as 0 (labeling.py numeric discipline). `complete` now
+  delegates (same behavior); `STRATEGIST_MAX_TOKENS = 4096` lands (the
+  llm.py "sets its own" note comes due). Frozen `test_llm` pins hold.
+- **`strategist.py` (NEW, §7 in full):** §7.5 env readers (strict parse;
+  interval ≥ 1, cap ≥ 0 with 0 = legal kill switch); the STATIC system
+  block (grammar §4.1 exact — the 8-key row shape with `sym`/`side` and
+  structured `trigger`, families/sides enums, validator-rule mirrors,
+  tighten-only caps 100/250/1000, the backtest gates, output contract,
+  worked example) marked `cache_control: {type: ephemeral}`; DYNAMIC
+  digest builder (market map + observed universe + `<run>/*.json`
+  feature files + news NDJSON tail oldest→newest + H5 performance seam),
+  char-capped at `STRATEGIST_INPUT_CAP = 24_000` (TEXT_CAP precedent),
+  deterministic for identical files (the dedupe key rides on it);
+  proposal + revision user-prompt builders (revision carries prior rows
+  + gate summary + report text per §7.4); §7.3 STRICT structural parse
+  (exact key sets, bool-rejecting types, enums, published domain
+  bounds, trigger-shape rules incl. the rule-6 mirrors `ref != sym` /
+  no-`ref`-on-`level_breach`; >256 rows = oversized = malformed);
+  canonical artifact writer (`{"rows":[...]}` compact, fixed key order
+  — thesis stays OUT: the engine validator is unknown-key-strict);
+  candidates-dir writers (atomic tmp+`os.replace`; `<utc-ts>-<hash128>
+  .json` / `<utc-ts>.rejected.json`); §8.1 `install_candidate` (atomic
+  `$AI_RULESET_DIR/<hash128>.json`); §7.5 ledger arithmetic
+  (`utc_day_start_ns`, `calls_today` over `kind='strategist_call'`,
+  `call_detail` JSON with model/usage/cache-read flag/purpose);
+  `call_with_cache` — the ONE background-thread entry point: own State
+  handle, `prompt_cache` table only, through the pinned
+  `cached_complete` seam verbatim.
+- **`state.py` (§8.2, additive):** `stage_ruleset` gains keyword-only
+  `model=None`/`thesis=None` writing the pre-provisioned columns with
+  COALESCE preservation (a restage WITHOUT attribution — e.g. H5's
+  restage-prior through the frozen pair — never erases it; explicit
+  values overwrite). `ruleset_row` stays the pinned 7-tuple; the new
+  `ruleset_attribution(hash)` reads the pair. Every existing call site
+  byte-unchanged (signature-pinned by test).
+- **`daemon.py` (§7.4/§7.6/§8.1/§9):** `ResearchCycle` collaborator —
+  idle→fetch→call→(revision)→promote state machine spanning 0.2 s
+  ticks; due-check once per tick in idle only (cycles never overlap ⇒
+  ≤1 in-flight background job); `ThreadPoolExecutor(max_workers=1)`
+  created in serve (threads spawn lazily — a serve run whose cycle
+  never comes due starts zero threads); the bg worker runs ONLY the
+  fetch subprocess and `call_with_cache`; frames + events-ledger rows
+  stay on the serve-loop thread; backtest subprocess inline on the
+  serve thread; promote = install (at gates-pass time) → FROZEN
+  `backtest.stage_ruleset(..., "auto")` → `state.stage_ruleset`
+  attribution upsert → FROZEN `commit_ruleset`, then the `promotion`
+  event; `serve()` composes it beside the watcher with additive
+  `research_*` test-seam kwargs; shutdown adds
+  `executor.shutdown(wait=False, cancel_futures=True)` (§9 drain).
+  `MODEL_STRATEGIST` gets its first consumer (the serve-built
+  completion seam binds it + `STRATEGIST_MAX_TOKENS`).
+
+### Numbered H4 interpretation calls (H5 review welcome; all pinned by tests)
+
+1. **Attribution route keeps `backtest.py` byte-frozen:** design §8.1
+   spells the frozen pair WITHOUT attribution params and §8.2 gives
+   them to `state.stage_ruleset` — so promote calls the frozen
+   `backtest.stage_ruleset` (frame + registry row), then
+   `state.stage_ruleset` AGAIN with `model=`/`thesis=` (attribution
+   upsert, no frame, refreshes `staged_ts` before the commit — order:
+   stage → attribute → commit), then the frozen `commit_ruleset`. The
+   alternative (additive optional params on `backtest.stage_ruleset`)
+   was rejected to keep the frozen surface literally byte-identical.
+2. **COALESCE attribution semantics** (state.py above): None preserves,
+   value overwrites — H5's restage-prior keeps the original author.
+3. **`ruleset_row` stays a 7-tuple** (pinned by the frozen lifecycle
+   test); attribution reads via the NEW `ruleset_attribution`.
+4. **Cadence primes at serve start: first cycle due at t0 + interval.**
+   Keeps every frozen daemon test hermetic (clock 0 / short runs never
+   fire) and makes serve restarts budget-safe; the SQLite dedupe
+   additionally makes any repeated inputs zero-API-cost. Interval + cap
+   env keys are read ONCE at composition (strict parse fails the boot,
+   the ServeConfig fail-fast pattern) — "checked once per tick" is the
+   DUE check, watcher-style.
+5. **The §7.4 in-cycle fetch = `claude-worker fetch --news` as a
+   SUBPROCESS on the bg worker** (entry script beside the interpreter —
+   the `test_session_scripted` invocation pattern; 180 s timeout).
+   Rationale: the verb surface is frozen, `fetch` never touches the
+   socket (no exit-4 collision with serve), cli.py↔daemon.py stay
+   acyclic, and WAL already legalizes cross-process DB use. Fetch
+   failure = counted degradation, cycle proceeds on existing files
+   (REST is best-effort enrichment, §6.1 doctrine). Injectable seam
+   (`research_fetch_fn`).
+6. **Budget check is serve-side, BEFORE submit** (the events ledger is
+   serve-thread-only under §7.6). Consequence: an at-cap cycle skips
+   without consulting the dedupe cache — conservative, recorded.
+7. **A SQLite-dedupe hit writes NO `strategist_call` row** (zero API
+   cost ⇒ zero budget burn); the ledger's `cache_read` flag refers to
+   ANTHROPIC prompt-cache reads (`usage.cache_read_input_tokens > 0`).
+8. **Daily ceiling window = the current UTC calendar day** (consistent
+   with the harness's UTC `trading_days`).
+9. **Freshness = latest `run-*` NAME differs from the last cycle's**,
+   held in memory for the serve lifetime; a restart re-runs one cycle
+   and the dedupe absorbs it. Skip event kind:
+   `strategist_capture_skip` (parallel to the design-named
+   `strategist_budget_skip`).
+10. **§7.3 parse is STRUCTURAL-only** (exact keys/types/enums/published
+    bounds + the two cheap rule-6 mirrors); the semantic families
+    (universe membership, duplicates, cap Σ walks) remain the harness
+    validator's — no second deep parser to drift (§3.5 doctrine).
+11. **`BacktestError` (untrusted report / validator reject) is
+    candidate-fatal: NO revision call** — §7.4's revision carries "gate
+    summary + report", which only a trustworthy gates-FAIL possesses.
+    Event `strategist_candidate_rejected` reason `backtest_error`.
+12. **Candidate artifact carries rows only**; the thesis persists via
+    the registry column (and the raw response sits in `prompt_cache`) —
+    recoverable, never validator-visible.
+13. **Candidates dir = `CLAUDE_WORKER_DB` parent / `candidates`** (≡ the
+    §14-pinned `~/multivenue/worker/candidates/` under defaults;
+    test-local under a tmp db; no new env key).
+14. **The §8.4 `promotion` event lands in H4** with the promote step it
+    describes (H5 adds the rollback kinds).
+15. **Promote waits for the engine:** gates-pass installs immediately;
+    Stage/Commit wait for a live connection and retry on `UdsError`
+    (Stage supersede semantics make retries idempotent). A pending
+    promote blocks SUBSEQUENT cycles until delivered — single-candidate
+    discipline, visible via stats/events.
+16. **SIGTERM drain nuance vs §9's "thread daemonized":**
+    `ThreadPoolExecutor` threads are not literally daemonic;
+    `shutdown(wait=False, cancel_futures=True)` returns serve
+    immediately and abandons the future — a truly in-flight SDK call
+    bounds process exit by the SDK's own request timeout. Recorded as
+    the §9-faithful mechanism on CPython 3.14.
+17. **Additive event kind `strategist_call_failed`** for API/transport
+    failures of the call itself (§5.1 no-crash doctrine: counted event,
+    cycle over, serve survives).
+18. **`ServeStats` untouched; research counters live in the new
+    `ResearchStats`** (exposed via `serve(research_stats_out=)`).
+
+### Tests added (+79 Python; frozen 202 + H2/H3 suites untouched; NO live SDK)
+
+- `tests/test_strategist.py` (63): §7.5 env strict-parse matrices;
+  system-block static/cache_control content pins; digest sections +
+  determinism + char-cap + static/dynamic split; revision-prompt
+  content; §7.3 parse — good 2-row (canonical key order), 12 top-level
+  malformed shapes, 25 row-level malformed shapes (missing/unknown key,
+  name len/ascii, enums, bool-sneaks, fractional `edge_bps`, domain
+  bounds, trigger-shape rules, `ref == sym`), oversized 257 vs 256;
+  candidate write (name = `<utc-ts>-<hash128>.json`, hash == the frozen
+  `ruleset_hashes` recomputation, rows-only body, no `.tmp` residue);
+  `.rejected` archive; §8.1 install (atomic, idempotent re-install);
+  candidates-dir derivation; `utc_day_start_ns`/`calls_today` UTC-day
+  arithmetic (other kinds excluded); `call_detail` field-exact incl.
+  cache-read flag both ways; `call_with_cache` miss→hit (zero API cost,
+  static blocks ride the call, second handle open = WAL legality) +
+  version scoping (`strategist-v0` seed must miss); llm surface —
+  usage returned, system passed-through when given and ABSENT when
+  None, bool/negative usage zeroed, `STRATEGIST_MAX_TOKENS == 4096`;
+  §8.2 — signature keyword-only defaults pinned, attribution
+  written/preserved/overwritten with `ruleset_row` 7-tuple intact.
+- `tests/test_research_cycle.py` (16): first-due-after-interval;
+  capture-skip (no runs + stale run, event details exact, no call);
+  budget cap 0 kill switch (event detail exact, zero calls);
+  yesterday's ledger rows don't count / today's 12 do; restart-dedupe
+  (fresh instance, identical inputs ⇒ replayed response, zero calls, no
+  new ledger row, flow still parses); call-failure event (no crash, no
+  frames); `BacktestError` ⇒ no revision, no install, no frames;
+  fetch-failure counted + cycle proceeds + fetch provably on the bg
+  thread; **revision-call cap** (exactly 2 calls, revision prompt
+  carries FAILED + gate summary + report + prior rows, final archive
+  event, both reports in the candidates dir, ledger purposes
+  [proposal, revision], no install, no frames); **full promotion**
+  against FakeUdsServer (bg-thread seam ident-checked, cache_control
+  blocks on the call, install byte-equal at
+  `$AI_RULESET_DIR/<hash128>.json`, frames = Heartbeat→Stage→Commit
+  with px/qty == hash128 LE halves + VENUE_AI + slot-5, registry
+  staged+committed `author_mode='auto'`, attribution ==
+  (claude-fable-5, thesis), ledger + promotion event details exact);
+  promote-waits-for-connection (install early, zero frames while down,
+  delivery after connect); **serve-level composition** (monkeypatched
+  system-capable fake at the llm seam, synthetic 0.5 s/tick clock,
+  interval 1 s: one cycle, one Fable-5 call with system blocks + the
+  4096 budget, Stage before Commit on the serve connection, install +
+  attribution + committed registry + ledger row — §9's composition
+  proven inside the real loop).
+
+### Gates at close (all on the Mac; MCP terminal, nohup+poll)
+
+- worker pytest **326** green, 0 skipped (202 frozen + 2 real-harness
+  RAN with the release binary on PATH + 43 H3 fetchers + 79 new).
+  **326 is the new stay-green.**
+- workspace nextest **1081/1081**, 1 skipped (the `#[ignore]` regen) —
+  untouched-green, zero Rust changes this session.
+- release alloc **36/36** 0 B/op `--test-threads=1` with the corrected
+  guard: `cargo clean -p bench --release` (`Removed 15 files`) + a
+  fresh `Compiling bench` verified in `/tmp/8h-h4-alloc.log`.
+- `cargo build --release -p cli` Finished 0.18 s (no Rust changes; the
+  H3-built binary stands — G0 law satisfied for the pytest PATH run).
+- Fuzz untouched (kickoff law): all new parsing is strict Python JSON
+  over MODEL output (labeling.py precedent) — no Rust untrusted-bytes
+  parser exists or was hand-rolled.
+
+### Hygiene
+
+- Cargo/pytest on the Mac ONLY (pitfall #10; the Linux sandbox ran
+  read-only file inspection + `py_compile` syntax checks only — never a
+  gate). No engine boots, no live sockets beyond the FakeUdsServer
+  fixture, no live SDK calls anywhere. `ANTHROPIC_API_KEY` is still
+  read nowhere outside serve (the strategist seam is built in
+  `daemon.serve` from the one llm client; the Base/Serve split tests
+  stayed untouched-green).
+- No git op until the authorized closing commit. Push anomaly:
+  unchanged posture; no fetch/push.
+- **CLAUDE.md edited this session — deliberately, two causes:** (a) the
+  NEW hard operator requirement above (operator-directed, belongs in
+  front-loaded context); (b) the H2-noted stale alloc-guard text
+  (`cargo clean -p bench` → `--release`) fixed as the rider H2's entry
+  scheduled "at the next phase-boundary edit"; plus the CURRENT STATE
+  block refreshed to H4-close truth (baselines, next session = H5).
+  The authority chain (latest progress entry wins) is unchanged.
+- The H3 §6.1 live fetch smoke remains OWED at operator discretion.
+  The strategist's own live proof is H6's (one real budget-capped
+  Fable-5 serve cycle, per design §13.6) — nothing live ran in H4, by
+  scope.
+- `market-map.json` still absent on the box (bootstraps on first live
+  fetch — unchanged).
+
+### Resume point
+
+Item 4 CLOSED (this commit). Next session H5 = design §13 item 5:
+rollback (§8.3 monitor + trigger + restage-prior + §8.4 events). The
+H5 kickoff prompt below is ready to paste; it opens with the mandatory
+review of the eighteen H4 interpretations above.
+
+---
+
+## H5 kickoff prompt (paste verbatim into a fresh session)
+
+8h implementation — SESSION H5 (design §13 checklist ITEM 5 ONLY:
+rollback — §8.3 walk-forward monitor + trigger + restage-prior + §8.4
+events; H6 close/live-demo is NOT this session — do NOT start it),
+MAIN CHECKOUT /Users/darkcite/trading-engine-multivenue. Stage-2
+status: 8f/8g CLOSED; 8h H0 design LOCKED, H1 CLOSED, H2 CLOSED, H3
+CLOSED, H4 CLOSED — HEAD = the H4 commit (strategist.py + serve
+research_cycle live: 6 h Fable-5 cycle on a 1-worker bg executor,
+prompt caching + SQLite dedupe via cached_complete, §7.5 budget ledger
+kind='strategist_call' + strategist_budget_skip/strategist_capture_skip
+/strategist_candidate_rejected/strategist_call_failed events,
+candidates dir db-parent/candidates, §7.3 strict structural parse,
+promote = atomic install → FROZEN backtest.stage_ruleset("auto") →
+state.stage_ruleset attribution upsert (model=/thesis= COALESCE) →
+FROZEN commit_ruleset → 'promotion' event; backtest.py + cli.py
+byte-untouched; ruleset_row stays a 7-tuple, attribution reads via
+state.ruleset_attribution). Baselines NOW: worker pytest **326** green
+0 skipped with the release binary on PATH (202 frozen UNTOUCHABLE + 2
+real-harness + 43 fetchers + 79 H4; 326 is the stay-green), workspace
+nextest 1081/1081 (+1 ignored fixture-regen), release alloc 36/36
+0 B/op (`--test-threads=1`; guard: `cargo clean -p bench --release` +
+fresh `Compiling bench` in-log), fuzz `ruleset_json` 72.3M clean
+(untouched unless you hand-roll a Rust untrusted-bytes parser — you
+must not). NO push, NO rebase, NO history rewrite, NO branches, NO git
+ops without operator ask (ONE closing commit IS authorized; one-line
+status after). Do NOT touch `.env`. Notes go ONLY to
+docs/phase-8h-progress.md (H5 entry: interpretation-review verdicts,
+decisions, tests, gates, hygiene, resume point + H6 kickoff prompt).
+Verify get_project_modules against the main checkout FIRST; stop if no
+attach. **HARD OPERATOR REQUIREMENT (standing, recorded H4): when
+Stage 2 (8f+8g+8h) is FULLY implemented — at H6 close with the §12
+exit criteria demonstrated — explicitly notify the operator that
+Stage 2 is complete, and do NOT start ANY Stage-3 work (executor,
+risk/8i+, dispatchers, live ramp — code, plans, or designs) without
+his explicit confirmation. H5 does not trigger the notification (H6
+does), but carry the requirement into the H6 kickoff prompt.**
+FIRST TASK, before any code: review the EIGHTEEN H4 interpretations in
+the H4 entry of docs/phase-8h-progress.md — uphold or amend each,
+explicitly, in the H5 entry (amendments must not break the frozen
+worker contract or the H4 tests without stating why). REQUIRED
+READING, in order: (1) docs/phase-8h-design.md §8.3 ENTIRE (the
+trigger table: walk-forward re-backtest of the ACTIVE ruleset,
+trailing 24 h of capture target with a 6 h FLOOR — below floor the
+monitor SKIPS with monitor_skip_insufficient_data, it never guesses;
+metric = net_pnl_usd ≤ −$100 OR max_drawdown_usd ≥ $200 from a
+`--split 0/100` all-OOS run — plain run_backtest(split="0/100")
+passthrough, ZERO worker-code change to backtest.py; action = (1)
+disable --strategy 5 equivalent through the commander path, (2)
+restage + commit the PRIOR gates-passed committed hash from the
+registry — artifact still installed by construction; no prior ⇒
+disable only + rollback_no_prior; cadence = every research cycle +
+once shortly after every promotion as the arm check; D3a semantics:
+disable flips the mask bit, the table persists, restaging the prior
+then commit flips back to known-good rows) + §8.4 (event kinds:
+rollback_triggered WITH metric values, rollback_no_prior,
+monitor_skip_insufficient_data; 'promotion' already landed in H4) +
+§8.5 (the forced-underperformance demo definition — H6 EXECUTES it,
+but H5 must leave the seams the demo needs: operator-selectable
+monitor window inputs) + §12 monitor test rows (threshold arithmetic
+BOTH arms, window floor skip, action ordering disable BEFORE restage,
+no-prior fallback, event rows); (2) docs/phase-8h-progress.md H4 entry
+(the 18 interpretations + what ResearchCycle already owns — the
+monitor is a new step INSIDE the existing cycle state machine, §8.3
+cadence row); (3) claude-worker/src/claude_worker/ daemon.py
+(ResearchCycle — the monitor slots in as a cycle step + a
+post-promotion arm check; UDS sends ONLY on the serve-loop thread —
+the disable/restage/commit frames ride exactly the promote path's
+client discipline; note interpretation #15: a pending promote blocks
+subsequent cycles — decide and record how the monitor interacts with
+that), state.py (registry queries — you will likely need an additive
+accessor for "latest committed hash" and "prior gates-passed committed
+hash"; ruleset_row stays a 7-tuple, the frozen lifecycle test pins
+it), backtest.py (READ-ONLY — run_backtest(split=) is a passthrough
+string and §3.4 carved 0/100 exactly for this; stage/commit pair
+frozen; you must NOT edit this file), strategist.py (event-kind
+constants live here; add the three §8.4 kinds beside them),
+frames.py (KIND_DISABLE_STRATEGY, STRATEGY_SLOT_VM = 5); (4)
+docs/prompts/ai-session.md §4 step 10 (the manual rollback the auto
+path mirrors); (5) docs/risk-policy.md (the −$100 = ½ the $200/day
+kill line rationale — thresholds are code constants, never prompts).
+H5 SCOPE (item 5, nothing more): monitor implementation inside
+ResearchCycle (or a sibling collaborator it owns) — select the
+trailing-window capture input for the ACTIVE ruleset's re-backtest
+(design §8.3 window row: trailing 24 h target / 6 h floor of CAPTURE;
+the harness merges runs under --replay-dir, so H5 must RESOLVE the
+window-selection mechanism against the run-dir layout and RECORD the
+interpretation — a floor-check over run epochs + a temp dir of
+selected runs, or an equivalent that keeps backtest.py untouched),
+run_backtest(active_ruleset_path, window_dir, split="0/100") inline,
+threshold check (net ≤ −100.0 OR dd ≥ 200.0, constants in code),
+trigger action ordering: disable-5 frame FIRST (through the serve
+uds_client, KIND_DISABLE_STRATEGY strategy_id=5 sym NONE venue AI —
+mirror the push verb's wire shape), THEN restage+commit the prior
+gates-passed committed hash via the FROZEN pair (attribution untouched
+— interpretation #2's COALESCE covers it), no-prior ⇒ disable only +
+rollback_no_prior event; rollback_triggered event carries the metric
+values; monitor_skip_insufficient_data on floor-breach; arm check once
+shortly after every promotion (§8.3 cadence row); the §7.1 digest
+"performance" seam may now feed the ACTIVE ruleset's latest
+walk-forward report into the strategist digest (design §7.1 — the
+parameter already exists); events + stats additive. TESTS (additive;
+326 stays green; design §12 monitor rows): threshold arithmetic both
+arms (boundary values exact), window floor skip + event, action
+ordering (disable frame BEFORE the Stage frame — FakeUdsServer frame
+order), no-prior fallback (disable only + event), rollback_triggered
+event detail carries net/dd values, restage-prior preserves
+attribution (#2), monitor frames on the serve-loop thread only,
+post-promotion arm check fires, insufficient-capture floor math over
+run epochs, and the existing H4 promotion tests stay byte-green.
+GREEN GATES to close: worker pytest 326 + new ALL green (release
+binary on PATH), workspace nextest 1081/1081 untouched-green, release
+alloc 36/36 `--test-threads=1` corrected guard, `cargo build --release
+-p cli` links (no Rust changes expected). LANDMINES: Mac-only
+cargo/pytest (pitfall #10); RustRover MCP ≤45 s window — nohup >
+/tmp/8h-h5-*.log & then poll, `sleep N` inside the polled command
+counts against the window; zsh eats bare ===; full `import x` only;
+engine/strategy-vm/ingress/core/cli crates READ-ONLY (claude-worker +
+docs only); backtest.py + cli.py stay byte-untouched (H4 precedent —
+attribution/monitor both live outside them); the 7-verb surface
+FROZEN; do NOT touch the committed backtest-real fixture; conftest.py
++ every frozen test file untouchable; ANTHROPIC_API_KEY never read
+outside serve. SESSION FACTS: projectPath
+/Users/darkcite/trading-engine-multivenue; macOS: AF_UNIX sun_path
+cap, SO_RCVTIMEO EINVAL on peer-closed UDS, std::thread::scope panic
+hangs without StopOnDrop, sample <pid> for hangs; push anomaly KNOWN
+(38e599b → f2b3742 across H0): record, never act; the H3 §6.1 live
+fetch smoke is OWED at operator discretion (not blocking);
+market-map.json still absent on the box; the strategist's live proof
+(one real budget-capped Fable-5 serve cycle) is H6's demo, not H5's.
+If context runs short: write interim state + exact resume point +
+relaunch prompt into docs/phase-8h-progress.md, then tell me.

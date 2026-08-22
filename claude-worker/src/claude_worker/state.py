@@ -193,13 +193,16 @@ class State:
 
     # ---- ruleset registry (§5.3; consumers arrive with item 12) ----
 
-    def stage_ruleset(
+    def stage_ruleset(  # noqa: PLR0913 — registry row fields, deliberately
         self,
         full_hash: str,
         path: str,
         report_path: str,
         author_mode: str,
         ts: int | None = None,
+        *,
+        model: str | None = None,
+        thesis: str | None = None,
     ) -> None:
         """Record a gate-passed ruleset as STAGED (§6 stage-ruleset).
 
@@ -210,6 +213,14 @@ class State:
         stub's staged/committed state machine mirrors this: a new Stage
         supersedes an old Commit). ``author_mode`` rides the §8.7
         attribution column ('session' from verbs, 'auto' from serve).
+
+        8h §8.2 (additive): optional ``model``/``thesis`` fill the
+        pre-provisioned attribution columns — the registry's answer to
+        "who wrote the live table and why". ``None`` PRESERVES any
+        existing value (COALESCE): a later restage through the frozen
+        pair — e.g. the §8.3 rollback restaging a prior hash — never
+        erases the original attribution. Every pre-8h call site is
+        byte-unchanged.
         """
         if author_mode not in ("auto", "session"):
             raise StateError(f"author_mode must be 'auto' or 'session': {author_mode!r}")
@@ -217,14 +228,32 @@ class State:
         with self._conn:
             self._conn.execute(
                 "INSERT INTO rulesets"
-                " (hash, path, report_path, gates_passed, author_mode, staged_ts, committed_ts)"
-                " VALUES (?, ?, ?, 1, ?, ?, NULL)"
+                " (hash, path, report_path, gates_passed, author_mode, model, thesis,"
+                "  staged_ts, committed_ts)"
+                " VALUES (?, ?, ?, 1, ?, ?, ?, ?, NULL)"
                 " ON CONFLICT(hash) DO UPDATE SET"
                 " path = excluded.path, report_path = excluded.report_path,"
                 " gates_passed = 1, author_mode = excluded.author_mode,"
+                " model = COALESCE(excluded.model, rulesets.model),"
+                " thesis = COALESCE(excluded.thesis, rulesets.thesis),"
                 " staged_ts = excluded.staged_ts, committed_ts = NULL",
-                (full_hash, path, report_path, author_mode, stamp),
+                (full_hash, path, report_path, author_mode, model, thesis, stamp),
             )
+
+    def ruleset_attribution(self, full_hash: str) -> tuple[str | None, str | None] | None:
+        """The §8.2 attribution pair ``(model, thesis)`` for one registry
+        row, or None when the hash is unknown. Kept OFF [`ruleset_row`]
+        — its 7-tuple shape is pinned by pre-8h tests."""
+        row = self._conn.execute(
+            "SELECT model, thesis FROM rulesets WHERE hash = ?",
+            (full_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (
+            None if row[0] is None else str(row[0]),
+            None if row[1] is None else str(row[1]),
+        )
 
     def ruleset_row(
         self, full_hash: str

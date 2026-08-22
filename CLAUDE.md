@@ -14,12 +14,13 @@ A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that ex
 - **Stage 1 (8a–8e) DONE**, G1 soak blessed 2026-08-15 (history: `docs/arch/phase-8-progress.md`).
 - **Stage 2:** 8f CLOSED (`7ca91be`) · 8g CLOSED (`39e6542`, G7) · **8h IN PROGRESS**.
 - **8h = autonomous research loop** (last Stage-2 phase): `data_fetcher` completion + strategist (Fable 5) + REAL `multivenue-engine backtest` harness + gates + auto-promotion + rollback. Exit criteria: Fable-5-authored ruleset auto-promoted after passing backtest, trading in paper, AND a forced-underperformance rollback demonstrated.
-- **Session H0 (2026-08-16, design-only) COMPLETE**: `docs/phase-8h-design.md` written, decisions **H-D1…H-D8 LOCKED** (strict-cross fill model, full-auto promotion, walk-forward rollback, 6 h strategist cadence ≤2 Fable-5 calls/cycle, full REST scope, multileg design-only, data_fetcher owns market-map, both-sides integration tests). Zero code ran in H0.
-- **NEXT SESSION = H1.** The verbatim H1 kickoff prompt is the section **"H1 kickoff prompt (paste verbatim into a fresh session)"** in `docs/phase-8h-progress.md` — paste it into the fresh session. H1 scope: `Cmd::Backtest` skeleton on the cli binary, hold-model only (fill model is H2 — do not start it); engine/strategy-vm/ingress/core crates READ-ONLY in H1 (cli additions only).
+- **8h sessions:** H0 design LOCKED (**H-D1…H-D8**, all option (a)) · H1 harness substrate CLOSED (`3ad40a9`) · H2 §4 fill/fee/latency model CLOSED (`1ed6017`) · H3 data_fetcher §6 CLOSED (`76680db`) · **H4 strategist §7 + §8.1/§8.2 auto-promotion CLOSED (this commit)** — `strategist.py` + serve `research_cycle` live: 6 h Fable-5 cycle, prompt caching + SQLite dedupe, budget ledger, candidates dir, gates-pass ⇒ atomic install ⇒ frozen stage/commit (`author_mode="auto"`, attribution columns). Remaining: **H5 = rollback (§8.3–§8.5)**, **H6 = close + live demo**.
+- **NEXT SESSION = H5.** The verbatim H5 kickoff prompt is the last section of `docs/phase-8h-progress.md` — paste it into the fresh session. H5 scope: the §8.3 walk-forward monitor + rollback trigger + restage-prior + §8.4 events ONLY (H6 is the close/demo).
+- **HARD OPERATOR REQUIREMENT (2026-08-22): when Stage 2 (8f+8g+8h) is FULLY implemented — i.e. at 8h/H6 close with the §12 exit criteria demonstrated — explicitly notify the operator that Stage 2 is complete, and do NOT start ANY Stage-3 work (executor, risk/8i+, venue dispatchers, live ramp — code, plans, or designs) without his explicit confirmation.**
 - **Authority chain for 8h:** `docs/prompts/8h-kickoff.md` (frozen H0 prompt) → `docs/phase-8h-design.md` (LOCKED) + the **latest entry in `docs/phase-8h-progress.md`** supersedes the committed plan where they conflict.
-- **Frozen contract:** `claude-worker/src/claude_worker/backtest.py` — argv `multivenue-engine backtest --ruleset R --replay-dir D --split 70/30`, schema-1 JSON on stdout, GateThresholds numbers; 202 worker tests pin it. **The harness conforms to the worker, never vice versa.** The 8g §5.1 fake-binary shim seam is RETIRED by the real subcommand.
-- **Baselines at 8g close** (carried through H0 — nothing ran): alloc gates 36/36 0 B/op (`--test-threads=1`), workspace nextest 1029/1029, worker pytest 202, fuzz `ruleset_json` 72.3M runs / 301 s clean.
-- **Working tree:** H0 docs (`phase-8h-design.md`, `phase-8h-progress.md`, `prompts/8h-kickoff.md`, `options-support-plan.md`) + the 2026-08-22 doc-reorg (this file, `docs/arch/`) are uncommitted by operator decision — fold into H1 commit 1 (8g-G0 precedent). **Push anomaly KNOWN and MOVED** (origin/main divergence observed H0): record, never act.
+- **Frozen contract:** `claude-worker/src/claude_worker/backtest.py` — argv `multivenue-engine backtest --ruleset R --replay-dir D --split 70/30`, schema-1 JSON on stdout, GateThresholds numbers; the frozen 202 worker tests pin it (suite now larger, the 202 stay untouchable). **The harness conforms to the worker, never vice versa.** `backtest.py` itself was byte-untouched through H4 (attribution rides `state.stage_ruleset`'s additive params).
+- **Baselines at H4 close:** workspace nextest 1081/1081 (+1 ignored fixture-regen), release alloc 36/36 0 B/op (`--test-threads=1`), worker pytest 326 (202 frozen + 2 real-harness + 43 fetchers + 79 strategist/research; 326 is the stay-green), fuzz `ruleset_json` 72.3M clean (untouched — no new Rust untrusted-bytes parser exists).
+- **Push anomaly KNOWN** (origin/main divergence observed H0): record, never act.
 - **Git discipline:** NO push, NO rebase, NO history rewrite, NO new branches, NO git ops without operator ask. Do NOT touch `.env`.
 - 8h session notes go ONLY to `docs/phase-8h-progress.md`. If context runs short: write interim state + exact resume point + relaunch prompt there, then tell the operator.
 
@@ -47,7 +48,8 @@ cargo fuzz run polymarket_clob_frame -- -max_total_time=300
 # --test-threads=1 is REQUIRED: CountingAllocator is process-global;
 # parallel threads pollute each other's AllocGuard deltas (or use `make alloc-assert`)
 # False-green guard: confirm a fresh `Compiling bench` in the log, or
-# `cargo clean -p bench` and rerun.
+# `cargo clean -p bench --release` and rerun (H2 correction: plain
+# `-p bench` does NOT remove the release test bin on this toolchain).
 cargo test -p bench --test alloc_assertions --release -- --test-threads=1
 
 # criterion benches
