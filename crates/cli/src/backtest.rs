@@ -7,7 +7,7 @@
 //! trustworthy report was printed. **The harness conforms to the
 //! worker, never vice versa.**
 //!
-//! What this H1 slice does (design §13 item 1):
+//! What this module does (design §13 items 1 + 2):
 //!
 //! * capture discovery — one `run-<epoch_ns>` dir or a log root of
 //!   `run-*` children, epoch-ordered, dir-name epochs cross-checked
@@ -21,14 +21,17 @@
 //!   REUSED `ingress_ai::validate_ruleset` (§3.5 — no second parser);
 //! * the real `strategy_vm::VmStrategy` driven through the real
 //!   injection paths: inherent `receive_table` (copy #2 seam) + a
-//!   synthesized `RulesetCommit` through `on_ai`, then `on_tick` per
-//!   merged record with a [`BacktestCtx`] virtual clock (§3.6);
+//!   synthesized `RulesetCommit` through `on_ai`, then per merged
+//!   record `on_tick` with a [`BacktestCtx`] virtual clock and the
+//!   synthesized fills fed back through `on_fill` (§3.6);
+//! * the §4 fill / fee / latency model + accounting ([`fill`], H2):
+//!   strict-cross maker fills over a preallocated open-order table
+//!   (4/sym, 32 total), per-venue Δ activation, maker fees, i64×1e6 /
+//!   i128×1e12 fixed-point books, §3.4 order-emit bucketing, OOS
+//!   equity/drawdown, end-of-replay mark-out, §4.6 observed bounds;
 //! * schema-1 stdout, byte-exact and fixed-point-rendered (§5), with
-//!   **hold-model** accounting: no fills are synthesized yet, so the
-//!   `oos` section is all zeros and only `bounds.max_order_notional_usd`
-//!   is live (observed over the FULL window per §4.6). The §4 fill /
-//!   fee / latency model lands in H2 — the model flags are declared
-//!   and parsed here, but explicitly unused.
+//!   the REAL `oos` numbers; optional `--emit-detail` sidecar (JSON,
+//!   `detail_version` 1 — operator surface, never worker-parsed).
 //!
 //! ## Doctrine note — this module ALLOCATES
 //!
@@ -37,18 +40,25 @@
 //! timelines are copied out of the mmap'd capture, ~80 B per tick).
 //! Nothing here is reachable from a hot path.
 
+pub mod fill;
+
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Order, RuleTable, Tick, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_VM,
-    SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleTable, Tick, VenueId, AI_SIDE_NONE,
+    STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
 };
 use ingress_ai::{validate_ruleset, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
 use strategy_vm::VmStrategy;
+
+use crate::backtest::fill::{
+    usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor, FillEngine, ModelOutcome, SynthFill,
+    MAX_OPEN_PER_SYM, MAX_OPEN_TOTAL,
+};
 
 /// Book capacity the backtest vm is monomorphized with (design §3.6):
 /// the same generic code as the engine's `SET_VM_SLOTS = 512`, sized
@@ -638,7 +648,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// two counts are JSON integer literals (`_strict_int` rejects bools
 /// and floats); `split` was digit/slash-validated before it is
 /// embedded, so the string is JSON-safe verbatim.
-fn render_schema1(hash_hex: &str, split: &str, hold: &HoldReport) -> String {
+fn render_schema1(hash_hex: &str, split: &str, vals: &ReportValues) -> String {
     format!(
         concat!(
             "{{\"schema_version\":1,",
@@ -656,23 +666,22 @@ fn render_schema1(hash_hex: &str, split: &str, hold: &HoldReport) -> String {
         ),
         hash = hash_hex,
         split = split,
-        pnl = fmt_usd_1e6(hold.oos_net_pnl_1e6),
-        trades = hold.oos_trades,
-        days = hold.oos_trading_days,
-        dd = fmt_usd_1e6(hold.oos_max_drawdown_1e6),
-        mo = fmt_usd_1e6(hold.max_order_notional_1e6),
-        ms = fmt_usd_1e6(hold.max_symbol_notional_1e6),
-        mt = fmt_usd_1e6(hold.max_total_notional_1e6),
+        pnl = fmt_usd_1e6(vals.oos_net_pnl_1e6),
+        trades = vals.oos_trades,
+        days = vals.oos_trading_days,
+        dd = fmt_usd_1e6(vals.oos_max_drawdown_1e6),
+        mo = fmt_usd_1e6(vals.max_order_notional_1e6),
+        ms = fmt_usd_1e6(vals.max_symbol_notional_1e6),
+        mt = fmt_usd_1e6(vals.max_total_notional_1e6),
     )
 }
 
-/// The H1 hold-model report values. `oos.*` and the two position
-/// bounds are structurally zero (no fills exist, so no trades, no
-/// P&L, no positions — real zeros by vacuity, not placeholders);
-/// `max_order_notional_1e6` is live (§4.6, observed over the FULL
-/// window). H2 replaces this struct with real accounting.
+/// The schema-1 value set, rendered from the §4 model (×1e6 fixed
+/// point, conversion direction per [`fill`] module docs: net floors,
+/// drawdown/position bounds ceil, max-order keeps the H1 emit-time
+/// floor). Was `HoldReport` in H1 — same field set, real numbers.
 #[derive(Copy, Clone, Debug)]
-struct HoldReport {
+struct ReportValues {
     oos_net_pnl_1e6: i64,
     oos_trades: u64,
     oos_trading_days: u64,
@@ -722,6 +731,42 @@ pub struct HarnessStats {
     pub vm_book_track_failed: u64,
     /// Observed max emitted-order notional ×1e6 (§4.6).
     pub max_order_notional_1e6: i64,
+    /// Synthesized fills, IS + OOS (§4.2).
+    pub fills_total: u64,
+    /// Fills of OOS-emitted orders (`oos.trades`, §3.4/§4.5).
+    pub fills_oos: u64,
+    /// Orders accepted into the open-order table before the boundary.
+    pub orders_is: u64,
+    /// Orders accepted into the table at/after the boundary.
+    pub orders_oos: u64,
+    /// §4.1 per-sym-cap drops (counted, never surfaced to the vm).
+    pub orders_rejected_sym_cap: u64,
+    /// §4.1 total-cap drops.
+    pub orders_rejected_total_cap: u64,
+    /// Orders on a venue byte with no Δ/fee row (cannot execute).
+    pub orders_unroutable: u64,
+    /// Orders still resting at replay end (canceled, zero P&L).
+    pub orders_canceled_end: u64,
+    /// Peak simultaneous open orders (total / one sym).
+    pub peak_open_total: u64,
+    /// Peak simultaneous open orders on one sym.
+    pub peak_open_per_sym: u64,
+    /// OOS net P&L ×1e6 (floored from ×1e12 — [`fill`] direction).
+    pub oos_net_pnl_1e6: i64,
+    /// OOS realized component ×1e6 (stderr surface; floor).
+    pub oos_realized_1e6: i64,
+    /// OOS fees ×1e6 (stderr surface; ceil — risk direction).
+    pub oos_fees_1e6: i64,
+    /// OOS mark-out (unrealized at last mids) ×1e6 (floor).
+    pub oos_unreal_1e6: i64,
+    /// OOS max peak-to-trough drawdown ×1e6 (ceil).
+    pub oos_max_drawdown_1e6: i64,
+    /// Distinct UTC days with ≥ 1 OOS fill.
+    pub oos_trading_days: u64,
+    /// §4.6 peak per-sym |position|×mark ×1e6 (ceil), full window.
+    pub max_symbol_notional_1e6: i64,
+    /// §4.6 peak Σ|position|×mark ×1e6 (ceil), full window.
+    pub max_total_notional_1e6: i64,
 }
 
 /// What `run` hands the bin: the exact stdout line, the stderr
@@ -835,23 +880,56 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             "synthesized RulesetCommit did not flip the staged table".to_owned(),
         ));
     }
-    // 3. The merged, rebased timeline through the real on_tick.
-    //    (§3.6.4's on_fill feedback starts existing when H2's fill
-    //    engine synthesizes fills; the hold model produces none.)
+    // 3. The merged, rebased timeline through the real on_tick, with
+    //    the §4 model in the loop: per record — (a) marks + strict-
+    //    cross fill pass ([`fill::FillEngine::on_record`]), (b) the
+    //    vm's on_tick, (c) the record's synthesized fills through the
+    //    REAL `on_fill` (§3.6.4 — the design order: tick, then fills,
+    //    matching the engine's pump; the vm ignores them today).
+    //    Every vm callback's newly emitted orders drain into the
+    //    model's §4.1 intake with `t_active = now + Δ_venue`; an order
+    //    therefore can never fill on its own emitting tick.
+    let mut engine = FillEngine::new(model, boundary_virt);
+    let mut consumed = ctx.orders().len(); // on_start/on_ai emit nothing, but stay uniform
+    debug_assert_eq!(consumed, 0);
+    let mut fills_scratch: Vec<SynthFill> = Vec::with_capacity(MAX_OPEN_TOTAL);
     for rec in &merged {
         ctx.now_ns = rec.virt_ns;
+        engine.on_record(&rec.tick, rec.virt_ns, rec.wall_ns, &mut fills_scratch);
         vm.on_tick(&rec.tick, &mut ctx);
+        while consumed < ctx.orders().len() {
+            let order = ctx.orders()[consumed];
+            engine.intake(&order, rec.virt_ns);
+            consumed += 1;
+        }
+        for f in &fills_scratch {
+            let vm_fill = Fill::new(
+                rec.virt_ns,
+                f.sym,
+                f.side,
+                Price::from_raw(f.px_1e6),
+                Qty::from_raw(f.qty_1e6),
+                f.client_oid,
+            );
+            vm.on_fill(&vm_fill, &mut ctx);
+            while consumed < ctx.orders().len() {
+                let order = ctx.orders()[consumed];
+                engine.intake(&order, rec.virt_ns);
+                consumed += 1;
+            }
+        }
     }
+    let outcome: ModelOutcome = engine.finish();
 
-    // ---- Hold-model report (§5; H2 replaces the zeros) ----
-    let hold = HoldReport {
-        oos_net_pnl_1e6: 0,
-        oos_trades: 0,
-        oos_trading_days: 0,
-        oos_max_drawdown_1e6: 0,
+    // ---- §5 report from the §4 model (fixed-point renders only) ----
+    let vals = ReportValues {
+        oos_net_pnl_1e6: usd_1e12_to_1e6_floor(outcome.oos_net_1e12),
+        oos_trades: outcome.oos_trades,
+        oos_trading_days: outcome.oos_trading_days,
+        oos_max_drawdown_1e6: usd_1e12_to_1e6_ceil(outcome.oos_max_dd_1e12),
         max_order_notional_1e6: ctx.max_order_notional_1e6(),
-        max_symbol_notional_1e6: 0,
-        max_total_notional_1e6: 0,
+        max_symbol_notional_1e6: usd_1e12_to_1e6_ceil(outcome.max_symbol_notional_1e12),
+        max_total_notional_1e6: usd_1e12_to_1e6_ceil(outcome.max_total_notional_1e12),
     };
     let stats = HarnessStats {
         runs: runs.len() as u64,
@@ -868,10 +946,49 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         vm_orders_dropped: vm.orders_dropped,
         vm_book_track_failed: vm.book_track_failed,
         max_order_notional_1e6: ctx.max_order_notional_1e6(),
+        fills_total: outcome.fills_total,
+        fills_oos: outcome.oos_trades,
+        orders_is: outcome.orders_is,
+        orders_oos: outcome.orders_oos,
+        orders_rejected_sym_cap: outcome.rejected_sym_cap,
+        orders_rejected_total_cap: outcome.rejected_total_cap,
+        orders_unroutable: outcome.unroutable,
+        orders_canceled_end: outcome.canceled_end,
+        peak_open_total: outcome.peak_open_total,
+        peak_open_per_sym: outcome.peak_open_per_sym,
+        oos_net_pnl_1e6: vals.oos_net_pnl_1e6,
+        oos_realized_1e6: usd_1e12_to_1e6_floor(outcome.oos_realized_1e12),
+        oos_fees_1e6: usd_1e12_to_1e6_ceil(outcome.oos_fees_1e12),
+        oos_unreal_1e6: usd_1e12_to_1e6_floor(outcome.oos_unreal_1e12),
+        oos_max_drawdown_1e6: vals.oos_max_drawdown_1e6,
+        oos_trading_days: outcome.oos_trading_days,
+        max_symbol_notional_1e6: vals.max_symbol_notional_1e6,
+        max_total_notional_1e6: vals.max_total_notional_1e6,
     };
     debug_assert_eq!(stats.vm_orders_emitted as usize, ctx.orders().len());
+    debug_assert_eq!(
+        outcome.orders_is
+            + outcome.orders_oos
+            + outcome.rejected_sym_cap
+            + outcome.rejected_total_cap
+            + outcome.unroutable,
+        stats.vm_orders_emitted,
+        "every vm-emitted order is accounted: accepted, cap-dropped or unroutable"
+    );
 
-    let schema1 = render_schema1(&hash_hex, &cfg.split, &hold);
+    // §5: the optional operator sidecar — written BEFORE stdout so a
+    // failed write yields a nonzero exit with nothing on stdout.
+    if let Some(detail_path) = &cfg.emit_detail {
+        let detail = render_detail(&hash_hex, &cfg.split, &model, &stats, &outcome, &engine);
+        std::fs::write(detail_path, detail).map_err(|e| {
+            HarnessError::Usage(format!(
+                "cannot write --emit-detail {}: {e}",
+                detail_path.display()
+            ))
+        })?;
+    }
+
+    let schema1 = render_schema1(&hash_hex, &cfg.split, &vals);
     let summary = render_summary(cfg, &split, &model, &run_summaries, &stats, &hash_hex);
     Ok(BacktestOutput {
         schema1,
@@ -889,9 +1006,9 @@ fn render_summary(
     stats: &HarnessStats,
     hash_hex: &str,
 ) -> String {
-    let mut s = String::with_capacity(1024);
+    let mut s = String::with_capacity(2048);
     s.push_str(&format!(
-        "backtest H1 (hold model): ruleset sha256 {hash_hex}\n"
+        "backtest H2 (strict-cross maker model): ruleset sha256 {hash_hex}\n"
     ));
     s.push_str(&format!(
         "capture: {} run(s), {} merged tick(s), universe {} sym(s), {} UTC day(s) spanned\n",
@@ -922,17 +1039,8 @@ fn render_summary(
         stats.vm_book_track_failed
     ));
     s.push_str(&format!(
-        "bounds: max_order_notional={} (full window); symbol/total notional 0.0 — no \
-         positions exist in the hold model\n",
-        fmt_usd_1e6(stats.max_order_notional_1e6)
-    ));
-    s.push_str(
-        "hold model: fills/fees/latency/P&L/DD land in H2 — oos section is all zeros; \
-         determinism is by construction (zero RNG anywhere)\n",
-    );
-    s.push_str(&format!(
-        "model params parsed but UNUSED by the hold model: latency_ns pm={} bn={} okx={} \
-         deribit={} hl={}; fee_bps pm={}:{} bn={}:{} okx={}:{} deribit={}:{} hl={}:{}\n",
+        "model: latency_ns pm={} bn={} okx={} deribit={} hl={}; fee_bps pm={}:{} bn={}:{} \
+         okx={}:{} deribit={}:{} hl={}:{}; open-order caps {}/sym {} total\n",
         model.latency_ns[VenueId::Polymarket as usize],
         model.latency_ns[VenueId::Binance as usize],
         model.latency_ns[VenueId::Okx as usize],
@@ -948,10 +1056,161 @@ fn render_summary(
         model.fee_bps[VenueId::Deribit as usize].1,
         model.fee_bps[VenueId::Hyperliquid as usize].0,
         model.fee_bps[VenueId::Hyperliquid as usize].1,
+        MAX_OPEN_PER_SYM,
+        MAX_OPEN_TOTAL,
     ));
-    if cfg.emit_detail.is_some() {
-        s.push_str("--emit-detail: declared, deferred to H2 — no sidecar written\n");
+    s.push_str(&format!(
+        "orders: accepted is={} oos={}, rejected_caps={}+{} (sym+total), unroutable={}, \
+         canceled_end={}, peak_open={} (per-sym {})\n",
+        stats.orders_is,
+        stats.orders_oos,
+        stats.orders_rejected_sym_cap,
+        stats.orders_rejected_total_cap,
+        stats.orders_unroutable,
+        stats.orders_canceled_end,
+        stats.peak_open_total,
+        stats.peak_open_per_sym
+    ));
+    s.push_str(&format!(
+        "fills: total={} oos={}\n",
+        stats.fills_total, stats.fills_oos
+    ));
+    s.push_str(&format!(
+        "oos: net_pnl={} (realized={} fees={} markout={}), max_drawdown={}, trades={}, \
+         trading_days={}\n",
+        fmt_usd_1e6(stats.oos_net_pnl_1e6),
+        fmt_usd_1e6(stats.oos_realized_1e6),
+        fmt_usd_1e6(stats.oos_fees_1e6),
+        fmt_usd_1e6(stats.oos_unreal_1e6),
+        fmt_usd_1e6(stats.oos_max_drawdown_1e6),
+        stats.fills_oos,
+        stats.oos_trading_days
+    ));
+    s.push_str(&format!(
+        "bounds (full window): max_order_notional={} max_symbol_notional={} \
+         max_total_notional={}\n",
+        fmt_usd_1e6(stats.max_order_notional_1e6),
+        fmt_usd_1e6(stats.max_symbol_notional_1e6),
+        fmt_usd_1e6(stats.max_total_notional_1e6)
+    ));
+    s.push_str(
+        "reproducibility: zero RNG anywhere (determinism by construction); strict-cross \
+         maker (trade-through only — no touch fills, no queue credit); fills/marks on \
+         two-sided ticks only; unfilled remainders canceled at end (zero P&L); open \
+         positions marked out at last mid into net_pnl\n",
+    );
+    if let Some(p) = &cfg.emit_detail {
+        s.push_str(&format!("--emit-detail: sidecar written to {}\n", p.display()));
     }
+    s
+}
+
+/// The `--emit-detail` sidecar (§5): versioned SEPARATELY from
+/// schema-1 (`detail_version` 1), operator/session surface, never
+/// parsed by the worker. Hand-rendered like schema-1 — every value is
+/// numeric, a fixed label, the validated split echo, or the hash hex;
+/// USD values are the same fixed-point renders as the stderr summary.
+fn render_detail(
+    hash_hex: &str,
+    split: &str,
+    model: &ModelParams,
+    stats: &HarnessStats,
+    outcome: &ModelOutcome,
+    engine: &FillEngine,
+) -> String {
+    let mut s = String::with_capacity(4096);
+    s.push_str(&format!(
+        concat!(
+            "{{\"detail_version\":1,",
+            "\"ruleset_hash\":\"{hash}\",",
+            "\"split\":\"{split}\",",
+            "\"model\":{{",
+            "\"latency_ns\":{{\"pm\":{lpm},\"bn\":{lbn},\"okx\":{lokx},\"deribit\":{lde},\"hl\":{lhl}}},",
+            "\"fee_bps\":{{\"pm\":[{fpm0},{fpm1}],\"bn\":[{fbn0},{fbn1}],\"okx\":[{fokx0},{fokx1}],",
+            "\"deribit\":[{fde0},{fde1}],\"hl\":[{fhl0},{fhl1}]}},",
+            "\"open_order_caps\":[{cap_sym},{cap_tot}]}},",
+            "\"window\":{{\"first_virt_ns\":{fv},\"last_virt_ns\":{lv},\"boundary_virt_ns\":{bv},",
+            "\"merged_records\":{mr},\"oos_records\":{or}}},",
+            "\"orders\":{{\"emitted\":{oe},\"accepted_is\":{ois},\"accepted_oos\":{ooos},",
+            "\"rejected_sym_cap\":{rsc},\"rejected_total_cap\":{rtc},\"unroutable\":{unr},",
+            "\"canceled_end\":{cend},\"peak_open_total\":{pot},\"peak_open_per_sym\":{pos}}},",
+            "\"fills\":{{\"total\":{ft},\"oos\":{fo}}},",
+            "\"oos\":{{\"net_pnl_usd\":{onet},\"realized_usd\":{orl},\"fees_usd\":{ofe},",
+            "\"markout_usd\":{oun},\"max_drawdown_usd\":{odd},\"trades\":{otr},",
+            "\"trading_days\":{oda}}},",
+            "\"full\":{{\"realized_usd\":{frl},\"fees_usd\":{ffe},\"unrealized_usd\":{fun}}},",
+            "\"bounds\":{{\"max_order_notional_usd\":{bmo},\"max_symbol_notional_usd\":{bms},",
+            "\"max_total_notional_usd\":{bmt}}},",
+            "\"per_sym\":["
+        ),
+        hash = hash_hex,
+        split = split,
+        lpm = model.latency_ns[VenueId::Polymarket as usize],
+        lbn = model.latency_ns[VenueId::Binance as usize],
+        lokx = model.latency_ns[VenueId::Okx as usize],
+        lde = model.latency_ns[VenueId::Deribit as usize],
+        lhl = model.latency_ns[VenueId::Hyperliquid as usize],
+        fpm0 = model.fee_bps[VenueId::Polymarket as usize].0,
+        fpm1 = model.fee_bps[VenueId::Polymarket as usize].1,
+        fbn0 = model.fee_bps[VenueId::Binance as usize].0,
+        fbn1 = model.fee_bps[VenueId::Binance as usize].1,
+        fokx0 = model.fee_bps[VenueId::Okx as usize].0,
+        fokx1 = model.fee_bps[VenueId::Okx as usize].1,
+        fde0 = model.fee_bps[VenueId::Deribit as usize].0,
+        fde1 = model.fee_bps[VenueId::Deribit as usize].1,
+        fhl0 = model.fee_bps[VenueId::Hyperliquid as usize].0,
+        fhl1 = model.fee_bps[VenueId::Hyperliquid as usize].1,
+        cap_sym = MAX_OPEN_PER_SYM,
+        cap_tot = MAX_OPEN_TOTAL,
+        fv = stats.first_virt_ns,
+        lv = stats.last_virt_ns,
+        bv = stats.boundary_virt_ns,
+        mr = stats.merged_records,
+        or = stats.oos_records,
+        oe = stats.vm_orders_emitted,
+        ois = stats.orders_is,
+        ooos = stats.orders_oos,
+        rsc = stats.orders_rejected_sym_cap,
+        rtc = stats.orders_rejected_total_cap,
+        unr = stats.orders_unroutable,
+        cend = stats.orders_canceled_end,
+        pot = stats.peak_open_total,
+        pos = stats.peak_open_per_sym,
+        ft = stats.fills_total,
+        fo = stats.fills_oos,
+        onet = fmt_usd_1e6(stats.oos_net_pnl_1e6),
+        orl = fmt_usd_1e6(stats.oos_realized_1e6),
+        ofe = fmt_usd_1e6(stats.oos_fees_1e6),
+        oun = fmt_usd_1e6(stats.oos_unreal_1e6),
+        odd = fmt_usd_1e6(stats.oos_max_drawdown_1e6),
+        otr = stats.fills_oos,
+        oda = stats.oos_trading_days,
+        frl = fmt_usd_1e6(usd_1e12_to_1e6_floor(outcome.full_realized_1e12)),
+        ffe = fmt_usd_1e6(usd_1e12_to_1e6_ceil(outcome.full_fees_1e12)),
+        fun = fmt_usd_1e6(usd_1e12_to_1e6_floor(outcome.full_unreal_1e12)),
+        bmo = fmt_usd_1e6(stats.max_order_notional_1e6),
+        bms = fmt_usd_1e6(stats.max_symbol_notional_1e6),
+        bmt = fmt_usd_1e6(stats.max_total_notional_1e6),
+    ));
+    for (i, row) in engine.per_sym_detail().iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            concat!(
+                "{{\"sym\":{sym},\"venue\":{venue},\"pos_qty\":{q},\"last_mid\":{m},",
+                "\"realized_usd\":{r},\"fees_usd\":{f},\"fills\":{n}}}"
+            ),
+            sym = row.sym,
+            venue = row.venue,
+            q = fmt_usd_1e6(row.pos_qty_1e6),
+            m = fmt_usd_1e6(row.last_mid_1e6),
+            r = fmt_usd_1e6(usd_1e12_to_1e6_floor(row.realized_1e12)),
+            f = fmt_usd_1e6(usd_1e12_to_1e6_ceil(row.fees_1e12)),
+            n = row.fills,
+        ));
+    }
+    s.push_str("]}\n");
     s
 }
 
@@ -1097,7 +1356,7 @@ mod tests {
 
     #[test]
     fn schema1_line_is_the_frozen_field_set() {
-        let hold = HoldReport {
+        let vals = ReportValues {
             oos_net_pnl_1e6: 0,
             oos_trades: 0,
             oos_trading_days: 0,
@@ -1106,7 +1365,7 @@ mod tests {
             max_symbol_notional_1e6: 0,
             max_total_notional_1e6: 0,
         };
-        let line = render_schema1("ab12", "70/30", &hold);
+        let line = render_schema1("ab12", "70/30", &vals);
         assert_eq!(
             line,
             "{\"schema_version\":1,\"ruleset_hash\":\"ab12\",\"split\":\"70/30\",\

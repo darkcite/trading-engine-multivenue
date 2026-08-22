@@ -87,6 +87,21 @@ By convention:
 
 Nothing is written outside `~/multivenue/` or the project directory.
 
+## Release binary on PATH (8h backtest harness)
+
+The worker's `backtest` verb (and `tests/test_backtest_real.py`) spawn
+`multivenue-engine` by NAME — PATH resolution is the pinned contract
+(phase-8h-design §14/§15.3; an absolute path stays a `.env`-commentary
+option only). After any harness change:
+
+```sh
+cargo build --release -p cli               # G0 law: relink before use
+export PATH="$PWD/target/release:$PATH"    # or symlink into ~/bin
+```
+
+Without the release binary on PATH the real-harness pytest module
+auto-skips (green, with a skip reason naming this runbook).
+
 ## claude-worker (Phase 8f: serve daemon + operator verbs)
 
 Python 3.14 via uv (`cd claude-worker && uv sync`). Two modes over one

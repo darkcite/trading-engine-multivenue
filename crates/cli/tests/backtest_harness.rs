@@ -442,3 +442,327 @@ fn unreadable_ruleset_is_a_usage_error() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ===============================================================
+// H2 — the §4 model: known-P&L golden fixture (design §12 / plan §11
+// "golden replay fixture with known P&L"), sidecar, fee override,
+// determinism, and the COMMITTED copy the Python real-harness test
+// (claude-worker/tests/test_backtest_real.py) replays.
+// ===============================================================
+
+/// The P&L candidate: two `level_breach` rows on PM sym 42 —
+/// buy-at-mid when ask ≤ 0.42, sell-at-mid when bid ≥ 0.60, $50 caps,
+/// 1500 ms cooldowns. BN sym 7 rides along as merge ballast (the rows
+/// never reference it), keeping the fixture two-venue (§16.3.1).
+const PNL_RULESET: &str = r#"{"rows":[{"name":"h2-buy-low","family":"crypto","trigger":{"type":"level_breach","level":0.42},"sym":42,"side":"bid","edge_bps":80,"horizon_ms":1500,"max_risk_usd":50.0},{"name":"h2-sell-high","family":"crypto","trigger":{"type":"level_breach","level":0.6},"sym":42,"side":"ask","edge_bps":80,"horizon_ms":1500,"max_risk_usd":50.0}]}"#;
+
+/// Wall epochs: run 0 on 1970-01-01; run 1 starts 1970-01-02
+/// 23:59:59.2 so its OOS fills straddle a UTC midnight (2 trading
+/// days). The 70/30 boundary lands inside the inter-run gap: run 0 is
+/// all IS, run 1 all OOS.
+const PNL_EPOCH_RUN_0: u64 = 1_000_000_000;
+const PNL_EPOCH_RUN_1: u64 = 172_799_200_000_000;
+
+fn mk_tick_q(
+    ts_ns: u64,
+    venue: VenueId,
+    sym: u32,
+    seq: u32,
+    bid: i64,
+    bid_q: i64,
+    ask: i64,
+    ask_q: i64,
+) -> Tick {
+    Tick::new(
+        ts_ns,
+        venue,
+        sym,
+        seq,
+        Price::from_raw(bid),
+        Qty::from_raw(bid_q),
+        Price::from_raw(ask),
+        Qty::from_raw(ask_q),
+    )
+}
+
+/// Build the known-P&L capture under `root`; returns the ruleset path.
+///
+/// Hand-computed script (Δ_pm = 200 ms default; virt per §3.3):
+///
+/// run 0 (ALL IS — warms the vm and the full book only):
+/// * bn @1000 (ballast) · pm @2000 0.38/0.42 ⇒ row-1 fires, O1 = BID
+///   0.40 × 125 ($50) · pm @0.5s 0.36/0.39 ask-size 200 ⇒ O1 fills
+///   125 @0.40 (IS) · pm @2.2s 0.60/0.65 ⇒ row-2 fires, O2 = ASK
+///   0.625 × 80 ($50) · pm @2.6s 0.66(size 30)/0.70 ⇒ O2 partial 30
+///   @0.625 (IS; realized +$6.75 in the FULL book only).
+///
+/// run 1 (ALL OOS — the schema-1 verdict):
+/// * bn @500 (ballast) · pm @700 0.38/0.42 ⇒ row-1 re-fires, O3 = BID
+///   0.40 × 125 ($50, OOS) · pm @+0.3s 0.35/0.38 ask-size 70 ⇒ O3
+///   partial 70 @0.40 — trade #1, day 1970-01-02; equity −$2.45 ·
+///   pm @+0.9s 0.35/0.38 ask-size 200 ⇒ O3 fills 55 — trade #2, day
+///   1970-01-03 (midnight crossed); equity trough −$4.375 (row-1
+///   cooldown 0.9 s < 1.5 s: no re-fire) · pm @+1.4s 0.43/0.45 ⇒ mark
+///   0.44, equity +$5.00; O2 (IS, 50 left) rests to the end (canceled).
+///
+/// Expected exactly: net +5.0, trades 2, days 2, DD 4.375; bounds
+/// 50.0 / 96.8 / 96.8 (peak = 220 held × 0.44 last mark).
+fn build_pnl_capture(root: &Path) -> PathBuf {
+    let run0 = root.join(format!("run-{PNL_EPOCH_RUN_0}"));
+    let run1 = root.join(format!("run-{PNL_EPOCH_RUN_1}"));
+    std::fs::create_dir_all(&run0).expect("mkdir run0");
+    std::fs::create_dir_all(&run1).expect("mkdir run1");
+
+    write_ticks(
+        &run0,
+        "bn",
+        PNL_EPOCH_RUN_0,
+        &[mk_tick_q(1_000, VenueId::Binance, 7, 1, 550_000, 10_000_000, 570_000, 10_000_000)],
+    );
+    write_ticks(
+        &run0,
+        "pm",
+        PNL_EPOCH_RUN_0,
+        &[
+            mk_tick_q(2_000, VenueId::Polymarket, 42, 1, 380_000, 10_000_000, 420_000, 10_000_000),
+            mk_tick_q(500_000_000, VenueId::Polymarket, 42, 2, 360_000, 10_000_000, 390_000, 200_000_000),
+            mk_tick_q(2_200_000_000, VenueId::Polymarket, 42, 3, 600_000, 10_000_000, 650_000, 10_000_000),
+            mk_tick_q(2_600_000_000, VenueId::Polymarket, 42, 4, 660_000, 30_000_000, 700_000, 10_000_000),
+        ],
+    );
+    write_ticks(
+        &run1,
+        "bn",
+        PNL_EPOCH_RUN_1,
+        &[mk_tick_q(500, VenueId::Binance, 7, 2, 550_000, 10_000_000, 570_000, 10_000_000)],
+    );
+    write_ticks(
+        &run1,
+        "pm",
+        PNL_EPOCH_RUN_1,
+        &[
+            mk_tick_q(700, VenueId::Polymarket, 42, 5, 380_000, 10_000_000, 420_000, 10_000_000),
+            mk_tick_q(300_000_700, VenueId::Polymarket, 42, 6, 350_000, 10_000_000, 380_000, 70_000_000),
+            mk_tick_q(900_000_700, VenueId::Polymarket, 42, 7, 350_000, 10_000_000, 380_000, 200_000_000),
+            mk_tick_q(1_400_000_700, VenueId::Polymarket, 42, 8, 430_000, 10_000_000, 450_000, 10_000_000),
+        ],
+    );
+
+    let ruleset = root.join("golden-ruleset.json");
+    std::fs::write(&ruleset, PNL_RULESET).expect("write ruleset");
+    ruleset
+}
+
+/// The expected schema-1 line for the P&L fixture (defaults, 70/30).
+fn pnl_schema1() -> String {
+    let digest = core_crypto::sha256(PNL_RULESET.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",\"split\":\"70/30\",\
+         \"oos\":{{\"net_pnl_usd\":5.0,\"trades\":2,\"trading_days\":2,\
+         \"max_drawdown_usd\":4.375}},\"bounds\":{{\"max_order_notional_usd\":50.0,\
+         \"max_symbol_notional_usd\":96.8,\"max_total_notional_usd\":96.8}}}}"
+    )
+}
+
+#[test]
+fn golden_pnl_fixture_hand_computed_accounting_exact() {
+    let root = unique_root("pnl");
+    let ruleset = build_pnl_capture(&root);
+
+    let out = cli::backtest::run(&cfg(&ruleset, &root, "70/30")).expect("harness ok");
+    assert_eq!(out.schema1, pnl_schema1(), "known P&L, byte for byte (plan §11)");
+
+    let s = out.stats;
+    assert_eq!(s.runs, 2);
+    assert_eq!(s.merged_records, 10);
+    assert_eq!(s.universe_syms, 2);
+    assert_eq!(s.oos_records, 5, "all of run 1 is OOS");
+    assert_eq!(s.capture_utc_days, 3, "days 0, 1, 2 spanned");
+    // vm drive: 2 rows × 8 pm ticks; fires at run0 @2000 (bid row),
+    // run0 @2.2s (ask row), run1 @700 (bid row re-armed).
+    assert_eq!(s.vm_evals, 16);
+    assert_eq!(s.vm_fires, 3);
+    assert_eq!(s.vm_orders_emitted, 3);
+    assert_eq!(s.vm_orders_dropped, 0);
+    // §4 model facts.
+    assert_eq!(s.orders_is, 2);
+    assert_eq!(s.orders_oos, 1);
+    assert_eq!(s.orders_rejected_sym_cap, 0);
+    assert_eq!(s.orders_rejected_total_cap, 0);
+    assert_eq!(s.orders_unroutable, 0);
+    assert_eq!(s.orders_canceled_end, 1, "O2's 50 rests to the end");
+    assert_eq!(s.peak_open_total, 2, "O2 (IS) + O3 (OOS) coexist");
+    assert_eq!(s.peak_open_per_sym, 2);
+    assert_eq!(s.fills_total, 4, "2 IS fills + 2 OOS fills");
+    assert_eq!(s.fills_oos, 2);
+    assert_eq!(s.oos_trading_days, 2, "midnight crossed inside run 1");
+    // §4.5 components: no OOS reducing fill, zero fees ⇒ net == markout.
+    assert_eq!(s.oos_realized_1e6, 0);
+    assert_eq!(s.oos_fees_1e6, 0);
+    assert_eq!(s.oos_unreal_1e6, 5_000_000);
+    assert_eq!(s.oos_net_pnl_1e6, 5_000_000);
+    assert_eq!(s.oos_max_drawdown_1e6, 4_375_000);
+    assert_eq!(s.max_order_notional_1e6, 50_000_000);
+    assert_eq!(s.max_symbol_notional_1e6, 96_800_000);
+    assert_eq!(s.max_total_notional_1e6, 96_800_000);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn golden_pnl_fee_override_charges_maker_bps_exactly() {
+    // Same fixture, PM maker 50 bps: OOS fees = ceil(28e12×50/1e4) +
+    // ceil(22e12×50/1e4) = $0.14 + $0.11 = $0.25 ⇒ net 4.75, and the
+    // fee-laden trough deepens the drawdown to 4.625.
+    let root = unique_root("pnlfee");
+    let ruleset = build_pnl_capture(&root);
+    let mut c = cfg(&ruleset, &root, "70/30");
+    c.fee_bps = vec!["pm:50:50".to_owned()];
+
+    let out = cli::backtest::run(&c).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.oos_fees_1e6, 250_000);
+    assert_eq!(s.oos_net_pnl_1e6, 4_750_000);
+    assert_eq!(s.oos_max_drawdown_1e6, 4_625_000);
+    assert_eq!(s.fills_oos, 2, "fees never change what fills");
+    assert_eq!(s.max_order_notional_1e6, 50_000_000);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
+    let root = unique_root("pnldetail");
+    let ruleset = build_pnl_capture(&root);
+    let detail_a = root.join("detail-a.json");
+    let detail_b = root.join("detail-b.json");
+
+    let mut c = cfg(&ruleset, &root, "70/30");
+    c.emit_detail = Some(detail_a.clone());
+    let out_a = cli::backtest::run(&c).expect("harness ok");
+    c.emit_detail = Some(detail_b.clone());
+    let out_b = cli::backtest::run(&c).expect("harness ok");
+
+    let a = std::fs::read_to_string(&detail_a).expect("sidecar a");
+    let b = std::fs::read_to_string(&detail_b).expect("sidecar b");
+    assert_eq!(a, b, "sidecar is deterministic");
+    assert_eq!(out_a.schema1, out_b.schema1);
+    // Versioned separately from schema-1; carries the operator detail
+    // the frozen stdout must NOT carry (§5).
+    assert!(a.starts_with("{\"detail_version\":1,"));
+    assert!(a.contains("\"canceled_end\":1"));
+    assert!(a.contains("\"full\":{\"realized_usd\":6.75,"), "IS sell realized $6.75: {a}");
+    assert!(a.contains("\"per_sym\":[{\"sym\":42,\"venue\":0,\"pos_qty\":220.0,\"last_mid\":0.44,"));
+    // The stdout line itself never grows keys (§5 pinned).
+    assert!(!out_a.schema1.contains("detail_version"));
+    // The summary names the sidecar path.
+    assert!(out_a.summary.contains("--emit-detail: sidecar written to"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pnl_reruns_are_byte_identical() {
+    let root = unique_root("pnldet");
+    let ruleset = build_pnl_capture(&root);
+    let c = cfg(&ruleset, &root, "70/30");
+
+    let a = cli::backtest::run(&c).expect("first run ok");
+    let b = cli::backtest::run(&c).expect("second run ok");
+    assert_eq!(a.schema1, b.schema1);
+    assert_eq!(a.summary, b.summary);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn real_binary_pnl_fixture_frozen_argv() {
+    // The worker argv over the P&L fixture: exit 0, stdout = the
+    // known-P&L schema-1 line alone.
+    let root = unique_root("pnlbin");
+    let ruleset = build_pnl_capture(&root);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_multivenue-engine"))
+        .args([
+            "backtest",
+            "--ruleset",
+            ruleset.to_str().expect("utf8 path"),
+            "--replay-dir",
+            root.to_str().expect("utf8 path"),
+            "--split",
+            "70/30",
+        ])
+        .output()
+        .expect("spawn harness binary");
+
+    assert!(
+        out.status.success(),
+        "harness must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("stdout utf8"),
+        format!("{}\n", pnl_schema1())
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------
+// The COMMITTED fixture for the Python real-harness test (§12 H-D8).
+// claude-worker/tests/fixtures/backtest-real/ holds byte-exact copies
+// of the P&L capture + ruleset; `test_backtest_real.py` replays them
+// through the frozen `run_backtest` against the release binary.
+// ---------------------------------------------------------------
+
+fn committed_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../claude-worker/tests/fixtures/backtest-real")
+}
+
+/// Every file of the P&L fixture, relative to its root.
+const PNL_FIXTURE_FILES: [&str; 5] = [
+    "run-1000000000/bn-ticks.pmlr",
+    "run-1000000000/pm-ticks.pmlr",
+    "run-172799200000000/bn-ticks.pmlr",
+    "run-172799200000000/pm-ticks.pmlr",
+    "golden-ruleset.json",
+];
+
+#[test]
+fn committed_python_fixture_matches_the_generator_byte_for_byte() {
+    // Drift guard: the committed copy must equal what
+    // `build_pnl_capture` writes (PmlrWriter output is deterministic).
+    // If this fails after an intentional fixture change, rerun
+    // `regenerate_committed_python_fixture -- --ignored`.
+    let committed = committed_fixture_dir();
+    let root = unique_root("pnlcommit");
+    let _ = build_pnl_capture(&root);
+
+    for rel in PNL_FIXTURE_FILES {
+        let generated = std::fs::read(root.join(rel)).expect("generated file");
+        let checked_in = std::fs::read(committed.join(rel)).unwrap_or_else(|e| {
+            panic!(
+                "committed fixture {} missing/unreadable ({e}) — run the ignored \
+                 regenerate_committed_python_fixture test once",
+                committed.join(rel).display()
+            )
+        });
+        assert_eq!(generated, checked_in, "{rel} drifted from the generator");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One-shot generator for the committed copy. `#[ignore]`d: run
+/// manually after an intentional fixture change —
+/// `cargo test -p cli --test backtest_harness regenerate_committed -- --ignored`.
+#[test]
+#[ignore]
+fn regenerate_committed_python_fixture() {
+    let committed = committed_fixture_dir();
+    std::fs::create_dir_all(&committed).expect("mkdir committed fixture dir");
+    let _ = build_pnl_capture(&committed);
+    eprintln!("committed fixture regenerated at {}", committed.display());
+}

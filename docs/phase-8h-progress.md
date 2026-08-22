@@ -462,3 +462,308 @@ market-map.json ABSENT (H3); no boots expected beyond the smoke — G0 law
 (`cargo build --release -p cli` before ANY boot) applies to it. If context
 runs short: write interim state + exact resume point + relaunch prompt
 into docs/phase-8h-progress.md, then tell me.
+
+---
+
+## 2026-08-22 — Session H2 (design §13 item 2: the §4 fill/fee/latency model + accounting) — CLOSED
+
+Authority: the H2 kickoff above + design (LOCKED). RustRover MCP attached
+FIRST (`get_project_modules` OK). Session-start HEAD `3ad40a9` (the H1
+commit), tree clean. Diff scope is exactly: `crates/cli/src/backtest.rs`,
+`crates/cli/src/backtest/fill.rs` (NEW), `crates/cli/tests/
+backtest_harness.rs`, `claude-worker/tests/test_backtest_real.py` (NEW),
+`claude-worker/tests/fixtures/backtest-real/` (NEW, committed golden
+capture), `docs/local-setup.md`, `docs/arch/phase-8g-design.md` (§15.1
+ride), this file. Read-only crates untouched (engine/strategy-vm/ingress/
+core — kickoff escape hatch unused). No bin changes needed: every §4 flag
+was already H1-declared and wired.
+
+### H1 interpretation review — all NINE UPHELD (kickoff first task)
+
+1. **Merge-key file-ordinal backstop — UPHELD.** H2 consumes the merged
+   stream as-is; nothing in §4 touches merge order.
+2. **PMLR v2 required — UPHELD.** Unchanged; the fill engine additionally
+   keys Δ/fees off the ORDER venue byte (sym-derived), not the tick's.
+3. **Overlapping runs refused — UPHELD.** Activation (`virt ≥ t_active`)
+   depends on cross-run virtual monotonicity; overlap would corrupt it.
+4. **OOS = `[boundary, last]`, boundary inclusive — UPHELD**, and §3.4
+   got its teeth: accounting buckets ORDERS by emit virt ts ≥
+   `boundary_virt_ns` (fills/marks follow their order). The zero-OOS-ticks
+   tripwire stays live.
+5. **Run-content rules — UPHELD.** Non-consumption of events/signals/
+   ai-cmds/engine-fills held (§3.1).
+6. **Split grammar strictness — UPHELD** (untouched).
+7. **Epoch-tied run-dir order — UPHELD** (untouched).
+8. **Table epoch stays 0 — UPHELD** (flip keys on hash128 only).
+9. **clap exit 2 / harness exit 1 — UPHELD.** One new exit-1 Usage path:
+   an unwritable `--emit-detail` (sidecar written BEFORE stdout, so
+   failure ⇒ nonzero with EMPTY stdout — "exit 0 ⇔ trustworthy report
+   printed" preserved).
+
+No H1 test changed semantically. One mechanical rename inside
+`backtest.rs` tests: the private `HoldReport` became `ReportValues`
+(same fields, real numbers) — the schema-1 shape test renamed its local
+accordingly. The H1 golden fixture now runs THROUGH the live model and
+its schema-1 stays byte-identical (its resting bids at 0.50 never see an
+ask strictly below — the zeros are now "no cross ever happened" zeros).
+
+### What was built (design §4 IN FULL; `cli::backtest::fill`, NEW module)
+
+Open-order table `[OpenOrder; 32]` (§4.1: 4/sym + 32 caps, risk-policy
+mirror; preallocated, emit-ordered, compaction preserves FIFO) →
+strict-cross maker matcher (§4.2) → per-venue Δ activation (§4.4) →
+maker-fee charge (§4.3) → two fixed-point books + DD/bounds trackers
+(§4.5/§4.6) → `on_fill` feedback (§3.6.4) → `--emit-detail` sidecar +
+refreshed stderr summary (§5/§10) → REAL `oos` numbers in schema-1 via
+the existing renderer. Zero floats anywhere; zero RNG anywhere.
+
+### Model math decisions (recorded; conservative doctrine throughout)
+
+1. **Per-record order:** mark update → fill pass → `vm.on_tick` →
+   `vm.on_fill` (per design §3.6's 3→4 listing) → order intake after
+   every vm callback. An order can NEVER fill on its emitting tick, even
+   with `--latency-ns 0` (its record's fill pass already ran).
+2. **Two-sided ticks only, for marks AND fills** (8e preopen lesson):
+   `ask_px = 0` must not read as "ask below our bid"; every fill needs
+   the mark its record just wrote. Fewer fills = conservative.
+3. **Shared displayed budget per side per tick, FIFO by emit seq:** two
+   of our resting orders can never double-claim one printed size
+   (conservative refinement of §4.2's per-order `min`; Σ fills per side
+   per tick ≤ displayed, proptest-pinned).
+4. **Cap-dropped emits:** counted (`rejected 31+0` in the live smoke —
+   see below) and refused fills, but the vm still sees `Ok` from
+   `submit` — production-faithful: today's engine has no cap wall, so
+   cooldown stamping must match production. Per-sym cap checked before
+   total (risk-policy table order). Divergence documented in module docs.
+5. **Unroutable venue byte** (≥ 5 — no Δ/fee row, e.g. Ai): counted +
+   dropped; a venue that cannot execute must not fill.
+6. **Two books:** FULL (every fill; §4.6 bounds — breach anywhere
+   disqualifies) and OOS (fills of OOS-emitted orders only; the schema-1
+   verdict — the P&L of a strategy starting flat at the boundary).
+   IS-emitted orders warm the vm and the full book but never leak into
+   `oos` even when their fills land after the boundary (unit-pinned).
+7. **Cost basis:** signed `cost i128×1e12`; average never materialized.
+   The truncated average-cost `removed` quantum leaves `cost` and enters
+   `realized` as the SAME value ⇒ `realized + unrealized` is EXACTLY
+   cash-conserving regardless of truncation — the §12 conservation
+   proptest asserts the identity with zero tolerance.
+8. **Fees:** maker bps, `ceil` (a fee never rounds in our favor); taker
+   column parsed and reserved (maker-only model has no taker fills).
+9. **Render directions (×1e12 → ×1e6, once, at the edge):** net FLOOR
+   (toward −∞ — profit never overstated), drawdown + symbol/total bounds
+   CEIL (risk never understated); `max_order` keeps the H1 emit-time
+   floor (pinned by the shipped golden; divergence < 1e-6 USD).
+10. **Equity sampling:** OOS book sampled after each OOS fill and on each
+    two-sided tick of a held sym, at THAT tick's mid — the mark precedes
+    the fill pass, so a fill against a falling book is booked at the
+    fallen mid (adverse-selection-honest; the golden's −$4.375 trough
+    exists precisely because of this ordering).
+11. **DD peak seeds at 0** (the OOS book starts flat at the boundary; a
+    pure loss is its own drawdown).
+12. **Fill identity:** `Fill.order_id = Order.client_oid`, fill ts = the
+    record's virt ts. Per-venue independent fill clocks upheld (§4.7):
+    activation compares each order's own `t_active` against the one
+    merged timeline — no cross-venue serialization anywhere
+    (door-closers §16.3.2/§16.3.6 hold; `bounds` composes across
+    namespaced syms venue-agnostically, unit-pinned).
+
+### Golden known-P&L fixture (plan §11) + the committed Python copy
+
+New two-run/two-venue fixture (`build_pnl_capture`): two `level_breach`
+rows (buy ≤ 0.42 / sell ≥ 0.60, $50 caps) over a scripted pm-42 path;
+bn-7 rides as merge ballast. Run 0 all-IS (warms vm + full book: an IS
+buy 125 @ 0.40, an IS partial sell 30 @ 0.625 ⇒ full-book realized
++$6.75, sidecar-asserted); run 1 all-OOS, starting 1970-01-02 23:59:59.2
+so its two OOS fills straddle midnight (trades 2, trading_days 2).
+Hand-computed and asserted EXACTLY: **net +5.0, DD 4.375 (deeper-buy
+trough), bounds 50.0 / 96.8 / 96.8** (peak = 220 held × 0.44 last mark),
+canceled_end 1, peak_open 2. A fee-override variant (`pm:50:50`) asserts
+net 4.75 / DD 4.625 / fees 0.25 exactly (ceil math). Byte-exact copies
+live at `claude-worker/tests/fixtures/backtest-real/` (5 files, ≤ 333 B
+each), regenerated ONLY via the `#[ignore]`d
+`regenerate_committed_python_fixture` test and drift-guarded by
+`committed_python_fixture_matches_the_generator_byte_for_byte`
+(PmlrWriter output is deterministic).
+
+### Tests added (+25 Rust, +2 Python)
+
+- `fill.rs` in-module (19): conversion floor/ceil, fee-ceil, Δ-activation
+  boundary (±1 ns), strict-cross vs touch, one-sided refusals, partial
+  fill (2 trades), shared-budget FIFO, per-sym + total caps, unroutable,
+  maker-fee equity, §3.4 bucketing, average-cost reduce + cross-zero,
+  liquidation mark-out, DD tracker, deeper-buy trough, cross-venue
+  bounds composition, and TWO §12 proptests: fill invariants (px == P,
+  strict-through only, Σ ≤ displayed per side, no fill before
+  activation, fees ≥ 0) and the EXACT cash+position conservation
+  identity (incremental unrealized == from-scratch, equity == cash −
+  fees + Σ pos×mark).
+- `backtest_harness.rs` integration (+6, +1 ignored): known-P&L exact,
+  fee override exact, sidecar (versioned, deterministic, full-realized
+  6.75, schema-1 gains NO keys), P&L determinism byte-identical, real
+  binary over the frozen argv, committed-fixture drift guard (+ regen).
+- Python `tests/test_backtest_real.py` (+2, module-level skipif when the
+  binary is off PATH — skip reason names the runbook): the real release
+  binary through the FROZEN `run_backtest` over the committed fixture —
+  all eight harness numbers exact, gate matrix over real numbers
+  (pnl ✓ / trades ✗ 2<50 / days ✓ 2≥2 / dd ✓ / bounds ✓ ⇒ all_passed
+  False, report still written), and nonzero-exit ⇒ `BacktestError`.
+  **The G7 §5.1 shim seam is RETIRED** (design §13.2): the real binary
+  now proves the frozen argv + schema-1 contract end to end; the
+  fake-binary pattern survives only inside the frozen 202 as a mock.
+
+### Gates at close (all on the Mac; MCP terminal, nohup+poll)
+
+- workspace nextest **1081/1081** (baseline 1056 + 25), 1 skipped (the
+  `#[ignore]` regen). nextest flagged `bench::alloc_assertions
+  cross_arb_on_tick_is_zero_alloc` LEAK (passing) — bench is UNTOUCHED
+  by H2; recorded as pre-existing/environmental, not acted on.
+- release alloc **36/36** 0 B/op `--test-threads=1` — with a REAL
+  false-green caught and killed: `cargo clean -p bench` (no `--release`)
+  removed 61 files yet the release test bin survived (`Finished` in
+  0.13 s, NO `Compiling bench` line). Guard escalation that works on
+  this toolchain: **`cargo clean -p bench --release`**, then the rerun
+  showed `Removed 15 files` + a fresh `Compiling bench` + 36/36. The
+  CLAUDE.md guard text still says plain `-p bench` — folded here per
+  notes-go-only-here; fix CLAUDE.md at the next phase-boundary edit.
+- worker pytest **204** green with the release binary on PATH (202
+  frozen untouched + 2 real-harness); binary-absent path verified
+  separately: 2 skipped cleanly, exit 0.
+- `cargo build --release -p cli` links (fresh `Compiling cli`, 19.87 s)
+  — G0 law satisfied BEFORE the smoke.
+- Fuzz untouched (design §12): no new untrusted-bytes parser — the
+  sidecar is a writer, capture stays on hardened `PmlrReader`, candidate
+  on `validate_ruleset`, argv on clap + strict ints.
+
+### Pitfall-#11 live-capture smoke (OWED from H1 — PAID)
+
+`./target/release/multivenue-engine backtest --ruleset
+claude-worker/tests/fixtures/backtest-real/golden-ruleset.json
+--replay-dir ~/multivenue/logs/run-1786874540193462000 --split 70/30`
+⇒ **exit 0**, schema-1 alone on stdout (`oos` zeros, max_order 50.0).
+stderr summary (verbatim numbers): capture 1 run, **4856 merged ticks**
+(pm=82 bn=4774), universe 2 syms, 1 UTC day; window virt
+[100000000000000000, 100000194978925417] boundary 100000136485247791
+(1012 OOS ticks); vm evals=164 fires=35 orders_emitted=35; orders
+accepted is=4 oos=0, **rejected_caps=31+0**, canceled_end=4, peak_open=4
+(per-sym 4); fills 0. The committed ruleset VALIDATED against the live
+universe (pm sym 42 present on the box), the vm fired 35× on real data,
+and the §4.1 per-sym cap visibly enforced the conservative wall (the
+0.42/0.60 levels never strictly crossed ⇒ zero fills — correct under
+strict-cross). Real PMLR bytes, real venue mix, real sizes: the harness
+is live-proven for item 2.
+
+### Hygiene
+
+- Cargo/pytest on the Mac ONLY (pitfall #10); the Linux sandbox was not
+  used at all this session. No engine boots (the smoke is an offline
+  binary run; G0 relink preceded it). No `.env` read or write. No git op
+  until the closing commit (authorized). Push anomaly: unchanged
+  posture; no fetch/push.
+- Read-only crates untouched — `git status` at close lists ONLY the
+  files in the diff-scope line above. New Rust tests live in cli, none
+  in bench (CountingAllocator isolation upheld). `RuleRow._pad`
+  untouched (§16.3.4).
+- Docs rides landed per kickoff: `docs/local-setup.md` gained the
+  "Release binary on PATH (8h backtest harness)" runbook section
+  (design §15.3 — PATH resolution stays the contract); `docs/arch/
+  phase-8g-design.md` §4.1 stale clause reworded per design §15.1
+  (mechanism was always right; wording fixed, edit annotated in place).
+  CLAUDE.md deliberately not edited (H1 precedent; authority chain
+  points here).
+
+### Resume point
+
+Item 2 CLOSED (this commit). Next session H3 = design §13 item 3:
+`data_fetcher` completion (§6 in full — Python only). The H3 kickoff
+prompt below is ready to paste.
+
+---
+
+## H3 kickoff prompt (paste verbatim into a fresh session)
+
+8h implementation — SESSION H3 (design §13 checklist ITEM 3 ONLY:
+data_fetcher completion, §6 IN FULL), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue. Stage-2 status: 8f/8g CLOSED;
+8h H0 design LOCKED, H1 CLOSED, H2 CLOSED — HEAD = the H2 commit
+(cli::backtest::fill live: strict-cross model + accounting, REAL oos
+numbers in schema-1, --emit-detail sidecar, committed golden fixture
+claude-worker/tests/fixtures/backtest-real/ + test_backtest_real.py; the
+G7 fake-binary shim seam RETIRED). Baselines NOW: workspace nextest
+1081/1081 (+1 ignored fixture-regen; nextest may flag
+bench::alloc_assertions cross_arb_on_tick_is_zero_alloc LEAK —
+pre-existing, passing, recorded H2), release alloc 36/36 0 B/op
+(`--test-threads=1`; false-green guard CORRECTED in H2: `cargo clean -p
+bench --release` — plain `-p bench` does NOT remove the release test bin
+on this toolchain; always confirm a fresh `Compiling bench` in-log),
+worker pytest 204 (202 frozen UNTOUCHABLE + 2 real-harness; 204 is the
+new stay-green), fuzz `ruleset_json` 72.3M clean (no fuzz run due UNLESS
+you hand-roll a Rust untrusted-bytes parser — §12; strict field-checked
+JSON parsing of REST responses in PYTHON follows the labeling.py
+precedent and implies NO fuzz). NO push, NO rebase, NO history rewrite,
+NO branches, NO git ops without operator ask (ONE closing commit IS
+authorized; one-line status after). Do NOT touch .env — `.env.example`
+IS in scope (§7.5 keys land here). Notes go ONLY to
+docs/phase-8h-progress.md (H3 entry: decisions, tests, gates, hygiene,
+resume point + H4 kickoff prompt). Verify get_project_modules against
+the main checkout FIRST; stop if no attach.
+REQUIRED READING, in order: (1) docs/phase-8h-design.md §6 ENTIRE + §7.5
+(the three env keys: CLAUDE_WORKER_STRATEGIST_INTERVAL_S=21600,
+CLAUDE_WORKER_STRATEGIST_DAILY_CAP=12, CLAUDE_WORKER_REST_BUDGET_PER_H=
+60) + §14 pinned tail (market-map SymbolId-stability caveat is RECORDED
+design — do not "fix" it); (2) docs/phase-8h-progress.md H2 entry
+(baselines + landmine deltas); (3) claude-worker/src/claude_worker/
+features.py (the injected-get_fn seam the new fetchers.py must preserve
+— the module doctrine "never imports an HTTP client"), cli.py (fetch
+verb wiring; the cli.py "no venue URL consumers exist until 8h"
+deviation note RETIRES this session; load_market_map reader UNTOUCHED —
+its shape is the write-side contract), labeling.py (strict-parse
+precedent: malformed ⇒ logged skip, never a crash), state.py (events
+surface), and the pinned RestBudget (grep it — wired for REAL this
+session: 60 req/venue/h default, fixed-window try_acquire,
+skipped_total surfaced in fetch output); (4) docs/local-setup.md worker
+env-keys paragraph. H3 SCOPE (item 3, nothing more — strategist is H4):
+§6.1 the FOUR public keyless REST consumers in a NEW fetchers.py handed
+the client (PM Gamma markets by token id/slug; OKX
+/api/v5/market/candles; Deribit /api/v2/public/
+get_tradingview_chart_data; HL POST /info {type:candleSnapshot}), each
+a strict field-checked parser writing per-sym OHLCV/metadata feature
+files beside the replay-derived ones, every call RestBudget-gated,
+`--no-rest` finally REAL (skips all four); §6.2 market-map.json
+ownership: derive the observed universe from the LATEST run's tick
+capture, resolve names (PM ordinals via Gamma question/slug, CEX as
+<venue>:<instrument>, HIP-4 (yes,no) pairs when present — none live
+today), BOOTSTRAP when absent ({"markets":{...},"hip4_pairs":[...]}
+complete), ADDITIVE refresh when present (add missing names only;
+operator entries NEVER deleted or overwritten; a conflict is REPORTED in
+fetch output and left alone), atomic tmp + os.replace in the same dir;
+`.env.example` gains the three §7.5 keys (+ the absolute-binary-path
+commentary option per §14 tail if absent). TESTS (additive; the 202
+frozen, 204 stays green): design §12 fetchers rows — per-venue consumers
+against injected get_fn fixtures (happy + malformed-skip +
+budget-exhausted), RestBudget acquire/skip arithmetic, --no-rest real,
+market-map bootstrap / additive refresh / conflict report /
+operator-entry preservation / atomic write (tmp+rename observed); NO
+live API calls in tests (house rule — mock at the seam). GREEN GATES to
+close: worker pytest 204 + new ALL green, workspace nextest 1081/1081
+untouched-green, release alloc 36/36 `--test-threads=1` with the
+corrected guard, `cargo build --release -p cli` links (no Rust changes
+expected — the gates are the pitfall-#9 regression net). LANDMINES:
+Mac-only cargo/pytest (pitfall #10); RustRover MCP ≤45 s window — nohup
+> /tmp/8h-h3-*.log & then poll, and remember a `sleep N` INSIDE the
+polled command counts against the window; zsh eats bare ===; full
+`import x` only (no `from x import y`); engine/strategy-vm/ingress/
+core/cli crates READ-ONLY (claude-worker + docs only); the 7-verb
+surface is FROZEN (fetch grows internals only, no new verbs); the
+Anthropic SDK stays constructed inside serve only (H3 needs NO SDK);
+do NOT touch the committed backtest-real fixture (byte-pinned by the
+Rust drift-guard; regen only via the ignored test). SESSION FACTS:
+projectPath /Users/darkcite/trading-engine-multivenue; macOS: AF_UNIX
+sun_path cap, SO_RCVTIMEO EINVAL on peer-closed UDS, std::thread::scope
+panic hangs without StopOnDrop, sample <pid> for hangs; push anomaly
+KNOWN (38e599b → f2b3742 across H0): record, never act; market-map.json
+ABSENT on the box — H3 owns creating it (fixtures drive the tests; a
+live one-shot `fetch` smoke against the public endpoints is
+operator-gated, budget-capped, at operator discretion); no engine boots
+expected (G0 law applies if one ever runs). If context runs short: write
+interim state + exact resume point + relaunch prompt into
+docs/phase-8h-progress.md, then tell me.

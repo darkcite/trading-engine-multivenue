@@ -156,9 +156,13 @@ is `hash128`; the JSON artifact is the durable form).
   SymbolIds are venue-namespaced (`core_types::symbol_venue_byte`), so
   every leg names "asset X **on venue V**" — D2 operator amendment
   makes this explicit: **both legs may be any symbol on any
-  boot-universe venue**. `Order` carries no venue field — the
-  namespaced `sym` IS the venue targeting, and `ctx.submit` is
-  venue-agnostic (cross-arb precedent). Live emission is a DEPLOYMENT
+  boot-universe venue**. The namespaced `sym` IS the venue targeting
+  and `ctx.submit` is venue-agnostic (cross-arb precedent);
+  `Order.venue` (offset 40, wire-format row) is DERIVED from the
+  action sym's namespace byte at emit, never chosen independently.
+  *(Clause reworded in 8h H2 per phase-8h-design §15.1 — the original
+  "carries no venue field" wording was factually stale; the mechanism
+  described was always correct.)* Live emission is a DEPLOYMENT
   gate, not a grammar rule: everything is paper until 8i, and per-venue
   live dispatchers are 8j — today's only live gateway
   (`clob-dispatcher`, EIP-712) happens to be Polymarket, which
