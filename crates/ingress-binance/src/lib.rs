@@ -26,6 +26,7 @@
 )]
 
 pub mod discovery;
+pub mod eapi;
 pub mod run_loop;
 
 pub use run_loop::{

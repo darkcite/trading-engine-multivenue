@@ -630,6 +630,12 @@ fn run(args: RunArgs) -> ExitCode {
              policy is DROPPED for this boot (flag replaces the venue section)"
         );
     }
+    if boot.bn_options_dropped {
+        warn!(
+            "--binance-symbol override active — the universe config's binance options \
+             policy is DROPPED for this boot (flag replaces the venue section)"
+        );
+    }
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
@@ -639,6 +645,7 @@ fn run(args: RunArgs) -> ExitCode {
         &boot.deribit_options,
         boot.hl_spec.as_deref(),
         bn_discovery_arg,
+        &boot.bn_options,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -906,12 +913,14 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.hl.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_binance)
             .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
-        // M2.1/M2.2: capped options chain sizes this boot (0 = lane
-        // off).
+        // M2.1/M2.2/M2.4: capped options chain sizes this boot
+        // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
             .set(discovery.deribit_options.len() as i64);
         reg.gauge(ids.okx_options_selected)
             .set(discovery.okx_options.len() as i64);
+        reg.gauge(ids.binance_options_selected)
+            .set(discovery.bn_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
@@ -969,15 +978,20 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Binance: the legacy single-stream lane for one-symbol boots
     // (byte-identical pre-M1, soak-proven), the M1 multi-connection
-    // lane whenever the universe wires more than one BN instrument.
+    // lane whenever the universe wires more than one BN instrument —
+    // or (M2.4) whenever the eapi options chain is on: the eapi slot
+    // is a MultiConn slot, keeping the venue single-writer.
     let bn_total = boot.allocated.bn_spot.len() + boot.allocated.bn_usdm.len();
-    let bn_handle = if bn_total > 1 {
-        let mut specs: Vec<cli::BinanceConnSpec> = Vec::with_capacity(bn_total);
+    let bn_eapi_on = !discovery.bn_options.is_empty();
+    let bn_handle = if bn_total > 1 || bn_eapi_on {
+        let mut specs: Vec<cli::BinanceConnSpec> =
+            Vec::with_capacity(bn_total + usize::from(bn_eapi_on));
         for inst in &boot.allocated.bn_spot {
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_ws_host.clone(),
                 path: format!("/ws/{}@bookTicker", inst.name),
                 sym: inst.sym,
+                eapi: None,
             });
         }
         for inst in &boot.allocated.bn_usdm {
@@ -985,12 +999,62 @@ fn run(args: RunArgs) -> ExitCode {
                 host: cfg.binance_fut_ws_host.clone(),
                 path: format!("/ws/{}@bookTicker", inst.name),
                 sym: inst.sym,
+                eapi: None,
             });
+        }
+        if bn_eapi_on {
+            // M2.4: one combined-stream slot carries every selected
+            // option ticker + one index stream per underlying (all
+            // stream names lowercased; no subscribe frames — the
+            // house direct-URL pattern).
+            let mut table = ingress_binance::eapi::EapiSymbolTable::new();
+            let mut streams = String::new();
+            for (symbol, sym, uly_idx) in &discovery.bn_options {
+                if let Err(e) = table.insert(symbol.as_bytes(), *sym, *uly_idx) {
+                    error!(?e, symbol = %symbol, "binance: eapi table build failed");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                if !streams.is_empty() {
+                    streams.push('/');
+                }
+                streams.push_str(&symbol.to_ascii_lowercase());
+                streams.push_str("@ticker");
+            }
+            for uly in &boot.bn_options.underlyings {
+                streams.push('/');
+                streams.push_str(&uly.to_ascii_lowercase());
+                streams.push_str("@index");
+            }
+            specs.push(cli::BinanceConnSpec {
+                host: cfg.binance_eapi_ws_host.clone(),
+                // The documented eapi combined base (legacy docs +
+                // the live nbstream ALB). TEMPORARILY UNREACHABLE
+                // from this network as of 2026-08-22 (404/403 on
+                // every candidate route while eapi REST serves —
+                // forensics in docs/m2-progress.md); the slot retries
+                // harmlessly and BINANCE_EAPI_WS_HOST is the
+                // override once an endpoint is confirmed.
+                path: format!("/eoptions/stream?streams={streams}"),
+                sym: 0,
+                eapi: Some((table, boot.bn_options.underlyings.clone())),
+            });
+        }
+        if bn_eapi_on {
+            // Loud endpoint provenance — the options WS base has
+            // churned (nbstream/fstream/vstream history) and can be
+            // geo-gated; the operator override is the escape hatch.
+            info!(
+                host = %cfg.binance_eapi_ws_host,
+                streams = discovery.bn_options.len() + boot.bn_options.underlyings.len(),
+                "binance: eapi options combined-stream slot (override via BINANCE_EAPI_WS_HOST)"
+            );
         }
         info!(
             conns = specs.len(),
             spot = boot.allocated.bn_spot.len(),
             usdm = boot.allocated.bn_usdm.len(),
+            eapi_options = discovery.bn_options.len(),
             "binance: M1 multi-connection lane"
         );
         match cli::spawn_binance_multi(

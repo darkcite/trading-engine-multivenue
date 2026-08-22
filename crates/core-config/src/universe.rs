@@ -214,6 +214,12 @@ pub struct Universe {
     pub binance_spot: Vec<String>,
     /// `[binance] usdm` — USDS-M futures stream symbols in file order.
     pub binance_usdm: Vec<String>,
+    /// `[binance] options_underlyings` / `options_expiries` /
+    /// `options_strikes` — the M2.4 capped options-chain policy
+    /// (underlyings are eapi names, e.g. `"BTCUSDT"`; see
+    /// [`OptionsPolicy`]; instruments are boot-discovered on the eapi
+    /// lane).
+    pub bn_options: OptionsPolicy,
     /// `[okx] instruments` — instIds in file order.
     pub okx_instruments: Vec<String>,
     /// `[okx] depth` — subscribe the 400-level books channel (§4.5).
@@ -332,6 +338,9 @@ enum Slot {
     PmMarkets,
     BnSpot,
     BnUsdm,
+    BnOptUnderlyings,
+    BnOptExpiries,
+    BnOptStrikes,
     OkxInstr,
     OkxDepth,
     OkxOptUnderlyings,
@@ -373,6 +382,9 @@ struct Builder {
     pm_markets: Option<Vec<String>>,
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
+    bn_opt_underlyings: Option<Vec<String>>,
+    bn_opt_expiries: Option<u32>,
+    bn_opt_strikes: Option<u32>,
     okx_instr: Option<Vec<String>>,
     okx_depth: Option<bool>,
     okx_opt_underlyings: Option<Vec<String>>,
@@ -458,7 +470,9 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 };
                 store_bool(&mut b, slot, v, line_no)?;
             }
-            Slot::OkxOptExpiries
+            Slot::BnOptExpiries
+            | Slot::BnOptStrikes
+            | Slot::OkxOptExpiries
             | Slot::OkxOptStrikes
             | Slot::DeribitOptExpiries
             | Slot::DeribitOptStrikes => {
@@ -519,6 +533,9 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Polymarket, "markets") => Some(Slot::PmMarkets),
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
+        (Section::Binance, "options_underlyings") => Some(Slot::BnOptUnderlyings),
+        (Section::Binance, "options_expiries") => Some(Slot::BnOptExpiries),
+        (Section::Binance, "options_strikes") => Some(Slot::BnOptStrikes),
         (Section::Okx, "instruments") => Some(Slot::OkxInstr),
         (Section::Okx, "depth") => Some(Slot::OkxDepth),
         (Section::Okx, "options_underlyings") => Some(Slot::OkxOptUnderlyings),
@@ -548,10 +565,14 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
         Slot::OkxInstr | Slot::DeribitInstr => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
-        Slot::OkxOptUnderlyings | Slot::DeribitOptUnderlyings => ElemKind::OptUnderlying,
+        Slot::BnOptUnderlyings | Slot::OkxOptUnderlyings | Slot::DeribitOptUnderlyings => {
+            ElemKind::OptUnderlying
+        }
         Slot::PairsMap => ElemKind::PairRef,
         Slot::OkxDepth
         | Slot::DeribitDepth
+        | Slot::BnOptExpiries
+        | Slot::BnOptStrikes
         | Slot::OkxOptExpiries
         | Slot::OkxOptStrikes
         | Slot::DeribitOptExpiries
@@ -799,6 +820,11 @@ fn store_array(
                 return Err(dup("options_underlyings"));
             }
         }
+        Slot::BnOptUnderlyings => {
+            if b.bn_opt_underlyings.replace(items).is_some() {
+                return Err(dup("options_underlyings"));
+            }
+        }
         Slot::HlCoins => {
             if b.hl_coins.replace(items).is_some() {
                 return Err(dup("coins"));
@@ -811,6 +837,8 @@ fn store_array(
         }
         Slot::OkxDepth
         | Slot::DeribitDepth
+        | Slot::BnOptExpiries
+        | Slot::BnOptStrikes
         | Slot::OkxOptExpiries
         | Slot::OkxOptStrikes
         | Slot::DeribitOptExpiries
@@ -880,6 +908,16 @@ fn store_int(b: &mut Builder, slot: Slot, v: u32, line_no: usize) -> Result<(), 
         }
         Slot::OkxOptStrikes => {
             if b.okx_opt_strikes.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `options_strikes`"));
+            }
+        }
+        Slot::BnOptExpiries => {
+            if b.bn_opt_expiries.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `options_expiries`"));
+            }
+        }
+        Slot::BnOptStrikes => {
+            if b.bn_opt_strikes.replace(v).is_some() {
                 return Err(err(line_no, "duplicate key `options_strikes`"));
             }
         }
@@ -966,6 +1004,12 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         b.okx_opt_expiries,
         b.okx_opt_strikes,
     )?;
+    let bn_options = finalize_options_policy(
+        "Binance",
+        b.bn_opt_underlyings.unwrap_or_default(),
+        b.bn_opt_expiries,
+        b.bn_opt_strikes,
+    )?;
 
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -1000,6 +1044,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         deribit_depth: b.deribit_depth.unwrap_or(false),
         deribit_options,
         okx_options,
+        bn_options,
         hl_coins,
         pairs,
     })
@@ -1662,13 +1707,12 @@ map = ["0:0", "1:1"]
     }
 
     #[test]
-    fn opt_keys_scope_deribit_and_okx_only() {
-        // The M2 scope pin: options keys exist under [deribit] (M2.1)
-        // and [okx] (M2.2); [binance] rejects until M2.4 lands its
-        // consumer, and non-options venues always reject.
+    fn opt_keys_scope_options_venues_only() {
+        // The M2 scope pin, final form: options keys exist under
+        // [deribit] (M2.1), [okx] (M2.2) and [binance] (M2.4);
+        // non-options venues always reject (options-plan §1: HL/PM
+        // have no options instrument class).
         for src in [
-            "[binance]\noptions_expiries = 2\n",
-            "[binance]\noptions_underlyings = [\"BTCUSDT\"]\n",
             "[polymarket]\noptions_strikes = 8\n",
             "[hyperliquid]\noptions_underlyings = [\"BTC\"]\n",
         ] {
@@ -1680,6 +1724,26 @@ map = ["0:0", "1:1"]
         assert_eq!(u.okx_options.expiries, OPT_EXPIRIES_DEFAULT);
         assert_eq!(u.okx_options.strikes, OPT_STRIKES_DEFAULT);
         assert!(!u.deribit_options.enabled());
+        assert!(!u.bn_options.enabled());
+    }
+
+    #[test]
+    fn bn_options_policy_same_law() {
+        let u = parse(
+            "[binance]\nspot = [\"btcusdt\"]\noptions_underlyings = [\"BTCUSDT\", \"ETHUSDT\"]\n\
+             options_expiries = 1\noptions_strikes = 4\n",
+        )
+        .expect("parses");
+        assert!(u.bn_options.enabled());
+        assert_eq!(u.bn_options.underlyings, vec!["BTCUSDT", "ETHUSDT"]);
+        assert_eq!(u.bn_options.expiries, 1);
+        assert_eq!(u.bn_options.strikes, 4);
+        // Venue-labeled errors from the shared law.
+        let e = parse("[binance]\noptions_expiries = 2\n").unwrap_err();
+        assert!(e.msg.contains("Binance") && e.msg.contains("options_underlyings"), "{e}");
+        let e = parse("[binance]\noptions_underlyings = [\"BTCUSDT\"]\noptions_strikes = 5\n")
+            .unwrap_err();
+        assert!(e.msg.contains("Binance") && e.msg.contains("options_strikes"), "{e}");
     }
 
     #[test]

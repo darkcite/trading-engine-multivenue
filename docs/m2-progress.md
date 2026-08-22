@@ -774,3 +774,185 @@ item; clean fallback if the operator rules M2 done at
 Deribit+OKX+channel — mvp-plan §6 risk 2). The §9.8 aggregated-IV
 digest table remains a worker-side follow-up needing an M3
 coordination window (claude-worker is M3-owned).
+
+---
+
+## 2026-08-22 — M2.3 COMMITTED `1d3670f`; M2.4 Binance eapi half-ingress CODE-COMPLETE (same session)
+
+Operator clarification recorded: "half-ingress" = engineering shape
+(a second lane inside `ingress-binance`, the M1c usdm precedent), not
+reduced function — after M2.4 the venue has full MARKET-DATA parity
+with Deribit/OKX. No venue gets options ORDER execution in M2
+(options-plan §5–§6, mvp-plan §7 — Stage-3-gated).
+
+### core-config (SHARED, third sequential touch)
+
+- `[binance] options_underlyings/options_expiries/options_strikes` →
+  `Universe.bn_options` via the shared `finalize_options_policy`
+  ("Binance"-labeled errors). Scope pin final form: all three options
+  venues accept; `[polymarket]`/`[hyperliquid]` reject (options-plan
+  §1 — no options instrument class there). Tests → 57.
+- `Config` gains `BINANCE_EAPI_REST_HOST` (`eapi.binance.com`) +
+  `BINANCE_EAPI_WS_HOST` (`nbstream.binance.com`); `.env.example` +
+  `universe.toml.example` updated.
+
+### ingress-binance — the eapi lane (`src/eapi.rs`, NEW)
+
+- **Discovery:** `EapiDiscovery::ingest_exchange_info` — ONE page
+  carries EVERY underlying (`optionSymbols[]`: symbol / underlying /
+  QUOTED `strikePrice` / BARE-ms `expiryDate` / `side` CALL|PUT;
+  `filters` + noise skipped structurally; cap 8192).
+  `parse_index_price` (`/eapi/v1/index?underlying=`, quoted
+  `indexPrice`). `select_capped_chain` — the selection LAW's third
+  twin (rule of three reached: unification into a shared home is now
+  a REAL refactor candidate — offered at M2 close; the three twins
+  stay pinned by identical proptest invariants), with the extra
+  `underlying` filter the one-page shape requires.
+- **WS lane:** ONE combined-stream connection
+  (`/stream?streams=<sym>@ticker/…/<uly>@index`, all lowercased) —
+  NO subscribe frames at all (the crate's direct-URL pattern; no ack
+  machinery). The eapi `<sym>@ticker` carries BOTH surfaces in one
+  message: `bo/ao/bq/aq` → `Tick` (skipped when both sides empty —
+  quiet far options), `mp/vo/d/g/v/t` → `OptSummary`
+  (flags = MARK_PX only: eapi has NO OI stream — the OKX-asymmetry
+  flags law); `<uly>@index` fills a fixed per-underlying cache that
+  supplies `underlying_px_1e9` (persists across reconnects,
+  refreshed by the first push). `EapiSymbolTable` (lowercased stream
+  sym → sym + uly idx, ≤64) + `EapiLane`.
+- **Integration:** `StreamLane` enum on the Binance `Driver`
+  (BookTicker | Eapi) — the eapi slot is ONE more `MultiConn` slot on
+  the SAME venue thread + producer (single-writer preserved;
+  monomorphic dispatch, no `dyn`); `Driver::new_eapi` with
+  `EAPI_RX_BUF_SIZE = 512 KiB` (64-ticker bursts); bookTicker slots
+  byte-identical. Two-phase frame handling (rx+lane borrows immutable
+  in phase 1; the index-cache write is the one phase-2 mutation).
+- Tests: ingress-binance 30 → **41** (exchangeInfo fixtures with
+  full filters noise, contract violations, index shapes, selection
+  per-underlying/determinism/no-leak, table lowercasing law, the
+  lane behavioral test: index→cache→summary-underlying, tick+summary
+  routing, quiet-quote summary-only, unknown-stream reject; +2
+  proptests: never-panic family + selection invariants incl.
+  foreign-underlying-zero). NEW fuzz target `binance_eapi` (all five
+  scanners + the selection cap on parsed tables).
+
+### cli
+
+- boot_discovery `run_bn_options`: ONE exchangeInfo fetch + one paced
+  index fetch per underlying (150 ms); ordinals
+  `make_symbol_id(Binance, BN_OPT_ORDINAL_BASE + k + 1)` (base 1024 —
+  reserved since M2.1; spot < 512, usdm < 1013); `no_chain` MISSING;
+  cap ≤ `EAPI_OPT_MAX`. `Outcome.bn_options: Vec<(symbol, sym,
+  uly_idx)>` (the lane table needs the family index). `run_all` gains
+  the policy param — the eapi surface is independent of the
+  spot/usdm audit arm.
+- bin: options ON forces the MULTI lane (the eapi slot is a MultiConn
+  slot — legacy one-symbol boots without options stay on the
+  soak-proven single-stream lane byte-identical); combined path built
+  at boot; `BinanceConnSpec.eapi` carries table+underlyings into the
+  spawn; NEW gauge `engine_ingress_binance_options_selected`;
+  `--binance-symbol` override drops the policy + WARNS (M1a law;
+  resolver-tested).
+- bench: the option-analytics alloc assertion now also covers
+  `split_combined` + `parse_eapi_ticker` + `parse_eapi_index` —
+  still 0 B/op (gate stays 37).
+
+### Gates (all on the Mac)
+
+- workspace nextest **1219/1219** (+1 skipped) = 1208 + 11 M2.4.
+- release alloc **37/37** 0 B/op (corrected guard, fresh `Compiling
+  bench`) — the option-analytics assertion now also covers
+  `split_combined`/`parse_eapi_ticker`/`parse_eapi_index`.
+- worker pytest **412/412** (serialized; `pgrep` clean first).
+- fuzz ≥300 s clean: `universe_toml` **172.5M** (bn keys riding),
+  `binance_eapi` (NEW) **13.0M**.
+
+### Live smoke — 3-venue exit-evidence boot + THE ENDPOINT FINDING
+
+`--paper --strategy all --metrics --raw-tap bn,okx,deribit`, all
+three options policies on, ~2.5 min, standing-lane window per
+runbook, ZERO `res=Error` (fresh-terminal verified):
+
+- **Discovery, all three venues LIVE:** Deribit 1038/932 rows, OKX
+  1558/1270, **Binance eapi 1860 rows in ONE exchangeInfo page +
+  per-uly index (77,016.06 / 2,412.94)** — selected **32+32 per
+  venue = 192 option instruments one boot**; all three gauges read
+  **64**; `binance: M1 multi-connection lane conns=4 spot=2 usdm=1
+  eapi_options=64` (the eapi slot on the SAME venue thread —
+  single-writer held).
+- **Records:** deribit-opt-summary **9,520** (64 syms, flags full,
+  IV 37–63 %); okx-opt-summary **792** (49 syms, flags 0/0);
+  spot/usdm ticks flowing (~5 MB bn-ticks). Integrity: bn/okx/hl
+  ZERO; pm 1 informational tick regr; deribit 1 tick regr + 1 trade
+  hole (2 ids) on the STATIC perp trades channel — genuine venue
+  stream reality, gap-paired by the monitors doing their job.
+- **THE FINDING — Binance options WS unreachable from THIS network
+  (pitfall #11 at the endpoint level):** eapi REST serves fine
+  (proven live, repeatedly), but EVERY candidate options-WS route
+  fails: `nbstream.binance.com` (a LIVE prod websocket ALB per DNS)
+  404s all path forms incl. the documented `/eoptions/…` (HTTP/1.1
+  forced); `fstream.binance.com/public|market/…` 403s (that
+  Connect.md carries 2021-era examples — stale); `vstream` 302s to
+  the homepage (retired); the futures mux connects but serves no
+  option streams. Calibration: known-good WS routes upgrade for the
+  same probe (curl code 000), so the 403/404s are real denials —
+  the geo/routing-block posture on the STREAM side that options-plan
+  anticipated. **Operator ruling 2026-08-22: recorded as TEMPORARILY
+  UNREACHABLE** — revisit (endpoint re-probe / permitted network)
+  before or during the M6 soak. **Shipped posture:** documented default
+  (`nbstream` + `/eoptions/stream?streams=…`, lowercase — spec'd),
+  loud boot provenance line, `BINANCE_EAPI_WS_HOST` operator
+  override as the escape hatch; the slot retries harmlessly;
+  `bn-opt-summary` stays header-only with flags honest until a
+  permitted endpoint/network is confirmed. The eapi WS lane itself is
+  fixture-proven end-to-end (the run-loop behavioral test: index →
+  cache → summary-underlying, tick+summary routing, quiet-quote
+  summary-only, reject path) and fuzz-clean — the ONLY unverified
+  link is the venue's stream endpoint from this network.
+- Universe restored (options OFF overnight); standing lane
+  bootstrapped back (pid verified).
+
+### M2 EXIT status vs mvp-plan §4-M2 + the §6-risk-2 RULING ASK
+
+- options ticks in capture: **Deribit ✓ OKX ✓ live; BN code-ready,
+  stream-blocked from this network** (BN option BBO would ride the
+  same eapi ticker message the moment the endpoint serves).
+- mark/IV records: **Deribit ✓ OKX ✓ live; BN same posture.**
+- integrity green ✓ · fuzz clean (all 7 options-family targets) ✓ ·
+  full-universe boot with capped chains (192 instruments, three
+  venues discovered+selected) ✓.
+
+**Operator ruling requested (mvp-plan §6 risk 2, verbatim fallback):
+rule M2 DONE with Deribit+OKX options fully live and BN options
+in-flight (code-complete, REST-half live-proven, stream endpoint
+gated on network/venue access) — or keep M2 open pending a
+BN-options-permitted network/endpoint confirmation.**
+
+### Slice checkpoint — COMMIT ASK (pending operator authorization)
+
+`M2:`-prefixed, EXPLICIT paths only:
+
+- `crates/core-config/src/lib.rs`
+- `crates/core-config/src/universe.rs`
+- `crates/ingress-binance/src/lib.rs`
+- `crates/ingress-binance/src/eapi.rs` (new)
+- `crates/ingress-binance/src/run_loop.rs`
+- `crates/cli/src/universe_boot.rs`
+- `crates/cli/src/paper.rs`
+- `crates/cli/src/bin/multivenue-engine.rs`
+- `crates/bench/tests/alloc_assertions.rs`
+- `fuzz/Cargo.toml`
+- `fuzz/fuzz_targets/binance_eapi.rs` (new)
+- `universe.toml.example`
+- `.env.example`
+- `docs/m2-progress.md`
+
+NOT staged: anything of M3's; `.env`; `~/multivenue/*`.
+
+**Resume point if context dies here:** M2.4 code-complete + gates
+green + exit-evidence smoked (BN stream endpoint documented-blocked);
+commit ask + the §6-risk-2 ruling pending. Remaining M2 close-out
+regardless of the ruling: the §9.8 aggregated-IV digest table (M3
+coordination window), the selection-law unification refactor OFFER
+(three pinned twins — rule of three reached), docs/hot-path-latency.md
+symbol-table note, CLAUDE.md CURRENT-STATE + session-facts refresh at
+M2 close.

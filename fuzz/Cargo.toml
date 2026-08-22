@@ -199,6 +199,13 @@ doc    = false
 bench  = false
 
 [[bin]]
+name   = "binance_eapi"
+path   = "fuzz_targets/binance_eapi.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
 name   = "hl_info"
 path   = "fuzz_targets/hl_info.rs"
 test   = false

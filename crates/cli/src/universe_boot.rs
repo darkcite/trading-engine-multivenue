@@ -76,6 +76,13 @@ pub struct BootUniverse {
     /// True when `--okx-symbols` dropped an ENABLED config options
     /// policy — the bin logs the consequence.
     pub okx_options_dropped: bool,
+    /// M2.4 capped options-chain policy for the Binance eapi lane
+    /// (config-file only; an explicit `--binance-symbol` override
+    /// replaces the whole `[binance]` section, policy included).
+    pub bn_options: universe::OptionsPolicy,
+    /// True when `--binance-symbol` dropped an ENABLED config options
+    /// policy — the bin logs the consequence.
+    pub bn_options_dropped: bool,
     /// Effective Deribit depth-channel toggle (flag OR config).
     pub deribit_depth: bool,
     /// M2.1 capped options-chain policy for Deribit (config-file
@@ -159,6 +166,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 deribit_depth: f.deribit_depth,
                 okx_options: universe::OptionsPolicy::default(),
                 okx_options_dropped: false,
+                bn_options: universe::OptionsPolicy::default(),
+                bn_options_dropped: false,
                 deribit_options: universe::OptionsPolicy::default(),
                 deribit_options_dropped: false,
                 from_config: false,
@@ -217,6 +226,15 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             } else {
                 (u.okx_options.clone(), false)
             };
+            // M2.4: --binance-symbol replaces the whole [binance]
+            // section (spot/usdm handled above via the allocated
+            // universe) — the options policy drops with it.
+            let bn_flag_active = f.bn_symbol.map(str::trim).filter(|s| !s.is_empty()).is_some();
+            let (bn_options, bn_options_dropped) = if bn_flag_active {
+                (universe::OptionsPolicy::default(), u.bn_options.enabled())
+            } else {
+                (u.bn_options.clone(), false)
+            };
             BootUniverse {
                 okx_spec: okx_flag.or_else(|| join_or_none(&u.okx_instruments)),
                 deribit_spec: deribit_flag.or_else(|| join_or_none(&u.deribit_instruments)),
@@ -225,6 +243,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 deribit_depth: f.deribit_depth || u.deribit_depth,
                 okx_options,
                 okx_options_dropped,
+                bn_options,
+                bn_options_dropped,
                 deribit_options,
                 deribit_options_dropped,
                 allocated,
@@ -525,5 +545,34 @@ mod tests {
         let b3 = resolve_boot_universe(&f3).expect("resolves");
         assert!(b3.okx_options.enabled());
         assert_eq!(b3.okx_spec, None);
+    }
+
+    // ---- M2.4 binance options policy through the resolver ----------
+
+    #[test]
+    fn config_bn_options_policy_carried_and_flag_dropped() {
+        let src = format!(
+            "[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n\
+             options_underlyings = [\"BTCUSDT\"]\noptions_expiries = 1\n"
+        );
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert!(b.bn_options.enabled());
+        assert_eq!(b.bn_options.underlyings, vec!["BTCUSDT"]);
+        assert_eq!(b.bn_options.expiries, 1);
+        assert!(!b.bn_options_dropped);
+        // --binance-symbol override replaces the [binance] section —
+        // the policy drops with it, flagged for the bin's warn.
+        let f2 = UniverseFlags {
+            config_src: Some(&src),
+            bn_symbol: Some("ethusdt"),
+            ..UniverseFlags::default()
+        };
+        let b2 = resolve_boot_universe(&f2).expect("resolves");
+        assert!(!b2.bn_options.enabled());
+        assert!(b2.bn_options_dropped);
     }
 }

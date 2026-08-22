@@ -1627,6 +1627,8 @@ fn deribit_parsers_are_zero_alloc() {
 fn option_analytics_parsers_are_zero_alloc() {
     let deribit_opt: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-27MAR26-100000-C.100ms","data":{"timestamp":1774000000123,"instrument_name":"BTC-27MAR26-100000-C","state":"open","mark_price":0.0523,"mark_iv":65.43,"greeks":{"delta":0.512,"gamma":1.234e-5,"vega":152.3,"theta":-85.3,"rho":12.1},"open_interest":1234.5,"index_price":77216.94,"underlying_price":77300.12}}}"#;
     let okx_row: &[u8] = br#"{"instType":"OPTION","instId":"BTC-USD-260327-100000-C","uly":"BTC-USD","deltaBS":"0.512","gammaBS":"1.234e-5","thetaBS":"-85.3","vegaBS":"152.3","markVol":"0.6543","fwdPx":"77300.12","ts":"1774598400123"}"#;
+    let bn_combined: &[u8] = br#"{"stream":"btc-260327-100000-c@ticker","data":{"s":"BTC-260327-100000-C","bo":"2040.5","ao":"2060.1","bq":"1.25","aq":"0.75","d":"0.512","t":"-85.3","g":"0.0000123","v":"152.3","vo":"0.6543","mp":"2051.2"}}"#;
+    let bn_index: &[u8] = br#"{"stream":"btcusdt@index","data":{"e":"index","s":"BTCUSDT","p":"77000.5"}}"#;
     let sym: SymbolId = (3 << 24) | 513;
 
     let g = AllocGuard::new();
@@ -1652,6 +1654,12 @@ fn option_analytics_parsers_are_zero_alloc() {
         let r = ingress_okx::parse_opt_summary_row(okx_row).unwrap();
         acc = acc.wrapping_add(r.fwd_px_1e9);
         std::hint::black_box(ingress_okx::extract_inst_family(okx_row));
+        // M2.4: the eapi combined splitter + ticker/index parsers.
+        let (_, tail) = ingress_binance::eapi::split_combined(bn_combined).unwrap();
+        let e = ingress_binance::eapi::parse_eapi_ticker(tail).unwrap();
+        acc = acc.wrapping_add(e.mark_px_1e9);
+        let (_, itail) = ingress_binance::eapi::split_combined(bn_index).unwrap();
+        acc = acc.wrapping_add(ingress_binance::eapi::parse_eapi_index(itail).unwrap());
     }
     std::hint::black_box(acc);
 

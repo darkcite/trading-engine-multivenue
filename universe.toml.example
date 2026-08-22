@@ -29,6 +29,13 @@ markets = [
 # usdm streams connect to BINANCE_FUT_WS_HOST (default fstream.binance.com).
 spot = ["btcusdt"]
 usdm = []
+# M2.4 capped options chain — same law as [deribit]/[okx]; underlyings
+# are eapi names (e.g. "BTCUSDT"); discovered instruments join the
+# eapi combined stream (BBO ticks + OptSummary records; no OI on this
+# venue's stream — flags say so).
+options_underlyings = []   # e.g. ["BTCUSDT", "ETHUSDT"] — empty/absent = lane OFF
+# options_expiries = 2     # E: nearest expiries, 1..=4 (default 2)
+# options_strikes = 8      # K: even, 2..=32 (default 8 = ATM±4)
 
 [okx]
 # instIds, file order = ordinal order (make_symbol_id(Okx, i+1)).

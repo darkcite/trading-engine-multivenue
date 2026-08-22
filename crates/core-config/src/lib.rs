@@ -83,6 +83,19 @@ pub struct Config {
     /// (`GET /fapi/v1/exchangeInfo`). Env: `BINANCE_FUT_REST_HOST`.
     /// Default: `fapi.binance.com`.
     pub binance_fut_rest_host: String,
+    /// Binance European-options REST host (M2.4 eapi discovery:
+    /// `GET /eapi/v1/exchangeInfo`, `GET /eapi/v1/index`). Env:
+    /// `BINANCE_EAPI_REST_HOST`. Default: `eapi.binance.com`.
+    pub binance_eapi_rest_host: String,
+    /// Binance European-options WS host (M2.4 combined stream at
+    /// `/eoptions/stream?streams=…` — the documented base on the live
+    /// nbstream ALB). TEMPORARILY UNREACHABLE from this network as of
+    /// 2026-08-22 (every candidate route 404/403s while eapi REST
+    /// serves fine — forensics in docs/m2-progress.md); the lane
+    /// retries harmlessly until an endpoint is confirmed, then this
+    /// override activates it without a code change. Env:
+    /// `BINANCE_EAPI_WS_HOST`. Default: `nbstream.binance.com`.
+    pub binance_eapi_ws_host: String,
     /// Alchemy RPC host.
     pub alchemy_host: String,
     /// Paper-mode toggle.
@@ -154,6 +167,10 @@ impl Config {
                 .unwrap_or_else(|| "api.binance.com".into()),
             binance_fut_rest_host: env_opt("BINANCE_FUT_REST_HOST")
                 .unwrap_or_else(|| "fapi.binance.com".into()),
+            binance_eapi_rest_host: env_opt("BINANCE_EAPI_REST_HOST")
+                .unwrap_or_else(|| "eapi.binance.com".into()),
+            binance_eapi_ws_host: env_opt("BINANCE_EAPI_WS_HOST")
+                .unwrap_or_else(|| "nbstream.binance.com".into()),
             alchemy_host: env_req("ALCHEMY_HOST")?,
             paper_mode: env_opt("MULTIVENUE_MODE").as_deref() == Some("paper"),
             metrics_bind: env_opt("METRICS_BIND").unwrap_or_else(|| "127.0.0.1:9191".into()),

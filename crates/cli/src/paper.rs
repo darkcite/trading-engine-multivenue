@@ -528,12 +528,19 @@ pub fn spawn_binance(
 /// host + path + pinned sym. Spot and USDS-M futures slots mix
 /// freely — each slot carries its own host (M1 design).
 pub struct BinanceConnSpec {
-    /// WS host (spot: `BINANCE_WS_HOST`; USDS-M: `BINANCE_FUT_WS_HOST`).
+    /// WS host (spot: `BINANCE_WS_HOST`; USDS-M: `BINANCE_FUT_WS_HOST`;
+    /// eapi options: `BINANCE_EAPI_WS_HOST`).
     pub host: String,
-    /// Stream path `/ws/<symbol>@bookTicker`.
+    /// Stream path (`/ws/<symbol>@bookTicker`, or the M2.4 eapi
+    /// combined `/stream?streams=…`).
     pub path: String,
-    /// Pinned SymbolId (the M1 allocation law).
+    /// Pinned SymbolId (the M1 allocation law; 0 sentinel on an eapi
+    /// slot — its syms live in the lane table).
     pub sym: core_types::SymbolId,
+    /// M2.4: present ⇒ this slot is the eapi combined options stream
+    /// — the boot-built symbol table + the configured underlyings
+    /// (stream-lowercased inside the lane).
+    pub eapi: Option<(ingress_binance::eapi::EapiSymbolTable, Vec<String>)>,
 }
 
 /// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
@@ -598,8 +605,20 @@ pub fn spawn_binance_multi(
                 }
             };
             let mut conns: Vec<bwl::MultiConn<TlsTransport>> = Vec::with_capacity(specs.len());
-            for i in 0..specs.len() {
-                let drv = bwl::Driver::new(now_ns().wrapping_add(i as u64), specs[i].sym);
+            for (i, spec) in specs.into_iter().enumerate() {
+                // M2.4: an eapi spec builds the combined-stream lane
+                // driver; bookTicker slots stay byte-identical.
+                let drv = match spec.eapi {
+                    Some((table, ulys)) => {
+                        let uly_refs: Vec<&[u8]> =
+                            ulys.iter().map(|s| s.as_bytes()).collect();
+                        bwl::Driver::new_eapi(
+                            now_ns().wrapping_add(i as u64),
+                            ingress_binance::eapi::EapiLane::new(table, &uly_refs),
+                        )
+                    }
+                    None => bwl::Driver::new(now_ns().wrapping_add(i as u64), spec.sym),
+                };
                 conns.push(bwl::MultiConn::new(
                     drv,
                     eps[i].host.as_bytes(),
@@ -2181,6 +2200,9 @@ impl Observability {
             let okx_options_selected = reg
                 .register_gauge("engine_ingress_okx_options_selected")
                 .map_err(|_| "register engine_ingress_okx_options_selected")?;
+            let binance_options_selected = reg
+                .register_gauge("engine_ingress_binance_options_selected")
+                .map_err(|_| "register engine_ingress_binance_options_selected")?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -2249,6 +2271,7 @@ impl Observability {
                 coverage_binance,
                 deribit_options_selected,
                 okx_options_selected,
+                binance_options_selected,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -2455,6 +2478,9 @@ pub struct EngineCounters {
     pub deribit_options_selected: GaugeId,
     /// M2.2: same for OKX (`engine_ingress_okx_options_selected`).
     pub okx_options_selected: GaugeId,
+    /// M2.4: same for the Binance eapi lane
+    /// (`engine_ingress_binance_options_selected`).
+    pub binance_options_selected: GaugeId,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -3457,7 +3483,7 @@ pub mod boot_discovery {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use core_config::universe::{OptionsPolicy, OPT_ORDINAL_BASE};
+    use core_config::universe::{OptionsPolicy, BN_OPT_ORDINAL_BASE, OPT_ORDINAL_BASE};
     use core_config::Config;
     use core_types::{make_symbol_id, SymbolId, VenueId};
     use ingress_binance::discovery::BnDiscovery;
@@ -3539,6 +3565,11 @@ pub mod boot_discovery {
         /// caller skipped it (legacy flag boots keep their historical
         /// zero-REST Binance behavior — config boots audit).
         pub bn: Option<VenueCoverage>,
+        /// M2.4: the selected Binance eapi options chain — `(symbol,
+        /// sym, uly_idx)` in deterministic allocation order (base
+        /// [`BN_OPT_ORDINAL_BASE`]). The bin builds the eapi lane
+        /// table from these. Empty when the policy is disabled.
+        pub bn_options: Vec<(String, SymbolId, u8)>,
     }
 
     // -----------------------------------------------------------
@@ -4175,6 +4206,105 @@ pub mod boot_discovery {
         Ok(VenueCoverage { configured, matched, universe })
     }
 
+    /// M2.4: fetch + select the capped Binance eapi options chain —
+    /// the Deribit/OKX law on the eapi surface. ONE `exchangeInfo`
+    /// page carries EVERY underlying (the selection filters per
+    /// family); one paced `index` fetch per configured underlying is
+    /// the ATM reference. Ordinals allocated HERE in selection order
+    /// from [`BN_OPT_ORDINAL_BASE`] (the venue's 512-block belongs to
+    /// usdm). Fetch/parse failures FATAL; an EMPTY per-underlying
+    /// selection is MISSING semantics (reason `no_chain`). Returns
+    /// `(symbol, sym, uly_idx)` — the lane table needs the underlying
+    /// index for its per-family index-price cache.
+    fn run_bn_options(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        policy: &OptionsPolicy,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<Vec<(String, SymbolId, u8)>, &'static str> {
+        let (host, port) = split_host_port(&cfg.binance_eapi_rest_host, 443)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let range = get(tls, host, port, "/eapi/v1/exchangeInfo", buf).map_err(|e| {
+            tracing::error!(venue = "bn", error = ?e, "discovery: eapi exchangeInfo fetch failed");
+            "bn: eapi exchangeInfo fetch failed"
+        })?;
+        let mut d = ingress_binance::eapi::EapiDiscovery::new();
+        d.ingest_exchange_info(&buf[range]).map_err(|e| {
+            tracing::error!(venue = "bn", error = ?e, "discovery: eapi exchangeInfo parse failed");
+            "bn: eapi exchangeInfo parse failed"
+        })?;
+
+        let mut out: Vec<(String, SymbolId, u8)> = Vec::new();
+        let mut k = 0u32;
+        for (uly_idx, uly) in policy.underlyings.iter().enumerate() {
+            std::thread::sleep(Duration::from_millis(150));
+            let idx_path = format!("/eapi/v1/index?underlying={uly}");
+            let range = get(tls, host, port, &idx_path, buf).map_err(|e| {
+                tracing::error!(venue = "bn", underlying = %uly, error = ?e, "discovery: eapi index fetch failed");
+                "bn: eapi index fetch failed"
+            })?;
+            let index_px_1e9 =
+                ingress_binance::eapi::parse_index_price(&buf[range]).map_err(|e| {
+                    tracing::error!(venue = "bn", underlying = %uly, error = ?e, "discovery: eapi index parse failed");
+                    "bn: eapi index parse failed"
+                })?;
+
+            let sel = ingress_binance::eapi::select_capped_chain(
+                d.rows(),
+                uly.as_bytes(),
+                index_px_1e9,
+                policy.expiries,
+                policy.strikes,
+                now_ms,
+            );
+            if sel.is_empty() {
+                *any_missing = true;
+                tracing::error!(
+                    venue = "bn",
+                    underlying = %uly,
+                    reason = "no_chain",
+                    chain_total = d.universe_total(),
+                    "discovery: options underlying selected no instruments"
+                );
+            }
+            for row in &sel {
+                let symbol = core::str::from_utf8(row.symbol())
+                    .map_err(|_| "bn: non-utf8 eapi option symbol")?;
+                let sym = make_symbol_id(VenueId::Binance, BN_OPT_ORDINAL_BASE + k + 1);
+                k += 1;
+                out.push((symbol.to_string(), sym, uly_idx as u8));
+            }
+            tracing::info!(
+                venue = "bn",
+                underlying = %uly,
+                index_px_1e9,
+                expiries = policy.expiries,
+                strikes = policy.strikes,
+                chain_total = d.universe_total(),
+                selected = sel.len(),
+                "discovery: options chain"
+            );
+        }
+        if out.len() > ingress_binance::eapi::EAPI_OPT_MAX {
+            tracing::error!(
+                venue = "bn",
+                selected = out.len(),
+                cap = ingress_binance::eapi::EAPI_OPT_MAX,
+                "discovery: selected options chain exceeds the per-connection cap"
+            );
+            return Err(
+                "bn: selected options chain exceeds EAPI_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes",
+            );
+        }
+        Ok(out)
+    }
+
     /// Run the full boot discovery pass: OKX (if `okx_spec` is
     /// configured), Deribit (if `deribit_spec` is configured),
     /// Hyperliquid (if `hl_spec` is configured), Binance (M1 — if the
@@ -4194,6 +4324,7 @@ pub mod boot_discovery {
         deribit_options_policy: &OptionsPolicy,
         hl_spec: Option<&str>,
         binance: Option<(&[String], &[String])>,
+        bn_options_policy: &OptionsPolicy,
         polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
@@ -4248,9 +4379,28 @@ pub mod boot_discovery {
             _ => None,
         };
 
+        // M2.4: the eapi capped options chain — its own surface,
+        // independent of the spot/usdm audit arm.
+        let bn_options = if bn_options_policy.enabled() {
+            run_bn_options(cfg, tls_config, bn_options_policy, &mut buf, &mut any_missing)?
+        } else {
+            Vec::new()
+        };
+
         let pm = run_pm(cfg, tls_config, polymarket_asset_ids, &mut buf, &mut any_missing)?;
 
-        Ok(Outcome { any_missing, pm, okx, okx_table, okx_options, deribit, deribit_options, hl, bn })
+        Ok(Outcome {
+            any_missing,
+            pm,
+            okx,
+            okx_table,
+            okx_options,
+            deribit,
+            deribit_options,
+            hl,
+            bn,
+            bn_options,
+        })
     }
 
     // -----------------------------------------------------------
