@@ -33,6 +33,7 @@
 )]
 
 pub mod audit_replay;
+pub mod backtest;
 pub mod paper;
 pub mod pinning;
 pub mod sigint;

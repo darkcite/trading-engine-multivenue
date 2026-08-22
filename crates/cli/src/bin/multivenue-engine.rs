@@ -55,6 +55,13 @@ enum Cmd {
     /// checks, integrity re-derivations and the venue×channel coverage
     /// matrix over one capture run directory.
     AuditReplay(AuditReplayArgs),
+    /// Offline 8h backtest harness (docs/phase-8h-design.md §3–§5):
+    /// deterministic replay of PMLR capture through the real
+    /// strategy-vm against a candidate ruleset. schema-1 JSON on
+    /// stdout (the frozen claude-worker contract), human summary on
+    /// stderr; exit 0 only when a trustworthy report was printed.
+    /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
+    Backtest(BacktestArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -62,6 +69,41 @@ struct AuditReplayArgs {
     /// Capture run directory (`<MULTIVENUE_LOG_DIR>/run-<ns>`).
     #[arg(long)]
     dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct BacktestArgs {
+    /// Candidate ruleset JSON artifact (8g §4.1 grammar).
+    #[arg(long)]
+    ruleset: PathBuf,
+    /// Capture source: a single `run-<epoch_ns>` directory or a log
+    /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
+    #[arg(long)]
+    replay_dir: PathBuf,
+    /// IS/OOS split `N/M`: integers, `N + M == 100`, both >= 10 — or
+    /// the carved all-OOS monitor form `0/100` (design §3.4). Echoed
+    /// verbatim into the schema-1 report.
+    #[arg(long)]
+    split: String,
+    /// §4.3 fee override `<venue>:<maker_bps>:<taker_bps>`,
+    /// repeatable (venues: pm|bn|okx|deribit|hl). Defaults all 0/0.
+    /// Parsed but UNUSED by the H1 hold model (consumed from H2).
+    #[arg(long)]
+    fee_bps: Vec<String>,
+    /// §4.4 global latency-penalty override in ns (default per-venue:
+    /// pm 200 ms, bn/okx/deribit 100 ms, hl 600 ms). Parsed but
+    /// UNUSED by the H1 hold model (consumed from H2).
+    #[arg(long)]
+    latency_ns: Option<u64>,
+    /// §4.4 per-venue latency override `<venue>:<ns>`, repeatable;
+    /// wins over `--latency-ns`. Parsed but UNUSED by the H1 hold
+    /// model (consumed from H2).
+    #[arg(long)]
+    latency_ns_venue: Vec<String>,
+    /// §5 rich-detail sidecar path (per-symbol/IS metrics). Declared
+    /// now; the sidecar is written starting H2.
+    #[arg(long)]
+    emit_detail: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -215,12 +257,56 @@ struct ConfigArgs {
 }
 
 fn main() -> ExitCode {
-    init_tracing();
+    // Parse BEFORE installing tracing: the backtest arm must route
+    // every log line to stderr — its stdout is the schema-1 JSON the
+    // worker `json.loads`es, and one stray fmt-layer line (default
+    // writer: stdout) would corrupt the frozen contract. The other
+    // arms keep their historical stdout logging unchanged.
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run(args) => run(args),
-        Cmd::PrintConfig(args) => print_config(args),
-        Cmd::AuditReplay(args) => audit_replay(args),
+        Cmd::Run(args) => {
+            init_tracing();
+            run(args)
+        }
+        Cmd::PrintConfig(args) => {
+            init_tracing();
+            print_config(args)
+        }
+        Cmd::AuditReplay(args) => {
+            init_tracing();
+            audit_replay(args)
+        }
+        Cmd::Backtest(args) => {
+            init_tracing_stderr();
+            backtest(args)
+        }
+    }
+}
+
+/// The §5 exit-code contract: schema-1 on stdout + summary on stderr
+/// and exit 0 iff the report is trustworthy; ANY failure prints its
+/// reason to stderr only and exits nonzero (the worker maps every
+/// nonzero to `BacktestError` — "harness output untrusted").
+fn backtest(args: BacktestArgs) -> ExitCode {
+    let cfg = cli::backtest::BacktestConfig {
+        ruleset: args.ruleset,
+        replay_dir: args.replay_dir,
+        split: args.split,
+        fee_bps: args.fee_bps,
+        latency_ns: args.latency_ns,
+        latency_ns_venue: args.latency_ns_venue,
+        emit_detail: args.emit_detail,
+    };
+    match cli::backtest::run(&cfg) {
+        Ok(out) => {
+            eprint!("{}", out.summary);
+            println!("{}", out.schema1);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("backtest: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -242,6 +328,17 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .try_init();
+}
+
+/// Backtest-arm tracing: identical filter, writer pinned to stderr so
+/// stdout carries schema-1 bytes and nothing else.
+fn init_tracing_stderr() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init();
 }
 

@@ -224,3 +224,241 @@ probe are runbook facts (no boots expected in H1; G0 law `cargo build
 --release -p cli` applies before ANY boot if one ever runs). If context
 runs short: write interim state + exact resume point + relaunch prompt into
 docs/phase-8h-progress.md, then tell me.
+
+---
+
+## 2026-08-22 — Session H1 (design §13 item 1: harness substrate) — CLOSED
+
+Authority: the H1 kickoff above + design (LOCKED). RustRover MCP attached
+FIRST (`get_project_modules` OK against the main checkout). **Precondition
+drift, recorded:** the kickoff assumed HEAD `39e6542` + five working-tree H0
+docs to fold; the actual session-start HEAD was `f052da0` ("+ Docks
+organized") — the operator had already committed ALL FIVE H0 docs plus the
+2026-08-22 doc-reorg (CLAUDE.md rewrite, `docs/arch/` moves, AGENTS/README
+touches, a 4-line `core-types` doc tweak) and the tree was CLEAN. The fold
+is therefore moot; **commit 1 of this session is code + this log entry
+only.** No git op was taken beyond read-only verify until that commit.
+
+### What was built (cli-only; engine/strategy-vm/ingress/core untouched)
+
+- `crates/cli/src/backtest.rs` (NEW, `audit_replay.rs` offline doctrine —
+  allocates freely, never engine-loaded): §3.1 capture discovery (run dir OR
+  log root; runs epoch-ordered; dir-name epoch cross-checked against every
+  PMLR header), §3.2 merge, §3.3 VIRT_T0 rebase, §3.5 capture-observed
+  universe (sorted dedup, `SYMBOL_ID_NONE` skipped) + `validate_ruleset`
+  REUSE, §3.6 evaluator drive, §5 schema-1 render + stderr summary, §4.3/
+  §4.4 model-flag parsing (declared, defaults pinned, explicitly UNUSED).
+- `crates/cli/src/bin/multivenue-engine.rs`: `Cmd::Backtest` +
+  `BacktestArgs` (`--ruleset/--replay-dir/--split` mandatory = the frozen
+  worker argv; `--fee-bps/--latency-ns/--latency-ns-venue/--emit-detail`
+  declared per §4/§5). **Backtest-arm tracing is pinned to stderr**
+  (parse-then-init split in `main`): the default fmt layer writes to
+  stdout, and one stray log line would corrupt the schema-1 contract; the
+  Run/PrintConfig/AuditReplay arms keep their historical stdout logging
+  byte-for-byte.
+- `crates/cli/Cargo.toml`: + `strategy-vm`, + `core-crypto` (moved up from
+  dev-deps — the harness hashes the artifact the way the worker does), +
+  `proptest` (dev).
+- Evaluator drive is the REAL path end to end: `Box<VmStrategy<4096>>` →
+  `on_start` → inherent `receive_table` (copy-#2 seam; NOT the defaulted
+  trait hook) → synthesized shape-valid `AiCmd{RulesetCommit, px/qty =
+  hash128 LE halves}` through `on_ai` — flip VERIFIED (`commits_applied ==
+  1` or Internal error, nonzero exit) → `on_tick` per merged record with
+  `BacktestCtx` (`now_ns` = record virt ts; `submit` logs orders +
+  running max notional, i128-exact). Cooldown stamps carry across run
+  boundaries (continuous replay); emit-time semantics are production
+  (post-only at mid, row-cap ∧ policy re-clamp — all inside the vm).
+
+### Interpretations — FLAGGED FOR H2 REVIEW (uphold or amend, explicitly)
+
+1. **Merge key carries a file-ordinal backstop:** implemented total key =
+   `(ts_ns, venue byte, file ordinal, per-file idx)` with the fixed label
+   order pm/bn/okx/rpc/deribit/hl. With one tick file per venue per run the
+   ordinal never differs from venue-byte ranking (the §3.2 triple), but it
+   keeps the order total on degenerate fixtures. Implemented as a total-key
+   sort — equivalent to the §3.2 k-way heap on per-file-monotonic inputs
+   and still total/deterministic if a file were ever non-monotonic.
+2. **PMLR v2 REQUIRED on consumed tick files:** v1 leaves the venue byte
+   undefined and the merge keys on it ⇒ v1 file = Capture error, nonzero.
+   (Reader itself accepts ≤2; the harness is stricter. Design was silent.)
+3. **Overlapping runs are refused:** if a run's virtual base (VIRT_T0 +
+   Δepoch) precedes the previous run's last virt tick, two captures overlap
+   in wall time (two writers on one root) — §3.2 "disjoint time windows"
+   is ENFORCED (Capture error), not assumed.
+4. **OOS window = `[boundary, last]`, boundary inclusive;** boundary =
+   `first_virt + span·N/100` (u128 mul, integer floor). Under this
+   definition empty-OOS is structurally unreachable while the merge is
+   non-empty; the §5 "zero OOS ticks" exit is kept as a tripwire for H2
+   bucketing changes.
+5. **Run-content rules:** a run dir with NO `*-ticks.pmlr` at all ⇒
+   Capture error; all-header-only runs are tolerated (contribute nothing);
+   a merged UNION that is empty ⇒ "merged capture stream is empty", nonzero.
+   Non-consumption of events/signals/ai-cmds/engine-fills upheld (§3.1).
+6. **Split grammar strictness:** ASCII digits only, ≤3 per part, no signs,
+   no whitespace, no leading zeros (echo is verbatim ⇒ canonical spellings
+   only); `N+M==100 ∧ both ≥10`, plus the carved `0/100`. `100/0` rejected.
+7. **Epoch-tied run dirs** order by `(epoch_ns, name)` — deterministic;
+   the overlap guard then rejects any real collision.
+8. **Table epoch stays 0** as `validate_ruleset` leaves it (production
+   epochs are the side path's to stamp; the flip keys on hash128 only).
+9. **clap usage errors exit 2** (clap default), harness errors exit 1 —
+   both nonzero, both mapped by the worker to `BacktestError`. §5 needs
+   only "nonzero"; noted for precision.
+
+### schema-1 wiring state — real vs stub (kickoff mandate)
+
+REAL now: `schema_version` (literal 1), `ruleset_hash` (core-crypto SHA-256
+of the file bytes, full hex), `split` (argv echo, validated before embed),
+`bounds.max_order_notional_usd` (max px·qty/1e6 over ALL emitted orders —
+§4.6 full-window — deterministic fixed-point i64×1e6 renderer, zero float
+round-trips anywhere). REAL ZEROS BY VACUITY (not placeholders): `oos.trades`
+/ `trading_days` / `net_pnl_usd` / `max_drawdown_usd` and the two position
+bounds — the hold model synthesizes no fills, so 0 is the true §4.5 value;
+the capture-span UTC-day count goes to stderr only. STUB (H2 scope): the
+whole §4 model — open-order table + 4/32 caps, strict-cross fills, fees, Δ
+activation, fixed-point equity/DD, end-of-window liquidation, OOS
+accounting bucketing, `--emit-detail` sidecar (flag parsed, stderr notes
+"deferred"), and `on_fill` feedback (§3.6.4 — nothing to feed yet).
+
+### Tests added (27; §12 H1 slice)
+
+In-module (14): split grammar (contract + carved form + 19 reject shapes),
+model-flag defaults/layering/malformed, run-dir name parse, fixed-point
+renderer (incl. i64::MAX), §3.2 order unit + **merge proptest
+(total/stable/sorted over arbitrary per-venue streams, adversarial input
+order)**, §3.3 rebase arithmetic (cross-run monotonicity), universe
+derivation, ctx notional/log. Integration `crates/cli/tests/
+backtest_harness.rs` (13): **golden two-run two-venue fixture** (PmlrWriter
+in-test; bn mid 0.56 / pm mid 0.50, 80 bps row ⇒ hand-computed: 5 merged,
+universe {7,42}, virt window/boundary exact, evals 3 / fires 2 / emits 2 /
+$50.0 max-order, 1 UTC day), single-run-dir form, carved 0/100 echo,
+**byte-identical determinism** (schema-1 AND summary), **REAL binary on the
+frozen worker argv** (stdout = the schema-1 line ALONE + nonempty stderr),
+reject/bad-split via binary ⇒ nonzero + EMPTY stdout, `Reject(Symbol)` via
+lib, empty root, header-only run, epoch cross-check mismatch, crafted
+v1-header refusal, unreadable ruleset.
+
+### Gates at close (all on the Mac; MCP terminal, nohup+poll)
+
+- workspace nextest **1056/1056** (baseline 1029 + 27 new), 0 skipped.
+- release alloc **36/36** 0 B/op `--test-threads=1`, false-green guard
+  applied (`cargo clean -p bench`; exactly one fresh `Compiling bench` in
+  `/tmp/8h-h1-alloc.log`).
+- worker pytest **202 untouched-green** (zero worker files changed).
+- `cargo build --release -p cli` links (backtest arm included).
+- Fuzz untouched by design §12: no new untrusted-bytes parser exists —
+  capture via hardened `PmlrReader`, candidate via `validate_ruleset`,
+  argv/split via clap + strict integer checks (unit-tested).
+
+### Hygiene
+
+- Cargo on the Mac ONLY (pitfall #10); zero sandbox cargo. No boots, no
+  live sockets, no `.env` read or write, no fuzz run (none due).
+- Diff scope is exactly: `crates/cli/{Cargo.toml, src/lib.rs,
+  src/backtest.rs (NEW), src/bin/multivenue-engine.rs,
+  tests/backtest_harness.rs (NEW)}` + this file. No seam was needed in any
+  read-only crate (kickoff escape hatch unused). New tests live in cli —
+  none in bench (CountingAllocator isolation upheld).
+- `RuleRow._pad` untouched (door-closer §16.3.4). Multi-venue merge is the
+  implementation, not an option (§16.3.1): the golden fixture is two-venue
+  from day one, and `BacktestCtx` accepts any venue byte (§16.3.6).
+- Push anomaly: unchanged posture — recorded, not acted on; no fetch/push
+  this session. CLAUDE.md deliberately NOT edited (notes go only here; its
+  "NEXT SESSION = H1" line is superseded by this entry per the authority
+  chain).
+- Live doctrine (pitfall #11): the harness has NOT yet seen a live-capture
+  run dir — the real-capture smoke stays OWED and lands with H2+ per §12
+  tail ("probe fixtures are not proof").
+
+### Resume point
+
+Item 1 CLOSED (this commit). Next session H2 = design §13 item 2: the §4
+model in full. The H2 kickoff prompt below is ready to paste; it opens with
+the mandatory review of the nine H1 interpretations above.
+
+---
+
+## H2 kickoff prompt (paste verbatim into a fresh session)
+
+8h implementation — SESSION H2 (design §13 checklist ITEM 2 ONLY: the §4
+fill/fee/latency model + accounting), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue. Stage-2 status: 8f/8g CLOSED; 8h
+H0 design LOCKED, H1 (harness substrate) CLOSED — HEAD = the H1 commit
+(cli::backtest exists, schema-1 skeleton live, hold-model zeros). Baselines
+NOW: workspace nextest 1056/1056, release alloc 36/36 0 B/op
+(`--test-threads=1`), worker pytest 202 (UNTOUCHABLE — additive only), fuzz
+`ruleset_json` 72.3M clean (no fuzz run due UNLESS you hand-roll a parser —
+design §12 says do not). NO push, NO rebase, NO history rewrite, NO
+branches, NO git ops without operator ask (ONE closing commit IS
+authorized; one-line status after). Do NOT touch .env. Notes go ONLY to
+docs/phase-8h-progress.md (H2 entry: interpretation-review verdicts, model
+math decisions, gates, hygiene, resume point + H3 kickoff prompt). Verify
+get_project_modules against the main checkout FIRST; stop if no attach.
+FIRST TASK, before any code: review the NINE H1 interpretations in the H1
+entry of docs/phase-8h-progress.md — uphold or amend each, explicitly, in
+the H2 entry (amendments must not break the frozen worker contract or the
+H1 tests without stating why the test changes).
+REQUIRED READING, in order: (1) docs/phase-8h-design.md §4 ENTIRE + §5 +
+§12 + §16.3 (door-closers 2/6: fill engine keyed by namespaced SymbolId,
+any venue byte); (2) docs/phase-8h-progress.md H1 entry (wiring state:
+what is real vs stub — you are replacing the stubs); (3)
+crates/cli/src/backtest.rs (the substrate you extend: BacktestCtx submit/
+order-log seam, HoldReport, boundary_virt_ns, ModelParams already parsed
+and UNUSED); (4) claude-worker/src/claude_worker/backtest.py (FROZEN;
+GateThresholds numbers are what the report must be judged against;
+run_backtest/parse_harness_report/write_report for the pytest side); (5)
+docs/risk-policy.md (caps the §4.1 open-order model mirrors); (6)
+docs/local-setup.md (gains the "release binary on PATH" runbook line —
+design §15.3). H2 SCOPE (item 2, nothing more — data_fetcher is H3): §4 IN
+FULL — preallocated open-order table (max 4/sym, 32 total; beyond-cap emit
+= counted + dropped, conservative divergence documented), per-venue Δ
+activation (t_active = t_emit + Δ_venue; §4.4 defaults already in
+ModelParams), strict-cross maker fills (BID fills iff ask_px < P at a tick
+of s with virt ts ≥ t_active; fill px = P; qty = min(remaining, displayed);
+mirror for asks; partials rest; NO touch-fill, NO queue credit, zero RNG),
+§4.3 fee charge on fill notional, §4.5 fixed-point i64×1e6 accounting
+(per-sym signed position + average-cost basis, realized on reducing fills,
+fees at fill, equity = realized + Σ unrealized on every fill AND every tick
+of a held sym, OOS max peak-to-trough DD, end-of-replay mark-out at last
+mid into net_pnl, trades = OOS fill count, trading_days = distinct UTC days
+with ≥1 OOS trade via the §3.3 wall mapping), §4.6 bounds observed maxima
+(order/symbol/total — full window), §3.4 split bucketing (replay
+continuous, accounting bucketed on boundary_virt_ns), on_fill feedback into
+the vm per §3.6.4, --emit-detail sidecar (versioned separately, operator
+surface) + refreshed stderr summary, schema-1 gains REAL oos numbers
+(fixed-point renderer already exists — reuse it, no floats). TESTS: golden
+fixture EXTENDED to known-P&L (hand-computed net/DD/trades/days asserted
+EXACTLY — plan §11), fill proptests (§12: fill px never better than the
+crossing book, qty ≤ displayed, fees ≥ 0, cash+position conservation),
+unit tests for Δ activation, fee charge, split-boundary bucketing,
+open-order caps, liquidation, partial fills; determinism test stays
+byte-identical; PYTHON side (additive, 202 untouched):
+claude-worker/tests/test_backtest_real.py per design §12 — drives the REAL
+release binary through backtest.run_backtest over a committed golden
+fixture, skipif binary absent; plus docs/local-setup.md runbook line and
+the §15.1 stale-comment docs fix may ride this commit. THE G7 §5.1 SHIM
+SEAM IS RETIRED THIS SESSION (design §13.2) — the fake-binary pattern
+survives only inside the frozen 202 as a mock. GREEN GATES to close:
+workspace nextest (1056 + new), release alloc 36/36 `--test-threads=1`
+with the false-green guard, worker pytest 202 + new real-harness module
+green (or cleanly skipped where the binary is absent), `cargo build
+--release -p cli` links, and the OWED pitfall-#11 live-capture smoke: run
+the release harness once over a REAL run dir from the box
+(~/multivenue/logs) and record the stderr summary + exit code in the H2
+entry. LANDMINES: Mac-only cargo (pitfall #10); stale-rmeta playbook;
+RustRover MCP ≤45 s window — nohup > /tmp/8h-h2-*.log & then poll; zsh
+eats bare === ; engine/strategy-vm/ingress/core crates READ-ONLY (cli +
+claude-worker/tests + docs only; flag any seam need in the log, smallest
+additive route); keep new Rust tests out of bench; schema-1 counts are
+JSON ints (no bools/floats); fixed-point everywhere — floats only at
+render, and only via the existing renderer; do NOT consume events/signals/
+ai-cmds/engine-fills; do NOT spend RuleRow._pad; per-venue independent
+fill clocks (§4.7) are LAW — no cross-venue serialization of fills.
+SESSION FACTS: projectPath /Users/darkcite/trading-engine-multivenue;
+macOS: AF_UNIX sun_path cap, SO_RCVTIMEO EINVAL on peer-closed UDS,
+std::thread::scope panic hangs without StopOnDrop, sample <pid> for hangs;
+push anomaly KNOWN (38e599b → f2b3742 across H0): record, never act;
+market-map.json ABSENT (H3); no boots expected beyond the smoke — G0 law
+(`cargo build --release -p cli` before ANY boot) applies to it. If context
+runs short: write interim state + exact resume point + relaunch prompt
+into docs/phase-8h-progress.md, then tell me.

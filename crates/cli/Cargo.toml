@@ -29,6 +29,10 @@ strategy-ev          = { workspace = true }
 strategy-cross-arb   = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
+# 8h backtest harness (cli::backtest): drives the real ruleset VM
+# offline and hashes the candidate artifact exactly like the worker.
+strategy-vm          = { workspace = true }
+core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
 book-builder         = { workspace = true }
@@ -51,6 +55,7 @@ rustls-pki-types     = { workspace = true }
 libc                 = "0.2"
 
 [dev-dependencies]
-# ruleset_engine_wiring integration tests hash real artifacts the way
-# the operator install step does (sha256 → hash128 filename prefix).
-core-crypto          = { workspace = true }
+# core-crypto moved to [dependencies] with the 8h backtest harness —
+# ruleset_engine_wiring keeps hashing artifacts through it unchanged.
+# backtest_harness merge ordering proptests (8h design §12).
+proptest             = { workspace = true }
