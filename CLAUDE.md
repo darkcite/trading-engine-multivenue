@@ -16,7 +16,7 @@ A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that ex
 - **What was demonstrated LIVE (semi-manual lane, rulings below):** H6a — Fable-5-authored `d8aea5f4…` gates-passed on the §8.5-sanctioned capA and promoted through the FROZEN verbs onto the live engine (vm_rows 2, epoch 1, vm_fires 1, paper). H6b-SEMI — second Fable-5 ruleset `92feb9ea…` (levels 0.45/0.58, $8 caps) gates-PASS first try (OOS +$60.30 / 63 trades / 2 days), promoted (Stage seq=20 / Commit seq=22); then the manual §8.5-shaped ROLLBACK: Disable-5 (mask 49→17) → restage/commit of the prior from its bound paths (staged 2 / committed 3) → operator-act re-enable + re-commit (mask →49, **epoch →2, prior live, vm_fires 0→1**); audit-replay renders the whole chain (seqs 19–32, gaps 0) with ZERO integrity violations. **Standing finding:** Commit is mask-gated at the vm member (8g gating pin) ⇒ the post-rollback operator procedure is **enable + re-commit** (staged prior survives the disabled window; applies without restaging).
 - **OPERATOR RULINGS (2026-08-22, standing):** `ANTHROPIC_API_KEY` will NOT be provisioned until Stage 3 — NO `serve`, NO Anthropic API calls, EVERYTHING semi-manual via the ai-session §4 verbs. §12 was AMENDED accordingly: the §8.1 auto-promotion + §8.3 monitor-rollback LIVE proofs are **deferred to the Stage-3 ENTRY GATE** (`docs/mvp-completion-plan.md` §7: key → one keyed serve cycle + one monitor rollback observed BEFORE any executor work). `AI_INGRESS_HMAC_KEY` is PERMANENT in `.env` (engine dotenvy + worker BaseConfig read it; worker verbs need `.env` sourced into the shell — see the H6b wrapper pattern in the closure entry; NEVER read/print `.env`).
 - **M1 CLOSED (2026-08-22, commits `c477bb9`+`bad65d6`+close):** universe config file (`~/multivenue/universe.toml`, TOML-subset parser in core-config, M1 SymbolId law: PM[0]→42/BN-spot[0]→7 anchors + namespaced ordinals, USDM base 512) · PM multi-market (one connection, N-id subscribe) · Binance multi-connection lane (one thread, N single-stream conns, spot+`BINANCE_FUT_WS_HOST`) · BN exchangeInfo discovery audit · worker universe-file seeding at the fetch seam (`CLAUDE_WORKER_UNIVERSE_FILE`). Exit proven live: ONE zero-flag boot ran PM 4 tokens + BN 3 conns + OKX/Deribit/HL; audit integrity zero all five venues; map unresolved=0; nextest 1139 / alloc 36 / pytest 363 / fuzz +2 targets clean. Legacy flag boots stay byte-identical. **Operational: the up/down dailies expire 16:00Z — refresh `universe.toml` via the Gamma lane before each boot (M3 automates).** Log: `docs/mvp-progress.md`.
-- **NEXT = M2** of `docs/mvp-completion-plan.md` (options: Deribit → OKX → mark/IV channel → Binance eapi; §9.8 records design) — **only on explicit operator go** — then M3…M6. Plan §9 (data storage: PMLR canonical, candles.db keyed venue+descriptor, fetch 1m/1h/1d + derive, backtest reads PMLR only) is BINDING.
+- **IN PROGRESS (operator go 2026-08-22): M2 ∥ M3 in PARALLEL sessions.** M2 = options ladder (Deribit → OKX → mark/IV channel → Binance eapi; §9.8). M3 = data ops (capture-catalog + launchd always-on + retention + candles.db per §9.4–§9.7). Per-phase logs: `docs/m2-progress.md` / `docs/m3-progress.md` (create on first entry); kickoff prompts at the end of `docs/mvp-progress.md`; the **Parallel session protocol below is LAW for both sessions**. Then M4…M6. Plan §9 (PMLR canonical, candles.db keyed venue+descriptor, fetch 1m/1h/1d + derive, backtest reads PMLR only) is BINDING.
 - **HARD OPERATOR REQUIREMENT (standing): Stage-2 completion has been notified (H6b-SEMI close). Do NOT start ANY Stage-3 work (executor, risk/8i+, venue dispatchers, live ramp — code, plans, or designs) without the operator's explicit confirmation; the Stage-3 ENTRY GATE is `docs/mvp-completion-plan.md` §7 and it is the operator's to open. M1 also starts only on explicit operator go.**
 - **Authority chain now:** `docs/mvp-completion-plan.md` (M-phases; §9 binding) → the M-phase progress log's latest entry → this file. For 8h archaeology: `docs/prompts/8h-kickoff.md` → `docs/phase-8h-design.md` (LOCKED) → `docs/phase-8h-progress.md` (closure entry last).
 - **Frozen contract (unchanged):** `claude-worker/src/claude_worker/backtest.py` — argv `multivenue-engine backtest --ruleset R --replay-dir D --split 70/30`, schema-1 JSON on stdout, GateThresholds numbers; the frozen 202 worker tests pin it. **The harness conforms to the worker, never vice versa.** `backtest.py` and `cli.py` byte-untouched through H6b-SEMI (five sessions).
@@ -24,6 +24,17 @@ A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that ex
 - **Push anomaly KNOWN** (origin/main divergence observed H0): record, never act.
 - **Git discipline:** NO push, NO rebase, NO history rewrite, NO new branches, NO git ops without operator ask. Do NOT touch `.env`.
 - If context runs short: write interim state + exact resume point + relaunch prompt to the active M-phase progress doc, then tell the operator.
+
+## Parallel M2/M3 session protocol (LAW while both phases run, operator go 2026-08-22)
+
+Two Claude sessions share this ONE checkout. Violating this section corrupts the other lane's work.
+
+- **Git staging is explicit-path ONLY.** `git add <your owned paths>` — NEVER `git add -A`/`-u`. Check `git status` first; the other lane's dirty files are NOT yours to stage, commit, or clean. Commit messages prefixed `M2:` / `M3:`. Commits remain operator-authorized (checkpoint pattern).
+- **Ownership.** M2 owns: `crates/ingress-deribit`, `crates/ingress-okx`, `crates/ingress-binance` (eapi), their tests + fuzz targets, `docs/wire-format.md` + `docs/migration.md` (M2.3), `docs/m2-progress.md`. M3 owns: the cli capture-catalog module + bin arm, `claude-worker` (candles.db, refresh automation), `docs/local-setup.md` runbook additions, `~/Library/LaunchAgents` plist, `docs/m3-progress.md`. SHARED — small additive edits, sequential commits, note in your log: `crates/cli` (bin + paper.rs), `crates/core-config`, `crates/core-io`, `universe.toml.example`, `.env.example`, `docs/mvp-progress.md`.
+- **ONE ENGINE EVER** (9191 + ai.sock are singletons). Once M3 installs the launchd instance, it is THE standing engine; any smoke boot first `pgrep -f multivenue-engine`, stops the standing instance (`launchctl`), and restarts it after. G0 relink law applies per boot; a relink under a running engine takes effect at its next restart.
+- **Worker verbs globally serialized** (one SQLite seq namespace across sessions): `pgrep -f claude-worker` before any verb; never overlap fetch/push/stage/commit with the other session.
+- **Cargo shares one target dir** — concurrent builds/tests BLOCK on the file lock. Wait; never kill the other session's build. Long-runners: nohup with per-lane prefixes (`/tmp/m2-*`, `/tmp/m3-*`).
+- **Sequencing pin:** M2.3 (mark/IV wire-format migration) starts only AFTER M3's capture-catalog first commit lands (M2's ladder order makes this natural). Whichever side lands second extends the other (the catalog gains the new channel's row).
 
 ## Build / test / run
 
@@ -62,10 +73,13 @@ cd claude-worker && uv run pytest
 # start the engine locally (paper mode)
 # G0 law: test gates build rlibs/test bins but NEVER relink the release
 # binary — ALWAYS `cargo build --release -p cli` before any live boot.
-# --polymarket-asset-id is REQUIRED (the market's clobTokenIds decimal
-# string; boot refuses to start venue-blind). For AI-cmd work use the
-# set path: --strategy all (bare latency-arb can't express AI toggles).
+# M1: the universe comes from ~/multivenue/universe.toml (zero flags);
+# legacy fallback: no config file ⇒ --polymarket-asset-id is REQUIRED
+# (boot refuses venue-blind). For AI-cmd work use the set path:
+# --strategy all (bare latency-arb can't express AI toggles).
 cargo build --release -p cli
+cargo run --release -p cli -- run --paper --strategy all
+# legacy (no universe.toml):
 cargo run --release -p cli -- run --paper --polymarket-asset-id <TOKEN_ID>
 
 # audit a capture run (every run writes PMLR capture to
@@ -73,6 +87,15 @@ cargo run --release -p cli -- run --paper --polymarket-asset-id <TOKEN_ID>
 # + optional --raw-tap payload tap)
 cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 ```
+
+## Universe config — adding markets/instruments (M1 runbook)
+
+- The boot universe lives in `~/multivenue/universe.toml` (TOML subset; grammar documented in `universe.toml.example` + `core-config::universe`; `--universe <path>` overrides; file absent ⇒ legacy flag boot). Read ONCE at boot — **changes apply on restart** (brief capture gap, one new run dir; M3 automates the cadence).
+- **Polymarket** (crypto up/down binaries only — M1-R1): resolve `clobTokenIds` via the Gamma lane (`https://gamma-api.polymarket.com/markets?slug=<slug>`), append `"<yes>:<no>"` (pair) or `"<token>"` (single leg) to `[polymarket] markets`. Caps: 64 market entries / 128 tokens. Latency-arb wiring: `[pairs] map = ["P:B"]` (market index × `binance.spot` index, 0-based file order).
+- **Append, never reorder.** SymbolIds are file-order ordinals (PM token[0]→42, BN spot[0]→7, everything else `make_symbol_id(venue, ordinal)`; USDM base 512). Reordering a still-listed instrument re-syms it next boot, and the worker map keeps the OLD sym by design (conflict reported on every fetch until the stale `market-map.json` entry is pruned). Wholesale replacement is clean — the daily up/down refresh (markets expire 16:00Z) drops old ids from the observed universe (dead map names are harmless) and adds fresh ones.
+- **Binance**: append to `spot` / `usdm` (lowercase stream symbols) — the multi-connection lane grows one conn; the exchangeInfo audit validates at boot. **OKX/Deribit/HL**: append to their instrument/coin lists; 8e discovery validates.
+- After restart, run `claude-worker fetch` once — the `CLAUDE_WORKER_UNIVERSE_FILE` seam seeds map names (§9.4 descriptors), Gamma meta and YES/NO pairs; `unresolved=0` in the fetch output is the done-tell.
+- One-off boots without editing the file: the per-venue CLI flags still override (`--polymarket-asset-id X` etc.).
 
 ## Hard architectural rules (do not violate — the build will fail if you do)
 

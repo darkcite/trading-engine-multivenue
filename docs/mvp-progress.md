@@ -368,3 +368,169 @@ commit.
 Binance eapi, per mvp-plan §4-M2 with the §9.8 records design) —
 **only on explicit operator go**; nothing Stage-3 without his
 confirmation (mvp-plan §7).
+
+---
+
+## 2026-08-22 — OPERATOR GO: M2 ∥ M3 in parallel
+
+The operator confirmed the mvp-plan §5 parallelism ("M3 can start in
+parallel with M2 — it touches no ingress code") and gave the go for
+BOTH phases in concurrent sessions on this one checkout. The
+**Parallel M2/M3 session protocol in CLAUDE.md is LAW** for both
+(explicit-path staging with `M2:`/`M3:` prefixes, ownership map,
+one-engine rule, verb serialization, cargo-lock patience, the
+M2.3-after-catalog sequencing pin). Per-phase logs:
+`docs/m2-progress.md` / `docs/m3-progress.md` (create on first
+entry); this file stays the shared index. The `.env` was
+operator-reviewed and refreshed this session (all M1 keys present;
+`CLAUDE_WORKER_UNIVERSE_FILE` active; HMAC key preserved). The two
+kickoff prompts below are the frozen session authorities.
+
+---
+
+## M2 kickoff prompt (paste verbatim into a fresh session)
+
+M2 of docs/mvp-completion-plan.md — OPTIONS INGESTION (Deribit → OKX
+→ mark/IV channel → Binance eapi), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue. OPERATOR GO recorded
+2026-08-22; **M3 runs IN PARALLEL in another session — read and obey
+the "Parallel M2/M3 session protocol" in CLAUDE.md before touching
+anything** (owned paths; explicit-path git staging, `M2:` prefix;
+one-engine rule; verb serialization; cargo-lock patience; the
+M2.3-after-catalog pin). Authority: mvp-plan §4-M2 + §6 risks + §9
+BINDING (esp. §9.8) + docs/options-support-plan.md §2–§3 (field
+deltas) → CLAUDE.md → your log docs/m2-progress.md (create on first
+entry; if context runs short: interim state + exact resume point +
+relaunch prompt there, then tell the operator). SESSION 0: RustRover
+attach FIRST (stop if no attach); gates baseline (nextest 1139 /
+alloc 36 corrected clean+fresh-Compiling-bench guard / pytest 363 /
+fuzz clean); design entry adopting the §8 capped-universe proposal
+(E=2 expiries × K=8 strikes ATM±4 per underlying, config-tunable via
+new options keys in core-config::universe — SHARED file, coordinate)
+unless the operator overrides. THEN THE LADDER, IN ORDER: **(1)
+DERIBIT OPTIONS (2–3d):** boot re-discovery of the strike×expiry
+chain under the capped policy (8e snapshot pattern; chains churn
+daily — M3's daily restart doubles as roll refresh); `quote`-channel
+BBO into the EXISTING tick lane (an option book is a book — ZERO
+wire changes this step); universe-config keys + discovery audit +
+live smoke with --raw-tap (pitfall #11) before "done". **(2) OKX
+OPTIONS (2–3d):** same v5 WS stack — discovery instType=OPTION,
+bbo-tbt subscriptions, same policy keys, live smoke. **(3) MARK/IV
+CHANNEL (3–4d; starts ONLY after M3's capture-catalog first commit —
+check their log):** ONE new PMLR capture record (mark px, mark IV,
+greeks, OI, underlying px — options-plan §3 deltas) fed by Deribit
+`ticker` + OKX `opt-summary`; docs/wire-format.md + docs/migration.md
+entries (reader-compat notes; capture stays append-only); every new
+parser ships proptest + a fuzz target (§21.3/§21.4 NON-NEGOTIABLE);
+audit-replay gains the channel's coverage/cadence row; coordinate the
+catalog extension with M3 (whoever lands second extends). The §9.8
+aggregated-IV snapshot table lands only after M3's candles.db exists
+(worker-side, beside it). **(4) BINANCE EAPI HALF-INGRESS (4–5d, the
+largest single item; falls back cleanly if the operator rules M2 done
+with Deribit+OKX live):** NEW eapi REST discovery + dedicated options
+WS host, full house ingress doctrine (mio, handwritten byte scanner,
+zero-alloc, single-writer, #[repr(C)]/align(64), capture from day
+one, raw-tap, proptest + fuzz); BBO first, then mark/IV into the
+M2.3 channel. EXIT (mvp-plan): options ticks (3 venues) + mark/IV
+records (3 venues) in capture, integrity green, fuzz clean,
+full-universe boot includes a capped options chain. GATES per slice:
+nextest ≥1139 / alloc 36+ 0 B/op corrected guard / pytest ≥363 /
+fuzz incl. new targets; commits operator-authorized at slice
+checkpoints, `M2:` prefix, EXPLICIT paths only. LANDMINES: Mac-only
+cargo/pytest (pitfall #10 — the Cowork sandbox false-greens);
+RustRover terminal ≤45 s — nohup > /tmp/m2-*.log & then poll
+(pitfall #12); zsh eats bare ===; fixtures lie, wires drift — live
+smoke before "done" (pitfall #11: 8e caught preopen empties, 27-byte
+XPERP ids, sci-notation floats LIVE); paper only, no --live; no
+tokio/serde_json in ingress; full `import x` in worker; frozen
+7-verb surface + backtest.py/cli.py byte-untouched; conftest +
+frozen 202 untouchable; .env: read/print NOTHING; NOTHING Stage-3
+(executor/risk/dispatcher/live — mvp-plan §7 is the operator's
+gate); push anomaly record-only. SESSION FACTS: metrics
+127.0.0.1:9191; ONE ENGINE EVER — `pgrep -f multivenue-engine`
+before any boot and coordinate smoke windows with M3's standing
+launchd instance (launchctl stop → smoke → start); universe.toml
+up/down dailies expire 16:00Z (refresh via the Gamma lane before
+smoke boots until M3's automation lands); AF_UNIX sun_path cap;
+SO_RCVTIMEO EINVAL on peer-closed UDS; `sample <pid>` for hangs.
+
+---
+
+## M3 kickoff prompt (paste verbatim into a fresh session)
+
+M3 of docs/mvp-completion-plan.md — CONTINUOUS DATA OPS
+(capture-catalog + launchd always-on + retention + candles.db), MAIN
+CHECKOUT /Users/darkcite/trading-engine-multivenue. OPERATOR GO
+recorded 2026-08-22; **M2 runs IN PARALLEL in another session — read
+and obey the "Parallel M2/M3 session protocol" in CLAUDE.md** (owned
+paths; explicit-path git staging, `M3:` prefix; one-engine rule —
+YOUR launchd instance becomes the standing engine; verb
+serialization; cargo-lock patience; land the capture-catalog FIRST
+commit early — M2.3's wire migration waits on it). Authority:
+mvp-plan §4-M3 + **§9 BINDING VERBATIM** (§9.2 continuity, §9.4
+candles.db, §9.5 timeframe policy, §9.6 gap-fill, §9.7
+capture-derived, §9.9 consumer matrix) → CLAUDE.md → your log
+docs/m3-progress.md (create on first entry; context-short procedure
+as usual). SESSION 0: RustRover attach FIRST; gates baseline
+(nextest 1139 / alloc 36 / pytest 363). SLICES, CATALOG-FIRST:
+**(1) CAPTURE-CATALOG** (new offline CLI subcommand, audit-replay
+doctrine — allocations allowed, doctrine header): walk a replay
+root → per-run spans, per-venue tick coverage, UTC days spanned, gap
+map, run-dir sizes, "backtestable window" report (surface the
+harness's span/stats logic + the monitor's window arithmetic); JSON
++ human summary, deterministic; per-crate tests; PMLR v2 as-is
+(M2.3 adds a channel later — whoever lands second extends). **LAND
+THE FIRST COMMIT EARLY.** **(2) LAUNCHD ALWAYS-ON:** KeepAlive'd
+paper engine on the full universe (~/Library/LaunchAgents plist +
+docs/local-setup.md runbook; caffeinate/power settings so the Mac
+never sleeps it); DAILY GRACEFUL RESTART (SIGTERM drain — proven
+clean at M1d) → one run dir per UTC day = gap-free days BY
+CONSTRUCTION (closes the H6a min_trading_days standing finding);
+the restart step ALSO refreshes universe.toml's PM up/down dailies
+via the Gamma lane (automating the M1-R1 recipe: resolve the day's
+`*-up-or-down-on-<date>-2026` markets → rewrite [polymarket]
+markets; wholesale PM replacement is the CLEAN path per the
+CLAUDE.md universe runbook; a standalone script or worker module —
+the 7-verb surface is FROZEN, no new verb); the plist must source
+`.env` via a wrapper script (never inline values); ONE ENGINE EVER —
+your instance is the standing one, M2's smoke windows stop/start it
+via launchctl. **(3) RETENTION:** age/size-based archival of run
+dirs (config; default keep-all until disk pressure), documented;
+catalog reports sizes. **(4) CANDLES.DB (§9.4–§9.7 BINDING):**
+worker-owned SQLite WAL; ONE table, PK (venue, descriptor, tf,
+open_ts) — descriptor NEVER bare SymbolId; columns o/h/l/c/v,
+source ∈ rest|derived|capture, fetched_ts; fetch bases 1m (24–48 h
+rolling) / 1h (30–90 d) / 1d (listing lifetime) ONLY; derive
+5m/15m/4h exactly (O=first H=max L=min C=last V=sum,
+source=derived, cached); §9.6 gap-fill upsert (SELECT max(open_ts)
+per (sym,tf) → request ONLY the missing window → paginate under
+RestBudget; bounded backfill 48h/90d/lifetime; budget exhaustion
+resumes next cycle by construction); the OPEN bar is upserted,
+CLOSED bars are IMMUTABLE — a refetch disagreeing with a stored
+closed bar is a LOGGED conflict (market-map pattern), never
+overwritten; §9.7 capture-derived 1m mid-OHLC + tick-count (volume
+NULL — we capture BBO; never fabricate) for PM especially, plus the
+REST-vs-socket drift check; worker-side Python, full `import x`,
+tests additive (frozen 202 + 7-verb surface untouchable — candle
+work rides fetch/offline modules; any new operator surface is a
+script/module, ask the operator before ANY CLI-surface change).
+**(5) INIT-IF-EMPTY restated end-to-end:** first boot on an empty
+MULTIVENUE_LOG_DIR/worker dir bootstraps everything; the catalog
+makes the capture side visible. EXIT (mvp-plan): **N≥3 CONSECUTIVE
+gap-free days on disk — CALENDAR TIME: install the always-on lane
+EARLY and let it accumulate while you build**; the catalog reports
+them; a REAL-capture backtest passes the days gate (the frozen
+`multivenue-engine backtest` argv over the accumulated root). GATES
+per slice: nextest ≥1139 / alloc 36+ corrected guard / pytest ≥363
+(+ additive) / fuzz untouched unless a new parser (then
+§21.3/§21.4). LANDMINES: Mac-only cargo/pytest (pitfall #10);
+RustRover ≤45 s — nohup > /tmp/m3-*.log & then poll; zsh eats bare
+===; paper only; .env read/print NOTHING; worker verbs globally
+serialized vs M2 (`pgrep -f claude-worker` first); **the backtest
+harness reads PMLR ONLY, never candles (§9.9 — candle-fed fills
+would be fabricated)**; NOTHING Stage-3 (mvp-plan §7); push anomaly
+record-only; commits operator-authorized, `M3:` prefix, EXPLICIT
+paths only. SESSION FACTS: metrics 127.0.0.1:9191; SIGTERM = clean
+drain (M1d-proven); universe.toml PM dailies expire 16:00Z — your
+restart automation is the standing fix; audit-replay integrity-zero
+is the health tell; `sample <pid>` for hangs.
