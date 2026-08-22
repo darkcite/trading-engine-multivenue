@@ -199,6 +199,20 @@ Operational laws:
   `PROTECT_DAYS` (7), archives never auto-deleted. `capture-catalog`
   reports per-run sizes; restoring =
   `tar -xzf archive/run-<ns>.tar.gz -C ~/multivenue/logs/`.
+- **candles.db** (mvp-plan §9.4–§9.6; `claude_worker.candles` MODULE
+  — never a verb; hourly `com.multivenue.candles` agent via
+  `scripts/candles-cycle.sh`): worker-owned SQLite WAL at
+  `~/multivenue/worker/candles.db`, PK
+  `(venue, descriptor, tf, open_ts)`, descriptors in the map-name
+  convention (`binance:btcusdt`, `binance-usdm:btcusdt`, …). Fetched
+  bases ONLY: 1m (48 h) / 1h (90 d) / 1d (listing lifetime; OKX
+  bounded 400 d). §9.6 gap-fill resumes from `max(open_ts)` per
+  cycle under `CLAUDE_WORKER_CANDLES_BUDGET_PER_H` (30/venue —
+  deliberately under the fetch verb's 60). Closed rest bars are
+  immutable; disagreements land in `candle_conflicts`. Inspect:
+  `sqlite3 ~/multivenue/worker/candles.db "SELECT descriptor, tf,
+  count(*) FROM candles GROUP BY 1,2"`. Manual cycle:
+  `./scripts/candles-cycle.sh` (skips itself if one is running).
 
 ## Troubleshooting
 

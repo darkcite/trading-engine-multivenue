@@ -276,3 +276,79 @@ stand).
 Commit ask C3 paths: `scripts/retention.sh` ·
 `retention.conf.example` · `scripts/daily-restart.sh` ·
 `docs/local-setup.md` · `docs/m3-progress.md`.
+
+**C3 LANDED** — commit `1d712e8`.
+
+---
+
+## 2026-08-22 — C4: candles.db BUILT + INSTALLED + LIVE-PROVEN (commit ask pending)
+
+**`claude_worker/candles.py`** — a MODULE (`python -m
+claude_worker.candles`), never a verb; `cli.py` stays byte-frozen.
+§9.4–§9.6 implemented VERBATIM:
+
+- **Store** (§9.4): SQLite WAL `~/multivenue/worker/candles.db`
+  (`CLAUDE_WORKER_CANDLES_DB`), ONE `candles` table, PK
+  `(venue, descriptor, tf, open_ts)` WITHOUT ROWID; descriptors in
+  the worker map-name convention (`binance:btcusdt`,
+  `binance-usdm:btcusdt`, `okx:BTC-USDT`, `deribit:BTC-PERPETUAL`,
+  `hyperliquid:BTC`) — never bare SymbolId; `o,h,l,c,v`, `source` ∈
+  rest|derived|capture, `fetched_ts`; `candle_conflicts` beside it
+  (market-map conflict pattern, `first_seen_ts` preserved).
+- **Timeframes** (§9.5): bases 1m (48 h) / 1h (90 d) / 1d (listing
+  lifetime) fetched ONLY; 5m/15m/4h never fetched (C5 derives).
+  Venue-cheapness adaptations, all live-probed: OKX 1d bounded 400 d
+  (backward 100-row pages make lifetime expensive — the §9.5 "where
+  cheap" carve-out); Deribit/HL 1d pre-launch floors (2016-01-01 /
+  2020-01-01) because epoch-0 forward windows crawl the 1970s
+  (Deribit no_data abort) and HL rejects startTime=0 — both venues
+  clamp a pre-listing floor to their earliest bar = true lifetime.
+- **Gap-fill** (§9.6): per (descriptor, tf) `max(open_ts)` frontier →
+  request ONLY the missing window (frontier bar re-requested — the
+  open-bar finalization lane) → paginate under a per-VENUE
+  `RestBudget` (30/h default, deliberately under the fetch verb's
+  60) → upsert. Bounded backfill on empty store; budget exhaustion
+  resumes next cycle by construction. **Closed-stored law**: a row is
+  immutable only if it had CLOSED when fetched
+  (`open_ts + tf_ms <= fetched_ts`) — mid-life snapshots are
+  finalized by later fetches; disagreement with a closed-stored bar
+  is logged to `candle_conflicts`, never overwritten. A rest bar
+  supersedes a capture bar on the same PK (capture fills only where
+  no rest lane exists, §9.7).
+- **Hole-avoidance**: forward lanes (BN spot `/api/v3/klines`, USDM
+  `/fapi/v1/klines` — NEW strict parser `parse_binance_klines`,
+  labeling.py discipline; Deribit chart; HL candleSnapshot) upsert
+  page-by-page, monotone frontier. OKX pages BACKWARD
+  (`history-candles` + `after`): the walk is BUFFERED and upserted
+  only when it connects to the frontier — a budget-truncated walk is
+  discarded whole (else `max(open_ts)` would leap a permanent hole).
+- Glue: `scripts/candles-cycle.sh` (.env sourced, self-overlap
+  guard) + `com.multivenue.candles` hourly agent (installed;
+  install-launchd.sh covers it for fresh installs), `.env.example`
+  M3 block (BN REST hosts — the only new host keys; db path, budget,
+  backfill horizons), runbook paragraph.
+
+**Live proofs (real venues, two cycles):** cycle 1 = 42,254 rows —
+BN spot/usdm full §9.6 backfills incl. TRUE lifetime 1d (btcusdt
+3,293 daily bars back to the 2017 listing; usdm 2,541 to 2019); OKX
+1m backward walk 29 pages/2,881 bars then BUDGET — and the remaining
+OKX lanes correctly deferred (§9.6 resume, observed); Deribit/HL
+1m+1h clean. Cycle 1 exposed the two 1d edge cases above; floors
+fixed; cycle 2 = **52,148 rows, conflict-rows 0**: Deribit 1d 2,931
+bars (full perpetual lifetime), HL 1d 2,195 × 2, OKX 1d 400
+(carve-out), BN 1d `pages=1 bars=1 open~1` — the frontier resume
+re-fetching ONLY the open daily bar and finalizing it. Zero
+conflicts across 52k rows.
+
+**Gates:** worker pytest **401** expected (381 + 20 additive — full
+suite re-run at commit); Rust untouched since C1 (nextest 1151 /
+alloc 36 stand); fuzz untouched (parse_binance_klines is worker-side
+Python under the labeling.py strict-parse discipline with
+table-driven tests — not a Rust ingress parser; §21.3/§21.4 does not
+attach).
+
+Commit ask C4 paths:
+`claude-worker/src/claude_worker/candles.py` ·
+`claude-worker/tests/test_candles.py` · `scripts/candles-cycle.sh` ·
+`launchd/com.multivenue.candles.plist` · `scripts/install-launchd.sh`
+· `.env.example` · `docs/local-setup.md` · `docs/m3-progress.md`.

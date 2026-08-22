@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- M3 candles.db hourly gap-fill (TEMPLATE — rendered by
+     install-launchd.sh). §9.6: budget exhaustion mid-cycle is fine,
+     the next cycle resumes from max(open_ts) by construction. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.candles</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/candles-cycle.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/candles.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/candles.log</string>
+</dict>
+</plist>
