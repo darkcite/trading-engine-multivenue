@@ -65,6 +65,7 @@ import os
 import pathlib
 import re
 import time
+import tomllib
 import typing
 
 import claude_worker.features
@@ -98,6 +99,19 @@ OKX_CANDLE_LIMIT: int = 60
 # Rust `ingress-polymarket` discovery mirrors (discovery.rs).
 PM_TOKEN_RUN_MIN: int = 10
 PM_TOKEN_MAX: int = 80
+
+# M1 universe-file seeding (docs/mvp-progress.md M1d). Read at the
+# fetch seam — the BaseConfig field tuple is frozen (H3 precedent).
+UNIVERSE_FILE_ENV: str = "CLAUDE_WORKER_UNIVERSE_FILE"
+# Rust `core-config::universe` allocation-law mirrors: PM token[0]
+# takes the legacy anchor; later tokens take flat namespaced ordinals
+# (VenueId::Polymarket is 0, so `make_symbol_id(PM, i+1)` == i+1).
+# Binance spot[0] takes anchor 7; every other instrument takes
+# `venue_byte << 24 | ordinal`, usdm ordinals from base 512.
+PM_LEGACY_ANCHOR_SYM: int = 42
+BN_LEGACY_ANCHOR_SYM: int = 7
+SYMBOL_VENUE_SHIFT: int = 24
+BN_USDM_ORDINAL_BASE: int = 512
 
 _SLUG_RE: typing.Pattern[str] = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -726,12 +740,140 @@ def gamma_names(resolved: dict[int, GammaMarket]) -> dict[str, int]:
     return out
 
 
+def _pm_token_entry(entry: str) -> tuple[str, ...] | None:
+    """Parse one universe-file PM market entry into its token tuple:
+    ``"<token>"`` -> 1-tuple, ``"<yes>:<no>"`` -> 2-tuple, anything
+    else -> None (best-effort — the ENGINE is the config validator)."""
+
+    def _is_token(s: str) -> bool:
+        return s.isdigit() and PM_TOKEN_RUN_MIN <= len(s) <= PM_TOKEN_MAX
+
+    parts = entry.split(":")
+    if len(parts) == 1 and _is_token(parts[0]):
+        return (parts[0],)
+    if len(parts) == 2 and _is_token(parts[0]) and _is_token(parts[1]) and parts[0] != parts[1]:
+        return (parts[0], parts[1])
+    return None
+
+
+def universe_file_proposals(
+    path: pathlib.Path,
+    universe: dict[int, int],
+) -> tuple[dict[str, int], tuple[tuple[int, int], ...], list[str]]:
+    """M1 universe-file seeding (docs/mvp-progress.md M1d).
+
+    Replicates the DETERMINISTIC engine allocation law over the
+    ``[polymarket] markets`` list (flat token order; token[0] ->
+    ``PM_LEGACY_ANCHOR_SYM``, token[i>=1] -> ``i+1``) and proposes
+    ``{token_id: sym}`` map names for every allocated sym the capture
+    actually OBSERVED as Polymarket. YES/NO pair entries whose both
+    syms are observed become additive pair proposals for the map's
+    pair machinery (positions netting). Best-effort by design: a
+    missing/malformed file yields no proposals plus one report line —
+    never an error (the engine validates the config at boot; the
+    worker only seeds).
+    """
+    lines: list[str] = []
+    try:
+        raw = path.read_text()
+    except OSError as exc:
+        lines.append(f"universe file skipped: {path}: {exc}")
+        return {}, (), lines
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as exc:
+        lines.append(f"universe file skipped: {path}: TOML parse error: {exc}")
+        return {}, (), lines
+    pm_section = data.get("polymarket")
+    entries: list[str] = []
+    if isinstance(pm_section, dict):
+        raw_markets = pm_section.get("markets")
+        if isinstance(raw_markets, list):
+            for item in raw_markets:
+                if isinstance(item, str):
+                    entries.append(item)
+
+    proposals: dict[str, int] = {}
+    pairs: list[tuple[int, int]] = []
+    flat = 0
+    skipped = 0
+    for entry in entries:
+        tokens = _pm_token_entry(entry)
+        if tokens is None:
+            skipped += 1
+            continue
+        syms: list[int] = []
+        for token in tokens:
+            sym = PM_LEGACY_ANCHOR_SYM if flat == 0 else flat + 1
+            flat += 1
+            syms.append(sym)
+            if universe.get(sym) == claude_worker.frames.VENUE_POLYMARKET:
+                proposals[token] = sym
+        if len(syms) == 2 and all(
+            universe.get(s) == claude_worker.frames.VENUE_POLYMARKET for s in syms
+        ):
+            pairs.append((syms[0], syms[1]))
+
+    # CEX sections: same law mirror, §9.4 descriptor names. Only
+    # observed (venue-byte-matching) syms are proposed.
+    def _propose_list(
+        section: str,
+        key: str,
+        venue: int,
+        name_prefix: str,
+        ordinal_base: int,
+        anchor: int | None,
+    ) -> None:
+        sec = data.get(section)
+        if not isinstance(sec, dict):
+            return
+        raw = sec.get(key)
+        if not isinstance(raw, list):
+            return
+        for i, item in enumerate(raw):
+            if not isinstance(item, str) or not item:
+                continue
+            if anchor is not None and i == 0:
+                sym = anchor
+            else:
+                sym = (venue << SYMBOL_VENUE_SHIFT) | (ordinal_base + i + 1)
+            if universe.get(sym) == venue:
+                proposals[f"{name_prefix}{item}"] = sym
+
+    _propose_list(
+        "binance", "spot", claude_worker.frames.VENUE_BINANCE, "binance:", 0, BN_LEGACY_ANCHOR_SYM
+    )
+    _propose_list(
+        "binance",
+        "usdm",
+        claude_worker.frames.VENUE_BINANCE,
+        "binance-usdm:",
+        BN_USDM_ORDINAL_BASE,
+        None,
+    )
+    _propose_list("okx", "instruments", claude_worker.frames.VENUE_OKX, "okx:", 0, None)
+    _propose_list(
+        "deribit", "instruments", claude_worker.frames.VENUE_DERIBIT, "deribit:", 0, None
+    )
+    _propose_list(
+        "hyperliquid", "coins", claude_worker.frames.VENUE_HYPERLIQUID, "hyperliquid:", 0, None
+    )
+
+    lines.append(
+        f"universe file {path.name}: entries={len(entries)}"
+        f" proposals={len(proposals)} pairs={len(pairs)} skipped={skipped}"
+    )
+    return proposals, tuple(pairs), lines
+
+
 def refresh_market_map(
     path: pathlib.Path,
     markets: dict[str, int],
     hip4_pairs: tuple[tuple[int, int], ...],
     proposals: dict[str, int],
     universe: dict[int, int],
+    *,
+    pair_proposals: tuple[tuple[int, int], ...] = (),
 ) -> MapRefresh:
     """Bootstrap (file absent) or additive refresh (file present).
 
@@ -767,9 +909,16 @@ def refresh_market_map(
     unresolved = sorted(
         (sym, venue) for sym, venue in universe.items() if sym not in named_syms
     )
+    # Pair merge (M1): operator pairs preserved verbatim and first;
+    # universe-file proposals appended additively, deduped. Nothing is
+    # ever removed or reordered.
+    merged_pairs: list[tuple[int, int]] = [(int(a), int(b)) for a, b in hip4_pairs]
+    for pair in pair_proposals:
+        if pair not in merged_pairs:
+            merged_pairs.append(pair)
     payload = {
         "markets": {name: merged[name] for name in sorted(merged)},
-        "hip4_pairs": [list(pair) for pair in hip4_pairs],
+        "hip4_pairs": [list(pair) for pair in merged_pairs],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -820,8 +969,21 @@ def run_secondary(  # noqa: PLR0913 — one injected seam per §6 element, delib
     lines: list[str] = []
     proposals = default_names(universe)
 
+    # M1 universe-file seeding (fetch-seam env; H3 precedent — no
+    # BaseConfig field). Proposals join the map refresh AND the same
+    # fetch's Gamma seed derivation below, so one fetch both names
+    # the configured tokens and resolves their question/slug/meta.
+    pair_proposals: tuple[tuple[int, int], ...] = ()
+    universe_file_raw = source.get(UNIVERSE_FILE_ENV, "")
+    if universe_file_raw:
+        u_props, pair_proposals, u_lines = universe_file_proposals(
+            pathlib.Path(universe_file_raw).expanduser(), universe
+        )
+        proposals.update(u_props)
+        lines.extend(u_lines)
+
     if not no_rest:
-        targets = derive_targets(markets, universe)
+        targets = derive_targets({**proposals, **markets}, universe)
         budgets = venue_budgets(rest_budget_per_h(source))
         if targets.pm_seeds:
             assert get_fn is not None  # caller wires the client when REST is on
@@ -867,7 +1029,9 @@ def run_secondary(  # noqa: PLR0913 — one injected seam per §6 element, delib
     else:
         lines.append("rest: skipped (--no-rest)")
 
-    refresh = refresh_market_map(map_path, markets, hip4_pairs, proposals, universe)
+    refresh = refresh_market_map(
+        map_path, markets, hip4_pairs, proposals, universe, pair_proposals=pair_proposals
+    )
     action = "bootstrapped" if refresh.created else "refreshed"
     lines.append(
         f"market map {action}: {refresh.path}"

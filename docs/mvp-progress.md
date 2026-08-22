@@ -277,11 +277,94 @@ findings**. `universe.toml.example` committed at repo root.
   `universe_toml` 34.9 M clean (both this session);
   `ruleset_json` 72.3 M standing untouched.
 
-**Remaining = M1d:** worker fetch-seam seeding
-(`CLAUDE_WORKER_UNIVERSE_FILE`, no BaseConfig field — H3 seam
-precedent; `import tomllib`) + worker pytest stay-green; then the
-pitfall-#11 LIVE smokes — the PM multi-id subscribe and the BN
-multi-connection lane (spot+usdm hosts) have NOT yet seen the real
-venues — via the full-universe boot on a real `universe.toml`;
-audit-replay every-venue-ticking check; market-map resolution for
-every observed sym; full gates; M1 close entry.
+### M1d results — **M1 CLOSED** (live smoke + worker seeding, all exit criteria met)
+
+**Worker universe-file seeding (fetch seam; frozen surfaces
+untouched).** `fetchers.universe_file_proposals` (NEW): full Python
+mirror of the `core-config::universe` allocation law — PM flat tokens
+(anchor 42, ordinals), Binance spot (anchor 7) + usdm (base-512
+block), OKX/Deribit/HL ordinals — proposing **§9.4 descriptor names**
+(`token id`, `binance:<s>`, `binance-usdm:<s>`, `okx:<i>`,
+`deribit:<i>`, `hyperliquid:<c>`) for observed syms only (venue-byte
+guarded); YES/NO pair entries with both syms observed feed the map's
+pair machinery via a new keyword-only `pair_proposals` on
+`refresh_market_map` (operator pairs first + verbatim, additive,
+deduped, idempotent). Read at the fetch seam
+(`CLAUDE_WORKER_UNIVERSE_FILE`; no BaseConfig field — H3 precedent);
+proposals ALSO join the same fetch's Gamma seed derivation, so ONE
+fetch names the tokens AND resolves question/slug/meta. Best-effort
+by design (missing/malformed file = one report line, never an error —
+the engine is the config validator). `import tomllib` (stdlib).
+Tests +9 (`tests/test_universe_file.py`); **pytest 363** (354
+stay-green + 9); `backtest.py`/`cli.py` byte-untouched (cli.py now
+SIX sessions), 7-verb surface + conftest + frozen 202 untouched.
+
+**The pitfall-#11 LIVE smoke — full non-options universe, ONE boot
+command, zero flags** (`run --paper --strategy all` off the default
+`~/multivenue/universe.toml`). Config picks (operator-delegated
+Gamma resolution, M1-R1): *Bitcoin Up or Down on August 22?*
+(Up:Down pair, vol24h ≈ $253k) + *Ethereum Up or Down on August 22?*
+(≈ $103k) — resolved live from the `*-up-or-down-on-<date>-2026`
+event series; BN spot btcusdt+ethusdt & usdm btcusdt; OKX
+BTC-USDT + ETH-USDT-SWAP; Deribit BTC-PERPETUAL; HL BTC+ETH; pairs
+0:0 + 1:1. Boot evidence (PID 66715, run-1787396699882623000):
+`universe resolved from_config=true pm_tokens=4 bn_spot=2 bn_usdm=1
+pairs=2`; discovery coverage okx 2/2 (universe 2004), deribit 1/1
+(106), hl 2/2 (574), **bn 3/3 (universe 746 — the NEW exchangeInfo
+audit live: spot probes + fapi page)**, pm 4/4 (each token resolved
+with sibling cross-link + tick/min-size metadata); PM symbol map
+markets=4 first_sym=42; **`binance: M1 multi-connection lane conns=3
+spot=2 usdm=1`**; okx/deribit/hl threads up; ingress-ai up (permanent
+key). ~13 min live: engine consuming thousands of ticks/5 s,
+orders flowing on both pairs, dropped=0; coverage gauges
+pm4/okx2/deribit1/hl2/**bn3**.
+
+**audit-replay (post-SIGTERM canonical, exit 0): every venue, every
+instrument ticking; integrity totals ALL FIVE venues ZERO.**
+pm 4 streams (2,700+2,700 BTC legs, 12,921+12,921 ETH legs — the
+multi-id subscribe proven on the real venue); bn 3 streams —
+btcusdt spot 28,320 @142/s, ethusdt spot 21,469 @108/s, **btcusdt
+USDM 79,917 @401/s through the fstream host — the multi-connection
+lane + futures host proven live**; okx ticks/mark/funding/trade;
+deribit ticks+ticker; hl ticks/book/trade/asset_ctx/all_mids.
+The `hl trade regr≈n/2` per-stream display note re-observed exactly
+as documented at G1 (equal-timestamp trade batches; totals zero —
+known behavior, not a violation).
+
+**Live fetch through the seam:** `universe file: entries=2
+proposals=12 pairs=2 skipped=0` → `market map refreshed: added=7
+conflicts=0 **unresolved=0**` — every observed sym resolves. Gamma
+4/4; **and the OKX (2/2), Deribit (1/1), Hyperliquid (2/2) candle
+consumers ran LIVE for the first time** (closing the H6a scope note
+— they had been MockTransport-proven only), zero
+failed/malformed/budget-skipped.
+
+**Final gates at M1 close:** workspace nextest **1139/1139** (+1
+ignored); release alloc **36/36 0 B/op** corrected guard (fresh
+`Compiling bench` in-log); worker pytest **363**; release cli
+relinked (M1c build; no Rust change in M1d); fuzz: `universe_toml`
+34.9 M + `binance_exchange_info` 4.48 M both clean this phase,
+`ruleset_json` 72.3 M standing.
+
+**M1 EXIT CRITERIA (mvp-plan §4-M1) — ALL MET:** ONE boot command
+runs the full non-options universe ✓ (zero flags, default config
+path); audit-replay shows every venue ticking ✓ (integrity zero);
+market-map resolves every observed sym ✓ (unresolved=0); gates
+green ✓ (incl. the two new fuzz targets). **M1 is CLOSED** —
+commits `c477bb9` (M1a+M1b) + `bad65d6` (M1c) + the M1d close
+commit.
+
+**Standing operational notes:**
+- The up/down dailies EXPIRE (16:00Z) — before the next boot,
+  re-resolve the day's markets via the Gamma lane and update
+  `~/multivenue/universe.toml` (the M1-R1 semi-manual recipe; M3's
+  daily-restart automation absorbs it).
+- Recommend adding `CLAUDE_WORKER_UNIVERSE_FILE=~/multivenue/universe.toml`
+  to `.env` (operator's hand — the session sets it inline until then).
+- Legacy flag boots remain byte-identical end to end (resolver law +
+  single-stream BN lane + zero-REST BN discovery posture).
+
+**NEXT = M2** (options ingestion: Deribit → OKX → mark/IV channel →
+Binance eapi, per mvp-plan §4-M2 with the §9.8 records design) —
+**only on explicit operator go**; nothing Stage-3 without his
+confirmation (mvp-plan §7).
