@@ -27,7 +27,10 @@ live in one JSON file at ``CLAUDE_WORKER_MARKET_MAP``::
     {"markets": {"<name>": <sym>, ...}, "hip4_pairs": [[<yes>, <no>], ...]}
 
 A missing file is a valid empty map (triage-only serve, no netting view);
-a malformed file is a usage error (exit 2).
+a malformed file is a usage error (exit 2). As of 8h §6.2 the ``fetch``
+verb OWNS the file's lifecycle (bootstrap + additive refresh via
+``fetchers.refresh_market_map``); operator entries always win — the
+reader here stays the shape contract.
 
 Convention: full ``import x`` only. No ``from x import y``.
 """
@@ -47,6 +50,7 @@ import claude_worker.config
 import claude_worker.daemon
 import claude_worker.features
 import claude_worker.feeds
+import claude_worker.fetchers
 import claude_worker.frames
 import claude_worker.pmlr
 import claude_worker.state
@@ -211,6 +215,34 @@ def _make_http_client() -> httpx.Client:
     return httpx.Client()
 
 
+def _http_get(client: httpx.Client, url: str) -> str | None:
+    """One best-effort GET for the §6.1 consumers (the ``feeds.fetch_feed``
+    pattern): ``None`` = transport failure or non-200; callers count it."""
+    try:
+        response = client.get(url, timeout=claude_worker.fetchers.REST_TIMEOUT_S)
+    except httpx.HTTPError:
+        return None
+    if response.status_code != httpx.codes.OK:
+        return None
+    return response.text
+
+
+def _http_post(client: httpx.Client, url: str, body: str) -> str | None:
+    """One best-effort JSON POST (HL ``/info`` candleSnapshot)."""
+    try:
+        response = client.post(
+            url,
+            content=body,
+            headers={"Content-Type": "application/json"},
+            timeout=claude_worker.fetchers.REST_TIMEOUT_S,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != httpx.codes.OK:
+        return None
+    return response.text
+
+
 def _fetch_news(cfg: claude_worker.config.BaseConfig) -> None:
     """One mechanical news poll (§6 ``fetch --news``): fetch the allowlist,
     dedupe via the shared SQLite, write items NDJSON — NO LLM steps; in
@@ -292,12 +324,45 @@ def fetch(
             typer.echo(str(feature_path))
         for torn_name in result.torn_files:
             typer.echo(f"torn tail (engine mid-flush): {torn_name}", err=True)
-        # REST secondary: the RestBudget mechanics are pinned (features.py)
-        # but no venue URL consumers exist until 8h — with or without
-        # --no-rest there is nothing to fetch yet (deviation note in the
-        # progress log). The flag is part of the frozen §6 surface.
-        if not no_rest:
-            pass
+        # 8h §6: venue REST secondary + market-map ownership. (The 8g
+        # "no venue URL consumers exist until 8h" deviation note retired
+        # here.) The httpx client is constructed LAZILY on the first
+        # actual request, so a fetch with no consumer targets — or with
+        # --no-rest — never touches the seam at all.
+        universe = claude_worker.fetchers.observed_universe(run_dir)
+        market_map = load_market_map(cfg.market_map_path)
+        holder: list[httpx.Client] = []
+
+        def _client() -> httpx.Client:
+            if not holder:
+                holder.append(_make_http_client())
+            return holder[0]
+
+        def get_fn(url: str) -> str | None:
+            return _http_get(_client(), url)
+
+        def post_fn(url: str, body: str) -> str | None:
+            return _http_post(_client(), url, body)
+
+        try:
+            report = claude_worker.fetchers.run_secondary(
+                universe=universe,
+                markets=market_map.markets,
+                hip4_pairs=market_map.hip4_pairs,
+                map_path=cfg.market_map_path,
+                features_dir=cfg.features_dir,
+                run_name=run_dir.name,
+                no_rest=no_rest,
+                get_fn=None if no_rest else get_fn,
+                post_fn=None if no_rest else post_fn,
+            )
+        finally:
+            if holder:
+                holder[0].close()
+        for rest_path in report.files:
+            typer.echo(str(rest_path))
+        for line in report.lines:
+            typer.echo(line, err=True)
         if news:
             _fetch_news(cfg)
         return EXIT_OK

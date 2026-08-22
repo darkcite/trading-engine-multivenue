@@ -767,3 +767,288 @@ operator-gated, budget-capped, at operator discretion); no engine boots
 expected (G0 law applies if one ever runs). If context runs short: write
 interim state + exact resume point + relaunch prompt into
 docs/phase-8h-progress.md, then tell me.
+
+---
+
+## 2026-08-22 — Session H3 (design §13 item 3: data_fetcher completion, §6 in full) — CLOSED
+
+Authority: the H3 kickoff above + design (LOCKED). RustRover MCP attached
+FIRST (`get_project_modules` OK). Session-start HEAD `1ed6017` (the H2
+commit), tree clean. Diff scope is exactly:
+`claude-worker/src/claude_worker/fetchers.py` (NEW),
+`claude-worker/src/claude_worker/cli.py` (fetch internals + HTTP wrappers
++ module-docstring map-ownership clause; verb surface UNTOUCHED),
+`claude-worker/tests/test_fetchers.py` (NEW), `.env.example` (the three
+§7.5 keys + §14 PATH commentary), `docs/local-setup.md` (env-keys
+paragraph ride), this file. Python + docs only — engine/strategy-vm/
+ingress/core/cli **crates** untouched (read-only law held); the
+committed backtest-real fixture untouched; `.env` untouched.
+
+### The descriptor question — the one §6 gap that needed an
+### interpretation, and how it was closed
+
+§6.2 says "resolve names — PM ordinals via Gamma (question/slug), CEX
+syms as `<venue>:<instrument>` from the instrument metadata already
+flowing through discovery-shaped REST" — but the capture carries NO
+instrument identity: a run dir is pmlr ticks + raw taps only (verified
+live on `run-1786874540193462000`), engine ordinals are allocated from
+BOOT FLAGS (`paper.rs`: "ordinals follow flag order", 1-based;
+`--binance-sym-id 7`, `--polymarket-sym-id 42` are direct ids), and boot
+flags are invisible to the worker. Interpretation LOCKED this session
+(H4 review welcome, H1/H2 precedent):
+
+**The market-map names themselves are the descriptors.** A PM entry
+whose NAME is an all-digit Gamma token id (10..80 digits — the Rust
+`PM_TOKEN_RUN_MIN`/`PM_TOKEN_MAX` mirror) or a slug seeds the Gamma
+consumer for its sym; `okx:<instId>` / `deribit:<instrument>` /
+`hyperliquid:<coin>` names drive the candle consumers. Unseeded observed
+syms are REPORTED unresolved in fetch output (with the exact
+name-format hint), never guessed — with ONE exception: the clap-default
+mirror `binance:btcusdt` ↔ (VENUE_BINANCE, sym 7), resolved with zero
+REST. A non-default boot then surfaces as a §6.2 conflict report —
+exactly the §14 SymbolId-stability caveat's visibility (recorded design,
+not fixed). Operator workflow: seed the token id (or slug) as a map name
+once; fetch resolves and ADDS the question + slug names additively (the
+slug keeps future fetches seeded — Gamma cannot be queried by question);
+the seed and every operator entry survive verbatim.
+
+### Numbered H3 interpretation calls (all pinned by tests)
+
+1. **Descriptors = map names** (above). `derive_targets` = map names ∩
+   observed universe of the LATEST run, name-sorted (deterministic
+   request order), one Gamma seed per sym (first sorted wins).
+2. **`CLAUDE_WORKER_REST_BUDGET_PER_H` reads at the fetch seam, NOT
+   `BaseConfig`**: the frozen 202 construct `ServeConfig(...)` directly
+   (`test_llm.py:47`, `test_daemon.py:57`), so the config dataclass
+   field tuple is itself a frozen surface (a defaulted BaseConfig field
+   would also be a dataclass TypeError under ServeConfig's non-default
+   key). Strict parse: malformed/negative ⇒ ValueError ⇒ exit 2.
+3. **Venue REST hosts reuse the engine's existing `.env` keys**
+   (`POLYMARKET_GAMMA_HOST`, `OKX_REST_HOST`, `DERIBIT_REST_HOST`,
+   `HYPERLIQUID_API_HOST`) with the same defaults — zero new keys
+   beyond §7.5's three.
+4. **`--no-rest` is REAL and scoped to REST**: all four consumers skip
+   (injected fns never touched); §6.2 map ownership still runs on every
+   fetch (zero-REST resolutions only). Bootstrap "complete" = the
+   complete `{"markets":{},"hip4_pairs":[]}` SHAPE; unresolvable syms
+   stay OUT of `markets` (reported), no placeholder names.
+5. **Lazy client construction**: the httpx client is built on the FIRST
+   actual request, so zero targets ⇒ `_make_http_client` never invoked.
+   This is the invariant that keeps the frozen fetch tests hermetic —
+   including `test_session_scripted`'s SUBPROCESS fetch, where
+   monkeypatching cannot reach — and it is pinned by
+   `test_run_secondary_zero_targets_never_touches_client` +
+   `test_cli_fetch_no_descriptors_zero_rest_and_bootstrap`.
+6. **BN has no candle consumer** — H-D5's locked set is PM/OKX/Deribit/
+   HL; binance syms get name resolution only.
+7. **HIP-4 pairs: preserved, never fabricated** — none derivable live
+   (design §6.2's own record); operator pairs round-trip verbatim; the
+   HL outcome-metadata derivation lands when outcome coins exist.
+8. **Strictness split per response shape**: Gamma/OKX/HL = per-row skip
+   + count (rows have identity); Deribit's columnar body = any bad cell
+   rejects the whole body. All bool-rejecting numeric coercion
+   (labeling.py), all logged-skip-never-crash. Token-seed match mirrors
+   Rust `find_by_token` (token ∈ `clobTokenIds`, double-encoding
+   handled); slug match is exact; no match = counted `failed`, not
+   `malformed`. All-digit names below the token threshold are
+   token-or-nothing (never a slug query).
+9. **Feature-file names**: `<sym>-ohlcv.json` (candles oldest-first,
+   normalized from OKX's newest-first) and `<sym>-meta.json` (Gamma
+   header) beside the replay-derived `<sym>.json` — same dir, per §6.1
+   "beside". Frozen glob-equality asserts are safe because the frozen
+   env has zero targets (invariant #5).
+10. **`--symbols` does NOT restrict the §6.2 universe** — its
+    documented contract only limits WRITTEN replay feature files; map
+    ownership always sees the full observed universe.
+11. **Malformed operator map halts fetch BEFORE any write** — the
+    UNTOUCHED `cli.load_market_map` loads first (exit 2), so a
+    half-readable map is never "repaired" by the writer
+    (`test_cli_fetch_malformed_map_is_exit_2_and_never_overwritten`).
+12. **Candle window/interval constants**: 1m bars, one-hour window
+    (OKX `limit=60`; Deribit/HL windowed from injectable `now_ms` —
+    deterministic in tests), `resolution=1` for Deribit's TradingView
+    grammar.
+
+### What was built
+
+`fetchers.py` (NEW, ~640 lines): strict parsers
+(`parse_gamma_markets`, `parse_okx_candles`, `parse_deribit_chart`,
+`parse_hl_candles`), the four §6.1 consumers (`fetch_pm_gamma`,
+`fetch_venue_candles` dispatching OKX-GET/Deribit-GET/HL-POST) — every
+call `RestBudget.try_acquire`-gated (per-venue instances via
+`venue_budgets`, default 60/h fixed window, `skipped_total` surfaced in
+the per-venue stats line), feature-file writers, §6.2
+`observed_universe` + `refresh_market_map` (bootstrap + additive
+refresh + conflict report + atomic same-dir tmp + `os.replace`), and
+the `run_secondary` orchestrator returning files + human summary lines.
+Module doctrine held: fetchers.py never imports an HTTP client —
+`get_fn`/`post_fn` injected; httpx lives in `cli.py` (`_http_get`/
+`_http_post` beside the existing `_make_http_client` test seam, the
+`feeds.fetch_feed` None-on-failure pattern). The 8g `cli.py` "no venue
+URL consumers exist until 8h" deviation note is RETIRED. The 7-verb
+surface is unchanged; fetch grew internals only.
+
+### Tests added (+43 Python; frozen 202 untouched; NO live API calls)
+
+`tests/test_fetchers.py`: budget env parse (default/override/malformed)
++ window-reset arithmetic + per-venue instance isolation; observed
+universe over the committed `ticks_v2.pmlr` (= {7:pm, 67119674:hl,
+67119675:hl}); all four parsers happy + malformed-skip + unusable-body;
+seed classification; target derivation (universe restriction, one seed
+per sym, binance-never-a-candle-target); per-consumer happy /
+budget-exhausted (fns provably uncalled) / failed / malformed / URL +
+POST-body exactness (windows from injected `now_ms`); candle + meta
+file content and placement; engine-default mirror; gamma question+slug
+naming; map bootstrap (reader-loadable by the UNTOUCHED
+`cli.load_market_map`), additive refresh with operator preservation,
+conflict reported-and-left-alone, pairs never fabricated, atomic write
+observed via an `os.replace` spy (same-dir `.tmp`, tmp gone after);
+`run_secondary` --no-rest-real / zero-targets-client-invariant / full
+pass (budget cap 1 ⇒ second HL target skipped, `skipped_total`
+surfaced); cli-level: --no-rest never constructs the client (raising
+seam), no-descriptors bootstrap keeps the frozen glob exactly
+[67119674.json, 67119675.json, 7.json], MockTransport end-to-end
+(gamma + HL, files written + printed, map gains question/slug), HTTP
+500 counted-not-fatal, malformed-map exit 2 with file byte-preserved.
+
+### Gates at close (all on the Mac; MCP terminal, nohup+poll)
+
+- worker pytest **247** green (204 baseline + 43; release binary on
+  PATH so the 2 real-harness tests RAN, 0 skipped). 247 is the new
+  stay-green.
+- workspace nextest **1081/1081**, 1 skipped (the `#[ignore]` regen) —
+  untouched-green; no LEAK flag appeared this run (H2's annotation was
+  environmental).
+- release alloc **36/36** 0 B/op `--test-threads=1` with the CORRECTED
+  guard: `cargo clean -p bench --release` (`Removed 15 files`) + a
+  fresh `Compiling bench` line verified in-log.
+- `cargo build --release -p cli` Finished (0.08 s — no Rust changes, as
+  the kickoff expected; the gates were the pitfall-#9 net).
+- Fuzz untouched (kickoff law): all new parsing is strict field-checked
+  JSON in PYTHON (labeling.py precedent) — no hand-rolled Rust
+  untrusted-bytes parser exists.
+
+### Hygiene
+
+- Cargo/pytest on the Mac ONLY (pitfall #10; the Linux sandbox was used
+  for read-only file inspection, never for gates). No engine boots. No
+  `.env` read or write (`.env.example` only). No git op until the
+  authorized closing commit. Push anomaly: unchanged posture.
+- The pitfall-#11 live smoke for §6.1 (a one-shot `fetch` against the
+  real public endpoints, budget-capped) is OPERATOR-GATED per the
+  kickoff and was NOT run; the operator can run it any time with:
+  seed the map (e.g. the boot market's token id as a name for sym 42),
+  then `uv run claude-worker fetch`. Recorded as OWED-at-operator-
+  discretion, not blocking item 3 (fixtures drove every §12 row).
+- market-map.json on the real box: still absent (creating it live is
+  part of the operator smoke above — the code path is
+  bootstrap-on-first-fetch by construction).
+
+### Resume point
+
+Item 3 CLOSED (this commit). Next session H4 = design §13 item 4:
+strategist (§7 in full + §8.1/§8.2 promotion). The H4 kickoff prompt
+below is ready to paste.
+
+---
+
+## H4 kickoff prompt (paste verbatim into a fresh session)
+
+8h implementation — SESSION H4 (design §13 checklist ITEM 4 ONLY:
+strategist §7 IN FULL + §8.1/§8.2 auto-promotion; rollback/§8.3–§8.5 is
+H5 — do NOT start it), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue. Stage-2 status: 8f/8g CLOSED;
+8h H0 design LOCKED, H1 CLOSED, H2 CLOSED, H3 CLOSED — HEAD = the H3
+commit (fetchers.py live: four §6.1 REST consumers on injected
+get_fn/post_fn, RestBudget wired real 60/venue/h, --no-rest real,
+market-map bootstrap/additive-refresh/conflict-report with atomic
+writes; descriptors = map names, engine-default mirror binance:btcusdt;
+.env.example carries the three §7.5 keys). Baselines NOW: workspace
+nextest 1081/1081 (+1 ignored fixture-regen), release alloc 36/36
+0 B/op (`--test-threads=1`; guard: `cargo clean -p bench --release` +
+fresh `Compiling bench` in-log), worker pytest **247** (202 frozen
+UNTOUCHABLE + 2 real-harness + 43 H3 fetchers; 247 is the stay-green),
+fuzz `ruleset_json` 72.3M clean (untouched unless you hand-roll a Rust
+untrusted-bytes parser — you must not). NO push, NO rebase, NO history
+rewrite, NO branches, NO git ops without operator ask (ONE closing
+commit IS authorized; one-line status after). Do NOT touch `.env`.
+Notes go ONLY to docs/phase-8h-progress.md (H4 entry: decisions, tests,
+gates, hygiene, resume point + H5 kickoff prompt). Verify
+get_project_modules against the main checkout FIRST; stop if no attach.
+REQUIRED READING, in order: (1) docs/phase-8h-design.md §7 ENTIRE
+(prompt architecture + cache_control, §7.3 output contract, §7.4 cycle
+state machine ≤2 calls/cycle + 12/day, §7.5 budget ledger + the env
+keys NOW CONSUMED: CLAUDE_WORKER_STRATEGIST_INTERVAL_S=21600,
+CLAUDE_WORKER_STRATEGIST_DAILY_CAP=12, §7.6 threading — LLM call on a
+1-worker ThreadPoolExecutor, FRAMES SINGLE-WRITER on the serve loop,
+background thread writes files only, own SQLite connection
+prompt_cache-only) + §8.1/§8.2 (promote = atomic §6.2-style install to
+$AI_RULESET_DIR/<hash128>.json then the FROZEN
+backtest.stage_ruleset(author_mode="auto")/commit_ruleset pair;
+attribution model=/thesis= additive OPTIONAL params on
+state.stage_ruleset writing the pre-provisioned rulesets.model/thesis
+columns — every existing call site unchanged) + §9 (serve composition:
+research_cycle collaborator, SDK client construction stays daemon.py
+and nowhere else, strategist receives complete_fn injected, SIGTERM
+drain semantics) + §12 strategist/promotion test rows; (2)
+docs/phase-8h-progress.md H3 entry (baselines + the 12 interpretation
+calls — review them, uphold or flag, H2 precedent); (3)
+claude-worker/src/claude_worker/ llm.py (grows the optional
+system/cache_control/usage-return surface; MODEL_STRATEGIST +
+STRATEGIST_MAX_TOKENS=4096 come due; existing triage/label callers
+UNCHANGED), daemon.py (0.2 s loop, heartbeat cadence, watcher
+composition pattern to mirror for research_cycle), state.py
+(stage_ruleset additive params + events surface + prompt_cache/
+cached_complete dedupe), backtest.py (the FROZEN stage/commit pair —
+backtest.py:307 already names serve's commander path as a caller;
+run_backtest is the promotion gate), labeling.py (strict-parse
+precedent for the §7.3 {"thesis", "rows"} contract: malformed ⇒
+.rejected archive + state event, cycle over), config.py (ServeConfig —
+NOTE H3 interpretation #2: the frozen 202 construct ServeConfig
+directly, so strategist env keys read at the seam, NOT new BaseConfig
+fields), fetchers.py (feature files + market map the strategist digests
+— read-only consumer); (4) docs/prompts/ai-session.md §4 (the
+semi-manual strategist the auto path must mirror gate-for-gate). H4
+SCOPE (item 4, nothing more): NEW strategist.py (inputs = feature files
++ news NDJSON + market map + grammar/caps contract; STATIC system block
+with cache_control ephemeral + DYNAMIC token-capped digest
+STRATEGIST_INPUT_CAP; strict §7.3 parse; candidates dir
+~/multivenue/worker/candidates/<utc-ts>-<hash128>.json; ≤2 Fable-5
+calls/cycle, revision call carries gate summary + report; daily
+ceiling via the state.db events ledger kind='strategist_call' with
+usage tokens + cache-read flag, breach ⇒ 'strategist_budget_skip'
+event; no-fresh-capture cycle ⇒ SKIP, event logged;
+prompt_cache dedupe via cached_complete), llm.py surface growth,
+daemon.py research_cycle (interval from env, checked once per tick;
+ThreadPoolExecutor(max_workers=1); UDS sends ONLY on the serve-loop
+thread; backtest subprocess inline), state.stage_ruleset additive
+model=/thesis= params, §8.1 promote step (gates PASS ⇒ atomic install ⇒
+frozen stage/commit, author_mode="auto", paper only; gates FAIL ⇒ no
+install, no frames). TESTS (additive; 247 stays green; design §12
+strategist + promotion rows): prompt build (static/dynamic split,
+cache_control present), strict output parse good/malformed/oversized,
+revision-call cap, daily ceiling, dedupe hit (zero API cost), budget
+ledger rows, background-thread seam with FakeClient (NO live SDK —
+house rule; SDK constructed inside serve only), promotion auto-install
++ stage/commit against FakeUdsServer, attribution columns written,
+gates-fail ⇒ no install no frames, existing stage_ruleset call sites
+byte-unchanged. GREEN GATES to close: worker pytest 247 + new ALL
+green, workspace nextest 1081/1081 untouched-green, release alloc 36/36
+`--test-threads=1` corrected guard, `cargo build --release -p cli`
+links (no Rust changes expected). LANDMINES: Mac-only cargo/pytest
+(pitfall #10); RustRover MCP ≤45 s window — nohup > /tmp/8h-h4-*.log &
+then poll, `sleep N` inside the polled command counts against the
+window; zsh eats bare ===; full `import x` only; engine/strategy-vm/
+ingress/core/cli crates READ-ONLY (claude-worker + docs only); the
+7-verb surface FROZEN (the strategist lives INSIDE serve); do NOT touch
+the committed backtest-real fixture; the H1 golden fixture + 202
+untouchable; ANTHROPIC_API_KEY never read outside serve (the Base/Serve
+split tests pin it). SESSION FACTS: projectPath
+/Users/darkcite/trading-engine-multivenue; macOS: AF_UNIX sun_path cap,
+SO_RCVTIMEO EINVAL on peer-closed UDS, std::thread::scope panic hangs
+without StopOnDrop, sample <pid> for hangs; push anomaly KNOWN (38e599b
+→ f2b3742 across H0): record, never act; the H3 §6.1 live fetch smoke
+is OWED at operator discretion (not blocking); market-map.json still
+absent on the box (bootstraps on first live fetch). If context runs
+short: write interim state + exact resume point + relaunch prompt into
+docs/phase-8h-progress.md, then tell me.

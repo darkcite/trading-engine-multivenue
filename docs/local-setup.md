@@ -124,8 +124,12 @@ Worker env keys (`.env.example` documents all): `AI_INGRESS_SOCK`,
 `AI_INGRESS_HMAC_KEY`, `AI_RULESET_DIR`, `CLAUDE_WORKER_REPLAY_DIR`
 (required — point at the engine `MULTIVENUE_LOG_DIR`),
 `CLAUDE_WORKER_DB`, `CLAUDE_WORKER_FEATURES_DIR`,
-`CLAUDE_WORKER_MARKET_MAP`, `RSS_FEEDS` (worker-only). The
-semi-manual playbook is `docs/prompts/ai-session.md`.
+`CLAUDE_WORKER_MARKET_MAP`, `RSS_FEEDS` (worker-only), and the 8h
+research-loop keys `CLAUDE_WORKER_STRATEGIST_INTERVAL_S`,
+`CLAUDE_WORKER_STRATEGIST_DAILY_CAP`,
+`CLAUDE_WORKER_REST_BUDGET_PER_H` (design §7.5; the REST budget is
+consumed by `fetch`, the strategist pair from H4). The semi-manual
+playbook is `docs/prompts/ai-session.md`.
 
 ## Troubleshooting
 
