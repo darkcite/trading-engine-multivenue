@@ -775,7 +775,7 @@ pub const AI_SIDE_NONE: u8 = 0xFF;
 
 /// Why an [`AiCmd`] failed [`AiCmd::validate_shape`]. Each variant maps
 /// to one violated row/column of the per-kind shape table in
-/// `docs/phase-8f-design.md` §3; the accept path folds all of them into
+/// `docs/arch/phase-8f-design.md` §3; the accept path folds all of them into
 /// `engine_ingress_ai_malformed_total` and keeps the frame in the PMLR
 /// capture for offline audit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -944,7 +944,7 @@ impl AiCmd {
     }
 
     /// Validate kind range and the full per-kind field-shape table of
-    /// `docs/phase-8f-design.md` §3 ("unused fields MUST be zero /
+    /// `docs/arch/phase-8f-design.md` §3 ("unused fields MUST be zero /
     /// `SYMBOL_ID_NONE` / `0xFF`"). Run by `ingress-ai` at accept
     /// (§4.4 step 4) and by the engine drain site; failures increment
     /// `engine_ingress_ai_malformed_total`.

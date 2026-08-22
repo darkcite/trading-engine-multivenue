@@ -24,7 +24,7 @@ Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine targe
 ```sh
 cargo build --release --workspace
 cargo nextest run --workspace
-cargo test --test alloc_assertions --release   # must show 0 B/op
+cargo test -p bench --test alloc_assertions --release -- --test-threads=1   # must show 0 B/op
 cargo fuzz run <target> -- -max_total_time=300
 cd claude-worker && uv run pytest
 ```
@@ -37,8 +37,9 @@ cd claude-worker && uv run pytest
 - `crates/ingress-*/` — external source adapters.
 - `crates/strategy-*/` — strategies implementing `strategy-core::Strategy`.
 - `crates/signer-eip712/`, `crates/clob-dispatcher/` — execution.
-- `tests/`, `fuzz/` — integration tests and fuzz targets.
-- `claude-worker/` — Python, offline only.
+- `fuzz/` — cargo-fuzz targets; integration tests live per-crate under each crate's `tests/`.
+- `claude-worker/` — Python 3.14, offline only (daemon + operator verbs; never hot path).
+- `docs/` — live docs; `docs/arch/` — closed historical plans and progress logs.
 - `.claude/` — Claude subagents and slash commands.
 
 ## If you are proposing to add

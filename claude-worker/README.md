@@ -12,7 +12,7 @@ One library core, two frontends over the same code path:
 
 Frames go to the engine over a UDS socket as 82-byte HMAC-tagged `AiCmd`
 frames; gates for ruleset stage/commit live in code, not prompts, and bind
-identically in both modes. See `docs/phase-8f-design.md` for the authority.
+identically in both modes. See `docs/arch/phase-8f-design.md` for the authority.
 
 Python 3.14, uv-managed. Run tests: `uv run pytest`.
 Convention: full `import x` only — never `from x import y` (enforced by test).

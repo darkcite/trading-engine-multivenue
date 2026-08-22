@@ -11,7 +11,7 @@ EC2 box — no cloud services, no observability stack, no IaC.
 - [PLAN.md](./PLAN.md) — authoritative architecture, phased roadmap, testing strategy.
 - [CLAUDE.md](./CLAUDE.md) — context front-loaded for Claude sessions.
 - [AGENTS.md](./AGENTS.md) — tool-agnostic brief for any AI coding agent.
-- [docs/](./docs/) — wire format, risk policy, local setup, migration notes.
+- [docs/](./docs/) — wire format, risk policy, local setup, migration notes, live phase docs (8h). Closed historical plans/logs live in [docs/arch/](./docs/arch/).
 
 ## Quick start
 
@@ -25,7 +25,7 @@ cargo build --release --workspace
 
 # 3. Run tests
 cargo nextest run --workspace
-cargo test --test alloc_assertions --release   # must show 0 B/op
+cargo test -p bench --test alloc_assertions --release -- --test-threads=1   # must show 0 B/op (or `make alloc-assert`)
 
 # 4. Paper-mode run (Phase 8: multivenue — supply per-venue symbols)
 cargo run --release -p cli -- run --paper --env-file ./.env \
@@ -64,10 +64,10 @@ crates/
   cli/              Main binary
   tui/              ratatui dashboard (read-only)
   bench/            criterion + dhat + alloc assertions
-fuzz/               cargo-fuzz targets
+fuzz/               cargo-fuzz targets (integration tests are per-crate under each crate's tests/)
 claude-worker/      Python 3.14, offline Claude researcher (no hot path)
 .claude/            Subagents, slash commands, settings
-docs/               Architecture notes
+docs/               Live docs (arch/ = closed historical plans/logs)
 ```
 
 ## Hard rules

@@ -103,7 +103,7 @@ slot, byte-identical to what the ring consumer sees; the worker's send
 time survives only in the optional raw tap (design §3/§13.1 as amended
 2026-08-15). Per-kind field shapes ("unused fields
 MUST be zero / `SYMBOL_ID_NONE` / `0xFF`") are pinned in
-`docs/phase-8f-design.md` §3 and enforced by
+`docs/arch/phase-8f-design.md` §3 and enforced by
 `core_types::AiCmd::validate_shape`.
 
 | offset | bytes | field       | type           | notes                                   |
