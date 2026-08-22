@@ -1,0 +1,17 @@
+# pm-dailies.toml — the M3 universe-refresh input (copy to
+# ~/multivenue/pm-dailies.toml; install-launchd.sh seeds it if absent).
+#
+# `claude_worker.universe_refresh` (module, NOT a verb) resolves, for
+# each underlying, the nearest unresolved Polymarket daily
+#   <underlying>-up-or-down-on-<monthname>-<day>-<year>
+# via the Gamma lane (today UTC before 16:00Z, else tomorrow — the
+# dailies resolve 16:00Z) and rewrites ONLY the [polymarket] markets
+# array of universe.toml (atomic; any failure keeps the old file).
+#
+# ORDER MATTERS: this list's order IS the markets-array order IS the
+# [pairs] index space — keep it aligned with binance.spot in
+# universe.toml (bitcoin<->btcusdt, ethereum<->ethusdt ⇒ pairs
+# "0:0", "1:1" keep meaning what they say).
+
+[dailies]
+underlyings = ["bitcoin", "ethereum"]

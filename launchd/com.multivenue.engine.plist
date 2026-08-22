@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- M3 standing paper engine (TEMPLATE — install-launchd.sh renders
+     @REPO@/@HOME@ and copies to ~/Library/LaunchAgents). Secrets stay
+     in .env, sourced by the wrapper: NEVER inline values here. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.engine</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/engine-wrapper.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>@REPO@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <!-- bootout/stop: SIGTERM, then 60 s before SIGKILL — the M1d
+       graceful-drain window. -->
+  <key>ExitTimeOut</key><integer>60</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/engine.out.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/engine.err.log</string>
+</dict>
+</plist>

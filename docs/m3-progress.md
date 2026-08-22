@@ -133,3 +133,111 @@ fix.
 + smoked; nothing committed; ask the operator to authorize the C1
 commit of exactly the six paths listed above, then follow the
 notification duty.
+
+---
+
+## 2026-08-22 — C1 LANDED
+
+CATALOG LANDED — M2.3 UNBLOCKED (commit cf132ae)
+
+Operator authorized; committed `M3:`-prefixed with the six explicit
+paths only (`git status` after: only M2's `docs/mvp-progress.md`
+remains dirty — untouched). Operator notified verbatim per the
+kickoff duty. Next: C2 — launchd always-on lane (installed EARLY so
+gap-free days start accumulating).
+
+---
+
+## 2026-08-22 — C2: launchd always-on lane BUILT + INSTALLED + LIVE-PROVEN (commit ask pending)
+
+**The standing engine is UP** (installed 12:08:21Z; the M3 one-engine
+law is now in force — this launchd instance IS the engine; M2 smoke
+windows stop/start it per the new runbook section).
+
+### Pieces
+
+- **`scripts/engine-wrapper.sh`** (launchd target, every boot):
+  one-engine pgrep guard (foreign engine ⇒ backoff-and-retry — the
+  lane self-heals around manual smoke windows) → source `.env`
+  (values never inlined in plists, never echoed; the H6b wrapper
+  pattern) → best-effort `claude_worker.universe_refresh` → `exec
+  release-binary run --paper --strategy all`. G0 relink law stated
+  in-file: the wrapper NEVER builds.
+- **`scripts/daily-restart.sh`** + 60 s `StartInterval` agent: on
+  UTC-day change (stamp file), SIGTERM drain (M1d-proven) →
+  KeepAlive relaunch → fresh universe + fresh run dir ⇒ **one run
+  dir per UTC day, gap-free by construction**. `StartInterval`
+  deliberately, not `StartCalendarInterval` (launchd calendars are
+  LOCAL-time/DST; slept-through midnights fire on wake).
+- **`launchd/com.multivenue.{engine,daily-restart,caffeinate}.plist`**
+  templates (`@REPO@`/`@HOME@`) + **`scripts/install-launchd.sh`**
+  (idempotent render+bootstrap; seeds the restart stamp so install
+  never self-kills; seeds `~/multivenue/pm-dailies.toml` from the
+  example). `caffeinate -s -i` holds sleep off on AC; pmset/clamshell
+  operator notes in the runbook.
+- **`claude_worker/universe_refresh.py`** — a MODULE, not a verb
+  (7-verb surface untouched; `cli.py` stays byte-frozen): resolves
+  each configured underlying's nearest unresolved up/down daily via
+  the Gamma lane and rewrites ONLY the `[polymarket]` `markets` array
+  of `universe.toml`, atomically, byte-preserving everything else
+  ([pairs] untouched — `pm-dailies.toml` order law documented).
+  **Date law** (live-verified): dailies resolve 16:00Z and list ~2
+  days early ⇒ target today before 16:00Z, else tomorrow — the
+  00:00Z restart always picks the day's markets. **Slug law**
+  live-verified (`bitcoin-up-or-down-on-august-22-2026`); unpadded
+  day, with a padded fallback until a single-digit day confirms.
+  Best-effort law: ANY failure leaves the file byte-untouched, exit
+  1, wrapper boots on the existing universe.
+- Tests: `tests/test_universe_refresh.py`, 18 additive (mocked
+  `get_fn`, real-shape Gamma fixtures incl. the double-encoded
+  `clobTokenIds`/token-id length law; Down/Up swap; rewrite
+  byte-preservation; end-to-end idempotence; fail-soft paths).
+- Runbook: `docs/local-setup.md` new "Always-on standing engine"
+  section (install/status/logs, M2 smoke-window dance, relink law —
+  `pkill -TERM`, never `kickstart -k` (SIGKILL), uninstall, power).
+
+### Live proofs (2026-08-22, this session)
+
+1. **Install** → engine pid 73763 via the wrapper, fresh
+   `run-1787400501923792000`, metrics 9191 up, caffeinate + restart
+   poller loaded.
+2. **First boot exposed a REAL bug**: the refresh module's stdlib
+   `urllib` GET failed CA verification under uv-managed CPython
+   (launchd env) while manual `curl` succeeded — root-caused and
+   FIXED to the worker-standard httpx GET (`cli._http_get` pattern,
+   `REST_TIMEOUT_S`); the wrapper's best-effort law held (booted on
+   the existing file — availability never depended on the refresh).
+3. **Refresh proven against ground truth**: live module run resolved
+   2 markets for 2026-08-22 whose token ids are BYTE-IDENTICAL to the
+   operator's hand-resolved M1 entries (diff shows comment lines
+   only).
+4. **Full-chain restart**: `pkill -TERM` → KeepAlive relaunch raced
+   the drain → one-engine guard backed off (by design) → retry →
+   **refresh SUCCESS through the wrapper** → engine pid 74176, fresh
+   `run-1787400655038242000`, ticks flowing. Dark window ≈ 60–90 s ≪
+   the 300 s gap tolerance.
+5. First automated UTC-midnight turn happens tonight; from tomorrow
+   the gap-free-day counter starts (catalog is the judge).
+
+### Gates
+
+- Rust byte-untouched since C1 ⇒ nextest 1151/1151 + alloc 36/36
+  stand (C1 numbers, same tree).
+- worker pytest **381** (363 stay-green + 18 additive), release
+  binary on PATH (the 2 real-harness tests included).
+- fuzz: untouched — no new untrusted-bytes parser (Gamma JSON rides
+  the EXISTING `parse_gamma_markets`; the new module adds no parser).
+
+### Commit ask C2 (pending operator go) — explicit paths
+
+`scripts/engine-wrapper.sh` · `scripts/daily-restart.sh` ·
+`scripts/install-launchd.sh` · `launchd/com.multivenue.engine.plist`
+· `launchd/com.multivenue.daily-restart.plist` ·
+`launchd/com.multivenue.caffeinate.plist` · `pm-dailies.toml.example`
+· `claude-worker/src/claude_worker/universe_refresh.py` ·
+`claude-worker/tests/test_universe_refresh.py` ·
+`docs/local-setup.md` · `docs/m3-progress.md`
+
+**Resume point if context dies here:** C2 installed + live-proven,
+commit not yet asked/landed; C3 (retention) + C4/C5 (candles.db) not
+started; the standing engine accumulates days meanwhile.

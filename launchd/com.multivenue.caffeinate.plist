@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- M3 sleep guard (TEMPLATE — rendered by install-launchd.sh):
+     caffeinate -s -i holds off system + idle sleep while on AC power
+     so the standing engine never gaps a day. Battery/clamshell
+     caveats: docs/local-setup.md (pmset runbook, operator act). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.caffeinate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>-i</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/caffeinate.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/caffeinate.log</string>
+</dict>
+</plist>

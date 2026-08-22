@@ -131,6 +131,65 @@ research-loop keys `CLAUDE_WORKER_STRATEGIST_INTERVAL_S`,
 consumed by `fetch`, the strategist pair from H4). The semi-manual
 playbook is `docs/prompts/ai-session.md`.
 
+## Always-on standing engine (M3 data-ops lane)
+
+One launchd-supervised paper engine on the full universe, restarted
+gracefully at every UTC midnight → one run dir per UTC day (gap-free
+days by construction; `capture-catalog` is the judge). **ONE ENGINE
+EVER**: once installed, this instance IS the standing engine.
+
+```sh
+# install / reinstall (idempotent; reinstall = graceful restart)
+./scripts/install-launchd.sh
+
+# status / live tail
+launchctl print gui/$UID/com.multivenue.engine | grep -E "state|pid"
+tail -f ~/multivenue/logs/launchd/engine.out.log
+
+# coverage truth (any time)
+./target/release/multivenue-engine capture-catalog --dir ~/multivenue/logs
+```
+
+Pieces (templates in `launchd/`, rendered by the installer):
+
+- `com.multivenue.engine` — KeepAlive; runs
+  `scripts/engine-wrapper.sh`: one-engine pgrep guard → source `.env`
+  (values never inlined in plists, never echoed) → best-effort
+  `claude_worker.universe_refresh` (Gamma re-resolve of the PM
+  up/down dailies from `~/multivenue/pm-dailies.toml` — today before
+  16:00Z, else tomorrow; failure boots on the existing
+  `universe.toml`) → `exec … run --paper --strategy all`.
+- `com.multivenue.daily-restart` — 60 s poller; on a new UTC day
+  SIGTERMs the engine (M1d-proven drain); KeepAlive relaunches
+  through the wrapper. `StartInterval`, not calendar: launchd
+  calendars are LOCAL-time (DST) and a slept-through midnight fires
+  on wake instead.
+- `com.multivenue.caffeinate` — `caffeinate -s -i` (no system/idle
+  sleep on AC). For lid-closed operation also run the operator-level
+  `sudo pmset -c sleep 0 && sudo pmset -a disablesleep 1` (revert
+  with `disablesleep 0`), or keep the lid open on AC.
+
+Operational laws:
+
+- **M2 smoke windows** (or any manual boot): stop the standing lane
+  first, restart it after —
+  `launchctl bootout gui/$UID/com.multivenue.engine` (SIGTERM drain)
+  … smoke … `launchctl bootstrap gui/$UID
+  ~/Library/LaunchAgents/com.multivenue.engine.plist`. The wrapper's
+  pgrep guard self-heals if the order is fumbled: the standing lane
+  backs off while a foreign engine lives and resumes when it exits.
+- **Relink law (G0)**: the wrapper never builds. Deploy = `cargo
+  build --release -p cli`, then `launchctl kickstart -k` is WRONG
+  (SIGKILL) — use `pkill -TERM -f "multivenue-engine run"`; KeepAlive
+  relaunches on the new binary.
+- **Worker verbs stay manual** and globally serialized (session law):
+  the wrapper runs only the refresh MODULE (file rewrite, no state.db
+  writes). After a notable universe change, run `uv run claude-worker
+  fetch` once (`unresolved=0` is the done-tell).
+- Uninstall: `for l in engine daily-restart caffeinate; do launchctl
+  bootout gui/$UID/com.multivenue.$l; done` (+ delete the plists from
+  `~/Library/LaunchAgents`).
+
 ## Troubleshooting
 
 - **Build fails with "unknown target-feature"**: the Apple Silicon target

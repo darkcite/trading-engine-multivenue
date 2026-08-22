@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- M3 UTC-day restart poller (TEMPLATE — rendered by
+     install-launchd.sh). StartInterval, not StartCalendarInterval:
+     launchd calendars fire in LOCAL time; the UTC-day check lives in
+     the script, DST-proof, and a missed window (Mac asleep) fires on
+     the next tick after wake. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.daily-restart</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/daily-restart.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/restart.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/restart.log</string>
+</dict>
+</plist>
