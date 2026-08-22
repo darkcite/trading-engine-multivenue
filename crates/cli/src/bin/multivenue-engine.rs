@@ -62,6 +62,15 @@ enum Cmd {
     /// stderr; exit 0 only when a trustworthy report was printed.
     /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
     Backtest(BacktestArgs),
+    /// Offline M3 capture catalog (mvp-plan §4-M3): walks a replay
+    /// root (or one `run-<epoch_ns>` dir) and reports per-run wall
+    /// spans, per-venue tick coverage, UTC-day continuity (gap map,
+    /// gap-free-day streaks), run-dir sizes, the backtest view
+    /// (harness §3.1 acceptance + §4.5 day arithmetic) and the
+    /// monitor view (§8.3 trailing-window coverage). JSON on stdout,
+    /// human summary on stderr; an EMPTY root is a valid zero-run
+    /// report (init-if-empty visibility).
+    CaptureCatalog(CaptureCatalogArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -69,6 +78,19 @@ struct AuditReplayArgs {
     /// Capture run directory (`<MULTIVENUE_LOG_DIR>/run-<ns>`).
     #[arg(long)]
     dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureCatalogArgs {
+    /// Replay root (`MULTIVENUE_LOG_DIR`) or one `run-<epoch_ns>`
+    /// directory — the same §3.1 resolution as `backtest
+    /// --replay-dir`.
+    #[arg(long)]
+    dir: PathBuf,
+    /// Max dark ns a UTC day may carry and still count gap-free
+    /// (default 300 s — the daily-restart drain allowance).
+    #[arg(long, default_value_t = cli::capture_catalog::DEFAULT_GAP_TOLERANCE_NS)]
+    gap_tolerance_ns: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -290,6 +312,33 @@ fn main() -> ExitCode {
         Cmd::Backtest(args) => {
             init_tracing_stderr();
             backtest(args)
+        }
+        Cmd::CaptureCatalog(args) => {
+            // stderr tracing for the same reason as the backtest arm:
+            // stdout carries the catalog JSON and nothing else.
+            init_tracing_stderr();
+            capture_catalog(args)
+        }
+    }
+}
+
+/// M3 catalog arm: JSON on stdout + summary on stderr, exit 0 iff a
+/// report was produced (an empty root IS a report); any failure
+/// prints its reason to stderr only and exits nonzero.
+fn capture_catalog(args: CaptureCatalogArgs) -> ExitCode {
+    let cfg = cli::capture_catalog::CatalogConfig {
+        dir: args.dir,
+        gap_tolerance_ns: args.gap_tolerance_ns,
+    };
+    match cli::capture_catalog::run_catalog(&cfg) {
+        Ok(out) => {
+            eprint!("{}", out.summary);
+            println!("{}", out.json);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("capture-catalog: {e}");
+            ExitCode::from(1)
         }
     }
 }

@@ -72,11 +72,13 @@ pub const VIRT_T0: u64 = 100_000_000_000_000_000;
 
 /// PMLR header version the merge requires: v1 tick slots carry an
 /// undefined venue byte, and the §3.2 total order keys on it.
-const REQUIRED_PMLR_VERSION: u16 = 2;
+/// `pub(crate)`: `capture_catalog` mirrors the same acceptance law.
+pub(crate) const REQUIRED_PMLR_VERSION: u16 = 2;
 
 /// Per-venue tick-capture file labels, in file-ordinal order (mirrors
 /// `audit_replay::VENUE_LABELS` — the cli spawn labels exactly).
-const VENUE_LABELS: [&str; 6] = ["pm", "bn", "okx", "rpc", "deribit", "hl"];
+/// `pub(crate)`: `capture_catalog` reports in this fixed order.
+pub(crate) const VENUE_LABELS: [&str; 6] = ["pm", "bn", "okx", "rpc", "deribit", "hl"];
 
 /// Venue labels accepted by the §4.3/§4.4 model flags, mapped to the
 /// wire-stable [`VenueId`] byte. `rpc` is absent by design: it is not
@@ -307,8 +309,10 @@ struct RunDir {
 }
 
 /// Parse `run-<epoch_ns>` (ASCII digits, u64). Anything else is not a
-/// capture run directory.
-fn parse_run_dir_name(name: &str) -> Option<u64> {
+/// capture run directory. `pub(crate)`: the ONE name law, shared with
+/// `capture_catalog` (its discovery differs only in treating an empty
+/// root as a valid zero-run report).
+pub(crate) fn parse_run_dir_name(name: &str) -> Option<u64> {
     let digits = name.strip_prefix("run-")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
