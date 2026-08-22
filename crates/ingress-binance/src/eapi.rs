@@ -329,21 +329,33 @@ pub fn parse_index_price(body: &[u8]) -> Result<i64, EapiDiscoveryErr> {
     Ok(px)
 }
 
-/// Apply the capped universe policy to ONE underlying's option rows —
-/// the M2 selection LAW, third twin of
-/// `ingress_deribit::discovery::select_capped_chain` (the law source;
-/// identical property invariants pin all three; the eapi variant adds
-/// the `underlying` filter because ONE exchangeInfo page carries every
-/// family):
-///
-/// - candidates: `row.underlying == underlying && expiry_ms > now_ms`
-///   (eapi lists tradable symbols only — no per-row state field);
-/// - nearest `expiries_e` distinct expiries asc; per expiry the
-///   `strikes_k` nearest-ATM strikes POSITION-BASED (last K/2
-///   at-or-below + first K/2 above; no backfill); calls then puts.
-///
-/// Deterministic order = the allocation order; ≤ `E × K × 2` by
-/// construction. Boot-only: allocates freely.
+/// The `options_select::ChainRow` view of an eapi option row (M2-close
+/// extraction — the shared law's read surface).
+impl options_select::ChainRow for EapiOptionRow {
+    #[inline]
+    fn exp_ms(&self) -> i64 {
+        self.expiry_ms
+    }
+    #[inline]
+    fn strike_1e9(&self) -> i64 {
+        self.strike_1e9
+    }
+    #[inline]
+    fn is_call(&self) -> bool {
+        self.is_call
+    }
+}
+
+/// Apply the capped universe policy to ONE underlying's option rows.
+/// The selection LAW lives in `options-select` since the M2-close
+/// extraction (`ingress-deribit` = law source; identical property
+/// invariants keep pinning all three venue surfaces) — here lives only
+/// the VENUE candidacy predicate, which for eapi adds the `underlying`
+/// filter because ONE exchangeInfo page carries every family
+/// (`row.underlying == underlying && expiry_ms > now_ms`; eapi lists
+/// tradable symbols only — no per-row state field). Deterministic
+/// order = the allocation order; ≤ `E × K × 2` by construction.
+/// Boot-only: allocates freely.
 pub fn select_capped_chain(
     rows: &[EapiOptionRow],
     underlying: &[u8],
@@ -352,50 +364,13 @@ pub fn select_capped_chain(
     strikes_k: u32,
     now_ms: i64,
 ) -> Vec<EapiOptionRow> {
-    let mut out: Vec<EapiOptionRow> = Vec::new();
-    if expiries_e == 0 || strikes_k == 0 {
-        return out;
-    }
-    let is_candidate =
-        |r: &EapiOptionRow| r.underlying() == underlying && r.expiry_ms > now_ms;
-
-    let mut expiries: Vec<i64> = Vec::new();
-    for r in rows {
-        if is_candidate(r) && !expiries.contains(&r.expiry_ms) {
-            expiries.push(r.expiry_ms);
-        }
-    }
-    expiries.sort_unstable();
-    expiries.truncate(expiries_e as usize);
-
-    let half = (strikes_k / 2) as usize;
-    for &exp in &expiries {
-        let mut strikes: Vec<i64> = Vec::new();
-        for r in rows {
-            if is_candidate(r) && r.expiry_ms == exp && !strikes.contains(&r.strike_1e9) {
-                strikes.push(r.strike_1e9);
-            }
-        }
-        strikes.sort_unstable();
-        let below_end = strikes.partition_point(|&s| s <= index_px_1e9);
-        let lo = below_end.saturating_sub(half);
-        let hi = (below_end + half).min(strikes.len());
-        for &strike in &strikes[lo..hi] {
-            for want_call in [true, false] {
-                for r in rows {
-                    if is_candidate(r)
-                        && r.expiry_ms == exp
-                        && r.strike_1e9 == strike
-                        && r.is_call == want_call
-                    {
-                        out.push(*r);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    out
+    options_select::select_capped_chain(
+        rows,
+        |r: &EapiOptionRow| r.underlying() == underlying && r.expiry_ms > now_ms,
+        index_px_1e9,
+        expiries_e,
+        strikes_k,
+    )
 }
 
 // ---------------------------------------------------------------

@@ -296,6 +296,24 @@ After landing the top 5 fixes above, re-run `cargo bench -p bench --bench hot_pa
 - `clock/now_ns` numbers should remain unchanged (already vDSO).
 - A new bench `engine/tick_burst_256` (not yet written — wanted but disk-constrained) would surface E-2/E-3/E-4 wins.
 
+## Addendum 2026-08-22 (M2 close) — venue symbol tables at options scale
+
+The M2 options ladder grew the per-frame symbol-table linear scans on
+the deribit and okx ingress threads from ≤ 16 rows to ≤ 80
+(`DERIBIT_STATIC_MAX 16 + DERIBIT_OPT_MAX 64`; `OKX_STATIC_MAX 16 +
+OKX_OPT_MAX 64`), and added the Binance eapi lane's own ≤ 64-row
+lowercased-symbol table. This is the promised follow-up to the I-7
+pattern note: measured at venue cadence the cost is TRIVIAL —
+worst-case ~80 short-string memcmps ≈ O(1 µs) per frame upper bound,
+against observed live frame rates of ~28/s (deribit ticks, M2.1
+smoke: 4,145 in ~2.5 min), ~97/s (okx bbo-tbt, M2.2 smoke: 15,694 in
+~2.7 min) and intrinsically sparse opt-summary pushes; both venues'
+live smokes ran ZERO parse rejects and zero backlog with the scans in
+place. No index structure is warranted at ≤ 80 rows; revisit only if
+a policy raise (E ≤ 4 × K ≤ 32 caps) ever multiplies the table by an
+order of magnitude — the I-7 fix (boot-time u64 hashes, scan over
+`[u64]`) is the ready answer then.
+
 Files referenced in this report:
 - `crates/engine/src/lib.rs`
 - `crates/strategy-*/src/lib.rs`

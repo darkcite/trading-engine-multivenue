@@ -24,6 +24,8 @@ members = [
     "crates/ingress-okx",
     "crates/ingress-polymarket",
     "crates/ingress-rpc",
+    # shared boot-only options-chain selection law (M2 close extraction)
+    "crates/options-select",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -145,6 +147,7 @@ ingress-hyperliquid = { path = "crates/ingress-hyperliquid" }
 ingress-okx        = { path = "crates/ingress-okx" }
 ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }
+options-select     = { path = "crates/options-select" }
 
 book-builder          = { path = "crates/book-builder" }
 research-artifacts    = { path = "crates/research-artifacts" }

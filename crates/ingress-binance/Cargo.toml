@@ -20,6 +20,7 @@ core-time  = { workspace = true }
 core-types = { workspace = true }
 memchr     = { workspace = true }
 mio        = { workspace = true }
+options-select = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

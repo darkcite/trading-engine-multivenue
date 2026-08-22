@@ -956,3 +956,239 @@ coordination window), the selection-law unification refactor OFFER
 (three pinned twins — rule of three reached), docs/hot-path-latency.md
 symbol-table note, CLAUDE.md CURRENT-STATE + session-facts refresh at
 M2 close.
+
+---
+
+## 2026-08-22 — M2 CLOSE: §9.8 IV digest + options manifest + selection-law extraction; gates + live proof; M2 CLOSED (commit ask below)
+
+Prior state: M2.1–M2.4 all COMMITTED (`d0e14d4` · `485cba1` ·
+`1d3670f` · `0e98bc0`); BN options WS operator-ruled TEMPORARILY
+UNREACHABLE (lever `BINANCE_EAPI_WS_HOST`, revisit ≤ M6 soak). This
+session executed the close-out ladder under two fresh operator
+rulings (AskUserQuestion, recorded here): **(R1) options descriptor
+resolution = ENGINE-EMITTED PER-RUN MANIFEST** (the M2.1-recorded
+naming gap, parked "until M2.3", now CLOSED); **(R2) selection-law
+unification = EXTRACT NOW** (not deferred).
+
+### Session 0 (baseline re-verification, all on the Mac)
+
+nextest **1219/1219** (+1 skipped) · release alloc **37/37** 0 B/op
+(corrected clean + fresh-`Compiling bench` ×1, `--test-threads=1`) ·
+worker pytest **412** (release binary on PATH; the 2
+`test_backtest_real` included) · fuzz standing per the kickoff (no
+rerun owed at baseline). `git status` at start: only M3's dirty
+`docs/m3-progress.md` (theirs — untouched by staging, see the ask).
+Standing engine up (one-engine law observed all session).
+
+### (R2) Selection-law extraction — design + what moved
+
+**Home: NEW zero-dep crate `crates/options-select`** (workspace member
++ `[workspace.dependencies]` entry). The LAW body (nearest-E distinct
+expiries asc; per expiry K nearest-ATM strikes POSITION-BASED, last
+K/2 at-or-below + first K/2 above, no cross-side backfill; C before
+P; deterministic allocation order; ≤ E×K×2) lives ONCE as
+`select_capped_chain<R: ChainRow, F: Fn(&R) -> bool>` — generic,
+monomorphized, no `dyn` (house rule). `ChainRow` = the three-getter
+row view (`exp_ms` / `strike_1e9` / `is_call`), implemented by
+`DeribitInstrumentRow` / `OkxInstrumentRow` / `EapiOptionRow` in
+their own crates. **Venue candidacy predicates stay venue-side** as
+closures (deribit `is_option && live && unexpired`; okx
+`inst_type==Option && live && unexpired`; eapi adds the `underlying`
+filter its one-page shape requires). **Every public venue
+`select_capped_chain` signature is UNCHANGED** — the three fns are
+now thin wrappers, so every call site (cli boot_discovery), every
+unit/property test and all three fuzz targets pin the SAME behavior
+through the surface they always used. Doctrine header: boot-only,
+allocates freely, no unsafe, zero deps. 6 law unit tests live in the
+new crate; the venue proptest invariants remain the standing
+anti-drift pins. Net: the triplicated law body is GONE; venue crates
+carry predicate + trait impl only.
+
+### (R1) Options manifest — the descriptor lane (docs/wire-format.md "Options manifest")
+
+Why: option ordinals are allocated per boot in selection order and
+reshuffle across boots BY DESIGN (chain roll; mvp-plan §6/PLAN §14),
+and options are boot-discovered — the M1d universe-file seeding lane
+can never name them (M2.1 recorded consequence). Every offline
+venue+descriptor consumer (§9.8 digest, M4 shadow-P&L, M5 digest)
+needs a per-run sym→name map; the run dir now carries it.
+
+- NEW `crates/cli/src/options_manifest.rs` (offline/boot doctrine
+  header): `render()` from the boot-discovery Outcome vectors →
+  `<venue_label>\t<sym_u32_decimal>\t<instrument_name>\n` lines,
+  labels = capture-file prefixes (`deribit` / `okx` / `bn`), no
+  header line; 2 unit tests (exact bytes, empty ⇒ empty).
+- bin: written ONCE after discovery into
+  `<run>/options-manifest.tsv`, ONLY when ≥ 1 option selected
+  (absence = options-less or pre-manifest run); write failure is
+  FATAL like the run-dir create (a boot that cannot write its
+  capture dir must not trade on it); info line carries path + rows.
+- No new fuzz target (own-file, not venue wire; the worker parses it
+  strictly — same trust class as PMLR reads). No alloc-gate change
+  (boot path).
+
+### (1) §9.8 IV digest — `claude_worker.iv_digest` (worker-side, ADDITIVE FILES ONLY)
+
+`claude-worker` is M3-owned ⇒ exactly TWO new files, nothing else
+touched: `src/claude_worker/iv_digest.py` +
+`tests/test_iv_digest.py` (frozen 7-verb surface, `backtest.py` /
+`cli.py` / conftest / pmlr.py all byte-untouched; `tests.craft`
+imported, not edited).
+
+- **Store**: table `iv_digest` BESIDE `candles` INSIDE `candles.db`
+  (same `CLAUDE_WORKER_CANDLES_DB` store — §9.9's "strategist digest
+  reads candles.db + feature files" stays literally true). PK
+  `(venue, descriptor, tf∈{1m,1h}, open_ts)` WITHOUT ROWID (§9.4
+  law); columns iv o/h/l/c (FRACTION; wire ×1e9), `n`, last-in-bucket
+  context `underlying_c` (wire 0 ⇒ NULL) and flag-gated `mark_px_c` /
+  `oi_c` (bit0/bit1 — OKX 0/0 by design; BN gains MARK_PX when its
+  stream activates), `computed_ts`. `CREATE IF NOT EXISTS` only —
+  the M3 candles schema is never created or altered; connection sets
+  WAL + `busy_timeout=5000` (an overlap with the hourly agent
+  degrades to a bounded wait; the operational law stays pgrep-first +
+  off top-of-hour like every worker invocation).
+- **Semantics**: digest rows are a derived CACHE of capture —
+  insert / refresh-when-refold-changes / unchanged; no conflict
+  table (PMLR is the truth). Wall mapping = harness §3.3 verbatim
+  (`epoch + (ts − run_anchor)`, anchor = min first-ts across the
+  run's tick files — the candles §9.7 pattern). Rolling window
+  default 26 h (`CLAUDE_WORKER_IV_DIGEST_WINDOW_H`, documented in
+  `.env.example`; `--backfill` = whole root; `.env` itself
+  UNTOUCHED). Descriptor namespaces: `deribit:` / `okx:` /
+  **`binance-opt:`** + instrument name (beside `binance:` /
+  `binance-usdm:`; §9.4 example set extended — recorded here as the
+  worker naming convention for eapi options).
+- **Local mirrors, flagged for M3 fold-in** (module docs + the
+  m3-progress coordination note): `SLOT_KIND_OPT_SUMMARY = 6` + the
+  kind-6 decode (`pmlr.py` stops at kind 5; the local `OptReader`
+  REUSES the pmlr header struct — one header layout, no drift; torn
+  tail tolerated) and the `_run_anchor_ns` mirror.
+- **Honest-skip lane**: a run with opt-summary records but no
+  manifest (all pre-close history) is skipped + counted with a
+  per-run report line; unresolved syms / malformed manifest lines
+  counted, never guessed.
+- Tests: **17 new** — wire-format offset pin (pack_into at the
+  documented offsets → decode-exact), OptReader/pmlr.Reader mutual
+  refusal cross-pin, torn tail, strict manifest parse (+absent),
+  happy-path 1m+1h o/h/l/c/n through a NONZERO anchor, OKX
+  flags-zero ⇒ NULLs, `binance-opt:` namespace + wire-0 underlying ⇒
+  NULL, no-manifest / no-anchor / unresolved / window / header-only
+  skips, insert→unchanged→refresh upsert cycle, open_db additive
+  beside an existing candles schema, main() e2e + missing-root.
+- Cadence deliberately NOT wired: `scripts/candles-cycle.sh` and the
+  launchd plists are M3-owned — hooking the digest into the hourly
+  cycle is M3's edit at its next window (coordination note appended
+  to `docs/m3-progress.md` per the both-logs duty; NOT staged here —
+  their file is dirty with their uncommitted content).
+
+### (3)+(4) Docs
+
+- `docs/hot-path-latency.md`: the promised addendum — deribit/okx
+  symbol-table linear scans grew to ≤ 80 rows (+ the eapi ≤ 64
+  table), measured trivial at venue cadence (live smoke rates cited);
+  I-7 named as the ready answer if policy caps ever multiply the
+  tables.
+- `CLAUDE.md` (SHARED, single refresh): CURRENT STATE → M2 CLOSED
+  (BN caveat + lever) · M3 complete-waiting-C6 (fleet live) · M4
+  next on operator go (design entry first); baselines → 1227/37/429
+  + the three fuzz re-runs; parallel-protocol header annotated
+  (ownership/one-engine/serialization laws remain until C6 closes);
+  4 new session facts (fresh-terminal evidence reads · ~45 s MCP cap
+  · concurrent-pytest collision (pgrep first) · pkill bracket trick).
+
+### Gates AFTER the close-out changes (all on the Mac)
+
+- workspace nextest **1227/1227** (+1 skipped) = 1219 + 6
+  options-select + 2 options_manifest. New stay-green floor **1227**.
+- release alloc **37/37** 0 B/op (corrected clean, fresh `Compiling
+  bench` grep-count 1, `--test-threads=1`) — re-verified after the
+  extraction + manifest work.
+- worker pytest **429/429** (412 + 17 digest; serialized, pgrep-first,
+  off top-of-hour). New stay-green **429**.
+- fuzz, the 3 discovery-family targets whose crates changed, ≥ 300 s
+  each, ZERO findings: `deribit_instruments` **8.77M** execs ·
+  `okx_instruments` **5.71M** · `binance_eapi` **11.84M**. (The other
+  4 options-family targets stand on their M2.1–M2.4 ≥300 s numbers —
+  their code is untouched by the wrappers.)
+
+### Live proof (pitfall #11 — one runbook smoke window, cores free)
+
+Bootout standing lane → smoke universe (M1 base + all three options
+policies, E2/K8) → G0 relink → foreign boot `run --paper --strategy
+all --metrics` (~2.5 min) → SIGTERM drain → audit → digest → restore
+→ bootstrap (pid verified).
+
+- **Discovery**: deribit 1038/932 rows (idx 77,204.78 / 2,420.06) ·
+  okx 1558/1270 (77,213.10 / 2,420.10) · bn eapi 1860 (77,219.87 /
+  2,420.46); **selected 32+32 per venue = 192**, allocation through
+  the EXTRACTED law — same numbers as the M2.4 exit boot.
+- **`options-manifest.tsv` LIVE: 192 rows** (first line
+  `deribit\t50332161\tBTC-23AUG26-75500-C` — the base-512 ordinal law
+  in the file), 64 rows per venue INCLUDING bn (discovery names the
+  chain even while the stream is gated — flags will tell the truth
+  when it activates).
+- **Capture**: deribit-opt-summary **11,946** records / 64 syms
+  (flags full, IV 33–62 %) · okx **781→811** records / **64/64 syms
+  observed this window** (flags 0/0 honest) · bn/hl/pm header-only.
+  audit-replay: integrity totals **ALL ZERO on all five venues**;
+  the only boot ERRORs = the four EXPIRED PM dailies (16:00Z
+  reality; discovery `not_found` → paper continues — the standing
+  lane's wrapper refresh repopulates on restore; recorded, not a
+  defect).
+- **Digest against the REAL store**: pre-flight `--backfill` dry run
+  BEFORE the smoke proved the honest-skip lane on real capture (8
+  pre-manifest runs skipped, 0 rows fabricated). Post-smoke run:
+  `records=12757 unresolved=0 manifest-malformed=0` → **571 rows
+  (443×1m + 128×1h) across 128 descriptors (64 deribit + 64 okx)**
+  into `~/multivenue/worker/candles.db`. Store checks: okx rows with
+  mark/oi non-NULL = **0**; deribit rows missing mark_px = **0**;
+  sample `deribit:ETH-24AUG26-2440-C 1h iv 0.5879→0.5862 n=236`;
+  M3's `candles` table intact (71,484 rows). §9.8 is LIVE.
+- Standing lane restored: pre-smoke universe back (wrapper refresh
+  then self-managed PM dailies), `launchctl bootstrap`, pid 97646 on
+  the NEW binary (manifest lane inert while options are off), fresh
+  run dir ticking.
+
+### M2 CLOSED — exit statement vs mvp-plan §4-M2
+
+Options ticks: Deribit ✓ OKX ✓ live, BN code-ready/stream-gated
+(operator ruling stands) · mark/IV records: same · integrity green ✓
+· fuzz clean ✓ · full-universe boot with capped chains ✓ · §9.8
+aggregated-IV table: **BUILT + LIVE-PROVEN** (this entry) · selection
+law: **ONE HOME** (`options-select`) · descriptor gap: **CLOSED**
+(manifest). Remaining M2-tagged item: NONE — the BN stream lever is
+an ops action (`.env` + restart), owned by the operator, revisit
+≤ M6 soak.
+
+### COMMIT ASK (pending operator authorization)
+
+`M2:`-prefixed, EXPLICIT paths only:
+
+- `Cargo.toml` · `Cargo.lock` · `fuzz/Cargo.lock` (the
+  options-select wiring; lock diffs are exactly +options-select)
+- `crates/options-select/Cargo.toml` ·
+  `crates/options-select/src/lib.rs` (new crate)
+- `crates/ingress-deribit/Cargo.toml` ·
+  `crates/ingress-deribit/src/discovery.rs`
+- `crates/ingress-okx/Cargo.toml` ·
+  `crates/ingress-okx/src/discovery.rs`
+- `crates/ingress-binance/Cargo.toml` ·
+  `crates/ingress-binance/src/eapi.rs`
+- `crates/cli/src/options_manifest.rs` (new) ·
+  `crates/cli/src/lib.rs` · `crates/cli/src/bin/multivenue-engine.rs`
+- `claude-worker/src/claude_worker/iv_digest.py` (new) ·
+  `claude-worker/tests/test_iv_digest.py` (new)
+- `docs/wire-format.md` · `docs/hot-path-latency.md` ·
+  `.env.example` · `CLAUDE.md` · `docs/m2-progress.md`
+
+**NOT staged**: `docs/m3-progress.md` — it carries M3's uncommitted
+content plus this close's coordination note; staging it would commit
+M3's WIP under an M2 message. The note rides M3's next commit (C6
+window) — operator may rule otherwise. Also NOT staged, as always:
+`.env`, `~/multivenue/*`.
+
+**Resume point if context dies here:** everything above is code-
+complete, gates-green, live-proven; ONLY the commit is pending —
+put the ask to the operator verbatim, then M4 awaits its explicit
+go (design entry first in `docs/m4-progress.md`; kickoff shape in
+the M2-close session prompt + mvp-plan §4-M4/§8-OQ4/§9.9).

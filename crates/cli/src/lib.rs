@@ -35,6 +35,7 @@
 pub mod audit_replay;
 pub mod backtest;
 pub mod capture_catalog;
+pub mod options_manifest;
 pub mod paper;
 pub mod pinning;
 pub mod sigint;

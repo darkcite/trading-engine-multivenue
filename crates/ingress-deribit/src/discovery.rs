@@ -316,22 +316,35 @@ pub fn parse_index_price(body: &[u8]) -> Result<i64, DeribitDiscoveryErr> {
     Ok(px)
 }
 
+/// The `options_select::ChainRow` view of a Deribit discovery row —
+/// what the shared selection law reads (M2-close extraction; this crate
+/// was the law source and remains the behavioral reference via its
+/// tests + proptests + fuzz corpus).
+impl options_select::ChainRow for DeribitInstrumentRow {
+    #[inline]
+    fn exp_ms(&self) -> i64 {
+        self.expiration_ts_ms
+    }
+    #[inline]
+    fn strike_1e9(&self) -> i64 {
+        self.strike_1e9
+    }
+    #[inline]
+    fn is_call(&self) -> bool {
+        self.is_call
+    }
+}
+
 /// Apply the capped universe policy (M2 design entry; mvp-plan §4-M2
-/// / options-plan §2) to ONE underlying's parsed option rows:
+/// / options-plan §2) to ONE underlying's parsed option rows.
 ///
-/// - candidates: `is_option && live && expiration_ts_ms > now_ms`;
-/// - the nearest `expiries_e` distinct expiries (ascending);
-/// - per expiry, the `strikes_k` strikes nearest ATM: the last K/2
-///   distinct strikes at-or-below `index_px_1e9` + the first K/2
-///   above (position-based — no distance tie-breaks; a short side is
-///   NOT backfilled from the other side: the cap is a maximum, not a
-///   promise);
-/// - both calls and puts at every selected (expiry, strike) — a
-///   missing twin simply isn't emitted.
-///
-/// Output order is the DETERMINISTIC allocation order the cli assigns
-/// options ordinals in (docs/m2-progress.md): expiry asc → strike asc
-/// → call before put. Output length ≤ `E × K × 2` by construction.
+/// The selection LAW (nearest-E distinct expiries asc; per expiry the
+/// K nearest-ATM strikes position-based, last K/2 at-or-below + first
+/// K/2 above, no backfill; C before P; deterministic allocation order;
+/// ≤ E×K×2) lives in `options-select` since the M2-close extraction —
+/// this wrapper owns only the VENUE candidacy predicate
+/// (`is_option && live && expiration_ts_ms > now_ms`) and the frozen
+/// public signature every call site / test / fuzz target pins.
 /// Precondition: `rows` is one underlying's page, ingested once (the
 /// venue lists each instrument once). Boot-only: allocates freely.
 pub fn select_capped_chain(
@@ -341,59 +354,13 @@ pub fn select_capped_chain(
     strikes_k: u32,
     now_ms: i64,
 ) -> Vec<DeribitInstrumentRow> {
-    let mut out: Vec<DeribitInstrumentRow> = Vec::new();
-    if expiries_e == 0 || strikes_k == 0 {
-        return out;
-    }
-
-    // Distinct future expiries, ascending.
-    let mut expiries: Vec<i64> = Vec::new();
-    for r in rows {
-        if r.is_option && r.live && r.expiration_ts_ms > now_ms
-            && !expiries.contains(&r.expiration_ts_ms)
-        {
-            expiries.push(r.expiration_ts_ms);
-        }
-    }
-    expiries.sort_unstable();
-    expiries.truncate(expiries_e as usize);
-
-    let half = (strikes_k / 2) as usize;
-    for &exp in &expiries {
-        // Distinct strikes at this expiry, ascending.
-        let mut strikes: Vec<i64> = Vec::new();
-        for r in rows {
-            if r.is_option && r.live && r.expiration_ts_ms == exp
-                && !strikes.contains(&r.strike_1e9)
-            {
-                strikes.push(r.strike_1e9);
-            }
-        }
-        strikes.sort_unstable();
-        // Position-based ATM split: last `half` at-or-below + first
-        // `half` above the index.
-        let below_end = strikes.partition_point(|&s| s <= index_px_1e9);
-        let lo = below_end.saturating_sub(half);
-        let hi = (below_end + half).min(strikes.len());
-        for &strike in &strikes[lo..hi] {
-            // Call before put, at most one row each (venue lists each
-            // instrument once — precondition above).
-            for want_call in [true, false] {
-                for r in rows {
-                    if r.is_option
-                        && r.live
-                        && r.expiration_ts_ms == exp
-                        && r.strike_1e9 == strike
-                        && r.is_call == want_call
-                    {
-                        out.push(*r);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    out
+    options_select::select_capped_chain(
+        rows,
+        |r: &DeribitInstrumentRow| r.is_option && r.live && r.expiration_ts_ms > now_ms,
+        index_px_1e9,
+        expiries_e,
+        strikes_k,
+    )
 }
 
 /// Which `kind=` page a row is being parsed from (M2.1). Determines

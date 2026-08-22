@@ -246,26 +246,32 @@ pub fn parse_index_price(body: &[u8]) -> Result<i64, OkxDiscoveryErr> {
     Ok(px)
 }
 
+/// The `options_select::ChainRow` view of an OKX discovery row (M2-close
+/// extraction — the shared law's read surface).
+impl options_select::ChainRow for OkxInstrumentRow {
+    #[inline]
+    fn exp_ms(&self) -> i64 {
+        self.exp_ms
+    }
+    #[inline]
+    fn strike_1e9(&self) -> i64 {
+        self.strike_1e9
+    }
+    #[inline]
+    fn is_call(&self) -> bool {
+        self.is_call
+    }
+}
+
 /// Apply the capped universe policy to ONE underlying's parsed OPTION
-/// rows — the M2 selection LAW, twinned VERBATIM from
-/// `ingress_deribit::discovery::select_capped_chain` (the law
-/// source; property tests pin both to the same invariants;
-/// unification into a shared home is deferred to M2.4 when Binance
-/// eapi becomes the third consumer — rule of three):
-///
-/// - candidates: `inst_type == Option && live && exp_ms > now_ms`;
-/// - the nearest `expiries_e` distinct expiries (ascending);
-/// - per expiry, the `strikes_k` strikes nearest ATM: the last K/2
-///   distinct strikes at-or-below `index_px_1e9` + the first K/2
-///   above (position-based — no distance tie-breaks; a short side is
-///   NOT backfilled);
-/// - both calls and puts at every selected (expiry, strike) — a
-///   missing twin simply isn't emitted.
-///
-/// Output order is the DETERMINISTIC allocation order (expiry asc →
-/// strike asc → call before put); length ≤ `E × K × 2` by
-/// construction. Precondition: `rows` is one underlying's page,
-/// ingested once. Boot-only: allocates freely.
+/// rows. The selection LAW lives in `options-select` since the M2-close
+/// extraction (`ingress-deribit` was the law source; this crate's tests
+/// + proptests keep pinning the same invariants through this wrapper) —
+/// here lives only the VENUE candidacy predicate
+/// (`inst_type == Option && live && exp_ms > now_ms`) and the frozen
+/// public signature. Deterministic order (expiry asc → strike asc → C
+/// before P), ≤ `E × K × 2`. Precondition: `rows` is one underlying's
+/// page, ingested once. Boot-only: allocates freely.
 pub fn select_capped_chain(
     rows: &[OkxInstrumentRow],
     index_px_1e9: i64,
@@ -273,58 +279,15 @@ pub fn select_capped_chain(
     strikes_k: u32,
     now_ms: i64,
 ) -> Vec<OkxInstrumentRow> {
-    let mut out: Vec<OkxInstrumentRow> = Vec::new();
-    if expiries_e == 0 || strikes_k == 0 {
-        return out;
-    }
-
-    let is_candidate = |r: &OkxInstrumentRow| {
-        r.inst_type == OkxInstType::Option && r.live && r.exp_ms > now_ms
-    };
-
-    // Distinct future expiries, ascending.
-    let mut expiries: Vec<i64> = Vec::new();
-    for r in rows {
-        if is_candidate(r) && !expiries.contains(&r.exp_ms) {
-            expiries.push(r.exp_ms);
-        }
-    }
-    expiries.sort_unstable();
-    expiries.truncate(expiries_e as usize);
-
-    let half = (strikes_k / 2) as usize;
-    for &exp in &expiries {
-        // Distinct strikes at this expiry, ascending.
-        let mut strikes: Vec<i64> = Vec::new();
-        for r in rows {
-            if is_candidate(r) && r.exp_ms == exp && !strikes.contains(&r.strike_1e9) {
-                strikes.push(r.strike_1e9);
-            }
-        }
-        strikes.sort_unstable();
-        // Position-based ATM split: last `half` at-or-below + first
-        // `half` above the index.
-        let below_end = strikes.partition_point(|&s| s <= index_px_1e9);
-        let lo = below_end.saturating_sub(half);
-        let hi = (below_end + half).min(strikes.len());
-        for &strike in &strikes[lo..hi] {
-            // Call before put, at most one row each (venue lists each
-            // instrument once — precondition above).
-            for want_call in [true, false] {
-                for r in rows {
-                    if is_candidate(r)
-                        && r.exp_ms == exp
-                        && r.strike_1e9 == strike
-                        && r.is_call == want_call
-                    {
-                        out.push(*r);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    out
+    options_select::select_capped_chain(
+        rows,
+        |r: &OkxInstrumentRow| {
+            r.inst_type == OkxInstType::Option && r.live && r.exp_ms > now_ms
+        },
+        index_px_1e9,
+        expiries_e,
+        strikes_k,
+    )
 }
 
 /// Which page a row is being parsed from (M2.2). Determines the

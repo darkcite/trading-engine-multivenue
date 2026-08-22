@@ -666,6 +666,33 @@ fn run(args: RunArgs) -> ExitCode {
         );
     }
 
+    // -- M2-close: options manifest (per-run sym → instrument-name
+    // sidecar; docs/wire-format.md "Capture files"). Options ordinals
+    // reshuffle per boot by design — offline venue+descriptor
+    // consumers (§9.8 IV digest, M4 shadow-P&L) resolve through this
+    // file. Written only when the boot selected ≥ 1 option; a write
+    // failure is fatal like the run-dir create above (a boot that
+    // cannot write its own capture dir must not trade on it).
+    let options_manifest = cli::options_manifest::render(
+        &discovery.deribit_options,
+        &discovery.okx_options,
+        &discovery.bn_options,
+    );
+    if !options_manifest.is_empty() {
+        let manifest_path = run_dir.join(cli::options_manifest::OPTIONS_MANIFEST_FILE);
+        if let Err(e) = std::fs::write(&manifest_path, &options_manifest) {
+            error!(error = ?e, path = %manifest_path.display(), "capture: options-manifest write failed");
+            return ExitCode::from(1);
+        }
+        info!(
+            path = %manifest_path.display(),
+            rows = discovery.deribit_options.len()
+                + discovery.okx_options.len()
+                + discovery.bn_options.len(),
+            "capture: options manifest written"
+        );
+    }
+
     // -- Resolve endpoints --
     // Path fixed 2026-08-14 (8d live test): the real-time host serves the
     // market channel at `/ws/market`; `/ws/` returns HTTP 404.

@@ -226,6 +226,22 @@ without an options lane — the uniform-file-set law), and optionally
 `<venue>-raw.tap`. Staged writes flush at least every 1 s
 (`CAPTURE_FLUSH_INTERVAL_NS`).
 
+### Options manifest — `options-manifest.tsv` (M2 close)
+
+Per-run sidecar written ONCE by the bin at boot, after discovery,
+mapping the boot's option SymbolIds to venue instrument names —
+option ordinals are allocated per boot in selection order and
+reshuffle across boots by design (chain roll), and options are
+boot-discovered, so no universe-file lane can name them. Offline
+venue+descriptor consumers (§9.4 law: the §9.8 IV digest, M4
+shadow-P&L) resolve option syms through this file. UTF-8 text, one
+line per selected instrument,
+`<venue_label>\t<sym_u32_decimal>\t<instrument_name>\n`, where
+`venue_label` is the venue's capture-file prefix (`deribit`, `okx`,
+`bn`); no header line; present only when the boot selected ≥ 1
+option instrument (absence = options-less or pre-M2-close run).
+Readers parse strictly and skip-and-count malformed lines.
+
 ### Raw tap — `<venue>-raw.tap`
 
 Bounded byte-exact inbound-payload capture for parser-vs-wire
