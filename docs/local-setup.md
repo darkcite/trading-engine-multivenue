@@ -189,6 +189,16 @@ Operational laws:
 - Uninstall: `for l in engine daily-restart caffeinate; do launchctl
   bootout gui/$UID/com.multivenue.$l; done` (+ delete the plists from
   `~/Library/LaunchAgents`).
+- **Retention** (`scripts/retention.sh`, runs once per UTC day from
+  the restart poller; config `~/multivenue/retention.conf`, see
+  `retention.conf.example`): KEEP-ALL until the log volume's free
+  space drops under `MIN_FREE_GIB` (default 25), then the oldest run
+  dirs are compressed (`tar -cz`, bsdtar-internal gzip — no external
+  tools) into `~/multivenue/archive/` until `TARGET_FREE_GIB` (40) is
+  free again — never the newest run dir, never anything younger than
+  `PROTECT_DAYS` (7), archives never auto-deleted. `capture-catalog`
+  reports per-run sizes; restoring =
+  `tar -xzf archive/run-<ns>.tar.gz -C ~/multivenue/logs/`.
 
 ## Troubleshooting
 

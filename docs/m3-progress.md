@@ -241,3 +241,38 @@ windows stop/start it per the new runbook section).
 **Resume point if context dies here:** C2 installed + live-proven,
 commit not yet asked/landed; C3 (retention) + C4/C5 (candles.db) not
 started; the standing engine accumulates days meanwhile.
+
+**C2 LANDED** — commit `2a89238` (operator-authorized, 11 explicit
+paths; post-commit tree carries only the M2 lane's files).
+
+---
+
+## 2026-08-22 — C3: retention BUILT + smoke-proven (commit ask pending)
+
+`scripts/retention.sh` + `retention.conf.example` +
+`docs/local-setup.md` paragraph + a one-line daily-restart hook (runs
+once per UTC day inside the day-flip branch).
+
+Policy exactly as ruled (mvp-plan §4-M3 item 3 / decision-log open
+question resolved toward the default): **KEEP-ALL until disk
+pressure** — free < `MIN_FREE_GIB` (25) triggers compressing the
+OLDEST run dirs into `~/multivenue/archive/` until `TARGET_FREE_GIB`
+(40); the newest (live) run dir and anything ≤ `PROTECT_DAYS` (7) are
+never touched; originals removed only after a verified archive;
+archives never auto-deleted (operator prunes; catalog reports sizes).
+`--root`/`--conf` flags for testing; config file sourced over
+defaults.
+
+**Live smoke found a real environment fact** (pitfall #11): macOS
+bsdtar `--zstd` shells out to an uninstalled external `zstd` — the
+fail-soft path held (original kept, partial archive removed, stop);
+switched to bsdtar-INTERNAL gzip (`tar -cz`, zero new deps, house
+doctrine), re-proven: 20d/10d/8d fixture dirs compressed + removed,
+newest kept, protect law honored, archive list+extract round-trip
+clean, keep-all no-op on the real root (free 50 GiB ≥ 25). Gates
+untouched (shell + docs only; pytest 381 / nextest 1151 / alloc 36
+stand).
+
+Commit ask C3 paths: `scripts/retention.sh` ·
+`retention.conf.example` · `scripts/daily-restart.sh` ·
+`docs/local-setup.md` · `docs/m3-progress.md`.

@@ -22,4 +22,7 @@ if [ "$today" != "$last" ]; then
     echo "daily-restart: UTC day $today — SIGTERM drain" >&2
     pkill -TERM -f "multivenue-engine run" 2>/dev/null || true
   fi
+  # Once per UTC day: the M3 retention pass (keep-all until disk
+  # pressure; scripts/retention.sh documents the policy).
+  "${0:A:h}/retention.sh" >&2 || true
 fi

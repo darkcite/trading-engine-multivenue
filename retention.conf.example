@@ -1,0 +1,22 @@
+# retention.conf — M3 capture-retention policy (copy to
+# ~/multivenue/retention.conf; absent file = these defaults).
+# Sourced by scripts/retention.sh (KEY=VALUE shell syntax), which
+# runs once per UTC day from the daily-restart poller.
+#
+# Policy: KEEP-ALL until disk pressure. Only when the log volume's
+# free space is under MIN_FREE_GIB are the OLDEST run dirs archived
+# (tar -cz — bsdtar-internal gzip — into ARCHIVE_DIR, original
+# removed after a verified archive) until TARGET_FREE_GIB. The newest run
+# dir (live capture) and anything younger than PROTECT_DAYS are never
+# touched. Archives are never auto-deleted — pruning
+# ~/multivenue/archive is yours. `capture-catalog` reports per-run
+# sizes; use it to decide.
+
+MIN_FREE_GIB=25
+TARGET_FREE_GIB=40
+PROTECT_DAYS=7
+ARCHIVE_DIR="$HOME/multivenue/archive"
+# compress (default) | move — `move` only makes sense when
+# ARCHIVE_DIR sits on a DIFFERENT volume (same-volume moves free
+# nothing).
+ARCHIVE_MODE="compress"
