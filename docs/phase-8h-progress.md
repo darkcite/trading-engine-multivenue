@@ -2122,3 +2122,276 @@ tell the operator. AT CLOSE, VERBATIM DUTY: tell the operator
 **"Stage 2 is fully implemented."**, list the demonstrated §12 exit
 criteria, and WAIT — no Stage-3 word (code, plans, or designs) until
 he says so.
+
+---
+
+## 2026-08-22 — Session H6b-SEMI (design §13 item 6 REMAINDER under OPERATOR AMENDMENT; = M0 of docs/mvp-completion-plan.md) — **PHASE 8h CLOSED · STAGE 2 CLOSED (amended §12)**
+
+Authority: the operator-issued H6b-SEMI prompt, which **SUPERSEDES the
+in-file "H6b kickoff" (keyed-serve version) directly above** → design
+(LOCKED) → the H6a entry → docs/mvp-completion-plan.md. Standing
+operator rulings (2026-08-22) in force: **(1)** no `ANTHROPIC_API_KEY`
+until Stage 3 — no `serve`, no Anthropic API calls, everything
+semi-manual through the ai-session §4 verbs (this session's Claude IS
+the Fable-5 strategist); **(2)** the §12 exit criteria are AMENDED —
+the §8.1 auto-promotion live proof and the §8.3 monitor-triggered
+rollback live proof are DEFERRED to the **Stage-3 ENTRY GATE**
+(mvp-plan §7); **(3)** `AI_INGRESS_HMAC_KEY` is PERMANENT in `.env`
+(engine dotenvy + worker BaseConfig read it; no per-invocation
+prefixes; value never displayed); **(4)** the tree carries the
+uncommitted mvp-completion-plan + CLAUDE.md amendment — this one
+authorized closing commit includes them. Session-start HEAD `044c398`
+(H6a), branch main, dirty = exactly those two docs (verified). RustRover
+attach verified first.
+
+### Final gates (single nohup chain, /tmp/8h-h6b-gates.log, all on the Mac)
+
+- G0: `cargo build --release -p cli` exit 0 BEFORE any boot.
+- workspace nextest **1081/1081, 1 skipped** (the `#[ignore]` regen) — 11.212 s.
+- release alloc **36/36, 0 B/op, `--test-threads=1`** — corrected guard
+  honored: `cargo clean -p bench --release`, fresh `Compiling bench`
+  verified in-log before the 0.26 s run.
+- worker pytest **354 green, 0 skipped** (release binary on PATH) — 12.09 s.
+- Fuzz untouched (72.3M standing): this session adds no parser on
+  either side; the only new artifacts are two demo-scoped ruleset JSONs.
+
+### Demo as run — evidence chain
+
+**(a) Paper boot on the permanent key.** PID 60132, 09:48:20Z, capture
+`run-1787392100788712000`. `ingress-ai: starting thread
+sock=~/multivenue/run/ai.sock ruleset_dir=~/multivenue/artifacts/rulesets`
+— the thread started off the PERMANENT `.env` key (ruling 3): H6a's
+boot-1 failure mode ("AI_INGRESS_HMAC_KEY unset") is gone for good.
+`strategy-set: composed mask=49 latency_arb=true ai_exec=true vm=true`,
+PAPER banner, metrics 127.0.0.1:9191. Clean slate verified: cmds=0
+staged=0 committed=0 rejected=0 heartbeat=-1, vm rows/epoch/fires 0,
+mask 49.
+
+**(a′) Worker-env finding (STANDING, feeds every M-phase).**
+`BaseConfig` reads `os.environ` — there is no dotenv autoload in the
+worker. First backtest attempt exited 2
+(`CLAUDE_WORKER_REPLAY_DIR is empty` — the verb's fail-fast contract
+working). Resolution: a /tmp-scoped wrapper that silently sources
+`./.env` from the repo root (`set -a; . ./.env; set +a` — nothing
+printed, ever), defaults `CLAUDE_WORKER_REPLAY_DIR` to
+`$HOME/multivenue/logs` if `.env` doesn't set it, prepends the release
+binary to PATH, and execs the verb. Ruling (3)'s "no env prefixes"
+means the VALUES live in `.env`; verb invocations still need the shell
+to source it — the wrapper is the recorded pattern.
+
+**(b) Prior bound without supersede.** /tmp survived:
+`/tmp/8h-h6-demo/{R2.json,R2.report.json}` intact (the d8aea5f4…
+registry row's recorded paths), artifact
+`d8aea5f4163c0ad312cc494edaef169d.json` present in the engine
+ruleset_dir. The H6a hygiene note's supersede lane was NOT needed.
+
+**(c) Sacrificial ruleset S — authored, gates-passed, promoted through
+the frozen lane.** S authored in-session by Fable 5, distinct from
+d8aea5f4 on every varying field: `h6b-dip-fade` (level_breach **0.45**,
+bid) + `h6b-rip-fade` (level_breach **0.58**, ask), edge **60** bps,
+horizon **1200** ms, max_risk **$8** (vs 0.42/0.60, 80, 1500, $10).
+Persisted OUTSIDE /tmp at `~/multivenue/worker/demo-h6a/demo/S.json`
+so the registry row binds durably (the H6a lesson applied). REAL
+harness over capA (`~/multivenue/worker/demo-h6a/capA`, the
+§8.5-sanctioned two-run crafted window): **exit 0 first try** —
+`gates: pnl_positive=True min_trades=True min_days=True
+max_drawdown=True bounds=True -> PASS`; OOS net **+$60.30**, **63
+trades**, **trading_days 2**, DD $42.16, bounds 8.0/82.008/82.008;
+hash
+`92feb9ea2d735994798c8f020bf8972c3a7c3a5eabdd174cafaf2a2cee598b05`.
+Installed to `$AI_RULESET_DIR/92feb9ea2d735994798c8f020bf8972c.json`;
+`positions --json` consulted before staging (§4 step 2: flat book,
+exposure $0, exit 0). Then the frozen pair, one verb at a time with a
+metrics poll between each: stage-ruleset exit 0 (`staged 92feb9ea… /
+sent kind=ruleset-stage seq=20`) → cmds 0→2, staged 0→1, rejected 0;
+commit-ruleset exit 0 (seq=22) → cmds 4, committed 0→1,
+**vm_rows_active 0→2, vm_table_epoch 0→1**, mask 49. S ACTIVE,
+d8aea5f4 = PRIOR by registry order.
+
+**(d) THE MANUAL §8.5-SHAPED ROLLBACK (ai-session §4 step 10) —
+DEMONSTRATED LIVE.** Verb-by-verb, applied-state verified at each step:
+
+1. `push --kind disable --strategy 5` exit 0 (seq=24) →
+   **enabled_mask 49→17** (cmds 6, expired 0) — the rollback tell.
+2. stage-ruleset of the PRIOR from its BOUND paths
+   (`/tmp/8h-h6-demo/R2.json` + report) exit 0 (seq=26) →
+   staged 1→**2**, rejected 0 (hash re-verified d8aea5f4… full).
+3. commit-ruleset of the prior exit 0 (seq=28) → committed 1→**2**
+   engine-side; **the vm table did NOT swap (epoch stayed 1) — BY
+   DESIGN.** The 8g item-7 gating pin (strategy-set test
+   `on_ruleset_table_stages_even_when_vm_disabled`): Stage is
+   deliberately NOT mask-gated — the staged table landed and
+   survived; **Commit IS mask-gated through `on_ai`** — with slot 5
+   disabled the frame never arrives at the vm member. The stale S
+   table stays harmless behind the cleared mask bit (dark-guard
+   posture); the prior waits STAGED.
+4. Operator-act re-enable: `push --kind enable --strategy 5` exit 0
+   (seq=30) → **mask 17→49**, enable_refused 0.
+5. Re-commit of the prior exit 0 (seq=32) → **vm_table_epoch 1→2 —
+   the staged prior APPLIED without restaging** ("staged survived the
+   disabled window", exactly the pinned semantics), vm_rows_active 2
+   (the prior's rows), committed 2→**3**, rejected 0 throughout every
+   step, and **vm_fires_total 0→1 — the restored PRIOR's table firing
+   on the live Fed book, trading in paper** (fires read 0 at every
+   earlier poll where sampled; first read 1 at the post-apply poll).
+
+**FINDING (STANDING — goes into the M5 walk-forward runbook and the
+Stage-3 gate observation):** after a §8.5 rollback pair sent while
+slot 5 is disabled, the operator re-enable procedure is **enable +
+re-commit**, not enable alone — the §8.3 monitor's own restage/commit
+pair leaves the prior STAGED at the member level (side-path counters
+increment; the member-level swap is mask-gated), which is consistent
+with H5 verdict #9 (no auto re-enable) and keeps the engine dark
+until the human acts. Metrics-cadence note: the drain applies frames
+within a few seconds of "sent"; every send was verified applied by a
+follow-up poll before the next verb (never parallelized — single
+SQLite seq namespace).
+
+**(e) Registry + events ledger.** `rulesets`: 92feb9ea… (path =
+persisted demo dir, gates_passed 1, author_mode session, staged_ts
+1787392280, committed_ts 1787392297) and d8aea5f4… (path
+/tmp/8h-h6-demo/R2.json, gates_passed 1, session, **re-staged
+1787392337 / committed 1787392479** — the re-stage made it
+registry-latest, i.e. the registry-order active-resolution shape of
+H5 verdict #5, observed). The G7-era 9f644093… row untouched
+(files-no-longer-bind, ignored per the standing note). `events`:
+`frame_sent` rows for every frame seq 19–32 (kinds: HB ×7, Stage ×2,
+Commit ×3, Disable, Enable); `ai_seq` next 33.
+
+**(f) audit-replay — the whole story renders from capture, zero
+integrity violations.** Live-read mid-session AND canonical post-stop
+render (exit 0) agree: pm 44 ticks (0.11/s — the quiet Fed book), bn
+**69,075** ticks (142.8/s); integrity totals ALL ZERO both venues
+(tick_seq_regressions / trade_holes / trade_ids_missing /
+book_chain_breaks). ai section verbatim: `cmds=14 unknown_kinds=0`;
+`per-kind: HB=7 Enable=1 Disable=1 Stage=2 Commit=3`; `seq: first=19
+last=32 gaps=0 missing=0 regressions=0`; `Stage seq=20 …
+hash128=92feb9ea…` → `Commit seq=22 … 92feb9ea…` → `Stage seq=26 …
+d8aea5f4…` → `Commit seq=28 … d8aea5f4…` → `Commit seq=32 …
+d8aea5f4…`; ttl'd-at-pop flagged=0. The required order
+Stage/Commit(S) → Disable-5 (24) → Stage/Commit(prior) → Enable (30)
+renders in seq order, plus the design-true trailing applied Commit
+(32) per the gating pin. Heartbeat >10 s gaps between verbs are the
+§5.4 TTL fail-safe, as always.
+
+**(g) Clean stop.** SIGTERM to PID 60132 → process gone; the
+post-stop audit's grown-and-clean capture (bn 67,086 → 69,075 with
+zero violations, all files whole) is the drain-flush proof. ~8 min
+live with tables under change the entire time.
+
+### AMENDED-§12 exit-criteria checklist — CLOSING STATUS
+
+Per operator ruling (2), the criteria close as amended; each arm below
+is either DEMONSTRATED with observed evidence or E2E-PROVEN +
+DEFERRED to the Stage-3 entry gate (mvp-plan §7).
+
+- **"Fable-5-authored ruleset"** — **DEMONSTRATED**, twice: d8aea5f4…
+  (H6a) and 92feb9ea… (this session), both authored in-session by
+  Fable 5 through the semi-manual lane (ruling 1; registry
+  author_mode=session).
+- **"auto-promoted after passing backtest"** — amended: promotion
+  through the FROZEN verb lane after passing the REAL harness —
+  **DEMONSTRATED** (S: gates-PASS exit 0 → install → Stage seq=20 →
+  Commit seq=22 → vm_rows_active 2 / table_epoch 1; counters +
+  capture prove application). §8.1 AUTO-promotion (serve's
+  install→stage→commit with no operator verbs): **E2E-PROVEN,
+  live proof DEFERRED to the Stage-3 entry gate** (ruling 2).
+- **"trading in paper"** — **DEMONSTRATED**: H6a's vm_fires 0→1 on
+  d8aea5f4; this session's vm_fires 0→1 on the RESTORED prior
+  post-rollback — both on the live Fed book, paper banner in-log.
+- **"forced-underperformance rollback demonstrated"** — amended: the
+  §8.5-SHAPED semi-manual rollback — **DEMONSTRATED LIVE**
+  (Disable-5 mask 49→17 → restage/commit prior staged 2 / committed 3
+  → enable mask →49 → re-commit epoch →2 → prior live and firing).
+  The §8.3 MONITOR-TRIGGERED arm (threshold breach ⇒ automatic
+  Disable-5 + restage, `rollback_triggered` event): **E2E-PROVEN (the
+  H5 suite), live proof DEFERRED to the Stage-3 entry gate** (ruling 2).
+
+### H6a interpretation verdicts — reviewed: ALL UPHELD, none amended
+
+H6a upheld all fourteen H5 verdicts; this session re-touched three
+with live evidence and upholds them: **#5** (registry-order active
+resolution — the re-stage made d8aea5f4 registry-latest, exactly the
+anticipated shape); **#9** (no auto re-enable — the enable was a
+distinct operator verb; the gating-pin finding EXTENDS the operating
+procedure to enable + re-commit, an extension, not an amendment);
+**#14** (registry non-empty scoring path — three rows now). The
+live-monitor arms referenced by #1/#2 move with ruling (2) to the
+Stage-3 gate. No verdict is amended.
+
+### Hygiene
+
+- Repo diff this session: **docs ONLY** — this file + CLAUDE.md
+  CURRENT STATE + the carried `docs/mvp-completion-plan.md` (first
+  commit). Zero code changes: engine/strategy-vm/ingress/core/cli
+  untouched; `backtest.py` + `cli.py` byte-untouched (FIVE sessions);
+  7-verb surface frozen; conftest + the frozen 202 untouched; 354
+  stay-green held.
+- `.env` never read or printed; the verb wrapper sources it silently
+  (values never displayed, never logged). No Anthropic key exists or
+  was sought (ruling 1). No serve ran; every verb hit the socket solo.
+- Demo artifacts: S.json + S.report.json persisted at
+  `~/multivenue/worker/demo-h6a/demo/` beside the H6a kit; installed
+  copy at `$AI_RULESET_DIR/92feb9ea….json`. The /tmp wrapper + logs
+  (`/tmp/8h-h6b-*`) are disposable.
+- Mac-only cargo/pytest (pitfall #10); all long-runners nohup+polled
+  (pitfall #12); paper only; git NOTHING beyond this ONE authorized
+  closing commit; push anomaly posture unchanged (record, never act).
+
+### STAGE-2 CLOSURE STATEMENT
+
+With this entry, **8h is CLOSED and Stage 2 (8f + 8g + 8h) is CLOSED
+under the operator-amended §12 exit criteria** (rulings of
+2026-08-22). The autonomous research loop is code-complete and
+E2E-proven end to end; the promotion lane and the §8.5 rollback lane
+have both been demonstrated live through the frozen verb surface; the
+two deferred live proofs (§8.1 auto-promotion, §8.3 monitor-triggered
+rollback) are inherited by the **Stage-3 ENTRY GATE** (mvp-plan §7:
+key provisioning → one keyed Fable-5 serve cycle + one monitor
+rollback observed BEFORE any executor work). NEXT = M1 of
+docs/mvp-completion-plan.md — **after explicit operator go, and
+nothing Stage-3 (executor, risk/8i+, venue dispatchers, live ramp —
+code, plans, or designs) without his explicit confirmation.**
+
+---
+
+## M1 kickoff prompt (paste verbatim into a fresh session — ONLY after operator go)
+
+M1 of docs/mvp-completion-plan.md (Stage 2.5 — universe config +
+venue breadth, "no new protocols"), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue. 8h + Stage 2 are CLOSED
+(amended §12; latest entry of docs/phase-8h-progress.md is the
+closure record — that file is now HISTORY, do not write to it; M-phase
+notes go to docs/mvp-progress.md, create on first entry). Authority:
+docs/mvp-completion-plan.md §4-M1 + §6 (risks) + **§9 (BINDING
+data-storage design)** → CLAUDE.md. STANDING RULINGS: no
+ANTHROPIC_API_KEY / no serve until Stage 3 (semi-manual verbs only);
+AI_INGRESS_HMAC_KEY permanent in .env (never read/print .env — the
+H6b verb-wrapper pattern sources it silently); Stage-3 entry gate per
+mvp-plan §7 is the operator's to open. SCOPE: (1) boot UNIVERSE
+CONFIG FILE — TOML via core-config, per-venue instrument lists + PM
+asset-id list + feature flags; CLI flags remain overrides;
+venue-blind boot still refuses; if the config parser consumes
+untrusted bytes it gets proptest + fuzz per §21.3/§21.4, no
+exceptions. (2) BINANCE multi-symbol spot + USDS-M futures — N
+streams on the existing crate capability (one connection per
+instrument), SymbolId allocation mirroring the flag-order convention,
+discovery audit extended. (3) POLYMARKET multi-market — N asset ids
+per boot, YES/NO pair ids into the map's pair machinery,
+fetch/market-map seeding per market. (4) OKX/Deribit/HL lists move
+into the config (mechanics exist today). STORAGE LAW (mvp-plan §9):
+PMLR ticks stay canonical; key everything by venue+descriptor, NEVER
+bare SymbolId (§9.4 + the §6 SymbolId-stability risk); candles.db is
+M3 — do NOT build it here. EXIT (mvp-plan M1): ONE boot command runs
+the full non-options universe; audit-replay shows every venue
+ticking; market-map resolves every observed sym; gates green
+(nextest ≥1081 / alloc 36+ 0 B/op corrected guard / pytest ≥354 /
+fuzz clean incl. any new targets); live smoke before "done" (pitfall
+#11). LANDMINES: Mac-only cargo/pytest (pitfall #10); RustRover MCP
+terminal ≤45 s — nohup > /tmp/m1-*.log & and poll (pitfall #12); zsh
+eats bare ===; paper only; full `import x` only; frozen 7-verb
+surface + backtest.py/cli.py byte-untouched; house ingress doctrine
+(mio, byte scanners, zero-alloc, single-writer, #[repr(C)]/align(64),
+capture from day one); git NOTHING without operator ask; push anomaly
+record-only. If context runs short: interim state + resume point +
+relaunch prompt into docs/mvp-progress.md, then tell the operator.
