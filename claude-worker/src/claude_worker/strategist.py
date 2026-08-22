@@ -74,6 +74,10 @@ EVENT_CAPTURE_SKIP: str = "strategist_capture_skip"
 EVENT_CANDIDATE_REJECTED: str = "strategist_candidate_rejected"
 EVENT_CALL_FAILED: str = "strategist_call_failed"
 EVENT_PROMOTION: str = "promotion"
+# §8.4 rollback-lane kinds (8h-H5; written by daemon.py, serve thread).
+EVENT_ROLLBACK_TRIGGERED: str = "rollback_triggered"
+EVENT_ROLLBACK_NO_PRIOR: str = "rollback_no_prior"
+EVENT_MONITOR_SKIP: str = "monitor_skip_insufficient_data"
 
 # ---- §4.1 grammar mirrors (published constants; the authoritative
 # enforcement is `ingress_ai::validate_ruleset` in the harness) ---------

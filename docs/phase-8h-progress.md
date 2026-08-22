@@ -1460,3 +1460,351 @@ market-map.json still absent on the box; the strategist's live proof
 (one real budget-capped Fable-5 serve cycle) is H6's demo, not H5's.
 If context runs short: write interim state + exact resume point +
 relaunch prompt into docs/phase-8h-progress.md, then tell me.
+
+---
+
+## 2026-08-22 — Session H5 (design §13 item 5: rollback — §8.3 monitor + trigger + restage-prior + §8.4 events) — CLOSED
+
+Authority: the H5 kickoff above + design (LOCKED). **Same-session
+continuation from H4 at operator direction** ("go" after an explicit
+context check — ~97% of budget free, all H5 required reading already
+in-context; the one-item-per-session convention was operator-waived; the
+one-closing-commit pattern re-authorized with the go). Session-start
+HEAD `7bd0e42` (the H4 commit), tree clean. Diff scope is exactly:
+`claude-worker/src/claude_worker/monitor.py` (NEW),
+`claude-worker/src/claude_worker/daemon.py` (monitor step + `_ROLLBACK`
+phase inside `ResearchCycle`), `claude-worker/src/claude_worker/
+state.py` (additive `committed_rulesets` accessor),
+`claude-worker/src/claude_worker/strategist.py` (the three §8.4 event
+kinds beside the H4 ones), `claude-worker/tests/craft.py` (NEW shared
+builders, not pytest-collected), `claude-worker/tests/test_monitor.py`
+(NEW), `claude-worker/tests/test_research_cycle.py` (H5 section
+appended; every H4 test byte-unchanged), CLAUDE.md (CURRENT STATE
+refresh), this file. **`backtest.py` and `cli.py` remain
+byte-untouched** (H4 precedent held — the monitor rides
+`run_backtest(split="0/100")` passthrough and the frozen stage/commit
+pair); engine/strategy-vm/ingress/core/cli crates untouched;
+`conftest.py` + every frozen test file untouched; `.env` untouched.
+
+### H4 interpretation review — all EIGHTEEN UPHELD (kickoff first task)
+
+Same-session review, verdicts explicit: #1 (frozen-pair attribution
+route) — upheld AND exercised: the rollback restage rides the identical
+frozen pair with NO attribution params; #2 (COALESCE) — upheld, now
+PROVEN by the E2E rollback test (the restaged prior keeps its original
+model/thesis); #3 (`ruleset_row` 7-tuple) — upheld, the new accessor is
+separate; #4 (cadence primes at start) — upheld; #5 (fetch subprocess)
+— upheld, untouched; #6/#7/#8 (budget seams) — upheld, untouched; #9
+(freshness by run NAME) — upheld, and its blind spot (a run GROWING
+under an unchanged name) is exactly why the monitor runs on
+capture-skipped cycles too (H5 call 1); #10 (structural parse) —
+upheld; #11 (BacktestError candidate-fatal) — upheld, and the monitor
+adopts the same fail-safe posture (H5 call 10); #12/#13/#14 — upheld
+(#14's early `promotion` event is now the ledger's active-resolution
+anchor); #15 (pending-promote discipline) — upheld and EXTENDED to the
+rollback action verbatim; #16/#17/#18 — upheld.
+
+One H4-entry correction (H2 honesty precedent): the H4 test-split
+prose said "test_strategist.py (63) + test_research_cycle.py (16)";
+actual collection is **67 + 12** — the TOTAL (+79, suite 326) was and
+is correct; the split prose was off by four. Numbers below are from
+`pytest --collect-only`.
+
+### What was built
+
+- **`monitor.py` (NEW, §8.3 pure substrate):** constants (window 24 h,
+  floor 6 h, net ≤ −$100 / dd ≥ $200 both-arms-inclusive, split
+  `0/100`); `read_run_spans` — per-run wall coverage `[epoch_ns,
+  epoch_ns + duration_ns]` with duration = max(last) − min(first) tick
+  ts across the run's files, **O(1) per file** via the index-by-slot
+  reader (the serve loop never iterates a capture; torn/foreign files
+  are skips); `select_window` — run-granular trailing window anchored
+  at the CAPTURE's end, straddlers included whole, coverage counts the
+  in-window portion only, tickless runs never selected (the harness
+  refuses a tickless dir — H1 §3.1); `breach` (+ event-detail metrics);
+  `stage_active_copy` — the report-clobber protection (below);
+  `prepare_window_dir` — full-root passthrough when every ticky run
+  overlaps the window, else a rebuilt-per-pass symlink dir preserving
+  run names (the harness's name↔header epoch cross-check holds;
+  disjointness inherited); `summary_line` for the §7.1 digest seam.
+- **`state.py` (additive):** `committed_rulesets()` — committed,
+  gates-passed rows ordered `committed_ts DESC, staged_ts DESC, hash`;
+  supersede-restaged rows correctly leave the set. `ruleset_row` and
+  every existing surface untouched.
+- **`strategist.py` (additive):** event kinds `rollback_triggered`,
+  `rollback_no_prior`, `monitor_skip_insufficient_data` beside the H4
+  kinds (one kind namespace).
+- **`daemon.py` (§8.3/§8.4 inside `ResearchCycle`):** `_end_cycle` —
+  the monitor runs ONCE at EVERY cycle end (capture-skip and
+  budget-skip cycles included), which makes a promote-ending cycle's
+  run the §8.3 post-promotion ARM CHECK with zero extra machinery;
+  active/prior resolution = registry order + events-ledger
+  disambiguation (`promotion.hash` / `rollback_triggered.restaged`,
+  AUTOINCREMENT-total order) — immune to same-second `committed_ts`
+  ties; the monitor scores a BYTE-COPY of the active artifact (source:
+  installed `$AI_RULESET_DIR/<hash128>.json`, registry-path fallback)
+  so the frozen `run_backtest`'s always-write-report-beside-input can
+  never clobber a registry-pointed promotion report (a later restage's
+  `check_stage_binding` depends on those bytes); trigger ⇒
+  `rollback_triggered` event at TRIGGER time + `_ROLLBACK` pending
+  phase (the promote-pending discipline: disconnected ⇒ wait, UdsError
+  ⇒ retry — disable re-send is mask-idempotent, Stage supersede covers
+  the pair; a pending rollback blocks new cycles); action order PINNED
+  disable-5 FIRST (push-verb wire shape: KIND_DISABLE_STRATEGY,
+  slot 5, sym NONE, venue AI) then FROZEN
+  `backtest.stage_ruleset(prior, "auto")` → `commit_ruleset`; no-prior
+  arm (no other committed row / NULL report_path / GateRefused-or-
+  OSError on restage) ⇒ disable only + `rollback_no_prior` + the DARK
+  GUARD (that hash is not re-scored until a NEW promotion — no
+  rollback spam; in-memory, worst restart cost = one idempotent
+  disable); NO auto re-enable (D3a: mask stays down, known-good rows
+  parked — enable remains an operator act, ai-session §4 step 10);
+  `monitor_skip_insufficient_data` on floor-breach AND on
+  BacktestError (never roll back on an unscored window);
+  `_performance` summary feeds `build_digest(performance=)` on the
+  next cycle (§7.1 wired). `ResearchStats` + monitor/rollback
+  counters. `serve()` unchanged beyond what H4 landed.
+
+### Numbered H5 interpretation calls (H6 review welcome; all pinned by tests)
+
+1. **Cadence collapse:** "every research cycle" + "once shortly after
+   every promotion" = ONE rule — the monitor runs at every cycle END
+   (skips included: capture grows under an unchanged run name, the H4
+   freshness key's blind spot), so the promote-ending cycle's run IS
+   the arm check, same tick ("shortly" ≤ one 0.2 s tick).
+2. **Window mechanism (the flagged §8.3 gap):** run-granular selection
+   over `(epoch_ns, duration_ns)` spans; duration from first/last tick
+   ts, O(1) via the slot-indexed reader; anchored at CAPTURE end (a
+   dark engine must not starve the monitor); straddlers whole;
+   coverage = in-window portion (the floor's number); tickless runs
+   never selected.
+3. **Window input:** full-root passthrough when all ticky runs
+   overlap; else a per-pass-rebuilt SYMLINK dir named like the source
+   runs. `backtest.py` byte-untouched.
+4. **Report-clobber protection:** the monitor scores a byte-copy
+   (`worker/monitor/active-<hash128>.json`); registry-pointed
+   promotion reports stay pristine (restage-binding depends on them).
+   Pinned by the E2E: the candidate's 70/30 PASS report and the
+   prior's report are byte-identical after monitoring; the monitor's
+   own 0/100 report lives beside the copy.
+5. **Active/prior resolution:** registry rows (committed, gates-passed,
+   `committed_ts DESC, staged_ts DESC, hash`) + events-ledger hint for
+   ACTIVE — the latest `promotion`/`rollback_triggered(restaged)`
+   event naming a still-committed hash. Second-resolution registry
+   stamps TIE under a same-second promote→rollback; the ledger's
+   AUTOINCREMENT order resolves it (E2E-pinned: no re-trigger on the
+   restaged prior). Prior = most recent committed row ≠ active;
+   operator-lane commits (no events) fall back to registry order.
+6. **`rollback_triggered` records at TRIGGER time** (metrics + the
+   intended `restaged` hash); delivery may lag in the pending phase.
+7. **The no-prior arm covers three shapes** (absent / NULL report_path
+   / files-no-longer-bind), all `rollback_no_prior` with reason; the
+   disable is already out in every shape.
+8. **Dark guard** after disable-only (in-memory, per-hash, cleared by
+   the next promotion's active change).
+9. **No auto re-enable** — not in the §8.3 action list, not implied by
+   D3a; enable stays operator-manual.
+10. **Monitor BacktestError ⇒ `monitor_skip_insufficient_data`** with
+    `reason=backtest_error` — the §3.5 untrustworthy-report doctrine
+    applied to the monitor: no action on an unscored window.
+11. **§7.1 performance seam** wired via the in-memory summary line
+    (repopulates on the first score after a restart).
+12. **Placement:** pure logic in NEW `monitor.py`; event kinds stay in
+    `strategist.py` (one namespace, per the H5 kickoff's own hint).
+13. **Both threshold arms INCLUSIVE** (≤ −100.0 / ≥ 200.0),
+    boundary-pinned to the cent in tests.
+14. **Empty committed registry ⇒ silent monitor no-op** (nothing to
+    monitor — no event spam; debug-level visibility only).
+
+### Tests added (+28: test_monitor.py 21, test_research_cycle.py +7; frozen 202 + H2/H3/H4 suites untouched — every H4 test byte-unchanged; NO live SDK; craft.py is a shared builder module, not collected)
+
+- `tests/test_monitor.py` (21): §12 threshold row — both arms with
+  EXACT boundaries (−100.0 triggers, −99.999 does not; 200.0 triggers,
+  199.999 does not; both-arm case), constants mirror risk-policy;
+  run-span durations/order over crafted PMLR (multi-venue widening,
+  tickless run, torn/foreign file tolerance, non-run dirs ignored);
+  window selection — empty ⇒ None, run-granular
+  straddler-included/old-run-excluded coverage arithmetic, straddler
+  clipping at window start, floor boundary (5 h < floor, 6 h == floor
+  proceeds), tickless-never-selected; active-copy bytes + atomicity +
+  idempotent overwrite; window dir — full-root passthrough, subset
+  symlinks resolving to real capture (re-read through the link),
+  stale-link rebuild; summary line; `committed_rulesets` order /
+  staged-never-committed excluded / supersede-clears / same-second tie
+  determinism.
+- `tests/test_research_cycle.py` (+7): monitor no-op without a
+  committed ruleset (zero events); post-promotion arm check SKIPS on
+  thin capture (event detail exact, scored hash == the just-promoted
+  hash); **the E2E §8.5-shaped path** — promote on 70/30 gates, arm
+  check breaches on the 0/100 trailing window ⇒ frame order
+  Heartbeat→Stage(cand)→Commit(cand)→**Disable-5**→Stage(prior)→
+  Commit(prior) (§12 "disable BEFORE restage" pinned byte-level:
+  slot-5/VENUE_AI/sym-NONE on the disable; prior hash128 LE halves on
+  the restage pair), `rollback_triggered` detail carries net/dd values
+  + arms + coverage + restaged hash, prior attribution PRESERVED
+  through the frozen restage (COALESCE), clobber protection held
+  (candidate report still 70/30 PASS; prior report byte-identical;
+  monitor's 0/100 report beside the copy), monitor scored a copy over
+  the symlink subset window, and the NEXT cycle's monitor resolves
+  ACTIVE = the restaged prior through the events ledger despite
+  same-second registry ties (no re-trigger); no-prior ⇒ disable-only
+  frames + `rollback_no_prior` + dark guard (no re-score, no frame
+  spam); rollback WAITS for connection (pending phase blocks new
+  cycles — the promote discipline — then delivers disable-only on
+  reconnect); monitor BacktestError ⇒ skip event with reason, zero
+  frames, root-passthrough window pinned; the §7.1 performance seam
+  (first digest carries no walk-forward; the post-score digest carries
+  "ACTIVE RULESET WALK-FORWARD ... verdict=holding").
+
+### Gates at close (all on the Mac; MCP terminal, nohup+poll)
+
+- worker pytest **354** green, 0 skipped (202 frozen + 2 real-harness
+  RAN on-PATH + 43 fetchers + 79 H4 + 28 H5). **354 is the new
+  stay-green.**
+- workspace nextest **1081/1081**, 1 skipped (the `#[ignore]` regen) —
+  untouched-green, zero Rust changes this session.
+- release alloc **36/36** 0 B/op `--test-threads=1`, corrected guard
+  (`cargo clean -p bench --release`: `Removed 15 files` + fresh
+  `Compiling bench` verified in `/tmp/8h-h5-alloc.log`).
+- `cargo build --release -p cli` Finished 0.19 s (no Rust changes).
+- Fuzz untouched: H5 parses NOTHING untrusted — capture via the
+  hardened worker reader (H3-era), registry/events via SQLite, no new
+  Rust parser, no new Python model-output parser.
+- One mid-session red recorded honestly: the first run of the new
+  suites failed 1/40 — `select_window` initially admitted tickless
+  runs; fixed in the FUNCTION (they'd hand the harness a dir it
+  refuses, H1 §3.1), not the test. All green after.
+
+### Hygiene
+
+- Cargo/pytest on the Mac ONLY (pitfall #10; sandbox = `py_compile`
+  syntax checks + read-only inspection). No engine boots, no live
+  sockets beyond FakeUdsServer, no live SDK. `ANTHROPIC_API_KEY`
+  untouched outside serve. No git op until the authorized closing
+  commit; push anomaly posture unchanged.
+- The symlinked window dir is exercised by the WORKER tests through
+  the Python reader; the real harness has consumed multi-run roots
+  since H1, and symlink traversal on macOS `read_dir` is
+  metadata-transparent — but per pitfall #11 doctrine the H6 live demo
+  (operator-selected window, §8.5) is the binary-level proof and is
+  called out in the H6 kickoff below.
+- CLAUDE.md: CURRENT STATE refreshed to H5-close truth (operator-gate
+  line unchanged). The H3 §6.1 live fetch smoke remains OWED at
+  operator discretion; market-map.json still absent on the box.
+
+### Resume point
+
+Item 5 CLOSED (this commit). 8h has ONE session left: **H6 = design
+§13 item 6 — final gates + the operator-gated LIVE demo + the phase
+close.** At H6 close, Stage 2 (8f+8g+8h) is FULLY implemented — the
+operator notification requirement fires there. The H6 kickoff prompt
+below is ready to paste.
+
+---
+
+## H6 kickoff prompt (paste verbatim into a fresh session)
+
+8h implementation — SESSION H6 (design §13 checklist ITEM 6 ONLY: the
+CLOSE — final gates + the operator-gated LIVE demo + the closing
+entry; NO new feature code), MAIN CHECKOUT
+/Users/darkcite/trading-engine-multivenue. Stage-2 status: 8f/8g
+CLOSED; 8h H0 design LOCKED, H1–H5 CLOSED — HEAD = the H5 commit (the
+FULL autonomous loop is code-complete: fetch → strategist (Fable 5,
+cached, budgeted) → real backtest → gates → auto-promotion (frozen
+stage/commit, attribution) → walk-forward monitor → rollback
+(disable-5 then restage-prior, no-prior disable-only + dark guard);
+monitor.py + ResearchCycle own it; backtest.py + cli.py byte-untouched
+through THREE sessions). Baselines NOW: worker pytest **354** green 0
+skipped with the release binary on PATH (202 frozen UNTOUCHABLE + 2
+real-harness + 43 fetchers + 79 H4 + 28 H5; 354 is the stay-green),
+workspace nextest 1081/1081 (+1 ignored fixture-regen), release alloc
+36/36 0 B/op (`--test-threads=1`; guard: `cargo clean -p bench
+--release` + fresh `Compiling bench` in-log), fuzz `ruleset_json`
+72.3M clean. NO push, NO rebase, NO history rewrite, NO branches, NO
+git ops without operator ask (ONE closing commit IS authorized;
+one-line status after). Do NOT touch `.env`. Notes go ONLY to
+docs/phase-8h-progress.md (H6 = the PHASE CLOSING entry: demo
+transcript facts, final gates, §12 exit-criteria checklist, hygiene,
+Stage-2 closure statement). Verify get_project_modules against the
+main checkout FIRST; stop if no attach.
+**HARD OPERATOR REQUIREMENT (standing since H4): H6 close = Stage 2
+(8f+8g+8h) FULLY implemented. When the §12 exit criteria are
+demonstrated and the closing entry is committed, EXPLICITLY NOTIFY THE
+OPERATOR that Stage 2 is complete — plainly: "Stage 2 is fully
+implemented." — and then STOP. Do NOT start ANY Stage-3 work
+(executor, risk/8i+, venue dispatchers, live ramp — no code, no plans,
+no designs) without his explicit confirmation. This requirement is in
+CLAUDE.md, the H4/H5 entries, and Claude's persistent memory.**
+FIRST TASK, before anything: review the FOURTEEN H5 interpretations in
+the H5 entry (uphold or amend, explicitly, in the closing entry), and
+re-read design §13.6 + §8.5 + §12 exit criteria. REQUIRED READING:
+(1) docs/phase-8h-design.md §13.6 (the close: final gates;
+operator-gated LIVE demo = real capture, one real Fable-5 serve cycle
+budget-capped, auto-promotion observed on a live paper boot, §8.5
+forced-underperformance rollback demonstrated, audit-replay
+verification) + §8.5 (the demo forces the INPUT, never bypasses a
+gate: a sacrificial ruleset that LEGITIMATELY passes gates on capture
+window A, promoted through the REAL auto path; then the monitor's
+trailing window pointed at capture window B where the regime inverts —
+operator-selected run dirs; worst case a crafted synthetic capture via
+PmlrWriter, the golden-fixture machinery doubling as the demo
+generator) + §12 (exit criteria row: Fable-5-authored ruleset
+auto-promoted after passing the real backtest, trading in paper, AND a
+forced-underperformance rollback demonstrated); (2) the H5 entry
+(interpretations + what the monitor already does — the demo drives
+EXISTING code; H6 writes NO new feature code; small demo-harness
+scripts/fixtures are acceptable if clearly demo-scoped and recorded);
+(3) docs/prompts/ai-session.md §2 (metrics endpoint verification:
+engine_ai_ruleset_{staged,committed}_total, enabled_mask 49→17 on
+disable-5) + CLAUDE.md build/run block (G0 law: `cargo build --release
+-p cli` BEFORE any boot; --polymarket-asset-id REQUIRED; --strategy
+all for AI-cmd work). DEMO SHAPE (operator drives the go/no-go at each
+step; everything budget-capped and paper-only): (a) relink release cli
+(G0), boot paper engine with --strategy all on a real market, let
+capture accumulate (or use existing ~/multivenue/logs runs); (b) run
+`claude-worker serve` with a REAL ANTHROPIC key from .env (the
+operator's shell, never Claude touching .env) with
+CLAUDE_WORKER_STRATEGIST_INTERVAL_S set low FOR THE DEMO (env
+override, .env untouched) — observe ONE full research cycle: ledger
+event, candidate, gates, and IF gates pass: auto-install + Stage +
+Commit on the live engine (metrics counters + audit-replay ai section
+prove it); a gates-FAIL cycle is a VALID demo of the gate (record it,
+iterate at operator discretion); (c) §8.5 rollback: point the
+monitor's window at an inverting capture (operator-selected run dirs
+under a scratch CLAUDE_WORKER_REPLAY_DIR, or a crafted PmlrWriter
+capture) so the ACTIVE ruleset breaches ⇒ observe Disable-5 +
+restage-prior frames live (enabled_mask 49→17, staged/committed
+counters increment, state.db rollback_triggered, audit-replay renders
+the Disable/Stage/Commit sequence); (d) the OWED H3 §6.1 live fetch
+smoke MAY ride this session at operator discretion (seed the map with
+the boot market's token id, one budget-capped `claude-worker fetch`).
+GREEN GATES to close the PHASE: worker pytest 354 (+ any demo-scoped
+additions) green, nextest 1081/1081, alloc 36/36 corrected guard,
+release cli relinked (G0 — it precedes the boots anyway), fuzz
+untouched; §12 exit-criteria checklist written out explicitly in the
+closing entry with the observed evidence (counters, event rows, frame
+seqs, audit-replay lines). LANDMINES: Mac-only cargo/pytest (pitfall
+#10); RustRover MCP ≤45 s window — nohup > /tmp/8h-h6-*.log & then
+poll (boots + serve are LONG-runners: always nohup, poll logs, kill by
+pid file); zsh eats bare ===; the engine and serve must not fight over
+the UDS with operator verbs (modes never interleave — exit 4 is the
+tell); .env NEVER read or written by Claude (the operator exports; the
+STRATEGIST_INTERVAL override rides the serve invocation's
+environment); live Fable-5 calls CO$T — the daily cap + one-cycle
+scope is the budget law, confirm the cap with the operator before
+starting serve; paper only (no --live anywhere); full `import x` only;
+engine/strategy-vm/ingress/core/cli crates READ-ONLY; backtest.py +
+cli.py byte-untouched; the 7-verb surface FROZEN; conftest + frozen
+tests untouchable. SESSION FACTS: projectPath
+/Users/darkcite/trading-engine-multivenue; macOS: AF_UNIX sun_path
+cap, SO_RCVTIMEO EINVAL on peer-closed UDS, std::thread::scope panic
+hangs without StopOnDrop, sample <pid> for hangs; push anomaly KNOWN
+(38e599b → f2b3742 across H0): record, never act; market-map.json
+absent on the box until the fetch smoke bootstraps it; boot needs
+--polymarket-asset-id <clobTokenIds decimal> (venue-blind boot
+refuses); metrics on 127.0.0.1 (engine_ai_* family per ai-session §2).
+If context runs short: write interim state + exact resume point +
+relaunch prompt into docs/phase-8h-progress.md, then tell me. AT
+CLOSE, VERBATIM DUTY: tell the operator "Stage 2 is fully
+implemented", list the demonstrated §12 exit criteria, and WAIT — no
+Stage-3 word until he says so.

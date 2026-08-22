@@ -255,6 +255,35 @@ class State:
             None if row[1] is None else str(row[1]),
         )
 
+    def committed_rulesets(self) -> list[tuple[str, str, str | None, int, int]]:
+        """COMMITTED, gates-passed registry rows as ``(hash, path,
+        report_path, staged_ts, committed_ts)``, most recently committed
+        first (8h §8.3 — the monitor's active/prior source).
+
+        Ordering ties (``committed_ts`` is second-resolution) break on
+        ``staged_ts`` DESC then ``hash`` — deterministic; the daemon
+        additionally disambiguates the ACTIVE hash via the events ledger
+        (AUTOINCREMENT order), and production commits are cycle-spaced.
+        Rows whose ``committed_ts`` was cleared by a supersede restage
+        are correctly absent."""
+        cur = self._conn.execute(
+            "SELECT hash, path, report_path, staged_ts, committed_ts FROM rulesets"
+            " WHERE committed_ts IS NOT NULL AND gates_passed = 1"
+            " ORDER BY committed_ts DESC, staged_ts DESC, hash"
+        )
+        out: list[tuple[str, str, str | None, int, int]] = []
+        for row in cur.fetchall():
+            out.append(
+                (
+                    str(row[0]),
+                    str(row[1]),
+                    None if row[2] is None else str(row[2]),
+                    int(row[3]),
+                    int(row[4]),
+                )
+            )
+        return out
+
     def ruleset_row(
         self, full_hash: str
     ) -> tuple[str, str, str | None, bool, str | None, int | None, int | None] | None:

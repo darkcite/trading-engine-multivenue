@@ -22,8 +22,14 @@ the seam). SIGTERM/SIGINT flip a stop flag; shutdown flushes SQLite
 (close), closes the UDS, restores prior signal handlers, returns 0.
 
 8h §9: one new collaborator joins beside the watcher — [`ResearchCycle`]
-(owns the §7.4 cycle state machine + the §8.1 promote step), due every
+(owns the §7.4 cycle state machine + the §8.1 promote step + the §8.3
+walk-forward monitor/rollback, H5), due every
 ``CLAUDE_WORKER_STRATEGIST_INTERVAL_S`` and checked once per tick. The
+monitor runs once at EVERY cycle end (skips included — capture grows
+under an unchanged run name), which makes a promote-ending cycle's run
+the §8.3 post-promotion arm check; a trigger sends disable-5 BEFORE the
+frozen restage/commit of the prior, and an undelivered action holds a
+pending phase exactly like promotion. The
 §7.6 threading law, enforced here: the slow work (the fetch subprocess
 and the Fable-5 call) runs on a single background worker thread
 (``ThreadPoolExecutor(max_workers=1)``) that writes FILES only — its one
@@ -61,8 +67,10 @@ import claude_worker.config
 import claude_worker.features
 import claude_worker.feeds
 import claude_worker.fetchers
+import claude_worker.frames
 import claude_worker.labeling
 import claude_worker.llm
+import claude_worker.monitor
 import claude_worker.state
 import claude_worker.strategist
 import claude_worker.uds
@@ -111,6 +119,7 @@ _IDLE: str = "idle"
 _FETCH: str = "fetch"
 _CALL: str = "call"
 _PROMOTE: str = "promote"
+_ROLLBACK: str = "rollback"  # §8.3 action pending frame delivery
 
 _PURPOSE_PROPOSAL: str = "proposal"
 _PURPOSE_REVISION: str = "revision"
@@ -134,6 +143,13 @@ class ResearchStats:
     gate_failures: int = 0
     promotions: int = 0
     promote_retries: int = 0
+    # 8h-H5 §8.3 walk-forward monitor + rollback lane.
+    monitor_runs: int = 0
+    monitor_skips: int = 0
+    rollbacks_triggered: int = 0
+    rollbacks_completed: int = 0
+    rollback_no_prior: int = 0
+    rollback_retries: int = 0
 
 
 def default_fetch_fn() -> bool:
@@ -228,6 +244,16 @@ class ResearchCycle:
         self._pending: tuple[
             claude_worker.strategist.Candidate, claude_worker.backtest.BacktestOutcome
         ] | None = None
+        # §8.3 monitor state (H5). `_performance` feeds the §7.1 digest
+        # seam; `_pending_rollback` = (active_hash, prior_row_or_None)
+        # awaiting frame delivery; `_dark_hash` marks a disable-only
+        # rollback's target so the monitor stands down until a NEW
+        # promotion changes the active hash.
+        self._performance: str | None = None
+        self._pending_rollback: tuple[
+            str, tuple[str, str, str | None, int, int] | None
+        ] | None = None
+        self._dark_hash: str | None = None
 
     # -- helpers (serve-loop thread only) --
 
@@ -243,6 +269,203 @@ class ResearchCycle:
         self._digest = ""
         self._run_name = None
         self._purpose = _PURPOSE_PROPOSAL
+
+    def _end_cycle(self, uds_client: claude_worker.uds.UdsClient) -> None:
+        """Cycle conclusion (§9's `... -> promote -> monitor`): run the
+        §8.3 walk-forward monitor ONCE — the "every research cycle"
+        cadence row; when the ending cycle just promoted, this same run
+        IS the post-promotion arm check — then reset. A triggered
+        rollback holds the `_ROLLBACK` phase until its frames deliver
+        (the promote-pending discipline, H4 interpretation 15)."""
+        self._run_monitor()
+        self._finish_cycle()
+        if self._pending_rollback is not None:
+            self._phase = _ROLLBACK
+            self._try_rollback(uds_client)
+
+    # -- §8.3 walk-forward monitor + rollback (H5; serve-loop thread) --
+
+    def _ledger_active_hint(self, committed_hashes: set[str]) -> str | None:
+        """Events-ledger disambiguation of the ACTIVE hash: registry
+        `committed_ts` is second-resolution, but the ledger's
+        AUTOINCREMENT ids totally order the auto lane's actions. The
+        latest promotion (its `hash`) or rollback (its `restaged` hash)
+        that still names a committed row wins; operator-lane commits
+        (no event) fall back to registry order."""
+        best_id = -1
+        best_hash: str | None = None
+        for kind, key in (
+            (claude_worker.strategist.EVENT_PROMOTION, "hash"),
+            (claude_worker.strategist.EVENT_ROLLBACK_TRIGGERED, "restaged"),
+        ):
+            for event_id, _ts, _kind, detail in self._state.events(kind=kind):
+                try:
+                    payload = json.loads(detail)
+                except ValueError:
+                    continue
+                value = payload.get(key) if isinstance(payload, dict) else None
+                if isinstance(value, str) and value in committed_hashes and event_id > best_id:
+                    best_id = event_id
+                    best_hash = value
+        return best_hash
+
+    def _resolve_active_prior(
+        self,
+    ) -> tuple[
+        tuple[str, str, str | None, int, int] | None,
+        tuple[str, str, str | None, int, int] | None,
+    ]:
+        """(active, prior) registry rows for the monitor — §8.3: active =
+        what the engine last committed; prior = the most recent OTHER
+        gates-passed committed hash (the rollback target)."""
+        rows = self._state.committed_rulesets()
+        if not rows:
+            return None, None
+        hint = self._ledger_active_hint({row[0] for row in rows})
+        active = rows[0]
+        if hint is not None:
+            for row in rows:
+                if row[0] == hint:
+                    active = row
+                    break
+        prior: tuple[str, str, str | None, int, int] | None = None
+        for row in rows:
+            if row[0] != active[0]:
+                prior = row
+                break
+        return active, prior
+
+    def _monitor_skip(self, active_hash: str, reason: str, coverage_ns: int, **extra: object) -> None:
+        detail: dict[str, object] = {
+            "active": active_hash,
+            "reason": reason,
+            "coverage_ns": coverage_ns,
+            "floor_ns": claude_worker.monitor.MONITOR_FLOOR_NS,
+        }
+        detail.update(extra)
+        self._event(claude_worker.strategist.EVENT_MONITOR_SKIP, detail)
+        self.stats.monitor_skips += 1
+        _log.info("monitor_skip", active=active_hash, reason=reason)
+
+    def _run_monitor(self) -> None:
+        """One §8.3 evaluation of the ACTIVE ruleset over the trailing
+        capture window. Socket-free: a trigger only ARMS
+        `_pending_rollback`; frames ride `_try_rollback` on the loop
+        thread. Never rolls back on an unscored window (fail-safe)."""
+        active, prior = self._resolve_active_prior()
+        if active is None:
+            return  # nothing committed — nothing to monitor
+        active_hash, active_path, _report, _staged, _committed = active
+        if self._dark_hash == active_hash:
+            return  # disable-only already actioned; wait for a new promotion
+        self.stats.monitor_runs += 1
+        spans = claude_worker.monitor.read_run_spans(self._cfg.replay_dir)
+        selection = claude_worker.monitor.select_window(spans)
+        if selection is None or selection.coverage_ns < claude_worker.monitor.MONITOR_FLOOR_NS:
+            coverage = 0 if selection is None else selection.coverage_ns
+            self._monitor_skip(active_hash, "coverage", coverage)
+            return
+        hash128 = active_hash[: 2 * claude_worker.backtest.HASH128_LEN]
+        installed = self._cfg.ai_ruleset_dir / f"{hash128}.json"
+        source = installed if installed.is_file() else pathlib.Path(active_path)
+        if not source.is_file():
+            self._monitor_skip(active_hash, "artifact_missing", selection.coverage_ns)
+            return
+        scratch = claude_worker.monitor.monitor_dir(self._cfg.db_path)
+        copy_path = claude_worker.monitor.stage_active_copy(scratch, source, hash128)
+        window_dir = claude_worker.monitor.prepare_window_dir(
+            scratch, selection, self._cfg.replay_dir
+        )
+        try:
+            outcome = self._run_backtest_fn(
+                copy_path, window_dir, split=claude_worker.monitor.MONITOR_SPLIT
+            )
+        except claude_worker.backtest.BacktestError as exc:
+            self._monitor_skip(
+                active_hash, "backtest_error", selection.coverage_ns, error=str(exc)
+            )
+            return
+        triggered, metrics = claude_worker.monitor.breach(outcome.harness)
+        self._performance = claude_worker.monitor.summary_line(
+            hash128, selection, outcome.harness, triggered
+        )
+        _log.info("monitor_scored", active=hash128, triggered=triggered)
+        if not triggered:
+            return
+        self.stats.rollbacks_triggered += 1
+        detail: dict[str, object] = {
+            "hash": active_hash,
+            "restaged": None if prior is None else prior[0],
+            "coverage_ns": selection.coverage_ns,
+        }
+        detail.update(metrics)
+        self._event(claude_worker.strategist.EVENT_ROLLBACK_TRIGGERED, detail)
+        _log.warning("rollback_triggered", active=hash128)
+        self._pending_rollback = (active_hash, prior)
+
+    def _rollback_degrade(self, active_hash: str, reason: str) -> None:
+        """§8.3 no-prior arm (also the prior-unusable degrade): the
+        disable is already out; record + go dark on this hash."""
+        self._event(
+            claude_worker.strategist.EVENT_ROLLBACK_NO_PRIOR,
+            {"hash": active_hash, "reason": reason},
+        )
+        self.stats.rollback_no_prior += 1
+        self._dark_hash = active_hash
+
+    def _try_rollback(self, uds_client: claude_worker.uds.UdsClient) -> None:
+        """§8.3 action, serve-loop thread only, ORDER PINNED: disable-5
+        FIRST (the push-verb wire shape), THEN restage+commit the prior
+        through the FROZEN pair. Disconnected => wait; UdsError => retry
+        next tick (the disable resend is idempotent on the engine mask;
+        Stage supersede semantics cover the pair). Attribution is NOT
+        passed — the §8.2 COALESCE preserves the prior's original
+        author."""
+        assert self._pending_rollback is not None  # phase invariant
+        active_hash, prior = self._pending_rollback
+        if not uds_client.connected:
+            return
+        try:
+            uds_client.send_cmd(
+                sym=claude_worker.frames.SYMBOL_ID_NONE,
+                px=0,
+                qty=0,
+                ttl_ns=0,
+                kind=claude_worker.frames.KIND_DISABLE_STRATEGY,
+                venue=claude_worker.frames.VENUE_AI,
+                strategy_id=claude_worker.frames.STRATEGY_SLOT_VM,
+                side=claude_worker.frames.SIDE_NONE,
+                param_id=0,
+                flags=0,
+            )
+            if prior is None:
+                self._rollback_degrade(active_hash, "no prior gates-passed committed hash")
+            else:
+                prior_hash, prior_path, prior_report, _staged, _committed = prior
+                if prior_report is None:
+                    self._rollback_degrade(active_hash, f"prior {prior_hash} has no report path")
+                else:
+                    try:
+                        claude_worker.backtest.stage_ruleset(
+                            self._state,
+                            uds_client,
+                            pathlib.Path(prior_path),
+                            pathlib.Path(prior_report),
+                            "auto",
+                        )
+                        claude_worker.backtest.commit_ruleset(self._state, uds_client, prior_hash)
+                    except (claude_worker.backtest.GateRefused, OSError) as exc:
+                        self._rollback_degrade(active_hash, f"prior restage refused: {exc}")
+        except claude_worker.uds.UdsError as exc:
+            self.stats.rollback_retries += 1
+            uds_client.close()
+            _log.warning("rollback_retry", error=str(exc))
+            return
+        self.stats.rollbacks_completed += 1
+        self._pending_rollback = None
+        if self._phase == _ROLLBACK:
+            self._phase = _IDLE
+        _log.info("rollback_completed", hash=active_hash)
 
     def _submit_call(self, prompt: str, purpose: str) -> bool:
         """Budget-gate (§7.5, serve-side — the events ledger is loop-only
@@ -268,7 +491,7 @@ class ResearchCycle:
         self._phase = _CALL
         return True
 
-    def _start_cycle(self) -> None:
+    def _start_cycle(self, uds_client: claude_worker.uds.UdsClient) -> None:
         latest = claude_worker.features.latest_run_dir(self._cfg.replay_dir)
         if latest is None or latest.name == self._last_run_name:
             self._event(
@@ -280,6 +503,10 @@ class ResearchCycle:
                 "strategist_capture_skip",
                 latest=None if latest is None else latest.name,
             )
+            # A skipped cycle is still a cycle: the §8.3 "every research
+            # cycle" cadence row runs the monitor (the same run dir can
+            # have grown hours of fresh ticks under the same name).
+            self._end_cycle(uds_client)
             return
         self._last_run_name = latest.name
         self._run_name = latest.name
@@ -288,7 +515,7 @@ class ResearchCycle:
         self._future = self._executor.submit(self._fetch_fn)
         self._phase = _FETCH
 
-    def _after_fetch(self, fetch_ok: bool) -> None:
+    def _after_fetch(self, fetch_ok: bool, uds_client: claude_worker.uds.UdsClient) -> None:
         if not fetch_ok:
             self.stats.fetch_failures += 1
         universe: list[int] | None
@@ -306,10 +533,11 @@ class ResearchCycle:
             self._run_name,
             self._markets,
             universe=universe,
+            performance=self._performance,  # §7.1: latest walk-forward (H5)
         )
         prompt = claude_worker.strategist.build_user_prompt(self._digest)
         if not self._submit_call(prompt, _PURPOSE_PROPOSAL):
-            self._finish_cycle()
+            self._end_cycle(uds_client)
 
     def _record_call(self, result: claude_worker.strategist.CallResult) -> None:
         """§7.5 ledger row — ONLY for a real API call; a SQLite dedupe
@@ -335,12 +563,16 @@ class ResearchCycle:
         self.stats.candidates_rejected += 1
         _log.info("strategist_candidate_rejected", reason=reason, archived=str(path))
 
-    def _after_call(self, result: claude_worker.strategist.CallResult) -> None:
+    def _after_call(
+        self,
+        result: claude_worker.strategist.CallResult,
+        uds_client: claude_worker.uds.UdsClient,
+    ) -> None:
         self._record_call(result)
         proposal = claude_worker.strategist.parse_proposal(result.text)
         if proposal is None:
             self._reject(result.text, "malformed_output")
-            self._finish_cycle()
+            self._end_cycle(uds_client)
             return
         candidate = claude_worker.strategist.write_candidate(
             claude_worker.strategist.candidates_dir(self._cfg.db_path), proposal
@@ -359,7 +591,7 @@ class ResearchCycle:
             )
             self.stats.backtest_errors += 1
             _log.warning("strategist_backtest_error", error=str(exc))
-            self._finish_cycle()
+            self._end_cycle(uds_client)
             return
         if outcome.all_passed:
             # §8.1 order: gates PASS => install now; frames when connected.
@@ -379,7 +611,7 @@ class ResearchCycle:
                 outcome.report_path.read_text(),
             )
             if not self._submit_call(prompt, _PURPOSE_REVISION):
-                self._finish_cycle()
+                self._end_cycle(uds_client)
             return
         # Revision failed too: archive with report (both already sit in
         # the candidates dir — candidate + R.report.json), cycle over.
@@ -393,7 +625,7 @@ class ResearchCycle:
             },
         )
         _log.info("strategist_gates_failed_final", candidate=str(candidate.path))
-        self._finish_cycle()
+        self._end_cycle(uds_client)
 
     def _try_promote(self, uds_client: claude_worker.uds.UdsClient) -> None:
         """§8.1 steps 2-3 on the serve-loop thread: the FROZEN
@@ -436,7 +668,9 @@ class ResearchCycle:
         )
         self.stats.promotions += 1
         _log.info("strategist_promoted", hash128=candidate.hash128_hex)
-        self._finish_cycle()
+        # Cycle end doubles as the §8.3 post-promotion ARM CHECK: the
+        # monitor scores the just-committed hash immediately.
+        self._end_cycle(uds_client)
 
     def maybe_run(self, now_ns: int, uds_client: claude_worker.uds.UdsClient) -> None:
         """One per-tick advance (§9: checked once per tick, watcher
@@ -446,10 +680,13 @@ class ResearchCycle:
             if now_ns < self._next_due_ns:
                 return
             self._next_due_ns = now_ns + self._interval_ns
-            self._start_cycle()
+            self._start_cycle(uds_client)
             return
         if self._phase == _PROMOTE:
             self._try_promote(uds_client)
+            return
+        if self._phase == _ROLLBACK:
+            self._try_rollback(uds_client)
             return
         future = self._future
         if future is None or not future.done():
@@ -461,7 +698,7 @@ class ResearchCycle:
             except Exception as exc:  # noqa: BLE001 — bg fetch is best-effort by doctrine
                 _log.warning("research_fetch_raised", error=str(exc))
                 fetch_ok = False
-            self._after_fetch(fetch_ok)
+            self._after_fetch(fetch_ok, uds_client)
             return
         # _CALL
         try:
@@ -473,9 +710,9 @@ class ResearchCycle:
             )
             self.stats.call_failures += 1
             _log.warning("strategist_call_failed", error=str(exc))
-            self._finish_cycle()
+            self._end_cycle(uds_client)
             return
-        self._after_call(result)
+        self._after_call(result, uds_client)
 
 
 def _ensure_connected(

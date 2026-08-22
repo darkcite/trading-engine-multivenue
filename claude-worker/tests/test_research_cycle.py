@@ -676,3 +676,387 @@ def test_serve_composes_research_cycle_end_to_end(
     )
     assert detail["input_tokens"] == 500 and detail["cache_read"] is False
     state.close()
+
+
+# ---- 8h-H5: §8.3 walk-forward monitor + rollback (design §12 monitor rows)
+
+import claude_worker.monitor  # noqa: E402 — H5 suite section
+import tests.craft  # noqa: E402
+
+_H_NS = 3_600_000_000_000
+_RECENT_EPOCH = 200 * _H_NS
+
+
+class _DispatchBacktest:
+    """Split-aware run_backtest double: 70/30 (the promotion gate) always
+    PASSES; 0/100 (the monitor) BREACHES iff the scored artifact carries
+    ``breach_marker`` (or raises when ``monitor_error`` is set). Records
+    every call for window/split assertions."""
+
+    def __init__(self, breach_marker: bytes, monitor_error: str | None = None) -> None:
+        self._marker = breach_marker
+        self._error = monitor_error
+        self.calls: list[tuple[str, pathlib.Path, pathlib.Path]] = []
+
+    def __call__(
+        self,
+        ruleset_path: pathlib.Path,
+        replay_dir: pathlib.Path,
+        split: str = "70/30",
+    ) -> claude_worker.backtest.BacktestOutcome:
+        self.calls.append((split, replay_dir, ruleset_path))
+        assert split in ("70/30", claude_worker.monitor.MONITOR_SPLIT)
+        if split == claude_worker.monitor.MONITOR_SPLIT and self._error is not None:
+            raise claude_worker.backtest.BacktestError(self._error)
+        breach = (
+            split == claude_worker.monitor.MONITOR_SPLIT
+            and self._marker in ruleset_path.read_bytes()
+        )
+        full_hash, _ = claude_worker.backtest.ruleset_hashes(ruleset_path)
+        harness = claude_worker.backtest.HarnessReport(
+            ruleset_hash=full_hash,
+            split=split,
+            oos_net_pnl_usd=-150.0 if breach else 5.0,
+            oos_trades=60,
+            oos_trading_days=3,
+            oos_max_drawdown_usd=20.0,
+            max_order_notional_usd=50.0,
+            max_symbol_notional_usd=96.8,
+            max_total_notional_usd=96.8,
+        )
+        thresholds = claude_worker.backtest.GateThresholds()
+        gates = claude_worker.backtest.evaluate_gates(harness, thresholds)
+        report_path = claude_worker.backtest.write_report(
+            ruleset_path, full_hash, harness, gates, thresholds
+        )
+        return claude_worker.backtest.BacktestOutcome(
+            all_passed=gates.all_passed, report_path=report_path, gates=gates, harness=harness
+        )
+
+
+def _mk_monitor_cycle(  # noqa: PLR0913 — test composition root
+    cfg: claude_worker.config.BaseConfig,
+    state: claude_worker.state.State,
+    executor: concurrent.futures.Executor,
+    complete: _CompleteFake,
+    clock: _Clock,
+    dispatch: _DispatchBacktest,
+) -> claude_worker.daemon.ResearchCycle:
+    return claude_worker.daemon.ResearchCycle(
+        state,
+        cfg,
+        {"btc-daily": 42},
+        complete,
+        executor,
+        fetch_fn=lambda: True,
+        run_backtest_fn=dispatch,
+        env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1"},
+        clock_ns=clock,
+        wall_ns=lambda: _FIXED_WALL_NS,
+    )
+
+
+def _connected_client(
+    fake_uds: tests.conftest.FakeUdsServer, state: claude_worker.state.State
+) -> claude_worker.uds.UdsClient:
+    client = claude_worker.uds.UdsClient(fake_uds.sock_path, tests.conftest.TEST_KEY, state)
+    client.connect()
+    client.send_heartbeat()
+    return client
+
+
+def _frame_kinds(server: tests.conftest.FakeUdsServer, count: int) -> list[int]:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and len(server.frames) < count:
+        time.sleep(0.01)
+    assert len(server.frames) == count, f"expected {count} frames, got {len(server.frames)}"
+    return [server.cmd_field(i, "kind") for i in range(count)]
+
+
+def test_monitor_noop_without_committed_ruleset(
+    tmp_path: pathlib.Path, executor: concurrent.futures.ThreadPoolExecutor
+) -> None:
+    cfg = _mk_cfg(tmp_path)
+    state = claude_worker.state.State(cfg.db_path)
+    clock = _Clock()
+    complete = _CompleteFake(["not json"])
+    cycle = _mk_cycle(cfg, state, executor, complete, clock)
+    client = _disconnected_client(cfg, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.candidates_rejected == 1)
+    assert cycle.stats.monitor_runs == 0, "nothing committed => nothing to monitor"
+    assert state.events(kind=claude_worker.strategist.EVENT_MONITOR_SKIP) == []
+    state.close()
+
+
+def test_promotion_arm_check_skips_on_thin_capture(
+    fake_uds: tests.conftest.FakeUdsServer,
+    tmp_path: pathlib.Path,
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> None:
+    # The H4 promotion flow over the tickless default capture: the §8.3
+    # arm check fires at cycle end and SKIPS below the 6 h floor.
+    cfg = _mk_cfg(tmp_path, sock=fake_uds.sock_path)
+    state = claude_worker.state.State(cfg.db_path)
+    clock = _Clock()
+    complete = _CompleteFake([_PROPOSAL])
+    cycle = _mk_cycle(cfg, state, executor, complete, clock, passing=True)
+    client = _connected_client(fake_uds, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.promotions == 1)
+    assert cycle.stats.monitor_runs == 1, "post-promotion arm check ran"
+    assert cycle.stats.monitor_skips == 1
+    assert cycle.stats.rollbacks_triggered == 0
+    skip = state.events(kind=claude_worker.strategist.EVENT_MONITOR_SKIP)
+    assert len(skip) == 1
+    detail = json.loads(skip[0][3])
+    assert detail["reason"] == "coverage"
+    assert detail["coverage_ns"] == 0
+    assert detail["floor_ns"] == claude_worker.monitor.MONITOR_FLOOR_NS
+    promo = json.loads(state.events(kind=claude_worker.strategist.EVENT_PROMOTION)[0][3])
+    assert detail["active"] == promo["hash"], "the arm check scored the just-promoted hash"
+    client.close()
+    state.close()
+
+
+def test_promote_arm_check_triggers_full_rollback(
+    fake_uds: tests.conftest.FakeUdsServer,
+    tmp_path: pathlib.Path,
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> None:
+    """The §8.5-shaped path: promote on the gates, then the arm check's
+    trailing window says the fresh ruleset LOSES — disable-5 BEFORE the
+    frozen restage/commit of the prior, all in the pinned order."""
+    cfg = _mk_cfg(tmp_path, sock=fake_uds.sock_path)
+    state = claude_worker.state.State(cfg.db_path)
+    prior_hash, _prior_path, prior_report = tests.craft.seed_committed_ruleset(
+        state, tmp_path, "prior", "prior-row", staged_ts=100, committed_ts=200,
+        model="claude-fable-5", thesis="prior thesis",
+    )
+    prior_report_bytes = prior_report.read_bytes()
+    # >= 6 h of capture in one recent run (default run-1 stays tickless).
+    tests.craft.write_run(cfg.replay_dir, _RECENT_EPOCH, [0, 8 * _H_NS])
+    clock = _Clock()
+    complete = _CompleteFake([_PROPOSAL])
+    dispatch = _DispatchBacktest(breach_marker=b"auto-buy-low")
+    cycle = _mk_monitor_cycle(cfg, state, executor, complete, clock, dispatch)
+    client = _connected_client(fake_uds, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.rollbacks_completed == 1)
+
+    assert cycle.stats.promotions == 1
+    assert cycle.stats.monitor_runs == 1
+    assert cycle.stats.rollbacks_triggered == 1
+    assert cycle.stats.rollback_no_prior == 0
+
+    # Frame order (§8.3 pinned): candidate Stage+Commit, then Disable-5
+    # FIRST, then the prior's Stage+Commit through the frozen pair.
+    kinds = _frame_kinds(fake_uds, 6)
+    assert kinds == [
+        claude_worker.frames.KIND_HEARTBEAT,
+        claude_worker.frames.KIND_RULESET_STAGE,
+        claude_worker.frames.KIND_RULESET_COMMIT,
+        claude_worker.frames.KIND_DISABLE_STRATEGY,
+        claude_worker.frames.KIND_RULESET_STAGE,
+        claude_worker.frames.KIND_RULESET_COMMIT,
+    ]
+    assert fake_uds.errors == []
+    assert fake_uds.cmd_field(3, "strategy_id") == claude_worker.frames.STRATEGY_SLOT_VM
+    assert fake_uds.cmd_field(3, "venue") == claude_worker.frames.VENUE_AI
+    assert fake_uds.cmd_field(3, "sym") == claude_worker.frames.SYMBOL_ID_NONE
+    prior_px, prior_qty = claude_worker.backtest.hash128_wire(bytes.fromhex(prior_hash)[:16])
+    assert fake_uds.cmd_field(4, "px") == prior_px
+    assert fake_uds.cmd_field(4, "qty") == prior_qty
+    assert fake_uds.cmd_field(5, "px") == prior_px
+
+    # Monitor scored a COPY over the subset window dir with the carved split.
+    monitor_calls = [c for c in dispatch.calls if c[0] == claude_worker.monitor.MONITOR_SPLIT]
+    assert len(monitor_calls) == 1
+    _split, window_dir, scored_path = monitor_calls[0]
+    assert window_dir.name == "window", "tickless run-1 excluded => symlink subset"
+    assert sorted(p.name for p in window_dir.iterdir()) == [f"run-{_RECENT_EPOCH}"]
+    assert scored_path.name.startswith("active-"), "report-clobber protection: a copy was scored"
+
+    # Events: rollback_triggered carries the metric values + the restage.
+    promo = json.loads(state.events(kind=claude_worker.strategist.EVENT_PROMOTION)[0][3])
+    trig = state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_TRIGGERED)
+    assert len(trig) == 1
+    detail = json.loads(trig[0][3])
+    assert detail["hash"] == promo["hash"]
+    assert detail["restaged"] == prior_hash
+    assert detail["net_pnl_usd"] == -150.0
+    assert detail["net_trigger"] is True and detail["drawdown_trigger"] is False
+    assert detail["coverage_ns"] == 8 * _H_NS
+    assert state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_NO_PRIOR) == []
+
+    # Registry: the prior is committed again, its attribution PRESERVED
+    # (the restage rode the frozen pair with no attribution — COALESCE).
+    row = state.ruleset_row(prior_hash)
+    assert row is not None and row[6] is not None and row[4] == "auto"
+    assert state.ruleset_attribution(prior_hash) == ("claude-fable-5", "prior thesis")
+    # Clobber protection held: the prior's PROMOTION report is byte-identical,
+    # and the candidate's own gates-passed report still says 70/30 PASS.
+    assert prior_report.read_bytes() == prior_report_bytes
+    cand_reports = list(
+        claude_worker.strategist.candidates_dir(cfg.db_path).glob("*.report.json")
+    )
+    assert len(cand_reports) == 1
+    cand_report = json.loads(cand_reports[0].read_text())
+    assert cand_report["split"] == "70/30" and cand_report["gates"]["all_passed"] is True
+    monitor_report = json.loads(
+        next(claude_worker.monitor.monitor_dir(cfg.db_path).glob("active-*.report.json")).read_text()
+    )
+    assert monitor_report["split"] == "0/100"
+
+    # Next cycle (same capture => capture-skip) re-monitors: the events
+    # ledger resolves ACTIVE = the restaged prior even though both rows
+    # committed within the same wall second — no re-trigger.
+    clock.now_ns = 4_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.monitor_runs == 2)
+    assert cycle.stats.rollbacks_triggered == 1, "prior is active now and scores clean"
+    assert cycle.stats.skips_no_capture == 1
+    client.close()
+    state.close()
+
+
+def test_rollback_no_prior_is_disable_only_then_dark(
+    fake_uds: tests.conftest.FakeUdsServer,
+    tmp_path: pathlib.Path,
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> None:
+    cfg = _mk_cfg(tmp_path, sock=fake_uds.sock_path)
+    state = claude_worker.state.State(cfg.db_path)
+    tests.craft.write_run(cfg.replay_dir, _RECENT_EPOCH, [0, 8 * _H_NS])
+    clock = _Clock()
+    complete = _CompleteFake([_PROPOSAL])
+    dispatch = _DispatchBacktest(breach_marker=b"auto-buy-low")
+    cycle = _mk_monitor_cycle(cfg, state, executor, complete, clock, dispatch)
+    client = _connected_client(fake_uds, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.rollbacks_completed == 1)
+
+    # §8.3 no-prior arm: disable only — NO second Stage/Commit pair.
+    kinds = _frame_kinds(fake_uds, 4)
+    assert kinds == [
+        claude_worker.frames.KIND_HEARTBEAT,
+        claude_worker.frames.KIND_RULESET_STAGE,
+        claude_worker.frames.KIND_RULESET_COMMIT,
+        claude_worker.frames.KIND_DISABLE_STRATEGY,
+    ]
+    trig = json.loads(
+        state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_TRIGGERED)[0][3]
+    )
+    assert trig["restaged"] is None
+    no_prior = state.events(kind=claude_worker.strategist.EVENT_ROLLBACK_NO_PRIOR)
+    assert len(no_prior) == 1
+    assert cycle.stats.rollback_no_prior == 1
+
+    # Dark guard: the disabled hash is not re-scored; no rollback spam.
+    clock.now_ns = 4_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.skips_no_capture == 1)
+    for _ in range(10):
+        cycle.maybe_run(clock(), client)
+    assert cycle.stats.monitor_runs == 1, "dark hash stands down until a NEW promotion"
+    assert cycle.stats.rollbacks_triggered == 1
+    assert len(fake_uds.frames) == 4
+    client.close()
+    state.close()
+
+
+def test_rollback_waits_for_connection_and_blocks_cycles(
+    fake_uds: tests.conftest.FakeUdsServer,
+    tmp_path: pathlib.Path,
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> None:
+    cfg = _mk_cfg(tmp_path, sock=fake_uds.sock_path)
+    state = claude_worker.state.State(cfg.db_path)
+    # Registry-seeded ACTIVE (no promotion event: the ledger is empty and
+    # the registry head resolves) whose artifact breaches on the window.
+    tests.craft.seed_committed_ruleset(
+        state, tmp_path, "active", "bad-active", staged_ts=100, committed_ts=200
+    )
+    tests.craft.write_run(cfg.replay_dir, _RECENT_EPOCH, [0, 8 * _H_NS])
+    clock = _Clock()
+    complete = _CompleteFake(["not json"])  # the cycle itself ends quickly
+    dispatch = _DispatchBacktest(breach_marker=b"bad-active")
+    cycle = _mk_monitor_cycle(cfg, state, executor, complete, clock, dispatch)
+    client = _disconnected_client(cfg, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.rollbacks_triggered == 1)
+    for _ in range(10):
+        cycle.maybe_run(clock(), client)
+    assert cycle.stats.rollbacks_completed == 0
+    assert state.events(kind=claude_worker.state.EVENT_FRAME_SENT) == []
+    # A pending rollback blocks new cycles (the promote-pending discipline).
+    clock.now_ns = 6_000_000_000
+    for _ in range(10):
+        cycle.maybe_run(clock(), client)
+    assert cycle.stats.cycles_started == 1
+    # The engine returns: disable-only delivers (no prior exists).
+    client.connect()
+    client.send_heartbeat()
+    _drive(cycle, clock, client, lambda: cycle.stats.rollbacks_completed == 1)
+    kinds = _frame_kinds(fake_uds, 2)
+    assert kinds == [
+        claude_worker.frames.KIND_HEARTBEAT,
+        claude_worker.frames.KIND_DISABLE_STRATEGY,
+    ]
+    client.close()
+    state.close()
+
+
+def test_monitor_backtest_error_is_a_skip_not_a_rollback(
+    tmp_path: pathlib.Path, executor: concurrent.futures.ThreadPoolExecutor
+) -> None:
+    cfg = _mk_cfg(tmp_path)
+    (cfg.replay_dir / "run-1").rmdir()
+    state = claude_worker.state.State(cfg.db_path)
+    active_hash, _p, _r = tests.craft.seed_committed_ruleset(
+        state, tmp_path, "active", "bad-active", staged_ts=100, committed_ts=200
+    )
+    tests.craft.write_run(cfg.replay_dir, _RECENT_EPOCH, [0, 8 * _H_NS])
+    clock = _Clock()
+    complete = _CompleteFake(["not json"])
+    dispatch = _DispatchBacktest(breach_marker=b"bad-active", monitor_error="validator reject")
+    cycle = _mk_monitor_cycle(cfg, state, executor, complete, clock, dispatch)
+    client = _disconnected_client(cfg, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.monitor_skips == 1)
+    detail = json.loads(state.events(kind=claude_worker.strategist.EVENT_MONITOR_SKIP)[0][3])
+    assert detail["reason"] == "backtest_error"
+    assert detail["active"] == active_hash
+    assert "validator reject" in detail["error"]
+    assert cycle.stats.rollbacks_triggered == 0
+    assert state.events(kind=claude_worker.state.EVENT_FRAME_SENT) == []
+    # Single run, no tickless sibling: the monitor handed the ROOT through.
+    monitor_calls = [c for c in dispatch.calls if c[0] == claude_worker.monitor.MONITOR_SPLIT]
+    assert len(monitor_calls) == 1 and monitor_calls[0][1] == cfg.replay_dir
+    state.close()
+
+
+def test_monitor_performance_feeds_next_digest(
+    tmp_path: pathlib.Path, executor: concurrent.futures.ThreadPoolExecutor
+) -> None:
+    cfg = _mk_cfg(tmp_path)
+    state = claude_worker.state.State(cfg.db_path)
+    tests.craft.seed_committed_ruleset(
+        state, tmp_path, "active", "good-active", staged_ts=100, committed_ts=200
+    )
+    tests.craft.write_run(cfg.replay_dir, _RECENT_EPOCH, [0, 8 * _H_NS])
+    clock = _Clock()
+    complete = _CompleteFake(["not json", "still not json"])
+    dispatch = _DispatchBacktest(breach_marker=b"never-matches")
+    cycle = _mk_monitor_cycle(cfg, state, executor, complete, clock, dispatch)
+    client = _disconnected_client(cfg, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.monitor_runs == 1)
+    assert "walk-forward" not in complete.calls[0][1], "no performance before the first score"
+    # Fresh capture => a second full cycle; its digest carries §7.1's
+    # walk-forward line from the monitor's last score.
+    tests.craft.write_run(cfg.replay_dir, _RECENT_EPOCH + 10 * _H_NS, [0, 7 * _H_NS])
+    clock.now_ns = 4_000_000_000
+    _drive(cycle, clock, client, lambda: len(complete.calls) == 2)
+    second_prompt = complete.calls[1][1]
+    assert "ACTIVE RULESET WALK-FORWARD" in second_prompt
+    assert "verdict=holding" in second_prompt
+    state.close()
