@@ -352,3 +352,58 @@ Commit ask C4 paths:
 `claude-worker/tests/test_candles.py` · `scripts/candles-cycle.sh` ·
 `launchd/com.multivenue.candles.plist` · `scripts/install-launchd.sh`
 · `.env.example` · `docs/local-setup.md` · `docs/m3-progress.md`.
+
+**C4 LANDED** — commit `e6b4de2`.
+
+---
+
+## 2026-08-22 — C5: derive + capture-derived + drift check BUILT + LIVE-PROVEN (commit ask pending)
+
+Extends `claude_worker/candles.py` (still a module, `cli.py` frozen):
+
+- **§9.5 derive**: 5m/15m from 1m, 4h from 1h — EXACT law (O=first,
+  H=max, L=min, C=last, V=sum), `source=derived`, cached; only
+  COMPLETE CLOSED windows (all k base bars present); derived rows
+  refresh when a base finalization changes them (they are cache —
+  immutability protects fetched rest bars only); NULL-volume
+  poisoning (any NULL base ⇒ NULL — volume never fabricated).
+- **§9.7 capture lane**: fold PMLR ticks (harness wall law,
+  `epoch + (ts − run_anchor)`; one-sided ticks skipped) → per-minute
+  mid-price OHLC + tick-count → stored for PM (`source=capture`,
+  `v` NULL, count in the new nullable **`n` column** — the §9.7
+  "tick-count" landing spot; §9.4's column list gains exactly this
+  one nullable column, C4→C5 `ALTER` migration in `open_db`;
+  OPERATOR NOTE: flagging since §9 is binding — say the word and it
+  moves to a side table instead). Rest supersedes capture on a
+  shared PK, never the reverse. Rolling 26 h window
+  (`CLAUDE_WORKER_CANDLES_CAPTURE_WINDOW_H`);
+  `--capture-backfill` = one-shot full-history fold.
+- **§9.7 drift check**: capture-vs-REST close comparison for
+  `binance:*` descriptors over a 6 h window, report-only, WARN over
+  20 bps (env-tunable).
+- **Rotation fix** (LIVE-observed convergence flaw): OKX
+  ETH-USDT-SWAP's 29-page backward 1m walk was discarded EVERY cycle
+  behind BTC's 3-page head start (27 < 29 remaining budget,
+  forever). Targets now rotate by cycle hour — every target leads
+  eventually, every backfill completes.
+
+**Live proof (cycle 3, real venues + real capture):** incremental
+§9.6 visible everywhere (`pages=1 bars=10 +9 open~1` per lane — ten
+minutes since cycle 2, frontier + open-bar finalization);
+**capture pm: minutes=166 +166** (today's real PM capture stored,
+volume NULL); **drift binance:btcusdt mean 1.09 bps max 5.67 /
+ethusdt 3.44/10.47 — our sockets and Binance's own candles agree to
+basis points** (BBO-mid vs trade-close structural difference
+included), no WARN; **derive +4,062/+1,348/+3,776** (5m/15m/4h).
+rows=61,570, conflict-rows=0.
+
+**Gates:** worker pytest **412** (401 + 11: 10 C5 + 1 rotation);
+Rust untouched (nextest 1151 / alloc 36 stand); fuzz untouched (no
+new parser — PMLR rides `claude_worker.pmlr`, map rides
+`cli.load_market_map`). `tests/craft.py` gained the additive
+`write_ticks_px` builder (explicit per-slot prices).
+
+Commit ask C5 paths:
+`claude-worker/src/claude_worker/candles.py` ·
+`claude-worker/tests/test_candles.py` · `claude-worker/tests/craft.py`
+· `.env.example` · `docs/local-setup.md` · `docs/m3-progress.md`.

@@ -7,6 +7,8 @@ import json
 import pathlib
 import sqlite3
 
+import tests.craft
+
 import claude_worker.candles
 import claude_worker.features
 import claude_worker.fetchers
@@ -543,6 +545,282 @@ def test_run_cycle_shares_budget_per_venue(tmp_path: pathlib.Path) -> None:
     assert len(calls) == 4
     assert sum("BUDGET" in line for line in lines) == 2
     assert any("binance:btcusdt 1m" in line for line in lines)
+
+
+def test_run_cycle_rotates_targets_by_hour(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    a = bn_target()
+    b = claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_BINANCE, "binance:ethusdt", "ETHUSDT"
+    )
+    lanes = [claude_worker.candles.Lane("binance", a.venue, [a, b], backward=False)]
+    seen: list[str] = []
+
+    def get(url: str) -> str:
+        seen.append(url.split("symbol=")[1].split("&")[0])
+        return klines_json([])
+
+    base = http_none()
+    http = claude_worker.candles.Http(get=get, post=base.post, hosts=base.hosts)
+    even_hour = (NOW // 3_600_000) * 3_600_000
+    claude_worker.candles.run_cycle(conn, lanes, http, even_hour, 50, {}, lambda _l: None)
+    first_even = seen[0]
+    seen.clear()
+    claude_worker.candles.run_cycle(
+        conn, lanes, http, even_hour + 3_600_000, 50, {}, lambda _l: None
+    )
+    assert seen[0] != first_even, "the lead target rotates hour to hour"
+
+
+# ---- C5: §9.5 derive ----------------------------------------------------
+
+
+def seed_1m(
+    conn: sqlite3.Connection,
+    desc: str,
+    start: int,
+    bases: list[float],
+    volume: float | None = 5.0,
+    source: str = "rest",
+) -> None:
+    for i, base in enumerate(bases):
+        conn.execute(
+            "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+            " VALUES (?,?, '1m', ?,?,?,?,?,?,?, 1)",
+            (
+                claude_worker.frames.VENUE_BINANCE,
+                desc,
+                start + i * MS_1M,
+                base,
+                base + 2,
+                base - 1,
+                base + 1,
+                volume,
+                source,
+            ),
+        )
+    conn.commit()
+
+
+def test_derive_5m_exact(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    w = (NOW // (5 * MS_1M)) * (5 * MS_1M) - 5 * MS_1M  # a closed 5m window
+    seed_1m(conn, "binance:btcusdt", w, [100.0, 105.0, 95.0, 102.0, 101.0])
+    lines: list[str] = []
+    claude_worker.candles.derive_pass(conn, NOW, lines.append)
+    row = conn.execute(
+        "SELECT o,h,l,c,v,source FROM candles WHERE tf='5m' AND open_ts=?", (w,)
+    ).fetchone()
+    assert row is not None
+    o, h, low, c, v, source = row
+    assert (o, c, source) == (100.0, 102.0, "derived")
+    assert h == 107.0, "max of base highs"
+    assert low == 94.0, "min of base lows"
+    assert v == 25.0, "sum of base volumes"
+    assert any("derive 5m: +1" in line for line in lines)
+
+
+def test_derive_skips_incomplete_and_open_windows(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    w_closed = (NOW // (5 * MS_1M)) * (5 * MS_1M) - 10 * MS_1M
+    seed_1m(conn, "binance:btcusdt", w_closed, [100.0, 100.0, 100.0, 100.0])  # 4/5
+    w_open = (NOW // (5 * MS_1M)) * (5 * MS_1M)  # window containing NOW
+    seed_1m(conn, "binance:ethusdt", w_open, [1.0, 1.0, 1.0, 1.0, 1.0])
+    claude_worker.candles.derive_pass(conn, NOW, lambda _line: None)
+    assert conn.execute("SELECT count(*) FROM candles WHERE tf='5m'").fetchone()[0] == 0
+
+
+def test_derive_null_volume_poisons_and_refreshes(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    w = (NOW // (5 * MS_1M)) * (5 * MS_1M) - 5 * MS_1M
+    seed_1m(conn, "tok", w, [0.5, 0.5, 0.5, 0.5, 0.5], volume=None, source="capture")
+    claude_worker.candles.derive_pass(conn, NOW, lambda _line: None)
+    v = conn.execute("SELECT v FROM candles WHERE tf='5m' AND open_ts=?", (w,)).fetchone()
+    assert v == (None,), "volume never fabricated (§9.7)"
+    # A base bar changes (late finalization): the derived row refreshes.
+    conn.execute(
+        "UPDATE candles SET c=0.9 WHERE tf='1m' AND open_ts=?", (w + 4 * MS_1M,)
+    )
+    conn.commit()
+    lines: list[str] = []
+    claude_worker.candles.derive_pass(conn, NOW, lines.append)
+    c = conn.execute("SELECT c FROM candles WHERE tf='5m' AND open_ts=?", (w,)).fetchone()
+    assert c == (0.9,)
+    assert any("refreshed=1" in line for line in lines)
+    # Idempotent afterwards.
+    lines2: list[str] = []
+    claude_worker.candles.derive_pass(conn, NOW, lines2.append)
+    assert any("unchanged=1" in line for line in lines2)
+
+
+def test_derive_4h_from_1h(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    w = (NOW // (4 * MS_1H)) * (4 * MS_1H) - 4 * MS_1H
+    for i, base in enumerate([10.0, 11.0, 9.0, 10.5]):
+        conn.execute(
+            "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+            " VALUES (1,'binance:btcusdt','1h',?,?,?,?,?,2.0,'rest',1)",
+            (w + i * MS_1H, base, base + 1, base - 1, base + 0.5),
+        )
+    conn.commit()
+    claude_worker.candles.derive_pass(conn, NOW, lambda _line: None)
+    row = conn.execute(
+        "SELECT o,h,l,c,v FROM candles WHERE tf='4h' AND open_ts=?", (w,)
+    ).fetchone()
+    assert row == (10.0, 12.0, 8.0, 11.0, 8.0)
+
+
+# ---- C5: §9.7 capture lane ----------------------------------------------
+
+
+TOKEN = "5" * 20  # a PM token-id map name (10..80 digit law)
+
+
+def craft_pm_run(
+    root: pathlib.Path, epoch_ns: int, rows: list[tuple[int, int, int, int, int]]
+) -> None:
+    run_dir = root / f"run-{epoch_ns}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tests.craft.write_ticks_px(run_dir / "pm-ticks.pmlr", rows, epoch_ns)
+
+
+def test_fold_capture_minutes_mid_ohlc_and_skips(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "logs"
+    epoch_ns = NOW * 1_000_000  # wall anchor = NOW ms
+    m0 = NOW - (NOW % MS_1M) + MS_1M  # first full minute after NOW... anchor maps ts0->NOW
+    # Build ticks relative to the anchor: wall = NOW + (ts - ts0)/1e6.
+    ts0 = 1_000
+    def at(wall_ms: int) -> int:
+        return ts0 + (wall_ms - NOW) * 1_000_000
+
+    rows = [
+        (ts0, 42, 400_000, 420_000, 0),                     # anchor tick (mid .41)
+        (at(m0), 42, 400_000, 440_000, 0),                  # minute m0 open  mid .42
+        (at(m0 + 10_000), 42, 500_000, 520_000, 0),         # high .51
+        (at(m0 + 20_000), 42, 300_000, 320_000, 0),         # low .31
+        (at(m0 + 30_000), 42, 440_000, 460_000, 0),         # close .45
+        (at(m0 + 40_000), 42, 0, 460_000, 0),               # one-sided: SKIP
+        (at(m0 + 50_000), 7, 400_000, 420_000, 1),          # unmapped sym: SKIP
+    ]
+    craft_pm_run(root, epoch_ns, rows)
+    bars = claude_worker.candles.fold_capture_minutes(
+        root, {42: TOKEN}, ("pm",), 0, NOW + 10 * MS_1M
+    )
+    bar = bars[(TOKEN, m0)]
+    assert (bar.o, bar.h, bar.low, bar.c, bar.n) == (0.42, 0.51, 0.31, 0.45, 4)
+    # The anchor tick landed in its own (earlier) minute.
+    assert (TOKEN, NOW - (NOW % MS_1M)) in bars
+
+
+def test_upsert_capture_laws(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    minute = NOW - 10 * MS_1M
+    bars = {(TOKEN, minute): claude_worker.candles.MinuteBar(0.4, 0.5, 0.3, 0.45, 9)}
+    ins, ref, kept = claude_worker.candles.upsert_capture(
+        conn, claude_worker.frames.VENUE_POLYMARKET, bars, NOW
+    )
+    assert (ins, ref, kept) == (1, 0, 0)
+    row = conn.execute(
+        "SELECT v, n, source FROM candles WHERE descriptor=? AND open_ts=?", (TOKEN, minute)
+    ).fetchone()
+    assert row == (None, 9, "capture"), "volume NULL, tick-count stored"
+    # Refresh when the fold changed (a minute still filling last cycle).
+    bars2 = {(TOKEN, minute): claude_worker.candles.MinuteBar(0.4, 0.5, 0.3, 0.46, 11)}
+    ins2, ref2, kept2 = claude_worker.candles.upsert_capture(
+        conn, claude_worker.frames.VENUE_POLYMARKET, bars2, NOW
+    )
+    assert (ins2, ref2, kept2) == (0, 1, 0)
+    # A rest row on the PK is never touched.
+    minute2 = NOW - 5 * MS_1M
+    conn.execute(
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+        " VALUES (?,?, '1m', ?, 1,1,1,1, 3.0, 'rest', 1)",
+        (claude_worker.frames.VENUE_POLYMARKET, TOKEN, minute2),
+    )
+    conn.commit()
+    bars3 = {(TOKEN, minute2): claude_worker.candles.MinuteBar(0.4, 0.5, 0.3, 0.45, 2)}
+    _ins3, _ref3, kept3 = claude_worker.candles.upsert_capture(
+        conn, claude_worker.frames.VENUE_POLYMARKET, bars3, NOW
+    )
+    assert kept3 == 1
+    src = conn.execute(
+        "SELECT source FROM candles WHERE descriptor=? AND open_ts=?", (TOKEN, minute2)
+    ).fetchone()
+    assert src == ("rest",)
+
+
+def test_drift_check_reports_and_warns(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    minute = NOW - 10 * MS_1M
+    desc = "binance:btcusdt"
+    conn.execute(
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+        " VALUES (1,?, '1m', ?, 100,101,99,100.0, 3.0, 'rest', 1)",
+        (desc, minute),
+    )
+    conn.commit()
+    capture = {
+        (desc, minute): claude_worker.candles.MinuteBar(100.0, 101.0, 99.0, 100.5, 30)
+    }
+    lines: list[str] = []
+    claude_worker.candles.drift_check(conn, 1, capture, 20.0, lines.append)
+    assert len(lines) == 1
+    assert "minutes=1" in lines[0] and "max=50.00bps" in lines[0] and "WARN" in lines[0]
+    lines2: list[str] = []
+    claude_worker.candles.drift_check(conn, 1, capture, 100.0, lines2.append)
+    assert "WARN" not in lines2[0]
+
+
+def test_sym_maps_pick_laws() -> None:
+    markets = {
+        TOKEN: 42,
+        "bitcoin-up-or-down-on-august-22-2026": 42,  # slug alias, not the descriptor
+        "binance:btcusdt": 7,
+        "okx:BTC-USDT": 200,
+    }
+    pm, bn = claude_worker.candles.sym_maps(markets)
+    assert pm == {42: TOKEN}
+    assert bn == {7: "binance:btcusdt"}
+
+
+def test_capture_and_derive_end_to_end(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    root = tmp_path / "logs"
+    ts0 = 1_000
+    w = (NOW // (5 * MS_1M)) * (5 * MS_1M) - 10 * MS_1M  # closed 5m window
+    # The dir-name epoch anchors the FIRST tick's wall (harness law):
+    # epoch = w ⇒ tick i (1 min apart on the monotonic clock) lands
+    # exactly on minute w + i.
+    epoch_ns = w * 1_000_000
+    rows: list[tuple[int, int, int, int, int]] = [
+        (ts0 + i * MS_1M * 1_000_000, 42, 400_000, 420_000, 0) for i in range(5)
+    ]
+    craft_pm_run(root, epoch_ns, rows)
+    lines: list[str] = []
+    claude_worker.candles.capture_and_derive(
+        conn, root, {TOKEN: 42}, NOW, {}, lines.append
+    )
+    caps = conn.execute(
+        "SELECT count(*) FROM candles WHERE source='capture' AND tf='1m'"
+    ).fetchone()[0]
+    assert caps == 5
+    derived = conn.execute(
+        "SELECT v, n, source FROM candles WHERE tf='5m' AND open_ts=?", (w,)
+    ).fetchone()
+    assert derived is not None
+    assert derived[0] is None, "NULL volume flows through the derive chain"
+    assert derived[2] == "derived"
+    assert any("capture pm" in line for line in lines)
+
+
+def test_capture_and_derive_missing_root_skips(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    lines: list[str] = []
+    claude_worker.candles.capture_and_derive(
+        conn, tmp_path / "absent", {TOKEN: 42}, NOW, {}, lines.append
+    )
+    assert any("skipped" in line for line in lines)
+    assert any("derive 5m" in line for line in lines), "derive still runs"
 
 
 def test_main_no_lanes_and_unusable_universe(tmp_path: pathlib.Path) -> None:

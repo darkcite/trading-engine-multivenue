@@ -66,9 +66,11 @@ import typing
 
 import httpx
 
+import claude_worker.cli
 import claude_worker.features
 import claude_worker.fetchers
 import claude_worker.frames
+import claude_worker.pmlr
 
 CANDLES_DB_ENV: str = "CLAUDE_WORKER_CANDLES_DB"
 DEFAULT_DB_PATH: str = "~/multivenue/worker/candles.db"
@@ -118,6 +120,7 @@ CREATE TABLE IF NOT EXISTS candles (
   open_ts    INTEGER NOT NULL,
   o REAL, h REAL, l REAL, c REAL,
   v REAL,
+  n INTEGER,
   source     TEXT    NOT NULL CHECK (source IN ('rest','derived','capture')),
   fetched_ts INTEGER NOT NULL,
   PRIMARY KEY (venue, descriptor, tf, open_ts)
@@ -166,11 +169,16 @@ class Lane(typing.NamedTuple):
 
 
 def open_db(path: pathlib.Path) -> sqlite3.Connection:
-    """Open/create the store (WAL; §9.4 schema)."""
+    """Open/create the store (WAL; §9.4 schema + the §9.7 ``n``
+    tick-count column — NULL except on capture bars)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    # C4→C5 migration: pre-`n` stores gain the column in place.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(candles)")}
+    if "n" not in cols:
+        conn.execute("ALTER TABLE candles ADD COLUMN n INTEGER")
     return conn
 
 
@@ -605,6 +613,332 @@ def fill_okx_backward(
     return FillStats(pages, len(keep), stats, budget_out=False, failed=False)
 
 
+# ---- §9.5 derive + §9.7 capture lanes (C5) ------------------------------
+
+# (tf_out, tf_base, bars_per_window, window_ms) — derived EXACTLY:
+# O = first, H = max, L = min, C = last, V = sum (NULL-poisoning: any
+# NULL base volume ⇒ NULL — volume is never fabricated, §9.7).
+DERIVED_TFS: tuple[tuple[str, str, int, int], ...] = (
+    ("5m", "1m", 5, 5 * MS_1M),
+    ("15m", "1m", 15, 15 * MS_1M),
+    ("4h", "1h", 4, 4 * MS_1H),
+)
+
+CAPTURE_WINDOW_H_ENV: str = "CLAUDE_WORKER_CANDLES_CAPTURE_WINDOW_H"
+CAPTURE_WINDOW_H_DEFAULT: int = 26  # daily-restart run + margin
+DRIFT_WINDOW_H_ENV: str = "CLAUDE_WORKER_CANDLES_DRIFT_WINDOW_H"
+DRIFT_WINDOW_H_DEFAULT: int = 6
+DRIFT_WARN_BPS_ENV: str = "CLAUDE_WORKER_CANDLES_DRIFT_WARN_BPS"
+DRIFT_WARN_BPS_DEFAULT: float = 20.0
+
+
+def derive_pass(
+    conn: sqlite3.Connection,
+    now_ms: int,
+    report: collections.abc.Callable[[str], None],
+) -> None:
+    """§9.5: recompute 5m/15m/4h from the stored finer bases (rest +
+    capture rows), store back ``source=derived``. Only COMPLETE,
+    CLOSED windows (all ``k`` base bars present, window end ≤ now) —
+    a window still missing base bars materializes once §9.6 fills
+    them. Derived rows are a CACHE: they refresh freely when a base
+    finalization changes them (immutability protects fetched rest
+    bars only). Bounded by construction: 1m bases are rolling 48 h
+    (+ PM capture), 1h bases rolling 90 d."""
+    for tf_out, tf_base, k, ms_out in DERIVED_TFS:
+        rows = conn.execute(
+            "SELECT venue, descriptor, open_ts, o, h, l, c, v FROM candles"
+            " WHERE tf=? AND source IN ('rest','capture')"
+            " ORDER BY venue, descriptor, open_ts",
+            (tf_base,),
+        ).fetchall()
+        made = 0
+        refreshed = 0
+        unchanged = 0
+        bucket: list[tuple[int, float, float, float, float, float | None]] = []
+        cur: tuple[int, str, int] | None = None  # (venue, descriptor, window)
+
+        def flush() -> None:
+            nonlocal made, refreshed, unchanged
+            if cur is None or len(bucket) != k:
+                return
+            venue, descriptor, window = cur
+            if window + ms_out > now_ms:
+                return  # window still open
+            o = bucket[0][1]
+            h = max(b[2] for b in bucket)
+            low = min(b[3] for b in bucket)
+            c = bucket[-1][4]
+            vols = [b[5] for b in bucket]
+            v = None if any(x is None for x in vols) else sum(typing.cast(list[float], vols))
+            row = conn.execute(
+                "SELECT o,h,l,c,v,source FROM candles"
+                " WHERE venue=? AND descriptor=? AND tf=? AND open_ts=?",
+                (venue, descriptor, tf_out, window),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO candles"
+                    " (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (venue, descriptor, tf_out, window, o, h, low, c, v, SOURCE_DERIVED, now_ms),
+                )
+                made += 1
+                return
+            if row[5] != SOURCE_DERIVED:
+                return  # never touch a non-derived row (tf spaces disjoint by law)
+            if (row[0], row[1], row[2], row[3], row[4]) == (o, h, low, c, v):
+                unchanged += 1
+                return
+            conn.execute(
+                "UPDATE candles SET o=?,h=?,l=?,c=?,v=?,fetched_ts=?"
+                " WHERE venue=? AND descriptor=? AND tf=? AND open_ts=?",
+                (o, h, low, c, v, now_ms, venue, descriptor, tf_out, window),
+            )
+            refreshed += 1
+
+        for venue, descriptor, open_ts, o, h, low, c, v in rows:
+            window = open_ts - (open_ts % ms_out)
+            key = (venue, descriptor, window)
+            if key != cur:
+                flush()
+                cur = key
+                bucket = []
+            bucket.append((open_ts, o, h, low, c, v))
+        flush()
+        conn.commit()
+        report(
+            f"candles: derive {tf_out}: +{made} refreshed={refreshed} unchanged={unchanged}"
+        )
+
+
+class MinuteBar(typing.NamedTuple):
+    """One folded capture minute (§9.7): mid-price OHLC + tick count."""
+
+    o: float
+    h: float
+    low: float
+    c: float
+    n: int
+
+
+def _run_anchor_ns(run_dir: pathlib.Path) -> int | None:
+    """The run's monotonic anchor — min first-ts across its readable
+    tick files (the harness §3.3 / monitor RunSpan law)."""
+    anchor: int | None = None
+    for path in sorted(run_dir.glob("*-ticks.pmlr")):
+        try:
+            with claude_worker.pmlr.Reader(path) as reader:
+                if reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK or len(reader) == 0:
+                    continue
+                first = reader.tick(0).ts_ns
+        except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+            continue
+        anchor = first if anchor is None else min(anchor, first)
+    return anchor
+
+
+def fold_capture_minutes(
+    replay_root: pathlib.Path,
+    sym_to_desc: dict[int, str],
+    venue_labels: tuple[str, ...],
+    lo_ms: int,
+    now_ms: int,
+) -> dict[tuple[str, int], MinuteBar]:
+    """Walk the capture (runs overlapping ``[lo, now]``, given venue
+    tick files only) → per (descriptor, minute) mid-price OHLC +
+    tick-count. Wall mapping is the harness law:
+    ``wall = epoch_ns + (ts − run_anchor)``. One-sided ticks (a zero
+    bid or ask) are skipped — a fabricated mid is worse than a gap."""
+    out: dict[tuple[str, int], MinuteBar] = {}
+    for run_dir in claude_worker.features.run_dirs(replay_root):
+        try:
+            epoch_ns = int(run_dir.name[len("run-") :])
+        except ValueError:
+            continue
+        # A run spans at most ~a day (daily restart); cheap skip for
+        # runs that cannot reach the window.
+        if epoch_ns // 1_000_000 + 36 * MS_1H < lo_ms:
+            continue
+        anchor = _run_anchor_ns(run_dir)
+        if anchor is None:
+            continue
+        for label in venue_labels:
+            path = run_dir / f"{label}-ticks.pmlr"
+            if not path.is_file():
+                continue
+            try:
+                with claude_worker.pmlr.Reader(path) as reader:
+                    if (
+                        reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK
+                        or len(reader) == 0
+                    ):
+                        continue
+                    for tick in reader.ticks():
+                        desc = sym_to_desc.get(tick.sym)
+                        if desc is None or tick.bid_px <= 0 or tick.ask_px <= 0:
+                            continue
+                        wall_ms = (epoch_ns + (tick.ts_ns - anchor)) // 1_000_000
+                        if wall_ms < lo_ms or wall_ms >= now_ms:
+                            continue
+                        minute = wall_ms - (wall_ms % MS_1M)
+                        mid = tick.mid() / 1_000_000
+                        key = (desc, minute)
+                        bar = out.get(key)
+                        if bar is None:
+                            out[key] = MinuteBar(mid, mid, mid, mid, 1)
+                        else:
+                            out[key] = MinuteBar(
+                                bar.o,
+                                mid if mid > bar.h else bar.h,
+                                mid if mid < bar.low else bar.low,
+                                mid,
+                                bar.n + 1,
+                            )
+            except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+                continue
+    return out
+
+
+def upsert_capture(
+    conn: sqlite3.Connection,
+    venue: int,
+    bars: dict[tuple[str, int], MinuteBar],
+    now_ms: int,
+) -> tuple[int, int, int]:
+    """§9.7 store lane: capture bars land only where no REST row holds
+    the PK (rest supersedes capture, never the reverse); existing
+    capture rows refresh when the fold changed them (a still-filling
+    minute at the previous cycle). ``v`` stays NULL — we capture BBO,
+    volume is never fabricated. Returns (inserted, refreshed,
+    rest_kept)."""
+    inserted = 0
+    refreshed = 0
+    rest_kept = 0
+    for (descriptor, minute), bar in sorted(bars.items()):
+        row = conn.execute(
+            "SELECT o,h,l,c,n,source FROM candles"
+            " WHERE venue=? AND descriptor=? AND tf='1m' AND open_ts=?",
+            (venue, descriptor, minute),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO candles"
+                " (venue,descriptor,tf,open_ts,o,h,l,c,v,n,source,fetched_ts)"
+                " VALUES (?,?,'1m',?,?,?,?,?,NULL,?,?,?)",
+                (venue, descriptor, minute, bar.o, bar.h, bar.low, bar.c, bar.n, SOURCE_CAPTURE, now_ms),
+            )
+            inserted += 1
+            continue
+        if row[5] != SOURCE_CAPTURE:
+            rest_kept += 1
+            continue
+        if (row[0], row[1], row[2], row[3], row[4]) == (bar.o, bar.h, bar.low, bar.c, bar.n):
+            continue
+        conn.execute(
+            "UPDATE candles SET o=?,h=?,l=?,c=?,n=?,fetched_ts=?"
+            " WHERE venue=? AND descriptor=? AND tf='1m' AND open_ts=?",
+            (bar.o, bar.h, bar.low, bar.c, bar.n, now_ms, venue, descriptor, minute),
+        )
+        refreshed += 1
+    conn.commit()
+    return inserted, refreshed, rest_kept
+
+
+def drift_check(
+    conn: sqlite3.Connection,
+    venue: int,
+    capture: dict[tuple[str, int], MinuteBar],
+    warn_bps: float,
+    report: collections.abc.Callable[[str], None],
+) -> None:
+    """§9.7 job (2): REST candles cross-checked against what our own
+    sockets saw — close-vs-close in bps over the overlapping minutes.
+    Report-only; a WARN line when the max drift crosses the
+    threshold."""
+    per_desc: dict[str, list[float]] = {}
+    for (descriptor, minute), bar in capture.items():
+        row = conn.execute(
+            "SELECT c FROM candles"
+            " WHERE venue=? AND descriptor=? AND tf='1m' AND open_ts=? AND source='rest'",
+            (venue, descriptor, minute),
+        ).fetchone()
+        if row is None or row[0] is None or row[0] == 0:
+            continue
+        rest_close = typing.cast(float, row[0])
+        bps = abs(rest_close - bar.c) / rest_close * 10_000.0
+        per_desc.setdefault(descriptor, []).append(bps)
+    for descriptor in sorted(per_desc):
+        samples = per_desc[descriptor]
+        worst = max(samples)
+        mean = sum(samples) / len(samples)
+        flag = " WARN" if worst > warn_bps else ""
+        report(
+            f"candles: drift {descriptor}: minutes={len(samples)}"
+            f" mean={mean:.2f}bps max={worst:.2f}bps{flag}"
+        )
+
+
+def sym_maps(markets: dict[str, int]) -> tuple[dict[int, str], dict[int, str]]:
+    """Invert the worker market map for the §9.7 lanes: PM syms →
+    token-id descriptor (the all-digit map name, §9.4), BN syms →
+    ``binance:*`` spot descriptor (drift lane). Sorted iteration ⇒
+    deterministic pick when a sym carries several names."""
+    pm: dict[int, str] = {}
+    bn: dict[int, str] = {}
+    for name in sorted(markets):
+        sym = markets[name]
+        if name.isdigit() and PM_TOKEN_RUN_MIN <= len(name) <= PM_TOKEN_MAX:
+            pm.setdefault(sym, name)
+        elif name.startswith("binance:"):
+            bn.setdefault(sym, name)
+    return pm, bn
+
+
+PM_TOKEN_RUN_MIN: int = claude_worker.fetchers.PM_TOKEN_RUN_MIN
+PM_TOKEN_MAX: int = claude_worker.fetchers.PM_TOKEN_MAX
+
+
+def capture_and_derive(
+    conn: sqlite3.Connection,
+    replay_root: pathlib.Path,
+    markets: dict[str, int],
+    now_ms: int,
+    env: collections.abc.Mapping[str, str],
+    report: collections.abc.Callable[[str], None],
+    capture_backfill: bool = False,
+) -> None:
+    """The C5 tail of one cycle: PM capture store lane → BN drift
+    check → §9.5 derive pass. Missing replay root / empty map =
+    reported skip, never an error (best-effort law)."""
+    if not replay_root.is_dir():
+        report(f"candles: capture lane skipped — no replay root {replay_root}")
+        derive_pass(conn, now_ms, report)
+        return
+    pm_map, bn_map = sym_maps(markets)
+    cap_h = int(env.get(CAPTURE_WINDOW_H_ENV, "") or CAPTURE_WINDOW_H_DEFAULT)
+    drift_h = int(env.get(DRIFT_WINDOW_H_ENV, "") or DRIFT_WINDOW_H_DEFAULT)
+    warn_bps = float(env.get(DRIFT_WARN_BPS_ENV, "") or DRIFT_WARN_BPS_DEFAULT)
+    if pm_map:
+        pm_lo = 0 if capture_backfill else now_ms - cap_h * MS_1H
+        pm_bars = fold_capture_minutes(replay_root, pm_map, ("pm",), pm_lo, now_ms)
+        ins, ref, kept = upsert_capture(
+            conn, claude_worker.frames.VENUE_POLYMARKET, pm_bars, now_ms
+        )
+        report(
+            f"candles: capture pm: minutes={len(pm_bars)} +{ins} refreshed={ref}"
+            f" rest_kept={kept}"
+        )
+    else:
+        report("candles: capture pm: no PM token names in the market map — skipped")
+    if bn_map:
+        bn_bars = fold_capture_minutes(
+            replay_root, bn_map, ("bn",), now_ms - drift_h * MS_1H, now_ms
+        )
+        drift_check(conn, claude_worker.frames.VENUE_BINANCE, bn_bars, warn_bps, report)
+    derive_pass(conn, now_ms, report)
+
+
 # ---- one cycle -----------------------------------------------------------
 
 
@@ -619,7 +953,12 @@ def run_cycle(
 ) -> None:
     """One §9.6 cycle over every lane × target × base tf. Budgets are
     per VENUE (fetchers convention); tf order 1m → 1h → 1d so the
-    freshest window always fills first."""
+    freshest window always fills first. Targets ROTATE by cycle hour:
+    a backward lane whose walk exceeds the leftover budget would
+    otherwise be discarded every cycle behind the same earlier
+    siblings (observed live 2026-08-22: okx ETH-USDT-SWAP's 29-page
+    1m walk vs 27 remaining) — rotation lets every target lead a
+    cycle eventually, so every backfill completes."""
     budgets: dict[int, claude_worker.features.RestBudget] = {}
     for lane in lanes:
         budgets.setdefault(
@@ -630,7 +969,9 @@ def run_cycle(
         )
     for lane in lanes:
         budget = budgets[lane.venue]
-        for target in lane.targets:
+        rot = (now_ms // 3_600_000) % len(lane.targets) if lane.targets else 0
+        rotated = lane.targets[rot:] + lane.targets[:rot]
+        for target in rotated:
             for tf in FETCHED_TFS:
                 if lane.backward:
                     st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env)
@@ -691,6 +1032,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", default=None)
     parser.add_argument("--budget-per-h", type=int, default=None)
     parser.add_argument("--now-ms", type=int, default=None, help="tests only")
+    parser.add_argument(
+        "--capture-backfill",
+        action="store_true",
+        help="one-shot: fold PM capture minutes over the WHOLE replay"
+        " root, not just the rolling window (operator-invoked)",
+    )
     args = parser.parse_args(argv)
     env = os.environ
     universe = pathlib.Path(
@@ -720,6 +1067,27 @@ def main(argv: list[str] | None = None) -> int:
                 env,
                 lambda line: print(line, file=sys.stderr),
             )
+        # C5 tail: PM capture store + BN drift + §9.5 derive.
+        replay_root = pathlib.Path(
+            env.get("CLAUDE_WORKER_REPLAY_DIR", "") or "~/multivenue/logs"
+        ).expanduser()
+        map_path = pathlib.Path(
+            env.get("CLAUDE_WORKER_MARKET_MAP", "") or "~/multivenue/worker/market-map.json"
+        ).expanduser()
+        try:
+            markets = claude_worker.cli.load_market_map(map_path).markets
+        except ValueError as e:
+            print(f"candles: market map unusable ({e}) — capture lane skipped", file=sys.stderr)
+            markets = {}
+        capture_and_derive(
+            conn,
+            replay_root,
+            markets,
+            now_ms,
+            env,
+            lambda line: print(line, file=sys.stderr),
+            capture_backfill=args.capture_backfill,
+        )
         total = conn.execute("SELECT count(*) FROM candles").fetchone()[0]
         conflicts = conn.execute("SELECT count(*) FROM candle_conflicts").fetchone()[0]
         stamp = datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc)

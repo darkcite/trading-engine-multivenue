@@ -52,6 +52,27 @@ def write_run(
     return run_dir
 
 
+def write_ticks_px(
+    path: pathlib.Path,
+    rows: list[tuple[int, int, int, int, int]],
+    epoch_ns: int,
+) -> None:
+    """M3-C5 builder: one v2 tick file with EXPLICIT per-slot prices —
+    ``rows`` = (ts_ns, sym, bid_px, ask_px, venue), fixed-point 1e6
+    (the capture-derived candle tests need controlled mids)."""
+    header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
+        claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
+    )
+    blob = bytearray(header + bytes(_HDR - len(header)))
+    for i, (ts, sym, bid_px, ask_px, venue) in enumerate(rows):
+        slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
+            ts, sym, i + 1, bid_px, 1_000_000, ask_px, 1_000_000, venue
+        )
+        blob.extend(slot + bytes(_SLOT - len(slot)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(blob))
+
+
 def seed_committed_ruleset(
     state: claude_worker.state.State,
     tmp_path: pathlib.Path,

@@ -213,6 +213,13 @@ Operational laws:
   `sqlite3 ~/multivenue/worker/candles.db "SELECT descriptor, tf,
   count(*) FROM candles GROUP BY 1,2"`. Manual cycle:
   `./scripts/candles-cycle.sh` (skips itself if one is running).
+  Each cycle also runs the §9.5/§9.7 tail: 5m/15m/4h derived exactly
+  from the stored bases (source=derived, cached, complete closed
+  windows only); PM capture-derived 1m mid-OHLC + tick-count (`n`
+  column, volume NULL — never fabricated) from the replay root; and
+  the Binance REST-vs-socket drift report (WARN over
+  `CLAUDE_WORKER_CANDLES_DRIFT_WARN_BPS`). One-shot full-history PM
+  fold: `uv run python -m claude_worker.candles --capture-backfill`.
 
 ## Troubleshooting
 
