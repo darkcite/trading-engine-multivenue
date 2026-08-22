@@ -35,6 +35,12 @@ usdm = []
 instruments = []
 # Also subscribe the 400-level books channel (capture + integrity only).
 depth = false
+# M2.2 capped options chain — same law as [deribit] below, but
+# underlyings are OKX `uly` families (e.g. "BTC-USD", "ETH-USD");
+# discovered instruments subscribe bbo-tbt ONLY (opt-summary at M2.3).
+options_underlyings = []   # e.g. ["BTC-USD", "ETH-USD"] — empty/absent = lane OFF
+# options_expiries = 2     # E: nearest expiries, 1..=4 (default 2)
+# options_strikes = 8      # K: even, 2..=32 (default 8 = ATM±4)
 
 [deribit]
 instruments = []

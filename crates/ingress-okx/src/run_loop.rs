@@ -61,20 +61,24 @@ use crate::{
 pub const RX_BUF_SIZE: usize = 256 * 1024;
 
 /// Tx buffer: handshake + one batched subscribe op (~46 B per arg ×
-/// [`MAX_SUB_ARGS`]) + resync pairs + pings.
-pub const TX_BUF_SIZE: usize = 8 * 1024;
+/// [`MAX_SUB_ARGS`] = 144 args ≈ 6.7 KiB with a full M2.2 options
+/// block) + resync pairs + pings. 16 KiB keeps ≥2× margin
+/// (boot-time allocation).
+pub const TX_BUF_SIZE: usize = 16 * 1024;
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
 pub const TICK_RING_CAP: usize = 16_384;
 
-/// Upper bound on `(channel × instrument)` subscribe args:
-/// 5 channels × [`OKX_MAX_SYMBOLS`].
-pub const MAX_SUB_ARGS: usize = 5 * OKX_MAX_SYMBOLS;
+/// Upper bound on `(channel × instrument)` subscribe args (M2.2
+/// partition law): up to 5 channels per STATIC instrument
+/// ([`crate::OKX_STATIC_MAX`]) + exactly one `bbo-tbt` arg per OPTION
+/// row ([`crate::OKX_OPT_MAX`]) = 80 + 64 = 144.
+pub const MAX_SUB_ARGS: usize = 5 * crate::OKX_STATIC_MAX + crate::OKX_OPT_MAX;
 
-/// Stack scratch for one rendered subscribe batch (~46 B/arg × 80
-/// args ≈ 3.7 KiB; doubled for margin).
-const SUBSCRIBE_SCRATCH: usize = 8 * 1024;
+/// Stack scratch for one rendered subscribe batch (~46 B/arg × 144
+/// args ≈ 6.7 KiB; ~2× margin).
+const SUBSCRIBE_SCRATCH: usize = 12 * 1024;
 
 /// Max `trades` rows whose `seqId` is chain-checked per push; rows
 /// beyond this are still counted as messages (OKX batches trades in
@@ -422,6 +426,13 @@ fn build_sub_args<'a>(
     while let Some((inst, _sym, inst_type)) = symbols.get(i) {
         out[n] = Some(SubArg { channel: OkxChannel::BboTbt, inst_id: inst });
         n += 1;
+        // M2.2: capped-chain OPTION rows are bbo-tbt ONLY — no
+        // trades/mark/funding/books (the mark/IV `opt-summary`
+        // stream arrives at M2.3).
+        if inst_type == OkxInstType::Option {
+            i += 1;
+            continue;
+        }
         out[n] = Some(SubArg { channel: OkxChannel::Trades, inst_id: inst });
         n += 1;
         if matches!(inst_type, OkxInstType::Swap | OkxInstType::Futures) {
@@ -1000,6 +1011,35 @@ mod tests {
         t.insert(b"BTC-USDT", SYM_BTC, OkxInstType::Spot).unwrap();
         t.insert(b"ETH-USD-SWAP", (2 << 24) | 2, OkxInstType::Swap).unwrap();
         t
+    }
+
+    #[test]
+    fn sub_args_option_rows_are_bbo_tbt_only() {
+        // M2.2: an OPTION row contributes exactly one bbo-tbt arg —
+        // no trades/mark/funding, and depth never touches it.
+        let mut t = test_symbols(); // spot: 2 args; swap: 4 args (no depth)
+        t.insert(b"BTC-USD-260327-100000-C", (2 << 24) | 513, OkxInstType::Option)
+            .unwrap();
+        let mut buf: [Option<SubArg<'_>>; MAX_SUB_ARGS] = [None; MAX_SUB_ARGS];
+        let n = build_sub_args(&t, false, &mut buf);
+        // spot(bbo,trades)=2 + swap(bbo,trades,mark,funding)=4 + option(bbo)=1.
+        assert_eq!(n, 7);
+        let opt_args: Vec<_> = buf[..n]
+            .iter()
+            .map(|a| a.unwrap())
+            .filter(|a| a.inst_id == b"BTC-USD-260327-100000-C")
+            .collect();
+        assert_eq!(opt_args.len(), 1);
+        assert_eq!(opt_args[0].channel, OkxChannel::BboTbt);
+        // Depth adds books for non-option rows only.
+        let n_depth = build_sub_args(&t, true, &mut buf);
+        assert_eq!(n_depth, 9); // +1 books each for spot + swap, none for the option
+        let opt_args_depth = buf[..n_depth]
+            .iter()
+            .map(|a| a.unwrap())
+            .filter(|a| a.inst_id == b"BTC-USD-260327-100000-C")
+            .count();
+        assert_eq!(opt_args_depth, 1);
     }
 
     fn steady_driver(depth: bool) -> Driver {

@@ -68,9 +68,24 @@ use core_types::{NsTs, SymbolId};
 /// margin. Table rows are fixed at this width.
 pub const OKX_INST_ID_MAX: usize = 32;
 
-/// Maximum number of configured instruments per connection. Fixed-cap
-/// tables everywhere; boot fails fast beyond this.
-pub const OKX_MAX_SYMBOLS: usize = 16;
+/// Maximum CONFIGURED (static) instruments per connection — the
+/// pre-M2 law, unchanged: these subscribe the full type-gated channel
+/// set. Fixed-cap tables everywhere; boot fails fast beyond this.
+pub const OKX_STATIC_MAX: usize = 16;
+
+/// Maximum boot-DISCOVERED capped-chain OPTION instruments per
+/// connection (M2.2, docs/m2-progress.md design entry). Options
+/// subscribe `bbo-tbt` ONLY (`opt-summary` mark/IV arrives at M2.3).
+/// Sized so the default policy (2 underlyings × E2 × K8 × C/P = 64)
+/// fits exactly; a larger configured policy fails fast at table build
+/// with an actionable message.
+pub const OKX_OPT_MAX: usize = 64;
+
+/// Total symbol-table capacity: the static block + the options block.
+/// The single sizing constant for per-row state arrays (book chains /
+/// trade seqs — options rows never use them, but row-indexed arrays
+/// stay uniform).
+pub const OKX_MAX_SYMBOLS: usize = OKX_STATIC_MAX + OKX_OPT_MAX;
 
 /// OKX instrument class, as discovered from the REST instruments
 /// endpoint at boot (8e). Drives WS channel gating: `mark-price`
@@ -85,18 +100,24 @@ pub enum OkxInstType {
     Swap = 1,
     /// `instType == "FUTURES"` — dated futures (mark, no funding).
     Futures = 2,
+    /// `instType == "OPTION"` — M2.2 capped-chain options
+    /// (`bbo-tbt`-only subscription; `opt-summary` arrives at M2.3).
+    Option = 3,
 }
 
 impl OkxInstType {
-    /// Decode the venue's `instType` string. Only the three classes
-    /// Phase 8 fetches are legal; anything else (OPTION, MARGIN,
-    /// EVENTS) is a contract violation at this layer.
+    /// Decode the venue's `instType` string. The legacy pages accept
+    /// SPOT/SWAP/FUTURES; OPTION decodes for the M2.2 options pages
+    /// (per-page contract enforced by the discovery `RowMode` — an
+    /// OPTION row on a legacy page is still a violation); anything
+    /// else (MARGIN, EVENTS) is a contract violation at this layer.
     #[inline]
     pub fn from_bytes(s: &[u8]) -> Option<Self> {
         match s {
             b"SPOT" => Some(Self::Spot),
             b"SWAP" => Some(Self::Swap),
             b"FUTURES" => Some(Self::Futures),
+            b"OPTION" => Some(Self::Option),
             _ => None,
         }
     }
@@ -108,6 +129,7 @@ impl OkxInstType {
             Self::Spot => "SPOT",
             Self::Swap => "SWAP",
             Self::Futures => "FUTURES",
+            Self::Option => "OPTION",
         }
     }
 }
@@ -1058,9 +1080,13 @@ mod tests {
         assert_eq!(OkxInstType::from_bytes(b"SPOT"), Some(OkxInstType::Spot));
         assert_eq!(OkxInstType::from_bytes(b"SWAP"), Some(OkxInstType::Swap));
         assert_eq!(OkxInstType::from_bytes(b"FUTURES"), Some(OkxInstType::Futures));
-        assert_eq!(OkxInstType::from_bytes(b"OPTION"), None);
+        // M2.2: OPTION decodes (the per-page contract lives in the
+        // discovery RowMode — legacy pages still reject option rows).
+        assert_eq!(OkxInstType::from_bytes(b"OPTION"), Some(OkxInstType::Option));
+        assert_eq!(OkxInstType::from_bytes(b"MARGIN"), None);
         assert_eq!(OkxInstType::from_bytes(b""), None);
         assert_eq!(OkxInstType::Swap.as_str(), "SWAP");
+        assert_eq!(OkxInstType::Option.as_str(), "OPTION");
     }
 
     #[test]

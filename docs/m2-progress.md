@@ -410,3 +410,169 @@ commit ask to the operator, then M2.2 (OKX options: same v5 stack,
 `instType=OPTION` discovery, `bbo-tbt` subs, `[okx]` options keys in
 core-config — grammar already speaks integers, so the M2.2
 core-config diff is slot wiring only).
+
+---
+
+## 2026-08-22 — M2.1 COMMITTED `d0e14d4` (operator-authorized); M2.2 OKX options CODE-COMPLETE (same session)
+
+M2.1 landed as `d0e14d4` (14 explicit paths, `M2:` prefix; only M3's
+`docs/m3-progress.md` remained dirty after — clean handoff). Operator
+go for M2.2 in the same message.
+
+### core-config (SHARED, additive — second sequential touch)
+
+- `[okx] options_underlyings / options_expiries / options_strikes` →
+  `Universe.okx_options` (underlyings are OKX **uly families**, e.g.
+  `"BTC-USD"`). The M2.1 validation block generalized into ONE
+  venue-labeled `finalize_options_policy` helper (no duplicated law;
+  deribit messages keep their M2.1 shape, okx errors say `OKX …`).
+  Grammar untouched — the integer extension was M2.1's.
+- Scope pin updated: `[deribit]` + `[okx]` accept the keys;
+  `[binance]`/`[polymarket]`/`[hyperliquid]` still reject
+  (test-pinned; `[binance]` flips at M2.4).
+- Tests 55 → **58** (okx carry/validate/coexist + scope flip;
+  `full_src` example carries okx options keys through allocation
+  untouched).
+
+### ingress-okx
+
+- `OkxInstType` gains `Option` (`from_bytes` decodes `OPTION`; the
+  per-page contract lives in the discovery `RowMode` — a legacy page
+  still rejects option rows, both directions test-pinned).
+- discovery: `ingest_options_body` (`RowMode::Option`: requires
+  `stk`/`expTime`/`optType`; quoted-string numbers per this venue —
+  `stk` via the quoted 1e9 scanner, `expTime` quoted-digit ms parse
+  (×1e9 scanners overflow), `optType` `"C"|"P"`; empty forms of all
+  three legal on NON-option rows and skipped); row gains
+  `is_call/strike_1e9/exp_ms`; `rows()` accessor; shared
+  `OKX_DISCOVERY_ROWS_CAP = 16 384` already covers a full uly chain —
+  no separate options cap needed (unlike Deribit's 1024→4096).
+- `parse_index_price` (`/api/v5/market/index-tickers?instId=<uly>`,
+  quoted `idxPx`; the uly IS the index instId — no name mapping) —
+  proptest + NEW fuzz target `okx_index_price`.
+- `select_capped_chain` — the M2 selection LAW **twinned verbatim**
+  from the Deribit original (doc header names the law source; the
+  SAME proptest invariants pin both — cap, candidate filter,
+  deterministic expiry→strike→C/P order). Unification into a shared
+  home deferred to M2.4 when BN eapi becomes the third consumer
+  (rule of three) — recorded as a deliberate twin, not drift.
+- Sizing partition law (the Deribit pattern, but NO table partition
+  field — the `OkxInstType::Option` tag IS the discriminator):
+  `OKX_STATIC_MAX = 16` (old law) + `OKX_OPT_MAX = 64` ⇒
+  `OKX_MAX_SYMBOLS = 80`; `MAX_SUB_ARGS = 5×16 + 64 = 144`
+  (options are **bbo-tbt ONLY** — one arg each; `opt-summary` is
+  M2.3); `TX_BUF 8→16 KiB`, `SUBSCRIBE_SCRATCH 8→12 KiB`.
+  `build_sub_args`: Option rows short-circuit after the bbo-tbt arg
+  (no trades/mark/funding/books, depth never touches them —
+  test-pinned). OKX has per-arg SubAcks (no Deribit-style mask) —
+  ack machinery unchanged, capacities follow MAX_SUB_ARGS.
+- Tests 61 → **72** (option grid fixtures in the quoted wire shape,
+  contract both directions, missing/bad chain fields, fractional
+  strike `"0.5"`, index-price shapes incl. bare-number rejection,
+  selection determinism/one-sided/missing-twin/cap, bbo-only
+  sub-args; +2 proptests mirroring the Deribit invariants).
+- Fuzz: `okx_instruments` extended (options walker + selection cap +
+  index parser on the same corpus); NEW target `okx_index_price`.
+
+### cli
+
+- `build_okx_symbol_table` caps static at `OKX_STATIC_MAX` (table
+  capacity is 80 now); NEW `extend_okx_table_with_options` (inserts
+  with `OkxInstType::Option`; dup + `OKX_OPT_MAX` fail-fast — the
+  existing-options count is DERIVED from the table so the cap holds
+  across calls).
+- boot_discovery: `run_okx_options` (per uly: index-tickers + OPTION
+  page, 150 ms pacing — the OKX page cadence; fatal index; `no_chain`
+  MISSING; ordinals `make_symbol_id(Okx, OPT_ORDINAL_BASE + k + 1)`
+  in selection order). `run_all` okx arm: options-only `[okx]` boots
+  the venue (empty static table + chain); the chain is appended to
+  `okx_table` INSIDE run_all (unlike deribit, whose table builds
+  bin-side); `Outcome.okx_options` carries the pairs for gauge +
+  logging.
+- universe_boot: `okx_options` (+`okx_options_dropped`; `--okx-symbols`
+  override replaces the whole `[okx]` section, policy dropped + bin
+  WARNS — same M1a law); legacy boots byte-identical.
+- bin: second warn line; NEW gauge `engine_ingress_okx_options_selected`.
+- cli tests → **all green** (261 across the three touched crates in
+  the slice run; totals in the gates below).
+
+### Gates (all on the Mac)
+
+- workspace nextest **1197/1197** (+1 skipped) = 1183 + 14 M2.2
+  (3 core-config + 11 ingress-okx + cli deltas net). New stay-green
+  floor 1197.
+- release alloc **36/36** 0 B/op, corrected clean-guard, fresh
+  `Compiling bench` (grep count 1) — re-verified after the OKX
+  Driver/table growth.
+- worker pytest **412/412** (Python untouched). The cross-session
+  concurrent-pytest flake bit AGAIN mid-gates (a DIFFERENT test this
+  time — `test_stage_refusals_…`; passes alone, full rerun green with
+  no second pytest running). TWICE-observed now: **proposed protocol
+  addendum — treat pytest runs like worker verbs: `pgrep -f pytest`
+  before running, don't overlap the lanes.**
+- fuzz ≥300 s each, all clean, zero crashes/panics: `universe_toml`
+  **173.4M** (now with okx keys), `okx_instruments` **5.5M**
+  (options walker + selection cap + index parser riding),
+  `okx_index_price` (NEW) **45.8M**.
+
+### Live smoke (pitfall #11 — BOTH venues' chains in ONE boot)
+
+Same runbook window (bootout → G0 relink → foreign boot `--paper
+--strategy all --metrics --raw-tap okx,deribit` → ~2.5 min → SIGTERM
+→ audit-replay → restore pre-smoke universe.toml → bootstrap; PM
+dailies still live — no refresh needed this window). The smoke
+universe carried BOTH `[okx]` and `[deribit]` options policies
+(BTC-USD/ETH-USD + BTC/ETH, E2/K8) — the coexistence proof.
+
+- **OKX discovery, live:** BTC-USD chain **1558 rows** parsed (the
+  quoted-string wire incl. `stk`/`expTime`/`optType`), idx 77,202.10;
+  ETH-USD **1270 rows**, idx 2,427.48; selected **32 + 32 = 64**.
+  Deribit alongside: 1038 + 932 rows, 32 + 32 — **128 option
+  instruments in one boot**. ZERO error lines.
+- **Threads:** `okx … instruments=66` (2 static + 64 options),
+  `deribit … instruments=65`; both Steady; per-arg OKX SubAcks
+  accepted (no missing-channel session error).
+- **Gauges:** `engine_ingress_okx_options_selected 64` +
+  `engine_ingress_deribit_options_selected 64` live on :9191.
+- **Capture:** okx-ticks **15,694 ticks** (~2.7 min — bbo-tbt's 10 ms
+  cadence), deribit-ticks 3,987; audit-replay shows **all 64 OKX
+  option streams** (`0x02000201+` = the base-512 law on the OKX venue
+  byte) and every okx/deribit stream `regr=0 holes=0 missing=0
+  chain_breaks=0`; both venues' integrity totals ALL ZERO. (One
+  informational OUT-OF-BAND cadence-band note on a quiet option
+  stream — the band display, not a violation.)
+- **Raw taps (rejects mode): okx-raw.tap AND deribit-raw.tap both
+  64 B header-only — ZERO parse rejects across both venues.**
+- Standing lane restored + bootstrapped (pid verified); pre-smoke
+  universe.toml back (options-off overnight until the operator rules
+  otherwise). Note: the drain `pkill -f "multivenue-engine run"`
+  pattern can match a POLLING shell that quotes the same string —
+  cosmetic (exit 143 on the poll), use a `[e]`-bracketed pattern.
+
+### Slice checkpoint — COMMIT ASK (pending operator authorization)
+
+`M2:`-prefixed, EXPLICIT paths only:
+
+- `crates/core-config/src/universe.rs`
+- `crates/ingress-okx/src/discovery.rs`
+- `crates/ingress-okx/src/lib.rs`
+- `crates/ingress-okx/src/run_loop.rs`
+- `crates/cli/src/universe_boot.rs`
+- `crates/cli/src/paper.rs`
+- `crates/cli/src/lib.rs`
+- `crates/cli/src/bin/multivenue-engine.rs`
+- `fuzz/Cargo.toml`
+- `fuzz/fuzz_targets/okx_instruments.rs`
+- `fuzz/fuzz_targets/okx_index_price.rs` (new)
+- `universe.toml.example`
+- `docs/m2-progress.md`
+
+NOT staged: anything of M3's; `.env`; `~/multivenue/*`.
+
+**Resume point if context dies here:** M2.2 code-complete + gates
+green + live-smoked; commit ask pending; then M2.3 (mark/IV channel —
+ALREADY UNBLOCKED by `cf132ae`): the BINDING one-new-PMLR-record
+reading from the Session-0 design entry, Deribit `ticker.{opt}` + OKX
+`opt-summary`, wire-format.md + migration.md entries, proptest+fuzz
+per parser, audit-replay coverage/cadence row, catalog extension
+(M2 lands second ⇒ extends).

@@ -50,4 +50,20 @@ fuzz_target!(|data: &[u8]| {
         let key_len = data.len().min(64);
         let _ = d2.find(&data[..key_len]);
     }
+
+    // M2.2: the OPTION-page walker shares the row machinery but
+    // carries its own contract (instType=OPTION + stk/expTime/optType
+    // required); fuzz it on the same input, then drive the capped
+    // selection over whatever parsed — ≤ E×K×2 and never panic.
+    let mut od = ingress_okx::discovery::OkxDiscovery::new();
+    if let Ok(n) = od.ingest_options_body(data) {
+        assert_eq!(n, od.universe_total());
+        assert!(od.universe_live() <= od.universe_total());
+        let sel = ingress_okx::discovery::select_capped_chain(od.rows(), 1_000_000_000, 2, 8, 0);
+        assert!(sel.len() as u32 <= 2 * 8 * 2);
+    }
+
+    // M2.2: the index-price parser also rides this corpus (its
+    // dedicated target is okx_index_price; double coverage is free).
+    let _ = ingress_okx::discovery::parse_index_price(data);
 });

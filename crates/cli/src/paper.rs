@@ -652,9 +652,10 @@ pub fn spawn_binance_multi(
 ///
 /// Still fails fast on an empty item, a duplicate `instId` (checked
 /// against the raw configured list, independent of venue liveness),
-/// or more than [`ingress_okx::OKX_MAX_SYMBOLS`] instruments — boot
+/// or more than [`ingress_okx::OKX_STATIC_MAX`] instruments — boot
 /// refuses to start rather than run with a venue map that doesn't
-/// match the operator's intent.
+/// match the operator's intent. (M2.2: discovered options rows join
+/// the table AFTER this via [`extend_okx_table_with_options`].)
 pub fn build_okx_symbol_table(
     spec: &str,
     discovery: &ingress_okx::discovery::OkxDiscovery,
@@ -662,7 +663,7 @@ pub fn build_okx_symbol_table(
     let mut table = ingress_okx::OkxSymbolTable::new();
     // Raw-spec dedupe list, independent of what actually gets
     // inserted (a MISSING item must still trip the duplicate check).
-    let mut seen: [&str; ingress_okx::OKX_MAX_SYMBOLS] = [""; ingress_okx::OKX_MAX_SYMBOLS];
+    let mut seen: [&str; ingress_okx::OKX_STATIC_MAX] = [""; ingress_okx::OKX_STATIC_MAX];
     let mut n_seen: usize = 0;
     let mut ordinal: u32 = 0;
     for item in spec.split(',') {
@@ -673,8 +674,8 @@ pub fn build_okx_symbol_table(
         if seen[..n_seen].contains(&inst_id) {
             return Err("okx: duplicate instId in --okx-symbols");
         }
-        if n_seen >= ingress_okx::OKX_MAX_SYMBOLS {
-            return Err("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments");
+        if n_seen >= ingress_okx::OKX_STATIC_MAX {
+            return Err("okx: --okx-symbols exceeds OKX_STATIC_MAX instruments");
         }
         seen[n_seen] = inst_id;
         n_seen += 1;
@@ -689,7 +690,9 @@ pub fn build_okx_symbol_table(
         match table.insert(inst_id.as_bytes(), sym, row.inst_type) {
             Ok(()) => {}
             Err(ingress_okx::SymbolTableErr::Full) => {
-                return Err("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments");
+                // Unreachable: n_seen caps at OKX_STATIC_MAX < table
+                // capacity — kept as a defensive arm.
+                return Err("okx: --okx-symbols exceeds OKX_STATIC_MAX instruments");
             }
             Err(ingress_okx::SymbolTableErr::TooLong) => {
                 return Err("okx: instId in --okx-symbols exceeds OKX_INST_ID_MAX bytes");
@@ -700,6 +703,56 @@ pub fn build_okx_symbol_table(
         }
     }
     Ok(table)
+}
+
+/// M2.2: append the discovered capped options chain to an OKX symbol
+/// table (after every static insert; `bbo-tbt`-only rows — the
+/// `OkxInstType::Option` tag drives the channel gating). `pairs`
+/// comes from `boot_discovery::Outcome::okx_options` — already
+/// deterministic-ordered and ordinal-allocated. Fails fast on
+/// duplicates and on the options-block cap.
+pub fn extend_okx_table_with_options(
+    table: &mut ingress_okx::OkxSymbolTable,
+    pairs: &[(String, core_types::SymbolId)],
+) -> Result<(), &'static str> {
+    // The OKX table has no static/options partition field (the
+    // instType tag IS the discriminator) — derive the current
+    // options count so the cap holds across calls.
+    let mut n_options: usize = 0;
+    let mut i = 0;
+    while let Some((_, _, it)) = table.get(i) {
+        if it == ingress_okx::OkxInstType::Option {
+            n_options += 1;
+        }
+        i += 1;
+    }
+    for (inst_id, sym) in pairs {
+        if table.lookup(inst_id.as_bytes()).is_some() {
+            return Err("okx: duplicate instId in discovered options chain");
+        }
+        if n_options >= ingress_okx::OKX_OPT_MAX {
+            return Err(
+                "okx: options chain exceeds OKX_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes",
+            );
+        }
+        match table.insert(inst_id.as_bytes(), *sym, ingress_okx::OkxInstType::Option) {
+            Ok(()) => n_options += 1,
+            Err(ingress_okx::SymbolTableErr::Full) => {
+                return Err(
+                    "okx: options chain exceeds the symbol-table capacity — shrink \
+                     options_underlyings/options_expiries/options_strikes",
+                );
+            }
+            Err(ingress_okx::SymbolTableErr::TooLong) => {
+                return Err("okx: discovered option instId exceeds OKX_INST_ID_MAX");
+            }
+            Err(ingress_okx::SymbolTableErr::Empty) => {
+                return Err("okx: empty discovered option instId");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Spawn the OKX v5 public-WS ingress thread (Phase 8b). One thread
@@ -2113,11 +2166,14 @@ impl Observability {
             let coverage_deribit = register_coverage_gauge(&mut reg, "deribit")?;
             let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
             let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
-            // M2.1: how many capped-chain option instruments this boot
-            // selected + subscribed (0 = options lane off).
+            // M2.1/M2.2: how many capped-chain option instruments
+            // this boot selected + subscribed (0 = options lane off).
             let deribit_options_selected = reg
                 .register_gauge("engine_ingress_deribit_options_selected")
                 .map_err(|_| "register engine_ingress_deribit_options_selected")?;
+            let okx_options_selected = reg
+                .register_gauge("engine_ingress_okx_options_selected")
+                .map_err(|_| "register engine_ingress_okx_options_selected")?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -2185,6 +2241,7 @@ impl Observability {
                 coverage_hyperliquid,
                 coverage_binance,
                 deribit_options_selected,
+                okx_options_selected,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -2389,6 +2446,8 @@ pub struct EngineCounters {
     /// M2.1: selected capped-chain option instrument count
     /// (`engine_ingress_deribit_options_selected`; 0 = lane off).
     pub deribit_options_selected: GaugeId,
+    /// M2.2: same for OKX (`engine_ingress_okx_options_selected`).
+    pub okx_options_selected: GaugeId,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -3435,8 +3494,16 @@ pub mod boot_discovery {
         pub okx: Option<VenueCoverage>,
         /// The discovery-gated OKX symbol table, built here because
         /// `build_okx_symbol_table` needs the discovered `instType`
-        /// per instrument. `Some` iff `okx` is `Some`.
+        /// per instrument. M2.2: ALSO carries the appended options
+        /// rows, and is `Some` when the options policy alone enables
+        /// the venue (options-only `[okx]` is a valid universe).
         pub okx_table: Option<ingress_okx::OkxSymbolTable>,
+        /// M2.2: the selected OKX capped options chain — `(instId,
+        /// sym)` pairs in the deterministic allocation order (base
+        /// [`OPT_ORDINAL_BASE`]). Already inside `okx_table`; carried
+        /// separately for the gauge + logging. Empty when the policy
+        /// is disabled.
+        pub okx_options: Vec<(String, SymbolId)>,
         /// Deribit coverage; `None` when `--deribit-symbols` is unset.
         /// Deribit's symbol table is still built by
         /// [`super::build_deribit_symbol_table`] exactly as before —
@@ -3681,6 +3748,106 @@ pub mod boot_discovery {
 
         let table = super::build_okx_symbol_table(spec, &d)?;
         Ok((VenueCoverage { configured: configured.len() as u32, matched, universe }, table))
+    }
+
+    /// M2.2: fetch + select the capped OKX options chain — the
+    /// Deribit `run_deribit_options` law on the v5 surface. Per
+    /// configured underlying (`uly`, e.g. `"BTC-USD"`): ONE
+    /// `index-tickers` fetch (the ATM reference — the uly IS the
+    /// index instId) + ONE `instType=OPTION&uly=` page into a FRESH
+    /// table, then `select_capped_chain`. Ordinals allocated HERE in
+    /// selection order from [`OPT_ORDINAL_BASE`]. Fetch/parse
+    /// failures FATAL; an EMPTY per-underlying selection is MISSING
+    /// semantics (reason `no_chain`). 150 ms pacing matches the OKX
+    /// page pacing.
+    fn run_okx_options(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        policy: &OptionsPolicy,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<Vec<(String, SymbolId)>, &'static str> {
+        let (host, port) = split_host_port(&cfg.okx_rest_host, 443)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut out: Vec<(String, SymbolId)> = Vec::new();
+        let mut k = 0u32;
+        for uly in &policy.underlyings {
+            std::thread::sleep(Duration::from_millis(150));
+            let idx_path = format!("/api/v5/market/index-tickers?instId={uly}");
+            let range = get(tls, host, port, &idx_path, buf).map_err(|e| {
+                tracing::error!(venue = "okx", underlying = %uly, error = ?e, "discovery: index-price fetch failed");
+                "okx: options index-price fetch failed"
+            })?;
+            let index_px_1e9 =
+                ingress_okx::discovery::parse_index_price(&buf[range]).map_err(|e| {
+                    tracing::error!(venue = "okx", underlying = %uly, error = ?e, "discovery: index-price parse failed");
+                    "okx: options index-price parse failed"
+                })?;
+
+            std::thread::sleep(Duration::from_millis(150));
+            let path = format!("/api/v5/public/instruments?instType=OPTION&uly={uly}");
+            let range = get(tls, host, port, &path, buf).map_err(|e| {
+                tracing::error!(venue = "okx", underlying = %uly, error = ?e, "discovery: options fetch failed");
+                "okx: options discovery fetch failed"
+            })?;
+            let mut d = OkxDiscovery::new();
+            d.ingest_options_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "okx", underlying = %uly, error = ?e, "discovery: options parse failed");
+                "okx: options discovery parse failed"
+            })?;
+
+            let sel = ingress_okx::discovery::select_capped_chain(
+                d.rows(),
+                index_px_1e9,
+                policy.expiries,
+                policy.strikes,
+                now_ms,
+            );
+            if sel.is_empty() {
+                *any_missing = true;
+                tracing::error!(
+                    venue = "okx",
+                    underlying = %uly,
+                    reason = "no_chain",
+                    chain_total = d.universe_total(),
+                    "discovery: options underlying selected no instruments"
+                );
+            }
+            for row in &sel {
+                let inst_id = core::str::from_utf8(row.inst_id())
+                    .map_err(|_| "okx: non-utf8 option instId")?;
+                let sym = make_symbol_id(VenueId::Okx, OPT_ORDINAL_BASE + k + 1);
+                k += 1;
+                out.push((inst_id.to_string(), sym));
+            }
+            tracing::info!(
+                venue = "okx",
+                underlying = %uly,
+                index_px_1e9,
+                expiries = policy.expiries,
+                strikes = policy.strikes,
+                chain_total = d.universe_total(),
+                chain_live = d.universe_live(),
+                selected = sel.len(),
+                "discovery: options chain"
+            );
+        }
+        if out.len() > ingress_okx::OKX_OPT_MAX {
+            tracing::error!(
+                venue = "okx",
+                selected = out.len(),
+                cap = ingress_okx::OKX_OPT_MAX,
+                "discovery: selected options chain exceeds the per-connection cap"
+            );
+            return Err(
+                "okx: selected options chain exceeds OKX_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes",
+            );
+        }
+        Ok(out)
     }
 
     fn run_deribit(
@@ -4008,6 +4175,7 @@ pub mod boot_discovery {
         cfg: &Config,
         tls_config: &Arc<rustls::ClientConfig>,
         okx_spec: Option<&str>,
+        okx_options_policy: &OptionsPolicy,
         deribit_spec: Option<&str>,
         deribit_options_policy: &OptionsPolicy,
         hl_spec: Option<&str>,
@@ -4017,12 +4185,28 @@ pub mod boot_discovery {
         let mut buf: Vec<u8> = Vec::new();
         let mut any_missing = false;
 
-        let (okx, okx_table) = match okx_spec.map(str::trim).filter(|s| !s.is_empty()) {
+        let (okx, mut okx_table) = match okx_spec.map(str::trim).filter(|s| !s.is_empty()) {
             Some(spec) => {
                 let (cov, table) = run_okx(cfg, tls_config, spec, &mut buf, &mut any_missing)?;
                 (Some(cov), Some(table))
             }
+            // M2.2: an options-only [okx] section still boots the
+            // venue — empty static table, chain appended below.
+            None if okx_options_policy.enabled() => {
+                (None, Some(ingress_okx::OkxSymbolTable::new()))
+            }
             None => (None, None),
+        };
+
+        // M2.2: the capped OKX options chain (config-file policy).
+        let okx_options = if okx_options_policy.enabled() {
+            let pairs =
+                run_okx_options(cfg, tls_config, okx_options_policy, &mut buf, &mut any_missing)?;
+            let table = okx_table.as_mut().expect("policy-on arm always has a table");
+            super::extend_okx_table_with_options(table, &pairs)?;
+            pairs
+        } else {
+            Vec::new()
         };
 
         let deribit = match deribit_spec.map(str::trim).filter(|s| !s.is_empty()) {
@@ -4052,7 +4236,7 @@ pub mod boot_discovery {
 
         let pm = run_pm(cfg, tls_config, polymarket_asset_ids, &mut buf, &mut any_missing)?;
 
-        Ok(Outcome { any_missing, pm, okx, okx_table, deribit, deribit_options, hl, bn })
+        Ok(Outcome { any_missing, pm, okx, okx_table, okx_options, deribit, deribit_options, hl, bn })
     }
 
     // -----------------------------------------------------------
@@ -4544,10 +4728,10 @@ mod tests {
             build_okx_symbol_table("BTC-USDT,ETH-USDT, BTC-USDT", &empty).err(),
             Some("okx: duplicate instId in --okx-symbols")
         );
-        // OKX_MAX_SYMBOLS + 1 distinct instruments ⇒ Full.
+        // OKX_STATIC_MAX + 1 distinct instruments ⇒ Full.
         let mut spec = String::new();
         let mut rows: Vec<(String, &str, bool)> = Vec::new();
-        for i in 0..=ingress_okx::OKX_MAX_SYMBOLS {
+        for i in 0..=ingress_okx::OKX_STATIC_MAX {
             if i > 0 {
                 spec.push(',');
             }
@@ -4560,13 +4744,13 @@ mod tests {
         let full = okx_discovery_fixture(&rows_ref);
         assert_eq!(
             build_okx_symbol_table(&spec, &full).err(),
-            Some("okx: --okx-symbols exceeds OKX_MAX_SYMBOLS instruments")
+            Some("okx: --okx-symbols exceeds OKX_STATIC_MAX instruments")
         );
-        // Exactly OKX_MAX_SYMBOLS is still fine.
+        // Exactly OKX_STATIC_MAX is still fine.
         let max_spec = spec.rsplit_once(',').unwrap().0;
         assert_eq!(
             build_okx_symbol_table(max_spec, &full).unwrap().len(),
-            ingress_okx::OKX_MAX_SYMBOLS
+            ingress_okx::OKX_STATIC_MAX
         );
     }
 
@@ -4675,6 +4859,50 @@ mod tests {
         }
         let e = extend_deribit_table_with_options(&mut t, &big).err().unwrap();
         assert!(e.contains("DERIBIT_OPT_MAX"), "{e}");
+    }
+
+    /// M2.2: the OKX table extension mirrors the deribit law — rows
+    /// carry `OkxInstType::Option` (bbo-tbt-only gating), ordinals in
+    /// the base-512 block, dupes + options cap fail fast.
+    #[test]
+    fn okx_table_extends_with_options_chain() {
+        use core_config::universe::OPT_ORDINAL_BASE;
+        let mut d = ingress_okx::discovery::OkxDiscovery::new();
+        d.ingest_body(br#"{"code":"0","data":[{"instId":"BTC-USDT","instType":"SPOT","state":"live","tickSz":"0.1","lotSz":"0.01","ctVal":""}],"msg":""}"#)
+            .unwrap();
+        let mut t = build_okx_symbol_table("BTC-USDT", &d).unwrap();
+        let pairs = vec![
+            (
+                "BTC-USD-260327-100000-C".to_string(),
+                make_symbol_id(VenueId::Okx, OPT_ORDINAL_BASE + 1),
+            ),
+            (
+                "BTC-USD-260327-100000-P".to_string(),
+                make_symbol_id(VenueId::Okx, OPT_ORDINAL_BASE + 2),
+            ),
+        ];
+        extend_okx_table_with_options(&mut t, &pairs).unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(
+            t.lookup(b"BTC-USD-260327-100000-C"),
+            Some(make_symbol_id(VenueId::Okx, OPT_ORDINAL_BASE + 1))
+        );
+        // Duplicate chain instId refuses boot.
+        let dup = vec![pairs[0].clone()];
+        assert_eq!(
+            extend_okx_table_with_options(&mut t, &dup).err(),
+            Some("okx: duplicate instId in discovered options chain")
+        );
+        // Options cap refuses boot with the actionable message.
+        let mut big: Vec<(String, core_types::SymbolId)> = Vec::new();
+        for i in 0..ingress_okx::OKX_OPT_MAX {
+            big.push((
+                format!("X{i}-C"),
+                make_symbol_id(VenueId::Okx, OPT_ORDINAL_BASE + 100 + i as u32),
+            ));
+        }
+        let e = extend_okx_table_with_options(&mut t, &big).err().unwrap();
+        assert!(e.contains("OKX_OPT_MAX"), "{e}");
     }
 
     /// Happy path: `--hl-coins` items get 1-based, flag-ordered

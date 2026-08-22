@@ -62,6 +62,13 @@ pub struct OkxInstrumentRow {
     pub lot_sz_1e9: i64,
     /// `ctVal` ×1e9; `0` for SPOT (venue sends `""`).
     pub ct_val_1e9: i64,
+    /// `optType == "C"` (M2.2 OPTION rows; false otherwise).
+    pub is_call: bool,
+    /// `stk` ×1e9 (OPTION rows; 0 otherwise).
+    pub strike_1e9: i64,
+    /// `expTime` ms since epoch (OPTION rows; captured on any row
+    /// that carries it — dated futures do; 0 when absent).
+    pub exp_ms: i64,
 }
 
 impl OkxInstrumentRow {
@@ -102,10 +109,26 @@ impl OkxDiscovery {
         }
     }
 
-    /// Parse one instruments-endpoint body (one `instType` page) into
-    /// the table. Returns the number of rows added. Call once per
-    /// fetched page; counts accumulate.
+    /// Parse one LEGACY instruments-endpoint body (one
+    /// `instType=SPOT|SWAP|FUTURES` page) into the table. An OPTION
+    /// row here is a contract violation, exactly as before M2.2.
+    /// Returns the number of rows added. Call once per fetched page;
+    /// counts accumulate.
     pub fn ingest_body(&mut self, body: &[u8]) -> Result<u32, OkxDiscoveryErr> {
+        self.ingest_inner(body, RowMode::Legacy)
+    }
+
+    /// Parse one `instType=OPTION&uly=<uly>` page (M2.2) into the
+    /// table. Option rows additionally require `stk` / `expTime` /
+    /// `optType`; non-OPTION rows are a contract violation. Use a
+    /// SEPARATE table instance per underlying page (the legacy
+    /// coverage counters must not mix with chain rows); the caller
+    /// then applies [`select_capped_chain`] to `rows()`.
+    pub fn ingest_options_body(&mut self, body: &[u8]) -> Result<u32, OkxDiscoveryErr> {
+        self.ingest_inner(body, RowMode::Option)
+    }
+
+    fn ingest_inner(&mut self, body: &[u8], mode: RowMode) -> Result<u32, OkxDiscoveryErr> {
         // Envelope: `"code":"0"`.
         let code_pos = find_field(body, b"\"code\":").ok_or(OkxDiscoveryErr::Envelope)?;
         let c = skip_ws(body, code_pos);
@@ -129,7 +152,7 @@ impl OkxDiscovery {
             match body[i] {
                 b']' => break,
                 b'{' => {
-                    let (row, end) = parse_row(body, i)?;
+                    let (row, end) = parse_row(body, i, mode)?;
                     if self.rows.len() >= OKX_DISCOVERY_ROWS_CAP {
                         return Err(OkxDiscoveryErr::TooMany);
                     }
@@ -156,6 +179,13 @@ impl OkxDiscovery {
             .find(|r| r.inst_id() == inst_id)
     }
 
+    /// All parsed rows in wire order (M2.2: [`select_capped_chain`]
+    /// input for an options table).
+    #[inline]
+    pub fn rows(&self) -> &[OkxInstrumentRow] {
+        &self.rows
+    }
+
     /// Total rows parsed (all states).
     #[inline]
     pub fn universe_total(&self) -> u32 {
@@ -176,9 +206,145 @@ impl Default for OkxDiscovery {
     }
 }
 
+// ---------------------------------------------------------------
+// M2.2: index price (ATM reference) + capped-chain selection
+// ---------------------------------------------------------------
+
+/// Parse a `GET /api/v5/market/index-tickers?instId=<uly>` body into
+/// the index price ×1e9 — the boot-time ATM reference for
+/// [`select_capped_chain`]. Envelope law matches `ingest_body`
+/// (`"code":"0"` + `"data":[`); `idxPx` is a quoted decimal string
+/// (this venue quotes its numbers); empty/malformed/nonpositive →
+/// [`OkxDiscoveryErr::BadRow`]. The configured underlying (`uly`,
+/// e.g. `"BTC-USD"`) IS the index instId — no name mapping (unlike
+/// Deribit's `ccy → ccy_usd`).
+pub fn parse_index_price(body: &[u8]) -> Result<i64, OkxDiscoveryErr> {
+    let code_pos = find_field(body, b"\"code\":").ok_or(OkxDiscoveryErr::Envelope)?;
+    let c = skip_ws(body, code_pos);
+    if body.len() < c + 3 || &body[c..c + 3] != b"\"0\"" {
+        return Err(OkxDiscoveryErr::Envelope);
+    }
+    let data_pos = find_field(body, b"\"data\":").ok_or(OkxDiscoveryErr::Envelope)?;
+    let i = skip_ws(body, data_pos);
+    if i >= body.len() || body[i] != b'[' {
+        return Err(OkxDiscoveryErr::Envelope);
+    }
+    let px_pos = find_field(body, b"\"idxPx\":").ok_or(OkxDiscoveryErr::BadRow)?;
+    let j = skip_ws(body, px_pos);
+    if j >= body.len() || body[j] != b'"' {
+        return Err(OkxDiscoveryErr::BadRow);
+    }
+    let end_q = skip_string(body, j + 1).ok_or(OkxDiscoveryErr::Truncated)?;
+    let span = &body[j + 1..end_q - 1];
+    if span.is_empty() || span.contains(&b'\\') {
+        return Err(OkxDiscoveryErr::BadRow);
+    }
+    let (px, used) = scan_price_1e9(span, 0).ok_or(OkxDiscoveryErr::BadRow)?;
+    if used != span.len() || px <= 0 {
+        return Err(OkxDiscoveryErr::BadRow);
+    }
+    Ok(px)
+}
+
+/// Apply the capped universe policy to ONE underlying's parsed OPTION
+/// rows — the M2 selection LAW, twinned VERBATIM from
+/// `ingress_deribit::discovery::select_capped_chain` (the law
+/// source; property tests pin both to the same invariants;
+/// unification into a shared home is deferred to M2.4 when Binance
+/// eapi becomes the third consumer — rule of three):
+///
+/// - candidates: `inst_type == Option && live && exp_ms > now_ms`;
+/// - the nearest `expiries_e` distinct expiries (ascending);
+/// - per expiry, the `strikes_k` strikes nearest ATM: the last K/2
+///   distinct strikes at-or-below `index_px_1e9` + the first K/2
+///   above (position-based — no distance tie-breaks; a short side is
+///   NOT backfilled);
+/// - both calls and puts at every selected (expiry, strike) — a
+///   missing twin simply isn't emitted.
+///
+/// Output order is the DETERMINISTIC allocation order (expiry asc →
+/// strike asc → call before put); length ≤ `E × K × 2` by
+/// construction. Precondition: `rows` is one underlying's page,
+/// ingested once. Boot-only: allocates freely.
+pub fn select_capped_chain(
+    rows: &[OkxInstrumentRow],
+    index_px_1e9: i64,
+    expiries_e: u32,
+    strikes_k: u32,
+    now_ms: i64,
+) -> Vec<OkxInstrumentRow> {
+    let mut out: Vec<OkxInstrumentRow> = Vec::new();
+    if expiries_e == 0 || strikes_k == 0 {
+        return out;
+    }
+
+    let is_candidate = |r: &OkxInstrumentRow| {
+        r.inst_type == OkxInstType::Option && r.live && r.exp_ms > now_ms
+    };
+
+    // Distinct future expiries, ascending.
+    let mut expiries: Vec<i64> = Vec::new();
+    for r in rows {
+        if is_candidate(r) && !expiries.contains(&r.exp_ms) {
+            expiries.push(r.exp_ms);
+        }
+    }
+    expiries.sort_unstable();
+    expiries.truncate(expiries_e as usize);
+
+    let half = (strikes_k / 2) as usize;
+    for &exp in &expiries {
+        // Distinct strikes at this expiry, ascending.
+        let mut strikes: Vec<i64> = Vec::new();
+        for r in rows {
+            if is_candidate(r) && r.exp_ms == exp && !strikes.contains(&r.strike_1e9) {
+                strikes.push(r.strike_1e9);
+            }
+        }
+        strikes.sort_unstable();
+        // Position-based ATM split: last `half` at-or-below + first
+        // `half` above the index.
+        let below_end = strikes.partition_point(|&s| s <= index_px_1e9);
+        let lo = below_end.saturating_sub(half);
+        let hi = (below_end + half).min(strikes.len());
+        for &strike in &strikes[lo..hi] {
+            // Call before put, at most one row each (venue lists each
+            // instrument once — precondition above).
+            for want_call in [true, false] {
+                for r in rows {
+                    if is_candidate(r)
+                        && r.exp_ms == exp
+                        && r.strike_1e9 == strike
+                        && r.is_call == want_call
+                    {
+                        out.push(*r);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Which page a row is being parsed from (M2.2). Determines the
+/// accepted `instType` set and the required-field set.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum RowMode {
+    /// `instType=SPOT|SWAP|FUTURES` pages — the pre-M2.2 contract.
+    Legacy,
+    /// `instType=OPTION&uly=…` pages — requires `stk` / `expTime` /
+    /// `optType`.
+    Option,
+}
+
 /// Parse one instrument object starting at `pos` (must point at `{`).
 /// Returns the row and the position after the closing `}`.
-fn parse_row(body: &[u8], pos: usize) -> Result<(OkxInstrumentRow, usize), OkxDiscoveryErr> {
+fn parse_row(
+    body: &[u8],
+    pos: usize,
+    mode: RowMode,
+) -> Result<(OkxInstrumentRow, usize), OkxDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
 
@@ -186,6 +352,9 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(OkxInstrumentRow, usize), OkxDi
     let mut inst_id_len = 0u8;
     let mut inst_type: Option<OkxInstType> = None;
     let mut live: Option<bool> = None;
+    let mut is_call: Option<bool> = None;
+    let mut strike: Option<i64> = None;
+    let mut exp_ms: Option<i64> = None;
     // Presence and value tracked separately: pre-listing rows
     // (`state:"preopen"`, observed live 2026-08-15 on JP225-USDT-SWAP)
     // carry EMPTY `tickSz`/`lotSz` strings (and `instIdCode:null`).
@@ -267,6 +436,48 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(OkxInstrumentRow, usize), OkxDi
                         }
                         i = end;
                     }
+                    b"stk" => {
+                        // OPTION rows: quoted decimal strike. Empty on
+                        // non-option rows (venue sends "") → skipped.
+                        let (s, end) = quoted_span(body, i)?;
+                        if !s.is_empty() {
+                            let (v, used) =
+                                scan_price_1e9(s, 0).ok_or(OkxDiscoveryErr::BadRow)?;
+                            if used != s.len() {
+                                return Err(OkxDiscoveryErr::BadRow);
+                            }
+                            strike = Some(v);
+                        }
+                        i = end;
+                    }
+                    b"expTime" => {
+                        // Quoted integer ms since epoch ("" on
+                        // perpetual-style rows → skipped). Too large
+                        // for the ×1e9 scanners — plain digit parse.
+                        let (s, end) = quoted_span(body, i)?;
+                        if !s.is_empty() {
+                            if s.len() > 16 || !s.iter().all(|b| b.is_ascii_digit()) {
+                                return Err(OkxDiscoveryErr::BadRow);
+                            }
+                            let mut v: i64 = 0;
+                            for &d in s {
+                                v = v * 10 + (d - b'0') as i64;
+                            }
+                            exp_ms = Some(v);
+                        }
+                        i = end;
+                    }
+                    b"optType" => {
+                        // "C" / "P" on OPTION rows; "" on others.
+                        let (s, end) = quoted_span(body, i)?;
+                        match s {
+                            b"C" => is_call = Some(true),
+                            b"P" => is_call = Some(false),
+                            b"" => {}
+                            _ => return Err(OkxDiscoveryErr::BadRow),
+                        }
+                        i = end;
+                    }
                     _ => {
                         i = skip_json_value(body, i).ok_or(OkxDiscoveryErr::BadRow)?;
                     }
@@ -289,14 +500,38 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(OkxInstrumentRow, usize), OkxDi
     if live && (tick_sz.is_none() || lot_sz.is_none()) {
         return Err(OkxDiscoveryErr::BadRow);
     }
+    let inst_type = inst_type.ok_or(OkxDiscoveryErr::BadRow)?;
+    // M2.2 per-page contract: a page carries exactly the instType
+    // family it was fetched with — cross rows are violations, not
+    // filter cases (the Deribit RowKind precedent).
+    match mode {
+        RowMode::Legacy => {
+            if inst_type == OkxInstType::Option {
+                return Err(OkxDiscoveryErr::BadRow);
+            }
+        }
+        RowMode::Option => {
+            if inst_type != OkxInstType::Option {
+                return Err(OkxDiscoveryErr::BadRow);
+            }
+            // Chain-defining fields are REQUIRED on option rows — a
+            // row without them is unusable for the capped filter.
+            if is_call.is_none() || strike.is_none() || exp_ms.is_none() {
+                return Err(OkxDiscoveryErr::BadRow);
+            }
+        }
+    }
     let row = OkxInstrumentRow {
         inst_id,
         inst_id_len,
-        inst_type: inst_type.ok_or(OkxDiscoveryErr::BadRow)?,
+        inst_type,
         live,
         tick_sz_1e9: tick_sz.unwrap_or(0),
         lot_sz_1e9: lot_sz.unwrap_or(0),
         ct_val_1e9: ct_val,
+        is_call: is_call.unwrap_or(false),
+        strike_1e9: strike.unwrap_or(0),
+        exp_ms: exp_ms.unwrap_or(0),
     };
     Ok((row, i))
 }
@@ -514,6 +749,195 @@ mod tests {
         }
         assert_eq!(d.ingest_body(&body).unwrap_err(), OkxDiscoveryErr::TooMany);
     }
+
+    // -----------------------------------------------------------
+    // M2.2: OPTION pages + index price + capped-chain selection
+    // -----------------------------------------------------------
+
+    /// One OPTION row in the live wire shape (quoted-string numbers,
+    /// per this venue). Test-only allocation.
+    fn opt_row(inst_id: &str, opt_type: &str, stk: &str, exp_ms: i64, state: &str) -> String {
+        format!(
+            r#"{{"instId":"{inst_id}","instType":"OPTION","uly":"BTC-USD","instFamily":"BTC-USD","optType":"{opt_type}","stk":"{stk}","expTime":"{exp_ms}","state":"{state}","tickSz":"0.0001","lotSz":"1","ctVal":"1","ctType":"","listTime":"1770000000000"}}"#
+        )
+    }
+
+    fn page(rows: &str) -> Vec<u8> {
+        let mut body = Vec::with_capacity(rows.len() + 64);
+        body.extend_from_slice(br#"{"code":"0","data":["#);
+        body.extend_from_slice(rows.as_bytes());
+        body.extend_from_slice(br#"],"msg":""}"#);
+        body
+    }
+
+    const EXP1: i64 = 1_774_598_400_000;
+    const EXP2: i64 = 1_775_203_200_000;
+    const EXP3: i64 = 1_775_808_000_000;
+    const NOW: i64 = 1_774_000_000_000;
+
+    /// A 3-expiry × 4-strike × C/P grid around index 100k + noise
+    /// (one suspended row, one already-expired expiry).
+    fn opt_grid() -> OkxDiscovery {
+        let mut rows: Vec<String> = Vec::new();
+        for (e, tag) in [(EXP1, "260327"), (EXP2, "260403"), (EXP3, "260410")] {
+            for s in ["90000", "95000", "100000", "105000"] {
+                for t in ["C", "P"] {
+                    rows.push(opt_row(&format!("BTC-USD-{tag}-{s}-{t}"), t, s, e, "live"));
+                }
+            }
+        }
+        rows.push(opt_row("BTC-USD-260327-110000-C", "C", "110000", EXP1, "suspend"));
+        rows.push(opt_row("BTC-USD-OLD-90000-C", "C", "90000", NOW - 1_000, "live"));
+        let mut d = OkxDiscovery::new();
+        d.ingest_options_body(&page(&rows.join(","))).expect("grid parses");
+        d
+    }
+
+    #[test]
+    fn options_page_parses_chain_fields() {
+        let d = opt_grid();
+        assert_eq!(d.universe_total(), 26);
+        let c = d.find(b"BTC-USD-260327-100000-C").expect("call row");
+        assert_eq!(c.inst_type, OkxInstType::Option);
+        assert!(c.is_call && c.live);
+        assert_eq!(c.strike_1e9, 100_000_000_000_000); // "100000" × 1e9
+        assert_eq!(c.exp_ms, EXP1);
+        assert_eq!(c.tick_sz_1e9, 100_000); // "0.0001"
+        let p = d.find(b"BTC-USD-260327-100000-P").expect("put row");
+        assert!(!p.is_call);
+        assert!(!d.find(b"BTC-USD-260327-110000-C").expect("suspended kept").live);
+    }
+
+    #[test]
+    fn option_page_contract_both_directions() {
+        // A legacy row on an OPTION page is a violation…
+        let mut d = OkxDiscovery::new();
+        let legacy =
+            r#"{"instId":"BTC-USDT","instType":"SPOT","state":"live","tickSz":"1","lotSz":"1"}"#;
+        assert_eq!(d.ingest_options_body(&page(legacy)).unwrap_err(), OkxDiscoveryErr::BadRow);
+        // …and an OPTION row on a legacy page stays one (pre-M2.2 law).
+        let mut d2 = OkxDiscovery::new();
+        let opt = opt_row("BTC-USD-260327-100000-C", "C", "100000", EXP1, "live");
+        assert_eq!(d2.ingest_body(&page(&opt)).unwrap_err(), OkxDiscoveryErr::BadRow);
+    }
+
+    #[test]
+    fn option_row_missing_chain_fields_rejected() {
+        let full = opt_row("BTC-USD-260327-100000-C", "C", "100000", EXP1, "live");
+        for gone in [
+            r#""optType":"C","#,
+            r#""stk":"100000","#,
+            r#""expTime":"1774598400000","#,
+        ] {
+            let broken = full.replacen(gone, "", 1);
+            assert_ne!(broken, full, "field `{gone}` must exist in the fixture");
+            let mut d = OkxDiscovery::new();
+            assert_eq!(
+                d.ingest_options_body(&page(&broken)).unwrap_err(),
+                OkxDiscoveryErr::BadRow,
+                "missing {gone} must reject"
+            );
+        }
+        // Bad optType value; bad expTime digits.
+        for (from, to) in [(r#""optType":"C""#, r#""optType":"X""#), (r#""expTime":"1774598400000""#, r#""expTime":"17abc""#)] {
+            let bad = full.replacen(from, to, 1);
+            assert_ne!(bad, full);
+            let mut d = OkxDiscovery::new();
+            assert_eq!(d.ingest_options_body(&page(&bad)).unwrap_err(), OkxDiscoveryErr::BadRow);
+        }
+    }
+
+    #[test]
+    fn option_fractional_strike_parses() {
+        let row = opt_row("XRP-USD-260327-0d5-C", "C", "0.5", EXP1, "live");
+        let mut d = OkxDiscovery::new();
+        d.ingest_options_body(&page(&row)).expect("parses");
+        assert_eq!(d.rows()[0].strike_1e9, 500_000_000);
+    }
+
+    #[test]
+    fn index_price_parses_and_rejects() {
+        let ok = br#"{"code":"0","msg":"","data":[{"instId":"BTC-USD","idxPx":"77275.53","high24h":"78000","open24h":"76000"}]}"#;
+        assert_eq!(parse_index_price(ok).expect("parses"), 77_275_530_000_000);
+        // Error envelope.
+        let err_body = br#"{"code":"51001","msg":"instrument not exist","data":[]}"#;
+        assert_eq!(parse_index_price(err_body).unwrap_err(), OkxDiscoveryErr::Envelope);
+        // Missing idxPx.
+        let none = br#"{"code":"0","data":[{"instId":"BTC-USD"}]}"#;
+        assert_eq!(parse_index_price(none).unwrap_err(), OkxDiscoveryErr::BadRow);
+        // Empty / bare-number / nonpositive forms.
+        let empty = br#"{"code":"0","data":[{"idxPx":""}]}"#;
+        assert_eq!(parse_index_price(empty).unwrap_err(), OkxDiscoveryErr::BadRow);
+        let bare = br#"{"code":"0","data":[{"idxPx":77275.53}]}"#;
+        assert_eq!(parse_index_price(bare).unwrap_err(), OkxDiscoveryErr::BadRow);
+        let zero = br#"{"code":"0","data":[{"idxPx":"0"}]}"#;
+        assert_eq!(parse_index_price(zero).unwrap_err(), OkxDiscoveryErr::BadRow);
+    }
+
+    fn names(sel: &[OkxInstrumentRow]) -> Vec<String> {
+        sel.iter()
+            .map(|r| String::from_utf8(r.inst_id().to_vec()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn capped_chain_selects_e2_k2_deterministically() {
+        let d = opt_grid();
+        // Index 101k: at-or-below take last 1 (100k), above take
+        // first 1 (105k); E=2 → EXP1 + EXP2.
+        let sel = select_capped_chain(d.rows(), 101_000_000_000_000, 2, 2, NOW);
+        assert_eq!(
+            names(&sel),
+            vec![
+                "BTC-USD-260327-100000-C",
+                "BTC-USD-260327-100000-P",
+                "BTC-USD-260327-105000-C",
+                "BTC-USD-260327-105000-P",
+                "BTC-USD-260403-100000-C",
+                "BTC-USD-260403-100000-P",
+                "BTC-USD-260403-105000-C",
+                "BTC-USD-260403-105000-P",
+            ]
+        );
+        let sel2 = select_capped_chain(d.rows(), 101_000_000_000_000, 2, 2, NOW);
+        assert_eq!(names(&sel), names(&sel2));
+    }
+
+    #[test]
+    fn capped_chain_excludes_dead_expired_and_respects_cap() {
+        let d = opt_grid();
+        let sel = select_capped_chain(d.rows(), 100_000_000_000_000, 1, 8, NOW);
+        assert_eq!(sel.len(), 8);
+        for r in &sel {
+            assert!(r.live && r.exp_ms == EXP1);
+        }
+        assert!(!names(&sel).iter().any(|n| n.contains("110000") || n.contains("OLD")));
+        let all = select_capped_chain(d.rows(), 100_000_000_000_000, 4, 32, NOW);
+        assert!(all.len() as u32 <= 4 * 32 * 2);
+        assert_eq!(all.len(), 24);
+    }
+
+    #[test]
+    fn capped_chain_one_sided_and_missing_twin() {
+        let d = opt_grid();
+        // Index far below every strike: first K/2 above only.
+        let sel = select_capped_chain(d.rows(), 1_000_000_000, 1, 4, NOW);
+        assert_eq!(
+            names(&sel),
+            vec![
+                "BTC-USD-260327-90000-C",
+                "BTC-USD-260327-90000-P",
+                "BTC-USD-260327-95000-C",
+                "BTC-USD-260327-95000-P"
+            ]
+        );
+        // Missing put twin emits the call alone.
+        let solo = opt_row("BTC-USD-260327-100000-C", "C", "100000", EXP1, "live");
+        let mut d2 = OkxDiscovery::new();
+        d2.ingest_options_body(&page(&solo)).unwrap();
+        let sel2 = select_capped_chain(d2.rows(), 100_000_000_000_000, 2, 8, NOW);
+        assert_eq!(names(&sel2), vec!["BTC-USD-260327-100000-C"]);
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +958,77 @@ mod proptests {
                 }
                 Err(_) => {}
             }
+        }
+
+        /// M2.2: the options walker + index-price parser never panic
+        /// on arbitrary bytes either (same §21.3 bar).
+        #[test]
+        fn options_ingest_and_index_price_never_panic(
+            input in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let mut d = OkxDiscovery::new();
+            if let Ok(n) = d.ingest_options_body(&input) {
+                prop_assert_eq!(n, d.universe_total());
+                prop_assert!(d.universe_live() <= d.universe_total());
+            }
+            let _ = parse_index_price(&input);
+        }
+
+        /// M2.2 selection invariants — the SAME properties that pin
+        /// the Deribit twin (law parity): output ≤ E×K×2, only
+        /// live/unexpired option candidates, deterministic order
+        /// (expiry asc → strike asc → call before put).
+        #[test]
+        fn capped_selection_invariants(
+            strikes in proptest::collection::vec(1i64..2_000_000, 1..24),
+            exps in proptest::collection::vec(1i64..1_000_000, 1..6),
+            e in 1u32..=4,
+            k_half in 1u32..=16,
+            idx in 1i64..2_000_000,
+            live_mask in proptest::collection::vec(proptest::bool::ANY, 48),
+        ) {
+            let now_ms = 500_000i64;
+            let mut rows: Vec<OkxInstrumentRow> = Vec::new();
+            let mut m = 0usize;
+            for &exp in &exps {
+                for &s in &strikes {
+                    for call in [true, false] {
+                        let tag = format!("O-{exp}-{s}-{}", if call { "C" } else { "P" });
+                        let tb = tag.as_bytes();
+                        let mut inst_id = [0u8; crate::OKX_INST_ID_MAX];
+                        let n = tb.len().min(crate::OKX_INST_ID_MAX);
+                        inst_id[..n].copy_from_slice(&tb[..n]);
+                        rows.push(OkxInstrumentRow {
+                            inst_id,
+                            inst_id_len: n as u8,
+                            inst_type: OkxInstType::Option,
+                            live: live_mask[m % live_mask.len()],
+                            tick_sz_1e9: 100_000,
+                            lot_sz_1e9: 1_000_000_000,
+                            ct_val_1e9: 1_000_000_000,
+                            is_call: call,
+                            strike_1e9: s,
+                            exp_ms: exp,
+                        });
+                        m += 1;
+                    }
+                }
+            }
+            let k = k_half * 2;
+            let sel = select_capped_chain(&rows, idx, e, k, now_ms);
+            prop_assert!(sel.len() as u32 <= e * k * 2);
+            for r in &sel {
+                prop_assert!(r.live && r.exp_ms > now_ms);
+                prop_assert_eq!(r.inst_type, OkxInstType::Option);
+            }
+            for w in sel.windows(2) {
+                let (a, b) = (&w[0], &w[1]);
+                let ka = (a.exp_ms, a.strike_1e9, !a.is_call);
+                let kb = (b.exp_ms, b.strike_1e9, !b.is_call);
+                prop_assert!(ka < kb, "order law violated");
+            }
+            let sel2 = select_capped_chain(&rows, idx, e, k, now_ms);
+            prop_assert_eq!(sel.len(), sel2.len());
         }
     }
 }

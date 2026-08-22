@@ -69,6 +69,13 @@ pub struct BootUniverse {
     pub hl_spec: Option<String>,
     /// Effective OKX depth-channel toggle (flag OR config).
     pub okx_depth: bool,
+    /// M2.2 capped options-chain policy for OKX (config-file only;
+    /// same override law as deribit: an explicit `--okx-symbols`
+    /// replaces the whole `[okx]` section, policy included).
+    pub okx_options: universe::OptionsPolicy,
+    /// True when `--okx-symbols` dropped an ENABLED config options
+    /// policy — the bin logs the consequence.
+    pub okx_options_dropped: bool,
     /// Effective Deribit depth-channel toggle (flag OR config).
     pub deribit_depth: bool,
     /// M2.1 capped options-chain policy for Deribit (config-file
@@ -150,6 +157,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 hl_spec: flag_spec(f.hl_coins),
                 okx_depth: f.okx_depth,
                 deribit_depth: f.deribit_depth,
+                okx_options: universe::OptionsPolicy::default(),
+                okx_options_dropped: false,
                 deribit_options: universe::OptionsPolicy::default(),
                 deribit_options_dropped: false,
                 from_config: false,
@@ -190,9 +199,9 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             let allocated = universe::allocate_with_anchors(&u, pm_anchor, bn_anchor)
                 .map_err(|e| e.to_string())?;
             universe::assert_bootable(&allocated).map_err(|e| e.to_string())?;
-            // M1a override law extended (M2.1): an explicit
-            // --deribit-symbols replaces the whole [deribit] section,
-            // options policy included.
+            // M1a override law extended (M2.1/M2.2): an explicit
+            // per-venue symbols flag replaces that venue's WHOLE
+            // config section, options policy included.
             let deribit_flag = flag_spec(f.deribit_symbols);
             let (deribit_options, deribit_options_dropped) = if deribit_flag.is_some() {
                 (
@@ -202,12 +211,20 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             } else {
                 (u.deribit_options.clone(), false)
             };
+            let okx_flag = flag_spec(f.okx_symbols);
+            let (okx_options, okx_options_dropped) = if okx_flag.is_some() {
+                (universe::OptionsPolicy::default(), u.okx_options.enabled())
+            } else {
+                (u.okx_options.clone(), false)
+            };
             BootUniverse {
-                okx_spec: flag_spec(f.okx_symbols).or_else(|| join_or_none(&u.okx_instruments)),
+                okx_spec: okx_flag.or_else(|| join_or_none(&u.okx_instruments)),
                 deribit_spec: deribit_flag.or_else(|| join_or_none(&u.deribit_instruments)),
                 hl_spec: flag_spec(f.hl_coins).or_else(|| join_or_none(&u.hl_coins)),
                 okx_depth: f.okx_depth || u.okx_depth,
                 deribit_depth: f.deribit_depth || u.deribit_depth,
+                okx_options,
+                okx_options_dropped,
                 deribit_options,
                 deribit_options_dropped,
                 allocated,
@@ -464,5 +481,49 @@ mod tests {
         let b = resolve_boot_universe(&f).expect("resolves");
         assert!(!b.deribit_options.enabled());
         assert!(!b.deribit_options_dropped);
+        assert!(!b.okx_options.enabled());
+        assert!(!b.okx_options_dropped);
+    }
+
+    // ---- M2.2 okx options policy through the resolver --------------
+
+    #[test]
+    fn config_okx_options_policy_carried_and_flag_dropped() {
+        let src = format!(
+            "{}[okx]\ninstruments = [\"BTC-USDT\"]\n\
+             options_underlyings = [\"BTC-USD\"]\noptions_expiries = 1\n",
+            cfg_src_no_deribit()
+        );
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert!(b.okx_options.enabled());
+        assert_eq!(b.okx_options.underlyings, vec!["BTC-USD"]);
+        assert_eq!(b.okx_options.expiries, 1);
+        assert!(!b.okx_options_dropped);
+        // Flag override drops the policy + flags the drop.
+        let f2 = UniverseFlags {
+            config_src: Some(&src),
+            okx_symbols: Some("ETH-USDT"),
+            ..UniverseFlags::default()
+        };
+        let b2 = resolve_boot_universe(&f2).expect("resolves");
+        assert!(!b2.okx_options.enabled());
+        assert!(b2.okx_options_dropped);
+        assert_eq!(b2.okx_spec.as_deref(), Some("ETH-USDT"));
+        // Options-only [okx] section: no static spec, policy on.
+        let src3 = format!(
+            "{}[okx]\noptions_underlyings = [\"BTC-USD\"]\n",
+            cfg_src_no_deribit()
+        );
+        let f3 = UniverseFlags {
+            config_src: Some(&src3),
+            ..UniverseFlags::default()
+        };
+        let b3 = resolve_boot_universe(&f3).expect("resolves");
+        assert!(b3.okx_options.enabled());
+        assert_eq!(b3.okx_spec, None);
     }
 }

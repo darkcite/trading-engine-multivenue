@@ -624,10 +624,17 @@ fn run(args: RunArgs) -> ExitCode {
              policy is DROPPED for this boot (flag replaces the venue section)"
         );
     }
+    if boot.okx_options_dropped {
+        warn!(
+            "--okx-symbols override active — the universe config's okx options \
+             policy is DROPPED for this boot (flag replaces the venue section)"
+        );
+    }
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
         boot.okx_spec.as_deref(),
+        &boot.okx_options,
         boot.deribit_spec.as_deref(),
         &boot.deribit_options,
         boot.hl_spec.as_deref(),
@@ -899,9 +906,12 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.hl.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_binance)
             .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
-        // M2.1: capped options chain size this boot (0 = lane off).
+        // M2.1/M2.2: capped options chain sizes this boot (0 = lane
+        // off).
         reg.gauge(ids.deribit_options_selected)
             .set(discovery.deribit_options.len() as i64);
+        reg.gauge(ids.okx_options_selected)
+            .set(discovery.okx_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
