@@ -55,7 +55,10 @@ pub use run_loop::{
 };
 
 use core_net::SubId;
-use core_parse::{find_field, scan_i64, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte};
+use core_parse::{
+    find_field, scan_i64, scan_number_sci_1e9, scan_price_1e6, scan_price_1e9, scan_u64,
+    skip_byte,
+};
 use core_types::{NsTs, SymbolId};
 
 // ---------------------------------------------------------------
@@ -160,6 +163,10 @@ pub enum OkxChannel {
     FundingRate = 3,
     /// `books` — 400-level diffs (behind `--okx-depth`).
     Books = 4,
+    /// `opt-summary` — per-FAMILY options mark-IV/greeks stream
+    /// (M2.3; subscribed with `instFamily`, not `instId` — the
+    /// subscribe writer keys on the channel).
+    OptSummary = 5,
 }
 
 impl OkxChannel {
@@ -172,6 +179,7 @@ impl OkxChannel {
             OkxChannel::MarkPrice => b"mark-price",
             OkxChannel::FundingRate => b"funding-rate",
             OkxChannel::Books => b"books",
+            OkxChannel::OptSummary => b"opt-summary",
         }
     }
 }
@@ -234,6 +242,9 @@ pub fn classify(payload: &[u8]) -> OkxMsgKind {
         if memchr::memmem::find(payload, b"\"channel\":\"books\"").is_some() {
             return OkxMsgKind::Data(OkxChannel::Books);
         }
+        if memchr::memmem::find(payload, b"\"channel\":\"opt-summary\"").is_some() {
+            return OkxMsgKind::Data(OkxChannel::OptSummary);
+        }
     }
     OkxMsgKind::Unknown
 }
@@ -247,6 +258,73 @@ pub fn extract_inst_id(payload: &[u8]) -> Option<&[u8]> {
     let start = skip_byte(payload, start, b'"');
     let rel_end = memchr::memchr(b'"', payload.get(start..)?)?;
     payload.get(start..start + rel_end)
+}
+
+/// Extract the FIRST `"instFamily":"…"` value — the `opt-summary`
+/// subscribe-ack arg key (M2.3; family-keyed, unlike every other
+/// channel's `instId`).
+#[inline]
+pub fn extract_inst_family(payload: &[u8]) -> Option<&[u8]> {
+    let start = find_field(payload, b"\"instFamily\":")?;
+    let start = skip_byte(payload, start, b'"');
+    let rel_end = memchr::memchr(b'"', payload.get(start..)?)?;
+    payload.get(start..start + rel_end)
+}
+
+/// One parsed `opt-summary` DATA ROW (M2.3) — the OKX side of the
+/// `OptSummary` capture record. Scaling matches the record: IV
+/// fraction ×1e9 (`markVol` is already a fraction on this venue),
+/// forward px ×1e9 (`fwdPx` → the record's underlying slot), BS
+/// greeks (`*BS` fields) delta/gamma ×1e9, vega/theta ×1e6. OKX
+/// `opt-summary` carries NO mark price and NO open interest — the
+/// record's flags stay 0 for both (docs/wire-format.md).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct OkxOptSummaryFrame {
+    /// `markVol` fraction ×1e9.
+    pub mark_iv_1e9: i64,
+    /// `fwdPx` ×1e9.
+    pub fwd_px_1e9: i64,
+    /// `deltaBS` ×1e9.
+    pub delta_1e9: i64,
+    /// `gammaBS` ×1e9.
+    pub gamma_1e9: i64,
+    /// `vegaBS` ×1e6.
+    pub vega_1e6: i64,
+    /// `thetaBS` ×1e6.
+    pub theta_1e6: i64,
+}
+
+/// Parse ONE `opt-summary` row slice (M2.3). All captured values are
+/// quoted decimal strings on this venue; sign + scientific notation
+/// accepted; an empty or malformed required field ⇒ `None`. Row
+/// slicing (one object per `"instId":"` marker) is the run-loop
+/// scanner's job — this parses within one row.
+#[inline]
+pub fn parse_opt_summary_row(row: &[u8]) -> Option<OkxOptSummaryFrame> {
+    #[inline]
+    fn quoted_1e9(row: &[u8], key: &[u8]) -> Option<i64> {
+        let start = find_field(row, key)?;
+        let start = skip_byte(row, start, b'"');
+        let rel_end = memchr::memchr(b'"', row.get(start..)?)?;
+        let span = row.get(start..start + rel_end)?;
+        if span.is_empty() {
+            return None;
+        }
+        let (v, used) = scan_number_sci_1e9(span, 0)?;
+        if used != span.len() {
+            return None;
+        }
+        Some(v)
+    }
+    Some(OkxOptSummaryFrame {
+        mark_iv_1e9: quoted_1e9(row, b"\"markVol\":")?,
+        fwd_px_1e9: quoted_1e9(row, b"\"fwdPx\":")?,
+        delta_1e9: quoted_1e9(row, b"\"deltaBS\":")?,
+        gamma_1e9: quoted_1e9(row, b"\"gammaBS\":")?,
+        vega_1e6: quoted_1e9(row, b"\"vegaBS\":")? / 1000,
+        theta_1e6: quoted_1e9(row, b"\"thetaBS\":")? / 1000,
+    })
 }
 
 // ---------------------------------------------------------------
@@ -825,7 +903,14 @@ fn write_op(dst: &mut [u8], op: &[u8], args: &[SubArg<'_>]) -> Option<usize> {
         }
         n = push_bytes(dst, n, b"{\"channel\":\"")?;
         n = push_bytes(dst, n, args[i].channel.wire_name())?;
-        n = push_bytes(dst, n, b"\",\"instId\":\"")?;
+        // M2.3: `opt-summary` is the one FAMILY-keyed channel — its
+        // arg key is `instFamily` (the SubArg's inst_id bytes carry
+        // the family string for it).
+        if args[i].channel == OkxChannel::OptSummary {
+            n = push_bytes(dst, n, b"\",\"instFamily\":\"")?;
+        } else {
+            n = push_bytes(dst, n, b"\",\"instId\":\"")?;
+        }
         n = push_bytes(dst, n, args[i].inst_id)?;
         n = push_bytes(dst, n, b"\"}")?;
         i += 1;
@@ -1073,6 +1158,50 @@ mod tests {
         assert_eq!(t.get(0).unwrap().2, OkxInstType::Spot);
         assert_eq!(t.get(1).unwrap().2, OkxInstType::Swap);
         assert_eq!(t.get(2).unwrap().2, OkxInstType::Futures);
+    }
+
+    #[test]
+    fn opt_summary_row_parses_and_rejects() {
+        // Live wire shape: quoted decimals, *BS greeks, negative
+        // theta, sci-notation gamma, empty realVol skipped.
+        let row = br#"{"instType":"OPTION","instId":"BTC-USD-260327-100000-C","uly":"BTC-USD","delta":"0.0000064","gamma":"0.0000000121","theta":"-0.000001","vega":"0.0000029","deltaBS":"0.512","gammaBS":"1.234e-5","thetaBS":"-85.3","vegaBS":"152.3","realVol":"","bidVol":"0.62","askVol":"0.68","markVol":"0.6543","lever":"12.3","fwdPx":"77300.12","ts":"1774598400123"}"#;
+        let f = parse_opt_summary_row(row).expect("parses");
+        assert_eq!(f.mark_iv_1e9, 654_300_000); // fraction already
+        assert_eq!(f.fwd_px_1e9, 77_300_120_000_000);
+        assert_eq!(f.delta_1e9, 512_000_000); // deltaBS, not delta
+        assert_eq!(f.gamma_1e9, 12_340);
+        assert_eq!(f.vega_1e6, 152_300_000);
+        assert_eq!(f.theta_1e6, -85_300_000);
+        // Empty markVol (pre-listing rows) rejects.
+        let empty = br#"{"instId":"X","markVol":"","fwdPx":"1","deltaBS":"0","gammaBS":"0","thetaBS":"0","vegaBS":"0"}"#;
+        assert!(parse_opt_summary_row(empty).is_none());
+        // Missing any BS greek rejects.
+        let no_vega = br#"{"instId":"X","markVol":"0.5","fwdPx":"1","deltaBS":"0","gammaBS":"0","thetaBS":"0"}"#;
+        assert!(parse_opt_summary_row(no_vega).is_none());
+        // Bare (unquoted) number = contract change → reject.
+        let bare = br#"{"instId":"X","markVol":0.5,"fwdPx":"1","deltaBS":"0","gammaBS":"0","thetaBS":"0","vegaBS":"0"}"#;
+        assert!(parse_opt_summary_row(bare).is_none());
+    }
+
+    #[test]
+    fn inst_family_extracts_and_subscribe_renders_family_key() {
+        let ack = br#"{"event":"subscribe","arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"connId":"x"}"#;
+        assert_eq!(extract_inst_family(ack), Some(&b"BTC-USD"[..]));
+        assert_eq!(extract_inst_family(b"{}"), None);
+        // write_op renders instFamily for the opt-summary channel and
+        // instId for everything else, in one batch.
+        let args = [
+            SubArg { channel: OkxChannel::OptSummary, inst_id: b"BTC-USD" },
+            SubArg { channel: OkxChannel::BboTbt, inst_id: b"BTC-USD-260327-100000-C" },
+        ];
+        let mut buf = [0u8; 512];
+        let n = write_subscribe_batch(&mut buf, &args).expect("fits");
+        let s = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.contains(r#"{"channel":"opt-summary","instFamily":"BTC-USD"}"#), "{s}");
+        assert!(s.contains(r#"{"channel":"bbo-tbt","instId":"BTC-USD-260327-100000-C"}"#), "{s}");
+        // classify sees the data push.
+        let push = br#"{"arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"data":[{"instId":"X"}]}"#;
+        assert_eq!(classify(push), OkxMsgKind::Data(OkxChannel::OptSummary));
     }
 
     #[test]

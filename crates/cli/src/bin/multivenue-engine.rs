@@ -1055,6 +1055,8 @@ fn run(args: RunArgs) -> ExitCode {
             tls_config.clone(),
             okx_symbols,
             boot.okx_depth,
+            // M2.3: family-keyed opt-summary subscription args.
+            boot.okx_options.underlyings.clone(),
             okx_prod,
             statuses.okx.clone(),
             5,

@@ -1415,7 +1415,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     let sym: SymbolId = (2 << 24) | 1;
     let mut symbols = ingress_okx::OkxSymbolTable::new();
     symbols.insert(b"BTC-USDT", sym, ingress_okx::OkxInstType::Spot).unwrap();
-    let mut driver = owl::Driver::new(0x0C0Cu64, symbols, true);
+    let mut driver = owl::Driver::new(0x0C0Cu64, symbols, true, &[]);
     owl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
     // the measurement window.
@@ -1619,6 +1619,50 @@ fn deribit_parsers_are_zero_alloc() {
 /// whose `public/test` answers are rendered inside the window) via a
 /// `TestTransport`. Steady state is reached over the real handshake +
 /// set_heartbeat + batched-subscribe + subscribe-result path; the
+/// M2.3 options-analytics parsers (Deribit option `ticker`, OKX
+/// `opt-summary` row) + the `OptSummary` record construction —
+/// live-shaped payloads for 10_000 iterations each, zero-alloc (the
+/// hot ingress threads run these per push).
+#[test]
+fn option_analytics_parsers_are_zero_alloc() {
+    let deribit_opt: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-27MAR26-100000-C.100ms","data":{"timestamp":1774000000123,"instrument_name":"BTC-27MAR26-100000-C","state":"open","mark_price":0.0523,"mark_iv":65.43,"greeks":{"delta":0.512,"gamma":1.234e-5,"vega":152.3,"theta":-85.3,"rho":12.1},"open_interest":1234.5,"index_price":77216.94,"underlying_price":77300.12}}}"#;
+    let okx_row: &[u8] = br#"{"instType":"OPTION","instId":"BTC-USD-260327-100000-C","uly":"BTC-USD","deltaBS":"0.512","gammaBS":"1.234e-5","thetaBS":"-85.3","vegaBS":"152.3","markVol":"0.6543","fwdPx":"77300.12","ts":"1774598400123"}"#;
+    let sym: SymbolId = (3 << 24) | 513;
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..10_000u32 {
+        let f = ingress_deribit::parse_option_ticker(deribit_opt).unwrap();
+        acc = acc.wrapping_add(f.mark_iv_1e9);
+        let o = core_types::OptSummary::new(
+            1,
+            core_types::VenueId::Deribit,
+            sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX | core_types::OPT_SUMMARY_FLAG_OI,
+            f.mark_px_1e9,
+            f.mark_iv_1e9,
+            f.underlying_px_1e9,
+            f.open_interest_1e6,
+            f.delta_1e9,
+            f.gamma_1e9,
+            f.vega_1e6,
+            f.theta_1e6,
+        );
+        acc = acc.wrapping_add(std::hint::black_box(&o).mark_px_1e9);
+        let r = ingress_okx::parse_opt_summary_row(okx_row).unwrap();
+        acc = acc.wrapping_add(r.fwd_px_1e9);
+        std::hint::black_box(ingress_okx::extract_inst_family(okx_row));
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "option analytics parsers allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "option analytics parser bytes should be zero: saw {bytes}");
+}
+
 /// entire scripted stream is injected before the guard; every
 /// `drive_one` call must allocate zero bytes.
 #[test]

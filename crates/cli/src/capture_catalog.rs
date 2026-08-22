@@ -140,6 +140,13 @@ struct RunReport {
     other_files: u64,
     /// Tick records summed over venues.
     ticks: u64,
+    /// M2.3: `<venue>-opt-summary.pmlr` records summed over venues —
+    /// the options-channel's dedicated coverage row (the C1-designated
+    /// extension point; files also remain size-visible in
+    /// `other_files`/`bytes`). Best-effort count: an unreadable or
+    /// wrong-kind file contributes 0 and never gates `harness_ok`
+    /// (the backtest harness reads ticks only, §9.9).
+    opt_summaries: u64,
     /// Would `backtest::load_run` accept this run.
     harness_ok: bool,
     /// Present venue tick files, [`VENUE_LABELS`] order.
@@ -462,6 +469,20 @@ fn inspect_run(
         venues.push(o.stat);
     }
 
+    // M2.3: options-channel record counts (best-effort, never gates).
+    let mut opt_summaries = 0u64;
+    for label in VENUE_LABELS.iter() {
+        let path = entry.path.join(format!("{label}-opt-summary.pmlr"));
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(r) = PmlrReader::<core_types::OptSummary>::open(&path) {
+            if r.slot_kind() == SlotKind::OptSummary {
+                opt_summaries += r.len() as u64;
+            }
+        }
+    }
+
     Ok(RunReport {
         dir_name: entry.dir_name.clone(),
         epoch_ns: entry.epoch_ns,
@@ -471,6 +492,7 @@ fn inspect_run(
         bytes,
         other_files,
         ticks,
+        opt_summaries,
         harness_ok,
         venues,
     })
@@ -790,7 +812,7 @@ fn render_json(
             concat!(
                 "{{\"dir\":\"{}\",\"epoch_ns\":{},\"wall_start_ns\":{},\"wall_end_ns\":{},",
                 "\"duration_ns\":{},\"bytes\":{},\"other_files\":{},\"ticks\":{},",
-                "\"harness_ok\":{},\"venues\":["
+                "\"opt_summaries\":{},\"harness_ok\":{},\"venues\":["
             ),
             esc(&r.dir_name),
             r.epoch_ns,
@@ -800,6 +822,7 @@ fn render_json(
             r.bytes,
             r.other_files,
             r.ticks,
+            r.opt_summaries,
             r.harness_ok
         ));
         for (j, v) in r.venues.iter().enumerate() {

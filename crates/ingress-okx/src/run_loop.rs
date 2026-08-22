@@ -43,7 +43,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Capture, ChannelEvent, ChannelId, Price, Qty, Tick, VenueId};
+use core_types::{Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId};
 
 use crate::{
     classify, extract_inst_id, parse_bbo, parse_book_header, parse_trade, sub_id_of,
@@ -56,9 +56,15 @@ use crate::{
 // Sizing
 // ---------------------------------------------------------------
 
-/// Rx buffer: a `books` 400-level snapshot is ~25 KiB; 256 KiB
-/// absorbs bursts of full snapshots across instruments.
-pub const RX_BUF_SIZE: usize = 256 * 1024;
+/// Rx buffer: a `books` 400-level snapshot is ~25 KiB; an M2.3
+/// `opt-summary` push can carry summaries for an entire family
+/// (order-1.5k instruments live ⇒ ~600 KiB in one frame). 4 MiB
+/// (boot-time allocation) leaves headroom for a full-family snapshot
+/// ON TOP of a bbo backlog — the M2.3 first live smoke reconnect-
+/// looped 103× when a concurrent sanitizer build starved the drain
+/// loop and the snapshot no longer fit behind the backlog; the
+/// margin absorbs exactly that (log entry 2026-08-22).
+pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tx buffer: handshake + one batched subscribe op (~46 B per arg ×
 /// [`MAX_SUB_ARGS`] = 144 args ≈ 6.7 KiB with a full M2.2 options
@@ -70,11 +76,19 @@ pub const TX_BUF_SIZE: usize = 16 * 1024;
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
 pub const TICK_RING_CAP: usize = 16_384;
 
-/// Upper bound on `(channel × instrument)` subscribe args (M2.2
+/// Max configured option FAMILIES (`opt-summary` subscribe args —
+/// one per configured underlying; core-config caps underlyings at
+/// 16).
+pub const OPT_FAMILIES_MAX: usize = 16;
+
+/// Upper bound on `(channel × instrument)` subscribe args (M2
 /// partition law): up to 5 channels per STATIC instrument
-/// ([`crate::OKX_STATIC_MAX`]) + exactly one `bbo-tbt` arg per OPTION
-/// row ([`crate::OKX_OPT_MAX`]) = 80 + 64 = 144.
-pub const MAX_SUB_ARGS: usize = 5 * crate::OKX_STATIC_MAX + crate::OKX_OPT_MAX;
+/// ([`crate::OKX_STATIC_MAX`]) + one `bbo-tbt` arg per OPTION row
+/// ([`crate::OKX_OPT_MAX`]) + one family-keyed `opt-summary` arg per
+/// configured underlying ([`OPT_FAMILIES_MAX`], M2.3) =
+/// 80 + 64 + 16 = 160.
+pub const MAX_SUB_ARGS: usize =
+    5 * crate::OKX_STATIC_MAX + crate::OKX_OPT_MAX + OPT_FAMILIES_MAX;
 
 /// Stack scratch for one rendered subscribe batch (~46 B/arg × 144
 /// args ≈ 6.7 KiB; ~2× margin).
@@ -103,6 +117,8 @@ pub enum OkxSubKind {
     Funding = 3,
     /// `books`.
     Books = 4,
+    /// `opt-summary` (M2.3; family-keyed).
+    OptSummary = 5,
     /// Slot free.
     None = 255,
 }
@@ -120,6 +136,7 @@ impl OkxSubKind {
             OkxChannel::MarkPrice => OkxSubKind::Mark,
             OkxChannel::FundingRate => OkxSubKind::Funding,
             OkxChannel::Books => OkxSubKind::Books,
+            OkxChannel::OptSummary => OkxSubKind::OptSummary,
         }
     }
 }
@@ -191,6 +208,12 @@ pub struct Driver {
     book_chains: [OkxSeqChain; OKX_MAX_SYMBOLS],
     /// Trades monotonic-`seqId` monitors, same indexing.
     trade_seqs: [TradeSeqMonitor; OKX_MAX_SYMBOLS],
+    /// M2.3: configured option FAMILY strings (`opt-summary`
+    /// subscribe args; `(len, bytes)` rows, `n_families` valid).
+    /// Boot-set, connection-independent.
+    families: [(u8, [u8; 24]); OPT_FAMILIES_MAX],
+    /// Valid prefix length of `families`.
+    n_families: usize,
     /// Set once the post-upgrade subscribe batch has been queued.
     subscribed: bool,
     /// `!Sync` marker — see struct doc.
@@ -200,10 +223,34 @@ pub struct Driver {
 impl Driver {
     /// Allocate buffers (boot-time) and seed the handshake nonce.
     /// `symbols` maps every configured instrument; `depth_enabled`
-    /// adds the `books` channel per instrument.
-    pub fn new(nonce_seed: u64, symbols: OkxSymbolTable, depth_enabled: bool) -> Self {
+    /// adds the `books` channel per instrument; `families` (M2.3)
+    /// carries the configured option underlyings for the
+    /// family-keyed `opt-summary` subscription (empty slice = no
+    /// options lane). Over-long/overflowing family entries are
+    /// dropped with a debug assert (the config layer caps both).
+    pub fn new(
+        nonce_seed: u64,
+        symbols: OkxSymbolTable,
+        depth_enabled: bool,
+        families: &[&[u8]],
+    ) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        let mut fam: [(u8, [u8; 24]); OPT_FAMILIES_MAX] = [(0, [0; 24]); OPT_FAMILIES_MAX];
+        let mut n_families = 0usize;
+        let mut i = 0;
+        while i < families.len() {
+            let f = families[i];
+            if f.is_empty() || f.len() > 24 || n_families >= OPT_FAMILIES_MAX {
+                debug_assert!(false, "family entry dropped (len/cap) — config layer caps this");
+                i += 1;
+                continue;
+            }
+            fam[n_families].0 = f.len() as u8;
+            fam[n_families].1[..f.len()].copy_from_slice(f);
+            n_families += 1;
+            i += 1;
+        }
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -217,6 +264,8 @@ impl Driver {
             subs: SubTable::new(),
             book_chains: [OkxSeqChain::new(); OKX_MAX_SYMBOLS],
             trade_seqs: [TradeSeqMonitor::new(); OKX_MAX_SYMBOLS],
+            families: fam,
+            n_families,
             subscribed: false,
             _not_sync: ::core::marker::PhantomData,
         }
@@ -419,9 +468,22 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()
 fn build_sub_args<'a>(
     symbols: &'a OkxSymbolTable,
     depth_enabled: bool,
+    families: &'a [(u8, [u8; 24])],
     out: &mut [Option<SubArg<'a>>; MAX_SUB_ARGS],
 ) -> usize {
     let mut n = 0;
+    // M2.3: one family-keyed `opt-summary` arg per configured option
+    // underlying (the write_op key branch renders `instFamily`).
+    let mut f = 0;
+    while f < families.len() {
+        let (len, ref bytes) = families[f];
+        out[n] = Some(SubArg {
+            channel: OkxChannel::OptSummary,
+            inst_id: &bytes[..len as usize],
+        });
+        n += 1;
+        f += 1;
+    }
     let mut i = 0;
     while let Some((inst, _sym, inst_type)) = symbols.get(i) {
         out[n] = Some(SubArg { channel: OkxChannel::BboTbt, inst_id: inst });
@@ -456,7 +518,12 @@ fn build_sub_args<'a>(
 fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     debug_assert!(!drv.subscribed, "subscribe batch must be queued exactly once");
     let mut args_buf: [Option<SubArg<'_>>; MAX_SUB_ARGS] = [None; MAX_SUB_ARGS];
-    let n_args = build_sub_args(&drv.symbols, drv.depth_enabled, &mut args_buf);
+    let n_args = build_sub_args(
+        &drv.symbols,
+        drv.depth_enabled,
+        &drv.families[..drv.n_families],
+        &mut args_buf,
+    );
     if n_args == 0 {
         return Err(io::Error::other("okx: no instruments configured"));
     }
@@ -526,6 +593,9 @@ enum Dispatch {
     Bbo { tick: Tick },
     /// `trades` push scanned.
     Trades { sym_idx: u8, scan: TradeScan },
+    /// M2.3: family-wide `opt-summary` push walked + captured in
+    /// phase 1 (capture-only; nothing reaches the engine ring).
+    OptSummaries { scan: OptScan },
     /// `mark-price` / `funding-rate` push validated.
     Slow,
     /// `books` push header.
@@ -608,6 +678,71 @@ fn drain_ws_frames<C: Capture>(
 /// row is captured as a `ChannelId::Trade` event (§6.5): `venue_seq` =
 /// trade `seqId`, `venue_time_ms` from the venue ts, `v0` = px ×1e6,
 /// `v1` = qty ×1e6 negated for sell-side prints.
+/// M2.3 `opt-summary` phase-1 scan result (`Copy`).
+#[derive(Copy, Clone)]
+struct OptScan {
+    rows_parsed: u32,
+    rows_rejected: u32,
+}
+
+/// Walk one FAMILY-wide `opt-summary` push (M2.3): one object per
+/// `"instId":"` marker; rows for instruments outside the table (the
+/// unsubscribed rest of the family) skip for free; rows for OUR
+/// option syms parse via [`crate::parse_opt_summary_row`] and are
+/// captured as [`OptSummary`] records right here in phase 1 (the
+/// trades-scanner pattern — capture is a separate borrow).
+fn scan_opt_summaries<C: Capture>(
+    payload: &[u8],
+    symbols: &OkxSymbolTable,
+    capture: &mut C,
+) -> OptScan {
+    const MARKER: &[u8] = b"\"instId\":\"";
+    let mut scan = OptScan {
+        rows_parsed: 0,
+        rows_rejected: 0,
+    };
+    let mut at = 0usize;
+    while let Some(off) = memchr::memmem::find(&payload[at..], MARKER) {
+        let row_start = at + off;
+        let next = memchr::memmem::find(&payload[row_start + MARKER.len()..], MARKER)
+            .map(|o| row_start + MARKER.len() + o);
+        let row_end = next.unwrap_or(payload.len());
+        let row = &payload[row_start..row_end];
+        // instId value (immediately after the marker).
+        let id_start = MARKER.len();
+        if let Some(rel_q) = memchr::memchr(b'"', &row[id_start..]) {
+            let inst = &row[id_start..id_start + rel_q];
+            if let Some(sym) = symbols.lookup(inst) {
+                match crate::parse_opt_summary_row(row) {
+                    Some(f) => {
+                        capture.opt_summary(&OptSummary::new(
+                            now_ns(),
+                            VenueId::Okx,
+                            sym,
+                            0, // no mark px / OI on this venue's channel
+                            0,
+                            f.mark_iv_1e9,
+                            f.fwd_px_1e9,
+                            0,
+                            f.delta_1e9,
+                            f.gamma_1e9,
+                            f.vega_1e6,
+                            f.theta_1e6,
+                        ));
+                        scan.rows_parsed += 1;
+                    }
+                    None => {
+                        scan.rows_rejected += 1;
+                        capture.parse_reject(now_ns(), row);
+                    }
+                }
+            }
+        }
+        at = row_end;
+    }
+    scan
+}
+
 fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
     const MARKER: &[u8] = b"\"tradeId\":\"";
     let mut scan = TradeScan {
@@ -674,6 +809,16 @@ fn handle_data_frame<C: Capture>(
             OkxMsgKind::UnsubAck => Dispatch::Quiet,
             OkxMsgKind::Error(code) => Dispatch::VenueError { code },
             OkxMsgKind::SubAck => match ack_channel(payload) {
+                // M2.3: the opt-summary ack arg is FAMILY-keyed.
+                Some(OkxChannel::OptSummary) => {
+                    match crate::extract_inst_family(payload) {
+                        Some(fam) => Dispatch::SubAck {
+                            id: sub_id_of(OkxChannel::OptSummary, fam),
+                            kind: OkxSubKind::OptSummary,
+                        },
+                        None => Dispatch::Nothing,
+                    }
+                }
                 Some(ch) => match extract_inst_id(payload) {
                     Some(inst) => Dispatch::SubAck {
                         id: sub_id_of(ch, inst),
@@ -682,6 +827,13 @@ fn handle_data_frame<C: Capture>(
                     None => Dispatch::Nothing,
                 },
                 None => Dispatch::Nothing,
+            },
+            // M2.3: opt-summary is FAMILY-keyed (no arg instId) and
+            // multi-row — walked + captured in phase 1, per-row
+            // instId → sym lookups against the table (rows for
+            // unsubscribed family members skip for free).
+            OkxMsgKind::Data(OkxChannel::OptSummary) => Dispatch::OptSummaries {
+                scan: scan_opt_summaries(payload, &drv.symbols, capture),
             },
             OkxMsgKind::Data(channel) => {
                 match extract_inst_id(payload).and_then(|inst| {
@@ -709,6 +861,12 @@ fn handle_data_frame<C: Capture>(
                             sym_idx: sym_idx as u8,
                             scan: scan_trades(payload, sym, capture),
                         },
+                        OkxChannel::OptSummary => {
+                            // Handled by the dedicated family-keyed
+                            // arm above — unreachable here.
+                            debug_assert!(false, "opt-summary reached the instId path");
+                            Dispatch::Nothing
+                        }
                         OkxChannel::MarkPrice => match crate::parse_mark_price(payload, sym) {
                             Some(m) => {
                                 // §6.5 capture: v0 = mark px ×1e6.
@@ -837,6 +995,17 @@ fn handle_data_frame<C: Capture>(
                 i += 1;
             }
         }
+        Dispatch::OptSummaries { scan } => {
+            // Rows already captured in phase 1; count messages +
+            // per-row rejects (family rows outside our table were
+            // free skips, not rejects).
+            status.add_msgs(scan.rows_parsed as u64);
+            let mut r = 0;
+            while r < scan.rows_rejected {
+                status.inc_parse_errors();
+                r += 1;
+            }
+        }
         Dispatch::Slow => status.add_msgs(1),
         Dispatch::Book { sym_idx, prev, seq } => {
             status.add_msgs(1);
@@ -873,6 +1042,12 @@ fn ack_channel(payload: &[u8]) -> Option<OkxChannel> {
     }
     if memchr::memmem::find(payload, b"\"channel\":\"books\"").is_some() {
         return Some(OkxChannel::Books);
+    }
+    // M2.3 — the pitfall-11 catch of this slice: the first live smoke
+    // tapped every opt-summary SubAck as a parse reject because this
+    // arm was missing (classify knew the channel; this fn did not).
+    if memchr::memmem::find(payload, b"\"channel\":\"opt-summary\"").is_some() {
+        return Some(OkxChannel::OptSummary);
     }
     None
 }
@@ -1013,6 +1188,79 @@ mod tests {
         t
     }
 
+    /// Test capture recording OptSummary records (M2.3).
+    struct RecCap {
+        records: Vec<OptSummary>,
+        rejects: u32,
+    }
+    impl Capture for RecCap {
+        fn opt_summary(&mut self, o: &OptSummary) {
+            self.records.push(*o);
+        }
+        fn parse_reject(&mut self, _ts: u64, _p: &[u8]) {
+            self.rejects += 1;
+        }
+    }
+
+    #[test]
+    fn opt_summary_ack_is_recognized_and_family_keyed() {
+        // The M2.3 live-smoke catch, pinned: an opt-summary SubAck
+        // must resolve a family-keyed SubId — never fall to Nothing
+        // (which taps it as a parse reject).
+        let ack = br#"{"event":"subscribe","arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"connId":"x"}"#;
+        assert_eq!(ack_channel(ack), Some(OkxChannel::OptSummary));
+        assert_eq!(crate::extract_inst_family(ack), Some(&b"BTC-USD"[..]));
+    }
+
+    #[test]
+    fn opt_summary_scan_captures_ours_skips_foreign_rejects_bad() {
+        let mut t = test_symbols();
+        t.insert(b"BTC-USD-260327-100000-C", (2 << 24) | 513, OkxInstType::Option)
+            .unwrap();
+        // Family push: one OUR row, one foreign-family row (skip), one
+        // OUR row malformed (reject). Foreign malformed rows are also
+        // free skips — only OUR rows can reject.
+        let payload = br#"{"arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"data":[
+          {"instId":"BTC-USD-260327-100000-C","markVol":"0.6543","fwdPx":"77300.12","deltaBS":"0.512","gammaBS":"1.234e-5","thetaBS":"-85.3","vegaBS":"152.3","ts":"1774598400123"},
+          {"instId":"BTC-USD-260327-90000-P","markVol":"0.7","fwdPx":"77300.12","deltaBS":"-0.2","gammaBS":"0.00001","thetaBS":"-40.0","vegaBS":"100.0"},
+          {"instId":"BTC-USD-260327-100000-C","markVol":"","fwdPx":"77300.12","deltaBS":"0.5","gammaBS":"0","thetaBS":"0","vegaBS":"0"}
+        ]}"#;
+        let mut cap = RecCap { records: Vec::new(), rejects: 0 };
+        let scan = scan_opt_summaries(payload, &t, &mut cap);
+        assert_eq!(scan.rows_parsed, 1);
+        assert_eq!(scan.rows_rejected, 1); // the malformed OUR row
+        assert_eq!(cap.records.len(), 1);
+        assert_eq!(cap.rejects, 1);
+        let r = &cap.records[0];
+        assert_eq!(r.sym, (2 << 24) | 513);
+        assert_eq!(r.venue, VenueId::Okx as u8);
+        assert_eq!(r.flags, 0); // no mark px / OI on this venue
+        assert_eq!(r.mark_px_1e9, 0);
+        assert_eq!(r.open_interest_1e6, 0);
+        assert_eq!(r.mark_iv_1e9, 654_300_000);
+        assert_eq!(r.underlying_px_1e9, 77_300_120_000_000);
+        assert_eq!(r.delta_1e9, 512_000_000);
+        assert_eq!(r.theta_1e6, -85_300_000);
+    }
+
+    #[test]
+    fn sub_args_prepend_family_opt_summary_args() {
+        let t = test_symbols();
+        let fams: [(u8, [u8; 24]); 1] = {
+            let mut f = [(0u8, [0u8; 24]); 1];
+            f[0].0 = 7;
+            f[0].1[..7].copy_from_slice(b"BTC-USD");
+            f
+        };
+        let mut buf: [Option<SubArg<'_>>; MAX_SUB_ARGS] = [None; MAX_SUB_ARGS];
+        let n = build_sub_args(&t, false, &fams, &mut buf);
+        // 1 family arg + spot 2 + swap 4.
+        assert_eq!(n, 7);
+        let first = buf[0].unwrap();
+        assert_eq!(first.channel, OkxChannel::OptSummary);
+        assert_eq!(first.inst_id, b"BTC-USD");
+    }
+
     #[test]
     fn sub_args_option_rows_are_bbo_tbt_only() {
         // M2.2: an OPTION row contributes exactly one bbo-tbt arg —
@@ -1021,7 +1269,7 @@ mod tests {
         t.insert(b"BTC-USD-260327-100000-C", (2 << 24) | 513, OkxInstType::Option)
             .unwrap();
         let mut buf: [Option<SubArg<'_>>; MAX_SUB_ARGS] = [None; MAX_SUB_ARGS];
-        let n = build_sub_args(&t, false, &mut buf);
+        let n = build_sub_args(&t, false, &[], &mut buf);
         // spot(bbo,trades)=2 + swap(bbo,trades,mark,funding)=4 + option(bbo)=1.
         assert_eq!(n, 7);
         let opt_args: Vec<_> = buf[..n]
@@ -1032,7 +1280,7 @@ mod tests {
         assert_eq!(opt_args.len(), 1);
         assert_eq!(opt_args[0].channel, OkxChannel::BboTbt);
         // Depth adds books for non-option rows only.
-        let n_depth = build_sub_args(&t, true, &mut buf);
+        let n_depth = build_sub_args(&t, true, &[], &mut buf);
         assert_eq!(n_depth, 9); // +1 books each for spot + swap, none for the option
         let opt_args_depth = buf[..n_depth]
             .iter()
@@ -1043,7 +1291,7 @@ mod tests {
     }
 
     fn steady_driver(depth: bool) -> Driver {
-        let mut d = Driver::new(7, test_symbols(), depth);
+        let mut d = Driver::new(7, test_symbols(), depth, &[]);
         d.set_state(State::Steady);
         d.subscribed = true;
         d
@@ -1118,7 +1366,7 @@ mod tests {
 
     #[test]
     fn driver_starts_in_connecting() {
-        let d = Driver::new(1, test_symbols(), false);
+        let d = Driver::new(1, test_symbols(), false, &[]);
         assert_eq!(d.state(), State::Connecting);
         assert_eq!(d.sub_count(), 0);
         assert!(!d.subscribed);
@@ -1126,7 +1374,7 @@ mod tests {
 
     #[test]
     fn note_transport_ready_advances_and_closes() {
-        let mut d = Driver::new(1, test_symbols(), false);
+        let mut d = Driver::new(1, test_symbols(), false, &[]);
         note_transport_ready(&mut d, Status::Ready);
         assert_eq!(d.state(), State::NeedsWsWrite);
         note_transport_ready(&mut d, Status::Closed);
@@ -1136,7 +1384,7 @@ mod tests {
     #[test]
     fn handshake_completes_and_batched_subscribe_is_emitted() {
         let mut t = TestTransport::with_capacity(65536);
-        let mut d = Driver::new(42, test_symbols(), true);
+        let mut d = Driver::new(42, test_symbols(), true, &[]);
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 

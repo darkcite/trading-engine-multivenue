@@ -458,7 +458,69 @@ pub fn parse_quote(payload: &[u8], sym: SymbolId) -> Option<DeribitQuoteFrame> {
     })
 }
 
-/// Parse a `ticker.{instr}.100ms` push into a [`DeribitTickerFrame`].
+/// Parsed OPTION `ticker.{instr}.100ms` push (M2.3) — the mark/IV /
+/// greeks / OI / underlying surface feeding the `OptSummary` capture
+/// channel. Field scaling matches the record (docs/wire-format.md):
+/// px/IV/underlying ×1e9 (IV normalized percent→fraction), OI ×1e6,
+/// delta/gamma ×1e9, vega/theta ×1e6. `Copy` POD, stack-only.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct DeribitOptTickerFrame {
+    /// `mark_price` ×1e9 (coin-denominated on this venue).
+    pub mark_px_1e9: i64,
+    /// `mark_iv` normalized percent→FRACTION ×1e9 (65.43 → 654.3e6).
+    pub mark_iv_1e9: i64,
+    /// `underlying_price` ×1e9.
+    pub underlying_px_1e9: i64,
+    /// `open_interest` ×1e6.
+    pub open_interest_1e6: i64,
+    /// `greeks.delta` ×1e9.
+    pub delta_1e9: i64,
+    /// `greeks.gamma` ×1e9.
+    pub gamma_1e9: i64,
+    /// `greeks.vega` ×1e6.
+    pub vega_1e6: i64,
+    /// `greeks.theta` ×1e6.
+    pub theta_1e6: i64,
+}
+
+/// Parse an OPTION ticker push payload (M2.3). Zero-alloc flat scans
+/// — every captured key appears exactly once in an option ticker
+/// (the `greeks` sub-object keys are unique payload-wide). Any
+/// missing/malformed field ⇒ `None` (the venue contract changed).
+/// The futures/perp ticker path is [`parse_ticker`], unchanged.
+#[inline]
+pub fn parse_option_ticker(payload: &[u8]) -> Option<DeribitOptTickerFrame> {
+    #[inline]
+    fn field_1e9(payload: &[u8], key: &[u8]) -> Option<i64> {
+        let pos = find_field(payload, key)?;
+        let (v, _) = scan_number_sci_1e9(payload, pos)?;
+        Some(v)
+    }
+    let mark_px_1e9 = field_1e9(payload, b"\"mark_price\":")?;
+    // Percent on the wire → fraction ×1e9.
+    let mark_iv_1e9 = field_1e9(payload, b"\"mark_iv\":")? / 100;
+    let underlying_px_1e9 = field_1e9(payload, b"\"underlying_price\":")?;
+    let open_interest_1e6 = field_1e9(payload, b"\"open_interest\":")? / 1000;
+    let delta_1e9 = field_1e9(payload, b"\"delta\":")?;
+    let gamma_1e9 = field_1e9(payload, b"\"gamma\":")?;
+    let vega_1e6 = field_1e9(payload, b"\"vega\":")? / 1000;
+    let theta_1e6 = field_1e9(payload, b"\"theta\":")? / 1000;
+    Some(DeribitOptTickerFrame {
+        mark_px_1e9,
+        mark_iv_1e9,
+        underlying_px_1e9,
+        open_interest_1e6,
+        delta_1e9,
+        gamma_1e9,
+        vega_1e6,
+        theta_1e6,
+    })
+}
+
+/// Parse a futures/perp `ticker.{instr}.100ms` push into a
+/// [`DeribitTickerFrame`]. OPTION tickers go through
+/// [`parse_option_ticker`] instead (M2.3 — routed by table row).
 #[inline]
 pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame> {
     // `"mark_price":`/`"index_price":` cannot false-match inside
@@ -998,10 +1060,11 @@ fn write_channel_name(
 /// configured `(channel × instrument)` pair: `quote` + `ticker.100ms`
 /// + `trades.100ms` per STATIC instrument, `book.100ms` when
 /// `depth_enabled`; OPTION rows (M2.1 capped chain) subscribe `quote`
-/// ONLY — an option book is a book, the BBO rides the existing tick
-/// lane; the mark/IV `ticker` stream arrives at M2.3. **One call** —
-/// subscribe costs 3000 of 30 000 credits (§4.2), so batching is
-/// mandatory. Returns the byte length, `None` if `dst` is too small.
+/// + `ticker.100ms` (M2.3 — BBO rides the tick lane, the option
+/// ticker feeds the `OptSummary` capture channel) — never
+/// trades/book. **One call** — subscribe costs 3000 of 30 000
+/// credits (§4.2), so batching is mandatory. Returns the byte
+/// length, `None` if `dst` is too small.
 #[inline]
 pub fn write_subscribe_all(
     dst: &mut [u8],
@@ -1021,7 +1084,7 @@ pub fn write_subscribe_all(
             DeribitChannel::Book,
         ];
         let n_ch = if symbols.is_option_row(i) {
-            1 // quote only (M2.1)
+            2 // quote + ticker (M2.3 — the mark/IV stream); never trades/book
         } else if depth_enabled {
             4
         } else {
@@ -1372,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_all_options_rows_are_quote_only() {
+    fn subscribe_all_options_rows_are_quote_and_ticker_only() {
         let mut t = DeribitSymbolTable::new();
         t.insert(b"BTC-PERPETUAL", 1).unwrap();
         t.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
@@ -1383,16 +1446,55 @@ mod tests {
         assert!(s.contains("\"quote.BTC-PERPETUAL\""));
         assert!(s.contains("\"ticker.BTC-PERPETUAL.100ms\""));
         assert!(s.contains("\"trades.BTC-PERPETUAL.100ms\""));
-        // Option row: quote only — no ticker/trades/book.
+        // Option row (M2.3): quote + ticker — never trades/book.
         assert!(s.contains("\"quote.BTC-27MAR26-100000-C\""));
-        assert!(!s.contains("ticker.BTC-27MAR26-100000-C"));
+        assert!(s.contains("\"ticker.BTC-27MAR26-100000-C.100ms\""));
         assert!(!s.contains("trades.BTC-27MAR26-100000-C"));
         assert!(!s.contains("book.BTC-27MAR26-100000-C"));
-        // Depth on: static gains book, option still quote-only.
+        // Depth on: static gains book, option unchanged.
         let n2 = write_subscribe_all(&mut buf, 6, &t, true).expect("fits");
         let s2 = core::str::from_utf8(&buf[..n2]).unwrap();
         assert!(s2.contains("\"book.BTC-PERPETUAL.100ms\""));
         assert!(!s2.contains("book.BTC-27MAR26-100000-C"));
+        assert!(s2.contains("\"ticker.BTC-27MAR26-100000-C.100ms\""));
+    }
+
+    #[test]
+    fn option_ticker_parses_and_normalizes() {
+        // Live wire shape (percent mark_iv, coin mark px, nested
+        // greeks, sci-notation gamma).
+        let b = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-27MAR26-100000-C.100ms","data":{"timestamp":1774000000123,"instrument_name":"BTC-27MAR26-100000-C","state":"open","mark_price":0.0523,"mark_iv":65.43,"bid_iv":64.0,"ask_iv":66.8,"greeks":{"delta":0.512,"gamma":1.234e-5,"vega":152.3,"theta":-85.3,"rho":12.1},"open_interest":1234.5,"index_price":77216.94,"underlying_price":77300.12,"underlying_index":"BTC-27MAR26","best_bid_price":0.052,"best_ask_price":0.0526}}}"#;
+        let f = parse_option_ticker(b).expect("parses");
+        assert_eq!(f.mark_px_1e9, 52_300_000); // 0.0523 × 1e9
+        assert_eq!(f.mark_iv_1e9, 654_300_000); // 65.43% → 0.6543 × 1e9
+        assert_eq!(f.underlying_px_1e9, 77_300_120_000_000);
+        assert_eq!(f.open_interest_1e6, 1_234_500_000);
+        assert_eq!(f.delta_1e9, 512_000_000);
+        assert_eq!(f.gamma_1e9, 12_340); // 1.234e-5 × 1e9
+        assert_eq!(f.vega_1e6, 152_300_000);
+        assert_eq!(f.theta_1e6, -85_300_000);
+        // Missing any required field rejects (futures tickers carry
+        // no greeks/mark_iv — they can never alias into this parser).
+        let fut = br#"{"timestamp":2000,"mark_price":1.0,"index_price":1.0,"current_funding":0.0,"open_interest":5,"min_price":0.9,"max_price":1.1}"#;
+        assert!(parse_option_ticker(fut).is_none());
+        let no_greeks = br#"{"mark_price":0.05,"mark_iv":65.0,"underlying_price":77000.0,"open_interest":1.0}"#;
+        assert!(parse_option_ticker(no_greeks).is_none());
+    }
+
+    mod opt_ticker_props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// §21.3: the option-ticker parser never panics on
+            /// printable-ASCII noise or arbitrary bytes.
+            #[test]
+            fn parse_option_ticker_never_panics(
+                input in proptest::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let _ = parse_option_ticker(&input);
+            }
+        }
     }
 
     // ---- book chain ----------------------------------------------

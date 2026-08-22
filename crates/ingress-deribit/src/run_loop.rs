@@ -78,10 +78,11 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Capture, ChannelEvent, ChannelId, Price, Qty, Tick, VenueId};
+use core_types::{Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId};
 
 use crate::{
-    classify, extract_instrument, parse_book_header, parse_quote, parse_ticker, parse_trade,
+    classify, extract_instrument, parse_book_header, parse_option_ticker, parse_quote,
+    parse_ticker, parse_trade,
     sub_id_of, write_book_op, write_set_heartbeat, write_subscribe_all, write_test, ChainOutcome,
     DeribitChannel, DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, TradeSeqOutcome,
     DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
@@ -98,10 +99,10 @@ use crate::{
 pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tx buffer: handshake + set_heartbeat + one batched subscribe
-/// (≤ ~48 B/channel × [`MAX_CHANNELS`] ≈ 6.1 KiB with a full M2.1
-/// options block) + resync pairs + test replies. 16 KiB keeps ≥2×
-/// margin (boot-time allocation).
-pub const TX_BUF_SIZE: usize = 16 * 1024;
+/// (≤ ~48 B/channel × [`MAX_CHANNELS`] = 192 ≈ 9.2 KiB with a full
+/// M2.3 options block) + resync pairs + test replies. 24 KiB keeps
+/// ≥2× margin (boot-time allocation).
+pub const TX_BUF_SIZE: usize = 24 * 1024;
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
@@ -120,19 +121,21 @@ const STATIC_MASK_BITS: usize = CHANNELS_PER_INSTR * crate::DERIBIT_STATIC_MAX;
 
 /// Upper bound on subscribed channels: the static block
 /// ([`CHANNELS_PER_INSTR`] × [`crate::DERIBIT_STATIC_MAX`] = 64) +
-/// one quote channel per option row ([`crate::DERIBIT_OPT_MAX`] = 64)
-/// = 128 — exactly the width of the subscribe-verification bitmask
-/// (u128 since M2.1; the mask is connection-establishment state, not
-/// hot-path).
+/// TWO channels per option row (quote + ticker, M2.3;
+/// [`crate::DERIBIT_OPT_MAX`] = 64) = 192. NOTE the
+/// subscribe-verification MASK stays u128: option rows FOLD their
+/// two channels into one per-row bit (64 static-channel bits + 64
+/// option-row bits — see `row_bit`/`found_mask`); MAX_CHANNELS
+/// bounds the SubTable/frame capacities, not the mask width.
 pub const MAX_CHANNELS: usize =
-    CHANNELS_PER_INSTR * crate::DERIBIT_STATIC_MAX + crate::DERIBIT_OPT_MAX;
+    CHANNELS_PER_INSTR * crate::DERIBIT_STATIC_MAX + 2 * crate::DERIBIT_OPT_MAX;
 
 /// Subscription-table capacity (≥ [`MAX_CHANNELS`]).
 pub const SUB_CAP: usize = MAX_CHANNELS;
 
 /// Stack scratch for one rendered subscribe batch (≤ ~48 B/channel ×
-/// 128 channels ≈ 6.1 KiB; doubled for margin).
-const SUBSCRIBE_SCRATCH: usize = 12 * 1024;
+/// 192 channels ≈ 9.2 KiB; ~1.7× margin).
+const SUBSCRIBE_SCRATCH: usize = 16 * 1024;
 
 /// Stack scratch for one rendered channel name
 /// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
@@ -637,12 +640,13 @@ const fn option_bit(sym_idx: usize, static_len: usize) -> u128 {
     1u128 << (STATIC_MASK_BITS + (sym_idx - static_len))
 }
 
-/// Channels a table row subscribes: options quote-only, static rows
-/// the full set (minus book without depth).
+/// Channels a table row subscribes: options quote + ticker (M2.3 —
+/// the mark/IV stream), static rows the full set (minus book without
+/// depth).
 #[inline]
 fn row_channels(symbols: &DeribitSymbolTable, idx: usize, depth_enabled: bool) -> usize {
     if symbols.is_option_row(idx) {
-        1
+        2
     } else if depth_enabled {
         CHANNELS_PER_INSTR
     } else {
@@ -650,12 +654,15 @@ fn row_channels(symbols: &DeribitSymbolTable, idx: usize, depth_enabled: bool) -
     }
 }
 
-/// Verification-mask bit for `(row, channel)` under the M2.1
-/// partition law.
+/// Verification-mask bit for `(row, channel)` under the M2 partition
+/// law. Option rows FOLD their channels (quote + ticker) into ONE
+/// per-row bit — [`found_mask`] sets it only when EVERY option
+/// channel was acknowledged, so the u128 stays exactly
+/// 64 static-channel bits + 64 option-row bits.
 #[inline]
 fn row_bit(symbols: &DeribitSymbolTable, idx: usize, ch: usize) -> u128 {
     if symbols.is_option_row(idx) {
-        debug_assert!(ch == 0, "option rows have exactly the quote channel");
+        debug_assert!(ch < 2, "option rows have quote + ticker only");
         option_bit(idx, symbols.static_len())
     } else {
         channel_bit(idx, ch)
@@ -686,6 +693,8 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
     let mut i = 0;
     while let Some((instr, _sym)) = symbols.get(i) {
         let n_ch = row_channels(symbols, i, depth_enabled);
+        // Option rows fold: the per-row bit requires EVERY channel.
+        let mut found_in_row = 0usize;
         let mut c = 0;
         while c < n_ch {
             let ch = CHANNEL_ORDER[c];
@@ -704,9 +713,16 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
             name[n] = b'"';
             n += 1;
             if memchr::memmem::find(payload, &name[..n]).is_some() {
-                m |= row_bit(symbols, i, c);
+                if symbols.is_option_row(i) {
+                    found_in_row += 1;
+                } else {
+                    m |= row_bit(symbols, i, c);
+                }
             }
             c += 1;
+        }
+        if symbols.is_option_row(i) && found_in_row == n_ch {
+            m |= option_bit(i, symbols.static_len());
         }
         i += 1;
     }
@@ -771,6 +787,9 @@ enum Dispatch {
     Quote { tick: Tick },
     /// `ticker` push validated (slow lane; captured as a §6.5 event).
     Ticker,
+    /// M2.3: an OPTION row's ticker parsed → `OptSummary` captured in
+    /// phase 1 (capture-only; nothing reaches the engine ring).
+    OptSummary,
     /// `trades` push scanned (`sym` rides along for phase-2 gap
     /// events — resolving it again would re-borrow `drv.symbols`).
     Trades { sym: u32, sym_idx: u8, scan: TradeScan },
@@ -1035,6 +1054,34 @@ fn handle_data_frame<C: Capture>(
                             },
                             None => Dispatch::Nothing,
                         },
+                        // M2.3: OPTION rows' ticker carries the
+                        // mark/IV/greeks/OI surface → OptSummary
+                        // capture (never the engine ring). The
+                        // futures parser would reject it (no
+                        // current_funding on option tickers).
+                        DeribitChannel::Ticker if drv.symbols.is_option_row(sym_idx) => {
+                            match parse_option_ticker(payload) {
+                                Some(f) => {
+                                    capture.opt_summary(&OptSummary::new(
+                                        now_ns(),
+                                        VenueId::Deribit,
+                                        sym,
+                                        core_types::OPT_SUMMARY_FLAG_MARK_PX
+                                            | core_types::OPT_SUMMARY_FLAG_OI,
+                                        f.mark_px_1e9,
+                                        f.mark_iv_1e9,
+                                        f.underlying_px_1e9,
+                                        f.open_interest_1e6,
+                                        f.delta_1e9,
+                                        f.gamma_1e9,
+                                        f.vega_1e6,
+                                        f.theta_1e6,
+                                    ));
+                                    Dispatch::OptSummary
+                                }
+                                None => Dispatch::Nothing,
+                            }
+                        }
                         DeribitChannel::Ticker => match parse_ticker(payload, sym) {
                             Some(tk) => {
                                 // §6.5 capture: v0 = mark px ×1e6
@@ -1175,6 +1222,7 @@ fn handle_data_frame<C: Capture>(
             }
         }
         Dispatch::Ticker => status.add_msgs(1),
+        Dispatch::OptSummary => status.add_msgs(1),
         Dispatch::Trades { sym, sym_idx, scan } => {
             status.add_msgs(scan.rows_parsed as u64);
             let mut r = 0;
@@ -2386,9 +2434,11 @@ mod tests {
     }
 
     #[test]
-    fn masks_put_option_rows_in_the_high_block_quote_only() {
-        // M2.1 partition law: static rows bits 0..64, option rows one
-        // quote bit each at 64 + opt_idx — depth never touches them.
+    fn masks_fold_option_rows_into_one_bit_requiring_all_channels() {
+        // M2 partition law: static rows bits 0..64; option rows ONE
+        // bit each at 64 + opt_idx, folded over quote + ticker (M2.3)
+        // — found only when BOTH channels are acknowledged; depth
+        // never touches them.
         let mut syms = test_symbols(); // 2 static rows
         syms.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
         syms.insert_option(b"BTC-27MAR26-100000-P", 514).unwrap();
@@ -2399,11 +2449,16 @@ mod tests {
         // Depth adds book bits for STATIC rows only.
         let e_depth = expected_mask(&syms, true);
         assert_eq!(e_depth, (0b1111u128 | (0b1111 << 4)) | opt_part);
-        // A subscribe ack listing one option quote sets exactly its
-        // high-block bit; the option's ticker name must NOT count.
-        let payload =
-            br#"["quote.BTC-27MAR26-100000-P","ticker.BTC-27MAR26-100000-C.100ms"]"#;
-        let f = found_mask(payload, &syms, false);
+        // Quote alone does NOT confirm an option row…
+        let quote_only = br#"["quote.BTC-27MAR26-100000-P"]"#;
+        assert_eq!(found_mask(quote_only, &syms, false), 0);
+        // …ticker alone doesn't either…
+        let ticker_only = br#"["ticker.BTC-27MAR26-100000-P.100ms"]"#;
+        assert_eq!(found_mask(ticker_only, &syms, false), 0);
+        // …both together set exactly the row's folded bit (the other
+        // option's stray ticker contributes nothing).
+        let both = br#"["quote.BTC-27MAR26-100000-P","ticker.BTC-27MAR26-100000-P.100ms","ticker.BTC-27MAR26-100000-C.100ms"]"#;
+        let f = found_mask(both, &syms, false);
         assert_eq!(f, 1u128 << (STATIC_MASK_BITS + 1));
     }
 }

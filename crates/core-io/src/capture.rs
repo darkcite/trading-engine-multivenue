@@ -53,7 +53,7 @@
 use std::io;
 use std::path::Path;
 
-use core_types::{Capture, ChannelEvent, NsTs, Signal, Tick};
+use core_types::{Capture, ChannelEvent, NsTs, OptSummary, Signal, Tick};
 
 use crate::pmlr::{PmlrWriter, SlotKind};
 use crate::PreallocatedWriter;
@@ -139,6 +139,7 @@ pub struct PmlrCapture {
     ticks: PmlrWriter,
     events: PmlrWriter,
     signals: PmlrWriter,
+    opt_summaries: PmlrWriter,
     tap: Option<PreallocatedWriter>,
     tap_mode: TapMode,
     tap_budget_left: u64,
@@ -177,6 +178,15 @@ impl PmlrCapture {
             SlotKind::Signal,
             epoch_ns,
         )?;
+        // M2.3: options analytics channel (mvp-plan §9.8). Opened for
+        // EVERY venue like signals — header-only on venues without an
+        // options lane (the house uniform-file-set pattern; the
+        // catalog's other_files sees it by size automatically).
+        let opt_summaries = PmlrWriter::open(
+            dir.join(format!("{venue_label}-opt-summary.pmlr")),
+            SlotKind::OptSummary,
+            epoch_ns,
+        )?;
         let tap = match tap_cfg.mode {
             TapMode::Off => None,
             TapMode::Rejects | TapMode::All => {
@@ -211,6 +221,7 @@ impl PmlrCapture {
             ticks,
             events,
             signals,
+            opt_summaries,
             tap,
             tap_mode: tap_cfg.mode,
             tap_budget_left: tap_cfg.budget_bytes,
@@ -270,6 +281,12 @@ impl PmlrCapture {
         self.signals.records_written()
     }
 
+    /// OptSummary slots staged since open (M2.3).
+    #[inline]
+    pub fn opt_summaries_written(&self) -> u64 {
+        self.opt_summaries.records_written()
+    }
+
     /// Tap records staged since open.
     #[inline]
     pub fn tap_records(&self) -> u64 {
@@ -289,6 +306,7 @@ impl PmlrCapture {
         self.ticks.flush()?;
         self.events.flush()?;
         self.signals.flush()?;
+        self.opt_summaries.flush()?;
         if let Some(t) = self.tap.as_mut() {
             t.flush_staging()?;
         }
@@ -364,6 +382,16 @@ impl Capture for PmlrCapture {
             return;
         }
         if self.signals.append(s).is_err() {
+            self.note_io_error();
+        }
+    }
+
+    #[inline]
+    fn opt_summary(&mut self, o: &OptSummary) {
+        if !self.enabled {
+            return;
+        }
+        if self.opt_summaries.append(o).is_err() {
             self.note_io_error();
         }
     }
@@ -612,6 +640,53 @@ mod tests {
 
         // No tap file in Off mode.
         assert!(!dir.join("okx-raw.tap").exists());
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_roundtrips_opt_summary_channel() {
+        // M2.3: the fourth per-venue channel. Header-only until an
+        // options record is appended; roundtrips byte-exact.
+        let dir = temp_dir("opt_summary");
+        let mut c = PmlrCapture::open(&dir, "deribit", 77, TapCfg::off()).unwrap();
+        // File exists header-only from open (uniform-file-set law).
+        c.flush_all().unwrap();
+        assert_eq!(c.opt_summaries_written(), 0);
+        let o = OptSummary::new(
+            1_000,
+            VenueId::Deribit,
+            core_types::make_symbol_id(VenueId::Deribit, 513),
+            core_types::OPT_SUMMARY_FLAG_MARK_PX | core_types::OPT_SUMMARY_FLAG_OI,
+            52_300_000,          // 0.0523 BTC ×1e9
+            654_300_000,         // IV 0.6543 ×1e9
+            77_216_940_000_000,  // underlying ×1e9
+            1_234_500_000,       // OI 1234.5 ×1e6
+            512_000_000,         // delta 0.512 ×1e9
+            12_340,              // gamma ×1e9
+            152_300_000,         // vega 152.3 ×1e6
+            -85_300_000,         // theta -85.3 ×1e6
+        );
+        c.opt_summary(&o);
+        c.flush_all().unwrap();
+        assert_eq!(c.opt_summaries_written(), 1);
+        assert_eq!(c.io_errors(), 0);
+
+        let r = crate::PmlrReader::<OptSummary>::open(dir.join("deribit-opt-summary.pmlr"))
+            .unwrap();
+        assert_eq!(r.slot_kind(), SlotKind::OptSummary);
+        assert_eq!(r.epoch_ns(), 77);
+        assert_eq!(r.len(), 1);
+        let got = &r.records()[0];
+        assert_eq!(got.ts_ns, 1_000);
+        assert_eq!(got.mark_iv_1e9, 654_300_000);
+        assert_eq!(got.underlying_px_1e9, 77_216_940_000_000);
+        assert_eq!(got.delta_1e9, 512_000_000);
+        assert_eq!(got.theta_1e6, -85_300_000);
+        assert_eq!(
+            got.flags,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX | core_types::OPT_SUMMARY_FLAG_OI
+        );
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
     }

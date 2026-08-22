@@ -761,12 +761,16 @@ pub fn extend_okx_table_with_options(
 /// `depth_enabled` adds the 400-level `books` channel per
 /// instrument (`--okx-depth`; capture + integrity only, §4.5). See
 /// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+/// M2.3: `opt_families` carries the configured option underlyings
+/// (`[okx] options_underlyings`) for the family-keyed `opt-summary`
+/// subscription — empty = no options analytics lane.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_okx(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     symbols: ingress_okx::OkxSymbolTable,
     depth_enabled: bool,
+    opt_families: Vec<String>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
@@ -794,7 +798,10 @@ pub fn spawn_okx(
                 }
             };
 
-            let mut driver = owl::Driver::new(now_ns(), symbols, depth_enabled);
+            // Boot-time (pre-loop) allocation: family byte refs for
+            // the driver's fixed-capacity family table.
+            let fam_refs: Vec<&[u8]> = opt_families.iter().map(|s| s.as_bytes()).collect();
+            let mut driver = owl::Driver::new(now_ns(), symbols, depth_enabled, &fam_refs);
             let mut keepalive = Keepalive::new(OKX_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -2855,6 +2862,13 @@ impl Capture for GaugedCapture {
     #[inline(always)]
     fn signal(&mut self, s: &Signal) {
         self.inner.signal(s);
+    }
+
+    #[inline(always)]
+    fn opt_summary(&mut self, o: &core_types::OptSummary) {
+        // M2.3: forward explicitly — the trait's default body is a
+        // no-op and would silently swallow the channel.
+        self.inner.opt_summary(o);
     }
 
     #[inline(always)]

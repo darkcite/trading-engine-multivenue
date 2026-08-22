@@ -30,6 +30,54 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-22 — SlotKind 6 (OptSummary): the options analytics capture channel (M2.3)
+
+**What changed**
+
+- New PMLR `slot_kind = 6` — `OptSummary` (64 B, layout pinned in
+  `docs/wire-format.md`): mark px / mark IV / BS greeks / open
+  interest / underlying px per option instrument, fed by Deribit
+  option `ticker.{instr}.100ms` and OKX `opt-summary` (BN eapi at
+  M2.4).
+- `core_io::PmlrCapture` opens a FOURTH per-venue file,
+  `<venue>-opt-summary.pmlr`, for EVERY venue (header-only where no
+  options lane exists — the same uniform-file-set law as
+  `<venue>-signals.pmlr`).
+- PMLR **version stays 2** — this is an append-only SlotKind addition;
+  no existing slot layout changed.
+
+**Why**
+
+- mvp-plan §4-M2.3/§9.8: one new capture record on the append-only
+  raw-store doctrine; the strategist digest and audit read it offline.
+
+**Impact**
+
+- On-disk formats: run dirs gain `<venue>-opt-summary.pmlr` per venue.
+  READER COMPAT: pre-M2.3 readers never open the new file (separate
+  name) and are unaffected; `SlotKind::from_u8(6)` decodes only in
+  M2.3+ binaries — an OLD binary reading a NEW file's header reports
+  unknown-kind corruption, which is correct-and-loud, and never
+  happens through the shipped tools (they open files by name/kind).
+  Old run dirs (no opt-summary files) audit exactly as before —
+  audit-replay treats the file as absent.
+- Config keys: none (the options lanes were M2.1/M2.2 config).
+- Wire formats: new `OptSummary` section in `docs/wire-format.md`;
+  Deribit option rows now subscribe `ticker` in addition to `quote`
+  (subscribe-verification folds both into one per-row bit); OKX
+  gains the family-keyed `opt-summary` subscription (2 args).
+
+**Migration steps**
+
+1. None — capture stays append-only; new files appear on the first
+   M2.3 boot.
+
+**Rollback**
+
+- Boot the previous binary: new files stop being written; existing
+  ones remain readable by M2.3+ tools and ignorable garbage-by-name
+  to older tools.
+
 ## 2026-08-15 — SlotKind 5 (ChannelEvent), capture files, raw tap (Phase 8e)
 
 **What changed**

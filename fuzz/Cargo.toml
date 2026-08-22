@@ -185,6 +185,20 @@ doc    = false
 bench  = false
 
 [[bin]]
+name   = "deribit_option_ticker"
+path   = "fuzz_targets/deribit_option_ticker.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "okx_opt_summary"
+path   = "fuzz_targets/okx_opt_summary.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
 name   = "hl_info"
 path   = "fuzz_targets/hl_info.rs"
 test   = false

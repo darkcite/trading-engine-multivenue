@@ -576,3 +576,201 @@ reading from the Session-0 design entry, Deribit `ticker.{opt}` + OKX
 `opt-summary`, wire-format.md + migration.md entries, proptest+fuzz
 per parser, audit-replay coverage/cadence row, catalog extension
 (M2 lands second ⇒ extends).
+
+---
+
+## 2026-08-22 — M2.2 COMMITTED `485cba1`; M2.3 mark/IV channel CODE-COMPLETE (same session)
+
+The Session-0 M2.3 transport reading implemented as recorded: ONE new
+capture record on a NEW PMLR channel (BINDING §4-M2.3/§9.8 wording),
+options-plan §3 supplying the field list.
+
+### The record + channel (core-types / core-io / docs)
+
+- **`OptSummary`** — 64 B `#[repr(C, align(64))]` POD (offsets
+  compile+test-pinned; wire-format.md carries the table): ts_ns / sym
+  / venue / **flags** (bit0 mark_px supplied, bit1 OI supplied — the
+  venue-asymmetry tell) / mark_px_1e9 / mark_iv_1e9 (IV as FRACTION
+  ×1e9) / underlying_px_1e9 / open_interest_1e6 / delta_1e9 /
+  gamma_1e9 / vega_1e6 / theta_1e6. Greeks are BS-style with
+  SATURATING i32 conversion (`sat_i32`; a value at the type bound
+  means saturation — detectable downstream). `AsBytes` + const
+  64-byte assert.
+- `Capture` trait gains default-body `opt_summary()` (additive — no
+  impl breakage; the cli's `GaugedCapture` FORWARDS explicitly, the
+  default no-op would have silently swallowed the channel).
+- `SlotKind::OptSummary = 6`; `PmlrCapture` opens a FOURTH per-venue
+  file `<venue>-opt-summary.pmlr` for EVERY venue (header-only where
+  no options lane — the signals uniform-file-set law). Roundtrip
+  test; PMLR **version stays 2** (append-only kind addition).
+- docs: wire-format.md `OptSummary` section + capture-files list;
+  migration.md dated entry (reader-compat: old readers never open the
+  new file; old binaries reading it report unknown-kind loudly; old
+  run dirs audit unchanged).
+
+### Deribit side (option `ticker` → records)
+
+- Option rows subscribe **quote + ticker.100ms** now (M2.1's
+  quote-only superseded this slice, as planned). Verification mask
+  STAYS u128 via the **fold law**: an option row's channels share ONE
+  per-row bit, set only when EVERY option channel is acked
+  (test-pinned: quote-alone and ticker-alone both fail the row).
+  `MAX_CHANNELS` (SubTable/frame capacity) decouples from the mask:
+  4×16 + 2×64 = 192; TX_BUF 16→24 KiB, SUBSCRIBE_SCRATCH → 16 KiB.
+- `parse_option_ticker` (flat zero-alloc scans; keys unique
+  payload-wide incl. the `greeks` sub-object): mark_price, mark_iv
+  (PERCENT on this wire → /100 to fraction), greeks
+  delta/gamma/vega/theta, open_interest, underlying_price. The
+  futures `parse_ticker` is untouched and can never alias (option
+  tickers lack `current_funding`; futures tickers lack greeks —
+  cross-tested). Dispatch routes ticker by `is_option_row` →
+  `capture.opt_summary` in phase 1, flags = MARK_PX|OI, **nothing
+  enters the engine ring**.
+- Proptest never-panics + NEW fuzz target `deribit_option_ticker`.
+
+### OKX side (`opt-summary` → records)
+
+- `OkxChannel::OptSummary` — the venue's per-FAMILY stream: subscribe
+  args are `instFamily`-keyed (rendered by a channel-keyed branch in
+  `write_op` — zero SubArg shape change), one arg per configured
+  underlying; `OPT_FAMILIES_MAX = 16`; `MAX_SUB_ARGS = 5×16 + 64 +
+  16 = 160`. Driver carries the boot-set family table (new
+  `Driver::new` param; cli `spawn_okx` gains `opt_families`, fed from
+  `[okx] options_underlyings`).
+- `RX_BUF 256 KiB → 2 MiB` — a family-wide push can carry summaries
+  for the WHOLE live family (order-1.5k instruments).
+- Multi-row scan (`scan_opt_summaries`, the trades-scanner pattern):
+  per `"instId":"` row, table lookup — rows for unsubscribed family
+  members are FREE SKIPS (most of the push); OUR rows parse via
+  `parse_opt_summary_row` (quoted-string numbers; **`*BS` greeks**
+  for cross-venue BS coherence; `markVol` is already a fraction;
+  `fwdPx` fills the underlying slot) → capture in phase 1; malformed
+  OUR rows reject + tap. **OKX supplies NO mark px and NO OI on this
+  channel — flags stay 0, fields 0, documented in wire-format.md;
+  the venue's `mark-price`/`open-interest` per-instId channels are a
+  possible additive follow-up, deliberately NOT subscribed in M2.3**
+  (§4-M2.3 names opt-summary only).
+- Family-keyed SubAck registration (`extract_inst_family`); proptest
+  parity + NEW fuzz target `okx_opt_summary`.
+
+### Audit + catalog + alloc gates
+
+- audit-replay: `Stream::OptSummary` rows per venue (the standing
+  SymStat count/rate/cadence machinery; NO cadence band — options
+  are intrinsically sparse, verdict `n/a`) + a per-venue totals line
+  (records / syms / IV-range sanity / with_mark_px / with_oi). The
+  channel has no seq — integrity fields zero by construction.
+  Header-only files don't change pre-M2.3 report shapes.
+- capture-catalog (M3's module, ADDITIVE per the lands-second rule —
+  flagged here for the M3 lane): `RunReport.opt_summaries` (records
+  summed over venues; best-effort, never gates `harness_ok` — the
+  harness reads ticks only, §9.9); JSON gains the field; files stay
+  size-visible in `other_files` as before.
+- bench: NEW `option_analytics_parsers_are_zero_alloc` (both new
+  parsers + record construction, 10k iters, 0 B/op) — the alloc gate
+  grows 36 → **37**.
+
+### Gates (all on the Mac)
+
+- workspace nextest **1208/1208** (+1 skipped) = 1197 + 11 M2.3
+  (core-types layout/saturation, core-io roundtrip, deribit option
+  ticker + subscribe/mask-fold, okx opt-summary parser/scan/ack/args,
+  the pitfall-catch pin).
+- release alloc **37/37** 0 B/op (`--test-threads=1`, corrected
+  clean-guard, fresh `Compiling bench`) — the NEW
+  `option_analytics_parsers_are_zero_alloc` holds 0 B/op.
+- worker pytest **412/412** (Python untouched; run serialized —
+  no concurrent pytest observed).
+- fuzz ≥300 s, both NEW targets clean: `deribit_option_ticker`
+  **193.9M** execs, `okx_opt_summary` **210.1M** execs.
+
+### Live smoke — TWO boots, and the tap EARNED ITS KEEP (pitfall #11)
+
+**Boot 1** (both venues' options policies, `--raw-tap okx,deribit`
+rejects mode, ~2.5 min — ran CONCURRENTLY with the nightly sanitizer
+fuzz builds): the channel worked immediately — deribit-opt-summary
+**12,808 records**, okx-opt-summary **1,725** — but the okx tap held
+**23 KiB: 206 opt-summary SubAcks across 103 distinct connIds**. Two
+findings, one bug:
+
+1. **BUG (caught by the tap, FIXED + test-pinned):** `ack_channel`
+   didn't know `opt-summary` (only `classify` did) ⇒ every
+   opt-summary SubAck fell to `Dispatch::Nothing` → counted as a
+   parse reject and tapped. Fix: the missing arm; pinned by
+   `opt_summary_ack_is_recognized_and_family_keyed`.
+2. **Load finding:** 103 silent reconnects while the sanitizer build
+   starved the drain loop — a full-family snapshot (~600 KiB) behind
+   a bbo backlog no longer fit the 2 MiB rx. Same binary+config with
+   the cores free (boot 2): ZERO reconnects. Mitigation shipped:
+   `RX_BUF_SIZE 2 → 4 MiB` (boot alloc; the launchd engine lives on
+   a Mac that also runs builds — the margin absorbs exactly this).
+
+**Boot 2** (post-fix, cores free, same policies + taps): **ZERO
+`res=Error` across ALL venues** (fresh-terminal-verified — see the
+session fact below), single connection per venue (both taps 64 B
+header-only — no tapped acks, no rejects), gauges 64+64;
+deribit-opt-summary **11,569 records**, okx-opt-summary **781**.
+audit-replay renders the NEW channel:
+
+- `deribit opt-summary totals: records=11569 syms=64
+  iv_1e9=[403500000, 647000000] with_mark_px=11569 with_oi=11569` —
+  all 64 options streaming, full field set, IV 40–65 % (sane).
+- `okx opt-summary totals: records=781 syms=49
+  iv_1e9=[387806395, 696151288] with_mark_px=0 with_oi=0` — the
+  venue-asymmetry flags telling the truth by design; 49/64 syms
+  observed (the venue pushes changed-instrument summaries — far
+  wings without updates simply don't appear in a 2.5-min window;
+  honest venue behavior, recorded).
+- 113 per-sym opt-summary coverage rows; okx/deribit/bn/hl integrity
+  totals ALL ZERO. (pm shows 4 INFORMATIONAL tick-seq regressions
+  with zero pm session errors — ordinary PM feed behavior per the
+  audit's own doc; PM code untouched since M1.)
+
+Universe restored to pre-smoke (options OFF overnight); standing
+launchd lane bootstrapped back (pid verified; it picks up the new
+binary at its next restart per G0).
+
+**NEW SESSION FACT (hard-won): the RustRover REUSED terminal window
+can return STALE/mixed output from earlier commands (it burned two
+investigation loops this slice — phantom `res=Error` lines that were
+in NO file). Evidence-critical reads run in a FRESH terminal
+(`reuseExistingTerminalWindow=false`); files are the only ground
+truth.** (Pitfall-12 extension; also proposed for CLAUDE.md at the
+next shared-doc window.)
+
+### Slice checkpoint — COMMIT ASK (pending operator authorization)
+
+`M2:`-prefixed, EXPLICIT paths only:
+
+- `crates/core-types/src/lib.rs`
+- `crates/core-io/src/pmlr.rs`
+- `crates/core-io/src/capture.rs`
+- `crates/ingress-deribit/src/lib.rs`
+- `crates/ingress-deribit/src/run_loop.rs`
+- `crates/ingress-okx/src/lib.rs`
+- `crates/ingress-okx/src/run_loop.rs`
+- `crates/ingress-okx/tests/okx_tls_loopback.rs`
+- `crates/cli/src/paper.rs`
+- `crates/cli/src/bin/multivenue-engine.rs`
+- `crates/cli/src/audit_replay.rs`
+- `crates/cli/src/capture_catalog.rs` (M3's module — ADDITIVE
+  extension per the lands-second rule; M3 please note the new
+  `opt_summaries` per-run field)
+- `crates/bench/tests/alloc_assertions.rs`
+- `fuzz/Cargo.toml`
+- `fuzz/fuzz_targets/deribit_option_ticker.rs` (new)
+- `fuzz/fuzz_targets/okx_opt_summary.rs` (new)
+- `docs/wire-format.md`
+- `docs/migration.md`
+- `docs/m2-progress.md`
+
+NOT staged: anything of M3's beyond the catalog extension; `.env`;
+`~/multivenue/*`.
+
+**Resume point if context dies here:** M2.3 code-complete + gates
+green + live-smoked twice (bug found/fixed/pinned between); commit
+ask pending; NEXT = M2.4 Binance eapi half-ingress (the largest
+item; clean fallback if the operator rules M2 done at
+Deribit+OKX+channel — mvp-plan §6 risk 2). The §9.8 aggregated-IV
+digest table remains a worker-side follow-up needing an M3
+coordination window (claude-worker is M3-owned).

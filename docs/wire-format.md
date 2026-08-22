@@ -141,6 +141,38 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …) |
 |     48 |    16 | _pad1         | `[u8; 16]`     | explicit, zeroed                        |
 
+### `OptSummary` — 64 bytes (M2.3; PMLR `slot_kind = 6` only, never rings)
+
+Options analytics record (mvp-plan §4-M2.3/§9.8): one record per venue
+push, appended by the owning ingress thread to its per-venue
+`<venue>-opt-summary.pmlr`. CAPTURE-ONLY — never enters the engine
+ring; consumers are offline (audit-replay, the strategist digest).
+Fed by Deribit option `ticker.{instr}.100ms` and OKX `opt-summary`
+(BN eapi joins at M2.4). Values are RAW VENUE UNITS fixed-point
+(Deribit option mark px is coin-denominated); IV is a FRACTION ×1e9
+(Deribit's percent wire value normalized /100); greeks are
+Black-Scholes-style (Deribit `greeks.*`, OKX `*BS`) with SATURATING
+i32 conversion — a value equal to the i32 bound means saturation.
+`flags` records venue-optional fields: bit0 = mark_px supplied,
+bit1 = open_interest supplied (OKX `opt-summary` carries neither in
+M2.3 — both 0 with flags 0; its `fwdPx` fills `underlying_px_1e9`).
+
+| offset | bytes | field             | type           | notes                                    |
+| -----: | ----: | ----------------- | -------------- | ---------------------------------------- |
+|      0 |     8 | ts_ns             | `u64` NsTs     | ingress parse-complete time              |
+|      8 |     4 | sym               | `u32` SymbolId | option sym (base-512 options block)      |
+|     12 |     1 | venue             | `u8` VenueId   |                                          |
+|     13 |     1 | flags             | `u8`           | bit0 mark_px, bit1 open_interest         |
+|     14 |     2 | _pad0             | `[u8; 2]`      | explicit, zeroed                         |
+|     16 |     8 | mark_px_1e9       | `i64`          | raw venue units ×1e9; 0 if flag absent   |
+|     24 |     8 | mark_iv_1e9       | `i64`          | IV fraction ×1e9                         |
+|     32 |     8 | underlying_px_1e9 | `i64`          | Deribit `underlying_price`; OKX `fwdPx`  |
+|     40 |     8 | open_interest_1e6 | `i64`          | raw venue units ×1e6; 0 if flag absent   |
+|     48 |     4 | delta_1e9         | `i32`          | BS delta ×1e9 (exact; \|δ\| ≤ 1)         |
+|     52 |     4 | gamma_1e9         | `i32`          | BS gamma ×1e9, saturating                |
+|     56 |     4 | vega_1e6          | `i32`          | BS vega ×1e6, saturating                 |
+|     60 |     4 | theta_1e6         | `i32`          | BS theta ×1e6, saturating                |
+
 ### `RuleRow` — 64 bytes (8g; row of `RuleTable`, in-process only)
 
 One validated rule of an operator-committed ruleset (8g design §3).
@@ -188,7 +220,9 @@ Per-run capture directory `<MULTIVENUE_LOG_DIR>/run-<epoch_ns>/`,
 per-venue files written by the owning ingress thread
 (`core_io::PmlrCapture`): `<venue>-ticks.pmlr` (kind 0),
 `<venue>-events.pmlr` (kind 5), `<venue>-signals.pmlr` (kind 1;
-header-only on venues that emit none), and optionally
+header-only on venues that emit none),
+`<venue>-opt-summary.pmlr` (kind 6, M2.3; header-only on venues
+without an options lane — the uniform-file-set law), and optionally
 `<venue>-raw.tap`. Staged writes flush at least every 1 s
 (`CAPTURE_FLUSH_INTERVAL_NS`).
 

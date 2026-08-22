@@ -296,6 +296,111 @@ impl Tick {
     }
 }
 
+/// Options analytics record (M2.3, mvp-plan §4-M2.3/§9.8): mark px,
+/// mark IV, greeks, open interest, underlying px — ONE record per
+/// venue push, appended to the per-venue `<venue>-opt-summary.pmlr`
+/// capture channel. CAPTURE-ONLY: never enters the engine ring; the
+/// strategist digest reads it offline.
+///
+/// Layout is fixed-size (64 bytes = one PMLR slot / cache line).
+/// Field conventions (docs/wire-format.md is the pinned law):
+///
+/// * prices/IV/OI are captured in RAW VENUE UNITS scaled fixed-point
+///   (Deribit option mark px is in BTC/ETH; OKX has no mark px in
+///   `opt-summary` — see `flags`). IV is a FRACTION ×1e9 (0.6543 →
+///   654_300_000; Deribit's percent wire value is normalized /100).
+/// * greeks are Black-Scholes-style (Deribit `greeks`, OKX `*BS`
+///   fields), i32 fixed-point with SATURATING conversion — delta and
+///   gamma ×1e9 (|delta| ≤ 1 exact; gamma > ~2.1 saturates), vega
+///   and theta ×1e6 (±2147 units — extreme near-expiry theta
+///   saturates; a saturated value equals the type bound, detectable
+///   downstream).
+/// * `flags` records which OPTIONAL fields the venue supplied.
+#[derive(Copy, Clone, Debug)]
+#[repr(C, align(64))]
+pub struct OptSummary {
+    /// When the ingress thread finished parsing the frame.
+    pub ts_ns: NsTs,
+    /// Resolved option symbol (base-512 options block).
+    pub sym: SymbolId,
+    /// Producing venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// [`OPT_SUMMARY_FLAG_MARK_PX`] | [`OPT_SUMMARY_FLAG_OI`].
+    pub flags: u8,
+    /// Explicit padding — always zero.
+    _pad0: [u8; 2],
+    /// Mark price ×1e9, raw venue units (0 when flag absent).
+    pub mark_px_1e9: i64,
+    /// Mark implied volatility, FRACTION ×1e9.
+    pub mark_iv_1e9: i64,
+    /// Underlying reference px ×1e9 (Deribit `underlying_price`;
+    /// OKX `fwdPx` — the family forward).
+    pub underlying_px_1e9: i64,
+    /// Open interest ×1e6, raw venue units (0 when flag absent).
+    pub open_interest_1e6: i64,
+    /// BS delta ×1e9 (|delta| ≤ 1 ⇒ exact).
+    pub delta_1e9: i32,
+    /// BS gamma ×1e9 (saturating).
+    pub gamma_1e9: i32,
+    /// BS vega ×1e6 (saturating).
+    pub vega_1e6: i32,
+    /// BS theta ×1e6 (saturating).
+    pub theta_1e6: i32,
+}
+
+/// [`OptSummary::flags`] bit: the venue supplied `mark_px_1e9`.
+pub const OPT_SUMMARY_FLAG_MARK_PX: u8 = 1;
+/// [`OptSummary::flags`] bit: the venue supplied `open_interest_1e6`.
+pub const OPT_SUMMARY_FLAG_OI: u8 = 2;
+
+impl OptSummary {
+    /// Construct in one shot; saturates the i32 greek conversions.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        flags: u8,
+        mark_px_1e9: i64,
+        mark_iv_1e9: i64,
+        underlying_px_1e9: i64,
+        open_interest_1e6: i64,
+        delta_1e9: i64,
+        gamma_1e9: i64,
+        vega_1e6: i64,
+        theta_1e6: i64,
+    ) -> Self {
+        Self {
+            ts_ns,
+            sym,
+            venue: venue as u8,
+            flags,
+            _pad0: [0; 2],
+            mark_px_1e9,
+            mark_iv_1e9,
+            underlying_px_1e9,
+            open_interest_1e6,
+            delta_1e9: sat_i32(delta_1e9),
+            gamma_1e9: sat_i32(gamma_1e9),
+            vega_1e6: sat_i32(vega_1e6),
+            theta_1e6: sat_i32(theta_1e6),
+        }
+    }
+}
+
+/// Saturating i64 → i32 (const-friendly; greek fixed-point law).
+#[inline(always)]
+pub const fn sat_i32(v: i64) -> i32 {
+    if v > i32::MAX as i64 {
+        i32::MAX
+    } else if v < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        v as i32
+    }
+}
+
 /// External signal (Binance price move, mempool tx, ...).
 ///
 /// `payload` is a caller-chosen 32-byte inline blob — typically a
@@ -521,6 +626,14 @@ unsafe impl AsBytes for ChannelEvent {}
 // `ai_cmd_layout_is_fully_explicit`); no compiler-inserted padding,
 // every byte initialized.
 unsafe impl AsBytes for AiCmd {}
+
+// SAFETY: OptSummary is `#[repr(C, align(64))]`, `#[derive(Copy)]`,
+// all fields plain integers + an explicit `_pad0` array summing to
+// exactly 64 bytes (checked by `opt_summary_layout_is_fully_explicit`
+// in tests); no compiler-inserted padding, every byte initialized.
+unsafe impl AsBytes for OptSummary {}
+
+const _: () = assert!(core::mem::size_of::<OptSummary>() == 64);
 
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
@@ -1152,6 +1265,12 @@ pub trait Capture {
     #[inline(always)]
     fn tick(&mut self, _t: &Tick) {}
 
+    /// One parsed options analytics record (M2.3, mvp-plan §9.8 —
+    /// Deribit option `ticker`, OKX `opt-summary`, BN eapi at M2.4).
+    /// Capture-only: never pushed to the engine ring.
+    #[inline(always)]
+    fn opt_summary(&mut self, _o: &OptSummary) {}
+
     /// One parsed non-tick channel event.
     #[inline(always)]
     fn event(&mut self, _e: &ChannelEvent) {}
@@ -1618,6 +1737,46 @@ mod tests {
         assert_eq!(::core::mem::size_of::<Signal>(), 64);
         assert_eq!(::core::mem::size_of::<Fill>(), 64);
         assert_eq!(::core::mem::size_of::<Order>(), 64);
+    }
+
+    #[test]
+    fn opt_summary_layout_is_fully_explicit() {
+        // OptSummary: 8+4+1+1+2+8+8+8+8+4+4+4+4 = 64 (M2.3).
+        assert_eq!(::core::mem::size_of::<OptSummary>(), 64);
+        // Field offsets are the docs/wire-format.md pinned law.
+        let o = OptSummary::new(
+            1, VenueId::Deribit, 2, OPT_SUMMARY_FLAG_MARK_PX | OPT_SUMMARY_FLAG_OI,
+            3, 4, 5, 6, 7, 8, 9, 10,
+        );
+        let base = &o as *const OptSummary as usize;
+        assert_eq!(&o.ts_ns as *const _ as usize - base, 0);
+        assert_eq!(&o.sym as *const _ as usize - base, 8);
+        assert_eq!(&o.venue as *const _ as usize - base, 12);
+        assert_eq!(&o.flags as *const _ as usize - base, 13);
+        assert_eq!(&o.mark_px_1e9 as *const _ as usize - base, 16);
+        assert_eq!(&o.mark_iv_1e9 as *const _ as usize - base, 24);
+        assert_eq!(&o.underlying_px_1e9 as *const _ as usize - base, 32);
+        assert_eq!(&o.open_interest_1e6 as *const _ as usize - base, 40);
+        assert_eq!(&o.delta_1e9 as *const _ as usize - base, 48);
+        assert_eq!(&o.gamma_1e9 as *const _ as usize - base, 52);
+        assert_eq!(&o.vega_1e6 as *const _ as usize - base, 56);
+        assert_eq!(&o.theta_1e6 as *const _ as usize - base, 60);
+    }
+
+    #[test]
+    fn opt_summary_greeks_saturate() {
+        assert_eq!(sat_i32(0), 0);
+        assert_eq!(sat_i32(-1_000_000_000), -1_000_000_000);
+        assert_eq!(sat_i32(i64::MAX), i32::MAX);
+        assert_eq!(sat_i32(i64::MIN), i32::MIN);
+        let o = OptSummary::new(
+            1, VenueId::Okx, 2, 0, 0, 650_000_000, 0, 0,
+            10_000_000_000, // delta overflow → saturates
+            5, 5, -10_000_000_000,
+        );
+        assert_eq!(o.delta_1e9, i32::MAX);
+        assert_eq!(o.theta_1e6, i32::MIN);
+        assert_eq!(o.flags, 0);
     }
 
     #[test]

@@ -79,6 +79,9 @@ pub enum SlotKind {
     /// [`core_types::ChannelEvent`] — non-tick channel capture
     /// (Phase 8e, plan §6.5).
     Event = 5,
+    /// [`core_types::OptSummary`] — options analytics capture
+    /// (M2.3, mvp-plan §4-M2.3/§9.8; docs/m2-progress.md).
+    OptSummary = 6,
 }
 
 impl SlotKind {
@@ -99,6 +102,7 @@ impl SlotKind {
             3 => Some(Self::Order),
             4 => Some(Self::AiCmd),
             5 => Some(Self::Event),
+            6 => Some(Self::OptSummary),
             _ => None,
         }
     }
@@ -255,6 +259,7 @@ mod tests {
         // 4 un-reserved in 8f: the AiCmd capture kind (plan §8.4).
         assert_eq!(SlotKind::from_u8(4), Some(SlotKind::AiCmd));
         assert_eq!(SlotKind::from_u8(5), Some(SlotKind::Event));
+        assert_eq!(SlotKind::from_u8(6), Some(SlotKind::OptSummary));
         assert_eq!(SlotKind::from_u8(42), None);
     }
 

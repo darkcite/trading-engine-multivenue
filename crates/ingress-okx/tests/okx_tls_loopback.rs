@@ -229,7 +229,7 @@ fn okx_tls_loopback_yields_expected_tick() {
     let mut transport =
         TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
 
-    let mut driver = Driver::new(0x0C5E, test_symbols(), false);
+    let mut driver = Driver::new(0x0C5E, test_symbols(), false, &[]);
     let status = IngressStatus::new();
     let ring: Arc<Ring<Tick, TICK_RING_CAP>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
@@ -337,7 +337,7 @@ fn okx_tls_loopback_books_gap_triggers_resubscribe() {
         TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
 
     // depth_enabled: books rides in the subscribe batch.
-    let mut driver = Driver::new(0xB00C, test_symbols(), true);
+    let mut driver = Driver::new(0xB00C, test_symbols(), true, &[]);
     let status = IngressStatus::new();
     let ring: Arc<Ring<Tick, TICK_RING_CAP>> = Ring::new();
     let (mut prod, _cons) = ring.split();
@@ -419,7 +419,7 @@ fn okx_tls_loopback_idle_timeout_sends_literal_ping() {
     let mut transport =
         TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
 
-    let mut driver = Driver::new(0x1D1E, test_symbols(), false);
+    let mut driver = Driver::new(0x1D1E, test_symbols(), false, &[]);
     let status = IngressStatus::new();
     let ring: Arc<Ring<Tick, TICK_RING_CAP>> = Ring::new();
     let (mut prod, _cons) = ring.split();

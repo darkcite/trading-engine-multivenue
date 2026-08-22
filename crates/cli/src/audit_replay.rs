@@ -215,6 +215,10 @@ fn band_for(venue: &str, stream: Stream) -> Option<(usize, usize)> {
 enum Stream {
     Ticks,
     Event(ChannelId),
+    /// M2.3 options analytics channel (`<venue>-opt-summary.pmlr`).
+    /// No cadence band: option streams are intrinsically sparse
+    /// (push-on-change on far strikes) — verdict stays `n/a`.
+    OptSummary,
 }
 
 impl Stream {
@@ -222,6 +226,7 @@ impl Stream {
         match self {
             Self::Ticks => "ticks",
             Self::Event(c) => c.as_str(),
+            Self::OptSummary => "opt-summary",
         }
     }
 }
@@ -237,6 +242,16 @@ struct VenueAudit {
     tap_records: u64,
     tap_rejects: u64,
     tap_reject_previews: Vec<String>,
+    /// M2.3 `<venue>-opt-summary.pmlr` per-sym streams (count/rate/
+    /// cadence via the standing SymStat machinery; the channel has no
+    /// seq — integrity fields stay zero by construction).
+    opt_summaries: Vec<SymStat>,
+    /// IV sanity range across the venue's records (×1e9 fraction).
+    opt_iv_min: i64,
+    opt_iv_max: i64,
+    /// Records whose flags said the venue supplied mark px / OI.
+    opt_flag_mark_px: u64,
+    opt_flag_oi: u64,
     files_seen: u32,
     /// Runtime gap-monitor pairing events (G1 remediation): every
     /// `gaps_total` increment writes one `TradeGap`/`BookGap` event —
@@ -286,6 +301,29 @@ fn audit_ticks(venue: &str, r: &PmlrReader<Tick>, out: &mut VenueAudit) {
         }
         s.last_seq = Some(t.venue_seq as u64);
         let _ = venue;
+    }
+}
+
+/// Audit one venue's M2.3 opt-summary log: per-sym count/rate/cadence
+/// + IV sanity range + venue-optional-field flags. Offline path —
+/// allocation permitted (module doctrine).
+fn audit_opt_summaries(r: &PmlrReader<core_types::OptSummary>, out: &mut VenueAudit) {
+    for o in r.records() {
+        let s = stat_for(&mut out.opt_summaries, o.sym);
+        s.note_ts(o.ts_ns);
+        if out.opt_summaries.iter().map(|s| s.count).sum::<u64>() == 1 {
+            out.opt_iv_min = o.mark_iv_1e9;
+            out.opt_iv_max = o.mark_iv_1e9;
+        } else {
+            out.opt_iv_min = out.opt_iv_min.min(o.mark_iv_1e9);
+            out.opt_iv_max = out.opt_iv_max.max(o.mark_iv_1e9);
+        }
+        if o.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 {
+            out.opt_flag_mark_px += 1;
+        }
+        if o.flags & core_types::OPT_SUMMARY_FLAG_OI != 0 {
+            out.opt_flag_oi += 1;
+        }
     }
 }
 
@@ -673,6 +711,25 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
             a.files_seen += 1;
         }
 
+        // M2.3: the options analytics channel (header-only on venues
+        // without an options lane — counted as seen only when it
+        // carries records, so pre-M2.3 output shapes are preserved
+        // for runs without options).
+        let opt_path = dir.join(format!("{label}-opt-summary.pmlr"));
+        if opt_path.exists() {
+            let r = PmlrReader::<core_types::OptSummary>::open(&opt_path)?;
+            if r.slot_kind() != SlotKind::OptSummary {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not an opt-summary log", opt_path.display()),
+                ));
+            }
+            if r.len() > 0 {
+                audit_opt_summaries(&r, &mut a);
+                a.files_seen += 1;
+            }
+        }
+
         let tap_path = dir.join(format!("{label}-raw.tap"));
         if tap_path.exists() {
             audit_tap(&tap_path, &mut a)?;
@@ -745,6 +802,22 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
             render_stream(&mut report, label, Stream::Ticks, &a.ticks);
             for (ch, stats) in &a.events {
                 render_stream(&mut report, label, Stream::Event(*ch), stats);
+            }
+            // M2.3: the options analytics channel's coverage/cadence
+            // rows + a per-venue totals line (IV sanity range +
+            // venue-optional-field counts).
+            render_stream(&mut report, label, Stream::OptSummary, &a.opt_summaries);
+            if !a.opt_summaries.is_empty() {
+                report.push_str(&format!(
+                    "  {} opt-summary totals: records={} syms={} iv_1e9=[{}, {}] with_mark_px={} with_oi={}\n",
+                    label,
+                    a.opt_summaries.iter().map(|s| s.count).sum::<u64>(),
+                    a.opt_summaries.len(),
+                    a.opt_iv_min,
+                    a.opt_iv_max,
+                    a.opt_flag_mark_px,
+                    a.opt_flag_oi,
+                ));
             }
             if a.signals_count > 0 {
                 report.push_str(&format!(
