@@ -235,6 +235,11 @@ pub fn parse_price_change_row(
 /// decimal digits.
 pub const PM_ASSET_ID_MAX: usize = 80;
 
+/// Maximum asset ids in one market-channel subscribe (M1 multi-market
+/// boot cap: 64 markets × YES/NO tokens; `core-config::universe`
+/// enforces the market-entry cap upstream).
+pub const PM_SUBSCRIBE_IDS_MAX: usize = 128;
+
 /// Serialize the market-channel subscribe frame the CLOB WS host
 /// (`ws-subscriptions-clob.polymarket.com/ws/market`) requires
 /// before it sends anything:
@@ -243,23 +248,56 @@ pub const PM_ASSET_ID_MAX: usize = 80;
 /// Discovered live 2026-08-14: without this frame the server stays
 /// silent and the endpoint path `/ws/` (pre-8d value) 404s — the
 /// Phase-1 run loop had never been proven against the venue because
-/// D1 masked it. Single asset for now; the multi-asset form arrives
-/// with 8e Gamma discovery. Returns the byte length, `None` if the
-/// id is empty/oversized or `dst` is too small.
+/// D1 masked it. Returns the byte length, `None` if the id is
+/// empty/oversized or `dst` is too small. Single-id form of
+/// [`write_market_subscribe_multi`] — byte-identical output for one
+/// id (pinned by test).
 #[inline]
 pub fn write_market_subscribe(dst: &mut [u8], asset_id: &[u8]) -> Option<usize> {
-    if asset_id.is_empty() || asset_id.len() > PM_ASSET_ID_MAX {
+    write_market_subscribe_multi(dst, &[asset_id])
+}
+
+/// Serialize the N-id market-channel subscribe (M1 multi-market):
+/// `{"assets_ids":["<id0>","<id1>",…],"type":"market"}`.
+///
+/// Returns the byte length; `None` if the list is empty or larger
+/// than [`PM_SUBSCRIBE_IDS_MAX`], any id is empty/oversized, or
+/// `dst` is too small. Zero-alloc: pure byte copies into `dst`.
+pub fn write_market_subscribe_multi(dst: &mut [u8], ids: &[&[u8]]) -> Option<usize> {
+    if ids.is_empty() || ids.len() > PM_SUBSCRIBE_IDS_MAX {
         return None;
     }
-    const HEAD: &[u8] = b"{\"assets_ids\":[\"";
-    const TAIL: &[u8] = b"\"],\"type\":\"market\"}";
-    let total = HEAD.len() + asset_id.len() + TAIL.len();
+    const HEAD: &[u8] = b"{\"assets_ids\":[";
+    const TAIL: &[u8] = b"],\"type\":\"market\"}";
+    let mut total = HEAD.len() + TAIL.len();
+    for i in 0..ids.len() {
+        if ids[i].is_empty() || ids[i].len() > PM_ASSET_ID_MAX {
+            return None;
+        }
+        // "<id>" plus a leading comma for every id after the first.
+        total += ids[i].len() + 2 + usize::from(i > 0);
+    }
     if dst.len() < total {
         return None;
     }
-    dst[..HEAD.len()].copy_from_slice(HEAD);
-    dst[HEAD.len()..HEAD.len() + asset_id.len()].copy_from_slice(asset_id);
-    dst[HEAD.len() + asset_id.len()..total].copy_from_slice(TAIL);
+    let mut w = 0usize;
+    dst[w..w + HEAD.len()].copy_from_slice(HEAD);
+    w += HEAD.len();
+    for i in 0..ids.len() {
+        if i > 0 {
+            dst[w] = b',';
+            w += 1;
+        }
+        dst[w] = b'"';
+        w += 1;
+        dst[w..w + ids[i].len()].copy_from_slice(ids[i]);
+        w += ids[i].len();
+        dst[w] = b'"';
+        w += 1;
+    }
+    dst[w..w + TAIL.len()].copy_from_slice(TAIL);
+    w += TAIL.len();
+    debug_assert_eq!(w, total);
     Some(total)
 }
 
@@ -306,6 +344,47 @@ mod tests {
         assert!(write_market_subscribe(&mut dst, &[b'1'; PM_ASSET_ID_MAX + 1]).is_none());
         let mut tiny = [0u8; 16];
         assert!(write_market_subscribe(&mut tiny, b"1234567890").is_none());
+    }
+
+    #[test]
+    fn write_market_subscribe_multi_exact_bytes() {
+        let mut dst = [0u8; 256];
+        let n =
+            write_market_subscribe_multi(&mut dst, &[b"1234567890", b"9876543210"]).unwrap();
+        assert_eq!(
+            &dst[..n],
+            br#"{"assets_ids":["1234567890","9876543210"],"type":"market"}"# as &[u8]
+        );
+    }
+
+    #[test]
+    fn write_market_subscribe_multi_rejects_bad_input() {
+        let mut dst = [0u8; 4096];
+        // Empty list.
+        assert!(write_market_subscribe_multi(&mut dst, &[]).is_none());
+        // Any empty / oversized id.
+        assert!(write_market_subscribe_multi(&mut dst, &[b"1234567890", b""]).is_none());
+        let big = [b'1'; PM_ASSET_ID_MAX + 1];
+        assert!(write_market_subscribe_multi(&mut dst, &[&big]).is_none());
+        // Over the id-count cap.
+        let id: &[u8] = b"1234567890";
+        let too_many = [id; PM_SUBSCRIBE_IDS_MAX + 1];
+        let mut huge = [0u8; 32 * 1024];
+        assert!(write_market_subscribe_multi(&mut huge, &too_many).is_none());
+        // dst too small.
+        let mut tiny = [0u8; 32];
+        assert!(write_market_subscribe_multi(&mut tiny, &[id, id]).is_none());
+    }
+
+    #[test]
+    fn write_market_subscribe_multi_cap_boundary_fits() {
+        // Exactly PM_SUBSCRIBE_IDS_MAX maximal ids must serialize.
+        let big = [b'7'; PM_ASSET_ID_MAX];
+        let ids = [&big[..]; PM_SUBSCRIBE_IDS_MAX];
+        let mut dst = [0u8; 16 * 1024];
+        let n = write_market_subscribe_multi(&mut dst, &ids).expect("cap boundary serializes");
+        assert!(n <= dst.len());
+        assert!(dst[..n].ends_with(br#"],"type":"market"}"#));
     }
 
     #[test]

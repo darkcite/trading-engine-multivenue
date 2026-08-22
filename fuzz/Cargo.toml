@@ -27,6 +27,8 @@ core-net           = { path = "../crates/core-net" }
 core-parse         = { path = "../crates/core-parse" }
 signer-eip712      = { path = "../crates/signer-eip712" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
+# universe_toml: the M1 boot-universe config parser (core-config).
+core-config        = { path = "../crates/core-config" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -178,6 +180,13 @@ bench  = false
 [[bin]]
 name   = "pm_gamma_markets"
 path   = "fuzz_targets/pm_gamma_markets.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "universe_toml"
+path   = "fuzz_targets/universe_toml.rs"
 test   = false
 doc    = false
 bench  = false

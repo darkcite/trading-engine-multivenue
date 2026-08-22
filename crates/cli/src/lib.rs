@@ -37,6 +37,7 @@ pub mod backtest;
 pub mod paper;
 pub mod pinning;
 pub mod sigint;
+pub mod universe_boot;
 
 pub use paper::{
     boot_discovery, build_ai_universe, build_deribit_symbol_table, build_hl_coin_table,

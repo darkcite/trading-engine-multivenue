@@ -119,18 +119,27 @@ struct RunArgs {
     /// a valid `.env` with `POLYMARKET_EIP712_KEY`. Default OFF.
     #[arg(long, default_value_t = false)]
     live: bool,
-    /// Binance symbol string (lowercase, no separator), e.g. `btcusdt`.
-    #[arg(long, default_value = "btcusdt")]
-    binance_symbol: String,
-    /// Internal SymbolId for the Binance pair. Compact u32 used inside
-    /// the engine; must match the run-loop driver argument.
-    #[arg(long, default_value_t = 7u32)]
-    binance_sym_id: u32,
-    /// Internal SymbolId for the Polymarket market paired with the
-    /// Binance symbol above. The Polymarket SymbolMap must resolve the
-    /// market's asset_id to this same id.
-    #[arg(long, default_value_t = 42u32)]
-    polymarket_sym_id: u32,
+    /// Universe config file (M1; TOML subset — see
+    /// `universe.toml.example`). Explicit path must exist. Absent:
+    /// `~/multivenue/universe.toml` is used IF present, else the
+    /// legacy flag-driven boot. Per-venue flags override the file.
+    #[arg(long)]
+    universe: Option<PathBuf>,
+    /// Binance spot symbol (lowercase, no separator), e.g. `btcusdt`.
+    /// Legacy default `btcusdt`; with a universe config this flag
+    /// OVERRIDES the config's spot list with the one symbol.
+    #[arg(long)]
+    binance_symbol: Option<String>,
+    /// Internal SymbolId for the Binance spot symbol (legacy anchor 7
+    /// when unset). With a universe config, requires
+    /// `--binance-symbol`.
+    #[arg(long)]
+    binance_sym_id: Option<u32>,
+    /// Internal SymbolId for the first Polymarket market (legacy
+    /// anchor 42 when unset). With a universe config, requires
+    /// `--polymarket-asset-id`.
+    #[arg(long)]
+    polymarket_sym_id: Option<u32>,
     /// Comma-separated OKX instIds (e.g. `BTC-USDT,ETH-USD-SWAP`).
     /// The i-th entry (0-based) is allocated SymbolId
     /// `make_symbol_id(Okx, i+1)` — flag order is id order. Empty /
@@ -164,13 +173,15 @@ struct RunArgs {
     /// subscribed — it feeds the §6.2 staleness monitor.
     #[arg(long)]
     hl_coins: Option<String>,
-    /// Polymarket CLOB asset id (token id) for the market above —
-    /// the decimal string from the market's `clobTokenIds`. Required:
-    /// without it the PM symbol map is empty and every Polymarket
-    /// frame fails lookup (defect D1 — zero PM ticks). Boot refuses
-    /// to start rather than run venue-blind.
+    /// Polymarket CLOB asset id (token id) — the decimal string from
+    /// the market's `clobTokenIds`. REQUIRED in legacy mode (no
+    /// universe config): without it the PM symbol map is empty and
+    /// every Polymarket frame fails lookup (defect D1 — zero PM
+    /// ticks); boot refuses to start rather than run venue-blind.
+    /// With a universe config, this flag OVERRIDES the config's
+    /// market list with the one market.
     #[arg(long)]
-    polymarket_asset_id: String,
+    polymarket_asset_id: Option<String>,
     /// Trigger threshold in 1e6 fixed-point units (e.g. `20000` is
     /// $0.02).
     #[arg(long, default_value_t = 20_000i64)]
@@ -460,6 +471,59 @@ fn run(args: RunArgs) -> ExitCode {
 
     let tls_config = TlsTransport::default_client_config();
 
+    // -- M1 universe resolution (config file + flag overrides) --
+    // Pure precedence law in cli::universe_boot; any failure is a
+    // fatal boot error BEFORE side effects (no capture dir, no
+    // discovery, no threads).
+    let config_src = match cli::universe_boot::read_universe_source(args.universe.as_deref()) {
+        Ok(v) => v,
+        Err(reason) => {
+            error!(reason, "universe config read failed");
+            return ExitCode::from(1);
+        }
+    };
+    let boot = match cli::universe_boot::resolve_boot_universe(&cli::universe_boot::UniverseFlags {
+        config_src: config_src.as_deref(),
+        pm_asset_id: args.polymarket_asset_id.as_deref(),
+        pm_sym_id: args.polymarket_sym_id,
+        bn_symbol: args.binance_symbol.as_deref(),
+        bn_sym_id: args.binance_sym_id,
+        okx_symbols: args.okx_symbols.as_deref(),
+        deribit_symbols: args.deribit_symbols.as_deref(),
+        hl_coins: args.hl_coins.as_deref(),
+        okx_depth: args.okx_depth,
+        deribit_depth: args.deribit_depth,
+    }) {
+        Ok(b) => b,
+        Err(reason) => {
+            error!(reason, "universe resolution failed");
+            return ExitCode::from(1);
+        }
+    };
+    info!(
+        from_config = boot.from_config,
+        pm_tokens = boot.allocated.pm_tokens.len(),
+        bn_spot = boot.allocated.bn_spot.len(),
+        bn_usdm = boot.allocated.bn_usdm.len(),
+        pairs = boot.allocated.pairs.len(),
+        "universe resolved"
+    );
+    // M1b interim: the multi-connection Binance lane lands in M1c —
+    // this build boots spot[0] only and says so loudly.
+    if boot.allocated.bn_spot.len() > 1 || !boot.allocated.bn_usdm.is_empty() {
+        warn!(
+            spot = boot.allocated.bn_spot.len(),
+            usdm = boot.allocated.bn_usdm.len(),
+            "binance multi-symbol/futures land in M1c; booting spot[0] only this build"
+        );
+    }
+    let pm_ids: Vec<String> = boot
+        .allocated
+        .pm_tokens
+        .iter()
+        .map(|t| t.token_id.clone())
+        .collect();
+
     // -- Raw-tap flags (Phase 8e §6.5; fail-fast on a bad spec) --
     let raw_tap_cfg = match cli::parse_raw_tap_flags(
         args.raw_tap.as_deref(),
@@ -495,10 +559,10 @@ fn run(args: RunArgs) -> ExitCode {
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
-        args.okx_symbols.as_deref(),
-        args.deribit_symbols.as_deref(),
-        args.hl_coins.as_deref(),
-        &args.polymarket_asset_id,
+        boot.okx_spec.as_deref(),
+        boot.deribit_spec.as_deref(),
+        boot.hl_spec.as_deref(),
+        &pm_ids,
     ) {
         Ok(o) => o,
         Err(reason) => {
@@ -528,7 +592,7 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let bn_path = format!("/ws/{}@bookTicker", args.binance_symbol);
+    let bn_path = format!("/ws/{}@bookTicker", boot.allocated.bn_spot[0].name);
     let bn_ep = match WssEndpoint::resolve(&cfg.binance_ws_host, 443, &bn_path) {
         Ok(e) => e,
         Err(e) => {
@@ -569,7 +633,7 @@ fn run(args: RunArgs) -> ExitCode {
     // path stays a cli const. Symbol table building is unaffected by
     // discovery (unlike OKX it needs no per-instrument `instType`).
     const DERIBIT_WS_PATH: &str = "/ws/api/v2";
-    let deribit_boot = match args.deribit_symbols.as_deref().map(str::trim) {
+    let deribit_boot = match boot.deribit_spec.as_deref().map(str::trim) {
         Some(spec) if !spec.is_empty() => {
             let symbols = match cli::build_deribit_symbol_table(spec) {
                 Ok(t) => t,
@@ -604,7 +668,7 @@ fn run(args: RunArgs) -> ExitCode {
     // WS path stays a cli const. Coin table building is unaffected by
     // discovery (unlike OKX it needs no per-coin metadata).
     const HL_WS_PATH: &str = "/ws";
-    let hl_boot = match args.hl_coins.as_deref().map(str::trim) {
+    let hl_boot = match boot.hl_spec.as_deref().map(str::trim) {
         Some(spec) if !spec.is_empty() => {
             let coins = match cli::build_hl_coin_table(spec) {
                 Ok(t) => t,
@@ -637,9 +701,14 @@ fn run(args: RunArgs) -> ExitCode {
     // before any ingress thread spawns (the tables move into their
     // spawn calls below). Sorted strict-ascending, deduped; feeds
     // `spawn_ai` → `RulesetSidePath` (§4.2 rule-6 membership checks).
+    // M1b: spawn-aligned — every PM token + the Binance symbol this
+    // build actually boots (spot[0]; M1c widens to the full BN set).
+    let pm_syms: Vec<core_types::SymbolId> =
+        boot.allocated.pm_tokens.iter().map(|t| t.sym).collect();
+    let bn_syms: Vec<core_types::SymbolId> = vec![boot.allocated.bn_spot[0].sym];
     let ai_universe = cli::build_ai_universe(
-        args.polymarket_sym_id,
-        args.binance_sym_id,
+        &pm_syms,
+        &bn_syms,
         okx_boot.as_ref().map(|(t, _)| t),
         deribit_boot.as_ref().map(|(t, _)| t),
         hl_boot.as_ref().map(|(t, _)| t),
@@ -749,23 +818,31 @@ fn run(args: RunArgs) -> ExitCode {
 
     // -- Spawn ingress threads --
 
-    // D1 fix: the PM symbol map is populated from the configured
-    // asset id instead of `std::iter::empty()`. Venue-wide REST
-    // discovery (above) validates it against the live venue.
-    let pm_map = ingress_polymarket::run_loop::SymbolMap::from_pairs([(
-        args.polymarket_asset_id.clone().into_bytes(),
-        args.polymarket_sym_id,
-    )]);
+    // D1 fix + M1 multi-market: the PM symbol map carries EVERY
+    // configured token id → sym pair. Venue-wide REST discovery
+    // (above) validated each against the live venue.
+    let pm_map = ingress_polymarket::run_loop::SymbolMap::from_pairs(
+        boot.allocated
+            .pm_tokens
+            .iter()
+            .map(|t| (t.token_id.clone().into_bytes(), t.sym)),
+    );
     info!(
-        asset_id = %args.polymarket_asset_id,
-        sym_id = args.polymarket_sym_id,
+        markets = boot.allocated.pm_tokens.len(),
+        first_sym = boot.allocated.pm_tokens[0].sym,
         "polymarket: symbol map configured"
     );
+    let pm_id_bytes: Vec<Vec<u8>> = boot
+        .allocated
+        .pm_tokens
+        .iter()
+        .map(|t| t.token_id.clone().into_bytes())
+        .collect();
     let pm_handle = match spawn_polymarket(
         pm_ep,
         tls_config.clone(),
         pm_map,
-        args.polymarket_asset_id.clone().into_bytes(),
+        pm_id_bytes,
         pm_prod,
         statuses.polymarket.clone(),
         1,
@@ -786,7 +863,7 @@ fn run(args: RunArgs) -> ExitCode {
     let bn_handle = match spawn_binance(
         bn_ep,
         tls_config.clone(),
-        args.binance_sym_id,
+        boot.allocated.bn_spot[0].sym,
         bn_prod,
         statuses.binance.clone(),
         2,
@@ -808,14 +885,14 @@ fn run(args: RunArgs) -> ExitCode {
     if let Some((okx_symbols, okx_ep)) = okx_boot {
         info!(
             instruments = okx_symbols.len(),
-            depth = args.okx_depth,
+            depth = boot.okx_depth,
             "okx: starting ingress thread"
         );
         let okx_handle = match spawn_okx(
             okx_ep,
             tls_config.clone(),
             okx_symbols,
-            args.okx_depth,
+            boot.okx_depth,
             okx_prod,
             statuses.okx.clone(),
             5,
@@ -843,14 +920,14 @@ fn run(args: RunArgs) -> ExitCode {
     if let Some((deribit_symbols, deribit_ep)) = deribit_boot {
         info!(
             instruments = deribit_symbols.len(),
-            depth = args.deribit_depth,
+            depth = boot.deribit_depth,
             "deribit: starting ingress thread"
         );
         let deribit_handle = match spawn_deribit(
             deribit_ep,
             tls_config.clone(),
             deribit_symbols,
-            args.deribit_depth,
+            boot.deribit_depth,
             deribit_prod,
             statuses.deribit.clone(),
             6,
@@ -1015,10 +1092,17 @@ fn run(args: RunArgs) -> ExitCode {
         ruleset_tables: ruleset_table_cons,
     };
     let engine_cfg = EngineConfig {
-        pairs: vec![StrategyPair {
-            polymarket: args.polymarket_sym_id,
-            binance: args.binance_sym_id,
-        }],
+        // M1: pairs from the resolved universe ([pairs] map or the
+        // default first-PM × first-BN-spot).
+        pairs: boot
+            .allocated
+            .pairs
+            .iter()
+            .map(|&(pm, bn)| StrategyPair {
+                polymarket: pm,
+                binance: bn,
+            })
+            .collect(),
         threshold_1e6: args.threshold_1e6,
         qty_1e6: args.qty_1e6,
         cooldown_ns: args.cooldown_ns,
@@ -1138,7 +1222,7 @@ fn run(args: RunArgs) -> ExitCode {
             let mut kw = [0u8; 16];
             let n = b"halving".len().min(16);
             kw[..n].copy_from_slice(&b"halving"[..n]);
-            let mapping = vec![(args.polymarket_sym_id, kw, n as u8)];
+            let mapping = vec![(boot.allocated.pm_tokens[0].sym, kw, n as u8)];
             info!("running rule-tree PAPER — no orders will be submitted");
             engine_loop_rule_tree_full(
                 cons,
@@ -1214,7 +1298,7 @@ fn run(args: RunArgs) -> ExitCode {
             let mut kw = [0u8; 16];
             let n = b"halving".len().min(16);
             kw[..n].copy_from_slice(&b"halving"[..n]);
-            let mapping = vec![(args.polymarket_sym_id, kw, n as u8)];
+            let mapping = vec![(boot.allocated.pm_tokens[0].sym, kw, n as u8)];
             let rules = args
                 .rules_path
                 .as_deref()

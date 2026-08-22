@@ -1,0 +1,50 @@
+# universe.toml — boot-universe config (Stage 2.5 M1; docs/mvp-progress.md)
+#
+# Copy to ~/multivenue/universe.toml (the default path; --universe <path>
+# overrides). Absent file + no flag = legacy flag-driven boot. Per-venue
+# CLI flags OVERRIDE that venue's section when explicitly passed.
+#
+# Grammar is a strict TOML subset (core-config::universe): [sections],
+# key = ["string", …] arrays (multiline ok, trailing comma ok),
+# key = true|false. Unknown sections/keys are fatal. No escapes in
+# strings. A `#` inside a string (e.g. HIP-4 "#330") is literal.
+
+[polymarket]
+# M1-R1 (operator ruling): crypto up/down binary markets ONLY.
+# Entry forms:
+#   "<token-id>"        — one market, single CLOB token (decimal string)
+#   "<yes-id>:<no-id>"  — one market, YES/NO token pair
+# NOTE: crypto up/down markets are short-dated — refresh this list via
+# the worker Gamma lane (semi-manual until M3's daily-restart recipe).
+# SymbolIds: first token → 42 (legacy anchor), then namespaced ordinals.
+markets = [
+  "57748138085022719760345772310040703848567377822400132842014290209986511882046",
+]
+
+[binance]
+# Lowercase stream symbols. spot[0] → SymbolId 7 (legacy anchor), then
+# namespaced; usdm ordinals live in a disjoint block (base 512).
+# usdm streams connect to BINANCE_FUT_WS_HOST (default fstream.binance.com).
+spot = ["btcusdt"]
+usdm = []
+
+[okx]
+# instIds, file order = ordinal order (make_symbol_id(Okx, i+1)).
+instruments = []
+# Also subscribe the 400-level books channel (capture + integrity only).
+depth = false
+
+[deribit]
+instruments = []
+depth = false
+
+[hyperliquid]
+# Coins; HIP-4 "#<enc>" outcome coins and spot "@<idx>" pairs are
+# ordinary items.
+coins = []
+
+[pairs]
+# Latency-arb pairs: "P:B" = polymarket.markets[P] × binance.spot[B]
+# (0-based file order; a YES/NO market entry resolves to its YES token).
+# Empty/absent with both sides configured ⇒ default pair "0:0".
+map = ["0:0"]

@@ -12,8 +12,12 @@ description  = "Boot-time config loader: reads the single `.env` file via dotenv
 path = "src/lib.rs"
 
 [dependencies]
+core-types = { workspace = true }
 dotenvy = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+proptest = { workspace = true }

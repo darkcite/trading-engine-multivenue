@@ -56,9 +56,15 @@ use crate::{
 /// fit comfortably in 16 KiB; we size to 64 KiB to absorb bursts.
 pub const RX_BUF_SIZE: usize = 64 * 1024;
 
-/// Size of the tx byte buffer. Only used for the handshake + occasional
-/// pong replies, so 4 KiB is generous.
-pub const TX_BUF_SIZE: usize = 4 * 1024;
+/// Size of the tx byte buffer. Holds the handshake, pong replies and
+/// the market subscribe — which since M1 multi-market can carry up to
+/// [`crate::PM_SUBSCRIBE_IDS_MAX`] ids (≈ 10.7 KiB payload worst
+/// case, plus WS framing), so 16 KiB.
+pub const TX_BUF_SIZE: usize = 16 * 1024;
+
+/// Worst-case market-subscribe payload: every id maximal, full cap.
+/// `{"assets_ids":[…]}` envelope + 128 × (80 + 3) bytes < 11 KiB.
+const SUBSCRIBE_SCRATCH: usize = 11 * 1024;
 
 /// Compile-time guard that the tick-ring capacity is a power of two.
 /// Ring construction itself checks this, but we restate it here because
@@ -215,11 +221,14 @@ pub struct Driver {
     /// Monotonic counter feeding [`ws_mask_from_counter`] for every
     /// outbound frame. Never wraps during a single session.
     mask_counter: u64,
-    /// The CLOB asset id this connection subscribes to (decimal
-    /// uint256 string; single asset until 8e discovery).
-    asset_id: [u8; crate::PM_ASSET_ID_MAX],
-    /// Live bytes of `asset_id`.
-    asset_id_len: u8,
+    /// The CLOB asset ids this connection subscribes to (decimal
+    /// uint256 strings; N ids on ONE connection since M1
+    /// multi-market — one subscribe frame lists them all).
+    asset_ids: [[u8; crate::PM_ASSET_ID_MAX]; crate::PM_SUBSCRIBE_IDS_MAX],
+    /// Live bytes of each row of `asset_ids`.
+    asset_id_lens: [u8; crate::PM_SUBSCRIBE_IDS_MAX],
+    /// Configured id count (rows 0..count of the tables are live).
+    asset_id_count: u16,
     /// Set once the post-upgrade market subscribe has been queued.
     subscribed: bool,
     /// `!Sync` marker — keeps `Driver: Send` but blocks `&Driver`
@@ -232,18 +241,39 @@ impl Driver {
     /// `asset_id` is the decimal CLOB token id sent in the
     /// market-channel subscribe (8d live fix — the venue sends
     /// nothing without it); must be non-empty and at most
-    /// [`crate::PM_ASSET_ID_MAX`] bytes.
+    /// [`crate::PM_ASSET_ID_MAX`] bytes. Single-id form of
+    /// [`Driver::new_multi`].
     pub fn new(nonce_seed: u64, asset_id: &[u8]) -> Self {
+        Self::new_multi(nonce_seed, &[asset_id])
+    }
+
+    /// Multi-market form (M1): one connection subscribing to
+    /// `ids.len()` CLOB token ids in a single market-channel
+    /// subscribe frame. Every id must be non-empty and at most
+    /// [`crate::PM_ASSET_ID_MAX`] bytes; the list must be non-empty
+    /// and at most [`crate::PM_SUBSCRIBE_IDS_MAX`] long (the cli
+    /// validates upstream; debug-asserted here).
+    pub fn new_multi(nonce_seed: u64, ids: &[&[u8]]) -> Self {
         debug_assert!(
-            !asset_id.is_empty() && asset_id.len() <= crate::PM_ASSET_ID_MAX,
-            "polymarket asset id must be 1..={} bytes",
-            crate::PM_ASSET_ID_MAX
+            !ids.is_empty() && ids.len() <= crate::PM_SUBSCRIBE_IDS_MAX,
+            "polymarket asset id count must be 1..={}",
+            crate::PM_SUBSCRIBE_IDS_MAX
         );
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        let mut id_buf = [0u8; crate::PM_ASSET_ID_MAX];
-        let id_len = asset_id.len().min(crate::PM_ASSET_ID_MAX);
-        id_buf[..id_len].copy_from_slice(&asset_id[..id_len]);
+        let mut id_bufs = [[0u8; crate::PM_ASSET_ID_MAX]; crate::PM_SUBSCRIBE_IDS_MAX];
+        let mut id_lens = [0u8; crate::PM_SUBSCRIBE_IDS_MAX];
+        let count = ids.len().min(crate::PM_SUBSCRIBE_IDS_MAX);
+        for i in 0..count {
+            debug_assert!(
+                !ids[i].is_empty() && ids[i].len() <= crate::PM_ASSET_ID_MAX,
+                "polymarket asset id must be 1..={} bytes",
+                crate::PM_ASSET_ID_MAX
+            );
+            let len = ids[i].len().min(crate::PM_ASSET_ID_MAX);
+            id_bufs[i][..len].copy_from_slice(&ids[i][..len]);
+            id_lens[i] = len as u8;
+        }
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -252,8 +282,9 @@ impl Driver {
             expected_accept_val: accept,
             last_activity_ns: 0,
             mask_counter: 0,
-            asset_id: id_buf,
-            asset_id_len: id_len as u8,
+            asset_ids: id_bufs,
+            asset_id_lens: id_lens,
+            asset_id_count: count as u16,
             subscribed: false,
             _not_sync: ::core::marker::PhantomData,
         }
@@ -412,18 +443,21 @@ fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> 
     Ok(())
 }
 
-/// Queue the market-channel subscribe for the configured asset —
+/// Queue the market-channel subscribe for the configured assets —
 /// the venue sends nothing until it arrives (8d live fix; see
-/// [`crate::write_market_subscribe`]). Runs exactly once per
+/// [`crate::write_market_subscribe_multi`]). One frame lists every
+/// configured id (M1 multi-market). Runs exactly once per
 /// connection, on the upgrade→Steady edge.
 fn queue_market_subscribe(drv: &mut Driver) -> io::Result<()> {
     debug_assert!(!drv.subscribed, "market subscribe must be queued exactly once");
-    let mut scratch = [0u8; crate::PM_ASSET_ID_MAX + 48];
-    let n = crate::write_market_subscribe(
-        &mut scratch,
-        &drv.asset_id[..drv.asset_id_len as usize],
-    )
-    .ok_or_else(|| io::Error::other("polymarket: bad asset id for subscribe"))?;
+    let count = drv.asset_id_count as usize;
+    let mut refs: [&[u8]; crate::PM_SUBSCRIBE_IDS_MAX] = [&[]; crate::PM_SUBSCRIBE_IDS_MAX];
+    for i in 0..count {
+        refs[i] = &drv.asset_ids[i][..drv.asset_id_lens[i] as usize];
+    }
+    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
+    let n = crate::write_market_subscribe_multi(&mut scratch, &refs[..count])
+        .ok_or_else(|| io::Error::other("polymarket: bad asset ids for subscribe"))?;
     queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
     drv.subscribed = true;
     Ok(())
@@ -886,6 +920,46 @@ mod tests {
         let mut d = build_driver_with_seed(1);
         note_transport_ready(&mut d, Status::Closed);
         assert_eq!(d.state(), State::Closed);
+    }
+
+    /// M1 multi-market: one subscribe frame lists every configured id.
+    /// Unmasks the queued client frame and pins the exact payload.
+    #[test]
+    fn multi_id_subscribe_queued_once_lists_every_id() {
+        let mut d = Driver::new_multi(7, &[b"1234567890", b"9876543210"]);
+        d.set_state(State::Steady);
+        queue_market_subscribe(&mut d).unwrap();
+        assert!(d.subscribed);
+        let out = d.tx.filled();
+        assert_eq!(out[0], 0x81, "FIN + text opcode");
+        assert_eq!(out[1] & 0x80, 0x80, "client frames are masked");
+        let plen = (out[1] & 0x7F) as usize;
+        assert!(plen < 126, "this payload fits the 7-bit length form");
+        assert_eq!(plen, out.len() - 6);
+        let mask = [out[2], out[3], out[4], out[5]];
+        let mut payload = Vec::with_capacity(plen);
+        for i in 0..plen {
+            payload.push(out[6 + i] ^ mask[i % 4]);
+        }
+        assert_eq!(
+            payload.as_slice(),
+            br#"{"assets_ids":["1234567890","9876543210"],"type":"market"}"# as &[u8]
+        );
+    }
+
+    /// Reconnect keeps the configured id table; only `subscribed`
+    /// resets — the next upgrade re-queues the same multi subscribe.
+    #[test]
+    fn reconnect_preserves_multi_id_table() {
+        let mut d = Driver::new_multi(7, &[b"1234567890", b"9876543210"]);
+        d.set_state(State::Steady);
+        queue_market_subscribe(&mut d).unwrap();
+        d.reset_for_reconnect(8);
+        assert!(!d.subscribed);
+        assert_eq!(d.asset_id_count, 2);
+        d.set_state(State::Steady);
+        queue_market_subscribe(&mut d).unwrap();
+        assert!(d.subscribed);
     }
 
     #[test]

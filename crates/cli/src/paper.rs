@@ -336,7 +336,7 @@ pub fn spawn_polymarket(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     symbol_map: pwl::SymbolMap,
-    asset_id: Vec<u8>,
+    asset_ids: Vec<Vec<u8>>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
@@ -364,7 +364,12 @@ pub fn spawn_polymarket(
                 }
             };
 
-            let mut driver = pwl::Driver::new(now_ns(), &asset_id);
+            // M1 multi-market: one connection, one subscribe frame
+            // listing every configured token id (the driver keeps the
+            // table across reconnects).
+            let id_refs: Vec<&[u8]> = asset_ids.iter().map(|v| v.as_slice()).collect();
+            let mut driver = pwl::Driver::new_multi(now_ns(), &id_refs);
+            drop(id_refs);
             let mut keepalive = Keepalive::new(PM_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -1143,19 +1148,21 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// Called ONCE in the bin, after 8e discovery gates the venue
 /// tables and before any thread spawns; boot-time allocation.
 pub fn build_ai_universe(
-    polymarket_sym: SymbolId,
-    binance_sym: SymbolId,
+    polymarket_syms: &[SymbolId],
+    binance_syms: &[SymbolId],
     okx: Option<&ingress_okx::OkxSymbolTable>,
     deribit: Option<&ingress_deribit::DeribitSymbolTable>,
     hl: Option<&ingress_hyperliquid::HlCoinTable>,
 ) -> Arc<[u32]> {
     let mut v: Vec<u32> = Vec::with_capacity(
-        2 + okx.map_or(0, |t| t.len())
+        polymarket_syms.len()
+            + binance_syms.len()
+            + okx.map_or(0, |t| t.len())
             + deribit.map_or(0, |t| t.len())
             + hl.map_or(0, |t| t.len()),
     );
-    v.push(polymarket_sym);
-    v.push(binance_sym);
+    v.extend_from_slice(polymarket_syms);
+    v.extend_from_slice(binance_syms);
     if let Some(t) = okx {
         let mut i = 0usize;
         while let Some((_, sym, _)) = t.get(i) {
@@ -3361,55 +3368,65 @@ pub mod boot_discovery {
     fn run_pm(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
-        asset_id: &str,
+        asset_ids: &[String],
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
     ) -> Result<VenueCoverage, &'static str> {
         let (host, port) = split_host_port(&cfg.polymarket_gamma_host, 443)?;
-        let path = format!("/markets?clob_token_ids={asset_id}");
-        let range = get(tls, host, port, &path, buf).map_err(|e| {
-            tracing::error!(venue = "pm", error = ?e, "discovery: fetch failed");
-            "pm: discovery fetch failed"
-        })?;
-        let mut d = PmDiscovery::new();
-        d.ingest_body(&buf[range]).map_err(|e| {
-            tracing::error!(venue = "pm", error = ?e, "discovery: parse failed");
-            "pm: discovery parse failed"
-        })?;
-
+        // M1 multi-market: one Gamma query per configured id — the
+        // single-id query shape + parse path proven live in 8e/H6a,
+        // looped. 150 ms spacing mirrors the OKX page pacing.
         let mut matched = 0u32;
-        match pm_missing_reason(&d, asset_id.as_bytes()) {
-            None => {
-                matched = 1;
-                // pm_missing_reason == None guarantees find_by_token hits.
-                if let Some(row) = d.find_by_token(asset_id.as_bytes()) {
-                    let sibling = d
-                        .sibling_of(asset_id.as_bytes())
-                        .map(|s| String::from_utf8_lossy(s).into_owned());
-                    tracing::info!(
+        let mut universe = 0u32;
+        for (i, asset_id) in asset_ids.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            let path = format!("/markets?clob_token_ids={asset_id}");
+            let range = get(tls, host, port, &path, buf).map_err(|e| {
+                tracing::error!(venue = "pm", asset_id, error = ?e, "discovery: fetch failed");
+                "pm: discovery fetch failed"
+            })?;
+            let mut d = PmDiscovery::new();
+            d.ingest_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "pm", asset_id, error = ?e, "discovery: parse failed");
+                "pm: discovery parse failed"
+            })?;
+
+            match pm_missing_reason(&d, asset_id.as_bytes()) {
+                None => {
+                    matched += 1;
+                    // pm_missing_reason == None guarantees find_by_token hits.
+                    if let Some(row) = d.find_by_token(asset_id.as_bytes()) {
+                        let sibling = d
+                            .sibling_of(asset_id.as_bytes())
+                            .map(|s| String::from_utf8_lossy(s).into_owned());
+                        tracing::info!(
+                            venue = "pm",
+                            asset_id,
+                            sibling,
+                            neg_risk = row.neg_risk,
+                            tick_1e9 = row.order_price_min_tick_1e9,
+                            min_size_1e6 = row.order_min_size_1e6,
+                            "discovery: pm market resolved"
+                        );
+                    }
+                }
+                Some(reason) => {
+                    *any_missing = true;
+                    tracing::error!(
                         venue = "pm",
-                        asset_id,
-                        sibling,
-                        neg_risk = row.neg_risk,
-                        tick_1e9 = row.order_price_min_tick_1e9,
-                        min_size_1e6 = row.order_min_size_1e6,
-                        "discovery: pm market resolved"
+                        symbol = asset_id,
+                        reason,
+                        "discovery: configured symbol missing from venue universe"
                     );
                 }
             }
-            Some(reason) => {
-                *any_missing = true;
-                tracing::error!(
-                    venue = "pm",
-                    symbol = asset_id,
-                    reason,
-                    "discovery: configured symbol missing from venue universe"
-                );
-            }
+            universe += d.universe_total();
         }
-        let universe = d.universe_total();
-        tracing::info!(venue = "pm", configured = 1, matched, universe, "discovery: coverage");
-        Ok(VenueCoverage { configured: 1, matched, universe })
+        let configured = asset_ids.len() as u32;
+        tracing::info!(venue = "pm", configured, matched, universe, "discovery: coverage");
+        Ok(VenueCoverage { configured, matched, universe })
     }
 
     fn run_okx(
@@ -3586,7 +3603,7 @@ pub mod boot_discovery {
         okx_spec: Option<&str>,
         deribit_spec: Option<&str>,
         hl_spec: Option<&str>,
-        polymarket_asset_id: &str,
+        polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
         let mut any_missing = false;
@@ -3609,7 +3626,7 @@ pub mod boot_discovery {
             None => None,
         };
 
-        let pm = run_pm(cfg, tls_config, polymarket_asset_id, &mut buf, &mut any_missing)?;
+        let pm = run_pm(cfg, tls_config, polymarket_asset_ids, &mut buf, &mut any_missing)?;
 
         Ok(Outcome { any_missing, pm, okx, okx_table, deribit, hl })
     }
@@ -3868,7 +3885,7 @@ mod tests {
         let deribit = build_deribit_symbol_table("BTC-PERPETUAL").unwrap();
         let hl = build_hl_coin_table("BTC,ETH").unwrap();
 
-        let u = build_ai_universe(42, 7, Some(&okx), Some(&deribit), Some(&hl));
+        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl));
         let expect: Vec<u32> = {
             let mut v = vec![
                 42,
@@ -3897,12 +3914,16 @@ mod tests {
     #[test]
     fn ai_universe_dedups_and_handles_absent_venues() {
         // PM and BN misconfigured to the same id: one survivor.
-        let u = build_ai_universe(7, 7, None, None, None);
+        let u = build_ai_universe(&[7], &[7], None, None, None);
         assert_eq!(&u[..], &[7]);
 
         // No optional venues: exactly the sorted pair.
-        let u = build_ai_universe(42, 7, None, None, None);
+        let u = build_ai_universe(&[42], &[7], None, None, None);
         assert_eq!(&u[..], &[7, 42]);
+
+        // M1 multi-market: every PM token + every BN sym flows in.
+        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None);
+        assert_eq!(&u[..], &[2, 3, 7, 42, 16_777_218]);
     }
 
     #[test]
