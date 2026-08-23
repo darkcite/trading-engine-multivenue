@@ -224,6 +224,22 @@ marginal-cost-on-existing-stacks:
   thresholds (net ≤ −$100 / dd ≥ $200), with the §4 step-10 rollback verbs
   as the action; documented as the operating procedure until serve
   unparks at Stage 3.
+- **Digest inventory/state seam (ruling #7, 2026-08-23)**:
+  `build_digest` gains two capped ADDITIVE sections — POSITIONS (the
+  `positions` netting: per-sym exposure + realized/unrealized, HIP-4
+  netted, from captured fills) and PER-STRATEGY P&L (the latest
+  `pnl-<day>.json` per-strategy lines) — so the automated lane sees
+  the same inventory state the semi-manual strategist reads via the
+  `positions`/`pnl` verbs, BEFORE Stage 3 unparks `serve`. Frozen
+  surfaces untouched (digest builder is H5 code; its pinned tests
+  extend additively; empty/absent sources render as honest empty
+  sections, never errors).
+- **Post-restart re-commit runbook step (same ruling)**: a committed
+  ruleset's table is in-memory — the 00:00Z daily restart clears it.
+  The M5 runbook (or a C6+-window script) re-stages + re-commits the
+  registry's active ruleset after each turn; without it the M5 exit
+  criterion ("trading paper on the full universe") silently lapses at
+  the first midnight.
 - Exit: a Fable-5(-in-session) ruleset promoted on real capture, trading
   paper on the full universe, walk-forward checked by runbook, shadow-P&L
   reported. **Est: 2–3 d.**
@@ -316,6 +332,14 @@ observed live — BEFORE any executor/risk/dispatcher work begins.
    permanent in `.env`** (operator-directed append; 600 perms,
    gitignored, value never displayed) — engine dotenvy + worker
    BaseConfig read it; no per-invocation env prefixes anymore.
+7. (2026-08-23) **M5 scope additions — inventory state to the AI**:
+   (a) `build_digest` gains POSITIONS + PER-STRATEGY P&L capped
+   sections (sources: the `positions` netting + `pnl-<day>.json`) —
+   closing the audited gap where the digest carried features/universe/
+   news/walk-forward but NO inventory; (b) the M5 runbook gains the
+   post-00:00Z ruleset re-commit step (committed tables are in-memory;
+   the daily restart clears them). Recorded in-session at the
+   full-scope-flip conversation; details in §4-M5.
 
 Open questions (answer during M1/M2 design, none blocking M0):
 - Options universe policy defaults: how many expiries × strikes per
