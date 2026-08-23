@@ -1330,6 +1330,16 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // M4.1: the order-intent log opens beside the fills capture —
+    // same §6.5 stance (capture is the product; open failure fatal).
+    let obs = match cli::open_orders_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_orders_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "orders capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
 
     // -- Main thread: real engine loop until SIGINT --
     let cons = Consumers {

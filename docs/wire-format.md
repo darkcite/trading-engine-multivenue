@@ -75,7 +75,12 @@ files predate it (see `docs/migration.md`).
 |     40 |    16 | _pad1     | `[u8; 16]`     | explicit, zeroed                |
 |     56 |     8 | _pad2     | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1) |
 
-### `Order` — 64 bytes
+### `Order` — 64 bytes (layout amended M4.1, pre-first-capture — see docs/migration.md)
+
+Captured to `engine-orders.pmlr` (`slot_kind = 3`) since M4.1 — the
+per-run strategy-intent log (`audit-pnl` input, §9.9). Before M4.1 no
+Order slot was ever persisted, so the `strategy_id` addition has zero
+reader-compat surface.
 
 | offset | bytes | field       | type           | notes                           |
 | -----: | ----: | ----------- | -------------- | ------------------------------- |
@@ -88,7 +93,8 @@ files predate it (see `docs/migration.md`).
 |     24 |     8 | qty         | `i64` Qty      |                                 |
 |     32 |     8 | client_oid  | `u64`          | engine-assigned, monotonic      |
 |     40 |     1 | venue       | `u8` VenueId   | routing target (v2+; garbage in v1) |
-|     41 |    15 | _pad1       | `[u8; 15]`     | explicit, zeroed                |
+|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=ev 2=cross-arb 3=rule-tree 4=ai-exec 5=vm), stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
+|     42 |    14 | _pad1       | `[u8; 14]`     | explicit, zeroed                |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed                |
 
 ### `AiCmd` — 64 bytes (8f; `ingress-ai` ring + PMLR `slot_kind = 4`)
@@ -225,6 +231,13 @@ header-only on venues that emit none),
 without an options lane — the uniform-file-set law), and optionally
 `<venue>-raw.tap`. Staged writes flush at least every 1 s
 (`CAPTURE_FLUSH_INTERVAL_NS`).
+
+Engine-side single-file sinks (`core_io::SlotCapture`) in the same
+run dir: `engine-fills.pmlr` (kind 2, Phase 8f — every fill
+dispatched to `Strategy::on_fill`, venue lanes + dispatcher pump),
+`engine-orders.pmlr` (kind 3, M4.1 — every order ACCEPTED by the
+dispatcher via `ctx.submit`; refusals are counters only), and
+`ai-cmds.pmlr` (kind 4, written by `ingress-ai`).
 
 ### Options manifest — `options-manifest.tsv` (M2 close)
 

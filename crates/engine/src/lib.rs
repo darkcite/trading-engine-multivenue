@@ -42,6 +42,13 @@ use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
 /// open positions via replay, never via a new IPC channel (design §2).
 pub const ENGINE_FILLS_FILE: &str = "engine-fills.pmlr";
 
+/// Engine-thread order-intent capture (M4.1 M-a): every order the
+/// dispatcher ACCEPTED via `ctx.submit`, staged next to the fills
+/// file. Refusals (ring-full etc.) remain counters only. This file is
+/// the `audit-pnl` "logged intents" input (mvp-plan §9.9) — before it
+/// existed, paper mode captured neither intents nor fills.
+pub const ENGINE_ORDERS_FILE: &str = "engine-orders.pmlr";
+
 // ---------------------------------------------------------------
 // Compile-time ring sizes + lane geometry
 // ---------------------------------------------------------------
@@ -145,6 +152,13 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// [`Self::maybe_flush_fill_capture`] from the cli report tick +
     /// an unconditional drain in [`Self::stop`].
     fill_capture: Option<SlotCapture<Fill>>,
+    /// Engine-thread order-intent capture → [`ENGINE_ORDERS_FILE`]
+    /// (M4.1 M-a). `None` when the cli did not wire one. Appended in
+    /// `EngineCtx::submit` AFTER the dispatcher accepts — the intent
+    /// log records what was TAKEN; refusals remain counters. Flush
+    /// rides [`Self::maybe_flush_fill_capture`]'s caller cadence via
+    /// [`Self::maybe_flush_order_capture`] + the [`Self::stop`] drain.
+    order_capture: Option<SlotCapture<Order>>,
     last_timer_ns: NsTs,
     /// Number of iterations completed (wraps on u64; for paper-mode stats).
     pub iterations: u64,
@@ -219,6 +233,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             ai_dispatched: 0,
             ai_drain_malformed: 0,
             fill_capture: None,
+            order_capture: None,
             last_timer_ns: 0,
             iterations: 0,
             ticks_dispatched: 0,
@@ -237,6 +252,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         let mut ctx = EngineCtx {
             disp: &mut self.disp,
             decide_lat: &self.decide_lat,
+            order_capture: self.order_capture.as_mut(),
             now: now_ns(),
         };
         self.strat.on_start(&mut ctx)
@@ -281,6 +297,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
                             now,
                         };
                         self.strat.on_tick(&t, &mut ctx);
@@ -303,6 +320,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
+                        order_capture: self.order_capture.as_mut(),
                         now,
                     };
                     self.strat.on_signal(&s, &mut ctx);
@@ -331,6 +349,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
                             now,
                         };
                         self.strat.on_fill(&f, &mut ctx);
@@ -363,6 +382,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
+                        order_capture: self.order_capture.as_mut(),
                         now,
                     };
                     self.strat.on_fill(&f, &mut ctx);
@@ -426,6 +446,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
                             now,
                         };
                         self.strat.on_ai(&cmd, &mut ctx);
@@ -446,6 +467,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 let mut ctx = EngineCtx {
                     disp: &mut self.disp,
                     decide_lat: &self.decide_lat,
+                    order_capture: self.order_capture.as_mut(),
                     now,
                 };
                 self.strat.on_timer(now, &mut ctx);
@@ -572,6 +594,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.fill_capture = Some(cap);
     }
 
+    /// Attach the engine-thread order-intent capture (M4.1; boot-only,
+    /// before [`Self::start`]). The cli opens [`ENGINE_ORDERS_FILE`]
+    /// inside the per-run capture directory and hands it over here.
+    pub fn set_order_capture(&mut self, cap: SlotCapture<Order>) {
+        self.order_capture = Some(cap);
+    }
+
     /// Drain staged fills to disk if the capture flush interval has
     /// elapsed. Called from the cli's 5 s report tick — off the hot
     /// path — so staged fills reach disk within one report period
@@ -580,6 +609,38 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn maybe_flush_fill_capture(&mut self, now_ns: u64) {
         if let Some(cap) = self.fill_capture.as_mut() {
             cap.maybe_flush(now_ns);
+        }
+    }
+
+    /// Drain staged order intents to disk on the same caller cadence
+    /// as the fills capture (cli 5 s report tick). No-op without a
+    /// capture.
+    #[inline]
+    pub fn maybe_flush_order_capture(&mut self, now_ns: u64) {
+        if let Some(cap) = self.order_capture.as_mut() {
+            cap.maybe_flush(now_ns);
+        }
+    }
+
+    /// Orders staged to the intent capture since boot (0 without a
+    /// capture). Mirrored into the `engine_orders_capture_records`
+    /// gauge.
+    #[inline]
+    pub fn order_capture_records(&self) -> u64 {
+        match self.order_capture.as_ref() {
+            Some(cap) => cap.records(),
+            None => 0,
+        }
+    }
+
+    /// Intent-capture I/O errors (first one sticky-disables; 0
+    /// without a capture). Mirrored into the
+    /// `engine_orders_capture_io_errors` gauge.
+    #[inline]
+    pub fn order_capture_io_errors(&self) -> u64 {
+        match self.order_capture.as_ref() {
+            Some(cap) => cap.io_errors(),
+            None => 0,
         }
     }
 
@@ -612,12 +673,17 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         let mut ctx = EngineCtx {
             disp: &mut self.disp,
             decide_lat: &self.decide_lat,
+            order_capture: self.order_capture.as_mut(),
             now: now_ns(),
         };
         self.strat.on_stop(&mut ctx);
         if let Some(cap) = self.fill_capture.as_mut() {
             // Sticky-disable policy: errors here are counted by the
             // sink itself; nothing to propagate at teardown.
+            let _ = cap.flush_all();
+        }
+        if let Some(cap) = self.order_capture.as_mut() {
+            // Same policy for the M4.1 intent log.
             let _ = cap.flush_all();
         }
     }
@@ -647,6 +713,9 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
 struct EngineCtx<'a, D: OrderDispatch> {
     disp: &'a mut D,
     decide_lat: &'a LatencyTracker<24>,
+    /// M4.1 intent log — reborrowed from the engine per callback;
+    /// `None` when the cli wired no capture (tests, replay tooling).
+    order_capture: Option<&'a mut SlotCapture<Order>>,
     now: NsTs,
 }
 
@@ -658,7 +727,19 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
         // callback. Atomic record — never blocks.
         self.decide_lat
             .record(now_ns().saturating_sub(order.ts_ns));
-        self.disp.submit(&order).map_err(|_| SubmitErr::RingFull)
+        match self.disp.submit(&order) {
+            Ok(()) => {
+                // M4.1: capture-what-was-accepted — stage the intent
+                // to engine-orders.pmlr AFTER the dispatcher takes
+                // it; refusals stay counters. Staged copy of one
+                // 64 B slot; zero-alloc (SlotCapture policy).
+                if let Some(cap) = self.order_capture.as_deref_mut() {
+                    cap.append(&order);
+                }
+                Ok(())
+            }
+            Err(_) => Err(SubmitErr::RingFull),
+        }
     }
     #[inline(always)]
     fn now_ns(&self) -> NsTs {
@@ -1045,6 +1126,152 @@ mod tests {
         let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.fill_capture_records(), 0);
         assert_eq!(eng.fill_capture_io_errors(), 0);
+    }
+
+    // ---------------- M4.1: order-intent capture ----------------
+
+    /// A strategy that submits one PM order per tick — the
+    /// intent-capture coverage double.
+    struct SubmitOnTick;
+    impl strategy_core::StrategyCounters for SubmitOnTick {}
+    impl Strategy for SubmitOnTick {
+        fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
+            Ok(())
+        }
+        fn on_tick<C: Ctx>(&mut self, t: &Tick, ctx: &mut C) {
+            let _ = ctx.submit(Order::new(
+                t.ts_ns,
+                VenueId::Polymarket,
+                t.sym,
+                Side::Bid,
+                0,
+                Price::from_raw(410_000),
+                Qty::from_raw(1_000_000),
+                77,
+            ));
+        }
+        fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {}
+        fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {}
+        fn on_ai<C: Ctx>(&mut self, _c: &AiCmd, _ctx: &mut C) {}
+        fn on_ruleset_table(&mut self, _t: &core_types::RuleTable) {}
+        fn on_timer<C: Ctx>(&mut self, _now: u64, _ctx: &mut C) {}
+        fn timer_period_ns(&self) -> u64 {
+            u64::MAX
+        }
+        fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+    }
+
+    #[test]
+    fn orders_capture_logs_accepted_intents() {
+        let dir = std::env::temp_dir().join(format!(
+            "engine_orders_capture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ENGINE_ORDERS_FILE);
+
+        let (mut tp, tc) = split_tick_lanes();
+        let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitOnTick,
+            PaperDispatcher::new(),
+            tc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.set_order_capture(
+            core_io::SlotCapture::open(&path, core_io::SlotKind::Order, 7).unwrap(),
+        );
+        eng.start().unwrap();
+        tp[VenueId::Polymarket as usize]
+            .try_push(mk_tick(VenueId::Polymarket, 1, 1))
+            .unwrap();
+        eng.tick(16);
+        assert_eq!(eng.order_capture_records(), 1, "accepted intent staged");
+        assert_eq!(eng.order_capture_io_errors(), 0);
+        eng.stop(); // drains staging
+
+        let r = core_io::PmlrReader::<Order>::open(&path).unwrap();
+        assert_eq!(r.slot_kind(), core_io::SlotKind::Order);
+        assert_eq!(r.epoch_ns(), 7);
+        assert_eq!(r.len(), 1);
+        let o = r.records()[0];
+        assert_eq!(o.client_oid, 77);
+        assert_eq!(o.sym, 1);
+        // The ENGINE does not stamp attribution — bare strategies
+        // stay STRATEGY_ID_NONE (the set's StampCtx stamps; pinned
+        // in strategy-set tests).
+        assert_eq!(o.strategy_id, core_types::STRATEGY_ID_NONE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dispatcher that refuses everything — capture-what-was-accepted
+    /// means a refused submit is NEVER staged.
+    struct RefuseAllDispatcher;
+    impl OrderDispatch for RefuseAllDispatcher {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Err(DispatchError::QueueFull)
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+    }
+
+    #[test]
+    fn orders_capture_skips_refused_submits() {
+        let dir = std::env::temp_dir().join(format!(
+            "engine_orders_refused_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ENGINE_ORDERS_FILE);
+
+        let (mut tp, tc) = split_tick_lanes();
+        let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitOnTick,
+            RefuseAllDispatcher,
+            tc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.set_order_capture(
+            core_io::SlotCapture::open(&path, core_io::SlotKind::Order, 0).unwrap(),
+        );
+        eng.start().unwrap();
+        tp[VenueId::Polymarket as usize]
+            .try_push(mk_tick(VenueId::Polymarket, 1, 1))
+            .unwrap();
+        eng.tick(16);
+        assert_eq!(eng.order_capture_records(), 0, "refusal is a counter, not a record");
+        eng.stop();
+        let r = core_io::PmlrReader::<Order>::open(&path).unwrap();
+        assert_eq!(r.len(), 0, "header-only file after refused submits");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orders_capture_getters_zero_without_capture() {
+        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        assert_eq!(eng.order_capture_records(), 0);
+        assert_eq!(eng.order_capture_io_errors(), 0);
     }
 
     // ---------------- AI command lane (Phase 8f §11) ----------------

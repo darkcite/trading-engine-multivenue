@@ -2435,6 +2435,79 @@ fn engine_fills_capture_append_is_zero_alloc() {
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
+/// M4.1 (M-a + M-c): the order-intent capture (`SlotCapture<Order>` →
+/// engine-orders.pmlr) and the strategy-set `StampCtx` attribution
+/// stamp must both run zero-alloc — they sit on the engine thread's
+/// submit path.
+#[test]
+fn engine_orders_capture_and_stamp_are_zero_alloc() {
+    use core_io::{SlotCapture, SlotKind};
+    use core_types::{Order, Side, VenueId};
+    use strategy_core::{Ctx, SubmitErr};
+    use strategy_set::{StampCtx, SLOT_VM};
+
+    struct SinkCtx {
+        submitted: u64,
+    }
+    impl Ctx for SinkCtx {
+        #[inline(always)]
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            // The stamp must land BEFORE the sink sees the order.
+            assert_eq!(order.strategy_id, SLOT_VM);
+            self.submitted += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            0
+        }
+    }
+
+    let cap_dir = std::env::temp_dir().join(format!(
+        "stage2_alloc_orders_capture_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    std::fs::create_dir_all(&cap_dir).unwrap();
+    let path = cap_dir.join(engine::ENGINE_ORDERS_FILE);
+    let mut capture: SlotCapture<Order> =
+        SlotCapture::open(&path, SlotKind::Order, 1).unwrap();
+    let mut sink = SinkCtx { submitted: 0 };
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        let o = Order::new(
+            i,
+            VenueId::Polymarket,
+            42,
+            Side::Bid,
+            0,
+            Price::from_raw(410_000),
+            Qty::from_raw(1_000_000),
+            i,
+        );
+        let mut stamped = StampCtx::new(&mut sink, SLOT_VM);
+        Ctx::submit(&mut stamped, o).unwrap();
+        capture.append(&o);
+        capture.maybe_flush(i.wrapping_mul(10_000_000_000));
+        i += 1;
+    }
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(sink.submitted, CYCLES);
+    assert_eq!(capture.records(), CYCLES);
+    assert_eq!(capture.io_errors(), 0);
+    assert!(!capture.is_disabled());
+    assert_eq!(
+        allocs, 0,
+        "orders capture/stamp path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "orders capture/stamp bytes should be zero: saw {bytes}");
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
+}
+
 /// Phase 8f item 8: `strategy-ai-exec`'s tick path (fair-table probe
 /// + lazy-tracked book apply + deviation quote) must be zero-alloc in
 /// steady state — it runs inside `Engine::tick()` for every market

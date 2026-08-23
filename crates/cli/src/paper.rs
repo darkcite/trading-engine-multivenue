@@ -43,13 +43,13 @@ use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
-    make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, RuleTableSlot, Signal, SymbolId,
-    Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, Order, RuleTableSlot, Signal,
+    SymbolId, Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use core_io::{SlotCapture, SlotKind};
 use engine::{
-    Engine, ENGINE_FILLS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE,
-    TICK_RING_SIZE,
+    Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES,
+    NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
 };
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
 // Re-exported (lib.rs) so the binary reaches the AI status slot type
@@ -1330,6 +1330,14 @@ pub fn open_fills_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCaptu
     SlotCapture::open(run_dir.join(ENGINE_FILLS_FILE), SlotKind::Fill, epoch_ns)
 }
 
+/// Open the M4.1 engine-thread order-intent capture
+/// (`<run_dir>/engine-orders.pmlr`, `SlotKind::Order`). Boot-only; the
+/// bin hands the result to [`Observability::with_orders_capture`] and
+/// the engine loop takes ownership from there.
+pub fn open_orders_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapture<Order>> {
+    SlotCapture::open(run_dir.join(ENGINE_ORDERS_FILE), SlotKind::Order, epoch_ns)
+}
+
 /// Parse `AI_INGRESS_HMAC_KEY` (64 hex chars) into the 32-byte HMAC
 /// key (Phase 8f §4.1). The error strings deliberately carry **no key
 /// material** — this value must never reach a log. Returns `Err` on
@@ -2226,6 +2234,15 @@ impl Observability {
                     .map_err(|_| "register engine_fills_capture_records")?;
                 CaptureGaugeIds { io_errors, records }
             };
+            let orders_capture = {
+                let io_errors = reg
+                    .register_gauge("engine_orders_capture_io_errors")
+                    .map_err(|_| "register engine_orders_capture_io_errors")?;
+                let records = reg
+                    .register_gauge("engine_orders_capture_records")
+                    .map_err(|_| "register engine_orders_capture_records")?;
+                CaptureGaugeIds { io_errors, records }
+            };
 
             out.metrics = Some(Arc::new(reg));
             out.counter_ids = Some(EngineCounters {
@@ -2275,6 +2292,7 @@ impl Observability {
                 ingress_ai,
                 capture_ai,
                 fills_capture,
+                orders_capture,
                 strategy_enabled_mask,
                 vm,
             });
@@ -2362,6 +2380,10 @@ pub struct Observability {
     /// engine thread owns it from then on). `None` in tests and in
     /// tools that replay rather than run.
     pub fills_capture: Option<SlotCapture<Fill>>,
+    /// M4.1: the engine-thread order-intent capture, same lifecycle
+    /// as `fills_capture` (bin opens, engine loop takes ownership).
+    /// `None` in tests and in tools that replay rather than run.
+    pub orders_capture: Option<SlotCapture<Order>>,
 }
 
 impl Observability {
@@ -2378,6 +2400,14 @@ impl Observability {
     /// directory exists.
     pub fn with_fills_capture(mut self, cap: SlotCapture<Fill>) -> Self {
         self.fills_capture = Some(cap);
+        self
+    }
+
+    /// Attach the engine-thread order-intent capture (M4.1).
+    /// Boot-only; called from the bin after the per-run capture
+    /// directory exists.
+    pub fn with_orders_capture(mut self, cap: SlotCapture<Order>) -> Self {
+        self.orders_capture = Some(cap);
         self
     }
 
@@ -2498,6 +2528,10 @@ pub struct EngineCounters {
     /// centrally from the engine loop (unlike the per-thread venue
     /// pairs — the engine owns this capture).
     pub fills_capture: CaptureGaugeIds,
+    /// M4.1 capture-health gauges, engine-thread order-intent capture
+    /// (`engine_orders_capture_{io_errors,records}`). Mirrored
+    /// centrally from the engine loop like the fills pair.
+    pub orders_capture: CaptureGaugeIds,
     /// Phase-8g §9: the set's live enable mask
     /// (`engine_strategy_enabled_mask` — the G0 demo finding: the
     /// flip was only inferable from order-flow deltas). Read via the
@@ -3085,6 +3119,10 @@ where
     if let Some(cap) = obs.fills_capture.take() {
         eng.set_fill_capture(cap);
     }
+    // M4.1: the order-intent capture rides the same handoff.
+    if let Some(cap) = obs.orders_capture.take() {
+        eng.set_order_capture(cap);
+    }
     if let Err(e) = eng.start() {
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
@@ -3120,6 +3158,7 @@ where
             // Independent of the metrics gate — capture durability is
             // not an observability option.
             eng.maybe_flush_fill_capture(now);
+            eng.maybe_flush_order_capture(now);
 
             let ticks = eng.ticks_dispatched;
             let signals = eng.signals_dispatched;
@@ -3236,6 +3275,11 @@ where
                     .set(eng.fill_capture_io_errors() as i64);
                 reg.gauge(ids.fills_capture.records)
                     .set(eng.fill_capture_records() as i64);
+                // M4.1 order-intent capture pair — same central mirror.
+                reg.gauge(ids.orders_capture.io_errors)
+                    .set(eng.order_capture_io_errors() as i64);
+                reg.gauge(ids.orders_capture.records)
+                    .set(eng.order_capture_records() as i64);
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)

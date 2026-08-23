@@ -538,14 +538,25 @@ pub struct Order {
     /// Target venue ([`VenueId`] as raw byte). The engine's
     /// `VenueRouter` dispatches on this byte (Phase 8j).
     pub venue: u8,
+    /// Emitting strategy-set slot (M4.1 M-b; docs/wire-format.md):
+    /// stamped by the set's `StampCtx` adapter around each member
+    /// callback; [`STRATEGY_ID_NONE`] (`0xFF`) = unattributed (bare
+    /// single-strategy boots, tests). Wire-additive pre-first-capture
+    /// — no Order slot was ever persisted before `engine-orders.pmlr`.
+    pub strategy_id: u8,
     /// Reserved.
-    _pad1: [u8; 15],
+    _pad1: [u8; 14],
     /// Explicit tail padding (see [`AsBytes`]). Always zero.
     _pad2: [u8; 8],
 }
 
+/// `Order.strategy_id` value meaning "no strategy attribution".
+pub const STRATEGY_ID_NONE: u8 = 0xFF;
+
 impl Order {
     /// Construct an Order without naming the private padding fields.
+    /// `strategy_id` starts [`STRATEGY_ID_NONE`]; the strategy-set's
+    /// stamping ctx overwrites it per member (M4.1 M-c).
     #[inline(always)]
     pub const fn new(
         ts_ns: NsTs,
@@ -567,7 +578,8 @@ impl Order {
             qty,
             client_oid,
             venue: venue as u8,
-            _pad1: [0; 15],
+            strategy_id: STRATEGY_ID_NONE,
+            _pad1: [0; 14],
             _pad2: [0; 8],
         }
     }
@@ -1718,7 +1730,9 @@ mod tests {
             core::slice::from_raw_parts((&o as *const Order).cast::<u8>(), 64)
         };
         assert_eq!(ob[40], VenueId::Okx.to_u8());
-        let mut i = 41;
+        // M4.1: offset 41 = strategy_id, STRATEGY_ID_NONE by default.
+        assert_eq!(ob[41], STRATEGY_ID_NONE);
+        let mut i = 42;
         while i < 64 {
             assert_eq!(ob[i], 0);
             i += 1;
@@ -1732,7 +1746,7 @@ mod tests {
         // Tick: 8+4+4+8+8+8+8+1+15 = 64.
         // Signal: 8+4+1+1+2+40+8 = 64.
         // Fill: 8+4+1+3+8+8+8+16+8 = 64.
-        // Order: 8+4+1+1+2+8+8+8+1+15+8 = 64.
+        // Order: 8+4+1+1+2+8+8+8+1+1+14+8 = 64 (M4.1: +strategy_id).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
         assert_eq!(::core::mem::size_of::<Signal>(), 64);
         assert_eq!(::core::mem::size_of::<Fill>(), 64);

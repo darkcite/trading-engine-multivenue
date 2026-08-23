@@ -75,10 +75,11 @@
 
 use core_time::NsTs;
 use core_types::{
-    AiCmd, AiCmdKind, Fill, RuleTable, Signal, Tick, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
+    AiCmd, AiCmdKind, Fill, Order, RuleTable, Signal, Tick, STRATEGY_SLOT_AI_EXEC,
+    STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
-use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError};
+use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 use strategy_cross_arb::CrossArb;
 use strategy_ev::EvStrategy;
 use strategy_latency_arb::LatencyArb;
@@ -374,28 +375,67 @@ impl StrategyCounters for StrategySet {
     }
 }
 
+/// M4.1 M-c: per-member attribution adapter. Wraps the engine ctx for
+/// exactly ONE member callback and stamps [`Order::strategy_id`] with
+/// that member's slot before forwarding — members stay byte-untouched
+/// and unaware; the engine stays set-agnostic. Monomorphized (`C:
+/// Ctx`, no `dyn` — house rule); cost is one register write per
+/// submit. Bare single-strategy boots bypass the set and therefore
+/// submit unstamped (`STRATEGY_ID_NONE`) — recorded semantics
+/// (docs/m4-progress.md M4.1).
+pub struct StampCtx<'a, C: Ctx> {
+    inner: &'a mut C,
+    slot: u8,
+}
+
+impl<'a, C: Ctx> StampCtx<'a, C> {
+    /// Wrap `inner` for the member occupying `slot`.
+    #[inline(always)]
+    pub fn new(inner: &'a mut C, slot: u8) -> Self {
+        Self { inner, slot }
+    }
+}
+
+impl<'a, C: Ctx> Ctx for StampCtx<'a, C> {
+    #[inline(always)]
+    fn submit(&mut self, mut order: Order) -> Result<(), SubmitErr> {
+        order.strategy_id = self.slot;
+        self.inner.submit(order)
+    }
+    #[inline(always)]
+    fn now_ns(&self) -> NsTs {
+        self.inner.now_ns()
+    }
+}
+
 impl Strategy for StrategySet {
     /// Forward `on_start` to the initially-enabled members only —
     /// their validation is exactly as fail-fast as the standalone
     /// paths. See the module docs for why skipped members are safe.
+    /// Every member callback in this impl goes through [`StampCtx`]
+    /// (M4.1 M-c) so any submit carries its member's slot.
     fn on_start<C: Ctx>(&mut self, ctx: &mut C) -> Result<(), StrategyError> {
         if self.initial & BIT_LATENCY_ARB != 0 {
-            self.latency_arb.on_start(ctx)?;
+            self.latency_arb
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB))?;
         }
         if self.initial & BIT_EV != 0 {
-            self.ev.on_start(ctx)?;
+            self.ev.on_start(&mut StampCtx::new(&mut *ctx, SLOT_EV))?;
         }
         if self.initial & BIT_CROSS_ARB != 0 {
-            self.cross_arb.on_start(ctx)?;
+            self.cross_arb
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB))?;
         }
         if self.initial & BIT_RULE_TREE != 0 {
-            self.rule_tree.on_start(ctx)?;
+            self.rule_tree
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE))?;
         }
         if self.initial & BIT_AI_EXEC != 0 {
-            self.ai_exec.on_start(ctx)?;
+            self.ai_exec
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC))?;
         }
         if self.initial & BIT_VM != 0 {
-            self.vm.on_start(ctx)?;
+            self.vm.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VM))?;
         }
         Ok(())
     }
@@ -403,66 +443,80 @@ impl Strategy for StrategySet {
     #[inline(always)]
     fn on_tick<C: Ctx>(&mut self, tick: &Tick, ctx: &mut C) {
         if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb.on_tick(tick, ctx);
+            self.latency_arb
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_tick(tick, ctx);
+            self.ev.on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb.on_tick(tick, ctx);
+            self.cross_arb
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree.on_tick(tick, ctx);
+            self.rule_tree
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec.on_tick(tick, ctx);
+            self.ai_exec
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_tick(tick, ctx);
+            self.vm.on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
     #[inline(always)]
     fn on_signal<C: Ctx>(&mut self, signal: &Signal, ctx: &mut C) {
         if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb.on_signal(signal, ctx);
+            self.latency_arb
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_signal(signal, ctx);
+            self.ev
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb.on_signal(signal, ctx);
+            self.cross_arb
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree.on_signal(signal, ctx);
+            self.rule_tree
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec.on_signal(signal, ctx);
+            self.ai_exec
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_signal(signal, ctx);
+            self.vm
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
     #[inline(always)]
     fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C) {
         if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb.on_fill(fill, ctx);
+            self.latency_arb
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_fill(fill, ctx);
+            self.ev.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb.on_fill(fill, ctx);
+            self.cross_arb
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree.on_fill(fill, ctx);
+            self.rule_tree
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec.on_fill(fill, ctx);
+            self.ai_exec
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_fill(fill, ctx);
+            self.vm.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
@@ -490,22 +544,26 @@ impl Strategy for StrategySet {
             _ => {}
         }
         if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb.on_ai(cmd, ctx);
+            self.latency_arb
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_ai(cmd, ctx);
+            self.ev.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb.on_ai(cmd, ctx);
+            self.cross_arb
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree.on_ai(cmd, ctx);
+            self.rule_tree
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec.on_ai(cmd, ctx);
+            self.ai_exec
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_ai(cmd, ctx);
+            self.vm.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
@@ -525,22 +583,26 @@ impl Strategy for StrategySet {
     #[inline(always)]
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
         if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb.on_timer(now_ns, ctx);
+            self.latency_arb
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_timer(now_ns, ctx);
+            self.ev.on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb.on_timer(now_ns, ctx);
+            self.cross_arb
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree.on_timer(now_ns, ctx);
+            self.rule_tree
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
-            self.ai_exec.on_timer(now_ns, ctx);
+            self.ai_exec
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_timer(now_ns, ctx);
+            self.vm.on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
@@ -577,12 +639,16 @@ impl Strategy for StrategySet {
         // Stop is unconditional — even disabled members get the
         // teardown callback (they may hold capture-worthy state some
         // day; today all six are no-ops).
-        self.latency_arb.on_stop(ctx);
-        self.ev.on_stop(ctx);
-        self.cross_arb.on_stop(ctx);
-        self.rule_tree.on_stop(ctx);
-        self.ai_exec.on_stop(ctx);
-        self.vm.on_stop(ctx);
+        self.latency_arb
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        self.ev.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_EV));
+        self.cross_arb
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
+        self.rule_tree
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        self.ai_exec
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
+        self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
     }
 }
 
@@ -739,6 +805,53 @@ mod tests {
         feed_trigger(&mut s, &mut c);
         assert_eq!(c.submitted, 0);
         assert_eq!(s.orders_emitted(), 0);
+    }
+
+    /// M4.1: ctx double that RECORDS submitted orders (attribution pin).
+    struct RecordCtx {
+        orders: Vec<Order>,
+    }
+    impl Ctx for RecordCtx {
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            self.orders.push(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> NsTs {
+            0
+        }
+    }
+
+    #[test]
+    fn stamp_ctx_attributes_member_orders() {
+        // Direct adapter law: the wrapped slot lands on the order.
+        let mut rec = RecordCtx { orders: Vec::new() };
+        let mut sc = StampCtx::new(&mut rec, SLOT_VM);
+        let o = Order::new(
+            0,
+            VenueId::Polymarket,
+            42,
+            Side::Bid,
+            0,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            9,
+        );
+        assert_eq!(o.strategy_id, core_types::STRATEGY_ID_NONE);
+        Ctx::submit(&mut sc, o).unwrap();
+        assert_eq!(rec.orders.len(), 1);
+        assert_eq!(rec.orders[0].strategy_id, SLOT_VM);
+        assert_eq!(rec.orders[0].client_oid, 9, "everything else untouched");
+
+        // Through the SET: the latency-arb trigger pair emits ONE
+        // order stamped slot 0 by the dispatch wrapper (M-c) — the
+        // member itself never saw the field.
+        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut rec = RecordCtx { orders: Vec::new() };
+        s.on_start(&mut rec).unwrap();
+        s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut rec);
+        s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut rec);
+        assert_eq!(rec.orders.len(), 1);
+        assert_eq!(rec.orders[0].strategy_id, SLOT_LATENCY_ARB);
     }
 
     #[test]

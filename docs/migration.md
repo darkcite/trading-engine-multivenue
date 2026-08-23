@@ -30,6 +30,55 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-23 — Order slot: `strategy_id` at offset 41 + the `engine-orders.pmlr` intent log (M4.1)
+
+**What changed**
+
+- `Order` (64 B ring/capture slot) claims ONE byte of `_pad1`:
+  offset 41 = `strategy_id: u8` (strategy-set slot ids; `0xFF` =
+  unattributed), `_pad1` shrinks 15 → 14 B. Stamped by the set's
+  `StampCtx` adapter around every member callback; bare
+  single-strategy boots leave `0xFF`.
+- NEW engine-side capture file `engine-orders.pmlr`
+  (`slot_kind = 3`, `core_io::SlotCapture<Order>`): every order the
+  dispatcher ACCEPTED via `ctx.submit`, staged on the engine thread
+  next to `engine-fills.pmlr`. Dispatcher refusals remain counters
+  only.
+
+**Why**
+
+- mvp-plan §4-M4 (shadow-P&L): the M4.1 audit found paper mode
+  captured NEITHER intents nor fills (`PaperDispatcher` counts and
+  drops; `SlotKind::Order` was defined but wired to nothing) — the
+  per-strategy intent log is the enabling substrate for `audit-pnl`
+  (§9.9 "logged intents"). Per-ruleset attribution deliberately
+  rides the existing ai-cmds `RulesetCommit` timeline (hash128 in
+  px/qty), NOT a wider Order slot.
+
+**Impact**
+
+- On-disk formats: a NEW per-run file; PMLR container version stays
+  2 (append-only kind usage). No historical Order file exists —
+  the layout amendment is PRE-FIRST-CAPTURE and has zero
+  reader-compat surface. Old binaries reading a new run dir simply
+  never open the file; `audit-replay`/catalog treat it as another
+  size-visible capture file.
+- Config keys: none.
+- Wire formats: `Order` table amended in `docs/wire-format.md`
+  (offset 41). In-process ring consumers are unaffected (field was
+  explicit zero padding; `Order::new` initializes `0xFF`).
+
+**Migration steps**
+
+1. Nothing operator-side: the file appears on the first boot of a
+   binary carrying M4.1; older run dirs simply lack it (audit-pnl
+   reports them intent-less).
+
+**Rollback**
+
+- Revert the commit; run dirs written meanwhile carry an extra
+  `.pmlr` file old code never opens. Harmless.
+
 ## 2026-08-22 — SlotKind 6 (OptSummary): the options analytics capture channel (M2.3)
 
 **What changed**
