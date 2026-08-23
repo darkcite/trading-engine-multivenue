@@ -407,3 +407,139 @@ Commit ask C5 paths:
 `claude-worker/src/claude_worker/candles.py` ·
 `claude-worker/tests/test_candles.py` · `claude-worker/tests/craft.py`
 · `.env.example` · `docs/local-setup.md` · `docs/m3-progress.md`.
+
+**C5 LANDED** — commit `406682d`.
+
+---
+
+## 2026-08-22 — C6 armed: M3 enters its CALENDAR phase
+
+Everything buildable is BUILT, LANDED (C1 `cf132ae` · C2 `2a89238` ·
+C3 `1d712e8` · C4 `e6b4de2` · C5 `406682d`), and RUNNING. Health at
+session close: standing engine (launchd, pid at the time 74176)
+ticking all five venues — current run 1.29M ticks in 34 min; candles
+agent hourly; caffeinate + daily-restart armed; catalog clean (16
+runs / 4.47M ticks / 348 MiB inventoried, zero overlaps).
+
+The M3 exit is now CALENDAR TIME: today (2026-08-22) is gapped by
+birth (lane installed 12:08Z), so the first candidate gap-free day is
+2026-08-23 and the earliest N≥3 close is **2026-08-26** after three
+automated midnight turns.
+
+### C6 closing procedure (any session, once the catalog says so)
+
+1. `./target/release/multivenue-engine capture-catalog --dir
+   ~/multivenue/logs` → `continuity.trailing_streak >= 3` is THE
+   exit tell (gap tolerance 300 s; verify the three dates are the
+   expected consecutive UTC days).
+2. Tidy for whole-root replay (operator-authorized, one-time): move
+   the two pre-M3 header-only aborted-boot dirs
+   (`run-1786739719233328000`, `run-1786739974629399000` — 0 ticks,
+   harness=REJECT, catalog-identified) into `~/multivenue/archive/`;
+   catalog then reports `whole_root_backtestable=true` (no overlaps,
+   all runs clean).
+3. REAL-capture backtest through the FROZEN argv over the
+   accumulated root: `multivenue-engine backtest --ruleset R
+   --replay-dir ~/multivenue/logs --split 70/30` with a ruleset that
+   actually fills across days (the H6a prior binds from
+   `~/multivenue/worker/demo-h6a/demo/`, or author a sacrificial one
+   in-session — ai-session §4 lane). PASS = `oos.trading_days >= 2`
+   (fill days, not just coverage).
+4. Close: this log's exit entry + CLAUDE.md CURRENT STATE refresh
+   (M3 CLOSED, M2/M4 state as of then) + the C6 commit
+   (operator-authorized, explicit paths).
+
+Interim ops until then: nothing required — the lane is autonomous.
+If the Mac must reboot: launchd agents are persistent (RunAtLoad);
+verify with `launchctl print gui/$UID/com.multivenue.engine` and one
+catalog run. M2 smoke windows follow the runbook stop/start dance;
+the wrapper self-heals around fumbles.
+
+**Resume point:** C6 pending calendar only; procedure above is
+complete and self-contained.
+
+---
+
+## 2026-08-22 — M2-close coordination note (written by the M2 lane per the both-logs duty; ADDITIVE)
+
+M2's close-out added, operator-ruled, the §9.8 IV digest WORKER-SIDE
+beside candles.db. Per the additive-files law the claude-worker
+additions are NEW FILES ONLY: `claude_worker/iv_digest.py` +
+`tests/test_iv_digest.py` (pytest 412 → **429**; frozen 7-verb
+surface, `backtest.py`/`cli.py`, conftest, and every existing worker
+file byte-untouched; `tests.craft` imported, not edited).
+
+What M3 inherits / decides at its next ownership window (C6+):
+
+- The **`iv_digest` table now lives INSIDE `candles.db`** (CREATE IF
+  NOT EXISTS only; `candles`/`candle_conflicts` never created or
+  altered by the digest; the digest connection sets WAL +
+  `busy_timeout=5000`, so an accidental overlap with the hourly agent
+  degrades to a bounded wait). Keying is §9.4 verbatim:
+  `(venue, descriptor, tf∈{1m,1h}, open_ts)` WITHOUT ROWID.
+- **pmlr.py fold-in candidates**, flagged in the module docs:
+  `SLOT_KIND_OPT_SUMMARY = 6` + the kind-6 record decode (pmlr.py
+  stops at kind 5; the digest carries a local `OptReader` REUSING the
+  pmlr header struct so there is no second header layout), and the
+  `_run_anchor_ns` mirror (harness §3.3 law, copied from candles).
+- **Cadence is M3's call**: the digest runs MANUAL/on-demand today
+  (`python -m claude_worker.iv_digest`; `--backfill` = full-history
+  fold; rolling default 26 h via `CLAUDE_WORKER_IV_DIGEST_WINDOW_H`).
+  M2 deliberately did NOT touch `scripts/candles-cycle.sh` or any
+  launchd plist — wiring the digest into the hourly cycle (natural
+  follow-on) is an M3-owned edit.
+- Sym→descriptor resolution rides the new per-run
+  **`options-manifest.tsv`** sidecar (bin-written at boot;
+  docs/wire-format.md "Options manifest") — descriptor namespaces
+  `deribit:` / `okx:` / **`binance-opt:`** (+ instrument name).
+  Pre-manifest capture (today's M2.3/M2.4 smoke runs) is honestly
+  unresolvable: the digest skips those runs with a per-run report
+  line (live-verified against the real root: 8 runs skipped, 0 rows
+  fabricated). Catalog: run-dir whole-dir bytes already include the
+  sidecar; a dedicated catalog row, if ever wanted, is M3's.
+
+---
+
+## 2026-08-23 — FULL-SCOPE FLIP of the standing lane (operator go; M5-prep)
+
+Operator question ("restart data collection for the full scope with
+options?") answered: NO wipe — append-only store; the flip = config +
+one graceful restart. Executed 06:12–06:15Z:
+
+- **Overnight automation proofs first** (found during assessment): the
+  first unattended 00:00Z turn WORKED (drain 00:00:34→boot 00:00:44Z,
+  ~10 s dark) and the wrapper's Gamma refresh independently resolved
+  the Aug-23 PM dailies. The midnight boot ran the mid-M4 binary
+  (engine-orders.pmlr + opt-summary channels present; manifests not
+  yet) on the non-options universe.
+- **Flip**: `~/multivenue/universe.toml` gained the M2-proven options
+  config — [deribit] `["BTC","ETH"]` · [okx] `["BTC-USD","ETH-USD"]` ·
+  [binance] `["BTCUSDT","ETHUSDT"]`, default E2/K8 (backup at
+  /tmp/m3-universe-pre-flip.toml; the daily refresher rewrites only
+  the PM array, so options keys persist). SIGTERM 06:14:16Z → wrapper
+  reboot onto the 04:10Z M4-close binary → run-1787465687128999000
+  live 06:14:47Z (~39 s dark).
+- **Verified**: options discovery all 3 venues (chains e.g. Deribit
+  ETH 932→selected 32; BN eapi REST 1862→32/underlying);
+  **options-manifest.tsv rows=192** (the exact M2 exit-boot scope) +
+  **instrument-manifest.tsv rows=204** (M4 D3 law — first
+  manifest-bearing STANDING run; descriptor continuity starts here);
+  SlotKind-6 flowing (deribit-opt-summary 391 KiB in the first
+  minute; okx flowing; catalog `opt_summaries=12023` @2.3 min); BN
+  opt lane correctly dark-but-armed on the default eapi host
+  (operator ruling; `BINANCE_EAPI_WS_HOST` lever); options TICKS
+  integrity-clean (audit-replay per-sym regr/holes/chain_breaks all
+  0; sparse-book cadence OUT-OF-BAND notes are the expected benign
+  class); PM 4/4 resolved; conns=4 (spot 2 + usdm 1 + eapi 1).
+- **C6 arithmetic intact**: Aug-23 dark ≈ 50 s of 300 s (10 s
+  midnight + 39 s flip) — today remains gap-free-candidate #1;
+  earliest close still 2026-08-26, now with FULL-SCOPE days.
+  Monitor view crossed its floor for the first time
+  (trailing coverage 18h11m ≥ 6 h ⇒ would RUN) — the M5 manual
+  walk-forward runbook is arithmetically satisfiable from here.
+- Everything from this boot onward is final-configuration capture for
+  the M5 promotion + M6 soak. iv_digest (§9.8) now has
+  manifest-bearing standing runs to consume — cadence hookup stays a
+  C6+ item as ruled; manual serialized runs are possible meanwhile.
+
+(Entry rides M3's next commit per the standing note.)
