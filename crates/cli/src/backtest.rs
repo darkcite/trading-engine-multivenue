@@ -301,11 +301,13 @@ pub fn parse_model_params(
 // Capture discovery (§3.1)
 // ---------------------------------------------------------------
 
-/// One discovered capture run.
+/// One discovered capture run. `pub(crate)`: `audit_pnl` inherits the
+/// SAME discovery + ordering law (one name law, one epoch order — no
+/// drift; the catalog precedent).
 #[derive(Debug)]
-struct RunDir {
-    path: PathBuf,
-    epoch_ns: u64,
+pub(crate) struct RunDir {
+    pub(crate) path: PathBuf,
+    pub(crate) epoch_ns: u64,
 }
 
 /// Parse `run-<epoch_ns>` (ASCII digits, u64). Anything else is not a
@@ -324,7 +326,8 @@ pub(crate) fn parse_run_dir_name(name: &str) -> Option<u64> {
 /// `run-<ns>` is a single run; otherwise it is a log root whose
 /// `run-*` children are the runs, ordered by `epoch_ns` (name order
 /// breaks the — physically impossible — epoch tie deterministically).
-fn discover_runs(replay_dir: &Path) -> Result<Vec<RunDir>, HarnessError> {
+/// `pub(crate)`: shared with `audit_pnl` (same law, one home).
+pub(crate) fn discover_runs(replay_dir: &Path) -> Result<Vec<RunDir>, HarnessError> {
     if !replay_dir.is_dir() {
         return Err(HarnessError::Capture(format!(
             "--replay-dir {} is not a directory",

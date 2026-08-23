@@ -32,6 +32,7 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+pub mod audit_pnl;
 pub mod audit_replay;
 pub mod backtest;
 pub mod capture_catalog;

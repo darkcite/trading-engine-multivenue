@@ -83,6 +83,12 @@ MS_1H: int = 3_600_000
 TFS: dict[str, int] = {"1m": MS_1M, "1h": MS_1H}
 
 MANIFEST_FILE: str = "options-manifest.tsv"
+# M4.2 ruling D3: the generalized manifest — EVERY allocated
+# instrument, `<sym_u32>\t<descriptor>` (final §9.4 strings baked
+# engine-side; venue derived from the SymbolId namespace byte).
+# Preferred over MANIFEST_FILE, which stays one release for pre-D3
+# runs (docs/wire-format.md "Instrument manifest").
+INSTRUMENT_MANIFEST_FILE: str = "instrument-manifest.tsv"
 
 # Manifest venue label → (frames venue id, descriptor prefix). The
 # labels are the capture-file prefixes (wire-format.md); the
@@ -231,11 +237,40 @@ class FoldStats(typing.NamedTuple):
 
 
 def read_manifest(run_dir: pathlib.Path) -> tuple[dict[tuple[int, int], str], int] | None:
-    """Parse the run's ``options-manifest.tsv`` into
-    ``(venue_id, sym) → descriptor``. ``None`` = no manifest file.
-    Strict per line (labeling.py discipline): exactly three
-    tab-separated fields, known label, decimal u32 sym, non-empty
-    name; malformed lines are counted and skipped."""
+    """Resolve the run's sym→descriptor map, ``(venue_id, sym) →
+    descriptor``. Prefers the D3 ``instrument-manifest.tsv`` (two
+    tab-separated fields: decimal u32 sym + non-empty descriptor;
+    venue = the SymbolId namespace byte, bits 31..24); falls back to
+    the M2-close ``options-manifest.tsv`` (three fields: known label +
+    sym + name, descriptor composed from the label prefix). ``None`` =
+    neither file. Strict per line (labeling.py discipline): malformed
+    lines are counted and skipped."""
+    inst = run_dir / INSTRUMENT_MANIFEST_FILE
+    if inst.is_file():
+        try:
+            text = inst.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = None
+        if text is not None:
+            out: dict[tuple[int, int], str] = {}
+            malformed = 0
+            for line in text.splitlines():
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    malformed += 1
+                    continue
+                sym_s, descriptor = parts
+                if not descriptor or not sym_s.isdigit():
+                    malformed += 1
+                    continue
+                sym = int(sym_s)
+                if sym <= 0 or sym > 0xFFFF_FFFF:
+                    malformed += 1
+                    continue
+                out[(sym >> 24, sym)] = descriptor
+            return out, malformed
     path = run_dir / MANIFEST_FILE
     if not path.is_file():
         return None
@@ -243,7 +278,7 @@ def read_manifest(run_dir: pathlib.Path) -> tuple[dict[tuple[int, int], str], in
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    out: dict[tuple[int, int], str] = {}
+    out = {}
     malformed = 0
     for line in text.splitlines():
         if not line:
@@ -329,7 +364,8 @@ def fold_iv_snapshots(
                     if manifest is None:
                         report(
                             f"iv-digest: {run_dir.name}: opt-summary records but no"
-                            f" {MANIFEST_FILE} — run skipped (pre-manifest capture)"
+                            f" {INSTRUMENT_MANIFEST_FILE} (or legacy {MANIFEST_FILE})"
+                            " — run skipped (pre-manifest capture)"
                         )
                         runs_no_manifest += 1
                         break

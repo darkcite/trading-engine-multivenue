@@ -255,6 +255,22 @@ line per selected instrument,
 option instrument (absence = options-less or pre-M2-close run).
 Readers parse strictly and skip-and-count malformed lines.
 
+### Instrument manifest — `instrument-manifest.tsv` (M4.2, ruling D3)
+
+The options manifest generalized to EVERY allocated instrument:
+written once by the bin on EVERY boot (a boot always carries ≥ 1
+instrument), `<sym_u32_decimal>\t<descriptor>\n` per line, where
+`descriptor` is the FINAL §9.4 worker map-name string (PM token ids
+bare; `binance:` / `binance-usdm:` / `okx:` / `deribit:` /
+`hyperliquid:` for the static lanes — baked by
+`core-config::universe` at allocation; options
+`deribit:`/`okx:`/`binance-opt:` + instrument name). Emission order =
+allocation order. This is the sym→descriptor resolution lane for
+every offline venue+descriptor consumer (`audit-pnl`, the §9.8 IV
+digest, M5 naming); `options-manifest.tsv` is kept ONE release for
+pre-D3 readers and then retires. Absence = a pre-D3 run. Readers
+parse strictly and skip-and-count malformed lines.
+
 ### Raw tap — `<venue>-raw.tap`
 
 Bounded byte-exact inbound-payload capture for parser-vs-wire

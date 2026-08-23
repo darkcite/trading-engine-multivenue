@@ -471,6 +471,16 @@ impl FillEngine {
         &self.open[..self.open_len]
     }
 
+    /// Current OOS-book equity ×1e12 (realized − fees + unrealized).
+    /// M4.2 `audit-pnl` surface: with `boundary_virt_ns == 0` the OOS
+    /// book IS the whole-window book, and per-UTC-day net buckets are
+    /// day-boundary snapshots of this value. Additive accessor — no
+    /// model behavior change.
+    #[inline]
+    pub fn oos_equity_1e12(&self) -> i128 {
+        self.oos.equity_1e12()
+    }
+
     /// §4.1 intake of one vm-emitted order at `emit_virt`. Applies the
     /// venue routability check, the 4/32 caps (per-sym first, then
     /// total — the risk-policy table order), tags the §3.4 bucket and

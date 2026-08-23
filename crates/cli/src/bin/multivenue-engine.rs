@@ -71,6 +71,11 @@ enum Cmd {
     /// human summary on stderr; an EMPTY root is a valid zero-run
     /// report (init-if-empty visibility).
     CaptureCatalog(CaptureCatalogArgs),
+    /// M4.2 shadow-P&L: replay LOGGED order intents
+    /// (engine-orders.pmlr) through the §4 strict-cross fill model —
+    /// per-strategy / per-ruleset-hash modeled P&L beside the paper
+    /// view. JSON on stdout, human summary on stderr.
+    AuditPnl(AuditPnlArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -91,6 +96,25 @@ struct CaptureCatalogArgs {
     /// (default 300 s — the daily-restart drain allowance).
     #[arg(long, default_value_t = cli::capture_catalog::DEFAULT_GAP_TOLERANCE_NS)]
     gap_tolerance_ns: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AuditPnlArgs {
+    /// Replay root (`MULTIVENUE_LOG_DIR`) or one `run-<epoch_ns>`
+    /// directory — the same §3.1 resolution as `backtest
+    /// --replay-dir`.
+    #[arg(long)]
+    dir: PathBuf,
+    /// Repeatable `--fee-bps <venue>:<maker>:<taker>` overrides
+    /// (same grammar as the backtest arm).
+    #[arg(long)]
+    fee_bps: Vec<String>,
+    /// Global activation-Δ override, ns (same as backtest).
+    #[arg(long)]
+    latency_ns: Option<u64>,
+    /// Repeatable `--latency-ns-venue <venue>:<ns>` overrides.
+    #[arg(long)]
+    latency_ns_venue: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -318,6 +342,34 @@ fn main() -> ExitCode {
             // stdout carries the catalog JSON and nothing else.
             init_tracing_stderr();
             capture_catalog(args)
+        }
+        Cmd::AuditPnl(args) => {
+            // Same stdout-purity law: JSON only on stdout.
+            init_tracing_stderr();
+            audit_pnl(args)
+        }
+    }
+}
+
+/// M4.2 arm: JSON on stdout + human summary on stderr, exit 0 iff a
+/// report was produced; any failure prints its reason to stderr only
+/// and exits nonzero.
+fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
+    let cfg = cli::audit_pnl::AuditPnlConfig {
+        replay_dir: args.dir,
+        fee_bps: args.fee_bps,
+        latency_ns: args.latency_ns,
+        latency_ns_venue: args.latency_ns_venue,
+    };
+    let mut report = |line: &str| eprintln!("{line}");
+    match cli::audit_pnl::run(&cfg, &mut report) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("audit-pnl: {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -690,6 +742,27 @@ fn run(args: RunArgs) -> ExitCode {
                 + discovery.okx_options.len()
                 + discovery.bn_options.len(),
             "capture: options manifest written"
+        );
+    }
+    // M4.2 (D3): the FULL instrument manifest — every allocated
+    // instrument, final §9.4 descriptors, written on EVERY boot (the
+    // options file above stays one release for pre-D3 readers).
+    let instrument_manifest = cli::options_manifest::render_instruments(
+        &boot.allocated,
+        &discovery.deribit_options,
+        &discovery.okx_options,
+        &discovery.bn_options,
+    );
+    {
+        let manifest_path = run_dir.join(cli::options_manifest::INSTRUMENT_MANIFEST_FILE);
+        if let Err(e) = std::fs::write(&manifest_path, &instrument_manifest) {
+            error!(error = ?e, path = %manifest_path.display(), "capture: instrument-manifest write failed");
+            return ExitCode::from(1);
+        }
+        info!(
+            path = %manifest_path.display(),
+            rows = instrument_manifest.lines().count(),
+            "capture: instrument manifest written"
         );
     }
 

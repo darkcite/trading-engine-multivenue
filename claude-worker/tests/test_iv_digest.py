@@ -256,7 +256,46 @@ def test_fold_no_manifest_run_is_skipped_and_counted(tmp_path):
     root = make_run(tmp_path, None, "deribit", recs)
     snaps, stats, lines = fold(root)
     assert snaps == {} and stats.runs_no_manifest == 1
-    assert any("no options-manifest.tsv" in line for line in lines)
+    assert any("no instrument-manifest.tsv" in line for line in lines)
+
+
+def test_instrument_manifest_is_preferred_and_two_col_strict(tmp_path):
+    """D3: the generalized manifest wins over the legacy options file;
+    venue derives from the SymbolId namespace byte; malformed 2-col
+    lines counted."""
+    recs = [(ANCHOR_TS, DERIBIT_SYM, 3, 3, 1, 400_000_000, 1, 1)]
+    root = make_run(
+        tmp_path, [f"deribit\t{DERIBIT_SYM}\tOLD-NAME"], "deribit", recs
+    )
+    run_dir = root / f"run-{EPOCH_NS}"
+    (run_dir / claude_worker.iv_digest.INSTRUMENT_MANIFEST_FILE).write_text(
+        f"{DERIBIT_SYM}\tderibit:BTC-27MAR26-100000-C\n"
+        "notanumber\tx\n"
+        f"{DERIBIT_SYM}\n"
+        "42\t\n",
+        encoding="utf-8",
+    )
+    parsed = claude_worker.iv_digest.read_manifest(run_dir)
+    assert parsed is not None
+    sym_map, malformed = parsed
+    assert malformed == 3
+    assert sym_map == {
+        (claude_worker.frames.VENUE_DERIBIT, DERIBIT_SYM): "deribit:BTC-27MAR26-100000-C"
+    }
+    # The fold resolves through the NEW descriptor, not OLD-NAME.
+    snaps, stats, _ = fold(root)
+    assert stats.unresolved_records == 0
+    assert all(k[1] == "deribit:BTC-27MAR26-100000-C" for k in snaps)
+
+
+def test_legacy_options_manifest_still_resolves_when_new_file_absent(tmp_path):
+    recs = [(ANCHOR_TS, OKX_SYM, 2, 0, 0, 400_000_000, 1, 0)]
+    root = make_run(
+        tmp_path, [f"okx\t{OKX_SYM}\tBTC-USD-260327-100000-C"], "okx", recs
+    )
+    snaps, stats, _ = fold(root)
+    assert stats.unresolved_records == 0
+    assert all(k[1] == "okx:BTC-USD-260327-100000-C" for k in snaps)
 
 
 def test_fold_no_anchor_run_is_skipped_and_counted(tmp_path):

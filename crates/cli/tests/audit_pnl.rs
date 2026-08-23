@@ -1,0 +1,414 @@
+//! audit-pnl integration tests (M4.2): golden hand-computable modeled
+//! fills through the REUSED §4 fill law, strategy_id attribution, the
+//! vm RulesetCommit hash timeline, the §6 descriptor-keying law across
+//! sym-reshuffled runs, the manifest-less per-run namespace arm, the
+//! paper-fill fold, and byte-identical determinism. Fixtures ride the
+//! real `PmlrWriter` (one layout law, no drift).
+
+use std::path::{Path, PathBuf};
+
+use core_io::{PmlrWriter, SlotKind};
+use core_types::{
+    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE,
+    SYMBOL_ID_NONE,
+};
+
+use cli::audit_pnl::{run, AuditPnlConfig};
+
+const EPOCH_1: u64 = 1_000_000_000_000_000_000;
+const EPOCH_2: u64 = 1_000_100_000_000_000_000; // +100 s wall
+
+fn tmp_root(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("m4_audit_pnl_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn run_dir(root: &Path, epoch: u64) -> PathBuf {
+    let d = root.join(format!("run-{epoch}"));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn write_ticks(dir: &Path, label: &str, epoch: u64, ticks: &[Tick]) {
+    let mut w = PmlrWriter::open(dir.join(format!("{label}-ticks.pmlr")), SlotKind::Tick, epoch)
+        .unwrap();
+    for t in ticks {
+        w.append(t).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn write_orders(dir: &Path, epoch: u64, orders: &[Order]) {
+    let mut w =
+        PmlrWriter::open(dir.join("engine-orders.pmlr"), SlotKind::Order, epoch).unwrap();
+    for o in orders {
+        w.append(o).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn write_fills(dir: &Path, epoch: u64, fills: &[Fill]) {
+    let mut w = PmlrWriter::open(dir.join("engine-fills.pmlr"), SlotKind::Fill, epoch).unwrap();
+    for f in fills {
+        w.append(f).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn write_ai_cmds(dir: &Path, epoch: u64, cmds: &[AiCmd]) {
+    let mut w = PmlrWriter::open(dir.join("ai-cmds.pmlr"), SlotKind::AiCmd, epoch).unwrap();
+    for c in cmds {
+        w.append(c).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn manifest(dir: &Path, rows: &[(u32, &str)]) {
+    let body: String = rows
+        .iter()
+        .map(|(sym, desc)| format!("{sym}\t{desc}\n"))
+        .collect();
+    std::fs::write(dir.join("instrument-manifest.tsv"), body).unwrap();
+}
+
+fn pm_tick(ts: u64, sym: u32, bid: i64, bq: i64, ask: i64, aq: i64) -> Tick {
+    Tick::new(
+        ts,
+        VenueId::Polymarket,
+        sym,
+        1,
+        Price::from_raw(bid),
+        Qty::from_raw(bq),
+        Price::from_raw(ask),
+        Qty::from_raw(aq),
+    )
+}
+
+fn order(ts: u64, sym: u32, side: Side, px: i64, qty: i64, oid: u64, strategy: u8) -> Order {
+    let mut o = Order::new(
+        ts,
+        VenueId::Polymarket,
+        sym,
+        side,
+        0,
+        Price::from_raw(px),
+        Qty::from_raw(qty),
+        oid,
+    );
+    o.strategy_id = strategy;
+    o
+}
+
+fn commit_cmd(ts: u64, seq: u32, hash: [u8; 16]) -> AiCmd {
+    let px = i64::from_le_bytes(hash[0..8].try_into().unwrap());
+    let qty = i64::from_le_bytes(hash[8..16].try_into().unwrap());
+    AiCmd::new(
+        ts,
+        seq,
+        SYMBOL_ID_NONE,
+        px,
+        qty,
+        0,
+        AiCmdKind::RulesetCommit,
+        VenueId::Ai,
+        5,
+        AI_SIDE_NONE,
+        0,
+        0,
+    )
+}
+
+fn run_report(root: &Path) -> (String, Vec<String>) {
+    let cfg = AuditPnlConfig {
+        replay_dir: root.to_path_buf(),
+        ..AuditPnlConfig::default()
+    };
+    let mut lines = Vec::new();
+    let json = run(&cfg, &mut |l: &str| lines.push(l.to_owned())).expect("report");
+    (json, lines)
+}
+
+/// PM activation Δ default = 200 ms (§4.4 table).
+const PM_DELTA: u64 = 200_000_000;
+
+#[test]
+fn golden_modeled_fill_attribution_and_markout() {
+    let root = tmp_root("golden");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    // Anchor tick at ts=1_000; order emitted ts=2_000 (activates at
+    // 2_000+Δ); crossing tick after activation: ask 0.38 < px 0.50,
+    // displayed 50 ⇒ full fill of 10 @ 0.50 (strict cross, maker at
+    // P); final tick marks mid 0.60 ⇒ unreal = (0.60−0.50)×10 = +$1.
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(
+                2_000 + PM_DELTA + 10,
+                42,
+                350_000,
+                1_000_000,
+                380_000,
+                50_000_000,
+            ),
+            pm_tick(
+                2_000 + PM_DELTA + 20,
+                42,
+                590_000,
+                1_000_000,
+                610_000,
+                1_000_000,
+            ),
+        ],
+    );
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 7, 0)],
+    );
+    let (json, lines) = run_report(&root);
+    assert!(json.contains("\"audit_pnl_version\":1"));
+    assert!(json.contains(
+        "\"strategy_id\":0,\"label\":\"latency-arb\",\"orders\":1,\"fills\":1,\"trades\":1"
+    ));
+    assert!(json.contains("\"net_usd\":\"1.0\""), "json: {json}");
+    // Per-sym human row carries the DESCRIPTOR, never the bare sym.
+    assert!(lines.iter().any(|l| l.contains("PMTOK: fills=1")));
+    // Paper view honestly empty.
+    assert!(json.contains("\"paper\":{\"fills\":0,\"net_usd\":\"0.0\"}"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn vm_hash_timeline_buckets_orders_after_commit_only() {
+    let root = tmp_root("vmhash");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(5_000_000_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+        ],
+    );
+    let hash = [0xAB; 16];
+    write_ai_cmds(&dir, EPOCH_1, &[commit_cmd(3_000, 1, hash)]);
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[
+            // BEFORE the commit: slot-5 aggregate only.
+            order(2_000, 42, Side::Bid, 100_000, 1_000_000, 1, 5),
+            // AFTER: bucketed under the hash too.
+            order(4_000, 42, Side::Bid, 100_000, 1_000_000, 2, 5),
+        ],
+    );
+    let (json, _lines) = run_report(&root);
+    assert!(json.contains("\"strategy_id\":5,\"label\":\"vm\",\"orders\":2"));
+    let hex = "ab".repeat(16);
+    assert!(
+        json.contains(&format!("\"hash128\":\"{hex}\",\"orders\":1")),
+        "json: {json}"
+    );
+    assert!(json.contains("\"vm_orders_no_hash\":1"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn descriptor_keying_survives_sym_reshuffle_across_runs() {
+    // §6 law: run 2 reshuffles ordinals (42 ⇒ OTHER, 43 ⇒ PMTOK).
+    // The PMTOK position opened in run 1 must mark against run 2's
+    // sym-43 ticks, and a run-2 order on sym 42 must land in OTHER.
+    let root = tmp_root("reshuffle");
+    let d1 = run_dir(&root, EPOCH_1);
+    manifest(&d1, &[(42, "PMTOK")]);
+    write_ticks(
+        &d1,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(
+                2_000 + PM_DELTA + 10,
+                42,
+                350_000,
+                1_000_000,
+                380_000,
+                50_000_000,
+            ),
+        ],
+    );
+    write_orders(
+        &d1,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 1, 0)],
+    );
+
+    let d2 = run_dir(&root, EPOCH_2);
+    manifest(&d2, &[(42, "OTHER"), (43, "PMTOK")]);
+    write_ticks(
+        &d2,
+        "pm",
+        EPOCH_2,
+        &[
+            // PMTOK now rides sym 43: mark to 0.60.
+            pm_tick(1_000, 43, 590_000, 1_000_000, 610_000, 1_000_000),
+            // OTHER (sym 42) ticks + crossing for the run-2 order.
+            pm_tick(2_000, 42, 200_000, 1_000_000, 220_000, 1_000_000),
+            pm_tick(
+                3_000 + PM_DELTA + 10,
+                42,
+                150_000,
+                1_000_000,
+                180_000,
+                50_000_000,
+            ),
+        ],
+    );
+    write_orders(
+        &d2,
+        EPOCH_2,
+        &[order(3_000, 42, Side::Bid, 200_000, 5_000_000, 2, 0)],
+    );
+
+    let (json, lines) = run_report(&root);
+    // PMTOK: filled 10 @ 0.50 in run 1, marked 0.60 by run 2's sym 43
+    // ⇒ +$1. OTHER: filled 5 @ 0.20, last mark = its fill-tick mid
+    // 0.165 ⇒ −$0.175. Net floor: 1.0 − 0.175 = 0.825.
+    assert!(json.contains("\"orders\":2,\"fills\":2,\"trades\":2"));
+    assert!(json.contains("\"net_usd\":\"0.825\""), "json: {json}");
+    let pmtok = lines
+        .iter()
+        .filter(|l| l.contains("PMTOK: fills="))
+        .count();
+    assert_eq!(pmtok, 1, "ONE continuous PMTOK row across the reshuffle");
+    assert!(lines.iter().any(|l| l.contains("OTHER: fills=1")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn manifestless_run_is_namespaced_per_run() {
+    let root = tmp_root("nomanifest");
+    let dir = run_dir(&root, EPOCH_1);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(
+                2_000 + PM_DELTA + 10,
+                42,
+                350_000,
+                1_000_000,
+                380_000,
+                50_000_000,
+            ),
+        ],
+    );
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 1, 0xFF)],
+    );
+    let (json, lines) = run_report(&root);
+    assert!(json.contains("\"strategy_id\":255,\"label\":\"unattributed\""));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains(&format!("run-{EPOCH_1}/sym-"))));
+    assert!(lines.iter().any(|l| l.contains("manifest=NO")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn paper_fills_fold_into_cash_plus_markout() {
+    let root = tmp_root("paper");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(9_000, 42, 590_000, 1_000_000, 610_000, 1_000_000),
+        ],
+    );
+    // Paper fill: bought 10 @ 0.50 ⇒ cash −5; mark-out 10 × 0.60 = 6
+    // ⇒ net +1 (no fees in paper).
+    write_fills(
+        &dir,
+        EPOCH_1,
+        &[Fill::new(
+            5_000,
+            42,
+            Side::Bid,
+            Price::from_raw(500_000),
+            Qty::from_raw(10_000_000),
+            77,
+        )],
+    );
+    let (json, _lines) = run_report(&root);
+    assert!(
+        json.contains("\"paper\":{\"fills\":1,\"net_usd\":\"1.0\"}"),
+        "json: {json}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rerun_is_byte_identical() {
+    let root = tmp_root("determinism");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(
+                2_000 + PM_DELTA + 10,
+                42,
+                350_000,
+                1_000_000,
+                380_000,
+                50_000_000,
+            ),
+        ],
+    );
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 1, 0)],
+    );
+    let (json1, lines1) = run_report(&root);
+    let (json2, lines2) = run_report(&root);
+    assert_eq!(json1, json2, "stdout JSON byte-identical");
+    assert_eq!(lines1, lines2, "stderr summary byte-identical");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tickless_root_is_refused() {
+    let root = tmp_root("tickless");
+    let dir = run_dir(&root, EPOCH_1);
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 1, 0)],
+    );
+    let cfg = AuditPnlConfig {
+        replay_dir: root.clone(),
+        ..AuditPnlConfig::default()
+    };
+    assert!(run(&cfg, &mut |_l: &str| {}).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}

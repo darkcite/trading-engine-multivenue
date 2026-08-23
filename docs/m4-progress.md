@@ -365,3 +365,145 @@ gates-green (1232/38/429) + live-proven (503 stamped intents);
 commit ask pending; NEXT = M4.2 (audit-pnl subcommand + D3
 instrument-manifest generalization; design pinned in the entry
 above — fill law REUSED from backtest.rs, never twinned).
+
+(M4.1 COMMITTED `89d9348`, operator-authorized, 10 explicit paths;
+post-commit tree carried only M3's dirty log.)
+
+---
+
+## 2026-08-23 — M4.2 IMPLEMENTED: `audit-pnl` + the D3 instrument manifest (gates + live proof below; commit ask at end)
+
+### (D3) `instrument-manifest.tsv` — the generalized descriptor lane
+
+- `options_manifest.rs`: NEW `INSTRUMENT_MANIFEST_FILE` +
+  `render_instruments()` — EVERY allocated instrument,
+  `<sym_u32>\t<descriptor>` per line, FINAL §9.4 strings: the static
+  lanes' descriptors come PRE-BAKED from `core-config::universe`
+  (`Instrument.descriptor` — the M1d allocation law; PM tokens =
+  bare token ids), options composed here
+  (`deribit:`/`okx:`/`binance-opt:` + name). Written by the bin on
+  EVERY boot (fatal on write failure, the capture-is-the-product
+  stance); `options-manifest.tsv` unchanged, kept ONE release for
+  pre-D3 readers (wire-format.md updated with the new section).
+- `claude_worker.iv_digest` follows: `read_manifest` PREFERS the
+   2-col instrument manifest (venue = the SymbolId namespace byte),
+  falls back to the legacy options file; skip line names both files.
+  (Both touched files are THIS lane's own M2-close additions —
+  the M3 additive-files law holds: no pre-existing worker file
+  touched.) +2 pytest (prefer/strict + legacy-fallback lanes).
+
+### `audit-pnl` — the §4-M4 analyzer (`crates/cli/src/audit_pnl.rs` + bin arm)
+
+- **Fill law REUSED, never twinned**: one
+  `backtest::fill::FillEngine` per attribution key with
+  `boundary_virt_ns = 0` — the OOS book IS the whole-window book, so
+  `oos_*` outcomes are the window stats. Same `ModelParams` knobs as
+  the backtest (`--fee-bps` / `--latency-ns` / `--latency-ns-venue`
+  via the SAME `parse_model_params`). Three additive promotions, all
+  behavior-free: `discover_runs`/`RunDir` → `pub(crate)` (one
+  discovery law; the catalog precedent) and
+  `FillEngine::oos_equity_1e12()` (per-day snapshots).
+- **Merge law inherited verbatim** (§3.2/§3.3): per-run total order
+  extended over event classes — at equal ts, TICKS sort before
+  ORDERS (the engine's "fill pass precedes emit" law) and
+  RulesetCommits before orders (8g §6 in-stream flip); VIRT_T0
+  rebase; the run anchor = min tick ts; orders/fills/ai-cmds share
+  the engine clock and rebase with the SAME anchor; wall-overlapping
+  runs refused. DELIBERATE divergence from the harness, documented
+  in-module: a tick-less run (aborted boot) is SKIPPED with a report
+  line, not fatal — audit tooling reports, only the harness gates.
+- **§6 keying — the reshuffle wall**: every sym is rewritten to a
+  root-scoped DENSE id through its run's manifest descriptor
+  (instrument manifest → options fallback); a manifest-less run
+  resolves into a PER-RUN namespace (`run-<epoch>/sym-0x…`) so its
+  instruments can NEVER silently merge across boots. Dense ids
+  preserve the venue byte (the model's Δ/fee lookup untouched).
+  Books, marks, and per-sym report rows all live in descriptor
+  space.
+- **Attribution**: per `Order.strategy_id` row (labels =
+  strategy-set slots; 255 = unattributed); vm intents additionally
+  bucket per ruleset hash ACTIVE at emit (ai-cmds `RulesetCommit`
+  timeline via `AiCmd::ruleset_hash128` — the shared helper; per-hash
+  books are INDEPENDENT replays beside the slot-5 aggregate;
+  pre-commit vm intents counted `vm_orders_no_hash`).
+- **Two views, one report**: modeled rows beside the paper view
+  (`engine-fills` folded to signed cash + mark-out at last mids, no
+  fees in paper — honestly zero today). Per-UTC-day net buckets =
+  day-boundary equity snapshots (§4-M4's per-day requirement).
+  Output: one deterministic hand-rendered JSON line on stdout
+  (`audit_pnl_version` 1, `fmt_usd_1e6` rendering) + human summary
+  incl. per-descriptor rows on stderr; stderr-pinned tracing; exit
+  0 iff a report was produced.
+- **Tests: +8** — 1 manifest-render unit (all lanes, final
+  descriptors) and 7 integration goldens via the real `PmlrWriter`
+  (hand-computed strict-cross fill + markout through a nonzero
+  anchor and the PM Δ; vm hash timeline pre/post-commit; THE
+  reshuffle test — same descriptor on different ordinals across two
+  runs stays ONE continuous book while a re-used ordinal lands in
+  its new descriptor; manifest-less namespace arm; paper fold;
+  byte-identical rerun; tick-less-root refusal). All passed FIRST
+  RUN.
+
+### Gates (all on the Mac)
+
+- workspace nextest **1240/1240** (+1 skipped; 1 leaky =
+  informational on a pre-existing real-binary harness test) = 1232 +
+  8. New stay-green floor **1240**.
+- release alloc **38/38** 0 B/op (corrected clean, fresh `Compiling
+  bench` ×1, `--test-threads=1`).
+- worker pytest **431/431** (429 + 2 manifest lanes; serialized,
+  off top-of-hour). New stay-green **431**.
+- fuzz: NOTHING owed — the new Rust parsers read OWN capture files +
+  own manifests (engine-authored trust class, same as every PMLR
+  read; no venue wire bytes).
+
+### Live proof (real root, real intents, G0-relinked binary)
+
+`audit-pnl --dir ~/multivenue/logs` over the WHOLE standing root —
+**35 runs, 10 UTC days, exit 0, 558-byte JSON**:
+
+- **strategy 0 (latency-arb): 217 accepted intents → 203 modeled
+  fills/trades over 2 trading days; net −$32.55 (all markout —
+  positions open at window end), max DD $165.03; per-day day8
+  +$47.70 / day9 −$80.25.** Paper view fills=0 net=$0 — the audited
+  paper-mode reality, printed beside the modeled view exactly as
+  §4-M4 demands.
+- **REAL FINDING the tool exists to surface: `caps_rejected=211,840`**
+  — the standing latency-arb re-emits while its 4-per-sym/32-total
+  §4.1 modeled slots are full (~212k intents logged since the M4.1
+  binary went live; the model's conservative wall takes 217). The
+  strategy's emit cadence vs open-order lifecycle is now VISIBLE and
+  quantified — M5 digest material.
+- vm rows empty + `vm_orders_no_hash=0` — correct: every vm-era run
+  predates the M4.1 intent log.
+- Manifest-less pre-D3 runs reported + per-run-namespaced (per-run
+  lines on stderr); no cross-run mixing possible.
+- Ops note: today's M4.1/M4.2 smoke windows (runbook dance) cost
+  ~30–40 s of dark time — well inside M3's 300 s/day gap tolerance;
+  2026-08-23 REMAINS a C6 candidate day.
+
+### Slice checkpoint — COMMIT ASK (pending operator authorization)
+
+`M4:`-prefixed, EXPLICIT paths only:
+
+- `crates/cli/src/audit_pnl.rs` (new)
+- `crates/cli/tests/audit_pnl.rs` (new)
+- `crates/cli/src/options_manifest.rs`
+- `crates/cli/src/backtest.rs` (pub(crate) promotions)
+- `crates/cli/src/backtest/fill.rs` (equity accessor)
+- `crates/cli/src/lib.rs`
+- `crates/cli/src/bin/multivenue-engine.rs`
+- `claude-worker/src/claude_worker/iv_digest.py`
+- `claude-worker/tests/test_iv_digest.py`
+- `docs/wire-format.md`
+- `docs/m4-progress.md`
+
+NOT staged: `docs/m3-progress.md` (M3's WIP + coordination note);
+`.env`; `~/multivenue/*`.
+
+**Resume point if context dies here:** M4.2 code-complete +
+gates-green (1240/38/431) + live-proven (35-run root, real modeled
+P&L, the caps finding); commit ask pending; REMAINING M4 = M4.3
+(the D1-unfrozen additive `pnl` verb + `claude_worker.pnl_report`
+module + nightly-at-C6 coordination; design + rulings pinned in the
+entries above).
