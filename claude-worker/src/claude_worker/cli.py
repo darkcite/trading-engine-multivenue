@@ -1,7 +1,10 @@
 """Operator verb CLI (design §6) — thin Typer frontends over the library.
 
 The §6 surface, verbatim: ``serve``, ``fetch``, ``backtest``, ``push``,
-``positions``, ``stage-ruleset``, ``commit-ruleset``. Global exit codes::
+``positions``, ``stage-ruleset``, ``commit-ruleset`` — plus ``pnl``
+(M4.3: the ONE additive verb the operator D1 ruling un-froze the
+surface for; a THIN reader of the ``pnl_report`` module's files, no
+socket, no engine spawn). Global exit codes::
 
     0 OK        2 usage/validation (bad args, bad file, schema)   3 GATE REFUSED
     4 transport (socket absent/busy/HMAC/protocol)                5 state (SQLite/seq)
@@ -53,6 +56,7 @@ import claude_worker.feeds
 import claude_worker.fetchers
 import claude_worker.frames
 import claude_worker.pmlr
+import claude_worker.pnl_report
 import claude_worker.state
 import claude_worker.uds
 
@@ -968,6 +972,55 @@ def commit_ruleset(
             state.close()
         typer.echo(f"committed {full_hash}")
         typer.echo(f"sent kind=ruleset-commit seq={seq}")
+        return EXIT_OK
+
+    _guarded(run)
+
+
+# ---- pnl (M4.3 — the D1-unfrozen additive verb) --------------------------
+
+
+@app.command()
+def pnl(
+    date: str = typer.Option(
+        "", help="UTC day YYYY-MM-DD; default = the newest report on disk."
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Print the raw report JSON instead of the summary."
+    ),
+) -> None:
+    """Read the shadow-P&L report (thin: the report pair is produced by
+    ``python -m claude_worker.pnl_report``; this verb only finds and
+    prints it — no socket, no engine spawn, BaseConfig-free)."""
+
+    def run() -> int:
+        reports_dir = claude_worker.pnl_report.resolve_reports_dir()
+        if date:
+            json_path, _ = claude_worker.pnl_report.report_paths(reports_dir, date)
+            _require(
+                json_path.is_file(),
+                f"no shadow-P&L report for {date} under {reports_dir} — run"
+                " `python -m claude_worker.pnl_report` first",
+            )
+        else:
+            latest = claude_worker.pnl_report.latest_report(reports_dir)
+            _require(
+                latest is not None,
+                f"no shadow-P&L reports under {reports_dir} — run"
+                " `python -m claude_worker.pnl_report` first",
+            )
+            json_path = typing.cast(pathlib.Path, latest)
+        if json_out:
+            typer.echo(json_path.read_text(encoding="utf-8").rstrip("\n"))
+        else:
+            summary_path = json_path.parent / (
+                json_path.name.removesuffix(".json") + ".summary.txt"
+            )
+            if summary_path.is_file():
+                typer.echo(summary_path.read_text(encoding="utf-8").rstrip("\n"))
+            else:
+                typer.echo(json_path.read_text(encoding="utf-8").rstrip("\n"))
+        typer.echo(f"report: {json_path}", err=True)
         return EXIT_OK
 
     _guarded(run)

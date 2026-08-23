@@ -507,3 +507,117 @@ P&L, the caps finding); commit ask pending; REMAINING M4 = M4.3
 (the D1-unfrozen additive `pnl` verb + `claude_worker.pnl_report`
 module + nightly-at-C6 coordination; design + rulings pinned in the
 entries above).
+
+(M4.2 COMMITTED `c107157`, operator-authorized, 11 explicit paths.)
+
+---
+
+## 2026-08-23 — M4.3 IMPLEMENTED: `pnl_report` module + the D1 `pnl` verb; M4 CLOSES (commit ask below)
+
+### `claude_worker.pnl_report` (NEW module — the report writer)
+
+`python -m claude_worker.pnl_report`: spawns
+`multivenue-engine audit-pnl --dir <replay>` by PATH-resolved name —
+`backtest.ENGINE_BINARY` REUSED, the same pinned §14 spawn contract,
+runner injectable for tests — validates the stdout
+(`audit_pnl_version` 1, JSON, non-empty; anything else = LOUD nonzero
+— a silently skipped nightly would read as a flat day), and writes
+the day pair under `CLAUDE_WORKER_REPORTS_DIR`
+(default `~/multivenue/worker/reports`; documented in `.env.example`,
+`.env` untouched): `pnl-<YYYY-MM-DD>.json` (verbatim stdout) +
+`pnl-<YYYY-MM-DD>.summary.txt` (verbatim stderr summary). Idempotent
+per UTC day (a re-run refreshes — derived cache; PMLR stays the
+truth). Serialized like every worker invocation. **D2 stands: the
+nightly launchd timer is M3's C6+ window; manual invocation until
+then** (this entry is the runbook line — `docs/local-setup.md` gains
+it at the C6 window, M3-owned).
+
+### The `pnl` verb (cli.py — the D1-unfrozen ONE additive verb)
+
+THIN by construction: finds the newest (or `--date`) report pair and
+prints the summary (`--json` for the raw report); no socket, no
+engine spawn, no BaseConfig read; exit 2 with a
+run-the-module hint when nothing exists. cli.py changes: the module
+import + the command + the docstring surface note — nothing else.
+
+### The frozen-pin conflict — fired and resolved EXACTLY per D1
+
+`test_cli.py::test_verb_surface_is_exactly_section_6` pins the verb
+set to the §6 seven — the D1 stop-condition. STOPPED, put to the
+operator; **operator ruling: amend the pin to 8** (the one sanctioned
+edit to a frozen test, comment in-test citing this ruling + date).
+The pin keeps guarding: an unsanctioned 9th verb still fails. The
+no-override-flag §11 test passes untouched (`pnl` carries no
+override-shaped option). Every other frozen test byte-untouched.
+
+### Tests (+8, all first-run green)
+
+`tests/test_pnl_report.py`: module — argv/spawn-contract pin, report
+pair written, per-day idempotence+refresh, loud failure on nonzero /
+empty / non-JSON / wrong-version stdout; verb — latest-with-JSON-
+fallback, dated summary + `--json`, missing ⇒ exit 2; and a
+PATH-gated REAL-BINARY end-to-end (crafted run: ticks + hand-packed
+Order slots + manifest → module spawns the real `audit-pnl` → report
+pair verified, fills=1) riding the `test_backtest_real` skip law.
+
+### Gates
+
+- worker pytest **439/439** (431 + 8; incl. the amended pin). New
+  stay-green **439**.
+- Rust BYTE-UNTOUCHED in M4.3 ⇒ nextest **1240** / alloc **38** stand
+  (same tree as the M4.2 gate run). fuzz: nothing owed.
+
+### Live proof (real root, serialized, off top-of-hour)
+
+- `python -m claude_worker.pnl_report` against the standing root:
+  exit 0 — `pnl-2026-08-23.json` + summary written
+  (strategies=1 runs=35; the audit-pnl numbers had GROWN since the
+  M4.2 proof — orders 217→324, fills 203→317 — the standing lane
+  logs intents continuously; the report is the living daily
+  snapshot, exactly the design).
+- `claude-worker pnl` prints the summary (per-descriptor rows
+  visible); `claude-worker pnl --json` prints the schema-1 line.
+- Recorded expectation: today's intent-bearing runs predate the
+  instrument manifest (M4.1-era binary) ⇒ their rows show the
+  per-run-namespace form (`run-…/sym-0x…`) — the §6-correct honest
+  arm. Descriptor continuity begins at the standing lane's NEXT
+  00:00Z restart (first boot of the M4.2+ binary writes
+  `instrument-manifest.tsv` every boot). No action needed.
+
+### M4 CLOSED — exit vs mvp-plan §4-M4
+
+- per-strategy attribution on capture: **BUILT + verified**
+  (M4.1 migration; wire-format + migration.md entries) ✓
+- `audit-pnl`: one command → per-strategy / per-ruleset-hash modeled
+  P&L over any window, beside the paper view, JSON + human,
+  deterministic ✓ (live-proven twice)
+- worker surface + daily report: `pnl_report` module + `pnl` verb ✓
+- "nightly report lands automatically (launchd timer)": **DEFERRED
+  to M3's C6+ window by operator ruling D2** — recorded as the one
+  open exit line, owned by the C6 procedure.
+- Estimates: plan said 3–4 d; landed in one session (M4.1+M4.2+M4.3)
+  on the back of the M2-close manifest work.
+
+### COMMIT ASK (pending operator authorization)
+
+`M4:`-prefixed, EXPLICIT paths only:
+
+- `claude-worker/src/claude_worker/pnl_report.py` (new)
+- `claude-worker/tests/test_pnl_report.py` (new)
+- `claude-worker/src/claude_worker/cli.py` (the D1 additive verb)
+- `claude-worker/tests/test_cli.py` (the ONE sanctioned pin
+  amendment)
+- `.env.example`
+- `CLAUDE.md` (CURRENT STATE → M4 CLOSED + baselines 1240/38/439;
+  M5 next on operator go)
+- `docs/m4-progress.md`
+
+NOT staged: `docs/m3-progress.md`; `.env`; `~/multivenue/*`.
+
+**Resume point if context dies here:** M4 is functionally COMPLETE
+and live-proven end-to-end; only this commit is pending. After it:
+M5 on explicit operator go (mvp-plan §4-M5 — full-universe
+digest inputs incl. the iv_digest table, one semi-manual promotion
+on REAL multi-day capture post-C6, the manual walk-forward runbook);
+the C6+ window owes M3 the nightly pnl timer + the digest cadence
+hookups (coordination notes in docs/m3-progress.md).

@@ -616,6 +616,11 @@ def _command_names() -> set[str]:
 
 
 def test_verb_surface_is_exactly_section_6() -> None:
+    # "pnl" added under the operator D1 ruling (2026-08-23, docs/
+    # m4-progress.md): the ONE sanctioned amendment to this frozen
+    # pin — the additive M4.3 thin report reader. Everything else on
+    # the surface stays the verbatim §6 seven; an unsanctioned 9th
+    # verb still fails here.
     assert _command_names() == {
         "serve",
         "fetch",
@@ -624,6 +629,7 @@ def test_verb_surface_is_exactly_section_6() -> None:
         "positions",
         "stage-ruleset",
         "commit-ruleset",
+        "pnl",
     }
 
 
