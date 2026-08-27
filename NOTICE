@@ -1,0 +1,33 @@
+Multivenue Trading Engine
+Copyright 2026 Anton (darkcite)
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may
+not use this file except in compliance with the License. You may obtain
+a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+The full license text is in the LICENSE file at the root of this
+repository.
+
+--------------------------------------------------------------------------
+Third-party attributions
+--------------------------------------------------------------------------
+
+This repository vendors no third-party source. All external dependencies
+are consumed as unmodified crates.io / PyPI packages resolved at build
+time (see Cargo.toml, Cargo.lock and claude-worker/pyproject.toml) and
+carry their own licenses; they are not redistributed in this source tree.
+
+Cryptographic primitives that would normally be pulled from a third-party
+stack are handwritten in-tree and are original work of this project:
+
+  * crates/core-crypto   — SHA-256, HMAC-SHA256, base64 (RFC 4648)
+  * crates/signer-eip712 — EIP-712 typed-data signing over secp256k1 +
+                           tiny-keccak (deliberately NOT ethers or alloy)
