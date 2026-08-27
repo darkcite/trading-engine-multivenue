@@ -194,8 +194,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
+Every source file carries `SPDX-License-Identifier: Apache-2.0`; `make
+license-check` fails the build if one does not. The license covers
+documentation source and diagrams (`docs/`, `PLAN.md`, `*.svg`) on the same
+terms — Apache-2.0's definition of "Source" is explicit that it includes
+documentation source.
+
 Contributions are accepted under Apache-2.0 §5 — a submitted contribution
-is licensed under the same terms, without additional conditions.
+is licensed under the same terms, without additional conditions. See
+[CONTRIBUTING.md](./CONTRIBUTING.md).
+
+### Third-party dependencies
+
+No third-party source is vendored in this tree; dependencies are resolved
+at build time from crates.io and PyPI and carry their own licenses. A
+compiled binary does link them, so attribution for the binary is generated
+by `make license-deps` (cargo-about) into `THIRD-PARTY-NOTICES.md`. **No
+distributed binary may ship without `LICENSE`, `NOTICE` and
+`THIRD-PARTY-NOTICES.md` alongside it.** `make license-deps` also runs
+`cargo deny check licenses` against the allowlist in
+[deny.toml](./deny.toml).
+
+### Trademarks
+
+Polymarket, Binance, OKX, Deribit and Hyperliquid are trademarks of their
+respective owners. This project is not affiliated with, endorsed by, or
+sponsored by any of them, and names them only to describe
+interoperability. Per Apache-2.0 §6, this license grants no trademark
+rights.
 
 ## Disclaimer
 

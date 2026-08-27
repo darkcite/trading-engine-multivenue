@@ -4,7 +4,16 @@ version         = "0.2.0"
 description     = "AI-ingress worker for the multivenue trading engine: serve daemon + operator verbs (8f rewrite)"
 readme          = "README.md"
 requires-python = ">=3.14"
-license         = { text = "Apache-2.0" }
+# PEP 639 SPDX expression. The deprecated PEP 621 `{ text = ... }` table
+# form was replaced 2026-08-27 (license audit G4). LICENSE and NOTICE here
+# are copies of the repo-root originals: PEP 639 `license-files` cannot
+# reference paths outside the project root, and without them the built
+# wheel/sdist would ship with NO license file at all (Apache-2.0 §4(a) and
+# §4(d)). Keep the copies in sync with `make sync-license` from the repo
+# root; `make license-check` fails if they drift.
+license         = "Apache-2.0"
+license-files   = ["LICENSE", "NOTICE"]
+authors         = [{ name = "Anton (darkcite)", email = "qqq.darkcite@gmail.com" }]
 
 dependencies = [
     # Anthropic SDK — constructed inside `serve` (llm.py seam) ONLY; verbs never touch it.

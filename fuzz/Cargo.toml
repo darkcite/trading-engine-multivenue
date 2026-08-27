@@ -3,6 +3,11 @@ name    = "polymarket-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+# NOT inheritable: fuzz/ is `exclude`d from the workspace (cargo-fuzz
+# convention), so `license.workspace = true` is unavailable here. Keep
+# this literal in sync with [workspace.package] in ../Cargo.toml.
+license = "Apache-2.0"
+authors = ["Anton (darkcite) <qqq.darkcite@gmail.com>"]
 
 [package.metadata]
 cargo-fuzz = true

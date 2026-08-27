@@ -74,3 +74,16 @@ Thumbs.db
 # --- Claude local session scratch ---
 .claude/cache/
 .claude/local/
+
+# --- external material, provenance unconfirmed ---
+# Third-party strategy research from a separate engagement. No authorship,
+# copyright or license statement of its own; references source documents
+# that are not in this repo. Nothing from it may enter git history until
+# ownership/relicensing is confirmed and recorded in NOTICE.
+# See docs/license-audit-2026-08-27.md G8.
+EXTERNAL STRATEGIES TO ONBOARD/
+
+# NOTE: THIRD-PARTY-NOTICES.md is deliberately NOT ignored. It is generated
+# by `make license-deps` but must be committed: it has to ship beside every
+# distributed binary, and an ignored file is one that can be missing at
+# release time. Regenerate it, never hand-edit it.
