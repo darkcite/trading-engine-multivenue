@@ -1,0 +1,5 @@
+# THIRD-PARTY-NOTICES.md reproduces upstream licence texts verbatim, some of
+# which ship CRLF. Store its bytes exactly as generated: it is a compliance
+# document, not source. Normalising it both alters a reproduced text and makes
+# every `make license-deps` run report spurious churn.
+THIRD-PARTY-NOTICES.md -text
