@@ -24,6 +24,7 @@ A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that ex
 - **Authority chain now:** `docs/mvp-completion-plan.md` (M-phases; §9 binding) → the M-phase progress log's latest entry → this file. For 8h archaeology: `docs/prompts/8h-kickoff.md` → `docs/phase-8h-design.md` (LOCKED) → `docs/phase-8h-progress.md` (closure entry last).
 - **Frozen contract (unchanged):** `claude-worker/src/claude_worker/backtest.py` — argv `multivenue-engine backtest --ruleset R --replay-dir D --split 70/30`, schema-1 JSON on stdout, GateThresholds numbers; the frozen 202 worker tests pin it. **The harness conforms to the worker, never vice versa.** `backtest.py` and `cli.py` byte-untouched through H6b-SEMI (five sessions).
 - **Baselines at M4 close (all run 2026-08-23):** workspace nextest **1240/1240** (+1 skipped fixture-regen; 1 informational leaky on a pre-existing real-binary harness test), release alloc **38/38** 0 B/op (`--test-threads=1`, corrected clean + fresh-`Compiling bench` guard; gate grew 37→38 with the M4.1 orders-capture/stamp assertion), worker pytest **439** (frozen 202 with the ONE D1-sanctioned verb-pin amendment; release binary on PATH), fuzz: standing clean — M2-close re-ran the 3 discovery-family targets ≥300 s (`deribit_instruments` 8.77M · `okx_instruments` 5.71M · `binance_eapi` 11.84M); M4 added no untrusted-bytes parser. Stay-greens: **1240 / 38 / 439**.
+- **LICENCE PASS LANDED 2026-08-27** (commits `2dd88d5` metadata · `3989d63` licence gate + audit · `9780d42` SPDX headers, 194 files +525/−0). Apache-2.0 is now applied per-file, not just at the root; `make license-check` gates it, `deny.toml`/`about.toml` gate the dependency surface. **The stay-greens were NOT re-run after these commits — run 1240 / 38 / 439 (+ `uv sync`, since `pyproject.toml` changed) before building on them.** `make license-deps` also still owed (needs cargo-deny + cargo-about installed); `THIRD-PARTY-NOTICES.md` does not exist yet. Rules in "Licensing" below are binding from here; authority `docs/license-audit-2026-08-27.md`.
 - **Push anomaly KNOWN** (origin/main divergence observed H0): record, never act.
 - **Git discipline:** NO push, NO rebase, NO history rewrite, NO new branches, NO git ops without operator ask. Do NOT touch `.env`.
 - If context runs short: write interim state + exact resume point + relaunch prompt to the active M-phase progress doc, then tell the operator.
@@ -72,6 +73,14 @@ cargo bench --workspace
 
 # python claude-worker tests
 cd claude-worker && uv run pytest
+
+# licence gates — run license-check before every commit (offline, ~1 s:
+# SPDX coverage on all tracked .rs/.py/.sh, claude-worker LICENSE/NOTICE
+# drift, the fuzz manifest's non-inheritable license key).
+make license-check
+# only when a dependency changed (needs cargo-deny + cargo-about installed);
+# regenerates THIRD-PARTY-NOTICES.md, which is COMMITTED, not release-time.
+make license-deps
 
 # start the engine locally (paper mode)
 # G0 law: test gates build rlibs/test bins but NEVER relink the release
@@ -124,6 +133,24 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 - **No live Anthropic API calls in tests.** Mock at the SDK boundary.
 - Anthropic SDK is constructed inside `serve` only; strategist model is `MODEL_STRATEGIST = "claude-fable-5"`.
 
+### Licensing — EVERY new file (enforced by `make license-check`)
+- **Every new `.rs`, `.py` and `.sh` file MUST carry the two-line SPDX record as its first lines.** No exceptions — tests, fuzz targets, one-off scripts, throwaway harnesses. Adding a file without it fails `make license-check`, which is a gate, not advice.
+  ```rust
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright 2026 Anton (darkcite)
+  ```
+  ```python
+  # SPDX-License-Identifier: Apache-2.0
+  # Copyright 2026 Anton (darkcite)
+  ```
+- **Placement is exact:** Rust — above the `//!` inner-doc block and above any `#![...]` inner attribute (comments may legally precede both). Python — above the module docstring (`__doc__` still resolves). Shell — **after** the shebang, never before it.
+- **Every new crate's `Cargo.toml` gets `license.workspace = true`.** The one manifest that cannot inherit is `fuzz/Cargo.toml` (workspace-`exclude`d by cargo-fuzz convention) — it carries a literal `license = "Apache-2.0"`; keep the two in sync.
+- **Adding/changing/removing a dependency changes the license surface of the shipped binary.** Run `make license-deps` (cargo-deny + cargo-about) and commit the regenerated `THIRD-PARTY-NOTICES.md` with that change. If `cargo deny check licenses` rejects a new license, that is a deliberate decision in `deny.toml` — read what the license obliges before appending a line, never rubber-stamp it.
+- **Never vendor third-party source into this tree.** Deps are unmodified crates.io/PyPI packages, which is what makes the `NOTICE` claim true. If material of any provenance must land in-tree, record it in `NOTICE` first.
+- **No binary leaves the build host without `LICENSE` + `NOTICE` + `THIRD-PARTY-NOTICES.md` beside it.** Stage-3 / Phase-7 gate.
+- **Repo-wide file rewrites: verify `git diff --summary` is empty of mode changes.** A `> tmp && mv` pass creates new inodes at the umask and silently strips exec bits — it did exactly that to the five `scripts/*.sh` launchd scripts on 2026-08-27. `--numstat` does NOT show mode changes and will not catch it.
+- Authority: `docs/license-audit-2026-08-27.md`. Contributor-facing copy: `CONTRIBUTING.md`.
+
 ### Secrets
 - **`.env` file only.** No macOS Keychain, no AWS KMS, no Vault, no Secrets Manager.
 - **`.env` is `chmod 600` and in `.gitignore`. `.env.example` is committed.**
@@ -141,6 +168,7 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 - `docs/prompts/8h-kickoff.md` — frozen H0 authority prompt. `docs/prompts/ai-session.md` — semi-manual AI-session prompt (pinned by `claude-worker/tests/test_session_scripted.py` — do not move or drift it).
 - `docs/wire-format.md` — PMLR v2 ring-slot/replay-log formats. `docs/migration.md` — format/schema migration log.
 - `docs/risk-policy.md` — kill-switch and cap rules.
+- `docs/license-audit-2026-08-27.md` — Apache-2.0 compliance audit + application record; the authority for the "Licensing" hard rules. `CONTRIBUTING.md` — the contributor-facing copy. `deny.toml` / `about.toml` / `about.hbs` — the dependency licence gate.
 - `docs/architecture.md` (+ `.svg`, `phase-8-architecture.svg`) — one-page orientation.
 - `docs/local-setup.md` — Mac toolchain setup. `docs/hot-path-latency.md` — standing latency audit (referenced by PLAN.md + bench).
 - `docs/options-support-plan.md` — Phase 9+ candidate, P&L-gated; nothing lands in 8h.
@@ -176,6 +204,8 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 11. **Trusting probe fixtures over live boots.** Venue wire drifts (OKX `preopen` empties, 27-byte XPERP ids, Deribit starbase reorder + sci-notation floats were all caught LIVE in 8e). New parsers get a live smoke run before being declared done; `--raw-tap` exists for exactly this.
 12. **Long commands through the RustRover MCP terminal.** `execute_terminal_command` executeInShell=true has a ≤45 s window — long runs: `nohup … > /tmp/log &` then poll. zsh eats bare `===` in echo.
 13. **Modifying the worker's frozen surfaces.** `backtest.py` argv/schema-1 and the verb surface are FROZEN; the harness conforms to the worker. The 202 pytest baseline stays untouched-green.
+14. **Creating a new `.rs`/`.py`/`.sh` without the SPDX header, or a new crate without `license.workspace = true`.** See "Licensing" above. `make license-check` fails on it, and a header-less file lifted out of the repo carries no license signal at all — §4(c) obliges downstream to retain notices that then do not exist. Write the two lines when you create the file, not later.
+15. **Adding a dependency without re-running `make license-deps`.** A new crate changes what the shipped binary must attribute. `THIRD-PARTY-NOTICES.md` is committed, not generated at release time, precisely so it cannot be missing when a binary ships.
 
 ## macOS session facts (hard-won)
 
