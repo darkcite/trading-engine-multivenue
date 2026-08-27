@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """state.py — WAL mode, durable seq allocator, dedupe, event log (§5.3).
 
 Convention: full ``import x`` only. No ``from x import y``.

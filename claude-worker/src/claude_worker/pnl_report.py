@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """pnl_report — the M4.3 shadow-P&L report writer (mvp-plan §4-M4).
 
 A standalone MODULE (``python -m claude_worker.pnl_report``): spawns

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! §11 proptests (1) + (2) for the §4.2 ruleset validator (they land
 //! WITH the strategy-vm crate per §12 item 5, alongside the
 //! `ruleset_json` fuzz target).

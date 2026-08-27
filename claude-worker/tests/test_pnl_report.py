@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """pnl_report module (M4.3) + the D1-unfrozen thin ``pnl`` verb.
 
 Module: injectable-runner contract (argv shape, schema refusals,

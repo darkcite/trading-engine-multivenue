@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Reconnect backoff — capped exponential with jitter (D8 fix)
 //!
 //! Replaces the flat 500 ms sleep every ingress used between

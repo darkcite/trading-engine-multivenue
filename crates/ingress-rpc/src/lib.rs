@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-rpc
 //!
 //! Polygon JSON-RPC ingress (Alchemy primary, QuickNode failover).

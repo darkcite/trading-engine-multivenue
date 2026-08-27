@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Walk-forward monitor logic (design §8.3) — the rollback trigger's
 pure substrate. serve-only, like the strategist: composed by
 ``daemon.ResearchCycle``; never a CLI verb.

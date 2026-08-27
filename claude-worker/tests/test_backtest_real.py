@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Real-harness integration (design §12, H-D8 centerpiece): drive the
 REAL ``multivenue-engine backtest`` release binary through the FROZEN
 ``claude_worker.backtest.run_backtest`` seam, over the committed golden

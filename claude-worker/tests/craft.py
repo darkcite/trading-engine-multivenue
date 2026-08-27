@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Shared 8h-H5 test builders: crafted PMLR tick files (known spans for
 the §8.3 window math) and committed-registry seeding. NOT collected by
 pytest (no ``test_`` prefix); imported by the monitor/research suites.

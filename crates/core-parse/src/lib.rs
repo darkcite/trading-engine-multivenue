@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-parse
 //!
 //! Zero-allocation byte-scanner primitives over `&[u8]`.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_okx::discovery::parse_index_price`,
 //! the M2.2 boot-time `/api/v5/market/index-tickers` REST parser (the
 //! capped-chain ATM reference; docs/m2-progress.md design entry —

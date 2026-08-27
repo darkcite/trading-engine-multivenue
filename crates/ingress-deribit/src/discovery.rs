@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Deribit boot-time REST discovery (Phase 8e, plan §4.2 + §6.1)
 //!
 //! Parses `GET /api/v2/public/get_instruments?currency=<ccy>&kind=future`

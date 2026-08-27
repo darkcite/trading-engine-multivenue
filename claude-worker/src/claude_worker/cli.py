@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Operator verb CLI (design §6) — thin Typer frontends over the library.
 
 The §6 surface, verbatim: ``serve``, ``fetch``, ``backtest``, ``push``,

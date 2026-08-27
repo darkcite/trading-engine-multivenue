@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Tiny HTTP/1.1 server for the `/metrics` endpoint.
 //!
 //! `serve_metrics(addr, registry, stop)` blocks the caller's thread

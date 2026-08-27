@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """candles — the §9.4–§9.6 persistent candle store (M3 C4).
 
 A standalone MODULE (``python -m claude_worker.candles``) — NOT a

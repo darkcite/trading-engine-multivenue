@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-binance
 //!
 //! Binance WebSocket ingress (spot + USDS-M futures).

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """backtester (design §5.1): subprocess seam to ``multivenue-engine
 backtest`` + the GATES.
 

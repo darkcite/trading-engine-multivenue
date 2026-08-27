@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Hyperliquid boot-time REST discovery (Phase 8e, plan §4.3/§4.4 + §6.1)
 //!
 //! Parses the four `POST /info` discovery bodies — `{"type":"meta"}`,

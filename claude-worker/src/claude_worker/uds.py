@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """UDS client — the worker side of the §4 transport.
 
 Design §4.3: ``uds.py`` is the **sole frame writer** in the worker process.

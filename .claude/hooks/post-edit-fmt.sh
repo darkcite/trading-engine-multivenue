@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # .claude/hooks/post-edit-fmt.sh
 #
 # Post-tool-use hook for Write/Edit. If the edited file is a Rust file,

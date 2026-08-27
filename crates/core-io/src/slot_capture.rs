@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # SlotCapture — generic single-file PMLR capture sink
 //!
 //! [`crate::PmlrCapture`] is the three-file *venue* sink

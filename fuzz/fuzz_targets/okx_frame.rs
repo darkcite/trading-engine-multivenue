@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the full ingress-okx parse surface.
 //!
 //! One OKX connection multiplexes five public channels; the run loop

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # OKX boot-time REST discovery (Phase 8e, plan §4.1 + §6.1)
 //!
 //! Parses `GET /api/v5/public/instruments?instType=SPOT|SWAP|FUTURES`

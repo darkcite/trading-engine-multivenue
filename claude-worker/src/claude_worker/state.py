@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Durable worker state — SQLite in WAL mode (design §5.3).
 
 One database (``CLAUDE_WORKER_DB``) shared by every mode. Item-9 scope:

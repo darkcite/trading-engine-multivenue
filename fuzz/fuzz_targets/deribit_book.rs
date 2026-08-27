@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary triples → the ingress-deribit book-chain
 //! monitor, checked against an inline reference model.
 //!

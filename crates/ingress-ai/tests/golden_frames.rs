@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Golden-frame vectors shared with the Python worker (Phase 8f item 9).
 //!
 //! Consumes `claude-worker/tests/fixtures/ai_frame_golden.txt` — the SAME

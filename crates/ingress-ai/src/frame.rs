@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! 82-byte UDS wire frame (design §4.1) + per-connection sequence
 //! policy (design §4.4 step 5).
 //!

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """data_fetcher core (design §5.1): replay-log features + positions/P&L.
 
 Primary input is the engine's PMLR capture (``CLAUDE_WORKER_REPLAY_DIR``

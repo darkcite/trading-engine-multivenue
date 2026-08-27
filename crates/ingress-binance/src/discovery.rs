@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Binance boot-time REST discovery (M1, mvp-plan §4-M1 "discovery
 //! audit"; the 8e §6.1 pattern applied to Binance)
 //!

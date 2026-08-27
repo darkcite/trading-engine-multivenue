@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Hand-rolled SIGINT handler.
 //!
 //! Goal: when the user hits `Ctrl+C` (or `kill -INT $pid`), flip a

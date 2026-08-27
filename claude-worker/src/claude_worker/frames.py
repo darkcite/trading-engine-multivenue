@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """AiCmd wire-frame packing (design §4.1; Rust counterpart: ``ingress-ai/src/frame.rs``).
 
 Frame layout, byte-identical to the Rust packer (pinned by the shared golden

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """daemon.py serve loop — the §11 composed-iteration test: canned feeds
 (httpx.MockTransport) + mocked LLM (FakeClient at the llm.py seam) +
 fake UDS server. Asserts dedupe honored, prompt-cache hit on identical

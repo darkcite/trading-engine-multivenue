@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! UDS loopback integration suite (design §11 — the AI-ingress analog
 //! of the venue TLS-loopback standard).
 //!

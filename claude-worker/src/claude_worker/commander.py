@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """commander (design §5.1): labeled events + operator policy -> AiCmd
 frames, plus the serve-mode Heartbeat cadence.
 

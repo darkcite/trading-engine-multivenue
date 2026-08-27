@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Zero-alloc scanner for Polymarket CLOB `/order` responses.
 //!
 //! Response envelopes (Phase 3 v1):

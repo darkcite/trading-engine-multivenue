@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Integration test: real TCP loopback against the embedded
 //! metrics server. Binds an ephemeral port, registers a counter +
 //! gauge, fires a GET /metrics, and asserts the Prometheus body

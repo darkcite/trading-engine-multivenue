@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! The M2 capped-options-universe selection LAW — extracted at M2 close
 //! (operator-ruled 2026-08-22; docs/m2-progress.md close entry) from the
 //! three verbatim twins that grew under the rule of three:

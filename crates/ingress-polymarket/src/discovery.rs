@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Polymarket Gamma boot-time REST discovery (Phase 8e, plan §6.1)
 //!
 //! Parses `GET /markets?clob_token_ids=<decimal-token-id>` bodies from

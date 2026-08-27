@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Phase-8g ruleset stage/commit side path: §4.2 validator + state
 //! machine (grown from the 8f stub per design §5 — semantics kept,
 //! the "drop after hash" is replaced by parse-and-validate into a

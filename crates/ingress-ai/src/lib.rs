@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-ai
 //!
 //! AI-command ingress (Phase 8f, design §4): a mio-driven Unix-domain

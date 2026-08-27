@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-latency
 //!
 //! Log-linear latency histogram. Preallocated buckets, lock-free

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Counter + gauge registry. Boot-only insertion; zero-alloc record.
 
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-deribit run-loop
 //!
 //! Deribit JSON-RPC 2.0 over WS/TLS. Same opening-handshake shape as

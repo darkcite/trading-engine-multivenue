@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-hyperliquid run-loop
 //!
 //! Hyperliquid public WS over TLS. Same opening-handshake shape as

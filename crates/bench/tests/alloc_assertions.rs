@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Allocation-assertion harness.
 //!
 //! Installs `core_alloc::CountingAllocator` as the global allocator for

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Zero-alloc JSON encoder for signed Polymarket orders.
 //!
 //! Polymarket CLOB POST `/order` body (Phase 3 v1 shape):

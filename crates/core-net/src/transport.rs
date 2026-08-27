@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Non-blocking transport trait
 //!
 //! Abstracts the I/O substrate under the Polymarket ingress run-loop.

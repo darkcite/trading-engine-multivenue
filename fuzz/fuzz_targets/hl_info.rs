@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_hyperliquid::discovery::HlDiscovery`,
 //! the boot-time `POST /info` REST parsers (`meta`, `spotMeta`,
 //! `perpDexs`, `outcomeMeta`) plus the `resolve()` coin-string

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # capture-catalog — offline capture inventory + continuity report (M3)
 //!
 //! Walks a replay root (`MULTIVENUE_LOG_DIR`, or one `run-<epoch_ns>`

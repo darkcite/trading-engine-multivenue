@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # .claude/hooks/no-forbidden-crates.sh
 #
 # Pre-tool-use hook for Write/Edit. Reads the tool-call JSON from stdin and

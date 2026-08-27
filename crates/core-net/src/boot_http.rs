@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # boot_http — boot-only blocking HTTPS/1.1 client
 //!
 //! Drives the [`crate::http1`] codec over a **blocking** `TcpStream` +

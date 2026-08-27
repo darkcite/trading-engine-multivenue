@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the subscribe-path pipeline.
 //!
 //! `eth_subscribe` is the only long-lived request the RPC run-loop

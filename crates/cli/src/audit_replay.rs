@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # audit-replay — offline capture audit (Phase 8e, plan §6.5)
 //!
 //! Reads one capture run directory (`<MULTIVENUE_LOG_DIR>/run-<ns>/`,

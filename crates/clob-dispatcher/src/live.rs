@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! `LiveDispatcher` — the real Polymarket CLOB POST path.
 //!
 //! Synchronous: each `submit` call signs the order, encodes JSON,

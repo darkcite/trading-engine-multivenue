@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # research-artifacts
 //!
 //! Loads claude-worker NDJSON tags + JSON rules at boot into

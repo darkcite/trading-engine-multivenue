@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Integration test: `core_net::boot_http` against a real `127.0.0.1`
 //! TLS server with a self-signed cert (same rcgen harness as every
 //! ingress loopback). Covers, per the house happy+failure rule:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """uds.py — client behavior against the fake UDS server (§11).
 
 Convention: full ``import x`` only. No ``from x import y``.

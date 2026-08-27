@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Venue REST consumers (design §6.1) + market-map ownership (§6.2).
 
 The four public, keyless consumers deferred from 8g §15 (H-D5 LOCKED):

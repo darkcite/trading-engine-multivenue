@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """news_watcher (design §5.1): httpx RSS/Atom polling, SQLite dedupe,
 triage → escalate → label pipeline over an INJECTED ``complete_fn``.
 

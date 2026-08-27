@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Scripted SEMI-MANUAL session test (design §11, 8f amendment).
 
 Executes the ``docs/prompts/ai-session.md`` §4 workflow verb-by-verb as

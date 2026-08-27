@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """frames.py — golden vectors shared with Rust, tag16, buffer reuse.
 
 The golden fixture (``tests/fixtures/ai_frame_golden.txt``) is consumed by

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Keepalive — proactive pings + idle-timeout detection (D5/D6)
 //!
 //! Every venue cuts idle connections (OKX at 30 s, Hyperliquid at

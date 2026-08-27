@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # book-builder
 //!
 //! Maintains a fixed-depth book per market. Fed by the Polymarket

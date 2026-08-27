@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_deribit::discovery::parse_index_price`,
 //! the M2.1 boot-time `/public/get_index_price` REST parser (the
 //! capped-chain ATM reference; docs/m2-progress.md design entry —

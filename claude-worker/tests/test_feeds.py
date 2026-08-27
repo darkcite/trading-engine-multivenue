@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """feeds.py: RSS/Atom mechanics, SQLite dedupe (pre-seeded per §11),
 triage→escalate pipeline with an injected complete_fn, prompt-cache
 behavior, jittered cadence, and the never-crash failure doctrine.

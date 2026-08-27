@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! mio UDS listener + §4.4 accept path.
 //!
 //! Thread model (design §4.3): this module runs on the AI ingress

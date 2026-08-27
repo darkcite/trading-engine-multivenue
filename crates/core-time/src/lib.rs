@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-time
 //!
 //! Monotonic nanosecond clock. A thin wrapper over the platform syscall

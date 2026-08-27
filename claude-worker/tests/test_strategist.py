@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """strategist.py units (design §12 strategist rows) + the 8h llm.py
 surface growth. Pure/file-level tests — the cycle composition lives in
 ``test_research_cycle.py``. NO live SDK anywhere (house rule).

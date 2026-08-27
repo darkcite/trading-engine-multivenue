@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! `options-manifest.tsv` — per-run sidecar mapping boot-discovered
 //! options SymbolIds to venue instrument names (M2 close, operator-ruled
 //! 2026-08-22).

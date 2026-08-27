@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Single-file PMLR capture sink for accepted AI commands.
 //!
 //! `PmlrCapture` (core-io) is the three-file *venue* sink

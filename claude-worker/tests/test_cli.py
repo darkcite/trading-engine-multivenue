@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """cli.py — operator verbs against the fake UDS server + canned reports
 (design §6, §11).
 

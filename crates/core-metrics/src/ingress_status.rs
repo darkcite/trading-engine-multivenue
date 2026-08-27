@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Per-ingress status slot — the D7 fix.
 //!
 //! One `IngressStatus` per ingress thread, allocated at boot and

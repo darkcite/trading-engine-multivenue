@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """llm.py — the SDK seam. FakeClient only; no live calls anywhere
 (§11: SDK mocked at the llm.py seam).
 

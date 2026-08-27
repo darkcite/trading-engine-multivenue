@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-ring
 //!
 //! A single-producer / single-consumer, lock-free, fixed-capacity ring

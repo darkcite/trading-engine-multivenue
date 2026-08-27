@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # strategy-ai-exec
 //!
 //! The AI-driven execution strategy (Phase 8f, design §7): slot 4 of

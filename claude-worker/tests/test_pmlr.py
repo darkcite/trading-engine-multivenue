@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """pmlr.py against the Rust-writer golden fixtures (design §11: v1 + v2,
 torn-tail tolerance). Fixture provenance: tests/fixtures/pmlr/README.md.
 

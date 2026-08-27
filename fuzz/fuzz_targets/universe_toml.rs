@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz the M1 boot-universe config parser (core-config::universe).
 //!
 //! The parser consumes operator-authored file bytes at boot; the house

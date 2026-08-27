@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the full ingress-deribit parse surface.
 //!
 //! One Deribit JSON-RPC connection multiplexes four public channels;

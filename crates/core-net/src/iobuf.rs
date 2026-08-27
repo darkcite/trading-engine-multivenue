@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # IoBuf — fixed-capacity rx/tx byte window
 //!
 //! Lifted out of the per-ingress run loops in Phase 8a (it existed as

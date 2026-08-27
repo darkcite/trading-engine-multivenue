@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Tests for claude_worker.config — the Base/Serve split (design §5.2, §10).
 
 Convention: full ``import x`` only. No ``from x import y``.

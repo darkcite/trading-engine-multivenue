@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # HTTP/1.1 minimal codec
 //!
 //! Zero-alloc, pure-byte-scanner HTTP/1.1 client codec used by the

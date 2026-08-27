@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → signer_eip712 hash + JSON encoder
 //! round-trip. The hash pipeline (`order_struct_hash` →
 //! `order_eip712_hash`) is constant-shape and panic-free by

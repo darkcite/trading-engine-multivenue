@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # capture-catalog integration tests (M3)
 //!
 //! Fixture-driven: synthetic `run-<epoch_ns>` capture dirs written

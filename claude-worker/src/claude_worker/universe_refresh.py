@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """universe_refresh — M3 daily Polymarket up/down universe refresh.
 
 A standalone MODULE (``python -m claude_worker.universe_refresh``) —

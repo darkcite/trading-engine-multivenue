@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # PMLR — Polymarket Replay Log writer
 //!
 //! Binary append-only log of 64-byte fixed-width slots, designed to be

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """iv_digest tests (M2 close, §9.8): kind-6 container decode pinned to
 docs/wire-format.md offsets, manifest resolution (venue+descriptor law,
 never bare SymbolId), harness-§3.3 wall mapping, 1m/1h snapshot

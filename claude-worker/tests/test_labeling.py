@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """labeling.py strict parsers (§9.1 carried patterns: tagger vocab,
 bool-rejecting numeric coercion) + prompt content pins.
 

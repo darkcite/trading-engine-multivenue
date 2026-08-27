@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Tag table — loaded from `topic_tagger.py`'s NDJSON output.
 
 use std::io::{self, BufRead, BufReader};

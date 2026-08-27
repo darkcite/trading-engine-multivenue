@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_polymarket::discovery::PmDiscovery`,
 //! the boot-time Gamma `/markets?clob_token_ids=` REST parser
 //! (Phase 8e, plan §11 — same bar as the WS parsers).

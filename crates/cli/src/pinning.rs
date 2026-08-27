@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! CPU-affinity pinning. Single entry point: pin the *current* thread
 //! to a single CPU core, identified by zero-based logical index.
 //!

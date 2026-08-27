@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """THE SDK seam (design §2/§5.2, §9.1 carried pattern): module-level
 ``make_client()`` + ``complete()`` — the ONLY place the Anthropic SDK is
 touched, and the canonical monkeypatch point for every test.

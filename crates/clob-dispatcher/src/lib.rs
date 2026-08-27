@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # clob-dispatcher
 //!
 //! HTTP/1.1 dispatcher to the Polymarket CLOB.

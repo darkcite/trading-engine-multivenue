@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """universe_refresh tests (M3) — additive; the frozen 202 + 7-verb
 surface untouched. No live API calls: the Gamma lane is mocked at the
 ``get_fn`` seam with a payload mirroring the live 2026-08-22 response

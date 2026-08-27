@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # universe_boot — flag/config resolution for the M1 boot universe
 //!
 //! BOOT DOCTRINE: runs once in the bin before any thread spawns;

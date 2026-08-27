@@ -1,4 +1,6 @@
 #!/bin/zsh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # M3 retention (mvp-plan §4-M3 item 3): age/size-based ARCHIVAL of
 # capture run dirs. Policy: KEEP-ALL until disk pressure — only when
 # the log volume's free space drops under MIN_FREE_GIB does archival

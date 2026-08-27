@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz the §4.2 ruleset validator (8g design §11): arbitrary bytes
 //! must never panic the byte scanner, never read out of bounds, and
 //! never leave a partially staged table (discard-on-reject: `len == 0`

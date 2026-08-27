@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # universe — boot-universe config file (Stage 2.5, M1)
 //!
 //! Parses `~/multivenue/universe.toml` (or `--universe <path>`) into

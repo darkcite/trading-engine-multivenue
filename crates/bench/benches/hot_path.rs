@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Hot-path criterion benchmarks.
 //!
 //! Measures the ns/op cost of every stage on the engine hot path,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `core_net::http1::read_response` +
 //! `dechunk_in_place` + `write_get_request`.
 //!

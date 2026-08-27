@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! §11 proptest (3) — the vm eval cap invariant: over arbitrary tick
 //! sequences, the notional emitted by one evaluation pass never
 //! exceeds the active table's per-sym budget (Σ row caps, policy-

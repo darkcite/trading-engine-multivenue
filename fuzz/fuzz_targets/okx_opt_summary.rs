@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the M2.3 OKX `opt-summary` byte
 //! scanners — `parse_opt_summary_row` (one data row → the OptSummary
 //! field set) and `extract_inst_family` (the family-keyed subscribe

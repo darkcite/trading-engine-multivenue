@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-metrics
 //!
 //! Preallocated counter + gauge registry with a tiny Prometheus

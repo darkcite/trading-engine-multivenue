@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-okx
 //!
 //! OKX v5 **public** WebSocket ingress (Phase 8b). Channels per

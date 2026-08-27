@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Rules table — loaded from `rule_parser.py`'s JSON-array output.
 
 use std::io::{self, Read};

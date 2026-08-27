@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # strategy-vm
 //!
 //! The ruleset-VM strategy (Phase 8g, design §7): slot 5 of the

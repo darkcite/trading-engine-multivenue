@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """M1 universe-file seeding tests (docs/mvp-progress.md M1d).
 
 Covers ``fetchers.universe_file_proposals`` (the Python mirror of the

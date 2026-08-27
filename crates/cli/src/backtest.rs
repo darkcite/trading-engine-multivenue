@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # backtest — the 8h offline harness substrate (design §3–§5, H1 slice)
 //!
 //! The REAL `multivenue-engine backtest` subcommand behind the frozen

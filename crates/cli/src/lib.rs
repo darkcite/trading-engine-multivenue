@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # cli
 //!
 //! Orchestration glue for the multivenue trading engine in

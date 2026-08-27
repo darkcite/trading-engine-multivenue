@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Single-writer status slot for the AI ingress thread.
 //!
 //! Same machinery as `core_metrics::IngressStatus` (the D7 pattern):

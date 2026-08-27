@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """candles.db tests (M3 C4) — additive; frozen 202 + 7-verb surface
 untouched. No live API calls: transports are injected fakes; venue
 payloads mirror the real wire shapes the pinned fetchers parsers

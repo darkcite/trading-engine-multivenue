@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """daemon.ResearchCycle — the §7.4 cycle state machine, §7.5 budget
 guards, §7.6 background-thread seam, and the §8.1/§8.2 promotion path
 against the FakeUdsServer. No live SDK, no real binary, no live sockets

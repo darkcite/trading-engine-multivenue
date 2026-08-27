@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # PMLR reader
 //!
 //! Zero-copy, zero-alloc reader for the replay-log format produced by

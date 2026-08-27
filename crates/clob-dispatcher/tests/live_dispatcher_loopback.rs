@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Integration test: `LiveDispatcher` against a real
 //! `127.0.0.1` rustls server with a self-signed cert.
 //!

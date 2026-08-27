@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Prompt formats + strict parsers for triage (Haiku) and labeling
 (Sonnet) — design §5.1 news_watcher pipeline, §9.1 carried patterns.
 

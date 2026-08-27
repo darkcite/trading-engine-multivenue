@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Phase 8g item 7 — §11 integration: the ruleset table's full path
 //! through the REAL engine loop.
 //!

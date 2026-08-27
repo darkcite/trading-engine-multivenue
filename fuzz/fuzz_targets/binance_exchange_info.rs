@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz the M1 Binance exchangeInfo discovery parser
 //! (`ingress_binance::discovery::BnDiscovery::ingest_body`) — spot
 //! single-symbol and full USDS-M page bodies share one walker. House

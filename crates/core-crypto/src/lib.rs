@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-crypto
 //!
 //! Handwritten SHA-256, HMAC-SHA256 and base64 (RFC 4648 standard

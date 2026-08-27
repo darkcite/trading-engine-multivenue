@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # core-simd
 //!
 //! Feature-detected SIMD kernels. Compile-time dispatched per target:

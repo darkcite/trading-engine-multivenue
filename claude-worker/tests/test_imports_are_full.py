@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Enforces the codebase rule: full ``import x`` only — never ``from x import y``.
 
 Walks every .py file under ``src/claude_worker/`` and ``tests/``, parses it,

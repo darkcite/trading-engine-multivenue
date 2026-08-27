@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_deribit::parse_option_ticker`,
 //! the M2.3 OPTION `ticker.{instr}.100ms` payload parser feeding the
 //! `OptSummary` capture channel (docs/m2-progress.md; §21.4: every new

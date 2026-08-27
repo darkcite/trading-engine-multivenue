@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Integration test: Polygon JSON-RPC ingress against a real
 //! `127.0.0.1` TLS server. Scripts an RFC 6455 101 reply plus one
 //! `eth_subscription` newHeads notification; asserts one warm

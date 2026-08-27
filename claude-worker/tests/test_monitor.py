@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """monitor.py — the §8.3 pure substrate (design §12 monitor rows):
 threshold arithmetic both arms, run-span reading, trailing-window
 selection + floor math, the active-artifact copy (report-clobber

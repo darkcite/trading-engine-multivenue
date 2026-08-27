@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Shared fixtures (design §11): the fake UDS server.
 
 Accepts clients sequentially on a private per-test socket path, reads

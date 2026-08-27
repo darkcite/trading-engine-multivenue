@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Fable-5 strategist internals (design §7) + the §8.1 install step.
 
 serve-ONLY collaborator: the 7-verb surface is frozen — this module is

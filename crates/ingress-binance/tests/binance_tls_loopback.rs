@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Integration test: Binance bookTicker ingress against a real
 //! `127.0.0.1` TLS server with a self-signed cert. Mirror of the
 //! `polymarket_tls_loopback` test — same scaffolding, different

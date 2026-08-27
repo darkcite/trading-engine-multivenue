@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # backtest::fill — the §4 fill / fee / latency model + accounting
 //! (design §4, H-D1 LOCKED: strict-cross maker, zero RNG)
 //!

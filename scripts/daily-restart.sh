@@ -1,4 +1,6 @@
 #!/bin/zsh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # M3 daily graceful restart (docs/m3-progress.md; mvp-plan §4-M3).
 # Runs every 60 s from com.multivenue.daily-restart; on the FIRST
 # tick of a new UTC day it SIGTERMs the engine (the M1d-proven clean

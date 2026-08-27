@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the M2.4 Binance eapi byte
 //! scanners — exchangeInfo option rows, the index-price REST body,
 //! the combined-stream splitter, and the ticker/index WS data

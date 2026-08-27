@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # WebSocket opening handshake (RFC 6455 §4)
 //!
 //! Zero-alloc, pure `&[u8]` / `&mut [u8]` client-side handshake: we

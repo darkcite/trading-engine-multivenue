@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Queued dispatcher
 //!
 //! Decouples the engine's hot path from network I/O. The strategy

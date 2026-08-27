@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """``serve`` composition loop (design §5.2 FULL-AUTO — the only daemon
 mode).
 

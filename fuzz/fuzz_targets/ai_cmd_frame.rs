@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz the AI-ingress frame path (design §11): arbitrary bytes must
 //! never panic the parser, on either the tag-reject path or the
 //! valid-tag → shape-validator path.

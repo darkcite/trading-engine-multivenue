@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # subs — request/subscription bookkeeping for WS venues
 //!
 //! Lifted out of `ingress-rpc` in Phase 8a (§3.4) so OKX / Deribit /

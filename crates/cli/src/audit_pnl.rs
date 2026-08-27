@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # audit-pnl — M4.2 shadow-P&L attribution over LOGGED intents
 //! (mvp-plan §4-M4; consumers per §9.9: PMLR ticks + logged intents +
 //! fills; design + rulings in docs/m4-progress.md)

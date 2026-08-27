@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the ingress-rpc JSON-RPC byte
 //! scanners. Covers classification, `eth_blockNumber` response
 //! parsing, `newHeads` subscription notification parsing, and error

@@ -1,4 +1,6 @@
 #!/bin/zsh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # M3 launchd installer (docs/local-setup.md runbook). Idempotent:
 # renders launchd/*.plist templates (@REPO@/@HOME@), seeds state,
 # (re)bootstraps the three agents. Re-running = graceful restart of

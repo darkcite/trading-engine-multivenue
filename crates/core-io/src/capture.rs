@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # PmlrCapture — per-ingress replay capture + bounded raw tap
 //!
 //! Production implementation of [`core_types::Capture`] (Phase 8e,

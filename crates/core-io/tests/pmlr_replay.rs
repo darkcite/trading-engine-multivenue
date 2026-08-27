@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! PMLR replay-harness integration test.
 //!
 //! Records a synthetic sequence of `Tick`s via `PmlrWriter`,

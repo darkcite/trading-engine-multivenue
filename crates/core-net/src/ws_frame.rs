@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # WebSocket frame codec (RFC 6455)
 //!
 //! Pure `&[u8]` / `&mut [u8]` parsers and serializers. No IO, no

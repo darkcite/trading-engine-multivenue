@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # strategy-ev
 //!
 //! Strategy A: mispricing vs model-derived true probability.

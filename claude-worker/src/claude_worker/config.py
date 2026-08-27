@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Boot-time configuration for the 8f worker (design §5, §10).
 
 Two layers, loaded once at startup, immutable thereafter:

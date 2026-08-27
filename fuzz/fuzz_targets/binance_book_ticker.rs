@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_binance::parse_book_ticker`.
 //!
 //! The byte scanner is expected to tolerate any input — returning

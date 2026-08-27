@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_polymarket::parse_book_update`.
 //!
 //! Invariant: the parser must never panic, never read out of bounds,

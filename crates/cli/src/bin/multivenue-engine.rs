@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # multivenue-engine — main entrypoint
 //!
 //! Thin dispatch shim. All orchestration logic lives in the `cli`

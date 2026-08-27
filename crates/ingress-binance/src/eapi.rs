@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # Binance European options — the M2.4 eapi half-ingress
 //!
 //! Options live on a DEDICATED endpoint family (`eapi.binance.com`

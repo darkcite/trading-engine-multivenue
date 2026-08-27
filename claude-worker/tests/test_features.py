@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """features.py: run discovery, tick features, marks, REST budget, and the
 positions/P&L reconstruction over the Rust-writer golden fills (§2/§5.1;
 HIP-4 netting mirror per risk-policy).

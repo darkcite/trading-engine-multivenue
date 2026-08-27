@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """iv_digest — the §9.8 aggregated-IV snapshot table (M2 close).
 
 A standalone MODULE (``python -m claude_worker.iv_digest``) — NOT a

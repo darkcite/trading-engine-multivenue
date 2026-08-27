@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """Read-only PMLR replay-log reader (design §5.1 — the data_fetcher substrate).
 
 Container (docs/wire-format.md §"Replay log"): one 64-byte header — magic

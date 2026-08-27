@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! audit-pnl integration tests (M4.2): golden hand-computable modeled
 //! fills through the REUSED §4 fill law, strategy_id attribution, the
 //! vm RulesetCommit hash timeline, the §6 descriptor-keying law across

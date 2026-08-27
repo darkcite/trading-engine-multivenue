@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-hyperliquid
 //!
 //! Hyperliquid **public** WebSocket ingress (Phase 8d). Channels per

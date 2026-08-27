@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: structured input → the ingress-hyperliquid `l2Book`
 //! surface, checked against inline reference models.
 //!

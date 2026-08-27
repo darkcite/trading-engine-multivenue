@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """backtest.py: mocked subprocess seam, canned pass/fail harness reports
 (§11), strict contract validation, gate matrix, report file contents.
 

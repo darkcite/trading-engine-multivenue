@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # strategy-cross-arb
 //!
 //! Strategy C: cross-market arbitrage.

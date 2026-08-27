@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # ingress-deribit
 //!
 //! Deribit **public** market-data ingress over JSON-RPC 2.0 / WebSocket

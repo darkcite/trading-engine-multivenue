@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `ingress_okx::discovery::OkxDiscovery`,
 //! the boot-time `/api/v5/public/instruments` REST parser
 //! (Phase 8e, plan §11 — same bar as the WS parsers).

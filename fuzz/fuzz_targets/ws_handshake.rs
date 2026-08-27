@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `core_net::read_server_handshake`.
 //!
 //! Validates that the RFC 6455 opening-handshake reader never panics,

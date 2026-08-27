@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! # signer-eip712
 //!
 //! EIP-712 typed-data signer for Polymarket CLOB orders. `secp256k1`

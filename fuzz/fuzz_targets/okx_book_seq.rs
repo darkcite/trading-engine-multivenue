@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → the ingress-okx integrity monitors.
 //!
 //! OKX book continuity is the `seqId`/`prevSeqId` chain, not a CRC:

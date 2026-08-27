@@ -1,4 +1,6 @@
 #!/bin/zsh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # M3 always-on engine wrapper (docs/m3-progress.md; mvp-plan §4-M3).
 # launchd ProgramArguments target — every engine boot flows through
 # here (RunAtLoad, KeepAlive relaunches, post-daily-restart).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Paper-mode orchestration. Wires the four ingress run-loops into
 //! dedicated threads, pins each to its own core, owns the lock-free
 //! SPSC rings, and runs a drain-and-count consumer on the main

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """fetchers.py: the §6.1 venue REST consumers + §6.2 market-map
 ownership (8h H3; design §12 fetchers/market-map rows).
 

@@ -1,4 +1,6 @@
 #!/bin/zsh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 # M3 candles.db hourly cycle (launchd com.multivenue.candles target).
 # Sources .env (never inlined in plists, never echoed) and runs one
 # §9.6 gap-fill cycle via the claude_worker.candles MODULE (not a

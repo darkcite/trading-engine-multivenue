@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Cross-crate boundary error type.
 //!
 //! The ingress crates (polymarket, binance, rpc, ...) and the

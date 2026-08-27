@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! 8h H1 harness-substrate integration tests (design §12, H1 slice):
 //! golden multi-venue multi-run fixture through the REAL `cli::backtest`
 //! pipeline (real `validate_ruleset`, real `VmStrategy` flip + emit

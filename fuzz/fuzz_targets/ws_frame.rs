@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Fuzz target: arbitrary bytes → `core_net::ws_read_frame` + unmask.
 //!
 //! Validates that the RFC 6455 frame reader never panics, never reads

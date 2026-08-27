@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Anton (darkcite)
 """commander.py against the fake UDS server (§11): policy gate, SetBias
 frame shape per the §3 table, TTL clamps, 5 s heartbeat cadence, and the
 transport protocol rule staying enforced underneath.

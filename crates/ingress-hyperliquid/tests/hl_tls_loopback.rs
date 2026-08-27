@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
 //! Integration test: Hyperliquid public WS ingress against a real
 //! `127.0.0.1` TLS server with a self-signed cert. Four scripted
 //! sessions per PLAN §11 ("every ingress" row): the happy path
