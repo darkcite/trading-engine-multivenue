@@ -119,7 +119,11 @@ license-deps:
 	# install trips it). Run this whenever a dependency is added, changed
 	# or removed, and commit the regenerated notices with that change.
 	cargo deny check licenses
-	cargo about generate about.hbs > THIRD-PARTY-NOTICES.md
+	# Write via a temp file: a plain `> THIRD-PARTY-NOTICES.md` truncates the
+	# committed notices to zero bytes the instant the generate step fails,
+	# which is exactly how a binary ships with an empty attribution file.
+	cargo about generate about.hbs > THIRD-PARTY-NOTICES.md.tmp
+	mv THIRD-PARTY-NOTICES.md.tmp THIRD-PARTY-NOTICES.md
 	@echo "license-deps: OK — THIRD-PARTY-NOTICES.md regenerated."
 	@echo "  Ship LICENSE + NOTICE + THIRD-PARTY-NOTICES.md beside ANY distributed binary."
 

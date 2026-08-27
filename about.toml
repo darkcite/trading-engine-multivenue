@@ -29,9 +29,11 @@ ignore-dev-dependencies   = true
 # through any direct dependency of ours.
 ignore-transitive-dependencies = false
 
-# A crate whose license text cargo-about cannot find must fail loudly
-# rather than be emitted as "NOASSERTION" in a compliance document.
-filter-noassertion = false
+# NOTE: `filter-noassertion` takes a TABLE in cargo-about 0.9, not a bool,
+# and its default already surfaces unresolvable licenses rather than
+# silently emitting NOASSERTION. Left unset deliberately — if a future
+# dependency ever lands with unresolvable license text, that must fail the
+# generate step loudly, not be configured away here.
 
 # The workspace's own crates are the Work, not third-party material; they
 # are covered by the top-level LICENSE and NOTICE.
@@ -44,9 +46,7 @@ accepted = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
-    "MIT-0",
     "ISC",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "Zlib",
     "Unlicense",

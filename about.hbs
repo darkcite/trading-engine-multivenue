@@ -23,23 +23,26 @@ distribution of this software.**
 
 | License | Packages |
 | --- | ---: |
-{{#each overview}}| {{name}} | {{count}} |
+{{#each overview}}| {{{name}}} | {{count}} |
 {{/each}}
 
+{{!-- Triple-stache throughout: handlebars HTML-escapes by default, which
+      turns every quote in a license text into &quot; — unacceptable in a
+      document whose whole purpose is reproducing those texts verbatim. --}}
 {{#each licenses}}
-## {{name}}
+## {{{name}}}
 
-Applies to {{#if used_by}}{{used_by.length}} package(s){{else}}—{{/if}}:
+Applies to:
 
 {{#each used_by}}
-- **{{crate.name}} {{crate.version}}**{{#if crate.repository}} — <{{crate.repository}}>{{/if}}
+- **{{{crate.name}}} {{{crate.version}}}**{{#if crate.repository}} — <{{{crate.repository}}}>{{/if}}
 {{/each}}
 
 <details>
 <summary>License text</summary>
 
 ```
-{{text}}
+{{{text}}}
 ```
 
 </details>

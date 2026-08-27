@@ -11,10 +11,14 @@ breach. Two (G3, G4) were real defects in artifacts buildable right now.
 One (G5) becomes a hard blocker the first time a compiled binary leaves the
 Mac, which is on the Stage-3 / PLAN.md Phase-7 path.**
 
-> **STATUS 2026-08-27: ALL TEN GAPS APPLIED IN THE WORKING TREE, UNCOMMITTED.**
-> 201 files modified, 6 added. Nothing staged, nothing committed — the
-> operator holds the commit decision. See **§3 Application record** for what
-> changed, what was verified, and what must still be run on the Mac.
+> **STATUS 2026-08-27: ALL TEN GAPS APPLIED, COMMITTED AND VERIFIED.**
+> Commits `2dd88d5` (metadata) · `3989d63` (licence gate + this document) ·
+> `9780d42` (SPDX headers, 194 files +525/−0) · `a0b9159` (CLAUDE.md rules) ·
+> plus the tooling-fix commit carrying `THIRD-PARTY-NOTICES.md`.
+> **Baselines re-run green on the Mac: nextest 1240 · alloc 38 · pytest 439**,
+> `cargo deny check licenses` ok, notices generated (131 packages).
+> Two PRE-EXISTING failures found and left alone, deliberately: `cargo fmt
+> --check` (~88 files) and `cargo clippy -D warnings` (~40 lints). See §3.4.
 > §2 is retained as written for the reasoning behind each change.
 
 ---
@@ -516,10 +520,92 @@ this session and were deliberately left as found.
 empty of mode changes, or use `chmod --reference` / in-place editing.**
 `--numstat` does not show mode changes and will not catch this.
 
-### 3.4 Still to run — on the Mac, not in a sandbox
+### 3.4 Verification run — 2026-08-27 08:38–08:47Z, on the Mac
 
-CLAUDE.md pitfall 10: cargo inside the Cowork Linux sandbox produces false
-greens. Nothing below was run; all of it must be, before this is committed.
+All of it run on the Mac, none in a sandbox (CLAUDE.md pitfall 10).
+
+| Check | Result |
+|---|---|
+| `cargo nextest run --workspace` | ✅ **1240 passed**, 1 skipped — baseline exactly |
+| `cargo test -p bench --test alloc_assertions --release -- --test-threads=1` | ✅ **38 passed**, 0 B/op. False-green guard satisfied: `target/release/deps/alloc_assertions-*` re-linked at 15:40 local during this run |
+| `uv run pytest` | ✅ **439 passed** in 12.62 s — baseline exactly; frozen surfaces intact |
+| `uv sync` | ✅ re-resolved cleanly; hatchling accepted PEP 639 `license-files` |
+| `uv build` + wheel inspection | ✅ **`claude_worker-0.2.0.dist-info/licenses/LICENSE` (11357 B) and `.../NOTICE` (1295 B)** — G4 proven fixed; the wheel previously shipped neither |
+| `make license-check` | ✅ 194 source files, LICENSE/NOTICE in sync |
+| `cargo deny check licenses` | ✅ **licenses ok** over the full graph, zero warnings after trimming two over-listed entries |
+| `make license-deps` | ✅ **`THIRD-PARTY-NOTICES.md` generated — 200,795 bytes, 131 packages, 60 license sections** |
+| `cargo fmt --all -- --check` | ⚠️ FAILS — **pre-existing**, see below |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ⚠️ FAILS (~40 lints) — **pre-existing**, see below |
+| `uv run ruff check` | ⚠️ FAILS (RUF002 en-dash in docstrings, PLR0913) — **pre-existing** |
+
+**The two pre-existing failures are not caused by this pass, and that is
+proven, not assumed.** The header commit is `+525 −0` with every `.rs` file
+gaining exactly 3 lines and deleting 0 — no Rust source line changed. Spot
+checks across five crates confirm line *N* today is byte-identical to line
+*N−3* pre-licence (`core-config/universe.rs:954`,
+`ingress-deribit/lib.rs:1065`, `ingress-okx/discovery.rs:273`,
+`strategy-set/lib.rs:755`, `ingress-polymarket/run_loop.rs:409`). Running
+`rustfmt --check` on the pre-licence blob of `alloc_assertions.rs` returns
+47 diffs of its own.
+
+* **`cargo fmt --check`: ~88 files drifted.** Import ordering and
+  `assert_eq!` wrapping, `max_width = 100`. The repo has evidently never
+  been fmt-clean, and nothing gates it. Fixing means a large mechanical
+  diff — worth its own commit, deliberately **not** folded into the licence
+  work.
+* **`cargo clippy -D warnings`: ~40 lints** across core-config, ingress-ai,
+  ingress-binance, ingress-deribit, ingress-hyperliquid, ingress-okx,
+  ingress-polymarket, ingress-rpc, strategy-set. Mostly `clippy::ptr_arg`
+  (`&PathBuf` where `&Path` would do) and `assert!(true)` in test helpers.
+  `make lint` therefore does not currently pass. Also its own task.
+
+**Findings from the first real `license-deps` run**
+
+* The graph attributes **131 packages** into a distributed binary — Apache-2.0
+  77, MIT 28, ISC 18, CC0-1.0 3, **CDLA-Permissive-2.0 2**, BSD-3-Clause 1,
+  Unicode-3.0 1, Zlib 1. The two CDLA entries are exactly the predicted
+  `webpki-roots` 0.26.11 and 1.0.7.
+* **`ring` alone contributes 18 separate license/notice documents** to the
+  file — its BoringSSL/OpenSSL heritage, reproduced in full. This is the
+  concrete form of the §G5 concern: shipping the binary without this file
+  would drop 18 required attributions on that one dependency.
+* Two allowlist entries (`MIT-0`, `BSD-2-Clause`) matched nothing and were
+  removed from `deny.toml`/`about.toml`. A pre-approved licence that nothing
+  uses is a licence approved for no reason.
+* `unicode-ident` still appears despite `ignore-build-dependencies` —
+  harmless over-attribution; left as is rather than configured away.
+
+**Two tooling defects found and fixed during the run**
+
+1. `about.toml`'s `filter-noassertion = false` — cargo-about 0.9 expects a
+   table, not a bool. Removed; the default already surfaces unresolvable
+   licences.
+2. The Makefile's `cargo about generate > THIRD-PARTY-NOTICES.md`
+   **truncated the committed notices file to zero bytes the moment generate
+   failed** — observed live. Now writes `.tmp` and `mv`s on success only.
+   Left unfixed, this is precisely how a binary ships with an empty
+   attribution file.
+3. The handlebars template HTML-escaped the licence texts (`&quot;`
+   throughout a legal document). Switched to triple-stache; verified **0
+   HTML entities** in the output.
+
+### 3.4b Commands, for repeat runs
+
+```sh
+cargo nextest run --workspace
+cargo build --release -p cli && \
+  cargo test -p bench --test alloc_assertions --release -- --test-threads=1
+cd claude-worker && uv sync && uv run pytest
+make license-check
+make license-deps        # needs: cargo +stable install cargo-deny; \
+                         #        cargo +stable install cargo-about --features cli
+```
+
+Note `cargo-about` needs `--features cli` or it installs no binary at all
+and still reports success for the other package.
+
+<details>
+<summary>Original pre-run checklist (kept for the record)</summary>
 
 ```sh
 cargo fmt --all -- --check          # headers are inert, but confirm
@@ -553,6 +639,8 @@ is the first time the full 266-package graph is machine-checked rather than
 spot-checked. If it rejects a license not in the `deny.toml` allowlist,
 that is the gate doing its job — read what the license obliges before
 adding the line.
+
+</details>
 
 ### 3.5 Commit shape (operator's call)
 
