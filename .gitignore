@@ -3,6 +3,27 @@
 .env.*
 !.env.example
 
+# key material — belt-and-braces for the public repo. Nothing tracked
+# matches these; they exist so a stray key can never be `git add`ed.
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.asc
+*.gpg
+.netrc
+.pypirc
+.npmrc
+credentials
+credentials.json
+secrets.*
+service-account*.json
+
 # --- Rust ---
 target/
 **/*.rs.bk
