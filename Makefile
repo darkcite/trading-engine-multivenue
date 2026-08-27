@@ -1,6 +1,7 @@
 .PHONY: help build build-release test test-fast nextest fmt lint \
 	check alloc-assert fuzz-quick bench bench-check coverage \
-	run-paper clean py-test py-lint
+	run-paper clean py-test py-lint \
+	license-check sync-license license-deps
 
 help:
 	@echo "targets:"
@@ -20,6 +21,9 @@ help:
 	@echo "  run-paper       cargo run --release -p cli -- run --paper --env-file ./.env"
 	@echo "  py-test         cd claude-worker && uv run pytest"
 	@echo "  py-lint         cd claude-worker && uv run ruff check"
+	@echo "  license-check   SPDX header + LICENSE/NOTICE sync gate (offline, fast)"
+	@echo "  sync-license    refresh claude-worker/{LICENSE,NOTICE} from the root copies"
+	@echo "  license-deps    cargo deny check licenses + regenerate THIRD-PARTY-NOTICES.md"
 	@echo "  clean           cargo clean"
 
 build:
@@ -79,6 +83,45 @@ py-test:
 
 py-lint:
 	cd claude-worker && uv run ruff check
+
+# ---- licensing (docs/license-audit-2026-08-27.md) ----
+
+license-check:
+	# Offline, no toolchain, ~1 s. Every tracked .rs/.py/.sh must carry the
+	# SPDX identifier in its first 3 lines, and the claude-worker copies of
+	# LICENSE/NOTICE must be byte-identical to the root originals — without
+	# them the built wheel ships with no license file at all (Apache-2.0
+	# §4(a)/§4(d)).
+	@fail=0; n=0; \
+	for f in $$(git ls-files '*.rs' '*.py' '*.sh'); do \
+		n=$$((n+1)); \
+		head -3 "$$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || \
+			{ echo "  missing SPDX header: $$f"; fail=1; }; \
+	done; \
+	cmp -s LICENSE claude-worker/LICENSE || \
+		{ echo "  drift: claude-worker/LICENSE != LICENSE  (run: make sync-license)"; fail=1; }; \
+	cmp -s NOTICE claude-worker/NOTICE || \
+		{ echo "  drift: claude-worker/NOTICE != NOTICE  (run: make sync-license)"; fail=1; }; \
+	grep -q '^license' fuzz/Cargo.toml || \
+		{ echo "  fuzz/Cargo.toml has no license key (workspace-excluded — it cannot inherit)"; fail=1; }; \
+	if [ $$fail -ne 0 ]; then echo "license-check: FAILED"; exit 1; fi; \
+	echo "license-check: OK ($$n source files, LICENSE/NOTICE in sync)"
+
+sync-license:
+	# claude-worker is its own PEP 621 project root; PEP 639 license-files
+	# cannot reference paths outside it, so the root files are copied in.
+	cp LICENSE NOTICE claude-worker/
+	@echo "sync-license: OK"
+
+license-deps:
+	# Requires: cargo install cargo-deny cargo-about (see CLAUDE.md on the
+	# 1.88.0 toolchain pin — install +stable from $$HOME if the in-repo
+	# install trips it). Run this whenever a dependency is added, changed
+	# or removed, and commit the regenerated notices with that change.
+	cargo deny check licenses
+	cargo about generate about.hbs > THIRD-PARTY-NOTICES.md
+	@echo "license-deps: OK — THIRD-PARTY-NOTICES.md regenerated."
+	@echo "  Ship LICENSE + NOTICE + THIRD-PARTY-NOTICES.md beside ANY distributed binary."
 
 clean:
 	cargo clean

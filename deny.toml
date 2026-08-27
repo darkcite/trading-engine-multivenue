@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------
+# cargo-deny — dependency license gate.
+#
+#   cargo install cargo-deny            # one-time; see CLAUDE.md on the
+#                                       # 1.88.0 toolchain pin (+stable
+#                                       # from $HOME if the in-repo install
+#                                       # trips it)
+#   cargo deny check licenses           # or: make license-deps
+#
+# Why this exists: the engine vendors no third-party source, so nothing
+# here matters for SOURCE distribution. It matters for BINARY distribution
+# — a release binary statically links ~266 packages whose licenses carry
+# their own attribution obligations. No binary leaves the build host
+# without LICENSE + NOTICE + THIRD-PARTY-NOTICES.md beside it.
+#
+# Established by the 2026-08-27 license audit — docs/license-audit-2026-08-27.md §G5.
+# ---------------------------------------------------------------
+
+[graph]
+# Check every target we actually build for (.cargo/config.toml): the M4 Mac
+# and the Phase-7 Linux box. Platform-gated deps (windows-sys et al.) are
+# then correctly excluded rather than silently allowed.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+# ---------------------------------------------------------------
+[licenses]
+version = 2
+
+# Every license present in the resolved graph as of 2026-08-27, verified
+# against the crates.io API for the versions actually in Cargo.lock.
+# Adding a license here is a deliberate decision, not a formality: read
+# what it obliges you to ship before you append a line.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unlicense",
+    # secp256k1-sys 0.10.1 — public-domain dedication; wraps upstream
+    # libsecp256k1 (MIT). This is the "audited C" behind signer-eip712.
+    "CC0-1.0",
+    # unicode-ident 1.0.24 — `(MIT OR Apache-2.0) AND Unicode-3.0`.
+    # BUILD-TIME ONLY (proc-macro2/syn path), never linked into the
+    # release binary, so it carries no binary-attribution obligation.
+    # Allowed so `cargo deny` is quiet; `ignore-build-dependencies` in
+    # about.toml keeps it out of THIRD-PARTY-NOTICES.md where it does not
+    # belong.
+    "Unicode-3.0",
+    # webpki-roots 0.26.11 and 1.0.7 — Community Data License Agreement,
+    # a DATA licence rather than an OSI software licence. It covers the
+    # Mozilla CA trust store compiled into the binary by the workspace's
+    # "compiled-in Mozilla CA roots, no runtime trust-store scan"
+    # decision. Permissive and Apache-compatible, but absent from most
+    # default allowlists — it must be here explicitly or the first scan
+    # anyone runs fails on it.
+    "CDLA-Permissive-2.0",
+]
+
+# 0.93 is cargo-deny's default. Lower it only with a reason recorded here;
+# a low threshold means guessing at license text, which is how a copyleft
+# dependency gets waved through.
+confidence-threshold = 0.93
+
+# Do NOT skip the workspace's own `publish = false` crates. They all
+# declare `license.workspace = true`, and checking them is what catches a
+# newly added crate that forgot to — exactly the fuzz/Cargo.toml defect
+# the audit found (G3).
+private = { ignore = false }
+
+# ring 0.17.14 declares `Apache-2.0 AND ISC` in its own manifest, so no
+# clarification is needed — both licenses are allowed above and the AND
+# resolves. Kept as a worked example for the day a dependency ships an
+# unrecognised LICENSE file:
+#
+# [[licenses.clarify]]
+# crate      = "some-crate"
+# expression = "MIT AND ISC"
+# license-files = [{ path = "LICENSE", hash = 0x00000000 }]
+#   ^ the hash must be the value cargo-deny PRINTS for that file. Never
+#     invent one; a wrong hash fails the check with a confusing error.
+
+# ---------------------------------------------------------------
+[bans]
+# Duplicate versions are a build-size and audit-surface issue, not a
+# licence violation — every duplicate is another entry in the notices
+# file. Known as of 2026-08-27: webpki-roots (0.26.11 + 1.0.7),
+# getrandom x3, rustix x2, linux-raw-sys x2, hashbrown x2, once_cell x2,
+# itertools x2, wit-bindgen x2, windows-sys x4, windows-targets x2.
+multiple-versions = "warn"
+wildcards         = "deny"
+
+# The hard architectural bans from CLAUDE.md, enforced at the dependency
+# graph rather than only at the .claude Write/Edit hook — a transitive
+# pull-in never passes through that hook.
+deny = [
+    { name = "tokio" },
+    { name = "async-std" },
+    { name = "serde_json" },
+    { name = "reqwest" },
+    { name = "ethers" },
+    { name = "alloy" },
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+
+# ---------------------------------------------------------------
+[advisories]
+version = 2
+# Not a licence concern, but this config is the natural home for it and
+# `cargo deny check` runs both. yanked crates in Cargo.lock are a supply
+# risk on a machine that signs orders.
+yanked = "warn"
+
+# ---------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

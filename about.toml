@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------
+# cargo-about — generates THIRD-PARTY-NOTICES.md, the attribution file
+# that must ship beside every distributed binary.
+#
+#   cargo install cargo-about
+#   cargo about generate about.hbs > THIRD-PARTY-NOTICES.md   # make license-deps
+#
+# See docs/license-audit-2026-08-27.md §G5.
+# ---------------------------------------------------------------
+
+# The targets we actually ship: the M4 Mac and the Phase-7 Linux box.
+# Anything gated to another platform (windows-sys, wasm, redox) is not in
+# the binary and must not appear in its notices.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Build- and dev-dependencies are not linked into the shipped artifact, so
+# they carry no binary-attribution obligation. This is what keeps
+# unicode-ident's Unicode-3.0 component (proc-macro path only), criterion,
+# proptest and rcgen out of a file that is supposed to describe the
+# binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies   = true
+
+# Transitive runtime deps ARE linked and DO need attribution — ring's
+# BoringSSL-derived C and assembly reaches the binary through rustls, not
+# through any direct dependency of ours.
+ignore-transitive-dependencies = false
+
+# A crate whose license text cargo-about cannot find must fail loudly
+# rather than be emitted as "NOASSERTION" in a compliance document.
+filter-noassertion = false
+
+# The workspace's own crates are the Work, not third-party material; they
+# are covered by the top-level LICENSE and NOTICE.
+private = { ignore = true }
+
+# Must match deny.toml's allow list. cargo-about refuses to emit a notice
+# for a license not accepted here, which is the second gate against a new
+# dependency's terms sliding in unreviewed.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
