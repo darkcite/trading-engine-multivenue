@@ -41,7 +41,10 @@ import time
 import typing
 
 import claude_worker.config
+import claude_worker.features
 import claude_worker.llm
+import claude_worker.pmlr
+import claude_worker.pnl_report
 import claude_worker.state
 
 # ---- §7.5 env keys (read at the seam — the H3 interpretation-#2
@@ -265,13 +268,23 @@ def build_digest(
     markets: dict[str, int],
     universe: collections.abc.Iterable[int] | None = None,
     performance: str | None = None,
+    positions: str | None = None,
+    pnl: str | None = None,
     cap: int = STRATEGIST_INPUT_CAP,
 ) -> str:
     """The DYNAMIC user-block digest (§7.2): market map, capture-derived
     universe, feature files of the named run (replay-derived + §6.1
     REST, same directory), news NDJSON tail, and — from H5 — the ACTIVE
     ruleset's walk-forward ``performance`` text. Deterministic for
-    identical file contents (the SQLite dedupe key rides on this)."""
+    identical file contents (the SQLite dedupe key rides on this).
+
+    Ruling #7(a) (mvp-plan §8 item 7, 2026-08-23): ``positions`` and
+    ``pnl`` carry the INVENTORY sections — the paper netting view and
+    the latest per-strategy shadow-P&L. Callers produce them via
+    :func:`positions_digest_text` / :func:`pnl_digest_text`, which
+    render absent/empty sources as honest empty text (never errors);
+    ``None`` omits the section entirely (pre-#7a callers unchanged —
+    the dedupe key for their inputs is untouched)."""
     parts: list[str] = []
     used = 0
     map_lines = "\n".join(f"  {name} -> sym {markets[name]}" for name in sorted(markets))
@@ -291,10 +304,153 @@ def build_digest(
                 used = _append_capped(parts, used, f"{path.name}: {body}\n", cap)
     if performance is not None:
         used = _append_capped(parts, used, f"\nACTIVE RULESET WALK-FORWARD:\n{performance}\n", cap)
+    if positions is not None:
+        used = _append_capped(parts, used, f"\nPOSITIONS (paper netting, current run):\n{positions}\n", cap)
+    if pnl is not None:
+        used = _append_capped(
+            parts, used, f"\nPER-STRATEGY SHADOW P&L (latest nightly report):\n{pnl}\n", cap
+        )
     news = _news_tail(features_dir / "news", max(0, cap - used))
     if news:
         used = _append_capped(parts, used, f"\nNEWS (NDJSON, oldest->newest):\n{news}\n", cap)
     return "".join(parts)
+
+
+# ---- ruling #7(a) inventory sections (2026-08-23; landed with the
+# 2026-08-28 remediation plan) --------------------------------------------
+
+POSITIONS_EMPTY_TEXT: str = "  (no positions view available)"
+PNL_EMPTY_TEXT: str = "  (no shadow-P&L report on disk yet)"
+
+
+def gather_positions_payload(
+    replay_dir: pathlib.Path,
+    hip4_pairs: collections.abc.Sequence[tuple[int, int]] = (),
+) -> dict[str, object] | None:
+    """Assemble the §6 ``positions`` netting view for the LATEST run
+    dir — the same read-only composition the ``positions`` verb makes
+    (read_fills -> reconstruct -> tick marks -> views -> HIP-4 pairs ->
+    total), deliberately mirrored here so the digest never shells out
+    to the frozen CLI. Returns ``None`` when there is no run dir or the
+    capture is unreadable (the caller renders that honestly)."""
+    try:
+        run_dir = claude_worker.features.latest_run_dir(replay_dir)
+        if run_dir is None:
+            return None
+        fills, fills_torn = claude_worker.features.read_fills(run_dir)
+        reconstructed = claude_worker.features.reconstruct_positions(fills)
+        marks: dict[int, int] = {}
+        for path in sorted(run_dir.glob("*-ticks.pmlr")):
+            with claude_worker.pmlr.Reader(path) as reader:
+                claude_worker.features.collect_marks(reader, into=marks)
+        views = claude_worker.features.position_views(reconstructed, marks)
+        pair_views = claude_worker.features.hip4_pair_views(views, list(hip4_pairs))
+        total = claude_worker.features.total_exposure(views, pair_views)
+    except (OSError, ValueError):
+        return None
+    scale = 1_000_000.0
+    to_usd = claude_worker.features.to_usd
+    positions_out: list[dict[str, object]] = []
+    for sym in sorted(views):
+        view = views[sym]
+        positions_out.append(
+            {
+                "sym": view.sym,
+                "net_qty": view.net_qty / scale,
+                "avg_px": view.avg_px / scale,
+                "mark_px": view.mark_px / scale,
+                "realized_usd": to_usd(view.realized),
+                "unrealized_usd": to_usd(view.unrealized),
+                "exposure_usd": to_usd(view.exposure),
+            }
+        )
+    pairs_out: list[dict[str, object]] = []
+    for pv in pair_views:
+        pairs_out.append(
+            {
+                "yes_sym": pv.yes_sym,
+                "no_sym": pv.no_sym,
+                "net_qty": pv.net_qty / scale,
+                "exposure_usd": to_usd(pv.exposure),
+            }
+        )
+    return {
+        "run_dir": str(run_dir),
+        "fills_torn": fills_torn,
+        "positions": positions_out,
+        "hip4_pairs": pairs_out,
+        "total_exposure_usd": to_usd(total),
+    }
+
+
+def positions_digest_text(payload: dict[str, object] | None) -> str:
+    """Render the #7(a) POSITIONS section body. Absent/empty sources
+    render honestly (never an error): ``None`` payload means no run /
+    unreadable capture; a payload with no rows means flat."""
+    if payload is None:
+        return POSITIONS_EMPTY_TEXT
+    lines: list[str] = []
+    positions = payload.get("positions")
+    if isinstance(positions, list):
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            lines.append(
+                "  sym {sym}  net {net_qty:.6f}  avg {avg_px:.6f}  mark {mark_px:.6f}"
+                "  realized ${realized_usd:.2f}  unrealized ${unrealized_usd:.2f}"
+                "  exposure ${exposure_usd:.2f}".format(**pos)
+            )
+    pairs = payload.get("hip4_pairs")
+    if isinstance(pairs, list):
+        for pv in pairs:
+            if not isinstance(pv, dict):
+                continue
+            lines.append(
+                "  pair yes {yes_sym} / no {no_sym}  net {net_qty:.6f}"
+                "  exposure ${exposure_usd:.2f}".format(**pv)
+            )
+    if not lines:
+        lines.append("  (flat — no open positions)")
+    total = payload.get("total_exposure_usd")
+    if isinstance(total, (int, float)):
+        lines.append(f"  total exposure ${total:.2f}")
+    if payload.get("fills_torn"):
+        lines.append("  (fills file torn tail — last partial record ignored)")
+    return "\n".join(lines)
+
+
+def pnl_digest_text(reports_dir: pathlib.Path) -> str:
+    """Render the #7(a) PER-STRATEGY SHADOW P&L section body from the
+    newest ``pnl-<day>.json`` (the M4.3 nightly pair). Absent dir /
+    report / malformed JSON render honestly, never raise."""
+    path = claude_worker.pnl_report.latest_report(reports_dir)
+    if path is None:
+        return PNL_EMPTY_TEXT
+    try:
+        obj = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return f"  (report unreadable: {path.name})"
+    if not isinstance(obj, dict):
+        return f"  (report malformed: {path.name})"
+    lines = [f"  report {path.name}  runs={obj.get('runs')}"]
+    paper = obj.get("paper")
+    if isinstance(paper, dict):
+        lines.append(
+            "  paper: "
+            + json.dumps(paper, sort_keys=True, separators=(",", ":"))
+        )
+    strategies = obj.get("strategies")
+    if isinstance(strategies, list) and strategies:
+        for row in strategies:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                "  strategy: "
+                + json.dumps(row, sort_keys=True, separators=(",", ":"))
+            )
+    else:
+        lines.append("  (no per-strategy rows in the report)")
+    return "\n".join(lines)
 
 
 def build_user_prompt(digest: str) -> str:

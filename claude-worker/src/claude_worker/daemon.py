@@ -73,6 +73,7 @@ import claude_worker.frames
 import claude_worker.labeling
 import claude_worker.llm
 import claude_worker.monitor
+import claude_worker.pnl_report
 import claude_worker.state
 import claude_worker.strategist
 import claude_worker.uds
@@ -530,12 +531,26 @@ class ResearchCycle:
             )
         except (OSError, ValueError):
             universe = None
+        # Ruling #7(a): the inventory sections. HIP-4 pairs are not
+        # plumbed into the daemon (the map file's pairs stay a cli
+        # concern) — per-sym netting + totals carry the signal, and
+        # both helpers render absent sources as honest empty text.
+        # Serve stays Stage-3-gated; the semi-manual M5 lane calls the
+        # same helpers with the map's pairs.
+        positions_text = claude_worker.strategist.positions_digest_text(
+            claude_worker.strategist.gather_positions_payload(self._cfg.replay_dir)
+        )
+        pnl_text = claude_worker.strategist.pnl_digest_text(
+            claude_worker.pnl_report.resolve_reports_dir()
+        )
         self._digest = claude_worker.strategist.build_digest(
             self._cfg.features_dir,
             self._run_name,
             self._markets,
             universe=universe,
             performance=self._performance,  # §7.1: latest walk-forward (H5)
+            positions=positions_text,
+            pnl=pnl_text,
         )
         prompt = claude_worker.strategist.build_user_prompt(self._digest)
         if not self._submit_call(prompt, _PURPOSE_PROPOSAL):
