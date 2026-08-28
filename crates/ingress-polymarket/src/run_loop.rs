@@ -612,6 +612,7 @@ fn push_tick<C: Capture>(
     capture: &mut C,
 ) {
     status.add_msgs(1);
+    status.add_ticks(1);
     // §6.5 capture BEFORE the push — a ring-dropped tick must still
     // reach the replay log (the audit pairs capture counts with
     // ring_drops_total).
@@ -710,8 +711,12 @@ fn handle_text_frame<C: Capture>(
             }
         }
         // Recognized market data we deliberately don't tick from yet
-        // (capture formalizes in 8e) — counted as received.
-        FrameKind::LastTrade => status.add_msgs(1),
+        // (capture formalizes in 8e) — counted as received (and as
+        // moved data for the T1(b) backoff predicate).
+        FrameKind::LastTrade => {
+            status.add_msgs(1);
+            status.add_ticks(1);
+        }
         FrameKind::Keepalive => {}
         // Subscription acks / unrelated events — neither a message
         // nor a parse error (Phase-1 behavior preserved); not tapped.

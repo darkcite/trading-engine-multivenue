@@ -395,7 +395,7 @@ pub fn spawn_polymarket(
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
-                let msgs_before = status.msgs_total();
+                let ticks_before = status.ticks_total();
 
                 let res = pwl::run(
                     &mut transport,
@@ -418,9 +418,14 @@ pub fn spawn_polymarket(
                     status.set_state(IngressState::Down);
                     return;
                 }
-                // A session that moved data restarts the schedule;
-                // a flapping endpoint keeps escalating (D8).
-                if status.msgs_total() > msgs_before {
+                // T1(b): only moved MARKET DATA (or a rate-limited
+                // idle trip) restarts the schedule — see
+                // `should_reset_backoff` (D8 restored).
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, pwl::RunResult::IdleTimeout),
+                ) {
                     backoff.reset();
                 }
                 status.inc_reconnects();
@@ -492,7 +497,7 @@ pub fn spawn_binance(
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
-                let msgs_before = status.msgs_total();
+                let ticks_before = status.ticks_total();
 
                 let res = bwl::run(
                     &mut transport,
@@ -514,7 +519,12 @@ pub fn spawn_binance(
                     status.set_state(IngressState::Down);
                     return;
                 }
-                if status.msgs_total() > msgs_before {
+                // T1(b): see `should_reset_backoff` (D8 restored).
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, bwl::RunResult::IdleTimeout),
+                ) {
                     backoff.reset();
                 }
                 status.inc_reconnects();
@@ -846,7 +856,7 @@ pub fn spawn_okx(
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
-                let msgs_before = status.msgs_total();
+                let ticks_before = status.ticks_total();
 
                 let res = owl::run(
                     &mut transport,
@@ -862,13 +872,28 @@ pub fn spawn_okx(
                     &mut keepalive,
                     &mut capture,
                 );
-                tracing::info!(?res, "okx: run-loop returned");
+                // T1(a): name the failure on the very line the
+                // operator greps (outage 2026-08-27 §5.5 — six days
+                // of `res=Error` with zero diagnostic payload).
+                let err = status.take_last_err();
+                tracing::info!(
+                    ?res,
+                    err_site = core_metrics::err_site_name(err.site),
+                    io_kind = core_metrics::io_kind_name(err.io_kind),
+                    venue_code = err.venue_code as i32,
+                    "okx: run-loop returned"
+                );
                 capture.mirror_now();
                 if matches!(res, owl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
                 }
-                if status.msgs_total() > msgs_before {
+                // T1(b): see `should_reset_backoff` (D8 restored).
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, owl::RunResult::IdleTimeout),
+                ) {
                     backoff.reset();
                 }
                 status.inc_reconnects();
@@ -1043,7 +1068,7 @@ pub fn spawn_deribit(
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
-                let msgs_before = status.msgs_total();
+                let ticks_before = status.ticks_total();
 
                 let res = dwl::run(
                     &mut transport,
@@ -1059,13 +1084,29 @@ pub fn spawn_deribit(
                     &mut keepalive,
                     &mut capture,
                 );
-                tracing::info!(?res, "deribit: run-loop returned");
+                // T1(a): name the failure on the very line the
+                // operator greps (outage 2026-08-27 §5.5). For the
+                // subscribe-missing site, venue_code = COUNT of
+                // missing channels (u128 masks don't fit a gauge).
+                let err = status.take_last_err();
+                tracing::info!(
+                    ?res,
+                    err_site = core_metrics::err_site_name(err.site),
+                    io_kind = core_metrics::io_kind_name(err.io_kind),
+                    venue_code = err.venue_code as i32,
+                    "deribit: run-loop returned"
+                );
                 capture.mirror_now();
                 if matches!(res, dwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
                     return;
                 }
-                if status.msgs_total() > msgs_before {
+                // T1(b): see `should_reset_backoff` (D8 restored).
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, dwl::RunResult::IdleTimeout),
+                ) {
                     backoff.reset();
                 }
                 status.inc_reconnects();
@@ -1187,7 +1228,7 @@ pub fn spawn_hyperliquid(
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
-                let msgs_before = status.msgs_total();
+                let ticks_before = status.ticks_total();
 
                 let res = hwl::run(
                     &mut transport,
@@ -1217,7 +1258,14 @@ pub fn spawn_hyperliquid(
                 if matches!(res, hwl::RunResult::Stale) {
                     tracing::warn!("hl: staleness trip — reconnecting for fresh snapshots");
                 }
-                if status.msgs_total() > msgs_before {
+                // T1(b): see `should_reset_backoff` (D8 restored).
+                // A staleness trip is budget-limited like an idle
+                // timeout — both count as venue-quiet trips.
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, hwl::RunResult::IdleTimeout | hwl::RunResult::Stale),
+                ) {
                     backoff.reset();
                 }
                 status.inc_reconnects();
@@ -1290,7 +1338,7 @@ pub fn spawn_rpc(
                     }
                 };
                 driver.reset_for_reconnect(now_ns());
-                let msgs_before = status.msgs_total();
+                let ticks_before = status.ticks_total();
 
                 let res = rwl::run(
                     &mut transport,
@@ -1312,7 +1360,12 @@ pub fn spawn_rpc(
                     status.set_state(IngressState::Down);
                     return;
                 }
-                if status.msgs_total() > msgs_before {
+                // T1(b): see `should_reset_backoff` (D8 restored).
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, rwl::RunResult::IdleTimeout),
+                ) {
                     backoff.reset();
                 }
                 status.inc_reconnects();
@@ -2144,6 +2197,34 @@ impl Observability {
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
+            // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
+            // in seconds. `*_state` lies on a 1 Hz-churning lane (a
+            // sampler nearly always catches it mid-cycle at Up) and
+            // `last_activity` advances on the venue's own rejection
+            // bytes — only "when did MARKET DATA last arrive" names a
+            // dead lane. -1 = no tick since boot. Order matches the
+            // derivation loop: pm, bn, okx, deribit, hl, rpc.
+            let ingress_last_tick_age: [core_metrics::GaugeId; 6] = [
+                reg.register_gauge("engine_ingress_polymarket_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_polymarket_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_binance_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_binance_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_okx_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_okx_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_deribit_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_deribit_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_hyperliquid_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_hyperliquid_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_rpc_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_rpc_last_tick_age_seconds")?,
+            ];
+            // T1(c) / F12: age of the newest launchd restart-lane
+            // slot stamp — the restart lane failing silently for 28 h
+            // is what let the Aug-28 midnight turn lapse. -1 = no
+            // stamps readable.
+            let restart_stamp_age = reg
+                .register_gauge("engine_restart_stamp_age_seconds")
+                .map_err(|_| "register engine_restart_stamp_age_seconds")?;
             let max_tick_age_ns = reg
                 .register_gauge("engine_max_tick_age_ns")
                 .map_err(|_| "register engine_max_tick_age_ns")?;
@@ -2270,6 +2351,8 @@ impl Observability {
                 ingress_deribit_state,
                 ingress_hyperliquid_state,
                 ingress_rpc_state,
+                ingress_last_tick_age,
+                restart_stamp_age,
                 max_tick_age_ns,
                 tick_age_ns_per_bucket,
                 ingress_polymarket,
@@ -2325,6 +2408,7 @@ fn register_ingress_counters(
         resubscribes: one("resubscribes")?,
         reconnects: one("reconnects")?,
         ring_drops: one("ring_drops")?,
+        ticks: one("ticks")?,
     })
 }
 
@@ -2467,6 +2551,13 @@ pub struct EngineCounters {
     pub ingress_hyperliquid_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
+    /// T1(c): per-venue last-tick-age gauges in seconds
+    /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
+    /// since boot). Order: pm, bn, okx, deribit, hl, rpc.
+    pub ingress_last_tick_age: [core_metrics::GaugeId; 6],
+    /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
+    /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
+    pub restart_stamp_age: core_metrics::GaugeId,
     /// Maximum tick age across every observed symbol (ns).
     /// Spikes here surface a silenced market.
     pub max_tick_age_ns: core_metrics::GaugeId,
@@ -2563,6 +2654,9 @@ pub struct IngressCounterIds {
     pub reconnects: core_metrics::CounterId,
     /// Ring `try_push` failures (D4).
     pub ring_drops: core_metrics::CounterId,
+    /// Parsed market-data rows (T1(b): control frames excluded —
+    /// `engine_ingress_<venue>_ticks_total`).
+    pub ticks: core_metrics::CounterId,
 }
 
 /// Registry handles for the Phase-8f AI ingress family
@@ -3012,6 +3106,7 @@ struct IngressCountersSnapshot {
     resubscribes: u64,
     reconnects: u64,
     ring_drops: u64,
+    ticks: u64,
 }
 
 /// Mirror one ingress status slot into its registry counters as
@@ -3030,6 +3125,7 @@ fn mirror_ingress_counters(
         resubscribes: st.resubscribes_total(),
         reconnects: st.reconnects_total(),
         ring_drops: st.ring_drops_total(),
+        ticks: st.ticks_total(),
     };
     reg.counter(ids.msgs).inc(cur.msgs.saturating_sub(last.msgs));
     reg.counter(ids.bytes).inc(cur.bytes.saturating_sub(last.bytes));
@@ -3042,6 +3138,7 @@ fn mirror_ingress_counters(
         .inc(cur.reconnects.saturating_sub(last.reconnects));
     reg.counter(ids.ring_drops)
         .inc(cur.ring_drops.saturating_sub(last.ring_drops));
+    reg.counter(ids.ticks).inc(cur.ticks.saturating_sub(last.ticks));
     *last = cur;
 }
 
@@ -3140,6 +3237,13 @@ where
     // get monotonic deltas. Append-only: existing indices are
     // load-bearing, new venues go at the end.
     let mut ingress_last = [IngressCountersSnapshot::default(); 6];
+    // T1(c): last-tick-age derivation state per venue —
+    // (ticks_total last seen, wall ns when it last advanced);
+    // wall ns 0 = never ticked. Order pairs with
+    // `ids.ingress_last_tick_age`: pm, bn, okx, deribit, hl, rpc
+    // (NOT the ingress_last order — that array predates this and its
+    // indices are load-bearing).
+    let mut tick_age_track = [(0u64, 0u64); 6];
     // Phase-8f AI-family delta snapshot (same bookkeeping).
     let mut ai_last = AiCountersSnapshot::default();
     // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
@@ -3256,7 +3360,40 @@ where
                         &ing.hyperliquid,
                         &mut ingress_last[5],
                     );
+
+                    // T1(c): derive per-venue last-tick age. A lane
+                    // that stops moving data goes visibly stale here
+                    // even while its ~1 Hz reconnect churn keeps the
+                    // state gauge reading Up (outage 2026-08-27
+                    // §5.5). -1 = no tick since boot.
+                    let venue_ticks = [
+                        ing.polymarket.ticks_total(),
+                        ing.binance.ticks_total(),
+                        ing.okx.ticks_total(),
+                        ing.deribit.ticks_total(),
+                        ing.hyperliquid.ticks_total(),
+                        ing.rpc.ticks_total(),
+                    ];
+                    let mut i = 0;
+                    while i < 6 {
+                        let (seen, _) = tick_age_track[i];
+                        if venue_ticks[i] > seen {
+                            tick_age_track[i] = (venue_ticks[i], now);
+                        }
+                        let (_, wall) = tick_age_track[i];
+                        let age_s: i64 = if wall == 0 {
+                            -1
+                        } else {
+                            (now.saturating_sub(wall) / 1_000_000_000) as i64
+                        };
+                        reg.gauge(ids.ingress_last_tick_age[i]).set(age_s);
+                        i += 1;
+                    }
                 }
+
+                // T1(c)/F12: restart-lane liveness — the newest slot
+                // stamp's age (cold fs read on the 5 s cadence).
+                reg.gauge(ids.restart_stamp_age).set(restart_stamp_age_secs());
 
                 // Phase-8f AI family: §4.4 counter deltas from the
                 // shared status slot (incl. the engine-written
@@ -3482,6 +3619,62 @@ fn sleep_backoff(b: &mut Backoff) {
     let delay = Duration::from_nanos(b.next_delay_ns());
     tracing::debug!(?delay, attempt = b.attempt(), "reconnect backoff");
     thread::sleep(delay);
+}
+
+/// T1(b) — the D8 intent, restored (outage 2026-08-27 §5.3): the
+/// reconnect schedule resets only when the session actually MOVED
+/// MARKET DATA (`ticks_total` advanced), or ended in a venue-quiet
+/// idle/staleness trip (inherently rate-limited by the keepalive /
+/// staleness budget, so it cannot hammer). A session that only
+/// received its own subscribe rejection — the exact post-settlement
+/// failure that reconnected at ~1 Hz for 16 h/day — keeps
+/// escalating. One definition for all six venue loops.
+#[inline]
+fn should_reset_backoff(ticks_after: u64, ticks_before: u64, venue_quiet_trip: bool) -> bool {
+    ticks_after > ticks_before || venue_quiet_trip
+}
+
+/// T1(c) (outage 2026-08-27 finding F12): age in seconds of the
+/// NEWEST launchd restart-lane slot stamp
+/// (`~/multivenue/state/last-restart-utc-*`), or -1 when the dir /
+/// stamps are unreadable or absent. A healthy lane rewrites a stamp
+/// at every UTC slot; an age far beyond the slot spacing means the
+/// minutely job is dead (the 2026-08-27→28 failure ran silent for
+/// 28 h with zero signals). Cold path — 5 s publish cadence;
+/// allocation + syscalls are sanctioned here like the rest of the
+/// publish block.
+fn restart_stamp_age_secs() -> i64 {
+    let Ok(home) = std::env::var("HOME") else {
+        return -1;
+    };
+    let dir = std::path::Path::new(&home).join("multivenue/state");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return -1;
+    };
+    let mut newest: Option<std::time::SystemTime> = None;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("last-restart-utc-") {
+            continue;
+        }
+        if let Ok(md) = ent.metadata() {
+            if let Ok(m) = md.modified() {
+                if newest.is_none_or(|n| m > n) {
+                    newest = Some(m);
+                }
+            }
+        }
+    }
+    let Some(m) = newest else {
+        return -1;
+    };
+    match std::time::SystemTime::now().duration_since(m) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
 }
 
 fn log_pin_outcome(thread_label: &str, core_id: usize) {
@@ -4591,6 +4784,34 @@ pub mod boot_discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T1(b) (outage 2026-08-27 §5.3): the predicate that replaces
+    /// the msgs-based reset. Happy path: data moved ⇒ reset. Failure
+    /// mode: a rejection-only session (msgs moved, ticks did not)
+    /// must keep escalating; a venue-quiet idle/staleness trip is
+    /// rate-limited by construction and may reset.
+    #[test]
+    fn backoff_resets_only_on_moved_data_or_quiet_trip() {
+        // Data moved ⇒ reset regardless of result class.
+        assert!(should_reset_backoff(10, 3, false));
+        // Rejection-only session: ticks unchanged ⇒ keep escalating.
+        assert!(!should_reset_backoff(3, 3, false));
+        // The exact outage shape: rejection received every cycle,
+        // never a tick — first cycle from zero included.
+        assert!(!should_reset_backoff(0, 0, false));
+        // Venue-quiet idle/staleness trip ⇒ reset (budget-limited).
+        assert!(should_reset_backoff(3, 3, true));
+    }
+
+    /// T1(c): stamp-age helper degrades to -1, never panics, when
+    /// the stamp dir is missing (fresh hosts, CI).
+    #[test]
+    fn restart_stamp_age_handles_missing_dir() {
+        // The helper reads $HOME/multivenue/state — on a host where
+        // that does not exist it must return -1; where it does, any
+        // value >= -1 is legal. Either way: no panic.
+        assert!(restart_stamp_age_secs() >= -1);
+    }
 
     fn temp_capture_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("gauged_capture_{tag}_{}", std::process::id()));

@@ -39,7 +39,11 @@ pub mod ingress_status;
 pub mod registry;
 pub mod server;
 
-pub use ingress_status::{IngressState, IngressStatus};
+pub use ingress_status::{
+    err_site_name, io_kind_code, io_kind_name, IngressState, IngressStatus, SessionErrSnapshot,
+    ERR_SITE_DRIVE, ERR_SITE_KEEPALIVE, ERR_SITE_POLL, ERR_SITE_PUMP, ERR_SITE_REGISTER,
+    ERR_SITE_REREGISTER, ERR_SITE_SUBSCRIBE_MISSING, ERR_SITE_VENUE_ERROR,
+};
 pub use registry::{
     Counter, CounterId, EncodeErr, Gauge, GaugeId, MetricsRegistry, RegErr, MAX_COUNTERS,
     MAX_GAUGES, NAME_MAX,

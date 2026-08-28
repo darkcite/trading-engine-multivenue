@@ -619,12 +619,14 @@ fn handle_eapi_frame<C: Capture>(
                 }
             }
             status.add_msgs(1);
+            status.add_ticks(1);
         }
         EapiAction::Index { uly_idx, px_1e9 } => {
             if let StreamLane::Eapi(lane) = &mut drv.lane {
                 lane.set_index_px(uly_idx, px_1e9);
             }
             status.add_msgs(1);
+            status.add_ticks(1);
         }
     }
 }
@@ -668,6 +670,7 @@ fn handle_text_frame<C: Capture>(
             status.inc_ring_drops();
         }
         status.add_msgs(1);
+        status.add_ticks(1);
     } else {
         status.inc_parse_errors();
         capture.parse_reject(now_ns(), payload);

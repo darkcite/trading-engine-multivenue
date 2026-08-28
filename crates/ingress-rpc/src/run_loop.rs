@@ -643,10 +643,12 @@ fn handle_json_frame<C: Capture>(
         }
         Dispatch::EmitNewHead(head) => {
             status.add_msgs(1);
+            status.add_ticks(1);
             emit_new_head_signal(producer, status, head, capture);
         }
         Dispatch::Response { id, block, sub_id } => {
             status.add_msgs(1);
+            status.add_ticks(1);
             match take_pending(drv, id) {
                 Some(RpcKind::BlockNumber) => {
                     if let Some(b) = block {

@@ -929,6 +929,7 @@ fn handle_data_frame<C: Capture>(
         }
         Dispatch::Bbo { tick } => {
             status.add_msgs(1);
+            status.add_ticks(1);
             // §6.5 capture BEFORE the push — a ring-dropped tick must
             // still reach the replay log (the audit pairs capture
             // counts with ring_drops_total).
@@ -943,18 +944,23 @@ fn handle_data_frame<C: Capture>(
             venue_ts_ns,
         } => {
             status.add_msgs(1);
+            status.add_ticks(1);
             drv.staleness
                 .on_l2book(coin_idx as usize, venue_ts_ns, now_ns());
         }
         Dispatch::Trades { scan } => {
             status.add_msgs(scan.rows_parsed as u64);
+            status.add_ticks(scan.rows_parsed as u64);
             let mut r = 0;
             while r < scan.rows_rejected {
                 status.inc_parse_errors();
                 r += 1;
             }
         }
-        Dispatch::Slow => status.add_msgs(1),
+        Dispatch::Slow => {
+            status.add_msgs(1);
+            status.add_ticks(1);
+        }
     }
     Ok(())
 }

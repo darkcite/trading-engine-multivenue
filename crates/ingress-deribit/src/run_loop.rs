@@ -1192,6 +1192,16 @@ fn handle_data_frame<C: Capture>(
                 // A configured channel was refused — misconfiguration.
                 // Fail-fast: crash loudly in debug, session error in
                 // release (reconnect w/ backoff, operator sees it).
+                // T1(a) (outage 2026-08-27 §5.2): this is the exact
+                // post-settlement kill site — expired option channels
+                // vanish from the echo. `venue_code` carries the
+                // COUNT of missing channels (the u128 masks don't fit
+                // a u32; the count is the operator-facing signal).
+                status.note_venue_err_code((expected & !found).count_ones());
+                status.note_session_err(
+                    core_metrics::ERR_SITE_SUBSCRIBE_MISSING,
+                    core_metrics::io_kind_code(io::ErrorKind::InvalidData),
+                );
                 debug_assert!(
                     false,
                     "deribit subscribe result missing channels: expected {expected:#x} found {found:#x}"
@@ -1207,6 +1217,15 @@ fn handle_data_frame<C: Capture>(
             // Fail-fast doctrine: a venue error response means our
             // request (or framing) is wrong. Crash loudly in debug,
             // surface a session error in release.
+            // T1(a) (outage 2026-08-27 §5.2): record the venue's
+            // numeric code (i32 bit-cast; negative JSON-RPC codes
+            // round-trip through the u32 slot) — first-wins so the
+            // outer drive-site conversion keeps this inner site.
+            status.note_venue_err_code(code as u32);
+            status.note_session_err(
+                core_metrics::ERR_SITE_VENUE_ERROR,
+                core_metrics::io_kind_code(io::ErrorKind::InvalidData),
+            );
             debug_assert!(false, "deribit venue error response, code={code}");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1215,6 +1234,7 @@ fn handle_data_frame<C: Capture>(
         }
         Dispatch::Quote { tick } => {
             status.add_msgs(1);
+            status.add_ticks(1);
             // §6.5 capture BEFORE the push — a ring-dropped tick must
             // still reach the replay log (the audit pairs capture
             // counts with ring_drops_total).
@@ -1224,10 +1244,17 @@ fn handle_data_frame<C: Capture>(
                 status.inc_ring_drops();
             }
         }
-        Dispatch::Ticker => status.add_msgs(1),
-        Dispatch::OptSummary => status.add_msgs(1),
+        Dispatch::Ticker => {
+            status.add_msgs(1);
+            status.add_ticks(1);
+        }
+        Dispatch::OptSummary => {
+            status.add_msgs(1);
+            status.add_ticks(1);
+        }
         Dispatch::Trades { sym, sym_idx, scan } => {
             status.add_msgs(scan.rows_parsed as u64);
+            status.add_ticks(scan.rows_parsed as u64);
             let mut r = 0;
             while r < scan.rows_rejected {
                 status.inc_parse_errors();
@@ -1281,6 +1308,7 @@ fn handle_data_frame<C: Capture>(
         }
         Dispatch::Book { sym, sym_idx, ts_ms, action, prev, seq } => {
             status.add_msgs(1);
+            status.add_ticks(1);
             let expected_prev = drv.book_chains[sym_idx as usize].last_change_id();
             match drv.book_chains[sym_idx as usize].apply(action, prev, seq) {
                 ChainOutcome::Init | ChainOutcome::Chained => {}
@@ -1480,16 +1508,26 @@ pub fn run<T: Transport, C: Capture>(
     let session_start_ns = now_ns();
     keepalive.reset();
 
-    if transport.register(poll.registry(), token).is_err() {
+    // T1(a) (outage 2026-08-27 §5.5): every fatal site below records
+    // its site + io-kind into the status slot before returning
+    // `RunResult::Error`; the cli names the triple on its
+    // `run-loop returned` line. First-error-wins, cleared by the
+    // caller — see `IngressStatus::take_last_err`.
+    if let Err(e) = transport.register(poll.registry(), token) {
+        status.note_session_err(
+            core_metrics::ERR_SITE_REGISTER,
+            core_metrics::io_kind_code(e.kind()),
+        );
         return RunResult::Error;
     }
     let mut last_interest = transport.interest();
 
     while !stop.load(Ordering::Relaxed) {
-        if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
-            .is_err()
-        {
+        if let Err(e) = poll.poll(events, Some(std::time::Duration::from_millis(50))) {
+            status.note_session_err(
+                core_metrics::ERR_SITE_POLL,
+                core_metrics::io_kind_code(e.kind()),
+            );
             return RunResult::Error;
         }
 
@@ -1499,7 +1537,13 @@ pub fn run<T: Transport, C: Capture>(
             }
             let transport_status = match transport.pump(ev) {
                 Ok(s) => s,
-                Err(_e) => return RunResult::Error,
+                Err(e) => {
+                    status.note_session_err(
+                        core_metrics::ERR_SITE_PUMP,
+                        core_metrics::io_kind_code(e.kind()),
+                    );
+                    return RunResult::Error;
+                }
             };
             note_transport_ready(drv, transport_status);
         }
@@ -1508,7 +1552,11 @@ pub fn run<T: Transport, C: Capture>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
+            if let Err(e) = drive_one(transport, drv, host, path, producer, status, capture) {
+                status.note_session_err(
+                    core_metrics::ERR_SITE_DRIVE,
+                    core_metrics::io_kind_code(e.kind()),
+                );
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -1538,6 +1586,10 @@ pub fn run<T: Transport, C: Capture>(
                 KeepaliveAction::None => {}
                 KeepaliveAction::SendPing => {
                     if queue_test(drv).is_err() || flush_tx(transport, drv).is_err() {
+                        // T1(a): site only — the two sources have
+                        // distinct error types; the site is the
+                        // diagnostic payload here.
+                        status.note_session_err(core_metrics::ERR_SITE_KEEPALIVE, 0);
                         return RunResult::Error;
                     }
                     keepalive.mark_ping_sent(now);
@@ -1548,7 +1600,11 @@ pub fn run<T: Transport, C: Capture>(
 
         let cur = transport.interest();
         if cur != last_interest {
-            if transport.reregister(poll.registry(), token).is_err() {
+            if let Err(e) = transport.reregister(poll.registry(), token) {
+                status.note_session_err(
+                    core_metrics::ERR_SITE_REREGISTER,
+                    core_metrics::io_kind_code(e.kind()),
+                );
                 return RunResult::Error;
             }
             last_interest = cur;
@@ -1819,6 +1875,30 @@ mod tests {
         assert!(status.last_activity_ns() > 0, "heartbeat refreshes the idle clock");
         let mut scratch = [0u8; 4096];
         assert_eq!(t.drain_outgoing(&mut scratch), 0, "nothing queued");
+    }
+
+    #[test]
+    fn quote_advances_ticks_total_heartbeat_does_not() {
+        // T1(b) (outage 2026-08-27 §5.3): the backoff predicate reads
+        // `ticks_total` — a heartbeat advances msgs only; a quote
+        // push advances ticks. Failure mode covered: a session that
+        // only ever receives control frames keeps ticks_total at 0.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+
+        let hb = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"heartbeat"}}"#;
+        inject_text(&mut t, hb);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        assert_eq!(status.msgs_total(), 1, "heartbeat counts as a message");
+        assert_eq!(status.ticks_total(), 0, "heartbeat must not count as a tick");
+
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
+        inject_text(&mut t, quote);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        assert_eq!(status.ticks_total(), 1, "quote push is a tick");
+        let _ = cons.try_pop().expect("tick must be pushed");
     }
 
     #[test]
