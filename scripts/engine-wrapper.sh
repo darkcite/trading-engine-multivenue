@@ -40,4 +40,17 @@ fi
 ( cd claude-worker && uv run python -m claude_worker.universe_refresh ) ||
   echo "engine-wrapper: universe refresh failed — booting with existing universe.toml" >&2
 
+# M5-prep #7b (operator ruling 7(b); remediation plan 2026-08-28): a
+# committed ruleset's table is IN-MEMORY — every boot must re-stage +
+# re-commit the registry's active ruleset or nothing AI-authored
+# trades after a restart (live finding: vm_fires 0 after every
+# midnight turn). Fired on EVERY boot (KeepAlive relaunches
+# included); the script waits for ai.sock, serializes behind the
+# worker law, and no-ops harmlessly when the registry has no
+# committed row. The backgrounded child survives the exec below
+# (it is reparented, not killed). Interpreter-invoked (zsh <path>)
+# so it works regardless of the file's exec bit — the 2026-08-27
+# exec-bit strip is exactly how the restart lane died.
+( zsh "${0:A:h}/recommit-ruleset.sh" >> "$HOME/multivenue/logs/launchd/recommit.log" 2>&1 & )
+
 exec ./target/release/multivenue-engine run --paper --strategy all
