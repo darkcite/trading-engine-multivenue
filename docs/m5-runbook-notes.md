@@ -224,3 +224,23 @@ auditable, no engine change — the carry pattern; ~a session); (b)
 re-run pm-fade + stage the CVFC tripwire after Aug-31 capture; (c)
 treat the position-cap wall as an 8i design input (RiskGate clamps
 make the VM family viable as-is at Stage 3).
+
+**Session-2 addendum: the $50k research tier + the xv carrier
+(operator rulings: caps as recommended with DD = 15% of book =
+$7,500; xv = 5-min / $10k legs).** Risk recalibration landed in all
+four layers — rule-7 validator ($10k/$20k/$100k), VM clamp ($10k),
+fill-law open-order caps (8/64), GateThresholds (frozen amendment,
+ruling cited in the pins) — law record in docs/risk-policy.md ($1k
+demo tier recorded superseded; historical reports keep their tier).
+carry_signal legs 90→$9,900 (CVFC spec scale). NEW
+`claude_worker.xv_signal` + com.multivenue.xv (5-min): the research
+finding's carrier — position-aware cross-venue reversion, live
+capture tick-tail mids (TWO staleness guards: engine-mtime wall
+guard + per-leg monotonic lag guard — the kickstart caught the
+monotonic-vs-wall confusion live), hedged $9,900 legs, ONE position
+per pair, enter ≥4 bps / exit ≤1 bps or sign-flip. First live cycle:
+okx +1.6 bps, hl +0.3 — correctly flat. Gates: nextest 1351 · alloc
+38 · pytest 499 (frozen 202 untouched inside the amended file) ·
+relink done. NOTE: the standing engine boots the recalibrated
+validator at its next restart (16:05Z slot) — rulesets staged before
+then meet the old $100 caps; intents are unaffected.
