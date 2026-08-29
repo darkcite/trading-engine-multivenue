@@ -182,6 +182,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-bybit"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+]
+
+[[package]]
 name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
@@ -325,6 +339,7 @@ dependencies = [
  "core-types",
  "ingress-ai",
  "ingress-binance",
+ "ingress-bybit",
  "ingress-deribit",
  "ingress-hyperliquid",
  "ingress-okx",

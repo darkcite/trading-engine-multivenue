@@ -24,6 +24,7 @@ core-types         = { path = "../crates/core-types" }
 core-crypto        = { path = "../crates/core-crypto" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
 ingress-binance    = { path = "../crates/ingress-binance" }
+ingress-bybit      = { path = "../crates/ingress-bybit" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
 ingress-okx        = { path = "../crates/ingress-okx" }
 ingress-deribit    = { path = "../crates/ingress-deribit" }
@@ -66,6 +67,27 @@ bench  = false
 [[bin]]
 name   = "binance_book_ticker"
 path   = "fuzz_targets/binance_book_ticker.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "binance_mark_price"
+path   = "fuzz_targets/binance_mark_price.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bybit_ws_frame"
+path   = "fuzz_targets/bybit_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bybit_instruments"
+path   = "fuzz_targets/bybit_instruments.rs"
 test   = false
 doc    = false
 bench  = false
@@ -192,6 +214,13 @@ bench  = false
 [[bin]]
 name   = "deribit_option_ticker"
 path   = "fuzz_targets/deribit_option_ticker.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "deribit_vol_index"
+path   = "fuzz_targets/deribit_vol_index.rs"
 test   = false
 doc    = false
 bench  = false
