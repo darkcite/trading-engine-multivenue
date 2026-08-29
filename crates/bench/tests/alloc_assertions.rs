@@ -30,6 +30,7 @@ use core_net::{
 use core_parse::scan_price_1e6;
 use core_ring::Ring;
 use core_types::{Price, Qty, SymbolId, Tick, VenueId};
+use ingress_ai::{admit_frame, pack_frame, AiCmdCapture, AiIngressStatus, FrameVerdict, SeqPolicy};
 use ingress_binance::parse_book_ticker;
 use ingress_polymarket::run_loop::{
     drive_one, note_transport_ready, Driver, State, SymbolMap, DEFAULT_TICK_RING_CAP,
@@ -37,7 +38,6 @@ use ingress_polymarket::run_loop::{
 use ingress_rpc::{
     parse_block_number_result, parse_new_head_notification, write_request_eth_block_number,
 };
-use ingress_ai::{admit_frame, pack_frame, AiCmdCapture, AiIngressStatus, FrameVerdict, SeqPolicy};
 
 /// Push/pop a Tick through the SPSC ring 10_000 times — must not
 /// allocate on any iteration after the initial ring construction.
@@ -85,7 +85,10 @@ fn price_scanner_is_zero_alloc() {
     }
     std::hint::black_box(acc);
     let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(allocs, 0, "price scanner allocated {allocs} times ({bytes} B)");
+    assert_eq!(
+        allocs, 0,
+        "price scanner allocated {allocs} times ({bytes} B)"
+    );
 }
 
 /// Parsing a sample Polymarket book frame 1000x must not allocate.
@@ -98,7 +101,10 @@ fn book_parser_is_zero_alloc() {
         std::hint::black_box(t);
     }
     let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(allocs, 0, "book parser allocated {allocs} times ({bytes} B)");
+    assert_eq!(
+        allocs, 0,
+        "book parser allocated {allocs} times ({bytes} B)"
+    );
 }
 
 /// Sanity check: the guard itself behaves.
@@ -158,7 +164,10 @@ fn ws_frame_roundtrip_is_zero_alloc() {
         allocs, 0,
         "ws_frame roundtrip allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "ws_frame roundtrip bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "ws_frame roundtrip bytes should be zero: saw {bytes}"
+    );
 }
 
 /// Parse a Binance `@bookTicker` frame 10_000x — must be zero-alloc.
@@ -207,10 +216,7 @@ fn rpc_block_number_is_zero_alloc() {
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(
-        allocs, 0,
-        "rpc codecs allocated {allocs} times ({bytes} B)"
-    );
+    assert_eq!(allocs, 0, "rpc codecs allocated {allocs} times ({bytes} B)");
 }
 
 // ---------------------------------------------------------------
@@ -411,7 +417,16 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     .unwrap();
 
     // Send the client GET handshake.
-    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    bwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -432,7 +447,16 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    bwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     assert_eq!(driver.state(), bwl::State::Steady);
 
     // Canned unmasked Text bookTicker frame.
@@ -452,7 +476,16 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     for _ in 0..1_000u32 {
         let written = transport.inject_incoming(&frame[..frame_len]);
         assert_eq!(written, frame_len);
-        bwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+        bwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
         let t = cons.try_pop().expect("tick should be produced");
         acc = acc.wrapping_add(t.bid_px.raw());
     }
@@ -513,7 +546,16 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     )
     .unwrap();
 
-    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    rwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -533,7 +575,16 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    rwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     assert_eq!(driver.state(), rwl::State::Steady);
     // Drain subscribe request so the tx buffer stays cursor=0.
     let _ = transport.drain_outgoing(&mut scratch);
@@ -567,7 +618,16 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     for _ in 0..1_000u32 {
         let written = transport.inject_incoming(&frame[..frame_len]);
         assert_eq!(written, frame_len);
-        rwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+        rwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
         // Drain the Signal so the ring doesn't fill.
         if let Some(s) = cons.try_pop() {
             acc = acc.wrapping_add(u64::from_le_bytes(s.payload[0..8].try_into().unwrap()));
@@ -1178,10 +1238,10 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     };
     use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
-    // The lane arrays below are written out for the Phase 8a
-    // geometry (five tick lanes in VenueId order, four fill lanes);
-    // break the build loudly if that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 5 && NUM_FILL_LANES == 4);
+    // The lane arrays below are written out for the lane geometry
+    // (six tick lanes since WS9 added Bybit at lane 5; four fill
+    // lanes); break the build loudly if that drifts.
+    const _: () = assert!(NUM_TICK_LANES == 6 && NUM_FILL_LANES == 4);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1202,16 +1262,17 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // unused inside this test fixture.
     let _ = std::marker::PhantomData::<SubmitErr>;
 
-    // Phase 8a lane arrays: five tick lanes (VenueId order:
-    // Polymarket, Binance, OKX, Deribit, Hyperliquid) + four fill
-    // lanes. Only lane 0 (Polymarket) gets a live producer here;
-    // the unused producer halves stay alive until end of scope, and
-    // their lanes simply read empty every iteration.
+    // Lane arrays: six tick lanes (Polymarket, Binance, OKX,
+    // Deribit, Hyperliquid, Bybit — WS9) + four fill lanes. Only
+    // lane 0 (Polymarket) gets a live producer here; the unused
+    // producer halves stay alive until end of scope, and their lanes
+    // simply read empty every iteration.
     let (mut pm_p, t0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t1p, t1) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t2p, t2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -1226,13 +1287,13 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // acquire load per iteration inside the measured window — the §6
     // steady-state cost of the lane; the loaded pop→receive_table
     // path is gate 35's seam).
-    let (_tblp, tbl_c) = Ring::<core_types::RuleTableSlot, { core_types::RULE_TABLE_RING_SLOTS }>::new()
-        .split();
+    let (_tblp, tbl_c) =
+        Ring::<core_types::RuleTableSlot, { core_types::RULE_TABLE_RING_SLOTS }>::new().split();
 
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4],
+        [t0, t1, t2, t3, t4, t5],
         sc,
         [f0, f1, f2, f3],
         ai_c,
@@ -1417,7 +1478,9 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     // Venue-namespaced symbol (venue byte 2 = Okx, ordinal 1).
     let sym: SymbolId = (2 << 24) | 1;
     let mut symbols = ingress_okx::OkxSymbolTable::new();
-    symbols.insert(b"BTC-USDT", sym, ingress_okx::OkxInstType::Spot).unwrap();
+    symbols
+        .insert(b"BTC-USDT", sym, ingress_okx::OkxInstType::Spot)
+        .unwrap();
     let mut driver = owl::Driver::new(0x0C0Cu64, symbols, true, &[]);
     owl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
@@ -1445,7 +1508,16 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     .unwrap();
 
     // Send the client GET handshake.
-    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    owl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     let mut scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -1466,7 +1538,16 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    owl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     assert_eq!(driver.state(), owl::State::Steady);
     // Drain the batched subscribe op so the tx buffer stays empty.
     let _ = transport.drain_outgoing(&mut scratch);
@@ -1522,7 +1603,16 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
 
     let mut drives = 0u32;
     while transport.incoming_len() > 0 {
-        owl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+        owl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
         drives += 1;
         assert!(drives <= 4_096, "scripted stream failed to drain");
     }
@@ -1582,7 +1672,8 @@ fn deribit_parsers_are_zero_alloc() {
     let ticker: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
     let trade_row: &[u8] = br#""trade_seq":30289442,"trade_id":"48079269","timestamp":1590484512188,"tick_direction":2,"price":8950.0,"mark_price":8948.9,"instrument_name":"BTC-PERPETUAL","index_price":8955.88,"direction":"sell","amount":10.0}"#;
     let book: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":297217105,"bids":[["new",5042.34,30.0],["new",5041.94,20.0]],"asks":[["new",5042.64,40.0]],"type":"snapshot"}}}"#;
-    let test_req: &[u8] = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
+    let test_req: &[u8] =
+        br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
     // Venue-namespaced symbol (venue byte 3 = Deribit, ordinal 1).
     let sym: SymbolId = (3 << 24) | 1;
 
@@ -1631,7 +1722,8 @@ fn option_analytics_parsers_are_zero_alloc() {
     let deribit_opt: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-27MAR26-100000-C.100ms","data":{"timestamp":1774000000123,"instrument_name":"BTC-27MAR26-100000-C","state":"open","mark_price":0.0523,"mark_iv":65.43,"greeks":{"delta":0.512,"gamma":1.234e-5,"vega":152.3,"theta":-85.3,"rho":12.1},"open_interest":1234.5,"index_price":77216.94,"underlying_price":77300.12}}}"#;
     let okx_row: &[u8] = br#"{"instType":"OPTION","instId":"BTC-USD-260327-100000-C","uly":"BTC-USD","deltaBS":"0.512","gammaBS":"1.234e-5","thetaBS":"-85.3","vegaBS":"152.3","markVol":"0.6543","fwdPx":"77300.12","ts":"1774598400123"}"#;
     let bn_combined: &[u8] = br#"{"stream":"btc-260327-100000-c@ticker","data":{"s":"BTC-260327-100000-C","bo":"2040.5","ao":"2060.1","bq":"1.25","aq":"0.75","d":"0.512","t":"-85.3","g":"0.0000123","v":"152.3","vo":"0.6543","mp":"2051.2"}}"#;
-    let bn_index: &[u8] = br#"{"stream":"btcusdt@index","data":{"e":"index","s":"BTCUSDT","p":"77000.5"}}"#;
+    let bn_index: &[u8] =
+        br#"{"stream":"btcusdt@index","data":{"e":"index","s":"BTCUSDT","p":"77000.5"}}"#;
     let sym: SymbolId = (3 << 24) | 513;
 
     let g = AllocGuard::new();
@@ -1671,7 +1763,10 @@ fn option_analytics_parsers_are_zero_alloc() {
         allocs, 0,
         "option analytics parsers allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "option analytics parser bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "option analytics parser bytes should be zero: saw {bytes}"
+    );
 }
 
 /// entire scripted stream is injected before the guard; every
@@ -1717,7 +1812,16 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     .unwrap();
 
     // Send the client GET handshake.
-    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    dwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     let mut scratch = [0u8; 8192];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -1738,7 +1842,16 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    dwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     assert_eq!(driver.state(), dwl::State::Steady);
     // Drain the set_heartbeat + batched subscribe calls (ids 1, 2).
     let _ = transport.drain_outgoing(&mut scratch);
@@ -1765,7 +1878,16 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","book.BTC-PERPETUAL.100ms"]}"#,
     );
     transport.inject_incoming(&boot);
-    dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    dwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     assert_eq!(driver.pending_count(), 0, "session-start calls retired");
     assert_eq!(driver.sub_count(), 4, "all channels confirmed");
     let boot_msgs = status.msgs_total();
@@ -1779,7 +1901,8 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     // trade_seq by exactly 1, so the §6.2 resync path stays cold.
     const CYCLES: usize = 333; // 1 snapshot + 3 × 333 + test_requests
     const QUOTE: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
-    const TEST_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
+    const TEST_REQ: &[u8] =
+        br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
     const BOOK_SNAP: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":1000,"bids":[["new",5042.34,30.0]],"asks":[["new",5042.64,40.0]],"type":"snapshot"}}}"#;
 
     let mut stream: Vec<u8> = Vec::with_capacity(400 * 1024);
@@ -1790,8 +1913,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     for c in 0..CYCLES {
         push_text_frame(&mut stream, QUOTE);
         let trade = format!(
-            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"trades.BTC-PERPETUAL.100ms","data":[{{"trade_seq":{},"trade_id":"9","timestamp":1000,"price":8950.0,"direction":"buy","amount":10.0}}]}}}}"#,
-            trade_seq
+            r#"{{"jsonrpc":"2.0","method":"subscription","params":{{"channel":"trades.BTC-PERPETUAL.100ms","data":[{{"trade_seq":{trade_seq},"trade_id":"9","timestamp":1000,"price":8950.0,"direction":"buy","amount":10.0}}]}}}}"#
         );
         push_text_frame(&mut stream, trade.as_bytes());
         trade_seq += 1;
@@ -1819,7 +1941,16 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
 
     let mut drives = 0u32;
     while transport.incoming_len() > 0 {
-        dwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+        dwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
         drives += 1;
         assert!(drives <= 4_096, "scripted stream failed to drain");
     }
@@ -1856,7 +1987,10 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         allocs, 0,
         "deribit run-loop allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "deribit run-loop bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "deribit run-loop bytes should be zero: saw {bytes}"
+    );
     assert!(!capture.is_disabled());
     assert_eq!(capture.io_errors(), 0);
     assert_eq!(capture.tap_dropped(), 0);
@@ -1913,10 +2047,7 @@ fn hl_parsers_are_zero_alloc() {
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(
-        allocs, 0,
-        "hl parsers allocated {allocs} times ({bytes} B)"
-    );
+    assert_eq!(allocs, 0, "hl parsers allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "hl parser bytes should be zero: saw {bytes}");
 }
 
@@ -1927,7 +2058,7 @@ fn hl_parsers_are_zero_alloc() {
 /// trades across a perp and a HIP-4 `#<enc>` coin, plus WS protocol
 /// Pings whose pong replies render inside the window) via a
 /// `TestTransport`. Steady state is reached over the real handshake
-/// + per-sub subscribe path; every `drive_one` call must allocate
+/// and per-sub subscribe path; every `drive_one` call must allocate
 /// zero bytes.
 #[test]
 fn hl_run_loop_steady_state_is_zero_alloc() {
@@ -1974,7 +2105,16 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     .unwrap();
 
     // Send the client GET handshake.
-    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     let mut scratch = [0u8; 16384];
     let _ = transport.drain_outgoing(&mut scratch);
 
@@ -1995,7 +2135,16 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         n += src.len();
     }
     transport.inject_incoming(&resp[..n]);
-    hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
     assert_eq!(driver.state(), hwl::State::Steady);
     // Drain the 9 per-subscription subscribe frames so the tx buffer
     // stays empty.
@@ -2069,7 +2218,16 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
 
     let mut drives = 0u32;
     while transport.incoming_len() > 0 {
-        hwl::drive_one(&mut transport, &mut driver, b"h", b"/", &mut prod, &status, &mut capture).unwrap();
+        hwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
         drives += 1;
         assert!(drives <= 4_096, "scripted stream failed to drain");
     }
@@ -2130,17 +2288,13 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
 /// and the push path is exercised end-to-end).
 #[test]
 fn ai_ingress_admit_frame_is_zero_alloc() {
-    use core_types::{
-        AiCmd, AiCmdKind, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE,
-    };
+    use core_types::{AiCmd, AiCmdKind, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE};
 
     // Boot (allocation allowed): ring, capture sink, status slot.
     let ring: std::sync::Arc<Ring<AiCmd, { core_types::AI_RING_SIZE }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
-    let cap_dir = std::env::temp_dir().join(format!(
-        "stage2_alloc_ai_ingress_{}",
-        std::process::id()
-    ));
+    let cap_dir =
+        std::env::temp_dir().join(format!("stage2_alloc_ai_ingress_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cap_dir);
     let mut capture = AiCmdCapture::open(&cap_dir, 1).unwrap();
     let status = AiIngressStatus::new();
@@ -2203,7 +2357,10 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
         allocs, 0,
         "ai ingress frame path allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "ai ingress frame path bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "ai ingress frame path bytes should be zero: saw {bytes}"
+    );
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
@@ -2384,7 +2541,10 @@ fn strategy_set_fanout_is_zero_alloc() {
         allocs, 0,
         "strategy-set fan-out allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "strategy-set fan-out bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "strategy-set fan-out bytes should be zero: saw {bytes}"
+    );
 }
 
 /// Phase 8f item 6: the engine-thread fills capture
@@ -2396,10 +2556,8 @@ fn engine_fills_capture_append_is_zero_alloc() {
     use core_io::{SlotCapture, SlotKind};
     use core_types::{Fill, Side};
 
-    let cap_dir = std::env::temp_dir().join(format!(
-        "stage2_alloc_fills_capture_{}",
-        std::process::id()
-    ));
+    let cap_dir =
+        std::env::temp_dir().join(format!("stage2_alloc_fills_capture_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cap_dir);
     std::fs::create_dir_all(&cap_dir).unwrap();
     let path = cap_dir.join(engine::ENGINE_FILLS_FILE);
@@ -2433,7 +2591,10 @@ fn engine_fills_capture_append_is_zero_alloc() {
         allocs, 0,
         "fills capture path allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "fills capture path bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "fills capture path bytes should be zero: saw {bytes}"
+    );
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
@@ -2472,8 +2633,7 @@ fn engine_orders_capture_and_stamp_are_zero_alloc() {
     let _ = std::fs::remove_dir_all(&cap_dir);
     std::fs::create_dir_all(&cap_dir).unwrap();
     let path = cap_dir.join(engine::ENGINE_ORDERS_FILE);
-    let mut capture: SlotCapture<Order> =
-        SlotCapture::open(&path, SlotKind::Order, 1).unwrap();
+    let mut capture: SlotCapture<Order> = SlotCapture::open(&path, SlotKind::Order, 1).unwrap();
     let mut sink = SinkCtx { submitted: 0 };
 
     const CYCLES: u64 = 10_000;
@@ -2506,13 +2666,16 @@ fn engine_orders_capture_and_stamp_are_zero_alloc() {
         allocs, 0,
         "orders capture/stamp path allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "orders capture/stamp bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "orders capture/stamp bytes should be zero: saw {bytes}"
+    );
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
-/// Phase 8f item 8: `strategy-ai-exec`'s tick path (fair-table probe
-/// + lazy-tracked book apply + deviation quote) must be zero-alloc in
+/// Phase 8f item 8: `strategy-ai-exec`'s tick path (fair-table probe,
+/// lazy-tracked book apply, deviation quote) must be zero-alloc in
 /// steady state — it runs inside `Engine::tick()` for every market
 /// tick when the member is enabled.
 #[test]
@@ -2543,7 +2706,10 @@ fn ai_exec_on_tick_is_zero_alloc() {
     // lazy book slot.
     let mut s: AiExec<64> = AiExec::new();
     s.set_cooldown_ns(0);
-    let mut ctx = CountCtx { submitted: 0, now: T0 };
+    let mut ctx = CountCtx {
+        submitted: 0,
+        now: T0,
+    };
     s.on_start(&mut ctx).unwrap();
     let fair = AiCmd::new(
         T0,
@@ -2602,7 +2768,10 @@ fn ai_exec_on_tick_is_zero_alloc() {
         allocs, 0,
         "ai-exec on_tick allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "ai-exec on_tick bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "ai-exec on_tick bytes should be zero: saw {bytes}"
+    );
 }
 
 /// Phase 8f item 8: `strategy-ai-exec`'s AI-lane path (fair/bias
@@ -2612,8 +2781,8 @@ fn ai_exec_on_tick_is_zero_alloc() {
 #[test]
 fn ai_exec_on_ai_is_zero_alloc() {
     use core_types::{
-        make_symbol_id, AiCmd, AiCmdKind, Order, Side, AI_CMD_FLAG_EXPIRE_ON_SILENCE,
-        AI_SIDE_NONE, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_NONE,
+        make_symbol_id, AiCmd, AiCmdKind, Order, Side, AI_CMD_FLAG_EXPIRE_ON_SILENCE, AI_SIDE_NONE,
+        STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_NONE,
     };
     use strategy_ai_exec::AiExec;
     use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -2656,7 +2825,10 @@ fn ai_exec_on_ai_is_zero_alloc() {
     let pm = make_symbol_id(VenueId::Polymarket, 7);
 
     let mut s: AiExec<64> = AiExec::new();
-    let mut ctx = CountCtx { submitted: 0, now: T0 };
+    let mut ctx = CountCtx {
+        submitted: 0,
+        now: T0,
+    };
     s.on_start(&mut ctx).unwrap();
     s.on_ai(&fair(T0, pm, 0), &mut ctx); // boot upsert
 
@@ -2800,7 +2972,11 @@ fn ruleset_validator_is_zero_alloc() {
     let cd = r#"{"type":"cross_deviation","ref":1000}"#;
     let reject_bodies: Vec<Vec<u8>> = vec![
         // Rule 2: unknown row key.
-        format!(r#"{{"rows":[{}]}}"#, row("j2", cd, "3", "3.9").replace(r#""side""#, r#""bogus":1,"side""#)).into_bytes(),
+        format!(
+            r#"{{"rows":[{}]}}"#,
+            row("j2", cd, "3", "3.9").replace(r#""side""#, r#""bogus":1,"side""#)
+        )
+        .into_bytes(),
         // Rule 3: exponent.
         format!(r#"{{"rows":[{}]}}"#, row("j3", cd, "3", "5e1")).into_bytes(),
         // Rule 4: empty rows.
@@ -2817,8 +2993,12 @@ fn ruleset_validator_is_zero_alloc() {
         // Rule 7: per-row cap breach.
         format!(r#"{{"rows":[{}]}}"#, row("j7", cd, "3", "100.01")).into_bytes(),
         // Rule 8: exact duplicate row.
-        format!(r#"{{"rows":[{},{}]}}"#, row("j8a", cd, "3", "3.9"), row("j8b", cd, "3", "3.9"))
-            .into_bytes(),
+        format!(
+            r#"{{"rows":[{},{}]}}"#,
+            row("j8a", cd, "3", "3.9"),
+            row("j8b", cd, "3", "3.9")
+        )
+        .into_bytes(),
     ];
     let rejects: Vec<(Vec<u8>, [u8; 16])> = reject_bodies
         .into_iter()
@@ -2862,7 +3042,10 @@ fn ruleset_validator_is_zero_alloc() {
         allocs, 0,
         "ruleset validator allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "ruleset validator bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "ruleset validator bytes should be zero: saw {bytes}"
+    );
 }
 
 /// Gate 35 (8g §10): the §6 table-handoff seam — ring push (documented
@@ -2962,7 +3145,10 @@ fn ruleset_table_handoff_is_zero_alloc() {
         allocs, 0,
         "ruleset table handoff allocated {allocs} times ({bytes} B)"
     );
-    assert_eq!(bytes, 0, "ruleset table handoff bytes should be zero: saw {bytes}");
+    assert_eq!(
+        bytes, 0,
+        "ruleset table handoff bytes should be zero: saw {bytes}"
+    );
 }
 
 /// Gate 36 (8g §10): `VmStrategy::on_tick` steady state — a full-table
@@ -3118,7 +3304,10 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
     }
     let warm_fires = vm.fires;
     let warm_emitted = vm.orders_emitted;
-    assert!(warm_fires > 0 && warm_emitted > 0, "prewarm must exercise the emit path");
+    assert!(
+        warm_fires > 0 && warm_emitted > 0,
+        "prewarm must exercise the emit path"
+    );
 
     let g = AllocGuard::new();
     while i < 258 + 10_000 {

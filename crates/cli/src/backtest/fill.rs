@@ -84,9 +84,18 @@ use crate::backtest::ModelParams;
 pub const MAX_OPEN_PER_SYM: usize = 4;
 /// §4.1 cap: max total open orders (risk-policy mirror).
 pub const MAX_OPEN_TOTAL: usize = 32;
-/// Venue bytes 0..=4 are tradeable ([`ModelParams`] table width);
-/// anything else (Ai = 5, or corruption) cannot execute orders.
-pub const TRADEABLE_VENUES: usize = 5;
+/// WS9: number of TRADEABLE venues (pm, bn, okx, deribit, hl,
+/// bybit). NOT a venue-byte bound any more — `Ai = 5` sits inside
+/// the byte range while `Bybit = 6` trades; use
+/// [`tradeable_venue_byte`] for the per-order gate.
+pub const TRADEABLE_VENUES: usize = 6;
+
+/// WS9: the per-order venue gate — venue bytes 0..=4 plus Bybit (6)
+/// can execute; the Ai feed (5) and corrupt bytes cannot.
+#[inline]
+pub const fn tradeable_venue_byte(venue: usize) -> bool {
+    venue <= 4 || venue == 6
+}
 /// ns per UTC day (§4.5 `trading_days` bucketing, §3.3 wall mapping).
 pub const DAY_NS: u64 = 86_400_000_000_000;
 
@@ -234,7 +243,15 @@ impl Book {
     /// truncated `removed` quantum leaves `cost` and enters `realized`
     /// as the SAME value, so `realized + unrealized` stays exactly
     /// cash-conserving (module docs).
-    fn apply_fill(&mut self, sym: u32, side: Side, px_1e6: i64, qty_1e6: i64, fee_1e12: i128, mark_1e6: i64) {
+    fn apply_fill(
+        &mut self,
+        sym: u32,
+        side: Side,
+        px_1e6: i64,
+        qty_1e6: i64,
+        fee_1e12: i128,
+        mark_1e6: i64,
+    ) {
         debug_assert!(px_1e6 > 0 && qty_1e6 > 0 && fee_1e12 >= 0);
         let e = self.entries.entry(sym).or_default();
         let pre_contrib = e.qty_1e6 as i128 * mark_1e6 as i128 - e.cost_1e12;
@@ -498,11 +515,14 @@ impl FillEngine {
         );
         let px = order.px.raw();
         let qty = order.qty.raw();
-        // The real vm cannot emit venue ≥ 5 (VenueId-derived), nor a
-        // non-positive px/qty (two-sided-book + cap guards). Fail
-        // closed on hand-built inputs: count as unroutable, drop.
+        // The real vm cannot emit an untradeable venue byte
+        // (VenueId-derived), nor a non-positive px/qty (two-sided-
+        // book + cap guards). Fail closed on hand-built inputs:
+        // count as unroutable, drop. WS9: the gate is the explicit
+        // predicate — Ai (5) sits inside the byte range, Bybit (6)
+        // trades.
         debug_assert!(px > 0 && qty > 0, "vm emits positive px/qty only");
-        if venue >= TRADEABLE_VENUES || px <= 0 || qty <= 0 {
+        if !tradeable_venue_byte(venue) || px <= 0 || qty <= 0 {
             self.unroutable += 1;
             return;
         }
@@ -553,12 +573,7 @@ impl FillEngine {
     /// Refresh the §4.6 bounds contribution of `sym` from the full
     /// book at `mark`.
     fn bounds_refresh(&mut self, sym: u32, mark_1e6: i64) {
-        let qty = self
-            .full
-            .entries
-            .get(&sym)
-            .map(|e| e.qty_1e6)
-            .unwrap_or(0);
+        let qty = self.full.entries.get(&sym).map(|e| e.qty_1e6).unwrap_or(0);
         let abs_notional = (qty as i128).abs() * mark_1e6 as i128;
         self.bounds.set_sym(sym, abs_notional);
     }
@@ -738,7 +753,16 @@ mod tests {
 
     fn order(sym: u32, side: Side, px: i64, qty: i64, oid: u64) -> Order {
         let venue = core_types::VenueId::from_u8(symbol_venue_byte(sym)).expect("venue");
-        Order::new(0, venue, sym, side, 0, Price::from_raw(px), Qty::from_raw(qty), oid)
+        Order::new(
+            0,
+            venue,
+            sym,
+            side,
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        )
     }
 
     fn tick(sym: u32, bid: i64, bq: i64, ask: i64, aq: i64) -> Tick {
@@ -763,8 +787,8 @@ mod tests {
     /// (still never fills on it — the pass precedes the emit).
     fn engine_zero_delta(boundary: u64) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [(0, 0); 5],
-            latency_ns: [0; 5],
+            fee_bps: [(0, 0); 7],
+            latency_ns: [0; 7],
         };
         FillEngine::new(p, boundary)
     }
@@ -805,10 +829,20 @@ mod tests {
         let t_active = 1_000 + 200_000_000;
         assert_eq!(e.open_orders()[0].t_active_ns, t_active);
         // Crossing tick 1 ns early: no fill.
-        e.on_record(&tick(PM_SYM, 400_000, 1, 450_000, 100_000_000), t_active - 1, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 400_000, 1, 450_000, 100_000_000),
+            t_active - 1,
+            0,
+            &mut out,
+        );
         assert!(out.is_empty());
         // At t_active exactly (≥, inclusive): fills.
-        e.on_record(&tick(PM_SYM, 400_000, 1, 450_000, 100_000_000), t_active, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 400_000, 1, 450_000, 100_000_000),
+            t_active,
+            0,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].px_1e6, 500_000, "maker fills at P, never better");
         assert_eq!(out[0].qty_1e6, 10_000_000);
@@ -823,10 +857,20 @@ mod tests {
         e.intake(&order(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 0);
         e.intake(&order(PM_SYM, Side::Ask, 600_000, 10_000_000, 2), 0);
         // Touch on both sides: ask == bid px, bid == ask px — nothing.
-        e.on_record(&tick(PM_SYM, 600_000, 50_000_000, 500_000, 50_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 600_000, 50_000_000, 500_000, 50_000_000),
+            10,
+            0,
+            &mut out,
+        );
         assert!(out.is_empty(), "touch ⇒ infinite queue ahead ⇒ no fill");
         // Strict cross on both: ask < 0.50, bid > 0.60.
-        e.on_record(&tick(PM_SYM, 610_000, 50_000_000, 490_000, 50_000_000), 20, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 610_000, 50_000_000, 490_000, 50_000_000),
+            20,
+            0,
+            &mut out,
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].px_1e6, 500_000);
         assert_eq!(out[1].px_1e6, 600_000);
@@ -838,14 +882,24 @@ mod tests {
         let mut out = Vec::new();
         e.intake(&order(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 0);
         // ask = 0 (absent) must NOT read as "ask below our bid".
-        e.on_record(&tick(PM_SYM, 400_000, 1_000_000, 0, 1_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 400_000, 1_000_000, 0, 1_000_000),
+            10,
+            0,
+            &mut out,
+        );
         assert!(out.is_empty());
-        assert!(e.marks_1e6.get(&PM_SYM).is_none(), "one-sided ⇒ no mark");
+        assert!(!e.marks_1e6.contains_key(&PM_SYM), "one-sided ⇒ no mark");
         // bid = 0 with a resting ask: 0 > px is false, no fill; still no mark.
         e.intake(&order(PM_SYM, Side::Ask, 300_000, 10_000_000, 2), 10);
-        e.on_record(&tick(PM_SYM, 0, 1_000_000, 700_000, 1_000_000), 20, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 0, 1_000_000, 700_000, 1_000_000),
+            20,
+            0,
+            &mut out,
+        );
         assert!(out.is_empty());
-        assert!(e.marks_1e6.get(&PM_SYM).is_none());
+        assert!(!e.marks_1e6.contains_key(&PM_SYM));
     }
 
     #[test]
@@ -854,13 +908,23 @@ mod tests {
         let mut out = Vec::new();
         e.intake(&order(PM_SYM, Side::Bid, 400_000, 125_000_000, 1), 0);
         // Displayed 70 < remaining 125 ⇒ partial; remainder rests.
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 70_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 70_000_000),
+            10,
+            0,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].qty_1e6, 70_000_000);
         assert_eq!(e.open_orders().len(), 1);
         assert_eq!(e.open_orders()[0].remaining_1e6, 55_000_000);
         // Remainder fills; slot frees.
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 200_000_000), 20, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 200_000_000),
+            20,
+            0,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].qty_1e6, 55_000_000);
         assert!(e.open_orders().is_empty());
@@ -878,7 +942,12 @@ mod tests {
         e.intake(&order(PM_SYM, Side::Bid, 450_000, 100_000_000, 2), 0);
         // Ask 0.40 crosses BOTH; displayed 60 — the older order eats
         // it all, the younger gets none (no double-claimed liquidity).
-        e.on_record(&tick(PM_SYM, 350_000, 1, 400_000, 60_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 400_000, 60_000_000),
+            10,
+            0,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].client_oid, 1);
         assert_eq!(out[0].qty_1e6, 60_000_000);
@@ -893,7 +962,10 @@ mod tests {
     fn per_sym_cap_rejects_the_fifth_open_order() {
         let mut e = engine(u64::MAX);
         for oid in 0..5u64 {
-            e.intake(&order(PM_SYM, Side::Bid, 100_000 + oid as i64, 1_000_000, oid), 0);
+            e.intake(
+                &order(PM_SYM, Side::Bid, 100_000 + oid as i64, 1_000_000, oid),
+                0,
+            );
         }
         assert_eq!(e.open_orders().len(), 4);
         let o = e.finish();
@@ -910,7 +982,10 @@ mod tests {
         for s in 0..8u32 {
             let sym = make_symbol_id(VenueId::Polymarket, 100 + s);
             for k in 0..4u64 {
-                e.intake(&order(sym, Side::Bid, 100_000, 1_000_000, (s as u64) * 4 + k), 0);
+                e.intake(
+                    &order(sym, Side::Bid, 100_000, 1_000_000, (s as u64) * 4 + k),
+                    0,
+                );
             }
         }
         assert_eq!(e.open_orders().len(), 32);
@@ -937,13 +1012,18 @@ mod tests {
     #[test]
     fn maker_fee_charges_on_fill_notional() {
         let p = ModelParams {
-            fee_bps: [(50, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // PM maker 50 bps
-            latency_ns: [0; 5],
+            fee_bps: [(50, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // PM maker 50 bps
+            latency_ns: [0; 7],
         };
         let mut e = FillEngine::new(p, 0); // all OOS
         let mut out = Vec::new();
         e.intake(&order(PM_SYM, Side::Bid, 400_000, 70_000_000, 1), 0);
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 70_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 70_000_000),
+            10,
+            0,
+            &mut out,
+        );
         // notional = 0.40 × 70 = $28 ⇒ fee = 28e12 × 50 / 1e4 = $0.14.
         assert_eq!(out[0].fee_1e12, 140_000_000_000);
         let o = e.finish();
@@ -962,7 +1042,10 @@ mod tests {
         let mut e = engine_zero_delta(boundary);
         let mut out = Vec::new();
         // Emitted BEFORE the boundary…
-        e.intake(&order(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), boundary - 1);
+        e.intake(
+            &order(PM_SYM, Side::Bid, 500_000, 10_000_000, 1),
+            boundary - 1,
+        );
         // …fills AFTER it: full book takes it, OOS book does not.
         e.on_record(
             &tick(PM_SYM, 400_000, 1, 450_000, 50_000_000),
@@ -973,7 +1056,10 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(!out[0].oos);
         // OOS-emitted order on the same sym fills next tick: counted.
-        e.intake(&order(PM_SYM, Side::Bid, 500_000, 10_000_000, 2), boundary + 10);
+        e.intake(
+            &order(PM_SYM, Side::Bid, 500_000, 10_000_000, 2),
+            boundary + 10,
+        );
         e.on_record(
             &tick(PM_SYM, 400_000, 1, 450_000, 50_000_000),
             boundary + 20,
@@ -1031,7 +1117,12 @@ mod tests {
         let mut e = engine_zero_delta(0); // all OOS
         let mut out = Vec::new();
         e.intake(&order(PM_SYM, Side::Bid, 400_000, 125_000_000, 1), 0);
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 125_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 125_000_000),
+            10,
+            0,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         // Last tick moves the mark to 0.44: unreal = (0.44−0.40)×125 = $5.
         e.on_record(&tick(PM_SYM, 430_000, 1, 450_000, 1), 20, 0, &mut out);
@@ -1063,9 +1154,19 @@ mod tests {
         let mut e = engine_zero_delta(0);
         let mut out = Vec::new();
         e.intake(&order(PM_SYM, Side::Bid, 400_000, 70_000_000, 1), 0);
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 70_000_000), 10, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 70_000_000),
+            10,
+            0,
+            &mut out,
+        );
         e.intake(&order(PM_SYM, Side::Bid, 400_000, 55_000_000, 2), 10);
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 200_000_000), 20, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 200_000_000),
+            20,
+            0,
+            &mut out,
+        );
         e.on_record(&tick(PM_SYM, 430_000, 1, 450_000, 1), 30, 0, &mut out);
         let o = e.finish();
         assert_eq!(o.oos_max_dd_1e12, 4_375_000_000_000);
@@ -1081,8 +1182,18 @@ mod tests {
         let mut out = Vec::new();
         e.intake(&order(PM_SYM, Side::Bid, 400_000, 125_000_000, 1), 0);
         e.intake(&order(BN_SYM, Side::Bid, 400_000, 50_000_000, 2), 0);
-        e.on_record(&tick(PM_SYM, 350_000, 1, 380_000, 200_000_000), 10, 0, &mut out);
-        e.on_record(&tick(BN_SYM, 350_000, 1, 380_000, 200_000_000), 20, 0, &mut out);
+        e.on_record(
+            &tick(PM_SYM, 350_000, 1, 380_000, 200_000_000),
+            10,
+            0,
+            &mut out,
+        );
+        e.on_record(
+            &tick(BN_SYM, 350_000, 1, 380_000, 200_000_000),
+            20,
+            0,
+            &mut out,
+        );
         // Marks rally on both: PM 0.625, BN 0.625.
         e.on_record(&tick(PM_SYM, 600_000, 1, 650_000, 1), 30, 0, &mut out);
         e.on_record(&tick(BN_SYM, 600_000, 1, 650_000, 1), 40, 0, &mut out);
@@ -1099,8 +1210,20 @@ mod tests {
     /// Scenario event: either a tick or a vm-style order emission.
     #[derive(Clone, Debug)]
     enum Ev {
-        Tick { sym_i: usize, bid: i64, bq: i64, ask_gap: i64, aq: i64, one_sided: u8 },
-        Emit { sym_i: usize, side_bid: bool, px: i64, qty: i64 },
+        Tick {
+            sym_i: usize,
+            bid: i64,
+            bq: i64,
+            ask_gap: i64,
+            aq: i64,
+            one_sided: u8,
+        },
+        Emit {
+            sym_i: usize,
+            side_bid: bool,
+            px: i64,
+            qty: i64,
+        },
     }
 
     fn syms() -> [u32; 4] {
@@ -1116,7 +1239,14 @@ mod tests {
         use proptest::prelude::any;
         use proptest::strategy::Strategy;
         proptest::prop_oneof![
-            (0usize..4, 1i64..999_000, 0i64..300_000_000, 1i64..50_000, 0i64..300_000_000, any::<u8>())
+            (
+                0usize..4,
+                1i64..999_000,
+                0i64..300_000_000,
+                1i64..50_000,
+                0i64..300_000_000,
+                any::<u8>()
+            )
                 .prop_map(|(sym_i, bid, bq, ask_gap, aq, one_sided)| Ev::Tick {
                     sym_i,
                     bid,
@@ -1125,8 +1255,14 @@ mod tests {
                     aq,
                     one_sided,
                 }),
-            (0usize..4, any::<bool>(), 1i64..1_000_000, 1i64..200_000_000)
-                .prop_map(|(sym_i, side_bid, px, qty)| Ev::Emit { sym_i, side_bid, px, qty }),
+            (0usize..4, any::<bool>(), 1i64..1_000_000, 1i64..200_000_000).prop_map(
+                |(sym_i, side_bid, px, qty)| Ev::Emit {
+                    sym_i,
+                    side_bid,
+                    px,
+                    qty
+                }
+            ),
         ]
     }
 
@@ -1142,8 +1278,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [(maker_bps, 0); 5],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000],
+                fee_bps: [(maker_bps, 0); 7],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
             };
             let mut e = FillEngine::new(params, u64::MAX / 2);
             let mut out = Vec::new();
@@ -1210,8 +1346,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [(maker_bps, 0); 5],
-                latency_ns: [0; 5],
+                fee_bps: [(maker_bps, 0); 7],
+                latency_ns: [0; 7],
             };
             let mut e = FillEngine::new(params, 0);
             let mut out = Vec::new();

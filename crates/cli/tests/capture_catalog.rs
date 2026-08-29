@@ -94,7 +94,8 @@ fn three_full_days_are_gap_free_and_whole_root_backtestable() {
     // `other_files` + bytes, never parsed.
     let first_epoch = D0 * NS_PER_DAY + 10 * G;
     std::fs::write(
-        root.join(format!("run-{first_epoch}")).join("pm-events.pmlr"),
+        root.join(format!("run-{first_epoch}"))
+            .join("pm-events.pmlr"),
         b"opaque-other-channel",
     )
     .expect("write other file");

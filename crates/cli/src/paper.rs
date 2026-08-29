@@ -41,6 +41,7 @@ use clob_dispatcher::{OrderDispatch, PaperDispatcher};
 // doesn't have to depend on clob-dispatcher directly.
 pub use clob_dispatcher::{LiveDispatcher, LiveDispatcherErr};
 use core_io::{PmlrCapture, TapCfg, TapMode};
+use core_io::{SlotCapture, SlotKind};
 use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
 use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
@@ -49,10 +50,9 @@ use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, Order, RuleTableSlot, Signal,
     SymbolId, Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
-use core_io::{SlotCapture, SlotKind};
 use engine::{
-    Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES,
-    NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
+    Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
+    SIGNAL_RING_SIZE, TICK_RING_SIZE,
 };
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
 // Re-exported (lib.rs) so the binary reaches the AI status slot type
@@ -62,6 +62,7 @@ use rustls_pki_types::ServerName;
 use strategy_latency_arb::LatencyArb;
 
 use ingress_binance::run_loop as bwl;
+use ingress_bybit::run_loop as ywl;
 use ingress_deribit::run_loop as dwl;
 use ingress_hyperliquid::run_loop as hwl;
 use ingress_okx::run_loop as owl;
@@ -80,7 +81,11 @@ use crate::sigint::{shutdown_requested, SHUTDOWN};
 ///
 /// On macOS the error message is less specific but the same
 /// general guidance applies.
-fn spawn_or_die(builder: thread::Builder, name: &'static str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+fn spawn_or_die(
+    builder: thread::Builder,
+    name: &'static str,
+    f: impl FnOnce() + Send + 'static,
+) -> JoinHandle<()> {
     match builder.spawn(f) {
         Ok(h) => h,
         Err(e) => {
@@ -138,6 +143,12 @@ const DERIBIT_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
 const HL_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 50_000_000_000,
     idle_timeout_ns: 60_000_000_000,
+};
+/// WS9: Bybit wants a `{"op":"ping"}` at least every 20 s; the probe
+/// goes out at 15 s and anything quieter than 30 s is a dead session.
+const BYBIT_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 15_000_000_000,
+    idle_timeout_ns: 30_000_000_000,
 };
 /// Polygon RPC: newHeads every ~2 s + our own 2 s poll → anything
 /// quieter than 30 s is a dead session.
@@ -266,7 +277,14 @@ impl Rings {
     /// Allocate all rings. Single call; never used on hot path.
     pub fn new() -> Self {
         Self {
-            tick: [Ring::new(), Ring::new(), Ring::new(), Ring::new(), Ring::new()],
+            tick: [
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+            ],
             rpc_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
@@ -298,12 +316,15 @@ pub struct IngressStatusSet {
     /// Hyperliquid WSS thread (Phase 8d). Stays Down when
     /// `--hl-coins` is empty and the thread is never spawned.
     pub hyperliquid: Arc<IngressStatus>,
+    /// WS9: Bybit WSS thread (spot + linear conns, one thread).
+    /// Stays Down when the `[bybit]` section is empty.
+    pub bybit: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
 }
 
 impl IngressStatusSet {
-    /// Allocate all six slots (boot only).
+    /// Allocate all seven slots (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -311,6 +332,7 @@ impl IngressStatusSet {
             okx: Arc::new(IngressStatus::new()),
             deribit: Arc::new(IngressStatus::new()),
             hyperliquid: Arc::new(IngressStatus::new()),
+            bybit: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
         }
     }
@@ -348,8 +370,10 @@ pub fn spawn_polymarket(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture =
-        GaugedCapture::new(PmlrCapture::open(run_dir, "pm", epoch_ns, tap_cfg)?, capture_metrics);
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "pm", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "pm", VenueId::Polymarket.to_u8())?;
     }
@@ -455,8 +479,10 @@ pub fn spawn_binance(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture =
-        GaugedCapture::new(PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?, capture_metrics);
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
     }
@@ -554,6 +580,10 @@ pub struct BinanceConnSpec {
     /// — the boot-built symbol table + the configured underlyings
     /// (stream-lowercased inside the lane).
     pub eapi: Option<(ingress_binance::eapi::EapiSymbolTable, Vec<String>)>,
+    /// WS5: true ⇒ this slot is a `/ws/<sym>@markPrice` stream (the
+    /// capture-only mark/index/funding lane; `sym` pinned like
+    /// bookTicker). Mutually exclusive with `eapi`.
+    pub mark_price: bool,
 }
 
 /// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
@@ -574,8 +604,10 @@ pub fn spawn_binance_multi(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture =
-        GaugedCapture::new(PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?, capture_metrics);
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "bn", VenueId::Binance.to_u8())?;
     }
@@ -589,11 +621,11 @@ pub fn spawn_binance_multi(
             // wrapper's bad-server-name posture, applied per slot).
             let mut eps: Vec<WssEndpoint> = Vec::with_capacity(specs.len());
             let mut names: Vec<ServerName> = Vec::with_capacity(specs.len());
-            for i in 0..specs.len() {
-                let ep = match WssEndpoint::resolve(&specs[i].host, 443, &specs[i].path) {
+            for spec in &specs {
+                let ep = match WssEndpoint::resolve(&spec.host, 443, &spec.path) {
                     Ok(e) => e,
                     Err(e) => {
-                        tracing::error!(error = ?e, host = %specs[i].host, "binance: DNS failed");
+                        tracing::error!(error = ?e, host = %spec.host, "binance: DNS failed");
                         status.set_state(IngressState::Down);
                         return;
                     }
@@ -620,15 +652,18 @@ pub fn spawn_binance_multi(
             let mut conns: Vec<bwl::MultiConn<TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
                 // M2.4: an eapi spec builds the combined-stream lane
-                // driver; bookTicker slots stay byte-identical.
+                // driver; WS5: a markPrice spec builds the mark lane;
+                // bookTicker slots stay byte-identical.
                 let drv = match spec.eapi {
                     Some((table, ulys)) => {
-                        let uly_refs: Vec<&[u8]> =
-                            ulys.iter().map(|s| s.as_bytes()).collect();
+                        let uly_refs: Vec<&[u8]> = ulys.iter().map(|s| s.as_bytes()).collect();
                         bwl::Driver::new_eapi(
                             now_ns().wrapping_add(i as u64),
                             ingress_binance::eapi::EapiLane::new(table, &uly_refs),
                         )
+                    }
+                    None if spec.mark_price => {
+                        bwl::Driver::new_mark_price(now_ns().wrapping_add(i as u64), spec.sym)
                     }
                     None => bwl::Driver::new(now_ns().wrapping_add(i as u64), spec.sym),
                 };
@@ -658,6 +693,124 @@ pub fn spawn_binance_multi(
                 },
             );
             tracing::info!(?res, "binance: multi run-loop returned");
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    ))
+}
+
+/// WS9: one resolved Bybit connection spec for [`spawn_bybit`] —
+/// a class (spot / linear) with its own symbol table.
+pub struct BybitConnSpec {
+    /// Stream path (`/v5/public/spot` or `/v5/public/linear`).
+    pub path: String,
+    /// This connection's `SYMBOL → SymbolId` table.
+    pub table: ingress_bybit::BybitSymbolTable,
+    /// True on the linear conn: subscribe `tickers.<SYM>` too.
+    pub want_tickers: bool,
+}
+
+/// WS9: spawn the Bybit ingress thread — N single-class connections
+/// (spot + linear) on ONE thread, ONE producer (single-writer law),
+/// one `"bybit"` capture. `ingress_bybit::run_multi` owns the
+/// in-thread reconnect pacing + the WS2 establishment budget. See
+/// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_bybit(
+    host: String,
+    specs: Vec<BybitConnSpec>,
+    tls_config: RustlsConfig,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "bybit", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "bybit", VenueId::Bybit.to_u8())?;
+    }
+    Ok(spawn_or_die(
+        thread::Builder::new().name(format!("ingress-bybit-x{}", specs.len())),
+        "ingress-bybit",
+        move || {
+            log_pin_outcome("bybit", core_id);
+            let mut eps: Vec<WssEndpoint> = Vec::with_capacity(specs.len());
+            let mut names: Vec<ServerName> = Vec::with_capacity(specs.len());
+            for spec in &specs {
+                let ep = match WssEndpoint::resolve(&host, 443, &spec.path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!(error = ?e, host = %host, "bybit: DNS failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                let name = match TlsTransport::server_name_from_host(&ep.host) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "bybit: bad server name");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                eps.push(ep);
+                names.push(name);
+            }
+            let (mut poll, mut events, _token) = match new_poll() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, "bybit: mio init failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut conns: Vec<ywl::BybitConn<TlsTransport>> = Vec::with_capacity(specs.len());
+            for (i, spec) in specs.into_iter().enumerate() {
+                let drv = ywl::Driver::new(
+                    now_ns().wrapping_add(i as u64),
+                    spec.table,
+                    spec.want_tickers,
+                );
+                conns.push(ywl::BybitConn::new(
+                    drv,
+                    eps[i].host.as_bytes(),
+                    eps[i].path.as_bytes(),
+                    Keepalive::new(BYBIT_KEEPALIVE),
+                    Backoff::default_for_ingress(core_id as u64 + 1 + i as u64),
+                ));
+            }
+            status.set_state(IngressState::Connecting);
+            let res = ywl::run_multi(
+                &mut conns,
+                &mut producer,
+                &mut poll,
+                &mut events,
+                &SHUTDOWN,
+                &status,
+                &mut capture,
+                |i| match connect_tls(&eps[i], &names[i], &tls_config) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, host = %eps[i].host, slot = i, "bybit: connect failed");
+                        None
+                    }
+                },
+            );
+            // T1(a): name any recorded session error on the exit line.
+            let err = status.take_last_err();
+            tracing::info!(
+                ?res,
+                err_site = core_metrics::err_site_name(err.site),
+                io_kind = core_metrics::io_kind_name(err.io_kind),
+                venue_code = err.venue_code as i32,
+                "bybit: multi run-loop returned"
+            );
             capture.mirror_now();
             status.set_state(IngressState::Down);
         },
@@ -696,9 +849,7 @@ pub fn build_okx_symbol_table(
     // Raw-spec dedupe list, independent of what actually gets
     // inserted (a MISSING item must still trip the duplicate check).
     let mut seen: [&str; ingress_okx::OKX_STATIC_MAX] = [""; ingress_okx::OKX_STATIC_MAX];
-    let mut n_seen: usize = 0;
-    let mut ordinal: u32 = 0;
-    for item in spec.split(',') {
+    for (n_seen, item) in spec.split(',').enumerate() {
         let inst_id = item.trim();
         if inst_id.is_empty() {
             return Err("okx: empty instId in --okx-symbols");
@@ -710,10 +861,10 @@ pub fn build_okx_symbol_table(
             return Err("okx: --okx-symbols exceeds OKX_STATIC_MAX instruments");
         }
         seen[n_seen] = inst_id;
-        n_seen += 1;
 
-        ordinal += 1;
-        let sym = make_symbol_id(VenueId::Okx, ordinal);
+        // Ordinals are 1-based, consumed per spec item (missing rows
+        // still burn theirs) — lockstep with the dedupe count.
+        let sym = make_symbol_id(VenueId::Okx, (n_seen + 1) as u32);
         let Some(row) = discovery.find(inst_id.as_bytes()).filter(|r| r.live) else {
             // MISSING — already logged by boot_discovery's coverage
             // pass; the table just doesn't carry a row for it.
@@ -763,10 +914,8 @@ pub fn extend_okx_table_with_options(
             return Err("okx: duplicate instId in discovered options chain");
         }
         if n_options >= ingress_okx::OKX_OPT_MAX {
-            return Err(
-                "okx: options chain exceeds OKX_OPT_MAX — shrink \
-                 options_underlyings/options_expiries/options_strikes",
-            );
+            return Err("okx: options chain exceeds OKX_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes");
         }
         match table.insert(inst_id.as_bytes(), *sym, ingress_okx::OkxInstType::Option) {
             Ok(()) => n_options += 1,
@@ -811,8 +960,10 @@ pub fn spawn_okx(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture =
-        GaugedCapture::new(PmlrCapture::open(run_dir, "okx", epoch_ns, tap_cfg)?, capture_metrics);
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "okx", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "okx", VenueId::Okx.to_u8())?;
     }
@@ -936,7 +1087,10 @@ pub fn build_deribit_symbol_table(
             return Err("deribit: duplicate instrument in --deribit-symbols");
         }
         ordinal += 1;
-        match table.insert(instrument.as_bytes(), make_symbol_id(VenueId::Deribit, ordinal)) {
+        match table.insert(
+            instrument.as_bytes(),
+            make_symbol_id(VenueId::Deribit, ordinal),
+        ) {
             Ok(()) => {}
             Err(ingress_deribit::SymbolTableErr::Full) => {
                 return Err("deribit: --deribit-symbols exceeds DERIBIT_STATIC_MAX instruments");
@@ -952,10 +1106,12 @@ pub fn build_deribit_symbol_table(
             Err(ingress_deribit::SymbolTableErr::HasDot) => {
                 return Err("deribit: instrument in --deribit-symbols must not contain '.'");
             }
-            Err(ingress_deribit::SymbolTableErr::StaticAfterOptions) => {
+            Err(ingress_deribit::SymbolTableErr::StaticAfterOptions)
+            | Err(ingress_deribit::SymbolTableErr::OptionAfterCombos) => {
                 // This builder only performs static inserts, before
-                // any option insert — unreachable by construction.
-                debug_assert!(false, "static-only builder saw StaticAfterOptions");
+                // any option/combo insert — unreachable by
+                // construction.
+                debug_assert!(false, "static-only builder saw a build-order error");
                 return Err("deribit: internal symbol-table build-order violation");
             }
         }
@@ -980,10 +1136,8 @@ pub fn extend_deribit_table_with_options(
         match table.insert_option(name.as_bytes(), *sym) {
             Ok(()) => {}
             Err(ingress_deribit::SymbolTableErr::Full) => {
-                return Err(
-                    "deribit: options chain exceeds DERIBIT_OPT_MAX — shrink \
-                     options_underlyings/options_expiries/options_strikes",
-                );
+                return Err("deribit: options chain exceeds DERIBIT_OPT_MAX — shrink \
+                     options_underlyings/options_expiries/options_strikes");
             }
             Err(ingress_deribit::SymbolTableErr::TooLong) => {
                 return Err("deribit: discovered option instrument exceeds DERIBIT_INSTR_MAX");
@@ -996,6 +1150,52 @@ pub fn extend_deribit_table_with_options(
             }
             Err(ingress_deribit::SymbolTableErr::StaticAfterOptions) => {
                 debug_assert!(false, "insert_option never reports StaticAfterOptions");
+                return Err("deribit: internal symbol-table build-order violation");
+            }
+            Err(ingress_deribit::SymbolTableErr::OptionAfterCombos) => {
+                // The bin inserts options BEFORE combos (WS6 partition
+                // law) — unreachable in that order.
+                debug_assert!(false, "options inserted after combos");
+                return Err("deribit: internal symbol-table build-order violation");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// WS6: append the configured option COMBOS to a Deribit symbol
+/// table — AFTER every static and option insert (partition law).
+/// Quote-only rows; combos share the venue's 64-row option-block
+/// capacity, so a full discovered chain plus a long combo list is a
+/// boot error naming the knobs to shrink.
+pub fn extend_deribit_table_with_combos(
+    table: &mut ingress_deribit::DeribitSymbolTable,
+    combos: &[(String, core_types::SymbolId)],
+) -> Result<(), &'static str> {
+    for (name, sym) in combos {
+        if table.lookup(name.as_bytes()).is_some() {
+            return Err("deribit: combo duplicates a configured/discovered instrument");
+        }
+        match table.insert_combo(name.as_bytes(), *sym) {
+            Ok(()) => {}
+            Err(ingress_deribit::SymbolTableErr::Full) => {
+                return Err(
+                    "deribit: options + combos exceed the 64-row tail block — shrink \
+                     options_underlyings/options_expiries/options_strikes or the combo list",
+                );
+            }
+            Err(ingress_deribit::SymbolTableErr::TooLong) => {
+                return Err("deribit: combo instrument exceeds DERIBIT_INSTR_MAX");
+            }
+            Err(ingress_deribit::SymbolTableErr::Empty) => {
+                return Err("deribit: empty combo instrument");
+            }
+            Err(ingress_deribit::SymbolTableErr::HasDot) => {
+                return Err("deribit: combo instrument must not contain '.'");
+            }
+            Err(ingress_deribit::SymbolTableErr::StaticAfterOptions)
+            | Err(ingress_deribit::SymbolTableErr::OptionAfterCombos) => {
+                debug_assert!(false, "insert_combo never reports build-order errors");
                 return Err("deribit: internal symbol-table build-order violation");
             }
         }
@@ -1016,6 +1216,7 @@ pub fn spawn_deribit(
     tls_config: RustlsConfig,
     symbols: ingress_deribit::DeribitSymbolTable,
     depth_enabled: bool,
+    dvol_indices: Vec<String>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
@@ -1045,7 +1246,11 @@ pub fn spawn_deribit(
                 }
             };
 
-            let mut driver = dwl::Driver::new(now_ns(), symbols, depth_enabled);
+            // WS6: DVOL index subscriptions (empty = none — the
+            // pre-WS6 shape).
+            let dvol_refs: Vec<&[u8]> = dvol_indices.iter().map(|s| s.as_bytes()).collect();
+            let mut driver =
+                dwl::Driver::new_with_dvol(now_ns(), symbols, depth_enabled, &dvol_refs);
             let mut keepalive = Keepalive::new(DERIBIT_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -1132,9 +1337,7 @@ pub fn spawn_deribit(
 /// coin, or more than [`ingress_hyperliquid::HL_MAX_COINS`] coins —
 /// boot refuses to start rather than run with a venue map that
 /// doesn't match the operator's intent.
-pub fn build_hl_coin_table(
-    spec: &str,
-) -> Result<ingress_hyperliquid::HlCoinTable, &'static str> {
+pub fn build_hl_coin_table(spec: &str) -> Result<ingress_hyperliquid::HlCoinTable, &'static str> {
     let mut table = ingress_hyperliquid::HlCoinTable::new();
     let mut ordinal: u32 = 0;
     for item in spec.split(',') {
@@ -1146,7 +1349,10 @@ pub fn build_hl_coin_table(
             return Err("hl: duplicate coin in --hl-coins");
         }
         ordinal += 1;
-        match table.insert(coin.as_bytes(), make_symbol_id(VenueId::Hyperliquid, ordinal)) {
+        match table.insert(
+            coin.as_bytes(),
+            make_symbol_id(VenueId::Hyperliquid, ordinal),
+        ) {
             Ok(()) => {}
             Err(ingress_hyperliquid::CoinTableErr::Full) => {
                 return Err("hl: --hl-coins exceeds HL_MAX_COINS coins");
@@ -1181,8 +1387,10 @@ pub fn spawn_hyperliquid(
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
 ) -> io::Result<JoinHandle<()>> {
-    let mut capture =
-        GaugedCapture::new(PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?, capture_metrics);
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "hl", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     if tap_cfg.mode != TapMode::Off {
         capture.set_tap_venue_byte(run_dir, "hl", VenueId::Hyperliquid.to_u8())?;
     }
@@ -1299,8 +1507,10 @@ pub fn spawn_rpc(
     // claude-worker command feed). The tap header's venue byte stays
     // the `0xFF` "unknown" sentinel; `rpc-raw.tap`'s filename already
     // self-identifies for the offline tooling.
-    let mut capture =
-        GaugedCapture::new(PmlrCapture::open(run_dir, "rpc", epoch_ns, tap_cfg)?, capture_metrics);
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "rpc", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
     Ok(spawn_or_die(
         thread::Builder::new().name("ingress-rpc".into()),
         "ingress-rpc",
@@ -1565,7 +1775,6 @@ pub fn spawn_ai(
     }))
 }
 
-
 // ---------------------------------------------------------------
 // Raw-tap flag parsing (--raw-tap / --raw-tap-mode / --raw-tap-budget-mb)
 // ---------------------------------------------------------------
@@ -1588,6 +1797,8 @@ pub struct RawTapConfig {
     pub deribit: TapCfg,
     /// Tap config for the Hyperliquid ingress.
     pub hl: TapCfg,
+    /// WS9: tap config for the Bybit ingress.
+    pub bybit: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -1611,7 +1822,10 @@ pub fn parse_raw_tap_flags(
         _ => return Err("--raw-tap-mode must be 'rejects' or 'all'"),
     };
     let budget_bytes = budget_mb.saturating_mul(1024 * 1024);
-    let enabled_cfg = TapCfg { mode: tap_mode, budget_bytes };
+    let enabled_cfg = TapCfg {
+        mode: tap_mode,
+        budget_bytes,
+    };
 
     let mut cfg = RawTapConfig {
         pm: TapCfg::off(),
@@ -1620,6 +1834,7 @@ pub fn parse_raw_tap_flags(
         rpc: TapCfg::off(),
         deribit: TapCfg::off(),
         hl: TapCfg::off(),
+        bybit: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1634,12 +1849,12 @@ pub fn parse_raw_tap_flags(
         cfg.rpc = enabled_cfg;
         cfg.deribit = enabled_cfg;
         cfg.hl = enabled_cfg;
+        cfg.bybit = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 6] = [""; 6];
-    let mut n_seen = 0usize;
-    for item in spec.split(',') {
+    let mut seen: [&str; 7] = [""; 7];
+    for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
             return Err("--raw-tap: empty venue label");
@@ -1651,7 +1866,6 @@ pub fn parse_raw_tap_flags(
             return Err("--raw-tap: more venue labels than known venues");
         }
         seen[n_seen] = label;
-        n_seen += 1;
         match label {
             "pm" => cfg.pm = enabled_cfg,
             "bn" => cfg.bn = enabled_cfg,
@@ -1659,6 +1873,7 @@ pub fn parse_raw_tap_flags(
             "rpc" => cfg.rpc = enabled_cfg,
             "deribit" => cfg.deribit = enabled_cfg,
             "hl" => cfg.hl = enabled_cfg,
+            "bybit" => cfg.bybit = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -1876,14 +2091,14 @@ fn configure_ev<const N: usize>(
     cfg: &EngineConfig,
     artifact_path: &std::path::Path,
 ) -> Result<(), &'static str> {
-    let (table, skipped) =
-        match research_artifacts::ArtifactTable::<N>::load_ndjson(artifact_path) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = ?e, path = %artifact_path.display(), "ev: load_ndjson failed");
-                return Err("engine_loop_ev: artifact load failed");
-            }
-        };
+    let (table, skipped) = match research_artifacts::ArtifactTable::<N>::load_ndjson(artifact_path)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, path = %artifact_path.display(), "ev: load_ndjson failed");
+            return Err("engine_loop_ev: artifact load failed");
+        }
+    };
     tracing::info!(
         loaded = table.len(),
         skipped,
@@ -2094,7 +2309,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
     }
     if let Some((rules_path, sym_for_rule)) = rules {
-        if let Err(reason) = configure_rule_tree(set.rule_tree_mut(), &cfg, rules_path, sym_for_rule)
+        if let Err(reason) =
+            configure_rule_tree(set.rule_tree_mut(), &cfg, rules_path, sym_for_rule)
         {
             return EngineLoopResult::Failed(reason);
         }
@@ -2194,6 +2410,9 @@ impl Observability {
             let ingress_hyperliquid_state = reg
                 .register_gauge("engine_ingress_hyperliquid_state")
                 .map_err(|_| "register engine_ingress_hyperliquid_state")?;
+            let ingress_bybit_state = reg
+                .register_gauge("engine_ingress_bybit_state")
+                .map_err(|_| "register engine_ingress_bybit_state")?;
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
@@ -2203,8 +2422,8 @@ impl Observability {
             // `last_activity` advances on the venue's own rejection
             // bytes — only "when did MARKET DATA last arrive" names a
             // dead lane. -1 = no tick since boot. Order matches the
-            // derivation loop: pm, bn, okx, deribit, hl, rpc.
-            let ingress_last_tick_age: [core_metrics::GaugeId; 6] = [
+            // derivation loop: pm, bn, okx, deribit, hl, bybit, rpc.
+            let ingress_last_tick_age: [core_metrics::GaugeId; 7] = [
                 reg.register_gauge("engine_ingress_polymarket_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_polymarket_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_binance_last_tick_age_seconds")
@@ -2215,6 +2434,8 @@ impl Observability {
                     .map_err(|_| "register engine_ingress_deribit_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_hyperliquid_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_hyperliquid_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_bybit_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_bybit_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_rpc_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_rpc_last_tick_age_seconds")?,
             ];
@@ -2247,8 +2468,8 @@ impl Observability {
                 name_buf[prefix.len()] = b'0' + tens;
                 name_buf[prefix.len() + 1] = b'0' + ones;
                 let n = prefix.len() + 2;
-                let name = std::str::from_utf8(&name_buf[..n])
-                    .map_err(|_| "tick_age_ns_b name utf8")?;
+                let name =
+                    std::str::from_utf8(&name_buf[..n]).map_err(|_| "tick_age_ns_b name utf8")?;
                 *slot = reg
                     .register_gauge(name)
                     .map_err(|_| "register engine_tick_age_ns_bNN")?;
@@ -2260,6 +2481,7 @@ impl Observability {
             let ingress_okx = register_ingress_counters(&mut reg, "okx")?;
             let ingress_deribit = register_ingress_counters(&mut reg, "deribit")?;
             let ingress_hyperliquid = register_ingress_counters(&mut reg, "hyperliquid")?;
+            let ingress_bybit = register_ingress_counters(&mut reg, "bybit")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
@@ -2274,6 +2496,7 @@ impl Observability {
             let capture_okx = register_capture_gauges(&mut reg, "okx")?;
             let capture_deribit = register_capture_gauges(&mut reg, "deribit")?;
             let capture_hyperliquid = register_capture_gauges(&mut reg, "hl")?;
+            let capture_bybit = register_capture_gauges(&mut reg, "bybit")?;
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
@@ -2284,6 +2507,7 @@ impl Observability {
             let coverage_deribit = register_coverage_gauge(&mut reg, "deribit")?;
             let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
             let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
+            let coverage_bybit = register_coverage_gauge(&mut reg, "bybit")?;
             // M2.1/M2.2: how many capped-chain option instruments
             // this boot selected + subscribed (0 = options lane off).
             let deribit_options_selected = reg
@@ -2350,6 +2574,7 @@ impl Observability {
                 ingress_okx_state,
                 ingress_deribit_state,
                 ingress_hyperliquid_state,
+                ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
@@ -2360,18 +2585,21 @@ impl Observability {
                 ingress_okx,
                 ingress_deribit,
                 ingress_hyperliquid,
+                ingress_bybit,
                 ingress_rpc,
                 capture_pm,
                 capture_bn,
                 capture_okx,
                 capture_deribit,
                 capture_hyperliquid,
+                capture_bybit,
                 capture_rpc,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
                 coverage_hyperliquid,
                 coverage_binance,
+                coverage_bybit,
                 deribit_options_selected,
                 okx_options_selected,
                 binance_options_selected,
@@ -2409,6 +2637,7 @@ fn register_ingress_counters(
         reconnects: one("reconnects")?,
         ring_drops: one("ring_drops")?,
         ticks: one("ticks")?,
+        sub_drops: one("sub_drops")?,
     })
 }
 
@@ -2549,12 +2778,14 @@ pub struct EngineCounters {
     pub ingress_deribit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Hyperliquid public WS.
     pub ingress_hyperliquid_state: core_metrics::GaugeId,
+    /// WS9: per-ingress state gauge, Bybit v5 public WS.
+    pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
-    /// since boot). Order: pm, bn, okx, deribit, hl, rpc.
-    pub ingress_last_tick_age: [core_metrics::GaugeId; 6],
+    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc.
+    pub ingress_last_tick_age: [core_metrics::GaugeId; 7],
     /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
     /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
     pub restart_stamp_age: core_metrics::GaugeId,
@@ -2576,6 +2807,8 @@ pub struct EngineCounters {
     pub ingress_deribit: IngressCounterIds,
     /// §6.4 loss-accounting counters, Hyperliquid thread.
     pub ingress_hyperliquid: IngressCounterIds,
+    /// WS9: §6.4 loss-accounting counters, Bybit thread.
+    pub ingress_bybit: IngressCounterIds,
     /// §6.4 loss-accounting counters, RPC thread.
     pub ingress_rpc: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
@@ -2588,6 +2821,8 @@ pub struct EngineCounters {
     pub capture_deribit: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Hyperliquid thread.
     pub capture_hyperliquid: CaptureGaugeIds,
+    /// WS9: §6.5 capture-health gauges, Bybit thread.
+    pub capture_bybit: CaptureGaugeIds,
     /// §6.5 capture-health gauges, RPC thread.
     pub capture_rpc: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
@@ -2611,6 +2846,9 @@ pub struct EngineCounters {
     /// M1 boot-discovery coverage gauge, Binance exchangeInfo audit
     /// (0 when skipped — legacy flag boots).
     pub coverage_binance: GaugeId,
+    /// WS9: boot-discovery coverage gauge, Bybit instruments-info
+    /// audit (0 when the `[bybit]` section is empty).
+    pub coverage_bybit: GaugeId,
     /// Phase-8f AI ingress family (`engine_ingress_ai_*` + the engine
     /// drain-site counter + heartbeat-age gauge).
     pub ingress_ai: AiIngressCounterIds,
@@ -2657,6 +2895,9 @@ pub struct IngressCounterIds {
     /// Parsed market-data rows (T1(b): control frames excluded —
     /// `engine_ingress_<venue>_ticks_total`).
     pub ticks: core_metrics::CounterId,
+    /// WS2: non-fatal subscribe drops
+    /// (`engine_ingress_<venue>_sub_drops_total`).
+    pub sub_drops: core_metrics::CounterId,
 }
 
 /// Registry handles for the Phase-8f AI ingress family
@@ -2769,7 +3010,8 @@ fn mirror_ai_counters(
         ruleset_rejected: st.ruleset_rejected(),
         table_push_fail: st.table_push_fail(),
     };
-    reg.counter(ids.cmds).inc(cur.cmds.saturating_sub(last.cmds));
+    reg.counter(ids.cmds)
+        .inc(cur.cmds.saturating_sub(last.cmds));
     reg.counter(ids.hmac_fail)
         .inc(cur.hmac_fail.saturating_sub(last.hmac_fail));
     reg.counter(ids.protocol_err)
@@ -2816,7 +3058,8 @@ fn register_ai_counters(
         .register_gauge("engine_ingress_ai_last_heartbeat_age_ns")
         .map_err(|_| "register engine_ingress_ai_last_heartbeat_age_ns")?;
     let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
-        reg.register_counter(name).map_err(|_| "register ai counter")
+        reg.register_counter(name)
+            .map_err(|_| "register ai counter")
     };
     Ok(AiIngressCounterIds {
         cmds: one("engine_ingress_ai_cmds_total")?,
@@ -2886,15 +3129,18 @@ fn mirror_vm_metrics<S: strategy_core::StrategyCounters>(
     strat: &S,
     last: &mut VmCountersSnapshot,
 ) {
-    reg.gauge(ids.rows_active).set(strat.vm_rows_active() as i64);
-    reg.gauge(ids.table_epoch).set(strat.vm_table_epoch() as i64);
+    reg.gauge(ids.rows_active)
+        .set(strat.vm_rows_active() as i64);
+    reg.gauge(ids.table_epoch)
+        .set(strat.vm_table_epoch() as i64);
     let cur = VmCountersSnapshot {
         fires: strat.vm_fires(),
         orders_emitted: strat.vm_orders_emitted(),
         orders_dropped: strat.vm_orders_dropped(),
         commit_dropped: strat.vm_commit_dropped(),
     };
-    reg.counter(ids.fires).inc(cur.fires.saturating_sub(last.fires));
+    reg.counter(ids.fires)
+        .inc(cur.fires.saturating_sub(last.fires));
     reg.counter(ids.orders_emitted)
         .inc(cur.orders_emitted.saturating_sub(last.orders_emitted));
     reg.counter(ids.orders_dropped)
@@ -2915,7 +3161,8 @@ fn register_vm_metrics(
         .register_gauge("engine_vm_table_epoch")
         .map_err(|_| "register engine_vm_table_epoch")?;
     let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
-        reg.register_counter(name).map_err(|_| "register vm counter")
+        reg.register_counter(name)
+            .map_err(|_| "register vm counter")
     };
     Ok(VmMetricIds {
         fires: one("engine_vm_fires_total")?,
@@ -2948,9 +3195,9 @@ pub struct CaptureGaugeIds {
     /// treated as a soak-verdict red flag even though the market-data
     /// session itself is unaffected.
     pub io_errors: GaugeId,
-    /// Mirrors `ticks_written() + events_written() + signals_written()
-    /// + tap_records()` — total records staged since the capture was
-    /// opened (monotonic snapshot, not a delta).
+    /// Mirrors `ticks_written() + events_written() +
+    /// signals_written() + tap_records()` — total records staged since
+    /// the capture was opened (monotonic snapshot, not a delta).
     pub records: GaugeId,
 }
 
@@ -2983,7 +3230,11 @@ pub struct GaugedCapture {
 impl GaugedCapture {
     /// Wrap an opened capture with its (optional) gauge handles.
     pub fn new(inner: PmlrCapture, metrics: CaptureMetrics) -> Self {
-        Self { inner, metrics, last_pub_ns: 0 }
+        Self {
+            inner,
+            metrics,
+            last_pub_ns: 0,
+        }
     }
 
     /// Mirror immediately — the spawn wrappers call this after every
@@ -3107,6 +3358,7 @@ struct IngressCountersSnapshot {
     reconnects: u64,
     ring_drops: u64,
     ticks: u64,
+    sub_drops: u64,
 }
 
 /// Mirror one ingress status slot into its registry counters as
@@ -3126,19 +3378,26 @@ fn mirror_ingress_counters(
         reconnects: st.reconnects_total(),
         ring_drops: st.ring_drops_total(),
         ticks: st.ticks_total(),
+        sub_drops: st.sub_drops_total(),
     };
-    reg.counter(ids.msgs).inc(cur.msgs.saturating_sub(last.msgs));
-    reg.counter(ids.bytes).inc(cur.bytes.saturating_sub(last.bytes));
+    reg.counter(ids.msgs)
+        .inc(cur.msgs.saturating_sub(last.msgs));
+    reg.counter(ids.bytes)
+        .inc(cur.bytes.saturating_sub(last.bytes));
     reg.counter(ids.parse_errors)
         .inc(cur.parse_errors.saturating_sub(last.parse_errors));
-    reg.counter(ids.gaps).inc(cur.gaps.saturating_sub(last.gaps));
+    reg.counter(ids.gaps)
+        .inc(cur.gaps.saturating_sub(last.gaps));
     reg.counter(ids.resubscribes)
         .inc(cur.resubscribes.saturating_sub(last.resubscribes));
     reg.counter(ids.reconnects)
         .inc(cur.reconnects.saturating_sub(last.reconnects));
     reg.counter(ids.ring_drops)
         .inc(cur.ring_drops.saturating_sub(last.ring_drops));
-    reg.counter(ids.ticks).inc(cur.ticks.saturating_sub(last.ticks));
+    reg.counter(ids.ticks)
+        .inc(cur.ticks.saturating_sub(last.ticks));
+    reg.counter(ids.sub_drops)
+        .inc(cur.sub_drops.saturating_sub(last.sub_drops));
     *last = cur;
 }
 
@@ -3179,12 +3438,7 @@ pub fn engine_loop_full<D: OrderDispatch>(
     run_engine_loop(cons, disp, strat, obs)
 }
 
-fn run_engine_loop<S, D>(
-    cons: Consumers,
-    disp: D,
-    strat: S,
-    obs: Observability,
-) -> EngineLoopResult
+fn run_engine_loop<S, D>(cons: Consumers, disp: D, strat: S, obs: Observability) -> EngineLoopResult
 where
     S: strategy_core::Strategy,
     D: OrderDispatch,
@@ -3236,14 +3490,14 @@ where
     // (pm, bn, okx, rpc, deribit, hyperliquid) so registry counters
     // get monotonic deltas. Append-only: existing indices are
     // load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 6];
+    let mut ingress_last = [IngressCountersSnapshot::default(); 7];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
-    // `ids.ingress_last_tick_age`: pm, bn, okx, deribit, hl, rpc
-    // (NOT the ingress_last order — that array predates this and its
-    // indices are load-bearing).
-    let mut tick_age_track = [(0u64, 0u64); 6];
+    // `ids.ingress_last_tick_age`: pm, bn, okx, deribit, hl, bybit,
+    // rpc (NOT the ingress_last order — that array predates this and
+    // its indices are load-bearing).
+    let mut tick_age_track = [(0u64, 0u64); 7];
     // Phase-8f AI-family delta snapshot (same bookkeeping).
     let mut ai_last = AiCountersSnapshot::default();
     // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
@@ -3330,6 +3584,8 @@ where
                         .set(ing.deribit.state() as i64);
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
+                    reg.gauge(ids.ingress_bybit_state)
+                        .set(ing.bybit.state() as i64);
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
@@ -3360,6 +3616,12 @@ where
                         &ing.hyperliquid,
                         &mut ingress_last[5],
                     );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_bybit,
+                        &ing.bybit,
+                        &mut ingress_last[6],
+                    );
 
                     // T1(c): derive per-venue last-tick age. A lane
                     // that stops moving data goes visibly stale here
@@ -3372,10 +3634,11 @@ where
                         ing.okx.ticks_total(),
                         ing.deribit.ticks_total(),
                         ing.hyperliquid.ticks_total(),
+                        ing.bybit.ticks_total(),
                         ing.rpc.ticks_total(),
                     ];
                     let mut i = 0;
-                    while i < 6 {
+                    while i < 7 {
                         let (seen, _) = tick_age_track[i];
                         if venue_ticks[i] > seen {
                             tick_age_track[i] = (venue_ticks[i], now);
@@ -3393,7 +3656,8 @@ where
 
                 // T1(c)/F12: restart-lane liveness — the newest slot
                 // stamp's age (cold fs read on the 5 s cadence).
-                reg.gauge(ids.restart_stamp_age).set(restart_stamp_age_secs());
+                reg.gauge(ids.restart_stamp_age)
+                    .set(restart_stamp_age_secs());
 
                 // Phase-8f AI family: §4.4 counter deltas from the
                 // shared status slot (incl. the engine-written
@@ -3477,8 +3741,9 @@ where
                 // bit0 = polymarket, bit1 = binance, bit2 = rpc,
                 // bit3 = rss (retired 8f — reserved, always 0),
                 // bit4 = okx, bit5 = deribit, bit6 = hl (8e —
-                // appended; existing bits never renumber); bit
-                // set iff the thread is Up.
+                // appended), bit7 = bybit (WS9 — the u8's last bit;
+                // existing bits never renumber); bit set iff the
+                // thread is Up.
                 state.ingest_health = match obs.ingress.as_ref() {
                     Some(ing) => {
                         (u8::from(ing.polymarket.state() == IngressState::Up))
@@ -3487,6 +3752,7 @@ where
                             | (u8::from(ing.okx.state() == IngressState::Up) << 4)
                             | (u8::from(ing.deribit.state() == IngressState::Up) << 5)
                             | (u8::from(ing.hyperliquid.state() == IngressState::Up) << 6)
+                            | (u8::from(ing.bybit.state() == IngressState::Up) << 7)
                     }
                     None => 0,
                 };
@@ -3810,6 +4076,9 @@ pub mod boot_discovery {
         /// [`BN_OPT_ORDINAL_BASE`]). The bin builds the eapi lane
         /// table from these. Empty when the policy is disabled.
         pub bn_options: Vec<(String, SymbolId, u8)>,
+        /// WS9: Bybit coverage (instruments-info audit, spot + linear
+        /// pages); `None` when the `[bybit]` section is empty.
+        pub bybit: Option<VenueCoverage>,
     }
 
     // -----------------------------------------------------------
@@ -3895,7 +4164,16 @@ pub mod boot_discovery {
         path: &str,
         buf: &mut Vec<u8>,
     ) -> Result<Range<usize>, core_net::boot_http::BootHttpErr> {
-        core_net::boot_http::https_get(tls, host, port, path, USER_AGENT, buf, MAX_BODY, FETCH_TIMEOUT)
+        core_net::boot_http::https_get(
+            tls,
+            host,
+            port,
+            path,
+            USER_AGENT,
+            buf,
+            MAX_BODY,
+            FETCH_TIMEOUT,
+        )
     }
 
     fn post(
@@ -3984,8 +4262,18 @@ pub mod boot_discovery {
             universe += d.universe_total();
         }
         let configured = asset_ids.len() as u32;
-        tracing::info!(venue = "pm", configured, matched, universe, "discovery: coverage");
-        Ok(VenueCoverage { configured, matched, universe })
+        tracing::info!(
+            venue = "pm",
+            configured,
+            matched,
+            universe,
+            "discovery: coverage"
+        );
+        Ok(VenueCoverage {
+            configured,
+            matched,
+            universe,
+        })
     }
 
     fn run_okx(
@@ -4012,7 +4300,11 @@ pub mod boot_discovery {
             })?;
         }
 
-        let configured: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let configured: Vec<&str> = spec
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         let mut matched = 0u32;
         for inst in &configured {
             match okx_missing_reason(&d, inst.as_bytes()) {
@@ -4029,10 +4321,23 @@ pub mod boot_discovery {
             }
         }
         let universe = d.universe_live();
-        tracing::info!(venue = "okx", configured = configured.len(), matched, universe, "discovery: coverage");
+        tracing::info!(
+            venue = "okx",
+            configured = configured.len(),
+            matched,
+            universe,
+            "discovery: coverage"
+        );
 
         let table = super::build_okx_symbol_table(spec, &d)?;
-        Ok((VenueCoverage { configured: configured.len() as u32, matched, universe }, table))
+        Ok((
+            VenueCoverage {
+                configured: configured.len() as u32,
+                matched,
+                universe,
+            },
+            table,
+        ))
     }
 
     /// M2.2: fetch + select the capped OKX options chain — the
@@ -4127,10 +4432,8 @@ pub mod boot_discovery {
                 cap = ingress_okx::OKX_OPT_MAX,
                 "discovery: selected options chain exceeds the per-connection cap"
             );
-            return Err(
-                "okx: selected options chain exceeds OKX_OPT_MAX — shrink \
-                 options_underlyings/options_expiries/options_strikes",
-            );
+            return Err("okx: selected options chain exceeds OKX_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes");
         }
         Ok(out)
     }
@@ -4160,11 +4463,52 @@ pub mod boot_discovery {
             })?;
         }
 
-        let configured: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let configured: Vec<&str> = spec
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        // WS6: a configured SPOT instrument (name-shape law: no `-`,
+        // e.g. `BTC_USDC`) lives on the `kind=spot` pages — fetch
+        // them ONLY when the config asks for spot (3 paced requests).
+        if configured.iter().any(|s| !s.contains('-')) {
+            for ccy in ["BTC", "ETH", "USDC"] {
+                std::thread::sleep(Duration::from_millis(1050));
+                let path = format!("/api/v2/public/get_instruments?currency={ccy}&kind=spot");
+                let range = get(tls, host, port, &path, buf).map_err(|e| {
+                    tracing::error!(venue = "deribit", currency = %ccy, page = "spot", error = ?e, "discovery: fetch failed");
+                    "deribit: discovery fetch failed"
+                })?;
+                d.ingest_spot_body(&buf[range]).map_err(|e| {
+                    tracing::error!(venue = "deribit", currency = %ccy, page = "spot", error = ?e, "discovery: parse failed");
+                    "deribit: discovery parse failed"
+                })?;
+            }
+        }
         let mut matched = 0u32;
+        let mut dated = 0u32;
         for instr in &configured {
             match deribit_missing_reason(&d, instr.as_bytes()) {
-                None => matched += 1,
+                None => {
+                    matched += 1;
+                    // WS3 (gaps §1): `settlement_period` was parsed
+                    // since 8e and never used. A configured DATED
+                    // future is named at boot — its ticker carries no
+                    // funding (the run loop's `has_funding` gate is
+                    // the wire-level twin of this split). WS6: spot
+                    // rows (no `-` in the name) are their own class,
+                    // not dated futures.
+                    if let Some(row) = d.find(instr.as_bytes()) {
+                        if !row.perpetual && instr.contains('-') {
+                            dated += 1;
+                            tracing::info!(
+                                venue = "deribit",
+                                symbol = *instr,
+                                "discovery: configured instrument is a dated future (no funding on its ticker)"
+                            );
+                        }
+                    }
+                }
                 Some(reason) => {
                     *any_missing = true;
                     tracing::error!(
@@ -4177,8 +4521,19 @@ pub mod boot_discovery {
             }
         }
         let universe = d.universe_live();
-        tracing::info!(venue = "deribit", configured = configured.len(), matched, universe, "discovery: coverage");
-        Ok(VenueCoverage { configured: configured.len() as u32, matched, universe })
+        tracing::info!(
+            venue = "deribit",
+            configured = configured.len(),
+            matched,
+            dated,
+            universe,
+            "discovery: coverage"
+        );
+        Ok(VenueCoverage {
+            configured: configured.len() as u32,
+            matched,
+            universe,
+        })
     }
 
     /// M2.1: fetch + select the capped Deribit options chain
@@ -4323,17 +4678,27 @@ pub mod boot_discovery {
             })?;
         }
 
-        let configured: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let configured: Vec<&str> = spec
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         let mut matched = 0u32;
         for coin in &configured {
             match d.resolve(coin.as_bytes()) {
                 Some(info) => {
                     matched += 1;
+                    // WS8 (gaps §2.5 tick/lot): the audit row now
+                    // names the venue's size/price granularity for
+                    // perps (lot step = 10^-szDecimals; price tick =
+                    // ≤ max_price_decimals decimals, ≤5 sig figs).
                     tracing::debug!(
                         venue = "hl",
                         coin = *coin,
                         asset_id = info.asset_id,
                         kind = ?info.kind,
+                        sz_decimals = info.sz_decimals,
+                        max_price_decimals = info.max_price_decimals().unwrap_or(0),
                         "discovery: hl asset resolved"
                     );
                 }
@@ -4349,8 +4714,18 @@ pub mod boot_discovery {
             }
         }
         let universe = d.universe_total();
-        tracing::info!(venue = "hl", configured = configured.len(), matched, universe, "discovery: coverage");
-        Ok(VenueCoverage { configured: configured.len() as u32, matched, universe })
+        tracing::info!(
+            venue = "hl",
+            configured = configured.len(),
+            matched,
+            universe,
+            "discovery: coverage"
+        );
+        Ok(VenueCoverage {
+            configured: configured.len() as u32,
+            matched,
+            universe,
+        })
     }
 
     fn run_bn(
@@ -4358,6 +4733,7 @@ pub mod boot_discovery {
         tls: &Arc<rustls::ClientConfig>,
         spot: &[String],
         usdm: &[String],
+        dated: &[String],
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
     ) -> Result<VenueCoverage, &'static str> {
@@ -4411,8 +4787,9 @@ pub mod boot_discovery {
             }
         }
 
-        // USDS-M: one full exchangeInfo page, membership-checked.
-        if !usdm.is_empty() {
+        // USDS-M: one full exchangeInfo page, membership-checked
+        // (perps AND — WS5 — the dated delivery class).
+        if !usdm.is_empty() || !dated.is_empty() {
             let (fut_host, fut_port) = split_host_port(&cfg.binance_fut_rest_host, 443)?;
             let range = get(tls, fut_host, fut_port, "/fapi/v1/exchangeInfo", buf).map_err(|e| {
                 tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: fetch failed");
@@ -4438,12 +4815,58 @@ pub mod boot_discovery {
                     }
                 }
             }
+            // WS5: a `usdm_dated` entry must exist AND be a dated
+            // contract class — a perpetual misfiled here would ride
+            // the dated ordinal block and lie to every offline
+            // consumer about its class.
+            for sym in dated {
+                let (up, up_len) = upper_symbol(sym);
+                match bn_missing_reason(&d, &up[..up_len]) {
+                    None => {
+                        let is_dated = d
+                            .find(&up[..up_len])
+                            .is_some_and(|row| row.contract_type.is_dated());
+                        if is_dated {
+                            matched += 1;
+                        } else {
+                            *any_missing = true;
+                            tracing::error!(
+                                venue = "bn",
+                                symbol = sym.as_str(),
+                                market = "usdm_dated",
+                                reason = "not_dated",
+                                "discovery: configured symbol is not a dated contract"
+                            );
+                        }
+                    }
+                    Some(reason) => {
+                        *any_missing = true;
+                        tracing::error!(
+                            venue = "bn",
+                            symbol = sym.as_str(),
+                            market = "usdm_dated",
+                            reason,
+                            "discovery: configured symbol missing from venue universe"
+                        );
+                    }
+                }
+            }
         }
 
-        let configured = (spot.len() + usdm.len()) as u32;
+        let configured = (spot.len() + usdm.len() + dated.len()) as u32;
         let universe = d.universe_trading();
-        tracing::info!(venue = "bn", configured, matched, universe, "discovery: coverage");
-        Ok(VenueCoverage { configured, matched, universe })
+        tracing::info!(
+            venue = "bn",
+            configured,
+            matched,
+            universe,
+            "discovery: coverage"
+        );
+        Ok(VenueCoverage {
+            configured,
+            matched,
+            universe,
+        })
     }
 
     /// M2.4: fetch + select the capped Binance eapi options chain —
@@ -4537,10 +4960,8 @@ pub mod boot_discovery {
                 cap = ingress_binance::eapi::EAPI_OPT_MAX,
                 "discovery: selected options chain exceeds the per-connection cap"
             );
-            return Err(
-                "bn: selected options chain exceeds EAPI_OPT_MAX — shrink \
-                 options_underlyings/options_expiries/options_strikes",
-            );
+            return Err("bn: selected options chain exceeds EAPI_OPT_MAX — shrink \
+                 options_underlyings/options_expiries/options_strikes");
         }
         Ok(out)
     }
@@ -4555,6 +4976,7 @@ pub mod boot_discovery {
     /// returned as `Err` for the caller to log + exit non-zero; a
     /// MISSING symbol is not itself an `Err` here (see
     /// [`Outcome::any_missing`] — the caller decides paper-vs-live).
+    #[allow(clippy::too_many_arguments)]
     pub fn run_all(
         cfg: &Config,
         tls_config: &Arc<rustls::ClientConfig>,
@@ -4563,8 +4985,9 @@ pub mod boot_discovery {
         deribit_spec: Option<&str>,
         deribit_options_policy: &OptionsPolicy,
         hl_spec: Option<&str>,
-        binance: Option<(&[String], &[String])>,
+        binance: Option<(&[String], &[String], &[String])>,
         bn_options_policy: &OptionsPolicy,
+        bybit: Option<(&[String], &[String])>,
         polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
@@ -4585,9 +5008,16 @@ pub mod boot_discovery {
 
         // M2.2: the capped OKX options chain (config-file policy).
         let okx_options = if okx_options_policy.enabled() {
-            let pairs =
-                run_okx_options(cfg, tls_config, okx_options_policy, &mut buf, &mut any_missing)?;
-            let table = okx_table.as_mut().expect("policy-on arm always has a table");
+            let pairs = run_okx_options(
+                cfg,
+                tls_config,
+                okx_options_policy,
+                &mut buf,
+                &mut any_missing,
+            )?;
+            let table = okx_table
+                .as_mut()
+                .expect("policy-on arm always has a table");
             super::extend_okx_table_with_options(table, &pairs)?;
             pairs
         } else {
@@ -4595,14 +5025,26 @@ pub mod boot_discovery {
         };
 
         let deribit = match deribit_spec.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(spec) => Some(run_deribit(cfg, tls_config, spec, &mut buf, &mut any_missing)?),
+            Some(spec) => Some(run_deribit(
+                cfg,
+                tls_config,
+                spec,
+                &mut buf,
+                &mut any_missing,
+            )?),
             None => None,
         };
 
         // M2.1: the capped options chain (config-file policy; legacy
         // boots carry a disabled default and skip this entirely).
         let deribit_options = if deribit_options_policy.enabled() {
-            run_deribit_options(cfg, tls_config, deribit_options_policy, &mut buf, &mut any_missing)?
+            run_deribit_options(
+                cfg,
+                tls_config,
+                deribit_options_policy,
+                &mut buf,
+                &mut any_missing,
+            )?
         } else {
             Vec::new()
         };
@@ -4613,8 +5055,18 @@ pub mod boot_discovery {
         };
 
         let bn = match binance {
-            Some((spot, usdm)) if !spot.is_empty() || !usdm.is_empty() => {
-                Some(run_bn(cfg, tls_config, spot, usdm, &mut buf, &mut any_missing)?)
+            Some((spot, usdm, dated))
+                if !spot.is_empty() || !usdm.is_empty() || !dated.is_empty() =>
+            {
+                Some(run_bn(
+                    cfg,
+                    tls_config,
+                    spot,
+                    usdm,
+                    dated,
+                    &mut buf,
+                    &mut any_missing,
+                )?)
             }
             _ => None,
         };
@@ -4622,12 +5074,38 @@ pub mod boot_discovery {
         // M2.4: the eapi capped options chain — its own surface,
         // independent of the spot/usdm audit arm.
         let bn_options = if bn_options_policy.enabled() {
-            run_bn_options(cfg, tls_config, bn_options_policy, &mut buf, &mut any_missing)?
+            run_bn_options(
+                cfg,
+                tls_config,
+                bn_options_policy,
+                &mut buf,
+                &mut any_missing,
+            )?
         } else {
             Vec::new()
         };
 
-        let pm = run_pm(cfg, tls_config, polymarket_asset_ids, &mut buf, &mut any_missing)?;
+        // WS9: the Bybit instruments-info audit (spot + linear pages,
+        // only the configured categories are fetched).
+        let bybit_cov = match bybit {
+            Some((spot, linear)) if !spot.is_empty() || !linear.is_empty() => Some(run_bybit(
+                cfg,
+                tls_config,
+                spot,
+                linear,
+                &mut buf,
+                &mut any_missing,
+            )?),
+            _ => None,
+        };
+
+        let pm = run_pm(
+            cfg,
+            tls_config,
+            polymarket_asset_ids,
+            &mut buf,
+            &mut any_missing,
+        )?;
 
         Ok(Outcome {
             any_missing,
@@ -4640,6 +5118,109 @@ pub mod boot_discovery {
             hl,
             bn,
             bn_options,
+            bybit: bybit_cov,
+        })
+    }
+
+    /// WS9: the Bybit boot audit — one PAGED `instruments-info` walk
+    /// per configured category (spot / linear), membership +
+    /// liveness checked per configured symbol; tick/lot metadata
+    /// rides the rows (the WS4 parity line). 150 ms page pacing.
+    fn run_bybit(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        spot: &[String],
+        linear: &[String],
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<VenueCoverage, &'static str> {
+        let (host, port) = split_host_port(&cfg.bybit_rest_host, 443)?;
+        let mut matched = 0u32;
+        let mut universe = 0u32;
+        for (category, symbols) in [("spot", spot), ("linear", linear)] {
+            if symbols.is_empty() {
+                continue;
+            }
+            // Per-category table: spot and linear share symbol TEXT
+            // but are different instruments.
+            let mut d = ingress_bybit::discovery::BybitDiscovery::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let path = match &cursor {
+                    None => format!("/v5/market/instruments-info?category={category}&limit=1000"),
+                    Some(c) => format!(
+                        "/v5/market/instruments-info?category={category}&limit=1000&cursor={c}"
+                    ),
+                };
+                let range = get(tls, host, port, &path, buf).map_err(|e| {
+                    tracing::error!(venue = "bybit", category, error = ?e, "discovery: fetch failed");
+                    "bybit: discovery fetch failed"
+                })?;
+                d.ingest_body(&buf[range.clone()]).map_err(|e| {
+                    tracing::error!(venue = "bybit", category, error = ?e, "discovery: parse failed");
+                    "bybit: discovery parse failed"
+                })?;
+                match ingress_bybit::discovery::next_page_cursor(&buf[range]) {
+                    Some(c) => {
+                        cursor = Some(
+                            core::str::from_utf8(c)
+                                .map_err(|_| "bybit: non-utf8 page cursor")?
+                                .to_string(),
+                        );
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                    None => break,
+                }
+            }
+            universe += d.universe_trading();
+            for symbol in symbols {
+                match d.find(symbol.as_bytes()) {
+                    Some(row) if row.trading => {
+                        matched += 1;
+                        tracing::debug!(
+                            venue = "bybit",
+                            category,
+                            symbol = symbol.as_str(),
+                            tick_size_1e9 = row.tick_size_1e9,
+                            lot_step_1e9 = row.lot_step_1e9,
+                            "discovery: bybit instrument resolved"
+                        );
+                    }
+                    Some(_) => {
+                        *any_missing = true;
+                        tracing::error!(
+                            venue = "bybit",
+                            category,
+                            symbol = symbol.as_str(),
+                            reason = "not_trading",
+                            "discovery: configured symbol missing from venue universe"
+                        );
+                    }
+                    None => {
+                        *any_missing = true;
+                        tracing::error!(
+                            venue = "bybit",
+                            category,
+                            symbol = symbol.as_str(),
+                            reason = "not_found",
+                            "discovery: configured symbol missing from venue universe"
+                        );
+                    }
+                }
+            }
+        }
+        let configured = (spot.len() + linear.len()) as u32;
+        tracing::info!(
+            venue = "bybit",
+            configured,
+            matched,
+            universe,
+            "discovery: coverage"
+        );
+        Ok(VenueCoverage {
+            configured,
+            matched,
+            universe,
         })
     }
 
@@ -4772,7 +5353,10 @@ pub mod boot_discovery {
                 pm_missing_reason(&d, b"99999999990000000000"),
                 Some("no_order_book")
             );
-            assert_eq!(pm_missing_reason(&d, b"00000000000000000000"), Some("not_found"));
+            assert_eq!(
+                pm_missing_reason(&d, b"00000000000000000000"),
+                Some("not_found")
+            );
         }
     }
 }
@@ -4861,7 +5445,11 @@ mod tests {
         // Past the interval: the new record shows without any
         // run-loop exit / mirror_now.
         cap.maybe_flush(t0 + 1_000_000_000);
-        assert_eq!(reg.gauge(ids.records).get(), 2, "advances on the 1 s cadence");
+        assert_eq!(
+            reg.gauge(ids.records).get(),
+            2,
+            "advances on the 1 s cadence"
+        );
         assert_eq!(reg.gauge(ids.io_errors).get(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4899,6 +5487,7 @@ mod tests {
         let tick_lanes = {
             let mut it = rings.tick.iter().map(|r| r.clone().split().1);
             [
+                it.next().unwrap(),
                 it.next().unwrap(),
                 it.next().unwrap(),
                 it.next().unwrap(),
@@ -4945,10 +5534,8 @@ mod tests {
     /// and deduped — the shape `RulesetSidePath::new` debug-asserts.
     #[test]
     fn ai_universe_is_sorted_deduped_union_of_boot_tables() {
-        let d = okx_discovery_fixture(&[
-            ("BTC-USDT", "SPOT", true),
-            ("ETH-USD-SWAP", "SWAP", true),
-        ]);
+        let d =
+            okx_discovery_fixture(&[("BTC-USDT", "SPOT", true), ("ETH-USD-SWAP", "SWAP", true)]);
         let okx = build_okx_symbol_table("BTC-USDT,ETH-USD-SWAP", &d).unwrap();
         let deribit = build_deribit_symbol_table("BTC-PERPETUAL").unwrap();
         let hl = build_hl_coin_table("BTC,ETH").unwrap();
@@ -5002,7 +5589,10 @@ mod tests {
         assert_eq!(key[1], 0x01);
         assert_eq!(key[31], 0x1f);
         // Mixed case + surrounding whitespace are tolerated.
-        let key2 = parse_ai_hmac_key(" 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F\n").unwrap();
+        let key2 = parse_ai_hmac_key(
+            " 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F\n",
+        )
+        .unwrap();
         assert_eq!(key, key2);
     }
 
@@ -5087,7 +5677,8 @@ mod tests {
         }
         body.push_str(r#"],"msg":""}"#);
         let mut d = ingress_okx::discovery::OkxDiscovery::new();
-        d.ingest_body(body.as_bytes()).expect("fixture body must parse");
+        d.ingest_body(body.as_bytes())
+            .expect("fixture body must parse");
         d
     }
 
@@ -5096,16 +5687,11 @@ mod tests {
     /// and each row's `OkxInstType` comes from discovery.
     #[test]
     fn okx_symbol_table_allocates_flag_ordered_ids() {
-        let d = okx_discovery_fixture(&[
-            ("BTC-USDT", "SPOT", true),
-            ("ETH-USD-SWAP", "SWAP", true),
-        ]);
+        let d =
+            okx_discovery_fixture(&[("BTC-USDT", "SPOT", true), ("ETH-USD-SWAP", "SWAP", true)]);
         let t = build_okx_symbol_table("BTC-USDT, ETH-USD-SWAP", &d).unwrap();
         assert_eq!(t.len(), 2);
-        assert_eq!(
-            t.lookup(b"BTC-USDT"),
-            Some(make_symbol_id(VenueId::Okx, 1))
-        );
+        assert_eq!(t.lookup(b"BTC-USDT"), Some(make_symbol_id(VenueId::Okx, 1)));
         assert_eq!(
             t.lookup(b"ETH-USD-SWAP"),
             Some(make_symbol_id(VenueId::Okx, 2))
@@ -5131,14 +5717,11 @@ mod tests {
         let d = okx_discovery_fixture(&[
             ("BTC-USDT", "SPOT", true),
             ("DEAD-USDT", "SPOT", false), // not live
-            // NOPE-USDT is entirely absent from the fixture.
+                                          // NOPE-USDT is entirely absent from the fixture.
         ]);
         let t = build_okx_symbol_table("BTC-USDT,DEAD-USDT,NOPE-USDT", &d).unwrap();
         assert_eq!(t.len(), 1);
-        assert_eq!(
-            t.lookup(b"BTC-USDT"),
-            Some(make_symbol_id(VenueId::Okx, 1))
-        );
+        assert_eq!(t.lookup(b"BTC-USDT"), Some(make_symbol_id(VenueId::Okx, 1)));
         assert_eq!(t.lookup(b"DEAD-USDT"), None);
         assert_eq!(t.lookup(b"NOPE-USDT"), None);
     }
@@ -5289,7 +5872,9 @@ mod tests {
                 make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 100 + i as u32),
             ));
         }
-        let e = extend_deribit_table_with_options(&mut t, &big).err().unwrap();
+        let e = extend_deribit_table_with_options(&mut t, &big)
+            .err()
+            .unwrap();
         assert!(e.contains("DERIBIT_OPT_MAX"), "{e}");
     }
 
@@ -5495,14 +6080,14 @@ mod tests {
         );
     }
 
-    /// More than six comma-separated labels trips the defensive
-    /// capacity guard — there are only six known venues, so this
-    /// branch is a pure defense-in-depth backstop reached here by
-    /// listing all six plus a seventh item.
+    /// More than seven comma-separated labels trips the defensive
+    /// capacity guard — there are only seven known venues (WS9 added
+    /// bybit), so this branch is a pure defense-in-depth backstop
+    /// reached here by listing all seven plus an eighth item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
-            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,pm2"), "rejects", 64).err(),
+            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,pm2"), "rejects", 64).err(),
             Some("--raw-tap: more venue labels than known venues")
         );
     }
@@ -5632,8 +6217,16 @@ mod tests {
             0,
         );
         strategy_core::Strategy::on_ai(&mut s, &commit, &mut c);
-        strategy_core::Strategy::on_tick(&mut s, &vm_mirror_tick(VenueId::Binance, VM_BN, 490_000, 510_000), &mut c);
-        strategy_core::Strategy::on_tick(&mut s, &vm_mirror_tick(VenueId::Polymarket, VM_PM, 390_000, 410_000), &mut c);
+        strategy_core::Strategy::on_tick(
+            &mut s,
+            &vm_mirror_tick(VenueId::Binance, VM_BN, 490_000, 510_000),
+            &mut c,
+        );
+        strategy_core::Strategy::on_tick(
+            &mut s,
+            &vm_mirror_tick(VenueId::Polymarket, VM_PM, 390_000, 410_000),
+            &mut c,
+        );
 
         mirror_vm_metrics(&reg, &ids, &s, &mut last);
         assert_eq!(reg.gauge(ids.rows_active).get(), 1, "gauge is a set");

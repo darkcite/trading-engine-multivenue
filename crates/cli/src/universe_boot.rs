@@ -97,6 +97,11 @@ pub struct BootUniverse {
     /// True when `--deribit-symbols` dropped an ENABLED config
     /// options policy — the bin logs the consequence.
     pub deribit_options_dropped: bool,
+    /// WS6: true when `--deribit-symbols` dropped a non-empty
+    /// `[deribit] combos` list (section-replacement law) — the bin
+    /// logs the consequence. The dropped combos are also cleared
+    /// from `allocated.deribit_combos`.
+    pub deribit_combos_dropped: bool,
     /// True when a universe config file drove this resolution.
     pub from_config: bool,
 }
@@ -147,12 +152,20 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
     let out = match f.config_src {
         None => {
             // ---- Legacy flag-driven boot (byte-identical pre-M1) ----
-            let pm_id = f.pm_asset_id.map(str::trim).filter(|s| !s.is_empty()).ok_or(
-                "no universe config found and --polymarket-asset-id not set — \
+            let pm_id = f
+                .pm_asset_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or(
+                    "no universe config found and --polymarket-asset-id not set — \
                  boot refuses to run venue-blind (provide the flag or \
                  ~/multivenue/universe.toml)",
-            )?;
-            let bn = f.bn_symbol.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("btcusdt");
+                )?;
+            let bn = f
+                .bn_symbol
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("btcusdt");
             let u = universe::Universe {
                 pm_markets: vec![universe::PmMarket::Single(pm_id.to_string())],
                 binance_spot: vec![bn.to_string()],
@@ -173,17 +186,16 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 bn_options_dropped: false,
                 deribit_options: universe::OptionsPolicy::default(),
                 deribit_options_dropped: false,
+                deribit_combos_dropped: false,
                 from_config: false,
             }
         }
         Some(src) => {
             // ---- Config-driven boot + per-venue flag overrides ----
             if f.pm_sym_id.is_some() && f.pm_asset_id.is_none() {
-                return Err(
-                    "--polymarket-sym-id requires --polymarket-asset-id when a \
+                return Err("--polymarket-sym-id requires --polymarket-asset-id when a \
                      universe config is active"
-                        .to_string(),
-                );
+                    .to_string());
             }
             if f.bn_sym_id.is_some() && f.bn_symbol.is_none() {
                 return Err(
@@ -208,7 +220,7 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 // pair (0,0) injected by allocation.
                 u.pairs.clear();
             }
-            let allocated = universe::allocate_with_anchors(&u, pm_anchor, bn_anchor)
+            let mut allocated = universe::allocate_with_anchors(&u, pm_anchor, bn_anchor)
                 .map_err(|e| e.to_string())?;
             universe::assert_bootable(&allocated).map_err(|e| e.to_string())?;
             // M1a override law extended (M2.1/M2.2): an explicit
@@ -223,6 +235,12 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             } else {
                 (u.deribit_options.clone(), false)
             };
+            // WS6: the section-replacement law covers combos too.
+            let deribit_combos_dropped =
+                deribit_flag.is_some() && !allocated.deribit_combos.is_empty();
+            if deribit_combos_dropped {
+                allocated.deribit_combos.clear();
+            }
             let okx_flag = flag_spec(f.okx_symbols);
             let (okx_options, okx_options_dropped) = if okx_flag.is_some() {
                 (universe::OptionsPolicy::default(), u.okx_options.enabled())
@@ -232,7 +250,11 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             // M2.4: --binance-symbol replaces the whole [binance]
             // section (spot/usdm handled above via the allocated
             // universe) — the options policy drops with it.
-            let bn_flag_active = f.bn_symbol.map(str::trim).filter(|s| !s.is_empty()).is_some();
+            let bn_flag_active = f
+                .bn_symbol
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some();
             let (bn_options, bn_options_dropped) = if bn_flag_active {
                 (universe::OptionsPolicy::default(), u.bn_options.enabled())
             } else {
@@ -250,6 +272,7 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 bn_options_dropped,
                 deribit_options,
                 deribit_options_dropped,
+                deribit_combos_dropped,
                 allocated,
                 from_config: true,
             }
@@ -262,7 +285,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
 mod tests {
     use super::*;
 
-    const T1: &str = "57748138085022719760345772310040703848567377822400132842014290209986511882046";
+    const T1: &str =
+        "57748138085022719760345772310040703848567377822400132842014290209986511882046";
     const T2: &str = "1234567890123456789";
 
     fn cfg_src() -> String {
@@ -434,8 +458,7 @@ mod tests {
 
     #[test]
     fn read_universe_source_explicit_missing_is_fatal() {
-        let e = read_universe_source(Some(Path::new("/nonexistent/m1-universe.toml")))
-            .unwrap_err();
+        let e = read_universe_source(Some(Path::new("/nonexistent/m1-universe.toml"))).unwrap_err();
         assert!(e.contains("--universe"), "{e}");
     }
 
@@ -451,9 +474,7 @@ mod tests {
     }
 
     fn cfg_src_no_deribit() -> String {
-        format!(
-            "[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n"
-        )
+        format!("[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n")
     }
 
     #[test]
@@ -485,7 +506,10 @@ mod tests {
         assert!(b.deribit_options_dropped); // bin logs the consequence
         assert_eq!(b.deribit_spec.as_deref(), Some("ETH-PERPETUAL"));
         // Flag override with NO enabled config policy: nothing to drop.
-        let src2 = format!("{}[deribit]\ninstruments = [\"BTC-PERPETUAL\"]\n", cfg_src_no_deribit());
+        let src2 = format!(
+            "{}[deribit]\ninstruments = [\"BTC-PERPETUAL\"]\n",
+            cfg_src_no_deribit()
+        );
         let f2 = UniverseFlags {
             config_src: Some(&src2),
             deribit_symbols: Some("ETH-PERPETUAL"),

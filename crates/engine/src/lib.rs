@@ -69,11 +69,30 @@ pub const SIGNAL_RING_SIZE: usize = 1_024;
 /// Fill ring capacity (per lane).
 pub const FILL_RING_SIZE: usize = 1_024;
 
-/// Number of tick lanes, indexed by `VenueId as usize`:
-/// 0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
-/// 4 = Hyperliquid. (`VenueId::Ai` has no tick lane — AI commands
-/// arrive on their own ring in Phase 8f.)
-pub const NUM_TICK_LANES: usize = 5;
+/// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
+/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9). Lane indices are
+/// BOOT-WIRED and NO LONGER equal `VenueId as usize` past lane 4:
+/// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
+/// ring, 8f), so `VenueId::Bybit = 6` occupies lane 5 — see
+/// [`tick_lane_of`].
+pub const NUM_TICK_LANES: usize = 6;
+
+/// Tick-lane index for a market-data venue (WS9 — the lane↔venue
+/// identity broke when Bybit's discriminant landed past `Ai`).
+/// `None` for `Ai` (no market data). Cold-path helper for boot
+/// wiring — the drain loop walks all lanes unconditionally.
+#[inline]
+pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
+    match venue {
+        VenueId::Polymarket => Some(0),
+        VenueId::Binance => Some(1),
+        VenueId::Okx => Some(2),
+        VenueId::Deribit => Some(3),
+        VenueId::Hyperliquid => Some(4),
+        VenueId::Bybit => Some(5),
+        VenueId::Ai => None,
+    }
+}
 
 /// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
 /// Binance is market-data-only, so it has no fill lane.
@@ -100,7 +119,9 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Okx => Some(1),
         VenueId::Deribit => Some(2),
         VenueId::Hyperliquid => Some(3),
-        VenueId::Binance | VenueId::Ai => None,
+        // WS9: Bybit is market-data-only in Stage 2 (order
+        // submission is Stage-3, gaps-doc §7) — no fill lane yet.
+        VenueId::Binance | VenueId::Ai | VenueId::Bybit => None,
     }
 }
 
@@ -728,8 +749,7 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
         // Strategy stamps `order.ts_ns` from `ctx.now_ns()` so the
         // gap here equals the time spent inside the strategy
         // callback. Atomic record — never blocks.
-        self.decide_lat
-            .record(now_ns().saturating_sub(order.ts_ns));
+        self.decide_lat.record(now_ns().saturating_sub(order.ts_ns));
         match self.disp.submit(&order) {
             Ok(()) => {
                 // M4.1: capture-what-was-accepted — stage the intent
@@ -827,7 +847,8 @@ mod tests {
         let (p2, c2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
         let (p3, c3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
         let (p4, c4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4], [c0, c1, c2, c3, c4])
+        let (p5, c5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3, p4, p5], [c0, c1, c2, c3, c4, c5])
     }
 
     fn split_fill_lanes() -> (
@@ -918,7 +939,9 @@ mod tests {
         let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..10u32 {
-            tp[0].try_push(mk_tick(VenueId::Polymarket, 1, i + 1)).unwrap();
+            tp[0]
+                .try_push(mk_tick(VenueId::Polymarket, 1, i + 1))
+                .unwrap();
             tp[2].try_push(mk_tick(VenueId::Okx, 2, i + 1)).unwrap();
         }
         eng.tick(3);
@@ -932,14 +955,7 @@ mod tests {
     fn engine_drains_fill_lanes() {
         let (mut eng, _tp, _sp, mut fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
-        let f = Fill::new(
-            10,
-            7,
-            Side::Bid,
-            Price::from_raw(1),
-            Qty::from_raw(1),
-            99,
-        );
+        let f = Fill::new(10, 7, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
         fp[0].try_push(f).unwrap(); // Polymarket fill lane
         fp[3].try_push(f).unwrap(); // Hyperliquid fill lane
         eng.tick(16);
@@ -996,7 +1012,10 @@ mod tests {
         );
         eng.start().unwrap();
         eng.tick(16);
-        assert_eq!(eng.fills_dispatched, 1, "dispatcher fill must reach on_fill");
+        assert_eq!(
+            eng.fills_dispatched, 1,
+            "dispatcher fill must reach on_fill"
+        );
         assert_eq!(eng.strategy().fills, 1);
     }
 
@@ -1057,10 +1076,7 @@ mod tests {
 
     #[test]
     fn fills_capture_stages_lane_and_dispatcher_fills() {
-        let dir = std::env::temp_dir().join(format!(
-            "stage2_engine_fills_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("stage2_engine_fills_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(ENGINE_FILLS_FILE);
@@ -1166,10 +1182,8 @@ mod tests {
 
     #[test]
     fn orders_capture_logs_accepted_intents() {
-        let dir = std::env::temp_dir().join(format!(
-            "engine_orders_capture_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("engine_orders_capture_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(ENGINE_ORDERS_FILE);
@@ -1232,10 +1246,8 @@ mod tests {
 
     #[test]
     fn orders_capture_skips_refused_submits() {
-        let dir = std::env::temp_dir().join(format!(
-            "engine_orders_refused_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("engine_orders_refused_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(ENGINE_ORDERS_FILE);
@@ -1263,7 +1275,11 @@ mod tests {
             .try_push(mk_tick(VenueId::Polymarket, 1, 1))
             .unwrap();
         eng.tick(16);
-        assert_eq!(eng.order_capture_records(), 0, "refusal is a counter, not a record");
+        assert_eq!(
+            eng.order_capture_records(),
+            0,
+            "refusal is a counter, not a record"
+        );
         eng.stop();
         let r = core_io::PmlrReader::<Order>::open(&path).unwrap();
         assert_eq!(r.len(), 0, "header-only file after refused submits");
@@ -1359,13 +1375,15 @@ mod tests {
         }
         eng.tick(16);
         assert_eq!(
-            eng.ai_dispatched,
-            AI_DRAIN_BUDGET as u64,
+            eng.ai_dispatched, AI_DRAIN_BUDGET as u64,
             "one iteration must drain at most AI_DRAIN_BUDGET commands"
         );
         eng.tick(16);
         eng.tick(16);
-        assert_eq!(eng.ai_dispatched, n as u64, "backlog drains across iterations");
+        assert_eq!(
+            eng.ai_dispatched, n as u64,
+            "backlog drains across iterations"
+        );
     }
 
     #[test]
@@ -1380,7 +1398,10 @@ mod tests {
         ap.try_push(bad).unwrap();
         ap.try_push(mk_heartbeat(now_ns(), 2)).unwrap();
         eng.tick(16);
-        assert_eq!(eng.ai_drain_malformed, 1, "malformed slot counted, not dispatched");
+        assert_eq!(
+            eng.ai_drain_malformed, 1,
+            "malformed slot counted, not dispatched"
+        );
         assert_eq!(eng.ai_dispatched, 1);
         assert_eq!(eng.strategy().ai_cmds, 1);
         assert_eq!(
@@ -1411,7 +1432,11 @@ mod tests {
         assert!(tblp.try_push(mk_table(7)).is_ok());
         ap.try_push(mk_heartbeat(now_ns(), 1)).unwrap();
         eng.tick(16);
-        assert_eq!(eng.strategy().tables, 1, "table delivered in the same iteration");
+        assert_eq!(
+            eng.strategy().tables,
+            1,
+            "table delivered in the same iteration"
+        );
         assert_eq!(eng.strategy().ai_cmds, 1);
         assert_eq!(
             eng.strategy().tables_at_first_ai,
@@ -1435,8 +1460,16 @@ mod tests {
             "cap-2 ring must reject the third undrained stage (§5)"
         );
         eng.tick(16);
-        assert_eq!(eng.strategy().tables, 2, "both slots delivered in one iteration");
-        assert_eq!(eng.strategy().last_table_epoch, 2, "in-ring order: newest last");
+        assert_eq!(
+            eng.strategy().tables,
+            2,
+            "both slots delivered in one iteration"
+        );
+        assert_eq!(
+            eng.strategy().last_table_epoch,
+            2,
+            "in-ring order: newest last"
+        );
         // Ring drained ⇒ the lane accepts stages again.
         assert!(tblp.try_push(mk_table(4)).is_ok());
         eng.tick(16);

@@ -24,11 +24,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use cli::{
-    engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
-    engine_loop_rule_tree_full, engine_loop_set_full, install_sigint_handler, join_reverse,
-    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
-    Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings,
-    StrategyPair, WssEndpoint, SHUTDOWN,
+    engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full, engine_loop_rule_tree_full,
+    engine_loop_set_full, install_sigint_handler, join_reverse, spawn_binance, spawn_deribit,
+    spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, Consumers, EngineConfig,
+    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint,
+    SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -511,17 +511,12 @@ fn boot_live_dispatcher(
     let mut key = [0u8; 32];
     key.copy_from_slice(secrets.signing_key());
     let port = 443u16;
-    LiveDispatcher::connect(
-        &cfg.polymarket_clob_host,
-        "/order",
-        port,
-        key,
-        tls_config,
+    LiveDispatcher::connect(&cfg.polymarket_clob_host, "/order", port, key, tls_config).map_err(
+        |e| {
+            error!(error = ?e, "LiveDispatcher::connect failed");
+            "LiveDispatcher::connect failed (DNS / cert / key)"
+        },
     )
-    .map_err(|e| {
-        error!(error = ?e, "LiveDispatcher::connect failed");
-        "LiveDispatcher::connect failed (DNS / cert / key)"
-    })
 }
 
 /// Boot a [`LiveDispatcher`] wrapped in a [`QueuedDispatcher`].
@@ -536,7 +531,13 @@ fn boot_live_dispatcher(
 fn boot_queued_live(
     cfg: &Config,
     tls_config: std::sync::Arc<rustls::ClientConfig>,
-) -> Result<(clob_dispatcher::QueuedDispatcher, std::thread::JoinHandle<()>), &'static str> {
+) -> Result<
+    (
+        clob_dispatcher::QueuedDispatcher,
+        std::thread::JoinHandle<()>,
+    ),
+    &'static str,
+> {
     let live = boot_live_dispatcher(cfg, tls_config)?;
     let (queued, worker) = clob_dispatcher::QueuedDispatcher::new(live);
     let stop_ref: &'static AtomicBool = &SHUTDOWN;
@@ -609,6 +610,7 @@ fn run(args: RunArgs) -> ExitCode {
         pm_tokens = boot.allocated.pm_tokens.len(),
         bn_spot = boot.allocated.bn_spot.len(),
         bn_usdm = boot.allocated.bn_usdm.len(),
+        bn_dated = boot.allocated.bn_dated.len(),
         pairs = boot.allocated.pairs.len(),
         "universe resolved"
     );
@@ -665,8 +667,14 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .map(|i| i.name.clone())
         .collect();
-    let bn_discovery_arg: Option<(&[String], &[String])> = if boot.from_config {
-        Some((&bn_spot_names, &bn_usdm_names))
+    let bn_dated_names: Vec<String> = boot
+        .allocated
+        .bn_dated
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_discovery_arg: Option<(&[String], &[String], &[String])> = if boot.from_config {
+        Some((&bn_spot_names, &bn_usdm_names, &bn_dated_names))
     } else {
         None
     };
@@ -691,6 +699,27 @@ fn run(args: RunArgs) -> ExitCode {
              policy is DROPPED for this boot (flag replaces the venue section)"
         );
     }
+    // WS9: the Bybit audit runs whenever the section is configured
+    // (both boot classes come from the universe file only — no
+    // legacy flag lane for the sixth venue).
+    let bybit_spot_names: Vec<String> = boot
+        .allocated
+        .bybit_spot
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bybit_linear_names: Vec<String> = boot
+        .allocated
+        .bybit_linear
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bybit_discovery_arg: Option<(&[String], &[String])> =
+        if !bybit_spot_names.is_empty() || !bybit_linear_names.is_empty() {
+            Some((&bybit_spot_names, &bybit_linear_names))
+        } else {
+            None
+        };
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
@@ -701,6 +730,7 @@ fn run(args: RunArgs) -> ExitCode {
         boot.hl_spec.as_deref(),
         bn_discovery_arg,
         &boot.bn_options,
+        bybit_discovery_arg,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -814,15 +844,24 @@ fn run(args: RunArgs) -> ExitCode {
     // path stays a cli const. Symbol table building is unaffected by
     // discovery (unlike OKX it needs no per-instrument `instType`).
     const DERIBIT_WS_PATH: &str = "/ws/api/v2";
-    // M2.1: the venue boots when EITHER static instruments are
-    // configured OR the discovered options chain is non-empty (an
-    // options-only [deribit] section is a valid universe).
+    // M2.1/WS6: the venue boots when static instruments are
+    // configured OR the discovered options chain is non-empty OR
+    // combos are configured (each alone is a valid universe).
     let deribit_spec_trim = boot
         .deribit_spec
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let deribit_boot = if deribit_spec_trim.is_some() || !discovery.deribit_options.is_empty() {
+    if boot.deribit_combos_dropped {
+        warn!(
+            "--deribit-symbols override active — the universe config's [deribit] combos \
+             list is DROPPED for this boot (flag replaces the venue section)"
+        );
+    }
+    let deribit_boot = if deribit_spec_trim.is_some()
+        || !discovery.deribit_options.is_empty()
+        || !boot.allocated.deribit_combos.is_empty()
+    {
         let mut symbols = match deribit_spec_trim {
             Some(spec) => match cli::build_deribit_symbol_table(spec) {
                 Ok(t) => t,
@@ -834,7 +873,8 @@ fn run(args: RunArgs) -> ExitCode {
             None => ingress_deribit::DeribitSymbolTable::new(),
         };
         // Discovered capped chain appends AFTER the static block
-        // (quote-only rows; ordinals already allocated in discovery).
+        // (quote + ticker rows; ordinals already allocated in
+        // discovery).
         if let Err(reason) =
             cli::extend_deribit_table_with_options(&mut symbols, &discovery.deribit_options)
         {
@@ -845,16 +885,38 @@ fn run(args: RunArgs) -> ExitCode {
             );
             return ExitCode::from(1);
         }
-        let (deribit_host, deribit_port) = match cli::split_host_port(&cfg.deribit_ws_host, 443)
-        {
+        // WS6: configured combos append LAST (quote-only rows; own
+        // ordinal block from allocation). No REST validation — the
+        // subscribe echo is the validator (a misspelled combo never
+        // echoes ⇒ boot fail-fast at first verification).
+        let combo_pairs: Vec<(String, core_types::SymbolId)> = boot
+            .allocated
+            .deribit_combos
+            .iter()
+            .map(|i| (i.name.clone(), i.sym))
+            .collect();
+        if let Err(reason) = cli::extend_deribit_table_with_combos(&mut symbols, &combo_pairs) {
+            error!(
+                reason,
+                combos = combo_pairs.len(),
+                "deribit combos table build failed"
+            );
+            return ExitCode::from(1);
+        }
+        if !combo_pairs.is_empty() {
+            info!(
+                combos = combo_pairs.len(),
+                "deribit: option combos wired (quote-only BBO capture; WS6)"
+            );
+        }
+        let (deribit_host, deribit_port) = match cli::split_host_port(&cfg.deribit_ws_host, 443) {
             Ok(v) => v,
             Err(reason) => {
                 error!(reason, host = %cfg.deribit_ws_host, "bad deribit_ws_host");
                 return ExitCode::from(1);
             }
         };
-        let deribit_ep = match WssEndpoint::resolve(deribit_host, deribit_port, DERIBIT_WS_PATH)
-        {
+        let deribit_ep = match WssEndpoint::resolve(deribit_host, deribit_port, DERIBIT_WS_PATH) {
             Ok(e) => e,
             Err(e) => {
                 error!(error = ?e, "deribit DNS failed");
@@ -913,6 +975,7 @@ fn run(args: RunArgs) -> ExitCode {
         .bn_spot
         .iter()
         .chain(boot.allocated.bn_usdm.iter())
+        .chain(boot.allocated.bn_dated.iter())
         .map(|i| i.sym)
         .collect();
     let ai_universe = cli::build_ai_universe(
@@ -922,7 +985,10 @@ fn run(args: RunArgs) -> ExitCode {
         deribit_boot.as_ref().map(|(t, _)| t),
         hl_boot.as_ref().map(|(t, _)| t),
     );
-    info!(symbols = ai_universe.len(), "ai: ruleset boot-universe snapshot built");
+    info!(
+        symbols = ai_universe.len(),
+        "ai: ruleset boot-universe snapshot built"
+    );
 
     // -- Allocate rings + split into producer/consumer halves --
     //
@@ -942,6 +1008,9 @@ fn run(args: RunArgs) -> ExitCode {
     let (okx_prod, okx_lane_cons) = rings.tick[2].clone().split();
     let (deribit_prod, deribit_lane_cons) = rings.tick[3].clone().split();
     let (hl_prod, hl_lane_cons) = rings.tick[4].clone().split();
+    // WS9: lane 5 = Bybit (VenueId 6 — lane≠venue past Ai, see
+    // engine::tick_lane_of).
+    let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let fill_lane_cons = {
         let (_f0p, f0) = rings.fill[0].clone().split();
@@ -1007,7 +1076,8 @@ fn run(args: RunArgs) -> ExitCode {
     // §6.1 boot-discovery coverage gauges — static boot-time counts,
     // set once (not mirrored on a cadence like the §6.4 counters).
     if let (Some(reg), Some(ids)) = (obs.metrics.as_ref(), obs.counter_ids.as_ref()) {
-        reg.gauge(ids.coverage_pm).set(discovery.pm.configured as i64);
+        reg.gauge(ids.coverage_pm)
+            .set(discovery.pm.configured as i64);
         reg.gauge(ids.coverage_okx)
             .set(discovery.okx.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_deribit)
@@ -1016,6 +1086,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.hl.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_binance)
             .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_bybit)
+            .set(discovery.bybit.map(|c| c.configured).unwrap_or(0) as i64);
         // M2.1/M2.2/M2.4: capped options chain sizes this boot
         // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
@@ -1084,25 +1156,45 @@ fn run(args: RunArgs) -> ExitCode {
     // lane whenever the universe wires more than one BN instrument —
     // or (M2.4) whenever the eapi options chain is on: the eapi slot
     // is a MultiConn slot, keeping the venue single-writer.
-    let bn_total = boot.allocated.bn_spot.len() + boot.allocated.bn_usdm.len();
+    // WS5: dated futures ride the fapi host beside the perps (their
+    // own ordinal block); every USDS-M instrument (perp + dated) also
+    // gets a `@markPrice` slot — the capture-only mark/index/funding
+    // lane (dated frames carry no funding; the parser's has_funding
+    // gate handles it).
+    let bn_usdm_all = boot.allocated.bn_usdm.len() + boot.allocated.bn_dated.len();
+    let bn_total = boot.allocated.bn_spot.len() + bn_usdm_all;
     let bn_eapi_on = !discovery.bn_options.is_empty();
-    let bn_handle = if bn_total > 1 || bn_eapi_on {
+    let bn_handle = if bn_total > 1 || bn_usdm_all > 0 || bn_eapi_on {
         let mut specs: Vec<cli::BinanceConnSpec> =
-            Vec::with_capacity(bn_total + usize::from(bn_eapi_on));
+            Vec::with_capacity(bn_total + bn_usdm_all + usize::from(bn_eapi_on));
         for inst in &boot.allocated.bn_spot {
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_ws_host.clone(),
                 path: format!("/ws/{}@bookTicker", inst.name),
                 sym: inst.sym,
                 eapi: None,
+                mark_price: false,
             });
         }
-        for inst in &boot.allocated.bn_usdm {
+        for inst in boot
+            .allocated
+            .bn_usdm
+            .iter()
+            .chain(boot.allocated.bn_dated.iter())
+        {
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_fut_ws_host.clone(),
                 path: format!("/ws/{}@bookTicker", inst.name),
                 sym: inst.sym,
                 eapi: None,
+                mark_price: false,
+            });
+            specs.push(cli::BinanceConnSpec {
+                host: cfg.binance_fut_ws_host.clone(),
+                path: format!("/ws/{}@markPrice", inst.name),
+                sym: inst.sym,
+                eapi: None,
+                mark_price: true,
             });
         }
         if bn_eapi_on {
@@ -1141,6 +1233,7 @@ fn run(args: RunArgs) -> ExitCode {
                 path: format!("/eoptions/stream?streams={streams}"),
                 sym: 0,
                 eapi: Some((table, boot.bn_options.underlyings.clone())),
+                mark_price: false,
             });
         }
         if bn_eapi_on {
@@ -1157,6 +1250,8 @@ fn run(args: RunArgs) -> ExitCode {
             conns = specs.len(),
             spot = boot.allocated.bn_spot.len(),
             usdm = boot.allocated.bn_usdm.len(),
+            dated = boot.allocated.bn_dated.len(),
+            mark_price = bn_usdm_all,
             eapi_options = discovery.bn_options.len(),
             "binance: M1 multi-connection lane"
         );
@@ -1249,9 +1344,21 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Deribit rides core 6 per the §9 core map.
     if let Some((deribit_symbols, deribit_ep)) = deribit_boot {
+        // WS6: DVOL index subscriptions derive from the configured
+        // options underlyings (BTC → btc_usd) — no extra config key.
+        // Outside the subscribe-verification mask: an index the venue
+        // does not serve simply never echoes (missing capture series,
+        // never a session verdict).
+        let dvol_indices: Vec<String> = boot
+            .deribit_options
+            .underlyings
+            .iter()
+            .map(|u| format!("{}_usd", u.to_ascii_lowercase()))
+            .collect();
         info!(
             instruments = deribit_symbols.len(),
             depth = boot.deribit_depth,
+            dvol = dvol_indices.len(),
             "deribit: starting ingress thread"
         );
         let deribit_handle = match spawn_deribit(
@@ -1259,6 +1366,7 @@ fn run(args: RunArgs) -> ExitCode {
             tls_config.clone(),
             deribit_symbols,
             boot.deribit_depth,
+            dvol_indices,
             deribit_prod,
             statuses.deribit.clone(),
             6,
@@ -1284,7 +1392,10 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Hyperliquid rides core 7 per the §9 core map.
     if let Some((hl_coins, hl_ep)) = hl_boot {
-        info!(coins = hl_coins.len(), "hyperliquid: starting ingress thread");
+        info!(
+            coins = hl_coins.len(),
+            "hyperliquid: starting ingress thread"
+        );
         let hl_handle = match spawn_hyperliquid(
             hl_ep,
             tls_config.clone(),
@@ -1310,6 +1421,72 @@ fn run(args: RunArgs) -> ExitCode {
         // Drop the producer side so the lane stays a permanently-
         // empty ring (the unspawned-venue shape, §3.3).
         drop(hl_prod);
+    }
+
+    // WS9: Bybit — spot + linear connection slots on ONE thread
+    // (core 8 per the §9 core-map extension). Config-file only.
+    if !boot.allocated.bybit_spot.is_empty() || !boot.allocated.bybit_linear.is_empty() {
+        let mut specs: Vec<cli::BybitConnSpec> = Vec::new();
+        if !boot.allocated.bybit_spot.is_empty() {
+            let mut table = ingress_bybit::BybitSymbolTable::new();
+            for inst in &boot.allocated.bybit_spot {
+                if let Err(e) = table.insert(inst.name.as_bytes(), inst.sym) {
+                    error!(?e, symbol = %inst.name, "bybit: spot table build failed");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            }
+            specs.push(cli::BybitConnSpec {
+                path: "/v5/public/spot".to_string(),
+                table,
+                want_tickers: false,
+            });
+        }
+        if !boot.allocated.bybit_linear.is_empty() {
+            let mut table = ingress_bybit::BybitSymbolTable::new();
+            for inst in &boot.allocated.bybit_linear {
+                if let Err(e) = table.insert(inst.name.as_bytes(), inst.sym) {
+                    error!(?e, symbol = %inst.name, "bybit: linear table build failed");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            }
+            specs.push(cli::BybitConnSpec {
+                path: "/v5/public/linear".to_string(),
+                table,
+                want_tickers: true,
+            });
+        }
+        info!(
+            spot = boot.allocated.bybit_spot.len(),
+            linear = boot.allocated.bybit_linear.len(),
+            conns = specs.len(),
+            "bybit: starting ingress thread"
+        );
+        let bybit_handle = match cli::spawn_bybit(
+            cfg.bybit_ws_host.clone(),
+            specs,
+            tls_config.clone(),
+            bybit_prod,
+            statuses.bybit.clone(),
+            8,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.bybit,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bybit)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "bybit: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
+        handles.push(bybit_handle);
+    } else {
+        // Drop the producer side so the lane stays a permanently-
+        // empty ring (the unspawned-venue shape, §3.3).
+        drop(bybit_prod);
     }
 
     if let Some(polygon_path) = args.polygon_path {
@@ -1380,7 +1557,10 @@ fn run(args: RunArgs) -> ExitCode {
             }
             Err(reason) => {
                 // `reason` is a static description; no key material.
-                error!(reason, "AI_INGRESS_HMAC_KEY present but invalid — refusing to boot");
+                error!(
+                    reason,
+                    "AI_INGRESS_HMAC_KEY present but invalid — refusing to boot"
+                );
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
@@ -1425,6 +1605,7 @@ fn run(args: RunArgs) -> ExitCode {
             okx_lane_cons,
             deribit_lane_cons,
             hl_lane_cons,
+            bybit_lane_cons,
         ],
         rpc_signal: rpc_cons,
         fill_lanes: fill_lane_cons,
@@ -1516,7 +1697,12 @@ fn run(args: RunArgs) -> ExitCode {
         },
         ("latency-arb", false) => {
             info!("running latency-arb PAPER — no orders will be submitted");
-            engine_loop_full(cons, engine_cfg, clob_dispatcher::PaperDispatcher::new(), obs)
+            engine_loop_full(
+                cons,
+                engine_cfg,
+                clob_dispatcher::PaperDispatcher::new(),
+                obs,
+            )
         }
         ("cross-arb", _live) => {
             let spec = match args.groups.as_deref() {

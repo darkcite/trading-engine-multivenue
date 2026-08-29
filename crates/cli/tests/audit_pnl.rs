@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrWriter, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE,
-    SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE, SYMBOL_ID_NONE,
 };
 
 use cli::audit_pnl::{run, AuditPnlConfig};
@@ -35,8 +34,12 @@ fn run_dir(root: &Path, epoch: u64) -> PathBuf {
 }
 
 fn write_ticks(dir: &Path, label: &str, epoch: u64, ticks: &[Tick]) {
-    let mut w = PmlrWriter::open(dir.join(format!("{label}-ticks.pmlr")), SlotKind::Tick, epoch)
-        .unwrap();
+    let mut w = PmlrWriter::open(
+        dir.join(format!("{label}-ticks.pmlr")),
+        SlotKind::Tick,
+        epoch,
+    )
+    .unwrap();
     for t in ticks {
         w.append(t).unwrap();
     }
@@ -44,8 +47,7 @@ fn write_ticks(dir: &Path, label: &str, epoch: u64, ticks: &[Tick]) {
 }
 
 fn write_orders(dir: &Path, epoch: u64, orders: &[Order]) {
-    let mut w =
-        PmlrWriter::open(dir.join("engine-orders.pmlr"), SlotKind::Order, epoch).unwrap();
+    let mut w = PmlrWriter::open(dir.join("engine-orders.pmlr"), SlotKind::Order, epoch).unwrap();
     for o in orders {
         w.append(o).unwrap();
     }
@@ -287,10 +289,7 @@ fn descriptor_keying_survives_sym_reshuffle_across_runs() {
     // 0.165 ⇒ −$0.175. Net floor: 1.0 − 0.175 = 0.825.
     assert!(json.contains("\"orders\":2,\"fills\":2,\"trades\":2"));
     assert!(json.contains("\"net_usd\":\"0.825\""), "json: {json}");
-    let pmtok = lines
-        .iter()
-        .filter(|l| l.contains("PMTOK: fills="))
-        .count();
+    let pmtok = lines.iter().filter(|l| l.contains("PMTOK: fills=")).count();
     assert_eq!(pmtok, 1, "ONE continuous PMTOK row across the reshuffle");
     assert!(lines.iter().any(|l| l.contains("OTHER: fills=1")));
     let _ = std::fs::remove_dir_all(&root);

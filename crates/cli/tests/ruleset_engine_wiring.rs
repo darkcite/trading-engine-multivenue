@@ -35,9 +35,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use strategy_set::{StrategySet, BIT_VM};
 
-// The lane arrays below are written out for the Phase 8a geometry;
-// break the build loudly if that drifts.
-const _: () = assert!(NUM_TICK_LANES == 5 && NUM_FILL_LANES == 4);
+// The lane arrays below are written out for the lane geometry (six
+// tick lanes since WS9 added Bybit); break the build loudly if that
+// drifts.
+const _: () = assert!(NUM_TICK_LANES == 6 && NUM_FILL_LANES == 4);
 
 /// Raw Polymarket SymbolId (venue byte 0) — the boot-universe shape
 /// `build_ai_universe` produces for `--polymarket-sym-id`.
@@ -53,7 +54,7 @@ fn ruleset_json(name: &str, level: &str) -> String {
 
 /// Operator install step: write the artifact under its
 /// `<hash128-hex>.json` name; return the hash128 the frames carry.
-fn install(dir: &PathBuf, bytes: &[u8]) -> [u8; 16] {
+fn install(dir: &std::path::Path, bytes: &[u8]) -> [u8; 16] {
     let digest = core_crypto::sha256(bytes);
     let mut h = [0u8; 16];
     h.copy_from_slice(&digest[..16]);
@@ -127,8 +128,7 @@ fn harness(tag: &str) -> Harness {
     std::fs::create_dir_all(&dir).expect("create ruleset dir");
 
     let status = Arc::new(AiIngressStatus::new());
-    let (table_prod, table_cons) =
-        Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+    let (table_prod, table_cons) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
     let universe: Arc<[u32]> = Arc::from(vec![PM_SYM]);
     let side = RulesetSidePath::new(dir.clone(), Arc::clone(&status), universe, table_prod);
 
@@ -137,6 +137,7 @@ fn harness(tag: &str) -> Harness {
     let (_t2p, t2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -147,7 +148,7 @@ fn harness(tag: &str) -> Harness {
     let mut eng = Engine::new(
         StrategySet::new(BIT_VM),
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4],
+        [t0, t1, t2, t3, t4, t5],
         sc,
         [f0, f1, f2, f3],
         ai_cons,
@@ -206,7 +207,9 @@ fn staged_table_commits_and_fires_through_engine_loop() {
     assert_eq!(vm.staged_hash128(), None, "flip consumes the staged buffer");
 
     // Committed row fires: bid row, best ask 0.49 ≤ level 0.5.
-    h.pm_prod.try_push(pm_tick(1, 480_000, 490_000)).expect("tick push");
+    h.pm_prod
+        .try_push(pm_tick(1, 480_000, 490_000))
+        .expect("tick push");
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.fires, 1, "committed row fired through the engine loop");
@@ -234,7 +237,9 @@ fn commit_without_staged_table_drops_through_engine_loop() {
     assert_eq!(vm.commits_applied, 0);
     assert_eq!(vm.rows_active(), 0, "still inert (§7.3)");
 
-    h.pm_prod.try_push(pm_tick(1, 480_000, 490_000)).expect("tick push");
+    h.pm_prod
+        .try_push(pm_tick(1, 480_000, 490_000))
+        .expect("tick push");
     h.eng.tick(16);
     assert_eq!(h.eng.strategy().vm().fires, 0);
     assert_eq!(h.eng.dispatcher().stats().accepted, 0);
@@ -250,7 +255,11 @@ fn mismatched_commit_drops_and_staged_survives_through_engine_loop() {
 
     stage(&mut h, 1, hash_a);
     h.eng.tick(16);
-    assert_eq!(h.eng.strategy().vm().staged_hash128(), Some(hash_a), "pop staged");
+    assert_eq!(
+        h.eng.strategy().vm().staged_hash128(),
+        Some(hash_a),
+        "pop staged"
+    );
 
     h.ai_prod
         .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 2, [0x5A; 16]))
@@ -284,12 +293,20 @@ fn restage_supersedes_and_newest_table_runs_through_engine_loop() {
     stage(&mut h, 1, hash_a);
     stage(&mut h, 2, hash_b);
     assert_eq!(h.status.ruleset_staged(), 2);
-    assert_eq!(h.side.staged(), Some(hash_b), "side path: restage supersedes");
+    assert_eq!(
+        h.side.staged(),
+        Some(hash_b),
+        "side path: restage supersedes"
+    );
 
     // ONE iteration drains both slots in order; vm keeps the newest.
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
-    assert_eq!(vm.staged_hash128(), Some(hash_b), "engine-side supersede mirror");
+    assert_eq!(
+        vm.staged_hash128(),
+        Some(hash_b),
+        "engine-side supersede mirror"
+    );
 
     h.ai_prod
         .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a))
@@ -306,12 +323,16 @@ fn restage_supersedes_and_newest_table_runs_through_engine_loop() {
 
     // Ask 0.45: at/below A's level (0.5) but ABOVE B's (0.4) — if A
     // were live this would fire; B stays quiet.
-    h.pm_prod.try_push(pm_tick(1, 440_000, 450_000)).expect("tick push");
+    h.pm_prod
+        .try_push(pm_tick(1, 440_000, 450_000))
+        .expect("tick push");
     h.eng.tick(16);
     assert_eq!(h.eng.strategy().vm().fires, 0, "A's threshold must be gone");
 
     // Ask 0.39 ≤ 0.4: B fires.
-    h.pm_prod.try_push(pm_tick(2, 380_000, 390_000)).expect("tick push");
+    h.pm_prod
+        .try_push(pm_tick(2, 380_000, 390_000))
+        .expect("tick push");
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.fires, 1, "B's committed row fires");

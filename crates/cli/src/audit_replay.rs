@@ -36,8 +36,8 @@ use core_types::{AiCmd, AiCmdKind, ChannelEvent, ChannelId, Signal, Tick};
 use ingress_ai::AI_CMDS_FILE;
 
 /// Venue labels in capture-file order (`<label>-ticks.pmlr`, …).
-/// Mirrors the cli spawn labels exactly.
-const VENUE_LABELS: [&str; 6] = ["pm", "bn", "okx", "rpc", "deribit", "hl"];
+/// Mirrors the cli spawn labels exactly (`bybit` appended at WS9).
+const VENUE_LABELS: [&str; 7] = ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit"];
 
 /// Inter-arrival histogram bucket upper bounds (ns, exclusive). The
 /// last bucket is open-ended. Bounds chosen so every §6.2 cadence band
@@ -187,7 +187,7 @@ impl SymStat {
     }
 }
 
-fn stat_for<'a>(stats: &'a mut Vec<SymStat>, sym: u32) -> &'a mut SymStat {
+fn stat_for(stats: &mut Vec<SymStat>, sym: u32) -> &mut SymStat {
     if let Some(i) = stats.iter().position(|s| s.sym == sym) {
         return &mut stats[i];
     }
@@ -308,7 +308,7 @@ fn audit_ticks(venue: &str, r: &PmlrReader<Tick>, out: &mut VenueAudit) {
 }
 
 /// Audit one venue's M2.3 opt-summary log: per-sym count/rate/cadence
-/// + IV sanity range + venue-optional-field flags. Offline path —
+/// plus IV sanity range and venue-optional-field flags. Offline path —
 /// allocation permitted (module doctrine).
 fn audit_opt_summaries(r: &PmlrReader<core_types::OptSummary>, out: &mut VenueAudit) {
     for o in r.records() {
@@ -422,7 +422,7 @@ fn preview(payload: &[u8]) -> String {
         }
     }
     if payload.len() > take {
-        s.push_str("…");
+        s.push('…');
     }
     s
 }
@@ -727,7 +727,7 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
                     format!("{} is not an opt-summary log", opt_path.display()),
                 ));
             }
-            if r.len() > 0 {
+            if !r.is_empty() {
                 audit_opt_summaries(&r, &mut a);
                 a.files_seen += 1;
             }
@@ -781,7 +781,10 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
     ];
     if !audits.is_empty() {
         report.push_str("\n== venue x channel coverage (message counts) ==\n");
-        report.push_str(&format!("  {:<8} {:>10} {:>10}", "venue", "ticks", "signals"));
+        report.push_str(&format!(
+            "  {:<8} {:>10} {:>10}",
+            "venue", "ticks", "signals"
+        ));
         for ch in MATRIX_CHANNELS {
             report.push_str(&format!(" {:>12}", ch.as_str()));
         }
@@ -944,28 +947,27 @@ fn render_pairing(report: &mut String, audits: &[(&str, VenueAudit)]) {
                         // Forward gap: expected..=observed-1 missing?
                         let (e, o1) = (*v0 as u64, (*v1 - 1) as u64);
                         let hit = st.is_some_and(|s| {
-                            s.hole_ranges.iter().any(|(from, to)| *from <= e && o1 <= *to)
+                            s.hole_ranges
+                                .iter()
+                                .any(|(from, to)| *from <= e && o1 <= *to)
                         });
                         if hit {
                             corroborated += 1;
                         } else {
                             refuted += 1;
                             report.push_str(&format!(
-                                "  {label} REFUTED-BY-CAPTURE: trade_gap sym={:#010x} expected={v0} observed={v1} — capture stream has these ids (monitor artifact)\n",
-                                sym
+                                "  {label} REFUTED-BY-CAPTURE: trade_gap sym={sym:#010x} expected={v0} observed={v1} — capture stream has these ids (monitor artifact)\n"
                             ));
                         }
                     } else {
                         // Regression/duplicate.
-                        let hit =
-                            st.is_some_and(|s| s.regr_at.iter().any(|r| *r == *v1 as u64));
+                        let hit = st.is_some_and(|s| s.regr_at.contains(&(*v1 as u64)));
                         if hit {
                             corroborated += 1;
                         } else {
                             unmatched_regr += 1;
                             report.push_str(&format!(
-                                "  {label} UNMATCHED: trade_gap regression sym={:#010x} expected={v0} observed={v1} — no derived regression at that seq\n",
-                                sym
+                                "  {label} UNMATCHED: trade_gap regression sym={sym:#010x} expected={v0} observed={v1} — no derived regression at that seq\n"
                             ));
                         }
                     }
@@ -1005,9 +1007,7 @@ fn render_pairing(report: &mut String, audits: &[(&str, VenueAudit)]) {
 mod tests {
     use super::*;
     use core_io::{PmlrCapture, TapCfg, TapMode};
-    use core_types::{
-        Capture, LatencyClass, Price, Qty, SignalSource, VenueId,
-    };
+    use core_types::{Capture, LatencyClass, Price, Qty, SignalSource, VenueId};
 
     fn temp_run_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("audit_replay_{tag}_{}", std::process::id()));
@@ -1283,9 +1283,7 @@ mod tests {
             "{report}"
         );
         assert!(
-            report.contains(
-                "REFUTED-BY-CAPTURE: trade_gap sym=0x03000001 expected=51 observed=52"
-            ),
+            report.contains("REFUTED-BY-CAPTURE: trade_gap sym=0x03000001 expected=51 observed=52"),
             "{report}"
         );
         assert!(
@@ -1401,12 +1399,8 @@ mod tests {
     /// exact production sink under `AiCmdCapture`).
     fn write_ai_cmds(dir: &Path, cmds: &[AiCmd]) {
         std::fs::create_dir_all(dir).unwrap();
-        let mut c = core_io::SlotCapture::<AiCmd>::open(
-            dir.join(AI_CMDS_FILE),
-            SlotKind::AiCmd,
-            7,
-        )
-        .unwrap();
+        let mut c = core_io::SlotCapture::<AiCmd>::open(dir.join(AI_CMDS_FILE), SlotKind::AiCmd, 7)
+            .unwrap();
         for cmd in cmds {
             c.append(cmd);
         }
@@ -1426,8 +1420,20 @@ mod tests {
             &[
                 ai_slot(AiCmdKind::Heartbeat, 1, AI_T0, 0, None),
                 ai_slot(AiCmdKind::Heartbeat, 2, AI_T0 + 5_000_000_000, 0, None),
-                ai_slot(AiCmdKind::RulesetStage, 3, AI_T0 + 6_000_000_000, 0, Some(h)),
-                ai_slot(AiCmdKind::RulesetCommit, 4, AI_T0 + 7_000_000_000, 0, Some(h)),
+                ai_slot(
+                    AiCmdKind::RulesetStage,
+                    3,
+                    AI_T0 + 6_000_000_000,
+                    0,
+                    Some(h),
+                ),
+                ai_slot(
+                    AiCmdKind::RulesetCommit,
+                    4,
+                    AI_T0 + 7_000_000_000,
+                    0,
+                    Some(h),
+                ),
                 // 4 → 7: one hole, two ids missing (worker restart /
                 // lost-frame shape — accepted gapped, §4.4).
                 ai_slot(AiCmdKind::Heartbeat, 7, AI_T0 + 10_000_000_000, 0, None),
@@ -1452,11 +1458,17 @@ mod tests {
         assert!(report.contains("heartbeats n=3 | 2-6s:2"), "{report}");
         let hex = "ab".repeat(16);
         assert!(
-            report.contains(&format!("Stage seq=3 ts={} hash128={hex}", AI_T0 + 6_000_000_000)),
+            report.contains(&format!(
+                "Stage seq=3 ts={} hash128={hex}",
+                AI_T0 + 6_000_000_000
+            )),
             "{report}"
         );
         assert!(
-            report.contains(&format!("Commit seq=4 ts={} hash128={hex}", AI_T0 + 7_000_000_000)),
+            report.contains(&format!(
+                "Commit seq=4 ts={} hash128={hex}",
+                AI_T0 + 7_000_000_000
+            )),
             "{report}"
         );
         // Ruleset frames ride ttl_ns = 0 (§13): nothing flags.
@@ -1509,7 +1521,10 @@ mod tests {
             ],
         );
         let report = run_audit(&dir).unwrap();
-        assert!(report.contains("seq: first=1 last=1 gaps=0 missing=0 regressions=1"), "{report}");
+        assert!(
+            report.contains("seq: first=1 last=1 gaps=0 missing=0 regressions=1"),
+            "{report}"
+        );
         assert!(
             report.contains("ttl'd-at-pop (capture-relative): flagged=2"),
             "{report}"
@@ -1540,12 +1555,9 @@ mod tests {
         let dir = temp_run_dir("ai_wrong_kind");
         std::fs::create_dir_all(&dir).unwrap();
         {
-            let mut c = core_io::SlotCapture::<Tick>::open(
-                dir.join(AI_CMDS_FILE),
-                SlotKind::Tick,
-                7,
-            )
-            .unwrap();
+            let mut c =
+                core_io::SlotCapture::<Tick>::open(dir.join(AI_CMDS_FILE), SlotKind::Tick, 7)
+                    .unwrap();
             c.append(&tick(AI_T0, 1, 1));
             c.flush_all().unwrap();
         }

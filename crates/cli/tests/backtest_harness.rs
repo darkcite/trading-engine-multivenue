@@ -41,10 +41,7 @@ fn unique_root(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "cli-backtest-{tag}-{}-{nanos}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("cli-backtest-{tag}-{}-{nanos}", std::process::id()))
 }
 
 fn mk_tick(ts_ns: u64, venue: VenueId, sym: u32, seq: u32, bid: i64, ask: i64) -> Tick {
@@ -162,7 +159,10 @@ fn golden_two_run_two_venue_capture_hold_model_report() {
     assert_eq!(s.runs, 2);
     assert_eq!(s.merged_records, 5);
     assert_eq!(s.universe_syms, 2, "capture-observed universe = {{7, 42}}");
-    assert_eq!(s.first_virt_ns, VIRT_T0, "run-0 first tick rebases to VIRT_T0");
+    assert_eq!(
+        s.first_virt_ns, VIRT_T0,
+        "run-0 first tick rebases to VIRT_T0"
+    );
     assert_eq!(
         s.last_virt_ns,
         VIRT_T0 + (EPOCH_RUN_1 - EPOCH_RUN_0) + 200,
@@ -196,7 +196,10 @@ fn golden_capture_single_run_dir_form() {
     let out = cli::backtest::run(&cfg(&ruleset, &run0, "70/30")).expect("harness ok");
     assert_eq!(out.stats.runs, 1);
     assert_eq!(out.stats.merged_records, 3);
-    assert_eq!(out.stats.vm_orders_emitted, 1, "second pm tick sits in cooldown");
+    assert_eq!(
+        out.stats.vm_orders_emitted, 1,
+        "second pm tick sits in cooldown"
+    );
     assert_eq!(out.stats.max_order_notional_1e6, 50_000_000);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -229,7 +232,10 @@ fn reruns_are_byte_identical() {
 
     let a = cli::backtest::run(&c).expect("first run ok");
     let b = cli::backtest::run(&c).expect("second run ok");
-    assert_eq!(a.schema1, b.schema1, "schema-1 stdout must be bit-identical");
+    assert_eq!(
+        a.schema1, b.schema1,
+        "schema-1 stdout must be bit-identical"
+    );
     assert_eq!(a.summary, b.summary, "stderr summary is deterministic too");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -520,34 +526,124 @@ fn build_pnl_capture(root: &Path) -> PathBuf {
         &run0,
         "bn",
         PNL_EPOCH_RUN_0,
-        &[mk_tick_q(1_000, VenueId::Binance, 7, 1, 550_000, 10_000_000, 570_000, 10_000_000)],
+        &[mk_tick_q(
+            1_000,
+            VenueId::Binance,
+            7,
+            1,
+            550_000,
+            10_000_000,
+            570_000,
+            10_000_000,
+        )],
     );
     write_ticks(
         &run0,
         "pm",
         PNL_EPOCH_RUN_0,
         &[
-            mk_tick_q(2_000, VenueId::Polymarket, 42, 1, 380_000, 10_000_000, 420_000, 10_000_000),
-            mk_tick_q(500_000_000, VenueId::Polymarket, 42, 2, 360_000, 10_000_000, 390_000, 200_000_000),
-            mk_tick_q(2_200_000_000, VenueId::Polymarket, 42, 3, 600_000, 10_000_000, 650_000, 10_000_000),
-            mk_tick_q(2_600_000_000, VenueId::Polymarket, 42, 4, 660_000, 30_000_000, 700_000, 10_000_000),
+            mk_tick_q(
+                2_000,
+                VenueId::Polymarket,
+                42,
+                1,
+                380_000,
+                10_000_000,
+                420_000,
+                10_000_000,
+            ),
+            mk_tick_q(
+                500_000_000,
+                VenueId::Polymarket,
+                42,
+                2,
+                360_000,
+                10_000_000,
+                390_000,
+                200_000_000,
+            ),
+            mk_tick_q(
+                2_200_000_000,
+                VenueId::Polymarket,
+                42,
+                3,
+                600_000,
+                10_000_000,
+                650_000,
+                10_000_000,
+            ),
+            mk_tick_q(
+                2_600_000_000,
+                VenueId::Polymarket,
+                42,
+                4,
+                660_000,
+                30_000_000,
+                700_000,
+                10_000_000,
+            ),
         ],
     );
     write_ticks(
         &run1,
         "bn",
         PNL_EPOCH_RUN_1,
-        &[mk_tick_q(500, VenueId::Binance, 7, 2, 550_000, 10_000_000, 570_000, 10_000_000)],
+        &[mk_tick_q(
+            500,
+            VenueId::Binance,
+            7,
+            2,
+            550_000,
+            10_000_000,
+            570_000,
+            10_000_000,
+        )],
     );
     write_ticks(
         &run1,
         "pm",
         PNL_EPOCH_RUN_1,
         &[
-            mk_tick_q(700, VenueId::Polymarket, 42, 5, 380_000, 10_000_000, 420_000, 10_000_000),
-            mk_tick_q(300_000_700, VenueId::Polymarket, 42, 6, 350_000, 10_000_000, 380_000, 70_000_000),
-            mk_tick_q(900_000_700, VenueId::Polymarket, 42, 7, 350_000, 10_000_000, 380_000, 200_000_000),
-            mk_tick_q(1_400_000_700, VenueId::Polymarket, 42, 8, 430_000, 10_000_000, 450_000, 10_000_000),
+            mk_tick_q(
+                700,
+                VenueId::Polymarket,
+                42,
+                5,
+                380_000,
+                10_000_000,
+                420_000,
+                10_000_000,
+            ),
+            mk_tick_q(
+                300_000_700,
+                VenueId::Polymarket,
+                42,
+                6,
+                350_000,
+                10_000_000,
+                380_000,
+                70_000_000,
+            ),
+            mk_tick_q(
+                900_000_700,
+                VenueId::Polymarket,
+                42,
+                7,
+                350_000,
+                10_000_000,
+                380_000,
+                200_000_000,
+            ),
+            mk_tick_q(
+                1_400_000_700,
+                VenueId::Polymarket,
+                42,
+                8,
+                430_000,
+                10_000_000,
+                450_000,
+                10_000_000,
+            ),
         ],
     );
 
@@ -574,7 +670,11 @@ fn golden_pnl_fixture_hand_computed_accounting_exact() {
     let ruleset = build_pnl_capture(&root);
 
     let out = cli::backtest::run(&cfg(&ruleset, &root, "70/30")).expect("harness ok");
-    assert_eq!(out.schema1, pnl_schema1(), "known P&L, byte for byte (plan §11)");
+    assert_eq!(
+        out.schema1,
+        pnl_schema1(),
+        "known P&L, byte for byte (plan §11)"
+    );
 
     let s = out.stats;
     assert_eq!(s.runs, 2);
@@ -655,7 +755,10 @@ fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
     // the frozen stdout must NOT carry (§5).
     assert!(a.starts_with("{\"detail_version\":1,"));
     assert!(a.contains("\"canceled_end\":1"));
-    assert!(a.contains("\"full\":{\"realized_usd\":6.75,"), "IS sell realized $6.75: {a}");
+    assert!(
+        a.contains("\"full\":{\"realized_usd\":6.75,"),
+        "IS sell realized $6.75: {a}"
+    );
     assert!(a.contains("\"per_sym\":[{\"sym\":42,\"venue\":0,\"pos_qty\":220.0,\"last_mid\":0.44,"));
     // The stdout line itself never grows keys (§5 pinned).
     assert!(!out_a.schema1.contains("detail_version"));
@@ -720,8 +823,7 @@ fn real_binary_pnl_fixture_frozen_argv() {
 // ---------------------------------------------------------------
 
 fn committed_fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../claude-worker/tests/fixtures/backtest-real")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../claude-worker/tests/fixtures/backtest-real")
 }
 
 /// Every file of the P&L fixture, relative to its root.

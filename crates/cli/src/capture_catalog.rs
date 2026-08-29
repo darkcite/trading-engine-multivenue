@@ -168,7 +168,7 @@ struct DayReport {
     /// Ticks whose wall stamp lands in this day.
     ticks: u64,
     /// Per-venue tick counts, [`VENUE_LABELS`] order.
-    venue_ticks: [u64; 6],
+    venue_ticks: [u64; VENUE_LABELS.len()],
     /// Runs whose wall span touches this day.
     runs: u64,
     /// `dark_ns <= tolerance && ticks > 0`.
@@ -318,7 +318,7 @@ fn discover(root: &Path) -> Result<Vec<RunEntry>, CatalogError> {
 /// exact wall mapping.
 fn inspect_run(
     entry: &RunEntry,
-    day_ticks: &mut BTreeMap<u64, [u64; 6]>,
+    day_ticks: &mut BTreeMap<u64, [u64; VENUE_LABELS.len()]>,
 ) -> Result<RunReport, CatalogError> {
     let mut venues: Vec<VenueFileStat> = Vec::new();
     let mut bytes = 0u64;
@@ -331,7 +331,7 @@ fn inspect_run(
     // engine-fills / ai-cmds / raw tap / future channels).
     let rd = std::fs::read_dir(&entry.path)
         .map_err(|e| CatalogError::Io(format!("read_dir {}: {e}", entry.path.display())))?;
-    let mut tick_file_names: [bool; 6] = [false; 6];
+    let mut tick_file_names: [bool; VENUE_LABELS.len()] = [false; VENUE_LABELS.len()];
     let mut names: Vec<String> = Vec::new();
     for e in rd {
         let e = e.map_err(|e| CatalogError::Io(format!("read_dir entry: {e}")))?;
@@ -461,7 +461,7 @@ fn inspect_run(
             for t in records {
                 let wall = entry.epoch_ns + (t.ts_ns - anchor);
                 let day = wall / NS_PER_DAY;
-                let row = day_ticks.entry(day).or_insert([0u64; 6]);
+                let row = day_ticks.entry(day).or_insert([0u64; VENUE_LABELS.len()]);
                 row[o.lord] += 1;
             }
         }
@@ -586,7 +586,7 @@ pub fn run_catalog(cfg: &CatalogConfig) -> Result<CatalogOutput, CatalogError> {
     let entries = discover(&cfg.dir)?;
 
     // Per-run inspection + the global per-day tick map.
-    let mut day_ticks: BTreeMap<u64, [u64; 6]> = BTreeMap::new();
+    let mut day_ticks: BTreeMap<u64, [u64; VENUE_LABELS.len()]> = BTreeMap::new();
     let mut runs: Vec<RunReport> = Vec::with_capacity(entries.len());
     for e in &entries {
         runs.push(inspect_run(e, &mut day_ticks)?);
@@ -665,7 +665,10 @@ pub fn run_catalog(cfg: &CatalogConfig) -> Result<CatalogOutput, CatalogError> {
                     runs_touching += 1;
                 }
             }
-            let venue_ticks = day_ticks.get(&day).copied().unwrap_or([0u64; 6]);
+            let venue_ticks = day_ticks
+                .get(&day)
+                .copied()
+                .unwrap_or([0u64; VENUE_LABELS.len()]);
             let ticks: u64 = venue_ticks.iter().sum();
             let dark = NS_PER_DAY - covered.min(NS_PER_DAY);
             days.push(DayReport {
@@ -1045,7 +1048,11 @@ fn render_summary(
         fmt_dur(MONITOR_WINDOW_NS),
         fmt_dur(facts.monitor_coverage_ns),
         fmt_dur(MONITOR_FLOOR_NS),
-        if facts.monitor_would_run { "RUN" } else { "SKIP" }
+        if facts.monitor_would_run {
+            "RUN"
+        } else {
+            "SKIP"
+        }
     ));
     s
 }

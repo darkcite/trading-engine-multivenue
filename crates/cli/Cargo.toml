@@ -43,6 +43,7 @@ ingress-polymarket   = { workspace = true }
 ingress-binance      = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-deribit      = { workspace = true }
+ingress-bybit        = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-rpc          = { workspace = true }
 ingress-ai           = { workspace = true }

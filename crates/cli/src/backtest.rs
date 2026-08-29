@@ -79,19 +79,21 @@ pub const VIRT_T0: u64 = 100_000_000_000_000_000;
 pub(crate) const REQUIRED_PMLR_VERSION: u16 = 2;
 
 /// Per-venue tick-capture file labels, in file-ordinal order (mirrors
-/// `audit_replay::VENUE_LABELS` — the cli spawn labels exactly).
+/// `audit_replay::VENUE_LABELS` — the cli spawn labels exactly;
+/// `bybit` appended at WS9).
 /// `pub(crate)`: `capture_catalog` reports in this fixed order.
-pub(crate) const VENUE_LABELS: [&str; 6] = ["pm", "bn", "okx", "rpc", "deribit", "hl"];
+pub(crate) const VENUE_LABELS: [&str; 7] = ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit"];
 
 /// Venue labels accepted by the §4.3/§4.4 model flags, mapped to the
 /// wire-stable [`VenueId`] byte. `rpc` is absent by design: it is not
 /// a tradeable venue (no `VenueId`, no orders route to it).
-const MODEL_VENUE_LABELS: [(&str, VenueId); 5] = [
+const MODEL_VENUE_LABELS: [(&str, VenueId); 6] = [
     ("pm", VenueId::Polymarket),
     ("bn", VenueId::Binance),
     ("okx", VenueId::Okx),
     ("deribit", VenueId::Deribit),
     ("hl", VenueId::Hyperliquid),
+    ("bybit", VenueId::Bybit),
 ];
 
 /// ns per millisecond, for the §4.4 default table.
@@ -199,7 +201,10 @@ pub fn parse_split(s: &str) -> Result<Split, HarnessError> {
     let carved_all_oos = n == 0 && m == 100;
     let regular = n >= 10 && m >= 10 && n + m == 100;
     if carved_all_oos || regular {
-        Ok(Split { is_pct: n, oos_pct: m })
+        Ok(Split {
+            is_pct: n,
+            oos_pct: m,
+        })
     } else {
         Err(HarnessError::Usage(format!(
             "bad --split {s:?}: N+M must be 100 with both >= 10 (or the carved 0/100)"
@@ -213,24 +218,35 @@ pub fn parse_split(s: &str) -> Result<Split, HarnessError> {
 // stderr so a stubbed override is never silently "applied").
 // ---------------------------------------------------------------
 
-/// Fee + latency-penalty tables, indexed by [`VenueId`] byte (0..=4).
+/// Fee + latency-penalty tables, indexed by [`VenueId`] byte
+/// (0..=6 since WS9; **slot 5 = Ai is a DEAD slot** — the command
+/// feed never trades — kept so the venue byte indexes directly).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ModelParams {
     /// `(maker_bps, taker_bps)` per venue. §4.3 defaults: all 0/0
     /// (Polymarket's current CLOB fee schedule; CEX venues cannot
     /// execute until 8j).
-    pub fee_bps: [(u32, u32); 5],
+    pub fee_bps: [(u32, u32); 7],
     /// Activation penalty Δ ns per venue (§4.4, deliberately
     /// conservative defaults).
-    pub latency_ns: [u64; 5],
+    pub latency_ns: [u64; 7],
 }
 
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
-            fee_bps: [(0, 0); 5],
-            // PM 200 ms, BN/OKX/Deribit 100 ms, HL 600 ms (§4.4).
-            latency_ns: [200 * MS, 100 * MS, 100 * MS, 100 * MS, 600 * MS],
+            fee_bps: [(0, 0); 7],
+            // PM 200 ms, BN/OKX/Deribit 100 ms, HL 600 ms (§4.4);
+            // slot 5 = Ai dead; Bybit 100 ms (WS9 — the CEX class).
+            latency_ns: [
+                200 * MS,
+                100 * MS,
+                100 * MS,
+                100 * MS,
+                600 * MS,
+                0,
+                100 * MS,
+            ],
         }
     }
 }
@@ -256,7 +272,8 @@ pub fn parse_model_params(
 ) -> Result<ModelParams, HarnessError> {
     let mut p = ModelParams::default();
     if let Some(ns) = latency_global {
-        p.latency_ns = [ns; 5];
+        p.latency_ns = [ns; 7];
+        p.latency_ns[VenueId::Ai as usize] = 0; // dead slot stays dead
     }
     for spec in latency_specs {
         let mut it = spec.split(':');
@@ -269,7 +286,9 @@ pub fn parse_model_params(
             }
         };
         let vi = model_venue(v).ok_or_else(|| {
-            HarnessError::Usage(format!("bad --latency-ns-venue {spec:?}: unknown venue {v:?}"))
+            HarnessError::Usage(format!(
+                "bad --latency-ns-venue {spec:?}: unknown venue {v:?}"
+            ))
         })?;
         let ns: u64 = ns.parse().map_err(|_| {
             HarnessError::Usage(format!("bad --latency-ns-venue {spec:?}: unparseable ns"))
@@ -372,9 +391,7 @@ pub(crate) fn discover_runs(replay_dir: &Path) -> Result<Vec<RunDir>, HarnessErr
             replay_dir.display()
         )));
     }
-    runs.sort_by(|a, b| {
-        (a.epoch_ns, a.path.as_os_str()).cmp(&(b.epoch_ns, b.path.as_os_str()))
-    });
+    runs.sort_by(|a, b| (a.epoch_ns, a.path.as_os_str()).cmp(&(b.epoch_ns, b.path.as_os_str())));
     Ok(runs)
 }
 
@@ -420,14 +437,16 @@ struct MergedRec {
 #[derive(Clone, Debug)]
 struct RunSummary {
     epoch_ns: u64,
-    venue_records: [u64; 6],
+    // Tied to the label set so a venue addition can never desync it
+    // again (WS13 caught exactly that at bybit's arrival).
+    venue_records: [u64; VENUE_LABELS.len()],
 }
 
 /// Open every present per-venue tick file of `run`, cross-check the
 /// header, and return the run's §3.2-ordered records.
 fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
-    let mut venue_records = [0u64; 6];
+    let mut venue_records = [0u64; VENUE_LABELS.len()];
     let mut any_file = false;
     for (lord, label) in VENUE_LABELS.iter().enumerate() {
         let path = run.path.join(format!("{label}-ticks.pmlr"));
@@ -435,9 +454,8 @@ fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError>
             continue; // a run captures only spawned venues (§3.1)
         }
         any_file = true;
-        let reader = PmlrReader::<Tick>::open(&path).map_err(|e: io::Error| {
-            HarnessError::Capture(format!("{}: {e}", path.display()))
-        })?;
+        let reader = PmlrReader::<Tick>::open(&path)
+            .map_err(|e: io::Error| HarnessError::Capture(format!("{}: {e}", path.display())))?;
         if reader.slot_kind() != SlotKind::Tick {
             return Err(HarnessError::Capture(format!(
                 "{}: slot_kind {:?} is not Tick",
@@ -496,9 +514,7 @@ fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError>
 /// non-decreasing; a regression means two capture runs overlap in
 /// wall time (two engines writing one log root), which no continuous
 /// replay can honestly represent — untrustworthy, nonzero exit.
-fn load_and_merge(
-    runs: &[RunDir],
-) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
+fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedRec> = Vec::new();
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(runs.len());
@@ -605,8 +621,7 @@ impl Ctx for BacktestCtx {
     fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
         // notional = px × qty / 1e6, exact in i128, floored like the
         // vm's own sizing arithmetic.
-        let notional_1e6 =
-            ((order.px.raw() as i128 * order.qty.raw() as i128) / 1_000_000) as i64;
+        let notional_1e6 = ((order.px.raw() as i128 * order.qty.raw() as i128) / 1_000_000) as i64;
         if notional_1e6 > self.max_order_notional_1e6 {
             self.max_order_notional_1e6 = notional_1e6;
         }
@@ -806,7 +821,10 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     // Candidate bytes + identity (§3.5): full SHA-256 is schema-1's
     // `ruleset_hash`; its first 16 bytes are the wire hash128.
     let ruleset_bytes = std::fs::read(&cfg.ruleset).map_err(|e| {
-        HarnessError::Usage(format!("cannot read --ruleset {}: {e}", cfg.ruleset.display()))
+        HarnessError::Usage(format!(
+            "cannot read --ruleset {}: {e}",
+            cfg.ruleset.display()
+        ))
     })?;
     let full_hash = core_crypto::sha256(&ruleset_bytes);
     let mut hash128 = [0u8; 16];
@@ -832,8 +850,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     let first_virt = merged[0].virt_ns;
     let last_virt = merged[merged.len() - 1].virt_ns;
     let span = last_virt - first_virt;
-    let boundary_virt =
-        first_virt + ((span as u128 * split.is_pct as u128) / 100) as u64;
+    let boundary_virt = first_virt + ((span as u128 * split.is_pct as u128) / 100) as u64;
     let mut oos_records = 0u64;
     for r in &merged {
         if r.virt_ns >= boundary_virt {
@@ -1110,7 +1127,10 @@ fn render_summary(
          positions marked out at last mid into net_pnl\n",
     );
     if let Some(p) = &cfg.emit_detail {
-        s.push_str(&format!("--emit-detail: sidecar written to {}\n", p.display()));
+        s.push_str(&format!(
+            "--emit-detail: sidecar written to {}\n",
+            p.display()
+        ));
     }
     s
 }
@@ -1274,9 +1294,8 @@ mod tests {
     #[test]
     fn split_rejects_everything_else() {
         for bad in [
-            "5/95", "95/5", "70/40", "100/0", "0/0", "70/30/0", "70", "", "/", "70/",
-            "/30", "a/b", " 70/30", "70/30 ", "070/30", "70/030", "+70/30", "-70/170",
-            "1000/0",
+            "5/95", "95/5", "70/40", "100/0", "0/0", "70/30/0", "70", "", "/", "70/", "/30", "a/b",
+            " 70/30", "70/30 ", "070/30", "70/030", "+70/30", "-70/170", "1000/0",
         ] {
             assert!(
                 matches!(parse_split(bad), Err(HarnessError::Usage(_))),
@@ -1290,10 +1309,19 @@ mod tests {
     #[test]
     fn model_params_defaults_pin_design_4() {
         let p = ModelParams::default();
-        assert_eq!(p.fee_bps, [(0, 0); 5]);
+        assert_eq!(p.fee_bps, [(0, 0); 7]);
+        // WS9: slot 5 = Ai (dead, 0), slot 6 = Bybit (CEX class).
         assert_eq!(
             p.latency_ns,
-            [200 * MS, 100 * MS, 100 * MS, 100 * MS, 600 * MS]
+            [
+                200 * MS,
+                100 * MS,
+                100 * MS,
+                100 * MS,
+                600 * MS,
+                0,
+                100 * MS
+            ]
         );
     }
 
@@ -1305,8 +1333,9 @@ mod tests {
             &["deribit:42".to_owned()],
         )
         .unwrap();
-        // global latency replaced all five, then deribit won on top.
-        assert_eq!(p.latency_ns, [1_000, 1_000, 1_000, 42, 1_000]);
+        // Global latency replaced every TRADEABLE slot (the Ai dead
+        // slot stays 0 — WS9), then deribit won on top.
+        assert_eq!(p.latency_ns, [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000]);
         assert_eq!(p.fee_bps[VenueId::Polymarket as usize], (0, 10));
         assert_eq!(p.fee_bps[VenueId::Hyperliquid as usize], (3, 4));
         assert_eq!(p.fee_bps[VenueId::Binance as usize], (0, 0));
@@ -1314,7 +1343,9 @@ mod tests {
 
     #[test]
     fn model_params_rejects_malformed_specs() {
-        for bad_fee in ["pm:1", "pm:1:2:3", "rpc:1:2", "nope:1:2", "pm:x:2", "pm:1:y"] {
+        for bad_fee in [
+            "pm:1", "pm:1:2:3", "rpc:1:2", "nope:1:2", "pm:x:2", "pm:1:y",
+        ] {
             assert!(
                 matches!(
                     parse_model_params(&[bad_fee.to_owned()], None, &[]),
@@ -1416,11 +1447,19 @@ mod tests {
             keyed(3, 0, 0, 0),
         ];
         order_run(&mut recs);
-        let keys: Vec<(u64, u8, u8, u64)> =
-            recs.iter().map(|r| (r.ts_ns, r.venue, r.lord, r.idx)).collect();
+        let keys: Vec<(u64, u8, u8, u64)> = recs
+            .iter()
+            .map(|r| (r.ts_ns, r.venue, r.lord, r.idx))
+            .collect();
         assert_eq!(
             keys,
-            vec![(1, 4, 5, 0), (3, 0, 0, 0), (5, 0, 0, 1), (5, 0, 0, 3), (5, 1, 1, 0)]
+            vec![
+                (1, 4, 5, 0),
+                (3, 0, 0, 0),
+                (5, 0, 0, 1),
+                (5, 0, 0, 3),
+                (5, 1, 1, 0)
+            ]
         );
     }
 
@@ -1482,9 +1521,7 @@ mod tests {
         let gap = 4_000_000_000u64;
         // run 0: ts 500, 700  → virt T0+0, T0+200
         // run 1: ts 9000, 9050 → virt T0+gap+0, T0+gap+50
-        let virt = |epoch: u64, ts_first: u64, ts: u64| {
-            VIRT_T0 + (epoch - e0) + (ts - ts_first)
-        };
+        let virt = |epoch: u64, ts_first: u64, ts: u64| VIRT_T0 + (epoch - e0) + (ts - ts_first);
         assert_eq!(virt(e0, 500, 500), VIRT_T0);
         assert_eq!(virt(e0, 500, 700), VIRT_T0 + 200);
         assert_eq!(virt(e0 + gap, 9_000, 9_000), VIRT_T0 + gap);

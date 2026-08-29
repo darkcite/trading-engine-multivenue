@@ -62,12 +62,12 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::{AiCmd, AiCmdKind, Fill, Order, Side, Tick, SYMBOL_ID_NONE};
 
+use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
 use crate::backtest::fill::{FillEngine, ModelOutcome, DAY_NS};
 use crate::backtest::{
     discover_runs, fmt_usd_1e6, parse_model_params, HarnessError, ModelParams, RunDir,
     REQUIRED_PMLR_VERSION, VENUE_LABELS, VIRT_T0,
 };
-use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
 use crate::options_manifest::{INSTRUMENT_MANIFEST_FILE, OPTIONS_MANIFEST_FILE};
 
 /// Report schema version (stdout JSON `audit_pnl_version`).
@@ -319,20 +319,18 @@ fn load_run_events(
     load.manifest = manifest.is_some();
     load.manifest_malformed = malformed;
 
-    let resolve = |sym: u32,
-                       interner: &mut SymInterner,
-                       load: &mut RunLoad|
-     -> Result<u32, HarnessError> {
-        let venue_byte = (sym >> 24) as u8;
-        match manifest.as_ref().and_then(|m| m.get(&sym)) {
-            Some(desc) => interner.intern(venue_byte, desc),
-            None => {
-                load.unresolved_namespaced += 1;
-                let ns = format!("run-{}/sym-{:#010x}", run.epoch_ns, sym);
-                interner.intern(venue_byte, &ns)
+    let resolve =
+        |sym: u32, interner: &mut SymInterner, load: &mut RunLoad| -> Result<u32, HarnessError> {
+            let venue_byte = (sym >> 24) as u8;
+            match manifest.as_ref().and_then(|m| m.get(&sym)) {
+                Some(desc) => interner.intern(venue_byte, desc),
+                None => {
+                    load.unresolved_namespaced += 1;
+                    let ns = format!("run-{}/sym-{:#010x}", run.epoch_ns, sym);
+                    interner.intern(venue_byte, &ns)
+                }
             }
-        }
-    };
+        };
 
     let mut evs: Vec<Ev> = Vec::new();
 
@@ -508,7 +506,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             l.orders,
             l.fills,
             l.commits,
-            if l.manifest { "yes" } else { "NO (per-run namespace)" },
+            if l.manifest {
+                "yes"
+            } else {
+                "NO (per-run namespace)"
+            },
             if l.manifest_malformed > 0 {
                 format!(" malformed={}", l.manifest_malformed)
             } else {
@@ -804,8 +806,6 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             fmt_usd_1e6(usd_1e12_to_1e6_ceil(o.oos_max_dd_1e12)),
         ));
     }
-    json.push_str(&format!(
-        "],\"vm_orders_no_hash\":{vm_orders_no_hash}}}"
-    ));
+    json.push_str(&format!("],\"vm_orders_no_hash\":{vm_orders_no_hash}}}"));
     Ok(json)
 }
