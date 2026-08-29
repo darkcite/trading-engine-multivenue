@@ -38,8 +38,8 @@ APR = daily × 365.
 Paper-fill law: intent prices CROSS the captured book (bid at
 last_ask × (1+slip), ask at last_bid × (1−slip)) so audit-pnl's
 strict-cross fill model — the strategies' own 0%-maker FLOOR
-scenario — can fill them. Leg notional is capped under the §4.2
-validator's $100/order bound.
+scenario — can fill them. Leg notional sits under the $10k/order
+research-tier cap (operator ruling 2026-08-29, $50k book).
 """
 
 import argparse
@@ -70,7 +70,9 @@ EXIT_MIN_HOLD_H: float = 96.0
 MAX_POSITIONS: int = 5
 S1_ENTRY_ABS_APR: float = 0.50
 S1_CONFIRM_3D_APR: float = 0.30
-LEG_NOTIONAL_USD: float = 90.0  # under the $100/order validator cap
+# Operator rulings 2026-08-29: strategies assume a $50k book; CVFC-1
+# spec legs are $10k (under the $10k/order research-tier cap exactly).
+LEG_NOTIONAL_USD: float = 9_900.0
 INTENT_TTL_S: float = 3600.0
 CROSS_SLIP: float = 0.01
 
@@ -79,6 +81,9 @@ INTENT_VENUE_BY_PREFIX: dict[str, str] = {
     "hyperliquid": "hyperliquid",
     "deribit": "deribit",
     "binance-usdm": "binance",
+    # xv_signal pairs (M5 session 2): spot legs + okx.
+    "binance": "binance",
+    "okx": "okx",
     # Operator ruling 2026-08-29: the bybit venue-table unfreeze.
     "bybit-linear": "bybit",
     "bybit": "bybit",

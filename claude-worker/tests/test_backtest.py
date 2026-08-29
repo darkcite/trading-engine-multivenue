@@ -138,7 +138,10 @@ def test_pass_report_all_gates(tmp_path: pathlib.Path) -> None:
                     "net_pnl_usd": 5.0,
                     "trades": 60,
                     "trading_days": 3,
-                    "max_drawdown_usd": 201.0,
+                    # Operator ruling 2026-08-29: $50k research tier (DD 15% = $7,500;
+                    # order/sym/total 10k/20k/100k) — frozen pins amended with the
+                    # ruling, the D1 pattern.
+                    "max_drawdown_usd": 7_501.0,
                 }
             },
             "max_drawdown",
@@ -146,7 +149,7 @@ def test_pass_report_all_gates(tmp_path: pathlib.Path) -> None:
         (
             {
                 "bounds": {
-                    "max_order_notional_usd": 101.0,
+                    "max_order_notional_usd": 10_001.0,
                     "max_symbol_notional_usd": 200.0,
                     "max_total_notional_usd": 800.0,
                 }
@@ -157,7 +160,7 @@ def test_pass_report_all_gates(tmp_path: pathlib.Path) -> None:
             {
                 "bounds": {
                     "max_order_notional_usd": 90.0,
-                    "max_symbol_notional_usd": 251.0,
+                    "max_symbol_notional_usd": 20_001.0,
                     "max_total_notional_usd": 800.0,
                 }
             },
@@ -168,7 +171,7 @@ def test_pass_report_all_gates(tmp_path: pathlib.Path) -> None:
                 "bounds": {
                     "max_order_notional_usd": 90.0,
                     "max_symbol_notional_usd": 200.0,
-                    "max_total_notional_usd": 1_001.0,
+                    "max_total_notional_usd": 100_001.0,
                 }
             },
             "bounds",

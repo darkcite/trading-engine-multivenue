@@ -117,7 +117,8 @@ use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 /// (`ingress-ai::RULE_ROW_MAX_RISK_1E6`) — two INDEPENDENT
 /// enforcement layers by design (defense in depth; the risk-reviewer
 /// subagent keeps the doc and both code sites in sync).
-pub const POLICY_SINGLE_ORDER_CAP_1E6: i64 = 100_000_000;
+// Operator ruling 2026-08-29: $50k-book research tier (per-order $10k).
+pub const POLICY_SINGLE_ORDER_CAP_1E6: i64 = 10_000_000_000;
 
 const ORDER_KIND_POST_ONLY: u8 = 0;
 
@@ -1030,13 +1031,14 @@ mod tests {
     fn handbuilt_table_exceeding_policy_cap_is_still_policy_clamped() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        // $500 row cap — the §4.2 validator would reject this table;
-        // built by hand it proves the emit-time layer stands alone
-        // (defense in depth): every order ≤ the $100 policy cap.
+        // $50,000 row cap — the §4.2 validator would reject this
+        // table; built by hand it proves the emit-time layer stands
+        // alone (defense in depth): every order ≤ the $10k policy cap
+        // (operator ruling 2026-08-29, $50k research tier).
         install(
             &mut vm,
             &mut ctx,
-            &[lb_row(Side::Bid as u8, 600_000, 10, 500_000_000)],
+            &[lb_row(Side::Bid as u8, 600_000, 10, 50_000_000_000)],
         );
         ctx.now = T0;
         let mut seq = 0u32;

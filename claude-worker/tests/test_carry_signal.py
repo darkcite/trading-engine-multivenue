@@ -161,7 +161,7 @@ def test_cvfc_enters_hl_short_dbt_long_with_crossing_caps(tmp_path):
     assert by_side["bid"]["venue"] == "deribit"
     assert by_side["bid"]["px"] > 0.2
     for i in batch["intents"]:
-        assert i["px"] * i["qty"] <= 100.0  # validator order cap
+        assert i["px"] * i["qty"] <= 10_000.0  # research-tier order cap
     sh = (out / "push.sh").read_text()
     assert sh.count("--kind order-intent") == 2
     assert "--venue hyperliquid" in sh and "--venue deribit" in sh
@@ -248,7 +248,7 @@ def test_s1_enters_both_legs_since_the_bybit_unfreeze(tmp_path):
     assert by_venue["bybit"]["side"] == "ask"  # short the rich venue
     assert by_venue["binance"]["side"] == "bid"  # long the negative venue
     for i in s1:
-        assert i["px"] * i["qty"] <= 100.0
+        assert i["px"] * i["qty"] <= 10_000.0
     state = json.loads((out / "state.json").read_text())
     assert len(state["s1_positions"]) == 1
     assert state["s1_positions"][0]["name"] == "COTIUSDT"

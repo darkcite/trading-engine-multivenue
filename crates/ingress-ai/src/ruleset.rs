@@ -99,13 +99,16 @@ pub const RULE_HORIZON_MS_MAX: u32 = 86_400_000;
 pub const RULE_LEVEL_1E6_MAX: i64 = 1_000_000;
 /// Rule 7: per-row notional cap ×1e6 — tighten-only mirror of the
 /// `docs/risk-policy.md` max single-order notional ($100).
-pub const RULE_ROW_MAX_RISK_1E6: i64 = 100_000_000;
+// Operator ruling 2026-08-29 (M5 $50k-book research tier; DD 15%):
+// per-order $10k, per-sym $20k, table $100k (2x book). The $1k demo
+// tier is recorded as superseded in docs/risk-policy.md.
+pub const RULE_ROW_MAX_RISK_1E6: i64 = 10_000_000_000;
 /// Rule 7: per-symbol Σ cap ×1e6 — mirror of the risk-policy max net
 /// notional per symbol ($250).
-pub const RULE_SYM_MAX_RISK_1E6: i64 = 250_000_000;
+pub const RULE_SYM_MAX_RISK_1E6: i64 = 20_000_000_000;
 /// Rule 7: whole-table Σ cap ×1e6 — mirror of the risk-policy max net
 /// notional total ($1 000).
-pub const RULE_TABLE_MAX_RISK_1E6: i64 = 1_000_000_000;
+pub const RULE_TABLE_MAX_RISK_1E6: i64 = 100_000_000_000;
 
 /// §4.2 reject reason — one variant per rule, first failure wins
 /// (streaming discipline, module docs). The ops surface stays the
@@ -1807,7 +1810,9 @@ mod tests {
 
     #[test]
     fn rule7_caps_tighten_only() {
-        // Per-row cap: $100.01 > $100.
+        // Operator ruling 2026-08-29 ($50k research tier): the rule-7
+        // numbers moved to $10k/$20k/$100k — boundaries re-pinned.
+        // Per-row cap: $10,000.01 > $10,000.
         let r = row_json(
             "c1",
             r#"{"type":"cross_deviation","ref":7}"#,
@@ -1815,7 +1820,7 @@ mod tests {
             "bid",
             "80",
             "1500",
-            "100.01",
+            "10000.01",
         );
         assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Caps));
         // Per-row boundary passes (control).
@@ -1826,12 +1831,12 @@ mod tests {
             "bid",
             "80",
             "1500",
-            "100.0",
+            "10000.0",
         );
         assert_eq!(check(wrap_rows(&[r]).as_bytes()), Ok(()));
-        // Per-sym Σ: 100 + 100 + 51 = 251 > 250 on sym 42.
+        // Per-sym Σ: 10k + 10k + 100.0 = 20,100 > 20,000 on sym 42.
         let mut rows = Vec::new();
-        for (i, risk) in [(0u32, "100.0"), (1, "100.0"), (2, "51.0")] {
+        for (i, risk) in [(0u32, "10000.0"), (1, "10000.0"), (2, "100.0")] {
             let trig = format!(r#"{{"type":"level_breach","level":0.{:06}}}"#, i + 1);
             rows.push(row_json(
                 &format!("c-sym-{i}"),
@@ -1844,8 +1849,8 @@ mod tests {
             ));
         }
         assert_eq!(check(wrap_rows(&rows).as_bytes()), Err(RulesetReject::Caps));
-        // Table Σ: 11 × $100 across 6 syms (≤ 2 rows = $200 per sym,
-        // under the per-sym cap) breaches $1 000 at row 11.
+        // Table Σ: 11 × $10k across 6 syms (≤ 2 rows = $20k per sym,
+        // AT the per-sym cap) breaches $100k at row 11.
         let syms = ["7", "42", "99", "100", "101", "102"];
         let mut rows = Vec::new();
         for i in 0..11u32 {
@@ -1858,7 +1863,7 @@ mod tests {
                 "ask",
                 "0",
                 "60000",
-                "100.0",
+                "10000.0",
             ));
         }
         assert_eq!(check(wrap_rows(&rows).as_bytes()), Err(RulesetReject::Caps));

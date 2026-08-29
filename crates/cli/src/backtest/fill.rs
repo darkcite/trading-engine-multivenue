@@ -81,9 +81,11 @@ use core_types::{symbol_venue_byte, Order, Side, Tick, SYMBOL_ID_NONE};
 use crate::backtest::ModelParams;
 
 /// §4.1 cap: max open orders per symbol (risk-policy mirror).
-pub const MAX_OPEN_PER_SYM: usize = 4;
+// Operator ruling 2026-08-29 ($50k tier): 4 -> 8.
+pub const MAX_OPEN_PER_SYM: usize = 8;
 /// §4.1 cap: max total open orders (risk-policy mirror).
-pub const MAX_OPEN_TOTAL: usize = 32;
+// Operator ruling 2026-08-29 ($50k tier): 32 -> 64.
+pub const MAX_OPEN_TOTAL: usize = 64;
 /// WS9: number of TRADEABLE venues (pm, bn, okx, deribit, hl,
 /// bybit). NOT a venue-byte bound any more — `Ai = 5` sits inside
 /// the byte range while `Bybit = 6` trades; use
@@ -959,42 +961,44 @@ mod tests {
     // -------------- caps (§4.1) --------------
 
     #[test]
-    fn per_sym_cap_rejects_the_fifth_open_order() {
+    fn per_sym_cap_rejects_the_ninth_open_order() {
+        // Operator ruling 2026-08-29 ($50k research tier): 4 -> 8.
         let mut e = engine(u64::MAX);
-        for oid in 0..5u64 {
+        for oid in 0..9u64 {
             e.intake(
                 &order(PM_SYM, Side::Bid, 100_000 + oid as i64, 1_000_000, oid),
                 0,
             );
         }
-        assert_eq!(e.open_orders().len(), 4);
+        assert_eq!(e.open_orders().len(), 8);
         let o = e.finish();
         assert_eq!(o.rejected_sym_cap, 1);
         assert_eq!(o.rejected_total_cap, 0);
-        assert_eq!(o.peak_open_per_sym, 4);
-        assert_eq!(o.canceled_end, 4);
+        assert_eq!(o.peak_open_per_sym, 8);
+        assert_eq!(o.canceled_end, 8);
     }
 
     #[test]
-    fn total_cap_rejects_the_thirty_third_open_order() {
+    fn total_cap_rejects_the_sixty_fifth_open_order() {
+        // Operator ruling 2026-08-29 ($50k research tier): 32 -> 64.
         let mut e = engine(u64::MAX);
-        // 8 syms × 4 orders = 32 (per-sym cap never trips).
+        // 8 syms × 8 orders = 64 (per-sym cap never trips).
         for s in 0..8u32 {
             let sym = make_symbol_id(VenueId::Polymarket, 100 + s);
-            for k in 0..4u64 {
+            for k in 0..8u64 {
                 e.intake(
-                    &order(sym, Side::Bid, 100_000, 1_000_000, (s as u64) * 4 + k),
+                    &order(sym, Side::Bid, 100_000, 1_000_000, (s as u64) * 8 + k),
                     0,
                 );
             }
         }
-        assert_eq!(e.open_orders().len(), 32);
+        assert_eq!(e.open_orders().len(), 64);
         let extra_sym = make_symbol_id(VenueId::Polymarket, 999);
         e.intake(&order(extra_sym, Side::Bid, 100_000, 1_000_000, 777), 0);
         let o = e.finish();
         assert_eq!(o.rejected_total_cap, 1);
         assert_eq!(o.rejected_sym_cap, 0);
-        assert_eq!(o.peak_open_total, 32);
+        assert_eq!(o.peak_open_total, 64);
     }
 
     #[test]

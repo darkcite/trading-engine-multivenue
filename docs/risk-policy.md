@@ -6,20 +6,35 @@ corresponding change to the code in `crates/strategy-*`, `crates/engine`,
 or `crates/clob-dispatcher` — and vice versa. The `risk-reviewer` subagent
 under `.claude/agents/` will block merges that update one without the other.
 
-## Absolute caps (Phase 0 — paper mode)
+## Absolute caps — $50k-book RESEARCH tier (operator ruling 2026-08-29)
 
-| cap                          | value    | enforced in                         |
-| ---------------------------- | -------- | ----------------------------------- |
-| max open orders per symbol   | 4        | `engine::Engine::on_new_order`      |
-| max total open orders        | 32       | `engine::Engine::on_new_order`      |
-| max net notional per symbol  | $250     | `strategy-core::RiskGate`           |
-| max net notional total       | $1 000   | `strategy-core::RiskGate`           |
-| max single-order notional    | $100     | `strategy-core::RiskGate`           |
-| max realized loss per day    | $200     | `engine::Engine::kill_if_exceeded`  |
-| max unrealized loss per sym  | $100     | `engine::Engine::kill_if_exceeded`  |
+Strategies assume a **$50,000 book** in M5 paper research; the DD line
+is the operator's 15%-of-book ruling. Enforced in: the §4.2 ruleset
+validator rule 7 (`ingress-ai::ruleset`), the VM emit-time clamp
+(`strategy-vm::POLICY_SINGLE_ORDER_CAP_1E6`), the backtest/audit-pnl
+fill law (`cli::backtest::fill` — open-order caps + caps-rejections),
+and the worker gate thresholds (`claude_worker.backtest.GateThresholds`,
+frozen-surface amendment with this ruling cited in the pin tests).
+
+| cap                          | value     | enforced in                          |
+| ---------------------------- | --------- | ------------------------------------ |
+| max open orders per symbol   | 8         | `cli::backtest::fill` (paper model)  |
+| max total open orders        | 64        | `cli::backtest::fill` (paper model)  |
+| max net notional per symbol  | $20 000   | rule 7 + gates (RiskGate at 8i)      |
+| max net notional total       | $100 000  | rule 7 + gates (2× book gross)       |
+| max single-order notional    | $10 000   | rule 7 + VM clamp + gates            |
+| max OOS drawdown (gate)      | $7 500    | `GateThresholds` (15% of book)       |
 
 Paper mode treats every fill as real for P&L accounting so the caps are
-exercised on the same code path that live mode will use.
+exercised on the same code path that live mode will use. Statistical
+gates (OOS > 0, ≥ 50 trades, ≥ 2 trading days) are scale-independent
+and unchanged.
+
+**Superseded demo tier (Phase 0 → 2026-08-29):** 4/sym · 32 total ·
+$250/sym · $1 000 total · $100/order · $200 DD — the numbers every
+pre-M5 backtest report and audit was measured against; historical
+reports keep meaning under the tier that produced them. Any LIVE
+(Stage-3) tier is a separate future ruling — these are research caps.
 
 ## Kill-switch triggers
 

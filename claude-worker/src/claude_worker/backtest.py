@@ -72,10 +72,15 @@ class GateThresholds:
     min_oos_net_pnl_usd: float = 0.0  # strict >
     min_trades: int = 50
     min_trading_days: int = 2
-    max_drawdown_usd: float = 200.0  # risk-policy daily realized-loss line
-    max_order_notional_usd: float = 100.0
-    max_symbol_notional_usd: float = 250.0
-    max_total_notional_usd: float = 1_000.0
+    # Operator ruling 2026-08-29 (D1-pattern frozen-surface amendment,
+    # cited in the pin tests): the $50k-book research tier — DD gate
+    # 15% of book, per-order $10k, per-sym $20k, total $100k (2x
+    # book). The $1k demo tier is recorded superseded in
+    # docs/risk-policy.md.
+    max_drawdown_usd: float = 7_500.0
+    max_order_notional_usd: float = 10_000.0
+    max_symbol_notional_usd: float = 20_000.0
+    max_total_notional_usd: float = 100_000.0
 
 
 class GateResult(typing.NamedTuple):

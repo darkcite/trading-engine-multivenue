@@ -3086,8 +3086,9 @@ fn ruleset_validator_is_zero_alloc() {
         .into_bytes(),
         // Rule 6: sym outside the universe.
         format!(r#"{{"rows":[{}]}}"#, row("j6", cd, "4", "3.9")).into_bytes(),
-        // Rule 7: per-row cap breach.
-        format!(r#"{{"rows":[{}]}}"#, row("j7", cd, "3", "100.01")).into_bytes(),
+        // Rule 7: per-row cap breach (operator ruling 2026-08-29,
+        // $50k tier: the cap is $10,000/row now).
+        format!(r#"{{"rows":[{}]}}"#, row("j7", cd, "3", "10000.01")).into_bytes(),
         // Rule 8: exact duplicate row.
         format!(
             r#"{{"rows":[{},{}]}}"#,
