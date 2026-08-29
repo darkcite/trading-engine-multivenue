@@ -336,3 +336,14 @@ checkpoint commits per repo law (operator-authorized, explicit-path staging,
   (own slice: PM overflow base clear of BN spot 7..506 and usdm
   512+, e.g. 1536+; core-config `universe.rs` + tests + migration
   note). TSLA/SPY dailies + their pairs re-enter with that slice.
+- 2026-08-29 — **STOCKS VERIFIED + PAUSE (operator order).** Cross-
+  validation vs independent venue reads: 9/11 instruments matched at
+  0.00–0.18% deviation (fetch-age drift; e.g. NVDAB 218.755 vs
+  218.670, SPY perp 770.895 vs 771.010, TEM 64.095 vs 63.980);
+  MARA/IONQ confirmed in capture directly (25/36 ticks — thin
+  Saturday names that printed after the fetch snapshot). PM NVDA
+  daily live BOTH sides (23 ticks/token; up-token at 0.585). ALL 11
+  stock instruments + the equity daily are receiving proper data.
+  BST0–BST7 complete except the 08-31 permissionSets re-probe (due
+  after the date) and the ≥24 h fleet soak (running passively).
+  Research loop deliberately NOT started — operator-ordered pause.
