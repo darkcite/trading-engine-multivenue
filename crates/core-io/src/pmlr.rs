@@ -85,6 +85,9 @@ pub enum SlotKind {
     /// [`core_types::OptSummary`] — options analytics capture
     /// (M2.3, mvp-plan §4-M2.3/§9.8; docs/m2-progress.md).
     OptSummary = 6,
+    /// [`core_types::DepthTopK`] — top-K L2 depth capture
+    /// (WS10-B, D-B1; docs/ws10-engine-plumbing-design.md §3).
+    Depth = 7,
 }
 
 impl SlotKind {
@@ -92,6 +95,19 @@ impl SlotKind {
     #[inline]
     pub const fn to_u8(self) -> u8 {
         self as u8
+    }
+
+    /// Record size for this kind (WS10-B format amendment: slot size
+    /// is KIND-determined — kinds 0–6 stay the original 64 B; kind 7
+    /// carries the 192 B [`core_types::DepthTopK`]). Always a
+    /// multiple of 64, so records never straddle a cache line and
+    /// mmap'd access stays aligned (header is 64 B).
+    #[inline]
+    pub const fn slot_size(self) -> usize {
+        match self {
+            Self::Depth => 192,
+            _ => SLOT_SIZE,
+        }
     }
 
     /// Decode a byte from a mmap'd header. Returns `None` for unknown
@@ -106,6 +122,7 @@ impl SlotKind {
             4 => Some(Self::AiCmd),
             5 => Some(Self::Event),
             6 => Some(Self::OptSummary),
+            7 => Some(Self::Depth),
             _ => None,
         }
     }
@@ -188,18 +205,19 @@ impl PmlrWriter {
     ///
     /// # Panics
     ///
-    /// Debug builds assert that `size_of::<R>() == SLOT_SIZE`; release
-    /// builds silently would-be-corrupt the file if a caller ever
-    /// supplies a non-64-byte record. The `AsBytes` marker trait is
-    /// only implemented for the four hot-path types, all of which
-    /// statically assert 64 B at build time, so this is unreachable in
-    /// practice.
+    /// Debug builds assert that `size_of::<R>()` equals the file
+    /// kind's [`SlotKind::slot_size`] (WS10-B: 64 B for kinds 0–6,
+    /// 192 B for `Depth`); release builds would silently corrupt the
+    /// file if a caller ever supplied a wrong-size record. The
+    /// `AsBytes` marker trait is only implemented for the capture
+    /// types, all of which statically assert their size at build
+    /// time, so this is unreachable in practice.
     #[inline]
     pub fn append<R: AsBytes>(&mut self, record: &R) -> io::Result<()> {
         debug_assert_eq!(
             core::mem::size_of::<R>(),
-            SLOT_SIZE,
-            "PMLR records must be exactly 64 bytes",
+            self.slot_kind.slot_size(),
+            "PMLR record size must match the file kind's slot size",
         );
         // SAFETY: `R: AsBytes` is an unsafe marker trait whose impls
         // promise `R` is `#[repr(C)] + Copy` with no uninitialized
@@ -262,6 +280,7 @@ mod tests {
         assert_eq!(SlotKind::from_u8(4), Some(SlotKind::AiCmd));
         assert_eq!(SlotKind::from_u8(5), Some(SlotKind::Event));
         assert_eq!(SlotKind::from_u8(6), Some(SlotKind::OptSummary));
+        assert_eq!(SlotKind::from_u8(7), Some(SlotKind::Depth));
         assert_eq!(SlotKind::from_u8(42), None);
     }
 

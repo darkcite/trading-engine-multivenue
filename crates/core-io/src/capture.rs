@@ -18,6 +18,11 @@
 //! * `<venue>-signals.pmlr` — [`SlotKind::Signal`] slots (RPC ingress;
 //!   empty 64 B header-only file on venues that emit none — uniform
 //!   construction beats per-venue file sets).
+//! * `<venue>-opt-summary.pmlr` — [`SlotKind::OptSummary`] slots
+//!   (M2.3 options analytics; header-only without an options lane).
+//! * `<venue>-depth.pmlr`   — [`SlotKind::Depth`] slots (WS10-B top-K
+//!   L2 snapshots, change-gated; header-only without a depth
+//!   subscription).
 //! * `<venue>-raw.tap`      — optional bounded raw-payload tap, see
 //!   below. Only created when the tap mode is not [`TapMode::Off`].
 //!
@@ -56,7 +61,7 @@
 use std::io;
 use std::path::Path;
 
-use core_types::{Capture, ChannelEvent, NsTs, OptSummary, Signal, Tick};
+use core_types::{Capture, ChannelEvent, DepthTopK, NsTs, OptSummary, Signal, Tick};
 
 use crate::pmlr::{PmlrWriter, SlotKind};
 use crate::PreallocatedWriter;
@@ -143,6 +148,7 @@ pub struct PmlrCapture {
     events: PmlrWriter,
     signals: PmlrWriter,
     opt_summaries: PmlrWriter,
+    depths: PmlrWriter,
     tap: Option<PreallocatedWriter>,
     tap_mode: TapMode,
     tap_budget_left: u64,
@@ -190,6 +196,14 @@ impl PmlrCapture {
             SlotKind::OptSummary,
             epoch_ns,
         )?;
+        // WS10-B: top-K depth channel (D-B1). Opened for EVERY venue
+        // like opt-summary — header-only on venues without a depth
+        // subscription (the house uniform-file-set pattern).
+        let depths = PmlrWriter::open(
+            dir.join(format!("{venue_label}-depth.pmlr")),
+            SlotKind::Depth,
+            epoch_ns,
+        )?;
         let tap = match tap_cfg.mode {
             TapMode::Off => None,
             TapMode::Rejects | TapMode::All => {
@@ -225,6 +239,7 @@ impl PmlrCapture {
             events,
             signals,
             opt_summaries,
+            depths,
             tap,
             tap_mode: tap_cfg.mode,
             tap_budget_left: tap_cfg.budget_bytes,
@@ -295,6 +310,12 @@ impl PmlrCapture {
         self.opt_summaries.records_written()
     }
 
+    /// DepthTopK slots staged since open (WS10-B).
+    #[inline]
+    pub fn depths_written(&self) -> u64 {
+        self.depths.records_written()
+    }
+
     /// Tap records staged since open.
     #[inline]
     pub fn tap_records(&self) -> u64 {
@@ -315,6 +336,7 @@ impl PmlrCapture {
         self.events.flush()?;
         self.signals.flush()?;
         self.opt_summaries.flush()?;
+        self.depths.flush()?;
         if let Some(t) = self.tap.as_mut() {
             t.flush_staging()?;
         }
@@ -400,6 +422,16 @@ impl Capture for PmlrCapture {
             return;
         }
         if self.opt_summaries.append(o).is_err() {
+            self.note_io_error();
+        }
+    }
+
+    #[inline]
+    fn depth(&mut self, d: &DepthTopK) {
+        if !self.enabled {
+            return;
+        }
+        if self.depths.append(d).is_err() {
             self.note_io_error();
         }
     }
@@ -692,6 +724,52 @@ mod tests {
             got.flags,
             core_types::OPT_SUMMARY_FLAG_MARK_PX | core_types::OPT_SUMMARY_FLAG_OI
         );
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_roundtrips_depth_channel() {
+        // WS10-B: slot kind 7 round-trips through the uniform file
+        // set (`<venue>-depth.pmlr` exists for every venue).
+        let dir = temp_dir("depth");
+        let mut c = PmlrCapture::open(&dir, "okx", 91, TapCfg::off()).unwrap();
+        let mut bids = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        let mut asks = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        bids[0] = core_types::DepthLevel {
+            px_1e6: 65_000_010_000,
+            qty_1e6: 1_234_000,
+        };
+        asks[0] = core_types::DepthLevel {
+            px_1e6: 65_000_550_000,
+            qty_1e6: 987_000,
+        };
+        let d = DepthTopK::new(
+            2_000,
+            VenueId::Okx,
+            core_types::make_symbol_id(VenueId::Okx, 1),
+            0,
+            bids,
+            asks,
+        );
+        c.depth(&d);
+        c.flush_all().unwrap();
+        assert_eq!(c.depths_written(), 1);
+        assert_eq!(c.io_errors(), 0);
+
+        let r = crate::PmlrReader::<DepthTopK>::open(dir.join("okx-depth.pmlr")).unwrap();
+        assert_eq!(r.slot_kind(), SlotKind::Depth);
+        assert_eq!(r.epoch_ns(), 91);
+        assert_eq!(r.len(), 1);
+        let got = &r.records()[0];
+        assert_eq!(got.ts_ns, 2_000);
+        assert_eq!(got.bids[0].px_1e6, 65_000_010_000);
+        assert_eq!(got.asks[0].qty_1e6, 987_000);
+        assert_eq!(got.k, core_types::DEPTH_K as u8);
+        // Failure-mode shape: a venue that never emits depth leaves a
+        // header-only file behind.
+        let empty = crate::PmlrReader::<DepthTopK>::open(dir.join("okx-depth.pmlr")).unwrap();
+        assert!(!empty.is_empty(), "same file re-read");
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -33,8 +33,8 @@ use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
-    AiCmd, ChannelEvent, Fill, Order, RuleTableSlot, Signal, Tick, VenueId, AI_RING_SIZE,
-    EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    AiCmd, ChannelEvent, DepthTopK, Fill, Order, RuleTableSlot, Signal, Tick, VenueId,
+    AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
@@ -103,6 +103,28 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
 /// [`core_types::EVENT_RING_SIZE`].
 pub const NUM_EVENT_LANES: usize = NUM_TICK_LANES;
 
+/// Number of depth lanes (WS10-B): only the venues with an L2 delta
+/// subscription — 0 = OKX (`books`), 1 = Deribit (`book.100ms`).
+/// [`DepthTopK`] slots, [`DEPTH_RING_SIZE`] capacity, mapped by
+/// [`depth_lane_of`]. Extending to another venue grows this constant
+/// and the map — mechanical, like the tick lanes.
+pub const NUM_DEPTH_LANES: usize = 2;
+
+/// Depth-lane index for a venue with an L2 subscription; `None` for
+/// every other venue. Cold-path helper for boot wiring.
+#[inline]
+pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
+    match venue {
+        VenueId::Okx => Some(0),
+        VenueId::Deribit => Some(1),
+        VenueId::Polymarket
+        | VenueId::Binance
+        | VenueId::Hyperliquid
+        | VenueId::Ai
+        | VenueId::Bybit => None,
+    }
+}
+
 /// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
 /// Binance is market-data-only, so it has no fill lane.
 pub const NUM_FILL_LANES: usize = 4;
@@ -148,6 +170,8 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Venue-event lanes (WS10-A), tick-lane indexing. v1 carries
     /// funding only (the spawn-time `event_mask` gates producers).
     event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
+    /// Depth lanes (WS10-B), [`depth_lane_of`] indexing.
+    depth_lanes: [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
@@ -207,6 +231,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative venue events dispatched to `on_venue_event`
     /// (WS10-A, all event lanes combined).
     pub events_dispatched: u64,
+    /// Cumulative depth snapshots dispatched to `on_depth`
+    /// (WS10-B, both depth lanes combined).
+    pub depths_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
     //
@@ -256,6 +283,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         disp: D,
         tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
+        depth_lanes: [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
         sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
         fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         ai_cons: Consumer<AiCmd, AI_RING_SIZE>,
@@ -267,6 +295,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             disp,
             tick_lanes,
             event_lanes,
+            depth_lanes,
             sig_cons,
             fill_lanes,
             ai_cons,
@@ -282,6 +311,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             signals_dispatched: 0,
             fills_dispatched: 0,
             events_dispatched: 0,
+            depths_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
             decide_lat: LatencyTracker::new(),
             ack_lat: LatencyTracker::new(),
@@ -457,6 +487,33 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         };
                         self.strat.on_venue_event(&e, &mut ctx);
                         self.events_dispatched = self.events_dispatched.wrapping_add(1);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
+            lane += 1;
+        }
+
+        // --- depth lanes (WS10-B) ---
+        // Change-gated at the ingress (a slot means the top-K moved);
+        // 10–20 Hz/instrument — drained after the event lanes with
+        // the same budget shape.
+        let mut lane = 0;
+        while lane < NUM_DEPTH_LANES {
+            let mut i = 0;
+            while i < max_per_ring {
+                match self.depth_lanes[lane].try_pop() {
+                    Some(d) => {
+                        let now = now_ns();
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
+                            now,
+                        };
+                        self.strat.on_depth(&d, &mut ctx);
+                        self.depths_dispatched = self.depths_dispatched.wrapping_add(1);
                     }
                     None => break,
                 }
@@ -836,6 +893,11 @@ mod tests {
         /// v0 of the most recent delivered event — pins payload
         /// pass-through.
         last_event_v0: i64,
+        /// Depth snapshots delivered via `on_depth` (WS10-B).
+        depths: u32,
+        /// Best-bid px of the most recent snapshot — pins payload
+        /// pass-through.
+        last_depth_bid_px: i64,
         /// Ruleset tables delivered via `on_ruleset_table` (8g §6).
         tables: u32,
         /// Epoch of the most recent delivered table — pins in-ring
@@ -870,6 +932,10 @@ mod tests {
         fn on_venue_event<C: Ctx>(&mut self, e: &ChannelEvent, _ctx: &mut C) {
             self.events += 1;
             self.last_event_v0 = e.v0;
+        }
+        fn on_depth<C: Ctx>(&mut self, d: &DepthTopK, _ctx: &mut C) {
+            self.depths += 1;
+            self.last_depth_bid_px = d.bids[0].px_1e6;
         }
         fn on_ruleset_table(&mut self, table: &core_types::RuleTable) {
             self.tables += 1;
@@ -921,6 +987,15 @@ mod tests {
         ([p0, p1, p2, p3, p4, p5], [c0, c1, c2, c3, c4, c5])
     }
 
+    fn split_depth_lanes() -> (
+        [Producer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
+        [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
+    ) {
+        let (p0, c0) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
+        let (p1, c1) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
+        ([p0, p1], [c0, c1])
+    }
+
     fn split_fill_lanes() -> (
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
@@ -948,6 +1023,9 @@ mod tests {
     ) {
         let (tp, tc) = split_tick_lanes();
         let (ep, ec) = split_event_lanes();
+        // Depth producers deliberately dropped — the dedicated depth
+        // test builds its own engine with a live producer.
+        let (_dp, dc) = split_depth_lanes();
         let sig_ring: std::sync::Arc<Ring<Signal, SIGNAL_RING_SIZE>> = Ring::new();
         let (sp, sc) = sig_ring.split();
         let (fp, fc) = split_fill_lanes();
@@ -961,6 +1039,7 @@ mod tests {
             disp,
             tc,
             ec,
+            dc,
             sc,
             fc,
             ac,
@@ -1056,7 +1135,9 @@ mod tests {
         eng.start().unwrap();
         // One funding event per producing venue (lane indices per
         // tick_lane_of: okx 2, deribit 3, bn 1, bybit 5).
-        ep[2].try_push(mk_funding_event(VenueId::Okx, 7, 125)).unwrap();
+        ep[2]
+            .try_push(mk_funding_event(VenueId::Okx, 7, 125))
+            .unwrap();
         ep[3]
             .try_push(mk_funding_event(VenueId::Deribit, 8, -50))
             .unwrap();
@@ -1093,7 +1174,78 @@ mod tests {
         eng.tick(3);
         assert_eq!(eng.events_dispatched, 3, "budget caps one iteration");
         eng.tick(16);
-        assert_eq!(eng.events_dispatched, 10, "backlog drains across iterations");
+        assert_eq!(
+            eng.events_dispatched, 10,
+            "backlog drains across iterations"
+        );
+    }
+
+    #[test]
+    fn engine_drains_depth_lanes_and_dispatches() {
+        // WS10-B: own engine build — the shared harness drops depth
+        // producers.
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (mut dp, dc) = split_depth_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            Counter::default(),
+            PaperDispatcher::new(),
+            tc,
+            ec,
+            dc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+
+        let mut bids = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        bids[0] = core_types::DepthLevel {
+            px_1e6: 65_000_010_000,
+            qty_1e6: 1_000_000,
+        };
+        let d_okx = DepthTopK::new(
+            1,
+            VenueId::Okx,
+            7,
+            0,
+            bids,
+            [core_types::DepthLevel::EMPTY; core_types::DEPTH_K],
+        );
+        // Lane map: OKX = 0, Deribit = 1 (depth_lane_of).
+        dp[depth_lane_of(VenueId::Okx).unwrap()]
+            .try_push(d_okx)
+            .unwrap();
+        dp[depth_lane_of(VenueId::Deribit).unwrap()]
+            .try_push(DepthTopK::EMPTY)
+            .unwrap();
+        eng.tick(16);
+        assert_eq!(eng.depths_dispatched, 2, "one per depth lane");
+        assert_eq!(eng.strategy().depths, 2);
+        // Lanes drain in index order → deribit's EMPTY (bid px 0)
+        // arrives last; okx's payload passed through en route.
+        assert_eq!(eng.strategy().last_depth_bid_px, 0);
+        assert_eq!(eng.ticks_dispatched, 0);
+        // Empty lanes are per-iteration no-ops.
+        eng.tick(16);
+        assert_eq!(eng.depths_dispatched, 2);
+    }
+
+    #[test]
+    fn depth_lane_map_matches_layout() {
+        assert_eq!(depth_lane_of(VenueId::Okx), Some(0));
+        assert_eq!(depth_lane_of(VenueId::Deribit), Some(1));
+        assert_eq!(depth_lane_of(VenueId::Polymarket), None);
+        assert_eq!(depth_lane_of(VenueId::Binance), None);
+        assert_eq!(depth_lane_of(VenueId::Hyperliquid), None);
+        assert_eq!(depth_lane_of(VenueId::Bybit), None);
+        assert_eq!(depth_lane_of(VenueId::Ai), None);
     }
 
     /// Dispatcher that emits one queued fill — proves the D3 pump.
@@ -1119,6 +1271,7 @@ mod tests {
         let (_tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
         let (_fp, fc) = split_fill_lanes();
         let disp = OneFillDispatcher {
             fill: Some(Fill::new(
@@ -1139,6 +1292,7 @@ mod tests {
             disp,
             tc,
             ec,
+            dc,
             sc,
             fc,
             ac,
@@ -1220,6 +1374,7 @@ mod tests {
         let (_tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
         let (mut fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let disp = OneFillDispatcher {
@@ -1240,6 +1395,7 @@ mod tests {
             disp,
             tc,
             ec,
+            dc,
             sc,
             fc,
             ac,
@@ -1328,6 +1484,7 @@ mod tests {
         let (mut tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
@@ -1336,6 +1493,7 @@ mod tests {
             PaperDispatcher::new(),
             tc,
             ec,
+            dc,
             sc,
             fc,
             ac,
@@ -1394,6 +1552,7 @@ mod tests {
         let (mut tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
@@ -1402,6 +1561,7 @@ mod tests {
             RefuseAllDispatcher,
             tc,
             ec,
+            dc,
             sc,
             fc,
             ac,

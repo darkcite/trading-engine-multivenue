@@ -36,7 +36,7 @@ use std::path::Path;
 
 use core_types::AsBytes;
 
-use crate::pmlr::{HEADER_SIZE, MAGIC, SLOT_SIZE, VERSION};
+use crate::pmlr::{HEADER_SIZE, MAGIC, VERSION};
 use crate::SlotKind;
 
 // ---------------------------------------------------------------
@@ -54,9 +54,11 @@ pub enum PmlrReadErr {
     UnsupportedVersion(u16),
     /// `slot_kind` byte is not a valid [`SlotKind`] variant.
     UnknownSlotKind(u8),
-    /// Payload length after the header isn't a multiple of [`SLOT_SIZE`].
+    /// Payload length after the header isn't a multiple of the
+    /// header kind's [`SlotKind::slot_size`].
     PayloadNotMultipleOfSlot,
-    /// Caller-typed record size doesn't equal [`SLOT_SIZE`].
+    /// Caller-typed record size doesn't equal the header kind's
+    /// [`SlotKind::slot_size`].
     RecordSizeMismatch(usize),
 }
 
@@ -88,7 +90,8 @@ impl std::error::Error for PmlrReadErr {}
 /// 1. `ptr` / `len` come from a successful `mmap(PROT_READ,
 ///    MAP_PRIVATE)` and stay live for the reader's entire lifetime.
 /// 2. The slice `records()` returns has length
-///    `(len - HEADER_SIZE) / SLOT_SIZE` and is aligned to at least
+///    `(len - HEADER_SIZE) / slot_size` (kind-determined) and is
+///    aligned to at least
 ///    `align_of::<R>()` because `mmap` always returns page-aligned
 ///    memory (4 KiB on Unix; page size >= max cache-line alignment
 ///    used by our POD types).
@@ -114,12 +117,6 @@ impl<R: AsBytes> PmlrReader<R> {
     /// as `io::Error`. Header-validation errors surface as
     /// `io::Error::other(PmlrReadErr)`.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        if core::mem::size_of::<R>() != SLOT_SIZE {
-            return Err(io::Error::other(PmlrReadErr::RecordSizeMismatch(
-                core::mem::size_of::<R>(),
-            )));
-        }
-
         let path = path.as_ref();
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -212,8 +209,23 @@ impl<R: AsBytes> PmlrReader<R> {
             header[15],
         ]);
 
+        // WS10-B: slot size is KIND-determined (64 B for kinds 0-6,
+        // 192 B for Depth). The typed check runs against the header's
+        // kind, so a mis-typed open of ANY kind still errors cleanly.
+        let slot_size = slot_kind.slot_size();
+        if core::mem::size_of::<R>() != slot_size {
+            // SAFETY: ptr + len + fd valid.
+            unsafe {
+                libc::munmap(raw, len);
+                libc::close(fd);
+            }
+            return Err(io::Error::other(PmlrReadErr::RecordSizeMismatch(
+                core::mem::size_of::<R>(),
+            )));
+        }
+
         let payload_len = len - HEADER_SIZE;
-        if payload_len % SLOT_SIZE != 0 {
+        if payload_len % slot_size != 0 {
             // SAFETY: ptr + len + fd valid.
             unsafe {
                 libc::munmap(raw, len);
@@ -229,7 +241,7 @@ impl<R: AsBytes> PmlrReader<R> {
             version: ver,
             slot_kind,
             epoch_ns,
-            record_count: payload_len / SLOT_SIZE,
+            record_count: payload_len / slot_size,
             _marker: PhantomData,
         })
     }
@@ -275,7 +287,7 @@ impl<R: AsBytes> PmlrReader<R> {
         // SAFETY:
         // * `ptr.add(HEADER_SIZE)` is within the mapping (we verified
         //   `len >= HEADER_SIZE`).
-        // * `record_count * SLOT_SIZE + HEADER_SIZE == len` (checked
+        // * `record_count * slot_size + HEADER_SIZE == len` (checked
         //   in `open`).
         // * `R: AsBytes` ⇒ `R: Copy` + `#[repr(C)]` with no
         //   uninit padding, so the bytes are a valid `R` bit-pattern
@@ -295,7 +307,12 @@ impl<R: AsBytes> PmlrReader<R> {
         if i < self.record_count {
             // SAFETY: bounds checked above; alignment + repr guaranteed
             // by `AsBytes`.
-            Some(unsafe { self.ptr.add(HEADER_SIZE + i * SLOT_SIZE).cast::<R>().read() })
+            Some(unsafe {
+                self.ptr
+                    .add(HEADER_SIZE + i * self.slot_kind.slot_size())
+                    .cast::<R>()
+                    .read()
+            })
         } else {
             None
         }

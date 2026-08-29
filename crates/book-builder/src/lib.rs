@@ -12,9 +12,10 @@
 //!   slots indexed by `SymbolId`. Linear-scan lookup, zero-alloc
 //!   apply, cache-aligned slots.
 //!
-//! Full L2 ladders are deferred to Phase 3 if the strategy needs
-//! depth — current Polymarket markets have so little depth past
-//! the top that mid-vs-mid is sufficient for the edge.
+//! WS10-B adds [`ladder`] — the bounded in-ingress L2 ladder behind
+//! the `DepthTopK` carrier (OKX `books` / Deribit `book.100ms`).
+//! Polymarket stays top-of-book: its markets have so little depth
+//! past the top that mid-vs-mid carries the edge.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -27,6 +28,8 @@
 )]
 
 use core_types::{Price, Qty, SymbolId, Tick, SYMBOL_ID_NONE};
+
+pub mod ladder;
 
 /// Outcome of [`TopOfBook::apply`]. D10 fix: out-of-order and gapped
 /// events are counted and surfaced to the caller instead of silently

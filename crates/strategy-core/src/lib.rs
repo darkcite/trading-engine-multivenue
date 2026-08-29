@@ -30,7 +30,7 @@
 )]
 
 use core_time::NsTs;
-use core_types::{AiCmd, ChannelEvent, Fill, Order, RuleTable, Signal, Tick};
+use core_types::{AiCmd, ChannelEvent, DepthTopK, Fill, Order, RuleTable, Signal, Tick};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -334,6 +334,21 @@ pub trait Strategy: StrategyCounters {
         let _ = (event, ctx);
     }
 
+    /// Called once per [`DepthTopK`] popped from a depth lane
+    /// (WS10-B). Snapshots are change-gated at the ingress (a delivery
+    /// means the top-K actually moved); `flags` carrying
+    /// `DEPTH_FLAG_STALE` marks a book mid-resync — never trade on a
+    /// stale snapshot.
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged; `strategy-set` forwards it to enabled
+    /// members like `on_tick`. Monomorphized — no `dyn`. Lands dark
+    /// in Stage 2: no in-tree strategy consumes it yet.
+    #[inline]
+    fn on_depth<C: Ctx>(&mut self, depth: &DepthTopK, ctx: &mut C) {
+        let _ = (depth, ctx);
+    }
+
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C);
@@ -462,6 +477,25 @@ mod tests {
             1_700_000_000_000,
         );
         s.on_venue_event(&ev, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
+    }
+
+    #[test]
+    fn on_depth_defaults_to_noop() {
+        // WS10-B default: a delivered depth snapshot touches neither
+        // strategy state nor the Ctx.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let d = DepthTopK::EMPTY;
+        s.on_depth(&d, &mut ctx);
         assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
         assert_eq!(ctx.submitted, 0, "default hook must not submit");
     }

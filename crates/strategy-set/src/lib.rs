@@ -529,6 +529,36 @@ impl Strategy for StrategySet {
         }
     }
 
+    /// WS10-B: depth snapshots fan out to enabled members exactly
+    /// like ticks/events — same mask gate, same slot stamping.
+    #[inline(always)]
+    fn on_depth<C: Ctx>(&mut self, depth: &core_types::DepthTopK, ctx: &mut C) {
+        if self.enabled & BIT_LATENCY_ARB != 0 {
+            self.latency_arb
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        }
+        if self.enabled & BIT_EV != 0 {
+            self.ev
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        }
+        if self.enabled & BIT_CROSS_ARB != 0 {
+            self.cross_arb
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
+        }
+        if self.enabled & BIT_RULE_TREE != 0 {
+            self.rule_tree
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        }
+        if self.enabled & BIT_AI_EXEC != 0 {
+            self.ai_exec
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
+        }
+        if self.enabled & BIT_VM != 0 {
+            self.vm
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+    }
+
     #[inline(always)]
     fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C) {
         if self.enabled & BIT_LATENCY_ARB != 0 {

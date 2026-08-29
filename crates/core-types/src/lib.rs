@@ -653,6 +653,16 @@ unsafe impl AsBytes for OptSummary {}
 
 const _: () = assert!(core::mem::size_of::<OptSummary>() == 64);
 
+// SAFETY: DepthTopK is `#[repr(C, align(64))]`, `#[derive(Copy)]`,
+// all fields plain integers / `#[repr(C)]` integer-pair levels +
+// explicit `_pad` bytes summing to exactly 192 bytes (checked by
+// `depth_top_k_layout_is_fully_explicit` in tests); no
+// compiler-inserted padding, every byte initialized.
+unsafe impl AsBytes for DepthTopK {}
+
+const _: () = assert!(core::mem::size_of::<DepthTopK>() == 192);
+const _: () = assert!(core::mem::align_of::<DepthTopK>() == 64);
+
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
 // ---------------------------------------------------------------
@@ -831,6 +841,119 @@ impl ChannelEvent {
             _pad1: [0; 16],
         }
     }
+}
+
+// ---------------------------------------------------------------
+// DepthTopK — L2 top-of-book depth carrier (WS10-B)
+// ---------------------------------------------------------------
+
+/// Levels per side carried by [`DepthTopK`] (D-B2). The in-ingress
+/// ladder maintains up to `book_builder::DEPTH_LADDER_CAP` levels;
+/// K is the CARRIER bound — what strategies and the depth capture
+/// see.
+pub const DEPTH_K: usize = 5;
+
+/// Capacity of every depth SPSC ring (WS10-B). Book channels run
+/// 10–20 Hz/instrument and emission is change-gated, so 4096 slots
+/// is generous headroom. Power of two, like every `core-ring`
+/// capacity.
+pub const DEPTH_RING_SIZE: usize = 4096;
+
+/// [`DepthTopK::flags`] bit 0: the book behind this snapshot broke
+/// its venue seq chain and is resyncing — a strategy must never
+/// trade a known-broken book. Set on the ladder-clearing emit; the
+/// first post-resync snapshot arrives with flags = 0.
+pub const DEPTH_FLAG_STALE: u8 = 1;
+
+/// One price level inside [`DepthTopK`]. `qty_1e6 == 0` marks an
+/// unpopulated slot (a book with fewer than K levels on that side).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct DepthLevel {
+    /// Price ×1e6.
+    pub px_1e6: i64,
+    /// Quantity ×1e6 (venue-native units, per the venue's tick
+    /// convention documented in docs/wire-format.md).
+    pub qty_1e6: i64,
+}
+
+impl DepthLevel {
+    /// The unpopulated-slot sentinel.
+    pub const EMPTY: Self = Self {
+        px_1e6: 0,
+        qty_1e6: 0,
+    };
+}
+
+/// Top-K L2 depth snapshot (WS10-B, D-B1/D-B2): the carrier the
+/// in-ingress ladder emits onto the per-venue depth ring AND into
+/// the `<venue>-depth.pmlr` capture (slot kind 7) whenever the top-K
+/// actually changed (byte-compare emission gate). 192 bytes, three
+/// cache lines.
+///
+/// `bids` are best-first (descending price), `asks` best-first
+/// (ascending price); slots beyond the book's real depth are
+/// [`DepthLevel::EMPTY`].
+#[derive(Copy, Clone, Debug)]
+#[repr(C, align(64))]
+pub struct DepthTopK {
+    /// When the ingress thread finished applying the update that
+    /// produced this snapshot.
+    pub ts_ns: NsTs,
+    /// Venue-namespaced symbol.
+    pub sym: SymbolId,
+    /// Producing venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// Populated level count hint: `min(K, real bid levels)` in the
+    /// low nibble is deliberately NOT packed — `k` carries
+    /// [`DEPTH_K`] for forward-compat readers.
+    pub k: u8,
+    /// [`DEPTH_FLAG_STALE`] et al.
+    pub flags: u8,
+    /// Reserved. Always zero.
+    _pad0: u8,
+    /// Best-first bid levels.
+    pub bids: [DepthLevel; DEPTH_K],
+    /// Best-first ask levels.
+    pub asks: [DepthLevel; DEPTH_K],
+    /// Explicit tail padding (see [`AsBytes`]). Always zero.
+    _pad1: [u8; 16],
+}
+
+impl DepthTopK {
+    /// Construct with zeroed padding.
+    #[inline(always)]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        flags: u8,
+        bids: [DepthLevel; DEPTH_K],
+        asks: [DepthLevel; DEPTH_K],
+    ) -> Self {
+        Self {
+            ts_ns,
+            sym,
+            venue: venue as u8,
+            k: DEPTH_K as u8,
+            flags,
+            _pad0: 0,
+            bids,
+            asks,
+            _pad1: [0; 16],
+        }
+    }
+
+    /// The all-empty snapshot (boot value for last-emitted compare
+    /// state; also the base of a STALE emit).
+    pub const EMPTY: Self = Self::new(
+        0,
+        VenueId::Polymarket,
+        0,
+        0,
+        [DepthLevel::EMPTY; DEPTH_K],
+        [DepthLevel::EMPTY; DEPTH_K],
+    );
 }
 
 // ---------------------------------------------------------------
@@ -1341,6 +1464,12 @@ pub trait Capture {
     /// One parsed non-tick channel event.
     #[inline(always)]
     fn event(&mut self, _e: &ChannelEvent) {}
+
+    /// One emitted top-K depth snapshot (WS10-B, D-B1 — slot kind 7,
+    /// `<venue>-depth.pmlr`). Called at the change-gated emission
+    /// site, BEFORE the depth-ring push (capture-before-push law).
+    #[inline(always)]
+    fn depth(&mut self, _d: &DepthTopK) {}
 
     /// One parsed signal (RPC ingress).
     #[inline(always)]
@@ -1889,6 +2018,41 @@ mod channel_event_tests {
         // inserted padding would break the AsBytes contract.
         assert_eq!(::core::mem::size_of::<ChannelEvent>(), 64);
         assert_eq!(::core::mem::align_of::<ChannelEvent>(), 64);
+    }
+
+    #[test]
+    fn depth_top_k_layout_is_fully_explicit() {
+        // WS10-B: 8+4+1+1+1+1 + 5×16 + 5×16 + 16 = 192 — any
+        // compiler-inserted padding would break the AsBytes contract.
+        assert_eq!(::core::mem::size_of::<DepthTopK>(), 192);
+        assert_eq!(::core::mem::align_of::<DepthTopK>(), 64);
+        assert_eq!(::core::mem::size_of::<DepthLevel>(), 16);
+    }
+
+    #[test]
+    fn depth_top_k_new_and_empty_shape() {
+        let mut bids = [DepthLevel::EMPTY; DEPTH_K];
+        bids[0] = DepthLevel {
+            px_1e6: 65_000_010_000,
+            qty_1e6: 1_234_000,
+        };
+        let d = DepthTopK::new(
+            7,
+            VenueId::Okx,
+            make_symbol_id(VenueId::Okx, 1),
+            0,
+            bids,
+            [DepthLevel::EMPTY; DEPTH_K],
+        );
+        assert_eq!(d.k, DEPTH_K as u8);
+        assert_eq!(d.venue, VenueId::Okx as u8);
+        assert_eq!(d.bids[0].px_1e6, 65_000_010_000);
+        assert_eq!(d.bids[1], DepthLevel::EMPTY);
+        assert_eq!(d.flags, 0);
+        // Failure-mode shape: EMPTY is all-zero and byte-comparable.
+        let e = DepthTopK::EMPTY;
+        assert_eq!(e.ts_ns, 0);
+        assert_eq!(e.bids[DEPTH_K - 1], DepthLevel::EMPTY);
     }
 
     #[test]
