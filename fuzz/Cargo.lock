@@ -18,6 +18,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "book-builder"
+version = "0.1.0"
+dependencies = [
+ "core-ring",
+ "core-time",
+ "core-types",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -199,6 +208,7 @@ dependencies = [
 name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",
@@ -228,6 +238,7 @@ dependencies = [
 name = "ingress-okx"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",
@@ -331,6 +342,7 @@ version = "0.1.0"
 name = "polymarket-fuzz"
 version = "0.0.0"
 dependencies = [
+ "book-builder",
  "clob-dispatcher",
  "core-config",
  "core-crypto",

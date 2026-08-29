@@ -109,8 +109,8 @@ use core_net::{
 use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{
-    Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId, EVENT_RING_SIZE,
-    SYMBOL_ID_NONE,
+    Capture, ChannelEvent, ChannelId, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
+    DEPTH_RING_SIZE, EVENT_RING_SIZE, SYMBOL_ID_NONE,
 };
 
 use crate::{
@@ -313,6 +313,12 @@ pub struct Driver {
     symbols: DeribitSymbolTable,
     /// Whether `book.*.100ms` is subscribed (`--deribit-depth`).
     depth_enabled: bool,
+    /// WS10-B: per-instrument depth ladders (symbol-table order;
+    /// empty when depth is off). Boot-allocated; steady state only
+    /// indexes.
+    ladders: Vec<book_builder::ladder::DepthLadder>,
+    /// WS10-B: last EMITTED top-K per instrument — the change gate.
+    last_depth: Vec<DepthTopK>,
     /// WS6: configured DVOL index names (`n_dvol` valid). Boot-set,
     /// connection-independent; ordinal = position here (the capture
     /// event's `v1` identity).
@@ -401,6 +407,17 @@ impl Driver {
             n_dvol += 1;
             i += 1;
         }
+        // WS10-B: per-instrument ladders + last-emitted snapshots,
+        // boot-allocated once (empty when depth is off).
+        let n_syms = symbols.len();
+        let (ladders, last_depth) = if depth_enabled {
+            (
+                vec![book_builder::ladder::DepthLadder::new(); n_syms],
+                vec![DepthTopK::EMPTY; n_syms],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -411,6 +428,8 @@ impl Driver {
             mask_counter: 0,
             symbols,
             depth_enabled,
+            ladders,
+            last_depth,
             dvol,
             n_dvol,
             subs: SubTable::new(),
@@ -520,6 +539,7 @@ pub fn drive_one<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -539,7 +559,9 @@ pub fn drive_one<T: Transport, C: Capture>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, event_tx, event_mask, status, capture)?;
+            drain_ws_frames(
+                drv, producer, event_tx, event_mask, depth_tx, status, capture,
+            )?;
         }
         State::Closed => {}
     }
@@ -937,15 +959,16 @@ enum Dispatch {
         sym_idx: u8,
         scan: TradeScan,
     },
-    /// `book` push header (`ts_ms` rides along for the phase-2
-    /// `BookGap` event's `venue_time_ms`).
+    /// `book` push — chain applied AND (WS10-B) ladder walked in
+    /// phase 1 (payload in scope there; the `BookGap` pairing event
+    /// moved with the apply). Phase 2 counts, rate-limit-logs and
+    /// queues the resync when `gapped`.
     Book {
         sym: u32,
         sym_idx: u8,
-        ts_ms: u64,
-        action: u8,
+        gapped: bool,
+        expected_prev: i64,
         prev: i64,
-        seq: i64,
     },
 }
 
@@ -954,6 +977,7 @@ fn drain_ws_frames<C: Capture>(
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -997,6 +1021,7 @@ fn drain_ws_frames<C: Capture>(
                             producer,
                             event_tx,
                             event_mask,
+                            depth_tx,
                             status,
                             capture,
                         )?;
@@ -1156,12 +1181,14 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
     scan
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_data_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -1318,8 +1345,7 @@ fn handle_data_frame<C: Capture>(
                                     // WS10-A: onto the venue-event
                                     // lane (capture stays first —
                                     // §6.5 capture-before-push law).
-                                    if event_mask
-                                        & core_types::event_lane_bit(ChannelId::Funding)
+                                    if event_mask & core_types::event_lane_bit(ChannelId::Funding)
                                         != 0
                                         && event_tx.try_push(ev).is_err()
                                     {
@@ -1358,13 +1384,53 @@ fn handle_data_frame<C: Capture>(
                                         + (b.excess_bids as i64)
                                         + (b.excess_asks as i64),
                                 ));
+                                // Chain apply moved into phase 1
+                                // (WS10-B needs the payload for the
+                                // level walk; `book_chains` and `rx`
+                                // are disjoint driver fields). The
+                                // §6.6 BookGap pairing event moves
+                                // with it; log + resync stay phase 2.
+                                let expected_prev = drv.book_chains[sym_idx].last_change_id();
+                                let outcome = drv.book_chains[sym_idx].apply(
+                                    b.action,
+                                    b.prev_change_id,
+                                    b.change_id,
+                                );
+                                let gapped = matches!(outcome, ChainOutcome::Gap);
+                                if gapped {
+                                    // §6.6 pairing: v0 = expected prev
+                                    // (i64::MIN = awaiting snapshot),
+                                    // v1 = observed prev.
+                                    capture.event(&ChannelEvent::new(
+                                        now_ns(),
+                                        VenueId::Deribit,
+                                        ChannelId::BookGap,
+                                        sym,
+                                        b.change_id as u64,
+                                        b.ts_ns / 1_000_000,
+                                        expected_prev,
+                                        b.prev_change_id,
+                                    ));
+                                }
+                                if !drv.ladders.is_empty() {
+                                    deribit_depth_step(
+                                        &mut drv.ladders[sym_idx],
+                                        &mut drv.last_depth[sym_idx],
+                                        payload,
+                                        sym,
+                                        gapped,
+                                        b.action == crate::BOOK_ACTION_SNAPSHOT,
+                                        depth_tx,
+                                        status,
+                                        capture,
+                                    );
+                                }
                                 Dispatch::Book {
                                     sym,
                                     sym_idx: sym_idx as u8,
-                                    ts_ms: b.ts_ns / 1_000_000,
-                                    action: b.action,
+                                    gapped,
+                                    expected_prev,
                                     prev: b.prev_change_id,
-                                    seq: b.change_id,
                                 }
                             }
                             None => Dispatch::Nothing,
@@ -1599,39 +1665,78 @@ fn handle_data_frame<C: Capture>(
         Dispatch::Book {
             sym,
             sym_idx,
-            ts_ms,
-            action,
+            gapped,
+            expected_prev,
             prev,
-            seq,
         } => {
             status.add_msgs(1);
             status.add_ticks(1);
-            let expected_prev = drv.book_chains[sym_idx as usize].last_change_id();
-            match drv.book_chains[sym_idx as usize].apply(action, prev, seq) {
-                ChainOutcome::Init | ChainOutcome::Chained => {}
-                ChainOutcome::Gap => {
-                    status.inc_gaps();
-                    // §6.6 pairing: v0 = expected prev (i64::MIN =
-                    // the monitor was still awaiting a snapshot),
-                    // v1 = observed prev.
-                    capture.event(&ChannelEvent::new(
-                        now_ns(),
-                        VenueId::Deribit,
-                        ChannelId::BookGap,
-                        sym,
-                        seq as u64,
-                        ts_ms,
-                        expected_prev,
-                        prev,
-                    ));
-                    log_gap_rate_limited(drv, b"book", sym, expected_prev, prev, 1);
-                    status.inc_resubscribes();
-                    queue_book_resync(drv, sym_idx as usize)?;
-                }
+            // Chain applied + BookGap event emitted in phase 1; the
+            // &mut-Driver log + tx-queueing halves live here.
+            if gapped {
+                status.inc_gaps();
+                log_gap_rate_limited(drv, b"book", sym, expected_prev, prev, 1);
+                status.inc_resubscribes();
+                queue_book_resync(drv, sym_idx as usize)?;
             }
         }
     }
     Ok(())
+}
+
+/// WS10-B: one book frame's depth step — ladder maintenance +
+/// change-gated emission (capture first, then the depth-lane push;
+/// full-ring pushes count `depth_ring_drops`). On a chain gap the
+/// ladder clears and a `DEPTH_FLAG_STALE` snapshot ALWAYS emits so a
+/// strategy never trades a known-broken book.
+#[allow(clippy::too_many_arguments)]
+fn deribit_depth_step<C: Capture>(
+    ladder: &mut book_builder::ladder::DepthLadder,
+    last: &mut DepthTopK,
+    payload: &[u8],
+    sym: u32,
+    gapped: bool,
+    is_snapshot: bool,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    status: &IngressStatus,
+    capture: &mut C,
+) {
+    if gapped {
+        ladder.clear();
+        let stale = ladder.snapshot(
+            now_ns(),
+            VenueId::Deribit,
+            sym,
+            core_types::DEPTH_FLAG_STALE,
+        );
+        capture.depth(&stale);
+        if depth_tx.try_push(stale).is_err() {
+            status.inc_depth_ring_drops();
+        }
+        *last = stale;
+        return;
+    }
+    if is_snapshot {
+        ladder.clear();
+    }
+    match crate::walk_book_levels(payload, ladder) {
+        Some(_) => {
+            let snap = ladder.snapshot(now_ns(), VenueId::Deribit, sym, 0);
+            if !book_builder::ladder::levels_equal(&snap, last) {
+                capture.depth(&snap);
+                if depth_tx.try_push(snap).is_err() {
+                    status.inc_depth_ring_drops();
+                }
+                *last = snap;
+            }
+        }
+        None => {
+            // Malformed level rows behind a valid header: count it;
+            // the chain monitor remains the resync law.
+            status.inc_parse_errors();
+            capture.parse_reject(now_ns(), payload);
+        }
+    }
 }
 
 /// Rate-limited (1 line / [`GAP_LOG_INTERVAL_NS`]) gap log line —
@@ -1958,6 +2063,7 @@ pub fn run<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -2014,7 +2120,8 @@ pub fn run<T: Transport, C: Capture>(
             let n_before = producer.len();
             let state_before = drv.state();
             if let Err(e) = drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, status, capture,
+                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, status,
+                capture,
             ) {
                 status.note_session_err(
                     core_metrics::ERR_SITE_DRIVE,
@@ -2205,6 +2312,13 @@ mod tests {
         Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split()
     }
 
+    fn depth_ring_pair() -> (
+        Producer<DepthTopK, DEPTH_RING_SIZE>,
+        core_ring::Consumer<DepthTopK, DEPTH_RING_SIZE>,
+    ) {
+        Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split()
+    }
+
     /// WS10-A shim: legacy tests drive with a fresh throwaway event
     /// lane (mask = FUNDING; consumer dropped — pushes vanish). A
     /// local item shadows the glob-imported `super::drive_one`, so
@@ -2221,6 +2335,7 @@ mod tests {
         capture: &mut C,
     ) -> io::Result<()> {
         let (mut etx, _erx) = event_ring_pair();
+        let (mut dtx, _drx) = depth_ring_pair();
         super::drive_one(
             transport,
             drv,
@@ -2229,6 +2344,7 @@ mod tests {
             producer,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut dtx,
             status,
             capture,
         )
@@ -2251,6 +2367,7 @@ mod tests {
         capture: &mut C,
     ) -> RunResult {
         let (mut etx, _erx) = event_ring_pair();
+        let (mut dtx, _drx) = depth_ring_pair();
         super::run(
             transport,
             drv,
@@ -2259,6 +2376,7 @@ mod tests {
             producer,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut dtx,
             poll,
             events,
             token,
@@ -3499,6 +3617,7 @@ mod tests {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut depth_ring_pair().0,
             &status,
             &mut cap,
         )

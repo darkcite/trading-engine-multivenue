@@ -19,6 +19,7 @@ core-ring    = { workspace = true }
 core-metrics = { workspace = true }
 core-time    = { workspace = true }
 memchr       = { workspace = true }
+book-builder = { workspace = true }
 mio          = { workspace = true }
 options-select = { workspace = true }
 

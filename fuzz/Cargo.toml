@@ -27,6 +27,7 @@ ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-bybit      = { path = "../crates/ingress-bybit" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
 ingress-okx        = { path = "../crates/ingress-okx" }
+book-builder    = { path = "../crates/book-builder" }
 ingress-deribit    = { path = "../crates/ingress-deribit" }
 ingress-hyperliquid = { path = "../crates/ingress-hyperliquid" }
 core-net           = { path = "../crates/core-net" }
@@ -263,6 +264,20 @@ bench  = false
 [[bin]]
 name   = "binance_exchange_info"
 path   = "fuzz_targets/binance_exchange_info.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "okx_book_levels"
+path   = "fuzz_targets/okx_book_levels.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "deribit_book_levels"
+path   = "fuzz_targets/deribit_book_levels.rs"
 test   = false
 doc    = false
 bench  = false

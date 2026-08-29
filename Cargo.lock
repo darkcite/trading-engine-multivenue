@@ -850,6 +850,7 @@ dependencies = [
 name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",
@@ -885,6 +886,7 @@ dependencies = [
 name = "ingress-okx"
 version = "0.1.0"
 dependencies = [
+ "book-builder",
  "core-metrics",
  "core-net",
  "core-parse",

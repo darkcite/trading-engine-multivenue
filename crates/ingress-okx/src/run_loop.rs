@@ -72,8 +72,8 @@ use core_net::{
 use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{
-    Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId, EVENT_RING_SIZE,
-    SYMBOL_ID_NONE,
+    Capture, ChannelEvent, ChannelId, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
+    DEPTH_RING_SIZE, EVENT_RING_SIZE, SYMBOL_ID_NONE,
 };
 
 use crate::{
@@ -239,6 +239,13 @@ pub struct Driver {
     symbols: OkxSymbolTable,
     /// Whether `books` is subscribed (`--okx-depth`).
     depth_enabled: bool,
+    /// WS10-B: per-instrument depth ladders (symbol-table order;
+    /// empty when depth is off — the ladder path is one `is_empty`
+    /// branch per book frame then). Boot-allocated; steady state
+    /// only indexes.
+    ladders: Vec<book_builder::ladder::DepthLadder>,
+    /// WS10-B: last EMITTED top-K per instrument — the change gate.
+    last_depth: Vec<core_types::DepthTopK>,
     /// Acknowledged subscriptions.
     subs: SubTable<OkxSubKind, SUB_CAP>,
     /// Books `seqId`/`prevSeqId` chains, indexed by symbol-table row.
@@ -291,6 +298,18 @@ impl Driver {
     ) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        // WS10-B: per-instrument ladders + last-emitted snapshots,
+        // boot-allocated once (empty when depth is off — the ladder
+        // path is a single is_empty branch per book frame then).
+        let n_syms = symbols.len();
+        let (ladders, last_depth) = if depth_enabled {
+            (
+                vec![book_builder::ladder::DepthLadder::new(); n_syms],
+                vec![core_types::DepthTopK::EMPTY; n_syms],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut fam: [(u8, [u8; 24]); OPT_FAMILIES_MAX] = [(0, [0; 24]); OPT_FAMILIES_MAX];
         let mut n_families = 0usize;
         let mut i = 0;
@@ -319,6 +338,8 @@ impl Driver {
             mask_counter: 0,
             symbols,
             depth_enabled,
+            ladders,
+            last_depth,
             subs: SubTable::new(),
             book_chains: [OkxSeqChain::new(); OKX_MAX_SYMBOLS],
             trade_seqs: [TradeSeqMonitor::new(); OKX_MAX_SYMBOLS],
@@ -402,6 +423,7 @@ pub fn drive_one<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -421,7 +443,9 @@ pub fn drive_one<T: Transport, C: Capture>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, event_tx, event_mask, status, capture)?;
+            drain_ws_frames(
+                drv, producer, event_tx, event_mask, depth_tx, status, capture,
+            )?;
         }
         State::Closed => {}
     }
@@ -696,8 +720,10 @@ enum Dispatch {
     OptSummaries { scan: OptScan },
     /// `mark-price` / `funding-rate` push validated.
     Slow,
-    /// `books` push header.
-    Book { sym_idx: u8, prev: i64, seq: i64 },
+    /// `books` push — chain applied AND (WS10-B) ladder walked in
+    /// phase 1 (payload in scope there); phase 2 counts + queues the
+    /// resync when `gapped`.
+    Book { sym_idx: u8, gapped: bool },
 }
 
 fn drain_ws_frames<C: Capture>(
@@ -705,6 +731,7 @@ fn drain_ws_frames<C: Capture>(
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -737,6 +764,7 @@ fn drain_ws_frames<C: Capture>(
                             producer,
                             event_tx,
                             event_mask,
+                            depth_tx,
                             status,
                             capture,
                         )?;
@@ -896,12 +924,14 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
     scan
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_data_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -1044,10 +1074,30 @@ fn handle_data_frame<C: Capture>(
                                     b.prev_seq_id,
                                     0,
                                 ));
+                                // Chain apply moved into phase 1
+                                // (WS10-B needs the payload for the
+                                // level walk; `book_chains` and `rx`
+                                // are disjoint driver fields). Resync
+                                // queueing stays in phase 2.
+                                let outcome =
+                                    drv.book_chains[sym_idx].apply(b.prev_seq_id, b.seq_id);
+                                let gapped = matches!(outcome, ChainOutcome::Gap);
+                                if !drv.ladders.is_empty() {
+                                    okx_depth_step(
+                                        &mut drv.ladders[sym_idx],
+                                        &mut drv.last_depth[sym_idx],
+                                        payload,
+                                        sym,
+                                        gapped,
+                                        b.action == crate::BOOK_ACTION_SNAPSHOT,
+                                        depth_tx,
+                                        status,
+                                        capture,
+                                    );
+                                }
                                 Dispatch::Book {
                                     sym_idx: sym_idx as u8,
-                                    prev: b.prev_seq_id,
-                                    seq: b.seq_id,
+                                    gapped,
                                 }
                             }
                             None => Dispatch::Nothing,
@@ -1175,23 +1225,69 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             status.add_ticks(1);
         }
-        Dispatch::Book { sym_idx, prev, seq } => {
+        Dispatch::Book { sym_idx, gapped } => {
             status.add_msgs(1);
             status.add_ticks(1);
-            match drv.book_chains[sym_idx as usize].apply(prev, seq) {
-                ChainOutcome::Init
-                | ChainOutcome::Chained
-                | ChainOutcome::IdleHeartbeat
-                | ChainOutcome::Reset => {}
-                ChainOutcome::Gap => {
-                    status.inc_gaps();
-                    status.inc_resubscribes();
-                    queue_books_resync(drv, sym_idx as usize)?;
-                }
+            // Chain applied in phase 1 (payload in scope there for
+            // the WS10-B walk); the tx-queueing half stays here.
+            if gapped {
+                status.inc_gaps();
+                status.inc_resubscribes();
+                queue_books_resync(drv, sym_idx as usize)?;
             }
         }
     }
     Ok(())
+}
+
+/// WS10-B: one book frame's depth step — ladder maintenance +
+/// change-gated emission (capture first, then the depth-lane push;
+/// full-ring pushes count `depth_ring_drops`). On a chain gap the
+/// ladder clears and a `DEPTH_FLAG_STALE` snapshot ALWAYS emits so a
+/// strategy never trades a known-broken book.
+#[allow(clippy::too_many_arguments)]
+fn okx_depth_step<C: Capture>(
+    ladder: &mut book_builder::ladder::DepthLadder,
+    last: &mut core_types::DepthTopK,
+    payload: &[u8],
+    sym: u32,
+    gapped: bool,
+    is_snapshot: bool,
+    depth_tx: &mut Producer<core_types::DepthTopK, DEPTH_RING_SIZE>,
+    status: &IngressStatus,
+    capture: &mut C,
+) {
+    if gapped {
+        ladder.clear();
+        let stale = ladder.snapshot(now_ns(), VenueId::Okx, sym, core_types::DEPTH_FLAG_STALE);
+        capture.depth(&stale);
+        if depth_tx.try_push(stale).is_err() {
+            status.inc_depth_ring_drops();
+        }
+        *last = stale;
+        return;
+    }
+    if is_snapshot {
+        ladder.clear();
+    }
+    match crate::walk_book_levels(payload, ladder) {
+        Some(_) => {
+            let snap = ladder.snapshot(now_ns(), VenueId::Okx, sym, 0);
+            if !book_builder::ladder::levels_equal(&snap, last) {
+                capture.depth(&snap);
+                if depth_tx.try_push(snap).is_err() {
+                    status.inc_depth_ring_drops();
+                }
+                *last = snap;
+            }
+        }
+        None => {
+            // Malformed level rows behind a valid header: count it;
+            // the chain monitor remains the resync law.
+            status.inc_parse_errors();
+            capture.parse_reject(now_ns(), payload);
+        }
+    }
 }
 
 /// Channel named in a subscribe/unsubscribe ack's `arg`.
@@ -1346,6 +1442,7 @@ pub fn run<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -1402,7 +1499,8 @@ pub fn run<T: Transport, C: Capture>(
             let n_before = producer.len();
             let state_before = drv.state();
             if let Err(e) = drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, status, capture,
+                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, status,
+                capture,
             ) {
                 status.note_session_err(
                     core_metrics::ERR_SITE_DRIVE,
@@ -1707,6 +1805,13 @@ mod tests {
         Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split()
     }
 
+    fn depth_ring_pair() -> (
+        Producer<DepthTopK, DEPTH_RING_SIZE>,
+        core_ring::Consumer<DepthTopK, DEPTH_RING_SIZE>,
+    ) {
+        Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split()
+    }
+
     /// WS10-A shim: legacy tests drive with a fresh throwaway event
     /// lane (mask = FUNDING; consumer dropped — pushes vanish). A
     /// local item shadows the glob-imported `super::drive_one`, so
@@ -1723,6 +1828,7 @@ mod tests {
         capture: &mut C,
     ) -> io::Result<()> {
         let (mut etx, _erx) = event_ring_pair();
+        let (mut dtx, _drx) = depth_ring_pair();
         super::drive_one(
             transport,
             drv,
@@ -1731,6 +1837,7 @@ mod tests {
             producer,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut dtx,
             status,
             capture,
         )
@@ -1753,6 +1860,7 @@ mod tests {
         capture: &mut C,
     ) -> RunResult {
         let (mut etx, _erx) = event_ring_pair();
+        let (mut dtx, _drx) = depth_ring_pair();
         super::run(
             transport,
             drv,
@@ -1761,6 +1869,7 @@ mod tests {
             producer,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut dtx,
             poll,
             events,
             token,
@@ -2452,6 +2561,7 @@ mod tests {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut depth_ring_pair().0,
             &status,
             &mut cap,
         )
@@ -2484,7 +2594,16 @@ mod tests {
         t.inject_incoming(&frame[..n]);
 
         super::drive_one(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut etx, 0, &status, &mut cap,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut etx,
+            0,
+            &mut depth_ring_pair().0,
+            &status,
+            &mut cap,
         )
         .unwrap();
 
@@ -2521,6 +2640,7 @@ mod tests {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut depth_ring_pair().0,
             &status,
             &mut cap,
         )

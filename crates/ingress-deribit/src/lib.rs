@@ -454,6 +454,121 @@ const _SIZE_CHECKS: () = {
     assert!(::core::mem::size_of::<DeribitVolIndexFrame>() == 64);
 };
 
+/// WS10-B: apply every level of one `book.100ms` side array onto a
+/// ladder side. `pos` points at the side's outer `[`. Rows are
+/// `["new"|"change"|"delete", px, amount]` — unquoted (possibly
+/// sci-notation — the starbase live catch) numbers; a `delete` row
+/// forces qty 0 regardless of the carried amount. Returns applied
+/// level count; `None` on malformed input — the caller counts a
+/// parse error (the change_id chain monitor stays the resync law).
+fn walk_book_side(
+    buf: &[u8],
+    pos: usize,
+    side: &mut book_builder::ladder::LadderSide,
+) -> Option<u32> {
+    if *buf.get(pos)? != b'[' {
+        return None;
+    }
+    let mut at = pos + 1;
+    let mut applied = 0u32;
+    loop {
+        match *buf.get(at)? {
+            b']' => return Some(applied),
+            b',' => {
+                at += 1;
+            }
+            b'[' => {
+                if *buf.get(at + 1)? != b'"' {
+                    return None;
+                }
+                // Action token: new / change / delete.
+                let tok_start = at + 2;
+                let tok_end = memchr::memchr(b'"', buf.get(tok_start..)?)? + tok_start;
+                let is_delete = &buf[tok_start..tok_end] == b"delete";
+                if *buf.get(tok_end + 1)? != b',' {
+                    return None;
+                }
+                let (px, px_end) = scan_number_sci_1e6(buf, tok_end + 2)?;
+                if *buf.get(px_end)? != b',' {
+                    return None;
+                }
+                let (amount, amt_end) = scan_number_sci_1e6(buf, px_end + 1)?;
+                let qty = if is_delete { 0 } else { amount };
+                side.set(px, qty);
+                applied += 1;
+                let close = memchr::memchr(b']', buf.get(amt_end..)?)? + amt_end;
+                at = close + 1;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// WS10-B: apply one `book.100ms` push's level arrays onto an
+/// instrument ladder (both sides). The caller has already
+/// chain-verified the frame ([`parse_book_header`]) and cleared the
+/// ladder on `type:"snapshot"`. Returns total applied levels; `None`
+/// on malformed input.
+pub fn walk_book_levels(
+    payload: &[u8],
+    ladder: &mut book_builder::ladder::DepthLadder,
+) -> Option<u32> {
+    let bids_pos = find_field(payload, b"\"bids\":")?;
+    let b = walk_book_side(payload, bids_pos, &mut ladder.bids)?;
+    let asks_pos = find_field(payload, b"\"asks\":")?;
+    let a = walk_book_side(payload, asks_pos, &mut ladder.asks)?;
+    Some(a + b)
+}
+
+#[cfg(test)]
+mod book_walk_tests {
+    use super::*;
+    use book_builder::ladder::DepthLadder;
+    use core_types::VenueId;
+
+    #[test]
+    fn walk_applies_snapshot_delta_and_delete() {
+        let mut l = DepthLadder::new();
+        let snap = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"type":"snapshot","timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":297217,"bids":[["new",5042.34,30.0],["new",5041.94,175.0]],"asks":[["new",5042.64,350.0],["new",5043.3,40.0]]}}}"#;
+        assert_eq!(walk_book_levels(snap, &mut l), Some(4));
+        let s = l.snapshot(1, VenueId::Deribit, 7, 0);
+        assert_eq!(s.bids[0].px_1e6, 5_042_340_000);
+        assert_eq!(s.bids[0].qty_1e6, 30_000_000);
+        assert_eq!(s.asks[0].px_1e6, 5_042_640_000);
+        // Change amends the best bid; delete removes the best ask —
+        // delete forces qty 0 even when the row carries an amount.
+        let delta = br#"{"params":{"data":{"type":"change","change_id":297218,"prev_change_id":297217,"bids":[["change",5042.34,55.0]],"asks":[["delete",5042.64,350.0]]}}}"#;
+        assert_eq!(walk_book_levels(delta, &mut l), Some(2));
+        let s = l.snapshot(2, VenueId::Deribit, 7, 0);
+        assert_eq!(s.bids[0].qty_1e6, 55_000_000);
+        assert_eq!(s.asks[0].px_1e6, 5_043_300_000, "old best deleted");
+        assert_eq!(l.asks.len(), 1);
+    }
+
+    #[test]
+    fn walk_handles_sci_notation_and_rejects_malformed() {
+        // Sci-notation amount — the starbase live catch (8e).
+        let mut l = DepthLadder::new();
+        let sci = br#"{"data":{"bids":[["new",5.0e3,1.0e3]],"asks":[]}}"#;
+        assert_eq!(walk_book_levels(sci, &mut l), Some(1));
+        assert_eq!(l.bids.top_k()[0].px_1e6, 5_000_000_000);
+        assert_eq!(l.bids.top_k()[0].qty_1e6, 1_000_000_000);
+        // Quoted price (OKX shape on the Deribit walker) rejects.
+        let mut l2 = DepthLadder::new();
+        assert_eq!(
+            walk_book_levels(br#"{"bids":[["new","5042.34",30.0]],"asks":[]}"#, &mut l2),
+            None
+        );
+        // Truncated mid-row rejects.
+        assert_eq!(
+            walk_book_levels(br#"{"bids":[["new",5042.3"#, &mut l2),
+            None
+        );
+        // Missing asks rejects (both sides are mandatory in a push).
+        assert_eq!(walk_book_levels(br#"{"bids":[]}"#, &mut l2), None);
+    }
+}
+
 // ---------------------------------------------------------------
 // Field helpers
 // ---------------------------------------------------------------

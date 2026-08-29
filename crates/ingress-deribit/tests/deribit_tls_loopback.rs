@@ -42,6 +42,13 @@ fn event_lane() -> core_ring::Producer<core_types::ChannelEvent, { core_types::E
         .0
 }
 
+/// WS10-B: a throwaway depth lane per `run` call (consumer dropped).
+fn depth_lane() -> core_ring::Producer<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }> {
+    Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new()
+        .split()
+        .0
+}
+
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::ServerConnection;
@@ -283,6 +290,7 @@ fn deribit_tls_loopback_yields_tick_and_answers_test_request() {
         &mut prod,
         &mut event_lane(),
         core_types::EVENT_LANE_FUNDING,
+        &mut depth_lane(),
         &mut poll,
         &mut events,
         token,
@@ -419,6 +427,7 @@ fn deribit_tls_loopback_book_gap_triggers_resubscribe() {
         &mut prod,
         &mut event_lane(),
         core_types::EVENT_LANE_FUNDING,
+        &mut depth_lane(),
         &mut poll,
         &mut events,
         token,
@@ -523,6 +532,7 @@ fn deribit_tls_loopback_idle_timeout_sends_public_test_probe() {
         &mut prod,
         &mut event_lane(),
         core_types::EVENT_LANE_FUNDING,
+        &mut depth_lane(),
         &mut poll,
         &mut events,
         token,

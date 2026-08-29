@@ -522,6 +522,112 @@ fn scan_bbo_side(buf: &[u8], pos: usize) -> Option<(i64, i64)> {
     }
 }
 
+/// WS10-B: apply every level of one `books` side array onto a ladder
+/// side. `pos` points at the side's outer `[` (the byte returned by
+/// `find_field`). Rows are `["px","sz","liqOrders","numOrders"]`;
+/// `sz == 0` deletes the level (venue delta semantics). Returns the
+/// applied level count; `None` on malformed input — the caller
+/// counts a parse error (the seq-chain monitor stays the resync
+/// law).
+fn walk_book_side(
+    buf: &[u8],
+    pos: usize,
+    side: &mut book_builder::ladder::LadderSide,
+) -> Option<u32> {
+    if *buf.get(pos)? != b'[' {
+        return None;
+    }
+    let mut at = pos + 1;
+    let mut applied = 0u32;
+    loop {
+        match *buf.get(at)? {
+            b']' => return Some(applied),
+            b',' => {
+                at += 1;
+            }
+            b'[' => {
+                if *buf.get(at + 1)? != b'"' {
+                    return None;
+                }
+                let (px, px_end) = scan_price_1e6(buf, at + 2)?;
+                if buf.get(px_end..px_end + 3)? != b"\",\"" {
+                    return None;
+                }
+                let (qty, qty_end) = scan_price_1e6(buf, px_end + 3)?;
+                side.set(px, qty);
+                applied += 1;
+                // Skip the row's remaining fields to its closing `]`.
+                let close = memchr::memchr(b']', buf.get(qty_end..)?)? + qty_end;
+                at = close + 1;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// WS10-B: apply one `books` push's level arrays onto an instrument
+/// ladder (both sides). The caller has already chain-verified the
+/// frame ([`parse_book_header`]) and cleared the ladder on
+/// `action:"snapshot"`. Returns total applied levels; `None` on
+/// malformed input.
+pub fn walk_book_levels(
+    payload: &[u8],
+    ladder: &mut book_builder::ladder::DepthLadder,
+) -> Option<u32> {
+    let asks_pos = find_field(payload, b"\"asks\":")?;
+    let a = walk_book_side(payload, asks_pos, &mut ladder.asks)?;
+    let bids_pos = find_field(payload, b"\"bids\":")?;
+    let b = walk_book_side(payload, bids_pos, &mut ladder.bids)?;
+    Some(a + b)
+}
+
+#[cfg(test)]
+mod book_walk_tests {
+    use super::*;
+    use book_builder::ladder::DepthLadder;
+    use core_types::VenueId;
+
+    #[test]
+    fn walk_applies_snapshot_and_delta() {
+        let mut l = DepthLadder::new();
+        // Snapshot: 2 asks + 2 bids (real books row shape).
+        let snap = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"asks":[["8476.98","415","0","13"],["8477","7","0","2"]],"bids":[["8476.97","256","0","12"],["8475.55","101","0","1"]],"ts":"1597026383085","seqId":123456}]}"#;
+        assert_eq!(walk_book_levels(snap, &mut l), Some(4));
+        assert_eq!(l.asks.len(), 2);
+        assert_eq!(l.bids.len(), 2);
+        let s = l.snapshot(1, VenueId::Okx, 7, 0);
+        assert_eq!(s.asks[0].px_1e6, 8_476_980_000);
+        assert_eq!(s.bids[0].px_1e6, 8_476_970_000);
+        // Delta: delete the best ask (sz 0), add a better bid.
+        let delta = br#"{"action":"update","data":[{"asks":[["8476.98","0","0","0"]],"bids":[["8476.99","5","0","1"]],"ts":"1597026383086","seqId":123457,"prevSeqId":123456}]}"#;
+        assert_eq!(walk_book_levels(delta, &mut l), Some(2));
+        assert_eq!(l.asks.len(), 1);
+        let s = l.snapshot(2, VenueId::Okx, 7, 0);
+        assert_eq!(s.asks[0].px_1e6, 8_477_000_000);
+        assert_eq!(s.bids[0].px_1e6, 8_476_990_000, "new best bid");
+    }
+
+    #[test]
+    fn walk_rejects_malformed_rows() {
+        let mut l = DepthLadder::new();
+        // Unquoted price inside a row.
+        assert_eq!(
+            walk_book_levels(br#"{"asks":[[8476.98,"415"]],"bids":[]}"#, &mut l),
+            None
+        );
+        // Missing bids field entirely.
+        assert_eq!(walk_book_levels(br#"{"asks":[]}"#, &mut l), None);
+        // Truncated mid-row.
+        assert_eq!(walk_book_levels(br#"{"asks":[["8476.98","#, &mut l), None);
+        // Empty sides parse as zero levels.
+        let mut l2 = DepthLadder::new();
+        assert_eq!(
+            walk_book_levels(br#"{"asks":[],"bids":[]}"#, &mut l2),
+            Some(0)
+        );
+    }
+}
+
 // ---------------------------------------------------------------
 // Channel parsers
 // ---------------------------------------------------------------
