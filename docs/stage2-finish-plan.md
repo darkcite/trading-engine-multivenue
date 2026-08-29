@@ -637,6 +637,23 @@ restart):**
   remain standing laws. Remaining before Stage 3: BN markPrice
   venue posture (.env lever) · M5 on explicit go · the §7 ENTRY
   GATE.
+- **BN venue-posture lever review (2026-08-29, operator granted
+  full `.env` read/edit):** `.env` ACTUALIZED to the complete
+  current key surface — Bybit WS9 hosts + `CLAUDE_WORKER_
+  {REPORTS_DIR,REFDATA_BUDGET_PER_H,FUNDING_BUDGET_PER_H}` +
+  iv-digest knob added at code defaults; header + lever comments
+  refreshed; mode 600 preserved; `.env.example` drift fixed (the
+  mangled UNIVERSE_FILE/MARKET_MAP line, duplicate REST-host pair,
+  missing WS9/WS11 keys) — example is the committed half. BOTH
+  levers RE-PROBED from this Mac and still venue-side dark:
+  markPrice on fstream (raw @markPrice/@markPrice@1s, combined,
+  AND the live SUBSCRIBE method — venue ACKS `{"result":null}`
+  then delivers nothing while bookTicker floods the same conn;
+  fstream3=302) · eapi options WS on nbstream (raw/combined/
+  SUBSCRIBE all 404; REST fine). NO restart needed — all edits
+  are comments + additive default-valued keys; activation stays
+  one `.env` value + restart whenever either route starts
+  delivering. Probe evidence dated in both files' comments.
 
 1. Full build (`cargo build --release --workspace`; G0 relink).
 2. Gates: `cargo nextest run --workspace` (baseline grows well past
