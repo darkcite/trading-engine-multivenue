@@ -255,6 +255,13 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(BnSymbolRow, usize), BnDiscover
                         let (s, end) = quoted_span(body, i)?;
                         contract_type = match s {
                             b"PERPETUAL" => BnContractType::Perpetual,
+                            // BST2 (binance-stocks-plan, live-probed
+                            // 2026-08-29): TradFi stock perps are
+                            // funding-bearing perpetuals — without
+                            // this arm they fell to Other ⇒
+                            // is_dated() == true, misclassifying
+                            // 148 live instruments.
+                            b"TRADIFI_PERPETUAL" => BnContractType::Perpetual,
                             b"CURRENT_QUARTER" => BnContractType::CurrentQuarter,
                             b"NEXT_QUARTER" => BnContractType::NextQuarter,
                             _ => BnContractType::Other,
@@ -603,6 +610,36 @@ mod tests {
         let row = d.find(b"BTCUSDT").unwrap();
         assert_eq!(row.contract_type, BnContractType::None);
         assert_eq!(row.delivery_ms, 0);
+    }
+
+    #[test]
+    fn tradifi_perp_row_classifies_perpetual_with_new_fields_skipped() {
+        // BST2 pin (live /fapi/v1/exchangeInfo shape, 2026-08-29):
+        // a TradFi stock perp row carries `underlyingType: "EQUITY"`
+        // and the ARRAY field `underlyingSubType: ["TradFi"]` — both
+        // structurally skipped — and its contractType is a
+        // funding-bearing PERPETUAL, never a dated class.
+        let mut d = BnDiscovery::new();
+        let body = br#"{"symbols":[{"symbol":"TEMUSDT","pair":"TEMUSDT","contractType":"TRADIFI_PERPETUAL","deliveryDate":4133404800000,"onboardDate":1787961600000,"status":"TRADING","underlyingType":"EQUITY","underlyingSubType":["TradFi"],"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.010"},{"filterType":"LOT_SIZE","stepSize":"0.01"}]}]}"#;
+        d.ingest_body(body).unwrap();
+        let row = d.find(b"TEMUSDT").unwrap();
+        assert_eq!(row.contract_type, BnContractType::Perpetual);
+        assert!(!row.contract_type.is_dated());
+        assert_eq!(row.tick_size_1e9, 10_000_000);
+    }
+
+    #[test]
+    fn bstock_spot_row_parses_like_any_spot_symbol() {
+        // BST2 pin (live /api/v3/exchangeInfo?symbol=NVDABUSDT shape,
+        // 2026-08-29): tokenized equities are first-class spot rows
+        // (tick 0.01, step 0.001).
+        let mut d = BnDiscovery::new();
+        let body = br#"{"timezone":"UTC","symbols":[{"symbol":"NVDABUSDT","status":"TRADING","baseAsset":"NVDAB","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","stepSize":"0.00100000"}],"permissionSets":[["SPOT"]]}]}"#;
+        d.ingest_body(body).unwrap();
+        let row = d.find(b"NVDABUSDT").unwrap();
+        assert_eq!(row.contract_type, BnContractType::None);
+        assert_eq!(row.tick_size_1e9, 10_000_000);
+        assert_eq!(row.lot_step_1e9, 1_000_000);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+
+# BST3: OPTIONAL equity dailies family (binance-stocks-plan §3).
+# Tickers as slugs (nvda-up-or-down-on-<month>-<day>-<year>); resolved
+# per US trading days in America/New_York (20:00Z EDT / 21:00Z EST
+# close). The equity block renders AFTER the crypto block so the
+# [pairs] index space never moves. Equity failures carry the previous
+# tail (equity=stale) — crypto failures still abort the refresh.
+#[equity_dailies]
+#underlyings = ["nvda", "tsla", "spy"]

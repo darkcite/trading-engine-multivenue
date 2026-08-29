@@ -108,3 +108,12 @@ linear = []                # e.g. ["BTCUSDT", "ETHUSDT"]
 # (0-based file order; a YES/NO market entry resolves to its YES token).
 # Empty/absent with both sides configured ⇒ default pair "0:0".
 map = ["0:0"]
+
+# BST (binance-stocks-plan): equities ride the SAME lists — bStocks
+# (`<ticker>busdt`) append to [binance] spot, TradFi perps to usdm
+# (both 24/7; usdm rows carry contractType TRADIFI_PERPETUAL +
+# underlyingType EQUITY — structurally skipped fields). PM equity
+# dailies (20:00Z EDT / 21:00Z EST close, trading days only) append
+# AFTER the crypto dailies block and pair with the bStocks tail via
+# [pairs]. The BST3 [equity_dailies] refresher family owns the PM
+# entries; [pairs] is never rewritten.

@@ -87,6 +87,20 @@ if slot_ready 1605; then
   drain=1
   fired="$fired 1605"
 fi
+# BST3.5 (binance-stocks-plan, operator-approved 2026-08-29): the
+# equity-dailies pair — next-day PM equity markets load ≤15 min after
+# the US close in BOTH seasons (20:00Z close in EDT, 21:00Z in EST;
+# the pre-close slot of the pair resolves idempotently).
+if slot_ready 2015; then
+  slot_mark 2015
+  drain=1
+  fired="$fired 2015"
+fi
+if slot_ready 2115; then
+  slot_mark 2115
+  drain=1
+  fired="$fired 2115"
+fi
 
 if [ "$drain" = 1 ]; then
   if pgrep -f "multivenue-engine run" >/dev/null 2>&1; then

@@ -304,3 +304,138 @@ def test_run_uses_env_gamma_host(tmp_path: pathlib.Path) -> None:
     )
     assert rc == 0
     assert seen and "gamma.example.test" in seen[0]
+
+
+# ---------------------------------------------------------------
+# BST3 — the equity-dailies family (binance-stocks-plan §3)
+# ---------------------------------------------------------------
+
+
+def _utc(y, m, d, h, mi=0):
+    return datetime.datetime(y, m, d, h, mi, tzinfo=datetime.timezone.utc)
+
+
+def test_equity_date_saturday_targets_monday() -> None:
+    # 2026-08-29 = Saturday; next trading day = Monday 08-31.
+    d = claude_worker.universe_refresh.equity_refresh_date(_utc(2026, 8, 29, 12))
+    assert d == datetime.date(2026, 8, 31)
+
+
+def test_equity_date_before_and_after_us_close_edt() -> None:
+    # Friday 2026-08-28: 15:59 ET = 19:59Z -> same day; 16:01 ET -> Monday.
+    before = claude_worker.universe_refresh.equity_refresh_date(_utc(2026, 8, 28, 19, 59))
+    after = claude_worker.universe_refresh.equity_refresh_date(_utc(2026, 8, 28, 20, 1))
+    assert before == datetime.date(2026, 8, 28)
+    assert after == datetime.date(2026, 8, 31)
+
+
+def test_equity_date_skips_labor_day() -> None:
+    # Sunday 2026-09-06 -> Monday 09-07 is Labor Day -> Tuesday 09-08.
+    d = claude_worker.universe_refresh.equity_refresh_date(_utc(2026, 9, 6, 12))
+    assert d == datetime.date(2026, 9, 8)
+
+
+def test_equity_date_est_season_close_is_2100z() -> None:
+    # Wednesday 2026-12-02 (EST): 20:30Z = 15:30 ET -> same day;
+    # 21:30Z = 16:30 ET -> next day. The DST-correctness pin.
+    same = claude_worker.universe_refresh.equity_refresh_date(_utc(2026, 12, 2, 20, 30))
+    nxt = claude_worker.universe_refresh.equity_refresh_date(_utc(2026, 12, 2, 21, 30))
+    assert same == datetime.date(2026, 12, 2)
+    assert nxt == datetime.date(2026, 12, 3)
+
+
+def test_read_equity_underlyings_optional_and_guarded(tmp_path: pathlib.Path) -> None:
+    p = tmp_path / "pm-dailies.toml"
+    p.write_text('[dailies]\nunderlyings = ["bitcoin"]\n')
+    assert claude_worker.universe_refresh.read_equity_underlyings(p) == ()
+    p.write_text(
+        '[dailies]\nunderlyings = ["bitcoin"]\n'
+        '[equity_dailies]\nunderlyings = ["nvda", "TSLA"]\n'
+    )
+    assert claude_worker.universe_refresh.read_equity_underlyings(p) == ("nvda", "tsla")
+
+
+UNIVERSE_TWO_FAMILY = """[polymarket]
+markets = [
+  # Bitcoin Up or Down on August 29?
+  "1:2",
+  # NVIDIA (NVDA) Up or Down on August 28?
+  "3:4",
+]
+
+[binance]
+spot = ["btcusdt", "nvdabusdt"]
+
+[pairs]
+map = ["0:0", "1:1"]
+"""
+
+
+def test_parse_markets_entries_reads_comments_and_entries() -> None:
+    rows = claude_worker.universe_refresh.parse_markets_entries(UNIVERSE_TWO_FAMILY)
+    assert rows is not None
+    assert [r.entry for r in rows] == ["1:2", "3:4"]
+    assert rows[1].question.startswith("NVIDIA")
+
+
+def _write_configs(tmp_path, equity=True):
+    dailies = tmp_path / "pm-dailies.toml"
+    body = '[dailies]\nunderlyings = ["bitcoin"]\n'
+    if equity:
+        body += '[equity_dailies]\nunderlyings = ["nvda"]\n'
+    dailies.write_text(body)
+    universe = tmp_path / "universe.toml"
+    universe.write_text(UNIVERSE_TWO_FAMILY)
+    return universe, dailies
+
+
+def test_run_refreshes_both_families_in_order(tmp_path: pathlib.Path) -> None:
+    universe, dailies = _write_configs(tmp_path)
+    # Saturday noon UTC: crypto date = today (before 16Z), equity = Monday.
+    now = _utc(2026, 8, 29, 12)
+    mapping = {
+        "bitcoin-up-or-down-on-august-29-2026": gamma_payload(
+            "bitcoin-up-or-down-on-august-29-2026", tid("71"), tid("72"), ["Up", "Down"]
+        ),
+        "nvda-up-or-down-on-august-31-2026": gamma_payload(
+            "nvda-up-or-down-on-august-31-2026", tid("73"), tid("74"), ["Up", "Down"]
+        ),
+    }
+    rc = claude_worker.universe_refresh.run(
+        universe, dailies, now, make_get(mapping), {}
+    )
+    assert rc == 0
+    text = universe.read_text()
+    entries = claude_worker.universe_refresh.parse_markets_entries(text)
+    assert entries is not None and len(entries) == 2
+    assert entries[0].entry == f"{tid('71')}:{tid('72')}"   # crypto first
+    assert entries[1].entry == f"{tid('73')}:{tid('74')}"   # equity after
+    assert "[pairs]" in text and '"1:1"' in text            # pairs untouched
+
+
+def test_run_equity_miss_carries_previous_tail(tmp_path: pathlib.Path) -> None:
+    universe, dailies = _write_configs(tmp_path)
+    now = _utc(2026, 8, 29, 12)
+    mapping = {
+        "bitcoin-up-or-down-on-august-29-2026": gamma_payload(
+            "bitcoin-up-or-down-on-august-29-2026", tid("71"), tid("72"), ["Up", "Down"]
+        ),
+        # NVDA missing entirely -> equity=stale, tail "3:4" carried.
+    }
+    rc = claude_worker.universe_refresh.run(
+        universe, dailies, now, make_get(mapping), {}
+    )
+    assert rc == 0
+    entries = claude_worker.universe_refresh.parse_markets_entries(universe.read_text())
+    assert entries is not None
+    assert [e.entry for e in entries] == [f"{tid('71')}:{tid('72')}", "3:4"]
+
+
+def test_run_crypto_miss_still_aborts_whole_refresh(tmp_path: pathlib.Path) -> None:
+    universe, dailies = _write_configs(tmp_path)
+    before = universe.read_text()
+    rc = claude_worker.universe_refresh.run(
+        universe, dailies, _utc(2026, 8, 29, 12), make_get({}), {}
+    )
+    assert rc == 1
+    assert universe.read_text() == before
