@@ -654,6 +654,25 @@ restart):**
   are comments + additive default-valued keys; activation stays
   one `.env` value + restart whenever either route starts
   delivering. Probe evidence dated in both files' comments.
+- **BN fault PRECISELY CHARACTERIZED (2026-08-29, operator-ordered
+  our-side error hunt — conclusion: NOT our code, NOT region
+  policy):** fstream serves this network path a PARTIAL data
+  plane — book-derived streams flow (bookTicker 288/10 s + depth5
+  <0.5 s on ONE TLS connection) while every centrally-computed
+  stream is silent (markPrice incl. `!markPrice@arr`, aggTrade,
+  kline_1m, forceOrder) even though `LIST_SUBSCRIPTIONS` echoes
+  the registration back; identical on all 8 DNS edges, IPv4 and
+  IPv6. Cross-checks all healthy: spot host serves
+  aggTrade/kline/trade; COIN-M dstream serves markPrice at 1/s;
+  fapi REST serves aggTrades + premiumIndex (mark+funding).
+  Selective per-subscription silence inside one encrypted
+  connection can only originate on the venue gateway ⇒ venue-side
+  infra fault/degradation for this egress, ongoing since ~Aug 22.
+  Even a REAL eapi symbol 404s on nbstream `/eoptions/*` (1 686
+  symbols alive on eapi REST). Mitigation stands: REST
+  premiumIndex/funding polling (proven) = the CVFC-1 §3 poller
+  shape; VPN/EC2 egress would likely restore WS; engine unaffected
+  (usdm lane rides bookTicker).
 
 1. Full build (`cargo build --release --workspace`; G0 relink).
 2. Gates: `cargo nextest run --workspace` (baseline grows well past
