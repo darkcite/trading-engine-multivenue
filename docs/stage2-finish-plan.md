@@ -550,6 +550,71 @@ catch:
   at its next 00:00Z restart regardless (established M4-close
   pattern).
 
+**§5.4 CHURN — ROOT-CAUSED + FIXED + GATED (2026-08-29 session, after
+the docs-archive commit `7d6518a`; live proof pending the next engine
+restart):**
+
+- **The venue was innocent and the named lead was a passenger.** The
+  current standing run (post-08:30Z boot, fresh 1400/1400-live chain)
+  carried **ZERO SubDrops, zero gaps, zero resubscribes** — every
+  subscribe arg accepted — yet 2 699 reconnects at the ~1.4 s
+  `pump/other` cadence. The per-arg OPTION refusals seen in the soak
+  hour were the post-settlement expired-instrument class riding the
+  churn, not causing it. A hand-rolled WSS probe replicating the
+  engine's EXACT batched subscribe (66 instruments, 4 064 bytes —
+  32 under OKX's 4 096 cap, `_UM` rows included) from this Mac
+  survived 90 s / 6 000+ msgs / ping-pong clean.
+- **ROOT CAUSE (ours, `core-net::TlsTransport`):** rustls 0.23 hard-
+  caps buffered received plaintext at **16 KiB**
+  (`DEFAULT_RECEIVED_PLAINTEXT_LIMIT`, `common_state.rs:1055`, NOT
+  configurable — `set_buffer_limit` is send-side only) and its
+  `read_tls()` signals BACKPRESSURE with `ErrorKind::Other`
+  ("received plaintext buffer full", `conn.rs:761`; the rustls doc
+  says exactly this). Our `drive_tls` looped `read_tls` +
+  `process_new_packets` WITHOUT draining plaintext between
+  iterations and treated every error as fatal ⇒ ANY poll wake with
+  >16 KiB decryptable queued = session death at `err_site=pump
+  io_kind="other" venue_code=0`. OKX is the venue whose NORMAL
+  bursts qualify — `books` 400-level snapshots ≈25 KiB in ONE frame,
+  `opt-summary` family pushes ≈600 KiB, post-subscribe burst = MBs.
+  **Aug-25 onset = OKX listing the `BTC-USD_UM`/`ETH-USD_UM` option
+  families** (manifest shows the `_UM` rows interleaved in our
+  capped chain): venue-side burst growth, zero repo change — matches
+  every observed property (pre-existing, depth-toggle-indifferent,
+  all-day cadence). Deribit's "churny sessions" in the soak = the
+  same bug at lower rate through the shared transport.
+- **FIX (`crates/core-net/src/transport.rs`, both sides of the drain
+  protocol):** (a) `drive_tls` treats the `ErrorKind::Other`
+  backpressure signal as break-not-die (kind-match is exact: raw OS
+  errors surface as specific kinds/`Uncategorized`, never `Other`;
+  TLS protocol failures keep surfacing via `process_new_packets` as
+  fatal `InvalidData`); (b) `Transport::read` gained a pull-through:
+  when plaintext runs empty it decrypts the next wave from the
+  queued ciphertext (`read_tls` + `process_new_packets`, with a
+  no-progress guard), so the existing fill-until-WouldBlock loops
+  drain an arbitrarily large burst within ONE poll iteration —
+  edge-triggered-safe (kqueue/mio re-fires only on NEW bytes), same
+  buffers, same copy count, zero allocation. Heals all six WSS
+  venues at once.
+- **Red→green proof:** NEW `crates/core-net/tests/tls_burst_loopback.rs`
+  (rcgen/rustls loopback, transport-only): a 256 KiB single-write
+  burst — 16× the cap — failed PRE-fix with the exact production
+  error (`Custom { kind: Other, "received plaintext buffer full" }`
+  at the pump) and passes POST-fix with every byte intact; a
+  small-trickle fast-path guard passes both sides.
+- **Gates re-run this session: nextest 1349/1349** (+2 = the new
+  loopback pins; +1 known skip) · **alloc 38/38 0 B/op** (fresh
+  `Compiling bench` confirmed) · **pytest 477** (worker untouched) ·
+  `cargo fmt --check` + `make lint` + `make license-check` green ·
+  fuzz: NO new target — no untrusted-bytes parser changed (§21.4
+  scope; the deterministic loopback covers the transport seam).
+  **Stay-greens now 1349 / 38 / 477.** Release binary RELINKED with
+  the fix (G0) — the standing lane boots it at its next restart
+  (T2 slot or revive lever); expected live tell: okx
+  `run-loop returned` churn stops, sessions go long-lived,
+  `reconnects_total` flatlines, opt-summary capture rate jumps to
+  full-family cadence.
+
 1. Full build (`cargo build --release --workspace`; G0 relink).
 2. Gates: `cargo nextest run --workspace` (baseline grows well past
    1247) · alloc assertions 0 B/op (`--test-threads=1`, fresh

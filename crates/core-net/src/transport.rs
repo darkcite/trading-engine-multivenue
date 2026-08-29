@@ -160,8 +160,28 @@ impl TlsTransport {
     /// while the handshake is in flight, or `Ok(Ready)` otherwise.
     fn drive_tls(&mut self) -> io::Result<Status> {
         // Pull ciphertext from the socket into rustls. Loops until
-        // WouldBlock; rustls has an internal buffer limit so this can
-        // never balloon.
+        // WouldBlock — or until rustls signals BACKPRESSURE: its
+        // received-plaintext buffer is hard-capped (16 KiB in 0.23,
+        // `DEFAULT_RECEIVED_PLAINTEXT_LIMIT`) and, per the
+        // `read_tls()` doc, "errors of `ErrorKind::Other` are emitted
+        // to signal backpressure" once that buffer is full. Nothing
+        // drains plaintext inside this loop (`Transport::read` does,
+        // from the caller's fill loop), so ANY poll wake with >16 KiB
+        // of decryptable ciphertext queued reaches that state — an
+        // OKX `books` 400-level snapshot is ~25 KiB in ONE frame and
+        // an `opt-summary` family push ~600 KiB. Treating the signal
+        // as fatal was the §5.4 churn (2026-08-25..29: `err_site=pump
+        // io_kind="other"`, ~1.4 s session cycle, 508 200 log lines):
+        // break instead — the leftover ciphertext stays queued in the
+        // kernel/deframer and `read()`'s pull-through drains it within
+        // the same poll iteration (edge-triggered pollers get no
+        // second event for bytes already buffered).
+        //
+        // Kind-match is exact by construction: raw OS errors surface
+        // as their specific `ErrorKind`s (unmapped ones as
+        // `Uncategorized`, which is distinct from `Other` since Rust
+        // 1.55), and TLS protocol failures surface through
+        // `process_new_packets` as `InvalidData` — both stay fatal.
         if self.conn.wants_read() {
             loop {
                 match self.conn.read_tls(&mut self.sock) {
@@ -172,6 +192,7 @@ impl TlsTransport {
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::Other => break,
                     Err(e) => return Err(e),
                 }
             }
@@ -223,16 +244,64 @@ impl Transport for TlsTransport {
     }
 
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        // rustls decrypted plaintext reader. Returns WouldBlock when
-        // no plaintext is buffered yet.
-        let mut reader = self.conn.reader();
-        match io::Read::read(&mut reader, dst) {
-            Ok(n) => Ok(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "no plaintext yet",
-            )),
-            Err(e) => Err(e),
+        // Fast path: rustls decrypted plaintext already buffered.
+        {
+            let mut reader = self.conn.reader();
+            match io::Read::read(&mut reader, dst) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Pull-through (§5.4 fix): the plaintext buffer is empty, but
+        // ciphertext may still be queued in the kernel socket buffer
+        // or rustls' deframer — `drive_tls` stops reading the socket
+        // at the 16 KiB received-plaintext cap (see the backpressure
+        // note there), and an edge-triggered poller never re-fires
+        // for bytes that already arrived. Decrypt the next wave here
+        // so the caller's fill loop (`read` until WouldBlock) drains
+        // an arbitrarily large burst within one poll iteration:
+        // socket → deframer → plaintext (≤16 KiB waves) → `dst`.
+        // Same buffers, same copy count as before — no allocation.
+        loop {
+            let mut pulled = false;
+            match self.conn.read_tls(&mut self.sock) {
+                // EOF with no buffered plaintext (checked above /
+                // drained below): clean close, surfaced as Ok(0)
+                // exactly like the pre-fix fill path.
+                Ok(0) => return Ok(0),
+                Ok(_) => pulled = true,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "no plaintext yet",
+                    ));
+                }
+                // Backpressure guard (buffer-full signal): nothing
+                // read this call, but the deframer may still hold
+                // processable records — fall through to process +
+                // retry once; the `pulled` flag stops a spin.
+                Err(ref e) if e.kind() == io::ErrorKind::Other => {}
+                Err(e) => return Err(e),
+            }
+            self.conn
+                .process_new_packets()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut reader = self.conn.reader();
+            match io::Read::read(&mut reader, dst) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            // No socket progress and no plaintext produced: a partial
+            // TLS record is in flight — wait for more bytes rather
+            // than spinning.
+            if !pulled {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "no plaintext yet",
+                ));
+            }
         }
     }
 
