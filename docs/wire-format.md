@@ -179,6 +179,34 @@ M2.3 — both 0 with flags 0; its `fwdPx` fills `underlying_px_1e9`).
 |     56 |     4 | vega_1e6          | `i32`          | BS vega ×1e6, saturating                 |
 |     60 |     4 | theta_1e6         | `i32`          | BS theta ×1e6, saturating                |
 
+### `DepthTopK` — 192 bytes (WS10-B; ring + PMLR `slot_kind = 7`)
+
+Top-K L2 depth snapshot: the in-ingress bounded ladder (OKX `books`,
+Deribit `book.100ms`; `book_builder::ladder`, cap 64 levels/side)
+emits one on every book update whose top-K actually CHANGED
+(byte-compare gate — levels + flags, not timestamps), onto the
+per-venue depth ring (`Ring<DepthTopK, 4096>`, engine `on_depth`) AND
+into `<venue>-depth.pmlr`. **First non-64-byte PMLR kind: slot size
+is KIND-determined since WS10-B — kinds 0–6 stay 64 B, kind 7 is
+192 B (three cache lines; still a 64-multiple, so mmap'd access
+stays aligned).** On a venue seq-chain break the ladder clears and a
+`flags = 1` (STALE) snapshot always emits — a strategy must never
+trade a known-broken book; the first post-resync snapshot arrives
+with flags 0. `bids` best-first descending, `asks` best-first
+ascending; slots past the book's real depth are all-zero.
+
+| offset | bytes | field | type                | notes                                |
+| -----: | ----: | ----- | ------------------- | ------------------------------------ |
+|      0 |     8 | ts_ns | `u64` NsTs          | ingress apply-complete time          |
+|      8 |     4 | sym   | `u32` SymbolId      |                                      |
+|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1                  |
+|     13 |     1 | k     | `u8`                | always 5 (`DEPTH_K`)                 |
+|     14 |     1 | flags | `u8`                | bit0 = STALE (book resyncing)        |
+|     15 |     1 | _pad0 | `u8`                | explicit, zeroed                     |
+|     16 |    80 | bids  | `[(i64,i64); 5]`    | (px ×1e6, qty ×1e6) best-first desc  |
+|     96 |    80 | asks  | `[(i64,i64); 5]`    | (px ×1e6, qty ×1e6) best-first asc   |
+|    176 |    16 | _pad1 | `[u8; 16]`          | explicit, zeroed                     |
+
 ### `RuleRow` — 64 bytes (8g; row of `RuleTable`, in-process only)
 
 One validated rule of an operator-committed ruleset (8g design §3).
@@ -228,7 +256,9 @@ per-venue files written by the owning ingress thread
 `<venue>-events.pmlr` (kind 5), `<venue>-signals.pmlr` (kind 1;
 header-only on venues that emit none),
 `<venue>-opt-summary.pmlr` (kind 6, M2.3; header-only on venues
-without an options lane — the uniform-file-set law), and optionally
+without an options lane — the uniform-file-set law),
+`<venue>-depth.pmlr` (kind 7, WS10-B, 192 B slots; header-only
+without a depth subscription), and optionally
 `<venue>-raw.tap`. Staged writes flush at least every 1 s
 (`CAPTURE_FLUSH_INTERVAL_NS`). Venue labels: `pm`, `bn`, `okx`,
 `rpc`, `deribit`, `hl`, and — WS9, appended 2026-08-29 — `bybit`
@@ -311,7 +341,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **2**; readers accept ≤ 2 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e) |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |
@@ -320,5 +350,9 @@ Version history: v1 = Phase-1 layouts (no venue byte; tail padding
 implicit — those bytes are undefined in v1 files). v2 = Phase-8a
 layouts above. Migration notes: `docs/migration.md`.
 
-No framing bytes between slots; the file size modulo 64 is a corruption
-check. Readers mmap the file and index by slot number.
+No framing bytes between slots. **Slot size is KIND-determined since
+WS10-B** (kinds 0–6: 64 B; kind 7: 192 B — always a 64-multiple);
+the file size modulo the kind's slot size is a corruption check.
+Readers decode `slot_kind` from the header first, then mmap-index by
+slot number at that stride. Files written before WS10-B are
+unaffected (no kind changed size).

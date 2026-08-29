@@ -30,6 +30,53 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-29 — SlotKind 7 = DepthTopK, first non-64-byte PMLR slot (WS10-B)
+
+**What changed**
+
+- PMLR slot size is now KIND-determined: kinds 0–6 keep 64 B; the new
+  kind 7 (`DepthTopK`, 192 B = three cache lines) carries the WS10-B
+  top-K depth snapshots in `<venue>-depth.pmlr` (opened for EVERY
+  venue by the uniform-file-set law; header-only without a depth
+  subscription). `PmlrReader` decodes the kind from the header FIRST
+  and validates the caller's type/stride against it. Container
+  version stays 2 — no pre-WS10 file changed shape.
+- The engine gains two depth lanes (`Ring<DepthTopK, 4096>`, OKX +
+  Deribit, `engine::depth_lane_of`) and the defaulted
+  `Strategy::on_depth`; emission is change-gated in the ingress
+  (`book_builder::ladder`, 64 levels/side); a seq-chain break emits a
+  `flags = STALE` snapshot after clearing the ladder.
+- WS10-A (same commit series, no wire change): venue-event lanes
+  carry funding `ChannelEvent`s in-process (`EVENT_RING_SIZE` 1024,
+  spawn-time `event_mask`, funding-only in v1) — the capture record
+  IS the carrier, so nothing here migrates.
+
+**Why**
+
+- gaps-doc §1 / ws10-engine-plumbing-design.md, operator-approved
+  D-A1..D-B3: funding and L2 depth reach `Strategy` without a second
+  wire type; the 192 B slot keeps the top-5-per-side snapshot in one
+  POD instead of splitting rows across 64 B records.
+
+**Impact**
+
+- On-disk: new `<venue>-depth.pmlr` files appear in every run dir
+  from the first WS10 boot. Readers that assumed a flat 64 B stride
+  must consult `SlotKind::slot_size` (in-tree readers updated;
+  `claude-worker/pmlr.py` opens only tick/opt-summary files and is
+  unaffected).
+- audit-replay renders a per-venue `depth` stream section + totals
+  (snapshots / syms / stale count) when records exist.
+
+**Migration steps**
+
+1. None for existing files. New binaries read old runs unchanged.
+
+**Rollback**
+
+- Pre-WS10 binaries ignore unknown kind 7 files (open fails with
+  `UnknownSlotKind`; nothing else reads them).
+
 ## 2026-08-29 — VenueId 6 = Bybit + tick lane 6 (WS9, the sixth venue)
 
 **What changed**

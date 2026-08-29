@@ -291,11 +291,44 @@ M1 shape, WS2 establishment budget built in).
   assumption (subscribe) and orderbook.1 zero-size-clear semantics
   are wire-UNPROVEN (pitfall 11) — the smoke names them.
 
-## WS10 — 🎛 DESIGN WRITTEN (2026-08-29), AWAITING OPERATOR REVIEW — Engine plumbing (gaps §1)
+## WS10 — 🔧→CODED + GATED (2026-08-29; operator approved D-A1…D-B3 as recommended, then A+B were coded, gated and committed the same day)
 
-**`docs/ws10-engine-plumbing-design.md` is the deliverable of this
-session's WS10 pass — per this workstream's own law, NO code lands
-until the operator approves it.** Summary: (A) funding carrier =
+**Review outcome (operator, 2026-08-29, via AskUserQuestion): D-A1
+ChannelEvent-as-carrier ✓ · D-A2 EVENT_RING_SIZE=1024 ✓ · D-B1
+slot_kind 7 + `<venue>-depth.pmlr` capture ✓ · D-B2 K=5 / ladder 64 /
+depth ring 4096 ✓ · D-B3 both now, A then B, gates once over both ✓.**
+
+**Landed (commit series `M-WS10a` ×3 + `M-WS10b` ×3 + docs):**
+A = venue-event lanes exactly per the design (core-types
+EVENT_RING_SIZE/event_lane_bit/EVENT_LANE_FUNDING; engine
+NUM_EVENT_LANES=6 drain + events_dispatched; defaulted
+`on_venue_event` + set fan-out; gated try_push at the four funding
+capture sites, capture-first; event_ring_drops counter+mirror; cli
+rings/spawns/capture-only drain; bench engine test pushes+drains one
+funding event/iteration at 0 B/op; per-venue lane tests incl. mask-0
+and ring-full). B = depth per the design + ONE discovered format
+amendment: **PMLR slot size became KIND-determined (kinds 0–6 = 64 B,
+kind 7 = 192 B)** — the 64 B pin was load-bearing in
+PmlrWriter/PmlrReader and the design's "container version unchanged"
+survived as: version stays 2, readers decode kind first
+(migration.md entry). book_builder::ladder (SoA sides, evict-worst at
+cap, beyond_cap counter, proptests vs BTreeMap incl. never-panic);
+okx/deribit level walkers (+ parser tests: snapshot/delta/delete,
+sci-notation, malformed rejects; fuzz targets okx_book_levels +
+deribit_book_levels); Book dispatch arms restructured (chain apply +
+BookGap event moved to phase 1 where the payload is in scope; resync
+queueing stays phase 2 — behavior-identical, pinned by the standing
+tests); change-gated emission + STALE-on-gap; engine
+NUM_DEPTH_LANES=2/depth_lane_of/on_depth; depth_ring_drops
+counter+mirror; audit-replay depth stream+totals; cli plumbing.
+
+**Gates over A+B (2026-08-29): nextest 1345/1345 (+29) · alloc 38/38
+0 B/op (engine test now proves event+depth push/drain in-window) ·
+pytest 477 (untouched) · make lint green · fuzz okx_book_levels +
+deribit_book_levels 301 s clean each · license-check green. The
+stay-greens move to 1345/38/477.**
+
+Original design summary (approved): Summary: (A) funding carrier =
 per-venue `ChannelEvent` lanes (the §6.5 POD reused; ring 1024×64 B
 ×6; ingress pushes at the four existing funding capture sites;
 `Strategy::on_venue_event` defaulted no-op; `event_lane_mask` gates
