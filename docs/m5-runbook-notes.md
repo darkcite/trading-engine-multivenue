@@ -174,3 +174,53 @@ the push verb, engine-up check before pushing, everything logged to
 (+0), signal cycled, 0 new intents (COTI held; CVFC under bar), push
 correctly skipped. The strategies now run engine + cron only — no
 human, no LLM in the loop; the fleet gains its sixth agent.
+
+## 2026-08-29 — M5 SESSION 2: first research-loop hour (operator: "run 1h, then review")
+
+Strategist = Claude-in-session (ai-session §4). Data-driven pass over
+the full universe; every number below is from real capture or a real
+frozen-argv backtest. Subset root `~/multivenue/research-root-1`
+(6 runs, Aug-23→29, ~12 GB — RAM-safe, peak RSS 8.4 GB).
+
+**Mining (100k+ aligned mid pairs, sampled from 4 recent runs):**
+cross-venue BTC deviations are TIGHT and mostly zero-centered —
+bn-spot↔okx-spot med −0.2 bps (|dev| p99 2.2), bn-usdm↔HL med +0.1
+(p99 3.4) — while bn-usdm↔deribit carries a −6.0 bps STANDING basis
+and spot↔own-perp +3.8 (funding basis): only zero-centered pairs are
+honest `cross_deviation` candidates (the VM measures |dev| from 0).
+
+**Backtests (4 real runs, ~2 min each on the subset):**
+
+| candidate | params | OOS | verdict |
+|---|---|---|---|
+| xv-revert-v1 | 3bps/5s/$50 | **+$409, 208 tr, 3 d, DD $171** | FAIL bounds: sym notional **$68,015** vs $250 |
+| xv-revert-v2 | 6bps/60s/$25 | +$114, 201 tr, 2 d, DD $51 | FAIL bounds: $25,479 |
+| xv-revert-v3 | 6bps/8min/$5 | +$6.1, 252 tr, 3 d, DD $5.7 | FAIL bounds: $1,187 |
+| pm-fade-v1 | 0.42/0.58 lvls | 0 OOS trades (Aug-28 PM-dark tail) | FAIL + bounds $34,841 in-sample |
+
+**THE session finding (structural, demonstrated by the sweep):** the
+VM is position-blind — any persistence signal (a deviation or level
+that HOLDS) re-fires each horizon and accumulates one-sided modeled
+exposure far past the $250/sym cap; basis regimes persist for
+hours–days in our data (the U5 "basis bleed" phenomenon reproduced
+independently). Tightening the knobs shrinks exposure 68k→25k→1.2k
+but eats OOS P&L 409→114→6 faster than it closes the gap — the
+bounds-passing corner of this family is ~zero-edge. **Verdict: the
+cross-venue reversion EDGE IS REAL (+$409 OOS at honest thresholds)
+but belongs to a position-aware carrier — either 8i's RiskGate era
+VM, or an s4 cron with position state (the carry_signal pattern).**
+The gates did exactly their job; nothing was forced through.
+
+Secondary: pm-fade's H6b-era pass does not reproduce on the current
+root (OOS tail spans the PM-dark Aug-28; re-attempt after 2 PM-
+healthy days, Aug-31+). Equities: day-0 capture — research-visible,
+gate-ineligible (as designed). Background: the carry cron cycled
+clean through the hour (0 intents — CVFC under bar, COTI held; one
+transient funding-REST failure 13:02, self-healing by design).
+
+**Recommended next steps (operator's pick):** (a) port xv-revert to
+the s4 cron with net-position tracking capped at $250/sym (paper,
+auditable, no engine change — the carry pattern; ~a session); (b)
+re-run pm-fade + stage the CVFC tripwire after Aug-31 capture; (c)
+treat the position-cap wall as an 8i design input (RiskGate clamps
+make the VM family viable as-is at Stage 3).
