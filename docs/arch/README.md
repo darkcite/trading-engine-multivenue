@@ -17,6 +17,7 @@ the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
 | `8h-kickoff.md` | frozen H0 authority prompt (was `docs/prompts/`) | Stage 2 closed; archaeology only |
 | `mvp-progress.md` | M1 progress log (universe config, multi-market lanes) | M1 closed 2026-08-22 |
 | `m2-progress.md` | M2 progress log (options ladder, options-select, iv_digest) | M2 closed 2026-08-22 |
+| `m3-progress.md` | M3 progress log (launchd fleet C1–C5, C6 calendar phase, the remediation-era ops entries) | C6 CLOSED by operator blessing 2026-08-29 (exit entry last; streak 6 ≥ 3, 37/37 runs harness-clean) |
 | `m4-progress.md` | M4 progress log (shadow-P&L attribution, D1–D3 rulings) | M4 closed 2026-08-23 |
 | `capture-continuity-outage-2026-08-27.md` | Defect A/B/C findings (settlement deaths, PM dark, unnamed errors) | remediated via the plan below; WS2 live-proven 2026-08-29 |
 | `capture-remediation-plan-2026-08-28.md` | remediation plan (T1/T2/D-lanes/#7a/#7b) | folded into `docs/stage2-finish-plan.md` WS0–WS13; live-proven 2026-08-29 |

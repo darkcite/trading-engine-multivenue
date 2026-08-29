@@ -543,3 +543,47 @@ one graceful restart. Executed 06:12–06:15Z:
   C6+ item as ruled; manual serialized runs are possible meanwhile.
 
 (Entry rides M3's next commit per the standing note.)
+
+## 2026-08-29 — C6 CLOSED by operator blessing ⇒ M3 CLOSED (exit entry)
+
+**Operator ruling (2026-08-29, in-session):** "bless the close now" —
+C6 closes on streak + machinery; the step-3 `oos.trading_days >= 2`
+fill sub-gate is BLESSED rather than executed, on the recorded
+grounds: the full-root merge (~27 GB of MergeKeyed) exceeds this
+Mac's 24 GiB, and every RAM-feasible subset's OOS tail lands on
+PM-dark Aug-28 (dailies expired 16:00Z Aug-27 under the pre-T2
+single-restart regime) — no ruleset can honestly fill 2 OOS days
+there. The fill MACHINERY itself was proven in the WS13 step-3 run
+(frozen argv over a 27-run/19M-tick multi-day subset: validator +
+k-way merge + VIRT_T0 + real vm + strict-cross fill model +
+schema-1 all exercised; 657 in-sample fires). The Aug-31 bounded
+rerun (two PM-healthy days exist by then under T2's three daily
+refreshes) remains AVAILABLE as an optional confidence run — it is
+no longer gating anything.
+
+**Closing catalog (this session, 10:50Z, tolerance 300 s):**
+`continuity: 6 gap-free day(s); longest streak 6; trailing streak 6
+(ends 2026-08-28)` ≥ 3 = THE exit tell · totals 37 runs /
+338 168 154 ticks / 23.2 GB · backtest view **37/37 runs
+harness-clean, whole-root replay OK**, spans 8 UTC days · monitor
+view: trailing-24 h coverage 23h55m11s ≥ the 6 h floor — the
+walk-forward monitor would RUN. Steps 1 (streak) and 2 (root tidy —
+boot-loop empties archived at WS13) were already green; step 4 is
+this entry + the CLAUDE.md refresh + the C6 commit.
+
+**C6+ owed items — all landed before the close, none carry over:**
+the nightly pnl timer (D2) runs at the 00:20Z slot of
+`daily-restart.sh` (remediation T2+D2, `9b062c1`); the
+candles+iv_digest cadence (D3) is the hourly cycle (`f3bd448`); the
+worker pmlr/refdata/funding/D5 fold-ins landed in WS11 (`065df0b`).
+The M2/M3 parallel-session ownership split DISSOLVES with this
+close; the one-engine law, serialized-worker-verbs law and
+explicit-path staging remain standing operational laws for every
+session. This file is CLOSED and moves to `docs/arch/` with this
+commit — the standing lane's operational truth lives in
+`CLAUDE.md` CURRENT STATE + `docs/stage2-finish-plan.md` (WS13
+tail) from here.
+
+Context at close: the standing engine is on the §5.4-fixed binary
+(`00c13bf`, run-1787999341626410000, okx/deribit reconnects 0) —
+capture from 10:29Z onward is churn-free full-scope M5/M6 material.

@@ -625,6 +625,18 @@ restart):**
   full-family pushes that used to kill the session are now consumed
   whole (~9× capture rate). §5.4 is CLOSED; the 508 200-line churn
   class is dead on all venues.
+- **C6 CLOSED by operator blessing (2026-08-29, same session) ⇒ M3
+  CLOSED.** Ruling: "bless the close now" — the step-3
+  `oos.trading_days≥2` fill sub-gate blessed on streak + machinery
+  (grounds + closing catalog recorded in the exit entry, last in
+  `docs/arch/m3-progress.md`: trailing streak 6 ≥ 3 ends Aug-28 ·
+  37 runs / 338.2M ticks / 23.2 GB · 37/37 harness-clean,
+  whole-root replay OK · monitor floor crossed). Aug-31 bounded
+  rerun stays available, NON-gating. M2/M3 ownership split
+  dissolved; one-engine + serialized-verbs + explicit-path staging
+  remain standing laws. Remaining before Stage 3: BN markPrice
+  venue posture (.env lever) · M5 on explicit go · the §7 ENTRY
+  GATE.
 
 1. Full build (`cargo build --release --workspace`; G0 relink).
 2. Gates: `cargo nextest run --workspace` (baseline grows well past
