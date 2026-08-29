@@ -27,6 +27,14 @@ use core_net::{expected_accept, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::Ring;
 use core_types::{NullCapture, SymbolId, Tick, VenueId};
 use ingress_okx::run_loop::{run, Driver, RunResult, StopFlag, TICK_RING_CAP};
+
+/// WS10-A: a throwaway venue-event lane per `run` call (consumer
+/// dropped — pushes vanish; the loopback asserts the tick path).
+fn event_lane() -> core_ring::Producer<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }> {
+    Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new()
+        .split()
+        .0
+}
 use ingress_okx::{OkxInstType, OkxSymbolTable};
 
 use rcgen::generate_simple_self_signed;
@@ -248,6 +256,8 @@ fn okx_tls_loopback_yields_expected_tick() {
         b"localhost",
         b"/ws/v5/public",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING,
         &mut poll,
         &mut events,
         token,
@@ -356,6 +366,8 @@ fn okx_tls_loopback_books_gap_triggers_resubscribe() {
         b"localhost",
         b"/ws/v5/public",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING,
         &mut poll,
         &mut events,
         token,
@@ -448,6 +460,8 @@ fn okx_tls_loopback_idle_timeout_sends_literal_ping() {
         b"localhost",
         b"/ws/v5/public",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING,
         &mut poll,
         &mut events,
         token,

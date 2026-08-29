@@ -34,6 +34,14 @@ use core_types::{NullCapture, SymbolId, Tick, VenueId};
 use ingress_deribit::run_loop::{run, Driver, RunResult, StopFlag, TICK_RING_CAP};
 use ingress_deribit::DeribitSymbolTable;
 
+/// WS10-A: a throwaway venue-event lane per `run` call (consumer
+/// dropped — pushes vanish; the loopback asserts the tick path).
+fn event_lane() -> core_ring::Producer<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }> {
+    Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new()
+        .split()
+        .0
+}
+
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::ServerConnection;
@@ -273,6 +281,8 @@ fn deribit_tls_loopback_yields_tick_and_answers_test_request() {
         b"localhost",
         b"/ws/api/v2",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING,
         &mut poll,
         &mut events,
         token,
@@ -407,6 +417,8 @@ fn deribit_tls_loopback_book_gap_triggers_resubscribe() {
         b"localhost",
         b"/ws/api/v2",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING,
         &mut poll,
         &mut events,
         token,
@@ -509,6 +521,8 @@ fn deribit_tls_loopback_idle_timeout_sends_public_test_probe() {
         b"localhost",
         b"/ws/api/v2",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING,
         &mut poll,
         &mut events,
         token,

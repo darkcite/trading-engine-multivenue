@@ -16,6 +16,14 @@ use std::time::{Duration, Instant};
 use core_net::{expected_accept, TlsTransport};
 use core_ring::Ring;
 use core_types::{NullCapture, SymbolId, Tick};
+
+/// WS10-A: a throwaway venue-event lane (consumer dropped — pushes
+/// vanish; the loopback asserts the tick path).
+fn event_lane() -> core_ring::Producer<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }> {
+    Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new()
+        .split()
+        .0
+}
 use ingress_binance::run_loop::{
     drive_one, note_transport_ready, Driver, State, DEFAULT_TICK_RING_CAP,
 };
@@ -184,6 +192,8 @@ fn binance_tls_loopback_yields_expected_tick() {
             b"localhost",
             b"/",
             &mut prod,
+            &mut event_lane(),
+            core_types::EVENT_LANE_FUNDING,
             &status,
             &mut NullCapture,
         )

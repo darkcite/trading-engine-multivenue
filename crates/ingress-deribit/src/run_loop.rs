@@ -109,7 +109,8 @@ use core_net::{
 use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{
-    Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId, SYMBOL_ID_NONE,
+    Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId, EVENT_RING_SIZE,
+    SYMBOL_ID_NONE,
 };
 
 use crate::{
@@ -510,12 +511,15 @@ impl Driver {
 ///   and bumps `IngressStatus::ring_drops`.
 /// * `status`: per-ingress observability slot; this thread is its
 ///   single writer.
+#[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -535,7 +539,7 @@ pub fn drive_one<T: Transport, C: Capture>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, status, capture)?;
+            drain_ws_frames(drv, producer, event_tx, event_mask, status, capture)?;
         }
         State::Closed => {}
     }
@@ -948,6 +952,8 @@ enum Dispatch {
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -989,6 +995,8 @@ fn drain_ws_frames<C: Capture>(
                             drv,
                             payload.start..payload.end,
                             producer,
+                            event_tx,
+                            event_mask,
                             status,
                             capture,
                         )?;
@@ -1152,6 +1160,8 @@ fn handle_data_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -1294,7 +1304,7 @@ fn handle_data_frame<C: Capture>(
                                 // (`has_funding` = the wire-level
                                 // settlement_period split).
                                 if tk.has_funding == 1 {
-                                    capture.event(&ChannelEvent::new(
+                                    let ev = ChannelEvent::new(
                                         now_ns(),
                                         VenueId::Deribit,
                                         ChannelId::Funding,
@@ -1303,7 +1313,18 @@ fn handle_data_frame<C: Capture>(
                                         tk.ts_ns / 1_000_000,
                                         tk.current_funding_1e9,
                                         0,
-                                    ));
+                                    );
+                                    capture.event(&ev);
+                                    // WS10-A: onto the venue-event
+                                    // lane (capture stays first —
+                                    // §6.5 capture-before-push law).
+                                    if event_mask
+                                        & core_types::event_lane_bit(ChannelId::Funding)
+                                        != 0
+                                        && event_tx.try_push(ev).is_err()
+                                    {
+                                        status.inc_event_ring_drops();
+                                    }
                                 }
                                 Dispatch::Ticker
                             }
@@ -1935,6 +1956,8 @@ pub fn run<T: Transport, C: Capture>(
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -1990,7 +2013,9 @@ pub fn run<T: Transport, C: Capture>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if let Err(e) = drive_one(transport, drv, host, path, producer, status, capture) {
+            if let Err(e) = drive_one(
+                transport, drv, host, path, producer, event_tx, event_mask, status, capture,
+            ) {
                 status.note_session_err(
                     core_metrics::ERR_SITE_DRIVE,
                     core_metrics::io_kind_code(e.kind()),
@@ -2171,6 +2196,77 @@ mod tests {
     ) {
         let ring = Ring::<Tick, TICK_RING_CAP>::new();
         ring.split()
+    }
+
+    fn event_ring_pair() -> (
+        Producer<ChannelEvent, EVENT_RING_SIZE>,
+        core_ring::Consumer<ChannelEvent, EVENT_RING_SIZE>,
+    ) {
+        Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split()
+    }
+
+    /// WS10-A shim: legacy tests drive with a fresh throwaway event
+    /// lane (mask = FUNDING; consumer dropped — pushes vanish). A
+    /// local item shadows the glob-imported `super::drive_one`, so
+    /// every pre-WS10 call site stays byte-identical. The dedicated
+    /// event-lane tests below call `super::drive_one` directly.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_one<T: Transport, C: Capture>(
+        transport: &mut T,
+        drv: &mut Driver,
+        host: &[u8],
+        path: &[u8],
+        producer: &mut Producer<Tick, TICK_RING_CAP>,
+        status: &IngressStatus,
+        capture: &mut C,
+    ) -> io::Result<()> {
+        let (mut etx, _erx) = event_ring_pair();
+        super::drive_one(
+            transport,
+            drv,
+            host,
+            path,
+            producer,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            status,
+            capture,
+        )
+    }
+
+    /// WS10-A shim for `run` — same rationale as the `drive_one` shim.
+    #[allow(clippy::too_many_arguments)]
+    fn run<T: Transport, C: Capture>(
+        transport: &mut T,
+        drv: &mut Driver,
+        host: &[u8],
+        path: &[u8],
+        producer: &mut Producer<Tick, TICK_RING_CAP>,
+        poll: &mut mio::Poll,
+        events: &mut mio::Events,
+        token: mio::Token,
+        stop: &StopFlag,
+        status: &IngressStatus,
+        keepalive: &mut Keepalive,
+        capture: &mut C,
+    ) -> RunResult {
+        let (mut etx, _erx) = event_ring_pair();
+        super::run(
+            transport,
+            drv,
+            host,
+            path,
+            producer,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            poll,
+            events,
+            token,
+            stop,
+            status,
+            keepalive,
+            capture,
+        )
     }
 
     fn inject_text(t: &mut TestTransport, body: &[u8]) {
@@ -3378,6 +3474,46 @@ mod tests {
         fn maybe_flush(&mut self, _now_ns: u64) {
             self.flushes += 1;
         }
+    }
+
+    /// WS10-A: the perp ticker's Funding event reaches the venue-event
+    /// lane — and ONLY the Funding one (the mask has no Ticker bit, so
+    /// the Ticker capture event stays capture-only). Mask-0 and
+    /// ring-full behavior are pinned crate-uniformly in ingress-okx.
+    #[test]
+    fn funding_event_reaches_the_event_lane_ticker_stays_capture_only() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let (mut etx, mut erx) = event_ring_pair();
+        let mut cap = CountingCapture::default();
+
+        let ticker = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
+        inject_text(&mut t, ticker);
+        super::drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            &status,
+            &mut cap,
+        )
+        .unwrap();
+
+        assert_eq!(cap.events, 2, "capture: Ticker + Funding");
+        let ev = erx.try_pop().expect("funding event on the lane");
+        assert_eq!(ev.channel, core_types::ChannelId::Funding as u8);
+        assert_eq!(ev.v0, 420_000, "0.00042 ×1e9");
+        assert_eq!(ev.v1, 0, "continuous perp funding — no next time");
+        assert!(
+            erx.try_pop().is_none(),
+            "Ticker event is NOT on the lane (mask gates per channel)"
+        );
+        assert_eq!(status.event_ring_drops_total(), 0);
     }
 
     #[test]
