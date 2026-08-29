@@ -200,3 +200,40 @@ def test_cycle_budget_and_failures(tmp_path: pathlib.Path) -> None:
     assert len(calls) == 2, "third refused by the budget"
     assert any("failed=2 BUDGET" in line for line in lines)
     assert all_rows(conn) == []
+
+
+def test_hl_fetch_resumes_from_newest_stored_point(tmp_path: pathlib.Path) -> None:
+    """M5-onboarding pin (2026-08-29): HL fundingHistory pages ASCENDING
+    from startTime — a fixed now-33d start returns the OLDEST page every
+    cycle and the series stalls ~12 days behind. The cycle must resume
+    from the newest stored point + 1."""
+    conn = db(tmp_path)
+    target = claude_worker.funding.FundingTarget(
+        claude_worker.frames.VENUE_HYPERLIQUID, "hyperliquid:ADA", "ADA"
+    )
+    lanes = [
+        claude_worker.funding.FundingLane(
+            "hyperliquid", claude_worker.frames.VENUE_HYPERLIQUID, [target]
+        )
+    ]
+    stored_ts = NOW - 5 * 86_400_000
+    claude_worker.funding.upsert_points(
+        conn, target.venue, target.descriptor, [(stored_ts, 1e-5)], NOW
+    )
+
+    seen_bodies: list[str] = []
+
+    class Http:
+        hosts = {"hyperliquid": "api.hyperliquid.xyz"}
+
+        def get(self, url: str) -> str | None:
+            raise AssertionError("HL lane must POST")
+
+        def post(self, url: str, body: str) -> str | None:
+            seen_bodies.append(body)
+            return "[]"
+
+    claude_worker.funding.run_cycle(conn, lanes, Http(), NOW, 30, lambda _s: None)
+    assert len(seen_bodies) == 1
+    body = json.loads(seen_bodies[0])
+    assert body["startTime"] == stored_ts + 1, "must resume past the stored point"

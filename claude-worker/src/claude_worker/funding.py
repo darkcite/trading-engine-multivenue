@@ -304,8 +304,17 @@ def _fetch_points(
     lane: FundingLane,
     target: FundingTarget,
     now_ms: int,
+    resume_ms: int | None = None,
 ) -> list[tuple[int, float]] | None:
-    """One newest-page fetch for one instrument. ``None`` = failure."""
+    """One newest-page fetch for one instrument. ``None`` = failure.
+
+    ``resume_ms`` (newest stored point) matters only to Hyperliquid:
+    its ``fundingHistory`` returns points ASCENDING from ``startTime``
+    with a ~500-row page, so a fixed ``now − 33 d`` start returns the
+    OLDEST page every cycle and the series stalls ~12 days behind
+    (M5-onboarding find, 2026-08-29 — first real consumer). Resuming
+    from the newest stored point makes repeat cycles converge on
+    now, exactly like the other venues' newest-first pages."""
     if lane.name == "binance-usdm":
         raw = http.get(
             f"https://{http.hosts['binance-usdm']}/fapi/v1/fundingRate"
@@ -328,6 +337,8 @@ def _fetch_points(
         return parse_deribit_funding(raw) if raw is not None else None
     if lane.name == "hyperliquid":
         start = now_ms - HL_RANGE_D * MS_1D
+        if resume_ms is not None and resume_ms + 1 > start:
+            start = resume_ms + 1
         body = json.dumps(
             {"type": "fundingHistory", "coin": target.instrument, "startTime": start},
             separators=(",", ":"),
@@ -371,7 +382,12 @@ def run_cycle(
             if not budget.try_acquire():
                 budget_out = True
                 break
-            points = _fetch_points(http, lane, target, now_ms)
+            resume_row = conn.execute(
+                "SELECT MAX(ts_ms) FROM funding WHERE descriptor = ?",
+                (target.descriptor,),
+            ).fetchone()
+            resume_ms = resume_row[0] if resume_row and resume_row[0] is not None else None
+            points = _fetch_points(http, lane, target, now_ms, resume_ms)
             if points is None:
                 failed += 1
                 continue

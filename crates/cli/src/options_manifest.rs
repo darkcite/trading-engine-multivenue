@@ -85,13 +85,29 @@ pub fn render_instruments(
     for i in &allocated.bn_usdm {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
+    // M5-onboarding fix (2026-08-29): the D3 law is EVERY instrument,
+    // every boot — the WS5/WS6/WS9 additions below were silently
+    // missing from the manifest until the first offline consumer
+    // (carry_signal) needed a Bybit descriptor.
+    for i in &allocated.bn_dated {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
     for i in &allocated.okx {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
     for i in &allocated.deribit {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
+    for i in &allocated.deribit_combos {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
     for i in &allocated.hl {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    for i in &allocated.bybit_spot {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    for i in &allocated.bybit_linear {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
     for (name, sym) in deribit_opts {
@@ -177,16 +193,49 @@ mod tests {
             name: "BTC-PERPETUAL".to_string(),
             descriptor: "deribit:BTC-PERPETUAL".to_string(),
         });
+        // M5-onboarding fix: the WS5/WS6/WS9 lanes were silently
+        // absent from the manifest — pin every block for good.
+        alloc.bn_dated.push(core_config::universe::Instrument {
+            sym: 0x0100_0301,
+            name: "btcusdt_260925".to_string(),
+            descriptor: "binance-usdm:btcusdt_260925".to_string(),
+        });
+        alloc.deribit_combos.push(core_config::universe::Instrument {
+            sym: 0x0300_0101,
+            name: "BTC-FS-27MAR26_PERP".to_string(),
+            descriptor: "deribit:BTC-FS-27MAR26_PERP".to_string(),
+        });
+        alloc.bybit_spot.push(core_config::universe::Instrument {
+            sym: 0x0600_0001,
+            name: "BTCUSDT".to_string(),
+            descriptor: "bybit:BTCUSDT".to_string(),
+        });
+        alloc.bybit_linear.push(core_config::universe::Instrument {
+            sym: 0x0600_0201,
+            name: "ADAUSDT".to_string(),
+            descriptor: "bybit-linear:ADAUSDT".to_string(),
+        });
         let deribit_opts = vec![("BTC-27MAR26-100000-C".to_string(), 0x0300_0201u32)];
         let bn_opts = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
         let body = render_instruments(&alloc, &deribit_opts, &[], &bn_opts);
         let want = format!(
             "42\t2875608808\n\
              {}\tbinance:btcusdt\n\
+             {}\tbinance-usdm:btcusdt_260925\n\
              {}\tderibit:BTC-PERPETUAL\n\
+             {}\tderibit:BTC-FS-27MAR26_PERP\n\
+             {}\tbybit:BTCUSDT\n\
+             {}\tbybit-linear:ADAUSDT\n\
              {}\tderibit:BTC-27MAR26-100000-C\n\
              {}\tbinance-opt:BTC-260327-100000-C\n",
-            0x0100_0007u32, 0x0300_0001u32, 0x0300_0201u32, 0x0100_0401u32
+            0x0100_0007u32,
+            0x0100_0301u32,
+            0x0300_0001u32,
+            0x0300_0101u32,
+            0x0600_0001u32,
+            0x0600_0201u32,
+            0x0300_0201u32,
+            0x0100_0401u32
         );
         assert_eq!(body, want);
     }
