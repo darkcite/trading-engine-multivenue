@@ -153,6 +153,9 @@ fn harness(tag: &str) -> Harness {
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e5p, e5) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    // WS10-B: depth lanes ride in every engine (producers dropped).
+    let (_d0p, d0) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -165,6 +168,7 @@ fn harness(tag: &str) -> Harness {
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5],
         [e0, e1, e2, e3, e4, e5],
+        [d0, d1],
         sc,
         [f0, f1, f2, f3],
         ai_cons,

@@ -47,9 +47,9 @@ use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
-    make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, Order, RuleTableSlot, Signal,
-    SymbolId, Tick, VenueId, AI_RING_SIZE, EVENT_LANE_FUNDING, EVENT_RING_SIZE,
-    RULE_TABLE_RING_SLOTS,
+    make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, Order, RuleTableSlot,
+    Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_LANE_FUNDING,
+    EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use engine::{
     Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
@@ -277,6 +277,11 @@ pub struct Rings {
     /// (bn/okx/deribit/bybit); PM and RPC lanes never see a producer
     /// push (§3.3 unspawned shape — the engine drains them empty).
     pub event: [Arc<Ring<ChannelEvent, EVENT_RING_SIZE>>; engine::NUM_EVENT_LANES],
+    /// WS10-B: one depth ring per depth lane (`engine::depth_lane_of`
+    /// order: 0 = OKX, 1 = Deribit). Producers ride into the two
+    /// depth-capable spawns; without a depth subscription the lane
+    /// reads empty forever (§3.3).
+    pub depth: [Arc<Ring<DepthTopK, DEPTH_RING_SIZE>>; engine::NUM_DEPTH_LANES],
 }
 
 impl Rings {
@@ -303,6 +308,7 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
             ],
+            depth: [Ring::new(), Ring::new()],
         }
     }
 }
@@ -977,6 +983,7 @@ pub fn spawn_okx(
     opt_families: Vec<String>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1041,6 +1048,7 @@ pub fn spawn_okx(
                     &mut producer,
                     &mut event_tx,
                     EVENT_LANE_FUNDING,
+                    &mut depth_tx,
                     &mut poll,
                     &mut events,
                     token,
@@ -1245,6 +1253,7 @@ pub fn spawn_deribit(
     dvol_indices: Vec<String>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1310,6 +1319,7 @@ pub fn spawn_deribit(
                     &mut producer,
                     &mut event_tx,
                     EVENT_LANE_FUNDING,
+                    &mut depth_tx,
                     &mut poll,
                     &mut events,
                     token,
@@ -1927,6 +1937,8 @@ pub struct DrainCounters {
     pub rpc_signals: u64,
     /// WS10-A: venue events observed (all event lanes combined).
     pub venue_events: u64,
+    /// WS10-B: depth snapshots observed (both depth lanes combined).
+    pub depth_snaps: u64,
 }
 
 impl DrainCounters {
@@ -1938,6 +1950,7 @@ impl DrainCounters {
         self.other_venue_ticks += other.other_venue_ticks;
         self.rpc_signals += other.rpc_signals;
         self.venue_events += other.venue_events;
+        self.depth_snaps += other.depth_snaps;
     }
 }
 
@@ -1949,6 +1962,8 @@ pub struct Consumers {
     /// WS10-A: venue-event lane consumers, tick-lane indexing. Lanes
     /// without a producing venue read empty forever (§3.3).
     pub event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; engine::NUM_EVENT_LANES],
+    /// WS10-B: depth-lane consumers (`engine::depth_lane_of` order).
+    pub depth_lanes: [Consumer<DepthTopK, DEPTH_RING_SIZE>; engine::NUM_DEPTH_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
@@ -2016,6 +2031,19 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
             }
             lane += 1;
         }
+        // WS10-B: same for the depth lanes (snapshots are already in
+        // capture).
+        let mut lane = 0;
+        while lane < engine::NUM_DEPTH_LANES {
+            for _ in 0..DRAIN_BATCH {
+                if cons.depth_lanes[lane].try_pop().is_some() {
+                    period.depth_snaps += 1;
+                } else {
+                    break;
+                }
+            }
+            lane += 1;
+        }
         for _ in 0..DRAIN_BATCH {
             if cons.rpc_signal.try_pop().is_some() {
                 period.rpc_signals += 1;
@@ -2033,6 +2061,7 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 other_ticks = period.other_venue_ticks,
                 rpc_sigs = period.rpc_signals,
                 venue_events = period.venue_events,
+                depth_snaps = period.depth_snaps,
                 "5s ring summary"
             );
             period = DrainCounters::default();
@@ -2689,6 +2718,7 @@ fn register_ingress_counters(
         ticks: one("ticks")?,
         sub_drops: one("sub_drops")?,
         event_ring_drops: one("event_ring_drops")?,
+        depth_ring_drops: one("depth_ring_drops")?,
     })
 }
 
@@ -2952,6 +2982,9 @@ pub struct IngressCounterIds {
     /// WS10-A: venue-event lane pushes refused by a full ring
     /// (`engine_ingress_<venue>_event_ring_drops_total`).
     pub event_ring_drops: core_metrics::CounterId,
+    /// WS10-B: depth-lane pushes refused by a full ring
+    /// (`engine_ingress_<venue>_depth_ring_drops_total`).
+    pub depth_ring_drops: core_metrics::CounterId,
 }
 
 /// Registry handles for the Phase-8f AI ingress family
@@ -3414,6 +3447,7 @@ struct IngressCountersSnapshot {
     ticks: u64,
     sub_drops: u64,
     event_ring_drops: u64,
+    depth_ring_drops: u64,
 }
 
 /// Mirror one ingress status slot into its registry counters as
@@ -3435,6 +3469,7 @@ fn mirror_ingress_counters(
         ticks: st.ticks_total(),
         sub_drops: st.sub_drops_total(),
         event_ring_drops: st.event_ring_drops_total(),
+        depth_ring_drops: st.depth_ring_drops_total(),
     };
     reg.counter(ids.msgs)
         .inc(cur.msgs.saturating_sub(last.msgs));
@@ -3456,6 +3491,8 @@ fn mirror_ingress_counters(
         .inc(cur.sub_drops.saturating_sub(last.sub_drops));
     reg.counter(ids.event_ring_drops)
         .inc(cur.event_ring_drops.saturating_sub(last.event_ring_drops));
+    reg.counter(ids.depth_ring_drops)
+        .inc(cur.depth_ring_drops.saturating_sub(last.depth_ring_drops));
     *last = cur;
 }
 
@@ -3509,6 +3546,7 @@ where
     let Consumers {
         tick_lanes,
         event_lanes,
+        depth_lanes,
         rpc_signal,
         fill_lanes,
         ai_cmds,
@@ -3521,6 +3559,7 @@ where
         disp,
         tick_lanes,
         event_lanes,
+        depth_lanes,
         rpc_signal,
         fill_lanes,
         ai_cmds,
@@ -5575,9 +5614,14 @@ mod tests {
                 it.next().unwrap(),
             ]
         };
+        let depth_lanes = {
+            let mut it = rings.depth.iter().map(|r| r.clone().split().1);
+            [it.next().unwrap(), it.next().unwrap()]
+        };
         Consumers {
             tick_lanes,
             event_lanes,
+            depth_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
@@ -5686,6 +5730,7 @@ mod tests {
             other_venue_ticks: 0,
             rpc_signals: 3,
             venue_events: 4,
+            depth_snaps: 5,
         };
         let b = DrainCounters {
             polymarket_ticks: 10,
@@ -5693,6 +5738,7 @@ mod tests {
             other_venue_ticks: 5,
             rpc_signals: 30,
             venue_events: 40,
+            depth_snaps: 50,
         };
         a.add(&b);
         assert_eq!(a.polymarket_ticks, 11);
@@ -5700,6 +5746,7 @@ mod tests {
         assert_eq!(a.other_venue_ticks, 5);
         assert_eq!(a.rpc_signals, 33);
         assert_eq!(a.venue_events, 44);
+        assert_eq!(a.depth_snaps, 55);
     }
 
     /// Drain loop must exit promptly when `SHUTDOWN` is set, and

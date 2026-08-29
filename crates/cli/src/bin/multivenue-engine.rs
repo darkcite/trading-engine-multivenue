@@ -1030,6 +1030,11 @@ fn run(args: RunArgs) -> ExitCode {
         hl_event_cons,
         bybit_event_cons,
     ];
+    // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
+    // deribit 1). Producers ride into the two depth-capable spawns.
+    let (okx_depth_prod, okx_depth_cons) = rings.depth[0].clone().split();
+    let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
+    let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let fill_lane_cons = {
         let (_f0p, f0) = rings.fill[0].clone().split();
@@ -1342,6 +1347,7 @@ fn run(args: RunArgs) -> ExitCode {
             boot.okx_options.underlyings.clone(),
             okx_prod,
             okx_event_prod,
+            okx_depth_prod,
             statuses.okx.clone(),
             5,
             &run_dir,
@@ -1363,6 +1369,7 @@ fn run(args: RunArgs) -> ExitCode {
         // empty rings (the unspawned-venue shape, §3.3).
         drop(okx_prod);
         drop(okx_event_prod);
+        drop(okx_depth_prod);
     }
 
     // Deribit rides core 6 per the §9 core map.
@@ -1392,6 +1399,7 @@ fn run(args: RunArgs) -> ExitCode {
             dvol_indices,
             deribit_prod,
             deribit_event_prod,
+            deribit_depth_prod,
             statuses.deribit.clone(),
             6,
             &run_dir,
@@ -1413,6 +1421,7 @@ fn run(args: RunArgs) -> ExitCode {
         // empty rings (the unspawned-venue shape, §3.3).
         drop(deribit_prod);
         drop(deribit_event_prod);
+        drop(deribit_depth_prod);
     }
 
     // Hyperliquid rides core 7 per the §9 core map.
@@ -1635,6 +1644,7 @@ fn run(args: RunArgs) -> ExitCode {
             bybit_lane_cons,
         ],
         event_lanes: event_lane_cons,
+        depth_lanes: depth_lane_cons,
         rpc_signal: rpc_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,

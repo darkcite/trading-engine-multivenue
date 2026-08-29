@@ -404,6 +404,9 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
     > = Ring::new();
     let (mut etx, _erx) = event_ring.split();
+    let depth_ring: std::sync::Arc<Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>> =
+        Ring::new();
+    let (_dtx, _drx) = depth_ring.split();
 
     // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
     // the measured window below proves the entire capture path (tick +
@@ -1302,6 +1305,12 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e5p, e5) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
+    // window pushes one DepthTopK per iteration and the engine
+    // drains it through `on_depth` (192 B Copy slot, 0 B/op).
+    let (mut d0_p, d0) =
+        Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -1324,6 +1333,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5],
         [e0, e1, e2, e3, e4, e5],
+        [d0, d1],
         sc,
         [f0, f1, f2, f3],
         ai_c,
@@ -1377,11 +1387,13 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
                 0,
             ))
             .unwrap();
+        d0_p.try_push(core_types::DepthTopK::EMPTY).unwrap();
         eng.tick(1);
         acc = acc.wrapping_add(eng.ingest_p50_ns());
     }
     std::hint::black_box(acc);
     assert_eq!(eng.events_dispatched, 10_000, "event lane drained");
+    assert_eq!(eng.depths_dispatched, 10_000, "depth lane drained");
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
@@ -1540,6 +1552,9 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
     > = Ring::new();
     let (mut etx, _erx) = event_ring.split();
+    let depth_ring: std::sync::Arc<Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>> =
+        Ring::new();
+    let (mut dtx, _drx) = depth_ring.split();
 
     // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
     // the measured window below proves the entire capture path (tick +
@@ -1567,6 +1582,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut dtx,
         &status,
         &mut capture,
     )
@@ -1599,6 +1615,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut dtx,
         &status,
         &mut capture,
     )
@@ -1666,6 +1683,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut dtx,
             &status,
             &mut capture,
         )
@@ -1856,6 +1874,9 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
     > = Ring::new();
     let (mut etx, _erx) = event_ring.split();
+    let depth_ring: std::sync::Arc<Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>> =
+        Ring::new();
+    let (mut dtx, _drx) = depth_ring.split();
 
     // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
     // the measured window below proves the entire capture path (tick +
@@ -1883,6 +1904,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut dtx,
         &status,
         &mut capture,
     )
@@ -1915,6 +1937,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut dtx,
         &status,
         &mut capture,
     )
@@ -1953,6 +1976,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut dtx,
         &status,
         &mut capture,
     )
@@ -2018,6 +2042,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut dtx,
             &status,
             &mut capture,
         )

@@ -222,12 +222,17 @@ enum Stream {
     /// No cadence band: option streams are intrinsically sparse
     /// (push-on-change on far strikes) — verdict stays `n/a`.
     OptSummary,
+    /// WS10-B top-K depth channel (`<venue>-depth.pmlr`). No cadence
+    /// band: emission is change-gated by design — verdict stays
+    /// `n/a`.
+    Depth,
 }
 
 impl Stream {
     fn name(self) -> &'static str {
         match self {
             Self::Ticks => "ticks",
+            Self::Depth => "depth",
             Self::Event(c) => c.as_str(),
             Self::OptSummary => "opt-summary",
         }
@@ -255,6 +260,12 @@ struct VenueAudit {
     /// Records whose flags said the venue supplied mark px / OI.
     opt_flag_mark_px: u64,
     opt_flag_oi: u64,
+    /// WS10-B `<venue>-depth.pmlr` per-sym streams (change-gated
+    /// snapshots — no cadence band by design; no seq — integrity
+    /// fields stay zero by construction).
+    depths: Vec<SymStat>,
+    /// Snapshots carrying `DEPTH_FLAG_STALE` (book resyncs observed).
+    depth_stale: u64,
     files_seen: u32,
     /// Runtime gap-monitor pairing events (G1 remediation): every
     /// `gaps_total` increment writes one `TradeGap`/`BookGap` event —
@@ -326,6 +337,20 @@ fn audit_opt_summaries(r: &PmlrReader<core_types::OptSummary>, out: &mut VenueAu
         }
         if o.flags & core_types::OPT_SUMMARY_FLAG_OI != 0 {
             out.opt_flag_oi += 1;
+        }
+    }
+}
+
+/// Audit one venue's WS10-B depth log: per-sym count/rate (snapshots
+/// are change-gated — no cadence verdict) plus the STALE-flag total
+/// (each one is an observed book resync). Offline path — allocation
+/// permitted (module doctrine).
+fn audit_depths(r: &PmlrReader<core_types::DepthTopK>, out: &mut VenueAudit) {
+    for d in r.records() {
+        let s = stat_for(&mut out.depths, d.sym);
+        s.note_ts(d.ts_ns);
+        if d.flags & core_types::DEPTH_FLAG_STALE != 0 {
+            out.depth_stale += 1;
         }
     }
 }
@@ -733,6 +758,24 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
             }
         }
 
+        // WS10-B: the top-K depth channel (header-only on venues
+        // without a depth subscription — counted as seen only when it
+        // carries records, the opt-summary pattern).
+        let depth_path = dir.join(format!("{label}-depth.pmlr"));
+        if depth_path.exists() {
+            let r = PmlrReader::<core_types::DepthTopK>::open(&depth_path)?;
+            if r.slot_kind() != SlotKind::Depth {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a depth log", depth_path.display()),
+                ));
+            }
+            if !r.is_empty() {
+                audit_depths(&r, &mut a);
+                a.files_seen += 1;
+            }
+        }
+
         let tap_path = dir.join(format!("{label}-raw.tap"));
         if tap_path.exists() {
             audit_tap(&tap_path, &mut a)?;
@@ -823,6 +866,17 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
                     a.opt_iv_max,
                     a.opt_flag_mark_px,
                     a.opt_flag_oi,
+                ));
+            }
+            // WS10-B: the depth channel (change-gated snapshots).
+            render_stream(&mut report, label, Stream::Depth, &a.depths);
+            if !a.depths.is_empty() {
+                report.push_str(&format!(
+                    "  {} depth totals: snapshots={} syms={} stale={}\n",
+                    label,
+                    a.depths.iter().map(|s| s.count).sum::<u64>(),
+                    a.depths.len(),
+                    a.depth_stale,
                 ));
             }
             if a.signals_count > 0 {
