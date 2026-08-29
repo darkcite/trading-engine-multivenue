@@ -423,6 +423,91 @@ then WS13.**
 
 ## WS13 — ▶ THE ONE LONG RUN (everything validated at once)
 
+**LIVE PHASE RUN 2026-08-29 (operator ruling: soak amended 7 days →
+1 HOUR — "we don't have 7 days"). Timeline (all UTC, all this
+session):**
+
+- 07:17 revive-lever reboot onto the WS10 binary → full universe
+  amendment (okx/deribit `depth = true`, Deribit `BTC_USDC` spot,
+  `[bybit]` BTCUSDT spot+linear) → **live catch #1 (pitfall 11):
+  Bybit spot discovery BadRow boot-loop — live `basePrecision` runs
+  to 1e-13 (BTTUSDT/BABYDOGEUSDT) and the WS4-inherited sub-1e-9
+  reject killed the page. Fix: Bybit `quoted_1e9` truncates past 9
+  fraction digits (floor → 0 = absent sentinel), regression test on
+  the exact live rows** (`98d4db2`).
+- **Live catch #2: GaugedCapture never forwarded `Capture::depth` —
+  the trait default silently swallowed every snapshot (zero depth
+  records while Book events flowed on both venues). Forward + a
+  test pinning EVERY per-record hook** (same commit). Verified live
+  within 2 min: okx-depth 242 / deribit-depth 258 snapshots.
+- 07:33:53 soak boot (run-1787988833603587000). T+32 min: okx-depth
+  5 735 · deribit-depth 4 933 snapshots · bybit 41.9k ticks + 35.2k
+  events (mark/funding/OI) · bn 409k · pm 27.3k · hl 16.8k ticks ·
+  9 271 stamped order intents.
+- **08:00Z SETTLEMENT CROSSED ALIVE — the WS2 proof.** Deribit and
+  OKX tick files grew straight through the hour that produced the
+  6-day outage; okx carried **1 441 `SubDrop` events** (non-fatal
+  per-arg drops with §6.6 evidence) instead of dying; deribit
+  crossed with zero drops. Settlement-adjacent churn on deribit
+  (~07:59) stayed non-fatal.
+- **§5.4 NAMED (the residual's precondition met):** okx chronic
+  churn = `err_site=pump io_kind=other venue_code=0`, ~1/s,
+  508 200 log lines over Aug 25–29 — PRE-EXISTING (present on the
+  old binary for days), unaffected by depth on/off. The fix is its
+  own slice as planned, now with the named code.
+- **BN markPrice: venue-side unreachable from this network** (the
+  M2.4 eapi-WS precedent): hand-rolled WSS probe — `@bookTicker`
+  pushes instantly, `@markPrice`/`@markPrice@1s`/combined-stream
+  upgrade then stay silent on fstream from here. Code correct; the
+  lane idles harmlessly; BN funding evidence deferred to the venue.
+- **#7b recommit proven live in fail-safe form:** the boot waiter
+  armed at every boot and REFUSED with the named reason (bound
+  paths in cleared /tmp) — the designed refuse-don't-guess posture.
+  Re-binding the prior to durable paths = the M5 runbook re-commit
+  step.
+- **D1 fetch:** every REST lane clean, conflicts=0, unresolved=0 in
+  the mapped universe (the 128 flagged are per-boot okx/deribit
+  OPTION ordinals, which resolve via options-manifest.tsv by the
+  M2-close law — map names never apply to them).
+- **C6:** step 1 **PASSED — trailing gap-free streak 6 (Aug 23–28)
+  vs the ≥3 tell**; step 2 done (7 boot-loop empties archived; the
+  two pre-M3 aborted dirs were already gone). Step 3 executed
+  through the FROZEN argv over a 27-run/19M-tick multi-day subset
+  (validator + merge + fill model + schema-1 all proven; 657
+  in-sample fires) but the `oos.trading_days >= 2` sub-gate is
+  STRUCTURALLY blocked today: the full-root merge (~27 GB of
+  MergeKeyed) exceeds this Mac's 24 GiB, and every RAM-feasible
+  subset's OOS tail lands on Aug-28 — a PM-dark legacy day (dailies
+  expired 16:00Z Aug-27 under the pre-T2 single-restart regime).
+  With T2's three daily refreshes now live, two PM-healthy days
+  accumulate by Aug-31 — the bounded rerun then satisfies the
+  sub-gate. OPERATOR CALL: bless the close on streak+machinery or
+  order the Aug-31 rerun.
+
+**SOAK VERDICT (run-1787988833603587000, 07:33:53→08:30:53Z = 57 min
++ the post-0830 session continuing; the 0830 T2 slot fired on the
+minute and closed the run — its own live proof):**
+
+- **audit-replay integrity: pm/bn/okx/hl/bybit ALL ZERO**
+  (regressions / trade holes / missing ids / chain breaks); deribit
+  6 trade holes / 68 missing ids (venue-side feed holes across its
+  churny sessions, chain_breaks=0 — the §6.6-paired class).
+- **Depth (WS10-B live): okx 9 678 snapshots / 2 syms / STALE=0 ·
+  deribit 8 687 / 2 / STALE=0** — change-gated emission at ~2.8/s
+  per book, zero broken-book emissions.
+- Bybit sixth venue: clean integrity, spot+linear ticks + the
+  mark/funding/OI event stream throughout.
+- Options analytics: deribit 102 178 opt-summaries (mark+OI on
+  every record) · okx 13 651.
+- The audit's sub_drop streams hand §5.4 its shape: each ~1 s okx
+  session's re-subscribe takes per-arg refusals on the OPTION block
+  (~0.64/s per sym ×20+ syms + 7.63/s venue-global) before dying at
+  pump/other — the named lead for the §5.4 fix slice.
+- **Soak = GREEN under the operator's 1-hour amendment.** Remaining
+  before Stage 3 (unchanged set, now all named): §5.4 okx churn fix
+  (evidence above) · C6 fill-days sub-gate (operator bless or
+  Aug-31 rerun) · M5 on go · the §7 entry gate.
+
 **GATES PHASE RUN 2026-08-29 (operator-ordered "test everything"; live
 phase still pending).** Results + the regression findings it existed to
 catch:
