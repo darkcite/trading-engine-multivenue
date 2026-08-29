@@ -96,7 +96,10 @@ impl<K: ReqKind, const N: usize> PendingTable<K, N> {
     /// Empty table. Boot-time.
     pub fn new() -> Self {
         const {
-            assert!(N.is_power_of_two() && N >= 2, "PendingTable N must be a power of two >= 2");
+            assert!(
+                N.is_power_of_two() && N >= 2,
+                "PendingTable N must be a power of two >= 2"
+            );
         }
         Self {
             slots: [PendingReq::empty(); N],
@@ -341,16 +344,10 @@ mod tests {
     #[test]
     fn pending_rejects_zero_id_and_busy_slot() {
         let mut t: PendingTable<TestKind, 4> = PendingTable::new();
-        assert_eq!(
-            t.record(0, TestKind::Poll, 0),
-            Err(PendingErr::ZeroId)
-        );
+        assert_eq!(t.record(0, TestKind::Poll, 0), Err(PendingErr::ZeroId));
         t.record(3, TestKind::Poll, 0).unwrap();
         // id 7 maps to the same slot (7 & 3 == 3): busy.
-        assert_eq!(
-            t.record(7, TestKind::Poll, 0),
-            Err(PendingErr::SlotBusy)
-        );
+        assert_eq!(t.record(7, TestKind::Poll, 0), Err(PendingErr::SlotBusy));
         // Unknown id whose slot is used by a different id → None.
         assert!(t.complete(7).is_none());
     }
@@ -378,7 +375,10 @@ mod tests {
     #[test]
     fn sub_table_rejects_reserved_and_overflow() {
         let mut s: SubTable<TestKind, 2> = SubTable::new();
-        assert_eq!(s.insert(SubId::NONE, TestKind::Poll), Err(SubErr::ReservedId));
+        assert_eq!(
+            s.insert(SubId::NONE, TestKind::Poll),
+            Err(SubErr::ReservedId)
+        );
         s.insert(SubId(1), TestKind::Poll).unwrap();
         s.insert(SubId(2), TestKind::Poll).unwrap();
         assert_eq!(s.insert(SubId(3), TestKind::Poll), Err(SubErr::Full));

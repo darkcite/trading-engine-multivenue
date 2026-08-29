@@ -205,7 +205,9 @@ mod tests {
 
     #[test]
     fn retryable_categories() {
-        assert!(NetworkErr::new(NetworkSource::Generic, NetworkErrKind::Disconnected).is_retryable());
+        assert!(
+            NetworkErr::new(NetworkSource::Generic, NetworkErrKind::Disconnected).is_retryable()
+        );
         assert!(NetworkErr::new(NetworkSource::Generic, NetworkErrKind::Tls).is_retryable());
         assert!(NetworkErr::new(NetworkSource::Generic, NetworkErrKind::Io).is_retryable());
         assert!(NetworkErr::new(NetworkSource::Generic, NetworkErrKind::Other).is_retryable());

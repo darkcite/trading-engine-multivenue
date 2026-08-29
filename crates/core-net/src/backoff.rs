@@ -124,7 +124,10 @@ mod tests {
         let _ = b.next_delay_ns();
         b.reset();
         let d = b.next_delay_ns();
-        assert!(d < BACKOFF_BASE_NS, "post-reset delay {d} not in first bucket");
+        assert!(
+            d < BACKOFF_BASE_NS,
+            "post-reset delay {d} not in first bucket"
+        );
         assert!(d >= BACKOFF_BASE_NS / 2);
     }
 

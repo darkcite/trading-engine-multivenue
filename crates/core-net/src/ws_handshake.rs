@@ -187,12 +187,7 @@ impl Sha1 {
         let mut i = 0;
         while i < 16 {
             let off = i * 4;
-            w[i] = u32::from_be_bytes([
-                block[off],
-                block[off + 1],
-                block[off + 2],
-                block[off + 3],
-            ]);
+            w[i] = u32::from_be_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
             i += 1;
         }
         while i < 80 {
@@ -732,9 +727,14 @@ mod tests {
         let mut plain = [0u8; 512];
         let m = write_client_handshake(&mut plain, b"ws.okx.com", b"/ws/v5/public", &key).unwrap();
         let mut with_none = [0u8; 512];
-        let k =
-            write_client_handshake_with_headers(&mut with_none, b"ws.okx.com", b"/ws/v5/public", &key, &[])
-                .unwrap();
+        let k = write_client_handshake_with_headers(
+            &mut with_none,
+            b"ws.okx.com",
+            b"/ws/v5/public",
+            &key,
+            &[],
+        )
+        .unwrap();
         assert_eq!(&plain[..m], &with_none[..k]);
     }
 
@@ -757,10 +757,9 @@ mod tests {
         assert!(body.ends_with(b"\r\n\r\n"));
         assert!(body.starts_with(b"GET /ws HTTP/1.1\r\n"));
         assert!(body.windows(8).any(|w| w == b"Host: ex"));
-        assert!(
-            body.windows(b"Sec-WebSocket-Key: ".len())
-                .any(|w| w == b"Sec-WebSocket-Key: ")
-        );
+        assert!(body
+            .windows(b"Sec-WebSocket-Key: ".len())
+            .any(|w| w == b"Sec-WebSocket-Key: "));
     }
 
     #[test]
@@ -818,10 +817,7 @@ mod tests {
     #[test]
     fn read_server_handshake_incomplete() {
         let partial = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n";
-        assert_eq!(
-            read_server_handshake(partial),
-            HandshakeResult::Incomplete
-        );
+        assert_eq!(read_server_handshake(partial), HandshakeResult::Incomplete);
     }
 
     #[test]

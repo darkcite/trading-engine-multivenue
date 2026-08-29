@@ -290,7 +290,9 @@ pub fn ws_read_frame(buf: &[u8]) -> WsReadResult {
 #[inline]
 pub fn ws_unmask_in_place(buf: &mut [u8], mask: [u8; 4]) {
     // Expand 4-byte mask to 8 bytes for wider XOR chunks.
-    let mask8 = [mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3]];
+    let mask8 = [
+        mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
+    ];
     let m64 = u64::from_ne_bytes(mask8);
 
     let mut i = 0usize;
@@ -462,10 +464,7 @@ mod tests {
         // Unmasked text frame, empty payload.
         let buf: &[u8] = &[0x81, 0x00];
         match ws_read_frame(buf) {
-            WsReadResult::Frame {
-                header,
-                payload,
-            } => {
+            WsReadResult::Frame { header, payload } => {
                 assert!(header.fin);
                 assert_eq!(header.opcode, WsOpcode::Text);
                 assert!(!header.masked);

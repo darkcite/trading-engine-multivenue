@@ -17,6 +17,35 @@
 //! per iteration in `Steady` and acts on the returned
 //! [`KeepaliveAction`].
 
+/// WS2 (capture-continuity outage 2026-08-27 §5.3): default budget
+/// for a session to produce its FIRST confirmed subscription,
+/// measured from session start. The keepalive idle timeout is gated
+/// on `Steady` and on inbound silence — it can never fire while a
+/// session wedges in `Connecting`/`AwaitingWsUpgrade` (non-blocking
+/// connect returns `Ok` instantly; a blackholed SYN then polls
+/// forever), nor while a zero-subscription `Steady` session is kept
+/// "active" by pong replies to our own pings. This budget covers the
+/// whole establishment window: TCP + TLS + WS upgrade + subscribe +
+/// first ack — normally < 2 s; 30 s is generous under any legitimate
+/// load, and the wedge it kills lasted ten hours.
+pub const ESTABLISH_BUDGET_NS: u64 = 30_000_000_000;
+
+/// The shared establishment-budget predicate (WS2): true when the
+/// session has been up for `budget_ns` or longer without a single
+/// confirmed subscription. The run loop tears the session down with
+/// its `EstablishTimeout` result; the reconnect backoff then
+/// escalates (no market data moved, so the T1(b) reset predicate
+/// stays false).
+#[inline]
+pub fn establishment_expired(
+    now_ns: u64,
+    session_start_ns: u64,
+    confirmed_subs: usize,
+    budget_ns: u64,
+) -> bool {
+    confirmed_subs == 0 && now_ns.saturating_sub(session_start_ns) >= budget_ns
+}
+
 /// Static per-venue keepalive configuration.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct KeepaliveCfg {
@@ -161,5 +190,25 @@ mod tests {
         let t0 = 1_000_000_000u64;
         // 41 s quiet, never pinged: both conditions true → Reconnect.
         assert_eq!(k.poll(t0 + 41_000_000_000, t0), KeepaliveAction::Reconnect);
+    }
+
+    #[test]
+    fn establishment_expired_trips_only_at_zero_subs_past_budget() {
+        let t0 = 1_000_000_000u64;
+        let budget = 30_000_000_000u64;
+        // Within budget, zero subs: not yet.
+        assert!(!establishment_expired(t0 + budget - 1, t0, 0, budget));
+        // At/past budget, zero subs: expired (the §5.3 wedge).
+        assert!(establishment_expired(t0 + budget, t0, 0, budget));
+        assert!(establishment_expired(t0 + 10 * budget, t0, 0, budget));
+        // Any confirmed subscription disarms it forever.
+        assert!(!establishment_expired(t0 + 10 * budget, t0, 1, budget));
+    }
+
+    #[test]
+    fn establishment_expired_saturates_on_clock_skew() {
+        // Failure mode: now < session_start (monotonic source swap in
+        // tests) must not underflow into a giant elapsed value.
+        assert!(!establishment_expired(5, 10, 0, 30_000_000_000));
     }
 }

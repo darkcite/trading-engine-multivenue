@@ -391,7 +391,10 @@ mod tests {
         let mut r = MetricsRegistry::new();
         r.register_counter("x").unwrap();
         let mut buf = [0u8; 4];
-        assert_eq!(r.encode_prometheus(&mut buf), Err(EncodeErr::BufferTooSmall));
+        assert_eq!(
+            r.encode_prometheus(&mut buf),
+            Err(EncodeErr::BufferTooSmall)
+        );
     }
 
     #[test]

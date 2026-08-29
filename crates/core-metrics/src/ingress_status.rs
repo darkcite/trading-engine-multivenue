@@ -48,6 +48,11 @@ pub const ERR_SITE_VENUE_ERROR: u8 = 7;
 /// Inner session-error site: the subscribe echo/result was missing
 /// configured channels (`venue_code` = count of missing channels).
 pub const ERR_SITE_SUBSCRIBE_MISSING: u8 = 8;
+/// Session-error site: the session failed to produce its FIRST
+/// confirmed subscription within the establishment budget (WS2,
+/// outage 2026-08-27 §5.3 — covers Connecting/AwaitingUpgrade
+/// wedges AND zero-sub `Steady` sessions kept alive by pongs).
+pub const ERR_SITE_ESTABLISH: u8 = 9;
 
 /// Human name for a session-error site code (0 = "none").
 #[inline]
@@ -62,6 +67,7 @@ pub const fn err_site_name(site: u8) -> &'static str {
         ERR_SITE_REREGISTER => "reregister",
         ERR_SITE_VENUE_ERROR => "venue-error",
         ERR_SITE_SUBSCRIBE_MISSING => "subscribe-missing",
+        ERR_SITE_ESTABLISH => "establish-timeout",
         _ => "unknown",
     }
 }
@@ -194,6 +200,11 @@ pub struct IngressStatus {
     /// session that only received its own subscribe rejection cannot
     /// reset the reconnect schedule (outage §5.3).
     ticks_total: AtomicU64,
+    /// WS2 (outage §5.2 remediation): subscribe args/channels dropped
+    /// NON-FATALLY on a reconnect session (venue error event or
+    /// missing-from-echo). Paired 1:1 with a `ChannelId::SubDrop`
+    /// capture event by the emitting ingress.
+    sub_drops_total: AtomicU64,
     /// T1(a) diag: `ERR_SITE_*` of the first fatal error this
     /// session (0 = none). First-error-wins; cleared by the venue
     /// loop via [`Self::take_last_err`] (same thread as the writer).
@@ -218,6 +229,7 @@ impl IngressStatus {
             reconnects_total: AtomicU64::new(0),
             ring_drops_total: AtomicU64::new(0),
             ticks_total: AtomicU64::new(0),
+            sub_drops_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
             last_err_venue_code: AtomicU32::new(0),
@@ -285,6 +297,13 @@ impl IngressStatus {
     #[inline(always)]
     pub fn add_ticks(&self, n: u64) {
         self.ticks_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count one non-fatal subscribe drop (WS2 — see
+    /// `sub_drops_total` field docs).
+    #[inline(always)]
+    pub fn inc_sub_drops(&self) {
+        self.sub_drops_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// T1(a): record the venue's numeric error code for the current
@@ -371,6 +390,12 @@ impl IngressStatus {
         self.ticks_total.load(Ordering::Relaxed)
     }
 
+    /// Total non-fatal subscribe drops (WS2).
+    #[inline]
+    pub fn sub_drops_total(&self) -> u64 {
+        self.sub_drops_total.load(Ordering::Relaxed)
+    }
+
     /// T1(a): read AND clear the session-error triple. Called by the
     /// cli venue loop right after `run()` returns — the SAME thread
     /// that wrote it (the venue loop and the run loop share one
@@ -453,8 +478,9 @@ mod tests {
     #[test]
     fn slot_is_cache_aligned() {
         assert_eq!(::core::mem::align_of::<IngressStatus>(), 64);
-        // 1 + 8 + 8×8 + (1+1+4) = 79 B of fields → still two cache
-        // lines (the T1 additions must never grow the slot past 128).
+        // 1 + 8 + 9×8 + (1+1+4) = 87 B of fields → still two cache
+        // lines (the T1/WS2 additions must never grow the slot past
+        // 128).
         assert_eq!(::core::mem::size_of::<IngressStatus>(), 128);
     }
 
@@ -475,7 +501,10 @@ mod tests {
         let s = IngressStatus::new();
         // Inner site records first (venue error with code)…
         s.note_venue_err_code((-32602i32) as u32);
-        s.note_session_err(ERR_SITE_VENUE_ERROR, io_kind_code(std::io::ErrorKind::InvalidData));
+        s.note_session_err(
+            ERR_SITE_VENUE_ERROR,
+            io_kind_code(std::io::ErrorKind::InvalidData),
+        );
         // …the outer drive-site conversion must NOT overwrite it.
         s.note_session_err(ERR_SITE_DRIVE, io_kind_code(std::io::ErrorKind::Other));
         s.note_venue_err_code(1);
@@ -486,19 +515,46 @@ mod tests {
         // take() cleared — the next session starts clean.
         assert_eq!(s.take_last_err(), SessionErrSnapshot::default());
         // And a fresh error records again after the clear.
-        s.note_session_err(ERR_SITE_PUMP, io_kind_code(std::io::ErrorKind::ConnectionReset));
+        s.note_session_err(
+            ERR_SITE_PUMP,
+            io_kind_code(std::io::ErrorKind::ConnectionReset),
+        );
         assert_eq!(s.take_last_err().site, ERR_SITE_PUMP);
+    }
+
+    #[test]
+    fn sub_drops_counter_accumulates_independently() {
+        // WS2: a non-fatal drop advances sub_drops ONLY — never msgs,
+        // ticks, or parse_errors (the drop is not data and not a
+        // parser failure).
+        let s = IngressStatus::new();
+        s.inc_sub_drops();
+        s.inc_sub_drops();
+        assert_eq!(s.sub_drops_total(), 2);
+        assert_eq!(s.msgs_total(), 0);
+        assert_eq!(s.ticks_total(), 0);
+        assert_eq!(s.parse_errors_total(), 0);
     }
 
     #[test]
     fn err_site_and_io_kind_names_resolve() {
         assert_eq!(err_site_name(0), "none");
         assert_eq!(err_site_name(ERR_SITE_DRIVE), "drive");
-        assert_eq!(err_site_name(ERR_SITE_SUBSCRIBE_MISSING), "subscribe-missing");
+        assert_eq!(
+            err_site_name(ERR_SITE_SUBSCRIBE_MISSING),
+            "subscribe-missing"
+        );
+        assert_eq!(err_site_name(ERR_SITE_ESTABLISH), "establish-timeout");
         assert_eq!(err_site_name(200), "unknown");
         assert_eq!(io_kind_name(0), "none");
-        assert_eq!(io_kind_name(io_kind_code(std::io::ErrorKind::TimedOut)), "timed-out");
-        assert_eq!(io_kind_name(io_kind_code(std::io::ErrorKind::BrokenPipe)), "broken-pipe");
+        assert_eq!(
+            io_kind_name(io_kind_code(std::io::ErrorKind::TimedOut)),
+            "timed-out"
+        );
+        assert_eq!(
+            io_kind_name(io_kind_code(std::io::ErrorKind::BrokenPipe)),
+            "broken-pipe"
+        );
         assert_eq!(io_kind_name(200), "unknown");
     }
 

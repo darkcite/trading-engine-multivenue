@@ -168,20 +168,17 @@ fn exchange(
         }
     }
     let mut sock = sock.ok_or(BootHttpErr::Connect(last_kind))?;
-    sock.set_nodelay(true).map_err(|e| BootHttpErr::Io(e.kind()))?;
+    sock.set_nodelay(true)
+        .map_err(|e| BootHttpErr::Io(e.kind()))?;
 
     // TLS session.
-    let server_name =
-        TlsTransport::server_name_from_host(host).map_err(|_| BootHttpErr::Tls)?;
-    let mut conn =
-        ClientConnection::new(tls.clone(), server_name).map_err(|_| BootHttpErr::Tls)?;
+    let server_name = TlsTransport::server_name_from_host(host).map_err(|_| BootHttpErr::Tls)?;
+    let mut conn = ClientConnection::new(tls.clone(), server_name).map_err(|_| BootHttpErr::Tls)?;
     let mut stream = rustls::Stream::new(&mut conn, &mut sock);
 
     // Send request.
     set_io_timeout(stream.sock, deadline)?;
-    stream
-        .write_all(request)
-        .map_err(|e| map_io(e, deadline))?;
+    stream.write_all(request).map_err(|e| map_io(e, deadline))?;
 
     // Read until the framed body is complete (Content-Length early
     // exit) or EOF (chunked / close-delimited; `Connection: close` is

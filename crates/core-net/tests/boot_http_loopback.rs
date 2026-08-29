@@ -27,11 +27,10 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
-    let key_der =
-        PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
+    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
 }
 
@@ -129,8 +128,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 #[test]
 fn get_content_length_body_roundtrips() {
     let cert = make_cert();
-    let response =
-        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello-clen".to_vec();
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello-clen".to_vec();
     let (port, srv) = one_shot_server(build_server_config(&cert), response, 0);
     let mut out = Vec::new();
     let range = https_get(

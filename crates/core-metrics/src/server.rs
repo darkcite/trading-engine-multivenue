@@ -234,9 +234,9 @@ fn write_headers(
     ];
     let mut pos = 0usize;
     for p in parts {
-        let end = pos.checked_add(p.len()).ok_or_else(|| {
-            io::Error::other("header overflow")
-        })?;
+        let end = pos
+            .checked_add(p.len())
+            .ok_or_else(|| io::Error::other("header overflow"))?;
         if end > dst.len() {
             return Err(io::Error::other("header overflow"));
         }

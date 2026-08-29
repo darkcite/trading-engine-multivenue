@@ -41,8 +41,7 @@ fn boot_server(registry: Arc<MetricsRegistry>) -> (u16, Arc<AtomicBool>, thread:
 }
 
 fn http_get(port: u16, path: &str) -> (u16, String) {
-    let mut sock =
-        TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     sock.write_all(req.as_bytes()).expect("write");
@@ -141,7 +140,10 @@ fn slow_request_after_connect_is_served_not_eagain() {
     handle.join().unwrap();
 
     let s = String::from_utf8_lossy(&buf);
-    assert!(s.starts_with("HTTP/1.1 200"), "slow request must be served; got: {s}");
+    assert!(
+        s.starts_with("HTTP/1.1 200"),
+        "slow request must be served; got: {s}"
+    );
     assert!(s.contains("engine_slow_total 7"), "{s}");
 }
 
@@ -184,5 +186,9 @@ fn scrape_hammer_all_succeed_without_conn_errors() {
     }
     stop.store(true, Ordering::Release);
     handle.join().unwrap();
-    assert_eq!(errors.load(Ordering::Relaxed), 0, "no connection errors under hammer");
+    assert_eq!(
+        errors.load(Ordering::Relaxed),
+        0,
+        "no connection errors under hammer"
+    );
 }

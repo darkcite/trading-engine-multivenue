@@ -47,7 +47,9 @@ pub mod ws_handshake;
 pub use backoff::{Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS};
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
 pub use iobuf::IoBuf;
-pub use keepalive::{Keepalive, KeepaliveAction, KeepaliveCfg};
+pub use keepalive::{
+    establishment_expired, Keepalive, KeepaliveAction, KeepaliveCfg, ESTABLISH_BUDGET_NS,
+};
 pub use subs::{
     queue_masked_binary_frame, queue_masked_text_frame, PendingErr, PendingReq, PendingTable,
     ReqKind, SubErr, SubId, SubTable,

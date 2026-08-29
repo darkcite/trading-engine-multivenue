@@ -54,6 +54,8 @@ pub enum VenueId {
     Hyperliquid = 4,
     /// AI-Ingress (claude-worker command feed; no market data).
     Ai = 5,
+    /// WS9: Bybit v5 public WS (spot + linear perps).
+    Bybit = 6,
 }
 
 impl VenueId {
@@ -74,6 +76,7 @@ impl VenueId {
             3 => Some(Self::Deribit),
             4 => Some(Self::Hyperliquid),
             5 => Some(Self::Ai),
+            6 => Some(Self::Bybit),
             _ => None,
         }
     }
@@ -669,7 +672,10 @@ pub enum ChannelId {
     Book = 1,
     /// Mark price (OKX `mark-price`).
     Mark = 2,
-    /// Funding rate (OKX `funding-rate`).
+    /// Funding rate (OKX `funding-rate`; WS3: Deribit perp tickers'
+    /// `current_funding` — `v0` = rate ×1e9 on both venues, `v1` =
+    /// next-funding time ms on OKX / 0 on Deribit (continuous
+    /// funding, no discrete next time)).
     Funding = 3,
     /// Composite ticker (Deribit `ticker.100ms`).
     Ticker = 4,
@@ -694,6 +700,27 @@ pub enum ChannelId {
     /// = monitor was awaiting a snapshot), `v1` = observed
     /// `prev_change_id`.
     BookGap = 10,
+    /// Runtime NON-FATAL subscribe drop (WS2, capture-continuity
+    /// outage 2026-08-27 §5.2 remediation): a venue refused one
+    /// subscribe arg — or omitted one expected channel from its
+    /// subscribe echo — on a RECONNECT session, and the ingress
+    /// dropped that instrument/channel from the session's subscribe
+    /// set instead of failing the session. Emitted 1:1 with every
+    /// `sub_drops_total` increment (the §6.6 pairing contract).
+    /// `sym` = the dropped instrument (`SYMBOL_ID_NONE` when the
+    /// venue's error names no resolvable instrument), `venue_seq` = 0,
+    /// `v0` = the venue's numeric error code (0 = missing-from-echo,
+    /// no code), `v1` = venue-local channel discriminant (−1 =
+    /// unknown, or a folded option row).
+    SubDrop = 11,
+    /// WS6: venue volatility-index series (Deribit DVOL,
+    /// `deribit_volatility_index.{index}`). Venue-GLOBAL — `sym` =
+    /// `SYMBOL_ID_NONE`; `v0` = volatility POINTS ×1e9 (the venue's
+    /// percent-points figure, e.g. 59.18 → 59_180_000_000), `v1` =
+    /// 0-based ordinal of the index in the boot-configured
+    /// options-underlyings list (the offline identity — the boot log
+    /// + universe file resolve it), `venue_time_ms` = venue ts.
+    VolIndex = 12,
 }
 
 impl ChannelId {
@@ -712,6 +739,8 @@ impl ChannelId {
             8 => Some(Self::PriceChange),
             9 => Some(Self::TradeGap),
             10 => Some(Self::BookGap),
+            11 => Some(Self::SubDrop),
+            12 => Some(Self::VolIndex),
             _ => None,
         }
     }
@@ -731,6 +760,8 @@ impl ChannelId {
             Self::PriceChange => "price_change",
             Self::TradeGap => "trade_gap",
             Self::BookGap => "book_gap",
+            Self::SubDrop => "sub_drop",
+            Self::VolIndex => "vol_index",
         }
     }
 }
@@ -1648,6 +1679,7 @@ mod tests {
             VenueId::Deribit,
             VenueId::Hyperliquid,
             VenueId::Ai,
+            VenueId::Bybit,
         ];
         let mut i = 0;
         while i < all.len() {
@@ -1658,7 +1690,8 @@ mod tests {
 
     #[test]
     fn venue_id_rejects_unknown_bytes() {
-        assert_eq!(VenueId::from_u8(6), None);
+        // 6 became Bybit at WS9 — the first unassigned byte is now 7.
+        assert_eq!(VenueId::from_u8(7), None);
         assert_eq!(VenueId::from_u8(254), None);
         // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
         assert_eq!(VenueId::from_u8(255), None);
@@ -1707,9 +1740,7 @@ mod tests {
         );
         // SAFETY: Tick is AsBytes (repr(C), Copy, fully-initialized);
         // read-only byte view of a live stack value.
-        let tb = unsafe {
-            core::slice::from_raw_parts((&t as *const Tick).cast::<u8>(), 64)
-        };
+        let tb = unsafe { core::slice::from_raw_parts((&t as *const Tick).cast::<u8>(), 64) };
         assert_eq!(tb[48], VenueId::Hyperliquid.to_u8());
         // Explicit tail padding must be zero.
         let mut i = 49;
@@ -1729,9 +1760,7 @@ mod tests {
             7,
         );
         // SAFETY: Order is AsBytes; same argument as above.
-        let ob = unsafe {
-            core::slice::from_raw_parts((&o as *const Order).cast::<u8>(), 64)
-        };
+        let ob = unsafe { core::slice::from_raw_parts((&o as *const Order).cast::<u8>(), 64) };
         assert_eq!(ob[40], VenueId::Okx.to_u8());
         // M4.1: offset 41 = strategy_id, STRATEGY_ID_NONE by default.
         assert_eq!(ob[41], STRATEGY_ID_NONE);
@@ -1762,8 +1791,18 @@ mod tests {
         assert_eq!(::core::mem::size_of::<OptSummary>(), 64);
         // Field offsets are the docs/wire-format.md pinned law.
         let o = OptSummary::new(
-            1, VenueId::Deribit, 2, OPT_SUMMARY_FLAG_MARK_PX | OPT_SUMMARY_FLAG_OI,
-            3, 4, 5, 6, 7, 8, 9, 10,
+            1,
+            VenueId::Deribit,
+            2,
+            OPT_SUMMARY_FLAG_MARK_PX | OPT_SUMMARY_FLAG_OI,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
         );
         let base = &o as *const OptSummary as usize;
         assert_eq!(&o.ts_ns as *const _ as usize - base, 0);
@@ -1787,9 +1826,18 @@ mod tests {
         assert_eq!(sat_i32(i64::MAX), i32::MAX);
         assert_eq!(sat_i32(i64::MIN), i32::MIN);
         let o = OptSummary::new(
-            1, VenueId::Okx, 2, 0, 0, 650_000_000, 0, 0,
+            1,
+            VenueId::Okx,
+            2,
+            0,
+            0,
+            650_000_000,
+            0,
+            0,
             10_000_000_000, // delta overflow → saturates
-            5, 5, -10_000_000_000,
+            5,
+            5,
+            -10_000_000_000,
         );
         assert_eq!(o.delta_1e9, i32::MAX);
         assert_eq!(o.theta_1e6, i32::MIN);
@@ -1838,9 +1886,8 @@ mod channel_event_tests {
         );
         // SAFETY: ChannelEvent is AsBytes (repr(C), Copy, fully
         // initialized); read-only byte view of a live stack value.
-        let b = unsafe {
-            core::slice::from_raw_parts((&e as *const ChannelEvent).cast::<u8>(), 64)
-        };
+        let b =
+            unsafe { core::slice::from_raw_parts((&e as *const ChannelEvent).cast::<u8>(), 64) };
         assert_eq!(b[12], VenueId::Deribit.to_u8());
         assert_eq!(b[13], ChannelId::Ticker as u8);
         // Reserved + tail padding must be zero.
@@ -1871,6 +1918,8 @@ mod channel_event_tests {
             ChannelId::PriceChange,
             ChannelId::TradeGap,
             ChannelId::BookGap,
+            ChannelId::SubDrop,
+            ChannelId::VolIndex,
         ];
         let mut i = 0;
         while i < all.len() {
@@ -1879,7 +1928,7 @@ mod channel_event_tests {
             assert!(!c.as_str().is_empty());
             i += 1;
         }
-        assert_eq!(ChannelId::from_u8(11), None);
+        assert_eq!(ChannelId::from_u8(13), None);
         assert_eq!(ChannelId::from_u8(255), None);
     }
 
@@ -2099,9 +2148,18 @@ mod ai_cmd_tests {
         // SAFETY: AiCmd is AsBytes (repr(C), Copy, fully initialized);
         // read-only byte view of a live stack value.
         let b = unsafe { core::slice::from_raw_parts((&c as *const AiCmd).cast::<u8>(), 64) };
-        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 0x1111_2222_3333_4444);
-        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 0xAABB_CCDD);
-        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 0x0500_0007);
+        assert_eq!(
+            u64::from_le_bytes(b[0..8].try_into().unwrap()),
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(
+            u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            0xAABB_CCDD
+        );
+        assert_eq!(
+            u32::from_le_bytes(b[12..16].try_into().unwrap()),
+            0x0500_0007
+        );
         assert_eq!(
             i64::from_le_bytes(b[16..24].try_into().unwrap()),
             0x0102_0304_0506_0708
@@ -2252,10 +2310,16 @@ mod ai_cmd_tests {
         // Symbol required on fair value / intents.
         let mut fv = valid(AiCmdKind::SetFairValue);
         fv.sym = SYMBOL_ID_NONE;
-        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE)));
+        assert_eq!(
+            fv.validate_shape(),
+            Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE))
+        );
         let mut oi = valid(AiCmdKind::OrderIntent);
         oi.sym = SYMBOL_ID_NONE;
-        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE)));
+        assert_eq!(
+            oi.validate_shape(),
+            Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE))
+        );
     }
 
     #[test]
@@ -2319,7 +2383,10 @@ mod ai_cmd_tests {
         // Kinds with no slot must carry the sentinel.
         let mut fv = valid(AiCmdKind::SetFairValue);
         fv.strategy_id = 0;
-        assert_eq!(fv.validate_shape(), Err(AiCmdShapeError::BadStrategySlot(0)));
+        assert_eq!(
+            fv.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(0))
+        );
         // Intents are pinned to the ai-exec slot...
         let mut oi = valid(AiCmdKind::OrderIntent);
         oi.strategy_id = STRATEGY_SLOT_VM;
@@ -2345,7 +2412,10 @@ mod ai_cmd_tests {
         oi.side = 2;
         assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadSide(2)));
         oi.side = AI_SIDE_NONE;
-        assert_eq!(oi.validate_shape(), Err(AiCmdShapeError::BadSide(AI_SIDE_NONE)));
+        assert_eq!(
+            oi.validate_shape(),
+            Err(AiCmdShapeError::BadSide(AI_SIDE_NONE))
+        );
     }
 
     #[test]
