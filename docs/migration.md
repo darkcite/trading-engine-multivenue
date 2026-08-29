@@ -30,6 +30,76 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-30 — VM2 V6: worker seed lane, depth digest, coverage audit, channel map, per-host candle budgets
+
+**What changed**
+
+- `claude_worker.pmlr` learned the kind-7 `DepthTopK` decode
+  (`DepthReader`, 192-byte stride — the FIRST kind-determined slot
+  size; the 64-B `Reader` keeps refusing kind 7 by design) and the
+  kind-3 `Order` decode (`Reader.order/orders`, engine-orders.pmlr).
+- `claude_worker.frames`: `KIND_FUNDING_SEED = 10`,
+  `KIND_POSITION_SEED = 11` (core-types AiCmdKind mirror).
+- NEW module `claude_worker.seeds` — the D-1/D-2 seed lane: kind-10
+  frames from the candles.db `funding` table (RAW venue prints ×1e9;
+  the ENGINE owns the deribit ÷8 law) + kind-11 restores
+  reconstructed from the previous run's engine-orders.pmlr (slot-5
+  FIFO fold, (sym,ref)-unique-row ambiguity law, sym RE-RESOLVED
+  through the CURRENT manifest, qty = age seconds, ttl 0).
+- NEW module `claude_worker.depth_digest` — hourly
+  imbalance/spread/near-notional stats per (venue, descriptor) into
+  the NEW `depth_digest` table beside candles (iv_digest pattern;
+  STALE and empty-side snapshots skipped + counted).
+- NEW module `claude_worker.coverage_audit` — per-class expected-vs-
+  present audit of candles/funding/iv/depth over the newest manifest.
+- NEW module `claude_worker.channel_map` — generated per-instrument
+  channel TSV; `caps_of_descriptor` python mirror pinned CROSS-
+  LANGUAGE against the new Rust `caps_of_descriptor_law` test.
+- `claude_worker.candles.run_cycle`: REST budgets are now per HOST
+  (`budget_key`; only the two bybit categories pool) and DEMAND-SIZED
+  `max(env floor, 2 × tfs × targets)` per host.
+- `scripts/candles-cycle.sh` runs `claude_worker.depth_digest` after
+  the IV digest (same serialized window; exec bit preserved).
+
+**Why**
+
+- V6 of docs/vm2-plan.md: warm VM restarts (funding windows + open
+  positions survive the daily restart without crons) and D-8 research
+  reach (the agent sees depth, knows every instrument's channels, and
+  the audit names data holes instead of leaving them silent).
+- The budget change fixes a LIVE starvation found by the new audit
+  (2026-08-30): binance spot and usdm shared one per-venue 30-call
+  budget although they hit different hosts — the 22-target usdm lane
+  got ZERO pages every cycle and 12 M5/BST symbols had no candles at
+  all.
+
+**Impact**
+
+- On-disk formats: NEW `depth_digest` table in candles.db (additive);
+  no existing table/file changes. `~/multivenue/worker/channel-map.tsv`
+  is a new generated file.
+- Config keys: none new (depth digest honors
+  `CLAUDE_WORKER_DEPTH_DIGEST_WINDOW_H`, default 26). The meaning of
+  `CLAUDE_WORKER_CANDLES_BUDGET_PER_H` narrows from per-venue pool to
+  PER-HOST FLOOR.
+- Wire formats: none (kinds 10/11 landed in V1; this is the worker
+  mirror).
+
+**Migration steps**
+
+1. Nothing mandatory — tables and modules are additive; the next
+   hourly candles cycle backfills the starved usdm symbols under the
+   new budgets and starts writing depth digests.
+2. Optional one-shots: `python -m claude_worker.depth_digest
+   --backfill` (done 2026-08-30, 108 buckets), `python -m
+   claude_worker.channel_map`.
+
+**Rollback**
+
+- Revert the commit; drop the `depth_digest` table if desired
+  (nothing reads it engine-side). Seeds are push-only and the engine
+  refuses/expires malformed ones by design.
+
 ## 2026-08-30 — VM2 V5: multi-channel backtest, warmup, D-7 options mark-fill law, D-3 report/gate amendment
 
 **What changed**

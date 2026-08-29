@@ -52,6 +52,14 @@ KIND_ORDER_INTENT: int = 6
 KIND_RULESET_STAGE: int = 7
 KIND_RULESET_COMMIT: int = 8
 KIND_HALT_REQUEST: int = 9
+# VM2 V1 (D-1): one settled funding print as the venue published it —
+# px = rate ×1e9 RAW (the engine's funding_print_divisor applies any
+# ÷8 law), qty = the venue print timestamp in ms (> 0).
+KIND_FUNDING_SEED: int = 10
+# VM2 V1 (D-2): restore one position row post-restart — param_id =
+# row index, px = entry px ×1e6, qty = position AGE in SECONDS (≥ 0),
+# ttl_ns MUST be 0 (the engine drain expires any nonzero ttl).
+KIND_POSITION_SEED: int = 11
 
 # ---- sentinels and enum bytes (core-types) ----
 

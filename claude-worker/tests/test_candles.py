@@ -571,7 +571,21 @@ def test_okx_backward_resumes_from_frontier(tmp_path: pathlib.Path) -> None:
 # ---- cycle + main --------------------------------------------------------
 
 
-def test_run_cycle_shares_budget_per_venue(tmp_path: pathlib.Path) -> None:
+def test_budget_key_is_per_host():
+    """VM2 V6: budgets pool per REST host — only the two bybit
+    categories share one."""
+    assert claude_worker.candles.budget_key("binance") == "binance"
+    assert claude_worker.candles.budget_key("binance-usdm") == "binance-usdm"
+    assert claude_worker.candles.budget_key("bybit") == "bybit"
+    assert claude_worker.candles.budget_key("bybit-linear") == "bybit"
+    assert claude_worker.candles.budget_key("okx") == "okx"
+
+
+def test_run_cycle_budgets_per_host_and_demand_sized(tmp_path: pathlib.Path) -> None:
+    """VM2 V6 correction of the old per-VENUE pool: the binance spot
+    and usdm lanes hit DIFFERENT hosts ⇒ separate budgets, each
+    demand-sized to max(floor, 2×tfs×targets) — with floor 4 both
+    lanes complete all 3 tfs (6 calls total, no BUDGET lines)."""
     conn = db(tmp_path)
     spot = bn_target()
     usdm = claude_worker.candles.LaneTarget(
@@ -591,10 +605,42 @@ def test_run_cycle_shares_budget_per_venue(tmp_path: pathlib.Path) -> None:
     http = claude_worker.candles.Http(get=get, post=base.post, hosts=base.hosts)
     lines: list[str] = []
     claude_worker.candles.run_cycle(conn, lanes, http, NOW, 4, {}, lines.append)
-    # ONE venue budget of 4 across both binance lanes × 3 tfs.
-    assert len(calls) == 4
-    assert sum("BUDGET" in line for line in lines) == 2
+    assert len(calls) == 6
+    assert sum("BUDGET" in line for line in lines) == 0
     assert any("binance:btcusdt 1m" in line for line in lines)
+    assert any("binance-usdm:btcusdt 1m" in line for line in lines)
+
+
+def test_run_cycle_spot_lane_cannot_starve_usdm(tmp_path: pathlib.Path) -> None:
+    """The 2026-08-30 live regression: a big spot lane must never eat
+    the usdm lane's pages — usdm always reaches its own host."""
+    conn = db(tmp_path)
+    spot_targets = [
+        claude_worker.candles.LaneTarget(
+            claude_worker.frames.VENUE_BINANCE, f"binance:s{i}usdt", f"S{i}USDT"
+        )
+        for i in range(6)
+    ]
+    usdm = claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_BINANCE, "binance-usdm:btcusdt", "BTCUSDT"
+    )
+    lanes = [
+        claude_worker.candles.Lane(
+            "binance", claude_worker.frames.VENUE_BINANCE, spot_targets, backward=False
+        ),
+        claude_worker.candles.Lane("binance-usdm", usdm.venue, [usdm], backward=False),
+    ]
+    fapi_calls: list[str] = []
+
+    def get(url: str) -> str:
+        if "bnf.test" in url:
+            fapi_calls.append(url)
+        return klines_json([])
+
+    base = http_none()
+    http = claude_worker.candles.Http(get=get, post=base.post, hosts=base.hosts)
+    claude_worker.candles.run_cycle(conn, lanes, http, NOW, 4, {}, lambda _l: None)
+    assert len(fapi_calls) == 3  # one page per tf, spot volume irrelevant
 
 
 def test_run_cycle_rotates_targets_by_hour(tmp_path: pathlib.Path) -> None:

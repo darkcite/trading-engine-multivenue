@@ -1026,6 +1026,15 @@ def capture_and_derive(
 # ---- one cycle -----------------------------------------------------------
 
 
+def budget_key(lane_name: str) -> str:
+    """REST budgets are per HOST — free-tier rate limits are per host,
+    and that is the pool a budget models. The two bybit categories
+    share ``api.bybit.com``; every other lane owns its host (binance
+    spot ``api.`` vs usdm ``fapi.`` are DIFFERENT hosts with
+    independent limits — see run_cycle's VM2 V6 note)."""
+    return "bybit" if lane_name.startswith("bybit") else lane_name
+
+
 def run_cycle(
     conn: sqlite3.Connection,
     lanes: list[Lane],
@@ -1036,23 +1045,38 @@ def run_cycle(
     report: collections.abc.Callable[[str], None],
 ) -> None:
     """One §9.6 cycle over every lane × target × base tf. Budgets are
-    per VENUE (fetchers convention); tf order 1m → 1h → 1d so the
-    freshest window always fills first. Targets ROTATE by cycle hour:
-    a backward lane whose walk exceeds the leftover budget would
+    per REST HOST ([`budget_key`]), DEMAND-SIZED: ``max(budget_per_h,
+    2 × tfs × targets)`` summed over the host's lanes — steady state
+    needs one page per (target, tf), the ×2 is backfill headroom, and
+    ``budget_per_h`` (env) stays the floor. VM2 V6 correction
+    (observed live 2026-08-30): the old per-VENUE key made binance
+    spot and usdm share ONE 30-call budget although they hit different
+    hosts — the spot lane ran first and starved the 22-target usdm
+    lane to ZERO pages every cycle (12 M5/BST symbols never got a
+    first candle). Worst-case demand stays trivially inside free
+    tiers (≈2 calls/min). tf order 1m → 1h → 1d so the freshest
+    window always fills first. Targets ROTATE by cycle hour: a
+    backward lane whose walk exceeds the leftover budget would
     otherwise be discarded every cycle behind the same earlier
     siblings (observed live 2026-08-22: okx ETH-USDT-SWAP's 29-page
     1m walk vs 27 remaining) — rotation lets every target lead a
     cycle eventually, so every backfill completes."""
-    budgets: dict[int, claude_worker.features.RestBudget] = {}
+    demand: dict[str, int] = {}
     for lane in lanes:
+        key = budget_key(lane.name)
+        demand[key] = demand.get(key, 0) + 2 * len(FETCHED_TFS) * len(lane.targets)
+    budgets: dict[str, claude_worker.features.RestBudget] = {}
+    for lane in lanes:
+        key = budget_key(lane.name)
         budgets.setdefault(
-            lane.venue,
+            key,
             claude_worker.features.RestBudget(
-                budget_per_h, claude_worker.fetchers.BUDGET_WINDOW_NS
+                max(budget_per_h, demand[key]),
+                claude_worker.fetchers.BUDGET_WINDOW_NS,
             ),
         )
     for lane in lanes:
-        budget = budgets[lane.venue]
+        budget = budgets[budget_key(lane.name)]
         rot = (now_ms // 3_600_000) % len(lane.targets) if lane.targets else 0
         rotated = lane.targets[rot:] + lane.targets[:rot]
         for target in rotated:

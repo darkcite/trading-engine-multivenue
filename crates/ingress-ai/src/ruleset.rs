@@ -3043,4 +3043,38 @@ mod v2_grammar_tests {
         .expect("valid");
         assert_eq!(t.rows[0].enter_1e9, 59_300);
     }
+
+    #[test]
+    fn caps_of_descriptor_law() {
+        // VM2 V6: the CROSS-LANGUAGE pin — this table is mirrored
+        // byte-for-byte by claude-worker/tests/test_channel_map.py
+        // (python `channel_map.caps_of_descriptor`). Change either
+        // side only with the other in the same commit.
+        const P: u8 = CAP_PRICE;
+        const F: u8 = CAP_FUNDING;
+        const D: u8 = CAP_DEPTH;
+        const O: u8 = CAP_OPT;
+        let law: [(&str, u8); 14] = [
+            ("123456789", P), // bare PM token id
+            ("binance:btcusdt", P),
+            ("binance-usdm:btcusdt", P | F),
+            ("okx:BTC-USDT-SWAP", P | F | D),
+            ("okx:BTC-USDT", P | D),
+            ("okx:BTC-USD-260925-100000-C", O),
+            ("deribit:BTC-PERPETUAL", P | F | D),
+            ("deribit:BTC-26SEP26", P | D),
+            ("deribit:BTC-26SEP26-100000-P", O | P),
+            ("binance-opt:BTC-260925-100000-C", O | P),
+            ("hyperliquid:BTC", P | F),
+            ("hyperliquid:#NVDA", P),
+            ("bybit:BTCUSDT", P),
+            ("bybit-linear:BTCUSDT", P | F),
+        ];
+        let mut i = 0;
+        while i < law.len() {
+            let (desc, want) = law[i];
+            assert_eq!(caps_of_descriptor(desc), want, "{desc}");
+            i += 1;
+        }
+    }
 }

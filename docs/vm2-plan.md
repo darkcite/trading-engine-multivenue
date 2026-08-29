@@ -555,3 +555,63 @@ new venues.
   partial-filled the $9.9k legs — deep-book v5_tick pinned it).
   Gates: nextest 1417/1417 · cli 151/151 · alloc/pytest/license
   this entry's close.
+
+- **2026-08-30 — V6 CODED + REAL-ROOT SMOKED (worker seed lane +
+  D-8 research reach).** pmlr.py grew the kind-7 `DepthReader`
+  (192-B stride — the container's first kind-determined slot size;
+  the 64-B `Reader` still refuses kind 7 by design, cross-pinned)
+  and the kind-3 `OrderRec` decode; frames.py kinds 10/11. FOUR new
+  modules (module-surface law, never verbs, serialized): **seeds**
+  (D-1 kind-10 pushes: 73 h of RAW venue prints from the funding
+  table, manifest-resolved, engine owns the ÷8 law, ≤640/sym
+  newest-kept; D-2 kind-11 restores: previous-run engine-orders
+  slot-5 FIFO fold under the (sym,ref)-unique-row ambiguity law,
+  sym RE-RESOLVED through the CURRENT manifest, px = surviving-
+  basket VWAP 1e6, qty = age s, ttl 0; `--dry-run` keyless;
+  heartbeat-first §5.4 push path), **depth_digest** (hourly
+  imb-OHLC/spread-bps-avg/near-notional-avg per (venue, descriptor)
+  beside candles, iv_digest pattern, STALE + empty-side skipped),
+  **coverage_audit** (expected-vs-present per class ×
+  candles/funding/iv/depth; expectation law from caps),
+  **channel_map** (generated TSV; `caps_of_descriptor` python
+  mirror pinned CROSS-LANGUAGE against the NEW Rust
+  `caps_of_descriptor_law` test — 14 fixture rows, change either
+  side only with the other). candles-cycle.sh runs the depth digest
+  in the same serialized window (D3 precedent). **Real-root
+  smokes:** depth_digest folded 725 943 live snapshots → 108 hourly
+  buckets, unresolved 0 (BTC-PERP 0.06 bps vs ADA 7.9 bps — sane
+  microstructure; backfilled into the REAL candles.db); seeds
+  --dry-run framed 1 634 prints across 52 funding descriptors;
+  channel_map rendered the live manifest. **The audit EARNED ITS
+  KEEP on first run (hollow-lanes-total=103):** (1) binance-usdm
+  candles 12/22 missing ⇒ ROOT-CAUSED per-VENUE budget pooling —
+  spot+usdm shared ONE 30-call budget across DIFFERENT hosts, spot
+  ran first, usdm starved to ZERO pages every cycle since the M5/BST
+  additions ⇒ FIXED: `run_cycle` budgets per HOST (`budget_key`;
+  bybit categories pool) and demand-sized `max(floor, 2×tfs×targets)`
+  (~2 calls/min worst case, free-tier-trivial; old shared-budget test
+  REWRITTEN into the per-host pin + a can't-starve regression);
+  (2) polymarket candles 4/6 missing = STALE market-map (fetch not
+  run since the 16:00Z universe refresh) — operational: run `fetch`
+  post-refresh, wiring it into the BST3 refresh family is an
+  operator call; (3) binance-opt iv 64/64 missing = the venue-dark
+  eapi lane (standing .env lever, recorded); (4) okx/opt iv 52/64 —
+  the 12 `_UM`-family instruments carry no opt-summary in-window
+  (venue-side observation, recorded); (5) deribit+okx depth hollow =
+  the digest not yet landed — closed by this workstream's backfill.
+  Tests: +36 worker pins (layout pins for Depth/Order at documented
+  offsets, torn-slot law, measure/fold/upsert, raw-rate + window +
+  640-cap laws, artifact exit-key law, FIFO/flip folds, ambiguity +
+  re-resolution + age, dry-run E2E, ÷8 mirror pin citing
+  funding_print_divisor, caps law table, audit expectation law) +
+  the candle-budget pins (old shared-venue pin rewritten per-host +
+  a can't-starve regression) + 1 Rust caps pin. **Gates at entry
+  close: nextest 1418/1418 · release alloc 39/39 (fresh `Compiling
+  bench`) · pytest 547 (release binary on PATH) · license-check OK
+  (222 files) — new stay-greens 1418/39/547.** Budget fix
+  LIVE-PROVEN in one manual cycle: all 12 starved symbols
+  backfilled 2 880 1m bars each, ZERO BUDGET lines. (A debug
+  parallel-nextest one-off on `rpc_block_number_is_zero_alloc`
+  under REST-cycle machine load passed solo + on the quiet full
+  rerun — the V2-noted bench-crate noise class; the release gate is
+  authoritative.)

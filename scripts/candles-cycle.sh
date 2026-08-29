@@ -36,3 +36,7 @@ uv run python -m claude_worker.candles ||
 # D3: the IV digest rides the same serialized window.
 uv run python -m claude_worker.iv_digest ||
   echo "candles-cycle: iv_digest failed (non-fatal; next hour retries)" >&2
+# VM2 V6 (D-8): the depth digest rides the same serialized window
+# (same rolling-window/skip laws as the IV digest).
+uv run python -m claude_worker.depth_digest ||
+  echo "candles-cycle: depth_digest failed (non-fatal; next hour retries)" >&2
