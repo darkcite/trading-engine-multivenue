@@ -498,6 +498,37 @@ impl Strategy for StrategySet {
         }
     }
 
+    /// WS10-A: venue events fan out to enabled members exactly like
+    /// ticks/signals — the member sees the same defaulted no-op until
+    /// it opts in, and submits (if it ever does) are slot-stamped.
+    #[inline(always)]
+    fn on_venue_event<C: Ctx>(&mut self, event: &core_types::ChannelEvent, ctx: &mut C) {
+        if self.enabled & BIT_LATENCY_ARB != 0 {
+            self.latency_arb
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        }
+        if self.enabled & BIT_EV != 0 {
+            self.ev
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        }
+        if self.enabled & BIT_CROSS_ARB != 0 {
+            self.cross_arb
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
+        }
+        if self.enabled & BIT_RULE_TREE != 0 {
+            self.rule_tree
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        }
+        if self.enabled & BIT_AI_EXEC != 0 {
+            self.ai_exec
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
+        }
+        if self.enabled & BIT_VM != 0 {
+            self.vm
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+    }
+
     #[inline(always)]
     fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C) {
         if self.enabled & BIT_LATENCY_ARB != 0 {

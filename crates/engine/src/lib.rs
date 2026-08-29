@@ -33,7 +33,8 @@ use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
-    AiCmd, Fill, Order, RuleTableSlot, Signal, Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    AiCmd, ChannelEvent, Fill, Order, RuleTableSlot, Signal, Tick, VenueId, AI_RING_SIZE,
+    EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
@@ -94,6 +95,14 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
     }
 }
 
+/// Number of venue-event lanes (WS10-A): mirrors the tick-lane
+/// geometry — same indices, same [`tick_lane_of`] map. Every lane
+/// carries [`ChannelEvent`] slots; venues without an event source
+/// (PM, RPC in v1) hand the engine a permanently-empty ring (§3.3
+/// unspawned pattern). Ring capacity is
+/// [`core_types::EVENT_RING_SIZE`].
+pub const NUM_EVENT_LANES: usize = NUM_TICK_LANES;
+
 /// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
 /// Binance is market-data-only, so it has no fill lane.
 pub const NUM_FILL_LANES: usize = 4;
@@ -136,6 +145,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     disp: D,
     /// Tick lanes indexed by `VenueId as usize` (§3.3).
     tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+    /// Venue-event lanes (WS10-A), tick-lane indexing. v1 carries
+    /// funding only (the spawn-time `event_mask` gates producers).
+    event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
@@ -192,6 +204,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     pub signals_dispatched: u64,
     /// Cumulative fills dispatched (fill lanes + dispatcher pump).
     pub fills_dispatched: u64,
+    /// Cumulative venue events dispatched to `on_venue_event`
+    /// (WS10-A, all event lanes combined).
+    pub events_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
     //
@@ -235,10 +250,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// the consumer ends of every lane. Unspawned venues pass the
     /// consumer half of a ring whose producer was dropped — it reads
     /// empty forever at the cost of two atomic loads per iteration.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         strat: S,
         disp: D,
         tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+        event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
         sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
         fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         ai_cons: Consumer<AiCmd, AI_RING_SIZE>,
@@ -249,6 +266,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             strat,
             disp,
             tick_lanes,
+            event_lanes,
             sig_cons,
             fill_lanes,
             ai_cons,
@@ -263,6 +281,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             ticks_dispatched: 0,
             signals_dispatched: 0,
             fills_dispatched: 0,
+            events_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
             decide_lat: LatencyTracker::new(),
             ack_lat: LatencyTracker::new(),
@@ -415,6 +434,35 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 None => break,
             }
             i += 1;
+        }
+
+        // --- venue-event lanes (WS10-A) ---
+        // Drained after every market-data/fill source (funding is
+        // analytics-cadence, 1–10 Hz/venue — ticks keep priority)
+        // and before the control plane. Same fixed lane order and
+        // per-lane budget as ticks. No latency sample and no sym-
+        // bucket touch: events are not tick freshness.
+        let mut lane = 0;
+        while lane < NUM_EVENT_LANES {
+            let mut i = 0;
+            while i < max_per_ring {
+                match self.event_lanes[lane].try_pop() {
+                    Some(e) => {
+                        let now = now_ns();
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
+                            now,
+                        };
+                        self.strat.on_venue_event(&e, &mut ctx);
+                        self.events_dispatched = self.events_dispatched.wrapping_add(1);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
+            lane += 1;
         }
 
         // --- ruleset table lane (Phase 8g §6, item 7) ---
@@ -783,6 +831,11 @@ mod tests {
         signals: u32,
         fills: u32,
         ai_cmds: u32,
+        /// Venue events delivered via `on_venue_event` (WS10-A).
+        events: u32,
+        /// v0 of the most recent delivered event — pins payload
+        /// pass-through.
+        last_event_v0: i64,
         /// Ruleset tables delivered via `on_ruleset_table` (8g §6).
         tables: u32,
         /// Epoch of the most recent delivered table — pins in-ring
@@ -813,6 +866,10 @@ mod tests {
                 self.tables_at_first_ai = self.tables;
             }
             self.ai_cmds += 1;
+        }
+        fn on_venue_event<C: Ctx>(&mut self, e: &ChannelEvent, _ctx: &mut C) {
+            self.events += 1;
+            self.last_event_v0 = e.v0;
         }
         fn on_ruleset_table(&mut self, table: &core_types::RuleTable) {
             self.tables += 1;
@@ -851,6 +908,19 @@ mod tests {
         ([p0, p1, p2, p3, p4, p5], [c0, c1, c2, c3, c4, c5])
     }
 
+    fn split_event_lanes() -> (
+        [Producer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
+        [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
+    ) {
+        let (p0, c0) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let (p1, c1) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let (p2, c2) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let (p3, c3) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let (p4, c4) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        let (p5, c5) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3, p4, p5], [c0, c1, c2, c3, c4, c5])
+    }
+
     fn split_fill_lanes() -> (
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
@@ -870,12 +940,14 @@ mod tests {
     fn build_engine() -> (
         Engine<Counter, PaperDispatcher>,
         [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+        [Producer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
         Producer<Signal, SIGNAL_RING_SIZE>,
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         Producer<AiCmd, AI_RING_SIZE>,
         Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     ) {
         let (tp, tc) = split_tick_lanes();
+        let (ep, ec) = split_event_lanes();
         let sig_ring: std::sync::Arc<Ring<Signal, SIGNAL_RING_SIZE>> = Ring::new();
         let (sp, sc) = sig_ring.split();
         let (fp, fc) = split_fill_lanes();
@@ -888,18 +960,19 @@ mod tests {
             strat,
             disp,
             tc,
+            ec,
             sc,
             fc,
             ac,
             Arc::new(AiIngressStatus::new()),
             tblc,
         );
-        (eng, tp, sp, fp, ap, tblp)
+        (eng, tp, ep, sp, fp, ap, tblp)
     }
 
     #[test]
     fn engine_drains_polymarket_tick_lane() {
-        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..3u32 {
             tp[VenueId::Polymarket as usize]
@@ -913,7 +986,7 @@ mod tests {
 
     #[test]
     fn engine_drains_every_lane_per_iteration() {
-        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let venues = [
             VenueId::Polymarket,
@@ -936,7 +1009,7 @@ mod tests {
 
     #[test]
     fn engine_respects_max_per_ring_cap_per_lane() {
-        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..10u32 {
             tp[0]
@@ -953,7 +1026,7 @@ mod tests {
 
     #[test]
     fn engine_drains_fill_lanes() {
-        let (mut eng, _tp, _sp, mut fp, _ap, _tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, mut fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let f = Fill::new(10, 7, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
         fp[0].try_push(f).unwrap(); // Polymarket fill lane
@@ -961,6 +1034,66 @@ mod tests {
         eng.tick(16);
         assert_eq!(eng.fills_dispatched, 2);
         assert_eq!(eng.strategy().fills, 2);
+    }
+
+    /// WS10-A fixture: a funding event with a recognizable payload.
+    fn mk_funding_event(venue: VenueId, sym: u32, rate_1e9: i64) -> ChannelEvent {
+        ChannelEvent::new(
+            1,
+            venue,
+            core_types::ChannelId::Funding,
+            sym,
+            0,
+            1_700_000_000_000,
+            rate_1e9,
+            1_700_000_400_000,
+        )
+    }
+
+    #[test]
+    fn engine_drains_event_lanes_and_dispatches() {
+        let (mut eng, _tp, mut ep, _sp, _fp, _ap, _tblp) = build_engine();
+        eng.start().unwrap();
+        // One funding event per producing venue (lane indices per
+        // tick_lane_of: okx 2, deribit 3, bn 1, bybit 5).
+        ep[2].try_push(mk_funding_event(VenueId::Okx, 7, 125)).unwrap();
+        ep[3]
+            .try_push(mk_funding_event(VenueId::Deribit, 8, -50))
+            .unwrap();
+        ep[1]
+            .try_push(mk_funding_event(VenueId::Binance, 9, 10))
+            .unwrap();
+        ep[5]
+            .try_push(mk_funding_event(VenueId::Bybit, 10, 99))
+            .unwrap();
+        eng.tick(16);
+        assert_eq!(eng.events_dispatched, 4, "one event per producing lane");
+        assert_eq!(eng.strategy().events, 4);
+        // Lanes drain in fixed index order → the last delivered is
+        // lane 5 (bybit); payload passes through untouched.
+        assert_eq!(eng.strategy().last_event_v0, 99);
+        // Ticks/fills untouched by the event path.
+        assert_eq!(eng.ticks_dispatched, 0);
+        assert_eq!(eng.fills_dispatched, 0);
+    }
+
+    #[test]
+    fn engine_event_lanes_respect_budget_and_empty_is_noop() {
+        let (mut eng, _tp, mut ep, _sp, _fp, _ap, _tblp) = build_engine();
+        eng.start().unwrap();
+        // Empty lanes: a tick() is a per-lane no-op.
+        eng.tick(16);
+        assert_eq!(eng.events_dispatched, 0);
+        // Budget: 10 queued on one lane, budget 3 → 3 per iteration.
+        for i in 0..10 {
+            ep[2]
+                .try_push(mk_funding_event(VenueId::Okx, 7, i as i64))
+                .unwrap();
+        }
+        eng.tick(3);
+        assert_eq!(eng.events_dispatched, 3, "budget caps one iteration");
+        eng.tick(16);
+        assert_eq!(eng.events_dispatched, 10, "backlog drains across iterations");
     }
 
     /// Dispatcher that emits one queued fill — proves the D3 pump.
@@ -985,6 +1118,7 @@ mod tests {
     fn engine_pumps_dispatcher_fills_d3() {
         let (_tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_ep, ec) = split_event_lanes();
         let (_fp, fc) = split_fill_lanes();
         let disp = OneFillDispatcher {
             fill: Some(Fill::new(
@@ -1004,6 +1138,7 @@ mod tests {
             strat,
             disp,
             tc,
+            ec,
             sc,
             fc,
             ac,
@@ -1031,20 +1166,20 @@ mod tests {
 
     #[test]
     fn engine_dispatcher_starts_with_zero_accepted() {
-        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.dispatcher().stats().accepted, 0);
     }
 
     #[test]
     fn max_tick_age_zero_before_any_tick() {
-        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.populated_sym_count(), 0);
         assert_eq!(eng.max_tick_age_ns(1_000_000), 0);
     }
 
     #[test]
     fn max_tick_age_tracks_freshest_per_bucket() {
-        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 11, 1)).unwrap();
@@ -1062,7 +1197,7 @@ mod tests {
     fn same_ordinal_on_two_venues_lands_in_two_buckets() {
         // The §3.1 regression the mixed bucket exists to prevent:
         // ordinal 0 on every venue used to collapse into bucket 0.
-        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let pm = core_types::make_symbol_id(VenueId::Polymarket, 0);
         let okx = core_types::make_symbol_id(VenueId::Okx, 0);
@@ -1084,6 +1219,7 @@ mod tests {
         // Dispatcher-pump source: one queued fill (D3 shape).
         let (_tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_ep, ec) = split_event_lanes();
         let (mut fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let disp = OneFillDispatcher {
@@ -1103,6 +1239,7 @@ mod tests {
             strat,
             disp,
             tc,
+            ec,
             sc,
             fc,
             ac,
@@ -1142,7 +1279,7 @@ mod tests {
 
     #[test]
     fn fills_capture_getters_zero_without_capture() {
-        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.fill_capture_records(), 0);
         assert_eq!(eng.fill_capture_io_errors(), 0);
     }
@@ -1190,6 +1327,7 @@ mod tests {
 
         let (mut tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_ep, ec) = split_event_lanes();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
@@ -1197,6 +1335,7 @@ mod tests {
             SubmitOnTick,
             PaperDispatcher::new(),
             tc,
+            ec,
             sc,
             fc,
             ac,
@@ -1254,6 +1393,7 @@ mod tests {
 
         let (mut tp, tc) = split_tick_lanes();
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_ep, ec) = split_event_lanes();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
@@ -1261,6 +1401,7 @@ mod tests {
             SubmitOnTick,
             RefuseAllDispatcher,
             tc,
+            ec,
             sc,
             fc,
             ac,
@@ -1288,7 +1429,7 @@ mod tests {
 
     #[test]
     fn orders_capture_getters_zero_without_capture() {
-        let (eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         assert_eq!(eng.order_capture_records(), 0);
         assert_eq!(eng.order_capture_io_errors(), 0);
     }
@@ -1337,7 +1478,7 @@ mod tests {
 
     #[test]
     fn ai_lane_dispatches_to_on_ai() {
-        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         // ts = now, no TTL → never expires; heartbeat has no shape
         // surprises.
@@ -1351,7 +1492,7 @@ mod tests {
 
     #[test]
     fn ai_lane_ttl_expires_on_pop() {
-        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         let now = now_ns();
         // Accepted 10 ms ago with a 1 ms TTL → expired at pop.
@@ -1367,7 +1508,7 @@ mod tests {
 
     #[test]
     fn ai_lane_respects_drain_budget() {
-        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         let n = (AI_DRAIN_BUDGET * 2 + 3) as u32;
         for i in 0..n {
@@ -1388,7 +1529,7 @@ mod tests {
 
     #[test]
     fn ai_lane_recheck_rejects_malformed_at_drain() {
-        let (mut eng, _tp, _sp, _fp, mut ap, _tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, mut ap, _tblp) = build_engine();
         eng.start().unwrap();
         // Bypass the ingress (the ring producer is ours) and push a
         // shape violation: Heartbeat must not carry px.
@@ -1427,7 +1568,7 @@ mod tests {
     /// immediately before the AI-cmd drain.
     #[test]
     fn ruleset_table_pop_precedes_ai_drain_same_iteration() {
-        let (mut eng, _tp, _sp, _fp, mut ap, mut tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, mut ap, mut tblp) = build_engine();
         eng.start().unwrap();
         assert!(tblp.try_push(mk_table(7)).is_ok());
         ap.try_push(mk_heartbeat(now_ns(), 1)).unwrap();
@@ -1451,7 +1592,7 @@ mod tests {
     /// the last (restage supersedes — pinned here via epoch order).
     #[test]
     fn ruleset_table_lane_drains_all_slots_in_order() {
-        let (mut eng, _tp, _sp, _fp, _ap, mut tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, _ap, mut tblp) = build_engine();
         eng.start().unwrap();
         assert!(tblp.try_push(mk_table(1)).is_ok());
         assert!(tblp.try_push(mk_table(2)).is_ok());
@@ -1481,7 +1622,7 @@ mod tests {
     /// no-op (the §3.3 unspawned pattern — the hook never fires).
     #[test]
     fn ruleset_table_lane_empty_is_noop() {
-        let (mut eng, _tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         eng.tick(16);
         eng.tick(16);
@@ -1491,7 +1632,7 @@ mod tests {
 
     #[test]
     fn max_tick_age_handles_now_before_recorded() {
-        let (mut eng, mut tp, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
         eng.tick(16);

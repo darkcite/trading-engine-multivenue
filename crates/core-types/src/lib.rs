@@ -905,6 +905,27 @@ impl AiCmdKind {
 /// like every `core-ring` capacity.
 pub const AI_RING_SIZE: usize = 1024;
 
+/// Capacity of every venue-event SPSC ring (WS10-A, D-A2). One ring
+/// per tick lane; [`ChannelEvent`] slots. Funding runs 1–10 Hz per
+/// venue, so 1024 slots is hours of headroom; 1024 × 64 B × 6 lanes
+/// = 384 KiB boot-time. Power of two, like every `core-ring`
+/// capacity.
+pub const EVENT_RING_SIZE: usize = 1024;
+
+/// Bit for `channel` in a venue-event lane mask (WS10-A gating knob:
+/// an ingress pushes a [`ChannelEvent`] onto its lane only when the
+/// channel's bit is set in the spawn-time `event_mask`). `ChannelId`
+/// discriminants are ≤ 12, so `u16` covers the whole enum.
+#[inline]
+pub const fn event_lane_bit(ch: ChannelId) -> u16 {
+    1u16 << (ch as u16)
+}
+
+/// The v1 venue-event lane mask: ONLY funding flows (WS10-A ships
+/// deliberately narrow — Mark/OI/DVOL flip on later by widening the
+/// spawn-time mask, no new plumbing).
+pub const EVENT_LANE_FUNDING: u16 = event_lane_bit(ChannelId::Funding);
+
 /// `AiCmd::flags` bit 0: the ai-exec fair-table entry this command
 /// creates additionally expires when worker heartbeats go stale,
 /// not only when its own TTL lapses. Valid on `SetFairValue` /

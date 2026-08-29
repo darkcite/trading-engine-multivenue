@@ -205,6 +205,10 @@ pub struct IngressStatus {
     /// missing-from-echo). Paired 1:1 with a `ChannelId::SubDrop`
     /// capture event by the emitting ingress.
     sub_drops_total: AtomicU64,
+    /// WS10-A: venue-event lane pushes refused by a full ring.
+    /// Funding loss ≠ tick loss (separate budget, separate alarm) —
+    /// deliberately NOT folded into `ring_drops_total`.
+    event_ring_drops_total: AtomicU64,
     /// T1(a) diag: `ERR_SITE_*` of the first fatal error this
     /// session (0 = none). First-error-wins; cleared by the venue
     /// loop via [`Self::take_last_err`] (same thread as the writer).
@@ -230,6 +234,7 @@ impl IngressStatus {
             ring_drops_total: AtomicU64::new(0),
             ticks_total: AtomicU64::new(0),
             sub_drops_total: AtomicU64::new(0),
+            event_ring_drops_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
             last_err_venue_code: AtomicU32::new(0),
@@ -304,6 +309,13 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_sub_drops(&self) {
         self.sub_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one venue-event lane push refused by a full ring
+    /// (WS10-A — see `event_ring_drops_total` field docs).
+    #[inline(always)]
+    pub fn inc_event_ring_drops(&self) {
+        self.event_ring_drops_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// T1(a): record the venue's numeric error code for the current
@@ -396,6 +408,12 @@ impl IngressStatus {
         self.sub_drops_total.load(Ordering::Relaxed)
     }
 
+    /// Total venue-event lane pushes refused by a full ring (WS10-A).
+    #[inline]
+    pub fn event_ring_drops_total(&self) -> u64 {
+        self.event_ring_drops_total.load(Ordering::Relaxed)
+    }
+
     /// T1(a): read AND clear the session-error triple. Called by the
     /// cli venue loop right after `run()` returns — the SAME thread
     /// that wrote it (the venue loop and the run loop share one
@@ -478,9 +496,9 @@ mod tests {
     #[test]
     fn slot_is_cache_aligned() {
         assert_eq!(::core::mem::align_of::<IngressStatus>(), 64);
-        // 1 + 8 + 9×8 + (1+1+4) = 87 B of fields → still two cache
-        // lines (the T1/WS2 additions must never grow the slot past
-        // 128).
+        // 1 + 8 + 10×8 + (1+1+4) = 95 B of fields → still two cache
+        // lines (the T1/WS2/WS10 additions must never grow the slot
+        // past 128).
         assert_eq!(::core::mem::size_of::<IngressStatus>(), 128);
     }
 
@@ -520,6 +538,18 @@ mod tests {
             io_kind_code(std::io::ErrorKind::ConnectionReset),
         );
         assert_eq!(s.take_last_err().site, ERR_SITE_PUMP);
+    }
+
+    #[test]
+    fn event_ring_drops_counter_accumulates_independently() {
+        // WS10-A: a refused lane push advances event_ring_drops ONLY —
+        // never ring_drops (tick loss) or sub_drops.
+        let s = IngressStatus::new();
+        s.inc_event_ring_drops();
+        s.inc_event_ring_drops();
+        assert_eq!(s.event_ring_drops_total(), 2);
+        assert_eq!(s.ring_drops_total(), 0);
+        assert_eq!(s.sub_drops_total(), 0);
     }
 
     #[test]

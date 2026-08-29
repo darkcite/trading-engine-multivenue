@@ -30,7 +30,7 @@
 )]
 
 use core_time::NsTs;
-use core_types::{AiCmd, Fill, Order, RuleTable, Signal, Tick};
+use core_types::{AiCmd, ChannelEvent, Fill, Order, RuleTable, Signal, Tick};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -317,6 +317,23 @@ pub trait Strategy: StrategyCounters {
         let _ = table;
     }
 
+    /// Called once per [`ChannelEvent`] popped from a venue-event
+    /// lane (WS10-A). v1 carries ONLY funding updates (the spawn-time
+    /// `event_mask` gates what an ingress pushes); the cross-venue
+    /// field semantics are pinned in docs/wire-format.md — funding:
+    /// `channel = Funding`, `v0` = rate ×1e9, `v1` = next-funding-time
+    /// ms (0 where the venue has none).
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged; `strategy-set` forwards it to enabled
+    /// members like `on_tick`. Monomorphized — no `dyn`. Lands dark
+    /// in Stage 2: no in-tree strategy consumes it yet (the first
+    /// consumer is M5/Stage-3 research work).
+    #[inline]
+    fn on_venue_event<C: Ctx>(&mut self, event: &ChannelEvent, ctx: &mut C) {
+        let _ = (event, ctx);
+    }
+
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C);
@@ -418,6 +435,35 @@ mod tests {
         assert!(s.started);
         assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
         assert_eq!(ctx.submitted, 0, "default hook cannot submit (no Ctx)");
+    }
+
+    #[test]
+    fn on_venue_event_defaults_to_noop() {
+        // WS10-A default: a strategy that does not override the hook
+        // compiles and neither its state nor the Ctx is touched by a
+        // delivered event.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let ev = ChannelEvent::new(
+            1,
+            core_types::VenueId::Okx,
+            core_types::ChannelId::Funding,
+            7,
+            0,
+            0,
+            125_000_000,
+            1_700_000_000_000,
+        );
+        s.on_venue_event(&ev, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
     }
 
     #[test]
