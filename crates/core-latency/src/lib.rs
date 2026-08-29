@@ -210,11 +210,7 @@ pub fn bucket_index<const ROWS: usize>(ns: u64) -> usize {
     }
     // ilog2: position of the highest set bit. 64-bit.
     let row_full = 63 - ns.leading_zeros() as usize;
-    let row = if row_full >= ROWS {
-        ROWS - 1
-    } else {
-        row_full
-    };
+    let row = if row_full >= ROWS { ROWS - 1 } else { row_full };
     let shift = row.saturating_sub(6);
     let col = (((ns - (1u64 << row)) >> shift) as usize) & (COLS_PER_ROW - 1);
     row * COLS_PER_ROW + col
@@ -263,10 +259,7 @@ mod tests {
         // 2 ns → row 1 (ilog2 = 1) → idx in [COLS, 2*COLS).
         // 63 ns → row 5 (ilog2 = 5) → idx in [5*COLS, 6*COLS).
         let i2 = bucket_index::<24>(2);
-        assert!(
-            (COLS_PER_ROW..2 * COLS_PER_ROW).contains(&i2),
-            "i2={i2}"
-        );
+        assert!((COLS_PER_ROW..2 * COLS_PER_ROW).contains(&i2), "i2={i2}");
         let i63 = bucket_index::<24>(63);
         assert!(
             (5 * COLS_PER_ROW..6 * COLS_PER_ROW).contains(&i63),

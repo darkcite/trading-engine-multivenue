@@ -45,11 +45,10 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .expect("private key DER");
+    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
 }
 
@@ -182,8 +181,7 @@ fn polymarket_tls_loopback_yields_expected_tick() {
         TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
 
     let mut driver = Driver::new(0xDEADBEEF, b"1234567890");
-    let symbol_map =
-        SymbolMap::from_pairs(std::iter::once((ASSET_ID.to_vec(), ASSET_SYM)));
+    let symbol_map = SymbolMap::from_pairs(std::iter::once((ASSET_ID.to_vec(), ASSET_SYM)));
     let ring: Arc<Ring<Tick, DEFAULT_TICK_RING_CAP>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
     let status = IngressStatus::new();
@@ -194,7 +192,9 @@ fn polymarket_tls_loopback_yields_expected_tick() {
     let mut events = mio::Events::with_capacity(16);
     let token = mio::Token(0);
     use core_net::Transport as _;
-    transport.register(poll.registry(), token).expect("register");
+    transport
+        .register(poll.registry(), token)
+        .expect("register");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got: Option<Tick> = None;

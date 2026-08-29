@@ -238,8 +238,8 @@ mod tests {
         let mut buf = [0u8; 4096];
         let sig = [0x12u8; 65];
         let owner = [0xAAu8; 20];
-        let n = encode_signed_order(&mut buf, &canned_order(), &sig, &owner, ORDER_TYPE_GTC)
-            .unwrap();
+        let n =
+            encode_signed_order(&mut buf, &canned_order(), &sig, &owner, ORDER_TYPE_GTC).unwrap();
         assert!(n > 0);
         assert!(n <= buf.len());
     }
@@ -249,8 +249,8 @@ mod tests {
         let mut buf = [0u8; 4096];
         let sig = [0x12u8; 65];
         let owner = [0xAAu8; 20];
-        let n = encode_signed_order(&mut buf, &canned_order(), &sig, &owner, ORDER_TYPE_GTC)
-            .unwrap();
+        let n =
+            encode_signed_order(&mut buf, &canned_order(), &sig, &owner, ORDER_TYPE_GTC).unwrap();
         let s = std::str::from_utf8(&buf[..n]).unwrap();
         // Top-level keys are present.
         assert!(s.starts_with("{\"order\":{"));
@@ -291,8 +291,7 @@ mod tests {
         let mut o = canned_order();
         o.maker_amount = u128::MAX;
         o.taker_amount = 1;
-        let n =
-            encode_signed_order(&mut buf, &o, &sig, &owner, ORDER_TYPE_GTC).expect("encode");
+        let n = encode_signed_order(&mut buf, &o, &sig, &owner, ORDER_TYPE_GTC).expect("encode");
         let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(s.contains(&format!("\"makerAmount\":\"{}\"", u128::MAX)));
         assert!(s.contains("\"takerAmount\":\"1\""));
@@ -305,8 +304,7 @@ mod tests {
         let owner = [0xAAu8; 20];
         let mut o = canned_order();
         o.maker_amount = 0;
-        let n =
-            encode_signed_order(&mut buf, &o, &sig, &owner, ORDER_TYPE_GTC).expect("encode");
+        let n = encode_signed_order(&mut buf, &o, &sig, &owner, ORDER_TYPE_GTC).expect("encode");
         let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(s.contains("\"makerAmount\":\"0\""));
     }

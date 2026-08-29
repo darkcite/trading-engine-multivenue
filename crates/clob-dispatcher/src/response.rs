@@ -149,7 +149,10 @@ mod tests {
     #[test]
     fn unrecognized_body_errors() {
         let body = br#"{"foo":"bar"}"#;
-        assert_eq!(parse_clob_response(body), Err(ResponseScanErr::Unrecognized));
+        assert_eq!(
+            parse_clob_response(body),
+            Err(ResponseScanErr::Unrecognized)
+        );
     }
 
     #[test]

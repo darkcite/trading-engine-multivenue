@@ -354,8 +354,7 @@ pub fn base64_encode(input: &[u8], dst: &mut [u8]) -> usize {
     let mut i = 0usize;
     let mut o = 0usize;
     while i + 3 <= input.len() {
-        let n =
-            ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
         dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
         dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
         dst[o + 2] = B64_ALPHA[((n >> 6) & 0x3F) as usize];

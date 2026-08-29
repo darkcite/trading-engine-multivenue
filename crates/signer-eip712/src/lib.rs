@@ -42,8 +42,8 @@
 
 use std::sync::OnceLock;
 
-use secp256k1::{All, Message, Secp256k1, SignOnly};
 pub use secp256k1::SecretKey;
+use secp256k1::{All, Message, Secp256k1, SignOnly};
 use tiny_keccak::{Hasher, Keccak};
 
 /// Process-wide cached signing context. Building a fresh
@@ -498,18 +498,7 @@ mod tests {
     #[test]
     fn order_struct_hash_changes_with_any_field() {
         let base = OrderToSign::new(
-            1,
-            [1u8; 20],
-            [1u8; 20],
-            [0u8; 20],
-            [2u8; 32],
-            1_000,
-            2_000,
-            0,
-            0,
-            0,
-            0,
-            0,
+            1, [1u8; 20], [1u8; 20], [0u8; 20], [2u8; 32], 1_000, 2_000, 0, 0, 0, 0, 0,
         );
         let h0 = order_struct_hash(&base);
 
@@ -532,18 +521,7 @@ mod tests {
         // but the prefix logic is also exercised — replace the
         // domain bytes manually and check that the result differs.
         let base = OrderToSign::new(
-            1,
-            [1u8; 20],
-            [1u8; 20],
-            [0u8; 20],
-            [2u8; 32],
-            1_000,
-            2_000,
-            0,
-            0,
-            0,
-            0,
-            0,
+            1, [1u8; 20], [1u8; 20], [0u8; 20], [2u8; 32], 1_000, 2_000, 0, 0, 0, 0, 0,
         );
         let h = order_eip712_hash(&base);
         // Sanity: the hash isn't the all-zero or all-FF bytestring.

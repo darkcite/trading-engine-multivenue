@@ -338,8 +338,11 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &Da
             s.orders_emitted, s.orders_dropped
         )),
     ];
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" multivenue-engine "));
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" multivenue-engine "),
+    );
     f.render_widget(p, area);
 }
 
@@ -377,9 +380,11 @@ fn render_markets(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &D
         Constraint::Length(10),
         Constraint::Length(10),
     ];
-    let t = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" markets (top-of-book) "));
+    let t = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" markets (top-of-book) "),
+    );
     f.render_widget(t, area);
 }
 
@@ -400,8 +405,8 @@ fn render_last_order(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s:
             ratatui::text::Line::from(format!("qty: {}", format_px(s.last_order_qty_1e6))),
         ]
     };
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" last order "));
+    let p =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" last order "));
     f.render_widget(p, area);
 }
 
@@ -409,7 +414,11 @@ fn render_latency(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &D
     use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
     let labels = ["ingest→strategy", "strategy→submit", "submit→ack"];
-    let header = Row::new(vec![Cell::from("stage"), Cell::from("p50"), Cell::from("p99")]);
+    let header = Row::new(vec![
+        Cell::from("stage"),
+        Cell::from("p50"),
+        Cell::from("p99"),
+    ]);
     let rows: Vec<Row> = (0..3)
         .map(|i| {
             Row::new(vec![
@@ -460,8 +469,11 @@ fn render_ingest_health(
             ))
         })
         .collect();
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" ingest health "));
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" ingest health "),
+    );
     f.render_widget(p, area);
 }
 

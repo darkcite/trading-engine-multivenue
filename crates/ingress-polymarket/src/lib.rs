@@ -216,8 +216,16 @@ pub fn parse_price_change_row(
     } else {
         return None;
     };
-    let bid_qty = if is_buy && level_px == bid_px { level_sz } else { 0 };
-    let ask_qty = if !is_buy && level_px == ask_px { level_sz } else { 0 };
+    let bid_qty = if is_buy && level_px == bid_px {
+        level_sz
+    } else {
+        0
+    };
+    let ask_qty = if !is_buy && level_px == ask_px {
+        level_sz
+    } else {
+        0
+    };
     Some(Tick::new(
         ts_ns,
         core_types::VenueId::Polymarket,
@@ -266,6 +274,9 @@ pub fn write_market_subscribe(dst: &mut [u8], asset_id: &[u8]) -> Option<usize> 
 /// Returns the byte length; `None` if the list is empty or larger
 /// than [`PM_SUBSCRIBE_IDS_MAX`], any id is empty/oversized, or
 /// `dst` is too small. Zero-alloc: pure byte copies into `dst`.
+// Doctrine: raw indices, not iterator adapters (CLAUDE.md hot-path rules;
+// `i` both indexes `ids` and drives the comma rule).
+#[allow(clippy::needless_range_loop)]
 pub fn write_market_subscribe_multi(dst: &mut [u8], ids: &[&[u8]]) -> Option<usize> {
     if ids.is_empty() || ids.len() > PM_SUBSCRIBE_IDS_MAX {
         return None;
@@ -352,8 +363,7 @@ mod tests {
     #[test]
     fn write_market_subscribe_multi_exact_bytes() {
         let mut dst = [0u8; 256];
-        let n =
-            write_market_subscribe_multi(&mut dst, &[b"1234567890", b"9876543210"]).unwrap();
+        let n = write_market_subscribe_multi(&mut dst, &[b"1234567890", b"9876543210"]).unwrap();
         assert_eq!(
             &dst[..n],
             br#"{"assets_ids":["1234567890","9876543210"],"type":"market"}"# as &[u8]
@@ -452,7 +462,8 @@ mod tests {
 
     #[test]
     fn parse_price_change_row_rejects_missing_fields() {
-        let no_side = br#"{"asset_id":"1","price":"0.5","size":"1","best_bid":"0.5","best_ask":"0.6"}"#;
+        let no_side =
+            br#"{"asset_id":"1","price":"0.5","size":"1","best_bid":"0.5","best_ask":"0.6"}"#;
         assert!(parse_price_change_row(no_side, 1, 0, 0).is_none());
         let no_touch = br#"{"asset_id":"1","price":"0.5","size":"1","side":"BUY"}"#;
         assert!(parse_price_change_row(no_touch, 1, 0, 0).is_none());

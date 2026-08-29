@@ -275,9 +275,7 @@ impl<const N: usize> LatencyArb<N> {
     /// Register a Polymarket ⇄ Binance pair. Boot-only. Also tracks
     /// the Polymarket symbol in the internal book.
     pub fn add_pair(&mut self, pm: SymbolId, bn: SymbolId) -> Result<(), AddPairError> {
-        self.pairs
-            .add(pm, bn)
-            .map_err(AddPairError::PairTable)?;
+        self.pairs.add(pm, bn).map_err(AddPairError::PairTable)?;
         self.book.track(pm).map_err(AddPairError::Book)?;
         Ok(())
     }

@@ -359,9 +359,7 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(PmMarketRow, usize), PmDiscover
 /// `clobTokenIds`: every maximal ASCII-digit run of ≥
 /// [`PM_TOKEN_RUN_MIN`] digits is one id, in wire order. Zero runs, a
 /// run over [`PM_TOKEN_MAX`], or more than 2 runs ⇒ `BadRow`.
-fn extract_tokens(
-    span: &[u8],
-) -> Result<([([u8; PM_TOKEN_MAX], u8); 2], u8), PmDiscoveryErr> {
+fn extract_tokens(span: &[u8]) -> Result<([([u8; PM_TOKEN_MAX], u8); 2], u8), PmDiscoveryErr> {
     let mut tokens = [([0u8; PM_TOKEN_MAX], 0u8); 2];
     let mut n: u8 = 0;
     let mut i = 0usize;
@@ -559,7 +557,10 @@ mod tests {
             PmDiscoveryErr::Envelope
         );
         assert_eq!(d.ingest_body(b"").unwrap_err(), PmDiscoveryErr::Envelope);
-        assert_eq!(d.ingest_body(b"null").unwrap_err(), PmDiscoveryErr::Envelope);
+        assert_eq!(
+            d.ingest_body(b"null").unwrap_err(),
+            PmDiscoveryErr::Envelope
+        );
     }
 
     #[test]
@@ -666,12 +667,9 @@ mod proptests {
         #[test]
         fn ingest_never_panics(input in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let mut d = PmDiscovery::new();
-            match d.ingest_body(&input) {
-                Ok(n) => {
-                    prop_assert_eq!(n, d.universe_total());
-                    prop_assert!(n as usize <= PM_DISCOVERY_ROWS_CAP);
-                }
-                Err(_) => {}
+            if let Ok(n) = d.ingest_body(&input) {
+                prop_assert_eq!(n, d.universe_total());
+                prop_assert!(n as usize <= PM_DISCOVERY_ROWS_CAP);
             }
         }
     }

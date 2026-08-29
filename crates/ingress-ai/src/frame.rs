@@ -110,8 +110,7 @@ pub fn pack_frame(key: &[u8; 32], cmd: &AiCmd, out: &mut [u8; FRAME_LEN]) {
     // SAFETY: AiCmd is `AsBytes` (repr(C), Copy, no padding holes —
     // asserted in core-types): every one of its 64 bytes is
     // initialized, so viewing it as raw bytes is defined behavior.
-    let cmd_bytes: &[u8; CMD_LEN] =
-        unsafe { &*(cmd as *const AiCmd).cast::<[u8; CMD_LEN]>() };
+    let cmd_bytes: &[u8; CMD_LEN] = unsafe { &*(cmd as *const AiCmd).cast::<[u8; CMD_LEN]>() };
     const _: () = assert!(::core::mem::size_of::<AiCmd>() == CMD_LEN);
     out[CMD_OFFSET..TAG_OFFSET].copy_from_slice(cmd_bytes);
     let tag = core_crypto::hmac_sha256_tag16(key, cmd_bytes);

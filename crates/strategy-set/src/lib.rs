@@ -78,8 +78,7 @@
 
 use core_time::NsTs;
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, RuleTable, Signal, Tick, STRATEGY_SLOT_AI_EXEC,
-    STRATEGY_SLOT_VM,
+    AiCmd, AiCmdKind, Fill, Order, RuleTable, Signal, Tick, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
@@ -450,7 +449,8 @@ impl Strategy for StrategySet {
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+            self.ev
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -465,7 +465,8 @@ impl Strategy for StrategySet {
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+            self.vm
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
@@ -504,7 +505,8 @@ impl Strategy for StrategySet {
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+            self.ev
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -519,7 +521,8 @@ impl Strategy for StrategySet {
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+            self.vm
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
@@ -590,7 +593,8 @@ impl Strategy for StrategySet {
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
         if self.enabled & BIT_EV != 0 {
-            self.ev.on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+            self.ev
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_EV));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -605,7 +609,8 @@ impl Strategy for StrategySet {
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
         if self.enabled & BIT_VM != 0 {
-            self.vm.on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+            self.vm
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
     }
 
@@ -752,8 +757,10 @@ mod tests {
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
-        assert!(BUILT_MASK & BIT_AI_EXEC != 0, "`all` includes ai-exec");
-        assert!(BUILT_MASK & BIT_VM != 0, "`all` composes vm (8g item 6)");
+        // Const pins — checked at compile time (clippy: a runtime
+        // `assert!` on consts folds away; this makes the pin official).
+        const _: () = assert!(BUILT_MASK & BIT_AI_EXEC != 0, "`all` includes ai-exec");
+        const _: () = assert!(BUILT_MASK & BIT_VM != 0, "`all` composes vm (8g item 6)");
         assert_eq!(BIT_VM, 1 << STRATEGY_SLOT_VM, "wire slot pinned");
         assert_eq!(mask_for_name("nope"), None);
         assert_eq!(mask_for_name(""), None);
@@ -873,7 +880,10 @@ mod tests {
         let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB), &mut c);
+        s.on_ai(
+            &ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB),
+            &mut c,
+        );
         assert_eq!(s.enabled_mask(), 0);
         feed_trigger(&mut s, &mut c);
         assert_eq!(c.submitted, 0);
@@ -881,7 +891,10 @@ mod tests {
         // Disable also works while halted.
         let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
         s.on_ai(&ai_cmd(AiCmdKind::HaltRequest, STRATEGY_SLOT_NONE), &mut c);
-        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB), &mut c);
+        s.on_ai(
+            &ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB),
+            &mut c,
+        );
         assert_eq!(s.enabled_mask(), 0);
         assert!(s.is_halted());
     }
@@ -949,7 +962,10 @@ mod tests {
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, STRATEGY_SLOT_VM), &mut c);
         assert_eq!(s.enabled_mask(), BIT_VM, "slot 5 is built in 8g item 6");
         assert_eq!(s.enable_refused_total(), 0);
-        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, STRATEGY_SLOT_VM), &mut c);
+        s.on_ai(
+            &ai_cmd(AiCmdKind::DisableStrategy, STRATEGY_SLOT_VM),
+            &mut c,
+        );
         assert_eq!(s.enabled_mask(), 0);
         assert!(!s.is_halted());
     }
@@ -1247,7 +1263,10 @@ mod tests {
             StrategyCounters::enabled_mask(&s),
             u64::from(BIT_VM | BIT_LATENCY_ARB)
         );
-        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB), &mut c);
+        s.on_ai(
+            &ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB),
+            &mut c,
+        );
         assert_eq!(StrategyCounters::enabled_mask(&s), u64::from(BIT_VM));
 
         // Mismatched Commit → vm_commit_dropped through the trait.
@@ -1264,7 +1283,11 @@ mod tests {
         assert_eq!(StrategyCounters::vm_fires(&s), 1);
         assert_eq!(StrategyCounters::vm_orders_emitted(&s), 1);
         assert_eq!(StrategyCounters::vm_orders_dropped(&s), 0);
-        assert_eq!(s.vm().fires, StrategyCounters::vm_fires(&s), "trait == member");
+        assert_eq!(
+            s.vm().fires,
+            StrategyCounters::vm_fires(&s),
+            "trait == member"
+        );
     }
 
     // ------------- engine table-pop seam (8g item 7) -------------
@@ -1281,10 +1304,18 @@ mod tests {
         s.on_start(&mut c).unwrap();
 
         Strategy::on_ruleset_table(&mut s, &vm_table(VM_HASH_A));
-        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A), "hook stages via the seam");
+        assert_eq!(
+            s.vm().staged_hash128(),
+            Some(VM_HASH_A),
+            "hook stages via the seam"
+        );
 
         Strategy::on_ruleset_table(&mut s, &vm_table(VM_HASH_B));
-        assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_B), "later delivery supersedes");
+        assert_eq!(
+            s.vm().staged_hash128(),
+            Some(VM_HASH_B),
+            "later delivery supersedes"
+        );
 
         s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
         assert_eq!(s.vm().commits_dropped, 1, "superseded hash must not commit");
@@ -1317,7 +1348,11 @@ mod tests {
         // Enable slot 5, re-commit: the staged table was not lost.
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, STRATEGY_SLOT_VM), &mut c);
         s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
-        assert_eq!(s.vm().commits_applied, 1, "staged survived the disabled window");
+        assert_eq!(
+            s.vm().commits_applied,
+            1,
+            "staged survived the disabled window"
+        );
         assert_eq!(s.vm().rows_active(), 1);
     }
 }

@@ -345,9 +345,7 @@ fn find_int_field(buf: &[u8], key: &[u8]) -> Option<i64> {
     }
     let mut v: i64 = 0;
     for &b in &buf[start..i] {
-        v = v
-            .checked_mul(10)?
-            .checked_add((b - b'0') as i64)?;
+        v = v.checked_mul(10)?.checked_add((b - b'0') as i64)?;
     }
     if neg {
         v = -v;
@@ -365,7 +363,8 @@ mod tests {
     #[test]
     fn insert_then_lookup_round_trips() {
         let mut t: T = ArtifactTable::empty();
-        t.insert(b"0xabc", 700_000, Family::Crypto, Impact::High).unwrap();
+        t.insert(b"0xabc", 700_000, Family::Crypto, Impact::High)
+            .unwrap();
         let got = t.lookup(b"0xabc").unwrap();
         assert_eq!(got.model_p_1e6, 700_000);
         assert_eq!(got.family, Family::Crypto);

@@ -140,7 +140,12 @@ mod tests {
         for &exp in expiries {
             for &strike in strikes {
                 for call in [true, false] {
-                    v.push(Row { exp, strike, call, live: true });
+                    v.push(Row {
+                        exp,
+                        strike,
+                        call,
+                        live: true,
+                    });
                 }
             }
         }
@@ -180,9 +185,16 @@ mod tests {
     fn expired_and_ineligible_rows_never_selected() {
         let mut rows = grid(&[500, 2_000], &[10, 20]);
         // Kill liveness on one in-date row too.
-        rows.push(Row { exp: 2_000, strike: 30, call: true, live: false });
+        rows.push(Row {
+            exp: 2_000,
+            strike: 30,
+            call: true,
+            live: false,
+        });
         let sel = select_capped_chain(&rows, elig, 15, 4, 32);
-        assert!(sel.iter().all(|r| r.exp == 2_000 && r.live && r.strike != 30));
+        assert!(sel
+            .iter()
+            .all(|r| r.exp == 2_000 && r.live && r.strike != 30));
     }
 
     #[test]

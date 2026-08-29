@@ -181,7 +181,10 @@ where
 /// Boot-time only — allocates (paths).
 pub fn bind_uds(path: &Path) -> io::Result<mio::net::UnixListener> {
     let parent = path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "AI_INGRESS_SOCK has no parent dir")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AI_INGRESS_SOCK has no parent dir",
+        )
     })?;
     std::fs::create_dir_all(parent)?;
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
@@ -470,8 +473,7 @@ where
                 },
                 TOKEN_CONN => {
                     if let Some(c) = conn.as_mut() {
-                        if drive_conn(c, key, producer, capture, status, seam)
-                            == ConnVerdict::Close
+                        if drive_conn(c, key, producer, capture, status, seam) == ConnVerdict::Close
                         {
                             let mut dead = conn.take();
                             if let Some(d) = dead.as_mut() {
@@ -509,7 +511,8 @@ mod tests {
     const KEY: [u8; 32] = [7u8; 32];
 
     fn temp_capture(tag: &str) -> (std::path::PathBuf, AiCmdCapture) {
-        let d = std::env::temp_dir().join(format!("stage2_ai_listener_{tag}_{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("stage2_ai_listener_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let c = AiCmdCapture::open(&d, 1).unwrap();
         (d, c)
@@ -566,7 +569,9 @@ mod tests {
         let mut seam = |_c: &AiCmd| seam_hits += 1;
 
         let f = packed(AiCmdKind::Heartbeat, 1);
-        let v = admit_frame(&f, &KEY, &mut seq, &mut prod, &mut cap, &status, &mut seam, 555);
+        let v = admit_frame(
+            &f, &KEY, &mut seq, &mut prod, &mut cap, &status, &mut seam, 555,
+        );
         assert_eq!(v, FrameVerdict::Accepted);
         assert_eq!(status.cmds(), 1);
         assert_eq!(status.last_heartbeat_ns(), 555);
@@ -701,7 +706,9 @@ mod tests {
         let mut s = 1u32;
         loop {
             let f = packed(AiCmdKind::Heartbeat, s);
-            let v = admit_frame(&f, &KEY, &mut seq, &mut prod, &mut cap, &status, &mut seam, 9);
+            let v = admit_frame(
+                &f, &KEY, &mut seq, &mut prod, &mut cap, &status, &mut seam, 9,
+            );
             assert_eq!(v, FrameVerdict::Accepted);
             if status.ring_drops() > 0 {
                 break;
@@ -709,7 +716,7 @@ mod tests {
             s += 1;
             assert!(s < 16, "ring never filled — capacity semantics changed?");
         }
-        assert_eq!(status.cmds() as u64, cap.records(), "every accepted cmd captured");
+        assert_eq!(status.cmds(), cap.records(), "every accepted cmd captured");
         drop(cap);
         let _ = std::fs::remove_dir_all(&dir);
     }

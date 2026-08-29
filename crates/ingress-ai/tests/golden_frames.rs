@@ -65,18 +65,18 @@ fn load_golden() -> ([u8; 32], Vec<Vector>) {
         let venue = VenueId::from_u8(parts[8].parse::<u8>().unwrap())
             .unwrap_or_else(|| panic!("unknown venue in vector {}", parts[0]));
         let cmd = AiCmd::new(
-            parts[1].parse().unwrap(),        // ts_ns
-            parts[2].parse().unwrap(),        // seq
-            parts[3].parse().unwrap(),        // sym
-            parts[4].parse().unwrap(),        // px (signed)
-            parts[5].parse().unwrap(),        // qty (signed)
-            parts[6].parse().unwrap(),        // ttl_ns
+            parts[1].parse().unwrap(), // ts_ns
+            parts[2].parse().unwrap(), // seq
+            parts[3].parse().unwrap(), // sym
+            parts[4].parse().unwrap(), // px (signed)
+            parts[5].parse().unwrap(), // qty (signed)
+            parts[6].parse().unwrap(), // ttl_ns
             kind,
             venue,
-            parts[9].parse().unwrap(),        // strategy_id
-            parts[10].parse().unwrap(),       // side
-            parts[11].parse().unwrap(),       // param_id
-            parts[12].parse().unwrap(),       // flags
+            parts[9].parse().unwrap(),  // strategy_id
+            parts[10].parse().unwrap(), // side
+            parts[11].parse().unwrap(), // param_id
+            parts[12].parse().unwrap(), // flags
         );
         vectors.push(Vector {
             name: parts[0].to_string(),

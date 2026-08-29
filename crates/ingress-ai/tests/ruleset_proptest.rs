@@ -108,7 +108,10 @@ fn serialize(rows: &[GenRow]) -> Vec<u8> {
         let trigger = if r.cross {
             format!(r#"{{"type":"cross_deviation","ref":{REF_SYM}}}"#)
         } else {
-            format!(r#"{{"type":"level_breach","level":{}}}"#, money(r.level_1e6))
+            format!(
+                r#"{{"type":"level_breach","level":{}}}"#,
+                money(r.level_1e6)
+            )
         };
         json.push_str(&format!(
             r#"{{"name":"r{i:03}","family":"{}","trigger":{trigger},"sym":{},"side":"{}","edge_bps":{},"horizon_ms":{},"max_risk_usd":{}}}"#,

@@ -131,11 +131,7 @@ impl PmlrWriter {
     /// Create or truncate `path` and write the 64-byte PMLR header.
     /// `epoch_ns` is the wall-clock ns at file creation — used by
     /// readers to convert monotonic ts_ns on records to human time.
-    pub fn open<P: AsRef<Path>>(
-        path: P,
-        slot_kind: SlotKind,
-        epoch_ns: u64,
-    ) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, slot_kind: SlotKind, epoch_ns: u64) -> io::Result<Self> {
         // We cannot use the existing `PreallocatedWriter` directly
         // because it opens in `append` mode — a PMLR file always
         // starts with a fresh header. Open with write+create+truncate
@@ -236,7 +232,9 @@ impl PmlrWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{Fill, LatencyClass, Order, Price, Qty, Side, Signal, SignalSource, Tick, VenueId};
+    use core_types::{
+        Fill, LatencyClass, Order, Price, Qty, Side, Signal, SignalSource, Tick, VenueId,
+    };
     use std::fs::File;
     use std::io::Read;
 
@@ -249,7 +247,8 @@ mod tests {
             // A low-entropy cookie to avoid cross-test collision when
             // run in parallel with --test-threads=N (currently 1 only,
             // but future-proof).
-            core::sync::atomic::AtomicU64::new(0).fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            core::sync::atomic::AtomicU64::new(0)
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         ))
     }
 
@@ -316,9 +315,8 @@ mod tests {
         // SAFETY: Tick is `AsBytes` (`#[repr(C)] + Copy`); producing a
         // byte view of a live reference for a read-only assertion is
         // sound and the slice does not outlive `t`.
-        let record_bytes = unsafe {
-            core::slice::from_raw_parts((&t as *const Tick).cast::<u8>(), SLOT_SIZE)
-        };
+        let record_bytes =
+            unsafe { core::slice::from_raw_parts((&t as *const Tick).cast::<u8>(), SLOT_SIZE) };
         assert_eq!(&bytes[HEADER_SIZE..HEADER_SIZE + SLOT_SIZE], record_bytes);
 
         let _ = std::fs::remove_file(&p);

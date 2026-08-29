@@ -32,11 +32,10 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .expect("private key DER");
+    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
 }
 
@@ -165,7 +164,9 @@ fn rpc_tls_loopback_yields_expected_signal() {
     let mut events = mio::Events::with_capacity(16);
     let token = mio::Token(0);
     use core_net::Transport as _;
-    transport.register(poll.registry(), token).expect("register");
+    transport
+        .register(poll.registry(), token)
+        .expect("register");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got: Option<Signal> = None;

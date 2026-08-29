@@ -240,7 +240,12 @@ impl PmlrCapture {
     /// Boot-time only (seeks under the staging writer are not
     /// possible, so this must be called before any tap record is
     /// staged — enforced by debug_assert).
-    pub fn set_tap_venue_byte(&mut self, dir: &Path, venue_label: &str, venue: u8) -> io::Result<()> {
+    pub fn set_tap_venue_byte(
+        &mut self,
+        dir: &Path,
+        venue_label: &str,
+        venue: u8,
+    ) -> io::Result<()> {
         debug_assert_eq!(self.tap_records, 0, "venue byte must be set before records");
         if self.tap_mode == TapMode::Off {
             return Ok(());
@@ -573,10 +578,7 @@ mod tests {
     use core_types::{ChannelId, LatencyClass, Price, Qty, SignalSource, VenueId};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "pmlr_capture_{tag}_{}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("pmlr_capture_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -661,22 +663,22 @@ mod tests {
             VenueId::Deribit,
             core_types::make_symbol_id(VenueId::Deribit, 513),
             core_types::OPT_SUMMARY_FLAG_MARK_PX | core_types::OPT_SUMMARY_FLAG_OI,
-            52_300_000,          // 0.0523 BTC ×1e9
-            654_300_000,         // IV 0.6543 ×1e9
-            77_216_940_000_000,  // underlying ×1e9
-            1_234_500_000,       // OI 1234.5 ×1e6
-            512_000_000,         // delta 0.512 ×1e9
-            12_340,              // gamma ×1e9
-            152_300_000,         // vega 152.3 ×1e6
-            -85_300_000,         // theta -85.3 ×1e6
+            52_300_000,         // 0.0523 BTC ×1e9
+            654_300_000,        // IV 0.6543 ×1e9
+            77_216_940_000_000, // underlying ×1e9
+            1_234_500_000,      // OI 1234.5 ×1e6
+            512_000_000,        // delta 0.512 ×1e9
+            12_340,             // gamma ×1e9
+            152_300_000,        // vega 152.3 ×1e6
+            -85_300_000,        // theta -85.3 ×1e6
         );
         c.opt_summary(&o);
         c.flush_all().unwrap();
         assert_eq!(c.opt_summaries_written(), 1);
         assert_eq!(c.io_errors(), 0);
 
-        let r = crate::PmlrReader::<OptSummary>::open(dir.join("deribit-opt-summary.pmlr"))
-            .unwrap();
+        let r =
+            crate::PmlrReader::<OptSummary>::open(dir.join("deribit-opt-summary.pmlr")).unwrap();
         assert_eq!(r.slot_kind(), SlotKind::OptSummary);
         assert_eq!(r.epoch_ns(), 77);
         assert_eq!(r.len(), 1);
@@ -859,17 +861,11 @@ mod tests {
         // Bad magic.
         let bad = dir.join("bad.tap");
         std::fs::write(&bad, [0u8; RAW_TAP_HEADER_SIZE]).unwrap();
-        assert!(matches!(
-            RawTapReader::open(&bad),
-            Err(RawTapErr::Header)
-        ));
+        assert!(matches!(RawTapReader::open(&bad), Err(RawTapErr::Header)));
         // Short file.
         let short = dir.join("short.tap");
         std::fs::write(&short, b"PMRT").unwrap();
-        assert!(matches!(
-            RawTapReader::open(&short),
-            Err(RawTapErr::Header)
-        ));
+        assert!(matches!(RawTapReader::open(&short), Err(RawTapErr::Header)));
         // Torn tail: header + record header claiming 100 B payload but
         // only 3 present.
         let torn = dir.join("torn.tap");

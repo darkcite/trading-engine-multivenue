@@ -57,7 +57,9 @@ pub fn now_ns() -> NsTs {
     unsafe {
         libc::clock_gettime(CLOCK_ID, ts.as_mut_ptr());
         let ts = ts.assume_init();
-        (ts.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(ts.tv_nsec as u64)
+        (ts.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(ts.tv_nsec as u64)
     }
 }
 
@@ -80,8 +82,8 @@ const CLOCK_ID: libc::clockid_t = libc::CLOCK_MONOTONIC;
 pub fn now_ns() -> NsTs {
     // This branch is tested-only scaffolding; the production target is
     // unix. Using `Instant` here allocates nothing (it's a value type).
-    use std::time::Instant;
     use std::sync::OnceLock;
+    use std::time::Instant;
     static BASE: OnceLock<Instant> = OnceLock::new();
     let base = BASE.get_or_init(Instant::now);
     base.elapsed().as_nanos() as u64

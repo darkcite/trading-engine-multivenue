@@ -362,7 +362,7 @@ pub fn note_transport_ready(drv: &mut Driver, status: Status) {
 // ---------------------------------------------------------------
 
 fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    if drv.tx.len() == 0 {
+    if drv.tx.is_empty() {
         return Ok(());
     }
     let mut written = 0;
@@ -524,7 +524,13 @@ fn drain_ws_frames<C: Capture>(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_json_frame(drv, payload.start..payload.end, producer, status, capture);
+                        handle_json_frame(
+                            drv,
+                            payload.start..payload.end,
+                            producer,
+                            status,
+                            capture,
+                        );
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -1015,7 +1021,16 @@ mod tests {
         let (mut prod, _cons) = ring.split();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"rpc.example",
+            b"/v2",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         // Drain the GET handshake so it doesn't confuse later assertions.
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1025,7 +1040,16 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"rpc.example", b"/v2", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"rpc.example",
+            b"/v2",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.subscribed);
         // D7: entering Steady must publish Up; D5: the 101 response
@@ -1071,14 +1095,21 @@ mod tests {
         let (mut prod, _cons) = ring.split();
         let status = IngressStatus::new();
 
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"result":"0x00000000deadbeef"}}"#,
-        );
+        let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":"0x00000000deadbeef"}}"#,);
         let mut frame_buf = [0u8; 256];
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.sub_count(), 1);
         assert_eq!(d.pending_count(), 0);
         assert_eq!(d.subs.kind_of(SubId(0xDEADBEEF)), Some(SubKind::NewHeads));
@@ -1106,7 +1137,16 @@ mod tests {
         let n = wrap_text_frame(body, &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1141,7 +1181,16 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
 
         let sig = cons.try_pop().expect("signal must be pushed");
@@ -1174,7 +1223,16 @@ mod tests {
         let n = wrap_text_frame(body.as_bytes(), &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.pending_count(), 0);
         // A well-formed error envelope is handled, not rejected.
         assert_eq!(status.msgs_total(), 1);
@@ -1209,7 +1267,10 @@ mod tests {
             u64::from_le_bytes(p[0..8].try_into().unwrap()),
             0x1122_3344_5566_7788
         );
-        assert_eq!(u64::from_le_bytes(p[8..16].try_into().unwrap()), 0xAABB_CCDD);
+        assert_eq!(
+            u64::from_le_bytes(p[8..16].try_into().unwrap()),
+            0xAABB_CCDD
+        );
         assert_eq!(u64::from_le_bytes(p[16..24].try_into().unwrap()), 0x99);
         // Reserved region must be zero.
         assert_eq!(&p[24..40], &[0u8; 16]);
@@ -1270,7 +1331,16 @@ mod tests {
         let (mut prod, _cons) = ring.split();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1278,8 +1348,16 @@ mod tests {
         let resp = build_server_response(&wrong_accept);
         t.inject_incoming(&resp);
 
-        let err =
-            drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let err = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // A failed upgrade must never publish Up.
         assert_eq!(status.state(), IngressState::Down);
@@ -1303,7 +1381,16 @@ mod tests {
         let n = wrap_text_frame(b"{\"nonsense\":true}", &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         // The frame still counts as inbound activity (D5).
@@ -1438,13 +1525,19 @@ mod tests {
 
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
 
-        assert_eq!(cap.raw_frames, 2, "every inbound payload tapped pre-classify");
+        assert_eq!(
+            cap.raw_frames, 2,
+            "every inbound payload tapped pre-classify"
+        );
         assert_eq!(cap.signals, 1, "newHeads captured as signal");
         assert_eq!(cap.last_source, SignalSource::Rpc as u8);
         assert_eq!(cap.rejects, 1, "garbage frame tapped as reject");
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
-        assert_eq!(cap.flushes, 0, "drive_one never flushes; run() owns the cadence");
+        assert_eq!(
+            cap.flushes, 0,
+            "drive_one never flushes; run() owns the cadence"
+        );
 
         // Signal still captured when the ring is full: fill it, resend.
         let filler = Signal::new(

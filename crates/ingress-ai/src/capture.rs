@@ -107,7 +107,8 @@ mod tests {
     use core_types::{AiCmdKind, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_NONE, SYMBOL_ID_NONE};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("stage2_ai_capture_{tag}_{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("stage2_ai_capture_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }

@@ -284,10 +284,7 @@ impl<R: AsBytes> PmlrReader<R> {
         //   in this workspace is `#[repr(align(64))]`, which divides
         //   page size on every target we support.
         unsafe {
-            core::slice::from_raw_parts(
-                self.ptr.add(HEADER_SIZE).cast::<R>(),
-                self.record_count,
-            )
+            core::slice::from_raw_parts(self.ptr.add(HEADER_SIZE).cast::<R>(), self.record_count)
         }
     }
 
@@ -298,12 +295,7 @@ impl<R: AsBytes> PmlrReader<R> {
         if i < self.record_count {
             // SAFETY: bounds checked above; alignment + repr guaranteed
             // by `AsBytes`.
-            Some(unsafe {
-                self.ptr
-                    .add(HEADER_SIZE + i * SLOT_SIZE)
-                    .cast::<R>()
-                    .read()
-            })
+            Some(unsafe { self.ptr.add(HEADER_SIZE + i * SLOT_SIZE).cast::<R>().read() })
         } else {
             None
         }

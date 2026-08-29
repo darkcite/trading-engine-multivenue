@@ -107,8 +107,8 @@
 use book_builder::MultiBook;
 use core_time::NsTs;
 use core_types::{
-    symbol_venue_byte, AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleRow, RuleTable, Side,
-    Signal, SymbolId, Tick, VenueId, RULE_TABLE_ROWS,
+    symbol_venue_byte, AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleRow, RuleTable, Side, Signal,
+    SymbolId, Tick, VenueId, RULE_TABLE_ROWS,
 };
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
@@ -340,11 +340,7 @@ impl<const N: usize> Strategy for VmStrategy<N> {
             // Trigger math (module docs).
             let fire_side: Option<Side> = if row.trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
                 match self.book.snapshot(row.ref_sym) {
-                    Some(rt)
-                        if rt.has_quotes()
-                            && rt.bid_px.raw() > 0
-                            && rt.ask_px.raw() > 0 =>
-                    {
+                    Some(rt) if rt.has_quotes() && rt.bid_px.raw() > 0 && rt.ask_px.raw() > 0 => {
                         let mid_r = rt.mid().raw();
                         let dev = mid_s as i128 - mid_r as i128;
                         let abs_dev = if dev >= 0 { dev } else { -dev };
@@ -677,7 +673,11 @@ mod tests {
     fn receive_then_commit_flips() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(&[lb_row(0, 12_000, 1_000, 3_000_000)], 1, HASH_A));
+        vm.receive_table(&table_with(
+            &[lb_row(0, 12_000, 1_000, 3_000_000)],
+            1,
+            HASH_A,
+        ));
         assert_eq!(vm.staged_hash128(), Some(HASH_A));
         assert_eq!(vm.rows_active(), 0, "staged table must not evaluate yet");
         vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
@@ -702,7 +702,11 @@ mod tests {
     fn commit_hash_mismatch_drops_and_keeps_staged() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(&[lb_row(0, 12_000, 1_000, 3_000_000)], 1, HASH_A));
+        vm.receive_table(&table_with(
+            &[lb_row(0, 12_000, 1_000, 3_000_000)],
+            1,
+            HASH_A,
+        ));
         vm.on_ai(&commit_cmd(HASH_B), &mut ctx);
         assert_eq!(vm.commits_dropped, 1);
         assert_eq!(
@@ -720,7 +724,11 @@ mod tests {
     fn stage_and_other_kinds_are_ignored() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(&[lb_row(0, 12_000, 1_000, 3_000_000)], 1, HASH_A));
+        vm.receive_table(&table_with(
+            &[lb_row(0, 12_000, 1_000, 3_000_000)],
+            1,
+            HASH_A,
+        ));
         vm.on_ai(&stage_cmd(HASH_A), &mut ctx);
         let mut hb = commit_cmd(HASH_A);
         hb.kind = AiCmdKind::Heartbeat as u8;
@@ -734,8 +742,16 @@ mod tests {
     fn restage_supersedes_staged_buffer() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(&[lb_row(0, 12_000, 1_000, 3_000_000)], 1, HASH_A));
-        vm.receive_table(&table_with(&[lb_row(1, 900_000, 1_000, 3_000_000)], 2, HASH_B));
+        vm.receive_table(&table_with(
+            &[lb_row(0, 12_000, 1_000, 3_000_000)],
+            1,
+            HASH_A,
+        ));
+        vm.receive_table(&table_with(
+            &[lb_row(1, 900_000, 1_000, 3_000_000)],
+            2,
+            HASH_B,
+        ));
         assert_eq!(vm.staged_hash128(), Some(HASH_B));
         vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
         assert_eq!(vm.commits_dropped, 1, "superseded hash must not commit");
@@ -749,13 +765,21 @@ mod tests {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(&mut vm, &mut ctx, &[lb_row(0, 12_000, 1_000, 3_000_000)]);
-        vm.receive_table(&table_with(&[lb_row(1, 900_000, 1_000, 4_000_000)], 2, HASH_B));
+        vm.receive_table(&table_with(
+            &[lb_row(1, 900_000, 1_000, 4_000_000)],
+            2,
+            HASH_B,
+        ));
         vm.on_ai(&commit_cmd(HASH_B), &mut ctx);
         assert_eq!(vm.commits_applied, 2);
         assert_eq!(vm.active_epoch(), 2);
         assert_eq!(vm.active_hash128(), HASH_B);
         // Third receive lands in the buffer the FIRST table used.
-        vm.receive_table(&table_with(&[lb_row(0, 12_000, 1_000, 5_000_000)], 3, HASH_A));
+        vm.receive_table(&table_with(
+            &[lb_row(0, 12_000, 1_000, 5_000_000)],
+            3,
+            HASH_A,
+        ));
         vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
         assert_eq!(vm.commits_applied, 3);
         assert_eq!(vm.active_epoch(), 3);
@@ -768,7 +792,10 @@ mod tests {
         install(vm, ctx, &[cd_row(side, edge_bps, 1_000, 3_000_000)]);
         ctx.now = T0;
         vm.on_tick(&tick(REF, 1, 490_000, 510_000), ctx);
-        assert!(ctx.submitted.is_empty(), "ref tick evaluates no action rows");
+        assert!(
+            ctx.submitted.is_empty(),
+            "ref tick evaluates no action rows"
+        );
         assert_eq!(vm.evals, 0, "ref leg has no action rows");
     }
 
@@ -832,7 +859,11 @@ mod tests {
     fn cross_deviation_without_ref_book_never_fires() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         // No REF tick ever: action ticks evaluate but cannot fire.
         vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
@@ -847,7 +878,11 @@ mod tests {
     fn level_breach_bid_fires_at_or_below_level() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 12_000, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 12_000, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         // Ask above the level ⇒ silent.
         vm.on_tick(&tick(SYM, 1, 11_000, 13_000), &mut ctx);
@@ -864,7 +899,11 @@ mod tests {
     fn level_breach_ask_fires_at_or_above_level() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Ask as u8, 900_000, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Ask as u8, 900_000, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 880_000, 895_000), &mut ctx);
         assert_eq!(vm.fires, 0);
@@ -877,13 +916,21 @@ mod tests {
     fn level_breach_both_prefers_the_bid_leg() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(RuleRow::SIDE_BOTH, 450_000, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(RuleRow::SIDE_BOTH, 450_000, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         // Crossed fixture: ask 400k ≤ level ≤ bid 500k — both legs
         // satisfied; the bid leg wins deterministically.
         vm.on_tick(&tick(SYM, 1, 500_000, 400_000), &mut ctx);
         assert_eq!(vm.fires, 1);
-        assert_eq!(ctx.submitted.len(), 1, "at most one emission per row per tick");
+        assert_eq!(
+            ctx.submitted.len(),
+            1,
+            "at most one emission per row per tick"
+        );
         assert_eq!(ctx.submitted[0].side, Side::Bid);
     }
 
@@ -891,7 +938,11 @@ mod tests {
     fn one_sided_book_never_fires() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 500_000, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 500_000, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         // Ask side empty (0): a naive `ask ≤ level` would fire — the
         // two-sided guard must hold it (8e preopen lesson).
@@ -906,7 +957,11 @@ mod tests {
     fn cooldown_rearm_after_horizon() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 12_000, 100, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 12_000, 100, 3_000_000)],
+        );
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
@@ -928,7 +983,11 @@ mod tests {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
         // Day-long horizon: without a flip the row stays asleep.
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 12_000, 86_400_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 12_000, 86_400_000, 3_000_000)],
+        );
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
@@ -953,7 +1012,11 @@ mod tests {
     fn per_order_notional_clamped_to_row_cap() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 600_000, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 600_000, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 480_000, 520_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
@@ -970,7 +1033,11 @@ mod tests {
         // $500 row cap — the §4.2 validator would reject this table;
         // built by hand it proves the emit-time layer stands alone
         // (defense in depth): every order ≤ the $100 policy cap.
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 600_000, 10, 500_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 600_000, 10, 500_000_000)],
+        );
         ctx.now = T0;
         let mut seq = 0u32;
         for _ in 0..3 {
@@ -990,12 +1057,19 @@ mod tests {
         let mut ctx = TestCtx::new();
         // A zero cap cannot pass the validator; hand-built it must
         // fail closed at the clamp (fires visible, no order).
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 600_000, 10, 0)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 600_000, 10, 0)],
+        );
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 480_000, 520_000), &mut ctx);
         assert_eq!(vm.fires, 1);
         assert!(ctx.submitted.is_empty());
-        assert_eq!(vm.orders_dropped, 0, "clamp-to-zero is not a dispatcher drop");
+        assert_eq!(
+            vm.orders_dropped, 0,
+            "clamp-to-zero is not a dispatcher drop"
+        );
     }
 
     #[test]
@@ -1022,7 +1096,11 @@ mod tests {
     fn ring_full_drops_and_leaves_cooldown_open() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 12_000, 86_400_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 12_000, 86_400_000, 3_000_000)],
+        );
         ctx.now = T0;
         ctx.next_err = Some(SubmitErr::RingFull);
         vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
@@ -1040,7 +1118,11 @@ mod tests {
     fn irrelevant_sym_claims_no_book_slot_and_evaluates_nothing() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)],
+        );
         vm.on_tick(&tick(999, 1, 400_000, 420_000), &mut ctx);
         assert_eq!(vm.evals, 0);
         assert_eq!(vm.book_track_failed, 0);
@@ -1053,7 +1135,11 @@ mod tests {
         // cannot track ⇒ counted, no eval, no panic.
         let mut vm: VmStrategy<1> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(&[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)], 1, HASH_A));
+        vm.receive_table(&table_with(
+            &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)],
+            1,
+            HASH_A,
+        ));
         vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
         vm.on_tick(&tick(REF, 1, 490_000, 510_000), &mut ctx);
         vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
@@ -1068,7 +1154,11 @@ mod tests {
     fn strategy_counters_trait_surface() {
         let mut vm: VmStrategy<8> = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 12_000, 1_000, 3_000_000)]);
+        install(
+            &mut vm,
+            &mut ctx,
+            &[lb_row(Side::Bid as u8, 12_000, 1_000, 3_000_000)],
+        );
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
         assert_eq!(StrategyCounters::orders_emitted(&vm), 1);

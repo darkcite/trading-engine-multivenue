@@ -373,8 +373,14 @@ mod tests {
 
     #[test]
     fn trait_is_object_usable_through_monomorphised_engine() {
-        let mut ctx = NoopCtx { submitted: 0, now: 0 };
-        let mut s = NoopStrat { started: false, ticks: 0 };
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
         s.on_start(&mut ctx).unwrap();
         assert!(s.started);
 
@@ -397,8 +403,14 @@ mod tests {
         // Happy path for the 8g §6 default: a strategy that does not
         // override the hook compiles and its state is untouched by a
         // delivered table.
-        let mut ctx = NoopCtx { submitted: 0, now: 0 };
-        let mut s = NoopStrat { started: false, ticks: 0 };
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
         s.on_start(&mut ctx).unwrap();
         let mut table = RuleTable::EMPTY;
         table.len = 1;
@@ -415,7 +427,10 @@ mod tests {
         // inert through the default hook — clamping is the concrete
         // receiver's job (`VmStrategy::receive_table`), not the
         // trait's.
-        let mut s = NoopStrat { started: false, ticks: 0 };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
         let mut table = RuleTable::EMPTY;
         table.len = u32::MAX;
         s.on_ruleset_table(&table);
@@ -427,7 +442,10 @@ mod tests {
         // 8g §9 bare-strategy posture: a strategy that overrides
         // nothing reports 0 on every observability row — the cli's
         // generic mirror renders an inert vm family on non-set boots.
-        let s = NoopStrat { started: false, ticks: 0 };
+        let s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
         assert_eq!(StrategyCounters::enabled_mask(&s), 0);
         assert_eq!(s.vm_rows_active(), 0);
         assert_eq!(s.vm_table_epoch(), 0);

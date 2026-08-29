@@ -224,7 +224,10 @@ impl<T, const N: usize> Producer<T, N> {
         compiler_fence(Ordering::Release);
         // Release on the index bump publishes the slot write to the
         // consumer under its Acquire load of `head`.
-        self.ring.head.value.store(head.wrapping_add(1), Ordering::Release);
+        self.ring
+            .head
+            .value
+            .store(head.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
@@ -283,7 +286,10 @@ impl<T, const N: usize> Consumer<T, N> {
             let slot = (*self.ring.buf.get()).get_unchecked(idx);
             slot.as_ptr().read()
         };
-        self.ring.tail.value.store(tail.wrapping_add(1), Ordering::Release);
+        self.ring
+            .tail
+            .value
+            .store(tail.wrapping_add(1), Ordering::Release);
         Some(value)
     }
 

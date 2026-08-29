@@ -322,7 +322,11 @@ impl<const N: usize, const M: usize> CrossArb<N, M> {
         let total_qty = self.qty.raw();
         let count_i = count as i64;
         let base = if count_i > 0 { total_qty / count_i } else { 0 };
-        let remainder = if count_i > 0 { (total_qty % count_i).max(0) as usize } else { 0 };
+        let remainder = if count_i > 0 {
+            (total_qty % count_i).max(0) as usize
+        } else {
+            0
+        };
         if base == 0 && remainder == 0 {
             return;
         }

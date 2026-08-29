@@ -63,14 +63,16 @@ fn gen_row() -> impl Strategy<Value = GenRow> {
         10u32..=1_000,
         0i64..=1_000_000,
     )
-        .prop_map(|(sym_idx, cross, side, edge_bps, horizon_ms, level_1e6)| GenRow {
-            sym_idx,
-            cross,
-            side,
-            edge_bps,
-            horizon_ms,
-            level_1e6,
-        })
+        .prop_map(
+            |(sym_idx, cross, side, edge_bps, horizon_ms, level_1e6)| GenRow {
+                sym_idx,
+                cross,
+                side,
+                edge_bps,
+                horizon_ms,
+                level_1e6,
+            },
+        )
 }
 
 /// One generated tick: sym choice (action pool + ref), a bounded

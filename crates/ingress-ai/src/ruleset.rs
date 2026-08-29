@@ -334,8 +334,8 @@ fn scan_u32_field(cur: &mut Cur<'_>) -> Result<u32, RulesetReject> {
 
 /// Scan a decimal money/price field into ×1e6 fixed point via the
 /// canonical `core-parse` scanner (rule 3: no exponents, no NaN/Inf;
-/// >6 fractional digits truncate per the scanner's documented
-/// contract; sign and range are the caller's domain checks).
+/// more than 6 fractional digits truncate per the scanner's
+/// documented contract; sign and range are the caller's domain checks).
 fn scan_money_field(cur: &mut Cur<'_>) -> Result<i64, RulesetReject> {
     cur.skip_ws();
     if cur.i >= cur.b.len() {
@@ -418,7 +418,7 @@ fn parse_trigger(cur: &mut Cur<'_>) -> Result<(u8, u32, i64, u8), RulesetReject>
             }
             trig_keys |= T_LEVEL;
             let v = scan_money_field(cur)?;
-            if v < 0 || v > RULE_LEVEL_1E6_MAX {
+            if !(0..=RULE_LEVEL_1E6_MAX).contains(&v) {
                 return Err(RulesetReject::Number);
             }
             level_1e6 = v;
@@ -937,10 +937,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cw-ai-ruleset-{}-{tag}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("cw-ai-ruleset-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp ruleset dir");
         dir
     }
@@ -964,7 +961,7 @@ mod tests {
         )
     }
 
-    fn install(dir: &PathBuf, bytes: &[u8]) -> [u8; HASH128_LEN] {
+    fn install(dir: &std::path::Path, bytes: &[u8]) -> [u8; HASH128_LEN] {
         let digest = sha256(bytes);
         let mut h = [0u8; HASH128_LEN];
         h.copy_from_slice(&digest[..HASH128_LEN]);
@@ -986,13 +983,15 @@ mod tests {
     /// can pop what Stage pushed; dropping it is also legal — pushes
     /// only see head/tail).
     fn side_path(
-        dir: &PathBuf,
+        dir: &std::path::Path,
         status: &Arc<AiIngressStatus>,
-    ) -> (RulesetSidePath, core_ring::Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>) {
-        let (prod, cons) =
-            core_ring::Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+    ) -> (
+        RulesetSidePath,
+        core_ring::Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
+    ) {
+        let (prod, cons) = core_ring::Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
         (
-            RulesetSidePath::new(dir.clone(), Arc::clone(status), arc_universe(), prod),
+            RulesetSidePath::new(dir.to_path_buf(), Arc::clone(status), arc_universe(), prod),
             cons,
         )
     }
@@ -1220,7 +1219,11 @@ mod tests {
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h2));
         assert_eq!(status.ruleset_staged(), 1);
         assert_eq!(status.ruleset_rejected(), 1);
-        assert_eq!(side.staged(), Some(h1), "staged state survives a rejected restage");
+        assert_eq!(
+            side.staged(),
+            Some(h1),
+            "staged state survives a rejected restage"
+        );
         // The scratch itself is discard-on-reject (len 0) — pinned
         // deliberately: the ring push copies the table out at stage
         // time (copy #1), so the parked scratch is a diagnostic, not
@@ -1421,7 +1424,10 @@ mod tests {
             "50.0",
         )
         .replace(r#""edge_bps":80"#, r#""edge_bps":80,"bogus":1"#);
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // Duplicate row key.
         let r = row_json(
             "g2",
@@ -1433,7 +1439,10 @@ mod tests {
             "50.0",
         )
         .replace(r#""sym":42"#, r#""sym":42,"sym":42"#);
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // Missing row key (drop horizon_ms).
         let r = row_json(
             "g3",
@@ -1445,7 +1454,10 @@ mod tests {
             "50.0",
         )
         .replace(r#","horizon_ms":1500"#, "");
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // Trailing non-whitespace bytes.
         let mut b = valid_json("g4").into_bytes();
         b.push(b'x');
@@ -1468,7 +1480,10 @@ mod tests {
             "50.0",
         )
         .replace(r#""family":"politics""#, r#""family":"memes""#);
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         let r = row_json(
             "g8",
             r#"{"type":"cross_deviation","ref":7}"#,
@@ -1478,7 +1493,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         let r = row_json(
             "g9",
             r#"{"type":"sma_cross","ref":7}"#,
@@ -1488,7 +1506,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // level key on cross_deviation (§4.1 shape).
         let r = row_json(
             "g10",
@@ -1499,7 +1520,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // ref missing on cross_deviation (§4.1 shape).
         let r = row_json(
             "g11",
@@ -1510,7 +1534,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // level missing on level_breach (§4.1 shape).
         let r = row_json(
             "g12",
@@ -1521,7 +1548,10 @@ mod tests {
             "60000",
             "25.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
         // Escape in a string (no escapes in the grammar).
         let r = row_json(
             r"g\1",
@@ -1532,7 +1562,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Grammar));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Grammar)
+        );
     }
 
     #[test]
@@ -1545,22 +1578,43 @@ mod tests {
             wrap_rows(&[row_json("n1", &trig, "42", "bid", edge, horizon, risk)])
         };
         // Exponents (Deribit sci-notation lesson).
-        assert_eq!(check(mk("1e3", "1500", "50.0", None).as_bytes()), Err(RulesetReject::Number));
-        assert_eq!(check(mk("80", "1500", "5e1", None).as_bytes()), Err(RulesetReject::Number));
+        assert_eq!(
+            check(mk("1e3", "1500", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
+        assert_eq!(
+            check(mk("80", "1500", "5e1", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
         // Fractional part in an integer field.
-        assert_eq!(check(mk("80.5", "1500", "50.0", None).as_bytes()), Err(RulesetReject::Number));
+        assert_eq!(
+            check(mk("80.5", "1500", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
         // Negative integer field.
-        assert_eq!(check(mk("-80", "1500", "50.0", None).as_bytes()), Err(RulesetReject::Number));
+        assert_eq!(
+            check(mk("-80", "1500", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
         // NaN / Infinity tokens.
-        assert_eq!(check(mk("80", "1500", "NaN", None).as_bytes()), Err(RulesetReject::Number));
+        assert_eq!(
+            check(mk("80", "1500", "NaN", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
         assert_eq!(
             check(mk("80", "1500", "Infinity", None).as_bytes()),
             Err(RulesetReject::Number)
         );
         // Ranges: edge_bps ≤ 10_000; horizon ∈ [10, 86_400_000];
         // level ∈ [0, 1e6]; risk > 0.
-        assert_eq!(check(mk("10001", "1500", "50.0", None).as_bytes()), Err(RulesetReject::Number));
-        assert_eq!(check(mk("80", "9", "50.0", None).as_bytes()), Err(RulesetReject::Number));
+        assert_eq!(
+            check(mk("10001", "1500", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
+        assert_eq!(
+            check(mk("80", "9", "50.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
         assert_eq!(
             check(mk("80", "86400001", "50.0", None).as_bytes()),
             Err(RulesetReject::Number)
@@ -1573,11 +1627,20 @@ mod tests {
             check(mk("0", "60000", "25.0", Some("-0.5")).as_bytes()),
             Err(RulesetReject::Number)
         );
-        assert_eq!(check(mk("80", "1500", "0", None).as_bytes()), Err(RulesetReject::Number));
-        assert_eq!(check(mk("80", "1500", "-1.0", None).as_bytes()), Err(RulesetReject::Number));
+        assert_eq!(
+            check(mk("80", "1500", "0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
+        assert_eq!(
+            check(mk("80", "1500", "-1.0", None).as_bytes()),
+            Err(RulesetReject::Number)
+        );
         // Boundary values pass (control).
         assert_eq!(check(mk("10000", "10", "50.0", None).as_bytes()), Ok(()));
-        assert_eq!(check(mk("0", "86400000", "25.0", Some("1.0")).as_bytes()), Ok(()));
+        assert_eq!(
+            check(mk("0", "86400000", "25.0", Some("1.0")).as_bytes()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1599,7 +1662,10 @@ mod tests {
                 "0.01",
             ));
         }
-        assert_eq!(check(wrap_rows(&rows).as_bytes()), Err(RulesetReject::RowCount));
+        assert_eq!(
+            check(wrap_rows(&rows).as_bytes()),
+            Err(RulesetReject::RowCount)
+        );
         // 256 rows pass (control — also the gate-34 shape).
         rows.truncate(256);
         assert_eq!(check(wrap_rows(&rows).as_bytes()), Ok(()));
@@ -1648,7 +1714,10 @@ mod tests {
             "60000",
             "10.0",
         );
-        assert_eq!(check(wrap_rows(&[r1, r2]).as_bytes()), Err(RulesetReject::Name));
+        assert_eq!(
+            check(wrap_rows(&[r1, r2]).as_bytes()),
+            Err(RulesetReject::Name)
+        );
     }
 
     #[test]
@@ -1663,7 +1732,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Symbol));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Symbol)
+        );
         // ref outside the universe.
         let r = row_json(
             "s2",
@@ -1674,7 +1746,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Symbol));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Symbol)
+        );
         // ref == sym.
         let r = row_json(
             "s3",
@@ -1685,7 +1760,10 @@ mod tests {
             "1500",
             "50.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Symbol));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Symbol)
+        );
         // ref present on level_breach (§4.2 rule 6, design-literal).
         let r = row_json(
             "s4",
@@ -1696,7 +1774,10 @@ mod tests {
             "60000",
             "25.0",
         );
-        assert_eq!(check(wrap_rows(&[r]).as_bytes()), Err(RulesetReject::Symbol));
+        assert_eq!(
+            check(wrap_rows(&[r]).as_bytes()),
+            Err(RulesetReject::Symbol)
+        );
         // Cross-venue legs are legal — D2 as amended (both legs = any
         // universe member; 7 and 42 stand in for different venues).
         let r = row_json(
@@ -1752,7 +1833,15 @@ mod tests {
         let mut rows = Vec::new();
         for (i, risk) in [(0u32, "100.0"), (1, "100.0"), (2, "51.0")] {
             let trig = format!(r#"{{"type":"level_breach","level":0.{:06}}}"#, i + 1);
-            rows.push(row_json(&format!("c-sym-{i}"), &trig, "42", "ask", "0", "60000", risk));
+            rows.push(row_json(
+                &format!("c-sym-{i}"),
+                &trig,
+                "42",
+                "ask",
+                "0",
+                "60000",
+                risk,
+            ));
         }
         assert_eq!(check(wrap_rows(&rows).as_bytes()), Err(RulesetReject::Caps));
         // Table Σ: 11 × $100 across 6 syms (≤ 2 rows = $200 per sym,
@@ -1762,7 +1851,15 @@ mod tests {
         for i in 0..11u32 {
             let sym = syms[(i / 2) as usize];
             let trig = format!(r#"{{"type":"level_breach","level":0.{:06}}}"#, i + 1);
-            rows.push(row_json(&format!("c-tab-{i}"), &trig, sym, "ask", "0", "60000", "100.0"));
+            rows.push(row_json(
+                &format!("c-tab-{i}"),
+                &trig,
+                sym,
+                "ask",
+                "0",
+                "60000",
+                "100.0",
+            ));
         }
         assert_eq!(check(wrap_rows(&rows).as_bytes()), Err(RulesetReject::Caps));
     }
@@ -1789,7 +1886,10 @@ mod tests {
             "3000",
             "25.0",
         );
-        assert_eq!(check(wrap_rows(&[r1, r2]).as_bytes()), Err(RulesetReject::DuplicateRow));
+        assert_eq!(
+            check(wrap_rows(&[r1, r2]).as_bytes()),
+            Err(RulesetReject::DuplicateRow)
+        );
         // Same sym+side, different level: NOT a duplicate (control).
         let r1 = row_json(
             "d3",

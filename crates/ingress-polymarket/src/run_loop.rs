@@ -47,9 +47,7 @@ use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{Capture, NsTs, SymbolId, Tick};
 
-use crate::{
-    classify, parse_book_update, parse_price_change_row, scan_venue_seq, FrameKind,
-};
+use crate::{classify, parse_book_update, parse_price_change_row, scan_venue_seq, FrameKind};
 
 // ---------------------------------------------------------------
 // Configuration + sizing
@@ -406,7 +404,7 @@ pub fn note_transport_ready(drv: &mut Driver, status: Status) {
 // ---------------------------------------------------------------
 
 fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    if drv.tx.len() == 0 {
+    if drv.tx.is_empty() {
         return Ok(());
     }
     let mut written = 0;
@@ -451,8 +449,14 @@ fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> 
 /// [`crate::write_market_subscribe_multi`]). One frame lists every
 /// configured id (M1 multi-market). Runs exactly once per
 /// connection, on the upgrade→Steady edge.
+// Doctrine: raw indices, not iterator adapters (CLAUDE.md hot-path rules;
+// `i` indexes three parallel fixed arrays).
+#[allow(clippy::needless_range_loop)]
 fn queue_market_subscribe(drv: &mut Driver) -> io::Result<()> {
-    debug_assert!(!drv.subscribed, "market subscribe must be queued exactly once");
+    debug_assert!(
+        !drv.subscribed,
+        "market subscribe must be queued exactly once"
+    );
     let count = drv.asset_id_count as usize;
     let mut refs: [&[u8]; crate::PM_SUBSCRIBE_IDS_MAX] = [&[]; crate::PM_SUBSCRIBE_IDS_MAX];
     for i in 0..count {
@@ -659,18 +663,17 @@ fn handle_text_frame<C: Capture>(
                 let ev_end = next.unwrap_or(payload.len());
                 let ev = &payload[ev_start..ev_end];
                 any = true;
-                match extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
-                    Some(sym) => match parse_book_update(ev, sym, ts_ns) {
+                // Lookup miss = sibling asset in the same market — not
+                // ours, and not tapped (§6.5): the venue groups by
+                // market, not by subscribed token.
+                if let Some(sym) = extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
+                    match parse_book_update(ev, sym, ts_ns) {
                         Some(tick) => push_tick(tick, producer, status, capture),
                         None => {
                             status.inc_parse_errors();
                             capture.parse_reject(now_ns(), ev);
                         }
-                    },
-                    // Sibling asset in the same market — not ours, and
-                    // not tapped (§6.5): the venue groups by market, not
-                    // by subscribed token.
-                    None => {}
+                    }
                 }
                 at = ev_end;
             }
@@ -696,16 +699,16 @@ fn handle_text_frame<C: Capture>(
                     .map(|o| row_start + ROW.len() + o);
                 let row_end = next.unwrap_or(payload.len());
                 let row = &payload[row_start..row_end];
-                match extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
-                    Some(sym) => match parse_price_change_row(row, sym, ts_ns, venue_seq) {
+                // Lookup miss = sibling-asset row — not ours, not
+                // tapped (§6.5).
+                if let Some(sym) = extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
+                    match parse_price_change_row(row, sym, ts_ns, venue_seq) {
                         Some(tick) => push_tick(tick, producer, status, capture),
                         None => {
                             status.inc_parse_errors();
                             capture.parse_reject(now_ns(), row);
                         }
-                    },
-                    // Sibling-asset row — not ours, not tapped (§6.5).
-                    None => {}
+                    }
                 }
                 at = row_end;
             }
@@ -814,7 +817,9 @@ pub fn run<T: Transport, C: Capture>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if let Err(_e) = drive_one(transport, drv, host, path, producer, symbol_map, status, capture) {
+            if let Err(_e) = drive_one(
+                transport, drv, host, path, producer, symbol_map, status, capture,
+            ) {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -980,11 +985,31 @@ mod tests {
         let status = IngressStatus::new();
 
         // Before Ready — no handshake written.
-        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"example.com",
+            b"/ws",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(t.outgoing_len(), 0);
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"example.com", b"/ws", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"example.com",
+            b"/ws",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
 
         // We now expect a GET-request in the outbound buffer.
         let mut buf = [0u8; 4096];
@@ -1006,7 +1031,17 @@ mod tests {
         let status = IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         // drain outbound request so we don't confuse the test.
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1016,7 +1051,17 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.state(), State::Steady);
         // D7: exactly this transition publishes Up, with the 101
         // response bytes accounted as activity (D5).
@@ -1055,7 +1100,17 @@ mod tests {
         let status = IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1065,7 +1120,17 @@ mod tests {
         let resp = build_server_response(&wrong_accept);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap_err();
+        let err = drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1088,7 +1153,17 @@ mod tests {
         let pc = br#"{"market":"0x60c2","price_changes":[{"asset_id":"0xABC","price":"0.519","size":"33.0","side":"BUY","hash":"h","best_bid":"0.519","best_ask":"0.520"}],"timestamp":"1713000000456","event_type":"price_change"}"#;
         inject_unmasked_text(&mut t, pc);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
 
         let tick = cons.try_pop().expect("book tick must be pushed");
         assert_eq!(tick.sym, 42);
@@ -1100,9 +1175,17 @@ mod tests {
         let tick2 = cons.try_pop().expect("price_change tick must be pushed");
         assert_eq!(tick2.sym, 42);
         assert_eq!(tick2.bid_px.raw(), 519_000);
-        assert_eq!(tick2.bid_qty.raw(), 33_000_000, "BUY row at the touch carries the size");
+        assert_eq!(
+            tick2.bid_qty.raw(),
+            33_000_000,
+            "BUY row at the touch carries the size"
+        );
         assert_eq!(tick2.ask_px.raw(), 520_000);
-        assert_eq!(tick2.ask_qty.raw(), 0, "far-side size unknown on price_change");
+        assert_eq!(
+            tick2.ask_qty.raw(),
+            0,
+            "far-side size unknown on price_change"
+        );
         assert_eq!(tick2.venue_seq, (1_713_000_000_456u64 & 0xFFFF_FFFF) as u32);
         assert!(cons.try_pop().is_none());
         // §6.4 accounting: two parsed+dispatched messages, frame bytes
@@ -1132,7 +1215,17 @@ mod tests {
         frame[2..6].copy_from_slice(b"PING");
         t.inject_incoming(&frame[..6]);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert!(t.outgoing_len() > 0, "driver should have emitted a pong");
 
         let mut out = [0u8; 64];
@@ -1182,7 +1275,17 @@ mod tests {
         // Known asset_id but no timestamp / levels → parser rejection.
         let bad = br#"[{"market":"0x1","asset_id":"0xABC","bids":"nope","event_type":"book"}]"#;
         inject_unmasked_text(&mut t, bad);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
@@ -1191,7 +1294,17 @@ mod tests {
         // silently — neither a message nor a parse error.
         let sibling = br#"[{"market":"0x1","asset_id":"0xSIBLING","timestamp":"1","bids":[{"price":"0.4","size":"1.0"}],"asks":[{"price":"0.6","size":"1.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, sibling);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
 
@@ -1211,7 +1324,17 @@ mod tests {
         while prod.try_push(filler).is_ok() {}
         let good = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, good);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &map,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 1);
         assert_eq!(status.parse_errors_total(), 1);
@@ -1395,10 +1518,19 @@ mod tests {
             inject_unmasked_text(&mut t, payload);
         }
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap).unwrap();
+        drive_one(
+            &mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap,
+        )
+        .unwrap();
 
-        assert_eq!(cap.raw_frames, 3, "every data payload is tapped pre-classify");
-        assert_eq!(cap.ticks, 2, "good event in frame 1 + good event in frame 2");
+        assert_eq!(
+            cap.raw_frames, 3,
+            "every data payload is tapped pre-classify"
+        );
+        assert_eq!(
+            cap.ticks, 2,
+            "good event in frame 1 + good event in frame 2"
+        );
         assert_eq!(
             cap.rejects, 2,
             "malformed known-asset event + timestamp-less price_change; \
@@ -1419,7 +1551,10 @@ mod tests {
         );
         while prod.try_push(filler).is_ok() {}
         inject_unmasked_text(&mut t, good);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap).unwrap();
+        drive_one(
+            &mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap,
+        )
+        .unwrap();
         assert_eq!(cap.ticks, 3, "ring-dropped tick still captured");
         assert_eq!(status.ring_drops_total(), 1);
     }

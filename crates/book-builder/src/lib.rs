@@ -515,8 +515,14 @@ mod tests {
     fn multi_book_apply_at_propagates_outcome_or_none() {
         let mut mb: MultiBook<4> = MultiBook::empty();
         let idx = mb.track(10).unwrap();
-        assert_eq!(mb.apply_at(idx, &mk(10, 1, 1, 2)), Some(ApplyOutcome::Applied));
-        assert_eq!(mb.apply_at(idx, &mk(10, 1, 1, 2)), Some(ApplyOutcome::Stale));
+        assert_eq!(
+            mb.apply_at(idx, &mk(10, 1, 1, 2)),
+            Some(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            mb.apply_at(idx, &mk(10, 1, 1, 2)),
+            Some(ApplyOutcome::Stale)
+        );
         // Wrong slot symbol → None (caller falls back to apply()).
         assert_eq!(mb.apply_at(idx, &mk(11, 2, 1, 2)), None);
         // Out-of-range index → None.

@@ -151,10 +151,8 @@ mod tests {
     use core_types::{Fill, Price, Qty, Side};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "stage2_slot_capture_{tag}_{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("stage2_slot_capture_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("engine-fills.pmlr")
@@ -230,7 +228,10 @@ mod tests {
     #[test]
     fn open_fails_on_missing_parent_dir() {
         let p = std::env::temp_dir()
-            .join(format!("stage2_slot_capture_missing_{}", std::process::id()))
+            .join(format!(
+                "stage2_slot_capture_missing_{}",
+                std::process::id()
+            ))
             .join("nope")
             .join("engine-fills.pmlr");
         assert!(SlotCapture::<Fill>::open(&p, SlotKind::Fill, 0).is_err());

@@ -71,11 +71,7 @@ pub fn scan_i64(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
         (false, pos)
     };
     let (mag, next) = scan_u64(buf, start)?;
-    let signed = if negative {
-        -(mag as i64)
-    } else {
-        mag as i64
-    };
+    let signed = if negative { -(mag as i64) } else { mag as i64 };
     Some((signed, next))
 }
 
@@ -216,9 +212,7 @@ pub fn find_field(buf: &[u8], needle: &[u8]) -> Option<Pos> {
         let after = abs + needle.len();
         // Ignore false matches inside a string value: the character
         // preceding `"` must be `{`, `,` or whitespace.
-        if abs == 0
-            || matches!(buf[abs - 1], b'{' | b',' | b' ' | b'\t' | b'\n' | b'\r')
-        {
+        if abs == 0 || matches!(buf[abs - 1], b'{' | b',' | b' ' | b'\t' | b'\n' | b'\r') {
             return Some(after);
         }
         start = after;
@@ -325,7 +319,9 @@ fn scan_number_sci_scaled(buf: &[u8], pos: Pos, out_scale: i32) -> Option<(i64, 
         }
         let mut exp_digits = 0usize;
         while i < buf.len() && buf[i].is_ascii_digit() {
-            exp_val = exp_val.saturating_mul(10).saturating_add((buf[i] - b'0') as i32);
+            exp_val = exp_val
+                .saturating_mul(10)
+                .saturating_add((buf[i] - b'0') as i32);
             exp_digits += 1;
             i += 1;
         }
@@ -613,10 +609,7 @@ mod tests {
     fn scan_price_1e9_pads_and_truncates() {
         assert_eq!(scan_price_1e9(b"1.5", 0).unwrap().0, 1_500_000_000);
         // 12 fractional digits; keep 9.
-        assert_eq!(
-            scan_price_1e9(b"0.123456789123", 0).unwrap().0,
-            123_456_789
-        );
+        assert_eq!(scan_price_1e9(b"0.123456789123", 0).unwrap().0, 123_456_789);
     }
 
     #[test]
@@ -770,7 +763,10 @@ mod sci_and_skip_tests {
         // amounts render as scientific notation.
         assert_eq!(scan_number_sci_1e6(b"1.0e3,", 0), Some((1_000_000_000, 5)));
         assert_eq!(scan_number_sci_1e6(b"209.0,", 0), Some((209_000_000, 5)));
-        assert_eq!(scan_number_sci_1e6(b"62863.68,", 0), Some((62_863_680_000, 8)));
+        assert_eq!(
+            scan_number_sci_1e6(b"62863.68,", 0),
+            Some((62_863_680_000, 8))
+        );
         assert_eq!(scan_number_sci_1e6(b"2.5e-2}", 0), Some((25_000, 6)));
         assert_eq!(scan_number_sci_1e6(b"1e30", 0), None); // overflow
         assert_eq!(scan_number_sci_1e6(b"e3", 0), None);

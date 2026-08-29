@@ -76,9 +76,7 @@ impl From<DispatchError> for core_net::NetworkErr {
     fn from(e: DispatchError) -> Self {
         use core_net::{NetworkErr, NetworkErrKind, NetworkSource};
         match e {
-            DispatchError::QueueFull => {
-                NetworkErr::new(NetworkSource::Clob, NetworkErrKind::Io)
-            }
+            DispatchError::QueueFull => NetworkErr::new(NetworkSource::Clob, NetworkErrKind::Io),
             DispatchError::Disconnected => {
                 NetworkErr::new(NetworkSource::Clob, NetworkErrKind::Disconnected)
             }

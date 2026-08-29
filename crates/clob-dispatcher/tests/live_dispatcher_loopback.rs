@@ -28,11 +28,10 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .expect("private key DER");
+    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
 }
 
@@ -182,10 +181,7 @@ fn live_dispatcher_accepts_success_envelope() {
 
 #[test]
 fn live_dispatcher_surfaces_error_envelope() {
-    let res = submit_and_collect(
-        br#"{"error":"insufficient balance"}"#,
-        b"HTTP/1.1 200 OK",
-    );
+    let res = submit_and_collect(br#"{"error":"insufficient balance"}"#, b"HTTP/1.1 200 OK");
     // The dispatcher treats the error envelope as Http(200) so
     // the caller sees a structured failure even though the
     // transport succeeded.

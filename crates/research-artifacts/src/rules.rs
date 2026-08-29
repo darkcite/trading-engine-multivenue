@@ -125,12 +125,14 @@ impl<const N: usize> RulesTable<N> {
         let mut buf = Vec::new();
         std::fs::File::open(path)?.read_to_end(&mut buf)?;
         // Find the opening '[' and closing ']' of the top-level array.
-        let start = buf.iter().position(|&b| b == b'[').ok_or_else(|| {
-            io::Error::other("rules file: missing top-level '['")
-        })?;
-        let end = buf.iter().rposition(|&b| b == b']').ok_or_else(|| {
-            io::Error::other("rules file: missing top-level ']'")
-        })?;
+        let start = buf
+            .iter()
+            .position(|&b| b == b'[')
+            .ok_or_else(|| io::Error::other("rules file: missing top-level '['"))?;
+        let end = buf
+            .iter()
+            .rposition(|&b| b == b']')
+            .ok_or_else(|| io::Error::other("rules file: missing top-level ']'"))?;
         if end <= start {
             return Err(io::Error::other("rules file: malformed array delimiters"));
         }
@@ -226,21 +228,21 @@ impl<'a> TopLevelObjects<'a> {
 }
 
 fn parse_rule_object(buf: &[u8]) -> Result<Rule, RuleError> {
-    let name = crate::tags::find_string_field_pub(buf, b"\"name\"")
-        .ok_or(RuleError::MissingField)?;
+    let name =
+        crate::tags::find_string_field_pub(buf, b"\"name\"").ok_or(RuleError::MissingField)?;
     if name.len() > KEY_LEN {
         return Err(RuleError::NameTooLong);
     }
-    let family_str = crate::tags::find_string_field_pub(buf, b"\"family\"")
-        .ok_or(RuleError::MissingField)?;
+    let family_str =
+        crate::tags::find_string_field_pub(buf, b"\"family\"").ok_or(RuleError::MissingField)?;
     let family = Family::from_bytes(family_str);
 
-    let edge = crate::tags::find_int_field_pub(buf, b"\"edge_bps\"")
-        .ok_or(RuleError::MissingField)?;
-    let horizon = crate::tags::find_int_field_pub(buf, b"\"horizon_ms\"")
-        .ok_or(RuleError::MissingField)?;
-    let risk = crate::tags::find_int_field_pub(buf, b"\"max_risk_usd\"")
-        .ok_or(RuleError::MissingField)?;
+    let edge =
+        crate::tags::find_int_field_pub(buf, b"\"edge_bps\"").ok_or(RuleError::MissingField)?;
+    let horizon =
+        crate::tags::find_int_field_pub(buf, b"\"horizon_ms\"").ok_or(RuleError::MissingField)?;
+    let risk =
+        crate::tags::find_int_field_pub(buf, b"\"max_risk_usd\"").ok_or(RuleError::MissingField)?;
 
     let edge_bps = u32::try_from(edge).map_err(|_| RuleError::BadInt)?;
     let horizon_ms = u32::try_from(horizon).map_err(|_| RuleError::BadInt)?;

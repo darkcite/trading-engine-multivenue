@@ -295,8 +295,7 @@ impl<const N: usize> AiExec<N> {
     /// §5.4 staleness at `now_ns`. True before the first frame ever.
     #[inline]
     pub fn is_stale(&self, now_ns: u64) -> bool {
-        self.last_frame_ns == 0
-            || now_ns.saturating_sub(self.last_frame_ns) > AI_STALENESS_NS
+        self.last_frame_ns == 0 || now_ns.saturating_sub(self.last_frame_ns) > AI_STALENESS_NS
     }
 
     /// Count of upsert-live entries (silence-expired excluded, TTL
@@ -716,7 +715,11 @@ mod tests {
             STRATEGY_SLOT_NONE,
             AI_SIDE_NONE,
             0,
-            if eos { AI_CMD_FLAG_EXPIRE_ON_SILENCE } else { 0 },
+            if eos {
+                AI_CMD_FLAG_EXPIRE_ON_SILENCE
+            } else {
+                0
+            },
         )
     }
 
@@ -871,7 +874,10 @@ mod tests {
         assert!(c.submitted.is_empty(), "no fair value → no quoting");
         // Fair arrives → quoting starts, bias applied (target 600_000,
         // mid 700_000 → dev 100_000).
-        s.on_ai(&set_fair(T0 + 1, PM, 500_000, 60_000_000_000, false), &mut c);
+        s.on_ai(
+            &set_fair(T0 + 1, PM, 500_000, 60_000_000_000, false),
+            &mut c,
+        );
         s.on_tick(&tick(PM, 690_000, 710_000), &mut c);
         assert_eq!(c.submitted.len(), 1);
         assert_eq!(c.submitted[0].side, Side::Ask);
@@ -997,7 +1003,10 @@ mod tests {
         assert_eq!(c.submitted.len(), 1, "unflagged entry survived");
 
         // A fresh SetFairValue revives the flagged symbol.
-        s.on_ai(&set_fair(t_rec + 20, PM, 500_000, 600_000_000_000, true), &mut c);
+        s.on_ai(
+            &set_fair(t_rec + 20, PM, 500_000, 600_000_000_000, true),
+            &mut c,
+        );
         c.now = t_rec + 30;
         s.on_tick(&tick(PM, 690_000, 710_000), &mut c);
         assert_eq!(c.submitted.len(), 2);
@@ -1009,7 +1018,14 @@ mod tests {
     fn intent_honored_when_live() {
         let (mut s, mut c) = primed();
         s.on_ai(
-            &intent(T0 + 5, PM, 430_000, 2_000_000, Side::Bid, VenueId::Polymarket),
+            &intent(
+                T0 + 5,
+                PM,
+                430_000,
+                2_000_000,
+                Side::Bid,
+                VenueId::Polymarket,
+            ),
             &mut c,
         );
         assert_eq!(s.intents_honored, 1);
@@ -1037,7 +1053,14 @@ mod tests {
         assert!(c.submitted.is_empty());
         // …but the frame restored liveness: the next intent lands.
         s.on_ai(
-            &intent(T0 + 5, PM, 430_000, 2_000_000, Side::Ask, VenueId::Polymarket),
+            &intent(
+                T0 + 5,
+                PM,
+                430_000,
+                2_000_000,
+                Side::Ask,
+                VenueId::Polymarket,
+            ),
             &mut c,
         );
         assert_eq!(s.intents_honored, 1);
@@ -1057,7 +1080,14 @@ mod tests {
         // Well-behaved worker: heartbeat precedes the retry.
         s.on_ai(&heartbeat(t1 + 1), &mut c);
         s.on_ai(
-            &intent(t1 + 2, PM, 430_000, 2_000_000, Side::Bid, VenueId::Polymarket),
+            &intent(
+                t1 + 2,
+                PM,
+                430_000,
+                2_000_000,
+                Side::Bid,
+                VenueId::Polymarket,
+            ),
             &mut c,
         );
         assert_eq!(s.intents_honored, 1);
@@ -1069,7 +1099,14 @@ mod tests {
         let (mut s, mut c) = primed();
         c.next_err = Some(SubmitErr::RingFull);
         s.on_ai(
-            &intent(T0 + 5, PM, 430_000, 2_000_000, Side::Bid, VenueId::Polymarket),
+            &intent(
+                T0 + 5,
+                PM,
+                430_000,
+                2_000_000,
+                Side::Bid,
+                VenueId::Polymarket,
+            ),
             &mut c,
         );
         assert_eq!(s.intents_honored, 0);
@@ -1096,7 +1133,10 @@ mod tests {
     fn upsert_updates_in_place_and_preserves_bias() {
         let (mut s, mut c) = primed();
         s.on_ai(&set_bias(T0 + 1, PM, 50_000, 60_000_000_000), &mut c);
-        s.on_ai(&set_fair(T0 + 2, PM, 400_000, 60_000_000_000, false), &mut c);
+        s.on_ai(
+            &set_fair(T0 + 2, PM, 400_000, 60_000_000_000, false),
+            &mut c,
+        );
         let snap = s.fair_snapshot(PM).unwrap();
         assert_eq!(snap.px_1e6, 400_000);
         assert_eq!(snap.bias_1e6, 50_000, "SetFairValue preserves bias");
@@ -1112,7 +1152,13 @@ mod tests {
         c.now = T0;
         for (i, sym) in [1u32, 9, 17].into_iter().enumerate() {
             s.on_ai(
-                &set_fair(T0 + i as u64, sym, 100_000 + i as i64, 60_000_000_000, false),
+                &set_fair(
+                    T0 + i as u64,
+                    sym,
+                    100_000 + i as i64,
+                    60_000_000_000,
+                    false,
+                ),
                 &mut c,
             );
         }
@@ -1149,7 +1195,10 @@ mod tests {
             s.on_ai(&set_fair(T0, sym, 100_000, 60_000_000_000, false), &mut c);
         }
         assert_eq!(s.fair_len(), 4);
-        s.on_ai(&set_fair(T0 + 1, 99, 100_000, 60_000_000_000, false), &mut c);
+        s.on_ai(
+            &set_fair(T0 + 1, 99, 100_000, 60_000_000_000, false),
+            &mut c,
+        );
         assert_eq!(s.fair_table_full, 1);
         assert!(s.fair_snapshot(99).is_none());
         // Existing entries untouched.

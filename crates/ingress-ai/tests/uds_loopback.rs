@@ -28,9 +28,7 @@ use core_types::{
     AiCmd, AiCmdKind, VenueId, AI_RING_SIZE, AI_SIDE_NONE, STRATEGY_SLOT_NONE, STRATEGY_SLOT_VM,
     SYMBOL_ID_NONE,
 };
-use ingress_ai::{
-    pack_frame, AiCmdCapture, AiIngressCfg, AiIngressStatus, FRAME_LEN,
-};
+use ingress_ai::{pack_frame, AiCmdCapture, AiIngressCfg, AiIngressStatus, FRAME_LEN};
 
 const KEY: [u8; 32] = [0xA5; 32];
 
@@ -73,10 +71,7 @@ fn snapshot(s: &AiIngressStatus) -> Expected {
 /// (`~/multivenue/run/ai.sock`); stays inside the stage2 `/tmp/stage2-*`
 /// isolation namespace.
 fn sock_path(tag: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!(
-        "/tmp/stage2-ai-{}/{tag}.sock",
-        std::process::id()
-    ))
+    std::path::PathBuf::from(format!("/tmp/stage2-ai-{}/{tag}.sock", std::process::id()))
 }
 
 fn capture_dir(tag: &str) -> std::path::PathBuf {
@@ -174,7 +169,10 @@ fn frame_bytes(cmd: &AiCmd) -> [u8; FRAME_LEN] {
 /// Run one scenario against a live listener: spawns the ingress
 /// thread, hands the client script a connected-on-demand socket path,
 /// stops the loop, joins, and returns for post-mortem assertions.
-fn with_ingress<F>(tag: &str, scenario: F) -> (Expected, AiCmdCapture, Vec<AiCmd>, u32, std::path::PathBuf)
+fn with_ingress<F>(
+    tag: &str,
+    scenario: F,
+) -> (Expected, AiCmdCapture, Vec<AiCmd>, u32, std::path::PathBuf)
 where
     F: FnOnce(&std::path::Path, &AiIngressStatus, &mut dyn FnMut() -> Option<AiCmd>),
 {
@@ -254,23 +252,22 @@ where
 #[test]
 fn good_frames_accepted_ts_rewritten_captured() {
     let mut seen: Vec<AiCmd> = Vec::new();
-    let (snap, mut capture, popped, seam_hits, dir) =
-        with_ingress("good", |path, status, pop| {
-            let mut c = connect(path);
-            c.write_all(&frame_bytes(&heartbeat(1))).unwrap();
-            assert!(wait_until(|| status.cmds() == 1), "first cmd not accepted");
-            // Two frames back-to-back in one write — stream framing.
-            let mut two = [0u8; FRAME_LEN * 2];
-            two[..FRAME_LEN].copy_from_slice(&frame_bytes(&heartbeat(2)));
-            two[FRAME_LEN..].copy_from_slice(&frame_bytes(&heartbeat(3)));
-            c.write_all(&two).unwrap();
-            assert!(wait_until(|| status.cmds() == 3), "batch not accepted");
-            for _ in 0..3 {
-                if let Some(x) = pop() {
-                    seen.push(x);
-                }
+    let (snap, mut capture, popped, seam_hits, dir) = with_ingress("good", |path, status, pop| {
+        let mut c = connect(path);
+        c.write_all(&frame_bytes(&heartbeat(1))).unwrap();
+        assert!(wait_until(|| status.cmds() == 1), "first cmd not accepted");
+        // Two frames back-to-back in one write — stream framing.
+        let mut two = [0u8; FRAME_LEN * 2];
+        two[..FRAME_LEN].copy_from_slice(&frame_bytes(&heartbeat(2)));
+        two[FRAME_LEN..].copy_from_slice(&frame_bytes(&heartbeat(3)));
+        c.write_all(&two).unwrap();
+        assert!(wait_until(|| status.cmds() == 3), "batch not accepted");
+        for _ in 0..3 {
+            if let Some(x) = pop() {
+                seen.push(x);
             }
-        });
+        }
+    });
     assert_eq!(
         snap,
         Expected {
@@ -304,19 +301,21 @@ fn good_frames_accepted_ts_rewritten_captured() {
 
 #[test]
 fn bad_hmac_drops_connection() {
-    let (snap, capture, popped, seam_hits, dir) =
-        with_ingress("badhmac", |path, status, _pop| {
-            let mut c = connect(path);
-            let mut f = frame_bytes(&heartbeat(1));
-            f[FRAME_LEN - 1] ^= 0x80;
-            c.write_all(&f).unwrap();
-            assert!(wait_until(|| status.hmac_fail() == 1), "hmac_fail not counted");
-            assert!(is_closed(&mut c), "connection must be dropped on bad tag");
-            // Reconnect works and the stream is trusted afresh.
-            let mut c2 = connect(path);
-            c2.write_all(&frame_bytes(&heartbeat(1))).unwrap();
-            assert!(wait_until(|| status.cmds() == 1), "reconnect not accepted");
-        });
+    let (snap, capture, popped, seam_hits, dir) = with_ingress("badhmac", |path, status, _pop| {
+        let mut c = connect(path);
+        let mut f = frame_bytes(&heartbeat(1));
+        f[FRAME_LEN - 1] ^= 0x80;
+        c.write_all(&f).unwrap();
+        assert!(
+            wait_until(|| status.hmac_fail() == 1),
+            "hmac_fail not counted"
+        );
+        assert!(is_closed(&mut c), "connection must be dropped on bad tag");
+        // Reconnect works and the stream is trusted afresh.
+        let mut c2 = connect(path);
+        c2.write_all(&frame_bytes(&heartbeat(1))).unwrap();
+        assert!(wait_until(|| status.cmds() == 1), "reconnect not accepted");
+    });
     assert_eq!(
         snap,
         Expected {
@@ -327,43 +326,46 @@ fn bad_hmac_drops_connection() {
     );
     assert_eq!(popped.len(), 1);
     assert_eq!(seam_hits, 0);
-    assert_eq!(capture.records(), 1, "nothing captured from the poisoned frame");
+    assert_eq!(
+        capture.records(),
+        1,
+        "nothing captured from the poisoned frame"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn short_len_torn_frame_and_oversize_len() {
-    let (snap, capture, popped, seam_hits, dir) =
-        with_ingress("torn", |path, status, _pop| {
-            // Oversize len field (200) — §4.4 step 1, conn dropped.
-            let mut c = connect(path);
-            c.write_all(&[200u8, 0u8, 1, 2, 3]).unwrap();
-            assert!(
-                wait_until(|| status.protocol_err() == 1),
-                "oversize len not counted"
-            );
-            assert!(is_closed(&mut c), "conn must drop on oversize len");
+    let (snap, capture, popped, seam_hits, dir) = with_ingress("torn", |path, status, _pop| {
+        // Oversize len field (200) — §4.4 step 1, conn dropped.
+        let mut c = connect(path);
+        c.write_all(&[200u8, 0u8, 1, 2, 3]).unwrap();
+        assert!(
+            wait_until(|| status.protocol_err() == 1),
+            "oversize len not counted"
+        );
+        assert!(is_closed(&mut c), "conn must drop on oversize len");
 
-            // Short len field (10).
-            let mut c = connect(path);
-            c.write_all(&[10u8, 0u8]).unwrap();
-            assert!(
-                wait_until(|| status.protocol_err() == 2),
-                "short len not counted"
-            );
-            assert!(is_closed(&mut c), "conn must drop on short len");
+        // Short len field (10).
+        let mut c = connect(path);
+        c.write_all(&[10u8, 0u8]).unwrap();
+        assert!(
+            wait_until(|| status.protocol_err() == 2),
+            "short len not counted"
+        );
+        assert!(is_closed(&mut c), "conn must drop on short len");
 
-            // Torn frame: valid prefix, closed mid-frame.
-            let mut c = connect(path);
-            let f = frame_bytes(&heartbeat(1));
-            c.write_all(&f[..40]).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            drop(c); // EOF with 40 B residue
-            assert!(
-                wait_until(|| status.protocol_err() == 3),
-                "torn residue not counted"
-            );
-        });
+        // Torn frame: valid prefix, closed mid-frame.
+        let mut c = connect(path);
+        let f = frame_bytes(&heartbeat(1));
+        c.write_all(&f[..40]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(c); // EOF with 40 B residue
+        assert!(
+            wait_until(|| status.protocol_err() == 3),
+            "torn residue not counted"
+        );
+    });
     assert_eq!(
         snap,
         Expected {
@@ -379,17 +381,16 @@ fn short_len_torn_frame_and_oversize_len() {
 
 #[test]
 fn seq_regress_discarded_gap_counted() {
-    let (snap, capture, popped, seam_hits, dir) =
-        with_ingress("seq", |path, status, _pop| {
-            let mut c = connect(path);
-            for s in [1u32, 2, 5, 3, 6] {
-                c.write_all(&frame_bytes(&heartbeat(s))).unwrap();
-            }
-            assert!(
-                wait_until(|| status.cmds() == 4 && status.seq_regress() == 1),
-                "seq policy counters wrong"
-            );
-        });
+    let (snap, capture, popped, seam_hits, dir) = with_ingress("seq", |path, status, _pop| {
+        let mut c = connect(path);
+        for s in [1u32, 2, 5, 3, 6] {
+            c.write_all(&frame_bytes(&heartbeat(s))).unwrap();
+        }
+        assert!(
+            wait_until(|| status.cmds() == 4 && status.seq_regress() == 1),
+            "seq policy counters wrong"
+        );
+    });
     assert_eq!(
         snap,
         Expected {
@@ -402,30 +403,39 @@ fn seq_regress_discarded_gap_counted() {
     let seqs: Vec<u32> = popped.iter().map(|c| c.seq).collect();
     assert_eq!(seqs, vec![1, 2, 5, 6]);
     assert_eq!(seam_hits, 0);
-    assert_eq!(capture.records(), 4, "discarded regress must not be captured");
+    assert_eq!(
+        capture.records(),
+        4,
+        "discarded regress must not be captured"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn second_connection_rejected_first_keeps_working() {
-    let (snap, capture, popped, seam_hits, dir) =
-        with_ingress("second", |path, status, _pop| {
-            let mut c1 = connect(path);
-            c1.write_all(&frame_bytes(&heartbeat(1))).unwrap();
-            assert!(wait_until(|| status.cmds() == 1));
+    let (snap, capture, popped, seam_hits, dir) = with_ingress("second", |path, status, _pop| {
+        let mut c1 = connect(path);
+        c1.write_all(&frame_bytes(&heartbeat(1))).unwrap();
+        assert!(wait_until(|| status.cmds() == 1));
 
-            let mut c2 = connect(path);
-            assert!(
-                wait_until(|| status.rejected_conns() == 1),
-                "second conn not rejected"
-            );
-            assert!(is_closed(&mut c2), "second conn must be accepted-then-closed");
+        let mut c2 = connect(path);
+        assert!(
+            wait_until(|| status.rejected_conns() == 1),
+            "second conn not rejected"
+        );
+        assert!(
+            is_closed(&mut c2),
+            "second conn must be accepted-then-closed"
+        );
 
-            // First client is unaffected — the interlock only refuses
-            // the newcomer.
-            c1.write_all(&frame_bytes(&heartbeat(2))).unwrap();
-            assert!(wait_until(|| status.cmds() == 2), "first conn broken by reject");
-        });
+        // First client is unaffected — the interlock only refuses
+        // the newcomer.
+        c1.write_all(&frame_bytes(&heartbeat(2))).unwrap();
+        assert!(
+            wait_until(|| status.cmds() == 2),
+            "first conn broken by reject"
+        );
+    });
     assert_eq!(
         snap,
         Expected {
@@ -448,7 +458,10 @@ fn malformed_frame_discarded_connection_kept() {
             let mut bad = heartbeat(1);
             bad.px = 5; // heartbeat with px != 0 — correctly tagged, bad shape
             c.write_all(&frame_bytes(&bad)).unwrap();
-            assert!(wait_until(|| status.malformed() == 1), "malformed not counted");
+            assert!(
+                wait_until(|| status.malformed() == 1),
+                "malformed not counted"
+            );
             // Same connection continues to be served.
             c.write_all(&frame_bytes(&heartbeat(2))).unwrap();
             assert!(wait_until(|| status.cmds() == 1), "conn died on malformed");
@@ -470,20 +483,19 @@ fn malformed_frame_discarded_connection_kept() {
 
 #[test]
 fn heartbeat_cadence_updates_liveness() {
-    let (snap, capture, popped, seam_hits, dir) =
-        with_ingress("cadence", |path, status, _pop| {
-            let mut c = connect(path);
-            assert_eq!(status.last_heartbeat_ns(), 0, "gauge must start at never");
-            c.write_all(&frame_bytes(&heartbeat(1))).unwrap();
-            assert!(wait_until(|| status.last_heartbeat_ns() > 0));
-            let first = status.last_heartbeat_ns();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            c.write_all(&frame_bytes(&heartbeat(2))).unwrap();
-            assert!(
-                wait_until(|| status.last_heartbeat_ns() > first),
-                "second heartbeat must advance the gauge"
-            );
-        });
+    let (snap, capture, popped, seam_hits, dir) = with_ingress("cadence", |path, status, _pop| {
+        let mut c = connect(path);
+        assert_eq!(status.last_heartbeat_ns(), 0, "gauge must start at never");
+        c.write_all(&frame_bytes(&heartbeat(1))).unwrap();
+        assert!(wait_until(|| status.last_heartbeat_ns() > 0));
+        let first = status.last_heartbeat_ns();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        c.write_all(&frame_bytes(&heartbeat(2))).unwrap();
+        assert!(
+            wait_until(|| status.last_heartbeat_ns() > first),
+            "second heartbeat must advance the gauge"
+        );
+    });
     assert_eq!(
         snap,
         Expected {
@@ -499,16 +511,15 @@ fn heartbeat_cadence_updates_liveness() {
 
 #[test]
 fn stage_and_commit_hit_side_path_and_ring() {
-    let (snap, capture, popped, seam_hits, dir) =
-        with_ingress("seam", |path, status, _pop| {
-            let mut c = connect(path);
-            c.write_all(&frame_bytes(&ruleset(AiCmdKind::RulesetStage, 1)))
-                .unwrap();
-            c.write_all(&frame_bytes(&ruleset(AiCmdKind::RulesetCommit, 2)))
-                .unwrap();
-            c.write_all(&frame_bytes(&heartbeat(3))).unwrap();
-            assert!(wait_until(|| status.cmds() == 3));
-        });
+    let (snap, capture, popped, seam_hits, dir) = with_ingress("seam", |path, status, _pop| {
+        let mut c = connect(path);
+        c.write_all(&frame_bytes(&ruleset(AiCmdKind::RulesetStage, 1)))
+            .unwrap();
+        c.write_all(&frame_bytes(&ruleset(AiCmdKind::RulesetCommit, 2)))
+            .unwrap();
+        c.write_all(&frame_bytes(&heartbeat(3))).unwrap();
+        assert!(wait_until(|| status.cmds() == 3));
+    });
     assert_eq!(
         snap,
         Expected {
@@ -517,7 +528,11 @@ fn stage_and_commit_hit_side_path_and_ring() {
         }
     );
     assert_eq!(seam_hits, 2, "exactly Stage + Commit hit the seam");
-    assert_eq!(popped.len(), 3, "side path is additional — all three ring through");
+    assert_eq!(
+        popped.len(),
+        3,
+        "side path is additional — all three ring through"
+    );
     assert_eq!(popped[0].kind, AiCmdKind::RulesetStage.to_u8());
     assert_eq!(popped[1].kind, AiCmdKind::RulesetCommit.to_u8());
     assert_eq!(capture.records(), 3);

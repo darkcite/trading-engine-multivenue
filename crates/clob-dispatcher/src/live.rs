@@ -31,9 +31,7 @@ use core_types::{Fill, Order, SymbolId};
 use mio::{Events, Poll, Token};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
-use signer_eip712::{
-    address_from_private_key, parse_secret_key, sign_order_with_key, OrderToSign,
-};
+use signer_eip712::{address_from_private_key, parse_secret_key, sign_order_with_key, OrderToSign};
 
 use crate::json_encoder::{encode_signed_order, ORDER_TYPE_GTC};
 use crate::response::{parse_clob_response, ClobResponse};
@@ -147,7 +145,8 @@ impl LiveDispatcher {
         // Pre-parse the secp256k1 scalar exactly once. Per-submit
         // signing reuses this rather than re-running the validity
         // check on every order (~1–2 µs/submit saving).
-        let parsed_key = parse_secret_key(&signer_key).map_err(|_| LiveDispatcherErr::InvalidKey)?;
+        let parsed_key =
+            parse_secret_key(&signer_key).map_err(|_| LiveDispatcherErr::InvalidKey)?;
         let poll = Poll::new().map_err(|_| LiveDispatcherErr::DnsResolution)?;
         let events = Events::with_capacity(16);
         Ok(Self {
@@ -260,9 +259,8 @@ impl LiveDispatcher {
         let to_sign = self.build_order_to_sign(order);
 
         // 2. Sign.
-        let sig =
-            sign_order_with_key(&to_sign, &self.signer_key)
-                .map_err(|_| DispatchError::SignerRejected)?;
+        let sig = sign_order_with_key(&to_sign, &self.signer_key)
+            .map_err(|_| DispatchError::SignerRejected)?;
 
         // 3. Encode JSON into the preallocated body buffer.
         let body_len = encode_signed_order(
@@ -356,8 +354,9 @@ impl LiveDispatcher {
         if self.transport.is_some() {
             return Ok(());
         }
-        let mut t = TlsTransport::connect(self.addr, self.server_name.clone(), self.tls_config.clone())
-            .map_err(|_| DispatchError::Disconnected)?;
+        let mut t =
+            TlsTransport::connect(self.addr, self.server_name.clone(), self.tls_config.clone())
+                .map_err(|_| DispatchError::Disconnected)?;
         t.register(self.poll.registry(), MIO_TOKEN)
             .map_err(|_| DispatchError::Disconnected)?;
 
@@ -402,10 +401,7 @@ impl LiveDispatcher {
         // calls means partial writes resume from the same offset
         // even under TLS backpressure — defensive against any
         // higher-level retry path that might re-enter `send_post`.
-        let segments: [&[u8]; 2] = [
-            &self.req_header[..header_len],
-            &self.req_body[..body_len],
-        ];
+        let segments: [&[u8]; 2] = [&self.req_header[..header_len], &self.req_body[..body_len]];
         write_segments(t, &segments)
     }
 
@@ -441,7 +437,9 @@ impl LiveDispatcher {
         ];
         let mut pos = 0usize;
         for p in parts {
-            let end = pos.checked_add(p.len()).ok_or(DispatchError::EncodeOverflow)?;
+            let end = pos
+                .checked_add(p.len())
+                .ok_or(DispatchError::EncodeOverflow)?;
             if end > buf.len() {
                 return Err(DispatchError::EncodeOverflow);
             }
@@ -513,8 +511,9 @@ impl LiveDispatcher {
                         core_net::BodyFraming::ContentLength(_) => body_end,
                         // close-delimited / chunked: body extends
                         // to whatever's already buffered.
-                        core_net::BodyFraming::CloseDelimited
-                        | core_net::BodyFraming::Chunked => self.resp_len,
+                        core_net::BodyFraming::CloseDelimited | core_net::BodyFraming::Chunked => {
+                            self.resp_len
+                        }
                     };
                     if self.resp_len >= need {
                         return Ok((status, body_start, body_end));

@@ -510,7 +510,10 @@ mod tests {
     #[test]
     fn register_rejects_sentinel() {
         let mut s: EvStrategy<4> = EvStrategy::new();
-        assert_eq!(s.register(SYMBOL_ID_NONE, b"x"), Err(RegisterError::ReservedSymbol));
+        assert_eq!(
+            s.register(SYMBOL_ID_NONE, b"x"),
+            Err(RegisterError::ReservedSymbol)
+        );
     }
 
     #[test]
@@ -524,9 +527,6 @@ mod tests {
     fn register_rejects_oversized_asset() {
         let mut s: EvStrategy<4> = EvStrategy::new();
         let big = [b'x'; KEY_LEN + 1];
-        assert_eq!(
-            s.register(PM, &big),
-            Err(RegisterError::AssetIdTooLong)
-        );
+        assert_eq!(s.register(PM, &big), Err(RegisterError::AssetIdTooLong));
     }
 }

@@ -414,13 +414,7 @@ mod tests {
         let mut payload = [0u8; 40];
         let n = payload_str.len().min(40);
         payload[..n].copy_from_slice(&payload_str[..n]);
-        Signal::new(
-            0,
-            42,
-            LatencyClass::Warm,
-            SignalSource::Rpc as u8,
-            payload,
-        )
+        Signal::new(0, 42, LatencyClass::Warm, SignalSource::Rpc as u8, payload)
     }
 
     fn mk_tick(sym: SymbolId, bid: i64, ask: i64) -> Tick {
