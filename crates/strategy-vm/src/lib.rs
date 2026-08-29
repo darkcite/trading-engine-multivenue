@@ -107,10 +107,12 @@
 use book_builder::MultiBook;
 use core_time::NsTs;
 use core_types::{
-    symbol_venue_byte, AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleRow, RuleTable, Side, Signal,
-    SymbolId, Tick, VenueId, RULE_TABLE_ROWS,
+    symbol_venue_byte, AiCmd, AiCmdKind, ChannelEvent, DepthTopK, Fill, OptSummary, Order, Price,
+    Qty, RuleRow, RuleTable, Side, Signal, SymbolId, Tick, VenueId, RULE_TABLE_ROWS,
 };
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+
+pub mod features;
 
 /// `docs/risk-policy.md` "max single-order notional" (×1e6). The
 /// §4.2 validator holds the mirror constant on the ingress side
@@ -157,6 +159,15 @@ pub struct VmStrategy<const N: usize> {
     /// Referenced symbols that could not claim a book slot (`N`
     /// exhausted) — evaluation for them stays off, fail closed.
     pub book_track_failed: u64,
+
+    /// VM2 V2: the feature engine — per-sym latest values, rolling
+    /// windows, funding APRs, mark/IV, depth and clock features. ONE
+    /// boxed block, allocated zeroed at construction (boot), fed by
+    /// the Strategy callbacks below and read by the v2 evaluator
+    /// (V3). Public for the backtest harness (§1.5 parity) and tests.
+    pub feats: Box<features::FeatureState>,
+    /// FundingSeed commands folded into the feature engine (D-1).
+    pub funding_seeds_applied: u64,
 }
 
 impl<const N: usize> VmStrategy<N> {
@@ -176,6 +187,8 @@ impl<const N: usize> VmStrategy<N> {
             commits_applied: 0,
             commits_dropped: 0,
             book_track_failed: 0,
+            feats: features::FeatureState::new_boxed(),
+            funding_seeds_applied: 0,
         }
     }
 
@@ -277,6 +290,11 @@ impl<const N: usize> Strategy for VmStrategy<N> {
 
     #[inline(always)]
     fn on_tick<C: Ctx>(&mut self, tick: &Tick, ctx: &mut C) {
+        // VM2 V2: the feature engine sees EVERY tick — feature
+        // freshness is independent of table state (a later commit
+        // must not start from cold books/windows).
+        self.feats.on_tick(tick, ctx.now_ns());
+
         let ai = (self.active & 1) as usize;
         let alen = self.tables[ai].len as usize;
         if alen == 0 {
@@ -469,9 +487,40 @@ impl<const N: usize> Strategy for VmStrategy<N> {
     #[inline(always)]
     fn on_fill<C: Ctx>(&mut self, _fill: &Fill, _ctx: &mut C) {}
 
-    /// §6 flip consumer — see the module docs. Everything except
-    /// `RulesetCommit` (Stage included) is deliberately ignored.
+    /// VM2 V2: funding (and HL AssetCtx) events feed the feature
+    /// engine's per-venue print law.
+    #[inline(always)]
+    fn on_venue_event<C: Ctx>(&mut self, event: &ChannelEvent, ctx: &mut C) {
+        self.feats.on_venue_event(event, ctx.now_ns());
+    }
+
+    /// VM2 V2: depth snapshots feed the depth features (STALE gap
+    /// law inside).
+    #[inline(always)]
+    fn on_depth<C: Ctx>(&mut self, depth: &DepthTopK, ctx: &mut C) {
+        self.feats.on_depth(depth, ctx.now_ns());
+    }
+
+    /// VM2 V2: options records feed the mark/IV features.
+    #[inline(always)]
+    fn on_opt_summary<C: Ctx>(&mut self, opt: &OptSummary, ctx: &mut C) {
+        self.feats.on_opt_summary(opt, ctx.now_ns());
+    }
+
+    /// §6 flip consumer + VM2 seed consumer. `RulesetCommit` flips
+    /// the table (module docs); `FundingSeed` (D-1) folds one settled
+    /// print into the feature engine — the SAME path live funding
+    /// events feed, so the cadence law applies in one place.
+    /// `PositionSeed` lands with the V3 position layer. Everything
+    /// else (Stage included) is deliberately ignored.
     fn on_ai<C: Ctx>(&mut self, cmd: &AiCmd, _ctx: &mut C) {
+        if matches!(cmd.kind(), Some(AiCmdKind::FundingSeed)) {
+            // Shape-checked at the ingress + drain: sym real, px =
+            // rate ×1e9, qty = venue print ms > 0.
+            self.feats.funding_seed(cmd.sym, cmd.qty, cmd.px);
+            self.funding_seeds_applied = self.funding_seeds_applied.wrapping_add(1);
+            return;
+        }
         if !matches!(cmd.kind(), Some(AiCmdKind::RulesetCommit)) {
             return;
         }

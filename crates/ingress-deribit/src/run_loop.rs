@@ -110,7 +110,7 @@ use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{
     Capture, ChannelEvent, ChannelId, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
-    DEPTH_RING_SIZE, EVENT_RING_SIZE, SYMBOL_ID_NONE,
+    DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, SYMBOL_ID_NONE,
 };
 
 use crate::{
@@ -540,6 +540,7 @@ pub fn drive_one<T: Transport, C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -560,7 +561,7 @@ pub fn drive_one<T: Transport, C: Capture>(
         }
         State::Steady => {
             drain_ws_frames(
-                drv, producer, event_tx, event_mask, depth_tx, status, capture,
+                drv, producer, event_tx, event_mask, depth_tx, opt_tx, status, capture,
             )?;
         }
         State::Closed => {}
@@ -978,6 +979,7 @@ fn drain_ws_frames<C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -1022,6 +1024,7 @@ fn drain_ws_frames<C: Capture>(
                             event_tx,
                             event_mask,
                             depth_tx,
+                            opt_tx,
                             status,
                             capture,
                         )?;
@@ -1189,6 +1192,7 @@ fn handle_data_frame<C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -1281,7 +1285,7 @@ fn handle_data_frame<C: Capture>(
                         DeribitChannel::Ticker if drv.symbols.is_option_row(sym_idx) => {
                             match parse_option_ticker(payload) {
                                 Some(f) => {
-                                    capture.opt_summary(&OptSummary::new(
+                                    let o = OptSummary::new(
                                         now_ns(),
                                         VenueId::Deribit,
                                         sym,
@@ -1295,7 +1299,14 @@ fn handle_data_frame<C: Capture>(
                                         f.gamma_1e9,
                                         f.vega_1e6,
                                         f.theta_1e6,
-                                    ));
+                                    );
+                                    capture.opt_summary(&o);
+                                    // VM2 V2: onto the opt lane
+                                    // (capture stays first — §6.5
+                                    // capture-before-push law).
+                                    if opt_tx.try_push(o).is_err() {
+                                        status.inc_opt_ring_drops();
+                                    }
                                     Dispatch::OptSummary
                                 }
                                 None => Dispatch::Nothing,
@@ -1323,9 +1334,13 @@ fn handle_data_frame<C: Capture>(
                                 // `current_funding_1e9` since 8c and
                                 // this site DROPPED it. Emit it as the
                                 // venue's Funding event — v0 = rate
-                                // ×1e9 (OKX-compatible scaling), v1 =
-                                // 0 (perp funding is continuous — no
-                                // next-funding time on this venue).
+                                // ×1e9 (OKX-compatible scaling).
+                                // VM2 V2: v1 = `funding_8h` ×1e9 (was
+                                // a constant 0 — additive: the vm's
+                                // hourly deribit sample prefers this,
+                                // the SAME series the worker's REST
+                                // lane stores, ÷8 law downstream; 0
+                                // when the frame lacked the field).
                                 // Gated on venue truth: dated-future
                                 // tickers carry no funding field
                                 // (`has_funding` = the wire-level
@@ -1339,7 +1354,7 @@ fn handle_data_frame<C: Capture>(
                                         0,
                                         tk.ts_ns / 1_000_000,
                                         tk.current_funding_1e9,
-                                        0,
+                                        tk.funding_8h_1e9,
                                     );
                                     capture.event(&ev);
                                     // WS10-A: onto the venue-event
@@ -2064,6 +2079,7 @@ pub fn run<T: Transport, C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -2120,8 +2136,8 @@ pub fn run<T: Transport, C: Capture>(
             let n_before = producer.len();
             let state_before = drv.state();
             if let Err(e) = drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, status,
-                capture,
+                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx,
+                status, capture,
             ) {
                 status.note_session_err(
                     core_metrics::ERR_SITE_DRIVE,
@@ -2319,6 +2335,13 @@ mod tests {
         Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split()
     }
 
+    fn opt_ring_pair() -> (
+        Producer<OptSummary, OPT_RING_SIZE>,
+        core_ring::Consumer<OptSummary, OPT_RING_SIZE>,
+    ) {
+        Ring::<OptSummary, OPT_RING_SIZE>::new().split()
+    }
+
     /// WS10-A shim: legacy tests drive with a fresh throwaway event
     /// lane (mask = FUNDING; consumer dropped — pushes vanish). A
     /// local item shadows the glob-imported `super::drive_one`, so
@@ -2336,6 +2359,7 @@ mod tests {
     ) -> io::Result<()> {
         let (mut etx, _erx) = event_ring_pair();
         let (mut dtx, _drx) = depth_ring_pair();
+        let (mut otx, _orx) = opt_ring_pair();
         super::drive_one(
             transport,
             drv,
@@ -2345,6 +2369,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut dtx,
+            &mut otx,
             status,
             capture,
         )
@@ -2368,6 +2393,7 @@ mod tests {
     ) -> RunResult {
         let (mut etx, _erx) = event_ring_pair();
         let (mut dtx, _drx) = depth_ring_pair();
+        let (mut otx, _orx) = opt_ring_pair();
         super::run(
             transport,
             drv,
@@ -2377,6 +2403,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut dtx,
+            &mut otx,
             poll,
             events,
             token,
@@ -3618,6 +3645,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut depth_ring_pair().0,
+            &mut opt_ring_pair().0,
             &status,
             &mut cap,
         )
@@ -3627,7 +3655,7 @@ mod tests {
         let ev = erx.try_pop().expect("funding event on the lane");
         assert_eq!(ev.channel, core_types::ChannelId::Funding as u8);
         assert_eq!(ev.v0, 420_000, "0.00042 ×1e9");
-        assert_eq!(ev.v1, 0, "continuous perp funding — no next time");
+        assert_eq!(ev.v1, 0, "no funding_8h in this frame ⇒ v1 = 0 (VM2 V2)");
         assert!(
             erx.try_pop().is_none(),
             "Ticker event is NOT on the lane (mask gates per channel)"

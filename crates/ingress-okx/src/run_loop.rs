@@ -73,7 +73,7 @@ use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{
     Capture, ChannelEvent, ChannelId, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
-    DEPTH_RING_SIZE, EVENT_RING_SIZE, SYMBOL_ID_NONE,
+    DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, SYMBOL_ID_NONE,
 };
 
 use crate::{
@@ -424,6 +424,7 @@ pub fn drive_one<T: Transport, C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -444,7 +445,7 @@ pub fn drive_one<T: Transport, C: Capture>(
         }
         State::Steady => {
             drain_ws_frames(
-                drv, producer, event_tx, event_mask, depth_tx, status, capture,
+                drv, producer, event_tx, event_mask, depth_tx, opt_tx, status, capture,
             )?;
         }
         State::Closed => {}
@@ -726,12 +727,14 @@ enum Dispatch {
     Book { sym_idx: u8, gapped: bool },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -765,6 +768,7 @@ fn drain_ws_frames<C: Capture>(
                             event_tx,
                             event_mask,
                             depth_tx,
+                            opt_tx,
                             status,
                             capture,
                         )?;
@@ -830,6 +834,8 @@ struct OptScan {
 fn scan_opt_summaries<C: Capture>(
     payload: &[u8],
     symbols: &OkxSymbolTable,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
+    status: &IngressStatus,
     capture: &mut C,
 ) -> OptScan {
     const MARKER: &[u8] = b"\"instId\":\"";
@@ -851,7 +857,7 @@ fn scan_opt_summaries<C: Capture>(
             if let Some(sym) = symbols.lookup(inst) {
                 match crate::parse_opt_summary_row(row) {
                     Some(f) => {
-                        capture.opt_summary(&OptSummary::new(
+                        let o = OptSummary::new(
                             now_ns(),
                             VenueId::Okx,
                             sym,
@@ -864,7 +870,13 @@ fn scan_opt_summaries<C: Capture>(
                             f.gamma_1e9,
                             f.vega_1e6,
                             f.theta_1e6,
-                        ));
+                        );
+                        capture.opt_summary(&o);
+                        // VM2 V2: onto the opt lane (capture stays
+                        // first — the §6.5 capture-before-push law).
+                        if opt_tx.try_push(o).is_err() {
+                            status.inc_opt_ring_drops();
+                        }
                         scan.rows_parsed += 1;
                     }
                     None => {
@@ -932,6 +944,7 @@ fn handle_data_frame<C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -978,7 +991,7 @@ fn handle_data_frame<C: Capture>(
             // instId → sym lookups against the table (rows for
             // unsubscribed family members skip for free).
             OkxMsgKind::Data(OkxChannel::OptSummary) => Dispatch::OptSummaries {
-                scan: scan_opt_summaries(payload, &drv.symbols, capture),
+                scan: scan_opt_summaries(payload, &drv.symbols, opt_tx, status, capture),
             },
             OkxMsgKind::Data(channel) => {
                 match extract_inst_id(payload).and_then(|inst| {
@@ -1443,6 +1456,7 @@ pub fn run<T: Transport, C: Capture>(
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
     depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -1499,7 +1513,8 @@ pub fn run<T: Transport, C: Capture>(
             let n_before = producer.len();
             let state_before = drv.state();
             if let Err(e) = drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, status,
+                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx,
+                status,
                 capture,
             ) {
                 status.note_session_err(
@@ -1656,7 +1671,9 @@ mod tests {
             records: Vec::new(),
             rejects: 0,
         };
-        let scan = scan_opt_summaries(payload, &t, &mut cap);
+        let (mut otx, _orx) = opt_ring_pair();
+        let status = IngressStatus::new();
+        let scan = scan_opt_summaries(payload, &t, &mut otx, &status, &mut cap);
         assert_eq!(scan.rows_parsed, 1);
         assert_eq!(scan.rows_rejected, 1); // the malformed OUR row
         assert_eq!(cap.records.len(), 1);
@@ -1812,6 +1829,13 @@ mod tests {
         Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split()
     }
 
+    fn opt_ring_pair() -> (
+        Producer<OptSummary, OPT_RING_SIZE>,
+        core_ring::Consumer<OptSummary, OPT_RING_SIZE>,
+    ) {
+        Ring::<OptSummary, OPT_RING_SIZE>::new().split()
+    }
+
     /// WS10-A shim: legacy tests drive with a fresh throwaway event
     /// lane (mask = FUNDING; consumer dropped — pushes vanish). A
     /// local item shadows the glob-imported `super::drive_one`, so
@@ -1829,6 +1853,7 @@ mod tests {
     ) -> io::Result<()> {
         let (mut etx, _erx) = event_ring_pair();
         let (mut dtx, _drx) = depth_ring_pair();
+        let (mut otx, _orx) = opt_ring_pair();
         super::drive_one(
             transport,
             drv,
@@ -1838,6 +1863,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut dtx,
+            &mut otx,
             status,
             capture,
         )
@@ -1861,6 +1887,7 @@ mod tests {
     ) -> RunResult {
         let (mut etx, _erx) = event_ring_pair();
         let (mut dtx, _drx) = depth_ring_pair();
+        let (mut otx, _orx) = opt_ring_pair();
         super::run(
             transport,
             drv,
@@ -1870,6 +1897,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut dtx,
+            &mut otx,
             poll,
             events,
             token,
@@ -2562,6 +2590,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut depth_ring_pair().0,
+            &mut opt_ring_pair().0,
             &status,
             &mut cap,
         )
@@ -2602,6 +2631,7 @@ mod tests {
             &mut etx,
             0,
             &mut depth_ring_pair().0,
+            &mut opt_ring_pair().0,
             &status,
             &mut cap,
         )
@@ -2641,6 +2671,7 @@ mod tests {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut depth_ring_pair().0,
+            &mut opt_ring_pair().0,
             &status,
             &mut cap,
         )

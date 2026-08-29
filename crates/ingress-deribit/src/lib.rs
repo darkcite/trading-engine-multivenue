@@ -376,6 +376,12 @@ pub struct DeribitTickerFrame {
     pub min_px_1e6: i64,
     /// `max_price` (upper price limit) ×1e6.
     pub max_px_1e6: i64,
+    /// VM2 V2: `funding_8h` ×1e9 — the venue's 8-hour rolling
+    /// interest figure, the SAME quantity the worker's REST lane
+    /// samples hourly (`get_funding_rate_history.interest_8h`), so
+    /// the engine's hourly funding sample and `carry_signal`'s
+    /// ÷8-law windows accumulate the same series. 0 when absent.
+    pub funding_8h_1e9: i64,
     /// Resolved symbol.
     pub sym: SymbolId,
     /// WS3: 1 when the wire frame carried `current_funding` — perps
@@ -384,8 +390,11 @@ pub struct DeribitTickerFrame {
     /// `ChannelId::Funding` capture emit; `current_funding_1e9` is 0
     /// when this is 0.
     pub has_funding: u8,
-    // Explicit tail padding.
-    _pad: [u8; 3],
+    /// VM2 V2: 1 when the wire frame carried `funding_8h`.
+    pub has_funding_8h: u8,
+    // Explicit tail padding (struct grew to two cache lines — a
+    // parse-scratch stack value, not a ring slot).
+    _pad: [u8; 58],
 }
 
 /// Parsed `trades.{instr}.100ms` row.
@@ -448,7 +457,10 @@ pub const BOOK_ACTION_CHANGE: u8 = 1;
 
 const _SIZE_CHECKS: () = {
     assert!(::core::mem::size_of::<DeribitQuoteFrame>() == 64);
-    assert!(::core::mem::size_of::<DeribitTickerFrame>() == 64);
+    // VM2 V2: the ticker frame grew to two cache lines (`funding_8h`
+    // + its presence flag) — a parse-scratch stack value, never a
+    // ring slot, so the only invariant is explicit padding.
+    assert!(::core::mem::size_of::<DeribitTickerFrame>() == 128);
     assert!(::core::mem::size_of::<DeribitTradeFrame>() == 64);
     assert!(::core::mem::size_of::<DeribitBookFrame>() == 64);
     assert!(::core::mem::size_of::<DeribitVolIndexFrame>() == 64);
@@ -756,6 +768,15 @@ pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame>
     let min_px_1e6 = scan_px_field_1e6(payload, b"\"min_price\":")?;
     let max_px_1e6 = scan_px_field_1e6(payload, b"\"max_price\":")?;
     let (ts_ns, _) = scan_ms_field(payload, b"\"timestamp\":")?;
+    // VM2 V2: `funding_8h` is optional exactly like `current_funding`
+    // (perps carry both; dated futures neither).
+    let (funding_8h_1e9, has_funding_8h) = match find_field(payload, b"\"funding_8h\":") {
+        Some(pos) => {
+            let (v, _) = scan_number_sci_1e9(payload, pos)?;
+            (v, 1u8)
+        }
+        None => (0, 0u8),
+    };
     Some(DeribitTickerFrame {
         ts_ns,
         mark_px_1e6,
@@ -764,9 +785,11 @@ pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame>
         open_interest_1e6,
         min_px_1e6,
         max_px_1e6,
+        funding_8h_1e9,
         sym,
         has_funding,
-        _pad: [0; 3],
+        has_funding_8h,
+        _pad: [0; 58],
     })
 }
 
@@ -1611,6 +1634,9 @@ mod tests {
         assert_eq!(f.index_px_1e6, 3_931_730_000);
         assert_eq!(f.current_funding_1e9, 420_000);
         assert_eq!(f.has_funding, 1, "perp ticker carries current_funding");
+        // VM2 V2: funding_8h — the worker-REST-parity series.
+        assert_eq!(f.funding_8h_1e9, 6_550_000);
+        assert_eq!(f.has_funding_8h, 1);
         assert_eq!(f.open_interest_1e6, 18_918_470_000_000);
         assert_eq!(f.min_px_1e6, 3_943_210_000);
         assert_eq!(f.max_px_1e6, 3_982_840_000);
@@ -1622,6 +1648,8 @@ mod tests {
         let b = br#"{"timestamp":2000,"mark_price":1.0,"index_price":1.0,"current_funding":-0.000375,"open_interest":5,"min_price":0.9,"max_price":1.1}"#;
         let f = parse_ticker(b, 0).unwrap();
         assert_eq!(f.current_funding_1e9, -375_000);
+        assert_eq!(f.has_funding_8h, 0, "no funding_8h in this frame");
+        assert_eq!(f.funding_8h_1e9, 0);
         assert_eq!(f.has_funding, 1);
         assert!(parse_ticker(b"{}", 0).is_none());
     }

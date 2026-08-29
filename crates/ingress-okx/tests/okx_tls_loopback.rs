@@ -43,6 +43,14 @@ fn depth_lane() -> core_ring::Producer<core_types::DepthTopK, { core_types::DEPT
         .0
 }
 
+/// VM2 V2: a throwaway options-summary lane per `run` call (consumer
+/// dropped).
+fn opt_lane() -> core_ring::Producer<core_types::OptSummary, { core_types::OPT_RING_SIZE }> {
+    Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new()
+        .split()
+        .0
+}
+
 use ingress_okx::{OkxInstType, OkxSymbolTable};
 
 use rcgen::generate_simple_self_signed;
@@ -267,6 +275,7 @@ fn okx_tls_loopback_yields_expected_tick() {
         &mut event_lane(),
         core_types::EVENT_LANE_FUNDING,
         &mut depth_lane(),
+        &mut opt_lane(),
         &mut poll,
         &mut events,
         token,
@@ -378,6 +387,7 @@ fn okx_tls_loopback_books_gap_triggers_resubscribe() {
         &mut event_lane(),
         core_types::EVENT_LANE_FUNDING,
         &mut depth_lane(),
+        &mut opt_lane(),
         &mut poll,
         &mut events,
         token,
@@ -473,6 +483,7 @@ fn okx_tls_loopback_idle_timeout_sends_literal_ping() {
         &mut event_lane(),
         core_types::EVENT_LANE_FUNDING,
         &mut depth_lane(),
+        &mut opt_lane(),
         &mut poll,
         &mut events,
         token,

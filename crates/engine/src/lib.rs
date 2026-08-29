@@ -33,8 +33,8 @@ use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
-    AiCmd, ChannelEvent, DepthTopK, Fill, Order, RuleTableSlot, Signal, Tick, VenueId,
-    AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTableSlot, Signal, Tick, VenueId,
+    AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
@@ -125,6 +125,26 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
     }
 }
 
+/// Number of options-summary lanes (VM2 V2): the venues with an
+/// options analytics channel — 0 = OKX (`opt-summary`), 1 = Deribit
+/// (option `ticker.100ms`), 2 = Binance (eapi WS — venue-dark today;
+/// the lane exists so the `.env` heal activates it with NO engine
+/// change, the M2 lever law). [`OptSummary`] slots,
+/// [`OPT_RING_SIZE`] capacity, mapped by [`opt_lane_of`].
+pub const NUM_OPT_LANES: usize = 3;
+
+/// Options-summary lane index for a venue with an options channel;
+/// `None` for every other venue. Cold-path helper for boot wiring.
+#[inline]
+pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
+    match venue {
+        VenueId::Okx => Some(0),
+        VenueId::Deribit => Some(1),
+        VenueId::Binance => Some(2),
+        VenueId::Polymarket | VenueId::Hyperliquid | VenueId::Ai | VenueId::Bybit => None,
+    }
+}
+
 /// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
 /// Binance is market-data-only, so it has no fill lane.
 pub const NUM_FILL_LANES: usize = 4;
@@ -172,6 +192,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
     /// Depth lanes (WS10-B), [`depth_lane_of`] indexing.
     depth_lanes: [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
+    /// Options-summary lanes (VM2 V2), [`opt_lane_of`] indexing.
+    /// Unspawned venues hand a producer-dropped ring (§3.3 pattern).
+    opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
@@ -234,6 +257,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative depth snapshots dispatched to `on_depth`
     /// (WS10-B, both depth lanes combined).
     pub depths_dispatched: u64,
+    /// Cumulative options records dispatched to `on_opt_summary`
+    /// (VM2 V2, all opt lanes combined).
+    pub opts_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
     //
@@ -284,6 +310,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
         depth_lanes: [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
+        opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
         sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
         fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         ai_cons: Consumer<AiCmd, AI_RING_SIZE>,
@@ -296,6 +323,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             tick_lanes,
             event_lanes,
             depth_lanes,
+            opt_lanes,
             sig_cons,
             fill_lanes,
             ai_cons,
@@ -312,6 +340,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             fills_dispatched: 0,
             events_dispatched: 0,
             depths_dispatched: 0,
+            opts_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
             decide_lat: LatencyTracker::new(),
             ack_lat: LatencyTracker::new(),
@@ -514,6 +543,34 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         };
                         self.strat.on_depth(&d, &mut ctx);
                         self.depths_dispatched = self.depths_dispatched.wrapping_add(1);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
+            lane += 1;
+        }
+
+        // --- options-summary lanes (VM2 V2) ---
+        // Options analytics cadence (100 ms tickers / family-burst
+        // pushes) — drained after depth with the same budget shape.
+        // No latency sample, no sym-bucket touch: analytics, not
+        // tick freshness.
+        let mut lane = 0;
+        while lane < NUM_OPT_LANES {
+            let mut i = 0;
+            while i < max_per_ring {
+                match self.opt_lanes[lane].try_pop() {
+                    Some(o) => {
+                        let now = now_ns();
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
+                            now,
+                        };
+                        self.strat.on_opt_summary(&o, &mut ctx);
+                        self.opts_dispatched = self.opts_dispatched.wrapping_add(1);
                     }
                     None => break,
                 }
@@ -898,6 +955,11 @@ mod tests {
         /// Best-bid px of the most recent snapshot — pins payload
         /// pass-through.
         last_depth_bid_px: i64,
+        /// Options records delivered via `on_opt_summary` (VM2 V2).
+        opts: u32,
+        /// Mark IV of the most recent record — pins payload
+        /// pass-through.
+        last_opt_iv: i64,
         /// Ruleset tables delivered via `on_ruleset_table` (8g §6).
         tables: u32,
         /// Epoch of the most recent delivered table — pins in-ring
@@ -936,6 +998,10 @@ mod tests {
         fn on_depth<C: Ctx>(&mut self, d: &DepthTopK, _ctx: &mut C) {
             self.depths += 1;
             self.last_depth_bid_px = d.bids[0].px_1e6;
+        }
+        fn on_opt_summary<C: Ctx>(&mut self, o: &core_types::OptSummary, _ctx: &mut C) {
+            self.opts += 1;
+            self.last_opt_iv = o.mark_iv_1e9;
         }
         fn on_ruleset_table(&mut self, table: &core_types::RuleTable) {
             self.tables += 1;
@@ -996,6 +1062,16 @@ mod tests {
         ([p0, p1], [c0, c1])
     }
 
+    fn split_opt_lanes() -> (
+        [Producer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
+        [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
+    ) {
+        let (p0, c0) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
+        let (p1, c1) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
+        let (p2, c2) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
+        ([p0, p1, p2], [c0, c1, c2])
+    }
+
     fn split_fill_lanes() -> (
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
@@ -1023,9 +1099,10 @@ mod tests {
     ) {
         let (tp, tc) = split_tick_lanes();
         let (ep, ec) = split_event_lanes();
-        // Depth producers deliberately dropped — the dedicated depth
-        // test builds its own engine with a live producer.
+        // Depth + opt producers deliberately dropped — the dedicated
+        // depth/opt tests build their own engines with live producers.
         let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
         let sig_ring: std::sync::Arc<Ring<Signal, SIGNAL_RING_SIZE>> = Ring::new();
         let (sp, sc) = sig_ring.split();
         let (fp, fc) = split_fill_lanes();
@@ -1040,6 +1117,7 @@ mod tests {
             tc,
             ec,
             dc,
+            oc,
             sc,
             fc,
             ac,
@@ -1187,6 +1265,7 @@ mod tests {
         let (_tp, tc) = split_tick_lanes();
         let (_ep, ec) = split_event_lanes();
         let (mut dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
         let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
@@ -1197,6 +1276,7 @@ mod tests {
             tc,
             ec,
             dc,
+            oc,
             sc,
             fc,
             ac,
@@ -1248,6 +1328,99 @@ mod tests {
         assert_eq!(depth_lane_of(VenueId::Ai), None);
     }
 
+    #[test]
+    fn engine_drains_opt_lanes_and_dispatches() {
+        // VM2 V2: own engine build — the shared harness drops opt
+        // producers.
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (mut op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            Counter::default(),
+            PaperDispatcher::new(),
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+
+        let o_okx = core_types::OptSummary::new(
+            1,
+            VenueId::Okx,
+            core_types::make_symbol_id(VenueId::Okx, 600),
+            0,
+            0,
+            654_300_000, // IV 0.6543
+            65_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        );
+        let o_dbt = core_types::OptSummary::new(
+            2,
+            VenueId::Deribit,
+            core_types::make_symbol_id(VenueId::Deribit, 601),
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            41_500_000,
+            700_000_000, // IV 0.70 — delivered last
+            65_000_000_000_000,
+            0,
+            -400_000_000,
+            2,
+            3,
+            -5,
+        );
+        // Lane map: OKX = 0, Deribit = 1, Binance = 2 (opt_lane_of).
+        op[opt_lane_of(VenueId::Okx).unwrap()].try_push(o_okx).unwrap();
+        op[opt_lane_of(VenueId::Deribit).unwrap()]
+            .try_push(o_dbt)
+            .unwrap();
+        eng.tick(16);
+        assert_eq!(eng.opts_dispatched, 2, "one per populated opt lane");
+        assert_eq!(eng.strategy().opts, 2);
+        // Lanes drain in index order → deribit's record arrives last;
+        // okx's payload passed through en route.
+        assert_eq!(eng.strategy().last_opt_iv, 700_000_000);
+        assert_eq!(eng.ticks_dispatched, 0);
+        // Empty lanes are per-iteration no-ops; budget shape matches
+        // the other lanes.
+        eng.tick(16);
+        assert_eq!(eng.opts_dispatched, 2);
+        for i in 0..10 {
+            let mut o = o_okx;
+            o.ts_ns = 10 + i;
+            op[0].try_push(o).unwrap();
+        }
+        eng.tick(3);
+        assert_eq!(eng.opts_dispatched, 5, "budget caps one iteration");
+        eng.tick(16);
+        assert_eq!(eng.opts_dispatched, 12, "backlog drains across iterations");
+    }
+
+    #[test]
+    fn opt_lane_map_matches_layout() {
+        assert_eq!(opt_lane_of(VenueId::Okx), Some(0));
+        assert_eq!(opt_lane_of(VenueId::Deribit), Some(1));
+        assert_eq!(opt_lane_of(VenueId::Binance), Some(2));
+        assert_eq!(opt_lane_of(VenueId::Polymarket), None);
+        assert_eq!(opt_lane_of(VenueId::Hyperliquid), None);
+        assert_eq!(opt_lane_of(VenueId::Bybit), None);
+        assert_eq!(opt_lane_of(VenueId::Ai), None);
+    }
+
     /// Dispatcher that emits one queued fill — proves the D3 pump.
     struct OneFillDispatcher {
         fill: Option<Fill>,
@@ -1272,6 +1445,7 @@ mod tests {
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
         let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
         let (_fp, fc) = split_fill_lanes();
         let disp = OneFillDispatcher {
             fill: Some(Fill::new(
@@ -1293,6 +1467,7 @@ mod tests {
             tc,
             ec,
             dc,
+            oc,
             sc,
             fc,
             ac,
@@ -1375,6 +1550,7 @@ mod tests {
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
         let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
         let (mut fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let disp = OneFillDispatcher {
@@ -1396,6 +1572,7 @@ mod tests {
             tc,
             ec,
             dc,
+            oc,
             sc,
             fc,
             ac,
@@ -1485,6 +1662,7 @@ mod tests {
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
         let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
@@ -1494,6 +1672,7 @@ mod tests {
             tc,
             ec,
             dc,
+            oc,
             sc,
             fc,
             ac,
@@ -1553,6 +1732,7 @@ mod tests {
         let (_sig_p, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
         let (_ep, ec) = split_event_lanes();
         let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
         let (_fp, fc) = split_fill_lanes();
         let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
         let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
@@ -1562,6 +1742,7 @@ mod tests {
             tc,
             ec,
             dc,
+            oc,
             sc,
             fc,
             ac,

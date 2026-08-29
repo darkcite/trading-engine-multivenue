@@ -212,6 +212,9 @@ pub struct IngressStatus {
     /// WS10-B: depth-lane pushes refused by a full ring. Same
     /// separation rationale as `event_ring_drops_total`.
     depth_ring_drops_total: AtomicU64,
+    /// VM2 V2: options-summary lane pushes refused by a full ring.
+    /// Same separation rationale as the two above.
+    opt_ring_drops_total: AtomicU64,
     /// T1(a) diag: `ERR_SITE_*` of the first fatal error this
     /// session (0 = none). First-error-wins; cleared by the venue
     /// loop via [`Self::take_last_err`] (same thread as the writer).
@@ -239,6 +242,7 @@ impl IngressStatus {
             sub_drops_total: AtomicU64::new(0),
             event_ring_drops_total: AtomicU64::new(0),
             depth_ring_drops_total: AtomicU64::new(0),
+            opt_ring_drops_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
             last_err_venue_code: AtomicU32::new(0),
@@ -326,6 +330,13 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_depth_ring_drops(&self) {
         self.depth_ring_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one options-summary lane push refused by a full ring
+    /// (VM2 V2).
+    #[inline(always)]
+    pub fn inc_opt_ring_drops(&self) {
+        self.opt_ring_drops_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// T1(a): record the venue's numeric error code for the current
@@ -428,6 +439,13 @@ impl IngressStatus {
     #[inline]
     pub fn depth_ring_drops_total(&self) -> u64 {
         self.depth_ring_drops_total.load(Ordering::Relaxed)
+    }
+
+    /// Total options-summary lane pushes refused by a full ring
+    /// (VM2 V2).
+    #[inline(always)]
+    pub fn opt_ring_drops_total(&self) -> u64 {
+        self.opt_ring_drops_total.load(Ordering::Relaxed)
     }
 
     /// T1(a): read AND clear the session-error triple. Called by the

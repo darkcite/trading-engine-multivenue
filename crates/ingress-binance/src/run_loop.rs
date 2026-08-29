@@ -41,7 +41,7 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Capture, NsTs, OptSummary, Price, Qty, SymbolId, Tick, EVENT_RING_SIZE};
+use core_types::{Capture, NsTs, OptSummary, Price, Qty, SymbolId, Tick, EVENT_RING_SIZE, OPT_RING_SIZE};
 
 use crate::parse_book_ticker;
 
@@ -330,6 +330,7 @@ pub fn drive_one<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<core_types::ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &core_metrics::IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -350,7 +351,7 @@ pub fn drive_one<T: Transport, C: Capture>(
             advance_ws_upgrade(drv, status)?;
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, event_tx, event_mask, status, capture)?;
+            drain_ws_frames(drv, producer, event_tx, event_mask, opt_tx, status, capture)?;
         }
         State::Closed => {}
     }
@@ -467,6 +468,7 @@ fn drain_ws_frames<C: Capture>(
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<core_types::ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &core_metrics::IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -499,6 +501,7 @@ fn drain_ws_frames<C: Capture>(
                             producer,
                             event_tx,
                             event_mask,
+                            opt_tx,
                             status,
                             capture,
                         );
@@ -571,6 +574,7 @@ fn handle_eapi_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &core_metrics::IngressStatus,
     capture: &mut C,
 ) {
@@ -645,8 +649,12 @@ fn handle_eapi_frame<C: Capture>(
             capture.parse_reject(now_ns(), &drv.rx.filled()[payload_range]);
         }
         EapiAction::Ticker { tick, summary } => {
-            // §6.5: capture before the push; the summary never rings.
+            // §6.5: capture first. VM2 V2: the summary now ALSO rides
+            // the opt lane (the kind-6 channel's engine entry).
             capture.opt_summary(&summary);
+            if opt_tx.try_push(summary).is_err() {
+                status.inc_opt_ring_drops();
+            }
             if let Some(t) = tick {
                 capture.tick(&t);
                 if producer.try_push(t).is_err() {
@@ -729,12 +737,13 @@ fn handle_text_frame<C: Capture>(
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<core_types::ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &core_metrics::IngressStatus,
     capture: &mut C,
 ) {
     // M2.4/WS5: per-slot lane dispatch (monomorphic).
     if matches!(drv.lane, StreamLane::Eapi(_)) {
-        return handle_eapi_frame(drv, payload_range, producer, status, capture);
+        return handle_eapi_frame(drv, payload_range, producer, opt_tx, status, capture);
     }
     if matches!(drv.lane, StreamLane::MarkPrice) {
         return handle_mark_price_frame(drv, payload_range, event_tx, event_mask, status, capture);
@@ -800,6 +809,7 @@ pub fn run<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<core_types::ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -843,7 +853,8 @@ pub fn run<T: Transport, C: Capture>(
             let n_before = producer.len();
             let state_before = drv.state();
             if drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, status, capture,
+                transport, drv, host, path, producer, event_tx, event_mask, opt_tx, status,
+                capture,
             )
             .is_err()
             {
@@ -996,6 +1007,7 @@ pub fn run_multi<T: Transport, C: Capture>(
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<core_types::ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     stop: &StopFlag,
@@ -1068,8 +1080,8 @@ pub fn run_multi<T: Transport, C: Capture>(
                 let n_before = producer.len();
                 let state_before = c.drv.state();
                 if drive_one(
-                    t, &mut c.drv, &c.host, &c.path, producer, event_tx, event_mask, status,
-                    capture,
+                    t, &mut c.drv, &c.host, &c.path, producer, event_tx, event_mask, opt_tx,
+                    status, capture,
                 )
                 .is_err()
                 {
@@ -1167,6 +1179,13 @@ mod tests {
         Ring::<core_types::ChannelEvent, EVENT_RING_SIZE>::new().split()
     }
 
+    fn opt_ring_pair() -> (
+        Producer<OptSummary, OPT_RING_SIZE>,
+        core_ring::Consumer<OptSummary, OPT_RING_SIZE>,
+    ) {
+        Ring::<OptSummary, OPT_RING_SIZE>::new().split()
+    }
+
     /// WS10-A shim: legacy tests drive with a fresh throwaway event
     /// lane (mask = FUNDING; consumer dropped — pushes vanish). A
     /// local item shadows the glob-imported `super::drive_one`, so
@@ -1183,6 +1202,7 @@ mod tests {
         capture: &mut C,
     ) -> io::Result<()> {
         let (mut etx, _erx) = event_ring_pair();
+        let (mut otx, _orx) = opt_ring_pair();
         super::drive_one(
             transport,
             drv,
@@ -1191,6 +1211,7 @@ mod tests {
             producer,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut otx,
             status,
             capture,
         )
@@ -1213,6 +1234,7 @@ mod tests {
         capture: &mut C,
     ) -> RunResult {
         let (mut etx, _erx) = event_ring_pair();
+        let (mut otx, _orx) = opt_ring_pair();
         super::run(
             transport,
             drv,
@@ -1221,6 +1243,7 @@ mod tests {
             producer,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut otx,
             poll,
             events,
             token,
@@ -1470,6 +1493,7 @@ mod tests {
                 &mut prod,
                 &mut etx,
                 core_types::EVENT_LANE_FUNDING,
+                &mut opt_ring_pair().0,
                 &mut poll,
                 &mut events,
                 &stop,
@@ -1517,6 +1541,7 @@ mod tests {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut opt_ring_pair().0,
             &mut poll,
             &mut events,
             &stop,
@@ -1978,6 +2003,7 @@ mod tests {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut opt_ring_pair().0,
             &status,
             &mut cap,
         )
@@ -2004,6 +2030,7 @@ mod tests {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut opt_ring_pair().0,
             &status,
             &mut cap,
         )

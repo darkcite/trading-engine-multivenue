@@ -1076,6 +1076,22 @@ pub const fn event_lane_bit(ch: ChannelId) -> u16 {
 /// spawn-time mask, no new plumbing).
 pub const EVENT_LANE_FUNDING: u16 = event_lane_bit(ChannelId::Funding);
 
+/// VM2 V2: the AssetCtx lane bit — Hyperliquid's funding rides its
+/// `activeAssetCtx` events (`v0` = rate ×1e9; there is no HL Funding
+/// channel), so the HL ingress spawns with
+/// `EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX` and the vm feature
+/// engine treats HL AssetCtx events as funding samples.
+pub const EVENT_LANE_ASSET_CTX: u16 = event_lane_bit(ChannelId::AssetCtx);
+
+/// Capacity of every OptSummary SPSC lane (VM2 V2 — the kind-6
+/// channel enters the engine for the first time; capture-only
+/// before). OKX `opt-summary` pushes whole-family bursts (the capped
+/// E2/K8 chains ≈ 200 instruments per push) and Deribit option
+/// tickers run at 100 ms cadence, so 4096 slots (256 KiB/lane)
+/// absorbs a full burst with an order of magnitude of headroom.
+/// Power of two, like every `core-ring` capacity.
+pub const OPT_RING_SIZE: usize = 4096;
+
 /// `AiCmd::flags` bit 0: the ai-exec fair-table entry this command
 /// creates additionally expires when worker heartbeats go stale,
 /// not only when its own TTL lapses. Valid on `SetFairValue` /

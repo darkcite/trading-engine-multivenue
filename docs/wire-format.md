@@ -143,16 +143,23 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |     14 |     2 | _pad0         | `[u8; 2]`      | explicit, zeroed                        |
 |     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none. WS3 (2026-08-29) exception: HL AssetCtx rows (channel 5) carry `premium` ×1e9 BIT-CAST `i64`→`u64` here (the ctx has no venue seq; pre-WS3 rows are a constant 0 — the M4 hash128-in-px/qty packing precedent) |
 |     24 |     8 | venue_time_ms | `u64`          | venue timestamp ms; 0 where absent      |
-|     32 |     8 | v0            | `i64`          | channel-dependent (px ×1e6, counts, …). Funding rows (channel 3): rate ×1e9 on OKX **and** (WS3) Deribit — the Deribit perp ticker's `current_funding` now emits a paired Funding row (`v1` = 0: continuous funding, no next-funding time; OKX keeps `v1` = next-funding ms) |
-|     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …). Mark rows (channel 2): WS5 — Binance `@markPrice` rows carry the INDEX price ×1e6 here (OKX Mark rows keep 0); Funding rows: next-funding ms on OKX **and** Binance, 0 on Deribit |
+|     32 |     8 | v0            | `i64`          | channel-dependent (px ×1e6, counts, …). Funding rows (channel 3): rate ×1e9 on OKX **and** (WS3) Deribit — the Deribit perp ticker's `current_funding` now emits a paired Funding row (OKX keeps `v1` = next-funding ms) |
+|     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …). Mark rows (channel 2): WS5 — Binance `@markPrice` rows carry the INDEX price ×1e6 here (OKX Mark rows keep 0); Funding rows: next-funding ms on OKX **and** Binance; Deribit — VM2 V2 (was a constant 0): `funding_8h` ×1e9 from the same ticker frame, the SAME 8-hour rolling series the worker's REST lane samples hourly (`interest_8h`), so the vm's hourly deribit funding sample and `carry_signal`'s ÷8-law windows accumulate one series; 0 when the frame lacked the field (pre-V2 captures replay with the `current_funding` fallback). VM2 V2 lane note: Hyperliquid FUNDING rides its AssetCtx rows (channel 5, `v0` = rate ×1e9 — there is no HL Funding channel), so the HL ingress gained its venue-event lane with spawn mask `EVENT_LANE_FUNDING \| EVENT_LANE_ASSET_CTX` |
 |     48 |    16 | _pad1         | `[u8; 16]`     | explicit, zeroed                        |
 
-### `OptSummary` — 64 bytes (M2.3; PMLR `slot_kind = 6` only, never rings)
+### `OptSummary` — 64 bytes (M2.3; PMLR `slot_kind = 6` + VM2 V2 opt lanes)
 
 Options analytics record (mvp-plan §4-M2.3/§9.8): one record per venue
 push, appended by the owning ingress thread to its per-venue
-`<venue>-opt-summary.pmlr`. CAPTURE-ONLY — never enters the engine
-ring; consumers are offline (audit-replay, the strategist digest).
+`<venue>-opt-summary.pmlr`. Capture-only through M5; **VM2 V2: the
+record now ALSO rides a per-venue options-summary SPSC lane into the
+engine** (`Ring<OptSummary, OPT_RING_SIZE = 4096>`,
+`engine::opt_lane_of`: OKX 0, Deribit 1, Binance-eapi 2 — the BN lane
+exists venue-dark so the `.env` heal activates it with no engine
+change) → `Strategy::on_opt_summary` → the vm feature engine's
+mark/IV features. Capture stays FIRST at every emit site (§6.5
+capture-before-push law); full-ring pushes count
+`opt_ring_drops_total`. Offline consumers unchanged.
 Fed by Deribit option `ticker.{instr}.100ms` and OKX `opt-summary`
 (BN eapi joins at M2.4). Values are RAW VENUE UNITS fixed-point
 (Deribit option mark px is coin-denominated); IV is a FRACTION ×1e9

@@ -425,4 +425,35 @@ new venues.
   `LhsOnly(Bid) ≥ level`, `cross_deviation` →
   `|DiffBps(Mid,Mid)| ≥ edge` + side filter) — ONE evaluator path,
   no v1 branch. Alloc gate deferred to V2 (V1 links into no hot
-  path); pytest untouched (499 stands).
+  path); pytest untouched (499 stands). Committed `6ad3a86`.
+- 2026-08-29 — **V2 CODED (feature engine + engine plumbing;
+  workspace green).** `strategy_vm::features` = the §1.1 engine: ONE
+  boxed ~12 MiB zeroed-at-boot state (heap-direct — a stack
+  round-trip would overflow), per-sym latest values (open-addressed
+  1024 slots), per-(sym,window) rolling minute rings (256-entry
+  pool, ≤8 windows/sym, LAZY stats recompute once per minute per
+  entry — deterministic in replay), funding blocks (256 × 640
+  prints) with the per-venue SETTLED-print laws, mark/IV + depth
+  features, clock features over a VENUE-DERIVED wall offset (no
+  syscalls; replay-identical). Fed only through Strategy callbacks ⇒
+  V5 replay parity is structural. Engine side: OptSummary enters the
+  engine (kind 6's first ring) — `on_opt_summary` hook, 3 opt lanes
+  (`opt_lane_of` okx/deribit/bn — BN venue-dark, `.env`-heal-ready),
+  capture-before-push at all emit sites, `opt_ring_drops_total`.
+  Venue-truth work: deribit ticker parser gains `funding_8h`
+  (Funding `v1`, was 0 — the worker-REST-parity series; ÷8 law
+  applies to ONE series now); HL gained its venue-event lane
+  (funding rides AssetCtx; mask FUNDING|ASSET_CTX); OKX/Bybit/BN
+  use the next-funding-ADVANCE settled-print law. FundingSeed
+  consumed by the vm (same path as live events; dedup within half
+  the venue period). **A REAL BUG caught by the new proptest and
+  fixed pre-commit:** the rolling ring's advance-clearing cap
+  (`min(gap,w)−1`) left one stale slot on ring wrap — a phantom
+  sample resurfaced under sparse ticking; law corrected to
+  `min(gap−1, w)` cleared slots, red→green pinned by
+  `features_proptest::rolling_stats_match_naive`. Gates: workspace
+  nextest 1388/1388 + 2 proptests (roll-stats + funding-APR vs the
+  transcribed carry_signal law) · **release alloc 39/39** (new gate
+  39 = every feature ingest+read path 0 B/op, seeds/dedup/lazy
+  recomputes included) · license-check green. PositionSeed consume +
+  grammar eval = V3.

@@ -58,7 +58,9 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Capture, ChannelEvent, ChannelId, Price, Qty, Tick, VenueId};
+use core_types::{
+    Capture, ChannelEvent, ChannelId, EVENT_RING_SIZE, Price, Qty, Tick, VenueId,
+};
 
 use crate::{
     bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, parse_active_asset_ctx,
@@ -315,12 +317,15 @@ impl Driver {
 ///   and bumps `IngressStatus::ring_drops`.
 /// * `status`: per-ingress observability slot; this thread is its
 ///   single writer.
+#[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -340,7 +345,7 @@ pub fn drive_one<T: Transport, C: Capture>(
             }
         }
         State::Steady => {
-            drain_ws_frames(drv, producer, status, capture)?;
+            drain_ws_frames(drv, producer, event_tx, event_mask, status, capture)?;
         }
         State::Closed => {}
     }
@@ -587,6 +592,8 @@ enum Dispatch {
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -628,6 +635,8 @@ fn drain_ws_frames<C: Capture>(
                             drv,
                             payload.start..payload.end,
                             producer,
+                            event_tx,
+                            event_mask,
                             status,
                             capture,
                         )?;
@@ -736,6 +745,8 @@ fn handle_data_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
 ) -> io::Result<()> {
@@ -882,7 +893,7 @@ fn handle_data_frame<C: Capture>(
                                         // ctx has no venue seq — the
                                         // M4 hash128-in-px/qty
                                         // packing precedent).
-                                        capture.event(&ChannelEvent::new(
+                                        let ev = ChannelEvent::new(
                                             now_ns(),
                                             VenueId::Hyperliquid,
                                             ChannelId::AssetCtx,
@@ -891,7 +902,23 @@ fn handle_data_frame<C: Capture>(
                                             0,
                                             f.funding_1e9,
                                             f.oi_1e6,
-                                        ));
+                                        );
+                                        capture.event(&ev);
+                                        // VM2 V2: HL funding rides
+                                        // the ctx — onto the venue-
+                                        // event lane when the spawn
+                                        // mask carries the AssetCtx
+                                        // bit (capture stays first,
+                                        // §6.5 law).
+                                        if event_mask
+                                            & core_types::event_lane_bit(
+                                                ChannelId::AssetCtx,
+                                            )
+                                            != 0
+                                            && event_tx.try_push(ev).is_err()
+                                        {
+                                            status.inc_event_ring_drops();
+                                        }
                                         Dispatch::Slow
                                     }
                                     None => Dispatch::Nothing,
@@ -996,12 +1023,15 @@ pub type StopFlag = AtomicBool;
 /// [`RunResult::IdleTimeout`]. [`session_health`] then enforces the
 /// ack deadline and the §6.2 staleness budget.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
     host: &[u8],
     path: &[u8],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
     poll: &mut mio::Poll,
     events: &mut mio::Events,
     token: mio::Token,
@@ -1041,7 +1071,11 @@ pub fn run<T: Transport, C: Capture>(
         loop {
             let n_before = producer.len();
             let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
+            if drive_one(
+                transport, drv, host, path, producer, event_tx, event_mask, status, capture,
+            )
+            .is_err()
+            {
                 return RunResult::Error;
             }
             if drv.state() == State::Closed {
@@ -1128,6 +1162,78 @@ mod tests {
             test_coins(),
             crate::HL_STALENESS_BUDGET_NS,
             HL_SUB_ACK_BUDGET_NS,
+        )
+    }
+
+    fn event_ring_pair() -> (
+        Producer<ChannelEvent, EVENT_RING_SIZE>,
+        core_ring::Consumer<ChannelEvent, EVENT_RING_SIZE>,
+    ) {
+        Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split()
+    }
+
+    /// VM2 V2 shim (the WS10 shim pattern, first applied to this
+    /// venue now that HL gained an event lane): legacy tests drive
+    /// with a fresh throwaway event lane (mask = FUNDING|ASSET_CTX;
+    /// consumer dropped). A local item shadows the glob-imported
+    /// `super::drive_one`; the dedicated lane tests call
+    /// `super::drive_one` directly.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_one<T: Transport, C: Capture>(
+        transport: &mut T,
+        drv: &mut Driver,
+        host: &[u8],
+        path: &[u8],
+        producer: &mut Producer<Tick, TICK_RING_CAP>,
+        status: &IngressStatus,
+        capture: &mut C,
+    ) -> io::Result<()> {
+        let (mut etx, _erx) = event_ring_pair();
+        super::drive_one(
+            transport,
+            drv,
+            host,
+            path,
+            producer,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
+            status,
+            capture,
+        )
+    }
+
+    /// VM2 V2 shim for `run` — same rationale.
+    #[allow(clippy::too_many_arguments)]
+    fn run<T: Transport, C: Capture>(
+        transport: &mut T,
+        drv: &mut Driver,
+        host: &[u8],
+        path: &[u8],
+        producer: &mut Producer<Tick, TICK_RING_CAP>,
+        poll: &mut mio::Poll,
+        events: &mut mio::Events,
+        token: mio::Token,
+        stop: &StopFlag,
+        status: &IngressStatus,
+        keepalive: &mut Keepalive,
+        capture: &mut C,
+    ) -> RunResult {
+        let (mut etx, _erx) = event_ring_pair();
+        super::run(
+            transport,
+            drv,
+            host,
+            path,
+            producer,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
+            poll,
+            events,
+            token,
+            stop,
+            status,
+            keepalive,
+            capture,
         )
     }
 

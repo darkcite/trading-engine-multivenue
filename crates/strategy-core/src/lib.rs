@@ -30,7 +30,7 @@
 )]
 
 use core_time::NsTs;
-use core_types::{AiCmd, ChannelEvent, DepthTopK, Fill, Order, RuleTable, Signal, Tick};
+use core_types::{AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTable, Signal, Tick};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -349,6 +349,21 @@ pub trait Strategy: StrategyCounters {
         let _ = (depth, ctx);
     }
 
+    /// Called once per [`OptSummary`] popped from an options-summary
+    /// lane (VM2 V2 — the kind-6 channel's first engine-side
+    /// consumer; before v2 it was capture-only). Records carry raw
+    /// venue units (`mark_px_1e9` coin-denominated on Deribit) and
+    /// venue-optional fields flagged in `flags` — consumers must
+    /// honor the flag bits.
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged; `strategy-set` forwards it to enabled
+    /// members like `on_depth`. Monomorphized — no `dyn`.
+    #[inline]
+    fn on_opt_summary<C: Ctx>(&mut self, opt: &OptSummary, ctx: &mut C) {
+        let _ = (opt, ctx);
+    }
+
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C);
@@ -496,6 +511,38 @@ mod tests {
         s.on_start(&mut ctx).unwrap();
         let d = DepthTopK::EMPTY;
         s.on_depth(&d, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
+    }
+
+    #[test]
+    fn on_opt_summary_defaults_to_noop() {
+        // VM2 V2 default: a delivered options record touches neither
+        // strategy state nor the Ctx.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let o = OptSummary::new(
+            1,
+            core_types::VenueId::Deribit,
+            7,
+            0,
+            0,
+            650_000_000,
+            0,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        );
+        s.on_opt_summary(&o, &mut ctx);
         assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
         assert_eq!(ctx.submitted, 0, "default hook must not submit");
     }

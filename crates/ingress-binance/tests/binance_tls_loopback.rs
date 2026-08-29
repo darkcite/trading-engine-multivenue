@@ -24,6 +24,14 @@ fn event_lane() -> core_ring::Producer<core_types::ChannelEvent, { core_types::E
         .split()
         .0
 }
+
+/// VM2 V2: a throwaway options-summary lane per call (consumer
+/// dropped).
+fn opt_lane() -> core_ring::Producer<core_types::OptSummary, { core_types::OPT_RING_SIZE }> {
+    Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new()
+        .split()
+        .0
+}
 use ingress_binance::run_loop::{
     drive_one, note_transport_ready, Driver, State, DEFAULT_TICK_RING_CAP,
 };
@@ -194,6 +202,7 @@ fn binance_tls_loopback_yields_expected_tick() {
             &mut prod,
             &mut event_lane(),
             core_types::EVENT_LANE_FUNDING,
+            &mut opt_lane(),
             &status,
             &mut NullCapture,
         )

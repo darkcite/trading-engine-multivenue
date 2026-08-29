@@ -48,7 +48,8 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, Order, RuleTableSlot,
-    Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_LANE_FUNDING,
+    OptSummary, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
+    EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, OPT_RING_SIZE,
     EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use engine::{
@@ -282,6 +283,12 @@ pub struct Rings {
     /// depth-capable spawns; without a depth subscription the lane
     /// reads empty forever (§3.3).
     pub depth: [Arc<Ring<DepthTopK, DEPTH_RING_SIZE>>; engine::NUM_DEPTH_LANES],
+    /// VM2 V2: one options-summary ring per opt lane
+    /// (`engine::opt_lane_of` order: 0 = OKX, 1 = Deribit,
+    /// 2 = Binance eapi). Producers ride into the three
+    /// options-capable spawns; without an options subscription the
+    /// lane reads empty forever (§3.3).
+    pub opt: [Arc<Ring<OptSummary, OPT_RING_SIZE>>; engine::NUM_OPT_LANES],
 }
 
 impl Rings {
@@ -309,6 +316,7 @@ impl Rings {
                 Ring::new(),
             ],
             depth: [Ring::new(), Ring::new()],
+            opt: [Ring::new(), Ring::new(), Ring::new()],
         }
     }
 }
@@ -493,6 +501,7 @@ pub fn spawn_binance(
     sym: core_types::SymbolId,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -554,6 +563,7 @@ pub fn spawn_binance(
                     &mut producer,
                     &mut event_tx,
                     EVENT_LANE_FUNDING,
+                    &mut opt_tx,
                     &mut poll,
                     &mut events,
                     token,
@@ -621,6 +631,7 @@ pub fn spawn_binance_multi(
     tls_config: RustlsConfig,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -705,6 +716,7 @@ pub fn spawn_binance_multi(
                 &mut producer,
                 &mut event_tx,
                 EVENT_LANE_FUNDING,
+                &mut opt_tx,
                 &mut poll,
                 &mut events,
                 &SHUTDOWN,
@@ -984,6 +996,7 @@ pub fn spawn_okx(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
+    mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1049,6 +1062,7 @@ pub fn spawn_okx(
                     &mut event_tx,
                     EVENT_LANE_FUNDING,
                     &mut depth_tx,
+                    &mut opt_tx,
                     &mut poll,
                     &mut events,
                     token,
@@ -1254,6 +1268,7 @@ pub fn spawn_deribit(
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
+    mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1320,6 +1335,7 @@ pub fn spawn_deribit(
                     &mut event_tx,
                     EVENT_LANE_FUNDING,
                     &mut depth_tx,
+                    &mut opt_tx,
                     &mut poll,
                     &mut events,
                     token,
@@ -1419,6 +1435,7 @@ pub fn spawn_hyperliquid(
     tls_config: RustlsConfig,
     coins: ingress_hyperliquid::HlCoinTable,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1483,6 +1500,10 @@ pub fn spawn_hyperliquid(
                     ep.host.as_bytes(),
                     ep.path.as_bytes(),
                     &mut producer,
+                    &mut event_tx,
+                    // VM2 V2: HL funding rides AssetCtx — the lane
+                    // mask carries both bits (feature-engine law).
+                    EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX,
                     &mut poll,
                     &mut events,
                     token,
@@ -1939,6 +1960,8 @@ pub struct DrainCounters {
     pub venue_events: u64,
     /// WS10-B: depth snapshots observed (both depth lanes combined).
     pub depth_snaps: u64,
+    /// VM2 V2: options records observed (all opt lanes combined).
+    pub opt_records: u64,
 }
 
 impl DrainCounters {
@@ -1951,6 +1974,7 @@ impl DrainCounters {
         self.rpc_signals += other.rpc_signals;
         self.venue_events += other.venue_events;
         self.depth_snaps += other.depth_snaps;
+        self.opt_records += other.opt_records;
     }
 }
 
@@ -1964,6 +1988,9 @@ pub struct Consumers {
     pub event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; engine::NUM_EVENT_LANES],
     /// WS10-B: depth-lane consumers (`engine::depth_lane_of` order).
     pub depth_lanes: [Consumer<DepthTopK, DEPTH_RING_SIZE>; engine::NUM_DEPTH_LANES],
+    /// VM2 V2: options-summary lane consumers (`engine::opt_lane_of`
+    /// order).
+    pub opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; engine::NUM_OPT_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
@@ -2038,6 +2065,19 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
             for _ in 0..DRAIN_BATCH {
                 if cons.depth_lanes[lane].try_pop().is_some() {
                     period.depth_snaps += 1;
+                } else {
+                    break;
+                }
+            }
+            lane += 1;
+        }
+        // VM2 V2: same for the opt lanes (records are already in
+        // capture).
+        let mut lane = 0;
+        while lane < engine::NUM_OPT_LANES {
+            for _ in 0..DRAIN_BATCH {
+                if cons.opt_lanes[lane].try_pop().is_some() {
+                    period.opt_records += 1;
                 } else {
                     break;
                 }
@@ -3560,6 +3600,7 @@ where
         tick_lanes,
         event_lanes,
         depth_lanes,
+        opt_lanes,
         rpc_signal,
         fill_lanes,
         ai_cmds,
@@ -3573,6 +3614,7 @@ where
         tick_lanes,
         event_lanes,
         depth_lanes,
+        opt_lanes,
         rpc_signal,
         fill_lanes,
         ai_cmds,
@@ -5631,10 +5673,15 @@ mod tests {
             let mut it = rings.depth.iter().map(|r| r.clone().split().1);
             [it.next().unwrap(), it.next().unwrap()]
         };
+        let opt_lanes = {
+            let mut it = rings.opt.iter().map(|r| r.clone().split().1);
+            [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()]
+        };
         Consumers {
             tick_lanes,
             event_lanes,
             depth_lanes,
+            opt_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
@@ -5780,6 +5827,7 @@ mod tests {
             rpc_signals: 3,
             venue_events: 4,
             depth_snaps: 5,
+            opt_records: 6,
         };
         let b = DrainCounters {
             polymarket_ticks: 10,
@@ -5788,6 +5836,7 @@ mod tests {
             rpc_signals: 30,
             venue_events: 40,
             depth_snaps: 50,
+            opt_records: 60,
         };
         a.add(&b);
         assert_eq!(a.polymarket_ticks, 11);
@@ -5796,6 +5845,7 @@ mod tests {
         assert_eq!(a.rpc_signals, 33);
         assert_eq!(a.venue_events, 44);
         assert_eq!(a.depth_snaps, 55);
+        assert_eq!(a.opt_records, 66);
     }
 
     /// Drain loop must exit promptly when `SHUTDOWN` is set, and

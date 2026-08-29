@@ -35,6 +35,14 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{expected_accept, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::Ring;
 use core_types::{NullCapture, SymbolId, Tick, VenueId};
+
+/// VM2 V2: a throwaway venue-event lane per `run` call (consumer
+/// dropped).
+fn event_lane() -> core_ring::Producer<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }> {
+    Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new()
+        .split()
+        .0
+}
 use ingress_hyperliquid::run_loop::{run, Driver, RunResult, StopFlag, TICK_RING_CAP};
 use ingress_hyperliquid::{HlCoinTable, PING_PAYLOAD};
 
@@ -352,6 +360,8 @@ fn happy_path_hip4_coin_roundtrip() {
         b"localhost",
         b"/ws",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
         &mut poll,
         &mut events,
         token,
@@ -483,6 +493,8 @@ fn staleness_trips_reconnect() {
         b"localhost",
         b"/ws",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
         &mut poll,
         &mut events,
         token,
@@ -582,6 +594,8 @@ fn ping_emitted_then_idle_timeout() {
         b"localhost",
         b"/ws",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
         &mut poll,
         &mut events,
         token,
@@ -662,6 +676,8 @@ fn missed_acks_fail_session() {
         b"localhost",
         b"/ws",
         &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
         &mut poll,
         &mut events,
         token,

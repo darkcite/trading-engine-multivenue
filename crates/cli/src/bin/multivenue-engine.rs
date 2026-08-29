@@ -1021,7 +1021,8 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
     let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
-    let (_hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
+    // VM2 V2: HL gained its event lane — funding rides AssetCtx.
+    let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
     let event_lane_cons = [
         pm_event_cons,
         bn_event_cons,
@@ -1035,6 +1036,13 @@ fn run(args: RunArgs) -> ExitCode {
     let (okx_depth_prod, okx_depth_cons) = rings.depth[0].clone().split();
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
     let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
+    // VM2 V2: options-summary lanes (engine::opt_lane_of order —
+    // okx 0, deribit 1, binance 2). Producers ride into the three
+    // options-capable spawns.
+    let (okx_opt_prod, okx_opt_cons) = rings.opt[0].clone().split();
+    let (deribit_opt_prod, deribit_opt_cons) = rings.opt[1].clone().split();
+    let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
+    let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let fill_lane_cons = {
         let (_f0p, f0) = rings.fill[0].clone().split();
@@ -1284,6 +1292,7 @@ fn run(args: RunArgs) -> ExitCode {
             tls_config.clone(),
             bn_prod,
             bn_event_prod,
+            bn_opt_prod,
             statuses.binance.clone(),
             2,
             &run_dir,
@@ -1314,6 +1323,7 @@ fn run(args: RunArgs) -> ExitCode {
             boot.allocated.bn_spot[0].sym,
             bn_prod,
             bn_event_prod,
+            bn_opt_prod,
             statuses.binance.clone(),
             2,
             &run_dir,
@@ -1348,6 +1358,7 @@ fn run(args: RunArgs) -> ExitCode {
             okx_prod,
             okx_event_prod,
             okx_depth_prod,
+            okx_opt_prod,
             statuses.okx.clone(),
             5,
             &run_dir,
@@ -1370,6 +1381,7 @@ fn run(args: RunArgs) -> ExitCode {
         drop(okx_prod);
         drop(okx_event_prod);
         drop(okx_depth_prod);
+        drop(okx_opt_prod);
     }
 
     // Deribit rides core 6 per the §9 core map.
@@ -1400,6 +1412,7 @@ fn run(args: RunArgs) -> ExitCode {
             deribit_prod,
             deribit_event_prod,
             deribit_depth_prod,
+            deribit_opt_prod,
             statuses.deribit.clone(),
             6,
             &run_dir,
@@ -1422,6 +1435,7 @@ fn run(args: RunArgs) -> ExitCode {
         drop(deribit_prod);
         drop(deribit_event_prod);
         drop(deribit_depth_prod);
+        drop(deribit_opt_prod);
     }
 
     // Hyperliquid rides core 7 per the §9 core map.
@@ -1435,6 +1449,7 @@ fn run(args: RunArgs) -> ExitCode {
             tls_config.clone(),
             hl_coins,
             hl_prod,
+            hl_event_prod,
             statuses.hyperliquid.clone(),
             7,
             &run_dir,
@@ -1455,6 +1470,7 @@ fn run(args: RunArgs) -> ExitCode {
         // Drop the producer side so the lane stays a permanently-
         // empty ring (the unspawned-venue shape, §3.3).
         drop(hl_prod);
+        drop(hl_event_prod);
     }
 
     // WS9: Bybit — spot + linear connection slots on ONE thread
@@ -1645,6 +1661,7 @@ fn run(args: RunArgs) -> ExitCode {
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,
+        opt_lanes: opt_lane_cons,
         rpc_signal: rpc_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,

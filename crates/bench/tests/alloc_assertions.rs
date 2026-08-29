@@ -394,6 +394,10 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     bwl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
     // the measurement window.
+    // VM2 V2: hoisted throwaway opt lane — created OUTSIDE the
+    // AllocGuard window (Ring::new allocates).
+    let (mut otx, _orx) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let status = core_metrics::IngressStatus::new();
 
     let ring: std::sync::Arc<Ring<Tick, { bwl::DEFAULT_TICK_RING_CAP }>> = Ring::new();
@@ -434,6 +438,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -466,6 +471,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         &mut prod,
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -497,6 +503,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
             &mut prod,
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
+            &mut otx,
             &status,
             &mut capture,
         )
@@ -1311,6 +1318,14 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (mut d0_p, d0) =
         Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    // VM2 V2: opt lanes (producer-dropped — empty-lane steady cost is
+    // part of the measured window, the §3.3 shape).
+    let (_o0p, o0) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o1p, o1) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o2p, o2) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -1334,6 +1349,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         [t0, t1, t2, t3, t4, t5],
         [e0, e1, e2, e3, e4, e5],
         [d0, d1],
+        [o0, o1, o2],
         sc,
         [f0, f1, f2, f3],
         ai_c,
@@ -1542,6 +1558,10 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     owl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
     // the measurement window.
+    // VM2 V2: hoisted throwaway opt lane — created OUTSIDE the
+    // AllocGuard window (Ring::new allocates).
+    let (mut otx, _orx) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let status = core_metrics::IngressStatus::new();
 
     let ring: std::sync::Arc<Ring<Tick, { owl::TICK_RING_CAP }>> = Ring::new();
@@ -1583,6 +1603,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
         &mut dtx,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -1616,6 +1637,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
         &mut dtx,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -1684,6 +1706,7 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut dtx,
+            &mut otx,
             &status,
             &mut capture,
         )
@@ -1864,6 +1887,10 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     dwl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
     // the measurement window.
+    // VM2 V2: hoisted throwaway opt lane — created OUTSIDE the
+    // AllocGuard window (Ring::new allocates).
+    let (mut otx, _orx) =
+        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let status = core_metrics::IngressStatus::new();
 
     let ring: std::sync::Arc<Ring<Tick, { dwl::TICK_RING_CAP }>> = Ring::new();
@@ -1905,6 +1932,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
         &mut dtx,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -1938,6 +1966,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
         &mut dtx,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -1977,6 +2006,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         &mut etx,
         core_types::EVENT_LANE_FUNDING,
         &mut dtx,
+        &mut otx,
         &status,
         &mut capture,
     )
@@ -2043,6 +2073,7 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
             &mut etx,
             core_types::EVENT_LANE_FUNDING,
             &mut dtx,
+            &mut otx,
             &status,
             &mut capture,
         )
@@ -2178,6 +2209,9 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
     // Health telemetry sink — relaxed atomics only; built outside
     // the measurement window.
+    // VM2 V2: hoisted throwaway HL event lane (same rationale).
+    let (mut hl_etx, _herx) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let status = core_metrics::IngressStatus::new();
 
     let ring: std::sync::Arc<Ring<Tick, { hwl::TICK_RING_CAP }>> = Ring::new();
@@ -2207,6 +2241,8 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut hl_etx,
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
         &status,
         &mut capture,
     )
@@ -2237,6 +2273,8 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut hl_etx,
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
         &status,
         &mut capture,
     )
@@ -2320,6 +2358,8 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
             b"h",
             b"/",
             &mut prod,
+            &mut hl_etx,
+            core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
             &status,
             &mut capture,
         )
@@ -3428,4 +3468,233 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
         "vm on_tick steady state allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "vm on_tick bytes should be zero: saw {bytes}");
+}
+
+#[test]
+fn vm_feature_engine_paths_are_zero_alloc() {
+    // VM2 V2 gate (39): every feature-engine ingest + read path is
+    // 0 B/op after boot — wall-live tick minute-sampling, the
+    // per-venue funding print laws (advance + hourly sample), seed
+    // dedup, depth derivation, opt-summary latch, and every FeatId
+    // read (lazy rolling recompute + APR recompute included).
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_vm::VmStrategy;
+
+    struct SinkCtx {
+        now: u64,
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, _o: core_types::Order) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn now_ns(&self) -> core_time::NsTs {
+            self.now
+        }
+    }
+
+    const MONO0: u64 = 100_000_000_000_000_000;
+    const WALL0: u64 = 1_787_961_600_000; // a UTC midnight, ms
+
+    let okx_sym = core_types::make_symbol_id(VenueId::Okx, 11);
+    let dbt_sym = core_types::make_symbol_id(VenueId::Deribit, 12);
+    let hl_sym = core_types::make_symbol_id(VenueId::Hyperliquid, 13);
+    let bn_sym = core_types::make_symbol_id(VenueId::Binance, 14);
+
+    let mut vm: Box<VmStrategy<512>> = Box::new(VmStrategy::new());
+    let mut ctx = SinkCtx { now: MONO0 };
+    vm.on_start(&mut ctx).unwrap();
+
+    // Boot-time roll bindings (table-commit-time in production).
+    assert!(vm.feats.bind_roll(okx_sym, 10));
+    assert!(vm.feats.bind_roll(okx_sym, 60));
+
+    let mono_at = |wall_ms: u64| MONO0 + (wall_ms - WALL0) * 1_000_000;
+
+    let mk_tick = |sym: u32, px: i64, seq: u32, ts: u64| {
+        Tick::new(
+            ts,
+            VenueId::Okx,
+            sym,
+            seq,
+            Price::from_raw(px - 5_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(px + 5_000),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let funding_ev = |sym: u32, wall: u64, rate: i64, next_ms: i64, venue: VenueId| {
+        core_types::ChannelEvent::new(
+            mono_at(wall),
+            venue,
+            core_types::ChannelId::Funding,
+            sym,
+            0,
+            wall,
+            rate,
+            next_ms,
+        )
+    };
+    let ctx_ev = |sym: u32, rate: i64| {
+        core_types::ChannelEvent::new(
+            0,
+            VenueId::Hyperliquid,
+            core_types::ChannelId::AssetCtx,
+            sym,
+            0,
+            0,
+            rate,
+            5,
+        )
+    };
+    let mk_depth = |sym: u32, ts: u64| {
+        let mut bids = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        let mut asks = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+        bids[0] = core_types::DepthLevel {
+            px_1e6: 100_000_000,
+            qty_1e6: 3_000_000,
+        };
+        asks[0] = core_types::DepthLevel {
+            px_1e6: 100_500_000,
+            qty_1e6: 1_000_000,
+        };
+        core_types::DepthTopK::new(ts, VenueId::Okx, sym, 0, bids, asks)
+    };
+    let mk_opt = |sym: u32, ts: u64| {
+        core_types::OptSummary::new(
+            ts,
+            VenueId::Deribit,
+            sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            41_500_000,
+            700_000_000,
+            65_000_000_000_000,
+            0,
+            -400_000_000,
+            2,
+            3,
+            -5,
+        )
+    };
+    let seed_cmd = |sym: u32, ts_ms: i64, rate: i64| {
+        core_types::AiCmd::new(
+            1,
+            1,
+            sym,
+            rate,
+            ts_ms,
+            0,
+            core_types::AiCmdKind::FundingSeed,
+            VenueId::Ai,
+            core_types::STRATEGY_SLOT_VM,
+            core_types::AI_SIDE_NONE,
+            0,
+            0,
+        )
+    };
+
+    // Prewarm: teach the wall, claim every slot, exercise every
+    // branch (block claims allocate NOTHING — pools are inside the
+    // boot Box — but the first pass exists to mirror the storm).
+    let all_feats = [
+        core_types::FeatId::Mid,
+        core_types::FeatId::Bid,
+        core_types::FeatId::Ask,
+        core_types::FeatId::RollMean,
+        core_types::FeatId::RollEma,
+        core_types::FeatId::RollMin,
+        core_types::FeatId::RollMax,
+        core_types::FeatId::RollStd,
+        core_types::FeatId::Apr24,
+        core_types::FeatId::Apr72,
+        core_types::FeatId::MarkPx,
+        core_types::FeatId::MarkIv,
+        core_types::FeatId::DepthImb,
+        core_types::FeatId::DepthSpreadBps,
+        core_types::FeatId::DepthNearNotional,
+        core_types::FeatId::ClockToFunding,
+        core_types::FeatId::ClockUtcSod,
+    ];
+    let mut pass = 0u64;
+    let mut run_storm = |vm: &mut Box<VmStrategy<512>>, ctx: &mut SinkCtx, iters: u64| {
+        let mut k = 0u64;
+        while k < iters {
+            let wall = WALL0 + pass * 60_000; // one minute per pass
+            let now = mono_at(wall);
+            ctx.now = now;
+            // Ticks (minute sampling on okx_sym's two bound rings).
+            let mut t = mk_tick(okx_sym, 100_000_000 + pass as i64, pass as u32 + 1, now);
+            t.ts_ns = now;
+            vm.on_tick(&t, ctx);
+            // OKX advance law: next-funding steps forward every 3
+            // passes ⇒ settled prints keep recording.
+            vm.on_venue_event(
+                &funding_ev(
+                    okx_sym,
+                    wall,
+                    100_000_000 + pass as i64,
+                    (WALL0 + ((pass / 3) + 1) * 8 * 3_600_000) as i64,
+                    VenueId::Okx,
+                ),
+                ctx,
+            );
+            // Deribit hourly sample (v1 = funding_8h).
+            vm.on_venue_event(
+                &funding_ev(dbt_sym, wall, 7_000_000, 16_000_000, VenueId::Deribit),
+                ctx,
+            );
+            // HL ctx sample (wall-hour law).
+            vm.on_venue_event(&ctx_ev(hl_sym, 12_500), ctx);
+            // Seeds: alternating fresh/duplicate (dedup scan path).
+            let seed_ts = (WALL0 as i64) - 8 * 3_600_000 * ((pass as i64 % 4) + 1);
+            vm.on_ai(&seed_cmd(bn_sym, seed_ts, 50_000_000), ctx);
+            // Depth + opt.
+            vm.on_depth(&mk_depth(okx_sym, now), ctx);
+            vm.on_opt_summary(&mk_opt(dbt_sym, now), ctx);
+            // Reads: every feature on its natural sym.
+            let mut f = 0;
+            while f < all_feats.len() {
+                let feat = all_feats[f];
+                let sym = if feat.requires_opt_summary() {
+                    dbt_sym
+                } else if feat == core_types::FeatId::Apr24
+                    || feat == core_types::FeatId::Apr72
+                {
+                    bn_sym
+                } else {
+                    okx_sym
+                };
+                let win = if feat.requires_window() {
+                    if f % 2 == 0 {
+                        10
+                    } else {
+                        60
+                    }
+                } else {
+                    0
+                };
+                std::hint::black_box(vm.feats.read(feat, sym, win, now));
+                f += 1;
+            }
+            pass += 1;
+            k += 1;
+        }
+    };
+
+    run_storm(&mut vm, &mut ctx, 200);
+    assert!(vm.feats.prints_recorded > 0, "prewarm recorded prints");
+    assert!(vm.feats.seeds_deduped > 0, "prewarm hit the dedup path");
+    assert_eq!(vm.feats.sym_slots_exhausted, 0);
+
+    let g = AllocGuard::new();
+    run_storm(&mut vm, &mut ctx, 2_000);
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(
+        vm.feats.prints_recorded >= 200,
+        "storm kept recording prints"
+    );
+    assert_eq!(
+        allocs, 0,
+        "feature-engine steady state allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "feature-engine bytes should be zero: saw {bytes}");
 }

@@ -30,6 +30,57 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-29 — VM2 V2: feature engine, OptSummary engine lanes, Deribit Funding `v1` = funding_8h, HL event lane
+
+**What changed**
+
+- `strategy-vm` gains the feature engine (`strategy_vm::features`,
+  vm2-plan §1.1): ONE boxed ~12 MiB zeroed-at-boot state holding
+  per-sym latest values, per-(sym, window) rolling minute rings
+  (lazy-recompute stats), funding-print rings with the per-venue
+  settled-print laws, mark/IV and depth-derived features, and the
+  venue-derived wall-clock offset. Fed exclusively through the vm's
+  `Strategy` callbacks — the backtest replays the same records
+  through the same code (§1.5 parity). Zero alloc after boot
+  (release gate 39, `vm_feature_engine_paths_are_zero_alloc`).
+- OptSummary (kind 6) enters the engine for the first time:
+  `Strategy::on_opt_summary` (defaulted), three opt lanes
+  (`OPT_RING_SIZE` 4096; `engine::opt_lane_of` okx/deribit/bn — the
+  BN lane venue-dark until the eapi heal), pushes at every venue
+  emit site AFTER capture (§6.5 law), `opt_ring_drops_total` per
+  ingress. Capture files unchanged.
+- Deribit Funding events: `v1` now carries `funding_8h` ×1e9 (was a
+  constant 0) — additive; the parser gained the optional field
+  (ticker scratch frame grew to 128 B, in-process only). Pre-V2
+  captures replay via the `current_funding` (`v0`) fallback.
+- Hyperliquid gained its venue-event lane (it had none): funding
+  rides AssetCtx rows, spawn mask
+  `EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX`.
+- `AiCmdKind::FundingSeed` is consumed: the vm folds seeds into the
+  same funding windows live events feed (dedup within half the
+  venue print period).
+
+**Why**
+
+- vm2-plan §4-V2: every §1.1 feature must evaluate engine-side (and
+  identically in replay) before the V3 grammar evaluator lands.
+
+**Impact**
+
+- On-disk formats: none (no capture layout changed; deribit Funding
+  `v1` is a value-semantics addition inside an existing field).
+- Config keys: none.
+- Wire formats: docs/wire-format.md — OptSummary lane note, Funding
+  `v1` note, HL AssetCtx lane note.
+
+**Migration steps**
+
+1. None — replay of old captures works (fallbacks documented).
+
+**Rollback**
+
+- Revert the commit; no persisted state depends on the new lanes.
+
 ## 2026-08-29 — VM2 V1: RuleRowV2/RuleTableV2 (table version 2), AiCmd kinds 10–11 (vm2-plan D-1…D-8)
 
 **What changed**
