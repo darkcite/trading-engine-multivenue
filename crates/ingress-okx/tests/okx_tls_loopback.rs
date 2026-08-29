@@ -43,11 +43,10 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .expect("private key DER");
+    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
 }
 
@@ -375,9 +374,15 @@ fn okx_tls_loopback_books_gap_triggers_resubscribe() {
     assert_eq!(status.gaps_total(), 1);
     assert_eq!(status.resubscribes_total(), 1);
     assert!(contains(&unsub, br#""op":"unsubscribe""#));
-    assert!(contains(&unsub, br#"{"channel":"books","instId":"BTC-USDT"}"#));
+    assert!(contains(
+        &unsub,
+        br#"{"channel":"books","instId":"BTC-USDT"}"#
+    ));
     assert!(contains(&resub, br#""op":"subscribe""#));
-    assert!(contains(&resub, br#"{"channel":"books","instId":"BTC-USDT"}"#));
+    assert!(contains(
+        &resub,
+        br#"{"channel":"books","instId":"BTC-USDT"}"#
+    ));
     // Ack + snapshot + update all counted; nothing rejected.
     assert_eq!(status.msgs_total(), 3);
     assert_eq!(status.parse_errors_total(), 0);

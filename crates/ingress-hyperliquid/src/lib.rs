@@ -335,10 +335,15 @@ pub struct HlAssetCtxFrame {
     pub oracle_px_1e6: i64,
     /// Open interest ×1e6 (base-coin units).
     pub oi_1e6: i64,
+    /// WS3 (gaps §2.5): `premium` ×1e9 (signed — the mark-vs-oracle
+    /// basis fraction; same 1e9 scaling as funding). 0 when the wire
+    /// omits the field (optional: perp ctxs carry it today; the ctx
+    /// shape drifts — pitfall 11).
+    pub premium_1e9: i64,
     /// Resolved symbol.
     pub sym: SymbolId,
     // Explicit tail padding.
-    _pad: [u8; 28],
+    _pad: [u8; 20],
 }
 
 /// HIP-4 lifecycle event kinds (`outcomeMetaUpdates`).
@@ -538,9 +543,10 @@ pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<HlTradeFrame> {
     })
 }
 
-/// Parse an `activeAssetCtx` push into an [`HlAssetCtxFrame`]. All
-/// four fields are required — a ctx without them is malformed for
-/// the perp coins we subscribe.
+/// Parse an `activeAssetCtx` push into an [`HlAssetCtxFrame`]. The
+/// four original fields are required — a ctx without them is
+/// malformed for the perp coins we subscribe. `premium` (WS3) is
+/// optional: absent ⇒ 0.
 #[inline]
 pub fn parse_active_asset_ctx(payload: &[u8], sym: SymbolId) -> Option<HlAssetCtxFrame> {
     let pos = find_field(payload, b"\"funding\":")?;
@@ -555,13 +561,23 @@ pub fn parse_active_asset_ctx(payload: &[u8], sym: SymbolId) -> Option<HlAssetCt
     let pos = find_field(payload, b"\"openInterest\":")?;
     let pos = skip_byte(payload, pos, b'"');
     let (oi_1e6, _) = scan_price_1e6(payload, pos)?;
+    // WS3: `premium` — optional, quoted like the other ctx numbers.
+    let premium_1e9 = match find_field(payload, b"\"premium\":") {
+        Some(pos) => {
+            let pos = skip_byte(payload, pos, b'"');
+            let (v, _) = scan_price_1e9(payload, pos)?;
+            v
+        }
+        None => 0,
+    };
     Some(HlAssetCtxFrame {
         funding_1e9,
         mark_px_1e6,
         oracle_px_1e6,
         oi_1e6,
+        premium_1e9,
         sym,
-        _pad: [0; 28],
+        _pad: [0; 20],
     })
 }
 
@@ -624,9 +640,7 @@ pub fn parse_outcome_meta(payload: &[u8]) -> Option<HlOutcomeMetaFrame> {
 /// or names no known channel — caller treats that as quiet/reject.
 #[inline]
 pub fn parse_sub_response(payload: &[u8]) -> Option<(HlChannel, Option<&[u8]>)> {
-    if memchr::memmem::find(payload, b"\"method\":\"subscribe\"").is_none() {
-        return None;
-    }
+    memchr::memmem::find(payload, b"\"method\":\"subscribe\"")?;
     let pos = find_field(payload, b"\"type\":")?;
     let pos = skip_byte(payload, pos, b'"');
     let rest = payload.get(pos..)?;
@@ -943,7 +957,11 @@ pub fn write_subscribe(dst: &mut [u8], channel: HlChannel, coin: Option<&[u8]>) 
         return None;
     }
     let mut n = 0;
-    n = push_bytes(dst, n, b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"")?;
+    n = push_bytes(
+        dst,
+        n,
+        b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"",
+    )?;
     n = push_bytes(dst, n, channel.wire_name())?;
     if let Some(c) = coin {
         n = push_bytes(dst, n, b"\",\"coin\":\"")?;
@@ -990,7 +1008,8 @@ mod tests {
         br#"{"channel":"allMids","data":{"mids":{"BTC":"29792.0","ETH":"1891.4","SOL":"25.1"}}}"#;
     const SUBRESP_BBO: &[u8] = br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#;
     const SUBRESP_ALLMIDS: &[u8] = br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"allMids"}}}"#;
-    const ERR: &[u8] = br#"{"channel":"error","data":"Already subscribed: {\"type\":\"bbo\",\"coin\":\"BTC\"}"}"#;
+    const ERR: &[u8] =
+        br#"{"channel":"error","data":"Already subscribed: {\"type\":\"bbo\",\"coin\":\"BTC\"}"}"#;
     const PONG: &[u8] = br#"{"channel":"pong"}"#;
     const OUTCOME: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"kind":"outcomeCreated","coin":"#330","time":1723600000000}]}"##;
 
@@ -1006,7 +1025,10 @@ mod tests {
         assert_eq!(classify(TRADES), HlMsgKind::Data(HlChannel::Trades));
         assert_eq!(classify(CTX), HlMsgKind::Data(HlChannel::ActiveAssetCtx));
         assert_eq!(classify(ALLMIDS), HlMsgKind::Data(HlChannel::AllMids));
-        assert_eq!(classify(OUTCOME), HlMsgKind::Data(HlChannel::OutcomeMetaUpdates));
+        assert_eq!(
+            classify(OUTCOME),
+            HlMsgKind::Data(HlChannel::OutcomeMetaUpdates)
+        );
         assert_eq!(classify(b"{\"nonsense\":true}"), HlMsgKind::Unknown);
     }
 
@@ -1029,7 +1051,10 @@ mod tests {
     #[test]
     fn asset_ctx_gating_skips_outcome_and_spot_coins() {
         assert!(coin_wants_asset_ctx(b"BTC"));
-        assert!(coin_wants_asset_ctx(b"test:ABC"), "HIP-3 dex coins are perps");
+        assert!(
+            coin_wants_asset_ctx(b"test:ABC"),
+            "HIP-3 dex coins are perps"
+        );
         assert!(!coin_wants_asset_ctx(b"#330"));
         assert!(!coin_wants_asset_ctx(b"@1"));
     }
@@ -1119,14 +1144,28 @@ mod tests {
         assert_eq!(f.mark_px_1e6, 14_316_100);
         assert_eq!(f.oracle_px_1e6, 14_320_000);
         assert_eq!(f.oi_1e6, 688_110_000);
+        // WS3: `premium` ×1e9 ("0.00031774" — the fixture value).
+        assert_eq!(f.premium_1e9, 317_740);
     }
 
     #[test]
     fn parse_ctx_negative_funding_and_rejects_missing() {
         let neg = br#"{"ctx":{"funding":"-0.0000125","markPx":"1.0","oraclePx":"1.0","openInterest":"2.0"}}"#;
-        assert_eq!(parse_active_asset_ctx(neg, 0).unwrap().funding_1e9, -12_500);
+        let f = parse_active_asset_ctx(neg, 0).unwrap();
+        assert_eq!(f.funding_1e9, -12_500);
+        assert_eq!(f.premium_1e9, 0, "absent premium parses as 0 (optional)");
         let missing = br#"{"ctx":{"funding":"0.0000125","markPx":"1.0"}}"#;
         assert!(parse_active_asset_ctx(missing, 0).is_none());
+    }
+
+    #[test]
+    fn parse_ctx_negative_premium() {
+        // WS3: a discount (mark below oracle) is a signed premium.
+        let neg = br#"{"ctx":{"funding":"0.0000125","markPx":"1.0","oraclePx":"1.0","openInterest":"2.0","premium":"-0.00031774"}}"#;
+        assert_eq!(
+            parse_active_asset_ctx(neg, 0).unwrap().premium_1e9,
+            -317_740
+        );
     }
 
     // ---- parse_all_mids ------------------------------------------
@@ -1134,7 +1173,10 @@ mod tests {
     #[test]
     fn parse_all_mids_counts_entries() {
         assert_eq!(parse_all_mids(ALLMIDS), Some(3));
-        assert_eq!(parse_all_mids(br#"{"channel":"allMids","data":{"mids":{}}}"#), Some(0));
+        assert_eq!(
+            parse_all_mids(br#"{"channel":"allMids","data":{"mids":{}}}"#),
+            Some(0)
+        );
         assert_eq!(parse_all_mids(b"{}"), None);
     }
 
@@ -1155,7 +1197,10 @@ mod tests {
 
     #[test]
     fn parse_outcome_meta_rejects_unknown_kind() {
-        assert!(parse_outcome_meta(br#"{"channel":"outcomeMetaUpdates","data":[{"kind":"other"}]}"#).is_none());
+        assert!(parse_outcome_meta(
+            br#"{"channel":"outcomeMetaUpdates","data":[{"kind":"other"}]}"#
+        )
+        .is_none());
     }
 
     // ---- parse_sub_response --------------------------------------
@@ -1166,7 +1211,10 @@ mod tests {
             parse_sub_response(SUBRESP_BBO),
             Some((HlChannel::Bbo, Some(&b"BTC"[..])))
         );
-        assert_eq!(parse_sub_response(SUBRESP_ALLMIDS), Some((HlChannel::AllMids, None)));
+        assert_eq!(
+            parse_sub_response(SUBRESP_ALLMIDS),
+            Some((HlChannel::AllMids, None))
+        );
         let hip4 = br##"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"#330"}}}"##;
         assert_eq!(
             parse_sub_response(hip4),
@@ -1206,7 +1254,10 @@ mod tests {
     fn coin_table_rejects_bad_input() {
         let mut t = HlCoinTable::new();
         assert_eq!(t.insert(b"", 1), Err(CoinTableErr::Empty));
-        assert_eq!(t.insert(&[b'A'; HL_COIN_MAX + 1], 1), Err(CoinTableErr::TooLong));
+        assert_eq!(
+            t.insert(&[b'A'; HL_COIN_MAX + 1], 1),
+            Err(CoinTableErr::TooLong)
+        );
         let mut i = 0u32;
         while (i as usize) < HL_MAX_COINS {
             t.insert(format!("C{i}").as_bytes(), i).unwrap();
@@ -1228,7 +1279,11 @@ mod tests {
         assert_ne!(m & bit_of(0, HlChannel::Trades), 0);
         assert_ne!(m & bit_of(0, HlChannel::ActiveAssetCtx), 0);
         assert_ne!(m & bit_of(1, HlChannel::Bbo), 0);
-        assert_eq!(m & bit_of(1, HlChannel::ActiveAssetCtx), 0, "outcome coin: no ctx");
+        assert_eq!(
+            m & bit_of(1, HlChannel::ActiveAssetCtx),
+            0,
+            "outcome coin: no ctx"
+        );
         assert_ne!(m & ALL_MIDS_BIT, 0);
         assert_ne!(m & OUTCOME_META_BIT, 0);
         // Exactly 4 + 3 + 2 bits set.
@@ -1287,7 +1342,8 @@ mod tests {
         let n = write_subscribe(&mut dst, HlChannel::L2Book, Some(b"#330")).unwrap();
         assert_eq!(
             &dst[..n],
-            br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#330"}}"## as &[u8]
+            br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#330"}}"##
+                as &[u8]
         );
     }
 

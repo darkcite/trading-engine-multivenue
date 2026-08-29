@@ -180,10 +180,20 @@ pub enum RunResult {
 /// What a Binance connection slot carries (M2.4). The venue's lanes
 /// share ONE thread + ONE tick producer (single-writer law); the lane
 /// tag drives per-slot parse dispatch — monomorphic match, no `dyn`.
+// Doctrine: the `Eapi` payload is deliberately inline — one slot per
+// connection, preallocated at boot; `Box` is forbidden (CLAUDE.md
+// zero-alloc rules), and the size delta buys pointer-chase-free access.
+#[allow(clippy::large_enum_variant)]
 pub enum StreamLane {
     /// `/ws/<symbol>@bookTicker` — the M1c spot/usdm lane (`sym`
     /// pinned on the driver).
     BookTicker,
+    /// WS5: `/ws/<symbol>@markPrice` — USDS-M mark/index/funding
+    /// stream (`sym` pinned on the driver, the bookTicker shape).
+    /// Capture-only: `ChannelId::Mark` + (perps) `ChannelId::Funding`
+    /// events; nothing reaches the engine ring until the WS10
+    /// funding carrier lands.
+    MarkPrice,
     /// M2.4 eapi combined options stream (`<sym>@ticker` × N +
     /// `<uly>@index`): BBO → `Tick`, mark/IV/greeks → `OptSummary`.
     Eapi(crate::eapi::EapiLane),
@@ -235,6 +245,15 @@ impl Driver {
             lane: StreamLane::BookTicker,
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// WS5: a `@markPrice` single-stream slot (USDS-M mark/index/
+    /// funding). Same sizing as bookTicker (~200 B frames at 1–3 s
+    /// cadence).
+    pub fn new_mark_price(nonce_seed: u64, sym: SymbolId) -> Self {
+        let mut d = Self::new(nonce_seed, sym);
+        d.lane = StreamLane::MarkPrice;
+        d
     }
 
     /// M2.4: an eapi combined-stream slot (options tickers + index
@@ -469,7 +488,13 @@ fn drain_ws_frames<C: Capture>(
 
                 match header.opcode {
                     WsOpcode::Text => {
-                        handle_text_frame(drv, payload.start..payload.end, producer, status, capture);
+                        handle_text_frame(
+                            drv,
+                            payload.start..payload.end,
+                            producer,
+                            status,
+                            capture,
+                        );
                     }
                     WsOpcode::Binary => {
                         // Binance @bookTicker is text-only; drop.
@@ -524,7 +549,10 @@ enum EapiAction {
     Reject,
     /// Option ticker: the summary is always captured; the tick only
     /// when a side exists (quiet far options carry empty quotes).
-    Ticker { tick: Option<Tick>, summary: OptSummary },
+    Ticker {
+        tick: Option<Tick>,
+        summary: OptSummary,
+    },
     /// Index push for the per-underlying cache.
     Index { uly_idx: u8, px_1e9: i64 },
 }
@@ -631,6 +659,53 @@ fn handle_eapi_frame<C: Capture>(
     }
 }
 
+/// WS5: handle one `@markPrice` frame — capture-only events, the
+/// OKX Mark/Funding conventions (`Mark` v0 = mark ×1e6; on this
+/// venue v1 = index ×1e6, where OKX leaves 0; `Funding` v0 = rate
+/// ×1e9, v1 = next-funding ms — gated on wire truth, the WS3
+/// `has_funding` split: dated futures push `"r":""`).
+fn handle_mark_price_frame<C: Capture>(
+    drv: &mut Driver,
+    payload_range: core::ops::Range<usize>,
+    status: &core_metrics::IngressStatus,
+    capture: &mut C,
+) {
+    let payload = &drv.rx.filled()[payload_range];
+    capture.raw_frame(now_ns(), payload);
+    match crate::parse_mark_price(payload, drv.sym) {
+        Some(f) => {
+            capture.event(&core_types::ChannelEvent::new(
+                now_ns(),
+                core_types::VenueId::Binance,
+                core_types::ChannelId::Mark,
+                f.sym,
+                0,
+                f.ts_ns / 1_000_000,
+                f.mark_px_1e6,
+                f.index_px_1e6,
+            ));
+            if f.has_funding == 1 {
+                capture.event(&core_types::ChannelEvent::new(
+                    now_ns(),
+                    core_types::VenueId::Binance,
+                    core_types::ChannelId::Funding,
+                    f.sym,
+                    0,
+                    f.ts_ns / 1_000_000,
+                    f.funding_rate_1e9,
+                    f.next_funding_ms as i64,
+                ));
+            }
+            status.add_msgs(1);
+            status.add_ticks(1);
+        }
+        None => {
+            status.inc_parse_errors();
+            capture.parse_reject(now_ns(), payload);
+        }
+    }
+}
+
 fn handle_text_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -638,9 +713,12 @@ fn handle_text_frame<C: Capture>(
     status: &core_metrics::IngressStatus,
     capture: &mut C,
 ) {
-    // M2.4: per-slot lane dispatch (monomorphic).
+    // M2.4/WS5: per-slot lane dispatch (monomorphic).
     if matches!(drv.lane, StreamLane::Eapi(_)) {
         return handle_eapi_frame(drv, payload_range, producer, status, capture);
+    }
+    if matches!(drv.lane, StreamLane::MarkPrice) {
+        return handle_mark_price_frame(drv, payload_range, status, capture);
     }
     let payload = &drv.rx.filled()[payload_range];
     // §6.5 capture: raw tap fires before parsing.
@@ -885,7 +963,9 @@ impl<T: Transport> MultiConn<T> {
 ///
 /// `connect(i)` dials slot `i` (blocking, bounded by the caller's
 /// connect timeout) and returns `None` on failure.
-#[allow(clippy::too_many_arguments)]
+// Doctrine: raw indices over `conns`, not iterator adapters — hot poll
+// loop (CLAUDE.md hot-path rules; `i` is also the mio Token identity).
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn run_multi<T: Transport, C: Capture>(
     conns: &mut [MultiConn<T>],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
@@ -942,7 +1022,9 @@ pub fn run_multi<T: Transport, C: Capture>(
                 continue;
             }
             let c = &mut conns[i];
-            let Some(t) = c.transport.as_mut() else { continue };
+            let Some(t) = c.transport.as_mut() else {
+                continue;
+            };
             match t.pump(ev) {
                 Ok(s) => note_transport_ready(&mut c.drv, s),
                 Err(_e) => c.kill(now_ns(), status),
@@ -952,7 +1034,9 @@ pub fn run_multi<T: Transport, C: Capture>(
         // 3. Drain every live slot (I-3 bounded no-progress loop).
         for i in 0..conns.len() {
             let c = &mut conns[i];
-            let Some(t) = c.transport.as_mut() else { continue };
+            let Some(t) = c.transport.as_mut() else {
+                continue;
+            };
             loop {
                 let n_before = producer.len();
                 let state_before = c.drv.state();
@@ -979,7 +1063,9 @@ pub fn run_multi<T: Transport, C: Capture>(
             if c.drv.state() != State::Steady {
                 continue;
             }
-            let Some(t) = c.transport.as_mut() else { continue };
+            let Some(t) = c.transport.as_mut() else {
+                continue;
+            };
             let now = now_ns();
             let act = if c.drv.last_activity_ns == 0 {
                 c.session_start_ns
@@ -1008,7 +1094,9 @@ pub fn run_multi<T: Transport, C: Capture>(
         // bitmask actually changed (see run()'s rationale).
         for i in 0..conns.len() {
             let c = &mut conns[i];
-            let Some(t) = c.transport.as_mut() else { continue };
+            let Some(t) = c.transport.as_mut() else {
+                continue;
+            };
             let cur = t.interest();
             if c.last_interest != Some(cur) {
                 if t.reregister(poll.registry(), mio::Token(i)).is_err() {
@@ -1080,11 +1168,29 @@ mod tests {
         let status = core_metrics::IngressStatus::new();
 
         // Before Ready — no handshake written.
-        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"stream.binance.com",
+            b"/ws/btcusdt@bookTicker",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(t.outgoing_len(), 0);
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"stream.binance.com", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"stream.binance.com",
+            b"/ws/btcusdt@bookTicker",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
 
         let mut buf = [0u8; 4096];
         let n = t.drain_outgoing(&mut buf);
@@ -1104,7 +1210,16 @@ mod tests {
         let status = core_metrics::IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
         assert_eq!(status.state(), core_metrics::IngressState::Down);
@@ -1114,7 +1229,16 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.state(), State::Steady);
         // D7: the upgrade transition publishes Up + activity + bytes.
         assert_eq!(status.state(), core_metrics::IngressState::Up);
@@ -1131,7 +1255,16 @@ mod tests {
         let status = core_metrics::IngressStatus::new();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = [0u8; 4096];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1139,7 +1272,16 @@ mod tests {
         let resp = build_server_response(&wrong);
         t.inject_incoming(&resp);
 
-        let err = drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let err = drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Failed upgrade must never publish Up.
         assert_eq!(status.state(), core_metrics::IngressState::Down);
@@ -1189,9 +1331,21 @@ mod tests {
         let mut d_b = build_driver(2, 7);
         d_b.set_state(State::Steady);
 
-        let mut c_a = MultiConn::new(d_a, b"spot.example", b"/ws/a", huge_keepalive(), test_backoff(1));
+        let mut c_a = MultiConn::new(
+            d_a,
+            b"spot.example",
+            b"/ws/a",
+            huge_keepalive(),
+            test_backoff(1),
+        );
         c_a.transport = Some(t_a);
-        let mut c_b = MultiConn::new(d_b, b"fut.example", b"/ws/b", huge_keepalive(), test_backoff(2));
+        let mut c_b = MultiConn::new(
+            d_b,
+            b"fut.example",
+            b"/ws/b",
+            huge_keepalive(),
+            test_backoff(2),
+        );
         c_b.transport = Some(t_b);
         let mut conns = [c_a, c_b];
 
@@ -1321,7 +1475,10 @@ mod tests {
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();
         let status = core_metrics::IngressStatus::new();
-        let mut cap = RecCap { summaries: Vec::new(), rejects: 0 };
+        let mut cap = RecCap {
+            summaries: Vec::new(),
+            rejects: 0,
+        };
         drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
 
         // Exactly ONE tick (the full ticker), sym + BBO from bo/ao.
@@ -1368,7 +1525,16 @@ mod tests {
         t.inject_incoming(&frame_buf[..frame_len]);
 
         let status = core_metrics::IngressStatus::new();
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
 
         let tick = cons.try_pop().expect("tick must be pushed");
         assert_eq!(tick.sym, 42);
@@ -1400,7 +1566,16 @@ mod tests {
         t.inject_incoming(&frame[..6]);
 
         let status = core_metrics::IngressStatus::new();
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert!(t.outgoing_len() > 0);
 
         let mut out = [0u8; 64];
@@ -1435,7 +1610,16 @@ mod tests {
         t.inject_incoming(&frame[..2 + payload.len()]);
 
         let status = core_metrics::IngressStatus::new();
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert!(cons.try_pop().is_none());
         // Silent drop on the ring, but the rejection is counted.
         assert_eq!(status.parse_errors_total(), 1);
@@ -1534,26 +1718,33 @@ mod tests {
         assert!(n >= 6, "at least one ping frame must reach the wire");
         assert_eq!(out[0] & 0x0F, 0x9, "opcode must be Ping");
         assert_ne!(out[0] & 0x80, 0, "FIN must be set");
-        assert_ne!(out[1] & 0x80, 0, "client frames must be masked (RFC 6455 §5.3)");
+        assert_ne!(
+            out[1] & 0x80,
+            0,
+            "client frames must be masked (RFC 6455 §5.3)"
+        );
         assert_eq!(out[1] & 0x7F, 0, "keepalive ping carries an empty payload");
     }
 
     /// Records every hook invocation — pins the §6.5 capture-site
-    /// semantics without touching the filesystem. BN never emits
-    /// `ChannelEvent`s in v1 (single-channel `@bookTicker` venue: BBO
-    /// flows as `Tick`), so `event()`/`signal()` are left at the
-    /// trait's no-op defaults.
+    /// semantics without touching the filesystem. The bookTicker lane
+    /// never emits `ChannelEvent`s (BBO flows as `Tick`); the WS5
+    /// markPrice lane does — `event()` records them.
     #[derive(Default)]
     struct CountingCapture {
         ticks: u32,
         raw_frames: u32,
         rejects: u32,
         flushes: u32,
+        events: Vec<core_types::ChannelEvent>,
     }
 
     impl core_types::Capture for CountingCapture {
         fn tick(&mut self, _t: &Tick) {
             self.ticks += 1;
+        }
+        fn event(&mut self, e: &core_types::ChannelEvent) {
+            self.events.push(*e);
         }
         fn raw_frame(&mut self, _ts_ns: u64, _payload: &[u8]) {
             self.raw_frames += 1;
@@ -1619,5 +1810,78 @@ mod tests {
         drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(cap.ticks, 2, "ring-dropped tick still captured");
         assert_eq!(status.ring_drops_total(), 1);
+    }
+
+    #[test]
+    fn mark_price_slot_emits_mark_and_funding_events() {
+        // WS5: a perp markPrice frame → Mark event (v0 = mark ×1e6,
+        // v1 = index ×1e6) + Funding event (v0 = rate ×1e9, v1 =
+        // next-funding ms). Capture-only — the ring stays empty.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new_mark_price(7, 42);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = CountingCapture::default();
+
+        let mark = br#"{"e":"markPriceUpdate","E":1562305380000,"s":"BTCUSDT","p":"11794.15","i":"11784.62","P":"11784.25","r":"0.00038167","T":1562306400000}"#;
+        t.inject_incoming(&ws_text_frame(mark));
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(cap.events.len(), 2, "Mark + Funding");
+        let m = &cap.events[0];
+        assert_eq!(m.channel, core_types::ChannelId::Mark as u8);
+        assert_eq!(m.sym, 42);
+        assert_eq!(m.v0, 11_794_150_000);
+        assert_eq!(m.v1, 11_784_620_000, "BN Mark carries index in v1");
+        assert_eq!(m.venue_time_ms, 1_562_305_380_000);
+        let fu = &cap.events[1];
+        assert_eq!(fu.channel, core_types::ChannelId::Funding as u8);
+        assert_eq!(fu.v0, 381_670);
+        assert_eq!(fu.v1, 1_562_306_400_000);
+        assert!(cons.try_pop().is_none(), "capture-only: nothing rings");
+        assert_eq!(status.ticks_total(), 1, "market-data row counted");
+        assert_eq!(status.parse_errors_total(), 0);
+    }
+
+    #[test]
+    fn mark_price_slot_dated_future_emits_mark_only() {
+        // WS5/WS3 convention: `"r":""` (delivery contract) ⇒ no
+        // Funding event, Mark still captured.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new_mark_price(7, 77);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = CountingCapture::default();
+
+        let dated = br#"{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT_260327","p":"65000.1","i":"64999.9","P":"65000.0","r":"","T":0}"#;
+        t.inject_incoming(&ws_text_frame(dated));
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.events.len(), 1, "Mark only");
+        assert_eq!(cap.events[0].channel, core_types::ChannelId::Mark as u8);
+        assert_eq!(status.parse_errors_total(), 0);
+    }
+
+    #[test]
+    fn mark_price_slot_rejects_foreign_frames() {
+        // A bookTicker payload on a markPrice slot is a tapped reject
+        // (the required "e" tag) — never a silent mis-parse.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new_mark_price(7, 42);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = CountingCapture::default();
+
+        let bt = br#"{"u":1,"s":"BTCUSDT","b":"25.10","B":"1.0","a":"25.20","A":"1.0"}"#;
+        t.inject_incoming(&ws_text_frame(bt));
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.rejects, 1);
+        assert_eq!(status.parse_errors_total(), 1);
+        assert!(cap.events.is_empty());
     }
 }

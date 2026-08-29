@@ -59,8 +59,7 @@ pub use run_loop::{
 
 use core_net::SubId;
 use core_parse::{
-    find_field, scan_i64, scan_number_sci_1e9, scan_price_1e6, scan_price_1e9, scan_u64,
-    skip_byte,
+    find_field, scan_i64, scan_number_sci_1e9, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte,
 };
 use core_types::{NsTs, SymbolId};
 
@@ -272,6 +271,35 @@ pub fn extract_inst_family(payload: &[u8]) -> Option<&[u8]> {
     let start = skip_byte(payload, start, b'"');
     let rel_end = memchr::memchr(b'"', payload.get(start..)?)?;
     payload.get(start..start + rel_end)
+}
+
+/// WS2 (outage 2026-08-27 §5.2): best-effort extraction of the
+/// failing instrument named INSIDE a venue error event's `msg` TEXT —
+/// e.g. `"msg":"Wrong URL or channel:bbo-tbt,instId:BTC-USD-260828-
+/// 45000-C doesn't exist. …"` (the 60018 post-settlement class). The
+/// key appears UNQUOTED inside the message string, so this scans for
+/// the literal `instId:` and takes the maximal `[A-Za-z0-9-]` run
+/// after it (OKX instIds are uppercase alphanumerics + `-`).
+/// `None` when the error names no instrument (60012-class) — the
+/// caller then attributes the drop to `SYMBOL_ID_NONE`.
+#[inline]
+pub fn extract_error_inst_id(payload: &[u8]) -> Option<&[u8]> {
+    let at = memchr::memmem::find(payload, b"instId:")?;
+    let start = at + b"instId:".len();
+    let rest = payload.get(start..)?;
+    let mut end = 0usize;
+    while end < rest.len() {
+        let b = rest[end];
+        let word = b.is_ascii_alphanumeric() || b == b'-';
+        if !word {
+            break;
+        }
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(&rest[..end])
 }
 
 /// One parsed `opt-summary` DATA ROW (M2.3) — the OKX side of the
@@ -974,7 +1002,8 @@ mod tests {
     const BOOK_SNAP: &[u8] = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"asks":[["8476.98","415","0","13"]],"bids":[["8476.97","256","0","12"]],"ts":"1597026383085","checksum":0,"prevSeqId":-1,"seqId":123456}]}"#;
     const BOOK_UPD: &[u8] = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[["8476.98","415","0","13"]],"bids":[],"ts":"1597026383217","checksum":0,"prevSeqId":123456,"seqId":123457}]}"#;
     const SUB_ACK: &[u8] = br#"{"event":"subscribe","arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"connId":"a4d3ae55"}"#;
-    const SUB_ERR: &[u8] = br#"{"event":"error","code":"60012","msg":"Invalid request","connId":"a4d3ae55"}"#;
+    const SUB_ERR: &[u8] =
+        br#"{"event":"error","code":"60012","msg":"Invalid request","connId":"a4d3ae55"}"#;
 
     // ---- classify -------------------------------------------------
 
@@ -1014,6 +1043,31 @@ mod tests {
     #[test]
     fn extract_inst_id_none_when_absent() {
         assert_eq!(extract_inst_id(b"{\"event\":\"error\"}"), None);
+    }
+
+    #[test]
+    fn extract_error_inst_id_reads_msg_text_form() {
+        // WS2: the 60018 post-settlement shape — instId appears
+        // UNQUOTED inside the msg string, terminated by a space.
+        let e = br#"{"event":"error","code":"60018","msg":"Wrong URL or channel:bbo-tbt,instId:BTC-USD-260828-45000-C doesn't exist. Please use the correct URL, channel and parameters referring to API document.","connId":"a4d3ae55"}"#;
+        assert_eq!(
+            extract_error_inst_id(e),
+            Some(&b"BTC-USD-260828-45000-C"[..])
+        );
+        // Quote-terminated (instId at the end of the msg string).
+        let e2 = br#"{"event":"error","code":"60018","msg":"channel:trades,instId:ETH-USDT-SWAP","connId":"x"}"#;
+        assert_eq!(extract_error_inst_id(e2), Some(&b"ETH-USDT-SWAP"[..]));
+    }
+
+    #[test]
+    fn extract_error_inst_id_none_when_error_names_no_instrument() {
+        // 60012-class errors carry no instId → None (drop attributes
+        // to SYMBOL_ID_NONE).
+        let e = br#"{"event":"error","code":"60012","msg":"Invalid request: {\"op\":\"subscribe\"}","connId":"x"}"#;
+        assert_eq!(extract_error_inst_id(e), None);
+        // Degenerate: key present but no word bytes after it.
+        assert_eq!(extract_error_inst_id(b"msg instId: "), None);
+        assert_eq!(extract_error_inst_id(b"no key at all"), None);
     }
 
     // ---- parse_bbo ------------------------------------------------
@@ -1140,8 +1194,10 @@ mod tests {
     #[test]
     fn symbol_table_roundtrip() {
         let mut t = OkxSymbolTable::new();
-        t.insert(b"BTC-USDT", 0x0200_0001, OkxInstType::Spot).unwrap();
-        t.insert(b"ETH-USDT", 0x0200_0002, OkxInstType::Spot).unwrap();
+        t.insert(b"BTC-USDT", 0x0200_0001, OkxInstType::Spot)
+            .unwrap();
+        t.insert(b"ETH-USDT", 0x0200_0002, OkxInstType::Spot)
+            .unwrap();
         assert_eq!(t.lookup(b"BTC-USDT"), Some(0x0200_0001));
         assert_eq!(t.lookup(b"ETH-USDT"), Some(0x0200_0002));
         assert_eq!(t.lookup(b"XRP-USDT"), None);
@@ -1157,7 +1213,8 @@ mod tests {
         let mut t = OkxSymbolTable::new();
         t.insert(b"BTC-USDT", 1, OkxInstType::Spot).unwrap();
         t.insert(b"BTC-USDT-SWAP", 2, OkxInstType::Swap).unwrap();
-        t.insert(b"BTC-USD-260821", 3, OkxInstType::Futures).unwrap();
+        t.insert(b"BTC-USD-260821", 3, OkxInstType::Futures)
+            .unwrap();
         assert_eq!(t.get(0).unwrap().2, OkxInstType::Spot);
         assert_eq!(t.get(1).unwrap().2, OkxInstType::Swap);
         assert_eq!(t.get(2).unwrap().2, OkxInstType::Futures);
@@ -1194,16 +1251,29 @@ mod tests {
         // write_op renders instFamily for the opt-summary channel and
         // instId for everything else, in one batch.
         let args = [
-            SubArg { channel: OkxChannel::OptSummary, inst_id: b"BTC-USD" },
-            SubArg { channel: OkxChannel::BboTbt, inst_id: b"BTC-USD-260327-100000-C" },
+            SubArg {
+                channel: OkxChannel::OptSummary,
+                inst_id: b"BTC-USD",
+            },
+            SubArg {
+                channel: OkxChannel::BboTbt,
+                inst_id: b"BTC-USD-260327-100000-C",
+            },
         ];
         let mut buf = [0u8; 512];
         let n = write_subscribe_batch(&mut buf, &args).expect("fits");
         let s = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(s.contains(r#"{"channel":"opt-summary","instFamily":"BTC-USD"}"#), "{s}");
-        assert!(s.contains(r#"{"channel":"bbo-tbt","instId":"BTC-USD-260327-100000-C"}"#), "{s}");
+        assert!(
+            s.contains(r#"{"channel":"opt-summary","instFamily":"BTC-USD"}"#),
+            "{s}"
+        );
+        assert!(
+            s.contains(r#"{"channel":"bbo-tbt","instId":"BTC-USD-260327-100000-C"}"#),
+            "{s}"
+        );
         // classify sees the data push.
-        let push = br#"{"arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"data":[{"instId":"X"}]}"#;
+        let push =
+            br#"{"arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"data":[{"instId":"X"}]}"#;
         assert_eq!(classify(push), OkxMsgKind::Data(OkxChannel::OptSummary));
     }
 
@@ -1211,10 +1281,16 @@ mod tests {
     fn inst_type_decodes_wire_strings() {
         assert_eq!(OkxInstType::from_bytes(b"SPOT"), Some(OkxInstType::Spot));
         assert_eq!(OkxInstType::from_bytes(b"SWAP"), Some(OkxInstType::Swap));
-        assert_eq!(OkxInstType::from_bytes(b"FUTURES"), Some(OkxInstType::Futures));
+        assert_eq!(
+            OkxInstType::from_bytes(b"FUTURES"),
+            Some(OkxInstType::Futures)
+        );
         // M2.2: OPTION decodes (the per-page contract lives in the
         // discovery RowMode — legacy pages still reject option rows).
-        assert_eq!(OkxInstType::from_bytes(b"OPTION"), Some(OkxInstType::Option));
+        assert_eq!(
+            OkxInstType::from_bytes(b"OPTION"),
+            Some(OkxInstType::Option)
+        );
         assert_eq!(OkxInstType::from_bytes(b"MARGIN"), None);
         assert_eq!(OkxInstType::from_bytes(b""), None);
         assert_eq!(OkxInstType::Swap.as_str(), "SWAP");
@@ -1224,14 +1300,18 @@ mod tests {
     #[test]
     fn symbol_table_rejects_bad_input() {
         let mut t = OkxSymbolTable::new();
-        assert_eq!(t.insert(b"", 1, OkxInstType::Spot), Err(SymbolTableErr::Empty));
+        assert_eq!(
+            t.insert(b"", 1, OkxInstType::Spot),
+            Err(SymbolTableErr::Empty)
+        );
         assert_eq!(
             t.insert(&[b'A'; OKX_INST_ID_MAX + 1], 1, OkxInstType::Spot),
             Err(SymbolTableErr::TooLong)
         );
         let mut i = 0u32;
         while (i as usize) < OKX_MAX_SYMBOLS {
-            t.insert(format!("S{i}").as_bytes(), i, OkxInstType::Spot).unwrap();
+            t.insert(format!("S{i}").as_bytes(), i, OkxInstType::Spot)
+                .unwrap();
             i += 1;
         }
         assert_eq!(
@@ -1293,8 +1373,14 @@ mod tests {
     fn write_subscribe_batch_exact_bytes() {
         let mut dst = [0u8; 256];
         let args = [
-            SubArg { channel: OkxChannel::BboTbt, inst_id: b"BTC-USDT" },
-            SubArg { channel: OkxChannel::Trades, inst_id: b"ETH-USDT" },
+            SubArg {
+                channel: OkxChannel::BboTbt,
+                inst_id: b"BTC-USDT",
+            },
+            SubArg {
+                channel: OkxChannel::Trades,
+                inst_id: b"ETH-USDT",
+            },
         ];
         let n = write_subscribe_batch(&mut dst, &args).unwrap();
         assert_eq!(
@@ -1307,7 +1393,10 @@ mod tests {
     #[test]
     fn write_unsubscribe_batch_and_tiny_dst() {
         let mut dst = [0u8; 256];
-        let args = [SubArg { channel: OkxChannel::Books, inst_id: b"BTC-USDT" }];
+        let args = [SubArg {
+            channel: OkxChannel::Books,
+            inst_id: b"BTC-USDT",
+        }];
         let n = write_unsubscribe_batch(&mut dst, &args).unwrap();
         assert!(n > 0);
         assert!(dst[..n].starts_with(br#"{"op":"unsubscribe""#));

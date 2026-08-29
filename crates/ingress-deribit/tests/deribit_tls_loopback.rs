@@ -48,11 +48,10 @@ struct LoopbackCert {
 }
 
 fn make_cert() -> LoopbackCert {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-signed cert");
+    let cert =
+        generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .expect("private key DER");
+    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key DER");
     LoopbackCert { cert_der, key_der }
 }
 
@@ -229,7 +228,8 @@ fn deribit_tls_loopback_yields_tick_and_answers_test_request() {
         stream
             .write_all(&build_unmasked_text_frame(push))
             .expect("write quote push");
-        let test_req = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
+        let test_req =
+            br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
         stream
             .write_all(&build_unmasked_text_frame(test_req))
             .expect("write test_request");
@@ -286,7 +286,10 @@ fn deribit_tls_loopback_yields_tick_and_answers_test_request() {
 
     assert_eq!(res, RunResult::Stopped);
     // Frame 1: set_heartbeat armed before anything else (id 1).
-    assert!(contains(&set_heartbeat, br#""method":"public/set_heartbeat""#));
+    assert!(contains(
+        &set_heartbeat,
+        br#""method":"public/set_heartbeat""#
+    ));
     assert!(contains(&set_heartbeat, br#""interval":15"#));
     assert!(!contains(&set_heartbeat, br#""method":"public/subscribe""#));
     // Frame 2: ONE batched subscribe with every configured channel.

@@ -177,9 +177,7 @@ impl OkxDiscovery {
 
     /// Look up a discovered instrument by exact `instId`.
     pub fn find(&self, inst_id: &[u8]) -> Option<&OkxInstrumentRow> {
-        self.rows
-            .iter()
-            .find(|r| r.inst_id() == inst_id)
+        self.rows.iter().find(|r| r.inst_id() == inst_id)
     }
 
     /// All parsed rows in wire order (M2.2: [`select_capped_chain`]
@@ -269,7 +267,7 @@ impl options_select::ChainRow for OkxInstrumentRow {
 /// Apply the capped universe policy to ONE underlying's parsed OPTION
 /// rows. The selection LAW lives in `options-select` since the M2-close
 /// extraction (`ingress-deribit` was the law source; this crate's tests
-/// + proptests keep pinning the same invariants through this wrapper) —
+/// and proptests keep pinning the same invariants through this wrapper) —
 /// here lives only the VENUE candidacy predicate
 /// (`inst_type == Option && live && exp_ms > now_ms`) and the frozen
 /// public signature. Deterministic order (expiry asc → strike asc → C
@@ -284,9 +282,7 @@ pub fn select_capped_chain(
 ) -> Vec<OkxInstrumentRow> {
     options_select::select_capped_chain(
         rows,
-        |r: &OkxInstrumentRow| {
-            r.inst_type == OkxInstType::Option && r.live && r.exp_ms > now_ms
-        },
+        |r: &OkxInstrumentRow| r.inst_type == OkxInstType::Option && r.live && r.exp_ms > now_ms,
         index_px_1e9,
         expiries_e,
         strikes_k,
@@ -393,8 +389,7 @@ fn parse_row(
                         // Empty string on SPOT → 0.
                         let (s, end) = quoted_span(body, i)?;
                         if !s.is_empty() {
-                            let (v, used) =
-                                scan_price_1e9(s, 0).ok_or(OkxDiscoveryErr::BadRow)?;
+                            let (v, used) = scan_price_1e9(s, 0).ok_or(OkxDiscoveryErr::BadRow)?;
                             if used != s.len() {
                                 return Err(OkxDiscoveryErr::BadRow);
                             }
@@ -407,8 +402,7 @@ fn parse_row(
                         // non-option rows (venue sends "") → skipped.
                         let (s, end) = quoted_span(body, i)?;
                         if !s.is_empty() {
-                            let (v, used) =
-                                scan_price_1e9(s, 0).ok_or(OkxDiscoveryErr::BadRow)?;
+                            let (v, used) = scan_price_1e9(s, 0).ok_or(OkxDiscoveryErr::BadRow)?;
                             if used != s.len() {
                                 return Err(OkxDiscoveryErr::BadRow);
                             }
@@ -607,7 +601,8 @@ mod tests {
             OkxDiscoveryErr::Envelope
         );
         assert_eq!(
-            d.ingest_body(br#"{"code":"0","data":{},"msg":""}"#).unwrap_err(),
+            d.ingest_body(br#"{"code":"0","data":{},"msg":""}"#)
+                .unwrap_err(),
             OkxDiscoveryErr::Envelope
         );
     }
@@ -752,10 +747,23 @@ mod tests {
                 }
             }
         }
-        rows.push(opt_row("BTC-USD-260327-110000-C", "C", "110000", EXP1, "suspend"));
-        rows.push(opt_row("BTC-USD-OLD-90000-C", "C", "90000", NOW - 1_000, "live"));
+        rows.push(opt_row(
+            "BTC-USD-260327-110000-C",
+            "C",
+            "110000",
+            EXP1,
+            "suspend",
+        ));
+        rows.push(opt_row(
+            "BTC-USD-OLD-90000-C",
+            "C",
+            "90000",
+            NOW - 1_000,
+            "live",
+        ));
         let mut d = OkxDiscovery::new();
-        d.ingest_options_body(&page(&rows.join(","))).expect("grid parses");
+        d.ingest_options_body(&page(&rows.join(",")))
+            .expect("grid parses");
         d
     }
 
@@ -771,7 +779,11 @@ mod tests {
         assert_eq!(c.tick_sz_1e9, 100_000); // "0.0001"
         let p = d.find(b"BTC-USD-260327-100000-P").expect("put row");
         assert!(!p.is_call);
-        assert!(!d.find(b"BTC-USD-260327-110000-C").expect("suspended kept").live);
+        assert!(
+            !d.find(b"BTC-USD-260327-110000-C")
+                .expect("suspended kept")
+                .live
+        );
     }
 
     #[test]
@@ -780,11 +792,17 @@ mod tests {
         let mut d = OkxDiscovery::new();
         let legacy =
             r#"{"instId":"BTC-USDT","instType":"SPOT","state":"live","tickSz":"1","lotSz":"1"}"#;
-        assert_eq!(d.ingest_options_body(&page(legacy)).unwrap_err(), OkxDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_options_body(&page(legacy)).unwrap_err(),
+            OkxDiscoveryErr::BadRow
+        );
         // …and an OPTION row on a legacy page stays one (pre-M2.2 law).
         let mut d2 = OkxDiscovery::new();
         let opt = opt_row("BTC-USD-260327-100000-C", "C", "100000", EXP1, "live");
-        assert_eq!(d2.ingest_body(&page(&opt)).unwrap_err(), OkxDiscoveryErr::BadRow);
+        assert_eq!(
+            d2.ingest_body(&page(&opt)).unwrap_err(),
+            OkxDiscoveryErr::BadRow
+        );
     }
 
     #[test]
@@ -805,11 +823,17 @@ mod tests {
             );
         }
         // Bad optType value; bad expTime digits.
-        for (from, to) in [(r#""optType":"C""#, r#""optType":"X""#), (r#""expTime":"1774598400000""#, r#""expTime":"17abc""#)] {
+        for (from, to) in [
+            (r#""optType":"C""#, r#""optType":"X""#),
+            (r#""expTime":"1774598400000""#, r#""expTime":"17abc""#),
+        ] {
             let bad = full.replacen(from, to, 1);
             assert_ne!(bad, full);
             let mut d = OkxDiscovery::new();
-            assert_eq!(d.ingest_options_body(&page(&bad)).unwrap_err(), OkxDiscoveryErr::BadRow);
+            assert_eq!(
+                d.ingest_options_body(&page(&bad)).unwrap_err(),
+                OkxDiscoveryErr::BadRow
+            );
         }
     }
 
@@ -827,17 +851,32 @@ mod tests {
         assert_eq!(parse_index_price(ok).expect("parses"), 77_275_530_000_000);
         // Error envelope.
         let err_body = br#"{"code":"51001","msg":"instrument not exist","data":[]}"#;
-        assert_eq!(parse_index_price(err_body).unwrap_err(), OkxDiscoveryErr::Envelope);
+        assert_eq!(
+            parse_index_price(err_body).unwrap_err(),
+            OkxDiscoveryErr::Envelope
+        );
         // Missing idxPx.
         let none = br#"{"code":"0","data":[{"instId":"BTC-USD"}]}"#;
-        assert_eq!(parse_index_price(none).unwrap_err(), OkxDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(none).unwrap_err(),
+            OkxDiscoveryErr::BadRow
+        );
         // Empty / bare-number / nonpositive forms.
         let empty = br#"{"code":"0","data":[{"idxPx":""}]}"#;
-        assert_eq!(parse_index_price(empty).unwrap_err(), OkxDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(empty).unwrap_err(),
+            OkxDiscoveryErr::BadRow
+        );
         let bare = br#"{"code":"0","data":[{"idxPx":77275.53}]}"#;
-        assert_eq!(parse_index_price(bare).unwrap_err(), OkxDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(bare).unwrap_err(),
+            OkxDiscoveryErr::BadRow
+        );
         let zero = br#"{"code":"0","data":[{"idxPx":"0"}]}"#;
-        assert_eq!(parse_index_price(zero).unwrap_err(), OkxDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(zero).unwrap_err(),
+            OkxDiscoveryErr::BadRow
+        );
     }
 
     fn names(sel: &[OkxInstrumentRow]) -> Vec<String> {
@@ -877,7 +916,9 @@ mod tests {
         for r in &sel {
             assert!(r.live && r.exp_ms == EXP1);
         }
-        assert!(!names(&sel).iter().any(|n| n.contains("110000") || n.contains("OLD")));
+        assert!(!names(&sel)
+            .iter()
+            .any(|n| n.contains("110000") || n.contains("OLD")));
         let all = select_capped_chain(d.rows(), 100_000_000_000_000, 4, 32, NOW);
         assert!(all.len() as u32 <= 4 * 32 * 2);
         assert_eq!(all.len(), 24);
@@ -917,12 +958,9 @@ mod proptests {
         #[test]
         fn ingest_never_panics(input in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let mut d = OkxDiscovery::new();
-            match d.ingest_body(&input) {
-                Ok(n) => {
-                    prop_assert_eq!(n, d.universe_total());
-                    prop_assert!(d.universe_live() <= d.universe_total());
-                }
-                Err(_) => {}
+            if let Ok(n) = d.ingest_body(&input) {
+                prop_assert_eq!(n, d.universe_total());
+                prop_assert!(d.universe_live() <= d.universe_total());
             }
         }
 

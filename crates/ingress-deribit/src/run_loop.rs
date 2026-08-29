@@ -22,9 +22,36 @@
 //! monotonic JSON-RPC id.
 //!
 //! The subscribe **result** echoes the successfully-subscribed
-//! channel list; any expected channel missing ⇒ misconfiguration ⇒
-//! session error (fail-fast). Venue `error` responses are equally
-//! fatal.
+//! channel list.
+//!
+//! ## Subscribe-verification policy (WS2 — outage 2026-08-27 §5.2)
+//!
+//! Until this process has ever seen ONE fully-verified subscribe
+//! result, any expected channel missing from the echo ⇒
+//! misconfiguration ⇒ session error, and venue `error` responses are
+//! equally fatal (fail-fast at BOOT: refuse to run venue-blind).
+//! Once a full verification has ever succeeded, a missing channel on
+//! a RECONNECT is the expired-instrument class — the venue dropped it
+//! from the universe mid-run — and becomes a NON-FATAL PER-CHANNEL
+//! DROP: only the echoed subset registers, everything echoed keeps
+//! flowing on the same connection. Venue `error` responses likewise
+//! become non-fatal (the pending request completes; a whole-subscribe
+//! refusal leaves zero registered channels and the establishment
+//! budget below tears the session down). Each drop increments
+//! `sub_drops_total`, emits one paired `ChannelId::SubDrop` capture
+//! event (§6.6 pairing) and a rate-limited stderr WARN. Reconnects
+//! re-send the full configured set (drops are session-scoped); the
+//! 0830/1605 slot restarts remain the chain-refresh mechanism.
+//!
+//! ## Establishment budget (WS2 — outage §5.3)
+//!
+//! The keepalive idle timeout is gated on `Steady`; a session wedged
+//! in `Connecting`/`AwaitingWsUpgrade` (blackholed SYN under the
+//! non-blocking connect), or `Steady` with zero registered channels,
+//! could previously live forever. [`run`] now returns
+//! [`RunResult::EstablishTimeout`] when no subscription has been
+//! confirmed within the driver's establishment budget
+//! (`core_net::ESTABLISH_BUDGET_NS` default).
 //!
 //! ## Heartbeat protocol (the 8c exit criterion)
 //!
@@ -81,14 +108,16 @@ use core_net::{
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId};
+use core_types::{
+    Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId, SYMBOL_ID_NONE,
+};
 
 use crate::{
     classify, extract_instrument, parse_book_header, parse_option_ticker, parse_quote,
-    parse_ticker, parse_trade,
-    sub_id_of, write_book_op, write_set_heartbeat, write_subscribe_all, write_test, ChainOutcome,
-    DeribitChannel, DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, TradeSeqOutcome,
-    DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
+    parse_ticker, parse_trade, parse_vol_index, row_wants_channel, sub_id_of, write_book_op,
+    write_set_heartbeat, write_subscribe_all, write_test, ChainOutcome, DeribitChannel,
+    DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName, TradeSeqOutcome,
+    DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
 };
 
 // ---------------------------------------------------------------
@@ -246,8 +275,16 @@ pub enum RunResult {
     /// No inbound bytes within the keepalive idle budget — caller
     /// reconnects.
     IdleTimeout,
+    /// WS2 (outage §5.3): no subscription was confirmed within the
+    /// establishment budget — the session never got past the
+    /// handshake, or the venue refused/omitted every channel. Caller
+    /// reconnects; the backoff keeps ESCALATING (no market data
+    /// moved, so the T1(b) reset predicate stays false —
+    /// deliberately unlike `IdleTimeout`'s venue-quiet reset).
+    EstablishTimeout,
     /// Fatal transport / protocol error (includes venue `error`
-    /// responses and missing subscribe confirmations — fail-fast).
+    /// responses and missing subscribe confirmations at BOOT — see
+    /// the module's subscribe-verification policy).
     Error,
 }
 
@@ -275,6 +312,12 @@ pub struct Driver {
     symbols: DeribitSymbolTable,
     /// Whether `book.*.100ms` is subscribed (`--deribit-depth`).
     depth_enabled: bool,
+    /// WS6: configured DVOL index names (`n_dvol` valid). Boot-set,
+    /// connection-independent; ordinal = position here (the capture
+    /// event's `v1` identity).
+    dvol: [DvolName; DERIBIT_DVOL_MAX],
+    /// Valid prefix length of `dvol`.
+    n_dvol: usize,
     /// Acknowledged subscriptions (filled from the subscribe result).
     subs: SubTable<DeribitSubKind, SUB_CAP>,
     /// In-flight JSON-RPC requests, indexed by `id & (PENDING_CAP-1)`.
@@ -290,6 +333,17 @@ pub struct Driver {
     trade_seqs: [DeribitTradeSeq; DERIBIT_MAX_SYMBOLS],
     /// Set once the session-start calls have been queued.
     session_started: bool,
+    /// WS2: PROCESS-LIFETIME flag — true once ANY subscribe result
+    /// has ever passed FULL verification. While false, missing
+    /// channels and venue errors stay fatal (boot fail-fast: refuse
+    /// venue-blind configs); once true, they become non-fatal drops.
+    /// Deliberately NOT cleared by [`Self::reset_for_reconnect`].
+    subs_ever_confirmed: bool,
+    /// WS2: establishment budget (ns from session start to the first
+    /// confirmed subscription) enforced by [`run`]. Defaults to
+    /// [`core_net::ESTABLISH_BUDGET_NS`]; overridable for tests /
+    /// operator tuning via [`Self::set_establish_budget_ns`].
+    establish_budget_ns: u64,
     /// Wall clock of the last emitted gap log line (rate limit:
     /// [`GAP_LOG_INTERVAL_NS`]). Deliberately NOT reset per session —
     /// the limit is an operator-terminal budget, not session state.
@@ -297,6 +351,12 @@ pub struct Driver {
     /// Gap increments swallowed by the rate limit since the last
     /// emitted line (carried into that next line as `suppressed=`).
     gap_log_suppressed: u32,
+    /// WS2 drop-log rate limiter — same operator-terminal-budget
+    /// semantics as the gap logger's (not session state).
+    drop_log_last_ns: u64,
+    /// Drop increments swallowed by the rate limit since the last
+    /// emitted drop line.
+    drop_log_suppressed: u32,
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -306,8 +366,40 @@ impl Driver {
     /// `symbols` maps every configured instrument; `depth_enabled`
     /// adds the `book.*.100ms` channel per instrument.
     pub fn new(nonce_seed: u64, symbols: DeribitSymbolTable, depth_enabled: bool) -> Self {
+        Self::new_with_dvol(nonce_seed, symbols, depth_enabled, &[])
+    }
+
+    /// WS6: [`Self::new`] plus configured DVOL index names
+    /// (`btc_usd` forms — one `deribit_volatility_index.{index}`
+    /// subscription each). Over-long/overflowing entries are dropped
+    /// with a debug assert (the config layer caps both — the OKX
+    /// families pattern).
+    pub fn new_with_dvol(
+        nonce_seed: u64,
+        symbols: DeribitSymbolTable,
+        depth_enabled: bool,
+        dvol_names: &[&[u8]],
+    ) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        let mut dvol: [DvolName; DERIBIT_DVOL_MAX] = [(0, [0; 16]); DERIBIT_DVOL_MAX];
+        let mut n_dvol = 0usize;
+        let mut i = 0;
+        while i < dvol_names.len() {
+            let name = dvol_names[i];
+            if name.is_empty() || name.len() > 16 || n_dvol >= DERIBIT_DVOL_MAX {
+                debug_assert!(
+                    false,
+                    "dvol entry dropped (len/cap) — config layer caps this"
+                );
+                i += 1;
+                continue;
+            }
+            dvol[n_dvol].0 = name.len() as u8;
+            dvol[n_dvol].1[..name.len()].copy_from_slice(name);
+            n_dvol += 1;
+            i += 1;
+        }
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -318,6 +410,8 @@ impl Driver {
             mask_counter: 0,
             symbols,
             depth_enabled,
+            dvol,
+            n_dvol,
             subs: SubTable::new(),
             pending: PendingTable::new(),
             next_req_id: 1,
@@ -325,10 +419,21 @@ impl Driver {
             book_chains: [crate::DeribitBookChain::new(); DERIBIT_MAX_SYMBOLS],
             trade_seqs: [DeribitTradeSeq::new(); DERIBIT_MAX_SYMBOLS],
             session_started: false,
+            subs_ever_confirmed: false,
+            establish_budget_ns: core_net::ESTABLISH_BUDGET_NS,
             gap_log_last_ns: 0,
             gap_log_suppressed: 0,
+            drop_log_last_ns: 0,
+            drop_log_suppressed: 0,
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// WS2: override the establishment budget (tests use millisecond
+    /// budgets; production keeps the default).
+    #[inline]
+    pub fn set_establish_budget_ns(&mut self, ns: u64) {
+        self.establish_budget_ns = ns;
     }
 
     /// Current state (metrics + tests).
@@ -369,6 +474,9 @@ impl Driver {
     /// Reset per-connection state for a reconnect. Subscriptions,
     /// pending requests and integrity chains are connection-scoped:
     /// tables clear, chains re-arm for fresh snapshots, ids restart.
+    /// `subs_ever_confirmed` (WS2 boot/reconnect discriminator), the
+    /// establishment budget and both log rate limiters are
+    /// process-lifetime — untouched here.
     pub fn reset_for_reconnect(&mut self, nonce_seed: u64) {
         self.state = State::Connecting;
         self.rx.clear();
@@ -455,7 +563,7 @@ pub fn note_transport_ready(drv: &mut Driver, status: Status) {
 // ---------------------------------------------------------------
 
 fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    if drv.tx.len() == 0 {
+    if drv.tx.is_empty() {
         return Ok(());
     }
     let mut written = 0;
@@ -573,11 +681,18 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
     queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
     record_pending(drv, hb_id, DeribitReqKind::SetHeartbeat)?;
 
-    // 2. One batched subscribe for every (channel × instrument).
+    // 2. One batched subscribe for every (channel × instrument)
+    //    (+ WS6 DVOL indices).
     let sub_id = drv.alloc_req_id();
     let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = write_subscribe_all(&mut scratch, sub_id, &drv.symbols, drv.depth_enabled)
-        .ok_or_else(|| io::Error::other("deribit: subscribe scratch too small"))?;
+    let n = write_subscribe_all(
+        &mut scratch,
+        sub_id,
+        &drv.symbols,
+        drv.depth_enabled,
+        &drv.dvol[..drv.n_dvol],
+    )
+    .ok_or_else(|| io::Error::other("deribit: subscribe scratch too small"))?;
     queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
     record_pending(drv, sub_id, DeribitReqKind::SubscribeAll)?;
     drv.subscribe_req_id = sub_id;
@@ -643,44 +758,44 @@ const fn option_bit(sym_idx: usize, static_len: usize) -> u128 {
     1u128 << (STATIC_MASK_BITS + (sym_idx - static_len))
 }
 
-/// Channels a table row subscribes: options quote + ticker (M2.3 —
-/// the mark/IV stream), static rows the full set (minus book without
-/// depth).
+/// WS6: true when row `idx` is a TAIL row (option or combo) — tail
+/// rows FOLD their channels into one per-row mask bit.
 #[inline]
-fn row_channels(symbols: &DeribitSymbolTable, idx: usize, depth_enabled: bool) -> usize {
-    if symbols.is_option_row(idx) {
-        2
-    } else if depth_enabled {
-        CHANNELS_PER_INSTR
-    } else {
-        CHANNELS_PER_INSTR - 1
-    }
+fn is_tail_row(symbols: &DeribitSymbolTable, idx: usize) -> bool {
+    symbols.is_option_row(idx) || symbols.is_combo_row(idx)
 }
 
-/// Verification-mask bit for `(row, channel)` under the M2 partition
-/// law. Option rows FOLD their channels (quote + ticker) into ONE
-/// per-row bit — [`found_mask`] sets it only when EVERY option
-/// channel was acknowledged, so the u128 stays exactly
-/// 64 static-channel bits + 64 option-row bits.
+/// Verification-mask bit for `(row, channel)` under the M2/WS6
+/// partition law. TAIL rows (options: quote + ticker; combos: quote
+/// only) FOLD their channels into ONE per-row bit — [`found_mask`]
+/// sets it only when EVERY wanted channel was acknowledged, so the
+/// u128 stays exactly 64 static-channel bits + 64 tail-row bits.
+/// Static rows use per-channel bits at the fixed channel index
+/// (spot rows simply never occupy the ticker bit —
+/// [`row_wants_channel`]).
 #[inline]
 fn row_bit(symbols: &DeribitSymbolTable, idx: usize, ch: usize) -> u128 {
-    if symbols.is_option_row(idx) {
-        debug_assert!(ch < 2, "option rows have quote + ticker only");
+    if is_tail_row(symbols, idx) {
         option_bit(idx, symbols.static_len())
     } else {
         channel_bit(idx, ch)
     }
 }
 
-/// Expected-channel mask for the configured table (+depth flag).
+/// Expected-channel mask for the configured table (+depth flag),
+/// driven by the [`row_wants_channel`] policy. WS6: DVOL channels
+/// are deliberately OUTSIDE this mask (no bits left in the u128; an
+/// absent DVOL echo surfaces as a missing capture series, not a
+/// session verdict).
 fn expected_mask(symbols: &DeribitSymbolTable, depth_enabled: bool) -> u128 {
     let mut m = 0u128;
     let mut i = 0;
     while i < symbols.len() {
-        let n_ch = row_channels(symbols, i, depth_enabled);
         let mut c = 0;
-        while c < n_ch {
-            m |= row_bit(symbols, i, c);
+        while c < CHANNELS_PER_INSTR {
+            if row_wants_channel(symbols, i, c, depth_enabled) {
+                m |= row_bit(symbols, i, c);
+            }
             c += 1;
         }
         i += 1;
@@ -695,11 +810,17 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
     let mut m = 0u128;
     let mut i = 0;
     while let Some((instr, _sym)) = symbols.get(i) {
-        let n_ch = row_channels(symbols, i, depth_enabled);
-        // Option rows fold: the per-row bit requires EVERY channel.
+        // Tail rows fold: the per-row bit requires EVERY wanted
+        // channel (options 2, combos 1).
+        let mut wanted = 0usize;
         let mut found_in_row = 0usize;
         let mut c = 0;
-        while c < n_ch {
+        while c < CHANNELS_PER_INSTR {
+            if !row_wants_channel(symbols, i, c, depth_enabled) {
+                c += 1;
+                continue;
+            }
+            wanted += 1;
             let ch = CHANNEL_ORDER[c];
             let mut name = [0u8; CHANNEL_NAME_SCRATCH];
             let mut n = 0usize;
@@ -716,7 +837,7 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
             name[n] = b'"';
             n += 1;
             if memchr::memmem::find(payload, &name[..n]).is_some() {
-                if symbols.is_option_row(i) {
+                if is_tail_row(symbols, i) {
                     found_in_row += 1;
                 } else {
                     m |= row_bit(symbols, i, c);
@@ -724,7 +845,7 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
             }
             c += 1;
         }
-        if symbols.is_option_row(i) && found_in_row == n_ch {
+        if is_tail_row(symbols, i) && wanted > 0 && found_in_row == wanted {
             m |= option_bit(i, symbols.static_len());
         }
         i += 1;
@@ -783,9 +904,21 @@ enum Dispatch {
     RpcOk { id: u64 },
     /// The session subscribe result, pre-verified against the
     /// configured channel set.
-    SubscribeResult { id: u64, found: u128, expected: u128 },
-    /// Venue `error` response — fatal (fail-fast).
-    VenueError { code: i32 },
+    SubscribeResult {
+        id: u64,
+        found: u128,
+        expected: u128,
+    },
+    /// Venue `error` response. Fatal at boot; a non-fatal drop on
+    /// reconnect (WS2 — module doc). Carries the JSON-RPC id so the
+    /// drop path can complete the pending request.
+    VenueError { id: u64, code: i32 },
+    /// WS6: one DVOL push, pre-parsed + ordinal-resolved in phase 1.
+    VolIndex {
+        ts_ms: u64,
+        vol_1e9: i64,
+        ordinal: i64,
+    },
     /// `quote` push became a Tick.
     Quote { tick: Tick },
     /// `ticker` push validated (slow lane; captured as a §6.5 event).
@@ -795,10 +928,21 @@ enum Dispatch {
     OptSummary,
     /// `trades` push scanned (`sym` rides along for phase-2 gap
     /// events — resolving it again would re-borrow `drv.symbols`).
-    Trades { sym: u32, sym_idx: u8, scan: TradeScan },
+    Trades {
+        sym: u32,
+        sym_idx: u8,
+        scan: TradeScan,
+    },
     /// `book` push header (`ts_ms` rides along for the phase-2
     /// `BookGap` event's `venue_time_ms`).
-    Book { sym: u32, sym_idx: u8, ts_ms: u64, action: u8, prev: i64, seq: i64 },
+    Book {
+        sym: u32,
+        sym_idx: u8,
+        ts_ms: u64,
+        action: u8,
+        prev: i64,
+        seq: i64,
+    },
 }
 
 fn drain_ws_frames<C: Capture>(
@@ -814,7 +958,7 @@ fn drain_ws_frames<C: Capture>(
                 // Oversize guard: a frame that cannot fit the rx
                 // buffer never completes — fail the session instead
                 // of livelocking (module doc).
-                if drv.rx.free_mut().is_empty() && drv.rx.len() > 0 {
+                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "ws frame exceeds rx buffer capacity",
@@ -841,7 +985,13 @@ fn drain_ws_frames<C: Capture>(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_data_frame(drv, payload.start..payload.end, producer, status, capture)?;
+                        handle_data_frame(
+                            drv,
+                            payload.start..payload.end,
+                            producer,
+                            status,
+                            capture,
+                        )?;
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -1018,7 +1168,36 @@ fn handle_data_frame<C: Capture>(
         match classify(payload) {
             DeribitMsgKind::Heartbeat => Dispatch::Quiet,
             DeribitMsgKind::TestRequest => Dispatch::TestRequest,
-            DeribitMsgKind::RpcError { id: _, code } => Dispatch::VenueError { code },
+            DeribitMsgKind::RpcError { id, code } => Dispatch::VenueError { id, code },
+            // WS6: DVOL — venue-global; identity = ordinal into the
+            // boot-configured index list (never the symbol table).
+            DeribitMsgKind::VolIndexPush => match parse_vol_index(payload) {
+                Some(f) => {
+                    let name = &f.index_name[..f.index_name_len as usize];
+                    let mut ordinal: i64 = -1;
+                    let mut d = 0;
+                    while d < drv.n_dvol {
+                        let (len, ref bytes) = drv.dvol[d];
+                        if &bytes[..len as usize] == name {
+                            ordinal = d as i64;
+                            break;
+                        }
+                        d += 1;
+                    }
+                    if ordinal < 0 {
+                        // A push for an index we never configured —
+                        // venue noise; count it.
+                        Dispatch::Nothing
+                    } else {
+                        Dispatch::VolIndex {
+                            ts_ms: f.ts_ns / 1_000_000,
+                            vol_1e9: f.vol_1e9,
+                            ordinal,
+                        }
+                    }
+                }
+                None => Dispatch::Nothing,
+            },
             DeribitMsgKind::RpcResult(id) => {
                 if id == drv.subscribe_req_id {
                     Dispatch::SubscribeResult {
@@ -1103,6 +1282,29 @@ fn handle_data_frame<C: Capture>(
                                     tk.mark_px_1e6,
                                     tk.open_interest_1e6,
                                 ));
+                                // WS3 (gaps §1): the parser filled
+                                // `current_funding_1e9` since 8c and
+                                // this site DROPPED it. Emit it as the
+                                // venue's Funding event — v0 = rate
+                                // ×1e9 (OKX-compatible scaling), v1 =
+                                // 0 (perp funding is continuous — no
+                                // next-funding time on this venue).
+                                // Gated on venue truth: dated-future
+                                // tickers carry no funding field
+                                // (`has_funding` = the wire-level
+                                // settlement_period split).
+                                if tk.has_funding == 1 {
+                                    capture.event(&ChannelEvent::new(
+                                        now_ns(),
+                                        VenueId::Deribit,
+                                        ChannelId::Funding,
+                                        sym,
+                                        0,
+                                        tk.ts_ns / 1_000_000,
+                                        tk.current_funding_1e9,
+                                        0,
+                                    ));
+                                }
                                 Dispatch::Ticker
                             }
                             None => Dispatch::Nothing,
@@ -1185,52 +1387,119 @@ fn handle_data_frame<C: Capture>(
                 }
             }
         }
-        Dispatch::SubscribeResult { id, found, expected } => {
+        Dispatch::SubscribeResult {
+            id,
+            found,
+            expected,
+        } => {
             let _ = drv.pending.complete(id);
             status.add_msgs(1);
-            if found & expected != expected {
-                // A configured channel was refused — misconfiguration.
-                // Fail-fast: crash loudly in debug, session error in
-                // release (reconnect w/ backoff, operator sees it).
+            let missing = expected & !found;
+            if missing != 0 {
                 // T1(a) (outage 2026-08-27 §5.2): this is the exact
                 // post-settlement kill site — expired option channels
                 // vanish from the echo. `venue_code` carries the
                 // COUNT of missing channels (the u128 masks don't fit
                 // a u32; the count is the operator-facing signal).
-                status.note_venue_err_code((expected & !found).count_ones());
-                status.note_session_err(
-                    core_metrics::ERR_SITE_SUBSCRIBE_MISSING,
-                    core_metrics::io_kind_code(io::ErrorKind::InvalidData),
-                );
-                debug_assert!(
-                    false,
-                    "deribit subscribe result missing channels: expected {expected:#x} found {found:#x}"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "deribit subscribe result missing configured channels",
-                ));
+                // Recorded on BOTH paths: evidence on the drop path,
+                // verdict on the boot path.
+                status.note_venue_err_code(missing.count_ones());
+                if !drv.subs_ever_confirmed {
+                    // BOOT fail-fast (unchanged doctrine): the first-
+                    // ever subscribe of a config came back incomplete
+                    // — misconfiguration; refuse to run venue-blind.
+                    // Crash loudly in debug, session error in release
+                    // (reconnect w/ backoff, operator sees it).
+                    status.note_session_err(
+                        core_metrics::ERR_SITE_SUBSCRIBE_MISSING,
+                        core_metrics::io_kind_code(io::ErrorKind::InvalidData),
+                    );
+                    debug_assert!(
+                        false,
+                        "deribit subscribe result missing channels at boot: expected {expected:#x} found {found:#x}"
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "deribit subscribe result missing configured channels",
+                    ));
+                }
+                // WS2 NON-FATAL DROP (outage §5.2): the venue dropped
+                // these channels from its universe mid-run (expired
+                // instruments) — register what WAS echoed, name every
+                // missing channel, keep the session flowing. A fully-
+                // empty echo registers nothing and the establishment
+                // budget tears the session down.
+                emit_sub_drops(drv, missing, status, capture);
+            } else {
+                // WS2: a FULL verification arms the process-lifetime
+                // boot/reconnect discriminator.
+                drv.subs_ever_confirmed = true;
             }
-            register_confirmed_subs(drv);
+            register_confirmed_subs(drv, found);
         }
-        Dispatch::VenueError { code } => {
-            // Fail-fast doctrine: a venue error response means our
-            // request (or framing) is wrong. Crash loudly in debug,
-            // surface a session error in release.
+        Dispatch::VenueError { id, code } => {
             // T1(a) (outage 2026-08-27 §5.2): record the venue's
             // numeric code (i32 bit-cast; negative JSON-RPC codes
             // round-trip through the u32 slot) — first-wins so the
             // outer drive-site conversion keeps this inner site.
+            // Recorded on BOTH paths below: evidence on the drop
+            // path, verdict on the boot path.
             status.note_venue_err_code(code as u32);
-            status.note_session_err(
-                core_metrics::ERR_SITE_VENUE_ERROR,
-                core_metrics::io_kind_code(io::ErrorKind::InvalidData),
-            );
-            debug_assert!(false, "deribit venue error response, code={code}");
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "deribit venue error response",
+            if !drv.subs_ever_confirmed {
+                // BOOT fail-fast (unchanged doctrine): a venue error
+                // before any confirmed subscribe means our request /
+                // framing / config is wrong. Crash loudly in debug,
+                // surface a session error in release.
+                status.note_session_err(
+                    core_metrics::ERR_SITE_VENUE_ERROR,
+                    core_metrics::io_kind_code(io::ErrorKind::InvalidData),
+                );
+                debug_assert!(false, "deribit venue error response at boot, code={code}");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "deribit venue error response",
+                ));
+            }
+            // WS2 NON-FATAL DROP: complete the failed request (frees
+            // the pending slot) and count/name the refusal. A refused
+            // session subscribe leaves sub_count() == 0 → the
+            // establishment budget ends the session; a refused book
+            // resync/test/heartbeat degrades only that lane.
+            let _ = drv.pending.complete(id);
+            status.inc_sub_drops();
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Deribit,
+                ChannelId::SubDrop,
+                SYMBOL_ID_NONE, // RPC errors carry id+code, no instrument
+                0,
+                0,
+                code as i64,
+                -1,
             ));
+            log_sub_drop_rate_limited(drv, SYMBOL_ID_NONE, code as i64, -1);
+        }
+        Dispatch::VolIndex {
+            ts_ms,
+            vol_1e9,
+            ordinal,
+        } => {
+            // WS6 §6.5 capture: venue-global series — sym =
+            // SYMBOL_ID_NONE, v0 = volatility points ×1e9, v1 = the
+            // configured-index ordinal (the offline identity; the
+            // boot log + universe file resolve it).
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Deribit,
+                ChannelId::VolIndex,
+                SYMBOL_ID_NONE,
+                0,
+                ts_ms,
+                vol_1e9,
+                ordinal,
+            ));
+            status.add_msgs(1);
+            status.add_ticks(1);
         }
         Dispatch::Quote { tick } => {
             status.add_msgs(1);
@@ -1306,7 +1575,14 @@ fn handle_data_frame<C: Capture>(
                 }
             }
         }
-        Dispatch::Book { sym, sym_idx, ts_ms, action, prev, seq } => {
+        Dispatch::Book {
+            sym,
+            sym_idx,
+            ts_ms,
+            action,
+            prev,
+            seq,
+        } => {
             status.add_msgs(1);
             status.add_ticks(1);
             let expected_prev = drv.book_chains[sym_idx as usize].last_change_id();
@@ -1371,13 +1647,21 @@ fn log_gap_rate_limited(
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put = |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| {
-        match crate::push_bytes(&mut buf[..], *n, src) {
+    let put =
+        |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
+            &mut buf[..],
+            *n,
+            src,
+        ) {
             Some(e) => *n = e,
             None => *ok = false,
-        }
-    };
-    put(&mut buf, &mut n, &mut ok, b"WARN ingress-deribit: seq gap channel=");
+        };
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        b"WARN ingress-deribit: seq gap channel=",
+    );
     put(&mut buf, &mut n, &mut ok, channel);
     put(&mut buf, &mut n, &mut ok, b" sym=");
     put(&mut buf, &mut n, &mut ok, fmt_hex_u32(sym, &mut digits));
@@ -1389,10 +1673,20 @@ fn log_gap_rate_limited(
     put(&mut buf, &mut n, &mut ok, fmt_i64(observed, &mut d3));
     put(&mut buf, &mut n, &mut ok, b" increments=");
     let mut d4 = [0u8; 20];
-    put(&mut buf, &mut n, &mut ok, crate::fmt_u64(increments as u64, &mut d4));
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        crate::fmt_u64(increments as u64, &mut d4),
+    );
     put(&mut buf, &mut n, &mut ok, b" suppressed=");
     let mut d5 = [0u8; 20];
-    put(&mut buf, &mut n, &mut ok, crate::fmt_u64(suppressed as u64, &mut d5));
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        crate::fmt_u64(suppressed as u64, &mut d5),
+    );
     put(&mut buf, &mut n, &mut ok, b" ts_ns=");
     let mut d6 = [0u8; 20];
     put(&mut buf, &mut n, &mut ok, crate::fmt_u64(now, &mut d6));
@@ -1440,12 +1734,15 @@ fn fmt_i64(v: i64, scratch: &mut [u8; 20]) -> &[u8] {
     &scratch[start - 1..]
 }
 
-/// After a verified subscribe result: mark every configured channel
-/// acknowledged in the `SubTable`.
-fn register_confirmed_subs(drv: &mut Driver) {
+/// After a subscribe result: mark every channel the venue actually
+/// ECHOED (`found` bit set) acknowledged in the `SubTable`. WS2: on
+/// a full verification `found == expected` and every configured
+/// channel registers (the pre-WS2 behaviour); on a partial reconnect
+/// echo only the confirmed subset registers — option rows fold
+/// quote+ticker into one bit, so a clear bit registers neither.
+fn register_confirmed_subs(drv: &mut Driver, found: u128) {
     let mut i = 0;
     while i < drv.symbols.len() {
-        let n_ch = row_channels(&drv.symbols, i, drv.depth_enabled);
         // Instrument bytes copied to end the immutable table borrow
         // before the mutable subs borrow (two-phase pattern).
         let mut instr_buf = [0u8; crate::DERIBIT_INSTR_MAX];
@@ -1459,9 +1756,22 @@ fn register_confirmed_subs(drv: &mut Driver) {
         };
         let instr = &instr_buf[..instr_len];
         let mut c = 0;
-        while c < n_ch {
+        while c < CHANNELS_PER_INSTR {
+            if !row_wants_channel(&drv.symbols, i, c, drv.depth_enabled) {
+                c += 1;
+                continue;
+            }
+            if found & row_bit(&drv.symbols, i, c) == 0 {
+                // WS2: not echoed by the venue — dropped, not
+                // registered (emit_sub_drops named it).
+                c += 1;
+                continue;
+            }
             let ch = CHANNEL_ORDER[c];
-            match drv.subs.insert(sub_id_of(ch, instr), DeribitSubKind::from_channel(ch)) {
+            match drv
+                .subs
+                .insert(sub_id_of(ch, instr), DeribitSubKind::from_channel(ch))
+            {
                 Ok(()) => {}
                 Err(SubErr::ReservedId) => {}
                 Err(SubErr::Full) => {
@@ -1471,6 +1781,134 @@ fn register_confirmed_subs(drv: &mut Driver) {
             c += 1;
         }
         i += 1;
+    }
+}
+
+/// WS2: name every missing subscribe-echo bit — one `sub_drops_total`
+/// increment + one paired [`ChannelId::SubDrop`] capture event per
+/// missing (row, channel), plus the rate-limited stderr WARN. Static
+/// rows carry the channel index in `v1`; option rows fold quote +
+/// ticker into one per-row bit and carry `v1 = -1`. Cold path — runs
+/// once per subscribe result.
+fn emit_sub_drops<C: Capture>(
+    drv: &mut Driver,
+    missing: u128,
+    status: &IngressStatus,
+    capture: &mut C,
+) {
+    let mut i = 0;
+    while i < drv.symbols.len() {
+        // Symbol id copied out (Copy) — the table borrow must end
+        // before the mutable logger borrow below.
+        let sym = match drv.symbols.get(i) {
+            Some((_instr, sym)) => sym,
+            None => {
+                debug_assert!(false, "row {i} < len() must exist");
+                break;
+            }
+        };
+        if is_tail_row(&drv.symbols, i) {
+            if missing & option_bit(i, drv.symbols.static_len()) != 0 {
+                status.inc_sub_drops();
+                capture.event(&ChannelEvent::new(
+                    now_ns(),
+                    VenueId::Deribit,
+                    ChannelId::SubDrop,
+                    sym,
+                    0,
+                    0,
+                    0, // missing-from-echo: no venue code
+                    -1,
+                ));
+                log_sub_drop_rate_limited(drv, sym, 0, -1);
+            }
+        } else {
+            let mut c = 0;
+            while c < CHANNELS_PER_INSTR {
+                if row_wants_channel(&drv.symbols, i, c, drv.depth_enabled)
+                    && missing & channel_bit(i, c) != 0
+                {
+                    status.inc_sub_drops();
+                    capture.event(&ChannelEvent::new(
+                        now_ns(),
+                        VenueId::Deribit,
+                        ChannelId::SubDrop,
+                        sym,
+                        0,
+                        0,
+                        0,
+                        c as i64,
+                    ));
+                    log_sub_drop_rate_limited(drv, sym, 0, c as i64);
+                }
+                c += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Rate-limited (1 line / [`GAP_LOG_INTERVAL_NS`]) WS2 sub-drop WARN
+/// line — same zero-alloc stderr contract as
+/// [`log_gap_rate_limited`]; the 1:1 evidence record is the paired
+/// `SubDrop` capture event, not this line. `code` 0 = missing-from-
+/// echo; `ch` −1 = unknown / folded option row.
+fn log_sub_drop_rate_limited(drv: &mut Driver, sym: u32, code: i64, ch: i64) {
+    let now = now_ns();
+    if now.wrapping_sub(drv.drop_log_last_ns) < GAP_LOG_INTERVAL_NS {
+        drv.drop_log_suppressed = drv.drop_log_suppressed.saturating_add(1);
+        return;
+    }
+    let suppressed = drv.drop_log_suppressed;
+    drv.drop_log_last_ns = now;
+    drv.drop_log_suppressed = 0;
+
+    // `WARN ingress-deribit: sub-drop sym=<hex> code=<i64> ch=<i64>
+    //  suppressed=<n> ts_ns=<n>\n`
+    let mut buf = [0u8; 160];
+    let mut digits = [0u8; 20];
+    let mut n = 0usize;
+    let mut ok = true;
+    let put =
+        |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
+            &mut buf[..],
+            *n,
+            src,
+        ) {
+            Some(e) => *n = e,
+            None => *ok = false,
+        };
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        b"WARN ingress-deribit: sub-drop sym=",
+    );
+    put(&mut buf, &mut n, &mut ok, fmt_hex_u32(sym, &mut digits));
+    put(&mut buf, &mut n, &mut ok, b" code=");
+    let mut d2 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, fmt_i64(code, &mut d2));
+    put(&mut buf, &mut n, &mut ok, b" ch=");
+    let mut d3 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, fmt_i64(ch, &mut d3));
+    put(&mut buf, &mut n, &mut ok, b" suppressed=");
+    let mut d4 = [0u8; 20];
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        crate::fmt_u64(suppressed as u64, &mut d4),
+    );
+    put(&mut buf, &mut n, &mut ok, b" ts_ns=");
+    let mut d5 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, crate::fmt_u64(now, &mut d5));
+    put(&mut buf, &mut n, &mut ok, b"\n");
+    debug_assert!(ok, "drop log scratch sized for the worst case");
+    if ok {
+        // Best-effort: a torn/failed stderr write must never affect
+        // the session (the counter + capture event already landed).
+        let mut err = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut err, &buf[..n]);
     }
 }
 
@@ -1570,7 +2008,27 @@ pub fn run<T: Transport, C: Capture>(
         // §6.5: staged capture reaches disk within the flush interval
         // even on quiet feeds (one clock read + one branch per poll
         // iteration; ~50 ms cadence).
-        capture.maybe_flush(now_ns());
+        let flush_now = now_ns();
+        capture.maybe_flush(flush_now);
+
+        // WS2 (outage §5.3): establishment budget — deliberately NOT
+        // gated on `Steady`. A session wedged pre-upgrade (blackholed
+        // SYN under the non-blocking connect) or `Steady` with zero
+        // confirmed channels (subscribe refused/empty on a reconnect)
+        // is dead by policy once the budget expires. One compare per
+        // poll iteration, clock read shared with the flush above.
+        if core_net::establishment_expired(
+            flush_now,
+            session_start_ns,
+            drv.sub_count(),
+            drv.establish_budget_ns,
+        ) {
+            status.note_session_err(
+                core_metrics::ERR_SITE_ESTABLISH,
+                core_metrics::io_kind_code(io::ErrorKind::TimedOut),
+            );
+            return RunResult::EstablishTimeout;
+        }
 
         // Keepalive: proactive `public/test` when nothing has been
         // received for the ping interval; venue heartbeats and every
@@ -1747,7 +2205,16 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"www.deribit.com", b"/ws/api/v2", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"www.deribit.com",
+            b"/ws/api/v2",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = vec![0u8; 65536];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1756,7 +2223,16 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"www.deribit.com", b"/ws/api/v2", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"www.deribit.com",
+            b"/ws/api/v2",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.session_started);
         assert_eq!(status.state(), IngressState::Up);
@@ -1795,19 +2271,32 @@ mod tests {
         let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms"],"testnet":false}"#;
         inject_text(&mut t, result);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.pending_count(), 0, "subscribe retired");
         // 2 instruments × 3 channels acknowledged.
         assert_eq!(d.sub_count(), 6);
         assert_eq!(
-            d.subs.kind_of(sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL")),
+            d.subs
+                .kind_of(sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL")),
             Some(DeribitSubKind::Quote)
         );
         assert_eq!(status.parse_errors_total(), 0);
     }
 
     #[test]
-    fn subscribe_result_missing_channel_fails_the_session() {
+    fn subscribe_result_missing_channel_fails_the_session_at_boot() {
+        // WS2: BOOT fail-fast preserved — before any full
+        // verification has ever succeeded, a missing channel is
+        // fatal (refuse venue-blind).
         // debug builds crash on the debug_assert (fail-fast); the
         // release-path behaviour is a session error → reconnect.
         if cfg!(debug_assertions) {
@@ -1823,8 +2312,160 @@ mod tests {
         let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms"]}"#;
         inject_text(&mut t, result);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let e = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(status.sub_drops_total(), 0, "boot misses are not drops");
+    }
+
+    /// Records every ChannelEvent — WS2 drop-event pinning.
+    #[derive(Default)]
+    struct EventRecCap {
+        events: Vec<ChannelEvent>,
+    }
+    impl Capture for EventRecCap {
+        fn event(&mut self, e: &ChannelEvent) {
+            self.events.push(*e);
+        }
+    }
+
+    #[test]
+    fn missing_channels_on_reconnect_drop_nonfatally_and_statics_flow() {
+        // The WS2 exit test as named by the plan: instruments that
+        // expired mid-run vanish from the reconnect echo; the echoed
+        // channels register and keep flowing on the same session.
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        d.subs_ever_confirmed = true; // a boot session verified fully
+        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        // The whole ETH row (3 channels) vanished from the echo —
+        // the expired-instrument shape.
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms"]}"#;
+        inject_text(&mut t, result);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap)
+            .expect("missing channels on reconnect must be non-fatal");
+
+        assert_eq!(d.sub_count(), 3, "only the echoed subset registers");
+        assert_eq!(
+            d.subs
+                .kind_of(sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL")),
+            Some(DeribitSubKind::Quote)
+        );
+        assert_eq!(
+            d.subs
+                .kind_of(sub_id_of(DeribitChannel::Quote, b"ETH-PERPETUAL")),
+            None,
+            "missing channel never registers"
+        );
+        assert_eq!(status.sub_drops_total(), 3, "one drop per missing channel");
+        // Every drop event names the ETH row; static rows carry the
+        // channel index in v1.
+        let drops: Vec<_> = cap
+            .events
+            .iter()
+            .filter(|e| e.channel == ChannelId::SubDrop as u8)
+            .collect();
+        assert_eq!(drops.len(), 3);
+        let mut i = 0;
+        while i < drops.len() {
+            assert_eq!(drops[i].sym, (3 << 24) | 2);
+            assert_eq!(drops[i].v0, 0, "missing-from-echo carries no venue code");
+            assert!(drops[i].v1 >= 0 && drops[i].v1 < CHANNELS_PER_INSTR as i64);
+            i += 1;
+        }
+        // T1 evidence: the missing COUNT recorded without a fatal
+        // verdict.
+        let snap = status.take_last_err();
+        assert_eq!(snap.venue_code, 3);
+        assert_eq!(snap.site, 0, "no session-error site on the drop path");
+        // The surviving instrument still moves data.
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40,"best_ask_price":3996.61,"best_ask_amount":50}}}"#;
+        inject_text(&mut t, quote);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        let tick = cons.try_pop().expect("echoed channel keeps flowing");
+        assert_eq!(tick.sym, SYM_BTC);
+    }
+
+    #[test]
+    fn missing_option_row_drops_as_one_folded_bit() {
+        // Option rows fold quote+ticker into ONE mask bit — a
+        // vanished option is one drop event with v1 = -1.
+        let mut symbols = test_symbols();
+        symbols
+            .insert_option(b"BTC-29AUG26-45000-C", (3 << 24) | 513)
+            .unwrap();
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = Driver::new(7, symbols, false);
+        d.set_state(State::Steady);
+        d.session_started = true;
+        d.next_req_id = 3;
+        d.subscribe_req_id = 2;
+        d.subs_ever_confirmed = true;
+        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        // Statics fully echoed; the option's quote+ticker both
+        // missing (expired strike).
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms"]}"#;
+        inject_text(&mut t, result);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(
+            d.sub_count(),
+            6,
+            "statics register; the option row does not"
+        );
+        assert_eq!(status.sub_drops_total(), 1, "folded row = one drop");
+        let drop = cap
+            .events
+            .iter()
+            .find(|e| e.channel == ChannelId::SubDrop as u8)
+            .expect("SubDrop event captured");
+        assert_eq!(drop.sym, (3 << 24) | 513);
+        assert_eq!(drop.v1, -1, "folded option row");
+    }
+
+    #[test]
+    fn full_verification_arms_the_reconnect_discriminator() {
+        // subs_ever_confirmed flips exactly on a FULL verification
+        // and survives reset_for_reconnect (process-lifetime).
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        assert!(!d.subs_ever_confirmed);
+        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms"],"testnet":false}"#;
+        inject_text(&mut t, result);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        assert!(d.subs_ever_confirmed);
+        d.reset_for_reconnect(9);
+        assert!(d.subs_ever_confirmed, "discriminator survives reset");
+        assert_eq!(d.sub_count(), 0, "subscriptions stay connection-scoped");
     }
 
     #[test]
@@ -1838,7 +2479,16 @@ mod tests {
             &mut t,
             br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
 
         // The reply is already flushed (same drive cycle).
         let mut scratch = [0u8; 8192];
@@ -1852,8 +2502,20 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
 
         // The venue's result then retires the pending slot.
-        inject_text(&mut t, br#"{"jsonrpc":"2.0","id":3,"result":{"version":"1.2.26"}}"#);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        inject_text(
+            &mut t,
+            br#"{"jsonrpc":"2.0","id":3,"result":{"version":"1.2.26"}}"#,
+        );
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.pending_count(), 0);
         assert_eq!(status.parse_errors_total(), 0);
     }
@@ -1869,10 +2531,22 @@ mod tests {
             &mut t,
             br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"heartbeat"}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(d.pending_count(), 0, "no reply for a plain heartbeat");
-        assert!(status.last_activity_ns() > 0, "heartbeat refreshes the idle clock");
+        assert!(
+            status.last_activity_ns() > 0,
+            "heartbeat refreshes the idle clock"
+        );
         let mut scratch = [0u8; 4096];
         assert_eq!(t.drain_outgoing(&mut scratch), 0, "nothing queued");
     }
@@ -1890,13 +2564,35 @@ mod tests {
 
         let hb = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"heartbeat"}}"#;
         inject_text(&mut t, hb);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1, "heartbeat counts as a message");
-        assert_eq!(status.ticks_total(), 0, "heartbeat must not count as a tick");
+        assert_eq!(
+            status.ticks_total(),
+            0,
+            "heartbeat must not count as a tick"
+        );
 
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
         inject_text(&mut t, quote);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.ticks_total(), 1, "quote push is a tick");
         let _ = cons.try_pop().expect("tick must be pushed");
     }
@@ -1911,7 +2607,16 @@ mod tests {
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
         inject_text(&mut t, quote);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1937,14 +2642,25 @@ mod tests {
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.SOL-PERPETUAL","data":{"timestamp":1000,"best_bid_price":1.0,"best_bid_amount":1.0,"best_ask_price":2.0,"best_ask_amount":1.0}}}"#;
         inject_text(&mut t, quote);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert!(cons.try_pop().is_none());
     }
 
     #[test]
-    fn venue_error_response_fails_the_session() {
+    fn venue_error_response_fails_the_session_at_boot() {
+        // WS2: BOOT fail-fast preserved — venue errors before the
+        // first-ever full verification stay fatal.
         // debug builds crash on the debug_assert (fail-fast).
         if cfg!(debug_assertions) {
             return;
@@ -1958,8 +2674,135 @@ mod tests {
             &mut t,
             br#"{"jsonrpc":"2.0","id":9,"error":{"code":10028,"message":"too_many_requests"}}"#,
         );
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let e = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(status.sub_drops_total(), 0, "boot errors are not drops");
+    }
+
+    #[test]
+    fn venue_error_on_reconnect_is_nonfatal_and_retires_pending() {
+        // WS2: after the first-ever full verification, an RPC error
+        // completes its pending request and counts a drop — the
+        // session lives (a refused book resync degrades one lane; a
+        // refused session subscribe leaves sub_count()==0 for the
+        // establishment budget to reap).
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        d.subs_ever_confirmed = true;
+        record_pending(&mut d, 9, DeribitReqKind::BookSub).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        inject_text(
+            &mut t,
+            br#"{"jsonrpc":"2.0","id":9,"error":{"code":10028,"message":"too_many_requests"}}"#,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap)
+            .expect("post-confirmation venue error must be non-fatal");
+        assert_eq!(
+            d.pending_count(),
+            0,
+            "failed request retired from the table"
+        );
+        assert_eq!(status.sub_drops_total(), 1);
+        let drop = cap
+            .events
+            .iter()
+            .find(|e| e.channel == ChannelId::SubDrop as u8)
+            .expect("SubDrop event captured");
+        assert_eq!(drop.sym, SYMBOL_ID_NONE, "RPC errors name no instrument");
+        assert_eq!(drop.v0, 10028);
+        let snap = status.take_last_err();
+        assert_eq!(snap.venue_code as i32, 10028);
+        assert_eq!(snap.site, 0, "no session-error site on the drop path");
+    }
+
+    #[test]
+    fn establish_timeout_fires_when_nothing_confirms() {
+        // WS2 (outage §5.3): a session that never confirms a
+        // subscription dies at the establishment budget — NOT gated
+        // on Steady (here the driver never even upgrades).
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = Driver::new(1, test_symbols(), false);
+        d.set_establish_budget_ns(50_000_000); // 50 ms test budget
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let stop = StopFlag::new(false);
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let mut ka = generous_keepalive();
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
+        );
+        assert_eq!(res, RunResult::EstablishTimeout);
+        let snap = status.take_last_err();
+        assert_eq!(snap.site, core_metrics::ERR_SITE_ESTABLISH);
+    }
+
+    #[test]
+    fn establish_timeout_disarmed_by_confirmed_subscribe() {
+        // Once the subscribe result registers channels, the tiny 1 ns
+        // budget here would otherwise trip on the first iteration —
+        // instead the session lives on to the ordinary idle timeout.
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        d.set_establish_budget_ns(1);
+        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let stop = StopFlag::new(false);
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let mut ka = Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: 1,
+            idle_timeout_ns: 150_000_000,
+        });
+
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms"],"testnet":false}"#;
+        inject_text(&mut t, result);
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
+        );
+        assert_eq!(
+            res,
+            RunResult::IdleTimeout,
+            "confirmed subscribe disarms the establishment budget"
+        );
+        assert_eq!(d.sub_count(), 6);
     }
 
     #[test]
@@ -1971,10 +2814,201 @@ mod tests {
 
         let ticker = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
         inject_text(&mut t, ticker);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
-        assert!(cons.try_pop().is_none(), "tickers do not enter the Tick lane");
+        assert!(
+            cons.try_pop().is_none(),
+            "tickers do not enter the Tick lane"
+        );
+    }
+
+    #[test]
+    fn perp_ticker_emits_funding_event_dated_does_not() {
+        // WS3 (gaps §1): `current_funding_1e9` was parsed since 8c
+        // and dropped at the capture site. A perp ticker now emits a
+        // paired Funding event (v0 = rate ×1e9, v1 = 0); a DATED
+        // future's ticker (no current_funding on the wire) emits the
+        // Ticker event only — and PARSES, where pre-WS3 it was
+        // rejected wholesale.
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        let perp = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":-0.000375}}}"#;
+        // ETH-PERPETUAL row reused as the dated stand-in: the gate is
+        // the WIRE (field presence), not the instrument name.
+        let dated = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.ETH-PERPETUAL.100ms","data":{"timestamp":1550652954500,"open_interest":1234,"min_price":64000.0,"max_price":66000.0,"mark_price":65100.5,"index_price":65099.0}}}"#;
+        inject_text(&mut t, perp);
+        inject_text(&mut t, dated);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+
+        assert_eq!(status.parse_errors_total(), 0, "dated ticker must parse");
+        assert_eq!(status.msgs_total(), 2);
+        let funding: Vec<_> = cap
+            .events
+            .iter()
+            .filter(|e| e.channel == ChannelId::Funding as u8)
+            .collect();
+        assert_eq!(funding.len(), 1, "funding only from the perp ticker");
+        assert_eq!(funding[0].sym, SYM_BTC);
+        assert_eq!(funding[0].v0, -375_000, "rate ×1e9");
+        assert_eq!(funding[0].v1, 0, "no next-funding time on this venue");
+        let tickers = cap
+            .events
+            .iter()
+            .filter(|e| e.channel == ChannelId::Ticker as u8)
+            .count();
+        assert_eq!(tickers, 2, "both tickers still captured as Ticker events");
+    }
+
+    #[test]
+    fn dvol_push_captures_vol_index_event() {
+        // WS6: DVOL — venue-global capture series, ordinal identity.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new_with_dvol(7, test_symbols(), false, &[b"btc_usd", b"eth_usd"]);
+        d.set_state(State::Steady);
+        d.session_started = true;
+        d.next_req_id = 3;
+        d.subscribe_req_id = 2;
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        let push = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_volatility_index.eth_usd","data":{"timestamp":1619777946007,"volatility":72.5,"index_name":"eth_usd"}}}"#;
+        inject_text(&mut t, push);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        let ev = cap
+            .events
+            .iter()
+            .find(|e| e.channel == ChannelId::VolIndex as u8)
+            .expect("VolIndex event captured");
+        assert_eq!(ev.sym, SYMBOL_ID_NONE, "venue-global series");
+        assert_eq!(ev.v0, 72_500_000_000, "points ×1e9");
+        assert_eq!(ev.v1, 1, "ordinal of eth_usd in the configured list");
+        assert_eq!(ev.venue_time_ms, 1_619_777_946_007);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.ticks_total(), 1, "market-data row counted");
+
+        // A push for an index we never configured is counted noise.
+        let foreign = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_volatility_index.sol_usd","data":{"timestamp":1,"volatility":50.0,"index_name":"sol_usd"}}}"#;
+        inject_text(&mut t, foreign);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.parse_errors_total(), 1);
+    }
+
+    #[test]
+    fn spot_row_verification_and_registration_skip_ticker() {
+        // WS6: a spot static row (no `-` in the name) wants
+        // quote + trades only — the subscribe echo without a spot
+        // ticker passes FULL verification and arms the WS2
+        // discriminator.
+        let mut symbols = DeribitSymbolTable::new();
+        symbols.insert(b"BTC-PERPETUAL", SYM_BTC).unwrap();
+        symbols.insert(b"BTC_USDC", (3 << 24) | 2).unwrap();
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = Driver::new(7, symbols, false);
+        d.set_state(State::Steady);
+        d.session_started = true;
+        d.next_req_id = 3;
+        d.subscribe_req_id = 2;
+        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.BTC_USDC","trades.BTC_USDC.100ms"],"testnet":false}"#;
+        inject_text(&mut t, result);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .expect("spot echo without ticker is a FULL verification");
+        assert!(
+            d.subs_ever_confirmed,
+            "full verification armed the discriminator"
+        );
+        assert_eq!(d.sub_count(), 5, "3 perp + 2 spot channels registered");
+        assert_eq!(status.sub_drops_total(), 0);
+        // Spot quote flows as a Tick like any static row.
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC_USDC","data":{"timestamp":1550658624149,"instrument_name":"BTC_USDC","best_bid_price":64000.5,"best_bid_amount":1.0,"best_ask_price":64001.0,"best_ask_amount":2.0}}}"#;
+        inject_text(&mut t, quote);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let tick = cons.try_pop().expect("spot BBO rings");
+        assert_eq!(tick.sym, (3 << 24) | 2);
+    }
+
+    #[test]
+    fn combo_row_quote_only_verification_and_flow() {
+        // WS6: combo rows are quote-only tail rows — one folded mask
+        // bit, echo of the quote alone fully verifies, and the combo
+        // BBO captures as a Tick.
+        let mut symbols = test_symbols();
+        symbols
+            .insert_combo(b"BTC-FS-27MAR26_PERP", (3 << 24) | 1025)
+            .unwrap();
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = Driver::new(7, symbols, false);
+        d.set_state(State::Steady);
+        d.session_started = true;
+        d.next_req_id = 3;
+        d.subscribe_req_id = 2;
+        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms","quote.BTC-FS-27MAR26_PERP"],"testnet":false}"#;
+        inject_text(&mut t, result);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .expect("combo quote echo fully verifies");
+        assert!(d.subs_ever_confirmed);
+        assert_eq!(d.sub_count(), 7, "6 static channels + 1 combo quote");
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-FS-27MAR26_PERP","data":{"timestamp":1550658624149,"instrument_name":"BTC-FS-27MAR26_PERP","best_bid_price":-25.5,"best_bid_amount":10.0,"best_ask_price":-24.0,"best_ask_amount":5.0}}}"#;
+        inject_text(&mut t, quote);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let tick = cons.try_pop().expect("combo BBO rings");
+        assert_eq!(tick.sym, (3 << 24) | 1025);
     }
 
     #[test]
@@ -2010,7 +3044,11 @@ mod tests {
         assert_eq!(g.3, 2000, "venue_time_ms from the broken frame");
         assert_eq!(g.4, 10, "v0 = expected prev_change_id");
         assert_eq!(g.5, 99, "v1 = observed prev_change_id");
-        assert_eq!(d.pending_count(), pending_before + 2, "unsub + sub in flight");
+        assert_eq!(
+            d.pending_count(),
+            pending_before + 2,
+            "unsub + sub in flight"
+        );
         let n = t.drain_outgoing(&mut scratch);
         let body = unmask_client_frames(&scratch[..n]);
         let unsub_at = memchr::memmem::find(&body, b"\"method\":\"public/unsubscribe\"")
@@ -2040,7 +3078,8 @@ mod tests {
     impl core_types::Capture for GapEventRecorder {
         fn event(&mut self, e: &ChannelEvent) {
             if e.channel == ChannelId::TradeGap as u8 || e.channel == ChannelId::BookGap as u8 {
-                self.gaps.push((e.channel, e.sym, e.venue_seq, e.venue_time_ms, e.v0, e.v1));
+                self.gaps
+                    .push((e.channel, e.sym, e.venue_seq, e.venue_time_ms, e.v0, e.v1));
             } else if e.channel == ChannelId::Trade as u8 {
                 self.trade_rows += 1;
             }
@@ -2179,7 +3218,11 @@ mod tests {
         let f2 = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":53,"trade_id":"3","timestamp":2000,"price":1.0,"direction":"buy","amount":1.0}]}}"#;
         inject_text(&mut t, f2);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
-        assert_eq!(status.gaps_total(), 1, "52 → 53 chains off the adopted tail");
+        assert_eq!(
+            status.gaps_total(),
+            1,
+            "52 → 53 chains off the adopted tail"
+        );
         assert_eq!(cap.gaps.len(), 1);
     }
 
@@ -2203,12 +3246,24 @@ mod tests {
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(status.msgs_total(), 3);
         assert_eq!(status.gaps_total(), 2, "one jump + one regression");
-        assert_eq!(status.resubscribes_total(), 0, "trades are never resubscribed");
+        assert_eq!(
+            status.resubscribes_total(),
+            0,
+            "trades are never resubscribed"
+        );
         assert_eq!(status.parse_errors_total(), 0);
         // §6.6 pairing: both increments carry TradeGap events.
         assert_eq!(cap.gaps.len(), 2, "1:1 event pairing");
-        assert_eq!((cap.gaps[0].4, cap.gaps[0].5), (51, 52), "jump: expected 51, observed 52");
-        assert_eq!((cap.gaps[1].4, cap.gaps[1].5), (53, 40), "regression: expected 53, observed 40");
+        assert_eq!(
+            (cap.gaps[0].4, cap.gaps[0].5),
+            (51, 52),
+            "jump: expected 51, observed 52"
+        );
+        assert_eq!(
+            (cap.gaps[1].4, cap.gaps[1].5),
+            (53, 40),
+            "regression: expected 53, observed 40"
+        );
     }
 
     #[test]
@@ -2221,7 +3276,16 @@ mod tests {
         let multi = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":50,"trade_id":"1","timestamp":1000,"price":1.0,"direction":"buy","amount":1.0},{"trade_seq":51,"trade_id":"2","timestamp":1001,"price":1.1,"direction":"sell","amount":2.0}]}}"#;
         inject_text(&mut t, multi);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 2, "both rows counted");
         assert_eq!(status.gaps_total(), 0, "50 → 51 chains");
     }
@@ -2324,12 +3388,17 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
         let mut cap = CountingCapture::default();
 
-        // A ticker alone first — pins the Ticker event channel.
+        // A perp ticker alone first — pins the Ticker event channel
+        // PLUS the WS3 funding emit (v0 = rate ×1e9, gated on the
+        // wire carrying `current_funding`).
         let ticker = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"index_price":3931.73,"current_funding":0.00042}}}"#;
         inject_text(&mut t, ticker);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
-        assert_eq!(cap.events, 1, "ticker captured as event");
-        assert_eq!(cap.last_event_channel, core_types::ChannelId::Ticker as u8);
+        assert_eq!(
+            cap.events, 2,
+            "perp ticker captures Ticker + Funding events"
+        );
+        assert_eq!(cap.last_event_channel, core_types::ChannelId::Funding as u8);
         assert_eq!(cap.ticks, 0, "tickers do not enter the Tick lane");
 
         // One quote (tick + raw), one trades push with one good + one
@@ -2345,7 +3414,7 @@ mod tests {
 
         assert_eq!(cap.raw_frames, 4, "every data payload is tapped");
         assert_eq!(cap.ticks, 1, "quote captured as tick");
-        assert_eq!(cap.events, 2, "one good trade row captured");
+        assert_eq!(cap.events, 3, "one good trade row captured");
         assert_eq!(cap.last_event_channel, core_types::ChannelId::Trade as u8);
         assert_eq!(
             cap.rejects, 2,
@@ -2353,17 +3422,18 @@ mod tests {
         );
         assert_eq!(status.parse_errors_total(), 2);
         // Tick still captured when the ring is full: fill it, resend.
-        while prod.try_push(Tick::new(
-            1,
-            VenueId::Deribit,
-            SYM_BTC,
-            1,
-            Price::from_raw(1),
-            Qty::from_raw(1),
-            Price::from_raw(2),
-            Qty::from_raw(1),
-        ))
-        .is_ok()
+        while prod
+            .try_push(Tick::new(
+                1,
+                VenueId::Deribit,
+                SYM_BTC,
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+            ))
+            .is_ok()
         {}
         inject_text(&mut t, quote);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
@@ -2380,7 +3450,16 @@ mod tests {
 
         // id 55 was never sent by us.
         inject_text(&mut t, br#"{"jsonrpc":"2.0","id":55,"result":"ok"}"#);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
     }
@@ -2401,7 +3480,16 @@ mod tests {
         junk[2..10].copy_from_slice(&declared.to_be_bytes());
         t.inject_incoming(&junk);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let e = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -2410,7 +3498,10 @@ mod tests {
         let mut d = steady_driver(true);
         record_pending(&mut d, 9, DeribitReqKind::Test).unwrap();
         d.subs
-            .insert(sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL"), DeribitSubKind::Quote)
+            .insert(
+                sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL"),
+                DeribitSubKind::Quote,
+            )
             .unwrap();
         assert_eq!(
             d.book_chains[0].apply(crate::BOOK_ACTION_SNAPSHOT, -1, 5),
@@ -2445,8 +3536,18 @@ mod tests {
         });
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -2467,8 +3568,18 @@ mod tests {
         });
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
         let mut scratch = [0u8; 4096];
@@ -2494,8 +3605,18 @@ mod tests {
         let mut ka = generous_keepalive();
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::Disconnected);
         assert_eq!(status.bytes_total(), 2);

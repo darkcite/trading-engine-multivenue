@@ -16,9 +16,34 @@
 //! `{"op":"subscribe","args":[...]}` op covering every configured
 //! `(channel × instrument)` pair — OKX budgets 480 sub/unsub ops per
 //! hour, so batching is mandatory (§4.1). Acks land in a
-//! `core_net::SubTable`; venue `error` events are **fatal** for the
-//! session (fail-fast: a rejected subscribe means misconfiguration —
-//! surface it, reconnect with backoff, let the operator see it).
+//! `core_net::SubTable`.
+//!
+//! ## Venue-error policy (WS2 — outage 2026-08-27 §5.2)
+//!
+//! Venue `error` events are **fatal only until this process has ever
+//! received a subscribe ack** from the venue (fail-fast at BOOT: a
+//! rejected first-ever subscribe means misconfiguration — refuse to
+//! run venue-blind). Once any subscribe has ever been acknowledged,
+//! an error event is a NON-FATAL PER-ARG DROP: the venue processes
+//! batched args individually (§5.4 proved good args keep flowing
+//! beside a rejected one), so the instrument the error names — the
+//! post-settlement expired-option class — is simply not subscribed
+//! this session while everything else lives. Each drop increments
+//! `sub_drops_total`, emits one paired `ChannelId::SubDrop` capture
+//! event (§6.6 pairing) and a rate-limited stderr WARN. Reconnects
+//! re-send the full configured set (the drop is session-scoped); the
+//! 0830/1605 slot restarts remain the chain-refresh mechanism.
+//!
+//! ## Establishment budget (WS2 — outage §5.3)
+//!
+//! The keepalive idle timeout is gated on `Steady`, so a session
+//! wedged in `Connecting`/`AwaitingWsUpgrade` (blackholed SYN under a
+//! non-blocking connect) — or `Steady` with ZERO acknowledged
+//! subscriptions, kept "active" by pong replies — could previously
+//! live forever. [`run`] now tears the session down with
+//! [`RunResult::EstablishTimeout`] when no subscription has been
+//! acknowledged within the driver's establishment budget
+//! (`core_net::ESTABLISH_BUDGET_NS` default).
 //!
 //! Keepalive is the venue-specific literal `ping` text frame queued
 //! by [`run`] when `core_net::Keepalive` says so (25 s interval vs
@@ -41,17 +66,19 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    ReqKind, Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
+    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, ReqKind,
+    Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
-use core_types::{Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId};
+use core_types::{
+    Capture, ChannelEvent, ChannelId, OptSummary, Price, Qty, Tick, VenueId, SYMBOL_ID_NONE,
+};
 
 use crate::{
-    classify, extract_inst_id, parse_bbo, parse_book_header, parse_trade, sub_id_of,
-    write_subscribe_batch, write_unsubscribe_batch, ChainOutcome, OkxChannel, OkxInstType,
-    OkxMsgKind, OkxSeqChain, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome,
+    classify, extract_error_inst_id, extract_inst_id, parse_bbo, parse_book_header, parse_trade,
+    sub_id_of, write_subscribe_batch, write_unsubscribe_batch, ChainOutcome, OkxChannel,
+    OkxInstType, OkxMsgKind, OkxSeqChain, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome,
     OKX_MAX_SYMBOLS, PING_PAYLOAD,
 };
 
@@ -90,8 +117,7 @@ pub const OPT_FAMILIES_MAX: usize = 16;
 /// ([`crate::OKX_OPT_MAX`]) + one family-keyed `opt-summary` arg per
 /// configured underlying ([`OPT_FAMILIES_MAX`], M2.3) =
 /// 80 + 64 + 16 = 160.
-pub const MAX_SUB_ARGS: usize =
-    5 * crate::OKX_STATIC_MAX + crate::OKX_OPT_MAX + OPT_FAMILIES_MAX;
+pub const MAX_SUB_ARGS: usize = 5 * crate::OKX_STATIC_MAX + crate::OKX_OPT_MAX + OPT_FAMILIES_MAX;
 
 /// Stack scratch for one rendered subscribe batch (~46 B/arg × 144
 /// args ≈ 6.7 KiB; ~2× margin).
@@ -176,8 +202,15 @@ pub enum RunResult {
     /// No inbound bytes within the keepalive idle budget — caller
     /// reconnects.
     IdleTimeout,
+    /// WS2 (outage §5.3): no subscription was acknowledged within the
+    /// establishment budget — the session never got past the
+    /// handshake, or the venue refused every arg. Caller reconnects;
+    /// the backoff keeps ESCALATING (no market data moved, so the
+    /// T1(b) reset predicate stays false — deliberately unlike
+    /// `IdleTimeout`'s venue-quiet reset).
+    EstablishTimeout,
     /// Fatal transport / protocol error (includes venue `error`
-    /// events — fail-fast).
+    /// events at BOOT — see the module's venue-error policy).
     Error,
 }
 
@@ -219,6 +252,24 @@ pub struct Driver {
     n_families: usize,
     /// Set once the post-upgrade subscribe batch has been queued.
     subscribed: bool,
+    /// WS2: PROCESS-LIFETIME flag — true once ANY subscribe ack has
+    /// ever been applied by this driver. While false, venue error
+    /// events stay fatal (boot fail-fast: refuse venue-blind
+    /// configs); once true, they become non-fatal per-arg drops.
+    /// Deliberately NOT cleared by [`Self::reset_for_reconnect`].
+    subs_ever_acked: bool,
+    /// WS2: establishment budget (ns from session start to the first
+    /// subscribe ack) enforced by [`run`]. Defaults to
+    /// [`core_net::ESTABLISH_BUDGET_NS`]; overridable for tests /
+    /// operator tuning via [`Self::set_establish_budget_ns`].
+    establish_budget_ns: u64,
+    /// WS2 drop-log rate limiter: wall ns of the last emitted
+    /// sub-drop WARN line. NOT session state (operator-terminal
+    /// budget) — survives reconnects, like the Deribit gap logger's.
+    drop_log_last_ns: u64,
+    /// Drop increments swallowed by the rate limit since the last
+    /// emitted line (surfaces as `suppressed=` on the next one).
+    drop_log_suppressed: u32,
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -245,7 +296,10 @@ impl Driver {
         while i < families.len() {
             let f = families[i];
             if f.is_empty() || f.len() > 24 || n_families >= OPT_FAMILIES_MAX {
-                debug_assert!(false, "family entry dropped (len/cap) — config layer caps this");
+                debug_assert!(
+                    false,
+                    "family entry dropped (len/cap) — config layer caps this"
+                );
                 i += 1;
                 continue;
             }
@@ -270,8 +324,19 @@ impl Driver {
             families: fam,
             n_families,
             subscribed: false,
+            subs_ever_acked: false,
+            establish_budget_ns: core_net::ESTABLISH_BUDGET_NS,
+            drop_log_last_ns: 0,
+            drop_log_suppressed: 0,
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// WS2: override the establishment budget (tests use millisecond
+    /// budgets; production keeps the default).
+    #[inline]
+    pub fn set_establish_budget_ns(&mut self, ns: u64) {
+        self.establish_budget_ns = ns;
     }
 
     /// Current state (metrics + tests).
@@ -294,7 +359,9 @@ impl Driver {
 
     /// Reset per-connection state for a reconnect. Subscriptions and
     /// integrity chains are connection-scoped: tables clear, chains
-    /// re-arm for fresh snapshots.
+    /// re-arm for fresh snapshots. `subs_ever_acked` (WS2 boot/
+    /// reconnect discriminator), the establishment budget and the
+    /// drop-log rate limiter are process-lifetime — untouched here.
     pub fn reset_for_reconnect(&mut self, nonce_seed: u64) {
         self.state = State::Connecting;
         self.rx.clear();
@@ -378,7 +445,7 @@ pub fn note_transport_ready(drv: &mut Driver, status: Status) {
 // ---------------------------------------------------------------
 
 fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    if drv.tx.len() == 0 {
+    if drv.tx.is_empty() {
         return Ok(());
     }
     let mut written = 0;
@@ -489,7 +556,10 @@ fn build_sub_args<'a>(
     }
     let mut i = 0;
     while let Some((inst, _sym, inst_type)) = symbols.get(i) {
-        out[n] = Some(SubArg { channel: OkxChannel::BboTbt, inst_id: inst });
+        out[n] = Some(SubArg {
+            channel: OkxChannel::BboTbt,
+            inst_id: inst,
+        });
         n += 1;
         // M2.2: capped-chain OPTION rows are bbo-tbt ONLY — no
         // trades/mark/funding/books (the mark/IV `opt-summary`
@@ -498,18 +568,30 @@ fn build_sub_args<'a>(
             i += 1;
             continue;
         }
-        out[n] = Some(SubArg { channel: OkxChannel::Trades, inst_id: inst });
+        out[n] = Some(SubArg {
+            channel: OkxChannel::Trades,
+            inst_id: inst,
+        });
         n += 1;
         if matches!(inst_type, OkxInstType::Swap | OkxInstType::Futures) {
-            out[n] = Some(SubArg { channel: OkxChannel::MarkPrice, inst_id: inst });
+            out[n] = Some(SubArg {
+                channel: OkxChannel::MarkPrice,
+                inst_id: inst,
+            });
             n += 1;
         }
         if inst_type == OkxInstType::Swap {
-            out[n] = Some(SubArg { channel: OkxChannel::FundingRate, inst_id: inst });
+            out[n] = Some(SubArg {
+                channel: OkxChannel::FundingRate,
+                inst_id: inst,
+            });
             n += 1;
         }
         if depth_enabled {
-            out[n] = Some(SubArg { channel: OkxChannel::Books, inst_id: inst });
+            out[n] = Some(SubArg {
+                channel: OkxChannel::Books,
+                inst_id: inst,
+            });
             n += 1;
         }
         i += 1;
@@ -519,7 +601,10 @@ fn build_sub_args<'a>(
 
 /// Queue the single batched subscribe op for every configured pair.
 fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
-    debug_assert!(!drv.subscribed, "subscribe batch must be queued exactly once");
+    debug_assert!(
+        !drv.subscribed,
+        "subscribe batch must be queued exactly once"
+    );
     let mut args_buf: [Option<SubArg<'_>>; MAX_SUB_ARGS] = [None; MAX_SUB_ARGS];
     let n_args = build_sub_args(
         &drv.symbols,
@@ -556,7 +641,10 @@ fn queue_books_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
         debug_assert!(false, "resync for unknown symbol row {sym_idx}");
         return Ok(());
     };
-    let args = [SubArg { channel: OkxChannel::Books, inst_id: inst }];
+    let args = [SubArg {
+        channel: OkxChannel::Books,
+        inst_id: inst,
+    }];
     let mut scratch = [0u8; 256];
     let n = write_unsubscribe_batch(&mut scratch, &args)
         .ok_or_else(|| io::Error::other("okx: resync scratch too small"))?;
@@ -590,8 +678,11 @@ enum Dispatch {
     Quiet,
     /// Subscribe ack for one arg.
     SubAck { id: SubId, kind: OkxSubKind },
-    /// Venue error event — fatal (fail-fast).
-    VenueError { code: u32 },
+    /// Venue error event. Fatal at boot; a non-fatal per-arg drop on
+    /// reconnect (WS2 — module doc). `sym` = the instrument the error
+    /// msg names, resolved against the table (`SYMBOL_ID_NONE` when
+    /// the error names none).
+    VenueError { code: u32, sym: u32 },
     /// `bbo-tbt` push became a Tick.
     Bbo { tick: Tick },
     /// `trades` push scanned.
@@ -634,7 +725,13 @@ fn drain_ws_frames<C: Capture>(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_data_frame(drv, payload.start..payload.end, producer, status, capture)?;
+                        handle_data_frame(
+                            drv,
+                            payload.start..payload.end,
+                            producer,
+                            status,
+                            capture,
+                        )?;
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -810,18 +907,23 @@ fn handle_data_frame<C: Capture>(
         match classify(payload) {
             OkxMsgKind::Pong => Dispatch::Quiet,
             OkxMsgKind::UnsubAck => Dispatch::Quiet,
-            OkxMsgKind::Error(code) => Dispatch::VenueError { code },
+            OkxMsgKind::Error(code) => Dispatch::VenueError {
+                code,
+                // WS2: best-effort — the failing instrument is named
+                // inside the msg TEXT for the 60018 class.
+                sym: extract_error_inst_id(payload)
+                    .and_then(|inst| drv.symbols.lookup(inst))
+                    .unwrap_or(SYMBOL_ID_NONE),
+            },
             OkxMsgKind::SubAck => match ack_channel(payload) {
                 // M2.3: the opt-summary ack arg is FAMILY-keyed.
-                Some(OkxChannel::OptSummary) => {
-                    match crate::extract_inst_family(payload) {
-                        Some(fam) => Dispatch::SubAck {
-                            id: sub_id_of(OkxChannel::OptSummary, fam),
-                            kind: OkxSubKind::OptSummary,
-                        },
-                        None => Dispatch::Nothing,
-                    }
-                }
+                Some(OkxChannel::OptSummary) => match crate::extract_inst_family(payload) {
+                    Some(fam) => Dispatch::SubAck {
+                        id: sub_id_of(OkxChannel::OptSummary, fam),
+                        kind: OkxSubKind::OptSummary,
+                    },
+                    None => Dispatch::Nothing,
+                },
                 Some(ch) => match extract_inst_id(payload) {
                     Some(inst) => Dispatch::SubAck {
                         id: sub_id_of(ch, inst),
@@ -951,6 +1053,10 @@ fn handle_data_frame<C: Capture>(
         Dispatch::Quiet => {}
         Dispatch::SubAck { id, kind } => {
             status.add_msgs(1);
+            // WS2: any applied ack proves the config is not venue-
+            // blind — venue errors become non-fatal drops from here
+            // on, for the rest of the PROCESS (survives reconnects).
+            drv.subs_ever_acked = true;
             match drv.subs.insert(id, kind) {
                 Ok(()) => {}
                 Err(SubErr::ReservedId) => {}
@@ -959,26 +1065,49 @@ fn handle_data_frame<C: Capture>(
                 }
             }
         }
-        Dispatch::VenueError { code } => {
-            // Fail-fast doctrine: a venue error event means our
-            // subscribe (or framing) is wrong. Crash loudly in debug,
-            // surface a session error in release — the reconnect
-            // path applies backoff and the operator sees it.
+        Dispatch::VenueError { code, sym } => {
             // T1(a) (outage 2026-08-27 §5.2): the parsed numeric code
             // was discarded at this boundary for six days of outage —
-            // record it first-wins so the run-loop-returned log line
+            // record it first-wins so a later session-death log line
             // names it (post-settlement expect 60018-class instId
-            // errors).
+            // errors). Recorded on BOTH paths below: on the drop path
+            // it is evidence, not an error verdict.
             status.note_venue_err_code(code);
-            status.note_session_err(
-                core_metrics::ERR_SITE_VENUE_ERROR,
-                core_metrics::io_kind_code(io::ErrorKind::InvalidData),
-            );
-            debug_assert!(false, "okx venue error event, code={code}");
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "okx venue error event",
+            if !drv.subs_ever_acked {
+                // BOOT fail-fast (unchanged doctrine): the first-ever
+                // subscribe of a config drew an error before any ack —
+                // misconfiguration; refuse to run venue-blind. Crash
+                // loudly in debug, surface a session error in release
+                // (reconnect w/ backoff, operator sees it).
+                status.note_session_err(
+                    core_metrics::ERR_SITE_VENUE_ERROR,
+                    core_metrics::io_kind_code(io::ErrorKind::InvalidData),
+                );
+                debug_assert!(false, "okx venue error event at boot, code={code}");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "okx venue error event",
+                ));
+            }
+            // WS2 NON-FATAL DROP (outage §5.2): the venue processes
+            // batched args individually — this error rejected ONE arg
+            // (expired instrument on reconnect, or the §5.4 chronic
+            // arg); everything else on the session keeps flowing. The
+            // venue itself refused the subscription, so there is
+            // nothing to unsubscribe: count it, pair it with a
+            // capture event (§6.6), name it on stderr, carry on.
+            status.inc_sub_drops();
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Okx,
+                ChannelId::SubDrop,
+                sym,
+                0,
+                0,
+                code as i64,
+                -1, // OKX errors do not reliably name the channel
             ));
+            log_sub_drop_rate_limited(drv, sym, code);
         }
         Dispatch::Bbo { tick } => {
             status.add_msgs(1);
@@ -1070,6 +1199,108 @@ fn ack_channel(payload: &[u8]) -> Option<OkxChannel> {
         return Some(OkxChannel::OptSummary);
     }
     None
+}
+
+// ---------------------------------------------------------------
+// WS2 sub-drop logging (rate-limited, zero-alloc)
+// ---------------------------------------------------------------
+
+/// Minimum interval between emitted sub-drop WARN lines (operator-
+/// terminal budget; the 1:1 evidence channel is the paired
+/// `ChannelId::SubDrop` capture event, not the log — same contract
+/// as the Deribit gap logger).
+const DROP_LOG_INTERVAL_NS: u64 = 1_000_000_000;
+
+/// Render `v` as decimal ASCII into the tail of `scratch`.
+#[inline]
+fn fmt_u64(mut v: u64, scratch: &mut [u8; 20]) -> &[u8] {
+    let mut i = scratch.len();
+    loop {
+        i -= 1;
+        scratch[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &scratch[i..]
+}
+
+/// Render `v` as `0x`-prefixed lowercase hex (SymbolId display form —
+/// matches the audit tool's `sym=0x...` rendering).
+#[inline]
+fn fmt_hex_u32(v: u32, scratch: &mut [u8; 12]) -> &[u8] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    scratch[0] = b'0';
+    scratch[1] = b'x';
+    let mut i = 2;
+    let mut shift = 32;
+    while shift > 0 {
+        shift -= 4;
+        scratch[i] = HEX[((v >> shift) & 0xF) as usize];
+        i += 1;
+    }
+    &scratch[..10]
+}
+
+/// Rate-limited (1 line / [`DROP_LOG_INTERVAL_NS`]) WS2 sub-drop WARN
+/// line. Zero-alloc: rendered into stack scratch, one `write_all` to
+/// stderr (interleaves with the cli's tracing lines at line
+/// granularity). Drops inside the rate-limit window surface as
+/// `suppressed=` on the next emitted line. Best-effort: a failed
+/// stderr write never affects the session (counter + capture event
+/// already landed). Cold path — fires only on venue rejections.
+fn log_sub_drop_rate_limited(drv: &mut Driver, sym: u32, code: u32) {
+    let now = now_ns();
+    if now.wrapping_sub(drv.drop_log_last_ns) < DROP_LOG_INTERVAL_NS {
+        drv.drop_log_suppressed = drv.drop_log_suppressed.saturating_add(1);
+        return;
+    }
+    let suppressed = drv.drop_log_suppressed;
+    drv.drop_log_last_ns = now;
+    drv.drop_log_suppressed = 0;
+
+    // `WARN ingress-okx: sub-drop sym=<hex> code=<u32>
+    //  suppressed=<n> ts_ns=<n>\n`
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    let mut ok = true;
+    let put = |buf: &mut [u8; 128], n: &mut usize, ok: &mut bool, src: &[u8]| {
+        if *n + src.len() <= buf.len() {
+            buf[*n..*n + src.len()].copy_from_slice(src);
+            *n += src.len();
+        } else {
+            *ok = false;
+        }
+    };
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        b"WARN ingress-okx: sub-drop sym=",
+    );
+    let mut h = [0u8; 12];
+    put(&mut buf, &mut n, &mut ok, fmt_hex_u32(sym, &mut h));
+    put(&mut buf, &mut n, &mut ok, b" code=");
+    let mut d1 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, fmt_u64(code as u64, &mut d1));
+    put(&mut buf, &mut n, &mut ok, b" suppressed=");
+    let mut d2 = [0u8; 20];
+    put(
+        &mut buf,
+        &mut n,
+        &mut ok,
+        fmt_u64(suppressed as u64, &mut d2),
+    );
+    put(&mut buf, &mut n, &mut ok, b" ts_ns=");
+    let mut d3 = [0u8; 20];
+    put(&mut buf, &mut n, &mut ok, fmt_u64(now, &mut d3));
+    put(&mut buf, &mut n, &mut ok, b"\n");
+    debug_assert!(ok, "drop log scratch sized for the worst case");
+    if ok {
+        let mut err = std::io::stderr().lock();
+        let _ = std::io::Write::write_all(&mut err, &buf[..n]);
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1166,7 +1397,28 @@ pub fn run<T: Transport, C: Capture>(
         // §6.5: staged capture reaches disk within the flush interval
         // even on quiet feeds (one clock read + one branch per poll
         // iteration; ~50 ms cadence).
-        capture.maybe_flush(now_ns());
+        let flush_now = now_ns();
+        capture.maybe_flush(flush_now);
+
+        // WS2 (outage §5.3): establishment budget — deliberately NOT
+        // gated on `Steady`. A session wedged pre-upgrade (blackholed
+        // SYN under the non-blocking connect) or sitting in `Steady`
+        // with zero acknowledged subscriptions (kept "active" only by
+        // pong replies) is dead by policy once the budget expires.
+        // One compare per poll iteration, clock read shared with the
+        // flush above.
+        if core_net::establishment_expired(
+            flush_now,
+            session_start_ns,
+            drv.sub_count(),
+            drv.establish_budget_ns,
+        ) {
+            status.note_session_err(
+                core_metrics::ERR_SITE_ESTABLISH,
+                core_metrics::io_kind_code(io::ErrorKind::TimedOut),
+            );
+            return RunResult::EstablishTimeout;
+        }
 
         // Keepalive: OKX wants a literal `ping` text frame; the
         // venue's `pong` (or any push) refreshes the activity clock.
@@ -1232,7 +1484,8 @@ mod tests {
     fn test_symbols() -> OkxSymbolTable {
         let mut t = OkxSymbolTable::new();
         t.insert(b"BTC-USDT", SYM_BTC, OkxInstType::Spot).unwrap();
-        t.insert(b"ETH-USD-SWAP", (2 << 24) | 2, OkxInstType::Swap).unwrap();
+        t.insert(b"ETH-USD-SWAP", (2 << 24) | 2, OkxInstType::Swap)
+            .unwrap();
         t
     }
 
@@ -1263,8 +1516,12 @@ mod tests {
     #[test]
     fn opt_summary_scan_captures_ours_skips_foreign_rejects_bad() {
         let mut t = test_symbols();
-        t.insert(b"BTC-USD-260327-100000-C", (2 << 24) | 513, OkxInstType::Option)
-            .unwrap();
+        t.insert(
+            b"BTC-USD-260327-100000-C",
+            (2 << 24) | 513,
+            OkxInstType::Option,
+        )
+        .unwrap();
         // Family push: one OUR row, one foreign-family row (skip), one
         // OUR row malformed (reject). Foreign malformed rows are also
         // free skips — only OUR rows can reject.
@@ -1273,7 +1530,10 @@ mod tests {
           {"instId":"BTC-USD-260327-90000-P","markVol":"0.7","fwdPx":"77300.12","deltaBS":"-0.2","gammaBS":"0.00001","thetaBS":"-40.0","vegaBS":"100.0"},
           {"instId":"BTC-USD-260327-100000-C","markVol":"","fwdPx":"77300.12","deltaBS":"0.5","gammaBS":"0","thetaBS":"0","vegaBS":"0"}
         ]}"#;
-        let mut cap = RecCap { records: Vec::new(), rejects: 0 };
+        let mut cap = RecCap {
+            records: Vec::new(),
+            rejects: 0,
+        };
         let scan = scan_opt_summaries(payload, &t, &mut cap);
         assert_eq!(scan.rows_parsed, 1);
         assert_eq!(scan.rows_rejected, 1); // the malformed OUR row
@@ -1314,8 +1574,12 @@ mod tests {
         // M2.2: an OPTION row contributes exactly one bbo-tbt arg —
         // no trades/mark/funding, and depth never touches it.
         let mut t = test_symbols(); // spot: 2 args; swap: 4 args (no depth)
-        t.insert(b"BTC-USD-260327-100000-C", (2 << 24) | 513, OkxInstType::Option)
-            .unwrap();
+        t.insert(
+            b"BTC-USD-260327-100000-C",
+            (2 << 24) | 513,
+            OkxInstType::Option,
+        )
+        .unwrap();
         let mut buf: [Option<SubArg<'_>>; MAX_SUB_ARGS] = [None; MAX_SUB_ARGS];
         let n = build_sub_args(&t, false, &[], &mut buf);
         // spot(bbo,trades)=2 + swap(bbo,trades,mark,funding)=4 + option(bbo)=1.
@@ -1437,7 +1701,16 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"ws.okx.com", b"/ws/v5/public", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"ws.okx.com",
+            b"/ws/v5/public",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = vec![0u8; 65536];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1446,7 +1719,16 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"ws.okx.com", b"/ws/v5/public", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"ws.okx.com",
+            b"/ws/v5/public",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.subscribed);
         assert_eq!(status.state(), IngressState::Up);
@@ -1455,13 +1737,31 @@ mod tests {
         let body = unmask_client_frames(&scratch[..n]);
         // One batched op containing every configured pair.
         assert!(memchr::memmem::find(&body, b"\"op\":\"subscribe\"").is_some());
-        assert!(memchr::memmem::find(&body, b"{\"channel\":\"bbo-tbt\",\"instId\":\"BTC-USDT\"}").is_some());
-        assert!(memchr::memmem::find(&body, b"{\"channel\":\"trades\",\"instId\":\"ETH-USD-SWAP\"}").is_some());
+        assert!(
+            memchr::memmem::find(&body, b"{\"channel\":\"bbo-tbt\",\"instId\":\"BTC-USDT\"}")
+                .is_some()
+        );
+        assert!(memchr::memmem::find(
+            &body,
+            b"{\"channel\":\"trades\",\"instId\":\"ETH-USD-SWAP\"}"
+        )
+        .is_some());
         // -SWAP gating: mark/funding only on the swap instrument.
-        assert!(memchr::memmem::find(&body, b"{\"channel\":\"funding-rate\",\"instId\":\"ETH-USD-SWAP\"}").is_some());
-        assert!(memchr::memmem::find(&body, b"{\"channel\":\"funding-rate\",\"instId\":\"BTC-USDT\"}").is_none());
+        assert!(memchr::memmem::find(
+            &body,
+            b"{\"channel\":\"funding-rate\",\"instId\":\"ETH-USD-SWAP\"}"
+        )
+        .is_some());
+        assert!(memchr::memmem::find(
+            &body,
+            b"{\"channel\":\"funding-rate\",\"instId\":\"BTC-USDT\"}"
+        )
+        .is_none());
         // Depth enabled: books present.
-        assert!(memchr::memmem::find(&body, b"{\"channel\":\"books\",\"instId\":\"BTC-USDT\"}").is_some());
+        assert!(
+            memchr::memmem::find(&body, b"{\"channel\":\"books\",\"instId\":\"BTC-USDT\"}")
+                .is_some()
+        );
         // Exactly one op frame (batching, not per-arg ops).
         assert_eq!(
             memchr::memmem::find_iter(&body, b"\"op\":\"subscribe\"").count(),
@@ -1484,7 +1784,16 @@ mod tests {
         let mut frame = [0u8; 256];
         let n = wrap_text_frame(ack, &mut frame);
         t.inject_incoming(&frame[..n]);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1, "ack counts as a message");
         assert_eq!(status.ticks_total(), 0, "ack must not count as a tick");
 
@@ -1492,7 +1801,16 @@ mod tests {
         let mut frame2 = [0u8; 512];
         let n2 = wrap_text_frame(bbo, &mut frame2);
         t.inject_incoming(&frame2[..n2]);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.ticks_total(), 1, "bbo push is a tick");
         let _ = cons.try_pop().expect("tick must be pushed");
     }
@@ -1509,7 +1827,16 @@ mod tests {
         let n = wrap_text_frame(ack, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.sub_count(), 1);
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.parse_errors_total(), 0);
@@ -1531,7 +1858,16 @@ mod tests {
         let n = wrap_text_frame(bbo, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1558,14 +1894,25 @@ mod tests {
         let n = wrap_text_frame(bbo, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert!(cons.try_pop().is_none());
     }
 
     #[test]
-    fn venue_error_event_fails_the_session() {
+    fn venue_error_event_fails_the_session_at_boot() {
+        // WS2: BOOT fail-fast preserved — before any ack has ever
+        // been applied, a venue error is fatal (refuse venue-blind).
         // debug builds crash on the debug_assert (fail-fast); the
         // release-path behaviour is a session error → reconnect.
         if cfg!(debug_assertions) {
@@ -1581,8 +1928,265 @@ mod tests {
         let n = wrap_text_frame(err, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let e = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(status.sub_drops_total(), 0, "boot errors are not drops");
+    }
+
+    /// Records every ChannelEvent — WS2 drop-event pinning.
+    #[derive(Default)]
+    struct EventRecCap {
+        events: Vec<ChannelEvent>,
+    }
+    impl Capture for EventRecCap {
+        fn event(&mut self, e: &ChannelEvent) {
+            self.events.push(*e);
+        }
+    }
+
+    #[test]
+    fn venue_error_after_ack_is_nonfatal_per_arg_drop() {
+        // WS2 (outage §5.2): once any subscribe ack has been applied,
+        // a venue error drops ONE arg — counter + paired SubDrop
+        // capture event — and the session keeps running.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        let ack = br#"{"event":"subscribe","arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"connId":"x"}"#;
+        let err = br#"{"event":"error","code":"60018","msg":"Wrong URL or channel:bbo-tbt,instId:ETH-USD-SWAP doesn't exist. Please use the correct URL, channel and parameters referring to API document.","connId":"x"}"#;
+        let bbo = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","5","0","2"]],"bids":[["111.05","7","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
+        let mut frame = [0u8; 512];
+        for payload in [&ack[..], &err[..], &bbo[..]] {
+            let n = wrap_text_frame(payload, &mut frame);
+            t.inject_incoming(&frame[..n]);
+        }
+
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap)
+            .expect("post-ack venue error must be non-fatal");
+        assert!(d.subs_ever_acked);
+        assert_eq!(status.sub_drops_total(), 1);
+        assert_eq!(
+            status.parse_errors_total(),
+            0,
+            "a drop is not a parse error"
+        );
+        // The paired SubDrop event names the instrument + code.
+        let drop = cap
+            .events
+            .iter()
+            .find(|e| e.channel == ChannelId::SubDrop as u8)
+            .expect("SubDrop event captured");
+        assert_eq!(
+            drop.sym,
+            (2 << 24) | 2,
+            "error msg instId resolved to the swap row"
+        );
+        assert_eq!(drop.v0, 60018);
+        assert_eq!(drop.v1, -1);
+        // T1 evidence recorded without a fatal verdict.
+        let snap = status.take_last_err();
+        assert_eq!(snap.venue_code, 60018);
+        assert_eq!(snap.site, 0, "no session-error site on the drop path");
+        // The session still moves data.
+        let tick = cons.try_pop().expect("bbo after the drop still flows");
+        assert_eq!(tick.sym, SYM_BTC);
+    }
+
+    #[test]
+    fn expired_instrument_reconnect_keeps_statics_flowing() {
+        // The WS2 exit test as named by the plan: an option row that
+        // expired mid-run draws errors on the RECONNECT session; the
+        // spot/swap args keep flowing on the same connection.
+        let mut opt_symbols = test_symbols();
+        opt_symbols
+            .insert(
+                b"BTC-USD-260828-45000-C",
+                (2 << 24) | 513,
+                OkxInstType::Option,
+            )
+            .unwrap();
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = Driver::new(7, opt_symbols, false, &[]);
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+
+        // "Boot" session: one applied ack arms the process-lifetime
+        // discriminator.
+        let ack = br#"{"event":"subscribe","arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"connId":"x"}"#;
+        let mut frame = [0u8; 512];
+        let n = wrap_text_frame(ack, &mut frame);
+        t.inject_incoming(&frame[..n]);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        assert!(d.subs_ever_acked);
+
+        // Reconnect: connection-scoped state clears, the WS2 flag
+        // survives.
+        d.reset_for_reconnect(9);
+        assert!(
+            d.subs_ever_acked,
+            "boot/reconnect discriminator survives reset"
+        );
+        assert_eq!(d.sub_count(), 0);
+        d.set_state(State::Steady);
+        d.subscribed = true;
+
+        // The reconnect session: statics ack, the expired option
+        // errors (60018), a spot bbo pushes.
+        let err = br#"{"event":"error","code":"60018","msg":"Wrong URL or channel:bbo-tbt,instId:BTC-USD-260828-45000-C doesn't exist.","connId":"x"}"#;
+        let bbo = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","5","0","2"]],"bids":[["111.05","7","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
+        for payload in [&ack[..], &err[..], &bbo[..]] {
+            let n = wrap_text_frame(payload, &mut frame);
+            t.inject_incoming(&frame[..n]);
+        }
+        let mut cap = EventRecCap::default();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap)
+            .expect("expired-instrument error on reconnect must not kill the session");
+        assert_eq!(status.sub_drops_total(), 1);
+        let drop = cap
+            .events
+            .iter()
+            .find(|e| e.channel == ChannelId::SubDrop as u8)
+            .expect("SubDrop event captured");
+        assert_eq!(
+            drop.sym,
+            (2 << 24) | 513,
+            "drop names the expired option row"
+        );
+        let tick = cons
+            .try_pop()
+            .expect("spot keeps flowing beside the dead option");
+        assert_eq!(tick.sym, SYM_BTC);
+        assert_eq!(
+            d.sub_count(),
+            1,
+            "the static ack registered on the reconnect session"
+        );
+    }
+
+    #[test]
+    fn venue_error_naming_unknown_instrument_drops_with_sym_none() {
+        // A post-ack error whose msg names no (or a foreign)
+        // instrument still drops non-fatally, attributed to
+        // SYMBOL_ID_NONE.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        d.subs_ever_acked = true;
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        let err = br#"{"event":"error","code":"60012","msg":"Invalid request"}"#;
+        let mut frame = [0u8; 256];
+        let n = wrap_text_frame(err, &mut frame);
+        t.inject_incoming(&frame[..n]);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.sub_drops_total(), 1);
+        let drop = &cap.events[0];
+        assert_eq!(drop.sym, SYMBOL_ID_NONE);
+        assert_eq!(drop.v0, 60012);
+    }
+
+    #[test]
+    fn establish_timeout_fires_when_no_sub_is_ever_acked() {
+        // WS2 (outage §5.3): a session that never produces a
+        // confirmed subscription dies at the establishment budget —
+        // NOT gated on Steady (here the driver never even upgrades).
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = Driver::new(1, test_symbols(), false, &[]);
+        d.set_establish_budget_ns(50_000_000); // 50 ms test budget
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let stop = StopFlag::new(false);
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let mut ka = generous_keepalive();
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
+        );
+        assert_eq!(res, RunResult::EstablishTimeout);
+        let snap = status.take_last_err();
+        assert_eq!(snap.site, core_metrics::ERR_SITE_ESTABLISH);
+    }
+
+    #[test]
+    fn establish_timeout_disarmed_by_first_ack() {
+        // Once one subscription is acknowledged the establishment
+        // budget never fires — the tiny 1 ns budget here would trip
+        // on the first iteration otherwise; instead the session lives
+        // on to the ordinary idle timeout.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver(false);
+        d.set_establish_budget_ns(1);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let stop = StopFlag::new(false);
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(4);
+        let mut ka = Keepalive::new(KeepaliveCfg {
+            ping_interval_ns: 1,
+            idle_timeout_ns: 150_000_000,
+        });
+
+        let ack = br#"{"event":"subscribe","arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"connId":"x"}"#;
+        let mut frame = [0u8; 256];
+        let n = wrap_text_frame(ack, &mut frame);
+        t.inject_incoming(&frame[..n]);
+
+        let res = run(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
+        );
+        assert_eq!(
+            res,
+            RunResult::IdleTimeout,
+            "ack disarms the establishment budget"
+        );
+        assert_eq!(d.sub_count(), 1);
     }
 
     #[test]
@@ -1597,7 +2201,16 @@ mod tests {
         let mut frame = [0u8; 512];
         let n = wrap_text_frame(snap, &mut frame);
         t.inject_incoming(&frame[..n]);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.gaps_total(), 0);
         let mut scratch = vec![0u8; 16384];
         let _ = t.drain_outgoing(&mut scratch);
@@ -1606,16 +2219,30 @@ mod tests {
         let broken = br#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[["1","1","0","1"]],"bids":[],"ts":"2000","checksum":0,"prevSeqId":99,"seqId":100}]}"#;
         let n = wrap_text_frame(broken, &mut frame);
         t.inject_incoming(&frame[..n]);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
 
         assert_eq!(status.gaps_total(), 1);
         assert_eq!(status.resubscribes_total(), 1);
         let n = t.drain_outgoing(&mut scratch);
         let body = unmask_client_frames(&scratch[..n]);
-        let unsub_at = memchr::memmem::find(&body, b"\"op\":\"unsubscribe\"").expect("unsubscribe queued");
-        let sub_at = memchr::memmem::find(&body, b"\"op\":\"subscribe\"").expect("subscribe queued");
+        let unsub_at =
+            memchr::memmem::find(&body, b"\"op\":\"unsubscribe\"").expect("unsubscribe queued");
+        let sub_at =
+            memchr::memmem::find(&body, b"\"op\":\"subscribe\"").expect("subscribe queued");
         assert!(unsub_at < sub_at, "unsubscribe must precede subscribe");
-        assert!(memchr::memmem::find(&body, b"{\"channel\":\"books\",\"instId\":\"BTC-USDT\"}").is_some());
+        assert!(
+            memchr::memmem::find(&body, b"{\"channel\":\"books\",\"instId\":\"BTC-USDT\"}")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1633,7 +2260,16 @@ mod tests {
         let n = wrap_text_frame(t2, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 2);
         assert_eq!(status.gaps_total(), 1, "seq 50 → 40 is a regression");
         assert_eq!(status.parse_errors_total(), 0);
@@ -1651,7 +2287,16 @@ mod tests {
         let n = wrap_text_frame(multi, &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 2, "both rows counted");
         assert_eq!(status.gaps_total(), 0);
     }
@@ -1719,17 +2364,18 @@ mod tests {
         );
         assert_eq!(status.parse_errors_total(), 2);
         // Tick still captured when the ring is full: fill it, resend.
-        while prod.try_push(Tick::new(
-            1,
-            VenueId::Okx,
-            SYM_BTC,
-            1,
-            Price::from_raw(1),
-            Qty::from_raw(1),
-            Price::from_raw(2),
-            Qty::from_raw(1),
-        ))
-        .is_ok()
+        while prod
+            .try_push(Tick::new(
+                1,
+                VenueId::Okx,
+                SYM_BTC,
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+            ))
+            .is_ok()
         {}
         let n = wrap_text_frame(bbo, &mut frame);
         t.inject_incoming(&frame[..n]);
@@ -1749,10 +2395,22 @@ mod tests {
         let n = wrap_text_frame(b"pong", &mut frame);
         t.inject_incoming(&frame[..n]);
 
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 0);
         assert_eq!(status.parse_errors_total(), 0);
-        assert!(status.last_activity_ns() > 0, "pong refreshes the idle clock");
+        assert!(
+            status.last_activity_ns() > 0,
+            "pong refreshes the idle clock"
+        );
     }
 
     #[test]
@@ -1785,8 +2443,18 @@ mod tests {
         });
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -1807,8 +2475,18 @@ mod tests {
         });
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
         let mut scratch = [0u8; 4096];
@@ -1834,8 +2512,18 @@ mod tests {
         let mut ka = generous_keepalive();
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::Disconnected);
         assert_eq!(status.bytes_total(), 2);

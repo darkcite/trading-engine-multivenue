@@ -42,7 +42,10 @@
 //! eapi has NO open-interest stream — `OptSummary.flags` carries
 //! MARK_PX only (the OKX-asymmetry mechanism, docs/wire-format.md).
 
-use core_parse::{find_field, scan_number_sci_1e9, scan_price_1e6, scan_u64, skip_json_value, skip_string, skip_ws};
+use core_parse::{
+    find_field, scan_number_sci_1e9, scan_price_1e6, scan_u64, skip_json_value, skip_string,
+    skip_ws,
+};
 use core_types::SymbolId;
 
 // ---------------------------------------------------------------
@@ -136,8 +139,7 @@ impl EapiDiscovery {
     /// Parse one `exchangeInfo` body into the table. Returns rows
     /// added.
     pub fn ingest_exchange_info(&mut self, body: &[u8]) -> Result<u32, EapiDiscoveryErr> {
-        let arr_pos =
-            find_field(body, b"\"optionSymbols\":").ok_or(EapiDiscoveryErr::Envelope)?;
+        let arr_pos = find_field(body, b"\"optionSymbols\":").ok_or(EapiDiscoveryErr::Envelope)?;
         let mut i = skip_ws(body, arr_pos);
         if i >= body.len() || body[i] != b'[' {
             return Err(EapiDiscoveryErr::Envelope);
@@ -213,8 +215,7 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
             b',' => i += 1,
             b'"' => {
                 let key_start = i + 1;
-                let key_end_q =
-                    skip_string(body, key_start).ok_or(EapiDiscoveryErr::Truncated)?;
+                let key_end_q = skip_string(body, key_start).ok_or(EapiDiscoveryErr::Truncated)?;
                 let key = &body[key_start..key_end_q - 1];
                 i = skip_ws(body, key_end_q);
                 if i >= body.len() || body[i] != b':' {
@@ -566,8 +567,7 @@ pub fn parse_eapi_ticker(data: &[u8]) -> Option<EapiTickerFrame> {
     #[inline]
     fn q_1e6_or_zero(data: &[u8], key: &[u8]) -> i64 {
         match q_span(data, key) {
-            None => 0,
-            Some(span) if span.is_empty() => 0,
+            None | Some([]) => 0,
             Some(span) => match scan_price_1e6(span, 0) {
                 Some((v, used)) if used == span.len() => v,
                 _ => 0,
@@ -722,8 +722,20 @@ mod tests {
     #[test]
     fn exchange_info_parses_option_rows_and_skips_filters() {
         let rows = [
-            opt_row("BTC-260327-100000-C", "BTCUSDT", "CALL", "100000.00000000", EXP1),
-            opt_row("BTC-260327-100000-P", "BTCUSDT", "PUT", "100000.00000000", EXP1),
+            opt_row(
+                "BTC-260327-100000-C",
+                "BTCUSDT",
+                "CALL",
+                "100000.00000000",
+                EXP1,
+            ),
+            opt_row(
+                "BTC-260327-100000-P",
+                "BTCUSDT",
+                "PUT",
+                "100000.00000000",
+                EXP1,
+            ),
             opt_row("ETH-260327-2400-C", "ETHUSDT", "CALL", "2400.5", EXP2),
         ]
         .join(",");
@@ -743,18 +755,31 @@ mod tests {
     #[test]
     fn exchange_info_rejects_contract_violations() {
         // Missing side.
-        let bad = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1).replacen(r#""side":"CALL","#, "", 1);
+        let bad =
+            opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1).replacen(r#""side":"CALL","#, "", 1);
         let mut d = EapiDiscovery::new();
-        assert_eq!(d.ingest_exchange_info(&info(&bad)).unwrap_err(), EapiDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_exchange_info(&info(&bad)).unwrap_err(),
+            EapiDiscoveryErr::BadRow
+        );
         // Bad side value.
         let bad = opt_row("BTC-1-C", "BTCUSDT", "STRADDLE", "1", EXP1);
         let mut d = EapiDiscovery::new();
-        assert_eq!(d.ingest_exchange_info(&info(&bad)).unwrap_err(), EapiDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_exchange_info(&info(&bad)).unwrap_err(),
+            EapiDiscoveryErr::BadRow
+        );
         // Bare (unquoted) strike = contract change.
-        let bad = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1)
-            .replacen(r#""strikePrice":"1""#, r#""strikePrice":1"#, 1);
+        let bad = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1).replacen(
+            r#""strikePrice":"1""#,
+            r#""strikePrice":1"#,
+            1,
+        );
         let mut d = EapiDiscovery::new();
-        assert_eq!(d.ingest_exchange_info(&info(&bad)).unwrap_err(), EapiDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_exchange_info(&info(&bad)).unwrap_err(),
+            EapiDiscoveryErr::BadRow
+        );
         // No optionSymbols array.
         let mut d = EapiDiscovery::new();
         assert_eq!(
@@ -764,7 +789,8 @@ mod tests {
         // Truncated inside the array.
         let mut d = EapiDiscovery::new();
         assert_eq!(
-            d.ingest_exchange_info(br#"{"optionSymbols":[{"symbol":"X""#).unwrap_err(),
+            d.ingest_exchange_info(br#"{"optionSymbols":[{"symbol":"X""#)
+                .unwrap_err(),
             EapiDiscoveryErr::Truncated
         );
     }
@@ -797,11 +823,24 @@ mod tests {
             }
         }
         // A second family that must never leak into BTCUSDT selection.
-        rows.push(opt_row("ETH-260327-2400-C", "ETHUSDT", "CALL", "2400", EXP1));
+        rows.push(opt_row(
+            "ETH-260327-2400-C",
+            "ETHUSDT",
+            "CALL",
+            "2400",
+            EXP1,
+        ));
         // An expired row.
-        rows.push(opt_row("BTC-OLD-90000-C", "BTCUSDT", "CALL", "90000", NOW - 1_000));
+        rows.push(opt_row(
+            "BTC-OLD-90000-C",
+            "BTCUSDT",
+            "CALL",
+            "90000",
+            NOW - 1_000,
+        ));
         let mut d = EapiDiscovery::new();
-        d.ingest_exchange_info(&info(&rows.join(","))).expect("grid parses");
+        d.ingest_exchange_info(&info(&rows.join(",")))
+            .expect("grid parses");
         d
     }
 
@@ -828,7 +867,9 @@ mod tests {
         let all = select_capped_chain(d.rows(), b"BTCUSDT", 100_000_000_000_000, 4, 32, NOW);
         assert!(all.len() as u32 <= 4 * 32 * 2);
         assert_eq!(all.len(), 16); // 2 expiries × 4 strikes × 2
-        assert!(!names(&all).iter().any(|n| n.contains("ETH") || n.contains("OLD")));
+        assert!(!names(&all)
+            .iter()
+            .any(|n| n.contains("ETH") || n.contains("OLD")));
         // Determinism.
         let again = select_capped_chain(d.rows(), b"BTCUSDT", 100_000_000_000_000, 4, 32, NOW);
         assert_eq!(names(&all), names(&again));
@@ -837,15 +878,20 @@ mod tests {
     #[test]
     fn symbol_table_lowercases_and_resolves() {
         let mut t = EapiSymbolTable::new();
-        t.insert(b"BTC-260327-100000-C", (1 << 24) | 1025, 0).unwrap();
-        assert_eq!(t.lookup(b"btc-260327-100000-c"), Some(((1 << 24) | 1025, 0)));
+        t.insert(b"BTC-260327-100000-C", (1 << 24) | 1025, 0)
+            .unwrap();
+        assert_eq!(
+            t.lookup(b"btc-260327-100000-c"),
+            Some(((1 << 24) | 1025, 0))
+        );
         assert_eq!(t.lookup(b"BTC-260327-100000-C"), None); // stream form only
         assert_eq!(t.lookup(b"missing"), None);
         assert_eq!(t.insert(b"", 1, 0), Err(EapiTableErr::BadSymbol));
         assert_eq!(t.insert(b"X", 1, 16), Err(EapiTableErr::BadUly));
         let mut full = EapiSymbolTable::new();
         for i in 0..EAPI_OPT_MAX {
-            full.insert(format!("S{i}").as_bytes(), i as u32, 0).unwrap();
+            full.insert(format!("S{i}").as_bytes(), i as u32, 0)
+                .unwrap();
         }
         assert_eq!(full.insert(b"OVER", 99, 0), Err(EapiTableErr::Full));
     }
@@ -867,11 +913,10 @@ mod tests {
         assert_eq!(f.vega_1e6, 152_300_000);
         assert_eq!(f.theta_1e6, -85_300_000);
         // Missing any required field rejects.
-        let no_mp = payload
-            .iter()
-            .copied()
-            .collect::<Vec<u8>>();
-        let no_mp = String::from_utf8(no_mp).unwrap().replacen(r#""mp":"2051.2","#, "", 1);
+        let no_mp = payload.to_vec();
+        let no_mp = String::from_utf8(no_mp)
+            .unwrap()
+            .replacen(r#""mp":"2051.2","#, "", 1);
         let (_, data2) = split_combined(no_mp.as_bytes()).unwrap();
         assert!(parse_eapi_ticker(data2).is_none());
         // Index push.

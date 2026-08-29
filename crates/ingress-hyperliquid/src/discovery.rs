@@ -152,6 +152,23 @@ pub struct HlAssetInfo {
     pub sz_decimals: u8,
 }
 
+impl HlAssetInfo {
+    /// WS8 (gaps §2.5 tick/lot): the venue's PRICE-TICK rule for a
+    /// native perp — prices carry at most 5 significant figures AND
+    /// at most `6 − szDecimals` decimal places (venue docs; integer
+    /// prices are always allowed). This is the derived "tick size"
+    /// the audit row exposes; the LOT step is `10^-szDecimals`.
+    /// Meaningful for [`HlAssetKind::Perp`] only — other kinds
+    /// return `None` (their szDecimals is uncaptured on this wire).
+    #[inline]
+    pub fn max_price_decimals(&self) -> Option<u8> {
+        match self.kind {
+            HlAssetKind::Perp => Some(6u8.saturating_sub(self.sz_decimals)),
+            _ => None,
+        }
+    }
+}
+
 /// Boot-only Hyperliquid asset table. See module docs.
 ///
 /// Build once at boot: [`HlDiscovery::new`], then one ingest call per
@@ -888,18 +905,58 @@ mod tests {
         assert_eq!(d.ingest_meta(META).expect("parse ok"), 3);
         assert_eq!(
             d.resolve(b"BTC"),
-            Some(HlAssetInfo { asset_id: 0, kind: HlAssetKind::Perp, sz_decimals: 5 })
+            Some(HlAssetInfo {
+                asset_id: 0,
+                kind: HlAssetKind::Perp,
+                sz_decimals: 5
+            })
         );
         assert_eq!(
             d.resolve(b"ETH"),
-            Some(HlAssetInfo { asset_id: 1, kind: HlAssetKind::Perp, sz_decimals: 4 })
+            Some(HlAssetInfo {
+                asset_id: 1,
+                kind: HlAssetKind::Perp,
+                sz_decimals: 4
+            })
         );
         assert_eq!(
             d.resolve(b"SOL"),
-            Some(HlAssetInfo { asset_id: 2, kind: HlAssetKind::Perp, sz_decimals: 2 })
+            Some(HlAssetInfo {
+                asset_id: 2,
+                kind: HlAssetKind::Perp,
+                sz_decimals: 2
+            })
         );
         assert_eq!(d.resolve(b"DOGE"), None);
         assert_eq!(d.counts(), (3, 0, 0, 0));
+    }
+
+    #[test]
+    fn max_price_decimals_derives_the_perp_tick_rule() {
+        // WS8 (gaps §2.5): price tick = ≤ (6 − szDecimals) decimals
+        // for native perps; other kinds carry no derivation.
+        let mut d = HlDiscovery::new();
+        d.ingest_meta(META).unwrap();
+        assert_eq!(d.resolve(b"BTC").unwrap().max_price_decimals(), Some(1)); // sz 5
+        assert_eq!(d.resolve(b"ETH").unwrap().max_price_decimals(), Some(2)); // sz 4
+        assert_eq!(d.resolve(b"SOL").unwrap().max_price_decimals(), Some(4)); // sz 2
+        let spot = HlAssetInfo {
+            asset_id: 10_000,
+            kind: HlAssetKind::Spot,
+            sz_decimals: 0,
+        };
+        assert_eq!(
+            spot.max_price_decimals(),
+            None,
+            "uncaptured kinds derive nothing"
+        );
+        // Saturation guard: a hypothetical sz > 6 never underflows.
+        let deep = HlAssetInfo {
+            asset_id: 0,
+            kind: HlAssetKind::Perp,
+            sz_decimals: 9,
+        };
+        assert_eq!(deep.max_price_decimals(), Some(0));
     }
 
     #[test]
@@ -926,7 +983,8 @@ mod tests {
         );
         // Missing name.
         assert_eq!(
-            d.ingest_meta(br#"{"universe":[{"szDecimals":5}]}"#).unwrap_err(),
+            d.ingest_meta(br#"{"universe":[{"szDecimals":5}]}"#)
+                .unwrap_err(),
             HlDiscoveryErr::BadRow
         );
         // Over-long name (25 > HL_COIN_MAX).
@@ -982,11 +1040,19 @@ mod tests {
         assert_eq!(d.ingest_spot_meta(SPOT_META).expect("parse ok"), 2);
         assert_eq!(
             d.resolve(b"@0"),
-            Some(HlAssetInfo { asset_id: 10_000, kind: HlAssetKind::Spot, sz_decimals: 0 })
+            Some(HlAssetInfo {
+                asset_id: 10_000,
+                kind: HlAssetKind::Spot,
+                sz_decimals: 0
+            })
         );
         assert_eq!(
             d.resolve(b"@1"),
-            Some(HlAssetInfo { asset_id: 10_001, kind: HlAssetKind::Spot, sz_decimals: 0 })
+            Some(HlAssetInfo {
+                asset_id: 10_001,
+                kind: HlAssetKind::Spot,
+                sz_decimals: 0
+            })
         );
         // Index never listed in the spot universe.
         assert_eq!(d.resolve(b"@2"), None);
@@ -1048,7 +1114,8 @@ mod tests {
     fn spot_meta_rejects_truncated_bodies() {
         let mut d = HlDiscovery::new();
         assert_eq!(
-            d.ingest_spot_meta(br#"{"tokens":[],"universe":["#).unwrap_err(),
+            d.ingest_spot_meta(br#"{"tokens":[],"universe":["#)
+                .unwrap_err(),
             HlDiscoveryErr::Truncated
         );
         assert_eq!(
@@ -1067,7 +1134,10 @@ mod tests {
             HL_DISCOVERY_SPOT_CAP + 1,
             br#"]}"#,
         );
-        assert_eq!(d.ingest_spot_meta(&body).unwrap_err(), HlDiscoveryErr::TooMany);
+        assert_eq!(
+            d.ingest_spot_meta(&body).unwrap_err(),
+            HlDiscoveryErr::TooMany
+        );
     }
 
     // ---- ingest_perp_dexs ----------------------------------------
@@ -1080,7 +1150,11 @@ mod tests {
         assert_eq!(d.counts(), (0, 0, 2, 0));
         assert_eq!(
             d.resolve(b"xyz:AAPL"),
-            Some(HlAssetInfo { asset_id: 0, kind: HlAssetKind::BuilderDex, sz_decimals: 0 })
+            Some(HlAssetInfo {
+                asset_id: 0,
+                kind: HlAssetKind::BuilderDex,
+                sz_decimals: 0
+            })
         );
         assert!(d.resolve(b"vntls:UBER").is_some());
         assert_eq!(d.resolve(b"nope:AAPL"), None);
@@ -1089,16 +1163,28 @@ mod tests {
     #[test]
     fn perp_dexs_rejects_envelope_violations() {
         let mut d = HlDiscovery::new();
-        assert_eq!(d.ingest_perp_dexs(b"{}").unwrap_err(), HlDiscoveryErr::Envelope);
-        assert_eq!(d.ingest_perp_dexs(b"").unwrap_err(), HlDiscoveryErr::Envelope);
-        assert_eq!(d.ingest_perp_dexs(b"null").unwrap_err(), HlDiscoveryErr::Envelope);
+        assert_eq!(
+            d.ingest_perp_dexs(b"{}").unwrap_err(),
+            HlDiscoveryErr::Envelope
+        );
+        assert_eq!(
+            d.ingest_perp_dexs(b"").unwrap_err(),
+            HlDiscoveryErr::Envelope
+        );
+        assert_eq!(
+            d.ingest_perp_dexs(b"null").unwrap_err(),
+            HlDiscoveryErr::Envelope
+        );
     }
 
     #[test]
     fn perp_dexs_rejects_bad_entries() {
         let mut d = HlDiscovery::new();
         // Bare number entry.
-        assert_eq!(d.ingest_perp_dexs(b"[42]").unwrap_err(), HlDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_perp_dexs(b"[42]").unwrap_err(),
+            HlDiscoveryErr::BadRow
+        );
         // Object without a name.
         assert_eq!(
             d.ingest_perp_dexs(br#"[{"fullName":"X"}]"#).unwrap_err(),
@@ -1106,27 +1192,43 @@ mod tests {
         );
         // Over-long name (17 > 16).
         assert_eq!(
-            d.ingest_perp_dexs(br#"[{"name":"AAAAAAAAAAAAAAAAA"}]"#).unwrap_err(),
+            d.ingest_perp_dexs(br#"[{"name":"AAAAAAAAAAAAAAAAA"}]"#)
+                .unwrap_err(),
             HlDiscoveryErr::BadRow
         );
         // Mangled null literal.
-        assert_eq!(d.ingest_perp_dexs(b"[nulX]").unwrap_err(), HlDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_perp_dexs(b"[nulX]").unwrap_err(),
+            HlDiscoveryErr::BadRow
+        );
     }
 
     #[test]
     fn perp_dexs_rejects_truncated_bodies() {
         let mut d = HlDiscovery::new();
-        assert_eq!(d.ingest_perp_dexs(b"[").unwrap_err(), HlDiscoveryErr::Truncated);
-        assert_eq!(d.ingest_perp_dexs(b"[null,").unwrap_err(), HlDiscoveryErr::Truncated);
+        assert_eq!(
+            d.ingest_perp_dexs(b"[").unwrap_err(),
+            HlDiscoveryErr::Truncated
+        );
+        assert_eq!(
+            d.ingest_perp_dexs(b"[null,").unwrap_err(),
+            HlDiscoveryErr::Truncated
+        );
     }
 
     #[test]
     fn perp_dexs_enforces_dexs_cap_counting_null_slots() {
         let mut d = HlDiscovery::new();
         let at_cap = synth_body(b"[", b"null", HL_DISCOVERY_DEXS_CAP, b"]");
-        assert_eq!(d.ingest_perp_dexs(&at_cap).expect("at cap ok"), HL_DISCOVERY_DEXS_CAP as u32);
+        assert_eq!(
+            d.ingest_perp_dexs(&at_cap).expect("at cap ok"),
+            HL_DISCOVERY_DEXS_CAP as u32
+        );
         let over = synth_body(b"[", b"null", HL_DISCOVERY_DEXS_CAP + 1, b"]");
-        assert_eq!(d.ingest_perp_dexs(&over).unwrap_err(), HlDiscoveryErr::TooMany);
+        assert_eq!(
+            d.ingest_perp_dexs(&over).unwrap_err(),
+            HlDiscoveryErr::TooMany
+        );
     }
 
     // ---- ingest_outcome_meta -------------------------------------
@@ -1195,12 +1297,14 @@ mod tests {
         let mut d = HlDiscovery::new();
         // Missing outcome id.
         assert_eq!(
-            d.ingest_outcome_meta(br#"{"outcomes":[{"sideSpecs":[]}]}"#).unwrap_err(),
+            d.ingest_outcome_meta(br#"{"outcomes":[{"sideSpecs":[]}]}"#)
+                .unwrap_err(),
             HlDiscoveryErr::BadRow
         );
         // Missing sideSpecs.
         assert_eq!(
-            d.ingest_outcome_meta(br#"{"outcomes":[{"outcome":1}]}"#).unwrap_err(),
+            d.ingest_outcome_meta(br#"{"outcomes":[{"outcome":1}]}"#)
+                .unwrap_err(),
             HlDiscoveryErr::BadRow
         );
         // sideSpecs of the wrong type.
@@ -1222,7 +1326,10 @@ mod tests {
             256,
             br#"]}]}"#,
         );
-        assert_eq!(d.ingest_outcome_meta(&body).unwrap_err(), HlDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_outcome_meta(&body).unwrap_err(),
+            HlDiscoveryErr::BadRow
+        );
     }
 
     #[test]
@@ -1248,7 +1355,10 @@ mod tests {
             HL_DISCOVERY_OUTCOMES_CAP + 1,
             br#"]}"#,
         );
-        assert_eq!(d.ingest_outcome_meta(&body).unwrap_err(), HlDiscoveryErr::TooMany);
+        assert_eq!(
+            d.ingest_outcome_meta(&body).unwrap_err(),
+            HlDiscoveryErr::TooMany
+        );
     }
 
     // ---- resolve edge cases / totals -----------------------------

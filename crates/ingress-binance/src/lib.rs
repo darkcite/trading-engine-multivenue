@@ -33,11 +33,11 @@ pub mod eapi;
 pub mod run_loop;
 
 pub use run_loop::{
-    drive_one, note_transport_ready, run, run_multi, Driver, MultiConn, RunResult, State,
-    StopFlag, DEFAULT_TICK_RING_CAP, RX_BUF_SIZE, TX_BUF_SIZE,
+    drive_one, note_transport_ready, run, run_multi, Driver, MultiConn, RunResult, State, StopFlag,
+    DEFAULT_TICK_RING_CAP, RX_BUF_SIZE, TX_BUF_SIZE,
 };
 
-use core_parse::{find_field, scan_price_1e6, scan_u64, skip_byte};
+use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte};
 use core_types::{NsTs, SymbolId};
 
 /// A parsed Binance trade — mapped to a `Signal` downstream.
@@ -178,10 +178,95 @@ pub fn parse_book_ticker(buf: &[u8], sym: SymbolId) -> Option<BookTickerFrame> {
 }
 
 // ---------------------------------------------------------------
+// markPrice frame (WS5 — gaps §2.1)
+// ---------------------------------------------------------------
+
+/// A parsed USDS-M `<sym>@markPrice` frame (WS5): mark, index,
+/// funding rate and next-funding time in one push. Dated futures'
+/// frames carry an EMPTY `"r"` (no funding on delivery contracts) —
+/// `has_funding` records wire truth, the WS3 Deribit convention.
+/// 64-byte POD; one cache line.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub struct BnMarkPriceFrame {
+    /// Venue event time (`"E"`, ms) converted to ns.
+    pub ts_ns: NsTs,
+    /// `"p"` mark price ×1e6.
+    pub mark_px_1e6: i64,
+    /// `"i"` index price ×1e6.
+    pub index_px_1e6: i64,
+    /// `"r"` funding rate ×1e9 (signed; 0 when `has_funding` = 0).
+    pub funding_rate_1e9: i64,
+    /// `"T"` next funding time, ms since epoch (0 when absent/none).
+    pub next_funding_ms: u64,
+    /// Resolved symbol id (connection-pinned, like bookTicker).
+    pub sym: SymbolId,
+    /// 1 when the wire carried a parseable funding rate — perps do;
+    /// dated futures send `"r":""`.
+    pub has_funding: u8,
+    /// Reserved for layout stability (keeps struct at 64 bytes).
+    _pad: [u8; 19],
+}
+
+/// Parse a USDS-M `@markPrice` frame (WS5). Zero-alloc byte scan;
+/// `None` on malformed input (caller counts + taps).
+///
+/// # Expected shape
+///
+/// ```text
+/// {"e":"markPriceUpdate","E":1562305380000,"s":"BTCUSDT",
+///  "p":"11794.15000000","i":"11784.62659091","P":"11784.25",
+///  "r":"0.00038167","T":1562306400000}
+/// ```
+///
+/// Key-matched (field order never assumed); the `"e"` tag is
+/// REQUIRED — a foreign frame on a markPrice connection is a reject,
+/// not a guess. `"r"`/`"T"` are optional-by-value: an empty or
+/// unparseable rate ⇒ `has_funding` = 0 (dated futures), a missing
+/// `"T"` ⇒ 0.
+#[inline]
+pub fn parse_mark_price(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
+    memchr::memmem::find(buf, b"\"e\":\"markPriceUpdate\"")?;
+    let pos = find_field(buf, b"\"E\":")?;
+    let (ts_ms, _) = scan_u64(buf, pos)?;
+    let pos = find_field(buf, b"\"p\":")?;
+    let pos = skip_byte(buf, pos, b'"');
+    let (mark_px_1e6, _) = scan_price_1e6(buf, pos)?;
+    let pos = find_field(buf, b"\"i\":")?;
+    let pos = skip_byte(buf, pos, b'"');
+    let (index_px_1e6, _) = scan_price_1e6(buf, pos)?;
+    let (funding_rate_1e9, has_funding) = match find_field(buf, b"\"r\":") {
+        Some(pos) => {
+            let pos = skip_byte(buf, pos, b'"');
+            match scan_price_1e9(buf, pos) {
+                Some((v, _)) => (v, 1u8),
+                None => (0, 0u8), // `"r":""` — the dated-future shape
+            }
+        }
+        None => (0, 0u8),
+    };
+    let next_funding_ms = match find_field(buf, b"\"T\":") {
+        Some(pos) => scan_u64(buf, pos).map(|(v, _)| v).unwrap_or(0),
+        None => 0,
+    };
+    Some(BnMarkPriceFrame {
+        ts_ns: ts_ms.saturating_mul(1_000_000),
+        mark_px_1e6,
+        index_px_1e6,
+        funding_rate_1e9,
+        next_funding_ms,
+        sym,
+        has_funding,
+        _pad: [0; 19],
+    })
+}
+
+// ---------------------------------------------------------------
 // Static layout
 // ---------------------------------------------------------------
 
 const _BOOK_TICKER_SIZE_CHECK: [(); 64] = [(); ::core::mem::size_of::<BookTickerFrame>()];
+const _MARK_PRICE_SIZE_CHECK: [(); 64] = [(); ::core::mem::size_of::<BnMarkPriceFrame>()];
 
 // ---------------------------------------------------------------
 // Tests
@@ -208,6 +293,49 @@ mod tests {
     #[test]
     fn parse_trade_returns_none_on_missing_fields() {
         assert!(parse_trade(b"{}", 0).is_none());
+    }
+
+    const SAMPLE_MARK: &[u8] = br#"{"e":"markPriceUpdate","E":1562305380000,"s":"BTCUSDT","p":"11794.15000000","i":"11784.62659091","P":"11784.25641265","r":"0.00038167","T":1562306400000}"#;
+
+    #[test]
+    fn parse_mark_price_extracts_all_fields() {
+        // WS5: mark + index + funding + next-funding in one frame.
+        let f = parse_mark_price(SAMPLE_MARK, 9).unwrap();
+        assert_eq!(f.sym, 9);
+        assert_eq!(f.ts_ns, 1_562_305_380_000 * 1_000_000);
+        assert_eq!(f.mark_px_1e6, 11_794_150_000);
+        assert_eq!(f.index_px_1e6, 11_784_626_590);
+        assert_eq!(f.funding_rate_1e9, 381_670);
+        assert_eq!(f.has_funding, 1);
+        assert_eq!(f.next_funding_ms, 1_562_306_400_000);
+    }
+
+    #[test]
+    fn parse_mark_price_negative_funding() {
+        let b = br#"{"e":"markPriceUpdate","E":1000,"s":"X","p":"1.0","i":"1.0","r":"-0.00038167","T":2000}"#;
+        assert_eq!(parse_mark_price(b, 0).unwrap().funding_rate_1e9, -381_670);
+    }
+
+    #[test]
+    fn parse_mark_price_dated_future_empty_rate() {
+        // WS5: delivery contracts push `"r":""` — no funding, still a
+        // valid frame (the WS3 has_funding convention).
+        let b = br#"{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT_260327","p":"65000.1","i":"64999.9","P":"65000.0","r":"","T":0}"#;
+        let f = parse_mark_price(b, 7).unwrap();
+        assert_eq!(f.has_funding, 0);
+        assert_eq!(f.funding_rate_1e9, 0);
+        assert_eq!(f.mark_px_1e6, 65_000_100_000);
+        assert_eq!(f.next_funding_ms, 0);
+    }
+
+    #[test]
+    fn parse_mark_price_rejects_foreign_and_malformed() {
+        // A bookTicker frame on a markPrice slot is a reject (the
+        // required "e" tag), as is a tagless blob.
+        assert!(parse_mark_price(SAMPLE_BT, 0).is_none());
+        assert!(parse_mark_price(b"{}", 0).is_none());
+        // Tag present but the price fields missing.
+        assert!(parse_mark_price(br#"{"e":"markPriceUpdate","E":1}"#, 0).is_none());
     }
 
     #[test]
@@ -276,6 +404,39 @@ mod proptests {
         #[test]
         fn bookticker_never_panics_on_arbitrary_bytes(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
             let _ = parse_book_ticker(&buf, 0);
+        }
+
+        // WS5: markPrice roundtrip — the funding sign and the dated
+        // empty-rate form both hold under generated values.
+        #[test]
+        fn mark_price_roundtrips(
+            ts in 1u64..4_000_000_000_000u64,
+            mp in 0u32..999_999u32,
+            ip in 0u32..999_999u32,
+            r_num in -999_999i64..1_000_000i64,
+            t_next in 0u64..4_000_000_000_000u64,
+        ) {
+            let mut buf = String::with_capacity(220);
+            use std::fmt::Write;
+            let sign = if r_num < 0 { "-" } else { "" };
+            write!(
+                &mut buf,
+                r#"{{"e":"markPriceUpdate","E":{ts},"s":"X","p":"0.{mp:06}","i":"0.{ip:06}","r":"{sign}0.{:09}","T":{t_next}}}"#,
+                r_num.unsigned_abs(),
+            ).unwrap();
+            let f = parse_mark_price(buf.as_bytes(), 7).unwrap();
+            prop_assert_eq!(f.sym, 7);
+            prop_assert_eq!(f.ts_ns, ts * 1_000_000);
+            prop_assert_eq!(f.mark_px_1e6, mp as i64);
+            prop_assert_eq!(f.index_px_1e6, ip as i64);
+            prop_assert_eq!(f.funding_rate_1e9, r_num);
+            prop_assert_eq!(f.has_funding, 1);
+            prop_assert_eq!(f.next_funding_ms, t_next);
+        }
+
+        #[test]
+        fn mark_price_never_panics_on_arbitrary_bytes(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
+            let _ = parse_mark_price(&buf, 0);
         }
     }
 }

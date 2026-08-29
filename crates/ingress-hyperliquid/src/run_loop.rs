@@ -53,8 +53,8 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    ReqKind, Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
+    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, ReqKind,
+    Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
@@ -368,7 +368,7 @@ pub fn note_transport_ready(drv: &mut Driver, status: Status) {
 // ---------------------------------------------------------------
 
 fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    if drv.tx.len() == 0 {
+    if drv.tx.is_empty() {
         return Ok(());
     }
     let mut written = 0;
@@ -471,7 +471,10 @@ fn queue_one_subscribe(
 /// (+ `activeAssetCtx` for perp coins); global: `allMids` +
 /// `outcomeMetaUpdates`.
 fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
-    debug_assert!(!drv.subscribed, "subscribe frames must be queued exactly once");
+    debug_assert!(
+        !drv.subscribed,
+        "subscribe frames must be queued exactly once"
+    );
     if drv.coins.is_empty() {
         return Err(io::Error::other("hl: no coins configured"));
     }
@@ -594,7 +597,7 @@ fn drain_ws_frames<C: Capture>(
                 // Oversize guard: a frame that cannot fit the rx
                 // buffer never completes — fail the session instead
                 // of livelocking (module doc).
-                if drv.rx.free_mut().is_empty() && drv.rx.len() > 0 {
+                if drv.rx.free_mut().is_empty() && !drv.rx.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "ws frame exceeds rx buffer capacity",
@@ -621,7 +624,13 @@ fn drain_ws_frames<C: Capture>(
 
                 match header.opcode {
                     WsOpcode::Text | WsOpcode::Binary => {
-                        handle_data_frame(drv, payload.start..payload.end, producer, status, capture)?;
+                        handle_data_frame(
+                            drv,
+                            payload.start..payload.end,
+                            producer,
+                            status,
+                            capture,
+                        )?;
                     }
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
@@ -866,12 +875,19 @@ fn handle_data_frame<C: Capture>(
                                         // units ×1e6). The ctx
                                         // carries no venue timestamp
                                         // → venue_time_ms = 0.
+                                        // WS3 (gaps §2.5): venue_seq
+                                        // carries `premium` ×1e9
+                                        // BIT-CAST i64→u64 (the slot
+                                        // was a constant 0 here; the
+                                        // ctx has no venue seq — the
+                                        // M4 hash128-in-px/qty
+                                        // packing precedent).
                                         capture.event(&ChannelEvent::new(
                                             now_ns(),
                                             VenueId::Hyperliquid,
                                             ChannelId::AssetCtx,
                                             sym,
-                                            0,
+                                            f.premium_1e9 as u64,
                                             0,
                                             f.funding_1e9,
                                             f.oi_1e6,
@@ -882,9 +898,7 @@ fn handle_data_frame<C: Capture>(
                                 }
                             }
                             // Handled above.
-                            HlChannel::AllMids | HlChannel::OutcomeMetaUpdates => {
-                                Dispatch::Nothing
-                            }
+                            HlChannel::AllMids | HlChannel::OutcomeMetaUpdates => Dispatch::Nothing,
                         },
                         // Data for a coin we never configured — a
                         // mapping bug or venue noise; count it.
@@ -1236,7 +1250,16 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
 
         note_transport_ready(&mut d, Status::Ready);
-        drive_one(&mut t, &mut d, b"api.hyperliquid.xyz", b"/ws", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"api.hyperliquid.xyz",
+            b"/ws",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let mut scratch = vec![0u8; 65536];
         let _ = t.drain_outgoing(&mut scratch);
 
@@ -1245,7 +1268,16 @@ mod tests {
         let resp = build_server_response(&accept);
         t.inject_incoming(&resp);
 
-        drive_one(&mut t, &mut d, b"api.hyperliquid.xyz", b"/ws", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"api.hyperliquid.xyz",
+            b"/ws",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.state(), State::Steady);
         assert!(d.subscribed);
         assert_eq!(status.state(), IngressState::Up);
@@ -1262,7 +1294,9 @@ mod tests {
         );
         assert!(memchr::memmem::find(&body, br#"{"type":"bbo","coin":"BTC"}"#).is_some());
         assert!(memchr::memmem::find(&body, br##"{"type":"l2Book","coin":"#330"}"##).is_some());
-        assert!(memchr::memmem::find(&body, br#"{"type":"activeAssetCtx","coin":"BTC"}"#).is_some());
+        assert!(
+            memchr::memmem::find(&body, br#"{"type":"activeAssetCtx","coin":"BTC"}"#).is_some()
+        );
         assert!(
             memchr::memmem::find(&body, br##"{"type":"activeAssetCtx","coin":"#330"}"##).is_none(),
             "outcome coins must not subscribe activeAssetCtx"
@@ -1282,7 +1316,16 @@ mod tests {
             &mut t,
             br#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.sub_count(), 1);
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(d.found, bit_of(0, HlChannel::Bbo));
@@ -1313,7 +1356,16 @@ mod tests {
         ] {
             inject_text(&mut t, body);
         }
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(d.sub_count(), 9);
         assert_eq!(d.found, d.expected);
 
@@ -1328,7 +1380,11 @@ mod tests {
         let mut d = steady_driver();
         // One ack short of expected, past the deadline.
         let t0 = d.steady_since_ns;
-        assert_eq!(session_health(&mut d, &status, t0 + 1), None, "inside budget");
+        assert_eq!(
+            session_health(&mut d, &status, t0 + 1),
+            None,
+            "inside budget"
+        );
         assert_eq!(
             session_health(&mut d, &status, t0 + HL_SUB_ACK_BUDGET_NS + 1),
             Some(RunResult::Error),
@@ -1349,7 +1405,10 @@ mod tests {
         assert_eq!(status.gaps_total(), 0);
         // …then the budget passes with no advancing snapshot.
         let later = now + crate::HL_STALENESS_BUDGET_NS + 1;
-        assert_eq!(session_health(&mut d, &status, later), Some(RunResult::Stale));
+        assert_eq!(
+            session_health(&mut d, &status, later),
+            Some(RunResult::Stale)
+        );
         assert_eq!(status.gaps_total(), 1, "staleness counts into gaps_total");
     }
 
@@ -1364,7 +1423,16 @@ mod tests {
             &mut t,
             br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
@@ -1391,7 +1459,16 @@ mod tests {
             &mut t,
             br##"{"channel":"bbo","data":{"coin":"#330","time":1723600000001,"bbo":[{"px":"0.4","sz":"100.0","n":1},{"px":"0.6","sz":"50.0","n":1}]}}"##,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         let tick = cons.try_pop().expect("HIP-4 tick must flow the same path");
         assert_eq!(tick.sym, SYM_HIP4);
         assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
@@ -1418,7 +1495,16 @@ mod tests {
             &mut t,
             br#"{"channel":"l2Book","data":{"coin":"BTC","time":1677700000000,"levels":[[{"px":"1.0","sz":"1.0","n":1}],[{"px":"2.0","sz":"1.0","n":1}]]}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 1);
         // Coin 0 was refreshed by the drive at ~t0; coin 1 (#330)
         // still sits on the aged baseline — it is the stale one.
@@ -1436,7 +1522,16 @@ mod tests {
             &mut t,
             br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1.0","sz":"1.0","hash":"0x1","time":1000,"tid":1},{"coin":"BTC","side":"A","px":"1.1","sz":"2.0","hash":"0x2","time":1001,"tid":2}]}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 2, "both rows counted");
         assert_eq!(status.parse_errors_total(), 0);
     }
@@ -1498,7 +1593,10 @@ mod tests {
             &mut t,
             br#"{"channel":"trades","data":[{"coin":"BTC","side":"A","px":"1.5","sz":"2.0","hash":"0x1","time":1000,"tid":7},{"coin":"BTC","broken":true}]}"#,
         );
-        inject_text(&mut t, br#"{"channel":"allMids","data":{"mids":{"BTC":"1.0"}}}"#);
+        inject_text(
+            &mut t,
+            br#"{"channel":"allMids","data":{"mids":{"BTC":"1.0"}}}"#,
+        );
         inject_text(&mut t, br#"{"what":"ever"}"#);
 
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
@@ -1518,17 +1616,18 @@ mod tests {
         );
         assert_eq!(status.parse_errors_total(), 2);
         // Tick still captured when the ring is full: fill it, resend.
-        while prod.try_push(Tick::new(
-            1,
-            VenueId::Hyperliquid,
-            SYM_BTC,
-            1,
-            Price::from_raw(1),
-            Qty::from_raw(1),
-            Price::from_raw(2),
-            Qty::from_raw(1),
-        ))
-        .is_ok()
+        while prod
+            .try_push(Tick::new(
+                1,
+                VenueId::Hyperliquid,
+                SYM_BTC,
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+            ))
+            .is_ok()
         {}
         inject_text(
             &mut t,
@@ -1550,14 +1649,64 @@ mod tests {
             &mut t,
             br#"{"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{"funding":"0.0000125","markPx":"1.0","oraclePx":"1.0","openInterest":"2.0"}}}"#,
         );
-        inject_text(&mut t, br#"{"channel":"allMids","data":{"mids":{"BTC":"1.0"}}}"#);
+        inject_text(
+            &mut t,
+            br#"{"channel":"allMids","data":{"mids":{"BTC":"1.0"}}}"#,
+        );
         inject_text(
             &mut t,
             br##"{"channel":"outcomeMetaUpdates","data":[{"kind":"outcomeCreated","coin":"#330","time":1}]}"##,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 3);
         assert_eq!(status.parse_errors_total(), 0);
+    }
+
+    /// Records every ChannelEvent — WS3 premium-packing pinning.
+    #[derive(Default)]
+    struct EventRecCap {
+        events: Vec<ChannelEvent>,
+    }
+    impl core_types::Capture for EventRecCap {
+        fn event(&mut self, e: &ChannelEvent) {
+            self.events.push(*e);
+        }
+    }
+
+    #[test]
+    fn asset_ctx_event_packs_premium_into_venue_seq() {
+        // WS3 (gaps §2.5): the `premium` wire field was parsed
+        // nowhere. It now rides the AssetCtx event's venue_seq slot
+        // (bit-cast i64→u64; the ctx has no venue seq — the slot was
+        // a constant 0 pre-WS3).
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver();
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = EventRecCap::default();
+
+        inject_text(
+            &mut t,
+            br#"{"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{"funding":"0.0000125","markPx":"1.0","oraclePx":"1.0","openInterest":"2.0","premium":"-0.00031774"}}}"#,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        let ev = cap
+            .events
+            .iter()
+            .find(|e| e.channel == ChannelId::AssetCtx as u8)
+            .expect("AssetCtx event captured");
+        assert_eq!(ev.venue_seq as i64, -317_740, "premium ×1e9, sign intact");
+        assert_eq!(ev.v0, 12_500, "funding unchanged in v0");
+        assert_eq!(ev.v1, 2_000_000, "OI unchanged in v1");
     }
 
     #[test]
@@ -1571,7 +1720,16 @@ mod tests {
             &mut t,
             br#"{"channel":"bbo","data":{"coin":"DOGE","time":1000,"bbo":[{"px":"1.0","sz":"1.0","n":1},{"px":"1.1","sz":"1.0","n":1}]}}"#,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
         assert!(cons.try_pop().is_none());
@@ -1593,7 +1751,16 @@ mod tests {
             &mut t,
             br#"{"channel":"error","data":"Invalid subscription {\"type\":\"nope\"}"}"#,
         );
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let e = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1605,10 +1772,22 @@ mod tests {
         let (mut prod, _cons) = ring_pair();
 
         inject_text(&mut t, br#"{"channel":"pong"}"#);
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
         assert_eq!(status.msgs_total(), 0);
         assert_eq!(status.parse_errors_total(), 0);
-        assert!(status.last_activity_ns() > 0, "pong refreshes the idle clock");
+        assert!(
+            status.last_activity_ns() > 0,
+            "pong refreshes the idle clock"
+        );
     }
 
     #[test]
@@ -1627,7 +1806,16 @@ mod tests {
         frame[2..10].copy_from_slice(&huge);
         t.inject_incoming(&frame);
 
-        let e = drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap_err();
+        let e = drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1662,8 +1850,18 @@ mod tests {
         });
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
     }
@@ -1684,8 +1882,18 @@ mod tests {
         });
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::IdleTimeout);
         let mut scratch = [0u8; 4096];
@@ -1712,8 +1920,18 @@ mod tests {
         let mut ka = generous_keepalive();
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::Stale);
         assert_eq!(status.gaps_total(), 1);
@@ -1733,8 +1951,18 @@ mod tests {
         let mut ka = generous_keepalive();
 
         let res = run(
-            &mut t, &mut d, b"h", b"/", &mut prod, &mut poll, &mut events,
-            mio::Token(1), &stop, &status, &mut ka, &mut NullCapture,
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut poll,
+            &mut events,
+            mio::Token(1),
+            &stop,
+            &status,
+            &mut ka,
+            &mut NullCapture,
         );
         assert_eq!(res, RunResult::Disconnected);
         assert_eq!(status.bytes_total(), 2);

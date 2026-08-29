@@ -23,7 +23,10 @@
 //! `(channel × instrument)` pairs into a single call
 //! ([`write_subscribe_all`]). The subscribe *result* echoes the list of
 //! successfully-subscribed channels; any expected channel missing from
-//! the result is a misconfiguration and fails the session (fail-fast).
+//! the result is a misconfiguration and fails the session (fail-fast)
+//! — at BOOT. Once one full verification has ever succeeded, missing
+//! channels on a reconnect are non-fatal per-channel drops (WS2 —
+//! see the run-loop module's subscribe-verification policy).
 //!
 //! ## Integrity (§6.2)
 //!
@@ -90,8 +93,8 @@
     clippy::undocumented_unsafe_blocks
 )]
 
-pub mod run_loop;
 pub mod discovery;
+pub mod run_loop;
 
 pub use run_loop::{
     drive_one, note_transport_ready, run, Driver, RunResult, State, StopFlag, PENDING_CAP,
@@ -99,7 +102,9 @@ pub use run_loop::{
 };
 
 use core_net::SubId;
-use core_parse::{find_field, scan_i64, scan_number_sci_1e6, scan_number_sci_1e9, scan_u64, skip_byte};
+use core_parse::{
+    find_field, scan_i64, scan_number_sci_1e6, scan_number_sci_1e9, scan_u64, skip_byte,
+};
 use core_types::{NsTs, SymbolId};
 
 // ---------------------------------------------------------------
@@ -183,6 +188,39 @@ impl DeribitChannel {
     }
 }
 
+/// WS6: the single per-row channel-policy law — used by BOTH the
+/// subscribe-batch builder and the run-loop's verification-mask /
+/// registration / drop-emission sites, so the two can never drift.
+/// `ch_idx` indexes the fixed channel order (0=quote 1=ticker
+/// 2=trades 3=book — the `DeribitChannel` discriminants).
+///
+/// | row class      | quote | ticker | trades | book (w/ depth) |
+/// |----------------|-------|--------|--------|-----------------|
+/// | static future  |  yes  |  yes   |  yes   |  yes            |
+/// | static SPOT    |  yes  |  —     |  yes   |  yes            |
+/// | option         |  yes  |  yes   |  —     |  —              |
+/// | combo (WS6)    |  yes  |  —     |  —     |  —              |
+#[inline]
+pub fn row_wants_channel(
+    symbols: &DeribitSymbolTable,
+    idx: usize,
+    ch_idx: usize,
+    depth_enabled: bool,
+) -> bool {
+    if symbols.is_combo_row(idx) {
+        return ch_idx == 0;
+    }
+    if symbols.is_option_row(idx) {
+        return ch_idx <= 1;
+    }
+    match ch_idx {
+        0 | 2 => true,
+        1 => !symbols.is_spot_row(idx),
+        3 => depth_enabled,
+        _ => false,
+    }
+}
+
 /// Coarse classification of one inbound text frame. Cheap byte scans
 /// only — full parsing happens per-channel afterwards. Order of
 /// checks follows hot-path frequency: subscription pushes first.
@@ -190,6 +228,10 @@ impl DeribitChannel {
 pub enum DeribitMsgKind {
     /// `{"method":"subscription","params":{"channel":"<ch>.<instr>...`.
     Notification(DeribitChannel),
+    /// WS6: `deribit_volatility_index.{index}` push (DVOL). Routed
+    /// separately from [`Self::Notification`] — the index name is not
+    /// an instrument and never resolves through the symbol table.
+    VolIndexPush,
     /// `{"method":"heartbeat","params":{"type":"test_request"}}` —
     /// **must** be answered with `public/test`.
     TestRequest,
@@ -228,6 +270,10 @@ pub fn classify(payload: &[u8]) -> DeribitMsgKind {
         if memchr::memmem::find(payload, b"\"channel\":\"book.").is_some() {
             return DeribitMsgKind::Notification(DeribitChannel::Book);
         }
+        // WS6: DVOL rides its own long prefix — no aliasing possible.
+        if memchr::memmem::find(payload, b"\"channel\":\"deribit_volatility_index.").is_some() {
+            return DeribitMsgKind::VolIndexPush;
+        }
         return DeribitMsgKind::Unknown;
     }
     if memchr::memmem::find(payload, b"\"method\":\"heartbeat\"").is_some() {
@@ -248,9 +294,7 @@ pub fn classify(payload: &[u8]) -> DeribitMsgKind {
         return DeribitMsgKind::RpcError { id, code };
     }
     if memchr::memmem::find(payload, b"\"result\"").is_some() {
-        if let Some((id, _)) =
-            find_field(payload, b"\"id\":").and_then(|p| scan_u64(payload, p))
-        {
+        if let Some((id, _)) = find_field(payload, b"\"id\":").and_then(|p| scan_u64(payload, p)) {
             return DeribitMsgKind::RpcResult(id);
         }
     }
@@ -334,8 +378,14 @@ pub struct DeribitTickerFrame {
     pub max_px_1e6: i64,
     /// Resolved symbol.
     pub sym: SymbolId,
+    /// WS3: 1 when the wire frame carried `current_funding` — perps
+    /// do, DATED futures do not (the venue-truth form of the
+    /// discovery `settlement_period` split). Gates the run-loop's
+    /// `ChannelId::Funding` capture emit; `current_funding_1e9` is 0
+    /// when this is 0.
+    pub has_funding: u8,
     // Explicit tail padding.
-    _pad: [u8; 4],
+    _pad: [u8; 3],
 }
 
 /// Parsed `trades.{instr}.100ms` row.
@@ -401,6 +451,7 @@ const _SIZE_CHECKS: () = {
     assert!(::core::mem::size_of::<DeribitTickerFrame>() == 64);
     assert!(::core::mem::size_of::<DeribitTradeFrame>() == 64);
     assert!(::core::mem::size_of::<DeribitBookFrame>() == 64);
+    assert!(::core::mem::size_of::<DeribitVolIndexFrame>() == 64);
 };
 
 // ---------------------------------------------------------------
@@ -521,17 +572,71 @@ pub fn parse_option_ticker(payload: &[u8]) -> Option<DeribitOptTickerFrame> {
     })
 }
 
+/// WS6: one parsed `deribit_volatility_index.{index}` (DVOL) push.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub struct DeribitVolIndexFrame {
+    /// Venue event time (`timestamp`, ms) converted to ns.
+    pub ts_ns: NsTs,
+    /// `volatility` POINTS ×1e9 (venue sends percent points, e.g.
+    /// `84.71`).
+    pub vol_1e9: i64,
+    /// Length of the index name captured into `index_name`.
+    pub index_name_len: u8,
+    /// `index_name` bytes (`btc_usd`), `index_name_len` valid.
+    pub index_name: [u8; 16],
+    // Explicit tail padding.
+    _pad: [u8; 31],
+}
+
+/// WS6: parse one DVOL push. The index name resolves to a
+/// boot-configured ordinal at the capture site (never the symbol
+/// table — DVOL is venue-global). `None` on malformed input.
+#[inline]
+pub fn parse_vol_index(payload: &[u8]) -> Option<DeribitVolIndexFrame> {
+    let (ts_ns, _) = scan_ms_field(payload, b"\"timestamp\":")?;
+    let pos = find_field(payload, b"\"volatility\":")?;
+    let (vol_1e9, _) = scan_number_sci_1e9(payload, pos)?;
+    let pos = find_field(payload, b"\"index_name\":")?;
+    let start = skip_byte(payload, pos, b'"');
+    let rel_end = memchr::memchr(b'"', payload.get(start..)?)?;
+    let name = payload.get(start..start + rel_end)?;
+    if name.is_empty() || name.len() > 16 {
+        return None;
+    }
+    let mut index_name = [0u8; 16];
+    index_name[..name.len()].copy_from_slice(name);
+    Some(DeribitVolIndexFrame {
+        ts_ns,
+        vol_1e9,
+        index_name_len: name.len() as u8,
+        index_name,
+        _pad: [0; 31],
+    })
+}
+
 /// Parse a futures/perp `ticker.{instr}.100ms` push into a
 /// [`DeribitTickerFrame`]. OPTION tickers go through
 /// [`parse_option_ticker`] instead (M2.3 — routed by table row).
+///
+/// WS3: `current_funding` is OPTIONAL — perp tickers carry it, DATED
+/// futures' tickers do not (the pre-WS3 hard requirement silently
+/// rejected every dated-future ticker as a parse error). Presence is
+/// reported through `has_funding` so the capture site can gate the
+/// funding emit on venue truth.
 #[inline]
 pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame> {
     // `"mark_price":`/`"index_price":` cannot false-match inside
     // `"settlement_price":` etc. — the leading quote anchors the key.
     let mark_px_1e6 = scan_px_field_1e6(payload, b"\"mark_price\":")?;
     let index_px_1e6 = scan_px_field_1e6(payload, b"\"index_price\":")?;
-    let pos = find_field(payload, b"\"current_funding\":")?;
-    let (current_funding_1e9, _) = scan_number_sci_1e9(payload, pos)?;
+    let (current_funding_1e9, has_funding) = match find_field(payload, b"\"current_funding\":") {
+        Some(pos) => {
+            let (v, _) = scan_number_sci_1e9(payload, pos)?;
+            (v, 1u8)
+        }
+        None => (0, 0u8),
+    };
     let open_interest_1e6 = scan_px_field_1e6(payload, b"\"open_interest\":")?;
     let min_px_1e6 = scan_px_field_1e6(payload, b"\"min_price\":")?;
     let max_px_1e6 = scan_px_field_1e6(payload, b"\"max_price\":")?;
@@ -545,7 +650,8 @@ pub fn parse_ticker(payload: &[u8], sym: SymbolId) -> Option<DeribitTickerFrame>
         min_px_1e6,
         max_px_1e6,
         sym,
-        _pad: [0; 4],
+        has_funding,
+        _pad: [0; 3],
     })
 }
 
@@ -613,11 +719,22 @@ fn count_side_levels(buf: &[u8], pos: usize) -> Option<(u16, u16)> {
         }
         i += 1;
     }
-    let capped = if n > DEPTH_CAP as u32 { DEPTH_CAP as u32 } else { n };
+    let capped = if n > DEPTH_CAP as u32 {
+        DEPTH_CAP as u32
+    } else {
+        n
+    };
     let excess = n - capped;
     // u16 saturation: a >65k-level side is beyond any real book; cap
     // rather than wrap (counts feed metrics, not indexing).
-    Some((capped as u16, if excess > u16::MAX as u32 { u16::MAX } else { excess as u16 }))
+    Some((
+        capped as u16,
+        if excess > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            excess as u16
+        },
+    ))
 }
 
 /// Parse a `book.{instr}.100ms` push **header** (chain fields, event
@@ -680,23 +797,36 @@ pub enum SymbolTableErr {
     /// corrupt channel-name parsing ([`extract_instrument`]).
     HasDot,
     /// A static `insert` after the first `insert_option` (M2.1): the
-    /// table is partitioned `[static | options]`; build order is
-    /// static first, options after.
+    /// table is partitioned `[static | options | combos]` (WS6 added
+    /// the combo tail); build order is static first, options after,
+    /// combos last.
     StaticAfterOptions,
+    /// WS6: an `insert_option` after the first `insert_combo` — the
+    /// combo tail must come last (the partition law above).
+    OptionAfterCombos,
 }
 
 /// Fixed-capacity `instrument_name → SymbolId` map, PARTITIONED
-/// (M2.1): rows `[0..static_len)` are configured instruments (full
-/// channel set), rows `[static_len..len)` are discovered capped-chain
-/// options (quote-only). Linear scan (static N ≤ 16; with a full
-/// options block N ≤ 80 — measured trivial at Deribit's per-message
-/// cadence, noted in docs/hot-path-latency.md at the M2.1 slice).
-/// Single-owner: built at boot, read by the ingress thread.
+/// (M2.1, WS6): rows `[0..static_len)` are configured instruments
+/// (full channel set; a static row whose name carries NO `-` is a
+/// SPOT instrument — `BTC_USDC` vs `BTC-PERPETUAL`/`BTC-27MAR26` —
+/// and skips the ticker channel), rows `[static_len..combo_start)`
+/// are discovered capped-chain options (quote + ticker), rows
+/// `[combo_start..len)` are configured option COMBOS (WS6 —
+/// quote-only BBO capture; combo ORDERS stay Stage-3). Options and
+/// combos SHARE the [`DERIBIT_OPT_MAX`] block (the verification
+/// mask's 64 folded bits cover the whole tail). Linear scan (static
+/// N ≤ 16; with a full tail N ≤ 80 — measured trivial at Deribit's
+/// per-message cadence, noted in docs/hot-path-latency.md at the
+/// M2.1 slice). Single-owner: built at boot, read by the ingress
+/// thread.
 pub struct DeribitSymbolTable {
     rows: [(u8, [u8; DERIBIT_INSTR_MAX], SymbolId); DERIBIT_MAX_SYMBOLS],
     len: usize,
     /// First options row (== `len` while no option was inserted).
     static_len: usize,
+    /// WS6: first combo row (== `len` while no combo was inserted).
+    combo_start: usize,
 }
 
 impl DeribitSymbolTable {
@@ -706,6 +836,7 @@ impl DeribitSymbolTable {
             rows: [(0, [0; DERIBIT_INSTR_MAX], 0); DERIBIT_MAX_SYMBOLS],
             len: 0,
             static_len: 0,
+            combo_start: 0,
         }
     }
 
@@ -742,16 +873,38 @@ impl DeribitSymbolTable {
         }
         self.push_row(instrument, sym);
         self.static_len += 1;
+        self.combo_start = self.len;
         Ok(())
     }
 
     /// Register a DISCOVERED capped-chain option `instrument → sym`
-    /// (quote-only subscription; M2.1). Boot-time only.
+    /// (quote + ticker subscription; M2.1/M2.3). Boot-time only;
+    /// must precede every [`Self::insert_combo`] (WS6 partition law).
     pub fn insert_option(
         &mut self,
         instrument: &[u8],
         sym: SymbolId,
     ) -> Result<(), SymbolTableErr> {
+        Self::validate(instrument)?;
+        if self.combo_start != self.len {
+            return Err(SymbolTableErr::OptionAfterCombos);
+        }
+        if self.len - self.static_len >= DERIBIT_OPT_MAX {
+            return Err(SymbolTableErr::Full);
+        }
+        debug_assert!(self.len < DERIBIT_MAX_SYMBOLS, "blocks sum to capacity");
+        self.push_row(instrument, sym);
+        self.combo_start = self.len;
+        Ok(())
+    }
+
+    /// WS6: register a CONFIGURED option-COMBO `instrument → sym`
+    /// (quote-only BBO capture). Boot-time only; combos come LAST and
+    /// SHARE the [`DERIBIT_OPT_MAX`] tail block with the discovered
+    /// options (the verification mask folds both into its 64
+    /// per-row bits) — shrink the options E/K knobs to make room for
+    /// a large combo list.
+    pub fn insert_combo(&mut self, instrument: &[u8], sym: SymbolId) -> Result<(), SymbolTableErr> {
         Self::validate(instrument)?;
         if self.len - self.static_len >= DERIBIT_OPT_MAX {
             return Err(SymbolTableErr::Full);
@@ -767,16 +920,42 @@ impl DeribitSymbolTable {
         self.static_len
     }
 
-    /// Number of option (quote-only) rows.
+    /// Number of option (quote + ticker) rows.
     #[inline]
     pub fn n_options(&self) -> usize {
-        self.len - self.static_len
+        self.combo_start - self.static_len
     }
 
-    /// True when row `idx` is an option row (quote-only).
+    /// WS6: number of combo (quote-only) rows.
+    #[inline]
+    pub fn n_combos(&self) -> usize {
+        self.len - self.combo_start
+    }
+
+    /// True when row `idx` is an option row (quote + ticker).
     #[inline]
     pub fn is_option_row(&self, idx: usize) -> bool {
-        idx >= self.static_len && idx < self.len
+        idx >= self.static_len && idx < self.combo_start
+    }
+
+    /// WS6: true when row `idx` is a combo row (quote-only).
+    #[inline]
+    pub fn is_combo_row(&self, idx: usize) -> bool {
+        idx >= self.combo_start && idx < self.len
+    }
+
+    /// WS6: true when static row `idx` is a SPOT instrument — the
+    /// name-shape law from the crate docs: spot names carry NO `-`
+    /// (`BTC_USDC`), every future/perp does (`BTC-PERPETUAL`,
+    /// `BTC_USDC-PERPETUAL`, `BTC-27MAR26`). Spot rows skip the
+    /// ticker channel (no funding/OI/mark analytics on spot).
+    #[inline]
+    pub fn is_spot_row(&self, idx: usize) -> bool {
+        if idx >= self.static_len {
+            return false;
+        }
+        let row = &self.rows[idx];
+        memchr::memchr(b'-', &row.1[..row.0 as usize]).is_none()
     }
 
     /// Resolve an instrument to its symbol. Hot path: length gate
@@ -1059,21 +1238,32 @@ fn write_channel_name(
     Some(n)
 }
 
+/// WS6: max DVOL index subscriptions per session (`[deribit]
+/// options_underlyings` caps at 16; DVOL exists for a handful of
+/// currencies — 8 is generous headroom).
+pub const DERIBIT_DVOL_MAX: usize = 8;
+
+/// WS6: one configured DVOL index name (`(len, bytes)`; `btc_usd`).
+pub type DvolName = (u8, [u8; 16]);
+
 /// Serialize the single batched `public/subscribe` covering every
-/// configured `(channel × instrument)` pair: `quote` + `ticker.100ms`
-/// + `trades.100ms` per STATIC instrument, `book.100ms` when
-/// `depth_enabled`; OPTION rows (M2.1 capped chain) subscribe `quote`
-/// + `ticker.100ms` (M2.3 — BBO rides the tick lane, the option
-/// ticker feeds the `OptSummary` capture channel) — never
-/// trades/book. **One call** — subscribe costs 3000 of 30 000
-/// credits (§4.2), so batching is mandatory. Returns the byte
-/// length, `None` if `dst` is too small.
+/// configured `(channel × instrument)` pair per the
+/// [`row_wants_channel`] policy (static futures: quote/ticker/trades
+/// +book with depth; static SPOT: no ticker — WS6; options: quote +
+/// ticker — M2.3; combos: quote only — WS6), PLUS one
+/// `deribit_volatility_index.{index}` channel per configured DVOL
+/// index (WS6 — OUTSIDE the verification mask: an absent echo shows
+/// up as a missing capture series, never a session verdict).
+/// **One call** — subscribe costs 3000 of 30 000 credits (§4.2), so
+/// batching is mandatory. Returns the byte length, `None` if `dst`
+/// is too small.
 #[inline]
 pub fn write_subscribe_all(
     dst: &mut [u8],
     id: u64,
     symbols: &DeribitSymbolTable,
     depth_enabled: bool,
+    dvol: &[DvolName],
 ) -> Option<usize> {
     let mut n = write_req_head(dst, id, b"public/subscribe")?;
     n = push_bytes(dst, n, b"{\"channels\":[")?;
@@ -1086,23 +1276,30 @@ pub fn write_subscribe_all(
             DeribitChannel::Trades,
             DeribitChannel::Book,
         ];
-        let n_ch = if symbols.is_option_row(i) {
-            2 // quote + ticker (M2.3 — the mark/IV stream); never trades/book
-        } else if depth_enabled {
-            4
-        } else {
-            3
-        };
         let mut c = 0;
-        while c < n_ch {
-            if !first {
-                n = push_bytes(dst, n, b",")?;
+        while c < channels.len() {
+            if row_wants_channel(symbols, i, c, depth_enabled) {
+                if !first {
+                    n = push_bytes(dst, n, b",")?;
+                }
+                first = false;
+                n = write_channel_name(dst, n, channels[c], instr)?;
             }
-            first = false;
-            n = write_channel_name(dst, n, channels[c], instr)?;
             c += 1;
         }
         i += 1;
+    }
+    let mut d = 0;
+    while d < dvol.len() {
+        let (len, ref bytes) = dvol[d];
+        if !first {
+            n = push_bytes(dst, n, b",")?;
+        }
+        first = false;
+        n = push_bytes(dst, n, b"\"deribit_volatility_index.")?;
+        n = push_bytes(dst, n, &bytes[..len as usize])?;
+        n = push_bytes(dst, n, b"\"")?;
+        d += 1;
     }
     n = push_bytes(dst, n, b"]}}")?;
     Some(n)
@@ -1112,12 +1309,7 @@ pub fn write_subscribe_all(
 /// for `book.{instr}.100ms` — the §6.2 resync action after a chain
 /// break (unsubscribe + subscribe ⇒ fresh snapshot).
 #[inline]
-pub fn write_book_op(
-    dst: &mut [u8],
-    id: u64,
-    method: &[u8],
-    instrument: &[u8],
-) -> Option<usize> {
+pub fn write_book_op(dst: &mut [u8], id: u64, method: &[u8], instrument: &[u8]) -> Option<usize> {
     let mut n = write_req_head(dst, id, method)?;
     n = push_bytes(dst, n, b"{\"channels\":[")?;
     n = write_channel_name(dst, n, DeribitChannel::Book, instrument)?;
@@ -1179,8 +1371,10 @@ mod tests {
     const TRADES: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-PERPETUAL.100ms","data":[{"trade_seq":30289442,"trade_id":"48079269","timestamp":1590484512188,"tick_direction":2,"price":8950.0,"mark_price":8948.9,"instrument_name":"BTC-PERPETUAL","index_price":8955.88,"direction":"sell","amount":10.0}]}}"#;
     const BOOK_SNAP: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1554373962454,"instrument_name":"BTC-PERPETUAL","change_id":297217105,"bids":[["new",5042.34,30.0],["new",5041.94,20.0]],"asks":[["new",5042.64,40.0]],"type":"snapshot"}}}"#;
     const BOOK_CHANGE: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"book.BTC-PERPETUAL.100ms","data":{"timestamp":1554373963454,"instrument_name":"BTC-PERPETUAL","change_id":297217107,"prev_change_id":297217105,"bids":[["delete",5041.94,0.0]],"asks":[],"type":"change"}}}"#;
-    const TEST_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
-    const HEARTBEAT: &[u8] = br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"heartbeat"}}"#;
+    const TEST_REQ: &[u8] =
+        br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
+    const HEARTBEAT: &[u8] =
+        br#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"heartbeat"}}"#;
     const RPC_OK: &[u8] = br#"{"jsonrpc":"2.0","id":42,"result":["quote.BTC-PERPETUAL"],"usIn":1,"usOut":2,"usDiff":1,"testnet":false}"#;
     const RPC_ERR: &[u8] = br#"{"jsonrpc":"2.0","id":7,"error":{"code":10028,"message":"too_many_requests"},"testnet":false}"#;
 
@@ -1188,14 +1382,29 @@ mod tests {
 
     #[test]
     fn classify_recognizes_every_kind() {
-        assert_eq!(classify(QUOTE), DeribitMsgKind::Notification(DeribitChannel::Quote));
-        assert_eq!(classify(TICKER), DeribitMsgKind::Notification(DeribitChannel::Ticker));
-        assert_eq!(classify(TRADES), DeribitMsgKind::Notification(DeribitChannel::Trades));
-        assert_eq!(classify(BOOK_SNAP), DeribitMsgKind::Notification(DeribitChannel::Book));
+        assert_eq!(
+            classify(QUOTE),
+            DeribitMsgKind::Notification(DeribitChannel::Quote)
+        );
+        assert_eq!(
+            classify(TICKER),
+            DeribitMsgKind::Notification(DeribitChannel::Ticker)
+        );
+        assert_eq!(
+            classify(TRADES),
+            DeribitMsgKind::Notification(DeribitChannel::Trades)
+        );
+        assert_eq!(
+            classify(BOOK_SNAP),
+            DeribitMsgKind::Notification(DeribitChannel::Book)
+        );
         assert_eq!(classify(TEST_REQ), DeribitMsgKind::TestRequest);
         assert_eq!(classify(HEARTBEAT), DeribitMsgKind::Heartbeat);
         assert_eq!(classify(RPC_OK), DeribitMsgKind::RpcResult(42));
-        assert_eq!(classify(RPC_ERR), DeribitMsgKind::RpcError { id: 7, code: 10028 });
+        assert_eq!(
+            classify(RPC_ERR),
+            DeribitMsgKind::RpcError { id: 7, code: 10028 }
+        );
         assert_eq!(classify(b"{\"nonsense\":true}"), DeribitMsgKind::Unknown);
     }
 
@@ -1204,7 +1413,13 @@ mod tests {
         let odd = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"platform_state","data":{}}}"#;
         assert_eq!(classify(odd), DeribitMsgKind::Unknown);
         let neg = br#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"invalid params"}}"#;
-        assert_eq!(classify(neg), DeribitMsgKind::RpcError { id: 3, code: -32602 });
+        assert_eq!(
+            classify(neg),
+            DeribitMsgKind::RpcError {
+                id: 3,
+                code: -32602
+            }
+        );
     }
 
     // ---- extract_instrument --------------------------------------
@@ -1280,6 +1495,7 @@ mod tests {
         assert_eq!(f.mark_px_1e6, 3_940_060_000);
         assert_eq!(f.index_px_1e6, 3_931_730_000);
         assert_eq!(f.current_funding_1e9, 420_000);
+        assert_eq!(f.has_funding, 1, "perp ticker carries current_funding");
         assert_eq!(f.open_interest_1e6, 18_918_470_000_000);
         assert_eq!(f.min_px_1e6, 3_943_210_000);
         assert_eq!(f.max_px_1e6, 3_982_840_000);
@@ -1291,7 +1507,23 @@ mod tests {
         let b = br#"{"timestamp":2000,"mark_price":1.0,"index_price":1.0,"current_funding":-0.000375,"open_interest":5,"min_price":0.9,"max_price":1.1}"#;
         let f = parse_ticker(b, 0).unwrap();
         assert_eq!(f.current_funding_1e9, -375_000);
+        assert_eq!(f.has_funding, 1);
         assert!(parse_ticker(b"{}", 0).is_none());
+    }
+
+    #[test]
+    fn parse_ticker_dated_future_without_funding_parses() {
+        // WS3: dated-future tickers carry NO current_funding — the
+        // pre-WS3 parser rejected every one of them. They must parse
+        // with has_funding = 0 / rate 0.
+        let dated = br#"{"timestamp":2000,"mark_price":65100.5,"index_price":65099.0,"open_interest":1234.0,"min_price":64000.0,"max_price":66000.0,"instrument_name":"BTC-26DEC26"}"#;
+        let f = parse_ticker(dated, 7).unwrap();
+        assert_eq!(f.has_funding, 0, "no current_funding on a dated future");
+        assert_eq!(f.current_funding_1e9, 0);
+        assert_eq!(f.mark_px_1e6, 65_100_500_000);
+        // The other required fields still gate the parse.
+        let broken = br#"{"timestamp":2000,"mark_price":65100.5}"#;
+        assert!(parse_ticker(broken, 7).is_none());
     }
 
     // ---- parse_trade ---------------------------------------------
@@ -1428,7 +1660,8 @@ mod tests {
         // Options block cap.
         let mut i = 2u32;
         while (i as usize) < DERIBIT_OPT_MAX {
-            t.insert_option(format!("O{i}").as_bytes(), 512 + i).unwrap();
+            t.insert_option(format!("O{i}").as_bytes(), 512 + i)
+                .unwrap();
             i += 1;
         }
         assert_eq!(t.insert_option(b"OVER", 999), Err(SymbolTableErr::Full));
@@ -1443,7 +1676,7 @@ mod tests {
         t.insert(b"BTC-PERPETUAL", 1).unwrap();
         t.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
         let mut buf = [0u8; 4096];
-        let n = write_subscribe_all(&mut buf, 5, &t, false).expect("fits");
+        let n = write_subscribe_all(&mut buf, 5, &t, false, &[]).expect("fits");
         let s = core::str::from_utf8(&buf[..n]).unwrap();
         // Static row: full non-depth set.
         assert!(s.contains("\"quote.BTC-PERPETUAL\""));
@@ -1455,11 +1688,111 @@ mod tests {
         assert!(!s.contains("trades.BTC-27MAR26-100000-C"));
         assert!(!s.contains("book.BTC-27MAR26-100000-C"));
         // Depth on: static gains book, option unchanged.
-        let n2 = write_subscribe_all(&mut buf, 6, &t, true).expect("fits");
+        let n2 = write_subscribe_all(&mut buf, 6, &t, true, &[]).expect("fits");
         let s2 = core::str::from_utf8(&buf[..n2]).unwrap();
         assert!(s2.contains("\"book.BTC-PERPETUAL.100ms\""));
         assert!(!s2.contains("book.BTC-27MAR26-100000-C"));
         assert!(s2.contains("\"ticker.BTC-27MAR26-100000-C.100ms\""));
+    }
+
+    #[test]
+    fn subscribe_all_spot_combo_and_dvol_channel_policy() {
+        // WS6: the row_wants_channel law end-to-end — spot rows skip
+        // the ticker, combo rows are quote-only, DVOL channels append
+        // after every instrument channel.
+        let mut t = DeribitSymbolTable::new();
+        t.insert(b"BTC-PERPETUAL", 1).unwrap();
+        t.insert(b"BTC_USDC", 2).unwrap(); // spot (name-shape law)
+        t.insert_option(b"BTC-27MAR26-100000-C", 513).unwrap();
+        t.insert_combo(b"BTC-FS-27MAR26_PERP", 1025).unwrap();
+        assert!(t.is_spot_row(1));
+        assert!(!t.is_spot_row(0));
+        assert!(t.is_combo_row(3));
+        assert!(t.is_option_row(2));
+        assert!(!t.is_option_row(3), "combo is not an option row");
+        assert_eq!(t.n_options(), 1);
+        assert_eq!(t.n_combos(), 1);
+
+        let dvol: [DvolName; 1] = {
+            let mut d = [(0u8, [0u8; 16]); 1];
+            d[0].0 = 7;
+            d[0].1[..7].copy_from_slice(b"btc_usd");
+            d
+        };
+        let mut buf = [0u8; 4096];
+        let n = write_subscribe_all(&mut buf, 5, &t, true, &dvol).expect("fits");
+        let s = core::str::from_utf8(&buf[..n]).unwrap();
+        // Spot: quote + trades + book — NO ticker.
+        assert!(s.contains("\"quote.BTC_USDC\""));
+        assert!(s.contains("\"trades.BTC_USDC.100ms\""));
+        assert!(s.contains("\"book.BTC_USDC.100ms\""));
+        assert!(!s.contains("ticker.BTC_USDC"));
+        // Combo: quote ONLY.
+        assert!(s.contains("\"quote.BTC-FS-27MAR26_PERP\""));
+        assert!(!s.contains("ticker.BTC-FS-27MAR26_PERP"));
+        assert!(!s.contains("trades.BTC-FS-27MAR26_PERP"));
+        assert!(!s.contains("book.BTC-FS-27MAR26_PERP"));
+        // DVOL rides the same batch.
+        assert!(s.contains("\"deribit_volatility_index.btc_usd\""));
+    }
+
+    #[test]
+    fn combo_partition_and_capacity_laws() {
+        let mut t = DeribitSymbolTable::new();
+        t.insert(b"BTC-PERPETUAL", 1).unwrap();
+        t.insert_combo(b"BTC-FS-A_B", 1025).unwrap();
+        // Options after combos violate the partition law.
+        assert_eq!(
+            t.insert_option(b"BTC-27MAR26-100000-C", 513),
+            Err(SymbolTableErr::OptionAfterCombos)
+        );
+        // Statics after the tail stay refused.
+        assert_eq!(
+            t.insert(b"ETH-PERPETUAL", 2),
+            Err(SymbolTableErr::StaticAfterOptions)
+        );
+        // Combos + options share the 64-row tail block.
+        let mut full = DeribitSymbolTable::new();
+        full.insert(b"BTC-PERPETUAL", 1).unwrap();
+        let mut k = 0u32;
+        while k < (DERIBIT_OPT_MAX as u32) {
+            let name = [
+                b'C',
+                b'M',
+                b'B',
+                b'A' + ((k / 26) % 26) as u8,
+                b'A' + (k % 26) as u8,
+            ];
+            full.insert_combo(&name, 2000 + k).unwrap();
+            k += 1;
+        }
+        assert_eq!(
+            full.insert_combo(b"OVERFLOW-X", 9999),
+            Err(SymbolTableErr::Full)
+        );
+    }
+
+    #[test]
+    fn parse_vol_index_extracts_and_rejects() {
+        // WS6: the DVOL push shape.
+        let b = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_volatility_index.btc_usd","data":{"timestamp":1619777946007,"volatility":84.71,"index_name":"btc_usd"}}}"#;
+        let f = parse_vol_index(b).expect("parses");
+        assert_eq!(f.ts_ns, 1_619_777_946_007 * 1_000_000);
+        assert_eq!(f.vol_1e9, 84_710_000_000, "points ×1e9");
+        assert_eq!(&f.index_name[..f.index_name_len as usize], b"btc_usd");
+        assert_eq!(
+            classify(b),
+            DeribitMsgKind::VolIndexPush,
+            "classify routes DVOL past the instrument channels"
+        );
+        assert!(parse_vol_index(b"{}").is_none());
+        let no_name = br#"{"timestamp":1,"volatility":50.0}"#;
+        assert!(parse_vol_index(no_name).is_none());
+        let long_name = br#"{"timestamp":1,"volatility":50.0,"index_name":"aaaaaaaaaaaaaaaaa"}"#;
+        assert!(
+            parse_vol_index(long_name).is_none(),
+            "17-byte name rejected"
+        );
     }
 
     #[test]
@@ -1480,7 +1813,8 @@ mod tests {
         // no greeks/mark_iv — they can never alias into this parser).
         let fut = br#"{"timestamp":2000,"mark_price":1.0,"index_price":1.0,"current_funding":0.0,"open_interest":5,"min_price":0.9,"max_price":1.1}"#;
         assert!(parse_option_ticker(fut).is_none());
-        let no_greeks = br#"{"mark_price":0.05,"mark_iv":65.0,"underlying_price":77000.0,"open_interest":1.0}"#;
+        let no_greeks =
+            br#"{"mark_price":0.05,"mark_iv":65.0,"underlying_price":77000.0,"open_interest":1.0}"#;
         assert!(parse_option_ticker(no_greeks).is_none());
     }
 
@@ -1535,10 +1869,18 @@ mod tests {
         let mut m = DeribitTradeSeq::new();
         assert_eq!(m.apply(5), TradeSeqOutcome::Ok);
         assert_eq!(m.apply(6), TradeSeqOutcome::Ok);
-        assert_eq!(m.apply(6), TradeSeqOutcome::Regression, "repeat is a regression");
+        assert_eq!(
+            m.apply(6),
+            TradeSeqOutcome::Regression,
+            "repeat is a regression"
+        );
         // Resynced to 6 → 7 chains.
         assert_eq!(m.apply(7), TradeSeqOutcome::Ok);
-        assert_eq!(m.apply(10), TradeSeqOutcome::Gap, "jump of +3 missed trades");
+        assert_eq!(
+            m.apply(10),
+            TradeSeqOutcome::Gap,
+            "jump of +3 missed trades"
+        );
         // Resynced to 10 → 11 chains.
         assert_eq!(m.apply(11), TradeSeqOutcome::Ok);
         assert_eq!(m.apply(3), TradeSeqOutcome::Regression);
@@ -1568,7 +1910,11 @@ mod tests {
         // Edge regression 15 → 9; tail adoption still moves to the
         // frame's last row so the following frame is judged off it.
         assert_eq!(m.apply_frame(9, 20), TradeSeqOutcome::Regression);
-        assert_eq!(m.apply_frame(21, 21), TradeSeqOutcome::Ok, "tail = 20 adopted");
+        assert_eq!(
+            m.apply_frame(21, 21),
+            TradeSeqOutcome::Ok,
+            "tail = 20 adopted"
+        );
     }
 
     #[test]
@@ -1578,7 +1924,11 @@ mod tests {
         assert_eq!(c.apply(BOOK_ACTION_SNAPSHOT, -1, 42), ChainOutcome::Init);
         assert_eq!(c.last_change_id(), 42);
         assert_eq!(c.apply(BOOK_ACTION_CHANGE, 42, 43), ChainOutcome::Chained);
-        assert_eq!(c.last_change_id(), 43, "reads as the expected prev for the next change");
+        assert_eq!(
+            c.last_change_id(),
+            43,
+            "reads as the expected prev for the next change"
+        );
     }
 
     // ---- request writers -----------------------------------------
@@ -1589,14 +1939,14 @@ mod tests {
         t.insert(b"BTC-PERPETUAL", 1).unwrap();
         t.insert(b"ETH-PERPETUAL", 2).unwrap();
         let mut dst = [0u8; 1024];
-        let n = write_subscribe_all(&mut dst, 5, &t, false).unwrap();
+        let n = write_subscribe_all(&mut dst, 5, &t, false, &[]).unwrap();
         assert_eq!(
             &dst[..n],
             br#"{"jsonrpc":"2.0","id":5,"method":"public/subscribe","params":{"channels":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.ETH-PERPETUAL","ticker.ETH-PERPETUAL.100ms","trades.ETH-PERPETUAL.100ms"]}}"#
                 as &[u8]
         );
         // Depth adds book.100ms per instrument; still one call.
-        let n = write_subscribe_all(&mut dst, 6, &t, true).unwrap();
+        let n = write_subscribe_all(&mut dst, 6, &t, true, &[]).unwrap();
         assert!(memchr::memmem::find(&dst[..n], b"\"book.BTC-PERPETUAL.100ms\"").is_some());
         assert!(memchr::memmem::find(&dst[..n], b"\"book.ETH-PERPETUAL.100ms\"").is_some());
         assert_eq!(
@@ -1610,7 +1960,7 @@ mod tests {
         let mut t = DeribitSymbolTable::new();
         t.insert(b"BTC-PERPETUAL", 1).unwrap();
         let mut tiny = [0u8; 16];
-        assert!(write_subscribe_all(&mut tiny, 1, &t, false).is_none());
+        assert!(write_subscribe_all(&mut tiny, 1, &t, false, &[]).is_none());
     }
 
     #[test]
@@ -1631,8 +1981,7 @@ mod tests {
         let n = write_test(&mut dst, 12345).unwrap();
         assert_eq!(
             &dst[..n],
-            br#"{"jsonrpc":"2.0","id":12345,"method":"public/test","params":{}}"#
-                as &[u8]
+            br#"{"jsonrpc":"2.0","id":12345,"method":"public/test","params":{}}"# as &[u8]
         );
         let mut tiny = [0u8; 8];
         assert!(write_test(&mut tiny, 1).is_none());
@@ -1661,6 +2010,36 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
+        // WS6: the DVOL scanner tolerates arbitrary bytes and
+        // roundtrips generated pushes.
+        #[test]
+        fn vol_index_never_panics_on_arbitrary_bytes(
+            buf in proptest::collection::vec(any::<u8>(), 0..=300)
+        ) {
+            let _ = parse_vol_index(&buf);
+        }
+
+        #[test]
+        fn vol_index_roundtrips(
+            ts in 1u64..2_000_000_000_000u64,
+            points in 0u32..400u32,
+            frac in 0u32..100u32,
+        ) {
+            let mut buf = String::with_capacity(160);
+            use std::fmt::Write;
+            write!(
+                &mut buf,
+                r#"{{"timestamp":{ts},"volatility":{points}.{frac:02},"index_name":"btc_usd"}}"#,
+            ).unwrap();
+            let f = parse_vol_index(buf.as_bytes()).unwrap();
+            prop_assert_eq!(f.ts_ns, ts * 1_000_000);
+            prop_assert_eq!(
+                f.vol_1e9,
+                (points as i64) * 1_000_000_000 + (frac as i64) * 10_000_000
+            );
+            prop_assert_eq!(&f.index_name[..f.index_name_len as usize], b"btc_usd");
+        }
+
         #[test]
         fn quote_roundtrips(
             bp in 1u32..999_999u32,

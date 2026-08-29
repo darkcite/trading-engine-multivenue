@@ -75,7 +75,9 @@
 //! Normalization to `Qty(1e6)` happens downstream in execution
 //! sizing — discovery capture does not quantize.
 
-use core_parse::{find_field, scan_number_sci_1e9, scan_u64, skip_json_value, skip_string, skip_ws};
+use core_parse::{
+    find_field, scan_number_sci_1e9, scan_u64, skip_json_value, skip_string, skip_ws,
+};
 
 use crate::DERIBIT_INSTR_MAX;
 
@@ -194,6 +196,15 @@ impl DeribitDiscovery {
         self.ingest_inner(body, RowKind::Option)
     }
 
+    /// WS6: parse one `kind=spot` `get_instruments` body (one
+    /// currency page) into the table — the spot-instrument boot
+    /// audit. Spot rows carry no `settlement_period` / no
+    /// `contract_size`; counts accumulate beside the futures pages
+    /// (same table — the coverage audit resolves both classes).
+    pub fn ingest_spot_body(&mut self, body: &[u8]) -> Result<u32, DeribitDiscoveryErr> {
+        self.ingest_inner(body, RowKind::Spot)
+    }
+
     fn ingest_inner(&mut self, body: &[u8], want: RowKind) -> Result<u32, DeribitDiscoveryErr> {
         // Envelope: `"jsonrpc":"2.0"`.
         let ver_pos = find_field(body, b"\"jsonrpc\":").ok_or(DeribitDiscoveryErr::Envelope)?;
@@ -222,7 +233,7 @@ impl DeribitDiscovery {
                 b'{' => {
                     let (row, end) = parse_row(body, i, want)?;
                     let cap = match want {
-                        RowKind::Future => DERIBIT_DISCOVERY_ROWS_CAP,
+                        RowKind::Future | RowKind::Spot => DERIBIT_DISCOVERY_ROWS_CAP,
                         RowKind::Option => DERIBIT_OPT_DISCOVERY_ROWS_CAP,
                     };
                     if self.rows.len() >= cap {
@@ -366,12 +377,16 @@ pub fn select_capped_chain(
     )
 }
 
-/// Which `kind=` page a row is being parsed from (M2.1). Determines
-/// the accepted `kind` value and the required-field set.
+/// Which `kind=` page a row is being parsed from (M2.1, WS6).
+/// Determines the accepted `kind` value and the required-field set.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum RowKind {
     Future,
     Option,
+    /// WS6: `kind=spot` pages — spot rows carry NO
+    /// `settlement_period` and NO `contract_size` (defaults: not
+    /// perpetual, contract size 1.0).
+    Spot,
 }
 
 /// Parse one instrument object starting at `pos` (must point at `{`).
@@ -446,6 +461,7 @@ fn parse_row(
                         let expect: &[u8] = match want {
                             RowKind::Future => b"future",
                             RowKind::Option => b"option",
+                            RowKind::Spot => b"spot",
                         };
                         if s != expect {
                             return Err(DeribitDiscoveryErr::BadRow);
@@ -471,8 +487,7 @@ fn parse_row(
                         // Bare integer ms since epoch — too large for
                         // the ×1e9 scanners (1.8e12 × 1e9 overflows
                         // i64); plain u64 scan, checked into i64.
-                        let (v, end) =
-                            scan_u64(body, i).ok_or(DeribitDiscoveryErr::BadRow)?;
+                        let (v, end) = scan_u64(body, i).ok_or(DeribitDiscoveryErr::BadRow)?;
                         if v > i64::MAX as u64 {
                             return Err(DeribitDiscoveryErr::BadRow);
                         }
@@ -536,15 +551,26 @@ fn parse_row(
     }
     let is_active = is_active.ok_or(DeribitDiscoveryErr::BadRow)?;
     let state_open = state_open.ok_or(DeribitDiscoveryErr::BadRow)?;
+    // WS6: spot rows carry NO settlement_period and NO contract_size
+    // — defaults (not perpetual; contract size 1.0). Futures/options
+    // keep the strict requirements.
+    let perpetual = match want {
+        RowKind::Spot => perpetual.unwrap_or(false),
+        _ => perpetual.ok_or(DeribitDiscoveryErr::BadRow)?,
+    };
+    let contract_size_1e9 = match want {
+        RowKind::Spot => contract_size.unwrap_or(1_000_000_000),
+        _ => contract_size.ok_or(DeribitDiscoveryErr::BadRow)?,
+    };
     let row = DeribitInstrumentRow {
         instrument_name,
         instrument_name_len,
-        perpetual: perpetual.ok_or(DeribitDiscoveryErr::BadRow)?,
+        perpetual,
         live: state_open && is_active,
         tick_size_1e9: tick_size.ok_or(DeribitDiscoveryErr::BadRow)?,
         tick_size_steps,
         n_tick_steps,
-        contract_size_1e9: contract_size.ok_or(DeribitDiscoveryErr::BadRow)?,
+        contract_size_1e9,
         min_trade_amount_1e9: min_trade_amount.ok_or(DeribitDiscoveryErr::BadRow)?,
         is_option: want == RowKind::Option,
         is_call: is_call.unwrap_or(false),
@@ -737,7 +763,10 @@ mod tests {
         assert_eq!(usdc.tick_size_1e9, 10_000); // 1e-05
         assert_eq!(usdc.n_tick_steps, 1);
         // above 100000 → tick 10, both ×1e9.
-        assert_eq!(usdc.tick_size_steps[0], (100_000_000_000_000, 10_000_000_000));
+        assert_eq!(
+            usdc.tick_size_steps[0],
+            (100_000_000_000_000, 10_000_000_000)
+        );
         assert_eq!(usdc.contract_size_1e9, 1_000_000_000); // 1.0
         assert_eq!(usdc.min_trade_amount_1e9, 1_000_000_000); // bare int 1
 
@@ -779,12 +808,14 @@ mod tests {
         );
         // Wrong version.
         assert_eq!(
-            d.ingest_body(br#"{"jsonrpc":"1.0","result":[]}"#).unwrap_err(),
+            d.ingest_body(br#"{"jsonrpc":"1.0","result":[]}"#)
+                .unwrap_err(),
             DeribitDiscoveryErr::Envelope
         );
         // Missing result.
         assert_eq!(
-            d.ingest_body(br#"{"jsonrpc":"2.0","testnet":false}"#).unwrap_err(),
+            d.ingest_body(br#"{"jsonrpc":"2.0","testnet":false}"#)
+                .unwrap_err(),
             DeribitDiscoveryErr::Envelope
         );
         // result is not an array.
@@ -842,13 +873,16 @@ mod tests {
         let mut d = DeribitDiscovery::new();
         // Body ends inside a row object.
         assert_eq!(
-            d.ingest_body(br#"{"jsonrpc":"2.0","result":[{"instrument_name":"BTC-PERPETUAL","kind":"future""#)
-                .unwrap_err(),
+            d.ingest_body(
+                br#"{"jsonrpc":"2.0","result":[{"instrument_name":"BTC-PERPETUAL","kind":"future""#
+            )
+            .unwrap_err(),
             DeribitDiscoveryErr::Truncated
         );
         // Body ends right after the array opens.
         assert_eq!(
-            d.ingest_body(br#"{"jsonrpc":"2.0","result":["#).unwrap_err(),
+            d.ingest_body(br#"{"jsonrpc":"2.0","result":["#)
+                .unwrap_err(),
             DeribitDiscoveryErr::Truncated
         );
         // Unterminated string value.
@@ -877,7 +911,10 @@ mod tests {
         for _ in 0..(DERIBIT_DISCOVERY_ROWS_CAP / per_page) {
             d.ingest_body(&body).expect("under cap");
         }
-        assert_eq!(d.ingest_body(&body).unwrap_err(), DeribitDiscoveryErr::TooMany);
+        assert_eq!(
+            d.ingest_body(&body).unwrap_err(),
+            DeribitDiscoveryErr::TooMany
+        );
     }
 
     // -----------------------------------------------------------
@@ -909,10 +946,23 @@ mod tests {
                 }
             }
         }
-        rows.push(opt_row("BTC-27MAR26-110000-C", "call", "110000", EXP1, false)); // closed
-        rows.push(opt_row("BTC-OLD-90000-C", "call", "90000", NOW - 1_000, true)); // expired
+        rows.push(opt_row(
+            "BTC-27MAR26-110000-C",
+            "call",
+            "110000",
+            EXP1,
+            false,
+        )); // closed
+        rows.push(opt_row(
+            "BTC-OLD-90000-C",
+            "call",
+            "90000",
+            NOW - 1_000,
+            true,
+        )); // expired
         let mut d = DeribitDiscovery::new();
-        d.ingest_options_body(&page(&rows.join(","))).expect("grid parses");
+        d.ingest_options_body(&page(&rows.join(",")))
+            .expect("grid parses");
         d
     }
 
@@ -929,7 +979,11 @@ mod tests {
         assert_eq!(c.tick_size_steps[0], (5_000_000, 500_000)); // 0.005 / 0.0005
         let p = d.find(b"BTC-27MAR26-100000-P").expect("put row");
         assert!(p.is_option && !p.is_call);
-        assert!(!d.find(b"BTC-27MAR26-110000-C").expect("closed row kept").live);
+        assert!(
+            !d.find(b"BTC-27MAR26-110000-C")
+                .expect("closed row kept")
+                .live
+        );
     }
 
     #[test]
@@ -948,7 +1002,11 @@ mod tests {
     #[test]
     fn option_row_missing_chain_fields_rejected() {
         let full = opt_row("BTC-27MAR26-100000-C", "call", "100000", EXP1, true);
-        for gone in ["\"option_type\":\"call\",", "\"strike\":100000,", "\"expiration_timestamp\":1774598400000,"] {
+        for gone in [
+            "\"option_type\":\"call\",",
+            "\"strike\":100000,",
+            "\"expiration_timestamp\":1774598400000,",
+        ] {
             let broken = full.replacen(gone, "", 1);
             assert_ne!(broken, full, "field `{gone}` must exist in the fixture");
             let mut d = DeribitDiscovery::new();
@@ -961,7 +1019,10 @@ mod tests {
         // Bad option_type value.
         let bad = full.replacen("\"call\"", "\"straddle\"", 1);
         let mut d = DeribitDiscovery::new();
-        assert_eq!(d.ingest_options_body(&page(&bad)).unwrap_err(), DeribitDiscoveryErr::BadRow);
+        assert_eq!(
+            d.ingest_options_body(&page(&bad)).unwrap_err(),
+            DeribitDiscoveryErr::BadRow
+        );
     }
 
     #[test]
@@ -979,19 +1040,34 @@ mod tests {
         let ok = br#"{"jsonrpc":"2.0","result":{"index_price":109731.42,"estimated_delivery_price":109731.42},"usIn":1,"usOut":2,"usDiff":1,"testnet":false}"#;
         assert_eq!(parse_index_price(ok).expect("parses"), 109_731_420_000_000);
         let sci = br#"{"jsonrpc":"2.0","result":{"index_price":1.0973142e5}}"#;
-        assert_eq!(parse_index_price(sci).expect("sci parses"), 109_731_420_000_000);
+        assert_eq!(
+            parse_index_price(sci).expect("sci parses"),
+            109_731_420_000_000
+        );
         // JSON-RPC error body: no result.
         let err_body = br#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"bad index"}}"#;
-        assert_eq!(parse_index_price(err_body).unwrap_err(), DeribitDiscoveryErr::Envelope);
+        assert_eq!(
+            parse_index_price(err_body).unwrap_err(),
+            DeribitDiscoveryErr::Envelope
+        );
         // Quoted number = contract change.
         let quoted = br#"{"jsonrpc":"2.0","result":{"index_price":"109731.42"}}"#;
-        assert_eq!(parse_index_price(quoted).unwrap_err(), DeribitDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(quoted).unwrap_err(),
+            DeribitDiscoveryErr::BadRow
+        );
         // Nonpositive.
         let zero = br#"{"jsonrpc":"2.0","result":{"index_price":0}}"#;
-        assert_eq!(parse_index_price(zero).unwrap_err(), DeribitDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(zero).unwrap_err(),
+            DeribitDiscoveryErr::BadRow
+        );
         // Missing field.
         let none = br#"{"jsonrpc":"2.0","result":{"estimated_delivery_price":1.0}}"#;
-        assert_eq!(parse_index_price(none).unwrap_err(), DeribitDiscoveryErr::BadRow);
+        assert_eq!(
+            parse_index_price(none).unwrap_err(),
+            DeribitDiscoveryErr::BadRow
+        );
     }
 
     #[test]
@@ -1040,7 +1116,9 @@ mod tests {
         for r in &sel {
             assert!(r.live && r.expiration_ts_ms == EXP1);
         }
-        assert!(!names(&sel).iter().any(|n| n.contains("110000") || n.contains("OLD")));
+        assert!(!names(&sel)
+            .iter()
+            .any(|n| n.contains("110000") || n.contains("OLD")));
         // Cap law: never more than E×K×2.
         let all = select_capped_chain(d.rows(), 100_000_000_000_000, 4, 32, NOW);
         assert!(all.len() as u32 <= 4 * 32 * 2);
@@ -1055,7 +1133,12 @@ mod tests {
         let sel = select_capped_chain(d.rows(), 1_000_000_000, 1, 4, NOW);
         assert_eq!(
             names(&sel),
-            vec!["BTC-27MAR26-90000-C", "BTC-27MAR26-90000-P", "BTC-27MAR26-95000-C", "BTC-27MAR26-95000-P"]
+            vec![
+                "BTC-27MAR26-90000-C",
+                "BTC-27MAR26-90000-P",
+                "BTC-27MAR26-95000-C",
+                "BTC-27MAR26-95000-P"
+            ]
         );
     }
 
@@ -1082,7 +1165,9 @@ mod tests {
             rows.push(opt_row(&format!("BTC-X-{k}-C"), "call", "1", EXP1, true));
         }
         let mut d = DeribitDiscovery::new();
-        let n = d.ingest_options_body(&page(&rows.join(","))).expect("under options cap");
+        let n = d
+            .ingest_options_body(&page(&rows.join(",")))
+            .expect("under options cap");
         assert_eq!(n, 1200);
     }
 }
@@ -1098,12 +1183,9 @@ mod proptests {
         #[test]
         fn ingest_never_panics(input in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let mut d = DeribitDiscovery::new();
-            match d.ingest_body(&input) {
-                Ok(n) => {
-                    prop_assert_eq!(n, d.universe_total());
-                    prop_assert!(d.universe_live() <= d.universe_total());
-                }
-                Err(_) => {}
+            if let Ok(n) = d.ingest_body(&input) {
+                prop_assert_eq!(n, d.universe_total());
+                prop_assert!(d.universe_live() <= d.universe_total());
             }
         }
 
