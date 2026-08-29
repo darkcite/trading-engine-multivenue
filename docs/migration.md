@@ -30,6 +30,127 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-29 — VenueId 6 = Bybit + tick lane 6 (WS9, the sixth venue)
+
+**What changed**
+
+- `VenueId` gains `Bybit = 6` (append-only; `Ai = 5` keeps its
+  discriminant — the lane↔venue identity is broken past lane 4 and
+  `engine::tick_lane_of` is the mapping: Bybit rides TICK LANE 5).
+- `NUM_TICK_LANES` 5 → 6; `TRADEABLE_VENUES` 5 → 6 with the new
+  `tradeable_venue_byte` predicate (bytes 0..=4 and 6; Ai excluded);
+  `ModelParams` tables widen to 7 slots (slot 5 = Ai, DEAD).
+- New capture label `bybit` (`bybit-ticks/-events/...pmlr`),
+  `bybit:` / `bybit-linear:` descriptor namespaces, `[bybit]`
+  universe section (spot/linear; linear ordinal base 512), Config
+  hosts `BYBIT_WS_HOST`/`BYBIT_REST_HOST`, metrics family
+  `engine_ingress_bybit_*` + coverage gauge, TUI health bit 7.
+- Worker: `VENUE_BYBIT = 6`, map seeding for `[bybit]`, candle lanes
+  `bybit`/`bybit-linear` (kline REST), refdata tickers lane.
+
+**Why**
+
+- stage2-finish-plan WS9 / gaps-doc §1 — the sixth venue.
+
+**Impact**
+
+- On-disk formats: new per-venue capture files under the existing
+  container version; ticks may carry venue byte 6. Pre-WS9
+  `audit-replay` binaries skip the unknown label's files and treat
+  venue byte 6 as corruption — decode with a post-WS9 binary.
+- Config keys: `[bybit] spot/linear` (additive); two new optional
+  env hosts.
+- Wire formats: append-only enum growth on `VenueId`.
+
+**Migration steps**
+
+1. None until a `[bybit]` section is configured; the venue is
+   entirely opt-in.
+
+**Rollback**
+
+- Safe while `[bybit]` stays empty (old binaries reject the section
+  as an unknown-section parse error — remove it before rolling
+  back).
+
+## 2026-08-29 — ChannelId 12 = VolIndex (WS6 Deribit DVOL)
+
+**What changed**
+
+- `ChannelId` gains `VolIndex = 12` (append-only): the Deribit DVOL
+  capture series. Field semantics in `docs/wire-format.md`: `sym` =
+  `SYMBOL_ID_NONE` (venue-global), `v0` = volatility points ×1e9,
+  `v1` = ordinal into the configured `[deribit] options_underlyings`
+  list (DVOL subscriptions derive from that list — `BTC` →
+  `btc_usd`; no new config key).
+- DVOL channels ride the batched subscribe but sit OUTSIDE the
+  subscribe-verification mask (its u128 is fully allocated) — an
+  index the venue does not serve is a missing capture series, never
+  a session verdict.
+
+**Why**
+
+- stage2-finish-plan WS6 / gaps-doc §1 "New data series": DVOL was
+  absent from the repo entirely.
+
+**Impact**
+
+- On-disk formats: event logs may carry `channel = 12` rows. PMLR
+  container version unchanged.
+- Config keys: none (derived from options underlyings).
+- Wire formats: pre-WS6 readers skip id 12 as a corrupt byte —
+  additive, same posture as id 11.
+
+**Migration steps**
+
+1. None — decode with a post-WS6 binary.
+
+**Rollback**
+
+- Binary rollback safe: old readers skip id 12; old writers never
+  emit it.
+
+## 2026-08-29 — ChannelId 11 = SubDrop (WS2 non-fatal subscribe drops)
+
+**What changed**
+
+- `ChannelId` gains `SubDrop = 11` (append-only; nothing renumbered):
+  the §6.6-paired evidence event for WS2's non-fatal subscribe drops
+  on OKX/Deribit reconnect sessions. Field semantics in
+  `docs/wire-format.md` (event-slot `channel` row): `sym` = dropped
+  instrument or `SYMBOL_ID_NONE`, `v0` = venue error code (0 =
+  missing-from-echo), `v1` = venue-local channel discriminant (−1 =
+  unknown/folded).
+- `IngressStatus` gains `sub_drops_total` (slot stays 128 B; mirrored
+  as `engine_ingress_<venue>_sub_drops_total`).
+
+**Why**
+
+- Capture-continuity outage 2026-08-27 §5.2: venue errors / missing
+  echo channels on reconnect killed whole sessions for six days.
+  WS2 makes them per-instrument drops; every drop must stay visible
+  offline (counter ↔ event pairing, the TradeGap/BookGap precedent).
+
+**Impact**
+
+- On-disk formats: event logs written by post-WS2 binaries may carry
+  `channel = 11` rows. PMLR container version unchanged.
+- Config keys: none.
+- Wire formats: pre-WS2 readers (`ChannelId::from_u8`) treat 11 as a
+  corrupt byte and skip the row — old `audit-replay` binaries
+  under-report only the new event class, nothing else.
+
+**Migration steps**
+
+1. None operationally — the id is additive. Decode with a post-WS2
+   binary; the worker's `pmlr.py` channel map picks the id up in its
+   WS11 fold-in.
+
+**Rollback**
+
+- Binary rollback is safe: old readers skip id 11; old writers never
+  emit it.
+
 ## 2026-08-23 — Order slot: `strategy_id` at offset 41 + the `engine-orders.pmlr` intent log (M4.1)
 
 **What changed**

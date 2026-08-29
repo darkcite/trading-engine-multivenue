@@ -47,7 +47,39 @@ iv_digest hourly · `0626cef` #7b post-boot re-commit ·
 `09a7bbb` #7a digest POSITIONS + per-strategy P&L. All UNTESTED until
 WS13. Detail: `docs/capture-remediation-plan-2026-08-28.md` §12.
 
-## WS2 — 🔧 Kill the OKX/Deribit failure class (was "Tier 3" items 1+2)
+## WS2 — 🔧→CODED (2026-08-29 session; untested until WS13) — Kill the OKX/Deribit failure class (was "Tier 3" items 1+2)
+
+**CODED, compile-checkpointed green (`cargo check --all-targets` on the
+6 touched crates), NOT test-run.** What landed:
+- `ChannelId::SubDrop = 11` (core-types; wire-format.md row +
+  migration.md entry) · `IngressStatus.sub_drops_total` +
+  `ERR_SITE_ESTABLISH` (core-metrics; root re-export extended; slot
+  stays 128 B) · `engine_ingress_<venue>_sub_drops_total` mirror (cli).
+- Venue-error policy: fatal ONLY until first-ever subscribe evidence
+  (OKX: first applied SubAck; Deribit: first FULL verification —
+  process-lifetime flags surviving `reset_for_reconnect`); after that,
+  non-fatal per-arg/per-channel drops: counter + 1:1 SubDrop capture
+  event (§6.6 pairing) + rate-limited stderr WARN. OKX resolves the
+  failing instId out of the error msg text (`extract_error_inst_id`);
+  Deribit registers only the echoed subset
+  (`register_confirmed_subs(found)`), emits per-missing-bit drops, and
+  completes the pending id on RPC errors.
+- Establishment budget (shared pattern in
+  `core_net::{ESTABLISH_BUDGET_NS, establishment_expired}`, 30 s
+  default, per-driver override for tests): both run loops return the
+  new `RunResult::EstablishTimeout` when zero subscriptions confirm in
+  budget — NOT gated on `Steady`, kills the §5.3 Connecting wedge AND
+  zero-sub pong-alive sessions. paper.rs needs no change (matches! are
+  non-exhaustive; EstablishTimeout ≠ IdleTimeout ⇒ backoff escalates).
+- Tests written (run at WS13): OKX +6 (boot-fatal kept, post-ack drop,
+  expired-instrument reconnect keeps spot flowing, sym-none drop,
+  establish-timeout fires/disarmed) · Deribit +6 (boot-fatal kept ×2,
+  reconnect missing-channels drop + statics flow, folded option row,
+  discriminator arming, rpc-error nonfatal, establish ×2) ·
+  core-net +2 · core-metrics +2 · core-types roundtrip extended.
+- STILL OPEN in WS2 (deliberately): §5.4 chronic-churn named-cause fix
+  — gated on the first live hour on the T1 binary (▶ WS13 names the
+  code; the non-fatal drop path likely absorbs the class meanwhile).
 
 The 08:00Z settlement still kills both venues today; WS1 only shrinks
 the darkness to ~30 min and names the error. WS2 removes the class:
@@ -69,101 +101,336 @@ the darkness to ~30 min and names the error. WS2 removes the class:
   chain RE-DISCOVERY. The 0830/1605 slots remain the chain-refresh
   mechanism; WS2 makes the sessions survive in between.
 
-## WS3 — 🔧 Small venue-data fixes (gaps §1, parsed-but-dropped class)
+## WS3 — 🔧→CODED (2026-08-29 session; untested until WS13) — Small venue-data fixes (gaps §1, parsed-but-dropped class)
 
-- Deribit: emit `current_funding_1e9` into the capture event (parser
-  already fills it; lib.rs:531).
-- Deribit: use `settlement_period` to gate perp-vs-dated channel
-  treatment (discovery.rs:489 parses it today, unused).
-- Hyperliquid: parse the `premium` wire field into the asset-ctx
-  event.
+- ✅ Deribit funding emit: perp tickers now emit a paired
+  `ChannelId::Funding` event (v0 = `current_funding` ×1e9, v1 = 0 —
+  continuous funding) beside the Ticker event.
+- ✅ settlement_period gating, two halves: (wire) `parse_ticker` makes
+  `current_funding` OPTIONAL with a `has_funding` frame flag — fixes
+  the latent bug where every DATED-future ticker was rejected
+  wholesale — and the Funding emit gates on it; (boot) `run_deribit`
+  discovery audit now counts + names configured dated futures
+  (`dated=` on the coverage line; `row.perpetual` finally used).
+- ✅ HL `premium`: parsed (optional, signed, ×1e9) into
+  `HlAssetCtxFrame.premium_1e9`; rides the AssetCtx event's
+  `venue_seq` slot bit-cast i64→u64 (slot was constant 0; M4
+  hash128-packing precedent; wire-format.md documents it).
+- Tests: deribit lib +1 / run_loop +1 (+2 updated counts for the
+  double emit) · hl lib +1 extended +1 new / run_loop +1.
+  `cargo check --all-targets` green on the 4 touched crates.
 
-## WS4 — 🔧 Reference-data REST, existing five venues (gaps §1/§5)
+## WS4 — 🔧→CODED (2026-08-29 session; untested until WS13) — Reference-data REST, existing five venues (gaps §1/§5)
 
-- 24h quote volume: BN spot `/api/v3/ticker/24hr`, BN USDM
-  `/fapi/v1/ticker/24hr`, OKX `tickers`, Deribit, HL.
-- Open interest REST: BN `/fapi/v1/openInterest`, OKX. (Deribit/HL
-  already carry OI on WS.)
-- Tick/lot/contract size: BN (`BnSymbolRow` grows fields), HL meta.
-- Placement law: static metadata → boot discovery (8e pattern, audit
-  row); periodic series (24h vol, OI) → WORKER fetch lane (serialized,
-  budgeted, stored beside candles keyed venue+descriptor) — the
-  engine's hot path never does REST.
+**Placement law implemented as written:** static metadata → boot
+discovery; periodic series → the NEW worker lane.
 
-## WS5 — 🔧 Binance expansion (gaps §2.1)
+- ✅ Worker lane `claude_worker.refdata` (a MODULE, never a verb —
+  candles/iv_digest precedent): hourly-bucketed snapshots in a new
+  `refdata` table BESIDE candles in candles.db, PK (venue, descriptor,
+  kind, hour_ts), kinds `vol24h_quote`/`oi`, RAW venue units,
+  per-venue RestBudget, universe lanes REUSED from candles, injectable
+  Http (no live calls in tests). Implements: BN spot vol24h · BN USDM
+  vol24h + OI (`/fapi/v1/openInterest`) · Deribit
+  `get_book_summary_by_instrument` (ONE call → vol_usd + OI). OKX and
+  HL lanes report "deferred to WS7/WS8" loudly. +12 pytest
+  (`test_refdata.py`); py_compile clean.
+- ✅ BN static tick/lot: `BnSymbolRow` grows `tick_size_1e9` /
+  `lot_step_1e9` (0 = absent — old fixtures parse), parsed from
+  `filters[]` PRICE_FILTER.tickSize / LOT_SIZE.stepSize (order-
+  independent, structural skip for foreign filters, strict quoted-
+  decimal → ×1e9 with sub-1e-9 rejection). +3 discovery tests.
+  NOTE for WS13: the `binance_exchange_info` fuzz target covers a
+  MODIFIED parser — re-run it ≥300 s with the new-target batch.
+- HL tick/lot + vol → WS8; OKX vol/OI → WS7 (venue workstreams).
 
-- USDM `<sym>@markPrice` channel: mark, index, funding, next-funding
-  → capture events (+ the WS10 carrier when it lands).
-- Dated futures: parse `contractType`/`deliveryDate` in discovery,
-  name the class in the universe grammar, dated-future BBO lane.
-- Parser/proptest/fuzz updates per new frame shapes.
+## WS5 — 🔧→CODED (2026-08-29 session; untested until WS13) — Binance expansion (gaps §2.1)
 
-## WS6 — 🔧 Deribit expansion (gaps §2.3)
+- ✅ `@markPrice` lane: `BnMarkPriceFrame` + `parse_mark_price` (new
+  fns — the frozen bookTicker parser bytes untouched; required
+  `"e":"markPriceUpdate"` tag; `"r":""` on dated contracts ⇒
+  `has_funding=0`, the WS3 convention) · `StreamLane::MarkPrice` +
+  `Driver::new_mark_price` · capture events: Mark (v0 = mark ×1e6,
+  v1 = INDEX ×1e6 — BN-only, documented in wire-format.md) + Funding
+  (v0 = rate ×1e9, v1 = next-funding ms) gated on wire truth ·
+  DEFAULT-ON: every usdm + dated instrument gets one extra
+  `@markPrice` conn in the multi lane (conn counts grow at the next
+  boot — expected in WS13's smoke).
+- ✅ Dated futures named as a class: `[binance] usdm_dated`
+  (`<base>_<yymmdd>`, underscore REQUIRED — provably disjoint from
+  `usdm` by alphabet), ordinals from `BN_DATED_ORDINAL_BASE = 2048`,
+  descriptor stays `binance-usdm:<sym>` (one fapi lane offline);
+  discovery parses `contractType`/`deliveryDate` into `BnSymbolRow`
+  (`BnContractType` enum, unknown ⇒ Other, never fatal) and the boot
+  audit REFUSES a non-dated symbol in `usdm_dated` (`not_dated`) ·
+  bin wires dated bookTicker + markPrice conns; ai-universe snapshot
+  includes the dated block; legacy flag boots byte-identical.
+- ✅ Worker: `usdm_dated` seeds map names (base-2048 law in
+  fetchers.py) and joins the binance-usdm candles lane (klines serve
+  delivery symbols) — refdata inherits automatically.
+- Tests: bn lib +4 (markPrice parse) + 2 proptests (roundtrip +
+  never-panics) · run_loop +3 (event pinning, dated, foreign-reject) ·
+  discovery +3+2 (filters, contract class) · core-config +1 big
+  (parse/allocate/validators) · NEW fuzz target `binance_mark_price`
+  (registered in fuzz/Cargo.toml — WS13 runs it ≥300 s with the
+  bybit batch; `binance_exchange_info` re-run per the WS4 note).
+  `cargo check --all-targets` green ×3 crates; py_compile clean.
 
-- Spot lane (`kind=spot` discovery page + subscribe).
-- DVOL volatility index (WS channel + descriptor + capture series).
-- Option COMBO INSTRUMENTS: discovery + BBO capture only (combo
-  ORDERS stay Stage-3).
+## WS6 — 🔧→CODED (2026-08-29 session; untested until WS13) — Deribit expansion (gaps §2.3)
 
-## WS7 — 🔧 OKX expansion (gaps §2.4)
+**Design pivot recorded here:** all three items route through ONE new
+policy fn `row_wants_channel` (lib) that now drives subscribe-building
+AND the WS2 verification-mask/registration/drop sites — the two can
+never drift again. Row classes: static future (q/t/tr[+b]) · static
+SPOT (no ticker — name-shape law: no `-` ⇒ spot, `BTC_USDC`) ·
+option (q+t) · combo (quote-only).
 
-- `tickers` channel (24h vol) or its REST twin, wired into the same
-  reference-data placement law as WS4; OI fetch.
+- ✅ Spot lane: `is_spot_row` (derived, no config change — spot names
+  go straight into `[deribit] instruments`); ticker never subscribed
+  (spot has no funding/OI/mark analytics; also avoids the
+  parse-reject noise); discovery gains `kind=spot` pages
+  (`ingest_spot_body`; `settlement_period`/`contract_size` optional
+  for spot rows, defaults false/1.0), fetched ONLY when a configured
+  name is spot-shaped; the WS3 dated log excludes spot. ⚠ pitfall-11:
+  the spot page row shape (`state` field presence) is NOT live-proven
+  — WS13's smoke should include one spot instrument.
+- ✅ DVOL: derives from `[deribit] options_underlyings` (BTC →
+  `btc_usd`; no new key) · `ChannelId::VolIndex = 12` (wire-format
+  row + own migration entry; v0 = points ×1e9, v1 = underlying
+  ordinal, sym = SYMBOL_ID_NONE) · `parse_vol_index` +
+  `DeribitMsgKind::VolIndexPush` + capture emit · Driver
+  `new_with_dvol` (additive; `new` delegates) · DVOL channels are
+  OUTSIDE the verification mask (u128 fully allocated) — absent echo
+  = missing series, never a verdict · NEW fuzz target
+  `deribit_vol_index` + 2 proptests.
+- ✅ Combos: `[deribit] combos` list (explicit names; cap 64;
+  cross-list dup check vs instruments) → allocation base
+  `DERIBIT_COMBO_ORDINAL_BASE = 1024` → table tail via
+  `insert_combo` (options+combos SHARE the 64-row/64-bit tail block —
+  partition law static→options→combos, new `OptionAfterCombos` err) ·
+  quote-only BBO → Tick capture · NO boot REST validation BY DESIGN:
+  the subscribe echo is the validator (misspelled combo ⇒ first-ever
+  verification fails ⇒ boot fail-fast) · `--deribit-symbols`
+  override drops combos (section-replacement law, warned).
+- Tests: deribit lib +4 big (policy end-to-end, partition/capacity,
+  DVOL parse/classify, subscribe rendering) + run_loop +3 (DVOL
+  event, spot verification/registration/flow, combo
+  verification/flow) + core-config +cross-dup + core-types roundtrip.
+  `cargo check --all-targets` green ×4 crates.
 
-## WS8 — 🔧 Hyperliquid expansion (gaps §2.5)
+## WS7 — 🔧→CODED (2026-08-29 session; untested until WS13) — OKX expansion (gaps §2.4)
 
-- Tick/lot metadata via meta REST; 24h volume. (`activeSpotAssetCtx`
-  stays deliberately unsubscribed unless the operator flips it.)
+- ✅ REST twin chosen (the WS4 placement law: periodic series → the
+  worker lane, never the engine): refdata okx lane —
+  `market/ticker` → `volCcy24h` → vol24h_quote per instId; OI
+  (`public/open-interest` → `oi`, contract units) fetched for
+  DERIVATIVE instIds only (≥3 hyphen segments; the venue errors OI on
+  spot). +2 parser tests +1 cycle test.
 
-## WS9 — 🔧 Bybit, the sixth venue (gaps §1 — the biggest single item)
+## WS8 — 🔧→CODED (2026-08-29 session; untested until WS13) — Hyperliquid expansion (gaps §2.5)
 
-- `VenueId::Bybit = 6` + `from_u8`; `crates/ingress-bybit` v5 public
-  WS (`tickers`, `publicTrade`, `orderbook` behind `--bybit-depth`);
-  REST discovery (`instruments-info`, `tickers`); handwritten byte
-  scanners + property tests + `bybit_ws_frame` / `bybit_instruments`
-  fuzz targets; `bybit-ticks/-events.pmlr` + `bybit:` manifest
-  prefix; `[bybit]` universe grammar; worker candle lane #6.
-- Constants ripple (gaps §1 last block): `VENUE_LABELS` ×2 mirrors,
-  `TRADEABLE_VENUES=6`, `MODEL_VENUE_LABELS`/`ModelParams` arrays +
-  their hand-rendered JSON/stderr lines, audit-replay coverage
-  matrix, `docs/wire-format.md` + `docs/migration.md`.
-- No new external deps expected (same hyper/rustls/mio stack) — if
-  one appears anyway: `make license-deps` + commit the regenerated
-  notices with it.
+- ✅ 24h volume: refdata hl lane — ONE `metaAndAssetCtxs` body per
+  cycle covers the whole perp universe (`dayNtlVlm` → vol24h_quote,
+  USD notional); `@spot`/`#outcome` coins skipped (no ctx on this
+  endpoint — the `coin_wants_asset_ctx` law). `activeSpotAssetCtx`
+  stays deliberately unsubscribed. +1 parser +1 cycle test.
+- ✅ Tick/lot: discovery already captured `szDecimals` (the gaps doc
+  aged); the missing derivation now exists —
+  `HlAssetInfo::max_price_decimals()` (perp price-tick rule:
+  ≤ 6−szDecimals decimals, ≤5 sig figs; lot step = 10^-szDecimals)
+  + the hl audit row logs `sz_decimals`/`max_price_decimals`.
+  +1 discovery test.
 
-## WS10 — 🔧 Engine plumbing (gaps §1) — DESIGN DOC FIRST, then code
+## WS9 — 🔧→CODED (2026-08-29 session; untested until WS13) — Bybit, the sixth venue (gaps §1)
 
-The two Strategy-surface changes; both get a short design doc for
-operator review BEFORE code (they touch `strategy-core`, rings, and
-the wire format — the highest-blast-radius items in the whole list):
+**Design deltas from the sketch, recorded:** BBO comes from
+`orderbook.1.<SYM>` on BOTH classes (spot `tickers` has no bid/ask;
+uniform parser; per-symbol snapshot/delta BBO state, one-sided books
+never emit) — there is no `--bybit-depth` flag (depth-1 IS the BBO
+lane; deeper books are a later want). `tickers.<SYM>` rides LINEAR
+conns only (mark v0 + index v1 = the WS5 shape · funding v0 + next
+ms v1 · OI in a Bybit-mapped `Ticker` event v0=0 v1=OI — wire-format
+notes). Trades carry venue_seq 0 (UUID ids — NO §6.2 chain law on
+this venue, documented). Subscribe acks are ALL-OR-NOTHING on this
+venue ⇒ WS2 semantics at request granularity (boot refusal fatal;
+post-first-success refusal = drop + establishment-budget reap).
+Spot+linear = 2 conns, ONE thread, one producer (`run_multi`, the BN
+M1 shape, WS2 establishment budget built in).
 
-- Funding carrier ingress → `Strategy` (today funding is capture-only
-  events; no engine ring type carries it).
-- L2 depth to `Strategy` (today book channels are header-only
-  capture; book-builder is top-of-book).
-- Zero-alloc laws apply in full: preallocated lanes, `#[repr(C)]`
-  Copy types, no new hot-path branches beyond the lane drain.
+- ✅ `VenueId::Bybit = 6` (Ai keeps 5 ⇒ lane↔venue identity broken:
+  NEW `engine::tick_lane_of`, Bybit = TICK LANE 5, `NUM_TICK_LANES`
+  = 6, alloc-gate pin updated 5→6) · `crates/ingress-bybit` (lib +
+  run_loop + discovery; ~2.2k lines; 8 lib tests + 4 proptests + 9
+  run-loop tests + 4 discovery tests + 1 discovery proptest) · fuzz
+  `bybit_ws_frame` + `bybit_instruments` registered.
+- ✅ Discovery: paged `instruments-info` (nextPageCursor walk),
+  liveness + tick/lot (`priceFilter.tickSize`,
+  `lotSizeFilter.qtyStep`/`basePrecision`) — the WS4 parity line;
+  boot audit `run_bybit` per configured category.
+- ✅ Constants ripple: VENUE_LABELS ×2 → 7 (+`bybit`),
+  `TRADEABLE_VENUES` = 6 with the NEW `tradeable_venue_byte`
+  predicate (Ai = 5 sits INSIDE the byte range — a plain bound would
+  have made the command feed "tradeable"), `ModelParams` [7] with a
+  DEAD Ai slot 5 (bybit latency default 100 ms), Rings/Consumers/
+  bench/wiring-test lane arrays ×6, IngressStatusSet + full metrics
+  family (`engine_ingress_bybit_*`, capture + coverage gauges,
+  last-tick-age [7], TUI health bit 7, raw-tap label `bybit`),
+  `[bybit] spot/linear` grammar (UPPERCASE [A-Z0-9]; linear base
+  512), Config hosts BYBIT_WS_HOST/BYBIT_REST_HOST, bin spawn on
+  core 8, wire-format + migration entries.
+- ✅ Worker: `VENUE_BYBIT=6` · map seeding (`bybit:`/`bybit-linear:`,
+  base-512 law) · candle lanes 6+7 (`parse_bybit_kline` —
+  newest-first wire normalized; 1d floor 2018, untested vs start=0 —
+  pitfall-11 note for WS13) · refdata tickers lane (one call: vol +
+  linear OI). +2 candle tests +1 refdata test; py_compile clean.
+- No new external deps (same stack) — license-deps not needed;
+  license-check green (new files carry SPDX; the tracked-file count
+  grows at `git add`).
+- WS13 NOTE: fuzz the two bybit targets ≥300 s; live smoke must
+  include ≥1 spot + ≥1 linear symbol; the all-or-nothing-ack
+  assumption (subscribe) and orderbook.1 zero-size-clear semantics
+  are wire-UNPROVEN (pitfall 11) — the smoke names them.
 
-## WS11 — 🔧 Worker offline lanes + leftovers
+## WS10 — 🎛 DESIGN WRITTEN (2026-08-29), AWAITING OPERATOR REVIEW — Engine plumbing (gaps §1)
 
-- Funding-history backfill (per-venue REST, new table beside candles,
-  §9 keying; "funding" currently has zero occurrences in the worker).
-- D5 fold-ins: `SLOT_KIND_OPT_SUMMARY=6` decode + `_run_anchor_ns`
-  mirror into `pmlr.py` (iv_digest's local reader retires).
-- 🎛 D4 ruling: recommendation (i) — candles.db's 12 descriptors
-  already = the full non-options universe; options ride iv_digest ⇒
-  closes with ZERO code. Reading (ii) = REST OHLCV for ~192 option
-  instruments (new budgeted lane). Default (i) unless overruled.
-- M5 semi-manual runbook snippet wiring #7a helpers with the map's
-  HIP-4 pairs (the daemon passes none by design).
+**`docs/ws10-engine-plumbing-design.md` is the deliverable of this
+session's WS10 pass — per this workstream's own law, NO code lands
+until the operator approves it.** Summary: (A) funding carrier =
+per-venue `ChannelEvent` lanes (the §6.5 POD reused; ring 1024×64 B
+×6; ingress pushes at the four existing funding capture sites;
+`Strategy::on_venue_event` defaulted no-op; `event_lane_mask` gates
+the lane to Funding-only in v1) — land first, ~1 day. (B) L2 depth =
+in-ingress bounded ladder (64 levels/side, in-place deltas) emitting
+change-gated `DepthTopK` PODs (192 B, top-5/side, slot_kind 7 +
+`<venue>-depth.pmlr` capture; `Strategy::on_depth`) — own slice,
+1.5–2 days. Five operator decisions (D-A1..D-B3) listed in the doc.
+WS11/WS12 do not depend on WS10 and proceeded.
 
-## WS12 — 🔧 Mechanical hygiene, LAST before the run
+## WS11 — 🔧→CODED (2026-08-29 session; untested until WS13) — Worker offline lanes + leftovers
+
+- ✅ Funding history: NEW `claude_worker.funding` module (a MODULE,
+  never a verb) — `funding` table beside candles, PK (venue,
+  descriptor, ts_ms), INSERT-OR-IGNORE idempotence (history is
+  immutable); lanes select ONLY funding-bearing instruments by the
+  engine's class laws (usdm minus dated · OKX `*-SWAP` · Deribit
+  PERPETUAL names · HL perp coins · bybit linear); 5 wire parsers;
+  depth = one NEWEST page per instrument per cycle (BN ≈333 d ·
+  OKX ≈33 d · Deribit 30 d range · HL 33 d · Bybit ≈66 d — deeper
+  pagination is a recorded extension, not v1). +5 pytest
+  (`test_funding.py`).
+- ✅ D5 fold-ins LANDED: `pmlr.py` now owns
+  `SLOT_KIND_OPT_SUMMARY = 6`, `OptSummaryRec`/`OptSummaryReader`
+  and `run_anchor_ns`; iv_digest's local reader + BOTH
+  `_run_anchor_ns` copies (candles too) retired to aliases — zero
+  test churn by construction.
+- ✅ D4 ruling recorded as (i) — ZERO code (documented in
+  `docs/m5-runbook-notes.md` §3; reading (ii) stays un-built unless
+  overruled).
+- ✅ M5 runbook snippet: `docs/m5-runbook-notes.md` — #7a
+  `gather_positions_payload` with the map's `hip4_pairs` (serialized
+  invocation, `.env` seam), plus the five offline-module lanes and
+  the candles.db table inventory. The pinned ai-session prompt is
+  untouched.
+
+## WS12 — 🔧→CODED (2026-08-29 session; untested until WS13) Mechanical hygiene, LAST before the run
 
 `cargo fmt` (~88 files) + `clippy -D warnings` (~40 lints) ⇒
 `make lint` green. Sequenced last so the churn never collides with
 WS2–WS11 diffs. Own commits, no logic changes.
 
+**Landed 2026-08-29 (same session as WS2–WS11; uncommitted):**
+
+- `cargo fmt` across the workspace — 106 files reformatted, whitespace
+  only; `git diff --summary` shows ZERO mode changes (the 2026-08-27
+  exec-bit pitfall audited explicitly).
+- clippy `-D warnings`, three `--keep-going` waves (~67 sites):
+  - **Doctrine-conflicting lints got targeted `#[allow]` + comment,
+    NEVER the suggested rewrite** (existing `too_many_arguments`
+    precedent): `needless_range_loop` on the binance/bybit `run_multi`
+    hot poll loops (`i` is the mio Token identity), on
+    `ingress-polymarket` `queue_market_subscribe` + the
+    `write_market_subscribe_multi` serializer (raw-index doctrine;
+    PM parser internals left byte-untouched);
+    `large_enum_variant` on binance `StreamLane` (Eapi payload
+    deliberately inline — `Box` forbidden, one slot per conn,
+    preallocated at boot).
+  - **Mechanical equivalents everywhere else** (identical codegen, no
+    logic change): `len() == 0`→`is_empty()` in every venue `flush_tx`
+    + the 3 rx-stall guards + audit-replay; proptest
+    `match {Ok…, Err(_)=>{}}`→`if let Ok` in all 5 discovery crates;
+    `?`-operator for the two `memmem::find` guards (hl
+    `parse_sub_response`, bn `parse_mark_price` — the latter is
+    WS5-new code, not a frozen parser); `Some(span) if
+    span.is_empty()`→`None | Some([])` (eapi); `.iter().copied()
+    .collect()`→`.to_vec()`; `.get(&k).is_none()`→`!contains_key`
+    (fill tests); `.iter().any(|r| *r == x)`→`.contains(&x)`
+    (audit-replay); inline format args ×6; `push_str("…")`→
+    `push('…')`; needless `&PathBuf`→`&Path` ×3 (test helpers);
+    elidable lifetime (audit-replay `stat_for`); `u64 as u64` cast
+    dropped; `explicit_counter_loop` ×2 in cli boot parsers rewritten
+    with `enumerate()` (okx legacy table: ordinal now derived
+    `(n_seen+1)` — lockstep proven, missing rows still burn ordinals;
+    raw-tap label parser); `assert!(const)` ×2 in strategy-set
+    promoted to `const _: () = assert!(…)` compile-time pins;
+    `doc_lazy_continuation` ×5 (doc lines starting with `+ ` parse as
+    markdown list bullets — reworded: okx discovery, paper.rs
+    CaptureGaugeIds, bench ×2, audit-replay) + one blockquote-lazy
+    (`>6 fractional digits` reworded, ingress-ai).
+- Final state, all run on the Mac: **`cargo fmt --check` clean ·
+  `make lint` GREEN (clippy `-D warnings`, all targets, zero errors) ·
+  `make license-check` OK (198 files) · zero mode changes.**
+- NOT touched: `backtest.py`/`cli.py` (frozen), any `.py` (fmt/clippy
+  are Rust-only), wire formats, test semantics.
+
+**WS12 exit state: WS2–WS12 ALL CODED ⇒ the coding phase of this plan
+is COMPLETE. Remaining: operator commit authorization (explicit paths,
+`M-` prefixes, license-check before each), the WS10 design review
+(`docs/ws10-engine-plumbing-design.md` — code only after approval),
+then WS13.**
+
 ## WS13 — ▶ THE ONE LONG RUN (everything validated at once)
+
+**GATES PHASE RUN 2026-08-29 (operator-ordered "test everything"; live
+phase still pending).** Results + the regression findings it existed to
+catch:
+
+- **Found + fixed — the WS9 seventh-venue test-world desyncs** (latent
+  because the no-tests-until-WS13 ruling deferred all suites; every fix
+  below is test-or-bug-scoped, no design change):
+  1. `paper.rs` raw-tap capacity test fed 6-era labels + 1 — now all
+     seven + an eighth (`bybit` in the list; stale "six venues"
+     docstring corrected).
+  2. `core-types` VenueId: round-trip list gained `Bybit`;
+     rejects-test boundary 6 → 7 (6 IS Bybit now).
+  3. **REAL BUG:** `backtest.rs` `RunSummary.venue_records` was still
+     `[u64; 6]` while `VENUE_LABELS` grew to 7 ⇒ every render_summary
+     (incl. the REAL BINARY on any capture dir) panicked OOB. Fixed +
+     future-proofed: `[u64; VENUE_LABELS.len()]`.
+  4. Same class in `capture_catalog.rs` (M3-owned; bugfix-scoped
+     touch): 5 sites `[…; 6]` → `VENUE_LABELS.len()`-tied.
+  5. `ingress-binance` discovery `parse_filters`: end-of-buffer at the
+     key's `:` returned `BadRow` — against the parser's own
+     convention; now `Truncated` (code fix, the WS5 test was right).
+  6. `iv_digest._OPT` alias restored beside OptRec/OptReader (D5
+     fold-in had dropped the struct alias the fixture-packing tests
+     use).
+- **Gate results:** nextest **1316/1316** (+1 known skip; baseline
+  1240 → +76 new tests) · alloc **38/38 0 B/op** (fresh `Compiling
+  bench` ×2 confirmed; release binary relinked WITH all WS2–WS12 +
+  the fixes above) · pytest **477/477** (baseline 439 → +38; frozen
+  202 untouched inside) · fuzz **5/5 CLEAN, 301 s each, ZERO crash
+  artifacts**: binance_mark_price 271.2M execs cov 97 ·
+  deribit_vol_index 80.1M cov 139 · bybit_ws_frame 17.4M cov 207 ·
+  bybit_instruments 18.7M cov 121 · binance_exchange_info re-run
+  14.8M cov 380 (re-fuzzed BECAUSE finding 5 touched its parser).
+  **New stay-greens: 1316 / 38 / 477.**
+- Post-fix hygiene re-verified at the end of the session: `cargo fmt
+  --check` + `make lint` + `make license-check`.
+- **Live phase (steps 3+ below) NOT run:** it stops the standing
+  capture engine mid-C6-window — operator's call, per this plan.
+  NOTE: the standing lane picks up the freshly-relinked release binary
+  at its next 00:00Z restart regardless (established M4-close
+  pattern).
 
 1. Full build (`cargo build --release --workspace`; G0 relink).
 2. Gates: `cargo nextest run --workspace` (baseline grows well past

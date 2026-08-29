@@ -139,12 +139,12 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete time             |
 |      8 |     4 | sym           | `u32` SymbolId | `SYMBOL_ID_NONE` for venue-global channels |
 |     12 |     1 | venue         | `u8` VenueId   |                                         |
-|     13 |     1 | channel       | `u8` ChannelId | 0=Trade 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) |
+|     13 |     1 | channel       | `u8` ChannelId | 0=Trade 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) 11=SubDrop (appended 2026-08-29, WS2 — non-fatal subscribe drop on a reconnect session: `sym`=dropped instrument (`SYMBOL_ID_NONE` when the venue error names none), `venue_seq`=0, `venue_time_ms`=0, `v0`=venue numeric error code (0 = missing-from-echo), `v1`=venue-local channel discriminant (−1 = unknown / folded Deribit option row; Deribit static rows carry the CHANNEL\_ORDER index 0=quote 1=ticker 2=trades 3=book). Emitted 1:1 with every `sub_drops_total` increment — same §6.6 pairing contract as the gap events) 12=VolIndex (appended 2026-08-29, WS6 — Deribit DVOL `deribit_volatility_index.{index}`: venue-GLOBAL series, `sym`=`SYMBOL_ID_NONE`, `venue_time_ms`=venue ts, `v0`=volatility POINTS ×1e9 (59.18 → 59\_180\_000\_000), `v1`=0-based ordinal of the index in the boot-configured `[deribit] options_underlyings` list — the boot log + universe file are the ordinal's resolution) |
 |     14 |     2 | _pad0         | `[u8; 2]`      | explicit, zeroed                        |
-|     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none      |
+|     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none. WS3 (2026-08-29) exception: HL AssetCtx rows (channel 5) carry `premium` ×1e9 BIT-CAST `i64`→`u64` here (the ctx has no venue seq; pre-WS3 rows are a constant 0 — the M4 hash128-in-px/qty packing precedent) |
 |     24 |     8 | venue_time_ms | `u64`          | venue timestamp ms; 0 where absent      |
-|     32 |     8 | v0            | `i64`          | channel-dependent (px ×1e6, counts, …)  |
-|     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …) |
+|     32 |     8 | v0            | `i64`          | channel-dependent (px ×1e6, counts, …). Funding rows (channel 3): rate ×1e9 on OKX **and** (WS3) Deribit — the Deribit perp ticker's `current_funding` now emits a paired Funding row (`v1` = 0: continuous funding, no next-funding time; OKX keeps `v1` = next-funding ms) |
+|     40 |     8 | v1            | `i64`          | channel-dependent (qty ×1e6, rate ×1e9, …). Mark rows (channel 2): WS5 — Binance `@markPrice` rows carry the INDEX price ×1e6 here (OKX Mark rows keep 0); Funding rows: next-funding ms on OKX **and** Binance, 0 on Deribit |
 |     48 |    16 | _pad1         | `[u8; 16]`     | explicit, zeroed                        |
 
 ### `OptSummary` — 64 bytes (M2.3; PMLR `slot_kind = 6` only, never rings)
@@ -230,7 +230,13 @@ header-only on venues that emit none),
 `<venue>-opt-summary.pmlr` (kind 6, M2.3; header-only on venues
 without an options lane — the uniform-file-set law), and optionally
 `<venue>-raw.tap`. Staged writes flush at least every 1 s
-(`CAPTURE_FLUSH_INTERVAL_NS`).
+(`CAPTURE_FLUSH_INTERVAL_NS`). Venue labels: `pm`, `bn`, `okx`,
+`rpc`, `deribit`, `hl`, and — WS9, appended 2026-08-29 — `bybit`
+(VenueId 6; spot + linear share one label the way `bn` covers
+spot + usdm; Bybit trades carry `venue_seq` 0 — UUID trade ids, no
+venue sequence, so the §6.2 chain law does not apply to this venue).
+Bybit `Ticker` event rows carry `v0` = 0, `v1` = open interest ×1e6
+(venue base/contract units) — unlike Deribit's mark+OI pairing.
 
 Engine-side single-file sinks (`core_io::SlotCapture`) in the same
 run dir: `engine-fills.pmlr` (kind 2, Phase 8f — every fill
