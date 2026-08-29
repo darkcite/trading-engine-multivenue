@@ -644,9 +644,7 @@ fn handle_data_frame<C: Capture>(
                                 // WS10-A: onto the venue-event lane
                                 // (capture stays first — §6.5
                                 // capture-before-push law).
-                                if event_mask
-                                    & core_types::event_lane_bit(ChannelId::Funding)
-                                    != 0
+                                if event_mask & core_types::event_lane_bit(ChannelId::Funding) != 0
                                     && event_tx.try_push(ev).is_err()
                                 {
                                     status.inc_event_ring_drops();
