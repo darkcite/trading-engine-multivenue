@@ -120,7 +120,7 @@ MUST be zero / `SYMBOL_ID_NONE` / `0xFF`") are pinned in
 |     16 |     8 | px          | `i64`          | ×1e6: fair value / intent px / param value / ruleset hash\[0..8\] LE |
 |     24 |     8 | qty         | `i64`          | ×1e6: intent qty / ruleset hash\[8..16\] LE |
 |     32 |     8 | ttl_ns      | `u64`          | expiry relative to `ts_ns`; 0 = none    |
-|     40 |     1 | kind        | `u8` AiCmdKind | 0=Heartbeat 1=EnableStrategy 2=DisableStrategy 3=SetFairValue 4=SetBias 5=SetParam 6=OrderIntent 7=RulesetStage 8=RulesetCommit 9=HaltRequest — **no Resume exists** (halt is sticky) |
+|     40 |     1 | kind        | `u8` AiCmdKind | 0=Heartbeat 1=EnableStrategy 2=DisableStrategy 3=SetFairValue 4=SetBias 5=SetParam 6=OrderIntent 7=RulesetStage 8=RulesetCommit 9=HaltRequest — **no Resume exists** (halt is sticky) — 10=FundingSeed 11=PositionSeed (appended 2026-08-29, VM2 V1 per D-1/D-2: FundingSeed = one historical funding PRINT — `sym`=instrument, `px`=raw per-print rate ×1e9 signed (NOT ×1e6 — the hash128-in-px precedent for kind-specific field meaning), `qty`=venue print time ms > 0, `strategy_id`=5 (vm), everything else zero/`0xFF`; the engine folds it into the SAME per-sym funding windows the live Funding-event path feeds, so the `funding_print_divisor` cadence law applies in one place. Seeds carry raw prints, not window aggregates — strictly more general than the plan's "window slot" sketch, refinement noted in vm2-plan §8. PositionSeed = restore one v2 row's position after restart — `param_id`=row index < 256, `sym`=the row's action sym (consume-time cross-check against the committed row; mismatch refuses), `side`=entered side (0/1 required), `px`=entry px ×1e6 > 0, `qty`=position AGE in SECONDS ≥ 0 (engine derives entry = now − age·1e9; no wall-clock crossing), `ttl_ns`=0 ENFORCED — the engine drain expires ANY kind with `ttl_ns ≠ 0`, so age can never ride there; entry QTY is not carried — the vm re-derives it from the committed row's sizing law at the seeded px, so restores respect the CURRENT caps. `strategy_id`=5. The worker's post-boot waiter sends PositionSeeds only after verifying the #7b re-commit landed the expected hash — the seed itself carries no table identity by design) |
 |     41 |     1 | venue       | `u8` VenueId   | `Ai=5` for engine-directed cmds; target venue for intents |
 |     42 |     1 | strategy_id | `u8`           | strategy-set slot; `0xFF` = none; intents pin 4 (ai-exec), ruleset cmds pin 5 (vm) |
 |     43 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1) or `0xFF`         |
@@ -247,6 +247,87 @@ defined and none is captured.
 |  16388 |     4 | epoch   | `u32`             | side-path monotonic stage counter      |
 |  16392 |    16 | hash128 | `[u8; 16]`        | identity — first 16 B of the artifact's full SHA-256 (d5 filename convention) |
 |  16408 |    40 | _pad    | `[u8; 40]`        | explicit, zeroed                       |
+
+### `RuleRowV2` — 128 bytes (VM2 V1, table version 2; in-process only)
+
+One validated rule of the VM2 general grammar (vm2-plan §1/§3,
+D-1…D-8 ruled + LOCKED 2026-08-29). Same contract as the v1 row:
+**built** by the v2 validator from the JSON artifact, never parsed
+from wire bytes, never captured; identity is the table's `hash128`.
+Two cache lines. v1 sugar maps FULLY onto this shape at build time
+with byte-exact v1 semantics (`level_breach` bid → `LhsOnly(Ask) ≤
+level`, ask → `LhsOnly(Bid) ≥ level`; `cross_deviation` →
+`|DiffBps(Mid, Mid)| ≥ edge` with the mean-reverting direction law
+and `side` as filter; both horizon-refire mode) — the evaluator has
+ONE path, no v1 branch.
+
+**Signal domain law**: every feature/combine output is an `i64` in
+×1e9 of its natural unit — prices px ×1e9, APR/IV/imbalance fractions
+×1e9, bps ×1e9, notional USD ×1e9, clock seconds ×1e9. Thresholds
+live in the same domain. `FeatId`: 0=Mid 1=Bid 2=Ask 3=RollMean
+4=RollEma 5=RollMin 6=RollMax 7=RollStd 8=Apr24 9=Apr72 10=MarkPx
+11=MarkIv 12=DepthImb 13=DepthSpreadBps 14=DepthNearNotional
+15=ClockToFunding 16=ClockUtcSod; `0xFF` = none (feat_c). `CombineOp`:
+0=Diff 1=DiffBps 2=Ratio1e9 3=LhsOnly (the CONST-operand form —
+`ref_sym` = `SYMBOL_ID_NONE`). `cmp_bits`: bit0 entry ≤ (clear = ≥),
+bit1 entry abs, bit2 confirm ≤, bit3 confirm abs, bit4 confirm-pair
+(confirm = the row's combine over `feat_c` across both legs; clear =
+`feat_c(sym)` alone). `flags`: bit0 = position mode (Flat→Entered
+state machine, two-leg emit when `ref_sym` real, universal exit law
+`signal × entry_sign ≤ exit_1e9`, min/max-hold honored); clear = v1
+horizon-refire (then `exit_1e9`/`min_hold_s`/`max_hold_s`/`group`
+must be 0 — rule 9). `group`: rows sharing a byte hold at most ONE
+position (first qualifying row in table order enters); `0xFF` =
+ungrouped. Funding accumulation applies
+`core_types::funding_print_divisor` (Deribit ÷8 — the R4-§9 law's
+single home).
+
+| offset | bytes | field        | type           | notes                                        |
+| -----: | ----: | ------------ | -------------- | -------------------------------------------- |
+|      0 |     1 | ver          | `u8`           | always 2 (`RULE_ROW_VER_2`); 0 = inert filler |
+|      1 |     1 | flags        | `u8`           | bit0 = position mode (`ROW_FLAGS_MASK`)      |
+|      2 |     1 | side         | `u8`           | `Side` (0/1) or `0xFF` both — emitted side for LhsOnly rows, direction filter for signal-signed rows |
+|      3 |     1 | group        | `u8`           | exclusivity group; `0xFF` = ungrouped        |
+|      4 |     1 | feat_a       | `u8` FeatId    | action-sym operand                           |
+|      5 |     1 | feat_b       | `u8` FeatId    | reference operand; 0 (unused) for LhsOnly    |
+|      6 |     1 | feat_c       | `u8` FeatId    | confirm feature or `0xFF`                    |
+|      7 |     1 | combine      | `u8` CombineOp |                                              |
+|      8 |     4 | sym          | `u32` SymbolId | action leg (descriptor-resolved at commit, D-6) |
+|     12 |     4 | ref_sym      | `u32` SymbolId | reference leg or `SYMBOL_ID_NONE`            |
+|     16 |     2 | win_a        | `u16`          | minutes, \[1, 4320\] iff feat_a is a Roll*, else 0 |
+|     18 |     2 | win_b        | `u16`          | same law for feat_b                          |
+|     20 |     2 | win_c        | `u16`          | same law for feat_c                          |
+|     22 |     1 | cmp_bits     | `u8`           | `CMP_BITS_MASK` = 0x1F                       |
+|     23 |     1 | _pad0        | `u8`           | explicit, zeroed                             |
+|     24 |     8 | enter_1e9    | `i64`          | entry threshold, signal domain               |
+|     32 |     8 | exit_1e9     | `i64`          | position-mode exit threshold (universal law) |
+|     40 |     8 | confirm_1e9  | `i64`          | confirm threshold; 0 when feat_c = `0xFF`    |
+|     48 |     4 | min_hold_s   | `u32`          | position mode: exit evaluates only after     |
+|     52 |     4 | horizon_ms   | `u32`          | refire cooldown (v1 law) / entry re-arm      |
+|     56 |     4 | edge_bps     | `u32`          | v1-sugar diagnostic mirror; 0 native rows    |
+|     60 |     4 | _pad1        | `u32`          | explicit, zeroed                             |
+|     64 |     8 | max_risk_1e6 | `i64`          | per-row (per-LEG in position mode) notional cap ×1e6 |
+|     72 |     8 | name_h       | `u64`          | FNV-1a 64 of the row name                    |
+|     80 |     4 | max_hold_s   | `u32`          | position age-out exit (S1 law); 0 = none     |
+|     84 |     1 | family       | `u8`           | `MarketFamily` — reporting only              |
+|     85 |     3 | _pad2        | `[u8; 3]`      | explicit, zeroed                             |
+|     88 |    40 | _pad3        | `[u8; 40]`     | explicit, zeroed (reserved)                  |
+
+### `RuleTableV2` / `RuleTableV2Slot` — 32 832 bytes (VM2 V1; `Ring<RuleTableV2Slot, 2>` once V4 flips the handoff, never captured)
+
+256 × 128 B rows (32 KiB) + one trailing metadata cache line —
+identical metadata layout to v1 at the 32 KiB base. The engine
+accepts BOTH artifact grammar versions (v1 JSON maps onto v2 rows at
+build); in-memory there is ONE row format. The §6 documented copies
+grow to 32 832 B each at operator cadence.
+
+| offset | bytes | field   | type               | notes                             |
+| -----: | ----: | ------- | ------------------ | --------------------------------- |
+|      0 | 32768 | rows    | `[RuleRowV2; 256]` | only `rows[..len]` is meaningful  |
+|  32768 |     4 | len     | `u32`              | validated row count               |
+|  32772 |     4 | epoch   | `u32`              | side-path monotonic stage counter |
+|  32776 |    16 | hash128 | `[u8; 16]`         | artifact identity                 |
+|  32792 |    40 | _pad    | `[u8; 40]`         | explicit, zeroed                  |
 
 ## Capture files (8e)
 

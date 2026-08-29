@@ -995,6 +995,31 @@ pub enum AiCmdKind {
     RulesetCommit = 8,
     /// Request a sticky engine halt. No wire-expressible resume.
     HaltRequest = 9,
+    /// VM2 D-1 (docs/vm2-plan.md §8 V0 entry): one historical funding
+    /// PRINT for a perp instrument — `sym` = instrument, `px` = raw
+    /// per-print rate ×1e9 (signed), `qty` = venue print time ms.
+    /// Pushed by the hourly funding data agent right after boot
+    /// (window seeding) and on each venue-dark-BN 8 h print. The
+    /// engine folds it into the same per-sym funding windows the live
+    /// `on_venue_event` Funding path feeds — the cadence law
+    /// ([`funding_print_divisor`]) applies in that ONE place for both.
+    FundingSeed = 10,
+    /// VM2 D-2 (operator ruling 2026-08-29: positions RESTORE at
+    /// boot): re-enter one v2 table row's position after a restart.
+    /// `param_id` = row index, `sym` = the row's action sym
+    /// (consume-time cross-check against the committed row — a
+    /// mismatch refuses the seed), `side` = entered side, `px` =
+    /// entry px ×1e6, `qty` = position AGE in SECONDS at send time
+    /// (≥ 0; engine derives entry_ts = now − age·1e9 — no wall-clock
+    /// crossing, the §13-decision-1 pattern), `ttl_ns` = 0 ENFORCED —
+    /// the drain site expires any kind with `ttl_ns ≠ 0`, so age can
+    /// never ride there. Entry QTY is deliberately not carried: the
+    /// vm re-derives it from the committed row's own sizing law at
+    /// the seeded entry px (min(row cap, policy cap) / px), so a
+    /// restored position always respects the CURRENT caps. Sent by
+    /// the worker's post-boot waiter AFTER it verifies the #7b
+    /// re-commit landed the expected hash.
+    PositionSeed = 11,
 }
 
 impl AiCmdKind {
@@ -1019,6 +1044,8 @@ impl AiCmdKind {
             7 => Some(Self::RulesetStage),
             8 => Some(Self::RulesetCommit),
             9 => Some(Self::HaltRequest),
+            10 => Some(Self::FundingSeed),
+            11 => Some(Self::PositionSeed),
             _ => None,
         }
     }
@@ -1429,6 +1456,64 @@ impl AiCmd {
                     return Err(AiCmdShapeError::BadFlags(self.flags));
                 }
             }
+            AiCmdKind::FundingSeed => {
+                // VM2 D-1: `px` = rate ×1e9 (any sign, 0 legal — a
+                // zero print is a venue fact), `qty` = venue print
+                // time ms (> 0: a print without a time is meaningless).
+                if self.sym == SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.qty <= 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns != 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_VM {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id != 0 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::PositionSeed => {
+                // VM2 D-2: `param_id` = v2 row index (< table rows),
+                // `side` = the entered side (required), `px` = entry
+                // px ×1e6 (> 0), `qty` = position age SECONDS (≥ 0;
+                // 0 = just entered), `ttl_ns` MUST be 0 — the engine
+                // drain expires any kind with a nonzero ttl, and a
+                // seed must never expire (kind docs).
+                if self.sym == SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.px <= 0 {
+                    return Err(AiCmdShapeError::BadPx(self.px));
+                }
+                if self.qty < 0 {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns != 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_VM {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != Side::Bid as u8 && self.side != Side::Ask as u8 {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id as usize >= RULE_TABLE_ROWS {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
         }
         Ok(())
     }
@@ -1685,6 +1770,511 @@ pub type RuleTableSlot = RuleTable;
 pub const RULE_TABLE_RING_SLOTS: usize = 2;
 
 // ---------------------------------------------------------------
+// RuleRowV2 / RuleTableV2 — the VM2 general grammar (vm2-plan §1/§3,
+// D-1…D-8 ruled + LOCKED 2026-08-29; byte layout pinned in
+// docs/wire-format.md)
+// ---------------------------------------------------------------
+
+/// v2 feature selector (vm2-plan §1.1). One byte in [`RuleRowV2`];
+/// wire-stable within the v2 table format — never renumber, only
+/// append. `0xFF` ([`FEAT_NONE`]) = no feature (a row's `feat_c` when
+/// no confirm condition exists).
+///
+/// Signal domain law (vm2-plan §1.2, pinned in docs/wire-format.md):
+/// every evaluated feature/combine output is an `i64` in **×1e9 of
+/// its natural unit** — prices in px ×1e9 (the ×1e6 tick domain
+/// ×1e3), APR/IV/imbalance as fractions ×1e9, bps values as bps ×1e9,
+/// notional as USD ×1e9, clock features as seconds ×1e9. Thresholds
+/// (`enter_1e9`/`exit_1e9`/`confirm_1e9`) live in the same domain.
+///
+/// There is deliberately no `Last` (last-trade) feature: the BBO
+/// carrier has no trade price and trade prints are a recorded absence
+/// (vm2-plan §1.6) — it slots in as an appended feature when a trade
+/// channel is captured.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FeatId {
+    /// Mid price of the operand sym's top-of-book (px ×1e9).
+    Mid = 0,
+    /// Best bid px (×1e9).
+    Bid = 1,
+    /// Best ask px (×1e9).
+    Ask = 2,
+    /// Rolling arithmetic mean of mid over the operand window (px ×1e9).
+    RollMean = 3,
+    /// Rolling EMA of mid over the operand window (px ×1e9).
+    RollEma = 4,
+    /// Rolling minimum of mid (px ×1e9).
+    RollMin = 5,
+    /// Rolling maximum of mid (px ×1e9).
+    RollMax = 6,
+    /// Rolling population std-dev of mid (px ×1e9).
+    RollStd = 7,
+    /// Annualized funding APR over the trailing 24 h of prints
+    /// (fraction ×1e9; the [`funding_print_divisor`] cadence law
+    /// applied at accumulation). Empty window ⇒ feature ABSENT.
+    Apr24 = 8,
+    /// Annualized funding APR over the trailing 72 h (fraction ×1e9).
+    Apr72 = 9,
+    /// Options mark price from OptSummary kind 6 (raw venue units
+    /// ×1e9, the OptSummary convention). Absent until first record,
+    /// or when the venue supplies no mark px (flags bit0 clear).
+    MarkPx = 10,
+    /// Options mark IV from OptSummary (fraction ×1e9).
+    MarkIv = 11,
+    /// Top-K depth imbalance: (Σ bid notional − Σ ask notional) /
+    /// (Σ bid + Σ ask), fraction ×1e9 in \[−1e9, 1e9\]. STALE book ⇒
+    /// ABSENT (WS10-B gap law).
+    DepthImb = 12,
+    /// Top-of-depth spread in bps of mid (bps ×1e9), from DepthTopK.
+    DepthSpreadBps = 13,
+    /// Near-depth notional: Σ (px×qty) over both sides' top-K, USD
+    /// ×1e9. STALE ⇒ ABSENT.
+    DepthNearNotional = 14,
+    /// Seconds to the sym's next funding print, ×1e9
+    /// (venue-cadence-aware: venue-supplied next-funding time when
+    /// the funding channel carries one, else derived from
+    /// [`funding_period_s`]). ABSENT on continuous-funding venues
+    /// (period 0) and before the first funding observation.
+    ClockToFunding = 15,
+    /// UTC seconds-of-day ×1e9 (always present).
+    ClockUtcSod = 16,
+}
+
+/// [`RuleRowV2::feat_c`] value meaning "no confirm condition".
+pub const FEAT_NONE: u8 = 0xFF;
+
+impl FeatId {
+    /// Decode a raw byte. `None` for unknown values — the §4.2 v2
+    /// validator rejects them (rule 2).
+    #[inline]
+    pub const fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Mid),
+            1 => Some(Self::Bid),
+            2 => Some(Self::Ask),
+            3 => Some(Self::RollMean),
+            4 => Some(Self::RollEma),
+            5 => Some(Self::RollMin),
+            6 => Some(Self::RollMax),
+            7 => Some(Self::RollStd),
+            8 => Some(Self::Apr24),
+            9 => Some(Self::Apr72),
+            10 => Some(Self::MarkPx),
+            11 => Some(Self::MarkIv),
+            12 => Some(Self::DepthImb),
+            13 => Some(Self::DepthSpreadBps),
+            14 => Some(Self::DepthNearNotional),
+            15 => Some(Self::ClockToFunding),
+            16 => Some(Self::ClockUtcSod),
+            _ => None,
+        }
+    }
+
+    /// The feature reads the sym's BBO tick stream (books / rolling
+    /// stats). Rule-10 channel arithmetic (vm2-plan §3): every
+    /// universe instrument with a tick lane satisfies this.
+    #[inline]
+    pub const fn requires_price(self) -> bool {
+        matches!(
+            self,
+            Self::Mid
+                | Self::Bid
+                | Self::Ask
+                | Self::RollMean
+                | Self::RollEma
+                | Self::RollMin
+                | Self::RollMax
+                | Self::RollStd
+        )
+    }
+
+    /// The feature reads the sym's funding channel (venue-event lane
+    /// prints + FundingSeeds).
+    #[inline]
+    pub const fn requires_funding(self) -> bool {
+        matches!(self, Self::Apr24 | Self::Apr72 | Self::ClockToFunding)
+    }
+
+    /// The feature reads the sym's OptSummary (kind 6) channel.
+    #[inline]
+    pub const fn requires_opt_summary(self) -> bool {
+        matches!(self, Self::MarkPx | Self::MarkIv)
+    }
+
+    /// The feature reads the sym's DepthTopK (kind 7) channel.
+    #[inline]
+    pub const fn requires_depth(self) -> bool {
+        matches!(
+            self,
+            Self::DepthImb | Self::DepthSpreadBps | Self::DepthNearNotional
+        )
+    }
+
+    /// The feature takes a per-row rolling window: its operand window
+    /// field must be in `[1, ROLL_WINDOW_MAX_MIN]`; every other
+    /// feature's window field must be 0 (the v2 validator's rule-3
+    /// window law).
+    #[inline]
+    pub const fn requires_window(self) -> bool {
+        matches!(
+            self,
+            Self::RollMean | Self::RollEma | Self::RollMin | Self::RollMax | Self::RollStd
+        )
+    }
+}
+
+/// v2 combine operator (vm2-plan §1.2): how `feat_a(sym)` and
+/// `feat_b(ref | CONST)` produce the row's signal. One byte in
+/// [`RuleRowV2`]; never renumber.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CombineOp {
+    /// `a − b` (same-unit operands; the signal keeps their unit ×1e9).
+    Diff = 0,
+    /// `(a − b) / b × 1e4`, in bps ×1e9 (i128 intermediate).
+    DiffBps = 1,
+    /// `a / b` as a ratio ×1e9 (i128 intermediate; b = 0 ⇒ ABSENT).
+    Ratio1e9 = 2,
+    /// `a` alone — the CONST-operand form: the row compares `feat_a`
+    /// directly against its thresholds; `ref` must be
+    /// [`SYMBOL_ID_NONE`] and `feat_b` unused.
+    LhsOnly = 3,
+}
+
+impl CombineOp {
+    /// Decode a raw byte. `None` = validator rule-2 reject.
+    #[inline]
+    pub const fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Diff),
+            1 => Some(Self::DiffBps),
+            2 => Some(Self::Ratio1e9),
+            3 => Some(Self::LhsOnly),
+            _ => None,
+        }
+    }
+}
+
+/// [`RuleRowV2::cmp_bits`] bit 0: entry fires on `signal ≤ enter_1e9`
+/// (clear = `signal ≥ enter_1e9`).
+pub const CMP_ENTRY_LE: u8 = 1 << 0;
+/// [`RuleRowV2::cmp_bits`] bit 1: entry compares `|signal|` (abs
+/// mode — the sym-rich/sym-cheap two-direction entry; the position
+/// records the raw signal's sign as `entry_sign`).
+pub const CMP_ENTRY_ABS: u8 = 1 << 1;
+/// [`RuleRowV2::cmp_bits`] bit 2: confirm fires on
+/// `confirm_signal ≤ confirm_1e9` (clear = `≥`).
+pub const CMP_CONFIRM_LE: u8 = 1 << 2;
+/// [`RuleRowV2::cmp_bits`] bit 3: confirm compares `|confirm_signal|`.
+pub const CMP_CONFIRM_ABS: u8 = 1 << 3;
+/// [`RuleRowV2::cmp_bits`] bit 4: the confirm signal is the row's
+/// combine applied to `feat_c` across BOTH legs (`feat_c(sym) ⊕
+/// feat_c(ref)` — the S1 72 h-spread confirm shape). Clear = confirm
+/// evaluates `feat_c(sym)` alone (the basis funding confirm / clock
+/// timing shape).
+pub const CMP_CONFIRM_PAIR: u8 = 1 << 4;
+/// Mask of the defined [`RuleRowV2::cmp_bits`] bits — the validator
+/// rejects any set bit outside it.
+pub const CMP_BITS_MASK: u8 =
+    CMP_ENTRY_LE | CMP_ENTRY_ABS | CMP_CONFIRM_LE | CMP_CONFIRM_ABS | CMP_CONFIRM_PAIR;
+
+/// [`RuleRowV2::flags`] bit 0: position mode — the row runs the
+/// Flat→Entered state machine (two-leg emit when `ref` is a real sym,
+/// exit law `signal × entry_sign ≤ exit_1e9`, min/max-hold honored).
+/// Clear = v1 horizon-refire semantics (fire, sleep `horizon_ms`,
+/// re-arm; `exit_1e9`/`min_hold_s`/`max_hold_s`/`group` must be 0 —
+/// validator rule 9).
+pub const ROW_FLAG_POSITION: u8 = 1 << 0;
+/// Mask of the defined [`RuleRowV2::flags`] bits.
+pub const ROW_FLAGS_MASK: u8 = ROW_FLAG_POSITION;
+
+/// [`RuleRowV2::group`] value meaning "no group" (the row's position
+/// is exclusive to itself alone).
+pub const GROUP_NONE: u8 = 0xFF;
+
+/// [`RuleRowV2::ver`] value of every row this workspace builds.
+pub const RULE_ROW_VER_2: u8 = 2;
+
+/// Upper bound on rolling-stat windows, minutes (3 days; vm2-plan
+/// §1.1). Also the longest window the backtest warmup must cover.
+pub const ROLL_WINDOW_MAX_MIN: u16 = 4320;
+
+/// One validated v2 rule — 128 bytes, exactly two cache lines
+/// (vm2-plan §3, D-5; byte layout pinned in docs/wire-format.md).
+///
+/// POD; **built** by the v2 §4.2 validator from the JSON artifact —
+/// never parsed from wire bytes, never captured (no `AsBytes`; the
+/// JSON artifact is the durable form, identity is the table's
+/// `hash128`). v1 sugar (`level_breach` / `cross_deviation`) maps
+/// FULLY onto this shape at build time with byte-exact v1 semantics:
+///
+/// * `level_breach` bid row → `LhsOnly(Ask) ≤ level` (watch the
+///   transact price), ask row → `LhsOnly(Bid) ≥ level`, `both` →
+///   two-arm check bid-leg-first; horizon-refire mode.
+/// * `cross_deviation` → `|DiffBps(Mid, Mid)| ≥ edge_bps` with the
+///   mean-reverting direction law and `side` as filter;
+///   horizon-refire mode.
+///
+/// The `edge_bps` field is a diagnostic mirror for sugar rows (the
+/// live threshold is `enter_1e9`); 0 on native-grammar rows.
+#[derive(Copy, Clone)]
+#[repr(C, align(64))]
+pub struct RuleRowV2 {
+    /// Row format version — always [`RULE_ROW_VER_2`].
+    pub ver: u8,
+    /// [`ROW_FLAG_POSITION`] et al ([`ROW_FLAGS_MASK`]).
+    pub flags: u8,
+    /// [`Side`] byte (0/1) or `0xFF` = both. For `LhsOnly` rows the
+    /// EMITTED side (v1 law); for signal-signed rows a direction
+    /// FILTER (v1 cross-deviation law).
+    pub side: u8,
+    /// Exclusivity group: rows sharing a group hold AT MOST ONE
+    /// position (first qualifying row in table order enters while the
+    /// group is flat). [`GROUP_NONE`] = ungrouped.
+    pub group: u8,
+    /// [`FeatId`] of the action-sym operand.
+    pub feat_a: u8,
+    /// [`FeatId`] of the reference operand (`ref`); unused (0) for
+    /// [`CombineOp::LhsOnly`].
+    pub feat_b: u8,
+    /// [`FeatId`] of the confirm condition, or [`FEAT_NONE`].
+    pub feat_c: u8,
+    /// [`CombineOp`] byte.
+    pub combine: u8,
+    /// Action-leg [`SymbolId`] (resolved from the artifact's
+    /// descriptor at commit — vm2-plan §1.4/D-6).
+    pub sym: SymbolId,
+    /// Reference-leg [`SymbolId`], or [`SYMBOL_ID_NONE`] for
+    /// `LhsOnly` (CONST-operand) rows.
+    pub ref_sym: SymbolId,
+    /// Rolling window of `feat_a`, minutes (`[1, 4320]` when
+    /// `feat_a.requires_window()`, else 0).
+    pub win_a: u16,
+    /// Rolling window of `feat_b`, minutes (same law).
+    pub win_b: u16,
+    /// Rolling window of `feat_c`, minutes (same law).
+    pub win_c: u16,
+    /// [`CMP_ENTRY_LE`] … [`CMP_CONFIRM_PAIR`] ([`CMP_BITS_MASK`]).
+    pub cmp_bits: u8,
+    /// Explicit padding — always zero.
+    _pad0: u8,
+    /// Entry threshold, signal-domain ×1e9 (see [`FeatId`] docs).
+    pub enter_1e9: i64,
+    /// Exit threshold (position mode): exit fires when
+    /// `signal × entry_sign ≤ exit_1e9` on the HELD position — the
+    /// universal reversion law (covers |signal| decay AND sign flip).
+    /// 0 with flags 0 = v1 refire semantics (rule 9).
+    pub exit_1e9: i64,
+    /// Confirm threshold, signal-domain ×1e9; 0 when `feat_c` is
+    /// [`FEAT_NONE`].
+    pub confirm_1e9: i64,
+    /// Minimum hold seconds before exit evaluates (position mode).
+    pub min_hold_s: u32,
+    /// Re-arm horizon ms (refire mode: v1 law; position mode:
+    /// cooldown between an exit and the row's next entry).
+    pub horizon_ms: u32,
+    /// v1-sugar diagnostic mirror of the bps threshold; 0 on
+    /// native-grammar rows (module docs).
+    pub edge_bps: u32,
+    /// Explicit padding — always zero.
+    _pad1: u32,
+    /// Per-row notional cap ×1e6 (§4.2 rule 7; per LEG in position
+    /// mode — a two-leg entry emits `max_risk` per leg, opposite
+    /// sides, equal notional).
+    pub max_risk_1e6: i64,
+    /// FNV-1a 64 of the row's `name` bytes ([`fnv1a_64`]).
+    pub name_h: u64,
+    /// Maximum hold seconds (position mode): the age-out exit — the
+    /// S1 `age > 10 d` law (vm2-plan V0 freeze: allocated from the §3
+    /// reserved space). 0 = no age-out.
+    pub max_hold_s: u32,
+    /// [`MarketFamily`] byte — reporting only.
+    pub family: u8,
+    /// Explicit padding — always zero.
+    _pad2: [u8; 3],
+    /// Explicit tail padding / reserved — always zero.
+    _pad3: [u8; 40],
+}
+
+impl RuleRowV2 {
+    /// The all-zero row — inert filler for `rows[len..]`; never
+    /// evaluated (`ver` 0 marks it non-built).
+    pub const ZERO: Self = Self {
+        ver: 0,
+        flags: 0,
+        side: 0,
+        group: 0,
+        feat_a: 0,
+        feat_b: 0,
+        feat_c: 0,
+        combine: 0,
+        sym: 0,
+        ref_sym: 0,
+        win_a: 0,
+        win_b: 0,
+        win_c: 0,
+        cmp_bits: 0,
+        _pad0: 0,
+        enter_1e9: 0,
+        exit_1e9: 0,
+        confirm_1e9: 0,
+        min_hold_s: 0,
+        horizon_ms: 0,
+        edge_bps: 0,
+        _pad1: 0,
+        max_risk_1e6: 0,
+        name_h: 0,
+        max_hold_s: 0,
+        family: 0,
+        _pad2: [0; 3],
+        _pad3: [0; 40],
+    };
+
+    /// Construct a row without naming the private padding fields. The
+    /// v2 §4.2 validator is the only production builder; tests build
+    /// fixtures through it too. `ver` is stamped [`RULE_ROW_VER_2`].
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        flags: u8,
+        side: u8,
+        group: u8,
+        feat_a: FeatId,
+        feat_b: FeatId,
+        feat_c: u8,
+        combine: CombineOp,
+        sym: SymbolId,
+        ref_sym: SymbolId,
+        win_a: u16,
+        win_b: u16,
+        win_c: u16,
+        cmp_bits: u8,
+        enter_1e9: i64,
+        exit_1e9: i64,
+        confirm_1e9: i64,
+        min_hold_s: u32,
+        horizon_ms: u32,
+        edge_bps: u32,
+        max_risk_1e6: i64,
+        name_h: u64,
+        max_hold_s: u32,
+        family: u8,
+    ) -> Self {
+        Self {
+            ver: RULE_ROW_VER_2,
+            flags,
+            side,
+            group,
+            feat_a: feat_a as u8,
+            feat_b: feat_b as u8,
+            feat_c,
+            combine: combine as u8,
+            sym,
+            ref_sym,
+            win_a,
+            win_b,
+            win_c,
+            cmp_bits,
+            _pad0: 0,
+            enter_1e9,
+            exit_1e9,
+            confirm_1e9,
+            min_hold_s,
+            horizon_ms,
+            edge_bps,
+            _pad1: 0,
+            max_risk_1e6,
+            name_h,
+            max_hold_s,
+            family,
+            _pad2: [0; 3],
+            _pad3: [0; 40],
+        }
+    }
+}
+
+/// The v2 engine-facing rule table — 32 KiB of rows plus one trailing
+/// metadata cache line, 32 832 B total (vm2-plan §3, D-5; layout
+/// pinned in docs/wire-format.md). In-memory POD only, identical
+/// contract to the v1 [`RuleTable`]: never crosses a process
+/// boundary, identity is `hash128`, ferried ingress→engine by value
+/// via `Ring<RuleTableV2Slot, RULE_TABLE_RING_SLOTS>` (the two
+/// documented copies grow to 32 KiB + 64 each — operator cadence).
+#[derive(Copy, Clone)]
+#[repr(C, align(64))]
+pub struct RuleTableV2 {
+    /// Row storage; only `rows[..len as usize]` is meaningful.
+    pub rows: [RuleRowV2; RULE_TABLE_ROWS],
+    /// Validated row count ≤ [`RULE_TABLE_ROWS`].
+    pub len: u32,
+    /// Side-path monotonic stage counter (diagnostics).
+    pub epoch: u32,
+    /// Identity — first 16 bytes of the full SHA-256 of the JSON
+    /// artifact bytes.
+    pub hash128: [u8; 16],
+    /// Explicit tail padding — always zero.
+    _pad: [u8; 40],
+}
+
+impl RuleTableV2 {
+    /// The empty table: no rows, epoch 0, zero hash. Boot/scratch
+    /// preallocation value — built once, reused forever.
+    pub const EMPTY: Self = Self {
+        rows: [RuleRowV2::ZERO; RULE_TABLE_ROWS],
+        len: 0,
+        epoch: 0,
+        hash128: [0; 16],
+        _pad: [0; 40],
+    };
+}
+
+/// Ring slot ferrying a staged v2 table ingress→engine (§6 law,
+/// v2-sized).
+pub type RuleTableV2Slot = RuleTableV2;
+
+// ---------------------------------------------------------------
+// Funding cadence law — the single home (vm2-plan §1.1, R4-§9)
+// ---------------------------------------------------------------
+
+/// Divisor applied to every funding print when accumulating a window
+/// sum, per venue — THE single home of the R4-§9 unit law: Deribit's
+/// funding rows are HOURLY SAMPLES of an 8-hour rolling
+/// `interest_8h`, so summing them over-counts 8× and every Deribit
+/// print divides by 8; every other venue's prints are settled
+/// per-print rates that sum directly. Used by the VM feature engine,
+/// the backtest harness, and (via pin tests) mirrored by
+/// `claude_worker.carry_signal.apr_from_prints`.
+#[inline(always)]
+pub const fn funding_print_divisor(venue: VenueId) -> i64 {
+    match venue {
+        VenueId::Deribit => 8,
+        _ => 1,
+    }
+}
+
+/// Nominal funding-print period per venue, seconds — the
+/// [`FeatId::ClockToFunding`] fallback when the venue's funding
+/// channel supplies no explicit next-funding time (OKX and Binance
+/// supply one; Bybit's per-symbol interval can differ from the 8 h
+/// default, so the venue-supplied time wins whenever present).
+/// 0 = continuous funding (Deribit — no discrete print; the clock
+/// feature is ABSENT) or no funding at all (PM, AI).
+#[inline(always)]
+pub const fn funding_period_s(venue: VenueId) -> u32 {
+    match venue {
+        VenueId::Binance | VenueId::Okx | VenueId::Bybit => 28_800,
+        VenueId::Hyperliquid => 3_600,
+        VenueId::Polymarket | VenueId::Deribit | VenueId::Ai => 0,
+    }
+}
+
+/// The [`FeatId::Apr24`] trailing window, minutes.
+pub const FUNDING_WINDOW_24H_MIN: u16 = 1_440;
+/// The [`FeatId::Apr72`] trailing window, minutes.
+pub const FUNDING_WINDOW_72H_MIN: u16 = 4_320;
+
+// ---------------------------------------------------------------
 // Static layout assertions — if these ever fire, revisit the
 // cache-line story in PLAN.md §7.
 // ---------------------------------------------------------------
@@ -1750,6 +2340,53 @@ const _: () = {
     assert!(::core::mem::offset_of!(RuleTable, hash128) == 16 * 1024 + 8);
     assert!(::core::mem::offset_of!(RuleTable, _pad) == 16 * 1024 + 24);
     assert!(RULE_TABLE_RING_SLOTS.is_power_of_two());
+};
+
+// RuleRowV2 / RuleTableV2 layout is pinned in docs/wire-format.md
+// (vm2-plan §3, D-5) — offsets asserted build-breaking, same spirit
+// as the v1 block above.
+static_assert_size!(RuleRowV2, 128);
+static_assert_size!(RuleTableV2, 32 * 1024 + 64);
+const _: () = {
+    assert!(::core::mem::align_of::<RuleRowV2>() == 64);
+    assert!(::core::mem::offset_of!(RuleRowV2, ver) == 0);
+    assert!(::core::mem::offset_of!(RuleRowV2, flags) == 1);
+    assert!(::core::mem::offset_of!(RuleRowV2, side) == 2);
+    assert!(::core::mem::offset_of!(RuleRowV2, group) == 3);
+    assert!(::core::mem::offset_of!(RuleRowV2, feat_a) == 4);
+    assert!(::core::mem::offset_of!(RuleRowV2, feat_b) == 5);
+    assert!(::core::mem::offset_of!(RuleRowV2, feat_c) == 6);
+    assert!(::core::mem::offset_of!(RuleRowV2, combine) == 7);
+    assert!(::core::mem::offset_of!(RuleRowV2, sym) == 8);
+    assert!(::core::mem::offset_of!(RuleRowV2, ref_sym) == 12);
+    assert!(::core::mem::offset_of!(RuleRowV2, win_a) == 16);
+    assert!(::core::mem::offset_of!(RuleRowV2, win_b) == 18);
+    assert!(::core::mem::offset_of!(RuleRowV2, win_c) == 20);
+    assert!(::core::mem::offset_of!(RuleRowV2, cmp_bits) == 22);
+    assert!(::core::mem::offset_of!(RuleRowV2, _pad0) == 23);
+    assert!(::core::mem::offset_of!(RuleRowV2, enter_1e9) == 24);
+    assert!(::core::mem::offset_of!(RuleRowV2, exit_1e9) == 32);
+    assert!(::core::mem::offset_of!(RuleRowV2, confirm_1e9) == 40);
+    assert!(::core::mem::offset_of!(RuleRowV2, min_hold_s) == 48);
+    assert!(::core::mem::offset_of!(RuleRowV2, horizon_ms) == 52);
+    assert!(::core::mem::offset_of!(RuleRowV2, edge_bps) == 56);
+    assert!(::core::mem::offset_of!(RuleRowV2, _pad1) == 60);
+    assert!(::core::mem::offset_of!(RuleRowV2, max_risk_1e6) == 64);
+    assert!(::core::mem::offset_of!(RuleRowV2, name_h) == 72);
+    assert!(::core::mem::offset_of!(RuleRowV2, max_hold_s) == 80);
+    assert!(::core::mem::offset_of!(RuleRowV2, family) == 84);
+    assert!(::core::mem::offset_of!(RuleRowV2, _pad2) == 85);
+    assert!(::core::mem::offset_of!(RuleRowV2, _pad3) == 88);
+    assert!(::core::mem::offset_of!(RuleTableV2, rows) == 0);
+    assert!(::core::mem::offset_of!(RuleTableV2, len) == 32 * 1024);
+    assert!(::core::mem::offset_of!(RuleTableV2, epoch) == 32 * 1024 + 4);
+    assert!(::core::mem::offset_of!(RuleTableV2, hash128) == 32 * 1024 + 8);
+    assert!(::core::mem::offset_of!(RuleTableV2, _pad) == 32 * 1024 + 24);
+    // The FundingSeed/PositionSeed row-index bound and the v2 window
+    // laws are wire facts, not tunables.
+    assert!(FUNDING_WINDOW_72H_MIN == ROLL_WINDOW_MAX_MIN);
+    assert!(CMP_BITS_MASK == 0b0001_1111);
+    assert!(ROW_FLAGS_MASK == 0b0000_0001);
 };
 
 // ---------------------------------------------------------------
@@ -2251,10 +2888,42 @@ mod ai_cmd_tests {
                 0,
                 0,
             ),
+            // VM2 V1 (D-1): one funding print — rate ×1e9 in px,
+            // venue print ms in qty.
+            AiCmdKind::FundingSeed => AiCmd::new(
+                1,
+                1,
+                make_symbol_id(VenueId::Okx, 3),
+                125_000_000,
+                1_756_400_000_000,
+                0,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_VM,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
+            // VM2 V1 (D-2): restore row 17's position — entry px
+            // ×1e6, age SECONDS in qty, ttl 0 (enforced).
+            AiCmdKind::PositionSeed => AiCmd::new(
+                1,
+                1,
+                make_symbol_id(VenueId::Binance, 9),
+                65_000_000_000,
+                3_600,
+                0,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_VM,
+                Side::Ask as u8,
+                17,
+                0,
+            ),
         }
     }
 
-    const ALL_KINDS: [AiCmdKind; 10] = [
+    const ALL_KINDS: [AiCmdKind; 12] = [
         AiCmdKind::Heartbeat,
         AiCmdKind::EnableStrategy,
         AiCmdKind::DisableStrategy,
@@ -2265,6 +2934,8 @@ mod ai_cmd_tests {
         AiCmdKind::RulesetStage,
         AiCmdKind::RulesetCommit,
         AiCmdKind::HaltRequest,
+        AiCmdKind::FundingSeed,
+        AiCmdKind::PositionSeed,
     ];
 
     #[test]
@@ -2376,9 +3047,11 @@ mod ai_cmd_tests {
             assert_eq!(AiCmdKind::from_u8(k.to_u8()), Some(k));
             i += 1;
         }
-        // 10 would be `Resume` if it existed. It must not: halt is
-        // sticky by design (risk-policy) — the wire cannot express it.
-        assert_eq!(AiCmdKind::from_u8(10), None);
+        // No `Resume` kind exists ANYWHERE in the table: halt is
+        // sticky by design (risk-policy) — the wire cannot express
+        // it. VM2 appended FundingSeed=10/PositionSeed=11 (append-only
+        // ABI); the first unassigned byte is now 12.
+        assert_eq!(AiCmdKind::from_u8(12), None);
         assert_eq!(AiCmdKind::from_u8(0xFF), None);
     }
 
@@ -2453,9 +3126,10 @@ mod ai_cmd_tests {
 
     #[test]
     fn validate_rejects_unknown_kind_byte() {
+        // 12 = first unassigned kind byte after VM2's 10/11.
         let mut c = valid(AiCmdKind::Heartbeat);
-        c.kind = 10;
-        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(10)));
+        c.kind = 12;
+        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(12)));
     }
 
     #[test]
@@ -2726,5 +3400,409 @@ mod ai_cmd_tests {
         assert_ne!(fnv1a_64(b"btc-pm-lag"), fnv1a_64(b"hormuz-floor"));
         assert_ne!(fnv1a_64(b"a"), fnv1a_64(b"b"));
         assert_ne!(fnv1a_64(b""), fnv1a_64(b"\0"));
+    }
+}
+
+#[cfg(test)]
+mod vm2_v1_tests {
+    use super::*;
+
+    // ---------------- AiCmd kinds 10/11 ----------------
+
+    #[test]
+    fn new_kinds_roundtrip_and_next_byte_rejects() {
+        assert_eq!(AiCmdKind::from_u8(10), Some(AiCmdKind::FundingSeed));
+        assert_eq!(AiCmdKind::from_u8(11), Some(AiCmdKind::PositionSeed));
+        assert_eq!(AiCmdKind::FundingSeed.to_u8(), 10);
+        assert_eq!(AiCmdKind::PositionSeed.to_u8(), 11);
+        // 12 is the first unassigned kind byte after VM2.
+        assert_eq!(AiCmdKind::from_u8(12), None);
+    }
+
+    fn funding_seed() -> AiCmd {
+        AiCmd::new(
+            1,
+            1,
+            make_symbol_id(VenueId::Okx, 3),
+            125_000_000, // rate ×1e9
+            1_756_400_000_000, // print time ms
+            0,
+            AiCmdKind::FundingSeed,
+            VenueId::Ai,
+            STRATEGY_SLOT_VM,
+            AI_SIDE_NONE,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn funding_seed_shape_happy_path() {
+        assert_eq!(funding_seed().validate_shape(), Ok(()));
+        // Negative and zero rates are venue facts, both legal.
+        let mut c = funding_seed();
+        c.px = -3_000_000;
+        assert_eq!(c.validate_shape(), Ok(()));
+        c.px = 0;
+        assert_eq!(c.validate_shape(), Ok(()));
+    }
+
+    #[test]
+    fn funding_seed_shape_rejects() {
+        let mut c = funding_seed();
+        c.sym = SYMBOL_ID_NONE;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadSym(_))
+        ));
+        let mut c = funding_seed();
+        c.qty = 0; // a print without a time
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadQty(0))
+        ));
+        let mut c = funding_seed();
+        c.ttl_ns = 5;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadTtl(5))
+        ));
+        let mut c = funding_seed();
+        c.strategy_id = STRATEGY_SLOT_AI_EXEC;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(_))
+        ));
+        let mut c = funding_seed();
+        c.side = Side::Bid as u8;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadSide(_))
+        ));
+        let mut c = funding_seed();
+        c.param_id = 1;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadParamId(1))
+        ));
+        let mut c = funding_seed();
+        c.flags = 1;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadFlags(1))
+        ));
+        let mut c = funding_seed();
+        c.venue = VenueId::Okx.to_u8(); // engine-directed kinds pin Ai
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadVenue(_))
+        ));
+    }
+
+    fn position_seed() -> AiCmd {
+        AiCmd::new(
+            1,
+            1,
+            make_symbol_id(VenueId::Binance, 9),
+            65_000_000_000, // entry px ×1e6
+            3_600,          // age SECONDS (1 h)
+            0,              // ttl MUST be 0 (drain-expiry law)
+            AiCmdKind::PositionSeed,
+            VenueId::Ai,
+            STRATEGY_SLOT_VM,
+            Side::Ask as u8,
+            17, // row index
+            0,
+        )
+    }
+
+    #[test]
+    fn position_seed_shape_happy_path() {
+        assert_eq!(position_seed().validate_shape(), Ok(()));
+        // Age 0 = just entered; row 0 and the last row are both legal.
+        let mut c = position_seed();
+        c.qty = 0;
+        c.param_id = 0;
+        assert_eq!(c.validate_shape(), Ok(()));
+        c.param_id = (RULE_TABLE_ROWS - 1) as u16;
+        assert_eq!(c.validate_shape(), Ok(()));
+    }
+
+    #[test]
+    fn position_seed_shape_rejects() {
+        let mut c = position_seed();
+        c.param_id = RULE_TABLE_ROWS as u16; // first out-of-range row
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadParamId(_))
+        ));
+        let mut c = position_seed();
+        c.px = 0;
+        assert!(matches!(c.validate_shape(), Err(AiCmdShapeError::BadPx(0))));
+        let mut c = position_seed();
+        c.qty = -1; // negative age
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadQty(-1))
+        ));
+        let mut c = position_seed();
+        c.ttl_ns = 1; // a seed must never expire at the drain site
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadTtl(1))
+        ));
+        let mut c = position_seed();
+        c.side = AI_SIDE_NONE; // the entered side is required
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadSide(_))
+        ));
+        let mut c = position_seed();
+        c.sym = SYMBOL_ID_NONE;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadSym(_))
+        ));
+        let mut c = position_seed();
+        c.strategy_id = STRATEGY_SLOT_NONE;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(_))
+        ));
+        let mut c = position_seed();
+        c.flags = 2;
+        assert!(matches!(
+            c.validate_shape(),
+            Err(AiCmdShapeError::BadFlags(2))
+        ));
+    }
+
+    // ---------------- FeatId / CombineOp ----------------
+
+    #[test]
+    fn feat_id_roundtrips_and_rejects() {
+        let all = [
+            FeatId::Mid,
+            FeatId::Bid,
+            FeatId::Ask,
+            FeatId::RollMean,
+            FeatId::RollEma,
+            FeatId::RollMin,
+            FeatId::RollMax,
+            FeatId::RollStd,
+            FeatId::Apr24,
+            FeatId::Apr72,
+            FeatId::MarkPx,
+            FeatId::MarkIv,
+            FeatId::DepthImb,
+            FeatId::DepthSpreadBps,
+            FeatId::DepthNearNotional,
+            FeatId::ClockToFunding,
+            FeatId::ClockUtcSod,
+        ];
+        let mut i = 0;
+        while i < all.len() {
+            assert_eq!(FeatId::from_u8(all[i] as u8), Some(all[i]));
+            i += 1;
+        }
+        // First unassigned byte, and the FEAT_NONE sentinel, reject.
+        assert_eq!(FeatId::from_u8(17), None);
+        assert_eq!(FeatId::from_u8(FEAT_NONE), None);
+    }
+
+    #[test]
+    fn feat_id_channel_classification_is_a_partition() {
+        // Every feature needs exactly one of price/funding/opt/depth —
+        // or none (pure clock) — never two: rule 10 leans on this.
+        let all = [
+            FeatId::Mid,
+            FeatId::Bid,
+            FeatId::Ask,
+            FeatId::RollMean,
+            FeatId::RollEma,
+            FeatId::RollMin,
+            FeatId::RollMax,
+            FeatId::RollStd,
+            FeatId::Apr24,
+            FeatId::Apr72,
+            FeatId::MarkPx,
+            FeatId::MarkIv,
+            FeatId::DepthImb,
+            FeatId::DepthSpreadBps,
+            FeatId::DepthNearNotional,
+            FeatId::ClockToFunding,
+            FeatId::ClockUtcSod,
+        ];
+        let mut i = 0;
+        while i < all.len() {
+            let f = all[i];
+            let n = f.requires_price() as u8
+                + f.requires_funding() as u8
+                + f.requires_opt_summary() as u8
+                + f.requires_depth() as u8;
+            assert!(n <= 1, "feature must not claim two channels");
+            i += 1;
+        }
+        assert!(FeatId::Mid.requires_price());
+        assert!(FeatId::RollStd.requires_price());
+        assert!(FeatId::Apr24.requires_funding());
+        assert!(FeatId::ClockToFunding.requires_funding());
+        assert!(FeatId::MarkIv.requires_opt_summary());
+        assert!(FeatId::DepthImb.requires_depth());
+        // ClockUtcSod needs nothing — always present.
+        let c = FeatId::ClockUtcSod;
+        assert!(
+            !c.requires_price()
+                && !c.requires_funding()
+                && !c.requires_opt_summary()
+                && !c.requires_depth()
+        );
+    }
+
+    #[test]
+    fn feat_id_window_law() {
+        assert!(FeatId::RollMean.requires_window());
+        assert!(FeatId::RollStd.requires_window());
+        assert!(!FeatId::Mid.requires_window());
+        assert!(!FeatId::Apr24.requires_window(), "APR windows are fixed");
+        assert!(!FeatId::ClockUtcSod.requires_window());
+    }
+
+    #[test]
+    fn combine_op_roundtrips_and_rejects() {
+        let all = [
+            CombineOp::Diff,
+            CombineOp::DiffBps,
+            CombineOp::Ratio1e9,
+            CombineOp::LhsOnly,
+        ];
+        let mut i = 0;
+        while i < all.len() {
+            assert_eq!(CombineOp::from_u8(all[i] as u8), Some(all[i]));
+            i += 1;
+        }
+        assert_eq!(CombineOp::from_u8(4), None);
+    }
+
+    #[test]
+    fn cmp_and_flag_bits_are_distinct() {
+        assert_eq!(CMP_ENTRY_LE & CMP_ENTRY_ABS, 0);
+        assert_eq!(CMP_CONFIRM_LE & CMP_CONFIRM_ABS, 0);
+        assert_eq!(CMP_CONFIRM_PAIR & (CMP_ENTRY_LE | CMP_ENTRY_ABS), 0);
+        assert_eq!(
+            CMP_ENTRY_LE | CMP_ENTRY_ABS | CMP_CONFIRM_LE | CMP_CONFIRM_ABS | CMP_CONFIRM_PAIR,
+            CMP_BITS_MASK
+        );
+        assert_eq!(ROW_FLAG_POSITION, ROW_FLAGS_MASK);
+    }
+
+    // ---------------- RuleRowV2 / RuleTableV2 layout ----------------
+
+    #[test]
+    fn rule_row_v2_layout_is_fully_explicit() {
+        // Declared field widths sum to size_of — no implicit padding:
+        // 1×8 + 4+4 + 2+2+2 + 1+1 + 8+8+8 + 4+4+4+4 + 8+8 + 4+1+3+40
+        // = 8+8+6+2+24+16+16+48 = 128.
+        assert_eq!(::core::mem::size_of::<RuleRowV2>(), 128);
+        assert_eq!(::core::mem::align_of::<RuleRowV2>(), 64);
+        assert_eq!(::core::mem::size_of::<RuleTableV2>(), 32 * 1024 + 64);
+        assert_eq!(::core::mem::align_of::<RuleTableV2>(), 64);
+    }
+
+    #[test]
+    fn rule_row_v2_zero_is_all_zero_and_new_stamps_ver() {
+        let z = RuleRowV2::ZERO;
+        assert_eq!(z.ver, 0, "ZERO is non-built filler");
+        assert_eq!(z.sym, 0);
+        assert_eq!(z.enter_1e9, 0);
+        // Byte-level: the whole 128 B slot is zero.
+        // SAFETY: RuleRowV2 is #[repr(C)] Copy with fully explicit
+        // padding; read-only byte view of a live stack value.
+        let zb = unsafe {
+            core::slice::from_raw_parts((&z as *const RuleRowV2).cast::<u8>(), 128)
+        };
+        let mut i = 0;
+        while i < 128 {
+            assert_eq!(zb[i], 0);
+            i += 1;
+        }
+
+        let r = RuleRowV2::new(
+            ROW_FLAG_POSITION,
+            RuleRow::SIDE_BOTH,
+            2,
+            FeatId::Apr24,
+            FeatId::Apr24,
+            FeatId::Apr72 as u8,
+            CombineOp::Diff,
+            make_symbol_id(VenueId::Hyperliquid, 1),
+            make_symbol_id(VenueId::Okx, 4),
+            0,
+            0,
+            0,
+            CMP_CONFIRM_PAIR | CMP_CONFIRM_ABS,
+            200_000_000,
+            0,
+            300_000_000,
+            345_600,
+            60_000,
+            0,
+            9_900_000_000,
+            fnv1a_64(b"cvfc-doge"),
+            0,
+            0,
+        );
+        assert_eq!(r.ver, RULE_ROW_VER_2);
+        assert_eq!(r.flags, ROW_FLAG_POSITION);
+        assert_eq!(r.feat_a, FeatId::Apr24 as u8);
+        assert_eq!(r.feat_c, FeatId::Apr72 as u8);
+        assert_eq!(r.combine, CombineOp::Diff as u8);
+        assert_eq!(r.min_hold_s, 345_600);
+        assert_eq!(r.name_h, fnv1a_64(b"cvfc-doge"));
+    }
+
+    #[test]
+    fn rule_table_v2_empty_is_inert() {
+        let t = RuleTableV2::EMPTY;
+        assert_eq!(t.len, 0);
+        assert_eq!(t.epoch, 0);
+        assert_eq!(t.hash128, [0u8; 16]);
+        assert_eq!(t.rows[0].ver, 0);
+        assert_eq!(t.rows[RULE_TABLE_ROWS - 1].ver, 0);
+    }
+
+    // ---------------- funding cadence law ----------------
+
+    #[test]
+    fn funding_print_divisor_is_the_deribit_law() {
+        // Exhaustive over venues: ONLY Deribit divides (hourly samples
+        // of interest_8h — the R4-§9 unit law; the worker mirror is
+        // claude_worker.carry_signal.apr_from_prints).
+        assert_eq!(funding_print_divisor(VenueId::Deribit), 8);
+        assert_eq!(funding_print_divisor(VenueId::Polymarket), 1);
+        assert_eq!(funding_print_divisor(VenueId::Binance), 1);
+        assert_eq!(funding_print_divisor(VenueId::Okx), 1);
+        assert_eq!(funding_print_divisor(VenueId::Hyperliquid), 1);
+        assert_eq!(funding_print_divisor(VenueId::Ai), 1);
+        assert_eq!(funding_print_divisor(VenueId::Bybit), 1);
+    }
+
+    #[test]
+    fn funding_period_matches_venue_cadence() {
+        assert_eq!(funding_period_s(VenueId::Binance), 28_800);
+        assert_eq!(funding_period_s(VenueId::Okx), 28_800);
+        assert_eq!(funding_period_s(VenueId::Bybit), 28_800);
+        assert_eq!(funding_period_s(VenueId::Hyperliquid), 3_600);
+        // Continuous funding / no funding: the clock feature is ABSENT.
+        assert_eq!(funding_period_s(VenueId::Deribit), 0);
+        assert_eq!(funding_period_s(VenueId::Polymarket), 0);
+        assert_eq!(funding_period_s(VenueId::Ai), 0);
+    }
+
+    #[test]
+    fn funding_windows_are_the_carry_law_windows() {
+        assert_eq!(FUNDING_WINDOW_24H_MIN, 1_440);
+        assert_eq!(FUNDING_WINDOW_72H_MIN, 4_320);
+        assert_eq!(ROLL_WINDOW_MAX_MIN, 4_320);
     }
 }

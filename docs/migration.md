@@ -30,6 +30,67 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-29 — VM2 V1: RuleRowV2/RuleTableV2 (table version 2), AiCmd kinds 10–11 (vm2-plan D-1…D-8)
+
+**What changed**
+
+- `core-types` gains the VM2 general-grammar types (vm2-plan §1/§3,
+  design LOCKED 2026-08-29): `RuleRowV2` (128 B, two cache lines —
+  feature/combine grammar, position mode, groups, confirm, min/max
+  hold) and `RuleTableV2` (256 rows, 32 832 B), ADDITIVE beside the
+  v1 types. The vm evaluator flips to v2 in V3, the validator + the
+  §6 table-handoff ring in V4; the v1 `RuleRow`/`RuleTable` retire
+  then (no unused code stays). v1 JSON artifacts keep committing
+  through a compat arm for one release (D-6) — sugar maps onto v2
+  rows with byte-exact v1 semantics, so H6-era artifacts and
+  `cvfc-basis-kill` stay valid.
+- `AiCmdKind` appends `FundingSeed = 10` (D-1: one historical funding
+  print — sym, rate ×1e9 in `px`, venue print ms in `qty`) and
+  `PositionSeed = 11` (D-2 as ruled: positions RESTORE at boot — row
+  index in `param_id`, entered side, entry px in `px`, position age
+  SECONDS in `qty`, `ttl_ns` 0-enforced: the drain site expires any
+  nonzero ttl, and entry qty re-derives from the row's sizing law so
+  restores respect current caps). Shape rules enforced by
+  `AiCmd::validate_shape`; byte
+  meanings pinned in `docs/wire-format.md`. Both are engine-directed
+  (`venue = Ai`, `strategy_id = 5`). Capture-compatible: the 64 B
+  AiCmd layout is unchanged, `ai-cmds.pmlr` readers see two new kind
+  bytes.
+- The funding cadence law gets its single home:
+  `core_types::funding_print_divisor` (Deribit ÷8 — hourly samples of
+  `interest_8h`) + `funding_period_s` (clock-feature fallback). The
+  worker mirror (`claude_worker.carry_signal.apr_from_prints`) gains
+  a pin test in V6.
+- Refinement over the D-1 sketch (recorded in vm2-plan §8):
+  FundingSeed carries RAW PRINTS with venue timestamps, not
+  per-window aggregates — windows recompute engine-side through the
+  same path live events take, keeping the cadence law in one place.
+
+**Why**
+
+- vm2-plan §0: the two-word v1 rule language cannot express the M5
+  strategy families; v2 is the general, cron-free replacement. D-5
+  ruled 128 B rows (the grammar does not fit 64 B).
+
+**Impact**
+
+- On-disk formats: none yet (RuleRow/Table never captured; AiCmd
+  layout unchanged — only new kind bytes appear in `ai-cmds.pmlr`
+  once V6 pushes seeds).
+- Config keys: none.
+- Wire formats: AiCmd kind table extended; RuleRowV2/RuleTableV2
+  documented in `docs/wire-format.md`.
+
+**Migration steps**
+
+1. None until V3/V4 flip the evaluator/validator — this commit is
+   type-additive and inert at runtime.
+
+**Rollback**
+
+- Revert the commit; no persisted state references the new types or
+  kinds until V6.
+
 ## 2026-08-29 — SlotKind 7 = DepthTopK, first non-64-byte PMLR slot (WS10-B)
 
 **What changed**

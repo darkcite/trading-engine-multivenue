@@ -390,3 +390,39 @@ new venues.
     channel map).
   Next: plan commit on operator authorization (`VM2:` prefix,
   explicit path), then V1.
+- 2026-08-29 — plan committed `a6e38b8` (operator-authorized).
+  Environment finding, recorded in memory + here: git write-ops
+  through the Cowork sandbox mount leave stale `.git` locks (mount
+  forbids unlink) — cleaned on the Mac; ALL git write-ops run on the
+  Mac lane from now on.
+- 2026-08-29 — **V1 CODED (core-types + docs; additive, workspace
+  green).** `RuleRowV2` 128 B / `RuleTableV2` 32 832 B beside the v1
+  types (v1 retires at V4 — every checkpoint stays compilable);
+  `FeatId` (17 features; no `Last` — trade prints are the §1.6
+  recorded absence) + `CombineOp` + `cmp_bits`/`flags` bit law;
+  `AiCmdKind::FundingSeed=10` / `PositionSeed=11` + shape arms;
+  `funding_print_divisor` (deribit ÷8) + `funding_period_s` single
+  home. Wire-format + migration entries written. Stay-green: nextest
+  workspace 1367/1367 (baseline 1351 + 16 new), core-types 68/68.
+  **Three design refinements recorded (all within the locked
+  skeleton, operator-visible):**
+  1. FundingSeed carries RAW PRINTS (rate ×1e9 + venue print ms),
+     not the D-1 sketch's per-window aggregates — windows recompute
+     engine-side through the same path live funding events take, so
+     the cadence law stays in its one home.
+  2. PositionSeed: age rides in `qty` as SECONDS and `ttl_ns` is
+     0-enforced — the engine drain expires ANY kind with nonzero
+     `ttl_ns` (age-in-ttl would be dropped at drain); entry qty is
+     NOT carried — the vm re-derives it from the committed row's
+     sizing law at the seeded px (restores respect current caps).
+  3. `max_hold_s` u32 allocated from the §3 reserved space — the S1
+     age-out exit (>240 h) is otherwise inexpressible; 0 = no
+     age-out.
+  Universal exit law pinned: `signal × entry_sign ≤ exit_1e9`
+  (covers xv |dev|-decay AND sign-flip, CVFC spread<0 after
+  min-hold, S1 directional<10%). v1 sugar maps FULLY onto the
+  grammar (bid `level_breach` → `LhsOnly(Ask) ≤ level`, ask →
+  `LhsOnly(Bid) ≥ level`, `cross_deviation` →
+  `|DiffBps(Mid,Mid)| ≥ edge` + side filter) — ONE evaluator path,
+  no v1 branch. Alloc gate deferred to V2 (V1 links into no hot
+  path); pytest untouched (499 stands).
