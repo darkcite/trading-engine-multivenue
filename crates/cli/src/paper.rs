@@ -3282,9 +3282,11 @@ pub struct CaptureGaugeIds {
     /// treated as a soak-verdict red flag even though the market-data
     /// session itself is unaffected.
     pub io_errors: GaugeId,
-    /// Mirrors `ticks_written() + events_written() +
-    /// signals_written() + tap_records()` — total records staged since
-    /// the capture was opened (monotonic snapshot, not a delta).
+    /// Mirrors the sum of `ticks_written()`, `events_written()`,
+    /// `signals_written()`, `opt_summaries_written()`,
+    /// `depths_written()` and `tap_records()` — total records staged
+    /// since the capture was opened (monotonic snapshot, not a
+    /// delta; opt/depth joined the sum at WS10-B).
     pub records: GaugeId,
 }
 
@@ -3367,6 +3369,15 @@ impl Capture for GaugedCapture {
     }
 
     #[inline(always)]
+    fn depth(&mut self, d: &DepthTopK) {
+        // WS10-B: same trap as opt_summary — the WS13 live smoke
+        // caught this wrapper swallowing every depth snapshot via
+        // the trait's default no-op (2026-08-29: zero <venue>-depth
+        // records while Book events flowed on both venues).
+        self.inner.depth(d);
+    }
+
+    #[inline(always)]
     fn raw_frame(&mut self, ts_ns: NsTs, payload: &[u8]) {
         self.inner.raw_frame(ts_ns, payload);
     }
@@ -3397,6 +3408,8 @@ fn mirror_capture_metrics(metrics: &CaptureMetrics, capture: &PmlrCapture) {
         let records = capture.ticks_written()
             + capture.events_written()
             + capture.signals_written()
+            + capture.opt_summaries_written()
+            + capture.depths_written()
             + capture.tap_records();
         reg.gauge(ids.records).set(records as i64);
     }
@@ -5628,6 +5641,42 @@ mod tests {
             ai_status: Arc::new(AiIngressStatus::new()),
             ruleset_tables: rings.ruleset_tables.clone().split().1,
         }
+    }
+
+    /// WS13 live catch (2026-08-29): the wrapper swallowed every
+    /// depth snapshot through the trait's default no-op while Book
+    /// events flowed on both depth venues. Pin EVERY per-record hook
+    /// forwarding to the inner capture so the next added channel
+    /// cannot repeat this silently.
+    #[test]
+    fn gauged_capture_forwards_every_record_hook() {
+        let dir =
+            std::env::temp_dir().join(format!("gauged_fwd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut g = GaugedCapture::new(
+            PmlrCapture::open(&dir, "okx", 1, core_io::TapCfg::off()).unwrap(),
+            None,
+        );
+        let t = Tick::new(
+            1,
+            VenueId::Okx,
+            7,
+            1,
+            core_types::Price::from_raw(1),
+            core_types::Qty::from_raw(1),
+            core_types::Price::from_raw(2),
+            core_types::Qty::from_raw(1),
+        );
+        Capture::tick(&mut g, &t);
+        Capture::event(
+            &mut g,
+            &ChannelEvent::new(1, VenueId::Okx, core_types::ChannelId::Funding, 7, 0, 0, 1, 0),
+        );
+        Capture::depth(&mut g, &core_types::DepthTopK::EMPTY);
+        assert_eq!(g.inner.ticks_written(), 1);
+        assert_eq!(g.inner.events_written(), 1);
+        assert_eq!(g.inner.depths_written(), 1, "the WS13 live catch");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

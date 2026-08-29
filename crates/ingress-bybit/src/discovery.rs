@@ -328,9 +328,16 @@ fn quoted_span(body: &[u8], pos: usize) -> Result<(&[u8], usize), BybitDiscovery
     Ok((span, end_q))
 }
 
-/// Parse a QUOTED non-negative decimal into ×1e9 fixed point (the
-/// WS4 Binance-discovery rule: fraction digits beyond 9 must be
-/// zero).
+/// Parse a QUOTED non-negative decimal into ×1e9 fixed point.
+///
+/// Fraction digits beyond 9 TRUNCATE — a deliberate divergence from
+/// the WS4 Binance-discovery reject rule, forced by the live wire
+/// (WS13 smoke 2026-08-29, the pitfall-11 catch for this venue):
+/// Bybit spot carries `basePrecision` down to 1e-13 (`BTTUSDT`
+/// "0.0000000001", `BABYDOGEUSDT` "0.0000000000001") on rows we
+/// never subscribe, and one such row must not kill the page. A
+/// sub-1e-9 step floors to 0 = the absent sentinel; a CONFIGURED
+/// symbol with one surfaces as step-absent in the boot audit.
 fn quoted_1e9(body: &[u8], pos: usize) -> Result<(i64, usize), BybitDiscoveryErr> {
     let (span, end) = quoted_span(body, pos)?;
     if span.is_empty() {
@@ -352,9 +359,8 @@ fn quoted_1e9(body: &[u8], pos: usize) -> Result<(i64, usize), BybitDiscoveryErr
                     if frac_digits < 9 {
                         frac = frac * 10 + d;
                         frac_digits += 1;
-                    } else if d != 0 {
-                        return Err(BybitDiscoveryErr::BadRow);
                     }
+                    // Digits beyond 9 frac places truncate (doc above).
                 } else {
                     int_part = int_part
                         .checked_mul(10)
@@ -424,6 +430,29 @@ mod tests {
             None,
             "empty cursor = last page"
         );
+    }
+
+    /// WS13 live catch (2026-08-29, pitfall 11): spot rows carry
+    /// `basePrecision` down to 1e-13 (`BTTUSDT` "0.0000000001",
+    /// `BABYDOGEUSDT` "0.0000000000001"); one such row must not kill
+    /// the page. Sub-1e-9 digits truncate — step floors to 0 = the
+    /// absent sentinel — and the neighbouring rows still parse.
+    #[test]
+    fn sub_1e9_base_precision_truncates_instead_of_killing_the_page() {
+        let page = br#"{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[{"symbol":"BTTUSDT","status":"Trading","lotSizeFilter":{"basePrecision":"0.0000000001"},"priceFilter":{"tickSize":"0.0000000001"}},{"symbol":"BABYDOGEUSDT","status":"Trading","lotSizeFilter":{"basePrecision":"0.0000000000001"},"priceFilter":{"tickSize":"0.0000000000001"}},{"symbol":"BTCUSDT","status":"Trading","lotSizeFilter":{"basePrecision":"0.000001"},"priceFilter":{"tickSize":"0.1"}}]}}"#;
+        let mut d = BybitDiscovery::new();
+        assert_eq!(d.ingest_body(page).expect("page must survive"), 3);
+        assert_eq!(d.find(b"BTTUSDT").unwrap().lot_step_1e9, 0, "floored");
+        assert_eq!(d.find(b"BABYDOGEUSDT").unwrap().tick_size_1e9, 0);
+        let btc = d.find(b"BTCUSDT").unwrap();
+        assert_eq!(btc.lot_step_1e9, 1_000, "healthy row untouched");
+        assert_eq!(btc.tick_size_1e9, 100_000_000);
+        // Mixed nonzero tail truncates (not rejects): 0.0000000015
+        // keeps the first 9 digits -> 1.
+        let tail = br#"{"retCode":0,"result":{"list":[{"symbol":"XUSDT","status":"Trading","lotSizeFilter":{"basePrecision":"0.0000000015"}}]}}"#;
+        let mut d2 = BybitDiscovery::new();
+        assert_eq!(d2.ingest_body(tail).expect("parse ok"), 1);
+        assert_eq!(d2.find(b"XUSDT").unwrap().lot_step_1e9, 1);
     }
 
     #[test]
