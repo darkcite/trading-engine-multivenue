@@ -519,3 +519,39 @@ new venues.
   alloc 39/39 release (fresh Compiling) · pytest 499 · license
   green · **fuzz `ruleset_json` 311 s / 34.05M runs CLEAN** (corpus
   is machine-local by repo convention; the v2 seeds live there).
+  Committed `e181ee9`.
+- 2026-08-30 — **V5 CODED (multi-channel backtest + audit-pnl D-7 +
+  D-3 gate; workspace green).** Harness: the merge carries
+  funding/ctx events + depth + OptSummary beside ticks (lord-space
+  extension of the §3.2 key; VIRT anchoring identical) through the
+  vm's REAL callbacks — §1.5 parity is structural; per-run manifest
+  REBIND (descriptor join to the newest run) unifies reshuffled
+  ordinals (pinned: `v5_cross_run_manifest_rebind_unifies_syms`);
+  WARMUP = the longest TABLE-referenced window (Roll wins, Apr24
+  24 h, Apr72 72 h; 0 when none — REFINEMENT of the locked "first
+  24 h" text: a flat floor would zero every short-capture v1
+  backtest while warming nothing; features-only feed via the public
+  `feats` API). **D-7 options law in `backtest::fill` (ONE home,
+  audit-pnl reuses it):** mark-bearing OptSummary ⇒ synthetic
+  zero-spread mark ticks for tickless option syms; registered syms
+  fill IMMEDIATELY at `mark ± max(0.5%, 1 tick)` with TAKER fees
+  (strict-cross can never cross its own synthetic book — the
+  mark-fill CLASS is the honest reading of the ruling), valued at
+  mark, `mark_fills` counted, assumption PRINTED in harness stderr
+  AND audit-pnl (pinned in both). okx's markless summaries stay
+  honestly unpriceable; live okx-option execution remains blocked
+  (recorded divergence — backtest models D-7, live waits on real
+  quotes). **D-3:** schema-1 additive keys `oos.round_trips` /
+  `oos.legs` / `position_rows` (schema stays 1; goldens updated);
+  the worker gate counts LEGS and folds `round_trips ≥ 10` for
+  position rulesets into the FROZEN-SHAPED `min_trades` verdict
+  (GateThresholds/GateResult untouched; `MIN_ROUND_TRIPS = 10`
+  cited to the ruling; `tests/test_backtest_d3.py` pins pre-V5
+  reports gating byte-identically). **The V5 golden:**
+  `v5_position_round_trip_hand_computed_exact` — a v2 position pair
+  through entry→reversion→exit, every fill at its resting px, net
+  EXACTLY $3 234, dd 0, legs 4, round_trips 1, byte-exact schema
+  line (a fixture-size catch en route: the shared 10-unit book
+  partial-filled the $9.9k legs — deep-book v5_tick pinned it).
+  Gates: nextest 1417/1417 · cli 151/151 · alloc/pytest/license
+  this entry's close.

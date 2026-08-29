@@ -414,3 +414,110 @@ fn tickless_root_is_refused() {
     assert!(run(&cfg, &mut |_l: &str| {}).is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// VM2 V5 (D-7): an option intent with NO tick lane executes under
+/// the mark-fill law — the opt-summary marks synthesize the book, the
+/// fill lands at mark ± h with taker economics, and the assumption is
+/// PRINTED.
+#[test]
+fn option_intents_mark_fill_and_print_the_d7_assumption() {
+    let root = tmp_root("d7opt");
+    let dir = run_dir(&root, EPOCH_1);
+    let opt_sym: u32 = (3 << 24) | 700;
+    let anchor_sym: u32 = (1 << 24) | 600;
+
+    std::fs::write(
+        dir.join("instrument-manifest.tsv"),
+        format!("{anchor_sym}\tbinance-usdm:btcusdt\n{opt_sym}\tderibit:BTC-27MAR26-60000-C\n"),
+    )
+    .unwrap();
+
+    // Tick anchor (runs need one) + two mark-bearing opt records.
+    write_ticks(
+        &dir,
+        "bn",
+        EPOCH_1,
+        &[Tick::new(
+            1_000,
+            VenueId::Binance,
+            anchor_sym,
+            1,
+            Price::from_raw(490_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(510_000),
+            Qty::from_raw(1_000_000),
+        )],
+    );
+    let mk_opt = |ts: u64, mark_1e9: i64| {
+        core_types::OptSummary::new(
+            ts,
+            VenueId::Deribit,
+            opt_sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            mark_1e9,
+            650_000_000,
+            65_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+    {
+        let mut w = PmlrWriter::open(
+            dir.join("deribit-opt-summary.pmlr"),
+            SlotKind::OptSummary,
+            EPOCH_1,
+        )
+        .unwrap();
+        w.append(&mk_opt(2_000, 50_000_000)).unwrap();
+        w.append(&mk_opt(3_000, 40_000_000)).unwrap();
+        w.flush().unwrap();
+    }
+    // One vm option intent between the marks: Bid 100 units @ 0.05.
+    let mut o = Order::new(
+        2_500,
+        VenueId::Deribit,
+        opt_sym,
+        Side::Bid,
+        0,
+        Price::from_raw(50_000),
+        Qty::from_raw(100_000_000),
+        1,
+    );
+    o.strategy_id = 5;
+    write_orders(&dir, EPOCH_1, &[o]);
+
+    let mut lines: Vec<String> = Vec::new();
+    let json = run(
+        &AuditPnlConfig {
+            replay_dir: root.clone(),
+            fee_bps: Vec::new(),
+            latency_ns: Some(0),
+            latency_ns_venue: Vec::new(),
+        },
+        &mut |l: &str| lines.push(l.to_owned()),
+    )
+    .expect("audit ok");
+
+    assert!(
+        lines.iter().any(|l| l.contains("OPTIONS MARK-FILL LAW (D-7)")),
+        "the assumption must be PRINTED: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("opt-synth-ticks=2")),
+        "synthetic mark ticks reported: {lines:?}"
+    );
+    // The vm strategy row shows exactly one fill (the mark fill at
+    // the second record).
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("strategy 5 (vm)") && l.contains("fills=1")),
+        "one mark fill on the vm row: {lines:?}"
+    );
+    assert!(json.contains("\"strategy_id\":5"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}

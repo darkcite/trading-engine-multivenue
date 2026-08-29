@@ -60,7 +60,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
-use core_types::{AiCmd, AiCmdKind, Fill, Order, Side, Tick, SYMBOL_ID_NONE};
+use core_types::{
+    AiCmd, AiCmdKind, Fill, OptSummary, Order, Price, Qty, Side, Tick, VenueId,
+    OPT_SUMMARY_FLAG_MARK_PX, SYMBOL_ID_NONE,
+};
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
 use crate::backtest::fill::{FillEngine, ModelOutcome, DAY_NS};
@@ -303,6 +306,10 @@ struct RunLoad {
     manifest_malformed: u64,
     unresolved_namespaced: u64,
     clamped_pre_anchor: u64,
+    /// VM2 V5 (D-7): synthetic option mark-ticks synthesized from
+    /// `<venue>-opt-summary.pmlr` for option syms without a tick
+    /// lane; these syms execute under the mark-fill law.
+    opt_synth_ticks: u64,
 }
 
 /// Load one run: every §9.9 input, syms rewritten to root-dense ids,
@@ -310,6 +317,7 @@ struct RunLoad {
 fn load_run_events(
     run: &RunDir,
     interner: &mut SymInterner,
+    mark_fill_syms: &mut std::collections::BTreeSet<u32>,
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
         epoch_ns: run.epoch_ns,
@@ -353,6 +361,57 @@ fn load_run_events(
                 idx: i as u64,
                 payload: Payload::Tick(tick),
             });
+            load.ticks += 1;
+        }
+    }
+    // VM2 V5 (D-7): option syms with a MARK but no tick lane get a
+    // synthetic zero-spread mark tick per OptSummary record — they
+    // anchor, mark and (mark-law) fill like any instrument, valued
+    // at mark. okx's markless summaries stay honestly unpriceable.
+    let mut tick_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for e in &evs {
+        if let Payload::Tick(t) = &e.payload {
+            tick_syms.insert(t.sym);
+        }
+    }
+    for (lord_off, label) in VENUE_LABELS.iter().enumerate() {
+        let path = run.path.join(format!("{label}-opt-summary.pmlr"));
+        let Some(reader) = open_checked::<OptSummary>(&path, SlotKind::OptSummary, run.epoch_ns)?
+        else {
+            continue;
+        };
+        for (i, o) in reader.records().iter().enumerate() {
+            if o.flags & OPT_SUMMARY_FLAG_MARK_PX == 0 || o.mark_px_1e9 <= 0 {
+                continue;
+            }
+            let dense = resolve(o.sym, interner, &mut load)?;
+            if tick_syms.contains(&dense) {
+                continue;
+            }
+            let mark_1e6 = o.mark_px_1e9 / 1_000;
+            if mark_1e6 <= 0 {
+                continue;
+            }
+            mark_fill_syms.insert(dense);
+            let venue = VenueId::from_u8(o.venue).unwrap_or(VenueId::Deribit);
+            let t = Tick::new(
+                o.ts_ns,
+                venue,
+                dense,
+                0,
+                Price::from_raw(mark_1e6),
+                Qty::from_raw(1_000_000_000_000),
+                Price::from_raw(mark_1e6),
+                Qty::from_raw(1_000_000_000_000),
+            );
+            evs.push(Ev {
+                ts_ns: o.ts_ns,
+                class: CLASS_TICK,
+                lord: 200 + lord_off as u8,
+                idx: i as u64,
+                payload: Payload::Tick(t),
+            });
+            load.opt_synth_ticks += 1;
             load.ticks += 1;
         }
     }
@@ -426,13 +485,14 @@ fn load_run_events(
 fn load_and_merge_events(
     runs: &[RunDir],
     interner: &mut SymInterner,
+    mark_fill_syms: &mut std::collections::BTreeSet<u32>,
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedEv> = Vec::new();
     let mut loads: Vec<RunLoad> = Vec::with_capacity(runs.len());
     let mut prev_last_virt: u64 = 0;
     for run in runs {
-        let (evs, mut load) = load_run_events(run, interner)?;
+        let (evs, mut load) = load_run_events(run, interner, mark_fill_syms)?;
         if evs.is_empty() {
             loads.push(load);
             continue;
@@ -496,7 +556,8 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         parse_model_params(&cfg.fee_bps, cfg.latency_ns, &cfg.latency_ns_venue)?;
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut interner = SymInterner::default();
-    let (merged, loads) = load_and_merge_events(&runs, &mut interner)?;
+    let mut mark_fill_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let (merged, loads) = load_and_merge_events(&runs, &mut interner, &mut mark_fill_syms)?;
 
     for l in &loads {
         report(&format!(
@@ -527,18 +588,38 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 String::new()
             },
         ));
+        if l.opt_synth_ticks > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: opt-synth-ticks={} (D-7 mark books)",
+                l.epoch_ns, l.opt_synth_ticks
+            ));
+        }
+    }
+    if !mark_fill_syms.is_empty() {
+        // D-7 obligation: the assumption is PRINTED wherever it can
+        // shape numbers.
+        report(&format!(
+            "audit-pnl: OPTIONS MARK-FILL LAW (D-7): {} option sym(s) execute at              mark ± max(0.5%, 1 tick) with TAKER fees and value at mark — no real              options book exists in the capture; assumption applies wherever these              syms filled",
+            mark_fill_syms.len()
+        ));
     }
 
     // Engines: per strategy_id, plus per (vm, hash128). ModelParams
     // fields are Copy arrays — rebuild per engine (derive-agnostic).
     let mk_engine = || {
-        FillEngine::new(
+        let mut e = FillEngine::new(
             ModelParams {
                 fee_bps: params.fee_bps,
                 latency_ns: params.latency_ns,
             },
             0,
-        )
+        );
+        // D-7: every engine executes registered option syms under
+        // the mark-fill law.
+        for sym in &mark_fill_syms {
+            e.set_mark_fill_sym(*sym);
+        }
+        e
     };
     let mut engines: BTreeMap<u8, FillEngine> = BTreeMap::new();
     let mut vm_hash_engines: BTreeMap<[u8; 16], FillEngine> = BTreeMap::new();

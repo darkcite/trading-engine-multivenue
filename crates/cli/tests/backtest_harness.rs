@@ -134,8 +134,10 @@ fn golden_schema1(split: &str) -> String {
     format!(
         "{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",\"split\":\"{split}\",\
          \"oos\":{{\"net_pnl_usd\":0.0,\"trades\":0,\"trading_days\":0,\
-         \"max_drawdown_usd\":0.0}},\"bounds\":{{\"max_order_notional_usd\":50.0,\
-         \"max_symbol_notional_usd\":0.0,\"max_total_notional_usd\":0.0}}}}"
+         \"max_drawdown_usd\":0.0,\"round_trips\":0,\"legs\":0}},\
+         \"bounds\":{{\"max_order_notional_usd\":50.0,\
+         \"max_symbol_notional_usd\":0.0,\"max_total_notional_usd\":0.0}},\
+         \"position_rows\":0}}"
     )
 }
 
@@ -662,8 +664,10 @@ fn pnl_schema1() -> String {
     format!(
         "{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",\"split\":\"70/30\",\
          \"oos\":{{\"net_pnl_usd\":5.0,\"trades\":2,\"trading_days\":2,\
-         \"max_drawdown_usd\":4.375}},\"bounds\":{{\"max_order_notional_usd\":50.0,\
-         \"max_symbol_notional_usd\":96.8,\"max_total_notional_usd\":96.8}}}}"
+         \"max_drawdown_usd\":4.375,\"round_trips\":0,\"legs\":2}},\
+         \"bounds\":{{\"max_order_notional_usd\":50.0,\
+         \"max_symbol_notional_usd\":96.8,\"max_total_notional_usd\":96.8}},\
+         \"position_rows\":0}}"
     )
 }
 
@@ -873,4 +877,336 @@ fn regenerate_committed_python_fixture() {
     std::fs::create_dir_all(&committed).expect("mkdir committed fixture dir");
     let _ = build_pnl_capture(&committed);
     eprintln!("committed fixture regenerated at {}", committed.display());
+}
+
+// ---------------------------------------------------------------
+// VM2 V5: multi-channel replay, warmup, positions, D-7 mark fills
+// ---------------------------------------------------------------
+
+/// okx-namespaced pair syms + their §9.4 descriptors (the v2 rows
+/// resolve through the fixture manifest).
+const V5_SYM: u32 = (2 << 24) | 1; // okx:BTC-USDT-SWAP
+const V5_REF: u32 = (1 << 24) | 600; // binance-usdm:btcusdt
+
+fn v5_write_manifest(run: &Path) {
+    std::fs::write(
+        run.join("instrument-manifest.tsv"),
+        format!(
+            "{V5_SYM}\tokx:BTC-USDT-SWAP\n{V5_REF}\tbinance-usdm:btcusdt\n{}\tderibit:BTC-27MAR26-60000-C\n",
+            (3u32 << 24) | 700
+        ),
+    )
+    .expect("manifest");
+}
+
+/// Deep displayed sizes: the hand-computed fixtures fill each leg in
+/// ONE crossing tick (the shared `mk_tick`'s 10-unit book would
+/// partial-fill the $9 900 legs).
+fn v5_tick(ts_ns: u64, venue: VenueId, sym: u32, seq: u32, bid: i64, ask: i64) -> Tick {
+    Tick::new(
+        ts_ns,
+        venue,
+        sym,
+        seq,
+        Price::from_raw(bid),
+        Qty::from_raw(100_000_000_000_000),
+        Price::from_raw(ask),
+        Qty::from_raw(100_000_000_000_000),
+    )
+}
+
+fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
+    BacktestConfig {
+        ruleset: ruleset.to_path_buf(),
+        replay_dir: replay.to_path_buf(),
+        split: split.to_owned(),
+        fee_bps: vec![
+            "okx:0:0".to_owned(),
+            "bn:0:0".to_owned(),
+            "deribit:0:0".to_owned(),
+        ],
+        latency_ns: Some(0),
+        latency_ns_venue: Vec::new(),
+        emit_detail: None,
+    }
+}
+
+/// The V5 golden: one v2 POSITION pair row (xv shape) driven through
+/// entry (two legs), reversion and exit (two closers) with zero fees,
+/// zero latency and crossed fill fixtures placed so every fill lands
+/// at its resting price with mark == fill px — the WHOLE accounting
+/// is hand-computed: net = (0.75 − 0.505) × 13 200 = $3 234 exactly,
+/// dd 0, legs 4, round_trips 1.
+#[test]
+fn v5_position_round_trip_hand_computed_exact() {
+    let root = unique_root("v5-rt");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+
+    let ruleset = root.join("xv2.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"xv2","instrument":"okx:BTC-USDT-SWAP","ref":"binance-usdm:btcusdt","feature":"mid","combine":"diff_bps","enter":4000.0,"abs":true,"exit":100.0,"horizon_ms":10,"max_risk_usd":9900.0}]}"#,
+    )
+    .expect("ruleset");
+
+    // Interleaved pair ticks (one file per venue; ts strictly
+    // ordered):
+    //  t1 ref  .49/.51        (mid .50 — books live)
+    //  t2 sym  .74/.76        (mid .75, dev +5000 bps ⇒ ENTER:
+    //                          Ask sym@.75 ×13200, Bid ref@.50 ×19800)
+    //  t3 sym  .755/.745      (crossed; fills sym Ask @.75, mark .75)
+    //  t4 ref  .505/.495      (crossed; fills ref Bid @.50, mark .50)
+    //  t5 sym  .51/.50        (mid .505, dev +100 bps ⇒ EXIT: emits
+    //                          Bid sym@.505, Ask ref@.50)
+    //  t6 sym  .51/.50        (fills sym closer @.505)
+    //  t7 ref  .505/.495      (fills ref closer @.50)
+    write_ticks(
+        &run0,
+        "okx",
+        EPOCH_RUN_0,
+        &[
+            v5_tick(2_000, VenueId::Okx, V5_SYM, 1, 740_000, 760_000),
+            v5_tick(3_000, VenueId::Okx, V5_SYM, 2, 755_000, 745_000),
+            v5_tick(5_000, VenueId::Okx, V5_SYM, 3, 510_000, 500_000),
+            v5_tick(6_000, VenueId::Okx, V5_SYM, 4, 510_000, 500_000),
+        ],
+    );
+    write_ticks(
+        &run0,
+        "bn",
+        EPOCH_RUN_0,
+        &[
+            v5_tick(1_000, VenueId::Binance, V5_REF, 1, 490_000, 510_000),
+            v5_tick(4_000, VenueId::Binance, V5_REF, 2, 505_000, 495_000),
+            v5_tick(7_000, VenueId::Binance, V5_REF, 3, 505_000, 495_000),
+        ],
+    );
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.position_rows, 1);
+    assert_eq!(s.vm_orders_emitted, 4, "two entry legs + two closers");
+    assert_eq!(s.fills_total, 4);
+    assert_eq!(s.oos_round_trips, 1);
+    assert_eq!(s.oos_net_pnl_1e6, 3_234_000_000, "hand-computed $3 234");
+    assert_eq!(s.oos_max_drawdown_1e6, 0, "marks pinned to fills ⇒ dd 0");
+    assert_eq!(s.max_order_notional_1e6, 9_900_000_000);
+    assert_eq!(s.max_symbol_notional_1e6, 9_900_000_000);
+    assert_eq!(s.max_total_notional_1e6, 19_800_000_000);
+    // The frozen stdout line, byte for byte (additive keys included).
+    let digest = core_crypto::sha256(
+        std::fs::read(&ruleset).expect("ruleset bytes").as_slice(),
+    );
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        out.schema1,
+        format!(
+            "{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",\"split\":\"0/100\",\
+             \"oos\":{{\"net_pnl_usd\":3234.0,\"trades\":4,\"trading_days\":1,\
+             \"max_drawdown_usd\":0.0,\"round_trips\":1,\"legs\":4}},\
+             \"bounds\":{{\"max_order_notional_usd\":9900.0,\
+             \"max_symbol_notional_usd\":9900.0,\"max_total_notional_usd\":19800.0}},\
+             \"position_rows\":1}}"
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Warmup (§1.5 as refined at V5): a windowed row trades NOTHING
+/// until its longest referenced window has filled — the same
+/// condition inside the warmup fires zero times.
+#[test]
+fn v5_warmup_gates_entries_until_window_filled() {
+    let root = unique_root("v5-warm");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+
+    // roll_mean(10 min) ≥ 0 refire row: fires on ANY present mean.
+    let ruleset = root.join("roll.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"roll","instrument":"okx:BTC-USDT-SWAP","feature":"roll_mean","window_min":10,"enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    // One funding event teaches the wall offset (rolling windows are
+    // wall-minute concepts); a depth snapshot rides along to pin the
+    // multi-channel merge count.
+    let ev = core_types::ChannelEvent::new(
+        500,
+        VenueId::Okx,
+        core_types::ChannelId::Funding,
+        V5_SYM,
+        0,
+        1_787_961_600_000,
+        100_000_000,
+        1_787_990_400_000,
+    );
+    let path = run0.join("okx-events.pmlr");
+    let mut w =
+        PmlrWriter::open(&path, SlotKind::Event, EPOCH_RUN_0).expect("open events");
+    w.append(&ev).expect("append");
+    w.flush().expect("flush");
+    let mut bids = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+    bids[0] = core_types::DepthLevel {
+        px_1e6: 500_000,
+        qty_1e6: 1_000_000,
+    };
+    let mut asks = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+    asks[0] = core_types::DepthLevel {
+        px_1e6: 502_000,
+        qty_1e6: 1_000_000,
+    };
+    let d = core_types::DepthTopK::new(600, VenueId::Okx, V5_SYM, 0, bids, asks);
+    let dpath = run0.join("okx-depth.pmlr");
+    let mut w = PmlrWriter::open(&dpath, SlotKind::Depth, EPOCH_RUN_0).expect("open depth");
+    w.append(&d).expect("append");
+    w.flush().expect("flush");
+
+    // Ticks: inside the 10-min warmup (condition true — mean would
+    // exist) and past it.
+    write_ticks(
+        &run0,
+        "okx",
+        EPOCH_RUN_0,
+        &[
+            mk_tick(1_000, VenueId::Okx, V5_SYM, 1, 499_000, 501_000),
+            mk_tick(60_000_000_000, VenueId::Okx, V5_SYM, 2, 499_000, 501_000),
+            mk_tick(660_000_000_000, VenueId::Okx, V5_SYM, 3, 499_000, 501_000),
+        ],
+    );
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.merged_events, 1);
+    assert_eq!(s.merged_depths, 1);
+    assert_eq!(
+        s.warmup_end_virt_ns,
+        s.first_virt_ns + 600_000_000_000,
+        "warmup = the longest referenced window (10 min)"
+    );
+    assert_eq!(
+        s.vm_fires, 1,
+        "the in-warmup condition (ticks 1–2) fired nothing; tick 3 fired"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// D-7: an options row (no tick lane, mark-bearing OptSummary) prices
+/// at mark and FILLS under the mark law — taker at mark ± h.
+#[test]
+fn v5_option_mark_fill_law_executes_and_counts() {
+    let root = unique_root("v5-opt");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+    let opt_sym = (3u32 << 24) | 700;
+
+    let ruleset = root.join("iv.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"iv","instrument":"deribit:BTC-27MAR26-60000-C","feature":"mark_iv","enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    // A tick anchor on another venue (runs need ≥ 1 tick file) …
+    write_ticks(
+        &run0,
+        "bn",
+        EPOCH_RUN_0,
+        &[mk_tick(500, VenueId::Binance, V5_REF, 1, 490_000, 510_000)],
+    );
+    // … and two mark-bearing option records: the row fires at the
+    // first (Mid = mark 0.05), rests Bid @50 000, and mark-fills at
+    // the second (mark 0.04 ⇒ fill @ 40 000 + h, h = max(0.5%, 1) =
+    // 200).
+    let mk_opt = |ts: u64, mark_1e9: i64| {
+        core_types::OptSummary::new(
+            ts,
+            VenueId::Deribit,
+            opt_sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            mark_1e9,
+            650_000_000,
+            65_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+    let opath = run0.join("deribit-opt-summary.pmlr");
+    let mut w =
+        PmlrWriter::open(&opath, SlotKind::OptSummary, EPOCH_RUN_0).expect("open opt");
+    w.append(&mk_opt(1_000, 50_000_000)).expect("append");
+    w.append(&mk_opt(2_000, 40_000_000)).expect("append");
+    w.flush().expect("flush");
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.merged_opts, 2);
+    assert_eq!(s.opt_synth_ticks, 2, "both marks synthesized ticks");
+    assert_eq!(s.vm_orders_emitted, 1, "priced at Mid = mark");
+    assert_eq!(s.mark_fills, 1, "the D-7 law executed");
+    assert_eq!(s.fills_total, 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The §6 replay half: option/instrument ordinals that reshuffle
+/// across runs evaluate as ONE instrument — run-0 syms remap through
+/// the manifest join onto the newest run's ids.
+#[test]
+fn v5_cross_run_manifest_rebind_unifies_syms() {
+    let root = unique_root("v5-rebind");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    let run1 = root.join(format!("run-{EPOCH_RUN_1}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    std::fs::create_dir_all(&run1).expect("mkdir");
+    // Same descriptor, RESHUFFLED sym across the runs.
+    let old_sym = (2u32 << 24) | 9;
+    std::fs::write(
+        run0.join("instrument-manifest.tsv"),
+        format!("{old_sym}\tokx:BTC-USDT-SWAP\n"),
+    )
+    .expect("m0");
+    std::fs::write(
+        run1.join("instrument-manifest.tsv"),
+        format!("{V5_SYM}\tokx:BTC-USDT-SWAP\n"),
+    )
+    .expect("m1");
+
+    let ruleset = root.join("lvl.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"lvl","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":0.0,"horizon_ms":10,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    write_ticks(
+        &run0,
+        "okx",
+        EPOCH_RUN_0,
+        &[mk_tick(1_000, VenueId::Okx, old_sym, 1, 499_000, 501_000)],
+    );
+    write_ticks(
+        &run1,
+        "okx",
+        EPOCH_RUN_1,
+        &[mk_tick(500, VenueId::Okx, V5_SYM, 1, 499_000, 501_000)],
+    );
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.universe_syms, 1, "one instrument across both runs");
+    assert_eq!(s.remapped_syms, 1, "run-0's old ordinal remapped");
+    assert_eq!(
+        s.vm_fires, 2,
+        "the row fires in BOTH runs — run-0's tick reached it via the rebind"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

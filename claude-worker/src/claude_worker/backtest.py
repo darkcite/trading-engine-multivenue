@@ -50,6 +50,16 @@ REPORT_SUFFIX: str = ".report.json"
 
 HASH128_LEN: int = 16
 
+# VM2 V5 — the D-3 gate amendment (operator ruling 2026-08-29, the
+# D1-pattern frozen-surface amendment; recorded in docs/vm2-plan.md §8
+# V0 entry): position rulesets do FEW round-trips, so `min_trades`
+# counts LEGS (fills — additive report key, defaulting to oos.trades
+# for pre-V5 reports) and position rulesets ADDITIONALLY require
+# `round_trips >= MIN_ROUND_TRIPS`. GateThresholds/GateResult keep
+# their frozen shapes — the requirement folds into the `min_trades`
+# verdict; a report with `position_rows == 0` gates exactly as before.
+MIN_ROUND_TRIPS: int = 10
+
 
 class BacktestError(Exception):
     """Harness failure or contract violation: bad exit, garbage stdout,
@@ -98,7 +108,13 @@ class GateResult(typing.NamedTuple):
 
 
 class HarnessReport(typing.NamedTuple):
-    """Validated machine-readable harness output (stdout contract)."""
+    """Validated machine-readable harness output (stdout contract).
+
+    The VM2 V5 fields (`oos_round_trips`, `oos_legs`,
+    `position_rows`) are ADDITIVE schema-1 keys — absent on pre-V5
+    reports, where they default to the exact pre-V5 semantics
+    (legs = trades, no position gating). D-3 ruling cited above.
+    """
 
     ruleset_hash: str
     split: str
@@ -109,6 +125,9 @@ class HarnessReport(typing.NamedTuple):
     max_order_notional_usd: float
     max_symbol_notional_usd: float
     max_total_notional_usd: float
+    oos_round_trips: int = 0
+    oos_legs: int = -1  # -1 = absent ⇒ legs := trades
+    position_rows: int = 0
 
 
 class BacktestOutcome(typing.NamedTuple):
@@ -141,6 +160,14 @@ def _strict_int(obj: dict[str, object], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise BacktestError(f"harness report: {key} must be an integer, got {value!r}")
     return value
+
+
+def _lenient_int(obj: dict[str, object], key: str, default: int) -> int:
+    """VM2 V5 additive keys: absent ⇒ default (pre-V5 reports);
+    present ⇒ integer or the report is untrustworthy."""
+    if key not in obj:
+        return default
+    return _strict_int(obj, key)
 
 
 def _section(obj: dict[str, object], key: str) -> dict[str, object]:
@@ -182,14 +209,26 @@ def parse_harness_report(stdout: str, expected_hash: str) -> HarnessReport:
         max_order_notional_usd=_strict_float(bounds, "max_order_notional_usd"),
         max_symbol_notional_usd=_strict_float(bounds, "max_symbol_notional_usd"),
         max_total_notional_usd=_strict_float(bounds, "max_total_notional_usd"),
+        oos_round_trips=_lenient_int(oos, "round_trips", 0),
+        oos_legs=_lenient_int(oos, "legs", -1),
+        position_rows=_lenient_int(obj, "position_rows", 0),
     )
 
 
 def evaluate_gates(report: HarnessReport, thresholds: GateThresholds) -> GateResult:
-    """The §5.1 gate matrix — pure code, no prompts, no overrides."""
+    """The §5.1 gate matrix — pure code, no prompts, no overrides.
+
+    VM2 V5 (D-3, ruling cited at MIN_ROUND_TRIPS): `min_trades`
+    counts LEGS (= trades on pre-V5 reports) and folds the
+    position-ruleset round-trip floor in — GateResult keeps its
+    frozen five-field shape."""
+    legs = report.oos_trades if report.oos_legs < 0 else report.oos_legs
+    round_trips_ok = report.position_rows == 0 or (
+        report.oos_round_trips >= MIN_ROUND_TRIPS
+    )
     return GateResult(
         pnl_positive=report.oos_net_pnl_usd > thresholds.min_oos_net_pnl_usd,
-        min_trades=report.oos_trades >= thresholds.min_trades,
+        min_trades=legs >= thresholds.min_trades and round_trips_ok,
         min_days=report.oos_trading_days >= thresholds.min_trading_days,
         max_drawdown=report.oos_max_drawdown_usd <= thresholds.max_drawdown_usd,
         bounds=(
@@ -225,6 +264,9 @@ def write_report(
             "trades": harness.oos_trades,
             "trading_days": harness.oos_trading_days,
             "max_drawdown_usd": harness.oos_max_drawdown_usd,
+            # VM2 V5 (D-3) additive keys — absent-tolerant readers.
+            "round_trips": harness.oos_round_trips,
+            "legs": harness.oos_trades if harness.oos_legs < 0 else harness.oos_legs,
         },
         "bounds": {
             "max_order_notional_usd": harness.max_order_notional_usd,
@@ -240,6 +282,8 @@ def write_report(
             "all_passed": gates.all_passed,
         },
         "thresholds": dataclasses.asdict(thresholds),
+        # VM2 V5 (D-3): position-ruleset context for report readers.
+        "position_rows": harness.position_rows,
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return path

@@ -45,13 +45,14 @@
 
 pub mod fill;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, OptSummary, Order,
+    Price, Qty, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
     STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
@@ -408,13 +409,25 @@ pub(crate) fn discover_runs(replay_dir: &Path) -> Result<Vec<RunDir>, HarnessErr
 /// per run it never differs from ranking by venue byte, but it keeps
 /// the order total even on adversarial fixtures where two files carry
 /// equal venue bytes.
+/// VM2 V5: one merged record's payload — the multi-channel replay
+/// carries funding/ctx events, depth snapshots and OptSummary
+/// records beside ticks, so every §1.1 feature evaluates in replay
+/// exactly as live (§1.5).
+#[derive(Copy, Clone, Debug)]
+enum RecPayload {
+    Tick(Tick),
+    Event(ChannelEvent),
+    Depth(DepthTopK),
+    Opt(OptSummary),
+}
+
 #[derive(Copy, Clone, Debug)]
 struct MergeKeyed {
     ts_ns: u64,
     venue: u8,
     lord: u8,
     idx: u64,
-    tick: Tick,
+    payload: RecPayload,
 }
 
 /// Order one run's records by the §3.2 total key. Keys are unique by
@@ -430,7 +443,7 @@ fn order_run(recs: &mut [MergeKeyed]) {
 /// (`epoch_ns_0 + (virt − VIRT_T0)`), kept for UTC-day reporting.
 #[derive(Copy, Clone, Debug)]
 struct MergedRec {
-    tick: Tick,
+    payload: RecPayload,
     virt_ns: u64,
     wall_ns: u64,
 }
@@ -442,15 +455,47 @@ struct RunSummary {
     // Tied to the label set so a venue addition can never desync it
     // again (WS13 caught exactly that at bybit's arrival).
     venue_records: [u64; VENUE_LABELS.len()],
+    /// VM2 V5: non-tick channel records loaded (funding/ctx events,
+    /// depth, opt) + synthesized option mark-ticks + syms remapped
+    /// through the per-run manifest join.
+    events: u64,
+    depths: u64,
+    opts: u64,
+    opt_synth_ticks: u64,
+    remapped_syms: u64,
 }
 
-/// Open every present per-venue tick file of `run`, cross-check the
-/// header, and return the run's §3.2-ordered records.
-fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
+/// Open every present per-venue capture file of `run` (ticks +
+/// VM2 V5: funding/ctx events, depth, OptSummary), cross-check
+/// headers, remap syms through the per-run manifest join (`remap`),
+/// synthesize option mark-ticks (D-7) for opt syms without a tick
+/// lane, and return the run's §3.2-ordered records.
+///
+/// Lane ordinals (`lord`): ticks = venue index, events = 8+vi,
+/// depth = 16+vi, opt = 24+vi, synthetic mark-ticks = 40+vi — ticks
+/// sort first at equal (ts, venue), preserving the book-before-
+/// analytics reading order.
+fn load_run(
+    run: &RunDir,
+    remap: &BTreeMap<u32, u32>,
+) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
+    let mut summary_extra = (0u64, 0u64, 0u64, 0u64, 0u64); // ev, dp, op, synth, remapped
     let mut any_file = false;
-    for (lord, label) in VENUE_LABELS.iter().enumerate() {
+    let map_sym = |sym: u32, remapped: &mut u64| -> u32 {
+        match remap.get(&sym) {
+            Some(new) => {
+                if *new != sym {
+                    *remapped += 1;
+                }
+                *new
+            }
+            None => sym,
+        }
+    };
+    let mut tick_syms: BTreeSet<u32> = BTreeSet::new();
+    for (vi, label) in VENUE_LABELS.iter().enumerate() {
         let path = run.path.join(format!("{label}-ticks.pmlr"));
         if !path.is_file() {
             continue; // a run captures only spawned venues (§3.1)
@@ -482,15 +527,18 @@ fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError>
             )));
         }
         let records = reader.records();
-        venue_records[lord] = records.len() as u64;
+        venue_records[vi] = records.len() as u64;
         recs.reserve(records.len());
         for (i, t) in records.iter().enumerate() {
+            let mut tick = *t;
+            tick.sym = map_sym(t.sym, &mut summary_extra.4);
+            tick_syms.insert(tick.sym);
             recs.push(MergeKeyed {
                 ts_ns: t.ts_ns,
                 venue: t.venue,
-                lord: lord as u8,
+                lord: vi as u8,
                 idx: i as u64,
-                tick: *t,
+                payload: RecPayload::Tick(tick),
             });
         }
     }
@@ -500,12 +548,139 @@ fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError>
             run.path.display()
         )));
     }
+    // VM2 V5: non-tick channels — absent files are normal (older
+    // captures, unspawned lanes); headers cross-check like ticks.
+    for (vi, label) in VENUE_LABELS.iter().enumerate() {
+        // Funding/ctx events (the vm consumes Funding + AssetCtx —
+        // gap/trade/book channels stay offline-audit material).
+        let path = run.path.join(format!("{label}-events.pmlr"));
+        if path.is_file() {
+            let reader = PmlrReader::<ChannelEvent>::open(&path).map_err(|e: io::Error| {
+                HarnessError::Capture(format!("{}: {e}", path.display()))
+            })?;
+            if reader.slot_kind() != SlotKind::Event {
+                return Err(HarnessError::Capture(format!(
+                    "{}: slot_kind {:?} is not ChannelEvent",
+                    path.display(),
+                    reader.slot_kind()
+                )));
+            }
+            for (i, e) in reader.records().iter().enumerate() {
+                let keep = e.channel == ChannelId::Funding as u8
+                    || e.channel == ChannelId::AssetCtx as u8;
+                if !keep {
+                    continue;
+                }
+                let mut ev = *e;
+                if ev.sym != SYMBOL_ID_NONE {
+                    ev.sym = map_sym(ev.sym, &mut summary_extra.4);
+                }
+                recs.push(MergeKeyed {
+                    ts_ns: e.ts_ns,
+                    venue: e.venue,
+                    lord: 8 + vi as u8,
+                    idx: i as u64,
+                    payload: RecPayload::Event(ev),
+                });
+                summary_extra.0 += 1;
+            }
+        }
+        // Depth snapshots (kind 7).
+        let path = run.path.join(format!("{label}-depth.pmlr"));
+        if path.is_file() {
+            let reader = PmlrReader::<DepthTopK>::open(&path).map_err(|e: io::Error| {
+                HarnessError::Capture(format!("{}: {e}", path.display()))
+            })?;
+            if reader.slot_kind() != SlotKind::Depth {
+                return Err(HarnessError::Capture(format!(
+                    "{}: slot_kind {:?} is not DepthTopK",
+                    path.display(),
+                    reader.slot_kind()
+                )));
+            }
+            for (i, d) in reader.records().iter().enumerate() {
+                let mut dp = *d;
+                dp.sym = map_sym(d.sym, &mut summary_extra.4);
+                recs.push(MergeKeyed {
+                    ts_ns: d.ts_ns,
+                    venue: d.venue,
+                    lord: 16 + vi as u8,
+                    idx: i as u64,
+                    payload: RecPayload::Depth(dp),
+                });
+                summary_extra.1 += 1;
+            }
+        }
+        // OptSummary records (kind 6) + D-7 synthetic mark-ticks for
+        // opt syms with no tick lane (mark present only — okx's
+        // markless summaries stay feature-only, honestly unpriceable).
+        let path = run.path.join(format!("{label}-opt-summary.pmlr"));
+        if path.is_file() {
+            let reader = PmlrReader::<OptSummary>::open(&path).map_err(|e: io::Error| {
+                HarnessError::Capture(format!("{}: {e}", path.display()))
+            })?;
+            if reader.slot_kind() != SlotKind::OptSummary {
+                return Err(HarnessError::Capture(format!(
+                    "{}: slot_kind {:?} is not OptSummary",
+                    path.display(),
+                    reader.slot_kind()
+                )));
+            }
+            for (i, o) in reader.records().iter().enumerate() {
+                let mut op = *o;
+                op.sym = map_sym(o.sym, &mut summary_extra.4);
+                recs.push(MergeKeyed {
+                    ts_ns: o.ts_ns,
+                    venue: o.venue,
+                    lord: 24 + vi as u8,
+                    idx: i as u64,
+                    payload: RecPayload::Opt(op),
+                });
+                summary_extra.2 += 1;
+                let has_mark =
+                    op.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && op.mark_px_1e9 > 0;
+                if has_mark && !tick_syms.contains(&op.sym) {
+                    // Zero-spread mark tick: the fill engine executes
+                    // these syms under the D-7 mark-fill law (the
+                    // harness registers them); the vm prices its
+                    // option legs at Mid = mark.
+                    let mark_1e6 = op.mark_px_1e9 / 1_000;
+                    if mark_1e6 > 0 {
+                        let venue = VenueId::from_u8(op.venue).unwrap_or(VenueId::Deribit);
+                        let t = Tick::new(
+                            op.ts_ns,
+                            venue,
+                            op.sym,
+                            0,
+                            Price::from_raw(mark_1e6),
+                            Qty::from_raw(1_000_000_000_000),
+                            Price::from_raw(mark_1e6),
+                            Qty::from_raw(1_000_000_000_000),
+                        );
+                        recs.push(MergeKeyed {
+                            ts_ns: op.ts_ns,
+                            venue: op.venue,
+                            lord: 40 + vi as u8,
+                            idx: i as u64,
+                            payload: RecPayload::Tick(t),
+                        });
+                        summary_extra.3 += 1;
+                    }
+                }
+            }
+        }
+    }
     order_run(&mut recs);
     Ok((
         recs,
         RunSummary {
             epoch_ns: run.epoch_ns,
             venue_records,
+            events: summary_extra.0,
+            depths: summary_extra.1,
+            opts: summary_extra.2,
+            opt_synth_ticks: summary_extra.3,
+            remapped_syms: summary_extra.4,
         },
     ))
 }
@@ -517,15 +692,31 @@ fn load_run(run: &RunDir) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError>
 /// wall time (two engines writing one log root), which no continuous
 /// replay can honestly represent — untrustworthy, nonzero exit.
 fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
+    // VM2 V5 (§6 replay half): per-run sym remap through the
+    // manifest join — each run's `<sym>\t<descriptor>` rows joined
+    // by DESCRIPTOR to the NEWEST run's manifest, so option ordinals
+    // that reshuffle across boots evaluate as ONE instrument (the
+    // row's validate-time binding is against the newest manifest).
+    // Manifest-less runs get the identity map.
+    let newest_by_desc: BTreeMap<String, u32> = read_manifest_rows(&runs[runs.len() - 1].path)
+        .into_iter()
+        .map(|(sym, desc)| (desc, sym))
+        .collect();
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedRec> = Vec::new();
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(runs.len());
     let mut prev_last_virt: u64 = 0;
     for run in runs {
-        let (recs, summary) = load_run(run)?;
+        let mut remap: BTreeMap<u32, u32> = BTreeMap::new();
+        for (sym, desc) in read_manifest_rows(&run.path) {
+            if let Some(new_sym) = newest_by_desc.get(&desc) {
+                remap.insert(sym, *new_sym);
+            }
+        }
+        let (recs, summary) = load_run(run, &remap)?;
         summaries.push(summary);
         if recs.is_empty() {
-            continue; // header-only files everywhere: run holds no ticks
+            continue; // header-only files everywhere: run holds no records
         }
         let base = VIRT_T0 + (run.epoch_ns - epoch_0);
         if base < prev_last_virt {
@@ -540,10 +731,15 @@ fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), 
         for r in &recs {
             let virt_ns = base + (r.ts_ns - ts_first);
             let wall_ns = run.epoch_ns + (r.ts_ns - ts_first);
-            let mut tick = r.tick;
-            tick.ts_ns = virt_ns;
+            let mut payload = r.payload;
+            match &mut payload {
+                RecPayload::Tick(t) => t.ts_ns = virt_ns,
+                RecPayload::Event(e) => e.ts_ns = virt_ns,
+                RecPayload::Depth(d) => d.ts_ns = virt_ns,
+                RecPayload::Opt(o) => o.ts_ns = virt_ns,
+            }
             merged.push(MergedRec {
-                tick,
+                payload,
                 virt_ns,
                 wall_ns,
             });
@@ -558,6 +754,27 @@ fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), 
     Ok((merged, summaries))
 }
 
+/// `<sym>\t<descriptor>` rows of one run's `instrument-manifest.tsv`
+/// (empty when absent/unreadable; malformed lines skipped — the
+/// manifest reader law).
+fn read_manifest_rows(dir: &Path) -> Vec<(u32, String)> {
+    let path = dir.join("instrument-manifest.tsv");
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            let mut it = line.splitn(2, '\t');
+            if let (Some(sym_s), Some(desc)) = (it.next(), it.next()) {
+                if let Ok(sym) = sym_s.parse::<u32>() {
+                    if !desc.is_empty() {
+                        out.push((sym, desc.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// VM2 V4: descriptor table from the NEWEST run's
 /// `instrument-manifest.tsv` (`<sym>\t<descriptor>` rows, M4.2 D3).
 /// Absent/malformed rows skip-and-count per the manifest's reader
@@ -567,26 +784,13 @@ fn manifest_descriptor_table(runs: &[RunDir]) -> DescriptorTable {
         Some(r) => r,
         None => return DescriptorTable::empty(),
     };
-    let path = newest.path.join("instrument-manifest.tsv");
-    let bytes = match std::fs::read_to_string(&path) {
-        Ok(b) => b,
-        Err(_) => return DescriptorTable::empty(),
-    };
-    let mut entries: Vec<(String, u32, u8)> = Vec::new();
-    for line in bytes.lines() {
-        let mut it = line.splitn(2, '\t');
-        let sym = it.next().and_then(|s| s.parse::<u32>().ok());
-        let desc = it.next();
-        if let (Some(sym), Some(desc)) = (sym, desc) {
-            if !desc.is_empty() {
-                entries.push((
-                    desc.to_owned(),
-                    sym,
-                    ingress_ai::caps_of_descriptor(desc),
-                ));
-            }
-        }
-    }
+    let entries: Vec<(String, u32, u8)> = read_manifest_rows(&newest.path)
+        .into_iter()
+        .map(|(sym, desc)| {
+            let caps = ingress_ai::caps_of_descriptor(&desc);
+            (desc, sym, caps)
+        })
+        .collect();
     DescriptorTable::from_entries(entries)
 }
 
@@ -596,8 +800,14 @@ fn manifest_descriptor_table(runs: &[RunDir]) -> DescriptorTable {
 fn derive_universe(merged: &[MergedRec]) -> Vec<u32> {
     let mut set: BTreeSet<u32> = BTreeSet::new();
     for r in merged {
-        if r.tick.sym != SYMBOL_ID_NONE {
-            set.insert(r.tick.sym);
+        // Tick-observed only (v1 rows' rule-6 law unchanged;
+        // synthetic option mark-ticks count — a markable option IS
+        // observable). v2 rows resolve through descriptors, never
+        // this set.
+        if let RecPayload::Tick(t) = &r.payload {
+            if t.sym != SYMBOL_ID_NONE {
+                set.insert(t.sym);
+            }
         }
     }
     set.into_iter().collect()
@@ -717,11 +927,14 @@ fn render_schema1(hash_hex: &str, split: &str, vals: &ReportValues) -> String {
             "\"net_pnl_usd\":{pnl},",
             "\"trades\":{trades},",
             "\"trading_days\":{days},",
-            "\"max_drawdown_usd\":{dd}}},",
+            "\"max_drawdown_usd\":{dd},",
+            "\"round_trips\":{rt},",
+            "\"legs\":{legs}}},",
             "\"bounds\":{{",
             "\"max_order_notional_usd\":{mo},",
             "\"max_symbol_notional_usd\":{ms},",
-            "\"max_total_notional_usd\":{mt}}}}}"
+            "\"max_total_notional_usd\":{mt}}},",
+            "\"position_rows\":{prows}}}"
         ),
         hash = hash_hex,
         split = split,
@@ -732,6 +945,9 @@ fn render_schema1(hash_hex: &str, split: &str, vals: &ReportValues) -> String {
         mo = fmt_usd_1e6(vals.max_order_notional_1e6),
         ms = fmt_usd_1e6(vals.max_symbol_notional_1e6),
         mt = fmt_usd_1e6(vals.max_total_notional_1e6),
+        rt = vals.oos_round_trips,
+        legs = vals.oos_legs,
+        prows = vals.position_rows,
     )
 }
 
@@ -748,6 +964,12 @@ struct ReportValues {
     max_order_notional_1e6: i64,
     max_symbol_notional_1e6: i64,
     max_total_notional_1e6: i64,
+    /// VM2 V5 (D-3) additive fields — schema stays 1; the worker's
+    /// get-based parser tolerates additions (verified; ruling cited
+    /// in the worker pins).
+    oos_round_trips: u64,
+    oos_legs: u64,
+    position_rows: u64,
 }
 
 // ---------------------------------------------------------------
@@ -827,6 +1049,24 @@ pub struct HarnessStats {
     pub max_symbol_notional_1e6: i64,
     /// §4.6 peak Σ|position|×mark ×1e6 (ceil), full window.
     pub max_total_notional_1e6: i64,
+    /// VM2 V5: non-tick channel records merged (funding/ctx events).
+    pub merged_events: u64,
+    /// Depth snapshots merged.
+    pub merged_depths: u64,
+    /// OptSummary records merged.
+    pub merged_opts: u64,
+    /// D-7 synthetic option mark-ticks synthesized.
+    pub opt_synth_ticks: u64,
+    /// Syms remapped through the per-run manifest join.
+    pub remapped_syms: u64,
+    /// D-7 mark-law fills executed (> 0 ⇒ the assumption printed).
+    pub mark_fills: u64,
+    /// Warmup window end on the virtual clock (== first_virt when 0).
+    pub warmup_end_virt_ns: u64,
+    /// D-3: OOS round-trips (exit landed at/after the boundary).
+    pub oos_round_trips: u64,
+    /// Committed-table position rows.
+    pub position_rows: u64,
 }
 
 /// What `run` hands the bin: the exact stdout line, the stderr
@@ -844,6 +1084,43 @@ pub struct BacktestOutput {
 // ---------------------------------------------------------------
 // The harness
 // ---------------------------------------------------------------
+
+/// VM2 V5 warmup (vm2-plan §1.5, refined at V5 — recorded in §8):
+/// warmup = the longest window the TABLE actually references
+/// (rolling windows in minutes; Apr24 ⇒ 1440; Apr72/72 h ⇒ 4320),
+/// and 0 when the table references no windowed/funding feature — a
+/// flat 24 h floor would zero out every short-capture v1 backtest
+/// while warming nothing. During warmup the replay feeds FEATURES
+/// only (books, windows, marks fill; the fill model runs); the vm
+/// evaluates nothing, so no entries exist before every referenced
+/// window is honestly full.
+fn warmup_ns_of(table: &RuleTableV2) -> u64 {
+    let mut max_min: u64 = 0;
+    let mut i = 0usize;
+    let len = (table.len as usize).min(core_types::RULE_TABLE_ROWS);
+    while i < len {
+        let r = &table.rows[i];
+        let feats = [r.feat_a, r.feat_b, r.feat_c];
+        let wins = [r.win_a, r.win_b, r.win_c];
+        let mut k = 0;
+        while k < feats.len() {
+            if let Some(f) = FeatId::from_u8(feats[k]) {
+                let need: u64 = match f {
+                    FeatId::Apr24 => 1_440,
+                    FeatId::Apr72 => 4_320,
+                    _ if f.requires_window() => wins[k] as u64,
+                    _ => 0,
+                };
+                if need > max_min {
+                    max_min = need;
+                }
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    max_min * 60 * 1_000_000_000
+}
 
 /// Run one backtest end to end (§3 substrate + §5 report; hold-model
 /// accounting until H2). On `Err` the caller must print the reason to
@@ -960,13 +1237,68 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     //    model's §4.1 intake with `t_active = now + Δ_venue`; an order
     //    therefore can never fill on its own emitting tick.
     let mut engine = FillEngine::new(model, boundary_virt);
+    // D-7: register mark-filled option syms (any sym that produced a
+    // synthetic mark-tick this root — collected from the payloads).
+    let mut mark_fill_syms: BTreeSet<u32> = BTreeSet::new();
+    for rec in &merged {
+        if let RecPayload::Opt(o) = &rec.payload {
+            if o.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && o.mark_px_1e9 > 0 {
+                mark_fill_syms.insert(o.sym);
+            }
+        }
+    }
+    for sym in &mark_fill_syms {
+        engine.set_mark_fill_sym(*sym);
+    }
+    // VM2 V5 warmup window (docs on `warmup_ns_of`).
+    let warmup_end_virt = first_virt.saturating_add(warmup_ns_of(&table));
     let mut consumed = ctx.orders().len(); // on_start/on_ai emit nothing, but stay uniform
     debug_assert_eq!(consumed, 0);
     let mut fills_scratch: Vec<SynthFill> = Vec::with_capacity(MAX_OPEN_TOTAL);
+    // D-3: round-trips completed before the boundary are IS; the OOS
+    // figure is the total minus this snapshot (an IS-entered position
+    // whose EXIT lands OOS counts OOS — the honest direction).
+    let mut rt_at_boundary: Option<u64> = None;
     for rec in &merged {
         ctx.now_ns = rec.virt_ns;
-        engine.on_record(&rec.tick, rec.virt_ns, rec.wall_ns, &mut fills_scratch);
-        vm.on_tick(&rec.tick, &mut ctx);
+        if rt_at_boundary.is_none() && rec.virt_ns >= boundary_virt {
+            rt_at_boundary = Some(vm.round_trips);
+        }
+        let warm = rec.virt_ns < warmup_end_virt;
+        match &rec.payload {
+            RecPayload::Tick(t) => {
+                engine.on_record(t, rec.virt_ns, rec.wall_ns, &mut fills_scratch);
+                if warm {
+                    vm.feats.on_tick(t, rec.virt_ns);
+                } else {
+                    vm.on_tick(t, &mut ctx);
+                }
+            }
+            RecPayload::Event(e) => {
+                if warm {
+                    vm.feats.on_venue_event(e, rec.virt_ns);
+                } else {
+                    vm.on_venue_event(e, &mut ctx);
+                }
+                fills_scratch.clear();
+            }
+            RecPayload::Depth(d) => {
+                if warm {
+                    vm.feats.on_depth(d, rec.virt_ns);
+                } else {
+                    vm.on_depth(d, &mut ctx);
+                }
+                fills_scratch.clear();
+            }
+            RecPayload::Opt(o) => {
+                if warm {
+                    vm.feats.on_opt_summary(o, rec.virt_ns);
+                } else {
+                    vm.on_opt_summary(o, &mut ctx);
+                }
+                fills_scratch.clear();
+            }
+        }
         while consumed < ctx.orders().len() {
             let order = ctx.orders()[consumed];
             engine.intake(&order, rec.virt_ns);
@@ -989,7 +1321,21 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             }
         }
     }
-    let outcome: ModelOutcome = engine.finish();
+    let oos_round_trips = vm.round_trips - rt_at_boundary.unwrap_or(vm.round_trips);
+    // Position rows of the committed table (the D-3 report field the
+    // worker keys the round-trip gate on).
+    let mut position_rows = 0u64;
+    {
+        let len = (table.len as usize).min(core_types::RULE_TABLE_ROWS);
+        let mut i = 0;
+        while i < len {
+            if table.rows[i].flags & core_types::ROW_FLAG_POSITION != 0 {
+                position_rows += 1;
+            }
+            i += 1;
+        }
+    }
+        let outcome: ModelOutcome = engine.finish();
 
     // ---- §5 report from the §4 model (fixed-point renders only) ----
     let vals = ReportValues {
@@ -1000,6 +1346,9 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         max_order_notional_1e6: ctx.max_order_notional_1e6(),
         max_symbol_notional_1e6: usd_1e12_to_1e6_ceil(outcome.max_symbol_notional_1e12),
         max_total_notional_1e6: usd_1e12_to_1e6_ceil(outcome.max_total_notional_1e12),
+        oos_round_trips,
+        oos_legs: outcome.oos_trades,
+        position_rows,
     };
     let stats = HarnessStats {
         runs: runs.len() as u64,
@@ -1034,6 +1383,15 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         oos_trading_days: outcome.oos_trading_days,
         max_symbol_notional_1e6: vals.max_symbol_notional_1e6,
         max_total_notional_1e6: vals.max_total_notional_1e6,
+        merged_events: run_summaries.iter().map(|r| r.events).sum(),
+        merged_depths: run_summaries.iter().map(|r| r.depths).sum(),
+        merged_opts: run_summaries.iter().map(|r| r.opts).sum(),
+        opt_synth_ticks: run_summaries.iter().map(|r| r.opt_synth_ticks).sum(),
+        remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
+        mark_fills: outcome.mark_fills,
+        warmup_end_virt_ns: warmup_end_virt,
+        oos_round_trips,
+        position_rows,
     };
     debug_assert_eq!(stats.vm_orders_emitted as usize, ctx.orders().len());
     debug_assert_eq!(
@@ -1448,14 +1806,23 @@ mod tests {
             max_order_notional_1e6: 50_000_000,
             max_symbol_notional_1e6: 0,
             max_total_notional_1e6: 0,
+            oos_round_trips: 2,
+            oos_legs: 4,
+            position_rows: 1,
         };
         let line = render_schema1("ab12", "70/30", &vals);
+        // VM2 V5 (D-3): schema stays 1; `round_trips`/`legs` are
+        // ADDITIVE inside "oos", `position_rows` additive top-level —
+        // the worker's get-based parser tolerates both (its pins
+        // cite the D-3 ruling).
         assert_eq!(
             line,
             "{\"schema_version\":1,\"ruleset_hash\":\"ab12\",\"split\":\"70/30\",\
              \"oos\":{\"net_pnl_usd\":0.0,\"trades\":0,\"trading_days\":0,\
-             \"max_drawdown_usd\":0.0},\"bounds\":{\"max_order_notional_usd\":50.0,\
-             \"max_symbol_notional_usd\":0.0,\"max_total_notional_usd\":0.0}}"
+             \"max_drawdown_usd\":0.0,\"round_trips\":2,\"legs\":4},\
+             \"bounds\":{\"max_order_notional_usd\":50.0,\
+             \"max_symbol_notional_usd\":0.0,\"max_total_notional_usd\":0.0},\
+             \"position_rows\":1}"
         );
     }
 
@@ -1467,7 +1834,7 @@ mod tests {
             venue,
             lord,
             idx,
-            tick: Tick::new(
+            payload: RecPayload::Tick(Tick::new(
                 ts,
                 VenueId::Polymarket,
                 1,
@@ -1476,7 +1843,7 @@ mod tests {
                 Qty::from_raw(1),
                 Price::from_raw(2),
                 Qty::from_raw(1),
-            ),
+            )),
         }
     }
 
@@ -1578,7 +1945,7 @@ mod tests {
     #[test]
     fn universe_is_sorted_deduped_and_skips_none() {
         let mk = |sym: u32| MergedRec {
-            tick: Tick::new(
+            payload: RecPayload::Tick(Tick::new(
                 0,
                 VenueId::Polymarket,
                 sym,
@@ -1587,7 +1954,7 @@ mod tests {
                 Qty::from_raw(1),
                 Price::from_raw(2),
                 Qty::from_raw(1),
-            ),
+            )),
             virt_ns: VIRT_T0,
             wall_ns: 0,
         };

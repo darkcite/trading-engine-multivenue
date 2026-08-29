@@ -174,6 +174,15 @@ const EMPTY_OPEN: OpenOrder = OpenOrder {
     client_oid: 0,
 };
 
+/// D-7 half-spread (VM2 V5): `max(0.5% of mark, 1 tick)` ×1e6 —
+/// flat per venue by ruling; the 1-tick floor stands in for the
+/// "1 IV-tick equivalent" at these mark scales (documented
+/// implementation choice, printed with every report that used it).
+#[inline]
+pub fn mark_half_spread_1e6(mark_1e6: i64) -> i64 {
+    (mark_1e6 / 200).max(1)
+}
+
 /// One synthesized fill (§3.6.4 feedback + accounting input).
 #[derive(Copy, Clone, Debug)]
 pub struct SynthFill {
@@ -403,6 +412,11 @@ pub struct ModelOutcome {
     pub canceled_end: u64,
     /// Peak simultaneous open orders (total).
     pub peak_open_total: u64,
+    /// VM2 V5 (D-7): fills executed under the OPTIONS MARK-FILL law
+    /// — immediate execution at mark ± half-spread with the TAKER
+    /// fee, for syms registered mark-filled (no real book exists to
+    /// be maker in). > 0 obliges the caller to PRINT the assumption.
+    pub mark_fills: u64,
     /// Peak simultaneous open orders on one sym.
     pub peak_open_per_sym: u64,
 }
@@ -447,6 +461,9 @@ pub struct FillEngine {
     bounds: BoundsTracker,
     dd: DdTracker,
     oos_days: BTreeSet<u64>,
+    /// D-7 mark-fill sym class (options with a synthetic mark book).
+    mark_fill_syms: BTreeSet<u32>,
+    mark_fills: u64,
     fills_total: u64,
     oos_trades: u64,
     orders_is: u64,
@@ -475,6 +492,8 @@ impl FillEngine {
             bounds: BoundsTracker::default(),
             dd: DdTracker::new(),
             oos_days: BTreeSet::new(),
+            mark_fill_syms: BTreeSet::new(),
+            mark_fills: 0,
             fills_total: 0,
             oos_trades: 0,
             orders_is: 0,
@@ -580,6 +599,17 @@ impl FillEngine {
         self.bounds.set_sym(sym, abs_notional);
     }
 
+    /// VM2 V5 (D-7): register `sym` as MARK-FILLED — an options
+    /// instrument whose "book" is a synthetic zero-spread mark tick.
+    /// Orders on such syms execute IMMEDIATELY (post-latency) at
+    /// `mark ± half-spread` with the venue's TAKER fee — the D-7 law:
+    /// no real displayed book exists to be maker in, so the model
+    /// charges the assumed spread + taker economics instead. Callers
+    /// that ever see `mark_fills > 0` MUST print the assumption.
+    pub fn set_mark_fill_sym(&mut self, sym: u32) {
+        self.mark_fill_syms.insert(sym);
+    }
+
     /// One merged record (§4.2): mark update first (a fill at this
     /// tick marks against THIS tick's mid — the adverse-selection-
     /// honest direction), then the strict-cross fill pass over the
@@ -608,6 +638,62 @@ impl FillEngine {
             if self.oos.on_mark(sym, old, mid) {
                 self.dd.sample(self.oos.equity_1e12());
             }
+        }
+
+        // ---- (b′) D-7 mark-fill pass (VM2 V5) ----
+        // Registered options syms: every active resting order fills
+        // in FULL at mark ± half-spread with the TAKER fee — buys pay
+        // `mark + h`, sells receive `mark − h`
+        // ([`mark_half_spread_1e6`]). Runs INSTEAD of the
+        // strict-cross pass for these syms (their ticks are synthetic
+        // zero-spread marks; displayed-size budgets are meaningless).
+        if two_sided && self.mark_fill_syms.contains(&sym) {
+            let mark = *self.marks_1e6.get(&sym).expect("mark just written");
+            let h = mark_half_spread_1e6(mark);
+            let mut i = 0usize;
+            while i < self.open_len {
+                let o = self.open[i];
+                if o.sym != sym || virt_ns < o.t_active_ns {
+                    i += 1;
+                    continue;
+                }
+                let (fill_px, fill_qty) = match o.side {
+                    Side::Bid => (mark + h, o.remaining_1e6),
+                    Side::Ask => ((mark - h).max(1), o.remaining_1e6),
+                };
+                let notional_1e12 = fill_px as i128 * fill_qty as i128;
+                let taker_bps = self.params.fee_bps[o.venue as usize].1;
+                let fee_1e12 = fee_ceil_1e12(notional_1e12, taker_bps);
+                self.full
+                    .apply_fill(sym, o.side, fill_px, fill_qty, fee_1e12, mark);
+                self.bounds_refresh(sym, mark);
+                if o.oos {
+                    self.oos
+                        .apply_fill(sym, o.side, fill_px, fill_qty, fee_1e12, mark);
+                    self.dd.sample(self.oos.equity_1e12());
+                    self.oos_trades += 1;
+                    self.oos_days.insert(wall_ns / DAY_NS);
+                }
+                self.fills_total += 1;
+                self.mark_fills += 1;
+                out.push(SynthFill {
+                    sym,
+                    side: o.side,
+                    px_1e6: fill_px,
+                    qty_1e6: fill_qty,
+                    fee_1e12,
+                    oos: o.oos,
+                    client_oid: o.client_oid,
+                });
+                // Full fill: compact (FIFO preserved).
+                let mut j = i;
+                while j + 1 < self.open_len {
+                    self.open[j] = self.open[j + 1];
+                    j += 1;
+                }
+                self.open_len -= 1;
+            }
+            return;
         }
 
         // ---- (b) strict-cross fill pass (§4.2) ----
@@ -720,6 +806,7 @@ impl FillEngine {
             canceled_end: self.canceled_end,
             peak_open_total: self.peak_open_total,
             peak_open_per_sym: self.peak_open_per_sym,
+            mark_fills: self.mark_fills,
         }
     }
 

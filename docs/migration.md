@@ -30,6 +30,57 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-30 — VM2 V5: multi-channel backtest, warmup, D-7 options mark-fill law, D-3 report/gate amendment
+
+**What changed**
+
+- The backtest merge carries funding/ctx `ChannelEvent`s, `DepthTopK`
+  and `OptSummary` records beside ticks (same §3.2/§3.3 total order
+  and VIRT rebase; lane ordinals extend the lord space), replayed
+  through the vm's REAL callbacks — every §1.1 feature evaluates in
+  replay exactly as live (§1.5).
+- Per-run sym REBIND (the §6 law's replay half): each run's manifest
+  joins by DESCRIPTOR to the newest run's, and every record's sym is
+  rewritten at load — options ordinals that reshuffle across boots
+  evaluate as ONE instrument.
+- WARMUP (§1.5, refined — recorded in vm2-plan §8): the longest
+  window the TABLE references (Roll windows; Apr24 ⇒ 24 h; Apr72 ⇒
+  72 h), 0 when none — features fill, no entries, split math
+  unchanged, `warmup_end_virt_ns` reported.
+- D-7 options mark-fill law in `backtest::fill` (shared by
+  audit-pnl): mark-bearing OptSummary records synthesize zero-spread
+  mark ticks for option syms without a tick lane; registered syms
+  execute IMMEDIATELY at `mark ± max(0.5%, 1 tick)` with TAKER fees
+  and value at mark; `mark_fills` counts and the assumption is
+  PRINTED wherever it shaped numbers. okx's markless summaries stay
+  feature-only (honestly unpriceable).
+- D-3: schema-1 gains ADDITIVE keys — `oos.round_trips`, `oos.legs`,
+  top-level `position_rows` (goldens updated; schema_version stays
+  1). The worker gate counts LEGS toward `min_trades` and folds the
+  position-ruleset floor `round_trips >= MIN_ROUND_TRIPS (10)` into
+  the same verdict — GateThresholds/GateResult keep their frozen
+  shapes; pre-V5 reports gate byte-identically (pinned by
+  `tests/test_backtest_d3.py`, ruling cited).
+
+**Why**
+
+- vm2-plan §4-V5: funding/IV/depth strategies must be honestly
+  backtestable through the frozen argv before V7's real backtests.
+
+**Impact**
+
+- On-disk formats: none. Config keys: none. Wire formats: schema-1
+  additive keys documented in the harness goldens; worker report
+  gains mirrored additive keys.
+
+**Migration steps**
+
+1. None — pre-V5 captures and reports replay/gate unchanged.
+
+**Rollback**
+
+- Revert the commit.
+
 ## 2026-08-30 — VM2 V4: validator v2 (descriptor resolution, rules 9–10), the §6 handoff flips to v2, v1 `RuleTable` retired
 
 **What changed**
