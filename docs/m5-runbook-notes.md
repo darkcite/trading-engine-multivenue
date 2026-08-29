@@ -148,3 +148,19 @@ tripwire backtest → stage-ruleset → commit-ruleset (H6b §4 flow);
 daily `audit-pnl --dir <run>` / `pnl` verb — s4-tagged orders =
 this lane. Watch: CVFC spread re-widening past 20 (the compression
 may be temporary), COTI persistence, bybit-venue unfreeze ruling.
+
+**Addendum (same session): the bybit unfreeze + the first real entry.**
+Operator APPROVED the D1-pattern unfreeze: "bybit" joined the push
+verb's `_VENUES` (cli.py; ruling cited in-code and in the new
+`test_push_order_intent_accepts_bybit_venue`). Engine-side needed
+NOTHING — the AiCmd shape law already admits any VenueId except Ai,
+and VenueId 6 = Bybit since WS9. carry_signal then gained full S1
+execution (long the more-negative venue / short the other; exit at
+directional <10% or age >10 d; ≤4 positions; one test reworked).
+Worker suite **485 passed** (frozen 202 untouched; test_cli 65).
+NEXT CYCLE ENTERED FOR REAL: **COTI short=bybit long=bn at
+spread24 −381.8% / 3d −105.9%** — push.sh reviewed + executed
+(seq 36/38), ai_cmds_total 6, zero rejects, **engine-orders.pmlr
+now carries 3 strategy_id-4 orders** (the demo + both COTI legs).
+The external-strategies lane is live in paper end-to-end; audit-pnl
+picks the s4 tag up from the next daily report.

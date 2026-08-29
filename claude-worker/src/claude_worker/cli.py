@@ -426,6 +426,12 @@ _VENUES: dict[str, int] = {
     "deribit": claude_worker.frames.VENUE_DERIBIT,
     "hyperliquid": claude_worker.frames.VENUE_HYPERLIQUID,
     "ai": claude_worker.frames.VENUE_AI,
+    # Operator ruling 2026-08-29 (M5 session 1, D1-pattern additive
+    # unfreeze): expose the WS9 Bybit venue byte to order-intents so
+    # the S1 pilot's Bybit legs are paper-addressable. Engine-side
+    # already accepts it (AiCmd shape law: OrderIntent takes any
+    # VenueId except Ai; VenueId 6 = Bybit since WS9).
+    "bybit": claude_worker.frames.VENUE_BYBIT,
 }
 _SIDES: dict[str, int] = {
     "bid": claude_worker.frames.SIDE_BID,

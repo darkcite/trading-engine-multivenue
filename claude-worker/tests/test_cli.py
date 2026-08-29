@@ -220,6 +220,37 @@ def test_push_order_intent_pins_ai_exec_slot(uds_env: tests.conftest.FakeUdsServ
     assert uds_env.cmd_field(1, "strategy_id") == claude_worker.frames.STRATEGY_SLOT_AI_EXEC
 
 
+def test_push_order_intent_accepts_bybit_venue(
+    uds_env: tests.conftest.FakeUdsServer,
+) -> None:
+    """Operator ruling 2026-08-29 (M5 session 1, the D1-pattern
+    additive unfreeze): "bybit" joined the push verb's venue table so
+    the S1 pilot's Bybit legs are paper-addressable. The engine-side
+    AiCmd shape law already admits VenueId 6 (WS9)."""
+    result = _invoke(
+        "push",
+        "--kind",
+        "order-intent",
+        "--sym",
+        "100663810",
+        "--venue",
+        "bybit",
+        "--side",
+        "ask",
+        "--px",
+        "0.20",
+        "--qty",
+        "10",
+        "--ttl-s",
+        "5",
+    )
+    assert result.exit_code == 0, result.output
+    _wait_for_frames(uds_env, 2)
+    assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_ORDER_INTENT
+    assert uds_env.cmd_field(1, "venue") == claude_worker.frames.VENUE_BYBIT
+    assert uds_env.cmd_field(1, "strategy_id") == claude_worker.frames.STRATEGY_SLOT_AI_EXEC
+
+
 def test_push_set_param_and_halt(uds_env: tests.conftest.FakeUdsServer) -> None:
     result = _invoke(
         "push", "--kind", "set-param", "--strategy", "1", "--param-id", "3", "--px", "0.5"

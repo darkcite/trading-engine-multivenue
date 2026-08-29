@@ -19,10 +19,11 @@ precedent). One cycle:
      majors (BTC/ETH) computed but EXCLUDED from entry by the doc's
      own economics.
    - **S1 pilot** (Consolidated §5.1, operator-ruled FIXED name set):
-     Binance↔Bybit |spread| with the 50%/30% entry confirms —
-     SIGNAL + DIGEST ONLY in v1: the AiCmd wire has no Bybit venue
-     byte, so S1 leg intents are not addressable (recorded, not
-     worked around).
+     Binance↔Bybit |spread| with the 50%/30% entry confirms; exits
+     at directional spread < 10% or age > 10 d. EXECUTABLE since the
+     operator's 2026-08-29 bybit venue-table unfreeze (D1 pattern) —
+     long the more-negative-funding venue, short the other, both
+     legs as paper intents.
 3. Emit, under ``~/multivenue/worker/carry/``: the intent batch JSON,
    a ``push.sh`` of exact ``claude-worker push`` verb lines (the
    session reviews then executes it — frames stay verb-built), a
@@ -73,13 +74,19 @@ LEG_NOTIONAL_USD: float = 90.0  # under the $100/order validator cap
 INTENT_TTL_S: float = 3600.0
 CROSS_SLIP: float = 0.01
 
-# Descriptor prefixes whose venue is addressable by the AiCmd wire
-# (frames.py has no Bybit venue byte — S1 stays digest-only in v1).
+# Descriptor prefixes whose venue is addressable by the AiCmd wire.
 INTENT_VENUE_BY_PREFIX: dict[str, str] = {
     "hyperliquid": "hyperliquid",
     "deribit": "deribit",
     "binance-usdm": "binance",
+    # Operator ruling 2026-08-29: the bybit venue-table unfreeze.
+    "bybit-linear": "bybit",
+    "bybit": "bybit",
 }
+
+S1_MAX_POSITIONS: int = 4
+S1_EXIT_DIRECTIONAL_APR: float = 0.10
+S1_MAX_AGE_H: float = 240.0
 
 WINDOW_24H_MS: int = 24 * 3600 * 1000
 WINDOW_3D_MS: int = 3 * WINDOW_24H_MS
@@ -407,10 +414,54 @@ def decide_cvfc(
     return intents, lines, notes
 
 
+def explicit_leg_intents(
+    tag: str,
+    leg_specs: list[tuple[str, str]],
+    market_map: dict[str, int],
+    marks: dict[int, tuple[float, float]],
+) -> tuple[list[Intent], list[str]]:
+    """Crossing intents for explicit (descriptor, side) legs — all
+    legs must be addressable+priced or the pair is skipped whole."""
+    intents: list[Intent] = []
+    skips: list[str] = []
+    for desc, side in leg_specs:
+        prefix = desc.split(":", 1)[0]
+        venue = INTENT_VENUE_BY_PREFIX.get(prefix)
+        if venue is None:
+            skips.append(f"{desc}: venue not intent-addressable")
+            continue
+        sym = market_map.get(desc)
+        if sym is None:
+            skips.append(f"{desc}: no market-map entry")
+            continue
+        mark = marks.get(sym)
+        if mark is None:
+            skips.append(f"{desc}: no captured mark (features)")
+            continue
+        px = crossing_px(side, mark[0], mark[1])
+        if px <= 0:
+            skips.append(f"{desc}: degenerate mark")
+            continue
+        qty = round(LEG_NOTIONAL_USD / px, 6)
+        intents.append(Intent(tag, desc, sym, venue, side, px, qty, INTENT_TTL_S))
+    if skips:
+        return [], skips
+    return intents, []
+
+
 def decide_s1(
-    conn: sqlite3.Connection, now_ms: int
-) -> list[str]:
-    """S1 pilot signal — digest only (Bybit not intent-addressable)."""
+    conn: sqlite3.Connection,
+    state: dict,
+    market_map: dict[str, int],
+    marks: dict[int, tuple[float, float]],
+    now_ms: int,
+) -> tuple[list[Intent], list[str], list[str]]:
+    """S1 pilot per Consolidated §5.1 — executable pairs since the
+    bybit unfreeze. Mutates ``state['s1_positions']``."""
+    intents: list[Intent] = []
+    notes: list[str] = []
+    positions: list[dict] = state.setdefault("s1_positions", [])
+    held = {p["name"]: p for p in positions}
     lines: list[str] = []
     for name in S1_PILOT:
         bn_desc = f"binance-usdm:{name.lower()}"
@@ -440,11 +491,81 @@ def decide_s1(
             sp3 is not None and abs(sp3) >= S1_CONFIRM_3D_APR
         )
         s3txt = f"{sp3:+.1%}" if sp3 is not None else "n/a"
-        lines.append(
-            f"  {name:13s} spread24={sp24:+.1%} spread3d={s3txt}"
-            f" {'QUALIFIES (digest-only: no bybit intent venue)' if qualifies else ''}"
-        )
-    return lines
+
+        pos = held.get(name)
+        if pos is not None:
+            # Directional held spread: apr(short venue) − apr(long).
+            aprs = {"bn": bn24, "bybit": by24}
+            directional = aprs[pos["short"]] - aprs[pos["long"]]
+            age_h = (now_ms - pos["entered_ms"]) / 3_600_000.0
+            if directional < S1_EXIT_DIRECTIONAL_APR or age_h > S1_MAX_AGE_H:
+                legs, skips = explicit_leg_intents(
+                    f"s1-exit-{name}",
+                    [
+                        (pos["short_desc"], "bid"),
+                        (pos["long_desc"], "ask"),
+                    ],
+                    market_map,
+                    marks,
+                )
+                if skips:
+                    notes.extend(skips)
+                    lines.append(f"  {name:13s} EXIT-BLOCKED: {'; '.join(skips)}")
+                    continue
+                intents.extend(legs)
+                positions[:] = [p for p in positions if p["name"] != name]
+                lines.append(
+                    f"  {name:13s} EXIT directional={directional:+.1%} age={age_h:.0f}h"
+                )
+            else:
+                lines.append(
+                    f"  {name:13s} HELD directional={directional:+.1%} age={age_h:.0f}h"
+                )
+            continue
+
+        if qualifies and len(positions) < S1_MAX_POSITIONS:
+            # Long the more-negative venue, short the other (§5.1).
+            if bn24 < by24:
+                long_kind, long_desc = "bn", f"binance-usdm:{name.lower()}"
+                short_kind, short_desc = "bybit", f"bybit-linear:{name}"
+            else:
+                long_kind, long_desc = "bybit", f"bybit-linear:{name}"
+                short_kind, short_desc = "bn", f"binance-usdm:{name.lower()}"
+            legs, skips = explicit_leg_intents(
+                f"s1-entry-{name}",
+                [(short_desc, "ask"), (long_desc, "bid")],
+                market_map,
+                marks,
+            )
+            if skips:
+                notes.extend(skips)
+                lines.append(
+                    f"  {name:13s} spread24={sp24:+.1%} spread3d={s3txt}"
+                    f" QUALIFIES — NOT executable: {'; '.join(skips)}"
+                )
+                continue
+            intents.extend(legs)
+            positions.append(
+                {
+                    "name": name,
+                    "short": short_kind,
+                    "long": long_kind,
+                    "short_desc": short_desc,
+                    "long_desc": long_desc,
+                    "entered_ms": now_ms,
+                    "entry_spread": sp24,
+                }
+            )
+            lines.append(
+                f"  {name:13s} ENTER short={short_kind} long={long_kind}"
+                f" spread24={sp24:+.1%} spread3d={s3txt}"
+            )
+        else:
+            lines.append(
+                f"  {name:13s} spread24={sp24:+.1%} spread3d={s3txt}"
+                f" {'QUALIFIES (slots full)' if qualifies else ''}"
+            )
+    return intents, lines, notes
 
 
 # ---------------------------------------------------------------
@@ -490,7 +611,11 @@ def run_cycle(
         intents, cvfc_lines, notes = decide_cvfc(
             conn, state, market_map, marks, now
         )
-        s1_lines = decide_s1(conn, now)
+        s1_intents, s1_lines, s1_notes = decide_s1(
+            conn, state, market_map, marks, now
+        )
+        intents.extend(s1_intents)
+        notes.extend(s1_notes)
     finally:
         conn.close()
 
@@ -508,7 +633,7 @@ def run_cycle(
         f" cadence law incl. deribit interest_8h/8)",
         "CVFC-1 board (24h APR by leg; majors excluded from entry):",
         *cvfc_lines,
-        "S1 pilot (BN vs Bybit; digest-only in v1 — no bybit intent venue):",
+        "S1 pilot (BN vs Bybit; executable since the bybit unfreeze):",
         *s1_lines,
         f"intents: {len(intents)}"
         + (f" — push.sh ready" if intents else " — nothing to push"),

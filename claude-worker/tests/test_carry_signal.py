@@ -214,17 +214,44 @@ def test_cvfc_signal_without_marks_is_reported_not_pushed(tmp_path):
     assert state["positions"] == []  # nothing recorded as held
 
 
-def test_s1_pilot_is_digest_only(tmp_path):
+def test_s1_enters_both_legs_since_the_bybit_unfreeze(tmp_path):
+    """Operator ruling 2026-08-29: bybit venue-table unfreeze — the S1
+    pair opens as TWO paper legs, long the more-negative venue."""
     db, features, map_path, out = fixture_world(tmp_path)
-    # A qualifying S1 name: |spread24| >= 50% ann with 3d confirm.
+    # Qualifying: bn deeply negative vs bybit ⇒ LONG bn, SHORT bybit.
     put_rates(db, "binance-usdm:cotiusdt", eight_hourly(-2e-3, prints=9))
     put_rates(db, "bybit-linear:COTIUSDT", eight_hourly(1e-4, prints=9))
+    # marks + map for both legs
+    fdir = features / "run-1"
+    for sym, px in ((7003, 0.005), (7004, 0.005)):
+        (fdir / f"{sym}.json").write_text(
+            json.dumps(
+                {
+                    "sym": sym,
+                    "last_bid_px": int(px * 1e6),
+                    "last_ask_px": int(px * 1e6) + 10,
+                }
+            )
+        )
+    m = json.loads(map_path.read_text())
+    m["markets"]["binance-usdm:cotiusdt"] = 7003
+    m["markets"]["bybit-linear:COTIUSDT"] = 7004
+    map_path.write_text(json.dumps(m))
+
     digest = run(tmp_path, db, features, map_path, out)
     body = digest.read_text()
-    assert "COTIUSDT" in body and "QUALIFIES" in body
+    assert "COTIUSDT" in body and "ENTER short=bybit long=bn" in body
     batch = json.loads(sorted(out.glob("batch-*.json"))[0].read_text())
-    for i in batch["intents"]:
-        assert "bybit" not in i["venue"]
+    s1 = [i for i in batch["intents"] if i["tag"].startswith("s1-entry-")]
+    assert len(s1) == 2
+    by_venue = {i["venue"]: i for i in s1}
+    assert by_venue["bybit"]["side"] == "ask"  # short the rich venue
+    assert by_venue["binance"]["side"] == "bid"  # long the negative venue
+    for i in s1:
+        assert i["px"] * i["qty"] <= 100.0
+    state = json.loads((out / "state.json").read_text())
+    assert len(state["s1_positions"]) == 1
+    assert state["s1_positions"][0]["name"] == "COTIUSDT"
 
 
 def test_push_sh_renders_exact_verb_lines(tmp_path):
