@@ -48,7 +48,8 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, Fill, NsTs, Order, RuleTableSlot, Signal,
-    SymbolId, Tick, VenueId, AI_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    SymbolId, Tick, VenueId, AI_RING_SIZE, EVENT_LANE_FUNDING, EVENT_RING_SIZE,
+    RULE_TABLE_RING_SLOTS,
 };
 use engine::{
     Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
@@ -271,6 +272,11 @@ pub struct Rings {
     /// `AI_INGRESS_HMAC_KEY` ⇒ producer dropped, ring reads empty
     /// forever.
     pub ruleset_tables: Arc<Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>>,
+    /// WS10-A: one venue-event ring per tick lane (same indexing).
+    /// Producers ride into the four funding-capable venue spawns
+    /// (bn/okx/deribit/bybit); PM and RPC lanes never see a producer
+    /// push (§3.3 unspawned shape — the engine drains them empty).
+    pub event: [Arc<Ring<ChannelEvent, EVENT_RING_SIZE>>; engine::NUM_EVENT_LANES],
 }
 
 impl Rings {
@@ -289,6 +295,14 @@ impl Rings {
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
+            event: [
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+            ],
         }
     }
 }
@@ -472,6 +486,7 @@ pub fn spawn_binance(
     tls_config: RustlsConfig,
     sym: core_types::SymbolId,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -531,6 +546,8 @@ pub fn spawn_binance(
                     ep.host.as_bytes(),
                     ep.path.as_bytes(),
                     &mut producer,
+                    &mut event_tx,
+                    EVENT_LANE_FUNDING,
                     &mut poll,
                     &mut events,
                     token,
@@ -597,6 +614,7 @@ pub fn spawn_binance_multi(
     specs: Vec<BinanceConnSpec>,
     tls_config: RustlsConfig,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -679,6 +697,8 @@ pub fn spawn_binance_multi(
             let res = bwl::run_multi(
                 &mut conns,
                 &mut producer,
+                &mut event_tx,
+                EVENT_LANE_FUNDING,
                 &mut poll,
                 &mut events,
                 &SHUTDOWN,
@@ -721,6 +741,7 @@ pub fn spawn_bybit(
     specs: Vec<BybitConnSpec>,
     tls_config: RustlsConfig,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -789,6 +810,8 @@ pub fn spawn_bybit(
             let res = ywl::run_multi(
                 &mut conns,
                 &mut producer,
+                &mut event_tx,
+                EVENT_LANE_FUNDING,
                 &mut poll,
                 &mut events,
                 &SHUTDOWN,
@@ -953,6 +976,7 @@ pub fn spawn_okx(
     depth_enabled: bool,
     opt_families: Vec<String>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1015,6 +1039,8 @@ pub fn spawn_okx(
                     ep.host.as_bytes(),
                     ep.path.as_bytes(),
                     &mut producer,
+                    &mut event_tx,
+                    EVENT_LANE_FUNDING,
                     &mut poll,
                     &mut events,
                     token,
@@ -1218,6 +1244,7 @@ pub fn spawn_deribit(
     depth_enabled: bool,
     dvol_indices: Vec<String>,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1281,6 +1308,8 @@ pub fn spawn_deribit(
                     ep.host.as_bytes(),
                     ep.path.as_bytes(),
                     &mut producer,
+                    &mut event_tx,
+                    EVENT_LANE_FUNDING,
                     &mut poll,
                     &mut events,
                     token,
@@ -1896,6 +1925,8 @@ pub struct DrainCounters {
     pub other_venue_ticks: u64,
     /// RPC signals observed.
     pub rpc_signals: u64,
+    /// WS10-A: venue events observed (all event lanes combined).
+    pub venue_events: u64,
 }
 
 impl DrainCounters {
@@ -1906,6 +1937,7 @@ impl DrainCounters {
         self.binance_ticks += other.binance_ticks;
         self.other_venue_ticks += other.other_venue_ticks;
         self.rpc_signals += other.rpc_signals;
+        self.venue_events += other.venue_events;
     }
 }
 
@@ -1914,6 +1946,9 @@ impl DrainCounters {
 pub struct Consumers {
     /// Tick-lane consumers, indexed by `VenueId as usize` (§3.3).
     pub tick_lanes: [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+    /// WS10-A: venue-event lane consumers, tick-lane indexing. Lanes
+    /// without a producing venue read empty forever (§3.3).
+    pub event_lanes: [Consumer<ChannelEvent, EVENT_RING_SIZE>; engine::NUM_EVENT_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
@@ -1967,6 +2002,20 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
             }
             lane += 1;
         }
+        // WS10-A: keep the event lanes drained in capture-only mode
+        // too — the events are already in capture; an undrained lane
+        // would fill within minutes and pollute event_ring_drops.
+        let mut lane = 0;
+        while lane < engine::NUM_EVENT_LANES {
+            for _ in 0..DRAIN_BATCH {
+                if cons.event_lanes[lane].try_pop().is_some() {
+                    period.venue_events += 1;
+                } else {
+                    break;
+                }
+            }
+            lane += 1;
+        }
         for _ in 0..DRAIN_BATCH {
             if cons.rpc_signal.try_pop().is_some() {
                 period.rpc_signals += 1;
@@ -1983,6 +2032,7 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 bn_ticks = period.binance_ticks,
                 other_ticks = period.other_venue_ticks,
                 rpc_sigs = period.rpc_signals,
+                venue_events = period.venue_events,
                 "5s ring summary"
             );
             period = DrainCounters::default();
@@ -2618,7 +2668,7 @@ impl Observability {
     }
 }
 
-/// Register the seven §6.4 counters for one ingress. Boot-only.
+/// Register the per-ingress §6.4 counters for one ingress. Boot-only.
 fn register_ingress_counters(
     reg: &mut core_metrics::MetricsRegistry,
     venue: &str,
@@ -2638,6 +2688,7 @@ fn register_ingress_counters(
         ring_drops: one("ring_drops")?,
         ticks: one("ticks")?,
         sub_drops: one("sub_drops")?,
+        event_ring_drops: one("event_ring_drops")?,
     })
 }
 
@@ -2898,6 +2949,9 @@ pub struct IngressCounterIds {
     /// WS2: non-fatal subscribe drops
     /// (`engine_ingress_<venue>_sub_drops_total`).
     pub sub_drops: core_metrics::CounterId,
+    /// WS10-A: venue-event lane pushes refused by a full ring
+    /// (`engine_ingress_<venue>_event_ring_drops_total`).
+    pub event_ring_drops: core_metrics::CounterId,
 }
 
 /// Registry handles for the Phase-8f AI ingress family
@@ -3359,6 +3413,7 @@ struct IngressCountersSnapshot {
     ring_drops: u64,
     ticks: u64,
     sub_drops: u64,
+    event_ring_drops: u64,
 }
 
 /// Mirror one ingress status slot into its registry counters as
@@ -3379,6 +3434,7 @@ fn mirror_ingress_counters(
         ring_drops: st.ring_drops_total(),
         ticks: st.ticks_total(),
         sub_drops: st.sub_drops_total(),
+        event_ring_drops: st.event_ring_drops_total(),
     };
     reg.counter(ids.msgs)
         .inc(cur.msgs.saturating_sub(last.msgs));
@@ -3398,6 +3454,8 @@ fn mirror_ingress_counters(
         .inc(cur.ticks.saturating_sub(last.ticks));
     reg.counter(ids.sub_drops)
         .inc(cur.sub_drops.saturating_sub(last.sub_drops));
+    reg.counter(ids.event_ring_drops)
+        .inc(cur.event_ring_drops.saturating_sub(last.event_ring_drops));
     *last = cur;
 }
 
@@ -3450,6 +3508,7 @@ where
     // per-venue fill-lane producers.
     let Consumers {
         tick_lanes,
+        event_lanes,
         rpc_signal,
         fill_lanes,
         ai_cmds,
@@ -3461,6 +3520,7 @@ where
         strat,
         disp,
         tick_lanes,
+        event_lanes,
         rpc_signal,
         fill_lanes,
         ai_cmds,
@@ -5504,8 +5564,20 @@ mod tests {
                 it.next().unwrap(),
             ]
         };
+        let event_lanes = {
+            let mut it = rings.event.iter().map(|r| r.clone().split().1);
+            [
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+            ]
+        };
         Consumers {
             tick_lanes,
+            event_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
@@ -5613,18 +5685,21 @@ mod tests {
             binance_ticks: 2,
             other_venue_ticks: 0,
             rpc_signals: 3,
+            venue_events: 4,
         };
         let b = DrainCounters {
             polymarket_ticks: 10,
             binance_ticks: 20,
             other_venue_ticks: 5,
             rpc_signals: 30,
+            venue_events: 40,
         };
         a.add(&b);
         assert_eq!(a.polymarket_ticks, 11);
         assert_eq!(a.binance_ticks, 22);
         assert_eq!(a.other_venue_ticks, 5);
         assert_eq!(a.rpc_signals, 33);
+        assert_eq!(a.venue_events, 44);
     }
 
     /// Drain loop must exit promptly when `SHUTDOWN` is set, and

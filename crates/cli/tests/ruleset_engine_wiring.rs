@@ -138,6 +138,21 @@ fn harness(tag: &str) -> Harness {
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // WS10-A: venue-event lanes ride in every engine (producers
+    // dropped — the lanes read empty; this harness exercises the
+    // ruleset plumbing, not funding).
+    let (_e0p, e0) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e1p, e1) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e2p, e2) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e3p, e3) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e4p, e4) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e5p, e5) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -149,6 +164,7 @@ fn harness(tag: &str) -> Harness {
         StrategySet::new(BIT_VM),
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5],
+        [e0, e1, e2, e3, e4, e5],
         sc,
         [f0, f1, f2, f3],
         ai_cons,

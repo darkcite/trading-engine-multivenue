@@ -398,6 +398,12 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
 
     let ring: std::sync::Arc<Ring<Tick, { bwl::DEFAULT_TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
+    // WS10-A: event lane built boot-side; the measured pushes/
+    // drops below must be 0 B/op like everything else.
+    let event_ring: std::sync::Arc<
+        Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
+    > = Ring::new();
+    let (mut etx, _erx) = event_ring.split();
 
     // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
     // the measured window below proves the entire capture path (tick +
@@ -423,6 +429,8 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -453,6 +461,8 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -482,6 +492,8 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
             b"h",
             b"/",
             &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
             &status,
             &mut capture,
         )
@@ -1273,6 +1285,23 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // WS10-A: six venue-event lanes ride in every engine. Lane 2
+    // (OKX) gets a live producer — the measured window below pushes
+    // one funding ChannelEvent per iteration and the engine drains
+    // it through `on_venue_event`, proving lane push + drain are
+    // 0 B/op; the other five read empty (two atomic loads each).
+    let (mut ev2_p, e2) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e0p, e0) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e1p, e1) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e3p, e3) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e4p, e4) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e5p, e5) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -1294,6 +1323,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         NoopStrat,
         PaperDispatcher::new(),
         [t0, t1, t2, t3, t4, t5],
+        [e0, e1, e2, e3, e4, e5],
         sc,
         [f0, f1, f2, f3],
         ai_c,
@@ -1321,7 +1351,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let g = AllocGuard::new();
     let mut acc: u64 = 0;
     for i in 0..10_000u32 {
-        // Push one tick + drain one.
+        // Push one tick + one funding event, drain both (WS10-A: the
+        // event-lane push + `on_venue_event` drain ride the same
+        // 0 B/op assertion).
         pm_p.try_push(Tick::new(
             (i as u64) * 1000,
             VenueId::Polymarket,
@@ -1333,10 +1365,23 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             Qty::from_raw(0),
         ))
         .unwrap();
+        ev2_p
+            .try_push(core_types::ChannelEvent::new(
+                (i as u64) * 1000,
+                VenueId::Okx,
+                core_types::ChannelId::Funding,
+                1,
+                0,
+                0,
+                125,
+                0,
+            ))
+            .unwrap();
         eng.tick(1);
         acc = acc.wrapping_add(eng.ingest_p50_ns());
     }
     std::hint::black_box(acc);
+    assert_eq!(eng.events_dispatched, 10_000, "event lane drained");
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
@@ -1489,6 +1534,12 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
 
     let ring: std::sync::Arc<Ring<Tick, { owl::TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
+    // WS10-A: event lane built boot-side; the measured pushes/
+    // drops below must be 0 B/op like everything else.
+    let event_ring: std::sync::Arc<
+        Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
+    > = Ring::new();
+    let (mut etx, _erx) = event_ring.split();
 
     // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
     // the measured window below proves the entire capture path (tick +
@@ -1514,6 +1565,8 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -1544,6 +1597,8 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -1609,6 +1664,8 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
             b"h",
             b"/",
             &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
             &status,
             &mut capture,
         )
@@ -1793,6 +1850,12 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
 
     let ring: std::sync::Arc<Ring<Tick, { dwl::TICK_RING_CAP }>> = Ring::new();
     let (mut prod, mut cons) = ring.split();
+    // WS10-A: event lane built boot-side; the measured pushes/
+    // drops below must be 0 B/op like everything else.
+    let event_ring: std::sync::Arc<
+        Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
+    > = Ring::new();
+    let (mut etx, _erx) = event_ring.split();
 
     // §6.5 capture: REAL PmlrCapture with the raw tap in `All` mode —
     // the measured window below proves the entire capture path (tick +
@@ -1818,6 +1881,8 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -1848,6 +1913,8 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -1884,6 +1951,8 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
         b"h",
         b"/",
         &mut prod,
+        &mut etx,
+        core_types::EVENT_LANE_FUNDING,
         &status,
         &mut capture,
     )
@@ -1947,6 +2016,8 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
             b"h",
             b"/",
             &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
             &status,
             &mut capture,
         )

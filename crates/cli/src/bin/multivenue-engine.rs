@@ -1011,6 +1011,25 @@ fn run(args: RunArgs) -> ExitCode {
     // WS9: lane 5 = Bybit (VenueId 6 — lane≠venue past Ai, see
     // engine::tick_lane_of).
     let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
+    // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
+    // into the four funding-capable venue spawns; PM (0) and the
+    // spare lane 4 producer for HL are dropped — HL carries premium
+    // inside its AssetCtx capture events and gains a lane push only
+    // when a funding-bearing channel exists for it.
+    let (bn_event_prod, bn_event_cons) = rings.event[1].clone().split();
+    let (okx_event_prod, okx_event_cons) = rings.event[2].clone().split();
+    let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
+    let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
+    let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
+    let (_hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
+    let event_lane_cons = [
+        pm_event_cons,
+        bn_event_cons,
+        okx_event_cons,
+        deribit_event_cons,
+        hl_event_cons,
+        bybit_event_cons,
+    ];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let fill_lane_cons = {
         let (_f0p, f0) = rings.fill[0].clone().split();
@@ -1259,6 +1278,7 @@ fn run(args: RunArgs) -> ExitCode {
             specs,
             tls_config.clone(),
             bn_prod,
+            bn_event_prod,
             statuses.binance.clone(),
             2,
             &run_dir,
@@ -1288,6 +1308,7 @@ fn run(args: RunArgs) -> ExitCode {
             tls_config.clone(),
             boot.allocated.bn_spot[0].sym,
             bn_prod,
+            bn_event_prod,
             statuses.binance.clone(),
             2,
             &run_dir,
@@ -1320,6 +1341,7 @@ fn run(args: RunArgs) -> ExitCode {
             // M2.3: family-keyed opt-summary subscription args.
             boot.okx_options.underlyings.clone(),
             okx_prod,
+            okx_event_prod,
             statuses.okx.clone(),
             5,
             &run_dir,
@@ -1337,9 +1359,10 @@ fn run(args: RunArgs) -> ExitCode {
         handles.push(okx_handle);
     } else {
         info!("--okx-symbols empty / unset; OKX ingress thread not started");
-        // Drop the producer side so the lane stays a permanently-
-        // empty ring (the unspawned-venue shape, §3.3).
+        // Drop the producer sides so the lanes stay permanently-
+        // empty rings (the unspawned-venue shape, §3.3).
         drop(okx_prod);
+        drop(okx_event_prod);
     }
 
     // Deribit rides core 6 per the §9 core map.
@@ -1368,6 +1391,7 @@ fn run(args: RunArgs) -> ExitCode {
             boot.deribit_depth,
             dvol_indices,
             deribit_prod,
+            deribit_event_prod,
             statuses.deribit.clone(),
             6,
             &run_dir,
@@ -1385,9 +1409,10 @@ fn run(args: RunArgs) -> ExitCode {
         handles.push(deribit_handle);
     } else {
         info!("--deribit-symbols empty / unset; Deribit ingress thread not started");
-        // Drop the producer side so the lane stays a permanently-
-        // empty ring (the unspawned-venue shape, §3.3).
+        // Drop the producer sides so the lanes stay permanently-
+        // empty rings (the unspawned-venue shape, §3.3).
         drop(deribit_prod);
+        drop(deribit_event_prod);
     }
 
     // Hyperliquid rides core 7 per the §9 core map.
@@ -1468,6 +1493,7 @@ fn run(args: RunArgs) -> ExitCode {
             specs,
             tls_config.clone(),
             bybit_prod,
+            bybit_event_prod,
             statuses.bybit.clone(),
             8,
             &run_dir,
@@ -1484,9 +1510,10 @@ fn run(args: RunArgs) -> ExitCode {
         };
         handles.push(bybit_handle);
     } else {
-        // Drop the producer side so the lane stays a permanently-
-        // empty ring (the unspawned-venue shape, §3.3).
+        // Drop the producer sides so the lanes stay permanently-
+        // empty rings (the unspawned-venue shape, §3.3).
         drop(bybit_prod);
+        drop(bybit_event_prod);
     }
 
     if let Some(polygon_path) = args.polygon_path {
@@ -1607,6 +1634,7 @@ fn run(args: RunArgs) -> ExitCode {
             hl_lane_cons,
             bybit_lane_cons,
         ],
+        event_lanes: event_lane_cons,
         rpc_signal: rpc_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
