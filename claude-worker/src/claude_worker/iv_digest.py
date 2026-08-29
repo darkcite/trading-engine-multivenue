@@ -53,11 +53,9 @@ Convention: full ``import x`` only. No ``from x import y``.
 """
 
 import argparse
-import mmap
 import os
 import pathlib
 import sqlite3
-import struct
 import sys
 import time
 import typing
@@ -66,16 +64,10 @@ import claude_worker.features
 import claude_worker.frames
 import claude_worker.pmlr
 
-# SlotKind 6 (docs/wire-format.md `OptSummary`) — pmlr.py stops at 5;
-# fold-in candidate for the next M3 window.
-SLOT_KIND_OPT_SUMMARY: int = 6
-
-# The whole 64-byte slot is field-covered (no tail pad): ts u64 · sym
-# u32 · venue u8 · flags u8 · pad2 · 4×i64 (mark_px_1e9, mark_iv_1e9,
-# underlying_px_1e9, open_interest_1e6) · 4×i32 (delta_1e9, gamma_1e9,
-# vega_1e6, theta_1e6).
-_OPT: struct.Struct = struct.Struct("<QIBB2xqqqqiiii")
-assert _OPT.size == claude_worker.pmlr.SLOT_SIZE
+# WS11 (D5 fold-in LANDED): the kind-6 decode + reader live in
+# pmlr.py now — these aliases keep this module's (and its tests')
+# names stable while the local definitions retire.
+SLOT_KIND_OPT_SUMMARY: int = claude_worker.pmlr.SLOT_KIND_OPT_SUMMARY
 
 FLAG_MARK_PX: int = 1
 FLAG_OPEN_INTEREST: int = 2
@@ -125,92 +117,12 @@ CREATE TABLE IF NOT EXISTS iv_digest (
 """
 
 
-class OptRec(typing.NamedTuple):
-    """One decoded `OptSummary` slot (docs/wire-format.md)."""
-
-    ts_ns: int
-    sym: int
-    venue: int
-    flags: int
-    mark_px_1e9: int
-    mark_iv_1e9: int
-    underlying_px_1e9: int
-    open_interest_1e6: int
-    delta_1e9: int
-    gamma_1e9: int
-    vega_1e6: int
-    theta_1e6: int
-
-
-class OptReader:
-    """Kind-6 sibling of ``claude_worker.pmlr.Reader`` (which refuses
-    unknown slot kinds by design). Same container rules: mmap'd
-    read-only, header REUSED from the pmlr reader (one layout, no
-    drift), torn trailing slot tolerated (the engine may be
-    mid-flush). Raises ``pmlr.PmlrError`` on a malformed container or
-    a non-kind-6 file."""
-
-    def __init__(self, path: pathlib.Path) -> None:
-        self._file = path.open("rb")
-        try:
-            size = path.stat().st_size
-            if size < claude_worker.pmlr.HEADER_SIZE:
-                raise claude_worker.pmlr.PmlrError(
-                    f"{path}: truncated before header ({size} B)"
-                )
-            self._map: mmap.mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        except BaseException:
-            self._file.close()
-            raise
-        try:
-            magic, version, slot_kind, epoch_ns = claude_worker.pmlr._HEADER.unpack_from(  # noqa: SLF001 — reader-defined layout, deliberately (craft.py precedent)
-                self._map, 0
-            )
-            if magic != claude_worker.pmlr.MAGIC:
-                raise claude_worker.pmlr.PmlrError(f"{path}: bad magic {magic!r}")
-            if version > claude_worker.pmlr.VERSION_MAX:
-                raise claude_worker.pmlr.PmlrError(
-                    f"{path}: version {version} unsupported (max {claude_worker.pmlr.VERSION_MAX})"
-                )
-            if slot_kind != SLOT_KIND_OPT_SUMMARY:
-                raise claude_worker.pmlr.PmlrError(
-                    f"{path}: slot kind {slot_kind} is not OptSummary ({SLOT_KIND_OPT_SUMMARY})"
-                )
-        except BaseException:
-            self.close()
-            raise
-        self.version: int = int(version)
-        self.epoch_ns: int = int(epoch_ns)
-        payload = size - claude_worker.pmlr.HEADER_SIZE
-        self._count: int = payload // claude_worker.pmlr.SLOT_SIZE
-        self.torn: bool = payload % claude_worker.pmlr.SLOT_SIZE != 0
-
-    def close(self) -> None:
-        """Unmap and close. Idempotent."""
-        if hasattr(self, "_map"):
-            self._map.close()
-        self._file.close()
-
-    def __enter__(self) -> "OptReader":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    def __len__(self) -> int:
-        return self._count
-
-    def record(self, index: int) -> OptRec:
-        """Decode slot ``index`` (unpack_from straight off the map)."""
-        if index < 0 or index >= self._count:
-            raise IndexError(f"slot {index} out of range ({self._count} records)")
-        offset = claude_worker.pmlr.HEADER_SIZE + index * claude_worker.pmlr.SLOT_SIZE
-        return OptRec._make(_OPT.unpack_from(self._map, offset))
-
-    def records(self) -> typing.Iterator[OptRec]:
-        """All records, in file (= venue-thread time) order."""
-        for i in range(self._count):
-            yield self.record(i)
+# WS11 (D5): the reader + record + slot struct retire into pmlr.py;
+# aliases keep every existing consumer/test name working unchanged
+# (tests pack fixture slots through `_OPT`).
+OptRec = claude_worker.pmlr.OptSummaryRec
+OptReader = claude_worker.pmlr.OptSummaryReader
+_OPT = claude_worker.pmlr._OPT_SUMMARY  # noqa: SLF001
 
 
 class Snapshot(typing.NamedTuple):
@@ -303,21 +215,8 @@ def read_manifest(run_dir: pathlib.Path) -> tuple[dict[tuple[int, int], str], in
     return out, malformed
 
 
-def _run_anchor_ns(run_dir: pathlib.Path) -> int | None:
-    """The run's monotonic anchor — min first-ts across its readable
-    tick files (harness §3.3 / monitor RunSpan law; mirrors
-    ``candles._run_anchor_ns`` — fold-in candidate, next M3 window)."""
-    anchor: int | None = None
-    for path in sorted(run_dir.glob("*-ticks.pmlr")):
-        try:
-            with claude_worker.pmlr.Reader(path) as reader:
-                if reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK or len(reader) == 0:
-                    continue
-                first = reader.tick(0).ts_ns
-        except (claude_worker.pmlr.PmlrError, OSError, ValueError):
-            continue
-        anchor = first if anchor is None else min(anchor, first)
-    return anchor
+# WS11 (D5): the anchor folded into pmlr.py; alias keeps the name.
+_run_anchor_ns = claude_worker.pmlr.run_anchor_ns
 
 
 def fold_iv_snapshots(

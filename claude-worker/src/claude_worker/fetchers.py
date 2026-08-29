@@ -114,6 +114,13 @@ PM_LEGACY_ANCHOR_SYM: int = 42
 BN_LEGACY_ANCHOR_SYM: int = 7
 SYMBOL_VENUE_SHIFT: int = 24
 BN_USDM_ORDINAL_BASE: int = 512
+# WS5: `[binance] usdm_dated` delivery futures — own ordinal block
+# (mirrors core-config BN_DATED_ORDINAL_BASE), shared `binance-usdm:`
+# descriptor namespace.
+BN_DATED_ORDINAL_BASE: int = 2048
+# WS9: `[bybit] linear` block (mirrors core-config
+# BYBIT_LINEAR_ORDINAL_BASE; spot ordinals are file-order from 1).
+BYBIT_LINEAR_ORDINAL_BASE: int = 512
 
 _SLUG_RE: typing.Pattern[str] = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -853,12 +860,31 @@ def universe_file_proposals(
         BN_USDM_ORDINAL_BASE,
         None,
     )
+    _propose_list(
+        "binance",
+        "usdm_dated",
+        claude_worker.frames.VENUE_BINANCE,
+        "binance-usdm:",
+        BN_DATED_ORDINAL_BASE,
+        None,
+    )
     _propose_list("okx", "instruments", claude_worker.frames.VENUE_OKX, "okx:", 0, None)
     _propose_list(
         "deribit", "instruments", claude_worker.frames.VENUE_DERIBIT, "deribit:", 0, None
     )
     _propose_list(
         "hyperliquid", "coins", claude_worker.frames.VENUE_HYPERLIQUID, "hyperliquid:", 0, None
+    )
+    # WS9: Bybit — spot from ordinal 1, linear from base 512 (mirrors
+    # core-config BYBIT_LINEAR_ORDINAL_BASE).
+    _propose_list("bybit", "spot", claude_worker.frames.VENUE_BYBIT, "bybit:", 0, None)
+    _propose_list(
+        "bybit",
+        "linear",
+        claude_worker.frames.VENUE_BYBIT,
+        "bybit-linear:",
+        BYBIT_LINEAR_ORDINAL_BASE,
+        None,
     )
 
     lines.append(

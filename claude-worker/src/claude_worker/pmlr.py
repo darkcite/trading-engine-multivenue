@@ -44,6 +44,10 @@ SLOT_KIND_FILL: int = 2
 SLOT_KIND_ORDER: int = 3
 SLOT_KIND_AI_CMD: int = 4
 SLOT_KIND_CHANNEL_EVENT: int = 5
+# WS11 (D5 fold-in): kind 6 = OptSummary (M2.3). Decoded by the
+# dedicated [`OptSummaryReader`] below — the generic [`Reader`] keeps
+# refusing it (its typed accessors cover kinds 0/2/4 only).
+SLOT_KIND_OPT_SUMMARY: int = 6
 
 _KNOWN_SLOT_KINDS: frozenset[int] = frozenset(
     (
@@ -223,3 +227,123 @@ class Reader:
         """All AiCmd records, in file order."""
         for i in range(self._count):
             yield self.ai_cmd(i)
+
+
+# ---------------------------------------------------------------------------
+# WS11 (D5 fold-in): the kind-6 OptSummary decode + the run anchor —
+# both previously private to iv_digest.py (and the anchor duplicated
+# in candles.py); ONE home now, importers alias.
+# ---------------------------------------------------------------------------
+
+# The whole 64-byte slot is field-covered (no tail pad): ts u64 · sym
+# u32 · venue u8 · flags u8 · pad2 · 4×i64 (mark_px_1e9, mark_iv_1e9,
+# underlying_px_1e9, open_interest_1e6) · 4×i32 (delta_1e9, gamma_1e9,
+# vega_1e6, theta_1e6). docs/wire-format.md `OptSummary`.
+_OPT_SUMMARY: struct.Struct = struct.Struct("<QIBB2xqqqqiiii")
+assert _OPT_SUMMARY.size == SLOT_SIZE
+
+# OptSummary venue-optional-field flags (docs/wire-format.md).
+OPT_SUMMARY_FLAG_MARK_PX: int = 1
+OPT_SUMMARY_FLAG_OPEN_INTEREST: int = 2
+
+
+class OptSummaryRec(typing.NamedTuple):
+    """One decoded kind-6 `OptSummary` slot."""
+
+    ts_ns: int
+    sym: int
+    venue: int
+    flags: int
+    mark_px_1e9: int
+    mark_iv_1e9: int
+    underlying_px_1e9: int
+    open_interest_1e6: int
+    delta_1e9: int
+    gamma_1e9: int
+    vega_1e6: int
+    theta_1e6: int
+
+
+class OptSummaryReader:
+    """Kind-6 sibling of [`Reader`] (which refuses unknown slot kinds
+    by design). Same container rules: mmap'd read-only, one header
+    layout, torn trailing slot tolerated (the engine may be
+    mid-flush). Raises [`PmlrError`] on a malformed container or a
+    non-kind-6 file."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self._file = path.open("rb")
+        try:
+            size = path.stat().st_size
+            if size < HEADER_SIZE:
+                raise PmlrError(f"{path}: truncated before header ({size} B)")
+            self._map: mmap.mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        except BaseException:
+            self._file.close()
+            raise
+        try:
+            magic, version, slot_kind, epoch_ns = _HEADER.unpack_from(self._map, 0)
+            if magic != MAGIC:
+                raise PmlrError(f"{path}: bad magic {magic!r}")
+            if version > VERSION_MAX:
+                raise PmlrError(
+                    f"{path}: version {version} unsupported (max {VERSION_MAX})"
+                )
+            if slot_kind != SLOT_KIND_OPT_SUMMARY:
+                raise PmlrError(
+                    f"{path}: slot kind {slot_kind} is not OptSummary"
+                    f" ({SLOT_KIND_OPT_SUMMARY})"
+                )
+        except BaseException:
+            self.close()
+            raise
+        self.version: int = int(version)
+        self.epoch_ns: int = int(epoch_ns)
+        payload = size - HEADER_SIZE
+        self._count: int = payload // SLOT_SIZE
+        self.torn: bool = payload % SLOT_SIZE != 0
+
+    def close(self) -> None:
+        """Unmap and close. Idempotent."""
+        if hasattr(self, "_map"):
+            self._map.close()
+        self._file.close()
+
+    def __enter__(self) -> "OptSummaryReader":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __len__(self) -> int:
+        return self._count
+
+    def record(self, index: int) -> OptSummaryRec:
+        """Decode slot ``index`` (unpack_from straight off the map)."""
+        if index < 0 or index >= self._count:
+            raise IndexError(f"slot {index} out of range ({self._count} records)")
+        offset = HEADER_SIZE + index * SLOT_SIZE
+        return OptSummaryRec._make(_OPT_SUMMARY.unpack_from(self._map, offset))
+
+    def records(self) -> typing.Iterator[OptSummaryRec]:
+        """All records, in file (= venue-thread time) order."""
+        for i in range(self._count):
+            yield self.record(i)
+
+
+def run_anchor_ns(run_dir: pathlib.Path) -> int | None:
+    """WS11 (D5): the run's monotonic anchor — min first-ts across its
+    readable tick files (the harness §3.3 / monitor RunSpan law).
+    Previously duplicated in candles.py and iv_digest.py; both alias
+    this now."""
+    anchor: int | None = None
+    for path in sorted(run_dir.glob("*-ticks.pmlr")):
+        try:
+            with Reader(path) as reader:
+                if reader.slot_kind != SLOT_KIND_TICK or len(reader) == 0:
+                    continue
+                first = reader.tick(0).ts_ns
+        except (PmlrError, OSError, ValueError):
+            continue
+        anchor = first if anchor is None else min(anchor, first)
+    return anchor

@@ -86,6 +86,9 @@ BN_REST_HOST_ENV: str = "BINANCE_REST_HOST"
 BN_REST_HOST_DEFAULT: str = "api.binance.com"
 BN_FUT_REST_HOST_ENV: str = "BINANCE_FUT_REST_HOST"
 BN_FUT_REST_HOST_DEFAULT: str = "fapi.binance.com"
+# WS9: Bybit REST host (mirrors the engine's BYBIT_REST_HOST).
+BYBIT_REST_HOST_ENV: str = "BYBIT_REST_HOST"
+BYBIT_REST_HOST_DEFAULT: str = "api.bybit.com"
 
 MS_1M: int = 60_000
 MS_1H: int = 3_600_000
@@ -325,9 +328,11 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
     ]
     if spot:
         lanes.append(Lane("binance", frames.VENUE_BINANCE, spot, backward=False))
+    # WS5: dated delivery futures ride the SAME fapi lane + descriptor
+    # namespace as the perps (klines/ticker endpoints serve both).
     usdm = [
         LaneTarget(frames.VENUE_BINANCE, f"binance-usdm:{s}", s.upper())
-        for s in str_list("binance", "usdm")
+        for s in str_list("binance", "usdm") + str_list("binance", "usdm_dated")
     ]
     if usdm:
         lanes.append(Lane("binance-usdm", frames.VENUE_BINANCE, usdm, backward=False))
@@ -348,6 +353,19 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
     ]
     if hl:
         lanes.append(Lane("hyperliquid", frames.VENUE_HYPERLIQUID, hl, backward=False))
+    # WS9: Bybit — one lane per category (the kline endpoint needs
+    # `category=`); symbols stay in the venue's UPPERCASE form.
+    bybit_spot = [
+        LaneTarget(frames.VENUE_BYBIT, f"bybit:{s}", s) for s in str_list("bybit", "spot")
+    ]
+    if bybit_spot:
+        lanes.append(Lane("bybit", frames.VENUE_BYBIT, bybit_spot, backward=False))
+    bybit_linear = [
+        LaneTarget(frames.VENUE_BYBIT, f"bybit-linear:{s}", s)
+        for s in str_list("bybit", "linear")
+    ]
+    if bybit_linear:
+        lanes.append(Lane("bybit-linear", frames.VENUE_BYBIT, bybit_linear, backward=False))
     return lanes
 
 
@@ -363,6 +381,13 @@ BN_INTERVAL: dict[str, str] = {"1m": "1m", "1h": "1h", "1d": "1d"}
 OKX_BAR: dict[str, str] = {"1m": "1m", "1h": "1H", "1d": "1Dutc"}
 DERIBIT_RESOLUTION: dict[str, str] = {"1m": "1", "1h": "60", "1d": "1D"}
 HL_INTERVAL: dict[str, str] = {"1m": "1m", "1h": "1h", "1d": "1d"}
+# WS9: Bybit kline intervals.
+BYBIT_INTERVAL: dict[str, str] = {"1m": "1", "1h": "60", "1d": "D"}
+BYBIT_PAGE_BARS: int = 1000
+# WS9: pre-launch 1d floor (linear launched 2019; spot 2021 — both
+# clamp a pre-listing start to their earliest bar, the Deribit/HL
+# pattern).
+BYBIT_1D_FLOOR_MS: int = 1_514_764_800_000  # 2018-01-01
 
 
 def parse_binance_klines(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int] | None:
@@ -408,6 +433,65 @@ def parse_binance_klines(raw: str) -> tuple[list[claude_worker.fetchers.Candle],
         )
     out.sort(key=lambda candle: candle.ts_ms)
     return out, malformed
+
+
+def parse_bybit_kline(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int] | None:
+    """WS9: strict parse of Bybit ``/v5/market/kline`` (spot and
+    linear share the shape): ``result.list`` rows of STRINGS
+    ``[startMs, o, h, l, c, volume, turnover]``, NEWEST-first on the
+    wire — normalized ascending here. ``None`` = unusable body
+    (including ``retCode != 0``); malformed rows counted."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or typing.cast(dict[str, object], obj).get("retCode") != 0:
+        return None
+    result = typing.cast(dict[str, object], obj).get("result")
+    if not isinstance(result, dict):
+        return None
+    rows = typing.cast(dict[str, object], result).get("list")
+    if not isinstance(rows, list):
+        return None
+    out: list[claude_worker.fetchers.Candle] = []
+    malformed = 0
+    for row in typing.cast(list[object], rows):
+        if not isinstance(row, list) or len(row) < 6:
+            malformed += 1
+            continue
+        cells = typing.cast(list[object], row)
+        ok = True
+        vals: list[float] = []
+        ts = 0
+        for k, cell in enumerate(cells[:6]):
+            if not isinstance(cell, str):
+                ok = False
+                break
+            try:
+                if k == 0:
+                    ts = int(cell)
+                else:
+                    vals.append(float(cell))
+            except ValueError:
+                ok = False
+                break
+        if not ok:
+            malformed += 1
+            continue
+        out.append(
+            claude_worker.fetchers.Candle(
+                ts_ms=ts, open=vals[0], high=vals[1], low=vals[2], close=vals[3], volume=vals[4]
+            )
+        )
+    out.sort(key=lambda candle: candle.ts_ms)
+    return out, malformed
+
+
+def _bybit_url(host: str, category: str, symbol: str, tf: str, start_ms: int) -> str:
+    return (
+        f"https://{host}/v5/market/kline?category={category}&symbol={symbol}"
+        f"&interval={BYBIT_INTERVAL[tf]}&start={start_ms}&limit={BYBIT_PAGE_BARS}"
+    )
 
 
 def _bn_url(host: str, path: str, symbol: str, tf: str, start_ms: int) -> str:
@@ -466,6 +550,14 @@ def _fetch_forward_page(
         if raw is None:
             return None
         return claude_worker.fetchers.parse_deribit_chart(raw)
+    if lane.name == "bybit" or lane.name == "bybit-linear":
+        # WS9: forward-paged; the category rides the lane name.
+        category = "spot" if lane.name == "bybit" else "linear"
+        raw = http.get(_bybit_url(http.hosts["bybit"], category, target.instrument, tf, lo_ms))
+        if raw is None:
+            return None
+        parsed_bb = parse_bybit_kline(raw)
+        return None if parsed_bb is None else parsed_bb[0]
     if lane.name == "hyperliquid":
         end = min(now_ms, lo_ms + HL_PAGE_BARS * tf_ms)
         body = json.dumps(
@@ -505,6 +597,8 @@ def backfill_start_ms(tf: str, now_ms: int, lane_name: str, env: collections.abc
         return DERIBIT_1D_FLOOR_MS
     if lane_name == "hyperliquid":
         return HL_1D_FLOOR_MS
+    if lane_name in ("bybit", "bybit-linear"):
+        return BYBIT_1D_FLOOR_MS  # WS9: pre-launch floor (untested vs start=0)
     return 0  # Binance: startTime=0 = true listing lifetime (proven)
 
 
@@ -724,20 +818,8 @@ class MinuteBar(typing.NamedTuple):
     n: int
 
 
-def _run_anchor_ns(run_dir: pathlib.Path) -> int | None:
-    """The run's monotonic anchor — min first-ts across its readable
-    tick files (the harness §3.3 / monitor RunSpan law)."""
-    anchor: int | None = None
-    for path in sorted(run_dir.glob("*-ticks.pmlr")):
-        try:
-            with claude_worker.pmlr.Reader(path) as reader:
-                if reader.slot_kind != claude_worker.pmlr.SLOT_KIND_TICK or len(reader) == 0:
-                    continue
-                first = reader.tick(0).ts_ns
-        except (claude_worker.pmlr.PmlrError, OSError, ValueError):
-            continue
-        anchor = first if anchor is None else min(anchor, first)
-    return anchor
+# WS11 (D5): the anchor folded into pmlr.py; alias keeps the name.
+_run_anchor_ns = claude_worker.pmlr.run_anchor_ns
 
 
 def fold_capture_minutes(
@@ -1017,6 +1099,7 @@ def make_http(client: httpx.Client, env: collections.abc.Mapping[str, str]) -> H
     hosts = {
         "binance": env.get(BN_REST_HOST_ENV, "") or BN_REST_HOST_DEFAULT,
         "binance-usdm": env.get(BN_FUT_REST_HOST_ENV, "") or BN_FUT_REST_HOST_DEFAULT,
+        "bybit": env.get(BYBIT_REST_HOST_ENV, "") or BYBIT_REST_HOST_DEFAULT,
         "okx": env.get(claude_worker.fetchers.OKX_REST_HOST_ENV, "")
         or claude_worker.fetchers.OKX_REST_HOST_DEFAULT,
         "deribit": env.get(claude_worker.fetchers.DERIBIT_REST_HOST_ENV, "")

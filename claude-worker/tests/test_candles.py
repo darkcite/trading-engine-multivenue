@@ -240,6 +240,54 @@ def test_parse_binance_klines_unusable_bodies() -> None:
     assert claude_worker.candles.parse_binance_klines('{"a":1}') is None
 
 
+def test_parse_bybit_kline_normalizes_and_rejects() -> None:
+    # WS9: rows are STRINGS, newest-first on the wire → ascending out.
+    raw = json.dumps(
+        {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "category": "linear",
+                "symbol": "BTCUSDT",
+                "list": [
+                    [str(NOW), "101.0", "103.0", "100.0", "102.0", "6.0", "612.0"],
+                    [str(NOW - MS_1M), "100.0", "102.0", "99.0", "101.0", "5.0", "505.0"],
+                    ["junk", "1", "2", "3", "4", "5", "6"],
+                ],
+            },
+        }
+    )
+    parsed = claude_worker.candles.parse_bybit_kline(raw)
+    assert parsed is not None
+    candles, malformed = parsed
+    assert malformed == 1
+    assert [x.ts_ms for x in candles] == [NOW - MS_1M, NOW]
+    assert candles[0].open == 100.0
+    assert candles[1].volume == 6.0
+    # Unusable bodies: bad retCode, missing result, junk.
+    assert claude_worker.candles.parse_bybit_kline(
+        json.dumps({"retCode": 10001, "result": {}})
+    ) is None
+    assert claude_worker.candles.parse_bybit_kline("junk") is None
+
+
+def test_bybit_lanes_read_from_universe(tmp_path: pathlib.Path) -> None:
+    # WS9: [bybit] spot/linear become two forward lanes with the
+    # class-split descriptor namespaces.
+    p = tmp_path / "universe.toml"
+    p.write_text(
+        "[binance]\nspot=[\"btcusdt\"]\n[bybit]\nspot=[\"BTCUSDT\"]\nlinear=[\"ETHUSDT\"]\n",
+        encoding="utf-8",
+    )
+    lanes = claude_worker.candles.read_universe_lanes(p)
+    assert lanes is not None
+    by_name = {lane.name: lane for lane in lanes}
+    assert by_name["bybit"].targets[0].descriptor == "bybit:BTCUSDT"
+    assert by_name["bybit"].targets[0].instrument == "BTCUSDT"
+    assert by_name["bybit-linear"].targets[0].descriptor == "bybit-linear:ETHUSDT"
+    assert not by_name["bybit"].backward
+
+
 # ---- universe lanes ------------------------------------------------------
 
 
