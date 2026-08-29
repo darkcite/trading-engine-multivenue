@@ -1,5 +1,5 @@
 <svg viewBox="0 0 1400 1030" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
-<!-- Architecture one-pager — generated 2026-08-14; actualized 2026-08-15 (8a–8e), 2026-08-16 (8g close), and 2026-08-23 at M4 close (Stage 2.5: M1 universe · M2 options · M3 data-ops fleet · M4 shadow-P&L all BUILT + live-verified; amber dashed = M5 next / deferred levers / the Stage-3 gate). Companion to docs/mvp-completion-plan.md + docs/m{2,3,4}-progress.md -->
+<!-- Architecture one-pager — generated 2026-08-14; actualized 2026-08-15 (8a–8e), 2026-08-16 (8g close), 2026-08-23 (M4 close), and 2026-08-29 at Stage-2 FINISH (stage2-finish-plan WS2–WS13 coded+gated+live-proven: WS2 drop semantics · WS9 Bybit sixth venue · WS10 funding/event + L2 depth lanes · T2 fleet; amber dashed = remaining item / deferred lever / the Stage-3 gate). Companion to docs/stage2-finish-plan.md + docs/mvp-completion-plan.md -->
 <defs>
 <marker id="mB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#3b82f6"/></marker>
 <marker id="mG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#10b981"/></marker>
@@ -22,193 +22,210 @@
 </style>
 <rect x="0" y="0" width="1400" height="1030" fill="#ffffff"/>
 
-<text x="40" y="24" font-size="16" font-weight="700" class="t1">Multivenue engine + research plane — Stage 2.5 <tspan font-size="10" font-weight="400" class="t2">(2026-08-23, M4 close: M1 universe · M2 options · M3 fleet · M4 shadow-P&amp;L BUILT + live-verified · </tspan><tspan font-size="10" font-weight="700" class="t8">amber dashed = M5 next / deferred lever / Stage-3 gate</tspan><tspan font-size="10" font-weight="400" class="t2">)</tspan></text>
+<text x="40" y="24" font-size="16" font-weight="700" class="t1">Multivenue engine + research plane — Stage 2 FINISHED <tspan font-size="10" font-weight="400" class="t2">(2026-08-29, WS13 soak GREEN: 6 venues · funding event lanes + L2 depth lanes live · settlement crossed alive · </tspan><tspan font-size="10" font-weight="700" class="t8">amber dashed = remaining / deferred lever / Stage-3 gate</tspan><tspan font-size="10" font-weight="400" class="t2">)</tspan></text>
 
 <!-- external venues (top) -->
-<g font-size="8">
-<rect x="60" y="40" width="118" height="72" rx="8" class="bx"/>
-<text x="119" y="56" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Polymarket</text>
-<text x="119" y="70" text-anchor="middle" class="t2">CLOB WS · N markets/boot</text>
-<text x="119" y="82" text-anchor="middle" class="t2">YES/NO pairs · Gamma disc.</text>
-<text x="119" y="94" text-anchor="middle" class="t2">up/down dailies (16:00Z)</text>
+<g font-size="7.6">
+<rect x="60" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="115" y="54" text-anchor="middle" font-size="10" font-weight="700" class="t1">Polymarket</text>
+<text x="115" y="68" text-anchor="middle" class="t2">CLOB WS · N markets/boot</text>
+<text x="115" y="80" text-anchor="middle" class="t2">YES/NO pairs · Gamma disc.</text>
+<text x="115" y="92" text-anchor="middle" class="t2">up/down dailies (16:00Z)</text>
 
-<rect x="190" y="40" width="118" height="72" rx="8" class="bx"/>
-<text x="249" y="56" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Binance</text>
-<text x="249" y="70" text-anchor="middle" class="t2">WS spot ×N · USDS-M fut</text>
-<text x="249" y="82" text-anchor="middle" class="t2">eapi REST (options) ✓ live</text>
-<text x="249" y="94" text-anchor="middle" class="t8">options WS gated — .env lever</text>
+<rect x="174" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="229" y="54" text-anchor="middle" font-size="10" font-weight="700" class="t1">Binance</text>
+<text x="229" y="68" text-anchor="middle" class="t2">WS spot ×N · USDS-M + dated</text>
+<text x="229" y="80" text-anchor="middle" class="t2">eapi REST (options) ✓ live</text>
+<text x="229" y="92" text-anchor="middle" class="t8">markPrice + opt WS: venue-dark</text>
+<text x="229" y="102" text-anchor="middle" class="t8">(.env host levers, no code)</text>
 
-<rect x="320" y="40" width="118" height="72" rx="8" class="bx"/>
-<text x="379" y="58" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Alchemy RPC</text>
-<text x="379" y="74" text-anchor="middle" class="t2">WS newHeads · 2 s poll</text>
+<rect x="288" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="343" y="54" text-anchor="middle" font-size="10" font-weight="700" class="t1">Bybit <tspan font-size="7" class="t2">(WS9, 6th venue)</tspan></text>
+<text x="343" y="68" text-anchor="middle" class="t2">v5 WS spot + linear ✓ live</text>
+<text x="343" y="80" text-anchor="middle" class="t2">orderbook.1 · publicTrade</text>
+<text x="343" y="92" text-anchor="middle" class="t2">tickers: funding · mark · OI</text>
 
-<rect x="450" y="40" width="118" height="72" rx="8" class="bx"/>
-<text x="509" y="56" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">OKX</text>
-<text x="509" y="70" text-anchor="middle" class="t2">v5 WS: spot · swap · futures</text>
-<text x="509" y="82" text-anchor="middle" class="t2">bbo-tbt · trades · funding</text>
-<text x="509" y="94" text-anchor="middle" class="t2">OPTION bbo-tbt + opt-summary</text>
+<rect x="402" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="457" y="58" text-anchor="middle" font-size="10" font-weight="700" class="t1">Alchemy RPC</text>
+<text x="457" y="74" text-anchor="middle" class="t2">WS newHeads · 2 s poll</text>
 
-<rect x="580" y="40" width="118" height="72" rx="8" class="bx"/>
-<text x="639" y="56" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Deribit</text>
-<text x="639" y="70" text-anchor="middle" class="t2">JSON-RPC WS: perps + options</text>
-<text x="639" y="82" text-anchor="middle" class="t2">quote · book · trades · ticker</text>
-<text x="639" y="94" text-anchor="middle" class="t2">option ticker.100ms · index px</text>
+<rect x="516" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="571" y="54" text-anchor="middle" font-size="10" font-weight="700" class="t1">OKX</text>
+<text x="571" y="68" text-anchor="middle" class="t2">v5 WS: spot·swap·fut·OPTION</text>
+<text x="571" y="80" text-anchor="middle" class="t2">bbo-tbt · trades · funding</text>
+<text x="571" y="92" text-anchor="middle" class="t2">books L2 · opt-summary</text>
 
-<rect x="710" y="40" width="118" height="72" rx="8" class="bx"/>
-<text x="769" y="56" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Hyperliquid</text>
-<text x="769" y="70" text-anchor="middle" class="t2">WS bbo · l2Book · ctx · /info</text>
-<text x="769" y="82" text-anchor="middle" class="t2">perps · spot @idx · HIP-3 dex:</text>
-<text x="769" y="94" text-anchor="middle" class="t2">HIP-4 #enc + outcomeMeta</text>
+<rect x="630" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="685" y="54" text-anchor="middle" font-size="10" font-weight="700" class="t1">Deribit</text>
+<text x="685" y="68" text-anchor="middle" class="t2">JSON-RPC WS: perps · options</text>
+<text x="685" y="80" text-anchor="middle" class="t2">· spot — quote · book.100ms L2</text>
+<text x="685" y="92" text-anchor="middle" class="t2">trades · ticker+funding · DVOL</text>
+
+<rect x="744" y="40" width="110" height="72" rx="8" class="bx"/>
+<text x="799" y="54" text-anchor="middle" font-size="10" font-weight="700" class="t1">Hyperliquid</text>
+<text x="799" y="68" text-anchor="middle" class="t2">WS bbo · l2Book · ctx · /info</text>
+<text x="799" y="80" text-anchor="middle" class="t2">perps · spot @idx · HIP-3/4</text>
+<text x="799" y="92" text-anchor="middle" class="t2">premium/funding in ctx</text>
 
 <rect x="1000" y="40" width="180" height="72" rx="8" class="bx"/>
-<text x="1090" y="58" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Venue REST (keyless)</text>
-<text x="1090" y="74" text-anchor="middle" class="t2">Gamma · candles: BN/OKX/DER/HL</text>
-<text x="1090" y="88" text-anchor="middle" class="t2">RestBudget-paced · worker-only</text>
+<text x="1090" y="56" text-anchor="middle" font-size="10" font-weight="700" class="t1">Venue REST (keyless)</text>
+<text x="1090" y="72" text-anchor="middle" class="t2">Gamma · candles · refdata +</text>
+<text x="1090" y="84" text-anchor="middle" class="t2">funding hist (WS11)</text>
+<text x="1090" y="96" text-anchor="middle" class="t2">RestBudget-paced · worker-only</text>
 
 <rect x="1200" y="40" width="185" height="72" rx="8" class="n8"/>
-<text x="1292" y="58" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Anthropic API — PARKED</text>
+<text x="1292" y="58" text-anchor="middle" font-size="10" font-weight="700" class="t1">Anthropic API — PARKED</text>
 <text x="1292" y="74" text-anchor="middle" class="t8">no key until Stage 3 (ruling #5)</text>
 <text x="1292" y="88" text-anchor="middle" class="t2">strategist = Claude-in-session</text>
 </g>
 
 <!-- market data arrows into process -->
-<path d="M119,112V176" class="lb" marker-end="url(#mB)"/>
-<path d="M249,112V176" class="lb" marker-end="url(#mB)"/>
-<path d="M379,112V176" class="lb" marker-end="url(#mB)"/>
-<path d="M509,112V176" class="lb" marker-end="url(#mB)"/>
-<path d="M639,112V176" class="lb" marker-end="url(#mB)"/>
-<path d="M769,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M115,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M229,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M343,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M457,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M571,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M685,112V176" class="lb" marker-end="url(#mB)"/>
+<path d="M799,112V176" class="lb" marker-end="url(#mB)"/>
 
 <!-- engine process -->
 <rect x="40" y="150" width="938" height="662" rx="12" fill="rgba(148,163,184,0.05)" stroke="#94a3b8" stroke-width="1.2"/>
 <text x="54" y="168" font-size="11" font-weight="700" class="t1">Rust engine process <tspan font-weight="400" class="t2">— `multivenue-engine` · zero alloc after boot · mio + rustls · no tokio / serde_json / dyn · universe from ~/multivenue/universe.toml (M1)</tspan></text>
 
 <!-- ingress row -->
-<g font-size="8">
-<rect x="60" y="180" width="118" height="78" rx="8" class="bx"/>
-<text x="119" y="194" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ingress-polymarket</text>
-<text x="119" y="208" text-anchor="middle" class="t2">one conn · N-id subscribe</text>
-<text x="119" y="220" text-anchor="middle" class="t2">book/price_change wire</text>
-<text x="119" y="246" text-anchor="middle" font-size="8.5" class="t2">core 1</text>
+<g font-size="7.5">
+<rect x="60" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="115" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-polymarket</text>
+<text x="115" y="206" text-anchor="middle" class="t2">one conn · N-id subscribe</text>
+<text x="115" y="217" text-anchor="middle" class="t2">book/price_change wire</text>
+<text x="115" y="250" text-anchor="middle" font-size="8" class="t2">core 1</text>
 
-<rect x="190" y="180" width="118" height="78" rx="8" class="bx"/>
-<text x="249" y="194" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ingress-binance</text>
-<text x="249" y="208" text-anchor="middle" class="t2">multi-conn lane, 1 thread:</text>
-<text x="249" y="220" text-anchor="middle" class="t2">spot ×N + usdm + eapi slot</text>
-<text x="249" y="232" text-anchor="middle" class="t2">eapi ticker→Tick+OptSummary</text>
-<text x="249" y="246" text-anchor="middle" font-size="8.5" class="t2">core 2</text>
+<rect x="174" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="229" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-binance</text>
+<text x="229" y="206" text-anchor="middle" class="t2">multi-conn lane, 1 thread:</text>
+<text x="229" y="217" text-anchor="middle" class="t2">spot ×N + usdm + dated</text>
+<text x="229" y="228" text-anchor="middle" class="t2">+ markPrice + eapi slots</text>
+<text x="229" y="250" text-anchor="middle" font-size="8" class="t2">core 2</text>
 
-<rect x="320" y="180" width="118" height="78" rx="8" class="bx"/>
-<text x="379" y="194" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ingress-rpc</text>
-<text x="379" y="208" text-anchor="middle" class="t2">newHeads → Signal ring</text>
-<text x="379" y="246" text-anchor="middle" font-size="8.5" class="t2">core 3</text>
+<rect x="288" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="343" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-bybit</text>
+<text x="343" y="206" text-anchor="middle" class="t2">spot + linear conns · v5 wire</text>
+<text x="343" y="217" text-anchor="middle" class="t2">data-only (tick lane 5)</text>
+<text x="343" y="228" text-anchor="middle" class="t2">1e-9 px law · truncate rule</text>
+<text x="343" y="250" text-anchor="middle" font-size="8" class="t2">core 8</text>
 
-<rect x="450" y="180" width="118" height="78" rx="8" class="bx"/>
-<text x="509" y="194" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ingress-okx</text>
-<text x="509" y="208" text-anchor="middle" class="t2">80-sym table (16 + 64 opt)</text>
-<text x="509" y="220" text-anchor="middle" class="t2">seqId chain · family subs</text>
-<text x="509" y="232" text-anchor="middle" class="t2">opt-summary scan (4 MiB rx)</text>
-<text x="509" y="246" text-anchor="middle" font-size="8.5" class="t2">core 5</text>
+<rect x="402" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="457" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-rpc</text>
+<text x="457" y="206" text-anchor="middle" class="t2">newHeads → Signal ring</text>
+<text x="457" y="250" text-anchor="middle" font-size="8" class="t2">core 3</text>
 
-<rect x="580" y="180" width="118" height="78" rx="8" class="bx"/>
-<text x="639" y="194" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ingress-deribit</text>
-<text x="639" y="208" text-anchor="middle" class="t2">80-sym table · u128 ack mask</text>
-<text x="639" y="220" text-anchor="middle" class="t2">change_id chain · heartbeat</text>
-<text x="639" y="232" text-anchor="middle" class="t2">option ticker → OptSummary</text>
-<text x="639" y="246" text-anchor="middle" font-size="8.5" class="t2">core 6</text>
+<rect x="516" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="571" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-okx</text>
+<text x="571" y="206" text-anchor="middle" class="t2">seqId chain · family subs</text>
+<text x="571" y="217" text-anchor="middle" class="t2">book walk → DepthTopK</text>
+<text x="571" y="228" text-anchor="middle" class="t2">per-arg drops non-fatal (WS2)</text>
+<text x="571" y="250" text-anchor="middle" font-size="8" class="t2">core 5</text>
 
-<rect x="710" y="180" width="118" height="78" rx="8" class="bx"/>
-<text x="769" y="194" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ingress-hyperliquid</text>
-<text x="769" y="208" text-anchor="middle" class="t2">coins pass-through incl.</text>
-<text x="769" y="220" text-anchor="middle" class="t2">#enc (HIP-4) · @idx (spot)</text>
-<text x="769" y="232" text-anchor="middle" class="t2">outcomeMeta lifecycle capture</text>
-<text x="769" y="246" text-anchor="middle" font-size="8.5" class="t2">core 7</text>
+<rect x="630" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="685" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-deribit</text>
+<text x="685" y="206" text-anchor="middle" class="t2">u128 ack · change_id chain</text>
+<text x="685" y="217" text-anchor="middle" class="t2">book walk → DepthTopK</text>
+<text x="685" y="228" text-anchor="middle" class="t2">heartbeat · option ticker</text>
+<text x="685" y="250" text-anchor="middle" font-size="8" class="t2">core 6</text>
 
-<rect x="840" y="180" width="118" height="78" rx="8" class="ai"/>
-<text x="899" y="194" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-ai (8f/8g)</text>
-<text x="899" y="208" text-anchor="middle" class="t2">UDS accept · HMAC · seq/TTL</text>
-<text x="899" y="220" text-anchor="middle" class="t2">ruleset validator §4.2</text>
-<text x="899" y="232" text-anchor="middle" class="t2">scratch → staged table</text>
-<text x="899" y="248" text-anchor="middle" font-size="8.5" class="t2">core 4</text>
+<rect x="744" y="180" width="110" height="80" rx="8" class="bx"/>
+<text x="799" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-hyperliquid</text>
+<text x="799" y="206" text-anchor="middle" class="t2">coins pass-through incl.</text>
+<text x="799" y="217" text-anchor="middle" class="t2">#enc (HIP-4) · @idx (spot)</text>
+<text x="799" y="228" text-anchor="middle" class="t2">outcomeMeta capture</text>
+<text x="799" y="250" text-anchor="middle" font-size="8" class="t2">core 7</text>
+
+<rect x="858" y="180" width="110" height="80" rx="8" class="ai"/>
+<text x="913" y="193" text-anchor="middle" font-size="9" font-weight="700" class="t1">ingress-ai (8f/8g)</text>
+<text x="913" y="206" text-anchor="middle" class="t2">UDS accept · HMAC · seq/TTL</text>
+<text x="913" y="217" text-anchor="middle" class="t2">ruleset validator §4.2</text>
+<text x="913" y="228" text-anchor="middle" class="t2">scratch → staged table</text>
+<text x="913" y="250" text-anchor="middle" font-size="8" class="t2">core 4</text>
 </g>
-<text x="509" y="276" text-anchor="middle" font-size="8.2" class="t2">boot REST discovery per venue (8e/M1/M2): universes + audits · capped options chains E2×K8 ATM (options-select LAW) + index px, fatal on failure · gap/seq monitors · backoff · Capture sink → PMLR + raw tap</text>
+<text x="509" y="276" text-anchor="middle" font-size="8" class="t2">boot REST discovery per venue (8e/M1/M2/WS4): universes + refdata audits · capped option chains E2×K8 (options-select LAW) · fatal on failure · WS2 establishment budget + non-fatal SubDrop semantics · named errs + last_tick_age (T1) · Capture sink → PMLR + raw tap</text>
 
 <!-- rings row -->
-<path d="M119,258V286" class="lb" marker-end="url(#mB)"/><path d="M249,258V286" class="lb" marker-end="url(#mB)"/><path d="M379,258V286" class="lb" marker-end="url(#mB)"/><path d="M509,258V286" class="lb" marker-end="url(#mB)"/><path d="M639,258V286" class="lb" marker-end="url(#mB)"/><path d="M769,258V286" class="lb" marker-end="url(#mB)"/><path d="M899,258V286" class="lp" marker-end="url(#mP)"/>
-<g font-size="8.5">
-<rect x="60" y="290" width="118" height="44" rx="14" class="bx"/><text x="119" y="308" text-anchor="middle" font-weight="700" class="t1">Tick lane</text><text x="119" y="322" text-anchor="middle" class="t2">SPSC ⟨16 384⟩</text>
-<rect x="190" y="290" width="118" height="44" rx="14" class="bx"/><text x="249" y="308" text-anchor="middle" font-weight="700" class="t1">Tick lane</text><text x="249" y="322" text-anchor="middle" class="t2">SPSC ⟨16 384⟩</text>
-<rect x="320" y="290" width="118" height="44" rx="14" class="bx"/><text x="379" y="308" text-anchor="middle" font-weight="700" class="t1">Signal ring</text><text x="379" y="322" text-anchor="middle" class="t2">SPSC ⟨1 024⟩</text>
-<rect x="450" y="290" width="118" height="44" rx="14" class="bx"/><text x="509" y="308" text-anchor="middle" font-weight="700" class="t1">Tick lane</text><text x="509" y="322" text-anchor="middle" class="t2">SPSC ⟨16 384⟩</text>
-<rect x="580" y="290" width="118" height="44" rx="14" class="bx"/><text x="639" y="308" text-anchor="middle" font-weight="700" class="t1">Tick lane</text><text x="639" y="322" text-anchor="middle" class="t2">SPSC ⟨16 384⟩</text>
-<rect x="710" y="290" width="118" height="44" rx="14" class="bx"/><text x="769" y="308" text-anchor="middle" font-weight="700" class="t1">Tick lane</text><text x="769" y="322" text-anchor="middle" class="t2">SPSC ⟨16 384⟩</text>
-<rect x="840" y="290" width="118" height="44" rx="14" class="ai"/><text x="899" y="304" text-anchor="middle" font-weight="700" class="t1">AiCmd ring ⟨1 024⟩</text><text x="899" y="316" text-anchor="middle" class="t2">+ RuleTable ring ⟨2⟩</text><text x="899" y="328" text-anchor="middle" class="t2">16 KiB staged→commit</text>
+<path d="M115,260V286" class="lb" marker-end="url(#mB)"/><path d="M229,260V286" class="lb" marker-end="url(#mB)"/><path d="M343,260V286" class="lb" marker-end="url(#mB)"/><path d="M457,260V286" class="lb" marker-end="url(#mB)"/><path d="M571,260V286" class="lb" marker-end="url(#mB)"/><path d="M685,260V286" class="lb" marker-end="url(#mB)"/><path d="M799,260V286" class="lb" marker-end="url(#mB)"/><path d="M913,260V286" class="lp" marker-end="url(#mP)"/>
+<g font-size="7.8">
+<rect x="60" y="290" width="110" height="52" rx="14" class="bx"/><text x="115" y="306" text-anchor="middle" font-weight="700" class="t1">Tick ⟨16 384⟩</text><text x="115" y="320" text-anchor="middle" class="t2">+ Event ⟨1 024⟩</text>
+<rect x="174" y="290" width="110" height="52" rx="14" class="bx"/><text x="229" y="306" text-anchor="middle" font-weight="700" class="t1">Tick ⟨16 384⟩</text><text x="229" y="320" text-anchor="middle" class="t2">+ Event ⟨1 024⟩ funding</text>
+<rect x="288" y="290" width="110" height="52" rx="14" class="bx"/><text x="343" y="306" text-anchor="middle" font-weight="700" class="t1">Tick ⟨16 384⟩</text><text x="343" y="320" text-anchor="middle" class="t2">+ Event ⟨1 024⟩ funding</text>
+<rect x="402" y="290" width="110" height="52" rx="14" class="bx"/><text x="457" y="310" text-anchor="middle" font-weight="700" class="t1">Signal ring</text><text x="457" y="324" text-anchor="middle" class="t2">SPSC ⟨1 024⟩</text>
+<rect x="516" y="290" width="110" height="52" rx="14" class="bx"/><text x="571" y="303" text-anchor="middle" font-weight="700" class="t1">Tick ⟨16 384⟩</text><text x="571" y="316" text-anchor="middle" class="t2">+ Event ⟨1 024⟩ funding</text><text x="571" y="329" text-anchor="middle" class="t2">+ Depth ⟨4 096⟩ lane 0</text>
+<rect x="630" y="290" width="110" height="52" rx="14" class="bx"/><text x="685" y="303" text-anchor="middle" font-weight="700" class="t1">Tick ⟨16 384⟩</text><text x="685" y="316" text-anchor="middle" class="t2">+ Event ⟨1 024⟩ funding</text><text x="685" y="329" text-anchor="middle" class="t2">+ Depth ⟨4 096⟩ lane 1</text>
+<rect x="744" y="290" width="110" height="52" rx="14" class="bx"/><text x="799" y="306" text-anchor="middle" font-weight="700" class="t1">Tick ⟨16 384⟩</text><text x="799" y="320" text-anchor="middle" class="t2">+ Event ⟨1 024⟩ funding</text>
+<rect x="858" y="290" width="110" height="52" rx="14" class="ai"/><text x="913" y="303" text-anchor="middle" font-weight="700" class="t1">AiCmd ⟨1 024⟩</text><text x="913" y="316" text-anchor="middle" class="t2">+ RuleTable ring ⟨2⟩</text><text x="913" y="329" text-anchor="middle" class="t2">16 KiB staged→commit</text>
 </g>
-<text x="509" y="348" text-anchor="middle" font-size="8" class="t2">option BBO rides the Tick lanes unchanged (a book is a book) · OptSummary (mark px · IV · greeks · OI, SlotKind 6) is CAPTURE-ONLY — never enters a ring</text>
-<path d="M119,334V358" class="lb" marker-end="url(#mB)"/><path d="M249,334V358" class="lb" marker-end="url(#mB)"/><path d="M379,334V358" class="lb" marker-end="url(#mB)"/><path d="M509,334V358" class="lb" marker-end="url(#mB)"/><path d="M639,334V358" class="lb" marker-end="url(#mB)"/><path d="M769,334V358" class="lb" marker-end="url(#mB)"/><path d="M899,334V358" class="lp" marker-end="url(#mP)"/>
+<text x="509" y="356" text-anchor="middle" font-size="8" class="t2">WS10-A: funding → ChannelEvent on 6 venue-event lanes (spawn-time EVENT_LANE_FUNDING mask, ring-full = counted drop) · WS10-B: OKX/Deribit L2 → DepthTopK 192 B (K=5/side, STALE-on-gap) on 2 depth lanes · option BBO rides Tick lanes · OptSummary (kind 6) CAPTURE-ONLY</text>
+<path d="M115,342V364" class="lb" marker-end="url(#mB)"/><path d="M229,342V364" class="lb" marker-end="url(#mB)"/><path d="M343,342V364" class="lb" marker-end="url(#mB)"/><path d="M457,342V364" class="lb" marker-end="url(#mB)"/><path d="M571,342V364" class="lb" marker-end="url(#mB)"/><path d="M685,342V364" class="lb" marker-end="url(#mB)"/><path d="M799,342V364" class="lb" marker-end="url(#mB)"/><path d="M913,342V364" class="lp" marker-end="url(#mP)"/>
 
 <!-- engine core -->
-<rect x="60" y="362" width="898" height="186" rx="10" fill="rgba(59,130,246,0.05)" stroke="#3b82f6" stroke-opacity="0.5" stroke-width="1.2"/>
-<text x="74" y="382" font-size="11" font-weight="700" class="t1">Engine⟨StrategySet⟩ <tspan font-weight="400" class="t2">— core 0 · single writer · mask compose-if-configured (49 live)</tspan></text>
-<text x="74" y="397" font-size="8.3" class="t2">fixed drain order · table-ring pop pre-AI-drain · Commit flips in-stream · fills captured pre-on_fill · M4.1: every member callback wraps in StampCtx → Order.strategy_id; EngineCtx.submit stages ACCEPTED intents to engine-orders.pmlr (refusals = counters)</text>
+<rect x="60" y="368" width="908" height="186" rx="10" fill="rgba(59,130,246,0.05)" stroke="#3b82f6" stroke-opacity="0.5" stroke-width="1.2"/>
+<text x="74" y="388" font-size="11" font-weight="700" class="t1">Engine⟨StrategySet⟩ <tspan font-weight="400" class="t2">— core 0 · single writer · mask compose-if-configured (49 live)</tspan></text>
+<text x="74" y="403" font-size="8.2" class="t2">drain order: ticks → signals → fills → pump → venue-events (on_venue_event) → depth (on_depth) → table pop → AI · both new callbacks DEFAULTED (no member implements them yet — v1 is capture+plumbing) · StampCtx → Order.strategy_id · accepted intents → engine-orders.pmlr</text>
 <g font-size="7.8">
-<rect x="74" y="408" width="136" height="40" rx="7" class="bx"/><text x="142" y="424" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">latency-arb · s0</text><text x="142" y="438" text-anchor="middle" class="t2">PM↔BN pairs (M1 map)</text>
-<rect x="220" y="408" width="136" height="40" rx="7" class="bx"/><text x="288" y="424" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ev · s1</text><text x="288" y="438" text-anchor="middle" class="t2">artifact table</text>
-<rect x="366" y="408" width="136" height="40" rx="7" class="bx"/><text x="434" y="424" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">cross-arb · s2</text><text x="434" y="438" text-anchor="middle" class="t2">MarketGroup sums</text>
-<rect x="512" y="408" width="136" height="40" rx="7" class="bx"/><text x="580" y="424" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">rule-tree · s3</text><text x="580" y="438" text-anchor="middle" class="t2">keyword rules</text>
-<rect x="658" y="408" width="136" height="40" rx="7" class="ai"/><text x="726" y="424" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ai-exec · s4</text><text x="726" y="438" text-anchor="middle" class="t2">AI fair values · intents · TTL</text>
-<rect x="804" y="408" width="136" height="40" rx="7" class="ai"/><text x="872" y="424" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">strategy-vm · s5</text><text x="872" y="438" text-anchor="middle" class="t2">256 rows · hash128 flip</text>
+<rect x="74" y="414" width="138" height="40" rx="7" class="bx"/><text x="143" y="430" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">latency-arb · s0</text><text x="143" y="444" text-anchor="middle" class="t2">PM↔BN pairs (M1 map)</text>
+<rect x="222" y="414" width="138" height="40" rx="7" class="bx"/><text x="291" y="430" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ev · s1</text><text x="291" y="444" text-anchor="middle" class="t2">artifact table</text>
+<rect x="370" y="414" width="138" height="40" rx="7" class="bx"/><text x="439" y="430" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">cross-arb · s2</text><text x="439" y="444" text-anchor="middle" class="t2">MarketGroup sums</text>
+<rect x="518" y="414" width="138" height="40" rx="7" class="bx"/><text x="587" y="430" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">rule-tree · s3</text><text x="587" y="444" text-anchor="middle" class="t2">keyword rules</text>
+<rect x="666" y="414" width="138" height="40" rx="7" class="ai"/><text x="735" y="430" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">ai-exec · s4</text><text x="735" y="444" text-anchor="middle" class="t2">AI fair values · intents · TTL</text>
+<rect x="814" y="414" width="138" height="40" rx="7" class="ai"/><text x="883" y="430" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">strategy-vm · s5</text><text x="883" y="444" text-anchor="middle" class="t2">256 rows · hash128 flip</text>
 </g>
 <g font-size="8.5">
-<rect x="74" y="458" width="400" height="58" rx="8" class="bx"/>
-<text x="274" y="474" text-anchor="middle" font-size="10" font-weight="700" class="t1">RiskGate + sticky halt <tspan class="t8" font-weight="700">(8i — Stage-3 gate)</tspan></text>
-<text x="274" y="490" text-anchor="middle" class="t2">docs/risk-policy.md caps modeled TODAY in backtest + audit-pnl</text>
-<text x="274" y="503" text-anchor="middle" class="t2">(4/sym · 32 total · $100/$250/$1000) — engine enforcement is 8i</text>
-<rect x="494" y="458" width="446" height="58" rx="8" class="bx"/>
-<text x="717" y="474" text-anchor="middle" font-size="10" font-weight="700" class="t1">Dispatch — paper (Stage 2.5) · live lane = 8j, Stage-3 gate</text>
-<text x="717" y="490" text-anchor="middle" class="t2">PaperDispatcher: accepts + counts · NO fills · submits nothing anywhere</text>
-<text x="717" y="503" text-anchor="middle" class="t2">VenueRouter⟨PM,OKX,DER,HL⟩ + venue dispatchers wait behind the operator gate</text>
+<rect x="74" y="464" width="400" height="58" rx="8" class="bx"/>
+<text x="274" y="480" text-anchor="middle" font-size="10" font-weight="700" class="t1">RiskGate + sticky halt <tspan class="t8" font-weight="700">(8i — Stage-3 gate)</tspan></text>
+<text x="274" y="496" text-anchor="middle" class="t2">docs/risk-policy.md caps modeled TODAY in backtest + audit-pnl</text>
+<text x="274" y="509" text-anchor="middle" class="t2">(4/sym · 32 total · $100/$250/$1000) — engine enforcement is 8i</text>
+<rect x="494" y="464" width="446" height="58" rx="8" class="bx"/>
+<text x="717" y="480" text-anchor="middle" font-size="10" font-weight="700" class="t1">Dispatch — paper · live lane = 8j, Stage-3 gate</text>
+<text x="717" y="496" text-anchor="middle" class="t2">PaperDispatcher: accepts + counts · NO fills · submits nothing anywhere</text>
+<text x="717" y="509" text-anchor="middle" class="t2">VenueRouter⟨PM,OKX,DER,HL⟩ + venue dispatchers wait behind the operator gate</text>
 </g>
-<text x="509" y="536" text-anchor="middle" font-size="8.3" class="t2">intent flow (M4): strategy fires → StampCtx stamps slot → dispatcher accepts → engine-orders.pmlr (503 stamped intents in the first live smoke; ~212k/day at standing cadence — the §4.1 caps finding)</text>
+<text x="509" y="542" text-anchor="middle" font-size="8.2" class="t2">intent flow (M4): strategy fires → StampCtx stamps slot → dispatcher accepts → engine-orders.pmlr (descriptor-keyed attribution; the §4.1 caps-rejection cadence finding stays visible in audit-pnl)</text>
 
 <!-- capture band -->
-<path d="M300,548V566" class="ln" marker-end="url(#mN)"/><path d="M717,548V566" class="ln" marker-end="url(#mN)"/>
+<path d="M300,554V572" class="ln" marker-end="url(#mN)"/><path d="M717,554V572" class="ln" marker-end="url(#mN)"/>
 <g font-size="8">
-<rect x="60" y="570" width="440" height="86" rx="8" class="bx"/>
-<text x="280" y="586" text-anchor="middle" font-size="10" font-weight="700" class="t1">PMLR capture v2 — run-⟨ns⟩/ per boot (append-only, torn-tail safe)</text>
-<text x="280" y="601" text-anchor="middle" class="t2">⟨venue⟩-{ticks · events · signals · opt-summary}.pmlr (kind 6 = M2.3) · raw tap</text>
-<text x="280" y="614" text-anchor="middle" class="t2">engine-fills.pmlr (header-only in paper) · engine-orders.pmlr (M4.1 intent log)</text>
-<text x="280" y="627" text-anchor="middle" class="t2">ai-cmds.pmlr (RulesetCommit timeline = per-hash attribution)</text>
-<text x="280" y="640" text-anchor="middle" class="t2">instrument-manifest.tsv (D3: EVERY sym → §9.4 descriptor, every boot) + options-manifest.tsv (1 release)</text>
-<rect x="516" y="570" width="220" height="86" rx="8" class="bx"/>
-<text x="626" y="586" text-anchor="middle" font-size="10" font-weight="700" class="t1">core-metrics — 127.0.0.1:9191</text>
-<text x="626" y="601" text-anchor="middle" class="t2">gap / drop / coverage / latency</text>
-<text x="626" y="614" text-anchor="middle" class="t2">enabled_mask · vm rows/epoch/fires</text>
-<text x="626" y="627" text-anchor="middle" class="t2">⟨venue⟩_options_selected (=64 ×3)</text>
-<text x="626" y="640" text-anchor="middle" class="t2">orders/fills_capture_{records,io_errors}</text>
-<rect x="752" y="570" width="206" height="86" rx="8" class="bx"/>
-<text x="855" y="588" text-anchor="middle" font-size="10" font-weight="700" class="t1">TUI (ratatui)</text>
-<text x="855" y="604" text-anchor="middle" class="t2">read-only · per-ingress health</text>
-<text x="855" y="618" text-anchor="middle" class="t2">snapshot-page driven</text>
+<rect x="60" y="576" width="440" height="86" rx="8" class="bx"/>
+<text x="280" y="592" text-anchor="middle" font-size="10" font-weight="700" class="t1">PMLR capture v2 — run-⟨ns⟩/ per boot (append-only, torn-tail safe)</text>
+<text x="280" y="606" text-anchor="middle" class="t2">slot size KIND-determined (WS10-B): kinds 0–6 = 64 B · kind 7 Depth = 192 B</text>
+<text x="280" y="619" text-anchor="middle" class="t2">⟨venue⟩-{ticks · events · signals · opt-summary · depth}.pmlr · raw tap</text>
+<text x="280" y="632" text-anchor="middle" class="t2">engine-fills.pmlr (header-only in paper) · engine-orders.pmlr (M4.1) · ai-cmds.pmlr</text>
+<text x="280" y="645" text-anchor="middle" class="t2">instrument-manifest.tsv (every sym, every boot) + options-manifest.tsv per run</text>
+<rect x="516" y="576" width="220" height="86" rx="8" class="bx"/>
+<text x="626" y="592" text-anchor="middle" font-size="10" font-weight="700" class="t1">core-metrics — 127.0.0.1:9191</text>
+<text x="626" y="606" text-anchor="middle" class="t2">gap / drop / coverage / latency</text>
+<text x="626" y="619" text-anchor="middle" class="t2">named errs + last_tick_age (T1)</text>
+<text x="626" y="632" text-anchor="middle" class="t2">event/depth_ring_drops (WS10)</text>
+<text x="626" y="645" text-anchor="middle" class="t2">enabled_mask · vm rows/epoch/fires</text>
+<rect x="752" y="576" width="206" height="86" rx="8" class="bx"/>
+<text x="855" y="594" text-anchor="middle" font-size="10" font-weight="700" class="t1">TUI (ratatui)</text>
+<text x="855" y="610" text-anchor="middle" class="t2">read-only · per-ingress health</text>
+<text x="855" y="624" text-anchor="middle" class="t2">snapshot-page driven</text>
 </g>
 
 <!-- offline analyzers band -->
-<path d="M280,656V674" class="ln" stroke-dasharray="5 4" marker-end="url(#mN)"/>
-<rect x="60" y="678" width="898" height="70" rx="10" fill="rgba(16,185,129,0.05)" stroke="#10b981" stroke-opacity="0.5"/>
-<text x="509" y="694" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Offline analyzers (same binary; audit doctrine — allocate freely, deterministic)</text>
-<text x="509" y="710" text-anchor="middle" font-size="8.3" class="t2">audit-replay (integrity · rates · opt-summary coverage) · capture-catalog (M3: spans · gap-free days · backtestable-window verdicts) · backtest (FROZEN argv · k-way merge + VIRT_T0 · real vm · strict-cross fills · schema-1)</text>
-<text x="509" y="724" text-anchor="middle" font-size="8.3" class="t1" font-weight="700">audit-pnl (M4): replays LOGGED intents through the SAME §4 fill law → per-strategy + per-ruleset-hash modeled P&amp;L · per-day buckets · paper view beside · descriptor-keyed (§6)</text>
-<text x="509" y="738" text-anchor="middle" font-size="8.3" class="t2">first live report: 35 runs / 10 days · latency-arb 203 modeled fills · net −$32.55 · max DD $165 · 211 840 §4.1 caps rejections surfaced</text>
+<path d="M280,662V678" class="ln" stroke-dasharray="5 4" marker-end="url(#mN)"/>
+<rect x="60" y="682" width="898" height="70" rx="10" fill="rgba(16,185,129,0.05)" stroke="#10b981" stroke-opacity="0.5"/>
+<text x="509" y="698" text-anchor="middle" font-size="10.5" font-weight="700" class="t1">Offline analyzers (same binary; audit doctrine — allocate freely, deterministic)</text>
+<text x="509" y="714" text-anchor="middle" font-size="8.3" class="t2">audit-replay (integrity · rates · opt-summary coverage · DEPTH stream w/ stale count) · capture-catalog (C6 judge: trailing streak 6 ≥ 3 PASSED) · backtest (FROZEN argv · k-way merge + VIRT_T0 · real vm · strict-cross fills · schema-1)</text>
+<text x="509" y="728" text-anchor="middle" font-size="8.3" class="t1" font-weight="700">audit-pnl (M4): replays LOGGED intents through the SAME §4 fill law → per-strategy + per-ruleset-hash modeled P&amp;L · per-day buckets · descriptor-keyed (§6)</text>
+<text x="509" y="742" text-anchor="middle" font-size="8.3" class="t8">C6 step-3 `oos.trading_days≥2` sub-gate operator-pending: full-root merge ~27 GB &gt; 24 GiB RAM · PM-dark Aug-28 in every feasible OOS tail · bounded rerun viable Aug-31</text>
 
 <!-- stage-3 strip -->
-<rect x="60" y="760" width="898" height="40" rx="10" class="n8"/>
-<text x="509" y="776" text-anchor="middle" font-size="10" font-weight="700" class="t8">STAGE-3 LANE — operator-gated (mvp-plan §7): NOTHING here executes an order anywhere</text>
-<text x="509" y="791" text-anchor="middle" font-size="8.3" class="t2">8i risk enforcement · 8j venue dispatchers/endpoints (PM CLOB · OKX · Deribit · HL exchange) · serve unpark + keyed strategist · live ramp — entry gate: key → one keyed serve cycle + one monitor rollback observed live</text>
+<rect x="60" y="764" width="898" height="40" rx="10" class="n8"/>
+<text x="509" y="780" text-anchor="middle" font-size="10" font-weight="700" class="t8">STAGE-3 LANE — operator-gated (mvp-plan §7): NOTHING here executes an order anywhere</text>
+<text x="509" y="795" text-anchor="middle" font-size="8.3" class="t2">8i risk enforcement · 8j venue dispatchers/endpoints (PM CLOB · OKX · Deribit · HL exchange) · serve unpark + keyed strategist · live ramp — entry gate: key → one keyed serve cycle + one monitor rollback observed live</text>
 
 <!-- claude-worker plane -->
 <path d="M1090,112V184" class="lb" marker-end="url(#mB)"/>
 <path d="M1292,112V150" class="l8" marker-end="url(#mA)"/>
-<rect x="1000" y="150" width="390" height="428" rx="12" fill="rgba(139,92,246,0.05)" stroke="#8b5cf6" stroke-opacity="0.55" stroke-width="1.2"/>
+<rect x="1000" y="150" width="390" height="452" rx="12" fill="rgba(139,92,246,0.05)" stroke="#8b5cf6" stroke-opacity="0.55" stroke-width="1.2"/>
 <text x="1012" y="170" font-size="11" font-weight="700" class="t1">claude-worker <tspan font-weight="400" class="t2">— Python 3.14 · offline · 8 verbs (pnl = the ONE D1 addition)</tspan></text>
 <g font-size="8">
 <rect x="1016" y="182" width="358" height="50" rx="8" class="bx"/>
@@ -218,46 +235,47 @@
 <rect x="1016" y="240" width="358" height="52" rx="8" class="bx"/>
 <text x="1195" y="255" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">data plane — fetch / features / market-map</text>
 <text x="1195" y="269" text-anchor="middle" class="t2">PMLR features + keyless REST under RestBudget · map bootstrap + additive refresh</text>
-<text x="1195" y="282" text-anchor="middle" class="t2">M1d universe-file seeding · descriptors now also via instrument-manifest (D3)</text>
-<rect x="1016" y="300" width="358" height="64" rx="8" class="bx"/>
-<text x="1195" y="315" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">modules (never verbs) — the M3/M2/M4 data ops</text>
-<text x="1195" y="329" text-anchor="middle" class="t2">universe_refresh (00:00Z dailies) · candles → candles.db §9.4–9.7 (61k+ rows, drift-checked)</text>
-<text x="1195" y="342" text-anchor="middle" class="t2">iv_digest (§9.8): opt-summary → per-sym 1m/1h IV table BESIDE candles (571-row live proof)</text>
-<text x="1195" y="355" text-anchor="middle" class="t2">pnl_report: spawns audit-pnl → reports/pnl-⟨day⟩.json + .summary.txt (schema-checked)</text>
-<rect x="1016" y="372" width="358" height="50" rx="8" class="n8"/>
-<text x="1195" y="387" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">strategist — SEMI-MANUAL (Stage 2.5 operating mode)</text>
-<text x="1195" y="401" text-anchor="middle" class="t2">Claude-in-session via ai-session §4 verbs: fetch → author → REAL backtest → gates</text>
-<text x="1195" y="414" text-anchor="middle" class="t2">→ stage/commit · manual §8.5 rollback proven (H6b) · M5 widens inputs to full universe</text>
-<rect x="1016" y="430" width="358" height="46" rx="8" class="bx"/>
-<text x="1195" y="445" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">backtester + walk-forward monitor (code-complete, E2E-proven)</text>
-<text x="1195" y="459" text-anchor="middle" class="t2">gates in code: OOS&gt;0 · ≥50 trades / ≥2 days · DD ≤ $200 · bounds ≤ 100/250/1000</text>
-<text x="1195" y="470" text-anchor="middle" class="t8">§8.1 auto-promotion + §8.3 monitor live proofs = deferred to the Stage-3 entry gate</text>
-<rect x="1016" y="484" width="358" height="40" rx="8" class="bx"/>
-<text x="1195" y="498" text-anchor="middle" class="t2">state.db: cross-boot seq · ruleset registry (model/thesis) · events · prompt cache + ledger</text>
-<text x="1195" y="511" text-anchor="middle" class="t2">~/multivenue/worker: market-map.json · candidates/ · features/ · candles.db · reports/</text>
-<rect x="1016" y="532" width="358" height="38" rx="8" class="bx"/>
-<text x="1195" y="546" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">positions — paper view from capture</text>
-<text x="1195" y="559" text-anchor="middle" class="t2">exposure · realized+unrealized · HIP-4 |Yes−No| netting via hip4_pairs</text>
+<text x="1195" y="282" text-anchor="middle" class="t2">universe-file seeding (M1d) · descriptors via instrument-manifest (D3) · WS13 D1 fetch clean</text>
+<rect x="1016" y="300" width="358" height="76" rx="8" class="bx"/>
+<text x="1195" y="315" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">modules (never verbs) — the data-ops lanes</text>
+<text x="1195" y="329" text-anchor="middle" class="t2">universe_refresh (restart slots) · candles → candles.db §9.4–9.7 · iv_digest (§9.8)</text>
+<text x="1195" y="342" text-anchor="middle" class="t2">refdata + funding-history fold-ins (WS11) · pnl_report → reports/pnl-⟨day⟩ (D2 timer 00:20Z)</text>
+<text x="1195" y="355" text-anchor="middle" class="t2">recommit (#7b): post-restart ruleset re-commit — armed at boot, FAIL-SAFE refuses</text>
+<text x="1195" y="368" text-anchor="middle" class="t2">digest (#7a): +POSITIONS / per-strategy P&amp;L capped sections for M5 inputs</text>
+<rect x="1016" y="384" width="358" height="50" rx="8" class="n8"/>
+<text x="1195" y="399" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">strategist — SEMI-MANUAL (standing operating mode)</text>
+<text x="1195" y="413" text-anchor="middle" class="t2">Claude-in-session via ai-session §4 verbs: fetch → author → REAL backtest → gates</text>
+<text x="1195" y="426" text-anchor="middle" class="t2">→ stage/commit · manual §8.5 rollback proven (H6b) · M5 widens to full universe</text>
+<rect x="1016" y="442" width="358" height="46" rx="8" class="bx"/>
+<text x="1195" y="457" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">backtester + walk-forward monitor (code-complete, E2E-proven)</text>
+<text x="1195" y="471" text-anchor="middle" class="t2">gates in code: OOS&gt;0 · ≥50 trades / ≥2 days · DD ≤ $200 · bounds ≤ 100/250/1000</text>
+<text x="1195" y="482" text-anchor="middle" class="t8">§8.1 auto-promotion + §8.3 monitor live proofs = deferred to the Stage-3 entry gate</text>
+<rect x="1016" y="496" width="358" height="40" rx="8" class="bx"/>
+<text x="1195" y="510" text-anchor="middle" class="t2">state.db: cross-boot seq · ruleset registry (model/thesis) · events · prompt cache + ledger</text>
+<text x="1195" y="523" text-anchor="middle" class="t2">~/multivenue/worker: market-map.json · candidates/ · features/ · candles.db · reports/</text>
+<rect x="1016" y="544" width="358" height="38" rx="8" class="bx"/>
+<text x="1195" y="558" text-anchor="middle" font-size="9.5" font-weight="700" class="t1">positions — paper view from capture</text>
+<text x="1195" y="571" text-anchor="middle" class="t2">exposure · realized+unrealized · HIP-4 |Yes−No| netting via hip4_pairs</text>
 </g>
 
 <!-- UDS command path -->
-<path d="M1016,207H986V219H962" class="lp" marker-end="url(#mP)"/>
+<path d="M1016,207H986V219H972" class="lp" marker-end="url(#mP)"/>
 <text x="979" y="300" font-size="9" class="t1" transform="rotate(-90 979 300)" text-anchor="middle">UDS ai.sock — [len][AiCmd 64 B][HMAC 16 B]</text>
 
 <!-- launchd fleet -->
-<rect x="1000" y="588" width="390" height="92" rx="8" class="bx"/>
-<text x="1195" y="604" text-anchor="middle" font-size="10" font-weight="700" class="t1">launchd fleet (M3) — always-on, unattended</text>
-<text x="1195" y="619" text-anchor="middle" font-size="8" class="t2">com.multivenue.engine (KeepAlive, one-engine law) · daily-restart 00:00Z (SIGTERM drain</text>
-<text x="1195" y="631" text-anchor="middle" font-size="8" class="t2">+ universe refresh ⇒ one gap-free run dir per UTC day) · hourly candles agent · retention</text>
-<text x="1195" y="643" text-anchor="middle" font-size="8" class="t2">+ caffeinate · catalog is the C6 judge (N≥3 gap-free days ⇒ real-capture days gate opens)</text>
-<text x="1195" y="658" text-anchor="middle" font-size="8" class="t8">C6+ window owes: nightly pnl_report timer (D2) · iv_digest cadence · pmlr.py fold-ins</text>
-<text x="1195" y="671" text-anchor="middle" font-size="8" class="t8">M5 (next, on go): full-universe digest inputs · real-capture promotion · walk-forward runbook</text>
+<rect x="1000" y="612" width="390" height="96" rx="8" class="bx"/>
+<text x="1195" y="628" text-anchor="middle" font-size="10" font-weight="700" class="t1">launchd fleet — always-on, unattended (M3 + T2/D2/D3)</text>
+<text x="1195" y="643" text-anchor="middle" font-size="8" class="t2">com.multivenue.engine (KeepAlive, one-engine law) · daily-restart at UTC slots</text>
+<text x="1195" y="655" text-anchor="middle" font-size="8" class="t2">00:00 / 08:30 / 16:05 (SIGTERM drain + universe refresh) + 00:20 pnl_report timer</text>
+<text x="1195" y="667" text-anchor="middle" font-size="8" class="t2">hourly candles + iv_digest cycle (pgrep-first, off top-of-hour) · retention · caffeinate</text>
+<text x="1195" y="682" text-anchor="middle" font-size="8" class="t2">revive lever: echo 19700101 &gt; ~/multivenue/state/last-restart-utc-0000 (fires ≤60 s)</text>
+<text x="1195" y="695" text-anchor="middle" font-size="8" class="t8">#7b recommit wrapper-child arms at every boot unless disarmed (fail-safe refuses)</text>
 
 <!-- worker reads capture -->
-<path d="M500,613H994V330H1012" class="ln" stroke-dasharray="5 4" marker-end="url(#mN)"/>
-<text x="800" y="562" font-size="8.5" class="t2" text-anchor="middle">replay logs + manifests (mmap) — worker features · candles capture lane · iv_digest · positions read here</text>
-<path d="M958,713H988V680" class="ln" stroke-dasharray="5 4" marker-end="url(#mN)"/>
-<text x="1024" y="700" font-size="8" class="t2">audit-pnl spawned by pnl_report (§14 PATH contract); backtest by the backtest verb</text>
+<path d="M500,619H994V330H1012" class="ln" stroke-dasharray="5 4" marker-end="url(#mN)"/>
+<text x="800" y="568" font-size="8.5" class="t2" text-anchor="middle">replay logs + manifests (mmap) — worker features · candles capture lane · iv_digest · positions read here</text>
+<path d="M958,717H988V708" class="ln" stroke-dasharray="5 4" marker-end="url(#mN)"/>
+<text x="1024" y="730" font-size="8" class="t2">audit-pnl spawned by pnl_report (§14 PATH contract); backtest by the backtest verb</text>
 
 <!-- legend + status -->
 <g font-size="9">
@@ -265,13 +283,13 @@
 <line x1="340" y1="836" x2="376" y2="836" class="lg"/><text x="384" y="839" class="t2">offline analytics band</text>
 <line x1="540" y1="836" x2="576" y2="836" class="lp"/><text x="584" y="839" class="t2">AI command plane (UDS → SPSC ring)</text>
 <line x1="800" y1="836" x2="836" y2="836" class="ln" stroke-dasharray="5 4"/><text x="844" y="839" class="t2">files · offline · out-of-band</text>
-<line x1="1040" y1="836" x2="1076" y2="836" class="l8"/><text x="1084" y="839" class="t8" font-weight="700">M5 next / deferred lever / Stage-3 gate</text>
-<text x="60" y="858" class="t2">coverage (operator-ruled scope, all live-proven unless noted): PM CLOB binaries ×N · BN spot ×N + USDS-M ✓, BN options code-complete + REST live but stream OPERATOR-RULED UNREACHABLE (lever: BINANCE_EAPI_WS_HOST + restart) ·</text>
-<text x="60" y="872" class="t2">OKX spot + swap ✓ live (dated futures supported, config-in) + options ✓ live · Deribit perps + options ✓ live (spot never in scope) · HL perps ✓ live (spot @idx + HIP-4 #enc supported pass-through, config-in; HIP-4 netting in positions)</text>
-<text x="60" y="890" class="t2">P&amp;L attribution chain (M4, live): StampCtx-stamped intents → engine-orders.pmlr → audit-pnl (descriptor-keyed, per-strategy/per-hash, per-day) → pnl_report → `pnl` verb — beside the honest paper view (paper fills = none by design)</text>
-<text x="60" y="908" class="t2">doctrine: one unavoidable copy per event — the 64 B slot into the ring (RuleTable ferries by value at operator cadence, two documented copies) · every accepted AiCmd + intent is PMLR-logged · capture stays append-only</text>
-<text x="60" y="926" class="t2">status 2026-08-23 (M4 close): Stage 2 + M1 + M2 + M4 CLOSED · M3 fleet LIVE, calendar-waiting C6 (earliest 2026-08-26) · gates 1240 nextest / 38 alloc 0 B/op / 439 pytest / fuzz standing · selection LAW one home (crates/options-select)</text>
-<text x="60" y="944" class="t2">cores: engine 0 · polymarket 1 · binance 2 · rpc 3 · ai 4 · okx 5 · deribit 6 · hyperliquid 7 — pinning effective on Linux (Phase 7); advisory on macOS · secrets: .env only (HMAC key permanent; no Anthropic key until Stage 3)</text>
-<text x="60" y="962" class="t8">amber summary: BN options WS lever (revisit ≤ M6 soak) · nightly pnl timer + digest cadence + pmlr fold-ins land in M3's C6+ window · M5 = research loop on full universe, real data, SEMI-MANUAL · Stage 3 only through mvp-plan §7</text>
+<line x1="1040" y1="836" x2="1076" y2="836" class="l8"/><text x="1084" y="839" class="t8" font-weight="700">remaining / deferred lever / Stage-3 gate</text>
+<text x="60" y="858" class="t2">coverage (all live-proven in the 2026-08-29 soak unless noted): PM CLOB binaries ×N · BN spot ×N + USDS-M + dated ✓ (markPrice + options WS venue-side dark from this network, probe-proven — `.env` host levers, no code change) ·</text>
+<text x="60" y="872" class="t2">Bybit spot + linear ✓ (data-only sixth venue) · OKX spot + swap + futures + options + L2 depth ✓ · Deribit perps + options + spot + L2 depth ✓ · HL perps ✓ (spot @idx + HIP-4 #enc pass-through, config-in; HIP-4 netting in positions)</text>
+<text x="60" y="890" class="t2">P&amp;L attribution chain (M4, live): StampCtx-stamped intents → engine-orders.pmlr → audit-pnl (descriptor-keyed, per-strategy/per-hash, per-day) → pnl_report (00:20Z timer) → `pnl` verb — beside the honest paper view</text>
+<text x="60" y="908" class="t2">doctrine: one unavoidable copy per event — the slot into the ring (64 B; depth snapshots 192 B, kind 7; RuleTable ferries by value at operator cadence, two documented copies) · every accepted AiCmd + intent is PMLR-logged · capture append-only</text>
+<text x="60" y="926" class="t2">status 2026-08-29 (Stage 2 FINISHED): WS2–WS13 coded + gated + soak GREEN (operator-amended 1 h) — 08:00Z settlement crossed ALIVE (okx 1 441 non-fatal SubDrops) · integrity ZERO pm/bn/okx/hl/bybit · depth okx 9 678 + der 8 687 STALE=0 · gates 1345 nextest / 38 alloc 0 B/op / 477 pytest / fuzz 7 targets / make lint green</text>
+<text x="60" y="944" class="t2">cores: engine 0 · polymarket 1 · binance 2 · rpc 3 · ai 4 · okx 5 · deribit 6 · hyperliquid 7 · bybit 8 — pinning effective on Linux (Phase 7); advisory on macOS · secrets: .env only (HMAC key permanent; no Anthropic key until Stage 3)</text>
+<text x="60" y="962" class="t8">amber summary — left before Stage 3: §5.4 okx churn fix (named: err pump/io other ~1/s + per-arg OPTION-block subscribe refusals; pre-existing) · C6 fill-days sub-gate (operator bless or Aug-31 bounded rerun) · M5 semi-manual research loop on explicit go · the §7 ENTRY GATE (key → keyed serve cycle + monitor rollback observed live)</text>
 </g>
 </svg>
