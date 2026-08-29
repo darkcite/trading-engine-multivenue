@@ -174,9 +174,12 @@ fn golden_two_run_two_venue_capture_hold_model_report() {
     assert_eq!(s.capture_utc_days, 1, "both wall epochs land on 1970-01-01");
 
     // vm drive through the REAL paths: commit flipped (or `run` would
-    // have errored), row evaluated on every pm tick, fired twice
-    // (cooldown swallowed the middle tick), emitted twice at $50.
-    assert_eq!(s.vm_evals, 3);
+    // have errored), row evaluated on every tick of EITHER leg (VM2
+    // V3 two-legged freshness: the two bn ref ticks evaluate too —
+    // run-1's fire lands on its ref tick, 200 ns EARLIER than v1's,
+    // on fresher data; fires/emits/bounds unchanged), fired twice
+    // (cooldown swallowed the middle pm tick), emitted twice at $50.
+    assert_eq!(s.vm_evals, 5);
     assert_eq!(s.vm_fires, 2);
     assert_eq!(s.vm_orders_emitted, 2);
     assert_eq!(s.vm_orders_dropped, 0);

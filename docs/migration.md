@@ -30,6 +30,51 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-30 — VM2 V3: the v2 grammar evaluator + position layer live in strategy-vm
+
+**What changed**
+
+- `VmStrategy` evaluates the GENERAL v2 grammar (vm2-plan §1.2–§1.3)
+  over the V2 feature engine: two-operand signals, confirm gates,
+  the position state machine (Flat→Entered→Flat), group exclusivity,
+  two-leg emits, min/max-hold, the universal exit law
+  `signal × entry_sign ≤ exit_1e9`, and `PositionSeed` (D-2)
+  restore. v1 `RuleTable`s arriving through the UNCHANGED trait seam
+  map row-for-row onto v2 sugar rows (`RuleRowV2::from_v1` — the
+  byte-exact v1 semantics law); the §6 handoff ring stays v1-typed
+  until V4 flips the validator.
+- SEMANTIC DELTA (deliberate, vm2-plan §1.2): rows now evaluate when
+  EITHER leg's sym ticks (two-legged signal freshness) — v1
+  evaluated on action-sym ticks only. Fires move to the FIRST tick
+  that satisfies them (fresher data); condition/emit laws unchanged.
+  The golden harness pins the new eval counts.
+- The vm's book generic retired (`VmStrategy<N>` → `VmStrategy`) —
+  mids live in the feature engine (`FEAT_SYM_SLOTS` grew 1024→4096,
+  absorbing the old `BACKTEST_VM_SLOTS` law); `SET_VM_SLOTS` retired
+  with it.
+- Sizing law hardened (caps-proptest catch): a qty whose NOTIONAL
+  floors to zero is clamped away (the §11 zero-notional invariant
+  now lives in `sized_qty_1e6` itself).
+
+**Why**
+
+- vm2-plan §4-V3: the general grammar must execute engine-side
+  before the validator (V4) can accept it from artifacts.
+
+**Impact**
+
+- On-disk formats: none. Config keys: none. Wire formats: none (the
+  evaluator is in-process; V1's formats stand).
+
+**Migration steps**
+
+1. None — v1 artifacts behave identically through the sugar mapping
+   (two-legged evaluation moves WHEN a fire lands, never whether).
+
+**Rollback**
+
+- Revert the commit.
+
 ## 2026-08-29 — VM2 V2: feature engine, OptSummary engine lanes, Deribit Funding `v1` = funding_8h, HL event lane
 
 **What changed**

@@ -3,74 +3,81 @@
 
 //! # strategy-vm
 //!
-//! The ruleset-VM strategy (Phase 8g, design §7): slot 5 of the
-//! `StrategySet`. Evaluates the operator-committed [`RuleTable`] in
-//! the engine hot path — zero alloc, zero `dyn`, compile-time
+//! The ruleset-VM strategy: slot 5 of the `StrategySet`. Since VM2 V3
+//! it evaluates the GENERAL v2 grammar (vm2-plan §1.2–§1.3) over the
+//! V2 feature engine — zero alloc, zero `dyn`, compile-time
 //! monomorphized like every other member.
 //!
-//! State is fully inline:
+//! State is fully inline (plus the one boxed feature block):
 //!
-//! * `[RuleTable; 2]` — active/staged **ping-pong** (§6). The engine's
-//!   table-ring pop lands in the staged buffer via
-//!   [`VmStrategy::receive_table`] (**documented copy #2**, 16 KiB+64
-//!   by value, operator cadence; a later pop overwrites staged =
-//!   engine-side restage-supersedes). The in-stream `RulesetCommit`
-//!   flips the index — **no copy at flip**.
-//! * `MultiBook<N>` for top-of-book. Symbols are tracked **lazily**:
-//!   the first tick of a symbol the active table references (action
-//!   OR reference leg) claims a book slot.
-//! * Per-row cooldown stamps (`[u64; 256]`) — `CooldownGate`-style
-//!   lazy `now_ns` compares, but per-row `horizon_ms` (the shared
-//!   gate type carries one global cooldown, rows each carry their
-//!   own), so the stamps live inline. No `on_timer` sweep (§7.1
-//!   timer disabled): stamps are compared lazily at eval time.
+//! * `[RuleTableV2; 2]` — active/staged **ping-pong** (8g §6). v1
+//!   [`RuleTable`]s arriving through the unchanged trait seam are
+//!   mapped row-for-row onto v2 sugar rows at receive
+//!   ([`RuleRowV2::from_v1`] — byte-exact v1 semantics, ONE
+//!   evaluator); V4 moves the mapping into the validator's compat
+//!   arm. The in-stream `RulesetCommit` flips the index — no copy at
+//!   flip.
+//! * [`features::FeatureState`] — every §1.1 feature (V2).
+//! * `[VmPosition; 256]` — the §1.3 position layer (8i's paper-grade
+//!   precursor): per-row `Flat → Entered → Flat`, group exclusivity,
+//!   two-leg emits, min/max-hold, the universal exit law.
+//! * Per-row cooldown stamps — refire horizon (v1 law) and the
+//!   position rows' re-entry cooldown share them.
 //!
-//! ## Trigger semantics (§7.1, D2 as amended)
+//! ## Evaluation (vm2-plan §1.2)
 //!
-//! Both legs are venue-explicit via namespaced SymbolIds; `ctx.submit`
-//! is venue-agnostic (the order's venue byte decodes from `row.sym`).
-//! Every trigger requires a **two-sided book** (`bid_px > 0 &&
-//! ask_px > 0`) on the action sym — and on the reference leg for
-//! `cross_deviation` — so one-sided/preopen books (the 8e OKX lesson)
-//! can never fire; the emit price is the action-sym mid (house
-//! pattern: post-only at mid, like rule-tree and ai-exec).
+//! A row evaluates when EITHER leg's sym ticks (signal freshness is
+//! two-legged; v1 rows keep action-sym-only firing semantics through
+//! their `LhsOnly`/ref shapes — a ref tick evaluates the row but the
+//! signal law is identical). Signal = `combine(feat_a(sym, win_a),
+//! feat_b(ref, win_b))` in the ×1e9 domain; ABSENT anywhere ⇒ the
+//! row HOLDS (the carry_signal absent-data law — entries and exits
+//! both). Entry compares per `cmp_bits` (LE/GE, abs); an optional
+//! confirm gates ENTRY only. Direction for signal-signed rows is
+//! mean-reverting (signal > 0 ⇒ sym rich ⇒ `Ask`), with `side` as a
+//! filter; `LhsOnly` rows emit `side` itself.
 //!
-//! * `cross_deviation`: fire when `|mid(sym) − mid(ref)|` in basis
-//!   points of `mid(ref)` reaches `edge_bps`
-//!   (`|dev| × 10_000 ≥ edge_bps × mid(ref)`, i128 — overflow-free).
-//!   Direction is mean-reverting, the ai-exec convention: sym rich
-//!   (`dev > 0`) ⇒ `Ask`, sym cheap ⇒ `Bid`. `row.side` acts as a
-//!   **filter**: a `bid`/`ask` row fires only when the computed
-//!   direction matches; `both` takes either.
-//! * `level_breach`: the row's side is the **emitted** side and the
-//!   trigger watches the price you would transact at — `bid` rows
-//!   fire when best ask ≤ `level_1e6` (buy at/below the level),
-//!   `ask` rows fire when best bid ≥ `level_1e6` (sell at/above).
-//!   "Crosses" is realized as level-attained + horizon re-arm: a
-//!   fired row sleeps `horizon_ms`, so a level that HOLDS refires at
-//!   most once per horizon. `both` checks the bid leg first, then the
-//!   ask leg — at most one emission per row per tick, deterministic.
+//! **v1 sugar arm** (documented, keyed on `LhsOnly` + `SIDE_BOTH` +
+//! refire): the both-sides `level_breach` is two transact-price
+//! checks — bid leg first (ask ≤ level ⇒ `Bid`), then ask leg
+//! (bid ≥ level ⇒ `Ask`) — at most one emission per row per tick,
+//! deterministic, byte-identical to v1.
 //!
-//! A fired row re-arms after `horizon_ms`; the stamp is recorded
-//! **only on an accepted submit** (`CooldownGate::record_emit`
-//! doctrine — a ring-full reject leaves the row armed to retry).
-//! Commit flips reset every stamp: a fresh table boots fully armed.
+//! ## Position law (§1.3, D-2)
+//!
+//! Entry (position rows, `Flat`): entry condition + confirm + the
+//! re-entry cooldown (`horizon_ms` since the last exit) + group
+//! exclusivity (rows sharing a `group` byte hold at most ONE
+//! position — the first qualifying row in table order enters). A
+//! real `ref` emits BOTH legs — opposite sides, equal notional, each
+//! leg clamped to `min(row cap, policy cap)`; `CONST` rows emit one
+//! leg. Paper law: the position advances on the ACCEPTED sym-leg
+//! SUBMIT (paper has no fills; 8i upgrades to fill-confirmed without
+//! touching the grammar). A ref-leg ring-full refusal is counted
+//! (`leg_drops`) and never blocks the position record.
+//!
+//! Exit (`Entered`): `max_hold_s` age-out fires UNCONDITIONALLY once
+//! exceeded; otherwise exits evaluate only after `min_hold_s`, on
+//! the universal reversion law `signal × entry_sign ≤ exit_1e9`
+//! (`entry_sign` = sign of the entry signal) — it covers |signal|
+//! decay AND sign flips (xv), spread < 0 after min-hold (CVFC) and
+//! directional < threshold (S1) in one comparison. Closers emit both
+//! legs at live mids; an unpriceable leg (absent mid) HOLDS the
+//! position and counts `exit_blocked`.
+//!
+//! Restart: a commit flip resets every position to `Flat` and every
+//! stamp to armed (a NEW table's rows are new identities);
+//! [`AiCmdKind::PositionSeed`] (D-2) restores a row's position
+//! post-#7b — row index + entered side + entry px + age; entry QTY
+//! re-derives from the row's OWN sizing law at the seeded px, so
+//! restores respect current caps; mismatched sym / non-position row
+//! / occupied row or group ⇒ the seed is REFUSED (counted).
 //!
 //! ## Emit-time re-clamp (defense in depth; 8i replaces with RiskGate)
 //!
-//! Per order: `qty` is sized so `notional = px×qty/1e6 ≤
-//! min(row.max_risk_1e6, $100)` — the row's own cap re-clamped
-//! against the `docs/risk-policy.md` single-order cap, independently
-//! of the §4.2 rule-7 validation (two enforcement layers by design; a
-//! hand-built table that never saw the validator is still policy-
-//! clamped). Because each row emits at most once per tick and each
-//! order respects its row's cap, one evaluation pass emits at most
-//! `Σ max_risk_1e6` per sym / per table — the rule-7-validated
-//! budgets (≤ $250 / ≤ $1 000); the caps proptest pins exactly this
-//! composition. The risk-policy per-symbol/total NET caps are
-//! position caps: they need fill feedback and belong to 8i's
-//! RiskGate (§15) — the engine's open-order caps bound the in-flight
-//! count meanwhile.
+//! Per order: `notional ≤ min(row.max_risk_1e6, policy cap)` —
+//! independent of the §4.2 rule-7 validation (two layers by design).
+//! Position rows apply it PER LEG.
 //!
 //! ## Inert states (§7.3)
 //!
@@ -78,21 +85,18 @@
 //! `on_tick` falls through on one predictable branch. Booting inert
 //! under `--strategy all` is normal, not an error.
 //!
-//! ## `on_ai` (§6)
+//! ## `on_ai` (§6 + VM2)
 //!
-//! Consumes `RulesetCommit` ONLY: reassembles the identity via
-//! [`AiCmd::ruleset_hash128`] (THE shared helper — same code path as
-//! the ingress-ai side path), compares against the staged buffer's
-//! `hash128`; match ⇒ index flip, mismatch/no-staged ⇒ drop +
-//! `commits_dropped`. `RulesetStage` is deliberately ignored (a
-//! side-path concern), as is every other kind — fair values and
-//! biases stay ai-exec's domain, and per D3 (a) the committed table
-//! persists through worker silence: the vm tracks no liveness.
+//! Consumes `RulesetCommit` (staged-hash match ⇒ flip, feature
+//! rebind, positions reset), `FundingSeed` (D-1 — folded into the
+//! SAME funding windows live events feed) and `PositionSeed` (D-2 —
+//! above). Everything else (Stage included) is deliberately ignored.
 //!
-//! Hot path: one `len == 0` branch when inert; else one `MultiBook`
-//! apply + a linear row scan (≤ 256 contiguous 64 B rows,
-//! `get_unchecked` inside safe wrappers). Zero alloc after boot —
-//! gate 36 in `bench/tests/alloc_assertions.rs`.
+//! Hot path: one `len == 0` branch when inert; else a linear row
+//! scan (≤ 256 contiguous 128 B rows, `get_unchecked` inside safe
+//! wrappers) over feature reads that are O(1) except the documented
+//! once-per-minute lazy recomputes. Zero alloc after boot — release
+//! alloc gates 38/39 in `bench/tests/alloc_assertions.rs`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -104,11 +108,12 @@
     clippy::undocumented_unsafe_blocks
 )]
 
-use book_builder::MultiBook;
 use core_time::NsTs;
 use core_types::{
-    symbol_venue_byte, AiCmd, AiCmdKind, ChannelEvent, DepthTopK, Fill, OptSummary, Order, Price,
-    Qty, RuleRow, RuleTable, Side, Signal, SymbolId, Tick, VenueId, RULE_TABLE_ROWS,
+    symbol_venue_byte, AiCmd, AiCmdKind, ChannelEvent, CombineOp, DepthTopK, FeatId, Fill,
+    OptSummary, Order, Price, Qty, RuleRowV2, RuleTable, RuleTableV2, Side, Signal, SymbolId,
+    Tick, VenueId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS,
+    CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, ROW_FLAG_POSITION, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
 };
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
@@ -124,31 +129,78 @@ pub const POLICY_SINGLE_ORDER_CAP_1E6: i64 = 10_000_000_000;
 
 const ORDER_KIND_POST_ONLY: u8 = 0;
 
-/// The ruleset-VM strategy. `N` sizes the book table (it must cover
-/// every distinct action + reference leg the active table can name —
-/// the set instantiates `VmStrategy<512>`: 256 rows × 2 legs).
-pub struct VmStrategy<const N: usize> {
+/// Position state byte: no position held.
+const POS_FLAT: u8 = 0;
+/// Position state byte: entered (fields below meaningful).
+const POS_ENTERED: u8 = 1;
+
+/// One row's position (§1.3). POD, inline array in the vm.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct VmPosition {
+    /// Entry qty on the action leg, ×1e6.
+    pub qty_sym_1e6: i64,
+    /// Entry qty on the ref leg, ×1e6 (0 = single-leg row).
+    pub qty_ref_1e6: i64,
+    /// Action-leg entry px ×1e6.
+    pub entry_px_1e6: i64,
+    /// Engine-monotonic entry time.
+    pub entry_ts_ns: u64,
+    /// [`POS_FLAT`] / [`POS_ENTERED`].
+    pub state: u8,
+    /// Action-leg entered side ([`Side`] byte).
+    pub side: u8,
+    /// Sign of the entry signal: +1 or −1 (the exit law's memory).
+    pub entry_sign: i8,
+    _pad: [u8; 5],
+}
+
+impl VmPosition {
+    const FLAT: Self = Self {
+        qty_sym_1e6: 0,
+        qty_ref_1e6: 0,
+        entry_px_1e6: 0,
+        entry_ts_ns: 0,
+        state: POS_FLAT,
+        side: 0,
+        entry_sign: 0,
+        _pad: [0; 5],
+    };
+}
+
+/// The ruleset-VM strategy (VM2: non-generic — books live in the
+/// feature engine's fixed sym slots).
+pub struct VmStrategy {
     /// Active/staged ping-pong (§6). `active & 1` indexes the live
     /// table; the other slot is the staging target.
-    tables: [RuleTable; 2],
+    tables: [RuleTableV2; 2],
     active: u8,
     /// The staging buffer holds a table received since the last flip.
     staged_valid: bool,
 
-    book: MultiBook<N>,
-
-    /// Per-row cooldown stamps (ns of the last ACCEPTED emit; 0 =
-    /// armed). Row-indexed into the ACTIVE table; reset on flip.
+    /// Per-row cooldown stamps (ns of the last ACCEPTED emit /
+    /// position exit; 0 = armed). Row-indexed into the ACTIVE table;
+    /// reset on flip.
     last_fire_ns: [u64; RULE_TABLE_ROWS],
+    /// Per-row positions (§1.3). Reset on flip; seeded via
+    /// `PositionSeed`.
+    positions: [VmPosition; RULE_TABLE_ROWS],
 
     next_oid: u64,
 
-    /// Rows evaluated (passed the `sym` filter) across all ticks.
+    /// VM2 V2: the feature engine — per-sym latest values, rolling
+    /// windows, funding APRs, mark/IV, depth and clock features. ONE
+    /// boxed block, allocated zeroed at construction (boot), fed by
+    /// the Strategy callbacks and read by the evaluator. Public for
+    /// the backtest harness (§1.5 parity) and tests.
+    pub feats: Box<features::FeatureState>,
+
+    /// Rows evaluated (matched a ticking leg) across all ticks.
     pub evals: u64,
-    /// Rows whose trigger (incl. the side constraint) fired — the §9
+    /// Rows whose ENTRY condition (confirm included) held — the §9
     /// pre-clamp counter.
     pub fires: u64,
-    /// Orders accepted by the dispatcher.
+    /// Orders accepted by the dispatcher (legs count individually).
     pub orders_emitted: u64,
     /// Orders rejected by the dispatcher (ring full).
     pub orders_dropped: u64,
@@ -156,39 +208,53 @@ pub struct VmStrategy<const N: usize> {
     pub commits_applied: u64,
     /// In-stream Commits dropped: no staged table or hash mismatch.
     pub commits_dropped: u64,
-    /// Referenced symbols that could not claim a book slot (`N`
-    /// exhausted) — evaluation for them stays off, fail closed.
-    pub book_track_failed: u64,
-
-    /// VM2 V2: the feature engine — per-sym latest values, rolling
-    /// windows, funding APRs, mark/IV, depth and clock features. ONE
-    /// boxed block, allocated zeroed at construction (boot), fed by
-    /// the Strategy callbacks below and read by the v2 evaluator
-    /// (V3). Public for the backtest harness (§1.5 parity) and tests.
-    pub feats: Box<features::FeatureState>,
+    /// Position entries recorded (pairs and singles alike).
+    pub entries: u64,
+    /// Round-trips completed (entry + exit) — the D-3 unit.
+    pub round_trips: u64,
+    /// Ref-leg submits refused by the dispatcher on an otherwise
+    /// recorded entry/exit (module docs paper law).
+    pub leg_drops: u64,
+    /// Exits blocked by an unpriceable leg (absent mid) — position
+    /// HELD.
+    pub exit_blocked: u64,
+    /// Entries blocked by an unpriceable leg (signal fired, no mid).
+    pub entry_blocked: u64,
     /// FundingSeed commands folded into the feature engine (D-1).
     pub funding_seeds_applied: u64,
+    /// PositionSeed commands applied (D-2).
+    pub position_seeds_applied: u64,
+    /// PositionSeed commands refused (bad row / sym mismatch /
+    /// occupied / non-position row / no table).
+    pub position_seeds_refused: u64,
 }
 
-impl<const N: usize> VmStrategy<N> {
-    /// Construct the inert strategy (no table, empty book). Boot-only.
+impl VmStrategy {
+    /// Construct the inert strategy (no table, cold features).
+    /// Boot-only (the feature block allocates here, once).
     pub fn new() -> Self {
         Self {
-            tables: [RuleTable::EMPTY; 2],
+            tables: [RuleTableV2::EMPTY; 2],
             active: 0,
             staged_valid: false,
-            book: MultiBook::empty(),
             last_fire_ns: [0; RULE_TABLE_ROWS],
+            positions: [VmPosition::FLAT; RULE_TABLE_ROWS],
             next_oid: 1,
+            feats: features::FeatureState::new_boxed(),
             evals: 0,
             fires: 0,
             orders_emitted: 0,
             orders_dropped: 0,
             commits_applied: 0,
             commits_dropped: 0,
-            book_track_failed: 0,
-            feats: features::FeatureState::new_boxed(),
+            entries: 0,
+            round_trips: 0,
+            leg_drops: 0,
+            exit_blocked: 0,
+            entry_blocked: 0,
             funding_seeds_applied: 0,
+            position_seeds_applied: 0,
+            position_seeds_refused: 0,
         }
     }
 
@@ -220,51 +286,341 @@ impl<const N: usize> VmStrategy<N> {
         }
     }
 
-    /// §6 copy #2 target: the engine's table-ring pop hands the
-    /// popped slot here (item 7 wires the call; gate 35 exercises it
-    /// directly). Copies the table into the staging buffer —
-    /// **documented copy #2** (16 KiB + 64 by value, operator
-    /// cadence, moves bytes never the heap). A later call overwrites
-    /// the staged table: the engine-side restage-supersedes mirror.
+    /// Read one row's position (tests/backtest surface).
+    #[inline]
+    pub fn position(&self, row: usize) -> Option<&VmPosition> {
+        if row < RULE_TABLE_ROWS && self.positions[row].state == POS_ENTERED {
+            Some(&self.positions[row])
+        } else {
+            None
+        }
+    }
+
+    /// §6 copy #2 target for v1 tables: maps rows onto v2 sugar
+    /// ([`RuleTableV2::map_v1`]) into the staging buffer. The trait
+    /// seam stays byte-frozen until V4 flips the handoff ring to v2.
     pub fn receive_table(&mut self, table: &RuleTable) {
+        let sidx = ((self.active & 1) ^ 1) as usize;
+        RuleTableV2::map_v1(table, &mut self.tables[sidx]);
+        self.staged_valid = true;
+    }
+
+    /// §6 copy #2 target for NATIVE v2 tables (the V4 handoff / the
+    /// backtest harness). Same staging semantics.
+    pub fn receive_table_v2(&mut self, table: &RuleTableV2) {
         let sidx = ((self.active & 1) ^ 1) as usize;
         self.tables[sidx] = *table;
         if self.tables[sidx].len as usize > RULE_TABLE_ROWS {
-            // Unreachable through the §4.2 validator; clamping here
-            // is what upholds the hot loop's `get_unchecked` bound at
-            // the single mutation entry point (safe-wrapper doctrine).
+            // Unreachable through the validator; clamping here
+            // upholds the hot loop's `get_unchecked` bound at the
+            // mutation entry point (safe-wrapper doctrine).
             debug_assert!(false, "received table len exceeds RULE_TABLE_ROWS");
             self.tables[sidx].len = RULE_TABLE_ROWS as u32;
         }
         self.staged_valid = true;
     }
 
-    /// Does the active table reference `sym` on either leg? Decides
-    /// lazy book tracking for first-sighted symbols.
-    #[inline(always)]
-    fn table_references(&self, sym: SymbolId, alen: usize) -> bool {
+    /// Post-flip rebind: rolling windows for every windowed feature
+    /// leg of the new ACTIVE table (feature history is deliberately
+    /// discarded — new windows warm honestly), positions reset,
+    /// stamps armed.
+    fn on_table_flipped(&mut self) {
+        self.feats.clear_roll_bindings();
         let ai = (self.active & 1) as usize;
-        let mut i = 0usize;
-        while i < alen {
-            // SAFETY: `i < alen ≤ len`, and `receive_table` clamps
-            // every stored table's `len` to `RULE_TABLE_ROWS`.
-            let r = unsafe { self.tables.get_unchecked(ai).rows.get_unchecked(i) };
-            if r.sym == sym || r.ref_sym == sym {
-                return true;
+        let len = self.tables[ai].len as usize;
+        let mut i = 0;
+        while i < len {
+            let r = self.tables[ai].rows[i];
+            let legs = [
+                (r.feat_a, r.win_a, r.sym),
+                (r.feat_b, r.win_b, r.ref_sym),
+                (r.feat_c, r.win_c, r.sym),
+                (
+                    r.feat_c,
+                    r.win_c,
+                    if r.cmp_bits & CMP_CONFIRM_PAIR != 0 {
+                        r.ref_sym
+                    } else {
+                        SYMBOL_ID_NONE
+                    },
+                ),
+            ];
+            let mut l = 0;
+            while l < legs.len() {
+                let (fb, win, sym) = legs[l];
+                if sym != SYMBOL_ID_NONE && win > 0 {
+                    if let Some(f) = FeatId::from_u8(fb) {
+                        if f.requires_window() {
+                            // Exhaustion fails closed (features stay
+                            // absent ⇒ rows hold); the V4 validator
+                            // refuses tables that need more.
+                            let _ = self.feats.bind_roll(sym, win);
+                        }
+                    }
+                }
+                l += 1;
             }
             i += 1;
         }
+        let mut i = 0;
+        while i < RULE_TABLE_ROWS {
+            self.last_fire_ns[i] = 0;
+            self.positions[i] = VmPosition::FLAT;
+            i += 1;
+        }
+    }
+
+    /// Compute a row's signal in the ×1e9 domain. `None` = ABSENT
+    /// (the row holds).
+    #[inline]
+    fn signal_of(&mut self, row: &RuleRowV2, now: u64) -> Option<i64> {
+        let fa = FeatId::from_u8(row.feat_a)?;
+        let a = self.feats.read(fa, row.sym, row.win_a, now)?;
+        let combine = CombineOp::from_u8(row.combine)?;
+        if matches!(combine, CombineOp::LhsOnly) {
+            return Some(a);
+        }
+        let fb = FeatId::from_u8(row.feat_b)?;
+        let b = self.feats.read(fb, row.ref_sym, row.win_b, now)?;
+        Self::combine_1e9(combine, a, b)
+    }
+
+    /// The confirm condition (ENTRY gate). `true` when absent
+    /// (`feat_c == FEAT_NONE`); ABSENT DATA ⇒ `false` (hold).
+    #[inline]
+    fn confirm_ok(&mut self, row: &RuleRowV2, now: u64) -> bool {
+        if row.feat_c == FEAT_NONE {
+            return true;
+        }
+        let fc = match FeatId::from_u8(row.feat_c) {
+            Some(f) => f,
+            None => return false,
+        };
+        let sig = if row.cmp_bits & CMP_CONFIRM_PAIR != 0 {
+            let a = match self.feats.read(fc, row.sym, row.win_c, now) {
+                Some(v) => v,
+                None => return false,
+            };
+            let b = match self.feats.read(fc, row.ref_sym, row.win_c, now) {
+                Some(v) => v,
+                None => return false,
+            };
+            let combine = match CombineOp::from_u8(row.combine) {
+                Some(c) => c,
+                None => return false,
+            };
+            match Self::combine_1e9(combine, a, b) {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            match self.feats.read(fc, row.sym, row.win_c, now) {
+                Some(v) => v,
+                None => return false,
+            }
+        };
+        let v = if row.cmp_bits & CMP_CONFIRM_ABS != 0 {
+            sig.saturating_abs()
+        } else {
+            sig
+        };
+        if row.cmp_bits & CMP_CONFIRM_LE != 0 {
+            v <= row.confirm_1e9
+        } else {
+            v >= row.confirm_1e9
+        }
+    }
+
+    /// Combine two ×1e9 operands. `LhsOnly` never reaches here.
+    #[inline(always)]
+    fn combine_1e9(op: CombineOp, a: i64, b: i64) -> Option<i64> {
+        match op {
+            CombineOp::Diff => Some(a.saturating_sub(b)),
+            CombineOp::DiffBps => {
+                if b == 0 {
+                    return None;
+                }
+                let n = (a as i128 - b as i128) * 10_000 * 1_000_000_000 / (b as i128);
+                Some(n.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+            }
+            CombineOp::Ratio1e9 => {
+                if b == 0 {
+                    return None;
+                }
+                let n = a as i128 * 1_000_000_000 / (b as i128);
+                Some(n.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+            }
+            CombineOp::LhsOnly => Some(a),
+        }
+    }
+
+    /// The entry comparison per `cmp_bits`.
+    #[inline(always)]
+    fn entry_fires(row: &RuleRowV2, signal: i64) -> bool {
+        let v = if row.cmp_bits & CMP_ENTRY_ABS != 0 {
+            signal.saturating_abs()
+        } else {
+            signal
+        };
+        if row.cmp_bits & CMP_ENTRY_LE != 0 {
+            v <= row.enter_1e9
+        } else {
+            v >= row.enter_1e9
+        }
+    }
+
+    /// Per-leg sized qty at `px_1e6` under `min(row cap, policy)`.
+    /// 0 = the cap cannot buy any MEANINGFUL quantity: a qty whose
+    /// notional floors to zero is clamped away too (the §11
+    /// zero-notional invariant — a 1-micro-dollar cap at a
+    /// near-dollar px must emit nothing, not a notional-0 order).
+    #[inline(always)]
+    fn sized_qty_1e6(row_cap_1e6: i64, px_1e6: i64) -> i64 {
+        let mut allowed = row_cap_1e6;
+        if allowed > POLICY_SINGLE_ORDER_CAP_1E6 {
+            allowed = POLICY_SINGLE_ORDER_CAP_1E6;
+        }
+        if allowed <= 0 || px_1e6 <= 0 {
+            return 0;
+        }
+        let q = ((allowed as i128 * 1_000_000) / px_1e6 as i128) as i64;
+        if (px_1e6 as i128 * q as i128) < 1_000_000 {
+            return 0;
+        }
+        q
+    }
+
+    /// Live mid ×1e6 for an emit leg (`None` = unpriceable now).
+    #[inline(always)]
+    fn mid_1e6(&mut self, sym: SymbolId, now: u64) -> Option<i64> {
+        let m = self.feats.read(FeatId::Mid, sym, 0, now)?;
+        Some(m / 1_000)
+    }
+
+    /// Submit one leg; returns true when the dispatcher accepted.
+    #[inline(always)]
+    fn submit_leg<C: Ctx>(
+        &mut self,
+        ctx: &mut C,
+        sym: SymbolId,
+        side: Side,
+        px_1e6: i64,
+        qty_1e6: i64,
+        now: u64,
+    ) -> bool {
+        let venue = match VenueId::from_u8(symbol_venue_byte(sym)) {
+            Some(v) => v,
+            None => {
+                // Rows are validated against the boot universe — an
+                // undecodable venue byte cannot happen.
+                debug_assert!(false, "row leg with undecodable venue");
+                return false;
+            }
+        };
+        let order = Order::new(
+            now,
+            venue,
+            sym,
+            side,
+            ORDER_KIND_POST_ONLY,
+            Price::from_raw(px_1e6),
+            Qty::from_raw(qty_1e6),
+            self.next_oid,
+        );
+        self.next_oid = self.next_oid.wrapping_add(1);
+        match ctx.submit(order) {
+            Ok(()) => {
+                self.orders_emitted = self.orders_emitted.wrapping_add(1);
+                true
+            }
+            Err(SubmitErr::RingFull) => {
+                self.orders_dropped = self.orders_dropped.wrapping_add(1);
+                false
+            }
+        }
+    }
+
+    /// Is any OTHER row of `group` holding a position? (Group law —
+    /// O(len) at entry attempts only; entries are rare.)
+    #[inline]
+    fn group_occupied(&self, group: u8, me: usize, len: usize) -> bool {
+        if group == GROUP_NONE {
+            return false;
+        }
+        let ai = (self.active & 1) as usize;
+        let mut j = 0;
+        while j < len {
+            if j != me
+                && self.positions[j].state == POS_ENTERED
+                && self.tables[ai].rows[j].group == group
+            {
+                return true;
+            }
+            j += 1;
+        }
         false
+    }
+
+    /// Emit a position exit's closers and settle the state. Returns
+    /// true when the position closed (sym leg accepted — the paper
+    /// law mirror of entries).
+    fn emit_exit<C: Ctx>(&mut self, i: usize, ctx: &mut C, now: u64) -> bool {
+        let ai = (self.active & 1) as usize;
+        let row = self.tables[ai].rows[i];
+        let pos = self.positions[i];
+        let close_side = if pos.side == Side::Bid as u8 {
+            Side::Ask
+        } else {
+            Side::Bid
+        };
+        let sym_px = match self.mid_1e6(row.sym, now) {
+            Some(p) => p,
+            None => {
+                self.exit_blocked = self.exit_blocked.wrapping_add(1);
+                return false;
+            }
+        };
+        let two_leg = pos.qty_ref_1e6 > 0 && row.ref_sym != SYMBOL_ID_NONE;
+        let ref_px = if two_leg {
+            match self.mid_1e6(row.ref_sym, now) {
+                Some(p) => p,
+                None => {
+                    self.exit_blocked = self.exit_blocked.wrapping_add(1);
+                    return false;
+                }
+            }
+        } else {
+            0
+        };
+        if !self.submit_leg(ctx, row.sym, close_side, sym_px, pos.qty_sym_1e6, now) {
+            // Ring full: the position HOLDS; the next evaluation
+            // retries (CooldownGate doctrine transplanted).
+            return false;
+        }
+        if two_leg {
+            let ref_close = if close_side == Side::Bid {
+                Side::Ask
+            } else {
+                Side::Bid
+            };
+            if !self.submit_leg(ctx, row.ref_sym, ref_close, ref_px, pos.qty_ref_1e6, now) {
+                self.leg_drops = self.leg_drops.wrapping_add(1);
+            }
+        }
+        self.positions[i] = VmPosition::FLAT;
+        self.round_trips = self.round_trips.wrapping_add(1);
+        self.last_fire_ns[i] = now; // re-entry cooldown
+        true
     }
 }
 
-impl<const N: usize> Default for VmStrategy<N> {
+impl Default for VmStrategy {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> StrategyCounters for VmStrategy<N> {
+impl StrategyCounters for VmStrategy {
     #[inline]
     fn orders_emitted(&self) -> u64 {
         self.orders_emitted
@@ -279,11 +635,10 @@ impl<const N: usize> StrategyCounters for VmStrategy<N> {
     }
 }
 
-impl<const N: usize> Strategy for VmStrategy<N> {
-    /// Nothing to allocate, nothing to validate (§7.1): tables are
-    /// inline fields that arrive later via the ring; per-row
-    /// parameters were validated by §4.2. Always `Ok` — booting inert
-    /// is normal (§7.3), so there is no failure mode by design.
+impl Strategy for VmStrategy {
+    /// Nothing to validate (§7.1): tables arrive later via the ring;
+    /// per-row parameters were validated by §4.2. Always `Ok` —
+    /// booting inert is normal (§7.3).
     fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
         Ok(())
     }
@@ -301,181 +656,214 @@ impl<const N: usize> Strategy for VmStrategy<N> {
             // §7.3: inert — one predictable branch.
             return;
         }
-
-        // Book refresh; lazily track symbols the table references.
-        let bidx = match self.book.index_of(tick.sym) {
-            Some(b) => {
-                let _ = self.book.apply_at(b, tick);
-                b as usize
-            }
-            None => {
-                if !self.table_references(tick.sym, alen) {
-                    return;
-                }
-                match self.book.track(tick.sym) {
-                    Ok(b) => {
-                        let _ = self.book.apply_at(b, tick);
-                        b as usize
-                    }
-                    Err(_) => {
-                        self.book_track_failed = self.book_track_failed.wrapping_add(1);
-                        return;
-                    }
-                }
-            }
-        };
-
-        // Action-sym top: every trigger requires a two-sided book
-        // (module docs — the 8e one-sided/preopen lesson).
-        let top = self.book.slots()[bidx];
-        if !top.has_quotes() || top.bid_px.raw() <= 0 || top.ask_px.raw() <= 0 {
-            return;
-        }
-        let mid_s = top.mid().raw();
         let now = ctx.now_ns();
+        let t_sym = tick.sym;
 
-        // Row scan: linear over `len` with a `sym` filter (§7.1).
         let mut i = 0usize;
         while i < alen {
-            // SAFETY: `i < alen ≤ len`, and `receive_table` clamps
+            // SAFETY: `i < alen ≤ len`, and both receive seams clamp
             // every stored table's `len` to `RULE_TABLE_ROWS`.
-            let row: RuleRow = unsafe { *self.tables.get_unchecked(ai).rows.get_unchecked(i) };
-            if row.sym != tick.sym {
+            let row: RuleRowV2 = unsafe { *self.tables.get_unchecked(ai).rows.get_unchecked(i) };
+            if row.sym != t_sym && row.ref_sym != t_sym {
                 i += 1;
                 continue;
             }
             self.evals = self.evals.wrapping_add(1);
 
-            // Cooldown: lazy stamp compare (no on_timer sweep).
-            let horizon_ns = (row.horizon_ms as u64).wrapping_mul(1_000_000);
-            // SAFETY: `i < alen ≤ RULE_TABLE_ROWS` — the stamp array
-            // is RULE_TABLE_ROWS long.
+            let position_row = row.flags & ROW_FLAG_POSITION != 0;
+            // SAFETY: `i < alen ≤ RULE_TABLE_ROWS` (stamp array).
             let last = unsafe { *self.last_fire_ns.get_unchecked(i) };
+            let horizon_ns = (row.horizon_ms as u64).wrapping_mul(1_000_000);
+
+            if position_row && self.positions[i].state == POS_ENTERED {
+                // ---- exit path ----
+                let pos = self.positions[i];
+                let age_ns = now.saturating_sub(pos.entry_ts_ns);
+                if row.max_hold_s > 0 && age_ns >= (row.max_hold_s as u64) * 1_000_000_000 {
+                    // Age-out: unconditional (S1 law).
+                    let _ = self.emit_exit(i, ctx, now);
+                    i += 1;
+                    continue;
+                }
+                if age_ns < (row.min_hold_s as u64) * 1_000_000_000 {
+                    i += 1;
+                    continue;
+                }
+                let signal = match self.signal_of(&row, now) {
+                    Some(s) => s,
+                    None => {
+                        // Absent data ⇒ HOLD (carry law).
+                        i += 1;
+                        continue;
+                    }
+                };
+                let directional = signal.saturating_mul(pos.entry_sign as i64);
+                if directional <= row.exit_1e9 {
+                    let _ = self.emit_exit(i, ctx, now);
+                }
+                i += 1;
+                continue;
+            }
+
+            // ---- entry / refire path ----
             if now < last.saturating_add(horizon_ns) {
                 i += 1;
                 continue;
             }
 
-            // Trigger math (module docs).
-            let fire_side: Option<Side> = if row.trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
-                match self.book.snapshot(row.ref_sym) {
-                    Some(rt) if rt.has_quotes() && rt.bid_px.raw() > 0 && rt.ask_px.raw() > 0 => {
-                        let mid_r = rt.mid().raw();
-                        let dev = mid_s as i128 - mid_r as i128;
-                        let abs_dev = if dev >= 0 { dev } else { -dev };
-                        if abs_dev * 10_000 >= (row.edge_bps as i128) * (mid_r as i128) {
-                            let s = if dev > 0 { Side::Ask } else { Side::Bid };
-                            if row.side == RuleRow::SIDE_BOTH || row.side == s as u8 {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            } else if row.trigger == RuleRow::TRIGGER_LEVEL_BREACH {
-                let bid_leg = top.ask_px.raw() <= row.level_1e6; // buy at/below
-                let ask_leg = top.bid_px.raw() >= row.level_1e6; // sell at/above
-                if row.side == Side::Bid as u8 {
-                    if bid_leg {
-                        Some(Side::Bid)
-                    } else {
-                        None
-                    }
-                } else if row.side == Side::Ask as u8 {
-                    if ask_leg {
-                        Some(Side::Ask)
-                    } else {
-                        None
-                    }
-                } else if row.side == RuleRow::SIDE_BOTH {
-                    // Bid leg first — deterministic, at most one per tick.
-                    if bid_leg {
-                        Some(Side::Bid)
-                    } else if ask_leg {
-                        Some(Side::Ask)
-                    } else {
-                        None
-                    }
+            // v1 sugar arm: both-sides level_breach (module docs).
+            let lhs_only = row.combine == CombineOp::LhsOnly as u8;
+            if lhs_only && row.side == core_types::RuleRow::SIDE_BOTH && !position_row {
+                let bid_leg = match self.feats.read(FeatId::Ask, row.sym, 0, now) {
+                    Some(a) => a <= row.enter_1e9,
+                    None => false,
+                };
+                let ask_leg = match self.feats.read(FeatId::Bid, row.sym, 0, now) {
+                    Some(b) => b >= row.enter_1e9,
+                    None => false,
+                };
+                let side = if bid_leg {
+                    Some(Side::Bid)
+                } else if ask_leg {
+                    Some(Side::Ask)
                 } else {
-                    // Unreachable through the §4.2 validator.
-                    debug_assert!(false, "invalid row side byte");
                     None
+                };
+                if let Some(side) = side {
+                    self.fires = self.fires.wrapping_add(1);
+                    if let Some(px) = self.mid_1e6(row.sym, now) {
+                        let qty = Self::sized_qty_1e6(row.max_risk_1e6, px);
+                        if qty > 0 && self.submit_leg(ctx, row.sym, side, px, qty, now) {
+                            // SAFETY: `i < RULE_TABLE_ROWS`.
+                            unsafe {
+                                *self.last_fire_ns.get_unchecked_mut(i) = now;
+                            }
+                        }
+                    } else {
+                        self.entry_blocked = self.entry_blocked.wrapping_add(1);
+                    }
                 }
-            } else {
-                // Unreachable through the §4.2 validator.
-                debug_assert!(false, "invalid row trigger byte");
-                None
-            };
-            let side = match fire_side {
+                i += 1;
+                continue;
+            }
+
+            let signal = match self.signal_of(&row, now) {
                 Some(s) => s,
                 None => {
                     i += 1;
                     continue;
                 }
             };
+            if !Self::entry_fires(&row, signal) {
+                i += 1;
+                continue;
+            }
+            // Direction law (module docs): LhsOnly rows emit their
+            // side; signal-signed rows mean-revert with side filter.
+            let side = if lhs_only {
+                if row.side == Side::Bid as u8 {
+                    Side::Bid
+                } else if row.side == Side::Ask as u8 {
+                    Side::Ask
+                } else {
+                    // A BOTH LhsOnly POSITION row: direction from the
+                    // signal sign like every signed row.
+                    if signal > 0 {
+                        Side::Ask
+                    } else {
+                        Side::Bid
+                    }
+                }
+            } else {
+                let dir = if signal > 0 { Side::Ask } else { Side::Bid };
+                if row.side != core_types::RuleRow::SIDE_BOTH && row.side != dir as u8 {
+                    i += 1;
+                    continue; // side filter: not our direction
+                }
+                dir
+            };
+            if !self.confirm_ok(&row, now) {
+                i += 1;
+                continue;
+            }
             self.fires = self.fires.wrapping_add(1);
 
-            // Emit-time re-clamp (module docs): row cap ∧ policy
-            // single-order cap. `mid_s > 0` by the two-sided guard;
-            // i128 keeps the products exact; floor division
-            // guarantees notional ≤ allowed.
-            let mut allowed = row.max_risk_1e6;
-            if allowed > POLICY_SINGLE_ORDER_CAP_1E6 {
-                allowed = POLICY_SINGLE_ORDER_CAP_1E6;
-            }
-            if allowed <= 0 {
-                // A non-positive row cap cannot pass the §4.2
-                // validator; hand-built tables fail closed here.
-                i += 1;
-                continue;
-            }
-            let qty_1e6 = ((allowed as i128 * 1_000_000) / mid_s as i128) as i64;
-            if qty_1e6 <= 0 {
-                // Price too high for the cap to buy any quantity —
-                // fired but nothing to emit (fires − emitted −
-                // dropped surfaces this).
+            if !position_row {
+                // v1 refire law.
+                if let Some(px) = self.mid_1e6(row.sym, now) {
+                    let qty = Self::sized_qty_1e6(row.max_risk_1e6, px);
+                    if qty > 0 && self.submit_leg(ctx, row.sym, side, px, qty, now) {
+                        // SAFETY: `i < RULE_TABLE_ROWS`.
+                        unsafe {
+                            *self.last_fire_ns.get_unchecked_mut(i) = now;
+                        }
+                    }
+                } else {
+                    self.entry_blocked = self.entry_blocked.wrapping_add(1);
+                }
                 i += 1;
                 continue;
             }
 
-            let venue = match VenueId::from_u8(symbol_venue_byte(row.sym)) {
-                Some(v) => v,
+            // ---- position entry ----
+            if self.group_occupied(row.group, i, alen) {
+                i += 1;
+                continue;
+            }
+            let sym_px = match self.mid_1e6(row.sym, now) {
+                Some(p) => p,
                 None => {
-                    // Rows are validated against the boot universe —
-                    // an undecodable venue byte cannot happen.
-                    debug_assert!(false, "table row with undecodable venue");
+                    self.entry_blocked = self.entry_blocked.wrapping_add(1);
                     i += 1;
                     continue;
                 }
             };
-            let order = Order::new(
-                now,
-                venue,
-                row.sym,
-                side,
-                ORDER_KIND_POST_ONLY,
-                Price::from_raw(mid_s),
-                Qty::from_raw(qty_1e6),
-                self.next_oid,
-            );
-            self.next_oid = self.next_oid.wrapping_add(1);
-            match ctx.submit(order) {
-                Ok(()) => {
-                    self.orders_emitted = self.orders_emitted.wrapping_add(1);
-                    // SAFETY: `i < alen ≤ RULE_TABLE_ROWS` (stamp array).
-                    unsafe {
-                        *self.last_fire_ns.get_unchecked_mut(i) = now;
+            let two_leg = row.ref_sym != SYMBOL_ID_NONE;
+            let ref_px = if two_leg {
+                match self.mid_1e6(row.ref_sym, now) {
+                    Some(p) => p,
+                    None => {
+                        self.entry_blocked = self.entry_blocked.wrapping_add(1);
+                        i += 1;
+                        continue;
                     }
                 }
-                Err(SubmitErr::RingFull) => {
-                    // Cooldown stays open — the row retries on the
-                    // next tick (CooldownGate doctrine).
-                    self.orders_dropped = self.orders_dropped.wrapping_add(1);
+            } else {
+                0
+            };
+            let qty_sym = Self::sized_qty_1e6(row.max_risk_1e6, sym_px);
+            if qty_sym <= 0 {
+                i += 1;
+                continue;
+            }
+            if !self.submit_leg(ctx, row.sym, side, sym_px, qty_sym, now) {
+                i += 1;
+                continue; // armed retry next tick (accept law)
+            }
+            let mut qty_ref = 0;
+            if two_leg {
+                let ref_side = if side == Side::Bid { Side::Ask } else { Side::Bid };
+                qty_ref = Self::sized_qty_1e6(row.max_risk_1e6, ref_px);
+                if qty_ref > 0
+                    && !self.submit_leg(ctx, row.ref_sym, ref_side, ref_px, qty_ref, now)
+                {
+                    self.leg_drops = self.leg_drops.wrapping_add(1);
                 }
+            }
+            self.positions[i] = VmPosition {
+                qty_sym_1e6: qty_sym,
+                qty_ref_1e6: qty_ref,
+                entry_px_1e6: sym_px,
+                entry_ts_ns: now,
+                state: POS_ENTERED,
+                side: side as u8,
+                entry_sign: if signal >= 0 { 1 } else { -1 },
+                _pad: [0; 5],
+            };
+            self.entries = self.entries.wrapping_add(1);
+            // SAFETY: `i < RULE_TABLE_ROWS`.
+            unsafe {
+                *self.last_fire_ns.get_unchecked_mut(i) = now;
             }
             i += 1;
         }
@@ -507,38 +895,81 @@ impl<const N: usize> Strategy for VmStrategy<N> {
         self.feats.on_opt_summary(opt, ctx.now_ns());
     }
 
-    /// §6 flip consumer + VM2 seed consumer. `RulesetCommit` flips
-    /// the table (module docs); `FundingSeed` (D-1) folds one settled
-    /// print into the feature engine — the SAME path live funding
-    /// events feed, so the cadence law applies in one place.
-    /// `PositionSeed` lands with the V3 position layer. Everything
-    /// else (Stage included) is deliberately ignored.
-    fn on_ai<C: Ctx>(&mut self, cmd: &AiCmd, _ctx: &mut C) {
-        if matches!(cmd.kind(), Some(AiCmdKind::FundingSeed)) {
-            // Shape-checked at the ingress + drain: sym real, px =
-            // rate ×1e9, qty = venue print ms > 0.
-            self.feats.funding_seed(cmd.sym, cmd.qty, cmd.px);
-            self.funding_seeds_applied = self.funding_seeds_applied.wrapping_add(1);
-            return;
-        }
-        if !matches!(cmd.kind(), Some(AiCmdKind::RulesetCommit)) {
-            return;
-        }
-        let sidx = ((self.active & 1) ^ 1) as usize;
-        if self.staged_valid && self.tables[sidx].hash128 == cmd.ruleset_hash128() {
-            // Flip: index swap, no copy (§6).
-            self.active ^= 1;
-            self.staged_valid = false;
-            self.commits_applied = self.commits_applied.wrapping_add(1);
-            // Fresh table ⇒ fully armed (module docs). Operator
-            // cadence — a plain indexed loop.
-            let mut i = 0usize;
-            while i < RULE_TABLE_ROWS {
-                self.last_fire_ns[i] = 0;
-                i += 1;
+    /// §6 flip consumer + VM2 seed consumer (module docs).
+    fn on_ai<C: Ctx>(&mut self, cmd: &AiCmd, ctx: &mut C) {
+        match cmd.kind() {
+            Some(AiCmdKind::FundingSeed) => {
+                // Shape-checked at the ingress + drain: sym real,
+                // px = rate ×1e9, qty = venue print ms > 0.
+                self.feats.funding_seed(cmd.sym, cmd.qty, cmd.px);
+                self.funding_seeds_applied = self.funding_seeds_applied.wrapping_add(1);
             }
-        } else {
-            self.commits_dropped = self.commits_dropped.wrapping_add(1);
+            Some(AiCmdKind::PositionSeed) => {
+                // D-2 restore (module docs). Refusals are counted,
+                // never fatal — the recommended Flat-boot fallback
+                // stays correct without any seed.
+                let ai = (self.active & 1) as usize;
+                let len = self.tables[ai].len as usize;
+                let i = cmd.param_id as usize;
+                let now = ctx.now_ns();
+                let ok = i < len && {
+                    let row = self.tables[ai].rows[i];
+                    row.flags & ROW_FLAG_POSITION != 0
+                        && row.sym == cmd.sym
+                        && self.positions[i].state == POS_FLAT
+                        && !self.group_occupied(row.group, i, len)
+                };
+                if ok {
+                    let row = self.tables[ai].rows[i];
+                    let qty_sym = Self::sized_qty_1e6(row.max_risk_1e6, cmd.px);
+                    let qty_ref = if row.ref_sym != SYMBOL_ID_NONE {
+                        // Ref qty re-derives at the ref's live mid
+                        // when priceable, else equal-notional at the
+                        // seeded px (both honest under the re-derive
+                        // law; the live mid wins when present).
+                        match self.mid_1e6(row.ref_sym, now) {
+                            Some(p) => Self::sized_qty_1e6(row.max_risk_1e6, p),
+                            None => Self::sized_qty_1e6(row.max_risk_1e6, cmd.px),
+                        }
+                    } else {
+                        0
+                    };
+                    if qty_sym > 0 {
+                        let age_ns = (cmd.qty as u64).saturating_mul(1_000_000_000);
+                        self.positions[i] = VmPosition {
+                            qty_sym_1e6: qty_sym,
+                            qty_ref_1e6: qty_ref,
+                            entry_px_1e6: cmd.px,
+                            entry_ts_ns: now.saturating_sub(age_ns),
+                            state: POS_ENTERED,
+                            side: cmd.side,
+                            entry_sign: if cmd.side == Side::Ask as u8 { 1 } else { -1 },
+                            _pad: [0; 5],
+                        };
+                        self.position_seeds_applied =
+                            self.position_seeds_applied.wrapping_add(1);
+                    } else {
+                        self.position_seeds_refused =
+                            self.position_seeds_refused.wrapping_add(1);
+                    }
+                } else {
+                    self.position_seeds_refused =
+                        self.position_seeds_refused.wrapping_add(1);
+                }
+            }
+            Some(AiCmdKind::RulesetCommit) => {
+                let sidx = ((self.active & 1) ^ 1) as usize;
+                if self.staged_valid && self.tables[sidx].hash128 == cmd.ruleset_hash128() {
+                    // Flip: index swap, no copy (§6).
+                    self.active ^= 1;
+                    self.staged_valid = false;
+                    self.commits_applied = self.commits_applied.wrapping_add(1);
+                    self.on_table_flipped();
+                } else {
+                    self.commits_dropped = self.commits_dropped.wrapping_add(1);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -557,7 +988,7 @@ impl<const N: usize> Strategy for VmStrategy<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{fnv1a_64, AI_SIDE_NONE, STRATEGY_SLOT_VM, SYMBOL_ID_NONE};
+    use core_types::{fnv1a_64, RuleRow, AI_SIDE_NONE, STRATEGY_SLOT_VM};
 
     struct TestCtx {
         now: NsTs,
@@ -594,10 +1025,8 @@ mod tests {
     const REF: SymbolId = 7;
     const HASH_A: [u8; 16] = [0xAB; 16];
     const HASH_B: [u8; 16] = [0xCD; 16];
-    /// Production-like base clock: fresh stamps (0) arm only once
-    /// `now ≥ horizon_ns` (the CooldownGate first-window semantic —
-    /// wallclock ns exceeds every horizon at boot; synthetic test
-    /// clocks must too, so T0 > the 86_400_000 ms max horizon).
+    /// Production-like base clock (the CooldownGate first-window
+    /// semantic: T0 > the 86_400_000 ms max horizon).
     const T0: u64 = 100_000_000_000_000_000;
 
     fn cd_row(side: u8, edge_bps: u32, horizon_ms: u32, max_risk_1e6: i64) -> RuleRow {
@@ -643,6 +1072,19 @@ mod tests {
         t
     }
 
+    fn v2_table_with(rows: &[RuleRowV2], epoch: u32, hash128: [u8; 16]) -> Box<RuleTableV2> {
+        let mut t = Box::new(RuleTableV2::EMPTY);
+        let mut i = 0;
+        while i < rows.len() {
+            t.rows[i] = rows[i];
+            i += 1;
+        }
+        t.len = rows.len() as u32;
+        t.epoch = epoch;
+        t.hash128 = hash128;
+        t
+    }
+
     fn commit_cmd(hash128: [u8; 16]) -> AiCmd {
         let px = i64::from_le_bytes(hash128[..8].try_into().expect("8 bytes"));
         let qty = i64::from_le_bytes(hash128[8..].try_into().expect("8 bytes"));
@@ -668,9 +1110,16 @@ mod tests {
         c
     }
 
-    /// Receive + commit `rows` as epoch-1 table `HASH_A`.
-    fn install(vm: &mut VmStrategy<8>, ctx: &mut TestCtx, rows: &[RuleRow]) {
+    /// Receive + commit v1 `rows` as epoch-1 table `HASH_A`.
+    fn install(vm: &mut VmStrategy, ctx: &mut TestCtx, rows: &[RuleRow]) {
         vm.receive_table(&table_with(rows, 1, HASH_A));
+        vm.on_ai(&commit_cmd(HASH_A), ctx);
+        assert_eq!(vm.commits_applied, 1);
+    }
+
+    /// Receive + commit NATIVE v2 rows.
+    fn install_v2(vm: &mut VmStrategy, ctx: &mut TestCtx, rows: &[RuleRowV2]) {
+        vm.receive_table_v2(&v2_table_with(rows, 1, HASH_A));
         vm.on_ai(&commit_cmd(HASH_A), ctx);
         assert_eq!(vm.commits_applied, 1);
     }
@@ -696,7 +1145,7 @@ mod tests {
 
     #[test]
     fn on_start_ok_and_inert_without_table() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         assert!(vm.on_start(&mut ctx).is_ok());
         assert_eq!(vm.rows_active(), 0);
@@ -708,7 +1157,7 @@ mod tests {
 
     #[test]
     fn zero_len_committed_table_is_inert() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(&mut vm, &mut ctx, &[]);
         assert_eq!(vm.rows_active(), 0);
@@ -721,7 +1170,7 @@ mod tests {
 
     #[test]
     fn receive_then_commit_flips() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         vm.receive_table(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
@@ -740,7 +1189,7 @@ mod tests {
 
     #[test]
     fn commit_without_staged_drops() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
         assert_eq!(vm.commits_dropped, 1);
@@ -750,7 +1199,7 @@ mod tests {
 
     #[test]
     fn commit_hash_mismatch_drops_and_keeps_staged() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         vm.receive_table(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
@@ -764,7 +1213,6 @@ mod tests {
             Some(HASH_A),
             "mismatch drops the COMMIT, not the staged table"
         );
-        // The correct commit still lands.
         vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
         assert_eq!(vm.commits_applied, 1);
         assert_eq!(vm.active_hash128(), HASH_A);
@@ -772,7 +1220,7 @@ mod tests {
 
     #[test]
     fn stage_and_other_kinds_are_ignored() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         vm.receive_table(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
@@ -790,7 +1238,7 @@ mod tests {
 
     #[test]
     fn restage_supersedes_staged_buffer() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         vm.receive_table(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
@@ -812,7 +1260,7 @@ mod tests {
 
     #[test]
     fn ping_pong_reuses_both_buffers_across_two_flips() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(&mut vm, &mut ctx, &[lb_row(0, 12_000, 1_000, 3_000_000)]);
         vm.receive_table(&table_with(
@@ -824,7 +1272,6 @@ mod tests {
         assert_eq!(vm.commits_applied, 2);
         assert_eq!(vm.active_epoch(), 2);
         assert_eq!(vm.active_hash128(), HASH_B);
-        // Third receive lands in the buffer the FIRST table used.
         vm.receive_table(&table_with(
             &[lb_row(0, 12_000, 1_000, 5_000_000)],
             3,
@@ -835,23 +1282,26 @@ mod tests {
         assert_eq!(vm.active_epoch(), 3);
     }
 
-    // ---------------- cross_deviation triggers ----------------
+    // ---------------- cross_deviation sugar ----------------
 
     /// Ref mid 500_000; a later SYM tick supplies the action mid.
-    fn prime_cd(vm: &mut VmStrategy<8>, ctx: &mut TestCtx, side: u8, edge_bps: u32) {
+    /// VM2: ref ticks EVALUATE the row now (two-legged freshness) —
+    /// the sym-mid-absent hold keeps behavior identical.
+    fn prime_cd(vm: &mut VmStrategy, ctx: &mut TestCtx, side: u8, edge_bps: u32) {
         install(vm, ctx, &[cd_row(side, edge_bps, 1_000, 3_000_000)]);
         ctx.now = T0;
         vm.on_tick(&tick(REF, 1, 490_000, 510_000), ctx);
         assert!(
             ctx.submitted.is_empty(),
-            "ref tick evaluates no action rows"
+            "ref tick alone cannot fire (sym mid absent ⇒ hold)"
         );
-        assert_eq!(vm.evals, 0, "ref leg has no action rows");
+        assert_eq!(vm.evals, 1, "VM2: the ref leg's tick evaluates the row");
+        assert_eq!(vm.fires, 0);
     }
 
     #[test]
     fn cross_deviation_fires_ask_when_sym_rich() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         prime_cd(&mut vm, &mut ctx, RuleRow::SIDE_BOTH, 80);
         vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
@@ -866,7 +1316,7 @@ mod tests {
 
     #[test]
     fn cross_deviation_fires_bid_when_sym_cheap() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         prime_cd(&mut vm, &mut ctx, RuleRow::SIDE_BOTH, 80);
         vm.on_tick(&tick(SYM, 1, 290_000, 310_000), &mut ctx);
@@ -876,15 +1326,13 @@ mod tests {
 
     #[test]
     fn cross_deviation_edge_boundary_is_inclusive() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         // edge 400 bps of ref mid 500_000 = 20_000 raw.
         prime_cd(&mut vm, &mut ctx, RuleRow::SIDE_BOTH, 400);
-        // dev 19_999 < 20_000 ⇒ silent.
         vm.on_tick(&tick(SYM, 1, 509_999, 529_999), &mut ctx);
         assert!(ctx.submitted.is_empty());
         assert_eq!(vm.fires, 0);
-        // dev exactly 20_000 ⇒ fire (≥, design-literal).
         vm.on_tick(&tick(SYM, 2, 510_000, 530_000), &mut ctx);
         assert_eq!(vm.fires, 1);
         assert_eq!(ctx.submitted.len(), 1);
@@ -892,14 +1340,12 @@ mod tests {
 
     #[test]
     fn cross_deviation_side_filter_blocks_mismatched_direction() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        // Bid-only row: a rich (Ask-direction) deviation must not fire.
         prime_cd(&mut vm, &mut ctx, Side::Bid as u8, 80);
         vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
         assert_eq!(vm.fires, 0, "side filter is part of the trigger");
         assert!(ctx.submitted.is_empty());
-        // The matching (cheap ⇒ Bid) direction fires.
         vm.on_tick(&tick(SYM, 2, 290_000, 310_000), &mut ctx);
         assert_eq!(vm.fires, 1);
         assert_eq!(ctx.submitted[0].side, Side::Bid);
@@ -907,7 +1353,7 @@ mod tests {
 
     #[test]
     fn cross_deviation_without_ref_book_never_fires() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -915,18 +1361,17 @@ mod tests {
             &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)],
         );
         ctx.now = T0;
-        // No REF tick ever: action ticks evaluate but cannot fire.
         vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
         assert_eq!(vm.evals, 1);
         assert_eq!(vm.fires, 0);
         assert!(ctx.submitted.is_empty());
     }
 
-    // ---------------- level_breach triggers ----------------
+    // ---------------- level_breach sugar ----------------
 
     #[test]
     fn level_breach_bid_fires_at_or_below_level() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -934,10 +1379,8 @@ mod tests {
             &[lb_row(Side::Bid as u8, 12_000, 1_000, 3_000_000)],
         );
         ctx.now = T0;
-        // Ask above the level ⇒ silent.
         vm.on_tick(&tick(SYM, 1, 11_000, 13_000), &mut ctx);
         assert_eq!(vm.fires, 0);
-        // Ask at the level ⇒ buy.
         vm.on_tick(&tick(SYM, 2, 10_000, 12_000), &mut ctx);
         assert_eq!(vm.fires, 1);
         assert_eq!(ctx.submitted.len(), 1);
@@ -947,7 +1390,7 @@ mod tests {
 
     #[test]
     fn level_breach_ask_fires_at_or_above_level() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -964,7 +1407,7 @@ mod tests {
 
     #[test]
     fn level_breach_both_prefers_the_bid_leg() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -973,20 +1416,16 @@ mod tests {
         );
         ctx.now = T0;
         // Crossed fixture: ask 400k ≤ level ≤ bid 500k — both legs
-        // satisfied; the bid leg wins deterministically.
+        // satisfied; the bid leg wins deterministically (v1 order).
         vm.on_tick(&tick(SYM, 1, 500_000, 400_000), &mut ctx);
         assert_eq!(vm.fires, 1);
-        assert_eq!(
-            ctx.submitted.len(),
-            1,
-            "at most one emission per row per tick"
-        );
+        assert_eq!(ctx.submitted.len(), 1, "at most one emission per row per tick");
         assert_eq!(ctx.submitted[0].side, Side::Bid);
     }
 
     #[test]
     fn one_sided_book_never_fires() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -994,8 +1433,9 @@ mod tests {
             &[lb_row(Side::Bid as u8, 500_000, 1_000, 3_000_000)],
         );
         ctx.now = T0;
-        // Ask side empty (0): a naive `ask ≤ level` would fire — the
-        // two-sided guard must hold it (8e preopen lesson).
+        // Ask side empty (0): the Ask FEATURE is absent on a
+        // one-sided book — the 8e preopen lesson, upheld by the
+        // feature layer now.
         vm.on_tick(&tick(SYM, 1, 400_000, 0), &mut ctx);
         assert_eq!(vm.fires, 0);
         assert!(ctx.submitted.is_empty());
@@ -1005,7 +1445,7 @@ mod tests {
 
     #[test]
     fn cooldown_rearm_after_horizon() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -1015,13 +1455,10 @@ mod tests {
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
-        // Within the horizon: the armed check blocks before trigger
-        // math — the sleeping row does not even fire.
         ctx.now += 50_000_000;
         vm.on_tick(&tick(SYM, 2, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
         assert_eq!(vm.fires, 1, "a sleeping row does not fire");
-        // At the horizon boundary: re-armed.
         ctx.now += 50_000_000;
         vm.on_tick(&tick(SYM, 3, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 2);
@@ -1030,9 +1467,8 @@ mod tests {
 
     #[test]
     fn flip_resets_cooldown_stamps() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        // Day-long horizon: without a flip the row stays asleep.
         install(
             &mut vm,
             &mut ctx,
@@ -1044,7 +1480,6 @@ mod tests {
         ctx.now += 1_000_000;
         vm.on_tick(&tick(SYM, 2, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1, "asleep for a day");
-        // Recommit (same rows, new epoch/hash) ⇒ fresh arms.
         vm.receive_table(&table_with(
             &[lb_row(Side::Bid as u8, 12_000, 86_400_000, 3_000_000)],
             2,
@@ -1060,7 +1495,7 @@ mod tests {
 
     #[test]
     fn per_order_notional_clamped_to_row_cap() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -1071,19 +1506,14 @@ mod tests {
         vm.on_tick(&tick(SYM, 1, 480_000, 520_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
         let o = &ctx.submitted[0];
-        // mid 500_000: qty = 3e6 × 1e6 / 5e5 = 6e6; notional = 3e6.
         assert_eq!(o.qty.raw(), 6_000_000);
         assert_eq!(notional_1e6(o), 3_000_000);
     }
 
     #[test]
     fn handbuilt_table_exceeding_policy_cap_is_still_policy_clamped() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        // $50,000 row cap — the §4.2 validator would reject this
-        // table; built by hand it proves the emit-time layer stands
-        // alone (defense in depth): every order ≤ the $10k policy cap
-        // (operator ruling 2026-08-29, $50k research tier).
         install(
             &mut vm,
             &mut ctx,
@@ -1104,31 +1534,36 @@ mod tests {
 
     #[test]
     fn nonpositive_row_cap_fires_but_emits_nothing() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        // A zero cap cannot pass the validator; hand-built it must
-        // fail closed at the clamp (fires visible, no order).
-        install(
-            &mut vm,
-            &mut ctx,
-            &[lb_row(Side::Bid as u8, 600_000, 10, 0)],
-        );
+        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 600_000, 10, 0)]);
         ctx.now = T0;
         vm.on_tick(&tick(SYM, 1, 480_000, 520_000), &mut ctx);
         assert_eq!(vm.fires, 1);
         assert!(ctx.submitted.is_empty());
-        assert_eq!(
-            vm.orders_dropped, 0,
-            "clamp-to-zero is not a dispatcher drop"
-        );
+        assert_eq!(vm.orders_dropped, 0, "clamp-to-zero is not a dispatcher drop");
+    }
+
+    #[test]
+    fn micro_cap_zero_notional_is_clamped_away() {
+        // The V3 caps-proptest catch, pinned: a 1-micro-dollar cap at
+        // a near-dollar px floors qty to 1 whose NOTIONAL floors to 0
+        // — such orders must never emit (the §11 zero-notional
+        // invariant lives in the sizing law itself).
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install(&mut vm, &mut ctx, &[lb_row(Side::Bid as u8, 999_999, 10, 1)]);
+        ctx.now = T0;
+        vm.on_tick(&tick(SYM, 1, 999_997, 999_999), &mut ctx);
+        assert_eq!(vm.fires, 1, "the condition itself fires");
+        assert!(ctx.submitted.is_empty(), "notional-0 order clamped away");
+        assert_eq!(vm.orders_dropped, 0);
     }
 
     #[test]
     fn one_pass_sym_emission_is_bounded_by_the_table_sym_budget() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        // Two $2 rows on the same sym: one tick fires both; the
-        // pass's Σ notional ≤ Σ row caps (the §4.2 rule-7 budget).
         let mut a = lb_row(Side::Bid as u8, 600_000, 86_400_000, 2_000_000);
         a.name_h = fnv1a_64(b"a");
         let mut b = lb_row(Side::Bid as u8, 550_000, 86_400_000, 2_000_000);
@@ -1139,13 +1574,11 @@ mod tests {
         assert_eq!(ctx.submitted.len(), 2);
         let pass_total: i64 = ctx.submitted.iter().map(notional_1e6).sum();
         assert!(pass_total <= 4_000_000, "Σ per pass ≤ table sym budget");
-        assert_eq!(notional_1e6(&ctx.submitted[0]), 2_000_000);
-        assert_eq!(notional_1e6(&ctx.submitted[1]), 2_000_000);
     }
 
     #[test]
     fn ring_full_drops_and_leaves_cooldown_open() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -1157,17 +1590,14 @@ mod tests {
         vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
         assert!(ctx.submitted.is_empty());
         assert_eq!(vm.orders_dropped, 1);
-        // Cooldown untouched ⇒ the very next tick emits.
         vm.on_tick(&tick(SYM, 2, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1);
         assert_eq!(vm.orders_emitted, 1);
     }
 
-    // ---------------- book handling ----------------
-
     #[test]
-    fn irrelevant_sym_claims_no_book_slot_and_evaluates_nothing() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+    fn irrelevant_sym_evaluates_nothing() {
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -1176,34 +1606,12 @@ mod tests {
         );
         vm.on_tick(&tick(999, 1, 400_000, 420_000), &mut ctx);
         assert_eq!(vm.evals, 0);
-        assert_eq!(vm.book_track_failed, 0);
         assert!(ctx.submitted.is_empty());
     }
-
-    #[test]
-    fn book_capacity_exhaustion_fails_closed_and_counts() {
-        // N = 1: the ref leg claims the only slot; the action sym
-        // cannot track ⇒ counted, no eval, no panic.
-        let mut vm: VmStrategy<1> = VmStrategy::new();
-        let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(
-            &[cd_row(RuleRow::SIDE_BOTH, 80, 1_000, 3_000_000)],
-            1,
-            HASH_A,
-        ));
-        vm.on_ai(&commit_cmd(HASH_A), &mut ctx);
-        vm.on_tick(&tick(REF, 1, 490_000, 510_000), &mut ctx);
-        vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
-        assert_eq!(vm.book_track_failed, 1);
-        assert_eq!(vm.evals, 0);
-        assert!(ctx.submitted.is_empty());
-    }
-
-    // ---------------- counters surface ----------------
 
     #[test]
     fn strategy_counters_trait_surface() {
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(
             &mut vm,
@@ -1216,5 +1624,376 @@ mod tests {
         assert_eq!(StrategyCounters::orders_dropped(&vm), 0);
         assert_eq!(vm.strategy_kind(), "vm");
         assert_eq!(StrategyCounters::ai_enable_refused(&vm), 0);
+    }
+
+    // ================ V3: the position layer ================
+
+    /// Position-mode cross-deviation pair (the xv-v2 shape): enter
+    /// |dev| ≥ 400 bps, exit directional ≤ 100 bps, no holds.
+    fn xv_row(group: u8) -> RuleRowV2 {
+        RuleRowV2::new(
+            ROW_FLAG_POSITION,
+            RuleRow::SIDE_BOTH,
+            group,
+            FeatId::Mid,
+            FeatId::Mid,
+            FEAT_NONE,
+            CombineOp::DiffBps,
+            SYM,
+            REF,
+            0,
+            0,
+            0,
+            CMP_ENTRY_ABS,
+            400_000_000_000,
+            100_000_000_000,
+            0,
+            0,
+            10,
+            0,
+            9_900_000_000,
+            fnv1a_64(b"xv"),
+            0,
+            0,
+        )
+    }
+
+    /// Prime both legs' mids: ref 500_000, sym per args.
+    fn prime_pair(vm: &mut VmStrategy, ctx: &mut TestCtx, sym_bid: i64, sym_ask: i64) {
+        vm.on_tick(&tick(REF, 1, 490_000, 510_000), ctx);
+        vm.on_tick(&tick(SYM, 1, sym_bid, sym_ask), ctx);
+    }
+
+    #[test]
+    fn position_pair_enters_both_legs_and_exits_on_reversion() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(&mut vm, &mut ctx, &[xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        // dev = (700k−500k)/500k = +4000 bps ≥ 400 ⇒ enter: sym rich
+        // ⇒ SELL sym / BUY ref, equal notional per leg.
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.entries, 1);
+        assert_eq!(ctx.submitted.len(), 2, "two legs");
+        assert_eq!(ctx.submitted[0].sym, SYM);
+        assert_eq!(ctx.submitted[0].side, Side::Ask);
+        assert_eq!(ctx.submitted[1].sym, REF);
+        assert_eq!(ctx.submitted[1].side, Side::Bid);
+        assert_eq!(notional_1e6(&ctx.submitted[0]), 9_899_999_999, "cap-floored");
+        let pos = vm.position(0).expect("entered");
+        assert_eq!(pos.side, Side::Ask as u8);
+        assert_eq!(pos.entry_sign, 1);
+        // Held: |dev| still 4000 bps ⇒ directional +4000 > exit 100.
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.round_trips, 0);
+        assert_eq!(ctx.submitted.len(), 2, "no refire while entered");
+        // Reversion: dev → +50 bps ≤ exit ⇒ close both legs.
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 3, 501_500, 503_500), &mut ctx);
+        assert_eq!(vm.round_trips, 1);
+        assert_eq!(ctx.submitted.len(), 4);
+        assert_eq!(ctx.submitted[2].sym, SYM);
+        assert_eq!(ctx.submitted[2].side, Side::Bid, "closer flips the side");
+        assert_eq!(ctx.submitted[3].sym, REF);
+        assert_eq!(ctx.submitted[3].side, Side::Ask);
+        assert!(vm.position(0).is_none());
+    }
+
+    #[test]
+    fn position_exit_covers_sign_flip() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(&mut vm, &mut ctx, &[xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000); // enter rich
+        assert_eq!(vm.entries, 1);
+        // Sign flips hard: dev −4000 bps ⇒ directional −4000 ≤ 100 ⇒
+        // exit (the |dev|≤exit OR flip law in ONE comparison).
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 290_000, 310_000), &mut ctx);
+        assert_eq!(vm.round_trips, 1);
+        assert!(vm.position(0).is_none());
+    }
+
+    #[test]
+    fn position_reenters_only_after_horizon_cooldown() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(&mut vm, &mut ctx, &[xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 501_500, 503_500), &mut ctx); // exit
+        assert_eq!(vm.round_trips, 1);
+        // Still dislocated within the 10 ms horizon ⇒ no re-entry.
+        ctx.now += 5_000_000;
+        vm.on_tick(&tick(SYM, 3, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.entries, 1, "cooldown blocks re-entry");
+        // Past the horizon ⇒ re-enter.
+        ctx.now += 5_000_000;
+        vm.on_tick(&tick(SYM, 4, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.entries, 2);
+    }
+
+    #[test]
+    fn group_exclusivity_admits_first_qualifying_row_only() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let mut r2 = xv_row(3);
+        r2.name_h = fnv1a_64(b"xv-2");
+        install_v2(&mut vm, &mut ctx, &[xv_row(3), r2]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.entries, 1, "one position per group");
+        assert!(vm.position(0).is_some());
+        assert!(vm.position(1).is_none());
+        // Exit row 0 ⇒ the group frees; row 0 re-enters first again
+        // (deterministic table order) after its cooldown.
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 501_500, 503_500), &mut ctx);
+        assert_eq!(vm.round_trips, 1);
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 3, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.entries, 2);
+        assert!(vm.position(0).is_some());
+        assert!(vm.position(1).is_none());
+    }
+
+    #[test]
+    fn min_hold_gates_exit_and_max_hold_forces_it() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let mut r = xv_row(GROUP_NONE);
+        r.min_hold_s = 2;
+        r.max_hold_s = 10;
+        install_v2(&mut vm, &mut ctx, &[r]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.entries, 1);
+        // Reverted IMMEDIATELY — but min_hold 2 s gates the exit.
+        ctx.now += 1_000_000_000;
+        vm.on_tick(&tick(SYM, 2, 501_500, 503_500), &mut ctx);
+        assert_eq!(vm.round_trips, 0, "min-hold holds the exit");
+        // Past min-hold: the same reversion exits.
+        ctx.now += 1_500_000_000;
+        vm.on_tick(&tick(SYM, 3, 501_500, 503_500), &mut ctx);
+        assert_eq!(vm.round_trips, 1);
+        // Re-enter, then age out with the signal STILL dislocated.
+        ctx.now += 1_000_000_000;
+        vm.on_tick(&tick(SYM, 4, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.entries, 2);
+        ctx.now += 11_000_000_000;
+        vm.on_tick(&tick(SYM, 5, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.round_trips, 2, "max-hold age-out is unconditional");
+        assert!(vm.position(0).is_none());
+    }
+
+    #[test]
+    fn absent_signal_holds_entries_and_exits() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        // Funding-spread row: apr24(sym) − apr24(ref) ≥ 0.20 —
+        // NO funding data exists ⇒ ABSENT ⇒ hold forever.
+        let r = RuleRowV2::new(
+            ROW_FLAG_POSITION,
+            RuleRow::SIDE_BOTH,
+            GROUP_NONE,
+            FeatId::Apr24,
+            FeatId::Apr24,
+            FEAT_NONE,
+            CombineOp::Diff,
+            SYM,
+            REF,
+            0,
+            0,
+            0,
+            0,
+            200_000_000,
+            0,
+            0,
+            0,
+            10,
+            0,
+            9_900_000_000,
+            fnv1a_64(b"carry"),
+            0,
+            0,
+        );
+        install_v2(&mut vm, &mut ctx, &[r]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.evals, 2);
+        assert_eq!(vm.fires, 0, "absent funding ⇒ no fire, ever");
+        assert_eq!(vm.entries, 0);
+    }
+
+    #[test]
+    fn confirm_gates_entry() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        // Entry |dev| ≥ 400 bps CONFIRMED by clock-to-utc-sod ≤ N —
+        // ClockUtcSod needs the wall offset; without it confirm is
+        // ABSENT ⇒ hold (entry only fires once the wall is taught
+        // and the confirm holds).
+        let mut r = xv_row(GROUP_NONE);
+        r.feat_c = FeatId::ClockUtcSod as u8;
+        r.win_c = 0;
+        r.cmp_bits |= CMP_CONFIRM_LE;
+        r.confirm_1e9 = i64::MAX; // always true — once present
+        install_v2(&mut vm, &mut ctx, &[r]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.entries, 0, "confirm ABSENT (no wall) ⇒ hold");
+        // Teach the wall via a funding event, then re-tick.
+        let ev = ChannelEvent::new(
+            ctx.now,
+            VenueId::Okx,
+            core_types::ChannelId::Funding,
+            core_types::make_symbol_id(VenueId::Okx, 900),
+            0,
+            1_787_961_600_000,
+            0,
+            0,
+        );
+        vm.on_venue_event(&ev, &mut ctx);
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 9, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.entries, 1, "confirm present + true ⇒ enter");
+    }
+
+    // ---------------- PositionSeed (D-2) ----------------
+
+    fn seed_cmd(row: u16, sym: SymbolId, side: Side, px_1e6: i64, age_s: i64) -> AiCmd {
+        AiCmd::new(
+            1,
+            1,
+            sym,
+            px_1e6,
+            age_s,
+            0,
+            AiCmdKind::PositionSeed,
+            VenueId::Ai,
+            STRATEGY_SLOT_VM,
+            side as u8,
+            row,
+            0,
+        )
+    }
+
+    #[test]
+    fn position_seed_restores_with_min_hold_memory() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let mut r = xv_row(GROUP_NONE);
+        r.min_hold_s = 100;
+        install_v2(&mut vm, &mut ctx, &[r]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 501_000, 503_000); // books live, no entry
+        assert_eq!(vm.entries, 0);
+        // Restore: entered Ask @ 700k, 99 s ago (1 s of min-hold left).
+        vm.on_ai(&seed_cmd(0, SYM, Side::Ask, 700_000, 99), &mut ctx);
+        assert_eq!(vm.position_seeds_applied, 1);
+        let pos = vm.position(0).expect("restored");
+        assert_eq!(pos.side, Side::Ask as u8);
+        assert_eq!(pos.entry_sign, 1, "Ask ⇒ +1 (the direction law inverse)");
+        assert!(pos.qty_sym_1e6 > 0, "qty re-derived from the sizing law");
+        assert!(pos.qty_ref_1e6 > 0, "ref leg re-derived at its live mid");
+        // Reverted signal NOW — but 1 s of min-hold survives the
+        // restart (the WHOLE POINT of the D-2 ruling).
+        vm.on_tick(&tick(SYM, 5, 501_000, 503_000), &mut ctx);
+        assert_eq!(vm.round_trips, 0, "min-hold memory survived");
+        ctx.now += 2_000_000_000;
+        vm.on_tick(&tick(SYM, 6, 501_000, 503_000), &mut ctx);
+        assert_eq!(vm.round_trips, 1, "then the reversion exits");
+    }
+
+    #[test]
+    fn position_seed_refusals_are_counted_not_fatal() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        // No table committed at all.
+        vm.on_ai(&seed_cmd(0, SYM, Side::Ask, 700_000, 10), &mut ctx);
+        assert_eq!(vm.position_seeds_refused, 1);
+        // Table with one refire (non-position) row + one position row.
+        let mut refire = RuleRowV2::from_v1(&lb_row(0, 12_000, 1_000, 3_000_000));
+        refire.name_h = fnv1a_64(b"refire");
+        install_v2(&mut vm, &mut ctx, &[refire, xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        // Non-position row refused.
+        vm.on_ai(&seed_cmd(0, SYM, Side::Ask, 700_000, 10), &mut ctx);
+        assert_eq!(vm.position_seeds_refused, 2);
+        // Sym mismatch refused (cross-check law).
+        vm.on_ai(&seed_cmd(1, 999, Side::Ask, 700_000, 10), &mut ctx);
+        assert_eq!(vm.position_seeds_refused, 3);
+        // Row index out of len refused.
+        vm.on_ai(&seed_cmd(9, SYM, Side::Ask, 700_000, 10), &mut ctx);
+        assert_eq!(vm.position_seeds_refused, 4);
+        // Valid seed applies…
+        vm.on_ai(&seed_cmd(1, SYM, Side::Ask, 700_000, 10), &mut ctx);
+        assert_eq!(vm.position_seeds_applied, 1);
+        // …and an occupied row refuses a second.
+        vm.on_ai(&seed_cmd(1, SYM, Side::Bid, 400_000, 5), &mut ctx);
+        assert_eq!(vm.position_seeds_refused, 5);
+    }
+
+    #[test]
+    fn commit_flip_resets_positions_to_flat() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(&mut vm, &mut ctx, &[xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert!(vm.position(0).is_some());
+        // New table (same rows, new hash) ⇒ positions reset (D-2
+        // base law; seeds re-enter post-#7b).
+        vm.receive_table_v2(&v2_table_with(&[xv_row(GROUP_NONE)], 2, HASH_B));
+        vm.on_ai(&commit_cmd(HASH_B), &mut ctx);
+        assert!(vm.position(0).is_none(), "flip resets positions");
+    }
+
+    #[test]
+    fn ref_leg_ring_full_is_counted_and_position_still_records() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(&mut vm, &mut ctx, &[xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        vm.on_tick(&tick(REF, 1, 490_000, 510_000), &mut ctx);
+        // Fail exactly the SECOND submit (the ref leg).
+        vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut ctx);
+        // (First run: both accepted — reset and do it properly.)
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(&mut vm, &mut ctx, &[xv_row(GROUP_NONE)]);
+        ctx.now = T0;
+        vm.on_tick(&tick(REF, 1, 490_000, 510_000), &mut ctx);
+        struct SecondFails {
+            now: NsTs,
+            n: u32,
+            submitted: u32,
+        }
+        impl Ctx for SecondFails {
+            fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+                self.n += 1;
+                if self.n == 2 {
+                    return Err(SubmitErr::RingFull);
+                }
+                self.submitted += 1;
+                Ok(())
+            }
+            fn now_ns(&self) -> NsTs {
+                self.now
+            }
+        }
+        let mut c2 = SecondFails {
+            now: ctx.now,
+            n: 0,
+            submitted: 0,
+        };
+        vm.on_tick(&tick(SYM, 1, 690_000, 710_000), &mut c2);
+        assert_eq!(vm.entries, 1, "paper law: sym-leg accept records");
+        assert_eq!(vm.leg_drops, 1, "ref-leg refusal counted");
+        let pos = vm.position(0).expect("entered");
+        assert_eq!(pos.qty_ref_1e6 > 0, true, "pair bookkeeping kept");
     }
 }

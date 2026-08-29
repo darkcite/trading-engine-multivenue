@@ -456,4 +456,35 @@ new venues.
   transcribed carry_signal law) · **release alloc 39/39** (new gate
   39 = every feature ingest+read path 0 B/op, seeds/dedup/lazy
   recomputes included) · license-check green. PositionSeed consume +
-  grammar eval = V3.
+  grammar eval = V3. Committed `781ee1a`.
+- 2026-08-30 — **V3 CODED (grammar evaluator + position layer;
+  workspace green).** `VmStrategy` rewritten around the v2 grammar:
+  signal = combine(feat_a, feat_b) ×1e9, confirm gates ENTRY only,
+  direction law (LhsOnly rows emit `side`; signal-signed rows
+  mean-revert with `side` as filter), the §1.3 state machine
+  (Flat→Entered→Flat, group exclusivity first-qualifying-row,
+  two-leg equal-notional emits with per-leg clamp, min-hold gate,
+  max-hold UNCONDITIONAL age-out, universal exit
+  `signal × entry_sign ≤ exit_1e9`, paper law = advance on accepted
+  sym-leg submit, ref-leg refusals counted `leg_drops`), and
+  `PositionSeed` (D-2) restore with min-hold memory + refusal
+  counting. v1 tables map at receive (`RuleRowV2::from_v1` +
+  `map_v1`) — the 20 pre-V3 vm tests pass THROUGH the sugar path
+  (v1-semantics regression suite); the both-sides `level_breach`
+  lives as the documented sugar arm. **Deliberate semantic delta:**
+  rows evaluate on EITHER leg's tick (two-legged freshness) — the
+  golden harness's run-1 fire moved 200 ns earlier onto its ref
+  tick, fires/emits/bounds byte-identical; migration.md documents
+  it. Book generic retired (VmStrategy<N> → VmStrategy;
+  FEAT_SYM_SLOTS 1024→4096 absorbs BACKTEST_VM_SLOTS; SET_VM_SLOTS
+  gone). **caps-proptest CATCH: zero-notional micro-cap orders**
+  (cap $1e-6 at ~\$1 px → qty 1, notional 0) — the clamp moved into
+  `sized_qty_1e6` itself, pinned by
+  `micro_cap_zero_notional_is_clamped_away`. New V3 tests: pair
+  enter/exit both legs, sign-flip exit, re-entry cooldown, group
+  exclusivity, min/max-hold, absent-holds (funding row with no
+  data), confirm gate (wall-absent ⇒ hold), seed
+  restore-with-min-hold-memory, seed refusal battery, flip resets
+  positions, ref-leg ring-full accounting. Gates: nextest
+  1404/1404 · alloc 39/39 release (fresh Compiling) · pytest 499 ·
+  license green.

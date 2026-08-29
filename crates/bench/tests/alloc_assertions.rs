@@ -3220,7 +3220,7 @@ fn ruleset_table_handoff_is_zero_alloc() {
 
     // The flip consumer + the in-stream Commit (px/qty = the [0xA5;16]
     // identity halves, the shared `ruleset_hash128` pairing).
-    let mut vm: Box<VmStrategy<8>> = Box::new(VmStrategy::new());
+    let mut vm: Box<VmStrategy> = Box::new(VmStrategy::new());
     let mut ctx = Noop;
     let commit = core_types::AiCmd::new(
         1,
@@ -3371,7 +3371,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
 
     let ring: std::sync::Arc<Ring<core_types::Order, 1024>> = Ring::new();
     let (prod, mut cons) = ring.split();
-    let mut vm: Box<VmStrategy<512>> = Box::new(VmStrategy::new());
+    let mut vm: Box<VmStrategy> = Box::new(VmStrategy::new());
     let mut ctx = RingCtx {
         prod,
         now: 1_000_000_000,
@@ -3462,7 +3462,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
         vm.fires > vm.orders_emitted + vm.orders_dropped,
         "the clamp-to-zero row must fire without emitting"
     );
-    assert_eq!(vm.book_track_failed, 0);
+    assert_eq!(vm.feats.sym_slots_exhausted, 0);
     assert_eq!(
         allocs, 0,
         "vm on_tick steady state allocated {allocs} times ({bytes} B)"
@@ -3500,7 +3500,7 @@ fn vm_feature_engine_paths_are_zero_alloc() {
     let hl_sym = core_types::make_symbol_id(VenueId::Hyperliquid, 13);
     let bn_sym = core_types::make_symbol_id(VenueId::Binance, 14);
 
-    let mut vm: Box<VmStrategy<512>> = Box::new(VmStrategy::new());
+    let mut vm: Box<VmStrategy> = Box::new(VmStrategy::new());
     let mut ctx = SinkCtx { now: MONO0 };
     vm.on_start(&mut ctx).unwrap();
 
@@ -3615,7 +3615,7 @@ fn vm_feature_engine_paths_are_zero_alloc() {
         core_types::FeatId::ClockUtcSod,
     ];
     let mut pass = 0u64;
-    let mut run_storm = |vm: &mut Box<VmStrategy<512>>, ctx: &mut SinkCtx, iters: u64| {
+    let mut run_storm = |vm: &mut Box<VmStrategy>, ctx: &mut SinkCtx, iters: u64| {
         let mut k = 0u64;
         while k < iters {
             let wall = WALL0 + pass * 60_000; // one minute per pass

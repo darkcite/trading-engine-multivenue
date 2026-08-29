@@ -146,7 +146,7 @@ proptest! {
             table_budget += clamped;
         }
 
-        let mut vm: VmStrategy<8> = VmStrategy::new();
+        let mut vm: VmStrategy = VmStrategy::new();
         // Production-like base clock: fresh stamps (0) arm only once
         // `now ≥ horizon_ns` (CooldownGate first-window semantic).
         let mut ctx = CaptureCtx { now: 100_000_000_000_000_000, submitted: Vec::new() };
@@ -189,7 +189,17 @@ proptest! {
             let mut pass_by_sym = [0i64; ACTION_SYMS.len()];
             let mut pass_total = 0i64;
             for o in ctx.submitted.iter() {
-                prop_assert_eq!(o.sym, sym, "orders only for the ticked sym");
+                // VM2 V3: rows evaluate when EITHER leg ticks
+                // (two-legged signal freshness) — a REF tick may
+                // legitimately fire cross rows on their ACTION syms.
+                if sym == REF_SYM {
+                    prop_assert!(
+                        ACTION_SYMS.contains(&o.sym),
+                        "ref-tick orders must target action syms"
+                    );
+                } else {
+                    prop_assert_eq!(o.sym, sym, "orders only for the ticked sym");
+                }
                 prop_assert!(matches!(o.side, Side::Bid | Side::Ask));
                 let n = notional_1e6(o);
                 prop_assert!(n > 0, "zero-notional orders must be clamped away");

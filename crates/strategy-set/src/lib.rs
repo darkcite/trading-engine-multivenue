@@ -137,10 +137,9 @@ pub const SET_RULE_TREE_SLOTS: usize = 8;
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
 pub const SET_AI_EXEC_SLOTS: usize = 64;
-/// Vm book capacity inside the set (design §7: `VmStrategy<512>` —
-/// the book table must cover every distinct action + reference leg
-/// the active table can name: 256 rows × 2 legs).
-pub const SET_VM_SLOTS: usize = 512;
+// (VM2 V3: the vm's book generic is gone — mids live in the feature
+// engine's fixed sym slots — so the old `SET_VM_SLOTS = 512` law
+// retired with it.)
 
 /// Map a `--strategy` value to an initial enable mask (design §7:
 /// single name = single bit, back-compatible; `all` = all built
@@ -171,7 +170,7 @@ pub struct StrategySet {
     cross_arb: CrossArb<SET_CROSS_ARB_GROUPS, SET_CROSS_ARB_MEMBERS>,
     rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
-    vm: VmStrategy<SET_VM_SLOTS>,
+    vm: VmStrategy,
     /// Runtime enable mask (bits per the slot map). Only built bits
     /// are ever set — Enable of a reserved slot is refused.
     enabled: u8,
@@ -261,7 +260,7 @@ impl StrategySet {
     /// Read the vm member (§9 gauges read rows_active/epoch/hash
     /// through this in item 8; tests observe counters).
     #[inline]
-    pub fn vm(&self) -> &VmStrategy<SET_VM_SLOTS> {
+    pub fn vm(&self) -> &VmStrategy {
         &self.vm
     }
 
@@ -270,7 +269,7 @@ impl StrategySet {
     /// copy-#2 seam; there is no boot config (§7.3: booting inert is
     /// normal).
     #[inline]
-    pub fn vm_mut(&mut self) -> &mut VmStrategy<SET_VM_SLOTS> {
+    pub fn vm_mut(&mut self) -> &mut VmStrategy {
         &mut self.vm
     }
 

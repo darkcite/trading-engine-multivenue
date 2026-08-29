@@ -64,9 +64,11 @@ use crate::backtest::fill::{
 };
 
 /// Book capacity the backtest vm is monomorphized with (design §3.6):
-/// the same generic code as the engine's `SET_VM_SLOTS = 512`, sized
+/// the same code as the engine's vm member (VM2 V3: the book
+/// generic retired — sym capacity is `features::FEAT_SYM_SLOTS`,
+/// sized
 /// up because a multi-run capture can carry more syms than one boot.
-pub const BACKTEST_VM_SLOTS: usize = 4096;
+pub const BACKTEST_VM_SLOTS: usize = strategy_vm::features::FEAT_SYM_SLOTS;
 
 /// House virtual-clock base (design §3.3; the G3 first-window lesson —
 /// `now − 0 ≥ horizon` must hold at the first tick, so the base must
@@ -752,7 +754,8 @@ pub struct HarnessStats {
     /// never refuses; the §4.1 open-order caps arrive with H2).
     pub vm_orders_dropped: u64,
     /// Referenced syms that could not claim one of the
-    /// [`BACKTEST_VM_SLOTS`] book slots (fail-closed, counted).
+    /// [`BACKTEST_VM_SLOTS`] feature sym slots (fail-closed,
+    /// counted — VM2 V3: the feature engine's exhaustion counter).
     pub vm_book_track_failed: u64,
     /// Observed max emitted-order notional ×1e6 (§4.6).
     pub max_order_notional_1e6: i64,
@@ -873,7 +876,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     }
 
     // ---- Evaluator drive (§3.6): the REAL vm, the REAL paths ----
-    let mut vm: Box<VmStrategy<BACKTEST_VM_SLOTS>> = Box::new(VmStrategy::new());
+    let mut vm: Box<VmStrategy> = Box::new(VmStrategy::new());
     let mut ctx = BacktestCtx::new();
     vm.on_start(&mut ctx)
         .map_err(|e| HarnessError::Internal(format!("vm on_start failed: {e}")))?;
@@ -971,7 +974,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         vm_fires: vm.fires,
         vm_orders_emitted: vm.orders_emitted,
         vm_orders_dropped: vm.orders_dropped,
-        vm_book_track_failed: vm.book_track_failed,
+        vm_book_track_failed: vm.feats.sym_slots_exhausted,
         max_order_notional_1e6: ctx.max_order_notional_1e6(),
         fills_total: outcome.fills_total,
         fills_oos: outcome.oos_trades,

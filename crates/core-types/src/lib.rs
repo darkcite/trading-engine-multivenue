@@ -2147,6 +2147,81 @@ impl RuleRowV2 {
         _pad3: [0; 40],
     };
 
+    /// Map one v1 row onto the grammar with byte-exact v1 semantics
+    /// (the struct docs' sugar law). V3 uses this at the vm's v1
+    /// table-receive seam; V4 moves the call into the validator's
+    /// compat arm and retires the v1 types.
+    ///
+    /// * `level_breach` → `LhsOnly` refire row: the threshold is
+    ///   `level ×1e3` (px 1e6 → signal 1e9 domain). Bid rows watch
+    ///   the ASK (`feat_a = Ask`, `≤`), Ask rows the BID (`≥`); a
+    ///   SIDE_BOTH row keeps `feat_a = Ask` and the evaluator's
+    ///   documented both-leg arm checks bid-leg-first (v1 order).
+    /// * `cross_deviation` → `|DiffBps(Mid, Mid)| ≥ edge_bps` with
+    ///   the mean-reverting direction law; `side` stays the filter.
+    pub const fn from_v1(r: &RuleRow) -> Self {
+        if r.trigger == RuleRow::TRIGGER_LEVEL_BREACH {
+            let (feat_a, cmp) = if r.side == Side::Ask as u8 {
+                (FeatId::Bid, 0u8) // sell at/above: bid ≥ level
+            } else {
+                // Bid rows AND SIDE_BOTH (both-leg arm keys off
+                // side byte + LhsOnly; bid leg first = v1 order).
+                (FeatId::Ask, CMP_ENTRY_LE) // buy at/below: ask ≤ level
+            };
+            Self::new(
+                0, // refire mode
+                r.side,
+                GROUP_NONE,
+                feat_a,
+                FeatId::Mid, // unused for LhsOnly
+                FEAT_NONE,
+                CombineOp::LhsOnly,
+                r.sym,
+                SYMBOL_ID_NONE,
+                0,
+                0,
+                0,
+                cmp,
+                r.level_1e6 * 1_000,
+                0,
+                0,
+                0,
+                r.horizon_ms,
+                r.edge_bps,
+                r.max_risk_1e6,
+                r.name_h,
+                0,
+                r.family,
+            )
+        } else {
+            Self::new(
+                0, // refire mode
+                r.side,
+                GROUP_NONE,
+                FeatId::Mid,
+                FeatId::Mid,
+                FEAT_NONE,
+                CombineOp::DiffBps,
+                r.sym,
+                r.ref_sym,
+                0,
+                0,
+                0,
+                CMP_ENTRY_ABS, // |dev| ≥ edge, direction from sign
+                (r.edge_bps as i64) * 1_000_000_000,
+                0,
+                0,
+                0,
+                r.horizon_ms,
+                r.edge_bps,
+                r.max_risk_1e6,
+                r.name_h,
+                0,
+                r.family,
+            )
+        }
+    }
+
     /// Construct a row without naming the private padding fields. The
     /// v2 §4.2 validator is the only production builder; tests build
     /// fixtures through it too. `ver` is stamped [`RULE_ROW_VER_2`].
@@ -2243,6 +2318,26 @@ impl RuleTableV2 {
         hash128: [0; 16],
         _pad: [0; 40],
     };
+
+    /// Map a whole v1 table onto v2 rows in place
+    /// ([`RuleRowV2::from_v1`] per row; len/epoch/hash carried).
+    /// Out-param form: a 32 KiB by-value return would churn the
+    /// stack at the caller.
+    pub fn map_v1(src: &RuleTable, out: &mut RuleTableV2) {
+        let n = (src.len as usize).min(RULE_TABLE_ROWS);
+        let mut i = 0;
+        while i < n {
+            out.rows[i] = RuleRowV2::from_v1(&src.rows[i]);
+            i += 1;
+        }
+        while i < RULE_TABLE_ROWS {
+            out.rows[i] = RuleRowV2::ZERO;
+            i += 1;
+        }
+        out.len = n as u32;
+        out.epoch = src.epoch;
+        out.hash128 = src.hash128;
+    }
 }
 
 /// Ring slot ferrying a staged v2 table ingress→engine (§6 law,
@@ -3785,6 +3880,104 @@ mod vm2_v1_tests {
         assert_eq!(t.hash128, [0u8; 16]);
         assert_eq!(t.rows[0].ver, 0);
         assert_eq!(t.rows[RULE_TABLE_ROWS - 1].ver, 0);
+    }
+
+    // ---------------- v1 → v2 sugar mapping ----------------
+
+    #[test]
+    fn from_v1_level_breach_maps_transact_price_law() {
+        // Bid row: buy at/below ⇒ watches the ASK with ≤.
+        let bid = RuleRow::new(
+            42,
+            SYMBOL_ID_NONE,
+            0,
+            1_500,
+            480_000,
+            3_000_000,
+            fnv1a_64(b"lb-bid"),
+            RuleRow::TRIGGER_LEVEL_BREACH,
+            Side::Bid as u8,
+            2,
+        );
+        let v2 = RuleRowV2::from_v1(&bid);
+        assert_eq!(v2.ver, RULE_ROW_VER_2);
+        assert_eq!(v2.flags, 0, "sugar rows keep v1 refire semantics");
+        assert_eq!(v2.feat_a, FeatId::Ask as u8);
+        assert_eq!(v2.combine, CombineOp::LhsOnly as u8);
+        assert_eq!(v2.cmp_bits, CMP_ENTRY_LE);
+        assert_eq!(v2.enter_1e9, 480_000_000, "px ×1e6 → signal ×1e9");
+        assert_eq!(v2.ref_sym, SYMBOL_ID_NONE);
+        assert_eq!(v2.group, GROUP_NONE);
+        assert_eq!(v2.exit_1e9, 0);
+        assert_eq!(v2.horizon_ms, 1_500);
+        assert_eq!(v2.name_h, fnv1a_64(b"lb-bid"));
+        assert_eq!(v2.family, 2);
+        // Ask row: sell at/above ⇒ watches the BID with ≥.
+        let mut ask = bid;
+        ask.side = Side::Ask as u8;
+        let v2a = RuleRowV2::from_v1(&ask);
+        assert_eq!(v2a.feat_a, FeatId::Bid as u8);
+        assert_eq!(v2a.cmp_bits, 0, "GE");
+        // SIDE_BOTH keeps Ask/LE (the evaluator's both-leg arm keys
+        // off the side byte — bid leg first, the v1 order).
+        let mut both = bid;
+        both.side = RuleRow::SIDE_BOTH;
+        let v2b = RuleRowV2::from_v1(&both);
+        assert_eq!(v2b.feat_a, FeatId::Ask as u8);
+        assert_eq!(v2b.side, RuleRow::SIDE_BOTH);
+    }
+
+    #[test]
+    fn from_v1_cross_deviation_maps_abs_diff_bps() {
+        let cd = RuleRow::new(
+            42,
+            7,
+            80,
+            1_000,
+            0,
+            3_000_000,
+            fnv1a_64(b"cd"),
+            RuleRow::TRIGGER_CROSS_DEVIATION,
+            RuleRow::SIDE_BOTH,
+            0,
+        );
+        let v2 = RuleRowV2::from_v1(&cd);
+        assert_eq!(v2.feat_a, FeatId::Mid as u8);
+        assert_eq!(v2.feat_b, FeatId::Mid as u8);
+        assert_eq!(v2.combine, CombineOp::DiffBps as u8);
+        assert_eq!(v2.cmp_bits, CMP_ENTRY_ABS);
+        assert_eq!(v2.enter_1e9, 80_000_000_000, "80 bps ×1e9");
+        assert_eq!(v2.ref_sym, 7);
+        assert_eq!(v2.side, RuleRow::SIDE_BOTH, "side stays the filter");
+        assert_eq!(v2.edge_bps, 80, "diagnostic mirror");
+    }
+
+    #[test]
+    fn map_v1_carries_len_epoch_hash_and_zeroes_the_tail() {
+        let mut t1 = RuleTable::EMPTY;
+        t1.rows[0] = RuleRow::new(
+            42,
+            SYMBOL_ID_NONE,
+            0,
+            10,
+            500_000,
+            1_000_000,
+            1,
+            RuleRow::TRIGGER_LEVEL_BREACH,
+            0,
+            0,
+        );
+        t1.len = 1;
+        t1.epoch = 9;
+        t1.hash128 = [0xAB; 16];
+        let mut t2 = Box::new(RuleTableV2::EMPTY);
+        t2.rows[5] = RuleRowV2::from_v1(&t1.rows[0]); // stale garbage
+        RuleTableV2::map_v1(&t1, &mut t2);
+        assert_eq!(t2.len, 1);
+        assert_eq!(t2.epoch, 9);
+        assert_eq!(t2.hash128, [0xAB; 16]);
+        assert_eq!(t2.rows[0].ver, RULE_ROW_VER_2);
+        assert_eq!(t2.rows[5].ver, 0, "tail rows zeroed");
     }
 
     // ---------------- funding cadence law ----------------

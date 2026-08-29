@@ -78,8 +78,11 @@ use core_types::{
     FUNDING_WINDOW_72H_MIN, OPT_SUMMARY_FLAG_MARK_PX, ROLL_WINDOW_MAX_MIN,
 };
 
-/// Per-sym latest-value slots (open-addressed, power of two).
-pub const FEAT_SYM_SLOTS: usize = 1024;
+/// Per-sym latest-value slots (open-addressed, power of two). Sized
+/// for the BACKTEST universe too (multi-run captures carry more syms
+/// than one boot — the old `BACKTEST_VM_SLOTS = 4096` law moved
+/// here when V3 dropped the vm's book-table generic).
+pub const FEAT_SYM_SLOTS: usize = 4096;
 /// Rolling-stat pool entries (distinct (sym, window) pairs a
 /// committed table may bind — the v2 validator refuses tables needing
 /// more).
