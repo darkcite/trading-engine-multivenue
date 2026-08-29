@@ -130,7 +130,13 @@ fn harness(tag: &str) -> Harness {
     let status = Arc::new(AiIngressStatus::new());
     let (table_prod, table_cons) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
     let universe: Arc<[u32]> = Arc::from(vec![PM_SYM]);
-    let side = RulesetSidePath::new(dir.clone(), Arc::clone(&status), universe, table_prod);
+    let side = RulesetSidePath::new(
+        dir.clone(),
+        Arc::clone(&status),
+        universe,
+        Arc::new(ingress_ai::DescriptorTable::empty()),
+        table_prod,
+    );
 
     let (pm_prod, t0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t1p, t1) = Ring::<Tick, TICK_RING_SIZE>::new().split();

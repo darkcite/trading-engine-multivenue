@@ -125,6 +125,62 @@ pub fn render_instruments(
     out
 }
 
+/// VM2 V4 (D-6): the LIVE DescriptorTable entries — every allocated
+/// instrument with its §9.4 descriptor and channel-capability bits.
+/// Capabilities start from the string law
+/// (`ingress_ai::caps_of_descriptor`) and are tightened by the boot
+/// flags the string cannot see (depth subscriptions). Same iteration
+/// as [`render_instruments`] — the manifest and the resolver can
+/// never disagree on membership.
+#[allow(clippy::too_many_arguments)]
+pub fn build_descriptor_entries(
+    allocated: &AllocatedUniverse,
+    deribit_opts: &[(String, SymbolId)],
+    okx_opts: &[(String, SymbolId)],
+    bn_opts: &[(String, SymbolId, u8)],
+    okx_depth: bool,
+    deribit_depth: bool,
+) -> Vec<(String, SymbolId, u8)> {
+    let mut out: Vec<(String, SymbolId, u8)> = Vec::new();
+    let mut push = |desc: String, sym: SymbolId| {
+        let mut caps = ingress_ai::caps_of_descriptor(&desc);
+        if desc.starts_with("okx:") && !okx_depth {
+            caps &= !ingress_ai::CAP_DEPTH;
+        }
+        if desc.starts_with("deribit:") && !deribit_depth {
+            caps &= !ingress_ai::CAP_DEPTH;
+        }
+        out.push((desc, sym, caps));
+    };
+    for t in &allocated.pm_tokens {
+        push(t.token_id.clone(), t.sym);
+    }
+    for i in allocated
+        .bn_spot
+        .iter()
+        .chain(allocated.bn_usdm.iter())
+        .chain(allocated.bn_dated.iter())
+        .chain(allocated.okx.iter())
+        .chain(allocated.deribit.iter())
+        .chain(allocated.deribit_combos.iter())
+        .chain(allocated.hl.iter())
+        .chain(allocated.bybit_spot.iter())
+        .chain(allocated.bybit_linear.iter())
+    {
+        push(i.descriptor.clone(), i.sym);
+    }
+    for (name, sym) in deribit_opts {
+        push(format!("deribit:{name}"), *sym);
+    }
+    for (name, sym) in okx_opts {
+        push(format!("okx:{name}"), *sym);
+    }
+    for (name, sym, _uly_idx) in bn_opts {
+        push(format!("binance-opt:{name}"), *sym);
+    }
+    out
+}
+
 fn push_desc_row(out: &mut String, sym: SymbolId, descriptor: &str) {
     debug_assert!(!descriptor.is_empty());
     debug_assert!(!descriptor.contains('\t') && !descriptor.contains('\n'));

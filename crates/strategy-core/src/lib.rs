@@ -30,7 +30,7 @@
 )]
 
 use core_time::NsTs;
-use core_types::{AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTable, Signal, Tick};
+use core_types::{AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTableV2, Signal, Tick};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -300,7 +300,7 @@ pub trait Strategy: StrategyCounters {
         let _ = (cmd, ctx);
     }
 
-    /// Called once per [`RuleTable`] slot popped from the ruleset
+    /// Called once per [`RuleTableV2`] slot popped from the ruleset
     /// table-handoff ring (Phase 8g §6), IMMEDIATELY before the AI-cmd
     /// drain of the same engine iteration — so a table Staged and
     /// Commit'd in one batch is received before the Commit dispatches
@@ -313,7 +313,7 @@ pub trait Strategy: StrategyCounters {
     /// Monomorphized like every other callback — no `dyn`. No `Ctx`:
     /// receiving a table stages state and never submits.
     #[inline]
-    fn on_ruleset_table(&mut self, table: &RuleTable) {
+    fn on_ruleset_table(&mut self, table: &RuleTableV2) {
         let _ = table;
     }
 
@@ -459,7 +459,7 @@ mod tests {
             ticks: 0,
         };
         s.on_start(&mut ctx).unwrap();
-        let mut table = RuleTable::EMPTY;
+        let mut table = RuleTableV2::EMPTY;
         table.len = 1;
         s.on_ruleset_table(&table);
         assert!(s.started);
@@ -558,7 +558,7 @@ mod tests {
             started: false,
             ticks: 0,
         };
-        let mut table = RuleTable::EMPTY;
+        let mut table = RuleTableV2::EMPTY;
         table.len = u32::MAX;
         s.on_ruleset_table(&table);
         assert_eq!(s.ticks, 0);

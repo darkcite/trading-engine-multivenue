@@ -80,7 +80,8 @@ pub use listener::{
     admit_frame, bind_uds, run, AiIngressCfg, FrameVerdict, POLL_TIMEOUT, RX_BUF_SIZE,
 };
 pub use ruleset::{
-    validate_ruleset, RulesetReject, RulesetSidePath, RULE_EDGE_BPS_MAX, RULE_HORIZON_MS_MAX,
+    caps_of_descriptor, validate_ruleset, DescriptorTable, RulesetReject, RulesetSidePath,
+    CAP_DEPTH, CAP_FUNDING, CAP_OPT, CAP_PRICE, RULE_EDGE_BPS_MAX, RULE_HORIZON_MS_MAX,
     RULE_HORIZON_MS_MIN, RULE_LEVEL_1E6_MAX, RULE_ROW_MAX_RISK_1E6, RULE_SYM_MAX_RISK_1E6,
     RULE_TABLE_MAX_RISK_1E6,
 };

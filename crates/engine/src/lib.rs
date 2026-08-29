@@ -1003,7 +1003,7 @@ mod tests {
             self.opts += 1;
             self.last_opt_iv = o.mark_iv_1e9;
         }
-        fn on_ruleset_table(&mut self, table: &core_types::RuleTable) {
+        fn on_ruleset_table(&mut self, table: &core_types::RuleTableV2) {
             self.tables += 1;
             self.last_table_epoch = table.epoch;
         }
@@ -1642,7 +1642,7 @@ mod tests {
         fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {}
         fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {}
         fn on_ai<C: Ctx>(&mut self, _c: &AiCmd, _ctx: &mut C) {}
-        fn on_ruleset_table(&mut self, _t: &core_types::RuleTable) {}
+        fn on_ruleset_table(&mut self, _t: &core_types::RuleTableV2) {}
         fn on_timer<C: Ctx>(&mut self, _now: u64, _ctx: &mut C) {}
         fn timer_period_ns(&self) -> u64 {
             u64::MAX
@@ -1898,7 +1898,7 @@ mod tests {
     /// Table slot with a recognizable epoch (contents immaterial to
     /// the engine — it moves slots, never reads rows).
     fn mk_table(epoch: u32) -> RuleTableSlot {
-        let mut t = core_types::RuleTable::EMPTY;
+        let mut t = core_types::RuleTableV2::EMPTY;
         t.epoch = epoch;
         t
     }

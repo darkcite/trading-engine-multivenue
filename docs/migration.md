@@ -30,6 +30,56 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-08-30 — VM2 V4: validator v2 (descriptor resolution, rules 9–10), the §6 handoff flips to v2, v1 `RuleTable` retired
+
+**What changed**
+
+- The §4.2 validator grew the v2 grammar arm (docs/wire-format.md
+  "Ruleset JSON grammar v2"): descriptor-addressed rows (D-6 —
+  stage-time resolution against the bin's DescriptorTable, built
+  from the SAME allocation truth as `instrument-manifest.tsv`;
+  unresolvable ⇒ the new `Descriptor` reject), rule 9 (`Position`)
+  and rule 10 (`Feature`: channel capabilities + window law + the
+  rolling-bind budget), signed 9-decimal thresholds, and the
+  KEYWORD_CAP 16→24 growth. v1 rows keep validating byte-exactly
+  (the compat arm builds them THROUGH `RuleRowV2::from_v1`); both
+  shapes may share one artifact.
+- The §6 table-handoff ring is v2-typed (`RuleTableSlot =
+  RuleTableV2`, 32 832 B slots; `Strategy::on_ruleset_table` takes
+  `&RuleTableV2`); the v1 `RuleTable` struct retired (`RuleRow`
+  stays as the v1-grammar record through the compat window).
+- The backtest harness resolves v2 descriptors against the NEWEST
+  run's `instrument-manifest.tsv` (offline capability law =
+  `caps_of_descriptor`, deliberately permissive where the string
+  under-determines — wrong grants only yield absent-data-holds);
+  manifest-less (pre-D3) captures refuse v2 rows honestly.
+- Fuzz: `ruleset_json` covers both arms (fixture descriptor table
+  wired into the target; corpus seeded with v2/mixed artifacts).
+  Bench gate 34 validates 255 v1 + 1 v2 rows with live resolution
+  inside the measured window.
+
+**Why**
+
+- vm2-plan §4-V4/D-6: artifacts must be portable across restarts and
+  universe edits, and refusals must be loud and specific before the
+  agent authors against the grammar.
+
+**Impact**
+
+- On-disk formats: none (artifacts stay JSON; identity unchanged).
+- Config keys: none.
+- Wire formats: ruleset JSON grammar v2 documented; v1 table section
+  retired in docs/wire-format.md.
+
+**Migration steps**
+
+1. None for operators: existing v1 artifacts (raw syms) stage and
+   commit unchanged through the compat arm — one release, per D-6.
+
+**Rollback**
+
+- Revert the commit.
+
 ## 2026-08-30 — VM2 V3: the v2 grammar evaluator + position layer live in strategy-vm
 
 **What changed**

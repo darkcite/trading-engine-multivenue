@@ -12,7 +12,9 @@
 //!     never panic and never leave a partially staged table
 //!     (discard-on-reject: `len == 0` on ANY failure).
 
-use core_types::{fnv1a_64, RuleRow, RuleTable, SYMBOL_ID_NONE};
+use core_types::{
+    CMP_ENTRY_ABS, CMP_ENTRY_LE, CombineOp, FeatId, RuleRow, RuleTableV2, SYMBOL_ID_NONE, fnv1a_64,
+};
 use ingress_ai::validate_ruleset;
 use proptest::prelude::*;
 
@@ -148,17 +150,24 @@ proptest! {
         let rows = dedup(raw_rows);
         let bytes = serialize(&rows);
         let hash = hash128_of(&bytes);
-        let mut scratch = Box::new(RuleTable::EMPTY);
+        let mut scratch = Box::new(RuleTableV2::EMPTY);
         scratch.epoch = 7; // must survive untouched (side-path state)
 
-        let res = validate_ruleset(&bytes, &hash, &UNIVERSE, &mut scratch);
+        let res = validate_ruleset(&bytes, &hash, &UNIVERSE, &ingress_ai::DescriptorTable::empty(), &mut scratch);
         prop_assert!(res.is_ok(), "generated ruleset rejected: {:?}", res);
         prop_assert_eq!(scratch.len as usize, rows.len());
         prop_assert_eq!(scratch.hash128, hash);
         prop_assert_eq!(scratch.epoch, 7, "validator must not touch epoch");
 
         for (i, r) in rows.iter().enumerate() {
-            let row: &RuleRow = &scratch.rows[i];
+            // VM2 V4: the admitted row is the v2 SUGAR image of the
+            // v1 shape (RuleRowV2::from_v1 law).
+            let row = &scratch.rows[i];
+            let side_byte = match r.side {
+                0 => 0u8,
+                1 => 1u8,
+                _ => RuleRow::SIDE_BOTH,
+            };
             prop_assert_eq!(row.sym, ACTION_SYMS[r.sym_idx]);
             prop_assert_eq!(
                 row.ref_sym,
@@ -166,24 +175,24 @@ proptest! {
             );
             prop_assert_eq!(row.edge_bps, r.edge_bps);
             prop_assert_eq!(row.horizon_ms, r.horizon_ms);
-            prop_assert_eq!(row.level_1e6, if r.cross { 0 } else { r.level_1e6 });
             prop_assert_eq!(row.max_risk_1e6, r.risk_1e6);
-            prop_assert_eq!(
-                row.trigger,
-                if r.cross {
-                    RuleRow::TRIGGER_CROSS_DEVIATION
+            prop_assert_eq!(row.flags, 0, "sugar rows keep refire mode");
+            if r.cross {
+                prop_assert_eq!(row.combine, CombineOp::DiffBps as u8);
+                prop_assert_eq!(row.cmp_bits, CMP_ENTRY_ABS);
+                prop_assert_eq!(row.enter_1e9, r.edge_bps as i64 * 1_000_000_000);
+            } else {
+                prop_assert_eq!(row.combine, CombineOp::LhsOnly as u8);
+                prop_assert_eq!(row.enter_1e9, r.level_1e6 * 1_000);
+                if side_byte == 1 {
+                    prop_assert_eq!(row.feat_a, FeatId::Bid as u8);
+                    prop_assert_eq!(row.cmp_bits, 0);
                 } else {
-                    RuleRow::TRIGGER_LEVEL_BREACH
+                    prop_assert_eq!(row.feat_a, FeatId::Ask as u8);
+                    prop_assert_eq!(row.cmp_bits, CMP_ENTRY_LE);
                 }
-            );
-            prop_assert_eq!(
-                row.side,
-                match r.side {
-                    0 => 0u8,
-                    1 => 1u8,
-                    _ => RuleRow::SIDE_BOTH,
-                }
-            );
+            }
+            prop_assert_eq!(row.side, side_byte);
             prop_assert_eq!(row.family, r.family_idx as u8);
             let name = format!("r{i:03}");
             prop_assert_eq!(row.name_h, fnv1a_64(name.as_bytes()));
@@ -232,9 +241,9 @@ proptest! {
         }
 
         // Path A: honest hash of the mutated bytes — drives rules 2–8.
-        let mut scratch = Box::new(RuleTable::EMPTY);
+        let mut scratch = Box::new(RuleTableV2::EMPTY);
         let h = hash128_of(&bytes);
-        match validate_ruleset(&bytes, &h, &UNIVERSE, &mut scratch) {
+        match validate_ruleset(&bytes, &h, &UNIVERSE, &ingress_ai::DescriptorTable::empty(), &mut scratch) {
             Ok(()) => {
                 prop_assert!(scratch.len >= 1 && scratch.len <= 256);
                 prop_assert_eq!(scratch.hash128, h);
@@ -246,8 +255,8 @@ proptest! {
 
         // Path B: the pre-mutation hash — rule 1 unless the mutation
         // chain happened to be byte-identical.
-        let mut scratch_b = Box::new(RuleTable::EMPTY);
-        match validate_ruleset(&bytes, &valid_hash, &UNIVERSE, &mut scratch_b) {
+        let mut scratch_b = Box::new(RuleTableV2::EMPTY);
+        match validate_ruleset(&bytes, &valid_hash, &UNIVERSE, &ingress_ai::DescriptorTable::empty(), &mut scratch_b) {
             Ok(()) => prop_assert_eq!(&bytes, &valid, "stale hash may only pass on identical bytes"),
             Err(_) => prop_assert_eq!(scratch_b.len, 0, "discard-on-reject (§11)"),
         }

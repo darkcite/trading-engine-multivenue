@@ -23,7 +23,7 @@
 //! * capture-observed universe (sorted, deduped syms) feeding the
 //!   REUSED `ingress_ai::validate_ruleset` (§3.5 — no second parser);
 //! * the real `strategy_vm::VmStrategy` driven through the real
-//!   injection paths: inherent `receive_table` (copy #2 seam) + a
+//!   injection paths: inherent `receive_table_v2` (copy #2 seam) + a
 //!   synthesized `RulesetCommit` through `on_ai`, then per merged
 //!   record `on_tick` with a [`BacktestCtx`] virtual clock and the
 //!   synthesized fills fed back through `on_fill` (§3.6);
@@ -51,10 +51,10 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleTable, Tick, VenueId, AI_SIDE_NONE,
+    AiCmd, AiCmdKind, Fill, Order, Price, Qty, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
     STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
 };
-use ingress_ai::{validate_ruleset, RulesetReject};
+use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
 use strategy_vm::VmStrategy;
 
@@ -558,6 +558,38 @@ fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), 
     Ok((merged, summaries))
 }
 
+/// VM2 V4: descriptor table from the NEWEST run's
+/// `instrument-manifest.tsv` (`<sym>\t<descriptor>` rows, M4.2 D3).
+/// Absent/malformed rows skip-and-count per the manifest's reader
+/// law; an absent file yields the EMPTY table.
+fn manifest_descriptor_table(runs: &[RunDir]) -> DescriptorTable {
+    let newest = match runs.last() {
+        Some(r) => r,
+        None => return DescriptorTable::empty(),
+    };
+    let path = newest.path.join("instrument-manifest.tsv");
+    let bytes = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(_) => return DescriptorTable::empty(),
+    };
+    let mut entries: Vec<(String, u32, u8)> = Vec::new();
+    for line in bytes.lines() {
+        let mut it = line.splitn(2, '\t');
+        let sym = it.next().and_then(|s| s.parse::<u32>().ok());
+        let desc = it.next();
+        if let (Some(sym), Some(desc)) = (sym, desc) {
+            if !desc.is_empty() {
+                entries.push((
+                    desc.to_owned(),
+                    sym,
+                    ingress_ai::caps_of_descriptor(desc),
+                ));
+            }
+        }
+    }
+    DescriptorTable::from_entries(entries)
+}
+
 /// Capture-observed universe (§3.5): sorted, deduplicated syms across
 /// every merged tick. `SYMBOL_ID_NONE` can never be a real instrument
 /// and is skipped defensively.
@@ -841,9 +873,17 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
 
     // The REUSED validator (§3.5) — same byte scanner, same reject
     // set as the live side path; the capture-observed universe stands
-    // in for the boot universe.
-    let mut table = Box::new(RuleTable::EMPTY);
-    validate_ruleset(&ruleset_bytes, &hash128, &universe, &mut table)
+    // in for the boot universe. VM2 V4: v2 rows resolve descriptors
+    // against the NEWEST run's `instrument-manifest.tsv` (capability
+    // bits from the offline string law — permissive where the string
+    // under-determines, docs on `caps_of_descriptor`); manifest-less
+    // (pre-D3) captures resolve nothing — v2 rows then reject
+    // `Descriptor` honestly, v1 rows are unaffected. Cross-run
+    // options-ordinal reshuffle stays a documented V5 concern (the
+    // multi-channel merge adds per-run rebind).
+    let descriptors = manifest_descriptor_table(&runs);
+    let mut table = Box::new(RuleTableV2::EMPTY);
+    validate_ruleset(&ruleset_bytes, &hash128, &universe, &descriptors, &mut table)
         .map_err(HarnessError::Reject)?;
 
     // §3.4 boundary: N% of the merged wall-time span. Replay is
@@ -880,10 +920,10 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     let mut ctx = BacktestCtx::new();
     vm.on_start(&mut ctx)
         .map_err(|e| HarnessError::Internal(format!("vm on_start failed: {e}")))?;
-    // 1. Inherent receive_table — the copy-#2 seam the StrategySet
+    // 1. Inherent receive_table_v2 — the copy-#2 seam the StrategySet
     //    forwarder would otherwise drive (the trait hook is a no-op on
     //    a bare vm by design).
-    vm.receive_table(&table);
+    vm.receive_table_v2(&table);
     // 2. The real hash-checked flip: a synthesized RulesetCommit with
     //    the hash128 riding px/qty as LE i64 halves (worker wire
     //    convention, `AiCmd::ruleset_hash128` reassembles it).

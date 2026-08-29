@@ -111,9 +111,9 @@
 use core_time::NsTs;
 use core_types::{
     symbol_venue_byte, AiCmd, AiCmdKind, ChannelEvent, CombineOp, DepthTopK, FeatId, Fill,
-    OptSummary, Order, Price, Qty, RuleRowV2, RuleTable, RuleTableV2, Side, Signal, SymbolId,
-    Tick, VenueId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS,
-    CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, ROW_FLAG_POSITION, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
+    OptSummary, Order, Price, Qty, RuleRowV2, RuleTableV2, Side, Signal, SymbolId, Tick,
+    VenueId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS, CMP_ENTRY_LE,
+    FEAT_NONE, GROUP_NONE, ROW_FLAG_POSITION, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
 };
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
@@ -294,15 +294,6 @@ impl VmStrategy {
         } else {
             None
         }
-    }
-
-    /// §6 copy #2 target for v1 tables: maps rows onto v2 sugar
-    /// ([`RuleTableV2::map_v1`]) into the staging buffer. The trait
-    /// seam stays byte-frozen until V4 flips the handoff ring to v2.
-    pub fn receive_table(&mut self, table: &RuleTable) {
-        let sidx = ((self.active & 1) ^ 1) as usize;
-        RuleTableV2::map_v1(table, &mut self.tables[sidx]);
-        self.staged_valid = true;
     }
 
     /// §6 copy #2 target for NATIVE v2 tables (the V4 handoff / the
@@ -1059,11 +1050,14 @@ mod tests {
         )
     }
 
-    fn table_with(rows: &[RuleRow], epoch: u32, hash128: [u8; 16]) -> RuleTable {
-        let mut t = RuleTable::EMPTY;
+    /// v1-shaped fixture rows mapped through the SAME sugar law the
+    /// validator's compat arm uses (`RuleRowV2::from_v1`) — these
+    /// tests remain the v1-semantics regression suite.
+    fn table_with(rows: &[RuleRow], epoch: u32, hash128: [u8; 16]) -> Box<RuleTableV2> {
+        let mut t = Box::new(RuleTableV2::EMPTY);
         let mut i = 0;
         while i < rows.len() {
-            t.rows[i] = rows[i];
+            t.rows[i] = RuleRowV2::from_v1(&rows[i]);
             i += 1;
         }
         t.len = rows.len() as u32;
@@ -1112,7 +1106,7 @@ mod tests {
 
     /// Receive + commit v1 `rows` as epoch-1 table `HASH_A`.
     fn install(vm: &mut VmStrategy, ctx: &mut TestCtx, rows: &[RuleRow]) {
-        vm.receive_table(&table_with(rows, 1, HASH_A));
+        vm.receive_table_v2(&table_with(rows, 1, HASH_A));
         vm.on_ai(&commit_cmd(HASH_A), ctx);
         assert_eq!(vm.commits_applied, 1);
     }
@@ -1172,7 +1166,7 @@ mod tests {
     fn receive_then_commit_flips() {
         let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
             1,
             HASH_A,
@@ -1201,7 +1195,7 @@ mod tests {
     fn commit_hash_mismatch_drops_and_keeps_staged() {
         let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
             1,
             HASH_A,
@@ -1222,7 +1216,7 @@ mod tests {
     fn stage_and_other_kinds_are_ignored() {
         let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
             1,
             HASH_A,
@@ -1240,12 +1234,12 @@ mod tests {
     fn restage_supersedes_staged_buffer() {
         let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(0, 12_000, 1_000, 3_000_000)],
             1,
             HASH_A,
         ));
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(1, 900_000, 1_000, 3_000_000)],
             2,
             HASH_B,
@@ -1263,7 +1257,7 @@ mod tests {
         let mut vm = VmStrategy::new();
         let mut ctx = TestCtx::new();
         install(&mut vm, &mut ctx, &[lb_row(0, 12_000, 1_000, 3_000_000)]);
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(1, 900_000, 1_000, 4_000_000)],
             2,
             HASH_B,
@@ -1272,7 +1266,7 @@ mod tests {
         assert_eq!(vm.commits_applied, 2);
         assert_eq!(vm.active_epoch(), 2);
         assert_eq!(vm.active_hash128(), HASH_B);
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(0, 12_000, 1_000, 5_000_000)],
             3,
             HASH_A,
@@ -1480,7 +1474,7 @@ mod tests {
         ctx.now += 1_000_000;
         vm.on_tick(&tick(SYM, 2, 10_000, 12_000), &mut ctx);
         assert_eq!(ctx.submitted.len(), 1, "asleep for a day");
-        vm.receive_table(&table_with(
+        vm.receive_table_v2(&table_with(
             &[lb_row(Side::Bid as u8, 12_000, 86_400_000, 3_000_000)],
             2,
             HASH_B,

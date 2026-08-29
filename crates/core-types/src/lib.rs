@@ -1621,7 +1621,7 @@ pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Row capacity of a [`RuleTable`] — the §4.2 rule-4 upper cap.
+/// Row capacity of a [`RuleTableV2`] — the §4.2 rule-4 upper cap.
 pub const RULE_TABLE_ROWS: usize = 256;
 
 /// One validated rule — 64 bytes, exactly one cache line; no row
@@ -1734,46 +1734,10 @@ impl RuleRow {
     }
 }
 
-/// The engine-facing rule table — 16 KiB of rows plus one trailing
-/// metadata cache line, 16 448 B total (8g design §3; layout pinned
-/// in `docs/wire-format.md`).
-///
-/// In-memory POD only: the table never crosses a process or
-/// byte-order boundary, so no serialization is defined and none is
-/// captured — identity is [`Self::hash128`]; the JSON artifact is the
-/// durable form. Ferried ingress→engine **by value** via
-/// `Ring<RuleTableSlot, 2>` (§6 — the two documented 16 KiB copies,
-/// operator cadence only).
-#[derive(Copy, Clone)]
-#[repr(C, align(64))]
-pub struct RuleTable {
-    /// Row storage; only `rows[..len as usize]` is meaningful.
-    pub rows: [RuleRow; RULE_TABLE_ROWS],
-    /// Validated row count ≤ [`RULE_TABLE_ROWS`].
-    pub len: u32,
-    /// Side-path monotonic stage counter (diagnostics).
-    pub epoch: u32,
-    /// Identity — the d5 truncated sha256 (first 16 bytes of the full
-    /// SHA-256 of the JSON artifact bytes).
-    pub hash128: [u8; 16],
-    /// Explicit tail padding — always zero.
-    _pad: [u8; 40],
-}
-
-impl RuleTable {
-    /// The empty table: no rows, epoch 0, zero hash. Boot/scratch
-    /// preallocation value — built once, reused forever.
-    pub const EMPTY: Self = Self {
-        rows: [RuleRow::ZERO; RULE_TABLE_ROWS],
-        len: 0,
-        epoch: 0,
-        hash128: [0; 16],
-        _pad: [0; 40],
-    };
-}
-
-/// Ring slot ferrying a staged table ingress→engine (§6).
-pub type RuleTableSlot = RuleTable;
+// (VM2 V4: the v1 `RuleTable` retired — the §6 handoff carries
+// [`RuleTableV2`] now and the validator builds v2 rows directly.
+// [`RuleRow`] stays as the v1 JSON grammar's record through the D-6
+// one-release compat window; `RuleRowV2::from_v1` is the sugar law.)
 
 /// Capacity (slots) of the §6 table-handoff ring
 /// `Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>` — SPSC, ingress-ai
@@ -2288,7 +2252,7 @@ impl RuleRowV2 {
 /// The v2 engine-facing rule table — 32 KiB of rows plus one trailing
 /// metadata cache line, 32 832 B total (vm2-plan §3, D-5; layout
 /// pinned in docs/wire-format.md). In-memory POD only, identical
-/// contract to the v1 [`RuleTable`]: never crosses a process
+/// contract to the retired v1 table: never crosses a process
 /// boundary, identity is `hash128`, ferried ingress→engine by value
 /// via `Ring<RuleTableV2Slot, RULE_TABLE_RING_SLOTS>` (the two
 /// documented copies grow to 32 KiB + 64 each — operator cadence).
@@ -2319,30 +2283,11 @@ impl RuleTableV2 {
         _pad: [0; 40],
     };
 
-    /// Map a whole v1 table onto v2 rows in place
-    /// ([`RuleRowV2::from_v1`] per row; len/epoch/hash carried).
-    /// Out-param form: a 32 KiB by-value return would churn the
-    /// stack at the caller.
-    pub fn map_v1(src: &RuleTable, out: &mut RuleTableV2) {
-        let n = (src.len as usize).min(RULE_TABLE_ROWS);
-        let mut i = 0;
-        while i < n {
-            out.rows[i] = RuleRowV2::from_v1(&src.rows[i]);
-            i += 1;
-        }
-        while i < RULE_TABLE_ROWS {
-            out.rows[i] = RuleRowV2::ZERO;
-            i += 1;
-        }
-        out.len = n as u32;
-        out.epoch = src.epoch;
-        out.hash128 = src.hash128;
-    }
 }
 
-/// Ring slot ferrying a staged v2 table ingress→engine (§6 law,
-/// v2-sized).
-pub type RuleTableV2Slot = RuleTableV2;
+/// Ring slot ferrying a staged table ingress→engine (§6; VM2 V4:
+/// v2-typed — 32 832 B by value at operator cadence).
+pub type RuleTableSlot = RuleTableV2;
 
 // ---------------------------------------------------------------
 // Funding cadence law — the single home (vm2-plan §1.1, R4-§9)
@@ -2406,7 +2351,6 @@ static_assert_size!(Order, 64);
 static_assert_size!(ChannelEvent, 64);
 static_assert_size!(AiCmd, 64);
 static_assert_size!(RuleRow, 64);
-static_assert_size!(RuleTable, 16 * 1024 + 64);
 
 // AiCmd byte layout is a cross-process wire contract (Python packs it,
 // docs/wire-format.md pins it) — every field offset is asserted at
@@ -2445,11 +2389,6 @@ const _: () = {
     assert!(::core::mem::offset_of!(RuleRow, side) == 41);
     assert!(::core::mem::offset_of!(RuleRow, family) == 42);
     assert!(::core::mem::offset_of!(RuleRow, _pad) == 43);
-    assert!(::core::mem::offset_of!(RuleTable, rows) == 0);
-    assert!(::core::mem::offset_of!(RuleTable, len) == 16 * 1024);
-    assert!(::core::mem::offset_of!(RuleTable, epoch) == 16 * 1024 + 4);
-    assert!(::core::mem::offset_of!(RuleTable, hash128) == 16 * 1024 + 8);
-    assert!(::core::mem::offset_of!(RuleTable, _pad) == 16 * 1024 + 24);
     assert!(RULE_TABLE_RING_SLOTS.is_power_of_two());
 };
 
@@ -3422,16 +3361,6 @@ mod ai_cmd_tests {
         assert_eq!(::core::mem::align_of::<RuleRow>(), 64);
     }
 
-    #[test]
-    fn rule_table_size_is_rows_plus_one_line() {
-        assert_eq!(::core::mem::size_of::<RuleTable>(), 16 * 1024 + 64);
-        assert_eq!(::core::mem::align_of::<RuleTable>(), 64);
-        // `RuleTableSlot` is the same type by definition (§6 slot).
-        assert_eq!(
-            ::core::mem::size_of::<RuleTableSlot>(),
-            ::core::mem::size_of::<RuleTable>()
-        );
-    }
 
     #[test]
     fn rule_row_layout_is_fully_explicit() {
@@ -3442,11 +3371,6 @@ mod ai_cmd_tests {
         assert_eq!(declared, ::core::mem::size_of::<RuleRow>());
     }
 
-    #[test]
-    fn rule_table_layout_is_fully_explicit() {
-        let declared = 64 * RULE_TABLE_ROWS + 4 + 4 + 16 + 40;
-        assert_eq!(declared, ::core::mem::size_of::<RuleTable>());
-    }
 
     #[test]
     fn rule_row_new_roundtrips_and_zeroes_padding() {
@@ -3479,20 +3403,6 @@ mod ai_cmd_tests {
         }
     }
 
-    #[test]
-    fn rule_table_empty_is_inert() {
-        let t = RuleTable::EMPTY;
-        assert_eq!(t.len, 0);
-        assert_eq!(t.epoch, 0);
-        assert_eq!(t.hash128, [0u8; 16]);
-        assert_eq!(t.rows[0].sym, 0);
-        assert_eq!(t.rows[RULE_TABLE_ROWS - 1].name_h, 0);
-        let mut i = 0;
-        while i < t._pad.len() {
-            assert_eq!(t._pad[i], 0);
-            i += 1;
-        }
-    }
 
     #[test]
     fn fnv1a_64_matches_published_vectors() {
@@ -3952,33 +3862,6 @@ mod vm2_v1_tests {
         assert_eq!(v2.edge_bps, 80, "diagnostic mirror");
     }
 
-    #[test]
-    fn map_v1_carries_len_epoch_hash_and_zeroes_the_tail() {
-        let mut t1 = RuleTable::EMPTY;
-        t1.rows[0] = RuleRow::new(
-            42,
-            SYMBOL_ID_NONE,
-            0,
-            10,
-            500_000,
-            1_000_000,
-            1,
-            RuleRow::TRIGGER_LEVEL_BREACH,
-            0,
-            0,
-        );
-        t1.len = 1;
-        t1.epoch = 9;
-        t1.hash128 = [0xAB; 16];
-        let mut t2 = Box::new(RuleTableV2::EMPTY);
-        t2.rows[5] = RuleRowV2::from_v1(&t1.rows[0]); // stale garbage
-        RuleTableV2::map_v1(&t1, &mut t2);
-        assert_eq!(t2.len, 1);
-        assert_eq!(t2.epoch, 9);
-        assert_eq!(t2.hash128, [0xAB; 16]);
-        assert_eq!(t2.rows[0].ver, RULE_ROW_VER_2);
-        assert_eq!(t2.rows[5].ver, 0, "tail rows zeroed");
-    }
 
     // ---------------- funding cadence law ----------------
 

@@ -1780,6 +1780,7 @@ pub fn spawn_ai(
     producer: Producer<AiCmd, AI_RING_SIZE>,
     table_producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     universe: Arc<[u32]>,
+    descriptors: Arc<ingress_ai::DescriptorTable>,
     status: Arc<AiIngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -1809,7 +1810,13 @@ pub fn spawn_ai(
         // consumer half parks in the bin until item 7 wires the
         // engine drain.
         let mut side_path =
-            RulesetSidePath::new(ruleset_dir, Arc::clone(&status), universe, table_producer);
+            RulesetSidePath::new(
+                ruleset_dir,
+                Arc::clone(&status),
+                universe,
+                descriptors,
+                table_producer,
+            );
         let mut seam = |c: &AiCmd| side_path.on_cmd(c);
         while !shutdown_requested() {
             match ingress_ai::run(
@@ -5736,7 +5743,7 @@ mod tests {
         // other ring and round-trips a slot.
         let (mut tp, mut tc) = rings.ruleset_tables.clone().split();
         assert_eq!(rings.ruleset_tables.capacity(), RULE_TABLE_RING_SLOTS);
-        assert!(tp.try_push(core_types::RuleTable::EMPTY).is_ok());
+        assert!(tp.try_push(core_types::RuleTableV2::EMPTY).is_ok());
         assert!(tc.try_pop().is_some());
         assert!(tc.try_pop().is_none());
     }
@@ -6347,9 +6354,9 @@ mod tests {
         }
     }
 
-    fn vm_mirror_table() -> core_types::RuleTable {
-        let mut t = core_types::RuleTable::EMPTY;
-        t.rows[0] = core_types::RuleRow::new(
+    fn vm_mirror_table() -> Box<core_types::RuleTableV2> {
+        let mut t = Box::new(core_types::RuleTableV2::EMPTY);
+        t.rows[0] = core_types::RuleRowV2::from_v1(&core_types::RuleRow::new(
             VM_PM,
             VM_BN,
             20,
@@ -6360,7 +6367,7 @@ mod tests {
             core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
             core_types::RuleRow::SIDE_BOTH,
             0,
-        );
+        ));
         t.len = 1;
         t.epoch = 3;
         t.hash128 = VM_HASH;
@@ -6422,7 +6429,7 @@ mod tests {
         strategy_core::Strategy::on_ai(&mut s, &bad, &mut c);
 
         // Stage → Commit → diverged books → fire.
-        s.vm_mut().receive_table(&vm_mirror_table());
+        s.vm_mut().receive_table_v2(&vm_mirror_table());
         let commit = core_types::AiCmd::new(
             VM_T0,
             2,

@@ -2512,7 +2512,8 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
 #[test]
 fn strategy_set_fanout_is_zero_alloc() {
     use core_types::{
-        fnv1a_64, AiCmd, AiCmdKind, Order, RuleRow, RuleTable, AI_SIDE_NONE, STRATEGY_SLOT_NONE,
+        fnv1a_64, AiCmd, AiCmdKind, Order, RuleRow, RuleTableV2, AI_SIDE_NONE,
+        STRATEGY_SLOT_NONE,
         STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
     };
     use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -2546,8 +2547,8 @@ fn strategy_set_fanout_is_zero_alloc() {
     set.on_start(&mut ctx).unwrap();
 
     let vm_hash: [u8; 16] = [0xAB; 16];
-    let mut table = RuleTable::EMPTY;
-    table.rows[0] = RuleRow::new(
+    let mut table = Box::new(RuleTableV2::EMPTY);
+    table.rows[0] = core_types::RuleRowV2::from_v1(&RuleRow::new(
         11,
         22,
         20,
@@ -2558,11 +2559,11 @@ fn strategy_set_fanout_is_zero_alloc() {
         RuleRow::TRIGGER_CROSS_DEVIATION,
         RuleRow::SIDE_BOTH,
         0,
-    );
+    ));
     table.len = 1;
     table.epoch = 1;
     table.hash128 = vm_hash;
-    set.vm_mut().receive_table(&table);
+    set.vm_mut().receive_table_v2(&table);
     let commit = {
         let px = i64::from_le_bytes(vm_hash[..8].try_into().expect("8 bytes"));
         let qty = i64::from_le_bytes(vm_hash[8..].try_into().expect("8 bytes"));
@@ -3081,10 +3082,12 @@ fn ruleset_validator_is_zero_alloc() {
     let mut universe: Vec<u32> = (1..=256u32).map(|i| i * 3).collect();
     universe.push(1_000);
 
-    // Max-size valid ruleset: 256 cross_deviation rows, distinct syms
-    // and names; $3.90/row ⇒ Σ $998.40 ≤ $1 000, per-sym $3.90 ≤ $250.
+    // Max-size valid ruleset: 255 v1 cross_deviation rows + one v2
+    // grammar row (VM2 V4 — the gate covers BOTH arms, descriptor
+    // resolution + capability checks included), distinct syms and
+    // names; $3.90/row keeps every budget green.
     let mut json = String::from(r#"{"rows":["#);
-    for i in 0..256u32 {
+    for i in 0..255u32 {
         if i > 0 {
             json.push(',');
         }
@@ -3093,6 +3096,9 @@ fn ruleset_validator_is_zero_alloc() {
             (i + 1) * 3
         ));
     }
+    json.push_str(
+        r#",{"name":"v2row","instrument":"okx:BTC-USDT-SWAP","ref":"binance-usdm:btcusdt","feature":"apr24","combine":"diff","enter":0.20,"exit":0.0,"confirm_feature":"apr72","confirm":0.30,"confirm_abs":true,"confirm_pair":true,"group":3,"min_hold_s":600,"max_hold_s":864000,"horizon_ms":60000,"max_risk_usd":3.9}"#,
+    );
     json.push_str("]}");
     let valid_bytes = json.into_bytes();
     let valid_hash = hash128_of(&valid_bytes);
@@ -3145,31 +3151,45 @@ fn ruleset_validator_is_zero_alloc() {
         })
         .collect();
 
-    let mut scratch = Box::new(core_types::RuleTable::EMPTY);
+    let mut scratch = Box::new(core_types::RuleTableV2::EMPTY);
+    // VM2 V4: the v2 row resolves through here — the resolve path
+    // (binary search) sits inside the measured window.
+    let descs = ingress_ai::DescriptorTable::from_entries(vec![
+        (
+            "okx:BTC-USDT-SWAP".to_owned(),
+            2_000,
+            ingress_ai::CAP_PRICE | ingress_ai::CAP_FUNDING | ingress_ai::CAP_DEPTH,
+        ),
+        (
+            "binance-usdm:btcusdt".to_owned(),
+            2_001,
+            ingress_ai::CAP_PRICE | ingress_ai::CAP_FUNDING,
+        ),
+    ]);
     // Prewarm + prove the fixtures behave before measuring.
-    ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &mut scratch)
+    ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &descs, &mut scratch)
         .expect("max-size ruleset must validate");
     assert_eq!(scratch.len, 256);
     assert!(
-        ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &mut scratch).is_err()
+        ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &descs, &mut scratch).is_err()
     );
     for (b, h) in &rejects {
-        assert!(ingress_ai::validate_ruleset(b, h, &universe, &mut scratch).is_err());
+        assert!(ingress_ai::validate_ruleset(b, h, &universe, &descs, &mut scratch).is_err());
     }
 
     let g = AllocGuard::new();
     for _ in 0..50u32 {
-        let ok = ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &mut scratch);
+        let ok = ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &descs, &mut scratch);
         std::hint::black_box(ok.is_ok());
         std::hint::black_box(&scratch.len);
         // Rule 1 reject on the same bytes.
-        let r1 = ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &mut scratch);
+        let r1 = ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &descs, &mut scratch);
         std::hint::black_box(r1.is_err());
         // Rules 2–8 rejects.
         let mut k = 0usize;
         while k < rejects.len() {
             let (b, h) = &rejects[k];
-            let r = ingress_ai::validate_ruleset(b, h, &universe, &mut scratch);
+            let r = ingress_ai::validate_ruleset(b, h, &universe, &descs, &mut scratch);
             std::hint::black_box(r.is_err());
             k += 1;
         }
@@ -3210,7 +3230,7 @@ fn ruleset_table_handoff_is_zero_alloc() {
 
     // Full-size table so every copy moves the entire body (contents
     // are immaterial to the seam).
-    let mut table = Box::new(core_types::RuleTable::EMPTY);
+    let mut table = Box::new(core_types::RuleTableV2::EMPTY);
     table.len = core_types::RULE_TABLE_ROWS as u32;
     table.hash128 = [0xA5; 16];
     let ring: std::sync::Arc<
@@ -3242,7 +3262,7 @@ fn ruleset_table_handoff_is_zero_alloc() {
     table.epoch = 0;
     assert!(prod.try_push(*table).is_ok());
     let warm = cons.try_pop().expect("prewarm pop");
-    vm.receive_table(&warm);
+    vm.receive_table_v2(&warm);
     vm.on_ai(&commit, &mut ctx);
     assert_eq!(vm.commits_applied, 1, "prewarm flip must land");
 
@@ -3264,7 +3284,7 @@ fn ruleset_table_handoff_is_zero_alloc() {
             // Copy #2: popped slot → member staged buffer. The second
             // pop of the pair overwrites the first — the engine-side
             // restage-supersedes mirror, measured too.
-            vm.receive_table(&t);
+            vm.receive_table_v2(&t);
             pops += 1;
         }
         // Commit flip third (§10): hash match ⇒ index swap, no copy.
@@ -3328,7 +3348,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
     //   sym 1  carries a $500 cap ⇒ policy-clamps to $100
     //   sym 128 is Ask-side with a 1-micro-$ cap and ticks at a $2
     //   mid ⇒ fires (bid ≥ level) but qty floors to zero
-    let mut table = Box::new(core_types::RuleTable::EMPTY);
+    let mut table = Box::new(core_types::RuleTableV2::EMPTY);
     for k in 0..128u32 {
         let risk = if k == 0 {
             500_000_000 // policy re-clamp branch
@@ -3338,7 +3358,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
             1_000_000
         };
         let side = if k == 127 { 1 } else { 0 }; // Ask / Bid
-        table.rows[k as usize] = core_types::RuleRow::new(
+        table.rows[k as usize] = core_types::RuleRowV2::from_v1(&core_types::RuleRow::new(
             k + 1,
             core_types::SYMBOL_ID_NONE,
             0,
@@ -3349,21 +3369,22 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
             core_types::RuleRow::TRIGGER_LEVEL_BREACH,
             side,
             0,
-        );
+        ));
     }
     for k in 0..128u32 {
-        table.rows[(128 + k) as usize] = core_types::RuleRow::new(
-            129 + k,
-            REF_SYM,
-            80,
-            10,
-            0,
-            1_000_000,
-            (128 + k) as u64,
-            core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
-            core_types::RuleRow::SIDE_BOTH,
-            0,
-        );
+        table.rows[(128 + k) as usize] =
+            core_types::RuleRowV2::from_v1(&core_types::RuleRow::new(
+                129 + k,
+                REF_SYM,
+                80,
+                10,
+                0,
+                1_000_000,
+                (128 + k) as u64,
+                core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
+                core_types::RuleRow::SIDE_BOTH,
+                0,
+            ));
     }
     table.len = core_types::RULE_TABLE_ROWS as u32;
     table.epoch = 1;
@@ -3377,7 +3398,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
         now: 1_000_000_000,
     };
     vm.on_start(&mut ctx).unwrap();
-    vm.receive_table(&table);
+    vm.receive_table_v2(&table);
     let commit = core_types::AiCmd::new(
         1,
         1,

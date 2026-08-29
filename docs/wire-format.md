@@ -320,13 +320,61 @@ single home).
 |     85 |     3 | _pad2        | `[u8; 3]`      | explicit, zeroed                             |
 |     88 |    40 | _pad3        | `[u8; 40]`     | explicit, zeroed (reserved)                  |
 
-### `RuleTableV2` / `RuleTableV2Slot` — 32 832 bytes (VM2 V1; `Ring<RuleTableV2Slot, 2>` once V4 flips the handoff, never captured)
+### `RuleTableV2` / `RuleTableSlot` — 32 832 bytes (VM2; the §6 handoff ring's slot since V4, never captured)
 
 256 × 128 B rows (32 KiB) + one trailing metadata cache line —
-identical metadata layout to v1 at the 32 KiB base. The engine
-accepts BOTH artifact grammar versions (v1 JSON maps onto v2 rows at
-build); in-memory there is ONE row format. The §6 documented copies
-grow to 32 832 B each at operator cadence.
+identical metadata layout to the retired v1 table at the 32 KiB
+base. The engine accepts BOTH artifact grammar versions (v1 JSON
+maps onto v2 rows at build); in-memory there is ONE row format. The
+§6 documented copies grew to 32 832 B each at operator cadence.
+
+### Ruleset JSON grammar v2 (VM2 V4; `~/multivenue/artifacts/rulesets/<hash128>.json`)
+
+A `rows` array whose rows are v1-shaped (the 8g sugar — raw `sym`
+ints + `trigger` objects, validated against the boot sym universe;
+commit-able through the D-6 one-release compat arm) or v2-shaped —
+the two shapes may coexist in one artifact but never mix in one row.
+A v2 row:
+
+- `name` (required; rule 5), `family` (optional, default `other`),
+  `side` (`bid`|`ask`|`both`, default `both`).
+- `instrument` (required) and `ref` (optional): **§9.4 DESCRIPTOR
+  strings** (`okx:BTC-USDT-SWAP`, `binance-usdm:btcusdt`,
+  `deribit:BTC-…-C`, bare PM token ids) resolved at STAGE time
+  against the LIVE boot universe (the bin's DescriptorTable, built
+  from the same allocation truth as `instrument-manifest.tsv`);
+  unresolvable ⇒ REFUSE (`Descriptor`). #7b re-commit re-resolves
+  every boot — this is what makes options tradeable across ordinal
+  reshuffles.
+- `feature` (required) / `ref_feature` (default = `feature`):
+  `mid bid ask roll_mean roll_ema roll_min roll_max roll_std apr24
+  apr72 mark_px mark_iv depth_imb depth_spread_bps depth_notional
+  clock_to_funding clock_utc_sod`. `window_min`/`ref_window_min`/
+  `confirm_window_min` ∈ [1, 4320], REQUIRED for `roll_*` features
+  and FORBIDDEN otherwise (rule 3's window law; `Feature` reject).
+- `combine` (`diff`|`diff_bps`|`ratio`): required WITH `ref`,
+  forbidden without (a ref-less row is `LhsOnly` — the CONST form).
+- `enter` (required), `exit`, `confirm`: decimals in NATURAL units
+  parsed at 9-decimal precision (funding rates survive); `cmp`
+  (`ge`|`le`, default `ge`) + `abs` (default false) shape the entry;
+  `confirm_cmp`/`confirm_abs`/`confirm_pair` shape the confirm
+  (`confirm_pair` = the row's combine over `confirm_feature` across
+  BOTH legs — the S1 72 h-spread shape; requires `ref`).
+- **Rule 9 (`Position` reject)**: `exit` present ⇔ the row is a
+  POSITION row; `group` (0–254), `min_hold_s`, `max_hold_s` require
+  it; `max_hold_s > min_hold_s` when both set. Ref-full position
+  rows emit two legs (`max_risk_usd` is PER LEG; rule 7 charges both
+  legs' syms and the table total accordingly).
+- **Rule 10 (`Feature` reject)**: every referenced feature must
+  exist for its resolved instrument's channels (capability bits from
+  the bin's lane truth — no depth rows on a sym without depth, no
+  funding features on spot, no IV off options); the table's distinct
+  rolling (sym, window) pairs must fit the feature engine's bind
+  budget (≤ 8 windows/sym, ≤ 256 pairs).
+- `horizon_ms` [10, 86 400 000] (required): refire cooldown on
+  refire rows, re-entry cooldown after position exits.
+- Rule 8 (v2 identity): duplicate `(instrument, ref, features,
+  windows, combine, cmp bits, mode, group, enter)` rejects.
 
 | offset | bytes | field   | type               | notes                             |
 | -----: | ----: | ------- | ------------------ | --------------------------------- |

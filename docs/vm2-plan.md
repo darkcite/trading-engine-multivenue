@@ -487,4 +487,35 @@ new venues.
   restore-with-min-hold-memory, seed refusal battery, flip resets
   positions, ref-leg ring-full accounting. Gates: nextest
   1404/1404 · alloc 39/39 release (fresh Compiling) · pytest 499 ·
-  license green.
+  license green. Committed `e9c6d43`.
+- 2026-08-30 — **V4 CODED (validator v2 + descriptor resolution +
+  ring flip; workspace green, fuzz running).** The §4.2 validator
+  gained the v2 grammar arm (wire-format.md "Ruleset JSON grammar
+  v2"): descriptor-addressed rows resolved at STAGE time against the
+  bin's `DescriptorTable` (built beside `instrument-manifest.tsv`
+  from the SAME allocation truth, with per-lane channel-capability
+  bits; unresolvable ⇒ the new `Descriptor` REFUSE — D-6 fail-fast;
+  #7b re-stages ⇒ re-resolves every boot); rule 9 (`Position`: exit
+  ⇔ position row, holds/groups require it, max>min sanity); rule 10
+  (`Feature`: channel capabilities per resolved leg, the rule-3
+  window law, the rolling-bind budget ≤8/sym ≤256 pairs); signed
+  9-DECIMAL thresholds (funding rates survive — pinned by
+  `v2_signal_scanner_keeps_nine_decimals`); KEYWORD_CAP 16→24;
+  rule 7 charges BOTH legs of two-leg position rows; rule 8 v2
+  identity includes features/windows/cmp-bits (a coarser draft
+  collided with the bind-budget fixture — caught in-session).
+  v1 rows validate byte-exactly through the compat arm (built VIA
+  `RuleRowV2::from_v1`); both shapes coexist per artifact (pinned).
+  The §6 handoff ring flipped to v2 (`RuleTableSlot = RuleTableV2`,
+  32 832 B slots; `on_ruleset_table(&RuleTableV2)`); the v1
+  `RuleTable` RETIRED (RuleRow stays as the v1-grammar record
+  through the compat window). Backtest resolves v2 descriptors from
+  the NEWEST run's manifest (offline `caps_of_descriptor` string
+  law, documented-permissive; pre-D3 captures refuse v2 rows
+  honestly; cross-run option-ordinal rebind = a documented V5
+  concern). Fuzz target covers both arms (fixture descriptor table
+  in-target; corpus seeded v2/mixed); bench gate 34 = 255 v1 + 1 v2
+  rows with live resolution measured. Gates: nextest 1412/1412 ·
+  alloc 39/39 release (fresh Compiling) · pytest 499 · license
+  green · **fuzz `ruleset_json` 311 s / 34.05M runs CLEAN** (corpus
+  is machine-local by repo convention; the v2 seeds live there).

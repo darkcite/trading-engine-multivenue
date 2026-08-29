@@ -18,7 +18,8 @@
 //!   its first 16 bytes to equal the frame's hash128, then rules 2–8
 //!   scan the bytes into the side-path scratch table. Pass ⇒ stamp
 //!   the candidate epoch and `try_push` the scratch into the §6
-//!   `Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>` (8g item 4);
+//!   `Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>` (8g item 4 — v2-typed
+//!   slots since VM2 V4);
 //!   push ok ⇒ staged state + `engine_ai_ruleset_staged_total`;
 //!   push-full ⇒ REJECT (`engine_ai_ruleset_rejected_total` + the
 //!   dedicated `engine_ai_table_push_fail_total`), staged/committed
@@ -60,7 +61,7 @@
 //! capture→push pump keeps its own 0 B/op gate.
 //!
 //! The stage-time table handoff is **documented copy #1** (§6):
-//! scratch → ring slot via `try_push`, 16 KiB + 64 by value, once per
+//! scratch → ring slot via `try_push`, 32 KiB + 64 by value, once per
 //! successful Stage — operator cadence, moves bytes, never the heap
 //! (alloc gate 35). Copy #2 (ring slot → the vm member's staged
 //! buffer at the engine pop) lands with item 7.
@@ -69,11 +70,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use core_crypto::sha256;
-use core_parse::{scan_price_1e6, scan_u64};
+use core_parse::{scan_price_1e6, scan_price_1e9, scan_u64};
 use core_ring::Producer;
 use core_types::{
-    fnv1a_64, AiCmd, AiCmdKind, RuleRow, RuleTable, RuleTableSlot, RULE_TABLE_RING_SLOTS,
-    RULE_TABLE_ROWS, SYMBOL_ID_NONE,
+    fnv1a_64, AiCmd, AiCmdKind, CombineOp, FeatId, RuleRow, RuleRowV2, RuleTableSlot,
+    RuleTableV2, SymbolId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS,
+    CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, ROLL_WINDOW_MAX_MIN, ROW_FLAG_POSITION,
+    RULE_TABLE_RING_SLOTS, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
 };
 
 use crate::status::AiIngressStatus;
@@ -136,8 +139,164 @@ pub enum RulesetReject {
     Symbol,
     /// Rule 7 — risk caps (tighten-only vs `docs/risk-policy.md`).
     Caps,
-    /// Rule 8 — exact-duplicate row `(sym, trigger, side, ref/level)`.
+    /// Rule 8 — exact-duplicate row `(sym, trigger, side, ref/level)`
+    /// (v1) / the v2 identity tuple (docs on the v2 arm).
     DuplicateRow,
+    /// VM2 V4 (D-6) — a v2 row's `instrument`/`ref` descriptor did
+    /// not resolve against the LIVE boot universe (fail-fast REFUSE;
+    /// #7b re-commit re-resolves every boot).
+    Descriptor,
+    /// VM2 V4 rule 10 — a referenced feature does not exist for the
+    /// resolved instrument's channels (no depth rows on a sym
+    /// without depth), a window violates the feature's window law,
+    /// or the table exceeds the rolling-bind budget.
+    Feature,
+    /// VM2 V4 rule 9 — position/refire shape violations: `exit`
+    /// present without position semantics being expressible, or
+    /// `min_hold_s`/`max_hold_s`/`group` on a refire row, or a
+    /// position row without `exit`.
+    Position,
+}
+
+// ---------------------------------------------------------------
+// VM2 V4 (D-6): descriptor resolution + channel capabilities
+// ---------------------------------------------------------------
+
+/// Capability bit: the instrument has a BBO tick lane (price
+/// features + rolling stats evaluate).
+pub const CAP_PRICE: u8 = 1;
+/// Capability bit: a funding channel exists (APR + clock features).
+pub const CAP_FUNDING: u8 = 2;
+/// Capability bit: an L2 depth subscription exists (depth features).
+pub const CAP_DEPTH: u8 = 4;
+/// Capability bit: an OptSummary channel exists (mark/IV features).
+pub const CAP_OPT: u8 = 8;
+
+/// §9.4-descriptor → (SymbolId, capability bits) table for the v2
+/// grammar's commit-time resolution (D-6). Built by the bin from the
+/// SAME allocation truth that writes `instrument-manifest.tsv`
+/// (live), or from a run's manifest via [`caps_of_descriptor`]
+/// (offline harness). Operator-cadence structure — allocation is
+/// fine here (boot/backtest setup only).
+pub struct DescriptorTable {
+    /// Sorted by descriptor bytes (binary-searched per row leg).
+    entries: Vec<(String, SymbolId, u8)>,
+}
+
+impl DescriptorTable {
+    /// An empty table: every v2 descriptor rejects
+    /// ([`RulesetReject::Descriptor`]) — the honest posture for
+    /// pre-D3 captures; v1 rows are unaffected (sym universe).
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Build from (descriptor, sym, caps) rows; sorts and dedups
+    /// (first entry wins on a duplicate name — allocation emits no
+    /// duplicates; defensive only).
+    pub fn from_entries(mut entries: Vec<(String, SymbolId, u8)>) -> Self {
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        Self { entries }
+    }
+
+    /// Resolve a descriptor's bytes. `None` = not in the boot
+    /// universe (rule-6/D-6 refuse).
+    pub fn resolve(&self, desc: &[u8]) -> Option<(SymbolId, u8)> {
+        let mut lo = 0usize;
+        let mut hi = self.entries.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let e = &self.entries[mid];
+            match e.0.as_bytes().cmp(desc) {
+                core::cmp::Ordering::Equal => return Some((e.1, e.2)),
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// Entry count (diagnostics).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no descriptors resolve.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The OFFLINE capability law: capabilities inferred from the §9.4
+/// descriptor string alone (the backtest's manifest path — manifests
+/// carry no lane flags). PERMISSIVE by design where the string
+/// under-determines the lane (a wrongly GRANTED capability only
+/// yields absent-data-holds downstream, never a wrong fire; the
+/// bin's live table is exact). The string law:
+///
+/// * `binance-opt:*` → OPT|PRICE (eapi tickers carry BBO).
+/// * `deribit:`/`okx:` names ending `-C`/`-P` → OPT|PRICE.
+/// * `deribit:*-PERPETUAL`, `okx:*-SWAP`, `binance-usdm:*`,
+///   `bybit-linear:*`, `hyperliquid:<coin>` (no `#` prefix) →
+///   PRICE|FUNDING (+DEPTH on okx/deribit).
+/// * everything else (PM tokens, spot, dated futures, `#` outcome
+///   coins) → PRICE (+DEPTH on okx/deribit non-options).
+pub fn caps_of_descriptor(desc: &str) -> u8 {
+    let (venue, name) = match desc.split_once(':') {
+        Some((v, n)) => (v, n),
+        None => return CAP_PRICE, // bare PM token id
+    };
+    let is_opt = name.ends_with("-C") || name.ends_with("-P");
+    match venue {
+        "binance-opt" => CAP_OPT | CAP_PRICE,
+        "deribit" => {
+            if is_opt {
+                CAP_OPT | CAP_PRICE
+            } else if name.ends_with("-PERPETUAL") {
+                CAP_PRICE | CAP_FUNDING | CAP_DEPTH
+            } else {
+                CAP_PRICE | CAP_DEPTH
+            }
+        }
+        "okx" => {
+            if is_opt {
+                CAP_OPT
+            } else if name.ends_with("-SWAP") {
+                CAP_PRICE | CAP_FUNDING | CAP_DEPTH
+            } else {
+                CAP_PRICE | CAP_DEPTH
+            }
+        }
+        "binance-usdm" => CAP_PRICE | CAP_FUNDING,
+        "bybit-linear" => CAP_PRICE | CAP_FUNDING,
+        "hyperliquid" => {
+            if name.starts_with('#') {
+                CAP_PRICE
+            } else {
+                CAP_PRICE | CAP_FUNDING
+            }
+        }
+        _ => CAP_PRICE,
+    }
+}
+
+/// Capability bits a [`FeatId`] requires ([`CAP_PRICE`] & co).
+#[inline]
+pub fn feat_caps_required(f: FeatId) -> u8 {
+    if f.requires_price() {
+        CAP_PRICE
+    } else if f.requires_funding() {
+        CAP_FUNDING
+    } else if f.requires_depth() {
+        CAP_DEPTH
+    } else if f.requires_opt_summary() {
+        CAP_OPT
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------
@@ -208,26 +367,81 @@ impl<'a> Cur<'a> {
     }
 }
 
-// Row-object key presence bits (rule 2: each exactly once, all eight
-// present).
-const K_NAME: u8 = 1 << 0;
-const K_FAMILY: u8 = 1 << 1;
-const K_TRIGGER: u8 = 1 << 2;
-const K_SYM: u8 = 1 << 3;
-const K_SIDE: u8 = 1 << 4;
-const K_EDGE: u8 = 1 << 5;
-const K_HORIZON: u8 = 1 << 6;
-const K_RISK: u8 = 1 << 7;
-const ALL_ROW_KEYS: u8 = 0xFF;
+// Row-object key presence bits (rule 2: keys at most once; per-arm
+// required sets checked at row close). u32 — the union grammar has
+// more than eight keys since VM2 V4.
+const K_NAME: u32 = 1 << 0;
+const K_FAMILY: u32 = 1 << 1;
+const K_TRIGGER: u32 = 1 << 2;
+const K_SYM: u32 = 1 << 3;
+const K_SIDE: u32 = 1 << 4;
+const K_EDGE: u32 = 1 << 5;
+const K_HORIZON: u32 = 1 << 6;
+const K_RISK: u32 = 1 << 7;
+const K_INSTRUMENT: u32 = 1 << 8;
+const K_REF: u32 = 1 << 9;
+const K_FEATURE: u32 = 1 << 10;
+const K_REF_FEATURE: u32 = 1 << 11;
+const K_COMBINE: u32 = 1 << 12;
+const K_WINDOW: u32 = 1 << 13;
+const K_REF_WINDOW: u32 = 1 << 14;
+const K_CMP: u32 = 1 << 15;
+const K_ABS: u32 = 1 << 16;
+const K_ENTER: u32 = 1 << 17;
+const K_EXIT: u32 = 1 << 18;
+const K_C_FEATURE: u32 = 1 << 19;
+const K_C_WINDOW: u32 = 1 << 20;
+const K_CONFIRM: u32 = 1 << 21;
+const K_C_CMP: u32 = 1 << 22;
+const K_C_ABS: u32 = 1 << 23;
+const K_C_PAIR: u32 = 1 << 24;
+const K_GROUP: u32 = 1 << 25;
+const K_MIN_HOLD: u32 = 1 << 26;
+const K_MAX_HOLD: u32 = 1 << 27;
 
-// Trigger-object key presence bits.
+/// The v1 arm's full required set (all eight, exactly like 8g).
+const V1_REQUIRED: u32 =
+    K_NAME | K_FAMILY | K_TRIGGER | K_SYM | K_SIDE | K_EDGE | K_HORIZON | K_RISK;
+/// Keys legal ONLY in the v1 arm.
+const V1_ONLY: u32 = K_TRIGGER | K_SYM | K_EDGE;
+/// Keys legal ONLY in the v2 arm.
+const V2_ONLY: u32 = K_INSTRUMENT
+    | K_REF
+    | K_FEATURE
+    | K_REF_FEATURE
+    | K_COMBINE
+    | K_WINDOW
+    | K_REF_WINDOW
+    | K_CMP
+    | K_ABS
+    | K_ENTER
+    | K_EXIT
+    | K_C_FEATURE
+    | K_C_WINDOW
+    | K_CONFIRM
+    | K_C_CMP
+    | K_C_ABS
+    | K_C_PAIR
+    | K_GROUP
+    | K_MIN_HOLD
+    | K_MAX_HOLD;
+/// The v2 arm's required set.
+const V2_REQUIRED: u32 = K_NAME | K_INSTRUMENT | K_FEATURE | K_ENTER | K_HORIZON | K_RISK;
+
+// Trigger-object key presence bits (v1 arm).
 const T_TYPE: u8 = 1 << 0;
 const T_REF: u8 = 1 << 1;
 const T_LEVEL: u8 = 1 << 2;
 
-/// Longest known token is `cross_deviation` (15 B); anything longer
-/// cannot match a key or enum value and rejects as rule 2.
-const KEYWORD_CAP: usize = 16;
+/// Longest known token is `confirm_window_min` (18 B; VM2 V4 grew
+/// this — `cross_deviation` was the v1 record-holder); anything
+/// longer cannot match a key or enum value and rejects as rule 2.
+const KEYWORD_CAP: usize = 24;
+
+/// Descriptor strings are venue-prefixed instrument names; PM token
+/// ids run ~78 digits. 128 covers every §9.4 descriptor with margin;
+/// longer rejects as rule 2.
+const DESCRIPTOR_CAP: usize = 128;
 
 /// Scan a short JSON string (key or enum value) into `out`; rejects
 /// escapes and control bytes (rule 2 — the grammar has no escaped
@@ -248,6 +462,37 @@ fn scan_keyword(cur: &mut Cur<'_>, out: &mut [u8; KEYWORD_CAP]) -> Result<usize,
             return Err(RulesetReject::Grammar);
         }
         if n >= KEYWORD_CAP {
+            return Err(RulesetReject::Grammar);
+        }
+        out[n] = c;
+        n += 1;
+    }
+}
+
+/// Scan a §9.4 descriptor string (v2 `instrument`/`ref` values):
+/// printable ASCII, no escapes, ≤ [`DESCRIPTOR_CAP`].
+fn scan_descriptor(
+    cur: &mut Cur<'_>,
+    out: &mut [u8; DESCRIPTOR_CAP],
+) -> Result<usize, RulesetReject> {
+    cur.eat(b'"')?;
+    let mut n = 0usize;
+    loop {
+        if cur.i >= cur.b.len() {
+            return Err(RulesetReject::Grammar);
+        }
+        let c = cur.b[cur.i];
+        cur.i += 1;
+        if c == b'"' {
+            if n == 0 {
+                return Err(RulesetReject::Descriptor);
+            }
+            return Ok(n);
+        }
+        if c == b'\\' || c < 0x20 || c > 0x7E {
+            return Err(RulesetReject::Grammar);
+        }
+        if n >= DESCRIPTOR_CAP {
             return Err(RulesetReject::Grammar);
         }
         out[n] = c;
@@ -365,7 +610,51 @@ fn scan_money_field(cur: &mut Cur<'_>) -> Result<i64, RulesetReject> {
     Ok(v)
 }
 
-/// Sorted-slice membership (rule 6). Binary search, no iterators.
+/// VM2 V4: scan a signed threshold into the ×1e9 signal domain
+/// (`enter`/`exit`/`confirm` carry NATURAL units — APR fractions,
+/// bps, px — where 6 decimals are too coarse for funding rates).
+/// Same lexical rules as [`scan_money_field`].
+fn scan_signal_field(cur: &mut Cur<'_>) -> Result<i64, RulesetReject> {
+    cur.skip_ws();
+    if cur.i >= cur.b.len() {
+        return Err(RulesetReject::Grammar);
+    }
+    let c = cur.b[cur.i];
+    if c == b'N' || c == b'n' || c == b'I' || c == b'i' {
+        return Err(RulesetReject::Number);
+    }
+    if c != b'-' && !c.is_ascii_digit() {
+        return Err(RulesetReject::Grammar);
+    }
+    let (v, end) = match scan_price_1e9(cur.b, cur.i) {
+        Some(x) => x,
+        None => return Err(RulesetReject::Grammar),
+    };
+    if end < cur.b.len() {
+        let t = cur.b[end];
+        if t == b'e' || t == b'E' {
+            return Err(RulesetReject::Number);
+        }
+    }
+    cur.i = end;
+    Ok(v)
+}
+
+/// Scan a JSON bool.
+fn scan_bool_field(cur: &mut Cur<'_>) -> Result<bool, RulesetReject> {
+    cur.skip_ws();
+    if cur.b.len() >= cur.i + 4 && &cur.b[cur.i..cur.i + 4] == b"true" {
+        cur.i += 4;
+        return Ok(true);
+    }
+    if cur.b.len() >= cur.i + 5 && &cur.b[cur.i..cur.i + 5] == b"false" {
+        cur.i += 5;
+        return Ok(false);
+    }
+    Err(RulesetReject::Grammar)
+}
+
+/// Sorted-slice membership (rule 6, v1 arm). Binary search.
 fn universe_contains(universe: &[u32], sym: u32) -> bool {
     let mut lo = 0usize;
     let mut hi = universe.len();
@@ -384,10 +673,32 @@ fn universe_contains(universe: &[u32], sym: u32) -> bool {
     false
 }
 
-/// Parse the trigger object. Returns
-/// `(trigger byte, ref_sym, level_1e6, trig_keys)` — the rule-6
-/// `ref`-presence decision for `level_breach` is deferred to the row
-/// close (design-literal: §4.2 lists it under rule 6, not grammar).
+/// Map a v2 `feature` token to its [`FeatId`].
+fn feat_of_token(tok: &[u8]) -> Option<FeatId> {
+    Some(match tok {
+        b"mid" => FeatId::Mid,
+        b"bid" => FeatId::Bid,
+        b"ask" => FeatId::Ask,
+        b"roll_mean" => FeatId::RollMean,
+        b"roll_ema" => FeatId::RollEma,
+        b"roll_min" => FeatId::RollMin,
+        b"roll_max" => FeatId::RollMax,
+        b"roll_std" => FeatId::RollStd,
+        b"apr24" => FeatId::Apr24,
+        b"apr72" => FeatId::Apr72,
+        b"mark_px" => FeatId::MarkPx,
+        b"mark_iv" => FeatId::MarkIv,
+        b"depth_imb" => FeatId::DepthImb,
+        b"depth_spread_bps" => FeatId::DepthSpreadBps,
+        b"depth_notional" => FeatId::DepthNearNotional,
+        b"clock_to_funding" => FeatId::ClockToFunding,
+        b"clock_utc_sod" => FeatId::ClockUtcSod,
+        _ => return None,
+    })
+}
+
+/// Parse the v1 trigger object. Returns
+/// `(trigger byte, ref_sym, level_1e6, trig_keys)`.
 fn parse_trigger(cur: &mut Cur<'_>) -> Result<(u8, u32, i64, u8), RulesetReject> {
     cur.eat(b'{')?;
     let mut kw = [0u8; KEYWORD_CAP];
@@ -450,49 +761,132 @@ fn parse_trigger(cur: &mut Cur<'_>) -> Result<(u8, u32, i64, u8), RulesetReject>
     Ok((trigger, ref_sym, level_1e6, trig_keys))
 }
 
-/// Parse one row object and, if rules 2–8 hold, admit it as
-/// `out.rows[count]`. Cross-row state (rule 5 uniqueness, rule 7
-/// sums, rule 8 duplicates) is recomputed against the admitted prefix
-/// `out.rows[..count]` — O(n²) over ≤ 256 contiguous rows at operator
-/// cadence, zero auxiliary storage.
+/// Rolling-bind budget tracker (rule 10's bind arm): distinct
+/// (sym, window) pairs across the whole table must fit the feature
+/// engine's pool, and ≤ 8 windows per sym.
+struct BindBudget {
+    pairs: [(u32, u16); 512],
+    n: usize,
+}
+
+impl BindBudget {
+    fn new() -> Self {
+        Self {
+            pairs: [(0, 0); 512],
+            n: 0,
+        }
+    }
+
+    /// Record a windowed leg; false = budget exceeded.
+    fn add(&mut self, sym: u32, win: u16) -> bool {
+        let mut per_sym = 0usize;
+        let mut i = 0;
+        while i < self.n {
+            let (s, w) = self.pairs[i];
+            if s == sym {
+                if w == win {
+                    return true; // already counted
+                }
+                per_sym += 1;
+            }
+            i += 1;
+        }
+        if per_sym >= strategy_bind_cap_per_sym() || self.n >= strategy_bind_pool() {
+            return false;
+        }
+        self.pairs[self.n] = (sym, win);
+        self.n += 1;
+        true
+    }
+}
+
+/// The feature engine's per-sym window cap (mirrored — ingress-ai
+/// must not depend on strategy-vm; the pin test keeps them equal).
+#[inline]
+const fn strategy_bind_cap_per_sym() -> usize {
+    8
+}
+
+/// The feature engine's rolling-pool size (mirrored, pin-tested).
+#[inline]
+const fn strategy_bind_pool() -> usize {
+    256
+}
+
+/// Per-row parse + rules 2–10 admission into `out.rows[count]`.
+/// Cross-row state (rule 5 uniqueness, rule 7 sums, rule 8
+/// duplicates, rule 10 bind budget) is recomputed against the
+/// admitted prefix — O(n²) over ≤ 256 rows at operator cadence.
 #[allow(clippy::too_many_lines)] // one row = one linear rule sequence; splitting hides the §4.2 order
 fn parse_and_admit_row(
     cur: &mut Cur<'_>,
     universe: &[u32],
-    out: &mut RuleTable,
+    descriptors: &DescriptorTable,
+    out: &mut RuleTableV2,
     count: u32,
     total_risk_1e6: &mut i64,
+    binds: &mut BindBudget,
 ) -> Result<(), RulesetReject> {
     cur.eat(b'{')?;
     let mut kw = [0u8; KEYWORD_CAP];
-    let mut keys = 0u8;
+    let mut desc_buf = [0u8; DESCRIPTOR_CAP];
+    let mut keys = 0u32;
     let mut trig_keys = 0u8;
-    let mut sym = 0u32;
-    let mut ref_sym = SYMBOL_ID_NONE;
+
+    // v1 locals.
+    let mut sym_raw = 0u32;
+    let mut v1_ref = SYMBOL_ID_NONE;
     let mut edge_bps = 0u32;
-    let mut horizon_ms = 0u32;
     let mut level_1e6 = 0i64;
-    let mut max_risk_1e6 = 0i64;
-    let mut name_h = 0u64;
     let mut trigger = 0u8;
-    let mut side = 0u8;
-    let mut family = 0u8;
+
+    // Shared / v2 locals.
+    let mut name_h = 0u64;
+    let mut family = 4u8; // "other" default (v2 arm; v1 requires it)
+    let mut side = RuleRow::SIDE_BOTH;
+    let mut horizon_ms = 0u32;
+    let mut max_risk_1e6 = 0i64;
+    let mut inst_sym = SYMBOL_ID_NONE;
+    let mut inst_caps = 0u8;
+    let mut ref_sym = SYMBOL_ID_NONE;
+    let mut ref_caps = 0u8;
+    let mut feat_a = FeatId::Mid;
+    let mut feat_b: Option<FeatId> = None;
+    let mut combine: Option<CombineOp> = None;
+    let mut win_a = 0u16;
+    let mut win_b = 0u16;
+    let mut win_c = 0u16;
+    let mut cmp_le = false;
+    let mut cmp_abs = false;
+    let mut enter_1e9 = 0i64;
+    let mut exit_1e9 = 0i64;
+    let mut feat_c: Option<FeatId> = None;
+    let mut confirm_1e9 = 0i64;
+    let mut c_le = false;
+    let mut c_abs = false;
+    let mut c_pair = false;
+    let mut group = GROUP_NONE;
+    let mut min_hold_s = 0u32;
+    let mut max_hold_s = 0u32;
+
+    macro_rules! once {
+        ($bit:expr) => {
+            if keys & $bit != 0 {
+                return Err(RulesetReject::Grammar);
+            }
+            keys |= $bit;
+        };
+    }
 
     loop {
         let n = scan_keyword(cur, &mut kw)?;
         cur.eat(b':')?;
         let key = &kw[..n];
         if key == b"name" {
-            if keys & K_NAME != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_NAME;
+            once!(K_NAME);
             name_h = scan_name(cur)?;
         } else if key == b"family" {
-            if keys & K_FAMILY != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_FAMILY;
+            once!(K_FAMILY);
             let m = scan_keyword(cur, &mut kw)?;
             family = match &kw[..m] {
                 b"crypto" => 0,
@@ -503,26 +897,17 @@ fn parse_and_admit_row(
                 _ => return Err(RulesetReject::Grammar),
             };
         } else if key == b"trigger" {
-            if keys & K_TRIGGER != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_TRIGGER;
+            once!(K_TRIGGER);
             let (t, r, l, tk) = parse_trigger(cur)?;
             trigger = t;
-            ref_sym = r;
+            v1_ref = r;
             level_1e6 = l;
             trig_keys = tk;
         } else if key == b"sym" {
-            if keys & K_SYM != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_SYM;
-            sym = scan_u32_field(cur)?;
+            once!(K_SYM);
+            sym_raw = scan_u32_field(cur)?;
         } else if key == b"side" {
-            if keys & K_SIDE != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_SIDE;
+            once!(K_SIDE);
             let m = scan_keyword(cur, &mut kw)?;
             side = match &kw[..m] {
                 b"bid" => 0,
@@ -531,32 +916,141 @@ fn parse_and_admit_row(
                 _ => return Err(RulesetReject::Grammar),
             };
         } else if key == b"edge_bps" {
-            if keys & K_EDGE != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_EDGE;
+            once!(K_EDGE);
             edge_bps = scan_u32_field(cur)?;
             if edge_bps > RULE_EDGE_BPS_MAX {
                 return Err(RulesetReject::Number);
             }
         } else if key == b"horizon_ms" {
-            if keys & K_HORIZON != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_HORIZON;
+            once!(K_HORIZON);
             horizon_ms = scan_u32_field(cur)?;
             if !(RULE_HORIZON_MS_MIN..=RULE_HORIZON_MS_MAX).contains(&horizon_ms) {
                 return Err(RulesetReject::Number);
             }
         } else if key == b"max_risk_usd" {
-            if keys & K_RISK != 0 {
-                return Err(RulesetReject::Grammar);
-            }
-            keys |= K_RISK;
+            once!(K_RISK);
             max_risk_1e6 = scan_money_field(cur)?;
             if max_risk_1e6 <= 0 {
                 return Err(RulesetReject::Number); // a non-positive cap is meaningless
             }
+        } else if key == b"instrument" {
+            once!(K_INSTRUMENT);
+            let m = scan_descriptor(cur, &mut desc_buf)?;
+            match descriptors.resolve(&desc_buf[..m]) {
+                Some((s, c)) => {
+                    inst_sym = s;
+                    inst_caps = c;
+                }
+                None => return Err(RulesetReject::Descriptor),
+            }
+        } else if key == b"ref" {
+            once!(K_REF);
+            let m = scan_descriptor(cur, &mut desc_buf)?;
+            match descriptors.resolve(&desc_buf[..m]) {
+                Some((s, c)) => {
+                    ref_sym = s;
+                    ref_caps = c;
+                }
+                None => return Err(RulesetReject::Descriptor),
+            }
+        } else if key == b"feature" {
+            once!(K_FEATURE);
+            let m = scan_keyword(cur, &mut kw)?;
+            feat_a = match feat_of_token(&kw[..m]) {
+                Some(f) => f,
+                None => return Err(RulesetReject::Grammar),
+            };
+        } else if key == b"ref_feature" {
+            once!(K_REF_FEATURE);
+            let m = scan_keyword(cur, &mut kw)?;
+            feat_b = match feat_of_token(&kw[..m]) {
+                Some(f) => Some(f),
+                None => return Err(RulesetReject::Grammar),
+            };
+        } else if key == b"combine" {
+            once!(K_COMBINE);
+            let m = scan_keyword(cur, &mut kw)?;
+            combine = Some(match &kw[..m] {
+                b"diff" => CombineOp::Diff,
+                b"diff_bps" => CombineOp::DiffBps,
+                b"ratio" => CombineOp::Ratio1e9,
+                _ => return Err(RulesetReject::Grammar),
+            });
+        } else if key == b"window_min" {
+            once!(K_WINDOW);
+            let v = scan_u32_field(cur)?;
+            if v == 0 || v > ROLL_WINDOW_MAX_MIN as u32 {
+                return Err(RulesetReject::Feature);
+            }
+            win_a = v as u16;
+        } else if key == b"ref_window_min" {
+            once!(K_REF_WINDOW);
+            let v = scan_u32_field(cur)?;
+            if v == 0 || v > ROLL_WINDOW_MAX_MIN as u32 {
+                return Err(RulesetReject::Feature);
+            }
+            win_b = v as u16;
+        } else if key == b"confirm_window_min" {
+            once!(K_C_WINDOW);
+            let v = scan_u32_field(cur)?;
+            if v == 0 || v > ROLL_WINDOW_MAX_MIN as u32 {
+                return Err(RulesetReject::Feature);
+            }
+            win_c = v as u16;
+        } else if key == b"cmp" {
+            once!(K_CMP);
+            let m = scan_keyword(cur, &mut kw)?;
+            cmp_le = match &kw[..m] {
+                b"ge" => false,
+                b"le" => true,
+                _ => return Err(RulesetReject::Grammar),
+            };
+        } else if key == b"abs" {
+            once!(K_ABS);
+            cmp_abs = scan_bool_field(cur)?;
+        } else if key == b"enter" {
+            once!(K_ENTER);
+            enter_1e9 = scan_signal_field(cur)?;
+        } else if key == b"exit" {
+            once!(K_EXIT);
+            exit_1e9 = scan_signal_field(cur)?;
+        } else if key == b"confirm_feature" {
+            once!(K_C_FEATURE);
+            let m = scan_keyword(cur, &mut kw)?;
+            feat_c = match feat_of_token(&kw[..m]) {
+                Some(f) => Some(f),
+                None => return Err(RulesetReject::Grammar),
+            };
+        } else if key == b"confirm" {
+            once!(K_CONFIRM);
+            confirm_1e9 = scan_signal_field(cur)?;
+        } else if key == b"confirm_cmp" {
+            once!(K_C_CMP);
+            let m = scan_keyword(cur, &mut kw)?;
+            c_le = match &kw[..m] {
+                b"ge" => false,
+                b"le" => true,
+                _ => return Err(RulesetReject::Grammar),
+            };
+        } else if key == b"confirm_abs" {
+            once!(K_C_ABS);
+            c_abs = scan_bool_field(cur)?;
+        } else if key == b"confirm_pair" {
+            once!(K_C_PAIR);
+            c_pair = scan_bool_field(cur)?;
+        } else if key == b"group" {
+            once!(K_GROUP);
+            let v = scan_u32_field(cur)?;
+            if v > 254 {
+                return Err(RulesetReject::Number);
+            }
+            group = v as u8;
+        } else if key == b"min_hold_s" {
+            once!(K_MIN_HOLD);
+            min_hold_s = scan_u32_field(cur)?;
+        } else if key == b"max_hold_s" {
+            once!(K_MAX_HOLD);
+            max_hold_s = scan_u32_field(cur)?;
         } else {
             return Err(RulesetReject::Grammar); // unknown row key
         }
@@ -567,13 +1061,250 @@ fn parse_and_admit_row(
         break;
     }
 
-    // Rule 2 (close): all eight keys present exactly once.
-    if keys != ALL_ROW_KEYS {
+    // Arm selection (rule 2): a row is v1 XOR v2 — mixing shapes
+    // rejects.
+    let v1 = keys & V1_ONLY != 0;
+    let v2 = keys & V2_ONLY != 0;
+    if v1 && v2 {
         return Err(RulesetReject::Grammar);
     }
 
-    // Rule 5 (close): name_h unique within the file — an FNV collision
-    // between ≤ 256 names is an authoring error by design.
+    let row: RuleRowV2 = if !v2 {
+        // ---- v1 arm: the 8g shape, byte-exact (D-6 compat) ----
+        if keys != V1_REQUIRED {
+            return Err(RulesetReject::Grammar);
+        }
+        // Rule 6: universe membership for BOTH legs; `ref != sym`
+        // for cross_deviation; `ref` ABSENT for level_breach.
+        if !universe_contains(universe, sym_raw) {
+            return Err(RulesetReject::Symbol);
+        }
+        if trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
+            if !universe_contains(universe, v1_ref) {
+                return Err(RulesetReject::Symbol);
+            }
+            if v1_ref == sym_raw {
+                return Err(RulesetReject::Symbol);
+            }
+        } else if trig_keys & T_REF != 0 {
+            return Err(RulesetReject::Symbol);
+        }
+        // Rule 8 (v1 identity law, preserved): duplicate
+        // `(sym, trigger, side, ref/level)` — edge/horizon/risk/name
+        // deliberately NOT part of it. Prior v1-mapped rows are
+        // recognized by their sugar shape.
+        let this_combine = if trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
+            CombineOp::DiffBps as u8
+        } else {
+            CombineOp::LhsOnly as u8
+        };
+        let this_level_1e9 = level_1e6 * 1_000;
+        let mut j = 0usize;
+        while j < count as usize {
+            let r = &out.rows[j];
+            if r.flags == 0
+                && r.sym == sym_raw
+                && r.side == side
+                && r.combine == this_combine
+                && r.ref_sym == if trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
+                    v1_ref
+                } else {
+                    SYMBOL_ID_NONE
+                }
+                && (this_combine != CombineOp::LhsOnly as u8 || r.enter_1e9 == this_level_1e9)
+            {
+                return Err(RulesetReject::DuplicateRow);
+            }
+            j += 1;
+        }
+        RuleRowV2::from_v1(&RuleRow::new(
+            sym_raw,
+            if trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
+                v1_ref
+            } else {
+                SYMBOL_ID_NONE
+            },
+            edge_bps,
+            horizon_ms,
+            level_1e6,
+            max_risk_1e6,
+            name_h,
+            trigger,
+            side,
+            family,
+        ))
+    } else {
+        // ---- v2 arm (VM2 V4) ----
+        if keys & V2_REQUIRED != V2_REQUIRED {
+            return Err(RulesetReject::Grammar);
+        }
+        let has_ref = keys & K_REF != 0;
+        // Combine law: required with `ref`, forbidden without.
+        let combine = match (has_ref, combine) {
+            (true, Some(c)) => c,
+            (false, None) => CombineOp::LhsOnly,
+            _ => return Err(RulesetReject::Grammar),
+        };
+        if !has_ref
+            && (keys & K_REF_FEATURE != 0 || keys & K_REF_WINDOW != 0 || c_pair)
+        {
+            return Err(RulesetReject::Grammar);
+        }
+        if has_ref && ref_sym == inst_sym {
+            return Err(RulesetReject::Symbol);
+        }
+        let feat_b = feat_b.unwrap_or(feat_a);
+        // Rule 9: position ⇔ `exit` present; holds/groups require it.
+        let position = keys & K_EXIT != 0;
+        if !position
+            && (keys & K_MIN_HOLD != 0 || keys & K_MAX_HOLD != 0 || keys & K_GROUP != 0)
+        {
+            return Err(RulesetReject::Position);
+        }
+        if position && min_hold_s > 0 && max_hold_s > 0 && max_hold_s <= min_hold_s {
+            return Err(RulesetReject::Position);
+        }
+        // Rule 3 window law: windows iff the feature rolls.
+        let win_law = |f: FeatId, w: u16| -> bool {
+            if f.requires_window() {
+                w > 0
+            } else {
+                w == 0
+            }
+        };
+        if !win_law(feat_a, win_a) || (has_ref && !win_law(feat_b, win_b)) {
+            return Err(RulesetReject::Feature);
+        }
+        if !has_ref && win_b != 0 {
+            return Err(RulesetReject::Feature);
+        }
+        // Confirm shape: threshold/cmp/abs/pair/window require the
+        // feature.
+        if feat_c.is_none()
+            && (keys & K_CONFIRM != 0
+                || keys & K_C_CMP != 0
+                || keys & K_C_ABS != 0
+                || keys & K_C_PAIR != 0
+                || keys & K_C_WINDOW != 0)
+        {
+            return Err(RulesetReject::Grammar);
+        }
+        if let Some(fc) = feat_c {
+            if keys & K_CONFIRM == 0 {
+                return Err(RulesetReject::Grammar);
+            }
+            if !win_law(fc, win_c) {
+                return Err(RulesetReject::Feature);
+            }
+        }
+        // Rule 10: channel capabilities per resolved leg.
+        if feat_caps_required(feat_a) & !inst_caps != 0 {
+            return Err(RulesetReject::Feature);
+        }
+        if has_ref && feat_caps_required(feat_b) & !ref_caps != 0 {
+            return Err(RulesetReject::Feature);
+        }
+        if let Some(fc) = feat_c {
+            if feat_caps_required(fc) & !inst_caps != 0 {
+                return Err(RulesetReject::Feature);
+            }
+            if c_pair && feat_caps_required(fc) & !ref_caps != 0 {
+                return Err(RulesetReject::Feature);
+            }
+        }
+        // Rule 10 bind budget (rolling windows are commit-bound).
+        let bind_legs: [(u32, u16, FeatId); 4] = [
+            (inst_sym, win_a, feat_a),
+            (if has_ref { ref_sym } else { SYMBOL_ID_NONE }, win_b, feat_b),
+            (inst_sym, win_c, feat_c.unwrap_or(FeatId::Mid)),
+            (
+                if c_pair { ref_sym } else { SYMBOL_ID_NONE },
+                win_c,
+                feat_c.unwrap_or(FeatId::Mid),
+            ),
+        ];
+        let mut l = 0;
+        while l < bind_legs.len() {
+            let (s, w, f) = bind_legs[l];
+            if s != SYMBOL_ID_NONE && w > 0 && f.requires_window() && !binds.add(s, w) {
+                return Err(RulesetReject::Feature);
+            }
+            l += 1;
+        }
+        // Rule 8 (v2 identity): duplicate
+        // `(sym, ref, feat_a/b/c, windows, combine, cmp_bits, flags,
+        //   group, enter)` — two rows differing ONLY in
+        // horizon/holds/risk/name/exit/confirm-threshold are the
+        // same rule (the v1 spirit: thresholds-of-degree are not
+        // identity, but a different window or comparison IS a
+        // different rule).
+        let flags = if position { ROW_FLAG_POSITION } else { 0 };
+        let fc_byte = feat_c.map(|f| f as u8).unwrap_or(FEAT_NONE);
+        let mut cmp_bits = 0u8;
+        if cmp_le {
+            cmp_bits |= CMP_ENTRY_LE;
+        }
+        if cmp_abs {
+            cmp_bits |= CMP_ENTRY_ABS;
+        }
+        if c_le {
+            cmp_bits |= CMP_CONFIRM_LE;
+        }
+        if c_abs {
+            cmp_bits |= CMP_CONFIRM_ABS;
+        }
+        if c_pair {
+            cmp_bits |= CMP_CONFIRM_PAIR;
+        }
+        let mut j = 0usize;
+        while j < count as usize {
+            let r = &out.rows[j];
+            if r.sym == inst_sym
+                && r.ref_sym == if has_ref { ref_sym } else { SYMBOL_ID_NONE }
+                && r.feat_a == feat_a as u8
+                && r.feat_b == feat_b as u8
+                && r.feat_c == fc_byte
+                && r.win_a == win_a
+                && r.win_b == win_b
+                && r.win_c == win_c
+                && r.combine == combine as u8
+                && r.cmp_bits == cmp_bits
+                && r.flags == flags
+                && r.group == group
+                && r.enter_1e9 == enter_1e9
+            {
+                return Err(RulesetReject::DuplicateRow);
+            }
+            j += 1;
+        }
+        RuleRowV2::new(
+            flags,
+            side,
+            group,
+            feat_a,
+            feat_b,
+            fc_byte,
+            combine,
+            inst_sym,
+            if has_ref { ref_sym } else { SYMBOL_ID_NONE },
+            win_a,
+            win_b,
+            win_c,
+            cmp_bits,
+            enter_1e9,
+            exit_1e9,
+            confirm_1e9,
+            min_hold_s,
+            horizon_ms,
+            0,
+            max_risk_1e6,
+            name_h,
+            max_hold_s,
+            family,
+        )
+    };
+
+    // Rule 5 (close): name_h unique within the file.
     let mut j = 0usize;
     while j < count as usize {
         if out.rows[j].name_h == name_h {
@@ -582,80 +1313,53 @@ fn parse_and_admit_row(
         j += 1;
     }
 
-    // Rule 6: universe membership for BOTH legs — no venue
-    // restriction on either (D2 as amended); `ref != sym` for
-    // cross_deviation; `ref` ABSENT for level_breach.
-    if !universe_contains(universe, sym) {
-        return Err(RulesetReject::Symbol);
-    }
-    if trigger == RuleRow::TRIGGER_CROSS_DEVIATION {
-        if !universe_contains(universe, ref_sym) {
-            return Err(RulesetReject::Symbol);
-        }
-        if ref_sym == sym {
-            return Err(RulesetReject::Symbol);
-        }
-    } else if trig_keys & T_REF != 0 {
-        return Err(RulesetReject::Symbol);
-    }
-
-    // Rule 7: tighten-only caps. Sums cannot overflow: 256 rows ×
-    // $100 ×1e6 = 2.56e10 ≪ i64::MAX.
-    if max_risk_1e6 > RULE_ROW_MAX_RISK_1E6 {
+    // Rule 7: tighten-only caps. Two-leg position rows spend their
+    // cap on BOTH legs — the ref sym's budget and the table total
+    // count it too. Sums cannot overflow: 256 rows × 2 legs × $10k
+    // ×1e6 ≪ i64::MAX.
+    if row.max_risk_1e6 > RULE_ROW_MAX_RISK_1E6 {
         return Err(RulesetReject::Caps);
     }
-    let mut sym_sum = max_risk_1e6;
-    j = 0;
-    while j < count as usize {
-        if out.rows[j].sym == sym {
-            sym_sum += out.rows[j].max_risk_1e6;
-        }
-        j += 1;
-    }
-    if sym_sum > RULE_SYM_MAX_RISK_1E6 {
-        return Err(RulesetReject::Caps);
-    }
-    if *total_risk_1e6 + max_risk_1e6 > RULE_TABLE_MAX_RISK_1E6 {
-        return Err(RulesetReject::Caps);
-    }
-
-    // Rule 8: exact-duplicate row identity `(sym, trigger, side,
-    // ref/level)` — edge/horizon/risk/name are deliberately NOT part
-    // of the identity.
-    j = 0;
+    let legs: i64 = if row.flags & ROW_FLAG_POSITION != 0 && row.ref_sym != SYMBOL_ID_NONE {
+        2
+    } else {
+        1
+    };
+    let mut sym_sum = row.max_risk_1e6;
+    let mut ref_sum = if legs == 2 { row.max_risk_1e6 } else { 0 };
+    let mut j = 0usize;
     while j < count as usize {
         let r = &out.rows[j];
-        if r.sym == sym
-            && r.trigger == trigger
-            && r.side == side
-            && r.ref_sym == ref_sym
-            && r.level_1e6 == level_1e6
-        {
-            return Err(RulesetReject::DuplicateRow);
+        let r_two = r.flags & ROW_FLAG_POSITION != 0 && r.ref_sym != SYMBOL_ID_NONE;
+        if r.sym == row.sym || (r_two && r.ref_sym == row.sym) {
+            sym_sum += r.max_risk_1e6;
+        }
+        if legs == 2 && (r.sym == row.ref_sym || (r_two && r.ref_sym == row.ref_sym)) {
+            ref_sum += r.max_risk_1e6;
         }
         j += 1;
     }
+    if sym_sum > RULE_SYM_MAX_RISK_1E6 || ref_sum > RULE_SYM_MAX_RISK_1E6 {
+        return Err(RulesetReject::Caps);
+    }
+    if *total_risk_1e6 + row.max_risk_1e6 * legs > RULE_TABLE_MAX_RISK_1E6 {
+        return Err(RulesetReject::Caps);
+    }
+    *total_risk_1e6 += row.max_risk_1e6 * legs;
 
-    *total_risk_1e6 += max_risk_1e6;
-    out.rows[count as usize] = RuleRow::new(
-        sym,
-        ref_sym,
-        edge_bps,
-        horizon_ms,
-        level_1e6,
-        max_risk_1e6,
-        name_h,
-        trigger,
-        side,
-        family,
-    );
+    out.rows[count as usize] = row;
     Ok(())
 }
 
-/// §4.2 validator — the full rule 1–8 battery over raw artifact bytes
-/// into a caller-owned scratch table. 0 B/op after construction
+/// §4.2 validator — the full rule 1–10 battery over raw artifact
+/// bytes into a caller-owned scratch table. 0 B/op after construction
 /// (alloc gate 34); the `fs::read` that produces `bytes` is the
 /// documented operator-cadence copy #0 and sits OUTSIDE this seam.
+///
+/// VM2 V4: rows may be v1-shaped (raw syms + trigger sugar — the D-6
+/// one-release compat arm, validated against `universe`) or
+/// v2-shaped (descriptor strings resolved through `descriptors`,
+/// rules 9–10). Output rows are ALWAYS v2.
 ///
 /// On success `out.rows[..out.len]` holds the validated rows and
 /// `out.hash128` the artifact identity; `out.epoch` is untouched (the
@@ -666,10 +1370,10 @@ pub fn validate_ruleset(
     bytes: &[u8],
     expect_hash128: &[u8; HASH128_LEN],
     universe: &[u32],
-    out: &mut RuleTable,
+    descriptors: &DescriptorTable,
+    out: &mut RuleTableV2,
 ) -> Result<(), RulesetReject> {
-    // Rule 1 FIRST — identity binding before any parse (8f stub
-    // behavior, kept).
+    // Rule 1 FIRST — identity binding before any parse.
     let digest = sha256(bytes);
     let mut k = 0usize;
     while k < HASH128_LEN {
@@ -696,12 +1400,21 @@ pub fn validate_ruleset(
 
     let mut count = 0u32;
     let mut total_risk_1e6 = 0i64;
+    let mut binds = BindBudget::new();
     if !cur.peek_is(b']') {
         loop {
             if count as usize >= RULE_TABLE_ROWS {
                 return Err(RulesetReject::RowCount); // rule 4 upper — a 257th row opens
             }
-            parse_and_admit_row(&mut cur, universe, out, count, &mut total_risk_1e6)?;
+            parse_and_admit_row(
+                &mut cur,
+                universe,
+                descriptors,
+                out,
+                count,
+                &mut total_risk_1e6,
+                &mut binds,
+            )?;
             count += 1;
             if cur.eat_if(b',') {
                 continue;
@@ -710,13 +1423,10 @@ pub fn validate_ruleset(
         }
     }
     cur.eat(b']')?;
-    // Top object: "rows" is the only legal key — a `,` here would
-    // start a duplicate or unknown key (rule 2 either way).
     cur.eat(b'}')?;
     if !cur.at_end() {
         return Err(RulesetReject::Grammar); // trailing non-whitespace (rule 2)
     }
-    // Rule 4 lower — grammar completes first (rule order 2 < 4).
     if count == 0 {
         return Err(RulesetReject::RowCount);
     }
@@ -745,12 +1455,16 @@ pub struct RulesetSidePath {
     /// membership is a boot-time fact; a symbol that later loses its
     /// feed still validates (the row just never triggers).
     universe: Arc<[u32]>,
+    /// VM2 V4 (D-6): descriptor → (sym, caps) resolution for the v2
+    /// grammar arm — built by the bin from the allocation truth (or
+    /// from run manifests in the offline harness).
+    descriptors: Arc<DescriptorTable>,
     /// Producer half of the §6 table-handoff ring (D1a). One
     /// `try_push` per validated Stage — documented copy #1; the
     /// engine owns the consumer half (parked at boot until item 7
     /// wires the pre-AI-drain pop).
     producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
-    scratch: Box<RuleTable>,
+    scratch: Box<RuleTableV2>,
     /// Monotonic successful-stage counter, stamped into
     /// `scratch.epoch` (diagnostics, §3). Advanced only when the
     /// ring push lands, so consumer-visible epochs are gapless.
@@ -771,6 +1485,7 @@ impl RulesetSidePath {
         dir: PathBuf,
         status: Arc<AiIngressStatus>,
         universe: Arc<[u32]>,
+        descriptors: Arc<DescriptorTable>,
         producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     ) -> Self {
         #[cfg(debug_assertions)]
@@ -788,9 +1503,10 @@ impl RulesetSidePath {
             dir,
             status,
             universe,
+            descriptors,
             producer,
             // Documented boot-time allocation: the reusable scratch.
-            scratch: Box::new(RuleTable::EMPTY),
+            scratch: Box::new(RuleTableV2::EMPTY),
             epoch: 0,
             staged: None,
             committed: None,
@@ -817,7 +1533,7 @@ impl RulesetSidePath {
     /// (discard-on-reject wipes `len`) even though `staged()` keeps
     /// the prior hash; the parked scratch is not a state guarantee.
     #[inline]
-    pub fn staged_table(&self) -> &RuleTable {
+    pub fn staged_table(&self) -> &RuleTableV2 {
         &self.scratch
     }
 
@@ -865,7 +1581,13 @@ impl RulesetSidePath {
         let file = self.dir.join(name_str);
         match std::fs::read(&file) {
             Ok(bytes) => {
-                match validate_ruleset(&bytes, &hash128, &self.universe, &mut self.scratch) {
+                match validate_ruleset(
+                    &bytes,
+                    &hash128,
+                    &self.universe,
+                    &self.descriptors,
+                    &mut self.scratch,
+                ) {
                     Ok(()) => self.push_staged(hash128),
                     Err(_) => self.status.inc_ruleset_rejected(),
                 }
@@ -876,7 +1598,7 @@ impl RulesetSidePath {
 
     /// §5 stage handoff (8g item 4): stamp the candidate epoch and
     /// `try_push` the validated scratch into the §6 table ring —
-    /// **documented copy #1** (16 KiB + 64 by value, once per Stage,
+    /// **documented copy #1** (32 KiB + 64 by value, once per Stage,
     /// operator cadence; moves bytes, never the heap — gate 35).
     ///
     /// Push ok ⇒ staged; a new Stage supersedes any previous Commit
@@ -994,7 +1716,13 @@ mod tests {
     ) {
         let (prod, cons) = core_ring::Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
         (
-            RulesetSidePath::new(dir.to_path_buf(), Arc::clone(status), arc_universe(), prod),
+            RulesetSidePath::new(
+                dir.to_path_buf(),
+                Arc::clone(status),
+                arc_universe(),
+                Arc::new(DescriptorTable::empty()),
+                prod,
+            ),
             cons,
         )
     }
@@ -1002,14 +1730,14 @@ mod tests {
     /// Raw byte view for the byte-identical handoff assertions —
     /// well-defined because `RuleTable` is `#[repr(C)]` POD with all
     /// padding explicitly declared and zeroed (§3, G1 pad amendment).
-    fn table_bytes(t: &RuleTable) -> &[u8] {
+    fn table_bytes(t: &RuleTableV2) -> &[u8] {
         // SAFETY: `t` is a fully initialized `#[repr(C)]` POD with no
         // uninitialized (implicit) padding bytes; the slice borrows
         // `t` for its own lifetime and never outlives it.
         unsafe {
             core::slice::from_raw_parts(
-                (t as *const RuleTable).cast::<u8>(),
-                core::mem::size_of::<RuleTable>(),
+                (t as *const RuleTableV2).cast::<u8>(),
+                core::mem::size_of::<RuleTableV2>(),
             )
         }
     }
@@ -1019,8 +1747,8 @@ mod tests {
         let digest = sha256(bytes);
         let mut h = [0u8; HASH128_LEN];
         h.copy_from_slice(&digest[..HASH128_LEN]);
-        let mut out = Box::new(RuleTable::EMPTY);
-        validate_ruleset(bytes, &h, UNIVERSE, &mut out)
+        let mut out = Box::new(RuleTableV2::EMPTY);
+        validate_ruleset(bytes, &h, UNIVERSE, &DescriptorTable::empty(), &mut out)
     }
 
     /// One-row JSON with substitutable fragments, for reject fixtures.
@@ -1079,10 +1807,13 @@ mod tests {
         assert_eq!(t.rows[0].ref_sym, 7);
         assert_eq!(t.rows[0].edge_bps, 80);
         assert_eq!(t.rows[0].horizon_ms, 1_500);
-        assert_eq!(t.rows[0].level_1e6, 0);
         assert_eq!(t.rows[0].max_risk_1e6, 50_000_000);
         assert_eq!(t.rows[0].name_h, fnv1a_64(b"happy-row"));
-        assert_eq!(t.rows[0].trigger, RuleRow::TRIGGER_CROSS_DEVIATION);
+        // v1 sugar shape (VM2 V4): cross_deviation → |DiffBps| ≥ edge.
+        assert_eq!(t.rows[0].combine, CombineOp::DiffBps as u8);
+        assert_eq!(t.rows[0].cmp_bits, CMP_ENTRY_ABS);
+        assert_eq!(t.rows[0].enter_1e9, 80_000_000_000);
+        assert_eq!(t.rows[0].flags, 0, "refire mode");
         assert_eq!(t.rows[0].side, 0);
         assert_eq!(t.rows[0].family, 0);
 
@@ -1404,9 +2135,9 @@ mod tests {
         let bytes = valid_json("rule-one").into_bytes();
         let mut wrong = [0u8; HASH128_LEN];
         wrong[0] = 0xEE;
-        let mut out = Box::new(RuleTable::EMPTY);
+        let mut out = Box::new(RuleTableV2::EMPTY);
         assert_eq!(
-            validate_ruleset(&bytes, &wrong, UNIVERSE, &mut out),
+            validate_ruleset(&bytes, &wrong, UNIVERSE, &DescriptorTable::empty(), &mut out),
             Err(RulesetReject::HashMismatch)
         );
         assert_eq!(out.len, 0);
@@ -1801,9 +2532,9 @@ mod tests {
         let digest = sha256(&bytes);
         let mut h = [0u8; HASH128_LEN];
         h.copy_from_slice(&digest[..HASH128_LEN]);
-        let mut out = Box::new(RuleTable::EMPTY);
+        let mut out = Box::new(RuleTableV2::EMPTY);
         assert_eq!(
-            validate_ruleset(&bytes, &h, &[], &mut out),
+            validate_ruleset(&bytes, &h, &[], &DescriptorTable::empty(), &mut out),
             Err(RulesetReject::Symbol)
         );
     }
@@ -1950,27 +2681,32 @@ mod tests {
         let digest = sha256(bytes);
         let mut h = [0u8; HASH128_LEN];
         h.copy_from_slice(&digest[..HASH128_LEN]);
-        let mut out = Box::new(RuleTable::EMPTY);
-        assert_eq!(validate_ruleset(bytes, &h, UNIVERSE, &mut out), Ok(()));
+        let mut out = Box::new(RuleTableV2::EMPTY);
+        assert_eq!(validate_ruleset(bytes, &h, UNIVERSE, &DescriptorTable::empty(), &mut out), Ok(()));
         assert_eq!(out.len, 2);
         assert_eq!(out.hash128, h);
         assert_eq!(out.epoch, 0, "epoch is the side path's to stamp");
         assert_eq!(out.rows[0].sym, 42);
         assert_eq!(out.rows[0].ref_sym, 7);
-        assert_eq!(out.rows[0].trigger, RuleRow::TRIGGER_CROSS_DEVIATION);
+        // v1 sugar shapes (VM2 V4 — the from_v1 law).
+        assert_eq!(out.rows[0].combine, CombineOp::DiffBps as u8);
+        assert_eq!(out.rows[0].cmp_bits, CMP_ENTRY_ABS);
+        assert_eq!(out.rows[0].enter_1e9, 80_000_000_000);
         assert_eq!(out.rows[0].side, 0);
         assert_eq!(out.rows[0].family, 0);
         assert_eq!(out.rows[0].edge_bps, 80);
         assert_eq!(out.rows[0].horizon_ms, 1_500);
-        assert_eq!(out.rows[0].level_1e6, 0);
         assert_eq!(out.rows[0].max_risk_1e6, 50_000_000);
         assert_eq!(out.rows[0].name_h, fnv1a_64(b"btc-pm-lag"));
         assert_eq!(out.rows[1].sym, 99);
         assert_eq!(out.rows[1].ref_sym, SYMBOL_ID_NONE);
-        assert_eq!(out.rows[1].trigger, RuleRow::TRIGGER_LEVEL_BREACH);
+        // Ask-side level_breach → LhsOnly(Bid) ≥ level.
+        assert_eq!(out.rows[1].combine, CombineOp::LhsOnly as u8);
+        assert_eq!(out.rows[1].feat_a, FeatId::Bid as u8);
+        assert_eq!(out.rows[1].cmp_bits, 0);
+        assert_eq!(out.rows[1].enter_1e9, 12_000_000);
         assert_eq!(out.rows[1].side, 1);
         assert_eq!(out.rows[1].family, 1);
-        assert_eq!(out.rows[1].level_1e6, 12_000);
         assert_eq!(out.rows[1].max_risk_1e6, 25_000_000);
         assert_eq!(out.rows[1].name_h, fnv1a_64(b"hormuz-floor"));
     }
@@ -1983,8 +2719,8 @@ mod tests {
         let digest = sha256(&good);
         let mut h = [0u8; HASH128_LEN];
         h.copy_from_slice(&digest[..HASH128_LEN]);
-        let mut out = Box::new(RuleTable::EMPTY);
-        assert_eq!(validate_ruleset(&good, &h, UNIVERSE, &mut out), Ok(()));
+        let mut out = Box::new(RuleTableV2::EMPTY);
+        assert_eq!(validate_ruleset(&good, &h, UNIVERSE, &DescriptorTable::empty(), &mut out), Ok(()));
         assert_eq!(out.len, 1);
 
         let bad = br#"{"rows":[]}"#;
@@ -1992,9 +2728,319 @@ mod tests {
         let mut hb = [0u8; HASH128_LEN];
         hb.copy_from_slice(&digest[..HASH128_LEN]);
         assert_eq!(
-            validate_ruleset(bad, &hb, UNIVERSE, &mut out),
+            validate_ruleset(bad, &hb, UNIVERSE, &DescriptorTable::empty(), &mut out),
             Err(RulesetReject::RowCount)
         );
         assert_eq!(out.len, 0, "reject discards the scratch");
+    }
+}
+
+#[cfg(test)]
+mod v2_grammar_tests {
+    use super::*;
+    use core_types::{FeatId, GROUP_NONE, ROW_FLAG_POSITION};
+
+    /// v2 descriptor fixture: a perp pair with funding+depth, a spot
+    /// ref, an option, and a PM token (price-only).
+    fn descs() -> DescriptorTable {
+        DescriptorTable::from_entries(vec![
+            (
+                "okx:BTC-USDT-SWAP".to_owned(),
+                0x0200_0001,
+                CAP_PRICE | CAP_FUNDING | CAP_DEPTH,
+            ),
+            ("binance:btcusdt".to_owned(), 0x0100_0007, CAP_PRICE),
+            (
+                "binance-usdm:btcusdt".to_owned(),
+                0x0100_0200,
+                CAP_PRICE | CAP_FUNDING,
+            ),
+            (
+                "deribit:BTC-27MAR26-60000-C".to_owned(),
+                0x0300_0201,
+                CAP_OPT | CAP_PRICE,
+            ),
+            ("2875608808".to_owned(), 42, CAP_PRICE),
+        ])
+    }
+
+    fn check_v2(json: &str) -> Result<(), RulesetReject> {
+        let bytes = json.as_bytes();
+        let digest = sha256(bytes);
+        let mut h = [0u8; HASH128_LEN];
+        h.copy_from_slice(&digest[..HASH128_LEN]);
+        let mut out = Box::new(RuleTableV2::EMPTY);
+        validate_ruleset(bytes, &h, &[7, 42], &descs(), &mut out)
+    }
+
+    fn check_v2_table(json: &str) -> Result<Box<RuleTableV2>, RulesetReject> {
+        let bytes = json.as_bytes();
+        let digest = sha256(bytes);
+        let mut h = [0u8; HASH128_LEN];
+        h.copy_from_slice(&digest[..HASH128_LEN]);
+        let mut out = Box::new(RuleTableV2::EMPTY);
+        validate_ruleset(bytes, &h, &[7, 42], &descs(), &mut out)?;
+        Ok(out)
+    }
+
+    /// The cvfc-v2 shape: funding spread pair with a 72 h confirm,
+    /// groups, min/max holds.
+    const CARRY: &str = r#"{"rows":[{"name":"carry-btc","family":"crypto","instrument":"okx:BTC-USDT-SWAP","ref":"binance-usdm:btcusdt","feature":"apr24","combine":"diff","enter":0.20,"exit":0.0,"confirm_feature":"apr72","confirm":0.30,"confirm_abs":true,"confirm_pair":true,"group":3,"min_hold_s":345600,"max_hold_s":864000,"horizon_ms":60000,"max_risk_usd":9900.0}]}"#;
+
+    #[test]
+    fn v2_position_pair_row_builds_correctly() {
+        let t = check_v2_table(CARRY).expect("carry row valid");
+        assert_eq!(t.len, 1);
+        let r = &t.rows[0];
+        assert_eq!(r.flags, ROW_FLAG_POSITION, "exit present ⇒ position");
+        assert_eq!(r.sym, 0x0200_0001);
+        assert_eq!(r.ref_sym, 0x0100_0200);
+        assert_eq!(r.feat_a, FeatId::Apr24 as u8);
+        assert_eq!(r.feat_b, FeatId::Apr24 as u8, "ref_feature defaults");
+        assert_eq!(r.feat_c, FeatId::Apr72 as u8);
+        assert_eq!(r.combine, CombineOp::Diff as u8);
+        assert_eq!(r.enter_1e9, 200_000_000);
+        assert_eq!(r.exit_1e9, 0);
+        assert_eq!(r.confirm_1e9, 300_000_000);
+        assert_eq!(
+            r.cmp_bits,
+            CMP_CONFIRM_ABS | CMP_CONFIRM_PAIR,
+            "entry ge signed; confirm abs pair"
+        );
+        assert_eq!(r.group, 3);
+        assert_eq!(r.min_hold_s, 345_600);
+        assert_eq!(r.max_hold_s, 864_000);
+        assert_eq!(r.edge_bps, 0, "no sugar mirror on native rows");
+        assert_eq!(r.family, 0);
+    }
+
+    #[test]
+    fn v2_lhs_only_and_negative_thresholds() {
+        // Depth-imbalance refire row with a NEGATIVE threshold and
+        // `le` — buy pressure exhaustion shape.
+        let t = check_v2_table(
+            r#"{"rows":[{"name":"imb","instrument":"okx:BTC-USDT-SWAP","feature":"depth_imb","enter":-0.5,"cmp":"le","horizon_ms":1000,"max_risk_usd":100.0,"side":"bid"}]}"#,
+        )
+        .expect("valid");
+        let r = &t.rows[0];
+        assert_eq!(r.flags, 0, "no exit ⇒ refire");
+        assert_eq!(r.combine, CombineOp::LhsOnly as u8);
+        assert_eq!(r.enter_1e9, -500_000_000);
+        assert_eq!(r.cmp_bits, CMP_ENTRY_LE);
+        assert_eq!(r.family, 4, "family defaults to other");
+        assert_eq!(r.group, GROUP_NONE);
+    }
+
+    #[test]
+    fn v2_unresolvable_descriptor_refuses() {
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:DOGE-USDT-SWAP","feature":"mid","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Descriptor),
+            "D-6: unresolvable ⇒ REFUSE, fail-fast"
+        );
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","ref":"okx:ETH-USDT-SWAP","feature":"mid","combine":"diff_bps","enter":4.0,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Descriptor),
+            "ref resolves too or the row refuses"
+        );
+    }
+
+    #[test]
+    fn v2_rule10_channel_capabilities() {
+        // Funding feature on a funding-less spot ref: reject.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","ref":"binance:btcusdt","feature":"apr24","combine":"diff","enter":0.2,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Feature)
+        );
+        // Depth feature on a PM token: reject.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"2875608808","feature":"depth_imb","enter":0.5,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Feature)
+        );
+        // IV on the option: fine.
+        assert!(check_v2(
+            r#"{"rows":[{"name":"x","instrument":"deribit:BTC-27MAR26-60000-C","feature":"mark_iv","enter":0.65,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+        )
+        .is_ok());
+        // Confirm feature capabilities count too.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"binance:btcusdt","feature":"mid","enter":1.0,"confirm_feature":"apr24","confirm":0.1,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Feature)
+        );
+    }
+
+    #[test]
+    fn v2_rule3_window_law() {
+        // Rolling feature REQUIRES a window…
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"roll_mean","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Feature)
+        );
+        // …and a non-rolling feature forbids one.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"mid","window_min":60,"enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Feature)
+        );
+        // Over-cap window rejects.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"roll_mean","window_min":4321,"enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Feature)
+        );
+        // A valid z-score-ish shape passes (mid vs rolling mean).
+        assert!(check_v2(
+            r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","ref":"okx:BTC-USDT-SWAP","feature":"mid","ref_feature":"roll_mean","ref_window_min":60,"combine":"diff_bps","enter":25.0,"abs":true,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+        )
+        .is_err(), "self-ref rejects (Symbol) — z-score uses the SAME sym only via distinct legs law");
+        // The honest z-score shape: LhsOnly is not enough — the ref
+        // must be a DIFFERENT instrument, so mid-vs-own-mean lands in
+        // V5+ as a dedicated feature; today the reject is loud.
+    }
+
+    #[test]
+    fn v2_rule9_position_shape() {
+        // group without exit ⇒ Position reject.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"group":1,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Position)
+        );
+        // min_hold without exit ⇒ Position reject.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"min_hold_s":60,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Position)
+        );
+        // max_hold ≤ min_hold ⇒ Position reject.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"exit":0.5,"min_hold_s":600,"max_hold_s":600,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Position)
+        );
+    }
+
+    #[test]
+    fn v2_mixed_shape_and_grammar_rejects() {
+        // v1 + v2 keys in one row: Grammar.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","sym":42,"instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Grammar)
+        );
+        // combine without ref: Grammar.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"mid","combine":"diff","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Grammar)
+        );
+        // ref without combine: Grammar.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","ref":"binance:btcusdt","feature":"mid","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Grammar)
+        );
+        // confirm threshold without confirm_feature: Grammar.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"confirm":0.5,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+            ),
+            Err(RulesetReject::Grammar)
+        );
+        // Unknown feature token: Grammar.
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"x","instrument":"okx:BTC-USDT-SWAP","feature":"vibes","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0}]}"#,
+            ),
+            Err(RulesetReject::Grammar)
+        );
+    }
+
+    #[test]
+    fn v2_two_leg_caps_count_both_legs() {
+        // One $9 900 two-leg row: table total = $19 800. Six such
+        // rows on DISTINCT syms would blow the $100k table cap at
+        // row 6 — but per-sym caps trip first on shared syms, so use
+        // the SAME pair: row 3 breaches the $20k per-sym budget
+        // ($9 900 × 3 = $29 700 > $20k on EACH leg's sym).
+        let row = |n: u8, e: &str| format!(
+            r#"{{"name":"r{n}","instrument":"okx:BTC-USDT-SWAP","ref":"binance-usdm:btcusdt","feature":"apr24","combine":"diff","enter":{e},"exit":0.0,"horizon_ms":1000,"max_risk_usd":9900.0}}"#
+        );
+        let two = format!(r#"{{"rows":[{},{}]}}"#, row(1, "0.20"), row(2, "0.25"));
+        assert!(check_v2(&two).is_ok(), "2 × $9.9k per sym fits $20k");
+        let three = format!(
+            r#"{{"rows":[{},{},{}]}}"#,
+            row(1, "0.20"),
+            row(2, "0.25"),
+            row(3, "0.30")
+        );
+        assert_eq!(check_v2(&three), Err(RulesetReject::Caps));
+    }
+
+    #[test]
+    fn v2_duplicate_identity_rejects() {
+        let row = r#"{"name":"a","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}"#;
+        let dup = r#"{"name":"b","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"horizon_ms":9000,"max_risk_usd":20.0,"side":"bid"}"#;
+        let json = format!(r#"{{"rows":[{row},{dup}]}}"#);
+        assert_eq!(check_v2(&json), Err(RulesetReject::DuplicateRow));
+    }
+
+    #[test]
+    fn v2_and_v1_rows_coexist_in_one_artifact() {
+        // D-6 compat: a v1 row (raw sym, trigger sugar) beside a v2
+        // row in the SAME artifact — both admit.
+        let json = r#"{"rows":[{"name":"old","family":"crypto","trigger":{"type":"cross_deviation","ref":7},"sym":42,"side":"bid","edge_bps":80,"horizon_ms":1500,"max_risk_usd":50.0},{"name":"new","instrument":"okx:BTC-USDT-SWAP","feature":"apr24","enter":0.2,"horizon_ms":1000,"max_risk_usd":10.0,"side":"ask"}]}"#;
+        let t = check_v2_table(json).expect("both arms admit");
+        assert_eq!(t.len, 2);
+        assert_eq!(t.rows[0].combine, CombineOp::DiffBps as u8);
+        assert_eq!(t.rows[1].feat_a, FeatId::Apr24 as u8);
+    }
+
+    #[test]
+    fn v2_bind_budget_per_sym_exhausts() {
+        // 9 distinct windows on ONE sym exceeds the 8-per-sym bind
+        // cap ⇒ Feature reject on the 9th.
+        let mut rows = String::new();
+        for w in 1..=9u32 {
+            if w > 1 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                r#"{{"name":"w{w}","instrument":"okx:BTC-USDT-SWAP","feature":"roll_mean","window_min":{},"enter":1.0,"horizon_ms":1000,"max_risk_usd":1.0,"side":"bid"}}"#,
+                w * 10
+            ));
+        }
+        let json = format!(r#"{{"rows":[{rows}]}}"#);
+        assert_eq!(check_v2(&json), Err(RulesetReject::Feature));
+    }
+
+    #[test]
+    fn v2_signal_scanner_keeps_nine_decimals() {
+        // Funding-rate-sized thresholds must survive: 0.0000593.
+        let t = check_v2_table(
+            r#"{"rows":[{"name":"tiny","instrument":"okx:BTC-USDT-SWAP","feature":"apr24","enter":0.0000593,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"}]}"#,
+        )
+        .expect("valid");
+        assert_eq!(t.rows[0].enter_1e9, 59_300);
     }
 }

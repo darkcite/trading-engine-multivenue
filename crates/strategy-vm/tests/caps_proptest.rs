@@ -13,7 +13,8 @@
 //! is exact without knowing which row fired.
 
 use core_types::{
-    fnv1a_64, AiCmd, AiCmdKind, Order, Price, Qty, RuleRow, RuleTable, Side, SymbolId, Tick,
+    fnv1a_64, AiCmd, AiCmdKind, Order, Price, Qty, RuleRow, RuleRowV2, RuleTableV2, Side,
+    SymbolId, Tick,
     VenueId, AI_SIDE_NONE, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
 };
 use proptest::prelude::*;
@@ -113,10 +114,10 @@ proptest! {
         ticks in proptest::collection::vec(gen_tick(), 0..=200),
     ) {
         // Build the table: per-sym uniform caps, unique name hashes.
-        let mut table = RuleTable::EMPTY;
+        let mut table = Box::new(RuleTableV2::EMPTY);
         for (i, r) in rows.iter().enumerate() {
             let sym = ACTION_SYMS[r.sym_idx];
-            table.rows[i] = RuleRow::new(
+            table.rows[i] = RuleRowV2::from_v1(&RuleRow::new(
                 sym,
                 if r.cross { REF_SYM } else { SYMBOL_ID_NONE },
                 r.edge_bps,
@@ -131,7 +132,7 @@ proptest! {
                 },
                 r.side,
                 0,
-            );
+            ));
         }
         table.len = rows.len() as u32;
         table.epoch = 1;
@@ -151,7 +152,7 @@ proptest! {
         // `now ≥ horizon_ns` (CooldownGate first-window semantic).
         let mut ctx = CaptureCtx { now: 100_000_000_000_000_000, submitted: Vec::new() };
         vm.on_start(&mut ctx).unwrap();
-        vm.receive_table(&table);
+        vm.receive_table_v2(&table);
         let px_half = i64::from_le_bytes([0x77; 8]);
         vm.on_ai(
             &AiCmd::new(

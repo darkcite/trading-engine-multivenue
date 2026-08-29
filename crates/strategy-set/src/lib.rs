@@ -78,7 +78,8 @@
 
 use core_time::NsTs;
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, RuleTable, Signal, Tick, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
+    AiCmd, AiCmdKind, Fill, Order, RuleTableV2, Signal, Tick, STRATEGY_SLOT_AI_EXEC,
+    STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
@@ -672,8 +673,8 @@ impl Strategy for StrategySet {
     /// operator may stage while slot 5 is disabled and enable before
     /// committing without losing the table.
     #[inline]
-    fn on_ruleset_table(&mut self, table: &RuleTable) {
-        self.vm.receive_table(table);
+    fn on_ruleset_table(&mut self, table: &RuleTableV2) {
+        self.vm.receive_table_v2(table);
     }
 
     #[inline(always)]
@@ -1202,7 +1203,7 @@ mod tests {
 
     // ------------- vm member integration (8g item 6) -------------
 
-    use core_types::{fnv1a_64, RuleRow, RuleTable};
+    use core_types::{fnv1a_64, RuleRow, RuleRowV2, RuleTableV2};
 
     /// Production-like clock for any test driving `VmStrategy` (G3
     /// lesson: fresh cooldown stamps (0) arm only once
@@ -1221,9 +1222,9 @@ mod tests {
 
     /// One cross_deviation row on the (PM, BN) pair the latency-arb
     /// fixtures already use; horizon 0 keeps every eval armed.
-    fn vm_table(hash128: [u8; 16]) -> RuleTable {
-        let mut t = RuleTable::EMPTY;
-        t.rows[0] = RuleRow::new(
+    fn vm_table(hash128: [u8; 16]) -> Box<RuleTableV2> {
+        let mut t = Box::new(RuleTableV2::EMPTY);
+        t.rows[0] = RuleRowV2::from_v1(&RuleRow::new(
             PM,
             BN,
             20,
@@ -1234,7 +1235,7 @@ mod tests {
             RuleRow::TRIGGER_CROSS_DEVIATION,
             RuleRow::SIDE_BOTH,
             0,
-        );
+        ));
         t.len = 1;
         t.epoch = 1;
         t.hash128 = hash128;
@@ -1272,7 +1273,7 @@ mod tests {
         let mut c = vm_ctx();
         s.on_start(&mut c).unwrap();
 
-        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.vm_mut().receive_table_v2(&vm_table(VM_HASH_A));
         assert_eq!(s.vm().staged_hash128(), Some(VM_HASH_A));
         assert_eq!(s.vm().rows_active(), 0, "staged ≠ active");
 
@@ -1310,7 +1311,7 @@ mod tests {
         assert_eq!(s.vm().commits_dropped, 1);
 
         // Staged HASH_A, committed HASH_B: dropped, staged survives.
-        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.vm_mut().receive_table_v2(&vm_table(VM_HASH_A));
         s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_B), &mut c);
         assert_eq!(s.vm().commits_dropped, 2);
         assert_eq!(s.vm().commits_applied, 0);
@@ -1325,7 +1326,7 @@ mod tests {
         let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
         let mut c = vm_ctx();
         s.on_start(&mut c).unwrap();
-        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.vm_mut().receive_table_v2(&vm_table(VM_HASH_A));
         s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
         assert_eq!(s.vm().commits_applied, 0, "bit off → frame never arrives");
         assert_eq!(s.vm().commits_dropped, 0);
@@ -1364,7 +1365,7 @@ mod tests {
         assert_eq!(StrategyCounters::vm_commit_dropped(&s), 1);
 
         // Stage → Commit → tick-fire; every §9 row goes live.
-        s.vm_mut().receive_table(&vm_table(VM_HASH_A));
+        s.vm_mut().receive_table_v2(&vm_table(VM_HASH_A));
         s.on_ai(&ruleset_cmd(AiCmdKind::RulesetCommit, VM_HASH_A), &mut c);
         s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut c);
         s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut c);

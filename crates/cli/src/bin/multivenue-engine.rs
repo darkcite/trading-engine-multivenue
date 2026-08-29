@@ -985,6 +985,19 @@ fn run(args: RunArgs) -> ExitCode {
         deribit_boot.as_ref().map(|(t, _)| t),
         hl_boot.as_ref().map(|(t, _)| t),
     );
+    // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
+    // grammar's stage-time resolution — same allocation truth as the
+    // instrument manifest.
+    let ai_descriptors = std::sync::Arc::new(ingress_ai::DescriptorTable::from_entries(
+        cli::options_manifest::build_descriptor_entries(
+            &boot.allocated,
+            &discovery.deribit_options,
+            &discovery.okx_options,
+            &discovery.bn_options,
+            boot.okx_depth,
+            boot.deribit_depth,
+        ),
+    ));
     info!(
         symbols = ai_universe.len(),
         "ai: ruleset boot-universe snapshot built"
@@ -1592,6 +1605,7 @@ fn run(args: RunArgs) -> ExitCode {
                     ai_prod,
                     ruleset_table_prod,
                     ai_universe,
+                    ai_descriptors,
                     ai_status.clone(),
                     4,
                     &run_dir,
