@@ -131,6 +131,14 @@ pub struct Config {
     /// Hyperliquid `/info` REST host for Phase-8e boot asset discovery.
     /// Env: `HYPERLIQUID_API_HOST`. Default: `api.hyperliquid.xyz`.
     pub hyperliquid_api_host: String,
+    /// WS9: Bybit public WS host (paths `/v5/public/spot` and
+    /// `/v5/public/linear`). Env: `BYBIT_WS_HOST`.
+    /// Default: `stream.bybit.com`.
+    pub bybit_ws_host: String,
+    /// WS9: Bybit REST host for boot instrument discovery
+    /// (`GET /v5/market/instruments-info`). Env: `BYBIT_REST_HOST`.
+    /// Default: `api.bybit.com`.
+    pub bybit_rest_host: String,
     /// AI-command UDS path (Phase 8f §4.2). Env: `AI_INGRESS_SOCK`.
     /// Default: `~/multivenue/run/ai.sock` (tilde expanded at load,
     /// like `log_dir`). The companion secret `AI_INGRESS_HMAC_KEY` is
@@ -189,6 +197,8 @@ impl Config {
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
             hyperliquid_api_host: env_opt("HYPERLIQUID_API_HOST")
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
+            bybit_ws_host: env_opt("BYBIT_WS_HOST").unwrap_or_else(|| "stream.bybit.com".into()),
+            bybit_rest_host: env_opt("BYBIT_REST_HOST").unwrap_or_else(|| "api.bybit.com".into()),
             ai_ingress_sock: expand_tilde(
                 &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
             )?,
@@ -337,10 +347,7 @@ impl SecretKeyBytes {
         #[cfg(not(unix))]
         let mlocked = false;
 
-        Ok(Self {
-            inner: b,
-            mlocked,
-        })
+        Ok(Self { inner: b, mlocked })
     }
 
     #[inline]

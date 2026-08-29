@@ -29,6 +29,14 @@ markets = [
 # usdm streams connect to BINANCE_FUT_WS_HOST (default fstream.binance.com).
 spot = ["btcusdt"]
 usdm = []
+# WS5: USDS-M DATED (delivery) futures — `<base>_<yymmdd>` stream names
+# (e.g. "btcusdt_260327"; the underscore is required — it is what
+# separates the class from `usdm`). Same host + streams as usdm; own
+# ordinal block (base 2048). Discovery refuses a non-dated symbol here.
+# Every usdm + usdm_dated instrument also gets a capture-only
+# `@markPrice` connection (mark/index/funding events; dated contracts
+# carry no funding by design).
+usdm_dated = []
 # M2.4 capped options chain — same law as [deribit]/[okx]; underlyings
 # are eapi names (e.g. "BTCUSDT"); discovered instruments join the
 # eapi combined stream (BBO ticks + OptSummary records; no OI on this
@@ -50,8 +58,19 @@ options_underlyings = []   # e.g. ["BTC-USD", "ETH-USD"] — empty/absent = lane
 # options_strikes = 8      # K: even, 2..=32 (default 8 = ATM±4)
 
 [deribit]
+# Instrument names, file order = ordinal order. WS6: SPOT instruments
+# (no `-` in the name, e.g. "BTC_USDC") are a recognized class — they
+# subscribe quote + trades (+book with depth), never the ticker (no
+# funding/OI/mark analytics on spot).
 instruments = []
 depth = false
+# WS6: option COMBO instruments (explicit venue names; quote-only BBO
+# capture — combo ORDERS stay Stage-3). Combos share the venue's
+# 64-row tail block with the discovered options chain (shrink E/K to
+# fit a long list). NO boot REST validation: a misspelled combo never
+# appears in the subscribe echo, which the first-ever verification
+# treats as a fatal misconfiguration (fail-fast at boot).
+combos = []                # e.g. ["BTC-FS-27MAR26_PERP"]
 # M2.1 capped options chain (docs/m2-progress.md design entry): boot
 # DISCOVERS the nearest `options_expiries` expiries × the
 # `options_strikes` strikes nearest ATM (K/2 either side of the index
@@ -63,11 +82,26 @@ depth = false
 options_underlyings = []   # e.g. ["BTC", "ETH"]
 # options_expiries = 2
 # options_strikes = 8
+# WS6: each configured underlying ALSO subscribes its DVOL volatility
+# index (`deribit_volatility_index.<uly>_usd` → VolIndex capture
+# events). No extra key; an index the venue does not serve simply
+# never echoes (missing series, never an error).
 
 [hyperliquid]
 # Coins; HIP-4 "#<enc>" outcome coins and spot "@<idx>" pairs are
 # ordinary items.
 coins = []
+
+[bybit]
+# WS9: the sixth venue. UPPERCASE venue symbols ([A-Z0-9] — topics
+# and REST take them verbatim). spot[i] → make_symbol_id(Bybit, i+1);
+# linear ordinals from base 512 (the Binance spot/usdm split).
+# One thread, one connection per configured class:
+#   spot   → orderbook.1 (BBO ticks) + publicTrade (Trade events)
+#   linear → the same + tickers (Mark/Funding/OI capture events)
+# Hosts: BYBIT_WS_HOST / BYBIT_REST_HOST (.env; sane defaults).
+spot = []                  # e.g. ["BTCUSDT"]
+linear = []                # e.g. ["BTCUSDT", "ETHUSDT"]
 
 [pairs]
 # Latency-arb pairs: "P:B" = polymarket.markets[P] × binance.spot[B]

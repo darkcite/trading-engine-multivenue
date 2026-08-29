@@ -65,6 +65,30 @@ pub const OPT_ORDINAL_BASE: u32 = 512;
 /// ≤ 500 < 512, the usdm block ends at 512 + 500 + 1 = 1013 < 1024.
 pub const BN_OPT_ORDINAL_BASE: u32 = 1024;
 
+/// WS5: ordinal base for `[binance] usdm_dated` delivery-future ids:
+/// `make_symbol_id(Binance, BN_DATED_ORDINAL_BASE + j + 1)`.
+/// Disjoint from every other Binance block by construction: spot
+/// ≤ 500, usdm ends at 1013, eapi options end well under 2048.
+pub const BN_DATED_ORDINAL_BASE: u32 = 2048;
+
+/// WS6: ordinal base for `[deribit] combos` option-combo ids:
+/// `make_symbol_id(Deribit, DERIBIT_COMBO_ORDINAL_BASE + j + 1)`.
+/// Disjoint from statics (≤ 500) and discovered options
+/// ([`OPT_ORDINAL_BASE`] 512..~576) by construction.
+pub const DERIBIT_COMBO_ORDINAL_BASE: u32 = 1024;
+
+/// WS6: config cap for `[deribit] combos`. Combos SHARE the venue's
+/// 64-row option-block capacity with the discovered chain — the
+/// boot table insert refuses when `options + combos > 64`, so a
+/// large combo list needs smaller options E/K knobs.
+pub const DERIBIT_COMBOS_MAX: usize = 64;
+
+/// WS9: ordinal base for `[bybit] linear` ids:
+/// `make_symbol_id(Bybit, BYBIT_LINEAR_ORDINAL_BASE + j + 1)` — the
+/// Binance spot/usdm split applied to the sixth venue (spot ordinals
+/// are file-order from 1).
+pub const BYBIT_LINEAR_ORDINAL_BASE: u32 = 512;
+
 /// Default E — nearest expiries per options underlying (mvp-plan §8
 /// proposal, adopted in the M2 design entry).
 pub const OPT_EXPIRIES_DEFAULT: u32 = 2;
@@ -217,6 +241,12 @@ pub struct Universe {
     pub binance_spot: Vec<String>,
     /// `[binance] usdm` — USDS-M futures stream symbols in file order.
     pub binance_usdm: Vec<String>,
+    /// WS5: `[binance] usdm_dated` — USDS-M DELIVERY (dated) future
+    /// stream symbols (`btcusdt_260327` forms) in file order. Same
+    /// host + streams as `usdm`; named as a distinct class so the
+    /// discovery audit can enforce dated-ness and ordinals get their
+    /// own block ([`BN_DATED_ORDINAL_BASE`]).
+    pub binance_usdm_dated: Vec<String>,
     /// `[binance] options_underlyings` / `options_expiries` /
     /// `options_strikes` — the M2.4 capped options-chain policy
     /// (underlyings are eapi names, e.g. `"BTCUSDT"`; see
@@ -234,6 +264,12 @@ pub struct Universe {
     pub okx_options: OptionsPolicy,
     /// `[deribit] instruments` — instrument names in file order.
     pub deribit_instruments: Vec<String>,
+    /// WS6: `[deribit] combos` — option-COMBO instrument names in
+    /// file order (quote-only BBO capture; combo ORDERS stay
+    /// Stage-3). No boot REST validation — the WS2 subscribe
+    /// verification is the validator (a misspelled combo never
+    /// echoes ⇒ boot fail-fast).
+    pub deribit_combos: Vec<String>,
     /// `[deribit] depth` — subscribe the change_id-chained book (§4.5).
     pub deribit_depth: bool,
     /// `[deribit] options_underlyings` / `options_expiries` /
@@ -243,6 +279,11 @@ pub struct Universe {
     /// `[hyperliquid] coins` — coin names (HIP-4 `#<enc>` and spot
     /// `@<idx>` forms are ordinary items) in file order.
     pub hl_coins: Vec<String>,
+    /// WS9: `[bybit] spot` — UPPERCASE venue symbols in file order.
+    pub bybit_spot: Vec<String>,
+    /// WS9: `[bybit] linear` — UPPERCASE linear-perp symbols in file
+    /// order (own ordinal block, [`BYBIT_LINEAR_ORDINAL_BASE`]).
+    pub bybit_linear: Vec<String>,
     /// `[pairs] map` — latency-arb pairs as
     /// `(pm market index, binance spot index)`, both 0-based file
     /// order. Empty = the default pair (0,0) is injected at
@@ -291,12 +332,22 @@ pub struct AllocatedUniverse {
     pub bn_spot: Vec<Instrument>,
     /// Binance USDS-M futures instruments.
     pub bn_usdm: Vec<Instrument>,
+    /// WS5: Binance USDS-M DATED (delivery) futures instruments —
+    /// same `binance-usdm:` descriptor prefix (one fapi lane for
+    /// every offline consumer), own ordinal block.
+    pub bn_dated: Vec<Instrument>,
     /// OKX instruments.
     pub okx: Vec<Instrument>,
     /// Deribit instruments.
     pub deribit: Vec<Instrument>,
+    /// WS6: Deribit option combos (quote-only; own ordinal block).
+    pub deribit_combos: Vec<Instrument>,
     /// Hyperliquid coins.
     pub hl: Vec<Instrument>,
+    /// WS9: Bybit spot instruments (`bybit:<sym>` descriptors).
+    pub bybit_spot: Vec<Instrument>,
+    /// WS9: Bybit linear-perp instruments (`bybit-linear:<sym>`).
+    pub bybit_linear: Vec<Instrument>,
     /// Latency-arb pairs as `(pm YES-token sym, bn spot sym)`.
     pub pairs: Vec<(SymbolId, SymbolId)>,
 }
@@ -332,6 +383,7 @@ enum Section {
     Okx,
     Deribit,
     Hyperliquid,
+    Bybit,
     Pairs,
 }
 
@@ -341,6 +393,7 @@ enum Slot {
     PmMarkets,
     BnSpot,
     BnUsdm,
+    BnUsdmDated,
     BnOptUnderlyings,
     BnOptExpiries,
     BnOptStrikes,
@@ -350,11 +403,14 @@ enum Slot {
     OkxOptExpiries,
     OkxOptStrikes,
     DeribitInstr,
+    DeribitCombos,
     DeribitDepth,
     DeribitOptUnderlyings,
     DeribitOptExpiries,
     DeribitOptStrikes,
     HlCoins,
+    BybitSpot,
+    BybitLinear,
     PairsMap,
 }
 
@@ -363,6 +419,11 @@ enum Slot {
 enum ElemKind {
     PmMarket,
     BnSymbol,
+    /// WS5: dated-future stream symbols (`btcusdt_260327`) — the
+    /// spot/usdm alphabet plus the delivery-name underscore.
+    BnDatedSymbol,
+    /// WS9: Bybit venue symbols (`BTCUSDT` — uppercase [A-Z0-9]).
+    BybitSymbol,
     Instrument,
     HlCoin,
     OptUnderlying,
@@ -385,6 +446,7 @@ struct Builder {
     pm_markets: Option<Vec<String>>,
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
+    bn_usdm_dated: Option<Vec<String>>,
     bn_opt_underlyings: Option<Vec<String>>,
     bn_opt_expiries: Option<u32>,
     bn_opt_strikes: Option<u32>,
@@ -394,11 +456,14 @@ struct Builder {
     okx_opt_expiries: Option<u32>,
     okx_opt_strikes: Option<u32>,
     deribit_instr: Option<Vec<String>>,
+    deribit_combos: Option<Vec<String>>,
     deribit_depth: Option<bool>,
     deribit_opt_underlyings: Option<Vec<String>>,
     deribit_opt_expiries: Option<u32>,
     deribit_opt_strikes: Option<u32>,
     hl_coins: Option<Vec<String>>,
+    bybit_spot: Option<Vec<String>>,
+    bybit_linear: Option<Vec<String>>,
     pairs_map: Option<Vec<String>>,
 }
 
@@ -439,6 +504,7 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 "okx" => Section::Okx,
                 "deribit" => Section::Deribit,
                 "hyperliquid" => Section::Hyperliquid,
+                "bybit" => Section::Bybit,
                 "pairs" => Section::Pairs,
                 other => {
                     return Err(err(line_no, format!("unknown section `[{other}]`")));
@@ -449,15 +515,18 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
 
         // key = value
         let Some(eq) = line.find('=') else {
-            return Err(err(line_no, format!("expected `key = value`, got `{line}`")));
+            return Err(err(
+                line_no,
+                format!("expected `key = value`, got `{line}`"),
+            ));
         };
         let key = line[..eq].trim();
         let value = line[eq + 1..].trim();
         if key.is_empty() {
             return Err(err(line_no, "empty key before `=`"));
         }
-        let slot = slot_for(section, key)
-            .ok_or_else(|| err(line_no, unknown_key_msg(section, key)))?;
+        let slot =
+            slot_for(section, key).ok_or_else(|| err(line_no, unknown_key_msg(section, key)))?;
 
         match slot {
             Slot::OkxDepth | Slot::DeribitDepth => {
@@ -536,6 +605,7 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Polymarket, "markets") => Some(Slot::PmMarkets),
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
+        (Section::Binance, "usdm_dated") => Some(Slot::BnUsdmDated),
         (Section::Binance, "options_underlyings") => Some(Slot::BnOptUnderlyings),
         (Section::Binance, "options_expiries") => Some(Slot::BnOptExpiries),
         (Section::Binance, "options_strikes") => Some(Slot::BnOptStrikes),
@@ -545,11 +615,14 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Okx, "options_expiries") => Some(Slot::OkxOptExpiries),
         (Section::Okx, "options_strikes") => Some(Slot::OkxOptStrikes),
         (Section::Deribit, "instruments") => Some(Slot::DeribitInstr),
+        (Section::Deribit, "combos") => Some(Slot::DeribitCombos),
         (Section::Deribit, "depth") => Some(Slot::DeribitDepth),
         (Section::Deribit, "options_underlyings") => Some(Slot::DeribitOptUnderlyings),
         (Section::Deribit, "options_expiries") => Some(Slot::DeribitOptExpiries),
         (Section::Deribit, "options_strikes") => Some(Slot::DeribitOptStrikes),
         (Section::Hyperliquid, "coins") => Some(Slot::HlCoins),
+        (Section::Bybit, "spot") => Some(Slot::BybitSpot),
+        (Section::Bybit, "linear") => Some(Slot::BybitLinear),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
         _ => None,
     }
@@ -566,7 +639,9 @@ fn elem_kind(slot: Slot) -> ElemKind {
     match slot {
         Slot::PmMarkets => ElemKind::PmMarket,
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
-        Slot::OkxInstr | Slot::DeribitInstr => ElemKind::Instrument,
+        Slot::BnUsdmDated => ElemKind::BnDatedSymbol,
+        Slot::BybitSpot | Slot::BybitLinear => ElemKind::BybitSymbol,
+        Slot::OkxInstr | Slot::DeribitInstr | Slot::DeribitCombos => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
         Slot::BnOptUnderlyings | Slot::OkxOptUnderlyings | Slot::DeribitOptUnderlyings => {
             ElemKind::OptUnderlying
@@ -630,7 +705,10 @@ fn scan_array_fragment(
             other => {
                 return Err(err(
                     line_no,
-                    format!("unexpected `{}` in array (elements are quoted strings)", other as char),
+                    format!(
+                        "unexpected `{}` in array (elements are quoted strings)",
+                        other as char
+                    ),
                 ));
             }
         }
@@ -666,7 +744,10 @@ fn scan_string(
             _ => i += 1,
         }
     }
-    Err(err(line_no, "unterminated string (strings cannot span lines)"))
+    Err(err(
+        line_no,
+        "unterminated string (strings cannot span lines)",
+    ))
 }
 
 // ---------------------------------------------------------------
@@ -677,6 +758,8 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
     match kind {
         ElemKind::PmMarket => validate_pm_entry(s, line_no),
         ElemKind::BnSymbol => validate_bn_symbol(s, line_no),
+        ElemKind::BnDatedSymbol => validate_bn_dated_symbol(s, line_no),
+        ElemKind::BybitSymbol => validate_bybit_symbol(s, line_no),
         ElemKind::Instrument => validate_name(s, INSTRUMENT_LEN_MAX, "instrument", line_no),
         ElemKind::HlCoin => validate_name(s, HL_COIN_LEN_MAX, "coin", line_no),
         ElemKind::OptUnderlying => {
@@ -733,13 +816,56 @@ fn validate_pm_entry(s: &str, line_no: usize) -> Result<(), UniverseError> {
 fn validate_bn_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
     let ok = !s.is_empty()
         && s.len() <= BN_SYMBOL_LEN_MAX
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     if ok {
         Ok(())
     } else {
         Err(err(
             line_no,
             format!("bad Binance symbol `{s}` (want lowercase [a-z0-9], 1..={BN_SYMBOL_LEN_MAX})"),
+        ))
+    }
+}
+
+/// WS9: Bybit venue symbols are UPPERCASE `[A-Z0-9]` (`BTCUSDT`,
+/// `1000PEPEUSDT`) — the venue takes them verbatim in topics and
+/// REST queries, so the config carries the wire form directly.
+fn validate_bybit_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= BN_SYMBOL_LEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!("bad Bybit symbol `{s}` (want UPPERCASE [A-Z0-9], 1..={BN_SYMBOL_LEN_MAX})"),
+        ))
+    }
+}
+
+/// WS5: dated delivery names are `<base>_<yymmdd>` — the usdm
+/// alphabet plus exactly the underscore. The underscore is REQUIRED:
+/// a plain perp symbol here is almost certainly a misfiled `usdm`
+/// entry (the discovery audit would also refuse it as non-dated).
+fn validate_bn_dated_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= BN_SYMBOL_LEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && s.bytes().filter(|b| *b == b'_').count() == 1
+        && !s.starts_with('_')
+        && !s.ends_with('_');
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!(
+                "bad Binance dated symbol `{s}` (want `<base>_<yymmdd>` lowercase, 1..={BN_SYMBOL_LEN_MAX})"
+            ),
         ))
     }
 }
@@ -803,6 +929,11 @@ fn store_array(
                 return Err(dup("usdm"));
             }
         }
+        Slot::BnUsdmDated => {
+            if b.bn_usdm_dated.replace(items).is_some() {
+                return Err(dup("usdm_dated"));
+            }
+        }
         Slot::OkxInstr => {
             if b.okx_instr.replace(items).is_some() {
                 return Err(dup("instruments"));
@@ -811,6 +942,11 @@ fn store_array(
         Slot::DeribitInstr => {
             if b.deribit_instr.replace(items).is_some() {
                 return Err(dup("instruments"));
+            }
+        }
+        Slot::DeribitCombos => {
+            if b.deribit_combos.replace(items).is_some() {
+                return Err(dup("combos"));
             }
         }
         Slot::DeribitOptUnderlyings => {
@@ -831,6 +967,16 @@ fn store_array(
         Slot::HlCoins => {
             if b.hl_coins.replace(items).is_some() {
                 return Err(dup("coins"));
+            }
+        }
+        Slot::BybitSpot => {
+            if b.bybit_spot.replace(items).is_some() {
+                return Err(dup("spot"));
+            }
+        }
+        Slot::BybitLinear => {
+            if b.bybit_linear.replace(items).is_some() {
+                return Err(dup("linear"));
             }
         }
         Slot::PairsMap => {
@@ -951,8 +1097,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // PM entries: parse the string forms into the typed model.
     let mut pm_markets: Vec<PmMarket> = Vec::new();
     let raw_pm = b.pm_markets.unwrap_or_default();
-    for i in 0..raw_pm.len() {
-        let s = raw_pm[i].as_str();
+    for raw in &raw_pm {
+        let s = raw.as_str();
         match s.split_once(':') {
             None => pm_markets.push(PmMarket::Single(s.to_string())),
             Some((yes, no)) => pm_markets.push(PmMarket::YesNo {
@@ -963,23 +1109,41 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     }
     let binance_spot = b.bn_spot.unwrap_or_default();
     let binance_usdm = b.bn_usdm.unwrap_or_default();
+    let binance_usdm_dated = b.bn_usdm_dated.unwrap_or_default();
     let okx_instruments = b.okx_instr.unwrap_or_default();
     let deribit_instruments = b.deribit_instr.unwrap_or_default();
+    let deribit_combos = b.deribit_combos.unwrap_or_default();
     let hl_coins = b.hl_coins.unwrap_or_default();
+    let bybit_spot = b.bybit_spot.unwrap_or_default();
+    let bybit_linear = b.bybit_linear.unwrap_or_default();
 
     // Caps.
     check_cap(pm_markets.len(), PM_MARKETS_MAX, "PM markets")?;
     check_cap(binance_spot.len(), VENUE_LIST_MAX, "Binance spot symbols")?;
     check_cap(binance_usdm.len(), VENUE_LIST_MAX, "Binance usdm symbols")?;
+    check_cap(
+        binance_usdm_dated.len(),
+        VENUE_LIST_MAX,
+        "Binance usdm_dated symbols",
+    )?;
     check_cap(okx_instruments.len(), VENUE_LIST_MAX, "OKX instruments")?;
-    check_cap(deribit_instruments.len(), VENUE_LIST_MAX, "Deribit instruments")?;
+    check_cap(
+        deribit_instruments.len(),
+        VENUE_LIST_MAX,
+        "Deribit instruments",
+    )?;
+    check_cap(deribit_combos.len(), DERIBIT_COMBOS_MAX, "Deribit combos")?;
     check_cap(hl_coins.len(), VENUE_LIST_MAX, "Hyperliquid coins")?;
+    // WS9: per-CONNECTION table capacity, tighter than the shared
+    // list max (crates/ingress-bybit BYBIT_MAX_SYMBOLS = 64).
+    check_cap(bybit_spot.len(), 64, "Bybit spot symbols")?;
+    check_cap(bybit_linear.len(), 64, "Bybit linear symbols")?;
 
     // Within-list duplicates (a duplicate = double subscribe + two
     // ids for one stream — always a config mistake).
     let mut pm_tokens_flat: Vec<String> = Vec::new();
-    for i in 0..pm_markets.len() {
-        match &pm_markets[i] {
+    for m in &pm_markets {
+        match m {
             PmMarket::Single(t) => pm_tokens_flat.push(t.clone()),
             PmMarket::YesNo { yes, no } => {
                 pm_tokens_flat.push(yes.clone());
@@ -990,9 +1154,26 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&pm_tokens_flat, "PM token id")?;
     check_unique(&binance_spot, "Binance spot symbol")?;
     check_unique(&binance_usdm, "Binance usdm symbol")?;
+    check_unique(&binance_usdm_dated, "Binance usdm_dated symbol")?;
     check_unique(&okx_instruments, "OKX instrument")?;
     check_unique(&deribit_instruments, "Deribit instrument")?;
+    check_unique(&deribit_combos, "Deribit combo")?;
+    // WS6: a combo listed as a plain instrument too would double-
+    // subscribe its quote channel and mint two ids for one name.
+    for s in &deribit_combos {
+        if deribit_instruments.contains(s) {
+            return Err(err(
+                0,
+                format!("`{s}` appears in both `instruments` and `combos` — pick one"),
+            ));
+        }
+    }
     check_unique(&hl_coins, "Hyperliquid coin")?;
+    check_unique(&bybit_spot, "Bybit spot symbol")?;
+    check_unique(&bybit_linear, "Bybit linear symbol")?;
+    // WS5 note: `usdm` and `usdm_dated` cannot overlap BY ALPHABET —
+    // plain usdm symbols reject `_`, dated symbols require exactly
+    // one — so no cross-list check is needed here.
 
     // Options policies (M2.1 deribit, M2.2 okx) — one law, per venue.
     let deribit_options = finalize_options_policy(
@@ -1017,22 +1198,28 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let raw_pairs = b.pairs_map.unwrap_or_default();
-    for i in 0..raw_pairs.len() {
-        let (p, bsym) = validate_pair_ref(&raw_pairs[i], 0)?;
+    for raw in &raw_pairs {
+        let (p, bsym) = validate_pair_ref(raw, 0)?;
         if p as usize >= pm_markets.len() {
             return Err(err(
                 0,
-                format!("pair `{}` references PM market {p} but only {} configured", raw_pairs[i], pm_markets.len()),
+                format!(
+                    "pair `{raw}` references PM market {p} but only {} configured",
+                    pm_markets.len()
+                ),
             ));
         }
         if bsym as usize >= binance_spot.len() {
             return Err(err(
                 0,
-                format!("pair `{}` references Binance spot {bsym} but only {} configured", raw_pairs[i], binance_spot.len()),
+                format!(
+                    "pair `{raw}` references Binance spot {bsym} but only {} configured",
+                    binance_spot.len()
+                ),
             ));
         }
         if pairs.contains(&(p, bsym)) {
-            return Err(err(0, format!("duplicate pair `{}`", raw_pairs[i])));
+            return Err(err(0, format!("duplicate pair `{raw}`")));
         }
         pairs.push((p, bsym));
     }
@@ -1041,14 +1228,18 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         pm_markets,
         binance_spot,
         binance_usdm,
+        binance_usdm_dated,
         okx_instruments,
         okx_depth: b.okx_depth.unwrap_or(false),
         deribit_instruments,
+        deribit_combos,
         deribit_depth: b.deribit_depth.unwrap_or(false),
         deribit_options,
         okx_options,
         bn_options,
         hl_coins,
+        bybit_spot,
+        bybit_linear,
         pairs,
     })
 }
@@ -1087,7 +1278,7 @@ fn finalize_options_policy(
             format!("{venue} `options_expiries` {expiries} out of range 1..={OPT_EXPIRIES_MAX}"),
         ));
     }
-    if strikes < 2 || strikes > OPT_STRIKES_MAX || strikes % 2 != 0 {
+    if !(2..=OPT_STRIKES_MAX).contains(&strikes) || strikes % 2 != 0 {
         return Err(err(
             0,
             format!(
@@ -1145,20 +1336,21 @@ pub fn allocate_with_anchors(
     let mut flat = 0u32;
     for m in 0..u.pm_markets.len() {
         let midx = m as u32;
-        let push_token = |token: &str, is_yes: bool, flat: &mut u32, out: &mut AllocatedUniverse| {
-            let sym = if *flat == 0 {
-                pm_anchor
-            } else {
-                make_symbol_id(VenueId::Polymarket, *flat + 1)
+        let push_token =
+            |token: &str, is_yes: bool, flat: &mut u32, out: &mut AllocatedUniverse| {
+                let sym = if *flat == 0 {
+                    pm_anchor
+                } else {
+                    make_symbol_id(VenueId::Polymarket, *flat + 1)
+                };
+                out.pm_tokens.push(PmToken {
+                    sym,
+                    token_id: token.to_string(),
+                    market_index: midx,
+                    is_yes,
+                });
+                *flat += 1;
             };
-            out.pm_tokens.push(PmToken {
-                sym,
-                token_id: token.to_string(),
-                market_index: midx,
-                is_yes,
-            });
-            *flat += 1;
-        };
         match &u.pm_markets[m] {
             PmMarket::Single(t) => push_token(t, true, &mut flat, &mut out),
             PmMarket::YesNo { yes, no } => {
@@ -1191,6 +1383,17 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // WS5: dated (delivery) futures — own ordinal block, shared
+    // `binance-usdm:` descriptor namespace (one fapi lane offline).
+    for j in 0..u.binance_usdm_dated.len() {
+        let sym = make_symbol_id(VenueId::Binance, BN_DATED_ORDINAL_BASE + j as u32 + 1);
+        let name = u.binance_usdm_dated[j].clone();
+        out.bn_dated.push(Instrument {
+            sym,
+            descriptor: format!("binance-usdm:{name}"),
+            name,
+        });
+    }
 
     // OKX / Deribit / HL — the standing per-venue convention.
     for i in 0..u.okx_instruments.len() {
@@ -1209,11 +1412,39 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // WS6: option combos — own ordinal block, same descriptor
+    // namespace (offline consumers resolve by name).
+    for i in 0..u.deribit_combos.len() {
+        let name = u.deribit_combos[i].clone();
+        out.deribit_combos.push(Instrument {
+            sym: make_symbol_id(VenueId::Deribit, DERIBIT_COMBO_ORDINAL_BASE + i as u32 + 1),
+            descriptor: format!("deribit:{name}"),
+            name,
+        });
+    }
     for i in 0..u.hl_coins.len() {
         let name = u.hl_coins[i].clone();
         out.hl.push(Instrument {
             sym: make_symbol_id(VenueId::Hyperliquid, i as u32 + 1),
             descriptor: format!("hyperliquid:{name}"),
+            name,
+        });
+    }
+    // WS9: Bybit — spot from ordinal 1, linear from its own block
+    // (the Binance spot/usdm split; venue byte 6).
+    for i in 0..u.bybit_spot.len() {
+        let name = u.bybit_spot[i].clone();
+        out.bybit_spot.push(Instrument {
+            sym: make_symbol_id(VenueId::Bybit, i as u32 + 1),
+            descriptor: format!("bybit:{name}"),
+            name,
+        });
+    }
+    for j in 0..u.bybit_linear.len() {
+        let name = u.bybit_linear[j].clone();
+        out.bybit_linear.push(Instrument {
+            sym: make_symbol_id(VenueId::Bybit, BYBIT_LINEAR_ORDINAL_BASE + j as u32 + 1),
+            descriptor: format!("bybit-linear:{name}"),
             name,
         });
     }
@@ -1223,7 +1454,17 @@ pub fn allocate_with_anchors(
     for t in &out.pm_tokens {
         all.push((t.sym, t.token_id.as_str()));
     }
-    for group in [&out.bn_spot, &out.bn_usdm, &out.okx, &out.deribit, &out.hl] {
+    for group in [
+        &out.bn_spot,
+        &out.bn_usdm,
+        &out.bn_dated,
+        &out.okx,
+        &out.deribit,
+        &out.deribit_combos,
+        &out.hl,
+        &out.bybit_spot,
+        &out.bybit_linear,
+    ] {
         for inst in group {
             all.push((inst.sym, inst.descriptor.as_str()));
         }
@@ -1246,12 +1487,14 @@ pub fn allocate_with_anchors(
     // Pairs: explicit refs, or the default (0,0) when both sides exist.
     if u.pairs.is_empty() {
         if !u.pm_markets.is_empty() && !u.binance_spot.is_empty() {
-            out.pairs.push((pm_market_yes_sym(&out, 0), out.bn_spot[0].sym));
+            out.pairs
+                .push((pm_market_yes_sym(&out, 0), out.bn_spot[0].sym));
         }
     } else {
         for k in 0..u.pairs.len() {
             let (p, bsym) = u.pairs[k];
-            out.pairs.push((pm_market_yes_sym(&out, p), out.bn_spot[bsym as usize].sym));
+            out.pairs
+                .push((pm_market_yes_sym(&out, p), out.bn_spot[bsym as usize].sym));
         }
     }
 
@@ -1278,12 +1521,21 @@ fn pm_market_yes_sym(a: &AllocatedUniverse, market_index: u32) -> SymbolId {
 /// one pair.
 pub fn assert_bootable(a: &AllocatedUniverse) -> Result<(), UniverseError> {
     if a.pm_tokens.is_empty() {
-        return Err(err(0, "no Polymarket markets configured — boot refuses to run venue-blind"));
+        return Err(err(
+            0,
+            "no Polymarket markets configured — boot refuses to run venue-blind",
+        ));
     }
     if a.bn_spot.is_empty() {
-        return Err(err(0, "no Binance spot symbols configured — the latency-arb pair anchor is required in M1"));
+        return Err(err(
+            0,
+            "no Binance spot symbols configured — the latency-arb pair anchor is required in M1",
+        ));
     }
-    debug_assert!(!a.pairs.is_empty(), "both sides exist ⇒ default pair injected");
+    debug_assert!(
+        !a.pairs.is_empty(),
+        "both sides exist ⇒ default pair injected"
+    );
     Ok(())
 }
 
@@ -1295,7 +1547,8 @@ pub fn assert_bootable(a: &AllocatedUniverse) -> Result<(), UniverseError> {
 mod tests {
     use super::*;
 
-    const T1: &str = "57748138085022719760345772310040703848567377822400132842014290209986511882046";
+    const T1: &str =
+        "57748138085022719760345772310040703848567377822400132842014290209986511882046";
     const T2: &str = "1234567890123456789";
     const T3: &str = "9876543210987654321";
 
@@ -1392,8 +1645,86 @@ map = ["0:0", "1:1"]
         assert_eq!(a.deribit[0].sym, make_symbol_id(VenueId::Deribit, 1));
         assert_eq!(a.hl[1].descriptor, "hyperliquid:#330");
         // Pairs resolve to (yes sym, spot sym).
-        assert_eq!(a.pairs, vec![(42, 7), (make_symbol_id(VenueId::Polymarket, 2), make_symbol_id(VenueId::Binance, 2))]);
+        assert_eq!(
+            a.pairs,
+            vec![
+                (42, 7),
+                (
+                    make_symbol_id(VenueId::Polymarket, 2),
+                    make_symbol_id(VenueId::Binance, 2)
+                )
+            ]
+        );
         assert_bootable(&a).expect("bootable");
+    }
+
+    #[test]
+    fn usdm_dated_parses_allocates_own_block_and_rejects_overlap() {
+        // WS5: the dated class is named in the grammar; ordinals come
+        // from BN_DATED_ORDINAL_BASE; descriptors share the
+        // `binance-usdm:` namespace (one fapi lane offline).
+        let src = "[binance]\nspot=[\"btcusdt\"]\nusdm=[\"btcusdt\"]\nusdm_dated=[\"btcusdt_260327\",\"btcusdt_261225\"]\n";
+        let u = parse(src).unwrap();
+        assert_eq!(
+            u.binance_usdm_dated,
+            vec!["btcusdt_260327", "btcusdt_261225"]
+        );
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.bn_dated.len(), 2);
+        assert_eq!(
+            a.bn_dated[0].sym,
+            make_symbol_id(VenueId::Binance, BN_DATED_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.bn_dated[0].descriptor, "binance-usdm:btcusdt_260327");
+        assert_eq!(
+            a.bn_dated[1].sym,
+            make_symbol_id(VenueId::Binance, BN_DATED_ORDINAL_BASE + 2)
+        );
+        // A dated name cannot hide in plain `usdm` — the spot/usdm
+        // alphabet rejects the underscore (class disjointness is
+        // enforced by construction).
+        let misfiled = "[binance]\nusdm=[\"btcusdt_260327\"]\n";
+        assert!(parse(misfiled)
+            .unwrap_err()
+            .msg
+            .contains("bad Binance symbol"));
+        // Duplicate key law applies to the new key too.
+        let dup = "[binance]\nusdm_dated=[\"a_1\"]\nusdm_dated=[\"b_2\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate key"));
+        // The dated validator wants exactly one interior underscore —
+        // a plain perp symbol here is a misfiled `usdm` entry.
+        for bad in ["btcusdt", "btc__usdt", "_x", "x_", "BTCUSDT_260327"] {
+            let src = format!("[binance]\nusdm_dated=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("dated symbol"),
+                "`{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn bybit_section_parses_allocates_and_validates() {
+        // WS9: the sixth venue's grammar + the venue-byte-6 blocks.
+        let src = "[binance]\nspot=[\"btcusdt\"]\n[bybit]\nspot=[\"BTCUSDT\"]\nlinear=[\"BTCUSDT\",\"ETHUSDT\"]\n";
+        let u = parse(src).unwrap();
+        assert_eq!(u.bybit_spot, vec!["BTCUSDT"]);
+        assert_eq!(u.bybit_linear, vec!["BTCUSDT", "ETHUSDT"]);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.bybit_spot[0].sym, make_symbol_id(VenueId::Bybit, 1));
+        assert_eq!(a.bybit_spot[0].descriptor, "bybit:BTCUSDT");
+        assert_eq!(
+            a.bybit_linear[0].sym,
+            make_symbol_id(VenueId::Bybit, BYBIT_LINEAR_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.bybit_linear[1].descriptor, "bybit-linear:ETHUSDT");
+        // Same TEXT in spot and linear is legal (different ids/
+        // classes) — the collision check passes.
+        // Lowercase rejects (the venue takes topics verbatim).
+        let bad = "[bybit]\nspot=[\"btcusdt\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad Bybit symbol"));
+        // Unknown key law holds for the new section.
+        let unk = "[bybit]\nusdm=[\"BTCUSDT\"]\n";
+        assert!(parse(unk).unwrap_err().msg.contains("unknown key"));
     }
 
     #[test]
@@ -1432,10 +1763,8 @@ map = ["0:0", "1:1"]
 
     #[test]
     fn multiline_array_with_trailing_comma_and_comments() {
-        let src = format!(
-            "[binance]\nspot = [\n  \"btcusdt\",  # main\n\n  \"ethusdt\",\n]\n"
-        );
-        let u = parse(&src).unwrap();
+        let src = "[binance]\nspot = [\n  \"btcusdt\",  # main\n\n  \"ethusdt\",\n]\n";
+        let u = parse(src).unwrap();
         assert_eq!(u.binance_spot, vec!["btcusdt", "ethusdt"]);
     }
 
@@ -1524,11 +1853,11 @@ map = ["0:0", "1:1"]
     #[test]
     fn pm_entry_shapes_rejected() {
         let cases: Vec<String> = vec![
-            "123".into(),                     // too short
-            "a2345678901".into(),             // non-digit
-            "1:2".into(),                     // pair sides too short
-            format!("{T1}:{T1}"),             // identical sides
-            format!("{T1}:{T2}:{T3}"),        // two colons
+            "123".into(),              // too short
+            "a2345678901".into(),      // non-digit
+            "1:2".into(),              // pair sides too short
+            format!("{T1}:{T1}"),      // identical sides
+            format!("{T1}:{T2}:{T3}"), // two colons
         ];
         for bad in &cases {
             let src = format!("[polymarket]\nmarkets=[\"{bad}\"]\n");
@@ -1569,7 +1898,7 @@ map = ["0:0", "1:1"]
     fn pm_markets_cap_enforced() {
         let mut src = String::from("[polymarket]\nmarkets=[\n");
         for i in 0..(PM_MARKETS_MAX + 1) {
-            src.push_str(&format!("\"{:010}1234567890\",\n", i));
+            src.push_str(&format!("\"{i:010}1234567890\",\n"));
         }
         src.push_str("]\n");
         let e = parse(&src).unwrap_err();
@@ -1582,7 +1911,7 @@ map = ["0:0", "1:1"]
         // flat 42 (venue byte 0) — colliding with the anchor.
         let mut src = String::from("[polymarket]\nmarkets=[\n");
         for i in 0..42 {
-            src.push_str(&format!("\"{:010}9876543210\",\n", i));
+            src.push_str(&format!("\"{i:010}9876543210\",\n"));
         }
         src.push_str("]\n");
         let u = parse(&src).expect("parses (under the entries cap)");
@@ -1648,7 +1977,10 @@ map = ["0:0", "1:1"]
             assert!(e.msg.contains("options_expiries"), "{bad} → {e}");
         }
         let src = "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = 4\n";
-        assert_eq!(parse(src).expect("max is valid").deribit_options.expiries, 4);
+        assert_eq!(
+            parse(src).expect("max is valid").deribit_options.expiries,
+            4
+        );
     }
 
     #[test]
@@ -1660,12 +1992,20 @@ map = ["0:0", "1:1"]
             assert!(e.msg.contains("options_strikes"), "{bad} → {e}");
         }
         let src = "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_strikes = 32\n";
-        assert_eq!(parse(src).expect("max even is valid").deribit_options.strikes, 32);
+        assert_eq!(
+            parse(src)
+                .expect("max even is valid")
+                .deribit_options
+                .strikes,
+            32
+        );
     }
 
     #[test]
     fn opt_bad_int_literals_rejected() {
-        for bad in ["2.5", "-1", "+2", "007", "2_000", "abc", "12345678", "\"2\"", "true"] {
+        for bad in [
+            "2.5", "-1", "+2", "007", "2_000", "abc", "12345678", "\"2\"", "true",
+        ] {
             let src =
                 format!("[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = {bad}\n");
             let e = parse(&src).unwrap_err();
@@ -1679,7 +2019,13 @@ map = ["0:0", "1:1"]
     #[test]
     fn opt_int_with_trailing_comment_parses() {
         let src = "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = 3 # E\n";
-        assert_eq!(parse(src).expect("comment after int").deribit_options.expiries, 3);
+        assert_eq!(
+            parse(src)
+                .expect("comment after int")
+                .deribit_options
+                .expiries,
+            3
+        );
     }
 
     #[test]
@@ -1689,24 +2035,29 @@ map = ["0:0", "1:1"]
         )
         .unwrap_err();
         assert!(e.msg.contains("duplicate key `options_expiries`"), "{e}");
-        let e = parse(
-            "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_underlyings = [\"ETH\"]\n",
-        )
-        .unwrap_err();
+        let e =
+            parse("[deribit]\noptions_underlyings = [\"BTC\"]\noptions_underlyings = [\"ETH\"]\n")
+                .unwrap_err();
         assert!(e.msg.contains("duplicate key `options_underlyings`"), "{e}");
     }
 
     #[test]
     fn opt_underlyings_dup_and_cap_enforced() {
         let e = parse("[deribit]\noptions_underlyings = [\"BTC\", \"BTC\"]\n").unwrap_err();
-        assert!(e.msg.contains("duplicate Deribit options underlying"), "{e}");
+        assert!(
+            e.msg.contains("duplicate Deribit options underlying"),
+            "{e}"
+        );
         let mut src = String::from("[deribit]\noptions_underlyings = [\n");
         for i in 0..(OPT_UNDERLYINGS_MAX + 1) {
             src.push_str(&format!("\"U{i}\",\n"));
         }
         src.push_str("]\n");
         let e = parse(&src).unwrap_err();
-        assert!(e.msg.contains("too many Deribit options underlyings"), "{e}");
+        assert!(
+            e.msg.contains("too many Deribit options underlyings"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -1743,23 +2094,38 @@ map = ["0:0", "1:1"]
         assert_eq!(u.bn_options.strikes, 4);
         // Venue-labeled errors from the shared law.
         let e = parse("[binance]\noptions_expiries = 2\n").unwrap_err();
-        assert!(e.msg.contains("Binance") && e.msg.contains("options_underlyings"), "{e}");
+        assert!(
+            e.msg.contains("Binance") && e.msg.contains("options_underlyings"),
+            "{e}"
+        );
         let e = parse("[binance]\noptions_underlyings = [\"BTCUSDT\"]\noptions_strikes = 5\n")
             .unwrap_err();
-        assert!(e.msg.contains("Binance") && e.msg.contains("options_strikes"), "{e}");
+        assert!(
+            e.msg.contains("Binance") && e.msg.contains("options_strikes"),
+            "{e}"
+        );
     }
 
     #[test]
     fn okx_options_policy_same_law_as_deribit() {
         // The shared finalize_options_policy law, venue-labeled.
         let e = parse("[okx]\noptions_expiries = 2\n").unwrap_err();
-        assert!(e.msg.contains("OKX") && e.msg.contains("options_underlyings"), "{e}");
-        let e = parse("[okx]\noptions_underlyings = [\"BTC-USD\"]\noptions_strikes = 7\n")
-            .unwrap_err();
-        assert!(e.msg.contains("OKX") && e.msg.contains("options_strikes"), "{e}");
+        assert!(
+            e.msg.contains("OKX") && e.msg.contains("options_underlyings"),
+            "{e}"
+        );
+        let e =
+            parse("[okx]\noptions_underlyings = [\"BTC-USD\"]\noptions_strikes = 7\n").unwrap_err();
+        assert!(
+            e.msg.contains("OKX") && e.msg.contains("options_strikes"),
+            "{e}"
+        );
         let e = parse("[okx]\noptions_underlyings = [\"BTC-USD\"]\noptions_expiries = 5\n")
             .unwrap_err();
-        assert!(e.msg.contains("OKX") && e.msg.contains("options_expiries"), "{e}");
+        assert!(
+            e.msg.contains("OKX") && e.msg.contains("options_expiries"),
+            "{e}"
+        );
         let e = parse("[okx]\noptions_underlyings = [\"BTC-USD\", \"BTC-USD\"]\n").unwrap_err();
         assert!(e.msg.contains("duplicate OKX options underlying"), "{e}");
         // Both venues' policies coexist independently.
@@ -1780,10 +2146,8 @@ map = ["0:0", "1:1"]
         let e = parse("[deribit]\ninstruments = 2\n").unwrap_err();
         assert!(e.msg.contains("string array"), "{e}");
         // Array on an integer key.
-        let e = parse(
-            "[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = [\"2\"]\n",
-        )
-        .unwrap_err();
+        let e = parse("[deribit]\noptions_underlyings = [\"BTC\"]\noptions_expiries = [\"2\"]\n")
+            .unwrap_err();
         assert!(e.msg.contains("bare decimal integer"), "{e}");
         // Bad underlying element (embedded space).
         let e = parse("[deribit]\noptions_underlyings = [\"B TC\"]\n").unwrap_err();
