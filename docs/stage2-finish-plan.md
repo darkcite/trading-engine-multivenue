@@ -614,6 +614,17 @@ restart):**
   `run-loop returned` churn stops, sessions go long-lived,
   `reconnects_total` flatlines, opt-summary capture rate jumps to
   full-family cadence.
+- **LIVE-PROVEN same session (commit `00c13bf`, operator-ordered
+  revive at 10:28Z → run-1787999341626410000 boot 10:29Z):** every
+  predicted tell landed — okx `run-loop returned` lines since boot
+  **0** (old binary: ~40/min) · okx **reconnects_total 0** across
+  the first 8 min on ONE unbroken Steady session (46 891 ticks,
+  sub_drops 0, last_tick_age 0) · **deribit reconnects_total 0**
+  (the same-bug healing) · okx-opt-summary.pmlr **1.26 MB in 8 min
+  vs ~874 KB in the ENTIRE 57-min soak hour** — the ~600 KiB
+  full-family pushes that used to kill the session are now consumed
+  whole (~9× capture rate). §5.4 is CLOSED; the 508 200-line churn
+  class is dead on all venues.
 
 1. Full build (`cargo build --release --workspace`; G0 relink).
 2. Gates: `cargo nextest run --workspace` (baseline grows well past
