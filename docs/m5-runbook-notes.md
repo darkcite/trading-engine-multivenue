@@ -164,3 +164,13 @@ spread24 −381.8% / 3d −105.9%** — push.sh reviewed + executed
 now carries 3 strategy_id-4 orders** (the demo + both COTI legs).
 The external-strategies lane is live in paper end-to-end; audit-pnl
 picks the s4 tag up from the next daily report.
+
+**Addendum 2 (same session): the cadence is UNATTENDED.** Operator
+"go" → `scripts/carry-cycle.sh` + `com.multivenue.carry` launchd
+agent (hourly at :02, aligned to the funding hour; candles-agent
+pattern: pgrep worker-serialization guard, .env sourced, modules +
+the push verb, engine-up check before pushing, everything logged to
+`launchd/carry.log`). Kickstart proof run 12:45Z: funding idempotent
+(+0), signal cycled, 0 new intents (COTI held; CVFC under bar), push
+correctly skipped. The strategies now run engine + cron only — no
+human, no LLM in the loop; the fleet gains its sixth agent.
