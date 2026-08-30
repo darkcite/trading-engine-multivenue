@@ -713,6 +713,31 @@ new venues.
   stage → commit → 48 h window → restart drill → per-family
   bootout). Gates: pytest 550 (+6) · license-check OK (231).
 
+- **2026-08-30 — V8 EXECUTION RESUME POINT (the Sep-1/2 session
+  starts HERE).** State: V0–V7 committed (`…`, `70bc59b` V5,
+  `342eccc` V6, `6cc1ba5` V7, `2a283a5` V8-prep); stay-greens
+  nextest 1420 / release alloc 39 / pytest 550 (553 with the release
+  binary on PATH) / license-check 231 files. The engine runs
+  unattended; crons carry all families; the VM is inert (no
+  committed table); seeds/parity/depth-digest/coverage/channel-map
+  modules all landed and real-root-smoked. NEXT SESSION, in order:
+  (1) runbook §9 step 1 — refresh the v7-root symlinks, rerun xv-v2
+  `33e91345…` through the frozen backtest verb; gates PASS expected
+  once OOS spans ≥ 2 UTC days and legs ≥ 50 (was 44 on 36 h);
+  if still short, wait a day, rerun. (2) On PASS: stage-ruleset +
+  commit-ruleset (engine live, §9 step 1 commands). (3) Operator
+  applies §9 step 2 (wrapper hookup + MULTIVENUE_SEED_RULESET).
+  (4) Open the ≥ 48 h parity window (§9 step 3, daily
+  `python -m claude_worker.parity --window-h 48`; xv family GREEN =
+  misses 0 + position sign agreement; carry family stays RED-by-
+  absence until cvfc/s1 stage — per-family law). (5) Mid-window
+  restart drill (§9 step 4). (6) Per-family bootout ONLY on explicit
+  operator order (§9 step 5). cvfc-v2 `f7d79ce5…` / s1-v2
+  `0cf7433e…` reruns ride the same verb as their gate horizons
+  arrive; switch to merged-v2 `4d5dbe65…` only when the MERGED
+  report itself passes (one-table + table-global-warmup laws, §9).
+  Then V9 (gates + docs + CLAUDE.md CURRENT STATE + closure).
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized
