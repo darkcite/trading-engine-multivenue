@@ -681,3 +681,125 @@ new venues.
   crons keep carrying every not-yet-staged family, and V8's cron
   bootout is PER-FAMILY on operator order. No frozen-surface
   amendment for the slow-carry families at this time.
+
+- **2026-08-30 — V8 PREP CODED (operator-authorized same day):
+  comparator + runbook + seed wiring; S1 pair correction; the
+  one-table/merged law.** `claude_worker.parity` (module, never a
+  verb): ONE ground truth for both sides = `engine-orders.pmlr`
+  (cron families = slot-4 ai-exec intents, VM = slot-5; same file,
+  clock, manifests — no cron state files trusted). EVENT law
+  (chronological net-fold per (slot, descriptor): |net|-increase =
+  entry, decrease-to-0 = exit, sign-flip = both; every cron event
+  needs a same-type/same-direction VM event on the descriptor within
+  the family tolerance — xv 600 s, carry 7200 s), POSITION law
+  (end-of-window net SIGN agreement; sizes deliberately differ),
+  P&L stays audit-pnl's. VM extras are informational. 6 pytest pins
+  + REAL-ROOT smoke: the honest pre-staging RED — cron entries live
+  right now (xv hl:BTC; carry COTI + 1000RATS S1 pairs, ADA cvfc
+  pair) all MISS with vm-events 0. **The smoke exposed the V7 S1
+  authoring error: the live cron trades bn-usdm↔bybit-linear
+  funding-SPREAD pairs (sp24/sp3 = cross-venue spreads), not
+  single-leg apr — s1-v2 re-authored as pair rows with confirm_pair
+  apr72 (`0cf7433e…`, old `a56350ce…` retired); re-backtested valid
+  (structural 0 at the 72 h warmup).** NEW `merged-v2` artifact
+  `4d5dbe65…` (19 rows, $99.4k static sum) for the ONE-TABLE law +
+  the discovered sequencing consequence: TABLE-GLOBAL warmup means
+  the merged table 0-trades on short roots even where xv-v2 alone
+  trades — xv commits alone first; merged waits for root depth
+  (per-row warmup recorded as a refinement candidate).
+  `scripts/seed-push.sh` committed UNWIRED (runbook §9 carries the
+  one-line wrapper hookup + `MULTIVENUE_SEED_RULESET`, applied on
+  operator order). §9 runbook below = the full execute path (rerun →
+  stage → commit → 48 h window → restart drill → per-family
+  bootout). Gates: pytest 550 (+6) · license-check OK (231).
+
+## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
+
+Every step below runs on the Mac; worker invocations serialized
+(`pgrep -f 'claude[-_]worke[r]'` first); one-engine law for anything
+touching the standing instance.
+
+**1. Root-age rerun (~Sep-1/2, then stage + commit xv-v2):**
+
+```sh
+cd ~/trading-engine-multivenue/claude-worker
+# refresh the root: add the newest run symlinks beside the V7 seven
+for r in ~/multivenue/logs/run-*; do ln -sfn "$r" ~/multivenue/backtest-roots/v7-root/$(basename "$r"); done
+set -a; . ../.env; set +a
+PATH=~/trading-engine-multivenue/target/release:$PATH uv run claude-worker backtest \
+  --ruleset ~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.json \
+  --replay-dir ~/multivenue/backtest-roots/v7-root --split 70/30
+# gates PASS ⇒ stage + commit through the frozen verbs (engine must be live):
+uv run claude-worker stage-ruleset \
+  --ruleset ~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.json \
+  --report  ~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.report.json
+uv run claude-worker commit-ruleset --hash 33e91345e98eccb2c239f4bfd789a6d2
+```
+
+(cvfc-v2 `f7d79ce5…` / s1-v2 `0cf7433e…` — the V8-prep S1
+CORRECTION: the live cron trades bn-usdm↔bybit-linear funding-spread
+PAIRS (sp24/sp3 are cross-venue spreads; verified against slot-4
+capture), so s1-v2 is pair rows with `confirm_pair` apr72 — same
+sequence whenever their reruns pass, expected weeks out at their
+hold/warmup laws.)
+
+**ONE-TABLE LAW:** the VM holds a single active table — families run
+TOGETHER only via the MERGED artifact `4d5dbe65…` (19 rows: xv
+$4,950 + cvfc $3,000 + s1 $1,400 legs = $99.4k static rule-7 sum;
+the leg-size deltas vs the crons are the group-blind cap's price).
+Sequencing consequence of the TABLE-GLOBAL warmup law (V5): the
+merged table references apr72 ⇒ 72 h warmup gates EVERY row
+(verified: merged backtests 0-trade on the 36 h root while xv-v2
+alone trades) — commit xv-v2 ALONE at Sep-1/2; switch to merged
+only once the root lets the merged REPORT itself pass gates
+(≈ a week of funding-era capture, realistically when cvfc clears).
+Per-row warmup is a recorded harness-refinement candidate, not V8
+scope.
+
+**2. Arm the seed lane** (operator applies; one line + one env):
+`scripts/seed-push.sh` is committed and NOT yet wired. Hookup =
+append to `scripts/engine-wrapper.sh` after the engine launch line:
+
+```sh
+( /bin/zsh "$REPO/scripts/seed-push.sh" & )  # VM2 V8: post-boot seeds
+```
+
+and set `MULTIVENUE_SEED_RULESET=~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.json`
+in `.env` once xv-v2 is COMMITTED (funding-only seeding runs safely
+without it). Verify at next restart: `seeds: sent N frames` in the
+wrapper log; engine-side `funding_seeds_applied > 0`.
+
+**3. The ≥48 h parity window:** VM + crons run in parallel
+(nothing to start — the crons already run; the VM trades once
+committed). Daily, and at window end:
+
+```sh
+cd ~/trading-engine-multivenue/claude-worker
+uv run python -m claude_worker.parity --window-h 48
+```
+
+GREEN = misses-total 0 AND position-disagreements 0 (vm-extras are
+informational by design — the VM trades rows the crons never
+carried). Run `python -m claude_worker.pnl_report` beside it for the
+per-strategy P&L buckets (slot-4 vs slot-5).
+
+**4. Mid-window restart drill (proves seed + re-resolve + re-enter
++ #7b):** pick a moment with an OPEN xv VM position;
+`launchctl kickstart -k gui/$(id -u)/com.multivenue.engine` (or wait
+for a T2 slot); then verify: (a) #7b re-staged + re-committed the
+ruleset (engine log), (b) seed-push ran (wrapper log), (c)
+`position_seeds_applied ≥ 1` + the position ages CONTINUOUSLY (no
+fresh entry emit for the seeded row), (d) `parity` stays GREEN over
+the restart boundary.
+
+**5. Per-family cron bootout — ONLY on explicit operator order,
+family by family after ITS parity is green:**
+
+```sh
+launchctl bootout gui/$(id -u)/com.multivenue.xv     # after xv parity GREEN
+launchctl bootout gui/$(id -u)/com.multivenue.carry  # after cvfc+s1 parity GREEN
+# plists archive to ~/multivenue/archive/launchd/ — do not delete.
+```
+
+The FUNDING data agent and candles/iv/depth cycles REMAIN (D-4/D-8:
+data agents are not strategy carriers).

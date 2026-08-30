@@ -80,24 +80,47 @@ CVFC = {
     ]
 }
 
-# carry_signal.py S1 law: |apr24| >= 0.50 enter with |apr72| >= 0.30
-# confirm (the cron's 3d window == 72 h), exit directional < 0.10,
-# max age 240 h. Side derives from the signal sign (short the perp on
-# positive funding). The cron's global 4-position cap is a cron
-# artifact the grammar does not reproduce (documented delta).
+# carry_signal.py S1 law (V8 CORRECTION — the live cron trades
+# cross-venue PAIRS, verified against slot-4 capture 2026-08-30):
+# sp24 = apr24(binance-usdm) - apr24(bybit-linear); enter |sp24| >=
+# 0.50 with |sp3d| >= 0.30 confirm (confirm_pair = the same combine
+# over apr72 on both legs), SHORT the higher-apr venue (= ASK on
+# positive signal), exit directional < 0.10 or age > 240 h. The
+# cron's global 4-position cap is a cron artifact the grammar does
+# not reproduce (documented delta).
 _S1 = ["coti", "dexe", "bank", "era", "bless", "1000rats", "uai"]
-S1 = {
-    "rows": [
+
+
+def s1_rows(risk):
+    return [
         row(
             name=f"s1-{n}", family="crypto",
             instrument=f"binance-usdm:{n}usdt",
-            feature="apr24",
+            ref=f"bybit-linear:{n.upper()}USDT",
+            feature="apr24", combine="diff",
             enter=0.50, abs=True, exit=0.10,
             confirm_feature="apr72", confirm=0.30, confirm_abs=True,
-            max_hold_s=864000,
+            confirm_pair=True,
+            max_hold_s=864000, max_risk_usd=risk,
         )
         for n in _S1
     ]
+
+
+S1 = {"rows": s1_rows(4950.0)}
+
+# ONE-TABLE LAW (V8): the VM holds a single active table, so families
+# run TOGETHER only via a MERGED artifact — static rule-7 sum <= $100k
+# forces smaller legs (xv $4,950 x4 + cvfc $3,000 x20 + s1 $1,400 x14
+# = $99.4k). Commit the merged artifact when a SECOND family clears
+# gates; leg-size deltas vs the crons are the documented price of the
+# group-blind static cap (8i RiskGate relieves later).
+MERGED = {
+    "rows": (
+        XV["rows"]
+        + [dict(r, max_risk_usd=3000.0) for r in CVFC["rows"]]
+        + s1_rows(1400.0)
+    )
 }
 
 # ---- generality proofs (backtest-only; committed only on merit) -----------
@@ -152,6 +175,7 @@ def main() -> None:
         ("xv-v2", XV),
         ("cvfc-v2", CVFC),
         ("s1-v2", S1),
+        ("merged-v2", MERGED),
         ("basis-proof", BASIS),
         ("iv-spread-proof", IV),
         ("depth-imb-proof", DEPTH),
