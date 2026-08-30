@@ -85,14 +85,45 @@ def test_system_blocks_static_and_cache_marked() -> None:
         '"rows"',
         "cross_deviation",
         "level_breach",
-        "$100",
-        "$250",
-        "$1000",
         '"thesis"',
         "crypto",
         "86400000",
     ):
         assert needle in text, f"static block is missing {needle!r}"
+
+
+def test_static_block_teaches_the_live_caps_and_gates() -> None:
+    """Drift guard (2026-08-30): the static block taught the superseded
+    $100/$250/$1000 demo tier and the pre-amendment gates long after
+    both moved. A keyed serve reads this text as law, so pin it to the
+    numbers `backtest.GateThresholds` actually enforces."""
+    text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
+    for needle in ("$10,000", "$20,000", "$100,000", "$7,500", ">= 50 OOS legs",
+                   ">= 10 round trips", ">= 1 OOS trading day"):
+        assert needle in text, f"static block is missing {needle!r}"
+    for stale in ("$250", "$1000", ">= 2 OOS trading days", "<= $200"):
+        assert stale not in text, f"static block still teaches the superseded {stale!r}"
+    # The published mirrors and the gate module must agree.
+    thresholds = claude_worker.backtest.GateThresholds()
+    assert claude_worker.strategist.ROW_MAX_RISK_USD == thresholds.max_order_notional_usd
+    assert claude_worker.strategist.SYM_MAX_RISK_USD == thresholds.max_symbol_notional_usd
+    assert claude_worker.strategist.TABLE_MAX_RISK_USD == thresholds.max_total_notional_usd
+
+
+def test_static_block_teaches_the_v2_grammar() -> None:
+    """The v2 vocabulary must be in the prompt: without it a keyed serve
+    can only author the legacy v1 sugar — no funding, options, depth,
+    positions, groups, holds or confirms."""
+    text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
+    for needle in ('"instrument"', '"feature"', '"combine"', '"enter"', '"exit"',
+                   '"group"', '"min_hold_s"', '"confirm_pair"', "diff_bps",
+                   "apr24", "mark_iv", "depth_imb", "clock_utc_sod", "4320"):
+        assert needle in text, f"static block is missing {needle!r}"
+    # Every FeatId token and every combine token is offered.
+    for feature in claude_worker.strategist.FEATURES:
+        assert feature in text, f"static block never names the feature {feature!r}"
+    for combine in claude_worker.strategist.COMBINES:
+        assert f'"{combine}"' in text, f"static block never names the combine {combine!r}"
 
 
 def _digest_fixture(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -207,8 +238,9 @@ def test_parse_proposal_top_level_malformed(raw: str) -> None:
         _row(horizon_ms=9),
         _row(horizon_ms=86_400_001),
         _row(max_risk_usd=0),
-        _row(max_risk_usd=100.5),  # above the $100 row cap
+        _row(max_risk_usd=10_000.01),  # above the $10k per-leg cap
         _row(max_risk_usd=True),
+        _row(instrument="okx:BTC-USDT"),  # v1 + v2 keys in one row
         _row(trigger={"type": "level_breach", "level": 1.5}),
         _row(trigger={"type": "level_breach", "level": -0.1}),
         _row(trigger={"type": "level_breach", "level": 0.4, "ref": 7}),  # rule-6 mirror
@@ -221,6 +253,152 @@ def test_parse_proposal_top_level_malformed(raw: str) -> None:
 )
 def test_parse_proposal_row_malformed(row: dict[str, object]) -> None:
     assert claude_worker.strategist.parse_proposal(_proposal_json([row])) is None
+
+
+# ---- VM2 v2 grammar arm --------------------------------------------------
+
+
+def _v2(**overrides: object) -> dict[str, object]:
+    """The live xv-v2 shape (artifact bfbc5349…, committed 2026-08-30)."""
+    base: dict[str, object] = {
+        "name": "xv-okx-bnspot",
+        "family": "crypto",
+        "instrument": "okx:BTC-USDT",
+        "ref": "binance:btcusdt",
+        "feature": "mid",
+        "combine": "diff_bps",
+        "abs": True,
+        "enter": 3.0,
+        "exit": 1.0,
+        "horizon_ms": 60_000,
+        "max_risk_usd": 3_000.0,
+    }
+    base.update(overrides)
+    return {key: value for key, value in base.items() if value is not None}
+
+
+def test_parse_proposal_v2_row_round_trips() -> None:
+    proposal = claude_worker.strategist.parse_proposal(_proposal_json([_v2()]))
+    assert proposal is not None
+    row = proposal.rows[0]
+    assert row["instrument"] == "okx:BTC-USDT"
+    assert row["combine"] == "diff_bps"
+    # Emission order is deterministic — artifact_bytes hashes these bytes.
+    assert list(row) == [
+        "name", "family", "instrument", "ref", "feature", "combine",
+        "abs", "enter", "exit", "horizon_ms", "max_risk_usd",
+    ]
+
+
+def test_parse_proposal_v2_full_position_row() -> None:
+    """The s1-v2 shape: a confirm_pair funding spread with holds."""
+    row = _v2(
+        name="s1-coti",
+        instrument="binance-usdm:cotiusdt",
+        ref="bybit-linear:COTIUSDT",
+        feature="apr24",
+        combine="diff",
+        enter=0.50,
+        exit=0.10,
+        confirm_feature="apr72",
+        confirm=0.30,
+        confirm_abs=True,
+        confirm_pair=True,
+        group=3,
+        min_hold_s=28_800,
+        max_hold_s=864_000,
+        horizon_ms=3_600_000,
+    )
+    assert claude_worker.strategist.parse_proposal(_proposal_json([row])) is not None
+
+
+def test_parse_proposal_v2_single_leg_and_rolling_window() -> None:
+    # depth-imb-proof shape: no ref ⇒ no combine (lhs_only is inferred).
+    single = _v2(name="imb", ref=None, combine=None, feature="depth_imb", enter=0.6)
+    assert claude_worker.strategist.parse_proposal(_proposal_json([single])) is not None
+    rolling = _v2(name="roll", ref=None, combine=None, feature="roll_mean",
+                  window_min=60, enter=100.0)
+    assert claude_worker.strategist.parse_proposal(_proposal_json([rolling])) is not None
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _v2(bogus=1),  # unknown key
+        _v2(name=None),  # missing required
+        _v2(enter=None),
+        _v2(instrument=None),
+        _v2(feature=None),
+        _v2(horizon_ms=None),
+        _v2(max_risk_usd=None),
+        _v2(sym=42),  # v1 key mixed into a v2 row
+        _v2(combine=None),  # ref without combine
+        _v2(ref=None),  # combine without ref
+        _v2(ref="okx:BTC-USDT"),  # ref == instrument
+        _v2(feature="last"),  # not a FeatId token
+        _v2(combine="lhs_only"),  # inferred, never a token
+        _v2(combine="ratio_1e9"),  # enum name, not the JSON token
+        _v2(window_min=60),  # window on a non-rolling feature
+        _v2(feature="roll_mean"),  # rolling feature without a window
+        _v2(feature="roll_mean", window_min=4_321),
+        _v2(feature="roll_mean", window_min=0),
+        _v2(ref_window_min=60),  # ref leg is `mid` — no window
+        _v2(cmp="gt"),
+        _v2(**{"abs": 1}),  # int is not a bool
+        _v2(confirm=1.0),  # confirm without confirm_feature
+        _v2(confirm_feature="apr72"),  # confirm_feature without confirm
+        _v2(ref=None, combine=None, confirm_feature="mid", confirm=1.0,
+            confirm_pair=True),  # paired confirm needs a second leg
+        _v2(exit=None, group=3),  # group without exit
+        _v2(exit=None, min_hold_s=60),
+        _v2(exit=None, max_hold_s=60),
+        _v2(min_hold_s=600, max_hold_s=600),  # age-out must outlast the hold
+        _v2(min_hold_s=600, max_hold_s=599),
+        _v2(group=255),  # 0xFF is GROUP_NONE
+        _v2(group=-1),
+        _v2(max_risk_usd=10_000.01),
+        _v2(max_risk_usd=0),
+        _v2(horizon_ms=9),
+        _v2(instrument="okx:BTC–USDT"),  # noqa: RUF001 — the EN DASH is the point
+        _v2(instrument=""),
+        _v2(instrument="x" * 129),
+        _v2(enter=float("inf")),
+    ],
+)
+def test_parse_proposal_v2_row_malformed(row: dict[str, object]) -> None:
+    assert claude_worker.strategist.parse_proposal(_proposal_json([row])) is None
+
+
+def test_parse_proposal_v2_mirrors_the_live_artifacts() -> None:
+    """The strongest check available offline: every row shape the engine
+    validator has actually ADMITTED must survive this mirror. These are
+    the VM2 V7/V8 artifacts (tools_author_v7.py), xv-v2 among them."""
+    live: list[dict[str, object]] = [
+        # xv-v2 — committed live 2026-08-30
+        _v2(),
+        # cvfc-v2 — grouped per-coin funding carry with both holds
+        _v2(name="cvfc-sol-0", instrument="binance-usdm:solusdt",
+            ref="deribit:SOL_USDC-PERPETUAL", feature="apr24", combine="diff",
+            enter=0.20, exit=0.0, group=1, min_hold_s=345_600,
+            max_hold_s=1_728_000, max_risk_usd=4_950.0),
+        # basis-proof — spot↔perp bps with a funding confirm, no pair
+        _v2(name="basis-btc", instrument="binance-usdm:btcusdt",
+            ref="binance:btcusdt", feature="mid", combine="diff_bps",
+            enter=3.0, exit=0.5, confirm_feature="apr24", confirm=0.05,
+            confirm_abs=True, max_hold_s=86_400, max_risk_usd=9_900.0),
+        # iv-spread-proof — the OptSummary channel
+        _v2(name="iv-btc-atm", instrument="deribit:BTC-30AUG26-77500-C",
+            ref="okx:BTC-USD-260830-77500-C", feature="mark_iv",
+            combine="diff", enter=0.03, exit=0.005, max_hold_s=21_600,
+            max_risk_usd=2_000.0),
+        # depth-imb-proof — single leg on the WS10-B depth channel
+        _v2(name="imb-btc-okx", instrument="okx:BTC-USDT", ref=None,
+            combine=None, feature="depth_imb", enter=0.6, exit=0.1,
+            max_hold_s=3_600, max_risk_usd=5_000.0),
+    ]
+    proposal = claude_worker.strategist.parse_proposal(_proposal_json(live))
+    assert proposal is not None, "a live-admitted artifact shape was refused"
+    assert len(proposal.rows) == len(live)
 
 
 def test_parse_proposal_oversized_row_count() -> None:

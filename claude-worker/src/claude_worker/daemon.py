@@ -543,11 +543,19 @@ class ResearchCycle:
         pnl_text = claude_worker.strategist.pnl_digest_text(
             claude_worker.pnl_report.resolve_reports_dir()
         )
+        # VM2 (2026-08-30): the v2 grammar names instruments by §9.4
+        # DESCRIPTOR string, never by SymbolId — ordinals reshuffle every
+        # boot. Without this section the strategist can only author the
+        # legacy v1 sugar, so it rides beside the #7a inventory.
+        instruments_text = claude_worker.strategist.instruments_digest_text(
+            self._cfg.replay_dir
+        )
         self._digest = claude_worker.strategist.build_digest(
             self._cfg.features_dir,
             self._run_name,
             self._markets,
             universe=universe,
+            instruments=instruments_text,
             performance=self._performance,  # §7.1: latest walk-forward (H5)
             positions=positions_text,
             pnl=pnl_text,

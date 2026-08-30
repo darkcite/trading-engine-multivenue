@@ -848,9 +848,13 @@ sequence whenever their reruns pass, expected weeks out at their
 hold/warmup laws.)
 
 **ONE-TABLE LAW:** the VM holds a single active table — families run
-TOGETHER only via the MERGED artifact `4d5dbe65…` (19 rows: xv
-$4,950 + cvfc $3,000 + s1 $1,400 legs = $99.4k static rule-7 sum;
+TOGETHER only via the MERGED artifact `79eaceec…` (18 rows: xv
+$3,000 + cvfc $3,000 + s1 $1,400 legs = $85.6k static rule-7 sum;
 the leg-size deltas vs the crons are the group-blind cap's price).
+(Corrected 2026-08-30: this runbook still named the pre-retune
+`4d5dbe65…` / 19 rows / $99.4k after the §8 log had moved to
+`79eaceec…`. The §8 entries above are dated history and stay as
+written — the log records what was true when; §9 must not.)
 Sequencing consequence of the TABLE-GLOBAL warmup law (V5): the
 merged table references apr72 ⇒ 72 h warmup gates EVERY row
 (verified: merged backtests 0-trade on the 12.4 h root while xv-v2

@@ -192,9 +192,10 @@ Thresholds live in the same domain, which is why `enter`/`exit`/`confirm` are pa
 | depth (kind 7) | `depth_imb` `depth_spread_bps` `depth_notional` |
 | clock | `clock_utc_sod` |
 
-**4 combines** (`CombineOp`): `diff` (natural units — APR and IV spreads) · `diff_bps` (relative price
-deviation) · `ratio_1e9` · `lhs_only` (single-leg; `ref` must be absent). The combine is **required
-with `ref` and forbidden without it**.
+**4 combines** (`CombineOp`), but only **three JSON tokens**: `diff` (natural units — APR and IV
+spreads) · `diff_bps` (relative price deviation) · `ratio` (the `Ratio1e9` variant). The fourth,
+`LhsOnly`, has **no token at all** — it is what the engine infers for a single-leg row. That falls out
+of the combine law: `combine` is **required with `ref` and forbidden without it**.
 
 **Direction law:** a positive signal means ASK the instrument (sell the rich leg / short the
 higher-funding venue), negative means BID. Refire rows may pin a `side` filter instead.
@@ -574,24 +575,48 @@ or dispatcher work begins. It is the operator's to open.
 
 ---
 
-## 14. Known drift to fix before the Stage-3 gate opens
+## 14. Strategist drift — found, and fixed 2026-08-30
 
-Found while writing this doc; none of it affects the live semi-manual lane, all of it affects the
-automated one the moment a key is provisioned:
+None of this affected the live semi-manual lane. All of it would have hit the automated one the moment
+a key was provisioned: the strategist was the only component still speaking the pre-VM2 world.
 
-1. **`strategist.py`'s static system prompt still teaches the superseded tier** — "≥2 OOS trading days,
-   DD ≤ $200, ≤$100/row, ≤$250/sym, ≤$1000 table" — against live thresholds of 1 day, $7,500, and
-   $10k/$20k/$100k. `docs/arch/phase-8h-design.md` §7.2 carries the same stale block.
-2. **`strategist.ROW_MAX_RISK_USD = 100.0`** in the strict parser would reject the $3,000–$9,900 rows
-   the operator lane actually authors under the $50k tier.
-3. **`strategist.py` emits v1 rows only** (`trigger`/`sym`/`ref`/`level`). The Rust validator accepts
-   both, but the automated strategist cannot express *any* of the v2 grammar — no funding, no options,
-   no depth, no positions, no groups, no holds, no confirms. Whatever a keyed `serve` proposes today
-   would be strictly weaker than what a session authors.
-4. **`docs/vm2-plan.md` §9's runbook cites the pre-retune `merged-v2` `4d5dbe65…`** while §8's log
-   carries the current `79eaceec…`.
-5. `docs/prompts/ai-session.md` does not mention the `pnl` verb (cosmetic; the doc is test-pinned, so
-   changing it means changing the pin).
+**Fixed (`claude-worker/src/claude_worker/strategist.py`, `daemon.py`, `tests/test_strategist.py`):**
+
+1. **The static system prompt taught the superseded tier** — "≥2 OOS trading days, DD ≤ $200,
+   ≤$100/row, ≤$250/sym, ≤$1000 table" — against live thresholds of 1 day, $7,500 and $10k/$20k/$100k.
+   Rewritten to the numbers `GateThresholds` actually enforces, including the ≥10-round-trip rider on
+   position tables and the table-global warmup trap. A new test pins the prompt to the gate module and
+   fails on the stale strings, so this cannot drift silently again.
+2. **`ROW_MAX_RISK_USD` was 100.0** — the strict parser would have rejected every $1,400–$9,900 row the
+   operator lane actually authors. Now 10,000.0, mirrored from `ingress_ai::RULE_ROW_MAX_RISK_1E6`, with
+   `SYM_MAX_RISK_USD` / `TABLE_MAX_RISK_USD` published beside it so the prompt can state the whole
+   tier. The per-sym and per-table Σ walks stay rule 7 in Rust — they need resolved symbols.
+3. **The parser emitted v1 rows only.** It now carries the full v2 arm: 17 features, the 3 combine
+   tokens, descriptor strings, positions, groups, holds and confirms, with v1 XOR v2 arm selection
+   mirroring `parse_and_admit_row`. Structural checks only, per the no-second-deep-parser doctrine —
+   descriptor resolution, name uniqueness, the cap Σ, row identity and the channel/bind budget stay
+   engine-side. **Verified against production:** all seven real V7/V8 artifacts — `xv-v2` (live), the
+   18-row `merged-v2`, `cvfc-v2`, `s1-v2` and the three generality proofs — now round-trip through the
+   mirror; under the old code every one of them was refused.
+4. **The digest had no instrument vocabulary.** v2 names instruments by descriptor string, so a keyed
+   `serve` literally could not author a valid v2 row. `build_digest` gained an `INSTRUMENTS` section
+   fed by `instruments_digest_text`, which reads the newest run's `instrument-manifest.tsv` — the same
+   file the engine's `DescriptorTable` is built from — and labels each descriptor's channels through
+   the pinned `caps_of_descriptor` mirror. `daemon.py` passes it.
+5. `STRATEGIST_PROMPT_VERSION` bumped `strategist-v1` → `strategist-v2`, as the module's own rule
+   requires: every v1-era `prompt_cache` entry is stale by construction.
+6. **`docs/vm2-plan.md` §9's runbook cited the pre-retune `merged-v2` `4d5dbe65…` / 19 rows / $99.4k.**
+   Corrected to `79eaceec…` / 18 rows / $85.6k. The §8 log entries above it are dated history and were
+   deliberately left alone — a log records what was true when.
+
+**Deliberately left:**
+
+- `docs/arch/phase-8h-design.md` §7.2 carries the same stale cap block. `docs/arch/` is CLOSED history
+  under the archive law — never written to, read only for archaeology. It is superseded, not wrong.
+- `docs/prompts/ai-session.md` does not mention the `pnl` verb. Cosmetic, and the doc is pinned by
+  `test_session_scripted.py`, so changing it means changing the pin.
+
+**Gate after the change:** worker pytest **595 passed** on the Mac (was 553), no regressions.
 
 ---
 

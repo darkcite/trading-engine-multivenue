@@ -150,7 +150,7 @@
   <text x="80" y="709" font-size="11" font-weight="700" fill="#1a1a18">the ruleset artifact — { "rows": [ … ] } · 1–256 rows · identity = SHA-256 of the FILE BYTES (first 32 hex = hash128, which is all that travels on the wire)</text>
   <text x="80" y="726" font-size="9.3" fill="#6b6b67">every row is one statement:   signal = combine( feat_a(instrument, window_a),  feat_b(ref, window_b) )   — every feature and combine output is an i64 in ×1e9 of its natural unit; thresholds live in the same domain</text>
   <text x="80" y="741" font-size="9.3" fill="#6b6b67">17 features: mid · bid · ask | roll_mean · roll_ema · roll_min · roll_max · roll_std (window 1–4320 min) | apr24 · apr72 · clock_to_funding | mark_px · mark_iv | depth_imb · depth_spread_bps · depth_notional | clock_utc_sod</text>
-  <text x="80" y="757" font-size="9.3" fill="#6b6b67">4 combines: diff · diff_bps · ratio_1e9 · lhs_only     positions: exit ⇔ position row · ONE exit law signal × entry_sign ≤ exit · min/max_hold_s · group = at most one position, first row wins · max_risk_usd is PER LEG</text>
+  <text x="80" y="757" font-size="9.3" fill="#6b6b67">3 combine tokens: diff · diff_bps · ratio  (lhs_only is INFERRED for a ref-less row — combine is required with ref, forbidden without)     positions: exit ⇔ position row · ONE exit law signal × entry_sign ≤ exit · min/max_hold_s · group = at most one position, first row wins · max_risk_usd is PER LEG</text>
 
   <line x1="758" y1="770" x2="758" y2="810" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
 

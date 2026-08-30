@@ -35,13 +35,16 @@ Convention: full ``import x`` only. No ``from x import y``.
 import collections.abc
 import hashlib
 import json
+import math
 import os
 import pathlib
 import time
 import typing
 
+import claude_worker.channel_map
 import claude_worker.config
 import claude_worker.features
+import claude_worker.iv_digest
 import claude_worker.llm
 import claude_worker.pmlr
 import claude_worker.pnl_report
@@ -68,7 +71,10 @@ _TRUNCATION_MARKER: str = "\n...[digest truncated at cap]"
 # Prompt-template version: feeds the prompt_cache key (state.py §5.3).
 # Bump on ANY change to the static block or user-prompt scaffolding so
 # stale cached responses cannot leak across versions (labeling.py rule).
-STRATEGIST_PROMPT_VERSION: str = "strategist-v1"
+# v2 (2026-08-30): the static block now teaches the VM2 v2 grammar and
+# the $50k-tier caps/gates; every v1-era cached response is stale by
+# construction.
+STRATEGIST_PROMPT_VERSION: str = "strategist-v2"
 
 # ---- events-ledger kinds (§7.5; written by daemon.py on the serve
 # thread — the events table is serve-loop-only under the §7.6 law) ------
@@ -84,8 +90,9 @@ EVENT_ROLLBACK_TRIGGERED: str = "rollback_triggered"
 EVENT_ROLLBACK_NO_PRIOR: str = "rollback_no_prior"
 EVENT_MONITOR_SKIP: str = "monitor_skip_insufficient_data"
 
-# ---- §4.1 grammar mirrors (published constants; the authoritative
-# enforcement is `ingress_ai::validate_ruleset` in the harness) ---------
+# ---- §4.1 + VM2-V4 grammar mirrors (published constants; the
+# authoritative enforcement is `ingress_ai::validate_ruleset` in the
+# harness) --------------------------------------------------------------
 
 MAX_RULESET_ROWS: int = 256
 NAME_LEN_MAX: int = 64
@@ -93,15 +100,99 @@ EDGE_BPS_MAX: int = 10_000
 HORIZON_MS_MIN: int = 10
 HORIZON_MS_MAX: int = 86_400_000
 LEVEL_MAX: float = 1.0
-ROW_MAX_RISK_USD: float = 100.0  # risk-policy single-order cap, tighten-only
 MAX_THESIS_CHARS: int = 4_000
+
+# Risk caps — the $50k research tier (operator ruling 2026-08-29),
+# mirrored from `ingress_ai::RULE_{ROW,SYM,TABLE}_MAX_RISK_1E6`. Only
+# the per-ROW cap is enforceable here: the per-symbol and per-table
+# sums need resolved symbol identities, so their Σ walk stays rule 7 in
+# the Rust validator. The other two are published so the static prompt
+# can state them and the model can size a whole table within them.
+ROW_MAX_RISK_USD: float = 10_000.0
+SYM_MAX_RISK_USD: float = 20_000.0
+TABLE_MAX_RISK_USD: float = 100_000.0
 
 FAMILIES: tuple[str, ...] = ("crypto", "politics", "sports", "macro", "other")
 SIDES: tuple[str, ...] = ("bid", "ask", "both")
 
-_ROW_KEYS: frozenset[str] = frozenset(
-    {"name", "family", "trigger", "sym", "side", "edge_bps", "horizon_ms", "max_risk_usd"}
+# ---- v2 grammar (VM2 V4; core_types::FeatId / CombineOp) --------------
+
+DESCRIPTOR_LEN_MAX: int = 128  # ingress_ai::DESCRIPTOR_CAP
+ROLL_WINDOW_MIN: int = 1
+ROLL_WINDOW_MAX_MIN: int = 4_320  # 3 days
+GROUP_MAX: int = 254  # 0xFF is GROUP_NONE
+HOLD_S_MAX: int = 0xFFFF_FFFF  # u32
+
+FEATURES: tuple[str, ...] = (
+    "mid",
+    "bid",
+    "ask",
+    "roll_mean",
+    "roll_ema",
+    "roll_min",
+    "roll_max",
+    "roll_std",
+    "apr24",
+    "apr72",
+    "mark_px",
+    "mark_iv",
+    "depth_imb",
+    "depth_spread_bps",
+    "depth_notional",
+    "clock_to_funding",
+    "clock_utc_sod",
 )
+# Rule 3 window law: exactly these five REQUIRE a window; every other
+# feature FORBIDS one.
+ROLLING_FEATURES: frozenset[str] = frozenset(
+    {"roll_mean", "roll_ema", "roll_min", "roll_max", "roll_std"}
+)
+# JSON tokens only. `lhs_only` is deliberately NOT a token: it is what
+# the engine infers for a row carrying no `ref` (the combine law —
+# required WITH `ref`, forbidden WITHOUT).
+COMBINES: tuple[str, ...] = ("diff", "diff_bps", "ratio")
+CMPS: tuple[str, ...] = ("ge", "le")
+
+# ---- row key sets (mirror of ingress_ai V1_ONLY / V2_ONLY / V2_REQUIRED)
+
+_ROW_KEYS_SHARED: frozenset[str] = frozenset(
+    {"name", "family", "side", "horizon_ms", "max_risk_usd"}
+)
+_ROW_KEYS_V1_ONLY: frozenset[str] = frozenset({"trigger", "sym", "edge_bps"})
+_ROW_KEYS_V2_ONLY: frozenset[str] = frozenset(
+    {
+        "instrument",
+        "ref",
+        "feature",
+        "ref_feature",
+        "combine",
+        "window_min",
+        "ref_window_min",
+        "cmp",
+        "abs",
+        "enter",
+        "exit",
+        "confirm_feature",
+        "confirm_window_min",
+        "confirm",
+        "confirm_cmp",
+        "confirm_abs",
+        "confirm_pair",
+        "group",
+        "min_hold_s",
+        "max_hold_s",
+    }
+)
+# v1 requires its ENTIRE key set (8g shape, byte-exact); v2 requires a
+# small core and treats the rest as optional.
+_ROW_KEYS_V1: frozenset[str] = _ROW_KEYS_SHARED | _ROW_KEYS_V1_ONLY
+_ROW_KEYS_V2: frozenset[str] = _ROW_KEYS_SHARED | _ROW_KEYS_V2_ONLY
+_ROW_REQUIRED_V2: frozenset[str] = frozenset(
+    {"name", "instrument", "feature", "enter", "horizon_ms", "max_risk_usd"}
+)
+# Back-compat alias: the v1 arm's exact key set.
+_ROW_KEYS: frozenset[str] = _ROW_KEYS_V1
+
 _ROW_KEY_ORDER: tuple[str, ...] = (
     "name",
     "family",
@@ -109,6 +200,35 @@ _ROW_KEY_ORDER: tuple[str, ...] = (
     "sym",
     "side",
     "edge_bps",
+    "horizon_ms",
+    "max_risk_usd",
+)
+# Deterministic v2 emission order — `artifact_bytes` hashes the exact
+# bytes, so key order is part of the artifact identity.
+_ROW_KEY_ORDER_V2: tuple[str, ...] = (
+    "name",
+    "family",
+    "instrument",
+    "ref",
+    "feature",
+    "ref_feature",
+    "combine",
+    "window_min",
+    "ref_window_min",
+    "side",
+    "cmp",
+    "abs",
+    "enter",
+    "exit",
+    "confirm_feature",
+    "confirm_window_min",
+    "confirm",
+    "confirm_cmp",
+    "confirm_abs",
+    "confirm_pair",
+    "group",
+    "min_hold_s",
+    "max_hold_s",
     "horizon_ms",
     "max_risk_usd",
 )
@@ -167,49 +287,141 @@ def candidates_dir(db_path: pathlib.Path) -> pathlib.Path:
 # after the first in a cache window pays ~10% for this bulk. Content
 # changes REQUIRE a STRATEGIST_PROMPT_VERSION bump.
 _STATIC_SYSTEM_TEXT: str = (
-    "You are the offline strategist for a latency-arbitrage trading engine"
-    " (Polymarket CLOB + reference venues). You author Tier-1 ruleset"
-    " artifacts only; you never touch execution. Your candidate is"
-    " validated by a strict byte-scanner and then backtested over real"
-    " capture; hard gates decide promotion. Paper trading only.\n"
+    "You are the offline strategist for a multi-venue trading engine"
+    " (Polymarket CLOB + Binance + OKX + Deribit + Hyperliquid + Bybit)."
+    " You author ruleset artifacts only; you never touch execution. Your"
+    " candidate is validated by a strict byte-scanner, then backtested by"
+    " the REAL engine VM replaying REAL capture; hard gates decide"
+    " promotion. Paper trading only.\n"
     "\n"
-    "RULESET GRAMMAR (exact; unknown or duplicate keys are rejected):\n"
-    'A ruleset is {"rows": [ROW, ...]} with 1..256 rows. Each ROW has'
-    " EXACTLY these keys:\n"
-    '  "name":        ASCII string, 1..64 chars, unique per table\n'
-    '  "family":      one of "crypto"|"politics"|"sports"|"macro"|"other"\n'
-    '  "trigger":     {"type": "cross_deviation", "ref": <SymbolId>}\n'
-    '                 or {"type": "level_breach", "level": <0..1>}\n'
-    '                 (no other trigger keys; level_breach must NOT carry "ref")\n'
-    '  "sym":         integer SymbolId — the ACTION leg (order-emitting)\n'
-    '  "side":        "bid"|"ask"|"both"\n'
-    '  "edge_bps":    integer 0..10000 (no fractional part)\n'
-    '  "horizon_ms":  integer 10..86400000 (cooldown/decision horizon)\n'
-    '  "max_risk_usd": number > 0, <= 100.0 (per-row notional cap)\n'
+    "A ruleset is {\"rows\": [ROW, ...]} with 1..256 rows. Unknown keys,"
+    " duplicate keys and mixed row shapes are rejected. Each row is one"
+    " statement of the same form:\n"
+    "  signal = combine( feature(instrument, window_min),"
+    " ref_feature(ref, ref_window_min) )\n"
     "\n"
-    "VALIDATOR RULES (mirror of the engine's eight families):\n"
-    "- Every sym and every cross_deviation ref must exist in the observed"
-    " capture universe given in the user message; ref != sym.\n"
-    "- Risk caps are TIGHTEN-ONLY mirrors of risk policy: <= $100 per row,"
-    " sum per symbol <= $250, whole-table sum <= $1000. Never propose more.\n"
-    "- Exact-duplicate rows (same sym, trigger, side, ref/level) are rejected.\n"
+    "SIGNAL DOMAIN (absolute law): every feature and combine output is an"
+    " integer-valued quantity in x1e9 of its NATURAL unit — prices x1e9,"
+    " APR/IV/imbalance fractions x1e9, basis points x1e9, notional USD"
+    " x1e9, clock seconds x1e9. Thresholds live in that same domain, so"
+    " 3 bps is 3.0 and a 20-point APR spread is 20.0. Write them as plain"
+    " JSON numbers with at most 9 decimals.\n"
+    "\n"
+    "ROW KEYS (v2 grammar; * = required):\n"
+    '  *"name":         ASCII string, 1..64 chars, unique per table\n'
+    '   "family":       "crypto"|"politics"|"sports"|"macro"|"other"'
+    ' (default "other")\n'
+    '  *"instrument":   DESCRIPTOR STRING of the action leg — the leg that'
+    " emits orders. Use ONLY descriptors listed in the digest's"
+    " INSTRUMENTS section. Never a bare SymbolId: ordinals reshuffle"
+    " every boot.\n"
+    '   "ref":          descriptor string of the reference leg; must'
+    ' differ from "instrument"\n'
+    '  *"feature":      one of: mid, bid, ask, roll_mean, roll_ema,'
+    " roll_min, roll_max, roll_std, apr24, apr72, mark_px, mark_iv,"
+    " depth_imb, depth_spread_bps, depth_notional, clock_to_funding,"
+    " clock_utc_sod\n"
+    '   "ref_feature":  same vocabulary, for the ref leg (defaults to'
+    ' "feature")\n'
+    '   "combine":      "diff" (natural units — APR and IV spreads) |'
+    ' "diff_bps" (relative price deviation) | "ratio".\n'
+    '                   REQUIRED when "ref" is present, FORBIDDEN when it'
+    " is absent (a ref-less row is single-leg).\n"
+    '   "window_min" / "ref_window_min" / "confirm_window_min": integer'
+    " 1..4320 minutes. REQUIRED for roll_mean/roll_ema/roll_min/roll_max/"
+    "roll_std and FORBIDDEN for every other feature.\n"
+    '   "cmp":          "ge" (default) | "le" — how signal is compared to'
+    ' "enter"\n'
+    '   "abs":          boolean (default false) — compare |signal|\n'
+    '  *"enter":        entry threshold, signal domain\n'
+    '   "exit":         exit threshold. PRESENT means this is a POSITION'
+    " row; absent means a stateless refire row.\n"
+    '   "confirm_feature" / "confirm" / "confirm_cmp" / "confirm_abs" /'
+    ' "confirm_pair": an optional second condition that gates ENTRY only.'
+    ' "confirm" requires "confirm_feature" and vice versa;'
+    ' "confirm_pair": true computes the same combine over the confirm'
+    ' feature on BOTH legs and requires "ref".\n'
+    '   "side":         "bid"|"ask"|"both" — a direction FILTER, not a'
+    " command\n"
+    '   "group":        integer 0..254. Rows sharing a group hold AT MOST'
+    " ONE position between them; the first qualifying row in table order"
+    ' wins. Requires "exit".\n'
+    '   "min_hold_s" / "max_hold_s": integer seconds. min_hold_s gates'
+    " exits; max_hold_s is an unconditional age-out; max_hold_s must"
+    ' exceed min_hold_s when both are set. Both require "exit".\n'
+    '  *"horizon_ms":   integer 10..86400000 — refire cooldown, and'
+    " re-entry cooldown after a position exits\n"
+    '  *"max_risk_usd": number > 0, <= 10000.0 — notional cap PER LEG\n'
+    "\n"
+    "DIRECTION LAW: a positive signal means ASK the instrument (sell the"
+    " rich leg / short the higher-funding venue); negative means BID. A"
+    " position row with a ref hedges both legs at equal notional. The"
+    " single exit law is: signal x entry_sign <= exit — it covers both"
+    " decay and sign flip.\n"
+    "\n"
+    "CHANNEL LAW: a feature only exists where its channel does."
+    " apr24/apr72/clock_to_funding need a funding channel;"
+    " mark_px/mark_iv need an options channel; depth_imb/"
+    "depth_spread_bps/depth_notional need an L2 depth subscription. The"
+    " digest's INSTRUMENTS section lists each descriptor's channels;"
+    " naming a feature the instrument does not carry is refused. An empty"
+    " feature window is ABSENT, never zero — the row simply holds.\n"
+    "\n"
+    "VALIDATOR RULES you must respect (enforced by the engine, not here):\n"
+    "- Every descriptor must resolve against the LIVE boot universe.\n"
+    "- Risk caps are TIGHTEN-ONLY: <= $10,000 per leg, sum per symbol"
+    " <= $20,000, whole-table sum <= $100,000. Two-leg position rows"
+    " charge their cap to BOTH legs, and the sum is group-blind — a wide"
+    " table forces smaller legs. Never propose more.\n"
+    "- Names must be unique; exact-duplicate rows are rejected (identity"
+    " is instrument/ref/features/windows/combine/comparison/group/enter —"
+    " horizon, holds, risk and name are NOT identity).\n"
+    "- At most 8 distinct rolling windows per symbol, 256 across the"
+    " table.\n"
     "\n"
     "BACKTEST GATES the candidate must pass to be promoted (strict-cross"
-    " maker fills, fees and latency charged, 70/30 IS/OOS split, OOS"
-    " scored): OOS net P&L > 0; >= 50 OOS trades; >= 2 OOS trading days;"
-    " OOS max drawdown <= $200; observed bounds within the caps above.\n"
+    " maker fills, fees and latency charged, 70/30 IS/OOS split, only OOS"
+    " scored): OOS net P&L > 0; >= 50 OOS legs, and >= 10 round trips if"
+    " the table has any position row; >= 1 OOS trading day; OOS max"
+    " drawdown <= $7,500; observed notional bounds within the caps above"
+    " (a breach anywhere in the window disqualifies). Gate failure is"
+    " final for that candidate — there is no override.\n"
+    "\n"
+    "WARMUP: the backtest's warmup is TABLE-GLOBAL and equals the longest"
+    " window any row references (apr24 counts as 24 h, apr72 as 72 h). A"
+    " single apr72 row zeroes the whole backtest on a capture root"
+    " younger than 72 h. Check the digest's capture span before reaching"
+    " for long windows.\n"
     "\n"
     "OUTPUT CONTRACT (strict): respond with EXACTLY one JSON object and"
-    ' nothing else — no prose, no code fences:\n'
+    " nothing else — no prose, no code fences:\n"
     '{"thesis": "<why these rows, <= 4000 chars>", "rows": [ROW, ...]}\n'
     "Malformed output is archived and discarded; the cycle ends.\n"
     "\n"
-    "WORKED EXAMPLE (shape only — author against the CURRENT digest):\n"
-    '{"thesis": "BTC prints lead the PM btc-daily market; fade lagged'
-    ' quotes on breach.", "rows": [{"name": "btc-pm-lag", "family":'
-    ' "crypto", "trigger": {"type": "cross_deviation", "ref": 7}, "sym":'
-    ' 42, "side": "bid", "edge_bps": 80, "horizon_ms": 1500,'
-    ' "max_risk_usd": 50.0}]}\n'
+    "WORKED EXAMPLE A — stateless refire, cross-venue price deviation:\n"
+    '{"name": "xv-btc-okx-bn", "family": "crypto", "instrument":'
+    ' "okx:BTC-USDT", "ref": "binance:btcusdt", "feature": "mid",'
+    ' "combine": "diff_bps", "abs": true, "enter": 3.0, "horizon_ms":'
+    " 60000, \"max_risk_usd\": 3000.0}\n"
+    "\n"
+    "WORKED EXAMPLE B — position pair on a funding spread, one per coin,"
+    " with a 72 h confirm:\n"
+    '{"name": "carry-btc", "family": "crypto", "instrument":'
+    ' "binance-usdm:btcusdt", "ref": "bybit-linear:BTCUSDT", "feature":'
+    ' "apr24", "combine": "diff", "abs": true, "enter": 20.0, "exit":'
+    ' 0.1, "confirm_feature": "apr72", "confirm": 10.0, "confirm_abs":'
+    ' true, "confirm_pair": true, "group": 0, "min_hold_s": 28800,'
+    ' "max_hold_s": 864000, "horizon_ms": 3600000, "max_risk_usd":'
+    " 1400.0}\n"
+    "\n"
+    "LEGACY v1 SUGAR (accepted, but strictly weaker — prefer v2): a row of"
+    ' EXACTLY {"name", "family", "trigger", "sym", "side", "edge_bps",'
+    ' "horizon_ms", "max_risk_usd"} where "trigger" is {"type":'
+    ' "cross_deviation", "ref": <SymbolId>} or {"type": "level_breach",'
+    ' "level": <0..1>}. It uses bare SymbolIds, expresses only price'
+    " deviation and level breach, and cannot express funding, options,"
+    " depth, positions, groups, holds or confirms. Never mix v1 and v2"
+    " keys in one row.\n"
 )
 
 
@@ -267,6 +479,7 @@ def build_digest(
     run_name: str | None,
     markets: dict[str, int],
     universe: collections.abc.Iterable[int] | None = None,
+    instruments: str | None = None,
     performance: str | None = None,
     positions: str | None = None,
     pnl: str | None = None,
@@ -277,6 +490,13 @@ def build_digest(
     REST, same directory), news NDJSON tail, and — from H5 — the ACTIVE
     ruleset's walk-forward ``performance`` text. Deterministic for
     identical file contents (the SQLite dedupe key rides on this).
+
+    VM2 (2026-08-30): ``instruments`` carries the §9.4 DESCRIPTOR
+    vocabulary and each descriptor's channels — the v2 grammar names
+    instruments by string, never by SymbolId, so without this section a
+    keyed ``serve`` cannot author a v2 row at all. Produced by
+    :func:`instruments_digest_text`; ``None`` omits the section (the
+    pre-VM2 callers' dedupe keys are untouched).
 
     Ruling #7(a) (mvp-plan §8 item 7, 2026-08-23): ``positions`` and
     ``pnl`` carry the INVENTORY sections — the paper netting view and
@@ -292,6 +512,14 @@ def build_digest(
     if universe is not None:
         syms = ", ".join(str(s) for s in sorted(set(universe)))
         used = _append_capped(parts, used, f"\nOBSERVED CAPTURE UNIVERSE (legal sym/ref values): {syms or '(none)'}\n", cap)
+    if instruments is not None:
+        used = _append_capped(
+            parts,
+            used,
+            "\nINSTRUMENTS (legal v2 descriptor strings + the channels each"
+            f" carries):\n{instruments}\n",
+            cap,
+        )
     if run_name is not None:
         run_dir = features_dir / run_name
         used = _append_capped(parts, used, f"\nFEATURES ({run_name}):\n", cap)
@@ -321,6 +549,34 @@ def build_digest(
 
 POSITIONS_EMPTY_TEXT: str = "  (no positions view available)"
 PNL_EMPTY_TEXT: str = "  (no shadow-P&L report on disk yet)"
+
+# VM2: the v2 grammar's instrument vocabulary.
+INSTRUMENTS_EMPTY_TEXT: str = "  (no instrument manifest in the latest run)"
+
+
+def instruments_digest_text(replay_dir: pathlib.Path) -> str:
+    """The INSTRUMENTS section: every descriptor the LATEST run
+    allocated, with the channels it carries, one per line.
+
+    Source of truth is that run's ``instrument-manifest.tsv`` (the same
+    file the engine's ``DescriptorTable`` is built from), read through
+    the shared :func:`claude_worker.iv_digest.read_manifest`; channels
+    come from :func:`claude_worker.channel_map.caps_of_descriptor`, the
+    pinned mirror of ``ingress_ai::caps_of_descriptor``. A missing run
+    or missing manifest renders as honest empty text — never an error,
+    and never a guess: proposing against a stale vocabulary would only
+    earn a ``Descriptor`` refuse at stage time."""
+    run_dir = claude_worker.features.latest_run_dir(replay_dir)
+    if run_dir is None:
+        return INSTRUMENTS_EMPTY_TEXT
+    manifest = claude_worker.iv_digest.read_manifest(run_dir)
+    if manifest is None or not manifest[0]:
+        return INSTRUMENTS_EMPTY_TEXT
+    lines: list[str] = []
+    for descriptor in sorted(set(manifest[0].values())):
+        caps = claude_worker.channel_map.caps_of_descriptor(descriptor)
+        lines.append(f"  {descriptor} [{claude_worker.channel_map.channel_names(caps)}]")
+    return "\n".join(lines)
 
 
 def gather_positions_payload(
@@ -504,6 +760,73 @@ def _number_field(value: object, lo: float, hi: float) -> float | None:
     return out
 
 
+def _bool_field(value: object) -> bool | None:
+    """Strict boolean — ``1``/``0`` are integers, not booleans (the
+    validator's ``scan_bool_field`` accepts only the JSON literals)."""
+    if not isinstance(value, bool):
+        return None
+    return value
+
+
+def _signal_field(value: object) -> float | None:
+    """A threshold in the x1e9 signal domain: bool-rejecting, finite,
+    any sign. The 9-decimal lexical law is the validator's
+    ``scan_signal_field`` — a JSON literal has already lost its text
+    form by the time it reaches us, so that check stays harness-side
+    (the §3.5 no-second-deep-parser doctrine)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    out = float(value)
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _descriptor_field(value: object) -> str | None:
+    """A §9.4 descriptor STRING: 1..128 printable-ASCII chars — the
+    validator's ``scan_descriptor`` range 0x20..0x7E, which is exactly
+    ASCII ∩ printable (DEL and every control byte fail both).
+
+    Resolution against the live boot universe is commit-time and
+    engine-side (a ``Descriptor`` refuse) — we only check the shape,
+    because the legal set changes with every boot."""
+    if not isinstance(value, str):
+        return None
+    if not 1 <= len(value) <= DESCRIPTOR_LEN_MAX:
+        return None
+    if not value.isascii() or not value.isprintable():
+        return None
+    return value
+
+
+def _feature_field(value: object) -> str | None:
+    """One of the 17 ``FeatId`` tokens."""
+    if not isinstance(value, str) or value not in FEATURES:
+        return None
+    return value
+
+
+def _window_ok(
+    obj: dict[str, object],
+    out: dict[str, object],
+    key: str,
+    feature: str | None,
+) -> bool:
+    """Rule 3 window law for one leg: ``key`` is present iff
+    ``feature`` rolls, and its value is 1..4320. ``feature is None``
+    means the leg itself is absent, so the window must be too."""
+    present = key in obj
+    rolls = feature in ROLLING_FEATURES if feature is not None else False
+    if present != rolls:
+        return False
+    if present:
+        window = _int_field(obj.get(key), ROLL_WINDOW_MIN, ROLL_WINDOW_MAX_MIN)
+        if window is None:
+            return False
+        out[key] = window
+    return True
+
+
 def _parse_trigger(value: object, sym: int) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
@@ -527,10 +850,219 @@ def _parse_trigger(value: object, sym: int) -> dict[str, object] | None:
 
 
 def _parse_row(value: object) -> dict[str, object] | None:
+    """Arm dispatch (validator rule 2): a row is v1 XOR v2. A row
+    carrying keys from BOTH shapes is malformed, exactly as
+    ``ingress_ai::parse_and_admit_row`` rejects it; a row carrying
+    neither falls to the v1 arm, whose exact-key-set check refuses it."""
     if not isinstance(value, dict):
         return None
     obj = typing.cast(dict[str, object], value)
-    if set(obj) != _ROW_KEYS:
+    keys = set(obj)
+    is_v1 = bool(keys & _ROW_KEYS_V1_ONLY)
+    is_v2 = bool(keys & _ROW_KEYS_V2_ONLY)
+    if is_v1 and is_v2:
+        return None
+    return _parse_row_v2(obj) if is_v2 else _parse_row_v1(obj)
+
+
+def _parse_row_v2(  # noqa: PLR0911, PLR0912, PLR0915
+    obj: dict[str, object],
+) -> dict[str, object] | None:
+    """The VM2-V4 arm. STRUCTURAL only, per the §3.5 doctrine: key sets,
+    types, enums, published bounds, and the shape laws that need no
+    cross-row or universe state (combine law, rule 3 windows, confirm
+    shape, rule 9 positions). Descriptor resolution (rule 6 / D-6),
+    rule 5 name uniqueness, the rule 7 cap Σ walk, rule 8 identity and
+    the rule 10 channel/bind-budget families stay in
+    ``ingress_ai::validate_ruleset`` — no second deep parser.
+
+    The return/branch-count lints are waived deliberately, for the same
+    reason ``parse_and_admit_row`` carries ``#[allow(clippy::
+    too_many_lines)]``: one row is one LINEAR rule sequence, and
+    splitting it into helpers hides the order the rules must run in."""
+    keys = set(obj)
+    if not keys <= _ROW_KEYS_V2 or not _ROW_REQUIRED_V2 <= keys:
+        return None
+
+    out: dict[str, object] = {}
+
+    name = obj.get("name")
+    if not isinstance(name, str) or not 1 <= len(name) <= NAME_LEN_MAX or not name.isascii():
+        return None
+    out["name"] = name
+
+    if "family" in keys:  # optional in v2 — the engine defaults to "other"
+        family = obj.get("family")
+        if family not in FAMILIES:
+            return None
+        out["family"] = family
+
+    instrument = _descriptor_field(obj.get("instrument"))
+    if instrument is None:
+        return None
+    out["instrument"] = instrument
+
+    has_ref = "ref" in keys
+    if has_ref:
+        ref = _descriptor_field(obj.get("ref"))
+        # Rule-6 mirror: identical descriptors resolve to one symbol.
+        if ref is None or ref == instrument:
+            return None
+        out["ref"] = ref
+
+    feature = _feature_field(obj.get("feature"))
+    if feature is None:
+        return None
+    out["feature"] = feature
+
+    # Combine law: required WITH `ref`, forbidden WITHOUT. `lhs_only` is
+    # the engine's inference for a ref-less row, never a token.
+    if has_ref != ("combine" in keys):
+        return None
+    if has_ref:
+        combine = obj.get("combine")
+        if combine not in COMBINES:
+            return None
+        out["combine"] = combine
+
+    # ref-only keys are illegal on a single-leg row.
+    if not has_ref and {"ref_feature", "ref_window_min"} & keys:
+        return None
+    ref_feature: str | None = None
+    if "ref_feature" in keys:
+        ref_feature = _feature_field(obj.get("ref_feature"))
+        if ref_feature is None:
+            return None
+        out["ref_feature"] = ref_feature
+
+    # Rule 3, per leg. The ref leg's effective feature falls back to
+    # `feature` when `ref_feature` is absent (the validator's
+    # `feat_b.unwrap_or(feat_a)`).
+    if not _window_ok(obj, out, "window_min", feature):
+        return None
+    ref_effective = (ref_feature or feature) if has_ref else None
+    if not _window_ok(obj, out, "ref_window_min", ref_effective):
+        return None
+
+    if "side" in keys:
+        side = obj.get("side")
+        if side not in SIDES:
+            return None
+        out["side"] = side
+
+    if "cmp" in keys:
+        cmp_token = obj.get("cmp")
+        if cmp_token not in CMPS:
+            return None
+        out["cmp"] = cmp_token
+    if "abs" in keys:
+        abs_flag = _bool_field(obj.get("abs"))
+        if abs_flag is None:
+            return None
+        out["abs"] = abs_flag
+
+    enter = _signal_field(obj.get("enter"))
+    if enter is None:
+        return None
+    out["enter"] = enter
+
+    position = "exit" in keys
+    if position:
+        exit_level = _signal_field(obj.get("exit"))
+        if exit_level is None:
+            return None
+        out["exit"] = exit_level
+
+    # Confirm shape: the threshold and the feature imply each other, and
+    # every other confirm key needs the feature.
+    confirm_keys = {
+        "confirm",
+        "confirm_cmp",
+        "confirm_abs",
+        "confirm_pair",
+        "confirm_window_min",
+    }
+    has_confirm_feature = "confirm_feature" in keys
+    if bool(confirm_keys & keys) != has_confirm_feature:
+        return None
+    if has_confirm_feature and "confirm" not in keys:
+        return None
+    confirm_feature: str | None = None
+    if has_confirm_feature:
+        confirm_feature = _feature_field(obj.get("confirm_feature"))
+        if confirm_feature is None:
+            return None
+        out["confirm_feature"] = confirm_feature
+    if not _window_ok(obj, out, "confirm_window_min", confirm_feature):
+        return None
+    if has_confirm_feature:
+        confirm = _signal_field(obj.get("confirm"))
+        if confirm is None:
+            return None
+        out["confirm"] = confirm
+        if "confirm_cmp" in keys:
+            confirm_cmp = obj.get("confirm_cmp")
+            if confirm_cmp not in CMPS:
+                return None
+            out["confirm_cmp"] = confirm_cmp
+        if "confirm_abs" in keys:
+            confirm_abs = _bool_field(obj.get("confirm_abs"))
+            if confirm_abs is None:
+                return None
+            out["confirm_abs"] = confirm_abs
+        if "confirm_pair" in keys:
+            confirm_pair = _bool_field(obj.get("confirm_pair"))
+            if confirm_pair is None:
+                return None
+            # The paired combine needs a second leg to compute over.
+            if confirm_pair and not has_ref:
+                return None
+            out["confirm_pair"] = confirm_pair
+
+    # Rule 9: groups and holds are position-only; a max age-out must
+    # outlast the min hold.
+    hold_keys = {"group", "min_hold_s", "max_hold_s"}
+    if not position and hold_keys & keys:
+        return None
+    if "group" in keys:
+        group = _int_field(obj.get("group"), 0, GROUP_MAX)
+        if group is None:
+            return None
+        out["group"] = group
+    min_hold = 0
+    max_hold = 0
+    if "min_hold_s" in keys:
+        parsed = _int_field(obj.get("min_hold_s"), 0, HOLD_S_MAX)
+        if parsed is None:
+            return None
+        min_hold = parsed
+        out["min_hold_s"] = min_hold
+    if "max_hold_s" in keys:
+        parsed = _int_field(obj.get("max_hold_s"), 0, HOLD_S_MAX)
+        if parsed is None:
+            return None
+        max_hold = parsed
+        out["max_hold_s"] = max_hold
+    if min_hold > 0 and max_hold > 0 and max_hold <= min_hold:
+        return None
+
+    horizon_ms = _int_field(obj.get("horizon_ms"), HORIZON_MS_MIN, HORIZON_MS_MAX)
+    if horizon_ms is None:
+        return None
+    out["horizon_ms"] = horizon_ms
+
+    max_risk = _number_field(obj.get("max_risk_usd"), 0.0, ROW_MAX_RISK_USD)
+    if max_risk is None or max_risk <= 0.0:
+        return None
+    out["max_risk_usd"] = max_risk
+
+    # Deterministic key order — `artifact_bytes` hashes the exact bytes.
+    return {key: out[key] for key in _ROW_KEY_ORDER_V2 if key in out}
+
+
+def _parse_row_v1(obj: dict[str, object]) -> dict[str, object] | None:
+    """The 8g arm, byte-exact: the whole key set is required."""
+    if set(obj) != _ROW_KEYS_V1:
         return None
     name = obj.get("name")
     if not isinstance(name, str) or not 1 <= len(name) <= NAME_LEN_MAX or not name.isascii():
