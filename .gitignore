@@ -94,7 +94,7 @@ EXTERNAL STRATEGIES TO ONBOARD/
 # hygiene, NOT a provenance rule: these files are the operator's own
 # Apache-2.0 work. See docs/research-tools-exclusion-plan.md.
 claude-worker/tools_*.py
-
+claude-worker/tools_*.sh
 # NOTE: THIRD-PARTY-NOTICES.md is deliberately NOT ignored. It is generated
 # by `make license-deps` but must be committed: it has to ship beside every
 # distributed binary, and an ignored file is one that can be missing at
