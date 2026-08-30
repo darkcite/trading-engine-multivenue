@@ -27,8 +27,13 @@ frozen-surface amendment with this ruling cited in the pin tests).
 
 Paper mode treats every fill as real for P&L accounting so the caps are
 exercised on the same code path that live mode will use. Statistical
-gates (OOS > 0, ≥ 50 trades, ≥ 2 trading days) are scale-independent
-and unchanged.
+gates (OOS > 0, ≥ 50 trades, ≥ 1 trading day) are scale-independent.
+**The trading-day floor moved 2 → 1** under the MVP-tempo operator
+ruling of 2026-08-30 (`GateThresholds.min_trading_days`, D1-pattern
+frozen-surface amendment, cited in the pin tests) so a ~12 h capture age
+suffices for staging; the accepted trade-off is that an OOS verdict can
+come from a single day's regime — the old floor was the
+single-regime-overfit guard. Revisit at the M6 soak.
 
 **Superseded demo tier (Phase 0 → 2026-08-29):** 4/sym · 32 total ·
 $250/sym · $1 000 total · $100/order · $200 DD — the numbers every

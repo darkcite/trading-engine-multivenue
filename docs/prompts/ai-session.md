@@ -39,6 +39,7 @@ Anthropic API key is never read by verbs, only `serve` uses it):
 | `CLAUDE_WORKER_DB` | worker SQLite: seq, dedupe, ruleset registry (`~/multivenue/worker/state.db`) |
 | `CLAUDE_WORKER_FEATURES_DIR` | fetch output (`~/multivenue/worker/features`) |
 | `CLAUDE_WORKER_MARKET_MAP` | JSON `{"markets": {name: SymbolId}, "hip4_pairs": [[yes,no],…]}` (`~/multivenue/worker/market-map.json`) |
+| `CLAUDE_WORKER_REPORTS_DIR` | shadow-P&L reports the `pnl` verb reads (`pnl-<day>.json` + `.summary.txt`) |
 
 Where things live:
 
@@ -78,7 +79,7 @@ interleave) · `5` state (SQLite) · `1` unexpected (traceback).
 
 Frame-sending verbs (`push`, `stage-ruleset`, `commit-ruleset`) send one
 implicit Heartbeat first on the same connection. `fetch`, `backtest`,
-`positions` never touch the socket.
+`positions` and `pnl` never touch the socket.
 
 ```sh
 claude-worker fetch [--replay-dir D] [--symbols CSV] [--no-rest] [--news]
@@ -106,6 +107,11 @@ claude-worker push --kind KIND [args]
 claude-worker positions [--run-dir D|latest] [--json]
     # read-only positions/exposure/realized+unrealized P&L, HIP-4 netted.
 
+claude-worker pnl [--date YYYY-MM-DD] [--json]
+    # thin READER for the shadow-P&L report; default = newest on disk.
+    # The report pair is produced by `python -m claude_worker.pnl_report`
+    # (a module, never a verb) — run that first or this exits 2.
+
 claude-worker stage-ruleset --ruleset R.json --report R.report.json
     # gate binding: recomputed hash + schema + gates.all_passed must
     # match, else exit 3. Records the registry row, sends RulesetStage.
@@ -124,11 +130,38 @@ The scripted test executes exactly this sequence.
 
 1. `claude-worker fetch` — refresh feature files; read them.
 2. `claude-worker positions --json` — know the book before you act.
-3. Author the ruleset JSON (Tier-1 artifact): rows of
-   `{name, family, trigger, edge_bps, horizon_ms, max_risk_usd}`;
-   ≤ 256 rows; symbols must exist in the boot universe; caps within
-   risk-policy (≤ $100/order, ≤ $250/symbol, ≤ $1 000 total notional;
-   DD cap $200/day). Tighten-only: never propose caps above these.
+3. Author the ruleset JSON: `{"rows": [ROW, …]}`, 1..256 rows, all one
+   shape. Use the **v2 grammar** — every row keyed on DESCRIPTOR strings
+   taken from the digest's INSTRUMENTS section, never a bare SymbolId
+   (ordinals reshuffle every boot). One row is one statement of:
+
+       signal = combine( feature(instrument, window_min),
+                         ref_feature(ref, ref_window_min) )
+
+   Required keys: `name`, `instrument`, `feature`, `enter`,
+   `horizon_ms`, `max_risk_usd`. `exit` PRESENT ⇒ a position row;
+   absent ⇒ a stateless refire row. Thresholds live in the ×1e9 signal
+   domain of their natural unit, so 3 bps is `3.0`. A feature only
+   exists where its channel does — naming one the instrument does not
+   carry is refused. v1 sugar (`trigger` / `edge_bps` / bare `sym`) is
+   still accepted but strictly weaker: it cannot express funding,
+   options, depth, positions, groups, holds or confirms. Never mix v1
+   and v2 keys in one row.
+
+   **The full grammar is deliberately NOT restated here** — a copy
+   drifts, and this block already did once. Print the canonical
+   statement instead (literally the text the model receives):
+
+   ```sh
+   cd claude-worker && uv run python -c \
+     "import claude_worker.strategist as s; print(s._STATIC_SYSTEM_TEXT)"
+   ```
+
+   Caps are TIGHTEN-ONLY, $50k research tier — authority
+   `docs/risk-policy.md`: **≤ $10 000 per leg · ≤ $20 000 per symbol ·
+   ≤ $100 000 whole table**; OOS drawdown gate $7 500. Two-leg position
+   rows charge their cap to BOTH legs and the table sum is group-blind,
+   so a wide table forces smaller legs. Never propose above these.
 4. `claude-worker backtest --ruleset R.json` — read the report either
    way. Exit 3 ⇒ back to step 3.
 5. Install the artifact where the ENGINE resolves it: copy `R.json` to
@@ -142,7 +175,10 @@ The scripted test executes exactly this sequence.
    incremented; `rejected_total` unchanged.
 9. Monitor: positions + per-strategy counters.
 10. Rollback: `claude-worker push --kind disable --strategy 5` (the vm
-    slot; the evaluator lands in 8g), or stage/commit the prior hash.
+    slot), or stage/commit the prior hash. Standing 8g finding: Commit
+    is mask-gated at the vm member, so after a disable the procedure is
+    **enable + re-commit** — the staged prior survives the disabled
+    window and applies without restaging.
 
 ## 5. News/labeling recipe
 

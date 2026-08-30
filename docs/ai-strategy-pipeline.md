@@ -613,8 +613,20 @@ a key was provisioned: the strategist was the only component still speaking the 
 
 - `docs/arch/phase-8h-design.md` §7.2 carries the same stale cap block. `docs/arch/` is CLOSED history
   under the archive law — never written to, read only for archaeology. It is superseded, not wrong.
-- `docs/prompts/ai-session.md` does not mention the `pnl` verb. Cosmetic, and the doc is pinned by
-  `test_session_scripted.py`, so changing it means changing the pin.
+- ~~`docs/prompts/ai-session.md` does not mention the `pnl` verb. Cosmetic, and the doc is pinned by
+  `test_session_scripted.py`, so changing it means changing the pin.~~ **CORRECTED 2026-08-30 — the
+  premise was wrong and the item was not cosmetic.** `test_session_scripted.py` pins the §4 VERB
+  SEQUENCE (fetch → positions → backtest → install → stage → commit → push disable), the first-32-hex
+  artifact rule and strategy slot 5; it writes its own trivial ruleset and never reads the doc's
+  prose. Prose was therefore always free to fix without touching the pin. Under that mistaken
+  premise the doc kept the **v1 row shape** and the **superseded demo-tier caps** ($100/order,
+  $250/symbol, $1 000 total, $200 DD) for the whole VM2 era — a session following it literally would
+  have authored a v1 ruleset at 1 % of the live per-leg cap. Fixed the same day: §4 step 3 now states
+  the v2 grammar and defers the full statement to a runnable command that prints
+  `strategist._STATIC_SYSTEM_TEXT`, caps mirror the $50k research tier with `docs/risk-policy.md`
+  named as authority, §3 gains the `pnl` verb, §2 gains `CLAUDE_WORKER_REPORTS_DIR`, and step 10
+  carries the 8g enable-then-re-commit finding. Lesson recorded: "pinned by a test" is a claim to
+  verify against the test, not to inherit.
 
 **Gate after the change:** worker pytest **595 passed** on the Mac (was 553), no regressions.
 
