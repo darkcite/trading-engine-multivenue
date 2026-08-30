@@ -81,7 +81,13 @@ class GateThresholds:
 
     min_oos_net_pnl_usd: float = 0.0  # strict >
     min_trades: int = 50
-    min_trading_days: int = 2
+    # Operator ruling 2026-08-30 (D1-pattern frozen-surface amendment,
+    # cited in the pin tests): MVP tempo — the OOS trading-day floor
+    # drops 2 → 1 so a ~12 h capture-age wait suffices for staging.
+    # Trade-off accepted on record: at floor 1 the OOS verdict can
+    # come from a single day's regime (the old floor was the
+    # single-regime-overfit guard). Revisit at the M6 soak.
+    min_trading_days: int = 1
     # Operator ruling 2026-08-29 (D1-pattern frozen-surface amendment,
     # cited in the pin tests): the $50k-book research tier — DD gate
     # 15% of book, per-order $10k, per-sym $20k, total $100k (2x

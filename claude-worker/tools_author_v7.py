@@ -28,23 +28,28 @@ def row(**kw):
 # ---- migrations -----------------------------------------------------------
 
 # xv_signal.py law: dev_bps = (mid_sym - mid_ref)/mid_ref * 1e4;
-# enter |dev| >= 4.0 flat (SELL rich = ASK on positive signal), exit
-# |dev| <= 1.0 or sign flip (the universal reversion law).
+# enter |dev| flat (SELL rich = ASK on positive signal), exit |dev|
+# decay or sign flip (the universal reversion law).
+#
+# V8 RETUNE (2026-08-30, operator MVP-tempo ruling; per-pair probes
+# on the 25 h root): the hl<->bn-usdm pair DROPPED from the
+# migration — the probe isolated ALL the damage there (OOS -$0.12,
+# dd $129, $59.6k per-sym bound from unfilled exits stacking on the
+# thin overnight book at the model's 600 ms hl latency) while the
+# okx<->bn-spot pair earned cleanly (+$8.75 @ 4.0 bps; +$14.73 /
+# 92 legs / 17 rt @ 3.0 bps). enter 4.0 -> 3.0 for statistical mass
+# (min_trades), leg $4,950 -> $3,000 so the deterministic 6-leg
+# in-flight stack fits the $20k per-sym bound (29,792 x 3000/4950 =
+# $18.1k). The cron keeps carrying the hl pair; its fate is an
+# operator call at bootout time (runbook §9 step 5 note).
 XV = {
     "rows": [
         row(
             name="xv-okx-bnspot", family="crypto",
             instrument="okx:BTC-USDT", ref="binance:btcusdt",
             feature="mid", combine="diff_bps",
-            enter=4.0, abs=True, exit=1.0,
-            max_risk_usd=4950.0,
-        ),
-        row(
-            name="xv-hl-bnusdm", family="crypto",
-            instrument="hyperliquid:BTC", ref="binance-usdm:btcusdt",
-            feature="mid", combine="diff_bps",
-            enter=4.0, abs=True, exit=1.0,
-            max_risk_usd=4950.0,
+            enter=3.0, abs=True, exit=1.0,
+            max_risk_usd=3000.0,
         ),
     ]
 }
@@ -111,13 +116,13 @@ S1 = {"rows": s1_rows(4950.0)}
 
 # ONE-TABLE LAW (V8): the VM holds a single active table, so families
 # run TOGETHER only via a MERGED artifact — static rule-7 sum <= $100k
-# forces smaller legs (xv $4,950 x4 + cvfc $3,000 x20 + s1 $1,400 x14
-# = $99.4k). Commit the merged artifact when a SECOND family clears
-# gates; leg-size deltas vs the crons are the documented price of the
-# group-blind static cap (8i RiskGate relieves later).
+# (xv $3,000 x2 + cvfc $3,000 x20 + s1 $1,400 x14 = $85.6k). Commit
+# the merged artifact when a SECOND family clears gates; leg-size
+# deltas vs the crons are the documented price of the group-blind
+# static cap (8i RiskGate relieves later).
 MERGED = {
     "rows": (
-        XV["rows"]
+        [dict(r) for r in XV["rows"]]
         + [dict(r, max_risk_usd=3000.0) for r in CVFC["rows"]]
         + s1_rows(1400.0)
     )

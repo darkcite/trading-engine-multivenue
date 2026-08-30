@@ -725,11 +725,10 @@ new venues.
   unattended; crons carry all families; the VM is inert (no
   committed table); seeds/parity/depth-digest/coverage/channel-map
   modules all landed and real-root-smoked. NEXT SESSION, in order:
-  (1) runbook §9 step 1 — refresh the v7-root symlinks, rerun xv-v2
-  `33e91345…` through the frozen backtest verb; gates PASS expected
-  once OOS spans ≥ 2 UTC days and legs ≥ 50 (was 44 in a ~3.7 h OOS
-  on the 12.4 h root — possibly viable Aug-31 evening UTC already);
-  if still short, wait a day, rerun. (2) On PASS: stage-ruleset +
+  (1) runbook §9 step 1 — SUPERSEDED 2026-08-30 by the MVP-tempo
+  ruling entry below: min_trading_days 2 → 1, xv-v2 retuned to
+  `bfbc5349…` (okx-only, 3.0/1.0, $3,000/leg) and ALREADY
+  gates-PASSED (exit 0). Start at step 2 = stage + commit. (2) On PASS: stage-ruleset +
   commit-ruleset (engine live, §9 step 1 commands). (3) Operator
   applies §9 step 2 (wrapper hookup + MULTIVENUE_SEED_RULESET).
   (4) Open the ≥ 48 h parity window (§9 step 3, daily
@@ -742,6 +741,36 @@ new venues.
   arrive; switch to merged-v2 `4d5dbe65…` only when the MERGED
   report itself passes (one-table + table-global-warmup laws, §9).
   Then V9 (gates + docs + CLAUDE.md CURRENT STATE + closure).
+
+- **2026-08-30 — OPERATOR RULING (MVP tempo) + xv-v2 RETUNE ⇒ ALL
+  GATES PASS; the V8 opening act unlocked TODAY.** Ruling: the
+  operator cannot afford the ~2-day wait — `GateThresholds.
+  min_trading_days` 2 → 1 (the D1-pattern frozen-surface amendment;
+  citation at the constant + in the amended pin; trade-off on
+  record: at floor 1 the OOS verdict can come from a single day's
+  regime — revisit at the M6 soak). Worker suite 553 green under
+  the amendment. **The immediate rerun then FAILED honestly** on
+  the aged 25 h root (OOS −$5.81, dd $131, sym bound $59.6k —
+  min_days/min_trades now green, pnl/bounds red): the overnight
+  hours flipped it, exactly the variance the old floor guarded.
+  **Per-pair probes isolated the damage:** okx↔bn-spot CLEAN
+  (+$8.75, dd $5.89, bounds green @ 4.0 bps; +$14.73 / 92 legs @
+  3.0 bps), hl↔bn-usdm carried ALL of it (−$0.12, dd $129, $59.6k
+  stacking — unfilled exits piling on the thin overnight book at
+  the model's 600 ms hl latency). **Retune (one iteration, recorded
+  as such):** xv-v2 = okx↔bn-spot ONLY, enter 3.0 / exit 1.0 bps,
+  $3,000/leg (the deterministic 6-leg in-flight stack × $3,000 =
+  $18.1k ≤ the $20k per-sym bound). New artifact **`bfbc5349…`**
+  (old `33e91345…` retired); merged-v2 → **`79eaceec…`** ($85.6k
+  static sum). **FROZEN-VERB RESULT: exit 0, ALL GATES PASS — OOS
+  +$8.93, 83 legs, 17 round trips, dd $16.50, bounds
+  $3,002/$18,056/$24,073.** Standing notes: (a) the cron keeps
+  carrying the hl pair — parity[xv] will show its entries as
+  KNOWN standing misses until the operator rules its fate at
+  bootout (§9 step 5: booting out com.multivenue.xv drops BOTH
+  pairs — keep the cron for hl, migrate a retuned hl row later, or
+  accept dropping hl); (b) probe artifacts were /tmp diagnostics,
+  not registry artifacts.
 
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
@@ -757,13 +786,13 @@ cd ~/trading-engine-multivenue/claude-worker
 for r in ~/multivenue/logs/run-*; do ln -sfn "$r" ~/multivenue/backtest-roots/v7-root/$(basename "$r"); done
 set -a; . ../.env; set +a
 PATH=~/trading-engine-multivenue/target/release:$PATH uv run claude-worker backtest \
-  --ruleset ~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.json \
+  --ruleset ~/multivenue/artifacts/rulesets/bfbc53491f0da7463970260f398daa62.json \
   --replay-dir ~/multivenue/backtest-roots/v7-root --split 70/30
 # gates PASS ⇒ stage + commit through the frozen verbs (engine must be live):
 uv run claude-worker stage-ruleset \
-  --ruleset ~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.json \
-  --report  ~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.report.json
-uv run claude-worker commit-ruleset --hash 33e91345e98eccb2c239f4bfd789a6d2
+  --ruleset ~/multivenue/artifacts/rulesets/bfbc53491f0da7463970260f398daa62.json \
+  --report  ~/multivenue/artifacts/rulesets/bfbc53491f0da7463970260f398daa62.report.json
+uv run claude-worker commit-ruleset --hash bfbc53491f0da7463970260f398daa62
 ```
 
 (cvfc-v2 `f7d79ce5…` / s1-v2 `0cf7433e…` — the V8-prep S1
@@ -794,7 +823,7 @@ append to `scripts/engine-wrapper.sh` after the engine launch line:
 ( /bin/zsh "$REPO/scripts/seed-push.sh" & )  # VM2 V8: post-boot seeds
 ```
 
-and set `MULTIVENUE_SEED_RULESET=~/multivenue/artifacts/rulesets/33e91345e98eccb2c239f4bfd789a6d2.json`
+and set `MULTIVENUE_SEED_RULESET=~/multivenue/artifacts/rulesets/bfbc53491f0da7463970260f398daa62.json`
 in `.env` once xv-v2 is COMMITTED (funding-only seeding runs safely
 without it). Verify at next restart: `seeds: sent N frames` in the
 wrapper log; engine-side `funding_seeds_applied > 0`.

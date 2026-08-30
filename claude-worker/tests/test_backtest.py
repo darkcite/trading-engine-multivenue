@@ -126,7 +126,10 @@ def test_pass_report_all_gates(tmp_path: pathlib.Path) -> None:
                 "oos": {
                     "net_pnl_usd": 5.0,
                     "trades": 60,
-                    "trading_days": 1,
+                    # Operator ruling 2026-08-30: min_trading_days
+                    # floor 2 → 1 (MVP tempo; D1-pattern amendment,
+                    # comment at GateThresholds) — 0 days still fails.
+                    "trading_days": 0,
                     "max_drawdown_usd": 20.0,
                 }
             },
