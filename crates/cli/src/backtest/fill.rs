@@ -1167,6 +1167,33 @@ mod tests {
         assert_eq!(o.oos_trading_days, 1, "day 3 only");
     }
 
+    #[test]
+    fn mark_fill_fills_exactly_once_across_many_marks() {
+        // VM2 V7 pin (the iv-proof finding): a mark-registered sym's
+        // resting order fills ONCE in FULL and leaves the book — a
+        // stream of subsequent marks must never re-fill it.
+        let mut e = engine_zero_delta(0);
+        e.set_mark_fill_sym(PM_SYM);
+        let mut out = Vec::new();
+        e.intake(&order(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 0);
+        let mut fills = 0u64;
+        let mut k = 0u64;
+        while k < 5 {
+            e.on_record(
+                &tick(PM_SYM, 400_000, 1_000_000, 400_000, 1_000_000),
+                10 + k,
+                0,
+                &mut out,
+            );
+            fills += out.len() as u64;
+            k += 1;
+        }
+        assert_eq!(fills, 1, "one full mark-fill only");
+        let s = e.finish();
+        assert_eq!(s.mark_fills, 1);
+        assert_eq!(s.fills_total, 1);
+    }
+
     // -------------- §4.5 accounting --------------
 
     #[test]

@@ -615,3 +615,69 @@ new venues.
   under REST-cycle machine load passed solo + on the quiet full
   rerun — the V2-noted bench-crate noise class; the release gate is
   authoritative.)
+
+- **2026-08-30 — V7 CODED + REAL-BACKTESTED (6 artifacts through
+  the frozen verb; 2 harness fixes found by the proofs; staging =
+  root-age-gated, operator ruling pending).** Authored via
+  `claude-worker/tools_author_v7.py` (committed = the reproducible
+  source; sha256-named artifacts in ~/multivenue/artifacts/rulesets):
+  **xv-v2** `33e91345…` (2 position pairs, mid diff_bps ABS 4.0 →
+  exit 1.0, $4,950/leg), **cvfc-v2** `f7d79ce5…` (5 coins × 2
+  addressable venue pairs, apr24 diff ABS 0.20 → exit 0.0, group per
+  coin = the MAX_POSITIONS-5 law, min-hold 96 h, $4,950/leg ⇒ table
+  Σ $99k inside the GROUP-BLIND rule-7 cap — leg size is the
+  documented delta vs the cron's $9.9k; the deribit↔hl cross pair
+  dropped), **s1-v2** `a56350ce…` (7 usdm perps, apr24 LhsOnly ABS
+  0.50, apr72 confirm ABS 0.30, exit 0.10, max-hold 240 h; the
+  cron's global 4-cap not reproduced — documented), **basis-proof**
+  `dfaaef31…`, **iv-spread-proof** `e98e7413…` (deribit vs okx BTC
+  30AUG26-77500-C mark_iv diff), **depth-imb-proof** `2f0dbd91…`.
+  Grammar lessons: `family` is the CLOSED enum (crypto/politics/
+  sports/macro/other). All six ran through the FROZEN
+  `claude-worker backtest` verb on `~/multivenue/backtest-roots/
+  v7-root` (symlinks to the 7 depth/funding-era runs, Aug-29 07:33 →
+  Aug-30 live, ≈2.5 GB, 34.9M merged ticks).
+  **Harness fixes the proofs forced (both pinned):** (1) the
+  §6-law completion — a run-manifest sym whose descriptor the
+  binding manifest no longer carries is DEAD and its records DROP
+  (`dropped_foreign`, printed per run + in the new `channels:`
+  stderr line): pass-through ordinals were interleaving expired
+  options/rotated PM dailies into current instruments — the 7-run
+  iv backtest carried **747,640 foreign records and a phantom
+  $248.8M per-sym bound**, sane ($3.2k) after the fix; pin =
+  `v7_dead_descriptor_records_drop_instead_of_colliding`. (2) the
+  D-7 mark-fill exactly-once pin
+  (`mark_fill_fills_exactly_once_across_many_marks`) + `mark=` on
+  the fills stderr line. Finding recorded, non-gating: okx OPTIONS
+  emit a real BBO tick lane live (2,846 legit partial cross-fills
+  against the real thin book) — `caps_of_descriptor`'s CAP_OPT-only
+  okx-option row UNDERSTATES the wire; a rule-10 refinement
+  candidate for a later phase, cross-language pin to move with it.
+  **Final OOS table (70/30, this root):** xv-v2 **+$11.73, 44 legs,
+  11 round-trips, dd $17.52, bounds ALL GREEN** — fails ONLY
+  legs 44<50 + trading_days 1<2, both pure root-age; cvfc-v2 valid,
+  0 trades (24 h apr warmup + 96 h min-hold ⇒ no round trip can
+  exist inside 36 h — REACHING rt≥10 needs a multi-WEEK root at
+  96 h holds); s1-v2 valid, 0 trades (72 h apr72 confirm warmup >
+  root span); basis honest-zero (no |3 bps| spot↔perp crossing with
+  live-funding confirm in OOS); iv-spread exercised the WHOLE
+  options path in-sample (entries on real IV spreads, D-7 mark
+  fills, real okx option book cross-fills) with an honestly empty
+  OOS (the 30AUG26 options EXPIRE before the OOS window); depth-imb
+  machinery-proven and NEGATIVE on merit (−$58.10 OOS) — per the
+  committed-only-on-merit law, not staged. **Staging/commit of the
+  migrations is structurally gated**: the frozen stage verb demands
+  gates.all_passed and NO OVERRIDE EXISTS — xv-v2 is expected to
+  clear as the funding-era root reaches ≥2 OOS UTC days (~Sep-1/2
+  rerun); cvfc/s1 cannot clear D-3's rt≥10 on any near-term root at
+  their hold laws — sequencing put to the operator at this entry.
+  **Gates at entry close: nextest 1420/1420 · release alloc 39/39
+  (fresh `Compiling bench`) · pytest 547 · license-check OK — new
+  stay-greens 1420/39/547.**
+  **OPERATOR RULING (2026-08-30, V7 exit):** stage on ROOT-AGE —
+  xv-v2 reruns through the frozen verb ~Sep-1/2 (OOS ≥ 2 UTC days)
+  and, gates-passing, stages+commits as V8's OPENING ACT; cvfc-v2 /
+  s1-v2 join the parity window as their gates clear naturally; the
+  crons keep carrying every not-yet-staged family, and V8's cron
+  bootout is PER-FAMILY on operator order. No frozen-surface
+  amendment for the slow-carry families at this time.

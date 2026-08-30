@@ -1210,3 +1210,61 @@ fn v5_cross_run_manifest_rebind_unifies_syms() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn v7_dead_descriptor_records_drop_instead_of_colliding() {
+    // VM2 V7 (found live by the iv proof): run-0 carries an
+    // instrument whose descriptor the newest manifest no longer
+    // lists, and run-1 REUSES the same ordinal for a DIFFERENT
+    // instrument (per-boot reshuffle). The dead instrument's records
+    // must DROP — passing them through would interleave a foreign
+    // price stream into the current instrument (§6 law).
+    let root = unique_root("v7-dead-desc");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    let run1 = root.join(format!("run-{EPOCH_RUN_1}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    std::fs::create_dir_all(&run1).expect("mkdir");
+    // Run-0: V5_SYM was yesterday's expired option; today (run-1)
+    // the SAME ordinal is the live swap the row trades.
+    std::fs::write(
+        run0.join("instrument-manifest.tsv"),
+        format!("{V5_SYM}\tokx:BTC-USD-260829-70000-C\n"),
+    )
+    .expect("m0");
+    std::fs::write(
+        run1.join("instrument-manifest.tsv"),
+        format!("{V5_SYM}\tokx:BTC-USDT-SWAP\n"),
+    )
+    .expect("m1");
+
+    let ruleset = root.join("lvl.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"lvl","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":0.0,"horizon_ms":10,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    // Run-0's tick is the FOREIGN instrument at an alien price.
+    write_ticks(
+        &run0,
+        "okx",
+        EPOCH_RUN_0,
+        &[mk_tick(1_000, VenueId::Okx, V5_SYM, 1, 2_000, 2_100)],
+    );
+    write_ticks(
+        &run1,
+        "okx",
+        EPOCH_RUN_1,
+        &[mk_tick(500, VenueId::Okx, V5_SYM, 1, 499_000, 501_000)],
+    );
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.dropped_foreign, 1, "the dead instrument's record dropped");
+    assert_eq!(s.universe_syms, 1, "only the live instrument remains");
+    assert_eq!(
+        s.vm_fires, 1,
+        "the row fires on run-1's tick ONLY — never on the foreign price"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

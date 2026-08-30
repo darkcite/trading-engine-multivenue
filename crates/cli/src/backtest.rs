@@ -463,6 +463,15 @@ struct RunSummary {
     opts: u64,
     opt_synth_ticks: u64,
     remapped_syms: u64,
+    /// VM2 V7: records DROPPED because their run-manifest descriptor
+    /// is absent from the binding (newest) manifest — a DEAD
+    /// instrument for this backtest. Ordinals reshuffle per boot
+    /// (options, PM dailies): passing such syms through raw would
+    /// interleave a foreign instrument's prices into whichever
+    /// CURRENT instrument reuses the ordinal (the §6 never-bare-
+    /// SymbolId-across-runs law; found live by the V7 iv proof —
+    /// $248M phantom bounds from expired-option collisions).
+    dropped_foreign: u64,
 }
 
 /// Open every present per-venue capture file of `run` (ticks +
@@ -471,6 +480,11 @@ struct RunSummary {
 /// synthesize option mark-ticks (D-7) for opt syms without a tick
 /// lane, and return the run's §3.2-ordered records.
 ///
+/// `dead` (VM2 V7) holds the run's manifest syms whose descriptors
+/// the binding manifest no longer carries — their records are
+/// dropped (see `RunSummary::dropped_foreign`). Manifest-less runs
+/// pass both maps empty (identity, the legacy law).
+///
 /// Lane ordinals (`lord`): ticks = venue index, events = 8+vi,
 /// depth = 16+vi, opt = 24+vi, synthetic mark-ticks = 40+vi — ticks
 /// sort first at equal (ts, venue), preserving the book-before-
@@ -478,20 +492,29 @@ struct RunSummary {
 fn load_run(
     run: &RunDir,
     remap: &BTreeMap<u32, u32>,
+    dead: &BTreeSet<u32>,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
     let mut summary_extra = (0u64, 0u64, 0u64, 0u64, 0u64); // ev, dp, op, synth, remapped
+    let mut dropped_foreign = 0u64;
     let mut any_file = false;
-    let map_sym = |sym: u32, remapped: &mut u64| -> u32 {
+    let map_sym = |sym: u32, remapped: &mut u64, dropped: &mut u64| -> Option<u32> {
         match remap.get(&sym) {
             Some(new) => {
                 if *new != sym {
                     *remapped += 1;
                 }
-                *new
+                Some(*new)
             }
-            None => sym,
+            None => {
+                if dead.contains(&sym) {
+                    *dropped += 1;
+                    None
+                } else {
+                    Some(sym)
+                }
+            }
         }
     };
     let mut tick_syms: BTreeSet<u32> = BTreeSet::new();
@@ -531,7 +554,10 @@ fn load_run(
         recs.reserve(records.len());
         for (i, t) in records.iter().enumerate() {
             let mut tick = *t;
-            tick.sym = map_sym(t.sym, &mut summary_extra.4);
+            tick.sym = match map_sym(t.sym, &mut summary_extra.4, &mut dropped_foreign) {
+                Some(s) => s,
+                None => continue,
+            };
             tick_syms.insert(tick.sym);
             recs.push(MergeKeyed {
                 ts_ns: t.ts_ns,
@@ -573,7 +599,10 @@ fn load_run(
                 }
                 let mut ev = *e;
                 if ev.sym != SYMBOL_ID_NONE {
-                    ev.sym = map_sym(ev.sym, &mut summary_extra.4);
+                    ev.sym = match map_sym(ev.sym, &mut summary_extra.4, &mut dropped_foreign) {
+                        Some(s) => s,
+                        None => continue,
+                    };
                 }
                 recs.push(MergeKeyed {
                     ts_ns: e.ts_ns,
@@ -600,7 +629,10 @@ fn load_run(
             }
             for (i, d) in reader.records().iter().enumerate() {
                 let mut dp = *d;
-                dp.sym = map_sym(d.sym, &mut summary_extra.4);
+                dp.sym = match map_sym(d.sym, &mut summary_extra.4, &mut dropped_foreign) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 recs.push(MergeKeyed {
                     ts_ns: d.ts_ns,
                     venue: d.venue,
@@ -628,7 +660,10 @@ fn load_run(
             }
             for (i, o) in reader.records().iter().enumerate() {
                 let mut op = *o;
-                op.sym = map_sym(o.sym, &mut summary_extra.4);
+                op.sym = match map_sym(o.sym, &mut summary_extra.4, &mut dropped_foreign) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 recs.push(MergeKeyed {
                     ts_ns: o.ts_ns,
                     venue: o.venue,
@@ -681,6 +716,7 @@ fn load_run(
             opts: summary_extra.2,
             opt_synth_ticks: summary_extra.3,
             remapped_syms: summary_extra.4,
+            dropped_foreign,
         },
     ))
 }
@@ -708,12 +744,22 @@ fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), 
     let mut prev_last_virt: u64 = 0;
     for run in runs {
         let mut remap: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut dead: BTreeSet<u32> = BTreeSet::new();
         for (sym, desc) in read_manifest_rows(&run.path) {
-            if let Some(new_sym) = newest_by_desc.get(&desc) {
-                remap.insert(sym, *new_sym);
+            match newest_by_desc.get(&desc) {
+                Some(new_sym) => {
+                    remap.insert(sym, *new_sym);
+                }
+                None => {
+                    // VM2 V7: the binding manifest no longer carries
+                    // this descriptor — DEAD instrument; its records
+                    // drop rather than leak into whichever current
+                    // instrument reuses the ordinal (§6 law).
+                    dead.insert(sym);
+                }
             }
         }
-        let (recs, summary) = load_run(run, &remap)?;
+        let (recs, summary) = load_run(run, &remap, &dead)?;
         summaries.push(summary);
         if recs.is_empty() {
             continue; // header-only files everywhere: run holds no records
@@ -1059,6 +1105,9 @@ pub struct HarnessStats {
     pub opt_synth_ticks: u64,
     /// Syms remapped through the per-run manifest join.
     pub remapped_syms: u64,
+    /// VM2 V7: dead-descriptor records dropped (§6 law; see
+    /// `RunSummary::dropped_foreign`).
+    pub dropped_foreign: u64,
     /// D-7 mark-law fills executed (> 0 ⇒ the assumption printed).
     pub mark_fills: u64,
     /// Warmup window end on the virtual clock (== first_virt when 0).
@@ -1388,6 +1437,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         merged_opts: run_summaries.iter().map(|r| r.opts).sum(),
         opt_synth_ticks: run_summaries.iter().map(|r| r.opt_synth_ticks).sum(),
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
+        dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
         warmup_end_virt_ns: warmup_end_virt,
         oos_round_trips,
@@ -1442,10 +1492,23 @@ fn render_summary(
         "capture: {} run(s), {} merged tick(s), universe {} sym(s), {} UTC day(s) spanned\n",
         stats.runs, stats.merged_records, stats.universe_syms, stats.capture_utc_days
     ));
+    s.push_str(&format!(
+        "channels: events={} depths={} opts={} opt_synth_ticks={} remapped_syms={} \
+         dropped_foreign={}\n",
+        stats.merged_events,
+        stats.merged_depths,
+        stats.merged_opts,
+        stats.opt_synth_ticks,
+        stats.remapped_syms,
+        stats.dropped_foreign
+    ));
     for (i, r) in runs.iter().enumerate() {
         s.push_str(&format!("  run[{i}] epoch_ns={}", r.epoch_ns));
         for (lord, label) in VENUE_LABELS.iter().enumerate() {
             s.push_str(&format!(" {label}={}", r.venue_records[lord]));
+        }
+        if r.dropped_foreign > 0 {
+            s.push_str(&format!(" dropped_foreign={}", r.dropped_foreign));
         }
         s.push('\n');
     }
@@ -1500,8 +1563,8 @@ fn render_summary(
         stats.peak_open_per_sym
     ));
     s.push_str(&format!(
-        "fills: total={} oos={}\n",
-        stats.fills_total, stats.fills_oos
+        "fills: total={} oos={} mark={}\n",
+        stats.fills_total, stats.fills_oos, stats.mark_fills
     ));
     s.push_str(&format!(
         "oos: net_pnl={} (realized={} fees={} markout={}), max_drawdown={}, trades={}, \
