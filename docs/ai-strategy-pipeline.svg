@@ -1,0 +1,405 @@
+<svg viewBox="0 0 1520 1996" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
+  <title id="t">The AI-strategy pipeline — multivenue trading engine</title>
+  <desc id="d">Eight stages: six venues stream into the engine, which writes append-only PMLR capture; offline Python folds that capture into a candle/funding/IV/depth store and per-run feature files; a strategist (Claude-in-session today, the keyed serve daemon at Stage 3) authors a ruleset in a fixed 17-feature grammar; the ruleset is scored by the real engine VM replaying the real capture and must pass five hard gates; a passing artifact is installed by content hash, staged and committed over an 82-byte HMAC UDS frame, validated a second time by the same validator, and flipped live in the VM; from then on it trades on every tick with no AI in the loop; audit-pnl, parity and audit-replay close the loop back into the next authoring round.</desc>
+
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8a86"/>
+    </marker>
+    <marker id="arb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1520" height="1996" fill="#ffffff"/>
+
+  <!-- ===================== HEADER ===================== -->
+  <text x="54" y="34" font-size="19" font-weight="700" fill="#1a1a18">The AI-strategy pipeline</text>
+  <text x="54" y="54" font-size="11" fill="#8a8a86">capture → derive → author → gate → promote → execute → observe · live state 2026-08-30 (VM2 V8)</text>
+
+  <rect x="1004" y="24" width="18" height="12" rx="2" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1028" y="34" font-size="9.5" fill="#8a8a86">live today</text>
+  <rect x="1120" y="24" width="18" height="12" rx="2" fill="#faf7ff" stroke="#7c3aed" stroke-dasharray="3 2"/>
+  <text x="1144" y="34" font-size="9.5" fill="#8a8a86">code-complete · deferred to the Stage-3 gate</text>
+  <rect x="1004" y="44" width="18" height="12" rx="2" fill="#fef3c7" stroke="#d97706"/>
+  <text x="1028" y="54" font-size="9.5" fill="#8a8a86">load-bearing rule — the pipeline breaks without it</text>
+  <rect x="1310" y="44" width="18" height="12" rx="2" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="1334" y="54" font-size="9.5" fill="#8a8a86">artifact on disk</text>
+
+  <!-- ===================== LANE A · CAPTURE ===================== -->
+  <rect x="54" y="84" width="1412" height="272" rx="8" fill="none" stroke="#b45309" stroke-width="1.3"/>
+  <text x="66" y="98" font-size="9.5" font-weight="700" fill="#b45309">A · CAPTURE — engine, Rust, continuous, no AI in the loop</text>
+
+  <g>
+    <rect x="68" y="106" width="220" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="178" y="123" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Polymarket CLOB</text>
+    <text x="178" y="138" font-size="9" fill="#8a8a86" text-anchor="middle">WSS book · ≤6 tokens (id 7 collides)</text>
+
+    <rect x="300" y="106" width="220" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="410" y="123" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Binance</text>
+    <text x="410" y="138" font-size="9" fill="#8a8a86" text-anchor="middle">spot · usdm · dated · opt (REST only)</text>
+
+    <rect x="532" y="106" width="220" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="642" y="123" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">OKX</text>
+    <text x="642" y="138" font-size="9" fill="#8a8a86" text-anchor="middle">spot · swap · options · books400</text>
+
+    <rect x="764" y="106" width="220" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="874" y="123" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Deribit</text>
+    <text x="874" y="138" font-size="9" fill="#8a8a86" text-anchor="middle">perp · options · combos</text>
+
+    <rect x="996" y="106" width="220" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="1106" y="123" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Hyperliquid</text>
+    <text x="1106" y="138" font-size="9" fill="#8a8a86" text-anchor="middle">perps · AssetCtx funding</text>
+
+    <rect x="1228" y="106" width="220" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+    <text x="1338" y="123" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Bybit</text>
+    <text x="1338" y="138" font-size="9" fill="#8a8a86" text-anchor="middle">spot · linear (data-only, venue 6)</text>
+  </g>
+
+  <line x1="178" y1="148" x2="178" y2="162" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="410" y1="148" x2="410" y2="162" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="642" y1="148" x2="642" y2="162" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="874" y1="148" x2="874" y2="162" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1106" y1="148" x2="1106" y2="162" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1338" y1="148" x2="1338" y2="162" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="164" width="1380" height="42" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="758" y="181" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">ingress-* threads — pinned cores · mio + rustls · handwritten byte scanners · zero allocation · no tokio, no serde_json</text>
+  <text x="758" y="196" font-size="9" fill="#8a8a86" text-anchor="middle">venue bytes → normalized 64 B Tick · ChannelEvent · OptSummary · DepthTopK</text>
+
+  <path d="M 758 206 L 758 214 L 408 214 L 408 218" fill="none" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <path d="M 758 206 L 758 214 L 1108 214 L 1108 218" fill="none" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="220" width="680" height="44" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="408" y="238" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">SPSC rings → Engine::tick() — single writer</text>
+  <text x="408" y="253" font-size="9" fill="#8a8a86" text-anchor="middle">lock-free · POD · 64 B aligned · generic over Strategy, monomorphized (no dyn)</text>
+
+  <rect x="768" y="220" width="680" height="44" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1108" y="238" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">PmlrCapture (per ingress) + SlotCapture (engine)</text>
+  <text x="1108" y="253" font-size="9" fill="#8a8a86" text-anchor="middle">the SAME record appended to disk · §6.5: capture IS the product — an open failure is a fatal boot error</text>
+
+  <line x1="408" y1="264" x2="408" y2="276" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1108" y1="264" x2="1108" y2="276" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="278" width="1380" height="70" rx="5" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="80" y="295" font-size="11" font-weight="700" fill="#1a1a18">~/multivenue/logs/run-&lt;epoch_ns&gt;/ — PMLR v2 · 64 B header + fixed-width slots · append-only · O(1) slot-indexed · torn-tail tolerant · one gap-free run per UTC day</text>
+  <text x="80" y="312" font-size="9.3" fill="#6b6b67">kind 0 &lt;venue&gt;-ticks · 1 -signals · 2 engine-fills · 3 engine-orders (the attribution log) · 4 ai-cmds · 5 -events · 6 -opt-summary · 7 -depth (192 B slots) · optional &lt;venue&gt;-raw.tap</text>
+  <text x="80" y="328" font-size="9.3" font-weight="600" fill="#b45309">instrument-manifest.tsv — sym → descriptor, rewritten EVERY boot. Option and PM-daily ordinals reshuffle per boot BY DESIGN:</text>
+  <text x="80" y="342" font-size="9.3" fill="#6b6b67">every offline consumer joins by DESCRIPTOR string (okx:BTC-USDT, binance-usdm:cotiusdt, deribit:BTC-30AUG26-77500-C, bare PM token id) — never a bare SymbolId. Skipping this produced a phantom $248.8M bound in V7.</text>
+
+  <line x1="410" y1="348" x2="410" y2="390" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1110" y1="348" x2="1110" y2="390" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <!-- ===================== LANE B · DERIVE + FETCH ===================== -->
+  <rect x="54" y="368" width="1412" height="200" rx="8" fill="none" stroke="#15803d" stroke-width="1.3"/>
+  <text x="66" y="382" font-size="9.5" font-weight="700" fill="#15803d">B · DERIVE + FETCH — worker, Python, offline, globally serialized (never the hot path)</text>
+
+  <rect x="68" y="392" width="684" height="62" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="410" y="410" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">worker MODULES (launchd cadence — modules, never verbs)</text>
+  <text x="410" y="426" font-size="9.3" fill="#6b6b67" text-anchor="middle">candles · funding · iv_digest · depth_digest · refdata</text>
+  <text x="410" y="441" font-size="9.3" fill="#6b6b67" text-anchor="middle">channel_map (per-descriptor capability) · coverage_audit (hollow-lane report)</text>
+
+  <rect x="768" y="392" width="684" height="62" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1110" y="410" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">claude-worker fetch --replay-dir D [--symbols] [--news]</text>
+  <text x="1110" y="426" font-size="9.3" fill="#6b6b67" text-anchor="middle">public keyless REST: PM Gamma · OKX candles · Deribit chart · HL candleSnapshot</text>
+  <text x="1110" y="441" font-size="9.3" fill="#6b6b67" text-anchor="middle">RestBudget 60 req / venue / h · budgets pooled per HOST · --news is mechanical, NO LLM runs here</text>
+
+  <line x1="410" y1="454" x2="410" y2="466" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1110" y1="454" x2="1110" y2="466" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="468" width="684" height="90" rx="5" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="80" y="485" font-size="11" font-weight="700" fill="#1a1a18">candles.db — the research data plane (SQLite WAL)</text>
+  <text x="80" y="501" font-size="9.3" fill="#6b6b67">tables: candles · candle_conflicts · funding · iv_digest · depth_digest · refdata</text>
+  <text x="80" y="516" font-size="9.3" font-weight="600" fill="#15803d">PK (venue, descriptor, tf, open_ts) — NEVER a bare SymbolId</text>
+  <text x="80" y="531" font-size="9.3" fill="#6b6b67">fetch 1m / 1h / 1d · derive 5m / 15m / 4h EXACTLY (O=first H=max L=min C=last V=sum)</text>
+  <text x="80" y="546" font-size="9.3" fill="#6b6b67">closed bars are immutable — a disagreeing re-fetch is a logged conflict · capture bars carry NULL volume (we capture BBO, not prints)</text>
+
+  <rect x="768" y="468" width="684" height="90" rx="5" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="780" y="485" font-size="11" font-weight="700" fill="#1a1a18">features/&lt;run&gt;/ — the digest inputs (files only, never a socket)</text>
+  <text x="780" y="501" font-size="9.3" fill="#6b6b67">&lt;sym&gt;.json (BBO / mid / spread / tick-rate) · &lt;sym&gt;-ohlcv.json · &lt;sym&gt;-meta.json</text>
+  <text x="780" y="516" font-size="9.3" fill="#6b6b67">news/items-&lt;ns&gt;.ndjson — pulled and deduped mechanically; the session is the triage brain</text>
+  <text x="780" y="531" font-size="9.3" font-weight="600" fill="#15803d">market-map.json  { markets: name → sym, hip4_pairs }</text>
+  <text x="780" y="546" font-size="9.3" fill="#6b6b67">refresh is ADDITIVE ONLY — a name that now resolves elsewhere is a reported CONFLICT; the operator entry wins · tmp + os.replace</text>
+
+  <line x1="410" y1="558" x2="410" y2="602" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1110" y1="558" x2="1110" y2="602" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <!-- ===================== LANE C · AUTHOR ===================== -->
+  <rect x="54" y="580" width="1412" height="196" rx="8" fill="none" stroke="#7c3aed" stroke-width="1.3"/>
+  <text x="66" y="594" font-size="9.5" font-weight="700" fill="#7c3aed">C · AUTHOR — the strategist reads FILES only, never a socket</text>
+
+  <rect x="68" y="604" width="684" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="410" y="622" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">Claude-in-session — SEMI-MANUAL · this is what runs today</text>
+  <text x="410" y="638" font-size="9.3" fill="#6b6b67" text-anchor="middle">cookbook: docs/prompts/ai-session.md §4 (pinned by test_session_scripted.py — doc and code cannot drift)</text>
+  <text x="410" y="653" font-size="9.3" fill="#6b6b67" text-anchor="middle">catalog: docs/research-universe.md · digest: features · candles.db · market-map · positions · pnl-&lt;day&gt;.json</text>
+  <text x="410" y="670" font-size="9.3" font-weight="600" fill="#7c3aed" text-anchor="middle">acts EXCLUSIVELY through the frozen verbs · one action → verify → log → next · never parallelize (one seq namespace)</text>
+
+  <rect x="768" y="604" width="684" height="76" rx="5" fill="#faf7ff" stroke="#7c3aed" stroke-dasharray="4 3"/>
+  <text x="1110" y="622" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">claude-worker serve → strategist.py → claude-fable-5   ⟨STAGE 3⟩</text>
+  <text x="1110" y="638" font-size="9.3" fill="#6b6b67" text-anchor="middle">ResearchCycle: fetch → propose → backtest → (fail ⇒ ONE revision) → promote → arm monitor</text>
+  <text x="1110" y="653" font-size="9.3" fill="#6b6b67" text-anchor="middle">6 h cadence · ≤2 calls per cycle · hard daily cap 12 · SQLite prompt cache · no-fresh-capture ⇒ cycle skipped</text>
+  <text x="1110" y="670" font-size="9.3" font-weight="600" fill="#7c3aed" text-anchor="middle">ANTHROPIC_API_KEY is NOT provisioned ⇒ serve has never run and no Anthropic call is made from this stack</text>
+
+  <line x1="410" y1="680" x2="410" y2="690" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <line x1="1110" y1="680" x2="1110" y2="690" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="692" width="1384" height="78" rx="5" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="80" y="709" font-size="11" font-weight="700" fill="#1a1a18">the ruleset artifact — { "rows": [ … ] } · 1–256 rows · identity = SHA-256 of the FILE BYTES (first 32 hex = hash128, which is all that travels on the wire)</text>
+  <text x="80" y="726" font-size="9.3" fill="#6b6b67">every row is one statement:   signal = combine( feat_a(instrument, window_a),  feat_b(ref, window_b) )   — every feature and combine output is an i64 in ×1e9 of its natural unit; thresholds live in the same domain</text>
+  <text x="80" y="741" font-size="9.3" fill="#6b6b67">17 features: mid · bid · ask | roll_mean · roll_ema · roll_min · roll_max · roll_std (window 1–4320 min) | apr24 · apr72 · clock_to_funding | mark_px · mark_iv | depth_imb · depth_spread_bps · depth_notional | clock_utc_sod</text>
+  <text x="80" y="757" font-size="9.3" fill="#6b6b67">4 combines: diff · diff_bps · ratio_1e9 · lhs_only     positions: exit ⇔ position row · ONE exit law signal × entry_sign ≤ exit · min/max_hold_s · group = at most one position, first row wins · max_risk_usd is PER LEG</text>
+
+  <line x1="758" y1="770" x2="758" y2="810" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <!-- ===================== LANE D · GATE ===================== -->
+  <rect x="54" y="788" width="1412" height="282" rx="8" fill="none" stroke="#b91c1c" stroke-width="1.3"/>
+  <text x="66" y="802" font-size="9.5" font-weight="700" fill="#b91c1c">D · GATE — the real engine VM replays the real capture · exit 3 is final, no override flag exists anywhere</text>
+
+  <rect x="68" y="812" width="556" height="56" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="346" y="830" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">claude-worker backtest --ruleset R.json [--replay-dir D] [--split 70/30]</text>
+  <text x="346" y="846" font-size="9.3" fill="#6b6b67" text-anchor="middle">the FROZEN contract — the harness conforms to the worker, never the reverse</text>
+  <text x="346" y="861" font-size="9.3" fill="#6b6b67" text-anchor="middle">backtest.py + cli.py byte-untouched across five sessions</text>
+
+  <line x1="624" y1="840" x2="654" y2="840" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="656" y="812" width="556" height="56" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="934" y="830" font-size="11.5" font-weight="600" fill="#1a1a18" text-anchor="middle">subprocess → multivenue-engine backtest --ruleset R --replay-dir D --split 70/30</text>
+  <text x="934" y="846" font-size="9.3" fill="#6b6b67" text-anchor="middle">schema-1 JSON on stdout ONLY (stdout purity law) · human summary to stderr</text>
+  <text x="934" y="861" font-size="9.3" fill="#6b6b67" text-anchor="middle">report hash must equal the recomputed file hash, else the report is untrusted (exit 2)</text>
+
+  <line x1="1212" y1="840" x2="1242" y2="840" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="1244" y="812" width="208" height="56" rx="5" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="1348" y="833" font-size="11" font-weight="700" fill="#1a1a18" text-anchor="middle">R.report.json</text>
+  <text x="1348" y="849" font-size="9.3" fill="#6b6b67" text-anchor="middle">written on PASS *and* FAIL</text>
+  <text x="1348" y="862" font-size="9.3" fill="#6b6b67" text-anchor="middle">it is the gate-binding evidence</text>
+
+  <line x1="758" y1="868" x2="758" y2="878" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="880" width="1384" height="100" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="897" font-size="11" font-weight="700" fill="#1a1a18">inside the harness — the same code that trades. Doctrine: the backtest may under-promise; it must never over-promise.</text>
+  <text x="80" y="915" font-size="9.2" fill="#6b6b67">k-way merge, total order (ts_ns, venue byte, record idx)</text>
+  <text x="80" y="930" font-size="9.2" fill="#6b6b67">VIRT_T0 rebase · runs never interleave</text>
+  <text x="80" y="945" font-size="9.2" font-weight="600" fill="#b91c1c">the SAME ingress_ai::validate_ruleset — no 2nd parser can drift</text>
+  <text x="80" y="960" font-size="9.2" fill="#6b6b67">the REAL VmStrategy, via receive_table_v2 + a synthesized Commit</text>
+  <text x="80" y="974" font-size="9.2" fill="#6b6b67">warmup is TABLE-GLOBAL: one apr72 row zeroes a root under 72 h</text>
+
+  <text x="546" y="915" font-size="9.2" font-weight="600" fill="#b91c1c">FillEngine — strict-cross maker, zero RNG</text>
+  <text x="546" y="930" font-size="9.2" fill="#6b6b67">a resting BID at P fills only when ask &lt; P (through, never a touch)</text>
+  <text x="546" y="945" font-size="9.2" fill="#6b6b67">fill px is always P · displayed size is a SHARED FIFO budget</text>
+  <text x="546" y="960" font-size="9.2" fill="#6b6b67">latency Δ: PM 200 ms · BN/OKX/Deribit/Bybit 100 ms · HL 600 ms</text>
+  <text x="546" y="974" font-size="9.2" fill="#6b6b67">caps 8/sym, 64 total · D-7 options: mark ± max(0.5%, 1 tick), TAKER</text>
+
+  <text x="1010" y="915" font-size="9.2" fill="#6b6b67">manifest rebind by descriptor; dead descriptors DROP all records</text>
+  <text x="1010" y="930" font-size="9.2" fill="#6b6b67">fees round UP · net rounds DOWN · DD and bounds round UP</text>
+  <text x="1010" y="945" font-size="9.2" fill="#6b6b67">fixed point: px/qty ×1e6, money ×1e12 — no floats</text>
+  <text x="1010" y="960" font-size="9.2" font-weight="600" fill="#b91c1c">70/30 on the virtual clock — TWO books over one fill stream:</text>
+  <text x="1010" y="974" font-size="9.2" fill="#6b6b67">full (IS+OOS) → bounds · OOS-emitted only → the verdict · PMLR ONLY, never candles</text>
+
+  <line x1="758" y1="980" x2="758" y2="990" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="68" y="992" width="920" height="66" rx="5" fill="#fef3c7" stroke="#d97706"/>
+  <text x="80" y="1009" font-size="11" font-weight="700" fill="#92400e">the five gates — GateThresholds, claude-worker/src/claude_worker/backtest.py</text>
+  <text x="80" y="1027" font-size="9.6" fill="#78350f">OOS net &gt; $0.00 (strict)   ·   ≥ 50 LEGS (+ ≥ 10 round trips iff position_rows &gt; 0)   ·   ≥ 1 OOS trading day  (amended 2 → 1 on 2026-08-30, MVP tempo)</text>
+  <text x="80" y="1044" font-size="9.6" fill="#78350f">max drawdown ≤ $7,500   ·   OBSERVED bounds ≤ $10k order / $20k symbol / $100k table — a breach ANYWHERE in IS+OOS disqualifies</text>
+
+  <rect x="1004" y="992" width="448" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1016" y="1009" font-size="11" font-weight="700" fill="#1a1a18">verdict</text>
+  <text x="1016" y="1025" font-size="9.3" fill="#6b6b67">exit 0 — gates passed, promotion is permitted</text>
+  <text x="1016" y="1039" font-size="9.3" font-weight="600" fill="#b91c1c">exit 3 — GATES REFUSED. Final. No --override / --force / --skip-gates</text>
+  <text x="1016" y="1052" font-size="9.3" fill="#6b6b67">exit 2 — report untrusted · 4 transport · 5 state</text>
+
+  <!-- exit-3 return channel -->
+  <path d="M 68 1025 L 32 1025 L 32 642 L 62 642" fill="none" stroke="#b91c1c" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+  <text x="24" y="835" font-size="9.3" font-weight="600" fill="#b91c1c" text-anchor="middle" transform="rotate(-90 24 835)">exit 3 ⇒ revise the table and re-gate</text>
+
+  <path d="M 528 1058 L 528 1076 L 400 1076 L 400 1102" fill="none" stroke="#15803d" stroke-width="1.2" marker-end="url(#ar)"/>
+  <text x="580" y="1072" font-size="9.3" font-weight="600" fill="#15803d">exit 0 ⇒ promote</text>
+
+  <!-- ===================== LANE E · PROMOTE ===================== -->
+  <rect x="54" y="1082" width="1412" height="346" rx="8" fill="none" stroke="#1d4ed8" stroke-width="1.3"/>
+  <text x="66" y="1096" font-size="9.5" font-weight="700" fill="#1d4ed8">E · PROMOTE — every step can only tighten</text>
+
+  <rect x="68" y="1106" width="440" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1123" font-size="11" font-weight="700" fill="#1a1a18">1 · install by content hash</text>
+  <text x="80" y="1139" font-size="9.3" fill="#6b6b67">cp R.json → $AI_RULESET_DIR/&lt;hash128&gt;.json</text>
+  <text x="80" y="1153" font-size="9.3" fill="#6b6b67">32 lowercase hex + .json · default ~/multivenue/artifacts/rulesets</text>
+  <text x="80" y="1166" font-size="9.3" font-weight="600" fill="#1d4ed8">the frame carries ONLY the hash — never the bytes</text>
+
+  <line x1="508" y1="1139" x2="534" y2="1139" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="536" y="1106" width="440" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="548" y="1123" font-size="11" font-weight="700" fill="#1a1a18">2 · stage-ruleset --ruleset R --report R.report.json</text>
+  <text x="548" y="1139" font-size="9.3" font-weight="600" fill="#1d4ed8">THE GATE BINDING SITE — recompute SHA-256; require schema 1,</text>
+  <text x="548" y="1153" font-size="9.3" fill="#6b6b67">matching ruleset_hash, and gates.all_passed — else GateRefused, exit 3</text>
+  <text x="548" y="1166" font-size="9.3" fill="#6b6b67">registry row in state.db FIRST, then send (record-then-send)</text>
+
+  <line x1="976" y1="1139" x2="1002" y2="1139" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="1004" y="1106" width="448" height="66" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1016" y="1123" font-size="11" font-weight="700" fill="#1a1a18">3 · commit-ruleset --hash &lt;64 hex&gt;</text>
+  <text x="1016" y="1139" font-size="9.3" fill="#6b6b67">requires a STAGED, gates-passed registry row — else exit 3</text>
+  <text x="1016" y="1153" font-size="9.3" fill="#6b6b67">send FIRST, then record (a failed send leaves no phantom commit)</text>
+  <text x="1016" y="1166" font-size="9.3" fill="#6b6b67">a re-stage of the same hash CLEARS committed_ts</text>
+
+  <line x1="758" y1="1172" x2="758" y2="1182" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#arb)"/>
+
+  <rect x="68" y="1184" width="1384" height="62" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1201" font-size="11" font-weight="700" fill="#1a1a18">the wire — one-way, single-client AF_UNIX at $AI_INGRESS_SOCK · parent dir 0700 · socket 0600 · peer-euid checked · NO response frame ever</text>
+  <text x="80" y="1219" font-size="9.6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" fill="#1d4ed8">[ len u16 LE = 80 ][ AiCmd 64 B ][ tag 16 B ]      tag = HMAC-SHA256(AI_INGRESS_HMAC_KEY, cmd[0..64])[0..16]      hash128 rides in px (bytes 0–7) + qty (bytes 8–15)</text>
+  <text x="80" y="1237" font-size="9.3" fill="#6b6b67">kind 7 RulesetStage · kind 8 RulesetCommit · strategy_id pinned to 5 · seq from ONE monotonic SQLite allocator; every verb sends an implicit Heartbeat first (live: stage seq 48 / commit seq 50) · a verb only reports "sent" — /metrics and ai-cmds.pmlr confirm application</text>
+
+  <line x1="408" y1="1246" x2="408" y2="1256" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#arb)"/>
+  <line x1="1108" y1="1246" x2="1108" y2="1256" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#arb)"/>
+
+  <rect x="68" y="1258" width="684" height="80" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1275" font-size="11" font-weight="700" fill="#1a1a18">ingress-ai · the §4.4 accept path (the ORDER is load-bearing)</text>
+  <text x="80" y="1291" font-size="9.3" fill="#6b6b67">1 len == 80  →  2 HMAC, constant-time  →  3 validate_shape  →  4 seq policy</text>
+  <text x="80" y="1305" font-size="9.3" font-weight="600" fill="#1d4ed8">5 ts_ns REWRITTEN to engine monotonic — the audit chain is our clock, not the sender's claim</text>
+  <text x="80" y="1319" font-size="9.3" font-weight="600" fill="#1d4ed8">6 appended to ai-cmds.pmlr BEFORE the ring push — a ring-dropped command stays auditable</text>
+  <text x="80" y="1333" font-size="9.3" fill="#6b6b67">7 try_push · Stage/Commit additionally routed to the side-path seam · fail at 1–2 drops the conn, at 3 discards the frame</text>
+
+  <rect x="768" y="1258" width="684" height="80" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="780" y="1275" font-size="11" font-weight="700" fill="#1a1a18">RulesetSidePath — the SECOND validation (off hot path; may allocate)</text>
+  <text x="780" y="1291" font-size="9.3" fill="#6b6b67">reads $AI_RULESET_DIR/&lt;hex&gt;.json (documented copy #0) into a Box&lt;RuleTableV2&gt; allocated once at boot</text>
+  <text x="780" y="1305" font-size="9.3" fill="#6b6b67">validate_ruleset rules 1–10 · rule 1 IS the hash check and strictly precedes any parsing</text>
+  <text x="780" y="1319" font-size="9.3" font-weight="600" fill="#1d4ed8">descriptors resolve HERE, against THIS boot's DescriptorTable — unresolvable ⇒ refuse</text>
+  <text x="780" y="1333" font-size="9.3" fill="#6b6b67">epoch := epoch + 1 · push RuleTableV2 (32,832 B) onto a 2-slot ring · a new Stage SUPERSEDES an old Commit</text>
+
+  <line x1="758" y1="1338" x2="758" y2="1348" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#arb)"/>
+
+  <rect x="68" y="1350" width="1384" height="76" rx="5" fill="#fef3c7" stroke="#d97706"/>
+  <text x="80" y="1367" font-size="11" font-weight="700" fill="#92400e">inside ONE Engine::tick() — the table lane is drained immediately BEFORE the AI lane, so a Stage and a Commit arriving in the same batch always land in order</text>
+  <text x="80" y="1385" font-size="9.6" fill="#78350f">table lane → StrategySet::on_ruleset_table → vm.receive_table_v2   ⇒  tables[(active&amp;1)^1] = table, staged_valid = true      —      NOT mask-gated</text>
+  <text x="80" y="1401" font-size="9.6" fill="#78350f">AI lane   → on_ai(RulesetCommit) fans out to ENABLED members only   ⇒  MASK-GATED by BIT_VM (32)   ⇒   active ^= 1 · the flip is an index swap, zero copy · rebind ≤4 feature legs/row · all 256 last_fire_ns = 0, all positions FLAT</text>
+  <text x="80" y="1418" font-size="9.6" font-weight="700" fill="#92400e">⇒ THE ASYMMETRY: with slot 5 disabled you can still STAGE — the table survives the disabled window — but the Commit is silently swallowed. Recovery is ENABLE, then RE-COMMIT. Never enable alone, never restage first.</text>
+
+  <line x1="1400" y1="1426" x2="1400" y2="1478" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <!-- ===================== LANE F · EXECUTE ===================== -->
+  <rect x="54" y="1440" width="1412" height="168" rx="8" fill="none" stroke="#0f766e" stroke-width="1.3"/>
+  <text x="66" y="1454" font-size="9.5" font-weight="700" fill="#0f766e">F · EXECUTE — on every tick, with NO AI, no worker and no cron in the loop</text>
+  <text x="66" y="1470" font-size="9.3" fill="#6b6b67">StrategySet is statically composed — no dyn, no allocation after boot. --strategy all requests 63; slots 1/2/3 need flags the launchd wrapper never passes ⇒ the live mask is 63 &amp; 49 = 49. Disable slot 5 ⇒ 17; re-enable ⇒ 49.</text>
+
+  <rect x="68" y="1480" width="220" height="36" rx="5" fill="#f6f6f4" stroke="#0f766e"/>
+  <text x="178" y="1495" font-size="10.5" font-weight="700" fill="#1a1a18" text-anchor="middle">slot 0 · latency-arb</text>
+  <text x="178" y="1509" font-size="8.8" fill="#6b6b67" text-anchor="middle">bit 1 · ON · not AI-authored</text>
+
+  <rect x="300" y="1480" width="220" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="410" y="1495" font-size="10.5" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 1 · ev</text>
+  <text x="410" y="1509" font-size="8.8" fill="#c0c0bc" text-anchor="middle">bit 2 · off (needs --artifacts-path)</text>
+
+  <rect x="532" y="1480" width="220" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="642" y="1495" font-size="10.5" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 2 · cross-arb</text>
+  <text x="642" y="1509" font-size="8.8" fill="#c0c0bc" text-anchor="middle">bit 4 · off (needs --groups)</text>
+
+  <rect x="764" y="1480" width="220" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="874" y="1495" font-size="10.5" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 3 · rule-tree</text>
+  <text x="874" y="1509" font-size="8.8" fill="#c0c0bc" text-anchor="middle">bit 8 · off (needs --rules-path)</text>
+
+  <rect x="996" y="1480" width="220" height="36" rx="5" fill="#f6f6f4" stroke="#0f766e"/>
+  <text x="1106" y="1495" font-size="10.5" font-weight="700" fill="#1a1a18" text-anchor="middle">slot 4 · ai-exec  (s4)</text>
+  <text x="1106" y="1509" font-size="8.8" fill="#6b6b67" text-anchor="middle">bit 16 · ON · Intent lane, cron-driven</text>
+
+  <rect x="1228" y="1480" width="220" height="36" rx="5" fill="#e6f4f1" stroke="#0f766e" stroke-width="1.6"/>
+  <text x="1338" y="1495" font-size="10.5" font-weight="700" fill="#0f766e" text-anchor="middle">slot 5 · vm  (s5)</text>
+  <text x="1338" y="1509" font-size="8.8" fill="#0f766e" text-anchor="middle">bit 32 · ON · THE RULESET VM</text>
+
+  <rect x="68" y="1528" width="684" height="58" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1545" font-size="10.5" font-weight="700" fill="#1a1a18">StampCtx writes the slot into Order.strategy_id (byte 41 of the 64 B Order) on submit</text>
+  <text x="80" y="1560" font-size="9.3" fill="#6b6b67">one register write, fully monomorphized — that is the WHOLE attribution mechanism</text>
+  <text x="80" y="1575" font-size="9" fill="#6b6b67">VM per tick: features always update · empty table ⇒ inert · exits first (age-out → min_hold → exit law), then entries (cooldown → confirm)</text>
+
+  <line x1="752" y1="1557" x2="766" y2="1557" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <rect x="768" y="1528" width="684" height="58" rx="5" fill="#eceae4" stroke="#c8c6c0"/>
+  <text x="780" y="1545" font-size="10.5" font-weight="700" fill="#1a1a18">engine-orders.pmlr — every ACCEPTED intent, stamped s0 / s4 / s5</text>
+  <text x="780" y="1560" font-size="9.3" fill="#6b6b67">paper-only until the operator opens the Stage-3 gate · refusals are counters, not records</text>
+  <text x="780" y="1575" font-size="9.3" fill="#6b6b67">per-RULESET attribution is deliberately not embedded — it is reconstructed offline from the RulesetCommit timeline in ai-cmds.pmlr</text>
+
+  <line x1="1110" y1="1586" x2="1110" y2="1640" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <!-- ===================== LANE G · OBSERVE ===================== -->
+  <rect x="54" y="1620" width="1412" height="140" rx="8" fill="none" stroke="#a16207" stroke-width="1.3"/>
+  <text x="66" y="1634" font-size="9.5" font-weight="700" fill="#a16207">G · OBSERVE — and the edge that closes the loop</text>
+
+  <rect x="68" y="1644" width="268" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">audit-pnl --dir</text>
+  <text x="80" y="1676" font-size="9.1" fill="#6b6b67">reuses backtest::fill VERBATIM,</text>
+  <text x="80" y="1689" font-size="9.1" fill="#6b6b67">boundary 0 — the gate and the</text>
+  <text x="80" y="1702" font-size="9.1" fill="#6b6b67">shadow book speak one economics</text>
+  <text x="80" y="1715" font-size="9.1" fill="#6b6b67">per slot AND per ruleset hash</text>
+
+  <rect x="347" y="1644" width="268" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="359" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">pnl_report → the pnl verb</text>
+  <text x="359" y="1676" font-size="9.1" fill="#6b6b67">nightly 00:20Z timer</text>
+  <text x="359" y="1689" font-size="9.1" fill="#6b6b67">reports/pnl-&lt;day&gt;.json</text>
+  <text x="359" y="1702" font-size="9.1" fill="#6b6b67">+ .summary.txt</text>
+  <text x="359" y="1715" font-size="9.1" fill="#6b6b67">pnl is a THIN reader — no socket</text>
+
+  <rect x="626" y="1644" width="268" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="638" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">parity --window-h 48</text>
+  <text x="638" y="1676" font-size="9.1" fill="#6b6b67">s4 cron vs s5 VM · ONE ground</text>
+  <text x="638" y="1689" font-size="9.1" fill="#6b6b67">truth: engine-orders.pmlr</text>
+  <text x="638" y="1702" font-size="9.1" fill="#6b6b67">tolerances xv 600 s / carry 7200 s</text>
+  <text x="638" y="1715" font-size="9.1" font-weight="600" fill="#a16207">GREEN = 0 misses AND 0 sign disagreements</text>
+
+  <rect x="905" y="1644" width="268" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="917" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">audit-replay --dir run-&lt;ns&gt;</text>
+  <text x="917" y="1676" font-size="9.1" fill="#6b6b67">cadence bands · sequence integrity</text>
+  <text x="917" y="1689" font-size="9.1" fill="#6b6b67">venue × channel coverage matrix</text>
+  <text x="917" y="1702" font-size="9.1" fill="#6b6b67">the FULL AI-command chain —</text>
+  <text x="917" y="1715" font-size="9.1" fill="#6b6b67">how the rollback was proven, not asserted</text>
+
+  <rect x="1184" y="1644" width="268" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1196" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">/metrics on 127.0.0.1</text>
+  <text x="1196" y="1676" font-size="9.1" fill="#6b6b67">engine_vm_rows_active · _table_epoch</text>
+  <text x="1196" y="1689" font-size="9.1" fill="#6b6b67">engine_vm_fires_total · _orders_*</text>
+  <text x="1196" y="1702" font-size="9.1" fill="#6b6b67">engine_ai_ruleset_{staged,committed,</text>
+  <text x="1196" y="1715" font-size="9.1" fill="#6b6b67">rejected}_total · engine_strategy_enabled_mask</text>
+
+  <text x="66" y="1742" font-size="9.3" fill="#6b6b67">Parity window OPEN since ~2026-08-30 08:55Z · judged PER FAMILY, never globally · known standing miss: the xv cron still carries the hl↔bn-usdm pair the retune dropped · cron bootout is OPERATOR-ONLY, per family, after that family is green (the data agents stay)</text>
+
+  <!-- feedback channel: observe → author -->
+  <path d="M 1452 1682 L 1492 1682 L 1492 642 L 1456 642" fill="none" stroke="#a16207" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#ar)"/>
+  <text x="1504" y="1160" font-size="9.3" font-weight="600" fill="#a16207" text-anchor="middle" transform="rotate(-90 1504 1160)">shadow P&amp;L · walk-forward · parity ⇒ the next authoring digest</text>
+
+  <!-- ===================== LANE H · RESTART CONTINUITY ===================== -->
+  <rect x="54" y="1772" width="1412" height="126" rx="8" fill="none" stroke="#64748b" stroke-width="1.3"/>
+  <text x="66" y="1786" font-size="9.5" font-weight="700" fill="#64748b">H · RESTART CONTINUITY — committed tables are IN-MEMORY ONLY</text>
+  <text x="66" y="1800" font-size="9.3" fill="#6b6b67">The engine reads NOTHING ruleset-related at boot: the VM boots inert (rows_active 0, epoch 0, hash all-zero). That is normal, not an error. Two backgrounded hooks in scripts/engine-wrapper.sh restore state.</text>
+
+  <rect x="68" y="1810" width="440" height="80" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1827" font-size="10.5" font-weight="700" fill="#1a1a18">scripts/engine-wrapper.sh</text>
+  <text x="80" y="1843" font-size="9.1" fill="#6b6b67">one-engine guard (pgrep) · source .env · universe refresh</text>
+  <text x="80" y="1857" font-size="9.1" fill="#6b6b67">exec multivenue-engine run --paper --strategy all</text>
+  <text x="80" y="1871" font-size="9.1" fill="#6b6b67">it NEVER builds — the G0 relink law is the operator's</text>
+  <text x="80" y="1884" font-size="9.1" fill="#6b6b67">daily graceful restarts at 00:00 / 08:30 / 16:05Z</text>
+
+  <rect x="536" y="1810" width="440" height="80" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="548" y="1827" font-size="10.5" font-weight="700" fill="#1a1a18">recommit-ruleset.sh — operator ruling #7b</text>
+  <text x="548" y="1843" font-size="9.1" fill="#6b6b67">python -m claude_worker.recommit --wait-sock-seconds 180</text>
+  <text x="548" y="1857" font-size="9.1" fill="#6b6b67">re-stages + re-commits the registry's ACTIVE ruleset</text>
+  <text x="548" y="1871" font-size="9.1" font-weight="600" fill="#64748b">because descriptors resolve at STAGE time, this is what re-binds</text>
+  <text x="548" y="1884" font-size="9.1" font-weight="600" fill="#64748b">options and PM dailies to THIS boot's ordinals · refuses rather than guesses</text>
+
+  <rect x="1004" y="1810" width="448" height="80" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="1016" y="1827" font-size="10.5" font-weight="700" fill="#1a1a18">seed-push.sh — after a 45 s grace</text>
+  <text x="1016" y="1843" font-size="9.1" fill="#6b6b67">the grace lets #7b land first: a seed against an inert VM is refused</text>
+  <text x="1016" y="1857" font-size="9.1" fill="#6b6b67">FundingSeed (kind 10) — 73 h of raw prints ⇒ apr24/apr72 warm at once</text>
+  <text x="1016" y="1871" font-size="9.1" fill="#6b6b67">PositionSeed (kind 11) — prior slot-5 FIFO fold · qty = age in SECONDS</text>
+  <text x="1016" y="1884" font-size="9.1" fill="#6b6b67">live-proven 2026-08-30: 1,669 frames · 52 descriptors · rejected 0</text>
+
+  <path d="M 68 1850 L 32 1850 L 32 1215 L 62 1215" fill="none" stroke="#64748b" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#ar)"/>
+  <text x="24" y="1540" font-size="9.3" font-weight="600" fill="#64748b" text-anchor="middle" transform="rotate(-90 24 1540)">post-boot re-stage + re-commit + seeds re-enter the wire (kinds 7 · 8 · 10 · 11)</text>
+
+  <!-- ===================== FOOTER ===================== -->
+  <text x="54" y="1920" font-size="9.5" font-weight="600" fill="#6b6b67">The AI is a compiler, not a runtime: nothing it produces ever executes as code — it emits data that a handwritten validator either admits or rejects.</text>
+  <text x="54" y="1935" font-size="9.5" fill="#8a8a86">One validator, shared by harness and engine. The gate is bound to the artifact by hash. Caps are enforced three times — validator rule 7 · the VM's own per-order policy · observed bounds — and only tightening is possible.</text>
+  <text x="54" y="1953" font-size="9.5" font-weight="600" fill="#6b6b67">Deferred to the Stage-3 entry gate (docs/mvp-completion-plan.md §7): ANTHROPIC_API_KEY provisioning ⇒ serve + Fable-5 authoring · §8.1 auto-promotion · §8.3 monitor + §8.5 automatic rollback.</text>
+  <text x="54" y="1968" font-size="9.5" fill="#8a8a86">The monitor's shape is fully specified: the ACTIVE ruleset re-run over a trailing 24 h at --split 0/100, floor 6 h (below it it SKIPS — it never guesses), trigger net ≤ −$100 or DD ≥ $200, act by Disable-5 then restage-and-commit the prior.</text>
+  <text x="54" y="1983" font-size="9.5" fill="#8a8a86">All of it is code-complete and E2E-proven; the LIVE proofs ARE the gate, and the gate is the operator's to open.      Companion walkthrough: docs/ai-strategy-pipeline.md</text>
+</svg>
