@@ -635,8 +635,12 @@ new venues.
   Grammar lessons: `family` is the CLOSED enum (crypto/politics/
   sports/macro/other). All six ran through the FROZEN
   `claude-worker backtest` verb on `~/multivenue/backtest-roots/
-  v7-root` (symlinks to the 7 depth/funding-era runs, Aug-29 07:33 →
-  Aug-30 live, ≈2.5 GB, 34.9M merged ticks).
+  v7-root` (symlinks to the 7 depth/funding-era runs; captured span
+  at run time = Aug-29 07:33Z → ~20:00Z — the harness's own truth:
+  virt span 44,739 s ≈ **12.4 h, 1 UTC day** [correction 2026-08-30:
+  earlier drafts said "36 h", a wall-clock slip off the operator's
+  LOCAL Aug-30 date while UTC was still Aug-29 evening]; ≈2.5 GB,
+  34.9M merged ticks).
   **Harness fixes the proofs forced (both pinned):** (1) the
   §6-law completion — a run-manifest sym whose descriptor the
   binding manifest no longer carries is DEAD and its records DROP
@@ -657,8 +661,8 @@ new venues.
   11 round-trips, dd $17.52, bounds ALL GREEN** — fails ONLY
   legs 44<50 + trading_days 1<2, both pure root-age; cvfc-v2 valid,
   0 trades (24 h apr warmup + 96 h min-hold ⇒ no round trip can
-  exist inside 36 h — REACHING rt≥10 needs a multi-WEEK root at
-  96 h holds); s1-v2 valid, 0 trades (72 h apr72 confirm warmup >
+  exist inside the 12.4 h root — REACHING rt≥10 needs a multi-WEEK
+  root at 96 h holds); s1-v2 valid, 0 trades (72 h apr72 confirm warmup >
   root span); basis honest-zero (no |3 bps| spot↔perp crossing with
   live-funding confirm in OOS); iv-spread exercised the WHOLE
   options path in-sample (entries on real IV spreads, D-7 mark
@@ -723,7 +727,8 @@ new venues.
   modules all landed and real-root-smoked. NEXT SESSION, in order:
   (1) runbook §9 step 1 — refresh the v7-root symlinks, rerun xv-v2
   `33e91345…` through the frozen backtest verb; gates PASS expected
-  once OOS spans ≥ 2 UTC days and legs ≥ 50 (was 44 on 36 h);
+  once OOS spans ≥ 2 UTC days and legs ≥ 50 (was 44 in a ~3.7 h OOS
+  on the 12.4 h root — possibly viable Aug-31 evening UTC already);
   if still short, wait a day, rerun. (2) On PASS: stage-ruleset +
   commit-ruleset (engine live, §9 step 1 commands). (3) Operator
   applies §9 step 2 (wrapper hookup + MULTIVENUE_SEED_RULESET).
@@ -774,7 +779,7 @@ $4,950 + cvfc $3,000 + s1 $1,400 legs = $99.4k static rule-7 sum;
 the leg-size deltas vs the crons are the group-blind cap's price).
 Sequencing consequence of the TABLE-GLOBAL warmup law (V5): the
 merged table references apr72 ⇒ 72 h warmup gates EVERY row
-(verified: merged backtests 0-trade on the 36 h root while xv-v2
+(verified: merged backtests 0-trade on the 12.4 h root while xv-v2
 alone trades) — commit xv-v2 ALONE at Sep-1/2; switch to merged
 only once the root lets the merged REPORT itself pass gates
 (≈ a week of funding-era capture, realistically when cvfc clears).
