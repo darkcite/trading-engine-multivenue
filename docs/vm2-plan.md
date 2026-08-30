@@ -618,10 +618,10 @@ new venues.
 
 - **2026-08-30 — V7 CODED + REAL-BACKTESTED (6 artifacts through
   the frozen verb; 2 harness fixes found by the proofs; staging =
-  root-age-gated, operator ruling pending).** Authored via the
-  repo-side one-shot `claude-worker/tools_author_v7.py` (git-excluded
-  by policy — see `docs/research-tools-exclusion-plan.md`; the
-  reproducible record is the sha256-named artifact itself in
+  root-age-gated, operator ruling pending).** Authored via a
+  git-excluded repo-side one-shot (that class, and its worked example:
+  `docs/research-tools-exclusion-plan.md` — the only doc that may name
+  one; the reproducible record is the sha256-named artifact itself in
   ~/multivenue/artifacts/rulesets, under the stage verb's recompute
   law, plus its stage/commit seqs in the audit-replay chain):
   **xv-v2** `33e91345…` (2 position pairs, mid diff_bps ABS 4.0 →

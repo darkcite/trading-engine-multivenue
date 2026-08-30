@@ -5,8 +5,10 @@ working tree and the §5 verification is green (record in §9). The commit is
 the operator's; §7 remains deferred and untouched.
 
 **Authority:** subordinate to `CLAUDE.md` (git discipline, Licensing) and
-`docs/license-audit-2026-08-27.md` §3.4. It creates one new standing law
-(§4.5) and amends three prose references (§4.3).
+`docs/license-audit-2026-08-27.md` §3.4. It creates two standing laws — the
+reserved `tools_` prefix (§4.1/§4.5) and the **reference ban** (§4.6) — and
+amends four prose references (§4.3). For the external research corpus it is
+subordinate to the license audit, which keeps ownership of that class.
 
 ---
 
@@ -17,6 +19,16 @@ the operator's; §7 remains deferred and untouched.
 | Motive | **Hygiene now, purge later.** Going-forward exclusion is unconditional; the history purge is recorded as a deferred, separately-authorized decision (§7). |
 | Location | **In place, glob-ignored.** Files stay at `claude-worker/tools_*.py`; a `.gitignore` glob excludes the class. No moves. |
 | `tools_author_v7.py` | **Untrack it too, and amend the docs** so nothing claims a committed source that no longer exists. |
+
+**Follow-up ruling, same day**, after the question *"are we ensuring a
+further run will not reference its research artifacts in the permanent
+docs?"* — answered honestly as **no**, the §4.4 gate caught tracked files
+only:
+
+| Question | Ruling |
+|---|---|
+| Gate shape | **Hard ban + one allowlisted owner per class.** Only the owning authority doc may name the material; everything else points at it. Chosen over a require-an-annotation-near-the-mention rule, which these aggressively wrapped docs would make brittle in both directions. |
+| Scope | **Both excluded classes** — the research one-shots and the external research corpus. The corpus pointer was the sharper risk: it invited a future session into provenance-unconfirmed material with no hint of its status. |
 
 The rulings are recorded here verbatim because §4.3 deletes the evidence
 that motivated them.
@@ -165,48 +177,88 @@ git rm --cached claude-worker/tools_author_v7.py
 After this, `git status` must show the file as neither staged-modified nor
 untracked — the §4.1 glob swallows it. That silence is the done-tell.
 
-### 4.3 Step 3 — amend the three references
+### 4.3 Step 3 — amend the references
 
-`git grep -n "tools_author_v7"` returns exactly three hits. Each currently
-asserts or implies that a *committed* script is the record.
+`git grep -n "tools_author_v7"` returned exactly three hits. Each asserted or
+implied that a *committed* script was the record. All three were rewritten to
+**point at this document rather than name the file** — the final form, under
+the §4.6 ban:
 
-**(a) `docs/vm2-plan.md:620-623`** — the load-bearing one, since it makes the
-explicit claim.
+- **`docs/vm2-plan.md`** (the load-bearing one, since it made the explicit
+  claim): `committed = the reproducible source` → *"Authored via a
+  git-excluded repo-side one-shot (that class, and its worked example:
+  `docs/research-tools-exclusion-plan.md` — the only doc that may name one;
+  the reproducible record is the sha256-named artifact itself … under the
+  stage verb's recompute law, plus its stage/commit seqs in the audit-replay
+  chain)"*.
+- **`docs/research-universe.md`** (path-to-live): *"author (the worked
+  example is a git-excluded local one-shot — see
+  `docs/research-tools-exclusion-plan.md`)"*.
+- **`claude-worker/tests/test_strategist.py`** (docstring only, no
+  assertion): *"authored by a git-excluded local one-shot; see
+  docs/research-tools-exclusion-plan.md"*.
 
-```diff
--  operator ruling pending).** Authored via
--  `claude-worker/tools_author_v7.py` (committed = the reproducible
--  source; sha256-named artifacts in ~/multivenue/artifacts/rulesets):
-+  operator ruling pending).** Authored via the repo-side one-shot
-+  `claude-worker/tools_author_v7.py` (git-excluded by policy — see
-+  `docs/research-tools-exclusion-plan.md`; the reproducible record is
-+  the sha256-named artifact itself in ~/multivenue/artifacts/rulesets,
-+  under the stage verb's recompute law, plus its stage/commit seqs in
-+  the audit-replay chain):
+A fourth reference, to the **external research corpus**, was folded in under
+the same rule (§4.6): `docs/research-universe.md` named that tree as a
+research source with no hint of its status. It now states the constraint —
+git-excluded, provenance unconfirmed, nothing may enter history until
+ownership is recorded in `NOTICE` — and defers to
+`docs/license-audit-2026-08-27.md` G8, which owns the rule. That reference
+gained information; it did not lose any.
+
+### 4.6 Step 6 — the reference ban (the durable half)
+
+§4.1 and §4.4 stop the *files* entering git. Neither stops a future session
+writing `tools_something.py did X` into a permanent doc — which is precisely
+the failure this plan was opened to clean up. Prose in `CLAUDE.md` is not a
+gate; prose is what let `committed = the reproducible source` exist.
+
+**The law:** git-excluded material may be named in exactly ONE tracked file —
+the authority doc that owns its exclusion. Everywhere else points at that doc.
+
+| Class | Owning authority doc |
+|---|---|
+| Research one-shots (`claude-worker/tools_*.py`) | `docs/research-tools-exclusion-plan.md` (this file) |
+| The external research corpus | `docs/license-audit-2026-08-27.md` (G8) |
+
+Enforced in the `license-check` recipe, beside the tracked-file guard:
+
+```make
+	refs=$$(git grep -nE 'tools_[a-z0-9_]*\.py|EXTERNAL STRATEGIES TO ONBOARD' -- \
+		':!:Makefile' ':!:.gitignore' ':!:docs/arch' \
+		':!:docs/research-tools-exclusion-plan.md' \
+		':!:docs/license-audit-2026-08-27.md'); \
+	if [ -n "$$refs" ]; then \
+		echo "  git-excluded material named outside its owning authority doc:"; \
+		echo "$$refs" | sed 's/^/    /'; \
+		echo "    owners: research one-shots -> docs/research-tools-exclusion-plan.md;"; \
+		echo "            external corpus     -> docs/license-audit-2026-08-27.md (G8)"; \
+		echo "    Point at the owner doc instead of naming the file or tree."; \
+		fail=1; \
+	fi; \
 ```
 
-**(b) `docs/research-universe.md:169-170`**
+Four exemptions, each for a reason:
 
-```diff
--- **Path to live:** author (`claude-worker/tools_author_v7.py` is
--  the worked example) → `backtest --ruleset R --replay-dir D` (use
-+- **Path to live:** author (`claude-worker/tools_author_v7.py` is the
-+  worked example — a git-excluded local one-shot, see
-+  `docs/research-tools-exclusion-plan.md`) → `backtest --ruleset R
-+  --replay-dir D` (use
-```
+- **`.gitignore`** must name the pattern in order to ignore it.
+- **`Makefile`** holds the patterns themselves; scanning it would make the
+  gate fail on its own source.
+- **`docs/arch/`** is closed history — "never write there, read only for
+  archaeology". A gate that fails on an archived doc would force an edit to
+  a doc nobody may edit. (It is clean today regardless.)
+- **The two owner docs**, which is the whole point of the allowlist.
 
-**(c) `claude-worker/tests/test_strategist.py:375`** — docstring only.
+**The regex bans concrete filenames, not the class glob** — by design, and
+worth stating so nobody "fixes" it. `tools_[a-z0-9_]*\.py` matches
+`tools_author_v7.py` but NOT `tools_*.py`, because `*` is outside the
+character class. Stating the law requires naming the *pattern*; that stays
+legal everywhere, including `CLAUDE.md`. Naming a *file the repo does not
+ship* is what rots.
 
-```diff
--    the VM2 V7/V8 artifacts (tools_author_v7.py), xv-v2 among them."""
-+    the VM2 V7/V8 artifacts (authored by the git-excluded local one-shot
-+    tools_author_v7.py), xv-v2 among them."""
-```
-
-No assertion is touched and the pytest count is unchanged at 553. If the
-operator counts `test_strategist.py` inside the **frozen 202**, drop (c)
-entirely — the rule loses nothing; only a stale parenthetical survives.
+**What this deliberately does not do:** it does not stop a session creating a
+new one-shot, running it, or recording its *findings* in `docs/`. Findings
+are the durable product and belong in the docs. Only the pointer to the
+ephemeral artifact is banned.
 
 ### 4.4 Step 4 — the regression gate
 
@@ -272,10 +324,16 @@ make license-check                               # expect: OK (233 source files)
 cd claude-worker && uv run pytest -q; cd ..      # expect: no regression (observed 598 passed)
 cargo nextest run --workspace                    # expect: 1420 (unchanged; not rerun — no Rust changed)
 
-# 6. the new gate actually bites (prove it red, then leave it green)
+# 6a. the tracked-file gate bites (prove it red, then leave it green)
 git add -f claude-worker/tools_research_bst.py
 make license-check                               # expect: FAILED, names the file
 git reset HEAD claude-worker/tools_research_bst.py
+make license-check                               # expect: OK again
+
+# 6b. the §4.6 reference gate bites — plant a reference in a permanent doc
+printf '\nSee claude-worker/tools_author_v7.py\n' >> docs/mvp-completion-plan.md
+make license-check                               # expect: FAILED, names doc:line
+git checkout -- docs/mvp-completion-plan.md
 make license-check                               # expect: OK again
 
 # 7. no stale reference survives
@@ -456,7 +514,38 @@ D  claude-worker/tools_author_v7.py        step 2 — git rm --cached (ON DISK, 
 
 Rust gates not rerun — no Rust changed (`nextest 1420 / alloc 39` stand).
 
-**Two findings worth carrying forward:**
+### 9.1 Second wave — the §4.6 reference ban (same day, after `278a34c`)
+
+`278a34c` shipped §4.1–§4.5. The operator then asked whether a further run
+would be *prevented* from referencing research artifacts in the permanent
+docs. It would not have been: §4.4 gated tracked **files**, never prose. §4.6
+closes that, and the audit that came with it found a fourth reference —
+the external-corpus pointer — of a class nobody had looked for.
+
+**Gate proven on both classes, red → green, with actionable `doc:line`:**
+
+| Probe | Result |
+|---|---|
+| Plant `claude-worker/tools_author_v7.py` in `docs/mvp-completion-plan.md` | **FAILED**, `docs/mvp-completion-plan.md:455` |
+| Plant the external-corpus tree name in the same doc | **FAILED**, same line, same actionable output |
+| Revert both | **OK (233 source files)** |
+| Plant the **class glob** `claude-worker/tools_*.py` (stating the law) | **OK** — the by-design distinction of §4.6 holds |
+| Owner docs + `CLAUDE.md`'s pattern mentions | not flagged — exemptions correct |
+| Probe residue | none; `git status` clean on the probed doc |
+
+`pytest` after the second wave: **598 passed** (11.0 s), twice.
+
+**One flake, characterized, not a regression.** The first full run of the
+second wave reported `1 failed, 597 passed` —
+`test_recommit.py::test_recommit_restages_and_recommits_active_row`, failing
+as `len(fake_uds.frames) == 0`: no frame reached the `FakeUdsServer`, i.e.
+the UDS fixture rather than the assertion under test. Nothing in either wave
+touches UDS, recommit or config (the only Python edit in the whole change is
+a docstring in an unrelated test file). Re-ran 6/6 green in isolation and
+598/598 green on two consecutive full runs. Recorded in `CLAUDE.md`'s macOS
+session facts, beside the AF_UNIX hazards it resembles.
+
+### 9.2 Findings carried forward
 
 1. **The pytest stay-green has drifted: 598, not the 553 in `CLAUDE.md`'s
    CURRENT STATE.** Nothing here caused it (the only Python edit is a

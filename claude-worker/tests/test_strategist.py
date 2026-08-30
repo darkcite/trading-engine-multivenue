@@ -372,8 +372,8 @@ def test_parse_proposal_v2_row_malformed(row: dict[str, object]) -> None:
 def test_parse_proposal_v2_mirrors_the_live_artifacts() -> None:
     """The strongest check available offline: every row shape the engine
     validator has actually ADMITTED must survive this mirror. These are
-    the VM2 V7/V8 artifacts (authored by the git-excluded local one-shot
-    tools_author_v7.py), xv-v2 among them."""
+    the VM2 V7/V8 artifacts (authored by a git-excluded local one-shot;
+    see docs/research-tools-exclusion-plan.md), xv-v2 among them."""
     live: list[dict[str, object]] = [
         # xv-v2 — committed live 2026-08-30
         _v2(),

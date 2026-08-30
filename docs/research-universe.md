@@ -85,9 +85,12 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
   vm2-plan §9). Authored + gate-pending: cvfc-v2 `f7d79ce5…` /
   s1-v2 `0cf7433e…` (their hold/warmup laws need older roots),
   merged-v2 `79eaceec…` (the one-table combination).
-- External research corpus: `EXTERNAL STRATEGIES TO ONBOARD/`
-  (S1–S7/S2R book + CVFC-1 + uplift studies — measured priors,
-  rejection tables, walk-forward bars worth reusing).
+- External research corpus (S1–S7/S2R book + CVFC-1 + uplift studies —
+  measured priors, rejection tables, walk-forward bars worth reusing):
+  git-excluded, provenance UNCONFIRMED. Nothing from it may enter git
+  history until ownership/relicensing is confirmed and recorded in
+  NOTICE — `docs/license-audit-2026-08-27.md` G8 names the tree and
+  owns the rule.
 
 ## 5. Standing constraints a strategy must respect
 
@@ -166,10 +169,9 @@ signal = combine( feat_a(instrument, window_a), feat_b(ref, window_b) )
   breadth/rank statistics, and okx-option BBO execution (the
   offline caps law lists okx options as opt-summary-only even
   though the wire ticks — validator refinement pending).
-- **Path to live:** author (`claude-worker/tools_author_v7.py` is the
-  worked example — a git-excluded local one-shot, see
-  `docs/research-tools-exclusion-plan.md`) → `backtest --ruleset R
-  --replay-dir D` (use
+- **Path to live:** author (the worked example is a git-excluded local
+  one-shot — see `docs/research-tools-exclusion-plan.md`) → `backtest
+  --ruleset R --replay-dir D` (use
   a bounded run-dir root; whole-root merges exceed RAM) → gates
   pass → `stage-ruleset` → `commit-ruleset` → parity vs any cron
   predecessor (`claude_worker.parity`) → cron bootout on operator

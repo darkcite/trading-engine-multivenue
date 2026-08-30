@@ -91,9 +91,15 @@ license-check:
 	# SPDX identifier in its first 3 lines, and the claude-worker copies of
 	# LICENSE/NOTICE must be byte-identical to the root originals — without
 	# them the built wheel ships with no license file at all (Apache-2.0
-	# §4(a)/§4(d)). Also refuses a tracked research one-shot: the only way
-	# one comes back is `git add -f`, and that must fail loudly rather than
-	# land quietly (docs/research-tools-exclusion-plan.md).
+	# §4(a)/§4(d)). Two further guards keep git-excluded material excluded:
+	# a TRACKED research one-shot fails (the only way one comes back is
+	# `git add -f`, which must fail loudly rather than land quietly), and so
+	# does NAMING excluded material anywhere but its owning authority doc —
+	# a reference outliving the file is how a permanent doc comes to point
+	# at nothing. Owners: research one-shots ->
+	# docs/research-tools-exclusion-plan.md; external corpus ->
+	# docs/license-audit-2026-08-27.md G8. docs/arch is closed history and
+	# exempt; this Makefile is exempt because it holds the patterns.
 	@fail=0; n=0; \
 	for f in $$(git ls-files '*.rs' '*.py' '*.sh'); do \
 		n=$$((n+1)); \
@@ -110,6 +116,18 @@ license-check:
 		echo "  tracked research one-shot(s) — must stay git-excluded:"; \
 		git ls-files 'claude-worker/tools_*.py' | sed 's/^/    /'; \
 		echo "    (docs/research-tools-exclusion-plan.md; promote into src/claude_worker/ instead)"; \
+		fail=1; \
+	fi; \
+	refs=$$(git grep -nE 'tools_[a-z0-9_]*\.py|EXTERNAL STRATEGIES TO ONBOARD' -- \
+		':!:Makefile' ':!:.gitignore' ':!:docs/arch' \
+		':!:docs/research-tools-exclusion-plan.md' \
+		':!:docs/license-audit-2026-08-27.md'); \
+	if [ -n "$$refs" ]; then \
+		echo "  git-excluded material named outside its owning authority doc:"; \
+		echo "$$refs" | sed 's/^/    /'; \
+		echo "    owners: research one-shots -> docs/research-tools-exclusion-plan.md;"; \
+		echo "            external corpus     -> docs/license-audit-2026-08-27.md (G8)"; \
+		echo "    Point at the owner doc instead of naming the file or tree."; \
 		fail=1; \
 	fi; \
 	if [ $$fail -ne 0 ]; then echo "license-check: FAILED"; exit 1; fi; \
