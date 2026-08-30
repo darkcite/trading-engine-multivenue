@@ -772,6 +772,32 @@ new venues.
   accept dropping hl); (b) probe artifacts were /tmp diagnostics,
   not registry artifacts.
 
+- **2026-08-30 ~08:55Z — V8 OPENING ACT EXECUTED: xv-v2 LIVE on the
+  standing engine; the ≥48 h parity window is OPEN.** Repo commit
+  `928fc99` (gate amendment + retune). Then through the frozen
+  verbs on the live engine: **stage seq=48 · commit seq=50** for
+  `bfbc5349…`; engine confirms staged 1 / committed 1 / rejected 0,
+  **vm_rows_active 1, vm_table_epoch 1**, vm_fires 0 (awaiting the
+  first ≥3 bps deviation). **Seed lane WIRED live (operator-
+  authorized):** engine-wrapper.sh gained the backgrounded
+  seed-push line (45 s grace so #7b recommits FIRST — a seed
+  against an inert VM is refused by design; same reparented +
+  interpreter-invoked laws), `.env` gained
+  `MULTIVENUE_SEED_RULESET` → the committed artifact (appended,
+  never read). **Proven E2E immediately: 1,669 frames SENT live**
+  (52 funding descriptors; position lane honestly flat=1/seeded=0 —
+  no slot-5 history yet); `engine_ingress_ai_cmds_total` 1674,
+  rejected 0. **Parity window T0 ≈ 2026-08-30 08:55Z** — daily
+  `python -m claude_worker.parity --window-h 48`; xv-family GREEN
+  criterion per §9 step 3 with the KNOWN standing hl-pair misses
+  (cron-only, operator rules at bootout). **The 16:05Z T2 restart
+  today doubles as the §9 step-4 drill for free**: expect #7b
+  restage+recommit in recommit.log, seed-push.log frames sent, and
+  any open xv position restored with continuous age
+  (`position_seeds_applied ≥ 1` iff a position is open at 16:05Z).
+  48 h earliest GREEN close: ~Sep-1 09:00Z, then per-family bootout
+  on explicit operator order only.
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized

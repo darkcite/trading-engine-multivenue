@@ -53,4 +53,13 @@ fi
 # exec-bit strip is exactly how the restart lane died.
 ( zsh "${0:A:h}/recommit-ruleset.sh" >> "$HOME/multivenue/logs/launchd/recommit.log" 2>&1 & )
 
+# VM2 V8 (operator-authorized 2026-08-30): post-boot seed push —
+# funding prints re-warm the VM's feature windows and PositionSeed
+# restores open rows (MULTIVENUE_SEED_RULESET in .env names the
+# committed artifact; unset ⇒ funding-only). The 45 s grace lets the
+# #7b recommit above land FIRST (a seed against an inert VM is
+# refused by design). Same reparented-background + interpreter-
+# invoked laws as the recommit line.
+( sleep 45 && zsh "${0:A:h}/seed-push.sh" >> "$HOME/multivenue/logs/launchd/seed-push.log" 2>&1 & )
+
 exec ./target/release/multivenue-engine run --paper --strategy all
