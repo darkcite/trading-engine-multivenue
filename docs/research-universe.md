@@ -1,4 +1,4 @@
-# Research universe — what the loop agent can analyze (2026-08-29)
+# Research universe — what the loop agent can analyze (2026-08-30)
 
 The single orientation file for a research session (the ai-session §4
 semi-manual loop, and `serve` when Stage 3 keys it). It answers: which
@@ -10,24 +10,29 @@ the manifests are the territory.
 
 ## 1. The two strategy carriers (architecture law)
 
-1. **Ruleset VM (engine-resident, s5).** Vocabulary: ≤256 rows of
-   `level_breach` (price level ×1e6 on one sym) and `cross_deviation`
-   (sym vs ref-sym deviation ≥ edge_bps) → capped order intents.
+1. **Ruleset VM (engine-resident, s5).** Since VM2 (2026-08-30) the
+   vocabulary is the GENERAL v2 grammar — §6 below is the authority
+   on what it expresses (features over price/funding/depth/IV/clock,
+   pair combines, position rows with holds/groups/confirms). The v1
+   `level_breach`/`cross_deviation` rows still validate as sugar.
    Push path: author JSON → `backtest` (frozen argv, gates in code) →
    `stage-ruleset` → `commit-ruleset`. **Executes on every tick with
    NO AI, no worker, no cron running**; survives until replaced or
-   disabled (per-boot re-commit rides the #7b waiter). Backtestable
-   natively; P&L audited per ruleset-hash by audit-pnl.
+   disabled (per-boot re-commit rides the #7b waiter; the post-boot
+   seed push re-warms funding windows and restores open positions).
+   Backtestable natively; P&L audited per ruleset-hash by audit-pnl.
 2. **Signal cron + Intent lane (worker-resident, s4).** Anything the
-   VM cannot express (funding, breadth, cross-venue statistics)
-   becomes a deterministic Python module emitting `order-intent`
-   pushes (the carry_signal pattern, hourly launchd cadence). No LLM
-   — but the CRON must run for entries/exits. Not natively
-   backtestable through the frozen argv; audited the same way
-   (stamped s4, per-tag).
+   VM cannot express (see §6 "what it cannot express") stays a
+   deterministic Python module emitting `order-intent` pushes (the
+   carry_signal pattern, launchd cadence). No LLM — but the CRON
+   must run for entries/exits. Not natively backtestable through the
+   frozen argv; audited the same way (stamped s4, per-tag).
+   `claude_worker.parity` compares the two carriers from capture
+   alone during migration windows.
 
 Both carriers are paper-only until the operator opens the Stage-3
-gate. Caps law for both: ≤$100/order, ≤$250/sym, ≤$1,000 total.
+gate. Caps law for both (the 2026-08-29 $50k research tier):
+≤$10k/order, ≤$20k/sym, ≤$100k table total.
 
 ## 2. Venues and what each carries
 
@@ -52,7 +57,15 @@ gate. Caps law for both: ≤$100/order, ≤$250/sym, ≤$1,000 total.
   configured instruments incl. equities via klines) · `funding` table
   (5 venues, per-print rates — cadence law: deribit rows are hourly
   samples of interest_8h, ÷8 on daily sums) · `iv_digest` (per-sym
-  1m/1h IV from opt-summary).
+  1m/1h IV from opt-summary) · `depth_digest` (VM2 V6: hourly
+  imbalance-OHLC / spread-bps / near-notional per depth-capable
+  descriptor).
+- **channel map** (`~/multivenue/worker/channel-map.tsv`, regenerate
+  via `python -m claude_worker.channel_map`): per-descriptor channel
+  capabilities — which features a row on that instrument may
+  reference. `python -m claude_worker.coverage_audit` names the data
+  holes per class; `python -m claude_worker.parity` compares s4 vs
+  s5 from capture.
 - **features/** per fetch run: per-sym BBO/mid/spread/tick-rate.
 - **reports/**: audit-pnl daily per-strategy/per-hash modeled P&L
   (00:20Z timer) — the audit trail for BOTH carriers.
@@ -63,10 +76,15 @@ gate. Caps law for both: ≤$100/order, ≤$250/sym, ≤$1,000 total.
 
 - s0 latency-arb: PM dailies × Binance leads (crypto 0:0/1:1 + NVDA
   2:2 equity pair — the BST thesis).
-- s4 lane: CVFC-1 (armed, entry ≥20 APR pts) + S1 pilot (COTI
-  position open) via the hourly carry cron.
-- s5 VM: empty this boot; `cvfc-basis-kill` candidate stages when
-  its backtest gates pass on new-sym capture.
+- s4 lane: CVFC-1 (armed, entry ≥20 APR pts) + S1 pilot (bn-usdm↔
+  bybit-linear funding-spread pairs) via the hourly carry cron; the
+  5-min xv cron carries the hl↔bn-usdm pair (its okx pair migrated).
+- s5 VM: **xv-v2 LIVE since 2026-08-30 08:55Z** (`bfbc5349…`:
+  okx:BTC-USDT ↔ binance:btcusdt mid reversion, enter 3.0 / exit
+  1.0 bps, $3,000/leg; the 48 h s4-vs-s5 parity window runs —
+  vm2-plan §9). Authored + gate-pending: cvfc-v2 `f7d79ce5…` /
+  s1-v2 `0cf7433e…` (their hold/warmup laws need older roots),
+  merged-v2 `79eaceec…` (the one-table combination).
 - External research corpus: `EXTERNAL STRATEGIES TO ONBOARD/`
   (S1–S7/S2R book + CVFC-1 + uplift studies — measured priors,
   rejection tables, walk-forward bars worth reusing).
@@ -77,9 +95,12 @@ gate. Caps law for both: ≤$100/order, ≤$250/sym, ≤$1,000 total.
   lands: PM token ids run `42,2,3,4,5,6` and the 7th collides with
   the reserved `binance:btcusdt` anchor 7 (live-hit 2026-08-29;
   needs an operator-ruled core-config amendment to extend).
-- Ruleset gates in code: OOS>0 · ≥50 trades · ≥2 days · DD ≤$200 ·
-  caps bounds — exit 3 is final; new instruments need ~2 days of
-  capture before a ruleset on them can pass.
+- Ruleset gates in code (2026-08-30 numbers): OOS net > $0 · ≥50
+  legs (+ ≥10 round trips when ANY position row exists, D-3) · ≥1
+  OOS trading day (2→1 by the MVP-tempo ruling) · DD ≤ $7,500 ·
+  OBSERVED bounds ≤ 10k/20k/100k — exit 3 is final, no override.
+  Referenced feature WINDOWS gate warmup table-globally: an apr72
+  row zeroes any backtest on a root younger than 72 h.
 - Backtests on this Mac: ALWAYS `--replay-dir <run-dir(s)>` — the
   whole-root merge exceeds 24 GiB RAM.
 - Strict-cross fill law = taker-floor economics; maker fill ratios
@@ -90,3 +111,64 @@ gate. Caps law for both: ≤$100/order, ≤$250/sym, ≤$1,000 total.
   dailies exist only for US trading days — session-segment any
   equity study (weekend prints are thin and drifty).
 - One engine, serialized worker verbs, paper caps — always.
+
+## 6. What the ruleset grammar expresses (VM2 v2 — the s5 vocabulary)
+
+A ruleset is `{"rows":[…]}`, ≤256 rows, each row one signal:
+
+```
+signal = combine( feat_a(instrument, window_a), feat_b(ref, window_b) )
+```
+
+- **Features (17):** `mid` `bid` `ask` · `roll_mean` `roll_ema`
+  `roll_min` `roll_max` `roll_std` (per-sym minute windows,
+  `window_min`, ≤8 distinct windows per sym) · `apr24` `apr72`
+  (annualized funding from live prints — deribit ÷8 law engine-side)
+  · `mark_px` `mark_iv` (options, from opt-summary) · `depth_imb`
+  `depth_spread_bps` `depth_notional` (okx/deribit L2) ·
+  `clock_to_funding` `clock_utc_sod`. A feature only validates on an
+  instrument whose CHANNELS carry it — the channel map (§3) is the
+  per-descriptor truth; rule 10 rejects mismatches at admit time.
+- **Combines:** `diff` (natural units — apr spreads, IV spreads),
+  `diff_bps` (relative price deviation), `ratio` (×1e9), or omit
+  for the single-leg signal. `ref` may be another descriptor or
+  absent; `ref_feature`/`ref_window_min` default to the a-side.
+- **Entry:** `enter` (9-decimal precision survives funding-sized
+  thresholds), `"abs": true` for |signal|, `cmp` `ge`/`le` for
+  direction. Direction law: positive signal ⇒ ASK the instrument
+  (sell the rich / short the higher-funding venue), negative ⇒ BID;
+  refire rows may pin a `side` filter instead.
+- **Confirm (optional):** `confirm_feature` + `confirm` +
+  `confirm_abs` + `confirm_window_min`; `confirm_pair: true`
+  computes the SAME combine over the confirm feature on both legs
+  (the S1 sp3 pattern).
+- **Position rows** (`exit` present): entry opens a tracked position
+  (pair rows hedge both legs, equal notional per leg); the ONE exit
+  law `signal × entry_sign ≤ exit` covers |signal| decay AND sign
+  flip; `min_hold_s` gates exits, `max_hold_s` is an unconditional
+  age-out, `group` N = mutual exclusion (first qualifying row wins —
+  the MAX_POSITIONS pattern). Rows without `exit` are stateless
+  refire rows (`horizon_ms` re-arm).
+- **Sizing/caps:** `max_risk_usd` per LEG; rule 7 statically sums
+  EVERY row × legs against 10k/20k/100k — group-blind by design, so
+  a wide table means smaller legs (the merged-artifact arithmetic).
+- **Instruments:** §9.4 descriptor STRINGS (`okx:BTC-USDT`,
+  `binance-usdm:cotiusdt`, bare PM token ids, option names).
+  Resolution to SymbolIds happens at stage time against the LIVE
+  boot's manifest and re-resolves every boot (#7b) — ordinals
+  reshuffle, descriptors are the identity. Restart continuity: the
+  seed lane replays 73 h of funding prints and restores open
+  positions by row.
+- **What it CANNOT express** (stays s4): dynamic best-pair venue
+  selection per coin (approximate with one row per pair sharing a
+  group), global cross-row position-count caps beyond groups,
+  anything needing REST/history at decision time, cross-coin
+  breadth/rank statistics, and okx-option BBO execution (the
+  offline caps law lists okx options as opt-summary-only even
+  though the wire ticks — validator refinement pending).
+- **Path to live:** author (`claude-worker/tools_author_v7.py` is
+  the worked example) → `backtest --ruleset R --replay-dir D` (use
+  a bounded run-dir root; whole-root merges exceed RAM) → gates
+  pass → `stage-ruleset` → `commit-ruleset` → parity vs any cron
+  predecessor (`claude_worker.parity`) → cron bootout on operator
+  order.

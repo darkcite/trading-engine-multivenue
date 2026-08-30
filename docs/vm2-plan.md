@@ -798,6 +798,25 @@ new venues.
   48 h earliest GREEN close: ~Sep-1 09:00Z, then per-family bootout
   on explicit operator order only.
 
+- **2026-08-30 — V9 PREP (everything not gated on the parity
+  outcome), run while the window ages.** Health at ~09:40Z: VM
+  armed (rows 1, fires 0 — no ≥3 bps deviation yet), both carriers
+  quiet in the trailing 2 h, parity trivially GREEN.
+  **research-universe.md actualized + gained §6 "What the ruleset
+  grammar expresses"** (the D-8 deliverable: features/combines/
+  entry/confirm/position laws, sizing arithmetic, descriptor
+  identity + seed continuity, the CANNOT-express list, the
+  author→backtest→stage→commit→parity path; also fixed stale v1
+  vocabulary, demo-tier caps, pre-amendment gate numbers, and the
+  live inventory). CLAUDE.md VM2 bullet actualized to the LIVE
+  state. **Battery: nextest 1420/1420 · release alloc 39/39 (fresh
+  `Compiling bench`) · pytest 553 · fuzz ruleset_json 311 s /
+  36.33M runs CLEAN (the V7-touched target re-cleared) —
+  stay-greens 1420/39/553.** Remaining for V9 close (after the
+  window): parity GREEN record, restart-drill record (16:05Z today,
+  free), bootout record on operator order, closure entries +
+  m5-runbook note.
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized
