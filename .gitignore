@@ -83,6 +83,18 @@ Thumbs.db
 # See docs/license-audit-2026-08-27.md G8.
 EXTERNAL STRATEGIES TO ONBOARD/
 
+# --- research one-shots (repo-side, never packaged) ---
+# Hand-run authoring/mining scripts that record ONE research moment: not
+# worker modules, not verbs, never imported by the package, no tests. They
+# live here for the venv and the `import claude_worker.*` seam only. Their
+# findings belong in docs/; their outputs are the sha256-named artifacts in
+# ~/multivenue/artifacts/rulesets, which are the reproducible record.
+# `tools_` is a RESERVED PREFIX inside claude-worker/: promotion out of this
+# class is a MOVE INTO src/claude_worker/ — never an un-ignore. This is
+# hygiene, NOT a provenance rule: these files are the operator's own
+# Apache-2.0 work. See docs/research-tools-exclusion-plan.md.
+claude-worker/tools_*.py
+
 # NOTE: THIRD-PARTY-NOTICES.md is deliberately NOT ignored. It is generated
 # by `make license-deps` but must be committed: it has to ship beside every
 # distributed binary, and an ignored file is one that can be missing at

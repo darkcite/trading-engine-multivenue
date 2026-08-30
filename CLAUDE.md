@@ -189,7 +189,7 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 - `crates/bench/` — criterion + dhat; allocation assertions live here too. `#[global_allocator]` CountingAllocator is process-global — keep new tests of other crates OUT of the bench crate.
 - Integration tests live per-crate under each crate's `tests/` directory. No workspace-level `tests/` is used.
 - `fuzz/` — cargo-fuzz targets.
-- `claude-worker/` — Python 3.14 worker: `serve` daemon + operator verbs (fetch/backtest/push/positions/stage-ruleset/commit-ruleset); Anthropic SDK constructed inside `serve` only; never in the hot path.
+- `claude-worker/` — Python 3.14 worker: `serve` daemon + operator verbs (fetch/backtest/push/positions/stage-ruleset/commit-ruleset); Anthropic SDK constructed inside `serve` only; never in the hot path. **Research one-shots (`claude-worker/tools_*.py`) are deliberately git-excluded** — `tools_` is a reserved prefix there; findings go to `docs/`, outputs are the sha256-named artifacts in `~/multivenue/artifacts/rulesets`, and anything that earns a caller moves into `src/claude_worker/`. Authority: `docs/research-tools-exclusion-plan.md`.
 - `.claude/` — subagents, slash commands, settings.
 
 ## Common pitfalls — if you're about to do one of these, stop
@@ -209,6 +209,7 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 13. **Modifying the worker's frozen surfaces.** `backtest.py` argv/schema-1 and the verb surface are FROZEN; the harness conforms to the worker. The 202 pytest baseline stays untouched-green.
 14. **Creating a new `.rs`/`.py`/`.sh` without the SPDX header, or a new crate without `license.workspace = true`.** See "Licensing" above. `make license-check` fails on it, and a header-less file lifted out of the repo carries no license signal at all — §4(c) obliges downstream to retain notices that then do not exist. Write the two lines when you create the file, not later.
 15. **Adding a dependency without re-running `make license-deps`.** A new crate changes what the shipped binary must attribute. `THIRD-PARTY-NOTICES.md` is committed, not generated at release time, precisely so it cannot be missing when a binary ships.
+16. **Committing a `claude-worker/tools_*.py` research one-shot** (or `git add -f`-ing one past the ignore rule). They are excluded by policy and `make license-check` fails on a tracked one. If it genuinely needs to be tracked, it needs to be a module in `src/claude_worker/` with tests — not a forced add. See `docs/research-tools-exclusion-plan.md`.
 
 ## macOS session facts (hard-won)
 

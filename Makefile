@@ -91,7 +91,9 @@ license-check:
 	# SPDX identifier in its first 3 lines, and the claude-worker copies of
 	# LICENSE/NOTICE must be byte-identical to the root originals — without
 	# them the built wheel ships with no license file at all (Apache-2.0
-	# §4(a)/§4(d)).
+	# §4(a)/§4(d)). Also refuses a tracked research one-shot: the only way
+	# one comes back is `git add -f`, and that must fail loudly rather than
+	# land quietly (docs/research-tools-exclusion-plan.md).
 	@fail=0; n=0; \
 	for f in $$(git ls-files '*.rs' '*.py' '*.sh'); do \
 		n=$$((n+1)); \
@@ -104,6 +106,12 @@ license-check:
 		{ echo "  drift: claude-worker/NOTICE != NOTICE  (run: make sync-license)"; fail=1; }; \
 	grep -q '^license' fuzz/Cargo.toml || \
 		{ echo "  fuzz/Cargo.toml has no license key (workspace-excluded — it cannot inherit)"; fail=1; }; \
+	if git ls-files --error-unmatch 'claude-worker/tools_*.py' >/dev/null 2>&1; then \
+		echo "  tracked research one-shot(s) — must stay git-excluded:"; \
+		git ls-files 'claude-worker/tools_*.py' | sed 's/^/    /'; \
+		echo "    (docs/research-tools-exclusion-plan.md; promote into src/claude_worker/ instead)"; \
+		fail=1; \
+	fi; \
 	if [ $$fail -ne 0 ]; then echo "license-check: FAILED"; exit 1; fi; \
 	echo "license-check: OK ($$n source files, LICENSE/NOTICE in sync)"
 

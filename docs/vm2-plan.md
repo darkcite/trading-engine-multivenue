@@ -618,9 +618,12 @@ new venues.
 
 - **2026-08-30 — V7 CODED + REAL-BACKTESTED (6 artifacts through
   the frozen verb; 2 harness fixes found by the proofs; staging =
-  root-age-gated, operator ruling pending).** Authored via
-  `claude-worker/tools_author_v7.py` (committed = the reproducible
-  source; sha256-named artifacts in ~/multivenue/artifacts/rulesets):
+  root-age-gated, operator ruling pending).** Authored via the
+  repo-side one-shot `claude-worker/tools_author_v7.py` (git-excluded
+  by policy — see `docs/research-tools-exclusion-plan.md`; the
+  reproducible record is the sha256-named artifact itself in
+  ~/multivenue/artifacts/rulesets, under the stage verb's recompute
+  law, plus its stage/commit seqs in the audit-replay chain):
   **xv-v2** `33e91345…` (2 position pairs, mid diff_bps ABS 4.0 →
   exit 1.0, $4,950/leg), **cvfc-v2** `f7d79ce5…` (5 coins × 2
   addressable venue pairs, apr24 diff ABS 0.20 → exit 0.0, group per

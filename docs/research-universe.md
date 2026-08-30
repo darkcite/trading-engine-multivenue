@@ -166,8 +166,10 @@ signal = combine( feat_a(instrument, window_a), feat_b(ref, window_b) )
   breadth/rank statistics, and okx-option BBO execution (the
   offline caps law lists okx options as opt-summary-only even
   though the wire ticks — validator refinement pending).
-- **Path to live:** author (`claude-worker/tools_author_v7.py` is
-  the worked example) → `backtest --ruleset R --replay-dir D` (use
+- **Path to live:** author (`claude-worker/tools_author_v7.py` is the
+  worked example — a git-excluded local one-shot, see
+  `docs/research-tools-exclusion-plan.md`) → `backtest --ruleset R
+  --replay-dir D` (use
   a bounded run-dir root; whole-root merges exceed RAM) → gates
   pass → `stage-ruleset` → `commit-ruleset` → parity vs any cron
   predecessor (`claude_worker.parity`) → cron bootout on operator
