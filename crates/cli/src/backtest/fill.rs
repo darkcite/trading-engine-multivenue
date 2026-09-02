@@ -98,6 +98,24 @@ pub const TRADEABLE_VENUES: usize = 6;
 pub const fn tradeable_venue_byte(venue: usize) -> bool {
     venue <= 4 || venue == 6
 }
+
+/// The venue whose Δ / fee column the MODEL applies to `sym`.
+///
+/// Every namespaced id carries its venue in bits 31..24 — except the
+/// M1 legacy anchors (`core-config::universe`): `binance:btcusdt` is
+/// the flat id **7**, whose venue byte reads 0 = Polymarket. Until the
+/// 2026-09-03 calibration pass every backtest/audit-pnl gave that leg
+/// Polymarket's activation Δ and fee column (`--fee-bps bn:` never
+/// touched it). The wire `Order.venue` byte is left as the vm derives
+/// it (`symbol_venue_byte`); only the model's lookup is corrected here.
+#[inline]
+pub fn model_venue_byte(sym: u32) -> u8 {
+    if sym == core_config::universe::LEGACY_BN_ANCHOR_SYM {
+        core_types::VenueId::Binance as u8
+    } else {
+        symbol_venue_byte(sym)
+    }
+}
 /// ns per UTC day (§4.5 `trading_days` bucketing, §3.3 wall mapping).
 pub const DAY_NS: u64 = 86_400_000_000_000;
 
@@ -528,12 +546,15 @@ impl FillEngine {
     /// stamps `t_active = emit + Δ_venue`. Rejections are counted,
     /// never surfaced to the vm (module docs: the vm sees `Ok`).
     pub fn intake(&mut self, order: &Order, emit_virt: u64) {
-        let venue = order.venue as usize;
         debug_assert_eq!(
             order.venue,
             symbol_venue_byte(order.sym),
             "vm derives Order.venue from the sym namespace"
         );
+        // Model venue (Δ / fee column), not the wire byte — the M1
+        // anchor id 7 is Binance spot with a Polymarket venue byte.
+        let venue_byte = model_venue_byte(order.sym);
+        let venue = venue_byte as usize;
         let px = order.px.raw();
         let qty = order.qty.raw();
         // The real vm cannot emit an untradeable venue byte
@@ -574,7 +595,7 @@ impl FillEngine {
             t_active_ns: emit_virt.saturating_add(self.params.latency_ns[venue]),
             sym: order.sym,
             side: order.side,
-            venue: order.venue,
+            venue: venue_byte,
             oos,
             px_1e6: px,
             remaining_1e6: qty,
@@ -816,7 +837,7 @@ impl FillEngine {
         for (sym, e) in &self.full.entries {
             rows.push(PerSymDetail {
                 sym: *sym,
-                venue: symbol_venue_byte(*sym),
+                venue: model_venue_byte(*sym),
                 pos_qty_1e6: e.qty_1e6,
                 last_mid_1e6: *self.marks_1e6.get(sym).unwrap_or(&0),
                 realized_1e12: e.realized_1e12,
@@ -1123,6 +1144,40 @@ mod tests {
         let mark = 365_000i128; // (350+380)/2
         let unreal = 70_000_000i128 * mark - 28_000_000_000_000;
         assert_eq!(o.oos_net_1e12, unreal - 140_000_000_000);
+    }
+
+    /// The M1 anchor id 7 (`binance:btcusdt`) carries venue byte 0:
+    /// the model must still apply BINANCE's Δ and fee column to it.
+    #[test]
+    fn legacy_bn_anchor_sym_takes_binance_delta_and_fee() {
+        const BN_ANCHOR: u32 = core_config::universe::LEGACY_BN_ANCHOR_SYM;
+        assert_eq!(
+            symbol_venue_byte(BN_ANCHOR),
+            0,
+            "wire byte reads Polymarket"
+        );
+        assert_eq!(model_venue_byte(BN_ANCHOR), VenueId::Binance as u8);
+        assert_eq!(model_venue_byte(PM_SYM), 0);
+        assert_eq!(model_venue_byte(BN_SYM), 1);
+        let p = ModelParams {
+            // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
+            fee_bps: [(50, 0), (10, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
+            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0],
+        };
+        let mut e = FillEngine::new(p, 0);
+        let mut out = Vec::new();
+        e.intake(&order(BN_ANCHOR, Side::Bid, 400_000, 70_000_000, 1), 0);
+        // virt 10 ns: PM's Δ (1 s) would still hold the order back;
+        // Binance's Δ (0) lets it fill — and at Binance's 10 bps.
+        e.on_record(
+            &tick(BN_ANCHOR, 350_000, 1, 380_000, 70_000_000),
+            10,
+            0,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "fills under Binance's Δ, not Polymarket's");
+        assert_eq!(out[0].fee_1e12, 28_000_000_000); // $28 × 10 bps = $0.028
+        assert_eq!(e.per_sym_detail()[0].venue, VenueId::Binance as u8);
     }
 
     // -------------- §3.4 bucketing --------------

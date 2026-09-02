@@ -329,7 +329,10 @@ fn load_run_events(
 
     let resolve =
         |sym: u32, interner: &mut SymInterner, load: &mut RunLoad| -> Result<u32, HarnessError> {
-            let venue_byte = (sym >> 24) as u8;
+            // Model venue byte: the M1 anchor id 7 (`binance:btcusdt`)
+            // interns under Binance so the Δ / fee lookup keyed on the
+            // dense id's venue byte is Binance's, not Polymarket's.
+            let venue_byte = crate::backtest::fill::model_venue_byte(sym);
             match manifest.as_ref().and_then(|m| m.get(&sym)) {
                 Some(desc) => interner.intern(venue_byte, desc),
                 None => {

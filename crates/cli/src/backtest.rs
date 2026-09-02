@@ -51,9 +51,8 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, OptSummary, Order,
-    Price, Qty, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
-    STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, OptSummary, Order, Price,
+    Qty, RuleTableV2, Tick, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -230,8 +229,9 @@ pub struct ModelParams {
     /// (Polymarket's current CLOB fee schedule; CEX venues cannot
     /// execute until 8j).
     pub fee_bps: [(u32, u32); 7],
-    /// Activation penalty Δ ns per venue (§4.4, deliberately
-    /// conservative defaults).
+    /// Activation penalty Δ ns per venue (§4.4). **A MEASUREMENT of the
+    /// deployment host + network, not a constant** — see
+    /// `docs/venue-latency.md` and the provenance on [`Default`].
     pub latency_ns: [u64; 7],
 }
 
@@ -239,17 +239,19 @@ impl Default for ModelParams {
     fn default() -> Self {
         Self {
             fee_bps: [(0, 0); 7],
-            // PM 200 ms, BN/OKX/Deribit 100 ms, HL 600 ms (§4.4);
-            // slot 5 = Ai dead; Bybit 100 ms (WS9 — the CEX class).
-            latency_ns: [
-                200 * MS,
-                100 * MS,
-                100 * MS,
-                100 * MS,
-                600 * MS,
-                0,
-                100 * MS,
-            ],
+            // Δ_venue = feed one-way p50 + REST request RTT p50 / 2,
+            // rounded up to 10 ms (docs/venue-latency.md §2), MEASURED
+            // 2026-09-03 17:07–17:32Z by `claude_worker.latency_probe`
+            // on the MacBook Pro M4 / operator's home network (UTC+7):
+            //   bn  71 + 107/2 → 130 ms   okx  67 + 120/2 → 130 ms
+            //   deribit 108 + 208/2 → 220 ms   hl 272 + 124/2 → 340 ms
+            //   bybit 29 + 44/2 → 60 ms
+            //   pm: CLOB feed UNMEASURED (socket needs an asset id);
+            //       REST one-way 114 ms → the §4.4 200 ms stays.
+            // Slot 5 = Ai is dead (0). Pre-2026-09-03 the table was
+            // the §4.4 assumption (pm 200 / bn·okx·deribit·bybit 100 /
+            // hl 600). RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.
+            latency_ns: [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS],
         }
     }
 }
@@ -592,8 +594,8 @@ fn load_run(
                 )));
             }
             for (i, e) in reader.records().iter().enumerate() {
-                let keep = e.channel == ChannelId::Funding as u8
-                    || e.channel == ChannelId::AssetCtx as u8;
+                let keep =
+                    e.channel == ChannelId::Funding as u8 || e.channel == ChannelId::AssetCtx as u8;
                 if !keep {
                     continue;
                 }
@@ -1209,8 +1211,14 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     // multi-channel merge adds per-run rebind).
     let descriptors = manifest_descriptor_table(&runs);
     let mut table = Box::new(RuleTableV2::EMPTY);
-    validate_ruleset(&ruleset_bytes, &hash128, &universe, &descriptors, &mut table)
-        .map_err(HarnessError::Reject)?;
+    validate_ruleset(
+        &ruleset_bytes,
+        &hash128,
+        &universe,
+        &descriptors,
+        &mut table,
+    )
+    .map_err(HarnessError::Reject)?;
 
     // §3.4 boundary: N% of the merged wall-time span. Replay is
     // continuous through it; only accounting buckets on it (H2 —
@@ -1384,7 +1392,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             i += 1;
         }
     }
-        let outcome: ModelOutcome = engine.finish();
+    let outcome: ModelOutcome = engine.finish();
 
     // ---- §5 report from the §4 model (fixed-point renders only) ----
     let vals = ReportValues {
@@ -1771,21 +1779,16 @@ mod tests {
     // ---------------- model flags (§4.3/§4.4) ----------------
 
     #[test]
-    fn model_params_defaults_pin_design_4() {
+    fn model_params_defaults_pin_measured_table() {
         let p = ModelParams::default();
         assert_eq!(p.fee_bps, [(0, 0); 7]);
-        // WS9: slot 5 = Ai (dead, 0), slot 6 = Bybit (CEX class).
+        // The 2026-09-03 measurement (docs/venue-latency.md §3); slot 5
+        // = Ai (dead, 0), slot 6 = Bybit. A new deployment re-measures
+        // and re-pins — this test exists so the table never drifts
+        // silently.
         assert_eq!(
             p.latency_ns,
-            [
-                200 * MS,
-                100 * MS,
-                100 * MS,
-                100 * MS,
-                600 * MS,
-                0,
-                100 * MS
-            ]
+            [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS]
         );
     }
 
