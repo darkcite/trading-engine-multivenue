@@ -53,11 +53,21 @@ EXIT_TRANSPORT: int = 4
 EXIT_STATE: int = 5
 
 _SOCK_POLL_S: float = 1.0
+#: Transport-retry cadence (VM2 V8 outage fix, see ``main``).
+_RETRY_POLL_S: float = 2.0
 _AUTHOR_MODE: str = "session"  # semi-manual lane (operator ruling #5)
 
 
 def wait_for_sock(sock_path: pathlib.Path, budget_s: float) -> bool:
-    """Poll for the UDS path to exist, up to ``budget_s`` seconds."""
+    """Poll for the UDS path to exist, up to ``budget_s`` seconds.
+
+    Existence is NOT readiness: the engine's PREVIOUS boot leaves a
+    stale socket inode behind, so this returns True immediately on
+    every restart while ``connect()`` still refuses until the new
+    engine binds. The 2026-08-30→09-01 outage (four boots, VM inert,
+    parity window lost) was exactly that race — which is why ``main``
+    now RETRIES transport failures against the same budget instead of
+    aborting on the first refused connect."""
     deadline = time.monotonic() + budget_s
     while time.monotonic() < deadline:
         if sock_path.exists():
@@ -141,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"recommit: config: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    deadline = time.monotonic() + args.wait_sock_seconds
     if not wait_for_sock(cfg.ai_ingress_sock, args.wait_sock_seconds):
         print(
             f"recommit: ai.sock never appeared at {cfg.ai_ingress_sock}"
@@ -148,17 +159,38 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_TRANSPORT
-    try:
-        return recommit_active(cfg)
-    except claude_worker.uds.UdsError as exc:
-        print(f"recommit: transport: {exc}", file=sys.stderr)
-        return EXIT_TRANSPORT
-    except claude_worker.backtest.GateRefused as exc:
-        print(f"recommit: gate refused (final — no override exists): {exc}", file=sys.stderr)
-        return EXIT_GATE
-    except claude_worker.state.StateError as exc:
-        print(f"recommit: state: {exc}", file=sys.stderr)
-        return EXIT_STATE
+    # VM2 V8 outage fix (2026-09-02; root-caused 2026-08-31): a STALE
+    # socket inode from the previous boot satisfies the existence wait
+    # instantly, then connect() gets ECONNREFUSED until the new engine
+    # binds — four consecutive boots aborted here and the VM ran inert
+    # for ~2.5 days. Transport failures now RETRY against the SAME
+    # --wait-sock-seconds budget (one final attempt at the deadline);
+    # gate/state refusals stay immediate — only transport is a race.
+    while True:
+        try:
+            return recommit_active(cfg)
+        except claude_worker.uds.UdsError as exc:
+            if time.monotonic() >= deadline:
+                print(
+                    f"recommit: transport: {exc} — budget exhausted"
+                    f" ({args.wait_sock_seconds:.0f}s); giving up (next boot retries)",
+                    file=sys.stderr,
+                )
+                return EXIT_TRANSPORT
+            print(
+                f"recommit: transport: {exc} — engine not bound yet, retrying",
+                file=sys.stderr,
+            )
+            time.sleep(_RETRY_POLL_S)
+        except claude_worker.backtest.GateRefused as exc:
+            print(
+                f"recommit: gate refused (final — no override exists): {exc}",
+                file=sys.stderr,
+            )
+            return EXIT_GATE
+        except claude_worker.state.StateError as exc:
+            print(f"recommit: state: {exc}", file=sys.stderr)
+            return EXIT_STATE
     # Anything else propagates — fail-fast, traceback to the log.
 
 

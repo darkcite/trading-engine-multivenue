@@ -820,6 +820,51 @@ new venues.
   free), bootout record on operator order, closure entries +
   m5-runbook note.
 
+- **2026-09-02 — V8 OUTAGE ROOT-CAUSED + FIXED + REVIVED (the
+  parity window RESTARTS; supersedes the "window open since Aug-30
+  08:55Z" reading).** What actually ran: xv-v2 traded ONE window,
+  2026-08-30 08:55Z → 16:05Z (~7 h 10 m). The interim audit
+  (2026-08-31 session, audit-pnl strategy-5 bucket): **net +$32.71
+  realized, 156 orders / 187 modeled fills, max_dd $247.88, both
+  legs flat at window end** (binance:btcusdt +$34.79 / 92 fills;
+  okx:BTC-USDT −$2.08 / 95 fills). Then FOUR consecutive boots
+  (Aug-30 16:05 / 20:15 / 21:15Z, Aug-31 00:00Z — and every boot
+  through Sep-2 08:30Z) left the VM INERT. **Root cause (worker
+  side, latent since #7b landed):** `claude_worker.recommit.
+  wait_for_sock` tests `sock_path.exists()` only — the STALE
+  ai.sock inode from the PREVIOUS boot satisfies it instantly,
+  `connect()` then gets `[Errno 61] Connection refused` (the new
+  engine hasn't bound yet) and main ABORTED with no retry; the
+  `--wait-sock-seconds 180` budget never engaged. Latent before
+  Aug-30 because earlier boots refused EARLIER (retired H6 demo
+  bound-paths) — the first real recommit attempt was the first
+  crash. **Fix (this session):** `main` now RETRIES transport
+  failures against the same budget (2 s cadence, one final attempt
+  at the deadline; gate/state refusals stay immediate — only
+  transport is a race); pins
+  `test_stale_socket_retries_until_engine_binds` (the outage
+  red→green: stale inode + late-binding FakeUdsServer → EXIT_OK,
+  ≥3 frames) and `test_stale_socket_exhausts_budget_as_transport`.
+  Also: seed-push.sh's serialization skip became a bounded WAIT
+  (5 min, 30 s poll — two boots had lost their seed push to
+  transient collisions). Worker suite **600 green** (interim
+  sessions grew it; +2 here). **REVIVE executed ~13:05Z:** the
+  fixed recommit re-staged (seq 18618) + re-committed (seq 18619)
+  `bfbc5349…`; engine staged 1 / committed 1 / rejected 0,
+  **vm_rows_active 1 / epoch 1**; seeds re-pushed (1,625 funding
+  frames; position lane honestly flat). **Parity window T0-2 =
+  2026-09-02 ~13:05Z. OPERATOR RULING (same session, MVP tempo):
+  the window duration is 2 HOURS, not ≥48 h — GREEN check ~15:05Z
+  today.** Caveat on record: 2 quiet hours can yield a VACUOUS
+  green (zero events both sides — the comparator reports it
+  honestly as cron-events=0); the operator rules bootout with that
+  in front of him. The 16:05Z T2 restart lands AFTER the window and
+  serves as the fixed recommit's first live boot proof
+  (non-gating). The Aug-30 7 h window stands as evidence, not as
+  window time. Ops note: a metrics scrape immediately after commit
+  can race the drain — staged/committed read 0 for ~a second before
+  flipping.
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized
@@ -880,9 +925,10 @@ in `.env` once xv-v2 is COMMITTED (funding-only seeding runs safely
 without it). Verify at next restart: `seeds: sent N frames` in the
 wrapper log; engine-side `funding_seeds_applied > 0`.
 
-**3. The ≥48 h parity window:** VM + crons run in parallel
-(nothing to start — the crons already run; the VM trades once
-committed). Daily, and at window end:
+**3. The parity window** (≥48 h as designed; **operator-ruled 2 HOURS
+on 2026-09-02, MVP tempo — see that §8 entry**): VM + crons run in
+parallel (nothing to start — the crons already run; the VM trades
+once committed). At window end (and daily if longer):
 
 ```sh
 cd ~/trading-engine-multivenue/claude-worker

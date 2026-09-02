@@ -43,10 +43,18 @@ if [ ! -S "$SOCK" ]; then
   exit 0
 fi
 
-if pgrep -f 'claude[-_]worke[r]' >/dev/null 2>&1; then
-  echo "seed-push: a worker invocation is live — skipping (worker serialization law)" >&2
-  exit 0
-fi
+# Worker serialization law — but WAIT rather than skip-once (VM2 V8
+# outage review 2026-09-02: two boots lost their seed push to a
+# transient collision). Up to 5 minutes, 30 s poll.
+j=0
+while pgrep -f 'claude[-_]worke[r]' >/dev/null 2>&1; do
+  if [ $j -ge 10 ]; then
+    echo "seed-push: a worker invocation stayed live 5 min — skipping (next boot retries)" >&2
+    exit 0
+  fi
+  sleep 30
+  j=$((j + 1))
+done
 
 cd claude-worker || exit 78
 if [ -n "$RULESET" ]; then

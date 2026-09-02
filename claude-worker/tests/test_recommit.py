@@ -13,6 +13,9 @@ Convention: full ``import x`` only.
 import hashlib
 import json
 import pathlib
+import shutil
+import socket
+import threading
 
 import pytest
 
@@ -157,3 +160,79 @@ def test_main_reports_transport_when_sock_never_appears(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     rc = claude_worker.recommit.main(["--wait-sock-seconds", "0"])
     assert rc == claude_worker.recommit.EXIT_TRANSPORT
+
+
+def _stale_sock(path: pathlib.Path) -> None:
+    """Leave a REFUSING socket inode at ``path`` — exactly what the
+    engine's previous boot leaves behind (bind, close, no unlink)."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(path))
+    s.close()  # inode stays; connect() now gets ECONNREFUSED
+
+
+def test_stale_socket_retries_until_engine_binds(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE 2026-08-30→09-01 outage pin: a stale inode satisfies the
+    existence wait instantly and the old code aborted on the first
+    refused connect — four boots, VM inert. main must now RETRY
+    within the budget and succeed once the (new) engine binds."""
+    sock_dir = tests.conftest.short_sock_dir()
+    sock = sock_dir / "ai.sock"
+    _stale_sock(sock)
+    for key, value in _cfg_env(tmp_path, sock).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    body = b'{"rows": []}'
+    ruleset, report, full_hash = _write_bound_pair(tmp_path, body)
+    _seed_committed(tmp_path / "state.db", ruleset, report, full_hash)
+
+    server_box: list[tests.conftest.FakeUdsServer] = []
+
+    def bind_late() -> None:
+        sock.unlink()  # the new engine replaces the stale inode
+        server = tests.conftest.FakeUdsServer(sock, tests.conftest.TEST_KEY)
+        server.start()
+        server_box.append(server)
+
+    timer = threading.Timer(1.5, bind_late)
+    timer.start()
+    try:
+        rc = claude_worker.recommit.main(["--wait-sock-seconds", "20"])
+    finally:
+        timer.join(timeout=10.0)
+        for server in server_box:
+            server.stop()
+        shutil.rmtree(sock_dir, ignore_errors=True)
+    assert rc == claude_worker.recommit.EXIT_OK
+    assert server_box, "the late listener must have started"
+    # heartbeat + stage + commit all landed on the late-bound engine.
+    assert len(server_box[0].frames) >= 3
+
+
+def test_stale_socket_exhausts_budget_as_transport(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No engine ever binds: the retry loop must exhaust the budget
+    (visibly retrying — never the old instant abort) and report
+    transport."""
+    sock_dir = tests.conftest.short_sock_dir()
+    sock = sock_dir / "ai.sock"
+    _stale_sock(sock)
+    for key, value in _cfg_env(tmp_path, sock).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    body = b'{"rows": []}'
+    ruleset, report, full_hash = _write_bound_pair(tmp_path, body)
+    _seed_committed(tmp_path / "state.db", ruleset, report, full_hash)
+    try:
+        rc = claude_worker.recommit.main(["--wait-sock-seconds", "3"])
+    finally:
+        shutil.rmtree(sock_dir, ignore_errors=True)
+    assert rc == claude_worker.recommit.EXIT_TRANSPORT
+    err = capsys.readouterr().err
+    assert "retrying" in err
+    assert "budget exhausted" in err
