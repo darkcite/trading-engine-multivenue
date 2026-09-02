@@ -1988,6 +1988,6 @@ mod tests {
         assert_eq!(vm.entries, 1, "paper law: sym-leg accept records");
         assert_eq!(vm.leg_drops, 1, "ref-leg refusal counted");
         let pos = vm.position(0).expect("entered");
-        assert_eq!(pos.qty_ref_1e6 > 0, true, "pair bookkeeping kept");
+        assert!(pos.qty_ref_1e6 > 0, "pair bookkeeping kept");
     }
 }

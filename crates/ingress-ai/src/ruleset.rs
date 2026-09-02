@@ -489,7 +489,7 @@ fn scan_descriptor(
             }
             return Ok(n);
         }
-        if c == b'\\' || c < 0x20 || c > 0x7E {
+        if c == b'\\' || !(0x20..=0x7E).contains(&c) {
             return Err(RulesetReject::Grammar);
         }
         if n >= DESCRIPTOR_CAP {

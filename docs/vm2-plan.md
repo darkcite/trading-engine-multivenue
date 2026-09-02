@@ -925,6 +925,28 @@ new venues.
   roots are the working shape (17 GB ≈ 8 GB RSS). Stay-green battery
   deferred to the V9 gates pass (engine + VM verified live instead).
 
+- **2026-09-02 ~15:45–16:30Z — V9 EXECUTED: FULL GATE BATTERY GREEN —
+  VM2 PLAN CLOSES.** nextest **1420** effective green (1419 passed +
+  1 skipped fixture-regen on the full run; two singleton reds across
+  runs — `ai_exec_on_ai_is_zero_alloc` debug-under-launchd and
+  `scrape_hammer_all_succeed_without_conn_errors` under load — EACH
+  green in isolation, the documented rerun-before-believing family;
+  the alloc truth-gate is release anyway). Release alloc gate
+  **39/39 0 B/op** (fresh `Compiling bench` verified,
+  `--test-threads=1`). Worker pytest **600 passed** (frozen 202
+  inside; baseline 553 superseded). `make lint` **GREEN** after two
+  one-line lint fixes landed this session (ingress-ai
+  `manual_range_contains` at ruleset.rs:492, strategy-vm bool-literal
+  `assert_eq!` at lib.rs:1991; both crates 133/133 after).
+  `make license-check` OK (233 files). Fuzz: V4's ≥300 s standing
+  runs remain the record — no new untrusted-bytes parser landed
+  since. **NEW STAY-GREENS: 1420 / 39 / 600.** Battery ops note:
+  launchd-submitted batteries need `PATH=$HOME/.cargo/bin:…` and the
+  `set -a` .env export; two debug-context test flakes above are
+  load/environment artifacts, not regressions. VM2 state at close:
+  engine-only, xv live on the VM (`bfbc5349…`), carry dark
+  (operator-ruled), crons deleted, V0–V9 all closed.
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized
