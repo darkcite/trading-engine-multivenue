@@ -29,7 +29,6 @@ the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
 | `vm2-plan.md` | ruleset-VM v2 plan V0–V9 (§8 log, §9 parity runbook) | V0–V9 all closed 2026-09-02; engine-only after the operator-ordered bootout; stay-greens 1420/39/600 |
 | `m5-runbook-notes.md` | M5 runbook (external strategies, carry/xv crons, session notes) | M5 closed with the 2026-09-02 bootout (crons decommissioned; xv lives on the VM) |
 | `binance-stocks-plan.md` | BST bStocks/TradFi-perps/PM-equity-dailies plan | landed 2026-08-29 (§8); PM ≤6-token cap finding standing |
-| `cvfc-backtest-2026-08-31.md`, `cvfc1-saved-capture-backtest-2026-08-31.md` | CVFC research backtest records | family ruled dark at the 2026-09-02 bootout; first tracked here |
 | `license-audit-2026-08-27.md` | Apache-2.0 audit + application record | archived 2026-09-02 (operator order); **REMAINS the authority for CLAUDE.md's Licensing rules + the Makefile gates** |
 | `research-tools-exclusion-plan.md` | research one-shots exclusion policy | archived 2026-09-02 (operator order); **REMAINS the owning authority doc for the `tools_` class** (Makefile naming-rule owner) |
 | `architecture.md` + `architecture.svg` | one-page architecture orientation | archived 2026-09-02 (operator order); last actualized 2026-08-29 |

@@ -113,6 +113,13 @@ license-check:
 		{ echo "  drift: claude-worker/NOTICE != NOTICE  (run: make sync-license)"; fail=1; }; \
 	grep -q '^license' fuzz/Cargo.toml || \
 		{ echo "  fuzz/Cargo.toml has no license key (workspace-excluded — it cannot inherit)"; fail=1; }; \
+	if git ls-files 'docs/research/**' | grep -q .; then \
+		echo "  tracked file(s) under docs/research/ — research material NEVER enters git"; \
+		echo "    (operator law 2026-09-02; the tree is gitignored — a forced add is the"; \
+		echo "     only way one lands, and it must fail loudly here)"; \
+		git ls-files 'docs/research/**' | sed 's/^/    /'; \
+		fail=1; \
+	fi; \
 	if git ls-files --error-unmatch 'claude-worker/tools_*.py' >/dev/null 2>&1; then \
 		echo "  tracked research one-shot(s) — must stay git-excluded:"; \
 		git ls-files 'claude-worker/tools_*.py' | sed 's/^/    /'; \

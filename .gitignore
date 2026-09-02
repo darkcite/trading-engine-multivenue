@@ -80,19 +80,27 @@ Thumbs.db
 # copyright or license statement of its own; references source documents
 # that are not in this repo. Nothing from it may enter git history until
 # ownership/relicensing is confirmed and recorded in NOTICE.
-# See docs/license-audit-2026-08-27.md G8.
+# See docs/arch/license-audit-2026-08-27.md G8.
 EXTERNAL STRATEGIES TO ONBOARD/
+
+# --- research findings, strategy docs, P&L/backtest reports (operator law
+# 2026-09-02: researched data, strategies and docs about them NEVER enter
+# git — no exceptions, no `git add -f`; `make license-check` refuses any
+# tracked file under this tree). Engine-generated research output lives
+# here; third-party material stays in the external vault above.
+docs/research/
 
 # --- research one-shots (repo-side, never packaged) ---
 # Hand-run authoring/mining scripts that record ONE research moment: not
 # worker modules, not verbs, never imported by the package, no tests. They
 # live here for the venv and the `import claude_worker.*` seam only. Their
-# findings belong in docs/; their outputs are the sha256-named artifacts in
+# findings belong in docs/research/ (git-excluded, below — operator law
+# 2026-09-02); their outputs are the sha256-named artifacts in
 # ~/multivenue/artifacts/rulesets, which are the reproducible record.
 # `tools_` is a RESERVED PREFIX inside claude-worker/: promotion out of this
 # class is a MOVE INTO src/claude_worker/ — never an un-ignore. This is
 # hygiene, NOT a provenance rule: these files are the operator's own
-# Apache-2.0 work. See docs/research-tools-exclusion-plan.md.
+# Apache-2.0 work. See docs/arch/research-tools-exclusion-plan.md.
 claude-worker/tools_*.py
 claude-worker/tools_*.sh
 # NOTE: THIRD-PARTY-NOTICES.md is deliberately NOT ignored. It is generated
