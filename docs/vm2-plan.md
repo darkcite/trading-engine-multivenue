@@ -865,6 +865,39 @@ new venues.
   can race the drain — staged/committed read 0 for ~a second before
   flipping.
 
+- **2026-09-02 ~13:10–13:35Z — DISK-FULL EMERGENCY (found while
+  building the operator's all-strategies P&L report) + RECOVERY +
+  the recommit fix's LIVE PROOF.** The Data volume hit 100 %
+  (418/460 GB; ~360 GB non-project data; logs 49 GB at ~5-8 GB/day)
+  — **all six venue capture lanes + the orders log took ENOSPC and
+  the writers WEDGED** (bn-ticks frozen ~13:48 local; writers do
+  not retry after ENOSPC — engine restart is the recovery, recorded
+  ops fact). Operator approved: (1) scratch/cache cleanup (~4 GB:
+  fuzz/target, uv cache, cargo debug profile), (2) retention
+  PROTECT_DAYS 7 → 5 via `~/multivenue/retention.conf` (the conf,
+  not the script — the designed knob) + one manual retention pass
+  (Aug-26/27 runs archived-compressed; 11 GB free after), (3)
+  engine restart. **Restart 13:33:19Z (run-1788356599313696000
+  ≈13:33) = the stale-sock fix's FIRST REAL BOOT: recommit.log
+  shows the exact designed sequence — two "Connection refused —
+  engine not bound yet, retrying" lines then re-staged seq=20247 +
+  re-committed seq=20248 — vm_rows_active 1 / epoch 1 with ZERO
+  manual help; seed-push sent 1,625 frames; capture_io_errors 0
+  all lanes.** The outage class is dead. **Parity window T0-3 =
+  2026-09-02 13:33Z; the operator's 2-hour ruling ⇒ GREEN check
+  ~15:33Z.** The 13:05Z revive window (T0-2) was voided by the
+  capture wedge inside it. Report deliverables (untracked, in
+  `pnl-reports/` + `vm2-window1-report.md`): all-strategies
+  totals/per-day/trades — s0 modeled −$1,408.59 net (5,009 fills;
+  3.71M of 3.72M intents caps-rejected by the model), s4 −$15,471.25
+  WITH the run-boundary caveat (per-run modeling splits 96 h cron
+  positions into naked legs; the honest chained whole-root
+  audit-pnl OOMs at this scale — recorded fix-shape: streaming
+  mode), s5 −$152.30 (the one 7 h window; strict-cross taker-floor
+  caveat). Ops findings also recorded: the 00:20Z nightly pnl
+  timer has been DEAD since Aug-23 (one report ever) — needs its
+  own lane revival; pre-Aug-26 P&L unrecoverable (retention).
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized
