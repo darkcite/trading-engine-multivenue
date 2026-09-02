@@ -24,8 +24,14 @@ the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
 | `remediation-run-phase.md` | remediation run-phase prompt (was `docs/prompts/`) | folded into WS13; superseded |
 | `venue-instrument-support-gaps.md` | venue/instrument gap audit | §1 folded into stage2-finish-plan WS2–WS12 (coded 2026-08-29); §2+ = Stage-3+ material |
 | `ws10-engine-plumbing-design.md` | WS10 funding/L2 lanes design | WS10 coded+gated+live-proven 2026-08-29 |
+| `stage2-finish-plan.md` | Stage-2 finish authority (WS0–WS13, single numbering; WS13 gates+live entries) | Stage 2 finished 2026-08-29; archived at MVP close 2026-09-02 |
+| `mvp-completion-plan.md` | M-phase plan M0–M6 | **MVP COMPLETE — M6 closed by operator ruling 2026-09-02** (close entry last in `mvp-progress.md`). **§7 (Stage-3 ENTRY GATE) and §9 (data-pipeline law) remain FORWARD-BINDING from here** |
+| `vm2-plan.md` | ruleset-VM v2 plan V0–V9 (§8 log, §9 parity runbook) | V0–V9 all closed 2026-09-02; engine-only after the operator-ordered bootout; stay-greens 1420/39/600 |
+| `m5-runbook-notes.md` | M5 runbook (external strategies, carry/xv crons, session notes) | M5 closed with the 2026-09-02 bootout (crons decommissioned; xv lives on the VM) |
+| `binance-stocks-plan.md` | BST bStocks/TradFi-perps/PM-equity-dailies plan | landed 2026-08-29 (§8); PM ≤6-token cap finding standing |
+| `cvfc-backtest-2026-08-31.md`, `cvfc1-saved-capture-backtest-2026-08-31.md` | CVFC research backtest records | family ruled dark at the 2026-09-02 bootout; first tracked here |
 
-Note: this archive grew in waves (2026-08-16, 2026-08-29). In-tree doc
+Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02). In-tree doc
 comments and older docs cite pre-move paths (`docs/phase-8-plan.md`,
 `docs/phase-8h-*`, `docs/prompts/8h-kickoff.md`,
 `docs/capture-remediation-plan-2026-08-28.md`, …) — those are historical

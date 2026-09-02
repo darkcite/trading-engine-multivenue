@@ -541,3 +541,21 @@ paths only. SESSION FACTS: metrics 127.0.0.1:9191; SIGTERM = clean
 drain (M1d-proven); universe.toml PM dailies expire 16:00Z — your
 restart automation is the standing fix; audit-replay integrity-zero
 is the health tell; `sample <pid>` for hangs.
+
+---
+
+## M6 — CLOSED by operator ruling, 2026-09-02
+
+The operator ruled M6 **done** at the VM2-close boundary (the same
+blessing pattern as C6 and the soak amendments: the 7-day calendar
+requirement waived on the accumulated evidence — the launchd fleet ran
+unattended since M3 with T2 restarts + retention + hourly candles/iv;
+WS13's 1-hour blessed soak; the Aug-29→Sep-2 VM2 live windows; the
+Sep-2 disk-full recovery proving the revive levers; gate batteries
+green at every boundary, last = VM2 V9's 1420/39/600). Shadow-P&L
+delivered as the operator's all-strategies report (2026-09-02;
+per-run model + aggregation — the whole-root OOM + the dead 00:20Z
+nightly timer are recorded ops debts, not gates). **MVP COMPLETE.
+The M-phase plan (M0–M6) is closed end to end; the only gate left is
+the Stage-3 ENTRY GATE (mvp-completion-plan §7, archived beside this
+log — §7 and §9 remain FORWARD-BINDING from the archive).**
