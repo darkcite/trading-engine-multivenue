@@ -102,6 +102,30 @@ export PATH="$PWD/target/release:$PATH"    # or symlink into ~/bin
 Without the release binary on PATH the real-harness pytest module
 auto-skips (green, with a skip reason naming this runbook).
 
+## Venue latency calibration (per deployment, per location — mandatory)
+
+The harness's activation-Δ table (`crates/cli/src/backtest.rs`,
+`ModelParams::default()`) is a **measurement of this host on this
+network**, not a constant. On a new box, a new region, a new ISP or
+behind a VPN, re-measure before trusting any backtest or audit-pnl
+number:
+
+```sh
+cd claude-worker
+uv run python -m claude_worker.latency_probe \
+    --out ~/multivenue/research/latency-$(date -u +%F) --minutes 25
+```
+
+The module prints a per-venue table (TCP / TLS / kept-alive request RTT
+to the REST edge, venue-clock offset, feed delay per stream) and writes
+`summary.json` + per-message NDJSON. Derive `Δ_venue = feed delay p50 +
+request RTT p50 / 2`, update the defaults, and record the run in
+`docs/venue-latency.md`. Full procedure and rationale live there.
+
+macOS note: the host clock is typically 50–70 ms off NTP (`sntp
+time.apple.com`); the probe corrects feed delays with each venue's own
+time endpoint, so never compare raw venue timestamps to `time.time()`.
+
 ## claude-worker (Phase 8f: serve daemon + operator verbs)
 
 Python 3.14 via uv (`cd claude-worker && uv sync`). Two modes over one

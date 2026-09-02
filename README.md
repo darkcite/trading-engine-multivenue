@@ -98,6 +98,29 @@ symbols through the manifest, never a bare `SymbolId` across runs.
 `backtest`'s argv and schema-1 JSON are a **frozen contract** with
 `claude-worker`. The harness conforms to the worker, never vice versa.
 
+## Venue latency calibration — REQUIRED per deployment and per location
+
+The backtest / audit-pnl fill model activates an order `Δ_venue` after
+emit and matches it against ticks in **local receive time**, so
+`Δ_venue = feed one-way + order one-way` **as seen from the host and
+network the engine runs on**. Those are location facts, not constants:
+moving the engine (a new box, a new region, a new ISP, a VPN) changes
+every number in the table and silently mis-prices every P&L the harness
+reports. The defaults in `crates/cli/src/backtest.rs` (`ModelParams`)
+are the values measured for the current deployment and carry their
+measurement date + location in the doc comment.
+
+```sh
+cd claude-worker && uv run python -m claude_worker.latency_probe --out ~/multivenue/research/latency-<date> --minutes 25
+```
+
+Run it on the deployment host **before the first backtest there and
+after every move**, then update `ModelParams::default()` and the table
+in [docs/venue-latency.md](./docs/venue-latency.md) (procedure,
+derivation, and the current measurement). The probe is stdlib-only,
+touches no engine path, and leaves per-message NDJSON so lead-lag can be
+re-derived in venue time.
+
 ## claude-worker (offline researcher)
 
 Python 3.14 package under [`claude-worker/`](./claude-worker). One `serve`
@@ -169,6 +192,7 @@ by env vars + CLI flags + `universe.toml`.
 9. **No cloud services at any phase.** Plain VMs only.
 10. **No observability stack.** TUI + log files + loopback `/metrics` only.
 11. **No git operations without the operator's explicit ask.** No push, rebase, history rewrite or new branches.
+12. **Venue latency is measured, never assumed.** Every deployment and every location re-runs `claude_worker.latency_probe` and re-derives the harness Δ table ([docs/venue-latency.md](./docs/venue-latency.md)).
 
 See [CLAUDE.md](./CLAUDE.md) for the complete list plus the "stop if you're
 about to do this" pitfalls.
