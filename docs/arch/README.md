@@ -30,6 +30,10 @@ the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
 | `m5-runbook-notes.md` | M5 runbook (external strategies, carry/xv crons, session notes) | M5 closed with the 2026-09-02 bootout (crons decommissioned; xv lives on the VM) |
 | `binance-stocks-plan.md` | BST bStocks/TradFi-perps/PM-equity-dailies plan | landed 2026-08-29 (§8); PM ≤6-token cap finding standing |
 | `cvfc-backtest-2026-08-31.md`, `cvfc1-saved-capture-backtest-2026-08-31.md` | CVFC research backtest records | family ruled dark at the 2026-09-02 bootout; first tracked here |
+| `license-audit-2026-08-27.md` | Apache-2.0 audit + application record | archived 2026-09-02 (operator order); **REMAINS the authority for CLAUDE.md's Licensing rules + the Makefile gates** |
+| `research-tools-exclusion-plan.md` | research one-shots exclusion policy | archived 2026-09-02 (operator order); **REMAINS the owning authority doc for the `tools_` class** (Makefile naming-rule owner) |
+| `architecture.md` + `architecture.svg` | one-page architecture orientation | archived 2026-09-02 (operator order); last actualized 2026-08-29 |
+| `options-support-plan.md` | Phase 9+ options-execution candidate | archived 2026-09-02 (operator order); P&L-gated, never scheduled |
 
 Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02). In-tree doc
 comments and older docs cite pre-move paths (`docs/phase-8-plan.md`,

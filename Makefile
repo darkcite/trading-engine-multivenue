@@ -84,7 +84,7 @@ py-test:
 py-lint:
 	cd claude-worker && uv run ruff check
 
-# ---- licensing (docs/license-audit-2026-08-27.md) ----
+# ---- licensing (docs/arch/license-audit-2026-08-27.md — archived, still the authority) ----
 
 license-check:
 	# Offline, no toolchain, ~1 s. Every tracked .rs/.py/.sh must carry the
@@ -97,9 +97,10 @@ license-check:
 	# does NAMING excluded material anywhere but its owning authority doc —
 	# a reference outliving the file is how a permanent doc comes to point
 	# at nothing. Owners: research one-shots ->
-	# docs/research-tools-exclusion-plan.md; external corpus ->
-	# docs/license-audit-2026-08-27.md G8. docs/arch is closed history and
-	# exempt; this Makefile is exempt because it holds the patterns.
+	# docs/arch/research-tools-exclusion-plan.md; external corpus ->
+	# docs/arch/license-audit-2026-08-27.md G8. Both live in docs/arch
+	# (archived 2026-09-02, operator order) which is exempt wholesale as
+	# closed history; this Makefile is exempt because it holds the patterns.
 	@fail=0; n=0; \
 	for f in $$(git ls-files '*.rs' '*.py' '*.sh'); do \
 		n=$$((n+1)); \
@@ -115,18 +116,16 @@ license-check:
 	if git ls-files --error-unmatch 'claude-worker/tools_*.py' >/dev/null 2>&1; then \
 		echo "  tracked research one-shot(s) — must stay git-excluded:"; \
 		git ls-files 'claude-worker/tools_*.py' | sed 's/^/    /'; \
-		echo "    (docs/research-tools-exclusion-plan.md; promote into src/claude_worker/ instead)"; \
+		echo "    (docs/arch/research-tools-exclusion-plan.md; promote into src/claude_worker/ instead)"; \
 		fail=1; \
 	fi; \
 	refs=$$(git grep -nE 'tools_[a-z0-9_]*\.py|EXTERNAL STRATEGIES TO ONBOARD' -- \
-		':!:Makefile' ':!:.gitignore' ':!:docs/arch' \
-		':!:docs/research-tools-exclusion-plan.md' \
-		':!:docs/license-audit-2026-08-27.md'); \
+		':!:Makefile' ':!:.gitignore' ':!:docs/arch'); \
 	if [ -n "$$refs" ]; then \
 		echo "  git-excluded material named outside its owning authority doc:"; \
 		echo "$$refs" | sed 's/^/    /'; \
-		echo "    owners: research one-shots -> docs/research-tools-exclusion-plan.md;"; \
-		echo "            external corpus     -> docs/license-audit-2026-08-27.md (G8)"; \
+		echo "    owners: research one-shots -> docs/arch/research-tools-exclusion-plan.md;"; \
+		echo "            external corpus     -> docs/arch/license-audit-2026-08-27.md (G8)"; \
 		echo "    Point at the owner doc instead of naming the file or tree."; \
 		fail=1; \
 	fi; \
