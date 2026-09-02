@@ -36,6 +36,18 @@ Files (epoch_ns = 1_755_216_000_000_000_000 in every header):
   padding — v2-only fields) filled with `0xAA`, modeling v1's undefined
   padding. No v1 writer exists anymore; this mirrors the crafted-v1
   pattern used by `core-io`'s own reader tests.
+- `ticks_v3.pmlr` — SlotKind::Tick, version 3 (VT1, 2026-09-03), 5
+  records exercising every `flags` / `venue_time_ms` combination: OKX
+  fresh (venue time 1_755_216_000_071, flags 0), OKX stale (flags 1),
+  Binance spot sentinel-inherited fresh (sym 7, flags 2), Binance spot
+  sentinel + stale (flags 3), and a v2-shape Polymarket tick (venue time
+  0, flags 0) — the "unknown, never stale" law inside a v3 file.
+
+Since VT1 the Rust writer stamps header version 3; `ticks_v2.pmlr` and
+`fills_v2.pmlr` are regenerated from the same writer with the header
+version patched back to 2 and were verified byte-identical to the
+2026-08-15 originals (every v3-only byte is zero for `Tick::new`; the
+other kinds are unchanged).
 
 Torn-tail cases are not checked in: tests create them by truncating
 copies of these files (tearing is a byte-level operation).

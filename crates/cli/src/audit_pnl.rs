@@ -68,8 +68,8 @@ use core_types::{
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
 use crate::backtest::fill::{FillEngine, ModelOutcome, DAY_NS};
 use crate::backtest::{
-    discover_runs, fmt_usd_1e6, parse_model_params, HarnessError, ModelParams, RunDir,
-    REQUIRED_PMLR_VERSION, VENUE_LABELS, VIRT_T0,
+    discover_runs, fmt_usd_1e6, parse_model_params, pmlr_version_accepted, HarnessError,
+    ModelParams, RunDir, MIN_PMLR_VERSION, VENUE_LABELS, VIRT_T0,
 };
 use crate::options_manifest::{INSTRUMENT_MANIFEST_FILE, OPTIONS_MANIFEST_FILE};
 
@@ -277,11 +277,13 @@ fn open_checked<R: core_types::AsBytes>(
             want
         )));
     }
-    if reader.version() != REQUIRED_PMLR_VERSION {
+    if !pmlr_version_accepted(reader.version()) {
         return Err(HarnessError::Capture(format!(
-            "{}: PMLR v{} — audit-pnl requires v2",
+            "{}: PMLR v{} — audit-pnl accepts v{}..=v{}",
             path.display(),
-            reader.version()
+            reader.version(),
+            MIN_PMLR_VERSION,
+            core_io::VERSION
         )));
     }
     if reader.epoch_ns() != epoch_ns {

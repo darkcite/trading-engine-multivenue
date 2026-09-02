@@ -3,9 +3,16 @@
 """Read-only PMLR replay-log reader (design §5.1 — the data_fetcher substrate).
 
 Container (docs/wire-format.md §"Replay log"): one 64-byte header — magic
-``b"PMLR"``, version u16 LE (current 2; this reader accepts <= 2), slot_kind
+``b"PMLR"``, version u16 LE (current 3; this reader accepts <= 3), slot_kind
 u8 at offset 6, epoch_ns u64 at offset 8 — then back-to-back 64-byte slots
 with no framing bytes.
+
+Version 3 (VT1, 2026-09-03, docs/venue-time-capture-plan.md): ``Tick``
+carries ``flags`` at offset 49 (bit0 stale, bit1 venue-time-from-sentinel)
+and ``venue_time_ms`` at offset 56. Both decode as 0 from v2 files (zeroed
+pad = "venue time unknown, never stale") and as garbage from v1 — gate on
+[`Reader.has_venue_time`] before trusting either. Venue time is data, not
+a clock: ``ts_ns`` stays the ordering key.
 
 The file is mapped read-only (``mmap.ACCESS_READ``) and decoded in place
 with ``struct.unpack_from`` straight off the map — no per-record byte-slice
@@ -32,10 +39,16 @@ import typing
 MAGIC: bytes = b"PMLR"
 HEADER_SIZE: int = 64
 SLOT_SIZE: int = 64
-VERSION_MAX: int = 2
+VERSION_MAX: int = 3
 # First version whose slots carry a valid venue byte / zeroed tail padding
 # (v1 predates both — those bytes are undefined garbage there).
 VENUE_BYTE_MIN_VERSION: int = 2
+# First version whose Tick slots carry `flags` + `venue_time_ms` (VT1).
+VENUE_TIME_MIN_VERSION: int = 3
+
+# `TickRec.flags` bits (core-types `TICK_FLAG_*`, wire-stable).
+TICK_FLAG_STALE: int = 1
+TICK_FLAG_VENUE_TIME_SENTINEL: int = 2
 
 # Slot kinds (docs/wire-format.md header table; wire-stable, never renumber).
 SLOT_KIND_TICK: int = 0
@@ -68,7 +81,8 @@ class PmlrError(Exception):
 
 class TickRec(typing.NamedTuple):
     """One `Tick` slot (wire-format.md). Prices/qtys fixed-point 1e6.
-    ``venue`` is garbage when the file is v1."""
+    ``venue`` is garbage when the file is v1; ``flags`` and
+    ``venue_time_ms`` (v3) are 0 in v2 files and garbage in v1."""
 
     ts_ns: int
     sym: int
@@ -78,6 +92,13 @@ class TickRec(typing.NamedTuple):
     ask_px: int
     ask_qty: int
     venue: int
+    flags: int
+    venue_time_ms: int
+
+    def is_stale(self) -> bool:
+        """``flags & TICK_FLAG_STALE`` — meaningful only when the file
+        ``has_venue_time`` (v3+)."""
+        return self.flags & TICK_FLAG_STALE != 0
 
     def mid(self) -> int:
         """Mid price, integer arithmetic, rounds toward zero (Rust twin:
@@ -135,7 +156,9 @@ class OrderRec(typing.NamedTuple):
 
 # magic 4s · version u16 · slot_kind u8 · pad x · epoch_ns u64  (16 of 64 B)
 _HEADER: struct.Struct = struct.Struct("<4sHBxQ")
-_TICK: struct.Struct = struct.Struct("<QIIqqqqB")
+# ts u64 · sym u32 · venue_seq u32 · 4×i64 · venue u8 · flags u8 (VT1) ·
+# pad 6 · venue_time_ms u64 (VT1) — the whole 64-B slot is field-covered.
+_TICK: struct.Struct = struct.Struct("<QIIqqqqBB6xQ")
 _FILL: struct.Struct = struct.Struct("<QIB3xqqQ")
 _AI_CMD: struct.Struct = struct.Struct("<QIIqqQBBBBHH")
 # VM2 V6: kind-3 Order (engine-orders.pmlr, M4.1) — ts u64 · sym u32 ·
@@ -144,7 +167,7 @@ _AI_CMD: struct.Struct = struct.Struct("<QIIqqQBBBBHH")
 _ORDER: struct.Struct = struct.Struct("<QIBB2xqqQBB")
 
 # Decoded-prefix lengths; the remainder of each 64-B slot is tail padding.
-_TICK_PREFIX_LEN: int = 49
+_TICK_PREFIX_LEN: int = 64
 _FILL_PREFIX_LEN: int = 40
 _AI_CMD_PREFIX_LEN: int = 48
 _ORDER_PREFIX_LEN: int = 42
@@ -208,6 +231,13 @@ class Reader:
 
     def __len__(self) -> int:
         return self._count
+
+    @property
+    def has_venue_time(self) -> bool:
+        """True when this file's Tick slots carry ``flags`` /
+        ``venue_time_ms`` (header version >= 3). A False file replays
+        under the v2 law: venue time unknown, never stale."""
+        return self.version >= VENUE_TIME_MIN_VERSION
 
     def _offset(self, index: int, want_kind: int, label: str) -> int:
         if self.slot_kind != want_kind:

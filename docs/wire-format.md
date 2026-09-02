@@ -35,19 +35,27 @@ log consumers and lane audits never decode `sym`. All padding in every
 slot is **explicit and zeroed** — this is the `AsBytes` contract; v1
 files predate it (see `docs/migration.md`).
 
-### `Tick` — 64 bytes
+### `Tick` — 64 bytes (v3 since VT1, 2026-09-03 — `docs/venue-time-capture-plan.md` §3)
 
-| offset | bytes | field      | type             | notes                                  |
-| -----: | ----: | ---------- | ---------------- | -------------------------------------- |
-|      0 |     8 | ts_ns      | `u64` NsTs       | monotonic ns from `core-time::now_ns`  |
-|      8 |     4 | sym        | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
-|     12 |     4 | venue_seq  | `u32`            | venue-provided sequence, monotonic     |
-|     16 |     8 | bid_px     | `i64` Price      | fixed-point ×1e6                       |
-|     24 |     8 | bid_qty    | `i64` Qty        | fixed-point ×1e6                       |
-|     32 |     8 | ask_px     | `i64` Price      | fixed-point ×1e6                       |
-|     40 |     8 | ask_qty    | `i64` Qty        | fixed-point ×1e6                       |
-|     48 |     1 | venue      | `u8` VenueId     | producing venue (v2+; garbage in v1)   |
-|     49 |    15 | _pad       | `[u8; 15]`       | explicit, zeroed                       |
+| offset | bytes | field         | type             | notes                                  |
+| -----: | ----: | ------------- | ---------------- | -------------------------------------- |
+|      0 |     8 | ts_ns         | `u64` NsTs       | monotonic ns from `core-time::now_ns` — the ordering key everywhere; venue time never re-times a record |
+|      8 |     4 | sym           | `u32` SymbolId   | venue-namespaced; `SYMBOL_ID_NONE = u32::MAX` invalid |
+|     12 |     4 | venue_seq     | `u32`            | venue-provided sequence, monotonic     |
+|     16 |     8 | bid_px        | `i64` Price      | fixed-point ×1e6                       |
+|     24 |     8 | bid_qty       | `i64` Qty        | fixed-point ×1e6                       |
+|     32 |     8 | ask_px        | `i64` Price      | fixed-point ×1e6                       |
+|     40 |     8 | ask_qty       | `i64` Qty        | fixed-point ×1e6                       |
+|     48 |     1 | venue         | `u8` VenueId     | producing venue (v2+; garbage in v1)   |
+|     49 |     1 | flags         | `u8`             | v3: bit0 `TICK_FLAG_STALE` (the ingress judged the quote stale against the venue's `stale_after_ms` — captured, but never a signal, a fill, or a mark), bit1 `TICK_FLAG_VENUE_TIME_SENTINEL` (venue time inherited from the connection's sentinel stream — Binance spot `aggTrade` — not this message). v2: zeroed pad; v1: garbage |
+|     50 |     6 | _pad          | `[u8; 6]`        | explicit, zeroed                       |
+|     56 |     8 | venue_time_ms | `u64`            | v3: venue timestamp ms (venue clock); 0 = unknown (VT2 lists the per-venue source field). v2: zeroed pad; v1: garbage |
+
+Constructors: `Tick::new` (venue time unknown, flags 0 — the v2 shape,
+used by tests/replay/synthetic ticks) and `Tick::new_stamped` (VT2
+ingress parsers). Readers gate every staleness judgement on the file's
+header version (`PmlrReader::has_venue_time`, `pmlr.Reader.has_venue_time`):
+a v2 file replays under the v2 law — never stale.
 
 ### `Signal` — 64 bytes
 
@@ -476,7 +484,7 @@ Header:
 | offset | bytes | field        | notes                                    |
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
-|      4 |     2 | version      | `u16` — current = **2**; readers accept ≤ 2 |
+|      4 |     2 | version      | `u16` — current = **3** (VT1); readers accept ≤ 3 |
 |      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
@@ -484,7 +492,10 @@ Header:
 
 Version history: v1 = Phase-1 layouts (no venue byte; tail padding
 implicit — those bytes are undefined in v1 files). v2 = Phase-8a
-layouts above. Migration notes: `docs/migration.md`.
+layouts above. v3 = VT1 (2026-09-03): `Tick.flags` at 49 and
+`Tick.venue_time_ms` at 56 spend the v2 tail pad; every other kind is
+byte-identical to v2 (the header version is one number for all kinds,
+so it bumps once). Migration notes: `docs/migration.md`.
 
 No framing bytes between slots. **Slot size is KIND-determined since
 WS10-B** (kinds 0–6: 64 B; kind 7: 192 B — always a 64-multiple);

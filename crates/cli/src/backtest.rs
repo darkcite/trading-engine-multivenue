@@ -75,10 +75,21 @@ pub const BACKTEST_VM_SLOTS: usize = strategy_vm::features::FEAT_SYM_SLOTS;
 /// exceed the 24 h max horizon by orders of magnitude).
 pub const VIRT_T0: u64 = 100_000_000_000_000_000;
 
-/// PMLR header version the merge requires: v1 tick slots carry an
-/// undefined venue byte, and the §3.2 total order keys on it.
-/// `pub(crate)`: `capture_catalog` mirrors the same acceptance law.
-pub(crate) const REQUIRED_PMLR_VERSION: u16 = 2;
+/// Oldest PMLR header version the merge accepts: v1 tick slots carry
+/// an undefined venue byte, and the §3.2 total order keys on it.
+/// Newest = `core_io::VERSION` (v3 since VT1 — `Tick.flags` /
+/// `venue_time_ms`; until VT4 lands its stale law the harness replays
+/// v3 ticks under the v2 law, i.e. never stale). `pub(crate)`:
+/// `audit_pnl` and `capture_catalog` share the same acceptance law
+/// through [`pmlr_version_accepted`].
+pub(crate) const MIN_PMLR_VERSION: u16 = 2;
+
+/// The one acceptance law for capture files across backtest, audit-pnl
+/// and capture-catalog: `MIN_PMLR_VERSION ..= core_io::VERSION`.
+#[inline]
+pub(crate) const fn pmlr_version_accepted(version: u16) -> bool {
+    version >= MIN_PMLR_VERSION && version <= core_io::VERSION
+}
 
 /// Per-venue tick-capture file labels, in file-ordinal order (mirrors
 /// `audit_replay::VENUE_LABELS` — the cli spawn labels exactly;
@@ -535,12 +546,14 @@ fn load_run(
                 reader.slot_kind()
             )));
         }
-        if reader.version() != REQUIRED_PMLR_VERSION {
+        if !pmlr_version_accepted(reader.version()) {
             return Err(HarnessError::Capture(format!(
                 "{}: PMLR v{} tick capture — the merge keys on the venue byte, which v1 \
-                 files leave undefined; backtest requires v2",
+                 files leave undefined; backtest accepts v{}..=v{}",
                 path.display(),
-                reader.version()
+                reader.version(),
+                MIN_PMLR_VERSION,
+                core_io::VERSION
             )));
         }
         if reader.epoch_ns() != run.epoch_ns {

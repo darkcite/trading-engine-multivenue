@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::Tick;
 
-use crate::backtest::{parse_run_dir_name, REQUIRED_PMLR_VERSION, VENUE_LABELS};
+use crate::backtest::{parse_run_dir_name, pmlr_version_accepted, VENUE_LABELS};
 
 /// ns per UTC day — the harness's §4.5 day divisor, verbatim.
 pub const NS_PER_DAY: u64 = 86_400_000_000_000;
@@ -391,11 +391,8 @@ fn inspect_run(
             Ok(reader) => {
                 if reader.slot_kind() != SlotKind::Tick {
                     stat.note = Some("slot-kind-not-tick".to_owned());
-                } else if reader.version() != REQUIRED_PMLR_VERSION {
-                    stat.note = Some(format!(
-                        "pmlr-v{}-not-v{REQUIRED_PMLR_VERSION}",
-                        reader.version()
-                    ));
+                } else if !pmlr_version_accepted(reader.version()) {
+                    stat.note = Some(format!("pmlr-v{}-unsupported", reader.version()));
                 } else if reader.epoch_ns() != entry.epoch_ns {
                     stat.note = Some("header-epoch-mismatch".to_owned());
                 } else {

@@ -56,7 +56,13 @@ pub const MAGIC: [u8; 4] = *b"PMLR";
 /// * v2 — Phase 8a: `Tick.venue` at offset 48, `Order.venue` at
 ///   offset 40, all padding explicit and zeroed. v1 files remain
 ///   readable but are venue-less; see `docs/migration.md`.
-pub const VERSION: u16 = 2;
+/// * v3 — VT1 (2026-09-03, docs/venue-time-capture-plan.md): `Tick`
+///   spends its tail pad on `flags` (offset 49: `TICK_FLAG_STALE`,
+///   `TICK_FLAG_VENUE_TIME_SENTINEL`) and `venue_time_ms` (offset 56).
+///   Every other kind is byte-identical to v2; the header version is
+///   ONE number for every kind, so it bumps once. v2 files read with
+///   both fields zero ("venue time unknown, never stale").
+pub const VERSION: u16 = 3;
 
 /// Default staging buffer size. 64 KiB == 1024 slots — amortises the
 /// `write_all` syscall rate over ~65k records at steady state.

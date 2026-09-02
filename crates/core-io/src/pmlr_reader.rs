@@ -255,10 +255,22 @@ impl<R: AsBytes> PmlrReader<R> {
     /// PMLR header version of the opened file. v1 files are readable
     /// but venue-less (`Tick.venue`/`Order.venue` bytes fall inside
     /// what v1 wrote as undefined implicit padding — consumers must
-    /// treat them as garbage when `version() == 1`).
+    /// treat them as garbage when `version() == 1`). `Tick.flags` and
+    /// `Tick.venue_time_ms` (VT1) are meaningful only when
+    /// `version() >= 3`; v2 wrote them as zeroed pad (= "unknown,
+    /// never stale"), v1 as garbage.
     #[inline]
     pub fn version(&self) -> u16 {
         self.version
+    }
+
+    /// True when this file's `Tick` slots carry venue time + flags
+    /// (VT1, header version ≥ 3). Consumers gate every staleness
+    /// judgement on it; a `false` file replays under the v2 law
+    /// ("never stale").
+    #[inline]
+    pub fn has_venue_time(&self) -> bool {
+        self.version >= 3
     }
 
     /// Wall-clock epoch (ns) written at file creation.
@@ -419,6 +431,90 @@ mod tests {
         assert_eq!(one.venue_seq, 43);
         assert!(r.get(2).is_none());
         drop(r);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reader_roundtrips_tick_v3_venue_time_and_flags() {
+        // VT1: the writer stamps header version 3 and the tail bytes
+        // carry `flags` / `venue_time_ms` through the mmap unchanged.
+        let p = unique_path("ticks_v3");
+        let _ = std::fs::remove_file(&p);
+        let mut w = PmlrWriter::open(&p, SlotKind::Tick, 7).unwrap();
+        let t = Tick::new_stamped(
+            1_000 as NsTs,
+            VenueId::Okx,
+            9,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(2),
+            Price::from_raw(3),
+            Qty::from_raw(4),
+            1_756_900_000_123,
+            core_types::TICK_FLAG_STALE,
+        );
+        w.append(&t).unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let r = PmlrReader::<Tick>::open(&p).unwrap();
+        assert_eq!(r.version(), 3);
+        assert!(r.has_venue_time());
+        let got = r.get(0).unwrap();
+        assert_eq!(got.venue_time_ms, 1_756_900_000_123);
+        assert_eq!(got.flags, core_types::TICK_FLAG_STALE);
+        assert!(got.is_stale());
+        drop(r);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reader_reads_v2_tick_file_with_venue_time_zero_and_never_stale() {
+        // A v2 file hand-assembled byte-for-byte: the 15 tail bytes of
+        // every slot are zeroed pad, so v3 readers see venue_time 0 /
+        // flags 0 — the "unknown, never stale" law — and
+        // `has_venue_time()` is false.
+        let p = unique_path("ticks_v2");
+        let _ = std::fs::remove_file(&p);
+        let mut out = vec![0u8; 64 + 64];
+        out[0..4].copy_from_slice(b"PMLR");
+        out[4..6].copy_from_slice(&2u16.to_le_bytes());
+        out[6] = SlotKind::Tick.to_u8();
+        out[8..16].copy_from_slice(&5u64.to_le_bytes());
+        let slot = &mut out[64..128];
+        slot[0..8].copy_from_slice(&1_000u64.to_le_bytes());
+        slot[8..12].copy_from_slice(&9u32.to_le_bytes());
+        slot[12..16].copy_from_slice(&1u32.to_le_bytes());
+        slot[16..24].copy_from_slice(&1i64.to_le_bytes());
+        slot[24..32].copy_from_slice(&2i64.to_le_bytes());
+        slot[32..40].copy_from_slice(&3i64.to_le_bytes());
+        slot[40..48].copy_from_slice(&4i64.to_le_bytes());
+        slot[48] = VenueId::Okx as u8;
+        std::fs::write(&p, &out).unwrap();
+        let r = PmlrReader::<Tick>::open(&p).unwrap();
+        assert_eq!(r.version(), 2);
+        assert!(!r.has_venue_time());
+        let got = r.get(0).unwrap();
+        assert_eq!(got.venue, VenueId::Okx as u8);
+        assert_eq!(got.ask_qty.raw(), 4);
+        assert_eq!(got.venue_time_ms, 0);
+        assert_eq!(got.flags, 0);
+        assert!(!got.is_stale());
+        drop(r);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reader_rejects_header_version_above_current() {
+        let p = unique_path("ticks_v4");
+        let _ = std::fs::remove_file(&p);
+        let mut out = vec![0u8; 64];
+        out[0..4].copy_from_slice(b"PMLR");
+        out[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        out[6] = SlotKind::Tick.to_u8();
+        std::fs::write(&p, &out).unwrap();
+        let err = PmlrReader::<Tick>::open(&p).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("unsupported"), "{err}");
         let _ = std::fs::remove_file(&p);
     }
 

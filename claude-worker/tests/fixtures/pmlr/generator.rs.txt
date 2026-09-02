@@ -1,10 +1,22 @@
-// One-shot golden-fixture generator for claude-worker pmlr.py (8f item 10).
-// Bytes come from the REAL core-io PmlrWriter so the Python reader is pinned
-// to the Rust writer. The v1 flavor is the v2 writer's bytes with the header
-// version patched to 1 and per-slot venue/tail-pad bytes filled with 0xAA —
-// modeling v1's undefined padding (no v1 writer exists anymore; this mirrors
-// the core-io reader-test pattern).
-use core_types::{make_symbol_id, Fill, Price, Qty, Side, Tick, VenueId};
+// One-shot golden-fixture generator for claude-worker pmlr.py (8f item 10;
+// VT1 2026-09-03 adds ticks_v3). Bytes come from the REAL core-io
+// PmlrWriter so the Python reader is pinned to the Rust writer.
+//
+// The writer stamps header version 3 since VT1. The v2 flavors are the
+// same slot bytes with the header version patched to 2 — byte-identical
+// to what the v2 writer produced, because every v3-only byte (Tick
+// offsets 49..64) is zero for `Tick::new` and every other kind is
+// unchanged. The v1 flavor additionally fills Tick bytes 48..64 with 0xAA
+// (v1's undefined padding; no v1 writer exists anymore — mirrors the
+// core-io reader-test pattern).
+use core_types::{
+    make_symbol_id, Fill, Price, Qty, Side, Tick, VenueId, TICK_FLAG_STALE,
+    TICK_FLAG_VENUE_TIME_SENTINEL,
+};
+
+fn patch_version(bytes: &mut [u8], version: u16) {
+    bytes[4..6].copy_from_slice(&version.to_le_bytes());
+}
 
 fn main() {
     let out = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: gen <outdir>"));
@@ -15,11 +27,10 @@ fn main() {
     let hl_yes = make_symbol_id(VenueId::Hyperliquid, 10_810);
     let hl_no = make_symbol_id(VenueId::Hyperliquid, 10_811);
 
-    // ---- ticks_v2.pmlr (SlotKind::Tick = 0) ----
+    // ---- ticks_v2.pmlr (SlotKind::Tick = 0): v3 writer, header patched to 2 ----
     {
-        let mut w =
-            core_io::PmlrWriter::open(out.join("ticks_v2.pmlr"), core_io::SlotKind::Tick, epoch_ns)
-                .unwrap();
+        let p = out.join("ticks_v2.pmlr");
+        let mut w = core_io::PmlrWriter::open(&p, core_io::SlotKind::Tick, epoch_ns).unwrap();
         let ticks = [
             Tick::new(1_000_000_000, VenueId::Polymarket, pm7, 1, Price(490_000), Qty(100_000_000), Price(510_000), Qty(50_000_000)),
             Tick::new(2_000_000_000, VenueId::Polymarket, pm7, 2, Price(500_000), Qty(90_000_000), Price(520_000), Qty(40_000_000)),
@@ -30,13 +41,39 @@ fn main() {
             w.append(&ticks[i]).unwrap();
         }
         w.flush().unwrap();
+        drop(w);
+        let mut bytes = std::fs::read(&p).unwrap();
+        patch_version(&mut bytes, 2);
+        std::fs::write(&p, &bytes).unwrap();
     }
 
-    // ---- fills_v2.pmlr (SlotKind::Fill = 2) ----
+    // ---- ticks_v3.pmlr (VT1): venue time + flags carried per slot ----
     {
         let mut w =
-            core_io::PmlrWriter::open(out.join("fills_v2.pmlr"), core_io::SlotKind::Fill, epoch_ns)
+            core_io::PmlrWriter::open(out.join("ticks_v3.pmlr"), core_io::SlotKind::Tick, epoch_ns)
                 .unwrap();
+        let ticks = [
+            // OKX: direct venue stamp, fresh.
+            Tick::new_stamped(1_000_000_000, VenueId::Okx, make_symbol_id(VenueId::Okx, 1), 1, Price(76_000_000_000), Qty(1_000_000), Price(76_000_100_000), Qty(2_000_000), 1_755_216_000_071, 0),
+            // OKX: direct venue stamp, STALE (feed lagged past the venue threshold).
+            Tick::new_stamped(2_000_000_000, VenueId::Okx, make_symbol_id(VenueId::Okx, 1), 2, Price(76_000_000_000), Qty(1_500_000), Price(76_000_100_000), Qty(2_000_000), 1_755_216_000_400, TICK_FLAG_STALE),
+            // Binance spot: stamp inherited from the aggTrade sentinel, fresh.
+            Tick::new_stamped(3_000_000_000, VenueId::Binance, 7, 3, Price(75_999_990_000), Qty(3_000_000), Price(76_000_000_000), Qty(100_000), 1_755_216_002_900, TICK_FLAG_VENUE_TIME_SENTINEL),
+            // Binance spot: sentinel-inherited AND stale (both bits).
+            Tick::new_stamped(4_000_000_000, VenueId::Binance, 7, 4, Price(75_999_990_000), Qty(3_100_000), Price(76_000_000_000), Qty(90_000), 1_755_216_002_950, TICK_FLAG_STALE | TICK_FLAG_VENUE_TIME_SENTINEL),
+            // Venue time unknown (v2 shape written by a v3 writer).
+            Tick::new(5_000_000_000, VenueId::Polymarket, pm7, 5, Price(490_000), Qty(100_000_000), Price(510_000), Qty(50_000_000)),
+        ];
+        for i in 0..ticks.len() {
+            w.append(&ticks[i]).unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    // ---- fills_v2.pmlr (SlotKind::Fill = 2): v3 writer, header patched to 2 ----
+    {
+        let p = out.join("fills_v2.pmlr");
+        let mut w = core_io::PmlrWriter::open(&p, core_io::SlotKind::Fill, epoch_ns).unwrap();
         let fills = [
             Fill::new(1_100_000_000, pm7, Side::Bid, Price(480_000), Qty(20_000_000), 101),
             Fill::new(1_200_000_000, pm7, Side::Bid, Price(500_000), Qty(10_000_000), 102),
@@ -48,12 +85,16 @@ fn main() {
             w.append(&fills[i]).unwrap();
         }
         w.flush().unwrap();
+        drop(w);
+        let mut bytes = std::fs::read(&p).unwrap();
+        patch_version(&mut bytes, 2);
+        std::fs::write(&p, &bytes).unwrap();
     }
 
-    // ---- ticks_v1.pmlr: v2 writer bytes, header version -> 1, v1-garbage bytes ----
+    // ---- ticks_v1.pmlr: v2 bytes, header version -> 1, v1-garbage bytes ----
     {
         let mut bytes = std::fs::read(out.join("ticks_v2.pmlr")).unwrap();
-        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        patch_version(&mut bytes, 1);
         let n = (bytes.len() - 64) / 64;
         for i in 0..n {
             let base = 64 + i * 64;

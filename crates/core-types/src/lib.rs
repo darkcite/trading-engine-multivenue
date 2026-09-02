@@ -231,12 +231,32 @@ pub enum MarketFamily {
 // Hot-path POD structs
 // ---------------------------------------------------------------
 
+/// `Tick::flags` bit 0 (VT1, Tick v3): the producing ingress judged this
+/// quote STALE — its venue time trails the connection's least-delayed
+/// message by more than the venue's `stale_after_ms`. A stale tick is
+/// still captured (it is what the engine saw) but MUST NOT feed a
+/// strategy signal, fill a modeled order, or move the last-known-good
+/// mark (docs/venue-time-capture-plan.md §2 doctrine 3).
+pub const TICK_FLAG_STALE: u8 = 1;
+/// `Tick::flags` bit 1 (VT1, Tick v3): `venue_time_ms` (and the
+/// staleness judgement) came from the connection's SENTINEL stream
+/// (Binance spot `aggTrade` — `bookTicker` carries no venue timestamp),
+/// not from this message itself. Research can separate the inferred
+/// case from the direct one.
+pub const TICK_FLAG_VENUE_TIME_SENTINEL: u8 = 2;
+
 /// Top-of-book tick snapshot. Produced by the Polymarket WS parser,
 /// pushed onto the tick ring, consumed by the engine.
 ///
 /// Layout is fixed-size (64 bytes) so it fills one cache line exactly —
 /// no false sharing between the ingress thread and the engine thread
 /// when they both touch adjacent slots in the ring.
+///
+/// Tick v3 (VT1, 2026-09-03) spends the v2 tail pad on `flags` (offset
+/// 49) and `venue_time_ms` (offset 56, naturally aligned `u64`). Both
+/// are zero in every v2 capture — "venue time unknown, never stale" —
+/// so v2 files keep replaying under the v2 law unchanged. Venue time
+/// is DATA, not a clock: `ts_ns` stays the ordering key everywhere.
 #[derive(Copy, Clone, Debug)]
 #[repr(C, align(64))]
 pub struct Tick {
@@ -258,13 +278,22 @@ pub struct Tick {
     /// venue byte inside `sym` by construction; carried explicitly so
     /// PMLR consumers and lane audits never need to decode `sym`.
     pub venue: u8,
-    /// Explicit tail padding — [`AsBytes`] requires every byte of the
-    /// 64 B slot to be initialized. Always zero.
-    _pad: [u8; 15],
+    /// [`TICK_FLAG_STALE`] | [`TICK_FLAG_VENUE_TIME_SENTINEL`]; 0 in
+    /// v2 captures.
+    pub flags: u8,
+    /// Explicit padding — [`AsBytes`] requires every byte of the 64 B
+    /// slot to be initialized. Always zero.
+    _pad: [u8; 6],
+    /// Venue timestamp of the quote in ms (venue clock); 0 = unknown
+    /// (v2 captures, and venues whose stream carries no stamp).
+    pub venue_time_ms: u64,
 }
 
 impl Tick {
-    /// Construct a Tick in one shot without named-field noise at call sites.
+    /// Construct a Tick whose venue time is UNKNOWN (`venue_time_ms = 0`,
+    /// `flags = 0` — the v2 shape). Ingress parsers that carry a venue
+    /// stamp use [`Tick::new_stamped`]; everything else (tests, replay
+    /// fixtures, synthetic ticks) uses this.
     #[inline(always)]
     pub const fn new(
         ts_ns: NsTs,
@@ -276,6 +305,28 @@ impl Tick {
         ask_px: Price,
         ask_qty: Qty,
     ) -> Self {
+        Self::new_stamped(ts_ns, venue, sym, venue_seq, bid_px, bid_qty, ask_px, ask_qty, 0, 0)
+    }
+
+    /// Construct a Tick v3 with its venue time and flags (VT1). The
+    /// ingress owns the staleness judgement: it sets
+    /// [`TICK_FLAG_STALE`] from its per-connection offset estimator and
+    /// [`TICK_FLAG_VENUE_TIME_SENTINEL`] when the stamp was inherited
+    /// from the connection's sentinel stream.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_stamped(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        venue_seq: u32,
+        bid_px: Price,
+        bid_qty: Qty,
+        ask_px: Price,
+        ask_qty: Qty,
+        venue_time_ms: u64,
+        flags: u8,
+    ) -> Self {
         Self {
             ts_ns,
             sym,
@@ -285,8 +336,18 @@ impl Tick {
             ask_px,
             ask_qty,
             venue: venue as u8,
-            _pad: [0; 15],
+            flags,
+            _pad: [0; 6],
+            venue_time_ms,
         }
+    }
+
+    /// True when the producing ingress flagged this quote stale
+    /// (`flags & TICK_FLAG_STALE`). Branch-free callers can use the
+    /// mask directly; this is the readable form for consumers.
+    #[inline(always)]
+    pub const fn is_stale(self) -> bool {
+        self.flags & TICK_FLAG_STALE != 0
     }
 
     /// Mid price (integer arithmetic; rounds toward zero).
@@ -2612,7 +2673,7 @@ mod tests {
     fn layout_is_fully_explicit() {
         // Sum of declared field widths must equal size_of — any
         // compiler-inserted padding would break the AsBytes contract.
-        // Tick: 8+4+4+8+8+8+8+1+15 = 64.
+        // Tick: 8+4+4+8+8+8+8+1+1+6+8 = 64 (VT1: +flags, +venue_time_ms).
         // Signal: 8+4+1+1+2+40+8 = 64.
         // Fill: 8+4+1+3+8+8+8+16+8 = 64.
         // Order: 8+4+1+1+2+8+8+8+1+1+14+8 = 64 (M4.1: +strategy_id).
@@ -2654,6 +2715,87 @@ mod tests {
         assert_eq!(&o.gamma_1e9 as *const _ as usize - base, 52);
         assert_eq!(&o.vega_1e6 as *const _ as usize - base, 56);
         assert_eq!(&o.theta_1e6 as *const _ as usize - base, 60);
+    }
+
+    #[test]
+    fn tick_v3_layout_offsets_are_the_wire_format_law() {
+        // docs/wire-format.md `Tick` v3: flags at 49, pad 50..56,
+        // venue_time_ms at 56 (naturally aligned u64), 64 B total.
+        let t = Tick::new_stamped(
+            1,
+            VenueId::Okx,
+            2,
+            3,
+            Price::from_raw(4),
+            Qty::from_raw(5),
+            Price::from_raw(6),
+            Qty::from_raw(7),
+            1_700_000_000_123,
+            TICK_FLAG_STALE | TICK_FLAG_VENUE_TIME_SENTINEL,
+        );
+        let base = &t as *const Tick as usize;
+        assert_eq!(&t.ts_ns as *const _ as usize - base, 0);
+        assert_eq!(&t.sym as *const _ as usize - base, 8);
+        assert_eq!(&t.venue_seq as *const _ as usize - base, 12);
+        assert_eq!(&t.bid_px as *const _ as usize - base, 16);
+        assert_eq!(&t.bid_qty as *const _ as usize - base, 24);
+        assert_eq!(&t.ask_px as *const _ as usize - base, 32);
+        assert_eq!(&t.ask_qty as *const _ as usize - base, 40);
+        assert_eq!(&t.venue as *const _ as usize - base, 48);
+        assert_eq!(&t.flags as *const _ as usize - base, 49);
+        assert_eq!(&t.venue_time_ms as *const _ as usize - base, 56);
+        assert_eq!(t.venue_time_ms, 1_700_000_000_123);
+        assert_eq!(t.flags, 3);
+        assert!(t.is_stale());
+        // The v2 bytes 50..56 stay zero so a v3 slot written by this
+        // constructor is byte-stable (AsBytes contract).
+        // SAFETY: Tick is AsBytes — repr(C, align(64)), 64 B, every byte
+        // initialized (the `layout_is_fully_explicit` law) — so viewing
+        // it as `[u8; 64]` is exactly what the PMLR writer does.
+        let bytes: [u8; 64] = unsafe { ::core::mem::transmute(t) };
+        assert_eq!(&bytes[50..56], &[0u8; 6]);
+        assert_eq!(&bytes[56..64], &1_700_000_000_123u64.to_le_bytes());
+        assert_eq!(bytes[49], 3);
+    }
+
+    #[test]
+    fn tick_new_is_the_v2_shape_venue_time_unknown_and_fresh() {
+        let t = Tick::new(
+            9,
+            VenueId::Binance,
+            7,
+            1,
+            Price::from_raw(100),
+            Qty::from_raw(1),
+            Price::from_raw(101),
+            Qty::from_raw(1),
+        );
+        assert_eq!(t.venue_time_ms, 0);
+        assert_eq!(t.flags, 0);
+        assert!(!t.is_stale());
+        // Tail bytes 49..64 all zero — identical to the v2 encoding.
+        // SAFETY: same AsBytes argument as
+        // `tick_v3_layout_offsets_are_the_wire_format_law`.
+        let bytes: [u8; 64] = unsafe { ::core::mem::transmute(t) };
+        assert_eq!(&bytes[49..64], &[0u8; 15]);
+    }
+
+    #[test]
+    fn tick_is_stale_reads_only_bit0() {
+        let t = Tick::new_stamped(
+            1,
+            VenueId::Bybit,
+            2,
+            3,
+            Price::from_raw(4),
+            Qty::from_raw(5),
+            Price::from_raw(6),
+            Qty::from_raw(7),
+            42,
+            TICK_FLAG_VENUE_TIME_SENTINEL,
+        );
+        assert!(!t.is_stale());
+        assert_eq!(t.flags & TICK_FLAG_VENUE_TIME_SENTINEL, TICK_FLAG_VENUE_TIME_SENTINEL);
     }
 
     #[test]

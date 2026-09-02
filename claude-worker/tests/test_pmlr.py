@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Anton (darkcite)
-"""pmlr.py against the Rust-writer golden fixtures (design §11: v1 + v2,
+"""pmlr.py against the Rust-writer golden fixtures (design §11: v1 + v2 + v3,
 torn-tail tolerance). Fixture provenance: tests/fixtures/pmlr/README.md.
 
 Convention: full ``import x`` only. No ``from x import y``.
@@ -66,6 +66,62 @@ def test_ticks_v2_iterator_matches_indexing() -> None:
         assert len(ticks) == 4
         assert ticks[0] == r.tick(0)
         assert ticks[3] == r.tick(3)
+
+
+def test_ticks_v2_venue_time_fields_decode_as_zero() -> None:
+    # v2 zeroed the tail pad: v3 readers see "unknown, never stale".
+    with claude_worker.pmlr.Reader(FIXTURES / "ticks_v2.pmlr") as r:
+        assert r.has_venue_time is False
+        for t in r.ticks():
+            assert t.flags == 0
+            assert t.venue_time_ms == 0
+            assert t.is_stale() is False
+
+
+# ---- golden v3 ticks (VT1: venue time + flags) ---------------------------
+
+
+def test_ticks_v3_header_and_venue_time_flags() -> None:
+    with claude_worker.pmlr.Reader(FIXTURES / "ticks_v3.pmlr") as r:
+        assert r.version == 3
+        assert r.has_venue_time is True
+        assert r.slot_kind == claude_worker.pmlr.SLOT_KIND_TICK
+        assert r.epoch_ns == EPOCH_NS
+        assert len(r) == 5
+        okx_fresh = r.tick(0)
+        assert okx_fresh.venue == 2  # OKX
+        assert okx_fresh.venue_time_ms == 1_755_216_000_071
+        assert okx_fresh.flags == 0
+        assert okx_fresh.is_stale() is False
+        assert okx_fresh.bid_px == 76_000_000_000
+        okx_stale = r.tick(1)
+        assert okx_stale.venue_time_ms == 1_755_216_000_400
+        assert okx_stale.flags == claude_worker.pmlr.TICK_FLAG_STALE
+        assert okx_stale.is_stale() is True
+        bn_sentinel = r.tick(2)
+        assert bn_sentinel.venue == 1  # Binance
+        assert bn_sentinel.sym == 7  # the M1 anchor id 7 (binance:btcusdt)
+        assert bn_sentinel.flags == claude_worker.pmlr.TICK_FLAG_VENUE_TIME_SENTINEL
+        assert bn_sentinel.is_stale() is False
+        assert bn_sentinel.venue_time_ms == 1_755_216_002_900
+        bn_both = r.tick(3)
+        assert bn_both.flags == (
+            claude_worker.pmlr.TICK_FLAG_STALE | claude_worker.pmlr.TICK_FLAG_VENUE_TIME_SENTINEL
+        )
+        assert bn_both.is_stale() is True
+        unknown = r.tick(4)
+        assert unknown.venue == 0  # Polymarket, v2-shape tick in a v3 file
+        assert unknown.venue_time_ms == 0
+        assert unknown.flags == 0
+        assert unknown.mid() == 500_000
+
+
+def test_ticks_v3_iterator_matches_indexing() -> None:
+    with claude_worker.pmlr.Reader(FIXTURES / "ticks_v3.pmlr") as r:
+        ticks = list(r.ticks())
+        assert len(ticks) == 5
+        assert ticks[1] == r.tick(1)
+        assert ticks[4] == r.tick(4)
 
 
 # ---- golden v2 fills -----------------------------------------------------
@@ -151,9 +207,10 @@ def test_truncated_header_rejected(tmp_path: pathlib.Path) -> None:
 
 
 def test_future_version_rejected(tmp_path: pathlib.Path) -> None:
-    p = tmp_path / "v3.pmlr"
-    p.write_bytes(_header(3, claude_worker.pmlr.SLOT_KIND_TICK))
-    with pytest.raises(claude_worker.pmlr.PmlrError, match="version 3"):
+    future = claude_worker.pmlr.VERSION_MAX + 1
+    p = tmp_path / f"v{future}.pmlr"
+    p.write_bytes(_header(future, claude_worker.pmlr.SLOT_KIND_TICK))
+    with pytest.raises(claude_worker.pmlr.PmlrError, match=f"version {future}"):
         claude_worker.pmlr.Reader(p)
 
 

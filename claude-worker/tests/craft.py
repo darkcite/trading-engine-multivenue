@@ -26,14 +26,16 @@ def write_ticks(
     venue: int = 0,
 ) -> None:
     """One v2 PMLR tick file with the given slot timestamps (the reader's
-    own struct formats — no second layout to drift)."""
+    own struct formats — no second layout to drift). The v3 fields
+    (flags, venue_time_ms) are packed as 0 — byte-identical to a v2
+    writer's zeroed tail pad."""
     header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
         claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, ts in enumerate(ts_list):
         slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
-            ts, sym, i + 1, 400_000, 1_000_000, 420_000, 1_000_000, venue
+            ts, sym, i + 1, 400_000, 1_000_000, 420_000, 1_000_000, venue, 0, 0
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +70,7 @@ def write_ticks_px(
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, (ts, sym, bid_px, ask_px, venue) in enumerate(rows):
         slot = claude_worker.pmlr._TICK.pack(  # noqa: SLF001
-            ts, sym, i + 1, bid_px, 1_000_000, ask_px, 1_000_000, venue
+            ts, sym, i + 1, bid_px, 1_000_000, ask_px, 1_000_000, venue, 0, 0
         )
         blob.extend(slot + bytes(_SLOT - len(slot)))
     path.parent.mkdir(parents=True, exist_ok=True)
