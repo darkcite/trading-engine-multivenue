@@ -898,6 +898,33 @@ new venues.
   timer has been DEAD since Aug-23 (one report ever) — needs its
   own lane revival; pre-Aug-26 P&L unrecoverable (retention).
 
+- **2026-09-02 ~14:20–15:20Z — OPERATOR-ORDERED BOOTOUT EXECUTED (V8
+  CLOSES).** Operator ruled: stop the parity run now, validate,
+  decommission the crons, keep everything engine-only. Parity
+  comparator on the truncated window (13:33Z boot → ~14:5xZ):
+  **GREEN** — 0 misses / 0 position disagreements (16 VM orders vs 0
+  cron events; cron-side quiet ⇒ semi-vacuous, caveat standing).
+  Positions verb + seed lane both flat (the COTI carry position had
+  closed) ⇒ bootout positionally clean. **com.multivenue.carry +
+  com.multivenue.xv booted out AND plists deleted.** The engine-only
+  continuation: xv lives on the VM (`bfbc5349…` active, rows 1).
+  **Carry is DARK by operator order:** the merged-table attempt
+  (retuned xv + cvfc-v2 + s1-v2) was built (`fe2f5aab…`, then
+  `b9883c1a…` after a Rule-7 leg-counted table-cap rejection at
+  $174,300 > $100k — carry legs rescaled 4950→2750) but its gate
+  run produced OOS 0-trades (bounded root's OOS tail = the outage
+  window; the healthy-root rerun was operator-killed as taking too
+  long) and the frozen §6 stage law (gates.all_passed required, NO
+  OVERRIDE) refuses a failing report — so no merged commit. Carry
+  revisit shape when wanted: healthy 3-day root (Aug-29→31 links
+  survive in logs/), b9883c1a as candidate. Ops learnings recorded:
+  worker-verb detached runs need launchd submit + `set -a` .env
+  export + release-dir PATH (the H6b wrapper pattern; `python -m
+  claude_worker.cli` is a silent no-op — no `__main__`); the
+  backtest harness OOMs (SIGKILL) on the ~44 GB full root — bounded
+  roots are the working shape (17 GB ≈ 8 GB RSS). Stay-green battery
+  deferred to the V9 gates pass (engine + VM verified live instead).
+
 ## §9 V8 parity runbook (prepared 2026-08-30; execute on the root-age ruling's schedule)
 
 Every step below runs on the Mac; worker invocations serialized
