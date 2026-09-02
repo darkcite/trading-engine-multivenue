@@ -1432,6 +1432,7 @@ fn run(args: RunArgs) -> ExitCode {
             instruments = deribit_symbols.len(),
             depth = boot.deribit_depth,
             dvol = dvol_indices.len(),
+            stale_after_ms = stale_after_ms[core_types::VenueId::Deribit as usize],
             "deribit: starting ingress thread"
         );
         let deribit_handle = match spawn_deribit(
@@ -1440,6 +1441,7 @@ fn run(args: RunArgs) -> ExitCode {
             deribit_symbols,
             boot.deribit_depth,
             dvol_indices,
+            stale_after_ms[core_types::VenueId::Deribit as usize],
             deribit_prod,
             deribit_event_prod,
             deribit_depth_prod,

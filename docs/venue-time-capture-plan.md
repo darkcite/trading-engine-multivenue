@@ -202,3 +202,12 @@ ruling); the Binance spot book-builder lane; any strategy work.
   garbage), proptest (`orderbook1_roundtrips` now generates ts/cts),
   run-loop fresh/stale/fresh + override/reconnect. `bybit_ws_frame` fuzz
   ≥ 300 s. Remaining: deribit, bn-usdm, hl, pm, bn-spot sentinel.
+- 2026-09-03 — **VT2 venue 3: Deribit.** `quote.*` `timestamp` (already
+  parsed as `DeribitQuoteFrame.ts_ms`, the `venue_seq` source) now rides
+  the slot in full via `Tick::new_stamped`; the driver's `FeedClock`
+  (600 ms default, `--stale-after-ms deribit:<ms>`, reset on reconnect)
+  judges every quote from the same `now_ns()`; stale quotes counted +
+  gauge published. Tests: venue_time on the existing quote test,
+  fresh/stale/fresh sequence, override + reconnect reset. Parser + fuzz
+  target unchanged; `deribit_jsonrpc_frame` re-run ≥ 300 s. Remaining:
+  bn-usdm, hl, pm, bn-spot sentinel.

@@ -1271,6 +1271,7 @@ pub fn spawn_deribit(
     symbols: ingress_deribit::DeribitSymbolTable,
     depth_enabled: bool,
     dvol_indices: Vec<String>,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
@@ -1308,6 +1309,8 @@ pub fn spawn_deribit(
             let dvol_refs: Vec<&[u8]> = dvol_indices.iter().map(|s| s.as_bytes()).collect();
             let mut driver =
                 dwl::Driver::new_with_dvol(now_ns(), symbols, depth_enabled, &dvol_refs);
+            // VT2: venue default or the operator's `--stale-after-ms deribit:<ms>`.
+            driver.set_stale_after_ms(stale_after_ms);
             let mut keepalive = Keepalive::new(DERIBIT_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
