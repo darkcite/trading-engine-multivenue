@@ -62,4 +62,6 @@ fi
 # invoked laws as the recommit line.
 ( sleep 45 && zsh "${0:A:h}/seed-push.sh" >> "$HOME/multivenue/logs/launchd/seed-push.log" 2>&1 & )
 
-exec ./target/release/multivenue-engine run --paper --strategy all
+# Operator ruling 2026-09-02: AI-pushed lanes only (ai-exec + vm,
+# mask 48) — Rust-coded strategies disabled at boot.
+exec ./target/release/multivenue-engine run --paper --strategy ai

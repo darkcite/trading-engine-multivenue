@@ -1858,7 +1858,7 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        (name @ ("all" | "ai-exec" | "vm"), _live) => {
+        (name @ ("all" | "ai" | "ai-exec" | "vm"), _live) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
             // latency-arb from the mandatory pair flags, ev/cross-arb/

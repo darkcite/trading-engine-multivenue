@@ -154,6 +154,10 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
         "rule-tree" => Some(BIT_RULE_TREE),
         "ai-exec" => Some(BIT_AI_EXEC),
         "vm" => Some(BIT_VM),
+        // AI-pushed lanes only (operator ruling 2026-09-02: Rust-coded
+        // strategies disabled at boot; the engine executes only what
+        // the AI command plane pushes — ai-exec intents + VM rulesets).
+        "ai" => Some(BIT_AI_EXEC | BIT_VM),
         "all" => Some(BUILT_MASK),
         _ => None,
     }
@@ -847,7 +851,14 @@ mod tests {
         assert_eq!(mask_for_name("rule-tree"), Some(BIT_RULE_TREE));
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
+        assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
+        // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
+        // (operator ruling 2026-09-02).
+        const _: () = assert!(
+            (BIT_AI_EXEC | BIT_VM) & BIT_LATENCY_ARB == 0,
+            "`ai` excludes latency-arb"
+        );
         // Const pins — checked at compile time (clippy: a runtime
         // `assert!` on consts folds away; this makes the pin official).
         const _: () = assert!(BUILT_MASK & BIT_AI_EXEC != 0, "`all` includes ai-exec");
