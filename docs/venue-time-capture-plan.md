@@ -191,3 +191,14 @@ ruling); the Binance spot book-builder lane; any strategy work.
   venues: bybit, deribit, bn-usdm, hl, pm, then the bn-spot `aggTrade`
   sentinel. Live smoke (`--raw-tap`, delays vs `latency_probe` ±10 ms
   p50) is the VT2 done-tell and needs the operator's relink + boot.
+- 2026-09-03 — **VT2 venue 2: Bybit.** `BybitBookFrame` gains
+  `venue_time_ms` (`"cts"` matching-engine time preferred, envelope
+  `"ts"` fallback, 0 when absent — a garbage stamp is "unknown", never
+  a parse failure; the `"ts":` scan cannot false-match inside `"cts":`).
+  One `FeedClock` per CONNECTION (the multi-conn lane builds one driver
+  per socket; `spawn_bybit` applies the threshold to each), judged on
+  EVERY push (one-sided deltas teach the offset too), stamped on the
+  emitted tick, reset on reconnect. Tests: parser (cts > ts > 0,
+  garbage), proptest (`orderbook1_roundtrips` now generates ts/cts),
+  run-loop fresh/stale/fresh + override/reconnect. `bybit_ws_frame` fuzz
+  ≥ 300 s. Remaining: deribit, bn-usdm, hl, pm, bn-spot sentinel.

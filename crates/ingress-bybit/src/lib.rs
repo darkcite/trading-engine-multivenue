@@ -207,8 +207,33 @@ pub struct BybitBookFrame {
     pub has_ask: u8,
     /// 1 on `"type":"snapshot"` (resets both sides first).
     pub is_snapshot: u8,
+    // Explicit padding.
+    _pad0: [u8; 5],
+    /// VT2: venue time of the push in ms — `"cts"` (matching-engine
+    /// time) when present, else the envelope `"ts"` (send time); 0
+    /// when the push carries neither ("unknown, never stale").
+    pub venue_time_ms: u64,
     // Explicit tail padding.
-    _pad: [u8; 21],
+    _pad: [u8; 8],
+}
+
+/// VT2: the `orderbook.1` venue stamp — `"cts":` (matching engine)
+/// preferred, `"ts":` (envelope send time) as the fallback, 0 when
+/// absent. Both are bare integers on the wire. `"ts":` cannot
+/// false-match inside `"cts":` (the byte before `t` is `c`, not `"`).
+#[inline]
+fn book_venue_time_ms(payload: &[u8]) -> u64 {
+    if let Some(pos) = find_field(payload, b"\"cts\":") {
+        if let Some((ms, _)) = scan_u64(payload, pos) {
+            return ms;
+        }
+    }
+    if let Some(pos) = find_field(payload, b"\"ts\":") {
+        if let Some((ms, _)) = scan_u64(payload, pos) {
+            return ms;
+        }
+    }
+    0
 }
 
 /// Parse one `orderbook.1` push. `None` on malformed input.
@@ -217,6 +242,7 @@ pub fn parse_orderbook1(payload: &[u8]) -> Option<BybitBookFrame> {
     let pos = find_field(payload, b"\"u\":")?;
     let (update_id, _) = scan_u64(payload, pos)?;
     let is_snapshot = u8::from(memchr::memmem::find(payload, b"\"type\":\"snapshot\"").is_some());
+    let venue_time_ms = book_venue_time_ms(payload);
 
     // A side: `"b":[["<px>","<qty>"]...]` — depth-1 subscribes only
     // ever carry 0 or 1 level; level[0] is the touch.
@@ -252,7 +278,9 @@ pub fn parse_orderbook1(payload: &[u8]) -> Option<BybitBookFrame> {
         has_bid,
         has_ask,
         is_snapshot,
-        _pad: [0; 21],
+        _pad0: [0; 5],
+        venue_time_ms,
+        _pad: [0; 8],
     })
 }
 
@@ -638,6 +666,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_orderbook1_venue_time_prefers_cts_then_ts_then_zero() {
+        // VT2: BOOK_SNAP carries ts 1687940967466 AND cts 1687940967464
+        // → the matching-engine time wins; the delta carries ts only.
+        assert_eq!(parse_orderbook1(BOOK_SNAP).unwrap().venue_time_ms, 1_687_940_967_464);
+        assert_eq!(
+            parse_orderbook1(BOOK_DELTA_BID_ONLY).unwrap().venue_time_ms,
+            1_687_940_967_470
+        );
+        let none = br#"{"topic":"orderbook.1.X","type":"delta","data":{"s":"X","b":[["1","1"]],"a":[],"u":2}}"#;
+        assert_eq!(parse_orderbook1(none).unwrap().venue_time_ms, 0);
+        // a garbage stamp is "unknown", never a parse failure
+        let bad = br#"{"topic":"orderbook.1.X","type":"delta","ts":"x","data":{"s":"X","b":[["1","1"]],"a":[],"u":2}}"#;
+        assert_eq!(parse_orderbook1(bad).unwrap().venue_time_ms, 0);
+    }
+
+    #[test]
     fn parse_orderbook1_zero_size_clears_a_side() {
         let z = br#"{"topic":"orderbook.1.X","type":"delta","data":{"s":"X","b":[["50005.12","0"]],"a":[],"u":2}}"#;
         let f = parse_orderbook1(z).unwrap();
@@ -765,13 +809,20 @@ mod proptests {
             bq in 1u32..999_999u32,
             ap in 1u32..999_999u32,
             aq in 1u32..999_999u32,
+            ts in 1u64..2_000_000_000_000u64,
+            cts in 1u64..2_000_000_000_000u64,
+            with_cts in any::<bool>(),
         ) {
             let mut buf = String::with_capacity(256);
             use std::fmt::Write;
             write!(
                 &mut buf,
-                r#"{{"topic":"orderbook.1.X","type":"snapshot","data":{{"s":"X","b":[["0.{bp:06}","0.{bq:06}"]],"a":[["0.{ap:06}","0.{aq:06}"]],"u":{u}}}}}"#,
+                r#"{{"topic":"orderbook.1.X","type":"snapshot","ts":{ts},"data":{{"s":"X","b":[["0.{bp:06}","0.{bq:06}"]],"a":[["0.{ap:06}","0.{aq:06}"]],"u":{u}}}"#,
             ).unwrap();
+            if with_cts {
+                write!(&mut buf, r#","cts":{cts}"#).unwrap();
+            }
+            buf.push('}');
             let f = parse_orderbook1(buf.as_bytes()).unwrap();
             prop_assert_eq!(f.update_id, u);
             prop_assert_eq!(f.bid_px_1e6, bp as i64);
@@ -779,6 +830,8 @@ mod proptests {
             prop_assert_eq!(f.ask_px_1e6, ap as i64);
             prop_assert_eq!(f.ask_qty_1e6, aq as i64);
             prop_assert_eq!((f.has_bid, f.has_ask, f.is_snapshot), (1, 1, 1));
+            // VT2: cts wins when present, ts otherwise
+            prop_assert_eq!(f.venue_time_ms, if with_cts { cts } else { ts });
         }
     }
 }

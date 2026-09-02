@@ -1542,12 +1542,14 @@ fn run(args: RunArgs) -> ExitCode {
             spot = boot.allocated.bybit_spot.len(),
             linear = boot.allocated.bybit_linear.len(),
             conns = specs.len(),
+            stale_after_ms = stale_after_ms[core_types::VenueId::Bybit as usize],
             "bybit: starting ingress thread"
         );
         let bybit_handle = match cli::spawn_bybit(
             cfg.bybit_ws_host.clone(),
             specs,
             tls_config.clone(),
+            stale_after_ms[core_types::VenueId::Bybit as usize],
             bybit_prod,
             bybit_event_prod,
             statuses.bybit.clone(),

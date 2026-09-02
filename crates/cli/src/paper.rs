@@ -758,6 +758,7 @@ pub fn spawn_bybit(
     host: String,
     specs: Vec<BybitConnSpec>,
     tls_config: RustlsConfig,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
@@ -811,11 +812,13 @@ pub fn spawn_bybit(
             };
             let mut conns: Vec<ywl::BybitConn<TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
-                let drv = ywl::Driver::new(
+                let mut drv = ywl::Driver::new(
                     now_ns().wrapping_add(i as u64),
                     spec.table,
                     spec.want_tickers,
                 );
+                // VT2: one estimator per CONNECTION, same threshold.
+                drv.set_stale_after_ms(stale_after_ms);
                 conns.push(ywl::BybitConn::new(
                     drv,
                     eps[i].host.as_bytes(),
