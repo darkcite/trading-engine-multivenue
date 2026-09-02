@@ -165,3 +165,29 @@ ruling); the Binance spot book-builder lane; any strategy work.
   time 0 (`reader_reads_v2_tick_file_with_venue_time_zero_and_never_stale`,
   `test_ticks_v2_venue_time_fields_decode_as_zero`). Stay-greens
   recorded in the commit message.
+- 2026-09-03 — **VT2 started: the shared estimator + OKX** (first
+  venue). `core_time::FeedClock` (per-connection: `off_ms = max(venue −
+  mono)` with the 1 ms/min decay, delay ≥ 0, `stale = delay >
+  threshold`, threshold 0 = measure only; saturating arithmetic so a
+  fuzzed stamp can never overflow; integer EMA gauge; unit tests for
+  every doctrine-2 property + an ingress-okx proptest over arbitrary
+  sequences). `VenueId::default_stale_after_ms` = the §2 doctrine-4
+  table (pm 1000, bn 1000 cap, okx 400, deribit 600, hl 700, bybit
+  500). `IngressStatus` gains `stale_ticks_total` + the
+  `feed_delay_ema_ms` gauge — the slot is now exactly 128 B with zero
+  slack (the gauge is a u16 in the diag triple's pad bytes; the next
+  counter must reuse a field or grow to 192). Metrics:
+  `engine_ingress_<venue>_stale_ticks_total`,
+  `engine_ingress_<venue>_feed_delay_ema_ms`. Engine flag
+  `--stale-after-ms <venue>:<ms>` (repeatable; harness venue labels;
+  `parse_stale_after_ms` + tests). **OKX**: `bbo-tbt` `ts` (already
+  parsed as `OkxBboFrame.ts_ns`) → `Tick::new_stamped(…, ts/1e6,
+  stale·TICK_FLAG_STALE)`, one `now_ns()` serves the tick and the
+  judgement, estimator reset on reconnect, `Driver::set_stale_after_ms`
+  (boot), run-loop tests (`bbo_ticks_carry_venue_time_and_the_stale_judgement`,
+  `stale_threshold_override_and_reconnect_reset_apply`); the OKX
+  parser and its fuzz target are unchanged (the stamp was already
+  extracted) — `okx_frame` re-run ≥ 300 s regardless. Remaining VT2
+  venues: bybit, deribit, bn-usdm, hl, pm, then the bn-spot `aggTrade`
+  sentinel. Live smoke (`--raw-tap`, delays vs `latency_probe` ±10 ms
+  p50) is the VT2 done-tell and needs the operator's relink + boot.

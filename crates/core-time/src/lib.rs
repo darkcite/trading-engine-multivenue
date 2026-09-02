@@ -102,12 +102,255 @@ pub const fn ns_since(earlier: NsTs, later: NsTs) -> u64 {
 }
 
 // ---------------------------------------------------------------
+// VT2: per-connection venue-clock offset + staleness judge.
+// ---------------------------------------------------------------
+
+/// Verdict of one [`FeedClock::judge`] call.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FeedJudgement {
+    /// How far this message trailed the connection's least-delayed
+    /// message, in ms (≥ 0; saturates at `u32::MAX`). 0 when the venue
+    /// time was unknown.
+    pub delay_ms: u32,
+    /// `delay_ms > stale_after_ms`. Always false for an unknown venue
+    /// time (the v2 law: unknown is never stale).
+    pub stale: bool,
+}
+
+/// Per-connection venue-time offset estimator + staleness judge
+/// (docs/venue-time-capture-plan.md §2 doctrine 2).
+///
+/// Age is measured against the venue's own fastest message, never the
+/// host wall clock: `off_ms = max over the window of (venue_ms −
+/// mono_ms)`; every message's delay is `off_ms − (venue_ms − mono_ms)
+/// ≥ 0`. `off_ms` decays by [`FeedClock::DECAY_MS_PER_MIN`] so a venue
+/// clock step re-learns (a 100 ms backward step clears in 100 min —
+/// the plan's accepted v1 bound). One estimator per CONNECTION: a
+/// reconnect calls [`FeedClock::reset`].
+///
+/// Cost per message: one subtraction, two compares, one max, one
+/// integer EMA step. No allocation, no syscall (the caller passes the
+/// `now_ns()` it already took for the tick's `ts_ns`). POD, `Copy`.
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+pub struct FeedClock {
+    /// `max(venue_ms − mono_ms)` seen since the last reset, minus the
+    /// decay; [`FeedClock::UNLEARNED`] until the first stamped message.
+    off_ms: i64,
+    /// Mono ms of the last decay step (aligned to whole minutes).
+    decay_at_ms: i64,
+    /// Staleness threshold (venue default or operator override).
+    stale_after_ms: i64,
+    /// Integer EMA of `delay_ms` ×16 (α = 1/16) — the cheap gauge the
+    /// metrics page exports as `feed_delay_ema_ms`.
+    delay_ema_x16: i64,
+}
+
+impl FeedClock {
+    /// `off_ms` sentinel before the first stamped message.
+    pub const UNLEARNED: i64 = i64::MIN;
+    /// Slow decay of the learned offset (doctrine 2).
+    pub const DECAY_MS_PER_MIN: i64 = 1;
+    const MS_PER_MIN: i64 = 60_000;
+    const EMA_SHIFT: u32 = 4;
+
+    /// Fresh, unlearned estimator with the given staleness threshold
+    /// (0 = measure only, never flag).
+    #[inline(always)]
+    pub const fn new(stale_after_ms: u32) -> Self {
+        Self {
+            off_ms: Self::UNLEARNED,
+            decay_at_ms: 0,
+            stale_after_ms: stale_after_ms as i64,
+            delay_ema_x16: 0,
+        }
+    }
+
+    /// Forget the learned offset (new connection = new offset). The
+    /// threshold and the delay EMA survive.
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        self.off_ms = Self::UNLEARNED;
+        self.decay_at_ms = 0;
+    }
+
+    /// True once a stamped message has set the offset.
+    #[inline(always)]
+    pub const fn learned(&self) -> bool {
+        self.off_ms != Self::UNLEARNED
+    }
+
+    /// The staleness threshold this estimator judges against.
+    #[inline(always)]
+    pub const fn stale_after_ms(&self) -> u32 {
+        self.stale_after_ms as u32
+    }
+
+    /// Smoothed delay in ms (EMA, α = 1/16).
+    #[inline(always)]
+    pub const fn delay_ema_ms(&self) -> u32 {
+        (self.delay_ema_x16 >> Self::EMA_SHIFT) as u32
+    }
+
+    /// Judge one message stamped `venue_time_ms` (0 = unknown) that the
+    /// ingress finished parsing at `mono_ns` (the tick's `ts_ns`).
+    #[inline(always)]
+    pub fn judge(&mut self, venue_time_ms: u64, mono_ns: NsTs) -> FeedJudgement {
+        if venue_time_ms == 0 {
+            return FeedJudgement {
+                delay_ms: 0,
+                stale: false,
+            };
+        }
+        let mono_ms = (mono_ns / 1_000_000) as i64;
+        // A garbage wire stamp above i64::MAX clamps instead of wrapping
+        // negative; every step below saturates so a fuzzed stamp can
+        // never overflow (no panics in release, none in debug either).
+        let venue_ms = if venue_time_ms > i64::MAX as u64 { i64::MAX } else { venue_time_ms as i64 };
+        let raw = venue_ms.saturating_sub(mono_ms);
+        if self.off_ms == Self::UNLEARNED {
+            self.off_ms = raw;
+            self.decay_at_ms = mono_ms;
+        } else {
+            let elapsed_min = mono_ms.saturating_sub(self.decay_at_ms) / Self::MS_PER_MIN;
+            // Branch taken once a minute; the decay is bounded by design.
+            if elapsed_min > 0 {
+                self.off_ms = self.off_ms.saturating_sub(elapsed_min * Self::DECAY_MS_PER_MIN);
+                self.decay_at_ms = self.decay_at_ms.saturating_add(elapsed_min * Self::MS_PER_MIN);
+            }
+            if raw > self.off_ms {
+                self.off_ms = raw;
+            }
+        }
+        let delay = self.off_ms.saturating_sub(raw);
+        debug_assert!(delay >= 0, "delay is max-relative and cannot be negative");
+        self.delay_ema_x16 = self
+            .delay_ema_x16
+            .saturating_add(delay - (self.delay_ema_x16 >> Self::EMA_SHIFT));
+        FeedJudgement {
+            delay_ms: if delay > u32::MAX as i64 { u32::MAX } else { delay as u32 },
+            // A zero threshold DISABLES the judgement (operator
+            // `--stale-after-ms <venue>:0`): the delay is still measured
+            // and exported, nothing is ever flagged.
+            stale: self.stale_after_ms > 0 && delay > self.stale_after_ms,
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn feed_clock_unknown_venue_time_is_never_stale_and_never_learns() {
+        let mut c = FeedClock::new(400);
+        let j = c.judge(0, 5_000 * MS);
+        assert_eq!(j, FeedJudgement { delay_ms: 0, stale: false });
+        assert!(!c.learned());
+        assert_eq!(c.delay_ema_ms(), 0);
+    }
+
+    #[test]
+    fn feed_clock_first_message_defines_the_offset_with_zero_delay() {
+        let mut c = FeedClock::new(400);
+        // venue clock is 62 ms ahead of the host at the least-delayed message
+        let j = c.judge(1_000_062, 1_000_000 * MS);
+        assert_eq!(j.delay_ms, 0);
+        assert!(!j.stale);
+        assert!(c.learned());
+        assert_eq!(c.stale_after_ms(), 400);
+    }
+
+    #[test]
+    fn feed_clock_delay_is_relative_to_the_fastest_message_and_flags_stale() {
+        let mut c = FeedClock::new(400);
+        let _ = c.judge(1_000_062, 1_000_000 * MS); // off = +62
+        // 300 ms later on the host, venue says only 10 ms passed: 290 ms behind
+        let j = c.judge(1_000_072, 1_000_300 * MS);
+        assert_eq!(j.delay_ms, 290);
+        assert!(!j.stale);
+        // a 5 s-old message: stale
+        let j = c.judge(1_000_100, 1_005_100 * MS);
+        assert_eq!(j.delay_ms, 5_062);
+        assert!(j.stale);
+        // a faster message raises the offset and is itself fresh
+        let j = c.judge(1_005_170, 1_005_100 * MS); // raw = +70 > +62
+        assert_eq!(j.delay_ms, 0);
+        assert!(!j.stale);
+        // and the previous stale one would now measure 8 ms worse
+        let j = c.judge(1_000_100, 1_005_100 * MS);
+        assert_eq!(j.delay_ms, 5_070);
+    }
+
+    #[test]
+    fn feed_clock_threshold_is_strict_greater_than() {
+        let mut c = FeedClock::new(400);
+        let _ = c.judge(2_000_000, 2_000_000 * MS);
+        assert!(!c.judge(2_000_000, 2_000_400 * MS).stale, "400 == threshold is fresh");
+        assert!(c.judge(2_000_000, 2_000_401 * MS).stale, "401 > threshold is stale");
+    }
+
+    #[test]
+    fn feed_clock_zero_threshold_measures_but_never_flags() {
+        let mut c = FeedClock::new(0);
+        let _ = c.judge(3_000_000, 3_000_000 * MS);
+        let j = c.judge(3_000_000, 3_059_000 * MS); // 59 s behind, before any decay step
+        assert_eq!(j.delay_ms, 59_000);
+        assert!(!j.stale);
+    }
+
+    #[test]
+    fn feed_clock_offset_decays_one_ms_per_minute_and_relearns() {
+        let mut c = FeedClock::new(1_000);
+        let _ = c.judge(10_000_000, 10_000_000 * MS); // off = 0
+        // venue clock steps BACK 100 ms: every message now looks 100 ms late
+        let j = c.judge(10_000_900, 10_001_000 * MS);
+        assert_eq!(j.delay_ms, 100);
+        // 30 minutes later the offset has decayed 30 ms: apparent delay 70
+        let j = c.judge(11_800_900, 11_801_000 * MS);
+        assert_eq!(j.delay_ms, 70);
+        // 100+ minutes after the step it has fully re-learned
+        let j = c.judge(16_000_900, 16_001_000 * MS);
+        assert_eq!(j.delay_ms, 0);
+    }
+
+    #[test]
+    fn feed_clock_reset_forgets_the_offset_but_keeps_the_threshold() {
+        let mut c = FeedClock::new(700);
+        let _ = c.judge(1_000, 1_000 * MS);
+        assert!(c.learned());
+        c.reset();
+        assert!(!c.learned());
+        assert_eq!(c.stale_after_ms(), 700);
+        // the next message starts a fresh offset: zero delay by definition
+        assert_eq!(c.judge(500, 1_000 * MS).delay_ms, 0);
+    }
+
+    #[test]
+    fn feed_clock_delay_ema_tracks_a_constant_delay() {
+        let mut c = FeedClock::new(400);
+        let _ = c.judge(1_000, 1_000 * MS);
+        for i in 1..200u64 {
+            let _ = c.judge(1_000 + i, (1_000 + i + 50) * MS); // constant 50 ms behind
+        }
+        assert!((45..=50).contains(&c.delay_ema_ms()), "ema={}", c.delay_ema_ms());
+    }
+
+    #[test]
+    fn feed_clock_delay_saturates_at_u32_max() {
+        let mut c = FeedClock::new(400);
+        let _ = c.judge(u64::MAX / 4, 0);
+        let j = c.judge(1, u64::MAX / 2);
+        assert_eq!(j.delay_ms, u32::MAX);
+        assert!(j.stale);
+    }
 
     #[test]
     fn now_ns_is_monotonic_across_two_calls() {

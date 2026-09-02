@@ -15,7 +15,7 @@
 //! loss-accounting counters (D4: `ring_drops` is incremented on every
 //! failed `try_push`).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 // ---------------------------------------------------------------
 // Session-error diagnosability (capture-continuity outage 2026-08-27,
@@ -221,8 +221,19 @@ pub struct IngressStatus {
     last_err_site: AtomicU8,
     /// T1(a) diag: [`io_kind_code`] class of the first fatal error.
     last_err_io_kind: AtomicU8,
+    /// VT2 gauge: the connection's smoothed feed delay in ms
+    /// (`FeedClock::delay_ema_ms`, α = 1/16), last published value,
+    /// saturating at `u16::MAX` (65 s — anything above is "unknown"
+    /// anyway). Sits in the diag triple's two pad bytes so the slot
+    /// stays at two cache lines.
+    feed_delay_ema_ms: AtomicU16,
     /// T1(a) diag: venue numeric code bit-cast to u32 (0 = none).
     last_err_venue_code: AtomicU32,
+    /// VT2: ticks the ingress judged STALE against the venue's
+    /// `stale_after_ms` (`TICK_FLAG_STALE` set; captured, never a
+    /// signal). A subset of `ticks_total`. Fills the slot's last
+    /// 8 bytes exactly (128 B).
+    stale_ticks_total: AtomicU64,
 }
 
 impl IngressStatus {
@@ -245,7 +256,9 @@ impl IngressStatus {
             opt_ring_drops_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
+            feed_delay_ema_ms: AtomicU16::new(0),
             last_err_venue_code: AtomicU32::new(0),
+            stale_ticks_total: AtomicU64::new(0),
         }
     }
 
@@ -337,6 +350,20 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_opt_ring_drops(&self) {
         self.opt_ring_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one tick the ingress judged stale (VT2).
+    #[inline(always)]
+    pub fn inc_stale_ticks(&self) {
+        self.stale_ticks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish the connection's smoothed feed delay (VT2 gauge;
+    /// saturates at 65 535 ms).
+    #[inline(always)]
+    pub fn set_feed_delay_ema_ms(&self, ms: u32) {
+        let v = if ms > u16::MAX as u32 { u16::MAX } else { ms as u16 };
+        self.feed_delay_ema_ms.store(v, Ordering::Relaxed);
     }
 
     /// T1(a): record the venue's numeric error code for the current
@@ -448,6 +475,19 @@ impl IngressStatus {
         self.opt_ring_drops_total.load(Ordering::Relaxed)
     }
 
+    /// Total ticks judged stale by the ingress (VT2).
+    #[inline]
+    pub fn stale_ticks_total(&self) -> u64 {
+        self.stale_ticks_total.load(Ordering::Relaxed)
+    }
+
+    /// Last published smoothed feed delay in ms (VT2 gauge; 0 until a
+    /// stamped tick has been judged; 65 535 = saturated).
+    #[inline]
+    pub fn feed_delay_ema_ms(&self) -> u32 {
+        self.feed_delay_ema_ms.load(Ordering::Relaxed) as u32
+    }
+
     /// T1(a): read AND clear the session-error triple. Called by the
     /// cli venue loop right after `run()` returns — the SAME thread
     /// that wrote it (the venue loop and the run loop share one
@@ -530,9 +570,10 @@ mod tests {
     #[test]
     fn slot_is_cache_aligned() {
         assert_eq!(::core::mem::align_of::<IngressStatus>(), 64);
-        // 1 + 8 + 11×8 + (1+1+4) = 103 B of fields → still two cache
-        // lines (the T1/WS2/WS10 additions must never grow the slot
-        // past 128).
+        // 1(+7 pad) + 8 + 12×8 + (1+1+2+4) + 8 = 128 B — exactly two
+        // cache lines with ZERO slack left (VT2 spent the last 8 B on
+        // stale_ticks and the diag triple's pad on the delay gauge);
+        // the next counter must reuse a field or grow to 192.
         assert_eq!(::core::mem::size_of::<IngressStatus>(), 128);
     }
 
@@ -585,6 +626,27 @@ mod tests {
         assert_eq!(s.ring_drops_total(), 0);
         assert_eq!(s.sub_drops_total(), 0);
         assert_eq!(s.depth_ring_drops_total(), 0);
+    }
+
+    #[test]
+    fn stale_ticks_counter_and_feed_delay_gauge_are_independent_of_loss_counters() {
+        // VT2: a stale judgement is data quality, not loss — it never
+        // touches ring_drops / gaps / parse_errors; the gauge is a
+        // last-value store, not an accumulator.
+        let s = IngressStatus::new();
+        assert_eq!(s.stale_ticks_total(), 0);
+        assert_eq!(s.feed_delay_ema_ms(), 0);
+        s.inc_stale_ticks();
+        s.inc_stale_ticks();
+        s.set_feed_delay_ema_ms(71);
+        s.set_feed_delay_ema_ms(68);
+        assert_eq!(s.stale_ticks_total(), 2);
+        assert_eq!(s.feed_delay_ema_ms(), 68);
+        s.set_feed_delay_ema_ms(1_000_000);
+        assert_eq!(s.feed_delay_ema_ms(), u16::MAX as u32, "gauge saturates, never wraps");
+        assert_eq!(s.ring_drops_total(), 0);
+        assert_eq!(s.gaps_total(), 0);
+        assert_eq!(s.parse_errors_total(), 0);
     }
 
     #[test]

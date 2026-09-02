@@ -222,6 +222,14 @@ struct RunArgs {
     /// subscribed — it feeds the §6.2 staleness monitor.
     #[arg(long)]
     hl_coins: Option<String>,
+    /// VT2: repeatable `--stale-after-ms <venue>:<ms>` — per-venue
+    /// tick staleness threshold overriding the measured defaults
+    /// (`VenueId::default_stale_after_ms`: pm 1000, bn 1000, okx 400,
+    /// deribit 600, hl 700, bybit 500). `0` = measure only, never
+    /// flag. Consumed by the venues that stamp venue time (OKX since
+    /// VT2; the rest as their extraction lands).
+    #[arg(long)]
+    stale_after_ms: Vec<String>,
     /// Polymarket CLOB asset id (token id) — the decimal string from
     /// the market's `clobTokenIds`. REQUIRED in legacy mode (no
     /// universe config): without it the PM symbol map is empty and
@@ -630,6 +638,14 @@ fn run(args: RunArgs) -> ExitCode {
         Ok(c) => c,
         Err(reason) => {
             error!(reason, "bad --raw-tap flags");
+            return ExitCode::from(1);
+        }
+    };
+    // VT2: per-venue staleness thresholds (defaults + overrides).
+    let stale_after_ms = match cli::parse_stale_after_ms(&args.stale_after_ms) {
+        Ok(t) => t,
+        Err(reason) => {
+            error!(reason, "bad --stale-after-ms flags");
             return ExitCode::from(1);
         }
     };
@@ -1359,6 +1375,7 @@ fn run(args: RunArgs) -> ExitCode {
         info!(
             instruments = okx_symbols.len(),
             depth = boot.okx_depth,
+            stale_after_ms = stale_after_ms[core_types::VenueId::Okx as usize],
             "okx: starting ingress thread"
         );
         let okx_handle = match spawn_okx(
@@ -1368,6 +1385,7 @@ fn run(args: RunArgs) -> ExitCode {
             boot.okx_depth,
             // M2.3: family-keyed opt-summary subscription args.
             boot.okx_options.underlyings.clone(),
+            stale_after_ms[core_types::VenueId::Okx as usize],
             okx_prod,
             okx_event_prod,
             okx_depth_prod,

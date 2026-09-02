@@ -80,6 +80,25 @@ impl VenueId {
             _ => None,
         }
     }
+
+    /// VT2 default staleness threshold (ms) for this venue's tick feed
+    /// — docs/venue-time-capture-plan.md §2 doctrine 4: the measured
+    /// feed-delay p99 rounded up (docs/venue-latency.md 2026-09-03),
+    /// with Binance capped at 1 000 ms on purpose (a 1 s-stale BTC book
+    /// is unknown). Operator override: `--stale-after-ms <venue>:<ms>`.
+    /// `Ai` carries no market data — 0, never judged.
+    #[inline(always)]
+    pub const fn default_stale_after_ms(self) -> u32 {
+        match self {
+            Self::Polymarket => 1_000,
+            Self::Binance => 1_000,
+            Self::Okx => 400,
+            Self::Deribit => 600,
+            Self::Hyperliquid => 700,
+            Self::Ai => 0,
+            Self::Bybit => 500,
+        }
+    }
 }
 
 /// Dense u32 identifier for a trading symbol, namespaced by venue:
@@ -2778,6 +2797,17 @@ mod tests {
         // `tick_v3_layout_offsets_are_the_wire_format_law`.
         let bytes: [u8; 64] = unsafe { ::core::mem::transmute(t) };
         assert_eq!(&bytes[49..64], &[0u8; 15]);
+    }
+
+    #[test]
+    fn default_stale_after_ms_is_the_measured_table_with_the_binance_cap() {
+        assert_eq!(VenueId::Binance.default_stale_after_ms(), 1_000);
+        assert_eq!(VenueId::Okx.default_stale_after_ms(), 400);
+        assert_eq!(VenueId::Bybit.default_stale_after_ms(), 500);
+        assert_eq!(VenueId::Deribit.default_stale_after_ms(), 600);
+        assert_eq!(VenueId::Hyperliquid.default_stale_after_ms(), 700);
+        assert_eq!(VenueId::Polymarket.default_stale_after_ms(), 1_000);
+        assert_eq!(VenueId::Ai.default_stale_after_ms(), 0);
     }
 
     #[test]

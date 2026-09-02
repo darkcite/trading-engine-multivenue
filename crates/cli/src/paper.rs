@@ -993,6 +993,7 @@ pub fn spawn_okx(
     symbols: ingress_okx::OkxSymbolTable,
     depth_enabled: bool,
     opt_families: Vec<String>,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut depth_tx: Producer<DepthTopK, DEPTH_RING_SIZE>,
@@ -1029,6 +1030,8 @@ pub fn spawn_okx(
             // the driver's fixed-capacity family table.
             let fam_refs: Vec<&[u8]> = opt_families.iter().map(|s| s.as_bytes()).collect();
             let mut driver = owl::Driver::new(now_ns(), symbols, depth_enabled, &fam_refs);
+            // VT2: venue default or the operator's `--stale-after-ms okx:<ms>`.
+            driver.set_stale_after_ms(stale_after_ms);
             let mut keepalive = Keepalive::new(OKX_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -2744,6 +2747,33 @@ impl Observability {
     }
 }
 
+/// VT2: per-venue staleness thresholds (ms), indexed by the `VenueId`
+/// byte — the venue defaults (`VenueId::default_stale_after_ms`,
+/// docs/venue-time-capture-plan.md §2 doctrine 4) overridden by
+/// repeatable `--stale-after-ms <venue>:<ms>` specs (labels as the
+/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`). A zero
+/// disables the judgement for that venue (nothing is ever stale).
+pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; 7], String> {
+    let mut table = [0u32; 7];
+    let mut i = 0;
+    while i < table.len() {
+        table[i] = VenueId::from_u8(i as u8).map_or(0, VenueId::default_stale_after_ms);
+        i += 1;
+    }
+    for spec in specs {
+        let (label, ms) = spec
+            .split_once(':')
+            .ok_or_else(|| format!("bad --stale-after-ms {spec:?}: want <venue>:<ms>"))?;
+        let venue = crate::backtest::model_venue(label)
+            .ok_or_else(|| format!("bad --stale-after-ms {spec:?}: unknown venue {label:?}"))?;
+        let ms: u32 = ms
+            .parse()
+            .map_err(|_| format!("bad --stale-after-ms {spec:?}: unparseable ms"))?;
+        table[venue] = ms;
+    }
+    Ok(table)
+}
+
 /// Register the per-ingress §6.4 counters for one ingress. Boot-only.
 fn register_ingress_counters(
     reg: &mut core_metrics::MetricsRegistry,
@@ -2754,7 +2784,7 @@ fn register_ingress_counters(
         reg.register_counter(&name)
             .map_err(|_| "register ingress counter")
     };
-    Ok(IngressCounterIds {
+    let ids = IngressCounterIds {
         msgs: one("msgs")?,
         bytes: one("bytes")?,
         parse_errors: one("parse_errors")?,
@@ -2766,7 +2796,12 @@ fn register_ingress_counters(
         sub_drops: one("sub_drops")?,
         event_ring_drops: one("event_ring_drops")?,
         depth_ring_drops: one("depth_ring_drops")?,
-    })
+        stale_ticks: one("stale_ticks")?,
+        feed_delay_ema_ms: reg
+            .register_gauge(&format!("engine_ingress_{venue}_feed_delay_ema_ms"))
+            .map_err(|_| "register ingress gauge")?,
+    };
+    Ok(ids)
 }
 
 /// Periodic HdrHistogram dump config. When wired into
@@ -3032,6 +3067,12 @@ pub struct IngressCounterIds {
     /// WS10-B: depth-lane pushes refused by a full ring
     /// (`engine_ingress_<venue>_depth_ring_drops_total`).
     pub depth_ring_drops: core_metrics::CounterId,
+    /// VT2: ticks the ingress judged stale
+    /// (`engine_ingress_<venue>_stale_ticks_total`).
+    pub stale_ticks: core_metrics::CounterId,
+    /// VT2 gauge: the connection's smoothed feed delay
+    /// (`engine_ingress_<venue>_feed_delay_ema_ms`).
+    pub feed_delay_ema_ms: GaugeId,
 }
 
 /// Registry handles for the Phase-8f AI ingress family
@@ -3508,10 +3549,12 @@ struct IngressCountersSnapshot {
     sub_drops: u64,
     event_ring_drops: u64,
     depth_ring_drops: u64,
+    stale_ticks: u64,
 }
 
 /// Mirror one ingress status slot into its registry counters as
-/// deltas since the previous publish tick. 5 s cadence — cold path.
+/// deltas since the previous publish tick (the VT2 delay gauge is a
+/// last-value copy). 5 s cadence — cold path.
 fn mirror_ingress_counters(
     reg: &core_metrics::MetricsRegistry,
     ids: &IngressCounterIds,
@@ -3530,6 +3573,7 @@ fn mirror_ingress_counters(
         sub_drops: st.sub_drops_total(),
         event_ring_drops: st.event_ring_drops_total(),
         depth_ring_drops: st.depth_ring_drops_total(),
+        stale_ticks: st.stale_ticks_total(),
     };
     reg.counter(ids.msgs)
         .inc(cur.msgs.saturating_sub(last.msgs));
@@ -3553,6 +3597,10 @@ fn mirror_ingress_counters(
         .inc(cur.event_ring_drops.saturating_sub(last.event_ring_drops));
     reg.counter(ids.depth_ring_drops)
         .inc(cur.depth_ring_drops.saturating_sub(last.depth_ring_drops));
+    reg.counter(ids.stale_ticks)
+        .inc(cur.stale_ticks.saturating_sub(last.stale_ticks));
+    reg.gauge(ids.feed_delay_ema_ms)
+        .set(st.feed_delay_ema_ms() as i64);
     *last = cur;
 }
 
@@ -6216,6 +6264,40 @@ mod tests {
     // parse_raw_tap_flags (Part B.3 — --raw-tap / --raw-tap-mode /
     // --raw-tap-budget-mb)
     // -----------------------------------------------------------
+
+    /// VT2: no `--stale-after-ms` ⇒ the measured per-venue defaults,
+    /// `Ai` (no market data) 0.
+    #[test]
+    fn stale_after_ms_defaults_to_the_venue_table() {
+        let t = parse_stale_after_ms(&[]).unwrap();
+        assert_eq!(t[VenueId::Polymarket as usize], 1_000);
+        assert_eq!(t[VenueId::Binance as usize], 1_000);
+        assert_eq!(t[VenueId::Okx as usize], 400);
+        assert_eq!(t[VenueId::Deribit as usize], 600);
+        assert_eq!(t[VenueId::Hyperliquid as usize], 700);
+        assert_eq!(t[VenueId::Ai as usize], 0);
+        assert_eq!(t[VenueId::Bybit as usize], 500);
+    }
+
+    /// VT2: overrides replace only the named venue; the last spec for
+    /// a venue wins; `0` is a legal "measure only" value.
+    #[test]
+    fn stale_after_ms_overrides_named_venues_only() {
+        let specs = ["okx:250".to_owned(), "bn:0".to_owned(), "okx:300".to_owned()];
+        let t = parse_stale_after_ms(&specs).unwrap();
+        assert_eq!(t[VenueId::Okx as usize], 300);
+        assert_eq!(t[VenueId::Binance as usize], 0);
+        assert_eq!(t[VenueId::Bybit as usize], 500, "untouched venue keeps its default");
+    }
+
+    /// VT2: malformed specs refuse the boot with a named reason.
+    #[test]
+    fn stale_after_ms_rejects_bad_specs() {
+        for bad in ["okx", "mars:400", "okx:fast", "okx:-1"] {
+            let err = parse_stale_after_ms(&[bad.to_owned()]).unwrap_err();
+            assert!(err.contains("--stale-after-ms"), "{err}");
+        }
+    }
 
     /// No `--raw-tap` ⇒ every venue's tap stays off, regardless of
     /// the (clap-default) `--raw-tap-mode` / `--raw-tap-budget-mb`.

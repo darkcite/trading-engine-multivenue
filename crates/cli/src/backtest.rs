@@ -267,7 +267,10 @@ impl Default for ModelParams {
     }
 }
 
-fn model_venue(label: &str) -> Option<usize> {
+/// Venue label (`pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`) → `VenueId`
+/// byte. `pub(crate)`: the engine's `--stale-after-ms` flag (VT2,
+/// `paper.rs`) uses the same labels as the harness flags.
+pub(crate) fn model_venue(label: &str) -> Option<usize> {
     let mut i = 0usize;
     while i < MODEL_VENUE_LABELS.len() {
         if MODEL_VENUE_LABELS[i].0 == label {

@@ -1558,6 +1558,38 @@ mod proptests {
             prop_assert_eq!(f.seq_id, seq);
         }
 
+        /// VT2: the staleness judge over arbitrary stamp/receive
+        /// sequences — delay is never negative, the least-delayed
+        /// message of a no-decay window measures exactly 0, stale is
+        /// exactly `delay > threshold`, and an unknown stamp (0) is
+        /// never stale and never learns.
+        #[test]
+        fn feed_clock_invariants_hold_over_any_sequence(
+            base_ms in 1_000_000_000u64..2_000_000_000_000u64,
+            offsets in proptest::collection::vec((0u32..50_000u32, 0u32..50_000u32), 1..64),
+            threshold in 0u32..5_000u32,
+        ) {
+            let mut clock = core_time::FeedClock::new(threshold);
+            let mut best_raw = i64::MIN;
+            let mut best_delay = u32::MAX;
+            for (i, (venue_off, mono_off)) in offsets.iter().enumerate() {
+                // all receives inside one minute ⇒ no decay step
+                let mono_ms = base_ms + (i as u64) * 100 + (*mono_off as u64 % 100);
+                let venue_ms = base_ms + *venue_off as u64;
+                let j = clock.judge(venue_ms, mono_ms * 1_000_000);
+                let raw = venue_ms as i64 - mono_ms as i64;
+                if raw >= best_raw {
+                    best_raw = raw;
+                    best_delay = j.delay_ms;
+                }
+                prop_assert!(clock.learned());
+                prop_assert_eq!(j.stale, threshold > 0 && j.delay_ms > threshold);
+            }
+            prop_assert_eq!(best_delay, 0, "the fastest message defines the offset");
+            let unknown = clock.judge(0, (base_ms + 999_999) * 1_000_000);
+            prop_assert_eq!(unknown, core_time::FeedJudgement { delay_ms: 0, stale: false });
+        }
+
         #[test]
         fn funding_roundtrips_1e9(
             rate_nano in -3_000_000i64..3_000_000i64,
