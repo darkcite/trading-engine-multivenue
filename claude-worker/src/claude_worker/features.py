@@ -178,7 +178,17 @@ def write_feature_files(
 
 def collect_marks(reader: claude_worker.pmlr.Reader, into: dict[int, int]) -> None:
     """Fold last-mid marks per symbol from one tick file (file order —
-    the last record wins, matching capture append order)."""
+    the last record wins, matching capture append order).
+
+    VT3 (docs/venue-time-capture-plan.md §2 doctrine 3): a STALE tick
+    never moves the mark — the last good mid stands. The flag is only
+    meaningful on v3 files (``reader.has_venue_time``); v2/v1 files replay
+    under the v2 law (never stale)."""
+    if reader.has_venue_time:
+        for tick in reader.ticks():
+            if not tick.is_stale():
+                into[tick.sym] = tick.mid()
+        return
     for tick in reader.ticks():
         into[tick.sym] = tick.mid()
 

@@ -167,7 +167,10 @@ pub struct FeatSym {
     depth_stale: u8,
     /// OptSummary flags mirror.
     opt_flags: u8,
-    _pad0: u8,
+    /// VT3: `TICK_FLAG_STALE` mirror of the LATEST tick — while set,
+    /// `Mid/Bid/Ask` read ABSENT (doctrine 3: a stale quote feeds no
+    /// signal); the last good BBO below stands untouched.
+    tick_stale: u8,
     /// Live top-of-book, px ×1e9 (0 = never ticked / one-sided).
     bid_1e9: i64,
     ask_1e9: i64,
@@ -338,6 +341,14 @@ impl FeatureState {
             Some(i) => i,
             None => return,
         };
+        // VT3 (docs/venue-time-capture-plan.md §2 doctrine 3): a STALE
+        // tick feeds nothing — the last good BBO stands, reads go
+        // ABSENT until a fresh tick, and the rolling rings are not
+        // sampled by it. One byte compare on the hot path.
+        if t.is_stale() {
+            self.syms[idx].tick_stale = 1;
+            return;
+        }
         let two_sided = bid > 0 && ask > 0;
         let mid_1e9 = if two_sided {
             ((bid + ask) / 2) * 1_000
@@ -346,6 +357,7 @@ impl FeatureState {
         };
         let wall = self.wall_ms(mono_ns);
         let s = &mut self.syms[idx];
+        s.tick_stale = 0;
         s.bid_1e9 = if bid > 0 { bid * 1_000 } else { 0 };
         s.ask_1e9 = if ask > 0 { ask * 1_000 } else { 0 };
         s.mid_1e9 = mid_1e9;
@@ -719,10 +731,14 @@ impl FeatureState {
         mono_ns: u64,
     ) -> Option<i64> {
         let idx = self.find(sym)?;
+        // VT3: the BBO features are ABSENT while the latest tick is
+        // stale (the "hold" of the channel law — rows neither enter nor
+        // exit off a known-stale quote; the vm counts entry/exit_blocked).
+        let bbo_live = self.syms[idx].last_tick_ns > 0 && self.syms[idx].tick_stale == 0;
         match feat {
             FeatId::Mid => {
                 let v = self.syms[idx].mid_1e9;
-                if self.syms[idx].last_tick_ns > 0 && v > 0 {
+                if bbo_live && v > 0 {
                     Some(v)
                 } else {
                     None
@@ -730,7 +746,7 @@ impl FeatureState {
             }
             FeatId::Bid => {
                 let v = self.syms[idx].bid_1e9;
-                if self.syms[idx].last_tick_ns > 0 && v > 0 {
+                if bbo_live && v > 0 {
                     Some(v)
                 } else {
                     None
@@ -738,7 +754,7 @@ impl FeatureState {
             }
             FeatId::Ask => {
                 let v = self.syms[idx].ask_1e9;
-                if self.syms[idx].last_tick_ns > 0 && v > 0 {
+                if bbo_live && v > 0 {
                     Some(v)
                 } else {
                     None
@@ -1065,6 +1081,36 @@ mod tests {
             f.read(FeatId::Ask, sym, 0, MONO0),
             Some(65_010_000_000_000)
         );
+    }
+
+    /// VT3: a stale tick makes Mid/Bid/Ask ABSENT without moving the
+    /// last good quote; the next fresh tick restores them (with its own
+    /// values); a stale tick never samples the rolling rings.
+    #[test]
+    fn stale_tick_holds_bbo_reads_absent_and_keeps_the_last_good_quote() {
+        let mut f = FeatureState::new_boxed();
+        teach_wall(&mut f);
+        let sym = make_symbol_id(VenueId::Okx, 7);
+        assert!(f.bind_roll(sym, 1));
+        f.on_tick(&tick(sym, 64_990_000_000, 65_010_000_000), MONO0);
+        assert_eq!(f.read(FeatId::Mid, sym, 0, MONO0), Some(65_000_000_000_000));
+        let mean_before = f.read(FeatId::RollMean, sym, 1, MONO0);
+        assert!(mean_before.is_some());
+
+        // A stale quote 10 bps away arrives: reads go ABSENT, the ring
+        // is not sampled, the good quote is untouched underneath.
+        let mut stale = tick(sym, 65_050_000_000, 65_070_000_000);
+        stale.flags = core_types::TICK_FLAG_STALE;
+        f.on_tick(&stale, MONO0 + 1);
+        assert_eq!(f.read(FeatId::Mid, sym, 0, MONO0 + 1), None);
+        assert_eq!(f.read(FeatId::Bid, sym, 0, MONO0 + 1), None);
+        assert_eq!(f.read(FeatId::Ask, sym, 0, MONO0 + 1), None);
+        assert_eq!(f.read(FeatId::RollMean, sym, 1, MONO0 + 1), mean_before);
+
+        // A fresh quote restores the reads with ITS values.
+        f.on_tick(&tick(sym, 65_030_000_000, 65_050_000_000), MONO0 + 2);
+        assert_eq!(f.read(FeatId::Mid, sym, 0, MONO0 + 2), Some(65_040_000_000_000));
+        assert_eq!(f.read(FeatId::Bid, sym, 0, MONO0 + 2), Some(65_030_000_000_000));
     }
 
     #[test]

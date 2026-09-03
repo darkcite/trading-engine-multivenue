@@ -275,3 +275,19 @@ ruling); the Binance spot book-builder lane; any strategy work.
   `--raw-tap`, delays vs `latency_probe` ±10 ms p50, and the first
   sighting of `engine_ingress_bn_stale_ticks_total` moving during a
   Binance staleness episode).
+- 2026-09-03 — **VT3 landed.** strategy-vm `features.rs`: `FeatSym`
+  gains `tick_stale` (in the old `_pad0` byte — no size change); a stale
+  tick sets it and returns before touching the BBO or sampling the
+  rolling rings (one byte compare on the hot path); `Mid/Bid/Ask` read
+  ABSENT while it is set (the channel law's "hold" — the vm's existing
+  `entry_blocked` / `exit_blocked` counters record the consequence);
+  the next fresh tick clears it and restores the reads with its own
+  values. Tests: features (stale ⇒ ABSENT, ring not sampled, last good
+  quote untouched, fresh restores) and vm (the same would-fire quote
+  flagged stale holds the row; fresh fires). Paper marks: the engine
+  keeps no in-process marks (paper fills are empty, P&L is offline), so
+  the "last good mark stands" law lands where the marks live —
+  `claude_worker.features.collect_marks` skips stale ticks on v3 files
+  (v2 files keep the v2 law) with a golden `ticks_v3.pmlr` test. The
+  metrics half of VT3 shipped with VT2. Not touched: capture-derived
+  candles (`candles.py`, PM only) still fold stale ticks — a VT5 note.

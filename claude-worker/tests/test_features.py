@@ -90,6 +90,29 @@ def test_collect_run_features_and_marks(tmp_path: pathlib.Path) -> None:
     assert hl["tick_rate_hz"] == 0.0
 
 
+def test_v3_marks_skip_stale_ticks_and_keep_the_last_good_mid() -> None:
+    # VT3: the golden v3 fixture carries, per symbol, a fresh tick then a
+    # stale one (OKX sym 1: fresh mid 76_000_050_000, stale after it;
+    # Binance sym 7: sentinel-fresh then sentinel+stale) — the mark
+    # must be the LAST FRESH mid, never the stale one; the v2-shape
+    # Polymarket tick (flags 0) marks normally.
+    marks: dict[int, int] = {}
+    with claude_worker.pmlr.Reader(FIXTURES / "ticks_v3.pmlr") as r:
+        assert r.has_venue_time
+        ticks = list(r.ticks())
+        claude_worker.features.collect_marks(r, marks)
+    okx = (2 << 24) + 1
+    assert ticks[1].sym == okx and ticks[1].is_stale()
+    assert marks[okx] == ticks[0].mid()
+    assert ticks[3].sym == PM7 and ticks[3].is_stale()
+    assert marks[PM7] == ticks[4].mid(), "the v2-shape PM tick (fresh) is the last good mid for sym 7"
+    # v2 files keep the v2 law: every tick marks.
+    marks_v2: dict[int, int] = {}
+    with claude_worker.pmlr.Reader(FIXTURES / "ticks_v2.pmlr") as r:
+        claude_worker.features.collect_marks(r, marks_v2)
+    assert marks_v2 == {PM7: 510_000, HL_YES: 610_000, HL_NO: 390_000}
+
+
 def test_v1_ticks_pin_venue_zero(tmp_path: pathlib.Path) -> None:
     with claude_worker.pmlr.Reader(FIXTURES / "ticks_v1.pmlr") as r:
         feats = claude_worker.features.tick_features(r)

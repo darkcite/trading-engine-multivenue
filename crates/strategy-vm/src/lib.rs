@@ -1318,6 +1318,26 @@ mod tests {
         assert_eq!(ctx.submitted[0].side, Side::Bid);
     }
 
+    /// VT3 (docs/venue-time-capture-plan.md §2 doctrine 3): the SAME
+    /// would-fire quote flagged stale holds the row — no order, the mid
+    /// is ABSENT — and the next fresh quote fires it.
+    #[test]
+    fn stale_tick_holds_a_would_fire_row_until_a_fresh_one() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        prime_cd(&mut vm, &mut ctx, RuleRow::SIDE_BOTH, 80);
+        let mut stale = tick(SYM, 1, 690_000, 710_000);
+        stale.flags = core_types::TICK_FLAG_STALE;
+        vm.on_tick(&stale, &mut ctx);
+        assert_eq!(vm.fires, 0, "a stale quote never feeds the signal");
+        assert!(ctx.submitted.is_empty());
+        // The identical quote, fresh, fires.
+        vm.on_tick(&tick(SYM, 2, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.fires, 1);
+        assert_eq!(ctx.submitted.len(), 1);
+        assert_eq!(ctx.submitted[0].side, Side::Ask);
+    }
+
     #[test]
     fn cross_deviation_edge_boundary_is_inclusive() {
         let mut vm = VmStrategy::new();
