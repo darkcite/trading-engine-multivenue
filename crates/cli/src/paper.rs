@@ -534,8 +534,14 @@ pub fn spawn_binance(
                 }
             };
 
-            let mut driver = bwl::Driver::new(now_ns(), sym);
-            // VT2: venue default or the operator's `--stale-after-ms bn:<ms>`.
+            // VT2: the legacy single-connection lane is the spot anchor
+            // (`/ws/<symbol>@bookTicker`) — it carries the aggTrade
+            // sentinel too.
+            let mut driver = match spot_stream_symbol(&ep.path) {
+                Some(symbol) => bwl::Driver::new_spot_sentinel(now_ns(), sym, symbol.as_bytes()),
+                None => bwl::Driver::new(now_ns(), sym),
+            };
+            // venue default or the operator's `--stale-after-ms bn:<ms>`.
             driver.set_stale_after_ms(stale_after_ms);
             let mut keepalive = Keepalive::new(BN_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
@@ -623,6 +629,18 @@ pub struct BinanceConnSpec {
     /// capture-only mark/index/funding lane; `sym` pinned like
     /// bookTicker). Mutually exclusive with `eapi`.
     pub mark_price: bool,
+    /// VT2: true ⇒ a SPOT bookTicker slot that also subscribes
+    /// `<sym>@aggTrade` on the same socket as its staleness sentinel
+    /// (spot bookTicker carries no venue stamp). The stream symbol is
+    /// derived from `path` (`/ws/<symbol>@bookTicker`). Only meaningful
+    /// with `eapi == None && !mark_price`.
+    pub spot_sentinel: bool,
+}
+
+/// VT2: the lowercase stream symbol of a `/ws/<symbol>@bookTicker`
+/// path (`None` for any other shape) — the sentinel's `<symbol>@aggTrade`.
+pub fn spot_stream_symbol(path: &str) -> Option<&str> {
+    path.strip_prefix("/ws/")?.strip_suffix("@bookTicker")
 }
 
 /// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
@@ -708,8 +726,17 @@ pub fn spawn_binance_multi(
                         bwl::Driver::new_mark_price(now_ns().wrapping_add(i as u64), spec.sym)
                     }
                     None => {
-                        let mut d = bwl::Driver::new(now_ns().wrapping_add(i as u64), spec.sym);
-                        // VT2: one estimator per CONNECTION, same threshold.
+                        let seed = now_ns().wrapping_add(i as u64);
+                        // VT2: a spot slot carries the aggTrade sentinel
+                        // (`<symbol>@aggTrade` from the path); USDS-M
+                        // stamps its bookTicker directly.
+                        let mut d = match (spec.spot_sentinel, spot_stream_symbol(&spec.path)) {
+                            (true, Some(symbol)) => {
+                                bwl::Driver::new_spot_sentinel(seed, spec.sym, symbol.as_bytes())
+                            }
+                            _ => bwl::Driver::new(seed, spec.sym),
+                        };
+                        // one estimator per CONNECTION, same threshold.
                         d.set_stale_after_ms(stale_after_ms);
                         d
                     }

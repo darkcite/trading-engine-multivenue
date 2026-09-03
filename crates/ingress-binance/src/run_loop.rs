@@ -37,16 +37,16 @@ use std::io;
 use core_net::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
     write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_ping,
-    ws_write_pong, HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
+    ws_write_pong, ws_write_text_frame, HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
 use core_types::{
-    Capture, NsTs, OptSummary, Price, Qty, SymbolId, Tick, EVENT_RING_SIZE, OPT_RING_SIZE,
-    TICK_FLAG_STALE,
+    Capture, ChannelEvent, ChannelId, NsTs, OptSummary, Price, Qty, SymbolId, Tick,
+    EVENT_RING_SIZE, OPT_RING_SIZE, TICK_FLAG_STALE, TICK_FLAG_VENUE_TIME_SENTINEL,
 };
 
-use crate::parse_book_ticker;
+use crate::{parse_book_ticker, parse_trade};
 
 // ---------------------------------------------------------------
 // Configuration + sizing
@@ -228,16 +228,33 @@ pub struct Driver {
     /// Per-slot parse dispatch (M2.4).
     lane: StreamLane,
     /// VT2: THIS connection's venue-clock offset estimator + staleness
-    /// judge for `bookTicker` (USDS-M `T`/`E`; spot pushes carry no
-    /// stamp and stay "unknown, never stale" until the aggTrade
-    /// sentinel step). One per connection by doctrine — the multi-conn
-    /// lane owns one driver per socket; reset on reconnect; threshold =
-    /// venue default or `--stale-after-ms bn:<ms>` via
+    /// judge for `bookTicker` (USDS-M `T`/`E` directly; spot through the
+    /// aggTrade sentinel below). One per connection by doctrine — the
+    /// multi-conn lane owns one driver per socket; reset on reconnect;
+    /// threshold = venue default or `--stale-after-ms bn:<ms>` via
     /// [`Self::set_stale_after_ms`].
     feed_clock: FeedClock,
+    /// VT2 spot SENTINEL (docs/venue-time-capture-plan.md §4): spot
+    /// `bookTicker` carries no venue stamp, so a spot slot also
+    /// subscribes `<sym>@aggTrade` on the SAME socket after the upgrade;
+    /// each aggTrade's `T` teaches [`Self::feed_clock`], and every
+    /// bookTicker tick inherits the sentinel's latest stamp + verdict
+    /// with `TICK_FLAG_VENUE_TIME_SENTINEL` set. `sentinel_len == 0` ⇒
+    /// not a sentinel slot (USDS-M / legacy).
+    sentinel_stream: [u8; SENTINEL_STREAM_MAX],
+    /// Live bytes of `sentinel_stream` (`btcusdt@aggTrade`).
+    sentinel_len: u8,
+    /// Latest sentinel stamp (ms; 0 = none seen this connection).
+    sentinel_time_ms: u64,
+    /// Latest sentinel verdict (`TICK_FLAG_STALE` or 0).
+    sentinel_stale_flag: u8,
     /// `!Sync` marker.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
+
+/// Longest sentinel stream name (`<symbol>@aggTrade`; spot symbols
+/// are ≤ 20 chars on this venue).
+pub const SENTINEL_STREAM_MAX: usize = 32;
 
 impl Driver {
     /// Allocate rx/tx buffers and seed the opening-handshake nonce.
@@ -255,8 +272,43 @@ impl Driver {
             sym,
             lane: StreamLane::BookTicker,
             feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
+            sentinel_stream: [0; SENTINEL_STREAM_MAX],
+            sentinel_len: 0,
+            sentinel_time_ms: 0,
+            sentinel_stale_flag: 0,
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// VT2: a SPOT bookTicker slot with the aggTrade sentinel —
+    /// `symbol` is the lowercase stream symbol (`btcusdt`); the slot
+    /// subscribes `<symbol>@aggTrade` on the same socket right after
+    /// the upgrade. An over-long symbol leaves the slot sentinel-less
+    /// (debug-asserted; the boot universe caps symbol length).
+    pub fn new_spot_sentinel(nonce_seed: u64, sym: SymbolId, symbol: &[u8]) -> Self {
+        let mut d = Self::new(nonce_seed, sym);
+        const SUFFIX: &[u8] = b"@aggTrade";
+        let n = symbol.len() + SUFFIX.len();
+        if symbol.is_empty() || n > SENTINEL_STREAM_MAX {
+            debug_assert!(false, "sentinel symbol length {} out of range", symbol.len());
+            return d;
+        }
+        d.sentinel_stream[..symbol.len()].copy_from_slice(symbol);
+        d.sentinel_stream[symbol.len()..n].copy_from_slice(SUFFIX);
+        d.sentinel_len = n as u8;
+        d
+    }
+
+    /// VT2: true when this slot carries the aggTrade sentinel.
+    #[inline]
+    pub fn has_sentinel(&self) -> bool {
+        self.sentinel_len != 0
+    }
+
+    /// VT2: the sentinel's latest stamp (ms; 0 = none this connection).
+    #[inline]
+    pub fn sentinel_time_ms(&self) -> u64 {
+        self.sentinel_time_ms
     }
 
     /// VT2: override the staleness threshold (operator
@@ -301,6 +353,10 @@ impl Driver {
             // Options tickers are never judged (no bookTicker on this
             // slot); the estimator sits idle.
             feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
+            sentinel_stream: [0; SENTINEL_STREAM_MAX],
+            sentinel_len: 0,
+            sentinel_time_ms: 0,
+            sentinel_stale_flag: 0,
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -327,7 +383,10 @@ impl Driver {
         self.last_activity_ns = 0;
         self.mask_counter = 0;
         // VT2: a new connection is a new offset; the threshold stays.
+        // The sentinel's last stamp is connection-scoped too.
         self.feed_clock.reset();
+        self.sentinel_time_ms = 0;
+        self.sentinel_stale_flag = 0;
     }
 }
 
@@ -459,6 +518,56 @@ fn write_handshake_to_tx(drv: &mut Driver, host: &[u8], path: &[u8]) -> io::Resu
     Ok(())
 }
 
+/// VT2: queue the sentinel's live SUBSCRIBE (`{"method":"SUBSCRIBE",
+/// "params":["<sym>@aggTrade"],"id":1}`) onto the connection's tx.
+/// Fixed scratch on the stack — no allocation; the venue's ack
+/// (`{"result":null,"id":1}`) is classified as a control frame.
+fn queue_sentinel_subscribe(drv: &mut Driver) -> io::Result<()> {
+    const HEAD: &[u8] = b"{\"method\":\"SUBSCRIBE\",\"params\":[\"";
+    const TAIL: &[u8] = b"\"],\"id\":1}";
+    let mut scratch = [0u8; HEAD.len() + SENTINEL_STREAM_MAX + TAIL.len()];
+    let n = drv.sentinel_len as usize;
+    let mut at = 0usize;
+    scratch[at..at + HEAD.len()].copy_from_slice(HEAD);
+    at += HEAD.len();
+    scratch[at..at + n].copy_from_slice(&drv.sentinel_stream[..n]);
+    at += n;
+    scratch[at..at + TAIL.len()].copy_from_slice(TAIL);
+    at += TAIL.len();
+    // Same masked-frame shape as this crate's ping/pong writes (the
+    // crate keeps its own private IoBuf).
+    let mask = ws_mask_from_counter(drv.mask_counter);
+    drv.mask_counter = drv.mask_counter.wrapping_add(1);
+    let dst = drv.tx.free_mut();
+    let n = ws_write_text_frame(dst, &scratch[..at], mask)
+        .map_err(|_| io::Error::other("sentinel subscribe: tx buffer too small"))?;
+    drv.tx.advance(n);
+    Ok(())
+}
+
+/// VT2 sentinel-slot frame kinds (spot bookTicker connections only;
+/// every other slot keeps its single-stream shape).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SentinelFrame {
+    /// `{"e":"aggTrade",…}` — the clock sentinel + a Trade capture row.
+    AggTrade,
+    /// `{"result":null,"id":1}` / `{"error":…}` — the SUBSCRIBE reply.
+    Control,
+    /// Anything else on the socket is the bookTicker stream.
+    BookTicker,
+}
+
+#[inline]
+fn classify_sentinel_frame(payload: &[u8]) -> SentinelFrame {
+    if memchr::memmem::find(payload, b"\"e\":\"aggTrade\"").is_some() {
+        SentinelFrame::AggTrade
+    } else if payload.starts_with(b"{\"result\":") || payload.starts_with(b"{\"error\":") {
+        SentinelFrame::Control
+    } else {
+        SentinelFrame::BookTicker
+    }
+}
+
 fn advance_ws_upgrade(drv: &mut Driver, status: &core_metrics::IngressStatus) -> io::Result<()> {
     match read_server_handshake(drv.rx.filled()) {
         HandshakeResult::Incomplete => Ok(()),
@@ -485,6 +594,11 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &core_metrics::IngressStatus) ->
             drv.last_activity_ns = now;
             status.touch_activity(now);
             status.add_bytes(header_end as u64);
+            // VT2: the spot sentinel subscribes on the same socket the
+            // moment the upgrade lands (the next flush sends it).
+            if drv.has_sentinel() {
+                queue_sentinel_subscribe(drv)?;
+            }
             Ok(())
         }
         HandshakeResult::Malformed => Err(io::Error::new(
@@ -779,15 +893,87 @@ fn handle_text_frame<C: Capture>(
     if matches!(drv.lane, StreamLane::MarkPrice) {
         return handle_mark_price_frame(drv, payload_range, event_tx, event_mask, status, capture);
     }
-    let payload = &drv.rx.filled()[payload_range];
+    // Disjoint field borrows: the payload is a view into `drv.rx`; the
+    // VT2 judge and the sentinel state are the only mutations.
+    let Driver {
+        rx,
+        sym: slot_sym,
+        feed_clock,
+        sentinel_len,
+        sentinel_time_ms,
+        sentinel_stale_flag,
+        ..
+    } = drv;
+    let payload = &rx.filled()[payload_range];
     // §6.5 capture: raw tap fires before parsing.
     capture.raw_frame(now_ns(), payload);
-    if let Some(f) = parse_book_ticker(payload, drv.sym) {
+    // VT2 sentinel slot: the socket also carries aggTrade prints and
+    // the SUBSCRIBE reply; one substring probe per frame sorts them.
+    if *sentinel_len != 0 {
+        match classify_sentinel_frame(payload) {
+            SentinelFrame::AggTrade => {
+                match parse_trade(payload, *slot_sym) {
+                    Some(t) => {
+                        let now = now_ns();
+                        // The print's `T` teaches the connection clock;
+                        // the verdict is what the next bookTicker ticks
+                        // inherit until the next print.
+                        let judged = feed_clock.judge(t.ts_ms, now);
+                        *sentinel_time_ms = t.ts_ms;
+                        *sentinel_stale_flag = (judged.stale as u8) * TICK_FLAG_STALE;
+                        status.set_feed_delay_ema_ms(feed_clock.delay_ema_ms());
+                        // §6.5 capture as a Trade row (v0 px ×1e6, v1
+                        // qty ×1e6 negated when the aggressor sold —
+                        // the cross-venue convention); capture only,
+                        // no engine lane (the trade lane is deferred).
+                        let signed_qty = if t.is_buyer_maker { -t.qty_1e6 } else { t.qty_1e6 };
+                        capture.event(&ChannelEvent::new(
+                            now,
+                            core_types::VenueId::Binance,
+                            ChannelId::Trade,
+                            t.sym,
+                            t.agg_id,
+                            t.ts_ms,
+                            t.price_1e6,
+                            signed_qty,
+                        ));
+                        status.add_msgs(1);
+                        status.add_ticks(1);
+                    }
+                    None => {
+                        status.inc_parse_errors();
+                        capture.parse_reject(now_ns(), payload);
+                    }
+                }
+                return;
+            }
+            SentinelFrame::Control => {
+                // The SUBSCRIBE ack (or a venue error naming it) — a
+                // message, not data, not a rejection.
+                status.add_msgs(1);
+                return;
+            }
+            SentinelFrame::BookTicker => {}
+        }
+    }
+    if let Some(f) = parse_book_ticker(payload, *slot_sym) {
         let ts_ns = now_ns();
         // VT2: one parse-complete stamp serves the judgement and the
-        // tick. Spot pushes carry venue_time 0 ⇒ never stale (the
-        // sentinel step supplies their stamp later).
-        let judged = drv.feed_clock.judge(f.venue_time_ms, ts_ns);
+        // tick. A direct stamp (USDS-M `T`/`E`) is judged here; a spot
+        // push carries none and inherits the sentinel's latest stamp +
+        // verdict (bit1 marks the inference; no sentinel print yet ⇒
+        // 0 / never stale, the v2 law).
+        let (venue_time_ms, flags) = if f.venue_time_ms != 0 {
+            let judged = feed_clock.judge(f.venue_time_ms, ts_ns);
+            (f.venue_time_ms, (judged.stale as u8) * TICK_FLAG_STALE)
+        } else if *sentinel_time_ms != 0 {
+            (
+                *sentinel_time_ms,
+                *sentinel_stale_flag | TICK_FLAG_VENUE_TIME_SENTINEL,
+            )
+        } else {
+            (0, 0)
+        };
         // `update_id` fits comfortably in u32 over the lifetime of a
         // connection (Binance resets on (re)connect). Truncate for the
         // venue_seq slot; it's only used for monotonicity checks.
@@ -801,13 +987,13 @@ fn handle_text_frame<C: Capture>(
             Qty::from_raw(f.bid_qty_1e6),
             Price::from_raw(f.ask_px_1e6),
             Qty::from_raw(f.ask_qty_1e6),
-            f.venue_time_ms,
-            (judged.stale as u8) * TICK_FLAG_STALE,
+            venue_time_ms,
+            flags,
         );
-        if judged.stale {
+        if tick.is_stale() {
             status.inc_stale_ticks();
         }
-        status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
+        status.set_feed_delay_ema_ms(feed_clock.delay_ema_ms());
         // §6.5 capture BEFORE the push — a ring-dropped tick must still
         // reach the replay log (the audit pairs capture counts with
         // ring_drops_total).
@@ -1411,6 +1597,188 @@ mod tests {
         assert_eq!(status.state(), core_metrics::IngressState::Up);
         assert!(status.last_activity_ns() > 0);
         assert_eq!(status.bytes_total(), resp.len() as u64);
+        // A plain slot subscribes nothing after the upgrade.
+        assert_eq!(t.outgoing_len(), 0, "no sentinel ⇒ no SUBSCRIBE frame");
+    }
+
+    /// VT2: a spot sentinel slot queues `<sym>@aggTrade` on the same
+    /// socket the moment the upgrade lands.
+    #[test]
+    fn sentinel_slot_subscribes_agg_trade_after_upgrade() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new_spot_sentinel(42, 7, b"btcusdt");
+        assert!(d.has_sentinel());
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        note_transport_ready(&mut d, Status::Ready);
+        drive_one(&mut t, &mut d, b"host", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
+        let mut scratch = [0u8; 4096];
+        let _ = t.drain_outgoing(&mut scratch);
+        let key = sec_key_pub(42);
+        let resp = build_server_response(&expected_accept_pub(&key));
+        t.inject_incoming(&resp);
+        drive_one(&mut t, &mut d, b"host", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
+        assert_eq!(d.state(), State::Steady);
+        // The next drive flushes the queued SUBSCRIBE (masked text frame).
+        drive_one(&mut t, &mut d, b"host", b"/ws/btcusdt@bookTicker", &mut prod, &status, &mut NullCapture).unwrap();
+        let n = t.drain_outgoing(&mut scratch);
+        assert!(n > 0, "SUBSCRIBE must be sent");
+        assert_eq!(scratch[0], 0x81, "FIN + text");
+        assert_ne!(scratch[1] & 0x80, 0, "client frames are masked");
+        let len = (scratch[1] & 0x7F) as usize;
+        let mask = [scratch[2], scratch[3], scratch[4], scratch[5]];
+        let mut body = scratch[6..6 + len].to_vec();
+        for (i, b) in body.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+        assert_eq!(
+            body,
+            br#"{"method":"SUBSCRIBE","params":["btcusdt@aggTrade"],"id":1}"#
+        );
+    }
+
+    /// VT2: an over-long symbol leaves the slot sentinel-less instead
+    /// of truncating the stream name (debug-asserted in debug builds).
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "sentinel symbol length"))]
+    fn sentinel_symbol_over_max_is_refused() {
+        let d = Driver::new_spot_sentinel(1, 7, &[b'a'; SENTINEL_STREAM_MAX]);
+        assert!(!d.has_sentinel());
+    }
+
+    /// VT2 helper: one spot bookTicker push (no stamp) on a sentinel
+    /// slot; returns its tick.
+    fn push_spot_book_ticker(
+        t: &mut TestTransport,
+        d: &mut Driver,
+        prod: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+        cons: &mut core_ring::Consumer<Tick, DEFAULT_TICK_RING_CAP>,
+        status: &core_metrics::IngressStatus,
+        u: u64,
+    ) -> Tick {
+        let s = format!(r#"{{"u":{u},"s":"BTCUSDT","b":"25.35","B":"31.21","a":"25.36","A":"40.66"}}"#);
+        t.inject_incoming(&ws_text_frame(s.as_bytes()));
+        drive_one(t, d, b"host", b"/", prod, status, &mut NullCapture).unwrap();
+        cons.try_pop().expect("bookTicker must produce a tick")
+    }
+
+    /// VT2 helper: one aggTrade print stamped `T = t_ms` on the same
+    /// slot (captured, never a tick).
+    fn push_agg_trade<C: Capture>(
+        t: &mut TestTransport,
+        d: &mut Driver,
+        prod: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+        status: &core_metrics::IngressStatus,
+        capture: &mut C,
+        t_ms: u64,
+        agg_id: u64,
+        buyer_is_maker: bool,
+    ) {
+        let s = format!(
+            r#"{{"e":"aggTrade","E":{},"s":"BTCUSDT","a":{agg_id},"p":"25.35","q":"0.5","f":1,"l":2,"T":{t_ms},"m":{buyer_is_maker},"M":true}}"#,
+            t_ms + 1
+        );
+        t.inject_incoming(&ws_text_frame(s.as_bytes()));
+        drive_one(t, d, b"host", b"/", prod, status, capture).unwrap();
+    }
+
+    #[test]
+    fn spot_book_ticker_inherits_the_sentinel_stamp_and_verdict() {
+        // VT2: before any print the spot tick is "unknown, never stale";
+        // after a fresh print it inherits that stamp with bit1; after a
+        // 5 s-older print it inherits STALE | SENTINEL; a fresh print
+        // clears it again. aggTrades never produce ticks.
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = Driver::new_spot_sentinel(7, 42, b"btcusdt");
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let t0: u64 = 1_755_216_000_000;
+
+        let unknown = push_spot_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, 1);
+        assert_eq!(unknown.venue_time_ms, 0);
+        assert_eq!(unknown.flags, 0);
+
+        push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut NullCapture, t0, 100, false);
+        assert!(cons.try_pop().is_none(), "a print is never a tick");
+        assert_eq!(d.sentinel_time_ms(), t0);
+        let fresh = push_spot_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, 2);
+        assert_eq!(fresh.venue_time_ms, t0, "inherited from the sentinel");
+        assert_eq!(fresh.flags, TICK_FLAG_VENUE_TIME_SENTINEL);
+        assert!(!fresh.is_stale());
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut NullCapture, t0 - 5_000, 101, true);
+        let stale = push_spot_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, 3);
+        assert_eq!(stale.venue_time_ms, t0 - 5_000);
+        assert_eq!(stale.flags, TICK_FLAG_STALE | TICK_FLAG_VENUE_TIME_SENTINEL);
+        assert!(stale.is_stale());
+        assert_eq!(status.stale_ticks_total(), 1);
+        // every bookTicker between prints inherits the same verdict
+        let stale2 = push_spot_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, 4);
+        assert!(stale2.is_stale());
+        assert_eq!(status.stale_ticks_total(), 2);
+
+        push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut NullCapture, t0 + 10, 102, false);
+        let again = push_spot_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, 5);
+        assert_eq!(again.flags, TICK_FLAG_VENUE_TIME_SENTINEL);
+        assert!(!again.is_stale());
+        assert_eq!(status.stale_ticks_total(), 2);
+        // 5 bookTicker ticks + 3 prints = 8 data rows; no rejects.
+        assert_eq!(status.ticks_total(), 8);
+        assert_eq!(status.parse_errors_total(), 0);
+    }
+
+    #[test]
+    fn sentinel_prints_are_captured_as_signed_trade_events_and_acks_are_quiet() {
+        struct EventCap {
+            events: Vec<core_types::ChannelEvent>,
+            rejects: u32,
+        }
+        impl Capture for EventCap {
+            fn tick(&mut self, _t: &Tick) {}
+            fn event(&mut self, e: &core_types::ChannelEvent) {
+                self.events.push(*e);
+            }
+            fn raw_frame(&mut self, _ts: NsTs, _p: &[u8]) {}
+            fn parse_reject(&mut self, _ts: NsTs, _p: &[u8]) {
+                self.rejects += 1;
+            }
+        }
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = Driver::new_spot_sentinel(7, 42, b"btcusdt");
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = EventCap {
+            events: Vec::new(),
+            rejects: 0,
+        };
+        // The SUBSCRIBE ack: a message, not data, not a reject.
+        t.inject_incoming(&ws_text_frame(br#"{"result":null,"id":1}"#));
+        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.ticks_total(), 0);
+        assert_eq!(cap.rejects, 0);
+        assert!(cons.try_pop().is_none());
+
+        push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut cap, 1_755_216_000_000, 26_129, true);
+        push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut cap, 1_755_216_000_050, 26_130, false);
+        assert_eq!(cap.events.len(), 2);
+        let sell = &cap.events[0];
+        assert_eq!(sell.venue, core_types::VenueId::Binance as u8);
+        assert_eq!(sell.channel, ChannelId::Trade as u8);
+        assert_eq!(sell.sym, 42);
+        assert_eq!(sell.venue_seq, 26_129);
+        assert_eq!(sell.venue_time_ms, 1_755_216_000_000);
+        assert_eq!(sell.v0, 25_350_000, "px ×1e6");
+        assert_eq!(sell.v1, -500_000, "m:true = the aggressor sold ⇒ negated qty");
+        assert_eq!(cap.events[1].v1, 500_000, "m:false = the aggressor bought");
+        assert!(cons.try_pop().is_none(), "prints never reach the tick ring");
+        assert_eq!(cap.rejects, 0);
     }
 
     #[test]

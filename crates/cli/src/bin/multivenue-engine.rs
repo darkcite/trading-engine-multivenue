@@ -1236,6 +1236,9 @@ fn run(args: RunArgs) -> ExitCode {
                 sym: inst.sym,
                 eapi: None,
                 mark_price: false,
+                // VT2: spot bookTicker carries no venue stamp — the
+                // aggTrade sentinel rides the same socket.
+                spot_sentinel: true,
             });
         }
         for inst in boot
@@ -1250,6 +1253,8 @@ fn run(args: RunArgs) -> ExitCode {
                 sym: inst.sym,
                 eapi: None,
                 mark_price: false,
+                // USDS-M bookTicker stamps itself (T/E) — no sentinel.
+                spot_sentinel: false,
             });
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_fut_ws_host.clone(),
@@ -1257,6 +1262,7 @@ fn run(args: RunArgs) -> ExitCode {
                 sym: inst.sym,
                 eapi: None,
                 mark_price: true,
+                spot_sentinel: false,
             });
         }
         if bn_eapi_on {
@@ -1296,6 +1302,7 @@ fn run(args: RunArgs) -> ExitCode {
                 sym: 0,
                 eapi: Some((table, boot.bn_options.underlyings.clone())),
                 mark_price: false,
+                spot_sentinel: false,
             });
         }
         if bn_eapi_on {

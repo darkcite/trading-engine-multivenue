@@ -249,3 +249,29 @@ ruling); the Binance spot book-builder lane; any strategy work.
   fresh/stale/fresh, override + reconnect reset. `polymarket_clob_frame`
   fuzz ≥ 300 s. Remaining: the bn-spot aggTrade sentinel (VT2's last
   step), then the live smoke.
+- 2026-09-03 — **VT2 venue 7: the Binance-spot aggTrade SENTINEL —
+  VT2 code-complete.** A spot bookTicker slot (`Driver::new_spot_sentinel`,
+  `BinanceConnSpec.spot_sentinel`, the legacy single-connection lane
+  too) queues `{"method":"SUBSCRIBE","params":["<sym>@aggTrade"],"id":1}`
+  on the SAME socket the moment the upgrade lands (stack scratch, no
+  allocation). One substring probe per frame sorts the socket:
+  `"e":"aggTrade"` ⇒ the print's `T` teaches the connection's
+  `FeedClock`, its verdict + stamp are latched, and the print is
+  captured as a `ChannelId::Trade` row (`venue_seq` = aggregate id,
+  `venue_time_ms` = `T`, `v0` = px ×1e6, `v1` = qty ×1e6 NEGATED when
+  `m:true` — the aggressor sold — the cross-venue convention; capture
+  only, no engine lane); `{"result":…}` / `{"error":…}` ⇒ the SUBSCRIBE
+  reply, a message not data; anything else ⇒ bookTicker, which INHERITS
+  the sentinel's latest stamp + verdict with `TICK_FLAG_VENUE_TIME_SENTINEL`
+  set (no print yet ⇒ 0 / never stale). USDS-M slots keep their direct
+  `T`/`E` judgement. `TradeFrame` gains `ts_ms` / `agg_id` /
+  `is_buyer_maker`. Tests: parser (agg id + maker flag), subscribe frame
+  after upgrade (unmasked and byte-checked), plain slots subscribe
+  nothing, over-long symbol refused, inherit unknown → fresh+bit1 →
+  stale+bit1 (every tick between prints) → fresh, prints never reach
+  the tick ring, Trade rows signed correctly, acks quiet.
+  `binance_agg_trade` + `binance_book_ticker` fuzz ≥ 300 s each.
+  **What is left of VT2 is the live smoke** (operator relink + boot,
+  `--raw-tap`, delays vs `latency_probe` ±10 ms p50, and the first
+  sighting of `engine_ingress_bn_stale_ticks_total` moving during a
+  Binance staleness episode).

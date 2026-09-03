@@ -40,7 +40,9 @@ pub use run_loop::{
 use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte};
 use core_types::{NsTs, SymbolId};
 
-/// A parsed Binance trade — mapped to a `Signal` downstream.
+/// A parsed Binance `aggTrade` — the VT2 spot staleness SENTINEL (its
+/// `T` teaches the connection's clock offset) and, since VT2, a
+/// captured `ChannelId::Trade` event.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TradeFrame {
     /// Symbol id resolved from the "s" field at boot.
@@ -51,6 +53,15 @@ pub struct TradeFrame {
     pub qty_1e6: i64,
     /// Trade time (`"T"` field, millis → nanos).
     pub ts_ns: NsTs,
+    /// Trade time in raw venue milliseconds (`"T"`) — the sentinel
+    /// stamp.
+    pub ts_ms: u64,
+    /// Aggregate trade id (`"a"`; 0 when absent) — the capture's
+    /// `venue_seq`.
+    pub agg_id: u64,
+    /// `"m":true` ⇒ the buyer was the maker ⇒ the aggressor SOLD (the
+    /// capture negates the qty, the OKX/Deribit/Bybit/HL convention).
+    pub is_buyer_maker: bool,
 }
 
 /// Parse a Binance `aggTrade` frame into a `TradeFrame`. Returns
@@ -70,11 +81,20 @@ pub fn parse_trade(buf: &[u8], sym: SymbolId) -> Option<TradeFrame> {
     let pos = find_field(buf, b"\"T\":")?;
     let (ts_ms, _) = scan_u64(buf, pos)?;
 
+    // Aggregate id: "a":26129 (optional — 0 when absent).
+    let agg_id = find_field(buf, b"\"a\":")
+        .and_then(|pos| scan_u64(buf, pos))
+        .map_or(0, |(v, _)| v);
+    let is_buyer_maker = memchr::memmem::find(buf, b"\"m\":true").is_some();
+
     Some(TradeFrame {
         sym,
         price_1e6,
         qty_1e6,
         ts_ns: ts_ms.saturating_mul(1_000_000),
+        ts_ms,
+        agg_id,
+        is_buyer_maker,
     })
 }
 
@@ -319,6 +339,22 @@ mod tests {
         assert_eq!(t.price_1e6, 65_432_100_000);
         assert_eq!(t.qty_1e6, 50_000);
         assert_eq!(t.ts_ns, 1_713_000_000_000 * 1_000_000);
+        // VT2: raw ms stamp, absent agg id ⇒ 0, absent "m" ⇒ taker bought.
+        assert_eq!(t.ts_ms, 1_713_000_000_000);
+        assert_eq!(t.agg_id, 0);
+        assert!(!t.is_buyer_maker);
+    }
+
+    #[test]
+    fn parse_trade_extracts_agg_id_and_maker_flag() {
+        // The live spot aggTrade shape (docs: a, p, q, f, l, T, m, M).
+        let live = br#"{"e":"aggTrade","E":1672515782136,"s":"BTCUSDT","a":26129,"p":"0.001","q":"100","f":100,"l":105,"T":1672515782136,"m":true,"M":true}"#;
+        let t = parse_trade(live, 7).unwrap();
+        assert_eq!(t.agg_id, 26_129);
+        assert!(t.is_buyer_maker, "m:true = the aggressor sold");
+        assert_eq!(t.ts_ms, 1_672_515_782_136);
+        let taker_buy = br#"{"e":"aggTrade","a":1,"p":"1","q":"1","T":5,"m":false}"#;
+        assert!(!parse_trade(taker_buy, 7).unwrap().is_buyer_maker);
     }
 
     #[test]
