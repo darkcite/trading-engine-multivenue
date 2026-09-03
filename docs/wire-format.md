@@ -101,7 +101,7 @@ reader-compat surface.
 |     24 |     8 | qty         | `i64` Qty      |                                 |
 |     32 |     8 | client_oid  | `u64`          | engine-assigned, monotonic      |
 |     40 |     1 | venue       | `u8` VenueId   | routing target (v2+; garbage in v1) |
-|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=ev 2=cross-arb 3=rule-tree 4=ai-exec 5=vm), stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
+|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=ev 2=cross-arb 3=rule-tree 4=ai-exec 5=vm 6=icdp — ICDP I4, 2026-09-03: the intrabar member; its intents are `kind = 1` IoC with `ttl_ns` = the bar's remaining life), stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
 |     42 |     6 | _pad1       | `[u8; 6]`      | explicit, zeroed                |
 |     48 |     8 | ttl_ns      | `u64`          | I1 (2026-09-03): time-to-live relative to `ts_ns`; 0 = none. A MODEL field — the offline fill law (`backtest::fill`) cancels the order at the first record of its sym at/after `ts_ns + ttl_ns` (an IoC that meets no fresh tick before its emitting bar closes is a cancel); no engine cancel path reads it (Stage-3). Wire-additive: every Order persisted before I1 carries 0 here (the bytes were explicit zeroed padding) |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed                |

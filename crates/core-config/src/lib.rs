@@ -29,6 +29,7 @@ use std::path::Path;
 
 use zeroize::Zeroize;
 
+pub mod icdp;
 pub mod universe;
 
 // ---------------------------------------------------------------

@@ -239,6 +239,135 @@ impl FeedClock {
 }
 
 // ---------------------------------------------------------------
+// I2 (ICDP): wall anchor + bar clock.
+// ---------------------------------------------------------------
+
+/// One (monotonic, wall) pair taken back-to-back ONCE at boot, so a
+/// strategy can put a monotonic timestamp on a UTC bar grid without
+/// ever touching the wall clock again (doctrine: venue time is data,
+/// the monotonic clock orders, the wall clock only ANCHORS).
+///
+/// Live: [`WallAnchor::now`] in the boot path. Replay: the harness
+/// builds it from its virtual-clock rebase (`virt = VIRT_T0 + (epoch −
+/// epoch_0) + (ts − ts_first)`, `wall = epoch + (ts − ts_first)`), i.e.
+/// `WallAnchor::new(VIRT_T0, epoch_0)` — bars fall on the same UTC
+/// boundaries offline as they did live. POD, `Copy`, no drop.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct WallAnchor {
+    /// Monotonic ns at the anchor instant.
+    pub mono_ns: NsTs,
+    /// Wall-clock ns since the Unix epoch at the same instant.
+    pub wall_ns: u64,
+}
+
+impl WallAnchor {
+    /// Pin the anchor.
+    #[inline(always)]
+    pub const fn new(mono_ns: NsTs, wall_ns: u64) -> Self {
+        Self { mono_ns, wall_ns }
+    }
+
+    /// Take the anchor NOW (two syscalls back-to-back; boot path only —
+    /// never called from a tick callback).
+    pub fn now() -> Self {
+        let mono_ns = now_ns();
+        let wall_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Self { mono_ns, wall_ns }
+    }
+
+    /// Wall ns of a monotonic instant. Wrapping arithmetic on purpose:
+    /// an instant slightly BEFORE the anchor (a tick parsed in the boot
+    /// race) maps to `wall − (anchor − instant)` exactly, and the
+    /// caller guarantees `wall ≥ anchor − instant` (both are ≥ 2026).
+    #[inline(always)]
+    pub const fn wall_of(&self, mono_ns: NsTs) -> u64 {
+        self.wall_ns
+            .wrapping_add(mono_ns.wrapping_sub(self.mono_ns))
+    }
+
+    /// Monotonic ns of a wall instant (the inverse of [`Self::wall_of`],
+    /// same wrapping law).
+    #[inline(always)]
+    pub const fn mono_of(&self, wall_ns: u64) -> NsTs {
+        self.mono_ns
+            .wrapping_add(wall_ns.wrapping_sub(self.wall_ns))
+    }
+}
+
+/// A UTC-aligned bar grid over the monotonic clock: bar `id` opens at
+/// wall `id × tf` (so `tf = 60 s` bars open on the minute), the
+/// decision point sits `delta` after the open, the close is the next
+/// open. Pure integer arithmetic, inlined; the only division is in
+/// [`BarClock::bar_id`], which a strategy calls on a ROLL, not per
+/// tick (compare against [`BarClock::close_mono`] instead). POD.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct BarClock {
+    /// The boot / replay anchor.
+    pub anchor: WallAnchor,
+    /// Bar length, ns (> 0).
+    pub tf_ns: u64,
+    /// Decision offset from the open, ns (< `tf_ns`).
+    pub delta_ns: u64,
+}
+
+impl BarClock {
+    /// Build a grid. `tf_ns > 0`, `delta_ns < tf_ns` (debug-asserted;
+    /// a config layer validates before boot).
+    #[inline(always)]
+    pub const fn new(anchor: WallAnchor, tf_ns: u64, delta_ns: u64) -> Self {
+        debug_assert!(tf_ns > 0, "bar length must be positive");
+        debug_assert!(delta_ns < tf_ns, "decision must fall inside the bar");
+        Self {
+            anchor,
+            tf_ns,
+            delta_ns,
+        }
+    }
+
+    /// The bar containing monotonic instant `mono_ns` (one division).
+    #[inline(always)]
+    pub const fn bar_id(&self, mono_ns: NsTs) -> u64 {
+        self.anchor.wall_of(mono_ns) / self.tf_ns
+    }
+
+    /// Wall ns at which bar `id` opens.
+    #[inline(always)]
+    pub const fn open_wall(&self, id: u64) -> u64 {
+        id * self.tf_ns
+    }
+
+    /// Monotonic ns at which bar `id` opens.
+    #[inline(always)]
+    pub const fn open_mono(&self, id: u64) -> NsTs {
+        self.anchor.mono_of(self.open_wall(id))
+    }
+
+    /// Monotonic ns of bar `id`'s decision point (`open + delta`).
+    #[inline(always)]
+    pub const fn decision_mono(&self, id: u64) -> NsTs {
+        self.open_mono(id).wrapping_add(self.delta_ns)
+    }
+
+    /// Monotonic ns at which bar `id` closes (= the next open).
+    #[inline(always)]
+    pub const fn close_mono(&self, id: u64) -> NsTs {
+        self.open_mono(id).wrapping_add(self.tf_ns)
+    }
+
+    /// Time left in bar `id` at `mono_ns` — the `Order.ttl_ns` of an
+    /// intent that must not outlive its bar (0 when the bar is over).
+    #[inline(always)]
+    pub const fn ttl_to_close(&self, id: u64, mono_ns: NsTs) -> u64 {
+        self.close_mono(id).saturating_sub(mono_ns)
+    }
+}
+
+// ---------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------
 
@@ -247,6 +376,90 @@ mod tests {
     use super::*;
 
     const MS: u64 = 1_000_000;
+
+    // -------- I2: WallAnchor + BarClock --------
+
+    const WALL_2026: u64 = 1_788_400_000_000_000_000; // 2026-09-03T02:26:40Z
+    const MONO_0: u64 = 3_191_000_000_000_000;
+
+    #[test]
+    fn wall_anchor_maps_both_ways_and_survives_a_pre_anchor_instant() {
+        let a = WallAnchor::new(MONO_0, WALL_2026);
+        assert_eq!(a.wall_of(MONO_0), WALL_2026);
+        assert_eq!(a.wall_of(MONO_0 + 5 * MS), WALL_2026 + 5 * MS);
+        assert_eq!(a.mono_of(WALL_2026 + 5 * MS), MONO_0 + 5 * MS);
+        // 7 ns before the anchor: wraps back exactly, no saturation.
+        assert_eq!(a.wall_of(MONO_0 - 7), WALL_2026 - 7);
+        assert_eq!(a.mono_of(a.wall_of(12_345)), 12_345);
+    }
+
+    #[test]
+    fn wall_anchor_now_is_within_a_second_of_the_system_clock() {
+        let a = WallAnchor::now();
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        assert!(a.wall_ns > 1_700_000_000_000_000_000, "epoch ns, not zero");
+        assert!(wall.abs_diff(a.wall_ns) < 1_000_000_000);
+        assert!(now_ns() >= a.mono_ns);
+    }
+
+    #[test]
+    fn bar_ids_are_utc_aligned_and_monotone_with_open_decision_close_in_order() {
+        let a = WallAnchor::new(MONO_0, WALL_2026);
+        let tf = 15_000 * MS; // 15 s
+        let c = BarClock::new(a, tf, 3_750 * MS); // δ = 25 %
+        // The anchor instant sits inside some bar; its open is on the
+        // 15 s wall grid.
+        let id0 = c.bar_id(MONO_0);
+        assert_eq!(c.open_wall(id0) % tf, 0);
+        assert!(c.open_wall(id0) <= WALL_2026 && WALL_2026 < c.open_wall(id0 + 1));
+        assert_eq!(c.open_mono(id0) + tf, c.close_mono(id0));
+        assert_eq!(c.close_mono(id0), c.open_mono(id0 + 1));
+        assert_eq!(c.decision_mono(id0), c.open_mono(id0) + 3_750 * MS);
+        // Monotone: the last ns of the bar is still the bar; the close is the next.
+        assert_eq!(c.bar_id(c.close_mono(id0) - 1), id0);
+        assert_eq!(c.bar_id(c.close_mono(id0)), id0 + 1);
+        // 1 h later: 240 bars on.
+        assert_eq!(c.bar_id(c.open_mono(id0) + 3_600_000 * MS), id0 + 240);
+    }
+
+    #[test]
+    fn ttl_to_close_counts_down_and_floors_at_zero() {
+        let a = WallAnchor::new(MONO_0, WALL_2026);
+        let c = BarClock::new(a, 60_000 * MS, 30_000 * MS);
+        let id = c.bar_id(MONO_0);
+        let open = c.open_mono(id);
+        assert_eq!(c.ttl_to_close(id, open), 60_000 * MS);
+        assert_eq!(c.ttl_to_close(id, open + 59_999 * MS), MS);
+        assert_eq!(c.ttl_to_close(id, c.close_mono(id)), 0);
+        assert_eq!(c.ttl_to_close(id, c.close_mono(id) + 5), 0);
+    }
+
+    #[test]
+    fn replay_anchor_reproduces_the_harness_rebase() {
+        // Harness law: virt = VIRT_T0 + (epoch − epoch_0) + (ts − ts_first),
+        // wall = epoch + (ts − ts_first)  ⇒  anchor = (VIRT_T0, epoch_0).
+        const VIRT_T0: u64 = 100_000_000_000_000_000;
+        let epoch_0 = WALL_2026;
+        let a = WallAnchor::new(VIRT_T0, epoch_0);
+        let epoch_1 = epoch_0 + 8 * 3_600_000 * MS; // a second run 8 h later
+        let ts_first = 77_777;
+        let ts = ts_first + 12_345 * MS;
+        let virt = VIRT_T0 + (epoch_1 - epoch_0) + (ts - ts_first);
+        let wall = epoch_1 + (ts - ts_first);
+        assert_eq!(a.wall_of(virt), wall);
+        let c = BarClock::new(a, 60_000 * MS, 15_000 * MS);
+        assert_eq!(c.bar_id(virt), wall / (60_000 * MS));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "decision must fall inside the bar")]
+    fn bar_clock_refuses_a_decision_outside_the_bar() {
+        let _ = BarClock::new(WallAnchor::new(0, 0), 1_000, 1_000);
+    }
 
     #[test]
     fn feed_clock_unknown_venue_time_is_never_stale_and_never_learns() {

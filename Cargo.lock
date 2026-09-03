@@ -153,6 +153,7 @@ dependencies = [
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
@@ -335,6 +336,7 @@ dependencies = [
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
@@ -1754,6 +1756,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-icdp"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "core-types",
+ "proptest",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-latency-arb"
 version = "0.1.0"
 dependencies = [
@@ -1785,6 +1797,7 @@ dependencies = [
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-vm",

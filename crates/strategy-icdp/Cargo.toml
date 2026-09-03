@@ -1,0 +1,17 @@
+[package]
+name         = "strategy-icdp"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "ICDP intrabar candle-direction strategy: bar clock, L1 features, linear composite, IoC intents (slot 6)"
+
+[dependencies]
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

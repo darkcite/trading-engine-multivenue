@@ -300,6 +300,13 @@ struct RunArgs {
     /// `--strategy rule-tree`.
     #[arg(long)]
     rules_path: Option<PathBuf>,
+    /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
+    /// by default). Read only when the requested mask carries the icdp
+    /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
+    /// unresolvable artifact refuses the boot with the bit set — never
+    /// a silent no-op.
+    #[arg(long)]
+    icdp: Option<PathBuf>,
     /// Cadence in seconds for periodic HdrHistogram dumps. `0`
     /// disables dumping (default). When >0, the engine writes the
     /// three latency histograms (ingest→strategy, strategy→submit,
@@ -1653,7 +1660,7 @@ fn run(args: RunArgs) -> ExitCode {
                     ai_prod,
                     ruleset_table_prod,
                     ai_universe,
-                    ai_descriptors,
+                    ai_descriptors.clone(),
                     ai_status.clone(),
                     4,
                     &run_dir,
@@ -1906,7 +1913,7 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        (name @ ("all" | "ai" | "ai-exec" | "vm"), _live) => {
+        (name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp"), _live) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
             // latency-arb from the mandatory pair flags, ev/cross-arb/
@@ -1947,6 +1954,22 @@ fn run(args: RunArgs) -> ExitCode {
                 .rules_path
                 .as_deref()
                 .map(|rp| (rp, mapping.as_slice()));
+            // ICDP I5: resolve the artifact against the SAME
+            // descriptor table the ruleset validator uses (D-6 truth).
+            // Only when the bit is requested — `--strategy ai` never
+            // touches the file.
+            let icdp_params = if requested & strategy_set::BIT_ICDP != 0 {
+                match load_icdp_params(args.icdp.as_deref(), &ai_descriptors) {
+                    Ok(p) => Some(p),
+                    Err(reason) => {
+                        error!(reason, "icdp: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
             info!("running strategy-set PAPER — no orders will be submitted");
             engine_loop_set_full(
                 cons,
@@ -1957,6 +1980,7 @@ fn run(args: RunArgs) -> ExitCode {
                 ev_path.as_deref(),
                 &groups_ref,
                 rules,
+                icdp_params.as_ref(),
             )
         }
         (other, _) => {
@@ -1986,4 +2010,52 @@ fn run(args: RunArgs) -> ExitCode {
     }
     info!("clean shutdown");
     exit_code
+}
+
+/// ICDP I5: read `icdp.toml`, resolve every descriptor against the boot
+/// universe, build the POD artifact the strategy consumes, hash the
+/// exact bytes (logged + stamped by the strategy). Boot-only.
+fn load_icdp_params(
+    path: Option<&std::path::Path>,
+    descriptors: &ingress_ai::DescriptorTable,
+) -> Result<strategy_icdp::IcdpParams, String> {
+    let owned;
+    let path: &std::path::Path = match path {
+        Some(p) => p,
+        None => {
+            owned = core_config::icdp::default_icdp_path().map_err(|e| e.to_string())?;
+            std::path::Path::new(&owned)
+        }
+    };
+    let (file, bytes) = core_config::icdp::load(path).map_err(|e| e.to_string())?;
+    let mut params = strategy_icdp::IcdpParams::EMPTY;
+    params.tf_ns = file.tf_ms.saturating_mul(1_000_000);
+    params.delta_ns = file.delta_ms.saturating_mul(1_000_000);
+    params.n = file.instruments.len();
+    params.hash = core_crypto::sha256(&bytes);
+    for (i, inst) in file.instruments.iter().enumerate() {
+        let (sym, _caps) = descriptors
+            .resolve(inst.descriptor.as_bytes())
+            .ok_or_else(|| format!("icdp: `{}` is not in the boot universe", inst.descriptor))?;
+        params.syms[i] = strategy_icdp::IcdpSymParams {
+            sym,
+            mu: inst.mu,
+            inv_sd: inst.inv_sd,
+            w: inst.w,
+            b: inst.b,
+            thr: inst.thr,
+            notional_1e6: inst.notional_usd_1e6,
+            spread_cap_1e9: inst.spread_cap_1e9,
+            entry_slip_1e9: inst.entry_slip_1e9,
+            exit_slip_1e9: inst.exit_slip_1e9,
+        };
+        info!(
+            descriptor = %inst.descriptor,
+            sym,
+            notional_usd_1e6 = inst.notional_usd_1e6,
+            thr_1e9 = inst.thr,
+            "icdp: instrument resolved"
+        );
+    }
+    Ok(params)
 }

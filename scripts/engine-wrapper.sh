@@ -64,4 +64,21 @@ fi
 
 # Operator ruling 2026-09-02: AI-pushed lanes only (ai-exec + vm,
 # mask 48) — Rust-coded strategies disabled at boot.
-exec ./target/release/multivenue-engine run --paper --strategy ai
+#
+# ICDP I4 (2026-09-03): the operator opts the slot-6 intrabar member in
+# by writing `STRATEGY=ai+icdp` to ~/multivenue/strategy.conf (KEY=VALUE,
+# sourced; absent ⇒ `ai`). Paper only — `icdp` never boots without
+# `--paper` (belt and braces: no live dispatcher exists, and the plan's
+# I4 law says the wrapper refuses it regardless). The artifact
+# (~/multivenue/icdp.toml) must resolve, or the engine refuses the boot
+# and KeepAlive relaunches — check the launchd log, then fix the file
+# or drop the mask back to `ai`.
+STRATEGY="ai"
+if [ -f "$HOME/multivenue/strategy.conf" ]; then
+  . "$HOME/multivenue/strategy.conf"
+fi
+case "$STRATEGY" in
+  ai|ai+icdp|icdp) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp)" >&2; exit 78 ;;
+esac
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY"

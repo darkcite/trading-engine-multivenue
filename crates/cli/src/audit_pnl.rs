@@ -86,6 +86,7 @@ fn strategy_label(id: u8) -> &'static str {
         3 => "rule-tree",
         4 => "ai-exec",
         5 => "vm",
+        6 => "icdp",
         0xFF => "unattributed",
         _ => "unknown",
     }

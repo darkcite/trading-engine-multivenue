@@ -115,6 +115,21 @@ a v2 root is an upper bound.** Metrics:
 Engine-side delay per venue: `docs/venue-latency.md` §5. Capture windows
 for research are ≤ 2 h by law (VT plan §6.1).
 
+**Slot 6 — `strategy-icdp` (ICDP I1–I7, 2026-09-03; paper only).** The
+intrabar candle-direction member: a UTC bar grid (`core_time::BarClock`),
+L1 features from every tick, an offline-fitted linear composite, IoC
+taker intents (`Order.kind = 1`, `ttl_ns` = the bar's remaining life) —
+entry at `open + δ`, exit at the roll, one position per instrument per
+bar. Parameters come from `~/multivenue/icdp.toml` (`--icdp <path>`), a
+generated integer artifact (sha256 logged at boot); descriptors must
+resolve against the boot universe or the boot refuses. Enable with
+`--strategy ai+icdp` (the launchd wrapper reads `STRATEGY=ai+icdp` from
+`~/multivenue/strategy.conf`; default `ai`). The offline fill model
+scores its intents under the I1 IoC law and prints the fee ladder.
+Metrics: `engine_icdp_{decisions,signals,intents,exits,exit_on_stale,
+skipped_spread,skipped_stale_open,skipped_stale_dec,skipped_prev,late_bars,
+caps_rejected,rolls}_total`.
+
 ## Venue latency calibration — REQUIRED per deployment and per location
 
 The backtest / audit-pnl fill model activates an order `Δ_venue` after

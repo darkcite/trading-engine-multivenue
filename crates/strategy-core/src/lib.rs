@@ -170,6 +170,46 @@ pub trait StrategyCounters {
     fn vm_commit_dropped(&self) -> u64 {
         0
     }
+    /// icdp member (slot 6, ICDP I3/I4): the intrabar strategy's
+    /// diagnostic counters (`engine_icdp_*_total`). Zeroes for every
+    /// strategy but the set carrying a configured icdp member.
+    #[inline]
+    fn icdp_counters(&self) -> IcdpCounters {
+        IcdpCounters::default()
+    }
+}
+
+/// Diagnostic counters of the intrabar (ICDP) strategy — defined here
+/// so the engine/cli mirror them through [`StrategyCounters`] without
+/// naming the strategy crate (the vm-gauge precedent). POD.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct IcdpCounters {
+    /// Decisions evaluated (a fresh tick at/after `open + δ`).
+    pub decisions: u64,
+    /// Composites past the threshold.
+    pub signals: u64,
+    /// Entry IoCs emitted.
+    pub intents: u64,
+    /// Exit IoCs emitted.
+    pub exits: u64,
+    /// Exits emitted while the last quote was stale (fill deferred).
+    pub exit_on_stale: u64,
+    /// Bars skipped: spread over the cap at decision.
+    pub skipped_spread: u64,
+    /// Bars skipped: the open quote was stale (or absent / too old).
+    pub skipped_stale_open: u64,
+    /// Bars skipped: a stale tick inside the bar before the decision.
+    pub skipped_stale_dec: u64,
+    /// Bars skipped: the previous bar was not valid (gap / stale).
+    pub skipped_prev: u64,
+    /// Bars skipped: the first fresh tick after δ came in the last
+    /// fifth of the bar.
+    pub late_bars: u64,
+    /// Entries refused by the table cap.
+    pub caps_rejected: u64,
+    /// Bar rolls processed.
+    pub rolls: u64,
 }
 
 // ---------------------------------------------------------------

@@ -28,6 +28,7 @@ strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-cross-arb   = { workspace = true }
 strategy-rule-tree   = { workspace = true }
+strategy-icdp        = { workspace = true }
 strategy-set         = { workspace = true }
 # 8h backtest harness (cli::backtest): drives the real ruleset VM
 # offline and hashes the candidate artifact exactly like the worker.

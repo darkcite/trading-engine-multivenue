@@ -22,10 +22,11 @@
 //! | 3 | `strategy-rule-tree` | built |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
 //! | 5 | `strategy-vm` | built (8g item 6) |
+//! | 6 | `strategy-icdp` | built (ICDP I4, 2026-09-03) — configured only when `~/multivenue/icdp.toml` resolves |
 //!
-//! Slots 6–7 are the only reserved values: no member exists behind
-//! them, no bit constant is defined (the cli cannot express them via
-//! [`mask_for_name`]), and an `EnableStrategy` targeting them is
+//! Slot 7 is the only reserved value: no member exists behind it, no
+//! bit constant is defined (the cli cannot express it via
+//! [`mask_for_name`]), and an `EnableStrategy` targeting it is
 //! refused (counted).
 //!
 //! ## AI command routing (`on_ai`, §7)
@@ -85,6 +86,7 @@ use strategy_ai_exec::AiExec;
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 use strategy_cross_arb::CrossArb;
 use strategy_ev::EvStrategy;
+use strategy_icdp::IcdpStrategy;
 use strategy_latency_arb::LatencyArb;
 use strategy_rule_tree::RuleTree;
 use strategy_vm::VmStrategy;
@@ -107,6 +109,9 @@ pub const SLOT_AI_EXEC: u8 = STRATEGY_SLOT_AI_EXEC;
 /// Slot index of the vm member (wire value pinned in `core-types` —
 /// `RulesetStage`/`RulesetCommit` shape enforcement depends on it).
 pub const SLOT_VM: u8 = STRATEGY_SLOT_VM;
+/// Slot index of the icdp member (ICDP I4; `docs/wire-format.md`
+/// `Order.strategy_id` 6 = icdp).
+pub const SLOT_ICDP: u8 = 6;
 
 /// Enable-mask bit for the latency-arb member.
 pub const BIT_LATENCY_ARB: u8 = 1 << SLOT_LATENCY_ARB;
@@ -120,10 +125,12 @@ pub const BIT_RULE_TREE: u8 = 1 << SLOT_RULE_TREE;
 pub const BIT_AI_EXEC: u8 = 1 << SLOT_AI_EXEC;
 /// Enable-mask bit for the vm member (8g item 6).
 pub const BIT_VM: u8 = 1 << SLOT_VM;
+/// Enable-mask bit for the icdp member (ICDP I4).
+pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
 
-/// Every built member's bit (8g: slots 0–5).
+/// Every built member's bit (slots 0–6).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_EV | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM;
+    BIT_LATENCY_ARB | BIT_EV | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
 
 /// Latency-arb slot capacity inside the set (design §7 sketch).
 pub const SET_LATENCY_ARB_SLOTS: usize = 64;
@@ -158,6 +165,11 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
         // strategies disabled at boot; the engine executes only what
         // the AI command plane pushes — ai-exec intents + VM rulesets).
         "ai" => Some(BIT_AI_EXEC | BIT_VM),
+        // ICDP I4: the operator opts the intrabar member in beside
+        // the AI lanes (paper only — the wrapper refuses it without
+        // `--paper`); `icdp` alone boots it bare.
+        "icdp" => Some(BIT_ICDP),
+        "ai+icdp" => Some(BIT_AI_EXEC | BIT_VM | BIT_ICDP),
         "all" => Some(BUILT_MASK),
         _ => None,
     }
@@ -176,6 +188,7 @@ pub struct StrategySet {
     rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
     vm: VmStrategy,
+    icdp: IcdpStrategy,
     /// Runtime enable mask (bits per the slot map). Only built bits
     /// are ever set — Enable of a reserved slot is refused.
     enabled: u8,
@@ -206,6 +219,7 @@ impl StrategySet {
             rule_tree: RuleTree::new(),
             ai_exec: AiExec::new(),
             vm: VmStrategy::new(),
+            icdp: IcdpStrategy::new(),
             enabled: m,
             initial: m,
             halted: false,
@@ -278,6 +292,19 @@ impl StrategySet {
         &mut self.vm
     }
 
+    /// Read the icdp member (counters, params hash).
+    #[inline]
+    pub fn icdp(&self) -> &IcdpStrategy {
+        &self.icdp
+    }
+
+    /// Configure the icdp member (boot-only: `configure` with the wall
+    /// anchor + the resolved artifact).
+    #[inline]
+    pub fn icdp_mut(&mut self) -> &mut IcdpStrategy {
+        &mut self.icdp
+    }
+
     /// Set-level `EnableStrategy` handling. See module docs.
     #[inline]
     fn enable_slot(&mut self, slot: u8) {
@@ -292,8 +319,9 @@ impl StrategySet {
             SLOT_RULE_TREE => BIT_RULE_TREE,
             SLOT_AI_EXEC => BIT_AI_EXEC,
             SLOT_VM => BIT_VM,
-            // Reserved slots (6/7): no member behind them — refuse
-            // and count.
+            SLOT_ICDP => BIT_ICDP,
+            // Reserved slot (7): no member behind it — refuse and
+            // count.
             _ => {
                 self.enable_refused = self.enable_refused.wrapping_add(1);
                 return;
@@ -322,6 +350,7 @@ impl StrategyCounters for StrategySet {
             + self.rule_tree.orders_emitted()
             + self.ai_exec.orders_emitted()
             + self.vm.orders_emitted()
+            + self.icdp.orders_emitted()
     }
     #[inline]
     fn orders_dropped(&self) -> u64 {
@@ -331,6 +360,7 @@ impl StrategyCounters for StrategySet {
             + self.rule_tree.orders_dropped()
             + self.ai_exec.orders_dropped()
             + self.vm.orders_dropped()
+            + self.icdp.orders_dropped()
     }
     #[inline]
     fn strategy_kind(&self) -> &'static str {
@@ -378,6 +408,10 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vm_commit_dropped(&self) -> u64 {
         self.vm.commits_dropped
+    }
+    #[inline]
+    fn icdp_counters(&self) -> strategy_core::IcdpCounters {
+        self.icdp.icdp_counters()
     }
 }
 
@@ -443,6 +477,10 @@ impl Strategy for StrategySet {
         if self.initial & BIT_VM != 0 {
             self.vm.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VM))?;
         }
+        if self.initial & BIT_ICDP != 0 {
+            self.icdp
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_ICDP))?;
+        }
         Ok(())
     }
 
@@ -472,6 +510,10 @@ impl Strategy for StrategySet {
             self.vm
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        }
     }
 
     #[inline(always)]
@@ -499,6 +541,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
         }
     }
 
@@ -531,6 +577,10 @@ impl Strategy for StrategySet {
             self.vm
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        }
     }
 
     /// WS10-B: depth snapshots fan out to enabled members exactly
@@ -560,6 +610,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
         }
     }
 
@@ -591,6 +645,10 @@ impl Strategy for StrategySet {
             self.vm
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        }
     }
 
     #[inline(always)]
@@ -618,6 +676,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
         }
     }
 
@@ -666,6 +728,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        }
     }
 
     /// 8g §6 item 7: the engine's pre-AI-drain table pop lands here,
@@ -707,6 +773,10 @@ impl Strategy for StrategySet {
             self.vm
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
+        if self.enabled & BIT_ICDP != 0 {
+            self.icdp
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        }
     }
 
     /// Minimum over the BUILT members (mask-independent so the
@@ -735,6 +805,10 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
+        let v = self.icdp.timer_period_ns();
+        if v < min {
+            min = v;
+        }
         min
     }
 
@@ -752,6 +826,8 @@ impl Strategy for StrategySet {
         self.ai_exec
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
+        self.icdp
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_ICDP));
     }
 }
 
@@ -872,8 +948,10 @@ mod tests {
     fn new_clamps_reserved_bits_to_built_mask() {
         let s = StrategySet::new(0xFF);
         assert_eq!(s.enabled_mask(), BUILT_MASK);
-        let s = StrategySet::new(0b1100_0000);
-        assert_eq!(s.enabled_mask(), 0, "reserved bits 6/7 cleared");
+        let s = StrategySet::new(0b1000_0000);
+        assert_eq!(s.enabled_mask(), 0, "reserved bit 7 cleared");
+        let s = StrategySet::new(BIT_ICDP);
+        assert_eq!(s.enabled_mask(), BIT_ICDP, "slot 6 is built now (ICDP I4)");
         let s = StrategySet::new(BIT_AI_EXEC);
         assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built now");
         let s = StrategySet::new(BIT_VM);
@@ -1027,18 +1105,24 @@ mod tests {
         assert_eq!(s.enable_refused_total(), 2);
     }
 
-    /// Migrated from slot 5 in 8g item 6 (§8): the vm member is built
-    /// now, so the reserved-slot refusal probes are 6 and 7.
+    /// Migrated from slot 5 in 8g item 6 (§8) and from slot 6 in ICDP
+    /// I4: the only reserved slot is 7 (probed twice: reserved + an
+    /// out-of-range id).
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
         let mut s = set_with_latency_arb(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 6), &mut c);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 7), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 9), &mut c);
         assert_eq!(s.enabled_mask(), 0);
         assert_eq!(s.enable_refused_total(), 2);
         assert!(!s.is_halted(), "reserved-slot refusal is not a halt");
+        // Slot 6 enables (an unconfigured icdp member is inert: it
+        // registers nothing and never fires).
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_ICDP), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_ICDP);
+        assert_eq!(s.enable_refused_total(), 2);
     }
 
     #[test]

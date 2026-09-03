@@ -2451,6 +2451,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     ev_artifacts: Option<&std::path::Path>,
     cross_groups: &[&[core_types::SymbolId]],
     rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
+    icdp: Option<&strategy_icdp::IcdpParams>,
 ) -> EngineLoopResult {
     if cfg.pairs.is_empty() {
         return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
@@ -2465,6 +2466,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
     if rules.is_some() {
         configured |= strategy_set::BIT_RULE_TREE;
+    }
+    if icdp.is_some() {
+        configured |= strategy_set::BIT_ICDP;
     }
     let mask = requested_mask & configured;
     if mask == 0 {
@@ -2492,6 +2496,26 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             return EngineLoopResult::Failed(reason);
         }
     }
+    if let Some(params) = icdp {
+        // ICDP I2/I4: the wall anchor is taken HERE, once, right
+        // before the engine loop starts — the bar grid is UTC-aligned
+        // from this instant on; replay rebuilds the same anchor from
+        // the harness rebase (core_time::WallAnchor docs).
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.icdp_mut().configure(anchor, params) {
+            tracing::error!(error = %e, "icdp: artifact refused");
+            return EngineLoopResult::Failed("icdp: artifact refused by the strategy");
+        }
+        let h = set.icdp().params_hash();
+        tracing::info!(
+            hash = %format_hex32(h),
+            instruments = set.icdp().instruments(),
+            tf_ns = params.tf_ns,
+            delta_ns = params.delta_ns,
+            anchor_wall_ns = anchor.wall_ns,
+            "icdp: artifact configured"
+        );
+    }
     tracing::info!(
         mask,
         latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
@@ -2500,9 +2524,19 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
+        icdp = mask & strategy_set::BIT_ICDP != 0,
         "strategy-set: composed"
     );
     run_engine_loop(cons, disp, set, obs)
+}
+
+/// Lower-hex render of a 32-byte hash (boot log; cold path).
+fn format_hex32(h: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in h {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn format_u64_into(buf: &mut [u8; 32], mut v: u64) -> &[u8] {
@@ -2710,6 +2744,7 @@ impl Observability {
                 .register_gauge("engine_strategy_enabled_mask")
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
+            let icdp = register_icdp_metrics(&mut reg)?;
             let fills_capture = {
                 let io_errors = reg
                     .register_gauge("engine_fills_capture_io_errors")
@@ -2786,6 +2821,7 @@ impl Observability {
                 orders_capture,
                 strategy_enabled_mask,
                 vm,
+                icdp,
             });
         }
         if enable_tui {
@@ -3078,6 +3114,8 @@ pub struct EngineCounters {
     /// Phase-8g §9 vm-member family (`engine_vm_*`), mirrored
     /// centrally on the 5 s cadence.
     pub vm: VmMetricIds,
+    /// ICDP I4: the `engine_icdp_*_total` family (slot 6).
+    pub icdp: IcdpMetricIds,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -3390,6 +3428,102 @@ fn register_vm_metrics(
         rows_active,
         table_epoch,
     })
+}
+
+// ---------------------------------------------------------------
+// ICDP I4 — slot-6 observability (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// Registry handles for the ICDP family (`engine_icdp_*_total`),
+/// mirrored like the vm family through the `StrategyCounters`
+/// default accessor `icdp_counters` (zeros on every boot without a
+/// configured slot-6 member).
+#[derive(Copy, Clone, Debug)]
+pub struct IcdpMetricIds {
+    /// `engine_icdp_decisions_total`
+    pub decisions: core_metrics::CounterId,
+    /// `engine_icdp_signals_total`
+    pub signals: core_metrics::CounterId,
+    /// `engine_icdp_intents_total`
+    pub intents: core_metrics::CounterId,
+    /// `engine_icdp_exits_total`
+    pub exits: core_metrics::CounterId,
+    /// `engine_icdp_exit_on_stale_total`
+    pub exit_on_stale: core_metrics::CounterId,
+    /// `engine_icdp_skipped_spread_total`
+    pub skipped_spread: core_metrics::CounterId,
+    /// `engine_icdp_skipped_stale_open_total`
+    pub skipped_stale_open: core_metrics::CounterId,
+    /// `engine_icdp_skipped_stale_dec_total`
+    pub skipped_stale_dec: core_metrics::CounterId,
+    /// `engine_icdp_skipped_prev_total`
+    pub skipped_prev: core_metrics::CounterId,
+    /// `engine_icdp_late_bars_total`
+    pub late_bars: core_metrics::CounterId,
+    /// `engine_icdp_caps_rejected_total`
+    pub caps_rejected: core_metrics::CounterId,
+    /// `engine_icdp_rolls_total`
+    pub rolls: core_metrics::CounterId,
+}
+
+/// Register the ICDP family. Boot-only.
+fn register_icdp_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<IcdpMetricIds, &'static str> {
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name)
+            .map_err(|_| "register icdp counter")
+    };
+    Ok(IcdpMetricIds {
+        decisions: one("engine_icdp_decisions_total")?,
+        signals: one("engine_icdp_signals_total")?,
+        intents: one("engine_icdp_intents_total")?,
+        exits: one("engine_icdp_exits_total")?,
+        exit_on_stale: one("engine_icdp_exit_on_stale_total")?,
+        skipped_spread: one("engine_icdp_skipped_spread_total")?,
+        skipped_stale_open: one("engine_icdp_skipped_stale_open_total")?,
+        skipped_stale_dec: one("engine_icdp_skipped_stale_dec_total")?,
+        skipped_prev: one("engine_icdp_skipped_prev_total")?,
+        late_bars: one("engine_icdp_late_bars_total")?,
+        caps_rejected: one("engine_icdp_caps_rejected_total")?,
+        rolls: one("engine_icdp_rolls_total")?,
+    })
+}
+
+/// Mirror the ICDP family as monotonic deltas of the cumulative
+/// strategy counters. 5 s cadence — cold path.
+fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &IcdpMetricIds,
+    strat: &S,
+    last: &mut strategy_core::IcdpCounters,
+) {
+    let cur = strat.icdp_counters();
+    reg.counter(ids.decisions)
+        .inc(cur.decisions.saturating_sub(last.decisions));
+    reg.counter(ids.signals)
+        .inc(cur.signals.saturating_sub(last.signals));
+    reg.counter(ids.intents)
+        .inc(cur.intents.saturating_sub(last.intents));
+    reg.counter(ids.exits)
+        .inc(cur.exits.saturating_sub(last.exits));
+    reg.counter(ids.exit_on_stale)
+        .inc(cur.exit_on_stale.saturating_sub(last.exit_on_stale));
+    reg.counter(ids.skipped_spread)
+        .inc(cur.skipped_spread.saturating_sub(last.skipped_spread));
+    reg.counter(ids.skipped_stale_open)
+        .inc(cur.skipped_stale_open.saturating_sub(last.skipped_stale_open));
+    reg.counter(ids.skipped_stale_dec)
+        .inc(cur.skipped_stale_dec.saturating_sub(last.skipped_stale_dec));
+    reg.counter(ids.skipped_prev)
+        .inc(cur.skipped_prev.saturating_sub(last.skipped_prev));
+    reg.counter(ids.late_bars)
+        .inc(cur.late_bars.saturating_sub(last.late_bars));
+    reg.counter(ids.caps_rejected)
+        .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
+    reg.counter(ids.rolls)
+        .inc(cur.rolls.saturating_sub(last.rolls));
+    *last = cur;
 }
 
 // ---------------------------------------------------------------
@@ -3754,6 +3888,8 @@ where
     let mut ai_last = AiCountersSnapshot::default();
     // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
     let mut vm_last = VmCountersSnapshot::default();
+    // ICDP I4 slot-6 family delta snapshot (same bookkeeping).
+    let mut icdp_last = strategy_core::IcdpCounters::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -3822,6 +3958,7 @@ where
                 reg.gauge(ids.strategy_enabled_mask)
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
+                mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
 
                 // Per-ingress connection state — real per-thread
                 // status slots (D7 fix). Gauge value = IngressState:

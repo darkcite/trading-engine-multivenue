@@ -3719,3 +3719,117 @@ fn vm_feature_engine_paths_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "feature-engine bytes should be zero: saw {bytes}");
 }
+
+/// ICDP I3 gate (40): the slot-6 strategy's whole tick path — foreign
+/// syms, in-bar feature updates, stale ticks, the decision (features +
+/// composite + IoC entry), the bar roll (IoC exit), the 256-tick sweep
+/// — is 0 B/op after `configure`. Eight instruments (the D4 v1 count),
+/// 15 s bars, δ 25 %, with a threshold every bar clears.
+#[test]
+fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
+    use core_time::WallAnchor;
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_icdp::{IcdpParams, IcdpStrategy, IcdpSymParams, ICDP_NF, SCALE_1E9};
+
+    struct RingCtx {
+        prod: core_ring::Producer<core_types::Order, 1024>,
+    }
+    impl Ctx for RingCtx {
+        fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
+            self.prod.try_push(order).map_err(|_| SubmitErr::RingFull)
+        }
+        fn now_ns(&self) -> core_time::NsTs {
+            0
+        }
+    }
+
+    const MS: u64 = 1_000_000;
+    const TF: u64 = 15_000 * MS;
+    const N: usize = 8;
+    let mut params = IcdpParams::EMPTY;
+    params.tf_ns = TF;
+    params.delta_ns = 3_750 * MS;
+    params.n = N;
+    let mut k = 0usize;
+    while k < N {
+        params.syms[k] = IcdpSymParams {
+            sym: core_types::make_symbol_id(VenueId::Okx, k as u32 + 1),
+            mu: [0; ICDP_NF],
+            inv_sd: [SCALE_1E9; ICDP_NF],
+            w: [SCALE_1E9, 0, 0, 0, 0],
+            b: 0,
+            thr: SCALE_1E9 / 10, // 0.1 bps: fires on the +2 bps script below
+            notional_1e6: 1_000_000_000,
+            spread_cap_1e9: 5 * SCALE_1E9,
+            entry_slip_1e9: SCALE_1E9,
+            exit_slip_1e9: SCALE_1E9,
+        };
+        k += 1;
+    }
+    let ring: std::sync::Arc<Ring<core_types::Order, 1024>> = Ring::new();
+    let (prod, mut cons) = ring.split();
+    let mut s: Box<IcdpStrategy> = Box::new(IcdpStrategy::new());
+    let anchor = WallAnchor::new(1_000_000_000_000, 1_788_400_000_000_000_000);
+    s.configure(anchor, &params).unwrap();
+    let mut ctx = RingCtx { prod };
+    s.on_start(&mut ctx).unwrap();
+    let foreign = core_types::make_symbol_id(VenueId::Deribit, 77);
+
+    // One bar per 8 syms = 40 ticks: 4 in-bar quotes per sym (one of
+    // them stale every third bar), the decision tick at δ with a +2 bps
+    // move, then 8 foreign ticks. Bars roll on the next bar's first tick.
+    fn script_tick(i: u32, t0: u64, foreign: u32) -> Tick {
+        let bar = i / 40;
+        let j = i % 40;
+        let open = t0 + bar as u64 * TF;
+        let (sym_i, phase) = (j % 8, j / 8);
+        let sym = core_types::make_symbol_id(VenueId::Okx, sym_i + 1);
+        // The bar opens on the previous bar's last quote, so the
+        // decision quote must MOVE bar to bar: ±4 bps alternating.
+        let dec_bid = if bar % 2 == 0 { 100_040_000 } else { 99_960_000 };
+        let (sym, ts, bid, flags) = match phase {
+            0 => (sym, open + 10 * MS, 100_000_000, 0),
+            1 => (sym, open + 1_000 * MS, 100_001_000, if bar % 3 == 2 { core_types::TICK_FLAG_STALE } else { 0 }),
+            2 => (sym, open + 2_000 * MS, 100_002_000, 0),
+            3 => (sym, open + 3_750 * MS, dec_bid, 0),
+            _ => (foreign, open + 5_000 * MS, 1_000_000, 0),
+        };
+        Tick::new_stamped(
+            ts,
+            VenueId::Okx,
+            sym,
+            i + 1,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000 + (i % 7) as i64 * 100_000),
+            Price::from_raw(bid + 10_000),
+            Qty::from_raw(1_000_000 + (i % 5) as i64 * 100_000),
+            0,
+            flags,
+        )
+    }
+    let t0 = s.clock().open_mono(s.clock().bar_id(anchor.mono_ns) + 1);
+    // Prewarm: 3 bars (every branch: fresh, stale, decision, roll, sweep).
+    let mut i = 0u32;
+    while i < 120 {
+        s.on_tick(&script_tick(i, t0, foreign), &mut ctx);
+        while let Some(o) = cons.try_pop() {
+            std::hint::black_box(o.client_oid);
+        }
+        i += 1;
+    }
+    let warm = s.counters().intents;
+    assert!(warm > 0, "prewarm must enter");
+    let g = AllocGuard::new();
+    while i < 120 + 40 * 300 {
+        s.on_tick(&script_tick(i, t0, foreign), &mut ctx);
+        while let Some(o) = cons.try_pop() {
+            std::hint::black_box(o.client_oid);
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    let k = s.counters();
+    assert!(k.intents > warm && k.exits > 0 && k.skipped_stale_dec > 0 && k.rolls > 0);
+    assert_eq!(allocs, 0, "icdp on_tick allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "icdp on_tick bytes should be zero: saw {bytes}");
+}

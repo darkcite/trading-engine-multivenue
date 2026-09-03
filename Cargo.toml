@@ -35,6 +35,7 @@ members = [
     "crates/strategy-core",
     "crates/strategy-cross-arb",
     "crates/strategy-ev",
+    "crates/strategy-icdp",
     "crates/strategy-latency-arb",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
@@ -157,6 +158,7 @@ strategy-ai-exec      = { path = "crates/strategy-ai-exec" }
 strategy-core         = { path = "crates/strategy-core" }
 strategy-cross-arb    = { path = "crates/strategy-cross-arb" }
 strategy-ev           = { path = "crates/strategy-ev" }
+strategy-icdp         = { path = "crates/strategy-icdp" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
