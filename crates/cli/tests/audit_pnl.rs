@@ -189,6 +189,91 @@ fn golden_modeled_fill_attribution_and_markout() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// I1 golden: mixed kind-0 / kind-1 intents through one run. The maker
+/// (kind 0) fills at P on the strict cross exactly as the golden
+/// above; the IoC (kind 1) at the same limit fills at the activation
+/// TOUCH (0.38, not 0.50), pays the TAKER column of `--fee-bps
+/// pm:1:5`, and a second IoC whose limit is below the touch cancels;
+/// a third IoC emitted with a TTL that elapses before any fresh tick
+/// expires. The fee ladder re-prices the same fills at 0 / 1 / 2 bps.
+#[test]
+fn ioc_intents_fill_at_the_touch_with_the_taker_fee_and_the_ladder_prints() {
+    let root = tmp_root("ioc");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(
+                2_000 + PM_DELTA + 10,
+                42,
+                350_000,
+                1_000_000,
+                380_000,
+                50_000_000,
+            ),
+            pm_tick(
+                2_000 + PM_DELTA + 20,
+                42,
+                590_000,
+                1_000_000,
+                610_000,
+                1_000_000,
+            ),
+        ],
+    );
+    let ioc = |ts: u64, px: i64, oid: u64, ttl: u64| {
+        let mut o = order(ts, 42, Side::Bid, px, 10_000_000, oid, 0);
+        o.kind = 1;
+        o.with_ttl_ns(ttl)
+    };
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[
+            order(2_000, 42, Side::Bid, 500_000, 10_000_000, 7, 0), // maker @0.50
+            ioc(2_000, 500_000, 8, 0),                              // IoC limit 0.50 ⇒ pays 0.38
+            ioc(2_000, 370_000, 9, 0),                              // IoC limit 0.37 < 0.38 ⇒ cancel
+            ioc(2_000, 500_000, 10, PM_DELTA), // expires at 2_000+Δ, before the 2_000+Δ+10 tick
+        ],
+    );
+    let cfg = AuditPnlConfig {
+        replay_dir: root.clone(),
+        fee_bps: vec!["pm:1:5".to_owned()],
+        ..AuditPnlConfig::default()
+    };
+    let mut lines = Vec::new();
+    let json = run(&cfg, &mut |l: &str| lines.push(l.to_owned())).expect("report");
+    // 4 orders; 2 fills (maker 10 @ 0.50, IoC 10 @ 0.38); final mark 0.60:
+    //   maker unreal (0.60−0.50)×10 = +1.0, fee 1 bps × $5 = $0.0005
+    //   IoC   unreal (0.60−0.38)×10 = +2.2, fee 5 bps × $3.8 = $0.0019
+    //   net = 3.2 − 0.0024 = 3.1976
+    assert!(
+        json.contains("\"orders\":4,\"fills\":2,\"trades\":2"),
+        "json: {json}"
+    );
+    assert!(json.contains("\"net_usd\":\"3.1976\""), "json: {json}");
+    assert!(json.contains("\"fees_usd\":\"0.0024\""), "json: {json}");
+    assert!(
+        json.contains("\"ioc_fills\":1,\"ioc_canceled\":1,\"ttl_expired\":1,"),
+        "json: {json}"
+    );
+    // Ladder: 0 ⇒ 3.2; 1 bps/side on $8.8 notional ⇒ 3.2 − 0.00088 =
+    // 3.19912; 2 bps ⇒ 3.19824.
+    assert!(
+        json.contains("\"fee_ladder_net_usd\":[\"3.2\",\"3.19912\",\"3.19824\"]"),
+        "json: {json}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("ioc_fills=1 ioc_canceled=1 ttl_expired=1 | fee ladder")),
+        "lines: {lines:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// VT4: the golden script with the crossing tick STAMPED stale — the
 /// order never fills (no fill, no mark on a stale tick), the run line
 /// says `pm=1/3`, and `pm:0` restores the golden fill (a threshold

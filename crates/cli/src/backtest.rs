@@ -1170,6 +1170,15 @@ pub struct HarnessStats {
     pub mark_fills: u64,
     /// VT4: ticks the fill model skipped as STALE (no mark, no fill).
     pub stale_ticks_skipped: u64,
+    /// I1: IoC orders filled at their activation touch.
+    pub ioc_fills: u64,
+    /// I1: IoC orders canceled at their activation tick.
+    pub ioc_canceled: u64,
+    /// I1: orders canceled by `ttl_ns`.
+    pub ttl_expired: u64,
+    /// I1 §4.3 fee ladder: OOS net ×1e6 (floor) at flat 0 / 1 / 2 bps
+    /// per side — the same fills as `oos_net_pnl_1e6`, re-priced.
+    pub oos_net_ladder_1e6: [i64; 3],
     /// Warmup window end on the virtual clock (== first_virt when 0).
     pub warmup_end_virt_ns: u64,
     /// D-3: OOS round-trips (exit landed at/after the boundary).
@@ -1511,6 +1520,14 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
         stale_ticks_skipped: outcome.stale_ticks_skipped,
+        ioc_fills: outcome.ioc_fills,
+        ioc_canceled: outcome.ioc_canceled,
+        ttl_expired: outcome.ttl_expired,
+        oos_net_ladder_1e6: [
+            usd_1e12_to_1e6_floor(outcome.oos_net_ladder_1e12[0]),
+            usd_1e12_to_1e6_floor(outcome.oos_net_ladder_1e12[1]),
+            usd_1e12_to_1e6_floor(outcome.oos_net_ladder_1e12[2]),
+        ],
         warmup_end_virt_ns: warmup_end_virt,
         oos_round_trips,
         position_rows,
@@ -1714,8 +1731,13 @@ fn render_summary(
         stats.peak_open_per_sym
     ));
     s.push_str(&format!(
-        "fills: total={} oos={} mark={}\n",
-        stats.fills_total, stats.fills_oos, stats.mark_fills
+        "fills: total={} oos={} mark={} ioc={} ioc_canceled={} ttl_expired={}\n",
+        stats.fills_total,
+        stats.fills_oos,
+        stats.mark_fills,
+        stats.ioc_fills,
+        stats.ioc_canceled,
+        stats.ttl_expired
     ));
     s.push_str(&format!(
         "oos: net_pnl={} (realized={} fees={} markout={}), max_drawdown={}, trades={}, \
@@ -1729,6 +1751,14 @@ fn render_summary(
         stats.oos_trading_days
     ));
     s.push_str(&format!(
+        "fee ladder (oos net, flat bps/side): 0={} 1={} 2={} tier={} — a number positive only \
+         at 0 is positive at zero fee only\n",
+        fmt_usd_1e6(stats.oos_net_ladder_1e6[0]),
+        fmt_usd_1e6(stats.oos_net_ladder_1e6[1]),
+        fmt_usd_1e6(stats.oos_net_ladder_1e6[2]),
+        fmt_usd_1e6(stats.oos_net_pnl_1e6),
+    ));
+    s.push_str(&format!(
         "bounds (full window): max_order_notional={} max_symbol_notional={} \
          max_total_notional={}\n",
         fmt_usd_1e6(stats.max_order_notional_1e6),
@@ -1737,9 +1767,11 @@ fn render_summary(
     ));
     s.push_str(
         "reproducibility: zero RNG anywhere (determinism by construction); strict-cross \
-         maker (trade-through only — no touch fills, no queue credit); fills/marks on \
-         two-sided ticks only; unfilled remainders canceled at end (zero P&L); open \
-         positions marked out at last mid into net_pnl\n",
+         maker (trade-through only — no touch fills, no queue credit); IoC takers judged \
+         once at the first fresh tick after Δ (pay the touch, remainder cancels, taker \
+         fee); fills/marks on two-sided fresh ticks only; ttl_ns cancels at expiry; \
+         unfilled remainders canceled at end (zero P&L); open positions marked out at \
+         last mid into net_pnl\n",
     );
     if let Some(p) = &cfg.emit_detail {
         s.push_str(&format!(
@@ -1752,8 +1784,10 @@ fn render_summary(
 
 /// The `--emit-detail` sidecar (§5): versioned SEPARATELY from
 /// schema-1 (`detail_version` 2 since VT4 — the `stale` block and the
-/// model's `stale_after_ms` table), operator/session surface, never
-/// parsed by the worker. Hand-rendered like schema-1 — every value is
+/// model's `stale_after_ms` table; 3 since I1 — `fills.ioc`,
+/// `fills.ioc_canceled`, `fills.ttl_expired` and the `oos.fee_ladder`
+/// array of net P&L at flat 0 / 1 / 2 bps per side), operator/session
+/// surface, never parsed by the worker. Hand-rendered like schema-1 — every value is
 /// numeric, a fixed label, the validated split echo, or the hash hex;
 /// USD values are the same fixed-point renders as the stderr summary.
 fn render_detail(
@@ -1768,7 +1802,7 @@ fn render_detail(
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
         concat!(
-            "{{\"detail_version\":2,",
+            "{{\"detail_version\":3,",
             "\"ruleset_hash\":\"{hash}\",",
             "\"split\":\"{split}\",",
             "\"model\":{{",
@@ -1784,10 +1818,11 @@ fn render_detail(
             "\"orders\":{{\"emitted\":{oe},\"accepted_is\":{ois},\"accepted_oos\":{ooos},",
             "\"rejected_sym_cap\":{rsc},\"rejected_total_cap\":{rtc},\"unroutable\":{unr},",
             "\"canceled_end\":{cend},\"peak_open_total\":{pot},\"peak_open_per_sym\":{pos}}},",
-            "\"fills\":{{\"total\":{ft},\"oos\":{fo}}},",
+            "\"fills\":{{\"total\":{ft},\"oos\":{fo},\"ioc\":{fioc},\"ioc_canceled\":{fiocc},",
+            "\"ttl_expired\":{fttl}}},",
             "\"oos\":{{\"net_pnl_usd\":{onet},\"realized_usd\":{orl},\"fees_usd\":{ofe},",
             "\"markout_usd\":{oun},\"max_drawdown_usd\":{odd},\"trades\":{otr},",
-            "\"trading_days\":{oda}}},",
+            "\"trading_days\":{oda},\"fee_ladder_net_usd\":[{ol0},{ol1},{ol2}]}},",
             "\"full\":{{\"realized_usd\":{frl},\"fees_usd\":{ffe},\"unrealized_usd\":{fun}}},",
             "\"bounds\":{{\"max_order_notional_usd\":{bmo},\"max_symbol_notional_usd\":{bms},",
             "\"max_total_notional_usd\":{bmt}}},",
@@ -1836,6 +1871,12 @@ fn render_detail(
         pos = stats.peak_open_per_sym,
         ft = stats.fills_total,
         fo = stats.fills_oos,
+        fioc = stats.ioc_fills,
+        fiocc = stats.ioc_canceled,
+        fttl = stats.ttl_expired,
+        ol0 = fmt_usd_1e6(stats.oos_net_ladder_1e6[0]),
+        ol1 = fmt_usd_1e6(stats.oos_net_ladder_1e6[1]),
+        ol2 = fmt_usd_1e6(stats.oos_net_ladder_1e6[2]),
         onet = fmt_usd_1e6(stats.oos_net_pnl_1e6),
         orl = fmt_usd_1e6(stats.oos_realized_1e6),
         ofe = fmt_usd_1e6(stats.oos_fees_1e6),

@@ -28,10 +28,28 @@
 //!   (production-faithful: today's engine never refuses, so cooldown
 //!   stamping must match production), the harness just refuses to let
 //!   the dropped order ever fill.
-//! * **Fees (§4.3):** maker bps on fill notional, rounded UP (a fee
-//!   never rounds in our favor). All harness fills are maker fills by
-//!   construction (post-only model); the taker column exists for §4.3
-//!   table completeness and future models.
+//! * **IoC taker fills (I1, 2026-09-03 — `Order.kind == 1`):** an IoC
+//!   is judged ONCE, at the first FRESH two-sided tick of its sym at or
+//!   after activation (a stale tick is not fill evidence — VT4): a BID
+//!   fills at that tick's `ask_px` iff `ask_px ≤ P` (P = the limit the
+//!   strategy set, i.e. the touch it saw plus its slippage allowance),
+//!   an ASK at `bid_px` iff `bid_px ≥ P`; qty is capped by the displayed
+//!   opposite size under the SAME shared per-tick budget as the maker
+//!   pass (FIFO by emit order); the unfilled remainder CANCELS — an IoC
+//!   never rests. Fill price is the touch AFTER Δ, never the touch at
+//!   emit: a spread that widened during Δ is paid in full. Fee = the
+//!   venue's TAKER column, rounded up.
+//! * **TTL (I1, `Order.ttl_ns`):** an order (any kind) still open at
+//!   the first record of its sym with `virt ≥ t_emit + ttl` is
+//!   canceled (zero P&L, counted `ttl_expired`). A MODEL rule — the
+//!   strategy states its bar close, the harness honours it; no engine
+//!   cancel path exists (Stage-3). `ttl_ns == 0` = never expires.
+//! * **Fees (§4.3):** maker bps on maker fills, taker bps on IoC and
+//!   mark-law fills, rounded UP (a fee never rounds in our favor).
+//!   Every fill ALSO accrues the §4.3 **fee ladder** — the same
+//!   notional at flat 0 / 1 / 2 bps per side — so a report can print
+//!   net P&L at the CLI tier beside the ladder (a number positive only
+//!   at 0/0 must be visible as such).
 //! * **Fixed-point (§4.5):** prices/qtys are i64 ×1e6; notionals,
 //!   costs, realized P&L, fees and equity are i128 ×1e12 (px×qty).
 //!   Floats appear NOWHERE; ×1e12 → ×1e6 happens once at render, with
@@ -154,6 +172,13 @@ fn fee_ceil_1e12(notional_1e12: i128, bps: u32) -> i128 {
 // Open-order table (§4.1)
 // ---------------------------------------------------------------
 
+/// `Order.kind` of a post-only maker (the VM's only primitive).
+pub const ORDER_KIND_MAKER: u8 = 0;
+/// `Order.kind` of an immediate-or-cancel taker (I1; ICDP's primitive).
+pub const ORDER_KIND_IOC: u8 = 1;
+/// Fee-ladder columns: flat bps per side (maker == taker) — §4.3.
+pub const FEE_LADDER_BPS: [u32; 3] = [0, 1, 2];
+
 /// One resting order. POD; the table is a fixed array in emit order
 /// (`seq` strictly increases with insertion, compaction preserves
 /// order), which IS the FIFO fill priority.
@@ -164,10 +189,14 @@ pub struct OpenOrder {
     pub seq: u64,
     /// Virtual activation time: `t_emit + Δ_venue` (§4.4).
     pub t_active_ns: u64,
+    /// Virtual expiry (`t_emit + ttl_ns`); 0 = never (I1 TTL law).
+    pub expiry_ns: u64,
     /// Namespaced symbol (venue byte inside — door-closer 16.3.2).
     pub sym: u32,
     /// Resting side.
     pub side: Side,
+    /// [`ORDER_KIND_MAKER`] or [`ORDER_KIND_IOC`].
+    pub kind: u8,
     /// Venue byte (== `symbol_venue_byte(sym)`; kept for Δ/fee lookup).
     pub venue: u8,
     /// §3.4 bucket tag: emitted at/after the boundary.
@@ -183,8 +212,10 @@ pub struct OpenOrder {
 const EMPTY_OPEN: OpenOrder = OpenOrder {
     seq: 0,
     t_active_ns: 0,
+    expiry_ns: 0,
     sym: SYMBOL_ID_NONE,
     side: Side::Bid,
+    kind: ORDER_KIND_MAKER,
     venue: 0,
     oos: false,
     px_1e6: 0,
@@ -208,7 +239,8 @@ pub struct SynthFill {
     pub sym: u32,
     /// OUR side of the trade (the resting order's side).
     pub side: Side,
-    /// Fill price ×1e6 — always the resting price `P`.
+    /// Fill price ×1e6 — the resting price `P` for a maker, the
+    /// activation touch for an IoC / mark-law fill.
     pub px_1e6: i64,
     /// Fill quantity ×1e6.
     pub qty_1e6: i64,
@@ -245,6 +277,9 @@ struct Book {
     realized_sum_1e12: i128,
     fees_sum_1e12: i128,
     unreal_sum_1e12: i128,
+    /// §4.3 fee ladder: the same fills charged at flat
+    /// [`FEE_LADDER_BPS`] per side (ceil per fill, like the real fee).
+    fees_ladder_1e12: [i128; 3],
 }
 
 impl Book {
@@ -252,6 +287,12 @@ impl Book {
     #[inline]
     fn equity_1e12(&self) -> i128 {
         self.realized_sum_1e12 - self.fees_sum_1e12 + self.unreal_sum_1e12
+    }
+
+    /// Equity re-priced at ladder column `k` (§4.3).
+    #[inline]
+    fn equity_ladder_1e12(&self, k: usize) -> i128 {
+        self.realized_sum_1e12 - self.fees_ladder_1e12[k] + self.unreal_sum_1e12
     }
 
     /// Mark move for `sym`: adjust the running unrealized sum.
@@ -317,6 +358,12 @@ impl Book {
         self.realized_sum_1e12 += realized_delta;
         self.fees_sum_1e12 += fee_1e12;
         self.unreal_sum_1e12 += post_contrib - pre_contrib;
+        let notional_1e12 = px * qty_1e6 as i128;
+        let mut k = 0usize;
+        while k < FEE_LADDER_BPS.len() {
+            self.fees_ladder_1e12[k] += fee_ceil_1e12(notional_1e12, FEE_LADDER_BPS[k]);
+            k += 1;
+        }
     }
 }
 
@@ -439,6 +486,21 @@ pub struct ModelOutcome {
     pub peak_open_per_sym: u64,
     /// VT4: ticks the model skipped as STALE (no mark, no fill).
     pub stale_ticks_skipped: u64,
+    /// I1: IoC orders that filled (fully or partly) at their activation
+    /// touch.
+    pub ioc_fills: u64,
+    /// I1: IoC orders canceled at their activation tick — the touch was
+    /// away from the limit, or no displayed size was left.
+    pub ioc_canceled: u64,
+    /// I1: orders (any kind) canceled by their `ttl_ns` before any fill
+    /// evidence (an IoC emitted into a stale interval that outlived its
+    /// bar, typically).
+    pub ttl_expired: u64,
+    /// §4.3 fee ladder: OOS equity re-priced at flat
+    /// [`FEE_LADDER_BPS`] per side (same fills, same marks).
+    pub oos_net_ladder_1e12: [i128; 3],
+    /// Fee ladder for the full book.
+    pub full_net_ladder_1e12: [i128; 3],
 }
 
 /// One per-sym row for the `--emit-detail` sidecar (full book, sorted
@@ -495,6 +557,9 @@ pub struct FillEngine {
     peak_open_total: u64,
     peak_open_per_sym: u64,
     stale_ticks_skipped: u64,
+    ioc_fills: u64,
+    ioc_canceled: u64,
+    ttl_expired: u64,
 }
 
 impl FillEngine {
@@ -526,6 +591,9 @@ impl FillEngine {
             peak_open_total: 0,
             peak_open_per_sym: 0,
             stale_ticks_skipped: 0,
+            ioc_fills: 0,
+            ioc_canceled: 0,
+            ttl_expired: 0,
         }
     }
 
@@ -568,7 +636,18 @@ impl FillEngine {
         // predicate — Ai (5) sits inside the byte range, Bybit (6)
         // trades.
         debug_assert!(px > 0 && qty > 0, "vm emits positive px/qty only");
-        if !tradeable_venue_byte(venue) || px <= 0 || qty <= 0 {
+        // I1: only the two modeled kinds execute; a reserved/garbage
+        // kind (2 = Market, rsv.) cannot be scored honestly — count it
+        // unroutable, never guess a law for it.
+        debug_assert!(
+            order.kind == ORDER_KIND_MAKER || order.kind == ORDER_KIND_IOC,
+            "strategies emit maker (0) or IoC (1) only"
+        );
+        if !tradeable_venue_byte(venue)
+            || px <= 0
+            || qty <= 0
+            || (order.kind != ORDER_KIND_MAKER && order.kind != ORDER_KIND_IOC)
+        {
             self.unroutable += 1;
             return;
         }
@@ -597,8 +676,14 @@ impl FillEngine {
         self.open[self.open_len] = OpenOrder {
             seq: self.seq_next,
             t_active_ns: emit_virt.saturating_add(self.params.latency_ns[venue]),
+            expiry_ns: if order.ttl_ns == 0 {
+                0
+            } else {
+                emit_virt.saturating_add(order.ttl_ns)
+            },
             sym: order.sym,
             side: order.side,
+            kind: order.kind,
             venue: venue_byte,
             oos,
             px_1e6: px,
@@ -655,6 +740,23 @@ impl FillEngine {
         // conservative direction as the one-sided rule below. The
         // stale bit is the harness's own re-judgement on v3 roots
         // (`backtest::stale`), never-set on v2 roots.
+        // ---- (0) I1 TTL sweep ----
+        // The first record of the sym at/after an order's expiry
+        // cancels it BEFORE any fill evidence of that record is read
+        // (the bar has closed; a fill now would belong to the next
+        // bar). Any kind; zero P&L; counted. Runs on stale and
+        // one-sided ticks too — expiry is a clock fact, not a book
+        // fact.
+        let mut i = 0usize;
+        while i < self.open_len {
+            let o = self.open[i];
+            if o.sym == sym && o.expiry_ns != 0 && virt_ns >= o.expiry_ns {
+                self.ttl_expired += 1;
+                self.remove_open(i);
+                continue;
+            }
+            i += 1;
+        }
         if tick.is_stale() {
             self.stale_ticks_skipped += 1;
             return;
@@ -692,46 +794,20 @@ impl FillEngine {
                     i += 1;
                     continue;
                 }
-                let (fill_px, fill_qty) = match o.side {
-                    Side::Bid => (mark + h, o.remaining_1e6),
-                    Side::Ask => ((mark - h).max(1), o.remaining_1e6),
+                let fill_px = match o.side {
+                    Side::Bid => mark + h,
+                    Side::Ask => (mark - h).max(1),
                 };
-                let notional_1e12 = fill_px as i128 * fill_qty as i128;
                 let taker_bps = self.params.fee_bps[o.venue as usize].1;
-                let fee_1e12 = fee_ceil_1e12(notional_1e12, taker_bps);
-                self.full
-                    .apply_fill(sym, o.side, fill_px, fill_qty, fee_1e12, mark);
-                self.bounds_refresh(sym, mark);
-                if o.oos {
-                    self.oos
-                        .apply_fill(sym, o.side, fill_px, fill_qty, fee_1e12, mark);
-                    self.dd.sample(self.oos.equity_1e12());
-                    self.oos_trades += 1;
-                    self.oos_days.insert(wall_ns / DAY_NS);
-                }
-                self.fills_total += 1;
+                self.book_fill(&o, fill_px, o.remaining_1e6, taker_bps, mark, wall_ns, out);
                 self.mark_fills += 1;
-                out.push(SynthFill {
-                    sym,
-                    side: o.side,
-                    px_1e6: fill_px,
-                    qty_1e6: fill_qty,
-                    fee_1e12,
-                    oos: o.oos,
-                    client_oid: o.client_oid,
-                });
                 // Full fill: compact (FIFO preserved).
-                let mut j = i;
-                while j + 1 < self.open_len {
-                    self.open[j] = self.open[j + 1];
-                    j += 1;
-                }
-                self.open_len -= 1;
+                self.remove_open(i);
             }
             return;
         }
 
-        // ---- (b) strict-cross fill pass (§4.2) ----
+        // ---- (b) fill pass: strict-cross makers + IoC takers ----
         // Two-sided ticks only, same as the mark: a one-sided book is
         // not trusted as fill evidence (the 8e preopen lesson; also
         // every fill needs the mark this record just wrote). Fewer
@@ -741,14 +817,46 @@ impl FillEngine {
         }
         // Shared displayed budgets: our BIDs consume the printed ask
         // size, our ASKs the printed bid size — FIFO in emit order
-        // (the table IS emit-ordered by construction).
+        // (the table IS emit-ordered by construction), makers and
+        // IoCs alike.
         let mut ask_budget = tick.ask_qty.raw().max(0);
         let mut bid_budget = tick.bid_qty.raw().max(0);
+        // Fills only happen at a two-sided tick of the sym, which just
+        // refreshed the mark above.
+        let mark = *self.marks_1e6.get(&sym).expect("fill implies a mark");
         let mut i = 0usize;
         while i < self.open_len {
             let o = self.open[i];
             if o.sym != sym || virt_ns < o.t_active_ns {
                 i += 1;
+                continue;
+            }
+            if o.kind == ORDER_KIND_IOC {
+                // I1: judged ONCE, here, at the first fresh two-sided
+                // tick at/after activation. Marketable ⇒ fill at the
+                // touch (`<=`/`>=`: a taker takes the touch); the
+                // remainder — or the whole order — cancels.
+                let (fill_px, fill_qty) = match o.side {
+                    Side::Bid if ask <= o.px_1e6 && ask_budget > 0 => {
+                        let q = o.remaining_1e6.min(ask_budget);
+                        ask_budget -= q;
+                        (ask, q)
+                    }
+                    Side::Ask if bid >= o.px_1e6 && bid_budget > 0 => {
+                        let q = o.remaining_1e6.min(bid_budget);
+                        bid_budget -= q;
+                        (bid, q)
+                    }
+                    _ => (0, 0),
+                };
+                if fill_qty > 0 {
+                    let taker_bps = self.params.fee_bps[o.venue as usize].1;
+                    self.book_fill(&o, fill_px, fill_qty, taker_bps, mark, wall_ns, out);
+                    self.ioc_fills += 1;
+                } else {
+                    self.ioc_canceled += 1;
+                }
+                self.remove_open(i);
                 continue;
             }
             let fill_qty = match o.side {
@@ -770,47 +878,69 @@ impl FillEngine {
                 i += 1;
                 continue;
             }
-            let notional_1e12 = o.px_1e6 as i128 * fill_qty as i128;
             let maker_bps = self.params.fee_bps[o.venue as usize].0;
-            let fee_1e12 = fee_ceil_1e12(notional_1e12, maker_bps);
-            // Fills only happen at a two-sided tick of the sym, which
-            // just refreshed the mark above.
-            let mark = *self.marks_1e6.get(&sym).expect("fill implies a mark");
-            self.full
-                .apply_fill(sym, o.side, o.px_1e6, fill_qty, fee_1e12, mark);
-            self.bounds_refresh(sym, mark);
-            if o.oos {
-                self.oos
-                    .apply_fill(sym, o.side, o.px_1e6, fill_qty, fee_1e12, mark);
-                self.dd.sample(self.oos.equity_1e12());
-                self.oos_trades += 1;
-                self.oos_days.insert(wall_ns / DAY_NS);
-            }
-            self.fills_total += 1;
-            out.push(SynthFill {
-                sym,
-                side: o.side,
-                px_1e6: o.px_1e6,
-                qty_1e6: fill_qty,
-                fee_1e12,
-                oos: o.oos,
-                client_oid: o.client_oid,
-            });
+            self.book_fill(&o, o.px_1e6, fill_qty, maker_bps, mark, wall_ns, out);
             let remaining = o.remaining_1e6 - fill_qty;
             if remaining > 0 {
                 self.open[i].remaining_1e6 = remaining;
                 i += 1;
             } else {
-                // Compact: shift left, preserving emit order (FIFO).
-                let mut j = i;
-                while j + 1 < self.open_len {
-                    self.open[j] = self.open[j + 1];
-                    j += 1;
-                }
-                self.open_len -= 1;
-                // Do not advance `i`: the next order slid into slot i.
+                // Compact: the next order slides into slot i.
+                self.remove_open(i);
             }
         }
+    }
+
+    /// Remove open-order slot `i`, shifting the tail left (emit order —
+    /// the FIFO priority — is preserved).
+    #[inline]
+    fn remove_open(&mut self, i: usize) {
+        debug_assert!(i < self.open_len);
+        let mut j = i;
+        while j + 1 < self.open_len {
+            self.open[j] = self.open[j + 1];
+            j += 1;
+        }
+        self.open_len -= 1;
+    }
+
+    /// Account one fill of `o` (`fill_qty` at `fill_px`, fee at
+    /// `fee_bps` on the notional) in both books, the bounds/drawdown
+    /// trackers and the day set, and hand it to the vm feedback.
+    #[allow(clippy::too_many_arguments)]
+    fn book_fill(
+        &mut self,
+        o: &OpenOrder,
+        fill_px: i64,
+        fill_qty: i64,
+        fee_bps: u32,
+        mark: i64,
+        wall_ns: u64,
+        out: &mut Vec<SynthFill>,
+    ) {
+        debug_assert!(fill_px > 0 && fill_qty > 0);
+        let notional_1e12 = fill_px as i128 * fill_qty as i128;
+        let fee_1e12 = fee_ceil_1e12(notional_1e12, fee_bps);
+        self.full
+            .apply_fill(o.sym, o.side, fill_px, fill_qty, fee_1e12, mark);
+        self.bounds_refresh(o.sym, mark);
+        if o.oos {
+            self.oos
+                .apply_fill(o.sym, o.side, fill_px, fill_qty, fee_1e12, mark);
+            self.dd.sample(self.oos.equity_1e12());
+            self.oos_trades += 1;
+            self.oos_days.insert(wall_ns / DAY_NS);
+        }
+        self.fills_total += 1;
+        out.push(SynthFill {
+            sym: o.sym,
+            side: o.side,
+            px_1e6: fill_px,
+            qty_1e6: fill_qty,
+            fee_1e12,
+            oos: o.oos,
+            client_oid: o.client_oid,
+        });
     }
 
     /// End of replay (§4.5): cancel unfilled remainders (zero P&L
@@ -843,6 +973,19 @@ impl FillEngine {
             peak_open_per_sym: self.peak_open_per_sym,
             stale_ticks_skipped: self.stale_ticks_skipped,
             mark_fills: self.mark_fills,
+            ioc_fills: self.ioc_fills,
+            ioc_canceled: self.ioc_canceled,
+            ttl_expired: self.ttl_expired,
+            oos_net_ladder_1e12: [
+                self.oos.equity_ladder_1e12(0),
+                self.oos.equity_ladder_1e12(1),
+                self.oos.equity_ladder_1e12(2),
+            ],
+            full_net_ladder_1e12: [
+                self.full.equity_ladder_1e12(0),
+                self.full.equity_ladder_1e12(1),
+                self.full.equity_ladder_1e12(2),
+            ],
         }
     }
 
@@ -1000,6 +1143,230 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].px_1e6, 500_000);
         assert_eq!(out[1].px_1e6, 600_000);
+    }
+
+    // -------------- I1: IoC taker law + TTL --------------
+
+    fn ioc(sym: u32, side: Side, px: i64, qty: i64, oid: u64) -> Order {
+        let venue = core_types::VenueId::from_u8(symbol_venue_byte(sym)).expect("venue");
+        Order::new(
+            0,
+            venue,
+            sym,
+            side,
+            ORDER_KIND_IOC,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        )
+    }
+
+    fn engine_fees(boundary: u64, maker: u32, taker: u32) -> FillEngine {
+        let p = ModelParams {
+            fee_bps: [(maker, taker); 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+        };
+        FillEngine::new(p, boundary)
+    }
+
+    #[test]
+    fn ioc_fills_at_the_activation_touch_and_never_rests() {
+        // PM Δ = 200 ms: the touch at emit is 0.45 (marketable for a
+        // 0.50 bid); by activation the ask moved to 0.48 — the IoC pays
+        // 0.48 (the touch AFTER Δ), not 0.45, not P.
+        let mut e = engine(u64::MAX);
+        let mut out = Vec::new();
+        e.intake(&ioc(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 1_000);
+        let t_active = 1_000 + 200_000_000;
+        e.on_record(
+            &tick(PM_SYM, 440_000, 1, 450_000, 100_000_000),
+            t_active - 1,
+            0,
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing before activation");
+        assert_eq!(e.open_orders().len(), 1);
+        e.on_record(
+            &tick(PM_SYM, 470_000, 1, 480_000, 100_000_000),
+            t_active,
+            0,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].px_1e6, 480_000, "taker pays the touch after Δ");
+        assert_eq!(out[0].qty_1e6, 10_000_000);
+        assert!(e.open_orders().is_empty(), "an IoC never rests");
+        let o = e.finish();
+        assert_eq!(o.ioc_fills, 1);
+        assert_eq!(o.ioc_canceled, 0);
+        assert_eq!(o.fills_total, 1);
+    }
+
+    #[test]
+    fn ioc_cancels_when_the_touch_is_away_or_size_is_gone() {
+        let mut e = engine_zero_delta(u64::MAX);
+        let mut out = Vec::new();
+        // Bid 0.50 vs ask 0.51 at activation: crossed away ⇒ cancel.
+        e.intake(&ioc(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 0);
+        e.on_record(
+            &tick(PM_SYM, 490_000, 1_000_000, 510_000, 1_000_000),
+            10,
+            0,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(e.open_orders().is_empty(), "a crossed-away IoC is gone");
+        // Ask 0.60 vs bid 0.60 (touch ⇒ marketable for a taker) but a
+        // prior IoC ate the whole displayed bid size: the second cancels.
+        e.intake(&ioc(PM_SYM, Side::Ask, 600_000, 5_000_000, 2), 10);
+        e.intake(&ioc(PM_SYM, Side::Ask, 600_000, 5_000_000, 3), 10);
+        e.on_record(
+            &tick(PM_SYM, 600_000, 5_000_000, 700_000, 1_000_000),
+            20,
+            0,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "FIFO: the first IoC takes the whole print");
+        assert_eq!(out[0].client_oid, 2);
+        assert_eq!(out[0].px_1e6, 600_000);
+        assert!(e.open_orders().is_empty());
+        let o = e.finish();
+        assert_eq!(o.ioc_fills, 1);
+        assert_eq!(o.ioc_canceled, 2);
+    }
+
+    #[test]
+    fn ioc_partial_fill_caps_at_displayed_size_and_remainder_cancels() {
+        let mut e = engine_zero_delta(u64::MAX);
+        let mut out = Vec::new();
+        e.intake(&ioc(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 0);
+        e.on_record(
+            &tick(PM_SYM, 480_000, 1, 490_000, 4_000_000),
+            10,
+            0,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].qty_1e6, 4_000_000, "capped by the displayed ask size");
+        assert!(e.open_orders().is_empty(), "the remainder cancels, never rests");
+        let o = e.finish();
+        assert_eq!(o.ioc_fills, 1);
+        assert_eq!(o.canceled_end, 0);
+    }
+
+    #[test]
+    fn ioc_pays_the_taker_fee_column_and_the_ladder_accrues() {
+        // maker 1 bps / taker 5 bps: an IoC on $10 notional pays $0.005.
+        let mut e = engine_fees(0, 1, 5);
+        let mut out = Vec::new();
+        e.intake(&ioc(PM_SYM, Side::Bid, 500_000, 20_000_000, 1), 0);
+        e.on_record(
+            &tick(PM_SYM, 490_000, 1, 500_000, 100_000_000),
+            10,
+            0,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        // notional = 0.50 × 20 = $10 ⇒ 5 bps = $0.005 = 5_000_000_000 ×1e12
+        assert_eq!(out[0].fee_1e12, 5_000_000_000);
+        let o = e.finish();
+        assert_eq!(o.oos_fees_1e12, 5_000_000_000);
+        // Ladder: same fill at 0 / 1 / 2 bps per side.
+        let base = o.oos_net_1e12 + o.oos_fees_1e12; // equity before fees
+        assert_eq!(o.oos_net_ladder_1e12[0], base);
+        assert_eq!(o.oos_net_ladder_1e12[1], base - 1_000_000_000);
+        assert_eq!(o.oos_net_ladder_1e12[2], base - 2_000_000_000);
+    }
+
+    #[test]
+    fn ioc_emitted_into_a_stale_interval_fills_at_the_first_fresh_tick() {
+        let mut e = engine_zero_delta(u64::MAX);
+        let mut out = Vec::new();
+        e.intake(&ioc(PM_SYM, Side::Bid, 500_000, 10_000_000, 1), 0);
+        // Two stale ticks with a better ask: not fill evidence.
+        let mut stale = tick(PM_SYM, 440_000, 1, 450_000, 100_000_000);
+        stale.flags = core_types::TICK_FLAG_STALE;
+        e.on_record(&stale, 10, 0, &mut out);
+        e.on_record(&stale, 20, 0, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(e.open_orders().len(), 1, "the IoC waits for fresh evidence");
+        // First fresh tick: fills at ITS touch (0.49), not the stale 0.45.
+        e.on_record(
+            &tick(PM_SYM, 480_000, 1, 490_000, 100_000_000),
+            30,
+            0,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].px_1e6, 490_000);
+        let o = e.finish();
+        assert_eq!(o.stale_ticks_skipped, 2);
+        assert_eq!(o.ioc_fills, 1);
+    }
+
+    #[test]
+    fn ttl_cancels_at_the_first_record_at_or_after_expiry_before_any_fill() {
+        let mut e = engine_zero_delta(u64::MAX);
+        let mut out = Vec::new();
+        // IoC with a 100 ns TTL emitted at 0; only stale ticks until 100.
+        let o1 = ioc(PM_SYM, Side::Bid, 500_000, 10_000_000, 1).with_ttl_ns(100);
+        e.intake(&o1, 0);
+        assert_eq!(e.open_orders()[0].expiry_ns, 100);
+        let mut stale = tick(PM_SYM, 440_000, 1, 450_000, 100_000_000);
+        stale.flags = core_types::TICK_FLAG_STALE;
+        e.on_record(&stale, 50, 0, &mut out);
+        assert_eq!(e.open_orders().len(), 1);
+        // A marketable FRESH tick exactly at expiry: the sweep runs
+        // first — canceled, no fill.
+        e.on_record(
+            &tick(PM_SYM, 440_000, 1, 450_000, 100_000_000),
+            100,
+            0,
+            &mut out,
+        );
+        assert!(out.is_empty(), "expiry beats fill evidence on the same record");
+        assert!(e.open_orders().is_empty());
+        // A maker with a TTL expires the same way, on a stale record too.
+        let o2 = order(PM_SYM, Side::Bid, 500_000, 10_000_000, 2).with_ttl_ns(10);
+        e.intake(&o2, 200);
+        e.on_record(&stale, 210, 0, &mut out);
+        assert!(e.open_orders().is_empty(), "expiry is a clock fact");
+        let o = e.finish();
+        assert_eq!(o.ttl_expired, 2);
+        assert_eq!(o.ioc_canceled, 0);
+        assert_eq!(o.canceled_end, 0);
+    }
+
+    fn market_order() -> Order {
+        let venue = core_types::VenueId::from_u8(symbol_venue_byte(PM_SYM)).expect("venue");
+        Order::new(
+            0,
+            venue,
+            PM_SYM,
+            Side::Bid,
+            2,
+            Price::from_raw(500_000),
+            Qty::from_raw(1_000_000),
+            9,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "maker (0) or IoC (1)")]
+    fn reserved_order_kind_fails_fast_in_debug() {
+        let mut e = engine_zero_delta(u64::MAX);
+        e.intake(&market_order(), 0);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn reserved_order_kind_is_unroutable_in_release() {
+        let mut e = engine_zero_delta(u64::MAX);
+        e.intake(&market_order(), 0);
+        assert!(e.open_orders().is_empty());
+        assert_eq!(e.finish().unroutable, 1);
     }
 
     #[test]
@@ -1525,6 +1892,88 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// I1 IoC invariants: an IoC never fills before activation, is
+        /// judged exactly once (never rests past its first fresh
+        /// two-sided tick at/after activation), fills only when
+        /// marketable at THAT tick's touch, at that touch (never a
+        /// better price), never more than the displayed size, and pays
+        /// the taker column.
+        #[test]
+        fn ioc_invariants_hold_for_arbitrary_scenarios(
+            evs in proptest::collection::vec(ev_strategy(), 1..120),
+            taker_bps in 0u32..200,
+        ) {
+            let params = ModelParams {
+                fee_bps: [(0, taker_bps); 7],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
+                stale_after_ms: VenueId::stale_after_ms_defaults(),
+            };
+            let mut e = FillEngine::new(params, u64::MAX / 2);
+            let mut out = Vec::new();
+            let mut virt = 0u64;
+            let mut oid = 0u64;
+            let mut by_oid: BTreeMap<u64, (u64, i64, Side, u32)> = BTreeMap::new();
+            let table = syms();
+            for ev in &evs {
+                virt += 1_000_003;
+                match ev {
+                    Ev::Emit { sym_i, side_bid, px, qty } => {
+                        oid += 1;
+                        let side = if *side_bid { Side::Bid } else { Side::Ask };
+                        e.intake(&ioc(table[*sym_i], side, *px, *qty, oid), virt);
+                        let venue = symbol_venue_byte(table[*sym_i]) as usize;
+                        by_oid.insert(oid, (virt + params.latency_ns[venue], *px, side, table[*sym_i]));
+                    }
+                    Ev::Tick { sym_i, bid, bq, ask_gap, aq, one_sided } => {
+                        let (b, a) = match one_sided % 8 {
+                            0 => (0, bid + ask_gap),
+                            1 => (*bid, 0),
+                            _ => (*bid, bid + ask_gap),
+                        };
+                        let t = tick(table[*sym_i], b, *bq, a, *aq);
+                        e.on_record(&t, virt, virt, &mut out);
+                        let mut bid_side_qty = 0i64;
+                        let mut ask_side_qty = 0i64;
+                        for f in &out {
+                            let (t_active, px, side, _) = *by_oid.get(&f.client_oid).expect("known oid");
+                            proptest::prop_assert!(virt >= t_active, "no fill before activation");
+                            proptest::prop_assert_eq!(f.side as u8, side as u8);
+                            match f.side {
+                                Side::Bid => {
+                                    proptest::prop_assert!(a > 0 && a <= px, "marketable at the touch");
+                                    proptest::prop_assert_eq!(f.px_1e6, a, "pays the activation touch");
+                                    bid_side_qty += f.qty_1e6;
+                                }
+                                Side::Ask => {
+                                    proptest::prop_assert!(b >= px, "marketable at the touch");
+                                    proptest::prop_assert_eq!(f.px_1e6, b, "receives the activation touch");
+                                    ask_side_qty += f.qty_1e6;
+                                }
+                            }
+                            let notional = f.px_1e6 as i128 * f.qty_1e6 as i128;
+                            proptest::prop_assert_eq!(f.fee_1e12, fee_ceil_1e12(notional, taker_bps));
+                        }
+                        proptest::prop_assert!(bid_side_qty <= *aq, "≤ displayed ask size");
+                        proptest::prop_assert!(ask_side_qty <= *bq, "≤ displayed bid size");
+                        // Judged once: no ACTIVE IoC of this sym survives a
+                        // two-sided tick.
+                        if b > 0 && a > 0 {
+                            for o in e.open_orders() {
+                                proptest::prop_assert!(
+                                    o.sym != table[*sym_i] || virt < o.t_active_ns,
+                                    "an active IoC never outlives its first fresh two-sided tick"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let outcome = e.finish();
+            proptest::prop_assert_eq!(outcome.ioc_fills + outcome.ioc_canceled + outcome.canceled_end
+                + outcome.rejected_sym_cap + outcome.rejected_total_cap, oid,
+                "every IoC is filled, canceled, dropped at the cap, or still waiting for activation");
         }
 
         /// §12 conservation identity, EXACT: for the full book,

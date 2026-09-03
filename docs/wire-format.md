@@ -102,8 +102,15 @@ reader-compat surface.
 |     32 |     8 | client_oid  | `u64`          | engine-assigned, monotonic      |
 |     40 |     1 | venue       | `u8` VenueId   | routing target (v2+; garbage in v1) |
 |     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=ev 2=cross-arb 3=rule-tree 4=ai-exec 5=vm), stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
-|     42 |    14 | _pad1       | `[u8; 14]`     | explicit, zeroed                |
+|     42 |     6 | _pad1       | `[u8; 6]`      | explicit, zeroed                |
+|     48 |     8 | ttl_ns      | `u64`          | I1 (2026-09-03): time-to-live relative to `ts_ns`; 0 = none. A MODEL field — the offline fill law (`backtest::fill`) cancels the order at the first record of its sym at/after `ts_ns + ttl_ns` (an IoC that meets no fresh tick before its emitting bar closes is a cancel); no engine cancel path reads it (Stage-3). Wire-additive: every Order persisted before I1 carries 0 here (the bytes were explicit zeroed padding) |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed                |
+
+`kind` semantics in the offline fill model (I1): 0 = post-only maker
+(strict-cross fill at P, maker fee); 1 = IoC taker (judged once at the
+first fresh two-sided tick at/after `t_emit + Δ_venue`: fills at that
+tick's touch iff marketable, capped by displayed size, remainder
+cancels, taker fee); 2 = reserved (unroutable in the model).
 
 ### `AiCmd` — 64 bytes (8f; `ingress-ai` ring + PMLR `slot_kind = 4`)
 

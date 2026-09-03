@@ -646,7 +646,16 @@ pub struct Order {
     /// — no Order slot was ever persisted before `engine-orders.pmlr`.
     pub strategy_id: u8,
     /// Reserved.
-    _pad1: [u8; 14],
+    _pad1: [u8; 6],
+    /// Time-to-live relative to `ts_ns`; 0 = none (I1, 2026-09-03 —
+    /// docs/wire-format.md). A MODEL field: the offline fill law
+    /// cancels the order at the first record of its sym at/after
+    /// `ts_ns + ttl_ns` (an IoC that meets no fresh tick before its
+    /// emitting bar closes is a cancel, never a fill in the next bar).
+    /// No engine cancel path reads it — Stage-3 owns live cancels.
+    /// Wire-additive: every Order persisted before I1 carries 0 here
+    /// (the byte range was explicit zeroed padding).
+    pub ttl_ns: u64,
     /// Explicit tail padding (see [`AsBytes`]). Always zero.
     _pad2: [u8; 8],
 }
@@ -680,9 +689,18 @@ impl Order {
             client_oid,
             venue: venue as u8,
             strategy_id: STRATEGY_ID_NONE,
-            _pad1: [0; 14],
+            _pad1: [0; 6],
+            ttl_ns: 0,
             _pad2: [0; 8],
         }
+    }
+
+    /// The same order with a time-to-live (I1 model rule; see the
+    /// field). Builder-style so the 8-argument `new` keeps its shape.
+    #[inline(always)]
+    pub const fn with_ttl_ns(mut self, ttl_ns: u64) -> Self {
+        self.ttl_ns = ttl_ns;
+        self
     }
 }
 

@@ -837,6 +837,19 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             o.rejected_sym_cap + o.rejected_total_cap,
             o.unroutable,
         ));
+        // I1: taker surface + the §4.3 fee ladder — printed for EVERY
+        // strategy so a number positive only at 0 bps is visible as such.
+        report(&format!(
+            "audit-pnl:   ioc_fills={} ioc_canceled={} ttl_expired={} | fee ladder (net, flat \
+             bps/side): 0={} 1={} 2={} tier={}",
+            o.ioc_fills,
+            o.ioc_canceled,
+            o.ttl_expired,
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[0])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[1])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[2])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_1e12)),
+        ));
         for (desc, pos, realized, fills) in &row.per_sym {
             report(&format!(
                 "audit-pnl:   {desc}: fills={fills} pos={} realized={}",
@@ -879,7 +892,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             "{{\"strategy_id\":{sid},\"label\":\"{}\",\"orders\":{},\"fills\":{},\"trades\":{},\
              \"trading_days\":{},\"net_usd\":\"{}\",\"realized_usd\":\"{}\",\"fees_usd\":\"{}\",\
              \"markout_usd\":\"{}\",\"max_drawdown_usd\":\"{}\",\"canceled_end\":{},\
-             \"rejected_caps\":{},\"unroutable\":{},\"per_day_net_usd\":[",
+             \"rejected_caps\":{},\"unroutable\":{},\"ioc_fills\":{},\"ioc_canceled\":{},\
+             \"ttl_expired\":{},\"fee_ladder_net_usd\":[\"{}\",\"{}\",\"{}\"],\
+             \"per_day_net_usd\":[",
             row.label,
             o.orders_is + o.orders_oos,
             o.fills_total,
@@ -893,6 +908,12 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             o.canceled_end,
             o.rejected_sym_cap + o.rejected_total_cap,
             o.unroutable,
+            o.ioc_fills,
+            o.ioc_canceled,
+            o.ttl_expired,
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[0])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[1])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[2])),
         ));
         for (j, (day_idx, net)) in row.per_day_net_1e6.iter().enumerate() {
             if j > 0 {

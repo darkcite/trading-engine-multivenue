@@ -30,6 +30,66 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-09-03 — `Order.ttl_ns` (wire-additive) + the IoC taker fill law + fee ladder (ICDP I1)
+
+**What changed**
+
+- `core_types::Order` spends 8 bytes of its explicit zero padding:
+  `ttl_ns: u64` at offset 48 (`_pad1` shrinks to 42..48; `_pad2`
+  unchanged). Still 64 B, `repr(C, align(64))`, every byte explicit.
+  `Order::new` keeps its 8-argument shape (ttl 0);
+  `Order::with_ttl_ns(ttl)` sets it.
+- `backtest::fill` (shared verbatim by `backtest` and `audit-pnl`):
+  `Order.kind == 1` (IoC) is now MODELED — judged once at the first
+  fresh two-sided tick of its sym at/after `t_emit + Δ_venue`: a BID
+  fills at that tick's `ask_px` iff `ask_px ≤ P` (an ASK at `bid_px`
+  iff `bid_px ≥ P`), qty capped by the displayed opposite size under
+  the same shared FIFO budget as makers, the remainder cancels (never
+  rests), fee = the venue's TAKER column, rounded up. Any order with
+  `ttl_ns > 0` is canceled at the first record of its sym at/after
+  `t_emit + ttl_ns` (stale and one-sided records included — expiry is
+  a clock fact), before any fill evidence of that record is read.
+  `kind ≥ 2` is unroutable (counted, dropped; `debug_assert!` in debug).
+- Every fill also accrues the §4.3 **fee ladder** (the same notional
+  at flat 0 / 1 / 2 bps per side); reports print OOS net at the ladder
+  beside the CLI tier. New counters `ioc_fills`, `ioc_canceled`,
+  `ttl_expired`.
+- Surfaces: backtest stderr `fills:` line gains `ioc= ioc_canceled=
+  ttl_expired=` and a new `fee ladder (oos net, flat bps/side): 0= 1=
+  2= tier=` line; **`--emit-detail` is `detail_version` 3**
+  (`fills.ioc`, `fills.ioc_canceled`, `fills.ttl_expired`,
+  `oos.fee_ladder_net_usd[3]`); audit-pnl per-strategy stderr gains an
+  `ioc_fills=… | fee ladder …` row and the JSON (still
+  `audit_pnl_version` 1 — additive keys, get-based readers) gains
+  `ioc_fills`, `ioc_canceled`, `ttl_expired`, `fee_ladder_net_usd[3]`.
+  **Schema-1 stdout is unchanged (frozen).**
+
+**Why**
+
+- ICDP is a taker edge (research note §5.6: resting entries are
+  anti-selected); the post-only law scored it negative by construction.
+  The vault's merged ICDP×VT plan, D1 (offline IoC model + paper IoC
+  intents are pre-Stage-3) and D6 (G1 gate lifted, I1–I7 in order).
+
+**Impact**
+
+- On-disk formats: `engine-orders.pmlr` slots may now carry a non-zero
+  `ttl_ns`; every older file reads 0 (never expires). `pmlr.py`'s
+  `OrderRec` decodes the 42-byte prefix and is untouched.
+- Config keys: none.
+- Wire formats: `docs/wire-format.md` `Order` table + `kind` semantics.
+
+**Migration steps**
+
+1. Nothing for existing captures or goldens (the VM emits kind 0, ttl 0
+   — every existing number is byte-identical).
+2. Sidecar readers: accept `detail_version` 3 (additive keys).
+
+**Rollback**
+
+- Revert the commit; IoC intents already captured would replay under
+  the maker law again (negative by construction) — the reason for I1.
+
 ## 2026-09-03 — Staleness is live: v3 captures start, the harness re-judges, `--emit-detail` v2 (VT2–VT6 close)
 
 **What changed**
