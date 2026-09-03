@@ -91,15 +91,23 @@ pub fn classify(buf: &[u8]) -> FrameKind {
 // Book-update parser
 // ---------------------------------------------------------------
 
-/// Extract the frame's monotonic `"timestamp"` (quoted ms): low 32
-/// bits become `Tick.venue_seq` (wraps ~49.7 days — the documented
-/// venue_seq policy on this venue since Phase 1).
+/// Extract the frame's `"timestamp"` (quoted ms) in full — the VT2
+/// venue time that rides `Tick.venue_time_ms`; its low 32 bits are the
+/// `Tick.venue_seq` (wraps ~49.7 days — the documented venue_seq
+/// policy on this venue since Phase 1, see [`venue_seq_of`]).
 #[inline]
-pub fn scan_venue_seq(buf: &[u8]) -> Option<u32> {
+pub fn scan_venue_time_ms(buf: &[u8]) -> Option<u64> {
     let p = find_field(buf, b"\"timestamp\":")?;
     let p = skip_byte(buf, p, b'"');
     let (v, _end) = scan_u64(buf, p)?;
-    Some((v & 0xFFFF_FFFF) as u32)
+    Some(v)
+}
+
+/// The venue_seq law for this venue: the low 32 bits of the frame's
+/// millisecond `timestamp`.
+#[inline(always)]
+pub const fn venue_seq_of(venue_time_ms: u64) -> u32 {
+    (venue_time_ms & 0xFFFF_FFFF) as u32
 }
 
 /// Parse one `book` event into a `Tick`.
@@ -123,22 +131,26 @@ pub fn scan_venue_seq(buf: &[u8]) -> Option<u32> {
 /// the array wrapper (see the run loop's event walk).
 #[inline]
 pub fn parse_book_update(buf: &[u8], sym: SymbolId, ts_ns: NsTs) -> Option<Tick> {
-    let venue_seq = scan_venue_seq(buf)?;
+    let venue_time_ms = scan_venue_time_ms(buf)?;
     let (bid_px, bid_qty) = scan_best_level(buf, b"\"bids\":[")?;
     let (ask_px, ask_qty) = scan_best_level(buf, b"\"asks\":[")?;
     // A book with both sides empty carries no information.
     if bid_px == 0 && ask_px == 0 {
         return None;
     }
-    Some(Tick::new(
+    // VT2: the stamp rides the slot; the run loop judges staleness
+    // (the parser has no per-connection estimator) and sets `flags`.
+    Some(Tick::new_stamped(
         ts_ns,
         core_types::VenueId::Polymarket,
         sym,
-        venue_seq,
+        venue_seq_of(venue_time_ms),
         Price::from_raw(bid_px),
         Qty::from_raw(bid_qty),
         Price::from_raw(ask_px),
         Qty::from_raw(ask_qty),
+        venue_time_ms,
+        0,
     ))
 }
 
@@ -187,15 +199,16 @@ fn scan_best_level(buf: &[u8], marker: &[u8]) -> Option<(i64, i64)> {
 /// otherwise the size is 0 = unknown. Documented tick semantics for
 /// this venue until 8e ladder work refines it.
 ///
-/// `venue_seq` comes from the enclosing event's `timestamp` (rows
-/// carry none) — the caller extracts it once per frame via
-/// [`scan_venue_seq`].
+/// `venue_time_ms` is the enclosing event's `timestamp` (rows carry
+/// none) — the caller extracts it once per frame via
+/// [`scan_venue_time_ms`]; `venue_seq` derives from it
+/// ([`venue_seq_of`]). `flags` are left 0 for the run loop's judge.
 #[inline]
 pub fn parse_price_change_row(
     row: &[u8],
     sym: SymbolId,
     ts_ns: NsTs,
-    venue_seq: u32,
+    venue_time_ms: u64,
 ) -> Option<Tick> {
     let p = find_field(row, b"\"best_bid\":")?;
     let p = skip_byte(row, p, b'"');
@@ -226,15 +239,17 @@ pub fn parse_price_change_row(
     } else {
         0
     };
-    Some(Tick::new(
+    Some(Tick::new_stamped(
         ts_ns,
         core_types::VenueId::Polymarket,
         sym,
-        venue_seq,
+        venue_seq_of(venue_time_ms),
         Price::from_raw(bid_px),
         Qty::from_raw(bid_qty),
         Price::from_raw(ask_px),
         Qty::from_raw(ask_qty),
+        venue_time_ms,
+        0,
     ))
 }
 
@@ -422,6 +437,9 @@ mod tests {
         assert_eq!(t.ask_qty.raw(), 50_000_000);
         // venue_seq = low 32 bits of "1713000000000".
         assert_eq!(t.venue_seq, (1_713_000_000_000u64 & 0xFFFF_FFFF) as u32);
+        // VT2: the full stamp rides the slot; the parser never judges.
+        assert_eq!(t.venue_time_ms, 1_713_000_000_000);
+        assert_eq!(t.flags, 0);
     }
 
     #[test]
@@ -446,12 +464,16 @@ mod tests {
 
     #[test]
     fn parse_price_change_row_uses_row_touch() {
-        let seq = scan_venue_seq(SAMPLE_PC).unwrap();
+        let venue_time_ms = scan_venue_time_ms(SAMPLE_PC).unwrap();
+        assert_eq!(venue_time_ms, 1_713_000_000_123);
+        let seq = venue_seq_of(venue_time_ms);
         assert_eq!(seq, (1_713_000_000_123u64 & 0xFFFF_FFFF) as u32);
-        let t = parse_price_change_row(SAMPLE_PC, 3, 99, seq).unwrap();
+        let t = parse_price_change_row(SAMPLE_PC, 3, 99, venue_time_ms).unwrap();
         assert_eq!(t.sym, 3);
         assert_eq!(t.ts_ns, 99);
         assert_eq!(t.venue_seq, seq);
+        assert_eq!(t.venue_time_ms, venue_time_ms);
+        assert_eq!(t.flags, 0);
         assert_eq!(t.bid_px.raw(), 518_000);
         assert_eq!(t.ask_px.raw(), 520_000);
         // BUY row at price == best_bid ⇒ the row size IS the new
@@ -472,6 +494,14 @@ mod tests {
         let t = parse_price_change_row(away, 1, 0, 0).unwrap();
         assert_eq!(t.bid_qty.raw(), 0);
         assert_eq!(t.ask_qty.raw(), 0);
+    }
+
+    #[test]
+    fn scan_venue_time_ms_rejects_missing_or_unquoted_garbage() {
+        assert_eq!(scan_venue_time_ms(b"{\"bids\":[]}"), None);
+        assert_eq!(scan_venue_time_ms(br#"{"timestamp":"soon"}"#), None);
+        assert_eq!(scan_venue_time_ms(br#"{"timestamp":"1713000000123"}"#), Some(1_713_000_000_123));
+        assert_eq!(venue_seq_of(0x1_0000_0007), 7);
     }
 }
 
@@ -508,6 +538,10 @@ mod proptests {
             prop_assert_eq!(t.bid_qty.raw(), bq as i64);
             prop_assert_eq!(t.ask_px.raw(), ap as i64);
             prop_assert_eq!(t.ask_qty.raw(), aq as i64);
+            // VT2: the stamp rides in full, venue_seq is its low 32 bits
+            prop_assert_eq!(t.venue_time_ms, ts);
+            prop_assert_eq!(t.venue_seq, venue_seq_of(ts));
+            prop_assert_eq!(t.flags, 0);
         }
     }
 }

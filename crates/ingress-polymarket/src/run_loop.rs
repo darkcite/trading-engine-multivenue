@@ -44,10 +44,12 @@ use core_net::{
     KeepaliveAction, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
-use core_time::now_ns;
-use core_types::{Capture, NsTs, SymbolId, Tick};
+use core_time::{now_ns, FeedClock};
+use core_types::{Capture, NsTs, SymbolId, Tick, TICK_FLAG_STALE};
 
-use crate::{classify, parse_book_update, parse_price_change_row, scan_venue_seq, FrameKind};
+use crate::{
+    classify, parse_book_update, parse_price_change_row, scan_venue_time_ms, FrameKind,
+};
 
 // ---------------------------------------------------------------
 // Configuration + sizing
@@ -232,6 +234,11 @@ pub struct Driver {
     asset_id_count: u16,
     /// Set once the post-upgrade market subscribe has been queued.
     subscribed: bool,
+    /// VT2: this connection's venue-clock offset estimator + staleness
+    /// judge for `book` / `price_change` (`timestamp`, ms string).
+    /// Reset on reconnect; threshold = venue default or
+    /// `--stale-after-ms pm:<ms>` via [`Self::set_stale_after_ms`].
+    feed_clock: FeedClock,
     /// `!Sync` marker — keeps `Driver: Send` but blocks `&Driver`
     /// from crossing threads.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
@@ -287,8 +294,23 @@ impl Driver {
             asset_id_lens: id_lens,
             asset_id_count: count as u16,
             subscribed: false,
+            feed_clock: FeedClock::new(core_types::VenueId::Polymarket.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// VT2: override the staleness threshold (operator
+    /// `--stale-after-ms pm:<ms>`). Boot-time only — re-arms the
+    /// estimator unlearned, exactly like a fresh connection.
+    #[inline]
+    pub fn set_stale_after_ms(&mut self, ms: u32) {
+        self.feed_clock = FeedClock::new(ms);
+    }
+
+    /// VT2: the connection's smoothed CLOB feed delay in ms.
+    #[inline]
+    pub fn feed_delay_ema_ms(&self) -> u32 {
+        self.feed_clock.delay_ema_ms()
     }
 
     /// Current state (useful for tests + metrics).
@@ -313,6 +335,8 @@ impl Driver {
         self.last_activity_ns = 0;
         self.mask_counter = 0;
         self.subscribed = false;
+        // VT2: a new connection is a new offset; the threshold stays.
+        self.feed_clock.reset();
     }
 }
 
@@ -606,15 +630,24 @@ fn drain_ws_frames<C: Capture>(
     }
 }
 
-/// Push one parsed tick; loss-accounts a full ring (D4) — ring-full
-/// is back-pressure, not an error, but it is never silent.
+/// VT2: judge the parsed tick's venue stamp against THIS connection's
+/// estimator (the parsers carry the stamp but own no estimator), set
+/// the flag, count, then push. Loss-accounts a full ring (D4) —
+/// ring-full is back-pressure, not an error, but it is never silent.
 #[inline]
-fn push_tick<C: Capture>(
-    tick: Tick,
+fn judge_and_push_tick<C: Capture>(
+    clock: &mut FeedClock,
+    mut tick: Tick,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     status: &IngressStatus,
     capture: &mut C,
 ) {
+    let judged = clock.judge(tick.venue_time_ms, tick.ts_ns);
+    tick.flags = (judged.stale as u8) * TICK_FLAG_STALE;
+    if judged.stale {
+        status.inc_stale_ticks();
+    }
+    status.set_feed_delay_ema_ms(clock.delay_ema_ms());
     status.add_msgs(1);
     status.add_ticks(1);
     // §6.5 capture BEFORE the push — a ring-dropped tick must still
@@ -640,14 +673,17 @@ fn push_tick<C: Capture>(
 ///   `venue_seq`. Sibling-asset rows are skipped silently, same §6.5
 ///   carve-out.
 fn handle_text_frame<C: Capture>(
-    drv: &Driver,
+    drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     symbol_map: &SymbolMap,
     status: &IngressStatus,
     capture: &mut C,
 ) {
-    let payload = &drv.rx.filled()[payload_range];
+    // Disjoint field borrows: the payload is a view into `drv.rx`; the
+    // VT2 judge mutates `drv.feed_clock` only.
+    let Driver { rx, feed_clock, .. } = drv;
+    let payload = &rx.filled()[payload_range];
     // §6.5 capture: raw tap fires before classification.
     capture.raw_frame(now_ns(), payload);
     match classify(payload) {
@@ -668,7 +704,9 @@ fn handle_text_frame<C: Capture>(
                 // market, not by subscribed token.
                 if let Some(sym) = extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
                     match parse_book_update(ev, sym, ts_ns) {
-                        Some(tick) => push_tick(tick, producer, status, capture),
+                        Some(tick) => {
+                            judge_and_push_tick(feed_clock, tick, producer, status, capture)
+                        }
                         None => {
                             status.inc_parse_errors();
                             capture.parse_reject(now_ns(), ev);
@@ -685,7 +723,7 @@ fn handle_text_frame<C: Capture>(
             }
         }
         FrameKind::PriceChange => {
-            let Some(venue_seq) = scan_venue_seq(payload) else {
+            let Some(venue_time_ms) = scan_venue_time_ms(payload) else {
                 status.inc_parse_errors();
                 capture.parse_reject(now_ns(), payload);
                 return;
@@ -702,8 +740,10 @@ fn handle_text_frame<C: Capture>(
                 // Lookup miss = sibling-asset row — not ours, not
                 // tapped (§6.5).
                 if let Some(sym) = extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
-                    match parse_price_change_row(row, sym, ts_ns, venue_seq) {
-                        Some(tick) => push_tick(tick, producer, status, capture),
+                    match parse_price_change_row(row, sym, ts_ns, venue_time_ms) {
+                        Some(tick) => {
+                            judge_and_push_tick(feed_clock, tick, producer, status, capture)
+                        }
                         None => {
                             status.inc_parse_errors();
                             capture.parse_reject(now_ns(), row);
@@ -1187,6 +1227,13 @@ mod tests {
             "far-side size unknown on price_change"
         );
         assert_eq!(tick2.venue_seq, (1_713_000_000_456u64 & 0xFFFF_FFFF) as u32);
+        // VT2: both frames carry their stamp; the book frame defined the
+        // offset (fresh), the price_change 456 ms LATER is fresh too.
+        assert_eq!(tick.venue_time_ms, 1_713_000_000_000);
+        assert_eq!(tick2.venue_time_ms, 1_713_000_000_456);
+        assert!(!tick.is_stale());
+        assert!(!tick2.is_stale());
+        assert_eq!(status.stale_ticks_total(), 0);
         assert!(cons.try_pop().is_none());
         // §6.4 accounting: two parsed+dispatched messages, frame bytes
         // counted, nothing rejected, nothing dropped.
@@ -1195,6 +1242,80 @@ mod tests {
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
         let _ = ws_write_text_frame; // quiet unused-import lint on tests that don't call it
+    }
+
+    /// VT2 helper: one book frame for asset `0xABC` stamped `ts_ms`
+    /// through a steady driver; returns the tick it produced.
+    fn push_book_with_ts(
+        t: &mut TestTransport,
+        d: &mut Driver,
+        prod: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+        cons: &mut core_ring::Consumer<Tick, DEFAULT_TICK_RING_CAP>,
+        map: &SymbolMap,
+        status: &IngressStatus,
+        ts_ms: u64,
+    ) -> Tick {
+        let s = format!(
+            r#"[{{"market":"0x60c2","asset_id":"0xABC","timestamp":"{ts_ms}","hash":"h","bids":[{{"price":"0.518","size":"100.0"}}],"asks":[{{"price":"0.520","size":"50.0"}}],"event_type":"book"}}]"#
+        );
+        inject_unmasked_text(t, s.as_bytes());
+        drive_one(t, d, b"host", b"/", prod, map, status, &mut NullCapture).unwrap();
+        cons.try_pop().expect("book must produce a tick")
+    }
+
+    #[test]
+    fn book_ticks_carry_the_stale_judgement() {
+        // VT2: first stamped frame = the offset (fresh); a frame whose
+        // timestamp is 5 s older is stale at pm 1000 ms (flag +
+        // counter); a later stamp is fresh again.
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let t0: u64 = 1_755_216_000_000;
+
+        let fresh = push_book_with_ts(&mut t, &mut d, &mut prod, &mut cons, &map, &status, t0);
+        assert_eq!(fresh.venue_time_ms, t0);
+        assert!(!fresh.is_stale());
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        let stale = push_book_with_ts(&mut t, &mut d, &mut prod, &mut cons, &map, &status, t0 - 5_000);
+        assert!(stale.is_stale());
+        assert_eq!(stale.flags, TICK_FLAG_STALE);
+        assert_eq!(status.stale_ticks_total(), 1);
+        assert!(status.feed_delay_ema_ms() > 0);
+
+        let again = push_book_with_ts(&mut t, &mut d, &mut prod, &mut cons, &map, &status, t0 + 10);
+        assert!(!again.is_stale());
+        assert_eq!(status.stale_ticks_total(), 1);
+        assert_eq!(status.ticks_total(), 3);
+    }
+
+    #[test]
+    fn stale_threshold_override_and_reconnect_reset_apply() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver_with_seed(7);
+        d.set_stale_after_ms(10_000);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let map = SymbolMap::from_pairs(std::iter::once((b"0xABC".to_vec(), 42u32)));
+        let status = IngressStatus::new();
+        let t0: u64 = 1_755_216_000_000;
+        let _ = push_book_with_ts(&mut t, &mut d, &mut prod, &mut cons, &map, &status, t0);
+        let five_s = push_book_with_ts(&mut t, &mut d, &mut prod, &mut cons, &map, &status, t0 - 5_000);
+        assert!(!five_s.is_stale(), "5 s is under a 10 s threshold");
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        d.reset_for_reconnect(9);
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let after = push_book_with_ts(&mut t, &mut d, &mut prod, &mut cons, &map, &status, t0 - 60_000);
+        assert!(!after.is_stale(), "a reconnect starts a fresh offset");
+        assert_eq!(after.venue_time_ms, t0 - 60_000);
     }
 
     #[test]
@@ -1511,7 +1632,7 @@ mod tests {
         // market, not by our subscribed token).
         let mixed = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1000","bids":[{"price":"0.51","size":"1.0"}],"asks":[{"price":"0.52","size":"1.0"}],"event_type":"book"},{"market":"0x1","asset_id":"0xABC","bids":"nope","event_type":"book"},{"market":"0x1","asset_id":"0xSIBLING","timestamp":"1000","bids":[{"price":"0.51","size":"1.0"}],"asks":[{"price":"0.52","size":"1.0"}],"event_type":"book"}]"#;
         // Frame 3: price_change missing "timestamp" — whole-payload
-        // reject (scan_venue_seq fails before any row is walked).
+        // reject (scan_venue_time_ms fails before any row is walked).
         let bad_pc = br#"{"market":"0x1","price_changes":[{"asset_id":"0xABC","price":"0.5","size":"1","side":"BUY","best_bid":"0.5","best_ask":"0.6"}],"event_type":"price_change"}"#;
 
         for payload in [&good[..], &mixed[..], &bad_pc[..]] {

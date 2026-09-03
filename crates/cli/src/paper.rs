@@ -390,6 +390,7 @@ pub fn spawn_polymarket(
     tls_config: RustlsConfig,
     symbol_map: pwl::SymbolMap,
     asset_ids: Vec<Vec<u8>>,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
@@ -425,6 +426,8 @@ pub fn spawn_polymarket(
             let id_refs: Vec<&[u8]> = asset_ids.iter().map(|v| v.as_slice()).collect();
             let mut driver = pwl::Driver::new_multi(now_ns(), &id_refs);
             drop(id_refs);
+            // VT2: venue default or the operator's `--stale-after-ms pm:<ms>`.
+            driver.set_stale_after_ms(stale_after_ms);
             let mut keepalive = Keepalive::new(PM_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {

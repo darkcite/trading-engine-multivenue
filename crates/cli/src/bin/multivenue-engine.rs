@@ -1195,6 +1195,7 @@ fn run(args: RunArgs) -> ExitCode {
         tls_config.clone(),
         pm_map,
         pm_id_bytes,
+        stale_after_ms[core_types::VenueId::Polymarket as usize],
         pm_prod,
         statuses.polymarket.clone(),
         1,

@@ -235,3 +235,17 @@ ruling); the Binance spot book-builder lane; any strategy work.
   existing bbo test, fresh/stale/fresh, override + reconnect reset.
   Parser + fuzz target unchanged; `hl_ws_frame` re-run ≥ 300 s.
   Remaining: pm, bn-spot sentinel.
+- 2026-09-03 — **VT2 venue 6: Polymarket.** `scan_venue_time_ms` (the
+  frame's quoted-ms `timestamp` in full) replaces `scan_venue_seq`;
+  `venue_seq_of` keeps the low-32-bit venue_seq law; `parse_book_update`
+  and `parse_price_change_row` (now taking the ms stamp) build the tick
+  with `venue_time_ms` set and `flags = 0` — the parsers own no
+  estimator, so the run loop's `judge_and_push_tick` judges against the
+  connection's `FeedClock` (1000 ms default, `--stale-after-ms pm:<ms>`,
+  reset on reconnect), sets the flag, counts, publishes the gauge.
+  `handle_text_frame` takes `&mut Driver` (disjoint `rx` / `feed_clock`
+  field borrows). Tests: parser venue_time + venue_seq_of + garbage,
+  proptest (stamp rides in full), run-loop book+price_change stamps,
+  fresh/stale/fresh, override + reconnect reset. `polymarket_clob_frame`
+  fuzz ≥ 300 s. Remaining: the bn-spot aggTrade sentinel (VT2's last
+  step), then the live smoke.
