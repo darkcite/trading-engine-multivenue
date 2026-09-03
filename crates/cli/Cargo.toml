@@ -17,6 +17,7 @@ path = "src/bin/multivenue-engine.rs"
 
 [dependencies]
 core-config          = { workspace = true }
+core-regime          = { workspace = true }
 core-io              = { workspace = true }
 core-net             = { workspace = true }
 core-ring            = { workspace = true }

@@ -9,6 +9,7 @@ authors.workspace      = true
 description  = "ICDP intrabar candle-direction strategy: bar clock, L1 features, linear composite, IoC intents (slot 6)"
 
 [dependencies]
+core-regime   = { workspace = true }
 core-time     = { workspace = true }
 core-types    = { workspace = true }
 strategy-core = { workspace = true }

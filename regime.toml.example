@@ -1,0 +1,81 @@
+# ~/multivenue/regime.toml — the engine's regime-detector parameters
+# (docs/regime-and-dashboard-plan.md §3.1–§3.2, §4.6; parser lands in RG2
+# as `core-config::regime`, same integer-only TOML subset + strictness as
+# `icdp.toml`: unknown/missing/duplicate keys are FATAL and refuse the boot).
+#
+# DATA, not source. Read ONCE at boot — the three daily T2 restarts apply
+# changes. The worker rewrites the percentile lines (`rv_p30/p70`,
+# `fund_p30/p70`) daily from candles.db (RG5); everything else is the
+# operator's. Every number is an INTEGER in fixed point (×1e9 unless the
+# key says otherwise); descriptors resolve against the LIVE boot universe
+# (the D-6 truth `icdp.toml` uses) — an unresolvable one refuses the boot.
+
+[refs]
+btc = "binance-usdm:btcusdt"     # TREND / SHAPE / VOL / STRETCH reference (§11-Q1 default)
+fund = "binance-usdm:btcusdt"    # FUND_SIGN / FUND_LEVEL reference (its Funding events)
+
+[breadth]
+# The TREND breadth set (≤ 31 descriptors; the ref is excluded). Default
+# (§11-Q2): every `binance.usdm` perp of universe.toml except the ref.
+members = ["binance-usdm:ethusdt", "binance-usdm:solusdt", "binance-usdm:bnbusdt", "binance-usdm:xrpusdt"]
+
+[hysteresis]
+confirm_min = 3                  # consecutive minute judgements before a dimension flips
+
+# ---- profile 0 = fast (1 h) ----
+[profile.fast]
+trend_w_min = 60
+shape_w_min = 60                 # ER window; steps are 5-minute closes (12 per hour)
+vol_w_min = 60
+stretch_w_min = 60
+rel_w_min = 60
+trend_thr_bps_1e9 = 30000000000  # 30 bps: BTC return beyond ±thr counts as directional
+breadth_q_1e9 = 600000000        # 0.60: share of members that must agree
+er_lo_enter_1e9 = 300000000      # CHOP  ⇐ ER < 0.30 (leave CHOP above 0.35)
+er_lo_exit_1e9 = 350000000
+er_hi_enter_1e9 = 600000000      # TREND ⇐ ER > 0.60 (leave TREND below 0.55)
+er_hi_exit_1e9 = 550000000
+rv_p30_bps_1e9 = 0               # worker-refreshed daily (0 = VOL dimension ABSENT until set)
+rv_p70_bps_1e9 = 0
+stretch_k_1e9 = 2000000000       # |ret / RV| > 2.0 ⇒ extended
+rel_thr_bps_1e9 = 50000000000    # 50 bps: coin vs BTC beyond ±thr ⇒ lagging/leading
+fund_prints = 9                  # FUND_LEVEL history (3 d of 8 h prints)
+fund_p30_1e9 = 0                 # worker-refreshed daily (0 = FUND_LEVEL ABSENT until set)
+fund_p70_1e9 = 0
+
+# ---- profile 1 = slow (4 h) ----
+[profile.slow]
+trend_w_min = 240
+shape_w_min = 240                # 48 five-minute steps
+vol_w_min = 240
+stretch_w_min = 240
+rel_w_min = 240
+trend_thr_bps_1e9 = 80000000000  # 80 bps
+breadth_q_1e9 = 600000000
+er_lo_enter_1e9 = 300000000
+er_lo_exit_1e9 = 350000000
+er_hi_enter_1e9 = 600000000
+er_hi_exit_1e9 = 550000000
+rv_p30_bps_1e9 = 0
+rv_p70_bps_1e9 = 0
+stretch_k_1e9 = 2000000000
+rel_thr_bps_1e9 = 150000000000   # 150 bps
+fund_prints = 90                 # 30 d of 8 h prints
+fund_p30_1e9 = 0
+fund_p70_1e9 = 0
+
+# ---- optional overrides of the coded members' regime labels (§4.2) ----
+# One `[labels.<member>]` table per coded member (latency_arb, ev,
+# cross_arb, rule_tree, ai_exec, icdp): `off = "soft" | "hard"` and up to
+# four product terms `term1..term4`, each a list of label strings in the
+# §3.3 grammar `[fast:|slow:]dim:(*|!v|v1|v2…)` (∃-semantics across
+# terms; `rel:` is not allowed here — coded members are not per-symbol).
+# Absent = the crate's compiled constant (ANY / soft for every coded
+# member at RG2 — §11-Q10).
+# [labels.latency_arb]
+# off = "soft"
+# term1 = ["fast:vol:!high"]
+# [labels.icdp]
+# off = "soft"
+# term1 = ["fast:shape:trend", "slow:trend:bull|neutral"]
+# term2 = ["fast:shape:trend", "slow:trend:bear"]

@@ -72,6 +72,7 @@
 //! forward) — the sample count is exposed and a window with zero
 //! samples is ABSENT.
 
+use core_regime::math::isqrt_i128;
 use core_types::{
     funding_period_s, funding_print_divisor, ChannelEvent, ChannelId, DepthTopK, FeatId,
     OptSummary, SymbolId, Tick, VenueId, DEPTH_FLAG_STALE, DEPTH_K, FUNDING_WINDOW_24H_MIN,
@@ -378,8 +379,7 @@ impl FeatureState {
                 let e = &mut self.roll[(r1 - 1) as usize];
                 let w = e.win_min as i64;
                 debug_assert!(w > 0);
-                let slot = (minute % w.max(1)) as usize
-                    % ROLL_RING_MINUTES;
+                let slot = (minute % w.max(1)) as usize % ROLL_RING_MINUTES;
                 if minute > e.newest_min {
                     // Entering a fresh minute: zero the slots of every
                     // SKIPPED minute (newest, minute) — capped at `w`
@@ -723,13 +723,7 @@ impl FeatureState {
     /// entry). Returns the ×1e9 signal-domain value, or `None` when
     /// the feature is ABSENT (no data / stale / no wall offset /
     /// unbound window).
-    pub fn read(
-        &mut self,
-        feat: FeatId,
-        sym: SymbolId,
-        win_min: u16,
-        mono_ns: u64,
-    ) -> Option<i64> {
+    pub fn read(&mut self, feat: FeatId, sym: SymbolId, win_min: u16, mono_ns: u64) -> Option<i64> {
         let idx = self.find(sym)?;
         // VT3: the BBO features are ABSENT while the latest tick is
         // stale (the "hold" of the channel law — rows neither enter nor
@@ -760,7 +754,10 @@ impl FeatureState {
                     None
                 }
             }
-            FeatId::RollMean | FeatId::RollEma | FeatId::RollMin | FeatId::RollMax
+            FeatId::RollMean
+            | FeatId::RollEma
+            | FeatId::RollMin
+            | FeatId::RollMax
             | FeatId::RollStd => {
                 let minute = self.wall_ms(mono_ns)? / MS_PER_MIN;
                 let e = self.roll_entry_of(idx, win_min)?;
@@ -908,8 +905,7 @@ impl FeatureState {
                         ema = if n == 1 {
                             v
                         } else {
-                            ema + ((alpha_1e9 as i128 * (v - ema) as i128) / 1_000_000_000)
-                                as i64
+                            ema + ((alpha_1e9 as i128 * (v - ema) as i128) / 1_000_000_000) as i64
                         };
                     }
                 }
@@ -990,25 +986,8 @@ impl FeatureState {
     }
 }
 
-/// Integer square root of a non-negative i128, returned as i64
-/// (saturating — inputs are ≤ (1e9·px)² so the root fits easily).
-#[inline]
-fn isqrt_i128(v: i128) -> i64 {
-    if v <= 0 {
-        return 0;
-    }
-    let mut x = v;
-    let mut y = (x + 1) >> 1;
-    while y < x {
-        x = y;
-        y = (x + v / x) >> 1;
-    }
-    if x > i64::MAX as i128 {
-        i64::MAX
-    } else {
-        x as i64
-    }
-}
+// RG1: `isqrt_i128` lives in `core_regime::math` (shared with the regime
+// law's realized-vol root; same floor semantics, no duplicate).
 
 #[cfg(test)]
 mod tests {
@@ -1073,14 +1052,8 @@ mod tests {
             f.read(FeatId::Mid, sym, 0, MONO0),
             Some(65_000_000_000 * 1_000)
         );
-        assert_eq!(
-            f.read(FeatId::Bid, sym, 0, MONO0),
-            Some(64_990_000_000_000)
-        );
-        assert_eq!(
-            f.read(FeatId::Ask, sym, 0, MONO0),
-            Some(65_010_000_000_000)
-        );
+        assert_eq!(f.read(FeatId::Bid, sym, 0, MONO0), Some(64_990_000_000_000));
+        assert_eq!(f.read(FeatId::Ask, sym, 0, MONO0), Some(65_010_000_000_000));
     }
 
     /// VT3: a stale tick makes Mid/Bid/Ask ABSENT without moving the
@@ -1109,8 +1082,14 @@ mod tests {
 
         // A fresh quote restores the reads with ITS values.
         f.on_tick(&tick(sym, 65_030_000_000, 65_050_000_000), MONO0 + 2);
-        assert_eq!(f.read(FeatId::Mid, sym, 0, MONO0 + 2), Some(65_040_000_000_000));
-        assert_eq!(f.read(FeatId::Bid, sym, 0, MONO0 + 2), Some(65_030_000_000_000));
+        assert_eq!(
+            f.read(FeatId::Mid, sym, 0, MONO0 + 2),
+            Some(65_040_000_000_000)
+        );
+        assert_eq!(
+            f.read(FeatId::Bid, sym, 0, MONO0 + 2),
+            Some(65_030_000_000_000)
+        );
     }
 
     #[test]
@@ -1172,8 +1151,11 @@ mod tests {
         let n = mids_1e9.len() as i64;
         let rsum: i64 = mids_1e9.iter().sum();
         let rmean = rsum / n;
-        let rex2: i128 =
-            mids_1e9.iter().map(|v| *v as i128 * *v as i128).sum::<i128>() / n as i128;
+        let rex2: i128 = mids_1e9
+            .iter()
+            .map(|v| *v as i128 * *v as i128)
+            .sum::<i128>()
+            / n as i128;
         let rvar = rex2 - (rmean as i128 * rmean as i128);
         assert_eq!(mean, rmean);
         assert_eq!(mn, *mids_1e9.iter().min().unwrap());
@@ -1227,14 +1209,20 @@ mod tests {
         teach_wall(&mut f);
         let sym = make_symbol_id(VenueId::Okx, 6);
         f.on_tick(&tick(sym, 1_000_000, 1_002_000), mono_at(WALL0 + 500));
-        assert_eq!(f.read(FeatId::RollMean, sym, 10, mono_at(WALL0 + 1_000)), None);
+        assert_eq!(
+            f.read(FeatId::RollMean, sym, 10, mono_at(WALL0 + 1_000)),
+            None
+        );
         assert!(!f.bind_roll(sym, 0), "window 0 refused");
         assert!(
             !f.bind_roll(sym, ROLL_WINDOW_MAX_MIN + 1),
             "over-cap window refused"
         );
         assert!(f.bind_roll(sym, 60));
-        assert!(f.bind_roll(sym, 60), "re-bind of the same pair is idempotent");
+        assert!(
+            f.bind_roll(sym, 60),
+            "re-bind of the same pair is idempotent"
+        );
         assert_eq!(f.roll_used, 1);
     }
 
@@ -1245,7 +1233,7 @@ mod tests {
         let mut f = FeatureState::new_boxed();
         let sym = make_symbol_id(VenueId::Okx, 7);
         let t_print = WALL0 + 8 * 3_600_000; // 08:00Z print
-        // Period open: rate updates latch, no print.
+                                             // Period open: rate updates latch, no print.
         let e1 = ChannelEvent::new(
             MONO0,
             VenueId::Okx,
@@ -1410,7 +1398,11 @@ mod tests {
         let t_old = WALL0 as i64 - 30 * MS_PER_HOUR;
         f.funding_seed(sym, t_old, 80_000_000);
         let now = mono_at(WALL0);
-        assert_eq!(f.read(FeatId::Apr24, sym, 0, now), None, "empty 24 h window");
+        assert_eq!(
+            f.read(FeatId::Apr24, sym, 0, now),
+            None,
+            "empty 24 h window"
+        );
         // 72 h: Σ/3 days ×365 = 0.08/3×365.
         assert_eq!(
             f.read(FeatId::Apr72, sym, 0, now).unwrap(),
@@ -1439,14 +1431,12 @@ mod tests {
         f.on_depth(&d, MONO0);
         // imb = (300 − 100.5)/400.5 ≈ 0.4981…
         let imb = f.read(FeatId::DepthImb, sym, 0, MONO0).unwrap();
-        let want = ((300_000_000_000_000i128 - 100_500_000_000_000)
-            * 1_000_000_000
+        let want = ((300_000_000_000_000i128 - 100_500_000_000_000) * 1_000_000_000
             / 400_500_000_000_000) as i64;
         assert_eq!(imb, want);
         // spread = 0.5 of mid 100.25 → ×1e4 bps.
         let sp = f.read(FeatId::DepthSpreadBps, sym, 0, MONO0).unwrap();
-        let want_sp =
-            ((500_000i128 * 10_000 * 1_000_000_000) / 100_250_000) as i64;
+        let want_sp = ((500_000i128 * 10_000 * 1_000_000_000) / 100_250_000) as i64;
         assert_eq!(sp, want_sp);
         // near notional ×1e9 = total(×1e12)/1e3.
         assert_eq!(

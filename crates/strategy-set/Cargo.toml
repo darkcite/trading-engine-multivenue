@@ -12,6 +12,7 @@ description  = "StrategySet: static bitmask fan-out over the in-tree strategies 
 path = "src/lib.rs"
 
 [dependencies]
+core-regime          = { workspace = true }
 core-time            = { workspace = true }
 core-types           = { workspace = true }
 strategy-ai-exec     = { workspace = true }

@@ -60,6 +60,102 @@ KIND_FUNDING_SEED: int = 10
 # row index, px = entry px ×1e6, qty = position AGE in SECONDS (≥ 0),
 # ttl_ns MUST be 0 (the engine drain expires any nonzero ttl).
 KIND_POSITION_SEED: int = 11
+# RG0 (docs/regime-and-dashboard-plan.md §4.4): DECLARE one horizon
+# profile's regime — param_id = profile (0 fast / 1 slow), px = the
+# declared RegimeWord (one-hot-or-empty per dimension byte, SOURCE byte
+# EMPTY — the engine stamps DECLARED), qty = the sender's own MEASURED
+# word (audit only; 0 or a state word), ttl_ns > 0 ENFORCED,
+# strategy_id = STRATEGY_SLOT_NONE, flags bit 0 (expire-on-silence) legal.
+KIND_SET_REGIME: int = 12
+
+# ---- regime word bit map (core-types regime.rs; wire-stable) ----
+# One byte per dimension, one-hot inside the byte. Names index the bit.
+
+REGIME_PROFILE_FAST: int = 0
+REGIME_PROFILE_SLOW: int = 1
+REGIME_PROFILES: int = 2
+REGIME_DIMS: dict[str, int] = {
+    "trend": 0,
+    "shape": 1,
+    "vol": 2,
+    "fund": 3,
+    "level": 4,
+    "stretch": 5,
+    "source": 6,
+}
+REGIME_VALUES: dict[str, tuple[str, ...]] = {
+    "trend": ("bear", "neutral", "bull"),
+    "shape": ("chop", "mixed", "trend"),
+    "vol": ("low", "normal", "high"),
+    "fund": ("neg", "pos"),
+    "level": ("low", "normal", "high"),
+    "stretch": ("ext_down", "neutral", "ext_up"),
+    "source": ("measured", "declared", "unknown"),
+}
+# Bit 7 of every MARKET dimension byte (0..=5): "could not be judged".
+# Fail-closed per dimension: a label that constrains the dimension
+# refuses it, a label that omits the dimension allows it.
+REGIME_DIM_UNKNOWN_BIT: int = 0x80
+REGIME_UNKNOWN_WORD: int = 0x0004_8080_8080_8080
+
+
+def regime_word(**dims: str) -> int:
+    """Build a RegimeWord from dimension=value keywords (e.g.
+    ``regime_word(trend="bull", vol="high")``). Omitted dimensions stay
+    EMPTY ("any" for gating; legal on the wire). ``"unknown"`` on a market
+    dimension sets its unknown mark (bit 7). Unknown names raise."""
+    word = 0
+    for name, value in dims.items():
+        if name not in REGIME_DIMS:
+            raise ValueError(f"unknown regime dimension {name!r}")
+        if name != "source" and value == "unknown":
+            word |= REGIME_DIM_UNKNOWN_BIT << (8 * REGIME_DIMS[name])
+            continue
+        values = REGIME_VALUES[name]
+        if value not in values:
+            raise ValueError(f"unknown value {value!r} for regime dimension {name!r}")
+        word |= 1 << (8 * REGIME_DIMS[name] + values.index(value))
+    return word
+
+
+def regime_word_dims(word: int) -> dict[str, str]:
+    """Decode a RegimeWord into ``{dimension: value}`` for every populated
+    byte (the unknown mark decodes to ``"unknown"``, malformed bytes to
+    ``"?"``)."""
+    out: dict[str, str] = {}
+    for name, byte_index in REGIME_DIMS.items():
+        b = (word >> (8 * byte_index)) & 0xFF
+        if b == 0:
+            continue
+        if name != "source" and b == REGIME_DIM_UNKNOWN_BIT:
+            out[name] = "unknown"
+            continue
+        values = REGIME_VALUES[name]
+        if b & (b - 1) == 0 and b.bit_length() - 1 < len(values):
+            out[name] = values[b.bit_length() - 1]
+        else:
+            out[name] = "?"
+    return out
+
+
+def regime_word_is_wire_declared(word: int) -> bool:
+    """The engine's ``RegimeWord::is_wire_declared`` law: every populated
+    market byte one-hot over its legal bits (a known value or the unknown
+    mark), SOURCE byte empty, reserved byte 7 empty."""
+    if word < 0 or word >> 64:
+        return False
+    if (word >> 48) & 0xFF or (word >> 56) & 0xFF:
+        return False
+    for name, byte_index in REGIME_DIMS.items():
+        if name == "source":
+            continue
+        b = (word >> (8 * byte_index)) & 0xFF
+        if b == 0 or b == REGIME_DIM_UNKNOWN_BIT:
+            continue
+        if b & (b - 1) or b.bit_length() > len(REGIME_VALUES[name]):
+            return False
+    return True
+
 
 # ---- sentinels and enum bytes (core-types) ----
 

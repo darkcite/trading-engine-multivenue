@@ -46,10 +46,11 @@
 )]
 
 use core_time::{BarClock, NsTs, WallAnchor};
+use core_types::RegimeLabelSet;
 use core_types::{
     symbol_venue_byte, Order, Price, Qty, Side, SymbolId, Tick, VenueId, SYMBOL_ID_NONE,
 };
-use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+use strategy_core::{Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
 /// The counters the engine mirrors (defined in `strategy-core` so the
 /// cli never names this crate — the vm-gauge precedent).
@@ -239,6 +240,13 @@ pub struct IcdpStrategy {
     orders_dropped: u64,
     next_oid: u64,
     tick_count: u32,
+    /// RG2: the member's regime label (`regime.toml [labels.icdp]`
+    /// override; default ANY).
+    regime_label: RegimeLabelSet,
+    /// RG2: the current gate verdict (open at boot). Closed ⇒ no
+    /// decision enters; hard-closed ⇒ open positions are exited at
+    /// once (the roll's exit law, run early).
+    regime_open: bool,
 }
 
 impl Default for IcdpStrategy {
@@ -260,20 +268,12 @@ pub const fn mid_1e6(bid: i64, ask: i64) -> i64 {
     (bid + ask) >> 1
 }
 
-#[inline(always)]
-const fn floor_div(n: i128, d: i128) -> i128 {
-    n.div_euclid(d)
-}
-
-/// Return of `to` over `from` in bps ×1e9: `((to − from) × 1e13) / from`.
-#[inline(always)]
-pub fn ret_bps_1e9(from_1e6: i64, to_1e6: i64) -> i64 {
-    debug_assert!(from_1e6 > 0);
-    floor_div(
-        (to_1e6 as i128 - from_1e6 as i128) * 10_000_000_000_000,
-        from_1e6 as i128,
-    ) as i64
-}
+// RG1: the integer primitives moved to `core_regime::math` (one home for
+// the ICDP feature law, the regime law and the VM feature engine — no
+// duplicates). `ret_bps_1e9` keeps its public path here for the vault's
+// Python mirror and the existing callers.
+use core_regime::math::floor_div;
+pub use core_regime::math::ret_bps_1e9;
 
 /// L1 queue imbalance ×1e9: `(bq − aq) / max(bq + aq, 1)`.
 #[inline(always)]
@@ -295,7 +295,16 @@ pub fn micro_bps_1e9(bid: i64, ask: i64, bq: i64, aq: i64) -> i64 {
 /// One Cont–Kukanov–Stoikov OFI increment between two consecutive
 /// quotes (qty ×1e6 units).
 #[inline(always)]
-pub const fn ofi_step(pb: i64, pbq: i64, pa: i64, paq: i64, b: i64, bq: i64, a: i64, aq: i64) -> i64 {
+pub const fn ofi_step(
+    pb: i64,
+    pbq: i64,
+    pa: i64,
+    paq: i64,
+    b: i64,
+    bq: i64,
+    a: i64,
+    aq: i64,
+) -> i64 {
     let db = b - pb;
     let da = a - pa;
     let mut e = 0i64;
@@ -335,7 +344,10 @@ pub fn composite_1e9(p: &IcdpSymParams, f: &[i64; ICDP_NF]) -> i64 {
     let mut s = p.b as i128;
     let mut i = 0usize;
     while i < ICDP_NF {
-        let z = floor_div((f[i] as i128 - p.mu[i] as i128) * p.inv_sd[i] as i128, SCALE_1E9 as i128);
+        let z = floor_div(
+            (f[i] as i128 - p.mu[i] as i128) * p.inv_sd[i] as i128,
+            SCALE_1E9 as i128,
+        );
         s += floor_div(p.w[i] as i128 * z, SCALE_1E9 as i128);
         i += 1;
     }
@@ -365,7 +377,10 @@ impl IcdpStrategy {
     pub const fn new() -> Self {
         Self {
             clock: BarClock {
-                anchor: WallAnchor { mono_ns: 0, wall_ns: 0 },
+                anchor: WallAnchor {
+                    mono_ns: 0,
+                    wall_ns: 0,
+                },
                 tf_ns: 1,
                 delta_ns: 0,
             },
@@ -388,12 +403,16 @@ impl IcdpStrategy {
                 late_bars: 0,
                 caps_rejected: 0,
                 rolls: 0,
+                regime_blocked: 0,
+                regime_exits: 0,
             },
             open_notional_total_1e6: 0,
             orders_emitted: 0,
             orders_dropped: 0,
             next_oid: 1,
             tick_count: 0,
+            regime_label: RegimeLabelSet::ANY,
+            regime_open: true,
         }
     }
 
@@ -401,9 +420,15 @@ impl IcdpStrategy {
     /// closed on anything the caps or the grid refuse; a refused
     /// config leaves the strategy unconfigured (`on_start` then errs
     /// when the slot is enabled).
-    pub fn configure(&mut self, anchor: WallAnchor, params: &IcdpParams) -> Result<(), StrategyError> {
+    pub fn configure(
+        &mut self,
+        anchor: WallAnchor,
+        params: &IcdpParams,
+    ) -> Result<(), StrategyError> {
         if params.tf_ns == 0 || params.delta_ns >= params.tf_ns {
-            return Err(StrategyError::Config("icdp: delta must fall inside a positive tf"));
+            return Err(StrategyError::Config(
+                "icdp: delta must fall inside a positive tf",
+            ));
         }
         if params.n == 0 || params.n > ICDP_MAX_SYMS {
             return Err(StrategyError::Config("icdp: instrument count out of range"));
@@ -535,7 +560,16 @@ impl IcdpStrategy {
     }
 
     #[inline(always)]
-    fn emit<C: Ctx>(&mut self, ctx: &mut C, i: usize, side: Side, px: i64, qty: i64, ttl: u64, now: NsTs) -> bool {
+    fn emit<C: Ctx>(
+        &mut self,
+        ctx: &mut C,
+        i: usize,
+        side: Side,
+        px: i64,
+        qty: i64,
+        ttl: u64,
+        now: NsTs,
+    ) -> bool {
         debug_assert!(px > 0 && qty > 0);
         let s = &self.syms[i];
         // The wire venue byte is the sym-namespace law (the fill model
@@ -576,26 +610,29 @@ impl IcdpStrategy {
     /// Bar roll for slot `i` at `now` (≥ the slot's close): exit the
     /// open position, close the ended bar's stats, open the new bar on
     /// the prevailing quote.
-    fn roll<C: Ctx>(&mut self, ctx: &mut C, i: usize, now: NsTs) {
-        self.counters.rolls = self.counters.rolls.wrapping_add(1);
-        let new_id = self.clock.bar_id(now);
+    /// Exit slot `i`'s open position (the roll's exit law; also the
+    /// RG2 hard-close flatten): emitted regardless of staleness with
+    /// `ttl` remaining, then the logical position is cleared. No-op
+    /// when flat or without a two-sided quote (the position is still
+    /// cleared — the harness's fill law is the source of truth).
+    fn exit_position<C: Ctx>(&mut self, ctx: &mut C, i: usize, now: NsTs, ttl: u64) -> bool {
         let s = self.syms[i];
-        let ended_id = s.bar_id;
-        let contiguous = s.open_valid != 0 && new_id == ended_id.wrapping_add(1);
-        // ---- exit at the roll (I3 rule: emitted regardless of staleness) ----
+        let mut emitted = false;
         if s.pos_side != POS_NONE && s.bid > 0 && s.ask > 0 {
             let (side, px) = if s.pos_side == POS_LONG {
                 (Side::Ask, shift_px_1e6(s.bid, s.p.exit_slip_1e9, false))
             } else {
                 (Side::Bid, shift_px_1e6(s.ask, s.p.exit_slip_1e9, true))
             };
-            let ttl = self.clock.ttl_to_close(new_id, now);
             if self.emit(ctx, i, side, px, s.pos_qty, ttl, now) {
                 self.counters.exits = self.counters.exits.wrapping_add(1);
                 if s.last_stale != 0 {
                     self.counters.exit_on_stale = self.counters.exit_on_stale.wrapping_add(1);
                 }
+                emitted = true;
             }
+        }
+        if s.pos_side != POS_NONE {
             self.open_notional_total_1e6 -= s.pos_notional_1e6;
             debug_assert!(self.open_notional_total_1e6 >= 0);
         }
@@ -603,6 +640,19 @@ impl IcdpStrategy {
         s.pos_side = POS_NONE;
         s.pos_qty = 0;
         s.pos_notional_1e6 = 0;
+        emitted
+    }
+
+    fn roll<C: Ctx>(&mut self, ctx: &mut C, i: usize, now: NsTs) {
+        self.counters.rolls = self.counters.rolls.wrapping_add(1);
+        let new_id = self.clock.bar_id(now);
+        let s = self.syms[i];
+        let ended_id = s.bar_id;
+        let contiguous = s.open_valid != 0 && new_id == ended_id.wrapping_add(1);
+        // ---- exit at the roll (I3 rule: emitted regardless of staleness) ----
+        let ttl = self.clock.ttl_to_close(new_id, now);
+        self.exit_position(ctx, i, now, ttl);
+        let s = &mut self.syms[i];
         // ---- previous-bar stats (only a contiguous, clean bar counts) ----
         if contiguous && s.open_stale == 0 && s.stale_in_bar == 0 && s.open_mid > 0 {
             s.prev_open_mid = s.open_mid;
@@ -614,7 +664,11 @@ impl IcdpStrategy {
         // The research's validity law: the boundary quote is at most
         // max(tf, 2 s) old at the boundary; older ⇒ the open is unknown.
         let open_mono = self.clock.open_mono(new_id);
-        let max_age = if self.clock.tf_ns > 2_000_000_000 { self.clock.tf_ns } else { 2_000_000_000 };
+        let max_age = if self.clock.tf_ns > 2_000_000_000 {
+            self.clock.tf_ns
+        } else {
+            2_000_000_000
+        };
         let quote_age = open_mono.saturating_sub(s.last_ts);
         let fresh_quote = s.last_stale == 0 && s.bid > 0 && s.ask > 0 && quote_age <= max_age;
         s.bar_id = new_id;
@@ -642,6 +696,11 @@ impl IcdpStrategy {
         let s = self.syms[i];
         self.syms[i].dec_done = 1;
         self.counters.decisions = self.counters.decisions.wrapping_add(1);
+        if !self.regime_open {
+            // RG2: closed gate — the decision is a would-be entry.
+            self.counters.regime_blocked = self.counters.regime_blocked.wrapping_add(1);
+            return;
+        }
         if now >= s.late_mono {
             self.counters.late_bars = self.counters.late_bars.wrapping_add(1);
             return;
@@ -737,7 +796,9 @@ impl Strategy for IcdpStrategy {
     /// sets the bit when `icdp.toml` resolved; belt and braces).
     fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
         if !self.configured {
-            return Err(StrategyError::Config("icdp: enabled without a resolved icdp.toml"));
+            return Err(StrategyError::Config(
+                "icdp: enabled without a resolved icdp.toml",
+            ));
         }
         Ok(())
     }
@@ -820,6 +881,41 @@ impl Strategy for IcdpStrategy {
         u64::MAX
     }
 
+    /// RG2: the compiled label (ANY) or the boot override.
+    #[inline]
+    fn regime_label(&self) -> RegimeLabelSet {
+        self.regime_label
+    }
+
+    /// RG2: boot override from `regime.toml [labels.icdp]`.
+    #[inline]
+    fn set_regime_label(&mut self, set: RegimeLabelSet) -> bool {
+        self.regime_label = set;
+        true
+    }
+
+    /// RG2 gate: closed ⇒ `decide` stops entering (positions still
+    /// exit at their roll — the soft law); hard-closed ⇒ every open
+    /// position is exited NOW with the bar's remaining TTL (the roll's
+    /// exit law run early; counted in `regime_exits`).
+    fn on_regime<C: Ctx>(&mut self, gate: RegimeGate, ctx: &mut C) {
+        self.regime_open = gate.open;
+        if !gate.hard_closed() || !self.configured {
+            return;
+        }
+        let now = ctx.now_ns();
+        let mut i = 0usize;
+        while i < self.n {
+            if self.syms[i].pos_side != POS_NONE {
+                let ttl = self.clock.ttl_to_close(self.syms[i].bar_id, now);
+                if self.exit_position(ctx, i, now, ttl) {
+                    self.counters.regime_exits = self.counters.regime_exits.wrapping_add(1);
+                }
+            }
+            i += 1;
+        }
+    }
+
     fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
 }
 
@@ -877,7 +973,7 @@ mod tests {
                 w: [SCALE_1E9, 0, 0, 0, 0],   // s = r_early (bps)
                 b: 0,
                 thr,
-                notional_1e6: 10_000_000_000, // $10k
+                notional_1e6: 10_000_000_000,  // $10k
                 spread_cap_1e9: 5 * SCALE_1E9, // 5 bps
                 entry_slip_1e9: SCALE_1E9,     // 1 bps
                 exit_slip_1e9: 2 * SCALE_1E9,  // 2 bps
@@ -934,7 +1030,10 @@ mod tests {
         p.syms[0].sym = SYMBOL_ID_NONE;
         assert!(s.configure(a, &p).is_err());
         assert!(!s.is_configured());
-        assert!(s.on_start(&mut ctx()).is_err(), "enabled without an artifact refuses");
+        assert!(
+            s.on_start(&mut ctx()).is_err(),
+            "enabled without an artifact refuses"
+        );
         assert!(s.configure(a, &params(&[OKX, BN], SCALE_1E9)).is_ok());
         assert!(s.on_start(&mut ctx()).is_ok());
         assert_eq!(s.instruments(), 2);
@@ -961,14 +1060,20 @@ mod tests {
         assert_eq!(imb_1e9(3_000_000, 1_000_000), 500_000_000);
         assert_eq!(imb_1e9(0, 0), 0);
         // microprice with bq 3, aq 1: (bid·1 + ask·3)/4 = 100.0075 ⇒ +0.25 bps − mid
-        assert_eq!(micro_bps_1e9(100_000_000, 100_010_000, 3_000_000, 1_000_000), 249_987_500);
+        assert_eq!(
+            micro_bps_1e9(100_000_000, 100_010_000, 3_000_000, 1_000_000),
+            249_987_500
+        );
         // OFI: bid up with new bq 5 (prev bq 3), ask unchanged with aq 2 (prev 2)
         assert_eq!(ofi_step(100, 3, 110, 2, 101, 5, 110, 2), 5 - 2 + 2);
         assert_eq!(ofi_norm_1e9(4_000_000, 4_000_000, 4_000_000), SCALE_1E9);
         assert_eq!(ofi_norm_1e9(1, 0, 0), 1_000); // den floors at 1.0 qty
         assert_eq!(shift_px_1e6(100_000_000, SCALE_1E9, true), 100_010_000);
         assert_eq!(shift_px_1e6(100_000_000, SCALE_1E9, false), 99_990_000);
-        assert_eq!(qty_for_notional_1e6(10_000_000_000, 100_000_000), 100_000_000);
+        assert_eq!(
+            qty_for_notional_1e6(10_000_000_000, 100_000_000),
+            100_000_000
+        );
         // composite: b + w·z with z = (f − mu)·inv_sd
         let p = IcdpSymParams {
             sym: BN,
@@ -991,35 +1096,262 @@ mod tests {
 
     // ---------- the bar machine ----------
 
+    /// Bring `s` to an open long in bar 1 (the flow of the test below,
+    /// minus the assertions); returns bar 1's open `o`.
+    fn enter_long(s: &mut IcdpStrategy, c: &mut RecCtx) -> NsTs {
+        let o = t0(s);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + 2 * MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + MS,
+                100_020_000,
+                2_000_000,
+                100_030_000,
+                1_000_000,
+                0,
+            ),
+            c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA,
+                100_020_000,
+                2_000_000,
+                100_030_000,
+                1_000_000,
+                0,
+            ),
+            c,
+        );
+        o
+    }
+
+    #[test]
+    fn regime_gate_blocks_entries_soft_and_flattens_hard() {
+        use core_types::regime::RegimeLabelBuilder;
+        use core_types::{RegimeLabelSet, RegimeWord, REGIME_OFF_HARD, REGIME_OFF_SOFT};
+        use strategy_core::RegimeGate;
+
+        // Default label ANY; the override sticks.
+        let mut s = strat(&[BN], SCALE_1E9);
+        assert_eq!(s.regime_label(), RegimeLabelSet::ANY);
+        let mut b = RegimeLabelBuilder::new();
+        b.add(b"fast:shape:trend").unwrap();
+        let set = RegimeLabelSet::from_terms(&[b.finish()], REGIME_OFF_HARD).unwrap();
+        assert!(s.set_regime_label(set));
+        assert_eq!(s.regime_label(), set);
+
+        // SOFT close: the decision is blocked (counted), nothing enters.
+        let mut c = ctx();
+        s.on_regime(
+            RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_SOFT),
+            &mut c,
+        );
+        enter_long(&mut s, &mut c);
+        assert!(c.orders.is_empty(), "closed gate: no entry");
+        let k = s.counters();
+        assert_eq!((k.decisions, k.regime_blocked, k.intents), (1, 1, 0));
+        assert_eq!(s.position_side(BN), POS_NONE);
+
+        // Reopen ⇒ the next bar's decision enters normally.
+        let mut s = strat(&[BN], SCALE_1E9);
+        let mut c = ctx();
+        s.on_regime(RegimeGate::OPEN_UNKNOWN, &mut c);
+        let o = enter_long(&mut s, &mut c);
+        assert_eq!(c.orders.len(), 1);
+        assert_eq!(s.position_side(BN), POS_LONG);
+        // HARD close mid-bar: the position exits NOW with the bar's
+        // remaining TTL, counted in regime_exits; the roll then finds
+        // nothing to exit.
+        c.orders.clear();
+        let now = o + DELTA + 2 * MS;
+        let mut c2 = RecCtx {
+            orders: Vec::new(),
+            full: false,
+        };
+        // A ctx clock at `now` so the flatten stamps and TTLs correctly.
+        struct AtCtx<'a> {
+            inner: &'a mut RecCtx,
+            now: NsTs,
+        }
+        impl<'a> Ctx for AtCtx<'a> {
+            fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+                self.inner.submit(order)
+            }
+            fn now_ns(&self) -> NsTs {
+                self.now
+            }
+        }
+        let mut at = AtCtx {
+            inner: &mut c2,
+            now,
+        };
+        s.on_regime(
+            RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_HARD),
+            &mut at,
+        );
+        assert_eq!(c2.orders.len(), 1, "hard close flattens at once");
+        let x = c2.orders[0];
+        assert_eq!(x.side as u8, Side::Ask as u8);
+        assert_eq!(x.kind, ORDER_KIND_IOC);
+        assert_eq!(x.ttl_ns, TF - DELTA - 2 * MS, "the bar's remaining life");
+        assert_eq!(s.position_side(BN), POS_NONE);
+        assert_eq!(s.open_notional_total_1e6(), 0);
+        let k = s.counters();
+        assert_eq!((k.exits, k.regime_exits, k.regime_blocked), (1, 1, 0));
+        // The roll of bar 2 emits no second exit.
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + 5 * MS,
+                100_050_000,
+                1_000_000,
+                100_060_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        assert!(c.orders.is_empty());
+        assert_eq!(s.counters().exits, 1);
+        // Hard close while flat is a no-op; an unconfigured strategy
+        // ignores the gate entirely.
+        s.on_regime(
+            RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_HARD),
+            &mut c,
+        );
+        assert!(c.orders.is_empty());
+        let mut u = IcdpStrategy::new();
+        u.on_regime(
+            RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_HARD),
+            &mut c,
+        );
+        assert!(c.orders.is_empty());
+    }
+
     #[test]
     fn entry_ioc_fires_at_the_decision_and_exit_ioc_at_the_roll() {
         let mut s = strat(&[BN], SCALE_1E9); // thr 1 bps on r_early
         let mut c = ctx();
         let o = t0(&s);
         // Warm bar (prev): quotes inside bar 0.
-        s.on_tick(&tick(BN, o - TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
-        s.on_tick(&tick(BN, o - TF + 2 * MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + 2 * MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert!(c.orders.is_empty());
         // Bar 1 opens on the prevailing quote (mid 100.005). A +2 bps
         // move before δ, then the first tick at/after δ decides.
-        s.on_tick(&tick(BN, o + MS, 100_020_000, 2_000_000, 100_030_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + MS,
+                100_020_000,
+                2_000_000,
+                100_030_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert!(c.orders.is_empty(), "before δ nothing fires");
-        s.on_tick(&tick(BN, o + DELTA, 100_020_000, 2_000_000, 100_030_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA,
+                100_020_000,
+                2_000_000,
+                100_030_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 1, "entry at the decision tick");
         let e = c.orders[0];
         assert_eq!(e.kind, ORDER_KIND_IOC);
         assert_eq!(e.side as u8, Side::Bid as u8);
         assert_eq!(e.px.raw(), shift_px_1e6(100_030_000, SCALE_1E9, true));
-        assert_eq!(e.qty.raw(), qty_for_notional_1e6(10_000_000_000, e.px.raw()));
+        assert_eq!(
+            e.qty.raw(),
+            qty_for_notional_1e6(10_000_000_000, e.px.raw())
+        );
         assert_eq!(e.ttl_ns, TF - DELTA, "the intent dies with its bar");
         assert_eq!(e.ts_ns, o + DELTA);
         assert_eq!(s.position_side(BN), POS_LONG);
         assert_eq!(s.open_notional_total_1e6(), 10_000_000_000);
         // Later ticks in the same bar: no second entry.
-        s.on_tick(&tick(BN, o + DELTA + MS, 100_050_000, 1_000_000, 100_060_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA + MS,
+                100_050_000,
+                1_000_000,
+                100_060_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 1);
         // The first tick of bar 2 rolls: exit IoC (ASK at bid − 2 bps), qty = position.
-        s.on_tick(&tick(BN, o + TF + 5 * MS, 100_050_000, 1_000_000, 100_060_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + 5 * MS,
+                100_050_000,
+                1_000_000,
+                100_060_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 2);
         let x = c.orders[1];
         assert_eq!(x.side as u8, Side::Ask as u8);
@@ -1039,18 +1371,65 @@ mod tests {
         let mut s = strat(&[BN], 3 * SCALE_1E9); // thr 3 bps
         let mut c = ctx();
         let o = t0(&s);
-        s.on_tick(&tick(BN, o - TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         // −2 bps: under the threshold ⇒ no fire.
-        s.on_tick(&tick(BN, o + DELTA, 99_980_000, 1_000_000, 99_990_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA,
+                99_980_000,
+                1_000_000,
+                99_990_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert!(c.orders.is_empty());
         assert_eq!(s.counters().decisions, 1);
         assert_eq!(s.counters().signals, 0);
         // Next bar: −5 bps vs its open ⇒ short.
-        s.on_tick(&tick(BN, o + TF + MS, 99_980_000, 1_000_000, 99_990_000, 1_000_000, 0), &mut c);
-        s.on_tick(&tick(BN, o + TF + DELTA, 99_930_000, 1_000_000, 99_940_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + MS,
+                99_980_000,
+                1_000_000,
+                99_990_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + DELTA,
+                99_930_000,
+                1_000_000,
+                99_940_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 1);
         assert_eq!(c.orders[0].side as u8, Side::Ask as u8);
-        assert_eq!(c.orders[0].px.raw(), shift_px_1e6(99_930_000, SCALE_1E9, false));
+        assert_eq!(
+            c.orders[0].px.raw(),
+            shift_px_1e6(99_930_000, SCALE_1E9, false)
+        );
         assert_eq!(s.position_side(BN), POS_SHORT);
     }
 
@@ -1059,28 +1438,120 @@ mod tests {
         let mut s = strat(&[BN], SCALE_1E9);
         let mut c = ctx();
         let o = t0(&s);
-        s.on_tick(&tick(BN, o - TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         // Bar 1: a stale tick inside the bar before δ ⇒ decision skipped.
-        s.on_tick(&tick(BN, o + MS, 100_020_000, 1_000_000, 100_030_000, 1_000_000, TICK_FLAG_STALE), &mut c);
-        s.on_tick(&tick(BN, o + DELTA, 100_020_000, 1_000_000, 100_030_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + MS,
+                100_020_000,
+                1_000_000,
+                100_030_000,
+                1_000_000,
+                TICK_FLAG_STALE,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA,
+                100_020_000,
+                1_000_000,
+                100_030_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert!(c.orders.is_empty());
         assert_eq!(s.counters().skipped_stale_dec, 1);
         // Bar 2 opens on a STALE prevailing quote ⇒ skipped_stale_open.
-        s.on_tick(&tick(BN, o + TF - MS, 100_020_000, 1_000_000, 100_030_000, 1_000_000, TICK_FLAG_STALE), &mut c);
-        s.on_tick(&tick(BN, o + TF + DELTA, 100_060_000, 1_000_000, 100_070_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF - MS,
+                100_020_000,
+                1_000_000,
+                100_030_000,
+                1_000_000,
+                TICK_FLAG_STALE,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + DELTA,
+                100_060_000,
+                1_000_000,
+                100_070_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert!(c.orders.is_empty());
         assert_eq!(s.counters().skipped_stale_open, 1);
         // Bar 3: prev bar (2) had a stale open ⇒ prev invalid ⇒ skipped_prev.
-        s.on_tick(&tick(BN, o + 2 * TF + DELTA, 100_100_000, 1_000_000, 100_110_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + 2 * TF + DELTA,
+                100_100_000,
+                1_000_000,
+                100_110_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(s.counters().skipped_prev, 1);
         // Bar 4: clean ⇒ enter long; then the roll happens on a STALE tick:
         // the exit is still emitted (fill deferred by the harness).
-        s.on_tick(&tick(BN, o + 3 * TF + DELTA, 100_150_000, 1_000_000, 100_160_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + 3 * TF + DELTA,
+                100_150_000,
+                1_000_000,
+                100_160_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 1);
-        s.on_tick(&tick(BN, o + 4 * TF + MS, 100_150_000, 1_000_000, 100_160_000, 1_000_000, TICK_FLAG_STALE), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + 4 * TF + MS,
+                100_150_000,
+                1_000_000,
+                100_160_000,
+                1_000_000,
+                TICK_FLAG_STALE,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 2, "exit emitted at the roll regardless");
         assert_eq!(s.counters().exits, 1);
-        assert_eq!(s.counters().exit_on_stale, 0, "the roll tick itself was stale, the last quote before it fresh");
+        assert_eq!(
+            s.counters().exit_on_stale,
+            0,
+            "the roll tick itself was stale, the last quote before it fresh"
+        );
         assert_eq!(s.position_side(BN), POS_NONE);
     }
 
@@ -1090,20 +1561,75 @@ mod tests {
         let mut c = ctx();
         let o = t0(&s);
         for sym in [BN, OKX] {
-            s.on_tick(&tick(sym, o - TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
+            s.on_tick(
+                &tick(
+                    sym,
+                    o - TF + MS,
+                    100_000_000,
+                    1_000_000,
+                    100_010_000,
+                    1_000_000,
+                    0,
+                ),
+                &mut c,
+            );
         }
         // BN: first tick after δ lands in the last fifth ⇒ late.
-        s.on_tick(&tick(BN, o + TF / 5 * 4, 100_050_000, 1_000_000, 100_060_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF / 5 * 4,
+                100_050_000,
+                1_000_000,
+                100_060_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(s.counters().late_bars, 1);
         // OKX: spread 10 bps > cap 5 ⇒ skipped_spread.
-        s.on_tick(&tick(OKX, o + DELTA, 100_000_000, 1_000_000, 100_100_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                OKX,
+                o + DELTA,
+                100_000_000,
+                1_000_000,
+                100_100_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(s.counters().skipped_spread, 1);
         assert!(c.orders.is_empty());
         // Table cap: shrink the cap by pre-loading open notional.
         s.open_notional_total_1e6 = CAP_TABLE_1E6 - 1;
         // Bar 2 opens on the last bar-1 quote (mid 100.055); +9.5 bps at δ.
-        s.on_tick(&tick(BN, o + TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
-        s.on_tick(&tick(BN, o + TF + DELTA, 100_150_000, 1_000_000, 100_160_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + TF + DELTA,
+                100_150_000,
+                1_000_000,
+                100_160_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(s.counters().signals, 1);
         assert_eq!(s.counters().caps_rejected, 1);
         assert!(c.orders.is_empty());
@@ -1115,8 +1641,30 @@ mod tests {
         let mut c = ctx();
         let o = t0(&s);
         let foreign = make_symbol_id(VenueId::Deribit, 9);
-        s.on_tick(&tick(BN, o - TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
-        s.on_tick(&tick(BN, o + DELTA, 100_050_000, 1_000_000, 100_060_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA,
+                100_050_000,
+                1_000_000,
+                100_060_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(c.orders.len(), 1, "long entered");
         // BN goes quiet; 256 foreign ticks after the close trigger the sweep.
         let mut t = o + TF + MS;
@@ -1124,7 +1672,11 @@ mod tests {
             s.on_tick(&tick(foreign, t, 1_000_000, 1, 1_010_000, 1, 0), &mut c);
             t += MS;
         }
-        assert_eq!(c.orders.len(), 2, "the sweep emitted BN's exit without a BN tick");
+        assert_eq!(
+            c.orders.len(),
+            2,
+            "the sweep emitted BN's exit without a BN tick"
+        );
         assert_eq!(c.orders[1].side as u8, Side::Ask as u8);
         assert_eq!(s.position_side(BN), POS_NONE);
     }
@@ -1135,11 +1687,37 @@ mod tests {
         let mut c = ctx();
         c.full = true;
         let o = t0(&s);
-        s.on_tick(&tick(BN, o - TF + MS, 100_000_000, 1_000_000, 100_010_000, 1_000_000, 0), &mut c);
-        s.on_tick(&tick(BN, o + DELTA, 100_050_000, 1_000_000, 100_060_000, 1_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                1_000_000,
+                100_010_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        s.on_tick(
+            &tick(
+                BN,
+                o + DELTA,
+                100_050_000,
+                1_000_000,
+                100_060_000,
+                1_000_000,
+                0,
+            ),
+            &mut c,
+        );
         assert_eq!(s.orders_dropped(), 1);
         assert_eq!(s.orders_emitted(), 0);
-        assert_eq!(s.position_side(BN), POS_NONE, "no position without an accepted intent");
+        assert_eq!(
+            s.position_side(BN),
+            POS_NONE,
+            "no position without an accepted intent"
+        );
         assert_eq!(s.open_notional_total_1e6(), 0);
     }
 
@@ -1148,16 +1726,63 @@ mod tests {
         let mut s = strat(&[BN], 1_000 * SCALE_1E9); // never fires
         let mut c = ctx();
         let o = t0(&s);
-        s.on_tick(&tick(BN, o - TF + MS, 100_000_000, 3_000_000, 100_010_000, 2_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o - TF + MS,
+                100_000_000,
+                3_000_000,
+                100_010_000,
+                2_000_000,
+                0,
+            ),
+            &mut c,
+        );
         // bar 1 opens on that quote (ofi 0). Bid up with bq 5, ask same aq 2:
-        s.on_tick(&tick(BN, o + MS, 100_001_000, 5_000_000, 100_010_000, 2_000_000, 0), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + MS,
+                100_001_000,
+                5_000_000,
+                100_010_000,
+                2_000_000,
+                0,
+            ),
+            &mut c,
+        );
         let i = s.slot(BN).unwrap();
         assert_eq!(s.syms[i].ofi_acc, 5_000_000 - 2_000_000 + 2_000_000);
         // a stale tick contributes nothing and breaks the chain
-        s.on_tick(&tick(BN, o + 2 * MS, 100_001_000, 9_000_000, 100_010_000, 2_000_000, TICK_FLAG_STALE), &mut c);
+        s.on_tick(
+            &tick(
+                BN,
+                o + 2 * MS,
+                100_001_000,
+                9_000_000,
+                100_010_000,
+                2_000_000,
+                TICK_FLAG_STALE,
+            ),
+            &mut c,
+        );
         assert_eq!(s.syms[i].ofi_acc, 5_000_000);
-        s.on_tick(&tick(BN, o + 3 * MS, 100_001_000, 9_000_000, 100_010_000, 2_000_000, 0), &mut c);
-        assert_eq!(s.syms[i].ofi_acc, 5_000_000, "no increment against a stale previous quote");
+        s.on_tick(
+            &tick(
+                BN,
+                o + 3 * MS,
+                100_001_000,
+                9_000_000,
+                100_010_000,
+                2_000_000,
+                0,
+            ),
+            &mut c,
+        );
+        assert_eq!(
+            s.syms[i].ofi_acc, 5_000_000,
+            "no increment against a stale previous quote"
+        );
     }
 
     proptest::proptest! {

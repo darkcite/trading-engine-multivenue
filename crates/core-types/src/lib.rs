@@ -29,6 +29,13 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+/// Market-regime words + labels (RG0, `docs/regime-and-dashboard-plan.md`).
+pub mod regime;
+pub use regime::{
+    RegimeLabel, RegimeLabelSet, RegimeRel, RegimeTerm, RegimeWord, REGIME_OFF_HARD,
+    REGIME_OFF_SOFT, REGIME_PROFILES,
+};
+
 // ---------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------
@@ -339,7 +346,9 @@ impl Tick {
         ask_px: Price,
         ask_qty: Qty,
     ) -> Self {
-        Self::new_stamped(ts_ns, venue, sym, venue_seq, bid_px, bid_qty, ask_px, ask_qty, 0, 0)
+        Self::new_stamped(
+            ts_ns, venue, sym, venue_seq, bid_px, bid_qty, ask_px, ask_qty, 0, 0,
+        )
     }
 
     /// Construct a Tick v3 with its venue time and flags (VT1). The
@@ -1133,6 +1142,18 @@ pub enum AiCmdKind {
     /// the worker's post-boot waiter AFTER it verifies the #7b
     /// re-commit landed the expected hash.
     PositionSeed = 11,
+    /// RG0 (`docs/regime-and-dashboard-plan.md` §4.4): DECLARE one
+    /// horizon profile's market regime. `param_id` = profile
+    /// (`< REGIME_PROFILES`), `px` = the declared [`RegimeWord`]
+    /// bit-cast (dimensions one-hot-or-empty, SOURCE byte EMPTY — the
+    /// engine stamps `DECLARED`), `qty` = the sender's own MEASURED
+    /// word (audit only; empty or a well-formed state word), `ttl_ns`
+    /// = the declaration's validity (> 0 ENFORCED — a declaration
+    /// without expiry is the stale trust the effective law forbids),
+    /// `flags` bit 0 = expire-on-silence allowed, `strategy_id` =
+    /// [`STRATEGY_SLOT_NONE`] (set-level), `sym`/`side` none. The
+    /// engine drain's TTL-on-pop law applies unchanged.
+    SetRegime = 12,
 }
 
 impl AiCmdKind {
@@ -1159,6 +1180,7 @@ impl AiCmdKind {
             9 => Some(Self::HaltRequest),
             10 => Some(Self::FundingSeed),
             11 => Some(Self::PositionSeed),
+            12 => Some(Self::SetRegime),
             _ => None,
         }
     }
@@ -1205,10 +1227,10 @@ pub const EVENT_LANE_ASSET_CTX: u16 = event_lane_bit(ChannelId::AssetCtx);
 /// Power of two, like every `core-ring` capacity.
 pub const OPT_RING_SIZE: usize = 4096;
 
-/// `AiCmd::flags` bit 0: the ai-exec fair-table entry this command
-/// creates additionally expires when worker heartbeats go stale,
-/// not only when its own TTL lapses. Valid on `SetFairValue` /
-/// `SetBias` only.
+/// `AiCmd::flags` bit 0: the entry this command creates (an ai-exec
+/// fair-table row, or a declared regime word) additionally expires
+/// when worker heartbeats go stale, not only when its own TTL lapses.
+/// Valid on `SetFairValue` / `SetBias` / `SetRegime` only.
 pub const AI_CMD_FLAG_EXPIRE_ON_SILENCE: u16 = 1 << 0;
 
 /// `AiCmd::strategy_id` sentinel meaning "no strategy slot".
@@ -1640,6 +1662,35 @@ impl AiCmd {
                     return Err(AiCmdShapeError::BadParamId(self.param_id));
                 }
                 if self.flags != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::SetRegime => {
+                // RG0 §4.4: `px` = declared word (SOURCE empty), `qty`
+                // = sender-measured word (audit; empty or a state
+                // word), `ttl_ns` > 0, `param_id` = profile.
+                if self.sym != SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if !RegimeWord(self.px as u64).is_wire_declared() {
+                    return Err(AiCmdShapeError::BadPx(self.px));
+                }
+                if self.qty != 0 && !RegimeWord(self.qty as u64).is_state() {
+                    return Err(AiCmdShapeError::BadQty(self.qty));
+                }
+                if self.ttl_ns == 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.strategy_id != STRATEGY_SLOT_NONE {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.param_id as usize >= REGIME_PROFILES {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                if self.flags & !AI_CMD_FLAG_EXPIRE_ON_SILENCE != 0 {
                     return Err(AiCmdShapeError::BadFlags(self.flags));
                 }
             }
@@ -2186,8 +2237,25 @@ pub struct RuleRowV2 {
     pub family: u8,
     /// Explicit padding — always zero.
     _pad2: [u8; 3],
-    /// Explicit tail padding / reserved — always zero.
-    _pad3: [u8; 40],
+    /// RG0 (plan §4.5): allowed regime set on profile 0 (`fast`), a
+    /// [`RegimeLabel`] bit-cast. `0` = unconstrained on this profile —
+    /// both masks zero is the legacy unconstrained row, bit-identical
+    /// to every pre-RG0 artifact. Gated in the evaluator's ENTRY path
+    /// only (exits are never gated).
+    pub regime_fast: u64,
+    /// RG0: allowed regime set on profile 1 (`slow`); same law.
+    pub regime_slow: u64,
+    /// RG0: [`REGIME_OFF_SOFT`] (block entries, own exit law drains)
+    /// or [`REGIME_OFF_HARD`] (block entries + forced exit). Must be
+    /// 0 when both masks are 0.
+    pub regime_off: u8,
+    /// RG0: per-symbol RELATIVE allowed sets, a [`RegimeRel`] byte
+    /// (bits 0–2 fast, 4–6 slow; 0 = any). Must be 0 when both masks
+    /// are 0.
+    pub regime_rel: u8,
+    /// Explicit tail padding / reserved — always zero (a third/fourth
+    /// profile costs 8 B each here).
+    _pad3: [u8; 22],
 }
 
 impl RuleRowV2 {
@@ -2221,7 +2289,11 @@ impl RuleRowV2 {
         max_hold_s: 0,
         family: 0,
         _pad2: [0; 3],
-        _pad3: [0; 40],
+        regime_fast: 0,
+        regime_slow: 0,
+        regime_off: 0,
+        regime_rel: 0,
+        _pad3: [0; 22],
     };
 
     /// Map one v1 row onto the grammar with byte-exact v1 semantics
@@ -2357,8 +2429,67 @@ impl RuleRowV2 {
             max_hold_s,
             family,
             _pad2: [0; 3],
-            _pad3: [0; 40],
+            regime_fast: 0,
+            regime_slow: 0,
+            regime_off: 0,
+            regime_rel: 0,
+            _pad3: [0; 22],
         }
+    }
+
+    /// RG0: attach a regime term to a built row (validator-side, after
+    /// [`Self::new`]). `off`/`rel` are only meaningful with a
+    /// constrained mask; the validator's rule 11 enforces that, this
+    /// setter just stores.
+    #[inline(always)]
+    pub const fn with_regime(mut self, term: RegimeTerm, off: u8) -> Self {
+        self.regime_fast = term.fast.0;
+        self.regime_slow = term.slow.0;
+        self.regime_rel = term.rel.0;
+        self.regime_off = off;
+        self
+    }
+
+    /// True when the row carries any regime constraint (either
+    /// profile mask non-zero).
+    #[inline(always)]
+    pub const fn regime_constrained(&self) -> bool {
+        self.regime_fast != 0 || self.regime_slow != 0
+    }
+
+    /// The row's regime term (masks + REL byte) as a [`RegimeTerm`].
+    #[inline(always)]
+    pub const fn regime_term(&self) -> RegimeTerm {
+        RegimeTerm::new(
+            RegimeLabel(self.regime_fast),
+            RegimeLabel(self.regime_slow),
+            RegimeRel(self.regime_rel),
+        )
+    }
+
+    /// RG0 tail-field well-formedness (the validator's rule 11 body):
+    /// both masks well-formed, REL byte well-formed, and `off`/`rel`
+    /// zero on an unconstrained row; `off` ∈ {soft, hard}.
+    #[inline]
+    pub const fn regime_fields_well_formed(&self) -> bool {
+        if !RegimeLabel(self.regime_fast).is_well_formed()
+            || !RegimeLabel(self.regime_slow).is_well_formed()
+            || !RegimeRel(self.regime_rel).is_well_formed()
+            || self.regime_off > REGIME_OFF_HARD
+        {
+            return false;
+        }
+        if !self.regime_constrained() && (self.regime_off != 0 || self.regime_rel != 0) {
+            return false;
+        }
+        let mut i = 0;
+        while i < self._pad3.len() {
+            if self._pad3[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 }
 
@@ -2395,7 +2526,6 @@ impl RuleTableV2 {
         hash128: [0; 16],
         _pad: [0; 40],
     };
-
 }
 
 /// Ring slot ferrying a staged table ingress→engine (§6; VM2 V4:
@@ -2539,7 +2669,15 @@ const _: () = {
     assert!(::core::mem::offset_of!(RuleRowV2, max_hold_s) == 80);
     assert!(::core::mem::offset_of!(RuleRowV2, family) == 84);
     assert!(::core::mem::offset_of!(RuleRowV2, _pad2) == 85);
-    assert!(::core::mem::offset_of!(RuleRowV2, _pad3) == 88);
+    // RG0 tail (plan §4.5): the former 40-byte reserved tail now
+    // carries the regime fields; 22 bytes stay reserved.
+    assert!(::core::mem::offset_of!(RuleRowV2, regime_fast) == 88);
+    assert!(::core::mem::offset_of!(RuleRowV2, regime_slow) == 96);
+    assert!(::core::mem::offset_of!(RuleRowV2, regime_off) == 104);
+    assert!(::core::mem::offset_of!(RuleRowV2, regime_rel) == 105);
+    assert!(::core::mem::offset_of!(RuleRowV2, _pad3) == 106);
+    assert!(::core::mem::size_of::<RuleRowV2>() == 128);
+    assert!(REGIME_PROFILES == 2);
     assert!(::core::mem::offset_of!(RuleTableV2, rows) == 0);
     assert!(::core::mem::offset_of!(RuleTableV2, len) == 32 * 1024);
     assert!(::core::mem::offset_of!(RuleTableV2, epoch) == 32 * 1024 + 4);
@@ -2849,7 +2987,11 @@ mod tests {
         let mut b = 0u8;
         while (b as usize) < table.len() {
             let venue = VenueId::from_u8(b).expect("every index is a venue");
-            assert_eq!(table[b as usize], venue.default_stale_after_ms(), "byte {b}");
+            assert_eq!(
+                table[b as usize],
+                venue.default_stale_after_ms(),
+                "byte {b}"
+            );
             b += 1;
         }
         // One past the table is not a venue: the table is exactly the
@@ -2872,7 +3014,10 @@ mod tests {
             TICK_FLAG_VENUE_TIME_SENTINEL,
         );
         assert!(!t.is_stale());
-        assert_eq!(t.flags & TICK_FLAG_VENUE_TIME_SENTINEL, TICK_FLAG_VENUE_TIME_SENTINEL);
+        assert_eq!(
+            t.flags & TICK_FLAG_VENUE_TIME_SENTINEL,
+            TICK_FLAG_VENUE_TIME_SENTINEL
+        );
     }
 
     #[test]
@@ -3189,10 +3334,42 @@ mod ai_cmd_tests {
                 17,
                 0,
             ),
+            // RG0 §4.4: declare the FAST profile — px = declared word
+            // (SOURCE empty), qty = sender-measured state word, ttl
+            // 15 min, param_id = profile 0.
+            AiCmdKind::SetRegime => AiCmd::new(
+                1,
+                1,
+                SYMBOL_ID_NONE,
+                DECLARED_WORD.0 as i64,
+                DECLARED_WORD.with_source(regime::SOURCE_MEASURED).0 as i64,
+                900_000_000_000,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_NONE,
+                AI_SIDE_NONE,
+                0,
+                0,
+            ),
         }
     }
 
-    const ALL_KINDS: [AiCmdKind; 12] = [
+    /// A fully specified declaration: bull / trend / normal vol /
+    /// positive funding / normal level / neutral stretch, SOURCE empty.
+    const DECLARED_WORD: RegimeWord = RegimeWord(
+        RegimeWord::from_values(
+            regime::TREND_BULL,
+            regime::SHAPE_TREND,
+            regime::VOL_NORMAL,
+            regime::FUND_POS,
+            regime::LEVEL_NORMAL,
+            regime::STRETCH_NEUTRAL,
+            regime::SOURCE_MEASURED,
+        )
+        .0 & !(0xFFu64 << 48),
+    );
+
+    const ALL_KINDS: [AiCmdKind; 13] = [
         AiCmdKind::Heartbeat,
         AiCmdKind::EnableStrategy,
         AiCmdKind::DisableStrategy,
@@ -3205,7 +3382,97 @@ mod ai_cmd_tests {
         AiCmdKind::HaltRequest,
         AiCmdKind::FundingSeed,
         AiCmdKind::PositionSeed,
+        AiCmdKind::SetRegime,
     ];
+
+    #[test]
+    fn set_regime_shape_rules() {
+        let ok = valid(AiCmdKind::SetRegime);
+        assert_eq!(ok.validate_shape(), Ok(()));
+
+        // A partial declaration (only TREND) is legal: unspecified
+        // dimensions gate as "any".
+        let mut partial = ok;
+        partial.px = (1u64 << regime::TREND_BEAR) as i64;
+        assert_eq!(partial.validate_shape(), Ok(()));
+        // An empty declaration is legal on the wire too (it clears).
+        partial.px = 0;
+        assert_eq!(partial.validate_shape(), Ok(()));
+
+        // SOURCE must be empty — the engine stamps it.
+        let mut src = ok;
+        src.px = DECLARED_WORD.with_source(regime::SOURCE_DECLARED).0 as i64;
+        assert!(matches!(
+            src.validate_shape(),
+            Err(AiCmdShapeError::BadPx(_))
+        ));
+        // Two bits in one dimension byte, or a reserved-byte bit.
+        src.px = 0b011;
+        assert!(matches!(
+            src.validate_shape(),
+            Err(AiCmdShapeError::BadPx(_))
+        ));
+        src.px = (1u64 << 56) as i64;
+        assert!(matches!(
+            src.validate_shape(),
+            Err(AiCmdShapeError::BadPx(_))
+        ));
+
+        // qty: empty or a state word (exactly one SOURCE bit).
+        let mut q = ok;
+        q.qty = 0;
+        assert_eq!(q.validate_shape(), Ok(()));
+        q.qty = DECLARED_WORD.0 as i64; // no SOURCE ⇒ not a state word
+        assert!(matches!(
+            q.validate_shape(),
+            Err(AiCmdShapeError::BadQty(_))
+        ));
+
+        // ttl 0 refused: a declaration must expire.
+        let mut ttl = ok;
+        ttl.ttl_ns = 0;
+        assert_eq!(ttl.validate_shape(), Err(AiCmdShapeError::BadTtl(0)));
+
+        // profile bound.
+        let mut p = ok;
+        p.param_id = REGIME_PROFILES as u16;
+        assert_eq!(
+            p.validate_shape(),
+            Err(AiCmdShapeError::BadParamId(REGIME_PROFILES as u16))
+        );
+        p.param_id = 1;
+        assert_eq!(p.validate_shape(), Ok(()));
+
+        // set-level: no slot, no sym, no side, venue Ai.
+        let mut slot = ok;
+        slot.strategy_id = STRATEGY_SLOT_VM;
+        assert_eq!(
+            slot.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(STRATEGY_SLOT_VM))
+        );
+        let mut sym = ok;
+        sym.sym = make_symbol_id(VenueId::Okx, 1);
+        assert!(matches!(
+            sym.validate_shape(),
+            Err(AiCmdShapeError::BadSym(_))
+        ));
+        let mut side = ok;
+        side.side = Side::Bid as u8;
+        assert_eq!(side.validate_shape(), Err(AiCmdShapeError::BadSide(0)));
+        let mut venue = ok;
+        venue.venue = VenueId::Okx.to_u8();
+        assert!(matches!(
+            venue.validate_shape(),
+            Err(AiCmdShapeError::BadVenue(_))
+        ));
+
+        // flags: expire-on-silence legal, anything else refused.
+        let mut fl = ok;
+        fl.flags = AI_CMD_FLAG_EXPIRE_ON_SILENCE;
+        assert_eq!(fl.validate_shape(), Ok(()));
+        fl.flags = 0b10;
+        assert_eq!(fl.validate_shape(), Err(AiCmdShapeError::BadFlags(0b10)));
+    }
 
     #[test]
     fn ai_cmd_size_is_one_cache_line() {
@@ -3318,9 +3585,10 @@ mod ai_cmd_tests {
         }
         // No `Resume` kind exists ANYWHERE in the table: halt is
         // sticky by design (risk-policy) — the wire cannot express
-        // it. VM2 appended FundingSeed=10/PositionSeed=11 (append-only
-        // ABI); the first unassigned byte is now 12.
-        assert_eq!(AiCmdKind::from_u8(12), None);
+        // it. VM2 appended FundingSeed=10/PositionSeed=11, RG0
+        // appended SetRegime=12 (append-only ABI); the first
+        // unassigned byte is now 13.
+        assert_eq!(AiCmdKind::from_u8(13), None);
         assert_eq!(AiCmdKind::from_u8(0xFF), None);
     }
 
@@ -3395,10 +3663,10 @@ mod ai_cmd_tests {
 
     #[test]
     fn validate_rejects_unknown_kind_byte() {
-        // 12 = first unassigned kind byte after VM2's 10/11.
+        // 13 = first unassigned kind byte after RG0's SetRegime = 12.
         let mut c = valid(AiCmdKind::Heartbeat);
-        c.kind = 12;
-        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(12)));
+        c.kind = 13;
+        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(13)));
     }
 
     #[test]
@@ -3580,7 +3848,6 @@ mod ai_cmd_tests {
         assert_eq!(::core::mem::align_of::<RuleRow>(), 64);
     }
 
-
     #[test]
     fn rule_row_layout_is_fully_explicit() {
         // Sum of declared field widths must equal size_of — any
@@ -3589,7 +3856,6 @@ mod ai_cmd_tests {
         let declared = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 1 + 1 + 21;
         assert_eq!(declared, ::core::mem::size_of::<RuleRow>());
     }
-
 
     #[test]
     fn rule_row_new_roundtrips_and_zeroes_padding() {
@@ -3621,7 +3887,6 @@ mod ai_cmd_tests {
             i += 1;
         }
     }
-
 
     #[test]
     fn fnv1a_64_matches_published_vectors() {
@@ -3655,8 +3920,10 @@ mod vm2_v1_tests {
         assert_eq!(AiCmdKind::from_u8(11), Some(AiCmdKind::PositionSeed));
         assert_eq!(AiCmdKind::FundingSeed.to_u8(), 10);
         assert_eq!(AiCmdKind::PositionSeed.to_u8(), 11);
-        // 12 is the first unassigned kind byte after VM2.
-        assert_eq!(AiCmdKind::from_u8(12), None);
+        // RG0 appended SetRegime = 12; 13 is the first unassigned byte.
+        assert_eq!(AiCmdKind::from_u8(12), Some(AiCmdKind::SetRegime));
+        assert_eq!(AiCmdKind::SetRegime.to_u8(), 12);
+        assert_eq!(AiCmdKind::from_u8(13), None);
     }
 
     fn funding_seed() -> AiCmd {
@@ -3664,7 +3931,7 @@ mod vm2_v1_tests {
             1,
             1,
             make_symbol_id(VenueId::Okx, 3),
-            125_000_000, // rate ×1e9
+            125_000_000,       // rate ×1e9
             1_756_400_000_000, // print time ms
             0,
             AiCmdKind::FundingSeed,
@@ -3941,8 +4208,8 @@ mod vm2_v1_tests {
     #[test]
     fn rule_row_v2_layout_is_fully_explicit() {
         // Declared field widths sum to size_of — no implicit padding:
-        // 1×8 + 4+4 + 2+2+2 + 1+1 + 8+8+8 + 4+4+4+4 + 8+8 + 4+1+3+40
-        // = 8+8+6+2+24+16+16+48 = 128.
+        // 1×8 + 4+4 + 2+2+2 + 1+1 + 8+8+8 + 4+4+4+4 + 8+8 + 4+1+3
+        // + 8+8+1+1+22 (RG0 tail) = 8+8+6+2+24+16+16+8+40 = 128.
         assert_eq!(::core::mem::size_of::<RuleRowV2>(), 128);
         assert_eq!(::core::mem::align_of::<RuleRowV2>(), 64);
         assert_eq!(::core::mem::size_of::<RuleTableV2>(), 32 * 1024 + 64);
@@ -3958,9 +4225,7 @@ mod vm2_v1_tests {
         // Byte-level: the whole 128 B slot is zero.
         // SAFETY: RuleRowV2 is #[repr(C)] Copy with fully explicit
         // padding; read-only byte view of a live stack value.
-        let zb = unsafe {
-            core::slice::from_raw_parts((&z as *const RuleRowV2).cast::<u8>(), 128)
-        };
+        let zb = unsafe { core::slice::from_raw_parts((&z as *const RuleRowV2).cast::<u8>(), 128) };
         let mut i = 0;
         while i < 128 {
             assert_eq!(zb[i], 0);
@@ -3999,6 +4264,80 @@ mod vm2_v1_tests {
         assert_eq!(r.combine, CombineOp::Diff as u8);
         assert_eq!(r.min_hold_s, 345_600);
         assert_eq!(r.name_h, fnv1a_64(b"cvfc-doge"));
+        // RG0: a freshly built row is unconstrained, with a zero tail.
+        assert!(!r.regime_constrained());
+        assert!(r.regime_fields_well_formed());
+        assert_eq!(r.regime_term(), RegimeTerm::ANY);
+        // SAFETY: as above — read-only byte view of a live value.
+        let rb = unsafe { core::slice::from_raw_parts((&r as *const RuleRowV2).cast::<u8>(), 128) };
+        let mut i = 88;
+        while i < 128 {
+            assert_eq!(rb[i], 0, "pre-RG0 artifacts stay bit-identical");
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn rule_row_v2_regime_tail_roundtrips_and_rule_11_body_holds() {
+        let base = RuleRowV2::from_v1(&RuleRow::new(
+            make_symbol_id(VenueId::Polymarket, 1),
+            SYMBOL_ID_NONE,
+            80,
+            1_500,
+            500_000,
+            50_000_000,
+            fnv1a_64(b"rg0"),
+            RuleRow::TRIGGER_LEVEL_BREACH,
+            Side::Bid as u8,
+            MarketFamily::Crypto as u8,
+        ));
+        let mut b = regime::RegimeLabelBuilder::new();
+        b.add(b"trend:bull|neutral").unwrap();
+        b.add(b"slow:vol:!high").unwrap();
+        b.add(b"rel:lagging").unwrap();
+        let term = b.finish();
+        let r = base.with_regime(term, REGIME_OFF_HARD);
+        assert!(r.regime_constrained());
+        assert_eq!(r.regime_term(), term);
+        assert_eq!(r.regime_off, REGIME_OFF_HARD);
+        assert!(r.regime_fields_well_formed());
+        // Bytes 88.. carry the masks LE, 104 = off, 105 = rel.
+        // SAFETY: read-only byte view of a live #[repr(C)] Copy value.
+        let rb = unsafe { core::slice::from_raw_parts((&r as *const RuleRowV2).cast::<u8>(), 128) };
+        assert_eq!(
+            u64::from_le_bytes(rb[88..96].try_into().unwrap()),
+            term.fast.0
+        );
+        assert_eq!(
+            u64::from_le_bytes(rb[96..104].try_into().unwrap()),
+            term.slow.0
+        );
+        assert_eq!(rb[104], REGIME_OFF_HARD);
+        assert_eq!(rb[105], term.rel.0);
+        let mut i = 106;
+        while i < 128 {
+            assert_eq!(rb[i], 0);
+            i += 1;
+        }
+        // Rule-11 refusals: off/rel on an unconstrained row, bad off,
+        // malformed mask, malformed rel.
+        let mut off_only = base;
+        off_only.regime_off = REGIME_OFF_HARD;
+        assert!(!off_only.regime_fields_well_formed());
+        let mut rel_only = base;
+        rel_only.regime_rel = 0b001;
+        assert!(!rel_only.regime_fields_well_formed());
+        let mut bad_off = r;
+        bad_off.regime_off = 2;
+        assert!(!bad_off.regime_fields_well_formed());
+        let mut bad_mask = r;
+        bad_mask.regime_fast = 1u64 << 56;
+        assert!(!bad_mask.regime_fields_well_formed());
+        let mut bad_rel = r;
+        bad_rel.regime_rel = 0b1000;
+        assert!(!bad_rel.regime_fields_well_formed());
+        // A legacy row with zero everything passes.
+        assert!(base.regime_fields_well_formed());
     }
 
     #[test]
@@ -4080,7 +4419,6 @@ mod vm2_v1_tests {
         assert_eq!(v2.side, RuleRow::SIDE_BOTH, "side stays the filter");
         assert_eq!(v2.edge_bps, 80, "diagnostic mirror");
     }
-
 
     // ---------------- funding cadence law ----------------
 

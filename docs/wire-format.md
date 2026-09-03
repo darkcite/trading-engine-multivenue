@@ -135,7 +135,7 @@ MUST be zero / `SYMBOL_ID_NONE` / `0xFF`") are pinned in
 |     16 |     8 | px          | `i64`          | ×1e6: fair value / intent px / param value / ruleset hash\[0..8\] LE |
 |     24 |     8 | qty         | `i64`          | ×1e6: intent qty / ruleset hash\[8..16\] LE |
 |     32 |     8 | ttl_ns      | `u64`          | expiry relative to `ts_ns`; 0 = none    |
-|     40 |     1 | kind        | `u8` AiCmdKind | 0=Heartbeat 1=EnableStrategy 2=DisableStrategy 3=SetFairValue 4=SetBias 5=SetParam 6=OrderIntent 7=RulesetStage 8=RulesetCommit 9=HaltRequest — **no Resume exists** (halt is sticky) — 10=FundingSeed 11=PositionSeed (appended 2026-08-29, VM2 V1 per D-1/D-2: FundingSeed = one historical funding PRINT — `sym`=instrument, `px`=raw per-print rate ×1e9 signed (NOT ×1e6 — the hash128-in-px precedent for kind-specific field meaning), `qty`=venue print time ms > 0, `strategy_id`=5 (vm), everything else zero/`0xFF`; the engine folds it into the SAME per-sym funding windows the live Funding-event path feeds, so the `funding_print_divisor` cadence law applies in one place. Seeds carry raw prints, not window aggregates — strictly more general than the plan's "window slot" sketch, refinement noted in vm2-plan §8. PositionSeed = restore one v2 row's position after restart — `param_id`=row index < 256, `sym`=the row's action sym (consume-time cross-check against the committed row; mismatch refuses), `side`=entered side (0/1 required), `px`=entry px ×1e6 > 0, `qty`=position AGE in SECONDS ≥ 0 (engine derives entry = now − age·1e9; no wall-clock crossing), `ttl_ns`=0 ENFORCED — the engine drain expires ANY kind with `ttl_ns ≠ 0`, so age can never ride there; entry QTY is not carried — the vm re-derives it from the committed row's sizing law at the seeded px, so restores respect the CURRENT caps. `strategy_id`=5. The worker's post-boot waiter sends PositionSeeds only after verifying the #7b re-commit landed the expected hash — the seed itself carries no table identity by design) |
+|     40 |     1 | kind        | `u8` AiCmdKind | 0=Heartbeat 1=EnableStrategy 2=DisableStrategy 3=SetFairValue 4=SetBias 5=SetParam 6=OrderIntent 7=RulesetStage 8=RulesetCommit 9=HaltRequest — **no Resume exists** (halt is sticky) — 10=FundingSeed 11=PositionSeed (appended 2026-08-29, VM2 V1 per D-1/D-2: FundingSeed = one historical funding PRINT — `sym`=instrument, `px`=raw per-print rate ×1e9 signed (NOT ×1e6 — the hash128-in-px precedent for kind-specific field meaning), `qty`=venue print time ms > 0, `strategy_id`=5 (vm), everything else zero/`0xFF`; the engine folds it into the SAME per-sym funding windows the live Funding-event path feeds, so the `funding_print_divisor` cadence law applies in one place. Seeds carry raw prints, not window aggregates — strictly more general than the plan's "window slot" sketch, refinement noted in vm2-plan §8. PositionSeed = restore one v2 row's position after restart — `param_id`=row index < 256, `sym`=the row's action sym (consume-time cross-check against the committed row; mismatch refuses), `side`=entered side (0/1 required), `px`=entry px ×1e6 > 0, `qty`=position AGE in SECONDS ≥ 0 (engine derives entry = now − age·1e9; no wall-clock crossing), `ttl_ns`=0 ENFORCED — the engine drain expires ANY kind with `ttl_ns ≠ 0`, so age can never ride there; entry QTY is not carried — the vm re-derives it from the committed row's sizing law at the seeded px, so restores respect the CURRENT caps. `strategy_id`=5. The worker's post-boot waiter sends PositionSeeds only after verifying the #7b re-commit landed the expected hash — the seed itself carries no table identity by design) — **12=SetRegime** (appended 2026-09-03, RG0 `docs/regime-and-dashboard-plan.md` §4.4: DECLARE one horizon profile's regime — `param_id` = profile (0 fast / 1 slow, `< REGIME_PROFILES`), `px` = the declared `RegimeWord` bit-cast (each dimension byte one-hot or EMPTY = unspecified/"any"; SOURCE byte MUST be empty — the engine stamps DECLARED), `qty` = the sender's own MEASURED word (audit only; 0 or a state word with exactly one SOURCE bit), `ttl_ns` > 0 ENFORCED (a declaration must expire; the drain's TTL-on-pop law applies unchanged), `flags` bit 0 expire-on-silence legal, `strategy_id` = `0xFF` (set-level), `sym`/`side` none, venue `Ai`) |
 |     41 |     1 | venue       | `u8` VenueId   | `Ai=5` for engine-directed cmds; target venue for intents |
 |     42 |     1 | strategy_id | `u8`           | strategy-set slot; `0xFF` = none; intents pin 4 (ai-exec), ruleset cmds pin 5 (vm) |
 |     43 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1) or `0xFF`         |
@@ -333,7 +333,31 @@ single home).
 |     80 |     4 | max_hold_s   | `u32`          | position age-out exit (S1 law); 0 = none     |
 |     84 |     1 | family       | `u8`           | `MarketFamily` — reporting only              |
 |     85 |     3 | _pad2        | `[u8; 3]`      | explicit, zeroed                             |
-|     88 |    40 | _pad3        | `[u8; 40]`     | explicit, zeroed (reserved)                  |
+|     88 |     8 | regime_fast  | `u64` RegimeLabel | RG0 (2026-09-03, `docs/regime-and-dashboard-plan.md` §4.5): allowed regime set on profile 0 (`fast`); 0 = unconstrained on this profile. Both masks 0 = the legacy unconstrained row (pre-RG0 artifacts bit-identical). Gates the evaluator's ENTRY path only |
+|     96 |     8 | regime_slow  | `u64` RegimeLabel | same law, profile 1 (`slow`)                 |
+|    104 |     1 | regime_off   | `u8`           | 0 soft (entries blocked, own exit law drains) / 1 hard (entries blocked + forced exit); must be 0 when both masks are 0 |
+|    105 |     1 | regime_rel   | `u8` RegimeRel | per-symbol RELATIVE allowed sets: bits 0–2 fast, bits 4–6 slow (`lagging/inline/leading`); 0 = any; must be 0 when both masks are 0 |
+|    106 |    22 | _pad3        | `[u8; 22]`     | explicit, zeroed (reserved; a 3rd/4th profile costs 8 B each here) |
+
+**`RegimeWord` / `RegimeLabel` byte map** (`core_types::regime`, RG0 —
+wire-stable, values append-only inside a byte): one byte per dimension,
+one-hot in a word, any subset in a label. Byte 0 TREND `bear/neutral/bull`
+· 1 SHAPE `chop/mixed/trend` · 2 VOL `low/normal/high` · 3 FUND_SIGN
+`neg/pos` · 4 FUND_LEVEL `low/normal/high` · 5 STRETCH
+`ext_down/neutral/ext_up` · 6 SOURCE `measured/declared/unknown` · 7
+reserved (0). **Bit 7 of every market byte (0..=5) is the per-dimension
+UNKNOWN mark** (`0x80`): a measured word sets it on a dimension it cannot
+judge (warm-up, percentiles not yet pushed); an empty market byte is
+legal only in a DECLARED word and means "the declarer does not constrain
+it". Gate: `label == 0 || (word & label) == word`. A label's omitted
+dimension is written as the full legal mask (known values + the unknown
+mark), an explicit list is known values only (the token `unknown` adds
+the mark, `!v` never includes it), so a `vol:low` row refuses an
+unknown VOL while a row that omits VOL passes — fail-closed per
+dimension with one formula. `RegimeWord::UNKNOWN` =
+`0x0004_8080_8080_8080` (every market byte marked + SOURCE bit 2) and is
+refused by every label that constrains anything. `source:` omitted ⇒
+`measured|declared`.
 
 ### `RuleTableV2` / `RuleTableSlot` — 32 832 bytes (VM2; the §6 handoff ring's slot since V4, never captured)
 

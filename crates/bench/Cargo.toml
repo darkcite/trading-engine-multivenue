@@ -34,6 +34,8 @@ ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 core-net             = { workspace = true }
 core-time            = { workspace = true }
+# RG1 gate 41: the regime evaluator's tick + minute-roll path.
+core-regime          = { workspace = true }
 book-builder         = { workspace = true }
 strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }

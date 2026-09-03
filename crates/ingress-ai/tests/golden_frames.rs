@@ -93,7 +93,13 @@ fn golden_fixture_covers_every_kind() {
     let mut kinds: Vec<u8> = vectors.iter().map(|v| v.cmd.kind).collect();
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds, (0u8..10).collect::<Vec<_>>(), "one vector per kind");
+    // 0..=9 (8f) + 10/11 (VM2 seeds) + 12 (RG0 SetRegime) — every wire
+    // kind has at least one shared vector.
+    assert_eq!(
+        kinds,
+        (0u8..=AiCmdKind::SetRegime.to_u8()).collect::<Vec<_>>(),
+        "one vector per kind"
+    );
 }
 
 #[test]

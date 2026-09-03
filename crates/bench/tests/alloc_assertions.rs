@@ -1320,12 +1320,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_d1p, d1) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
     // VM2 V2: opt lanes (producer-dropped — empty-lane steady cost is
     // part of the measured window, the §3.3 shape).
-    let (_o0p, o0) =
-        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
-    let (_o1p, o1) =
-        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
-    let (_o2p, o2) =
-        Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o1p, o1) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o2p, o2) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -2512,8 +2509,7 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
 #[test]
 fn strategy_set_fanout_is_zero_alloc() {
     use core_types::{
-        fnv1a_64, AiCmd, AiCmdKind, Order, RuleRow, RuleTableV2, AI_SIDE_NONE,
-        STRATEGY_SLOT_NONE,
+        fnv1a_64, AiCmd, AiCmdKind, Order, RuleRow, RuleTableV2, AI_SIDE_NONE, STRATEGY_SLOT_NONE,
         STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
     };
     use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -3170,20 +3166,37 @@ fn ruleset_validator_is_zero_alloc() {
     ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &descs, &mut scratch)
         .expect("max-size ruleset must validate");
     assert_eq!(scratch.len, 256);
-    assert!(
-        ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &descs, &mut scratch).is_err()
-    );
+    assert!(ingress_ai::validate_ruleset(
+        &valid_bytes,
+        &wrong_hash,
+        &universe,
+        &descs,
+        &mut scratch
+    )
+    .is_err());
     for (b, h) in &rejects {
         assert!(ingress_ai::validate_ruleset(b, h, &universe, &descs, &mut scratch).is_err());
     }
 
     let g = AllocGuard::new();
     for _ in 0..50u32 {
-        let ok = ingress_ai::validate_ruleset(&valid_bytes, &valid_hash, &universe, &descs, &mut scratch);
+        let ok = ingress_ai::validate_ruleset(
+            &valid_bytes,
+            &valid_hash,
+            &universe,
+            &descs,
+            &mut scratch,
+        );
         std::hint::black_box(ok.is_ok());
         std::hint::black_box(&scratch.len);
         // Rule 1 reject on the same bytes.
-        let r1 = ingress_ai::validate_ruleset(&valid_bytes, &wrong_hash, &universe, &descs, &mut scratch);
+        let r1 = ingress_ai::validate_ruleset(
+            &valid_bytes,
+            &wrong_hash,
+            &universe,
+            &descs,
+            &mut scratch,
+        );
         std::hint::black_box(r1.is_err());
         // Rules 2–8 rejects.
         let mut k = 0usize;
@@ -3372,19 +3385,18 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
         ));
     }
     for k in 0..128u32 {
-        table.rows[(128 + k) as usize] =
-            core_types::RuleRowV2::from_v1(&core_types::RuleRow::new(
-                129 + k,
-                REF_SYM,
-                80,
-                10,
-                0,
-                1_000_000,
-                (128 + k) as u64,
-                core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
-                core_types::RuleRow::SIDE_BOTH,
-                0,
-            ));
+        table.rows[(128 + k) as usize] = core_types::RuleRowV2::from_v1(&core_types::RuleRow::new(
+            129 + k,
+            REF_SYM,
+            80,
+            10,
+            0,
+            1_000_000,
+            (128 + k) as u64,
+            core_types::RuleRow::TRIGGER_CROSS_DEVIATION,
+            core_types::RuleRow::SIDE_BOTH,
+            0,
+        ));
     }
     table.len = core_types::RULE_TABLE_ROWS as u32;
     table.epoch = 1;
@@ -3677,9 +3689,7 @@ fn vm_feature_engine_paths_are_zero_alloc() {
                 let feat = all_feats[f];
                 let sym = if feat.requires_opt_summary() {
                     dbt_sym
-                } else if feat == core_types::FeatId::Apr24
-                    || feat == core_types::FeatId::Apr72
-                {
+                } else if feat == core_types::FeatId::Apr24 || feat == core_types::FeatId::Apr72 {
                     bn_sym
                 } else {
                     okx_sym
@@ -3786,10 +3796,23 @@ fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
         let sym = core_types::make_symbol_id(VenueId::Okx, sym_i + 1);
         // The bar opens on the previous bar's last quote, so the
         // decision quote must MOVE bar to bar: ±4 bps alternating.
-        let dec_bid = if bar % 2 == 0 { 100_040_000 } else { 99_960_000 };
+        let dec_bid = if bar % 2 == 0 {
+            100_040_000
+        } else {
+            99_960_000
+        };
         let (sym, ts, bid, flags) = match phase {
             0 => (sym, open + 10 * MS, 100_000_000, 0),
-            1 => (sym, open + 1_000 * MS, 100_001_000, if bar % 3 == 2 { core_types::TICK_FLAG_STALE } else { 0 }),
+            1 => (
+                sym,
+                open + 1_000 * MS,
+                100_001_000,
+                if bar % 3 == 2 {
+                    core_types::TICK_FLAG_STALE
+                } else {
+                    0
+                },
+            ),
             2 => (sym, open + 2_000 * MS, 100_002_000, 0),
             3 => (sym, open + 3_750 * MS, dec_bid, 0),
             _ => (foreign, open + 5_000 * MS, 1_000_000, 0),
@@ -3830,6 +3853,134 @@ fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
     let (allocs, bytes, _deallocs) = g.delta();
     let k = s.counters();
     assert!(k.intents > warm && k.exits > 0 && k.skipped_stale_dec > 0 && k.rolls > 0);
-    assert_eq!(allocs, 0, "icdp on_tick allocated {allocs} times ({bytes} B)");
+    assert_eq!(
+        allocs, 0,
+        "icdp on_tick allocated {allocs} times ({bytes} B)"
+    );
     assert_eq!(bytes, 0, "icdp on_tick bytes should be zero: saw {bytes}");
+}
+
+/// RG1 gate 41 (`docs/regime-and-dashboard-plan.md` §7): the regime
+/// evaluator's hot path — `on_tick` for members and non-members, the
+/// 1 s timer including several minute rolls (ring write + the full
+/// judge pass for both profiles), a declaration and the effective
+/// refresh — allocates nothing after `new_boxed` + `configure` + `seed`.
+#[test]
+fn regime_on_tick_and_minute_roll_are_zero_alloc() {
+    use core_regime::{
+        ProfileParams, RegimeParams, RegimeState, SeedRow, MINUTE_NS, REGIME_MAX_MEMBERS,
+    };
+    use core_time::WallAnchor;
+    use core_types::RegimeWord;
+
+    const N_MEMBERS: usize = REGIME_MAX_MEMBERS;
+    let btc = core_types::make_symbol_id(VenueId::Binance, 900);
+    let mut members = [core_types::SYMBOL_ID_NONE; REGIME_MAX_MEMBERS];
+    let mut i = 0usize;
+    while i < N_MEMBERS {
+        members[i] = core_types::make_symbol_id(VenueId::Binance, 901 + i as u32);
+        i += 1;
+    }
+    let foreign = core_types::make_symbol_id(VenueId::Okx, 7);
+    let mut fast = ProfileParams::FAST_DEFAULT;
+    fast.rv_p30_bps_1e9 = 10_000_000_000;
+    fast.rv_p70_bps_1e9 = 100_000_000_000;
+    let params = RegimeParams::new(
+        btc,
+        btc,
+        members,
+        N_MEMBERS as u8,
+        3,
+        [fast, ProfileParams::SLOW_DEFAULT],
+    );
+    // Boot (may allocate): the box, the map, a 300-minute seed.
+    const T0: u64 = 1_000_000_000_000;
+    let anchor = WallAnchor::new(T0, 1_800_000_000 * 1_000_000_000);
+    let mut s = RegimeState::new_boxed();
+    s.configure(&params, anchor, T0).expect("params valid");
+    let m0 = s.minute();
+    let mut rows = Vec::with_capacity(300 * (N_MEMBERS + 1));
+    let mut k = 0i64;
+    while k < 300 {
+        let m = m0 - 300 + k;
+        rows.push(SeedRow::new(btc, m, 100_000_000 + k * 20_000));
+        let mut j = 0usize;
+        while j < N_MEMBERS {
+            rows.push(SeedRow::new(
+                members[j],
+                m,
+                50_000_000 + k * 10_000 + j as i64,
+            ));
+            j += 1;
+        }
+        k += 1;
+    }
+    assert_eq!(s.seed(&rows) as usize, rows.len());
+    s.on_funding(25_000, 1_700_000_000_000);
+
+    let tick = |sym: SymbolId, ts: u64, mid: i64| {
+        Tick::new(
+            ts,
+            VenueId::Binance,
+            sym,
+            1,
+            Price(mid - 500),
+            Qty(1_000_000),
+            Price(mid + 500),
+            Qty(1_000_000),
+        )
+    };
+    // Prewarm one live minute so every branch has run once.
+    let mut ts = T0;
+    let mut minute = 0u64;
+    while minute < 1 {
+        let mut n = 0usize;
+        while n < 60 {
+            s.on_tick(&tick(btc, ts, 106_000_000 + n as i64));
+            s.on_tick(&tick(members[n % N_MEMBERS], ts, 53_000_000 + n as i64));
+            s.on_tick(&tick(foreign, ts, 5_000_000));
+            ts += 1_000_000_000;
+            n += 1;
+        }
+        std::hint::black_box(s.on_timer(ts + 1_000_000));
+        minute += 1;
+    }
+
+    let g = AllocGuard::new();
+    while minute < 6 {
+        let mut n = 0usize;
+        while n < 60 {
+            s.on_tick(&tick(
+                btc,
+                ts,
+                106_000_000 + (minute as i64) * 20_000 + n as i64,
+            ));
+            s.on_tick(&tick(members[n % N_MEMBERS], ts, 53_000_000 + n as i64));
+            s.on_tick(&tick(foreign, ts, 5_000_000));
+            std::hint::black_box(s.on_timer(ts));
+            ts += 1_000_000_000;
+            n += 1;
+        }
+        if minute == 3 {
+            s.set_declared(0, RegimeWord(1u64 << 2), ts, 5 * MINUTE_NS);
+        }
+        std::hint::black_box(s.on_timer(ts + 1_000_000));
+        std::hint::black_box(s.effective(0));
+        std::hint::black_box(s.rel_of(1, members[3]));
+        minute += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(
+        s.minutes_judged() >= 6,
+        "rolls happened: {}",
+        s.minutes_judged()
+    );
+    assert_eq!(
+        allocs, 0,
+        "regime hot path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "regime hot path bytes should be zero: saw {bytes}"
+    );
 }

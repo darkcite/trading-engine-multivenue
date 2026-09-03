@@ -11,6 +11,7 @@ members = [
     "crates/core-metrics",
     "crates/core-net",
     "crates/core-parse",
+    "crates/core-regime",
     "crates/core-ring",
     "crates/core-simd",
     "crates/core-time",
@@ -137,6 +138,7 @@ core-latency = { path = "crates/core-latency" }
 core-metrics = { path = "crates/core-metrics" }
 core-net     = { path = "crates/core-net" }
 core-parse   = { path = "crates/core-parse" }
+core-regime  = { path = "crates/core-regime" }
 core-ring    = { path = "crates/core-ring" }
 core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }

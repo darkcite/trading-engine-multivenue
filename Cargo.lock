@@ -134,6 +134,7 @@ dependencies = [
  "core-metrics",
  "core-net",
  "core-parse",
+ "core-regime",
  "core-ring",
  "core-time",
  "core-types",
@@ -315,6 +316,7 @@ dependencies = [
  "core-latency",
  "core-metrics",
  "core-net",
+ "core-regime",
  "core-ring",
  "core-time",
  "core-types",
@@ -392,6 +394,7 @@ version = "0.1.0"
 name = "core-config"
 version = "0.1.0"
 dependencies = [
+ "core-regime",
  "core-types",
  "dotenvy",
  "libc",
@@ -443,6 +446,15 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "memchr",
+ "proptest",
+]
+
+[[package]]
+name = "core-regime"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "core-types",
  "proptest",
 ]
 
@@ -1759,6 +1771,7 @@ dependencies = [
 name = "strategy-icdp"
 version = "0.1.0"
 dependencies = [
+ "core-regime",
  "core-time",
  "core-types",
  "proptest",
@@ -1791,6 +1804,7 @@ dependencies = [
 name = "strategy-set"
 version = "0.1.0"
 dependencies = [
+ "core-regime",
  "core-time",
  "core-types",
  "strategy-ai-exec",
@@ -1808,6 +1822,7 @@ name = "strategy-vm"
 version = "0.1.0"
 dependencies = [
  "book-builder",
+ "core-regime",
  "core-time",
  "core-types",
  "proptest",

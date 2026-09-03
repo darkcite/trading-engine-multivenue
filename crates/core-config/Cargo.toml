@@ -12,6 +12,7 @@ description  = "Boot-time config loader: reads the single `.env` file via dotenv
 path = "src/lib.rs"
 
 [dependencies]
+core-regime = { workspace = true }
 core-types = { workspace = true }
 dotenvy = { workspace = true }
 zeroize = { workspace = true }

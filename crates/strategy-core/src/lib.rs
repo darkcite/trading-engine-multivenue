@@ -30,7 +30,10 @@
 )]
 
 use core_time::NsTs;
-use core_types::{AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTableV2, Signal, Tick};
+use core_types::{
+    AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet, RegimeWord,
+    RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_OFF_SOFT,
+};
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
 /// fatal; the process exits rather than continuing with half-init.
@@ -177,6 +180,80 @@ pub trait StrategyCounters {
     fn icdp_counters(&self) -> IcdpCounters {
         IcdpCounters::default()
     }
+
+    /// RG2: the regime detector's observables (`engine_regime_*`),
+    /// mirrored by the cli's generic 5 s block. The default (no
+    /// detector) reports UNKNOWN words, open gates and zero counters —
+    /// bare strategies never carry a detector.
+    #[inline]
+    fn regime_counters(&self) -> RegimeCounters {
+        RegimeCounters::default()
+    }
+}
+
+/// The regime detector's observables (RG2, plan §4.9) — defined here
+/// so the cli mirrors them through [`StrategyCounters`] without naming
+/// `core-regime` or the set (the icdp-counters precedent). POD.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct RegimeCounters {
+    /// Measured word per profile (index = profile).
+    pub measured: [RegimeWord; 4],
+    /// Declared word per profile (EMPTY when none).
+    pub declared: [RegimeWord; 4],
+    /// Effective word per profile.
+    pub effective: [RegimeWord; 4],
+    /// Engine-monotonic stamp of the declaration per profile (0 = none);
+    /// the cli derives the age with its own clock at mirror time.
+    pub declared_ts_ns: [u64; 4],
+    /// TTL of the declaration per profile (0 = none).
+    pub declared_ttl_ns: [u64; 4],
+    /// Flip counters per profile × dimension (0..6 live).
+    pub flips: [[u64; 8]; 4],
+    /// Disagree counter per profile.
+    pub disagree: [u64; 4],
+    /// Raw judgement inputs per profile: ret bps ×1e9, ER ×1e9, RV bps
+    /// ×1e9, stretch ×1e9 (present bits in `raw_present`).
+    pub raw: [[i64; 4]; 4],
+    /// Presence bits per profile (`core_regime::RAW_*`).
+    pub raw_present: [u8; 4],
+    /// Per-slot gate: 0 open, 1 soft-closed, 2 hard-closed.
+    pub gates: [u8; 8],
+    /// Minutes judged since boot.
+    pub minutes_judged: u64,
+    /// Seed rows applied at boot.
+    pub seed_rows: u64,
+    /// `SetRegime` commands applied.
+    pub declared_total: u64,
+    /// Gate changes fanned out (`on_regime` calls).
+    pub gate_changes: u64,
+    /// 1 when a detector is configured (else every word is UNKNOWN).
+    pub configured: u8,
+    /// Explicit padding — always zero.
+    _pad: [u8; 7],
+}
+
+impl Default for RegimeCounters {
+    fn default() -> Self {
+        Self {
+            measured: [RegimeWord::UNKNOWN; 4],
+            declared: [RegimeWord::EMPTY; 4],
+            effective: [RegimeWord::UNKNOWN; 4],
+            declared_ts_ns: [0; 4],
+            declared_ttl_ns: [0; 4],
+            flips: [[0; 8]; 4],
+            disagree: [0; 4],
+            raw: [[0; 4]; 4],
+            raw_present: [0; 4],
+            gates: [0; 8],
+            minutes_judged: 0,
+            seed_rows: 0,
+            declared_total: 0,
+            gate_changes: 0,
+            configured: 0,
+            _pad: [0; 7],
+        }
+    }
 }
 
 /// Diagnostic counters of the intrabar (ICDP) strategy — defined here
@@ -210,6 +287,12 @@ pub struct IcdpCounters {
     pub caps_rejected: u64,
     /// Bar rolls processed.
     pub rolls: u64,
+    /// RG2: decisions refused because the member's regime gate was
+    /// closed (`engine_icdp_regime_blocked_total`).
+    pub regime_blocked: u64,
+    /// RG2: positions exited early by a hard-closed gate
+    /// (`engine_icdp_regime_exits_total`).
+    pub regime_exits: u64,
 }
 
 // ---------------------------------------------------------------
@@ -411,8 +494,81 @@ pub trait Strategy: StrategyCounters {
     /// How often `on_timer` should fire (ns). `u64::MAX` disables.
     fn timer_period_ns(&self) -> u64;
 
+    /// The member's static regime label set (RG2,
+    /// `docs/regime-and-dashboard-plan.md` §4.2): the regimes it may
+    /// ENTER in, ∃ over up to four product terms, plus its off-mode.
+    /// The strategy set evaluates it on regime change only — never per
+    /// tick — and fans [`Self::on_regime`] out when the verdict flips.
+    /// Default = unconstrained / soft: every strategy that exists today
+    /// keeps its exact behaviour. A coded member's compiled constant
+    /// can be overridden at boot from `regime.toml [labels.<member>]`
+    /// through [`Self::set_regime_label`].
+    #[inline]
+    fn regime_label(&self) -> RegimeLabelSet {
+        RegimeLabelSet::ANY
+    }
+
+    /// Boot-time override of [`Self::regime_label`] (the `regime.toml`
+    /// `[labels.<member>]` seam). Default: ignored — a member that does
+    /// not store a label cannot be relabelled, and the set logs the
+    /// refusal at boot.
+    #[inline]
+    fn set_regime_label(&mut self, set: RegimeLabelSet) -> bool {
+        let _ = set;
+        false
+    }
+
+    /// Edge-triggered regime gate (RG2): called by the strategy set
+    /// only when this member's gate CHANGED — opened, or closed
+    /// (soft: block entries and let the member's own exit law drain;
+    /// hard: block entries and run the member's flatten path). Never
+    /// called per tick. The default ignores it, which is exactly right
+    /// for an unconstrained member (its gate never closes).
+    #[inline]
+    fn on_regime<C: Ctx>(&mut self, gate: RegimeGate, ctx: &mut C) {
+        let _ = (gate, ctx);
+    }
+
     /// Called once on graceful shutdown.
     fn on_stop<C: Ctx>(&mut self, ctx: &mut C);
+}
+
+/// The verdict handed to [`Strategy::on_regime`] (RG2). POD.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct RegimeGate {
+    /// The effective words the verdict was taken on (index = profile;
+    /// `REGIME_PROFILES` live, the rest UNKNOWN).
+    pub effective: [RegimeWord; 4],
+    /// `true` = the member may enter; `false` = closed.
+    pub open: bool,
+    /// The member's off-mode when closed: [`REGIME_OFF_SOFT`] or
+    /// [`REGIME_OFF_HARD`] (meaningful only while `!open`).
+    pub off: u8,
+    /// Explicit padding — always zero.
+    _pad: [u8; 6],
+}
+
+impl RegimeGate {
+    /// Construct without naming the padding.
+    #[inline(always)]
+    pub const fn new(effective: [RegimeWord; 4], open: bool, off: u8) -> Self {
+        Self {
+            effective,
+            open,
+            off,
+            _pad: [0; 6],
+        }
+    }
+
+    /// The boot value: open, every word UNKNOWN (no detector yet).
+    pub const OPEN_UNKNOWN: Self = Self::new([RegimeWord::UNKNOWN; 4], true, REGIME_OFF_SOFT);
+
+    /// `true` when closed with the hard off-mode (flatten now).
+    #[inline(always)]
+    pub const fn hard_closed(&self) -> bool {
+        !self.open && self.off == REGIME_OFF_HARD
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +661,39 @@ mod tests {
         assert!(s.started);
         assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
         assert_eq!(ctx.submitted, 0, "default hook cannot submit (no Ctx)");
+    }
+
+    #[test]
+    fn regime_hooks_default_to_unconstrained_and_noop() {
+        // RG2 defaults: an unconstrained label, no relabel, a no-op
+        // gate callback, and the counters' "no detector" shape.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        assert_eq!(s.regime_label(), RegimeLabelSet::ANY);
+        assert!(!s.set_regime_label(RegimeLabelSet::ANY));
+        let closed = RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_HARD);
+        assert!(closed.hard_closed());
+        let boot = RegimeGate::OPEN_UNKNOWN;
+        assert!(!boot.hard_closed());
+        assert!(boot.open && boot.off == REGIME_OFF_SOFT);
+        s.on_regime(closed, &mut ctx);
+        assert_eq!(s.ticks, 0);
+        assert_eq!(ctx.submitted, 0);
+        let c = s.regime_counters();
+        assert_eq!(c, RegimeCounters::default());
+        assert_eq!(c.effective[0], RegimeWord::UNKNOWN);
+        assert_eq!(c.declared[1], RegimeWord::EMPTY);
+        assert_eq!(c.declared_ts_ns[0], 0);
+        assert_eq!(c.declared_ttl_ns[0], 0);
+        assert_eq!(c.gates, [0; 8]);
+        assert_eq!(c.configured, 0);
+        assert_eq!(core::mem::size_of::<RegimeGate>(), 40);
     }
 
     #[test]

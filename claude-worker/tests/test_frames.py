@@ -103,7 +103,10 @@ def test_golden_fixture_covers_every_kind() -> None:
     kinds = set()
     for i in range(len(vectors)):
         kinds.add(vectors[i].kind)
-    assert kinds == set(range(10)), "one golden vector per AiCmdKind"
+    # 0..=9 (8f) + 10/11 (VM2 seeds) + 12 (RG0 SetRegime).
+    assert kinds == set(range(claude_worker.frames.KIND_SET_REGIME + 1)), (
+        "one golden vector per AiCmdKind"
+    )
 
 
 def test_golden_vectors_pack_byte_identical() -> None:
@@ -152,3 +155,79 @@ def test_frame_geometry_constants() -> None:
         claude_worker.frames.CMD_OFFSET + claude_worker.frames.CMD_LEN
         == claude_worker.frames.TAG_OFFSET
     )
+
+
+# ---- RG0: regime word helpers (core-types regime.rs mirror) ----
+
+
+def test_regime_word_matches_the_golden_set_regime_vector() -> None:
+    # The set_regime_fast vector's px is the word bull/trend/normal/pos/
+    # normal/neutral with an EMPTY source byte; its qty is the same word
+    # stamped MEASURED. Both are pinned by the shared golden bytes.
+    _key, vectors = load_golden()
+    fast = [v for v in vectors if v.name == "set_regime_fast"][0]
+    word = claude_worker.frames.regime_word(
+        trend="bull",
+        shape="trend",
+        vol="normal",
+        fund="pos",
+        level="normal",
+        stretch="neutral",
+    )
+    assert fast.px == word
+    assert fast.qty == word | (1 << (8 * 6))
+    assert fast.kind == claude_worker.frames.KIND_SET_REGIME
+    assert fast.param_id == claude_worker.frames.REGIME_PROFILE_FAST
+    assert claude_worker.frames.regime_word_is_wire_declared(fast.px)
+    assert not claude_worker.frames.regime_word_is_wire_declared(fast.qty)
+    slow = [v for v in vectors if v.name == "set_regime_slow_eos"][0]
+    assert slow.px == claude_worker.frames.regime_word(trend="bull")
+    assert slow.param_id == claude_worker.frames.REGIME_PROFILE_SLOW
+    assert slow.flags == claude_worker.frames.FLAG_EXPIRE_ON_SILENCE
+
+
+def test_regime_word_roundtrips_and_refuses_unknown_names() -> None:
+    word = claude_worker.frames.regime_word(trend="bear", stretch="ext_up")
+    assert claude_worker.frames.regime_word_dims(word) == {
+        "trend": "bear",
+        "stretch": "ext_up",
+    }
+    assert claude_worker.frames.regime_word_dims(0) == {}
+    assert claude_worker.frames.regime_word_dims(0b011) == {"trend": "?"}
+    # The all-unknown word: every market dimension marked, SOURCE unknown.
+    assert claude_worker.frames.regime_word_dims(
+        claude_worker.frames.REGIME_UNKNOWN_WORD
+    ) == {
+        "trend": "unknown",
+        "shape": "unknown",
+        "vol": "unknown",
+        "fund": "unknown",
+        "level": "unknown",
+        "stretch": "unknown",
+        "source": "unknown",
+    }
+    assert claude_worker.frames.regime_word(vol="unknown") == (
+        claude_worker.frames.REGIME_DIM_UNKNOWN_BIT << 16
+    )
+    with pytest.raises(ValueError):
+        claude_worker.frames.regime_word(mood="happy")
+    with pytest.raises(ValueError):
+        claude_worker.frames.regime_word(fund="high")
+
+
+def test_regime_word_wire_law() -> None:
+    f = claude_worker.frames
+    assert f.regime_word_is_wire_declared(0)
+    assert f.regime_word_is_wire_declared(f.regime_word(trend="bull"))
+    # A declarer may mark a dimension unknown explicitly.
+    assert f.regime_word_is_wire_declared(f.regime_word(trend="bull", vol="unknown"))
+    # Two bits in one byte, a bit outside the valid mask, a SOURCE bit,
+    # a reserved-byte bit, a negative or an over-wide value.
+    assert not f.regime_word_is_wire_declared(0b011)
+    assert not f.regime_word_is_wire_declared(1 << (8 * 3 + 2))
+    assert not f.regime_word_is_wire_declared(f.REGIME_UNKNOWN_WORD)
+    assert not f.regime_word_is_wire_declared(1 << 56)
+    assert not f.regime_word_is_wire_declared(-1)
+    assert not f.regime_word_is_wire_declared(1 << 64)
+    # Unknown mark beside a value in the same byte is malformed.
+    assert not f.regime_word_is_wire_declared(0x81)

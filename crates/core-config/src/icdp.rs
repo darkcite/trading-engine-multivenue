@@ -104,23 +104,25 @@ pub fn default_icdp_path() -> Result<String, super::ConfigError> {
 /// Read + parse. Returns the file bytes too so the caller can hash the
 /// EXACT artifact it booted with.
 pub fn load(path: &Path) -> Result<(IcdpFile, Vec<u8>), IcdpError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| IcdpError(format!("{}: {e}", path.display())))?;
+    let bytes = std::fs::read(path).map_err(|e| IcdpError(format!("{}: {e}", path.display())))?;
     let src = std::str::from_utf8(&bytes)
         .map_err(|_| IcdpError(format!("{}: not UTF-8", path.display())))?;
     let file = parse(src)?;
     Ok((file, bytes))
 }
 
+/// One parsed TOML-subset value (shared with `regime.rs`, RG2).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Value {
+pub(crate) enum Value {
     Str(String),
     Int(i64),
     Ints(Vec<i64>),
+    /// `["a", "b"]` — string arrays (RG2 `regime.toml` members/terms).
+    Strs(Vec<String>),
 }
 
 /// Strip a trailing comment (quote-aware) and surrounding whitespace.
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut in_str = false;
     let mut i = 0usize;
@@ -135,7 +137,7 @@ fn strip_comment(line: &str) -> &str {
     line.trim()
 }
 
-fn parse_int(s: &str, ln: usize) -> Result<i64, IcdpError> {
+pub(crate) fn parse_int(s: &str, ln: usize) -> Result<i64, IcdpError> {
     let t = s.trim();
     let (neg, digits) = match t.strip_prefix('-') {
         Some(d) => (true, d),
@@ -157,21 +159,42 @@ fn parse_int(s: &str, ln: usize) -> Result<i64, IcdpError> {
     Ok(if neg { -v } else { v })
 }
 
-fn parse_value(s: &str, ln: usize) -> Result<Value, IcdpError> {
+fn parse_str(t: &str, ln: usize) -> Result<String, IcdpError> {
+    let inner = t
+        .strip_prefix('"')
+        .ok_or_else(|| IcdpError(format!("line {ln}: expected a quoted string")))?;
+    let body = inner
+        .strip_suffix('"')
+        .ok_or_else(|| IcdpError(format!("line {ln}: unterminated string")))?;
+    if body.contains('"') || body.contains('\\') {
+        return Err(IcdpError(format!("line {ln}: strings carry no escapes")));
+    }
+    Ok(body.to_owned())
+}
+
+pub(crate) fn parse_value(s: &str, ln: usize) -> Result<Value, IcdpError> {
     let t = s.trim();
-    if let Some(inner) = t.strip_prefix('"') {
-        let body = inner
-            .strip_suffix('"')
-            .ok_or_else(|| IcdpError(format!("line {ln}: unterminated string")))?;
-        if body.contains('"') || body.contains('\\') {
-            return Err(IcdpError(format!("line {ln}: strings carry no escapes")));
-        }
-        return Ok(Value::Str(body.to_owned()));
+    if t.starts_with('"') {
+        return Ok(Value::Str(parse_str(t, ln)?));
     }
     if let Some(inner) = t.strip_prefix('[') {
         let body = inner
             .strip_suffix(']')
             .ok_or_else(|| IcdpError(format!("line {ln}: unterminated array")))?;
+        // A string array: every element quoted, split on commas outside
+        // quotes (descriptors never contain commas; the grammar refuses
+        // escapes so a quote cannot be nested).
+        if body.trim_start().starts_with('"') {
+            let mut out = Vec::new();
+            for part in body.split(',') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue; // trailing comma
+                }
+                out.push(parse_str(p, ln)?);
+            }
+            return Ok(Value::Strs(out));
+        }
         let mut out = Vec::new();
         for part in body.split(',') {
             let p = part.trim();
@@ -185,7 +208,11 @@ fn parse_value(s: &str, ln: usize) -> Result<Value, IcdpError> {
     Ok(Value::Int(parse_int(t, ln)?))
 }
 
-fn take_ints(kv: &[(String, Value, usize)], key: &str, ln: usize) -> Result<[i64; ICDP_NF], IcdpError> {
+fn take_ints(
+    kv: &[(String, Value, usize)],
+    key: &str,
+    ln: usize,
+) -> Result<[i64; ICDP_NF], IcdpError> {
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Ints(v), l)) => {
             if v.len() != ICDP_NF {
@@ -197,8 +224,12 @@ fn take_ints(kv: &[(String, Value, usize)], key: &str, ln: usize) -> Result<[i64
             out.copy_from_slice(v);
             Ok(out)
         }
-        Some((_, _, l)) => Err(IcdpError(format!("line {l}: `{key}` must be an integer array"))),
-        None => Err(IcdpError(format!("instrument at line {ln}: missing `{key}`"))),
+        Some((_, _, l)) => Err(IcdpError(format!(
+            "line {l}: `{key}` must be an integer array"
+        ))),
+        None => Err(IcdpError(format!(
+            "instrument at line {ln}: missing `{key}`"
+        ))),
     }
 }
 
@@ -206,7 +237,9 @@ fn take_int(kv: &[(String, Value, usize)], key: &str, ln: usize) -> Result<i64, 
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Int(v), _)) => Ok(*v),
         Some((_, _, l)) => Err(IcdpError(format!("line {l}: `{key}` must be an integer"))),
-        None => Err(IcdpError(format!("instrument at line {ln}: missing `{key}`"))),
+        None => Err(IcdpError(format!(
+            "instrument at line {ln}: missing `{key}`"
+        ))),
     }
 }
 
@@ -214,7 +247,9 @@ fn take_str(kv: &[(String, Value, usize)], key: &str, ln: usize) -> Result<Strin
     match kv.iter().find(|(k, _, _)| k == key) {
         Some((_, Value::Str(v), _)) => Ok(v.clone()),
         Some((_, _, l)) => Err(IcdpError(format!("line {l}: `{key}` must be a string"))),
-        None => Err(IcdpError(format!("instrument at line {ln}: missing `{key}`"))),
+        None => Err(IcdpError(format!(
+            "instrument at line {ln}: missing `{key}`"
+        ))),
     }
 }
 
@@ -231,7 +266,10 @@ const INSTRUMENT_KEYS: [&str; 10] = [
     "exit_slip_1e9",
 ];
 
-fn finish_instrument(kv: &[(String, Value, usize)], ln: usize) -> Result<IcdpInstrument, IcdpError> {
+fn finish_instrument(
+    kv: &[(String, Value, usize)],
+    ln: usize,
+) -> Result<IcdpInstrument, IcdpError> {
     for (k, _, l) in kv {
         if !INSTRUMENT_KEYS.contains(&k.as_str()) {
             return Err(IcdpError(format!("line {l}: unknown instrument key `{k}`")));
@@ -250,10 +288,14 @@ fn finish_instrument(kv: &[(String, Value, usize)], ln: usize) -> Result<IcdpIns
         exit_slip_1e9: take_int(kv, "exit_slip_1e9", ln)?,
     };
     if inst.descriptor.is_empty() {
-        return Err(IcdpError(format!("instrument at line {ln}: empty descriptor")));
+        return Err(IcdpError(format!(
+            "instrument at line {ln}: empty descriptor"
+        )));
     }
     if inst.inv_sd.iter().any(|v| *v <= 0) {
-        return Err(IcdpError(format!("instrument at line {ln}: inv_sd must be > 0")));
+        return Err(IcdpError(format!(
+            "instrument at line {ln}: inv_sd must be > 0"
+        )));
     }
     if inst.thr <= 0 || inst.notional_usd_1e6 <= 0 || inst.spread_cap_1e9 <= 0 {
         return Err(IcdpError(format!(
@@ -261,7 +303,9 @@ fn finish_instrument(kv: &[(String, Value, usize)], ln: usize) -> Result<IcdpIns
         )));
     }
     if inst.entry_slip_1e9 < 0 || inst.exit_slip_1e9 < 0 {
-        return Err(IcdpError(format!("instrument at line {ln}: slips must be ≥ 0")));
+        return Err(IcdpError(format!(
+            "instrument at line {ln}: slips must be ≥ 0"
+        )));
     }
     Ok(inst)
 }
@@ -337,7 +381,9 @@ pub fn parse(src: &str) -> Result<IcdpFile, IcdpError> {
                     }
                 }
                 ("tf_ms", _) | ("delta_ms", _) => {
-                    return Err(IcdpError(format!("line {ln}: `{key}` must be a non-negative integer")))
+                    return Err(IcdpError(format!(
+                        "line {ln}: `{key}` must be a non-negative integer"
+                    )))
                 }
                 _ => return Err(IcdpError(format!("line {ln}: unknown [icdp] key `{key}`"))),
             },

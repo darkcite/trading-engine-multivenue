@@ -47,10 +47,10 @@ use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
-    make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, Order, RuleTableSlot,
-    OptSummary, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
-    EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, OPT_RING_SIZE,
-    EVENT_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
+    RuleTableSlot, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
+    EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
+    RULE_TABLE_RING_SLOTS,
 };
 use engine::{
     Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
@@ -1860,14 +1860,13 @@ pub fn spawn_ai(
         // push-full ⇒ reject, counted (`table_push_fail`). The
         // consumer half parks in the bin until item 7 wires the
         // engine drain.
-        let mut side_path =
-            RulesetSidePath::new(
-                ruleset_dir,
-                Arc::clone(&status),
-                universe,
-                descriptors,
-                table_producer,
-            );
+        let mut side_path = RulesetSidePath::new(
+            ruleset_dir,
+            Arc::clone(&status),
+            universe,
+            descriptors,
+            table_producer,
+        );
         let mut seam = |c: &AiCmd| side_path.on_cmd(c);
         while !shutdown_requested() {
             match ingress_ai::run(
@@ -2452,6 +2451,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     cross_groups: &[&[core_types::SymbolId]],
     rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
     icdp: Option<&strategy_icdp::IcdpParams>,
+    regime: Option<&RegimeBoot>,
 ) -> EngineLoopResult {
     if cfg.pairs.is_empty() {
         return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
@@ -2516,6 +2516,54 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             "icdp: artifact configured"
         );
     }
+    // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
+    // `[labels.*]` overrides, seed, and print the boot tells. An
+    // absent artifact leaves it unconfigured: every word UNKNOWN,
+    // every unconstrained member open (today's behaviour).
+    match regime {
+        Some(rb) => {
+            let anchor = core_time::WallAnchor::now();
+            let now = core_time::now_ns();
+            if let Err(e) = set.configure_regime(&rb.params, anchor, now) {
+                tracing::error!(error = ?e, "regime: artifact refused by the detector");
+                return EngineLoopResult::Failed("regime: artifact refused by the detector");
+            }
+            for (slot, label) in &rb.labels {
+                if set.set_regime_label(*slot, *label) {
+                    tracing::info!(
+                        slot,
+                        terms = label.n,
+                        off = label.off,
+                        "regime: label override applied"
+                    );
+                } else {
+                    tracing::warn!(
+                        slot,
+                        "regime: label override refused (slot cannot be relabelled)"
+                    );
+                }
+            }
+            let applied = set.seed_regime(&rb.seed, now);
+            let c = strategy_core::StrategyCounters::regime_counters(&set);
+            tracing::info!(
+                hash = %format_hex32(&rb.hash),
+                members = rb.params.n_members,
+                confirm_min = rb.params.confirm_min,
+                seed_rows = applied,
+                seed_file_rows = rb.seed.len(),
+                fast = %format_hex16(c.effective[0].0),
+                slow = %format_hex16(c.effective[1].0),
+                gates = ?c.gates,
+                "regime: artifact configured"
+            );
+            if rb.seed.is_empty() {
+                tracing::info!("regime: seed absent — profiles warm live");
+            }
+        }
+        None => tracing::info!(
+            "regime: no artifact — detector unconfigured (words UNKNOWN, gates open)"
+        ),
+    }
     tracing::info!(
         mask,
         latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
@@ -2537,6 +2585,26 @@ fn format_hex32(h: &[u8; 32]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// 16-hex-digit render of a regime word (boot log; cold path).
+fn format_hex16(w: u64) -> String {
+    format!("{w:016x}")
+}
+
+/// RG2: everything the set needs to boot its regime detector — built
+/// by the bin from `regime.toml` + the seed file with every descriptor
+/// resolved against the boot universe (the icdp precedent). Boot-only;
+/// allocation is fine.
+pub struct RegimeBoot {
+    /// Resolved detector parameters.
+    pub params: core_regime::RegimeParams,
+    /// `[labels.<member>]` overrides as `(slot, set)`.
+    pub labels: Vec<(u8, core_types::RegimeLabelSet)>,
+    /// Resolved seed rows (empty = seed absent).
+    pub seed: Vec<core_regime::SeedRow>,
+    /// SHA-256 of the artifact bytes (boot log / `/state`).
+    pub hash: [u8; 32],
 }
 
 fn format_u64_into(buf: &mut [u8; 32], mut v: u64) -> &[u8] {
@@ -2745,6 +2813,7 @@ impl Observability {
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
             let icdp = register_icdp_metrics(&mut reg)?;
+            let regime = register_regime_metrics(&mut reg)?;
             let fills_capture = {
                 let io_errors = reg
                     .register_gauge("engine_fills_capture_io_errors")
@@ -2822,6 +2891,7 @@ impl Observability {
                 strategy_enabled_mask,
                 vm,
                 icdp,
+                regime,
             });
         }
         if enable_tui {
@@ -3116,6 +3186,8 @@ pub struct EngineCounters {
     pub vm: VmMetricIds,
     /// ICDP I4: the `engine_icdp_*_total` family (slot 6).
     pub icdp: IcdpMetricIds,
+    /// RG2: the `engine_regime_*` family.
+    pub regime: RegimeMetricIds,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -3464,6 +3536,10 @@ pub struct IcdpMetricIds {
     pub caps_rejected: core_metrics::CounterId,
     /// `engine_icdp_rolls_total`
     pub rolls: core_metrics::CounterId,
+    /// `engine_icdp_regime_blocked_total` (RG2)
+    pub regime_blocked: core_metrics::CounterId,
+    /// `engine_icdp_regime_exits_total` (RG2)
+    pub regime_exits: core_metrics::CounterId,
 }
 
 /// Register the ICDP family. Boot-only.
@@ -3487,6 +3563,8 @@ fn register_icdp_metrics(
         late_bars: one("engine_icdp_late_bars_total")?,
         caps_rejected: one("engine_icdp_caps_rejected_total")?,
         rolls: one("engine_icdp_rolls_total")?,
+        regime_blocked: one("engine_icdp_regime_blocked_total")?,
+        regime_exits: one("engine_icdp_regime_exits_total")?,
     })
 }
 
@@ -3511,8 +3589,10 @@ fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.exit_on_stale.saturating_sub(last.exit_on_stale));
     reg.counter(ids.skipped_spread)
         .inc(cur.skipped_spread.saturating_sub(last.skipped_spread));
-    reg.counter(ids.skipped_stale_open)
-        .inc(cur.skipped_stale_open.saturating_sub(last.skipped_stale_open));
+    reg.counter(ids.skipped_stale_open).inc(
+        cur.skipped_stale_open
+            .saturating_sub(last.skipped_stale_open),
+    );
     reg.counter(ids.skipped_stale_dec)
         .inc(cur.skipped_stale_dec.saturating_sub(last.skipped_stale_dec));
     reg.counter(ids.skipped_prev)
@@ -3523,6 +3603,162 @@ fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
     reg.counter(ids.rolls)
         .inc(cur.rolls.saturating_sub(last.rolls));
+    reg.counter(ids.regime_blocked)
+        .inc(cur.regime_blocked.saturating_sub(last.regime_blocked));
+    reg.counter(ids.regime_exits)
+        .inc(cur.regime_exits.saturating_sub(last.regime_exits));
+    *last = cur;
+}
+
+// ---------------------------------------------------------------
+// RG2: the `engine_regime_*` family (plan §4.9)
+// ---------------------------------------------------------------
+
+/// Registry handles of the regime family: per-profile word gauges +
+/// raw inputs, per-dimension flip counters, disagree counters, the
+/// per-slot gate gauges and the boot/plane counters.
+#[derive(Copy, Clone, Debug)]
+pub struct RegimeMetricIds {
+    /// `engine_regime_configured` (0/1).
+    pub configured: GaugeId,
+    /// `engine_regime_{fast,slow}_{measured,declared,effective}` — the
+    /// word as an i64 gauge (index = profile).
+    pub words: [[GaugeId; 3]; 2],
+    /// `engine_regime_{fast,slow}_source` (0 measured / 1 declared / 2 unknown).
+    pub source: [GaugeId; 2],
+    /// `engine_regime_{fast,slow}_declared_age_ns` (−1 = none).
+    pub declared_age: [GaugeId; 2],
+    /// `engine_regime_{fast,slow}_raw_{ret_bps,er,rv_bps,stretch}` ×1e9.
+    pub raw: [[GaugeId; 4]; 2],
+    /// `engine_regime_{fast,slow}_flips_{trend,shape,vol,fund,level,stretch}_total`.
+    pub flips: [[core_metrics::CounterId; 6]; 2],
+    /// `engine_regime_{fast,slow}_disagree_total`.
+    pub disagree: [core_metrics::CounterId; 2],
+    /// `engine_strategy_regime_gate_{0..7}` (0 open / 1 soft-closed / 2 hard-closed).
+    pub gates: [GaugeId; 8],
+    /// `engine_regime_minutes_judged_total`.
+    pub minutes_judged: core_metrics::CounterId,
+    /// `engine_regime_seed_rows` (gauge).
+    pub seed_rows: GaugeId,
+    /// `engine_regime_declared_total`.
+    pub declared_total: core_metrics::CounterId,
+    /// `engine_regime_gate_changes_total`.
+    pub gate_changes: core_metrics::CounterId,
+}
+
+const REGIME_PROFILE_NAMES: [&str; 2] = ["fast", "slow"];
+const REGIME_WORD_NAMES: [&str; 3] = ["measured", "declared", "effective"];
+const REGIME_RAW_NAMES: [&str; 4] = ["ret_bps", "er", "rv_bps", "stretch"];
+const REGIME_DIM_NAMES: [&str; 6] = ["trend", "shape", "vol", "fund", "level", "stretch"];
+
+/// Register the regime family (≈ 50 names). Boot-only.
+fn register_regime_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<RegimeMetricIds, &'static str> {
+    let mut gauge = |name: &str| -> Result<GaugeId, &'static str> {
+        reg.register_gauge(name)
+            .map_err(|_| "register regime gauge")
+    };
+    let configured = gauge("engine_regime_configured")?;
+    let mut words = [[GaugeId::default(); 3]; 2];
+    let mut source = [GaugeId::default(); 2];
+    let mut declared_age = [GaugeId::default(); 2];
+    let mut raw = [[GaugeId::default(); 4]; 2];
+    let mut gates = [GaugeId::default(); 8];
+    for (p, pname) in REGIME_PROFILE_NAMES.iter().enumerate() {
+        for (w, wname) in REGIME_WORD_NAMES.iter().enumerate() {
+            words[p][w] = gauge(&format!("engine_regime_{pname}_{wname}"))?;
+        }
+        source[p] = gauge(&format!("engine_regime_{pname}_source"))?;
+        declared_age[p] = gauge(&format!("engine_regime_{pname}_declared_age_ns"))?;
+        for (r, rname) in REGIME_RAW_NAMES.iter().enumerate() {
+            raw[p][r] = gauge(&format!("engine_regime_{pname}_raw_{rname}"))?;
+        }
+    }
+    for (slot, g) in gates.iter_mut().enumerate() {
+        *g = gauge(&format!("engine_strategy_regime_gate_{slot}"))?;
+    }
+    let seed_rows = gauge("engine_regime_seed_rows")?;
+    let mut counter = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name)
+            .map_err(|_| "register regime counter")
+    };
+    let mut flips = [[core_metrics::CounterId::default(); 6]; 2];
+    let mut disagree = [core_metrics::CounterId::default(); 2];
+    for (p, pname) in REGIME_PROFILE_NAMES.iter().enumerate() {
+        for (d, dname) in REGIME_DIM_NAMES.iter().enumerate() {
+            flips[p][d] = counter(&format!("engine_regime_{pname}_flips_{dname}_total"))?;
+        }
+        disagree[p] = counter(&format!("engine_regime_{pname}_disagree_total"))?;
+    }
+    Ok(RegimeMetricIds {
+        configured,
+        words,
+        source,
+        declared_age,
+        raw,
+        flips,
+        disagree,
+        gates,
+        minutes_judged: counter("engine_regime_minutes_judged_total")?,
+        seed_rows,
+        declared_total: counter("engine_regime_declared_total")?,
+        gate_changes: counter("engine_regime_gate_changes_total")?,
+    })
+}
+
+/// Mirror the regime family: gauges set, counters as monotonic deltas
+/// of the cumulative values. 5 s cadence — cold path.
+fn mirror_regime_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &RegimeMetricIds,
+    strat: &S,
+    last: &mut strategy_core::RegimeCounters,
+    now: NsTs,
+) {
+    let cur = strat.regime_counters();
+    reg.gauge(ids.configured).set(i64::from(cur.configured));
+    for p in 0..2usize {
+        reg.gauge(ids.words[p][0]).set(cur.measured[p].0 as i64);
+        reg.gauge(ids.words[p][1]).set(cur.declared[p].0 as i64);
+        reg.gauge(ids.words[p][2]).set(cur.effective[p].0 as i64);
+        let src = cur.effective[p].source();
+        reg.gauge(ids.source[p]).set(if src & 0b001 != 0 {
+            0
+        } else if src & 0b010 != 0 {
+            1
+        } else {
+            2
+        });
+        let age = if cur.declared_ttl_ns[p] == 0 {
+            -1
+        } else {
+            now.wrapping_sub(cur.declared_ts_ns[p]).min(i64::MAX as u64) as i64
+        };
+        reg.gauge(ids.declared_age[p]).set(age);
+        for r in 0..4usize {
+            let present = cur.raw_present[p] & (1u8 << r) != 0;
+            reg.gauge(ids.raw[p][r])
+                .set(if present { cur.raw[p][r] } else { 0 });
+        }
+        for d in 0..6usize {
+            reg.counter(ids.flips[p][d])
+                .inc(cur.flips[p][d].saturating_sub(last.flips[p][d]));
+        }
+        reg.counter(ids.disagree[p])
+            .inc(cur.disagree[p].saturating_sub(last.disagree[p]));
+    }
+    for slot in 0..8usize {
+        reg.gauge(ids.gates[slot]).set(i64::from(cur.gates[slot]));
+    }
+    reg.counter(ids.minutes_judged)
+        .inc(cur.minutes_judged.saturating_sub(last.minutes_judged));
+    reg.gauge(ids.seed_rows)
+        .set(cur.seed_rows.min(i64::MAX as u64) as i64);
+    reg.counter(ids.declared_total)
+        .inc(cur.declared_total.saturating_sub(last.declared_total));
+    reg.counter(ids.gate_changes)
+        .inc(cur.gate_changes.saturating_sub(last.gate_changes));
     *last = cur;
 }
 
@@ -3890,6 +4126,7 @@ where
     let mut vm_last = VmCountersSnapshot::default();
     // ICDP I4 slot-6 family delta snapshot (same bookkeeping).
     let mut icdp_last = strategy_core::IcdpCounters::default();
+    let mut regime_last = strategy_core::RegimeCounters::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -3959,6 +4196,7 @@ where
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
+                mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
 
                 // Per-ingress connection state — real per-thread
                 // status slots (D7 fix). Gauge value = IngressState:
@@ -5932,8 +6170,7 @@ mod tests {
     /// cannot repeat this silently.
     #[test]
     fn gauged_capture_forwards_every_record_hook() {
-        let dir =
-            std::env::temp_dir().join(format!("gauged_fwd_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gauged_fwd_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut g = GaugedCapture::new(
             PmlrCapture::open(&dir, "okx", 1, core_io::TapCfg::off()).unwrap(),
@@ -5952,7 +6189,16 @@ mod tests {
         Capture::tick(&mut g, &t);
         Capture::event(
             &mut g,
-            &ChannelEvent::new(1, VenueId::Okx, core_types::ChannelId::Funding, 7, 0, 0, 1, 0),
+            &ChannelEvent::new(
+                1,
+                VenueId::Okx,
+                core_types::ChannelId::Funding,
+                7,
+                0,
+                0,
+                1,
+                0,
+            ),
         );
         Capture::depth(&mut g, &core_types::DepthTopK::EMPTY);
         assert_eq!(g.inner.ticks_written(), 1);
@@ -6463,11 +6709,19 @@ mod tests {
     /// a venue wins; `0` is a legal "measure only" value.
     #[test]
     fn stale_after_ms_overrides_named_venues_only() {
-        let specs = ["okx:250".to_owned(), "bn:0".to_owned(), "okx:300".to_owned()];
+        let specs = [
+            "okx:250".to_owned(),
+            "bn:0".to_owned(),
+            "okx:300".to_owned(),
+        ];
         let t = parse_stale_after_ms(&specs).unwrap();
         assert_eq!(t[VenueId::Okx as usize], 300);
         assert_eq!(t[VenueId::Binance as usize], 0);
-        assert_eq!(t[VenueId::Bybit as usize], 500, "untouched venue keeps its default");
+        assert_eq!(
+            t[VenueId::Bybit as usize],
+            500,
+            "untouched venue keeps its default"
+        );
     }
 
     /// VT2: malformed specs refuse the boot with a named reason.

@@ -30,6 +30,8 @@ use std::path::Path;
 use zeroize::Zeroize;
 
 pub mod icdp;
+/// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
+pub mod regime;
 pub mod universe;
 
 // ---------------------------------------------------------------

@@ -457,11 +457,27 @@ fn preview(payload: &[u8]) -> String {
 // ---------------------------------------------------------------
 
 /// Short per-kind labels, index = `AiCmd::kind` byte (wire-format §3
-/// order). Unknown bytes are counted separately.
-const AI_KIND_LABELS: [&str; 10] = [
-    "HB", "Enable", "Disable", "SetFair", "SetBias", "SetParam", "Intent", "Stage", "Commit",
+/// order). Unknown bytes are counted separately. Sized by the last
+/// appended kind (`SetRegime = 12`, RG0) — the pre-RG0 table stopped at
+/// `Halt` and indexed out of bounds on a captured seed (kinds 10/11).
+const AI_KIND_LABELS: [&str; AI_KIND_COUNT] = [
+    "HB",
+    "Enable",
+    "Disable",
+    "SetFair",
+    "SetBias",
+    "SetParam",
+    "Intent",
+    "Stage",
+    "Commit",
     "Halt",
+    "FundSeed",
+    "PosSeed",
+    "SetRegime",
 ];
+
+/// `AiCmdKind::SetRegime as usize + 1` — every wire kind has a label.
+const AI_KIND_COUNT: usize = AiCmdKind::SetRegime as usize + 1;
 
 /// Cap on rendered TTL'd-at-pop previews (tap-preview convention).
 const MAX_TTL_PREVIEWS: usize = 8;
@@ -471,7 +487,7 @@ const MAX_TTL_PREVIEWS: usize = 8;
 #[derive(Default)]
 struct AiCmdAudit {
     total: u64,
-    per_kind: [u64; 10],
+    per_kind: [u64; AI_KIND_COUNT],
     unknown_kinds: u64,
     first_seq: Option<u32>,
     last_seq: Option<u32>,

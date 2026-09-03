@@ -105,11 +105,14 @@
 
 use book_builder::MultiBook;
 use core_time::NsTs;
+use core_types::RegimeLabelSet;
 use core_types::{
     symbol_venue_byte, AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Signal, SymbolId, Tick,
     VenueId, AI_CMD_FLAG_EXPIRE_ON_SILENCE, SYMBOL_ID_NONE,
 };
-use strategy_core::{CooldownGate, Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+use strategy_core::{
+    CooldownGate, Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr,
+};
 
 /// §5.4 staleness threshold: worker silence beyond this pulls AI
 /// quotes and refuses intents. Compile-time per §13 decision 6 —
@@ -236,6 +239,15 @@ pub struct AiExec<const N: usize> {
     pub orders_emitted: u64,
     /// Orders rejected by the dispatcher (ring full).
     pub orders_dropped: u64,
+    /// RG2: `OrderIntent` frames refused because the member's regime
+    /// gate was closed (plan §4.2 — slot 4 is gated as a whole; the
+    /// worker composes intents regime-aware upstream).
+    pub intents_refused_regime: u64,
+    /// RG2: the member's regime label (overridable at boot from
+    /// `regime.toml [labels.ai_exec]`; default ANY).
+    regime_label: RegimeLabelSet,
+    /// RG2: the current gate verdict (open at boot).
+    regime_open: bool,
 }
 
 impl<const N: usize> AiExec<N> {
@@ -259,6 +271,9 @@ impl<const N: usize> AiExec<N> {
             book_track_failed: 0,
             orders_emitted: 0,
             orders_dropped: 0,
+            intents_refused_regime: 0,
+            regime_label: RegimeLabelSet::ANY,
+            regime_open: true,
         }
     }
 
@@ -620,6 +635,9 @@ impl<const N: usize> Strategy for AiExec<N> {
                     // heartbeat-precedes-payload rule exists so this
                     // branch never fires in a well-behaved session.
                     self.intents_refused_stale = self.intents_refused_stale.wrapping_add(1);
+                } else if !self.regime_open {
+                    // RG2: the gate is closed — intents are entries.
+                    self.intents_refused_regime = self.intents_refused_regime.wrapping_add(1);
                 } else {
                     self.honor_intent(cmd, ctx);
                 }
@@ -641,13 +659,38 @@ impl<const N: usize> Strategy for AiExec<N> {
         u64::MAX
     }
 
+    /// RG2: the compiled label (ANY) or the boot override.
+    #[inline]
+    fn regime_label(&self) -> RegimeLabelSet {
+        self.regime_label
+    }
+
+    /// RG2: boot override from `regime.toml [labels.ai_exec]`.
+    #[inline]
+    fn set_regime_label(&mut self, set: RegimeLabelSet) -> bool {
+        self.regime_label = set;
+        true
+    }
+
+    /// RG2: intents are one-shot entries, so soft and hard close the
+    /// same way — nothing rests to flatten (quotes from the fair table
+    /// keep working; they are the ai-exec's own exit law).
+    #[inline]
+    fn on_regime<C: Ctx>(&mut self, gate: RegimeGate, _ctx: &mut C) {
+        self.regime_open = gate.open;
+    }
+
     fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{make_symbol_id, AI_SIDE_NONE, STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_NONE};
+    use core_types::regime::RegimeLabelBuilder;
+    use core_types::{
+        make_symbol_id, RegimeWord, AI_SIDE_NONE, REGIME_OFF_HARD, STRATEGY_SLOT_AI_EXEC,
+        STRATEGY_SLOT_NONE,
+    };
 
     struct TestCtx {
         now: NsTs,
@@ -1013,6 +1056,49 @@ mod tests {
     }
 
     // ---------------- OrderIntent paper flow (§11 row) ----------------
+
+    #[test]
+    fn regime_gate_blocks_intents_and_label_is_overridable() {
+        // RG2: a closed gate refuses intents (counted), an open gate
+        // honours them again; the default label is ANY and the boot
+        // override sticks.
+        let (mut s, mut c) = primed();
+        assert_eq!(s.regime_label(), RegimeLabelSet::ANY);
+        let closed = RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_HARD);
+        s.on_regime(closed, &mut c);
+        s.on_ai(
+            &intent(
+                T0 + 5,
+                PM,
+                430_000,
+                2_000_000,
+                Side::Bid,
+                VenueId::Polymarket,
+            ),
+            &mut c,
+        );
+        assert_eq!(s.intents_refused_regime, 1);
+        assert_eq!(s.intents_honored, 0);
+        assert!(c.submitted.is_empty());
+        s.on_regime(RegimeGate::OPEN_UNKNOWN, &mut c);
+        s.on_ai(
+            &intent(
+                T0 + 6,
+                PM,
+                430_000,
+                2_000_000,
+                Side::Bid,
+                VenueId::Polymarket,
+            ),
+            &mut c,
+        );
+        assert_eq!(s.intents_honored, 1);
+        let mut b = RegimeLabelBuilder::new();
+        b.add(b"fast:vol:!high").unwrap();
+        let set = RegimeLabelSet::from_terms(&[b.finish()], REGIME_OFF_HARD).unwrap();
+        assert!(s.set_regime_label(set));
+        assert_eq!(s.regime_label(), set);
+    }
 
     #[test]
     fn intent_honored_when_live() {

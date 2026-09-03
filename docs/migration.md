@@ -30,6 +30,133 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-09-03 — Regime detector in the engine: `regime.toml`, `regime-seed.tsv`, `--regime`, the `engine_regime_*` family (RG1–RG2)
+
+**What changed**
+
+- New crate `core-regime` (the measured regime: minute-close rings,
+  the integer judge law, confirm hysteresis, the declared-over-measured
+  effective law) and `core-config::regime` (the `regime.toml` parser +
+  the seed reader). `ret_bps_1e9` / `isqrt_i128` moved to
+  `core_regime::math` (`strategy-icdp` re-exports; `strategy-vm` imports).
+- `Strategy` trait: `regime_label` / `set_regime_label` / `on_regime`
+  (all defaulted — no existing strategy changes behaviour);
+  `StrategyCounters::regime_counters`; `IcdpCounters` gains
+  `regime_blocked` / `regime_exits` (additive).
+- `StrategySet` owns the detector: a 1 s timer is armed when a detector
+  is configured (`REGIME_TIMER_NS`; members' timers were `u64::MAX`);
+  `AiCmdKind::SetRegime` is consumed at set level; labelled members
+  receive edge-triggered `on_regime` calls. The ai-exec refuses intents
+  while its gate is closed; the icdp blocks decisions while closed and
+  exits open positions on a HARD close.
+- Boot surface: `--regime <path>` (default `~/multivenue/regime.toml`;
+  ABSENT default = detector unconfigured, today's behaviour; explicit
+  path or present-but-invalid file = boot refused), `--regime-seed
+  <path>` (default `~/multivenue/regime-seed.tsv`; absent = warm live).
+  `scripts/engine-wrapper.sh` exports the seed
+  (`python -m claude_worker.regime seed-out`) before every boot when
+  the artifact exists.
+- `/metrics`: the `engine_regime_*` family (≈ 50 names) +
+  `engine_icdp_regime_{blocked,exits}_total`. Registry headroom holds
+  (256 counters / 384 gauges).
+
+**Why**
+
+- `docs/regime-and-dashboard-plan.md` RG1–RG2 (operator decisions
+  D1–D4): the engine measures the regime itself, the AI declares, the
+  effective word gates members without a table flip.
+
+**Impact**
+
+- On-disk formats: two new DATA files under `~/multivenue/`
+  (`regime.toml` — operator-authored from `regime.toml.example`;
+  `regime-seed.tsv` — worker-generated, atomic write). Neither is in git.
+- Config keys: `regime.toml` grammar per `regime.toml.example`
+  (integer-only TOML subset; unknown/missing/duplicate keys refuse the
+  boot).
+- Wire formats: none beyond RG0's kind 12.
+- Behaviour: NONE until `~/multivenue/regime.toml` exists. With it and
+  no `[labels.*]`, every coded member stays unconstrained (ANY) — the
+  detector only measures and publishes.
+
+**Migration steps**
+
+1. `cargo build --release -p cli` (G0 relink) before the next boot.
+2. Optional: `cp regime.toml.example ~/multivenue/regime.toml` and edit
+   `[breadth] members` to descriptors present in `universe.toml`.
+3. Restart the standing engine; check the boot tells and
+   `engine_regime_configured`.
+
+**Rollback**
+
+- Remove `~/multivenue/regime.toml` (detector unconfigured, no
+  behaviour change) or revert the commit. The seed file is inert
+  without an artifact.
+
+## 2026-09-03 — `AiCmdKind::SetRegime = 12` + `RuleRowV2` regime tail (RG0 — regime wire freeze)
+
+**What changed**
+
+- `core_types::regime` (new module): `RegimeWord` (one byte per
+  dimension, one-hot; bit 7 of each market byte = the per-dimension
+  UNKNOWN mark; byte map in `docs/wire-format.md`), `RegimeLabel`
+  (any subset per byte; `0` = unconstrained; gate `label == 0 || (word &
+  label) == word`; omitted dimensions fill with the legal mask incl.
+  the unknown mark, explicit lists exclude it — fail-closed per
+  dimension), `RegimeRel` (per-symbol RELATIVE nibbles),
+  `RegimeTerm` / `RegimeLabelSet` (≤ 4 product terms, ∃-semantics, for
+  coded members), the rule-8 `intersects` law, and the text grammar
+  `[fast:|slow:]dim:(*|!v|v1|v2…)` (`parse_label_term`,
+  `RegimeLabelBuilder`). `REGIME_PROFILES = 2` is a layout constant.
+- `AiCmdKind` gains **`SetRegime = 12`** (append-only ABI; the first
+  unassigned byte is now 13) with its `validate_shape` arm: `param_id`
+  = profile `< 2`, `px` = declared word (SOURCE byte empty), `qty` = 0
+  or a state word, `ttl_ns > 0` ENFORCED, `strategy_id = 0xFF`, sym/side
+  none, flags bit 0 legal. `frames.py` mirrors it (`KIND_SET_REGIME`,
+  `regime_word()` helpers); the shared golden fixture gains vectors for
+  kinds 10, 11 and 12 (it stopped at 9 before).
+- `RuleRowV2` spends 18 of its 40 reserved tail bytes: `regime_fast:
+  u64` @88, `regime_slow: u64` @96, `regime_off: u8` @104, `regime_rel:
+  u8` @105; `_pad3` shrinks to `[u8; 22]` @106. Still 128 B; `ver`
+  stays 2; `RuleRowV2::new` keeps its 23-argument shape (tail zero);
+  `with_regime(term, off)` sets the tail; `regime_fields_well_formed()`
+  is the rule-11 body (RG3 wires it into the validator).
+- `audit-replay`'s AI-command table is sized by the last kind (13
+  labels) — it indexed out of bounds on any captured seed (kinds 10/11)
+  before.
+
+**Why**
+
+- `docs/regime-and-dashboard-plan.md` (operator decisions D1–D4): the
+  regime is a gate; VM rows carry their own per-profile masks so a
+  regime change never flips a table; the AI declares a word per
+  profile through the existing AI plane.
+
+**Impact**
+
+- On-disk formats: none (`RuleRowV2` never crosses a process boundary;
+  PMLR `slot_kind = 4` records keep their 64 B shape — kind 12 is a new
+  value in an existing byte).
+- Config keys: none yet (`regime.toml` arrives with RG2; the example
+  file is committed now).
+- Wire formats: `AiCmd` kind byte 12 admitted; a pre-RG0 engine counts
+  it as malformed (`engine_ingress_ai_malformed_total`) and drops it —
+  no crash, no ring push.
+- Every existing ruleset artifact validates to bit-identical rows
+  (both masks 0); nothing is gated until a row carries a `regimes` key
+  (RG3 grammar).
+
+**Migration steps**
+
+1. `cargo build --release -p cli` before any live boot (G0 relink law).
+2. Nothing else — no artifact, DB, or capture changes.
+
+**Rollback**
+
+- Revert the commit; the ABI is append-only so no captured file needs
+  rewriting. A worker that sends kind 12 to a reverted engine sees the
+  frame counted as malformed.
+
 ## 2026-09-03 — `Order.ttl_ns` (wire-additive) + the IoC taker fill law + fee ladder (ICDP I1)
 
 **What changed**

@@ -1,0 +1,19 @@
+[package]
+name         = "core-regime"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Market-regime evaluator: minute-close rings + the integer regime law (trend/shape/vol/funding/stretch/relative) with hysteresis and the declared-over-measured effective law. Zero-alloc after boot."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-time  = { workspace = true }
+core-types = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

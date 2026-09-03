@@ -9,6 +9,7 @@ authors.workspace      = true
 description  = "Ruleset-VM strategy: zero-alloc evaluation of the operator-committed RuleTable (Phase 8g §7)"
 
 [dependencies]
+core-regime   = { workspace = true }
 book-builder  = { workspace = true }
 core-time     = { workspace = true }
 core-types    = { workspace = true }

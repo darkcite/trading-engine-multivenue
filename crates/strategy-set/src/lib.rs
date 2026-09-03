@@ -77,13 +77,20 @@
     clippy::undocumented_unsafe_blocks
 )]
 
-use core_time::NsTs;
+use core_regime::{
+    RegimeErr, RegimeParams, RegimeState, SeedRow, RAW_ER, RAW_RET, RAW_RV, RAW_STRETCH,
+};
+use core_time::{NsTs, WallAnchor};
+use core_types::regime::REL_UNKNOWN;
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, RuleTableV2, Signal, Tick, STRATEGY_SLOT_AI_EXEC,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, RegimeLabelSet, RegimeWord,
+    RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_PROFILES, STRATEGY_SLOT_AI_EXEC,
     STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
-use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+use strategy_core::{
+    Ctx, RegimeCounters, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr,
+};
 use strategy_cross_arb::CrossArb;
 use strategy_ev::EvStrategy;
 use strategy_icdp::IcdpStrategy;
@@ -201,7 +208,24 @@ pub struct StrategySet {
     /// Refused `EnableStrategy` commands (halted or reserved/unknown
     /// slot). Mirrored to `engine_ai_enable_refused_total`.
     enable_refused: u64,
+    /// RG2: the regime detector (boot-boxed; inert until
+    /// [`Self::configure_regime`] — every word UNKNOWN, every gate open
+    /// for the unconstrained members that exist today).
+    regime: Box<RegimeState>,
+    /// RG2: per-slot label sets, pulled from the members at configure
+    /// time (or overridden from `regime.toml [labels.*]`).
+    regime_labels: [RegimeLabelSet; 8],
+    /// RG2: per-slot current gate.
+    regime_gates: [RegimeGate; 8],
+    /// RG2: `SetRegime` commands applied.
+    regime_declared_total: u64,
+    /// RG2: gate edges fanned out (`on_regime` calls).
+    regime_gate_changes: u64,
 }
+
+/// RG2: the set's timer cadence once a detector is configured — the
+/// regime rolls once per wall minute, the timer polls for the boundary.
+pub const REGIME_TIMER_NS: u64 = 1_000_000_000;
 
 impl StrategySet {
     /// Build the set with all members default-constructed and the
@@ -224,6 +248,168 @@ impl StrategySet {
             initial: m,
             halted: false,
             enable_refused: 0,
+            regime: RegimeState::new_boxed(),
+            regime_labels: [RegimeLabelSet::ANY; 8],
+            regime_gates: [RegimeGate::OPEN_UNKNOWN; 8],
+            regime_declared_total: 0,
+            regime_gate_changes: 0,
+        }
+    }
+
+    // ---- RG2: regime detector (plan §4.2) ----------------------------
+
+    /// Boot: install the detector's parameters (descriptors already
+    /// resolved by the cli), anchor its minute clock at `now`, and pull
+    /// every member's label. Refuses (detector untouched) on invalid
+    /// params. Gates are re-judged on the next timer tick / seed.
+    pub fn configure_regime(
+        &mut self,
+        params: &RegimeParams,
+        anchor: WallAnchor,
+        now: NsTs,
+    ) -> Result<(), RegimeErr> {
+        self.regime.configure(params, anchor, now)?;
+        self.pull_regime_labels();
+        // Fail-closed from the first instant: a labelled member stays
+        // shut until the regime is known (seed or live warm-up).
+        self.judge_gates_silently();
+        Ok(())
+    }
+
+    /// Boot: seed the detector's rings (plan §4.3) and re-judge the
+    /// gates at once — silently (no member callbacks: nothing has run
+    /// yet; `on_start` members see the current gate through
+    /// [`Self::regime_gate`]). Returns rows applied.
+    pub fn seed_regime(&mut self, rows: &[SeedRow], now: NsTs) -> u32 {
+        let applied = self.regime.seed(rows);
+        let _ = self.regime.refresh_effective(now);
+        self.judge_gates_silently();
+        applied
+    }
+
+    /// Boot: override one coded member's label from
+    /// `regime.toml [labels.<member>]`. `false` when the slot is not a
+    /// coded member or the member cannot be relabelled.
+    pub fn set_regime_label(&mut self, slot: u8, set: RegimeLabelSet) -> bool {
+        let ok = match slot {
+            SLOT_LATENCY_ARB => self.latency_arb.set_regime_label(set),
+            SLOT_EV => self.ev.set_regime_label(set),
+            SLOT_CROSS_ARB => self.cross_arb.set_regime_label(set),
+            SLOT_RULE_TREE => self.rule_tree.set_regime_label(set),
+            SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
+            SLOT_ICDP => self.icdp.set_regime_label(set),
+            _ => false,
+        };
+        if ok {
+            self.regime_labels[slot as usize] = set;
+        }
+        ok
+    }
+
+    /// The detector (cli: boot tells, `/state`; tests).
+    #[inline]
+    pub fn regime(&self) -> &RegimeState {
+        &self.regime
+    }
+
+    /// The current gate of `slot` (open for unconstrained members).
+    #[inline]
+    pub fn regime_gate(&self, slot: u8) -> RegimeGate {
+        if slot < 8 {
+            self.regime_gates[slot as usize]
+        } else {
+            RegimeGate::OPEN_UNKNOWN
+        }
+    }
+
+    /// The label set of `slot`.
+    #[inline]
+    pub fn regime_label_of(&self, slot: u8) -> RegimeLabelSet {
+        if slot < 8 {
+            self.regime_labels[slot as usize]
+        } else {
+            RegimeLabelSet::ANY
+        }
+    }
+
+    fn pull_regime_labels(&mut self) {
+        self.regime_labels[SLOT_LATENCY_ARB as usize] = self.latency_arb.regime_label();
+        self.regime_labels[SLOT_EV as usize] = self.ev.regime_label();
+        self.regime_labels[SLOT_CROSS_ARB as usize] = self.cross_arb.regime_label();
+        self.regime_labels[SLOT_RULE_TREE as usize] = self.rule_tree.regime_label();
+        self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
+        self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
+        self.regime_labels[SLOT_ICDP as usize] = self.icdp.regime_label();
+        self.regime_labels[7] = RegimeLabelSet::ANY;
+    }
+
+    /// The gate verdict for `slot` on the current effective words.
+    /// Coded members are not per-symbol: REL is judged as unknown,
+    /// which the `regime.toml` grammar keeps unconstrained for them.
+    #[inline]
+    fn judge_slot(&self, slot: usize) -> RegimeGate {
+        let mut eff = [RegimeWord::UNKNOWN; 4];
+        let mut p = 0u8;
+        while (p as usize) < REGIME_PROFILES {
+            eff[p as usize] = self.regime.effective(p);
+            p += 1;
+        }
+        let set = self.regime_labels[slot];
+        let open = set.allows(eff[0], eff[1], REL_UNKNOWN, REL_UNKNOWN);
+        RegimeGate::new(eff, open, set.off)
+    }
+
+    /// Re-judge every slot without member callbacks (boot / seed).
+    fn judge_gates_silently(&mut self) {
+        let mut slot = 0usize;
+        while slot < 8 {
+            self.regime_gates[slot] = self.judge_slot(slot);
+            slot += 1;
+        }
+    }
+
+    /// Re-judge every slot and fan `on_regime` out to the ENABLED
+    /// members whose verdict flipped (edge-triggered; a disabled
+    /// member's stored gate still updates and is delivered by
+    /// [`Self::enable_slot`] when it comes back).
+    fn refresh_gates<C: Ctx>(&mut self, ctx: &mut C) {
+        let mut slot = 0usize;
+        while slot < 8 {
+            let next = self.judge_slot(slot);
+            let prev = self.regime_gates[slot];
+            self.regime_gates[slot] = next;
+            if next.open != prev.open && self.enabled & (1u8 << slot) != 0 {
+                self.regime_gate_changes = self.regime_gate_changes.wrapping_add(1);
+                self.deliver_gate(slot as u8, next, ctx);
+            }
+            slot += 1;
+        }
+    }
+
+    fn deliver_gate<C: Ctx>(&mut self, slot: u8, gate: RegimeGate, ctx: &mut C) {
+        match slot {
+            SLOT_LATENCY_ARB => self
+                .latency_arb
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB)),
+            SLOT_EV => self
+                .ev
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_EV)),
+            SLOT_CROSS_ARB => self
+                .cross_arb
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB)),
+            SLOT_RULE_TREE => self
+                .rule_tree
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE)),
+            SLOT_AI_EXEC => self
+                .ai_exec
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
+            SLOT_VM => self
+                .vm
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
+            SLOT_ICDP => self
+                .icdp
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_ICDP)),
+            _ => {}
         }
     }
 
@@ -330,6 +516,16 @@ impl StrategySet {
         self.enabled |= bit;
     }
 
+    /// RG2: a member coming back through Enable receives its CURRENT
+    /// gate (its own state may be stale from before the disable).
+    #[inline]
+    fn sync_gate_on_enable<C: Ctx>(&mut self, slot: u8, ctx: &mut C) {
+        if slot < 8 && self.enabled & (1u8 << slot) != 0 {
+            let gate = self.regime_gates[slot as usize];
+            self.deliver_gate(slot, gate, ctx);
+        }
+    }
+
     /// Set-level `DisableStrategy` handling — always honored. Bits
     /// outside `BUILT_MASK` are never set, so clearing them is a
     /// no-op by construction.
@@ -413,6 +609,47 @@ impl StrategyCounters for StrategySet {
     fn icdp_counters(&self) -> strategy_core::IcdpCounters {
         self.icdp.icdp_counters()
     }
+    /// RG2: the detector's observables + per-slot gates.
+    fn regime_counters(&self) -> RegimeCounters {
+        let mut c = RegimeCounters::default();
+        c.configured = u8::from(self.regime.is_configured());
+        let mut p = 0u8;
+        while (p as usize) < REGIME_PROFILES {
+            let i = p as usize;
+            c.measured[i] = self.regime.measured(p);
+            c.declared[i] = self.regime.declared(p);
+            c.effective[i] = self.regime.effective(p);
+            c.declared_ts_ns[i] = self.regime.declared_ts(p);
+            c.declared_ttl_ns[i] = self.regime.declared_ttl(p);
+            let mut d = 0u8;
+            while d < 8 {
+                c.flips[i][d as usize] = self.regime.flips(p, d);
+                d += 1;
+            }
+            c.disagree[i] = self.regime.disagree(p);
+            let raw = self.regime.raw(p);
+            c.raw[i] = [raw.ret_bps_1e9, raw.er_1e9, raw.rv_bps_1e9, raw.stretch_1e9];
+            c.raw_present[i] = raw.present & (RAW_RET | RAW_ER | RAW_RV | RAW_STRETCH);
+            p += 1;
+        }
+        let mut slot = 0usize;
+        while slot < 8 {
+            let g = self.regime_gates[slot];
+            c.gates[slot] = if g.open {
+                0
+            } else if g.off == REGIME_OFF_HARD {
+                2
+            } else {
+                1
+            };
+            slot += 1;
+        }
+        c.minutes_judged = self.regime.minutes_judged();
+        c.seed_rows = u64::from(self.regime.seed_rows());
+        c.declared_total = self.regime_declared_total;
+        c.gate_changes = self.regime_gate_changes;
+        c
+    }
 }
 
 /// M4.1 M-c: per-member attribution adapter. Wraps the engine ctx for
@@ -486,6 +723,9 @@ impl Strategy for StrategySet {
 
     #[inline(always)]
     fn on_tick<C: Ctx>(&mut self, tick: &Tick, ctx: &mut C) {
+        // RG2: the detector sees every fresh tick first (one probe +
+        // one store for members, one probe for everything else).
+        self.regime.on_tick(tick);
         if self.enabled & BIT_LATENCY_ARB != 0 {
             self.latency_arb
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
@@ -552,7 +792,17 @@ impl Strategy for StrategySet {
     /// ticks/signals — the member sees the same defaulted no-op until
     /// it opts in, and submits (if it ever does) are slot-stamped.
     #[inline(always)]
-    fn on_venue_event<C: Ctx>(&mut self, event: &core_types::ChannelEvent, ctx: &mut C) {
+    fn on_venue_event<C: Ctx>(&mut self, event: &ChannelEvent, ctx: &mut C) {
+        // RG2: the funding reference's prints feed the detector
+        // (Funding on every venue; Hyperliquid rides AssetCtx, whose
+        // `v0` is the rate — the vm feature engine's law).
+        if event.sym == self.regime.params().fund_ref
+            && self.regime.is_configured()
+            && (event.channel == ChannelId::Funding as u8
+                || event.channel == ChannelId::AssetCtx as u8)
+        {
+            self.regime.on_funding(event.v0, event.venue_time_ms);
+        }
         if self.enabled & BIT_LATENCY_ARB != 0 {
             self.latency_arb
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
@@ -688,7 +938,11 @@ impl Strategy for StrategySet {
     fn on_ai<C: Ctx>(&mut self, cmd: &AiCmd, ctx: &mut C) {
         match cmd.kind() {
             Some(AiCmdKind::EnableStrategy) => {
+                let before = self.enabled;
                 self.enable_slot(cmd.strategy_id);
+                if self.enabled != before {
+                    self.sync_gate_on_enable(cmd.strategy_id, ctx);
+                }
                 return;
             }
             Some(AiCmdKind::DisableStrategy) => {
@@ -700,6 +954,27 @@ impl Strategy for StrategySet {
                 // restart. No Resume exists on the wire.
                 self.halted = true;
                 self.enabled = 0;
+                return;
+            }
+            Some(AiCmdKind::SetRegime) => {
+                // RG2 §4.4: set-level — declare one profile's word
+                // (shape-checked upstream: SOURCE empty, ttl > 0,
+                // profile < REGIME_PROFILES). Effective words and gates
+                // re-judge at once; never fanned out. The declaration
+                // is bounded by its TTL only (the expire-on-silence
+                // flag is accepted on the wire and honoured by the
+                // TTL law in RG2 — heartbeat-bound expiry is RG3+).
+                let now = ctx.now_ns();
+                self.regime.set_declared(
+                    cmd.param_id as u8,
+                    RegimeWord(cmd.px as u64),
+                    now,
+                    cmd.ttl_ns,
+                );
+                self.regime_declared_total = self.regime_declared_total.wrapping_add(1);
+                if self.regime.refresh_effective(now) != 0 {
+                    self.refresh_gates(ctx);
+                }
                 return;
             }
             // Unknown kinds cannot reach here (ingress + drain-site
@@ -749,6 +1024,11 @@ impl Strategy for StrategySet {
 
     #[inline(always)]
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
+        // RG2: roll the minute clock (nothing until a boundary) and
+        // re-judge the gates only when an effective word changed.
+        if self.regime.on_timer(now_ns) != 0 {
+            self.refresh_gates(ctx);
+        }
         if self.enabled & BIT_LATENCY_ARB != 0 {
             self.latency_arb
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
@@ -781,10 +1061,19 @@ impl Strategy for StrategySet {
 
     /// Minimum over the BUILT members (mask-independent so the
     /// engine's timer arming is stable across runtime Enable/Disable;
-    /// `on_timer` itself fans out to enabled members only). All six
-    /// members currently return `u64::MAX` (disabled).
+    /// `on_timer` itself fans out to enabled members only). All seven
+    /// members currently return `u64::MAX` (disabled); a configured
+    /// regime detector arms the 1 s [`REGIME_TIMER_NS`] poll.
     fn timer_period_ns(&self) -> u64 {
-        let mut min = self.latency_arb.timer_period_ns();
+        let mut min = if self.regime.is_configured() {
+            REGIME_TIMER_NS
+        } else {
+            u64::MAX
+        };
+        let v = self.latency_arb.timer_period_ns();
+        if v < min {
+            min = v;
+        }
         let v = self.ev.timer_period_ns();
         if v < min {
             min = v;
@@ -826,8 +1115,7 @@ impl Strategy for StrategySet {
         self.ai_exec
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
-        self.icdp
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        self.icdp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_ICDP));
     }
 }
 
@@ -1540,5 +1828,283 @@ mod tests {
             "staged survived the disabled window"
         );
         assert_eq!(s.vm().rows_active(), 1);
+    }
+
+    // ---------------- RG2: regime detector + gates ----------------
+
+    mod regime_gates {
+        use super::*;
+        use core_regime::{ProfileParams, RegimeParams, SeedRow, MINUTE_NS, REGIME_MAX_MEMBERS};
+        use core_types::regime::{
+            RegimeLabelBuilder, DIM_TREND, SOURCE_DECLARED, SOURCE_MEASURED, TREND_BEAR, TREND_BULL,
+        };
+        use core_types::{RegimeTerm, REGIME_OFF_SOFT};
+        use strategy_core::RegimeCounters;
+
+        const BTC: SymbolId = make_symbol_id(VenueId::Binance, 100);
+        const ETH: SymbolId = make_symbol_id(VenueId::Binance, 101);
+        const T0: NsTs = 1_000_000_000_000;
+        const WALL0: u64 = 1_800_000_000 * 1_000_000_000;
+
+        fn params() -> RegimeParams {
+            let mut members = [SYMBOL_ID_NONE; REGIME_MAX_MEMBERS];
+            members[0] = ETH;
+            let mut fast = ProfileParams::FAST_DEFAULT;
+            fast.trend_w_min = 10;
+            fast.shape_w_min = 10;
+            fast.vol_w_min = 10;
+            fast.stretch_w_min = 10;
+            fast.rel_w_min = 10;
+            let mut slow = fast;
+            slow.trend_w_min = 20;
+            slow.shape_w_min = 20;
+            slow.vol_w_min = 20;
+            slow.stretch_w_min = 20;
+            slow.rel_w_min = 20;
+            RegimeParams::new(BTC, BTC, members, 1, 1, [fast, slow])
+        }
+
+        fn bull_label(off: u8) -> RegimeLabelSet {
+            let mut b = RegimeLabelBuilder::new();
+            b.add(b"fast:trend:bull").unwrap();
+            RegimeLabelSet::from_terms(&[b.finish()], off).unwrap()
+        }
+
+        fn uptrend_seed(minute0: i64) -> Vec<SeedRow> {
+            let mut rows = Vec::new();
+            let mut k = 0i64;
+            while k < 40 {
+                let m = minute0 - 40 + k;
+                rows.push(SeedRow::new(BTC, m, 100_000_000 + k * 200_000));
+                rows.push(SeedRow::new(ETH, m, 3_000_000_000 + k * 6_000_000));
+                k += 1;
+            }
+            rows
+        }
+
+        fn hb_at(ts: u64) -> AiCmd {
+            AiCmd::new(
+                ts,
+                1,
+                SYMBOL_ID_NONE,
+                0,
+                0,
+                0,
+                AiCmdKind::Heartbeat,
+                VenueId::Ai,
+                STRATEGY_SLOT_NONE,
+                AI_SIDE_NONE,
+                0,
+                0,
+            )
+        }
+
+        fn set_regime_cmd(ts: u64, profile: u16, word: RegimeWord, ttl: u64) -> AiCmd {
+            AiCmd::new(
+                ts,
+                1,
+                SYMBOL_ID_NONE,
+                word.0 as i64,
+                0,
+                ttl,
+                AiCmdKind::SetRegime,
+                VenueId::Ai,
+                STRATEGY_SLOT_NONE,
+                AI_SIDE_NONE,
+                profile,
+                0,
+            )
+        }
+
+        #[test]
+        fn unconfigured_detector_is_inert_and_open() {
+            let mut s = StrategySet::new(BIT_AI_EXEC);
+            let mut c = ctx();
+            s.on_start(&mut c).unwrap();
+            assert_eq!(s.timer_period_ns(), u64::MAX);
+            assert!(s.regime_gate(SLOT_AI_EXEC).open);
+            assert!(s.regime_gate(9).open);
+            let k = s.regime_counters();
+            assert_eq!(k, RegimeCounters::default());
+            // Ticks and timers are harmless.
+            s.on_tick(
+                &tick(VenueId::Binance, BTC, 100_000_000, 100_001_000),
+                &mut c,
+            );
+            s.on_timer(c.now, &mut c);
+            assert_eq!(s.regime_counters().configured, 0);
+            // Labels of unconstrained members are ANY; the vm and the
+            // reserved slot cannot be relabelled.
+            assert_eq!(s.regime_label_of(SLOT_AI_EXEC), RegimeLabelSet::ANY);
+            assert!(!s.set_regime_label(SLOT_VM, bull_label(REGIME_OFF_SOFT)));
+            assert!(!s.set_regime_label(7, bull_label(REGIME_OFF_SOFT)));
+            assert!(s.set_regime_label(SLOT_AI_EXEC, bull_label(REGIME_OFF_SOFT)));
+            assert_eq!(s.regime_label_of(SLOT_AI_EXEC), bull_label(REGIME_OFF_SOFT));
+        }
+
+        #[test]
+        fn labelled_member_is_closed_until_the_regime_is_known_then_gated_edge_triggered() {
+            let mut s = StrategySet::new(BIT_AI_EXEC);
+            let mut c = ctx();
+            c.now = T0;
+            assert!(s.set_regime_label(SLOT_AI_EXEC, bull_label(REGIME_OFF_SOFT)));
+            let anchor = WallAnchor::new(T0, WALL0);
+            s.configure_regime(&params(), anchor, T0).unwrap();
+            assert_eq!(s.timer_period_ns(), REGIME_TIMER_NS);
+            assert_eq!(s.regime_counters().configured, 1);
+            // The label survives configure (pulled from the member).
+            assert_eq!(s.regime_label_of(SLOT_AI_EXEC), bull_label(REGIME_OFF_SOFT));
+            // Nothing known yet ⇒ a labelled member is closed (fail-closed).
+            s.on_timer(T0, &mut c);
+            assert!(!s.regime_gate(SLOT_AI_EXEC).open);
+            assert_eq!(s.regime_counters().gates[SLOT_AI_EXEC as usize], 1);
+            s.on_start(&mut c).unwrap();
+            // Seed an uptrend ⇒ BULL measured ⇒ gate opens silently at boot.
+            let minute0 = s.regime().minute();
+            let applied = s.seed_regime(&uptrend_seed(minute0), T0);
+            assert_eq!(applied, 80);
+            assert!(s.regime_gate(SLOT_AI_EXEC).open);
+            assert_eq!(
+                s.regime_counters().gate_changes,
+                0,
+                "boot judgement is silent"
+            );
+            assert_eq!(
+                s.regime_counters().effective[0].value_of(DIM_TREND),
+                Some(TREND_BULL)
+            );
+            assert_eq!(
+                s.regime_counters().effective[0].source(),
+                1 << SOURCE_MEASURED
+            );
+            // The ai-exec honours an intent while open (heartbeat first —
+            // the §5.4 liveness law).
+            s.on_ai(&hb_at(T0 + 1), &mut c);
+            s.on_ai(&intent_cmd(T0 + 2, PM, 430_000, 2_000_000), &mut c);
+            assert_eq!(s.ai_exec_mut().intents_honored, 1);
+            // A declaration of TREND=bear closes it at once (edge → on_regime).
+            let bear = RegimeWord::EMPTY.with_dim(DIM_TREND, TREND_BEAR);
+            s.on_ai(&set_regime_cmd(T0 + 3, 0, bear, 5 * MINUTE_NS), &mut c);
+            assert!(!s.regime_gate(SLOT_AI_EXEC).open);
+            assert_eq!(s.regime_counters().gate_changes, 1);
+            assert_eq!(s.regime_counters().declared_total, 1);
+            assert_eq!(
+                s.regime_counters().effective[0].source(),
+                1 << SOURCE_DECLARED
+            );
+            assert_eq!(s.regime_counters().declared[0], bear);
+            assert_eq!(
+                s.regime_counters().declared_ts_ns[0],
+                T0,
+                "stamped with the ctx clock"
+            );
+            assert_eq!(s.regime_counters().declared_ttl_ns[0], 5 * MINUTE_NS);
+            s.on_ai(&intent_cmd(T0 + 4, PM, 430_000, 2_000_000), &mut c);
+            assert_eq!(
+                s.ai_exec_mut().intents_honored,
+                1,
+                "closed gate refuses the entry"
+            );
+            assert_eq!(s.ai_exec_mut().intents_refused_regime, 1);
+            // A second identical declaration is not an edge.
+            s.on_ai(&set_regime_cmd(T0 + 5, 0, bear, 5 * MINUTE_NS), &mut c);
+            assert_eq!(s.regime_counters().gate_changes, 1);
+            // TTL expiry reopens (edge again) — the market keeps
+            // trending up meanwhile (a silent feed would leave TREND
+            // unknown-marked and the gate closed: fail-closed).
+            let mut k = 0i64;
+            while k < 6 {
+                c.now = T0 + (k as u64 + 1) * MINUTE_NS;
+                let btc = 108_000_000 + k * 200_000;
+                s.on_tick(&tick(VenueId::Binance, BTC, btc - 500, btc + 500), &mut c);
+                let eth = 3_240_000_000 + k * 6_000_000;
+                s.on_tick(&tick(VenueId::Binance, ETH, eth - 500, eth + 500), &mut c);
+                s.on_timer(c.now + 1_000_000, &mut c);
+                k += 1;
+            }
+            assert!(s.regime_gate(SLOT_AI_EXEC).open);
+            assert_eq!(s.regime_counters().gate_changes, 2);
+            s.on_ai(&hb_at(c.now), &mut c);
+            s.on_ai(&intent_cmd(c.now + 1, PM, 430_000, 2_000_000), &mut c);
+            assert_eq!(s.ai_exec_mut().intents_honored, 2);
+            assert!(
+                s.regime_counters().minutes_judged >= 6,
+                "the timer rolled the minutes"
+            );
+        }
+
+        #[test]
+        fn disabled_member_gets_its_gate_when_enabled() {
+            // ai-exec starts disabled; the regime turns bearish while
+            // it is off; Enable must hand it the CURRENT (closed) gate.
+            let mut s = StrategySet::new(BIT_VM);
+            let mut c = ctx();
+            c.now = T0;
+            assert!(s.set_regime_label(SLOT_AI_EXEC, bull_label(REGIME_OFF_SOFT)));
+            s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                .unwrap();
+            s.on_start(&mut c).unwrap();
+            let minute0 = s.regime().minute();
+            s.seed_regime(&uptrend_seed(minute0), T0);
+            assert!(s.regime_gate(SLOT_AI_EXEC).open);
+            let bear = RegimeWord::EMPTY.with_dim(DIM_TREND, TREND_BEAR);
+            s.on_ai(&set_regime_cmd(T0 + 3, 0, bear, 5 * MINUTE_NS), &mut c);
+            assert!(!s.regime_gate(SLOT_AI_EXEC).open);
+            assert_eq!(s.regime_counters().gate_changes, 0, "disabled: no callback");
+            s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_AI_EXEC), &mut c);
+            s.on_ai(&hb_at(T0 + 3), &mut c);
+            s.on_ai(&intent_cmd(T0 + 4, PM, 430_000, 2_000_000), &mut c);
+            assert_eq!(
+                s.ai_exec_mut().intents_refused_regime,
+                1,
+                "enabled into a closed gate"
+            );
+        }
+
+        #[test]
+        fn funding_reference_events_reach_the_detector() {
+            let mut s = StrategySet::new(BIT_AI_EXEC);
+            let mut c = ctx();
+            c.now = T0;
+            s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                .unwrap();
+            s.on_start(&mut c).unwrap();
+            let ev = ChannelEvent::new(
+                T0 + 1,
+                VenueId::Binance,
+                ChannelId::Funding,
+                BTC,
+                7,
+                1_700_000_000_000,
+                -25_000,
+                0,
+            );
+            s.on_venue_event(&ev, &mut c);
+            assert_eq!(s.regime().funding(), (-25_000, 1_700_000_000_000));
+            // Another symbol's funding is ignored.
+            let other = ChannelEvent::new(
+                T0 + 2,
+                VenueId::Binance,
+                ChannelId::Funding,
+                ETH,
+                8,
+                1_700_000_001_000,
+                99,
+                0,
+            );
+            s.on_venue_event(&other, &mut c);
+            assert_eq!(s.regime().funding(), (-25_000, 1_700_000_000_000));
+        }
+
+        #[test]
+        fn term_and_word_helpers_compile_in_the_set() {
+            let t = RegimeTerm::ANY;
+            assert!(t.allows(
+                RegimeWord::UNKNOWN,
+                RegimeWord::UNKNOWN,
+                REL_UNKNOWN,
+                REL_UNKNOWN
+            ));
+        }
     }
 }

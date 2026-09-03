@@ -40,6 +40,22 @@ fi
 ( cd claude-worker && uv run python -m claude_worker.universe_refresh ) ||
   echo "engine-wrapper: universe refresh failed — booting with existing universe.toml" >&2
 
+# RG2 (docs/regime-and-dashboard-plan.md §4.3): the regime detector's
+# warm-up seed — the last ~25 h of 1-minute closes of the artifact's
+# reference + breadth members, exported from candles.db right before
+# the boot so the `slow` profile is judged from the first minute
+# (three restarts a day would otherwise leave it blind for hours).
+# Best-effort: no artifact ⇒ nothing to export; a failed export leaves
+# a stale or absent seed and the engine warms live (boot tell
+# `regime: seed absent`). The seed is DERIVED data (candles), never a
+# capture window — the ≤ 2 h capture-window law is untouched.
+if [ -f "$HOME/multivenue/regime.toml" ]; then
+  ( cd claude-worker && uv run python -m claude_worker.regime seed-out \
+      --regime "$HOME/multivenue/regime.toml" \
+      --out "$HOME/multivenue/regime-seed.tsv" ) ||
+    echo "engine-wrapper: regime seed export failed — the detector warms live" >&2
+fi
+
 # M5-prep #7b (operator ruling 7(b); remediation plan 2026-08-28): a
 # committed ruleset's table is IN-MEMORY — every boot must re-stage +
 # re-commit the registry's active ruleset or nothing AI-authored
