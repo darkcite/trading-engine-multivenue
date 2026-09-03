@@ -117,7 +117,7 @@ Zero allocation. The offset estimator is 3 × u64 per connection.
 | **VT2** ingress | okx / bybit / deribit / bn-usdm / hl / pm field extraction; bn-spot `aggTrade` sentinel on the same socket; per-connection `off_ms` estimator; flag set at parse | per-venue parser proptest + fuzz target updated; live smoke with `--raw-tap`: delays match `latency_probe` within ±10 ms p50 |
 | **VT3** VM + paper | `features.rs` stale ⇒ ABSENT; paper marks skip stale; metrics | unit tests: a stale tick holds a would-fire row; alloc assertions 0 B/op (the tick path is in the bench) |
 | **VT4** harness | fill.rs stale law; recompute-from-venue-time for v3; `--stale-after-ms`; sidecar + stderr; audit-pnl same; capture-catalog column | the Aug-30 xv window replays with stale-time % printed; filtered-root equivalence still byte-identical on v2 roots |
-| **VT5** proof | 24 h of v3 capture; re-run the xv sweep (`tools_xv_sweep`) on a v3 root with the gate on vs off — the delta IS the stale-blindness cost, recorded in the research vault; `docs/venue-latency.md` gains the engine-side delay p50/p99 per venue | numbers in the vault; CLAUDE.md pitfall added ("a backtest on a v2 root is stale-blind") |
+| **VT5** proof | **≤ 2 h WINDOWS ONLY (operator law 2026-09-03, §6.1).** On a bounded symlink root of ONE ≤ 2 h v3 window: backtest + audit-pnl with the default gate vs `--stale-after-ms <venue>:0` (the delta IS the stale-blindness cost); re-run the xv sweep (`tools_xv_sweep`) gate on vs off on the same window (≥ 30 gate-off modeled fills, else the window is degenerate for xv and another is cut); ICDP I0 re-validation per the vault plan's G1 (pooled windows, §6.1); every number in the research vault; `docs/venue-latency.md` gains the engine-side delay p50/p99 per venue (from `feed_delay_ema_ms` + the harness stale summary) | numbers in the vault; CLAUDE.md pitfall added ("a backtest on a v2 root is stale-blind") |
 | **VT6** close | migration doc, README subcommand notes, this doc's close entry | stay-greens recorded |
 
 Stay-greens at every phase: `cargo nextest run --workspace` · release alloc
@@ -125,6 +125,33 @@ assertions 0 B/op (`--test-threads=1`, fresh bench compile) · worker
 pytest · `make lint` · `make license-check`. Live boots stay
 operator-authorized (G0 relink law); VT2's smoke uses the standing engine
 window after a scheduled restart.
+
+### 6.1 Capture-window law (operator ruling 2026-09-03 — absolute)
+
+**No capture window or data gate may exceed 2 hours.** The earlier "24 h
+of v3 capture" in the VT5 row (and the "≥ 48 h / two disjoint 24 h
+windows" in the vault's merged ICDP×VT plan) is VOID. Phases never wait
+for data; they design the gate around what ≤ 2 h can prove, and pool
+windows that already exist when more is needed.
+
+- **A window** is a contiguous slice of ONE run of at most 2 h by `ts_ns`
+  (slot offset 0, monotonic — `docs/wire-format.md`), materialized as a
+  bounded root by the vault symfilter one-shot (which gains a
+  `--from-s/--to-s` bound relative to the run's first slot; header
+  `epoch_ns` copied byte-for-byte so the harness's directory-name check
+  holds). Whole-run and whole-root replays are out (they also OOM —
+  CLAUDE.md ops debt c).
+- **Pooling** is over DISJOINT windows. Windows may all come from a
+  single run (operator ruling); more runs add independence but are never
+  waited for. A pool is grown by cutting another window from capture
+  that already exists — never by scheduling a capture.
+- **Every gate states its sample in per-window fills / ticks / bars and
+  a window count N**, never in hours. VT5's xv on/off delta: ≥ 30
+  gate-off modeled fills in the window. The ICDP I0 gate G1 (vault plan
+  §5): N ≥ 4 windows, leave-one-window-out cross-fitting, pooled
+  top-decile trade floors — the substance stays in the vault.
+- A v2 window is admissible only for stale-BLIND comparisons (it prints
+  `stale-blind(v2)`); a judged number needs a v3 window.
 
 ## 7. Risks
 
@@ -325,3 +352,17 @@ ruling); the Binance spot book-builder lane; any strategy work.
   Not done here: the Aug-30 xv-window replay (a v2 root — it prints
   `stale-blind(v2)`, which is the point; the gate on/off delta needs the
   VT5 v3 capture).
+- 2026-09-03 — **Capture-window law amendment (operator ruling, absolute):
+  no capture window or data gate may exceed 2 hours.** The VT5 row's
+  "24 h of v3 capture" is VOID and rewritten; new §6.1 states the law
+  (window = ≤ 2 h `ts_ns` slice of one run as a bounded root; pool
+  DISJOINT windows that already exist, single-run pools admissible;
+  gates count per-window fills/ticks/bars + N windows, never hours; v2
+  windows only for stale-blind comparisons). The ICDP I0 gate G1 was
+  re-ruled the same day via AskUserQuestion — shape A: N ≥ 4 disjoint
+  ≤ 2 h v3 windows, leave-one-window-out cross-fitting, 15 s cells gate
+  on pooled top-decile floors, 1 m cells report only (the 2 h yield at
+  1 m is ≈ 11 top-decile trades per instrument-window — un-gateable);
+  substance in the vault's merged ICDP×VT plan §5. CLAUDE.md CURRENT
+  STATE carries the law. Nothing else changed; VT2 live smoke + VT5
+  still wait on the operator's relink + boot (G0).
