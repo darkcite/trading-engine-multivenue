@@ -1314,11 +1314,13 @@ fn run(args: RunArgs) -> ExitCode {
             dated = boot.allocated.bn_dated.len(),
             mark_price = bn_usdm_all,
             eapi_options = discovery.bn_options.len(),
+            stale_after_ms = stale_after_ms[core_types::VenueId::Binance as usize],
             "binance: M1 multi-connection lane"
         );
         match cli::spawn_binance_multi(
             specs,
             tls_config.clone(),
+            stale_after_ms[core_types::VenueId::Binance as usize],
             bn_prod,
             bn_event_prod,
             bn_opt_prod,
@@ -1350,6 +1352,7 @@ fn run(args: RunArgs) -> ExitCode {
             bn_ep,
             tls_config.clone(),
             boot.allocated.bn_spot[0].sym,
+            stale_after_ms[core_types::VenueId::Binance as usize],
             bn_prod,
             bn_event_prod,
             bn_opt_prod,

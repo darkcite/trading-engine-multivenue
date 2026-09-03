@@ -211,3 +211,17 @@ ruling); the Binance spot book-builder lane; any strategy work.
   fresh/stale/fresh sequence, override + reconnect reset. Parser + fuzz
   target unchanged; `deribit_jsonrpc_frame` re-run ≥ 300 s. Remaining:
   bn-usdm, hl, pm, bn-spot sentinel.
+- 2026-09-03 — **VT2 venue 4: Binance (USDS-M direct; spot deferred to
+  the sentinel step).** `BookTickerFrame` gains `venue_time_ms` — `"T"`
+  (transaction time) preferred, `"E"` (event time) fallback, 0 when
+  absent: spot `bookTicker` carries neither, so spot ticks stay
+  "unknown, never stale" until the aggTrade sentinel lands. One
+  `FeedClock` per connection (the M1 multi-conn lane owns one driver per
+  socket; `spawn_binance` / `spawn_binance_multi` apply the threshold to
+  every bookTicker slot; eapi/markPrice slots never judge), reset on
+  reconnect, stamped on the emitted tick, counted + gauge per tick.
+  Tests: parser (T > E > 0, garbage), proptest with the three wire
+  shapes (spot / E only / E+T), run-loop spot-unknown assertion,
+  USDS-M fresh/stale/fresh sequence, override + reconnect reset.
+  `binance_book_ticker` fuzz ≥ 300 s. Remaining: hl, pm, bn-spot
+  sentinel.

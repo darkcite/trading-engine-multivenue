@@ -101,8 +101,16 @@ pub struct BookTickerFrame {
     pub ask_qty_1e6: i64,
     /// Resolved symbol id (`"s"` field mapped at boot).
     pub sym: SymbolId,
+    /// Explicit padding (keeps `venue_time_ms` 8-aligned).
+    _pad0: [u8; 4],
+    /// VT2: venue time of the push in ms — USDS-M `bookTicker` carries
+    /// `"T"` (transaction time, preferred) and `"E"` (event time,
+    /// fallback); SPOT `bookTicker` carries neither ⇒ 0 ("unknown,
+    /// never stale") until the aggTrade sentinel (VT2, last step)
+    /// supplies the connection's stamp.
+    pub venue_time_ms: u64,
     /// Reserved for layout stability (keeps struct at 64 bytes).
-    _pad: [u8; 20],
+    _pad: [u8; 8],
 }
 
 impl BookTickerFrame {
@@ -115,6 +123,7 @@ impl BookTickerFrame {
         bid_qty_1e6: i64,
         ask_px_1e6: i64,
         ask_qty_1e6: i64,
+        venue_time_ms: u64,
     ) -> Self {
         Self {
             update_id,
@@ -123,9 +132,30 @@ impl BookTickerFrame {
             ask_px_1e6,
             ask_qty_1e6,
             sym,
-            _pad: [0; 20],
+            _pad0: [0; 4],
+            venue_time_ms,
+            _pad: [0; 8],
         }
     }
+}
+
+/// VT2: the `bookTicker` venue stamp — `"T"` (transaction time)
+/// preferred, `"E"` (event time) as the fallback, 0 when absent (spot).
+/// Both are bare integers on the wire; the single-letter keys cannot
+/// false-match any other bookTicker field.
+#[inline]
+fn book_ticker_venue_time_ms(buf: &[u8]) -> u64 {
+    if let Some(pos) = find_field(buf, b"\"T\":") {
+        if let Some((ms, _)) = scan_u64(buf, pos) {
+            return ms;
+        }
+    }
+    if let Some(pos) = find_field(buf, b"\"E\":") {
+        if let Some((ms, _)) = scan_u64(buf, pos) {
+            return ms;
+        }
+    }
+    0
 }
 
 /// Parse a Binance `@bookTicker` frame. Zero-alloc. Returns `None` on
@@ -174,6 +204,7 @@ pub fn parse_book_ticker(buf: &[u8], sym: SymbolId) -> Option<BookTickerFrame> {
         bid_qty_1e6,
         ask_px_1e6,
         ask_qty_1e6,
+        book_ticker_venue_time_ms(buf),
     ))
 }
 
@@ -350,6 +381,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_book_ticker_venue_time_prefers_t_then_e_then_zero() {
+        // VT2: spot bookTicker carries no stamp ⇒ 0 ("unknown, never
+        // stale"); USDS-M carries E (event) and T (transaction) ⇒ T
+        // wins; E alone is the fallback; a garbage stamp is 0, never a
+        // parse failure.
+        assert_eq!(parse_book_ticker(SAMPLE_BT, 42).unwrap().venue_time_ms, 0);
+        let usdm = br#"{"e":"bookTicker","u":400900217,"E":1568014460893,"T":1568014460891,"s":"BNBUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}"#;
+        assert_eq!(parse_book_ticker(usdm, 42).unwrap().venue_time_ms, 1_568_014_460_891);
+        let e_only = br#"{"e":"bookTicker","u":1,"E":1568014460893,"s":"X","b":"1.0","B":"1.0","a":"1.0","A":"1.0"}"#;
+        assert_eq!(parse_book_ticker(e_only, 0).unwrap().venue_time_ms, 1_568_014_460_893);
+        let bad = br#"{"u":1,"T":"soon","s":"X","b":"1.0","B":"1.0","a":"1.0","A":"1.0"}"#;
+        assert_eq!(parse_book_ticker(bad, 0).unwrap().venue_time_ms, 0);
+    }
+
+    #[test]
     fn parse_book_ticker_returns_none_on_missing_fields() {
         // Missing "a" price.
         let b = br#"{"u":1,"s":"X","b":"1.0","B":"1.0","A":"1.0"}"#;
@@ -385,12 +431,22 @@ mod proptests {
             bq in 0u32..999_999u32,
             ap in 0u32..999_999u32,
             aq in 0u32..999_999u32,
+            e in 1u64..4_000_000_000_000u64,
+            t in 1u64..4_000_000_000_000u64,
+            shape in 0u8..3u8, // 0 = spot (no stamp), 1 = E only, 2 = E + T
         ) {
-            let mut buf = String::with_capacity(160);
+            let mut buf = String::with_capacity(200);
             use std::fmt::Write;
+            buf.push('{');
+            if shape >= 1 {
+                write!(&mut buf, r#""e":"bookTicker","E":{e},"#).unwrap();
+            }
+            if shape == 2 {
+                write!(&mut buf, r#""T":{t},"#).unwrap();
+            }
             write!(
                 &mut buf,
-                r#"{{"u":{u},"s":"X","b":"0.{bp:06}","B":"0.{bq:06}","a":"0.{ap:06}","A":"0.{aq:06}"}}"#,
+                r#""u":{u},"s":"X","b":"0.{bp:06}","B":"0.{bq:06}","a":"0.{ap:06}","A":"0.{aq:06}"}}"#,
             ).unwrap();
             let f = parse_book_ticker(buf.as_bytes(), 7).unwrap();
             prop_assert_eq!(f.sym, 7);
@@ -399,6 +455,8 @@ mod proptests {
             prop_assert_eq!(f.bid_qty_1e6, bq as i64);
             prop_assert_eq!(f.ask_px_1e6, ap as i64);
             prop_assert_eq!(f.ask_qty_1e6, aq as i64);
+            // VT2: T > E > 0
+            prop_assert_eq!(f.venue_time_ms, match shape { 0 => 0, 1 => e, _ => t });
         }
 
         #[test]

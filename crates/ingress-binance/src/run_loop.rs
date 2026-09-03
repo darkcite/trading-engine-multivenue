@@ -40,8 +40,11 @@ use core_net::{
     ws_write_pong, HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
-use core_time::now_ns;
-use core_types::{Capture, NsTs, OptSummary, Price, Qty, SymbolId, Tick, EVENT_RING_SIZE, OPT_RING_SIZE};
+use core_time::{now_ns, FeedClock};
+use core_types::{
+    Capture, NsTs, OptSummary, Price, Qty, SymbolId, Tick, EVENT_RING_SIZE, OPT_RING_SIZE,
+    TICK_FLAG_STALE,
+};
 
 use crate::parse_book_ticker;
 
@@ -224,6 +227,14 @@ pub struct Driver {
     sym: SymbolId,
     /// Per-slot parse dispatch (M2.4).
     lane: StreamLane,
+    /// VT2: THIS connection's venue-clock offset estimator + staleness
+    /// judge for `bookTicker` (USDS-M `T`/`E`; spot pushes carry no
+    /// stamp and stay "unknown, never stale" until the aggTrade
+    /// sentinel step). One per connection by doctrine — the multi-conn
+    /// lane owns one driver per socket; reset on reconnect; threshold =
+    /// venue default or `--stale-after-ms bn:<ms>` via
+    /// [`Self::set_stale_after_ms`].
+    feed_clock: FeedClock,
     /// `!Sync` marker.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -243,8 +254,23 @@ impl Driver {
             mask_counter: 0,
             sym,
             lane: StreamLane::BookTicker,
+            feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// VT2: override the staleness threshold (operator
+    /// `--stale-after-ms bn:<ms>`). Boot-time only — re-arms the
+    /// estimator unlearned, exactly like a fresh connection.
+    #[inline]
+    pub fn set_stale_after_ms(&mut self, ms: u32) {
+        self.feed_clock = FeedClock::new(ms);
+    }
+
+    /// VT2: this connection's smoothed `bookTicker` feed delay (ms).
+    #[inline]
+    pub fn feed_delay_ema_ms(&self) -> u32 {
+        self.feed_clock.delay_ema_ms()
     }
 
     /// WS5: a `@markPrice` single-stream slot (USDS-M mark/index/
@@ -272,6 +298,9 @@ impl Driver {
             mask_counter: 0,
             sym: 0,
             lane: StreamLane::Eapi(lane),
+            // Options tickers are never judged (no bookTicker on this
+            // slot); the estimator sits idle.
+            feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
         }
     }
@@ -297,6 +326,8 @@ impl Driver {
         self.expected_accept_val = expected_accept(&self.sec_key);
         self.last_activity_ns = 0;
         self.mask_counter = 0;
+        // VT2: a new connection is a new offset; the threshold stays.
+        self.feed_clock.reset();
     }
 }
 
@@ -753,11 +784,15 @@ fn handle_text_frame<C: Capture>(
     capture.raw_frame(now_ns(), payload);
     if let Some(f) = parse_book_ticker(payload, drv.sym) {
         let ts_ns = now_ns();
+        // VT2: one parse-complete stamp serves the judgement and the
+        // tick. Spot pushes carry venue_time 0 ⇒ never stale (the
+        // sentinel step supplies their stamp later).
+        let judged = drv.feed_clock.judge(f.venue_time_ms, ts_ns);
         // `update_id` fits comfortably in u32 over the lifetime of a
         // connection (Binance resets on (re)connect). Truncate for the
         // venue_seq slot; it's only used for monotonicity checks.
         let venue_seq = (f.update_id & 0xFFFF_FFFF) as u32;
-        let tick = Tick::new(
+        let tick = Tick::new_stamped(
             ts_ns,
             core_types::VenueId::Binance,
             f.sym,
@@ -766,7 +801,13 @@ fn handle_text_frame<C: Capture>(
             Qty::from_raw(f.bid_qty_1e6),
             Price::from_raw(f.ask_px_1e6),
             Qty::from_raw(f.ask_qty_1e6),
+            f.venue_time_ms,
+            (judged.stale as u8) * TICK_FLAG_STALE,
         );
+        if judged.stale {
+            status.inc_stale_ticks();
+        }
+        status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
         // §6.5 capture BEFORE the push — a ring-dropped tick must still
         // reach the replay log (the audit pairs capture counts with
         // ring_drops_total).
@@ -1675,6 +1716,10 @@ mod tests {
         assert_eq!(tick.bid_px.raw(), 25_351_900);
         assert_eq!(tick.ask_px.raw(), 25_365_200);
         assert_eq!(tick.venue_seq, 400_900_217u32);
+        // VT2: a SPOT push carries no stamp — unknown, never stale.
+        assert_eq!(tick.venue_time_ms, 0);
+        assert!(!tick.is_stale());
+        assert_eq!(status.stale_ticks_total(), 0);
         assert!(cons.try_pop().is_none());
         // D5 accounting: one parsed message, whole frame counted.
         assert_eq!(status.msgs_total(), 1);
@@ -1682,6 +1727,78 @@ mod tests {
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.ring_drops_total(), 0);
         assert!(status.last_activity_ns() > 0);
+    }
+
+    /// VT2 helper: one USDS-M `bookTicker` push stamped `T = t_ms`
+    /// (`E = t_ms + 2`) through a steady driver; returns its tick.
+    fn push_usdm_book_ticker(
+        t: &mut TestTransport,
+        d: &mut Driver,
+        prod: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
+        cons: &mut core_ring::Consumer<Tick, DEFAULT_TICK_RING_CAP>,
+        status: &core_metrics::IngressStatus,
+        t_ms: u64,
+        u: u64,
+    ) -> Tick {
+        let s = format!(
+            r#"{{"e":"bookTicker","u":{u},"E":{},"T":{t_ms},"s":"BTCUSDT","b":"25.35","B":"31.21","a":"25.36","A":"40.66"}}"#,
+            t_ms + 2
+        );
+        t.inject_incoming(&ws_text_frame(s.as_bytes()));
+        drive_one(t, d, b"host", b"/", prod, status, &mut NullCapture).unwrap();
+        cons.try_pop().expect("bookTicker must produce a tick")
+    }
+
+    #[test]
+    fn usdm_book_ticker_carries_t_and_the_stale_judgement() {
+        // VT2: first stamped push = the offset (fresh); a push whose
+        // transaction time is 5 s older is stale at bn 1000 ms (flag +
+        // counter); a later stamp is fresh again.
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver(7, 42);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let t0: u64 = 1_755_216_000_000;
+
+        let fresh = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0, 1);
+        assert_eq!(fresh.venue_time_ms, t0, "T wins over E (+2)");
+        assert!(!fresh.is_stale());
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        let stale = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 5_000, 2);
+        assert!(stale.is_stale());
+        assert_eq!(stale.flags, TICK_FLAG_STALE);
+        assert_eq!(status.stale_ticks_total(), 1);
+        assert!(status.feed_delay_ema_ms() > 0);
+
+        let again = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0 + 10, 3);
+        assert!(!again.is_stale());
+        assert_eq!(status.stale_ticks_total(), 1);
+        assert_eq!(status.ticks_total(), 3);
+    }
+
+    #[test]
+    fn stale_threshold_override_and_reconnect_reset_apply() {
+        let mut t = TestTransport::with_capacity(16 * 1024);
+        let mut d = build_driver(7, 42);
+        d.set_stale_after_ms(10_000);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let t0: u64 = 1_755_216_000_000;
+        let _ = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0, 1);
+        let five_s = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 5_000, 2);
+        assert!(!five_s.is_stale(), "5 s is under a 10 s threshold");
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        d.reset_for_reconnect(9);
+        d.set_state(State::Steady);
+        let after = push_usdm_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 60_000, 3);
+        assert!(!after.is_stale(), "a reconnect starts a fresh offset");
+        assert_eq!(after.venue_time_ms, t0 - 60_000);
     }
 
     #[test]

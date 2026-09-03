@@ -499,6 +499,7 @@ pub fn spawn_binance(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     sym: core_types::SymbolId,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
@@ -531,6 +532,8 @@ pub fn spawn_binance(
             };
 
             let mut driver = bwl::Driver::new(now_ns(), sym);
+            // VT2: venue default or the operator's `--stale-after-ms bn:<ms>`.
+            driver.set_stale_after_ms(stale_after_ms);
             let mut keepalive = Keepalive::new(BN_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -629,6 +632,7 @@ pub struct BinanceConnSpec {
 pub fn spawn_binance_multi(
     specs: Vec<BinanceConnSpec>,
     tls_config: RustlsConfig,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     mut opt_tx: Producer<OptSummary, OPT_RING_SIZE>,
@@ -700,7 +704,12 @@ pub fn spawn_binance_multi(
                     None if spec.mark_price => {
                         bwl::Driver::new_mark_price(now_ns().wrapping_add(i as u64), spec.sym)
                     }
-                    None => bwl::Driver::new(now_ns().wrapping_add(i as u64), spec.sym),
+                    None => {
+                        let mut d = bwl::Driver::new(now_ns().wrapping_add(i as u64), spec.sym);
+                        // VT2: one estimator per CONNECTION, same threshold.
+                        d.set_stale_after_ms(stale_after_ms);
+                        d
+                    }
                 };
                 conns.push(bwl::MultiConn::new(
                     drv,
