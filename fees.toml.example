@@ -1,0 +1,16 @@
+# ~/multivenue/fees.toml — the operator's fee tier per venue (ICDP I6, D2/D6).
+# DATA, not source: read by `python -m claude_worker.pnl_report --closed-day`
+# (the nightly lane) and passed to `audit-pnl` as `--fee-bps <venue>:<maker>:<taker>`.
+# Integer basis points per side. The harness defaults stay 0/0 and the fee
+# ladder (0 / 1 / 2 bps per side) prints beside the tier regardless, so a
+# number positive only at zero fee is visible as such.
+#
+# D2 (2026-09-03): retail perp tier 2 maker / 5 taker bps; Polymarket 0/0
+# (its CLOB charges no fee today).
+[fees]
+pm = "0:0"
+bn = "2:5"
+okx = "2:5"
+deribit = "2:5"
+hl = "2:5"
+bybit = "2:5"

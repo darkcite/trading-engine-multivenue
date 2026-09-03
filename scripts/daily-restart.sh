@@ -128,15 +128,22 @@ if slot_ready 0020; then
     slot_mark 0020
     (
       cd "$REPO_DIR" || exit 0
-      export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+      # ICDP I6 (2026-09-03): the release dir on PATH — the module spawns
+      # `multivenue-engine` by name (the §14 spawn contract) and launchd's
+      # PATH never carried it: every 0020 run since Aug-23 died with
+      # FileNotFoundError before audit-pnl started (restart.log).
+      export PATH="$REPO_DIR/target/release:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
       if [ -f .env ]; then
         set -a
         . ./.env
         set +a
       fi
       cd claude-worker || exit 0
-      echo "daily-restart: 0020 pnl_report (closed UTC day)" >&2
-      uv run python -m claude_worker.pnl_report >&2 ||
+      echo "daily-restart: 0020 pnl_report (closed UTC day, per-run bounded, fee tier)" >&2
+      # Day mode: one bounded audit-pnl per run of the closed UTC day
+      # (never the whole root — ops debt c), merged into the day pair,
+      # with the operator's tier from ~/multivenue/fees.toml when present.
+      uv run python -m claude_worker.pnl_report --closed-day >&2 ||
         echo "daily-restart: pnl_report failed (non-fatal; tomorrow retries)" >&2
     )
   fi

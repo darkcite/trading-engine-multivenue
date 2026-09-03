@@ -73,6 +73,141 @@ def test_run_once_writes_the_report_pair(tmp_path):
     assert any("strategies=1" in l and "runs=2" in l for l in lines)
 
 
+RUN_JSON = (
+    '{"audit_pnl_version":1,"runs":1,"window":{"wall_first_ns":%d,"wall_last_ns":%d,"utc_days":1},'
+    '"paper":{"fills":0,"net_usd":"0.0"},'
+    '"strategies":[{"strategy_id":6,"label":"icdp","orders":%d,"fills":%d,"trades":%d,'
+    '"trading_days":1,"net_usd":"%s","realized_usd":"0.0","fees_usd":"0.01",'
+    '"markout_usd":"0.0","max_drawdown_usd":"%s","canceled_end":0,"rejected_caps":0,'
+    '"unroutable":0,"ioc_fills":%d,"ioc_canceled":1,"ttl_expired":0,'
+    '"fee_ladder_net_usd":["1.0","0.5","0.0"],"per_day_net_usd":[{"day":0,"net_usd":"%s"}]}],'
+    '"vm_by_ruleset":[{"hash128":"ab","orders":2,"trades":1,"net_usd":"0.25","max_drawdown_usd":"0.5"}],'
+    '"vm_orders_no_hash":0}'
+)
+
+
+def _day_run_json(epoch_ns: int, orders: int, net: str, dd: str) -> str:
+    return RUN_JSON % (epoch_ns, epoch_ns + 10, orders, orders // 2, orders // 2, net, dd, orders // 2, net)
+
+
+def test_day_mode_audits_each_run_of_the_closed_day_with_the_fee_tier_and_merges(tmp_path):
+    # ICDP I6: the nightly lane — per-run bounded audits, fee tier from
+    # fees.toml, merge = sums + worst-run drawdown, failures listed.
+    day_ns = 86_400 * 10**9
+    d0 = (NOW_MS // 1000 // 86_400 - 1) * day_ns  # the closed UTC day, ns
+    logs = tmp_path / "logs"
+    runs = [d0 + 3_600 * 10**9, d0 + 8 * 3_600 * 10**9, d0 + 16 * 3_600 * 10**9]
+    for e in runs:
+        (logs / f"run-{e}").mkdir(parents=True)
+    (logs / f"run-{d0 + day_ns + 60 * 10**9}").mkdir()  # today: excluded
+    (logs / "not-a-run").mkdir()
+    fees = tmp_path / "fees.toml"
+    fees.write_text('# tier\n[fees]\npm = "0:0"\nbn = "2:5"  # perp retail\nokx = "2:5"\n')
+    flags = claude_worker.pnl_report.load_fee_flags(fees)
+    assert flags == ["--fee-bps", "pm:0:0", "--fee-bps", "bn:2:5", "--fee-bps", "okx:2:5"]
+    seen: list[list[str]] = []
+
+    def fn(argv):
+        seen.append(argv)
+        assert argv[0] == claude_worker.backtest.ENGINE_BINARY
+        assert argv[1:3] == ["audit-pnl", "--dir"]
+        assert argv[4:] == flags
+        run = pathlib.Path(argv[3]).name
+        if run == f"run-{runs[1]}":
+            return 1, "", "boom\n"
+        e = int(run[4:])
+        return 0, _day_run_json(e, 4, "1.5", "0.75") + "\n", f"audit-pnl: {run}: stale: pm=1/3 (0bps)\n"
+
+    lines: list[str] = []
+    day = datetime.datetime.fromtimestamp(d0 / 1e9, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+    rc = claude_worker.pnl_report.run_day(logs, tmp_path / "reports", day, lines.append, run_fn=fn, fee_flags=flags)
+    assert rc == 0, lines
+    assert [pathlib.Path(a[3]).name for a in seen] == [f"run-{e}" for e in runs]
+    obj = json.loads((tmp_path / "reports" / f"pnl-{day}.json").read_text())
+    assert obj["audit_pnl_version"] == 1 and obj["day"] == day and obj["runs"] == 2
+    assert obj["failed_runs"] == [f"run-{runs[1]}"]
+    row = obj["strategies"][0]
+    assert row["strategy_id"] == 6 and row["label"] == "icdp" and row["runs"] == 2
+    assert row["orders"] == 8 and row["fills"] == 4 and row["ioc_fills"] == 4 and row["ioc_canceled"] == 2
+    assert row["net_usd"] == "3.000000" and row["fees_usd"] == "0.020000"
+    assert row["max_drawdown_usd"] == "0.750000", "worst single run, not a sum"
+    assert row["fee_ladder_net_usd"] == ["2.000000", "1.000000", "0.000000"]
+    assert obj["vm_by_ruleset"] == [{"hash128": "ab", "orders": 4, "trades": 2, "net_usd": "0.500000", "max_drawdown_usd": "0.500000"}]
+    assert obj["window"]["wall_first_ns"] == runs[0] and obj["window"]["wall_last_ns"] == runs[2] + 10
+    assert len(obj["runs_detail"]) == 2
+    summary = (tmp_path / "reports" / f"pnl-{day}.summary.txt").read_text()
+    assert "fee tier flags: --fee-bps pm:0:0" in summary
+    assert "FAILED (exit 1)" in summary and "stale: pm=1/3" in summary
+    assert any("runs=2 failed=1" in l for l in lines)
+    # Nothing for the day ⇒ loud nonzero.
+    assert claude_worker.pnl_report.run_day(logs, tmp_path / "reports", "1999-01-01", lines.append, run_fn=fn) == 1
+    # A malformed tier line is fatal.
+    fees.write_text("[fees]\nbn = 2\n")
+    with pytest.raises(ValueError):
+        claude_worker.pnl_report.load_fee_flags(fees)
+
+
+def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
+    # ICDP I6 + the 2 h law: a 3 h run becomes two window units, each a
+    # bounded run dir of its own (epoch advanced), deleted after audit.
+    day_ns = 86_400 * 10**9
+    d0 = (NOW_MS // 1000 // 86_400 - 1) * day_ns
+    epoch = d0 + 3_600 * 10**9
+    logs = tmp_path / "logs"
+    run = tests.craft.write_run(logs, epoch, [1_000, 1_000 + 3_600 * 10**9, 1_000 + 3 * 3_600 * 10**9 - 1])
+    (run / "instrument-manifest.tsv").write_text("42\tPMTOK\n")
+    seen: list[tuple[str, int]] = []
+
+    def fn(argv):
+        d = pathlib.Path(argv[3])
+        n = len(list(claude_worker.pmlr.Reader(d / "pm-ticks.pmlr").ticks()))
+        seen.append((d.name, n))
+        assert (d / "instrument-manifest.tsv").is_file()
+        return 0, _day_run_json(int(d.name[4:]), 2, "0.5", "0.1") + "\n", ""
+
+    lines: list[str] = []
+    day = datetime.datetime.fromtimestamp(d0 / 1e9, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+    root = tmp_path / "nightly"
+    rc = claude_worker.pnl_report.run_day(logs, tmp_path / "reports", day, lines.append, run_fn=fn, window_root=root)
+    assert rc == 0, lines
+    assert seen == [(f"run-{epoch}", 2), (f"run-{epoch + 7_200 * 10**9}", 1)]
+    assert not any(root.glob("run-*")), "window cuts are deleted after their audit"
+    obj = json.loads((tmp_path / "reports" / f"pnl-{day}.json").read_text())
+    assert obj["runs"] == 2
+    assert [r["run"] for r in obj["runs_detail"]] == [f"run-{epoch}@0s", f"run-{epoch}@7200s"]
+    assert obj["strategies"][0]["orders"] == 4
+
+
+def test_main_closed_day_selects_yesterday(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    def fn(argv):
+        calls.append(argv)
+        e = int(pathlib.Path(argv[3]).name[4:])
+        return 0, _day_run_json(e, 2, "0.1", "0.0") + "\n", ""
+
+    monkeypatch.setattr(claude_worker.pnl_report, "_default_run_fn", fn)
+    # hermetic: the operator's real ~/multivenue/fees.toml must not leak in
+    monkeypatch.setattr(claude_worker.pnl_report, "FEES_PATH_DEFAULT", str(tmp_path / "no-fees.toml"))
+    day_ns = 86_400 * 10**9
+    yesterday = (NOW_MS // 1000 // 86_400 - 1) * day_ns + 5 * 10**9
+    (tmp_path / "logs" / f"run-{yesterday}").mkdir(parents=True)
+    # --fees pointing at an absent file is a loud error, not a silent 0/0
+    with pytest.raises(FileNotFoundError):
+        claude_worker.pnl_report.main([
+            "--replay-dir", str(tmp_path / "logs"), "--reports-dir", str(tmp_path / "reports"),
+            "--now-ms", str(NOW_MS), "--closed-day", "--fees", str(tmp_path / "absent.toml"),
+        ])
+    rc = claude_worker.pnl_report.main([
+        "--replay-dir", str(tmp_path / "logs"), "--reports-dir", str(tmp_path / "reports"),
+        "--now-ms", str(NOW_MS), "--closed-day",
+    ])
+    assert rc == 0
+    assert len(calls) == 1 and calls[0][3].endswith(f"run-{yesterday}")
+    day = datetime.datetime.fromtimestamp(yesterday / 1e9, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+    assert (tmp_path / "reports" / f"pnl-{day}.json").is_file()
+
+
 def test_run_once_is_idempotent_per_day_and_refreshes(tmp_path):
     rc, _, reports = run_once(tmp_path, ok_run_fn)
     assert rc == 0
