@@ -98,6 +98,23 @@ symbols through the manifest, never a bare `SymbolId` across runs.
 `backtest`'s argv and schema-1 JSON are a **frozen contract** with
 `claude-worker`. The harness conforms to the worker, never vice versa.
 
+**Venue time + staleness (VT, 2026-09-03 — `docs/venue-time-capture-plan.md`).**
+Tick v3 carries `venue_time_ms` + `flags`; every ingress judges each tick
+against the venue's own fastest message (`core_time::FeedClock`) and
+flags it STALE past the per-venue `stale_after_ms` (pm 1000 / bn 1000 /
+okx 400 / deribit 600 / hl 700 / bybit 500; `run --stale-after-ms
+<venue>:<ms>` overrides, `:0` = measure only). A stale tick is captured
+but never a signal (`Mid/Bid/Ask` ABSENT in the VM), never a fill and
+never a mark. `backtest` and `audit-pnl` RE-JUDGE v3 captures from the
+stamp (`--stale-after-ms` on both — a threshold change is a replay), print
+`stale: bn=59149/2639478 (12bps) …` per run and `stale-blind(v2)` on a
+v2 root; `--emit-detail` is `detail_version` 2 with a `stale` block;
+`capture-catalog` reports `stale_captured` per lane. **Any number from
+a v2 root is an upper bound.** Metrics:
+`engine_ingress_<venue>_stale_ticks_total`, `_feed_delay_ema_ms`.
+Engine-side delay per venue: `docs/venue-latency.md` §5. Capture windows
+for research are ≤ 2 h by law (VT plan §6.1).
+
 ## Venue latency calibration — REQUIRED per deployment and per location
 
 The backtest / audit-pnl fill model activates an order `Δ_venue` after

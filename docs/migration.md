@@ -30,6 +30,69 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-09-03 — Staleness is live: v3 captures start, the harness re-judges, `--emit-detail` v2 (VT2–VT6 close)
+
+**What changed**
+
+- The standing engine writes PMLR v3 since `run-1788417289611943000`
+  (relink + reboot 06:34Z); every earlier run dir is v2.
+- Every ingress stamps `venue_time_ms` and judges staleness live
+  (`core_time::FeedClock`, per-venue `stale_after_ms` defaults pm 1000 /
+  bn 1000 / okx 400 / deribit 600 / hl 700 / bybit 500; `run
+  --stale-after-ms <venue>:<ms>`); Binance spot inherits the `aggTrade`
+  sentinel's stamp + verdict with `TICK_FLAG_VENUE_TIME_SENTINEL`, and
+  spot prints are captured as `ChannelId::Trade` event rows.
+- strategy-vm: `Mid/Bid/Ask` are ABSENT while the last tick is stale.
+- `backtest` / `audit-pnl`: `--stale-after-ms <venue>:<ms>` (both);
+  v3 ticks are RE-JUDGED from the stamp per (venue, sym) per run in file
+  order (`cli::backtest::stale`), with the **sentinel latch law**: a
+  repeated inherited stamp keeps its print's verdict (re-judging it on
+  the book update's own `ts_ns` flagged quiet seconds — 3.3 % false stale
+  on `binance:btcusdt`, found by the VT2 live smoke). Stale ticks
+  neither fill nor mark. stderr gains one `stale:` line per run
+  (`stale-blind(v2)` on v2 files). **`--emit-detail` sidecar is
+  `detail_version` 2**: `model.stale_after_ms` + a `stale` block
+  (`ticks_skipped`, per-run per-lane `{ticks, stale_ticks,
+  stale_time_bps, stale_blind}`). Schema-1 stdout is unchanged (frozen).
+- `capture-catalog`: per-lane `stale_captured` (the ingress's live
+  verdict count; `null` on v2 lanes) in JSON + summary.
+- Metrics: `engine_ingress_<venue>_stale_ticks_total`,
+  `engine_ingress_<venue>_feed_delay_ema_ms`. `IngressStatus` slot is
+  exactly 128 B with zero slack.
+- `claude_worker.features.collect_marks` skips stale ticks on v3 files.
+
+**Why**
+
+- `docs/venue-time-capture-plan.md` §1 — stale-blind captures book
+  mid-to-mid gains against books the engine could not see. Measured on
+  the first v3 run: the VM row's one round trip is +$1.07 stale-blind vs
+  −$4.87 judged (vault note).
+
+**Impact**
+
+- On-disk formats: v3 run dirs; `detail_version` 2 sidecars (a v1
+  reader must tolerate the new keys — the worker never reads the
+  sidecar).
+- Config keys: none (`--stale-after-ms` is a flag; the wrapper passes
+  none — venue defaults apply).
+- Wire formats: none beyond VT1's entry below.
+
+**Migration steps**
+
+1. Research on staleness needs v3 roots: cut ≤ 2 h windows by `ts_ns`
+   (the events file cut too) from runs ≥ `run-1788417289611943000`.
+2. Treat every `stale-blind(v2)` number as an upper bound (CLAUDE.md
+   pitfall 17).
+3. Thresholds are re-derived per deployment with the engine-side table
+   in `docs/venue-latency.md` §5 — a change is a replay, not a recapture.
+
+**Rollback**
+
+- `--stale-after-ms <venue>:0` on every venue restores the stale-blind
+  law offline without a rebuild; the engine flag does the same live
+  (ticks still carry the stamp). Reverting the crates restores v2
+  writing; v3 files remain readable by the v3 reader only.
+
 ## 2026-09-03 — PMLR v3: `Tick.flags` + `Tick.venue_time_ms` (VT1, venue-time capture)
 
 **What changed**

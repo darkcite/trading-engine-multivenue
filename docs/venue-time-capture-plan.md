@@ -1,9 +1,13 @@
 # Venue-time capture + staleness gate — plan (VT0–VT6)
 
-**Status: OPEN — authored 2026-09-03 on the operator's "go with the plan".**
-Owner doc for the work; progress entries go at the bottom (§9). This is
+**Status: CLOSED 2026-09-03 (VT0–VT6 landed the same day; close entry =
+last of §9). Residue — the xv on/off delta on a non-degenerate window and
+ICDP G1 on N ≥ 4 windows — is owned by the ICDP lane in the research
+vault.** Authored 2026-09-03 on the operator's "go with the plan". Owner
+doc for the work; progress entries at the bottom (§9). This was
 data-integrity work on the capture + harness, NOT Stage-3 executor work —
 the §7 entry gate (`docs/arch/mvp-completion-plan.md`) is untouched.
+§6.1 (the ≤ 2 h capture-window law) remains a STANDING law from here.
 
 ## 1. Why
 
@@ -407,3 +411,61 @@ ruling); the Binance spot book-builder lane; any strategy work.
   the "counter moving during an episode" sighting is deferred to the
   next episode, watched during VT5). Numbers per venue go to
   `docs/venue-latency.md` §5 (engine-side delay).
+- 2026-09-03 — **VT5 landed on the first ≤ 2 h v3 window (§6.1 law);
+  two re-cuts deferred to windows that do not exist yet.** The Binance
+  episode tell arrived during VT5: `engine_ingress_binance_stale_ticks_total`
+  0 (06:42Z) → 2 840 (07:00Z) → 58 876 (07:08Z) while the socket kept
+  flowing — VT2's last done-tell, observed. Window W1 = `ts_ns` slice
+  0–7200 s of `run-1788417289611943000` cut by the vault symfilter
+  one-shot's new `--from-s/--to-s` (events file cut too; > 2 h refused).
+  (a) **Harness on/off delta, live-proven:** `audit-pnl` on the run
+  with the default gate vs `--stale-after-ms <venue>:0` on all six —
+  the VM xv row's single round trip (fired 07:04Z) scores **−$4.87
+  judged vs +$1.07 stale-blind** (Δ +$5.94: stale-blind, the okx exit
+  leg "fills" on a tick the engine had judged stale — okx 95 bps of the
+  run stale). The xv-sweep backtests on W1 are DEGENERATE (`vm:
+  evals=90267 fires=0` under both gates; the 2 h v2 control window
+  00:00–02:00Z fires 16× — the harness is fine, the 25 quiet minutes
+  held no ≥ 3 bps divergence): the ≥ 30-fill rule says cut another
+  window — from a later existing run, never a wait. Pre-fix datum kept:
+  VT4's original re-judge showed 1 347 false-stale bn ticks (323 bps)
+  on this root; the sentinel latch law makes it 1. (b) **Engine-side
+  delay per venue** → `docs/venue-latency.md` §5 (tracked). (c) **ICDP
+  I0 pipeline complete and validated** (vault one-shots: `--stale-gate`
+  drops bars whose open/decision/close quote is stale or that overlap a
+  stale tick, dropped fraction per (instrument, tf) reported and the
+  > 25 % lane-window exclusion applied; measured-Δ and p90-stress taker
+  columns; `lowo` = G1 shape A leave-one-window-out with the i–vi
+  criteria printed). On W1′ (38 min, 8 majors) the gate drops 1.6–13.4 %
+  of 15 s bars (okx most: thin-spread stale ticks touch many bars);
+  `lowo` on two 16-min sub-windows returns `FAIL / NOT YET` as it must.
+  **G1 = NOT YET: the pool holds N = 1; it needs N ≥ 4 disjoint ≤ 2 h v3
+  windows cut from the runs that exist at the next session** (the
+  08:30Z / 16:05Z restarts give ~8 h runs ⇒ up to 4 windows each).
+  Substance + command shapes: the vault note
+  `docs/research/vt5-stale-gate-2026-09-03.md`. CLAUDE.md pitfall 17
+  ("a v2 root is stale-blind") added; README subcommand notes updated.
+- 2026-09-03 — **VT6 CLOSE ENTRY — the VT plan is CLOSED for engine +
+  harness work.** Delivered: Tick v3 / PMLR v3 (VT1); six venues stamp
+  + judge live, Binance-spot sentinel, `FeedClock`, metrics, `run
+  --stale-after-ms` (VT2, live-smoked ±7 ms p50 vs an independent probe,
+  live verdict = offline re-judge 100 %); VM `Mid/Bid/Ask` ABSENT on
+  stale + worker marks (VT3); harness stale law, `--stale-after-ms` on
+  backtest + audit-pnl, `detail_version` 2, catalog `stale_captured`,
+  sentinel latch law (VT4 + smoke fix); the first judged-vs-blind
+  measurement, engine-side delay table, I0 pipeline (VT5).
+  `docs/migration.md` carries the close entry ("Staleness is live");
+  `docs/wire-format.md` was updated at VT1/VT2. **Residue (owned by the
+  ICDP lane in the vault, not by this plan):** the xv on/off delta on a
+  non-degenerate window and G1 on N ≥ 4 windows — both are cuts of
+  future existing capture. Deviations from §5/§6 as written: stale time
+  is rendered in integer bps of the file span; `feed_delay_p50_ms`
+  became an integer EMA gauge (`feed_delay_ema_ms`); the paper "marks
+  skip stale" law lives in the worker (`collect_marks`) because the
+  engine keeps no in-process marks; capture-derived candles
+  (`candles.py`, PM only) still fold stale ticks — a known, harmless
+  gap (PM staleness 1 bps of time). Stay-greens at close: nextest 1474
+  (+ the known scrape_hammer flake green in isolation) · release alloc
+  39/39 0 B/op · `make lint` · `make license-check` · worker pytest 618
+  (+ the UDS-fixture flake green in isolation). Not Stage-3 work; the
+  §7 entry gate is untouched.
