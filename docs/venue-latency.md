@@ -128,3 +128,43 @@ flowing while its content is seconds old.
    kept-alive request RTT measures the path to the venue — and DNS can
    hand out a far edge on one run and a near one on the next (Binance:
    10 ms vs 108 ms TCP connect across two runs, same request RTT).
+
+## 5. Engine-side feed delay (VT2, `core_time::FeedClock`) — per venue
+
+Since VT2 (2026-09-03) the engine judges every stamped tick against the
+venue's own fastest message (`docs/venue-time-capture-plan.md` §2
+doctrine 2): `delay = off_ms − (venue_ms − mono_ms)`, `off_ms = max` with
+a 1 ms/min decay. This is a **max-relative** delay: `absolute ≈ relative +
+floor`, the floor being the network's one-way minimum (§3's absolute p50
+minus the relative p50 below ≈ 60–70 ms on every venue from this host —
+the same 60 ms the venue-clock offsets show). The engine exports the
+running EMA (`engine_ingress_<venue>_feed_delay_ema_ms`) and the stale
+count; the harness re-derives the same numbers from a v3 capture
+(`--stale-after-ms`, stale line per run).
+
+### 2026-09-03 06:36–06:51Z — first v3 run, BTC instrument per venue (15 min)
+
+Engine capture (`run-1788417289611943000`) vs an independent
+`latency_probe` on the same host over the same wall window, both judged
+by the same law (raw + comparison: `~/multivenue/research/latency-2026-09-03-vt2/`).
+
+| venue (engine stream) | engine relative p50 / p90 / p99 ms | stale % @ default | probe relative p50 (same law) | probe absolute p50 | Δp50 |
+|---|---|---|---|---|---|
+| binance spot `bookTicker` ← `aggTrade` sentinel | 6 / 137 / 499 (per print) | 0.00 @ 1000 | 5 | 60.9 | +1 |
+| binance-usdm `bookTicker` T | 9 / 112 / 356 | 0.00 @ 1000 | 16 (probe tail is its own jitter: p99 +967 ms excess on a 1:1 seq join) | 78.0 | −7 |
+| okx `bbo-tbt` ts (all-instrument socket) | 2 / 40 / 475 | 1.30 @ 400 | 3 (single-instrument socket: p99 205, 0.18 %) | 70.3 | −1 |
+| bybit `orderbook.1` cts | 6 / 46 / 244 | 0.21 @ 500 | 6 | 31.4 | 0 |
+| deribit `quote` timestamp | 6 / 29 / 251 | 0.07 @ 600 | 4 | 112.9 | +2 |
+| hyperliquid `bbo` time | 63 / 142 / 357 | 0.10 @ 700 | 38 (`l2Book`, 168 msgs — not comparable) | 290.6 | (+25) |
+| polymarket `book`/`price_change` timestamp | EMA 5–38 (no probe lane) | 0.00 @ 1000 | — | — | — |
+
+Findings: (1) the engine's delay estimator agrees with an independent
+probe within ±7 ms p50 on every directly comparable venue — the VT2
+done-tell; (2) the live verdict and the harness's offline re-judge agree
+on 100.00 % of ticks on every venue once the sentinel latch law is
+applied (`cli::backtest::stale`); (3) the OKX tail on the engine's
+socket (1.3 % > 400 ms) is ~7× the probe's dedicated socket — socket load
+is part of the engine's delay and is exactly what the harness must
+replay; (4) Binance had no staleness episode in this window (the 8.9 %
+of §3 was measured at 17:07Z) — thresholds stay per §2 doctrine 4 until
+a longer v3 record says otherwise.

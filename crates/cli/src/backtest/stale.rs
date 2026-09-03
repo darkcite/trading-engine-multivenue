@@ -11,6 +11,20 @@
 //! v2 files carry no stamp: their ticks stay never-stale (the v2 law)
 //! and the venue is reported STALE-BLIND.
 //!
+//! **Sentinel law (VT2 live smoke, 2026-09-03).** A tick carrying
+//! `TICK_FLAG_VENUE_TIME_SENTINEL` did not stamp itself: its
+//! `venue_time_ms` is the connection's latest sentinel print (Binance
+//! spot `aggTrade` `T`), and the ingress LATCHED the print's verdict for
+//! every book update until the next print. Re-judging such a tick
+//! against its own `ts_ns` would add the time since the print to the
+//! delay and flag quiet seconds as stale (the smoke measured 3.3 %
+//! re-judged vs 0.0 % live on `binance:btcusdt`). So the harness judges
+//! a sentinel stamp ONCE — on the first tick that carries it (whose
+//! `ts_ns` trails the print's by at most one book-update interval) —
+//! and latches that verdict for every following tick with the same
+//! stamp; a new stamp is judged afresh. Direct stamps (bit1 clear) are
+//! judged on every tick, as the ingress does.
+//!
 //! Shared verbatim by `backtest` and `audit-pnl` (one law, never
 //! twinned). DOCTRINE (audit_replay.rs): offline — allocates freely,
 //! deterministic (BTree, integer math).
@@ -18,7 +32,7 @@
 use std::collections::BTreeMap;
 
 use core_time::FeedClock;
-use core_types::{Tick, TICK_FLAG_STALE};
+use core_types::{Tick, TICK_FLAG_STALE, TICK_FLAG_VENUE_TIME_SENTINEL};
 
 use super::VENUE_LABELS;
 
@@ -55,11 +69,21 @@ impl StaleStats {
     }
 }
 
-/// One run's re-judge state: a `FeedClock` per (lane, sym) plus the
+/// One connection's estimator plus the latched sentinel verdict
+/// (module doc, "Sentinel law").
+struct LaneClock {
+    clock: FeedClock,
+    /// The last sentinel stamp judged (0 = none yet).
+    sentinel_stamp: u64,
+    /// The verdict latched for `sentinel_stamp`.
+    sentinel_stale: bool,
+}
+
+/// One run's re-judge state: a [`LaneClock`] per (lane, sym) plus the
 /// per-lane accounting.
 pub struct StaleJudge {
     thresholds: [u32; 7],
-    clocks: BTreeMap<(u8, u32), FeedClock>,
+    clocks: BTreeMap<(u8, u32), LaneClock>,
     /// Per-lane accounting, [`VENUE_LABELS`] order.
     pub stats: [StaleStats; VENUE_LABELS.len()],
 }
@@ -76,7 +100,8 @@ impl StaleJudge {
 
     /// Judge one tick of lane `lord` in FILE ORDER. On a v3 file
     /// (`has_venue_time`) the `TICK_FLAG_STALE` bit is REWRITTEN from
-    /// the stamp (the sentinel bit is preserved); on a v2 file the
+    /// the stamp (the sentinel bit is preserved; a repeated sentinel
+    /// stamp latches its first verdict — module doc); on a v2 file the
     /// flags stay as captured (0) and the lane is marked stale-blind.
     pub fn judge(&mut self, lord: usize, tick: &mut Tick, has_venue_time: bool) {
         let st = &mut self.stats[lord];
@@ -98,14 +123,26 @@ impl StaleJudge {
         } else {
             0
         };
-        let clock = self
-            .clocks
-            .entry((tick.venue, tick.sym))
-            .or_insert_with(|| FeedClock::new(threshold));
-        let judged = clock.judge(tick.venue_time_ms, tick.ts_ns);
-        tick.flags = (tick.flags & !TICK_FLAG_STALE) | ((judged.stale as u8) * TICK_FLAG_STALE);
-        st.last_stale = judged.stale;
-        if judged.stale {
+        let lane = self.clocks.entry((tick.venue, tick.sym)).or_insert_with(|| LaneClock {
+            clock: FeedClock::new(threshold),
+            sentinel_stamp: 0,
+            sentinel_stale: false,
+        });
+        let sentinel = tick.flags & TICK_FLAG_VENUE_TIME_SENTINEL != 0;
+        let stale = if sentinel && tick.venue_time_ms != 0 && tick.venue_time_ms == lane.sentinel_stamp {
+            // Same print as the previous tick: the ingress latched, so do we.
+            lane.sentinel_stale
+        } else {
+            let judged = lane.clock.judge(tick.venue_time_ms, tick.ts_ns);
+            if sentinel {
+                lane.sentinel_stamp = tick.venue_time_ms;
+                lane.sentinel_stale = judged.stale;
+            }
+            judged.stale
+        };
+        tick.flags = (tick.flags & !TICK_FLAG_STALE) | ((stale as u8) * TICK_FLAG_STALE);
+        st.last_stale = stale;
+        if stale {
             st.stale_ticks += 1;
         }
     }
@@ -160,6 +197,47 @@ mod tests {
         // 500 ms of a 5_600 ms span = 892 bps
         assert_eq!(s.stale_time_bps(), 892);
         assert!(!s.stale_blind);
+    }
+
+    #[test]
+    fn sentinel_stamp_is_judged_once_and_latched_until_the_next_print() {
+        // okx lane/threshold (400) for brevity; the law is per flag, not
+        // per venue. Print A stamps 1_000_000 at 1_000 ms and sets the
+        // offset (fresh). Book updates inherit it for 2 s of quiet — a
+        // re-judge by their own ts_ns would call the last one 2 s stale;
+        // the latch keeps A's verdict. Print B (stamp +2_000, seen at
+        // 3_450 ms = 450 ms behind) is judged afresh: stale; its
+        // followers inherit stale WITHOUT accruing more delay. Print C
+        // (fresh again) clears.
+        let mut j = StaleJudge::new(VenueId::stale_after_ms_defaults());
+        let lord = 2;
+        let s = TICK_FLAG_VENUE_TIME_SENTINEL;
+        let mut a0 = t(1_000, 1_000_000, s);
+        let mut a1 = t(1_500, 1_000_000, s);
+        let mut a2 = t(3_000, 1_000_000, s);
+        let mut b0 = t(3_450, 1_002_000, s);
+        let mut b1 = t(3_460, 1_002_000, s);
+        let mut c0 = t(4_000, 1_003_000, s);
+        for tick in [&mut a0, &mut a1, &mut a2, &mut b0, &mut b1, &mut c0] {
+            j.judge(lord, tick, true);
+        }
+        assert_eq!(a0.flags, s);
+        assert_eq!(a1.flags, s);
+        assert_eq!(a2.flags, s, "quiet seconds after a fresh print stay fresh");
+        assert_eq!(b0.flags, s | TICK_FLAG_STALE);
+        assert_eq!(b1.flags, s | TICK_FLAG_STALE, "followers inherit the print's verdict");
+        assert_eq!(c0.flags, s);
+        let st = j.stats[lord];
+        assert_eq!(st.stale_ticks, 2);
+        // stale time = gaps after b0 and b1 (3_450 → 3_460 → 4_000)
+        assert_eq!(st.stale_ns, 550 * 1_000_000);
+        // A DIRECT tick repeating a stamp is judged on its own clock.
+        let mut d0 = t(4_100, 1_003_100, 0);
+        let mut d1 = t(6_000, 1_003_100, 0); // same stamp, 1.9 s later: stale
+        j.judge(lord, &mut d0, true);
+        j.judge(lord, &mut d1, true);
+        assert_eq!(d0.flags, 0);
+        assert_eq!(d1.flags, TICK_FLAG_STALE);
     }
 
     #[test]

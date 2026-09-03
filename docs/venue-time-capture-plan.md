@@ -366,3 +366,44 @@ ruling); the Binance spot book-builder lane; any strategy work.
   substance in the vault's merged ICDP×VT plan §5. CLAUDE.md CURRENT
   STATE carries the law. Nothing else changed; VT2 live smoke + VT5
   still wait on the operator's relink + boot (G0).
+- 2026-09-03 — **VT2 LIVE SMOKE — PASSED (VT2 closed).** Relink
+  (`cargo build --release -p cli`, 13:31 +07) + restart through the
+  sanctioned lever (`echo 19700101 > ~/multivenue/state/last-restart-utc-0000`;
+  the 0000 slot drained + KeepAlive rebooted pid 63755 at 06:34:03Z) on
+  the operator's "do all by yourself". First v3 run
+  `run-1788417289611943000`: every `*-ticks.pmlr` header is `PMLR 0300`;
+  `engine_vm_rows_active 1` (the #7b recommit held); the new metrics
+  are live for all six venues (`engine_ingress_<venue>_stale_ticks_total`,
+  `_feed_delay_ema_ms`); capture-catalog on the run prints
+  `stale_captured` per lane (pm 0 / bn 0 / okx 87 / deribit 39 / hl 1 /
+  bybit 182 at 8 min; `harness=ok`). **Delay check vs an independent
+  `latency_probe` run (15 min, 06:36–06:51Z, both sides judged by the
+  same `FeedClock` law on the BTC instrument; raw + comparison in
+  `~/multivenue/research/latency-2026-09-03-vt2/`):** Δp50
+  engine−probe = binance-spot (sentinel) +1 ms · binance-usdm −7 ·
+  okx −1 · bybit 0 · deribit +2 — all within the ±10 ms done-tell;
+  hyperliquid +25 is NOT comparable (engine `bbo` vs probe `l2Book`,
+  and the probe's HL collector kept only 168 messages). A 1:1 join on
+  the Binance-USDM update id (176 074 of 179 419 ticks matched) puts
+  the probe's receive-side EXCESS over the engine at p50 0.0 / p90 +72
+  / p99 +967 ms — the probe's own > 1 s tail (1.5 % of its messages)
+  is Python-side jitter; the engine saw 0 stale USDM ticks in the
+  window. **Live-verdict = offline-re-judge agreement 100.00 % on every
+  venue** — after one harness fix found by this smoke: the VT4
+  `StaleJudge` re-judged sentinel-inherited (bit1) ticks against their
+  own `ts_ns`, adding the time since the print and flagging quiet
+  seconds (3.3 % re-judged vs 0.0 % live on `binance:btcusdt` in the
+  first 3 min). Fixed in `cli::backtest::stale` (sentinel law: a
+  repeated inherited stamp latches the first verdict; a new stamp is
+  judged afresh; module doc + test
+  `sentinel_stamp_is_judged_once_and_latched_until_the_next_print`).
+  Engine-side observations worth keeping: the OKX BTC-USDT lane on the
+  engine's all-instrument socket runs 1.3 % > 400 ms (p99 475 ms)
+  where the probe's single-instrument socket runs 0.18 % (p99 205) —
+  socket load is part of the engine's delay and the estimator measures
+  exactly that; Deribit's 35–39 stale ticks were all in the boot
+  flood's first minute (subscription burst); Binance had NO staleness
+  episode in the window (the 8.9 % measurement was taken at 17:07Z —
+  the "counter moving during an episode" sighting is deferred to the
+  next episode, watched during VT5). Numbers per venue go to
+  `docs/venue-latency.md` §5 (engine-side delay).
