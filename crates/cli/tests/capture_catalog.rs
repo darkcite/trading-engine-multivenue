@@ -17,7 +17,7 @@ use cli::capture_catalog::{
     run_catalog, CatalogConfig, DEFAULT_GAP_TOLERANCE_NS, MONITOR_FLOOR_NS, NS_PER_DAY,
 };
 use core_io::{PmlrWriter, SlotKind};
-use core_types::{Price, Qty, Tick, VenueId};
+use core_types::{Price, Qty, Tick, VenueId, TICK_FLAG_STALE};
 
 /// 1 s in ns.
 const G: u64 = 1_000_000_000;
@@ -269,5 +269,55 @@ fn overlapping_runs_are_flagged_and_root_refused() {
     assert_eq!(out.facts.overlaps, 1);
     assert!(!out.facts.whole_root_backtestable);
     assert!(out.summary.contains("OVERLAPS"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// VT4: the catalog reports the CAPTURED stale count per v3 lane
+/// (the ingress verdict at boot-time thresholds, not a re-judge) and
+/// says `stale-blind` for a v2 file, so nobody reads "0" as measured.
+#[test]
+fn v3_lanes_report_captured_stale_counts_and_v2_lanes_are_stale_blind() {
+    let root = unique_root("stale");
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    let epoch = D0 * NS_PER_DAY + 10 * G;
+    let run = root.join(format!("run-{epoch}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    let mut stale = mk_tick(2_000, VenueId::Okx, (2 << 24) | 1, 2);
+    stale.flags |= TICK_FLAG_STALE;
+    write_ticks(
+        &run,
+        "okx",
+        epoch,
+        &[
+            mk_tick(1_000, VenueId::Okx, (2 << 24) | 1, 1),
+            stale,
+            mk_tick(3_000 + 3_600 * G, VenueId::Okx, (2 << 24) | 1, 3),
+        ],
+    );
+    // A v2 file of the same run: header version (u16 LE @4) rewritten to 2 (the
+    // stamp column is absent by law, whatever the slot bytes hold).
+    write_ticks(
+        &run,
+        "pm",
+        epoch,
+        &[
+            mk_tick(1_000, VenueId::Polymarket, 42, 1),
+            mk_tick(2_000, VenueId::Polymarket, 42, 2),
+        ],
+    );
+    let pm_path = run.join("pm-ticks.pmlr");
+    let mut bytes = std::fs::read(&pm_path).expect("read pm");
+    assert_eq!(bytes[4..6], [3, 0], "writer emits v3 (u16 LE at 4..6)");
+    bytes[4] = 2;
+    std::fs::write(&pm_path, bytes).expect("rewrite pm as v2");
+
+    let out = catalog(&root);
+    assert_eq!(out.facts.runs, 1);
+    assert!(out.json.contains("\"venue\":\"okx\",\"records\":3,"));
+    assert!(out.json.contains("\"last_ts_ns\":3600000003000,\"stale_captured\":1}"));
+    assert!(out.json.contains("\"venue\":\"pm\",\"records\":2,"));
+    assert!(out.json.contains("\"stale_captured\":null"));
+    assert!(out.summary.contains("okx=3(stale 1)"));
+    assert!(out.summary.contains("pm=2(stale-blind v2)"));
     let _ = std::fs::remove_dir_all(&root);
 }

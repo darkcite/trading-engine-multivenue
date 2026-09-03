@@ -189,6 +189,72 @@ fn golden_modeled_fill_attribution_and_markout() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// VT4: the golden script with the crossing tick STAMPED stale — the
+/// order never fills (no fill, no mark on a stale tick), the run line
+/// says `pm=1/3`, and `pm:0` restores the golden fill (a threshold
+/// change is a replay).
+#[test]
+fn stale_tick_neither_fills_nor_marks_in_audit_pnl_and_is_reported() {
+    let root = tmp_root("stale");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    let stamped = |ts: u64, bid: i64, ask: i64, aq: i64, venue_ms: u64| {
+        Tick::new_stamped(
+            ts,
+            VenueId::Polymarket,
+            42,
+            1,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(aq),
+            venue_ms,
+            0,
+        )
+    };
+    // Offsets: the anchor learns venue≈mono; the crossing tick's stamp
+    // sits 2 s behind ⇒ delay ≈ 2200 ms > pm's 1000 ⇒ STALE; the last
+    // tick is on time again (10 ns later: stale time rounds to 0 bps).
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            stamped(1_000, 400_000, 420_000, 1_000_000, 1_000_000),
+            stamped(2_000 + PM_DELTA + 10, 350_000, 380_000, 50_000_000, 998_000),
+            stamped(2_000 + PM_DELTA + 20, 590_000, 610_000, 1_000_000, 1_000_200),
+        ],
+    );
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 7, 0)],
+    );
+    let (json, lines) = run_report(&root);
+    assert!(
+        json.contains("\"strategy_id\":0,\"label\":\"latency-arb\",\"orders\":1,\"fills\":0,"),
+        "json: {json}"
+    );
+    assert!(
+        lines.iter().any(|l| l.ends_with(" stale: pm=1/3 (0bps)")),
+        "lines: {lines:?}"
+    );
+    // Judgement OFF for pm ⇒ the golden fill and +$1 markout return.
+    let cfg = AuditPnlConfig {
+        replay_dir: root.clone(),
+        stale_after_ms: vec!["pm:0".to_owned()],
+        ..AuditPnlConfig::default()
+    };
+    let mut lines = Vec::new();
+    let json = run(&cfg, &mut |l: &str| lines.push(l.to_owned())).expect("report");
+    assert!(json.contains("\"net_usd\":\"1.0\""), "json: {json}");
+    assert!(
+        lines.iter().any(|l| l.ends_with(" stale: pm=0/3 (0bps)")),
+        "lines: {lines:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn vm_hash_timeline_buckets_orders_after_commit_only() {
     let root = tmp_root("vmhash");
@@ -496,6 +562,7 @@ fn option_intents_mark_fill_and_print_the_d7_assumption() {
             fee_bps: Vec::new(),
             latency_ns: Some(0),
             latency_ns_venue: Vec::new(),
+            stale_after_ms: Vec::new(),
         },
         &mut |l: &str| lines.push(l.to_owned()),
     )

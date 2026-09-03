@@ -118,6 +118,11 @@ struct AuditPnlArgs {
     /// Repeatable `--latency-ns-venue <venue>:<ns>` overrides.
     #[arg(long)]
     latency_ns_venue: Vec<String>,
+    /// VT4: repeatable `--stale-after-ms <venue>:<ms>` — the harness
+    /// re-judges every v3 tick from its venue stamp against this table
+    /// (defaults = the venue table; 0 = never stale).
+    #[arg(long)]
+    stale_after_ms: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -149,6 +154,12 @@ struct BacktestArgs {
     /// model (consumed from H2).
     #[arg(long)]
     latency_ns_venue: Vec<String>,
+    /// VT4: repeatable `--stale-after-ms <venue>:<ms>` — the harness
+    /// re-judges every v3 tick from its venue stamp against this table
+    /// (defaults = the venue table; 0 = never stale). v2 roots are
+    /// stale-blind and say so on stderr.
+    #[arg(long)]
+    stale_after_ms: Vec<String>,
     /// §5 rich-detail sidecar path (per-symbol/IS metrics). Declared
     /// now; the sidecar is written starting H2.
     #[arg(long)]
@@ -371,6 +382,7 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         fee_bps: args.fee_bps,
         latency_ns: args.latency_ns,
         latency_ns_venue: args.latency_ns_venue,
+        stale_after_ms: args.stale_after_ms,
     };
     let mut report = |line: &str| eprintln!("{line}");
     match cli::audit_pnl::run(&cfg, &mut report) {
@@ -418,6 +430,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         fee_bps: args.fee_bps,
         latency_ns: args.latency_ns,
         latency_ns_venue: args.latency_ns_venue,
+        stale_after_ms: args.stale_after_ms,
         emit_detail: args.emit_detail,
     };
     match cli::backtest::run(&cfg) {

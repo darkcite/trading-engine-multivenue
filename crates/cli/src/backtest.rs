@@ -34,7 +34,7 @@
 //!   equity/drawdown, end-of-replay mark-out, §4.6 observed bounds;
 //! * schema-1 stdout, byte-exact and fixed-point-rendered (§5), with
 //!   the REAL `oos` numbers; optional `--emit-detail` sidecar (JSON,
-//!   `detail_version` 1 — operator surface, never worker-parsed).
+//!   `detail_version` 2 since VT4 — operator surface, never worker-parsed).
 //!
 //! ## Doctrine note — this module ALLOCATES
 //!
@@ -44,6 +44,7 @@
 //! Nothing here is reachable from a hot path.
 
 pub mod fill;
+pub mod stale;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -170,6 +171,9 @@ pub struct BacktestConfig {
     /// Repeatable `--latency-ns-venue <venue>:<ns>` overrides
     /// (win over the global one).
     pub latency_ns_venue: Vec<String>,
+    /// VT4: repeatable `--stale-after-ms <venue>:<ms>` overrides of the
+    /// harness's re-judge thresholds (defaults = the venue table).
+    pub stale_after_ms: Vec<String>,
     /// `--emit-detail` sidecar path — declared per §5; written in H2.
     pub emit_detail: Option<PathBuf>,
 }
@@ -244,12 +248,20 @@ pub struct ModelParams {
     /// deployment host + network, not a constant** — see
     /// `docs/venue-latency.md` and the provenance on [`Default`].
     pub latency_ns: [u64; 7],
+    /// VT4: staleness threshold ms per venue — the harness re-judges
+    /// every v3 tick from its venue stamp against this table (a
+    /// threshold change is a replay, not a recapture); 0 = never
+    /// stale. Defaults = `VenueId::stale_after_ms_defaults()` (the
+    /// doctrine-4 table the ingress uses); `--stale-after-ms
+    /// <venue>:<ms>` overrides.
+    pub stale_after_ms: [u32; 7],
 }
 
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
             fee_bps: [(0, 0); 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
             // Δ_venue = feed one-way p50 + REST request RTT p50 / 2,
             // rounded up to 10 ms (docs/venue-latency.md §2), MEASURED
             // 2026-09-03 17:07–17:32Z by `claude_worker.latency_probe`
@@ -282,14 +294,27 @@ pub(crate) fn model_venue(label: &str) -> Option<usize> {
 }
 
 /// Fold the §4 flag overrides onto the defaults. Precedence: defaults
-/// → `--latency-ns` (global) → `--latency-ns-venue` / `--fee-bps`
-/// (later occurrences of a repeated flag win).
+/// → `--latency-ns` (global) → `--latency-ns-venue` / `--fee-bps` /
+/// `--stale-after-ms` (later occurrences of a repeated flag win).
 pub fn parse_model_params(
     fee_specs: &[String],
     latency_global: Option<u64>,
     latency_specs: &[String],
+    stale_specs: &[String],
 ) -> Result<ModelParams, HarnessError> {
     let mut p = ModelParams::default();
+    for spec in stale_specs {
+        let (v, ms) = spec.split_once(':').ok_or_else(|| {
+            HarnessError::Usage(format!("bad --stale-after-ms {spec:?}: want <venue>:<ms>"))
+        })?;
+        let vi = model_venue(v).ok_or_else(|| {
+            HarnessError::Usage(format!("bad --stale-after-ms {spec:?}: unknown venue {v:?}"))
+        })?;
+        let ms: u32 = ms.parse().map_err(|_| {
+            HarnessError::Usage(format!("bad --stale-after-ms {spec:?}: unparseable ms"))
+        })?;
+        p.stale_after_ms[vi] = ms;
+    }
     if let Some(ns) = latency_global {
         p.latency_ns = [ns; 7];
         p.latency_ns[VenueId::Ai as usize] = 0; // dead slot stays dead
@@ -488,6 +513,9 @@ struct RunSummary {
     /// SymbolId-across-runs law; found live by the V7 iv proof —
     /// $248M phantom bounds from expired-option collisions).
     dropped_foreign: u64,
+    /// VT4: per-lane stale accounting from the harness's own re-judge
+    /// (v3 lanes) — `stale_blind` marks v2 lanes.
+    stale: [stale::StaleStats; VENUE_LABELS.len()],
 }
 
 /// Open every present per-venue capture file of `run` (ticks +
@@ -509,9 +537,13 @@ fn load_run(
     run: &RunDir,
     remap: &BTreeMap<u32, u32>,
     dead: &BTreeSet<u32>,
+    stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
+    // VT4: one re-judge per run — connections (and their clock
+    // offsets) are per run; a threshold change is a replay.
+    let mut judge = stale::StaleJudge::new(stale_after_ms);
     let mut summary_extra = (0u64, 0u64, 0u64, 0u64, 0u64); // ev, dp, op, synth, remapped
     let mut dropped_foreign = 0u64;
     let mut any_file = false;
@@ -570,8 +602,12 @@ fn load_run(
         let records = reader.records();
         venue_records[vi] = records.len() as u64;
         recs.reserve(records.len());
+        let has_venue_time = reader.has_venue_time();
         for (i, t) in records.iter().enumerate() {
             let mut tick = *t;
+            // Judged in FILE order on the RAW sym (the estimator is
+            // per connection; the remap below is a naming concern).
+            judge.judge(vi, &mut tick, has_venue_time);
             tick.sym = match map_sym(t.sym, &mut summary_extra.4, &mut dropped_foreign) {
                 Some(s) => s,
                 None => continue,
@@ -735,6 +771,7 @@ fn load_run(
             opt_synth_ticks: summary_extra.3,
             remapped_syms: summary_extra.4,
             dropped_foreign,
+            stale: judge.stats,
         },
     ))
 }
@@ -745,7 +782,10 @@ fn load_run(
 /// non-decreasing; a regression means two capture runs overlap in
 /// wall time (two engines writing one log root), which no continuous
 /// replay can honestly represent — untrustworthy, nonzero exit.
-fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
+fn load_and_merge(
+    runs: &[RunDir],
+    stale_after_ms: [u32; 7],
+) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
     // manifest join — each run's `<sym>\t<descriptor>` rows joined
     // by DESCRIPTOR to the NEWEST run's manifest, so option ordinals
@@ -777,7 +817,7 @@ fn load_and_merge(runs: &[RunDir]) -> Result<(Vec<MergedRec>, Vec<RunSummary>), 
                 }
             }
         }
-        let (recs, summary) = load_run(run, &remap, &dead)?;
+        let (recs, summary) = load_run(run, &remap, &dead, stale_after_ms)?;
         summaries.push(summary);
         if recs.is_empty() {
             continue; // header-only files everywhere: run holds no records
@@ -1128,6 +1168,8 @@ pub struct HarnessStats {
     pub dropped_foreign: u64,
     /// D-7 mark-law fills executed (> 0 ⇒ the assumption printed).
     pub mark_fills: u64,
+    /// VT4: ticks the fill model skipped as STALE (no mark, no fill).
+    pub stale_ticks_skipped: u64,
     /// Warmup window end on the virtual clock (== first_virt when 0).
     pub warmup_end_virt_ns: u64,
     /// D-3: OOS round-trips (exit landed at/after the boundary).
@@ -1195,7 +1237,12 @@ fn warmup_ns_of(table: &RuleTableV2) -> u64 {
 /// any nonzero exit as "no trustworthy report exists".
 pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     let split = parse_split(&cfg.split)?;
-    let model = parse_model_params(&cfg.fee_bps, cfg.latency_ns, &cfg.latency_ns_venue)?;
+    let model = parse_model_params(
+        &cfg.fee_bps,
+        cfg.latency_ns,
+        &cfg.latency_ns_venue,
+        &cfg.stale_after_ms,
+    )?;
 
     // Candidate bytes + identity (§3.5): full SHA-256 is schema-1's
     // `ruleset_hash`; its first 16 bytes are the wire hash128.
@@ -1212,7 +1259,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
 
     // Capture discovery + merge + rebase (§3.1–§3.3).
     let runs = discover_runs(&cfg.replay_dir)?;
-    let (merged, run_summaries) = load_and_merge(&runs)?;
+    let (merged, run_summaries) = load_and_merge(&runs, model.stale_after_ms)?;
     let universe = derive_universe(&merged);
 
     // The REUSED validator (§3.5) — same byte scanner, same reject
@@ -1463,6 +1510,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
+        stale_ticks_skipped: outcome.stale_ticks_skipped,
         warmup_end_virt_ns: warmup_end_virt,
         oos_round_trips,
         position_rows,
@@ -1481,7 +1529,15 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     // §5: the optional operator sidecar — written BEFORE stdout so a
     // failed write yields a nonzero exit with nothing on stdout.
     if let Some(detail_path) = &cfg.emit_detail {
-        let detail = render_detail(&hash_hex, &cfg.split, &model, &stats, &outcome, &engine);
+        let detail = render_detail(
+            &hash_hex,
+            &cfg.split,
+            &model,
+            &stats,
+            &outcome,
+            &engine,
+            &run_summaries,
+        );
         std::fs::write(detail_path, detail).map_err(|e| {
             HarnessError::Usage(format!(
                 "cannot write --emit-detail {}: {e}",
@@ -1497,6 +1553,66 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         summary,
         stats,
     })
+}
+
+/// VT4: one deterministic per-run stale line — every present lane as
+/// `label=stale/ticks (bps‰-style basis points of span)`; a v2 lane
+/// prints `stale-blind` so nobody mistakes "0 stale" for "measured".
+/// `pub(crate)`: audit-pnl prints the same shape.
+pub(crate) fn render_stale_line(stale: &[stale::StaleStats; VENUE_LABELS.len()]) -> String {
+    let mut s = String::with_capacity(160);
+    s.push_str(" stale:");
+    for (lord, label) in VENUE_LABELS.iter().enumerate() {
+        let st = &stale[lord];
+        if st.ticks == 0 {
+            continue;
+        }
+        if st.stale_blind {
+            s.push_str(&format!(" {label}=stale-blind(v2)"));
+        } else {
+            s.push_str(&format!(
+                " {label}={}/{} ({}bps)",
+                st.stale_ticks,
+                st.ticks,
+                st.stale_time_bps()
+            ));
+        }
+    }
+    s
+}
+
+/// VT4 sidecar block: one object per run, one entry per PRESENT lane —
+/// `{"epoch_ns":…,"lanes":{"okx":{"ticks":n,"stale_ticks":n,
+/// "stale_time_bps":n,"stale_blind":false},…}}` (BTree-free: the lane
+/// order is the fixed [`VENUE_LABELS`] order).
+fn render_stale_runs_json(runs: &[RunSummary]) -> String {
+    let mut s = String::with_capacity(256);
+    for (i, r) in runs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{{\"epoch_ns\":{},\"lanes\":{{", r.epoch_ns));
+        let mut first = true;
+        for (lord, label) in VENUE_LABELS.iter().enumerate() {
+            let st = &r.stale[lord];
+            if st.ticks == 0 {
+                continue;
+            }
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            s.push_str(&format!(
+                "\"{label}\":{{\"ticks\":{},\"stale_ticks\":{},\"stale_time_bps\":{},\"stale_blind\":{}}}",
+                st.ticks,
+                st.stale_ticks,
+                st.stale_time_bps(),
+                st.stale_blind
+            ));
+        }
+        s.push_str("}}");
+    }
+    s
 }
 
 /// Deterministic human summary (stderr; §10 harness observability).
@@ -1535,6 +1651,9 @@ fn render_summary(
             s.push_str(&format!(" dropped_foreign={}", r.dropped_foreign));
         }
         s.push('\n');
+        s.push_str("   ");
+        s.push_str(&render_stale_line(&r.stale));
+        s.push('\n');
     }
     s.push_str(&format!(
         "window: virt [{}, {}], split {}/{} boundary {} ({} OOS tick(s))\n",
@@ -1555,7 +1674,8 @@ fn render_summary(
     ));
     s.push_str(&format!(
         "model: latency_ns pm={} bn={} okx={} deribit={} hl={}; fee_bps pm={}:{} bn={}:{} \
-         okx={}:{} deribit={}:{} hl={}:{}; open-order caps {}/sym {} total\n",
+         okx={}:{} deribit={}:{} hl={}:{}; open-order caps {}/sym {} total; \
+         stale_after_ms pm={} bn={} okx={} deribit={} hl={} bybit={} (stale ticks skipped: {})\n",
         model.latency_ns[VenueId::Polymarket as usize],
         model.latency_ns[VenueId::Binance as usize],
         model.latency_ns[VenueId::Okx as usize],
@@ -1573,6 +1693,13 @@ fn render_summary(
         model.fee_bps[VenueId::Hyperliquid as usize].1,
         MAX_OPEN_PER_SYM,
         MAX_OPEN_TOTAL,
+        model.stale_after_ms[VenueId::Polymarket as usize],
+        model.stale_after_ms[VenueId::Binance as usize],
+        model.stale_after_ms[VenueId::Okx as usize],
+        model.stale_after_ms[VenueId::Deribit as usize],
+        model.stale_after_ms[VenueId::Hyperliquid as usize],
+        model.stale_after_ms[VenueId::Bybit as usize],
+        stats.stale_ticks_skipped,
     ));
     s.push_str(&format!(
         "orders: accepted is={} oos={}, rejected_caps={}+{} (sym+total), unroutable={}, \
@@ -1624,7 +1751,8 @@ fn render_summary(
 }
 
 /// The `--emit-detail` sidecar (§5): versioned SEPARATELY from
-/// schema-1 (`detail_version` 1), operator/session surface, never
+/// schema-1 (`detail_version` 2 since VT4 — the `stale` block and the
+/// model's `stale_after_ms` table), operator/session surface, never
 /// parsed by the worker. Hand-rendered like schema-1 — every value is
 /// numeric, a fixed label, the validated split echo, or the hash hex;
 /// USD values are the same fixed-point renders as the stderr summary.
@@ -1635,18 +1763,22 @@ fn render_detail(
     stats: &HarnessStats,
     outcome: &ModelOutcome,
     engine: &FillEngine,
+    runs: &[RunSummary],
 ) -> String {
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
         concat!(
-            "{{\"detail_version\":1,",
+            "{{\"detail_version\":2,",
             "\"ruleset_hash\":\"{hash}\",",
             "\"split\":\"{split}\",",
             "\"model\":{{",
             "\"latency_ns\":{{\"pm\":{lpm},\"bn\":{lbn},\"okx\":{lokx},\"deribit\":{lde},\"hl\":{lhl}}},",
             "\"fee_bps\":{{\"pm\":[{fpm0},{fpm1}],\"bn\":[{fbn0},{fbn1}],\"okx\":[{fokx0},{fokx1}],",
             "\"deribit\":[{fde0},{fde1}],\"hl\":[{fhl0},{fhl1}]}},",
-            "\"open_order_caps\":[{cap_sym},{cap_tot}]}},",
+            "\"open_order_caps\":[{cap_sym},{cap_tot}],",
+            "\"stale_after_ms\":{{\"pm\":{spm},\"bn\":{sbn},\"okx\":{sokx},\"deribit\":{sde},",
+            "\"hl\":{shl},\"bybit\":{sby}}}}},",
+            "\"stale\":{{\"ticks_skipped\":{sts},\"runs\":[{sruns}]}},",
             "\"window\":{{\"first_virt_ns\":{fv},\"last_virt_ns\":{lv},\"boundary_virt_ns\":{bv},",
             "\"merged_records\":{mr},\"oos_records\":{or}}},",
             "\"orders\":{{\"emitted\":{oe},\"accepted_is\":{ois},\"accepted_oos\":{ooos},",
@@ -1680,6 +1812,14 @@ fn render_detail(
         fhl1 = model.fee_bps[VenueId::Hyperliquid as usize].1,
         cap_sym = MAX_OPEN_PER_SYM,
         cap_tot = MAX_OPEN_TOTAL,
+        spm = model.stale_after_ms[VenueId::Polymarket as usize],
+        sbn = model.stale_after_ms[VenueId::Binance as usize],
+        sokx = model.stale_after_ms[VenueId::Okx as usize],
+        sde = model.stale_after_ms[VenueId::Deribit as usize],
+        shl = model.stale_after_ms[VenueId::Hyperliquid as usize],
+        sby = model.stale_after_ms[VenueId::Bybit as usize],
+        sts = stats.stale_ticks_skipped,
+        sruns = render_stale_runs_json(runs),
         fv = stats.first_virt_ns,
         lv = stats.last_virt_ns,
         bv = stats.boundary_virt_ns,
@@ -1814,6 +1954,7 @@ mod tests {
             &["pm:0:10".to_owned(), "hl:3:4".to_owned()],
             Some(1_000),
             &["deribit:42".to_owned()],
+            &["okx:250".to_owned(), "bn:0".to_owned(), "okx:300".to_owned()],
         )
         .unwrap();
         // Global latency replaced every TRADEABLE slot (the Ai dead
@@ -1822,6 +1963,12 @@ mod tests {
         assert_eq!(p.fee_bps[VenueId::Polymarket as usize], (0, 10));
         assert_eq!(p.fee_bps[VenueId::Hyperliquid as usize], (3, 4));
         assert_eq!(p.fee_bps[VenueId::Binance as usize], (0, 0));
+        // VT4: stale thresholds default to the venue table; overrides
+        // replace only the named venue, the last spec wins, 0 is legal.
+        assert_eq!(p.stale_after_ms[VenueId::Okx as usize], 300);
+        assert_eq!(p.stale_after_ms[VenueId::Binance as usize], 0);
+        assert_eq!(p.stale_after_ms[VenueId::Bybit as usize], 500);
+        assert_eq!(p.stale_after_ms[VenueId::Ai as usize], 0);
     }
 
     #[test]
@@ -1831,7 +1978,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_model_params(&[bad_fee.to_owned()], None, &[]),
+                    parse_model_params(&[bad_fee.to_owned()], None, &[], &[]),
                     Err(HarnessError::Usage(_))
                 ),
                 "fee spec {bad_fee:?} must be a usage error"
@@ -1840,10 +1987,19 @@ mod tests {
         for bad_lat in ["pm", "pm:1:2", "rpc:5", "nope:5", "pm:x"] {
             assert!(
                 matches!(
-                    parse_model_params(&[], None, &[bad_lat.to_owned()]),
+                    parse_model_params(&[], None, &[bad_lat.to_owned()], &[]),
                     Err(HarnessError::Usage(_))
                 ),
                 "latency spec {bad_lat:?} must be a usage error"
+            );
+        }
+        for bad_stale in ["okx", "mars:400", "okx:fast", "okx:-1"] {
+            assert!(
+                matches!(
+                    parse_model_params(&[], None, &[], &[bad_stale.to_owned()]),
+                    Err(HarnessError::Usage(_))
+                ),
+                "stale spec {bad_stale:?} must be a usage error"
             );
         }
     }

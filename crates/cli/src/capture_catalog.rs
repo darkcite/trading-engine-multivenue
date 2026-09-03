@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
-use core_types::Tick;
+use core_types::{Tick, TICK_FLAG_STALE};
 
 use crate::backtest::{parse_run_dir_name, pmlr_version_accepted, VENUE_LABELS};
 
@@ -118,6 +118,10 @@ struct VenueFileStat {
     first_ts_ns: u64,
     /// Last record's monotonic ts (0 when `records == 0`).
     last_ts_ns: u64,
+    /// VT4: records the ingress CAPTURED as stale (`TICK_FLAG_STALE`,
+    /// the boot-time thresholds — the harness re-judges, this does
+    /// not); `None` on a v2 file, which is stale-blind.
+    stale_captured: Option<u64>,
     /// Why the harness would refuse this file, when it would
     /// (deterministic text — no OS error strings).
     note: Option<String>,
@@ -381,6 +385,7 @@ fn inspect_run(
             bytes: fbytes,
             first_ts_ns: 0,
             last_ts_ns: 0,
+            stale_captured: None,
             note: None,
         };
         let mut ok = false;
@@ -404,6 +409,13 @@ fn inspect_run(
                         last = records[records.len() - 1].ts_ns;
                         stat.first_ts_ns = first;
                         stat.last_ts_ns = last;
+                    }
+                    if reader.has_venue_time() {
+                        let mut stale = 0u64;
+                        for t in records {
+                            stale += u64::from(t.flags & TICK_FLAG_STALE != 0);
+                        }
+                        stat.stale_captured = Some(stale);
                     }
                     kept = Some(reader);
                 }
@@ -836,6 +848,10 @@ fn render_json(
                 "{{\"venue\":\"{}\",\"records\":{},\"bytes\":{},\"first_ts_ns\":{},\"last_ts_ns\":{}",
                 VENUE_LABELS[v.lord], v.records, v.bytes, v.first_ts_ns, v.last_ts_ns
             ));
+            match v.stale_captured {
+                Some(n) => s.push_str(&format!(",\"stale_captured\":{n}")),
+                None => s.push_str(",\"stale_captured\":null"),
+            }
             if let Some(note) = &v.note {
                 s.push_str(&format!(",\"note\":\"{}\"", esc(note)));
             }
@@ -971,6 +987,11 @@ fn render_summary(
         ));
         for v in &r.venues {
             s.push_str(&format!(" {}={}", VENUE_LABELS[v.lord], v.records));
+            match v.stale_captured {
+                Some(n) if v.records > 0 => s.push_str(&format!("(stale {n})")),
+                None if v.records > 0 => s.push_str("(stale-blind v2)"),
+                _ => {}
+            }
             if let Some(note) = &v.note {
                 s.push_str(&format!("[{note}]"));
             }

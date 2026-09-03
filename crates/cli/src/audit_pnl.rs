@@ -102,6 +102,8 @@ pub struct AuditPnlConfig {
     pub latency_ns: Option<u64>,
     /// Repeatable `--latency-ns-venue <venue>:<ns>` overrides.
     pub latency_ns_venue: Vec<String>,
+    /// VT4: repeatable `--stale-after-ms <venue>:<ms>` overrides.
+    pub stale_after_ms: Vec<String>,
 }
 
 // ---------------------------------------------------------------
@@ -312,6 +314,8 @@ struct RunLoad {
     /// `<venue>-opt-summary.pmlr` for option syms without a tick
     /// lane; these syms execute under the mark-fill law.
     opt_synth_ticks: u64,
+    /// VT4: per-lane stale accounting (the harness re-judge).
+    stale: [crate::backtest::stale::StaleStats; VENUE_LABELS.len()],
 }
 
 /// Load one run: every §9.9 input, syms rewritten to root-dense ids,
@@ -320,11 +324,15 @@ fn load_run_events(
     run: &RunDir,
     interner: &mut SymInterner,
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
+    stale_after_ms: [u32; 7],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
         epoch_ns: run.epoch_ns,
         ..RunLoad::default()
     };
+    // VT4: one re-judge per run (connections and their clock offsets
+    // are per run); a threshold change is a replay, never a recapture.
+    let mut judge = crate::backtest::stale::StaleJudge::new(stale_after_ms);
     let (manifest, malformed) = read_run_manifest(&run.path);
     load.manifest = manifest.is_some();
     load.manifest_malformed = malformed;
@@ -353,11 +361,15 @@ fn load_run_events(
         let Some(reader) = open_checked::<Tick>(&path, SlotKind::Tick, run.epoch_ns)? else {
             continue;
         };
+        let has_venue_time = reader.has_venue_time();
         for (i, t) in reader.records().iter().enumerate() {
             if t.sym == SYMBOL_ID_NONE {
                 continue;
             }
             let mut tick = *t;
+            // Judged in FILE order on the RAW sym (the estimator is per
+            // connection; interning is a naming concern).
+            judge.judge(lord, &mut tick, has_venue_time);
             tick.sym = resolve(t.sym, interner, &mut load)?;
             evs.push(Ev {
                 ts_ns: t.ts_ns,
@@ -420,6 +432,7 @@ fn load_run_events(
             load.ticks += 1;
         }
     }
+    load.stale = judge.stats;
     if load.ticks == 0 {
         // No tick anchor: nothing can mark or fill — the run
         // contributes nothing (reported, not fatal).
@@ -491,13 +504,14 @@ fn load_and_merge_events(
     runs: &[RunDir],
     interner: &mut SymInterner,
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
+    stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedEv> = Vec::new();
     let mut loads: Vec<RunLoad> = Vec::with_capacity(runs.len());
     let mut prev_last_virt: u64 = 0;
     for run in runs {
-        let (evs, mut load) = load_run_events(run, interner, mark_fill_syms)?;
+        let (evs, mut load) = load_run_events(run, interner, mark_fill_syms, stale_after_ms)?;
         if evs.is_empty() {
             loads.push(load);
             continue;
@@ -557,12 +571,17 @@ struct KeyRow {
 /// Run the whole report. Returns the stdout JSON line; human summary
 /// goes through `report` (stderr).
 pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String, HarnessError> {
-    let params: ModelParams =
-        parse_model_params(&cfg.fee_bps, cfg.latency_ns, &cfg.latency_ns_venue)?;
+    let params: ModelParams = parse_model_params(
+        &cfg.fee_bps,
+        cfg.latency_ns,
+        &cfg.latency_ns_venue,
+        &cfg.stale_after_ms,
+    )?;
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut interner = SymInterner::default();
     let mut mark_fill_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let (merged, loads) = load_and_merge_events(&runs, &mut interner, &mut mark_fill_syms)?;
+    let (merged, loads) =
+        load_and_merge_events(&runs, &mut interner, &mut mark_fill_syms, params.stale_after_ms)?;
 
     for l in &loads {
         report(&format!(
@@ -599,6 +618,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 l.epoch_ns, l.opt_synth_ticks
             ));
         }
+        // VT4: the per-lane stale verdict of the re-judge — a stale
+        // tick neither fills nor marks; v2 lanes are stale-blind.
+        report(&format!(
+            "audit-pnl: run-{}:{}",
+            l.epoch_ns,
+            crate::backtest::render_stale_line(&l.stale)
+        ));
     }
     if !mark_fill_syms.is_empty() {
         // D-7 obligation: the assumption is PRINTED wherever it can
@@ -616,6 +642,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             ModelParams {
                 fee_bps: params.fee_bps,
                 latency_ns: params.latency_ns,
+                stale_after_ms: params.stale_after_ms,
             },
             0,
         );

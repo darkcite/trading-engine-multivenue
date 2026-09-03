@@ -437,6 +437,8 @@ pub struct ModelOutcome {
     pub mark_fills: u64,
     /// Peak simultaneous open orders on one sym.
     pub peak_open_per_sym: u64,
+    /// VT4: ticks the model skipped as STALE (no mark, no fill).
+    pub stale_ticks_skipped: u64,
 }
 
 /// One per-sym row for the `--emit-detail` sidecar (full book, sorted
@@ -492,6 +494,7 @@ pub struct FillEngine {
     canceled_end: u64,
     peak_open_total: u64,
     peak_open_per_sym: u64,
+    stale_ticks_skipped: u64,
 }
 
 impl FillEngine {
@@ -522,6 +525,7 @@ impl FillEngine {
             canceled_end: 0,
             peak_open_total: 0,
             peak_open_per_sym: 0,
+            stale_ticks_skipped: 0,
         }
     }
 
@@ -643,6 +647,16 @@ impl FillEngine {
         out.clear();
         let sym = tick.sym;
         if sym == SYMBOL_ID_NONE {
+            return;
+        }
+        // VT4 (docs/venue-time-capture-plan.md §2 doctrine 3): a STALE
+        // tick neither marks nor fills — the venue's book is unknown,
+        // so it is not fill evidence and must not move the mark. Same
+        // conservative direction as the one-sided rule below. The
+        // stale bit is the harness's own re-judgement on v3 roots
+        // (`backtest::stale`), never-set on v2 roots.
+        if tick.is_stale() {
+            self.stale_ticks_skipped += 1;
             return;
         }
         let bid = tick.bid_px.raw();
@@ -827,6 +841,7 @@ impl FillEngine {
             canceled_end: self.canceled_end,
             peak_open_total: self.peak_open_total,
             peak_open_per_sym: self.peak_open_per_sym,
+            stale_ticks_skipped: self.stale_ticks_skipped,
             mark_fills: self.mark_fills,
         }
     }
@@ -899,6 +914,7 @@ mod tests {
         let p = ModelParams {
             fee_bps: [(0, 0); 7],
             latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
         };
         FillEngine::new(p, boundary)
     }
@@ -1126,6 +1142,7 @@ mod tests {
         let p = ModelParams {
             fee_bps: [(50, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // PM maker 50 bps
             latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
         };
         let mut e = FillEngine::new(p, 0); // all OOS
         let mut out = Vec::new();
@@ -1163,6 +1180,7 @@ mod tests {
             // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
             fee_bps: [(50, 0), (10, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
             latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
         };
         let mut e = FillEngine::new(p, 0);
         let mut out = Vec::new();
@@ -1453,6 +1471,7 @@ mod tests {
             let params = ModelParams {
                 fee_bps: [(maker_bps, 0); 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
+                stale_after_ms: VenueId::stale_after_ms_defaults(),
             };
             let mut e = FillEngine::new(params, u64::MAX / 2);
             let mut out = Vec::new();
@@ -1521,6 +1540,7 @@ mod tests {
             let params = ModelParams {
                 fee_bps: [(maker_bps, 0); 7],
                 latency_ns: [0; 7],
+                stale_after_ms: VenueId::stale_after_ms_defaults(),
             };
             let mut e = FillEngine::new(params, 0);
             let mut out = Vec::new();

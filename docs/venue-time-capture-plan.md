@@ -291,3 +291,37 @@ ruling); the Binance spot book-builder lane; any strategy work.
   (v2 files keep the v2 law) with a golden `ticks_v3.pmlr` test. The
   metrics half of VT3 shipped with VT2. Not touched: capture-derived
   candles (`candles.py`, PM only) still fold stale ticks — a VT5 note.
+- 2026-09-03 — **VT4 landed (harness stale law).** New
+  `cli::backtest::stale` — `StaleJudge` (one `core_time::FeedClock` per
+  (venue, sym) per run, judged in FILE order on the RAW sym, thresholds
+  from `ModelParams::stale_after_ms`) REWRITES `TICK_FLAG_STALE` on every
+  v3 tick from its `venue_time_ms` (the sentinel bit survives); a v2
+  file's ticks stay never-stale and the lane is `stale_blind`. So a
+  threshold change is a REPLAY: the same capture under `pm:0` / `pm:5000`
+  reproduces the golden P&L byte for byte. `fill.rs::on_record` returns
+  on a stale tick before the mark and the fill scan (`stale_ticks_skipped`
+  counted in `ModelOutcome` → `HarnessStats`). `ModelParams` gains
+  `stale_after_ms: [u32; 7]` (`VenueId::stale_after_ms_defaults()`, the
+  table the engine flag shares); `parse_model_params` takes the
+  `--stale-after-ms <venue>:<ms>` specs on `backtest` and `audit-pnl`
+  (bin + `BacktestConfig` / `AuditPnlConfig`). Surfaces: the backtest
+  stderr model line prints the threshold table + skipped count and every
+  run line gains `stale: pm=1/4 (4285bps) bn=0/1 (0bps)` / `stale-blind(v2)`
+  (`render_stale_line`, shared verbatim by audit-pnl's per-run report);
+  the `--emit-detail` sidecar is **`detail_version` 2** — `model` carries
+  `stale_after_ms`, a new `stale` block carries `ticks_skipped` + per-run
+  per-lane `{ticks, stale_ticks, stale_time_bps, stale_blind}`. Schema-1
+  stdout unchanged (frozen). capture-catalog: per-lane `stale_captured`
+  (the ingress's boot-time verdict, NOT a re-judge; `null`/`stale-blind v2`
+  on v2 files) in JSON + summary. Tests: stale unit (re-judge, bit1 kept,
+  stale-time accounting, v2 blind, threshold 0); harness golden-minus-
+  one-stale-tick (trades 2→1, days 2→1, trough + final mark unchanged,
+  stderr + sidecar exact), replay-not-recapture (`pm:0`, `pm:5000`, v2
+  rewrite ⇒ golden + stale-blind); audit-pnl (stale crossing tick never
+  fills, `pm:0` restores the +$1 markout); catalog v3/v2 lanes. The
+  existing goldens are unchanged because `Tick::new` ticks carry stamp 0
+  (unknown ⇒ fresh). Deviation from §5: `stale_time_pct` is rendered as
+  integer basis points of the file span (deterministic, no floats).
+  Not done here: the Aug-30 xv-window replay (a v2 root — it prints
+  `stale-blind(v2)`, which is the point; the gate on/off delta needs the
+  VT5 v3 capture).

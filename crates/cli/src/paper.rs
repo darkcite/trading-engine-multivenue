@@ -2802,12 +2802,7 @@ impl Observability {
 /// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`). A zero
 /// disables the judgement for that venue (nothing is ever stale).
 pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; 7], String> {
-    let mut table = [0u32; 7];
-    let mut i = 0;
-    while i < table.len() {
-        table[i] = VenueId::from_u8(i as u8).map_or(0, VenueId::default_stale_after_ms);
-        i += 1;
-    }
+    let mut table = VenueId::stale_after_ms_defaults();
     for spec in specs {
         let (label, ms) = spec
             .split_once(':')

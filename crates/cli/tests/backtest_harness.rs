@@ -121,6 +121,7 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         fee_bps: Vec::new(),
         latency_ns: None,
         latency_ns_venue: Vec::new(),
+        stale_after_ms: Vec::new(),
         emit_detail: None,
     }
 }
@@ -760,7 +761,7 @@ fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
     assert_eq!(out_a.schema1, out_b.schema1);
     // Versioned separately from schema-1; carries the operator detail
     // the frozen stdout must NOT carry (§5).
-    assert!(a.starts_with("{\"detail_version\":1,"));
+    assert!(a.starts_with("{\"detail_version\":2,"), "VT4 bumped the sidecar version");
     assert!(a.contains("\"canceled_end\":1"));
     assert!(
         a.contains("\"full\":{\"realized_usd\":6.75,"),
@@ -771,6 +772,111 @@ fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
     assert!(!out_a.schema1.contains("detail_version"));
     // The summary names the sidecar path.
     assert!(out_a.summary.contains("--emit-detail: sidecar written to"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// VT4: rewrite run 1's pm lane with venue stamps so that the seq-6
+/// tick (O3's first partial fill in the golden script) is judged
+/// STALE under the pm default (1000 ms): stamps advance with the clock
+/// except seq 6, whose stamp is 2 s behind ⇒ delay 2300 ms.
+fn stamp_pnl_run1_pm_with_one_stale_tick(root: &Path) {
+    let run1 = root.join(format!("run-{PNL_EPOCH_RUN_1}"));
+    let stamped = |ts_ns: u64, seq: u32, bid: i64, ask: i64, ask_q: i64, venue_ms: u64| {
+        Tick::new_stamped(
+            ts_ns,
+            VenueId::Polymarket,
+            42,
+            seq,
+            Price::from_raw(bid),
+            Qty::from_raw(10_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(ask_q),
+            venue_ms,
+            0,
+        )
+    };
+    write_ticks(
+        &run1,
+        "pm",
+        PNL_EPOCH_RUN_1,
+        &[
+            stamped(700, 5, 380_000, 420_000, 10_000_000, 1_000_000),
+            stamped(300_000_700, 6, 350_000, 380_000, 70_000_000, 998_000),
+            stamped(900_000_700, 7, 350_000, 380_000, 200_000_000, 1_000_900),
+            stamped(1_400_000_700, 8, 430_000, 450_000, 10_000_000, 1_001_400),
+        ],
+    );
+}
+
+#[test]
+fn vt4_stale_tick_neither_fills_nor_marks_and_is_reported() {
+    // Golden script minus the stale seq-6 tick: O3 fills 125 in ONE
+    // fill at seq 7 (day 1970-01-03 only) — trades 1, days 1, the
+    // trough (−4.375) and the final mark (+5.0) unchanged.
+    let root = unique_root("pnlstale");
+    let ruleset = build_pnl_capture(&root);
+    stamp_pnl_run1_pm_with_one_stale_tick(&root);
+    let detail = root.join("detail.json");
+    let mut c = cfg(&ruleset, &root, "70/30");
+    c.emit_detail = Some(detail.clone());
+
+    let out = cli::backtest::run(&c).expect("harness ok");
+    let expected = pnl_schema1()
+        .replace("\"trades\":2,\"trading_days\":2", "\"trades\":1,\"trading_days\":1")
+        .replace("\"legs\":2", "\"legs\":1");
+    assert_eq!(out.schema1, expected, "stale seq-6 skipped: {}", out.summary);
+    let s = out.stats;
+    assert_eq!(s.stale_ticks_skipped, 1);
+    assert_eq!(s.fills_total, 3, "2 IS fills + ONE OOS fill");
+    assert_eq!(s.fills_oos, 1);
+    assert_eq!(s.oos_trading_days, 1);
+    assert_eq!(s.oos_max_drawdown_1e6, 4_375_000, "125 marked at 0.365 after seq 7");
+    assert_eq!(s.oos_net_pnl_1e6, 5_000_000);
+    // stderr: run 0 all fresh; run 1 pm 1/4 stale, 600 ms of a 1.4 s
+    // span = 4285 bps; bn lanes carry no stamp (0) ⇒ never stale.
+    assert!(out.summary.contains(" stale: pm=0/4 (0bps) bn=0/1 (0bps)\n"), "{}", out.summary);
+    assert!(out.summary.contains(" stale: pm=1/4 (4285bps) bn=0/1 (0bps)\n"), "{}", out.summary);
+    assert!(out.summary.contains("(stale ticks skipped: 1)"));
+    assert!(out.summary.contains("stale_after_ms pm=1000 bn=1000 okx=400 deribit=600 hl=700 bybit=500"));
+    // sidecar v2: the model's thresholds + the per-run lane block.
+    let d = std::fs::read_to_string(&detail).expect("sidecar");
+    assert!(d.starts_with("{\"detail_version\":2,"));
+    assert!(d.contains("\"stale_after_ms\":{\"pm\":1000,\"bn\":1000,\"okx\":400,\"deribit\":600,\"hl\":700,\"bybit\":500}"), "{d}");
+    assert!(d.contains(&format!(
+        "\"stale\":{{\"ticks_skipped\":1,\"runs\":[{{\"epoch_ns\":{PNL_EPOCH_RUN_0},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}},{{\"epoch_ns\":{PNL_EPOCH_RUN_1},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":1,\"stale_time_bps\":4285,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}}]}}"
+    )), "{d}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn vt4_threshold_change_is_a_replay_not_a_recapture() {
+    // The same stamped capture judged under `pm:0` (judgement OFF) and
+    // under `pm:5000` (2300 ms is fresh) reproduces the golden P&L
+    // byte for byte: the stale bit is derived at load, never trusted
+    // from the file.
+    let root = unique_root("pnlstalethr");
+    let ruleset = build_pnl_capture(&root);
+    stamp_pnl_run1_pm_with_one_stale_tick(&root);
+    for spec in ["pm:0", "pm:5000"] {
+        let mut c = cfg(&ruleset, &root, "70/30");
+        c.stale_after_ms = vec![spec.to_owned()];
+        let out = cli::backtest::run(&c).expect("harness ok");
+        assert_eq!(out.schema1, pnl_schema1(), "{spec}: golden P&L");
+        assert_eq!(out.stats.stale_ticks_skipped, 0, "{spec}");
+        assert!(out.summary.contains(" stale: pm=0/4 (0bps) bn=0/1 (0bps)\n"), "{spec}: {}", out.summary);
+    }
+    // And a v2 file of the same bytes is STALE-BLIND: golden P&L, the
+    // lane says so instead of claiming "0 stale".
+    let pm_path = root.join(format!("run-{PNL_EPOCH_RUN_1}")).join("pm-ticks.pmlr");
+    let mut bytes = std::fs::read(&pm_path).expect("read pm");
+    assert_eq!(bytes[4..6], [3, 0], "writer emits v3 (u16 LE at 4..6)");
+    bytes[4] = 2;
+    std::fs::write(&pm_path, bytes).expect("rewrite pm as v2");
+    let out = cli::backtest::run(&cfg(&ruleset, &root, "70/30")).expect("harness ok");
+    assert_eq!(out.schema1, pnl_schema1(), "v2: golden P&L (stale-blind)");
+    assert!(out.summary.contains(" stale: pm=stale-blind(v2) bn=0/1 (0bps)\n"), "{}", out.summary);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -927,6 +1033,7 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         ],
         latency_ns: Some(0),
         latency_ns_venue: Vec::new(),
+        stale_after_ms: Vec::new(),
         emit_detail: None,
     }
 }

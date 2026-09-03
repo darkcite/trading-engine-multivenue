@@ -99,6 +99,21 @@ impl VenueId {
             Self::Bybit => 500,
         }
     }
+
+    /// VT2/VT4: the whole default threshold table indexed by the venue
+    /// byte — the ONE table the engine flag parser and the harness
+    /// `ModelParams` share.
+    pub const fn stale_after_ms_defaults() -> [u32; 7] {
+        [
+            Self::Polymarket.default_stale_after_ms(),
+            Self::Binance.default_stale_after_ms(),
+            Self::Okx.default_stale_after_ms(),
+            Self::Deribit.default_stale_after_ms(),
+            Self::Hyperliquid.default_stale_after_ms(),
+            Self::Ai.default_stale_after_ms(),
+            Self::Bybit.default_stale_after_ms(),
+        ]
+    }
 }
 
 /// Dense u32 identifier for a trading symbol, namespaced by venue:
@@ -2808,6 +2823,20 @@ mod tests {
         assert_eq!(VenueId::Hyperliquid.default_stale_after_ms(), 700);
         assert_eq!(VenueId::Polymarket.default_stale_after_ms(), 1_000);
         assert_eq!(VenueId::Ai.default_stale_after_ms(), 0);
+    }
+
+    #[test]
+    fn stale_after_ms_defaults_is_indexed_by_the_venue_byte() {
+        let table = VenueId::stale_after_ms_defaults();
+        let mut b = 0u8;
+        while (b as usize) < table.len() {
+            let venue = VenueId::from_u8(b).expect("every index is a venue");
+            assert_eq!(table[b as usize], venue.default_stale_after_ms(), "byte {b}");
+            b += 1;
+        }
+        // One past the table is not a venue: the table is exactly the
+        // venue-byte space, nothing more.
+        assert!(VenueId::from_u8(table.len() as u8).is_none());
     }
 
     #[test]
