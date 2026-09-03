@@ -57,9 +57,9 @@ use core_net::{
     Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
-use core_time::now_ns;
+use core_time::{now_ns, FeedClock};
 use core_types::{
-    Capture, ChannelEvent, ChannelId, EVENT_RING_SIZE, Price, Qty, Tick, VenueId,
+    Capture, ChannelEvent, ChannelId, EVENT_RING_SIZE, Price, Qty, Tick, VenueId, TICK_FLAG_STALE,
 };
 
 use crate::{
@@ -223,6 +223,14 @@ pub struct Driver {
     subscribed: bool,
     /// Set once `found == expected` (staleness armed at that edge).
     verified: bool,
+    /// VT2: this connection's venue-clock offset estimator + staleness
+    /// judge for `bbo` (`time`, ms — block-paced, so the 700 ms default
+    /// is cadence + delay). Reset on reconnect; threshold = venue
+    /// default or `--stale-after-ms hl:<ms>` via
+    /// [`Self::set_stale_after_ms`]. Distinct from the §6.2
+    /// [`HlStaleness`] monitor, which watches `l2Book` cadence per coin
+    /// and kills the session — this one flags individual ticks.
+    feed_clock: FeedClock,
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -258,8 +266,23 @@ impl Driver {
             steady_since_ns: 0,
             subscribed: false,
             verified: false,
+            feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// VT2: override the staleness threshold (operator
+    /// `--stale-after-ms hl:<ms>`). Boot-time only — re-arms the
+    /// estimator unlearned, exactly like a fresh connection.
+    #[inline]
+    pub fn set_stale_after_ms(&mut self, ms: u32) {
+        self.feed_clock = FeedClock::new(ms);
+    }
+
+    /// VT2: the connection's smoothed `bbo` feed delay in ms.
+    #[inline]
+    pub fn feed_delay_ema_ms(&self) -> u32 {
+        self.feed_clock.delay_ema_ms()
     }
 
     /// Current state (metrics + tests).
@@ -303,6 +326,8 @@ impl Driver {
         self.steady_since_ns = 0;
         self.subscribed = false;
         self.verified = false;
+        // VT2: a new connection is a new offset; the threshold stays.
+        self.feed_clock.reset();
     }
 }
 
@@ -832,20 +857,30 @@ fn handle_data_frame<C: Capture>(
                     }) {
                         Some((sym, Some(coin_idx))) => match channel {
                             HlChannel::Bbo => match parse_bbo(payload, sym) {
-                                Some(f) => Dispatch::Bbo {
-                                    // venue_seq = time (ms) as u32 —
-                                    // crate-header policy.
-                                    tick: Tick::new(
-                                        now_ns(),
-                                        VenueId::Hyperliquid,
-                                        sym,
-                                        (f.ts_ns / 1_000_000) as u32,
-                                        Price::from_raw(f.bid_px_1e6),
-                                        Qty::from_raw(f.bid_qty_1e6),
-                                        Price::from_raw(f.ask_px_1e6),
-                                        Qty::from_raw(f.ask_qty_1e6),
-                                    ),
-                                },
+                                Some(f) => {
+                                    // VT2: one parse-complete stamp
+                                    // serves the tick AND the judgement;
+                                    // `time` is the venue block time.
+                                    let now = now_ns();
+                                    let venue_time_ms = f.ts_ns / 1_000_000;
+                                    let judged = drv.feed_clock.judge(venue_time_ms, now);
+                                    Dispatch::Bbo {
+                                        // venue_seq = time (ms) as u32 —
+                                        // crate-header policy.
+                                        tick: Tick::new_stamped(
+                                            now,
+                                            VenueId::Hyperliquid,
+                                            sym,
+                                            venue_time_ms as u32,
+                                            Price::from_raw(f.bid_px_1e6),
+                                            Qty::from_raw(f.bid_qty_1e6),
+                                            Price::from_raw(f.ask_px_1e6),
+                                            Qty::from_raw(f.ask_qty_1e6),
+                                            venue_time_ms,
+                                            (judged.stale as u8) * TICK_FLAG_STALE,
+                                        ),
+                                    }
+                                }
                                 None => Dispatch::Nothing,
                             },
                             HlChannel::L2Book => match parse_l2book_header(payload, sym) {
@@ -971,6 +1006,13 @@ fn handle_data_frame<C: Capture>(
         Dispatch::Bbo { tick } => {
             status.add_msgs(1);
             status.add_ticks(1);
+            // VT2: stale ticks are captured and pushed like any other
+            // (the flag travels with the slot); counted here, gauge
+            // published per tick.
+            if tick.is_stale() {
+                status.inc_stale_ticks();
+            }
+            status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
             // §6.5 capture BEFORE the push — a ring-dropped tick must
             // still reach the replay log (the audit pairs capture
             // counts with ring_drops_total).
@@ -1552,6 +1594,79 @@ mod tests {
         assert_eq!(tick.bid_qty.raw(), 1_449_100);
         assert_eq!(tick.ask_qty.raw(), 541_000);
         assert!(tick.ts_ns > 0);
+        // VT2: the venue stamp rides the slot in full.
+        assert_eq!(tick.venue_time_ms, 1_708_622_398_623);
+    }
+
+    /// VT2 helper: one `bbo` push for BTC stamped `time = ts_ms`
+    /// through the steady driver; returns the tick it produced.
+    fn push_bbo_with_time(
+        t: &mut TestTransport,
+        d: &mut Driver,
+        prod: &mut Producer<Tick, TICK_RING_CAP>,
+        cons: &mut core_ring::Consumer<Tick, TICK_RING_CAP>,
+        status: &IngressStatus,
+        ts_ms: u64,
+    ) -> Tick {
+        let s = format!(
+            r#"{{"channel":"bbo","data":{{"coin":"BTC","time":{ts_ms},"bbo":[{{"px":"64437.0","sz":"1.4491","n":2}},{{"px":"64438.0","sz":"0.541","n":3}}]}}}}"#
+        );
+        inject_text(t, s.as_bytes());
+        drive_one(t, d, b"h", b"/", prod, status, &mut NullCapture).unwrap();
+        cons.try_pop().expect("bbo must produce a tick")
+    }
+
+    #[test]
+    fn bbo_ticks_carry_the_stale_judgement() {
+        // VT2: first stamped push = the offset (fresh); a push whose
+        // block time is 5 s older is stale at hl 700 ms (flag +
+        // counter); a later stamp is fresh again.
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let t0: u64 = 1_755_216_000_000;
+
+        let fresh = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0);
+        assert_eq!(fresh.venue_time_ms, t0);
+        assert!(!fresh.is_stale());
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        let stale = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 5_000);
+        assert!(stale.is_stale());
+        assert_eq!(stale.flags, TICK_FLAG_STALE);
+        assert_eq!(status.stale_ticks_total(), 1);
+        assert!(status.feed_delay_ema_ms() > 0);
+
+        let again = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0 + 10);
+        assert!(!again.is_stale());
+        assert_eq!(status.stale_ticks_total(), 1);
+        assert_eq!(status.ticks_total(), 3);
+    }
+
+    #[test]
+    fn stale_threshold_override_and_reconnect_reset_apply() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = steady_driver();
+        d.set_stale_after_ms(10_000);
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let t0: u64 = 1_755_216_000_000;
+        let _ = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0);
+        let five_s = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 5_000);
+        assert!(!five_s.is_stale(), "5 s is under a 10 s threshold");
+        assert_eq!(status.stale_ticks_total(), 0);
+
+        d.reset_for_reconnect(9);
+        // Re-arm the steady shape the helper builds (the reconnect
+        // cleared it) — the estimator is what is under test here.
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        d.expected = expected_mask(&d.coins);
+        d.steady_since_ns = now_ns();
+        let after = push_bbo_with_time(&mut t, &mut d, &mut prod, &mut cons, &status, t0 - 60_000);
+        assert!(!after.is_stale(), "a reconnect starts a fresh offset");
+        assert_eq!(after.venue_time_ms, t0 - 60_000);
     }
 
     #[test]

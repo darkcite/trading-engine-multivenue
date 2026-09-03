@@ -225,3 +225,13 @@ ruling); the Binance spot book-builder lane; any strategy work.
   USDS-M fresh/stale/fresh sequence, override + reconnect reset.
   `binance_book_ticker` fuzz ≥ 300 s. Remaining: hl, pm, bn-spot
   sentinel.
+- 2026-09-03 — **VT2 venue 5: Hyperliquid.** `bbo` `time` (already
+  parsed as `HlBboFrame.ts_ns`, the venue_seq source) rides the slot;
+  the driver's `FeedClock` (700 ms default = block cadence + delay,
+  `--stale-after-ms hl:<ms>`, reset on reconnect) judges every bbo from
+  the same `now_ns()`; stale ticks counted + gauge. Distinct from the
+  §6.2 `HlStaleness` session monitor (l2Book cadence per coin, kills the
+  session) — this flags individual ticks. Tests: venue_time on the
+  existing bbo test, fresh/stale/fresh, override + reconnect reset.
+  Parser + fuzz target unchanged; `hl_ws_frame` re-run ≥ 300 s.
+  Remaining: pm, bn-spot sentinel.

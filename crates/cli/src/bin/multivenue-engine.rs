@@ -1478,12 +1478,14 @@ fn run(args: RunArgs) -> ExitCode {
     if let Some((hl_coins, hl_ep)) = hl_boot {
         info!(
             coins = hl_coins.len(),
+            stale_after_ms = stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             "hyperliquid: starting ingress thread"
         );
         let hl_handle = match spawn_hyperliquid(
             hl_ep,
             tls_config.clone(),
             hl_coins,
+            stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
             statuses.hyperliquid.clone(),

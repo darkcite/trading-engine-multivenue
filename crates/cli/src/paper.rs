@@ -1452,6 +1452,7 @@ pub fn spawn_hyperliquid(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     coins: ingress_hyperliquid::HlCoinTable,
+    stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
     status: Arc<IngressStatus>,
@@ -1488,6 +1489,8 @@ pub fn spawn_hyperliquid(
                 ingress_hyperliquid::HL_STALENESS_BUDGET_NS,
                 hwl::HL_SUB_ACK_BUDGET_NS,
             );
+            // VT2: venue default or the operator's `--stale-after-ms hl:<ms>`.
+            driver.set_stale_after_ms(stale_after_ms);
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
