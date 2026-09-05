@@ -7,8 +7,9 @@ live smoke PASSED 2026-09-05 (§12); RG4 code-complete 2026-09-05
 `/state` + TUI + the worker page on 9292, all LIVE; §12 last entry).
 RG6 CLOSED by operator ruling 2026-09-05 (§7 exit tell met: page live on
 9292 showing regime, mask, rows, P&L, recent fills). RG7 restated under
-the ≤ 2 h law (§7.1) and OPEN: the soak = N pooled ≤ 2 h windows with
-regime gating live, judged by `regime soak`; §11 defaults apply until
+the ≤ 2 h law (§7.1) and OPEN (judge + seed-hole fix committed
+`2ca05e1`, 2026-09-05): the soak = N pooled ≤ 2 h windows with regime
+gating live, judged by `regime soak`; §11 defaults apply until
 overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
 need to implement the following"). Paper mode only; no
 dispatcher/signer/RiskGate/live-ramp work — the Stage-3 ENTRY GATE
@@ -1825,7 +1826,7 @@ is therefore never a calendar span. It is a COUNT of disjoint, complete,
   wording VOID under the ≤ 2 h law) and opens now.**
 - **2026-09-05 — RG7 OPENED (operator: "then RG7 restated as N ≤ 2 h").
   Restated in §7 (row) + §7.1 (procedure); code + docs landed the same
-  session (uncommitted at writing — operator commits):** `claude_worker.
+  session (committed `2ca05e1` on operator approval):** `claude_worker.
   regime` gains (1) `state_url` / `engine_state` / `engine_regime_sample`
   — the cycle now samples the engine's `/state` regime block (pid,
   cumulative flips per profile x market dim, minutes judged, effective
