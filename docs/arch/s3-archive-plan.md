@@ -1603,6 +1603,106 @@ RESUME POINT.`
   and finally stage B on a separate day (§13.2 rule 5: one change at a time in
   the restart lane).
 
+- **2026-09-05 — GO-LIVE. Operator requirement changed the target policy: "keep
+  the last 24 h locally, older on demand."** Rulings taken: PROTECT_DAYS 5 → 1
+  (**this SUPERSEDES standing ruling D3**); retention becomes a fixed-window
+  sweep rather than a pressure-driven one; build tarball pull now; use the
+  credentials as supplied (no rotation this session).
+
+  **THE THROUGHPUT MYSTERY, SOLVED — and an earlier §16 conclusion RETRACTED.**
+  This entry corrects the previous one. The story in order, because the wrong
+  answer was convincing twice:
+  1. First real push: 87.38 MiB in 908 s = **0.096 MiB/s**. Recorded as "the
+     link is slow and variable".
+  2. A 4 MiB A/B of `taskpolicy -b`: 5.21 vs 5.47 MiB/s → recorded as "background
+     QoS is free". **Both readings were true and both conclusions were wrong.**
+  3. Disk was ruled out (2.2 s of digest+compress for the largest file, even at
+     LowPriorityIO).
+  4. The isolating test: a 32 MiB unthrottled probe hit **5.76 MiB/s while the
+     throttled backfill was crawling on the same link at the same moment**, and
+     `sample` showed the backfill parked in
+     `_ssl__SSLSocket_write → PySSL_select → poll` — blocked on the socket, not
+     on CPU or disk.
+  **Conclusion: macOS's background traffic class does not measurably affect a
+  short burst but throttles a SUSTAINED transfer by ~13×.** A 4 MiB test cannot
+  see it; that is why it looked free. Unthrottled, real runs upload at
+  **4.7–5.6 MiB/s** (1.79 GiB raw → 349 MB stored in 69 s; 3.85 GiB → 733 MB in
+  130 s), consistently ~5.3× compression.
+
+  **The cost of dropping it is real and was measured, not waved away:** during
+  the unthrottled backfill venue feed-delivery EMAs rose transiently (binance
+  2 → 210 ms, bybit 9 → 209 ms) before settling back to 21–40 ms, and okx's
+  stale-tick counter ran at ~525/min against a ~28/min lifetime average. The
+  venue-time gate judges ticks while the upload runs, so that hour of capture is
+  measurably worse. The default is nonetheless OFF, justified by DURATION: a
+  day's capture is ~1.8 GiB stored ≈ 6 minutes at 5 MiB/s, at 04:30 local.
+  `S3_NICE_NETWORK=1` restores the background class for anyone who prefers hours
+  of invisible upload.
+
+  **Sizing corrected again:** capture is **9.6 GiB/day raw** measured across 50
+  runs over 7.4 days — roughly double the plan's §9 estimate of ~5 GB/day.
+  Stored, that is ~1.8 GiB/day.
+
+  **Landed this session:** `pull_tarball` (download → verify sha256 → extract,
+  all under the `.partial` invisibility law, sha checked BEFORE `tar` runs so an
+  unverified archive is never scattered across the cache) + resolver/CLI
+  auto-detection of run-vs-tarball shape; `PART_SIZE_MIB` 8 → **32** and
+  `TIMEOUT_S` 300 → **900** (multipart costs ~3× a single PUT *per part*, so
+  bigger parts recover most of it, while 32 MiB against 900 s still survives
+  ~0.04 MiB/s on a bad night); per-run backfill progress reporting;
+  `S3_NICE_NETWORK`; `S3_CYCLE_BUDGET_S` 600 → 3600.
+
+  **`com.multivenue.archive` BOOTSTRAPPED** (one label, rendered from the
+  template; `install-launchd.sh` never run). Verified inert: `state = not
+  running`, and the engine label kept **pid 85953 before and after**. Both cycle
+  guards proven live — `ARCHIVE_MODE=compress` exits 0 silently, and the
+  single-instance `pgrep -f 'archive-ru[n].py'` guard correctly skips while a
+  backfill is running.
+
+  **STILL BLOCKED, and genuinely operator-only: bucket versioning + the
+  `AbortIncompleteMultipartUpload` lifecycle rule.** Two attempts to set them
+  were refused by this session's permission classifier as bucket-configuration
+  changes. I did not work around it. Until versioning is on, S-LAW 11 has no
+  backstop against an accidental overwrite. Set them in the Hetzner Console, or
+  re-run the S0 probe's `--enable-versioning --set-lifecycle` in a session where
+  that is permitted.
+
+  **THE LANE IS LIVE. Backfill and first sweep, both complete:**
+  - **Backfill:** 49/50 runs pushed (the 50th is the live capture, excluded by
+    S-LAW 4) + all 40 legacy tarballs. **16.99 GiB stored** for 71 GiB of runs
+    plus 3.6 GiB of tarballs. Sustained ~5 MiB/s; compression consistently
+    5.0–5.7× on run directories, 1.0× on tarballs (already gzip, stored
+    verbatim on purpose — re-packing would destroy the evidence that they are
+    what retention actually wrote).
+  - **Sample verify: 3/3 PASS** across the oldest, middle and newest archived
+    runs, including a v2 and a v3 root.
+  - **Tarball pull proven on real data:** a 9.6 MiB legacy archive pulled from
+    the bucket, extracted, and compared against a local `tar -xzf` of the same
+    file — **17/17 files byte-identical**, the result visible to
+    `features.run_dirs` as a real run, and no `.partial` left behind.
+  - **`retention.conf` REWRITTEN to the fixed-window policy** (backup kept as
+    `retention.conf.bak-*`): `PROTECT_DAYS=1`, `MIN/TARGET_FREE_GIB=999999` so
+    the sweep runs nightly rather than only under pressure, `ARCHIVE_MODE=s3`,
+    `S3_CYCLE_BUDGET_S=3600`, `S3_NICE_NETWORK=0`.
+  - **Preflight before the first sweep:** of 50 local runs — 1 newest (never a
+    candidate), 7 protected under 24 h, **42 eligible, and 0 of those missing
+    from the bucket**.
+  - **First sweep: 37 runs deleted, 0 refused**, stopping cleanly on
+    `run-… is 1d old (<= protect 1d) — stopping`. Free space **22 → 75 GiB**;
+    log root 72 GiB → 18 GiB; 13 runs local. (37 rather than 42 because the
+    sweep re-evaluates age as it goes and the boundary moved.)
+  - **Engine untouched throughout:** pid **85953** before and after,
+    `engine_vm_rows_active 2`, `engine_regime_configured 1`.
+    `multivenue-archive status` → `archive: enabled bucket=market-data-qu
+    host=mbp-m4 runs_remote=49`.
+
+  **RESUME POINT: nothing outstanding but the two bucket-configuration
+  settings.** The nightly shape from here: `com.multivenue.archive` uploads at
+  04:30 local; `retention.sh` at 0000Z verifies and prunes to 24 h. Watch the
+  first unattended cycle in `~/multivenue/logs/launchd/archive.log`, and watch
+  that the 0020Z pnl slot still fires on time (it is the reason stage A is not
+  in the restart lane).
+
 ---
 
 ## Appendix A — SigV4 golden vectors
