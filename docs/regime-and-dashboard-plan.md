@@ -3,11 +3,11 @@
 **Status: IN PROGRESS — RG0–RG2 committed (`77f5ea5`); RG3 committed
 (`81ed263`, 2026-09-05); RG5 committed (`8defc26`, 2026-09-05); RG2/RG3/RG5
 live smoke PASSED 2026-09-05 (§12); RG4 code-complete 2026-09-05
-(uncommitted — §12); RG6 ENGINE + TUI halves code-complete 2026-09-05
-(uncommitted — §12 last entry: `/state` live on 9191 after the next
-relink + restart, TUI over the same snapshot). Next: the RG6 worker page
-(`python -m claude_worker.dashboard`, §6.2) + the live check of every
-panel; §11 defaults apply until overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
+(uncommitted — §12); RG6 committed (`ef75c91`, 2026-09-05 — engine
+`/state` + TUI + the worker page on 9292, all LIVE; §12 last entry).
+Next: the RG6 close ruling (§7 exit tell met: page live on 9292 showing
+regime, mask, rows, P&L, recent fills), then RG7 restated as N ≤ 2 h
+windows; §11 defaults apply until overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
 need to implement the following"). Paper mode only; no
 dispatcher/signer/RiskGate/live-ramp work — the Stage-3 ENTRY GATE
 (`docs/arch/mvp-completion-plan.md` §7) is untouched. Owner doc for the
@@ -1751,15 +1751,20 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   rows with their gate bytes) — the frozen record (page + both JSON
   documents, self-replaying `index.html`) is in the vault at
   `docs/research/rg6-dashboard-live-2026-09-05/` (git-excluded; the
-  §7 "screenshot in the vault" tell). Not yet done: bootstrapping
-  `com.multivenue.dashboard` (operator lever), the RG6 close ruling. Pitfall-10 note for the next
+  §7 "screenshot in the vault" tell). **`com.multivenue.dashboard`
+  BOOTSTRAPPED 08:19Z on operator approval (pid 77305, `state =
+  running`, guard silent, all routes 200) and RG6 COMMITTED as
+  `ef75c91` (35 files; the RG4 worker set stays unstaged for the
+  operator); `make license-check` 262 files OK post-commit.** Open: the
+  RG6 close ruling (§7 exit tell met). Pitfall-10 note for the next
   session: three "impossible" unresolved-import errors in a row today
   were stale rmeta after edits to `strategy-core` / `core-metrics` —
   `cargo clean -p <crate>` fixed each; and a sandbox-side `git status`
   left a stale `.git/index.lock` (removed on the Mac; use the Mac lane
   for every git read too).
-- **RESUME POINT (for a fresh session):** RG6 engine + TUI halves are
-  code-complete on disk (commit status = the operator's; paths: `Cargo.
+- **RESUME POINT (for a fresh session):** RG6 is COMMITTED (`ef75c91`)
+  and LIVE (engine `/state`, TUI, `com.multivenue.dashboard` on 9292);
+  the path list below is the historical staging record (paths: `Cargo.
   toml` `Cargo.lock` `crates/engine-snapshot/` `crates/cli/build.rs`
   `crates/cli/Cargo.toml` `crates/cli/src/{lib.rs,paper.rs,bin/
   multivenue-engine.rs}` `crates/core-metrics/{src/lib.rs,src/server.rs,
