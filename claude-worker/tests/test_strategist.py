@@ -373,7 +373,7 @@ def test_parse_proposal_v2_row_malformed(row: dict[str, object]) -> None:
 
 
 def test_static_block_v3_teaches_the_regime_keys_and_variants() -> None:
-    assert claude_worker.strategist.STRATEGIST_PROMPT_VERSION == "strategist-v3"
+    assert claude_worker.strategist.STRATEGIST_PROMPT_VERSION == "strategist-v4"
     text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
     for needle in ('"regimes"', '"regime_off"', '"rel"', "REGIME LAW", "GATE, never a signal",
                    "exits", "NEVER gated", "VARIANTS", "DISJOINT", "--regime off",
@@ -751,3 +751,51 @@ def test_stage_ruleset_attribution_written_and_preserved(tmp_path: pathlib.Path)
     assert st.ruleset_attribution(full_hash) == ("m2", "t2")
     assert st.ruleset_attribution("cd" * 32) is None
     st.close()
+
+
+# ---- RG5: the regime verdict + REGIME digest section (strategist-v4) -----
+
+
+def test_static_block_v4_asks_for_the_regime_verdict() -> None:
+    text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
+    for needle in ('"regime": VERDICT', "REGIME VERDICT", '"measured"', "trend:bull,shape:trend",
+                   "OPTIONAL", "TTL", "the rows fit the regime"):
+        assert needle in text, f"static block is missing {needle!r}"
+
+
+def test_parse_proposal_accepts_the_optional_regime_verdict_and_refuses_bad_ones() -> None:
+    base = {"thesis": "confirm", "rows": [_row()]}
+    p = claude_worker.strategist.parse_proposal(json.dumps({**base, "regime": {"fast": "measured"}}))
+    assert p is not None and p.regime == {"fast": "measured"}
+    p = claude_worker.strategist.parse_proposal(
+        json.dumps({**base, "regime": {"fast": "trend:bull, shape:trend", "slow": "measured"}})
+    )
+    assert p is not None and p.regime == {"fast": "trend:bull, shape:trend", "slow": "measured"}
+    # Omitted = None (the pre-RG5 contract is unchanged).
+    p = claude_worker.strategist.parse_proposal(json.dumps(base))
+    assert p is not None and p.regime is None
+    for bad in (
+        {"fast": "sideways"},          # not a dimension:value
+        {"fast": "trend:sideways"},    # unknown value
+        {"fast": 7},                   # not a string
+        {},                            # empty map
+        {"medium": "measured"},        # unknown profile
+        {"fast": "trend:bull|neutral"},  # a region, not a word
+        {"fast": "rel:lagging"},       # rel is per-symbol, never declared
+        "measured",                    # not a map
+        None,
+    ):
+        assert claude_worker.strategist.parse_proposal(json.dumps({**base, "regime": bad})) is None, bad
+    # Any other top-level key is still malformed.
+    assert claude_worker.strategist.parse_proposal(json.dumps({**base, "verdict": {}})) is None
+
+
+def test_build_digest_regime_section_is_optional(tmp_path: pathlib.Path) -> None:
+    without = claude_worker.strategist.build_digest(tmp_path, None, {"m": 1})
+    assert "REGIME" not in without
+    with_section = claude_worker.strategist.build_digest(
+        tmp_path, None, {"m": 1}, regime="  [fast] measured: trend=bull shape=trend"
+    )
+    assert "\nREGIME (worker-measured words" in with_section
+    assert "[fast] measured: trend=bull" in with_section
+    assert with_section.startswith(without.rstrip("\n"))

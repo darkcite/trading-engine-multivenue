@@ -25,6 +25,7 @@ import claude_worker.config
 import claude_worker.daemon
 import claude_worker.frames
 import claude_worker.llm
+import claude_worker.regime
 import claude_worker.state
 import claude_worker.strategist
 import claude_worker.uds
@@ -1061,4 +1062,142 @@ def test_monitor_performance_feeds_next_digest(
     second_prompt = complete.calls[1][1]
     assert "ACTIVE RULESET WALK-FORWARD" in second_prompt
     assert "verdict=holding" in second_prompt
+    state.close()
+
+
+# ---- RG5 (plan §5.4): the _REGIME phase + the strategist's verdict --------
+
+import tests.regime_fixture  # noqa: E402 — RG5 suite section
+
+_REGIME_NOW_NS = tests.regime_fixture.NOW_MS * 1_000_000
+_PROPOSAL_WITH_VERDICT = json.dumps(
+    {**json.loads(_PROPOSAL), "regime": {"fast": "trend:bear,shape:chop", "slow": "measured"}}
+)
+
+
+def _regime_words(fake_uds: tests.conftest.FakeUdsServer, start: int) -> list[tuple[int, str]]:
+    """``(param_id, word)`` of every SetRegime frame recorded from ``start``."""
+    out: list[tuple[int, str]] = []
+    for i in range(start, len(fake_uds.frames)):
+        if fake_uds.cmd_field(i, "kind") == claude_worker.frames.KIND_SET_REGIME:
+            out.append((fake_uds.cmd_field(i, "param_id"), claude_worker.regime.describe(fake_uds.cmd_field(i, "px"))))
+    return out
+
+
+def test_regime_phase_measures_auto_confirms_and_the_verdict_overrides(
+    fake_uds: tests.conftest.FakeUdsServer,
+    tmp_path: pathlib.Path,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(claude_worker.regime.METRICS_URL_ENV, "http://127.0.0.1:9/metrics")
+    cfg = _mk_cfg(tmp_path, sock=fake_uds.sock_path)
+    state = claude_worker.state.State(cfg.db_path)
+    clock = _Clock()
+    complete = _CompleteFake([_PROPOSAL_WITH_VERDICT])
+    inputs = (tests.regime_fixture.artifact(tmp_path), tests.regime_fixture.candles_db(tmp_path))
+    cycle = claude_worker.daemon.ResearchCycle(
+        state, cfg, {"btc-daily": 42}, complete, executor,
+        fetch_fn=lambda: True, run_backtest_fn=_fake_run_backtest(True),
+        env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1", claude_worker.regime.DECLARE_TTL_S_ENV: "600"},
+        clock_ns=clock, wall_ns=lambda: _REGIME_NOW_NS, regime_inputs=inputs,
+    )
+    client = claude_worker.uds.UdsClient(cfg.ai_ingress_sock, cfg.ai_ingress_hmac_key, state)
+    client.connect()
+    client.send_heartbeat()
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.promotions == 1)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and len(fake_uds.frames) < 7:
+        time.sleep(0.01)
+    assert fake_uds.errors == []
+    # Phase: measured once, both profiles auto-confirmed (2 frames) BEFORE
+    # the strategist call; the history line + declared.json landed beside
+    # state.db, never under the operator's directory.
+    assert cycle.stats.regime_measured == 1 and cycle.stats.regime_declared == 2
+    regime_dir = claude_worker.regime.regime_dir_for(cfg.db_path)
+    assert (regime_dir / claude_worker.regime.HISTORY_FILE).is_file()
+    words = _regime_words(fake_uds, 1)
+    assert [p for p, _ in words] == [0, 1, 0, 1], "phase fast+slow, then the verdict fast+slow"
+    assert words[0][1].startswith("trend=bull shape=trend") and "source=" not in words[0][1]
+    # The digest carried the REGIME section and the prompt asked for it.
+    prompt = complete.calls[0][1]
+    assert "REGIME (worker-measured words" in prompt and "[fast] measured: trend=bull" in prompt
+    # Verdict: fast overridden by the AI's ruling, slow = confirm measured;
+    # source strategist in declared.json; the ledger has both events.
+    assert cycle.stats.regime_verdicts == 1 and cycle.stats.regime_verdict_failures == 0
+    assert words[2][1].startswith("trend=bear shape=chop") and words[3][1] == words[1][1]
+    entries = claude_worker.regime.load_declared(regime_dir)
+    assert entries["fast"]["source"] == claude_worker.regime.SOURCE_STRATEGIST
+    assert entries["fast"]["dims"] == {"trend": "bear", "shape": "chop"}
+    assert entries["slow"]["source"] == claude_worker.regime.SOURCE_STRATEGIST
+    assert entries["fast"]["ttl_s"] == 600
+    measured_ev = state.events(kind=claude_worker.strategist.EVENT_REGIME_MEASURED)
+    verdict_ev = state.events(kind=claude_worker.strategist.EVENT_REGIME_VERDICT)
+    assert len(measured_ev) == 1 and len(verdict_ev) == 1
+    assert json.loads(measured_ev[0][3])["declared"] == ["fast", "slow"]
+    assert json.loads(verdict_ev[0][3])["verdict"] == {"fast": "trend:bear,shape:chop", "slow": "measured"}
+    # Stage + Commit still rode the same connection after the verdict.
+    kinds = [fake_uds.cmd_field(i, "kind") for i in range(len(fake_uds.frames))]
+    assert kinds.count(claude_worker.frames.KIND_RULESET_STAGE) == 1
+    assert kinds.count(claude_worker.frames.KIND_RULESET_COMMIT) == 1
+
+    # A second cycle (fresh capture, same wall clock): the strategist's
+    # ruling is FRESHER than serve's own confirm on BOTH profiles, so the
+    # phase measures but declares nothing.
+    n_frames = len(fake_uds.frames)
+    (cfg.replay_dir / "run-2").mkdir()
+    complete._responses = [_PROPOSAL]  # no verdict this time
+    clock.now_ns = 4_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.regime_measured == 2)
+    _drive(cycle, clock, client, lambda: len(complete.calls) == 2)
+    assert cycle.stats.regime_declared == 2, "no auto-confirm over a fresh strategist ruling"
+    assert _regime_words(fake_uds, n_frames) == []
+    measured_ev = state.events(kind=claude_worker.strategist.EVENT_REGIME_MEASURED)
+    assert json.loads(measured_ev[-1][3])["skipped"] == "fresher ruling in force on every profile"
+    client.close()
+    state.close()
+
+
+def test_regime_phase_without_inputs_is_silent_and_a_verdict_is_then_ignored(
+    tmp_path: pathlib.Path, executor: concurrent.futures.ThreadPoolExecutor
+) -> None:
+    cfg = _mk_cfg(tmp_path)
+    state = claude_worker.state.State(cfg.db_path)
+    clock = _Clock()
+    complete = _CompleteFake([_PROPOSAL_WITH_VERDICT])
+    cycle = _mk_cycle(cfg, state, executor, complete, clock, passing=False)
+    client = _disconnected_client(cfg, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.gate_failures >= 1)
+    assert cycle.stats.regime_measured == 0 and cycle.stats.regime_skipped == 0
+    assert cycle.stats.regime_verdicts == 0 and cycle.stats.regime_verdict_failures == 0
+    assert "REGIME (" not in complete.calls[0][1]
+    assert not claude_worker.regime.regime_dir_for(cfg.db_path).exists()
+    state.close()
+
+
+def test_regime_phase_absent_artifact_is_a_counted_skip_with_an_honest_digest(
+    tmp_path: pathlib.Path, executor: concurrent.futures.ThreadPoolExecutor
+) -> None:
+    cfg = _mk_cfg(tmp_path)
+    state = claude_worker.state.State(cfg.db_path)
+    clock = _Clock()
+    complete = _CompleteFake([_PROPOSAL_WITH_VERDICT])
+    cycle = claude_worker.daemon.ResearchCycle(
+        state, cfg, {"btc-daily": 42}, complete, executor,
+        fetch_fn=lambda: True, run_backtest_fn=_fake_run_backtest(False),
+        env={"CLAUDE_WORKER_STRATEGIST_INTERVAL_S": "1"}, clock_ns=clock,
+        wall_ns=lambda: _REGIME_NOW_NS,
+        regime_inputs=(tmp_path / "missing.toml", tmp_path / "missing.db"),
+    )
+    client = _disconnected_client(cfg, state)
+    clock.now_ns = 2_000_000_000
+    _drive(cycle, clock, client, lambda: cycle.stats.gate_failures >= 1)
+    assert cycle.stats.regime_skipped == 1 and cycle.stats.regime_measured == 0
+    assert claude_worker.regime.REGIME_UNMEASURED_TEXT.strip() in complete.calls[0][1]
+    # A "measured" verdict without a measurement is a counted failure, not
+    # a declaration of nothing.
+    assert cycle.stats.regime_verdict_failures == 1 and cycle.stats.regime_verdicts == 0
+    assert claude_worker.regime.load_declared(claude_worker.regime.regime_dir_for(cfg.db_path)) == {}
     state.close()

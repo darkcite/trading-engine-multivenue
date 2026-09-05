@@ -54,7 +54,7 @@ import time
 import typing
 
 import claude_worker.backtest
-import claude_worker.candles
+import claude_worker.regime
 import claude_worker.window_root
 
 REPORTS_DIR_ENV: str = "CLAUDE_WORKER_REPORTS_DIR"
@@ -231,14 +231,73 @@ def _usd(v: object) -> float:
         return 0.0
 
 
+_REGIME_SUM_KEYS = ("minutes_judged", "declared_applied", "set_regime_frames", "set_regime_expired")
+_REGIME_ROW_KEYS = ("orders", "fills", "trades")
+
+
+def _merge_regime(acc: dict, section: dict) -> None:
+    """Fold one run's additive ``regime`` section (RG3 audit-pnl) into
+    the day accumulator: mode counts, the judged/declared/frame counters,
+    and per (profile, word) minutes + per-strategy fill-model rows — the
+    §5.1 per-regime P&L. Words are keyed by their hex ``bits`` so a
+    profile's word list is a set across runs, never a list per run."""
+    mode = str(section.get("mode", "?"))
+    acc["modes"][mode] = acc["modes"].get(mode, 0) + 1
+    for k in _REGIME_SUM_KEYS:
+        acc[k] += int(section.get(k, 0) or 0)
+    for prof in section.get("profiles") or []:
+        pname = str(prof.get("profile", "?"))
+        words = acc["profiles"].setdefault(pname, {})
+        for w in prof.get("words") or []:
+            bits = str(w.get("bits", "?"))
+            wacc = words.setdefault(bits, {"word": str(w.get("word", "?")), "bits": bits, "minutes": 0, "strategies": {}})
+            wacc["minutes"] += int(w.get("minutes", 0) or 0)
+            for srow in w.get("strategies") or []:
+                sid = int(srow.get("strategy_id", 255))
+                sacc = wacc["strategies"].setdefault(sid, {
+                    "strategy_id": sid, "label": srow.get("label", "unknown"),
+                    **{k: 0 for k in _REGIME_ROW_KEYS}, "net_usd": 0.0,
+                    "fee_ladder_net_usd": [0.0, 0.0, 0.0],
+                })
+                for k in _REGIME_ROW_KEYS:
+                    sacc[k] += int(srow.get(k, 0) or 0)
+                sacc["net_usd"] += _usd(srow.get("net_usd", "0"))
+                ladder = srow.get("fee_ladder_net_usd") or []
+                for i in range(min(3, len(ladder))):
+                    sacc["fee_ladder_net_usd"][i] += _usd(ladder[i])
+
+
+def _render_regime(acc: dict) -> dict:
+    """The merged ``regime`` section: profiles in wire order, words by
+    minutes descending (the regime the day mostly WAS first), strategies
+    by id; usd rendered like the harness (1e-6 strings)."""
+    profiles = []
+    for pname in sorted(acc["profiles"], key=lambda n: (n != "fast", n)):
+        words = []
+        for wacc in sorted(acc["profiles"][pname].values(), key=lambda w: (-w["minutes"], w["bits"])):
+            strategies = [
+                {
+                    **{k: s[k] for k in ("strategy_id", "label", *_REGIME_ROW_KEYS)},
+                    "net_usd": f"{s['net_usd']:.6f}",
+                    "fee_ladder_net_usd": [f"{v:.6f}" for v in s["fee_ladder_net_usd"]],
+                }
+                for s in (wacc["strategies"][sid] for sid in sorted(wacc["strategies"]))
+            ]
+            words.append({**{k: wacc[k] for k in ("word", "bits", "minutes")}, "strategies": strategies})
+        profiles.append({"profile": pname, "words": words})
+    return {"modes": acc["modes"], **{k: acc[k] for k in _REGIME_SUM_KEYS}, "profiles": profiles}
+
+
 def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
     """Fold per-run audit-pnl JSONs into one day report (same top-level
     shape, ``audit_pnl_version`` 1, additive keys). Sums are exact to
     the harness's 1e-6 render; ``max_drawdown_usd`` is the WORST single
     run — a day-level drawdown across runs is not defined when each run
-    starts flat."""
+    starts flat. RG5: the additive ``regime`` key folds every run's
+    per-regime section (absent on pre-RG3 reports ⇒ empty profiles)."""
     by_sid: dict[int, dict] = {}
     vm: dict[str, dict] = {}
+    regime_acc: dict = {"modes": {}, **{k: 0 for k in _REGIME_SUM_KEYS}, "profiles": {}}
     wall_first = None
     wall_last = None
     paper_fills = 0
@@ -277,6 +336,9 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
             acc["trades"] += int(row.get("trades", 0) or 0)
             acc["net_usd"] += _usd(row.get("net_usd", "0"))
             acc["max_drawdown_usd"] = max(acc["max_drawdown_usd"], _usd(row.get("max_drawdown_usd", "0")))
+        section = obj.get("regime")
+        if isinstance(section, dict):
+            _merge_regime(regime_acc, section)
     strategies = []
     for sid in sorted(by_sid):
         acc = by_sid[sid]
@@ -300,26 +362,63 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
             {**v, "net_usd": f"{v['net_usd']:.6f}", "max_drawdown_usd": f"{v['max_drawdown_usd']:.6f}"}
             for v in (vm[h] for h in sorted(vm))
         ],
+        "regime": _render_regime(regime_acc),
         "runs_detail": [{"run": name, "report": obj} for name, obj in runs],
     }
 
 
+def regime_head_lines(merged: dict) -> list[str]:
+    """The summary's per-regime block (the ``pnl`` verb prints the
+    summary): one line per (profile, word) with minutes and every
+    strategy's fills / net at the tier / ladder. Empty when no run
+    carried a regime section (pre-RG3 reports)."""
+    section = merged.get("regime") or {}
+    profiles = section.get("profiles") or []
+    if not profiles or not any(p.get("words") for p in profiles):
+        return []
+    modes = ", ".join(f"{m}={n}" for m, n in sorted((section.get("modes") or {}).items()))
+    out = [
+        f"regime: modes {modes} minutes_judged={section.get('minutes_judged', 0)}"
+        f" declared_applied={section.get('declared_applied', 0)}"
+        f" set_regime_frames={section.get('set_regime_frames', 0)}"
+        f" (expired {section.get('set_regime_expired', 0)})"
+    ]
+    for prof in profiles:
+        for w in prof.get("words") or []:
+            rows = " ".join(
+                f"{s['label']}[fills={s['fills']} net={s['net_usd']} ladder={s['fee_ladder_net_usd']}]"
+                for s in w.get("strategies") or []
+            )
+            out.append(f"regime {prof['profile']} [{w['word']}] minutes={w['minutes']}: {rows or '(no fills)'}")
+    return out
+
+
 WINDOW_ROOT_DEFAULT: str = "~/multivenue/backtest-roots/nightly"
-# RG3: the window seed's inputs — the operator's regime artifact and the
-# worker's candles.db (plan §4.3); either absent ⇒ no seed is written.
-REGIME_PATH_DEFAULT: str = "~/multivenue/regime.toml"
 
 
 def regime_seed_inputs(
-    env: collections.abc.Mapping[str, str] | None = None,
+    env: typing.Mapping[str, str] | None = None,
 ) -> tuple[pathlib.Path, pathlib.Path]:
-    """``(regime.toml, candles.db)`` for the window seed step."""
-    source: collections.abc.Mapping[str, str] = os.environ if env is None else env
-    db = source.get(claude_worker.candles.CANDLES_DB_ENV, "") or claude_worker.candles.DEFAULT_DB_PATH
-    return (
-        pathlib.Path(REGIME_PATH_DEFAULT).expanduser(),
-        pathlib.Path(db).expanduser(),
-    )
+    """``(regime.toml, candles.db)`` for the window seed step (RG3, plan
+    §4.3; either absent ⇒ no seed is written) — the regime lane's own
+    resolver, so every caller agrees on the paths."""
+    return claude_worker.regime.regime_inputs(env)
+
+
+def latest_report_regimes(reports_dir: pathlib.Path) -> list[dict[str, object]]:
+    """The newest day report's merged ``regime.profiles`` (RG5) — the
+    strategist digest's per-regime P&L rows; empty when no report, an
+    unreadable one, or a pre-RG5 report without the section."""
+    path = latest_report(reports_dir)
+    if path is None:
+        return []
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    section = obj.get("regime") if isinstance(obj, dict) else None
+    profiles = section.get("profiles") if isinstance(section, dict) else None
+    return [p for p in profiles if isinstance(p, dict)] if isinstance(profiles, list) else []
 
 
 def _audit_units(
@@ -416,6 +515,7 @@ def run_day(
             f"ioc_canceled={row['ioc_canceled']} ttl_expired={row['ttl_expired']} "
             f"ladder(0/1/2 bps)={row['fee_ladder_net_usd']}"
         )
+    head.extend(regime_head_lines(merged))
     summary_path.write_text("\n".join(head) + "\n\n" + "\n".join(summaries), encoding="utf-8")
     report(f"pnl-report: {day}: strategies={len(merged['strategies'])} runs={len(ok)} failed={len(failed)} -> {json_path} (+ summary)")
     return 0 if ok else 1

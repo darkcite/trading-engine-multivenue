@@ -40,6 +40,10 @@ last_ask × (1+slip), ask at last_bid × (1−slip)) so audit-pnl's
 strict-cross fill model — the strategies' own 0%-maker FLOOR
 scenario — can fill them. Leg notional sits under the $10k/order
 research-tier cap (operator ruling 2026-08-29, $50k book).
+
+Regime gate (RG5, plan §5.1): ``REGIME_LABEL`` (§3.3 terms, default
+empty = ANY) gates CVFC + S1 ENTRIES only, through
+``claude_worker.regime.lane_gate``; exits are never gated.
 """
 
 import argparse
@@ -52,6 +56,8 @@ import sqlite3
 import sys
 import time
 import typing
+
+import claude_worker.regime
 
 CVFC_COINS: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LTC")
 CVFC_MAJORS_EXCLUDED: tuple[str, ...] = ("BTC", "ETH")
@@ -92,6 +98,8 @@ INTENT_VENUE_BY_PREFIX: dict[str, str] = {
 S1_MAX_POSITIONS: int = 4
 S1_EXIT_DIRECTIONAL_APR: float = 0.10
 S1_MAX_AGE_H: float = 240.0
+#: RG5 entry label (§3.3 terms; empty = ANY, the pre-RG5 behaviour).
+REGIME_LABEL: tuple[str, ...] = ()
 
 WINDOW_24H_MS: int = 24 * 3600 * 1000
 WINDOW_3D_MS: int = 3 * WINDOW_24H_MS
@@ -318,15 +326,17 @@ def leg_intents(
     return intents, []
 
 
-def decide_cvfc(
+def decide_cvfc(  # noqa: PLR0913, PLR0917 — one argument per input source + the RG5 gate
     conn: sqlite3.Connection,
     state: dict,
     market_map: dict[str, int],
     marks: dict[int, tuple[float, float]],
     now_ms: int,
+    entries_open: bool = True,
 ) -> tuple[list[Intent], list[str], list[str]]:
     """CVFC entries/exits per the doc spec. Returns
-    (intents, digest_lines, skip_notes); mutates ``state``."""
+    (intents, digest_lines, skip_notes); mutates ``state``.
+    ``entries_open`` False (the regime gate) skips the entry pass."""
     intents: list[Intent] = []
     lines: list[str] = []
     notes: list[str] = []
@@ -377,6 +387,9 @@ def decide_cvfc(
     # Entries. A coin exited THIS cycle sits out one cycle — the
     # reversed pair may be a legitimate new entry (the doc's ADA
     # short-DBT example), but exit+re-enter in one push is churn.
+    if not entries_open:
+        lines.append("  ENTRIES regime-blocked this cycle (exits unaffected)")
+        return intents, lines, notes
     for coin in CVFC_COINS:
         if coin in held or coin in CVFC_MAJORS_EXCLUDED:
             continue
@@ -454,15 +467,17 @@ def explicit_leg_intents(
     return intents, []
 
 
-def decide_s1(
+def decide_s1(  # noqa: PLR0913, PLR0917 — one argument per input source + the RG5 gate
     conn: sqlite3.Connection,
     state: dict,
     market_map: dict[str, int],
     marks: dict[int, tuple[float, float]],
     now_ms: int,
+    entries_open: bool = True,
 ) -> tuple[list[Intent], list[str], list[str]]:
     """S1 pilot per Consolidated §5.1 — executable pairs since the
-    bybit unfreeze. Mutates ``state['s1_positions']``."""
+    bybit unfreeze. Mutates ``state['s1_positions']``. ``entries_open``
+    False (the regime gate) reports a qualifying pair as blocked."""
     intents: list[Intent] = []
     notes: list[str] = []
     positions: list[dict] = state.setdefault("s1_positions", [])
@@ -528,7 +543,12 @@ def decide_s1(
                 )
             continue
 
-        if qualifies and len(positions) < S1_MAX_POSITIONS:
+        if qualifies and not entries_open:
+            lines.append(
+                f"  {name:13s} spread24={sp24:+.1%} spread3d={s3txt}"
+                " QUALIFIES — ENTRY-BLOCKED: regime"
+            )
+        elif qualifies and len(positions) < S1_MAX_POSITIONS:
             # Long the more-negative venue, short the other (§5.1).
             if bn24 < by24:
                 long_kind, long_desc = "bn", f"binance-usdm:{name.lower()}"
@@ -598,15 +618,19 @@ def batch_dict(intents: list[Intent], now_ms: int) -> dict:
     }
 
 
-def run_cycle(
+def run_cycle(  # noqa: PLR0913, PLR0917 — one argument per input source + the RG5 words
     db_path: pathlib.Path,
     features_dir: pathlib.Path,
     map_path: pathlib.Path,
     out_dir: pathlib.Path,
     now_ms: int | None = None,
+    regime_words: dict[str, int] | None = None,
 ) -> pathlib.Path:
-    """One full cycle; returns the digest path. Pure files+SQLite."""
+    """One full cycle; returns the digest path. Pure files+SQLite
+    (plus one loopback ``/metrics`` read when ``REGIME_LABEL`` is set
+    and ``regime_words`` is not given)."""
     now = int(time.time() * 1000) if now_ms is None else now_ms
+    entries_open, regime_tell = claude_worker.regime.lane_gate(REGIME_LABEL, now, regime_words)
     conn = sqlite3.connect(str(db_path))
     try:
         market_map = load_map(map_path)
@@ -614,10 +638,10 @@ def run_cycle(
         state_path = out_dir / "state.json"
         state = load_state(state_path)
         intents, cvfc_lines, notes = decide_cvfc(
-            conn, state, market_map, marks, now
+            conn, state, market_map, marks, now, entries_open
         )
         s1_intents, s1_lines, s1_notes = decide_s1(
-            conn, state, market_map, marks, now
+            conn, state, market_map, marks, now, entries_open
         )
         intents.extend(s1_intents)
         notes.extend(s1_notes)
@@ -636,6 +660,7 @@ def run_cycle(
     body = [
         f"carry_signal digest {stamp} (funding source: candles.db;"
         f" cadence law incl. deribit interest_8h/8)",
+        *([regime_tell] if REGIME_LABEL else []),
         "CVFC-1 board (24h APR by leg; majors excluded from entry):",
         *cvfc_lines,
         "S1 pilot (BN vs Bybit; executable since the bybit unfreeze):",

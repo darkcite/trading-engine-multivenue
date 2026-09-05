@@ -1,10 +1,11 @@
 # Market regime + regime labels + regime-aware AI aggregation + dashboard — plan (RG0–RG7)
 
-**Status: IN PROGRESS — RG0–RG2 committed (`77f5ea5`); RG3 code-complete
-2026-09-05 (uncommitted; operator commits — §12 entry). Next: the RG2/RG3
-live smoke (operator: relink + `regime.toml` + restart; a labelled
-ruleset staged/committed live — §7 RG3 exit tell), then RG5 (worker
-regime lane) or RG4 (library + composer); §11 defaults apply until
+**Status: IN PROGRESS — RG0–RG2 committed (`77f5ea5`); RG3 committed
+(`81ed263`, 2026-09-05); RG5 code-complete 2026-09-05 (uncommitted;
+operator commits — §12 entry). Next: the RG2/RG3/RG5 live smoke
+(operator: relink + `regime.toml` + restart + `install-launchd.sh`; a
+labelled ruleset staged/committed live — §7 RG3 exit tell), then RG4
+(library + composer) or RG6 (dashboard); §11 defaults apply until
 overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
 need to implement the following"). Paper mode only; no
 dispatcher/signer/RiskGate/live-ramp work — the Stage-3 ENTRY GATE
@@ -1091,3 +1092,95 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   ≤ 2 h windows; research out of git; compile/test on the Mac
   (RustRover), never the sandbox; explicit-path `git add`, operator
   commits, never push.
+- **2026-09-05 — RG5 CODE-COMPLETE (the worker regime lane, §5.1 +
+  §5.4 + §5.5; RG3 was committed as `81ed263` earlier the same day).**
+  The operator picked RG5 over RG4 (AskUserQuestion). What landed —
+  **(1) `claude_worker.regime` lanes** (module, never a verb; the
+  `seed-out` lane from RG2 kept): `report` (worker-measured words + raw
+  values per profile, the declaration in force, the engine's words from
+  `/metrics` gauges `engine_regime_<profile>_{measured,declared,effective}`,
+  the 24 h timeline), `history`, `refresh-params [--dry-run]` (RV +
+  funding p30/p70 over the §5.1 lookbacks — fast 7 d of 1 h RV, slow
+  30 d of 4 h RV, funding prints — rewriting ONLY the six percentile
+  lines of `regime.toml`, comments kept, `.bak` beside it; too few
+  samples keep the zeros = dimension ABSENT, honestly), `declare --fast
+  "<decl>|measured" --slow … --ttl N --source operator|strategist
+  [--no-send]` (persists `declared.json` FIRST, then one `SetRegime`
+  frame per profile over `uds.py`; `qty` carries the worker-measured
+  audit word), `cycle` (the 5-minute launchd job: measure + history +
+  once-per-UTC-day refresh via a stamp file; NEVER declares), `repush`
+  (post-boot: every still-fresh entry of `declared.json` re-sent with
+  ITS OWN remaining TTL). **Measurement law**: `measure()` is the
+  engine's seed law over `candles.db` judged at the LAST minute the
+  store holds for the BTC ref and reports `age_min` — the candles lane
+  is hourly, so a lag is normal, not an error. State lives under
+  `~/multivenue/worker/regime/` (`$CLAUDE_WORKER_REGIME_DIR`;
+  config-carrying callers use `regime_dir_for(db_path)` = the worker dir
+  + `regime`, so tests never touch the operator's directory).
+  `recommit` re-pushes the declaration after every boot's re-commit on
+  the same connection (best-effort; a transport error never fails the
+  re-commit). `scripts/regime-cycle.sh` + `launchd/com.multivenue.regime.plist`
+  (StartInterval 300, worker-serialization pgrep guard, absent artifact
+  = exit 0) are installed by `install-launchd.sh`. **(2) label mirror +
+  intent lanes**: `label_masks`/`label_allows`/`regime_allows` mirror
+  the §3.3 grammar (omitted dims of a touched profile fill with the
+  any-mask incl. the unknown mark; SOURCE defaults measured|declared);
+  `lane_gate(label, now_ms, words)` = the coded lanes' entry gate —
+  empty label = ANY with no engine/file touch (bit-identical to
+  pre-RG5), else the `current_words` chain engine → fresh declaration →
+  UNKNOWN (a constrained profile fails closed). `xv_signal` and
+  `carry_signal` carry `REGIME_LABEL` (default empty) and gate ENTRIES
+  only (CVFC + S1 entry passes, the xv entry arm); exits drain by their
+  own law; `run_cycle(..., regime_words=)` injects words for tests. **(3)
+  nightly**: `pnl_report.merge_reports` folds every run's additive
+  `regime` section into a merged `regime` key — mode counts,
+  minutes_judged / declared_applied / set_regime_frames / expired sums,
+  per profile × word (keyed by hex `bits`, ordered by minutes desc)
+  minutes + per-strategy fills/orders/trades/net/ladder; a pre-RG3
+  report contributes nothing; `regime_head_lines` adds the `regime …`
+  summary lines the `pnl` verb prints; `latest_report_regimes` feeds the
+  digest. **(4) serve `_REGIME` phase** (§5.4; the §7 gate is untouched —
+  no `serve` runs, the SDK stays mocked): `ResearchCycle` gains
+  `regime_inputs=(regime.toml, candles.db)` (production =
+  `regime.regime_inputs()` from the environment,
+  `$CLAUDE_WORKER_REGIME_TOML` override; a test that injects
+  `research_env` gets NO phase unless it passes
+  `research_regime_inputs`) and a synchronous `_REGIME` phase between
+  capture selection and fetch: `serve_regime_step` = measure → history →
+  AUTO-CONFIRM (declare the measured word, source `serve-measured`) for
+  every profile whose declaration in force is not a FRESHER ruling by
+  someone else (operator `declare` / the strategist's verdict win while
+  fresh; serve's own prior confirm is overwritten); never raises —
+  absent inputs / transport are counted skips (`ResearchStats.regime_*`)
+  and events `regime_measured` / `regime_verdict` land in the ledger.
+  The digest gains the REGIME section (`build_digest(regime=)`:
+  `regime_digest_from` = the report text + the latest nightly report's
+  per-regime P&L rows). **Prompt `strategist-v4`**: the output contract
+  gains the OPTIONAL `"regime": {"fast": "<decl>|measured", "slow": …}`
+  verdict (rule only when the digest contradicts the measurement; never
+  invent a regime to fit the rows); `parse_proposal` accepts it
+  (`Proposal.regime`, structural: `regime.parse_verdict`), the cycle
+  applies it right after the parse — independent of the gate result —
+  as a declaration with source `strategist` (a `measured` verdict without
+  a measurement is a counted failure, never a declaration of nothing).
+  Semi-manual `ai-session.md` §4 steps 0a–0c and the LIBRARY section are
+  RG4's (the library does not exist yet). **Gates at RG5 close
+  (2026-09-05): worker pytest 692 (frozen 202 inside; +21 over RG3:
+  `test_regime_lane` 9, research-cycle 3, strategist 3, pnl 2, xv 1,
+  carry 1, window_root/prompt pins) · `make license-check` OK (249
+  files) · `make lint` green (Rust untouched by RG5 — the lint is the
+  standing gate) · no Rust change ⇒ nextest/alloc/fuzz numbers stand
+  from RG3 · `ruff` finding counts on the touched files did not grow
+  except new E501s in the same hand-wrapped style the files already
+  carry (py-lint is not a gate).**
+- **RESUME POINT (for a fresh session):** RG5 is code-complete on disk
+  (commit status = the operator's). Next = (a) the operator's live smoke
+  of RG2+RG3(+RG5) — the recipe in the RG3 resume point above, plus
+  `./scripts/install-launchd.sh` to install `com.multivenue.regime`
+  (no-op until `~/multivenue/regime.toml` exists), then `uv run python
+  -m claude_worker.regime report` and one `declare --fast measured` to
+  see `engine_regime_fast_declared` move and `regime: declared` in the
+  TUI-less metrics; (b) then **RG4** (library + composer +
+  `ai-session.md` 0a–0c with the pinned scripted test extended) or
+  **RG6** (dashboard: engine `/state` + worker page + TUI words) — the
+  operator picks. Laws unchanged (see the RG3 resume point).

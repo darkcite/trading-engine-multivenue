@@ -49,6 +49,7 @@ import claude_worker.iv_digest
 import claude_worker.llm
 import claude_worker.pmlr
 import claude_worker.pnl_report
+import claude_worker.regime
 import claude_worker.state
 
 # ---- §7.5 env keys (read at the seam — the H3 interpretation-#2
@@ -78,7 +79,10 @@ _TRUNCATION_MARKER: str = "\n...[digest truncated at cap]"
 # v3 (2026-09-05, RG3): the static block teaches the grammar v2.1 regime
 # keys (`regimes` / `regime_off` / `rel`), the gate law and regime
 # VARIANTS of one signal, and asks for a label on every row.
-STRATEGIST_PROMPT_VERSION: str = "strategist-v3"
+# v4 (2026-09-05, RG5): the output contract gains the OPTIONAL regime
+# VERDICT (`"regime": {"fast": "<decl>|measured", …}`) the worker turns
+# into a declaration; the digest gains the REGIME section.
+STRATEGIST_PROMPT_VERSION: str = "strategist-v4"
 
 # ---- events-ledger kinds (§7.5; written by daemon.py on the serve
 # thread — the events table is serve-loop-only under the §7.6 law) ------
@@ -93,6 +97,9 @@ EVENT_PROMOTION: str = "promotion"
 EVENT_ROLLBACK_TRIGGERED: str = "rollback_triggered"
 EVENT_ROLLBACK_NO_PRIOR: str = "rollback_no_prior"
 EVENT_MONITOR_SKIP: str = "monitor_skip_insufficient_data"
+# RG5 (plan §5.4): the serve `_REGIME` phase + the strategist's verdict.
+EVENT_REGIME_MEASURED: str = "regime_measured"
+EVENT_REGIME_VERDICT: str = "regime_verdict"
 
 # ---- §4.1 + VM2-V4 grammar mirrors (published constants; the
 # authoritative enforcement is `ingress_ai::validate_ruleset` in the
@@ -504,8 +511,25 @@ _STATIC_SYSTEM_TEXT: str = (
     "\n"
     "OUTPUT CONTRACT (strict): respond with EXACTLY one JSON object and"
     " nothing else — no prose, no code fences:\n"
-    '{"thesis": "<why these rows, <= 4000 chars>", "rows": [ROW, ...]}\n'
+    '{"thesis": "<why these rows, <= 4000 chars>", "rows": [ROW, ...],'
+    ' "regime": VERDICT}\n'
     "Malformed output is archived and discarded; the cycle ends.\n"
+    "\n"
+    'REGIME VERDICT: "regime" is OPTIONAL — your ruling on the CURRENT'
+    " mode, which the worker DECLARES to the engine (a declaration"
+    " overrides the measurement on the dimensions it names, for a"
+    " bounded TTL, then the measurement resumes). VERDICT ="
+    ' {"fast": "<decl>", "slow": "<decl>"} with either profile omitted;'
+    ' <decl> is "measured" (confirm the worker-measured word in the'
+    " digest's REGIME section) or a comma list of ONE value per named"
+    ' dimension, e.g. "trend:bull,shape:trend" (dimensions: trend'
+    " bull|bear|neutral, shape trend|chop|mixed, vol low|normal|high,"
+    " fund pos|neg, level low|normal|high, stretch ext_up|ext_down|"
+    "neutral; unknown marks a dimension unjudgeable). Rule ONLY when the"
+    " digest's evidence (raw values, timeline, engine words) contradicts"
+    ' the measurement or the measurement is unknown; otherwise "measured"'
+    " or omit. Never invent a regime to fit the rows — the rows fit the"
+    " regime.\n"
     "\n"
     "WORKED EXAMPLE A — stateless refire, cross-venue price deviation,"
     " labelled for calm markets on both horizons:\n"
@@ -611,6 +635,7 @@ def build_digest(
     performance: str | None = None,
     positions: str | None = None,
     pnl: str | None = None,
+    regime: str | None = None,
     cap: int = STRATEGIST_INPUT_CAP,
 ) -> str:
     """The DYNAMIC user-block digest (§7.2): market map, capture-derived
@@ -632,7 +657,14 @@ def build_digest(
     :func:`positions_digest_text` / :func:`pnl_digest_text`, which
     render absent/empty sources as honest empty text (never errors);
     ``None`` omits the section entirely (pre-#7a callers unchanged —
-    the dedupe key for their inputs is untouched)."""
+    the dedupe key for their inputs is untouched).
+
+    RG5 (plan §5.4): ``regime`` carries the REGIME section — the
+    worker-measured words + raw values, the declaration in force, the
+    engine's effective words, the 24 h timeline and the per-regime P&L
+    of the latest nightly report (:func:`claude_worker.regime.regime_digest_text`
+    / the serve phase's :class:`claude_worker.regime.ServeRegimeOutcome`
+    digest); ``None`` omits it."""
     parts: list[str] = []
     used = 0
     map_lines = "\n".join(f"  {name} -> sym {markets[name]}" for name in sorted(markets))
@@ -665,6 +697,14 @@ def build_digest(
     if pnl is not None:
         used = _append_capped(
             parts, used, f"\nPER-STRATEGY SHADOW P&L (latest nightly report):\n{pnl}\n", cap
+        )
+    if regime is not None:
+        used = _append_capped(
+            parts,
+            used,
+            "\nREGIME (worker-measured words + raw values, declaration in force,"
+            f" engine words, 24 h timeline, per-regime P&L):\n{regime}\n",
+            cap,
         )
     news = _news_tail(features_dir / "news", max(0, cap - used))
     if news:
@@ -862,10 +902,13 @@ def build_revision_prompt(digest: str, prior_rows_json: str, gate_summary: str, 
 
 
 class Proposal(typing.NamedTuple):
-    """A parsed, structurally-valid strategist proposal."""
+    """A parsed, structurally-valid strategist proposal. ``regime`` is the
+    RG5 verdict (plan §5.4) — ``{"fast": "<decl>|measured", …}`` the
+    worker turns into a declaration — or ``None`` when omitted."""
 
     thesis: str
     rows: list[dict[str, object]]  # canonical key order, validated types
+    regime: dict[str, str] | None = None
 
 
 def _int_field(value: object, lo: int, hi: int) -> int | None:
@@ -1259,10 +1302,11 @@ def _parse_row_v1(obj: dict[str, object]) -> dict[str, object] | None:
 
 
 def parse_proposal(raw: str) -> Proposal | None:
-    """STRICT §7.3 parse: exactly ``{"thesis": str, "rows": [...]}`` with
-    rows in the §4.1 grammar (structural bounds mirrored above). ``None``
-    on ANY deviation — the caller archives + counts, never crashes.
-    Oversized (> 256 rows) is malformed."""
+    """STRICT §7.3 parse: exactly ``{"thesis": str, "rows": [...]}`` plus
+    the OPTIONAL RG5 ``"regime"`` verdict, with rows in the §4.1 grammar
+    (structural bounds mirrored above). ``None`` on ANY deviation — the
+    caller archives + counts, never crashes. Oversized (> 256 rows) is
+    malformed; so is a verdict that is not a profile → declaration map."""
     try:
         obj = json.loads(raw)
     except (ValueError, TypeError):
@@ -1270,7 +1314,7 @@ def parse_proposal(raw: str) -> Proposal | None:
     if not isinstance(obj, dict):
         return None
     top = typing.cast(dict[str, object], obj)
-    if set(top) != {"thesis", "rows"}:
+    if set(top) - {"regime"} != {"thesis", "rows"}:
         return None
     thesis = top.get("thesis")
     if not isinstance(thesis, str) or not 1 <= len(thesis) <= MAX_THESIS_CHARS:
@@ -1287,7 +1331,16 @@ def parse_proposal(raw: str) -> Proposal | None:
         if row is None:
             return None
         rows.append(row)
-    return Proposal(thesis=thesis, rows=rows)
+    regime: dict[str, str] | None = None
+    if "regime" in top:
+        verdict = top["regime"]
+        if not isinstance(verdict, dict):
+            return None
+        try:
+            regime = claude_worker.regime.parse_verdict(typing.cast(dict[str, object], verdict))
+        except ValueError:
+            return None
+    return Proposal(thesis=thesis, rows=rows, regime=regime)
 
 
 # ---- candidate files (§7.3) + the §8.1 install --------------------------

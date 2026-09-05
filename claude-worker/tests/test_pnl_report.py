@@ -147,6 +147,61 @@ def test_day_mode_audits_each_run_of_the_closed_day_with_the_fee_tier_and_merges
         claude_worker.pnl_report.load_fee_flags(fees)
 
 
+def _regime_section(mode: str, fast_words: list[tuple[str, str, int, list[dict]]]) -> dict:
+    return {
+        "mode": mode, "artifact_sha256": "ab" * 32, "seed_rows": 7680, "minutes_judged": sum(m for _, _, m, _ in fast_words),
+        "declared_applied": 1 if mode == "artifact" else 0, "funding_events": 3,
+        "set_regime_frames": 2, "set_regime_expired": 1,
+        "profiles": [
+            {"profile": "fast", "words": [{"word": w, "bits": b, "minutes": m, "strategies": s} for w, b, m, s in fast_words]},
+            {"profile": "slow", "words": []},
+        ],
+    }
+
+
+def _regime_row(sid: int, label: str, fills: int, net: str, ladder: list[str]) -> dict:
+    return {"strategy_id": sid, "label": label, "orders": fills * 2, "fills": fills, "trades": fills // 2,
+            "net_usd": net, "fee_ladder_net_usd": ladder}
+
+
+def test_merge_folds_the_per_regime_section_across_runs_and_tolerates_pre_rg3_reports():
+    # RG5 (plan §5.1): per (profile, word) minutes + strategy rows sum
+    # across runs keyed by the word's bits; a run without the section
+    # (pre-RG3 harness) contributes nothing; the summary head names each
+    # regime the day was in with every strategy's fills / net / ladder.
+    bull = ("trend=bull shape=trend", "0000000000000104", 90, [_regime_row(5, "vm", 4, "1.50", ["2.0", "1.0", "0.5"])])
+    bear = ("trend=bear shape=chop", "0000000000000201", 30, [_regime_row(5, "vm", 1, "-0.25", ["0.0", "-0.1", "-0.2"]),
+                                                             _regime_row(6, "icdp", 2, "0.10", ["0.2", "0.1", "0.0"])])
+    bull2 = ("trend=bull shape=trend", "0000000000000104", 20, [_regime_row(5, "vm", 2, "0.50", ["1.0", "0.5", "0.0"])])
+    base = json.loads(_day_run_json(1, 4, "1.5", "0.75"))
+    r1 = {**base, "regime": _regime_section("artifact", [bull, bear])}
+    r2 = {**base, "regime": _regime_section("artifact", [bull2])}
+    r3 = {**base, "regime": _regime_section("blind", [])}
+    r4 = dict(base)  # pre-RG3: no section at all
+    merged = claude_worker.pnl_report.merge_reports("2026-09-05", [("run-1", r1), ("run-2", r2), ("run-3", r3), ("run-4", r4)])
+    reg = merged["regime"]
+    assert reg["modes"] == {"artifact": 2, "blind": 1}
+    assert reg["minutes_judged"] == 140 and reg["declared_applied"] == 2
+    assert reg["set_regime_frames"] == 6 and reg["set_regime_expired"] == 3
+    assert [p["profile"] for p in reg["profiles"]] == ["fast", "slow"]
+    fast = reg["profiles"][0]["words"]
+    assert [(w["word"], w["minutes"]) for w in fast] == [("trend=bull shape=trend", 110), ("trend=bear shape=chop", 30)]
+    vm_bull = fast[0]["strategies"]
+    assert vm_bull == [{"strategy_id": 5, "label": "vm", "orders": 12, "fills": 6, "trades": 3,
+                        "net_usd": "2.000000", "fee_ladder_net_usd": ["3.000000", "1.500000", "0.500000"]}]
+    assert [s["strategy_id"] for s in fast[1]["strategies"]] == [5, 6]
+    assert reg["profiles"][1]["words"] == []
+    head = claude_worker.pnl_report.regime_head_lines(merged)
+    assert head[0].startswith("regime: modes artifact=2, blind=1 minutes_judged=140")
+    assert "regime fast [trend=bull shape=trend] minutes=110: vm[fills=6 net=2.000000" in head[1]
+    assert "icdp[fills=2" in head[2] and len(head) == 3
+    # Only pre-RG3 reports ⇒ an empty section and no head lines.
+    empty = claude_worker.pnl_report.merge_reports("2026-09-05", [("run-4", r4)])
+    assert empty["regime"] == {"modes": {}, "minutes_judged": 0, "declared_applied": 0,
+                               "set_regime_frames": 0, "set_regime_expired": 0, "profiles": []}
+    assert claude_worker.pnl_report.regime_head_lines(empty) == []
+
+
 def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
     # ICDP I6 + the 2 h law: a 3 h run becomes two window units, each a
     # bounded run dir of its own (epoch advanced), deleted after audit.
@@ -335,3 +390,17 @@ def test_real_binary_end_to_end(tmp_path):
     assert obj["audit_pnl_version"] == 1
     assert obj["strategies"][0]["strategy_id"] == 0
     assert obj["strategies"][0]["fills"] == 1
+
+
+def test_latest_report_regimes_reads_the_merged_profiles(tmp_path):
+    reports = tmp_path / "reports"
+    assert claude_worker.pnl_report.latest_report_regimes(reports) == []
+    reports.mkdir()
+    (reports / "pnl-2026-09-04.json").write_text('{"audit_pnl_version":1}\n')
+    assert claude_worker.pnl_report.latest_report_regimes(reports) == [], "pre-RG5 report: no section"
+    (reports / "pnl-2026-09-05.json").write_text(
+        json.dumps({"audit_pnl_version": 1, "regime": {"profiles": [{"profile": "fast", "words": []}, "junk"]}})
+    )
+    assert claude_worker.pnl_report.latest_report_regimes(reports) == [{"profile": "fast", "words": []}]
+    (reports / "pnl-2026-09-06.json").write_text("{not json")
+    assert claude_worker.pnl_report.latest_report_regimes(reports) == []

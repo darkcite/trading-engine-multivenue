@@ -74,6 +74,7 @@ import claude_worker.labeling
 import claude_worker.llm
 import claude_worker.monitor
 import claude_worker.pnl_report
+import claude_worker.regime
 import claude_worker.state
 import claude_worker.strategist
 import claude_worker.uds
@@ -119,6 +120,7 @@ _SPLIT_DEFAULT: str = "70/30"
 
 # maybe_run phases (one research cycle spans many 0.2 s ticks).
 _IDLE: str = "idle"
+_REGIME: str = "regime"  # RG5 (plan §5.4): measure → history → auto-confirm, before fetch
 _FETCH: str = "fetch"
 _CALL: str = "call"
 _PROMOTE: str = "promote"
@@ -153,6 +155,12 @@ class ResearchStats:
     rollbacks_completed: int = 0
     rollback_no_prior: int = 0
     rollback_retries: int = 0
+    # RG5 regime phase + the strategist's verdict.
+    regime_measured: int = 0
+    regime_declared: int = 0
+    regime_skipped: int = 0
+    regime_verdicts: int = 0
+    regime_verdict_failures: int = 0
 
 
 def default_fetch_fn() -> bool:
@@ -219,6 +227,7 @@ class ResearchCycle:
         clock_ns: typing.Callable[[], int] = time.monotonic_ns,
         wall_ns: typing.Callable[[], int] = time.time_ns,
         stats: ResearchStats | None = None,
+        regime_inputs: tuple[pathlib.Path, pathlib.Path] | None = None,
     ) -> None:
         self._state = state
         self._cfg = cfg
@@ -226,6 +235,12 @@ class ResearchCycle:
         self._complete_fn = complete_fn
         self._executor = executor
         self._fetch_fn = default_fetch_fn if fetch_fn is None else fetch_fn
+        # RG5 (plan §5.4): ``(regime.toml, candles.db)`` — None = no regime
+        # phase at all (tests, or a box without the artifact); the
+        # declared/history state lives beside state.db (``regime_dir_for``).
+        self._regime_inputs = regime_inputs
+        self._regime_dir = claude_worker.regime.regime_dir_for(cfg.db_path)
+        self._declare_ttl_s: int = claude_worker.regime.declare_ttl_s(env)
         self._run_backtest_fn = (
             claude_worker.backtest.run_backtest if run_backtest_fn is None else run_backtest_fn
         )
@@ -243,6 +258,8 @@ class ResearchCycle:
         # In-cycle context.
         self._run_name: str | None = None
         self._digest: str = ""
+        self._regime_text: str | None = None
+        self._regime_measurement: claude_worker.regime.Measurement | None = None
         self._purpose: str = _PURPOSE_PROPOSAL
         self._pending: tuple[
             claude_worker.strategist.Candidate, claude_worker.backtest.BacktestOutcome
@@ -515,8 +532,101 @@ class ResearchCycle:
         self._run_name = latest.name
         self.stats.cycles_started += 1
         _log.info("research_cycle_start", run=latest.name)
+        self._phase = _REGIME
+
+    def _regime_phase(self, uds_client: claude_worker.uds.UdsClient) -> None:
+        """RG5 (plan §5.4), the ``_REGIME`` phase: synchronous on the
+        serve-loop thread (SQLite over candles.db, one loopback
+        ``/metrics`` read, at most two SetRegime frames — the same
+        connection the stage/commit pair rides, §7.6). Then fetch."""
+        self._regime_text = None
+        self._regime_measurement = None
+        if self._regime_inputs is not None:
+            regime_path, db_path = self._regime_inputs
+            outcome = claude_worker.regime.serve_regime_step(
+                regime_path,
+                db_path,
+                self._regime_dir,
+                self._wall_ns() // 1_000_000,
+                uds_client if uds_client.connected else None,
+                self._declare_ttl_s,
+                claude_worker.pnl_report.latest_report_regimes(
+                    claude_worker.pnl_report.resolve_reports_dir()
+                ),
+            )
+            self._regime_text = outcome.digest
+            if outcome.measurement is None:
+                self.stats.regime_skipped += 1
+                _log.info("regime_phase_skipped", reason=outcome.skipped)
+            else:
+                self.stats.regime_measured += 1
+                self.stats.regime_declared += len(outcome.seqs)
+                self._regime_measurement = outcome.measurement
+                self._event(
+                    claude_worker.strategist.EVENT_REGIME_MEASURED,
+                    {
+                        "minute": outcome.measurement.minute,
+                        "age_min": outcome.measurement.age_min,
+                        "measured": {
+                            n: claude_worker.regime.describe(w)
+                            for n, w in claude_worker.regime.measured_words(
+                                outcome.measurement
+                            ).items()
+                        },
+                        "declared": sorted(outcome.declared),
+                        "seqs": outcome.seqs,
+                        "skipped": outcome.skipped,
+                    },
+                )
         self._future = self._executor.submit(self._fetch_fn)
         self._phase = _FETCH
+
+    def _apply_verdict(
+        self, verdict: dict[str, str], uds_client: claude_worker.uds.UdsClient
+    ) -> None:
+        """The strategist's regime verdict (plan §5.4) → a declaration
+        with source ``strategist`` (persisted; frames when connected —
+        the post-boot repush covers the rest). ``measured`` needs this
+        cycle's measurement; without one the verdict is a counted skip."""
+        m = self._regime_measurement
+        if m is None:
+            if any(v == claude_worker.regime.VERDICT_MEASURED for v in verdict.values()):
+                self.stats.regime_verdict_failures += 1
+                _log.info("regime_verdict_unmeasured", verdict=verdict)
+                return
+            confirm: dict[str, int] = {}
+            audit: dict[str, int] | None = None
+        else:
+            confirm = claude_worker.regime.measured_declaration_words(m)
+            audit = claude_worker.regime.measured_words(m)
+        words = claude_worker.regime.verdict_words(verdict, confirm)
+        now_ms = self._wall_ns() // 1_000_000
+        try:
+            seqs = claude_worker.regime.declare_words(
+                uds_client if uds_client.connected else None,
+                self._regime_dir,
+                words,
+                now_ms,
+                self._declare_ttl_s,
+                claude_worker.regime.SOURCE_STRATEGIST,
+                audit,
+            )
+        except claude_worker.uds.UdsError as exc:
+            self.stats.regime_verdict_failures += 1
+            uds_client.close()
+            _log.warning("regime_verdict_transport", error=str(exc))
+            return
+        self.stats.regime_verdicts += 1
+        self._event(
+            claude_worker.strategist.EVENT_REGIME_VERDICT,
+            {
+                "verdict": verdict,
+                "words": {n: claude_worker.regime.describe(w) for n, w in words.items()},
+                "ttl_s": self._declare_ttl_s,
+                "seqs": seqs,
+            },
+        )
+        _log.info("regime_verdict_declared", verdict=verdict, seqs=seqs)
 
     def _after_fetch(self, fetch_ok: bool, uds_client: claude_worker.uds.UdsClient) -> None:
         if not fetch_ok:
@@ -559,6 +669,7 @@ class ResearchCycle:
             performance=self._performance,  # §7.1: latest walk-forward (H5)
             positions=positions_text,
             pnl=pnl_text,
+            regime=self._regime_text,  # RG5 §5.4: None until an artifact is configured
         )
         prompt = claude_worker.strategist.build_user_prompt(self._digest)
         if not self._submit_call(prompt, _PURPOSE_PROPOSAL):
@@ -599,6 +710,10 @@ class ResearchCycle:
             self._reject(result.text, "malformed_output")
             self._end_cycle(uds_client)
             return
+        if proposal.regime is not None and self._regime_inputs is not None:
+            # The verdict is the AI's ruling on the MODE — independent of
+            # whether its rows pass the gates.
+            self._apply_verdict(proposal.regime, uds_client)
         candidate = claude_worker.strategist.write_candidate(
             claude_worker.strategist.candidates_dir(self._cfg.db_path), proposal
         )
@@ -713,6 +828,9 @@ class ResearchCycle:
         if self._phase == _ROLLBACK:
             self._try_rollback(uds_client)
             return
+        if self._phase == _REGIME:
+            self._regime_phase(uds_client)
+            return
         future = self._future
         if future is None or not future.done():
             return
@@ -798,6 +916,7 @@ def serve(  # noqa: PLR0913 — composition root: injected collaborators for the
     research_run_backtest_fn: typing.Callable[..., claude_worker.backtest.BacktestOutcome]
     | None = None,
     research_stats_out: ResearchStats | None = None,
+    research_regime_inputs: tuple[pathlib.Path, pathlib.Path] | None = None,
 ) -> int:
     """Run the daemon until SIGTERM/SIGINT (or ``iterations``, tests
     only). Returns the process exit code (0 = clean shutdown).
@@ -810,7 +929,11 @@ def serve(  # noqa: PLR0913 — composition root: injected collaborators for the
     The ``research_*`` keywords (8h, additive) are test seams for the
     [`ResearchCycle`] collaborator; production leaves them None
     (env = ``os.environ``, fetch = the verb subprocess, backtest = the
-    frozen ``backtest.run_backtest`` over the real binary).
+    frozen ``backtest.run_backtest`` over the real binary, regime inputs
+    = ``regime.regime_inputs()`` from the environment — a test that
+    injects ``research_env`` gets NO regime phase unless it also passes
+    ``research_regime_inputs``, so no test ever measures the operator's
+    files).
     """
     stats = ServeStats() if stats_out is None else stats_out
     flag = _StopFlag()
@@ -867,6 +990,11 @@ def serve(  # noqa: PLR0913 — composition root: injected collaborators for the
         env=os.environ if research_env is None else research_env,
         clock_ns=clock_ns,
         stats=research_stats_out,
+        regime_inputs=(
+            research_regime_inputs
+            if research_regime_inputs is not None or research_env is not None
+            else claude_worker.regime.regime_inputs()
+        ),
     )
     _log.info("serve_started", feeds=len(cfg.rss_feeds), db=str(cfg.db_path))
 

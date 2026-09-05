@@ -34,6 +34,13 @@ Cadence honesty: a 5-min cron harvests the PERSISTENT-dislocation
 component only (regimes lasting ≥ minutes-to-hours — exactly what the
 mining showed persists); the 5-second oscillation P&L of the v1
 backtest is NOT claimable here and is not claimed.
+
+Regime gate (RG5, plan §5.1): ``REGIME_LABEL`` (the §3.3 term grammar,
+default empty = ANY) gates ENTRIES only through
+``claude_worker.regime.lane_gate`` — exits are never gated, a held
+position drains by its own law. The words come from the engine's
+``/metrics`` when reachable, else the fresh ``declared.json``, else
+UNKNOWN (a constrained profile then fails closed).
 """
 
 import argparse
@@ -48,6 +55,7 @@ import sys
 import time
 
 import claude_worker.carry_signal
+import claude_worker.regime
 
 # (sym, ref, sym_descriptor, ref_descriptor, tag) — zero-centered
 # pairs per the 2026-08-29 mining (bn↔okx med −0.2 bps, bn↔hl +0.1;
@@ -63,6 +71,8 @@ LEG_NOTIONAL_USD: float = 9_900.0
 MAX_MID_AGE_S: float = 120.0
 TAIL_BYTES: int = 512 * 1024
 SLOT: int = 64
+#: RG5 entry label (§3.3 terms; empty = ANY, the pre-RG5 behaviour).
+REGIME_LABEL: tuple[str, ...] = ()
 
 
 def newest_run_dir(logs_dir: pathlib.Path) -> pathlib.Path | None:
@@ -130,6 +140,7 @@ def run_cycle(
     map_path: pathlib.Path,
     out_dir: pathlib.Path,
     now_ns: int | None = None,
+    regime_words: dict[str, int] | None = None,
 ) -> pathlib.Path:
     now = time.time_ns() if now_ns is None else now_ns
     run_dir = newest_run_dir(logs_dir)
@@ -141,6 +152,11 @@ def run_cycle(
     state_path = out_dir / "state.json"
     state = load_state(state_path)
     positions: dict = state["positions"]
+    entries_open, regime_tell = claude_worker.regime.lane_gate(
+        REGIME_LABEL, now // 1_000_000, regime_words
+    )
+    if REGIME_LABEL:
+        lines.append(regime_tell)
 
     mids: dict[int, tuple[float, float, float]] = {}
     feed_live = False
@@ -185,7 +201,9 @@ def run_cycle(
         dev_bps = (mid_s - mid_r) / mid_r * 1e4
 
         if pos is None:
-            if abs(dev_bps) >= ENTRY_BPS:
+            if abs(dev_bps) >= ENTRY_BPS and not entries_open:
+                lines.append(f"  {tag:14s} dev={dev_bps:+.1f}bps ENTRY-BLOCKED: regime")
+            elif abs(dev_bps) >= ENTRY_BPS:
                 # sym rich ⇒ sell sym / buy ref; sym cheap ⇒ reverse.
                 rich, cheap = (sym_desc, ref_desc) if dev_bps > 0 else (ref_desc, sym_desc)
                 legs, skips = pair_legs_for(f"{tag}-entry", rich, cheap, market_map, marks)

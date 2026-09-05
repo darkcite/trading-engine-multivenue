@@ -210,7 +210,7 @@ Operational laws:
   the wrapper runs only the refresh MODULE (file rewrite, no state.db
   writes). After a notable universe change, run `uv run claude-worker
   fetch` once (`unresolved=0` is the done-tell).
-- Uninstall: `for l in engine daily-restart caffeinate; do launchctl
+- Uninstall: `for l in engine daily-restart caffeinate candles regime; do launchctl
   bootout gui/$UID/com.multivenue.$l; done` (+ delete the plists from
   `~/Library/LaunchAgents`).
 - **Retention** (`scripts/retention.sh`, runs once per UTC day from
@@ -244,6 +244,30 @@ Operational laws:
   the Binance REST-vs-socket drift report (WARN over
   `CLAUDE_WORKER_CANDLES_DRIFT_WARN_BPS`). One-shot full-history PM
   fold: `uv run python -m claude_worker.candles --capture-backfill`.
+- **Regime lane** (RG5, `docs/regime-and-dashboard-plan.md` §5.1;
+  `claude_worker.regime` MODULE — never a verb; 5-minute
+  `com.multivenue.regime` agent via `scripts/regime-cycle.sh`, installed
+  by the same installer): honest no-op until `~/multivenue/regime.toml`
+  exists (copy `regime.toml.example`, set `[breadth] members` to
+  descriptors that exist in `universe.toml`; the engine reads it at its
+  next restart). Each cycle measures the worker's words over
+  `candles.db` (judged at the last minute the store holds — the candles
+  lane is hourly, so `age_min` is normal), appends the 24 h history
+  under `~/multivenue/worker/regime/`, and once per UTC day rewrites
+  ONLY the six RV/funding percentile lines of `regime.toml` (`.bak`
+  kept). The cycle NEVER declares. Operator lanes:
+  `uv run python -m claude_worker.regime report` (measured words + raw
+  values, declaration in force, engine words from `/metrics`, 24 h
+  timeline), `… history`, `… refresh-params [--dry-run]`,
+  `… declare --fast "trend:bull,shape:trend" [--slow measured] --ttl 900`
+  (persists `declared.json` + one `SetRegime` frame per profile; a
+  session-serialized socket verb like every worker invocation), and
+  `… repush` (re-send the persisted declaration with its remaining TTL
+  — `recommit` does this after every boot's re-commit). `serve` runs the
+  same measurement as its `_REGIME` phase and auto-confirms it unless a
+  fresher operator/strategist ruling is in force (§7 gate: no `serve`
+  yet). The nightly `pnl_report` merges the harness's per-regime
+  section (`regime` key + `regime …` summary lines; `pnl` prints them).
 
 ## Troubleshooting
 

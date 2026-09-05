@@ -7,6 +7,8 @@ import pathlib
 import struct
 import time
 
+import claude_worker.frames
+import claude_worker.regime
 import claude_worker.xv_signal
 
 NOW_NS = 1_788_100_000_000_000_000
@@ -115,3 +117,34 @@ def test_lagging_leg_holds_that_pair(tmp_path):
     assert "xv-okx-bnspot" in body and "lags feed" in body
     # the hl pair (fresh both legs, dev 0) stays flat, not blocked
     assert "xv-hl-bnusdm" in body and "flat" in body
+
+
+def test_regime_label_gates_entries_only_and_exits_drain(tmp_path, monkeypatch):
+    # RG5: an empty label is ANY (the pre-RG5 behaviour, no engine touch);
+    # a labelled lane blocks ENTRIES when the words miss the label and
+    # never gates an EXIT. Words are injected — no /metrics, no files.
+    bull = claude_worker.frames.regime_word(trend="bull", shape="trend", source="measured")
+    bear = claude_worker.frames.regime_word(trend="bear", shape="chop", source="measured")
+    unknown = claude_worker.regime.UNKNOWN_WORD
+    monkeypatch.setattr(claude_worker.xv_signal, "REGIME_LABEL", ("trend:bull|neutral",))
+    logs, mp, out = world(tmp_path, dev_bps=+6.0)
+    d = claude_worker.xv_signal.run_cycle(logs, mp, out, NOW_NS, regime_words={"fast": bear, "slow": bull})
+    body = d.read_text()
+    assert "regime: ENTRIES BLOCKED" in body and "ENTRY-BLOCKED: regime" in body
+    assert json.loads((out / "state.json").read_text())["positions"] == {}
+    # Unknown (engine unreachable, no declaration) fails a constrained profile closed.
+    d = claude_worker.xv_signal.run_cycle(logs, mp, out, NOW_NS, regime_words={"fast": unknown, "slow": unknown})
+    assert "ENTRY-BLOCKED: regime" in d.read_text()
+    # Allowed words: the same dislocation enters.
+    d = claude_worker.xv_signal.run_cycle(logs, mp, out, NOW_NS, regime_words={"fast": bull, "slow": bear})
+    assert "regime: open" in d.read_text() and "ENTER short=okx:BTC-USDT" in d.read_text()
+    # Reversion under a BLOCKING regime still exits: exits are never gated.
+    logs2, mp2, _ = world(tmp_path / "b", dev_bps=+0.5)
+    d = claude_worker.xv_signal.run_cycle(logs2, mp2, out, NOW_NS, regime_words={"fast": bear, "slow": bear})
+    assert "EXIT" in d.read_text()
+    assert json.loads((out / "state.json").read_text())["positions"] == {}
+    # The default label is empty = ANY: no regime line at all.
+    monkeypatch.setattr(claude_worker.xv_signal, "REGIME_LABEL", ())
+    logs3, mp3, out3 = world(tmp_path / "c", dev_bps=+6.0)
+    body = claude_worker.xv_signal.run_cycle(logs3, mp3, out3, NOW_NS, regime_words={"fast": bear, "slow": bear}).read_text()
+    assert "regime" not in body and "ENTER" in body

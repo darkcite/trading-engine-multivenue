@@ -43,6 +43,7 @@ import typing
 
 import claude_worker.backtest
 import claude_worker.config
+import claude_worker.regime
 import claude_worker.state
 import claude_worker.uds
 
@@ -123,6 +124,20 @@ def recommit_active(
                 )
                 return EXIT_GATE
             seq_commit = claude_worker.backtest.commit_ruleset(state, client, full_hash)
+            # RG5 (plan §4.3): the DECLARED regime word does not survive a
+            # restart in the engine — re-push the persisted declaration
+            # with its remaining TTL on the same connection, one more
+            # frame after the re-commit. Best-effort: a declaration is
+            # never worth failing the re-commit over.
+            try:
+                claude_worker.regime.repush_declared(
+                    client,
+                    claude_worker.regime.regime_dir_for(cfg.db_path),
+                    int(time.time() * 1000),
+                    report,
+                )
+            except claude_worker.uds.UdsError as exc:
+                report(f"recommit: regime repush transport: {exc} (declaration not re-sent)")
         finally:
             client.close()
     finally:

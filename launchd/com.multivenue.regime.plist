@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- RG5 regime cycle (TEMPLATE — rendered by install-launchd.sh;
+     docs/regime-and-dashboard-plan.md §5.1): every 5 min the worker
+     measures the regime over candles.db, appends the 24 h history and,
+     once a UTC day, refreshes the percentile lines of regime.toml.
+     Never declares. Absent ~/multivenue/regime.toml = no-op. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.regime</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/regime-cycle.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/regime.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/regime.log</string>
+</dict>
+</plist>

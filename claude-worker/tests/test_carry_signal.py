@@ -7,6 +7,7 @@ import pathlib
 import sqlite3
 
 import claude_worker.carry_signal
+import claude_worker.frames
 import claude_worker.funding
 
 HOUR_MS = 3_600_000
@@ -264,3 +265,39 @@ def test_push_sh_renders_exact_verb_lines(tmp_path):
                 "uv run claude-worker push --kind order-intent --sym "
             )
             assert "--ttl-s 3600.0" in line
+
+
+def test_regime_label_gates_cvfc_and_s1_entries_never_exits(tmp_path, monkeypatch):
+    # RG5: the label gates CVFC + S1 entries through the shared lane gate;
+    # a held position under a blocking regime still exits by its own law.
+    bull = claude_worker.frames.regime_word(trend="bull", source="measured")
+    bear = claude_worker.frames.regime_word(trend="bear", source="measured")
+    monkeypatch.setattr(claude_worker.carry_signal, "REGIME_LABEL", ("slow:trend:!bear",))
+    db, features, map_path, out = fixture_world(tmp_path)
+    put_rates(db, "binance-usdm:cotiusdt", eight_hourly(-2e-3, prints=9))
+    put_rates(db, "bybit-linear:COTIUSDT", eight_hourly(1e-4, prints=9))
+    fdir = features / "run-1"
+    for sym, px in ((7003, 0.005), (7004, 0.005)):
+        (fdir / f"{sym}.json").write_text(json.dumps({"sym": sym, "last_bid_px": int(px * 1e6), "last_ask_px": int(px * 1e6) + 10}))
+    m = json.loads(map_path.read_text())
+    m["markets"]["binance-usdm:cotiusdt"] = 7003
+    m["markets"]["bybit-linear:COTIUSDT"] = 7004
+    map_path.write_text(json.dumps(m))
+    blocked = claude_worker.carry_signal.run_cycle(db, features, map_path, out, NOW, regime_words={"fast": bull, "slow": bear})
+    body = blocked.read_text()
+    assert "regime: ENTRIES BLOCKED" in body
+    assert "ENTRIES regime-blocked this cycle" in body and "ENTER ADA" not in body
+    assert "QUALIFIES — ENTRY-BLOCKED: regime" in body and "ENTER short=bybit" not in body
+    state = json.loads((out / "state.json").read_text())
+    assert state["positions"] == [] and state.get("s1_positions", []) == []
+    # Open regime: both lanes enter as before.
+    opened = claude_worker.carry_signal.run_cycle(db, features, map_path, out, NOW, regime_words={"fast": bear, "slow": bull})
+    body = opened.read_text()
+    assert "regime: open" in body and "ENTER ADA short=hl long=dbt" in body and "ENTER short=bybit long=bn" in body
+    # Past min-hold with the spread flipped, under a BLOCKING regime: exits.
+    late = NOW + 100 * HOUR_MS
+    put_rates(db, "hyperliquid:ADA", hourly(-6e-5, end=late))
+    put_rates(db, "deribit:ADA_USDC-PERPETUAL", hourly(1e-5, end=late))
+    exited = claude_worker.carry_signal.run_cycle(db, features, map_path, out, late, regime_words={"fast": bear, "slow": bear})
+    assert "EXIT ADA" in exited.read_text()
+    assert json.loads((out / "state.json").read_text())["positions"] == []
