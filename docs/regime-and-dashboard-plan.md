@@ -1,8 +1,7 @@
 # Market regime + regime labels + regime-aware AI aggregation + dashboard — plan (RG0–RG7)
 
 **Status: IN PROGRESS — RG0–RG2 committed (`77f5ea5`); RG3 committed
-(`81ed263`, 2026-09-05); RG5 code-complete 2026-09-05 (uncommitted;
-operator commits — §12 entry). Next: the RG2/RG3/RG5 live smoke
+(`81ed263`, 2026-09-05); RG5 committed (`8defc26`, 2026-09-05; §12 entry). Next: the RG2/RG3/RG5 live smoke
 (operator: relink + `regime.toml` + restart + `install-launchd.sh`; a
 labelled ruleset staged/committed live — §7 RG3 exit tell), then RG4
 (library + composer) or RG6 (dashboard); §11 defaults apply until
@@ -1173,8 +1172,7 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   from RG3 · `ruff` finding counts on the touched files did not grow
   except new E501s in the same hand-wrapped style the files already
   carry (py-lint is not a gate).**
-- **RESUME POINT (for a fresh session):** RG5 is code-complete on disk
-  (commit status = the operator's). Next = (a) the operator's live smoke
+- **RESUME POINT (for a fresh session):** RG5 is committed (`8defc26`). Next = (a) the operator's live smoke
   of RG2+RG3(+RG5) — the recipe in the RG3 resume point above, plus
   `./scripts/install-launchd.sh` to install `com.multivenue.regime`
   (no-op until `~/multivenue/regime.toml` exists), then `uv run python
