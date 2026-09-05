@@ -16,7 +16,29 @@ MIN_FREE_GIB=25
 TARGET_FREE_GIB=40
 PROTECT_DAYS=7
 ARCHIVE_DIR="$HOME/multivenue/archive"
-# compress (default) | move — `move` only makes sense when
-# ARCHIVE_DIR sits on a DIFFERENT volume (same-volume moves free
-# nothing).
+# compress (default) | move | s3
+#   compress — tar -cz into ARCHIVE_DIR, then remove the original.
+#   move     — only makes sense when ARCHIVE_DIR sits on a DIFFERENT
+#              volume (same-volume moves free nothing).
+#   s3       — retention stage B: delete a run dir ONLY after the
+#              archiver verifies the bucket holds it (index object
+#              present, manifest byte-identical, every object HEADs with
+#              the recorded size and ETag). An unverified run is KEPT and
+#              the sweep stops there: disk pressure is never a reason to
+#              lose the only copy of anything. Falls back to `compress`
+#              when the archiver is not installed.
+#              Uploading is NOT done here — it is a separate daily agent
+#              (com.multivenue.archive), deliberately outside the restart
+#              lane, so nothing slow can stall the 0000Z tick.
 ARCHIVE_MODE="compress"
+
+# ---- object-storage archive (ARCHIVE_MODE=s3 only) ----
+# Wall budget for one run of the upload cycle (stage A). The cycle stops
+# cleanly when it is spent and resumes where it left off next time — a
+# half-uploaded run has no manifest and no index, so no reader can see it.
+S3_CYCLE_BUDGET_S=600
+
+# Only when the credentials are NOT at the default ~/multivenue/s3.env.
+# Both scripts export it; neither ever READS the file — only the Python
+# loader does, which is what keeps the secret out of the process table.
+# MULTIVENUE_S3_ENV_FILE="/abs/path/to/s3.env"
