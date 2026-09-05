@@ -892,7 +892,7 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
         return EXIT_FAILED
 
 
-def _dispatch(  # noqa: PLR0911 — one branch per verb, deliberately flat
+def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately flat
     args: argparse.Namespace,
     cfg: claude_worker.archive_config.ArchiveConfig,
     archiver: Archiver,

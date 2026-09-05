@@ -1517,6 +1517,21 @@ RESUME POINT.`
     exactly as designed.
   - Ratio 5.4× confirms the S0 prediction (5–6× blended) and retires the §5
     manifest example's optimistic "~10×".
+  - **G-S5 PARITY PASSED ON REAL DATA (operator-ruled variant: a ≤ 2 h cut
+    window, not the whole run).** The pushed run was pulled back out of the
+    bucket into a separate directory; `diff -rq` reports the pulled tree
+    **byte-for-byte identical** to the original. `window_root.cut_run` was then
+    run on BOTH copies over the same first complete 2 h window (the run holds
+    3), and `multivenue-engine audit-pnl --dir <cut>` produced **byte-identical
+    stdout** — 2 482 bytes, sha256 `9298bc16cdb0a1b20f5078b17d4168903fa877313a49d0d6ec76010162d5b415`
+    from each side, over a non-trivial workload (orders 35 054, fills 108).
+    Pitfall 18 was checked first: the release binary (16:51:41) is newer than
+    the last `crates/cli` commit (`b246069`, 16:50:56). The local run was never
+    moved or deleted — the pull went to a scratch directory, so nothing in
+    `~/multivenue/logs` was at risk. The one-off needed
+    `MULTIVENUE_S3_CACHE_MIN_FREE_GIB=0` in its environment because the volume
+    (22 GiB free) is under the production floor; that is the floor working, not
+    failing.
 
   **DEVIATIONS FROM THE PLAN (declared, with reasons):**
   1. **§7 S3 step 3's free-space rule is WRONG and was not implemented as
