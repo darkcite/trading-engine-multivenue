@@ -2128,3 +2128,28 @@ worker-side layers are the enforcement that is live.
   Python full `import x` only; SPDX header on every new file;
   explicit-path `git add`, commit only on my ask, never push; tell me
   when short on context with a resume prompt."
+
+- **2026-09-05 09:5xZ — COMMITTED `b246069` (operator: "commit everything
+  except s3-archive-plan.md" — RG4 + RG8 + funding seed in ONE commit;
+  the S3 lane's plan + `tests/fixtures/sigv4/` stay untracked),
+  RELEASED (`cargo build --release --workspace` after the commit —
+  `/state` `boot.git_sha` = `b2460691c821`), and the engine REBOOTED IN
+  AI-ONLY MODE (operator order): `~/multivenue/strategy.conf` →
+  `STRATEGY=ai` (old conf `.bak-20260905T095205Z`), SIGTERM → KeepAlive
+  relaunch, pid 85953 since 09:53:27Z; tells: `strategy-set: composed
+  mask=48 latency_arb=false`, `regime: seed file read rows=10752`,
+  `regime: artifact configured … members=6 confirm_min=3
+  require_labels=false`, `refresh-tail` 7 descriptors before
+  `seed-out`, `metrics: HTTP server starting … state=true`;
+  `/state`: masks requested 48 / enabled 48, slots 4+5 enabled only,
+  vm `fde6f733…` rows_active 2, all six WS venues state 2, icdp
+  decisions 0. **Landing status of the whole lane:** RG0–RG6 CLOSED;
+  RG8 + funding seed LANDED; RG7 OPEN on evidence only — `regime soak`
+  right after the boot: `INSUFFICIENT (windows 8, counted 1, failed 0,
+  need 8)` (the one counted window, 04:55Z, PASSED with `src=mirror`;
+  the rest predate the regime going live) — close = PASS on N ≥ 8 +
+  ruling; RG3b optional, not built; `[labels] require = 1` is the
+  operator's lever (passes under the `ai` mask; refuses `ai+icdp` until
+  icdp is labelled). The RG4 "≥ 2 members committed live" tell stays
+  OPEN (carry evidence is empty/negative under the 2 h law — finding
+  above).
