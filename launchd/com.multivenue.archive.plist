@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- S3 archive lane, stage A (TEMPLATE — rendered by install-launchd.sh;
+     docs/arch/s3-archive-plan.md §7 S4a): push closed capture runs to the
+     object store once a day, oldest first, under a wall budget.
+
+     04:30 LOCAL is chosen for distance from every restart slot
+     (0000Z / 0020Z / 0830Z / 1605Z / 2015Z / 2115Z), not for any UTC-day
+     meaning — this lane has no day law of its own.
+
+     NO KeepAlive: a failed cycle must wait for tomorrow, not spin. The next
+     run resumes exactly where this one stopped, because a run with no index
+     object is invisible to every reader.
+
+     Credentials are NOT here and never will be: the archiver's Python loader
+     reads ~/multivenue/s3.env itself, so no secret enters the process table
+     or this file. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.archive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/archive-cycle.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>@REPO@</string>
+  <key>RunAtLoad</key><false/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/archive.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/archive.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>19</integer>
+</dict>
+</plist>

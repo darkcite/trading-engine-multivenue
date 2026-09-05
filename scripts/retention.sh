@@ -29,7 +29,7 @@ MIN_FREE_GIB=25
 TARGET_FREE_GIB=40
 PROTECT_DAYS=7
 ARCHIVE_DIR="$HOME/multivenue/archive"
-ARCHIVE_MODE="compress" # compress | move
+ARCHIVE_MODE="compress" # compress | move | s3
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,6 +39,31 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -f "$CONF" ] && . "$CONF"
+
+# --- ARCHIVE_MODE=s3 preflight (S3 archive lane, stage B) ------------------
+# This stage VERIFIES ONLY — it never uploads. Uploading lives in its own
+# launchd agent at a quiet hour, deliberately outside this restart lane:
+# daily-restart.sh runs retention.sh SYNCHRONOUSLY at the 0000Z slot, so
+# anything slow here delays every later slot (0020Z pnl, 0830Z, 1605Z), and a
+# `claude-worker` cmdline here would make the boot recommit give up after five
+# minutes and leave vm_rows_active 0 for hours.
+#
+# A verify is a handful of HEADs — seconds. If the archiver is not installed we
+# fall back to `compress`: the failure mode of this script must always be
+# "keep the data", never "delete it against an archive that isn't there".
+if [ "$ARCHIVE_MODE" = "s3" ]; then
+  REPO_DIR="${0:A:h:h}"
+  VENV_ALIAS="$HOME/multivenue/venv"
+  if [ -x "$VENV_ALIAS/bin/python3" ] && [ -f "$REPO_DIR/scripts/archive-run.py" ]; then
+    [ -n "${MULTIVENUE_S3_ENV_FILE:-}" ] && export MULTIVENUE_S3_ENV_FILE
+    archive_verify() {
+      "$VENV_ALIAS/bin/python3" "$REPO_DIR/scripts/archive-run.py" verify "$1"
+    }
+  else
+    echo "retention: ARCHIVE_MODE=s3 but the archiver is not installed — using compress" >&2
+    ARCHIVE_MODE="compress"
+  fi
+fi
 
 free_gib() { df -g "$LOG_ROOT" | awk 'NR==2 {print $4}'; }
 
@@ -63,7 +88,19 @@ for d in ${(f)candidates}; do
     echo "retention: $name is ${age_days}d old (<= protect ${PROTECT_DAYS}d) — stopping" >&2
     break # older→newer order: everything after is younger
   fi
-  if [ "$ARCHIVE_MODE" = "move" ]; then
+  if [ "$ARCHIVE_MODE" = "s3" ]; then
+    # S-LAW 3: delete only what the bucket verifiably holds. `break`, not
+    # `continue` — this loop runs oldest-first, so an unverified oldest means
+    # stage A has not reached it yet and neither has anything after it. Disk
+    # pressure is never a reason to lose the only copy of something.
+    if archive_verify "$name" >&2; then
+      echo "retention: $name verified in bucket — removing local copy" >&2
+      rm -r "$d"
+    else
+      echo "retention: $name NOT verified in bucket — stopping" >&2
+      break
+    fi
+  elif [ "$ARCHIVE_MODE" = "move" ]; then
     echo "retention: move $name -> $ARCHIVE_DIR/" >&2
     mv "$d" "$ARCHIVE_DIR/" || { echo "retention: move failed — stopping" >&2; break; }
   else
