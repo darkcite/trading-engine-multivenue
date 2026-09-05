@@ -138,7 +138,7 @@ use core_types::{
     CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, REGIME_OFF_HARD, ROW_FLAG_POSITION, RULE_TABLE_ROWS,
     SYMBOL_ID_NONE,
 };
-use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr, VmRowView};
 
 pub mod features;
 
@@ -381,6 +381,39 @@ impl VmStrategy {
         } else {
             None
         }
+    }
+
+    /// RG6 `/state`: copy the active rows into `out` — identity fields
+    /// of the `RuleRowV2`, the position and the gate byte per row,
+    /// `min(rows_active, out.len())` entries; returns the count. 1 s
+    /// cadence from the cli, off the tick path.
+    pub fn rows_view(&self, out: &mut [VmRowView]) -> u32 {
+        let ai = (self.active & 1) as usize;
+        let n = (self.rows_active() as usize)
+            .min(RULE_TABLE_ROWS)
+            .min(out.len());
+        let mut i = 0usize;
+        while i < n {
+            let r = &self.tables[ai].rows[i];
+            let p = &self.positions[i];
+            out[i] = VmRowView::new(
+                r.name_h,
+                p.entry_px_1e6,
+                p.entry_ts_ns,
+                p.qty_sym_1e6,
+                r.sym,
+                r.ref_sym,
+                p.state,
+                p.side,
+                self.row_gate[i],
+                r.flags,
+                r.family,
+                r.regime_off,
+                p.entry_sign,
+            );
+            i += 1;
+        }
+        n as u32
     }
 
     /// Read one row's position (tests/backtest surface).

@@ -1,0 +1,357 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 Anton (darkcite)
+
+  RG6 §6.2 — the operator's dashboard page. One file, inline CSS + JS,
+  vanilla, no CDN, no framework (the engine's offline law). Served by
+  `python -m claude_worker.dashboard` on 127.0.0.1:9292; reads
+  `/api/engine/state` every 2 s (the engine's 1 s snapshot, proxied
+  same-origin from 9191) and `/api/worker` every 10 s. Read-only: no
+  control reaches the AI plane from here (plan §10).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>multivenue — dashboard</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#d7dbe3; --dim:#8a93a6; --ok:#39c26c; --warn:#e2b13c; --bad:#e25b4c; --acc:#5b9cf5; --mono:ui-monospace,Menlo,Consolas,monospace; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.35 var(--mono); }
+  header { position:sticky; top:0; z-index:2; background:var(--panel); border-bottom:1px solid var(--line); padding:8px 12px; display:flex; flex-wrap:wrap; gap:8px 18px; align-items:center; }
+  header .chip { padding:2px 8px; border:1px solid var(--line); border-radius:10px; white-space:nowrap; }
+  header .chip b { color:var(--acc); }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .dim { color:var(--dim); }
+  main { display:grid; grid-template-columns:repeat(auto-fit,minmax(460px,1fr)); gap:10px; padding:10px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-width:0; overflow:auto; }
+  section.wide { grid-column:1 / -1; }
+  h2 { margin:0 0 6px; font-size:13px; color:var(--acc); font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
+  h2 small { color:var(--dim); font-weight:400; text-transform:none; letter-spacing:0; margin-left:8px; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:2px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:2px 12px; }
+  .kv div:nth-child(odd) { color:var(--dim); }
+  pre { margin:0; white-space:pre-wrap; word-break:break-all; color:var(--fg); max-height:260px; overflow:auto; }
+  .tl { display:flex; gap:1px; height:14px; align-items:stretch; margin:2px 0 6px; }
+  .tl span { flex:1 1 0; min-width:1px; }
+  .lg { display:flex; gap:10px; flex-wrap:wrap; color:var(--dim); }
+  .lg i { display:inline-block; width:10px; height:10px; vertical-align:-1px; margin-right:3px; }
+  .hash { color:var(--acc); }
+  .muted { color:var(--dim); }
+  #err { color:var(--bad); }
+</style>
+</head>
+<body>
+<header id="bar">
+  <span class="chip">engine <b id="b-engine">…</b></span>
+  <span class="chip">mask <b id="b-mask">…</b></span>
+  <span class="chip">fast <b id="b-fast">…</b></span>
+  <span class="chip">slow <b id="b-slow">…</b></span>
+  <span class="chip">ai.sock hb <b id="b-hb">…</b></span>
+  <span class="chip">run <b id="b-run">…</b></span>
+  <span class="chip">disk free <b id="b-disk">…</b></span>
+  <span class="chip">worker <b id="b-worker">…</b></span>
+  <span id="err"></span>
+</header>
+<main>
+  <section id="s-regime" class="wide"><h2>Regime <small id="regime-sub"></small></h2><div id="regime"></div></section>
+  <section id="s-strat"><h2>Strategies <small id="strat-sub"></small></h2><div id="strat"></div></section>
+  <section id="s-pnl"><h2>P&amp;L <small id="pnl-sub"></small></h2><div id="pnl"></div></section>
+  <section id="s-ruleset" class="wide"><h2>Ruleset <small id="ruleset-sub"></small></h2><div id="ruleset"></div></section>
+  <section id="s-library"><h2>Library <small id="library-sub"></small></h2><div id="library"></div></section>
+  <section id="s-recent"><h2>Recent trades <small id="recent-sub"></small></h2><div id="recent"></div></section>
+  <section id="s-ingress"><h2>Ingress</h2><div id="ingress"></div></section>
+  <section id="s-latency"><h2>Latency &amp; loop</h2><div id="latency"></div></section>
+  <section id="s-ai"><h2>AI plane <small id="ai-sub"></small></h2><div id="ai"></div></section>
+  <section id="s-positions"><h2>Positions <small id="positions-sub"></small></h2><div id="positions"></div></section>
+  <section id="s-config" class="wide"><h2>Configs <small>read-only</small></h2><div id="config"></div></section>
+</main>
+<script>
+'use strict';
+// ---- the §3.3 byte map (mirrors core_types::regime + claude_worker.frames) ----
+const DIMS = ['trend','shape','vol','fund','level','stretch','source'];
+const VALUES = {
+  trend:['bear','neutral','bull'], shape:['chop','mixed','trend'], vol:['low','normal','high'],
+  fund:['neg','pos'], level:['low','normal','high'], stretch:['ext_down','neutral','ext_up'],
+  source:['measured','declared','unknown'],
+};
+const SLOT_NAMES = ['latency-arb','ev','cross-arb','rule-tree','ai-exec','vm','icdp','reserved'];
+const GATE = ['open','soft','HARD'];
+const ING_STATE = ['down','connecting','UP','backoff'];
+const COLORS = { bear:'#e25b4c', neutral:'#8a93a6', bull:'#39c26c', chop:'#e2b13c', mixed:'#8a93a6', trend:'#5b9cf5',
+  low:'#39c26c', normal:'#8a93a6', high:'#e25b4c', neg:'#e25b4c', pos:'#39c26c', ext_down:'#e25b4c', ext_up:'#39c26c',
+  unknown:'#3a3f4b', '?':'#3a3f4b', empty:'#22262f' };
+
+function dimValue(byte, d) {
+  if (byte === 0) return 'empty';
+  if (d !== 'source' && byte === 0x80) return 'unknown';
+  if ((byte & (byte - 1)) !== 0) return '?';
+  const idx = Math.log2(byte);
+  const vals = VALUES[d];
+  return idx < vals.length ? vals[idx] : '?';
+}
+function decodeDims(dims) { const o = {}; DIMS.forEach((d, i) => { o[d] = dimValue(dims[i] || 0, d); }); return o; }
+function decodeHex(hex) { // 16 hex digits, big-endian u64 → dims[]
+  const dims = []; for (let i = 0; i < 7; i++) { const b = parseInt(hex.substr(14 - 2 * i, 2), 16); dims.push(isNaN(b) ? 0 : b); }
+  return dims;
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function n(v, digits) { if (v === null || v === undefined || v === '' ) return '—'; const x = Number(v); return isNaN(x) ? esc(v) : x.toLocaleString(undefined, {maximumFractionDigits: digits === undefined ? 2 : digits}); }
+function usd(v) { if (v === null || v === undefined) return '—'; const x = Number(v); const cls = x > 0 ? 'ok' : x < 0 ? 'bad' : 'dim'; return `<span class="${cls}">${x >= 0 ? '+' : ''}${x.toFixed(2)}</span>`; }
+function age(s) { if (s === null || s === undefined || s < 0) return 'never'; if (s < 60) return `${s}s`; if (s < 3600) return `${Math.floor(s/60)}m${String(s%60).padStart(2,'0')}s`; if (s < 86400) return `${Math.floor(s/3600)}h${String(Math.floor(s%3600/60)).padStart(2,'0')}m`; return `${Math.floor(s/86400)}d${String(Math.floor(s%86400/3600)).padStart(2,'0')}h`; }
+function px(v1e6) { return (Number(v1e6) / 1e6).toFixed(6).replace(/0+$/, '').replace(/\.$/, '.0'); }
+function short(h) { return !h || /^0+$/.test(h) ? '—' : `<span class="hash" title="${esc(h)}">${esc(h.slice(0, 12))}…</span>`; }
+function tsLocal(ms) { return ms ? new Date(Number(ms)).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—'; }
+function table(headers, rows, numCols) {
+  const nc = new Set(numCols || []);
+  const th = headers.map((h, i) => `<th class="${nc.has(i) ? 'num' : ''}">${esc(h)}</th>`).join('');
+  const body = rows.map(r => '<tr>' + r.map((c, i) => `<td class="${nc.has(i) ? 'num' : ''}">${c}</td>`).join('') + '</tr>').join('');
+  return `<table><thead><tr>${th}</tr></thead><tbody>${body || `<tr><td colspan="${headers.length}" class="muted">(none)</td></tr>`}</tbody></table>`;
+}
+function set(id, html) { document.getElementById(id).innerHTML = html; }
+
+let E = null;   // engine /state
+let W = null;   // worker payload
+let engineErr = null, workerErr = null;
+
+// ---- header ----
+function renderBar() {
+  if (E) {
+    const b = E.boot;
+    set('b-engine', `<span class="${E.boot.halted ? 'bad' : 'ok'}">${b.halted ? 'HALTED' : 'up'}</span> pid ${b.pid} · ${esc(b.strategy)} · ${b.paper ? 'paper' : '<span class="bad">LIVE</span>'} · up ${age(E.now.uptime_s)} · git ${esc(b.git_sha)}`);
+    set('b-mask', `${b.enabled_mask} <span class="dim">(req ${b.requested_mask} cfg ${b.configured_mask})</span>`);
+    for (const p of E.regime.profiles) {
+      const v = decodeDims(p.effective.dims);
+      const src = v.source;
+      const txt = E.regime.configured ? `${v.trend}/${v.shape}/${v.vol}/${v.stretch} <span class="dim">[${src}${p.declared_age_s >= 0 ? ' ' + age(p.declared_age_s) + '/' + age(p.declared_ttl_s) : ''}]</span>` : '<span class="dim">no detector</span>';
+      set('b-' + p.name, txt);
+    }
+    const hb = E.ai.heartbeat_age_s;
+    set('b-hb', `<span class="${hb < 0 ? 'dim' : hb > 120 ? 'warn' : 'ok'}">${age(hb)}</span>`);
+    const rd = b.run_dir.split('/').pop();
+    set('b-run', `<span title="${esc(b.run_dir)}">${esc(rd)}</span> <span class="dim">seq ${E.seq}</span>`);
+  } else {
+    set('b-engine', `<span class="bad">${esc(engineErr || 'no data')}</span>`);
+  }
+  if (W) {
+    const d = W.disk;
+    set('b-disk', d ? `<span class="${d.free_bytes < 20e9 ? 'bad' : d.free_bytes < 60e9 ? 'warn' : 'ok'}">${(d.free_bytes / 1e9).toFixed(1)} GB</span> <span class="dim">/ ${(d.total_bytes / 1e9).toFixed(0)}</span>` : '—');
+    set('b-worker', `<span class="ok">ok</span> <span class="dim">${tsLocal(W.now_ms)}</span>`);
+  } else {
+    set('b-worker', `<span class="bad">${esc(workerErr || 'no data')}</span>`);
+  }
+  set('err', [engineErr, workerErr].filter(Boolean).map(esc).join(' · '));
+}
+
+// ---- regime ----
+function renderRegime() {
+  const parts = [];
+  if (E) {
+    const R = E.regime;
+    set('regime-sub', `configured ${R.configured} · judged ${R.minutes_judged} min · seed ${R.seed_rows} rows · declared ${R.declared_total} · gate changes ${R.gate_changes}`);
+    const rows = [];
+    for (const p of R.profiles) {
+      const m = decodeDims(p.measured.dims), d = decodeDims(p.declared.dims), e = decodeDims(p.effective.dims);
+      const raw = p.raw;
+      const pres = raw.present;
+      const f = (v, bit, scale, unit) => (pres & bit) ? `${(Number(v) / scale).toFixed(3)}${unit}` : '<span class="dim">n/a</span>';
+      rows.push([
+        `<b>${p.name}</b>`,
+        DIMS.slice(0,6).map(k => `<span style="color:${COLORS[e[k]] || 'inherit'}">${e[k]}</span>`).join(' / ') + ` <span class="dim">[${e.source}]</span>`,
+        DIMS.slice(0,6).map(k => m[k]).join('/'),
+        d.source === 'empty' && DIMS.slice(0,6).every(k => d[k] === 'empty') ? '<span class="dim">none</span>' : DIMS.slice(0,6).map(k => d[k]).join('/') + (p.declared_age_s >= 0 ? ` <span class="dim">${age(p.declared_age_s)}/${age(p.declared_ttl_s)}</span>` : ''),
+        `${p.disagree}`,
+        f(raw.ret_bps_1e9, 1, 1e9, ' bps'), f(raw.er_1e9, 2, 1e9, ''), f(raw.rv_bps_1e9, 4, 1e9, ' bps'), f(raw.stretch_1e9, 8, 1e9, ''),
+        p.flips.slice(0, 6).join(' '),
+      ]);
+    }
+    parts.push(table(['profile','effective','measured','declared','disagree','ret','ER','RV','stretch','flips t/s/v/f/l/st'], rows, [4]));
+    // rel per breadth sym
+    const rel = R.rel;
+    if (rel && rel.syms.length) {
+      const relName = v => v === 255 ? '<span class="dim">?</span>' : ['lagging','inline','leading'][v] || v;
+      parts.push(`<div class="kv" style="margin-top:6px"><div>rel syms</div><div>${rel.syms.map((s, i) => i === 0 ? `${s}<span class="dim">:ref</span>` : `${s}<span class="dim">:</span>${relName(rel.fast[i])}<span class="dim">/</span>${relName(rel.slow[i])}`).join('  ')}</div></div>`);
+    }
+    parts.push(`<div class="kv"><div>slot gates</div><div>${R.gates.map((g, i) => `${SLOT_NAMES[i]}=<span class="${g === 0 ? 'ok' : g === 2 ? 'bad' : 'warn'}">${GATE[g] || g}</span>`).join('  ')}</div></div>`);
+  }
+  if (W && W.regime) {
+    const H = W.regime.history || [];
+    if (H.length) {
+      parts.push(`<div class="muted" style="margin-top:8px">24 h measured timeline (worker 5-min cycle, ${H.length} points, ${tsLocal(H[0].ts_ms)} → ${tsLocal(H[H.length-1].ts_ms)})</div>`);
+      for (const prof of ['fast', 'slow']) {
+        for (const d of ['trend', 'shape', 'vol', 'stretch']) {
+          const di = DIMS.indexOf(d);
+          const cells = H.map(h => { const dims = decodeHex(h[prof] || '0000000000000000'); const v = dimValue(dims[di], d); return `<span style="background:${COLORS[v] || '#22262f'}" title="${tsLocal(h.ts_ms)} ${d}=${v}"></span>`; }).join('');
+          parts.push(`<div style="display:flex;gap:8px;align-items:center"><span class="dim" style="width:90px">${prof} ${d}</span><div class="tl" style="flex:1">${cells}</div></div>`);
+        }
+      }
+      parts.push(`<div class="lg">${['bear','neutral','bull','chop','trend','low','high','ext_down','ext_up','unknown'].map(v => `<span><i style="background:${COLORS[v]}"></i>${v}</span>`).join('')}</div>`);
+    }
+    const P = W.regime.params;
+    if (P) {
+      const pr = P.profiles || {};
+      const rows = Object.keys(pr).map(name => { const q = pr[name]; return [name, `${q.trend_w_min}/${q.shape_w_min}/${q.vol_w_min}/${q.stretch_w_min}m`, `${(q.trend_thr_bps_1e9/1e9).toFixed(0)} bps`, `${(q.er_lo_enter_1e9/1e9).toFixed(2)}–${(q.er_lo_exit_1e9/1e9).toFixed(2)} / ${(q.er_hi_exit_1e9/1e9).toFixed(2)}–${(q.er_hi_enter_1e9/1e9).toFixed(2)}`, `${(q.rv_p30_bps_1e9/1e9).toFixed(1)} / ${(q.rv_p70_bps_1e9/1e9).toFixed(1)} bps`, `${(q.stretch_k_1e9/1e9).toFixed(2)}`, `${(q.rel_thr_bps_1e9/1e9).toFixed(0)} bps`, `${(q.fund_p30_1e9/1e9).toExponential(2)} / ${(q.fund_p70_1e9/1e9).toExponential(2)}`]; });
+      parts.push(`<div class="muted" style="margin-top:8px">regime.toml bands — ref ${esc(P.btc)} · fund ${esc(P.fund)} · members ${P.members.length} · confirm_min ${P.confirm_min}</div>`);
+      parts.push(table(['profile','windows t/s/v/st','trend thr','ER lo / hi','RV p30/p70','stretch k','rel thr','fund p30/p70'], rows));
+    }
+    const D = W.regime.declared || {};
+    const dk = Object.keys(D);
+    if (dk.length) parts.push(`<div class="muted" style="margin-top:6px">declared.json: ${dk.map(k => { const e = D[k]; const expired = Number(e.ts_ms) + Number(e.ttl_s) * 1000 < W.now_ms; return `${k}=${esc(e.word)} (${esc(e.source || '?')}, ${tsLocal(e.ts_ms)}, ttl ${e.ttl_s}s${expired ? ', <span class="warn">expired</span>' : ', <span class="ok">in force</span>'})`; }).join(' · ')}</div>`);
+  }
+  set('regime', parts.join('') || '<span class="muted">n/a</span>');
+}
+
+// ---- strategies ----
+function pnlByLabel() { const out = {}; const L = W && W.pnl && W.pnl.latest; if (L && L.strategies) for (const r of L.strategies) out[r.label] = r; return out; }
+function renderStrategies() {
+  if (!E) { set('strat', '<span class="muted">n/a</span>'); return; }
+  const by = pnlByLabel();
+  const rows = E.slots.map(s => {
+    const p = by[s.name];
+    const ladder = p && p.fee_ladder_net_usd ? p.fee_ladder_net_usd.map(v => usd(v)).join(' / ') : '<span class="dim">—</span>';
+    return [s.slot, esc(s.name), s.configured ? 'yes' : '<span class="dim">no</span>', s.enabled ? '<span class="ok">on</span>' : '<span class="dim">off</span>',
+      `<span class="${s.gate === 0 ? 'ok' : s.gate === 2 ? 'bad' : 'warn'}">${GATE[s.gate]}</span>${s.label_terms ? ` <span class="dim">(${s.label_terms} terms, ${s.label_off ? 'hard' : 'soft'})</span>` : ''}`,
+      n(s.orders_emitted, 0), n(s.orders_dropped, 0),
+      s.name === 'vm' ? n(E.vm.fires, 0) : s.name === 'icdp' ? n(E.icdp.signals, 0) : '<span class="dim">—</span>',
+      p ? n(p.fills, 0) : '<span class="dim">—</span>', ladder];
+  });
+  set('strat-sub', `${E.boot.strategy_kind} · latest report ${W && W.pnl && W.pnl.latest ? esc(W.pnl.latest.day) : '—'}`);
+  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]));
+}
+
+// ---- P&L ----
+function renderPnl() {
+  const parts = [];
+  const P = W && W.pnl;
+  if (P && P.latest) {
+    const L = P.latest;
+    set('pnl-sub', `${esc(L.day)} · ${L.runs} runs · paper fills ${L.paper.fills} · net ${usd(L.paper.net_usd)}`);
+    parts.push(table(['strategy','fills','round trips','net @0','@1 bps','@tier','max DD'], (L.strategies || []).map(r => [esc(r.label), n(r.fills, 0), n(r.round_trips !== undefined ? r.round_trips : r.trades, 0), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[0] : r.net_usd), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[1] : null), usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[2] : null), usd(-Math.abs(Number(r.max_drawdown_usd)))]), [1,2,3,4,5,6]));
+    if (L.vm_by_ruleset && L.vm_by_ruleset.length) parts.push(`<div class="muted" style="margin-top:6px">per ruleset</div>` + table(['hash128','orders','trades','net','max DD'], L.vm_by_ruleset.map(r => [short(r.hash128), n(r.orders, 0), n(r.trades, 0), usd(r.net_usd), usd(-Math.abs(Number(r.max_drawdown_usd)))]), [1,2,3,4]));
+    const RG = L.regime;
+    if (RG && RG.profiles && RG.profiles.length) {
+      const rows = [];
+      for (const prof of RG.profiles) {
+        for (const w of (prof.words || [])) {
+          rows.push([esc(prof.profile), `<span title="${esc(w.bits)}">${esc(w.word)}</span>`, n(w.minutes, 0),
+            (w.strategies || []).map(r => `${esc(r.label)} ${r.fills}f ${usd(r.fee_ladder_net_usd ? r.fee_ladder_net_usd[2] : r.net_usd)}`).join(' · ') || '<span class="dim">—</span>']);
+        }
+      }
+      parts.push(`<div class="muted" style="margin-top:6px">per regime (minutes per word · strategies fills + net @tier; modes ${esc(JSON.stringify(RG.modes || {}))})</div>` + table(['profile','word','min','strategies'], rows, [2]));
+    }
+  } else set('pnl-sub', 'no report yet');
+  if (P && P.series && P.series.length) {
+    parts.push(`<div class="muted" style="margin-top:6px">day series (${P.series.length})</div>` + table(['day','runs','fills','paper net', 'per strategy @tier'], P.series.slice().reverse().map(s => [esc(s.day), n(s.runs, 0), n(s.paper_fills, 0), usd(s.paper_net_usd), Object.keys(s.strategies).map(k => `${esc(k)} ${usd(s.strategies[k].fee_ladder_net_usd ? s.strategies[k].fee_ladder_net_usd[2] : s.strategies[k].net_usd)}`).join(' · ')]), [1,2,3]));
+  }
+  set('pnl', parts.join('') || '<span class="muted">n/a</span>');
+}
+
+// ---- ruleset ----
+function renderRuleset() {
+  if (!E) { set('ruleset', '<span class="muted">n/a</span>'); return; }
+  const V = E.vm;
+  const reg = W && W.rulesets ? W.rulesets.find(r => r.hash.startsWith(V.active_hash)) : null;
+  const comp = W && W.compositions ? W.compositions.find(c => c.hash128 === V.active_hash) : null;
+  set('ruleset-sub', `${short(V.active_hash)} rows ${V.rows_active} epoch ${V.epoch} · staged ${short(V.staged_hash)} · fires ${V.fires} orders ${V.orders_emitted} · regime blocked ${V.regime_blocked} hard exits ${V.regime_hard_exits} · commit dropped ${V.commit_dropped}`);
+  const parts = [];
+  if (reg) parts.push(`<div class="kv"><div>thesis</div><div>${esc(reg.thesis || '—')}</div><div>author</div><div>${esc(reg.author_mode || '?')} ${esc(reg.model || '')} · gates ${reg.gates_passed ? '<span class="ok">passed</span>' : '<span class="warn">not passed</span>'} · staged ${tsLocal(reg.staged_ts * 1000)} · committed ${tsLocal(reg.committed_ts ? reg.committed_ts * 1000 : 0)}</div></div>`);
+  if (comp) parts.push(`<div class="kv"><div>composition</div><div>${comp.member_ids.map(m => short(m)).join(' + ')} · words ${esc(JSON.stringify(comp.words))} · gate ${comp.gate ? esc(comp.gate.verdict || JSON.stringify(comp.gate).slice(0, 80)) : '—'}</div></div>`);
+  const rows = V.rows.map(r => [r.i, `<span class="hash">${esc(r.name_h)}</span>`, r.sym, r.ref_sym === 4294967295 ? '<span class="dim">—</span>' : r.ref_sym,
+    (r.gate & 1) ? '<span class="ok">open</span>' : (r.gate & 2) ? '<span class="bad">HARD</span>' : '<span class="warn">soft</span>',
+    r.regime_off ? 'hard' : 'soft', r.state ? `<span class="ok">IN</span> ${r.side ? 'ASK' : 'BID'} ${r.entry_sign > 0 ? '+' : '−'}` : '<span class="dim">flat</span>',
+    r.state ? px(r.entry_px_1e6) : '', r.state ? px(r.qty_sym_1e6) : '', r.state ? age(r.age_s) : '', r.flags & 1 ? 'position' : 'refire', r.family]);
+  parts.push(table(['row','name_h','sym','ref','gate','off','pos','entry px','qty','age','mode','fam'], rows, [0,2,3,7,8]));
+  set('ruleset', parts.join(''));
+}
+
+// ---- library ----
+function renderLibrary() {
+  if (!W) { set('library', '<span class="muted">n/a</span>'); return; }
+  const L = W.library || [];
+  set('library-sub', `${L.length} members · ${(W.compositions || []).length} compositions · ${(W.candidates || []).length} candidates`);
+  const rows = L.map(m => [short(m.member_id), esc(m.name), esc(m.kind), `<span class="${m.status === 'validated' ? 'ok' : m.status === 'retired' ? 'dim' : 'warn'}">${esc(m.status)}</span>`, esc((m.labels || []).map(t => t.join(' ')).join(' | ') || 'ANY'), esc(m.regime_off || 'soft'), n(m.evidence_n, 0), n(m.evidence_fills, 0), usd(m.evidence_net_usd_0), usd(m.evidence_net_usd_tier)]);
+  let html = table(['id','name','kind','status','labels','off','windows','fills','Σ net @0','Σ net @tier'], rows, [6,7,8,9]);
+  const C = W.candidates || [];
+  if (C.length) html += `<div class="muted" style="margin-top:6px">candidates (newest ${Math.min(C.length, 10)})</div>` + table(['file','size','mtime'], C.slice(0, 10).map(c => [esc(c.name), n(c.size, 0), tsLocal(c.mtime_ms)]), [1]);
+  set('library', html);
+}
+
+// ---- recent trades ----
+function renderRecent() {
+  if (!E) { set('recent', '<span class="muted">n/a</span>'); return; }
+  const R = E.recent;
+  set('recent-sub', `${R.orders_total} orders · ${R.fills_total} fills since boot`);
+  const oids = new Map(R.orders.map(o => [o.oid, o]));
+  const orders = R.orders.slice().reverse().slice(0, 20).map(o => [age(o.age_s), `<span style="color:${['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6'][o.slot] || 'inherit'}">${SLOT_NAMES[o.slot] || o.slot}</span>`, ['pm','bn','okx','deribit','hl','ai','bybit'][o.venue] || o.venue, o.sym, o.side ? 'ASK' : 'BID', px(o.px_1e6), px(o.qty_1e6), o.kind, o.ttl_ns !== '0' ? 'IoC' : '']);
+  const fills = R.fills.slice().reverse().slice(0, 20).map(f => { const o = oids.get(f.oid); return [age(f.age_s), o ? (SLOT_NAMES[o.slot] || o.slot) : '<span class="dim">?</span>', f.sym, f.side ? 'ASK' : 'BID', px(f.px_1e6), px(f.qty_1e6), esc(f.oid)]; });
+  set('recent', `<div class="muted">orders</div>` + table(['age','slot','venue','sym','side','px','qty','kind',''], orders, [3,5,6]) + `<div class="muted" style="margin-top:6px">fills</div>` + table(['age','slot','sym','side','px','qty','oid'], fills, [2,4,5]));
+}
+
+// ---- ingress / latency ----
+function renderIngress() {
+  if (!E) { set('ingress', '<span class="muted">n/a</span>'); return; }
+  const rows = E.ingress.map(g => [esc(g.venue), `<span class="${g.state === 2 ? 'ok' : g.state === 0 ? 'dim' : 'warn'}">${ING_STATE[g.state] || g.state}</span>`, `<span class="${g.last_tick_age_s < 0 ? 'dim' : g.last_tick_age_s > 30 ? 'bad' : g.last_tick_age_s > 5 ? 'warn' : ''}">${age(g.last_tick_age_s)}</span>`, n(g.ticks, 0), n(g.stale_ticks, 0), n(g.feed_delay_ema_ms, 0), n(g.reconnects, 0), n(g.ring_drops, 0), n(g.parse_errors, 0), n(g.gaps, 0)]);
+  set('ingress', table(['venue','state','last tick','ticks','stale','delay ms','reconn','ring drops','parse err','gaps'], rows, [3,4,5,6,7,8,9]));
+}
+function renderLatency() {
+  if (!E) { set('latency', '<span class="muted">n/a</span>'); return; }
+  const L = E.latency, C = E.counters;
+  const ns = v => v === 0 ? '<span class="dim">—</span>' : v >= 1e6 ? `${(v/1e6).toFixed(2)} ms` : v >= 1e3 ? `${(v/1e3).toFixed(2)} µs` : `${v} ns`;
+  set('latency', table(['stage','p50','p99'], ['ingest','decide','ack'].map(k => [k, ns(L[k].p50_ns), ns(L[k].p99_ns)]), [1,2]) +
+    `<div class="kv" style="margin-top:6px"><div>iterations</div><div>${n(C.iterations,0)}</div><div>ticks / signals</div><div>${n(C.ticks,0)} / ${n(C.signals,0)}</div><div>events / depths / opts</div><div>${n(C.events,0)} / ${n(C.depths,0)} / ${n(C.opts,0)}</div><div>orders / dropped</div><div>${n(C.orders_emitted,0)} / ${n(C.orders_dropped,0)}</div><div>fills</div><div>${n(C.fills,0)}</div><div>capture</div><div>fills ${n(E.capture.fills_records,0)} (${E.capture.fills_io_errors ? '<span class="bad">io err ' + E.capture.fills_io_errors + '</span>' : 'ok'}) · orders ${n(E.capture.orders_records,0)} (${E.capture.orders_io_errors ? '<span class="bad">io err</span>' : 'ok'})</div><div>binary</div><div>${tsLocal(Number(E.boot.binary_mtime_ns) / 1e6)} <span class="dim">boot ${tsLocal(Number(E.boot.boot_wall_ns) / 1e6)}</span></div></div>`);
+}
+
+// ---- AI plane ----
+function renderAi() {
+  const parts = [];
+  if (E) {
+    const A = E.ai, I = E.icdp;
+    set('ai-sub', `cmds ${A.cmds} · staged ${A.ruleset_staged} committed ${A.ruleset_committed} rejected ${A.ruleset_rejected} · hb ${age(A.heartbeat_age_s)}`);
+    parts.push(`<div class="kv"><div>hmac / protocol / malformed</div><div>${A.hmac_fail} / ${A.protocol_err} / ${A.malformed}</div><div>seq gap / regress</div><div>${A.seq_gap} / ${A.seq_regress}</div><div>ring drops / expired / rejected conns</div><div>${A.ring_drops} / ${A.expired} / ${A.rejected_conns}</div><div>drain malformed / enable refused</div><div>${A.drain_malformed} / ${A.enable_refused}</div><div>table push fail</div><div>${A.table_push_fail}</div>` +
+      `<div>icdp</div><div>${I.configured ? `${short(I.hash)} ${I.instruments} instr · decisions ${I.decisions} signals ${I.signals} intents ${I.intents} exits ${I.exits} · skipped spread ${I.skipped_spread} stale-open ${I.skipped_stale_open} stale-dec ${I.skipped_stale_dec} prev ${I.skipped_prev} late ${I.late_bars} caps ${I.caps_rejected} · rolls ${I.rolls} · regime blocked ${I.regime_blocked} exits ${I.regime_exits}` : '<span class="dim">unconfigured</span>'}</div></div>`);
+  }
+  if (W && W.events) {
+    parts.push(`<div class="muted" style="margin-top:6px">ledger tail (${W.events.length})</div>` + table(['ts','kind','detail'], W.events.slice().reverse().slice(0, 40).map(e => [tsLocal(e.ts > 1e14 ? e.ts / 1e6 : e.ts > 1e11 ? e.ts : e.ts * 1000), esc(e.kind), `<span title="${esc(e.detail)}">${esc(e.detail.slice(0, 120))}</span>`])));
+  }
+  set('ai', parts.join('') || '<span class="muted">n/a</span>');
+}
+
+// ---- positions ----
+function renderPositions() {
+  if (!W || !W.positions) { set('positions', '<span class="muted">n/a</span>'); return; }
+  const P = W.positions;
+  set('positions-sub', `${P.run_dir ? esc(P.run_dir.split('/').pop()) : 'no run'} · ${P.fills} fills${P.fills_torn ? ' <span class="warn">(torn)</span>' : ''} · realized ${usd(P.realized_usd)} <span class="dim">(marks at cost)</span>`);
+  set('positions', table(['sym','net qty','avg px','realized','exposure'], (P.positions || []).map(p => [p.sym, n(p.net_qty, 6), n(p.avg_px, 6), usd(p.realized_usd), n(p.exposure_usd, 2)]), [1,2,3,4]));
+}
+
+// ---- configs ----
+function renderConfig() {
+  if (!W || !W.config) { set('config', '<span class="muted">n/a</span>'); return; }
+  const C = W.config;
+  const block = (name, text) => `<div><div class="muted">${esc(name)}</div><pre>${text === null || text === undefined ? '<span class="dim">(absent)</span>' : esc(text)}</pre></div>`;
+  const uni = C.universe ? Object.keys(C.universe).map(v => `${v}: ${Object.keys(C.universe[v]).map(k => `${k} ${C.universe[v][k]}`).join(', ')}`).join('\n') : null;
+  set('config', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px">${block('strategy.conf', C.strategy_conf)}${block('fees.toml', C.fees_toml)}${block('icdp.toml', C.icdp && C.icdp.hash ? `sha256 ${C.icdp.hash}\ninstruments ${C.icdp.instruments}` : null)}${block('universe.toml (entries per list)', uni)}${block('retention.conf', C.retention_conf)}${block('regime.toml', C.regime_toml)}</div>`);
+}
+
+function renderAll() {
+  renderBar(); renderRegime(); renderStrategies(); renderPnl(); renderRuleset(); renderLibrary(); renderRecent(); renderIngress(); renderLatency(); renderAi(); renderPositions(); renderConfig();
+}
+async function pollEngine() {
+  try { const r = await fetch('/api/engine/state', {cache: 'no-store'}); if (!r.ok) throw new Error(`engine ${r.status}`); E = await r.json(); engineErr = null; }
+  catch (e) { engineErr = `engine: ${e.message}`; }
+  renderAll();
+}
+async function pollWorker() {
+  try { const r = await fetch('/api/worker', {cache: 'no-store'}); if (!r.ok) throw new Error(`worker ${r.status}`); W = await r.json(); workerErr = null; }
+  catch (e) { workerErr = `worker: ${e.message}`; }
+  renderAll();
+}
+pollEngine(); pollWorker();
+setInterval(pollEngine, 2000);
+setInterval(pollWorker, 10000);
+</script>
+</body>
+</html>

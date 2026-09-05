@@ -56,6 +56,7 @@ use engine::{
     Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
     SIGNAL_RING_SIZE, TICK_RING_SIZE,
 };
+use engine_snapshot::{BootInfo, EngineSnapshot, SnapshotCell, SNAPSHOT_VENUES};
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
 // Re-exported (lib.rs) so the binary reaches the AI status slot type
 // through `cli::` like every other paper-mode surface.
@@ -106,6 +107,10 @@ type RustlsConfig = std::sync::Arc<rustls::ClientConfig>;
 
 /// Cadence at which the main-thread drain loop logs ring counters.
 const REPORT_PERIOD_NS: u64 = 5_000_000_000;
+
+/// RG6: cadence of the `/state` snapshot publish (plan §6.1 — one
+/// ≈ 24 KB POD copy into the seqlock per period, off the tick path).
+const SNAPSHOT_PERIOD_NS: u64 = 1_000_000_000;
 
 /// Keepalive policy per WSS ingress (D5/D6). Ping intervals sit
 /// well under each venue's idle cutoff; idle timeouts catch
@@ -2474,6 +2479,10 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if mask == 0 {
         return EngineLoopResult::Failed("engine_loop_set: no requested member is configured");
     }
+    // RG6: the masks the `/state` `boot` section reports.
+    let mut obs = obs;
+    obs.boot.requested_mask = requested_mask;
+    obs.boot.configured_mask = configured;
 
     let mut set = strategy_set::StrategySet::new(mask);
     if let Err(reason) = configure_latency_arb(set.latency_arb_mut(), &cfg) {
@@ -2622,10 +2631,9 @@ fn format_u64_into(buf: &mut [u8; 32], mut v: u64) -> &[u8] {
 }
 
 impl Observability {
-    /// Build the registry + snapshot cell. Both are `None` by
-    /// default; flip `enable_metrics` / `enable_tui` to populate.
-    /// Boot-only; allocates once.
-    pub fn build(enable_metrics: bool, enable_tui: bool) -> Result<Self, &'static str> {
+    /// Build the registry + the `/state` snapshot cell (both `None`
+    /// unless `enable_metrics`). Boot-only; allocates once.
+    pub fn build(enable_metrics: bool) -> Result<Self, &'static str> {
         let mut out = Observability::default();
         if enable_metrics {
             let mut reg = core_metrics::MetricsRegistry::new();
@@ -2894,8 +2902,11 @@ impl Observability {
                 regime,
             });
         }
-        if enable_tui {
-            out.snapshot = Some(Arc::new(tui::SnapshotCell::new()));
+        if enable_metrics {
+            // RG6: the `/state` snapshot cell — `/metrics` and the TUI
+            // both read it (`--tui` implies metrics in the bin); one
+            // boot-only allocation, ≈ 24 KB.
+            out.state = Some(Arc::new(SnapshotCell::new(EngineSnapshot::empty())));
         }
         Ok(out)
     }
@@ -2994,9 +3005,15 @@ pub struct Observability {
     pub metrics: Option<Arc<core_metrics::MetricsRegistry>>,
     /// Counter handles the engine loop bumps inline.
     pub counter_ids: Option<EngineCounters>,
-    /// Snapshot cell the TUI thread reads. `None` if `--tui` is
+    /// RG6: the `/state` snapshot cell — published every
+    /// [`SNAPSHOT_PERIOD_NS`] by the engine loop, read by the
+    /// `metrics-http` thread and the TUI. `None` when `/metrics` is
     /// disabled.
-    pub snapshot: Option<Arc<tui::SnapshotCell>>,
+    pub state: Option<Arc<SnapshotCell<EngineSnapshot>>>,
+    /// RG6: boot identity copied into every snapshot (the bin fills
+    /// the process/run facts via [`Observability::with_boot_info`],
+    /// the set builder stamps the masks).
+    pub boot: BootInfo,
     /// Periodic HdrHistogram dump config. `None` disables dumping.
     pub latency_dump: Option<LatencyDump>,
     /// Per-ingress status slots (D7). `None` only in tests that
@@ -3036,6 +3053,13 @@ impl Observability {
     /// directory exists.
     pub fn with_orders_capture(mut self, cap: SlotCapture<Order>) -> Self {
         self.orders_capture = Some(cap);
+        self
+    }
+
+    /// RG6: attach the boot identity the `/state` snapshot carries.
+    /// Boot-only; the bin fills it once the run directory exists.
+    pub fn with_boot_info(mut self, boot: BootInfo) -> Self {
+        self.boot = boot;
         self
     }
 
@@ -3779,6 +3803,205 @@ fn mirror_regime_metrics<S: strategy_core::StrategyCounters>(
 }
 
 // ---------------------------------------------------------------
+// RG6 `/state` snapshot — filled once per second by the engine loop
+// ---------------------------------------------------------------
+
+/// Build the boot identity of the `/state` snapshot: pid, the wall
+/// anchor of this instant, the running binary's link time (pitfall
+/// 18's staleness tell), the git commit `build.rs` recorded
+/// (`MULTIVENUE_GIT_SHA`; "unknown" without git at build time), the
+/// capture run and the `--strategy` name. The masks and the regime
+/// hash are stamped later by the set builder / the bin. Boot-only.
+pub fn boot_info(run_dir: &Path, run_epoch_ns: u64, strategy: &str, paper: bool) -> BootInfo {
+    let anchor = core_time::WallAnchor::now();
+    let mut b = BootInfo::EMPTY;
+    b.boot_mono_ns = anchor.mono_ns;
+    b.boot_wall_ns = anchor.wall_ns;
+    b.binary_mtime_ns = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    b.run_epoch_ns = run_epoch_ns;
+    b.pid = std::process::id();
+    b.paper = u8::from(paper);
+    b.set_git_sha(option_env!("MULTIVENUE_GIT_SHA").unwrap_or("unknown").as_bytes());
+    b.set_strategy_name(strategy.as_bytes());
+    b.set_run_dir(run_dir.as_os_str().as_encoded_bytes());
+    b
+}
+
+/// The `GET /state` body writer the metrics server calls (one per
+/// server thread): copy the latest snapshot out of the seqlock into a
+/// boot-boxed scratch and encode it into the response buffer. Zero
+/// allocation after construction.
+pub fn state_writer(
+    cell: Arc<SnapshotCell<EngineSnapshot>>,
+) -> impl FnMut(&mut [u8]) -> Result<usize, core_metrics::EncodeErr> {
+    let mut scratch = Box::new(EngineSnapshot::empty());
+    move |dst: &mut [u8]| {
+        cell.read_into(&mut scratch);
+        engine_snapshot::encode_state_json(&scratch, dst)
+            .map_err(|_| core_metrics::EncodeErr::BufferTooSmall)
+    }
+}
+
+/// The ingress status slots in the T1(c) / `VENUE_NAMES` order:
+/// pm, bn, okx, deribit, hl, bybit, rpc.
+#[inline]
+fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
+    [
+        &ing.polymarket,
+        &ing.binance,
+        &ing.okx,
+        &ing.deribit,
+        &ing.hyperliquid,
+        &ing.bybit,
+        &ing.rpc,
+    ]
+}
+
+/// T1(c) last-tick tracking: `(ticks_total last seen, engine ns when
+/// it last advanced; 0 = never)` per lane. 1 s cadence — cold path.
+fn update_tick_age(
+    track: &mut [(u64, u64); SNAPSHOT_VENUES],
+    ing: &IngressStatusSet,
+    now: NsTs,
+) {
+    let lanes = ingress_lanes(ing);
+    let mut i = 0usize;
+    while i < SNAPSHOT_VENUES {
+        let ticks = lanes[i].ticks_total();
+        if ticks > track[i].0 {
+            track[i] = (ticks, now);
+        }
+        i += 1;
+    }
+}
+
+/// Fill `out` from every source the loop can reach — the strategy
+/// (through the `StrategyCounters` UFCS route, set-agnostic), the
+/// engine's counters/percentiles/captures/recent rings, the AI status
+/// slot and the ingress slots. 1 s cadence, off the tick path, zero
+/// allocation (every field is a plain store or a POD copy; the alloc
+/// gate in `crates/bench` pins the publish + encode).
+fn fill_snapshot<S, D>(
+    out: &mut EngineSnapshot,
+    eng: &Engine<S, D>,
+    obs: &Observability,
+    tick_age: &[(u64, u64); SNAPSHOT_VENUES],
+    now: NsTs,
+    seq: u64,
+) where
+    S: strategy_core::Strategy,
+    D: OrderDispatch,
+{
+    use strategy_core::StrategyCounters as Sc;
+    let strat = eng.strategy();
+
+    out.seq = seq;
+    out.mono_ns = now;
+    out.wall_ns = obs
+        .boot
+        .boot_wall_ns
+        .wrapping_add(now.wrapping_sub(obs.boot.boot_mono_ns));
+    out.boot = obs.boot;
+    out.set_strategy_kind(Sc::strategy_kind(strat).as_bytes());
+    out.halted = u8::from(Sc::is_halted(strat));
+    out.enabled_mask = Sc::enabled_mask(strat) as u8;
+
+    let k = &mut out.counters;
+    k.iterations = eng.iterations;
+    k.ticks = eng.ticks_dispatched;
+    k.signals = eng.signals_dispatched;
+    k.fills = eng.fills_dispatched;
+    k.events = eng.events_dispatched;
+    k.depths = eng.depths_dispatched;
+    k.opts = eng.opts_dispatched;
+    k.orders_emitted = Sc::orders_emitted(strat);
+    k.orders_dropped = Sc::orders_dropped(strat);
+    k.ai_dispatched = eng.ai_dispatched;
+    k.ai_drain_malformed = eng.ai_drain_malformed;
+
+    out.latency.p50_ns = [eng.ingest_p50_ns(), eng.decide_p50_ns(), eng.ack_p50_ns()];
+    out.latency.p99_ns = [eng.ingest_p99_ns(), eng.decide_p99_ns(), eng.ack_p99_ns()];
+
+    out.regime = Sc::regime_counters(strat);
+    out.regime_rel = Sc::regime_rel_view(strat);
+    let mut slot = 0u8;
+    while (slot as usize) < out.slots.len() {
+        out.slots[slot as usize] = Sc::slot_counters(strat, slot);
+        slot += 1;
+    }
+
+    let v = &mut out.vm;
+    v.active_hash = Sc::vm_active_hash128(strat);
+    v.staged_hash = Sc::vm_staged_hash128(strat);
+    v.rows_active = Sc::vm_rows_view(strat, &mut v.rows);
+    v.epoch = Sc::vm_table_epoch(strat) as u32;
+    v.fires = Sc::vm_fires(strat);
+    v.orders_emitted = Sc::vm_orders_emitted(strat);
+    v.orders_dropped = Sc::vm_orders_dropped(strat);
+    v.commit_dropped = Sc::vm_commit_dropped(strat);
+    v.regime_blocked = Sc::vm_regime_blocked(strat);
+    v.regime_hard_exits = Sc::vm_regime_hard_exits(strat);
+
+    out.icdp.hash = Sc::icdp_params_hash(strat);
+    out.icdp.instruments = Sc::icdp_instruments(strat);
+    out.icdp.counters = Sc::icdp_counters(strat);
+
+    let st = eng.ai_status();
+    let a = &mut out.ai;
+    a.cmds = st.cmds();
+    a.hmac_fail = st.hmac_fail();
+    a.protocol_err = st.protocol_err();
+    a.malformed = st.malformed();
+    a.seq_gap = st.seq_gap();
+    a.seq_regress = st.seq_regress();
+    a.ring_drops = st.ring_drops();
+    a.expired = st.expired();
+    a.rejected_conns = st.rejected_conns();
+    a.drain_malformed = eng.ai_drain_malformed;
+    a.enable_refused = Sc::ai_enable_refused(strat);
+    a.ruleset_staged = st.ruleset_staged();
+    a.ruleset_committed = st.ruleset_committed();
+    a.ruleset_rejected = st.ruleset_rejected();
+    a.table_push_fail = st.table_push_fail();
+    a.last_heartbeat_ns = st.last_heartbeat_ns();
+
+    if let Some(ing) = obs.ingress.as_ref() {
+        let lanes = ingress_lanes(ing);
+        let mut i = 0usize;
+        while i < SNAPSHOT_VENUES {
+            let g = &mut out.ingress[i];
+            let l = lanes[i];
+            g.last_tick_ns = tick_age[i].1;
+            g.ticks = l.ticks_total();
+            g.msgs = l.msgs_total();
+            g.reconnects = l.reconnects_total();
+            g.ring_drops = l.ring_drops_total();
+            g.stale_ticks = l.stale_ticks_total();
+            g.parse_errors = l.parse_errors_total();
+            g.gaps = l.gaps_total();
+            g.sub_drops = l.sub_drops_total();
+            g.feed_delay_ema_ms = l.feed_delay_ema_ms();
+            g.state = l.state() as u8;
+            i += 1;
+        }
+    }
+
+    out.capture.fills_records = eng.fill_capture_records();
+    out.capture.fills_io_errors = eng.fill_capture_io_errors();
+    out.capture.orders_records = eng.order_capture_records();
+    out.capture.orders_io_errors = eng.order_capture_io_errors();
+
+    out.recent_orders = *eng.recent_orders();
+    out.recent_fills = *eng.recent_fills();
+}
+
+// ---------------------------------------------------------------
 // §6.5 capture metrics — set from inside the spawn wrapper thread
 // ---------------------------------------------------------------
 //
@@ -4121,6 +4344,14 @@ where
     }
 
     let mut next_report = now_ns() + REPORT_PERIOD_NS;
+    // RG6: the 1 s `/state` publish gate + the boot-boxed scratch the
+    // loop fills before each seqlock copy (one allocation, here).
+    let mut next_state = now_ns() + SNAPSHOT_PERIOD_NS;
+    let mut state_scratch: Option<Box<EngineSnapshot>> = obs
+        .state
+        .as_ref()
+        .map(|_| Box::new(EngineSnapshot::empty()));
+    let mut state_seq = 0u64;
     let mut last_ticks = 0u64;
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
@@ -4154,6 +4385,22 @@ where
         eng.tick(DRAIN_BATCH);
 
         let now = now_ns();
+        if now >= next_state {
+            // T1(c): per-venue last-tick stamps, refreshed on the 1 s
+            // cadence (the 5 s block below reads them for the age
+            // gauges; the snapshot reads them for `last_tick_age_s`).
+            if let Some(ing) = obs.ingress.as_ref() {
+                update_tick_age(&mut tick_age_track, ing, now);
+            }
+            // RG6: fill the scratch from every source reachable here
+            // and publish it into the seqlock — one POD copy.
+            if let (Some(cell), Some(scratch)) = (obs.state.as_ref(), state_scratch.as_mut()) {
+                state_seq = state_seq.wrapping_add(1);
+                fill_snapshot(scratch, &eng, &obs, &tick_age_track, now, state_seq);
+                cell.publish(scratch);
+            }
+            next_state = now + SNAPSHOT_PERIOD_NS;
+        }
         if now >= next_report {
             // Phase 8f: bound fills-capture staging staleness to one
             // report period even when no further fills arrive.
@@ -4266,31 +4513,19 @@ where
                         &mut ingress_last[6],
                     );
 
-                    // T1(c): derive per-venue last-tick age. A lane
-                    // that stops moving data goes visibly stale here
-                    // even while its ~1 Hz reconnect churn keeps the
-                    // state gauge reading Up (outage 2026-08-27
-                    // §5.5). -1 = no tick since boot.
-                    let venue_ticks = [
-                        ing.polymarket.ticks_total(),
-                        ing.binance.ticks_total(),
-                        ing.okx.ticks_total(),
-                        ing.deribit.ticks_total(),
-                        ing.hyperliquid.ticks_total(),
-                        ing.bybit.ticks_total(),
-                        ing.rpc.ticks_total(),
-                    ];
+                    // T1(c): per-venue last-tick age from the stamps
+                    // the 1 s gate keeps. A lane that stops moving
+                    // data goes visibly stale here even while its
+                    // ~1 Hz reconnect churn keeps the state gauge
+                    // reading Up (outage 2026-08-27 §5.5). -1 = no
+                    // tick since boot.
                     let mut i = 0;
-                    while i < 7 {
-                        let (seen, _) = tick_age_track[i];
-                        if venue_ticks[i] > seen {
-                            tick_age_track[i] = (venue_ticks[i], now);
-                        }
-                        let (_, wall) = tick_age_track[i];
-                        let age_s: i64 = if wall == 0 {
+                    while i < SNAPSHOT_VENUES {
+                        let (_, stamp) = tick_age_track[i];
+                        let age_s: i64 = if stamp == 0 {
                             -1
                         } else {
-                            (now.saturating_sub(wall) / 1_000_000_000) as i64
+                            (now.saturating_sub(stamp) / 1_000_000_000) as i64
                         };
                         reg.gauge(ids.ingress_last_tick_age[i]).set(age_s);
                         i += 1;
@@ -4355,51 +4590,6 @@ where
                     }
                     next_dump_ns = now.saturating_add(dump.interval_ns);
                 }
-            }
-
-            // Publish a dashboard snapshot if `--tui` wired one up.
-            // Per-symbol top-of-book is strategy-specific; v1
-            // leaves `recent_tob` empty and lets the dashboard
-            // show ring counts + last order summary. Phase 5.1
-            // will expose a generic `Strategy::book_snapshot()`
-            // accessor.
-            if let Some(cell) = obs.snapshot.as_ref() {
-                let mut state = tui::DashboardState::empty();
-                state.iterations = eng.iterations;
-                state.ticks_dispatched = ticks;
-                state.signals_dispatched = signals;
-                state.orders_emitted = orders;
-                state.orders_dropped = dropped;
-                state.fills_seen = eng.fills_dispatched;
-                // Wire engine-side LatencyTracker percentiles into
-                // the dashboard. ix 0 = ingest→strategy,
-                // 1 = strategy→submit, 2 = submit→ack.
-                state.p50_ns[0] = eng.ingest_p50_ns();
-                state.p99_ns[0] = eng.ingest_p99_ns();
-                state.p50_ns[1] = eng.decide_p50_ns();
-                state.p99_ns[1] = eng.decide_p99_ns();
-                state.p50_ns[2] = eng.ack_p50_ns();
-                state.p99_ns[2] = eng.ack_p99_ns();
-                // Ingest health from the real status slots (D7):
-                // bit0 = polymarket, bit1 = binance, bit2 = rpc,
-                // bit3 = rss (retired 8f — reserved, always 0),
-                // bit4 = okx, bit5 = deribit, bit6 = hl (8e —
-                // appended), bit7 = bybit (WS9 — the u8's last bit;
-                // existing bits never renumber); bit set iff the
-                // thread is Up.
-                state.ingest_health = match obs.ingress.as_ref() {
-                    Some(ing) => {
-                        (u8::from(ing.polymarket.state() == IngressState::Up))
-                            | (u8::from(ing.binance.state() == IngressState::Up) << 1)
-                            | (u8::from(ing.rpc.state() == IngressState::Up) << 2)
-                            | (u8::from(ing.okx.state() == IngressState::Up) << 4)
-                            | (u8::from(ing.deribit.state() == IngressState::Up) << 5)
-                            | (u8::from(ing.hyperliquid.state() == IngressState::Up) << 6)
-                            | (u8::from(ing.bybit.state() == IngressState::Up) << 7)
-                    }
-                    None => 0,
-                };
-                cell.publish(state);
             }
 
             last_ticks = ticks;
@@ -7046,12 +7236,12 @@ mod tests {
         assert_eq!(stale.fires, 0, "snapshot re-bases to the source");
     }
 
-    /// Boot-surface pin: `Observability::build(true, _)` registers
+    /// Boot-surface pin: `Observability::build(true)` registers
     /// every §9 row under its verbatim design name (plus the AI-side
     /// `table_push_fail`), and the registry encodes them.
     #[test]
     fn observability_build_registers_section9_rows() {
-        let obs = Observability::build(true, false).unwrap();
+        let obs = Observability::build(true).unwrap();
         let reg = obs.metrics.as_ref().unwrap();
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).unwrap();

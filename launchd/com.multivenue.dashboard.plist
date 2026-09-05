@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- RG6 dashboard server (TEMPLATE — rendered by install-launchd.sh;
+     docs/regime-and-dashboard-plan.md §6.2): the read-only operator
+     page on 127.0.0.1:9292 (engine /state + /metrics proxied from
+     9191, worker state from state.db / reports / regime dir). Secrets
+     stay in .env, sourced by the wrapper: NEVER inline values here. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/dashboard.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>@REPO@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/dashboard.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/dashboard.log</string>
+</dict>
+</plist>

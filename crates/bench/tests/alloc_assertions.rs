@@ -935,7 +935,8 @@ fn signer_sign_order_per_call_budget_holds() {
 }
 
 // ---------------------------------------------------------------
-// Phase 4: metrics + latency + tui hot-path assertions
+// Phase 4: metrics + latency hot-path assertions (the RG6 /state
+// snapshot gate 43 sits at the end of the file)
 // ---------------------------------------------------------------
 
 /// 10 000 counter increments through a registered counter must be
@@ -982,39 +983,6 @@ fn latency_record_is_zero_alloc() {
     assert_eq!(
         allocs, 0,
         "LatencyTracker::record allocated {allocs} times ({bytes} B)"
-    );
-    assert_eq!(bytes, 0);
-}
-
-/// 10 000 snapshot publish + read round-trips through SnapshotCell
-/// must be zero-alloc. The cell is a single-writer seqlock
-/// (version counter + POD slot) — no OS lock object exists at all.
-/// History: the v1 `Mutex<DashboardState>` cell failed this
-/// assertion on macOS, where std's pthread-backed `Mutex` lazily
-/// heap-allocates its 64-byte `pthread_mutex_t` on first lock
-/// (Linux's futex `Mutex` never allocates, so only the Mac gate
-/// caught it). The seqlock is allocation-free by construction on
-/// every platform.
-#[test]
-fn dashboard_snapshot_read_is_zero_alloc() {
-    use tui::{DashboardState, SnapshotCell};
-    let cell = SnapshotCell::new();
-    let mut state = DashboardState::empty();
-
-    let g = AllocGuard::new();
-    let mut acc: u64 = 0;
-    for i in 0..10_000u64 {
-        state.iterations = i;
-        cell.publish(state);
-        let got = cell.read();
-        acc = acc.wrapping_add(got.iterations);
-    }
-    std::hint::black_box(acc);
-
-    let (allocs, bytes, _deallocs) = g.delta();
-    assert_eq!(
-        allocs, 0,
-        "SnapshotCell publish+read allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0);
 }
@@ -4228,4 +4196,85 @@ fn regime_on_tick_and_minute_roll_are_zero_alloc() {
         bytes, 0,
         "regime hot path bytes should be zero: saw {bytes}"
     );
+}
+
+/// RG6 gate 43 (`docs/regime-and-dashboard-plan.md` §7): the `/state`
+/// path — a FULL `EngineSnapshot` (256 vm rows, 64 + 64 recents, every
+/// text field at capacity) published into the seqlock, read back into
+/// the server thread's scratch and encoded as JSON into a 256 KiB
+/// response buffer, 1 000 times — allocates nothing. Truncation is a
+/// test failure (the encoder refuses, never truncates).
+#[test]
+fn state_snapshot_publish_read_encode_is_zero_alloc() {
+    use core_types::{Fill, Order, Price, Qty, Side, VenueId, RULE_TABLE_ROWS};
+    use engine_snapshot::{
+        encode_state_json, EngineSnapshot, SnapshotCell, RECENT_FILLS, RECENT_ORDERS,
+        RUN_DIR_MAX,
+    };
+    use strategy_core::VmRowView;
+
+    // Boot-time construction (allocation sanctioned): the cell, the
+    // engine-side scratch, the server-side scratch, the response buf.
+    let cell = SnapshotCell::new(EngineSnapshot::empty());
+    let mut scratch = Box::new(EngineSnapshot::empty());
+    scratch.boot.set_git_sha(&[b'f'; 48]);
+    scratch.boot.set_run_dir(&[b'r'; RUN_DIR_MAX]);
+    scratch.set_strategy_kind(b"set");
+    scratch.vm.rows_active = RULE_TABLE_ROWS as u32;
+    for (i, r) in scratch.vm.rows.iter_mut().enumerate() {
+        *r = VmRowView::new(
+            u64::MAX - i as u64,
+            1_500_000,
+            1,
+            2_000_000,
+            i as u32,
+            u32::MAX,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+        );
+    }
+    let o = Order::new(
+        1,
+        VenueId::Okx,
+        7,
+        Side::Bid,
+        0,
+        Price::from_raw(1_500_000),
+        Qty::from_raw(2_000_000),
+        u64::MAX,
+    );
+    for _ in 0..RECENT_ORDERS {
+        scratch.recent_orders.push(o);
+    }
+    let f = Fill::new(1, 7, Side::Ask, Price::from_raw(1), Qty::from_raw(2), u64::MAX);
+    for _ in 0..RECENT_FILLS {
+        scratch.recent_fills.push(f);
+    }
+    let mut server_scratch = Box::new(EngineSnapshot::empty());
+    let mut resp = vec![0u8; 256 * 1024];
+
+    let g = AllocGuard::new();
+    let mut acc: usize = 0;
+    for i in 0..1_000u64 {
+        scratch.seq = i;
+        scratch.mono_ns = i * 1_000_000_000;
+        cell.publish(&scratch);
+        cell.read_into(&mut server_scratch);
+        let n = encode_state_json(&server_scratch, &mut resp).expect("full body fits 256 KiB");
+        acc = acc.wrapping_add(n);
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc > 0);
+    assert_eq!(
+        allocs, 0,
+        "/state publish+read+encode allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "/state path bytes should be zero: saw {bytes}");
 }

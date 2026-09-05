@@ -7,6 +7,9 @@ license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
 description  = "Main binary. Parses CLI args, loads config via core-config, wires together ingress + engine + strategy + dispatcher."
+# RG6: `build.rs` (auto-detected) records the git commit into
+# MULTIVENUE_GIT_SHA for the `/state` boot section (soft — "unknown"
+# without git).
 
 [lib]
 path = "src/lib.rs"
@@ -24,6 +27,7 @@ core-ring            = { workspace = true }
 core-time            = { workspace = true }
 core-types           = { workspace = true }
 engine               = { workspace = true }
+engine-snapshot      = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }

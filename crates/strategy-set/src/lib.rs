@@ -79,6 +79,7 @@
 
 use core_regime::{
     RegimeErr, RegimeParams, RegimeState, SeedRow, RAW_ER, RAW_RET, RAW_RV, RAW_STRETCH,
+    REGIME_MAX_SYMS,
 };
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::REL_UNKNOWN;
@@ -89,8 +90,13 @@ use core_types::{
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{
-    Ctx, RegimeCounters, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr,
+    Ctx, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters, Strategy, StrategyCounters,
+    StrategyError, SubmitErr, VmRowView, REGIME_REL_SYMS,
 };
+
+// RG6: `regime_rel_view` copies the detector's view arrays straight
+// into the trait's POD — the two capacities must agree.
+const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
 use strategy_cross_arb::CrossArb;
 use strategy_ev::EvStrategy;
 use strategy_icdp::IcdpStrategy;
@@ -669,6 +675,70 @@ impl StrategyCounters for StrategySet {
         c.declared_total = self.regime_declared_total;
         c.gate_changes = self.regime_gate_changes;
         c
+    }
+
+    // ---- RG6 `/state` family (1 s snapshot, same UFCS route) --------
+
+    #[inline]
+    fn is_halted(&self) -> bool {
+        self.halted
+    }
+    /// Per-slot orders + the slot's label shape (the gate itself rides
+    /// `regime_counters().gates`).
+    fn slot_counters(&self, slot: u8) -> SlotCounters {
+        let (emitted, dropped) = match slot {
+            SLOT_LATENCY_ARB => (
+                self.latency_arb.orders_emitted(),
+                self.latency_arb.orders_dropped(),
+            ),
+            SLOT_EV => (self.ev.orders_emitted(), self.ev.orders_dropped()),
+            SLOT_CROSS_ARB => (
+                self.cross_arb.orders_emitted(),
+                self.cross_arb.orders_dropped(),
+            ),
+            SLOT_RULE_TREE => (
+                self.rule_tree.orders_emitted(),
+                self.rule_tree.orders_dropped(),
+            ),
+            SLOT_AI_EXEC => (
+                self.ai_exec.orders_emitted(),
+                self.ai_exec.orders_dropped(),
+            ),
+            SLOT_VM => (self.vm.orders_emitted(), self.vm.orders_dropped()),
+            SLOT_ICDP => (self.icdp.orders_emitted(), self.icdp.orders_dropped()),
+            _ => return SlotCounters::default(),
+        };
+        let label = self.regime_labels[slot as usize];
+        SlotCounters::new(emitted, dropped, label.n, label.off)
+    }
+    #[inline]
+    fn vm_active_hash128(&self) -> [u8; 16] {
+        self.vm.active_hash128()
+    }
+    #[inline]
+    fn vm_staged_hash128(&self) -> [u8; 16] {
+        self.vm.staged_hash128().unwrap_or([0; 16])
+    }
+    #[inline]
+    fn vm_rows_view(&self, out: &mut [VmRowView]) -> u32 {
+        self.vm.rows_view(out)
+    }
+    #[inline]
+    fn icdp_params_hash(&self) -> [u8; 32] {
+        if self.icdp.is_configured() {
+            *self.icdp.params_hash()
+        } else {
+            [0; 32]
+        }
+    }
+    #[inline]
+    fn icdp_instruments(&self) -> u32 {
+        self.icdp.instruments() as u32
+    }
+    /// The detector's per-symbol REL state (its view minus the words).
+    fn regime_rel_view(&self) -> RegimeRelView {
+        let v = self.regime.view();
+        RegimeRelView::new(v.syms, v.rel, v.n_syms)
     }
 }
 

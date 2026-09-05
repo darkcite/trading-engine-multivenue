@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! Tiny HTTP/1.1 server for the `/metrics` endpoint.
+//! Tiny HTTP/1.1 server for the `/metrics`, `/healthz` and `/state`
+//! endpoints.
 //!
-//! `serve_metrics(addr, registry, stop)` blocks the caller's thread
-//! in an accept loop. Each connection is handled inline:
+//! `serve_metrics(addr, registry, state, stop, on_event)` blocks the
+//! caller's thread in an accept loop. Each connection is handled
+//! inline:
 //! 1. Read the request line (up to `\r\n\r\n`).
 //! 2. Switch on the method + path:
 //!    * `GET /metrics`   → 200 + Prometheus body.
 //!    * `GET /healthz`   → 200 with `ok\n`.
+//!    * `GET /state`     → 200 + the JSON body the caller's `state`
+//!      writer produces (RG6; 404 when no writer was wired, 500 when
+//!      the body does not fit the response buffer — never truncated).
 //!    * anything else    → 404.
 //! 3. Close.
+//!
+//! The `/state` writer is a caller-supplied `FnMut(&mut [u8])` —
+//! this crate stays dependency-free and knows nothing about the
+//! snapshot it serves (the cli wires `engine-snapshot`'s seqlock
+//! read + JSON encode into it). Monomorphized, no `dyn`.
 //!
 //! No keep-alive, no pipelining, no HTTPS — this endpoint is for
 //! local consumption only and the cli docs say so.
@@ -21,7 +31,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::registry::MetricsRegistry;
+use crate::registry::{EncodeErr, MetricsRegistry};
+
+/// The `/state` writer's signature: encode the current state as JSON
+/// into the buffer, returning the body length. The `None` spelling
+/// for callers without a state page: `None::<StateFn>`.
+pub type StateFn = fn(&mut [u8]) -> Result<usize, EncodeErr>;
 
 /// Errors surfaced from [`serve_metrics`].
 #[derive(Debug)]
@@ -51,20 +66,29 @@ pub enum MetricsServeEvent<'a> {
 
 const REQ_BUF_SIZE: usize = 4 * 1024;
 // 256 counters + 384 gauges × (63-byte name + value + newline) can
-// approach 64 KiB; 128 KiB keeps the single boot-time allocation
-// comfortably ahead of the registry's worst case.
-const RESP_BUF_SIZE: usize = 128 * 1024;
+// approach 64 KiB; the RG6 `/state` body reaches ≈ 100 KB with a full
+// vm table + recents (`engine_snapshot::STATE_JSON_MAX` = 160 KiB is
+// its pinned bound). 256 KiB keeps the single boot-time allocation
+// ahead of both worst cases with the header budget to spare.
+const RESP_BUF_SIZE: usize = 256 * 1024;
 const ACCEPT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Run the metrics server until `stop` is raised. Blocking; spawn
 /// this in its own `std::thread`. Non-fatal per-connection/accept
 /// errors are reported through `on_event` (see [`MetricsServeEvent`]).
-pub fn serve_metrics<E: Fn(MetricsServeEvent<'_>)>(
+/// `state` is the `GET /state` body writer (`None` ⇒ 404 on that
+/// path; see the module docs).
+pub fn serve_metrics<E, F>(
     addr: SocketAddr,
     registry: Arc<MetricsRegistry>,
+    mut state: Option<F>,
     stop: &AtomicBool,
     on_event: E,
-) -> Result<(), MetricsServerErr> {
+) -> Result<(), MetricsServerErr>
+where
+    E: Fn(MetricsServeEvent<'_>),
+    F: FnMut(&mut [u8]) -> Result<usize, EncodeErr>,
+{
     let listener = TcpListener::bind(addr).map_err(MetricsServerErr::Bind)?;
     listener
         .set_nonblocking(true)
@@ -89,7 +113,8 @@ pub fn serve_metrics<E: Fn(MetricsServeEvent<'_>)>(
                     on_event(MetricsServeEvent::ConnError(&e));
                     continue;
                 }
-                if let Err(e) = handle_one(sock, &registry, &mut req, &mut resp) {
+                if let Err(e) = handle_one(sock, &registry, state.as_mut(), &mut req, &mut resp)
+                {
                     // Per-connection errors are non-fatal — report and
                     // keep accepting.
                     on_event(MetricsServeEvent::ConnError(&e));
@@ -107,12 +132,16 @@ pub fn serve_metrics<E: Fn(MetricsServeEvent<'_>)>(
     Ok(())
 }
 
-fn handle_one(
+fn handle_one<F>(
     mut sock: TcpStream,
     registry: &MetricsRegistry,
+    state: Option<&mut F>,
     req: &mut [u8; REQ_BUF_SIZE],
     resp: &mut [u8],
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    F: FnMut(&mut [u8]) -> Result<usize, EncodeErr>,
+{
     sock.set_read_timeout(Some(Duration::from_secs(2)))?;
     sock.set_write_timeout(Some(Duration::from_secs(2)))?;
 
@@ -147,11 +176,11 @@ fn handle_one(
         return write_response(&mut sock, 405, b"", b"Method Not Allowed", resp);
     }
 
+    // Bodies are encoded directly into `resp` past a header budget,
+    // then the headers are written in front — no extra copy.
+    const HEADER_BUDGET: usize = 256;
+
     if path == b"/metrics" {
-        // Encode body directly into `resp`, then prepend headers.
-        // We use a scratch slice past the header offset to avoid an
-        // extra copy.
-        const HEADER_BUDGET: usize = 256;
         let (head, body) = resp.split_at_mut(HEADER_BUDGET);
         let body_len = match registry.encode_prometheus(body) {
             Ok(n) => n,
@@ -159,10 +188,21 @@ fn handle_one(
                 return write_response(&mut sock, 500, b"", b"Encode Overflow", resp);
             }
         };
-        let head_len = write_headers(head, 200, body_len, b"text/plain; version=0.0.4")?;
-        sock.write_all(&head[..head_len])?;
-        sock.write_all(&body[..body_len])?;
-        return Ok(());
+        return write_body(&mut sock, head, body, body_len, b"text/plain; version=0.0.4");
+    }
+
+    if path == b"/state" {
+        let Some(encode) = state else {
+            return write_response(&mut sock, 404, b"", b"Not Found", resp);
+        };
+        let (head, body) = resp.split_at_mut(HEADER_BUDGET);
+        let body_len = match encode(body) {
+            Ok(n) => n,
+            Err(_) => {
+                return write_response(&mut sock, 500, b"", b"Encode Overflow", resp);
+            }
+        };
+        return write_body(&mut sock, head, body, body_len, b"application/json");
     }
 
     if path == b"/healthz" {
@@ -170,6 +210,21 @@ fn handle_one(
     }
 
     write_response(&mut sock, 404, b"", b"Not Found", resp)
+}
+
+/// Write a 200 with `body[..body_len]` (already encoded in place)
+/// behind headers rendered into `head`.
+fn write_body(
+    sock: &mut TcpStream,
+    head: &mut [u8],
+    body: &[u8],
+    body_len: usize,
+    content_type: &[u8],
+) -> io::Result<()> {
+    let head_len = write_headers(head, 200, body_len, content_type)?;
+    sock.write_all(&head[..head_len])?;
+    sock.write_all(&body[..body_len])?;
+    Ok(())
 }
 
 fn parse_request_line(buf: &[u8]) -> Option<(&[u8], &[u8])> {

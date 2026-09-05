@@ -52,7 +52,7 @@ signer-eip712        = { workspace = true }
 clob-dispatcher      = { workspace = true }
 core-metrics         = { workspace = true }
 core-latency         = { workspace = true }
-tui                  = { workspace = true }
+engine-snapshot      = { workspace = true }
 
 [[bench]]
 name = "hot_path"

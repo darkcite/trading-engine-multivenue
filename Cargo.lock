@@ -141,6 +141,7 @@ dependencies = [
  "criterion",
  "dhat",
  "engine",
+ "engine-snapshot",
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
@@ -159,7 +160,6 @@ dependencies = [
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
- "tui",
 ]
 
 [[package]]
@@ -321,6 +321,7 @@ dependencies = [
  "core-time",
  "core-types",
  "engine",
+ "engine-snapshot",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
@@ -653,7 +654,16 @@ dependencies = [
  "core-ring",
  "core-time",
  "core-types",
+ "engine-snapshot",
  "ingress-ai",
+ "strategy-core",
+]
+
+[[package]]
+name = "engine-snapshot"
+version = "0.1.0"
+dependencies = [
+ "core-types",
  "strategy-core",
 ]
 
@@ -2005,10 +2015,11 @@ dependencies = [
 name = "tui"
 version = "0.1.0"
 dependencies = [
- "book-builder",
  "core-types",
  "crossterm",
+ "engine-snapshot",
  "ratatui",
+ "strategy-core",
 ]
 
 [[package]]

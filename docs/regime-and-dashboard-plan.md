@@ -1,11 +1,13 @@
 # Market regime + regime labels + regime-aware AI aggregation + dashboard — plan (RG0–RG7)
 
 **Status: IN PROGRESS — RG0–RG2 committed (`77f5ea5`); RG3 committed
-(`81ed263`, 2026-09-05); RG5 committed (`8defc26`, 2026-09-05; §12 entry). Next: the RG2/RG3/RG5 live smoke
-(operator: relink + `regime.toml` + restart + `install-launchd.sh`; a
-labelled ruleset staged/committed live — §7 RG3 exit tell), then RG4
-(library + composer) or RG6 (dashboard); §11 defaults apply until
-overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
+(`81ed263`, 2026-09-05); RG5 committed (`8defc26`, 2026-09-05); RG2/RG3/RG5
+live smoke PASSED 2026-09-05 (§12); RG4 code-complete 2026-09-05
+(uncommitted — §12); RG6 ENGINE + TUI halves code-complete 2026-09-05
+(uncommitted — §12 last entry: `/state` live on 9191 after the next
+relink + restart, TUI over the same snapshot). Next: the RG6 worker page
+(`python -m claude_worker.dashboard`, §6.2) + the live check of every
+panel; §11 defaults apply until overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
 need to implement the following"). Paper mode only; no
 dispatcher/signer/RiskGate/live-ramp work — the Stage-3 ENTRY GATE
 (`docs/arch/mvp-completion-plan.md` §7) is untouched. Owner doc for the
@@ -710,6 +712,48 @@ library is written from the same run (the day's windows are the
 - `DashboardState` (TUI) is replaced by a view over the same snapshot;
   the never-filled `recent_tob` goes away.
 
+**As landed (RG6 engine half, 2026-09-05 — the `/state` contract,
+`"v": 1`; pinned byte-exact by `crates/engine-snapshot/tests/encode.rs`).**
+Crate `engine-snapshot` (deps: `core-types`, `strategy-core`) holds
+`EngineSnapshot` (≈ 21 KB, `#[repr(C, align(64))]`, `Copy`), the generic
+seqlock `SnapshotCell<T>` (the tui cell generalized — `publish(&T)`,
+`read()`, `read_into(&mut T)`), `RecentRing<T, N>` (the engine keeps
+`recent_orders`/`recent_fills` beside its captures) and
+`encode_state_json` (sticky-overflow cursor: complete body or
+`JsonOverflow`, never truncated; `STATE_JSON_MAX` = 160 KiB, the
+server's `RESP_BUF_SIZE` = 256 KiB). `core-metrics` stays
+dependency-free: `serve_metrics(addr, registry, state: Option<F>, stop,
+on_event)` takes the writer as an `FnMut(&mut [u8])` (`None::<StateFn>`
+⇒ 404; encode error ⇒ 500). The cli publishes every `SNAPSHOT_PERIOD_NS`
+= 1 s (`fill_snapshot` + one `publish` — a second gate beside the 5 s
+`next_report`; the T1(c) tick-age stamps moved to that gate); the cell
+exists whenever `/metrics` does; the TUI (`--tui`) reads the same cell.
+`crates/cli/build.rs` records `MULTIVENUE_GIT_SHA` (soft — `unknown`
+without git; re-runs only when `.git/HEAD`/its ref moves); the binary's
+own mtime is the relink tell.
+
+*Number law:* counters, masks, small ids, ×1e6 prices/qtys = JSON
+numbers; ns stamps, 64-bit ids/hashes/words = strings (decimal for
+stamps/ids, lower-hex for hashes/words); `*_age_s` derived against the
+snapshot's `now.mono_ns` (`-1` = never). Body timestamps are
+engine-monotonic — `wall = now.wall_ns + (t − now.mono_ns)`.
+
+| key | content |
+|---|---|
+| `v`, `seq` | schema 1; publish counter |
+| `now` | `mono_ns`, `wall_ns` (anchor arithmetic), `uptime_s` |
+| `boot` | `pid`, `git_sha`, `binary_mtime_ns`, `boot_wall_ns`, `run_epoch_ns`, `run_dir`, `strategy` (the `--strategy` name), `strategy_kind`, `paper`, `requested_mask`, `configured_mask`, `enabled_mask`, `halted`, `ruleset_hash`, `ruleset_staged_hash` (hash128 hex, zero = none), `icdp_hash`, `regime_hash` (sha256 hex), `regime_configured` |
+| `counters` | `iterations`, `ticks`, `signals`, `fills`, `events`, `depths`, `opts`, `orders_emitted`, `orders_dropped`, `ai_dispatched`, `ai_drain_malformed` |
+| `latency` | `ingest`/`decide`/`ack` × `{p50_ns, p99_ns}` |
+| `regime` | `configured`, `minutes_judged`, `seed_rows`, `declared_total`, `gate_changes`, `gates[8]` (0 open / 1 soft / 2 hard), `profiles[2]` = `{name, measured, declared, effective}` each a word `{hex, dims[7]}` (raw dimension bytes — decode with the §3.3 byte map) + `declared_age_s`, `declared_ttl_s`, `disagree`, `flips[8]`, `raw{present, ret_bps_1e9, er_1e9, rv_bps_1e9, stretch_1e9}`; `rel{syms[], fast[], slow[]}` (REL byte per breadth sym, 255 = unknown) |
+| `slots[8]` | `slot`, `name`, `configured`, `enabled`, `gate`, `label_terms`, `label_off`, `orders_emitted`, `orders_dropped` |
+| `vm` | `active_hash`, `staged_hash`, `rows_active`, `epoch`, `fires`, `orders_emitted`, `orders_dropped`, `commit_dropped`, `regime_blocked`, `regime_hard_exits`, `rows[]` = `{i, name_h (hex), sym, ref_sym, flags, family, gate (bit 0 open, bit 1 hard), regime_off, state (1 = entered), side, entry_sign, entry_px_1e6, qty_sym_1e6, entry_ts_ns, age_s}` |
+| `icdp` | `configured`, `hash`, `instruments`, the 14 `IcdpCounters` |
+| `ai` | the 15 `AiIngressStatus` counters (+ `drain_malformed`, `enable_refused`), `heartbeat_age_s` |
+| `ingress[7]` | `venue` (pm, bn, okx, deribit, hl, bybit, rpc), `state` (0 down / 1 connecting / 2 up / 3 backoff), `last_tick_age_s`, `ticks`, `msgs`, `reconnects`, `ring_drops`, `stale_ticks`, `parse_errors`, `gaps`, `sub_drops`, `feed_delay_ema_ms` |
+| `capture` | `fills_records`, `fills_io_errors`, `orders_records`, `orders_io_errors` |
+| `recent` | `orders_total`, `orders[≤64]` oldest-first `{ts_ns, age_s, slot, venue, sym, side, kind, px_1e6, qty_1e6, oid, ttl_ns}`; `fills_total`, `fills[≤64]` `{ts_ns, age_s, sym, side, px_1e6, qty_1e6, oid}` (a `Fill` carries no slot — join on `oid` against the orders) |
+
 ### 6.2 Worker-served page — `python -m claude_worker.dashboard`
 
 - `http.server` (stdlib) on `127.0.0.1:9292` (§11-Q6), single-threaded,
@@ -1172,13 +1216,590 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   from RG3 · `ruff` finding counts on the touched files did not grow
   except new E501s in the same hand-wrapped style the files already
   carry (py-lint is not a gate).**
-- **RESUME POINT (for a fresh session):** RG5 is committed (`8defc26`). Next = (a) the operator's live smoke
-  of RG2+RG3(+RG5) — the recipe in the RG3 resume point above, plus
-  `./scripts/install-launchd.sh` to install `com.multivenue.regime`
-  (no-op until `~/multivenue/regime.toml` exists), then `uv run python
-  -m claude_worker.regime report` and one `declare --fast measured` to
-  see `engine_regime_fast_declared` move and `regime: declared` in the
-  TUI-less metrics; (b) then **RG4** (library + composer +
-  `ai-session.md` 0a–0c with the pinned scripted test extended) or
-  **RG6** (dashboard: engine `/state` + worker page + TUI words) — the
-  operator picks. Laws unchanged (see the RG3 resume point).
+- **2026-09-05 — RG2+RG3+RG5 LIVE SMOKE PASSED (run by the session on
+  the operator's "you do the smoke first"; RG5 hash entry = `61b9ab8`).
+  Every §7 exit tell observed on the standing launchd engine:**
+  - **Install.** `~/multivenue/regime.toml` from the example with
+    `[breadth] members` = the six `binance.usdm` crypto majors that
+    exist in `universe.toml` (`eth sol xrp doge ada ltc`; the example's
+    `bnbusdt` is not in the universe and would have refused the boot;
+    §11-Q2's all-usdm default was NOT taken — stock perps and micro-alts
+    are not a BTC-trend breadth set; the operator's pre-existing
+    `regime.toml.candidate` had the first four); `refresh-params` filled
+    the six percentile lines from candles.db (fast RV p30/p70 26.4/39.8
+    bps on 167 samples, slow 65.2/103.0 on 93, funding 9/90 prints) so
+    VOL + FUND_LEVEL are judged, not ABSENT. `./scripts/install-launchd.sh`
+    = graceful restart + `com.multivenue.regime` installed (StartInterval
+    300). Release binary verified current (`cargo build --release -p cli`
+    = `Finished … 0.20s`, nothing recompiled since RG3).
+  - **Boot tells (pid 60169, 04:55:25Z, run `run-1788584102583092000`):**
+    wrapper `regime seed-out: 10346 rows for 7 descriptors`; engine
+    `regime: member resolved` ×6, `regime: seed file read rows=10346
+    dropped=0`, `regime: artifact configured hash=8be4364c… members=6
+    confirm_min=3 seed_rows=10332 … gates=[0,…]`, `strategy-set:
+    composed mask=112`; `/metrics` `engine_regime_configured 1`,
+    `engine_regime_seed_rows 10332`, `engine_regime_minutes_judged_total`
+    1/min (18 at 05:13Z); #7b recommit re-staged/re-committed
+    `bfbc5349…` (seq 39189/39190) ⇒ `vm_rows_active 1`; `regime repush:
+    no fresh declaration persisted — nothing to re-send` (the RG5
+    post-boot lane ran). Fast TREND judged `neutral` after the 3-minute
+    confirm (word `0x0001808080808002`, source 0 = measured).
+  - **Worker lane.** `regime report` = fast `neutral/mixed/low/pos/
+    normal/neutral`, slow `neutral/chop/low/pos/normal/neutral` (candles
+    lag 3 min); `declare --fast measured --ttl 900` → seq 39422 →
+    `engine_regime_fast_declared 0x0000020202010202`, effective =
+    declared (`0x0002020202010202`, `fast_source 1`, `declared_age_ns`
+    0.9 s); slow untouched (`slow_source 0`). The 5-minute cycle ran at
+    04:59/05:09 (history rows written; the 05:04 slot skipped itself on
+    the pgrep guard while a worker backtest was live) and did the
+    once-per-UTC-day percentile refresh at 04:59 (stamp
+    `params-refreshed-utc-day`; `.bak` = the file the engine booted
+    with) — the engine keeps `8be4364c…` until the next T2 restart, the
+    harness reads the refreshed file (`1f57d25a…`): by design, noted.
+  - **Labelled ruleset (the RG3 exit tell).** Two disjoint variants of
+    the live xv row (`xv-okx-bnspot-vlow` `regimes:["vol:low"]` /
+    `xv-okx-bnspot-vnot` `regimes:["vol:!low"]`, everything else
+    identical incl. `exit 1.0`, both `regime_off` soft) = artifact
+    `fde6f733e72649e0c6452b009d0f7c3c…` (installed by hand as
+    `<hash128>.json` + `.report.json` — the frozen `stage-ruleset` verb
+    binds gates and sends the frame but does NOT install the artifact:
+    the first stage (seq 39424) targeted a missing file and the engine
+    ignored it silently). Gate evidence per the ≤ 2 h law: a research
+    one-shot of the git-excluded class (owner doc
+    `docs/arch/research-tools-exclusion-plan.md`) pooled 11 seeded 2 h
+    windows (4+3+2+2 from the four v3 runs of 2026-09-04
+    00:01Z → 2026-09-05 04:54Z, 9.8 GB, RSS ≤ 8.6 GB) under
+    `~/multivenue/research/rg-smoke/root`; the frozen worker `backtest`
+    on that root: **PASS** — OOS legs 78, round trips 14, net +$4.51
+    (0-fee argv, an upper bound), DD $9.26, 2 trading days, bounds
+    $3,002/$15,006/$20,964. A single-window harness run (`--emit-detail`
+    = detail_version 4) proves the replay is judged, not regime-blind:
+    `regime: artifact … seed_rows=10745 fast=trend=neutral shape=chop
+    vol=low fund=unknown level=unknown stretch=neutral`, `labelled_rows
+    2, blocked 267948, minutes_judged 120` (FUND dims unknown: no
+    Binance funding events reach this host — ops debt (d)). Stage seq
+    39426 + commit seq 39428 → `vm_rows_active 2`, `engine_vm_table_epoch
+    2`, `engine_vm_regime_blocked_total` 0 → 37 within 4 s and ≈ 100–900
+    per 10 s thereafter (variant B gated under the declared `vol:low`;
+    the rate follows the syms' tick bursts). `declare --fast "vol:high"`
+    (seq 39430) → effective `0x0002808080048080` (only VOL overridden,
+    the rest = the measurement), the counter kept climbing (variant A
+    now gated), `table_epoch` STAYED 2 and `vm_rows_active` 2 = **no
+    table flip on a regime change**; `declare --fast "vol:unknown"`
+    (seq 39432) accepted (both variants closed = fail-closed); restored
+    with `declare --fast measured --ttl 2400` (seq 39434) so variant A
+    trades until the engine's own VOL judgement lands.
+  - **Findings to carry (not fixed here):** (1) **seed hole** — the
+    wrapper's `seed-out` ran at 04:54 from candles.db ending 03:55 (the
+    hourly candles lane refreshed minutes later), so the ring holds a
+    03:56–04:54 hole; `close_at` walks ≤ 5 min over holes, hence fast
+    TREND was known 04:58–05:00 (m−60 within 5 min of 03:55) and then
+    UNKNOWN again until live minutes cover 60 min (~05:55Z); fast VOL /
+    SHAPE need ≥ 80 % of their windows live (~05:45Z). Every T2 restart
+    repeats this (up to ~1 h of fast-profile blindness ×3/day ⇒ labelled
+    rows fail closed then). Fix shape for RG7: refresh the candles tail
+    in the wrapper BEFORE `seed-out` (or seed the last hour from the
+    previous run's own ticks). (2) FUND_SIGN/FUND_LEVEL are UNKNOWN live
+    and in the harness on this host (Binance markPrice unreachable, ops
+    debt (d)) — `fund:`/`level:` labels are unusable until the `.env`
+    lever. (3) A stage frame for a missing artifact is dropped without a
+    counter — RG6's `/state`/metrics should expose `stage_refused`.
+    (4) `regime_blocked` counts per evaluated tick of a closed row, so
+    its rate is tick-bursty; a per-row gate byte in `/state` (RG6) is
+    the readable form. (5) The labelled table `fde6f733…` is now the
+    ACTIVE row the daily recommit carries forward — the operator rules
+    whether it stays (the RG7 soak shape: "5 paper days with regime
+    gating live") or `bfbc5349…` is re-committed.
+  - **Gates:** no source change (a git-excluded research one-shot only);
+    stay-greens stand from RG3/RG5 (nextest 1578 · alloc 42/42 · pytest
+    692 · lint · license-check).
+- **2026-09-05 — RG4 CODE-COMPLETE (library + composer, §5.2–§5.4; the
+  operator picked RG4 over RG6, then ruled by AskUserQuestion: keep
+  `fde6f733…` live; import validates ONLY the active table; gate =
+  pooled + on/off delta + LOWO; the carry legs come in as a CANDIDATE
+  member; pool = 8 windows; words from `/metrics` with the measured
+  fallback — and, verbatim, "in any scenario any test time / soak time /
+  protect time MUST NOT EVER BE MORE THAN 2 hours", which is now a
+  standing law: retention by window COUNT, a 2 h WALL BUDGET on every
+  gate, soaks stated as window counts).** Python only, no Rust change.
+  What landed — **(1) `state.py`**: additive tables `library`
+  (`member_id` PK, name, kind vm-rows|coded, path, status
+  candidate|validated|retired, `labels_json`, `regime_off`, thesis,
+  `origin_json`, stamps), `library_evidence` (PK member × window:
+  root, `n_ticks`, `n_fills`, `net_usd_0`, `net_usd_tier`, `max_dd_usd`,
+  `regime_word_mode`, judged, `detail_version`, ts) and `compositions`
+  (`table_hash` PK, hash128, `member_ids_json`, `words_json` — both
+  profiles, the plan's `regime_word, profile` pair folded into one
+  column —, path, `gate_json`, composed/staged/committed stamps); the
+  typed readers `RegistryRow` / `LibraryMember` / `EvidenceRow` /
+  `CompositionRow`; `library_insert` is insert-or-ignore (an import
+  re-run never downgrades a status the operator set). **(2)
+  `claude_worker/library.py`** (module lane): `member_id` = sha256 of
+  the canonical rows (`strategist.parse_row` — a new public seam over
+  the structural parser — + `artifact_bytes`), so a single-member
+  composition's table hash IS the member id; labels derived from the
+  rows' `regimes` (+ the `rel` sugar) — an unlabelled row makes the
+  member ANY; ∃-semantics `label_fits`, `rel:` terms stripped from the
+  word-fit law; member files `~/multivenue/worker/library/<id>.json`
+  (`$CLAUDE_WORKER_LIBRARY_DIR`, `library_dir_for(db)`), drift-checked
+  on read (rows must re-hash to the id); lanes `add` (`--split-by-name-
+  prefix`, `--regimes` override, `--status`), `import-catalog` (registry
+  rows via the new `State.rulesets_all()` + `candidates/*.json`, thesis
+  + source hash in `origin`, dedup by file hash, the coded
+  `icdp@<sha256>` from `icdp.toml` with `[labels.icdp]` of
+  `regime.toml`; idempotent; `--dry-run`), `list [--regime current|
+  "<decl>[;<decl>]"] [--status] [--all] [--json]` (a query's unnamed
+  dimensions are UNKNOWN — fail-closed like the engine),
+  `label … --regimes … | --any [--regime-off]`, `validate | retire |
+  candidate`, `evidence <member> --window … [--fees]` (one run per
+  window through the ADDITIVE `backtest.run_harness_extra` — the frozen
+  argv + `--fee-bps` tier + `--emit-detail`, the carved `0/100` split
+  so the WHOLE window is scored; the row reads `net_usd_0` from the fee
+  ladder's zero rung, `net_usd_tier` from the report, `judged` from the
+  detail's stale lanes, the dominant fast word from the regime block).
+  **(3) `window_root.py`**: the standing POOL — `pool_candidates`
+  (every complete 2 h window of every v3+ run, newest first;
+  `run_pmlr_version` refuses stale-blind v2), `pool_ensure(logs, pool,
+  k, seed)` (reuse existing cuts by name, cut the missing with their
+  seeds, prune beyond the newest k BY COUNT), `pool_windows`,
+  `complete_windows`, `symlink_root` (the LOWO roots). **(4)
+  `claude_worker/compose.py`** (module lane): `effective_words` (query
+  → RG5 chain engine → declaration → the worker's own `measure()` →
+  UNKNOWN), `neighbourhood` (Hamming-1: one market dimension of one
+  profile; an unknown byte neighbours every value), the rule-8 mirror
+  (`row_identity` over the validator's tuple + `exit` presence,
+  `row_region` = per-profile label masks + REL nibbles,
+  `regions_intersect` = `RegimeLabel/RegimeRel::intersects`), the rule-7
+  mirror (`cap_usage`: both legs of a position row, 256 rows, $10k /
+  $20k / $100k), `select_members` (fit word | neighbour | any |
+  evidence; retired never, candidates on `--include-candidates`; sorted
+  by judged tier net, windows, name) → `admit` (rule 5 names, rule 8,
+  caps) → `compose` → `write_composition` (canonical bytes at
+  `<worker>/compositions/<hash128>.json`; idempotent) → `gate`
+  (per-member evidence for every pool window it lacks, the FROZEN
+  `run_backtest` on the pool = the binding report, `--regime off` on
+  the pool = the on/off delta ≥ 0, LOWO = every pool-minus-one symlink
+  root keeps OOS net > 0; every run charged to `WallBudget` 7200 s —
+  `BudgetExceeded` is a FAIL reason, never a wait; a harness error is a
+  verdict, not a crash) → `promote` (`FREEZE` pin refuses; hash ==
+  active, or the active table's CANONICAL rows == the composition's,
+  is a no-op — the smoke-era hand-written `fde6f733…` would otherwise
+  flip to byte-different identical rows; else `install_candidate` →
+  the frozen `stage_ruleset`/`commit_ruleset` pair in-process with the
+  composed thesis as attribution → `engine_vm_table_epoch` watched).
+  CLI: `--dry-run | --promote`, `--include-candidates`,
+  `--fit-from-evidence`, `--regime`, `--pool/--pool-size/--no-refresh`,
+  `--no-lowo`, `--fees`, `--budget-s ≤ 7200`, `--freeze/--unfreeze`,
+  `--json`; exit 0 PASS · 2 nothing fits / usage · 3 gate FAIL · 4
+  promote transport. **(5) `ai-session.md`** §4 steps 0a (`regime
+  report`), 0b (`declare`), 0c (`library list --regime current` →
+  author members → `library add` → `compose --dry-run` → steps 4–10, or
+  `compose --promote`) + the new §8 LIBRARY section; the pinned
+  scripted test extended in the same change (0a's honest exit 2 without
+  an artifact, 0c on an empty library, `library add` of a REAL v2 row,
+  `compose --dry-run --json` whose single-member table hashes to the
+  member id, then backtest → install → stage → commit → push on the
+  COMPOSED artifact). **Tests:** `tests/test_library.py` (8) +
+  `tests/test_compose.py` (10) — state round-trips, canonical id /
+  labels / drift, import preserves every hash + thesis and validates
+  only the active table, query words, the evidence row from a fake
+  additive-path run, every lane through `main`; neighbourhood count,
+  rule-8 (ANY vs variant, disjoint variants, REL nibbles), caps,
+  selection order + rule-8 dedup + idempotent hash, the gate on a fake
+  harness (evidence caching, frozen pooled argv + binding report,
+  off/LOWO/pooled/floor/budget/harness-error verdicts), promotion
+  (freeze, same hash, canonical no-op, the frozen frames on the fake
+  UDS server, registry + composition stamps), count-only pool pruning
+  on crafted v3 runs (v2 refused), the CLI. **Gates (Mac):** worker
+  pytest **709** (692 + 17; the frozen 202 inside; scripted pin green)
+  · `make license-check` OK (252 files — the smoke entry above was
+  re-worded: it named a one-shot file, pitfall 16) · `make lint` stands
+  (no Rust) · ruff on the new files: E501 in the files' hand-wrapped
+  style only.
+- **2026-09-05 — RG4 LIVE (the §7 exit tell, run on the real worker
+  db against the standing engine):** `import-catalog` → 6 members
+  (`954fba8da621` = the live `fde6f733…` rows, VALIDATED; `bfbc5349`
+  xv, h6/h6b dip-rip fades and the g7 smoke floor as candidates — all
+  four RETIRED by the session as superseded/smoke-era; `icdp@407e064b…`
+  coded). The carry legs of `b9883c1a` (10 cvfc deribit/hl + 7 s1
+  bybit) added as the candidate member `cvfc-carry` at **$2,500/leg**
+  (the $2,750 of the merged table no longer fits beside TWO xv
+  variants under the leg-counted $100k cap: 17 × 2 × 2,750 + 2 × 2 ×
+  3,000 = $105.5k; at $2,500 it is $97k), unlabelled because FUND dims
+  are unknown on this host. Pool: 8 windows under
+  `~/multivenue/worker/windows/` (7 reused from the smoke's cuts by
+  name, 1 cut fresh — the newest complete 2 h windows of the four v3
+  runs 2026-09-04 08:31Z → 2026-09-05 04:54Z). **Finding (structural,
+  carried to RG7/harness): a funding-carry member cannot be evidenced
+  under the 2 h law with today's harness** — `apr24` needs 24 h of
+  funding prints and the backtest warm-up is TABLE-GLOBAL, so one
+  evidence run of `cvfc-carry` on a 2 h window emitted 0 orders
+  (`orders.emitted 0`, 6.7 M records replayed, judged) and any table
+  carrying it would block its OTHER rows for the first 24 h of the
+  pooled timeline (16 h) — the fix shape is a per-window FUNDING seed
+  the way `regime-seed.tsv` warms the detector (window_root writes it
+  from candles.db's `funding` table, the harness's `--funding-seed` /
+  `FundingSeed` replay honours it) — a `crates/cli` change, out of
+  RG4's Python scope. The composition therefore ran validated-only:
+  words from the engine (`fast` = trend neutral · shape mixed · vol low
+  · fund/level unknown · stretch neutral, measured — the seed hole had
+  filled by 06:0xZ), member `954fba8da621` fit "word", table
+  `954fba8da621d769d2bc9607e95854b9` (2 rows, $12k), evidence rows
+  written for all 8 windows (whole-window, tier `okx 8:10`): fills
+  16–283 per window, zero-fee nets −73.4 … +3.1 (Σ ≈ −$97), tier nets
+  −40 … −417 (Σ ≈ −$1,343) — the xv verdict of 2026-09-02 restated
+  per window: nothing survives the okx tier. Pooled frozen gate on the
+  8-window pool: **PASS** — OOS legs 76, RT 13, net +$4.09 (0 fee),
+  DD $9.26, 2 days, bounds $3,002 / $14,870 / $20,787. **`--regime
+  off` on the same pool: +$4.46 ⇒ on−off = −$0.36 — the vol labels
+  are WORSE than their absence; LOWO: +2.42 / +4.09 ×4 / +2.42 /
+  −8.86 (without the 2026-09-05 00:01Z window) / −0.70 (without the
+  02:01Z window) — the OOS edge sits in two windows. Composer verdict:
+  FAIL (838 s of the 7 200 s budget; `compositions.gate_json` holds
+  it).** So the labelled table the smoke committed is NOT confirmed by
+  its own gate: the label does not earn its keep and the edge is not
+  robust to leaving one window out — the 2026-09-02 xv verdict, now
+  measured per window and per label. No promotion was asked (a single
+  member; its rows ARE the live table — the canonical no-op law) —
+  the "≥ 2 members committed live" tell stays honestly OPEN until a
+  second member can be evidenced (carry needs the funding seed; an
+  authored member needs its own windows). Operator decision pending:
+  keep `fde6f733…` live as the RG7 soak shape regardless (paper), or
+  re-commit `bfbc5349…` now that the on/off delta says the split adds
+  nothing.
+- **2026-09-05 — operator rulings after RG4 (AskUserQuestion): keep
+  `fde6f733…` live as the soak shape; next = RG6 (dashboard); the
+  smoke's leftover cuts under the research vault deleted (23 GiB free).
+  RG6 was NOT started in the RG4 session (context budget) — the map
+  below is the session's hand-off, gathered read-only from the tree so
+  the next session starts at the design, not the archaeology.**
+  - **Server (`crates/core-metrics/src/server.rs`)**: `serve_metrics`
+    (`:62`) = a plain non-blocking `TcpListener` accept loop
+    (`ACCEPT_TIMEOUT` 200 ms), one connection at a time, `handle_one`
+    (`:141`) routes `/metrics` (`:150`) and `/healthz` (`:168`) — the
+    `/state` branch goes beside `/healthz`; body written in place past
+    `HEADER_BUDGET = 256` into `resp` (`RESP_BUF_SIZE = 128 * 1024` at
+    `:56` → raise to 256 KiB), `write_headers`/`format_u64` reusable;
+    the data source today is the live `Arc<MetricsRegistry>` atomics
+    (`registry.rs:232` `encode_prometheus` with its private `Cursor`
+    `put/put_u64/put_i64` = the precedent for the hand-written JSON
+    writer). `/state` is the first consumer that needs a snapshot cell
+    handed to the server thread (`bin/multivenue-engine.rs:1809-1832`
+    spawns `metrics-http` with `serve_metrics(bind, reg, stop, on_event)`
+    — clone the new cell into that closure). Loopback tests:
+    `crates/core-metrics/tests/server_loopback.rs`.
+  - **Seqlock**: `tui::SnapshotCell` (`crates/tui/src/lib.rs:144-233`,
+    `#[repr(C, align(64))]`, `publish`/`read`, single-writer
+    debug_assert) carries `DashboardState` (≈ 640 B, `:57-100`); the ONLY
+    publish site is `paper.rs:4366-4403` inside `engine_loop_full`'s
+    `if now >= next_report` (5 s, `REPORT_PERIOD_NS` `paper.rs:108`);
+    the cell exists only under `--tui` (`Observability::build`
+    `paper.rs:2898`, field `snapshot` `:2999`). RG6: make the cell
+    generic over its POD (or add `StateCell<EngineSnapshot>`), publish
+    every 1 s (`SNAPSHOT_PERIOD_NS`, a second `next_state` gate beside
+    `next_report`; `now_ns()` in hand at `:4156`), create it regardless
+    of `--tui`; the TUI reads the same snapshot.
+  - **TUI** (`crates/tui/src/lib.rs`): `run_dashboard(cell, stop)`
+    `:253`, 30 Hz frame (`FRAME_PERIOD` `:244`), panels `render_header`
+    `:329` / `render_markets` `:349` / `render_last_order` `:391` /
+    `render_latency` `:412` / `render_ingest_health` `:441` (labels bits
+    0..6 only — bybit at bit 7 is invisible); `recent_tob*` AND
+    `last_order_*` are never filled (dead); the "~10 ms" claim at `:12`
+    and `:204` is wrong (5 s) — correct both. Alignment test
+    `dashboard_state_is_cache_aligned`.
+  - **The generic boundary**: `engine_loop_full` is generic over
+    `S: Strategy`; every strategy datum crosses through
+    `strategy_core::StrategyCounters` (`crates/strategy-core/src/lib.rs:
+    83-204`, default-0 accessors: `enabled_mask` `:593`, `icdp_counters`
+    `:192`, `regime_counters` `:201`, `vm_*`). New accessors needed
+    (default-empty, so every other strategy is untouched): `is_halted`
+    (`StrategySet::is_halted` `strategy-set:436` exists, not exposed),
+    per-slot orders emitted/dropped (today only the 7-member sum
+    `strategy-set:554-572` + the vm breakout `:609`), vm
+    `active_hash128()`/`staged_hash128()`/`active_epoch()`/`rows_active()`
+    (exist, `strategy-vm:360-378`), the per-row view (`positions:
+    [VmPosition; RULE_TABLE_ROWS]` `:216` + `row_gate: [u8; …]` `:220`
+    are private — add a `vm_row(i) -> VmRowView {idx, name_h, sym,
+    state, side, entry_px_1e6, entry_ts_ns, gate}` reading
+    `tables[active].rows[i]` (`RuleRowV2`) + `positions[i]` +
+    `row_gate[i]`), icdp `params_hash()`/`instruments()`
+    (`strategy-icdp:505/511`, boot-logged only), regime `rel` per
+    breadth sym (`RegimeView::rel_of` `core-regime:467`; not in
+    `RegimeCounters` `strategy-core:211-246`).
+  - **Sources already reachable from the loop**: `AiIngressStatus`
+    (`ingress-ai/src/status.rs:26`, `eng.ai_status()`), `IngressStatus`
+    ×venue (`core-metrics/src/ingress_status.rs:177-237`, 128 B each,
+    `feed_delay_ema_ms`, `stale_ticks_total`; last-tick AGE is derived
+    only in the loop — `tick_age_track` `paper.rs:4138`, venue order
+    pm/bn/okx/deribit/hl/bybit/rpc), latency `Engine::{ingest,decide,
+    ack}_{p50,p99}_ns()` (`engine/src/lib.rs:666-692`), capture
+    `fill/order_capture_records/io_errors` (`:815-848`), regime words
+    via `RegimeCounters`.
+  - **Boot info**: NOTHING exists — no `build.rs` in the workspace, no
+    pid/git-sha/build-ts anywhere; `requested_mask` and `configured`
+    are computed in `engine_loop_set_full` (`paper.rs:2459-2475`) and
+    dropped (only `mask` survives); `run_dir`/`epoch_ns` come from
+    `cli::new_capture_run_dir` (`bin:715`, `paper.rs:221`) and are not
+    threaded in; artifact hashes = `vm.active_hash128()`,
+    `IcdpStrategy::params_hash() -> &[u8;32]`, `RegimeBoot.hash`
+    (`paper.rs:2598`), seed rows = `RegimeCounters.seed_rows`. RG6:
+    a `BootInfo` POD threaded `bin` → `engine_loop_set_full` →
+    `engine_loop_full` (+ `Observability`), a workspace `build.rs` for
+    the cli crate (`git rev-parse` + build ts via `option_env!`
+    fallbacks — never a hard dependency on git at build time).
+  - **Orders / fills — no in-memory ring exists** (only counters and
+    the PMLR write-through). Choke points: `EngineCtx::submit`
+    (`engine/src/lib.rs:908`, `Order` 64 B carries ts/sym/side/kind/
+    px/qty/client_oid/venue/strategy_id/ttl — the `Ok` arm beside
+    `cap.append(&order)`), and the two fill drains in `Engine::tick`
+    (`:436-465` fill lanes, `:467-496` dispatcher pump; `Fill` 64 B has
+    NO strategy_id — join by `order_id == client_oid` against the order
+    ring, or leave the slot out). `EngineCtx` is rebuilt per callback at
+    11 sites — the rings live on `Engine`, reborrowed like
+    `order_capture`.
+  - **Conventions**: `static_assert_size!` (`core-types:2584`);
+    `#[repr(C, align(64))]` + explicit `_pad` + `const fn empty()`;
+    alloc gate = `crates/bench/tests/alloc_assertions.rs` (copy
+    `dashboard_snapshot_read_is_zero_alloc` `:999-1020` for the
+    publish/read AND the JSON encode of a FULL snapshot — 256 rows,
+    64 + 64 recents — into a 256 KiB buffer; truncation = test
+    failure, not a runtime branch).
+  - **Worker half (Python, §6.2)**: `python -m claude_worker.dashboard`
+    — stdlib `http.server` on 127.0.0.1:9292, `/` = one
+    `dashboard.html` (inline CSS+JS, no CDN; a licence comment header —
+    §11-Q9 open), `/api/worker` (rulesets catalog, library + evidence +
+    compositions via the RG4 readers, regime history 24 h +
+    `declared.json`, latest `pnl-<day>.json` per strategy and regime,
+    candidates, events tail 100, positions from the existing code
+    path, config snapshot — `strategy.conf`, `fees.toml`, `regime.toml`,
+    `icdp.toml` hash + instruments, universe summary, Data-volume free
+    — never `.env`), `/api/engine/state` + `/api/engine/metrics`
+    same-origin proxies to 9191; cadence engine 2 s / worker 10 s /
+    P&L 30 s; `launchd/com.multivenue.dashboard.plist` (RunAtLoad,
+    KeepAlive) + `install-launchd.sh` + a `local-setup.md` line; pytest
+    for the `/api/worker` shape on a tmp worker dir. Write controls are
+    NOT in v1 (§10).
+  - **Order of work**: engine half first (snapshot POD + accessors +
+    BootInfo + rings + 1 s publish + `/state` writer + tests + alloc
+    gate + `make lint`), relink + launchd restart + `curl /state`, then
+    the TUI, then the worker page, then the live check of every panel
+    (screenshot into the vault, never git). Exit tell (§7): page live
+    on 9292 showing regime, mask, rows, P&L, recent fills.
+- **RESUME POINT (for a fresh session):** RG4 is code-complete on disk
+  (commit status = the operator's; gates at the end of the RG4 entry);
+  the live composition run and the rulings are recorded above. Next =
+  **RG6** per the hand-off map directly above (§6 is the spec; add
+  `stage_refused` and the per-row gate bytes the smoke asked for).
+  Alternative the operator may order first: the harness FUNDING SEED
+  (the carry member's blocker — `window_root` writes `funding-seed.tsv`
+  per window from candles.db, `crates/cli backtest --funding-seed`
+  replays it before the first tick) to close the RG4 "≥ 2 members"
+  tell. RG7's "5 paper days" wording is VOID under the 2026-09-05
+  ruling — restate it as N ≤ 2 h windows when RG7 opens. Laws unchanged
+  (see the RG3 resume point) + the 2 h test/soak/protect law. Relaunch
+  prompt: "Continue the regime lane in trading-engine-multivenue. Read
+  CLAUDE.md CURRENT STATE (regime bullet), then
+  `docs/regime-and-dashboard-plan.md` §12 last two entries (the RG6
+  hand-off map + RESUME POINT). Start RG6 — engine half first. Laws:
+  regime is a gate not a signal; exits never gated; legacy rows
+  bit-identical; no table flip on regime change; capture windows and
+  every test/soak/protect time ≤ 2 h; research never in git;
+  compile/test only on the Mac via RustRover (nohup + poll for > 45 s);
+  Python full `import x` only; SPDX header on every new file;
+  explicit-path `git add`, commit only on my ask, never push; tell me
+  when short on context with a resume prompt."
+- **2026-09-05 — RG6 ENGINE + TUI halves CODE-COMPLETE (uncommitted —
+  operator commits; explicit paths listed below). Engine half, per the
+  hand-off map:** new crate `crates/engine-snapshot` (`license.workspace
+  = true`; deps `core-types` + `strategy-core`; no new external
+  dependency ⇒ no `license-deps` run) = `EngineSnapshot` (≈ 21 KB POD,
+  `#[repr(C, align(64))]`, size-pinned ≤ 32 KB) + `BootInfo` + the
+  section PODs + `RecentRing<T, N>` + the generic seqlock
+  `SnapshotCell<T>` (moved out of `tui`, `_pad` so `data` starts on its
+  own line for any `T`; `publish(&T)` copies once, `read_into(&mut T)`
+  for the 24 KB reader) + `encode_state_json` (sticky-overflow cursor,
+  the §6.1 number law, `STATE_JSON_MAX` 160 KiB) + tests (`tests/
+  encode.rs`: a FULL snapshot — 256 rows, 64 + 64 recents, every text
+  field at capacity, every scalar at its widest — fits and is balanced;
+  one byte short is refused; a fixed snapshot renders BYTE-EXACT (the
+  schema pin); recents render oldest-first with ages). `strategy-core`:
+  `SlotCounters` / `VmRowView` (48 B) / `RegimeRelView` (`REGIME_REL_SYMS`
+  = 32, const-asserted against `core_regime::REGIME_MAX_SYMS` in the set)
+  + default-empty accessors `is_halted` / `slot_counters(slot)` /
+  `vm_active_hash128` / `vm_staged_hash128` / `vm_rows_view(&mut [..])` /
+  `icdp_params_hash` / `icdp_instruments` / `regime_rel_view`;
+  `strategy-set` overrides all eight; `strategy-vm::rows_view` (row +
+  position + gate byte per active row). `engine`: `recent_orders` /
+  `recent_fills` rings on `Engine` (push in `EngineCtx::submit`'s Ok arm
+  beside the intent capture — accepted orders only — and in both fill
+  drains; `EngineCtx` reborrows the ring at all 11 sites). `core-metrics`
+  stays dependency-free: `serve_metrics(addr, registry, state:
+  Option<F>, stop, on_event)` with `F: FnMut(&mut [u8]) -> Result<usize,
+  EncodeErr>` (`StateFn` = the `None` spelling), `GET /state` →
+  `application/json` (404 without a writer, 500 on overflow — never
+  truncated), `RESP_BUF_SIZE` 128 → 256 KiB, `write_body` shared with
+  `/metrics`; loopback tests for all three outcomes. `cli`:
+  `Observability.state` (the cell, created whenever `/metrics` is) +
+  `.boot: BootInfo` (`with_boot_info`; `boot_info()` = pid, wall anchor,
+  binary mtime, `MULTIVENUE_GIT_SHA`, run dir/epoch, `--strategy`,
+  paper); `engine_loop_set_full` stamps `requested_mask`/
+  `configured_mask`; the set arm stamps `regime_hash`/`regime_configured`
+  from `RegimeBoot`; `run_engine_loop` gains the 1 s `next_state` gate
+  (before the 5 s gate) = `update_tick_age` (the T1(c) stamps moved here
+  — the 5 s gauges read them) + `fill_snapshot` (every source: the
+  `StrategyCounters` UFCS route, engine counters/percentiles/captures/
+  rings, `AiIngressStatus`, the seven `IngressStatus` slots) + one
+  `publish`; `state_writer(cell)` = the server thread's boxed scratch +
+  `read_into` + encode; `crates/cli/build.rs` (git sha, soft; re-runs
+  on `.git/HEAD` + its ref only). **TUI half (§6.3):** `crates/tui`
+  rewritten over `EngineSnapshot` — `DashboardState`, `MAX_TOB_SLOTS`,
+  the dead `recent_tob`/`last_order_*` and the "~10 ms" claim are GONE;
+  panels = header (pid / strategy / masks / halted / uptime / git / seq;
+  counters; two regime chips decoded through the §3.3 byte map with
+  declared age/TTL + minutes judged), Strategies (slot / member / cfg /
+  on / gate / orders / drop), Recent orders (newest first, 8 of 64),
+  Ruleset (hash / rows / epoch / staged / fires / blocked / hard_exits +
+  every active row with gate, position, side, entry px, age), Latency,
+  Ingress (7 venues: state / last tick / ticks / stale / delay / reconn);
+  `run_dashboard(&SnapshotCell<EngineSnapshot>, stop)`; the bin spawns
+  it on `obs.state` under `--tui`; `Observability::build(enable_metrics)`
+  lost its `enable_tui` parameter and the 5 s `DashboardState` publish
+  block is deleted; tui deps = `core-types` + `engine-snapshot` (+
+  `strategy-core` dev). **Gates (2026-09-05, all on the Mac):** nextest
+  1593 passed / 1 skipped (was 1578); alloc gate **42/42 0 B/op** with a
+  fresh `Compiling bench` (the old `dashboard_snapshot_read_is_zero_alloc`
+  is superseded by **gate 43** `state_snapshot_publish_read_encode_is_
+  zero_alloc` — a FULL snapshot published + read back + encoded into a
+  256 KiB buffer 1 000×, 0 B); `make lint` green; `make license-check`
+  OK; `cargo build --release -p cli` relinked 14:57:16 local with the
+  head sha `61b9ab865ab4` embedded. **LIVE `/state` CHECK PASSED
+  2026-09-05 08:02Z (operator-approved restart: `pkill -TERM` → KeepAlive
+  reboot on the relinked binary, pid 75758, run
+  `run-1788595347123757000`):** boot tell `metrics: HTTP server starting
+  bind=127.0.0.1:9191 state=true`; `/state` 15 s after boot = `"v": 1`,
+  `boot.git_sha 61b9ab865ab4`, `binary_mtime_ns` = the 14:57 relink,
+  `strategy ai+icdp` / `set`, masks req 112 / cfg 113 / on 112, `paper`
+  1, `regime_configured` 1 with `seed_rows 10738`, both profiles
+  measured (`dims [2,1,1,128,128,2,1]` = trend NEUTRAL · shape CHOP · vol
+  LOW · fund/level UNKNOWN · stretch NEUTRAL · source MEASURED — the
+  raw one-hot bytes, decoded by bit index), `rel` = 7 syms (BTC ref 255
+  + six members INLINE), `icdp` configured `407e064b…` 8 instruments
+  with `decisions` climbing (16 → 48), all six WS venues `state 2` with
+  last-tick ages 0–2 s and feed-delay EMAs (deribit 134 ms, hl 147 ms),
+  rpc down (as always), captures 0 errors, body 5.5 KB. After the #7b
+  recommit (seq 39436/39437) at ~70 s: `vm.active_hash fde6f733…`,
+  `rows_active 2`, `epoch 1`, and the two labelled rows carry THEIR OWN
+  GATE BYTES — row 0 (`vol:low`) `gate 1` = open, row 1 (`vol:!low`)
+  `gate 0` = soft-closed under the live LOW vol — the per-row gate the
+  RG5 smoke asked for, now observable; `ai.cmds 159`, `ruleset_staged
+  1`, `ruleset_committed 1`, `heartbeat_age_s 8`; `/metrics`
+  `engine_vm_rows_active 2` (the post-restart law holds).
+  **WORKER PAGE (§6.2) CODE-COMPLETE + LIVE-CHECKED the same session
+  (08:16Z):** `claude_worker/dashboard.py` (module, `python -m
+  claude_worker.dashboard`; stdlib `http.server` on 127.0.0.1:9292,
+  single-threaded, read-only; `Inputs` resolved once from env —
+  `CLAUDE_WORKER_DB` / `_REPLAY_DIR` / `_REPORTS_DIR` / the new
+  `CLAUDE_WORKER_MULTIVENUE_DIR` / `CLAUDE_WORKER_ENGINE_URL` /
+  `CLAUDE_WORKER_DASHBOARD_PORT`; `worker_payload()` = rulesets
+  (`rulesets_all`), library + per-member evidence roll-ups, compositions
+  (the RG4 readers), regime = 24 h `history_tail` + `load_declared` +
+  the `regime.toml` bands (`read_regime_params`) + the byte map for the
+  page, pnl = the latest `pnl-<day>.json` minus `runs_detail` + a
+  14-day series, candidates (`*.json` only), the events ledger tail
+  (100, read-only SQLite), positions from the CURRENT run's fills
+  (`features.read_fills` → `reconstruct_positions` → `position_views`
+  with marks carried at cost — no tick scan at cadence), config
+  snapshot (`strategy.conf`, `fees.toml`, `regime.toml`, `icdp.toml`
+  sha256 + `[[instrument]]` count, `universe.toml` per-list counts,
+  `retention.conf`; `.env` is never read and the test asserts no
+  `sk-ant`/`.env` in the document), Data-volume free; server-side cache
+  5 s (positions 30 s); `/api/engine/state` + `/api/engine/metrics` =
+  allow-listed same-origin proxies to 9191 (502 when down); `--once`
+  prints the document); `dashboard/dashboard.html` (one file, inline
+  CSS+JS, vanilla, no CDN — the test asserts no `<script src`/`<link`/
+  URL; SPDX comment header; engine 2 s / worker 10 s; panels: status
+  bar, Regime (effective/measured/declared per profile with raw ret/ER/
+  RV/stretch + flips, rel per breadth sym, slot gates, the 24 h
+  per-dimension timeline strips, the bands table, declared.json with
+  in-force/expired), Strategies (slot table + today's net @0/1/tier
+  from the report), P&L (per strategy, per ruleset, per regime word,
+  day series), Ruleset (registry thesis/author + composition link + the
+  rows with gate/position), Library (+ candidates), Recent trades
+  (orders newest-first with slot colour, fills joined by oid), Ingress,
+  Latency & loop, AI plane (+ ledger tail), Positions, Configs);
+  `tests/test_dashboard.py` (document shape on a tmp worker dir incl.
+  the no-db case, loopback routes 200/200/502/404, `--once`); worker
+  pytest **713** (frozen 202 inside), ruff clean. **CMDLINE LAW
+  (found while wiring launchd):** every lane's overlap guard is `pgrep
+  -f 'claude[-_]worke[r]'`, which a long-running server whose cmdline
+  carried `claude_worker`/`claude-worker` (a `-m` module path, the
+  venv's own `claude-worker/.venv/bin/python3`) would trip FOREVER —
+  the boot-time recommit `while pgrep …` would never restore the live
+  table. Hence `scripts/dashboard.sh` execs `~/multivenue/venv/bin/
+  python3 scripts/dashboard-serve.py` (a directory symlink alias of the
+  venv — Python finds `pyvenv.cfg` through the unresolved path — and a
+  repo-root launcher), verified live: `pgrep -f 'claude[-_]worke[r]'`
+  prints nothing while the page serves. `launchd/com.multivenue.
+  dashboard.plist` (RunAtLoad, KeepAlive, `dashboard.log`) +
+  `install-launchd.sh` (both loops) + `docs/local-setup.md` (uninstall
+  list + a Dashboard paragraph). **LIVE CHECK 08:16Z (hand-run
+  wrapper, not yet bootstrapped in launchd):** `/ 200 28.7 KB`,
+  `/api/worker 200 47.7 KB in 21 ms`, `/api/engine/state 200 12.1 KB`,
+  `/api/engine/metrics 200`, `/nope 404`; every panel populated from
+  the live engine + worker (35 history points 04:59→08:15Z, 7 library
+  members, 3 day reports, 40 recent orders, 6 venues UP, the two vm
+  rows with their gate bytes) — the frozen record (page + both JSON
+  documents, self-replaying `index.html`) is in the vault at
+  `docs/research/rg6-dashboard-live-2026-09-05/` (git-excluded; the
+  §7 "screenshot in the vault" tell). Not yet done: bootstrapping
+  `com.multivenue.dashboard` (operator lever), the RG6 close ruling. Pitfall-10 note for the next
+  session: three "impossible" unresolved-import errors in a row today
+  were stale rmeta after edits to `strategy-core` / `core-metrics` —
+  `cargo clean -p <crate>` fixed each; and a sandbox-side `git status`
+  left a stale `.git/index.lock` (removed on the Mac; use the Mac lane
+  for every git read too).
+- **RESUME POINT (for a fresh session):** RG6 engine + TUI halves are
+  code-complete on disk (commit status = the operator's; paths: `Cargo.
+  toml` `Cargo.lock` `crates/engine-snapshot/` `crates/cli/build.rs`
+  `crates/cli/Cargo.toml` `crates/cli/src/{lib.rs,paper.rs,bin/
+  multivenue-engine.rs}` `crates/core-metrics/{src/lib.rs,src/server.rs,
+  tests/server_loopback.rs}` `crates/engine/{Cargo.toml,src/lib.rs}`
+  `crates/strategy-core/src/lib.rs` `crates/strategy-set/src/lib.rs`
+  `crates/strategy-vm/src/lib.rs` `crates/tui/{Cargo.toml,src/lib.rs}`
+  `crates/bench/{Cargo.toml,tests/alloc_assertions.rs}` `docs/regime-
+  and-dashboard-plan.md` `CLAUDE.md` — the RG4 worker files are a
+  SEPARATE uncommitted set, stage them separately; the worker page adds
+  `claude-worker/src/claude_worker/dashboard.py`, `claude-worker/src/
+  claude_worker/dashboard/dashboard.html`, `claude-worker/tests/
+  test_dashboard.py`, `scripts/dashboard.sh`, `scripts/dashboard-
+  serve.py`, `launchd/com.multivenue.dashboard.plist`, `scripts/
+  install-launchd.sh`, `docs/local-setup.md`). The live `/state` check
+  PASSED and the worker page is LIVE-CHECKED (entry above). Remaining
+  for RG6: bootstrap `com.multivenue.dashboard` (operator: `launchctl
+  bootstrap gui/$UID ~/Library/LaunchAgents/com.multivenue.dashboard.
+  plist` after rendering the template, or re-run `install-launchd.sh`
+  which also restarts the engine), then the §7 close ruling. Then RG7
+  (restated as N ≤ 2 h windows). Historical note — the order of work
+  was: (2) the worker page
+  `python -m claude_worker.dashboard` (§6.2 + the hand-off map's worker
+  bullet: stdlib `http.server` on 127.0.0.1:9292, `dashboard.html`
+  inline CSS+JS no CDN, `/api/worker`, same-origin proxies to 9191,
+  `launchd/com.multivenue.dashboard.plist` + `install-launchd.sh` +
+  `local-setup.md`, pytest for the `/api/worker` shape; the page decodes
+  `regime.profiles[].*.dims` with the §3.3 byte map — mirror
+  `claude_worker/regime.py`'s names); (3) the live check of every panel
+  (screenshots into the vault, never git) = the §7 RG6 exit tell.
+  Alternative the operator may order first: the harness FUNDING SEED
+  (RG4's carry blocker). Laws unchanged (RG3/RG4 resume points + the 2 h
+  law). Relaunch prompt: "Continue the regime lane in
+  trading-engine-multivenue. Read CLAUDE.md CURRENT STATE (regime
+  bullet), then `docs/regime-and-dashboard-plan.md` §12 last two entries
+  (RG6 engine+TUI landing + RESUME POINT) and §6.1 'As landed' (the
+  `/state` contract). Continue RG6 — the worker dashboard page next
+  (§6.2), then the live panel check. Laws: regime is a gate not a
+  signal; exits never gated; legacy rows bit-identical; no table flip on
+  regime change; capture windows and every test/soak/protect time ≤ 2 h;
+  research never in git; compile/test only on the Mac via RustRover
+  (nohup + poll for > 45 s); Python full `import x` only; SPDX header on
+  every new file; explicit-path `git add`, commit only on my ask, never
+  push; tell me when short on context with a resume prompt."

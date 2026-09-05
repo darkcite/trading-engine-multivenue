@@ -1,0 +1,16 @@
+[package]
+name         = "engine-snapshot"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "RG6: the engine's 1 s observability snapshot — one #[repr(C, align(64))] POD, the single-writer seqlock cell that carries it off the engine thread, and the hand-written zero-alloc JSON writer behind GET /state."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-types    = { workspace = true }
+strategy-core = { workspace = true }

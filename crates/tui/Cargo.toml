@@ -6,13 +6,16 @@ rust-version.workspace = true
 license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
-description  = "Read-only ratatui dashboard. Consumes a snapshot page published by the engine thread — never touches the hot path directly."
+description  = "Read-only ratatui dashboard over the engine's 1 s EngineSnapshot (the same POD GET /state serves) — never touches the hot path directly."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-core-types   = { workspace = true }
-book-builder = { workspace = true }
-ratatui      = { workspace = true }
-crossterm    = { workspace = true }
+core-types      = { workspace = true }
+engine-snapshot = { workspace = true }
+ratatui         = { workspace = true }
+crossterm       = { workspace = true }
+
+[dev-dependencies]
+strategy-core   = { workspace = true }

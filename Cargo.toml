@@ -48,6 +48,7 @@ members = [
 
     # --- engine + UI ---
     "crates/engine",
+    "crates/engine-snapshot",
     "crates/cli",
     "crates/tui",
 
@@ -169,8 +170,9 @@ strategy-vm           = { path = "crates/strategy-vm" }
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 signer-eip712   = { path = "crates/signer-eip712" }
 
-engine = { path = "crates/engine" }
-tui    = { path = "crates/tui" }
+engine          = { path = "crates/engine" }
+engine-snapshot = { path = "crates/engine-snapshot" }
+tui             = { path = "crates/tui" }
 
 # ---------------------------------------------------------------
 # Profiles

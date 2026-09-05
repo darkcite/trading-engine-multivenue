@@ -36,6 +36,7 @@ use core_types::{
     AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTableSlot, Signal, Tick, VenueId,
     AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
+use engine_snapshot::{RecentRing, RECENT_FILLS, RECENT_ORDERS};
 use ingress_ai::AiIngressStatus;
 use strategy_core::{Ctx, Strategy, StrategyError, SubmitErr};
 
@@ -242,6 +243,14 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// rides [`Self::maybe_flush_fill_capture`]'s caller cadence via
     /// [`Self::maybe_flush_order_capture`] + the [`Self::stop`] drain.
     order_capture: Option<SlotCapture<Order>>,
+    /// RG6 `/state` `recent` section: the last [`RECENT_ORDERS`]
+    /// orders the dispatcher ACCEPTED (pushed in `EngineCtx::submit`
+    /// beside the intent capture — same "what was taken" law) and the
+    /// last [`RECENT_FILLS`] fills dispatched (both drains). Fixed
+    /// rings, one 64 B store per event; the cli copies them into the
+    /// 1 s snapshot by value.
+    recent_orders: RecentRing<Order, RECENT_ORDERS>,
+    recent_fills: RecentRing<Fill, RECENT_FILLS>,
     last_timer_ns: NsTs,
     /// Number of iterations completed (wraps on u64; for paper-mode stats).
     pub iterations: u64,
@@ -333,6 +342,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             ai_drain_malformed: 0,
             fill_capture: None,
             order_capture: None,
+            recent_orders: RecentRing::new(ZERO_ORDER),
+            recent_fills: RecentRing::new(ZERO_FILL),
             last_timer_ns: 0,
             iterations: 0,
             ticks_dispatched: 0,
@@ -355,6 +366,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             disp: &mut self.disp,
             decide_lat: &self.decide_lat,
             order_capture: self.order_capture.as_mut(),
+            recent_orders: &mut self.recent_orders,
             now: now_ns(),
         };
         self.strat.on_start(&mut ctx)
@@ -400,6 +412,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
                             now,
                         };
                         self.strat.on_tick(&t, &mut ctx);
@@ -423,6 +436,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
                         order_capture: self.order_capture.as_mut(),
+                        recent_orders: &mut self.recent_orders,
                         now,
                     };
                     self.strat.on_signal(&s, &mut ctx);
@@ -448,10 +462,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         if let Some(cap) = self.fill_capture.as_mut() {
                             cap.append(&f);
                         }
+                        self.recent_fills.push(f);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
                             now,
                         };
                         self.strat.on_fill(&f, &mut ctx);
@@ -481,10 +497,12 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     if let Some(cap) = self.fill_capture.as_mut() {
                         cap.append(&f);
                     }
+                    self.recent_fills.push(f);
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
                         order_capture: self.order_capture.as_mut(),
+                        recent_orders: &mut self.recent_orders,
                         now,
                     };
                     self.strat.on_fill(&f, &mut ctx);
@@ -512,6 +530,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
                             now,
                         };
                         self.strat.on_venue_event(&e, &mut ctx);
@@ -539,6 +558,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
                             now,
                         };
                         self.strat.on_depth(&d, &mut ctx);
@@ -567,6 +587,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
                             now,
                         };
                         self.strat.on_opt_summary(&o, &mut ctx);
@@ -633,6 +654,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
                             now,
                         };
                         self.strat.on_ai(&cmd, &mut ctx);
@@ -654,6 +676,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     disp: &mut self.disp,
                     decide_lat: &self.decide_lat,
                     order_capture: self.order_capture.as_mut(),
+                    recent_orders: &mut self.recent_orders,
                     now,
                 };
                 self.strat.on_timer(now, &mut ctx);
@@ -860,6 +883,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             disp: &mut self.disp,
             decide_lat: &self.decide_lat,
             order_capture: self.order_capture.as_mut(),
+            recent_orders: &mut self.recent_orders,
             now: now_ns(),
         };
         self.strat.on_stop(&mut ctx);
@@ -893,7 +917,42 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn ai_status(&self) -> &AiIngressStatus {
         &self.ai_status
     }
+
+    /// RG6: the last accepted orders (cli snapshot publish).
+    #[inline]
+    pub fn recent_orders(&self) -> &RecentRing<Order, RECENT_ORDERS> {
+        &self.recent_orders
+    }
+
+    /// RG6: the last dispatched fills (cli snapshot publish).
+    #[inline]
+    pub fn recent_fills(&self) -> &RecentRing<Fill, RECENT_FILLS> {
+        &self.recent_fills
+    }
 }
+
+/// Ring filler for `recent_orders` (never rendered: the ring's
+/// `total` bounds every read).
+const ZERO_ORDER: Order = Order::new(
+    0,
+    VenueId::Polymarket,
+    0,
+    core_types::Side::Bid,
+    0,
+    core_types::Price::from_raw(0),
+    core_types::Qty::from_raw(0),
+    0,
+);
+
+/// Ring filler for `recent_fills` (same law).
+const ZERO_FILL: Fill = Fill::new(
+    0,
+    0,
+    core_types::Side::Bid,
+    core_types::Price::from_raw(0),
+    core_types::Qty::from_raw(0),
+    0,
+);
 
 /// Concrete `Ctx` passed into strategy callbacks.
 struct EngineCtx<'a, D: OrderDispatch> {
@@ -902,6 +961,8 @@ struct EngineCtx<'a, D: OrderDispatch> {
     /// M4.1 intent log — reborrowed from the engine per callback;
     /// `None` when the cli wired no capture (tests, replay tooling).
     order_capture: Option<&'a mut SlotCapture<Order>>,
+    /// RG6 `recent` ring — reborrowed like the intent log.
+    recent_orders: &'a mut RecentRing<Order, RECENT_ORDERS>,
     now: NsTs,
 }
 
@@ -921,6 +982,7 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
                 if let Some(cap) = self.order_capture.as_deref_mut() {
                     cap.append(&order);
                 }
+                self.recent_orders.push(order);
                 Ok(())
             }
             Err(_) => Err(SubmitErr::RingFull),

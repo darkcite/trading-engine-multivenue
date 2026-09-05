@@ -3,32 +3,26 @@
 
 //! # tui
 //!
-//! Read-only `ratatui` dashboard. Consumes a snapshot page
-//! published by the engine thread via a [`SnapshotCell`] — never
-//! touches the hot path directly.
+//! Read-only `ratatui` dashboard. Renders the engine's 1 s
+//! [`EngineSnapshot`] (RG6, `docs/regime-and-dashboard-plan.md` §6.3)
+//! — the same POD `GET /state` serves — and never touches the hot
+//! path.
 //!
 //! ## Architecture
 //!
-//! 1. The engine periodically (every ~10 ms) packs counters +
-//!    top-of-book + ingest health into a [`DashboardState`] and
-//!    calls `SnapshotCell::publish(state)`.
+//! 1. The engine loop publishes an [`EngineSnapshot`] into the
+//!    `engine-snapshot` seqlock once per second (`SNAPSHOT_PERIOD_NS`
+//!    in the cli).
 //! 2. The TUI thread runs `run_dashboard(cell, stop)` at ~30 Hz,
-//!    reading the latest snapshot via `cell.read()` and rendering
-//!    a four-panel ratatui layout.
-//! 3. On SIGINT the engine drops the snapshot, the TUI sees `stop`
-//!    flip, restores the terminal, and exits.
+//!    copying the latest snapshot out under the version bracket and
+//!    rendering: header (identity, mask, regime chips, counters),
+//!    Strategies (slot / enabled / gate / orders), Ruleset (active
+//!    table + rows), Recent orders, Latency, Ingress.
+//! 3. On SIGINT the TUI sees `stop` flip, restores the terminal, and
+//!    exits.
 //!
-//! The cell is a single-writer **seqlock**: a version counter
-//! (odd = write in flight) bracketing a plain `DashboardState`
-//! slot. The engine's `publish` is wait-free (two atomic stores +
-//! one POD copy); the TUI's `read` retries only if it observed a
-//! concurrent write. Chosen over `std::sync::Mutex` in Phase 8a:
-//! on Darwin, std's `Mutex` falls back to the pthread
-//! implementation, which lazily heap-allocates its 64-byte
-//! `pthread_mutex_t` on first lock — a hidden allocation on the
-//! engine thread that broke the zero-alloc gate on macOS. The
-//! seqlock has no OS object, no poisoning, and identical behaviour
-//! on every platform.
+//! Rendering allocates (`ratatui` strings) — this is the TUI thread,
+//! not the engine; the seqlock read itself is allocation-free.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -40,208 +34,20 @@
     clippy::undocumented_unsafe_blocks
 )]
 
-use std::cell::UnsafeCell;
 use std::io;
-use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use book_builder::TopOfBook;
-use core_types::SymbolId;
-
-/// How many recent top-of-book snapshots the dashboard surfaces.
-pub const MAX_TOB_SLOTS: usize = 8;
-
-/// Dashboard snapshot. Produced by the engine, rendered by the TUI
-/// thread. `Copy` so the TUI grabs it by value and renders without
-/// racing against the producer.
-#[derive(Copy, Clone, Debug)]
-#[repr(C, align(64))]
-pub struct DashboardState {
-    /// Total ticks dispatched since boot (PM + BN combined).
-    pub ticks_dispatched: u64,
-    /// Total signals dispatched since boot.
-    pub signals_dispatched: u64,
-    /// Total orders the strategy emitted via `ctx.submit`.
-    pub orders_emitted: u64,
-    /// Orders the dispatcher dropped (ring-full / network errors).
-    pub orders_dropped: u64,
-    /// Total fills observed.
-    pub fills_seen: u64,
-    /// Engine iterations.
-    pub iterations: u64,
-
-    /// p99 latency per stage (ns). 0=ingest→strategy,
-    /// 1=strategy→submit, 2=submit→ack.
-    pub p99_ns: [u64; 3],
-    /// p50 latency per stage (ns). Same indices as p99.
-    pub p50_ns: [u64; 3],
-
-    /// Most recently updated markets.
-    pub recent_tob: [TopOfBook; MAX_TOB_SLOTS],
-    /// Populated prefix of [`recent_tob`].
-    pub recent_tob_count: u32,
-
-    /// Most recently emitted order — symbol.
-    pub last_order_sym: SymbolId,
-    /// Most recently emitted order — price (1e6 fixed-point).
-    pub last_order_px_1e6: i64,
-    /// Most recently emitted order — quantity (1e6 fixed-point).
-    pub last_order_qty_1e6: i64,
-    /// Most recently emitted order — side (0 = Bid, 1 = Ask).
-    pub last_order_side: u8,
-
-    /// Ingest health: each bit = 1 → that ingress thread is in
-    /// Steady state. Bit 0 = Polymarket, 1 = Binance, 2 = RPC,
-    /// 3 = RSS (retired 8f — always 0), 4 = OKX, 5 = Deribit,
-    /// 6 = Hyperliquid (Phase 8e — appended; existing bits never
-    /// renumber, retired bits are never reused).
-    pub ingest_health: u8,
-    _pad: [u8; 6],
-}
-
-impl DashboardState {
-    /// Construct an empty snapshot (no ticks observed yet).
-    pub const fn empty() -> Self {
-        Self {
-            ticks_dispatched: 0,
-            signals_dispatched: 0,
-            orders_emitted: 0,
-            orders_dropped: 0,
-            fills_seen: 0,
-            iterations: 0,
-            p99_ns: [0; 3],
-            p50_ns: [0; 3],
-            recent_tob: [TopOfBook::empty(0); MAX_TOB_SLOTS],
-            recent_tob_count: 0,
-            last_order_sym: 0,
-            last_order_px_1e6: 0,
-            last_order_qty_1e6: 0,
-            last_order_side: 0,
-            ingest_health: 0,
-            _pad: [0; 6],
-        }
-    }
-}
-
-impl Default for DashboardState {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-/// Cross-thread snapshot pump. The engine calls `publish`; the TUI
-/// calls `read`. Single-writer seqlock — zero allocation, no OS
-/// lock object, on every platform.
-///
-/// Protocol: `seq` even = slot stable, odd = writer mid-copy. The
-/// writer brackets its copy with an Acquire RMW (odd) and a Release
-/// store (even); readers copy the slot and revalidate the version,
-/// discarding any copy that overlapped a write.
-///
-/// **Single-writer contract:** exactly one thread (the engine
-/// thread) may call `publish`. Enforced by `debug_assert!` only —
-/// a second publisher is a design error upstream.
-#[repr(C, align(64))]
-pub struct SnapshotCell {
-    /// Version counter. Even = stable; odd = write in flight.
-    /// `DashboardState` is `#[repr(align(64))]`, so `data` starts
-    /// on its own cache line and reader version-polling does not
-    /// false-share with the payload copy.
-    seq: AtomicU64,
-    data: UnsafeCell<DashboardState>,
-}
-
-// SAFETY: all cross-thread access to `data` is mediated by the
-// seqlock protocol on `seq`. The single writer (contract above)
-// brackets its non-atomic copy with an odd version (Acquire RMW —
-// the copy cannot be reordered before the odd version is visible)
-// and an even version (Release store — the copy is visible before
-// the new version). Readers copy `data` and then revalidate `seq`
-// behind an Acquire fence, so any copy that overlapped a write is
-// discarded and retried; a torn copy of the `Copy`-POD
-// `DashboardState` (no invalid bit patterns, no pointers) is
-// materialized at most transiently and never returned.
-unsafe impl Sync for SnapshotCell {}
-
-impl SnapshotCell {
-    /// Build an empty cell.
-    pub const fn new() -> Self {
-        Self {
-            seq: AtomicU64::new(0),
-            data: UnsafeCell::new(DashboardState::empty()),
-        }
-    }
-
-    /// Publish the latest snapshot. Wait-free for the (single)
-    /// writer: one Acquire RMW, one POD copy, one Release store.
-    /// Never allocates, never blocks, cannot poison.
-    pub fn publish(&self, s: DashboardState) {
-        let seq0 = self.seq.load(Ordering::Relaxed);
-        debug_assert_eq!(
-            seq0 & 1,
-            0,
-            "SnapshotCell: odd version on publish entry — second concurrent publisher"
-        );
-        // Enter the write section. The Acquire RMW forbids the
-        // payload copy below from being reordered before the odd
-        // version becomes visible (pairs with the readers'
-        // Acquire fence + revalidation).
-        let _prev = self.seq.swap(seq0.wrapping_add(1), Ordering::Acquire);
-        debug_assert_eq!(_prev, seq0, "SnapshotCell: version moved under the writer");
-        // SAFETY: single-writer contract — no concurrent writes to
-        // `data` exist. Concurrent readers may race this non-atomic
-        // copy, but the version bracket makes them discard any copy
-        // that overlapped it (see `Sync` impl note). The pointer is
-        // valid, aligned, and owned by `self`.
-        unsafe { *self.data.get() = s };
-        // Exit the write section: publish the copy to any reader
-        // that observes the new even version.
-        self.seq.store(seq0.wrapping_add(2), Ordering::Release);
-    }
-
-    /// Read the most recent snapshot. Lock-free: retries only while
-    /// a write is in flight (the writer publishes every ~10 ms and
-    /// copies a few hundred bytes — retries are vanishingly rare at
-    /// the TUI's 30 Hz). Never allocates.
-    pub fn read(&self) -> DashboardState {
-        loop {
-            let seq1 = self.seq.load(Ordering::Acquire);
-            if seq1 & 1 != 0 {
-                // Writer mid-copy — spin briefly.
-                std::hint::spin_loop();
-                continue;
-            }
-            // SAFETY: this volatile copy may race the writer's
-            // non-atomic copy; the revalidation below discards any
-            // result that overlapped a write, and a transient torn
-            // copy of the `Copy`-POD `DashboardState` is harmless
-            // (no invalid bit patterns, no pointers). Volatile
-            // forces the copy to complete before the version
-            // re-check. Pointer valid + aligned by construction.
-            let val = unsafe { core::ptr::read_volatile(self.data.get()) };
-            // Pairs with the writer's bracket: if the copy above
-            // overlapped a write, the version has moved (odd or
-            // advanced) and we retry.
-            fence(Ordering::Acquire);
-            if self.seq.load(Ordering::Relaxed) == seq1 {
-                return val;
-            }
-        }
-    }
-}
-
-impl Default for SnapshotCell {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// -----------------------------------------------------------------
-// Renderer
-// -----------------------------------------------------------------
+use core_types::regime::{DIM_COUNT, DIM_SOURCE};
+use core_types::{RegimeWord, REGIME_PROFILES};
+use engine_snapshot::{EngineSnapshot, SnapshotCell, SLOT_NAMES, SNAPSHOT_SLOTS, VENUE_NAMES};
+use ratatui::layout::Constraint;
 
 /// Tick period for the TUI redraw loop.
 const FRAME_PERIOD: Duration = Duration::from_millis(33); // ~30 Hz
+
+/// Recent orders shown (the snapshot holds 64).
+const RECENT_SHOWN: usize = 8;
 
 /// Run the dashboard until `stop` is raised. Owns the terminal
 /// while running; restores it on exit.
@@ -250,7 +56,7 @@ const FRAME_PERIOD: Duration = Duration::from_millis(33); // ~30 Hz
 ///
 /// Returns any I/O error from terminal init or render. The caller
 /// should log + exit non-zero.
-pub fn run_dashboard(cell: &SnapshotCell, stop: &AtomicBool) -> io::Result<()> {
+pub fn run_dashboard(cell: &SnapshotCell<EngineSnapshot>, stop: &AtomicBool) -> io::Result<()> {
     use crossterm::event::{self, Event, KeyCode};
     use crossterm::execute;
     use crossterm::terminal::{
@@ -264,10 +70,13 @@ pub fn run_dashboard(cell: &SnapshotCell, stop: &AtomicBool) -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // One boxed copy target for the ≈ 24 KB snapshot (boot of this
+    // thread; never reallocated).
+    let mut state = Box::new(EngineSnapshot::empty());
 
     let result = (|| -> io::Result<()> {
         while !stop.load(Ordering::Acquire) {
-            let state = cell.read();
+            cell.read_into(&mut state);
             let frame_start = Instant::now();
             terminal.draw(|f| render_frame(f, &state))?;
 
@@ -296,47 +105,70 @@ pub fn run_dashboard(cell: &SnapshotCell, stop: &AtomicBool) -> io::Result<()> {
     result
 }
 
-fn render_frame(f: &mut ratatui::Frame<'_>, state: &DashboardState) {
-    use ratatui::layout::{Constraint, Direction, Layout};
+fn render_frame(f: &mut ratatui::Frame<'_>, s: &EngineSnapshot) {
+    use ratatui::layout::{Direction, Layout};
 
     let size = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // header
-            Constraint::Min(8),    // markets + orders side-by-side
-            Constraint::Length(8), // latency + ingest health
+            Constraint::Length(6),  // header
+            Constraint::Length(11), // strategies + recent orders
+            Constraint::Min(6),     // ruleset rows
+            Constraint::Length(10), // latency + ingress
         ])
         .split(size);
 
-    render_header(f, chunks[0], state);
+    render_header(f, chunks[0], s);
 
     let mid = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
-    render_markets(f, mid[0], state);
-    render_last_order(f, mid[1], state);
+    render_strategies(f, mid[0], s);
+    render_recent_orders(f, mid[1], s);
+
+    render_ruleset(f, chunks[2], s);
 
     let foot = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(chunks[2]);
-    render_latency(f, foot[0], state);
-    render_ingest_health(f, foot[1], state);
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[3]);
+    render_latency(f, foot[0], s);
+    render_ingress(f, foot[1], s);
 }
 
-fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &DashboardState) {
+fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &EngineSnapshot) {
     use ratatui::widgets::{Block, Borders, Paragraph};
+    let b = &s.boot;
+    let uptime_s = s.mono_ns.saturating_sub(b.boot_mono_ns) / 1_000_000_000;
     let lines = vec![
         ratatui::text::Line::from(format!(
-            "iterations: {}    ticks: {}    signals: {}    fills: {}",
-            s.iterations, s.ticks_dispatched, s.signals_dispatched, s.fills_seen
+            "pid {}  strategy {} ({})  mask req={} cfg={} on={}  {}  up {}  git {}  seq {}",
+            b.pid,
+            text(b.strategy_name()),
+            text(s.strategy_kind()),
+            b.requested_mask,
+            b.configured_mask,
+            s.enabled_mask,
+            if s.halted != 0 { "HALTED" } else { "running" },
+            format_dur_s(uptime_s),
+            text(b.git_sha()),
+            s.seq
         )),
         ratatui::text::Line::from(format!(
-            "orders emitted: {}    dropped: {}",
-            s.orders_emitted, s.orders_dropped
+            "iter {}  ticks {}  signals {}  fills {}  orders {} (dropped {})  ai {}  run {}",
+            s.counters.iterations,
+            s.counters.ticks,
+            s.counters.signals,
+            s.counters.fills,
+            s.counters.orders_emitted,
+            s.counters.orders_dropped,
+            s.counters.ai_dispatched,
+            text(b.run_dir())
         )),
+        ratatui::text::Line::from(format!("regime {}", regime_chip(s, 0))),
+        ratatui::text::Line::from(format!("       {}", regime_chip(s, 1))),
     ];
     let p = Paragraph::new(lines).block(
         Block::default()
@@ -346,71 +178,228 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &Da
     f.render_widget(p, area);
 }
 
-fn render_markets(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &DashboardState) {
+/// `fast: trend=BULL shape=MIXED vol=LOW fund=? level=? stretch=NEUTRAL [measured] decl 0s/0s`
+fn regime_chip(s: &EngineSnapshot, p: usize) -> String {
+    const NAMES: [&str; 2] = ["fast", "slow"];
+    if p >= REGIME_PROFILES {
+        return String::new();
+    }
+    let r = &s.regime;
+    if r.configured == 0 {
+        return format!("{}: (no detector)", NAMES[p]);
+    }
+    let w = r.effective[p];
+    let mut out = format!("{}: ", NAMES[p]);
+    let dims = ["trend", "shape", "vol", "fund", "level", "stretch"];
+    let mut d = 0u8;
+    while d < DIM_SOURCE {
+        out.push_str(dims[d as usize]);
+        out.push('=');
+        out.push_str(dim_value_name(w, d));
+        out.push(' ');
+        d += 1;
+    }
+    out.push('[');
+    out.push_str(dim_value_name(w, DIM_SOURCE));
+    out.push(']');
+    if r.declared_ttl_ns[p] != 0 {
+        let age = s.mono_ns.saturating_sub(r.declared_ts_ns[p]) / 1_000_000_000;
+        out.push_str(&format!(
+            " decl {}/{}",
+            format_dur_s(age),
+            format_dur_s(r.declared_ttl_ns[p] / 1_000_000_000)
+        ));
+    }
+    out.push_str(&format!(" judged {}", r.minutes_judged));
+    out
+}
+
+/// Human name of one dimension's value (the `core_types::regime` byte
+/// map); `?` for unknown / empty / malformed.
+fn dim_value_name(w: RegimeWord, d: u8) -> &'static str {
+    const TABLE: [[&str; 3]; DIM_COUNT as usize] = [
+        ["BEAR", "NEUTRAL", "BULL"],
+        ["CHOP", "MIXED", "TREND"],
+        ["LOW", "NORMAL", "HIGH"],
+        ["NEG", "POS", "?"],
+        ["LOW", "NORMAL", "HIGH"],
+        ["EXT_DOWN", "NEUTRAL", "EXT_UP"],
+        ["measured", "declared", "unknown"],
+    ];
+    match w.value_of(d) {
+        Some(v) if d < DIM_COUNT && (v as usize) < 3 => TABLE[d as usize][v as usize],
+        _ => "?",
+    }
+}
+
+fn render_strategies(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &EngineSnapshot) {
     use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
     let header = Row::new(vec![
-        Cell::from("sym"),
-        Cell::from("bid"),
-        Cell::from("bid_qty"),
-        Cell::from("ask"),
-        Cell::from("ask_qty"),
-        Cell::from("seq"),
+        Cell::from("slot"),
+        Cell::from("member"),
+        Cell::from("cfg"),
+        Cell::from("on"),
+        Cell::from("gate"),
+        Cell::from("orders"),
+        Cell::from("drop"),
     ]);
-
-    let rows: Vec<Row> = (0..s.recent_tob_count as usize)
+    let rows: Vec<Row> = (0..SNAPSHOT_SLOTS)
         .map(|i| {
-            let t = s.recent_tob[i];
+            let c = &s.slots[i];
             Row::new(vec![
-                Cell::from(format!("{}", t.sym)),
-                Cell::from(format_px(t.bid_px.raw())),
-                Cell::from(format!("{}", t.bid_qty.raw())),
-                Cell::from(format_px(t.ask_px.raw())),
-                Cell::from(format!("{}", t.ask_qty.raw())),
-                Cell::from(format!("{}", t.venue_seq)),
+                Cell::from(format!("{i}")),
+                Cell::from(SLOT_NAMES[i]),
+                Cell::from(yes_no(s.boot.configured_mask >> i & 1)),
+                Cell::from(yes_no(s.enabled_mask >> i & 1)),
+                Cell::from(gate_name(s.regime.gates[i])),
+                Cell::from(format!("{}", c.orders_emitted)),
+                Cell::from(format!("{}", c.orders_dropped)),
             ])
         })
         .collect();
-
     let widths = [
+        Constraint::Length(4),
+        Constraint::Length(12),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Length(8),
+        Constraint::Length(6),
+    ];
+    let t = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(" strategies "));
+    f.render_widget(t, area);
+}
+
+fn render_recent_orders(
+    f: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    s: &EngineSnapshot,
+) {
+    use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+
+    let header = Row::new(vec![
+        Cell::from("age"),
+        Cell::from("slot"),
+        Cell::from("venue"),
+        Cell::from("sym"),
+        Cell::from("side"),
+        Cell::from("px"),
+        Cell::from("qty"),
+    ]);
+    let ring = &s.recent_orders;
+    let n = ring.len();
+    let first = n.saturating_sub(RECENT_SHOWN);
+    // Newest first.
+    let rows: Vec<Row> = (first..n)
+        .rev()
+        .filter_map(|k| ring.oldest_first(k))
+        .map(|o| {
+            Row::new(vec![
+                Cell::from(format_dur_s(
+                    s.mono_ns.saturating_sub(o.ts_ns) / 1_000_000_000,
+                )),
+                Cell::from(format!("{}", o.strategy_id)),
+                Cell::from(format!("{}", o.venue)),
+                Cell::from(format!("{}", o.sym)),
+                Cell::from(side_name(o.side as u8)),
+                Cell::from(format_px(o.px.raw())),
+                Cell::from(format_px(o.qty.raw())),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(7),
+        Constraint::Length(4),
+        Constraint::Length(5),
+        Constraint::Length(10),
+        Constraint::Length(4),
+        Constraint::Length(14),
         Constraint::Length(12),
-        Constraint::Length(10),
-        Constraint::Length(12),
-        Constraint::Length(10),
-        Constraint::Length(10),
     ];
     let t = Table::new(rows, widths).header(header).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" markets (top-of-book) "),
+            .title(format!(" recent orders ({} total) ", ring.total)),
     );
     f.render_widget(t, area);
 }
 
-fn render_last_order(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &DashboardState) {
-    use ratatui::widgets::{Block, Borders, Paragraph};
-    let side = match s.last_order_side {
-        0 => "BID",
-        1 => "ASK",
-        _ => "?",
-    };
-    let lines = if s.orders_emitted == 0 {
-        vec![ratatui::text::Line::from("(no orders emitted yet)")]
-    } else {
-        vec![
-            ratatui::text::Line::from(format!("sym: {}", s.last_order_sym)),
-            ratatui::text::Line::from(format!("side: {side}")),
-            ratatui::text::Line::from(format!("px:  {}", format_px(s.last_order_px_1e6))),
-            ratatui::text::Line::from(format!("qty: {}", format_px(s.last_order_qty_1e6))),
-        ]
-    };
-    let p =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" last order "));
-    f.render_widget(p, area);
+fn render_ruleset(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &EngineSnapshot) {
+    use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+
+    let v = &s.vm;
+    let title = format!(
+        " ruleset {} rows={} epoch={} staged={} fires={} blocked={} hard_exits={} ",
+        hex_short(&v.active_hash),
+        v.rows_active,
+        v.epoch,
+        hex_short(&v.staged_hash),
+        v.fires,
+        v.regime_blocked,
+        v.regime_hard_exits
+    );
+    let header = Row::new(vec![
+        Cell::from("row"),
+        Cell::from("name_h"),
+        Cell::from("sym"),
+        Cell::from("ref"),
+        Cell::from("gate"),
+        Cell::from("pos"),
+        Cell::from("side"),
+        Cell::from("entry px"),
+        Cell::from("age"),
+    ]);
+    let n = (v.rows_active as usize).min(v.rows.len());
+    let rows: Vec<Row> = (0..n)
+        .map(|i| {
+            let r = &v.rows[i];
+            let entered = r.state == 1;
+            Row::new(vec![
+                Cell::from(format!("{i}")),
+                Cell::from(format!("{:016x}", r.name_h)),
+                Cell::from(format!("{}", r.sym)),
+                Cell::from(if r.ref_sym == core_types::SYMBOL_ID_NONE {
+                    "-".to_string()
+                } else {
+                    format!("{}", r.ref_sym)
+                }),
+                Cell::from(row_gate_name(r.gate)),
+                Cell::from(if entered { "IN" } else { "flat" }),
+                Cell::from(if entered { side_name(r.side) } else { "" }),
+                Cell::from(if entered {
+                    format_px(r.entry_px_1e6)
+                } else {
+                    String::new()
+                }),
+                Cell::from(if entered {
+                    format_dur_s(s.mono_ns.saturating_sub(r.entry_ts_ns) / 1_000_000_000)
+                } else {
+                    String::new()
+                }),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Length(17),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(4),
+        Constraint::Length(14),
+        Constraint::Length(8),
+    ];
+    let t = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(t, area);
 }
 
-fn render_latency(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &DashboardState) {
+fn render_latency(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &EngineSnapshot) {
     use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
     let labels = ["ingest→strategy", "strategy→submit", "submit→ack"];
@@ -423,8 +412,8 @@ fn render_latency(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &D
         .map(|i| {
             Row::new(vec![
                 Cell::from(labels[i]),
-                Cell::from(format_ns(s.p50_ns[i])),
-                Cell::from(format_ns(s.p99_ns[i])),
+                Cell::from(format_ns(s.latency.p50_ns[i])),
+                Cell::from(format_ns(s.latency.p99_ns[i])),
             ])
         })
         .collect();
@@ -439,51 +428,117 @@ fn render_latency(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &D
     f.render_widget(t, area);
 }
 
-fn render_ingest_health(
-    f: &mut ratatui::Frame<'_>,
-    area: ratatui::layout::Rect,
-    s: &DashboardState,
-) {
-    use ratatui::widgets::{Block, Borders, Paragraph};
-    // Per-bit labels, index = ingest_health bit position. Bits never
-    // renumber: the retired "rss" row (bit 3, 8f) stays and honestly
-    // renders [DOWN] forever.
-    let names = [
-        "polymarket",
-        "binance",
-        "rpc",
-        "rss",
-        "okx",
-        "deribit",
-        "hyperliquid",
-    ];
-    let lines: Vec<_> = names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let up = s.ingest_health & (1 << i) != 0;
-            ratatui::text::Line::from(format!(
-                " {} {}",
-                if up { "[UP]  " } else { "[DOWN]" },
-                name
-            ))
+fn render_ingress(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &EngineSnapshot) {
+    use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+
+    let header = Row::new(vec![
+        Cell::from("venue"),
+        Cell::from("state"),
+        Cell::from("last tick"),
+        Cell::from("ticks"),
+        Cell::from("stale"),
+        Cell::from("delay ms"),
+        Cell::from("reconn"),
+    ]);
+    let rows: Vec<Row> = (0..VENUE_NAMES.len())
+        .map(|i| {
+            let g = &s.ingress[i];
+            Row::new(vec![
+                Cell::from(VENUE_NAMES[i]),
+                Cell::from(ingress_state_name(g.state)),
+                Cell::from(if g.last_tick_ns == 0 {
+                    "never".to_string()
+                } else {
+                    format_dur_s(s.mono_ns.saturating_sub(g.last_tick_ns) / 1_000_000_000)
+                }),
+                Cell::from(format!("{}", g.ticks)),
+                Cell::from(format!("{}", g.stale_ticks)),
+                Cell::from(format!("{}", g.feed_delay_ema_ms)),
+                Cell::from(format!("{}", g.reconnects)),
+            ])
         })
         .collect();
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" ingest health "),
-    );
-    f.render_widget(p, area);
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(7),
+    ];
+    let t = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(" ingress "));
+    f.render_widget(t, area);
 }
 
 // -----------------------------------------------------------------
 // Formatters
 // -----------------------------------------------------------------
 
+fn text(b: &[u8]) -> &str {
+    core::str::from_utf8(b).unwrap_or("?")
+}
+
+fn yes_no(bit: u8) -> &'static str {
+    if bit != 0 {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn gate_name(g: u8) -> &'static str {
+    match g {
+        0 => "open",
+        1 => "soft",
+        2 => "HARD",
+        _ => "?",
+    }
+}
+
+/// RG3 row gate byte: bit 0 open, bit 1 hard-closed.
+fn row_gate_name(g: u8) -> &'static str {
+    match g & 0b11 {
+        0b01 | 0b11 => "open",
+        0b10 => "HARD",
+        _ => "soft",
+    }
+}
+
+fn side_name(side: u8) -> &'static str {
+    match side {
+        0 => "BID",
+        1 => "ASK",
+        _ => "?",
+    }
+}
+
+fn ingress_state_name(state: u8) -> &'static str {
+    match state {
+        0 => "down",
+        1 => "connecting",
+        2 => "UP",
+        3 => "backoff",
+        _ => "?",
+    }
+}
+
+/// First 8 hex digits of a hash; `-` for the all-zero (absent) value.
+fn hex_short(h: &[u8]) -> String {
+    if h.iter().all(|&b| b == 0) {
+        return "-".to_string();
+    }
+    let mut s = String::with_capacity(8);
+    for b in h.iter().take(4) {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 fn format_px(px_1e6: i64) -> String {
-    // 1e6 fixed-point → "{dollars}.{micros:06}". Truncate trailing
-    // zeros for readability.
+    // 1e6 fixed-point → "{dollars}.{micros:06}".
     let neg = px_1e6 < 0;
     let n = px_1e6.unsigned_abs();
     let dollars = n / 1_000_000;
@@ -505,87 +560,25 @@ fn format_ns(ns: u64) -> String {
     }
 }
 
-// `Constraint` is imported in each render fn that uses it; avoid a
-// crate-level re-export to keep render_frame self-contained.
-use ratatui::layout::Constraint;
+/// `37s` / `5m12s` / `3h04m` / `2d01h`.
+fn format_dur_s(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else if s < 86_400 {
+        format!("{}h{:02}m", s / 3_600, (s % 3_600) / 60)
+    } else {
+        format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3_600)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{Price, Qty};
-
-    #[test]
-    fn dashboard_state_is_cache_aligned() {
-        assert_eq!(::core::mem::align_of::<DashboardState>(), 64);
-    }
-
-    #[test]
-    fn default_is_all_zero() {
-        let d = DashboardState::default();
-        assert_eq!(d.ticks_dispatched, 0);
-        assert_eq!(d.orders_emitted, 0);
-        assert_eq!(d.recent_tob_count, 0);
-    }
-
-    #[test]
-    fn snapshot_cell_round_trips() {
-        let cell = SnapshotCell::new();
-        let mut s = DashboardState::empty();
-        s.orders_emitted = 7;
-        s.iterations = 42;
-        cell.publish(s);
-        let got = cell.read();
-        assert_eq!(got.orders_emitted, 7);
-        assert_eq!(got.iterations, 42);
-    }
-
-    #[test]
-    fn snapshot_cell_overwrites_on_second_publish() {
-        let cell = SnapshotCell::new();
-        let mut a = DashboardState::empty();
-        a.orders_emitted = 1;
-        cell.publish(a);
-        let mut b = DashboardState::empty();
-        b.orders_emitted = 9;
-        cell.publish(b);
-        assert_eq!(cell.read().orders_emitted, 9);
-    }
-
-    /// Failure-mode coverage for the seqlock: hammer `publish` from
-    /// one thread while another reads continuously; every observed
-    /// snapshot must be internally consistent (all mirrored fields
-    /// equal), i.e. torn reads are never returned.
-    #[test]
-    fn snapshot_cell_concurrent_reads_never_tear() {
-        const PUBLISHES: u64 = 100_000;
-        let cell = SnapshotCell::new();
-        std::thread::scope(|scope| {
-            let writer = scope.spawn(|| {
-                let mut s = DashboardState::empty();
-                for i in 0..PUBLISHES {
-                    // Mirror `i` across four fields; a torn read
-                    // shows up as a mismatch between them.
-                    s.iterations = i;
-                    s.ticks_dispatched = i;
-                    s.orders_emitted = i;
-                    s.fills_seen = i;
-                    cell.publish(s);
-                }
-            });
-            let mut last = 0u64;
-            while !writer.is_finished() {
-                let got = cell.read();
-                assert_eq!(got.iterations, got.ticks_dispatched, "torn read");
-                assert_eq!(got.iterations, got.orders_emitted, "torn read");
-                assert_eq!(got.iterations, got.fills_seen, "torn read");
-                assert!(got.iterations >= last, "snapshot went backwards");
-                last = got.iterations;
-            }
-            writer.join().expect("writer thread panicked");
-        });
-        let last_published = cell.read();
-        assert_eq!(last_published.iterations, PUBLISHES - 1);
-    }
+    use core_types::regime::{
+        FUND_POS, LEVEL_HIGH, SHAPE_CHOP, SOURCE_DECLARED, STRETCH_EXT_UP, TREND_BULL, VOL_LOW,
+    };
 
     #[test]
     fn format_px_pads_micros() {
@@ -602,37 +595,103 @@ mod tests {
         assert!(format_ns(50_000_000).contains("ms"));
     }
 
-    /// Builds a populated snapshot exercising every field so the
-    /// renderer code paths compile against representative data.
     #[test]
-    fn populated_snapshot_round_trips() {
-        let cell = SnapshotCell::new();
-        let mut s = DashboardState::empty();
-        s.iterations = 100;
-        s.ticks_dispatched = 50;
-        s.signals_dispatched = 5;
-        s.orders_emitted = 3;
-        s.orders_dropped = 1;
-        s.last_order_sym = 42;
-        s.last_order_px_1e6 = 500_000;
-        s.last_order_qty_1e6 = 1_000_000;
-        s.last_order_side = 0;
-        s.ingest_health = 0b1111;
-        s.p50_ns = [100, 200, 300];
-        s.p99_ns = [1_000, 2_000, 3_000];
-        let mut tob = TopOfBook::empty(7);
-        tob.bid_px = Price::from_raw(500_000);
-        tob.bid_qty = Qty::from_raw(100);
-        tob.ask_px = Price::from_raw(510_000);
-        tob.ask_qty = Qty::from_raw(50);
-        tob.venue_seq = 1234;
-        s.recent_tob[0] = tob;
-        s.recent_tob_count = 1;
-        cell.publish(s);
+    fn format_dur_brackets() {
+        assert_eq!(format_dur_s(37), "37s");
+        assert_eq!(format_dur_s(312), "5m12s");
+        assert_eq!(format_dur_s(3 * 3_600 + 4 * 60), "3h04m");
+        assert_eq!(format_dur_s(2 * 86_400 + 3_600), "2d01h");
+    }
 
-        let got = cell.read();
-        assert_eq!(got.recent_tob_count, 1);
-        assert_eq!(got.recent_tob[0].sym, 7);
-        assert_eq!(got.ingest_health, 0b1111);
+    #[test]
+    fn regime_chip_decodes_every_dimension() {
+        let mut s = Box::new(EngineSnapshot::empty());
+        assert_eq!(regime_chip(&s, 0), "fast: (no detector)");
+        s.regime.configured = 1;
+        s.regime.effective[1] = RegimeWord::from_values(
+            TREND_BULL,
+            SHAPE_CHOP,
+            VOL_LOW,
+            FUND_POS,
+            LEVEL_HIGH,
+            STRETCH_EXT_UP,
+            SOURCE_DECLARED,
+        );
+        s.regime.declared_ts_ns[1] = 5_000_000_000;
+        s.regime.declared_ttl_ns[1] = 600_000_000_000;
+        s.regime.minutes_judged = 12;
+        s.mono_ns = 65_000_000_000;
+        assert_eq!(
+            regime_chip(&s, 1),
+            "slow: trend=BULL shape=CHOP vol=LOW fund=POS level=HIGH stretch=EXT_UP [declared] \
+             decl 1m00s/10m00s judged 12"
+        );
+        // The unknown word decodes to `?` everywhere.
+        assert_eq!(
+            regime_chip(&s, 0),
+            "fast: trend=? shape=? vol=? fund=? level=? stretch=? [unknown] judged 12"
+        );
+        assert_eq!(regime_chip(&s, 3), "");
+    }
+
+    #[test]
+    fn small_names_cover_every_byte() {
+        assert_eq!(gate_name(2), "HARD");
+        assert_eq!(gate_name(9), "?");
+        assert_eq!(row_gate_name(0b01), "open");
+        assert_eq!(row_gate_name(0b10), "HARD");
+        assert_eq!(row_gate_name(0), "soft");
+        assert_eq!(side_name(1), "ASK");
+        assert_eq!(ingress_state_name(2), "UP");
+        assert_eq!(hex_short(&[0; 16]), "-");
+        assert_eq!(hex_short(&[0xfd, 0xe6, 0xf7, 0x33, 0xaa]), "fde6f733");
+        assert_eq!(text(b"ai+icdp"), "ai+icdp");
+        assert_eq!(text(&[0xff]), "?");
+        assert_eq!(yes_no(1), "yes");
+    }
+
+    /// The renderer paths compile against a populated snapshot and a
+    /// real (test) terminal backend — every panel draws without panic.
+    #[test]
+    fn populated_snapshot_renders_every_panel() {
+        use core_types::{Order, Price, Qty, Side, VenueId};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use strategy_core::VmRowView;
+
+        let mut s = Box::new(EngineSnapshot::empty());
+        s.mono_ns = 100_000_000_000;
+        s.boot.set_strategy_name(b"ai+icdp");
+        s.boot.set_git_sha(b"abc123");
+        s.boot.set_run_dir(b"/tmp/run-1");
+        s.set_strategy_kind(b"set");
+        s.enabled_mask = 112;
+        s.boot.configured_mask = 113;
+        s.regime.configured = 1;
+        s.vm.rows_active = 2;
+        s.vm.active_hash = [0xfd; 16];
+        s.vm.rows[0] = VmRowView::new(7, 1_500_000, 90_000_000_000, 10, 42, 7, 1, 0, 1, 1, 0, 0, 1);
+        s.vm.rows[1] = VmRowView::new(8, 0, 0, 0, 43, u32::MAX, 0, 0, 2, 1, 0, 1, 0);
+        for i in 0..10u64 {
+            s.recent_orders.push(Order::new(
+                90_000_000_000 + i,
+                VenueId::Okx,
+                42,
+                Side::Bid,
+                0,
+                Price::from_raw(1_000_000),
+                Qty::from_raw(2_000_000),
+                i,
+            ));
+        }
+        s.ingress[0].state = 2;
+        s.ingress[0].last_tick_ns = 99_000_000_000;
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &s)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("ai+icdp"));
+        assert!(rendered.contains("fdfdfdfd"));
+        assert!(rendered.contains("recent orders (10 total)"));
     }
 }

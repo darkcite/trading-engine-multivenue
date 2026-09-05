@@ -4,7 +4,8 @@
 //! Integration test: real TCP loopback against the embedded
 //! metrics server. Binds an ephemeral port, registers a counter +
 //! gauge, fires a GET /metrics, and asserts the Prometheus body
-//! contains the registered metrics.
+//! contains the registered metrics; RG6 adds the `/state` route
+//! (writer-supplied body, 404 without a writer, 500 on overflow).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -13,9 +14,19 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use core_metrics::{serve_metrics, MetricsRegistry};
+use core_metrics::{serve_metrics, EncodeErr, MetricsRegistry, StateFn};
 
 fn boot_server(registry: Arc<MetricsRegistry>) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    boot_server_with(registry, None::<StateFn>)
+}
+
+fn boot_server_with<F>(
+    registry: Arc<MetricsRegistry>,
+    state: Option<F>,
+) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>)
+where
+    F: FnMut(&mut [u8]) -> Result<usize, EncodeErr> + Send + 'static,
+{
     let stop = Arc::new(AtomicBool::new(false));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -23,7 +34,7 @@ fn boot_server(registry: Arc<MetricsRegistry>) -> (u16, Arc<AtomicBool>, thread:
 
     let stop_clone = stop.clone();
     let handle = thread::spawn(move || {
-        let _ = serve_metrics(addr, registry, &stop_clone, |_ev| {});
+        let _ = serve_metrics(addr, registry, state, &stop_clone, |_ev| {});
     });
 
     // Wait until the server is ready to accept (poll the port).
@@ -166,7 +177,7 @@ fn scrape_hammer_all_succeed_without_conn_errors() {
     drop(listener);
     let (stop_clone, errs_clone, reg_clone) = (stop.clone(), errors.clone(), reg.clone());
     let handle = thread::spawn(move || {
-        let _ = serve_metrics(addr, reg_clone, &stop_clone, |_ev| {
+        let _ = serve_metrics(addr, reg_clone, None::<StateFn>, &stop_clone, |_ev| {
             errs_clone.fetch_add(1, Ordering::Relaxed);
         });
     });
@@ -191,4 +202,59 @@ fn scrape_hammer_all_succeed_without_conn_errors() {
         0,
         "no connection errors under hammer"
     );
+}
+
+/// RG6: `/state` serves whatever the wired writer encodes, as JSON.
+#[test]
+fn state_endpoint_serves_the_writer_body_as_json() {
+    let reg = Arc::new(MetricsRegistry::new());
+    let mut calls = 0u32;
+    let writer = move |dst: &mut [u8]| -> Result<usize, EncodeErr> {
+        calls += 1;
+        let body = b"{\"v\":1,\"calls\":";
+        let mut n = 0usize;
+        dst[..body.len()].copy_from_slice(body);
+        n += body.len();
+        dst[n] = b'0' + (calls as u8);
+        n += 1;
+        dst[n] = b'}';
+        n += 1;
+        Ok(n)
+    };
+    let (port, stop, handle) = boot_server_with(reg, Some(writer));
+    let (status, first) = http_get(port, "/state");
+    let (status2, second) = http_get(port, "/state");
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(status2, 200);
+    assert!(first.contains("Content-Type: application/json"), "{first}");
+    assert!(first.ends_with("{\"v\":1,\"calls\":1}"), "{first}");
+    assert!(second.ends_with("{\"v\":1,\"calls\":2}"), "writer is FnMut: {second}");
+}
+
+/// RG6: without a writer the path is simply absent.
+#[test]
+fn state_endpoint_is_404_without_a_writer() {
+    let reg = Arc::new(MetricsRegistry::new());
+    let (port, stop, handle) = boot_server(reg);
+    let (status, _body) = http_get(port, "/state");
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+    assert_eq!(status, 404);
+}
+
+/// RG6: an overflowing writer is a 500 — the body is never truncated
+/// — and the server keeps serving afterwards.
+#[test]
+fn state_endpoint_overflow_is_500_and_server_survives() {
+    let reg = Arc::new(MetricsRegistry::new());
+    let writer = |_dst: &mut [u8]| -> Result<usize, EncodeErr> { Err(EncodeErr::BufferTooSmall) };
+    let (port, stop, handle) = boot_server_with(reg, Some(writer));
+    let (status, _body) = http_get(port, "/state");
+    let (health, _ok) = http_get(port, "/healthz");
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+    assert_eq!(status, 500);
+    assert_eq!(health, 200);
 }

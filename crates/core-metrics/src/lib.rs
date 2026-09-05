@@ -48,4 +48,4 @@ pub use registry::{
     Counter, CounterId, EncodeErr, Gauge, GaugeId, MetricsRegistry, RegErr, MAX_COUNTERS,
     MAX_GAUGES, NAME_MAX,
 };
-pub use server::{serve_metrics, MetricsServeEvent, MetricsServerErr};
+pub use server::{serve_metrics, MetricsServeEvent, MetricsServerErr, StateFn};

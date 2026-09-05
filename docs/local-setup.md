@@ -210,9 +210,25 @@ Operational laws:
   the wrapper runs only the refresh MODULE (file rewrite, no state.db
   writes). After a notable universe change, run `uv run claude-worker
   fetch` once (`unresolved=0` is the done-tell).
-- Uninstall: `for l in engine daily-restart caffeinate candles regime; do launchctl
+- Uninstall: `for l in engine daily-restart caffeinate candles regime dashboard; do launchctl
   bootout gui/$UID/com.multivenue.$l; done` (+ delete the plists from
   `~/Library/LaunchAgents`).
+- **Dashboard** (RG6, `docs/regime-and-dashboard-plan.md` §6.2):
+  `com.multivenue.dashboard` (KeepAlive, installed by the same
+  installer) runs `scripts/dashboard.sh` → the read-only operator page
+  on <http://127.0.0.1:9292/> — the engine's 1 s `/state` snapshot
+  (proxied same-origin from 9191, 2 s) beside the worker's state
+  (rulesets, library + evidence, compositions, regime history +
+  declarations + bands, nightly P&L, positions from the current run's
+  fills, configs — never `.env`; 10 s). One file, no CDN, no controls.
+  `curl -s 127.0.0.1:9191/state | python3 -m json.tool` is the raw
+  engine view; `cd claude-worker && uv run python -m
+  claude_worker.dashboard --once` prints the worker document. The
+  server's cmdline is deliberately `~/multivenue/venv/bin/python3
+  scripts/dashboard-serve.py` (a venv alias + a repo-root launcher):
+  the lanes' overlap guard `pgrep -f 'claude[-_]worke[r]'` must never
+  see a long-running server, or every lane (the boot-time recommit
+  included) waits forever. Log: `~/multivenue/logs/launchd/dashboard.log`.
 - **Retention** (`scripts/retention.sh`, runs once per UTC day from
   the restart poller; config `~/multivenue/retention.conf`, see
   `retention.conf.example`): KEEP-ALL until the log volume's free

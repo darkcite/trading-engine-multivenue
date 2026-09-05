@@ -24,11 +24,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use cli::{
-    engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full, engine_loop_rule_tree_full,
-    engine_loop_set_full, install_sigint_handler, join_reverse, spawn_binance, spawn_deribit,
-    spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc, Consumers, EngineConfig,
-    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint,
-    SHUTDOWN,
+    boot_info, engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
+    engine_loop_rule_tree_full, engine_loop_set_full, install_sigint_handler, join_reverse,
+    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
+    state_writer, Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher,
+    Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -284,12 +284,14 @@ struct RunArgs {
     /// thread is not started.
     #[arg(long)]
     polygon_path: Option<String>,
-    /// Bind `127.0.0.1:9191` and expose `/metrics` in Prometheus
-    /// text format. Default ON.
+    /// Bind `127.0.0.1:9191` and expose `/metrics` (Prometheus text),
+    /// `/healthz` and `/state` (RG6: the 1 s engine snapshot as
+    /// JSON — boot identity, regime words, slots, vm rows, recent
+    /// orders/fills). Default ON.
     #[arg(long, default_value_t = true)]
     metrics: bool,
-    /// Render a live ratatui dashboard instead of the per-5s
-    /// tracing log line. Implies `--metrics`.
+    /// Render a live ratatui dashboard over the same 1 s snapshot
+    /// `/state` serves. Implies `--metrics`.
     #[arg(long, default_value_t = false)]
     tui: bool,
     /// Strategy selector. `latency-arb` (default) uses Binance →
@@ -1164,9 +1166,13 @@ fn run(args: RunArgs) -> ExitCode {
     // spawn wrapper thread itself, so the registry + gauge ids must
     // already exist at spawn time.
     let enable_metrics = args.metrics || args.tui;
-    let enable_tui = args.tui;
-    let obs = match Observability::build(enable_metrics, enable_tui) {
-        Ok(o) => o.with_ingress_statuses(statuses.clone()),
+    let obs = match Observability::build(enable_metrics) {
+        // RG6: the `/state` boot identity (pid, anchor, binary link
+        // time, git sha, run dir, `--strategy`); masks + regime hash
+        // are stamped by the set arm below.
+        Ok(o) => o
+            .with_ingress_statuses(statuses.clone())
+            .with_boot_info(boot_info(&run_dir, epoch_ns, &args.strategy, !args.live)),
         Err(reason) => {
             error!(reason, "observability build failed");
             join_reverse(handles);
@@ -1805,11 +1811,15 @@ fn run(args: RunArgs) -> ExitCode {
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:9191".parse().unwrap());
         let stop_ref: &'static AtomicBool = &SHUTDOWN;
+        // RG6: `/state` reads the snapshot cell through a writer that
+        // owns its own boxed scratch (built inside the thread).
+        let state_cell = obs.state.clone();
         obs_handles.push(
             std::thread::Builder::new()
                 .name("metrics-http".into())
                 .spawn(move || {
-                    info!(%bind, "metrics: HTTP server starting");
+                    info!(%bind, state = state_cell.is_some(), "metrics: HTTP server starting");
+                    let state = state_cell.map(state_writer);
                     // Non-fatal serve events land here so they carry
                     // the standard tracing timestamp (G1 remediation
                     // item 2 — the old in-crate eprintln had neither
@@ -1824,7 +1834,9 @@ fn run(args: RunArgs) -> ExitCode {
                             warn!(error = %e, "metrics: accept error")
                         }
                     };
-                    if let Err(e) = core_metrics::serve_metrics(bind, reg, stop_ref, on_event) {
+                    if let Err(e) =
+                        core_metrics::serve_metrics(bind, reg, state, stop_ref, on_event)
+                    {
                         error!(error = ?e, "metrics: serve_metrics returned error");
                     }
                 })
@@ -1832,8 +1844,9 @@ fn run(args: RunArgs) -> ExitCode {
         );
     }
 
-    // Boot the TUI render thread if requested.
-    if let Some(cell) = obs.snapshot.clone() {
+    // Boot the TUI render thread if requested (RG6: it renders the
+    // same `/state` snapshot the metrics server serves).
+    if let Some(cell) = obs.state.clone().filter(|_| args.tui) {
         let stop_ref: &'static AtomicBool = &SHUTDOWN;
         obs_handles.push(
             std::thread::Builder::new()
@@ -2024,6 +2037,12 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // RG6: the `/state` `boot` section's regime identity.
+            let mut obs = obs;
+            if let Some(rb) = regime_boot.as_ref() {
+                obs.boot.regime_hash = rb.hash;
+                obs.boot.regime_configured = 1;
+            }
             info!("running strategy-set PAPER — no orders will be submitted");
             engine_loop_set_full(
                 cons,

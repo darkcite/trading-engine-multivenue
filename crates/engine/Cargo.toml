@@ -24,3 +24,6 @@ ingress-ai      = { workspace = true }
 # SlotCapture<Fill> only: the engine thread stages every dispatched
 # fill to engine-fills.pmlr (Phase 8f item 6 — the positions/P&L feed).
 core-io         = { workspace = true }
+# RecentRing only: the RG6 `/state` `recent` rings the engine keeps
+# beside the captures (the cli copies them into the 1 s snapshot).
+engine-snapshot = { workspace = true }

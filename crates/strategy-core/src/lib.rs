@@ -30,9 +30,11 @@
 )]
 
 use core_time::NsTs;
+use core_types::regime::REL_UNKNOWN;
 use core_types::{
     AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet, RegimeWord,
-    RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_OFF_SOFT,
+    RuleTableV2, Signal, SymbolId, Tick, REGIME_OFF_HARD, REGIME_OFF_SOFT, REGIME_PROFILES,
+    SYMBOL_ID_NONE,
 };
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
@@ -200,6 +202,218 @@ pub trait StrategyCounters {
     #[inline]
     fn regime_counters(&self) -> RegimeCounters {
         RegimeCounters::default()
+    }
+
+    // ---- RG6 `/state` snapshot family (plan §6.1) ----------------
+    //
+    // Read once per second by the cli's snapshot publish through the
+    // same generic route as every row above. Defaults are the empty
+    // value, so every strategy but the set is untouched.
+
+    /// Sticky halt state (`StrategySet::is_halted`); `false` for
+    /// every plain strategy (they have no halt lever).
+    #[inline]
+    fn is_halted(&self) -> bool {
+        false
+    }
+    /// Per-slot counters of a composed set (slot map in
+    /// `strategy-set`); zeros for a plain strategy or an unbuilt slot.
+    #[inline]
+    fn slot_counters(&self, _slot: u8) -> SlotCounters {
+        SlotCounters::default()
+    }
+    /// vm member: identity of the active table (all-zero = none ever
+    /// committed).
+    #[inline]
+    fn vm_active_hash128(&self) -> [u8; 16] {
+        [0; 16]
+    }
+    /// vm member: identity of the staged (received, not yet committed)
+    /// table; all-zero = nothing staged.
+    #[inline]
+    fn vm_staged_hash128(&self) -> [u8; 16] {
+        [0; 16]
+    }
+    /// vm member: copy the active table's rows into `out`
+    /// (`min(rows_active, out.len())` entries — row, position and gate
+    /// per entry); returns the count written. 0 for a plain strategy.
+    #[inline]
+    fn vm_rows_view(&self, _out: &mut [VmRowView]) -> u32 {
+        0
+    }
+    /// icdp member: SHA-256 of the configured artifact (all-zero =
+    /// unconfigured).
+    #[inline]
+    fn icdp_params_hash(&self) -> [u8; 32] {
+        [0; 32]
+    }
+    /// icdp member: instruments configured (0 = unconfigured).
+    #[inline]
+    fn icdp_instruments(&self) -> u32 {
+        0
+    }
+    /// RG6: the detector's per-symbol RELATIVE state per profile
+    /// (`RegimeView` minus the words, which `regime_counters` carries).
+    /// Empty for a plain strategy.
+    #[inline]
+    fn regime_rel_view(&self) -> RegimeRelView {
+        RegimeRelView::EMPTY
+    }
+}
+
+/// RG6: one strategy-set slot's dashboard counters — POD, embedded in
+/// the `/state` snapshot (`engine-snapshot`) eight times.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct SlotCounters {
+    /// Orders the member emitted via `ctx.submit` (dispatcher accepted).
+    pub orders_emitted: u64,
+    /// Orders the dispatcher refused (ring full).
+    pub orders_dropped: u64,
+    /// Live terms of the member's regime label set (0 = `ANY`).
+    pub label_terms: u8,
+    /// The label's off-mode (`REGIME_OFF_SOFT` / `REGIME_OFF_HARD`).
+    pub label_off: u8,
+    /// Explicit padding — always zero.
+    _pad: [u8; 6],
+}
+
+impl SlotCounters {
+    /// Construct without naming the padding.
+    #[inline(always)]
+    pub const fn new(
+        orders_emitted: u64,
+        orders_dropped: u64,
+        label_terms: u8,
+        label_off: u8,
+    ) -> Self {
+        Self {
+            orders_emitted,
+            orders_dropped,
+            label_terms,
+            label_off,
+            _pad: [0; 6],
+        }
+    }
+}
+
+/// RG6: one vm row as the dashboard sees it — the `RuleRowV2` identity
+/// fields + the row's position + its regime gate byte, flattened into
+/// one 48 B POD (256 of them ride in the `/state` snapshot).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct VmRowView {
+    /// FNV-1a 64 of the row's `name` (`RuleRowV2::name_h`).
+    pub name_h: u64,
+    /// Action-leg entry px ×1e6 (0 when flat).
+    pub entry_px_1e6: i64,
+    /// Engine-monotonic entry stamp (0 when flat).
+    pub entry_ts_ns: u64,
+    /// Entry qty on the action leg ×1e6 (0 when flat).
+    pub qty_sym_1e6: i64,
+    /// Action-leg symbol.
+    pub sym: SymbolId,
+    /// Reference-leg symbol (`SYMBOL_ID_NONE` for single-leg rows).
+    pub ref_sym: SymbolId,
+    /// Position state byte (0 flat, 1 entered — the vm's law).
+    pub state: u8,
+    /// Entered side (`Side` byte; meaningful when `state == 1`).
+    pub side: u8,
+    /// RG3 row gate byte: bit 0 open, bit 1 hard-closed.
+    pub gate: u8,
+    /// `RuleRowV2::flags`.
+    pub flags: u8,
+    /// `RuleRowV2::family` (`MarketFamily` byte).
+    pub family: u8,
+    /// `RuleRowV2::regime_off`.
+    pub regime_off: u8,
+    /// Sign of the entry signal (+1 / −1; 0 when flat).
+    pub entry_sign: i8,
+    /// Explicit padding — always zero.
+    _pad: u8,
+}
+
+impl VmRowView {
+    /// Construct without naming the padding.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        name_h: u64,
+        entry_px_1e6: i64,
+        entry_ts_ns: u64,
+        qty_sym_1e6: i64,
+        sym: SymbolId,
+        ref_sym: SymbolId,
+        state: u8,
+        side: u8,
+        gate: u8,
+        flags: u8,
+        family: u8,
+        regime_off: u8,
+        entry_sign: i8,
+    ) -> Self {
+        Self {
+            name_h,
+            entry_px_1e6,
+            entry_ts_ns,
+            qty_sym_1e6,
+            sym,
+            ref_sym,
+            state,
+            side,
+            gate,
+            flags,
+            family,
+            regime_off,
+            entry_sign,
+            _pad: 0,
+        }
+    }
+}
+
+/// Slots of [`RegimeRelView`] — equals `core_regime::REGIME_MAX_SYMS`
+/// (pinned by a const assert in `strategy-set`, which copies the
+/// detector's view straight in).
+pub const REGIME_REL_SYMS: usize = 32;
+
+/// RG6: the detector's per-symbol RELATIVE state (`RegimeView` minus
+/// the words) — slot 0 is the BTC ref, `syms[..n]` live. POD.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct RegimeRelView {
+    /// Slot → symbol (`SYMBOL_ID_NONE` beyond `n`).
+    pub syms: [SymbolId; REGIME_REL_SYMS],
+    /// REL byte per profile per slot (`REL_UNKNOWN` for the ref, empty
+    /// slots and warm-up).
+    pub rel: [[u8; REGIME_REL_SYMS]; REGIME_PROFILES],
+    /// Live slots.
+    pub n: u8,
+    /// Explicit padding — always zero.
+    _pad: [u8; 7],
+}
+
+impl RegimeRelView {
+    /// No detector: no members, every REL unknown.
+    pub const EMPTY: Self = Self {
+        syms: [SYMBOL_ID_NONE; REGIME_REL_SYMS],
+        rel: [[REL_UNKNOWN; REGIME_REL_SYMS]; REGIME_PROFILES],
+        n: 0,
+        _pad: [0; 7],
+    };
+
+    /// Construct without naming the padding.
+    #[inline(always)]
+    pub const fn new(
+        syms: [SymbolId; REGIME_REL_SYMS],
+        rel: [[u8; REGIME_REL_SYMS]; REGIME_PROFILES],
+        n: u8,
+    ) -> Self {
+        Self {
+            syms,
+            rel,
+            n,
+            _pad: [0; 7],
+        }
     }
 }
 
