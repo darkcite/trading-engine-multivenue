@@ -587,14 +587,23 @@ class Archiver:
         *,
         budget: claude_worker.objstore.Budget | None = None,
         dry_run: bool = False,
+        on_result: collections.abc.Callable[[PushResult], None] | None = None,
     ) -> list[PushResult]:
-        """Stage A: every closed run not yet complete, oldest first."""
+        """Stage A: every closed run not yet complete, oldest first.
+
+        ``on_result`` is called as each run lands rather than at the end. A
+        backfill is hours of work; without it the operator watches a silent log
+        and cannot tell progress from a hang.
+        """
         runs = claude_worker.features.run_dirs(root)
         out: list[PushResult] = []
         for run_dir in runs[:-1]:  # never the newest (S-LAW 4)
             if budget is not None and budget.spent():
                 raise ArchiveError("budget spent between runs", EXIT_BUDGET)
-            out.append(self.push_run(run_dir, budget=budget, dry_run=dry_run))
+            result = self.push_run(run_dir, budget=budget, dry_run=dry_run)
+            out.append(result)
+            if on_result is not None:
+                on_result(result)
         return out
 
     # -- verify ----------------------------------------------------------
@@ -984,10 +993,16 @@ def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately f
         print(result.tell(), file=sys.stderr)
         return EXIT_OK
     if args.verb == "push-pending":
-        for result in archiver.push_pending(
-            _replay_dir(args.root), budget=_budget(args.budget_s), dry_run=args.dry_run
-        ):
-            print(result.tell(), file=sys.stderr)
+
+        def report(result: PushResult) -> None:
+            print(result.tell(), file=sys.stderr, flush=True)
+
+        archiver.push_pending(
+            _replay_dir(args.root),
+            budget=_budget(args.budget_s),
+            dry_run=args.dry_run,
+            on_result=report,
+        )
         return EXIT_OK
     if args.verb == "verify":
         run_id = _run_id(args.run)

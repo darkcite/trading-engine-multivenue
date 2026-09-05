@@ -15,6 +15,24 @@
 MIN_FREE_GIB=25
 TARGET_FREE_GIB=40
 PROTECT_DAYS=7
+
+# ---- "keep only the last N hours" (requires ARCHIVE_MODE=s3) ----
+# The defaults above are PRESSURE-driven: nothing is deleted until the volume
+# drops under MIN_FREE_GIB. If instead you want a fixed local window — keep the
+# last 24 h on disk, everything older in object storage and pulled on demand —
+# make the thresholds unreachable so the sweep runs every night, and let
+# PROTECT_DAYS define the window:
+#
+#   MIN_FREE_GIB=999999      # never satisfied -> the sweep always runs
+#   TARGET_FREE_GIB=999999   # never satisfied -> walk every candidate
+#   PROTECT_DAYS=1           # keep the last 24 h; older is eligible
+#   ARCHIVE_MODE="s3"
+#
+# The failure mode is unchanged and is the point: each deletion is gated on
+# `verify` exiting 0, and the FIRST run that is not confirmed in the bucket
+# stops the sweep with everything after it intact. Set this only once a backfill
+# has actually put the history there — otherwise the sweep correctly refuses to
+# free anything, and the volume keeps filling.
 ARCHIVE_DIR="$HOME/multivenue/archive"
 # compress (default) | move | s3
 #   compress — tar -cz into ARCHIVE_DIR, then remove the original.
