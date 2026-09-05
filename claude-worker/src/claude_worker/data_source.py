@@ -117,16 +117,31 @@ class DataSource:
         return out
 
     def remote_manifests(self) -> dict[str, dict[str, typing.Any]]:
+        """Runs held in the bucket, whichever shape they are in.
+
+        Directory archives win over legacy tarballs for the same run id: a
+        directory can be windowed in place, a tarball has to be extracted first.
+        """
         if self._archiver is None:
             return {}
-        return {m["run"]: m for m in self._archiver.list_runs()}
+        out: dict[str, dict[str, typing.Any]] = dict(self._archiver.list_tarballs())
+        out.update({m["run"]: m for m in self._archiver.list_runs()})
+        return out
+
+    def _remote_shape(self, run_id: str) -> str | None:
+        """``"run"``, ``"tarball"`` or None — how the bucket holds this run."""
+        if self.store is None or self._archiver is None:
+            return None
+        if self.store.head(self.cfg.index_key(run_id)) is not None:
+            return "run"
+        if self.store.head(self._archiver.tarball_index_key(run_id)) is not None:
+            return "tarball"
+        return None
 
     def where(self, run_id: str) -> Location:
         local = run_id in self.local_runs()
         cached = run_id in self.cached_runs()
-        remote = False
-        if self.store is not None:
-            remote = self.store.head(self.cfg.index_key(run_id)) is not None
+        remote = self._remote_shape(run_id) is not None
         if local:
             return "local+s3" if remote else "local"
         if cached and remote:
@@ -172,14 +187,20 @@ class DataSource:
             if run_id in refs:
                 continue
             span = manifest.get("span_ns")
+            # A legacy tarball manifest carries only {size_bytes, sha256}: the
+            # richer facts did not exist when retention wrote it, and inventing
+            # them would mean extracting every archive just to list it.
+            totals = manifest.get("totals")
+            size = totals["size_bytes"] if totals else manifest.get("size_bytes")
+            stored = totals["stored_bytes"] if totals else manifest.get("size_bytes")
             refs[run_id] = RunRef(
                 run_id=run_id,
-                epoch_ns=manifest["epoch_ns"],
+                epoch_ns=manifest.get("epoch_ns") or _epoch_of(run_id),
                 location="s3",
                 local_path=None,
                 span_ns=(span[0], span[1]) if span else None,
-                size_bytes=manifest["totals"]["size_bytes"],
-                stored_bytes=manifest["totals"]["stored_bytes"],
+                size_bytes=size,
+                stored_bytes=stored,
                 pmlr_version=manifest.get("pmlr_version"),
                 windows_2h_complete=manifest.get("windows_2h_complete"),
                 venues=_venues_from_catalog(manifest),
@@ -218,14 +239,25 @@ class DataSource:
             self._marker(run_id).touch()
             return cached
 
-        if self._archiver is None:
+        if self._archiver is None or self.store is None:
             raise DataSourceError(f"{run_id}: not local and the archive is disabled")
 
-        manifest = self._archiver.verify(run_id)
-        needed = int(manifest["totals"]["size_bytes"])
-        self._make_room(needed)
-        pulled = self._archiver.pull(run_id, self.cfg.cache_dir)
-        return pulled
+        # A directory archive is preferred; a legacy tarball is the fallback,
+        # because the oldest week of history only exists in that shape.
+        shape = self._remote_shape(run_id)
+        if shape == "run":
+            manifest = self._archiver.verify(run_id)
+            self._make_room(int(manifest["totals"]["size_bytes"]))
+            return self._archiver.pull(run_id, self.cfg.cache_dir)
+
+        if shape == "tarball":
+            manifest = self._archiver.verify_tarball(run_id)
+            # The tarball AND its expansion coexist on disk during extraction,
+            # so budget for both rather than for the compressed size alone.
+            self._make_room(int(manifest["size_bytes"]) * 6)
+            return self._archiver.pull_tarball(run_id, self.cfg.cache_dir)
+
+        raise DataSourceError(f"{run_id}: not local and not in the archive")
 
     def _make_room(self, needed_bytes: int) -> None:
         """Evict by LRU, then refuse if the volume still could not take it.

@@ -705,6 +705,82 @@ class Archiver:
         self.store.put_bytes(index_key, manifest_bytes(manifest))
         return PushResult(run_id, 1, size, size, parts, self._clock() - started)
 
+    def tarball_index_key(self, run_id: str) -> str:
+        return f"{self.cfg.prefix}/tarballs/{self.cfg.host_id}/{run_id}.json"
+
+    def list_tarballs(self) -> dict[str, dict[str, typing.Any]]:
+        """Every run held as a legacy tarball rather than as a directory."""
+        out: dict[str, dict[str, typing.Any]] = {}
+        prefix = f"{self.cfg.prefix}/tarballs/{self.cfg.host_id}/"
+        for meta in self.store.list(prefix):
+            if not meta.key.endswith(".json"):
+                continue
+            manifest = json.loads(self.store.get_bytes(meta.key))
+            out[manifest["run"]] = manifest
+        return out
+
+    def verify_tarball(self, run_id: str) -> dict[str, typing.Any]:
+        index = self.store.head(self.tarball_index_key(run_id))
+        if index is None:
+            raise ArchiveError(f"{run_id}: no tarball index object", EXIT_FAILED)
+        manifest = json.loads(self.store.get_bytes(self.tarball_index_key(run_id)))
+        head = self.store.head(manifest["key"])
+        if head is None:
+            raise ArchiveError(f"{manifest['key']}: missing from the bucket", EXIT_FAILED)
+        if head.size != int(manifest["size_bytes"]):
+            raise ArchiveError(f"{manifest['key']}: size disagrees with the manifest", EXIT_FAILED)
+        return typing.cast(dict[str, typing.Any], manifest)
+
+    def pull_tarball(self, run_id: str, into: pathlib.Path) -> pathlib.Path:
+        """Materialise a run that was archived as a legacy ``.tar.gz``.
+
+        Same invisibility law as a directory pull: everything happens under a
+        ``.partial`` suffix, which breaks the ``run-<digits>`` name that every
+        discovery law keys on, so an interrupted extraction is nothing rather
+        than a half-run some backtest quietly reads.
+
+        The tarball's sha256 is checked BEFORE extraction — untarring an
+        unverified archive would scatter unverified files across the cache.
+        """
+        manifest = self.verify_tarball(run_id)
+        partial = into / f"{run_id}.partial"
+        shutil.rmtree(partial, ignore_errors=True)
+        partial.mkdir(parents=True, exist_ok=True)
+        blob = partial / f"{run_id}.tar.gz"
+        try:
+            self.store.get(manifest["key"], blob, expect_size=int(manifest["size_bytes"]))
+            digest, _md5, _size = _digests(blob)
+            if digest != manifest["sha256"]:
+                raise ArchiveError(f"{run_id}: tarball sha256 mismatch", EXIT_FAILED)
+            done = subprocess.run(
+                ["tar", "-xzf", str(blob), "-C", str(partial)],
+                capture_output=True,
+                check=False,
+            )
+            if done.returncode != 0:
+                raise ArchiveError(f"{run_id}: tar -xzf exited {done.returncode}", EXIT_FAILED)
+            blob.unlink(missing_ok=True)
+            # retention tarred with `-C <log root> <name>`, so the archive holds
+            # a single `run-<ns>/` directory. Tolerate a flat layout too.
+            inner = partial / run_id
+            source = inner if inner.is_dir() else partial
+            final = into / run_id
+            shutil.rmtree(final, ignore_errors=True)
+            if source is inner:
+                os.replace(inner, final)
+                shutil.rmtree(partial, ignore_errors=True)
+            else:
+                os.replace(partial, final)
+        except BaseException:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
+        marker = into / f".{run_id}.complete"
+        marker.write_text(
+            json.dumps({"manifest_sha256": hashlib.sha256(manifest_bytes(manifest)).hexdigest()}),
+            encoding="utf-8",
+        )
+        return final
+
     def push_derived(self, kind: str, path: pathlib.Path) -> PushResult:
         """A derived store (candles db, a report, a features day).
 
@@ -914,8 +990,15 @@ def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately f
             print(result.tell(), file=sys.stderr)
         return EXIT_OK
     if args.verb == "verify":
-        archiver.verify(_run_id(args.run), deep=args.deep)
-        print(f"archive: {_run_id(args.run)} verified", file=sys.stderr)
+        run_id = _run_id(args.run)
+        if archiver.store.head(cfg.index_key(run_id)) is not None:
+            archiver.verify(run_id, deep=args.deep)
+        else:
+            # retention asks this question about runs it is about to delete, and
+            # the oldest week is held as legacy tarballs — answering "no" for
+            # those would keep data forever that IS safely in the bucket.
+            archiver.verify_tarball(run_id)
+        print(f"archive: {run_id} verified", file=sys.stderr)
         return EXIT_OK
     if args.verb == "list":
         since = int(args.since) if args.since.isdigit() else None
@@ -924,7 +1007,11 @@ def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately f
         return EXIT_OK
     if args.verb == "pull":
         into = pathlib.Path(args.into).expanduser() if args.into else cfg.cache_dir
-        print(str(archiver.pull(_run_id(args.run), into)))
+        run_id = _run_id(args.run)
+        if archiver.store.head(cfg.index_key(run_id)) is not None:
+            print(str(archiver.pull(run_id, into)))
+        else:
+            print(str(archiver.pull_tarball(run_id, into)))
         return EXIT_OK
     if args.verb == "gc":
         print(json.dumps(gc_cache(cfg, args.max_gib or cfg.cache_max_gib)))

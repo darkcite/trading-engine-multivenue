@@ -161,11 +161,16 @@ def test_host_id_regex(host_id: str, ok: bool, tmp_path: pathlib.Path) -> None:
         )
 
 
-def test_defaults_are_the_s0_pinned_values(tmp_path: pathlib.Path) -> None:
+def test_defaults_are_the_measured_values(tmp_path: pathlib.Path) -> None:
     cfg = claude_worker.archive_config.load(env=FULL_ENV, env_file=nowhere(tmp_path))
-    assert cfg.part_size_mib == 8, "S0 measured 1.6-2.3 MiB/s; 64 MiB parts blew the timeout"
-    assert cfg.part_size == 8 * 1024 * 1024
-    assert cfg.timeout_s == 300.0
+    # Bounded from both sides by measurement: multipart costs ~3x a single PUT
+    # per PART (2.29 vs 7.36 MiB/s), so bigger is faster; but a part must still
+    # finish inside the timeout on a bad network window, and this link has been
+    # seen at 0.1 MiB/s. 32 MiB against 900 s survives ~0.04 MiB/s.
+    assert cfg.part_size_mib == 32
+    assert cfg.part_size == 32 * 1024 * 1024
+    assert cfg.part_size >= claude_worker.objstore.MIN_PART_SIZE
+    assert cfg.timeout_s == 900.0
     assert cfg.zstd_level == 3
     assert cfg.concurrency == 1
     assert cfg.cache_max_gib == 20
@@ -177,8 +182,8 @@ def test_malformed_numeric_values_fall_back_to_defaults(tmp_path: pathlib.Path) 
     env = dict(FULL_ENV, MULTIVENUE_S3_PART_SIZE_MIB="not-a-number", MULTIVENUE_S3_TIMEOUT_S="")
     cfg = claude_worker.archive_config.load(env=env, env_file=nowhere(tmp_path))
     assert cfg.enabled
-    assert cfg.part_size_mib == 8
-    assert cfg.timeout_s == 300.0
+    assert cfg.part_size_mib == 32
+    assert cfg.timeout_s == 900.0
 
 
 def test_unknown_addressing_falls_back_to_virtual(tmp_path: pathlib.Path) -> None:

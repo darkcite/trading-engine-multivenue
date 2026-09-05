@@ -76,11 +76,17 @@ DEFAULTS: typing.Final[dict[str, str]] = {
     "MULTIVENUE_S3_CACHE_MAX_GIB": "20",
     "MULTIVENUE_S3_CACHE_MIN_FREE_GIB": "25",
     "MULTIVENUE_S3_ZSTD_LEVEL": "3",
-    # 8, not the AWS-conventional 64: S0 measured 1.6-2.3 MiB/s at background
-    # QoS, where a 64 MiB part cannot finish inside a sane request timeout.
-    "MULTIVENUE_S3_PART_SIZE_MIB": "8",
+    # 32 MiB. Two measurements bound this from both sides:
+    #   * multipart costs ~3x a single PUT on this endpoint (2.29 vs 7.36 MiB/s
+    #     measured), and that penalty is per PART — so bigger parts are faster.
+    #   * a part must still finish inside TIMEOUT_S on a BAD network window.
+    #     The link is highly variable here (0.1 MiB/s observed at one point,
+    #     5-7 MiB/s at another), so 32 MiB against a 900 s timeout survives
+    #     roughly 0.04 MiB/s, while the 64 MiB the plan first proposed blew a
+    #     120 s timeout outright.
+    "MULTIVENUE_S3_PART_SIZE_MIB": "32",
     "MULTIVENUE_S3_CONCURRENCY": "1",
-    "MULTIVENUE_S3_TIMEOUT_S": "300",
+    "MULTIVENUE_S3_TIMEOUT_S": "900",
     "MULTIVENUE_S3_SKIP_GLOBS": "",
 }
 

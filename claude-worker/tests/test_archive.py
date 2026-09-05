@@ -17,6 +17,7 @@ import json
 import pathlib
 import random
 import struct
+import subprocess
 import typing
 
 import pytest
@@ -488,6 +489,79 @@ def test_list_runs_returns_one_row_per_complete_run(tmp_path: pathlib.Path) -> N
 # --------------------------------------------------------------------------
 # the key schema
 # --------------------------------------------------------------------------
+
+
+def test_tarball_round_trip_extracts_the_original_run(tmp_path: pathlib.Path) -> None:
+    """The oldest week of history exists ONLY as legacy tarballs, so a tarball
+    that cannot be pulled back is write-only storage."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    run = make_run(logs, f"run-{EPOCH_NS}")
+    original = {p.name: p.read_bytes() for p in run.iterdir()}
+
+    # exactly the shape retention.sh writes: tar -czf <out> -C <root> <name>
+    tarball = tmp_path / f"{run.name}.tar.gz"
+    subprocess.run(
+        ["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True
+    )
+    result = archiver.push_tarball(tarball)
+    assert result.files == 1
+    assert cfg.tarballs_prefix() + run.name + ".tar.gz" in fake.objects
+
+    archiver.verify_tarball(run.name)
+    pulled = archiver.pull_tarball(run.name, tmp_path / "cache2")
+    assert pulled.name == run.name
+    assert {p.name: p.read_bytes() for p in pulled.iterdir()} == original
+
+
+def test_tarball_push_is_idempotent(tmp_path: pathlib.Path) -> None:
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    run = make_run(logs, f"run-{EPOCH_NS}")
+    tarball = tmp_path / f"{run.name}.tar.gz"
+    subprocess.run(["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True)
+    archiver.push_tarball(tarball)
+    fake.put_keys.clear()
+    assert archiver.push_tarball(tarball).skipped
+    assert fake.put_keys == []
+
+
+def test_corrupt_tarball_is_never_extracted(tmp_path: pathlib.Path) -> None:
+    """Untarring an unverified archive would scatter unverified files across
+    the cache, so the sha256 is checked BEFORE tar runs."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    run = make_run(logs, f"run-{EPOCH_NS}")
+    tarball = tmp_path / f"{run.name}.tar.gz"
+    subprocess.run(["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True)
+    archiver.push_tarball(tarball)
+
+    key = cfg.tarballs_prefix() + run.name + ".tar.gz"
+    fake.objects[key] = b"\x00" * len(fake.objects[key])  # same length, wrong bytes
+    with pytest.raises(claude_worker.archive.ArchiveError, match="sha256"):
+        archiver.pull_tarball(run.name, tmp_path / "cache3")
+    assert not (tmp_path / "cache3" / run.name).exists()
+    assert claude_worker.features.run_dirs(tmp_path / "cache3") == []
+
+
+def test_verify_tarball_rejects_a_missing_object(tmp_path: pathlib.Path) -> None:
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    run = make_run(logs, f"run-{EPOCH_NS}")
+    tarball = tmp_path / f"{run.name}.tar.gz"
+    subprocess.run(["tar", "-czf", str(tarball), "-C", str(logs), run.name], check=True)
+    archiver.push_tarball(tarball)
+    del fake.objects[cfg.tarballs_prefix() + run.name + ".tar.gz"]
+    with pytest.raises(claude_worker.archive.ArchiveError, match="missing"):
+        archiver.verify_tarball(run.name)
 
 
 def test_key_order_property_lexicographic_equals_numeric(tmp_path: pathlib.Path) -> None:
