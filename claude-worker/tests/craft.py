@@ -18,19 +18,21 @@ _SLOT = claude_worker.pmlr.SLOT_SIZE
 _HDR = claude_worker.pmlr.HEADER_SIZE
 
 
-def write_ticks(
+def write_ticks(  # noqa: PLR0913 — one parameter per header/slot field, deliberately
     path: pathlib.Path,
     ts_list: list[int],
     epoch_ns: int,
     sym: int = 42,
     venue: int = 0,
+    version: int = 2,
 ) -> None:
-    """One v2 PMLR tick file with the given slot timestamps (the reader's
+    """One PMLR tick file with the given slot timestamps (the reader's
     own struct formats — no second layout to drift). The v3 fields
     (flags, venue_time_ms) are packed as 0 — byte-identical to a v2
-    writer's zeroed tail pad."""
+    writer's zeroed tail pad; ``version`` only stamps the header (RG4's
+    window pool refuses stale-blind v2 runs, so its tests write 3)."""
     header = claude_worker.pmlr._HEADER.pack(  # noqa: SLF001 — reader-defined layout, deliberately
-        claude_worker.pmlr.MAGIC, 2, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
+        claude_worker.pmlr.MAGIC, version, claude_worker.pmlr.SLOT_KIND_TICK, epoch_ns
     )
     blob = bytearray(header + bytes(_HDR - len(header)))
     for i, ts in enumerate(ts_list):
@@ -47,12 +49,13 @@ def write_run(
     epoch_ns: int,
     ts_list: list[int],
     venue_label: str = "pm",
+    version: int = 2,
 ) -> pathlib.Path:
     """One ``run-<epoch>`` dir holding a single crafted tick file."""
     run_dir = replay_dir / f"run-{epoch_ns}"
     run_dir.mkdir(parents=True, exist_ok=True)
     if ts_list:
-        write_ticks(run_dir / f"{venue_label}-ticks.pmlr", ts_list, epoch_ns)
+        write_ticks(run_dir / f"{venue_label}-ticks.pmlr", ts_list, epoch_ns, version=version)
     return run_dir
 
 

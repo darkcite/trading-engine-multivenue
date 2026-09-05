@@ -128,6 +128,34 @@ Exit 3 → the gate spoke; the answer is a better ruleset, not a retry.
 
 The scripted test executes exactly this sequence.
 
+0a. `cd claude-worker && uv run python -m claude_worker.regime report` —
+    the worker-measured regime words (fast 1 h / slow 4 h) with every
+    dimension's raw value and bands, the declaration in force, the
+    ENGINE's own words (measured / declared / effective from `/metrics`)
+    and the last 24 h of words. Read it before anything else: the regime
+    is a GATE on every labelled row, never a signal. Exit 2 with a tell
+    when `~/multivenue/regime.toml` or `candles.db` is absent — then the
+    engine runs regime-blind and every labelled row fails CLOSED.
+0b. Rule on the mode: `uv run python -m claude_worker.regime declare
+    --fast measured --ttl 900` confirms the measurement (or `--fast
+    "trend:bull,vol:high" --slow measured` overrides the dimensions you
+    name, for the TTL, then the measurement resumes). A declaration
+    never flips the table — it only re-judges the row gates. Skip this
+    step when you have no reason to disagree with the measurement.
+0c. `uv run python -m claude_worker.library list --regime current` — the
+    validated members that FIT the effective words (∃ label allowing
+    both profiles; `--all` shows the non-fitting ones, `--include
+    candidates` is the composer's flag, `--status candidate` lists the
+    unproven). Then, to add strategy: author NEW members whose rows
+    carry `regimes` keys (§8 — **RG8 law, operator ruling 2026-09-05:
+    every row you author MUST carry `regimes`; an unlabelled member is
+    a candidate at best, never `validated`, never composed, and the
+    gate refuses a table whose labels earn nothing against `--regime
+    off`**), `library add --from R.json --name …`,
+    `uv run python -m claude_worker.compose --dry-run` to see the
+    composed table for the current words, and continue with steps 4–10
+    unchanged on the composed artifact (`compose` prints its path) — or
+    let `compose --promote` run the gate + steps 5–7 in one go (§8).
 1. `claude-worker fetch` — refresh feature files; read them.
 2. `claude-worker positions --json` — know the book before you act.
 3. Author the ruleset JSON: `{"rows": [ROW, …]}`, 1..256 rows, all one
@@ -217,3 +245,68 @@ The scripted test executes exactly this sequence.
   single frame namespace; interleaved processes would interleave seqs.
 - If a verb exits 1, stop and surface the traceback to the operator —
   fail-fast is policy, not an inconvenience.
+
+## 8. Strategy library + composer (RG4, `docs/regime-and-dashboard-plan.md` §5.2–§5.3)
+
+Where AI strategies LIVE: the library. The unit is a **member** — a named
+row set sharing a thesis (regime-specific VARIANTS of one signal are
+separate rows of the SAME member; the engine's per-row masks pick the
+open variant) or a coded-member reference (`icdp@<sha256>`, catalog
+only). A **table** is a composition of members. Both lanes are module
+lanes (`uv run python -m …` from `claude-worker/`), not verbs — the
+8-verb surface and the frozen `stage-ruleset` / `commit-ruleset` pair
+are untouched; the library sits BEFORE them.
+
+- Files: `~/multivenue/worker/library/<member_id>.json`
+  (`$CLAUDE_WORKER_LIBRARY_DIR`); index + evidence + the table↔members
+  link in `state.db` (`library`, `library_evidence`, `compositions`).
+  `member_id` = sha256 of the canonical rows — content-addressed like an
+  artifact (a single-member table's hash IS its member id); labels,
+  thesis and status are metadata and never change the id.
+- `library import-catalog` — one-time, idempotent: every registry row and
+  raw candidate becomes a member with its hash + thesis; ONLY the table
+  the engine runs is `validated`, everything else `candidate` until
+  `evidence` on ≤ 2 h seeded v3 windows re-validates it (v2-era gate
+  passes were stale-blind). `list [--regime current|"<decl>[;<decl>]"]
+  [--status …] [--all] [--json]` · `add --from R.json --name N [--thesis T]
+  [--regimes "t1,t2"]… [--regime-off soft|hard] [--split-by-name-prefix]`
+  · `label <member> --regimes "…" [--regimes "…"] | --any` (∃ across
+  flags) · `validate | retire | candidate <member>` · `evidence <member>
+  --window <cut> …` (the harness on one ≤ 2 h window, `0/100` split,
+  the operator's fee tier, `--emit-detail`: records fills, ticks, the
+  zero-fee and tier nets, the dominant word and whether the window was
+  stale-JUDGED). A member is addressed by exact id, a ≥ 8-char id
+  prefix, or its exact name.
+- `compose [--regime …] [--include-candidates] [--fit-from-evidence]
+  [--dry-run | --promote] [--pool-size K] [--no-lowo] [--freeze |
+  --unfreeze]` — selects the members that fit the effective words or
+  their NEIGHBOURHOOD (one dimension of one profile away), orders them
+  by judged tier evidence, admits them while rule 5 (names), rule 8
+  (one identity tuple + intersecting regions = duplicate — the later
+  member waits) and rule 7 (caps, both legs of a position row) hold,
+  emits canonical bytes (same inputs ⇒ same hash), then GATES on the
+  window pool — the newest K = 8 complete ≤ 2 h seeded windows, pruned
+  by COUNT (never by a time): the frozen pooled `backtest` (the report
+  a stage binds on), `--regime off` on the same pool (the labels must
+  not be worse than their absence), leave-one-window-out (every
+  pool-minus-one keeps OOS net > 0), evidence rows for every member ×
+  window. Every run is charged to a 2 h WALL BUDGET: a gate that would
+  run longer FAILS (exit 3) — it never waits. `--promote` installs,
+  stages and commits ONLY on a hash change and only without the
+  `compositions/FREEZE` pin (`--freeze` during a soak); it then watches
+  `engine_vm_table_epoch` for the flip.
+- Laws: the regime is a gate, not a signal; exits are never gated; a
+  labelled member fails CLOSED while a constrained dimension is UNKNOWN
+  (engine warm-up after a restart); research substance (evidence,
+  reports) never enters git. **RG8 (operator ruling 2026-09-05 —
+  labels are enforced everywhere):** an unlabelled member is ANY and
+  may exist only as a CANDIDATE (`library import-catalog` / `add` keep
+  legacy artifacts importable) — `validate` refuses it, `compose`
+  excludes it (`--include-any` is the explicit override), the
+  strategist's proposal parser refuses a proposal with ONE unlabelled
+  row (`serve` archives it as malformed), and the backtest gate of a
+  labelled table compares it against `--regime off` (net_on ≥ net_off,
+  the 6th gate — a label must EARN itself). Coded members are held to
+  the same law through `regime.toml` `[labels] require = true` (the
+  engine refuses to boot an enabled signal-carrying coded member with an
+  ANY label). Retire the unlabelled original once its variants exist.

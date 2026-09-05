@@ -40,3 +40,11 @@ uv run python -m claude_worker.iv_digest ||
 # (same rolling-window/skip laws as the IV digest).
 uv run python -m claude_worker.depth_digest ||
   echo "candles-cycle: depth_digest failed (non-fatal; next hour retries)" >&2
+# 2026-09-05: the WS11 funding-history lane rides here too. It used to
+# ride com.multivenue.carry (deleted at the 2026-09-02 bootout) and the
+# `funding` table silently froze at 2026-09-02 14:00Z — the boot
+# FundingSeed frames, the regime FUND dims and the per-window
+# funding-seed.tsv all read it. Idempotent (INSERT OR IGNORE), one
+# newest page per instrument, best-effort.
+uv run python -m claude_worker.funding ||
+  echo "candles-cycle: funding failed (non-fatal; next hour retries)" >&2

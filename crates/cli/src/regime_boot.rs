@@ -38,6 +38,9 @@ pub struct ResolvedRegime {
     pub hash: [u8; 32],
     /// Members that did not resolve (only with `drop_unresolved_members`).
     pub members_dropped: usize,
+    /// RG8: `[labels] require = 1` — the set builder refuses an enabled
+    /// signal-carrying coded member whose label is ANY.
+    pub require_labels: bool,
 }
 
 /// Map a `[labels.<member>]` name to its strategy-set slot.
@@ -99,6 +102,7 @@ pub fn resolve_regime_file(
         labels,
         hash: core_crypto::sha256(bytes),
         members_dropped,
+        require_labels: file.require_labels,
     })
 }
 
@@ -175,6 +179,7 @@ pub fn load_regime_boot(
         labels: resolved.labels,
         seed,
         hash: resolved.hash,
+        require_labels: resolved.require_labels,
     }))
 }
 
@@ -192,6 +197,7 @@ mod tests {
             confirm_min: 3,
             profiles: [ProfileParams::FAST_DEFAULT, ProfileParams::SLOW_DEFAULT],
             labels: Vec::new(),
+            require_labels: false,
         }
     }
 

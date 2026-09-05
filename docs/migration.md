@@ -30,6 +30,62 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-09-05 — The harness funding seed: `funding-seed.tsv` per window, `backtest --funding-seed` (RG4 carry blocker)
+
+**What changed**
+
+- `backtest` gains `--funding-seed <path>` (`cli::backtest::funding`):
+  a `descriptor \t ts_ms \t rate_1e9` file (`#` comments; malformed =
+  fatal) becomes synthesized `AiCmdKind::FundingSeed` commands applied
+  through the vm's live `on_ai` path — dedup law included — BEFORE the
+  first replayed record. Default = the first run directory's own
+  `funding-seed.tsv` when it exists, else none. With a seed applied the
+  V5 warm-up law drops the `apr24`/`apr72` 24 h / 72 h requirement
+  (the seed IS the prints' history; a seed shorter than a feature's
+  window leaves that feature ABSENT by the feature law). Summary gains
+  `funding: seed_prints=… dropped=… deduped=… warmup=seeded|table`
+  plus a `funding: seed <path> …` build tell. `audit-pnl` is untouched
+  (it audits what happened; no vm warm-up is involved).
+- Worker: `window_root.cut_run` writes the window's `funding-seed.tsv`
+  whenever `seed=(…, candles.db)` names a store with a funding table —
+  the window's manifest × the funding table under the boot seed lane's
+  own law (`claude_worker.seeds.funding_seed_rows`: 73 h before the
+  window's first instant, exclusive; newest 640 per sym; rate ×1e9
+  RAW). `pool_ensure` back-fills the file on reused cuts (no re-cut).
+  Neither file is in git (a window root is research data).
+
+**Why**
+
+- Under the ≤ 2 h law a funding-carry member (`apr24`/`apr72`) could
+  never be evidenced — the table-global 24 h warm-up swallowed every
+  2 h window (0 orders). Live, the same row is warm from its first
+  minute because the boot seed lane pushes 73 h of prints; the replay
+  now has the same warm-up, so the library / composer can evidence
+  carry members on the standing pool (RG4's "≥ 2 members" exit tell).
+
+**Impact**
+
+- On-disk formats: a new optional per-window file `funding-seed.tsv`
+  beside the manifests. Schema-1 stdout unchanged; `--emit-detail`
+  unchanged (`detail_version` 4).
+- Config keys: none. Wire formats: none (kind 10 frames, unchanged).
+- Behaviour: NONE without a seed file (`warmup=table` = the V5 law);
+  a root whose first run carries `funding-seed.tsv` replays seeded —
+  the frozen worker argv picks it up by default, which is the point.
+
+**Migration steps**
+
+1. `cargo build --release -p cli` (pitfall 18 — the harness is the
+   release binary).
+2. Existing pool windows gain the file on the next `pool_ensure`
+   (composer run) with `candles.db`; single windows: cut again with
+   `seed=(regime.toml, candles.db)`, or pass `--funding-seed`.
+
+**Rollback**
+
+- Delete the per-window files (or pass `--funding-seed /dev/null` —
+  an empty seed = `warmup=table`).
+
 ## 2026-09-05 — Ruleset grammar v2.1 regime keys, the vm row gate, the regime-aware harness (RG3)
 
 **What changed**

@@ -15,7 +15,7 @@ as runs of their own:
 * the 64-byte header is copied with ``epoch_ns`` advanced by the
   window's offset from the run's first tick, and the window directory is
   named ``run-<advanced epoch>`` — the harness's directory/epoch check
-  holds and its wall rebase (``wall = epoch + (ts − ts_first)``) lands
+  holds and its wall rebase (``wall = epoch + (ts - ts_first)``) lands
   on the true wall clock, so consecutive windows are disjoint runs on
   its virtual timeline;
 * the manifests are copied;
@@ -27,6 +27,12 @@ as runs of their own:
   force at the cut. The harness clamps such a frame to its first tick
   and shortens the TTL by the clamp, so the carried declaration expires
   on the true wall clock.
+* the harness FUNDING seed (RG4's carry blocker, 2026-09-05): with a
+  ``candles.db`` the cut writes ``funding-seed.tsv`` — the window's
+  manifest × the funding table, the boot seed lane's own law
+  (``claude_worker.seeds.funding_seed_rows``: 73 h before the window's
+  first instant) — so a ≤ 2 h window replays an ``apr24``/``apr72`` row
+  warm from its first tick exactly as the live engine is.
 
 Offline tool — allocation is fine; never imported by the engine.
 Convention: full ``import x`` only. No ``from x import y``.
@@ -36,10 +42,13 @@ import mmap
 import os
 import pathlib
 import shutil
+import sqlite3
 import struct
 import typing
 
+import claude_worker.iv_digest
 import claude_worker.regime
+import claude_worker.seeds
 
 HEADER_SIZE: int = 64
 SEED_FILE: str = "regime-seed.tsv"
@@ -221,7 +230,9 @@ def cut_run(
     closes BEFORE the window's first instant, from ``candles.db`` (derived
     data, not a capture window) — which the harness picks up by default
     so a ≤ 2 h window can warm the detector's 4 h profile. Either file
-    absent ⇒ no seed (the harness warms live and says so)."""
+    absent ⇒ no seed (the harness warms live and says so). The same
+    ``candles.db`` (its funding table) writes ``funding-seed.tsv`` for
+    the window's manifest — regime.toml is not needed for that one."""
     if to_s <= from_s or to_s - from_s > WINDOW_MAX_S:
         raise WindowError(f"window {from_s}..{to_s} s violates the 2 h law")
     span = run_span(run_dir)
@@ -255,4 +266,176 @@ def cut_run(
         )
         if report is not None:
             report(f"window-root: {run_dir.name} {SEED_FILE} {n_rows} rows for {n_desc} descriptors")
+    if seed is not None and seed[1].is_file():
+        n_desc, n_rows = funding_seed_out(out_dir, seed[1], new_epoch // 1_000_000)
+        if report is not None:
+            report(
+                f"window-root: {run_dir.name} {claude_worker.seeds.FUNDING_SEED_FILE}"
+                f" {n_rows} prints for {n_desc} descriptors"
+            )
     return out_dir
+
+
+def funding_seed_out(run_dir: pathlib.Path, db_path: pathlib.Path, now_ms: int) -> tuple[int, int]:
+    """Write ``run_dir/funding-seed.tsv`` from the run's own manifest and
+    the funding table (prints before ``now_ms``); returns
+    ``(descriptors, prints)``. No manifest, no funding table or no print
+    ⇒ nothing written, ``(0, 0)`` — the harness then warms from the
+    window and its summary says ``warmup=table``."""
+    manifest = claude_worker.iv_digest.read_manifest(run_dir)
+    if manifest is None:
+        return 0, 0
+    conn = sqlite3.connect(db_path)
+    try:
+        if not claude_worker.seeds.has_funding_table(conn):
+            return 0, 0
+        rows, stats = claude_worker.seeds.funding_seed_rows(conn, manifest[0], now_ms)
+    finally:
+        conn.close()
+    if not rows:
+        return 0, 0
+    out = run_dir / claude_worker.seeds.FUNDING_SEED_FILE
+    claude_worker.seeds.write_funding_seed_tsv(out, rows)
+    return stats.descriptors, stats.frames
+
+
+# ---- RG4: the standing window POOL (plan §5.3 gate shape) ----
+#
+# The composer's gate runs on N ≥ 4 pooled DISJOINT ≤ 2 h seeded windows
+# that already exist. The nightly lane deletes its cuts, so the pool is
+# its own directory of `run-<epoch>` cuts, filled newest-first from the
+# capture runs and pruned by WINDOW COUNT — never by a time: the
+# operator's 2026-09-05 ruling forbids any test / soak / protect time
+# beyond 2 hours, so "keep the last K windows" is the only retention law
+# this pool knows. A window is admitted only when the run holds it in
+# full (the growing tail of the live run waits for its next cut).
+
+POOL_DIRNAME: str = "windows"
+POOL_SIZE_DEFAULT: int = 8
+#: PMLR versions below this are stale-BLIND (no venue time — pitfall 17);
+#: the pool refuses them so every evidence row is a judged one.
+POOL_MIN_PMLR_VERSION: int = 3
+
+
+def pool_dir_for(db_path: pathlib.Path) -> pathlib.Path:
+    """``<worker dir>/windows`` beside ``state.db`` (the ``regime_dir_for``
+    precedent — no new env key)."""
+    return db_path.parent / POOL_DIRNAME
+
+
+def complete_windows(run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S) -> list[tuple[float, float]]:
+    """The FULL ``window_s`` slices a run holds (``windows_of`` minus the
+    partial tail) — the only windows a pool may cut."""
+    span = run_span(run_dir)
+    if span is None:
+        return []
+    total_s = (span[1] - span[0]) / 1e9
+    return [w for w in windows_of(run_dir, window_s) if w[1] <= total_s]
+
+
+def run_pmlr_version(run_dir: pathlib.Path) -> int | None:
+    """The PMLR version of the run's tick files (the minimum over them);
+    None when the run has no tick file."""
+    version: int | None = None
+    for p in sorted(run_dir.glob("*-ticks.pmlr")):
+        try:
+            v, _kind, _epoch = _header(p)
+        except WindowError:
+            continue
+        version = v if version is None else min(version, v)
+    return version
+
+
+class PoolWindow(typing.NamedTuple):
+    """One candidate cut: its source run, offsets and the cut's dir name."""
+
+    run_dir: pathlib.Path
+    from_s: float
+    to_s: float
+    name: str
+
+
+def pool_candidates(logs_dir: pathlib.Path, window_s: float = WINDOW_MAX_S) -> list[PoolWindow]:
+    """Every complete window of every judged (v3+) run under ``logs_dir``,
+    NEWEST cut first (by the cut's own epoch)."""
+    out: list[tuple[int, PoolWindow]] = []
+    for run_dir in logs_dir.glob("run-*"):
+        if not run_dir.is_dir():
+            continue
+        try:
+            epoch_ns = int(run_dir.name[4:])
+        except ValueError:
+            continue
+        version = run_pmlr_version(run_dir)
+        if version is None or version < POOL_MIN_PMLR_VERSION:
+            continue
+        for lo, hi in complete_windows(run_dir, window_s):
+            cut_epoch = epoch_ns + int(lo * 1e9)
+            out.append((cut_epoch, PoolWindow(run_dir, lo, hi, f"run-{cut_epoch}")))
+    out.sort(key=lambda t: t[0], reverse=True)
+    return [w for _e, w in out]
+
+
+def pool_windows(pool_dir: pathlib.Path) -> list[pathlib.Path]:
+    """The cuts the pool holds, oldest first (by name = epoch)."""
+    if not pool_dir.is_dir():
+        return []
+    return sorted((p for p in pool_dir.glob("run-*") if p.is_dir()), key=lambda p: p.name)
+
+
+def pool_ensure(  # noqa: PLR0913 — one parameter per pool knob, deliberately
+    logs_dir: pathlib.Path,
+    pool_dir: pathlib.Path,
+    k: int,
+    seed: tuple[pathlib.Path, pathlib.Path] | None,
+    *,
+    report: typing.Callable[[str], None] | None = None,
+    window_s: float = WINDOW_MAX_S,
+) -> list[pathlib.Path]:
+    """Bring the pool to the NEWEST ``k`` complete windows: reuse cuts that
+    exist, cut the missing ones (with their seeds), prune every cut that
+    is no longer among the newest ``k`` — pruning by COUNT only. Returns
+    the pool's window dirs, oldest first. A reused cut that predates the
+    funding seed gets its ``funding-seed.tsv`` back-filled (same law,
+    same ``candles.db``) — the pool never needs a re-cut for it."""
+    if k <= 0:
+        raise WindowError("pool size must be positive")
+    wanted = pool_candidates(logs_dir, window_s)[:k]
+    wanted_names = {w.name for w in wanted}
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    existing = {p.name: p for p in pool_windows(pool_dir)}
+    for w in wanted:
+        if w.name in existing:
+            cut = existing[w.name]
+            if (
+                seed is not None
+                and seed[1].is_file()
+                and not (cut / claude_worker.seeds.FUNDING_SEED_FILE).is_file()
+            ):
+                n_desc, n_rows = funding_seed_out(cut, seed[1], int(w.name[4:]) // 1_000_000)
+                if report is not None and n_rows:
+                    report(
+                        f"window-pool: {w.name} {claude_worker.seeds.FUNDING_SEED_FILE}"
+                        f" back-filled {n_rows} prints for {n_desc} descriptors"
+                    )
+            continue
+        cut_run(w.run_dir, pool_dir, w.from_s, w.to_s, report=report, seed=seed)
+        if report is not None:
+            report(f"window-pool: cut {w.name} <- {w.run_dir.name} {w.from_s:.0f}..{w.to_s:.0f} s")
+    for name, path in existing.items():
+        if name not in wanted_names:
+            shutil.rmtree(path, ignore_errors=True)
+            if report is not None:
+                report(f"window-pool: pruned {name} (beyond the newest {k})")
+    return [p for p in pool_windows(pool_dir) if p.name in wanted_names]
+
+
+def symlink_root(dst: pathlib.Path, windows: typing.Iterable[pathlib.Path]) -> pathlib.Path:
+    """A replay root of symlinks to the given window dirs (the bounded
+    symlink-root shape) — what a leave-one-window-out run replays."""
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True)
+    for w in windows:
+        (dst / w.name).symlink_to(w.resolve(), target_is_directory=True)
+    return dst

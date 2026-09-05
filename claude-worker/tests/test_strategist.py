@@ -41,7 +41,10 @@ def _row(**overrides: object) -> dict[str, object]:
 
 
 def _proposal_json(rows: list[dict[str, object]] | None = None, thesis: str = "lag fade") -> str:
-    return json.dumps({"thesis": thesis, "rows": [_row()] if rows is None else rows})
+    # RG8: the default row is the labelled v2 shape — a v1 sugar row has no
+    # label slot (byte-exact 8g key set), so a v1 PROPOSAL is refused now;
+    # the v1-arm tests below parse with `require_labels=False`.
+    return json.dumps({"thesis": thesis, "rows": [_v2()] if rows is None else rows})
 
 
 # ---- env keys (§7.5, read at the seam) -----------------------------------
@@ -189,9 +192,11 @@ def test_parse_proposal_good_two_rows() -> None:
         _row(),
         _row(name="x-dev", trigger={"type": "cross_deviation", "ref": 7}, side="ask"),
     ]
-    proposal = claude_worker.strategist.parse_proposal(_proposal_json(rows))
+    proposal = claude_worker.strategist.parse_proposal(_proposal_json(rows), require_labels=False)
     assert proposal is not None
     assert proposal.thesis == "lag fade"
+    # RG8: the same v1 proposal is refused under the default law.
+    assert claude_worker.strategist.parse_proposal(_proposal_json(rows)) is None
     assert len(proposal.rows) == 2
     assert list(proposal.rows[0]) == [
         "name", "family", "trigger", "sym", "side", "edge_bps", "horizon_ms", "max_risk_usd",
@@ -272,6 +277,7 @@ def _v2(**overrides: object) -> dict[str, object]:
         "exit": 1.0,
         "horizon_ms": 60_000,
         "max_risk_usd": 3_000.0,
+        "regimes": ["vol:low|normal"],  # RG8: labelled by default
     }
     base.update(overrides)
     return {key: value for key, value in base.items() if value is not None}
@@ -286,7 +292,7 @@ def test_parse_proposal_v2_row_round_trips() -> None:
     # Emission order is deterministic — artifact_bytes hashes these bytes.
     assert list(row) == [
         "name", "family", "instrument", "ref", "feature", "combine",
-        "abs", "enter", "exit", "horizon_ms", "max_risk_usd",
+        "abs", "enter", "exit", "regimes", "horizon_ms", "max_risk_usd",
     ]
 
 
@@ -373,7 +379,7 @@ def test_parse_proposal_v2_row_malformed(row: dict[str, object]) -> None:
 
 
 def test_static_block_v3_teaches_the_regime_keys_and_variants() -> None:
-    assert claude_worker.strategist.STRATEGIST_PROMPT_VERSION == "strategist-v4"
+    assert claude_worker.strategist.STRATEGIST_PROMPT_VERSION == "strategist-v5"
     text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
     for needle in ('"regimes"', '"regime_off"', '"rel"', "REGIME LAW", "GATE, never a signal",
                    "exits", "NEVER gated", "VARIANTS", "DISJOINT", "--regime off",
@@ -412,9 +418,17 @@ def test_parse_proposal_v3_regime_keys_round_trip_in_canonical_order() -> None:
         "name", "family", "instrument", "ref", "feature", "combine", "abs", "enter", "exit",
         "regimes", "regime_off", "rel", "horizon_ms", "max_risk_usd",
     ], "the regime keys sit before horizon_ms in the canonical emission"
-    # Unlabelled rows still parse (legacy artifacts) — the prompt asks,
-    # the validator does not require.
-    assert claude_worker.strategist.parse_proposal(_proposal_json([_v2()])) is not None
+    # RG8 (operator ruling 2026-09-05): an unlabelled row makes the
+    # PROPOSAL malformed; the library's structural `parse_row` seam still
+    # accepts it (legacy artifacts import as candidates).
+    bare = _v2()
+    del bare["regimes"]
+    assert claude_worker.strategist.parse_proposal(_proposal_json([bare])) is None
+    assert claude_worker.strategist.parse_proposal(_proposal_json([_v2(), bare])) is None
+    assert claude_worker.strategist.parse_proposal(_proposal_json([bare]), require_labels=False) is not None
+    assert claude_worker.strategist.parse_row(bare) is not None
+    assert "regimes" not in typing.cast(dict, claude_worker.strategist.parse_row(bare))
+    assert "REFUSED as malformed (RG8)" in claude_worker.strategist._STATIC_SYSTEM_TEXT
 
 
 @pytest.mark.parametrize(
@@ -455,8 +469,8 @@ def test_regime_term_structural_mirror(term: str, ok: bool) -> None:
         _v2(regimes=["trend:sideways"]),  # unknown value
         _v2(regimes=["mood:happy"]),  # unknown dimension
         _v2(regimes=["trend:bull"] * 17),  # more terms than (profile, dim) pairs
-        _v2(regime_off="soft"),  # off without regimes
-        _v2(rel="lagging"),  # rel without regimes
+        {k: v for k, v in _v2(regime_off="soft").items() if k != "regimes"},  # off without regimes
+        {k: v for k, v in _v2(rel="lagging").items() if k != "regimes"},  # rel without regimes
         _v2(regimes=["trend:bull"], regime_off="maybe"),
         _v2(regimes=["trend:bull"], rel="rel:lagging"),  # the array form, not the sugar
         _v2(regimes=["trend:bull"], rel="sideways"),
@@ -502,9 +516,9 @@ def test_parse_proposal_v2_mirrors_the_live_artifacts() -> None:
 
 
 def test_parse_proposal_oversized_row_count() -> None:
-    ok = [_row(name=f"r{i}") for i in range(256)]
+    ok = [_v2(name=f"r{i}") for i in range(256)]
     assert claude_worker.strategist.parse_proposal(_proposal_json(ok)) is not None
-    over = [_row(name=f"r{i}") for i in range(257)]
+    over = [_v2(name=f"r{i}") for i in range(257)]
     assert claude_worker.strategist.parse_proposal(_proposal_json(over)) is None
 
 
@@ -524,7 +538,7 @@ def test_write_candidate_canonical_hash_and_atomic(tmp_path: pathlib.Path) -> No
     # Canonical artifact: rows only (validator is unknown-key-strict).
     body = json.loads(candidate.path.read_text())
     assert set(body) == {"rows"}
-    assert body["rows"][0]["name"] == "t-row"
+    assert body["rows"][0]["name"] == "xv-okx-bnspot"
     assert not list(candidate.path.parent.glob("*.tmp")), "atomic write leaves no temp"
 
 
@@ -764,7 +778,7 @@ def test_static_block_v4_asks_for_the_regime_verdict() -> None:
 
 
 def test_parse_proposal_accepts_the_optional_regime_verdict_and_refuses_bad_ones() -> None:
-    base = {"thesis": "confirm", "rows": [_row()]}
+    base = {"thesis": "confirm", "rows": [_v2()]}
     p = claude_worker.strategist.parse_proposal(json.dumps({**base, "regime": {"fast": "measured"}}))
     assert p is not None and p.regime == {"fast": "measured"}
     p = claude_worker.strategist.parse_proposal(

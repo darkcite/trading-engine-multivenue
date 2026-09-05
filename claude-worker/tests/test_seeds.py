@@ -150,6 +150,40 @@ def test_funding_frames_raw_rate_law_and_caps_filter(tmp_path):
     assert f.side == claude_worker.frames.SIDE_NONE
 
 
+def test_funding_seed_rows_and_tsv_carry_the_harness_shape(tmp_path):
+    """The harness seed file (``funding-seed.tsv``) is the SAME law as
+    the boot frames: descriptor / venue ms / rate ×1e9 RAW, oldest
+    first, ``#`` header lines."""
+    now_ms = EPOCH_MS
+    _db, conn = _funding_db(
+        tmp_path,
+        [
+            (1, "binance-usdm:btcusdt", now_ms - 2 * MS_1H, 0.0001),
+            (1, "binance-usdm:btcusdt", now_ms - MS_1H, -0.00005),
+            (1, "binance:btcusdt", now_ms - MS_1H, 0.0001),  # spot: never seeded
+        ],
+    )
+    manifest = {(1, USDM_SYM): "binance-usdm:btcusdt", (0, SPOT_SYM): "binance:btcusdt"}
+    rows, stats = claude_worker.seeds.funding_seed_rows(conn, manifest, now_ms)
+    frames, fstats = claude_worker.seeds.funding_seed_frames(conn, manifest, now_ms)
+    conn.close()
+    assert stats == fstats == claude_worker.seeds.FundingStats(1, 2, 0)
+    assert rows == [
+        claude_worker.seeds.FundingSeedRow(USDM_SYM, "binance-usdm:btcusdt", now_ms - 2 * MS_1H, 100_000),
+        claude_worker.seeds.FundingSeedRow(USDM_SYM, "binance-usdm:btcusdt", now_ms - MS_1H, -50_000),
+    ]
+    assert [(f.sym, f.px, f.qty) for f in frames] == [(r.sym, r.rate_1e9, r.ts_ms) for r in rows]
+    out = tmp_path / claude_worker.seeds.FUNDING_SEED_FILE
+    claude_worker.seeds.write_funding_seed_tsv(out, rows)
+    text = out.read_text("utf-8")
+    body = [l for l in text.splitlines() if l and not l.startswith("#")]
+    assert text.startswith("# funding-seed.tsv")
+    assert body == [
+        f"binance-usdm:btcusdt\t{now_ms - 2 * MS_1H}\t100000",
+        f"binance-usdm:btcusdt\t{now_ms - MS_1H}\t-50000",
+    ]
+
+
 def test_funding_frames_window_and_order(tmp_path):
     now_ms = EPOCH_MS
     rows = [

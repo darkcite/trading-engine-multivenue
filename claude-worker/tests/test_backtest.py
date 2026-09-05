@@ -257,3 +257,127 @@ def test_custom_thresholds_apply(tmp_path: pathlib.Path) -> None:
     )
     assert outcome.gates.min_trades is False
     assert outcome.all_passed is False
+
+
+# ---- RG8 (operator ruling 2026-09-05): a label must EARN itself ----------
+
+
+_LABELLED_ROWS = {
+    "rows": [
+        {
+            "name": "xv-vlow",
+            "family": "crypto",
+            "instrument": "okx:BTC-USDT",
+            "ref": "binance:btcusdt",
+            "feature": "mid",
+            "combine": "diff_bps",
+            "abs": True,
+            "enter": 3.0,
+            "exit": 1.0,
+            "regimes": ["vol:low"],
+            "horizon_ms": 60000,
+            "max_risk_usd": 3000.0,
+        }
+    ]
+}
+
+
+def _labelled_ruleset(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:
+    data = json.dumps(_LABELLED_ROWS).encode()
+    path = tmp_path / "labelled.json"
+    path.write_bytes(data)
+    return path, hashlib.sha256(data).hexdigest()
+
+
+def test_labelled_artifact_runs_the_off_replay_and_must_earn_its_label(
+    tmp_path: pathlib.Path,
+) -> None:
+    path, full_hash = _labelled_ruleset(tmp_path)
+    assert claude_worker.backtest.artifact_is_labelled(path)
+    assert not claude_worker.backtest.artifact_is_labelled(_ruleset(tmp_path)[0])
+    seen: list[list[str]] = []
+
+    def run_fn(argv: list[str]) -> str:
+        seen.append(argv)
+        # The off replay (every row unconstrained) earns LESS: the label pays.
+        off = argv[-2:] == ["--regime", "off"]
+        return _harness_stdout(
+            full_hash,
+            oos={
+                "net_pnl_usd": 8.0 if off else 12.5,
+                "trades": 60,
+                "trading_days": 3,
+                "max_drawdown_usd": 20.0,
+            },
+        )
+
+    outcome = claude_worker.backtest.run_backtest(path, tmp_path / "replay", run_fn=run_fn)
+    # The frozen argv first, then the SAME argv + the harness's additive flag.
+    frozen = [
+        claude_worker.backtest.ENGINE_BINARY,
+        "backtest",
+        "--ruleset",
+        str(path),
+        "--replay-dir",
+        str(tmp_path / "replay"),
+        "--split",
+        "70/30",
+    ]
+    assert seen == [frozen, [*frozen, "--regime", "off"]]
+    assert outcome.all_passed is True
+    report = json.loads(outcome.report_path.read_text())
+    assert report["regime"] == {
+        "labelled": True,
+        "net_on": 12.5,
+        "net_off": 8.0,
+        "delta": 4.5,
+        "earned": True,
+    }
+    assert report["thresholds"]["min_regime_delta_usd"] == 0.0
+    assert report["gates"]["all_passed"] is True
+
+    # A label that earns NOTHING (off ≥ on) fails the P&L gate — GateResult
+    # keeps its five-field shape (the V5 precedent), the report says why.
+    def run_fn_worse(argv: list[str]) -> str:
+        off = argv[-2:] == ["--regime", "off"]
+        return _harness_stdout(
+            full_hash,
+            oos={
+                "net_pnl_usd": 12.6 if off else 12.5,
+                "trades": 60,
+                "trading_days": 3,
+                "max_drawdown_usd": 20.0,
+            },
+        )
+
+    outcome = claude_worker.backtest.run_backtest(path, tmp_path / "replay", run_fn=run_fn_worse)
+    assert outcome.all_passed is False
+    assert outcome.gates == claude_worker.backtest.GateResult(False, True, True, True, True)
+    report = json.loads(outcome.report_path.read_text())
+    assert report["regime"]["earned"] is False and report["regime"]["delta"] < 0
+    # The threshold is the operator's: a stricter floor refuses a thin edge.
+    strict = claude_worker.backtest.GateThresholds(min_regime_delta_usd=5.0)
+    outcome = claude_worker.backtest.run_backtest(
+        path, tmp_path / "replay", thresholds=strict, run_fn=run_fn
+    )
+    assert outcome.all_passed is False and outcome.gates.pnl_positive is False
+
+
+def test_unlabelled_artifact_keeps_the_single_frozen_run(tmp_path: pathlib.Path) -> None:
+    path, full_hash = _ruleset(tmp_path)
+    seen: list[list[str]] = []
+
+    def run_fn(argv: list[str]) -> str:
+        seen.append(argv)
+        return _harness_stdout(full_hash)
+
+    outcome = claude_worker.backtest.run_backtest(path, tmp_path / "replay", run_fn=run_fn)
+    assert len(seen) == 1 and outcome.all_passed is True
+    report = json.loads(outcome.report_path.read_text())
+    assert report["regime"] == {
+        "labelled": False,
+        "net_on": 12.5,
+        "net_off": None,
+        "delta": None,
+        "earned": True,
+    }

@@ -2552,12 +2552,28 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
                     );
                 }
             }
+            // RG8 (operator ruling 2026-09-05): with `[labels] require = 1`
+            // an enabled signal-carrying coded member must carry a label
+            // — an ANY member would trade in every regime and the gate
+            // would be a no-op for it. Fail-fast, before the seed.
+            if let Some(slot) = unlabelled_required_slot(&set, mask, rb.require_labels) {
+                tracing::error!(
+                    slot,
+                    member = engine_snapshot::SLOT_NAMES[slot as usize],
+                    "regime: [labels] require = 1 but this ENABLED member carries no label (ANY) — \
+                     add [labels.<member>] to regime.toml or drop it from the mask"
+                );
+                return EngineLoopResult::Failed(
+                    "regime: an enabled coded member has no label ([labels] require = 1)",
+                );
+            }
             let applied = set.seed_regime(&rb.seed, now);
             let c = strategy_core::StrategyCounters::regime_counters(&set);
             tracing::info!(
                 hash = %format_hex32(&rb.hash),
                 members = rb.params.n_members,
                 confirm_min = rb.params.confirm_min,
+                require_labels = rb.require_labels,
                 seed_rows = applied,
                 seed_file_rows = rb.seed.len(),
                 fast = %format_hex16(c.effective[0].0),
@@ -2614,6 +2630,40 @@ pub struct RegimeBoot {
     pub seed: Vec<core_regime::SeedRow>,
     /// SHA-256 of the artifact bytes (boot log / `/state`).
     pub hash: [u8; 32],
+    /// RG8: `[labels] require = 1` — refuse to boot an enabled
+    /// signal-carrying coded member whose label is ANY.
+    pub require_labels: bool,
+}
+
+/// RG8: the coded members the `[labels] require` law covers — the ones
+/// that carry their OWN signal (slots 0–3 + icdp). `ai-exec` (slot 4) is
+/// exempt: it carries the worker's intent lanes, which gate themselves
+/// through `regime_allows()` (their `REGIME_LABEL`); the vm (slot 5) is
+/// held to the law upstream — every row of a staged table must be
+/// labelled (the worker's RG8 gates), never at boot.
+const REQUIRE_LABEL_SLOTS: [u8; 5] = [
+    strategy_set::SLOT_LATENCY_ARB,
+    strategy_set::SLOT_EV,
+    strategy_set::SLOT_CROSS_ARB,
+    strategy_set::SLOT_RULE_TREE,
+    strategy_set::SLOT_ICDP,
+];
+
+/// RG8: the first enabled, label-required slot whose label set is ANY —
+/// `None` when the law holds (or is off).
+fn unlabelled_required_slot(set: &strategy_set::StrategySet, mask: u8, require: bool) -> Option<u8> {
+    if !require {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < REQUIRE_LABEL_SLOTS.len() {
+        let slot = REQUIRE_LABEL_SLOTS[i];
+        if mask & (1u8 << slot) != 0 && set.regime_label_of(slot).n == 0 {
+            return Some(slot);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn format_u64_into(buf: &mut [u8; 32], mut v: u64) -> &[u8] {
@@ -7234,6 +7284,38 @@ mod tests {
         mirror_vm_metrics(&reg, &ids, &Bare, &mut stale);
         assert_eq!(reg.counter(ids.fires).get(), 0, "regression saturates");
         assert_eq!(stale.fires, 0, "snapshot re-bases to the source");
+    }
+
+    /// RG8: `[labels] require = 1` refuses an ENABLED signal-carrying coded
+    /// member whose label is ANY; ai-exec and the vm are exempt (their
+    /// labels live elsewhere); labelled members pass; `require = 0` is
+    /// advisory.
+    #[test]
+    fn require_labels_refuses_only_enabled_unlabelled_signal_members() {
+        use core_types::regime::RegimeLabelBuilder;
+        let mut set = strategy_set::StrategySet::new(strategy_set::BUILT_MASK);
+        // Off: never a refusal.
+        assert_eq!(unlabelled_required_slot(&set, strategy_set::BUILT_MASK, false), None);
+        // On, every coded member ANY: the first enabled required slot names the refusal.
+        assert_eq!(
+            unlabelled_required_slot(&set, strategy_set::BUILT_MASK, true),
+            Some(strategy_set::SLOT_LATENCY_ARB)
+        );
+        // The AI-only mask (ai-exec + vm) is exempt — nothing to label at boot.
+        let ai = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
+        assert_eq!(unlabelled_required_slot(&set, ai, true), None);
+        // ai+icdp: icdp is a signal member ⇒ refused until labelled.
+        let ai_icdp = ai | strategy_set::BIT_ICDP;
+        assert_eq!(
+            unlabelled_required_slot(&set, ai_icdp, true),
+            Some(strategy_set::SLOT_ICDP)
+        );
+        let mut b = RegimeLabelBuilder::new();
+        b.add(b"fast:shape:trend").unwrap();
+        let label = core_types::RegimeLabelSet::from_terms(&[b.finish()], core_types::REGIME_OFF_SOFT)
+            .unwrap();
+        assert!(set.set_regime_label(strategy_set::SLOT_ICDP, label));
+        assert_eq!(unlabelled_required_slot(&set, ai_icdp, true), None);
     }
 
     /// Boot-surface pin: `Observability::build(true)` registers

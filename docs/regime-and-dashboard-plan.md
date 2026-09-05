@@ -822,6 +822,8 @@ on operator ask, no push.
 | **RG5** worker regime lane | `regime` lane (report / percentiles → `regime.toml` / seed / declare / history), `regime-cycle.sh` + plist, `serve` `_REGIME` phase + digest/prompt sections (SDK mocked), intent-lane `regime_allows()`, `pnl_report` per-regime merge | pytest for each lane; declared re-push after a simulated boot; serve cycle test with the mock; day report shows per-regime rows | `pnl-<day>.json` carries `regimes` for a live day |
 | **RG6** dashboard | `EngineSnapshot` + 1 s publish + `/state` writer; TUI panels; worker `dashboard` module + HTML + plist | `/state` encode test (fixed snapshot ⇒ byte-exact JSON, fits the buffer); server thread 0 alloc (bench); pytest for `/api/worker` shape; a manual live check of every panel populated (screenshot in the vault) | page live on 9292 showing regime, mask, rows, P&L, recent fills |
 | **RG7** soak + close (RESTATED 2026-09-05 under the ≤ 2 h law — §7.1; the original "5 paper days / per day / 5 nightly reports" wording is VOID) | the soak = **N ≥ 8 complete ≤ 2 h windows** with regime gating LIVE (detector configured + a labelled table active), pooled from runs that already exist (single-run pools admissible — never a wait); per-window flip bound (≤ `FLIPS_MAX_PER_WINDOW` = 2 per market dimension per profile per window — the old 24/day rate restated for 2 h); per-regime P&L present in the nightly reports covering the pooled windows; the seed-hole fix (candles tail refreshed before `seed-out`); docs: `CLAUDE.md` CURRENT STATE, `ai-strategy-pipeline.md` (+svg), `research-universe.md`, `local-setup.md`, `risk-policy.md` cross-ref; close entry in §12 | `python -m claude_worker.regime soak` (the judge: history samples + the engine's own flip counters per window; pytest); stay-greens recorded | `soak` verdict PASS on N ≥ 8 windows + operator ruling |
+| **RG8** label enforcement (operator ruling 2026-09-05: "everything incl. coded members" — §7.2) | AI paths refuse unlabelled rows (`strategist` prompt v5 + `parse_proposal`, `library` validate/import, `compose` excludes ANY unless `--include-any`); the earned-label 6th gate (`backtest.py`: a labelled table is replayed `--regime off`, `net_on − net_off ≥ min_regime_delta_usd` folded into `pnl_positive`; report gains the additive `regime` block); `regime.toml [labels] require = 1` ⇒ boot refuses an enabled signal-carrying coded member (slots 0–3, 6) whose label is ANY; `ai-session.md` §4 0c + §8 law | pytest (parse refusal, library refusal + downgrade, composer skip tell, frozen-surface amendment pin, on/off double run), nextest (`core-config` policy parser, `paper.rs` refusal only for enabled unlabelled signal members), `make lint` | a proposal with one unlabelled row is refused; a labelled table that earns nothing fails the gate; `require = 1` refuses an `ai+icdp` boot until icdp is labelled |
+| **funding seed** (RG4's carry blocker; operator: "Funding seed next", 2026-09-05) | `cli::backtest::funding` + `backtest --funding-seed` (default = the window's own `funding-seed.tsv`), the vm's live `FundingSeed` path before the first record, warm-up law drops apr24/apr72 when seeded, summary `funding: …`; `window_root.cut_run` writes the file from `candles.db` (the boot seed lane's law), `pool_ensure` back-fills reused cuts; `candles-cycle.sh` gains the funding fetch (the lane died with the carry cron) | nextest (parser, `seed_cmds` shape, warm-up unit, the harness integration: unseeded 0 fires / seeded fires + flag wins + malformed fatal), pytest (`funding_seed_rows` + tsv, `cut_run`, `pool_ensure` back-fill) | `cvfc-carry` evidenced on all 8 pool windows with `warmup=seeded` |
 
 Dependency order: RG0 → RG1 → RG2 → {RG3, RG5} → RG4 → RG6 → RG7. RG6's
 engine half can start after RG2. Estimated size: RG0–RG2 ≈ the ICDP
@@ -873,6 +875,56 @@ is therefore never a calendar span. It is a COUNT of disjoint, complete,
   N ≥ 8; the JSON goes under `~/multivenue/worker/regime/soak-<utc>.json`
   (worker state, never git). The operator's close ruling follows a
   PASS.
+
+### 7.2 RG8 — label enforcement (operator ruling 2026-09-05)
+
+The operator answered "do we enforce regime labelling for all strategies
+in our semi-manual and future automated AI research?" with **everything,
+including the coded members**. Regime stays a GATE, not a signal; what
+changes is that an UNLABELLED strategy no longer reaches the live table
+by default, and a label that earns nothing is refused by the gate. Three
+layers, each one refusing at the point where it can be honest:
+
+- **AI paths (worker).** `strategist` prompt **v5** asks for `regimes`
+  on EVERY row and says a proposal with one unlabelled row is refused;
+  `parse_proposal(raw, require_labels=True)` refuses it as malformed
+  (`serve` and the semi-manual §4 verbs share the parser). `library`:
+  a member can be `validated` only with labels (`add --status
+  validated`, `validate`); `import-catalog` imports an unlabelled ACTIVE
+  table as `candidate` with the tell `… is the ACTIVE table but
+  unlabelled — candidate (RG8)`; `compose` excludes ANY members unless
+  `--include-any` (skip reason names RG8). `docs/prompts/ai-session.md`
+  §4 0c + §8 carry the law.
+- **Earned labels (the 6th gate).** `backtest.py` (the frozen worker
+  contract, amended the D1 way — pin tests cite it): when the artifact
+  carries a labelled row the harness runs TWICE — the frozen argv and
+  `[*argv, "--regime", "off"]`; `regime_earned = net_on − net_off ≥
+  GateThresholds.min_regime_delta_usd` (default 0) is folded into
+  `pnl_positive` (the V5 precedent: the five-field `GateResult` shape is
+  untouched); the report gains the additive `"regime": {labelled,
+  net_on, net_off, delta, earned}`. Unlabelled artifacts keep the single
+  frozen run bit for bit. `compose` reuses `net_off` from the report for
+  its on/off delta.
+- **Coded members (engine).** `regime.toml` `[labels] require = 1`
+  (integer TOML subset, no booleans; `core-config::regime`
+  `RegimeFile.require_labels`, `Sec::LabelsPolicy`) ⇒ `engine_loop_set_full`
+  refuses the boot (`EngineLoopResult::Failed("regime: an enabled coded
+  member has no label ([labels] require = 1)")`) when an ENABLED
+  signal-carrying coded member — `REQUIRE_LABEL_SLOTS` = latency-arb,
+  ev, cross-arb, rule-tree, icdp — has an ANY label; ai-exec (slot 4)
+  is exempt (it executes intents, it has no signal of its own); the vm
+  (slot 5) is enforced upstream by the worker. `require = 0` / absent =
+  today's behaviour (every existing `regime.toml` boots unchanged). The
+  refusal is a boot-time law: the hot path is untouched.
+
+**Live consequence (open, the operator's):** the live `~/multivenue/regime.toml`
+keeps `require` ABSENT. Flipping it to 1 today would refuse the
+`ai+icdp` boot, because icdp's label is ANY and icdp has no positive
+regime evidence to label it by (the ICDP research: a signal at 1 s that
+dies by 15 m). The order is: evidence icdp per regime word (the nightly
+`regime` section + the library `evidence` lane on the pool) → label it
+in `[labels.icdp]` → flip `require = 1` → restart. Until then the
+worker-side layers are the enforcement that is live.
 
 ## 8. Hot-path + zero-copy accounting
 
@@ -1932,3 +1984,147 @@ is therefore never a calendar span. It is a COUNT of disjoint, complete,
   (nohup + poll for > 45 s); Python full `import x` only; SPDX header on
   every new file; explicit-path `git add`, commit only on my ask, never
   push; tell me when short on context with a resume prompt."
+
+- **2026-09-05 — RG8 LABEL ENFORCEMENT CODE-COMPLETE (operator ruling
+  by AskUserQuestion: "Everything incl. coded members"; §7.2 is the
+  law, uncommitted — operator commits).** Worker: `strategist.py`
+  prompt **v5** (`STRATEGIST_PROMPT_VERSION = "strategist-v5"`; the
+  `regimes` line says REQUIRED + the earned-label gate),
+  `parse_proposal(raw, require_labels=True)` (a row without `regimes`
+  ⇒ `None`; v1-arm tests pass `require_labels=False`); `library.py`
+  `require_labels(labels, what)` → `LibraryError` (message carries
+  "RG8") in `add_member` (status validated) and `set_status`
+  (validated, vm-rows kind), `import-catalog` downgrades an unlabelled
+  ACTIVE table to candidate with a tell; `compose.py`
+  `select_members(..., include_any=False)` skips ANY members
+  ("unlabelled (ANY) — RG8 excludes it (use --include-any)"),
+  `--include-any` flag, `_report_regime_block` reuses the report's
+  `net_off`; `backtest.py` `GateThresholds.min_regime_delta_usd = 0.0`,
+  `artifact_is_labelled(path)`, `regime_earned(report, off,
+  thresholds)`, `evaluate_gates(report, thresholds, off=None)`
+  (`pnl_positive = net > min and regime_earned(...)`),
+  `write_report(..., off=None)` with the additive `regime` block,
+  `run_backtest` second run `runner([*argv, "--regime", "off"])` only
+  for a labelled artifact (unlabelled = the single frozen run, bit
+  for bit — pin test). Engine: `core-config::regime` `[labels] require
+  = 0|1` (`RegimeFile.require_labels`, `Sec::LabelsPolicy`,
+  `finish_labels_policy`), `cli::regime_boot` `ResolvedRegime/
+  RegimeBoot.require_labels`, `paper.rs` `REQUIRE_LABEL_SLOTS` +
+  `unlabelled_required_slot(set, mask, require)` + the refusal before
+  `seed_regime` + `require_labels` in the "regime: artifact configured"
+  log; `regime.toml.example` gained the `[labels] require = 1` block
+  with the RG8 comment. Docs: `docs/prompts/ai-session.md` §4 0c + §8
+  (pinned test extended). Tests touched: `test_strategist.py`
+  (fixtures labelled; v5 pin; RG8 assertions), `test_library.py`,
+  `test_compose.py`, `test_research_cycle.py`,
+  `test_session_scripted.py`, `test_backtest.py`
+  (`_LABELLED_ROWS`, the double-run test, the single-run pin);
+  nextest `core-config` (`labels_policy_parses_and_refuses_bad_values`)
+  + `cli` (`require_labels_refuses_only_enabled_unlabelled_signal_members`).
+  NOT flipped live: `~/multivenue/regime.toml` has no `[labels]
+  require` (see §7.2 — it would refuse the `ai+icdp` boot).
+
+- **2026-09-05 — HARNESS FUNDING SEED LANDED + `cvfc-carry` EVIDENCED
+  (operator: "Funding seed next"; uncommitted — operator commits).**
+  Engine (`crates/cli`): new `src/backtest/funding.rs`
+  (`FundingSeedLine`, `parse_funding_seed` — tab-separated
+  `descriptor / ts_ms / rate_1e9`, `#` comments, malformed FATAL —,
+  `load_funding_seed`, `seed_cmds(lines, resolve, ts_ns)` =
+  synthesized `AiCmd::new(ts_ns, i, sym, rate_1e9, ts_ms, 0,
+  FundingSeed, Ai, STRATEGY_SLOT_VM, AI_SIDE_NONE, 0, 0)` — the live
+  frame shape, `validate_shape` debug-asserted); `backtest.rs`:
+  `BacktestConfig.funding_seed: Option<PathBuf>` (flag wins, else the
+  first run's `funding-seed.tsv` when it exists, else none), the cmds
+  applied through `vm.on_ai` AFTER the synthesized commit and BEFORE
+  the first record (dedup law = the vm's own `funding_seed`),
+  `warmup_ns_of(table, funding_seeded)` (Apr24/Apr72 need 0 when
+  seeded; a rolling window still binds), `HarnessStats.
+  funding_seed_{prints,dropped,deduped}`, stderr build tell `funding:
+  seed <path> prints=… dropped=… applied=… deduped=…` and summary
+  `funding: seed_prints=… dropped=… deduped=… warmup=seeded|table`;
+  bin `--funding-seed <path>` on `backtest` only (`audit-pnl` audits
+  what happened — no vm warm-up). Tests: `backtest::funding::tests`
+  (2), `backtest::tests::warmup_drops_the_funding_windows_only_when_seeded`,
+  `backtest_harness::funding_seed_warms_apr_rows_inside_a_short_window`
+  (an `apr24` row on an 11 min window: unseeded 0 fires + warm-up
+  1440 min; seeded with the three 8 h settlements + a 1-min duplicate
+  + an unknown descriptor ⇒ `(prints, dropped, deduped) = (4, 1, 1)`,
+  warm-up 0, fires ≥ 1; `--funding-seed` wins; a malformed file is
+  `HarnessError::Usage`). Worker: `seeds.py` `funding_seed_rows`
+  (ONE law for the boot frames and the file: 73 h before `now_ms`
+  exclusive, newest 640/sym, rate ×1e9 RAW) with `funding_seed_frames`
+  rebuilt on it, `FundingSeedRow`, `FUNDING_SEED_FILE`,
+  `write_funding_seed_tsv`, `has_funding_table`; `window_root.cut_run`
+  writes the file when `seed=(…, candles.db)` (regime.toml not needed
+  for it; no print ⇒ no file), `funding_seed_out(run_dir, db,
+  now_ms)`, `pool_ensure` back-fills reused cuts (no re-cut). Tests:
+  `test_seeds.py` (rows + tsv shape), `test_window_root.py` (the cut
+  writes it: 73 h look-back, the print AT the cut excluded, spot never,
+  bare db ⇒ no file), `test_compose.py` (`pool_ensure` back-fill,
+  existing file kept). Docs: `docs/migration.md` entry,
+  `docs/ai-strategy-pipeline.md` bullet.
+  **LIVE RUN (worker, 09:3x–09:5xZ):** release relinked 16:34 local;
+  the pool's 8 windows back-filled (1548–1600 prints × 52 descriptors
+  each — after the funding table was refreshed, see the finding);
+  `library evidence cvfc-carry` on all 8 windows ⇒ evidenced at last
+  (`funding: seed … prints=1593 dropped=0 deduped=30`, `warmup=seeded`
+  verified on the harness stderr of `run-1788537972350213000`): fills
+  0 on 7 windows, 5 fills on one (1 fire, one pair entry, round_trips
+  0, −$0.83 zero-fee / −$3.83 at tier, dd $6.82). **FINDING — carry
+  under the ≤ 2 h law:** the carry rows carry `min_hold_s = 345600`
+  (96 h), so NO window and no 8-window pool (16 h) can hold a round
+  trip; per-window evidence = entry cost + 2 h mark, the carry accrual
+  (the thesis) is structurally invisible to any ≤ 2 h gate. Not a
+  harness defect — the operator decides whether carry is judged by a
+  different law (e.g. funding accrued while open, marked per window)
+  or stays dark. **FINDING — the funding-history lane was DEAD since
+  2026-09-02 14:00Z:** `python -m claude_worker.funding` rode ONLY
+  `scripts/carry-cycle.sh` (`com.multivenue.carry`, deleted at the
+  2026-09-02 bootout), so the `funding` table froze — the boot
+  `FundingSeed` frames, the regime FUND dims (ops debt d — this is the
+  likely cause) and the new per-window seed all read it. Fixed:
+  `scripts/candles-cycle.sh` runs the funding module after the depth
+  digest (hourly, best-effort; exec bit intact); two hand runs
+  refreshed all five venues to 2026-09-05 08:00Z–09:00Z (the first run
+  had deribit `failed=8` transiently, the second `+536 failed=0`).
+  The RG4 "≥ 2 members committed live" exit tell stays OPEN (the
+  composer can now evidence carry, but its evidence is negative/empty
+  under the 2 h law).
+
+- **RESUME POINT (for a fresh session):** UNCOMMITTED on disk (the
+  operator commits, explicit paths): (a) the RG8 set — `claude-worker/
+  src/claude_worker/{strategist.py,library.py,compose.py,backtest.py}`,
+  `claude-worker/tests/{test_strategist.py,test_library.py,
+  test_compose.py,test_research_cycle.py,test_session_scripted.py,
+  test_backtest.py}`, `crates/core-config/src/regime.rs`,
+  `crates/cli/src/{regime_boot.rs,paper.rs}`, `regime.toml.example`,
+  `docs/prompts/ai-session.md`; (b) the funding-seed set —
+  `crates/cli/src/backtest/funding.rs` (NEW), `crates/cli/src/
+  backtest.rs`, `crates/cli/src/bin/multivenue-engine.rs`,
+  `crates/cli/tests/backtest_harness.rs`, `claude-worker/src/
+  claude_worker/{seeds.py,window_root.py}`, `claude-worker/tests/
+  {test_seeds.py,test_window_root.py,test_compose.py}`,
+  `scripts/candles-cycle.sh`, `docs/migration.md`,
+  `docs/ai-strategy-pipeline.md`; (c) this plan + `CLAUDE.md`. The RG4
+  worker set (`library.py`, `compose.py`, `state.py`, `tests/craft.py`,
+  `test_library.py`, `test_compose.py`) is STILL the operator's
+  separate uncommitted set — RG8 edits landed INSIDE `library.py` /
+  `compose.py` / `test_*.py`, so they can only be committed together
+  with RG4. NEXT (operator's choice): (1) RG7 `regime soak` when ≥ 8
+  regime-gated windows exist (never wait); (2) the carry law under
+  ≤ 2 h (finding above) or leave carry dark; (3) icdp per-regime
+  evidence → `[labels.icdp]` → `require = 1` → restart (§7.2). Laws
+  unchanged. Relaunch prompt: "Continue the regime lane in
+  trading-engine-multivenue. Read CLAUDE.md CURRENT STATE (regime
+  bullet), then `docs/regime-and-dashboard-plan.md` §7.2 (RG8) and §12
+  last three entries (RG8, funding seed, RESUME POINT). Everything is
+  uncommitted — do not stage. Continue with what I pick: RG7 `regime
+  soak` (from `claude-worker/`, `.env` sourced; INSUFFICIENT = report
+  the count and stop), or the carry law, or icdp labelling. Laws:
+  regime is a gate not a signal; exits never gated; legacy rows
+  bit-identical; no table flip on regime change; capture windows and
+  every test/soak/protect time ≤ 2 h; research never in git;
+  compile/test only on the Mac via RustRover (nohup + poll for > 45 s);
+  Python full `import x` only; SPDX header on every new file;
+  explicit-path `git add`, commit only on my ask, never push; tell me
+  when short on context with a resume prompt."

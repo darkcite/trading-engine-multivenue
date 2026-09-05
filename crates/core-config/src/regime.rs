@@ -23,8 +23,15 @@
 //! [hysteresis]  confirm_min = 3
 //! [profile.fast]  trend_w_min = 60 … fund_p70_1e9 = 0     # every key of core_regime::ProfileParams
 //! [profile.slow]  …
+//! [labels]        require = 1                                   # RG8: optional, 0 | 1
 //! [labels.icdp]   off = "soft"   term1 = ["fast:shape:trend"]   # optional, ≤ 4 terms
 //! ```
+//!
+//! `[labels] require = 1` (RG8 — operator ruling 2026-09-05, "enforce
+//! regime labelling everywhere"): the engine REFUSES to boot an ENABLED
+//! signal-carrying coded member whose label is still ANY (the cli checks
+//! it after the overrides are applied). Absent = 0 = advisory (the RG2
+//! default). The integer TOML subset has no booleans — `0` / `1`.
 
 use std::path::Path;
 
@@ -78,6 +85,9 @@ pub struct RegimeFile {
     pub profiles: [ProfileParams; REGIME_PROFILES],
     /// `[labels.*]` overrides in file order.
     pub labels: Vec<LabelOverride>,
+    /// RG8: `[labels] require = 1` — an enabled signal-carrying coded
+    /// member without a label refuses the boot.
+    pub require_labels: bool,
 }
 
 /// Default location beside `universe.toml`.
@@ -230,6 +240,18 @@ pub fn parse_label_terms(
     Ok(b.finish())
 }
 
+/// RG8: `[labels] require = 0 | 1`.
+fn finish_labels_policy(kv: &Kv, ln: usize) -> Result<bool, RegimeConfigError> {
+    only_keys(kv, &["require"], "labels")?;
+    match take_int(kv, "require", "labels")? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(RegimeConfigError(format!(
+            "line {ln}: [labels] require must be 0 or 1, got {other}"
+        ))),
+    }
+}
+
 fn finish_labels(kv: &Kv, member: &str, ln: usize) -> Result<LabelOverride, RegimeConfigError> {
     let sec = format!("labels.{member}");
     only_keys(kv, &["off", "term1", "term2", "term3", "term4"], &sec)?;
@@ -285,6 +307,8 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
         Hysteresis,
         Profile(usize, usize),
         Labels(String, usize),
+        /// RG8: the bare `[labels]` policy section.
+        LabelsPolicy(usize),
     }
     let mut sec = Sec::None;
     let mut cur: Kv = Vec::new();
@@ -293,7 +317,9 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
     let mut hyst: Option<Kv> = None;
     let mut profiles: [Option<ProfileParams>; REGIME_PROFILES] = [None; REGIME_PROFILES];
     let mut labels: Vec<LabelOverride> = Vec::new();
+    let mut policy: Option<bool> = None;
 
+    #[allow(clippy::too_many_arguments)]
     fn close(
         sec: &Sec,
         cur: &mut Kv,
@@ -302,6 +328,7 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
         hyst: &mut Option<Kv>,
         profiles: &mut [Option<ProfileParams>; REGIME_PROFILES],
         labels: &mut Vec<LabelOverride>,
+        policy: &mut Option<bool>,
     ) -> Result<(), RegimeConfigError> {
         let kv = std::mem::take(cur);
         match sec {
@@ -318,6 +345,7 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
                 profiles[*p] = Some(finish_profile(&kv, name)?);
             }
             Sec::Labels(member, ln) => labels.push(finish_labels(&kv, member, *ln)?),
+            Sec::LabelsPolicy(ln) => *policy = Some(finish_labels_policy(&kv, *ln)?),
         }
         Ok(())
     }
@@ -341,6 +369,7 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
                 &mut hyst,
                 &mut profiles,
                 &mut labels,
+                &mut policy,
             )?;
             sec = match name {
                 "refs" if refs.is_none() => Sec::Refs,
@@ -348,7 +377,8 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
                 "hysteresis" if hyst.is_none() => Sec::Hysteresis,
                 "profile.fast" if profiles[0].is_none() => Sec::Profile(0, ln),
                 "profile.slow" if profiles[1].is_none() => Sec::Profile(1, ln),
-                "refs" | "breadth" | "hysteresis" | "profile.fast" | "profile.slow" => {
+                "labels" if policy.is_none() => Sec::LabelsPolicy(ln),
+                "refs" | "breadth" | "hysteresis" | "profile.fast" | "profile.slow" | "labels" => {
                     return Err(RegimeConfigError(format!(
                         "line {ln}: duplicate section [{name}]"
                     )))
@@ -403,6 +433,7 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
         &mut hyst,
         &mut profiles,
         &mut labels,
+        &mut policy,
     )?;
 
     let refs = refs.ok_or_else(|| RegimeConfigError("missing [refs]".to_owned()))?;
@@ -454,6 +485,7 @@ pub fn parse(src: &str) -> Result<RegimeFile, RegimeConfigError> {
         confirm_min: confirm as u8,
         profiles: [fast, slow],
         labels,
+        require_labels: policy.unwrap_or(false),
     })
 }
 
@@ -549,6 +581,37 @@ mod tests {
         format!(
             "{EXAMPLE}\n[labels.icdp]\noff = \"hard\"\nterm1 = [\"fast:shape:trend\", \"slow:trend:bull|neutral\"]\nterm2 = [\"fast:shape:trend\", \"slow:trend:bear\"]\n[labels.latency_arb]\noff = \"soft\"\nterm1 = [\"fast:vol:!high\"]\n"
         )
+    }
+
+    /// The example minus its RG8 `[labels] require = 1` block.
+    fn without_policy() -> String {
+        EXAMPLE
+            .lines()
+            .filter(|l| !(l.starts_with("[labels]") || l.starts_with("require = ")))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn labels_policy_parses_and_refuses_bad_values() {
+        let f = parse(EXAMPLE).unwrap();
+        assert!(f.require_labels, "the example ships with [labels] require = 1 (RG8)");
+        let bare = without_policy();
+        assert!(!parse(&bare).unwrap().require_labels, "absent = advisory");
+        assert!(!parse(&format!("{bare}\n[labels]\nrequire = 0\n")).unwrap().require_labels);
+        let both = format!(
+            "{bare}\n[labels]\nrequire = 1\n[labels.icdp]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n"
+        );
+        let f = parse(&both).unwrap();
+        assert!(f.require_labels && f.labels.len() == 1, "policy + member sections coexist");
+        for bad in [
+            "[labels]\nrequire = 2\n",
+            "[labels]\nrequire = \"yes\"\n",
+            "[labels]\nrequire = 1\noff = \"soft\"\n",
+            "[labels]\nrequire = 1\n[labels]\nrequire = 1\n",
+        ] {
+            assert!(parse(&format!("{bare}\n{bad}")).is_err(), "{bad}");
+        }
     }
 
     #[test]

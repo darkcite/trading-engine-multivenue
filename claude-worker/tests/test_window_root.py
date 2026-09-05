@@ -195,3 +195,56 @@ def test_cut_run_writes_the_windows_own_regime_seed_from_candles(tmp_path):
         run, tmp_path / "roots", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db)
     )
     assert not (out_no / claude_worker.window_root.SEED_FILE).exists()
+
+
+def test_cut_run_writes_the_windows_own_funding_seed_from_the_funding_table(tmp_path):
+    """The harness funding seed: the window's manifest × the funding
+    table, prints strictly before the window's first instant (the boot
+    lane's 73 h law), rate ×1e9 RAW; spot descriptors never seed; a
+    print AT the cut is excluded. No funding table ⇒ no file."""
+    import claude_worker.candles
+    import claude_worker.seeds
+
+    ts = [1_000, 1_000 + 30 * S, 1_000 + 7_200 * S, 1_000 + 9_000 * S]
+    run = _mk_run(tmp_path, ts)
+    (run / "instrument-manifest.tsv").write_text(
+        "16777728\tbinance-usdm:btcusdt\n7\tbinance:btcusdt\n", encoding="utf-8"
+    )
+    db = tmp_path / "candles.db"
+    conn = claude_worker.candles.open_db(db)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS funding (venue INTEGER NOT NULL, descriptor TEXT NOT NULL,"
+        " ts_ms INTEGER NOT NULL, rate REAL NOT NULL, fetched_ts INTEGER NOT NULL,"
+        " PRIMARY KEY (venue, descriptor, ts_ms)) WITHOUT ROWID"
+    )
+    w2_ms = (EPOCH + 7200 * S) // 1_000_000
+    h = 3_600_000
+    prints = [
+        (1, "binance-usdm:btcusdt", w2_ms - 80 * h, 0.0009),  # outside the 73 h look-back
+        (1, "binance-usdm:btcusdt", w2_ms - 16 * h, 0.0001),
+        (1, "binance-usdm:btcusdt", w2_ms - 8 * h, -0.0002),
+        (1, "binance-usdm:btcusdt", w2_ms, 0.0003),  # at the cut: excluded
+        (1, "binance:btcusdt", w2_ms - 8 * h, 0.0001),  # spot: never seeded
+    ]
+    conn.executemany("INSERT INTO funding VALUES (?,?,?,?,0)", prints)
+    conn.commit()
+    conn.close()
+    lines: list[str] = []
+    out = claude_worker.window_root.cut_run(
+        run, tmp_path / "roots", 7200.0, 14400.0, lines.append, seed=(tmp_path / "nope.toml", db)
+    )
+    seed = out / claude_worker.seeds.FUNDING_SEED_FILE
+    body = [l for l in seed.read_text("utf-8").splitlines() if l and not l.startswith("#")]
+    assert body == [
+        f"binance-usdm:btcusdt\t{w2_ms - 16 * h}\t100000",
+        f"binance-usdm:btcusdt\t{w2_ms - 8 * h}\t-200000",
+    ]
+    assert any("funding-seed.tsv 2 prints for 1 descriptors" in l for l in lines), lines
+    assert not (out / claude_worker.window_root.SEED_FILE).exists()
+    # A window with no print before it gets no file (the harness warms from the window).
+    out_first = claude_worker.window_root.cut_run(run, tmp_path / "roots2", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db))
+    assert (out_first / claude_worker.seeds.FUNDING_SEED_FILE).exists()  # 2 prints precede it too
+    db2 = tmp_path / "bare.db"
+    claude_worker.candles.open_db(db2).close()
+    out_bare = claude_worker.window_root.cut_run(run, tmp_path / "roots3", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db2))
+    assert not (out_bare / claude_worker.seeds.FUNDING_SEED_FILE).exists()

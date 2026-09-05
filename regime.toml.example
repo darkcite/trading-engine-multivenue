@@ -64,6 +64,18 @@ fund_prints = 90                 # 30 d of 8 h prints
 fund_p30_1e9 = 0
 fund_p70_1e9 = 0
 
+# ---- RG8 (operator ruling 2026-09-05): labels are enforced everywhere ----
+# `require = 1` makes the engine REFUSE to boot an ENABLED signal-carrying
+# coded member (latency_arb, ev, cross_arb, rule_tree, icdp) whose label is
+# still ANY — label it below or leave it out of the mask. ai_exec is
+# exempt (its intents carry the lane's own label) and the vm's rows are
+# held to the law upstream (every row of a staged table must carry
+# `regimes`; the worker's parser, library, composer and the earned-label
+# gate enforce it). `0` = advisory (the RG2 default). The integer TOML
+# subset has no booleans — 0 | 1.
+[labels]
+require = 1
+
 # ---- optional overrides of the coded members' regime labels (§4.2) ----
 # One `[labels.<member>]` table per coded member (latency_arb, ev,
 # cross_arb, rule_tree, ai_exec, icdp): `off = "soft" | "hard"` and up to

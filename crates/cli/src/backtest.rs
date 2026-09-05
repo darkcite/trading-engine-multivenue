@@ -44,6 +44,7 @@
 //! Nothing here is reachable from a hot path.
 
 pub mod fill;
+pub mod funding;
 pub mod regime;
 pub mod stale;
 
@@ -187,6 +188,11 @@ pub struct BacktestConfig {
     /// RG3: `--regime-seed <path>` (default = the first run's own
     /// `regime-seed.tsv`, else warm live).
     pub regime_seed: Option<PathBuf>,
+    /// The funding seed (`backtest::funding`): `--funding-seed <path>`
+    /// (default = the first run's own `funding-seed.tsv`, else none —
+    /// the funding features warm from the window's own prints as
+    /// before).
+    pub funding_seed: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------
@@ -1245,6 +1251,13 @@ pub struct HarnessStats {
     pub regime_cmds_dropped: u64,
     /// RG3: seed rows applied at build.
     pub regime_seed_rows: u32,
+    /// Funding seed: prints applied through `on_ai` before the first
+    /// record (0 = no seed file).
+    pub funding_seed_prints: u64,
+    /// Funding seed: lines whose descriptor did not resolve on this root.
+    pub funding_seed_dropped: u64,
+    /// Funding seed: prints the vm deduped against its own prints.
+    pub funding_seed_deduped: u64,
 }
 
 /// RG3: the non-`Copy` half of the regime replay report — the stderr
@@ -1291,7 +1304,12 @@ pub struct BacktestOutput {
 /// only (books, windows, marks fill; the fill model runs); the vm
 /// evaluates nothing, so no entries exist before every referenced
 /// window is honestly full.
-fn warmup_ns_of(table: &RuleTableV2) -> u64 {
+///
+/// With a FUNDING seed applied (`backtest::funding`) the Apr24/Apr72
+/// requirement drops out: the seed IS the prints' history (the live
+/// boot's law), and a seed shorter than a feature's window leaves that
+/// feature ABSENT by the feature law — the row simply never fires.
+fn warmup_ns_of(table: &RuleTableV2, funding_seeded: bool) -> u64 {
     let mut max_min: u64 = 0;
     let mut i = 0usize;
     let len = (table.len as usize).min(core_types::RULE_TABLE_ROWS);
@@ -1303,6 +1321,7 @@ fn warmup_ns_of(table: &RuleTableV2) -> u64 {
         while k < feats.len() {
             if let Some(f) = FeatId::from_u8(feats[k]) {
                 let need: u64 = match f {
+                    FeatId::Apr24 | FeatId::Apr72 if funding_seeded => 0,
                     FeatId::Apr24 => 1_440,
                     FeatId::Apr72 => 4_320,
                     _ if f.requires_window() => wins[k] as u64,
@@ -1476,8 +1495,45 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     for sym in &mark_fill_syms {
         engine.set_mark_fill_sym(*sym);
     }
+    // The funding seed (docs on `backtest::funding`): the flag wins,
+    // else the first run's own `funding-seed.tsv` when it exists (the
+    // window cut writes one), else nothing. Applied through the live
+    // `on_ai` path BEFORE the first record; the warm-up law below then
+    // drops the funding features' 24 h / 72 h requirement.
+    let funding_seed_path: Option<PathBuf> = match cfg.funding_seed.as_deref() {
+        Some(p) => Some(p.to_path_buf()),
+        None => {
+            let p = runs[0].path.join("funding-seed.tsv");
+            p.exists().then_some(p)
+        }
+    };
+    let mut funding_seed_prints = 0u64;
+    let mut funding_seed_dropped = 0u64;
+    let mut funding_seed_lines: Vec<String> = Vec::new();
+    if let Some(sp) = funding_seed_path.as_ref() {
+        let lines = funding::load_funding_seed(sp)?;
+        let resolve = |d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym);
+        let (cmds, dropped) = funding::seed_cmds(&lines, &resolve, VIRT_T0);
+        let mut i = 0usize;
+        while i < cmds.len() {
+            vm.on_ai(&cmds[i], &mut ctx);
+            i += 1;
+        }
+        funding_seed_prints = cmds.len() as u64;
+        funding_seed_dropped = dropped as u64;
+        funding_seed_lines.push(format!(
+            "funding: seed {} prints={} dropped={} applied={} deduped={}",
+            sp.display(),
+            funding_seed_prints,
+            funding_seed_dropped,
+            vm.funding_seeds_applied,
+            vm.feats.seeds_deduped,
+        ));
+    }
+    let funding_seed_deduped = vm.feats.seeds_deduped;
     // VM2 V5 warmup window (docs on `warmup_ns_of`).
-    let warmup_end_virt = first_virt.saturating_add(warmup_ns_of(&table));
+    let warmup_end_virt =
+        first_virt.saturating_add(warmup_ns_of(&table, funding_seed_prints > 0));
     let mut consumed = ctx.orders().len(); // on_start/on_ai emit nothing, but stay uniform
     debug_assert_eq!(consumed, 0);
     let mut fills_scratch: Vec<SynthFill> = Vec::with_capacity(MAX_OPEN_TOTAL);
@@ -1486,7 +1542,8 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     // `first_virt` == the first record's wall instant; its view is
     // handed to the vm exactly as the set does live. Regime-blind
     // replays keep the vm's boot view (labelled rows fail closed).
-    let mut regime_lines: Vec<String> = Vec::new();
+    // (The funding-seed tell leads the stderr build lines.)
+    let mut regime_lines: Vec<String> = funding_seed_lines;
     let mut regime = {
         let resolve = |d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym);
         let default_seed = runs[0].path.join("regime-seed.tsv");
@@ -1688,6 +1745,9 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         regime_cmds: run_summaries.iter().map(|r| r.regime_cmds).sum(),
         regime_cmds_dropped: run_summaries.iter().map(|r| r.regime_cmds_dropped).sum(),
         regime_seed_rows: regime.as_ref().map(|r| r.seed_rows).unwrap_or(0),
+        funding_seed_prints,
+        funding_seed_dropped,
+        funding_seed_deduped,
     };
     let regime_report = RegimeReport {
         lines: regime_lines,
@@ -1823,6 +1883,17 @@ fn render_regime_summary(stats: &HarnessStats, regime: &RegimeReport) -> String 
             "artifact"
         } else {
             "blind"
+        },
+    ));
+    s.push_str(&format!(
+        "funding: seed_prints={} dropped={} deduped={} warmup={}\n",
+        stats.funding_seed_prints,
+        stats.funding_seed_dropped,
+        stats.funding_seed_deduped,
+        if stats.funding_seed_prints > 0 {
+            "seeded"
+        } else {
+            "table"
         },
     ));
     s
@@ -2241,6 +2312,24 @@ fn render_detail(
 mod tests {
     use super::*;
     use core_types::{Price, Qty};
+
+    // ---------------- warm-up law ----------------
+
+    #[test]
+    fn warmup_drops_the_funding_windows_only_when_seeded() {
+        let mut t = Box::new(RuleTableV2::EMPTY);
+        t.rows[0].feat_a = FeatId::Apr72 as u8;
+        t.rows[0].feat_b = FeatId::RollMean as u8;
+        t.rows[0].win_b = 10;
+        t.len = 1;
+        let minute = 60 * 1_000_000_000u64;
+        assert_eq!(warmup_ns_of(&t, false), 4_320 * minute);
+        // Seeded: the rolling window still binds; the funding history is the seed's.
+        assert_eq!(warmup_ns_of(&t, true), 10 * minute);
+        t.rows[0].feat_a = FeatId::Apr24 as u8;
+        assert_eq!(warmup_ns_of(&t, false), 1_440 * minute);
+        assert_eq!(warmup_ns_of(&t, true), 10 * minute);
+    }
 
     // ---------------- split (§3.4) ----------------
 

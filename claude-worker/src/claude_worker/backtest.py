@@ -97,6 +97,15 @@ class GateThresholds:
     max_order_notional_usd: float = 10_000.0
     max_symbol_notional_usd: float = 20_000.0
     max_total_notional_usd: float = 100_000.0
+    # RG8 (operator ruling 2026-09-05 — "enforce regime labelling
+    # everywhere"; D1-pattern frozen-surface amendment, cited in the pin
+    # tests): a LABELLED table must EARN its labels — its OOS net must be
+    # at least `min_regime_delta_usd` above the same table replayed with
+    # `--regime off` (every row unconstrained). Folded into the
+    # `pnl_positive` verdict (the V5 precedent: GateResult keeps its
+    # frozen five-field shape); an unlabelled table gates exactly as
+    # before (no second run, no delta).
+    min_regime_delta_usd: float = 0.0
 
 
 class GateResult(typing.NamedTuple):
@@ -221,19 +230,52 @@ def parse_harness_report(stdout: str, expected_hash: str) -> HarnessReport:
     )
 
 
-def evaluate_gates(report: HarnessReport, thresholds: GateThresholds) -> GateResult:
+def artifact_is_labelled(ruleset_path: pathlib.Path) -> bool:
+    """RG8: does the artifact carry at least one row with a non-empty
+    ``regimes`` list? (Anything unreadable or not a rows artifact is
+    "unlabelled" — the harness/validator refuse those on their own.)"""
+    try:
+        obj = json.loads(ruleset_path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return False
+    rows = obj.get("rows") if isinstance(obj, dict) else None
+    if not isinstance(rows, list):
+        return False
+    return any(
+        isinstance(r, dict) and isinstance(r.get("regimes"), list) and bool(r.get("regimes"))
+        for r in rows
+    )
+
+
+def regime_earned(
+    report: HarnessReport, off: HarnessReport | None, thresholds: GateThresholds
+) -> bool:
+    """RG8: the labelled table's OOS net beats its own `--regime off`
+    replay by at least `min_regime_delta_usd`. ``off is None`` = an
+    unlabelled table (nothing to earn) ⇒ True."""
+    if off is None:
+        return True
+    return report.oos_net_pnl_usd - off.oos_net_pnl_usd >= thresholds.min_regime_delta_usd
+
+
+def evaluate_gates(
+    report: HarnessReport, thresholds: GateThresholds, off: HarnessReport | None = None
+) -> GateResult:
     """The §5.1 gate matrix — pure code, no prompts, no overrides.
 
     VM2 V5 (D-3, ruling cited at MIN_ROUND_TRIPS): `min_trades`
     counts LEGS (= trades on pre-V5 reports) and folds the
     position-ruleset round-trip floor in — GateResult keeps its
-    frozen five-field shape."""
+    frozen five-field shape. RG8 folds the earned-label law into
+    `pnl_positive` the same way (`off` = the `--regime off` replay of a
+    labelled table; None for an unlabelled one)."""
     legs = report.oos_trades if report.oos_legs < 0 else report.oos_legs
     round_trips_ok = report.position_rows == 0 or (
         report.oos_round_trips >= MIN_ROUND_TRIPS
     )
     return GateResult(
-        pnl_positive=report.oos_net_pnl_usd > thresholds.min_oos_net_pnl_usd,
+        pnl_positive=report.oos_net_pnl_usd > thresholds.min_oos_net_pnl_usd
+        and regime_earned(report, off, thresholds),
         min_trades=legs >= thresholds.min_trades and round_trips_ok,
         min_days=report.oos_trading_days >= thresholds.min_trading_days,
         max_drawdown=report.oos_max_drawdown_usd <= thresholds.max_drawdown_usd,
@@ -250,15 +292,18 @@ def report_path_for(ruleset_path: pathlib.Path) -> pathlib.Path:
     return ruleset_path.with_suffix(REPORT_SUFFIX)
 
 
-def write_report(
+def write_report(  # noqa: PLR0913 — one parameter per report input, deliberately
     ruleset_path: pathlib.Path,
     full_hash: str,
     harness: HarnessReport,
     gates: GateResult,
     thresholds: GateThresholds,
+    off: HarnessReport | None = None,
 ) -> pathlib.Path:
     """The worker report — the artifact stage-ruleset later binds on
-    (hash + schema version + gates.all_passed). Written on pass AND fail."""
+    (hash + schema version + gates.all_passed). Written on pass AND fail.
+    RG8: the additive ``regime`` block records the earned-label check
+    (``labelled``, ``net_on``, ``net_off``, ``delta``, ``earned``)."""
     path = report_path_for(ruleset_path)
     payload = {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -290,6 +335,14 @@ def write_report(
         "thresholds": dataclasses.asdict(thresholds),
         # VM2 V5 (D-3): position-ruleset context for report readers.
         "position_rows": harness.position_rows,
+        # RG8: the earned-label check (additive; absent-tolerant readers).
+        "regime": {
+            "labelled": off is not None,
+            "net_on": harness.oos_net_pnl_usd,
+            "net_off": None if off is None else off.oos_net_pnl_usd,
+            "delta": None if off is None else harness.oos_net_pnl_usd - off.oos_net_pnl_usd,
+            "earned": regime_earned(harness, off, thresholds),
+        },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return path
@@ -416,7 +469,13 @@ def run_backtest(
     """Drive the harness, validate its report, evaluate gates, write the
     worker report next to the ruleset. Gate FAIL is a normal outcome
     (report written, ``all_passed`` False — verb maps it to exit 3);
-    BacktestError is for reports that cannot be trusted at all."""
+    BacktestError is for reports that cannot be trusted at all.
+
+    RG8 (operator ruling 2026-09-05): a LABELLED artifact is replayed a
+    second time with ``--regime off`` (the frozen argv + the harness's
+    additive flag) and must earn its labels — see `GateThresholds.
+    min_regime_delta_usd`. An unlabelled artifact runs the frozen argv
+    exactly once, as before."""
     gate_cfg = GateThresholds() if thresholds is None else thresholds
     runner = default_run_fn if run_fn is None else run_fn
     full_hash, _hash128 = ruleset_hashes(ruleset_path)
@@ -431,11 +490,85 @@ def run_backtest(
         split,
     ]
     harness = parse_harness_report(runner(argv), full_hash)
-    gates = evaluate_gates(harness, gate_cfg)
-    report_path = write_report(ruleset_path, full_hash, harness, gates, gate_cfg)
+    off: HarnessReport | None = None
+    if artifact_is_labelled(ruleset_path):
+        off = parse_harness_report(runner([*argv, "--regime", "off"]), full_hash)
+    gates = evaluate_gates(harness, gate_cfg, off)
+    report_path = write_report(ruleset_path, full_hash, harness, gates, gate_cfg, off)
     return BacktestOutcome(
         all_passed=gates.all_passed,
         report_path=report_path,
         gates=gates,
         harness=harness,
     )
+
+
+# ---- RG4 (plan §5.3): the ADDITIVE harness path beside the frozen one ----
+#
+# `run_backtest` above is the frozen worker contract (argv + schema-1 +
+# the report next to the ruleset) — untouched. The library/composer
+# lanes need the same binary with EXTRA flags the frozen argv never
+# carries (`--regime off` for the on/off delta, `--fee-bps` for the
+# operator tier, `--emit-detail` for the per-window evidence, the carved
+# `0/100` split for whole-window evidence). This function builds the
+# frozen four flags first, appends the extras, parses stdout with the
+# same strict parser, reads the detail sidecar back and NEVER writes the
+# worker report — the report a stage binds on comes only from
+# `run_backtest`.
+
+DETAIL_SUFFIX: str = ".detail.json"
+
+
+class HarnessDetail(typing.NamedTuple):
+    """One additive-path run: the strict schema-1 report + the parsed
+    `--emit-detail` sidecar (empty dict when not requested)."""
+
+    harness: HarnessReport
+    gates: GateResult
+    detail: dict[str, object]
+
+
+def run_harness_extra(  # noqa: PLR0913 — one parameter per harness knob, deliberately
+    ruleset_path: pathlib.Path,
+    replay_dir: pathlib.Path,
+    *,
+    split: str = "70/30",
+    extra_flags: typing.Sequence[str] = (),
+    detail_path: pathlib.Path | None = None,
+    thresholds: GateThresholds | None = None,
+    run_fn: typing.Callable[[list[str]], str] | None = None,
+) -> HarnessDetail:
+    """Run the harness with the frozen four flags PLUS ``extra_flags``
+    (and ``--emit-detail <detail_path>`` when given); the gates are
+    evaluated for the caller's information only — no worker report is
+    written. ``detail_path`` is read back after the run (a missing or
+    malformed sidecar is a BacktestError: evidence must never be
+    silently empty)."""
+    gate_cfg = GateThresholds() if thresholds is None else thresholds
+    runner = default_run_fn if run_fn is None else run_fn
+    full_hash, _hash128 = ruleset_hashes(ruleset_path)
+    argv = [
+        ENGINE_BINARY,
+        "backtest",
+        "--ruleset",
+        str(ruleset_path),
+        "--replay-dir",
+        str(replay_dir),
+        "--split",
+        split,
+    ]
+    argv.extend(extra_flags)
+    if detail_path is not None:
+        argv.extend(["--emit-detail", str(detail_path)])
+    harness = parse_harness_report(runner(argv), full_hash)
+    gates = evaluate_gates(harness, gate_cfg)
+    detail: dict[str, object] = {}
+    if detail_path is not None:
+        try:
+            raw = json.loads(detail_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise BacktestError(f"harness detail unreadable: {detail_path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise BacktestError(f"harness detail is not a JSON object: {detail_path}")
+        detail = typing.cast(dict[str, object], raw)
+    return HarnessDetail(harness=harness, gates=gates, detail=detail)

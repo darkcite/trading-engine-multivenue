@@ -5,12 +5,62 @@
 # ladder (0 / 1 / 2 bps per side) prints beside the tier regardless, so a
 # number positive only at zero fee is visible as such.
 #
-# D2 (2026-09-03): retail perp tier 2 maker / 5 taker bps; Polymarket 0/0
-# (its CLOB charges no fee today).
+# D2 (2026-09-03): retail perp tier 2 maker / 5 taker bps; Polymarket 0/0.
+#
+# D2-AMEND (2026-09-04, operator ruling): D2 stamped ONE blanket perp tier on
+# every venue, and it was wrong wherever a venue's traded legs are spot. Every
+# line below is re-derived from that venue's own published regular/base-tier
+# schedule. Three laws:
+#
+#   L1  ONE SLOT PER VENUE. `ModelParams::fee_bps` is indexed by `VenueId`
+#       (7 slots), so a venue whose STRATEGIES take both spot and perp legs
+#       gets ONE number: the DEARER of the two. Over-charging a perp leg
+#       understates P&L; under-charging a spot leg flatters it, and only the
+#       second direction can talk us into a losing strategy.
+#   L2  TRADED legs decide, not the universe. `universe.toml` carries
+#       capture-only instruments (e.g. bybit spot) that no strategy sends an
+#       order to. Those do not pull the venue's number up. If a strategy ever
+#       takes such a leg, revisit the line — the per-venue table below says
+#       which one and what it would become.
+#   L3  ROUND UP to the next whole bp. The parser is integer-only, and up is
+#       the safe direction.
+#
+# Verified 2026-09-04 against each venue's published schedule:
+#
+#   venue    traded legs today               published (maker/taker)      bps
+#   -------  ------------------------------  ---------------------------  -----
+#   pm       (none — latency-arb disabled)   0 / 0.07·(1-p) of notional   0:350
+#   bn       icdp spot btc/eth               0.1000 % / 0.1000 %          10:10 <- binds
+#            icdp usdm btc/eth               ~0.0200 % / ~0.0400-0.0500 %  2:5
+#   okx      icdp+vm spot BTC-USDT           0.08 % / 0.10 %               8:10 <- binds
+#            icdp ETH-USDT-SWAP              0.02 % / 0.05 %               2:5
+#   deribit  (none)                          spot 2 bps / 5 bps            2:5  <- binds
+#                                            perp 1.5 bps / 3.5 bps        2:4
+#   hl       icdp BTC perp                   0.015 % / 0.045 %             2:5
+#   bybit    icdp bybit-linear BTCUSDT       0.0200 % / 0.0550 %           2:6  <- binds
+#            (bybit SPOT is capture-only)    0.1000 % / 0.1000 %          10:10
+#
+# pm CAVEAT — the one line that does not fit the model. Polymarket's taker fee
+# is `C x 0.07 x p x (1-p)`, i.e. 0.07·(1-p) OF NOTIONAL: price-dependent, and
+# makers are never charged. The harness charges a FLAT bps on notional, so no
+# integer is right everywhere. 350 bps is the p = 0.50 point — the up/down
+# dailies' usual band. The same law is ~70 bps at p = 0.90 and ~560 bps at
+# p = 0.20. Read any PM row in a report as a p ~ 0.50 approximation until
+# `backtest::fill` learns the p-dependent law. (Geopolitics markets are
+# fee-free; the crypto category we trade is the 0.07 rate.)
+#
+# deribit CAVEAT — spot fees are published but WAIVED until Deribit's spot book
+# is routed to Coinbase. 2:5 carries the standing (unwaived) rate deliberately:
+# a waiver that ends silently must not flatter a report.
+#
+# bn CAVEAT — the USD(S)-M table at /en/fee/futureFee is client-rendered and was
+# not machine-readable on 2026-09-04. It does not matter here: the spot tier is
+# strictly dearer and binds the slot under L1. Re-check before ever moving `bn`
+# down to a perp-only number.
 [fees]
-pm = "0:0"
-bn = "2:5"
-okx = "2:5"
+pm = "0:350"
+bn = "10:10"
+okx = "8:10"
 deribit = "2:5"
 hl = "2:5"
-bybit = "2:5"
+bybit = "2:6"

@@ -82,7 +82,12 @@ _TRUNCATION_MARKER: str = "\n...[digest truncated at cap]"
 # v4 (2026-09-05, RG5): the output contract gains the OPTIONAL regime
 # VERDICT (`"regime": {"fast": "<decl>|measured", …}`) the worker turns
 # into a declaration; the digest gains the REGIME section.
-STRATEGIST_PROMPT_VERSION: str = "strategist-v4"
+# v5 (2026-09-05, RG8 — operator ruling "enforce regime labelling
+# everywhere"): `regimes` is no longer advisory — a proposal with ONE
+# unlabelled row is malformed (`parse_proposal` refuses it, the cycle
+# archives it as `malformed_output`), and a label must EARN itself: the
+# gate compares the table against `--regime off` (net_on >= net_off).
+STRATEGIST_PROMPT_VERSION: str = "strategist-v5"
 
 # ---- events-ledger kinds (§7.5; written by daemon.py on the serve
 # thread — the events table is serve-loop-only under the §7.6 law) ------
@@ -432,8 +437,10 @@ _STATIC_SYSTEM_TEXT: str = (
     '  *"horizon_ms":   integer 10..86400000 — refire cooldown, and'
     " re-entry cooldown after a position exits\n"
     '  *"max_risk_usd": number > 0, <= 10000.0 — notional cap PER LEG\n'
-    '   "regimes":      REQUIRED on every row you propose (the engine'
-    " accepts unlabelled rows only as legacy): a non-empty list of label"
+    '   "regimes":      REQUIRED on every row you propose — a proposal'
+    " with ONE unlabelled row is REFUSED as malformed (RG8), and the gate"
+    " refuses a table whose labels earn nothing against `--regime off`"
+    " (net_on >= net_off is a gate): a non-empty list of label"
     ' terms "[fast:|slow:]<dim>:<values>" — the REGION of the market'
     " regime space in which this row may ENTER. Dimensions: trend"
     " (bear|neutral|bull), shape (chop|mixed|trend), vol"
@@ -1020,6 +1027,14 @@ def _parse_trigger(value: object, sym: int) -> dict[str, object] | None:
     return None
 
 
+def parse_row(value: object) -> dict[str, object] | None:
+    """RG4 (plan §5.2): the structural row parser as a public seam for
+    the strategy library — one artifact row in, the canonical-key-order
+    row out (or ``None`` when malformed). Same arm dispatch and laws as
+    [`parse_proposal`]'s per-row step; nothing cross-row."""
+    return _parse_row(value)
+
+
 def _parse_row(value: object) -> dict[str, object] | None:
     """Arm dispatch (validator rule 2): a row is v1 XOR v2. A row
     carrying keys from BOTH shapes is malformed, exactly as
@@ -1301,12 +1316,17 @@ def _parse_row_v1(obj: dict[str, object]) -> dict[str, object] | None:
     return ordered
 
 
-def parse_proposal(raw: str) -> Proposal | None:
+def parse_proposal(raw: str, require_labels: bool = True) -> Proposal | None:
     """STRICT §7.3 parse: exactly ``{"thesis": str, "rows": [...]}`` plus
     the OPTIONAL RG5 ``"regime"`` verdict, with rows in the §4.1 grammar
     (structural bounds mirrored above). ``None`` on ANY deviation — the
     caller archives + counts, never crashes. Oversized (> 256 rows) is
-    malformed; so is a verdict that is not a profile → declaration map."""
+    malformed; so is a verdict that is not a profile → declaration map.
+
+    RG8 (operator ruling 2026-09-05): every proposed row must carry
+    ``regimes`` — an unlabelled row makes the proposal malformed
+    (``require_labels``; the library's ``parse_row`` seam stays
+    structural so legacy artifacts still import as candidates)."""
     try:
         obj = json.loads(raw)
     except (ValueError, TypeError):
@@ -1328,7 +1348,7 @@ def parse_proposal(raw: str) -> Proposal | None:
     rows: list[dict[str, object]] = []
     for entry in entries:
         row = _parse_row(entry)
-        if row is None:
+        if row is None or (require_labels and "regimes" not in row):
             return None
         rows.append(row)
     regime: dict[str, str] | None = None

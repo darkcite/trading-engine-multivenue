@@ -39,12 +39,17 @@ _PROPOSAL = json.dumps(
         "thesis": "fade the lagged PM quote",
         "rows": [
             {
+                # RG8: the strategist must label every row (v2 grammar).
                 "name": "auto-buy-low",
                 "family": "crypto",
-                "trigger": {"type": "level_breach", "level": 0.42},
-                "sym": 42,
-                "side": "bid",
-                "edge_bps": 80,
+                "instrument": "okx:BTC-USDT",
+                "ref": "binance:btcusdt",
+                "feature": "mid",
+                "combine": "diff_bps",
+                "abs": True,
+                "enter": 3.0,
+                "exit": 1.0,
+                "regimes": ["vol:low|normal"],
                 "horizon_ms": 1500,
                 "max_risk_usd": 50.0,
             }
@@ -58,10 +63,14 @@ _REVISION = json.dumps(
             {
                 "name": "auto-buy-lower",
                 "family": "crypto",
-                "trigger": {"type": "level_breach", "level": 0.38},
-                "sym": 42,
-                "side": "bid",
-                "edge_bps": 90,
+                "instrument": "okx:BTC-USDT",
+                "ref": "binance:btcusdt",
+                "feature": "mid",
+                "combine": "diff_bps",
+                "abs": True,
+                "enter": 4.0,
+                "exit": 1.0,
+                "regimes": ["vol:low|normal"],
                 "horizon_ms": 1500,
                 "max_risk_usd": 40.0,
             }

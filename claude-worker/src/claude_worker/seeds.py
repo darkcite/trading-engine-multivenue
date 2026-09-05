@@ -112,6 +112,22 @@ class FundingStats(typing.NamedTuple):
     capped: int
 
 
+class FundingSeedRow(typing.NamedTuple):
+    """One settled print as the harness seed file carries it
+    (``funding-seed.tsv``: tab-separated ``descriptor``, ``ts_ms``,
+    ``rate_1e9``)."""
+
+    sym: int
+    descriptor: str
+    ts_ms: int
+    rate_1e9: int
+
+
+#: The harness funding seed a window cut writes beside its manifests
+#: (``crates/cli/src/backtest/funding.rs`` reads it by default).
+FUNDING_SEED_FILE: str = "funding-seed.tsv"
+
+
 class PositionStats(typing.NamedTuple):
     """Position-seed collection counters."""
 
@@ -123,15 +139,17 @@ class PositionStats(typing.NamedTuple):
     seeded: int
 
 
-def funding_seed_frames(
+def funding_seed_rows(
     conn: sqlite3.Connection,
     manifest: dict[tuple[int, int], str],
     now_ms: int,
-) -> tuple[list[SeedFrame], FundingStats]:
-    """Manifest × funding table → kind-10 frames, oldest print first
-    per descriptor (the engine folds them into the same windows the
-    live event lane feeds)."""
-    frames: list[SeedFrame] = []
+) -> tuple[list[FundingSeedRow], FundingStats]:
+    """Manifest × funding table → the seed prints, oldest first per
+    descriptor: the last ``FUNDING_WINDOW_H`` hours before ``now_ms``
+    (exclusive), newest ``MAX_PRINTS_PER_SYM`` kept, rate ×1e9 RAW as
+    the venue printed it. ONE law for the boot frames and the per-window
+    harness seed."""
+    rows_out: list[FundingSeedRow] = []
     descriptors = 0
     capped = 0
     lo_ms = now_ms - FUNDING_WINDOW_H * MS_1H
@@ -156,17 +174,51 @@ def funding_seed_frames(
             rows = rows[-MAX_PRINTS_PER_SYM:]
         descriptors += 1
         for ts_ms, rate in rows:
-            frames.append(
-                SeedFrame(
-                    kind=claude_worker.frames.KIND_FUNDING_SEED,
-                    sym=sym,
-                    px=round(rate * 1e9),
-                    qty=ts_ms,
-                    side=claude_worker.frames.SIDE_NONE,
-                    param_id=0,
-                )
-            )
-    return frames, FundingStats(descriptors, len(frames), capped)
+            rows_out.append(FundingSeedRow(sym, desc, int(ts_ms), round(rate * 1e9)))
+    return rows_out, FundingStats(descriptors, len(rows_out), capped)
+
+
+def funding_seed_frames(
+    conn: sqlite3.Connection,
+    manifest: dict[tuple[int, int], str],
+    now_ms: int,
+) -> tuple[list[SeedFrame], FundingStats]:
+    """The boot lane: ``funding_seed_rows`` as kind-10 frames (the
+    engine folds them into the same windows the live event lane
+    feeds)."""
+    rows, stats = funding_seed_rows(conn, manifest, now_ms)
+    frames = [
+        SeedFrame(
+            kind=claude_worker.frames.KIND_FUNDING_SEED,
+            sym=r.sym,
+            px=r.rate_1e9,
+            qty=r.ts_ms,
+            side=claude_worker.frames.SIDE_NONE,
+            param_id=0,
+        )
+        for r in rows
+    ]
+    return frames, stats
+
+
+def write_funding_seed_tsv(path: pathlib.Path, rows: list[FundingSeedRow]) -> None:
+    """Write the harness seed file (``#`` header, one print per line)."""
+    lines = [
+        "# funding-seed.tsv — settled funding prints before the window (claude_worker.seeds)",
+        "# descriptor\tts_ms\trate_1e9",
+    ]
+    lines.extend(f"{r.descriptor}\t{r.ts_ms}\t{r.rate_1e9}" for r in rows)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def has_funding_table(conn: sqlite3.Connection) -> bool:
+    """``candles.db`` carries the funding table (the hourly lane's)."""
+    return (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='funding'"
+        ).fetchone()
+        is not None
+    )
 
 
 class _Row(typing.NamedTuple):
@@ -420,13 +472,7 @@ def main(argv: list[str] | None = None) -> int:
     if db_path.is_file():
         conn = sqlite3.connect(db_path)
         try:
-            has_funding = (
-                conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='funding'"
-                ).fetchone()
-                is not None
-            )
-            if has_funding:
+            if has_funding_table(conn):
                 f_frames, f_stats = funding_seed_frames(conn, cur_manifest[0], now_ms)
                 frames.extend(f_frames)
                 report(

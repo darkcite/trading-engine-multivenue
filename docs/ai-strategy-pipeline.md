@@ -467,6 +467,11 @@ itself unless the row's own `off = hard` law says so, and it never flips a table
   (`--regime <path>|off`, `--regime-seed`); `--regime off` is the on/off delta every labelled table
   must earn (the live `fde6f733…` did NOT: on−off = −$0.36 on the 8-window pool, LOWO fails twice —
   kept live as the soak shape by operator ruling).
+- **Funding seed (2026-09-05).** A window cut with `candles.db` also writes `funding-seed.tsv` (the
+  boot seed lane's law: 73 h of settled prints before the window); `backtest` replays it through the
+  vm's live `FundingSeed` path before the first record (`--funding-seed` overrides), so an
+  `apr24`/`apr72` member is warm from the first tick of a ≤ 2 h window exactly as the live engine
+  is — the carry family can be evidenced on the pool at last.
 - **Library + composer (RG4).** `state.db` gains `library` / `library_evidence` / `compositions`;
   `python -m claude_worker.library` catalogs members with labels + per-window evidence, `python -m
   claude_worker.compose` assembles a table from the members fitting the CURRENT words and gates it on

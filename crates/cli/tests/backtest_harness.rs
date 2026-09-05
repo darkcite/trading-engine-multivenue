@@ -129,6 +129,7 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         // is bit-identical to a blind replay).
         regime: RegimeMode::Off,
         regime_seed: None,
+        funding_seed: None,
     }
 }
 
@@ -1044,6 +1045,7 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         emit_detail: None,
         regime: RegimeMode::Off,
         regime_seed: None,
+        funding_seed: None,
     }
 }
 
@@ -1214,6 +1216,96 @@ fn v5_warmup_gates_entries_until_window_filled() {
 
 /// D-7: an options row (no tick lane, mark-bearing OptSummary) prices
 /// at mark and FILLS under the mark law — taker at mark ± h.
+/// The harness FUNDING seed (RG4's carry blocker, 2026-09-05): an
+/// `apr24` row inside a short window is warm-gated for 24 h without a
+/// seed (0 fires) and warm from the first tick with the window's own
+/// `funding-seed.tsv` (default) or `--funding-seed` (wins); the seed
+/// goes through the vm's live `FundingSeed` path — dedup law included —
+/// and the summary says so.
+#[test]
+fn funding_seed_warms_apr_rows_inside_a_short_window() {
+    let root = unique_root("fund-seed");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+
+    // apr24 ≥ 0 refire row: fires on ANY present (positive) APR.
+    let ruleset = root.join("apr.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"apr","instrument":"okx:BTC-USDT-SWAP","feature":"apr24","enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    // One funding event teaches the wall offset (the window's own print).
+    const WALL_MS: i64 = 1_787_961_600_000;
+    let ev = core_types::ChannelEvent::new(
+        500,
+        VenueId::Okx,
+        core_types::ChannelId::Funding,
+        V5_SYM,
+        0,
+        WALL_MS as u64,
+        100_000_000,
+        WALL_MS + 8 * 3_600_000,
+    );
+    let path = run0.join("okx-events.pmlr");
+    let mut w =
+        PmlrWriter::open(&path, SlotKind::Event, EPOCH_RUN_0).expect("open events");
+    w.append(&ev).expect("append");
+    w.flush().expect("flush");
+    write_ticks(
+        &run0,
+        "okx",
+        EPOCH_RUN_0,
+        &[
+            mk_tick(1_000, VenueId::Okx, V5_SYM, 1, 499_000, 501_000),
+            mk_tick(60_000_000_000, VenueId::Okx, V5_SYM, 2, 499_000, 501_000),
+            mk_tick(660_000_000_000, VenueId::Okx, V5_SYM, 3, 499_000, 501_000),
+        ],
+    );
+
+    // Unseeded: the 24 h warm-up gates every tick of an 11 min window.
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.funding_seed_prints, 0);
+    assert_eq!(s.warmup_end_virt_ns, s.first_virt_ns + 1_440 * 60_000_000_000);
+    assert_eq!(s.vm_fires, 0, "warm-gated");
+    assert!(out.summary.contains("funding: seed_prints=0 dropped=0 deduped=0 warmup=table"));
+
+    // The window's own seed: the three 8 h settlements before the
+    // window, one duplicate 1 min after a print (deduped by the vm's
+    // half-period law), one line for a descriptor this root does not
+    // carry.
+    let mut seed = String::from("# funding-seed.tsv\n");
+    for k in 1..=3i64 {
+        seed.push_str(&format!("okx:BTC-USDT-SWAP\t{}\t100000\n", WALL_MS - k * 8 * 3_600_000));
+    }
+    seed.push_str(&format!("okx:BTC-USDT-SWAP\t{}\t100000\n", WALL_MS - 8 * 3_600_000 + 60_000));
+    seed.push_str(&format!("bybit-linear:BTCUSDT\t{}\t100000\n", WALL_MS - 8 * 3_600_000));
+    std::fs::write(run0.join("funding-seed.tsv"), &seed).expect("seed");
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!((s.funding_seed_prints, s.funding_seed_dropped, s.funding_seed_deduped), (4, 1, 1));
+    assert_eq!(s.warmup_end_virt_ns, s.first_virt_ns, "seeded: no funding warm-up");
+    assert!(s.vm_fires >= 1, "warm from the first tick: {}", s.vm_fires);
+    assert!(out.summary.contains("funding: seed_prints=4 dropped=1 deduped=1 warmup=seeded"));
+    assert!(out.summary.contains("funding: seed "), "{}", out.summary);
+
+    // `--funding-seed` wins over the run's own file; a malformed file is fatal.
+    let flag = root.join("flag-seed.tsv");
+    std::fs::write(&flag, format!("okx:BTC-USDT-SWAP\t{}\t100000\n", WALL_MS - 8 * 3_600_000)).expect("seed");
+    let mut cfg = v5_cfg(&ruleset, &root, "0/100");
+    cfg.funding_seed = Some(flag);
+    let out = cli::backtest::run(&cfg).expect("harness ok");
+    assert_eq!(out.stats.funding_seed_prints, 1);
+    let bad = root.join("bad-seed.tsv");
+    std::fs::write(&bad, "okx:BTC-USDT-SWAP\tnope\t1\n").expect("seed");
+    cfg.funding_seed = Some(bad);
+    assert!(matches!(cli::backtest::run(&cfg), Err(HarnessError::Usage(_))));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn v5_option_mark_fill_law_executes_and_counts() {
     let root = unique_root("v5-opt");

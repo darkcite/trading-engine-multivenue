@@ -184,6 +184,12 @@ struct BacktestArgs {
     /// the first run directory's own `regime-seed.tsv`, else warm live).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// `funding-seed.tsv` replayed through the vm's live `FundingSeed`
+    /// path before the first record (default: the first run directory's
+    /// own `funding-seed.tsv` when it exists, else none — the funding
+    /// features then warm from the window's own prints).
+    #[arg(long)]
+    funding_seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -479,6 +485,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         emit_detail: args.emit_detail,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
+        funding_seed: args.funding_seed,
     };
     match cli::backtest::run(&cfg) {
         Ok(out) => {
