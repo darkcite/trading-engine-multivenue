@@ -60,9 +60,30 @@ fi
 
 [ -n "${MULTIVENUE_S3_ENV_FILE:-}" ] && export MULTIVENUE_S3_ENV_FILE
 
-# Background QoS: this shares the box with the ingress threads whose venue-time
-# staleness gate judges the data being captured WHILE the upload runs. An
-# upload that adds delivery delay degrades the very data it is preserving.
-exec taskpolicy -b nice -n 19 \
+# Network QoS — measured, not assumed.
+#
+# `taskpolicy -b` puts the process in macOS's BACKGROUND traffic class. A short
+# burst shows no penalty (4 MiB transfers measured 5.21 vs 5.47 MiB/s), which is
+# exactly why it looked free at first. A SUSTAINED transfer is throttled hard:
+# the real backfill crawled at ~0.3 MiB/s under it while an unthrottled probe on
+# the same link, at the same moment, got 5.76 MiB/s — and `sample` showed the
+# process parked in _ssl__SSLSocket_write -> poll, blocked on the socket. Off it,
+# the same work runs at ~5 MiB/s, a 13x difference.
+#
+# So it is OFF by default. The justification is duration, not indifference: one
+# day of capture is ~1.8 GiB stored, which is ~6 minutes at 5 MiB/s, in a quiet
+# local hour. During those minutes feed delivery does take a measurable hit
+# (venue delay EMAs rose to ~200 ms transiently), and the venue-time staleness
+# gate judges ticks while the upload runs — so this is a real, bounded cost.
+#
+# Set S3_NICE_NETWORK=1 in retention.conf to put the background class back: the
+# upload then takes hours instead of minutes but is invisible to the feeds.
+NET_PREFIX=""
+if [ "${S3_NICE_NETWORK:-0}" = "1" ]; then
+  NET_PREFIX="taskpolicy -b"
+fi
+
+# shellcheck disable=SC2086  # NET_PREFIX is a deliberate word-split
+exec $NET_PREFIX nice -n 19 \
   "$ALIAS/bin/python3" "$REPO/scripts/archive-run.py" \
   push-pending --budget-s "$S3_CYCLE_BUDGET_S"
