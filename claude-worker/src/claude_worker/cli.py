@@ -50,9 +50,11 @@ import typing
 import httpx
 import typer
 
+import claude_worker.archive_config
 import claude_worker.backtest
 import claude_worker.config
 import claude_worker.daemon
+import claude_worker.data_source
 import claude_worker.features
 import claude_worker.feeds
 import claude_worker.fetchers
@@ -764,6 +766,20 @@ def _resolve_run_dir(cfg: claude_worker.config.BaseConfig, run_dir: str | None) 
         _require(resolved is not None, f"no run-* dirs under {cfg.replay_dir}")
         return typing.cast(pathlib.Path, resolved)
     path = pathlib.Path(run_dir).expanduser()
+    if path.is_dir():
+        return path
+    # A bare run id, for a run retention has already reclaimed. Resolved
+    # through the archive when one is configured; when it is not, the error
+    # below is exactly the one this verb has always produced.
+    name = pathlib.Path(run_dir).name
+    if name.startswith("run-") and name[4:].isdigit():
+        archive_cfg = claude_worker.archive_config.load()
+        if claude_worker.archive_config.is_enabled(archive_cfg):
+            source = claude_worker.data_source.build(archive_cfg, cfg.replay_dir)
+            try:
+                return source.ensure_local(name)
+            except claude_worker.data_source.DataSourceError as exc:
+                _require(False, f"--run-dir: {exc}")
     _require(path.is_dir(), f"--run-dir: no such directory: {path}")
     return path
 

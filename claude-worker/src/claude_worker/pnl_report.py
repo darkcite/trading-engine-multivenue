@@ -197,24 +197,50 @@ def load_fee_flags(path: pathlib.Path) -> list[str]:
     return flags
 
 
-def select_runs(replay_dir: pathlib.Path, day: str) -> list[pathlib.Path]:
-    """Run dirs whose epoch (wall ns in the name) falls on UTC ``day``."""
+def _day_of(epoch_ns: int) -> str:
+    return datetime.datetime.fromtimestamp(
+        epoch_ns / 1e9, tz=datetime.timezone.utc
+    ).strftime("%Y-%m-%d")
+
+
+def select_runs(
+    replay_dir: pathlib.Path, day: str, source: typing.Any = None
+) -> list[pathlib.Path]:
+    """Run dirs whose epoch (wall ns in the name) falls on UTC ``day``.
+
+    ``source`` is an optional ``data_source.DataSource``. When given, runs of
+    that day which exist only in the object archive are materialised into the
+    local cache and returned as real paths — the caller sees directories either
+    way and needs no change.
+
+    Day mode for the CLOSED day is unaffected in practice: PROTECT_DAYS keeps
+    those runs local. This matters for re-running an OLD day after retention has
+    reclaimed it, which is precisely the case that used to be impossible.
+    """
     out: list[pathlib.Path] = []
-    if not replay_dir.is_dir():
+    seen: set[str] = set()
+    if replay_dir.is_dir():
+        for child in sorted(replay_dir.iterdir()):
+            if not child.is_dir() or not child.name.startswith("run-"):
+                continue
+            try:
+                epoch_ns = int(child.name[4:])
+            except ValueError:
+                continue
+            if _day_of(epoch_ns) == day:
+                out.append(child)
+                seen.add(child.name)
+    if source is None:
         return out
-    for child in sorted(replay_dir.iterdir()):
-        if not child.is_dir() or not child.name.startswith("run-"):
+    for ref in source.list_runs():
+        if ref.run_id in seen or _day_of(ref.epoch_ns) != day:
             continue
         try:
-            epoch_ns = int(child.name[4:])
-        except ValueError:
+            out.append(source.ensure_local(ref.run_id))
+            seen.add(ref.run_id)
+        except Exception:  # a pull failure must never lose the local runs
             continue
-        d = datetime.datetime.fromtimestamp(
-            epoch_ns / 1e9, tz=datetime.timezone.utc
-        ).strftime("%Y-%m-%d")
-        if d == day:
-            out.append(child)
-    return out
+    return sorted(out, key=lambda p: p.name)
 
 
 _SUM_KEYS = (
@@ -459,6 +485,7 @@ def run_day(
     run_fn: RunFn | None = None,
     fee_flags: list[str] | None = None,
     window_root: pathlib.Path | None = None,
+    source: typing.Any = None,
 ) -> int:
     """Day mode: one bounded audit-pnl per ≤ 2 h window of every run of
     ``day`` (``window_root`` = where the cuts are materialised, deleted
@@ -467,7 +494,9 @@ def run_day(
     and on stderr; the merge still lands for the others)."""
     fn = _default_run_fn if run_fn is None else run_fn
     flags = list(fee_flags or [])
-    runs = select_runs(replay_dir, day)
+    if source is not None:
+        report(source.cfg.tell())
+    runs = select_runs(replay_dir, day, source)
     if not runs:
         report(f"pnl-report: {day}: no run dir under {replay_dir} — nothing to audit")
         return 1
@@ -502,6 +531,11 @@ def run_day(
     merged = merge_reports(day, ok)
     merged["failed_runs"] = failed
     merged["fee_flags"] = flags
+    # S-LAW 8: a number produced from archived data records where the bytes came
+    # from. ADDITIVE — with the subsystem off the key is simply absent, so a
+    # report built without an archive is byte-identical to a pre-S6 one.
+    if source is not None:
+        merged["data_source"] = source.provenance([p.name for p in runs])
     json_path.write_text(json.dumps(merged, separators=(",", ":")) + "\n", encoding="utf-8")
     head = [
         f"pnl-report: day {day}: runs audited {len(ok)} failed {len(failed)}",
