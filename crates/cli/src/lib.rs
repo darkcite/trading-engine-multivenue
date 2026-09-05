@@ -42,6 +42,7 @@ pub mod capture_catalog;
 pub mod options_manifest;
 pub mod paper;
 pub mod pinning;
+pub mod regime_boot;
 pub mod sigint;
 pub mod universe_boot;
 

@@ -44,6 +44,25 @@
 //! after grammar completes (rule order 2 < 4), its upper bound fires
 //! the moment a 257th row opens.
 //!
+//! ## Grammar v2.1 — regime keys (RG3, `docs/regime-and-dashboard-plan.md` §4.5)
+//!
+//! Three optional v2 row keys land in the `RuleRowV2` regime tail:
+//! `regimes` (a non-empty string array in the §3.3 label grammar —
+//! `[fast:|slow:]<dim>:<values>`, `rel:` terms allowed — folded through
+//! `core_types::regime::RegimeLabelBuilder` into one product term),
+//! `regime_off` (`"soft"` | `"hard"`) and `rel` (sugar for one more
+//! `[fast:|slow:]rel:<values>` term). **Rule 11**: every term parses,
+//! no `(profile, dim)` repeats, `regime_off`/`rel` appear only beside
+//! `regimes`, and the stored tail passes
+//! `RuleRowV2::regime_fields_well_formed` — [`RulesetReject::Regime`].
+//! A row whose only constraint is REL gets `RegimeLabel::LABELLED_ANY`
+//! on that profile so it fails closed on warm-up like every labelled
+//! row. **Rule 8 amendment**: two rows on one v2 identity tuple are a
+//! duplicate only when their regime terms INTERSECT
+//! (`RegimeTerm::intersects`) — disjoint variants of one signal are
+//! legal, at most one is ever open. Rows without the keys are
+//! bit-identical to before (tail zero).
+//!
 //! Trailing bytes (rule 2): only JSON-insignificant ASCII whitespace
 //! may follow the closing brace — G1 documented interpretation: the
 //! hash already pins content byte-exactly, and rejecting a trailing
@@ -72,11 +91,13 @@ use std::sync::Arc;
 use core_crypto::sha256;
 use core_parse::{scan_price_1e6, scan_price_1e9, scan_u64};
 use core_ring::Producer;
+use core_types::regime::RegimeLabelBuilder;
 use core_types::{
-    fnv1a_64, AiCmd, AiCmdKind, CombineOp, FeatId, RuleRow, RuleRowV2, RuleTableSlot,
-    RuleTableV2, SymbolId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS,
-    CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, ROLL_WINDOW_MAX_MIN, ROW_FLAG_POSITION,
-    RULE_TABLE_RING_SLOTS, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
+    fnv1a_64, AiCmd, AiCmdKind, CombineOp, FeatId, RegimeLabel, RegimeTerm, RuleRow, RuleRowV2,
+    RuleTableSlot, RuleTableV2, SymbolId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR,
+    CMP_ENTRY_ABS, CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, REGIME_OFF_HARD, REGIME_OFF_SOFT,
+    ROLL_WINDOW_MAX_MIN, ROW_FLAG_POSITION, RULE_TABLE_RING_SLOTS, RULE_TABLE_ROWS,
+    SYMBOL_ID_NONE,
 };
 
 use crate::status::AiIngressStatus;
@@ -156,6 +177,13 @@ pub enum RulesetReject {
     /// `min_hold_s`/`max_hold_s`/`group` on a refire row, or a
     /// position row without `exit`.
     Position,
+    /// RG3 rule 11 — regime keys: a `regimes`/`rel` term that does
+    /// not parse (unknown dimension/value, empty set, duplicate
+    /// `(profile, dim)`, over-long), `regime_off` outside
+    /// `soft|hard`, `regime_off`/`rel` without `regimes`, an empty
+    /// `regimes` array, or a tail that fails
+    /// `RuleRowV2::regime_fields_well_formed`.
+    Regime,
 }
 
 // ---------------------------------------------------------------
@@ -398,6 +426,10 @@ const K_C_PAIR: u32 = 1 << 24;
 const K_GROUP: u32 = 1 << 25;
 const K_MIN_HOLD: u32 = 1 << 26;
 const K_MAX_HOLD: u32 = 1 << 27;
+// RG3 grammar v2.1 — regime keys (row tail, plan §4.5).
+const K_REGIMES: u32 = 1 << 28;
+const K_REGIME_OFF: u32 = 1 << 29;
+const K_REL: u32 = 1 << 30;
 
 /// The v1 arm's full required set (all eight, exactly like 8g).
 const V1_REQUIRED: u32 =
@@ -424,7 +456,10 @@ const V2_ONLY: u32 = K_INSTRUMENT
     | K_C_PAIR
     | K_GROUP
     | K_MIN_HOLD
-    | K_MAX_HOLD;
+    | K_MAX_HOLD
+    | K_REGIMES
+    | K_REGIME_OFF
+    | K_REL;
 /// The v2 arm's required set.
 const V2_REQUIRED: u32 = K_NAME | K_INSTRUMENT | K_FEATURE | K_ENTER | K_HORIZON | K_RISK;
 
@@ -498,6 +533,78 @@ fn scan_descriptor(
         out[n] = c;
         n += 1;
     }
+}
+
+/// RG3: longest legal label term is
+/// `slow:stretch:ext_down|neutral|ext_up|unknown` (44 B); 64 leaves
+/// margin, anything longer cannot be a term and rejects as rule 11.
+const REGIME_TERM_CAP: usize = 64;
+
+/// RG3: scan one `regimes` / `rel` string into `out` — printable
+/// ASCII, no escapes (rule 2 on the JSON shape), ≤ [`REGIME_TERM_CAP`]
+/// and non-empty (rule 11 on the term).
+fn scan_regime_term(
+    cur: &mut Cur<'_>,
+    out: &mut [u8; REGIME_TERM_CAP],
+) -> Result<usize, RulesetReject> {
+    cur.eat(b'"')?;
+    let mut n = 0usize;
+    loop {
+        if cur.i >= cur.b.len() {
+            return Err(RulesetReject::Grammar);
+        }
+        let c = cur.b[cur.i];
+        cur.i += 1;
+        if c == b'"' {
+            if n == 0 {
+                return Err(RulesetReject::Regime);
+            }
+            return Ok(n);
+        }
+        if c == b'\\' || !(0x20..=0x7E).contains(&c) {
+            return Err(RulesetReject::Grammar);
+        }
+        if n >= REGIME_TERM_CAP {
+            return Err(RulesetReject::Regime);
+        }
+        out[n] = c;
+        n += 1;
+    }
+}
+
+/// RG3: fold one term string into the row's label builder (rule 11 —
+/// every grammar refusal maps to [`RulesetReject::Regime`]).
+fn add_regime_term(b: &mut RegimeLabelBuilder, term: &[u8]) -> Result<(), RulesetReject> {
+    b.add(term).map_err(|_| RulesetReject::Regime)
+}
+
+/// RG3: the `rel` key's sugar — `[fast:|slow:]<values>` becomes the
+/// term `[fast:|slow:]rel:<values>` (the builder's REL route). `out`
+/// receives the rewritten term; returns its length.
+fn rel_sugar_term(
+    value: &[u8],
+    out: &mut [u8; REGIME_TERM_CAP + 4],
+) -> Result<usize, RulesetReject> {
+    let (prefix, rest): (&[u8], &[u8]) = if value.starts_with(b"fast:") {
+        (b"fast:", &value[5..])
+    } else if value.starts_with(b"slow:") {
+        (b"slow:", &value[5..])
+    } else {
+        (b"", value)
+    };
+    if rest.is_empty() || rest.starts_with(b"rel:") {
+        // `rel: "rel:lagging"` is not the sugar — refuse rather than
+        // guess (the array form spells the dimension out).
+        return Err(RulesetReject::Regime);
+    }
+    let n = prefix.len() + 4 + rest.len();
+    if n > out.len() {
+        return Err(RulesetReject::Regime);
+    }
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..prefix.len() + 4].copy_from_slice(b"rel:");
+    out[prefix.len() + 4..n].copy_from_slice(rest);
+    Ok(n)
 }
 
 /// Scan a row `name` string: escapes/control bytes reject as rule 2;
@@ -868,6 +975,11 @@ fn parse_and_admit_row(
     let mut group = GROUP_NONE;
     let mut min_hold_s = 0u32;
     let mut max_hold_s = 0u32;
+    // RG3 regime tail (grammar v2.1). The builder folds every term of
+    // `regimes` plus the `rel` sugar; `regime_off` defaults soft.
+    let mut regime_builder = RegimeLabelBuilder::new();
+    let mut regime_off = REGIME_OFF_SOFT;
+    let mut term_buf = [0u8; REGIME_TERM_CAP];
 
     macro_rules! once {
         ($bit:expr) => {
@@ -1051,6 +1163,36 @@ fn parse_and_admit_row(
         } else if key == b"max_hold_s" {
             once!(K_MAX_HOLD);
             max_hold_s = scan_u32_field(cur)?;
+        } else if key == b"regimes" {
+            // RG3 rule 11: a non-empty array of label terms.
+            once!(K_REGIMES);
+            cur.eat(b'[')?;
+            if cur.peek_is(b']') {
+                return Err(RulesetReject::Regime); // empty label list
+            }
+            loop {
+                let m = scan_regime_term(cur, &mut term_buf)?;
+                add_regime_term(&mut regime_builder, &term_buf[..m])?;
+                if cur.eat_if(b',') {
+                    continue;
+                }
+                cur.eat(b']')?;
+                break;
+            }
+        } else if key == b"regime_off" {
+            once!(K_REGIME_OFF);
+            let m = scan_keyword(cur, &mut kw)?;
+            regime_off = match &kw[..m] {
+                b"soft" => REGIME_OFF_SOFT,
+                b"hard" => REGIME_OFF_HARD,
+                _ => return Err(RulesetReject::Regime),
+            };
+        } else if key == b"rel" {
+            once!(K_REL);
+            let m = scan_regime_term(cur, &mut term_buf)?;
+            let mut sugar = [0u8; REGIME_TERM_CAP + 4];
+            let n = rel_sugar_term(&term_buf[..m], &mut sugar)?;
+            add_regime_term(&mut regime_builder, &sugar[..n])?;
         } else {
             return Err(RulesetReject::Grammar); // unknown row key
         }
@@ -1231,13 +1373,39 @@ fn parse_and_admit_row(
             }
             l += 1;
         }
+        // Rule 11 (RG3): `regime_off`/`rel` only beside `regimes`; the
+        // folded term must be well-formed once stored. A profile that
+        // received only a `rel:` term keeps the word masks ANY in the
+        // builder — fill it with LABELLED_ANY so the row is a labelled
+        // (fail-closed on warm-up) row rather than an unconstrained
+        // one carrying a REL byte the tail law forbids.
+        if keys & K_REGIMES == 0 && keys & (K_REGIME_OFF | K_REL) != 0 {
+            return Err(RulesetReject::Regime);
+        }
+        let mut regime_term = regime_builder.finish();
+        if regime_term.rel.fast() != 0 && regime_term.fast == RegimeLabel::ANY {
+            regime_term.fast = RegimeLabel::LABELLED_ANY;
+        }
+        if regime_term.rel.slow() != 0 && regime_term.slow == RegimeLabel::ANY {
+            regime_term.slow = RegimeLabel::LABELLED_ANY;
+        }
+        if keys & K_REGIMES != 0 && regime_term == RegimeTerm::ANY {
+            // Unreachable through the builder (every parsed term fills
+            // its profile), kept as the rule's tripwire.
+            return Err(RulesetReject::Regime);
+        }
         // Rule 8 (v2 identity): duplicate
         // `(sym, ref, feat_a/b/c, windows, combine, cmp_bits, flags,
         //   group, enter)` — two rows differing ONLY in
         // horizon/holds/risk/name/exit/confirm-threshold are the
         // same rule (the v1 spirit: thresholds-of-degree are not
         // identity, but a different window or comparison IS a
-        // different rule).
+        // different rule). RG3 amendment: a match on the tuple is a
+        // duplicate only when the regime regions INTERSECT — disjoint
+        // variants of one signal (`trend:bull` vs `trend:bear`, each
+        // with its own exit/horizon/risk/off) are admitted; at most
+        // one of them is ever open, so the double-fire hazard cannot
+        // arise. Two legacy rows (both ANY) intersect ⇒ unchanged.
         let flags = if position { ROW_FLAG_POSITION } else { 0 };
         let fc_byte = feat_c.map(|f| f as u8).unwrap_or(FEAT_NONE);
         let mut cmp_bits = 0u8;
@@ -1272,12 +1440,13 @@ fn parse_and_admit_row(
                 && r.flags == flags
                 && r.group == group
                 && r.enter_1e9 == enter_1e9
+                && r.regime_term().intersects(&regime_term)
             {
                 return Err(RulesetReject::DuplicateRow);
             }
             j += 1;
         }
-        RuleRowV2::new(
+        let row = RuleRowV2::new(
             flags,
             side,
             group,
@@ -1302,6 +1471,16 @@ fn parse_and_admit_row(
             max_hold_s,
             family,
         )
+        .with_regime(regime_term, regime_off);
+        // Rule 11 (close): the stored tail law — masks and REL byte
+        // well-formed, `off`/`rel` zero on an unconstrained row (a
+        // `regime_off` beside an `regimes` list that constrains
+        // nothing cannot happen after the fills above, but the row
+        // type owns the law, so it is asked).
+        if !row.regime_fields_well_formed() {
+            return Err(RulesetReject::Regime);
+        }
+        row
     };
 
     // Rule 5 (close): name_h unique within the file.
@@ -3042,6 +3221,242 @@ mod v2_grammar_tests {
         )
         .expect("valid");
         assert_eq!(t.rows[0].enter_1e9, 59_300);
+    }
+
+    // ---- RG3: grammar v2.1 regime keys (rule 11 + rule 8 amendment) ----
+
+    /// One refire row on the swap with the regime keys spliced in.
+    fn regime_row(name: &str, extra: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1.0,"horizon_ms":1000,"max_risk_usd":10.0,"side":"bid"{extra}}}"#
+        )
+    }
+
+    fn one_row(extra: &str) -> Result<Box<RuleTableV2>, RulesetReject> {
+        check_v2_table(&format!(r#"{{"rows":[{}]}}"#, regime_row("r", extra)))
+    }
+
+    #[test]
+    fn regime_keys_land_in_the_tail_and_unlabelled_rows_stay_zero() {
+        use core_types::regime::{
+            dim_any_mask, DIM_FUND_LEVEL, DIM_FUND_SIGN, DIM_SHAPE, DIM_SOURCE, DIM_STRETCH,
+            DIM_TREND, DIM_VOL, SOURCE_DEFAULT_MASK,
+        };
+        let t = one_row(
+            r#","regimes":["trend:bull|neutral","slow:vol:!high"],"regime_off":"hard","rel":"lagging|inline""#,
+        )
+        .expect("labelled row admits");
+        let r = &t.rows[0];
+        assert_eq!(r.regime_off, REGIME_OFF_HARD);
+        assert_eq!(r.regime_rel, 0b011, "rel sugar lands in the fast nibble");
+        let fast = RegimeLabel(r.regime_fast);
+        assert_eq!(fast.0 as u8, 0b110, "trend:bull|neutral");
+        assert_eq!(
+            (fast.0 >> (8 * DIM_SHAPE as u32)) as u8,
+            dim_any_mask(DIM_SHAPE)
+        );
+        assert_eq!(
+            (fast.0 >> (8 * DIM_VOL as u32)) as u8,
+            dim_any_mask(DIM_VOL)
+        );
+        assert_eq!(
+            (fast.0 >> (8 * DIM_SOURCE as u32)) as u8,
+            SOURCE_DEFAULT_MASK
+        );
+        let slow = RegimeLabel(r.regime_slow);
+        assert_eq!((slow.0 >> (8 * DIM_VOL as u32)) as u8, 0b011, "vol:!high");
+        assert_eq!(slow.0 as u8, dim_any_mask(DIM_TREND));
+        assert_eq!(
+            (slow.0 >> (8 * DIM_FUND_SIGN as u32)) as u8,
+            dim_any_mask(DIM_FUND_SIGN)
+        );
+        assert_eq!(
+            (slow.0 >> (8 * DIM_FUND_LEVEL as u32)) as u8,
+            dim_any_mask(DIM_FUND_LEVEL)
+        );
+        assert_eq!(
+            (slow.0 >> (8 * DIM_STRETCH as u32)) as u8,
+            dim_any_mask(DIM_STRETCH)
+        );
+        assert!(r.regime_fields_well_formed());
+        assert!(r.regime_constrained());
+        // The legacy fixture: every tail byte zero, bit-identical rows.
+        let legacy = check_v2_table(CARRY).expect("legacy artifact still admits");
+        let l = &legacy.rows[0];
+        assert_eq!(l.regime_fast, 0);
+        assert_eq!(l.regime_slow, 0);
+        assert_eq!(l.regime_off, 0);
+        assert_eq!(l.regime_rel, 0);
+        assert_eq!(l.regime_term(), RegimeTerm::ANY);
+        assert!(!l.regime_constrained());
+    }
+
+    #[test]
+    fn regime_soft_default_and_the_rel_prefix_forms() {
+        let t = one_row(r#","regimes":["shape:trend"]"#).expect("admits");
+        assert_eq!(t.rows[0].regime_off, REGIME_OFF_SOFT);
+        assert_eq!(t.rows[0].regime_rel, 0);
+        // `rel` sugar with a slow prefix + a `rel:` term in the array
+        // on the other profile: both nibbles.
+        let t = one_row(r#","regimes":["trend:bull","rel:leading"],"rel":"slow:lagging""#)
+            .expect("admits");
+        let r = &t.rows[0];
+        assert_eq!(r.regime_rel, (0b001 << 4) | 0b100);
+        assert_eq!(
+            RegimeLabel(r.regime_slow),
+            RegimeLabel::LABELLED_ANY,
+            "REL-only profile is labelled-any, never bare ANY"
+        );
+        assert!(r.regime_fields_well_formed());
+    }
+
+    #[test]
+    fn rel_only_row_is_labelled_any_on_that_profile() {
+        let t = one_row(r#","regimes":["rel:lagging"]"#).expect("REL-only row admits");
+        let r = &t.rows[0];
+        assert_eq!(RegimeLabel(r.regime_fast), RegimeLabel::LABELLED_ANY);
+        assert_eq!(RegimeLabel(r.regime_slow), RegimeLabel::ANY);
+        assert_eq!(r.regime_rel, 0b001);
+        assert!(r.regime_constrained());
+        assert!(r.regime_fields_well_formed());
+    }
+
+    #[test]
+    fn rule11_refusals() {
+        let refused = |extra: &str, why: &str| {
+            assert_eq!(one_row(extra).err(), Some(RulesetReject::Regime), "{why}");
+        };
+        refused(r#","regimes":[]"#, "empty label list");
+        refused(r#","regimes":[""]"#, "empty term");
+        refused(r#","regimes":["mood:happy"]"#, "unknown dimension");
+        refused(r#","regimes":["trend:sideways"]"#, "unknown value");
+        refused(r#","regimes":["trend"]"#, "term syntax");
+        refused(
+            r#","regimes":["trend:bull","fast:trend:bear"]"#,
+            "duplicate (profile, dim)",
+        );
+        refused(
+            r#","regimes":["rel:lagging","rel:leading"]"#,
+            "duplicate rel",
+        );
+        refused(r#","regimes":["rel:unknown"]"#, "REL has no unknown mark");
+        refused(r#","regime_off":"soft""#, "regime_off without regimes");
+        refused(r#","rel":"lagging""#, "rel without regimes");
+        refused(
+            r#","regimes":["trend:bull"],"regime_off":"maybe""#,
+            "bad off token",
+        );
+        refused(
+            r#","regimes":["trend:bull"],"rel":"rel:lagging""#,
+            "rel sugar is not the array form",
+        );
+        refused(
+            r#","regimes":["trend:bull"],"rel":"sideways""#,
+            "bad rel value",
+        );
+        refused(
+            r#","regimes":["trend:bull"],"rel":"fast:""#,
+            "empty rel after prefix",
+        );
+        refused(
+            r#","regimes":["slow:stretch:ext_down|neutral|ext_up|unknown|ext_down|neutral|ext_up|unknown"]"#,
+            "over-long term",
+        );
+        // JSON-shape faults on the new keys stay rule 2.
+        assert_eq!(
+            one_row(r#","regimes":"trend:bull""#).err(),
+            Some(RulesetReject::Grammar),
+            "regimes must be an array"
+        );
+        assert_eq!(
+            one_row(r#","regimes":[1]"#).err(),
+            Some(RulesetReject::Grammar),
+            "terms must be strings"
+        );
+        assert_eq!(
+            one_row(r#","regimes":["trend:bull"],"regimes":["trend:bear"]"#).err(),
+            Some(RulesetReject::Grammar),
+            "duplicate key"
+        );
+        // v1 rows cannot carry the keys (shape mix).
+        assert_eq!(
+            check_v2(
+                r#"{"rows":[{"name":"old","family":"crypto","trigger":{"type":"level_breach","level":0.5},"sym":42,"side":"bid","edge_bps":80,"horizon_ms":1500,"max_risk_usd":50.0,"regimes":["trend:bull"]}]}"#,
+            ),
+            Err(RulesetReject::Grammar)
+        );
+    }
+
+    #[test]
+    fn rule8_amendment_admits_disjoint_variants_and_refuses_overlaps() {
+        let two = |a: &str, b: &str| {
+            check_v2_table(&format!(
+                r#"{{"rows":[{},{}]}}"#,
+                regime_row("a", a),
+                regime_row("b", b)
+            ))
+        };
+        // Disjoint on TREND: both admit, order preserved.
+        let t = two(
+            r#","regimes":["trend:bull"],"regime_off":"hard""#,
+            r#","regimes":["trend:bear"]"#,
+        )
+        .expect("disjoint variants admit");
+        assert_eq!(t.len, 2);
+        assert_eq!(t.rows[0].regime_off, REGIME_OFF_HARD);
+        assert_eq!(t.rows[1].regime_off, REGIME_OFF_SOFT);
+        // Overlapping regions on the same tuple: still rule 8.
+        assert_eq!(
+            two(
+                r#","regimes":["trend:bull"]"#,
+                r#","regimes":["trend:!bear"]"#
+            )
+            .err(),
+            Some(RulesetReject::DuplicateRow)
+        );
+        // Different dimensions constrained ⇒ the products overlap.
+        assert_eq!(
+            two(r#","regimes":["trend:bull"]"#, r#","regimes":["vol:high"]"#).err(),
+            Some(RulesetReject::DuplicateRow)
+        );
+        // Different PROFILES constrained ⇒ each profile intersects.
+        assert_eq!(
+            two(
+                r#","regimes":["trend:bull"]"#,
+                r#","regimes":["slow:trend:bear"]"#
+            )
+            .err(),
+            Some(RulesetReject::DuplicateRow)
+        );
+        // A labelled row beside a legacy row: the legacy row is ANY.
+        assert_eq!(
+            two(r#","regimes":["trend:bull"]"#, "").err(),
+            Some(RulesetReject::DuplicateRow)
+        );
+        // Legacy duplicates unchanged.
+        assert_eq!(two("", "").err(), Some(RulesetReject::DuplicateRow));
+        // REL-only variants: disjoint nibbles admit, shared bits refuse.
+        assert!(two(
+            r#","regimes":["rel:lagging"]"#,
+            r#","regimes":["rel:leading"]"#
+        )
+        .is_ok());
+        assert_eq!(
+            two(
+                r#","regimes":["rel:lagging"]"#,
+                r#","regimes":["rel:lagging|inline"]"#
+            )
+            .err(),
+            Some(RulesetReject::DuplicateRow)
+        );
+        // Three-way split of one signal (bull / neutral / bear).
+        let three = format!(
+            r#"{{"rows":[{},{},{}]}}"#,
+            regime_row("bull", r#","regimes":["trend:bull"]"#),
+            regime_row("flat", r#","regimes":["trend:neutral"]"#),
+            regime_row("bear", r#","regimes":["trend:bear"]"#),
+        );
+        assert_eq!(check_v2_table(&three).expect("three variants").len, 3);
     }
 
     #[test]

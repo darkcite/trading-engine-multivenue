@@ -318,6 +318,30 @@ impl RegimeLabel {
     /// artifact row and coded strategy.
     pub const ANY: Self = Self(0);
 
+    /// The "labelled but unconstrained" label (RG3): every value of
+    /// every market dimension (unknown marks included) and SOURCE =
+    /// measured|declared — exactly what [`RegimeLabelBuilder`] fills a
+    /// profile with when only its dimensions are omitted. Allows every
+    /// state word except [`RegimeWord::UNKNOWN`], so a row that
+    /// constrains only REL (its word masks would otherwise be `ANY`)
+    /// still fails closed on warm-up like every labelled row.
+    pub const LABELLED_ANY: Self = Self(Self::labelled_any_bits());
+
+    const fn labelled_any_bits() -> u64 {
+        let mut w = 0u64;
+        let mut d = 0u8;
+        while d < DIM_COUNT {
+            let b = if d == DIM_SOURCE {
+                SOURCE_DEFAULT_MASK
+            } else {
+                dim_any_mask(d)
+            };
+            w |= (b as u64) << (8 * d as u32);
+            d += 1;
+        }
+        w
+    }
+
     /// The gate: unconstrained, or every populated dimension of `eff`
     /// is inside the allowed set. An unknown-marked dimension (`0x80`)
     /// passes only a label that does not constrain it (its byte carries
@@ -1230,6 +1254,32 @@ mod tests {
         let c = RegimeTerm::new(bull, RegimeLabel::ANY, RegimeRel::ANY);
         assert!(!a.intersects(&b));
         assert!(a.intersects(&c));
+    }
+
+    #[test]
+    fn labelled_any_is_the_omitted_dimension_fill_and_refuses_only_unknown() {
+        // RG3: the REL-only row fill == what the builder writes for a
+        // profile whose word dimensions are all omitted.
+        let via_builder = labelled(&["source:measured|declared"]).fast;
+        assert_eq!(RegimeLabel::LABELLED_ANY, via_builder);
+        assert!(RegimeLabel::LABELLED_ANY.is_well_formed());
+        assert_ne!(RegimeLabel::LABELLED_ANY, RegimeLabel::ANY);
+        let w = word(
+            TREND_BEAR,
+            SHAPE_CHOP,
+            VOL_HIGH,
+            FUND_NEG,
+            LEVEL_HIGH,
+            STRETCH_EXT_DOWN,
+            SOURCE_MEASURED,
+        );
+        assert!(RegimeLabel::LABELLED_ANY.allows(w));
+        assert!(RegimeLabel::LABELLED_ANY.allows(w.with_source(SOURCE_DECLARED)));
+        assert!(RegimeLabel::LABELLED_ANY.allows(w.with_dim_unknown(DIM_VOL)));
+        assert!(!RegimeLabel::LABELLED_ANY.allows(RegimeWord::UNKNOWN));
+        // It intersects every label (rule 8: a REL-only variant is only
+        // disjoint from another through the REL nibbles).
+        assert!(RegimeLabel::LABELLED_ANY.intersects(labelled(&["trend:bull"]).fast));
     }
 
     #[test]

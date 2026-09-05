@@ -30,6 +30,89 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-09-05 — Ruleset grammar v2.1 regime keys, the vm row gate, the regime-aware harness (RG3)
+
+**What changed**
+
+- Ruleset JSON grammar v2.1: three optional v2 row keys — `regimes`
+  (string array, the §3.3 label grammar with `fast:`/`slow:` prefixes
+  and `rel:` terms), `regime_off` (`soft`|`hard`), `rel` (sugar for one
+  `rel:` term) — parsed by the ingress-ai byte scanner into the
+  `RuleRowV2` regime tail RG0 reserved (`regime_fast`/`regime_slow`/
+  `regime_off`/`regime_rel`). Validator **rule 11** (`RulesetReject::Regime`)
+  and the **rule-8 amendment** (identity-tuple duplicates only when the
+  regime regions intersect — disjoint variants of one signal admit).
+  `RegimeLabel::LABELLED_ANY` (core-types) = the fill of a REL-only
+  profile. Rows without the keys are bit-identical (tail zero) — every
+  existing artifact hashes and validates unchanged.
+- `strategy-vm`: per-row gate byte `row_gate` judged on every
+  `set_regime_view` (the new set→vm seam: `core_regime::RegimeView`,
+  `RegimeState::view()`, pushed by `StrategySet` on configure / seed /
+  every minute roll / effective change / declaration) and on every
+  flip; the entry path skips closed rows (`regime_blocked`), the exit
+  path flattens HARD-closed position rows at once (`regime_hard_exits`;
+  age-out first, min-hold bypassed); soft-closed rows drain by their
+  own law. `StrategyCounters::vm_regime_{blocked,hard_exits}`,
+  `/metrics` `engine_vm_regime_{blocked,hard_exits}_total`.
+- Harness: `backtest` / `audit-pnl` gain `--regime <path>|off` and
+  `--regime-seed <path>` (`cli::backtest::regime`): the engine's own
+  `RegimeState` replays over the window's ticks, funding prints and the
+  `SetRegime` frames of `ai-cmds.pmlr` (pre-anchor frames clamped with
+  their TTL shortened; expired ones dropped + counted); the vm receives
+  the view exactly as live; `off` strips every tail (the on/off delta);
+  absent flag = the default artifact when it exists and resolves on the
+  root (members absent from the root are DROPPED, refs must resolve),
+  else regime-blind with a stderr tell — the frozen worker argv can
+  never fail on a default artifact. `--emit-detail` is `detail_version`
+  4 (additive `regime` block); `audit-pnl` JSON gains the additive
+  `regime` section (per profile: minutes per effective word, per
+  `(word, strategy)` fill-model replays with the fee ladder;
+  `audit_pnl_version` stays 1). `cli::regime_boot` is the ONE resolver
+  the engine boot and the harness share.
+- Worker: `window_root.cut_run` carries the pre-window `SetRegime`
+  declaration still in force at the cut (latest frame per profile
+  decides) in front of the `ai-cmds.pmlr` slice, and writes the window's
+  own `regime-seed.tsv` from `candles.db` when `seed=(regime.toml,
+  candles.db)` is given (`pnl_report` day mode passes the defaults);
+  `strategist` prompt **v3** (`STRATEGIST_PROMPT_VERSION =
+  "strategist-v3"`) teaches the keys, the gate law and regime variants
+  and asks for `regimes` on every row; `parse_proposal` accepts the keys
+  structurally (`regime_term_ok` / `regime_rel_ok` vocabulary mirrors).
+- Bench alloc gate 42 (`vm_regime_gate_and_view_rejudge_are_zero_alloc`).
+
+**Why**
+
+- `docs/regime-and-dashboard-plan.md` RG3: rows gate themselves on the
+  regime (D2 — no table flip on a regime change), and every backtest /
+  nightly report shows the per-regime P&L and the on/off delta.
+
+**Impact**
+
+- On-disk formats: none new. `--emit-detail` sidecar `detail_version`
+  3 → 4 (additive). `audit-pnl` stdout: additive `regime` key.
+  Windowed roots may now carry `regime-seed.tsv` and a carried
+  pre-window `SetRegime` frame in `ai-cmds.pmlr` (ts before the first
+  tick — the harness clamps it).
+- Config keys: none. Ruleset artifacts: the three optional row keys.
+- Wire formats: none (the tail bytes were reserved at RG0; kind 12
+  unchanged).
+- Behaviour: NONE for every existing artifact (tail zero ⇒ open under
+  every view). A LABELLED row fails closed until the engine's detector
+  knows the regime (`~/multivenue/regime.toml` + seed) — and in the
+  harness until `--regime` (or the default artifact) resolves.
+
+**Migration steps**
+
+1. `cargo build --release -p cli` (G0 relink) before any backtest /
+   audit-pnl that matters or the next boot.
+2. Nothing else: labelled rows only exist once a ruleset carries the
+   keys.
+
+**Rollback**
+
+- Revert the commit. Labelled artifacts then reject as rule 2
+  (unknown key) at stage — nothing else changes.
+
 ## 2026-09-03 — Regime detector in the engine: `regime.toml`, `regime-seed.tsv`, `--regime`, the `engine_regime_*` family (RG1–RG2)
 
 **What changed**

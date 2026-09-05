@@ -3435,6 +3435,12 @@ pub struct VmMetricIds {
     /// `engine_vm_commit_dropped_total` — in-stream Commit with
     /// no/mismatched staged table (§6).
     pub commit_dropped: core_metrics::CounterId,
+    /// `engine_vm_regime_blocked_total` (RG3) — entry evaluations
+    /// refused by a closed row regime gate.
+    pub regime_blocked: core_metrics::CounterId,
+    /// `engine_vm_regime_hard_exits_total` (RG3) — positions
+    /// flattened by a HARD-closed row gate.
+    pub regime_hard_exits: core_metrics::CounterId,
 }
 
 /// Last-mirrored cumulative vm-member counter values — same delta
@@ -3446,6 +3452,8 @@ struct VmCountersSnapshot {
     orders_emitted: u64,
     orders_dropped: u64,
     commit_dropped: u64,
+    regime_blocked: u64,
+    regime_hard_exits: u64,
 }
 
 /// Mirror the §9 vm family: gauges as sets, counters as monotonic
@@ -3466,6 +3474,8 @@ fn mirror_vm_metrics<S: strategy_core::StrategyCounters>(
         orders_emitted: strat.vm_orders_emitted(),
         orders_dropped: strat.vm_orders_dropped(),
         commit_dropped: strat.vm_commit_dropped(),
+        regime_blocked: strat.vm_regime_blocked(),
+        regime_hard_exits: strat.vm_regime_hard_exits(),
     };
     reg.counter(ids.fires)
         .inc(cur.fires.saturating_sub(last.fires));
@@ -3475,6 +3485,10 @@ fn mirror_vm_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.orders_dropped.saturating_sub(last.orders_dropped));
     reg.counter(ids.commit_dropped)
         .inc(cur.commit_dropped.saturating_sub(last.commit_dropped));
+    reg.counter(ids.regime_blocked)
+        .inc(cur.regime_blocked.saturating_sub(last.regime_blocked));
+    reg.counter(ids.regime_hard_exits)
+        .inc(cur.regime_hard_exits.saturating_sub(last.regime_hard_exits));
     *last = cur;
 }
 
@@ -3497,6 +3511,8 @@ fn register_vm_metrics(
         orders_emitted: one("engine_vm_orders_emitted_total")?,
         orders_dropped: one("engine_vm_orders_dropped_total")?,
         commit_dropped: one("engine_vm_commit_dropped_total")?,
+        regime_blocked: one("engine_vm_regime_blocked_total")?,
+        regime_hard_exits: one("engine_vm_regime_hard_exits_total")?,
         rows_active,
         table_epoch,
     })
@@ -7022,6 +7038,8 @@ mod tests {
             orders_emitted: 100,
             orders_dropped: 100,
             commit_dropped: 100,
+            regime_blocked: 100,
+            regime_hard_exits: 100,
         };
         mirror_vm_metrics(&reg, &ids, &Bare, &mut stale);
         assert_eq!(reg.counter(ids.fires).get(), 0, "regression saturates");
@@ -7046,6 +7064,8 @@ mod tests {
             "engine_vm_orders_emitted_total",
             "engine_vm_orders_dropped_total",
             "engine_vm_commit_dropped_total",
+            "engine_vm_regime_blocked_total",
+            "engine_vm_regime_hard_exits_total",
             "engine_ai_table_push_fail_total",
         ] {
             assert!(text.contains(name), "missing §9 row {name}");

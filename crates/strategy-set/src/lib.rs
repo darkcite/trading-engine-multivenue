@@ -366,12 +366,23 @@ impl StrategySet {
             self.regime_gates[slot] = self.judge_slot(slot);
             slot += 1;
         }
+        self.push_vm_regime_view();
+    }
+
+    /// RG3: the set→vm seam — hand the vm the detector's current view
+    /// (effective words + per-member REL) so its rows re-judge. Called
+    /// on every minute roll, effective change and declaration
+    /// regardless of slot 5's own (always-ANY) gate; never per tick.
+    fn push_vm_regime_view(&mut self) {
+        let view = self.regime.view();
+        self.vm.set_regime_view(&view);
     }
 
     /// Re-judge every slot and fan `on_regime` out to the ENABLED
     /// members whose verdict flipped (edge-triggered; a disabled
     /// member's stored gate still updates and is delivered by
-    /// [`Self::enable_slot`] when it comes back).
+    /// [`Self::enable_slot`] when it comes back). The vm's rows judge
+    /// themselves from the pushed view (RG3).
     fn refresh_gates<C: Ctx>(&mut self, ctx: &mut C) {
         let mut slot = 0usize;
         while slot < 8 {
@@ -384,6 +395,7 @@ impl StrategySet {
             }
             slot += 1;
         }
+        self.push_vm_regime_view();
     }
 
     fn deliver_gate<C: Ctx>(&mut self, slot: u8, gate: RegimeGate, ctx: &mut C) {
@@ -604,6 +616,14 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vm_commit_dropped(&self) -> u64 {
         self.vm.commits_dropped
+    }
+    #[inline]
+    fn vm_regime_blocked(&self) -> u64 {
+        self.vm.regime_blocked
+    }
+    #[inline]
+    fn vm_regime_hard_exits(&self) -> u64 {
+        self.vm.regime_hard_exits
     }
     #[inline]
     fn icdp_counters(&self) -> strategy_core::IcdpCounters {
@@ -1026,8 +1046,13 @@ impl Strategy for StrategySet {
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
         // RG2: roll the minute clock (nothing until a boundary) and
         // re-judge the gates only when an effective word changed.
+        // RG3: a roll that changed no word may still have moved a
+        // member's REL — the vm's `rel:` rows get the view anyway.
+        let minutes_before = self.regime.minutes_judged();
         if self.regime.on_timer(now_ns) != 0 {
             self.refresh_gates(ctx);
+        } else if self.regime.minutes_judged() != minutes_before {
+            self.push_vm_regime_view();
         }
         if self.enabled & BIT_LATENCY_ARB != 0 {
             self.latency_arb
@@ -2094,6 +2119,65 @@ mod tests {
             );
             s.on_venue_event(&other, &mut c);
             assert_eq!(s.regime().funding(), (-25_000, 1_700_000_000_000));
+        }
+
+        #[test]
+        fn vm_receives_the_regime_view_on_seed_declaration_and_every_minute() {
+            // RG3 seam: the vm's rows judge against the view the set
+            // pushes — at seed (silent), on a declaration (edge), and
+            // on every minute roll even when no word changed (REL).
+            let mut s = StrategySet::new(BIT_VM);
+            let mut c = ctx();
+            c.now = T0;
+            assert_eq!(s.vm().regime_view().configured, 0);
+            s.configure_regime(&params(), WallAnchor::new(T0, WALL0), T0)
+                .unwrap();
+            assert_eq!(s.vm().regime_view().configured, 1, "configure pushes");
+            assert_eq!(s.vm().regime_view().n_syms, 2);
+            assert_eq!(s.vm().regime_view().syms[1], ETH);
+            s.on_start(&mut c).unwrap();
+            let minute0 = s.regime().minute();
+            s.seed_regime(&uptrend_seed(minute0), T0);
+            let v = *s.vm().regime_view();
+            assert_eq!(v.effective[0], s.regime().effective(0), "seed pushes");
+            assert_eq!(v.effective[0].value_of(DIM_TREND), Some(TREND_BULL));
+            assert_eq!(v.rel_of(0, ETH), s.regime().rel_of(0, ETH));
+            // A declaration that changes the effective word pushes at
+            // once — slot 5's own gate is ANY and never flips, the
+            // push is unconditional.
+            let bear = RegimeWord::EMPTY.with_dim(DIM_TREND, TREND_BEAR);
+            s.on_ai(&set_regime_cmd(T0 + 3, 0, bear, 5 * MINUTE_NS), &mut c);
+            assert_eq!(
+                s.vm().regime_view().effective[0].value_of(DIM_TREND),
+                Some(TREND_BEAR)
+            );
+            assert_eq!(s.regime_counters().gate_changes, 0, "vm gate is ANY");
+            // A minute roll with an unchanged word still pushes (the
+            // ETH REL moves from INLINE to LAGGING as ETH stalls).
+            let before = *s.vm().regime_view();
+            let mut k = 0i64;
+            while k < 12 {
+                c.now = T0 + (k as u64 + 1) * MINUTE_NS;
+                let btc = 108_000_000 + k * 200_000;
+                s.on_tick(&tick(VenueId::Binance, BTC, btc - 500, btc + 500), &mut c);
+                s.on_tick(
+                    &tick(
+                        VenueId::Binance,
+                        ETH,
+                        3_240_000_000 - 500,
+                        3_240_000_000 + 500,
+                    ),
+                    &mut c,
+                );
+                s.on_timer(c.now + 1_000_000, &mut c);
+                k += 1;
+            }
+            let after = *s.vm().regime_view();
+            assert_ne!(before, after, "minute rolls re-push the view");
+            assert_eq!(after.rel_of(0, ETH), s.regime().rel_of(0, ETH));
+            assert_eq!(after.rel_of(0, ETH), core_types::regime::REL_LAGGING);
+            assert_eq!(StrategyCounters::vm_regime_blocked(&s), 0);
+            assert_eq!(StrategyCounters::vm_regime_hard_exits(&s), 0);
         }
 
         #[test]

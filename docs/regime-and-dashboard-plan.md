@@ -1,9 +1,11 @@
 # Market regime + regime labels + regime-aware AI aggregation + dashboard — plan (RG0–RG7)
 
-**Status: IN PROGRESS — RG0 + RG1 + RG2 code-complete 2026-09-03
-(operator "lets start the implementation"; §11 defaults apply until
-overridden). Next: RG2 live smoke (operator: relink + `regime.toml` +
-restart), then RG3 (VM rows + harness replay).** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
+**Status: IN PROGRESS — RG0–RG2 committed (`77f5ea5`); RG3 code-complete
+2026-09-05 (uncommitted; operator commits — §12 entry). Next: the RG2/RG3
+live smoke (operator: relink + `regime.toml` + restart; a labelled
+ruleset staged/committed live — §7 RG3 exit tell), then RG5 (worker
+regime lane) or RG4 (library + composer); §11 defaults apply until
+overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
 need to implement the following"). Paper mode only; no
 dispatcher/signer/RiskGate/live-ramp work — the Stage-3 ENTRY GATE
 (`docs/arch/mvp-completion-plan.md` §7) is untouched. Owner doc for the
@@ -962,31 +964,130 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   RG2 close: nextest 1555 · alloc 41/41 · lint green · license-check
   OK · pytest 633 (+ the known UDS-fixture flake green in isolation) ·
   no mode changes.
-- **RESUME POINT (for a fresh session):** everything through RG2 is
-  code-complete on disk (commit status = the operator's). Next work =
-  the RG2 live smoke (operator-driven, §7 row) and then **RG3** per §7:
-  (1) `ingress-ai/src/ruleset.rs` v2 grammar gains the row keys
-  `regimes` (string array, §3.3 grammar with `fast:`/`slow:` prefixes),
-  `regime_off` (`"soft"|"hard"`), `rel` (string) → `RuleRowV2::with_regime`
-  (`core_types::regime::RegimeLabelBuilder` + `core_config::regime::parse_label_terms`
-  with `allow_rel = true`); validator rule 11 =
-  `RuleRowV2::regime_fields_well_formed()` + `RulesetReject::Regime`;
-  rule 8 amendment = identity-tuple match AND
-  `a.regime_term().intersects(&b.regime_term())`; (2) `strategy-vm`:
-  store `regime_eff: [RegimeWord; 4]` + a per-sym REL lookup fed by
-  `on_regime` (the set must hand the VM the words: extend
-  `RegimeGate` with the REL source, or give the VM a `set_regime_view`
-  seam called from `StrategySet::refresh_gates` for slot 5 regardless
-  of its own gate), entry-path gate at `lib.rs` "entry / refire path"
-  (`allows(fast) && allows(slow) && rel_allows`), hard-exit in the
-  exit path, counters `regime_blocked`/`regime_hard_exits` →
-  `engine_vm_regime_*_total`; (3) the harness: `cli::backtest` builds a
-  `RegimeState` from `--regime`/`--regime-seed`, feeds ticks/funding,
-  replays `SetRegime` from `ai-cmds.pmlr`, `--regime off`, audit-pnl
-  per-regime JSON (additive; `window_root.cut_run` must cut
-  `ai-cmds.pmlr` by `ts_ns`); (4) `strategist.py` prompt v3 asks for
-  labels/variants; fuzz `ruleset_json` covers the keys; alloc gate.
-  Laws to keep: regime is a gate not a signal; exits never gated; legacy
-  rows bit-identical; no table flip on regime change; ≤ 2 h windows;
-  research out of git; compile/test on the Mac (RustRover), never the
-  sandbox; explicit-path `git add`, operator commits.
+- 2026-09-03 — RG0–RG2 committed by the operator as `77f5ea5`.
+- 2026-09-05 — **RG3 code-complete** (uncommitted; operator commits).
+  Landed, per the §7 row: **(1) grammar v2.1** — `ingress-ai/src/ruleset.rs`
+  gains the v2 row keys `regimes` (non-empty string array, §3.3 grammar,
+  `fast:`/`slow:` prefixes, `rel:` terms allowed on rows; scanned into a
+  64 B term buffer, folded through `core_types::regime::RegimeLabelBuilder`
+  — 0 B/op, no `core-config` dependency), `regime_off` (`soft`|`hard`),
+  `rel` (sugar for one `[fast:|slow:]rel:<values>` term) →
+  `RuleRowV2::with_regime`; **rule 11** = term grammar + no duplicate
+  `(profile, dim)` + `regime_off`/`rel` only beside `regimes` + the
+  stored tail's `regime_fields_well_formed` (`RulesetReject::Regime`;
+  JSON-shape faults stay rule 2); a profile constrained only by REL
+  stores the new `RegimeLabel::LABELLED_ANY` (the omitted-dimension
+  fill: every value, `measured|declared`) so REL-only rows are labelled
+  rows (fail-closed on warm-up) instead of tail-law violations;
+  **rule-8 amendment** = identity tuple AND
+  `RegimeTerm::intersects` (disjoint variants admit — the three-way
+  bull/neutral/bear split of one signal is one table; overlapping
+  regions, different-dimension products, cross-profile pairs and
+  legacy duplicates still refuse). **(2) vm row gate** — the set→vm
+  seam is `core_regime::RegimeView` (`RegimeState::view()`: effective
+  words + every member's REL byte per profile, 232 B, minute cadence)
+  handed through `VmStrategy::set_regime_view` by
+  `StrategySet::push_vm_regime_view` on configure / seed / every
+  minute roll (REL can move with no word change — `on_timer` compares
+  `minutes_judged`) / effective change / declaration, regardless of
+  slot 5's own always-ANY gate; the vm re-judges every active row into
+  one gate byte (`row_gate`: open / hard) on each push and on each
+  flip (`on_table_flipped`), so the hot path pays ONE byte load per
+  evaluated row: the entry/refire path skips closed rows
+  (`regime_blocked`, per evaluated tick like `evals`), the exit path of
+  a HARD-closed position row runs `emit_exit` at once after the age-out
+  check and before min-hold (`regime_hard_exits`; ring-full retries);
+  soft-closed rows drain by their own law; a view change touches
+  neither `tables` nor `positions` (proptest); unlabelled rows judge
+  open under every view (bit-identical). `StrategyCounters::vm_regime_{blocked,hard_exits}`
+  → `engine_vm_regime_{blocked,hard_exits}_total` (paper.rs mirror +
+  the §9 observability pin). Without a detector the vm keeps
+  `RegimeView::UNKNOWN`: labelled rows fail closed, as live. **(3) the
+  harness** — `cli::backtest::regime` (`RegimeMode` {`Auto` = the
+  default artifact when it exists AND resolves on the root, else
+  regime-blind with a stderr tell — the frozen worker argv can never
+  fail on a default artifact; `Off` = tails stripped, every row ANY;
+  `Artifact(path)` = refusals fatal}; `RegimeReplay` = the engine's own
+  `RegimeState` anchored at (first virt, first wall), seeded from
+  `--regime-seed` → the first run's own `regime-seed.tsv` → warm live,
+  fed replay ticks + the fund ref's Funding/AssetCtx prints + the 1 s
+  timer on the virtual clock + the window's `SetRegime` frames from
+  `ai-cmds.pmlr` (`RecPayload::Regime`, lane 48; frames stamped before
+  the run's first tick are clamped to it with the TTL shortened,
+  expired ones dropped + counted), handing the vm the view exactly as
+  the set does); `cli::regime_boot` = the ONE resolver the engine boot
+  (strict) and the harness (members absent from the root dropped +
+  counted; refs must resolve) share — moved out of the bin. `--regime`
+  / `--regime-seed` on `backtest` and `audit-pnl`; `HarnessStats`
+  `regime_*` + `BacktestOutput.regime` (`RegimeReport`: tells,
+  per-profile minutes-per-word histogram, final words); stderr
+  `regime: …` block (artifact/seed/mode tells, `regime fast:
+  [word]=Nm …`, `regime end: fast=… slow=…`, counters);
+  `--emit-detail` = `detail_version` **4** (additive `regime` block);
+  `audit-pnl` gains funding events + `SetRegime` frames in its stream
+  (class `CLASS_REGIME` between ticks and fills), one fill-model replay
+  per `(profile, effective word at emit, strategy)`, the additive
+  `regime` JSON section (`audit_pnl_version` stays 1) + stderr rows.
+  **(4) worker** — `window_root.cut_run` cuts `ai-cmds.pmlr` like every
+  file AND carries the pre-window `SetRegime` still in force at the cut
+  (the LATEST frame per profile decides; ≤ 4096-frame scan), and writes
+  the window's own `regime-seed.tsv` from `candles.db` when
+  `seed=(regime.toml, candles.db)` is passed (`pnl_report` day mode
+  passes `regime_seed_inputs()`); `strategist` **prompt v3**
+  (`strategist-v3`: the keys, the gate law, VARIANTS on disjoint
+  regions, worked examples A/B relabelled + example C = a bull/bear
+  variant pair, rule-11 lines) and the structural mirrors
+  `regime_term_ok`/`regime_rel_ok` in `parse_proposal` (keys optional in
+  the parser, asked for by the prompt; canonical emission order puts
+  them before `horizon_ms`). **(5) gates** — bench gate 42
+  (`vm_regime_gate_and_view_rejudge_are_zero_alloc`: 256 labelled rows,
+  view flips every cycle, hard exits + blocked entries, 0 B/op); fuzz
+  `ruleset_json` reaches the keys through local corpus seeds
+  `fuzz/corpus/ruleset_json/rg3-seed-*` (the corpus is gitignored; the
+  ≥ 300 s run is recorded below). Tests: ingress-ai (tail landing,
+  soft default + rel prefix forms, REL-only fill, every rule-11 refusal,
+  the rule-8 amendment matrix), strategy-vm (gate blocks / legacy open,
+  hard flatten vs soft drain, age-out-first + ring-full retry, REL from
+  the view, flip re-judge, the variants/state proptest), strategy-set
+  (view pushed on configure/seed/declaration/minute), core-regime
+  (`view()`), core-types (`LABELLED_ANY`), cli (`regime_boot`,
+  `backtest::regime` unit + the two `rg3_*` harness integrations:
+  declared-gated on/off/refusals, expired-declaration fail-closed),
+  worker (ai-cmds cut + carry, window seed, prompt v3 + 13 malformed +
+  20 term-vocabulary cases). Not done by design (§7 rows): the
+  `pnl_report` per-regime MERGE (RG5), the TUI snapshot words (RG6),
+  `FeatId::RegimeRel` (RG3b, §11-Q8). **Gates at RG3 close (2026-09-05):
+  nextest 1578 · release alloc 42/42 0 B/op (fresh `Compiling bench`) ·
+  `make lint` green · `make license-check` OK (247 files) · worker
+  pytest 671 (frozen 202 inside) · fuzz `cargo +nightly fuzz run
+  ruleset_json -- -max_total_time=330`: 331 s, 37.6 M runs, cov 1732,
+  no crash · `cargo build --release -p cli` relinked (G0) · `git diff
+  --summary` shows no mode change.** Design notes worth keeping: the vm
+  precomputes the per-row verdict on view change instead of evaluating
+  `allows()` inline per tick (the same law, one byte per row on the hot
+  path; a flip re-judges from the stored view); `RegimeMode`'s trait
+  `Default` is `Off` so library callers and tests never consult the
+  operator's home directory — only the bin maps an absent flag to
+  `Auto`; the repo is not rustfmt-clean as a whole (pre-existing
+  hunks), so only the new hunks were formatted.
+- **RESUME POINT (for a fresh session):** RG3 is code-complete on disk
+  (commit status = the operator's; gates at the end of this entry).
+  Next = (a) the operator's live smoke of RG2+RG3 together — `cargo
+  build --release -p cli` (G0 relink), `~/multivenue/regime.toml`
+  from the example with members that exist in `universe.toml`, restart
+  via launchd, check `regime: artifact configured`,
+  `engine_regime_minutes_judged_total` climbing, `vm_rows_active 1`
+  after #7b, then stage + commit ONE labelled ruleset (two disjoint
+  variants of the live row is the smallest honest shape) and watch
+  `engine_vm_regime_blocked_total` move with the effective word — the
+  §7 RG3 exit tell; (b) then **RG5** (worker regime lane: report /
+  percentiles / declare / `pnl_report` per-regime merge / serve
+  `_REGIME` phase with the SDK mocked) or **RG4** (library + composer) —
+  the operator picks. Harness numbers on a labelled ruleset are
+  meaningful only on a ≤ 2 h v3 window WITH a seed (`window_root` now
+  writes one) — a seedless window judges `slow` UNKNOWN for its whole
+  span. Laws unchanged: regime is a gate not a signal; exits never
+  gated; legacy rows bit-identical; no table flip on regime change;
+  ≤ 2 h windows; research out of git; compile/test on the Mac
+  (RustRover), never the sandbox; explicit-path `git add`, operator
+  commits, never push.

@@ -648,6 +648,7 @@ fn option_intents_mark_fill_and_print_the_d7_assumption() {
             latency_ns: Some(0),
             latency_ns_venue: Vec::new(),
             stale_after_ms: Vec::new(),
+            ..AuditPnlConfig::default()
         },
         &mut |l: &str| lines.push(l.to_owned()),
     )

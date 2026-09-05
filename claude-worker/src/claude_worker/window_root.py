@@ -18,7 +18,15 @@ as runs of their own:
   holds and its wall rebase (``wall = epoch + (ts − ts_first)``) lands
   on the true wall clock, so consecutive windows are disjoint runs on
   its virtual timeline;
-* the manifests are copied.
+* the manifests are copied;
+* RG3: ``ai-cmds.pmlr`` is cut by ``ts_ns`` like every file (the
+  events-file lesson — an uncut file drags out-of-window rows into the
+  merge), PLUS the latest ``SetRegime`` frame per profile stamped BEFORE
+  the window whose TTL still covers the window's first instant is
+  carried over in front of the slice — the declaration that was in
+  force at the cut. The harness clamps such a frame to its first tick
+  and shortens the TTL by the clamp, so the carried declaration expires
+  on the true wall clock.
 
 Offline tool — allocation is fine; never imported by the engine.
 Convention: full ``import x`` only. No ``from x import y``.
@@ -31,13 +39,28 @@ import shutil
 import struct
 import typing
 
+import claude_worker.regime
+
 HEADER_SIZE: int = 64
+SEED_FILE: str = "regime-seed.tsv"
 _HEADER = struct.Struct("<4sHBxQ")
+SLOT_KIND_AI_CMD: int = 4
 SLOT_KIND_DEPTH: int = 7
 DEPTH_SLOT: int = 192
 SLOT: int = 64
 WINDOW_MAX_S: float = 2 * 3600.0
 MANIFESTS: tuple[str, ...] = ("instrument-manifest.tsv", "options-manifest.tsv")
+# AiCmd slot (docs/wire-format.md §3): ts_ns @0, ttl_ns @32, kind @40,
+# param_id @44 — the three fields the carry-over law reads.
+_AI_TTL_OFF: int = 32
+_AI_KIND_OFF: int = 40
+_AI_PARAM_OFF: int = 44
+KIND_SET_REGIME: int = 12
+REGIME_PROFILES: int = 2
+# How far back the carry-over scans for a live declaration (frames): the
+# AI plane is low-cadence (heartbeats every few seconds), a 15-minute
+# TTL lies within a few hundred frames — 4096 is a generous ceiling.
+_CARRY_SCAN_MAX: int = 4096
 
 
 class WindowError(Exception):
@@ -126,8 +149,36 @@ def windows_of(run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S) -> list[tu
     return out
 
 
+def _carry_set_regime(mm: mmap.mmap, a: int, lo_ts: int) -> list[bytes]:
+    """RG3: per profile, the LATEST ``SetRegime`` frame before slot ``a``
+    decides (a later declaration replaces an earlier one in the engine);
+    it is carried iff ``ts + ttl > lo_ts`` — still in force at the
+    window's first instant. Returned in file (ts) order."""
+    seen: set[int] = set()
+    found: dict[int, bytes] = {}
+    i = a - 1
+    stop = max(0, a - _CARRY_SCAN_MAX)
+    while i >= stop and len(seen) < REGIME_PROFILES:
+        off = HEADER_SIZE + i * SLOT
+        if mm[off + _AI_KIND_OFF] == KIND_SET_REGIME:
+            profile = struct.unpack_from("<H", mm, off + _AI_PARAM_OFF)[0]
+            if profile < REGIME_PROFILES and profile not in seen:
+                seen.add(profile)
+                ts, ttl = _ts_at(mm, i, SLOT), struct.unpack_from("<Q", mm, off + _AI_TTL_OFF)[0]
+                if ts + ttl > lo_ts:
+                    found[profile] = bytes(mm[off : off + SLOT])
+        i -= 1
+    return [found[p] for p in sorted(found, key=lambda p: _ts_at_bytes(found[p]))]
+
+
+def _ts_at_bytes(slot_bytes: bytes) -> int:
+    return struct.unpack_from("<Q", slot_bytes, 0)[0]
+
+
 def _cut_file(src: pathlib.Path, dst: pathlib.Path, lo_ts: int, hi_ts: int, epoch_ns: int) -> tuple[int, int]:
-    """Copy the slots with ``lo_ts <= ts < hi_ts``; header epoch rewritten."""
+    """Copy the slots with ``lo_ts <= ts < hi_ts``; header epoch rewritten.
+    An ``ai-cmds.pmlr`` additionally carries the pre-window ``SetRegime``
+    declarations still in force at ``lo_ts`` (module docs)."""
     size = os.path.getsize(src)
     _, kind, _ = _header(src)
     slot = _slot_size(kind)
@@ -142,13 +193,16 @@ def _cut_file(src: pathlib.Path, dst: pathlib.Path, lo_ts: int, hi_ts: int, epoc
         try:
             a = _lower_bound(mm, n, slot, lo_ts)
             b = _lower_bound(mm, n, slot, hi_ts)
+            carried = _carry_set_regime(mm, a, lo_ts) if kind == SLOT_KIND_AI_CMD else []
             with dst.open("wb") as out:
                 out.write(bytes(head))
+                for frame in carried:
+                    out.write(frame)
                 if b > a:
                     out.write(mm[HEADER_SIZE + a * slot : HEADER_SIZE + b * slot])
         finally:
             mm.close()
-    return n, max(b - a, 0)
+    return n, max(b - a, 0) + len(carried)
 
 
 def cut_run(
@@ -157,9 +211,17 @@ def cut_run(
     from_s: float,
     to_s: float,
     report: typing.Callable[[str], None] | None = None,
+    seed: tuple[pathlib.Path, pathlib.Path] | None = None,
 ) -> pathlib.Path:
     """Materialise the window ``[from_s, to_s)`` of ``run_dir`` under
-    ``dst_root`` as ``run-<epoch + from_s>``; returns the new run dir."""
+    ``dst_root`` as ``run-<epoch + from_s>``; returns the new run dir.
+
+    RG3 (plan §4.3): ``seed = (regime.toml, candles.db)`` writes the
+    window's own ``regime-seed.tsv`` — the ``REGIME_RING_MIN`` minute
+    closes BEFORE the window's first instant, from ``candles.db`` (derived
+    data, not a capture window) — which the harness picks up by default
+    so a ≤ 2 h window can warm the detector's 4 h profile. Either file
+    absent ⇒ no seed (the harness warms live and says so)."""
     if to_s <= from_s or to_s - from_s > WINDOW_MAX_S:
         raise WindowError(f"window {from_s}..{to_s} s violates the 2 h law")
     span = run_span(run_dir)
@@ -183,4 +245,14 @@ def cut_run(
         total, kept = _cut_file(p, out_dir / p.name, lo_ts, hi_ts, new_epoch)
         if report is not None:
             report(f"window-root: {run_dir.name} {p.name} {total} -> {kept} ({from_s:.0f}..{to_s:.0f} s)")
+    if seed is not None and seed[0].is_file() and seed[1].is_file():
+        n_desc, n_rows = claude_worker.regime.seed_out(
+            seed[0],
+            seed[1],
+            out_dir / SEED_FILE,
+            claude_worker.regime.SEED_MINUTES_DEFAULT,
+            now_ms=new_epoch // 1_000_000,
+        )
+        if report is not None:
+            report(f"window-root: {run_dir.name} {SEED_FILE} {n_rows} rows for {n_desc} descriptors")
     return out_dir

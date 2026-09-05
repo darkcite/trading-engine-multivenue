@@ -54,6 +54,7 @@ import time
 import typing
 
 import claude_worker.backtest
+import claude_worker.candles
 import claude_worker.window_root
 
 REPORTS_DIR_ENV: str = "CLAUDE_WORKER_REPORTS_DIR"
@@ -304,6 +305,21 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
 
 
 WINDOW_ROOT_DEFAULT: str = "~/multivenue/backtest-roots/nightly"
+# RG3: the window seed's inputs — the operator's regime artifact and the
+# worker's candles.db (plan §4.3); either absent ⇒ no seed is written.
+REGIME_PATH_DEFAULT: str = "~/multivenue/regime.toml"
+
+
+def regime_seed_inputs(
+    env: collections.abc.Mapping[str, str] | None = None,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """``(regime.toml, candles.db)`` for the window seed step."""
+    source: collections.abc.Mapping[str, str] = os.environ if env is None else env
+    db = source.get(claude_worker.candles.CANDLES_DB_ENV, "") or claude_worker.candles.DEFAULT_DB_PATH
+    return (
+        pathlib.Path(REGIME_PATH_DEFAULT).expanduser(),
+        pathlib.Path(db).expanduser(),
+    )
 
 
 def _audit_units(
@@ -313,7 +329,8 @@ def _audit_units(
 ) -> list[tuple[str, pathlib.Path, bool]]:
     """(label, dir to audit, is_temporary) per ≤ 2 h window of the run —
     the capture-window law; a run without ticks (or windowing off)
-    audits as-is."""
+    audits as-is. Every cut carries its own ``regime-seed.tsv`` when the
+    artifact + candles.db exist (RG3)."""
     if window_root is None:
         return [(run_dir.name, run_dir, False)]
     try:
@@ -324,9 +341,10 @@ def _audit_units(
     if len(windows) <= 1:
         return [(run_dir.name, run_dir, False)]
     units: list[tuple[str, pathlib.Path, bool]] = []
+    seed = regime_seed_inputs()
     for lo, hi in windows:
         try:
-            cut = claude_worker.window_root.cut_run(run_dir, window_root, lo, hi)
+            cut = claude_worker.window_root.cut_run(run_dir, window_root, lo, hi, seed=seed)
         except claude_worker.window_root.WindowError as exc:
             report(f"pnl-report: {run_dir.name}: window {lo:.0f}..{hi:.0f} s failed ({exc})")
             continue

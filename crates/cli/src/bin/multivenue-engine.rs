@@ -123,6 +123,15 @@ struct AuditPnlArgs {
     /// (defaults = the venue table; 0 = never stale).
     #[arg(long)]
     stale_after_ms: Vec<String>,
+    /// RG3: `<path>` = a `regime.toml` artifact to replay the regime
+    /// detector from (refusals fatal); `off` = regime-blind; absent =
+    /// the default artifact when it exists and resolves on this root.
+    #[arg(long)]
+    regime: Option<String>,
+    /// RG3: `regime-seed.tsv` for the detector's warm-up (default:
+    /// the first run directory's own `regime-seed.tsv`, else warm live).
+    #[arg(long)]
+    regime_seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -164,6 +173,17 @@ struct BacktestArgs {
     /// now; the sidecar is written starting H2.
     #[arg(long)]
     emit_detail: Option<PathBuf>,
+    /// RG3: `<path>` = a `regime.toml` artifact to replay the regime
+    /// detector from (refusals fatal); `off` = every row evaluates as
+    /// ANY (the on/off delta); absent = the default artifact when it
+    /// exists and resolves on this root, else regime-blind (labelled
+    /// rows fail closed, stderr says so).
+    #[arg(long)]
+    regime: Option<String>,
+    /// RG3: `regime-seed.tsv` for the detector's warm-up (default:
+    /// the first run directory's own `regime-seed.tsv`, else warm live).
+    #[arg(long)]
+    regime_seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -404,6 +424,8 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         latency_ns: args.latency_ns,
         latency_ns_venue: args.latency_ns_venue,
         stale_after_ms: args.stale_after_ms,
+        regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
+        regime_seed: args.regime_seed,
     };
     let mut report = |line: &str| eprintln!("{line}");
     match cli::audit_pnl::run(&cfg, &mut report) {
@@ -453,6 +475,8 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         latency_ns_venue: args.latency_ns_venue,
         stale_after_ms: args.stale_after_ms,
         emit_detail: args.emit_detail,
+        regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
+        regime_seed: args.regime_seed,
     };
     match cli::backtest::run(&cfg) {
         Ok(out) => {
@@ -1988,7 +2012,7 @@ fn run(args: RunArgs) -> ExitCode {
             // against the same descriptor table (D-6 truth). An absent
             // DEFAULT file is legal (unconfigured); an explicit path
             // or a present-but-invalid file refuses the boot.
-            let regime_boot = match load_regime_boot(
+            let regime_boot = match cli::regime_boot::load_regime_boot(
                 args.regime.as_deref(),
                 args.regime_seed.as_deref(),
                 &ai_descriptors,
@@ -2041,102 +2065,6 @@ fn run(args: RunArgs) -> ExitCode {
     }
     info!("clean shutdown");
     exit_code
-}
-
-/// RG2: read `regime.toml` (+ the seed file), resolve every descriptor
-/// against the boot universe, build the detector's parameters and the
-/// label overrides. `Ok(None)` = the DEFAULT artifact is absent
-/// (detector stays unconfigured); an explicit `--regime` path must
-/// exist. Seed rows for descriptors outside the artifact's members are
-/// dropped with a count (the worker exports the universe's 1 m closes
-/// generously). Boot-only.
-fn load_regime_boot(
-    path: Option<&std::path::Path>,
-    seed_path: Option<&std::path::Path>,
-    descriptors: &ingress_ai::DescriptorTable,
-) -> Result<Option<cli::paper::RegimeBoot>, String> {
-    let explicit = path.is_some();
-    let owned;
-    let path: &std::path::Path = match path {
-        Some(p) => p,
-        None => {
-            owned = core_config::regime::default_regime_path().map_err(|e| e.to_string())?;
-            std::path::Path::new(&owned)
-        }
-    };
-    if !explicit && !path.exists() {
-        return Ok(None);
-    }
-    let (file, bytes) = core_config::regime::load(path).map_err(|e| e.to_string())?;
-    let resolve = |d: &str| -> Result<core_types::SymbolId, String> {
-        descriptors
-            .resolve(d.as_bytes())
-            .map(|(sym, _caps)| sym)
-            .ok_or_else(|| format!("regime: `{d}` is not in the boot universe"))
-    };
-    let btc = resolve(&file.btc)?;
-    let fund = resolve(&file.fund)?;
-    let mut members = [core_types::SYMBOL_ID_NONE; core_regime::REGIME_MAX_MEMBERS];
-    for (i, m) in file.members.iter().enumerate() {
-        members[i] = resolve(m)?;
-        info!(descriptor = %m, sym = members[i], "regime: member resolved");
-    }
-    let params = core_regime::RegimeParams::new(
-        btc,
-        fund,
-        members,
-        file.members.len() as u8,
-        file.confirm_min,
-        file.profiles,
-    );
-    params.validate().map_err(|e| format!("regime: {e:?}"))?;
-    let mut labels = Vec::with_capacity(file.labels.len());
-    for l in &file.labels {
-        let slot = match l.member.as_str() {
-            "latency_arb" => strategy_set::SLOT_LATENCY_ARB,
-            "ev" => strategy_set::SLOT_EV,
-            "cross_arb" => strategy_set::SLOT_CROSS_ARB,
-            "rule_tree" => strategy_set::SLOT_RULE_TREE,
-            "ai_exec" => strategy_set::SLOT_AI_EXEC,
-            "icdp" => strategy_set::SLOT_ICDP,
-            other => return Err(format!("regime: unknown coded member `{other}`")),
-        };
-        labels.push((slot, l.set));
-    }
-    // Seed: absent file = warm live; present = every row of a member.
-    let seed_owned;
-    let seed_path: &std::path::Path = match seed_path {
-        Some(p) => p,
-        None => {
-            seed_owned = core_config::regime::default_seed_path().map_err(|e| e.to_string())?;
-            std::path::Path::new(&seed_owned)
-        }
-    };
-    let mut seed = Vec::new();
-    if seed_path.exists() {
-        let lines = core_config::regime::load_seed(seed_path).map_err(|e| e.to_string())?;
-        let mut dropped = 0usize;
-        for l in &lines {
-            match descriptors.resolve(l.descriptor.as_bytes()) {
-                Some((sym, _)) if sym == btc || members[..file.members.len()].contains(&sym) => {
-                    seed.push(core_regime::SeedRow::new(sym, l.minute, l.close_1e6));
-                }
-                _ => dropped += 1,
-            }
-        }
-        info!(
-            path = %seed_path.display(),
-            rows = seed.len(),
-            dropped,
-            "regime: seed file read"
-        );
-    }
-    Ok(Some(cli::paper::RegimeBoot {
-        params,
-        labels,
-        seed,
-        hash: core_crypto::sha256(&bytes),
-    }))
 }
 
 /// ICDP I5: read `icdp.toml`, resolve every descriptor against the boot

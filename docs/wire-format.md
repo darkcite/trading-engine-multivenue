@@ -413,7 +413,31 @@ A v2 row:
 - `horizon_ms` [10, 86 400 000] (required): refire cooldown on
   refire rows, re-entry cooldown after position exits.
 - Rule 8 (v2 identity): duplicate `(instrument, ref, features,
-  windows, combine, cmp bits, mode, group, enter)` rejects.
+  windows, combine, cmp bits, mode, group, enter)` rejects — **RG3
+  amendment: only when the two rows' regime regions INTERSECT**
+  (`RegimeTerm::intersects`: `ANY` intersects everything, otherwise
+  every dimension byte of both profiles and both REL nibbles must
+  share a bit). Disjoint regime variants of one signal are legal —
+  at most one is ever open.
+- **Grammar v2.1 — regime keys (RG3, 2026-09-05; `docs/regime-and-dashboard-plan.md`
+  §4.5), all optional, v2 rows only, landing in the row tail above:**
+  `regimes` = a NON-EMPTY string array of label terms
+  `[fast:|slow:]<dim>:<values>` (§3.3 grammar: `dim` ∈ `trend shape
+  vol fund level stretch source rel`, `<values>` = `*` | `!v` |
+  `v1|v2…`, `unknown` adds the mark on market dimensions; unprefixed
+  = `fast`; `rel:` terms allowed on rows) folded through
+  `RegimeLabelBuilder` into `regime_fast`/`regime_slow`/`regime_rel`;
+  `regime_off` = `"soft"` (default) | `"hard"`; `rel` = sugar for
+  one more term `[fast:|slow:]rel:<values>` (`"lagging|inline"`,
+  `"slow:leading"`). A profile constrained ONLY by REL stores
+  `RegimeLabel::LABELLED_ANY` (every value, `measured|declared`) so
+  it fails closed on warm-up like every labelled row. **Rule 11
+  (`Regime` reject)**: every term parses, no `(profile, dim)`
+  repeats, `regime_off`/`rel` only beside `regimes`, `regimes` never
+  empty, terms ≤ 64 B, and the stored tail passes
+  `RuleRowV2::regime_fields_well_formed`. Rows without the keys are
+  bit-identical to before (tail zero); JSON-shape faults on the keys
+  (not an array, non-string term, duplicate key) stay rule 2.
 
 | offset | bytes | field   | type               | notes                             |
 | -----: | ----: | ------- | ------------------ | --------------------------------- |

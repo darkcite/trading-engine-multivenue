@@ -63,6 +63,7 @@ dependencies = [
 name = "core-config"
 version = "0.1.0"
 dependencies = [
+ "core-regime",
  "core-types",
  "dotenvy",
  "libc",
@@ -103,6 +104,14 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "memchr",
+]
+
+[[package]]
+name = "core-regime"
+version = "0.1.0"
+dependencies = [
+ "core-time",
+ "core-types",
 ]
 
 [[package]]

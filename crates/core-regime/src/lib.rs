@@ -421,6 +421,71 @@ impl SeedRow {
     }
 }
 
+/// RG3: the gate-relevant projection of the detector for a consumer
+/// that cannot hold it — the effective word per profile plus every
+/// member's committed REL byte per profile (plan §4.5: the vm's
+/// per-row gate reads words AND `rel:` nibbles). Built by
+/// [`RegimeState::view`] once per minute roll / effective change /
+/// declaration — never per tick — and handed to the vm by value (232 B,
+/// a documented copy at minute cadence). POD.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct RegimeView {
+    /// Effective word per profile (index = profile; UNKNOWN beyond
+    /// [`REGIME_PROFILES`]).
+    pub effective: [RegimeWord; 4],
+    /// Committed REL value per profile per slot (`REL_UNKNOWN` for the
+    /// BTC ref, empty slots and warm-up).
+    pub rel: [[u8; REGIME_MAX_SYMS]; REGIME_PROFILES],
+    /// Slot → symbol (`SYMBOL_ID_NONE` beyond `n_syms`); slot 0 = BTC.
+    pub syms: [SymbolId; REGIME_MAX_SYMS],
+    /// Live slots.
+    pub n_syms: u8,
+    /// 1 after a successful `configure` (0 ⇒ every word is UNKNOWN).
+    pub configured: u8,
+    /// Explicit padding — always zero.
+    _pad: [u8; 6],
+}
+
+impl RegimeView {
+    /// The no-detector view: every word UNKNOWN, no members — a
+    /// labelled row fails closed against it, an unlabelled one is open.
+    pub const UNKNOWN: Self = Self {
+        effective: [RegimeWord::UNKNOWN; 4],
+        rel: [[REL_UNKNOWN; REGIME_MAX_SYMS]; REGIME_PROFILES],
+        syms: [SYMBOL_ID_NONE; REGIME_MAX_SYMS],
+        n_syms: 0,
+        configured: 0,
+        _pad: [0; 6],
+    };
+
+    /// REL value of `sym` on profile `p` — a linear probe over the
+    /// live slots (≤ 32 compares; consumers call this when they
+    /// RE-JUDGE rows on a view change, never per tick). `REL_UNKNOWN`
+    /// for non-members.
+    #[inline]
+    pub fn rel_of(&self, p: u8, sym: SymbolId) -> u8 {
+        if (p as usize) >= REGIME_PROFILES {
+            return REL_UNKNOWN;
+        }
+        let n = (self.n_syms as usize).min(REGIME_MAX_SYMS);
+        let mut i = 0usize;
+        while i < n {
+            if self.syms[i] == sym {
+                return self.rel[p as usize][i];
+            }
+            i += 1;
+        }
+        REL_UNKNOWN
+    }
+}
+
+impl Default for RegimeView {
+    fn default() -> Self {
+        Self::UNKNOWN
+    }
+}
+
 /// The raw numbers behind one profile's judgement (metrics + `/state`).
 /// `present` bit i ⇒ field i is meaningful: 0 ret, 1 er, 2 rv, 3
 /// stretch, 4 funding, 5 breadth.
@@ -1107,6 +1172,28 @@ impl RegimeState {
         }
     }
 
+    /// RG3: the current [`RegimeView`] — effective words + every slot's
+    /// REL per profile. Minute-cadence (the set builds it on a roll /
+    /// effective change / declaration and hands it to the vm).
+    pub fn view(&self) -> RegimeView {
+        let mut v = RegimeView::UNKNOWN;
+        v.configured = self.configured;
+        let n = (self.n_syms as usize).min(REGIME_MAX_SYMS);
+        v.n_syms = n as u8;
+        let mut p = 0u8;
+        while (p as usize) < REGIME_PROFILES {
+            v.effective[p as usize] = self.effective[p as usize];
+            let mut s = 0usize;
+            while s < n {
+                v.syms[s] = self.syms[s].sym;
+                v.rel[p as usize][s] = self.rel_of_slot(p, s as u8);
+                s += 1;
+            }
+            p += 1;
+        }
+        v
+    }
+
     /// The raw judgement inputs of profile `p`.
     #[inline]
     pub fn raw(&self, p: u8) -> RegimeRaw {
@@ -1719,6 +1806,43 @@ mod tests {
         let mut s3 = state(0, 1);
         run_minutes(&mut s3, &[BTC], 12, |_, k| 100_000_000 + k * 200_000);
         assert_eq!(s3.measured(0).value_of(DIM_TREND), Some(TREND_BULL));
+    }
+
+    #[test]
+    fn view_projects_words_slots_and_rel_per_profile() {
+        // RG3: the vm's view == the detector's readers, slot for slot.
+        let unconfigured = RegimeState::new_boxed().view();
+        assert_eq!(unconfigured, RegimeView::UNKNOWN);
+        assert_eq!(RegimeView::default(), RegimeView::UNKNOWN);
+        assert_eq!(unconfigured.rel_of(0, ETH), REL_UNKNOWN);
+        let mut s = state(3, 1);
+        let price = |i: usize, k: i64| {
+            if i == 0 {
+                100_000_000 + k * 200_000
+            } else {
+                100_000_000 - k * 200_000
+            }
+        };
+        run_minutes(&mut s, &[BTC, ETH, SOL, XRP], 12, price);
+        let v = s.view();
+        assert_eq!(v.configured, 1);
+        assert_eq!(v.n_syms, 4);
+        assert_eq!(v.syms[0], BTC);
+        assert_eq!(v.syms[1], ETH);
+        assert_eq!(v.syms[3], XRP);
+        assert_eq!(v.syms[4], SYMBOL_ID_NONE);
+        assert_eq!(v.effective[0], s.effective(0));
+        assert_eq!(v.effective[1], s.effective(1));
+        assert_eq!(v.effective[2], RegimeWord::UNKNOWN);
+        assert_eq!(v.rel_of(0, ETH), s.rel_of(0, ETH));
+        assert_eq!(v.rel_of(0, ETH), REL_LAGGING);
+        assert_eq!(v.rel_of(1, SOL), REL_LAGGING);
+        assert_eq!(v.rel_of(0, BTC), REL_UNKNOWN, "the ref has no REL");
+        assert_eq!(v.rel_of(0, OTHER), REL_UNKNOWN);
+        assert_eq!(v.rel_of(5, ETH), REL_UNKNOWN);
+        assert_eq!(v.rel[0][0], REL_UNKNOWN);
+        assert_eq!(v.rel[0][1], REL_LAGGING);
+        assert_eq!(core::mem::size_of::<RegimeView>(), 232);
     }
 
     #[test]

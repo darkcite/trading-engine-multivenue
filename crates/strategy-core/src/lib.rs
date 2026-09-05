@@ -173,6 +173,18 @@ pub trait StrategyCounters {
     fn vm_commit_dropped(&self) -> u64 {
         0
     }
+    /// vm member (RG3): entry/refire evaluations refused by a closed
+    /// row regime gate (`engine_vm_regime_blocked_total`).
+    #[inline]
+    fn vm_regime_blocked(&self) -> u64 {
+        0
+    }
+    /// vm member (RG3): positions flattened by a HARD-closed row gate
+    /// (`engine_vm_regime_hard_exits_total`).
+    #[inline]
+    fn vm_regime_hard_exits(&self) -> u64 {
+        0
+    }
     /// icdp member (slot 6, ICDP I3/I4): the intrabar strategy's
     /// diagnostic counters (`engine_icdp_*_total`). Zeroes for every
     /// strategy but the set carrying a configured icdp member.

@@ -79,6 +79,26 @@
 //! independent of the §4.2 rule-7 validation (two layers by design).
 //! Position rows apply it PER LEG.
 //!
+//! ## Regime gate (RG3, `docs/regime-and-dashboard-plan.md` §4.5)
+//!
+//! Every row carries its own regime term in the `RuleRowV2` tail
+//! (`regime_fast` / `regime_slow` masks, `regime_rel` nibbles,
+//! `regime_off`). The set hands the vm a [`RegimeView`] (effective
+//! words + per-member REL) through [`VmStrategy::set_regime_view`] on
+//! every minute roll / effective change / declaration — never per
+//! tick — and the vm RE-JUDGES every active row once into a per-row
+//! gate byte (`row_gate`: open / hard-closed). The hot path then pays
+//! ONE byte load per evaluated row: the entry/refire path skips a
+//! closed row (`regime_blocked`), the exit path of a HARD-closed
+//! position row runs the flatten path at once (`regime_hard_exits`;
+//! age-out stays first, min-hold is bypassed — "flatten now" is the
+//! law). Soft-closed rows drain through their own exit law. Exits are
+//! never gated. Legacy rows (tail zero) judge open under every view —
+//! bit-identical behaviour. A table flip re-judges from the stored
+//! view; a view change never touches `tables` or `positions` (§2.4).
+//! Without a detector the view is [`RegimeView::UNKNOWN`]: labelled
+//! rows fail closed, unlabelled rows are open — the same law as live.
+//!
 //! ## Inert states (§7.3)
 //!
 //! No table committed / `len == 0` / slot disabled at the set level ⇒
@@ -108,16 +128,25 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+use core_regime::RegimeView;
 use core_time::NsTs;
+use core_types::regime::{rel_allows, REGIME_PROFILE_FAST, REGIME_PROFILE_SLOW};
 use core_types::{
     symbol_venue_byte, AiCmd, AiCmdKind, ChannelEvent, CombineOp, DepthTopK, FeatId, Fill,
-    OptSummary, Order, Price, Qty, RuleRowV2, RuleTableV2, Side, Signal, SymbolId, Tick,
-    VenueId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS, CMP_ENTRY_LE,
-    FEAT_NONE, GROUP_NONE, ROW_FLAG_POSITION, RULE_TABLE_ROWS, SYMBOL_ID_NONE,
+    OptSummary, Order, Price, Qty, RegimeLabel, RegimeRel, RuleRowV2, RuleTableV2, Side, Signal,
+    SymbolId, Tick, VenueId, CMP_CONFIRM_ABS, CMP_CONFIRM_LE, CMP_CONFIRM_PAIR, CMP_ENTRY_ABS,
+    CMP_ENTRY_LE, FEAT_NONE, GROUP_NONE, REGIME_OFF_HARD, ROW_FLAG_POSITION, RULE_TABLE_ROWS,
+    SYMBOL_ID_NONE,
 };
 use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
 pub mod features;
+
+/// `row_gate` bit: the row may ENTER under the current view.
+const ROW_GATE_OPEN: u8 = 1;
+/// `row_gate` bit: the row is closed with the HARD off-mode — an open
+/// position flattens on its next evaluation.
+const ROW_GATE_HARD: u8 = 2;
 
 /// `docs/risk-policy.md` "max single-order notional" (×1e6). The
 /// §4.2 validator holds the mirror constant on the ingress side
@@ -185,6 +214,12 @@ pub struct VmStrategy {
     /// Per-row positions (§1.3). Reset on flip; seeded via
     /// `PositionSeed`.
     positions: [VmPosition; RULE_TABLE_ROWS],
+    /// RG3: per-row regime verdict under `regime_view`
+    /// ([`ROW_GATE_OPEN`] / [`ROW_GATE_HARD`]), re-judged on every view
+    /// change and every flip — the hot path's ONE byte per row.
+    row_gate: [u8; RULE_TABLE_ROWS],
+    /// RG3: the last view the set handed over (UNKNOWN until one does).
+    regime_view: RegimeView,
 
     next_oid: u64,
 
@@ -227,6 +262,13 @@ pub struct VmStrategy {
     /// PositionSeed commands refused (bad row / sym mismatch /
     /// occupied / non-position row / no table).
     pub position_seeds_refused: u64,
+    /// RG3: entry/refire evaluations refused by a closed row gate
+    /// (`engine_vm_regime_blocked_total`; one per evaluated tick of a
+    /// closed row, like `evals`).
+    pub regime_blocked: u64,
+    /// RG3: positions flattened by a HARD-closed gate
+    /// (`engine_vm_regime_hard_exits_total`).
+    pub regime_hard_exits: u64,
 }
 
 impl VmStrategy {
@@ -239,6 +281,8 @@ impl VmStrategy {
             staged_valid: false,
             last_fire_ns: [0; RULE_TABLE_ROWS],
             positions: [VmPosition::FLAT; RULE_TABLE_ROWS],
+            row_gate: [ROW_GATE_OPEN; RULE_TABLE_ROWS],
+            regime_view: RegimeView::UNKNOWN,
             next_oid: 1,
             feats: features::FeatureState::new_boxed(),
             evals: 0,
@@ -255,6 +299,59 @@ impl VmStrategy {
             funding_seeds_applied: 0,
             position_seeds_applied: 0,
             position_seeds_refused: 0,
+            regime_blocked: 0,
+            regime_hard_exits: 0,
+        }
+    }
+
+    /// RG3: the set→vm regime seam — store the view and re-judge every
+    /// active row. Minute cadence (the set calls it on a roll /
+    /// effective change / declaration, and once at configure/seed);
+    /// O(rows) with at most one ≤ 32-probe REL lookup per `rel:` row.
+    /// Never touches `tables` or `positions` (§2.4).
+    pub fn set_regime_view(&mut self, view: &RegimeView) {
+        self.regime_view = *view;
+        self.judge_rows();
+    }
+
+    /// RG3: the view the vm currently judges rows against.
+    #[inline]
+    pub fn regime_view(&self) -> &RegimeView {
+        &self.regime_view
+    }
+
+    /// RG3: one row's gate byte under the current view (tests / the
+    /// harness). `0` for an out-of-range or inactive row.
+    #[inline]
+    pub fn row_gate(&self, row: usize) -> u8 {
+        if row < self.rows_active() as usize {
+            self.row_gate[row]
+        } else {
+            0
+        }
+    }
+
+    /// Re-judge every active row against `regime_view` into
+    /// `row_gate`. Unlabelled rows (tail zero) are always open: `ANY`
+    /// short-circuits both masks, a zero REL byte skips the probe.
+    fn judge_rows(&mut self) {
+        let ai = (self.active & 1) as usize;
+        let len = (self.tables[ai].len as usize).min(RULE_TABLE_ROWS);
+        let eff_fast = self.regime_view.effective[REGIME_PROFILE_FAST as usize];
+        let eff_slow = self.regime_view.effective[REGIME_PROFILE_SLOW as usize];
+        let mut i = 0usize;
+        while i < len {
+            let r = &self.tables[ai].rows[i];
+            let mut open = RegimeLabel(r.regime_fast).allows(eff_fast)
+                && RegimeLabel(r.regime_slow).allows(eff_slow);
+            if open && r.regime_rel != 0 {
+                let rel_fast = self.regime_view.rel_of(REGIME_PROFILE_FAST, r.sym);
+                let rel_slow = self.regime_view.rel_of(REGIME_PROFILE_SLOW, r.sym);
+                open = rel_allows(RegimeRel(r.regime_rel), rel_fast, rel_slow);
+            }
+            let hard = !open && r.regime_off == REGIME_OFF_HARD;
+            self.row_gate[i] = (open as u8) | ((hard as u8) << 1);
+            i += 1;
         }
     }
 
@@ -359,6 +456,8 @@ impl VmStrategy {
             self.positions[i] = VmPosition::FLAT;
             i += 1;
         }
+        // RG3: the new table's rows judge against the stored view.
+        self.judge_rows();
     }
 
     /// Compute a row's signal in the ×1e9 domain. `None` = ABSENT
@@ -665,6 +764,10 @@ impl Strategy for VmStrategy {
             // SAFETY: `i < alen ≤ RULE_TABLE_ROWS` (stamp array).
             let last = unsafe { *self.last_fire_ns.get_unchecked(i) };
             let horizon_ns = (row.horizon_ms as u64).wrapping_mul(1_000_000);
+            // RG3: the row's regime verdict (one byte, judged on view
+            // change / flip — never here).
+            // SAFETY: `i < alen ≤ RULE_TABLE_ROWS` (gate array).
+            let gate = unsafe { *self.row_gate.get_unchecked(i) };
 
             if position_row && self.positions[i].state == POS_ENTERED {
                 // ---- exit path ----
@@ -673,6 +776,16 @@ impl Strategy for VmStrategy {
                 if row.max_hold_s > 0 && age_ns >= (row.max_hold_s as u64) * 1_000_000_000 {
                     // Age-out: unconditional (S1 law).
                     let _ = self.emit_exit(i, ctx, now);
+                    i += 1;
+                    continue;
+                }
+                if gate & ROW_GATE_HARD != 0 {
+                    // RG3 hard-off: flatten now — min-hold and the
+                    // reversion law do not apply (§2.5). Ring-full
+                    // retries on the next evaluation like every exit.
+                    if self.emit_exit(i, ctx, now) {
+                        self.regime_hard_exits = self.regime_hard_exits.wrapping_add(1);
+                    }
                     i += 1;
                     continue;
                 }
@@ -697,6 +810,13 @@ impl Strategy for VmStrategy {
             }
 
             // ---- entry / refire path ----
+            if gate & ROW_GATE_OPEN == 0 {
+                // RG3: closed under the current regime — no entry, no
+                // refire (§2.1: a gate, not a signal).
+                self.regime_blocked = self.regime_blocked.wrapping_add(1);
+                i += 1;
+                continue;
+            }
             if now < last.saturating_add(horizon_ns) {
                 i += 1;
                 continue;
@@ -2009,5 +2129,299 @@ mod tests {
         assert_eq!(vm.leg_drops, 1, "ref-leg refusal counted");
         let pos = vm.position(0).expect("entered");
         assert!(pos.qty_ref_1e6 > 0, "pair bookkeeping kept");
+    }
+
+    // ================ RG3: the row regime gate ================
+
+    use core_types::regime::{
+        RegimeLabelBuilder, REL_INLINE, REL_LAGGING, REL_LEADING, REL_UNKNOWN, SHAPE_TREND,
+        SOURCE_MEASURED, STRETCH_NEUTRAL, TREND_BEAR, TREND_BULL, TREND_NEUTRAL, VOL_NORMAL,
+    };
+    use core_types::{RegimeTerm, RegimeWord, REGIME_OFF_SOFT};
+    use proptest::prelude::*;
+
+    fn term(strs: &[&str]) -> RegimeTerm {
+        let mut b = RegimeLabelBuilder::new();
+        for s in strs {
+            b.add(s.as_bytes()).expect("valid term");
+        }
+        b.finish()
+    }
+
+    /// A measured fast word with the given TREND and every other
+    /// dimension known-neutral.
+    fn fast_word(trend: u8) -> RegimeWord {
+        RegimeWord::from_values(
+            trend,
+            SHAPE_TREND,
+            VOL_NORMAL,
+            core_types::regime::FUND_POS,
+            core_types::regime::LEVEL_NORMAL,
+            STRETCH_NEUTRAL,
+            SOURCE_MEASURED,
+        )
+    }
+
+    /// A view whose fast word is `w` (slow UNKNOWN) and whose only
+    /// member is SYM at slot 1 with `rel` on both profiles.
+    fn view(w: RegimeWord, rel: u8) -> RegimeView {
+        let mut v = RegimeView::UNKNOWN;
+        v.configured = 1;
+        v.effective[0] = w;
+        v.n_syms = 2;
+        v.syms[0] = REF;
+        v.syms[1] = SYM;
+        v.rel[0][1] = rel;
+        v.rel[1][1] = rel;
+        v
+    }
+
+    /// Refire level-breach on SYM (bid @ ≤ 0.012) with a regime term.
+    fn labelled_refire(name: &[u8], t: RegimeTerm, off: u8) -> RuleRowV2 {
+        let mut r = RuleRowV2::from_v1(&lb_row(Side::Bid as u8, 12_000, 10, 3_000_000));
+        r.name_h = fnv1a_64(name);
+        r.with_regime(t, off)
+    }
+
+    #[test]
+    fn regime_gate_blocks_labelled_entries_and_legacy_rows_stay_open() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let bull = labelled_refire(b"bull", term(&["trend:bull"]), REGIME_OFF_SOFT);
+        let legacy = labelled_refire(b"legacy", RegimeTerm::ANY, REGIME_OFF_SOFT);
+        install_v2(&mut vm, &mut ctx, &[bull, legacy]);
+        ctx.now = T0;
+        // No view yet (UNKNOWN): the labelled row fails closed, the
+        // legacy row is bit-identical to before.
+        assert_eq!(vm.row_gate(0), 0);
+        assert_eq!(vm.row_gate(1), ROW_GATE_OPEN);
+        assert_eq!(vm.row_gate(7), 0, "inactive rows read 0");
+        vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
+        assert_eq!(ctx.submitted.len(), 1, "only the legacy row fires");
+        assert_eq!(vm.regime_blocked, 1);
+        assert_eq!(vm.fires, 1);
+        // Bull view: both fire (past the 10 ms horizon).
+        vm.set_regime_view(&view(fast_word(TREND_BULL), REL_UNKNOWN));
+        assert_eq!(vm.row_gate(0), ROW_GATE_OPEN);
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 10_000, 12_000), &mut ctx);
+        assert_eq!(ctx.submitted.len(), 3);
+        assert_eq!(vm.regime_blocked, 1);
+        // Bear view: the labelled row closes again — soft ⇒ no hard bit.
+        vm.set_regime_view(&view(fast_word(TREND_BEAR), REL_UNKNOWN));
+        assert_eq!(vm.row_gate(0), 0);
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 3, 10_000, 12_000), &mut ctx);
+        assert_eq!(ctx.submitted.len(), 4);
+        assert_eq!(vm.regime_blocked, 2);
+        // A view change never touched the table or its identity.
+        assert_eq!(vm.rows_active(), 2);
+        assert_eq!(vm.active_epoch(), 1);
+        assert_eq!(vm.active_hash128(), HASH_A);
+        assert_eq!(vm.commits_applied, 1);
+        assert_eq!(vm.regime_view().effective[0], fast_word(TREND_BEAR));
+        assert_eq!(
+            StrategyCounters::vm_regime_blocked(&vm),
+            0,
+            "bare trait default"
+        );
+    }
+
+    #[test]
+    fn hard_close_flattens_and_soft_close_drains_by_the_rows_own_law() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let bull = term(&["trend:bull"]);
+        let mut hard = xv_row(GROUP_NONE).with_regime(bull, REGIME_OFF_HARD);
+        hard.min_hold_s = 3_600; // would hold the reversion exit for an hour
+        let mut soft = xv_row(GROUP_NONE).with_regime(bull, REGIME_OFF_SOFT);
+        soft.name_h = fnv1a_64(b"xv-soft");
+        install_v2(&mut vm, &mut ctx, &[hard, soft]);
+        ctx.now = T0;
+        vm.set_regime_view(&view(fast_word(TREND_BULL), REL_UNKNOWN));
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.entries, 2, "both variants enter under bull");
+        assert_eq!(ctx.submitted.len(), 4);
+        // The regime turns: the hard row flattens on its next
+        // evaluation (min-hold bypassed), the soft row holds until its
+        // own exit law says so.
+        vm.set_regime_view(&view(fast_word(TREND_BEAR), REL_UNKNOWN));
+        assert_eq!(vm.row_gate(0), ROW_GATE_HARD);
+        assert_eq!(vm.row_gate(1), 0);
+        assert!(
+            vm.position(0).is_some(),
+            "a view change never touches positions"
+        );
+        assert!(vm.position(1).is_some());
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 690_000, 710_000), &mut ctx); // still dislocated
+        assert_eq!(vm.regime_hard_exits, 1);
+        assert!(vm.position(0).is_none(), "hard: flattened");
+        assert!(vm.position(1).is_some(), "soft: held");
+        assert_eq!(ctx.submitted.len(), 6, "two closer legs");
+        assert_eq!(ctx.submitted[4].side, Side::Bid, "closer flips the side");
+        // No re-entry while closed, even though the signal is live
+        // (the hard row is flat now ⇒ its entry evaluation is blocked;
+        // the soft row is still in its exit path ⇒ not an entry).
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 3, 690_000, 710_000), &mut ctx);
+        assert_eq!(vm.entries, 2);
+        assert_eq!(vm.regime_blocked, 1);
+        // Soft row drains on reversion (exits are never gated).
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 4, 501_500, 503_500), &mut ctx);
+        assert!(vm.position(1).is_none(), "soft: its own exit law");
+        assert_eq!(vm.round_trips, 2);
+        assert_eq!(vm.regime_hard_exits, 1);
+    }
+
+    #[test]
+    fn hard_close_age_out_still_wins_and_ring_full_retries() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let mut r = xv_row(GROUP_NONE).with_regime(term(&["trend:bull"]), REGIME_OFF_HARD);
+        r.max_hold_s = 1;
+        install_v2(&mut vm, &mut ctx, &[r]);
+        ctx.now = T0;
+        vm.set_regime_view(&view(fast_word(TREND_BULL), REL_UNKNOWN));
+        prime_pair(&mut vm, &mut ctx, 690_000, 710_000);
+        assert_eq!(vm.entries, 1);
+        vm.set_regime_view(&view(fast_word(TREND_BEAR), REL_UNKNOWN));
+        // Ring full on the first flatten attempt: the position HOLDS
+        // and the counter does not move.
+        ctx.next_err = Some(SubmitErr::RingFull);
+        ctx.now += 20_000_000;
+        vm.on_tick(&tick(SYM, 2, 690_000, 710_000), &mut ctx);
+        assert!(vm.position(0).is_some());
+        assert_eq!(vm.regime_hard_exits, 0);
+        // Past max-hold the age-out fires first — counted as a plain
+        // exit, not a regime exit.
+        ctx.now += 2_000_000_000;
+        vm.on_tick(&tick(SYM, 3, 690_000, 710_000), &mut ctx);
+        assert!(vm.position(0).is_none());
+        assert_eq!(vm.round_trips, 1);
+        assert_eq!(vm.regime_hard_exits, 0);
+    }
+
+    #[test]
+    fn rel_gate_reads_the_views_member_bytes() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        let lag = labelled_refire(b"lag", term(&["rel:lagging"]), REGIME_OFF_SOFT);
+        let lead_slow = labelled_refire(b"lead", term(&["slow:rel:leading"]), REGIME_OFF_SOFT);
+        install_v2(&mut vm, &mut ctx, &[lag, lead_slow]);
+        // REL-only rows carry LABELLED_ANY-style masks from the
+        // validator; the test builder leaves the masks ANY, so the
+        // word never blocks — only the nibbles decide here.
+        vm.set_regime_view(&view(fast_word(TREND_NEUTRAL), REL_LAGGING));
+        assert_eq!(vm.row_gate(0), ROW_GATE_OPEN);
+        assert_eq!(vm.row_gate(1), 0, "slow nibble wants LEADING");
+        vm.set_regime_view(&view(fast_word(TREND_NEUTRAL), REL_LEADING));
+        assert_eq!(vm.row_gate(0), 0);
+        assert_eq!(vm.row_gate(1), ROW_GATE_OPEN);
+        vm.set_regime_view(&view(fast_word(TREND_NEUTRAL), REL_INLINE));
+        assert_eq!(vm.row_gate(0), 0);
+        assert_eq!(vm.row_gate(1), 0);
+        // Warm-up (REL unknown) fails a constrained nibble closed.
+        vm.set_regime_view(&view(fast_word(TREND_NEUTRAL), REL_UNKNOWN));
+        assert_eq!(vm.row_gate(0), 0);
+        // A sym the view does not carry is unknown too.
+        let mut v = view(fast_word(TREND_NEUTRAL), REL_LAGGING);
+        v.syms[1] = 4_242;
+        vm.set_regime_view(&v);
+        assert_eq!(vm.row_gate(0), 0);
+    }
+
+    #[test]
+    fn a_flip_rejudges_the_new_table_against_the_stored_view() {
+        let mut vm = VmStrategy::new();
+        let mut ctx = TestCtx::new();
+        install_v2(
+            &mut vm,
+            &mut ctx,
+            &[labelled_refire(b"a", RegimeTerm::ANY, 0)],
+        );
+        vm.set_regime_view(&view(fast_word(TREND_BEAR), REL_UNKNOWN));
+        // Stage + commit a labelled table: judged at the flip, no
+        // second push needed.
+        let bull = labelled_refire(b"bull", term(&["trend:bull"]), REGIME_OFF_SOFT);
+        let bear = labelled_refire(b"bear", term(&["trend:bear"]), REGIME_OFF_SOFT);
+        vm.receive_table_v2(&v2_table_with(&[bull, bear], 2, HASH_B));
+        vm.on_ai(&commit_cmd(HASH_B), &mut ctx);
+        assert_eq!(vm.commits_applied, 2);
+        assert_eq!(vm.row_gate(0), 0);
+        assert_eq!(vm.row_gate(1), ROW_GATE_OPEN);
+    }
+
+    proptest::proptest! {
+        /// RG3 evaluator law: under ANY effective word, disjoint
+        /// variants of one signal have at most one open row; a
+        /// blocked row never enters while open rows may; and a view
+        /// change never touches the table bytes or the positions.
+        #[test]
+        fn at_most_one_variant_open_and_views_never_touch_state(
+            trend in 0u8..4, shape in 0u8..4, vol in 0u8..4,
+            fund in 0u8..3, level in 0u8..4, stretch in 0u8..4,
+            declared in proptest::bool::ANY,
+        ) {
+            use core_types::regime::{
+                DIM_FUND_LEVEL, DIM_FUND_SIGN, DIM_SHAPE, DIM_STRETCH, DIM_TREND, DIM_VOL,
+                SOURCE_DECLARED,
+            };
+            // Value 3 (2 for FUND) = the unknown mark on that dimension.
+            let mut w = RegimeWord::from_values(0, 0, 0, 0, 0, 0, if declared {
+                SOURCE_DECLARED
+            } else {
+                SOURCE_MEASURED
+            });
+            let dims = [
+                (DIM_TREND, trend, 3u8), (DIM_SHAPE, shape, 3), (DIM_VOL, vol, 3),
+                (DIM_FUND_SIGN, fund, 2), (DIM_FUND_LEVEL, level, 3), (DIM_STRETCH, stretch, 3),
+            ];
+            for (d, v, n) in dims {
+                w = if v >= n { w.with_dim_unknown(d) } else { w.with_dim(d, v) };
+            }
+            let mut vm = VmStrategy::new();
+            let mut ctx = TestCtx::new();
+            let rows = [
+                labelled_refire(b"bull", term(&["trend:bull"]), REGIME_OFF_SOFT),
+                labelled_refire(b"flat", term(&["trend:neutral"]), REGIME_OFF_SOFT),
+                labelled_refire(b"bear", term(&["trend:bear"]), REGIME_OFF_HARD),
+                labelled_refire(b"any", RegimeTerm::ANY, REGIME_OFF_SOFT),
+            ];
+            install_v2(&mut vm, &mut ctx, &rows);
+            let table_before = vm.tables;
+            let positions_before: Vec<u8> = vm.positions.iter().map(|p| p.state).collect();
+            vm.set_regime_view(&view(w, REL_UNKNOWN));
+            let open: Vec<usize> = (0..3).filter(|i| vm.row_gate(*i) & ROW_GATE_OPEN != 0).collect();
+            prop_assert!(open.len() <= 1, "variants open: {open:?} under {w:?}");
+            prop_assert_eq!(vm.row_gate(3), ROW_GATE_OPEN, "legacy row always open");
+            // The expected open variant is the word's TREND value —
+            // unknown-marked TREND opens none.
+            let expect: Vec<usize> = match w.value_of(DIM_TREND) {
+                Some(TREND_BULL) => vec![0],
+                Some(TREND_NEUTRAL) => vec![1],
+                Some(TREND_BEAR) => vec![2],
+                _ => vec![],
+            };
+            prop_assert_eq!(open.clone(), expect);
+            // Hard bit only on the closed HARD row.
+            prop_assert_eq!(vm.row_gate(2) & ROW_GATE_HARD != 0, !open.contains(&2));
+            prop_assert_eq!(vm.row_gate(0) & ROW_GATE_HARD, 0);
+            // State untouched by the view.
+            let same_table = vm.tables.iter().zip(table_before.iter()).all(|(a, b)| {
+                a.len == b.len && a.hash128 == b.hash128 && (0..a.len as usize).all(|i| {
+                    a.rows[i].name_h == b.rows[i].name_h && a.rows[i].regime_fast == b.rows[i].regime_fast
+                })
+            });
+            prop_assert!(same_table);
+            let positions_after: Vec<u8> = vm.positions.iter().map(|p| p.state).collect();
+            prop_assert_eq!(positions_before, positions_after);
+            // Fire the signal: exactly the open variants (+ legacy) emit.
+            ctx.now = T0;
+            vm.on_tick(&tick(SYM, 1, 10_000, 12_000), &mut ctx);
+            prop_assert_eq!(ctx.submitted.len(), open.len() + 1);
+            prop_assert_eq!(vm.regime_blocked as usize, 3 - open.len());
+        }
     }
 }

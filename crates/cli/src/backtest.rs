@@ -44,6 +44,7 @@
 //! Nothing here is reachable from a hot path.
 
 pub mod fill;
+pub mod regime;
 pub mod stale;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,7 +54,8 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, OptSummary, Order, Price,
-    Qty, RuleTableV2, Tick, VenueId, AI_SIDE_NONE, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
+    Qty, RegimeTerm, RuleTableV2, Tick, VenueId, AI_SIDE_NONE, REGIME_OFF_SOFT, STRATEGY_SLOT_VM,
+    SYMBOL_ID_NONE,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -62,6 +64,9 @@ use strategy_vm::VmStrategy;
 use crate::backtest::fill::{
     usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor, FillEngine, ModelOutcome, SynthFill,
     MAX_OPEN_PER_SYM, MAX_OPEN_TOTAL,
+};
+use crate::backtest::regime::{
+    load_set_regime_frames, profile_name, word_string, RegimeMode, RegimeReplay,
 };
 
 /// Book capacity the backtest vm is monomorphized with (design §3.6):
@@ -176,6 +181,12 @@ pub struct BacktestConfig {
     pub stale_after_ms: Vec<String>,
     /// `--emit-detail` sidecar path — declared per §5; written in H2.
     pub emit_detail: Option<PathBuf>,
+    /// RG3: `--regime` (`docs/regime-and-dashboard-plan.md` §4.8 — the
+    /// law is on [`regime::RegimeMode`]).
+    pub regime: RegimeMode,
+    /// RG3: `--regime-seed <path>` (default = the first run's own
+    /// `regime-seed.tsv`, else warm live).
+    pub regime_seed: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------
@@ -460,6 +471,8 @@ enum RecPayload {
     Event(ChannelEvent),
     Depth(DepthTopK),
     Opt(OptSummary),
+    /// RG3: a captured `SetRegime` frame (`ai-cmds.pmlr`, kind 12 only).
+    Regime(AiCmd),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -516,6 +529,10 @@ struct RunSummary {
     /// VT4: per-lane stale accounting from the harness's own re-judge
     /// (v3 lanes) — `stale_blind` marks v2 lanes.
     stale: [stale::StaleStats; VENUE_LABELS.len()],
+    /// RG3: `SetRegime` frames loaded from `ai-cmds.pmlr` (pre-anchor
+    /// frames clamped) and frames dropped as already expired.
+    regime_cmds: u64,
+    regime_cmds_dropped: u64,
 }
 
 /// Open every present per-venue capture file of `run` (ticks +
@@ -627,6 +644,25 @@ fn load_run(
             "{}: no <venue>-ticks.pmlr files present",
             run.path.display()
         )));
+    }
+    // RG3: the run's `SetRegime` frames, clamped to the run's tick
+    // anchor (a window root's carried-over pre-window declaration
+    // applies from the first tick with its remaining TTL). Lane
+    // ordinal 48: after every market lane at equal ts — a declaration
+    // stamped on a tick's instant is applied after that tick, as the
+    // engine's AI drain runs after its market pumps.
+    let tick_anchor = recs.iter().map(|r| r.ts_ns).min().unwrap_or(0);
+    let (regime_frames, regime_cmds_dropped) =
+        load_set_regime_frames(&run.path, run.epoch_ns, tick_anchor)?;
+    let regime_cmds = regime_frames.len() as u64;
+    for (i, c) in regime_frames.into_iter().enumerate() {
+        recs.push(MergeKeyed {
+            ts_ns: c.ts_ns,
+            venue: c.venue,
+            lord: 48,
+            idx: i as u64,
+            payload: RecPayload::Regime(c),
+        });
     }
     // VM2 V5: non-tick channels — absent files are normal (older
     // captures, unspawned lanes); headers cross-check like ticks.
@@ -772,6 +808,8 @@ fn load_run(
             remapped_syms: summary_extra.4,
             dropped_foreign,
             stale: judge.stats,
+            regime_cmds,
+            regime_cmds_dropped,
         },
     ))
 }
@@ -841,6 +879,7 @@ fn load_and_merge(
                 RecPayload::Event(e) => e.ts_ns = virt_ns,
                 RecPayload::Depth(d) => d.ts_ns = virt_ns,
                 RecPayload::Opt(o) => o.ts_ns = virt_ns,
+                RecPayload::Regime(c) => c.ts_ns = virt_ns,
             }
             merged.push(MergedRec {
                 payload,
@@ -1185,6 +1224,44 @@ pub struct HarnessStats {
     pub oos_round_trips: u64,
     /// Committed-table position rows.
     pub position_rows: u64,
+    /// RG3: a detector ran (an artifact resolved on this root).
+    pub regime_configured: bool,
+    /// RG3: `--regime off` (tails stripped).
+    pub regime_off: bool,
+    /// RG3: rows of the committed table carrying a regime tail.
+    pub regime_rows_labelled: u64,
+    /// RG3: vm entry evaluations refused by a closed row gate.
+    pub regime_blocked: u64,
+    /// RG3: vm positions flattened by a HARD-closed gate.
+    pub regime_hard_exits: u64,
+    /// RG3: minutes the detector judged over the replay.
+    pub regime_minutes_judged: u64,
+    /// RG3: `SetRegime` frames applied to the detector.
+    pub regime_declared_applied: u64,
+    /// RG3: `SetRegime` frames loaded (clamped ones included) / dropped
+    /// as expired at their run's anchor.
+    pub regime_cmds: u64,
+    /// RG3: see `regime_cmds`.
+    pub regime_cmds_dropped: u64,
+    /// RG3: seed rows applied at build.
+    pub regime_seed_rows: u32,
+}
+
+/// RG3: the non-`Copy` half of the regime replay report — the stderr
+/// tells and the per-profile minute histogram (`detail_version` 4).
+#[derive(Clone, Debug, Default)]
+pub struct RegimeReport {
+    /// Stderr lines (artifact/seed/mode tells), in order.
+    pub lines: Vec<String>,
+    /// `(profile, word bits, minutes)` sorted by profile then word.
+    pub minutes_by_word: Vec<(u8, u64, u64)>,
+    /// The effective word bits per profile at replay end (index =
+    /// profile; empty when no detector ran).
+    pub final_words: Vec<u64>,
+    /// Hex SHA-256 of the artifact (empty when no detector ran).
+    pub artifact_sha256: String,
+    /// Where the seed came from (`absent` when none).
+    pub seed_source: String,
 }
 
 /// What `run` hands the bin: the exact stdout line, the stderr
@@ -1197,6 +1274,8 @@ pub struct BacktestOutput {
     pub summary: String,
     /// The facts behind both strings.
     pub stats: HarnessStats,
+    /// RG3: the regime replay's tells + histogram.
+    pub regime: RegimeReport,
 }
 
 // ---------------------------------------------------------------
@@ -1291,6 +1370,24 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &mut table,
     )
     .map_err(HarnessError::Reject)?;
+    // RG3: labelled rows (regime tail set) — counted for the report;
+    // `--regime off` strips every tail so each row evaluates as ANY
+    // (the artifact identity `hash128` is unchanged — this is a replay
+    // knob, not a new artifact).
+    let mut regime_rows_labelled = 0u64;
+    {
+        let len = (table.len as usize).min(core_types::RULE_TABLE_ROWS);
+        let mut i = 0;
+        while i < len {
+            if table.rows[i].regime_constrained() {
+                regime_rows_labelled += 1;
+                if cfg.regime.is_off() {
+                    table.rows[i] = table.rows[i].with_regime(RegimeTerm::ANY, REGIME_OFF_SOFT);
+                }
+            }
+            i += 1;
+        }
+    }
 
     // §3.4 boundary: N% of the merged wall-time span. Replay is
     // continuous through it; only accounting buckets on it (H2 —
@@ -1384,6 +1481,35 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     let mut consumed = ctx.orders().len(); // on_start/on_ai emit nothing, but stay uniform
     debug_assert_eq!(consumed, 0);
     let mut fills_scratch: Vec<SynthFill> = Vec::with_capacity(MAX_OPEN_TOTAL);
+    // RG3: the regime detector — the engine's own `RegimeState` over
+    // the replay's ticks/funding/declarations, anchored so that
+    // `first_virt` == the first record's wall instant; its view is
+    // handed to the vm exactly as the set does live. Regime-blind
+    // replays keep the vm's boot view (labelled rows fail closed).
+    let mut regime_lines: Vec<String> = Vec::new();
+    let mut regime = {
+        let resolve = |d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym);
+        let default_seed = runs[0].path.join("regime-seed.tsv");
+        let mut report = |line: &str| regime_lines.push(line.to_owned());
+        RegimeReplay::build(
+            &cfg.regime,
+            cfg.regime_seed.as_deref(),
+            Some(&default_seed),
+            &resolve,
+            first_virt,
+            merged[0].wall_ns,
+            &mut report,
+        )?
+    };
+    if regime.is_none() && !cfg.regime.is_off() && regime_rows_labelled > 0 {
+        regime_lines.push(format!(
+            "regime: {regime_rows_labelled} labelled row(s) fail CLOSED for the whole replay \
+             (no detector) — pass --regime <toml> or --regime off"
+        ));
+    }
+    if let Some(rg) = regime.as_ref() {
+        vm.set_regime_view(&rg.view());
+    }
     // D-3: round-trips completed before the boundary are IS; the OOS
     // figure is the total minus this snapshot (an IS-entered position
     // whose EXIT lands OOS counts OOS — the honest direction).
@@ -1394,8 +1520,18 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             rt_at_boundary = Some(vm.round_trips);
         }
         let warm = rec.virt_ns < warmup_end_virt;
+        if let Some(rg) = regime.as_mut() {
+            // The 1 s poll on the virtual clock precedes the record,
+            // as the engine's timer precedes the pump it interleaves.
+            if rg.on_time(rec.virt_ns) {
+                vm.set_regime_view(&rg.view());
+            }
+        }
         match &rec.payload {
             RecPayload::Tick(t) => {
+                if let Some(rg) = regime.as_mut() {
+                    rg.on_tick(t);
+                }
                 engine.on_record(t, rec.virt_ns, rec.wall_ns, &mut fills_scratch);
                 if warm {
                     vm.feats.on_tick(t, rec.virt_ns);
@@ -1404,10 +1540,21 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
                 }
             }
             RecPayload::Event(e) => {
+                if let Some(rg) = regime.as_mut() {
+                    rg.on_event(e);
+                }
                 if warm {
                     vm.feats.on_venue_event(e, rec.virt_ns);
                 } else {
                     vm.on_venue_event(e, &mut ctx);
+                }
+                fills_scratch.clear();
+            }
+            RecPayload::Regime(c) => {
+                if let Some(rg) = regime.as_mut() {
+                    if rg.on_set_regime(c, rec.virt_ns) {
+                        vm.set_regime_view(&rg.view());
+                    }
                 }
                 fills_scratch.clear();
             }
@@ -1531,6 +1678,44 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         warmup_end_virt_ns: warmup_end_virt,
         oos_round_trips,
         position_rows,
+        regime_configured: regime.is_some(),
+        regime_off: cfg.regime.is_off(),
+        regime_rows_labelled,
+        regime_blocked: vm.regime_blocked,
+        regime_hard_exits: vm.regime_hard_exits,
+        regime_minutes_judged: regime.as_ref().map(|r| r.minutes_judged()).unwrap_or(0),
+        regime_declared_applied: regime.as_ref().map(|r| r.declared_applied).unwrap_or(0),
+        regime_cmds: run_summaries.iter().map(|r| r.regime_cmds).sum(),
+        regime_cmds_dropped: run_summaries.iter().map(|r| r.regime_cmds_dropped).sum(),
+        regime_seed_rows: regime.as_ref().map(|r| r.seed_rows).unwrap_or(0),
+    };
+    let regime_report = RegimeReport {
+        lines: regime_lines,
+        minutes_by_word: regime
+            .as_ref()
+            .map(|r| {
+                r.minutes_by_word
+                    .iter()
+                    .map(|((p, w), m)| (*p, *w, *m))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        final_words: regime
+            .as_ref()
+            .map(|r| {
+                (0..core_types::REGIME_PROFILES as u8)
+                    .map(|p| r.effective(p).0)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        artifact_sha256: regime
+            .as_ref()
+            .map(|r| hex_lower(&r.hash))
+            .unwrap_or_default(),
+        seed_source: regime
+            .as_ref()
+            .map(|r| r.seed_source.clone())
+            .unwrap_or_else(|| "absent".to_owned()),
     };
     debug_assert_eq!(stats.vm_orders_emitted as usize, ctx.orders().len());
     debug_assert_eq!(
@@ -1554,6 +1739,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             &outcome,
             &engine,
             &run_summaries,
+            &regime_report,
         );
         std::fs::write(detail_path, detail).map_err(|e| {
             HarnessError::Usage(format!(
@@ -1564,12 +1750,138 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     }
 
     let schema1 = render_schema1(&hash_hex, &cfg.split, &vals);
-    let summary = render_summary(cfg, &split, &model, &run_summaries, &stats, &hash_hex);
+    let summary = render_summary(
+        cfg,
+        &split,
+        &model,
+        &run_summaries,
+        &stats,
+        &hash_hex,
+        &regime_report,
+    );
     Ok(BacktestOutput {
         schema1,
         summary,
         stats,
+        regime: regime_report,
     })
+}
+
+/// RG3: the deterministic regime block of the stderr summary — the
+/// build tells, then one line per profile with minutes per effective
+/// word (sorted by word bits), then the vm's gate counters.
+fn render_regime_summary(stats: &HarnessStats, regime: &RegimeReport) -> String {
+    let mut s = String::with_capacity(512);
+    for line in &regime.lines {
+        s.push_str(line);
+        s.push('\n');
+    }
+    if stats.regime_configured {
+        let mut p = 0u8;
+        while (p as usize) < core_types::REGIME_PROFILES {
+            s.push_str(&format!("regime {}:", profile_name(p)));
+            let mut any = false;
+            for (pp, w, m) in &regime.minutes_by_word {
+                if *pp == p {
+                    s.push_str(&format!(
+                        " [{}]={m}m",
+                        word_string(core_types::RegimeWord(*w))
+                    ));
+                    any = true;
+                }
+            }
+            if !any {
+                s.push_str(" (no minute judged)");
+            }
+            s.push('\n');
+            p += 1;
+        }
+        s.push_str("regime end:");
+        for (p, w) in regime.final_words.iter().enumerate() {
+            s.push_str(&format!(
+                " {}={} ",
+                profile_name(p as u8),
+                word_string(core_types::RegimeWord(*w))
+            ));
+        }
+        s.push('\n');
+    }
+    s.push_str(&format!(
+        "regime: labelled_rows={} blocked={} hard_exits={} minutes={} declared={} \
+         set_regime_frames={} (expired-at-anchor {}) seed_rows={} mode={}\n",
+        stats.regime_rows_labelled,
+        stats.regime_blocked,
+        stats.regime_hard_exits,
+        stats.regime_minutes_judged,
+        stats.regime_declared_applied,
+        stats.regime_cmds,
+        stats.regime_cmds_dropped,
+        stats.regime_seed_rows,
+        if stats.regime_off {
+            "off"
+        } else if stats.regime_configured {
+            "artifact"
+        } else {
+            "blind"
+        },
+    ));
+    s
+}
+
+/// RG3: the `detail_version` 4 sidecar block — additive; the schema-1
+/// stdout stays frozen.
+fn render_regime_detail(stats: &HarnessStats, regime: &RegimeReport) -> String {
+    let mut s = String::with_capacity(512);
+    s.push_str(&format!(
+        "\"regime\":{{\"mode\":\"{}\",\"artifact_sha256\":\"{}\",\"seed\":\"{}\",\"seed_rows\":{},\
+         \"labelled_rows\":{},\"blocked\":{},\"hard_exits\":{},\"minutes_judged\":{},\
+         \"declared_applied\":{},\"set_regime_frames\":{},\"set_regime_expired\":{},\"profiles\":[",
+        if stats.regime_off {
+            "off"
+        } else if stats.regime_configured {
+            "artifact"
+        } else {
+            "blind"
+        },
+        regime.artifact_sha256,
+        regime.seed_source.replace('\\', "/").replace('"', "'"),
+        stats.regime_seed_rows,
+        stats.regime_rows_labelled,
+        stats.regime_blocked,
+        stats.regime_hard_exits,
+        stats.regime_minutes_judged,
+        stats.regime_declared_applied,
+        stats.regime_cmds,
+        stats.regime_cmds_dropped,
+    ));
+    let mut p = 0u8;
+    while (p as usize) < core_types::REGIME_PROFILES {
+        if p > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"profile\":\"{}\",\"minutes\":[",
+            profile_name(p)
+        ));
+        let mut first = true;
+        for (pp, w, m) in &regime.minutes_by_word {
+            if *pp != p {
+                continue;
+            }
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            s.push_str(&format!(
+                "{{\"word\":\"{}\",\"bits\":\"{w:016x}\",\"minutes\":{m}}}",
+                word_string(core_types::RegimeWord(*w))
+            ));
+        }
+        s.push_str("]}");
+        p += 1;
+    }
+    s.push_str("]}");
+    s
 }
 
 /// VT4: one deterministic per-run stale line — every present lane as
@@ -1640,6 +1952,7 @@ fn render_summary(
     runs: &[RunSummary],
     stats: &HarnessStats,
     hash_hex: &str,
+    regime: &RegimeReport,
 ) -> String {
     let mut s = String::with_capacity(2048);
     s.push_str(&format!(
@@ -1689,6 +2002,7 @@ fn render_summary(
         stats.vm_orders_dropped,
         stats.vm_book_track_failed
     ));
+    s.push_str(&render_regime_summary(stats, regime));
     s.push_str(&format!(
         "model: latency_ns pm={} bn={} okx={} deribit={} hl={}; fee_bps pm={}:{} bn={}:{} \
          okx={}:{} deribit={}:{} hl={}:{}; open-order caps {}/sym {} total; \
@@ -1786,10 +2100,13 @@ fn render_summary(
 /// schema-1 (`detail_version` 2 since VT4 — the `stale` block and the
 /// model's `stale_after_ms` table; 3 since I1 — `fills.ioc`,
 /// `fills.ioc_canceled`, `fills.ttl_expired` and the `oos.fee_ladder`
-/// array of net P&L at flat 0 / 1 / 2 bps per side), operator/session
+/// array of net P&L at flat 0 / 1 / 2 bps per side; 4 since RG3 — the
+/// additive `regime` block: mode, artifact hash, seed, gate counters
+/// and the per-profile minutes-per-word histogram), operator/session
 /// surface, never parsed by the worker. Hand-rendered like schema-1 — every value is
 /// numeric, a fixed label, the validated split echo, or the hash hex;
 /// USD values are the same fixed-point renders as the stderr summary.
+#[allow(clippy::too_many_arguments)] // one sidecar = one render of every section
 fn render_detail(
     hash_hex: &str,
     split: &str,
@@ -1798,11 +2115,12 @@ fn render_detail(
     outcome: &ModelOutcome,
     engine: &FillEngine,
     runs: &[RunSummary],
+    regime: &RegimeReport,
 ) -> String {
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
         concat!(
-            "{{\"detail_version\":3,",
+            "{{\"detail_version\":4,",
             "\"ruleset_hash\":\"{hash}\",",
             "\"split\":\"{split}\",",
             "\"model\":{{",
@@ -1909,7 +2227,9 @@ fn render_detail(
             n = row.fills,
         ));
     }
-    s.push_str("]}\n");
+    s.push_str("],");
+    s.push_str(&render_regime_detail(stats, regime));
+    s.push_str("}\n");
     s
 }
 

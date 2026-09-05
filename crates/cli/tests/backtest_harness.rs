@@ -16,6 +16,7 @@ use core_io::{PmlrWriter, SlotKind};
 use core_types::{Price, Qty, Tick, VenueId};
 use ingress_ai::RulesetReject;
 
+use cli::backtest::regime::RegimeMode;
 use cli::backtest::{BacktestConfig, HarnessError, VIRT_T0};
 
 // ---------------------------------------------------------------
@@ -123,6 +124,11 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         latency_ns_venue: Vec::new(),
         stale_after_ms: Vec::new(),
         emit_detail: None,
+        // RG3: hermetic — never consult the operator's default artifact
+        // from a test (legacy fixtures carry no labelled row, so `off`
+        // is bit-identical to a blind replay).
+        regime: RegimeMode::Off,
+        regime_seed: None,
     }
 }
 
@@ -761,7 +767,8 @@ fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
     assert_eq!(out_a.schema1, out_b.schema1);
     // Versioned separately from schema-1; carries the operator detail
     // the frozen stdout must NOT carry (§5).
-    assert!(a.starts_with("{\"detail_version\":3,"), "I1 bumped the sidecar version (VT4: 2)");
+    assert!(a.starts_with("{\"detail_version\":4,"), "RG3 bumped the sidecar version (VT4: 2, I1: 3)");
+    assert!(a.contains("\"regime\":{\"mode\":\"off\","), "{a}");
     assert!(a.contains("\"canceled_end\":1"));
     assert!(
         a.contains("\"full\":{\"realized_usd\":6.75,"),
@@ -841,7 +848,7 @@ fn vt4_stale_tick_neither_fills_nor_marks_and_is_reported() {
     assert!(out.summary.contains("stale_after_ms pm=1000 bn=1000 okx=400 deribit=600 hl=700 bybit=500"));
     // sidecar v2: the model's thresholds + the per-run lane block.
     let d = std::fs::read_to_string(&detail).expect("sidecar");
-    assert!(d.starts_with("{\"detail_version\":3,"));
+    assert!(d.starts_with("{\"detail_version\":4,"));
     assert!(d.contains("\"stale_after_ms\":{\"pm\":1000,\"bn\":1000,\"okx\":400,\"deribit\":600,\"hl\":700,\"bybit\":500}"), "{d}");
     assert!(d.contains(&format!(
         "\"stale\":{{\"ticks_skipped\":1,\"runs\":[{{\"epoch_ns\":{PNL_EPOCH_RUN_0},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}},{{\"epoch_ns\":{PNL_EPOCH_RUN_1},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":1,\"stale_time_bps\":4285,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}}]}}"
@@ -1035,6 +1042,8 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         latency_ns_venue: Vec::new(),
         stale_after_ms: Vec::new(),
         emit_detail: None,
+        regime: RegimeMode::Off,
+        regime_seed: None,
     }
 }
 
@@ -1372,6 +1381,217 @@ fn v7_dead_descriptor_records_drop_instead_of_colliding() {
     assert_eq!(
         s.vm_fires, 1,
         "the row fires on run-1's tick ONLY — never on the foreign price"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------
+// RG3: regime-aware replay (docs/regime-and-dashboard-plan.md §4.8)
+// ---------------------------------------------------------------
+
+/// Three refire rows on one signal: a `trend:bull` variant, a
+/// disjoint `trend:bear` variant (rule-8 amendment admits both) and an
+/// unlabelled row on a different `enter` (its own identity).
+const RG3_RULESET: &str = r#"{"rows":[{"name":"bull","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid","regimes":["trend:bull"]},{"name":"bear","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid","regimes":["trend:bear"],"regime_off":"hard"},{"name":"any","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":0.1,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid"}]}"#;
+
+/// A `SetRegime` frame declaring `trend=bull` on `profile` at `ts`.
+fn rg3_set_regime(ts: u64, profile: u16, ttl_ns: u64) -> core_types::AiCmd {
+    core_types::AiCmd::new(
+        ts,
+        1,
+        core_types::SYMBOL_ID_NONE,
+        (1u64 << 2) as i64, // TREND byte, bit 2 = bull; SOURCE empty (wire law)
+        0,
+        ttl_ns,
+        core_types::AiCmdKind::SetRegime,
+        VenueId::Ai,
+        core_types::STRATEGY_SLOT_NONE,
+        core_types::AI_SIDE_NONE,
+        profile,
+        0,
+    )
+}
+
+/// Build the RG3 capture: the manifest, the ruleset, the committed
+/// `regime.toml.example` as the artifact (its refs resolve through the
+/// manifest, its breadth members do not — dropped, lenient), one
+/// declaration BEFORE the first tick (clamped to the anchor), a bn
+/// anchor tick and two okx ticks that fire the rows.
+fn rg3_build(root: &Path) -> (PathBuf, PathBuf) {
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+    let ruleset = root.join("rg3.json");
+    std::fs::write(&ruleset, RG3_RULESET).expect("ruleset");
+    let artifact = root.join("regime.toml");
+    std::fs::write(&artifact, include_str!("../../../regime.toml.example")).expect("artifact");
+    let mut w = PmlrWriter::open(run0.join("ai-cmds.pmlr"), SlotKind::AiCmd, EPOCH_RUN_0)
+        .expect("open ai-cmds");
+    w.append(&rg3_set_regime(100, 0, 3_600_000_000_000))
+        .expect("append");
+    w.flush().expect("flush");
+    write_ticks(
+        &run0,
+        "bn",
+        EPOCH_RUN_0,
+        &[mk_tick(
+            1_000,
+            VenueId::Binance,
+            V5_REF,
+            1,
+            490_000,
+            510_000,
+        )],
+    );
+    write_ticks(
+        &run0,
+        "okx",
+        EPOCH_RUN_0,
+        &[
+            mk_tick(2_000, VenueId::Okx, V5_SYM, 1, 499_000, 501_000),
+            mk_tick(3_000, VenueId::Okx, V5_SYM, 2, 499_000, 501_000),
+        ],
+    );
+    (ruleset, artifact)
+}
+
+#[test]
+fn rg3_declared_regime_gates_labelled_rows_and_off_strips_them() {
+    let root = unique_root("rg3");
+    let (ruleset, artifact) = rg3_build(&root);
+
+    // --regime <artifact>: the declaration (clamped to the anchor with
+    // its TTL shortened) makes fast TREND=bull effective ⇒ the bull
+    // variant + the unlabelled row fire, the bear variant is blocked on
+    // both okx ticks.
+    let detail = root.join("detail.json");
+    let mut c = v5_cfg(&ruleset, &root, "0/100");
+    c.regime = RegimeMode::Artifact(artifact.clone());
+    c.emit_detail = Some(detail.clone());
+    let on = cli::backtest::run(&c).expect("harness ok");
+    let s = on.stats;
+    assert!(s.regime_configured, "{}", on.summary);
+    assert!(!s.regime_off);
+    assert_eq!(s.regime_rows_labelled, 2);
+    assert_eq!(s.regime_cmds, 1);
+    assert_eq!(s.regime_cmds_dropped, 0);
+    assert_eq!(s.regime_declared_applied, 1);
+    assert_eq!(s.vm_orders_emitted, 2, "bull + any: {}", on.summary);
+    assert_eq!(s.regime_blocked, 2, "bear blocked on both okx ticks");
+    assert_eq!(s.regime_hard_exits, 0, "refire rows hold no position");
+    assert!(on.summary.contains("regime: artifact "), "{}", on.summary);
+    assert!(
+        on.summary.contains("members=0 (dropped 4)"),
+        "{}",
+        on.summary
+    );
+    assert!(on.summary.contains("seed=absent"), "{}", on.summary);
+    assert!(
+        on.summary.contains("regime end: fast=trend=bull "),
+        "{}",
+        on.summary
+    );
+    assert!(on.summary.contains("source=declared"), "{}", on.summary);
+    assert!(
+        on.summary
+            .contains("regime: labelled_rows=2 blocked=2 hard_exits=0"),
+        "{}",
+        on.summary
+    );
+    let d = std::fs::read_to_string(&detail).expect("sidecar");
+    assert!(d.starts_with("{\"detail_version\":4,"));
+    assert!(
+        d.contains("\"regime\":{\"mode\":\"artifact\",\"artifact_sha256\":\""),
+        "{d}"
+    );
+    assert!(
+        d.contains("\"labelled_rows\":2,\"blocked\":2,\"hard_exits\":0"),
+        "{d}"
+    );
+    assert!(
+        d.contains("\"declared_applied\":1,\"set_regime_frames\":1,\"set_regime_expired\":0"),
+        "{d}"
+    );
+    assert!(d.contains("{\"profile\":\"fast\",\"minutes\":["), "{d}");
+    assert_eq!(on.regime.artifact_sha256.len(), 64);
+    // Determinism: same inputs ⇒ same stdout + summary.
+    let again = cli::backtest::run(&c).expect("harness ok");
+    assert_eq!(again.schema1, on.schema1);
+    assert_eq!(again.summary, on.summary);
+
+    // --regime off: every tail stripped ⇒ all three fire, nothing blocked.
+    let mut c_off = v5_cfg(&ruleset, &root, "0/100");
+    c_off.regime = RegimeMode::Off;
+    let off = cli::backtest::run(&c_off).expect("harness ok");
+    assert!(off.stats.regime_off);
+    assert!(!off.stats.regime_configured);
+    assert_eq!(
+        off.stats.regime_rows_labelled, 2,
+        "counted before the strip"
+    );
+    assert_eq!(off.stats.vm_orders_emitted, 3, "{}", off.summary);
+    assert_eq!(off.stats.regime_blocked, 0);
+    assert!(
+        off.summary
+            .contains("regime: off — every row evaluates as ANY"),
+        "{}",
+        off.summary
+    );
+    assert!(off.summary.contains("mode=off"), "{}", off.summary);
+    // Schema-1 never grows a key for the regime: the on/off delta lives
+    // in the stats + summary (no fill crosses here, so both lines carry
+    // the same zeros).
+    assert!(!off.schema1.contains("regime") && !on.schema1.contains("regime"));
+
+    // --regime <missing path>: fatal usage error (explicit artifact).
+    let mut c_bad = v5_cfg(&ruleset, &root, "0/100");
+    c_bad.regime = RegimeMode::Artifact(root.join("nope.toml"));
+    match cli::backtest::run(&c_bad) {
+        Err(HarnessError::Usage(msg)) => assert!(msg.contains("--regime"), "{msg}"),
+        other => panic!("expected a usage error, got {other:?}"),
+    }
+    // --regime-seed <missing path>: fatal too.
+    let mut c_seed = v5_cfg(&ruleset, &root, "0/100");
+    c_seed.regime = RegimeMode::Artifact(artifact.clone());
+    c_seed.regime_seed = Some(root.join("nope.tsv"));
+    assert!(matches!(
+        cli::backtest::run(&c_seed),
+        Err(HarnessError::Usage(_))
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rg3_expired_declaration_leaves_labelled_rows_closed() {
+    // The same capture, but the declaration's TTL ran out before the
+    // anchor ⇒ dropped at load; measured is UNKNOWN (no seed, no
+    // minute rolled) ⇒ both labelled variants fail closed, only the
+    // unlabelled row fires.
+    let root = unique_root("rg3-exp");
+    let (ruleset, artifact) = rg3_build(&root);
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    let mut w = PmlrWriter::open(run0.join("ai-cmds.pmlr"), SlotKind::AiCmd, EPOCH_RUN_0)
+        .expect("open ai-cmds");
+    w.append(&rg3_set_regime(100, 0, 500)).expect("append"); // expires at 600 < anchor 1000
+    w.flush().expect("flush");
+    let mut c = v5_cfg(&ruleset, &root, "0/100");
+    c.regime = RegimeMode::Artifact(artifact);
+    let out = cli::backtest::run(&c).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.regime_cmds, 0);
+    assert_eq!(s.regime_cmds_dropped, 1);
+    assert_eq!(s.regime_declared_applied, 0);
+    assert_eq!(
+        s.vm_orders_emitted, 1,
+        "only the unlabelled row: {}",
+        out.summary
+    );
+    assert_eq!(s.regime_blocked, 4, "two labelled rows × two okx ticks");
+    assert!(
+        out.summary.contains("regime end: fast=trend=unknown "),
+        "{}",
+        out.summary
     );
     let _ = std::fs::remove_dir_all(&root);
 }

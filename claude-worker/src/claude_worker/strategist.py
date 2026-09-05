@@ -44,6 +44,7 @@ import typing
 import claude_worker.channel_map
 import claude_worker.config
 import claude_worker.features
+import claude_worker.frames
 import claude_worker.iv_digest
 import claude_worker.llm
 import claude_worker.pmlr
@@ -74,7 +75,10 @@ _TRUNCATION_MARKER: str = "\n...[digest truncated at cap]"
 # v2 (2026-08-30): the static block now teaches the VM2 v2 grammar and
 # the $50k-tier caps/gates; every v1-era cached response is stale by
 # construction.
-STRATEGIST_PROMPT_VERSION: str = "strategist-v2"
+# v3 (2026-09-05, RG3): the static block teaches the grammar v2.1 regime
+# keys (`regimes` / `regime_off` / `rel`), the gate law and regime
+# VARIANTS of one signal, and asks for a label on every row.
+STRATEGIST_PROMPT_VERSION: str = "strategist-v3"
 
 # ---- events-ledger kinds (§7.5; written by daemon.py on the serve
 # thread — the events table is serve-loop-only under the §7.6 law) ------
@@ -153,6 +157,20 @@ ROLLING_FEATURES: frozenset[str] = frozenset(
 COMBINES: tuple[str, ...] = ("diff", "diff_bps", "ratio")
 CMPS: tuple[str, ...] = ("ge", "le")
 
+# ---- grammar v2.1 regime keys (RG3; core_types::regime text grammar) ----
+# The STRUCTURAL mirror only: profile prefix, dimension names, value
+# vocabulary per dimension (+ `*`, `!v`, `v1|v2`, the `unknown` mark on
+# market dimensions). Duplicate `(profile, dim)`, empty sets and the
+# stored-tail law are rule 11 in `ingress_ai::validate_ruleset`.
+REGIME_OFFS: tuple[str, ...] = ("soft", "hard")
+REGIME_PROFILES_PREFIX: tuple[str, ...] = ("fast", "slow")
+REGIME_TERM_MAX: int = 16  # 2 profiles × (7 dims + rel) — more is a duplicate
+REGIME_TERM_LEN_MAX: int = 64  # ingress_ai::REGIME_TERM_CAP
+_REGIME_DIM_VALUES: dict[str, tuple[str, ...]] = {
+    **claude_worker.frames.REGIME_VALUES,
+    "rel": ("lagging", "inline", "leading"),
+}
+
 # ---- row key sets (mirror of ingress_ai V1_ONLY / V2_ONLY / V2_REQUIRED)
 
 _ROW_KEYS_SHARED: frozenset[str] = frozenset(
@@ -181,6 +199,9 @@ _ROW_KEYS_V2_ONLY: frozenset[str] = frozenset(
         "group",
         "min_hold_s",
         "max_hold_s",
+        "regimes",
+        "regime_off",
+        "rel",
     }
 )
 # v1 requires its ENTIRE key set (8g shape, byte-exact); v2 requires a
@@ -229,10 +250,62 @@ _ROW_KEY_ORDER_V2: tuple[str, ...] = (
     "group",
     "min_hold_s",
     "max_hold_s",
+    "regimes",
+    "regime_off",
+    "rel",
     "horizon_ms",
     "max_risk_usd",
 )
 _SYMBOL_ID_MAX: int = 0xFFFF_FFFE  # < SYMBOL_ID_NONE
+
+
+def regime_term_ok(term: str) -> bool:
+    """Structural check of one `regimes` term — `[fast:|slow:]<dim>:<values>`
+    with `<values>` = `*` | `!<value>` | `<value>[|<value>…]` over the
+    dimension's vocabulary (`unknown` allowed on market dimensions, the
+    REL pseudo-dimension `rel` has no mark). Mirrors
+    `core_types::regime::parse_label_term`'s vocabulary; the deep laws
+    (duplicates, empty sets) stay in the Rust validator."""
+    if not term or len(term) > REGIME_TERM_LEN_MAX or not term.isascii():
+        return False
+    parts = term.split(":")
+    if len(parts) == 3:
+        if parts[0] not in REGIME_PROFILES_PREFIX:
+            return False
+        dim, values = parts[1], parts[2]
+    elif len(parts) == 2:
+        dim, values = parts
+    else:
+        return False
+    vocab = _REGIME_DIM_VALUES.get(dim)
+    if vocab is None or not values:
+        return False
+    if values == "*":
+        return True
+    if values.startswith("!"):
+        return values[1:] in vocab
+    for v in values.split("|"):
+        if v in vocab:
+            continue
+        if v == "unknown" and dim not in ("source", "rel"):
+            continue
+        return False
+    return True
+
+
+def regime_rel_ok(value: str) -> bool:
+    """Structural check of the `rel` sugar — `[fast:|slow:]<values>` over
+    the REL vocabulary (the validator rewrites it to a `rel:` term)."""
+    if not value or not value.isascii():
+        return False
+    rest = value
+    for prefix in REGIME_PROFILES_PREFIX:
+        if value.startswith(prefix + ":"):
+            rest = value[len(prefix) + 1 :]
+            break
+    if not rest or rest.startswith("rel:"):
+        return False
+    return regime_term_ok(f"rel:{rest}")
 
 _REJECTED_SUFFIX: str = ".rejected.json"
 
@@ -352,6 +425,39 @@ _STATIC_SYSTEM_TEXT: str = (
     '  *"horizon_ms":   integer 10..86400000 — refire cooldown, and'
     " re-entry cooldown after a position exits\n"
     '  *"max_risk_usd": number > 0, <= 10000.0 — notional cap PER LEG\n'
+    '   "regimes":      REQUIRED on every row you propose (the engine'
+    " accepts unlabelled rows only as legacy): a non-empty list of label"
+    ' terms "[fast:|slow:]<dim>:<values>" — the REGION of the market'
+    " regime space in which this row may ENTER. Dimensions: trend"
+    " (bear|neutral|bull), shape (chop|mixed|trend), vol"
+    " (low|normal|high), fund (neg|pos), level (low|normal|high),"
+    " stretch (ext_down|neutral|ext_up), source (measured|declared),"
+    " rel (lagging|inline|leading — the row's instrument vs BTC)."
+    ' <values> is "*" (any), "!v" (all but v) or "v1|v2" (exactly'
+    ' these); the token "unknown" adds "trade even if this dimension'
+    ' cannot be judged". Profiles: "fast:" = 1 h horizon (the default'
+    ' when unprefixed), "slow:" = 4 h; a row is open only when BOTH'
+    " profiles' words fit. An omitted dimension means any value.\n"
+    '   "regime_off":   "soft" (default) | "hard" — what happens to an'
+    " OPEN position when the row's region no longer holds: soft blocks"
+    " new entries and lets the row's own exit law drain; hard blocks"
+    " entries AND flattens the position at once.\n"
+    '   "rel":          sugar for one more rel term, "[fast:|slow:]<values>"'
+    ' over lagging|inline|leading (e.g. "lagging|inline").\n'
+    "\n"
+    "REGIME LAW: the regime is a GATE, never a signal — it decides whether"
+    " a row may enter; it never sizes, prices or times an order, and exits"
+    " are NEVER gated. A labelled row fails CLOSED while the regime is"
+    " unknown (engine warm-up). Regime changes never flip the table: every"
+    " row carries its own region, so author VARIANTS — the same signal"
+    " with regime-specific exit / horizon / max_risk_usd / regime_off,"
+    " each variant on a DISJOINT region (e.g. trend:bull vs trend:bear vs"
+    " trend:neutral). Disjoint variants of one signal are legal; two rows"
+    " on the same signal whose regions OVERLAP are rejected as duplicates."
+    " Every backtest reports per-regime P&L and the on/off delta"
+    " (--regime off replays every row unlabelled): a label must EARN its"
+    " keep — prefer a region where the digest's per-regime P&L shows the"
+    " edge, and say why in the thesis.\n"
     "\n"
     "DIRECTION LAW: a positive signal means ASK the instrument (sell the"
     " rich leg / short the higher-funding venue); negative means BID. A"
@@ -375,7 +481,10 @@ _STATIC_SYSTEM_TEXT: str = (
     " table forces smaller legs. Never propose more.\n"
     "- Names must be unique; exact-duplicate rows are rejected (identity"
     " is instrument/ref/features/windows/combine/comparison/group/enter —"
-    " horizon, holds, risk and name are NOT identity).\n"
+    " horizon, holds, risk and name are NOT identity; two rows on one"
+    " identity are duplicates only when their regime regions overlap).\n"
+    '- Regime terms must parse; "regime_off" and "rel" need "regimes";'
+    " a dimension named twice on one profile is rejected.\n"
     "- At most 8 distinct rolling windows per symbol, 256 across the"
     " table.\n"
     "\n"
@@ -398,21 +507,40 @@ _STATIC_SYSTEM_TEXT: str = (
     '{"thesis": "<why these rows, <= 4000 chars>", "rows": [ROW, ...]}\n'
     "Malformed output is archived and discarded; the cycle ends.\n"
     "\n"
-    "WORKED EXAMPLE A — stateless refire, cross-venue price deviation:\n"
+    "WORKED EXAMPLE A — stateless refire, cross-venue price deviation,"
+    " labelled for calm markets on both horizons:\n"
     '{"name": "xv-btc-okx-bn", "family": "crypto", "instrument":'
     ' "okx:BTC-USDT", "ref": "binance:btcusdt", "feature": "mid",'
-    ' "combine": "diff_bps", "abs": true, "enter": 3.0, "horizon_ms":'
+    ' "combine": "diff_bps", "abs": true, "enter": 3.0, "regimes":'
+    ' ["vol:!high", "slow:shape:chop|mixed"], "horizon_ms":'
     " 60000, \"max_risk_usd\": 3000.0}\n"
     "\n"
     "WORKED EXAMPLE B — position pair on a funding spread, one per coin,"
-    " with a 72 h confirm:\n"
+    " with a 72 h confirm, hard-off when funding turns negative:\n"
     '{"name": "carry-btc", "family": "crypto", "instrument":'
     ' "binance-usdm:btcusdt", "ref": "bybit-linear:BTCUSDT", "feature":'
     ' "apr24", "combine": "diff", "abs": true, "enter": 20.0, "exit":'
     ' 0.1, "confirm_feature": "apr72", "confirm": 10.0, "confirm_abs":'
     ' true, "confirm_pair": true, "group": 0, "min_hold_s": 28800,'
-    ' "max_hold_s": 864000, "horizon_ms": 3600000, "max_risk_usd":'
+    ' "max_hold_s": 864000, "regimes": ["fund:pos", "slow:level:normal|high"],'
+    ' "regime_off": "hard", "horizon_ms": 3600000, "max_risk_usd":'
     " 1400.0}\n"
+    "\n"
+    "WORKED EXAMPLE C — two VARIANTS of one signal on disjoint regions"
+    " (a bull-trend momentum row exits faster and sizes smaller in a"
+    " bear trend; the neutral trend is left unlabelled on purpose = no row):\n"
+    '{"name": "mom-eth-bull", "instrument": "okx:ETH-USDT-SWAP",'
+    ' "feature": "mid", "ref": "binance-usdm:ethusdt", "ref_feature":'
+    ' "roll_mean", "ref_window_min": 30, "combine": "diff_bps", "enter":'
+    ' 25.0, "exit": 5.0, "side": "bid", "regimes": ["trend:bull",'
+    ' "shape:trend"], "rel": "leading|inline", "horizon_ms": 300000,'
+    ' "max_risk_usd": 2000.0}\n'
+    '{"name": "mom-eth-bear", "instrument": "okx:ETH-USDT-SWAP",'
+    ' "feature": "mid", "ref": "binance-usdm:ethusdt", "ref_feature":'
+    ' "roll_mean", "ref_window_min": 30, "combine": "diff_bps", "enter":'
+    ' 25.0, "exit": 12.0, "side": "bid", "regimes": ["trend:bear",'
+    ' "shape:trend"], "regime_off": "hard", "horizon_ms": 300000,'
+    ' "max_risk_usd": 800.0}\n'
     "\n"
     "LEGACY v1 SUGAR (accepted, but strictly weaker — prefer v2): a row of"
     ' EXACTLY {"name", "family", "trigger", "sym", "side", "edge_bps",'
@@ -1045,6 +1173,32 @@ def _parse_row_v2(  # noqa: PLR0911, PLR0912, PLR0915
         out["max_hold_s"] = max_hold
     if min_hold > 0 and max_hold > 0 and max_hold <= min_hold:
         return None
+
+    # RG3 grammar v2.1: the regime keys (structural; rule 11 — duplicate
+    # dimensions, empty sets, the stored-tail law — is the validator's).
+    has_regimes = "regimes" in keys
+    if not has_regimes and {"regime_off", "rel"} & keys:
+        return None
+    if has_regimes:
+        regimes = obj.get("regimes")
+        if not isinstance(regimes, list) or not 1 <= len(regimes) <= REGIME_TERM_MAX:
+            return None
+        terms: list[str] = []
+        for term in typing.cast(list[object], regimes):
+            if not isinstance(term, str) or not regime_term_ok(term):
+                return None
+            terms.append(term)
+        out["regimes"] = terms
+        if "regime_off" in keys:
+            off = obj.get("regime_off")
+            if off not in REGIME_OFFS:
+                return None
+            out["regime_off"] = off
+        if "rel" in keys:
+            rel = obj.get("rel")
+            if not isinstance(rel, str) or not regime_rel_ok(rel):
+                return None
+            out["rel"] = rel
 
     horizon_ms = _int_field(obj.get("horizon_ms"), HORIZON_MS_MIN, HORIZON_MS_MAX)
     if horizon_ms is None:

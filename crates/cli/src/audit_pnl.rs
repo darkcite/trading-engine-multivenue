@@ -54,6 +54,17 @@
 //! position mark-out at last mids (`net = cash + Σ pos × mark`; paper
 //! charges no fees). Empty in every paper run today — reported
 //! honestly as zero.
+//!
+//! RG3 (`docs/regime-and-dashboard-plan.md` §4.8): the report gains an
+//! ADDITIVE `regime` section. The same `RegimeState` the engine runs
+//! replays over the window's ticks, the funding reference's prints
+//! (`<venue>-events.pmlr`) and the `SetRegime` frames of `ai-cmds.pmlr`
+//! ([`crate::backtest::regime`]); every intent is bucketed by the
+//! EFFECTIVE word of each profile at its emit instant into an
+//! independent fill-model replay per `(profile, word, strategy)`, and
+//! the minutes each word held are counted per profile. `--regime`
+//! follows the backtest's law (default artifact if usable, `off`,
+//! or a path); without a detector the section says `blind`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -61,19 +72,24 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Fill, OptSummary, Order, Price, Qty, Side, Tick, VenueId,
-    OPT_SUMMARY_FLAG_MARK_PX, SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, Price, Qty, Side, Tick,
+    VenueId, OPT_SUMMARY_FLAG_MARK_PX, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
 use crate::backtest::fill::{FillEngine, ModelOutcome, DAY_NS};
+use crate::backtest::regime::{
+    load_set_regime_frames, profile_name, word_string, RegimeMode, RegimeReplay,
+};
 use crate::backtest::{
     discover_runs, fmt_usd_1e6, parse_model_params, pmlr_version_accepted, HarnessError,
     ModelParams, RunDir, MIN_PMLR_VERSION, VENUE_LABELS, VIRT_T0,
 };
 use crate::options_manifest::{INSTRUMENT_MANIFEST_FILE, OPTIONS_MANIFEST_FILE};
 
-/// Report schema version (stdout JSON `audit_pnl_version`).
+/// Report schema version (stdout JSON `audit_pnl_version`). RG3 added
+/// the `regime` section ADDITIVELY — every pre-RG3 key is unchanged, so
+/// the version stays 1 (the nightly merge reads by key).
 pub const AUDIT_PNL_VERSION: u32 = 1;
 
 /// `Order.strategy_id` display names (strategy-set slot order; the
@@ -105,6 +121,11 @@ pub struct AuditPnlConfig {
     pub latency_ns_venue: Vec<String>,
     /// VT4: repeatable `--stale-after-ms <venue>:<ms>` overrides.
     pub stale_after_ms: Vec<String>,
+    /// RG3: `--regime` (the backtest's law, [`RegimeMode`]).
+    pub regime: RegimeMode,
+    /// RG3: `--regime-seed <path>` (default = the first run's own
+    /// `regime-seed.tsv`, else warm live).
+    pub regime_seed: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------
@@ -112,11 +133,14 @@ pub struct AuditPnlConfig {
 // ---------------------------------------------------------------
 
 /// Event class rank at equal ts (module docs: ticks fill before
-/// emits; commits flip before emits).
+/// emits; commits flip before emits; RG3: funding prints and regime
+/// declarations land between ticks and fills — the detector sees them
+/// before the intents of the same instant are bucketed).
 const CLASS_TICK: u8 = 0;
-const CLASS_FILL: u8 = 1;
-const CLASS_COMMIT: u8 = 2;
-const CLASS_ORDER: u8 = 3;
+const CLASS_REGIME: u8 = 1;
+const CLASS_FILL: u8 = 2;
+const CLASS_COMMIT: u8 = 3;
+const CLASS_ORDER: u8 = 4;
 
 #[derive(Copy, Clone, Debug)]
 enum Payload {
@@ -124,6 +148,10 @@ enum Payload {
     Order(Order),
     Fill(Fill),
     Commit([u8; 16]),
+    /// RG3: a Funding / AssetCtx print (sym dense) for the detector.
+    Funding(ChannelEvent),
+    /// RG3: a captured `SetRegime` frame.
+    Regime(AiCmd),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -317,6 +345,11 @@ struct RunLoad {
     opt_synth_ticks: u64,
     /// VT4: per-lane stale accounting (the harness re-judge).
     stale: [crate::backtest::stale::StaleStats; VENUE_LABELS.len()],
+    /// RG3: funding prints loaded, `SetRegime` frames loaded (clamped
+    /// ones included) and dropped as expired at the run's tick anchor.
+    funding_events: u64,
+    regime_cmds: u64,
+    regime_cmds_dropped: u64,
 }
 
 /// Load one run: every §9.9 input, syms rewritten to root-dense ids,
@@ -492,6 +525,57 @@ fn load_run_events(
         }
     }
 
+    // RG3: the regime detector's inputs — the anchor law stays "the
+    // run's first TICK": a funding print or a declaration stamped
+    // before it is clamped to it (a declaration keeps its remaining
+    // TTL; the backtest's loader applies the same clamp).
+    let tick_anchor = evs
+        .iter()
+        .filter(|e| e.class == CLASS_TICK)
+        .map(|e| e.ts_ns)
+        .min()
+        .unwrap_or(0);
+    for (lord_off, label) in VENUE_LABELS.iter().enumerate() {
+        let path = run.path.join(format!("{label}-events.pmlr"));
+        let Some(reader) = open_checked::<ChannelEvent>(&path, SlotKind::Event, run.epoch_ns)?
+        else {
+            continue;
+        };
+        for (i, e) in reader.records().iter().enumerate() {
+            let keep =
+                e.channel == ChannelId::Funding as u8 || e.channel == ChannelId::AssetCtx as u8;
+            if !keep || e.sym == SYMBOL_ID_NONE {
+                continue;
+            }
+            let mut ev = *e;
+            ev.sym = resolve(e.sym, interner, &mut load)?;
+            if ev.ts_ns < tick_anchor {
+                ev.ts_ns = tick_anchor;
+                load.clamped_pre_anchor += 1;
+            }
+            evs.push(Ev {
+                ts_ns: ev.ts_ns,
+                class: CLASS_REGIME,
+                lord: 100 + lord_off as u8,
+                idx: i as u64,
+                payload: Payload::Funding(ev),
+            });
+            load.funding_events += 1;
+        }
+    }
+    let (frames, dropped) = load_set_regime_frames(&run.path, run.epoch_ns, tick_anchor)?;
+    load.regime_cmds = frames.len() as u64;
+    load.regime_cmds_dropped = dropped;
+    for (i, c) in frames.into_iter().enumerate() {
+        evs.push(Ev {
+            ts_ns: c.ts_ns,
+            class: CLASS_REGIME,
+            lord: 252,
+            idx: i as u64,
+            payload: Payload::Regime(c),
+        });
+    }
+
     // §3.2 total order, extended: (ts, class, lord, idx) — unique by
     // construction, so sort_unstable stays deterministic.
     evs.sort_unstable_by_key(|e| (e.ts_ns, e.class, e.lord, e.idx));
@@ -537,8 +621,11 @@ fn load_and_merge_events(
                 0
             });
             let mut payload = e.payload;
-            if let Payload::Tick(ref mut t) = payload {
-                t.ts_ns = base + delta;
+            match payload {
+                Payload::Tick(ref mut t) => t.ts_ns = base + delta,
+                Payload::Funding(ref mut f) => f.ts_ns = base + delta,
+                Payload::Regime(ref mut c) => c.ts_ns = base + delta,
+                _ => {}
             }
             merged.push(MergedEv {
                 virt_ns: base + delta,
@@ -659,6 +746,26 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut active_hash: Option<[u8; 16]> = None;
     let mut vm_orders_no_hash: u64 = 0;
 
+    // RG3: the detector over the merged stream (descriptors resolve
+    // through the interner — a member the root never observed is
+    // dropped, as the backtest does) + one independent replay per
+    // (profile, effective word at emit, strategy).
+    let mut regime = {
+        let resolve = |d: &str| interner.by_desc.get(d).copied();
+        let default_seed = runs[0].path.join("regime-seed.tsv");
+        RegimeReplay::build(
+            &cfg.regime,
+            cfg.regime_seed.as_deref(),
+            Some(&default_seed),
+            &resolve,
+            merged[0].virt_ns,
+            merged[0].wall_ns,
+            report,
+        )?
+    };
+    let mut regime_engines: BTreeMap<(u8, u64, u8), FillEngine> = BTreeMap::new();
+    let mut regime_orders: BTreeMap<(u8, u64, u8), u64> = BTreeMap::new();
+
     // Paper view: signed cash flow + positions at last mids, no fees.
     let mut paper_qty: BTreeMap<u32, i64> = BTreeMap::new();
     let mut paper_cash_1e12: i128 = 0;
@@ -687,8 +794,14 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         }
         cur_day = Some(day);
 
+        if let Some(rg) = regime.as_mut() {
+            let _ = rg.on_time(ev.virt_ns);
+        }
         match &ev.payload {
             Payload::Tick(t) => {
+                if let Some(rg) = regime.as_mut() {
+                    rg.on_tick(t);
+                }
                 if t.bid_px.raw() > 0 && t.ask_px.raw() > 0 {
                     marks_1e6.insert(t.sym, t.mid().raw());
                 }
@@ -697,6 +810,19 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 }
                 for eng in vm_hash_engines.values_mut() {
                     eng.on_record(t, ev.virt_ns, ev.wall_ns, &mut scratch);
+                }
+                for eng in regime_engines.values_mut() {
+                    eng.on_record(t, ev.virt_ns, ev.wall_ns, &mut scratch);
+                }
+            }
+            Payload::Funding(f) => {
+                if let Some(rg) = regime.as_mut() {
+                    rg.on_event(f);
+                }
+            }
+            Payload::Regime(c) => {
+                if let Some(rg) = regime.as_mut() {
+                    let _ = rg.on_set_regime(c, ev.virt_ns);
                 }
             }
             Payload::Order(o) => {
@@ -713,6 +839,18 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                                 .intake(o, ev.virt_ns);
                         }
                         None => vm_orders_no_hash += 1,
+                    }
+                }
+                if let Some(rg) = regime.as_ref() {
+                    let mut p = 0u8;
+                    while (p as usize) < REGIME_PROFILES {
+                        let key = (p, rg.effective(p).0, o.strategy_id);
+                        regime_engines
+                            .entry(key)
+                            .or_insert_with(mk_engine)
+                            .intake(o, ev.virt_ns);
+                        *regime_orders.entry(key).or_insert(0) += 1;
+                        p += 1;
                     }
                 }
             }
@@ -800,6 +938,26 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
         vm_rows.push((hex, eng.finish()));
     }
+    // RG3: per (profile, word, strategy) rows — BTree order = profile,
+    // word bits, strategy id (deterministic).
+    let mut regime_rows: Vec<((u8, u64, u8), u64, ModelOutcome)> = Vec::new();
+    let regime_keys: Vec<(u8, u64, u8)> = regime_engines.keys().copied().collect();
+    for k in regime_keys {
+        let eng = regime_engines.get_mut(&k).expect("keyed");
+        let orders = *regime_orders.get(&k).unwrap_or(&0);
+        regime_rows.push((k, orders, eng.finish()));
+    }
+    let regime_minutes: Vec<((u8, u64), u64)> = regime
+        .as_ref()
+        .map(|r| r.minutes_by_word.iter().map(|(k, v)| (*k, *v)).collect())
+        .unwrap_or_default();
+    let regime_mode = if cfg.regime.is_off() {
+        "off"
+    } else if regime.is_some() {
+        "artifact"
+    } else {
+        "blind"
+    };
 
     // ---- human summary (stderr) ----
     let utc_days = (wall_last / DAY_NS) - day0 + 1;
@@ -874,6 +1032,39 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
              — counted in the slot-5 aggregate only"
         ));
     }
+    // RG3: the regime section — minutes per word per profile, then one
+    // line per (profile, word, strategy) with the same fee ladder.
+    report(&format!(
+        "audit-pnl: regime mode={regime_mode} minutes_judged={} declared={} funding_events={} \
+         set_regime_frames={} (expired-at-anchor {})",
+        regime.as_ref().map(|r| r.minutes_judged()).unwrap_or(0),
+        regime.as_ref().map(|r| r.declared_applied).unwrap_or(0),
+        loads.iter().map(|l| l.funding_events).sum::<u64>(),
+        loads.iter().map(|l| l.regime_cmds).sum::<u64>(),
+        loads.iter().map(|l| l.regime_cmds_dropped).sum::<u64>(),
+    ));
+    for ((p, w), m) in &regime_minutes {
+        report(&format!(
+            "audit-pnl: regime {} [{}] minutes={m}",
+            profile_name(*p),
+            word_string(core_types::RegimeWord(*w))
+        ));
+    }
+    for ((p, w, sid), orders, o) in &regime_rows {
+        report(&format!(
+            "audit-pnl: regime {} [{}] strategy {sid} ({}): orders={orders} fills={} trades={} \
+             net={} | ladder 0={} 1={} 2={}",
+            profile_name(*p),
+            word_string(core_types::RegimeWord(*w)),
+            strategy_label(*sid),
+            o.fills_total,
+            o.oos_trades,
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_1e12)),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[0])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[1])),
+            fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[2])),
+        ));
+    }
 
     // ---- stdout JSON (one line, hand-rendered, deterministic) ----
     let mut json = String::new();
@@ -941,6 +1132,85 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             fmt_usd_1e6(usd_1e12_to_1e6_ceil(o.oos_max_dd_1e12)),
         ));
     }
-    json.push_str(&format!("],\"vm_orders_no_hash\":{vm_orders_no_hash}}}"));
+    json.push_str(&format!("],\"vm_orders_no_hash\":{vm_orders_no_hash}"));
+    // RG3: the additive `regime` section.
+    let artifact_hex: String = regime
+        .as_ref()
+        .map(|r| r.hash.iter().map(|b| format!("{b:02x}")).collect())
+        .unwrap_or_default();
+    json.push_str(&format!(
+        ",\"regime\":{{\"mode\":\"{regime_mode}\",\"artifact_sha256\":\"{artifact_hex}\",\
+         \"seed_rows\":{},\"minutes_judged\":{},\"declared_applied\":{},\"funding_events\":{},\
+         \"set_regime_frames\":{},\"set_regime_expired\":{},\"profiles\":[",
+        regime.as_ref().map(|r| r.seed_rows).unwrap_or(0),
+        regime.as_ref().map(|r| r.minutes_judged()).unwrap_or(0),
+        regime.as_ref().map(|r| r.declared_applied).unwrap_or(0),
+        loads.iter().map(|l| l.funding_events).sum::<u64>(),
+        loads.iter().map(|l| l.regime_cmds).sum::<u64>(),
+        loads.iter().map(|l| l.regime_cmds_dropped).sum::<u64>(),
+    ));
+    let mut p = 0u8;
+    while (p as usize) < REGIME_PROFILES {
+        if p > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"profile\":\"{}\",\"words\":[",
+            profile_name(p)
+        ));
+        // Every word seen on this profile: judged minutes ∪ emit words.
+        let mut words: Vec<u64> = regime_minutes
+            .iter()
+            .filter(|((pp, _), _)| *pp == p)
+            .map(|((_, w), _)| *w)
+            .chain(
+                regime_rows
+                    .iter()
+                    .filter(|((pp, _, _), _, _)| *pp == p)
+                    .map(|((_, w, _), _, _)| *w),
+            )
+            .collect();
+        words.sort_unstable();
+        words.dedup();
+        for (wi, w) in words.iter().enumerate() {
+            if wi > 0 {
+                json.push(',');
+            }
+            let minutes = regime_minutes
+                .iter()
+                .find(|((pp, ww), _)| *pp == p && ww == w)
+                .map(|(_, m)| *m)
+                .unwrap_or(0);
+            json.push_str(&format!(
+                "{{\"word\":\"{}\",\"bits\":\"{w:016x}\",\"minutes\":{minutes},\"strategies\":[",
+                word_string(core_types::RegimeWord(*w))
+            ));
+            let mut first = true;
+            for ((pp, ww, sid), orders, o) in &regime_rows {
+                if *pp != p || ww != w {
+                    continue;
+                }
+                if !first {
+                    json.push(',');
+                }
+                first = false;
+                json.push_str(&format!(
+                    "{{\"strategy_id\":{sid},\"label\":\"{}\",\"orders\":{orders},\"fills\":{},\
+                     \"trades\":{},\"net_usd\":\"{}\",\"fee_ladder_net_usd\":[\"{}\",\"{}\",\"{}\"]}}",
+                    strategy_label(*sid),
+                    o.fills_total,
+                    o.oos_trades,
+                    fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_1e12)),
+                    fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[0])),
+                    fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[1])),
+                    fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[2])),
+                ));
+            }
+            json.push_str("]}");
+        }
+        json.push_str("]}");
+        p += 1;
+    }
+    json.push_str("]}}");
     Ok(json)
 }

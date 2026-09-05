@@ -369,6 +369,105 @@ def test_parse_proposal_v2_row_malformed(row: dict[str, object]) -> None:
     assert claude_worker.strategist.parse_proposal(_proposal_json([row])) is None
 
 
+# ---- RG3: grammar v2.1 regime keys (strategist-v3) -----------------------
+
+
+def test_static_block_v3_teaches_the_regime_keys_and_variants() -> None:
+    assert claude_worker.strategist.STRATEGIST_PROMPT_VERSION == "strategist-v3"
+    text = typing.cast(str, claude_worker.strategist.system_blocks()[0]["text"])
+    for needle in ('"regimes"', '"regime_off"', '"rel"', "REGIME LAW", "GATE, never a signal",
+                   "exits", "NEVER gated", "VARIANTS", "DISJOINT", "--regime off",
+                   "trend:bull", '"soft"', '"hard"', "lagging|inline|leading",
+                   "WORKED EXAMPLE C"):
+        assert needle in text, f"static block is missing {needle!r}"
+    for dim, values in claude_worker.strategist._REGIME_DIM_VALUES.items():  # noqa: SLF001
+        assert dim in text
+        for v in values:
+            assert v in text, f"static block never names {dim}:{v}"
+    # The worked examples parse under the mirror (a prompt that teaches an
+    # unparseable row would be a lie).
+    for example in (
+        {"name": "xv-btc-okx-bn", "family": "crypto", "instrument": "okx:BTC-USDT",
+         "ref": "binance:btcusdt", "feature": "mid", "combine": "diff_bps", "abs": True,
+         "enter": 3.0, "regimes": ["vol:!high", "slow:shape:chop|mixed"],
+         "horizon_ms": 60000, "max_risk_usd": 3000.0},
+        {"name": "mom-eth-bull", "instrument": "okx:ETH-USDT-SWAP", "feature": "mid",
+         "ref": "binance-usdm:ethusdt", "ref_feature": "roll_mean", "ref_window_min": 30,
+         "combine": "diff_bps", "enter": 25.0, "exit": 5.0, "side": "bid",
+         "regimes": ["trend:bull", "shape:trend"], "rel": "leading|inline",
+         "horizon_ms": 300000, "max_risk_usd": 2000.0},
+    ):
+        assert claude_worker.strategist.parse_proposal(_proposal_json([example])) is not None, example
+
+
+def test_parse_proposal_v3_regime_keys_round_trip_in_canonical_order() -> None:
+    row = _v2(regimes=["trend:bull|neutral", "slow:vol:!high"], regime_off="hard", rel="lagging|inline")
+    proposal = claude_worker.strategist.parse_proposal(_proposal_json([row]))
+    assert proposal is not None
+    out = proposal.rows[0]
+    assert out["regimes"] == ["trend:bull|neutral", "slow:vol:!high"]
+    assert out["regime_off"] == "hard"
+    assert out["rel"] == "lagging|inline"
+    assert list(out) == [
+        "name", "family", "instrument", "ref", "feature", "combine", "abs", "enter", "exit",
+        "regimes", "regime_off", "rel", "horizon_ms", "max_risk_usd",
+    ], "the regime keys sit before horizon_ms in the canonical emission"
+    # Unlabelled rows still parse (legacy artifacts) — the prompt asks,
+    # the validator does not require.
+    assert claude_worker.strategist.parse_proposal(_proposal_json([_v2()])) is not None
+
+
+@pytest.mark.parametrize(
+    "term,ok",
+    [
+        ("trend:bull", True),
+        ("fast:trend:bull|neutral", True),
+        ("slow:vol:!high", True),
+        ("stretch:*", True),
+        ("source:measured|declared", True),
+        ("vol:low|unknown", True),
+        ("rel:lagging|inline", True),
+        ("slow:rel:leading", True),
+        ("", False),
+        ("trend", False),
+        ("trend:", False),
+        ("trend:sideways", False),
+        ("mood:happy", False),
+        ("medium:trend:bull", False),
+        ("trend:bull|", False),
+        ("rel:unknown", False),
+        ("source:unknown|nope", False),
+        ("fast:", False),
+        ("a:b:c:d", False),
+        ("x" * 65, False),
+    ],
+)
+def test_regime_term_structural_mirror(term: str, ok: bool) -> None:
+    assert claude_worker.strategist.regime_term_ok(term) is ok
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _v2(regimes=[]),  # empty list
+        _v2(regimes="trend:bull"),  # not a list
+        _v2(regimes=[1]),  # not a string
+        _v2(regimes=["trend:sideways"]),  # unknown value
+        _v2(regimes=["mood:happy"]),  # unknown dimension
+        _v2(regimes=["trend:bull"] * 17),  # more terms than (profile, dim) pairs
+        _v2(regime_off="soft"),  # off without regimes
+        _v2(rel="lagging"),  # rel without regimes
+        _v2(regimes=["trend:bull"], regime_off="maybe"),
+        _v2(regimes=["trend:bull"], rel="rel:lagging"),  # the array form, not the sugar
+        _v2(regimes=["trend:bull"], rel="sideways"),
+        _v2(regimes=["trend:bull"], rel="fast:"),
+        _v2(regimes=["trend:bull"], rel=7),
+    ],
+)
+def test_parse_proposal_v3_regime_keys_malformed(row: dict[str, object]) -> None:
+    assert claude_worker.strategist.parse_proposal(_proposal_json([row])) is None
+
+
 def test_parse_proposal_v2_mirrors_the_live_artifacts() -> None:
     """The strongest check available offline: every row shape the engine
     validator has actually ADMITTED must survive this mirror. These are

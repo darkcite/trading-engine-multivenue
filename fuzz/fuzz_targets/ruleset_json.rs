@@ -10,10 +10,14 @@
 //! Two passes per input:
 //! * wrong-hash — exercises the rule-1 identity reject;
 //! * honest-hash (sha256 of the input) — carries every input past
-//!   rule 1 into the full rule 2–10 scanner (VM2 V4: both grammar
+//!   rule 1 into the full rule 2–11 scanner (VM2 V4: both grammar
 //!   arms — the corpus carries v1 AND v2 row shapes; descriptors
 //!   resolve against a small fixed table so the v2 arm's resolution
-//!   and capability checks are fuzz-reachable).
+//!   and capability checks are fuzz-reachable; RG3: the grammar v2.1
+//!   regime keys `regimes` / `regime_off` / `rel` — the label-term
+//!   scanner, the `RegimeLabelBuilder` fold, rule 11 and the rule-8
+//!   intersection law — reached through the local corpus seeds
+//!   `rg3-seed-*`, which the fuzzer mutates like every other input).
 
 #![no_main]
 

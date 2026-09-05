@@ -3860,6 +3860,251 @@ fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
     assert_eq!(bytes, 0, "icdp on_tick bytes should be zero: saw {bytes}");
 }
 
+/// RG3 gate 42 (`docs/regime-and-dashboard-plan.md` §7): the vm's row
+/// regime gate — a full 256-row table of LABELLED rows (bull / bear /
+/// `rel:` variants over one signal, hard and soft off) under a tick
+/// storm interleaved with view changes (`set_regime_view` re-judging
+/// every row, REL probes included) — allocates nothing after the
+/// commit. Covers the blocked-entry branch, the open-entry emit, the
+/// hard-exit flatten of position rows and the re-judge itself.
+#[test]
+fn vm_regime_gate_and_view_rejudge_are_zero_alloc() {
+    use core_regime::RegimeView;
+    use core_types::regime::{
+        RegimeLabelBuilder, FUND_POS, LEVEL_NORMAL, REL_LAGGING, REL_LEADING, SHAPE_TREND,
+        SOURCE_MEASURED, STRETCH_NEUTRAL, TREND_BEAR, TREND_BULL, VOL_NORMAL,
+    };
+    use core_types::{
+        CombineOp, FeatId, RegimeTerm, RegimeWord, RuleRow, RuleRowV2, FEAT_NONE, GROUP_NONE,
+        REGIME_OFF_HARD, REGIME_OFF_SOFT, ROW_FLAG_POSITION,
+    };
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_vm::VmStrategy;
+
+    struct RingCtx {
+        prod: core_ring::Producer<core_types::Order, 4096>,
+        now: u64,
+    }
+    impl Ctx for RingCtx {
+        fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
+            self.prod.try_push(order).map_err(|_| SubmitErr::RingFull)
+        }
+        fn now_ns(&self) -> core_time::NsTs {
+            self.now
+        }
+    }
+
+    const REF_SYM: u32 = 1_000;
+    let term = |strs: &[&str]| -> RegimeTerm {
+        let mut b = RegimeLabelBuilder::new();
+        for s in strs {
+            b.add(s.as_bytes()).expect("term");
+        }
+        b.finish()
+    };
+    let bull = term(&["trend:bull"]);
+    let bear = term(&["trend:bear"]);
+    let lag = term(&["rel:lagging"]);
+
+    // 256 rows: syms 1..=128 carry refire level-breach rows labelled
+    // bull / bear / rel-lagging (round robin); syms 129..=256 carry
+    // POSITION cross-deviation rows vs REF_SYM labelled bull (hard) /
+    // bear (soft) — the flatten path runs when the view turns.
+    let mut table = Box::new(core_types::RuleTableV2::EMPTY);
+    for k in 0..128u32 {
+        let base = RuleRowV2::from_v1(&RuleRow::new(
+            k + 1,
+            core_types::SYMBOL_ID_NONE,
+            0,
+            10,
+            500_000,
+            1_000_000,
+            k as u64,
+            RuleRow::TRIGGER_LEVEL_BREACH,
+            0,
+            0,
+        ));
+        let t = match k % 3 {
+            0 => bull,
+            1 => bear,
+            _ => lag,
+        };
+        table.rows[k as usize] = base.with_regime(t, REGIME_OFF_SOFT);
+    }
+    for k in 0..128u32 {
+        let row = RuleRowV2::new(
+            ROW_FLAG_POSITION,
+            RuleRow::SIDE_BOTH,
+            GROUP_NONE,
+            FeatId::Mid,
+            FeatId::Mid,
+            FEAT_NONE,
+            CombineOp::DiffBps,
+            129 + k,
+            REF_SYM,
+            0,
+            0,
+            0,
+            core_types::CMP_ENTRY_ABS,
+            400_000_000_000,
+            100_000_000_000,
+            0,
+            0,
+            10,
+            0,
+            1_000_000,
+            (128 + k) as u64,
+            0,
+            0,
+        );
+        let (t, off) = if k % 2 == 0 {
+            (bull, REGIME_OFF_HARD)
+        } else {
+            (bear, REGIME_OFF_SOFT)
+        };
+        table.rows[(128 + k) as usize] = row.with_regime(t, off);
+    }
+    table.len = core_types::RULE_TABLE_ROWS as u32;
+    table.epoch = 1;
+    table.hash128 = [0x42; 16];
+
+    let ring: std::sync::Arc<Ring<core_types::Order, 4096>> = Ring::new();
+    let (prod, mut cons) = ring.split();
+    let mut vm: Box<VmStrategy> = Box::new(VmStrategy::new());
+    let mut ctx = RingCtx {
+        prod,
+        now: 1_000_000_000,
+    };
+    vm.on_start(&mut ctx).unwrap();
+    vm.receive_table_v2(&table);
+    let commit = core_types::AiCmd::new(
+        1,
+        1,
+        core_types::SYMBOL_ID_NONE,
+        i64::from_le_bytes([0x42; 8]),
+        i64::from_le_bytes([0x42; 8]),
+        0,
+        core_types::AiCmdKind::RulesetCommit,
+        VenueId::Ai,
+        core_types::STRATEGY_SLOT_VM,
+        core_types::AI_SIDE_NONE,
+        0,
+        0,
+    );
+    vm.on_ai(&commit, &mut ctx);
+    assert_eq!(vm.rows_active(), 256);
+
+    // Two views: bull with every sym LAGGING, bear with every sym
+    // LEADING — the storm alternates them so both variants open and
+    // close, and the REL probe walks all 32 slots.
+    let word = |trend: u8| {
+        RegimeWord::from_values(
+            trend,
+            SHAPE_TREND,
+            VOL_NORMAL,
+            FUND_POS,
+            LEVEL_NORMAL,
+            STRETCH_NEUTRAL,
+            SOURCE_MEASURED,
+        )
+    };
+    let view = |trend: u8, rel: u8| {
+        let mut v = RegimeView::UNKNOWN;
+        v.configured = 1;
+        v.effective[0] = word(trend);
+        v.effective[1] = word(trend);
+        v.n_syms = 32;
+        let mut s = 0usize;
+        while s < 32 {
+            // slot 0 = the "ref" (never REL-judged); slots 1..32 = syms
+            // 1..=31 — the rest of the table's syms are non-members
+            // (REL unknown ⇒ their `rel:` rows stay closed: fail-closed).
+            v.syms[s] = if s == 0 { REF_SYM } else { s as u32 };
+            v.rel[0][s] = rel;
+            v.rel[1][s] = rel;
+            s += 1;
+        }
+        v
+    };
+    let views = [view(TREND_BULL, REL_LAGGING), view(TREND_BEAR, REL_LEADING)];
+
+    fn storm_tick(i: u32) -> Tick {
+        let phase = i % 258;
+        let (sym, bid, ask) = if phase < 128 {
+            (phase + 1, 470_000, 490_000) // ask ≤ 0.50 ⇒ Bid fire
+        } else if phase < 256 {
+            (phase + 1, 690_000, 710_000) // +4000 bps vs ref ⇒ enter
+        } else if phase == 256 {
+            (REF_SYM, 490_000, 510_000)
+        } else {
+            (5_000, 400_000, 420_000) // irrelevant sym
+        };
+        Tick::new(
+            0,
+            VenueId::Polymarket,
+            sym,
+            i + 1,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        )
+    }
+
+    // Prewarm: two full cycles under both views.
+    let mut i = 0u32;
+    while i < 2 * 258 {
+        if i % 258 == 0 {
+            vm.set_regime_view(&views[((i / 258) % 2) as usize]);
+        }
+        vm.on_tick(&storm_tick(i), &mut ctx);
+        ctx.now += 1_000_000;
+        while let Some(o) = cons.try_pop() {
+            std::hint::black_box(o.client_oid);
+        }
+        i += 1;
+    }
+    let warm_blocked = vm.regime_blocked;
+    let warm_hard = vm.regime_hard_exits;
+    let warm_emitted = vm.orders_emitted;
+    assert!(
+        warm_blocked > 0 && warm_emitted > 0,
+        "prewarm must gate and emit"
+    );
+
+    let g = AllocGuard::new();
+    while i < 2 * 258 + 20 * 258 {
+        if i % 258 == 0 {
+            // A view change every cycle: re-judge all 256 rows.
+            vm.set_regime_view(&views[((i / 258) % 2) as usize]);
+        }
+        vm.on_tick(&storm_tick(i), &mut ctx);
+        ctx.now += 1_000_000;
+        while let Some(o) = cons.try_pop() {
+            std::hint::black_box(o.client_oid);
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(
+        vm.regime_blocked > warm_blocked,
+        "the storm keeps blocking closed rows"
+    );
+    assert!(
+        vm.regime_hard_exits > warm_hard,
+        "the view flips keep flattening hard rows"
+    );
+    assert!(
+        vm.orders_emitted > warm_emitted,
+        "open variants keep emitting"
+    );
+    assert_eq!(
+        allocs, 0,
+        "vm regime gate / re-judge allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "vm regime gate bytes should be zero: saw {bytes}");
+}
+
 /// RG1 gate 41 (`docs/regime-and-dashboard-plan.md` §7): the regime
 /// evaluator's hot path — `on_tick` for members and non-members, the
 /// 1 s timer including several minute rolls (ring write + the full
