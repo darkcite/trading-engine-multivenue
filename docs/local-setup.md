@@ -308,3 +308,109 @@ Operational laws:
   iteration first reported a non-zero delta.
 - **Engine can't read `.env`**: confirm `chmod 600 .env` and that the
   process's cwd is the project root.
+
+## Object-storage archive (optional cold tier)
+
+A second copy of closed capture runs in S3-compatible object storage, so that
+`retention.sh` can reclaim disk without destroying the only input the ≤ 2 h
+window gates have. **Entirely outside the engine**: no Rust, no new dependency,
+no engine flag, no restart. Absent configuration = absent behaviour.
+
+### 1. Credentials
+
+Create a bucket and an access key pair in the provider's console, then:
+
+```sh
+cp s3.env.example ~/multivenue/s3.env
+chmod 600 ~/multivenue/s3.env
+$EDITOR ~/multivenue/s3.env      # bucket, endpoint, region, host_id, key pair
+```
+
+`MULTIVENUE_S3_HOST_ID` is **required and explicit** — never derived from the
+machine name, because macOS renames `LocalHostName` on conflict and that would
+silently split the archive in two.
+
+Only the Python loader reads this file; no shell script sources it, and no
+value ever reaches argv, a log line, a manifest or a URL. It is deliberately
+NOT `.env`: `engine-wrapper.sh` sources that with `set -a`, which would put the
+archive credential into the engine's environment for no reason.
+
+### 2. Check it, then fill the bucket
+
+```sh
+cd claude-worker && uv sync && cd ..           # installs `multivenue-archive`
+uv run --project claude-worker multivenue-archive status
+```
+
+Backfill by hand before switching retention over — the daily cycle is sized for
+one day's capture, not for a backlog:
+
+```sh
+taskpolicy -b nice -n 19 ~/multivenue/venv/bin/python3 \
+  scripts/archive-run.py push-pending --budget-s 7000
+```
+
+Repeat until it reports nothing pending. Each invocation is bounded to ≤ 2 h of
+wall time; it resumes exactly where the last one stopped, because a run with no
+index object is invisible to every reader. **Run it through
+`scripts/archive-run.py`, never `python -m claude_worker.archive`**: every
+worker lane's overlap guard is `pgrep -f 'claude[-_]worke[r]'`, and the boot
+recommit gives up after five minutes of it, leaving `vm_rows_active 0`.
+
+Verify one run round-trips before trusting the lane with deletion:
+
+```sh
+uv run --project claude-worker multivenue-archive verify <run-id> --deep
+```
+
+### 3. Turn on the daily cycle (stage A)
+
+Render and bootstrap the ONE new agent — do **not** re-run
+`scripts/install-launchd.sh`, which reinstalls every label and restarts the
+engine:
+
+```sh
+sed -e "s|@REPO@|$PWD|g" -e "s|@HOME@|$HOME|g" \
+  launchd/com.multivenue.archive.plist > ~/Library/LaunchAgents/com.multivenue.archive.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.multivenue.archive.plist
+```
+
+It runs at 04:30 local — far from every restart slot — and is an honest no-op
+until `ARCHIVE_MODE=s3` is set. Log: `~/multivenue/logs/launchd/archive.log`.
+
+### 4. Turn on verify-gated deletion (stage B)
+
+Only after the backfill is complete, and on a day with no other change in the
+restart lane, add to `~/multivenue/retention.conf`:
+
+```sh
+ARCHIVE_MODE="s3"
+S3_CYCLE_BUDGET_S=600
+```
+
+Retention then deletes a run **only** after `verify` exits 0 — index object
+present, manifest byte-identical to the index, every object `HEAD`ing with the
+recorded size and ETag. An unverified run is kept and the sweep stops there.
+If the archiver is not installed, retention falls back to `compress`: the
+failure mode is always "keep the data".
+
+### Rollback
+
+`ARCHIVE_MODE="compress"` in `retention.conf`, or `MULTIVENUE_S3_ENABLED=0` in
+`~/multivenue/s3.env`. Effective at the next tick — no restart, no rebuild, no
+cache invalidation. Bucket objects remain: nothing in this subsystem deletes a
+completed object, and the client has no `delete_object` verb at all.
+`launchctl bootout gui/$UID/com.multivenue.archive` removes the agent.
+
+### Reading data back
+
+Any consumer that takes a run-dir path keeps taking one. `multivenue-archive
+list --json` prints one row per archived run including `windows_2h_complete`,
+so a pool can be planned before a byte is pulled; `pull <run-id>` materialises
+one into the cache, verifying every file's sha256 after decompression. The
+cache is disposable — the bucket holds everything in it.
+
+**Free space matters twice.** Pulls refuse below `MULTIVENUE_S3_CACHE_MIN_FREE_GIB`
+(keep it equal to retention's `MIN_FREE_GIB`), and the cache is capped by
+`MULTIVENUE_S3_CACHE_MAX_GIB` with LRU eviction. The volume ENOSPC-wedged every
+capture lane once, and writers do not retry after ENOSPC.

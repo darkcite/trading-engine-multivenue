@@ -33,6 +33,7 @@ the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
 | `research-tools-exclusion-plan.md` | research one-shots exclusion policy | archived 2026-09-02 (operator order); **REMAINS the owning authority doc for the `tools_` class** (Makefile naming-rule owner) |
 | `architecture.md` + `architecture.svg` | one-page architecture orientation | archived 2026-09-02 (operator order); last actualized 2026-08-29 |
 | `options-support-plan.md` | Phase 9+ options-execution candidate | archived 2026-09-02 (operator order); P&L-gated, never scheduled |
+| `s3-archive-plan.md` | object-storage archive lane S0–S7 (cold tier for capture) | CLOSED 2026-09-05; **its S-LAWs REMAIN the standing authority for that subsystem** — index-object-last, verify-before-delete, no `delete_object`, ≤ 2 h law unchanged. §16 carries the S0 measurements and the open operator items (versioning/lifecycle, credential rotation, throughput) |
 
 Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02). In-tree doc
 comments and older docs cite pre-move paths (`docs/phase-8-plan.md`,

@@ -6,6 +6,54 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-05 — `archive_manifest_version: 1` (object-storage archive)
+
+**What changed**
+- A new on-disk/on-bucket schema: `_manifest.json` under each archived run
+  prefix, and a byte-identical copy at `v1/index/<host_id>/<run>.json`.
+  Top-level keys: `archive_manifest_version, run, epoch_ns, host_id,
+  uploaded_at_ns, tool_version, stored_encoding, zstd_level, files, totals,
+  span_ns, pmlr_version, windows_2h_complete, catalog, catalog_note`
+  (+ `catalog_error` when the catalog could not be produced).
+- New optional config namespace `MULTIVENUE_S3_*`, read ONLY by
+  `claude_worker.archive_config`, from `~/multivenue/s3.env` (template:
+  `s3.env.example`). Not in `.env`: `engine-wrapper.sh` sources that with
+  `set -a`, and the archive credential has no business in the engine's
+  environment.
+- `~/multivenue/retention.conf` gains `ARCHIVE_MODE=s3` and
+  `S3_CYCLE_BUDGET_S`.
+- `claude-worker/pyproject.toml` gains a SECOND console script,
+  `multivenue-archive`. `dependencies` is unchanged — the S3 client is
+  handwritten SigV4 over `hmac`/`hashlib`/`httpx`, so no cloud SDK enters
+  either dependency graph.
+
+**Why**
+- Capture was single-copy on one Mac, and `retention.sh` deleted the oldest
+  runs under disk pressure with nothing ever reading the tarballs it made.
+  Every research gate is stated in ≤ 2 h windows that already exist, so
+  deleting capture deletes the only input those gates have.
+
+**Impact**
+- **No engine change of any kind.** No Rust file, no `Cargo.toml`, no new
+  engine flag or env key; `target/release/multivenue-engine` is not relinked
+  and needs no restart. The PMLR wire format is untouched.
+- **Absent config = absent behaviour.** With `MULTIVENUE_S3_ENABLED` unset,
+  no HTTP client is constructed, the resolver reports every run as local or
+  absent, `retention.sh` uses `compress` exactly as before, and the nightly
+  report has no `data_source` key.
+- Pulled runs are byte-identical to the originals (file names preserved;
+  `.zst` is only the storage encoding), so `discover_runs`, `run_dirs`,
+  `select_runs` and `window_root.cut_run` behave identically on them.
+- Rollback is one line in `retention.conf` (`ARCHIVE_MODE=compress`) or
+  `MULTIVENUE_S3_ENABLED=0`; effective at the next tick, no restart, no data
+  movement. Bucket objects are never deleted by this subsystem.
+
+**Layout versioning**
+- The bucket prefix `v1/` IS the layout version. A layout change is a new
+  prefix, never an in-place rewrite. `epoch_ns` is the partition key so that
+  lexicographic `ListObjectsV2` order is chronological order — do not insert
+  `YYYY/MM/DD` levels, which would break it.
+
 ## Template
 
 ```
