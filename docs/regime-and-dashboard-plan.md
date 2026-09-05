@@ -5,9 +5,11 @@
 live smoke PASSED 2026-09-05 (§12); RG4 code-complete 2026-09-05
 (uncommitted — §12); RG6 committed (`ef75c91`, 2026-09-05 — engine
 `/state` + TUI + the worker page on 9292, all LIVE; §12 last entry).
-Next: the RG6 close ruling (§7 exit tell met: page live on 9292 showing
-regime, mask, rows, P&L, recent fills), then RG7 restated as N ≤ 2 h
-windows; §11 defaults apply until overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
+RG6 CLOSED by operator ruling 2026-09-05 (§7 exit tell met: page live on
+9292 showing regime, mask, rows, P&L, recent fills). RG7 restated under
+the ≤ 2 h law (§7.1) and OPEN: the soak = N pooled ≤ 2 h windows with
+regime gating live, judged by `regime soak`; §11 defaults apply until
+overridden.** Pre-Stage-3 work by operator ruling ("before going to stage 3 we
 need to implement the following"). Paper mode only; no
 dispatcher/signer/RiskGate/live-ramp work — the Stage-3 ENTRY GATE
 (`docs/arch/mvp-completion-plan.md` §7) is untouched. Owner doc for the
@@ -818,11 +820,58 @@ on operator ask, no push.
 | **RG4** library + composer | `state.db` tables (schema migration additive), `library` + `compose` lanes, `import-catalog` of today's rulesets/candidates, `compositions` link, ai-session §4 steps 0a–0c + the pinned test extended | pytest: import preserves every hash + thesis; compose selects the neighbourhood, respects caps, is idempotent (same inputs ⇒ same hash), promotes only on hash change; gate runs on pooled windows only (N ≥ 4, each ≤ 2 h, LOWO) | first composed table committed live from ≥ 2 members |
 | **RG5** worker regime lane | `regime` lane (report / percentiles → `regime.toml` / seed / declare / history), `regime-cycle.sh` + plist, `serve` `_REGIME` phase + digest/prompt sections (SDK mocked), intent-lane `regime_allows()`, `pnl_report` per-regime merge | pytest for each lane; declared re-push after a simulated boot; serve cycle test with the mock; day report shows per-regime rows | `pnl-<day>.json` carries `regimes` for a live day |
 | **RG6** dashboard | `EngineSnapshot` + 1 s publish + `/state` writer; TUI panels; worker `dashboard` module + HTML + plist | `/state` encode test (fixed snapshot ⇒ byte-exact JSON, fits the buffer); server thread 0 alloc (bench); pytest for `/api/worker` shape; a manual live check of every panel populated (screenshot in the vault) | page live on 9292 showing regime, mask, rows, P&L, recent fills |
-| **RG7** soak + close | 5 paper days with regime gating live (coincides with ICDP G2); flip bound (≤ `flips_max`/day per dim, default 24); per-regime P&L in 5 nightly reports; docs: `CLAUDE.md` CURRENT STATE, `ai-strategy-pipeline.md` (+svg), `research-universe.md`, `local-setup.md`, `risk-policy.md` cross-ref; close entry in §12 | stay-greens recorded | operator ruling |
+| **RG7** soak + close (RESTATED 2026-09-05 under the ≤ 2 h law — §7.1; the original "5 paper days / per day / 5 nightly reports" wording is VOID) | the soak = **N ≥ 8 complete ≤ 2 h windows** with regime gating LIVE (detector configured + a labelled table active), pooled from runs that already exist (single-run pools admissible — never a wait); per-window flip bound (≤ `FLIPS_MAX_PER_WINDOW` = 2 per market dimension per profile per window — the old 24/day rate restated for 2 h); per-regime P&L present in the nightly reports covering the pooled windows; the seed-hole fix (candles tail refreshed before `seed-out`); docs: `CLAUDE.md` CURRENT STATE, `ai-strategy-pipeline.md` (+svg), `research-universe.md`, `local-setup.md`, `risk-policy.md` cross-ref; close entry in §12 | `python -m claude_worker.regime soak` (the judge: history samples + the engine's own flip counters per window; pytest); stay-greens recorded | `soak` verdict PASS on N ≥ 8 windows + operator ruling |
 
 Dependency order: RG0 → RG1 → RG2 → {RG3, RG5} → RG4 → RG6 → RG7. RG6's
 engine half can start after RG2. Estimated size: RG0–RG2 ≈ the ICDP
 I1–I5 footprint; RG4–RG6 mostly Python.
+
+### 7.1 RG7 under the ≤ 2 h law (restated 2026-09-05)
+
+Operator law (2026-09-05, verbatim): *"in any scenario any test time /
+soak time / protect time MUST NOT EVER BE MORE THAN 2 hours."* A soak
+is therefore never a calendar span. It is a COUNT of disjoint, complete,
+≤ 2 h windows that already exist, judged together:
+
+- **Window.** One `≤ 2 h` `ts_ns` slice of one run (the RG4 pool law:
+  `~/multivenue/worker/windows/`, newest K = 8 complete v3 cuts,
+  count-pruned). A window counts for RG7 only if regime gating was LIVE
+  through it: the engine's detector configured (`regime_configured 1`,
+  seed applied) AND a labelled table active (`vm_rows_active ≥ 1` with
+  regime masks) — i.e. windows cut from runs after the RG5 live smoke
+  (2026-09-05 ≈ 05:11Z) and the RG6 restart (08:02Z).
+- **N.** `N ≥ 8` windows (the pool size). Fewer = the verdict is
+  `INSUFFICIENT`, never a wait — the next lane cut adds windows as the
+  engine keeps running.
+- **Flip bound per window.** For each profile × market dimension
+  (trend, shape, vol, fund, level, stretch): flips inside the window ≤
+  `FLIPS_MAX_PER_WINDOW` = 2 (the old "24/day" restated: 24 × 2 h / 24 h).
+  Source of truth = the engine's own cumulative
+  `engine_regime_<p>_flips_<dim>_total` counters, sampled every 5 min
+  into the regime history by `com.multivenue.regime` (RG7 extends the
+  history entry with the engine's `/state` regime block: flips,
+  `minutes_judged`, effective words, pid); the per-window count is the
+  counter delta between the last sample at/after the window's start
+  and the last sample before its end, valid only when the pid is
+  unchanged inside the window (a restart resets the counters; such a
+  window is judged from the worker's 5-min mirror — word changes at
+  5-min resolution — and marked `mirror`).
+- **Coverage.** ≥ 20 history samples inside the window (24 nominal).
+- **Per-regime P&L.** The nightly report of each window's UTC day
+  (`pnl-<day>.json`) carries the `regime` section with ≥ 1 word holding
+  fill-model strategy rows per profile — the RG5 tell, now required
+  over the pooled windows.
+- **Seed hole.** The fast profile must not be UNKNOWN for the first
+  hour after a restart: the wrapper refreshes the 1 m candles tail of
+  the regime's own descriptors right before `seed-out` (`regime
+  seed-out --refresh-tail`, ≤ 8 instruments × 1–2 REST pages), so the
+  seed reaches the boot minute.
+- **Verdict.** `python -m claude_worker.regime soak` prints one line
+  per window (`PASS` / `FAIL <dim> flips=n` / `mirror` / `short`) and
+  the pooled verdict: PASS when every counted window passes and
+  N ≥ 8; the JSON goes under `~/multivenue/worker/regime/soak-<utc>.json`
+  (worker state, never git). The operator's close ruling follows a
+  PASS.
 
 ## 8. Hot-path + zero-copy accounting
 
@@ -1762,9 +1811,82 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   `cargo clean -p <crate>` fixed each; and a sandbox-side `git status`
   left a stale `.git/index.lock` (removed on the Mac; use the Mac lane
   for every git read too).
+- **2026-09-05 — RG6 CLOSED (operator ruling "go do the RG6 close
+  ruling (§7 exit tell met)"): the §7 exit tell — page live on 9292
+  showing regime, mask, rows, P&L, recent fills — was observed live at
+  08:16Z (entry above; frozen record in the vault), `/state` + TUI +
+  the worker page are committed (`ef75c91`, `634f740`) and
+  `com.multivenue.dashboard` runs under launchd. Carried out of RG6 into
+  RG7: the seed-hole fix (§7.1), `stage_refused` (RG5 finding 3 — NOT
+  exposed by RG6: a stage frame for a missing artifact is still dropped
+  without a counter; the ingress side path owns it), the `.html`
+  licence-gate question (§11 Q9, still open, default = leave at
+  `.rs/.py/.sh`). RG7 is restated in §7 + §7.1 (the "5 paper days"
+  wording VOID under the ≤ 2 h law) and opens now.**
+- **2026-09-05 — RG7 OPENED (operator: "then RG7 restated as N ≤ 2 h").
+  Restated in §7 (row) + §7.1 (procedure); code + docs landed the same
+  session (uncommitted at writing — operator commits):** `claude_worker.
+  regime` gains (1) `state_url` / `engine_state` / `engine_regime_sample`
+  — the cycle now samples the engine's `/state` regime block (pid,
+  cumulative flips per profile x market dim, minutes judged, effective
+  words, vm rows, hard exits) into every `history.ndjson` line
+  (`engine` key; absent when the engine is down — the log line says
+  `engine=unreachable`); (2) the **`soak` lane** — `SoakWindow` /
+  `WindowVerdict`, `soak_windows_from_runs` (every complete ≤ 2 h window
+  of every v3 run under the replay root inside the history horizon —
+  the pool's candidate law WITHOUT cutting) or `--pool` (the standing
+  cuts), `judge_window` (coverage ≥ 20 samples → `short`; gating live at
+  every engine sample else `ungated`; flips from the engine counters
+  when the pid is constant across the window — baseline = the last
+  sample before the window, same pid — else the worker mirror's 5-min
+  word changes; hard-exit delta; `pnl_regime_present` = the window's
+  day report holds fill-model rows for both profiles), `run_soak`
+  (pooled verdict PASS / FAIL / INSUFFICIENT, needs `SOAK_MIN_WINDOWS` =
+  8 counted; `FLIPS_MAX_PER_WINDOW` = 2; JSON under the regime dir;
+  exit 0 only on PASS, else 3); (3) **`seed-out --refresh-tail
+  [--universe]`** = `refresh_tail`: the §9.6 gap-fill of the 1 m candles
+  for the artifact's own descriptors only (forward + OKX-backward lanes,
+  demand-sized budget) before the export — the seed-hole fix; the
+  wrapper passes it. Tests `tests/test_regime_soak.py` (sample shape,
+  cycle with a mocked `/state`, every window verdict branch, the pooled
+  lane incl. INSUFFICIENT/exit codes, refresh-tail over a fake venue
+  reaching the boot minute). Worker pytest **718**, ruff clean on the
+  new hunks (the file's pre-existing E501/RUF002 lines untouched —
+  format only your own hunks), `make license-check` OK. **Live:**
+  `regime soak` on the real history + runs = `INSUFFICIENT (windows 8,
+  counted 0)` — every existing pool/run window predates the regime
+  going live (the history starts 04:59Z today; the 08:30Z T2 restart
+  reset the counters at pid 78186) — the honest verdict, never a wait;
+  the cycle's history lines carry `engine` since 08:35Z; `seed-out
+  --refresh-tail` by hand: 7 descriptors, 36 bars each, 1.5 s, the seed's
+  last minute lag 1 min (was up to 60). Docs: `ai-strategy-pipeline.md`
+  (§7b the regime gate + the slot-6/mask-112 correction + §9 `/state` /
+  dashboard / soak rows + §15 seams and kind 12 + §16) and the SVG (lane
+  F: 7 slots, the REGIME GATE and DASHBOARD rows, lanes G/H shifted,
+  `/metrics + /state`), `research-universe.md` (§5 the ≤ 2 h law + the
+  regime-gate law, §4 the live inventory incl. `fde6f733…`/icdp/library,
+  §6 the v2.1 regime keys), `risk-policy.md` (the day-floor note
+  superseded + a "Regime gate" section: entries only, fail closed,
+  bounded declarations, no flicker, read-only observability),
+  `local-setup.md` (soak + refresh-tail), CLAUDE.md. **RG7 exit = a
+  `soak` PASS on N ≥ 8 counted windows (gating live throughout) + the
+  operator ruling — accumulates as the engine runs; nothing to wait
+  for by hand.**
 - **RESUME POINT (for a fresh session):** RG6 is COMMITTED (`ef75c91`)
-  and LIVE (engine `/state`, TUI, `com.multivenue.dashboard` on 9292);
-  the path list below is the historical staging record (paths: `Cargo.
+  and LIVE (engine `/state`, TUI, `com.multivenue.dashboard` on 9292).
+  RG7 is OPEN with its judge landed (entry above; the RG7 set =
+  `claude-worker/src/claude_worker/regime.py`, `claude-worker/tests/
+  test_regime_soak.py`, `scripts/engine-wrapper.sh`, `docs/
+  ai-strategy-pipeline.{md,svg}`, `docs/research-universe.md`, `docs/
+  risk-policy.md`, `docs/local-setup.md`, this plan, `CLAUDE.md` —
+  uncommitted until the operator commits). NEXT: run `uv run python -m
+  claude_worker.regime soak` (from `claude-worker/`, `.env` sourced)
+  when ≥ 8 complete ≤ 2 h windows of regime-gated runs exist (≈ 16 h of
+  engine time after 08:35Z 2026-09-05 — the T2 restarts at 16:05Z/00:00Z
+  split runs but windows are per run, so they still count; a restart
+  INSIDE a window makes it `mirror`-judged, never lost); on PASS the
+  operator rules RG7 closed. The RG6 path list below is the historical
+  staging record (paths: `Cargo.
   toml` `Cargo.lock` `crates/engine-snapshot/` `crates/cli/build.rs`
   `crates/cli/Cargo.toml` `crates/cli/src/{lib.rs,paper.rs,bin/
   multivenue-engine.rs}` `crates/core-metrics/{src/lib.rs,src/server.rs,
@@ -1799,9 +1921,10 @@ I1–I5 footprint; RG4–RG6 mostly Python.
   law). Relaunch prompt: "Continue the regime lane in
   trading-engine-multivenue. Read CLAUDE.md CURRENT STATE (regime
   bullet), then `docs/regime-and-dashboard-plan.md` §12 last two entries
-  (RG6 engine+TUI landing + RESUME POINT) and §6.1 'As landed' (the
-  `/state` contract). Continue RG6 — the worker dashboard page next
-  (§6.2), then the live panel check. Laws: regime is a gate not a
+  (RG7 landing + RESUME POINT), §7.1 (the ≤ 2 h soak law) and §6.1 'As
+  landed' (the `/state` contract). Continue RG7: run `regime soak`; if
+  INSUFFICIENT, report the window count and stop (never wait); if PASS,
+  write the close entry for the operator's ruling. Laws: regime is a gate not a
   signal; exits never gated; legacy rows bit-identical; no table flip on
   regime change; capture windows and every test/soak/protect time ≤ 2 h;
   research never in git; compile/test only on the Mac via RustRover

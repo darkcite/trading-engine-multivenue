@@ -1,6 +1,9 @@
 # The AI-strategy pipeline
 
-**Status:** current as of 2026-08-30 (VM2 V8 opening act live, xv-v2 `bfbc5349…` committed).
+**Status:** current as of 2026-09-05 (regime lane RG0–RG6 live — `docs/regime-and-dashboard-plan.md`;
+the AI-only mask `ai+icdp` = 112 since 2026-09-03; the labelled table `fde6f733…` committed). Sections
+written on 2026-08-30 keep their numbers (the xv-v2 walk-through, the parity window) as the record of
+that state; §7b is the regime-lane addendum and §12 the "live today" list.
 **Companion diagram:** `docs/ai-strategy-pipeline.svg`.
 **Authority above this file:** `docs/vm2-plan.md` §8/§9 → `docs/stage2-finish-plan.md` → `docs/mvp-completion-plan.md` (§7 gate, §9 data law) → `CLAUDE.md`.
 This file is descriptive, not normative — where it disagrees with those, they win.
@@ -409,10 +412,14 @@ to enabled members in slot order:
 | 3 | 8 | `rule-tree` |
 | 4 | 16 | `ai-exec` — the s4 Intent lane |
 | 5 | 32 | `vm` — the ruleset VM |
+| 6 | 64 | `icdp` — the intrabar candle-direction member (ICDP I3, 2026-09-03; configured only when `~/multivenue/icdp.toml` resolves) |
 
-`--strategy all` requests 63, but slots 1/2/3 need `--artifacts-path` / `--groups` / `--rules-path`,
-which the launchd wrapper does not pass. So the live mask is **`63 & 49 = 49`** (`latency_arb=true
-ai_exec=true vm=true`). Disabling slot 5 gives **17**; re-enabling gives 49 back.
+`--strategy all` requests 127, but slots 1/2/3 need `--artifacts-path` / `--groups` / `--rules-path`,
+which the launchd wrapper does not pass. **Since the operator ruling of 2026-09-02 the wrapper boots
+the mask named in `~/multivenue/strategy.conf` — `STRATEGY=ai+icdp` = 112 (`ai_exec=true vm=true
+icdp=true`, every Rust-coded legacy strategy DISABLED at boot).** Disabling slot 5 gives **80**;
+re-enabling gives 112 back. (The 2026-08-30 state this walk-through was written against was
+`--strategy all` = 49 with latency-arb on.)
 
 Every member callback is wrapped in `StampCtx`, which writes the slot into `Order.strategy_id` (byte
 41 of the 64-byte `Order`) on submit. That one register write is the whole attribution mechanism —
@@ -424,6 +431,58 @@ takes the inert branch and returns. Otherwise a linear scan over active rows —
 (`max_hold_s` age-out unconditional, then `min_hold_s` gate, then the universal exit law), then the
 refire/entry path behind the `horizon_ms` cooldown, then `confirm`, then group occupancy, then sizing
 clamped by a second independent per-order cap that mirrors the validator's.
+
+---
+
+## 7b. The regime gate (RG0–RG7, 2026-09-03 →)
+
+`docs/regime-and-dashboard-plan.md` is the owner; this is the map. **A regime is a GATE, never a
+signal.** It decides which strategies (and which VM rows) may ENTER; it never closes a position by
+itself unless the row's own `off = hard` law says so, and it never flips a table.
+
+- **Measured, in the engine.** `crates/core-regime` judges six market dimensions — trend, shape
+  (efficiency ratio), vol (realized), fund sign, fund level, stretch — on two horizon profiles
+  (`fast` 1 h, `slow` 4 h) once per wall minute from the ticks it already sees, with hysteresis bands
+  and a `confirm_min = 3` law, seeded at boot from `candles.db` (`regime-seed.tsv`, exported by the
+  wrapper; RG7's `--refresh-tail` gap-fills the artifact's own 1 m candles first so the seed reaches
+  the boot minute). One byte per dimension, one-hot, in a `RegimeWord` (`core_types::regime`).
+- **Declared, by the AI or the operator.** `SetRegime` (AiCmd kind 12) carries a word + TTL per
+  profile over the same 82-byte frame. **Effective** = declared while fresh, else measured, else
+  UNKNOWN — and UNKNOWN fails a LABELLED row closed (bit 7 of every market byte is the per-dimension
+  unknown mark).
+- **Labels.** Coded members carry a `RegimeLabelSet` (`regime.toml [labels.<member>]`); VM rows carry
+  per-profile masks in the `RuleRowV2` tail (`regimes` / `regime_off` / `rel` — grammar v2.1; validator
+  rule 11; rule 8 admits DISJOINT regime variants of one signal). Both masks 0 = the legacy
+  unconstrained row — every pre-RG0 artifact is bit-identical. The gate is one AND + one CMP per row
+  on the ENTRY path (`engine_vm_regime_blocked_total`); `soft` rows drain by their own exit law,
+  `hard` rows flatten (`engine_vm_regime_hard_exits_total`).
+- **Worker mirror.** `claude_worker.regime` runs the SAME integer law over minute closes (a committed
+  parity fixture pins Rust ↔ Python bit for bit); `com.multivenue.regime` measures every 5 min into
+  `~/multivenue/worker/regime/history.ndjson` (now with the engine's own `/state` regime block —
+  pid, flips, minutes judged), refreshes the RV/funding percentiles of `regime.toml` daily, never
+  declares; `regime declare` / `repush` are the operator's and the strategist's levers; the coded
+  intent lanes gate their ENTRIES through `regime_allows()`; the nightly `pnl_report` merges the
+  harness's per-regime section (minutes per word × strategy rows).
+- **Harness.** `backtest` / `audit-pnl` replay the engine's own `RegimeState` over the window
+  (`--regime <path>|off`, `--regime-seed`); `--regime off` is the on/off delta every labelled table
+  must earn (the live `fde6f733…` did NOT: on−off = −$0.36 on the 8-window pool, LOWO fails twice —
+  kept live as the soak shape by operator ruling).
+- **Library + composer (RG4).** `state.db` gains `library` / `library_evidence` / `compositions`;
+  `python -m claude_worker.library` catalogs members with labels + per-window evidence, `python -m
+  claude_worker.compose` assembles a table from the members fitting the CURRENT words and gates it on
+  the standing pool of the newest 8 complete ≤ 2 h windows (frozen pooled backtest + on/off delta +
+  leave-one-window-out, every run under a 2 h wall budget — fail, never wait).
+- **Dashboard (RG6).** `GET /state` on 9191 = the engine's 1 s snapshot (`crates/engine-snapshot`:
+  one ≈ 21 KB `#[repr(C, align(64))]` POD through a seqlock, hand-encoded JSON, 0 B/op) — boot
+  identity, counters, latency, regime words + per-row gate bytes, vm rows, icdp, the AI plane,
+  ingress, the last 64 orders + fills; the TUI renders the same snapshot; `python -m
+  claude_worker.dashboard` serves the read-only operator page on 127.0.0.1:9292
+  (`com.multivenue.dashboard`). No control reaches the AI plane from a browser.
+- **Soak (RG7).** Under the ≤ 2 h law a soak is a COUNT of pooled windows, never days:
+  `python -m claude_worker.regime soak` judges every complete ≤ 2 h window of the judged runs —
+  flips ≤ 2 per profile × dimension per window from the engine's own counters, ≥ 20 history samples,
+  gating live throughout, per-regime P&L present in the covering nightly report — and needs N ≥ 8 for
+  a pooled verdict (`INSUFFICIENT` otherwise; it never waits).
 
 ---
 
@@ -461,7 +520,10 @@ Proven live 2026-08-30: 1,669 frames, 52 funding descriptors, `cmds_total` 1674,
 | `pnl` verb | `claude-worker pnl [--date] [--json]` | those files | the operator's read (thin; no socket, no spawn) |
 | `parity` | `python -m claude_worker.parity --window-h 48` | `engine-orders.pmlr` only | s4-vs-s5 verdict (§10) |
 | `audit-replay` | `multivenue-engine audit-replay --dir run-<ns>` | the whole run dir | cadence/integrity verdicts + the full AI-command chain |
-| `/metrics` | `127.0.0.1:<port>/metrics` | live counters | `engine_vm_*`, `engine_ai_ruleset_*`, `engine_ingress_ai_*` |
+| `/metrics` | `127.0.0.1:9191/metrics` | live counters | `engine_vm_*`, `engine_ai_ruleset_*`, `engine_ingress_ai_*`, `engine_regime_*` |
+| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 1` — boot / regime words + per-row gate bytes / slots / vm rows / icdp / ai / ingress / recent orders + fills |
+| dashboard | `http://127.0.0.1:9292/` (`python -m claude_worker.dashboard`) | `/state` + `/metrics` proxied, `state.db`, reports, regime history, configs | the read-only operator page (no controls) |
+| `regime soak` | `python -m claude_worker.regime soak` (RG7) | the regime history + the runs' complete ≤ 2 h windows + the nightly reports | the pooled soak verdict (`~/multivenue/worker/regime/soak-<utc>.json`) |
 
 `audit-pnl` reuses `backtest::fill` **verbatim** with `boundary_virt_ns = 0`, so the shadow-P&L and the
 gate speak the same economics. It reuses the same fill model, the same rounding, the same latency
@@ -637,14 +699,16 @@ a key was provisioned: the strategist was the only component still speaking the 
 **Environment seams** — `AI_INGRESS_SOCK` · `AI_INGRESS_HMAC_KEY` (64 hex, permanent in `.env`, never
 read or printed by a session) · `AI_RULESET_DIR` · `MULTIVENUE_LOG_DIR` = `CLAUDE_WORKER_REPLAY_DIR` ·
 `CLAUDE_WORKER_DB` · `CLAUDE_WORKER_FEATURES_DIR` · `CLAUDE_WORKER_MARKET_MAP` ·
-`CLAUDE_WORKER_CANDLES_DB` · `CLAUDE_WORKER_REPORTS_DIR` · `MULTIVENUE_SEED_RULESET`.
+`CLAUDE_WORKER_CANDLES_DB` · `CLAUDE_WORKER_REPORTS_DIR` · `MULTIVENUE_SEED_RULESET` ·
+`CLAUDE_WORKER_REGIME_DIR` · `CLAUDE_WORKER_METRICS_URL` (the `/state` URL sits beside it) ·
+`CLAUDE_WORKER_DASHBOARD_PORT` · `CLAUDE_WORKER_ENGINE_URL` · `CLAUDE_WORKER_MULTIVENUE_DIR`.
 
 **Verb surface (frozen 7 + the one D1-sanctioned addition)** — `serve` · `fetch` · `backtest` · `push`
 · `positions` · `stage-ruleset` · `commit-ruleset` · `pnl`.
 
 **AiCmd kinds** — 0 Heartbeat · 1 Enable · 2 Disable · 3 SetFairValue · 4 SetBias · 5 SetParam ·
 6 OrderIntent (slot 4) · **7 RulesetStage** · **8 RulesetCommit** · 9 Halt (sticky, no Resume) ·
-10 FundingSeed · 11 PositionSeed.
+10 FundingSeed · 11 PositionSeed · **12 SetRegime** (RG0 — a declared word + TTL per profile).
 
 **Two SQLite stores, never mixed** — `state.db` is the control plane (seq allocator, dedupe, prompt
 cache, ruleset registry, events ledger); `candles.db` is the research data plane.
@@ -657,7 +721,9 @@ compile and test on the Mac, never in the sandbox.
 
 ## 16. Read next
 
-`docs/vm2-plan.md` (§8 log, §9 runbook) → `docs/research-universe.md` (grammar §6, the authoring
-catalog) → `docs/prompts/ai-session.md` (the verb-by-verb cookbook) → `docs/mvp-completion-plan.md`
-(§7 gate, §8 automation, §9 data law) → `docs/wire-format.md` (slot and row layouts) →
-`docs/risk-policy.md` (kill-switch and caps).
+`docs/regime-and-dashboard-plan.md` (the regime lane: §3 model, §4 engine, §5 worker, §6 dashboard,
+§7/§7.1 phases + the ≤ 2 h soak law, §12 log) → `docs/arch/vm2-plan.md` (§8 log, §9 runbook) →
+`docs/research-universe.md` (grammar §6 incl. the v2.1 regime keys, the authoring catalog) →
+`docs/prompts/ai-session.md` (the verb-by-verb cookbook, §4 0a–0c library steps) →
+`docs/arch/mvp-completion-plan.md` (§7 gate, §8 automation, §9 data law) → `docs/wire-format.md`
+(slot and row layouts, `RuleRowV2` regime tail) → `docs/risk-policy.md` (kill-switch and caps).

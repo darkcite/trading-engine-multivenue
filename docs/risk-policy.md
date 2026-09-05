@@ -33,7 +33,38 @@ ruling of 2026-08-30 (`GateThresholds.min_trading_days`, D1-pattern
 frozen-surface amendment, cited in the pin tests) so a ~12 h capture age
 suffices for staging; the accepted trade-off is that an OOS verdict can
 come from a single day's regime — the old floor was the
-single-regime-overfit guard. Revisit at the M6 soak.
+single-regime-overfit guard. **Superseded 2026-09-05 by the ≤ 2 h
+law + the regime lane:** evidence is now a COUNT of disjoint complete
+≤ 2 h windows pooled and judged leave-one-window-out (never days —
+`docs/regime-and-dashboard-plan.md` §7.1), and the single-regime
+overfit is guarded by the regime GATE itself: a labelled row trades
+only in the words it was evidenced in, UNKNOWN fails it closed, and
+its label must earn the `--regime off` delta.
+
+## Regime gate (RG0–RG7, 2026-09-03 →) — a gate, never a signal
+
+`docs/regime-and-dashboard-plan.md` §2 is the doctrine; the risk-relevant
+laws, enforced in `crates/core-regime` (the detector), `crates/strategy-set`
+(per-member gates), `crates/strategy-vm` (per-row gate bytes) and
+`ingress-ai::ruleset` (validator rule 11 + the rule-8 amendment):
+
+- **Entries only.** A closed gate blocks ENTRIES; it never blocks an
+  exit and never flips a table. `off = soft` lets the position drain by
+  its own exit law; `off = hard` flattens on the flip
+  (`engine_vm_regime_hard_exits_total`, `engine_icdp_regime_exits_total`).
+- **Fail closed.** UNKNOWN words (warm-up, a declaration that expired,
+  a venue-dark FUND dimension) close every LABELLED row/member; an
+  unlabelled row is bit-identical to pre-RG0 behaviour.
+- **Declarations are bounded.** A `SetRegime` frame carries a TTL
+  (`ttl_ns = 0` refused at the shape check); after it expires the
+  engine's own measurement rules. Declarations never bypass caps.
+- **No flicker.** Hysteresis bands + `confirm_min = 3`; the RG7 soak
+  bounds flips to ≤ 2 per profile × dimension per ≤ 2 h window from the
+  engine's own counters (`python -m claude_worker.regime soak`).
+- **Read-only observability.** `/state` (9191), the TUI and the
+  dashboard page (9292) carry no control into the AI plane —
+  enable/disable/declare/halt stay verbs and frames under the
+  single-writer seq law.
 
 **Superseded demo tier (Phase 0 → 2026-08-29):** 4/sym · 32 total ·
 $250/sym · $1 000 total · $100/order · $200 DD — the numbers every

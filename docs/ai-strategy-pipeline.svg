@@ -1,6 +1,6 @@
-<svg viewBox="0 0 1520 1996" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
+<svg viewBox="0 0 1520 2124" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif">
   <title id="t">The AI-strategy pipeline — multivenue trading engine</title>
-  <desc id="d">Eight stages: six venues stream into the engine, which writes append-only PMLR capture; offline Python folds that capture into a candle/funding/IV/depth store and per-run feature files; a strategist (Claude-in-session today, the keyed serve daemon at Stage 3) authors a ruleset in a fixed 17-feature grammar; the ruleset is scored by the real engine VM replaying the real capture and must pass five hard gates; a passing artifact is installed by content hash, staged and committed over an 82-byte HMAC UDS frame, validated a second time by the same validator, and flipped live in the VM; from then on it trades on every tick with no AI in the loop; audit-pnl, parity and audit-replay close the loop back into the next authoring round.</desc>
+  <desc id="d">Eight stages plus the regime gate (RG0–RG7): six venues stream into the engine, which writes append-only PMLR capture; offline Python folds that capture into a candle/funding/IV/depth store and per-run feature files; a strategist (Claude-in-session today, the keyed serve daemon at Stage 3) authors a ruleset in a fixed 17-feature grammar; the ruleset is scored by the real engine VM replaying the real capture and must pass five hard gates; a passing artifact is installed by content hash, staged and committed over an 82-byte HMAC UDS frame, validated a second time by the same validator, and flipped live in the VM; from then on it trades on every tick with no AI in the loop; audit-pnl, parity and audit-replay close the loop back into the next authoring round.</desc>
 
   <defs>
     <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -14,11 +14,11 @@
     </marker>
   </defs>
 
-  <rect x="0" y="0" width="1520" height="1996" fill="#ffffff"/>
+  <rect x="0" y="0" width="1520" height="2124" fill="#ffffff"/>
 
   <!-- ===================== HEADER ===================== -->
   <text x="54" y="34" font-size="19" font-weight="700" fill="#1a1a18">The AI-strategy pipeline</text>
-  <text x="54" y="54" font-size="11" fill="#8a8a86">capture → derive → author → gate → promote → execute → observe · live state 2026-08-30 (VM2 V8)</text>
+  <text x="54" y="54" font-size="11" fill="#8a8a86">capture → derive → author → gate → promote → execute (regime-gated) → observe · live state 2026-09-05 (RG6 closed, RG7 open)</text>
 
   <rect x="1004" y="24" width="18" height="12" rx="2" fill="#f6f6f4" stroke="#d0d0cc"/>
   <text x="1028" y="34" font-size="9.5" fill="#8a8a86">live today</text>
@@ -280,33 +280,37 @@
   <line x1="1400" y1="1426" x2="1400" y2="1478" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
 
   <!-- ===================== LANE F · EXECUTE ===================== -->
-  <rect x="54" y="1440" width="1412" height="168" rx="8" fill="none" stroke="#0f766e" stroke-width="1.3"/>
+  <rect x="54" y="1440" width="1412" height="296" rx="8" fill="none" stroke="#0f766e" stroke-width="1.3"/>
   <text x="66" y="1454" font-size="9.5" font-weight="700" fill="#0f766e">F · EXECUTE — on every tick, with NO AI, no worker and no cron in the loop</text>
-  <text x="66" y="1470" font-size="9.3" fill="#6b6b67">StrategySet is statically composed — no dyn, no allocation after boot. --strategy all requests 63; slots 1/2/3 need flags the launchd wrapper never passes ⇒ the live mask is 63 &amp; 49 = 49. Disable slot 5 ⇒ 17; re-enable ⇒ 49.</text>
+  <text x="66" y="1470" font-size="9.3" fill="#6b6b67">StrategySet is statically composed — no dyn, no allocation after boot. Live since 2026-09-02/03: ~/multivenue/strategy.conf STRATEGY=ai+icdp ⇒ mask 112 (ai-exec + vm + icdp); every Rust-coded legacy strategy is DISABLED at boot by operator ruling. Disable slot 5 ⇒ 80; re-enable ⇒ 112.</text>
 
-  <rect x="68" y="1480" width="220" height="36" rx="5" fill="#f6f6f4" stroke="#0f766e"/>
-  <text x="178" y="1495" font-size="10.5" font-weight="700" fill="#1a1a18" text-anchor="middle">slot 0 · latency-arb</text>
-  <text x="178" y="1509" font-size="8.8" fill="#6b6b67" text-anchor="middle">bit 1 · ON · not AI-authored</text>
+  <rect x="68" y="1480" width="190" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="163" y="1495" font-size="10" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 0 · latency-arb</text>
+  <text x="163" y="1509" font-size="7.8" fill="#c0c0bc" text-anchor="middle">bit 1 · OFF since 09-02 · not AI-authored</text>
 
-  <rect x="300" y="1480" width="220" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
-  <text x="410" y="1495" font-size="10.5" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 1 · ev</text>
-  <text x="410" y="1509" font-size="8.8" fill="#c0c0bc" text-anchor="middle">bit 2 · off (needs --artifacts-path)</text>
+  <rect x="268" y="1480" width="190" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="363" y="1495" font-size="10" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 1 · ev</text>
+  <text x="363" y="1509" font-size="8.2" fill="#c0c0bc" text-anchor="middle">bit 2 · off (needs --artifacts-path)</text>
 
-  <rect x="532" y="1480" width="220" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
-  <text x="642" y="1495" font-size="10.5" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 2 · cross-arb</text>
-  <text x="642" y="1509" font-size="8.8" fill="#c0c0bc" text-anchor="middle">bit 4 · off (needs --groups)</text>
+  <rect x="468" y="1480" width="190" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="563" y="1495" font-size="10" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 2 · cross-arb</text>
+  <text x="563" y="1509" font-size="8.2" fill="#c0c0bc" text-anchor="middle">bit 4 · off (needs --groups)</text>
 
-  <rect x="764" y="1480" width="220" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
-  <text x="874" y="1495" font-size="10.5" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 3 · rule-tree</text>
-  <text x="874" y="1509" font-size="8.8" fill="#c0c0bc" text-anchor="middle">bit 8 · off (needs --rules-path)</text>
+  <rect x="668" y="1480" width="190" height="36" rx="5" fill="#f2f2f0" stroke="#e2e2de"/>
+  <text x="763" y="1495" font-size="10" font-weight="600" fill="#b0b0ac" text-anchor="middle">slot 3 · rule-tree</text>
+  <text x="763" y="1509" font-size="8.2" fill="#c0c0bc" text-anchor="middle">bit 8 · off (needs --rules-path)</text>
 
-  <rect x="996" y="1480" width="220" height="36" rx="5" fill="#f6f6f4" stroke="#0f766e"/>
-  <text x="1106" y="1495" font-size="10.5" font-weight="700" fill="#1a1a18" text-anchor="middle">slot 4 · ai-exec  (s4)</text>
-  <text x="1106" y="1509" font-size="8.8" fill="#6b6b67" text-anchor="middle">bit 16 · ON · Intent lane, cron-driven</text>
+  <rect x="868" y="1480" width="190" height="36" rx="5" fill="#f6f6f4" stroke="#0f766e"/>
+  <text x="963" y="1495" font-size="10" font-weight="700" fill="#1a1a18" text-anchor="middle">slot 4 · ai-exec  (s4)</text>
+  <text x="963" y="1509" font-size="8.2" fill="#6b6b67" text-anchor="middle">bit 16 · ON · Intent lane</text>
 
-  <rect x="1228" y="1480" width="220" height="36" rx="5" fill="#e6f4f1" stroke="#0f766e" stroke-width="1.6"/>
-  <text x="1338" y="1495" font-size="10.5" font-weight="700" fill="#0f766e" text-anchor="middle">slot 5 · vm  (s5)</text>
-  <text x="1338" y="1509" font-size="8.8" fill="#0f766e" text-anchor="middle">bit 32 · ON · THE RULESET VM</text>
+  <rect x="1068" y="1480" width="190" height="36" rx="5" fill="#e6f4f1" stroke="#0f766e" stroke-width="1.6"/>
+  <text x="1163" y="1495" font-size="10" font-weight="700" fill="#0f766e" text-anchor="middle">slot 5 · vm  (s5)</text>
+  <text x="1163" y="1509" font-size="7.8" fill="#0f766e" text-anchor="middle">bit 32 · ON · THE RULESET VM (rows gated)</text>
+
+  <rect x="1268" y="1480" width="190" height="36" rx="5" fill="#f6f6f4" stroke="#0f766e"/>
+  <text x="1363" y="1495" font-size="10" font-weight="700" fill="#1a1a18" text-anchor="middle">slot 6 · icdp</text>
+  <text x="1363" y="1509" font-size="7.8" fill="#6b6b67" text-anchor="middle">bit 64 · ON · intrabar (ICDP) · labelled</text>
 
   <rect x="68" y="1528" width="684" height="58" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
   <text x="80" y="1545" font-size="10.5" font-weight="700" fill="#1a1a18">StampCtx writes the slot into Order.strategy_id (byte 41 of the 64 B Order) on submit</text>
@@ -320,8 +324,20 @@
   <text x="780" y="1560" font-size="9.3" fill="#6b6b67">paper-only until the operator opens the Stage-3 gate · refusals are counters, not records</text>
   <text x="780" y="1575" font-size="9.3" fill="#6b6b67">per-RULESET attribution is deliberately not embedded — it is reconstructed offline from the RulesetCommit timeline in ai-cmds.pmlr</text>
 
-  <line x1="1110" y1="1586" x2="1110" y2="1640" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+  <rect x="68" y="1596" width="1384" height="86" rx="5" fill="#fef3c7" stroke="#d97706"/>
+  <text x="80" y="1613" font-size="10.5" font-weight="700" fill="#1a1a18">REGIME GATE (RG0–RG7, docs/regime-and-dashboard-plan.md) — a GATE, never a signal · exits are NEVER gated · a regime change NEVER flips a table</text>
+  <text x="80" y="1628" font-size="9" fill="#6b6b67">core-regime in the engine: MEASURED per minute from ticks (trend · shape · vol · fund · level · stretch × fast 1 h / slow 4 h; hysteresis bands, confirm 3; seeded from candles.db at boot — the RG7 tail refresh closes the seed hole)</text>
+  <text x="80" y="1643" font-size="9" fill="#6b6b67">DECLARED by the AI/operator (SetRegime kind 12, TTL) · effective = declared if fresh, else measured, else UNKNOWN (fail-closed for labelled rows) · worker mirror claude_worker.regime = the same integer law (parity fixture)</text>
+  <text x="80" y="1658" font-size="9" fill="#6b6b67">labels: coded members via regime.toml [labels.*] · VM rows via the v2.1 keys regimes / regime_off / rel in the RuleRowV2 tail (legacy rows bit-identical) · the gate = ONE AND + CMP per row on ENTRY only; soft = drain by own law, hard = flatten</text>
+  <text x="80" y="1673" font-size="9" fill="#6b6b67">library + composer (RG4) admit only regime-fitting members · com.multivenue.regime every 5 min → history.ndjson (+ the engine's flips from /state) · RG7 soak = N ≥ 8 pooled ≤ 2 h windows judged by `regime soak`, never a calendar span</text>
 
+  <rect x="68" y="1690" width="1384" height="36" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
+  <text x="80" y="1706" font-size="10.5" font-weight="700" fill="#1a1a18">DASHBOARD (RG6) — read-only, no controls</text>
+  <text x="80" y="1720" font-size="9" fill="#6b6b67">engine GET /state on 9191 = the 1 s ≈ 21 KB POD snapshot (seqlock), encoded zero-alloc: boot · counters · regime words + per-row gate bytes · vm rows · icdp · AI plane · ingress · last 64 orders + fills · the TUI renders the same snapshot · worker page 127.0.0.1:9292 — one HTML, no CDN</text>
+
+  <line x1="1110" y1="1726" x2="1110" y2="1768" stroke="#8a8a86" stroke-width="1.1" marker-end="url(#ar)"/>
+
+  <g transform="translate(0 128)">
   <!-- ===================== LANE G · OBSERVE ===================== -->
   <rect x="54" y="1620" width="1412" height="140" rx="8" fill="none" stroke="#a16207" stroke-width="1.3"/>
   <text x="66" y="1634" font-size="9.5" font-weight="700" fill="#a16207">G · OBSERVE — and the edge that closes the loop</text>
@@ -355,11 +371,11 @@
   <text x="917" y="1715" font-size="9.1" fill="#6b6b67">how the rollback was proven, not asserted</text>
 
   <rect x="1184" y="1644" width="268" height="76" rx="5" fill="#f6f6f4" stroke="#d0d0cc"/>
-  <text x="1196" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">/metrics on 127.0.0.1</text>
-  <text x="1196" y="1676" font-size="9.1" fill="#6b6b67">engine_vm_rows_active · _table_epoch</text>
-  <text x="1196" y="1689" font-size="9.1" fill="#6b6b67">engine_vm_fires_total · _orders_*</text>
-  <text x="1196" y="1702" font-size="9.1" fill="#6b6b67">engine_ai_ruleset_{staged,committed,</text>
-  <text x="1196" y="1715" font-size="9.1" fill="#6b6b67">rejected}_total · engine_strategy_enabled_mask</text>
+  <text x="1196" y="1661" font-size="10.5" font-weight="700" fill="#1a1a18">/metrics + /state on 127.0.0.1:9191</text>
+  <text x="1196" y="1676" font-size="9.1" fill="#6b6b67">engine_vm_rows_active · _table_epoch · _regime_*</text>
+  <text x="1196" y="1689" font-size="9.1" fill="#6b6b67">engine_regime_{fast,slow}_{effective,flips_*}</text>
+  <text x="1196" y="1702" font-size="9.1" fill="#6b6b67">/state: the 1 s snapshot as JSON (v1) — the</text>
+  <text x="1196" y="1715" font-size="9.1" fill="#6b6b67">dashboard page (9292) and regime soak read it</text>
 
   <text x="66" y="1742" font-size="9.3" fill="#6b6b67">Parity window OPEN since ~2026-08-30 08:55Z · judged PER FAMILY, never globally · known standing miss: the xv cron still carries the hl↔bn-usdm pair the retune dropped · cron bootout is OPERATOR-ONLY, per family, after that family is green (the data agents stay)</text>
 
@@ -393,7 +409,7 @@
   <text x="1016" y="1871" font-size="9.1" fill="#6b6b67">PositionSeed (kind 11) — prior slot-5 FIFO fold · qty = age in SECONDS</text>
   <text x="1016" y="1884" font-size="9.1" fill="#6b6b67">live-proven 2026-08-30: 1,669 frames · 52 descriptors · rejected 0</text>
 
-  <path d="M 68 1850 L 32 1850 L 32 1215 L 62 1215" fill="none" stroke="#64748b" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#ar)"/>
+  <path d="M 68 1850 L 32 1850 L 32 1087 L 62 1087" fill="none" stroke="#64748b" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#ar)"/>
   <text x="24" y="1540" font-size="9.3" font-weight="600" fill="#64748b" text-anchor="middle" transform="rotate(-90 24 1540)">post-boot re-stage + re-commit + seeds re-enter the wire (kinds 7 · 8 · 10 · 11)</text>
 
   <!-- ===================== FOOTER ===================== -->
@@ -402,4 +418,5 @@
   <text x="54" y="1953" font-size="9.5" font-weight="600" fill="#6b6b67">Deferred to the Stage-3 entry gate (docs/mvp-completion-plan.md §7): ANTHROPIC_API_KEY provisioning ⇒ serve + Fable-5 authoring · §8.1 auto-promotion · §8.3 monitor + §8.5 automatic rollback.</text>
   <text x="54" y="1968" font-size="9.5" fill="#8a8a86">The monitor's shape is fully specified: the ACTIVE ruleset re-run over a trailing 24 h at --split 0/100, floor 6 h (below it it SKIPS — it never guesses), trigger net ≤ −$100 or DD ≥ $200, act by Disable-5 then restage-and-commit the prior.</text>
   <text x="54" y="1983" font-size="9.5" fill="#8a8a86">All of it is code-complete and E2E-proven; the LIVE proofs ARE the gate, and the gate is the operator's to open.      Companion walkthrough: docs/ai-strategy-pipeline.md</text>
+  </g>
 </svg>

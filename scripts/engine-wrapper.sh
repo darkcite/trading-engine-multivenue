@@ -49,10 +49,16 @@ fi
 # a stale or absent seed and the engine warms live (boot tell
 # `regime: seed absent`). The seed is DERIVED data (candles), never a
 # capture window — the ≤ 2 h capture-window law is untouched.
+# RG7 (plan §7.1, the seed hole): `--refresh-tail` gap-fills the 1 m
+# candles of the artifact's OWN descriptors first (≤ 8 instruments, one
+# or two REST pages each) so the seed reaches the boot minute — without
+# it the hourly candles lane's lag left the fast profile UNKNOWN for
+# up to an hour after every restart.
 if [ -f "$HOME/multivenue/regime.toml" ]; then
   ( cd claude-worker && uv run python -m claude_worker.regime seed-out \
       --regime "$HOME/multivenue/regime.toml" \
-      --out "$HOME/multivenue/regime-seed.tsv" ) ||
+      --out "$HOME/multivenue/regime-seed.tsv" \
+      --refresh-tail --universe "$HOME/multivenue/universe.toml" ) ||
     echo "engine-wrapper: regime seed export failed — the detector warms live" >&2
 fi
 

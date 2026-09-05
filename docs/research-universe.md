@@ -82,7 +82,17 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
 - s5 VM: **xv-v2 LIVE since 2026-08-30 08:55Z** (`bfbc5349…`:
   okx:BTC-USDT ↔ binance:btcusdt mid reversion, enter 3.0 / exit
   1.0 bps, $3,000/leg; the 48 h s4-vs-s5 parity window runs —
-  vm2-plan §9). Authored + gate-pending: cvfc-v2 `f7d79ce5…` /
+  vm2-plan §9). **Since 2026-09-05 the ACTIVE row is the labelled
+  `fde6f733…`** (two disjoint `vol:low` / `vol:!low` variants of that
+  xv row — the RG7 soak shape, not a confirmed edge: on−off −$0.36,
+  LOWO fails twice; the xv family is ruled NEGATIVE under any fee).
+- s6 icdp: LIVE since 2026-09-03 (mask 112 = `ai+icdp`;
+  `~/multivenue/icdp.toml`, 8 majors, 15 s bars); negative at the
+  operator tier so far — G2 reports accumulate as ≤ 2 h windows.
+- The library (RG4, `python -m claude_worker.library list`): every
+  authored member with its labels, status (candidate / validated /
+  retired) and per-window evidence — benchmark against it before
+  authoring; `compose` builds the regime-fitting table from it. Authored + gate-pending: cvfc-v2 `f7d79ce5…` /
   s1-v2 `0cf7433e…` (their hold/warmup laws need older roots),
   merged-v2 `79eaceec…` (the one-table combination).
 - External research corpus (S1–S7/S2R book + CVFC-1 + uplift studies —
@@ -93,6 +103,20 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
   owns the rule.
 
 ## 5. Standing constraints a strategy must respect
+
+- **The ≤ 2 h law (operator, 2026-09-03/05, absolute):** no capture
+  window, data gate, test, soak or protect TIME may exceed 2 hours.
+  Evidence is a COUNT of disjoint complete ≤ 2 h windows that already
+  exist (`~/multivenue/worker/windows/`, the newest 8 v3 cuts;
+  `claude_worker.window_root`), pooled and judged leave-one-window-out
+  — never a wait, never "N days". The RG7 regime soak, the ICDP gates
+  and the composer's gate are all stated this way.
+- **Regime is a gate, not a signal.** A strategy or row fits regimes
+  through its label (§6 v2.1 keys / `regime.toml [labels.*]`); the
+  words are measured in the engine and mirrored by the worker
+  (`python -m claude_worker.regime report`); UNKNOWN fails a labelled
+  row closed; exits are never gated. The current words are the first
+  input of every authoring round (`ai-session.md` §4 step 0a).
 
 - **PM ≤6 tokens total** (3 markets) until the allocation-base slice
   lands: PM token ids run `42,2,3,4,5,6` and the 7th collides with
@@ -162,6 +186,25 @@ signal = combine( feat_a(instrument, window_a), feat_b(ref, window_b) )
   reshuffle, descriptors are the identity. Restart continuity: the
   seed lane replays 73 h of funding prints and restores open
   positions by row.
+- **Regime labels (grammar v2.1, RG3 — `docs/regime-and-dashboard-plan.md`
+  §3.3):** optional row keys `regimes` (a string array of terms —
+  `"vol:low"`, `"fast:trend:bull"`, `"slow:shape:!chop"`,
+  `"rel:leading"`; unprefixed terms apply to the fast profile), `rel`
+  (sugar for the per-symbol RELATIVE term) and `regime_off`
+  (`"soft"` = block entries and let the row's own exit law drain,
+  `"hard"` = block entries AND flatten on the flip). A row without
+  the keys is unconstrained and bit-identical to every pre-RG0
+  artifact. The gate is on ENTRY only — exits are never gated — and
+  a regime change never flips the table. Rule 11 refuses malformed
+  terms; the rule-8 duplicate law admits DISJOINT regime variants of
+  one signal (e.g. one row `vol:low`, its twin `vol:!low`) and still
+  refuses intersecting ones. UNKNOWN dimensions (warm-up, or FUND on
+  this host — Binance markPrice is venue-dark) fail a constrained row
+  CLOSED, so `fund:` / `level:` labels are unusable until the `.env`
+  lever. Every labelled table must earn its label: the harness's
+  `--regime off` delta and leave-one-window-out on the standing ≤ 2 h
+  window pool are the RG4 composer's gate (the live `fde6f733…` did
+  not earn its vol split — kept as the soak shape by ruling).
 - **What it CANNOT express** (stays s4): dynamic best-pair venue
   selection per coin (approximate with one row per pair sharing a
   group), global cross-row position-count caps beyond groups,

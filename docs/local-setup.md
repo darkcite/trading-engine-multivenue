@@ -284,6 +284,19 @@ Operational laws:
   fresher operator/strategist ruling is in force (§7 gate: no `serve`
   yet). The nightly `pnl_report` merges the harness's per-regime
   section (`regime` key + `regime …` summary lines; `pnl` prints them).
+  **RG7 (plan §7.1):** each cycle also samples the engine's own regime
+  block from `/state` (pid, cumulative flips, minutes judged) into the
+  history line; `uv run python -m claude_worker.regime soak` judges
+  every complete ≤ 2 h window of the judged runs (or `--pool` for the
+  standing cuts) — flips ≤ 2 per profile × dimension per window from
+  those counters, ≥ 20 samples, gating live throughout, per-regime P&L
+  in the covering nightly report — and prints the pooled verdict (needs
+  N ≥ 8 counted windows; `INSUFFICIENT` never waits; exit 0 only on
+  PASS; the JSON lands under `~/multivenue/worker/regime/soak-*.json`).
+  The wrapper's `seed-out --refresh-tail` gap-fills the artifact's own
+  1 m candles (≈ 1.5 s, one page per instrument) right before every
+  boot so the seed reaches the boot minute — the fast profile no longer
+  spends its first hour UNKNOWN after a restart.
 
 ## Troubleshooting
 

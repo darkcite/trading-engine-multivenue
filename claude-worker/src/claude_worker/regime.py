@@ -42,8 +42,23 @@ stays frozen — module-lane precedent ``pnl_report``/``candles``):
   4-hourly for slow, the profile's ``fund_prints`` prints) and rewrite
   ONLY those six lines; the next T2 restart applies them.
 - ``cycle``: the ``com.multivenue.regime`` 5-minute job — measure +
-  history line + the daily percentile refresh. Never declares.
+  history line (RG7: + the engine's own regime block from ``/state`` —
+  pid, flips, minutes judged, effective words — when it answers) + the
+  daily percentile refresh. Never declares.
 - ``history``: the 24 h tail under ``~/multivenue/worker/regime/``.
+- ``soak`` (RG7, plan §7.1): the ≤ 2 h-law soak judge — for every
+  window of the standing pool (``~/multivenue/worker/windows/``): the
+  history samples inside it, the per-profile x dimension flip count from
+  the engine's counters (same pid throughout) or the worker mirror's
+  word changes, the ``FLIPS_MAX_PER_WINDOW`` bound, the sample-coverage
+  floor and the per-regime P&L presence in the window's day report;
+  the pooled verdict needs ``SOAK_MIN_WINDOWS`` counted windows. Never
+  waits: fewer windows = ``INSUFFICIENT``.
+- ``seed-out --refresh-tail``: before exporting, gap-fill the 1 m
+  candles of the artifact's own descriptors (≤ 8 instruments, one or
+  two REST pages each) so the seed reaches the boot minute — the RG7
+  fix of the seed hole (a restart no longer leaves the fast profile
+  UNKNOWN for its first hour).
 - ``regime_allows(terms, words)``: the coded-lane gate the intent crons
   (``xv_signal`` / ``carry_signal``) call — the §3.3 label grammar folded
   exactly like ``RegimeLabelBuilder``, judged against the engine's
@@ -67,11 +82,16 @@ import tomllib
 import typing
 import urllib.request
 
+import httpx
+
 import claude_worker.candles
 import claude_worker.config
 import claude_worker.frames
+import claude_worker.features
+import claude_worker.fetchers
 import claude_worker.state
 import claude_worker.uds
+import claude_worker.window_root
 
 # ---- constants (core_regime) ----
 
@@ -639,6 +659,66 @@ def write_seed_tsv(path: pathlib.Path, rows: list[SeedRow]) -> None:
     os.replace(tmp, path)
 
 
+def refresh_tail(
+    regime_path: pathlib.Path,
+    db_path: pathlib.Path,
+    universe_path: pathlib.Path,
+    now_ms: int,
+    env: typing.Mapping[str, str],
+    report: typing.Callable[[str], None] = print,
+    http: claude_worker.candles.Http | None = None,
+) -> int:
+    """RG7 (plan §7.1 seed hole): gap-fill the 1 m candles of the
+    artifact's own descriptors — ref, funding ref, breadth members — from
+    ``max(open_ts)`` to now, the §9.6 law over a subset. Returns the
+    descriptors touched (0 when the universe holds none of them). Boot
+    path: one or two pages per instrument under a demand-sized budget;
+    any failure is counted and skipped (the seed then reaches as far as
+    the store does — the pre-RG7 behaviour)."""
+    wanted = set(read_regime_descriptors(regime_path))
+    lanes = claude_worker.candles.read_universe_lanes(universe_path) or []
+    picked: list[tuple[claude_worker.candles.Lane, claude_worker.candles.LaneTarget]] = [
+        (lane, t) for lane in lanes for t in lane.targets if t.descriptor in wanted
+    ]
+    if not picked:
+        report(f"regime refresh-tail: none of {sorted(wanted)} in {universe_path} — skipped")
+        return 0
+    budget = claude_worker.features.RestBudget(
+        2 * len(picked) + 2, claude_worker.fetchers.BUDGET_WINDOW_NS
+    )
+    conn = claude_worker.candles.open_db(db_path)
+    touched = 0
+
+    def fill(h: claude_worker.candles.Http) -> int:
+        n_ok = 0
+        for lane, target in picked:
+            if lane.backward:
+                st = claude_worker.candles.fill_okx_backward(
+                    conn, h, target, "1m", now_ms, budget, env
+                )
+            else:
+                st = claude_worker.candles.fill_forward(
+                    conn, h, lane, target, "1m", now_ms, budget, env
+                )
+            report(
+                f"regime refresh-tail: {target.descriptor} 1m pages={st.pages} bars={st.bars}"
+                f" +{st.upsert.inserted}{' BUDGET' if st.budget_out else ''}"
+                f"{' FAILED' if st.failed else ''}"
+            )
+            n_ok += 0 if st.failed else 1
+        return n_ok
+
+    try:
+        if http is not None:
+            touched = fill(http)
+        else:
+            with httpx.Client() as client:
+                touched = fill(claude_worker.candles.make_http(client, env))
+    finally:
+        conn.close()
+    return touched
+
+
 def seed_out(
     regime_path: pathlib.Path,
     db_path: pathlib.Path,
@@ -674,6 +754,15 @@ DECLARE_TTL_S_DEFAULT: int = 900
 HISTORY_HOURS: int = 24
 PROFILE_NAMES: tuple[str, ...] = ("fast", "slow")
 DIM_NAMES: tuple[str, ...] = ("trend", "shape", "vol", "fund", "level", "stretch", "source")
+#: The market dimensions the RG7 flip bound judges (SOURCE is not a flip).
+MARKET_DIMS: tuple[str, ...] = DIM_NAMES[:-1]
+#: RG7 (plan §7.1): flips per profile x market dimension per <= 2 h window —
+#: the old "24 per day" restated for 2 h.
+FLIPS_MAX_PER_WINDOW: int = 2
+#: RG7: counted windows a pooled verdict needs (= the RG4 pool size).
+SOAK_MIN_WINDOWS: int = 8
+#: RG7: 5-min history samples a window needs to be judged (24 nominal).
+SOAK_MIN_SAMPLES: int = 20
 #: Declaration provenance (persisted in ``declared.json``).
 SOURCE_OPERATOR: str = "operator"
 SOURCE_MEASURED_WORKER: str = "measured"
@@ -905,6 +994,58 @@ def engine_words(url: str, timeout_s: float = 2.0) -> dict[str, int] | None:
         return None
     words = parse_metrics_words(text)
     return words or None
+
+
+def state_url(env: typing.Mapping[str, str] | None = None) -> str:
+    """The engine's ``/state`` (RG6) beside its ``/metrics`` URL."""
+    url = metrics_url(env)
+    return url[: -len("/metrics")] + "/state" if url.endswith("/metrics") else url + "/state"
+
+
+def engine_state(url: str, timeout_s: float = 2.0) -> dict[str, object] | None:
+    """The engine's ``/state`` document; ``None`` when unreachable or not
+    served (a pre-RG6 binary answers 404) — never an error."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # loopback only
+            obj = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except OSError, ValueError:
+        return None
+    return obj if isinstance(obj, dict) and obj.get("v") == 1 else None
+
+
+def engine_regime_sample(state: dict[str, object]) -> dict[str, object] | None:
+    """The RG7 history sample cut from ``/state``: the pid (a counter
+    reset tell), the detector's cumulative flips per profile x market
+    dimension, minutes judged, effective words, the vm's hard exits.
+    ``None`` when the document lacks the regime block."""
+    regime = state.get("regime")
+    boot = state.get("boot")
+    if not isinstance(regime, dict) or not isinstance(boot, dict):
+        return None
+    flips: dict[str, list[int]] = {}
+    effective: dict[str, str] = {}
+    for prof in regime.get("profiles") or []:
+        if not isinstance(prof, dict) or prof.get("name") not in PROFILE_NAMES:
+            continue
+        name = str(prof["name"])
+        raw = prof.get("flips") or []
+        flips[name] = [int(v) for v in raw[: len(MARKET_DIMS)]]
+        eff = prof.get("effective")
+        if isinstance(eff, dict) and isinstance(eff.get("hex"), str):
+            effective[name] = str(eff["hex"])
+    if len(flips) != len(PROFILE_NAMES):
+        return None
+    vm = state.get("vm") if isinstance(state.get("vm"), dict) else {}
+    return {
+        "pid": int(boot.get("pid", 0)),
+        "seq": int(state.get("seq", 0)),
+        "configured": int(regime.get("configured", 0)),
+        "minutes_judged": int(regime.get("minutes_judged", 0)),
+        "flips": flips,
+        "effective": effective,
+        "vm_rows": int(vm.get("rows_active", 0)),
+        "hard_exits": int(vm.get("regime_hard_exits", 0)),
+    }
 
 
 # ---- declarations (declared.json + SetRegime frames) ----
@@ -1233,7 +1374,9 @@ def history_tail(
     return out
 
 
-def history_entry(m: Measurement, now_ms: int) -> dict[str, object]:
+def history_entry(
+    m: Measurement, now_ms: int, engine: dict[str, object] | None = None
+) -> dict[str, object]:
     ev = m.evaluator
     entry: dict[str, object] = {
         "ts_ms": now_ms,
@@ -1244,6 +1387,8 @@ def history_entry(m: Measurement, now_ms: int) -> dict[str, object]:
     for p, name in enumerate(PROFILE_NAMES):
         entry[name] = word_hex(ev.measured[p])
         entry[f"{name}_raw"] = raw_dict(ev.raw[p])
+    if engine is not None:
+        entry["engine"] = engine  # RG7: the soak judge's source of truth
     return entry
 
 
@@ -1259,6 +1404,251 @@ def words_timeline(entries: list[dict[str, object]], profile: str) -> list[tuple
             out[-1] = (text, out[-1][1] + 1)
         else:
             out.append((text, 1))
+    return out
+
+
+# ---- RG7: the ≤ 2 h-law soak judge (plan §7.1) ----
+
+
+class SoakWindow(typing.NamedTuple):
+    """One pooled window: the cut's name and its wall span (ms)."""
+
+    name: str
+    start_ms: int
+    end_ms: int
+
+
+class WindowVerdict(typing.NamedTuple):
+    """One window's judgement."""
+
+    name: str
+    start_ms: int
+    end_ms: int
+    samples: int
+    source: str  # engine | mirror | none
+    flips: dict[str, list[int]]  # profile -> per MARKET_DIMS
+    worst: tuple[str, str, int]  # (profile, dim, flips)
+    hard_exits: int
+    pnl_regime: bool
+    verdict: str  # PASS | FAIL | short | ungated
+
+    def as_json(self) -> dict[str, object]:
+        return {**self._asdict(), "worst": list(self.worst)}
+
+
+def soak_windows_from_pool(pool_dir: pathlib.Path) -> list[SoakWindow]:
+    """The pool's cuts as wall spans: a cut is named ``run-<epoch_ns>`` by
+    its own start and is exactly ``WINDOW_MAX_S`` long (complete windows
+    only — the RG4 pool law)."""
+    out: list[SoakWindow] = []
+    for cut in claude_worker.window_root.pool_windows(pool_dir):
+        try:
+            epoch_ns = int(cut.name[4:])
+        except ValueError:
+            continue
+        start_ms = epoch_ns // 1_000_000
+        out.append(
+            SoakWindow(
+                cut.name, start_ms, start_ms + int(claude_worker.window_root.WINDOW_MAX_S * 1000)
+            )
+        )
+    return out
+
+
+def soak_windows_from_runs(logs_dir: pathlib.Path, since_ms: int) -> list[SoakWindow]:
+    """Every complete ≤ 2 h window of every judged (v3+) run under
+    ``logs_dir`` starting at/after ``since_ms`` — the pool's candidate
+    law WITHOUT cutting anything (the judge needs spans, not files).
+    Oldest first."""
+    out: list[SoakWindow] = []
+    for c in claude_worker.window_root.pool_candidates(logs_dir):
+        try:
+            epoch_ns = int(c.name[4:])
+        except ValueError:
+            continue
+        start_ms = epoch_ns // 1_000_000
+        if start_ms < since_ms:
+            continue
+        out.append(SoakWindow(c.name, start_ms, start_ms + int((c.to_s - c.from_s) * 1000)))
+    out.sort(key=lambda w: w.start_ms)
+    return out
+
+
+def _engine_of(entry: dict[str, object]) -> dict[str, object] | None:
+    e = entry.get("engine")
+    return e if isinstance(e, dict) and isinstance(e.get("flips"), dict) else None
+
+
+def _mirror_flips(inside: list[dict[str, object]]) -> dict[str, list[int]]:
+    """Word changes per profile x market dimension between consecutive
+    worker samples (5-min resolution — a bound, not a count)."""
+    flips = {name: [0] * len(MARKET_DIMS) for name in PROFILE_NAMES}
+    prev: dict[str, int] = {}
+    for e in inside:
+        for name in PROFILE_NAMES:
+            w = e.get(name)
+            if not isinstance(w, str):
+                continue
+            word = int(w, 16)
+            if name in prev:
+                for d in range(len(MARKET_DIMS)):
+                    if word_dim(word, d) != word_dim(prev[name], d):
+                        flips[name][d] += 1
+            prev[name] = word
+    return flips
+
+
+def _engine_flips(
+    before: dict[str, object] | None, inside: list[dict[str, object]]
+) -> dict[str, list[int]] | None:
+    """Counter deltas from the engine samples: the last sample before the
+    window (same pid) or the first inside, to the last inside. ``None``
+    when the pid changed inside the window (a restart reset the counters)
+    or no engine sample exists."""
+    engines = [e for e in (_engine_of(x) for x in inside) if e is not None]
+    if not engines:
+        return None
+    pid = engines[0]["pid"]
+    if any(e["pid"] != pid for e in engines):
+        return None
+    base = before if before is not None and before.get("pid") == pid else engines[0]
+    last = engines[-1]
+    out: dict[str, list[int]] = {}
+    for name in PROFILE_NAMES:
+        b = typing.cast(dict[str, list[int]], base["flips"]).get(name, [])
+        cur = typing.cast(dict[str, list[int]], last["flips"]).get(name, [])
+        out[name] = [
+            max(0, int(cur[d]) - int(b[d])) if d < len(cur) and d < len(b) else 0
+            for d in range(len(MARKET_DIMS))
+        ]
+    return out
+
+
+def pnl_regime_present(reports_dir: pathlib.Path, day: str) -> bool:
+    """The day's ``pnl-<day>.json`` carries per-regime fill-model rows
+    (RG5's merged section) for at least one word per profile."""
+    path = reports_dir / f"pnl-{day}.json"
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return False
+    section = obj.get("regime") if isinstance(obj, dict) else None
+    profiles = section.get("profiles") if isinstance(section, dict) else None
+    if not isinstance(profiles, list) or not profiles:
+        return False
+    seen = {
+        str(p.get("profile"))
+        for p in profiles
+        if isinstance(p, dict)
+        and any(isinstance(w, dict) and w.get("strategies") for w in (p.get("words") or []))
+    }
+    return all(name in seen for name in PROFILE_NAMES)
+
+
+def judge_window(
+    entries: list[dict[str, object]],
+    w: SoakWindow,
+    reports_dir: pathlib.Path | None,
+    flips_max: int = FLIPS_MAX_PER_WINDOW,
+    min_samples: int = SOAK_MIN_SAMPLES,
+) -> WindowVerdict:
+    """One window under §7.1: coverage, gating live at every engine
+    sample, the flip bound from the engine's counters (else the mirror),
+    hard exits, the day report's per-regime section."""
+    inside = [e for e in entries if w.start_ms <= int(e.get("ts_ms", 0)) < w.end_ms]
+    before_entries = [e for e in entries if int(e.get("ts_ms", 0)) < w.start_ms]
+    before = _engine_of(before_entries[-1]) if before_entries else None
+    flips = _engine_flips(before, inside)
+    source = "engine"
+    if flips is None:
+        flips = _mirror_flips(inside)
+        source = "mirror" if inside else "none"
+    engines = [e for e in (_engine_of(x) for x in inside) if e is not None]
+    hard = 0
+    if engines and engines[0]["pid"] == engines[-1]["pid"]:
+        hard = max(0, int(engines[-1]["hard_exits"]) - int(engines[0]["hard_exits"]))
+    worst = ("", "", -1)
+    for name in PROFILE_NAMES:
+        for d, dim in enumerate(MARKET_DIMS):
+            if flips[name][d] > worst[2]:
+                worst = (name, dim, flips[name][d])
+    day = datetime.datetime.fromtimestamp(w.start_ms / 1000, tz=datetime.timezone.utc).strftime(
+        "%Y-%m-%d"
+    )
+    pnl_ok = pnl_regime_present(reports_dir, day) if reports_dir is not None else False
+    # Gating must have been LIVE through the window: the detector
+    # configured and a table active at every engine sample (§7.1).
+    ungated = any(
+        int(e.get("configured", 0)) == 0 or int(e.get("vm_rows", 0)) == 0 for e in engines
+    )
+    if len(inside) < min_samples:
+        verdict = "short"
+    elif ungated:
+        verdict = "ungated"
+    elif worst[2] > flips_max:
+        verdict = "FAIL"
+    else:
+        verdict = "PASS"
+    return WindowVerdict(
+        w.name, w.start_ms, w.end_ms, len(inside), source, flips, worst, hard, pnl_ok, verdict
+    )
+
+
+def run_soak(  # noqa: PLR0913 — one parameter per input source, deliberately
+    directory: pathlib.Path,
+    windows: list[SoakWindow],
+    reports_dir: pathlib.Path | None,
+    now_ms: int,
+    report: typing.Callable[[str], None] = print,
+    hours: int = HISTORY_HOURS,
+    min_windows: int = SOAK_MIN_WINDOWS,
+    source: str = "runs",
+) -> dict[str, object]:
+    """The ``soak`` lane: judge every window against the history tail,
+    print one line per window and the pooled verdict, write the JSON
+    beside the history. Never waits."""
+    entries = history_tail(directory, now_ms, hours)
+    verdicts = [judge_window(entries, w, reports_dir) for w in windows]
+    counted = [v for v in verdicts if v.verdict in ("PASS", "FAIL")]
+    failed = [v for v in counted if v.verdict == "FAIL"]
+    if len(counted) < min_windows:
+        pooled = "INSUFFICIENT"
+    elif failed:
+        pooled = "FAIL"
+    else:
+        pooled = "PASS"
+    for v in verdicts:
+        stamp = datetime.datetime.fromtimestamp(v.start_ms / 1000, tz=datetime.timezone.utc)
+        report(
+            f"soak {v.name} {stamp.strftime('%Y-%m-%dT%H:%MZ')} samples={v.samples}"
+            f" src={v.source} worst={v.worst[0]}/{v.worst[1]}={v.worst[2]}"
+            f" hard_exits={v.hard_exits} pnl_regime={'yes' if v.pnl_regime else 'no'}"
+            f" -> {v.verdict}"
+        )
+    report(
+        f"soak verdict: {pooled} (windows {len(windows)}, counted {len(counted)},"
+        f" failed {len(failed)}, need {min_windows}; flips ≤ {FLIPS_MAX_PER_WINDOW}"
+        f" per profile x dim per window; history {len(entries)} samples / {hours} h)"
+    )
+    out: dict[str, object] = {
+        "v": 1,
+        "now_ms": now_ms,
+        "law": "docs/regime-and-dashboard-plan.md §7.1 — N pooled ≤ 2 h windows, never a wait",
+        "flips_max_per_window": FLIPS_MAX_PER_WINDOW,
+        "min_windows": min_windows,
+        "min_samples": SOAK_MIN_SAMPLES,
+        "history_samples": len(entries),
+        "windows_source": source,
+        "windows": [v.as_json() for v in verdicts],
+        "counted": len(counted),
+        "failed": len(failed),
+        "verdict": pooled,
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc)
+    path = directory / f"soak-{stamp.strftime('%Y%m%dT%H%M%SZ')}.json"
+    path.write_text(json.dumps(out, indent=1, sort_keys=True), encoding="utf-8")
+    out["path"] = str(path)
     return out
 
 
@@ -1527,10 +1917,12 @@ def run_cycle(  # noqa: PLR0913, PLR0917 — one argument per input source
     now_ms: int,
     report: typing.Callable[[str], None] = print,
     refresh_daily: bool = True,
+    engine_url: str | None = None,
 ) -> Measurement | None:
     """The ``com.multivenue.regime`` 5-minute cycle: measure, append the
-    history line, and once per UTC day refresh the percentile lines. No
-    declaration — that is the AI's / operator's call (``declare``)."""
+    history line (with the engine's ``/state`` regime sample when it
+    answers — RG7), and once per UTC day refresh the percentile lines.
+    No declaration — that is the AI's / operator's call (``declare``)."""
     if not regime_path.is_file():
         report(f"regime cycle: {regime_path} absent — nothing to measure")
         return None
@@ -1538,10 +1930,17 @@ def run_cycle(  # noqa: PLR0913, PLR0917 — one argument per input source
         report(f"regime cycle: {db_path} absent — nothing to measure")
         return None
     m = measure(regime_path, db_path, now_ms)
-    append_history(directory, history_entry(m, now_ms))
+    state = engine_state(state_url() if engine_url is None else engine_url)
+    sample = engine_regime_sample(state) if state is not None else None
+    append_history(directory, history_entry(m, now_ms, sample))
     report(
         f"regime cycle: minute={m.minute} (lag {m.age_min} min) rows={m.rows}"
         f" fast={describe(m.evaluator.measured[0])} | slow={describe(m.evaluator.measured[1])}"
+        + (
+            f" engine pid={sample['pid']} judged={sample['minutes_judged']}"
+            if sample is not None
+            else " engine=unreachable"
+        )
     )
     if refresh_daily:
         stamp = directory / "params-refreshed-utc-day"
@@ -1726,6 +2125,17 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
         help="candles.db (default: $CLAUDE_WORKER_CANDLES_DB or ~/multivenue/worker/candles.db)",
     )
     seed.add_argument("--minutes", type=int, default=SEED_MINUTES_DEFAULT)
+    seed.add_argument(
+        "--refresh-tail",
+        action="store_true",
+        help="RG7: gap-fill the artifact's own 1 m candles to now before exporting",
+    )
+    seed.add_argument(
+        "--universe",
+        default=None,
+        help="universe.toml for --refresh-tail (default: the candles lane's)",
+    )
+    seed.add_argument("--now-ms", type=int, default=None, help="tests only")
     rep = sub.add_parser(
         "report",
         help="the worker-measured words + raw values, declaration, engine words, 24 h history",
@@ -1765,6 +2175,23 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
         "repush", help="post-boot: re-send the persisted declaration with its remaining TTL"
     )
     _add_common(rep2)
+    soak = sub.add_parser("soak", help="RG7: judge the ≤ 2 h windows (plan §7.1)")
+    _add_common(soak)
+    soak.add_argument(
+        "--pool",
+        default=None,
+        help="judge the standing pool's cuts instead of every complete window of the runs",
+    )
+    soak.add_argument(
+        "--replay-dir", default=None, help="runs root (default $CLAUDE_WORKER_REPLAY_DIR)"
+    )
+    soak.add_argument(
+        "--reports-dir",
+        default=None,
+        help="nightly reports dir (default $CLAUDE_WORKER_REPORTS_DIR)",
+    )
+    soak.add_argument("--hours", type=int, default=HISTORY_HOURS)
+    soak.add_argument("--min-windows", type=int, default=SOAK_MIN_WINDOWS)
     args = parser.parse_args(argv)
 
     if args.lane == "seed-out":
@@ -1777,7 +2204,23 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
         if not db_path.exists():
             print(f"regime seed-out: {db_path} absent — nothing to export", file=sys.stderr)
             return 2
-        n_desc, n_rows = seed_out(regime_path, db_path, out_path, args.minutes)
+        seed_now = args.now_ms if args.now_ms is not None else int(time.time() * 1000)
+        if args.refresh_tail:
+            universe = pathlib.Path(
+                args.universe
+                or os.environ.get(claude_worker.fetchers.UNIVERSE_FILE_ENV, "")
+                or claude_worker.candles.DEFAULT_UNIVERSE_PATH
+            ).expanduser()
+            touched = refresh_tail(
+                regime_path,
+                db_path,
+                universe,
+                seed_now,
+                os.environ,
+                lambda line: print(line, file=sys.stderr),
+            )
+            print(f"regime seed-out: tail refreshed for {touched} descriptors", file=sys.stderr)
+        n_desc, n_rows = seed_out(regime_path, db_path, out_path, args.minutes, seed_now)
         print(f"regime seed-out: {n_rows} rows for {n_desc} descriptors -> {out_path}")
         return 0
 
@@ -1799,6 +2242,35 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
         return 0
     if args.lane == "repush":
         return _repush_main(directory, now_ms)
+    if args.lane == "soak":
+        if args.pool:
+            windows = soak_windows_from_pool(pathlib.Path(args.pool).expanduser())
+            source = "pool"
+        else:
+            replay = pathlib.Path(
+                args.replay_dir
+                or os.environ.get("CLAUDE_WORKER_REPLAY_DIR", "")
+                or "~/multivenue/logs"
+            ).expanduser()
+            windows = soak_windows_from_runs(replay, now_ms - args.hours * 3_600_000)
+            source = "runs"
+        reports_dir = (
+            pathlib.Path(args.reports_dir).expanduser()
+            if args.reports_dir
+            else pathlib.Path(
+                os.environ.get("CLAUDE_WORKER_REPORTS_DIR", "") or "~/multivenue/worker/reports"
+            ).expanduser()
+        )
+        result = run_soak(
+            directory,
+            windows,
+            reports_dir,
+            now_ms,
+            hours=args.hours,
+            min_windows=args.min_windows,
+            source=source,
+        )
+        return 0 if result["verdict"] == "PASS" else 3
     if not regime_path.is_file():
         print(f"regime {args.lane}: {regime_path} absent", file=sys.stderr)
         return 2
