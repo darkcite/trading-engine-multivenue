@@ -111,7 +111,7 @@ pub fn load(path: &Path) -> Result<(RegimeFile, Vec<u8>), RegimeConfigError> {
     Ok((file, bytes))
 }
 
-const PROFILE_KEYS: [&str; 18] = [
+const PROFILE_KEYS: [&str; 22] = [
     "trend_w_min",
     "shape_w_min",
     "vol_w_min",
@@ -130,6 +130,12 @@ const PROFILE_KEYS: [&str; 18] = [
     "fund_prints",
     "fund_p30_1e9",
     "fund_p70_1e9",
+    // RG7 hysteresis (plan §3.5 as landed) — every one optional, 0 = the
+    // pre-fix law.
+    "confirm_min",
+    "trend_exit_bps_1e9",
+    "rv_exit_frac_1e9",
+    "stretch_exit_k_1e9",
 ];
 
 const MEMBER_NAMES: [&str; 6] = [
@@ -150,6 +156,17 @@ fn take_int(kv: &Kv, key: &str, sec: &str) -> Result<i64, RegimeConfigError> {
             "line {l}: `{key}` must be an integer"
         ))),
         None => Err(RegimeConfigError(format!("[{sec}]: missing `{key}`"))),
+    }
+}
+
+/// An optional integer key (absent ⇒ `default`).
+fn take_int_or(kv: &Kv, key: &str, default: i64) -> Result<i64, RegimeConfigError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        Some((_, Value::Int(v), _)) => Ok(*v),
+        Some((_, _, l)) => Err(RegimeConfigError(format!(
+            "line {l}: `{key}` must be an integer"
+        ))),
+        None => Ok(default),
     }
 }
 
@@ -212,6 +229,16 @@ fn finish_profile(kv: &Kv, sec: &str) -> Result<ProfileParams, RegimeConfigError
         take_int(kv, "rel_thr_bps_1e9", sec)?,
         take_int(kv, "fund_p30_1e9", sec)?,
         take_int(kv, "fund_p70_1e9", sec)?,
+    );
+    let confirm = take_int_or(kv, "confirm_min", 0)?;
+    let confirm = u8::try_from(confirm).map_err(|_| {
+        RegimeConfigError(format!("[{sec}]: `confirm_min` must fit u8, got {confirm}"))
+    })?;
+    let pp = pp.with_hysteresis(
+        confirm,
+        take_int_or(kv, "trend_exit_bps_1e9", 0)?,
+        take_int_or(kv, "rv_exit_frac_1e9", 0)?,
+        take_int_or(kv, "stretch_exit_k_1e9", 0)?,
     );
     pp.validate().map_err(|e| {
         RegimeConfigError(format!(
@@ -569,8 +596,20 @@ mod tests {
         assert_eq!(f.fund, "binance-usdm:btcusdt");
         assert_eq!(f.members.len(), 4);
         assert_eq!(f.confirm_min, 3);
-        assert_eq!(f.profiles[0], ProfileParams::FAST_DEFAULT);
+        // The fast profile carries the RG7 hysteresis (wider ER band +
+        // its own confirm + the TREND/VOL/STRETCH exit bands); the slow
+        // one is the pre-fix default (keys absent ⇒ zero).
+        let mut fast = ProfileParams::FAST_DEFAULT.with_hysteresis(
+            10,
+            20_000_000_000,
+            100_000_000,
+            1_500_000_000,
+        );
+        fast.er_lo_exit_1e9 = 400_000_000;
+        fast.er_hi_exit_1e9 = 500_000_000;
+        assert_eq!(f.profiles[0], fast);
         assert_eq!(f.profiles[1], ProfileParams::SLOW_DEFAULT);
+        assert_eq!(f.profiles[1].confirm_min, 0);
         assert!(
             f.labels.is_empty(),
             "the example's [labels] block is commented out"
@@ -659,6 +698,20 @@ mod tests {
         expect_err(
             &EXAMPLE.replace("shape_w_min = 60", "shape_w_min = 61"),
             "Window",
+        );
+        // RG7 hysteresis keys: a band beyond its entry threshold, a
+        // confirm that does not fit u8, a non-integer.
+        expect_err(
+            &EXAMPLE.replace("trend_exit_bps_1e9 = 20000000000", "trend_exit_bps_1e9 = 30000000001"),
+            "Bands",
+        );
+        expect_err(
+            &EXAMPLE.replace("confirm_min = 10", "confirm_min = 256"),
+            "must fit u8",
+        );
+        expect_err(
+            &EXAMPLE.replace("rv_exit_frac_1e9 = 100000000", "rv_exit_frac_1e9 = \"x\""),
+            "must be an integer",
         );
         expect_err(
             &EXAMPLE.replace("[profile.slow]", "[profile.fast]"),

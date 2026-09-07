@@ -276,6 +276,17 @@ def test_run_soak_pools_windows_and_never_waits(tmp_path, capsys) -> None:
     assert claude_worker.regime.main(["soak", *common]) == 0
     assert "soak verdict: PASS" in capsys.readouterr().out
     assert claude_worker.regime.main(["soak", "--min-windows", "9", *common]) == 3
+    # `--since`: the soak restarts from zero after a detector change —
+    # windows starting before the instant do not count (ISO or epoch ms).
+    since = base + 4 * WINDOW_MS
+    since_iso = datetime.datetime.fromtimestamp(since / 1000, tz=datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    assert claude_worker.regime.parse_since_ms(since_iso) == since
+    assert claude_worker.regime.parse_since_ms(str(since)) == since
+    assert claude_worker.regime.main(["soak", "--since", since_iso, *common]) == 3
+    assert "INSUFFICIENT (windows 4, counted 4" in capsys.readouterr().out
+    assert claude_worker.regime.main(["soak", "--since", str(base), "--min-windows", "8", *common]) == 0
     # Without --pool the windows come from the runs themselves (no cut
     # needed): an empty replay root has none ⇒ INSUFFICIENT.
     empty = tmp_path / "logs"

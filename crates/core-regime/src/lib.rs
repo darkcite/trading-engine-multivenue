@@ -75,10 +75,11 @@ pub mod math;
 
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::{
-    DIM_SHAPE, DIM_SOURCE, DIM_UNKNOWN_BIT, FUND_NEG, FUND_POS, LEVEL_HIGH, LEVEL_LOW,
-    LEVEL_NORMAL, REGIME_PROFILES, REL_INLINE, REL_LAGGING, REL_LEADING, REL_UNKNOWN, SHAPE_CHOP,
-    SHAPE_MIXED, SHAPE_TREND, SOURCE_DECLARED, SOURCE_MEASURED, STRETCH_EXT_DOWN, STRETCH_EXT_UP,
-    STRETCH_NEUTRAL, TREND_BEAR, TREND_BULL, TREND_NEUTRAL, VOL_HIGH, VOL_LOW, VOL_NORMAL,
+    DIM_SHAPE, DIM_SOURCE, DIM_STRETCH, DIM_TREND, DIM_UNKNOWN_BIT, DIM_VOL, FUND_NEG, FUND_POS,
+    LEVEL_HIGH, LEVEL_LOW, LEVEL_NORMAL, REGIME_PROFILES, REL_INLINE, REL_LAGGING, REL_LEADING,
+    REL_UNKNOWN, SHAPE_CHOP, SHAPE_MIXED, SHAPE_TREND, SOURCE_DECLARED, SOURCE_MEASURED,
+    STRETCH_EXT_DOWN, STRETCH_EXT_UP, STRETCH_NEUTRAL, TREND_BEAR, TREND_BULL, TREND_NEUTRAL,
+    VOL_HIGH, VOL_LOW, VOL_NORMAL,
 };
 use core_types::{RegimeWord, SymbolId, Tick, SYMBOL_ID_NONE, TICK_FLAG_STALE};
 
@@ -129,8 +130,12 @@ pub struct ProfileParams {
     /// FUND_LEVEL history length in prints (worker-side lookback; the
     /// engine carries it so the struct mirrors the file).
     pub fund_prints: u16,
+    /// Hysteresis (RG7 fix, plan §3.5): this profile's own confirm
+    /// length in consecutive minutes; 0 = inherit `[hysteresis]
+    /// confirm_min`.
+    pub confirm_min: u8,
     /// Explicit padding — always zero.
-    _pad0: u32,
+    _pad0: [u8; 3],
     /// TREND: BTC return beyond ±thr counts as directional (bps ×1e9).
     pub trend_thr_bps_1e9: i64,
     /// TREND: share of present members that must agree (×1e9).
@@ -155,6 +160,16 @@ pub struct ProfileParams {
     pub fund_p30_1e9: i64,
     /// FUND_LEVEL: p70 of the print history (rate ×1e9).
     pub fund_p70_1e9: i64,
+    /// TREND exit band (§3.5): a committed BULL/BEAR holds while
+    /// `|r| > trend_exit_bps_1e9`; 0 = no band (exit at the enter
+    /// threshold — the pre-fix law).
+    pub trend_exit_bps_1e9: i64,
+    /// VOL exit band (×1e9 fraction of the percentile): LOW holds while
+    /// `rv < p30·(1+f)`, HIGH while `rv > p70·(1−f)`; 0 = no band.
+    pub rv_exit_frac_1e9: i64,
+    /// STRETCH exit band: EXT holds while `|s| > stretch_exit_k_1e9`;
+    /// 0 = no band (exit at `k`).
+    pub stretch_exit_k_1e9: i64,
 }
 
 impl ProfileParams {
@@ -187,7 +202,8 @@ impl ProfileParams {
             stretch_w_min,
             rel_w_min,
             fund_prints,
-            _pad0: 0,
+            confirm_min: 0,
+            _pad0: [0; 3],
             trend_thr_bps_1e9,
             breadth_q_1e9,
             er_lo_enter_1e9,
@@ -200,7 +216,27 @@ impl ProfileParams {
             rel_thr_bps_1e9,
             fund_p30_1e9,
             fund_p70_1e9,
+            trend_exit_bps_1e9: 0,
+            rv_exit_frac_1e9: 0,
+            stretch_exit_k_1e9: 0,
         }
+    }
+
+    /// The RG7 hysteresis keys (plan §3.5 as landed): a per-profile
+    /// confirm length and the TREND / VOL / STRETCH exit bands. All zero
+    /// = the pre-fix law, bit for bit.
+    pub const fn with_hysteresis(
+        mut self,
+        confirm_min: u8,
+        trend_exit_bps_1e9: i64,
+        rv_exit_frac_1e9: i64,
+        stretch_exit_k_1e9: i64,
+    ) -> Self {
+        self.confirm_min = confirm_min;
+        self.trend_exit_bps_1e9 = trend_exit_bps_1e9;
+        self.rv_exit_frac_1e9 = rv_exit_frac_1e9;
+        self.stretch_exit_k_1e9 = stretch_exit_k_1e9;
+        self
     }
 
     /// The plan §3.2 / `regime.toml.example` defaults for `fast` (1 h).
@@ -289,6 +325,18 @@ impl ProfileParams {
         {
             return Err(RegimeErr::Percentile);
         }
+        // §3.5 exit bands: inside the enter threshold, never beyond it
+        // (a band wider than the entry would let a state hold that was
+        // never entered).
+        if self.trend_exit_bps_1e9 < 0
+            || self.trend_exit_bps_1e9 > self.trend_thr_bps_1e9
+            || self.rv_exit_frac_1e9 < 0
+            || self.rv_exit_frac_1e9 > SCALE_1E9 as i64
+            || self.stretch_exit_k_1e9 < 0
+            || self.stretch_exit_k_1e9 > self.stretch_k_1e9
+        {
+            return Err(RegimeErr::Bands);
+        }
         Ok(())
     }
 }
@@ -335,6 +383,34 @@ impl RegimeParams {
             _pad0: [0; 6],
             profiles,
         }
+    }
+
+    /// The confirm length profile `p` runs under (its own, else the
+    /// global one).
+    #[inline(always)]
+    pub const fn confirm_of(&self, p: usize) -> u8 {
+        let own = self.profiles[p].confirm_min;
+        if own != 0 {
+            own
+        } else {
+            self.confirm_min
+        }
+    }
+
+    /// The longest confirm length any profile runs under — the seed
+    /// replay depth (`2·max`) so every profile's judges start warm.
+    #[inline(always)]
+    pub const fn max_confirm_min(&self) -> u8 {
+        let mut m = self.confirm_min;
+        let mut p = 0usize;
+        while p < REGIME_PROFILES {
+            let own = self.profiles[p].confirm_min;
+            if own > m {
+                m = own;
+            }
+            p += 1;
+        }
+        m
     }
 
     /// Boot validation: real refs, ≤ 31 unique members none of which is
@@ -733,7 +809,7 @@ impl RegimeState {
         }
         self.seed_rows = self.seed_rows.saturating_add(applied);
         if applied > 0 {
-            let replay = 2 * self.params.confirm_min as i64;
+            let replay = 2 * self.params.max_confirm_min() as i64;
             let now = self.minute_end_mono.wrapping_sub(MINUTE_NS);
             let mut m = self.minute - replay;
             while m < self.minute {
@@ -932,11 +1008,11 @@ impl RegimeState {
     /// the roll instant (the freshness reference for the disagree law —
     /// the same instant the effective law sees).
     fn judge_minute(&mut self, m: i64, count: bool, now: NsTs) {
-        let confirm = self.params.confirm_min;
         let n_members = self.params.n_members as usize;
         let mut p = 0usize;
         while p < REGIME_PROFILES {
             let pp = self.params.profiles[p];
+            let confirm = self.params.confirm_of(p);
             let btc = &self.syms[SLOT_BTC as usize].ring;
             let mut raw = RegimeRaw::default();
 
@@ -1014,7 +1090,15 @@ impl RegimeState {
 
             // --- candidates ---
             let trend_cand = match ret {
-                Some(r) if breadth_ok => judge_trend(r, up, dn, present, n_members, &pp),
+                Some(r) if breadth_ok => judge_trend(
+                    self.judges[p][DIM_TREND as usize].cur,
+                    r,
+                    up,
+                    dn,
+                    present,
+                    n_members,
+                    &pp,
+                ),
                 _ => ABSENT,
             };
             let shape_cand = match er {
@@ -1022,7 +1106,7 @@ impl RegimeState {
                 None => ABSENT,
             };
             let vol_cand = match rv {
-                Some(v) => judge_vol(v, &pp),
+                Some(v) => judge_vol(self.judges[p][DIM_VOL as usize].cur, v, &pp),
                 None => ABSENT,
             };
             let fund_cand = match funding {
@@ -1034,7 +1118,7 @@ impl RegimeState {
                 None => ABSENT,
             };
             let stretch_cand = match stretch {
-                Some(s) => judge_stretch(s, &pp),
+                Some(s) => judge_stretch(self.judges[p][DIM_STRETCH as usize].cur, s, &pp),
                 None => ABSENT,
             };
 
@@ -1369,9 +1453,15 @@ pub fn rv_over(ring: &[i64; REGIME_RING_MIN], m: i64, w: u16) -> Option<i64> {
     Some(isqrt_i128(sum))
 }
 
-/// TREND candidate from the BTC return + breadth counts.
+/// TREND candidate from the BTC return + breadth counts, relative to
+/// the committed state: with an exit band configured a BULL/BEAR holds
+/// while `|r|` stays beyond it (§3.5; breadth is an ENTRY condition —
+/// it is not re-asked to hold), else the enter law — bit for bit the
+/// pre-fix law when no band is set.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn judge_trend(
+    cur: u8,
     r: i64,
     up: u8,
     dn: u8,
@@ -1379,6 +1469,15 @@ pub fn judge_trend(
     n_members: usize,
     pp: &ProfileParams,
 ) -> u8 {
+    if pp.trend_exit_bps_1e9 > 0 {
+        let exit = pp.trend_exit_bps_1e9;
+        if cur == TREND_BULL && r > exit {
+            return TREND_BULL;
+        }
+        if cur == TREND_BEAR && r < -exit {
+            return TREND_BEAR;
+        }
+    }
     let agree_up =
         n_members == 0 || (up as i128) * SCALE_1E9 >= pp.breadth_q_1e9 as i128 * present as i128;
     let agree_dn =
@@ -1420,12 +1519,26 @@ pub fn judge_shape(cur: u8, er: i64, pp: &ProfileParams) -> u8 {
     }
 }
 
-/// VOL candidate (`ABSENT` while both percentiles are 0).
+/// VOL candidate (`ABSENT` while both percentiles are 0), relative to
+/// the committed state: LOW holds while `rv < p30·(1+f)`, HIGH while
+/// `rv > p70·(1−f)` (§3.5; `f` = `rv_exit_frac_1e9`, 0 = no band).
 #[inline]
-pub fn judge_vol(rv: i64, pp: &ProfileParams) -> u8 {
+pub fn judge_vol(cur: u8, rv: i64, pp: &ProfileParams) -> u8 {
     if pp.rv_p30_bps_1e9 == 0 && pp.rv_p70_bps_1e9 == 0 {
-        ABSENT
-    } else if rv < pp.rv_p30_bps_1e9 {
+        return ABSENT;
+    }
+    if pp.rv_exit_frac_1e9 > 0 {
+        let f = pp.rv_exit_frac_1e9 as i128;
+        let lo_hold = floor_div(pp.rv_p30_bps_1e9 as i128 * (SCALE_1E9 + f), SCALE_1E9);
+        let hi_hold = floor_div(pp.rv_p70_bps_1e9 as i128 * (SCALE_1E9 - f), SCALE_1E9);
+        if cur == VOL_LOW && (rv as i128) < lo_hold {
+            return VOL_LOW;
+        }
+        if cur == VOL_HIGH && (rv as i128) > hi_hold {
+            return VOL_HIGH;
+        }
+    }
+    if rv < pp.rv_p30_bps_1e9 {
         VOL_LOW
     } else if rv > pp.rv_p70_bps_1e9 {
         VOL_HIGH
@@ -1458,9 +1571,19 @@ pub fn judge_fund_level(rate_1e9: i64, pp: &ProfileParams) -> u8 {
     }
 }
 
-/// STRETCH candidate.
+/// STRETCH candidate relative to the committed state: an EXT holds
+/// while `|s|` stays beyond the exit band (§3.5; 0 = exit at `k`).
 #[inline]
-pub fn judge_stretch(stretch_1e9: i64, pp: &ProfileParams) -> u8 {
+pub fn judge_stretch(cur: u8, stretch_1e9: i64, pp: &ProfileParams) -> u8 {
+    if pp.stretch_exit_k_1e9 > 0 {
+        let exit = pp.stretch_exit_k_1e9;
+        if cur == STRETCH_EXT_UP && stretch_1e9 > exit {
+            return STRETCH_EXT_UP;
+        }
+        if cur == STRETCH_EXT_DOWN && stretch_1e9 < -exit {
+            return STRETCH_EXT_DOWN;
+        }
+    }
     if stretch_1e9 > pp.stretch_k_1e9 {
         STRETCH_EXT_UP
     } else if stretch_1e9 < -pp.stretch_k_1e9 {
@@ -1904,7 +2027,7 @@ mod tests {
         assert_eq!(s.funding(), (250_000, 1));
         let pp = ProfileParams::FAST_DEFAULT; // percentiles 0 ⇒ ABSENT
         assert_eq!(judge_fund_level(5, &pp), ABSENT);
-        assert_eq!(judge_vol(5, &pp), ABSENT);
+        assert_eq!(judge_vol(ABSENT, 5, &pp), ABSENT);
     }
 
     #[test]
@@ -2065,23 +2188,96 @@ mod tests {
     #[test]
     fn candidate_laws() {
         let pp = short_profile();
-        assert_eq!(judge_trend(40_000_000_000, 2, 0, 3, 3, &pp), TREND_BULL); // 2/3 ≥ 0.6
-        assert_eq!(judge_trend(40_000_000_000, 1, 0, 3, 3, &pp), TREND_NEUTRAL);
-        assert_eq!(judge_trend(-40_000_000_000, 0, 3, 3, 3, &pp), TREND_BEAR);
-        assert_eq!(judge_trend(-40_000_000_000, 0, 0, 0, 0, &pp), TREND_BEAR); // no members
-        assert_eq!(judge_trend(10_000_000_000, 3, 0, 3, 3, &pp), TREND_NEUTRAL);
-        assert_eq!(judge_vol(5_000_000_000, &pp), VOL_LOW);
-        assert_eq!(judge_vol(50_000_000_000, &pp), VOL_NORMAL);
-        assert_eq!(judge_vol(500_000_000_000, &pp), VOL_HIGH);
+        let a = ABSENT;
+        assert_eq!(judge_trend(a, 40_000_000_000, 2, 0, 3, 3, &pp), TREND_BULL); // 2/3 ≥ 0.6
+        assert_eq!(judge_trend(a, 40_000_000_000, 1, 0, 3, 3, &pp), TREND_NEUTRAL);
+        assert_eq!(judge_trend(a, -40_000_000_000, 0, 3, 3, 3, &pp), TREND_BEAR);
+        assert_eq!(judge_trend(a, -40_000_000_000, 0, 0, 0, 0, &pp), TREND_BEAR); // no members
+        assert_eq!(judge_trend(a, 10_000_000_000, 3, 0, 3, 3, &pp), TREND_NEUTRAL);
+        assert_eq!(judge_vol(a, 5_000_000_000, &pp), VOL_LOW);
+        assert_eq!(judge_vol(a, 50_000_000_000, &pp), VOL_NORMAL);
+        assert_eq!(judge_vol(a, 500_000_000_000, &pp), VOL_HIGH);
         assert_eq!(judge_fund_sign(-1), FUND_NEG);
         assert_eq!(judge_fund_sign(0), FUND_POS);
         assert_eq!(judge_fund_level(-200_000, &pp), LEVEL_LOW);
-        assert_eq!(judge_stretch(2_000_000_001, &pp), STRETCH_EXT_UP);
-        assert_eq!(judge_stretch(-2_000_000_001, &pp), STRETCH_EXT_DOWN);
-        assert_eq!(judge_stretch(0, &pp), STRETCH_NEUTRAL);
+        assert_eq!(judge_stretch(a, 2_000_000_001, &pp), STRETCH_EXT_UP);
+        assert_eq!(judge_stretch(a, -2_000_000_001, &pp), STRETCH_EXT_DOWN);
+        assert_eq!(judge_stretch(a, 0, &pp), STRETCH_NEUTRAL);
         assert_eq!(judge_rel(-60_000_000_000, pp.rel_thr_bps_1e9), REL_LAGGING);
         assert_eq!(judge_rel(60_000_000_000, pp.rel_thr_bps_1e9), REL_LEADING);
         assert_eq!(judge_rel(0, pp.rel_thr_bps_1e9), REL_INLINE);
+    }
+
+    /// RG7 hysteresis: without bands the committed state is irrelevant
+    /// (the pre-fix law, bit for bit); with bands a committed BULL/BEAR,
+    /// LOW/HIGH or EXT holds inside the band and releases beyond it.
+    #[test]
+    fn exit_bands_hold_the_committed_state_only_inside_the_band() {
+        let plain = short_profile();
+        // No band: cur changes nothing.
+        assert_eq!(judge_trend(TREND_BULL, 20_000_000_000, 0, 0, 3, 3, &plain), TREND_NEUTRAL);
+        assert_eq!(judge_vol(VOL_LOW, 10_000_000_000, &plain), VOL_NORMAL); // == p30 ⇒ NORMAL
+        assert_eq!(judge_stretch(STRETCH_EXT_UP, 1_900_000_000, &plain), STRETCH_NEUTRAL);
+        // No band: a committed BULL without breadth agreement drops (the pre-fix law).
+        assert_eq!(judge_trend(TREND_BULL, 40_000_000_000, 0, 0, 3, 3, &plain), TREND_NEUTRAL);
+
+        let pp = plain.with_hysteresis(0, 20_000_000_000, 100_000_000, 1_500_000_000);
+        assert!(pp.validate().is_ok());
+        // TREND: BULL holds at 25 bps (> exit 20) without breadth, releases at 20.
+        assert_eq!(judge_trend(TREND_BULL, 25_000_000_000, 0, 0, 3, 3, &pp), TREND_BULL);
+        assert_eq!(judge_trend(TREND_BULL, 20_000_000_000, 0, 0, 3, 3, &pp), TREND_NEUTRAL);
+        assert_eq!(judge_trend(TREND_BEAR, -25_000_000_000, 0, 0, 3, 3, &pp), TREND_BEAR);
+        assert_eq!(judge_trend(TREND_NEUTRAL, 25_000_000_000, 3, 0, 3, 3, &pp), TREND_NEUTRAL);
+        assert_eq!(judge_trend(TREND_NEUTRAL, 31_000_000_000, 3, 0, 3, 3, &pp), TREND_BULL);
+        // VOL: p30 = 10 bps, p70 = 100 bps (short_profile); LOW holds below 11, HIGH above 90.
+        assert_eq!(judge_vol(VOL_LOW, 10_900_000_000, &pp), VOL_LOW);
+        assert_eq!(judge_vol(VOL_LOW, 11_000_000_000, &pp), VOL_NORMAL);
+        assert_eq!(judge_vol(VOL_NORMAL, 10_900_000_000, &pp), VOL_NORMAL);
+        assert_eq!(judge_vol(VOL_HIGH, 90_100_000_000, &pp), VOL_HIGH);
+        assert_eq!(judge_vol(VOL_HIGH, 90_000_000_000, &pp), VOL_NORMAL);
+        assert_eq!(judge_vol(VOL_NORMAL, 100_000_000_001, &pp), VOL_HIGH);
+        // STRETCH: EXT holds above 1.5, releases at 1.5.
+        assert_eq!(judge_stretch(STRETCH_EXT_UP, 1_600_000_000, &pp), STRETCH_EXT_UP);
+        assert_eq!(judge_stretch(STRETCH_EXT_UP, 1_500_000_000, &pp), STRETCH_NEUTRAL);
+        assert_eq!(judge_stretch(STRETCH_EXT_DOWN, -1_600_000_000, &pp), STRETCH_EXT_DOWN);
+        assert_eq!(judge_stretch(STRETCH_NEUTRAL, 1_600_000_000, &pp), STRETCH_NEUTRAL);
+        // Bands beyond the entry are refused; the frac is 0..=1e9.
+        assert_eq!(plain.with_hysteresis(0, 30_000_000_001, 0, 0).validate(), Err(RegimeErr::Bands));
+        assert_eq!(plain.with_hysteresis(0, 0, 1_000_000_001, 0).validate(), Err(RegimeErr::Bands));
+        assert_eq!(plain.with_hysteresis(0, 0, 0, 2_000_000_001).validate(), Err(RegimeErr::Bands));
+        assert_eq!(plain.with_hysteresis(0, -1, 0, 0).validate(), Err(RegimeErr::Bands));
+    }
+
+    /// RG7 hysteresis: a profile's own `confirm_min` overrides the global
+    /// one for that profile only; the seed replay depth follows the max.
+    #[test]
+    fn per_profile_confirm_overrides_the_global_one() {
+        let mut ps = params(0, 2);
+        ps.profiles[0] = ps.profiles[0].with_hysteresis(5, 0, 0, 0);
+        assert_eq!(ps.confirm_of(0), 5);
+        assert_eq!(ps.confirm_of(1), 2);
+        assert_eq!(ps.max_confirm_min(), 5);
+        assert!(ps.validate().is_ok());
+        let mut s = RegimeState::new_boxed();
+        s.configure(&ps, anchor(), T0_MONO).unwrap();
+        // A step from flat to a +50 bps ramp: the slow profile (confirm
+        // 2) commits BULL two minutes before the fast one (confirm 5).
+        run_minutes(&mut s, &[BTC], 12, |_, _| 100_000_000);
+        let mut k = 0i64;
+        let mut fast_at = None;
+        let mut slow_at = None;
+        while k < 12 {
+            run_minutes(&mut s, &[BTC], 1, |_, _| 100_000_000 + (k + 1) * 2_000_000);
+            if fast_at.is_none() && s.measured(0).value_of(DIM_TREND) == Some(TREND_BULL) {
+                fast_at = Some(k);
+            }
+            if slow_at.is_none() && s.measured(1).value_of(DIM_TREND) == Some(TREND_BULL) {
+                slow_at = Some(k);
+            }
+            k += 1;
+        }
+        let (f, sl) = (fast_at.expect("fast commits"), slow_at.expect("slow commits"));
+        assert_eq!(f - sl, 3, "fast {f} slow {sl}");
     }
 
     #[test]

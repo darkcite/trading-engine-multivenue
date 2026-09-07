@@ -239,6 +239,29 @@ the row's action `sym` is the symbol judged) and (b) as a feature
   (`engine_regime_flips_total`), and the soak gate (§7 RG7) bounds them.
 - A DECLARED word is never hysteresis-filtered — it is the AI's call.
 
+**As landed (2026-09-07, the RG7 fix — the first soak FAILED on
+fast-profile flicker, §12):** RG1 had given a band to SHAPE only. Now
+TREND, VOL and STRETCH carry optional exit bands and each profile may
+carry its own confirm length; every key is optional and 0 = the RG1 law
+bit for bit (parity fixture 1 unchanged; fixture 2 = the same tape under
+the keys):
+
+| key (`[profile.<name>]`) | law |
+|---|---|
+| `confirm_min` | this profile's consecutive-minute confirm; 0 = `[hysteresis] confirm_min`. The seed replay warms `2·max` over the profiles. |
+| `trend_exit_bps_1e9` | a committed BULL/BEAR holds while `|r| > exit` — breadth is an ENTRY condition, not re-asked to hold; 0 = exit at the enter threshold |
+| `rv_exit_frac_1e9` | LOW holds while `rv < p30·(1+f)`, HIGH while `rv > p70·(1−f)`; 0 = no band |
+| `stretch_exit_k_1e9` | an EXT holds while `|s| > exit`; 0 = exit at `k` |
+| `er_lo_exit_1e9` / `er_hi_exit_1e9` | (RG1) the SHAPE band — widened to 0.40 / 0.50 on the fast profile |
+
+Bands live INSIDE their entry threshold (validator: `RegimeErr::Bands`).
+FUND_LEVEL and REL keep single thresholds + confirm (no flicker seen).
+The `regime.toml.example` fast profile carries the values the offline
+replay chose (confirm 10, trend exit 20 bps, vol ±10 %, stretch 1.5, ER
+exits 0.40/0.50): on the nine failed windows the pre-fix law fails 8/9,
+confirm 10 alone 2/9, bands alone 6/9, both 1/9 (a genuine vol=high
+night). The slow profile keeps the RG1 law.
+
 ### 3.6 Measured vs declared vs effective
 
 ```
@@ -484,6 +507,9 @@ untouched — regime change never touches the tables (§2.4).
                 rv_p30_bps_1e9 = …  rv_p70_bps_1e9 = …       # worker-refreshed daily
                 stretch_k_1e9 = 2000000000  rel_thr_bps_1e9 = …
                 fund_p30_1e9 = …  fund_p70_1e9 = …           # worker-refreshed daily
+                # RG7 hysteresis (§3.5 as landed) — optional, 0 = the RG1 law
+                confirm_min = 10  trend_exit_bps_1e9 = 20000000000
+                rv_exit_frac_1e9 = 100000000  stretch_exit_k_1e9 = 1500000000
 [profile.slow]  …(4 h)…
 [labels]      # optional overrides of the coded constants; `terms` = up to 4 product terms (∃-semantics), each may mix fast:/slow: prefixes
 latency_arb = { terms = [["fast:vol:!high"]], off = "soft" }
@@ -875,6 +901,11 @@ is therefore never a calendar span. It is a COUNT of disjoint, complete,
   N ≥ 8; the JSON goes under `~/multivenue/worker/regime/soak-<utc>.json`
   (worker state, never git). The operator's close ruling follows a
   PASS.
+- **Reset.** A detector change (parameters or law) restarts the soak
+  from zero: `soak --since <ISO-8601|epoch ms>` counts only windows
+  starting at/after the instant the change went live (2026-09-07: the
+  hysteresis fix, `--since 2026-09-07T07:04:07Z`). Windows judged under
+  the old law are history, not evidence.
 
 ### 7.2 RG8 — label enforcement (operator ruling 2026-09-05)
 
@@ -2153,3 +2184,75 @@ worker-side layers are the enforcement that is live.
   icdp is labelled). The RG4 "≥ 2 members committed live" tell stays
   OPEN (carry evidence is empty/negative under the 2 h law — finding
   above).
+
+- **2026-09-07 06:38Z — RG7 SOAK VERDICT: FAIL (operator asked "check the
+  RG7 state — if everything is good, close it"; it is NOT good — RG7 stays
+  OPEN).** The judge now counts every window (9 windows, 22–24 samples
+  each, `src=engine`, per-regime P&L on the 09-06 windows): `FAIL
+  (windows 9, counted 9, failed 7, need 8)`. The FAST profile breaks the
+  ≤ 2 flips bound on `shape` (3–7 per window) and `trend` (3–6); the
+  SLOW profile passes everywhere (≤ 1). Root causes (vault:
+  `docs/research/rg7-soak-flicker-2026-09-07.md`, replayed by a
+  `tools_` one-shot per `docs/arch/research-tools-exclusion-plan.md` —
+  both git-excluded): (1) §3.5 is
+  half-implemented — only SHAPE has enter/exit bands; TREND / VOL /
+  STRETCH / FUND_LEVEL / REL are single thresholds guarded only by
+  `confirm_min`; (2) `confirm_min = 3` is global and thin for a 60-min
+  horizon judged in 5-min steps; (3) one window (09-07 02:00Z, a
+  vol=high night) is genuine motion at the fast horizon. Offline replay
+  of the reference evaluator over the same 9 windows: live law 8/9 fail;
+  confirm 10 → 2/9; §3.5 bands alone → 6/9; **bands + confirm 10 → 1/9**
+  (the wild window: trend 4, vol 5); confirm 15 → 1/9. Closing needs:
+  (a) code — per-profile `confirm_min` (fast ≈ 10) + the §3.5 exit bands
+  for TREND/VOL/STRETCH in `core-regime` + the worker mirror + the parity
+  fixture + `regime.toml.example` (bit-identical when absent), then the
+  live `regime.toml` values + restart + a FRESH soak of N ≥ 8 windows
+  after the change (never a wait); (b) possibly a ruling on the bound
+  (2 per profile × dim per 2 h is the 24/day restated uniformly; a 60-min
+  fast profile can legitimately move more in a wild 2 h — options: keep
+  2, or fast ≤ 4 / slow ≤ 2, or median-window with one outlier). Nothing
+  changed live; no code changed; the verdict record is
+  `~/multivenue/worker/regime/soak-20260907T063759Z.json`.
+
+- **2026-09-07 07:04Z — RG7 HYSTERESIS FIX LANDED + LIVE (operator pick
+  by AskUserQuestion: "Build the hysteresis fix (Recommended)"; the
+  bound stays 2; uncommitted — operator commits).** Engine
+  (`core-regime`): `ProfileParams` gains `confirm_min` (0 = inherit; the
+  old `_pad0` byte) + `trend_exit_bps_1e9` / `rv_exit_frac_1e9` /
+  `stretch_exit_k_1e9` (trailing i64, 0 = the RG1 law),
+  `with_hysteresis(..)`, `RegimeParams::{confirm_of, max_confirm_min}`;
+  `judge_trend` / `judge_vol` / `judge_stretch` take the committed state
+  like `judge_shape` (a band holds a committed state INSIDE it; breadth
+  is an entry condition; without a band every judge is the RG1 law bit
+  for bit — parity fixture 1 regenerated byte-identical); the seed
+  replay warms `2·max confirm`; `validate` refuses a band beyond its
+  entry (`RegimeErr::Bands`); tests `exit_bands_hold_the_committed_state_only_inside_the_band`,
+  `per_profile_confirm_overrides_the_global_one`. `core-config::regime`:
+  four OPTIONAL profile keys (`take_int_or`), `confirm_min` u8-checked;
+  `regime.toml.example` fast profile = confirm 10, trend exit 20 bps,
+  vol ±10 %, stretch 1.5, ER exits 0.40/0.50 (slow unchanged); parity
+  harness runs `parity-1` + the new `parity-2` (same tape under the
+  keys; `hysteresis_fixture_flips_less_than_the_plain_one`). Worker
+  (`claude_worker.regime`): the mirror (dataclass defaults, `confirm_of`
+  / `max_confirm_min`, stateful judges, `_vol_holds`, optional keys in
+  `read_regime_params`, `measure()` replays `2·max`), `soak --since`
+  (`parse_since_ms`, ISO or ms) — the soak reset law (§7.1); tests
+  `test_regime.py` (both fixtures parametrized + the band/confirm
+  mirror test), `test_regime_lane.py` (example values), `test_regime_soak.py`
+  (`--since`). The research one-shot re-run through the PRODUCTION
+  mirror reproduces the offline numbers exactly (pre-fix 8/9, confirm 10
+  alone 2/9, bands alone 6/9, both 1/9). Gates: worker pytest 901
+  (3 skipped), nextest 1602, alloc 42/42 (fresh `Compiling bench`),
+  `make lint`, `make license-check` (281), release relinked 14:01
+  local. LIVE: `~/multivenue/regime.toml` `[profile.fast]` got the
+  example's keys + ER exits 0.40/0.50 (backup `regime.toml.bak-20260907T*`;
+  the Rust parser accepted it through a harness run first); SIGTERM →
+  KeepAlive, pid 73804 since 07:04:07Z, `regime: artifact configured
+  hash=e80d77ef…`, mask 48, `vm_rows_active 2` (`fde6f733…`), all six
+  venues up. **SOAK RESET:** `regime soak --since 2026-09-07T07:04:07Z`
+  = `INSUFFICIENT (windows 0, counted 0, need 8)` — the first counted
+  windows come from the 08:30Z T2 run (3), then the 16:05Z run (3),
+  then the 00:00Z run (4) ⇒ N ≥ 8 by ≈ 08:00Z 2026-09-08 (never a
+  wait; the judge says so until then). RG7 stays OPEN; close = PASS on
+  those windows + the operator's ruling. Docs: §3.5 "As landed" table,
+  §4.6 keys, §7.1 reset law, `docs/migration.md` entry.

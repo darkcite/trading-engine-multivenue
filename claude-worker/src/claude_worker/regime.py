@@ -28,7 +28,7 @@ stays frozen — module-lane precedent ``pnl_report``/``candles``):
   the engine's own words read from ``/metrics`` (``/state`` is RG6), and
   the last 24 h of worker words — the AI's input in semi-manual mode.
   The measurement is the engine's SEED law over candles.db: fill the
-  rings, latch the latest funding print, judge the last ``2·confirm_min``
+  rings, latch the latest funding print, judge the last ``2·max confirm``
   closed minutes.
 - ``declare --fast "trend:bull,shape:trend" --slow measured --ttl 900``:
   persist ``declared.json`` and send one ``SetRegime`` frame per profile
@@ -174,6 +174,25 @@ class ProfileParams:
     rel_thr_bps_1e9: int
     fund_p30_1e9: int
     fund_p70_1e9: int
+    # RG7 hysteresis (plan §3.5 as landed) — 0 = the pre-fix law.
+    confirm_min: int = 0
+    trend_exit_bps_1e9: int = 0
+    rv_exit_frac_1e9: int = 0
+    stretch_exit_k_1e9: int = 0
+
+
+#: The 18 keys every `[profile.<name>]` must carry.
+_PROFILE_KEYS_REQUIRED: tuple[str, ...] = (
+    "trend_w_min", "shape_w_min", "vol_w_min", "stretch_w_min", "rel_w_min", "fund_prints",
+    "trend_thr_bps_1e9", "breadth_q_1e9",
+    "er_lo_enter_1e9", "er_lo_exit_1e9", "er_hi_enter_1e9", "er_hi_exit_1e9",
+    "rv_p30_bps_1e9", "rv_p70_bps_1e9", "stretch_k_1e9", "rel_thr_bps_1e9",
+    "fund_p30_1e9", "fund_p70_1e9",
+)
+#: The RG7 hysteresis keys — optional, 0 when absent.
+_PROFILE_KEYS_OPTIONAL: tuple[str, ...] = (
+    "confirm_min", "trend_exit_bps_1e9", "rv_exit_frac_1e9", "stretch_exit_k_1e9",
+)
 
 
 FAST_DEFAULT: ProfileParams = ProfileParams(
@@ -199,6 +218,15 @@ class RegimeParams:
     members: tuple[int, ...]
     confirm_min: int
     profiles: tuple[ProfileParams, ...]
+
+    def confirm_of(self, p: int) -> int:
+        """The confirm length profile ``p`` runs under (its own, else the
+        global one) — ``RegimeParams::confirm_of``."""
+        return self.profiles[p].confirm_min or self.confirm_min
+
+    def max_confirm_min(self) -> int:
+        """The seed replay depth's base (``2·max``) — ``max_confirm_min``."""
+        return max(self.confirm_min, *(pp.confirm_min for pp in self.profiles))
 
 
 # ---- the pure law (mirrored function by function) ----
@@ -263,7 +291,15 @@ def rv_over(ring: list[int], m: int, w: int) -> int | None:
     return isqrt_i128(total)
 
 
-def judge_trend(r: int, up: int, dn: int, present: int, n_members: int, pp: ProfileParams) -> int:
+def judge_trend(  # noqa: PLR0913, PLR0917 — the engine's argument list, mirrored
+    cur: int, r: int, up: int, dn: int, present: int, n_members: int, pp: ProfileParams
+) -> int:
+    if pp.trend_exit_bps_1e9 > 0:
+        exit_thr = pp.trend_exit_bps_1e9
+        if cur == TREND_BULL and r > exit_thr:
+            return TREND_BULL
+        if cur == TREND_BEAR and r < -exit_thr:
+            return TREND_BEAR
     agree_up = n_members == 0 or up * SCALE_1E9 >= pp.breadth_q_1e9 * present
     agree_dn = n_members == 0 or dn * SCALE_1E9 >= pp.breadth_q_1e9 * present
     if r > pp.trend_thr_bps_1e9 and agree_up:
@@ -289,9 +325,23 @@ def judge_shape(cur: int, er: int, pp: ProfileParams) -> int:
     return SHAPE_MIXED
 
 
-def judge_vol(rv: int, pp: ProfileParams) -> int:
+def _vol_holds(cur: int, rv: int, pp: ProfileParams) -> bool:
+    """§3.5 VOL exit band: a committed LOW/HIGH holds inside it."""
+    if pp.rv_exit_frac_1e9 <= 0:
+        return False
+    f = pp.rv_exit_frac_1e9
+    if cur == VOL_LOW:
+        return rv < floor_div(pp.rv_p30_bps_1e9 * (SCALE_1E9 + f), SCALE_1E9)
+    if cur == VOL_HIGH:
+        return rv > floor_div(pp.rv_p70_bps_1e9 * (SCALE_1E9 - f), SCALE_1E9)
+    return False
+
+
+def judge_vol(cur: int, rv: int, pp: ProfileParams) -> int:
     if pp.rv_p30_bps_1e9 == 0 and pp.rv_p70_bps_1e9 == 0:
         return ABSENT
+    if _vol_holds(cur, rv, pp):
+        return cur
     if rv < pp.rv_p30_bps_1e9:
         return VOL_LOW
     if rv > pp.rv_p70_bps_1e9:
@@ -313,7 +363,13 @@ def judge_fund_level(rate_1e9: int, pp: ProfileParams) -> int:
     return LEVEL_NORMAL
 
 
-def judge_stretch(stretch_1e9: int, pp: ProfileParams) -> int:
+def judge_stretch(cur: int, stretch_1e9: int, pp: ProfileParams) -> int:
+    if pp.stretch_exit_k_1e9 > 0:
+        exit_k = pp.stretch_exit_k_1e9
+        if cur == STRETCH_EXT_UP and stretch_1e9 > exit_k:
+            return STRETCH_EXT_UP
+        if cur == STRETCH_EXT_DOWN and stretch_1e9 < -exit_k:
+            return STRETCH_EXT_DOWN
     if stretch_1e9 > pp.stretch_k_1e9:
         return STRETCH_EXT_UP
     if stretch_1e9 < -pp.stretch_k_1e9:
@@ -424,6 +480,15 @@ class RegimeEvaluator:
             raise ValueError("exactly two profiles")
         if not 1 <= params.confirm_min <= 255:
             raise ValueError("confirm_min in 1..=255")
+        for pp in params.profiles:
+            if not 0 <= pp.confirm_min <= 255:
+                raise ValueError("profile confirm_min in 0..=255")
+            if (
+                not 0 <= pp.trend_exit_bps_1e9 <= pp.trend_thr_bps_1e9
+                or not 0 <= pp.rv_exit_frac_1e9 <= SCALE_1E9
+                or not 0 <= pp.stretch_exit_k_1e9 <= pp.stretch_k_1e9
+            ):
+                raise ValueError("exit bands inside their entry thresholds (§3.5)")
         if len(params.members) > REGIME_MAX_MEMBERS or len(set(params.members)) != len(params.members):
             raise ValueError("members: ≤ 31, unique")
         if params.btc_ref in params.members:
@@ -509,12 +574,12 @@ class RegimeEvaluator:
         return changed
 
     def _judge_minute(self, m: int, now_ns: int, count: bool) -> None:
-        confirm = self.params.confirm_min
         members = self.params.members
         n_members = len(members)
         btc = self.rings[self.params.btc_ref]
         for p in range(REGIME_PROFILES):
             pp = self.params.profiles[p]
+            confirm = self.params.confirm_of(p)
             raw = Raw()
             ret = ret_over(btc, m, pp.trend_w_min)
             raw.ret_bps_1e9 = ret
@@ -552,13 +617,19 @@ class RegimeEvaluator:
                 funding = self.funding_rate_1e9
                 raw.funding_1e9 = funding
 
+            judges = self.judges[p]
+            trend_cand = ABSENT
+            if ret is not None and breadth_ok:
+                trend_cand = judge_trend(judges[DIM_TREND].cur, ret, up, dn, present, n_members, pp)
             cands = [
-                judge_trend(ret, up, dn, present, n_members, pp) if ret is not None and breadth_ok else ABSENT,
-                judge_shape(self.judges[p][DIM_SHAPE].cur, er, pp) if er is not None else ABSENT,
-                judge_vol(rv, pp) if rv is not None else ABSENT,
+                trend_cand,
+                judge_shape(judges[DIM_SHAPE].cur, er, pp) if er is not None else ABSENT,
+                judge_vol(judges[DIM_VOL].cur, rv, pp) if rv is not None else ABSENT,
                 judge_fund_sign(funding) if funding is not None else ABSENT,
                 judge_fund_level(funding, pp) if funding is not None else ABSENT,
-                judge_stretch(stretch, pp) if stretch is not None else ABSENT,
+                judge_stretch(judges[DIM_STRETCH].cur, stretch, pp)
+                if stretch is not None
+                else ABSENT,
             ]
             for d in range(DIM_SOURCE):
                 if self.judges[p][d].feed(cands[d], confirm) and count:
@@ -777,8 +848,6 @@ MIN_FUND_SAMPLES: int = 3
 _METRIC_NAME_PARTS: int = 4  # engine_regime_<profile>_<kind>
 _TERM_PARTS_PREFIXED: int = 3
 _TERM_PARTS: int = 2
-_PROFILE_KEYS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(ProfileParams))
-
 
 def regime_dir(env: typing.Mapping[str, str] | None = None) -> pathlib.Path:
     """``~/multivenue/worker/regime`` (``$CLAUDE_WORKER_REGIME_DIR``) — the
@@ -851,13 +920,15 @@ def read_regime_params(path: pathlib.Path) -> Artifact:
         pp = (obj.get("profile") or {}).get(name)
         if not isinstance(pp, dict):
             raise ValueError(f"{path}: [profile.{name}] missing")
-        unknown = set(pp) - set(_PROFILE_KEYS)
-        missing = set(_PROFILE_KEYS) - set(pp)
+        unknown = set(pp) - set(_PROFILE_KEYS_REQUIRED) - set(_PROFILE_KEYS_OPTIONAL)
+        missing = set(_PROFILE_KEYS_REQUIRED) - set(pp)
         if unknown or missing:
             raise ValueError(
                 f"{path}: [profile.{name}] unknown={sorted(unknown)} missing={sorted(missing)}"
             )
-        profiles.append(ProfileParams(**{k: int(pp[k]) for k in _PROFILE_KEYS}))
+        values = {k: int(pp[k]) for k in _PROFILE_KEYS_REQUIRED}
+        values.update({k: int(pp[k]) for k in _PROFILE_KEYS_OPTIONAL if k in pp})
+        profiles.append(ProfileParams(**values))
     ids: dict[str, int] = {btc: 0}
     for i, m in enumerate(members):
         ids[m] = i + 1
@@ -915,7 +986,7 @@ def measure(
 ) -> Measurement:
     """The engine's seed law over candles.db: fill the rings with the last
     ``minutes`` closes, latch the latest funding print, then judge the last
-    ``2·confirm_min`` closed minutes in order (``RegimeState::seed``) —
+    ``2·max confirm_min`` closed minutes in order (``RegimeState::seed``) —
     ending at the last minute candles.db actually holds for the BTC ref
     (``age_min`` says how far behind the wall clock that is)."""
     art = read_regime_params(regime_path)
@@ -937,7 +1008,7 @@ def measure(
         ev.close(r.minute, art.ids[r.descriptor], r.close_1e6)
     if funding is not None:
         ev.funding(funding[0], funding[1])
-    replay = 2 * art.params.confirm_min
+    replay = 2 * art.params.max_confirm_min()
     for m in range(last - replay + 1, last + 1):
         ev.roll(m, (m + 1) * MINUTE_NS, count=False)
     return Measurement(
@@ -1453,6 +1524,20 @@ def soak_windows_from_pool(pool_dir: pathlib.Path) -> list[SoakWindow]:
             )
         )
     return out
+
+
+def parse_since_ms(text: str) -> int:
+    """``--since``: epoch milliseconds, or an ISO-8601 UTC instant
+    (``2026-09-07T07:04:07Z``)."""
+    t = text.strip()
+    if t.isdigit():
+        return int(t)
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(t)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
 def soak_windows_from_runs(logs_dir: pathlib.Path, since_ms: int) -> list[SoakWindow]:
@@ -2192,6 +2277,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
     )
     soak.add_argument("--hours", type=int, default=HISTORY_HOURS)
     soak.add_argument("--min-windows", type=int, default=SOAK_MIN_WINDOWS)
+    soak.add_argument(
+        "--since",
+        default=None,
+        help="count only windows starting at/after this UTC instant (ISO-8601 or epoch ms) — "
+        "the soak restarts from zero after a detector change (plan §7.1)",
+    )
     args = parser.parse_args(argv)
 
     if args.lane == "seed-out":
@@ -2254,6 +2345,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911, PLR0915 — on
             ).expanduser()
             windows = soak_windows_from_runs(replay, now_ms - args.hours * 3_600_000)
             source = "runs"
+        if args.since:
+            since_ms = parse_since_ms(args.since)
+            windows = [w for w in windows if w.start_ms >= since_ms]
         reports_dir = (
             pathlib.Path(args.reports_dir).expanduser()
             if args.reports_dir

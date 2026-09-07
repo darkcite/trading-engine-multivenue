@@ -21,6 +21,8 @@ members = ["binance-usdm:ethusdt", "binance-usdm:solusdt", "binance-usdm:bnbusdt
 
 [hysteresis]
 confirm_min = 3                  # consecutive minute judgements before a dimension flips
+                                 # (the global default; a profile may carry its own
+                                 # `confirm_min` — the RG7 fix below)
 
 # ---- profile 0 = fast (1 h) ----
 [profile.fast]
@@ -31,10 +33,10 @@ stretch_w_min = 60
 rel_w_min = 60
 trend_thr_bps_1e9 = 30000000000  # 30 bps: BTC return beyond ±thr counts as directional
 breadth_q_1e9 = 600000000        # 0.60: share of members that must agree
-er_lo_enter_1e9 = 300000000      # CHOP  ⇐ ER < 0.30 (leave CHOP above 0.35)
-er_lo_exit_1e9 = 350000000
-er_hi_enter_1e9 = 600000000      # TREND ⇐ ER > 0.60 (leave TREND below 0.55)
-er_hi_exit_1e9 = 550000000
+er_lo_enter_1e9 = 300000000      # CHOP  ⇐ ER < 0.30 (leave CHOP above 0.40)
+er_lo_exit_1e9 = 400000000
+er_hi_enter_1e9 = 600000000      # TREND ⇐ ER > 0.60 (leave TREND below 0.50)
+er_hi_exit_1e9 = 500000000
 rv_p30_bps_1e9 = 0               # worker-refreshed daily (0 = VOL dimension ABSENT until set)
 rv_p70_bps_1e9 = 0
 stretch_k_1e9 = 2000000000       # |ret / RV| > 2.0 ⇒ extended
@@ -42,6 +44,15 @@ rel_thr_bps_1e9 = 50000000000    # 50 bps: coin vs BTC beyond ±thr ⇒ lagging/
 fund_prints = 9                  # FUND_LEVEL history (3 d of 8 h prints)
 fund_p30_1e9 = 0                 # worker-refreshed daily (0 = FUND_LEVEL ABSENT until set)
 fund_p70_1e9 = 0
+# RG7 hysteresis (plan §3.5 as landed, 2026-09-07 — the first soak FAILED on
+# fast-profile flicker: shape 3–7 / trend 3–6 flips per 2 h window). Every key
+# is optional; 0 = the pre-fix law. A 60-min horizon judged in 5-min steps
+# needs both a longer confirm AND exit bands (offline replay over the failed
+# windows: confirm 10 alone 2/9 fail, bands alone 6/9, both 1/9).
+confirm_min = 10                 # this profile's own confirm length (0 = the global one)
+trend_exit_bps_1e9 = 20000000000 # a committed BULL/BEAR holds while |ret| > 20 bps
+rv_exit_frac_1e9 = 100000000     # LOW holds below p30·1.10, HIGH above p70·0.90
+stretch_exit_k_1e9 = 1500000000  # an EXT holds while |ret / RV| > 1.5
 
 # ---- profile 1 = slow (4 h) ----
 [profile.slow]

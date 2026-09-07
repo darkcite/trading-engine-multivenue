@@ -104,6 +104,59 @@ Each entry is atomic: one version bump per section. Do not batch.
 - ...
 ```
 
+## 2026-09-07 — `regime.toml` hysteresis keys: per-profile `confirm_min` + TREND/VOL/STRETCH exit bands (RG7 fix)
+
+**What changed**
+
+- `[profile.<name>]` gains four OPTIONAL integer keys — `confirm_min`
+  (this profile's consecutive-minute confirm; 0 = `[hysteresis]
+  confirm_min`), `trend_exit_bps_1e9` (a committed BULL/BEAR holds while
+  `|ret| > exit`; breadth is an entry condition), `rv_exit_frac_1e9`
+  (LOW holds while `rv < p30·(1+f)`, HIGH while `rv > p70·(1−f)`),
+  `stretch_exit_k_1e9` (an EXT holds while `|s| > exit`). Bands must lie
+  inside their entry thresholds (`RegimeErr::Bands`, boot refused).
+  `core_regime::ProfileParams` carries them (`with_hysteresis`;
+  `RegimeParams::{confirm_of, max_confirm_min}`); `judge_trend` /
+  `judge_vol` / `judge_stretch` take the committed state like
+  `judge_shape`; the seed replay warms `2·max confirm`. The worker
+  mirror (`claude_worker.regime`) parses and judges identically; the
+  parity harness now runs TWO fixtures (`parity-1` = the RG1 law,
+  unchanged bit for bit; `parity-2` = the same tape under the keys).
+- `regime.toml.example`: the fast profile carries `confirm_min = 10`,
+  `trend_exit_bps_1e9 = 20000000000`, `rv_exit_frac_1e9 = 100000000`,
+  `stretch_exit_k_1e9 = 1500000000` and a wider SHAPE band
+  (`er_lo_exit_1e9 = 400000000`, `er_hi_exit_1e9 = 500000000`); the
+  slow profile is unchanged.
+
+**Why**
+
+- The first RG7 soak (2026-09-07) FAILED: 7 of 9 windows over the ≤ 2
+  flips bound, all on the FAST profile (`shape` 3–7, `trend` 3–6 per
+  2 h). RG1 had implemented the §3.5 bands for SHAPE only, and a global
+  `confirm_min = 3` is thin for a 60-min horizon judged in 5-min steps.
+  Offline replay over the failed windows: pre-fix 8/9, confirm 10 alone
+  2/9, bands alone 6/9, both 1/9.
+
+**Impact**
+
+- On-disk formats: none. Wire formats: none. Config: four optional keys
+  per profile; every existing `regime.toml` boots and judges unchanged
+  (keys absent ⇒ 0 ⇒ the RG1 law). The live file needs the keys for the
+  fix to apply; the boot reads them (restart-applied, as every regime
+  parameter).
+- `RegimeState` layout: `ProfileParams` grew (the `_pad0` byte + 3
+  trailing `i64`) — a boot-boxed struct, no wire or snapshot exposure.
+
+**Migration steps**
+
+1. `cargo build --release -p cli`; add the keys to `~/multivenue/
+   regime.toml` `[profile.fast]` (values as the example); restart.
+2. The RG7 soak restarts from zero: only windows AFTER the restart count.
+
+**Rollback**
+
+- Delete the keys (or set them to 0) and restart — the RG1 law, bit for bit.
+
 ## 2026-09-05 — The harness funding seed: `funding-seed.tsv` per window, `backtest --funding-seed` (RG4 carry blocker)
 
 **What changed**

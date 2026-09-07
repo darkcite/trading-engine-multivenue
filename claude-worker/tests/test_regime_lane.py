@@ -13,6 +13,7 @@ and the module lanes' exit codes. No socket, no network: the engine's
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import dataclasses
 import json
 import pathlib
 
@@ -42,8 +43,19 @@ def test_read_regime_params_maps_descriptors_to_dense_ids(tmp_path):
     assert art.params.members == (1, 2, 3, 4)
     assert art.params.confirm_min == 3
     assert art.params.profiles[0].trend_w_min == 60 and art.params.profiles[1].trend_w_min == 240
-    assert art.params.profiles[0] == claude_worker.regime.FAST_DEFAULT
+    # The example's fast profile carries the RG7 hysteresis (wider ER
+    # band + its own confirm + the exit bands); slow = the pre-fix default.
+    assert art.params.profiles[0] == dataclasses.replace(
+        claude_worker.regime.FAST_DEFAULT,
+        er_lo_exit_1e9=400_000_000,
+        er_hi_exit_1e9=500_000_000,
+        confirm_min=10,
+        trend_exit_bps_1e9=20_000_000_000,
+        rv_exit_frac_1e9=100_000_000,
+        stretch_exit_k_1e9=1_500_000_000,
+    )
     assert art.params.profiles[1] == claude_worker.regime.SLOW_DEFAULT
+    assert art.params.confirm_of(0) == 10 and art.params.confirm_of(1) == 3
     # A missing profile key is an error, like the engine's parser.
     bad = tmp_path / "bad.toml"
     bad.write_text(

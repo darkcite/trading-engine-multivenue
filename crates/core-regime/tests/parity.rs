@@ -3,12 +3,14 @@
 
 //! Rust ↔ Python parity of the regime law (RG1, plan §2.6).
 //!
-//! Consumes `claude-worker/tests/fixtures/regime/parity-1.input.tsv` and
-//! asserts every judged minute against `parity-1.expected.tsv` — the SAME
-//! pair `claude-worker/tests/test_regime.py` checks. The expected file is
-//! (re)written by THIS harness when `REGIME_PARITY_WRITE=1` is set (the
-//! engine's code is the law); a change in either implementation shows
-//! up as a red on one side.
+//! Consumes `claude-worker/tests/fixtures/regime/parity-<n>.input.tsv` and
+//! asserts every judged minute against `parity-<n>.expected.tsv` — the SAME
+//! pairs `claude-worker/tests/test_regime.py` checks. The expected files
+//! are (re)written by THIS harness when `REGIME_PARITY_WRITE=1` is set
+//! (the engine's code is the law); a change in either implementation
+//! shows up as a red on one side. Fixture 1 = the RG1 law (hysteresis
+//! keys absent ⇒ the pre-fix law bit for bit); fixture 2 = the same tape
+//! under the RG7 hysteresis (per-profile confirm + exit bands).
 //!
 //! Test-only code: allocation and `unwrap` are fine here.
 
@@ -22,14 +24,19 @@ use core_types::{
     SYMBOL_ID_NONE,
 };
 
-const INPUT: &str = concat!(
+const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../claude-worker/tests/fixtures/regime/parity-1.input.tsv"
+    "/../../claude-worker/tests/fixtures/regime/"
 );
-const EXPECTED: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../claude-worker/tests/fixtures/regime/parity-1.expected.tsv"
-);
+const FIXTURES: [&str; 2] = ["parity-1", "parity-2"];
+
+fn input_path(name: &str) -> String {
+    format!("{FIXTURE_DIR}{name}.input.tsv")
+}
+
+fn expected_path(name: &str) -> String {
+    format!("{FIXTURE_DIR}{name}.expected.tsv")
+}
 
 #[derive(Default)]
 struct Input {
@@ -53,9 +60,19 @@ fn kv(parts: &[&str], key: &str) -> String {
     panic!("missing {key}");
 }
 
+/// An optional `key=value` (the RG7 hysteresis keys; absent = 0).
+fn kv_or(parts: &[&str], key: &str) -> i64 {
+    for p in parts {
+        if let Some(v) = p.strip_prefix(&format!("{key}=")) {
+            return v.parse().unwrap();
+        }
+    }
+    0
+}
+
 fn profile_from(parts: &[&str]) -> ProfileParams {
     let g = |k: &str| kv(parts, k).parse::<i64>().unwrap();
-    ProfileParams::new(
+    let base = ProfileParams::new(
         g("trend_w") as u16,
         g("shape_w") as u16,
         g("vol_w") as u16,
@@ -74,11 +91,18 @@ fn profile_from(parts: &[&str]) -> ProfileParams {
         g("rel_thr"),
         g("fund_p30"),
         g("fund_p70"),
+    );
+    base.with_hysteresis(
+        kv_or(parts, "confirm") as u8,
+        kv_or(parts, "trend_exit"),
+        kv_or(parts, "rv_exit_frac"),
+        kv_or(parts, "stretch_exit_k"),
     )
 }
 
-fn load_input() -> Input {
-    let text = std::fs::read_to_string(INPUT).unwrap_or_else(|e| panic!("{INPUT}: {e}"));
+fn load_input(name: &str) -> Input {
+    let input = input_path(name);
+    let text = std::fs::read_to_string(&input).unwrap_or_else(|e| panic!("{input}: {e}"));
     let mut inp = Input::default();
     for line in text.lines() {
         let line = line.trim();
@@ -130,8 +154,8 @@ fn raw_field(present: u8, bit: u8, v: i64) -> String {
 }
 
 /// Run the law over the fixture; one line per (live minute, profile).
-fn run() -> Vec<String> {
-    let inp = load_input();
+fn run(name: &str) -> Vec<String> {
+    let inp = load_input(name);
     let mut members = [SYMBOL_ID_NONE; REGIME_MAX_MEMBERS];
     for (i, m) in inp.members.iter().enumerate() {
         members[i] = *m;
@@ -223,39 +247,75 @@ fn run() -> Vec<String> {
     out
 }
 
-#[test]
-fn regime_law_matches_the_shared_fixture() {
-    let got = run();
+fn check_fixture(name: &str) {
+    let got = run(name);
+    let expected = expected_path(name);
     if std::env::var("REGIME_PARITY_WRITE").as_deref() == Ok("1") {
-        let mut text = String::from(
-            "# parity-1.expected.tsv — WRITTEN by crates/core-regime/tests/parity.rs (REGIME_PARITY_WRITE=1).\n\
+        let mut text = format!(
+            "# {name}.expected.tsv — WRITTEN by crates/core-regime/tests/parity.rs (REGIME_PARITY_WRITE=1).\n\
              # E minute profile measured_hex effective_hex ret er rv stretch rel(members) up,dn,n flips(6) disagree minutes_judged\n",
         );
         for l in &got {
             text.push_str(l);
             text.push('\n');
         }
-        std::fs::write(EXPECTED, text).unwrap();
+        std::fs::write(&expected, text).unwrap();
     }
-    let want = std::fs::read_to_string(EXPECTED).unwrap_or_else(|e| {
-        panic!("{EXPECTED}: {e} — run with REGIME_PARITY_WRITE=1 once to create it")
+    let want = std::fs::read_to_string(&expected).unwrap_or_else(|e| {
+        panic!("{expected}: {e} — run with REGIME_PARITY_WRITE=1 once to create it")
     });
     let want: Vec<&str> = want
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
-    assert_eq!(got.len(), want.len(), "line count drifted");
+    assert_eq!(got.len(), want.len(), "{name}: line count drifted");
     for (g, w) in got.iter().zip(want.iter()) {
-        assert_eq!(g, w, "regime law drifted from the shared fixture");
+        assert_eq!(g, w, "{name}: regime law drifted from the shared fixture");
     }
+}
+
+#[test]
+fn regime_law_matches_the_shared_fixtures() {
+    for name in FIXTURES {
+        check_fixture(name);
+    }
+}
+
+/// RG7: fixture 2 is fixture 1's tape under hysteresis — it must flip
+/// strictly less on the fast profile (the point of the fix) while its
+/// expected file is a real, non-trivial re-judgement of the same tape.
+#[test]
+fn hysteresis_fixture_flips_less_than_the_plain_one() {
+    let plain = run("parity-1");
+    let hyst = run("parity-2");
+    assert_eq!(plain.len(), hyst.len(), "same tape, same minutes");
+    let flips = |lines: &[String], profile: &str| -> u64 {
+        let last = lines
+            .iter()
+            .rev()
+            .find(|l| l.split_whitespace().nth(2) == Some(profile))
+            .expect("profile line");
+        let parts: Vec<&str> = last.split_whitespace().collect();
+        parts[parts.len() - 3]
+            .split(',')
+            .map(|v| v.parse::<u64>().unwrap())
+            .sum()
+    };
+    assert!(
+        flips(&hyst, "0") < flips(&plain, "0"),
+        "fast flips: hysteresis {} vs plain {}",
+        flips(&hyst, "0"),
+        flips(&plain, "0")
+    );
+    assert_ne!(plain, hyst, "the hysteresis fixture must judge differently");
 }
 
 #[test]
 fn fixture_exercises_every_dimension_and_the_declared_merge() {
     // Sanity on the fixture's coverage, so a regenerated input cannot
     // silently degrade the parity check into a trivial one.
-    let lines = run();
+    let lines = run("parity-1");
     let mut sources = std::collections::HashSet::new();
     let mut trend_values = std::collections::HashSet::new();
     let mut shape_values = std::collections::HashSet::new();

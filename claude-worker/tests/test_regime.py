@@ -2,10 +2,12 @@
 # Copyright 2026 Anton (darkcite)
 """regime.py — the Python half of the Rust ↔ Python regime-law parity (RG1).
 
-``tests/fixtures/regime/parity-1.{input,expected}.tsv`` are the SAME files
-``crates/core-regime/tests/parity.rs`` consumes; the expected file is
+``tests/fixtures/regime/parity-<n>.{input,expected}.tsv`` are the SAME files
+``crates/core-regime/tests/parity.rs`` consumes; the expected files are
 written by the Rust law and asserted here line by line, so the two
-implementations cannot drift without one suite going red.
+implementations cannot drift without one suite going red. Fixture 1 = the
+RG1 law (hysteresis keys absent); fixture 2 = the same tape under the RG7
+hysteresis (per-profile confirm + the §3.5 exit bands).
 
 Convention: full ``import x`` only. No ``from x import y``.
 """
@@ -19,8 +21,7 @@ import claude_worker.frames
 import claude_worker.regime
 
 _DIR: pathlib.Path = pathlib.Path(__file__).resolve().parent / "fixtures" / "regime"
-_INPUT: pathlib.Path = _DIR / "parity-1.input.tsv"
-_EXPECTED: pathlib.Path = _DIR / "parity-1.expected.tsv"
+_FIXTURES: tuple[str, ...] = ("parity-1", "parity-2")
 
 
 @dataclasses.dataclass(slots=True)
@@ -39,6 +40,14 @@ def _kv(parts: list[str], key: str) -> str:
     raise KeyError(key)
 
 
+def _kv_or(parts: list[str], key: str) -> int:
+    """An optional ``key=value`` (the RG7 hysteresis keys; absent = 0)."""
+    try:
+        return int(_kv(parts, key))
+    except KeyError:
+        return 0
+
+
 def _profile(parts: list[str]) -> claude_worker.regime.ProfileParams:
     g = lambda k: int(_kv(parts, k))  # noqa: E731 — tiny local accessor
     return claude_worker.regime.ProfileParams(
@@ -46,17 +55,19 @@ def _profile(parts: list[str]) -> claude_worker.regime.ProfileParams:
         g("trend_thr"), g("breadth_q"),
         g("er_lo_enter"), g("er_lo_exit"), g("er_hi_enter"), g("er_hi_exit"),
         g("rv_p30"), g("rv_p70"), g("stretch_k"), g("rel_thr"), g("fund_p30"), g("fund_p70"),
+        _kv_or(parts, "confirm"), _kv_or(parts, "trend_exit"),
+        _kv_or(parts, "rv_exit_frac"), _kv_or(parts, "stretch_exit_k"),
     )
 
 
-def load_input() -> Input:
+def load_input(name: str = "parity-1") -> Input:
     btc = fund = confirm = minute0 = 0
     members: tuple[int, ...] = ()
     profiles: list[claude_worker.regime.ProfileParams] = []
     closes: list[tuple[int, int, int]] = []
     funding: list[tuple[int, int, int]] = []
     declared: list[tuple[int, int, int, int]] = []
-    for raw in _INPUT.read_text("utf-8").splitlines():
+    for raw in (_DIR / f"{name}.input.tsv").read_text("utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -88,16 +99,16 @@ def _fmt(v: int | None) -> str:
     return "-" if v is None else str(v)
 
 
-def run() -> list[str]:
-    inp = load_input()
+def run(name: str = "parity-1") -> list[str]:
+    inp = load_input(name)
     ev = claude_worker.regime.RegimeEvaluator(inp.params)
     minute_ns = claude_worker.regime.MINUTE_NS
     # Seed rows (minutes before the first live one) are plain closes;
-    # the engine replays the last 2·confirm minutes to warm its judges.
+    # the engine replays the last 2·max confirm minutes to warm its judges.
     for m, sym, c in inp.closes:
         if m < inp.minute0:
             assert ev.close(m, sym, c)
-    for m in range(inp.minute0 - 2 * inp.params.confirm_min, inp.minute0):
+    for m in range(inp.minute0 - 2 * inp.params.max_confirm_min(), inp.minute0):
         ev.roll(m, inp.minute0 * minute_ns, count=False)
     last = max(m for m, _, _ in inp.closes)
     out: list[str] = []
@@ -127,16 +138,72 @@ def run() -> list[str]:
     return out
 
 
-def test_python_law_reproduces_the_rust_expected_file() -> None:
-    got = run()
+@pytest.mark.parametrize("name", _FIXTURES)
+def test_python_law_reproduces_the_rust_expected_file(name: str) -> None:
+    got = run(name)
     want = [
         line.strip()
-        for line in _EXPECTED.read_text("utf-8").splitlines()
+        for line in (_DIR / f"{name}.expected.tsv").read_text("utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
-    assert len(got) == len(want), "line count drifted"
+    assert len(got) == len(want), f"{name}: line count drifted"
     for i, (g, w) in enumerate(zip(got, want, strict=True)):
-        assert g == w, f"line {i}: python law drifted from the Rust expected file"
+        assert g == w, f"{name} line {i}: python law drifted from the Rust expected file"
+
+
+def test_hysteresis_fixture_flips_less_on_the_fast_profile() -> None:
+    """RG7: fixture 2 is fixture 1's tape under the hysteresis keys — the
+    fast profile must flip strictly less (the point of the fix)."""
+    plain = run("parity-1")
+    hyst = run("parity-2")
+
+    def fast_flips(lines: list[str]) -> int:
+        last = next(line for line in reversed(lines) if line.split()[2] == "0")
+        return sum(int(v) for v in last.split()[-3].split(","))
+
+    assert fast_flips(hyst) < fast_flips(plain)
+    assert plain != hyst
+
+
+def test_exit_bands_and_per_profile_confirm_mirror_the_engine() -> None:
+    """The banded judges hold a committed state inside the band and are
+    the pre-fix law bit for bit without one; a profile's own confirm wins."""
+    r = claude_worker.regime
+    plain = dataclasses.replace(
+        r.FAST_DEFAULT, rv_p30_bps_1e9=10_000_000_000, rv_p70_bps_1e9=100_000_000_000
+    )
+    bull, bear, neutral = r.TREND_BULL, r.TREND_BEAR, r.TREND_NEUTRAL
+    assert r.judge_trend(bull, 20_000_000_000, 0, 0, 3, 3, plain) == neutral
+    assert r.judge_trend(bull, 40_000_000_000, 0, 0, 3, 3, plain) == neutral  # no breadth
+    assert r.judge_vol(r.VOL_LOW, 10_000_000_000, plain) == r.VOL_NORMAL
+    assert r.judge_stretch(r.STRETCH_EXT_UP, 1_900_000_000, plain) == r.STRETCH_NEUTRAL
+    pp = dataclasses.replace(
+        plain,
+        trend_exit_bps_1e9=20_000_000_000,
+        rv_exit_frac_1e9=100_000_000,
+        stretch_exit_k_1e9=1_500_000_000,
+    )
+    assert r.judge_trend(bull, 25_000_000_000, 0, 0, 3, 3, pp) == bull
+    assert r.judge_trend(bull, 20_000_000_000, 0, 0, 3, 3, pp) == neutral
+    assert r.judge_trend(bear, -25_000_000_000, 0, 0, 3, 3, pp) == bear
+    assert r.judge_trend(neutral, 31_000_000_000, 3, 0, 3, 3, pp) == bull
+    assert r.judge_vol(r.VOL_LOW, 10_900_000_000, pp) == r.VOL_LOW
+    assert r.judge_vol(r.VOL_LOW, 11_000_000_000, pp) == r.VOL_NORMAL
+    assert r.judge_vol(r.VOL_HIGH, 90_100_000_000, pp) == r.VOL_HIGH
+    assert r.judge_vol(r.VOL_HIGH, 90_000_000_000, pp) == r.VOL_NORMAL
+    assert r.judge_stretch(r.STRETCH_EXT_UP, 1_600_000_000, pp) == r.STRETCH_EXT_UP
+    assert r.judge_stretch(r.STRETCH_EXT_UP, 1_500_000_000, pp) == r.STRETCH_NEUTRAL
+    params = r.RegimeParams(0, 0, (), 2, (dataclasses.replace(pp, confirm_min=5), pp))
+    assert (params.confirm_of(0), params.confirm_of(1), params.max_confirm_min()) == (5, 2, 5)
+    r.RegimeEvaluator(params)
+    for bad in (
+        {"trend_exit_bps_1e9": 30_000_000_001},
+        {"rv_exit_frac_1e9": 1_000_000_001},
+        {"stretch_exit_k_1e9": 2_000_000_001},
+        {"confirm_min": 256},
+    ):
+        with pytest.raises(ValueError):
+            r.RegimeEvaluator(r.RegimeParams(0, 0, (), 2, (dataclasses.replace(pp, **bad), pp)))
 
 
 def test_math_primitives_match_the_rust_definitions() -> None:
