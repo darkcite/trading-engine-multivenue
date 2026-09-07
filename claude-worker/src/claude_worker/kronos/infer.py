@@ -163,9 +163,18 @@ class Forecaster:
         self._kronos = claude_worker.kronos.upstream.activate(self.lock)
         batch = n_series_max * s_max
         # Staging (numpy, host) and the device-side working set.
-        self._norm = numpy.empty((n_series_max, lookback, N_COLS), dtype=numpy.float32)
-        self._mean = numpy.empty((n_series_max, N_COLS), dtype=numpy.float32)
-        self._std = numpy.empty((n_series_max, N_COLS), dtype=numpy.float32)
+        #
+        # The z-score accumulates in float64 and only the RESULT is cast
+        # to float32. Not pedantry: the `amount` column is volume x price,
+        # order 1e6, and a float32 mean over a 400-bar window keeps ~7
+        # digits — which showed up as a 2.3e-6 drift against the goldens
+        # on this gate's first run. The tensors that reach the GPU stay
+        # float32; only these six numbers per series are wider.
+        self._norm = numpy.empty((n_series_max, lookback, N_COLS), dtype=numpy.float64)
+        self._norm32 = numpy.empty((n_series_max, lookback, N_COLS), dtype=numpy.float32)
+        self._mean = numpy.empty((n_series_max, N_COLS), dtype=numpy.float64)
+        self._std = numpy.empty((n_series_max, N_COLS), dtype=numpy.float64)
+        self._scale = numpy.empty((n_series_max, N_COLS), dtype=numpy.float64)
         self._x = torch.empty((batch, lookback, N_COLS), dtype=torch.float32, device=device)
         self._stamp = torch.empty(
             (batch, lookback + h_max, N_STAMP), dtype=torch.float32, device=device
@@ -195,17 +204,22 @@ class Forecaster:
             torch.cuda.synchronize()
 
     def _normalise(self, ohlcv: numpy.ndarray, n: int) -> tuple[numpy.ndarray, numpy.ndarray]:
-        """Per-window z-score, exactly ``KronosPredictor.predict``'s law.
-        Returns the (mean, std) views the inverse transform needs."""
+        """Per-window z-score, exactly ``KronosPredictor.predict``'s law,
+        accumulated in float64 (see ``__init__``). Returns the (mean,
+        scale) views the inverse transform needs, where scale is the
+        ``std + 1e-5`` upstream divides by."""
         mean = self._mean[:n]
         std = self._std[:n]
-        numpy.mean(ohlcv, axis=1, out=mean)
-        numpy.std(ohlcv, axis=1, out=std)
+        scale = self._scale[:n]
+        numpy.mean(ohlcv, axis=1, dtype=numpy.float64, out=mean)
+        numpy.std(ohlcv, axis=1, dtype=numpy.float64, out=std)
+        numpy.add(std, STD_EPS, out=scale)
         norm = self._norm[:n]
         numpy.subtract(ohlcv, mean[:, None, :], out=norm)
-        numpy.divide(norm, (std + STD_EPS)[:, None, :], out=norm)
+        numpy.divide(norm, scale[:, None, :], out=norm)
         numpy.clip(norm, -CLIP, CLIP, out=norm)
-        return mean, std
+        numpy.copyto(self._norm32[:n], norm)
+        return mean, scale
 
     def _stage(
         self, x_stamp: numpy.ndarray, y_stamp: numpy.ndarray, n: int, s: int, h: int
@@ -215,7 +229,7 @@ class Forecaster:
         final reshape back to ``[n, s, ...]`` depends on it)."""
         batch = n * s
         x = self._x[:batch, : self.lookback]
-        x.copy_(torch.from_numpy(self._norm[:n]).repeat_interleave(s, dim=0))
+        x.copy_(torch.from_numpy(self._norm32[:n]).repeat_interleave(s, dim=0))
         stamp = self._stamp[:batch, : self.lookback + h]
         stamp[:, : self.lookback].copy_(torch.from_numpy(x_stamp[:n]).repeat_interleave(s, dim=0))
         stamp[:, self.lookback :].copy_(torch.from_numpy(y_stamp[:n]).repeat_interleave(s, dim=0))
@@ -290,13 +304,13 @@ class Forecaster:
         that substitution belongs to the caller, as it does upstream)."""
         n = int(ohlcv.shape[0])
         self._check(ohlcv, x_stamp, y_stamp, (n, h, s), out)
-        mean, std = self._normalise(ohlcv, n)
+        mean, scale = self._normalise(ohlcv, n)
         x, stamp = self._stage(x_stamp, y_stamp, n, s, h)
         with torch.no_grad():
             decoded = self._ar_loop(x, stamp, h, t, top_p)
             self._sync()
             paths = decoded[:, -h:, :].reshape(n, s, h, N_COLS).to("cpu").numpy()
-        numpy.multiply(paths, (std + STD_EPS)[:, None, None, :], out=out[:n, :s, :h])
+        numpy.multiply(paths, scale[:, None, None, :], out=out[:n, :s, :h])
         numpy.add(out[:n, :s, :h], mean[:, None, None, :], out=out[:n, :s, :h])
 
     def _check(

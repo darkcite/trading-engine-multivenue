@@ -119,6 +119,11 @@ testpaths  = ["tests"]
 markers    = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "network: marks tests that would require network (must be mocked)",
+    # KK parity gate (Kronos lanes plan §3a.4): needs the optional
+    # `kronos` dependency group AND the installed vendor snapshot +
+    # weights, so it is opt-in (`-m kronos`) and skips without them.
+    # Everything else in the suite stays torch-free.
+    "kronos: Kronos golden-parity tests (needs `uv sync --group kronos` + installed artifacts)",
 ]
 
 [tool.mypy]

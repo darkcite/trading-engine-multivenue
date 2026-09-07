@@ -113,6 +113,14 @@ license-check:
 		{ echo "  drift: claude-worker/NOTICE != NOTICE  (run: make sync-license)"; fail=1; }; \
 	grep -q '^license' fuzz/Cargo.toml || \
 		{ echo "  fuzz/Cargo.toml has no license key (workspace-excluded — it cannot inherit)"; fail=1; }; \
+	if [ -f claude-worker/kronos.lock ]; then \
+		grep -q '^license *= *"MIT"' claude-worker/kronos.lock || \
+			{ echo "  claude-worker/kronos.lock: [upstream] names no MIT license"; fail=1; }; \
+		grep -q 'kronos.lock' NOTICE || \
+			{ echo "  NOTICE carries no attribution for the kronos.lock artifacts"; \
+			  echo "    (the snapshot + weights are fetched and EXECUTED but never"; \
+			  echo "     vendored; cargo-about cannot see them — NOTICE is their home)"; fail=1; }; \
+	fi; \
 	if git ls-files 'docs/research/**' | grep -q .; then \
 		echo "  tracked file(s) under docs/research/ — research material NEVER enters git"; \
 		echo "    (operator law 2026-09-02; the tree is gitignored — a forced add is the"; \

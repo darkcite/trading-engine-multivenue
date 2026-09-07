@@ -323,6 +323,76 @@ Operational laws:
 - **Engine can't read `.env`**: confirm `chmod 600 .env` and that the
   process's cwd is the project root.
 
+## Kronos forecast sidecar (optional)
+
+The forecast lanes run the Kronos time-series model in offline Python. **Nothing
+here touches the engine**: no Rust, no new engine dependency, no flag, no
+restart. Forecasts reach the hot path only as ordinary AI command frames, and an
+uninstalled sidecar is simply an absent sender.
+
+Upstream Kronos has no `pyproject`, so it cannot be a PyPI dependency, and this
+repository vendors no third-party source. It is therefore treated exactly like
+the weights: a pinned, hash-verified runtime artifact **outside git**.
+
+### 1. Install the optional dependency group
+
+```sh
+cd claude-worker
+uv sync --group kronos          # torch, numpy, pandas, einops, huggingface_hub, tqdm, safetensors
+uv run python -c "import torch; print(torch.backends.mps.is_available())"   # -> True
+```
+
+The base worker install stays torch-free; every verb, `serve` and CI keep their
+current dependency surface. A plain `uv run` does not evict the group (uv prunes
+only with `--exact`), so one venv serves both.
+
+### 2. Fetch the pinned artifacts
+
+```sh
+# from claude-worker/ — `install` is idempotent; a second run prints "up to date"
+python -m claude_worker.kronos install                 # snapshot + every checkpoint
+python -m claude_worker.kronos install --model Kronos-base   # or just one (its tokenizer comes along)
+python -m claude_worker.kronos verify                  # re-hash what is on disk
+python -m claude_worker.kronos where                   # resolved paths
+```
+
+`claude-worker/kronos.lock` is the contract: the upstream commit and every
+weight file pinned by sha256, with URLs pinned to an immutable commit/revision
+so a reinstall is a byte-identical fetch rather than a refusal. Files land in
+`~/multivenue/vendor/kronos/<id>/` (the code, ~55 KB) and
+`~/multivenue/artifacts/kronos/<name>/` (the weights, ~540 MB for all five).
+**A hash mismatch is a refusal, not a warning** — nothing is written, and
+`activate()` re-checks at import, because that directory is writable and outside
+git.
+
+### 3. The parity gate
+
+```sh
+uv run pytest -m kronos          # skips cleanly without the group or the artifacts
+```
+
+This compares the adapter against goldens generated on the research test bed
+with the same pinned snapshot, weights and torch build: token ids exactly,
+logits `max |Δ| == 0.0`, decoded OHLC and the full sampling loop at 1e-6. Run it
+after any change to `claude_worker/kronos/`, after a torch bump, and after
+re-installing artifacts.
+
+### 4. Sharing the host with the live engine
+
+The sidecar's work is on the GPU (MPS), so it costs little CPU — but run it
+politely anyway, and watch the engine rather than assuming:
+
+```sh
+OMP_NUM_THREADS=2 nice -n 10 <command>
+```
+
+Measured on this host (2026-09-07, `L = 400`, p50): one `Kronos-base` forecast of
+6 series × 15 bars × 16 paths takes **≈ 49 s**, and 2 markets × 24 bars × 64
+paths takes **≈ 135 s**. `Kronos-mini` is ~17× faster at the same shapes. Cost
+is close to linear in batch, horizon and context length, because upstream has no
+KV cache — every decode step re-runs the whole window. **Size any cadence
+against measurements on the host that will run it, never against these numbers.**
+
 ## Object-storage archive (optional cold tier)
 
 A second copy of closed capture runs in S3-compatible object storage, so that

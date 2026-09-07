@@ -140,14 +140,24 @@ bytes  = {len(CFG)}
 """
 
 
+def drop_model_modules() -> None:
+    for name in [key for key in sys.modules if key == "model" or key.startswith("model.")]:
+        del sys.modules[name]
+
+
 @pytest.fixture(autouse=True)
 def clean_import_state() -> typing.Iterator[None]:
     """`model` is a spectacularly generic name; leaking one between tests
-    would make the shadowing test pass for the wrong reason."""
+    would make the shadowing test pass for the wrong reason.
+
+    Cleared BEFORE as well as after: the parity suite activates the real
+    snapshot and sorts earlier alphabetically, so a fixture that only
+    tidies up after itself lets a real `model` leak in and fail these
+    fake-snapshot tests for a reason that has nothing to do with them."""
     before = list(sys.path)
+    drop_model_modules()
     yield
-    for name in [key for key in sys.modules if key == "model" or key.startswith("model.")]:
-        del sys.modules[name]
+    drop_model_modules()
     sys.path[:] = before
 
 
