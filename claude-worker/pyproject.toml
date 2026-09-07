@@ -49,6 +49,32 @@ dev = [
     "ruff>=0.16.3",
     "mypy>=2.3.1",
 ]
+# Kronos sidecar only (lanes plan §3a.3, ruling D8). OPT-IN: the base
+# worker install stays torch-free, so every existing verb, the serve
+# daemon and CI keep their current dependency surface. Install with
+# `uv sync --group kronos` on the host that runs the forecaster; the
+# engine never links any of it (forecasts reach the hot path as 64-byte
+# AI command frames, never as a Python object).
+#
+# These are upstream Kronos' REAL imports (torch, numpy, pandas, einops,
+# huggingface_hub, tqdm) plus safetensors, which its `from_pretrained`
+# loader uses. Its own `requirements.txt` pins (pandas 2.2) are stale and
+# are deliberately NOT what we install. All seven resolve on CPython
+# 3.14.7 arm64 (uv dry run 2026-09-05, re-run at install 2026-09-07).
+#
+# torch is pinned EXACTLY: a minor torch bump can change MPS kernel
+# numerics, and the KK parity gate (§3a.4) asserts logits max |Δ| == 0.0
+# against goldens generated on one build. Moving it is a deliberate act
+# that re-runs the goldens, not a resolver decision.
+kronos = [
+    "torch==2.14.0",
+    "numpy>=2.5",
+    "pandas>=3.0",
+    "einops>=0.8",
+    "huggingface_hub>=1.30",
+    "tqdm",
+    "safetensors>=0.8",
+]
 
 [build-system]
 requires      = ["hatchling"]

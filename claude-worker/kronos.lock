@@ -1,0 +1,151 @@
+# Kronos runtime-artifact lock — DATA, not code (Kronos lanes plan §3a.2,
+# ruling D13: upstream as-is, pinned by hash OUTSIDE git).
+#
+# Nothing described here is ever vendored into this tree. The installer
+# (`python -m claude_worker.kronos install`) fetches each file, verifies
+# its sha256, and writes it under ~/multivenue/vendor/kronos/<sha>/ (the
+# upstream snapshot) and ~/multivenue/artifacts/kronos/<name>/ (the
+# weights). A mismatching hash is a REFUSAL, never a warning, and nothing
+# is written on a refusal.
+#
+# Why per-file raw URLs and not a GitHub archive tarball: a tarball's
+# bytes are not stable across GitHub's compression settings, so its
+# sha256 is not a pin. A raw blob at a commit is immutable. The weight
+# URLs are likewise pinned to the HF repo REVISION each file was
+# downloaded at, not to `main` — `main` moving would turn a reinstall
+# into a refusal instead of a byte-identical fetch.
+#
+# Hashes were computed with `shasum -a 256` over the copies on the
+# research test bed (~/Kronos_test) on 2026-09-07; the byte counts match
+# the plan's §3a.2 record exactly (16440776 / 98980656 / 409264008 /
+# 15842376 / 15842368).
+#
+# Licences: the upstream snapshot is MIT (its own LICENSE is fetched and
+# stored beside the code); the weights are released under the same
+# upstream MIT terms. Both carry an entry in THIRD-PARTY-NOTICES.md.
+
+[upstream]
+repo    = "shiyu-coder/Kronos"
+commit  = "67b630e67f6a18c9e9be918d9b4337c960db1e9a"
+license = "MIT"
+
+[[upstream.file]]
+path   = "model/__init__.py"
+url    = "https://raw.githubusercontent.com/shiyu-coder/Kronos/67b630e67f6a18c9e9be918d9b4337c960db1e9a/model/__init__.py"
+sha256 = "f8f856ca3fedadcaac97e196be23d1aeda1c3c9ffe8903d66d43ea3bcac6240c"
+bytes  = 412
+
+[[upstream.file]]
+path   = "model/kronos.py"
+url    = "https://raw.githubusercontent.com/shiyu-coder/Kronos/67b630e67f6a18c9e9be918d9b4337c960db1e9a/model/kronos.py"
+sha256 = "0a5f90282e2039c2de0771473419715c845def154896dbd0f5747837e6241032"
+bytes  = 30133
+
+[[upstream.file]]
+path   = "model/module.py"
+url    = "https://raw.githubusercontent.com/shiyu-coder/Kronos/67b630e67f6a18c9e9be918d9b4337c960db1e9a/model/module.py"
+sha256 = "a07edbadc0e96804c8158c021bbc6063bb7cc43b34d7fc470d5c8ff2005a409f"
+bytes  = 23426
+
+[[upstream.file]]
+path   = "LICENSE"
+url    = "https://raw.githubusercontent.com/shiyu-coder/Kronos/67b630e67f6a18c9e9be918d9b4337c960db1e9a/LICENSE"
+sha256 = "acb2d194d378204e5f2be4dcd24d39ecac437903620c790c3315a96dab388fdc"
+bytes  = 1062
+
+# ---- weights -------------------------------------------------------------
+# `kind = "model"` entries carry the context bound and the tokenizer they
+# were trained with (upstream README "Model Zoo"); `kind = "tokenizer"`
+# entries are the paired quantizers. D4 rules `Kronos-base` everywhere;
+# mini/small stay in the lock because C0 sweeps them for the record.
+
+[weights."Kronos-base"]
+kind        = "model"
+repo        = "NeoQuasar/Kronos-base"
+revision    = "2b554741eca47781b64468546e77fef3e85130e6"
+max_context = 512
+tokenizer   = "Kronos-Tokenizer-base"
+
+[[weights."Kronos-base".file]]
+path   = "model.safetensors"
+url    = "https://huggingface.co/NeoQuasar/Kronos-base/resolve/2b554741eca47781b64468546e77fef3e85130e6/model.safetensors"
+sha256 = "abff193acab6db1a0368e9773e75799d11403b6d054ee6d5f0a11aeabc5f4b83"
+bytes  = 409264008
+
+[[weights."Kronos-base".file]]
+path   = "config.json"
+url    = "https://huggingface.co/NeoQuasar/Kronos-base/resolve/2b554741eca47781b64468546e77fef3e85130e6/config.json"
+sha256 = "77ebc3038b647709b92be002f801d72e1a385f4c8c2c5aa1cc6cf21fcfe44eb2"
+bytes  = 228
+
+[weights."Kronos-small"]
+kind        = "model"
+repo        = "NeoQuasar/Kronos-small"
+revision    = "901c26c1332695a2a8f243eb2f37243a37bea320"
+max_context = 512
+tokenizer   = "Kronos-Tokenizer-base"
+
+[[weights."Kronos-small".file]]
+path   = "model.safetensors"
+url    = "https://huggingface.co/NeoQuasar/Kronos-small/resolve/901c26c1332695a2a8f243eb2f37243a37bea320/model.safetensors"
+sha256 = "b082dfcbd8e8c142a725c8bbb99781802f38fec81210e13479effb32b3c3e020"
+bytes  = 98980656
+
+[[weights."Kronos-small".file]]
+path   = "config.json"
+url    = "https://huggingface.co/NeoQuasar/Kronos-small/resolve/901c26c1332695a2a8f243eb2f37243a37bea320/config.json"
+sha256 = "5e0f6a605d5f81b5c9b559fe5cf716a1acb041c744e6f41bd05b097b7a685396"
+bytes  = 228
+
+[weights."Kronos-mini"]
+kind        = "model"
+repo        = "NeoQuasar/Kronos-mini"
+revision    = "f4e68697d9d5aed55cef5c96aabc3376bcad9f81"
+max_context = 2048
+tokenizer   = "Kronos-Tokenizer-2k"
+
+[[weights."Kronos-mini".file]]
+path   = "model.safetensors"
+url    = "https://huggingface.co/NeoQuasar/Kronos-mini/resolve/f4e68697d9d5aed55cef5c96aabc3376bcad9f81/model.safetensors"
+sha256 = "a7d5f37e2e9fbd9891f7d7d4f72574512dd1f704fee14223e0a8cd0fbf54197c"
+bytes  = 16440776
+
+[[weights."Kronos-mini".file]]
+path   = "config.json"
+url    = "https://huggingface.co/NeoQuasar/Kronos-mini/resolve/f4e68697d9d5aed55cef5c96aabc3376bcad9f81/config.json"
+sha256 = "70daca2cb11e3a979dd6b8ac12ee08e2aace877acf28f5b8dfb4fe5609736201"
+bytes  = 225
+
+[weights."Kronos-Tokenizer-base"]
+kind     = "tokenizer"
+repo     = "NeoQuasar/Kronos-Tokenizer-base"
+revision = "0e0117387f39004a9016484a186a908917e22426"
+
+[[weights."Kronos-Tokenizer-base".file]]
+path   = "model.safetensors"
+url    = "https://huggingface.co/NeoQuasar/Kronos-Tokenizer-base/resolve/0e0117387f39004a9016484a186a908917e22426/model.safetensors"
+sha256 = "59d85f6af76a2c3b8240ea06cb21db4213b4eeca053f246b23e29cf832fc6bee"
+bytes  = 15842368
+
+[[weights."Kronos-Tokenizer-base".file]]
+path   = "config.json"
+url    = "https://huggingface.co/NeoQuasar/Kronos-Tokenizer-base/resolve/0e0117387f39004a9016484a186a908917e22426/config.json"
+sha256 = "2366e7ccfec76cbc19cf3c4c1b9c5d901be336ca1e83f2d2292c9bff381b77a2"
+bytes  = 301
+
+[weights."Kronos-Tokenizer-2k"]
+kind     = "tokenizer"
+repo     = "NeoQuasar/Kronos-Tokenizer-2k"
+revision = "26966d0035065a0cae0ebad7af8ece35bc1fb51c"
+
+[[weights."Kronos-Tokenizer-2k".file]]
+path   = "model.safetensors"
+url    = "https://huggingface.co/NeoQuasar/Kronos-Tokenizer-2k/resolve/26966d0035065a0cae0ebad7af8ece35bc1fb51c/model.safetensors"
+sha256 = "b97ec46b3b72160509e289183eaf7bdf5f0dac5bb9b49522f6d46638a99a8717"
+bytes  = 15842376
+
+[[weights."Kronos-Tokenizer-2k".file]]
+path   = "config.json"
+url    = "https://huggingface.co/NeoQuasar/Kronos-Tokenizer-2k/resolve/26966d0035065a0cae0ebad7af8ece35bc1fb51c/config.json"
+sha256 = "0b30a443affb03e05a876a083857de9164f899feb7b4d261da02c485c9a3e3b6"
+bytes  = 301
