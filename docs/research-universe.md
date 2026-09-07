@@ -52,7 +52,26 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
 - **PMLR capture** (`~/multivenue/logs/run-*/`): per-venue ticks,
   events (funding/mark/gaps/SubDrop/DVOL), depth (okx+deribit,
   K=5/side), opt-summary, engine orders/fills, AI-command timeline,
-  manifests. 37+ runs, 338M+ ticks, C6-blessed continuity.
+  manifests. C6-blessed continuity.
+
+  **Since 2026-09-07 the log root is NOT the whole history.** Retention
+  keeps a 24–72 h window locally and everything older lives in object
+  storage (`docs/arch/s3-archive-plan.md`). A pulled run is
+  byte-identical to the original, so `discover_runs`, `run_dirs`,
+  `select_runs` and `window_root.cut_run` behave the same on it — but
+  research that wants an older window has to materialise it first:
+
+  ```sh
+  multivenue-archive list --json          # one row per archived run,
+                                          # incl. windows_2h_complete
+  multivenue-archive pull <run-id>        # -> the local cache
+  ```
+
+  `windows_2h_complete` in the listing is what lets you plan an
+  N ≥ 4 disjoint-window pool BEFORE pulling a byte. `pnl_report --day`
+  resolves an archived day by itself; every other consumer takes the
+  path `pull` prints. The oldest history (pre-2026-08-29) is held as
+  legacy tarballs and pulls back the same way.
 - **candles.db**: 1m/1h/1d candles keyed venue+descriptor (all
   configured instruments incl. equities via klines) · `funding` table
   (5 venues, per-print rates — cadence law: deribit rows are hourly

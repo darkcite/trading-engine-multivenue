@@ -54,6 +54,32 @@ Each entry is atomic: one version bump per section. Do not batch.
   lexicographic `ListObjectsV2` order is chronological order — do not insert
   `YYYY/MM/DD` levels, which would break it.
 
+**Amended 2026-09-07 — went live; defaults re-derived by measurement**
+- `MULTIVENUE_S3_PART_SIZE_MIB` 8 → **32** and `MULTIVENUE_S3_TIMEOUT_S`
+  300 → **900**. Multipart costs ~3× a single PUT *per part*, so larger parts
+  recover most of that; a part must still finish inside the timeout on a bad
+  window, and this link has been seen at both 0.1 and 7 MiB/s.
+- New key `S3_NICE_NETWORK` in `retention.conf` (default 0). It is the ONE
+  lever for the uploader's network class. **Do not put `ProcessType=Background`
+  back in the launchd plist**: it applies background QoS to the whole job and
+  silently overrides this key, which throttles sustained transfers ~13× and
+  starves the cycle until retention can no longer verify-and-delete.
+- `S3_CYCLE_BUDGET_S` default 600 → **3600**.
+- `gc --max-gib` now takes **-1** to mean "use the configured cap"; `0` means
+  "empty the cache" and is honoured (it used to be swallowed as falsy).
+- `pnl_report --day` resolves an archived day through the object store, but
+  only as a FALLBACK — when the day has no local run at all. A locally-present
+  day costs zero HTTP requests.
+- **Retention policy change (operator ruling, supersedes D3):** `PROTECT_DAYS`
+  5 → 1 with `MIN/TARGET_FREE_GIB` set unreachably high, so the sweep runs
+  nightly rather than only under pressure and old runs are DELETED (after
+  verification) rather than tarred. The effective local window is **24–72 h**:
+  `age_days` is integer, so anything under 48 h is protected, and the sweep
+  runs once a day.
+- Legacy `~/multivenue/archive/*.tar.gz` are pushed verbatim and pull back via
+  `pull` (download → verify sha256 → `tar -xzf`), so the pre-2026-08-29 history
+  is retrievable through the same verb as everything else.
+
 ## Template
 
 ```
@@ -437,7 +463,7 @@ Each entry is atomic: one version bump per section. Do not batch.
 
 **Why**
 
-- `docs/venue-time-capture-plan.md` §1 — stale-blind captures book
+- `docs/arch/venue-time-capture-plan.md` §1 — stale-blind captures book
   mid-to-mid gains against books the engine could not see. Measured on
   the first v3 run: the VM row's one round trip is +$1.07 stale-blind vs
   −$4.87 judged (vault note).
@@ -491,7 +517,7 @@ Each entry is atomic: one version bump per section. Do not batch.
 
 **Why**
 
-- `docs/venue-time-capture-plan.md` §1: the capture cannot tell a stale
+- `docs/arch/venue-time-capture-plan.md` §1: the capture cannot tell a stale
   Binance book (8.9 % of messages > 500 ms stale) from a current one;
   VT1 is the wire-format prerequisite for the per-venue venue-time
   extraction (VT2) and the staleness gate (VT3/VT4).

@@ -35,7 +35,7 @@ log consumers and lane audits never decode `sym`. All padding in every
 slot is **explicit and zeroed** — this is the `AsBytes` contract; v1
 files predate it (see `docs/migration.md`).
 
-### `Tick` — 64 bytes (v3 since VT1, 2026-09-03 — `docs/venue-time-capture-plan.md` §3)
+### `Tick` — 64 bytes (v3 since VT1, 2026-09-03 — `docs/arch/venue-time-capture-plan.md` §3)
 
 | offset | bytes | field         | type             | notes                                  |
 | -----: | ----: | ------------- | ---------------- | -------------------------------------- |

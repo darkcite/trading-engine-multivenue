@@ -75,7 +75,7 @@ Operator decisions already taken (AskUserQuestion, 2026-09-03):
    Python reference (`claude_worker.regime`) compute the same words from
    the same minute closes; a committed fixture pins them (the ICDP
    feature-law precedent).
-7. **Windows stay ≤ 2 h** (`docs/venue-time-capture-plan.md` §6.1). Regime
+7. **Windows stay ≤ 2 h** (`docs/arch/venue-time-capture-plan.md` §6.1). Regime
    *warm-up* comes from `candles.db` (existing derived data — a seed, not
    a capture window); gates are stated in windows N and per-window
    counts, never hours.

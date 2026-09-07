@@ -132,7 +132,7 @@ flowing while its content is seconds old.
 ## 5. Engine-side feed delay (VT2, `core_time::FeedClock`) — per venue
 
 Since VT2 (2026-09-03) the engine judges every stamped tick against the
-venue's own fastest message (`docs/venue-time-capture-plan.md` §2
+venue's own fastest message (`docs/arch/venue-time-capture-plan.md` §2
 doctrine 2): `delay = off_ms − (venue_ms − mono_ms)`, `off_ms = max` with
 a 1 ms/min decay. This is a **max-relative** delay: `absolute ≈ relative +
 floor`, the floor being the network's one-way minimum (§3's absolute p50

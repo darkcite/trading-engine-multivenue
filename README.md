@@ -98,7 +98,7 @@ symbols through the manifest, never a bare `SymbolId` across runs.
 `backtest`'s argv and schema-1 JSON are a **frozen contract** with
 `claude-worker`. The harness conforms to the worker, never vice versa.
 
-**Venue time + staleness (VT, 2026-09-03 — `docs/venue-time-capture-plan.md`).**
+**Venue time + staleness (VT, 2026-09-03 — `docs/arch/venue-time-capture-plan.md`).**
 Tick v3 carries `venue_time_ms` + `flags`; every ingress judges each tick
 against the venue's own fastest message (`core_time::FeedClock`) and
 flags it STALE past the per-venue `stale_after_ms` (pm 1000 / bn 1000 /

@@ -231,14 +231,28 @@ Operational laws:
   included) waits forever. Log: `~/multivenue/logs/launchd/dashboard.log`.
 - **Retention** (`scripts/retention.sh`, runs once per UTC day from
   the restart poller; config `~/multivenue/retention.conf`, see
-  `retention.conf.example`): KEEP-ALL until the log volume's free
-  space drops under `MIN_FREE_GIB` (default 25), then the oldest run
-  dirs are compressed (`tar -cz`, bsdtar-internal gzip — no external
-  tools) into `~/multivenue/archive/` until `TARGET_FREE_GIB` (40) is
-  free again — never the newest run dir, never anything younger than
-  `PROTECT_DAYS` (7), archives never auto-deleted. `capture-catalog`
-  reports per-run sizes; restoring =
+  `retention.conf.example`). Two policies; **this deployment runs the
+  second.**
+
+  *Default, pressure-driven (what you get with no config):* KEEP-ALL
+  until the log volume's free space drops under `MIN_FREE_GIB` (25),
+  then the oldest run dirs are compressed (`tar -cz`, bsdtar-internal
+  gzip — no external tools) into `~/multivenue/archive/` until
+  `TARGET_FREE_GIB` (40) is free again — never the newest run dir,
+  never anything younger than `PROTECT_DAYS`, archives never
+  auto-deleted. Restoring =
   `tar -xzf archive/run-<ns>.tar.gz -C ~/multivenue/logs/`.
+
+  *LIVE HERE since 2026-09-07 — fixed window (operator ruling;
+  SUPERSEDES D3's `PROTECT_DAYS=5`):* `MIN_FREE_GIB` and
+  `TARGET_FREE_GIB` are set unreachably high so the sweep runs EVERY
+  night rather than only under pressure, `PROTECT_DAYS=1`, and
+  `ARCHIVE_MODE="s3"`. Old runs are DELETED rather than tarred, and
+  only after the object archive verifies it holds them; the first run
+  that does not verify stops the sweep with everything after it intact.
+  Note the window is really **24–72 h**, not 24 h: `age_days` is
+  integer, so anything under 48 h is protected, and the sweep runs only
+  once a day. `capture-catalog` still reports per-run sizes.
 - **candles.db** (mvp-plan §9.4–§9.6; `claude_worker.candles` MODULE
   — never a verb; hourly `com.multivenue.candles` agent via
   `scripts/candles-cycle.sh`): worker-owned SQLite WAL at
@@ -334,6 +348,18 @@ Only the Python loader reads this file; no shell script sources it, and no
 value ever reaches argv, a log line, a manifest or a URL. It is deliberately
 NOT `.env`: `engine-wrapper.sh` sources that with `set -a`, which would put the
 archive credential into the engine's environment for no reason.
+
+Two settings are worth understanding rather than copying, because both
+were derived by measurement on this link and a different link will want
+different numbers:
+
+- **`MULTIVENUE_S3_PART_SIZE_MIB` (32).** Multipart costs roughly 3× a
+  single PUT *per part*, so larger parts are faster — but a part must
+  still finish inside `MULTIVENUE_S3_TIMEOUT_S` on a bad network
+  window. 32 MiB against a 900 s timeout survives ~0.04 MiB/s.
+- **`MULTIVENUE_S3_ZSTD_LEVEL` (3).** Level 9 buys about a tenth off
+  the stored size for four times the CPU; on a link this slow the
+  compression time it adds exceeds the upload time it saves.
 
 ### 2. Check it, then fill the bucket
 
