@@ -1748,6 +1748,34 @@ RESUME POINT.`
   `vm_rows_active 2`; suite 898 passed / 3 skipped; `git diff` over `crates/`
   still 0 lines.**
 
+- **2026-09-07 — docs actualized; legacy pruned (operator ruling).**
+  - **Docs moved to this archive:** `venue-time-capture-plan.md` (VT0–VT6,
+    closed 2026-09-03 — its §6.1 ≤ 2 h law REMAINS a standing absolute, and is
+    cited from nine `crates/` files at the pre-move path, left as written per
+    this archive's own convention) and `phase-8-architecture.svg`.
+  - **Docs actualized:** `local-setup.md` (the retention section described only
+    the pressure-driven policy; the fixed-window one is what runs here, and the
+    window is **24–72 h** not 24 h — `age_days` is integer so anything under
+    48 h is protected, and the sweep runs once a day); `research-universe.md`
+    (it said research reads `~/multivenue/logs/run-*/`, which is no longer the
+    whole history — added how to plan a pool from `list --json`'s
+    `windows_2h_complete` BEFORE pulling a byte); `migration.md` (the measured
+    defaults, `S3_NICE_NETWORK`, the plist trap, `gc --max-gib` semantics, the
+    fallback resolver, the retention change); `CLAUDE.md` stay-greens.
+    **Corrected a false stay-green while there: `make py-lint` is NOT green and
+    was not before this lane** — 696 ruff errors across committed files at HEAD;
+    the old "make lint green" covered clippy only.
+  - **Legacy tarballs pruned.** All 40 were verified against the bucket first
+    (index object present, manifest agreeing, and the on-disk size matching the
+    manifest's) with an explicit refuse-all-if-any-fail guard; 40/40 passed and
+    **3.60 GiB** was freed. Seven empty leftover directories removed.
+    `~/multivenue/archive` now holds nothing but a `.DS_Store`. Re-proven after
+    deletion: a tarball with no local copy left still pulls back from the bucket
+    and appears to `features.run_dirs` as a real run.
+  - **State: 83 GiB free** (from 22 at the start of this lane), 17 GiB of logs,
+    1.1 MB of cache, bucket 58 runs + 40 tarballs = 19.41 GiB, engine pid 51165,
+    worker pytest 898, git tree clean.
+
   **RESUME POINT: nothing outstanding but the two bucket-configuration
   settings.** The nightly shape from here: `com.multivenue.archive` uploads at
   04:30 local; `retention.sh` at 0000Z verifies and prunes to 24 h. Watch the
