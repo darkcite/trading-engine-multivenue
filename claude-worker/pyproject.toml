@@ -17,7 +17,12 @@ authors         = [{ name = "Anton (darkcite)", email = "qqq.darkcite@gmail.com"
 
 dependencies = [
     # Anthropic SDK — constructed inside `serve` (llm.py seam) ONLY; verbs never touch it.
-    "anthropic>=0.122.0",
+    # >=1.4.0 for `claude-fable-5-1` (MODEL_STRATEGIST): 0.122.0's model Literal
+    # knows the Fable family as `claude-fable-5` alone. The surface the worker
+    # touches is two names — `anthropic.Anthropic` and
+    # `anthropic.types.TextBlock` — both unchanged across the 0.x -> 1.x
+    # boundary, which is why a major bump is safe here.
+    "anthropic>=1.4.0",
     # HTTP client for news_watcher feed polling + rate-budgeted venue REST.
     "httpx>=0.28.1",
     # CLI: serve + operator verbs (design §13 Q4 — Typer verified under 3.14).

@@ -533,7 +533,7 @@ def test_full_cycle_auto_promotes_through_frozen_pair(
     assert row[3] is True and row[4] == "auto"
     assert row[5] is not None and row[6] is not None, "staged AND committed"
     assert state.ruleset_attribution(full_hash) == (
-        "claude-fable-5",
+        claude_worker.config.MODEL_STRATEGIST,
         "fade the lagged PM quote",
     )
 
@@ -541,7 +541,7 @@ def test_full_cycle_auto_promotes_through_frozen_pair(
     ledger = state.events(kind=claude_worker.strategist.EVENT_STRATEGIST_CALL)
     assert len(ledger) == 1
     detail = json.loads(ledger[0][3])
-    assert detail["model"] == "claude-fable-5"
+    assert detail["model"] == claude_worker.config.MODEL_STRATEGIST
     assert detail["input_tokens"] == 111 and detail["output_tokens"] == 42
     assert detail["cache_read"] is False
     promo = state.events(kind=claude_worker.strategist.EVENT_PROMOTION)
@@ -660,7 +660,7 @@ def test_serve_composes_research_cycle_end_to_end(
     # The strategist call went out with system blocks + the 4096 budget.
     assert len(fake_llm.messages.calls) == 1
     sent = fake_llm.messages.calls[0]
-    assert sent["model"] == "claude-fable-5"
+    assert sent["model"] == claude_worker.config.MODEL_STRATEGIST
     assert sent["max_tokens"] == claude_worker.llm.STRATEGIST_MAX_TOKENS
     assert sent["system"] == claude_worker.strategist.system_blocks()
 
@@ -678,7 +678,7 @@ def test_serve_composes_research_cycle_end_to_end(
     full_hash, hash128 = claude_worker.backtest.ruleset_hashes(installed[0])
     assert installed[0].stem == hash128.hex()
     assert state.ruleset_attribution(full_hash) == (
-        "claude-fable-5",
+        claude_worker.config.MODEL_STRATEGIST,
         "fade the lagged PM quote",
     )
     row = state.ruleset_row(full_hash)

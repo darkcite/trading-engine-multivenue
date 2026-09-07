@@ -598,7 +598,7 @@ def test_call_detail_fields() -> None:
     )
     detail = json.loads(claude_worker.strategist.call_detail(completion, "proposal"))
     assert detail == {
-        "model": "claude-fable-5",
+        "model": claude_worker.config.MODEL_STRATEGIST,
         "purpose": "proposal",
         "input_tokens": 1000,
         "output_tokens": 200,
@@ -699,7 +699,7 @@ def test_complete_message_returns_usage_and_passes_system() -> None:
     )
     assert completion == claude_worker.llm.Completion("out", 1200, 340, 1100, 0)
     sent = fake.messages.kwargs[0]
-    assert sent["model"] == "claude-fable-5"
+    assert sent["model"] == claude_worker.config.MODEL_STRATEGIST
     assert sent["max_tokens"] == 4096
     assert sent["system"] == blocks
 

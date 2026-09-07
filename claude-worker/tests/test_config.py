@@ -177,4 +177,4 @@ def test_model_ids_are_stable() -> None:
     """
     assert claude_worker.config.MODEL_BULK == "claude-haiku-4-5"
     assert claude_worker.config.MODEL_REASONING == "claude-sonnet-5"
-    assert claude_worker.config.MODEL_STRATEGIST == "claude-fable-5"
+    assert claude_worker.config.MODEL_STRATEGIST == "claude-fable-5-1"
