@@ -1696,6 +1696,58 @@ RESUME POINT.`
     `multivenue-archive status` → `archive: enabled bucket=market-data-qu
     host=mbp-m4 runs_remote=49`.
 
+- **2026-09-07 — first unattended cycles reviewed; two live defects found and
+  fixed.** The nightly lane had been running on its own for two days.
+
+  **What worked unattended, with no help:** the 0000Z sweep verified against the
+  bucket and pruned to the window, stopping cleanly at the protect boundary; the
+  **0020Z pnl report fired on time** (`2026-09-06: strategies=1 runs=15
+  failed=0`) — the thing stage A was kept out of the restart lane to protect;
+  the RG4/RG7 window pool is intact at 8 windows; the engine survived its own
+  daily restarts.
+
+  **DEFECT 1 — the plist was re-imposing the QoS the script had been told to
+  skip.** The 04:30 cycle moved 306 MB in 3185 s (0.096 MiB/s) and then spent
+  its budget mid-run, despite `S3_NICE_NETWORK=0`. Cause: launchd's
+  `ProcessType=Background` applies macOS background QoS — network traffic class
+  included — to the whole job, overriding the script's own decision.
+  `LowPriorityIO` compounded it. **Consequence, which is the part that matters:**
+  a cycle that cannot keep up means retention can never verify-and-delete, so
+  the 24 h policy quietly stops holding. It was already happening — 7 runs
+  pending, three of them past 24 h and correctly refused for deletion. Fixed by
+  removing both keys (`Nice 19` stays; CPU politeness does not touch the
+  socket), so network QoS has ONE lever. Verified: the same work then ran at
+  **3.4–5.0 MiB/s** (302 MB in 12 s; 2.81 GiB in 130 s). The run that had exited
+  on budget at 27/35 files finished in 12 s — **production proof that resume
+  skips what was already uploaded.** Backlog cleared to 0 pending.
+
+  **DEFECT 2 — wiring the resolver into the nightly lane made a TEST RUN reach
+  the live bucket** and pull 24 runs / 1.2 GB into the operator's cache. Two
+  causes, both fixed: `select_runs` consulted the archive even when the day was
+  local (it is now a FALLBACK — consulted only when the day has no local run,
+  which is correct because PROTECT_DAYS keeps a whole UTC day on disk), and
+  three tests passed `env={}`, which makes the loader fall back to the
+  operator's REAL cache dir; they now pin `tmp_path`. The spurious cache was
+  emptied (S-LAW 9 — disposable by construction). A regression test asserts the
+  locally-present day costs **zero HTTP requests**.
+
+  Two smaller bugs found while proving it: `list_runs` raised `KeyError` on
+  `totals` for a run that is local AND held as a legacy tarball (tarball
+  manifests carry only `{size_bytes, sha256}`); and `gc --max-gib 0` silently
+  did nothing, because the CLI read it as `args.max_gib or cfg.cache_max_gib`
+  and swallowed an explicit zero as falsy.
+
+  **Operator rulings 2026-09-07:** keep the 24–48 h window as-is (integer
+  `age_days` in `retention.sh` means anything under 48 h survives — a useful
+  margin that guarantees the 0020Z report always has its full closed day);
+  accept the ~6 min/day of full-priority upload rather than build a rate cap;
+  wire the resolver in; versioning to be set in the Hetzner Console.
+
+  **State at close: 58 runs + 40 tarballs, 19.41 GiB in the bucket, 0 pending;
+  14 runs / 17 GiB local; 79 GiB free; engine pid 51165 with
+  `vm_rows_active 2`; suite 898 passed / 3 skipped; `git diff` over `crates/`
+  still 0 lines.**
+
   **RESUME POINT: nothing outstanding but the two bucket-configuration
   settings.** The nightly shape from here: `com.multivenue.archive` uploads at
   04:30 local; `retention.sh` at 0000Z verifies and prunes to 24 h. Watch the
