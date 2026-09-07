@@ -179,10 +179,10 @@ These gaps are expected; the point of v1 is to prove strategy logic, not latency
                          v
 +------------------------------------------------------------------+
 | claude_worker (Python 3.14, cold path)                           |
-|   - rule parser (Sonnet 4.6)                                     |
+|   - rule parser (Sonnet 5)                                       |
 |   - topic tagger (Haiku 4.5, bulk)                               |
 |   - news labeler (Sonnet, warm, 500 ms timeout fallthrough)      |
-|   - backtest reviewer (Opus 4.6, batch only)                     |
+|   - backtest reviewer (Opus 5, batch only)                       |
 |   - aggressive SQLite prompt cache                               |
 +------------------------------------------------------------------+
 ```
@@ -514,8 +514,8 @@ Same as v0.3 core risks, plus local-deployment and free-tier specifics:
 
 ### 10.1 Model selection by task
 - **Haiku 4.5** — bulk topic tagging across thousands of markets. Cheapest, good enough for label-style tasks.
-- **Sonnet 4.6** — rule parsing, news labeling, most reasoning tasks.
-- **Opus 4.6** — backtest review, hard ambiguity cases. Batch only.
+- **Sonnet 5** — rule parsing, news labeling, most reasoning tasks.
+- **Opus 5** — backtest review, hard ambiguity cases. Batch only.
 
 ### 10.2 Budget discipline
 - Aggressive **SQLite prompt cache** keyed by `(model, prompt_version_hash, content_hash)`. Most prompts are idempotent over a market's lifetime.
@@ -545,7 +545,7 @@ client = anthropic.Anthropic()
 
 def parse_market(market: dict) -> dict:
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=2048,
         system=_SYSTEM,
         messages=[{"role": "user", "content": json.dumps(market)}],

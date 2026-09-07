@@ -7,7 +7,7 @@ rereading the whole doc set. `PLAN.md` remains the architectural deep-dive.
 
 ## What this is
 
-A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that executes latency-arbitrage trades on Polymarket's CLOB. v1 runs locally on a MacBook Pro M4 using only free-tier external APIs. Claude (via the `claude-worker` Python process) acts as an offline strategy researcher — never in the hot path.
+A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that executes systematic strategies across a multivenue universe (Binance spot/USDM, OKX, Deribit, Hyperliquid, Bybit, Polymarket CLOB, Polygon RPC + an options ladder). Strategies are composed at boot from a slot set and may trade **any subset** of that universe — **Polymarket is one venue among several, not the target**. The original PM latency-arb strategy still exists in-tree but is DISABLED at boot (operator ruling 2026-09-02; the live mask is `ai` = 48). v1 runs locally on a MacBook Pro M4 using only free-tier external APIs. Claude (via the `claude-worker` Python process) acts as an offline strategy researcher — never in the hot path.
 
 ## CURRENT STATE (updated 2026-09-02 — MVP COMPLETE; keep this section current at every phase boundary)
 
@@ -230,10 +230,21 @@ cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
 
 ## Preferred Claude models for tasks in this repo
 
-- **Bulk artifact generation** (topic tagging): Haiku 4.5.
-- **Reasoning** (rule parsing, news labeling): Sonnet 4.6.
-- **Strategy proposals** (`claude-worker` serve strategist, ruleset drafts): Fable 5 (`MODEL_STRATEGIST = "claude-fable-5"`).
-- **Hard work** (backtest review, architectural changes): Opus 4.6.
+- **Bulk artifact generation** (topic tagging): Haiku 4.5 (`MODEL_BULK = "claude-haiku-4-5"`).
+- **Reasoning** (rule parsing, news labeling): Sonnet 5 (`MODEL_REASONING = "claude-sonnet-5"`).
+- **Strategy proposals** (`claude-worker` serve strategist, ruleset drafts): Fable 5 (`MODEL_STRATEGIST = "claude-fable-5"`) — see the note below on 5.1.
+- **Hard work** (backtest review, architectural changes): Opus 5.
+
+**These are not just labels.** `MODEL_BULK` / `MODEL_REASONING` / `MODEL_STRATEGIST` live in `claude-worker/src/claude_worker/config.py`, are consumed by `feeds.py`, `strategist.py` and `daemon.py`, and are pinned by `tests/test_config.py`. Change the doc and the constant together, or a lane will call a model string that does not exist.
+
+**Verify against the SDK, not against a version number.** The pinned `anthropic` (0.122.0) enumerates every accepted identifier in `anthropic/types/model.py` — that list is the authority:
+
+```sh
+cd claude-worker && .venv/bin/python -c \
+  "import anthropic.types.model as m; print(m.__file__)"   # then read the Literal
+```
+
+**"Fable 5.1" was requested 2026-09-07 and NOT applied: `claude-fable-5-1` is not in that list** (the Fable family is `claude-fable-5` alone). Shipping it would have failed at the first keyed `serve` cycle — which IS the Stage-3 entry gate, so nothing earlier would have caught it. If a 5.1 exists upstream it needs a newer SDK, which is a dependency change and therefore `make license-deps` + a regenerated `THIRD-PARTY-NOTICES.md`. `claude-sonnet-5`, `claude-opus-5` and `claude-haiku-4-5` are all present and in use.
 
 ## When in doubt, read (in this order)
 

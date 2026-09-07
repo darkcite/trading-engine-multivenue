@@ -5,9 +5,16 @@
 [![Python](https://img.shields.io/badge/python-3.14-blue.svg)](./claude-worker/pyproject.toml)
 
 Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine
-that executes latency-arbitrage trades on Polymarket's CLOB against a
-multivenue reference universe (Binance spot/USDM, OKX, Deribit,
-Hyperliquid, Polygon RPC — plus a boot-selected options ladder).
+that executes systematic strategies across a multivenue universe — Binance
+spot/USDM, OKX, Deribit, Hyperliquid, Bybit, Polymarket's CLOB and Polygon
+RPC, plus a boot-selected options ladder.
+
+Strategies are composed at boot from a slot set (AI-executed intents, the
+ruleset VM, the intrabar candle member) and are free to trade any subset of
+that universe. **Polymarket is one venue among several, not the target**: a
+strategy may use it, ignore it, or trade purely between the crypto venues.
+The original Polymarket latency-arbitrage strategy still exists in-tree but
+is disabled at boot.
 
 **v1 runs locally on a MacBook Pro M4** on free-tier external APIs only.
 Phase 7 migrates to a plain Linux EC2 box — no cloud services, no

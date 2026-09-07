@@ -176,5 +176,5 @@ def test_model_ids_are_stable() -> None:
     Brittle on purpose: upgrading a model means updating here too.
     """
     assert claude_worker.config.MODEL_BULK == "claude-haiku-4-5"
-    assert claude_worker.config.MODEL_REASONING == "claude-sonnet-4-6"
+    assert claude_worker.config.MODEL_REASONING == "claude-sonnet-5"
     assert claude_worker.config.MODEL_STRATEGIST == "claude-fable-5"

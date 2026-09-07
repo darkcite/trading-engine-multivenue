@@ -25,7 +25,13 @@ import pathlib
 # Model identifiers. Kept in one place so upgrades are a single-line edit.
 # See CLAUDE.md §"Preferred Claude models for tasks in this repo".
 MODEL_BULK: str = "claude-haiku-4-5"  # topic tagging, cheap labels
-MODEL_REASONING: str = "claude-sonnet-4-6"  # news labeling, rule parsing
+MODEL_REASONING: str = "claude-sonnet-5"  # news labeling, rule parsing
+# "claude-fable-5-1" is NOT a valid identifier: the pinned anthropic 0.122.0
+# enumerates the Fable family as `claude-fable-5` only (see
+# anthropic/types/model.py). Bumping this to a name the SDK does not know would
+# fail at the first keyed `serve` cycle — which is itself the Stage-3 entry
+# gate, so nothing before then would catch it. Re-check the SDK's own list
+# before changing this.
 MODEL_STRATEGIST: str = "claude-fable-5"  # ruleset proposals (serve only)
 
 _HMAC_KEY_HEX_LEN: int = 64  # 64 hex chars -> 32-byte key (design §4.1)
