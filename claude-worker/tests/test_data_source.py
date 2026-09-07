@@ -13,6 +13,7 @@ asserts through a request counter, not through a code reading.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import argparse
 import json
 import os
 import pathlib
@@ -304,14 +305,45 @@ def test_gc_removes_partials_and_respects_the_cap(tmp_path: pathlib.Path) -> Non
     assert not (cfg.cache_dir / f"run-{EPOCH_NS}.partial").exists()
 
 
+def test_gc_max_gib_zero_empties_the_cache(tmp_path: pathlib.Path) -> None:
+    """`--max-gib 0` is a real request, not an absent one.
+
+    The CLI used to read it as `args.max_gib or cfg.cache_max_gib`, so an
+    explicit zero was swallowed as falsy and `gc --max-gib 0` silently did
+    nothing — observed live against a cache holding 24 runs.
+    """
+    cfg, _fake, logs, source = seeded(tmp_path)
+    run_id = f"run-{EPOCH_NS}"
+    (logs / run_id).rename(tmp_path / "aside")
+    source.ensure_local(run_id)
+    assert (cfg.cache_dir / run_id).is_dir()
+
+    args = argparse.Namespace(max_gib=0.0)
+    assert claude_worker.archive._gc_limit(args, cfg) == 0.0
+    assert claude_worker.archive._gc_limit(argparse.Namespace(max_gib=-1.0), cfg) == (
+        cfg.cache_max_gib
+    )
+    assert claude_worker.archive.gc_cache(cfg, 0.0)["runs"] == 1
+    assert not (cfg.cache_dir / run_id).exists()
+
+
 # --------------------------------------------------------------------------
 # disabled + provenance
 # --------------------------------------------------------------------------
 
 
 def test_disabled_resolver_does_zero_http(tmp_path: pathlib.Path) -> None:
-    """S-LAW 2 for this layer: no store is constructed, so no request is possible."""
-    cfg = claude_worker.archive_config.load(env={}, env_file=tmp_path / "absent.env")
+    """S-LAW 2 for this layer: no store is constructed, so no request is possible.
+
+    The cache dir is pinned to tmp_path deliberately. Passing ``env={}`` makes
+    the loader fall back to its real defaults, which means the operator's own
+    ``~/multivenue/s3-cache`` — a test that reads it is a test whose result
+    depends on the machine it runs on.
+    """
+    cfg = claude_worker.archive_config.load(
+        env={"MULTIVENUE_S3_CACHE_DIR": str(tmp_path / "cache")},
+        env_file=tmp_path / "absent.env",
+    )
     logs = tmp_path / "logs"
     make_run(logs, f"run-{EPOCH_NS}")
     source = claude_worker.data_source.build(cfg, logs)
@@ -322,7 +354,10 @@ def test_disabled_resolver_does_zero_http(tmp_path: pathlib.Path) -> None:
 
 
 def test_disabled_resolver_cannot_materialise_an_absent_run(tmp_path: pathlib.Path) -> None:
-    cfg = claude_worker.archive_config.load(env={}, env_file=tmp_path / "absent.env")
+    cfg = claude_worker.archive_config.load(
+        env={"MULTIVENUE_S3_CACHE_DIR": str(tmp_path / "cache")},
+        env_file=tmp_path / "absent.env",
+    )
     source = claude_worker.data_source.build(cfg, tmp_path / "logs")
     with pytest.raises(claude_worker.data_source.DataSourceError, match="disabled"):
         source.ensure_local(f"run-{EPOCH_NS}")
@@ -343,7 +378,10 @@ def test_provenance_block_matches_where(tmp_path: pathlib.Path) -> None:
 
 
 def test_disabled_provenance_block_is_the_empty_shape(tmp_path: pathlib.Path) -> None:
-    cfg = claude_worker.archive_config.load(env={}, env_file=tmp_path / "absent.env")
+    cfg = claude_worker.archive_config.load(
+        env={"MULTIVENUE_S3_CACHE_DIR": str(tmp_path / "cache")},
+        env_file=tmp_path / "absent.env",
+    )
     source = claude_worker.data_source.build(cfg, tmp_path / "logs")
     assert source.provenance([]) == {"archive_enabled": False, "runs": []}
 

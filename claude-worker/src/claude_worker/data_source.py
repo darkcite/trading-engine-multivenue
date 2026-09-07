@@ -73,6 +73,25 @@ def _epoch_of(run_id: str) -> int:
     return int(suffix) if suffix.isdigit() else 0
 
 
+def _manifest_sizes(
+    manifest: dict[str, typing.Any] | None,
+) -> tuple[int | None, int | None]:
+    """(size_bytes, stored_bytes) from a manifest of EITHER shape.
+
+    A run manifest carries a `totals` block. A legacy tarball manifest carries
+    only `{size_bytes, sha256}` — the richer facts did not exist when retention
+    wrote the tarball, and inventing them would mean extracting every archive
+    just to list it. A tarball is already compressed, so stored == size.
+    """
+    if manifest is None:
+        return None, None
+    totals = manifest.get("totals")
+    if totals:
+        return totals.get("size_bytes"), totals.get("stored_bytes")
+    size = manifest.get("size_bytes")
+    return size, size
+
+
 def _venues_from_catalog(manifest: dict[str, typing.Any]) -> tuple[str, ...]:
     catalog = manifest.get("catalog")
     if not isinstance(catalog, dict):
@@ -165,6 +184,7 @@ class DataSource:
         refs: dict[str, RunRef] = {}
         for run_id, path in list(local.items()) + list(cached.items()):
             manifest = manifests.get(run_id)
+            size, stored = _manifest_sizes(manifest)
             span = claude_worker.window_root.run_span(path)
             refs[run_id] = RunRef(
                 run_id=run_id,
@@ -176,8 +196,8 @@ class DataSource:
                 ),
                 local_path=path,
                 span_ns=span,
-                size_bytes=manifest["totals"]["size_bytes"] if manifest else None,
-                stored_bytes=manifest["totals"]["stored_bytes"] if manifest else None,
+                size_bytes=size,
+                stored_bytes=stored,
                 pmlr_version=claude_worker.window_root.run_pmlr_version(path),
                 windows_2h_complete=len(claude_worker.window_root.complete_windows(path)),
                 venues=_venues_from_catalog(manifest) if manifest else (),
@@ -187,12 +207,7 @@ class DataSource:
             if run_id in refs:
                 continue
             span = manifest.get("span_ns")
-            # A legacy tarball manifest carries only {size_bytes, sha256}: the
-            # richer facts did not exist when retention wrote it, and inventing
-            # them would mean extracting every archive just to list it.
-            totals = manifest.get("totals")
-            size = totals["size_bytes"] if totals else manifest.get("size_bytes")
-            stored = totals["stored_bytes"] if totals else manifest.get("size_bytes")
+            size, stored = _manifest_sizes(manifest)
             refs[run_id] = RunRef(
                 run_id=run_id,
                 epoch_ns=manifest.get("epoch_ns") or _epoch_of(run_id),

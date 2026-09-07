@@ -941,7 +941,10 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
     pull.add_argument("--into", default="")
 
     collect = sub.add_parser("gc")
-    collect.add_argument("--max-gib", type=float, default=0.0)
+    # -1 means "use the configured cap". NOT 0: `--max-gib 0` is a legitimate
+    # request meaning "empty the cache", and `args.max_gib or cfg.cache_max_gib`
+    # would silently swallow it as falsy.
+    collect.add_argument("--max-gib", type=float, default=-1.0)
 
     sub.add_parser("status")
 
@@ -962,7 +965,7 @@ def main(argv: collections.abc.Sequence[str] | None = None) -> int:
     # Non-gating lanes stay useful with the subsystem off: the cache is local.
     if args.verb in ("status", "gc") and not claude_worker.archive_config.is_enabled(cfg):
         if args.verb == "gc":
-            print(json.dumps(gc_cache(cfg, args.max_gib or cfg.cache_max_gib)))
+            print(json.dumps(gc_cache(cfg, _gc_limit(args, cfg))))
         print(cfg.tell(), file=sys.stderr)
         return EXIT_OK
 
@@ -1029,7 +1032,7 @@ def _dispatch(  # noqa: PLR0911, PLR0912 — one branch per verb, deliberately f
             print(str(archiver.pull_tarball(run_id, into)))
         return EXIT_OK
     if args.verb == "gc":
-        print(json.dumps(gc_cache(cfg, args.max_gib or cfg.cache_max_gib)))
+        print(json.dumps(gc_cache(cfg, _gc_limit(args, cfg))))
         return EXIT_OK
     if args.verb == "status":
         runs = archiver.list_runs()
@@ -1081,6 +1084,13 @@ def _derived_paths(kind: str, explicit: str) -> list[pathlib.Path]:
             raise ArchiveError("candles: sqlite3 .backup failed", EXIT_FAILED)
         return [snapshot]
     return sorted(p for p in (home / "worker" / "features").rglob("*") if p.is_file())
+
+
+def _gc_limit(
+    args: argparse.Namespace, cfg: claude_worker.archive_config.ArchiveConfig
+) -> float:
+    """A NEGATIVE --max-gib means "use the configured cap"; 0 means "empty it"."""
+    return cfg.cache_max_gib if args.max_gib < 0 else args.max_gib
 
 
 def _run_id(raw: str) -> str:

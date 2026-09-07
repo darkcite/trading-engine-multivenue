@@ -230,7 +230,19 @@ def select_runs(
             if _day_of(epoch_ns) == day:
                 out.append(child)
                 seen.add(child.name)
-    if source is None:
+    # The archive is a FALLBACK, not a default: it is consulted only when the
+    # day has no local runs at all. Two reasons, both load-bearing.
+    #
+    # First, correctness costs nothing here — PROTECT_DAYS keeps a whole UTC day
+    # local (the sweep runs oldest-first and stops at the protect boundary, and
+    # the closed day is 0-24 h old when it runs), so a day is either entirely on
+    # disk or entirely reclaimed.
+    #
+    # Second, and the reason it is written this way: the nightly report must not
+    # acquire a network dependency it does not need. This function is on the
+    # path that produces the report the RG7 soak reads, and it is called from
+    # tests that must never touch a real bucket.
+    if source is None or out:
         return out
     for ref in source.list_runs():
         if ref.run_id in seen or _day_of(ref.epoch_ns) != day:
@@ -599,8 +611,40 @@ def main(argv: list[str] | None = None) -> int:
         if args.fees or fees_path.is_file():
             fee_flags = load_fee_flags(fees_path)
         window_root = None if args.no_windows else pathlib.Path(args.window_root).expanduser()
-        return run_day(replay_dir, reports_dir, day, report, fee_flags=fee_flags, window_root=window_root)
+        return run_day(
+            replay_dir,
+            reports_dir,
+            day,
+            report,
+            fee_flags=fee_flags,
+            window_root=window_root,
+            source=_archive_source(replay_dir),
+        )
     return run_once(replay_dir, reports_dir, now_ms, report)
+
+
+def _archive_source(replay_dir: pathlib.Path) -> typing.Any:
+    """A resolver for days retention has already reclaimed, or None.
+
+    The nightly run never needs this — its day is still on local disk under
+    PROTECT_DAYS. It exists so that re-running an OLD day works at all: without
+    it, `--day 2026-08-30` silently reports on nothing once those runs are only
+    in the bucket.
+
+    Returns None on ANY failure, including the archive being unconfigured. This
+    lane writes the report the RG7 soak reads; it must never fail to produce one
+    because an optional subsystem is missing or broken.
+    """
+    try:
+        import claude_worker.archive_config  # noqa: PLC0415 — optional subsystem
+        import claude_worker.data_source  # noqa: PLC0415 — optional subsystem
+
+        cfg = claude_worker.archive_config.load()
+        if not claude_worker.archive_config.is_enabled(cfg):
+            return None
+        return claude_worker.data_source.build(cfg, replay_dir)
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

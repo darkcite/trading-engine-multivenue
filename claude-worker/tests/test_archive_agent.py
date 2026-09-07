@@ -104,11 +104,12 @@ def test_select_runs_materialises_an_archived_day(tmp_path: pathlib.Path) -> Non
     make_run(logs, epoch_for("2026-09-02"))  # newest, never pushed
 
     claude_worker.archive.Archiver(cfg, wire(cfg, fake)).push_pending(logs)
-    # Retention reclaims the first run of that day.
+    # Retention reclaims the whole day — which is what actually happens, since
+    # the sweep runs oldest-first and stops at the PROTECT_DAYS boundary, so a
+    # UTC day is either entirely on disk or entirely gone.
     shutil.rmtree(archived)
-    assert claude_worker.pnl_report.select_runs(logs, day) == [
-        logs / f"run-{epoch_for(day, hour=5)}"
-    ]
+    shutil.rmtree(logs / f"run-{epoch_for(day, hour=5)}")
+    assert claude_worker.pnl_report.select_runs(logs, day) == []
 
     source = claude_worker.data_source.DataSource(cfg, logs, wire(cfg, fake))
     resolved = claude_worker.pnl_report.select_runs(logs, day, source)
@@ -120,6 +121,25 @@ def test_select_runs_materialises_an_archived_day(tmp_path: pathlib.Path) -> Non
     assert (resolved[0] / "pm-ticks.pmlr").is_file()
 
 
+def test_local_day_consults_the_archive_not_at_all(tmp_path: pathlib.Path) -> None:
+    """The regression guard for a live incident: wiring the resolver in gave the
+    nightly report a network dependency it does not need, and a test run reached
+    the real bucket. PROTECT_DAYS keeps a whole UTC day local, so when the day
+    has ANY local run the archive must not be touched."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    logs = tmp_path / "logs"
+    day = "2026-09-01"
+    make_run(logs, epoch_for(day))
+    make_run(logs, epoch_for("2026-09-02"))
+    source = claude_worker.data_source.DataSource(cfg, logs, wire(cfg, fake))
+
+    fake.requests.clear()
+    found = claude_worker.pnl_report.select_runs(logs, day, source)
+    assert [p.name for p in found] == [f"run-{epoch_for(day)}"]
+    assert fake.count() == 0, "a locally-present day must cost zero HTTP requests"
+
+
 def test_select_runs_keeps_local_runs_when_a_pull_fails(tmp_path: pathlib.Path) -> None:
     """A broken archive must degrade to today's behaviour, not to an empty day."""
     cfg = make_cfg(tmp_path)
@@ -127,16 +147,20 @@ def test_select_runs_keeps_local_runs_when_a_pull_fails(tmp_path: pathlib.Path) 
     logs = tmp_path / "logs"
     day = "2026-09-01"
     archived = make_run(logs, epoch_for(day, hour=3))
-    local = make_run(logs, epoch_for(day, hour=5))
+    make_run(logs, epoch_for(day, hour=5))
     make_run(logs, epoch_for("2026-09-02"))
     claude_worker.archive.Archiver(cfg, wire(cfg, fake)).push_pending(logs)
+    # Reclaim the WHOLE day, so the archive fallback is the only route to it.
     shutil.rmtree(archived)
+    shutil.rmtree(logs / f"run-{epoch_for(day, hour=5)}")
     # Break the archived copy after the index was written.
     manifest = json.loads(fake.objects[cfg.manifest_key(archived.name)])
     del fake.objects[manifest["files"][0]["key"]]
 
     source = claude_worker.data_source.DataSource(cfg, logs, wire(cfg, fake))
-    assert claude_worker.pnl_report.select_runs(logs, day, source) == [local]
+    # The broken run is skipped; the intact one still resolves.
+    resolved = claude_worker.pnl_report.select_runs(logs, day, source)
+    assert [p.name for p in resolved] == [f"run-{epoch_for(day, hour=5)}"]
 
 
 # --------------------------------------------------------------------------
@@ -251,6 +275,36 @@ def test_list_row_shape_is_what_the_agent_reads(tmp_path: pathlib.Path) -> None:
     # pool BEFORE deciding what to pull.
     assert row["windows_2h_complete"] == 0
     json.dumps(row)  # must be serialisable as one NDJSON line
+
+
+def test_archive_source_is_none_when_disabled(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The nightly lane writes the report the RG7 soak reads. It must never
+    fail to produce one because an optional subsystem is absent."""
+    disabled = claude_worker.archive_config.load(env={}, env_file=tmp_path / "absent.env")
+    monkeypatch.setattr(claude_worker.archive_config, "load", lambda *a, **k: disabled)
+    assert claude_worker.pnl_report._archive_source(tmp_path / "logs") is None
+
+
+def test_archive_source_swallows_a_broken_archive(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(*_a: object, **_k: object) -> typing.NoReturn:
+        raise RuntimeError("credential file is a directory, say")
+
+    monkeypatch.setattr(claude_worker.archive_config, "load", explode)
+    assert claude_worker.pnl_report._archive_source(tmp_path / "logs") is None
+
+
+def test_archive_source_builds_a_resolver_when_enabled(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(claude_worker.archive_config, "load", lambda *a, **k: cfg)
+    source = claude_worker.pnl_report._archive_source(tmp_path / "logs")
+    assert source is not None
+    assert source.store is not None
 
 
 def test_status_tell_is_house_style(tmp_path: pathlib.Path) -> None:
