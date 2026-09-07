@@ -5,7 +5,7 @@
 #   cargo install cargo-about
 #   cargo about generate about.hbs > THIRD-PARTY-NOTICES.md   # make license-deps
 #
-# See docs/license-audit-2026-08-27.md §G5.
+# See docs/arch/license-audit-2026-08-27.md §G5.
 # ---------------------------------------------------------------
 
 # The targets we actually ship: the M4 Mac and the Phase-7 Linux box.

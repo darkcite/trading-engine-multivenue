@@ -118,7 +118,7 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
   measured priors, rejection tables, walk-forward bars worth reusing):
   git-excluded, provenance UNCONFIRMED. Nothing from it may enter git
   history until ownership/relicensing is confirmed and recorded in
-  NOTICE — `docs/license-audit-2026-08-27.md` G8 names the tree and
+  NOTICE — `docs/arch/license-audit-2026-08-27.md` G8 names the tree and
   owns the rule.
 
 ## 5. Standing constraints a strategy must respect

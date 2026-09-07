@@ -16,7 +16,7 @@ Attribution for dependencies linked into a distributed *binary* is
 generated at release time into THIRD-PARTY-NOTICES.md via `make
 license-deps` (cargo-about). No compiled binary may be distributed
 without LICENSE, NOTICE and THIRD-PARTY-NOTICES.md alongside it.
-See docs/license-audit-2026-08-27.md §G5.
+See docs/arch/license-audit-2026-08-27.md §G5.
 
 --------------------------------------------------------------------------
 Runtime artifacts fetched by hash (Kronos forecast sidecar)
