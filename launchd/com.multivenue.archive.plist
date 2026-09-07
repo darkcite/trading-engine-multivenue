@@ -31,8 +31,20 @@
   </dict>
   <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/archive.log</string>
   <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/archive.log</string>
-  <key>ProcessType</key><string>Background</string>
-  <key>LowPriorityIO</key><true/>
+
+  <!-- ProcessType is deliberately NOT "Background".
+
+       launchd's Background type applies macOS's background QoS to the whole
+       job — including the network traffic class — which throttles sustained
+       transfers by ~13x. It did exactly that here: the first unattended cycle
+       moved 306 MB in 3185 s (0.096 MiB/s) and then spent its budget mid-run,
+       even though retention.conf said S3_NICE_NETWORK=0. The plist was
+       silently re-imposing what the script had been told to skip, and a cycle
+       that cannot keep up means retention can never delete, so the local
+       window grows without bound.
+
+       Network QoS belongs to ONE lever, S3_NICE_NETWORK in retention.conf.
+       Nice 19 stays: CPU politeness is free and does not touch the socket. -->
   <key>Nice</key><integer>19</integer>
 </dict>
 </plist>
