@@ -2216,7 +2216,8 @@ worker-side layers are the enforcement that is live.
 
 - **2026-09-07 07:04Z — RG7 HYSTERESIS FIX LANDED + LIVE (operator pick
   by AskUserQuestion: "Build the hysteresis fix (Recommended)"; the
-  bound stays 2; uncommitted — operator commits).** Engine
+  bound stays 2; COMMITTED `d5108e9` on the operator's "commit
+  everything", release relinked after the commit).** Engine
   (`core-regime`): `ProfileParams` gains `confirm_min` (0 = inherit; the
   old `_pad0` byte) + `trend_exit_bps_1e9` / `rv_exit_frac_1e9` /
   `stretch_exit_k_1e9` (trailing i64, 0 = the RG1 law),
