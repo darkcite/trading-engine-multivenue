@@ -720,6 +720,14 @@ DERIVED_TFS: tuple[tuple[str, str, int, int], ...] = (
     ("4h", "1h", 4, 4 * MS_1H),
 )
 
+#: How far back the HOURLY lane re-derives 5m/15m/4h. Comfortably wider
+#: than the 26 h capture window and the 48 h/90 d §9.6 gap-fill bounds,
+#: so every window the lane can still change is covered — while keeping
+#: the pass off the millions of base rows a research backfill may have
+#: parked in the store. An explicit unbounded pass (``since_ms=None``)
+#: is what materialises derived rows for freshly backfilled history.
+DERIVE_WINDOW_D: int = 14
+
 CAPTURE_WINDOW_H_ENV: str = "CLAUDE_WORKER_CANDLES_CAPTURE_WINDOW_H"
 CAPTURE_WINDOW_H_DEFAULT: int = 26  # daily-restart run + margin
 DRIFT_WINDOW_H_ENV: str = "CLAUDE_WORKER_CANDLES_DRIFT_WINDOW_H"
@@ -732,6 +740,7 @@ def derive_pass(
     conn: sqlite3.Connection,
     now_ms: int,
     report: collections.abc.Callable[[str], None],
+    since_ms: int | None = None,
 ) -> None:
     """§9.5: recompute 5m/15m/4h from the stored finer bases (rest +
     capture rows), store back ``source=derived``. Only COMPLETE,
@@ -739,15 +748,37 @@ def derive_pass(
     a window still missing base bars materializes once §9.6 fills
     them. Derived rows are a CACHE: they refresh freely when a base
     finalization changes them (immutability protects fetched rest
-    bars only). Bounded by construction: 1m bases are rolling 48 h
-    (+ PM capture), 1h bases rolling 90 d."""
+    bars only).
+
+    ``since_ms`` bounds the BASE rows read (default ``None`` = all, the
+    original behaviour). The docstring's old claim that this pass is
+    "bounded by construction: 1m bases are rolling 48 h" stopped being
+    true the moment a deep backfill landed: research backfills took the
+    1m base from ~50 k rows to **6.9 M**, which this pass would otherwise
+    `fetchall()` into ~2.5 GB of Python tuples on EVERY hourly cycle,
+    growing forever. The hourly lane passes a bound because it only
+    needs recent windows; a backfill that adds OLD bases must run an
+    unbounded pass explicitly, which is what the research driver's
+    derive phase does."""
     for tf_out, tf_base, k, ms_out in DERIVED_TFS:
-        rows = conn.execute(
-            "SELECT venue, descriptor, open_ts, o, h, l, c, v FROM candles"
-            " WHERE tf=? AND source IN ('rest','capture')"
-            " ORDER BY venue, descriptor, open_ts",
-            (tf_base,),
-        ).fetchall()
+        if since_ms is None:
+            rows = conn.execute(
+                "SELECT venue, descriptor, open_ts, o, h, l, c, v FROM candles"
+                " WHERE tf=? AND source IN ('rest','capture')"
+                " ORDER BY venue, descriptor, open_ts",
+                (tf_base,),
+            ).fetchall()
+        else:
+            # Align the bound down to a whole output window so the first
+            # window in range is never half-read (which would silently
+            # drop it as incomplete).
+            floor = (since_ms // ms_out) * ms_out
+            rows = conn.execute(
+                "SELECT venue, descriptor, open_ts, o, h, l, c, v FROM candles"
+                " WHERE tf=? AND source IN ('rest','capture') AND open_ts>=?"
+                " ORDER BY venue, descriptor, open_ts",
+                (tf_base, floor),
+            ).fetchall()
         made = 0
         refreshed = 0
         unchanged = 0
@@ -997,7 +1028,7 @@ def capture_and_derive(
     reported skip, never an error (best-effort law)."""
     if not replay_root.is_dir():
         report(f"candles: capture lane skipped — no replay root {replay_root}")
-        derive_pass(conn, now_ms, report)
+        derive_pass(conn, now_ms, report, now_ms - DERIVE_WINDOW_D * MS_1D)
         return
     pm_map, bn_map = sym_maps(markets)
     cap_h = int(env.get(CAPTURE_WINDOW_H_ENV, "") or CAPTURE_WINDOW_H_DEFAULT)
@@ -1020,7 +1051,7 @@ def capture_and_derive(
             replay_root, bn_map, ("bn",), now_ms - drift_h * MS_1H, now_ms
         )
         drift_check(conn, claude_worker.frames.VENUE_BINANCE, bn_bars, warn_bps, report)
-    derive_pass(conn, now_ms, report)
+    derive_pass(conn, now_ms, report, now_ms - DERIVE_WINDOW_D * MS_1D)
 
 
 # ---- one cycle -----------------------------------------------------------
