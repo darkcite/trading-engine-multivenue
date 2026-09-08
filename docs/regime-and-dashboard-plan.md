@@ -2257,3 +2257,84 @@ worker-side layers are the enforcement that is live.
   wait; the judge says so until then). RG7 stays OPEN; close = PASS on
   those windows + the operator's ruling. Docs: §3.5 "As landed" table,
   §4.6 keys, §7.1 reset law, `docs/migration.md` entry.
+
+- **2026-09-08 04:27Z — RG7 SOAK VERDICT: PASS ⇒ RG7 CLOSED by operator
+  ruling.** `python -m claude_worker.regime soak --since
+  2026-09-07T07:04:07Z` (from `claude-worker/`, `.env` sourced, release
+  dir on PATH) exits **0** — the documented PASS tell — with
+  `PASS (windows 8, counted 8, failed 0, need 8; flips ≤ 2 per profile x
+  dim per window; history 268 samples / 24 h)`. Verdict record:
+  `~/multivenue/worker/regime/soak-20260908T042655Z.json` (worker state,
+  never git). The eight counted windows, all `src=engine`, all
+  `hard_exits=0`:
+
+  | window start (UTC) | run | samples | worst flip | pnl_regime |
+  |---|---|---|---|---|
+  | 09-07 08:31Z | `run-1788769873673140000` | 22 | fast/vol=1 | yes |
+  | 09-07 10:31Z | (same run, +2 h cut) | 22 | fast/trend=0 | yes |
+  | 09-07 12:31Z | (same run, +4 h cut) | 21 | fast/trend=1 | yes |
+  | 09-07 16:06Z | `run-1788797197365908000` | 22 | fast/trend=2 | yes |
+  | 09-07 18:06Z | (same run, +2 h cut) | 23 | fast/shape=2 | yes |
+  | 09-07 21:15Z | `run-1788815751498252000` | 22 | fast/trend=1 | yes |
+  | 09-08 00:00Z | `run-1788825657955530000` | 24 | fast/trend=2 | no |
+  | 09-08 02:00Z | (same run, +2 h cut) | 23 | fast/trend=2 | no |
+
+  **The hysteresis fix is what closed it.** Against the 2026-09-07
+  06:38Z FAIL (7 of 9 windows failed; FAST `shape` 3–7 and `trend` 3–6
+  per window), every post-fix window sits at 0–2 against the bound of 2,
+  and the SLOW profile is flat at zero flips in all eight — the offline
+  prediction (bands + confirm 10 → 1/9 failures, the one genuine
+  vol=high night) held live, and the wild night did not recur inside the
+  soak. Three windows land exactly on the bound (`=2`), so the margin is
+  thin by construction: the bound is the 24/day rate restated, and a
+  fast profile confirmed over 10 samples cannot flicker below it without
+  also going blind to real motion. No parameter is left to tighten
+  without re-opening D-level questions; the operator's ruling takes it
+  as PASS at the bound, not with headroom.
+
+  **Finding — §7.1's per-regime-P&L condition is REPORTED, not
+  ENFORCED.** `judge_window` computes `pnl_ok` via
+  `pnl_regime_present(reports_dir, day)` and carries it into the record
+  and the per-window line, but the verdict branch is `short` → `ungated`
+  → flips-bound → `PASS`; `pnl_ok` never appears in it. So §7.1's "the
+  nightly report … now required over the pooled windows" overstates the
+  judge as landed. It did not change this verdict: the six 09-07 windows
+  carry `pnl_regime=yes` on evidence, and the two 09-08 windows read
+  `no` only because the 09-08 nightly report cannot exist until the
+  00:20Z slot on 09-09 (day mode covers the closed prior day) — pending
+  by construction, not absent. Either fold `pnl_ok` into the branch and
+  accept that same-day windows can never count, or amend §7.1 to say
+  "reported per window"; the doc and the code should not disagree. Left
+  as the operator's call; nothing changed here.
+
+  **Finding — the evidence is perishable; the JSON is the record.**
+  `soak_windows_from_runs` enumerates live run dirs under
+  `MULTIVENUE_LOG_DIR`, and retention is `PROTECT_DAYS=1` with
+  `ARCHIVE_MODE="s3"` (sweep at 04:30 local = **21:30Z**, host is
+  UTC+7). At the next sweep `run-1788769873673140000` passes 24 h and is
+  deleted after `verify` — it alone carries three of the eight counted
+  windows, so a re-run after 21:30Z 09-08 returns `INSUFFICIENT
+  (counted 5)`. That is expected behaviour of the ≤ 2 h law plus a 24 h
+  local tier, not a regression: the verdict JSON above and this entry
+  are the durable record, and any future re-judge needs a fresh N ≥ 8
+  from runs that still exist. Do not read a later `INSUFFICIENT` as the
+  soak having been lost.
+
+  **Nothing changed live and no code changed for this close** — the
+  engine is still pid 35409 on `d5108e9c7fb9`, mask 48 (`ai`), regime
+  artifact `e80d77ef…`, `vm_rows_active 2` (`fde6f733…`), run
+  `run-1788825657955530000` from the 00:00Z T2 restart. The stay-greens
+  of `d5108e9` therefore stand unchanged and were not re-run (nextest
+  1602, alloc 42/42 0 B/op, worker pytest 901/3 skipped, `make lint`,
+  `make license-check` 281). The soak lane is read-only: three judge
+  runs, no worker verb overlap (`pgrep` guard clean each time).
+
+  **RG7 exit tell met** (§7 table: "`soak` verdict PASS on N ≥ 8
+  windows + operator ruling"), so RG0–RG8 + the funding seed are now all
+  landed and RG7 is CLOSED. What the RG lane still leaves open, none of
+  it gating: RG3b (`FeatId::RegimeRel`) deliberately not built;
+  `[labels] require = 1` NOT flipped live (the operator's lever — it
+  passes under mask 48, and refuses an `ai+icdp` boot until icdp is
+  labelled, §7.2); RG4's "≥ 2 members committed live" tell (the carry
+  member is evidenced but structurally unprofitable inside 2 h —
+  `min_hold_s` 96 h); and the §7.1-vs-judge divergence above.
