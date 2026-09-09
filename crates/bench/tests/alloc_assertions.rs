@@ -4278,3 +4278,94 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "/state path bytes should be zero: saw {bytes}");
 }
+
+/// VRP V1 gate: the option registry's HOT lookups.
+///
+/// `get` / `is_option` run inside `on_opt_summary`, which fires on every
+/// option ticker push (measured: ~480 k Deribit records per 2 h window
+/// across a 64-instrument chain), so they are on the hot path by volume
+/// even though each call is trivial. Population is boot-only and stays
+/// OUTSIDE the guard, exactly as the icdp gate keeps configure+prewarm
+/// outside its own.
+///
+/// The measurement deliberately includes MISSES as well as hits — the
+/// perp hedge leg, the static instruments, and another venue's
+/// identically-ordinalled symbols all reach `is_option` in the member's
+/// real callback, and the miss path must not allocate either.
+#[test]
+fn opt_registry_lookups_are_zero_alloc() {
+    use opt_registry::{OptInstrument, OptRegistry, RIGHT_CALL, RIGHT_PUT};
+
+    // The live shape (VRP V0(d), 2026-09-09): a Deribit block of 64
+    // options at ordinals 513..=576 over a perp at ordinal 1.
+    const OPT_BASE: u32 = 512;
+    const N: u32 = 64;
+    let perp = core_types::make_symbol_id(VenueId::Deribit, 1);
+
+    // Boot: may allocate (it does not, but that is not what is measured).
+    let mut reg = Box::new(OptRegistry::new());
+    let mut syms = Vec::with_capacity(N as usize);
+    for k in 0..N {
+        let sym = core_types::make_symbol_id(VenueId::Deribit, OPT_BASE + 1 + k);
+        syms.push(sym);
+        reg.insert(OptInstrument::new(
+            sym,
+            perp,
+            VenueId::Deribit as u8,
+            1_789_027_200_000_000_000,
+            (78_000 + 500 * (k as i64 / 2)) * 1_000_000,
+            if k % 2 == 0 { RIGHT_CALL } else { RIGHT_PUT },
+            1_000_000_000,
+        ))
+        .expect("boot insert");
+    }
+    assert_eq!(reg.len(), N as usize);
+
+    // Misses the member really sees: the hedge leg, a static, an
+    // out-of-block ordinal, and another venue at the same ordinal.
+    let misses = [
+        perp,
+        core_types::make_symbol_id(VenueId::Deribit, 9),
+        core_types::make_symbol_id(VenueId::Deribit, OPT_BASE + 1 + N),
+        core_types::make_symbol_id(VenueId::Okx, OPT_BASE + 1),
+    ];
+
+    let g = AllocGuard::new();
+    let mut hits: u64 = 0;
+    let mut strike_acc: i64 = 0;
+    let mut miss_acc: u64 = 0;
+    for _ in 0..1_000u32 {
+        let mut i = 0usize;
+        while i < syms.len() {
+            let sym = syms[i];
+            if let Some(row) = reg.get(sym) {
+                strike_acc = strike_acc.wrapping_add(row.strike_1e6);
+                hits += 1;
+            }
+            if reg.is_option(sym) {
+                hits += 1;
+            }
+            i += 1;
+        }
+        let mut j = 0usize;
+        while j < misses.len() {
+            if reg.get(misses[j]).is_none() {
+                miss_acc += 1;
+            }
+            if !reg.is_option(misses[j]) {
+                miss_acc += 1;
+            }
+            j += 1;
+        }
+    }
+    std::hint::black_box((hits, strike_acc, miss_acc));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(hits, 2 * 1_000 * N as u64);
+    assert_eq!(miss_acc, 2 * 1_000 * misses.len() as u64);
+    assert_eq!(
+        allocs, 0,
+        "opt-registry lookups allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "opt-registry lookup bytes should be zero: saw {bytes}");
+}

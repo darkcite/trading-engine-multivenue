@@ -28,6 +28,8 @@ members = [
     "crates/ingress-rpc",
     # shared boot-only options-chain selection law (M2 close extraction)
     "crates/options-select",
+    # VRP V1: option sym -> (expiry, strike, right, contract size) table
+    "crates/opt-registry",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -154,6 +156,7 @@ ingress-okx        = { path = "crates/ingress-okx" }
 ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }
 options-select     = { path = "crates/options-select" }
+opt-registry       = { path = "crates/opt-registry" }
 
 book-builder          = { path = "crates/book-builder" }
 research-artifacts    = { path = "crates/research-artifacts" }
