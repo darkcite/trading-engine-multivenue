@@ -30,6 +30,10 @@
 //! | OKX           | `BTC-USD-260910-79000-C`          | 5 dash-fields, not 4       |
 //! | Binance eapi  | `BTC-260910-79000-C`              | 4 fields, but `260910` has |
 //! |               |                                   | no 3-letter month          |
+//! | Deribit LINEAR| `BTC_USDC-10SEP26-79000-C`        | `_` in the currency — a    |
+//! |               |                                   | USDC-quoted chain, not the |
+//! |               |                                   | inverse one this lane      |
+//! |               |                                   | prices (see `is_plain_ccy`)|
 //!
 //! The month lookup is what separates Deribit from Binance-eapi: both
 //! have four fields, and only Deribit's date field carries `JAN`..`DEC`.
@@ -50,8 +54,6 @@ const NS_PER_S: u64 = 1_000_000_000;
 const S_PER_DAY: i64 = 86_400;
 /// Strike is carried ×1e6, matching `OptInstrument::strike_1e6`.
 const STRIKE_SCALE: i64 = 1_000_000;
-/// Guard: reject a strike whose ×1e6 value would not fit an `i64`.
-const STRIKE_INT_MAX: i64 = i64::MAX / STRIKE_SCALE;
 
 /// One parsed Deribit option name. The currency is a BORROWED span into
 /// the caller's bytes — zero-copy, and the caller compares it against
@@ -97,19 +99,18 @@ pub fn parse_deribit_descriptor(desc: &[u8]) -> Option<ParsedOptionName<'_>> {
 
 /// Parse a bare Deribit option instrument name.
 ///
-/// Accepts exactly `<CCY>-<D|DD><MMM><YY>-<STRIKE>-<C|P>`. `STRIKE` is a
-/// positive decimal integer with an optional fractional part of at most
-/// six digits (BTC and ETH strikes are integers; the fraction is
-/// accepted so a future non-integer strike is not silently truncated).
-/// Deribit's `d`-for-decimal-point spelling is deliberately NOT accepted
-/// — it would have to be guessed, and this parser fails closed.
+/// Accepts exactly `<CCY>-<D|DD><MMM><YY>-<STRIKE>-<C|P>`, where `CCY`
+/// is uppercase ASCII alphanumerics (which is what refuses the venue's
+/// USDC-LINEAR chains — see [`is_plain_ccy`]) and `STRIKE` is a positive
+/// whole decimal (see [`parse_strike_1e6`] for why no fractional
+/// spelling is accepted).
 #[must_use]
 pub fn parse_deribit_option_name(name: &[u8]) -> Option<ParsedOptionName<'_>> {
     // Exactly four dash-separated fields. Splitting by index keeps this
     // allocation-free and lets the field count itself be a rejection.
     let (f0, f1, f2, f3) = split4(name)?;
 
-    if f0.is_empty() {
+    if !is_plain_ccy(f0) {
         return None;
     }
     let right = match f3 {
@@ -292,56 +293,83 @@ const fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 // strike
 // ---------------------------------------------------------------
 
-/// Positive decimal, optional `.` fraction of ≤ 6 digits, → ×1e6.
+/// Positive whole decimal → ×1e6.
+///
+/// **Digits only, deliberately.** A Deribit `instrument_name` can never
+/// contain a `.`: the venue's own discovery refuses dotted names
+/// (`ingress-deribit/src/discovery.rs:155`, enforced as
+/// `SymbolTableErr::HasDot` and pinned by the `BTC-PERP.X` test at
+/// `:845`), so a dotted strike is not a Deribit name and accepting one
+/// would be accepting a shape the venue cannot emit.
+///
+/// Fractional strikes themselves DO exist on this venue (the in-tree
+/// option fixture at `discovery.rs:1032` carries `"strike":5e-1`), and
+/// when a chain that needs them is configured the venue spells the point
+/// as `d` — visible in the OKX sibling's own fixture,
+/// `XRP-USD-260327-0d5-C` (`ingress-okx/src/discovery.rs:842`). That
+/// spelling is NOT accepted here: this lane is Deribit BTC/ETH inverse
+/// options with whole-USD strikes (ruling O‑D1), and guessing a
+/// separator we have not seen Deribit emit is exactly the kind of guess
+/// this parser exists to refuse. A future linear/altcoin phase adds it
+/// explicitly, with the matching contract size.
 #[inline]
 fn parse_strike_1e6(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    let mut int_part: i64 = 0;
+    let mut v: i64 = 0;
     let mut i = 0usize;
-    while i < s.len() && s[i] != b'.' {
+    while i < s.len() {
         let c = s[i];
         if !c.is_ascii_digit() {
             return None;
         }
-        if int_part > STRIKE_INT_MAX / 10 {
-            return None; // would overflow once scaled
-        }
-        int_part = int_part * 10 + (c - b'0') as i64;
+        // Checked at every step: the field is caller-supplied bytes, and
+        // an unchecked multiply here panics in debug and wraps to a
+        // negative in release.
+        v = v.checked_mul(10)?.checked_add((c - b'0') as i64)?;
         i += 1;
     }
-    if i == 0 {
-        return None; // leading '.'
-    }
-    if int_part > STRIKE_INT_MAX {
-        return None;
-    }
-    let mut frac: i64 = 0;
-    let mut scale: i64 = STRIKE_SCALE;
-    if i < s.len() {
-        i += 1; // skip '.'
-        if i == s.len() {
-            return None; // trailing '.'
-        }
-        let mut digits = 0usize;
-        while i < s.len() {
-            let c = s[i];
-            if !c.is_ascii_digit() {
-                return None;
-            }
-            if digits == 6 {
-                return None; // more precision than the ×1e6 field holds
-            }
-            frac = frac * 10 + (c - b'0') as i64;
-            scale /= 10;
-            digits += 1;
-            i += 1;
-        }
-    }
-    let v = int_part * STRIKE_SCALE + frac * scale;
+    let v = v.checked_mul(STRIKE_SCALE)?;
     if v <= 0 {
-        return None; // a zero or absent strike is not an option
+        return None; // a zero strike is not an option
     }
     Some(v)
+}
+
+/// A currency field the venue can actually emit: non-empty, uppercase
+/// ASCII alphanumerics only.
+///
+/// **This is what refuses Deribit's USDC-LINEAR option chains**, whose
+/// names carry an underscore — `XRP_USDC-27MAR26-5000-C` is an in-tree
+/// Deribit option row (`ingress-deribit/src/discovery.rs:1032`), and the
+/// live universe already lists `BTC_USDC-PERPETUAL` and friends. Those
+/// instruments are linear and USDC-quoted, so they do NOT share the
+/// inverse coin-denominated economics or the 1.0-coin contract size that
+/// [`crate::OptInstrument::from_descriptor`]'s callers pass. Nothing
+/// downstream could tell them apart from the name alone, and the
+/// selection law (`options-select`) filters on `is_option`/`live`/expiry
+/// with no settlement test — so a USDC chain would interleave into an
+/// ATM selection invisibly and be priced with the wrong multiplier. This
+/// parser fails closed instead. (No such instrument reaches the live
+/// ladder today: `options_underlyings = ["BTC", "ETH"]`, and the
+/// measured manifests hold zero of them.)
+///
+/// It also rejects an embedded NUL, non-ASCII bytes, a lowercase field,
+/// and an un-stripped `deribit:` prefix — none of which any caller
+/// should be handed as a currency.
+#[inline]
+fn is_plain_ccy(f: &[u8]) -> bool {
+    if f.is_empty() || f.len() > 16 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < f.len() {
+        let c = f[i];
+        if !(c.is_ascii_uppercase() || c.is_ascii_digit()) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }

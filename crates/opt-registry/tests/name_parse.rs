@@ -189,15 +189,116 @@ fn malformed_names_are_refused() {
     }
 }
 
+/// Deribit's USDC-LINEAR option chains must NOT parse as inverse ones.
+///
+/// `XRP_USDC-27MAR26-5000-C` is an in-tree Deribit option row
+/// (`ingress-deribit/src/discovery.rs:1032`) and the live universe lists
+/// `BTC_USDC-PERPETUAL` and friends, so these names are real. They are
+/// linear and USDC-quoted: they do not share the inverse coin
+/// economics or the 1.0-coin contract size a caller passes to
+/// `from_descriptor`, and nothing downstream could tell them apart from
+/// the name. Fail closed.
 #[test]
-fn fractional_strikes_scale_exactly() {
-    let p = parse_deribit_option_name(b"XRP-10SEP26-2.5-C").expect("fractional strike");
-    assert_eq!(p.strike_1e6, 2_500_000);
-    let p = parse_deribit_option_name(b"XRP-10SEP26-0.000001-P").expect("one micro-unit");
-    assert_eq!(p.strike_1e6, 1);
-    // Six digits is the limit and must still be exact.
-    let p = parse_deribit_option_name(b"XRP-10SEP26-1.234567-C").expect("six digits");
-    assert_eq!(p.strike_1e6, 1_234_567);
+fn usdc_linear_option_names_are_refused() {
+    let linear: &[&[u8]] = &[
+        b"BTC_USDC-10SEP26-79000-C",
+        b"ETH_USDC-10SEP26-2560-P",
+        b"XRP_USDC-27MAR26-5000-C",
+        b"deribit:BTC_USDC-10SEP26-79000-C",
+    ];
+    for b in linear {
+        assert!(
+            parse_deribit_descriptor(b).is_none(),
+            "linear chain {:?} must not parse as an inverse option",
+            core::str::from_utf8(b)
+        );
+    }
+    // The inverse twin of the first one still parses, so the rejection
+    // is the underscore and not the date or the strike.
+    assert!(parse_deribit_option_name(b"BTC-10SEP26-79000-C").is_some());
+}
+
+/// The currency field is validated, not merely non-empty: an
+/// un-stripped prefix, an embedded NUL, non-ASCII and lowercase are all
+/// refused rather than handed on as a `ccy` a later consumer must cope
+/// with.
+#[test]
+fn currency_field_is_validated() {
+    let bad: &[&[u8]] = &[
+        b"deribit:BTC-10SEP26-79000-C", // prefix left on by a bare-name caller
+        b"btc-10SEP26-79000-C",         // lowercase
+        b"B\0C-10SEP26-79000-C",        // embedded NUL
+        b"BT\xc3\x87-10SEP26-79000-C",  // non-ASCII
+        b"BTC.X-10SEP26-79000-C",       // dot: not a Deribit instrument name
+        b"BTC USD-10SEP26-79000-C",     // space
+    ];
+    for b in bad {
+        assert!(
+            parse_deribit_option_name(b).is_none(),
+            "currency of {:?} must be refused",
+            core::str::from_utf8(b)
+        );
+    }
+    // Digits in a currency are legitimate and must still pass.
+    assert!(parse_deribit_option_name(b"1000RATS-10SEP26-5-C").is_some());
+}
+
+/// Fractional strikes are refused, and the reason is not arbitrary: a
+/// Deribit `instrument_name` cannot contain a `.` at all — discovery
+/// rejects dotted names (`discovery.rs:155`, `BTC-PERP.X` test at
+/// `:845`) — so a dotted strike is a shape the venue cannot emit. The
+/// venue's real spelling for a fractional strike is `d`
+/// (`XRP-USD-260327-0d5-C`, `ingress-okx/src/discovery.rs:842`), which
+/// is equally refused rather than guessed at.
+#[test]
+fn fractional_strike_spellings_are_refused() {
+    let frac: &[&[u8]] = &[
+        b"XRP-10SEP26-2.5-C",
+        b"XRP-10SEP26-0.000001-P",
+        b"XRP-10SEP26-1.234567-C",
+        b"XRP-10SEP26-0d5-C",
+        b"XRP-10SEP26-2d5-P",
+    ];
+    for b in frac {
+        assert!(
+            parse_deribit_option_name(b).is_none(),
+            "{:?} must be refused, not guessed",
+            core::str::from_utf8(b)
+        );
+    }
+}
+
+/// Regression: an oversized strike must return `None`, never panic.
+///
+/// Found by an adversarial review of this parser. The earlier code
+/// bounded the integer part alone and then added a scaled fraction, so
+/// `9223372036854.8` — whose integer part is exactly `i64::MAX / 1e6`,
+/// leaving 775_807 of headroom against a fraction reaching 999_999 —
+/// overflowed the ADD. That panics in a debug build, which is precisely
+/// where this crate's own proptests run, and it violated the module's
+/// stated "cannot panic on arbitrary bytes" contract. Neither proptest
+/// could reach it: random bytes never land a 13-digit boundary literal,
+/// and the name-shaped generator capped the strike field at 12
+/// characters while the shortest trigger is 15.
+#[test]
+fn oversized_strikes_return_none_and_never_panic() {
+    let huge: &[&[u8]] = &[
+        b"BTC-10SEP26-9223372036854.8-C",  // the exact historical trigger
+        b"BTC-10SEP26-9223372036854.9-C",
+        b"BTC-10SEP26-9223372036855-C",    // one past the scaled ceiling
+        b"BTC-10SEP26-99999999999999999999-C",
+        b"BTC-10SEP26-0000000000009223372036854.9-C", // leading zeros are free
+    ];
+    for b in huge {
+        assert!(
+            parse_deribit_option_name(b).is_none(),
+            "{:?} must return None",
+            core::str::from_utf8(b)
+        );
+    }
+    // The largest strike that DOES fit is still accepted exactly.
+    let ok = parse_deribit_option_name(b"BTC-10SEP26-9223372036854-C").expect("at the ceiling");
+    assert_eq!(ok.strike_1e6, 9_223_372_036_854_000_000);
 }
 
 proptest::proptest! {
@@ -215,7 +316,7 @@ proptest::proptest! {
     /// actually reaches the numeric branches rather than bouncing off
     /// the field-count test.
     #[test]
-    fn never_panics_on_name_shaped_input(s in "[A-Za-z0-9.]{0,6}-[A-Za-z0-9]{0,8}-[0-9.]{0,12}-[A-Za-z]{0,2}") {
+    fn never_panics_on_name_shaped_input(s in "[A-Za-z0-9._]{0,6}-[A-Za-z0-9]{0,8}-[0-9.]{0,24}-[A-Za-z]{0,2}") {
         let _ = parse_deribit_option_name(s.as_bytes());
     }
 

@@ -375,9 +375,14 @@ proptest::proptest! {
         n in 1usize..=OPT_REGISTRY_CAP,
         gap in 0u32..3,
     ) {
-        // Keep the span inside the window whatever the gap.
+        // CLAMP the chain length to what the window holds rather than
+        // rejecting the case. `prop_assume!` here threw away so many
+        // inputs that proptest aborted on its global-reject cap once the
+        // case count was raised (found at PROPTEST_CASES=200000); a
+        // generator that constructs valid inputs tests strictly more.
         let step = gap + 1;
-        proptest::prop_assume!((n as u32 - 1) * step < OPT_REGISTRY_SLOTS as u32);
+        let max_n = (((OPT_REGISTRY_SLOTS as u32 - 1) / step + 1) as usize).min(OPT_REGISTRY_CAP);
+        let n = n.min(max_n);
         let mut r = OptRegistry::new();
         let mut syms = Vec::with_capacity(n);
         for k in 0..n as u32 {
