@@ -7,8 +7,18 @@
 #
 # UTC SLOTS (fire once per UTC day, on the first minute-tick at/after
 # the slot time):
-#   0000  day boundary — SIGTERM drain; wrapper reboot refreshes the
-#         PM universe; retention pass (0000 only).
+#   0010  day boundary — SIGTERM drain; wrapper reboot refreshes the
+#         PM universe; retention pass (0010 only).
+#         0010, NOT 0000 (operator ruling 2026-09-10): the VRP
+#         member's decision instant is E−τ = 00:00Z for the 08:00Z
+#         Deribit daily, so a drain on that same second costs the
+#         entry a 10–40 s dark window and re-decides a HOLD
+#         (`entry_done` is derived from the restored position, so a
+#         hold leaves nothing to restore). The campaign itself
+#         SURVIVES the collision — selection is persisted and the
+#         contract re-resolved by (expiry, strike, right) — but
+#         nothing in this slot is time-critical to the second, so
+#         the slot moves rather than the measured edge.
 #   0830  Defect A revival: options settle 08:00Z on Deribit+OKX and
 #         the frozen boot-time chain kills both sessions; a restart
 #         re-runs discovery onto a live chain. 08:30 — not 08:05 —
@@ -32,7 +42,7 @@
 # today WITHOUT firing — deploying this script mid-day never
 # triggers a surprise drain. Force a slot NOW (also the sanctioned
 # manual mid-day revive) with:
-#   echo 19700101 > ~/multivenue/state/last-restart-utc-0000
+#   echo 19700101 > ~/multivenue/state/last-restart-utc-0010
 # (fires within 60 s). The legacy single stamp `last-restart-utc-day`
 # is ignored and left in place.
 #
@@ -71,11 +81,11 @@ slot_mark() {
 drain=0
 retention=0
 fired=""
-if slot_ready 0000; then
-  slot_mark 0000
+if slot_ready 0010; then
+  slot_mark 0010
   drain=1
   retention=1
-  fired="$fired 0000"
+  fired="$fired 0010"
 fi
 if slot_ready 0830; then
   slot_mark 0830
