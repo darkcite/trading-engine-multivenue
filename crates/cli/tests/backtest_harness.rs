@@ -131,6 +131,7 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         // is bit-identical to a blind replay).
         regime: RegimeMode::Off,
         regime_seed: None,
+        vrp_seed: None,
         funding_seed: None,
     }
 }
@@ -1061,6 +1062,7 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         emit_detail: None,
         regime: RegimeMode::Off,
         regime_seed: None,
+        vrp_seed: None,
         funding_seed: None,
     }
 }

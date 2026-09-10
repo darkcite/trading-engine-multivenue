@@ -4394,7 +4394,7 @@ fn vol_engine_minute_and_bounds_are_zero_alloc() {
         s = s
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        px = (px + ((s >> 40) % 40_000_000) - 20_000_000).max(1_000_000_000);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
         e.on_minute_close(px);
         i += 1;
     }
@@ -4414,7 +4414,7 @@ fn vol_engine_minute_and_bounds_are_zero_alloc() {
         s = s
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        px = (px + ((s >> 40) % 40_000_000) - 20_000_000).max(1_000_000_000);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
         e.on_minute_close(px);
         // The decision path: bounds, then the two i64 compares the
         // member actually makes against a quoted IV.

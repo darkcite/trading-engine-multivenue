@@ -322,6 +322,7 @@ dependencies = [
  "core-ring",
  "core-time",
  "core-types",
+ "core-vol",
  "engine",
  "engine-snapshot",
  "ingress-ai",

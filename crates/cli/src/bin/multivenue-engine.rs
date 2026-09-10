@@ -147,6 +147,14 @@ struct AuditPnlArgs {
     /// the first run directory's own `regime-seed.tsv`, else warm live).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// VRP V5: the worker-written boot seed
+    /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
+    /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
+    /// (cold boot; the member holds until it has 60 pairs); an explicit
+    /// path that does not exist, or any file that does not parse
+    /// exactly, refuses the boot.
+    #[arg(long)]
+    vrp_seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -214,6 +222,14 @@ struct BacktestArgs {
     /// the first run directory's own `regime-seed.tsv`, else warm live).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// VRP V5: the worker-written boot seed
+    /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
+    /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
+    /// (cold boot; the member holds until it has 60 pairs); an explicit
+    /// path that does not exist, or any file that does not parse
+    /// exactly, refuses the boot.
+    #[arg(long)]
+    vrp_seed: Option<PathBuf>,
     /// `funding-seed.tsv` replayed through the vm's live `FundingSeed`
     /// path before the first record (default: the first run directory's
     /// own `funding-seed.tsv` when it exists, else none — the funding
@@ -379,6 +395,14 @@ struct RunArgs {
     /// absent = warm live (boot tell `regime: seed absent`).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// VRP V5: the worker-written boot seed
+    /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
+    /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
+    /// (cold boot; the member holds until it has 60 pairs); an explicit
+    /// path that does not exist, or any file that does not parse
+    /// exactly, refuses the boot.
+    #[arg(long)]
+    vrp_seed: Option<PathBuf>,
     /// Cadence in seconds for periodic HdrHistogram dumps. `0`
     /// disables dumping (default). When >0, the engine writes the
     /// three latency histograms (ingest→strategy, strategy→submit,
@@ -466,6 +490,7 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         option_spread_frac_1e6: args.option_spread_frac,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
+        vrp_seed: args.vrp_seed,
     };
     let mut report = |line: &str| eprintln!("{line}");
     match cli::audit_pnl::run(&cfg, &mut report) {
@@ -519,6 +544,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         emit_detail: args.emit_detail,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
+        vrp_seed: args.vrp_seed,
         funding_seed: args.funding_seed,
     };
     match cli::backtest::run(&cfg) {
@@ -2078,6 +2104,20 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // VRP V5: the member's boot seed. An ABSENT default file is
+            // legal — a cold boot must be, the engine restarts about
+            // three times a day — and the member simply holds. A file
+            // that is present and unreadable refuses the boot: a seed
+            // the engine cannot read exactly is a fit nobody measured.
+            let vrp_seed = match cli::vrp_boot::load_vrp_seed(args.vrp_seed.as_deref()) {
+                Ok(v) => v,
+                Err(reason) => {
+                    error!(reason, "vrp: seed refused — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            info!("{}", cli::vrp_boot::render_seed_tell(vrp_seed.as_ref()));
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {

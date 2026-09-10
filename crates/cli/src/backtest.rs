@@ -198,6 +198,9 @@ pub struct BacktestConfig {
     /// RG3: `--regime-seed <path>` (default = the first run's own
     /// `regime-seed.tsv`, else warm live).
     pub regime_seed: Option<PathBuf>,
+    /// VRP V5: `--vrp-seed <path>` (default = the run's own
+    /// `vrp-seed.tsv`, else the member holds).
+    pub vrp_seed: Option<PathBuf>,
     /// The funding seed (`backtest::funding`): `--funding-seed <path>`
     /// (default = the first run's own `funding-seed.tsv`, else none —
     /// the funding features warm from the window's own prints as

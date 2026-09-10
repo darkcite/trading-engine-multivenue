@@ -49,6 +49,7 @@ import typing
 import claude_worker.iv_digest
 import claude_worker.regime
 import claude_worker.seeds
+import claude_worker.vrp_seed
 
 HEADER_SIZE: int = 64
 SEED_FILE: str = "regime-seed.tsv"
@@ -221,6 +222,7 @@ def cut_run(
     to_s: float,
     report: typing.Callable[[str], None] | None = None,
     seed: tuple[pathlib.Path, pathlib.Path] | None = None,
+    vrp: pathlib.Path | None = None,
 ) -> pathlib.Path:
     """Materialise the window ``[from_s, to_s)`` of ``run_dir`` under
     ``dst_root`` as ``run-<epoch + from_s>``; returns the new run dir.
@@ -232,7 +234,15 @@ def cut_run(
     so a ≤ 2 h window can warm the detector's 4 h profile. Either file
     absent ⇒ no seed (the harness warms live and says so). The same
     ``candles.db`` (its funding table) writes ``funding-seed.tsv`` for
-    the window's manifest — regime.toml is not needed for that one."""
+    the window's manifest — regime.toml is not needed for that one.
+
+    VRP V5: ``vrp`` = a ``vrp.toml`` path also writes the window's own
+    ``vrp-seed.tsv`` from that same ``candles.db`` — the 60+ settled
+    ``(x, y)`` pairs the VRP member needs before it will produce a
+    bound. Seeded AS OF the window's first instant, never the wall
+    clock: a window cut from last month must replay only what was known
+    then, or the harness fits on the future. Absent file ⇒ no seed, and
+    the member holds."""
     if to_s <= from_s or to_s - from_s > WINDOW_MAX_S:
         raise WindowError(f"window {from_s}..{to_s} s violates the 2 h law")
     span = run_span(run_dir)
@@ -272,6 +282,16 @@ def cut_run(
             report(
                 f"window-root: {run_dir.name} {claude_worker.seeds.FUNDING_SEED_FILE}"
                 f" {n_rows} prints for {n_desc} descriptors"
+            )
+    if vrp is not None and vrp.is_file() and seed is not None and seed[1].is_file():
+        n_pairs, vrp_stats = claude_worker.vrp_seed.seed_for_window(
+            out_dir, seed[1], vrp, new_epoch // 1_000_000
+        )
+        if report is not None:
+            report(
+                f"window-root: {run_dir.name} {claude_worker.vrp_seed.SEED_FILE}"
+                f" {n_pairs} pair(s) (considered={vrp_stats.expiries_considered}"
+                f" unsettled={vrp_stats.skipped_unsettled})"
             )
     return out_dir
 

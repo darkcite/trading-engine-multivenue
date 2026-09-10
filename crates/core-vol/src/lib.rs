@@ -557,8 +557,15 @@ mod tests {
         while i < minutes {
             // A 64-bit LCG's high bits, used as an integer step in
             // ×1e6 dollars. Test-only; nothing here is a model.
-            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            let step = ((s >> 40) % 40_000_000) - 20_000_000;
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            // Unsigned shift before the modulus: `>>` on an i64 keeps the
+            // sign and `%` keeps the sign of the dividend, so the signed
+            // spelling of this line is a ONE-sided walk wearing a
+            // two-sided expression — every step negative, the tape
+            // sliding into the price clamp and the returns going flat.
+            let step = ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000;
             px += step;
             if px < 1_000_000_000 {
                 px = 1_000_000_000;
@@ -626,7 +633,7 @@ mod tests {
             s = s
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let step = ((s >> 40) % 40_000_000) - 20_000_000;
+            let step = ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000;
             let next = (px + step).max(1_000_000_000);
             rets.push(core_regime::math::ret_bps_1e9(px, next));
             e.on_minute_close(next);

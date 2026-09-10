@@ -243,6 +243,46 @@ pub fn parse_seed_row(line: &str, ln: usize) -> Result<(u64, i64, i64), VrpError
     }
 }
 
+/// Parse a whole `vrp-seed.tsv`: `#` comments and blank lines skipped,
+/// every other line an `expiry_ts_ms\tx_1e9\ty_1e9` triple. Rows are
+/// returned in FILE order, which the cutter writes oldest first — the
+/// pair ring is order-sensitive once it wraps, so a re-ordered seed is a
+/// different (and undeclared) fit.
+pub fn parse_seed(src: &str) -> Result<Vec<(u64, i64, i64)>, VrpError> {
+    let mut out = Vec::new();
+    let mut prev_ts = 0u64;
+    for (i, raw) in src.lines().enumerate() {
+        let ln = i + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let row = parse_seed_row(line, ln)?;
+        if row.0 <= prev_ts && prev_ts != 0 {
+            return Err(err(format!(
+                "line {ln}: seed rows must be strictly increasing in expiry_ts_ms \
+                 (got {} after {prev_ts})",
+                row.0
+            )));
+        }
+        prev_ts = row.0;
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Read + parse a seed file.
+pub fn load_seed(path: &Path) -> Result<Vec<(u64, i64, i64)>, VrpError> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| err(format!("{}: {e}", path.display())))?;
+    parse_seed(&src)
+}
+
+/// Default seed location beside `vrp.toml`.
+pub fn default_seed_path() -> Result<String, super::ConfigError> {
+    super::expand_tilde("~/multivenue/vrp-seed.tsv")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +371,22 @@ hedge_descriptor      = \"deribit:BTC-PERPETUAL\"
         assert!(parse_seed_row("a\tb\tc", 1).is_err(), "not integers");
         // Negative x/y are legal: they are logs, and a log can be < 0.
         assert!(parse_seed_row("1\t-5\t-6", 1).is_ok());
+    }
+
+    #[test]
+    fn a_seed_file_parses_in_order_and_refuses_disorder() {
+        let good = "# vrp-seed.tsv\n\n1000\t10\t11\n2000\t20\t21\n3000\t30\t31\n";
+        let rows = parse_seed(good).expect("parses");
+        assert_eq!(rows, vec![(1000, 10, 11), (2000, 20, 21), (3000, 30, 31)]);
+        // Comments and blank lines are skipped, not counted.
+        assert_eq!(parse_seed("# only a comment\n\n").unwrap(), vec![]);
+        // Out of order, or a repeat, is fatal: the pair ring is
+        // order-sensitive once it wraps, so a shuffled seed is a
+        // different fit than the one the cutter measured.
+        assert!(parse_seed("2000\t1\t2\n1000\t3\t4\n").is_err());
+        assert!(parse_seed("2000\t1\t2\n2000\t3\t4\n").is_err());
+        // And a malformed row anywhere refuses the whole file rather
+        // than silently seeding a shorter history.
+        assert!(parse_seed("1000\t1\t2\nnonsense\n").is_err());
     }
 }

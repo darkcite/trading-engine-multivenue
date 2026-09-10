@@ -6,6 +6,57 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — `vrp-seed.tsv` + `--vrp-seed` (VRP V5)
+
+**What changed**
+- New worker module `claude_worker.vrp_seed`. Lane
+  `python -m claude_worker.vrp_seed seed-out --db <candles.db>
+  --descriptor <d> --out <vrp-seed.tsv>` cuts `expiry_ts_ms\tx_1e9\ty_1e9`
+  rows for settled daily expiries out of `candles.db`, using the SAME
+  integer law `core_vol` runs (`claude_worker.vol_ref`).
+- `window_root.cut_run` gains an optional `vrp=<vrp.toml>` argument. When
+  given alongside the existing `seed=(regime.toml, candles.db)` pair it
+  writes the window's own `vrp-seed.tsv` beside `regime-seed.tsv` and
+  `funding-seed.tsv` — seeded **as of the window's first instant**, never
+  the wall clock.
+- New engine module `cli::vrp_boot` and a `--vrp-seed <path>` flag on
+  `run`, `backtest` and `audit-pnl`. `core_config::vrp` gains
+  `parse_seed` / `load_seed` / `default_seed_path`.
+- Boot tell: `vrp: seed applied pairs=N decisive=<bool> from <path>`, or
+  `vrp: seed absent — the member holds until it has 60 pairs`.
+
+**Why**
+The forecast needs 60 settled `(x, y)` pairs before it will produce a
+bound, and the engine restarts about three times a day. Without a seed
+the member would be blind for two months after every restart.
+
+**The two laws this file exists to enforce**
+- **A cold boot is legal.** An absent default seed never refuses a boot;
+  the member holds and the tell says so. A seed that is PRESENT and wrong
+  — a float, a short row, a repeat, rows out of order — does refuse it: a
+  seed the engine cannot read exactly is a fit nobody measured.
+- **No lookahead.** A pair is `(x formed from the 1440 minutes BEFORE the
+  entry instant, y realised over the hold that followed)`. A pair whose
+  hold has not settled is never emitted, and `x` is formed by feeding a
+  fresh engine only the minutes strictly before entry — the two windows
+  are disjoint by construction, so no minute of a hold can reach its own
+  regressor. Both are tested
+  (`test_an_unsettled_hold_is_never_emitted`,
+  `test_a_pair_is_cut_from_two_disjoint_windows`).
+
+**Ripple effects**
+- `vrp-seed.tsv` lives OUTSIDE git, beside `icdp.toml`, exactly like
+  `regime-seed.tsv`. Fitted numbers go in the vault, never in the tree.
+- Nothing consumes the loaded rows yet — the member arrives in V6 and is
+  composed in V7. `--vrp-seed` on `run` today reads, validates and
+  reports; it changes no behaviour.
+- Schema-1, `AUDIT_PNL_VERSION` and `detail_version` are untouched.
+
+**Operator action**
+None yet. At V8, cut the live file with
+`python -m claude_worker.vrp_seed seed-out --db ~/multivenue/candles.db
+--descriptor deribit:BTC-PERPETUAL --out ~/multivenue/vrp-seed.tsv`.
+
 ## 2026-09-10 — new crate `core-vol` + `~/multivenue/vrp.toml` (VRP V4)
 
 **What changed**

@@ -27,6 +27,7 @@ core-ring            = { workspace = true }
 core-time            = { workspace = true }
 core-types           = { workspace = true }
 # VRP V1: option sym -> (expiry, strike, right, contract size).
+core-vol             = { workspace = true }
 opt-registry         = { workspace = true }
 engine               = { workspace = true }
 engine-snapshot      = { workspace = true }
