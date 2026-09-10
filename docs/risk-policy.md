@@ -168,21 +168,21 @@ not running the strategy that was measured. Enforced in
 armed only on a full window — a half-filled comparison is not evidence
 that a mechanism has died.
 
-> **Not yet enforceable — a V8 precondition, stated plainly.** The QLIKE
-> window lives in `core_vol::VolEngine` and is zeroed at construction;
-> the V5 boot seed restores the fitted `(x, y)` pairs but NOT the
-> window. With the standing restart cadence (`scripts/daily-restart.sh`,
-> five slots a day) and an 8 h campaign, sixty settlements cannot
-> accumulate inside one process, so trigger 7 **cannot arm as deployed
-> today** and its halt would in any case be cleared by the next
-> scheduled restart — which is the "auto-resume" the section above
-> forbids. Two things must land before the lane is enabled at V8: the
-> QLIKE window must persist across restarts (alongside the pair seed),
-> and `engine_vrp_killed` must carry an operator-facing alert so a halt
-> is seen rather than erased. The member-side code is written and tested
-> so that closing this is a seed change, not a strategy change. **Until
-> both land, kill criterion 3 is an operator obligation — read the two
-> QLIKE gauges — not an engine control.**
+**The halt survives a restart (V8a, 2026-09-10).** The QLIKE window and
+the armed flag are written to `~/multivenue/vrp-state.tsv` by the engine
+and replayed at boot, so the sixty-expiry window accumulates across the
+five scheduled restarts a day it takes twenty days to fill, and an armed
+halt is NOT cleared by one. `vrp: kill criterion 3 was ARMED before this
+restart` is logged at every boot that comes up halted. Clearing it is an
+operator act — delete the state file — which is the manual step the
+section above requires, not an auto-resume.
+
+> **One item remains before V8.** `engine_vrp_killed` needs an
+> operator-facing ALERT, not just a gauge: a halt nobody is paged for is
+> a halt discovered in a weekly report. Until that alert exists, reading
+> `engine_vrp_killed`, `engine_vrp_qlike_iv_1e6` and
+> `engine_vrp_qlike_har_1e6` is an operator obligation on top of the
+> engine control.
 
 ## Signing-key handling
 

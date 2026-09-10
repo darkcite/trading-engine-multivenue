@@ -6,6 +6,64 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — `vrp-state.tsv`: the VRP member's state survives a restart (V8a)
+
+**What changed**
+- New engine-written file `~/multivenue/vrp-state.tsv`, read at boot and
+  rewritten whenever the member's state epoch moves. It carries three
+  things that outlive a process: the fitted `(x, y)` pairs with the
+  expiry each came from, the **QLIKE window** kill criterion 3 is
+  measured over, and any **open campaign**.
+- `core-vol` gains `seed_pair_at`, `seed_qlike`, `pair_at`, `qlike_at`,
+  `n_qlike` and `arm_hold_at`; pairs now carry an expiry stamp. The
+  parity fixture and `vol_ref.py` are untouched — `seed_pair` and
+  `arm_hold` still exist and stamp `0`.
+- `strategy-vrp` gains `render_state` / `restore_state` / `state_epoch`,
+  and holds the selected option's strike and right itself.
+- `strategy-core` gains `StrategyCounters::{vrp_state_epoch,
+  render_vrp_state}` (defaulted), forwarded by `strategy-set`. The cli
+  writes the file on the same 5 s cadence as the metrics mirror, and
+  ONLY when the epoch moved.
+
+**Why**
+Two gaps, both real:
+- **Kill criterion 3 could never arm.** It is measured over sixty
+  settled expiries — twenty days at an 8 h campaign — and the window
+  started empty at every boot, against five scheduled restarts a day.
+  It now accumulates across them, and an armed halt is no longer
+  cleared by a restart (which `docs/risk-policy.md` forbids as
+  auto-resume).
+- **A restart inside a hold orphaned the position.** The next boot knew
+  nothing about it: never hedged it again, never settled it.
+
+**Ripple effects**
+- **The campaign is keyed by `(expiry_ns, strike, right)`, never by
+  `SymbolId`.** Deribit option ordinals reshuffle at every boot, so a
+  persisted symbol would name a different instrument tomorrow.
+- **Two files, one writer each.** `vrp-seed.tsv` is the WORKER's
+  bootstrap cut and the engine only reads it. `vrp-state.tsv` is the
+  ENGINE's own history. When both exist the state file wins.
+- A state file that is present and malformed **refuses the boot** — a
+  state file the engine cannot read exactly is a position nobody is
+  tracking. An absent one is a normal first boot.
+- New counter `engine_vrp_settled_unpriced_total`. **Non-zero is a
+  reconciliation item, not a routine counter:** an in-the-money expiry
+  whose contract had already rolled off the boot chain, so the member
+  closed the position out of its own book without being able to price
+  it. There is no symbol to submit against and the persisted one names
+  a different instrument on the new boot, so booking it would be worse
+  than counting it.
+- Writes are atomic (temp file + rename) and a failed write is logged,
+  never fatal: taking a running engine down over a full disk while it
+  holds a position is worse than losing the ability to restore one.
+
+**Operator action**
+- Nothing to install — the engine creates the file.
+- A boot logging `vrp: kill criterion 3 was ARMED before this restart`
+  means the member will not enter. Investigate before deleting the state
+  file; deleting it is what clears the halt, and it also discards the
+  QLIKE window that armed it.
+
 ## 2026-09-10 — Deribit position caps are in COINS (operator amendment)
 
 **What changed**

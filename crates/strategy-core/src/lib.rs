@@ -202,6 +202,27 @@ pub trait StrategyCounters {
         VrpCounters::default()
     }
 
+    /// VRP V8a: the VRP member's persisted-state epoch, bumped whenever
+    /// something that outlives the process changes. The cli watches it
+    /// on the same 5 s cadence and rewrites `vrp-state.tsv` only when it
+    /// moved — so a quiet engine writes nothing.
+    #[inline]
+    fn vrp_state_epoch(&self) -> u64 {
+        0
+    }
+
+    /// VRP V8a: render that state. `false` = there is nothing to
+    /// persist (no VRP member, or it is unconfigured), and the cli
+    /// leaves the file alone.
+    ///
+    /// The member owns its own format: the cli owns only the file. Cold
+    /// path — at most once per state change, off the tick loop.
+    #[inline]
+    fn render_vrp_state(&self, out: &mut String) -> bool {
+        let _ = out;
+        false
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -566,6 +587,13 @@ pub struct VrpCounters {
     /// of the money — the option is worth nothing, so there is no order
     /// and, per the venue's schedule, no fee.
     pub settled_otm: u64,
+    /// V8a: an IN-the-money expiry the member could not PRICE, because
+    /// the campaign was restored across a restart and its contract has
+    /// already rolled off the boot chain. The position is closed out of
+    /// the member's book and the value is NOT recorded — an operator has
+    /// to reconcile that one expiry by hand. Any non-zero value here is
+    /// a reconciliation item, not a routine counter.
+    pub settled_unpriced: u64,
     /// `1` once kill criterion 3 has HALTED the member: a full
     /// trailing-60 window in which the forecast no longer beat implied
     /// vol. Sticky — it takes a restart to clear, exactly like the

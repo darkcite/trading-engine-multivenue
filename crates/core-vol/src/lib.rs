@@ -165,6 +165,12 @@ pub struct VolEngine {
     /// Fitted pairs, ×1e9.
     pair_x_1e9: [i64; PAIR_RING],
     pair_y_1e9: [i64; PAIR_RING],
+    /// V8a: which expiry each pair came from, ms since the epoch. `0`
+    /// for a pair whose provenance is unknown (the parity fixture, a
+    /// unit test). Carried ONLY so the engine can write its own state
+    /// back out and read it in again — the fit is order-independent and
+    /// never looks at it.
+    pair_ts_ms: [u64; PAIR_RING],
     /// Trailing QLIKE, ×1e9.
     qlike_iv_1e9: [i64; QLIKE_RING],
     qlike_har_1e9: [i64; QLIKE_RING],
@@ -175,6 +181,7 @@ pub struct VolEngine {
     q_n: usize,
     /// The armed hold: the `x` formed at entry, the forecast made from
     /// it, and the implied vol that was quoted against it.
+    pend_expiry_ms: u64,
     pend_x_1e9: i64,
     pend_ln_sigma_1e9: i64,
     pend_rv_iv_1e9: i64,
@@ -202,12 +209,14 @@ impl VolEngine {
             ret_1e9: [0; MINUTE_RING],
             pair_x_1e9: [0; PAIR_RING],
             pair_y_1e9: [0; PAIR_RING],
+            pair_ts_ms: [0; PAIR_RING],
             qlike_iv_1e9: [0; QLIKE_RING],
             qlike_har_1e9: [0; QLIKE_RING],
             pair_head: 0,
             n_pairs: 0,
             q_head: 0,
             q_n: 0,
+            pend_expiry_ms: 0,
             pend_x_1e9: 0,
             pend_ln_sigma_1e9: 0,
             pend_rv_iv_1e9: 0,
@@ -367,8 +376,20 @@ impl VolEngine {
     /// Returns the armed `x`, or `None` if the ring is not warm — in
     /// which case nothing is armed and the caller must hold.
     pub fn arm_hold(&mut self, tau_ns: u64, mark_iv_1e9: i64) -> Option<i64> {
+        self.arm_hold_at(0, tau_ns, mark_iv_1e9)
+    }
+
+    /// [`Self::arm_hold`], recording WHICH expiry the hold belongs to so
+    /// the pair it forms can be written back out and read in again.
+    pub fn arm_hold_at(
+        &mut self,
+        expiry_ts_ms: u64,
+        tau_ns: u64,
+        mark_iv_1e9: i64,
+    ) -> Option<i64> {
         let x = self.x_1e9(tau_ns)?;
         let t = tenor_of(tau_ns)?;
+        self.pend_expiry_ms = expiry_ts_ms;
         self.pend_x_1e9 = x;
         // The fit may not exist yet; the pair is still worth forming,
         // it just scores no QLIKE this expiry.
@@ -400,7 +421,12 @@ impl VolEngine {
     /// worker has already replayed history through the identical
     /// integer law. Refits.
     pub fn seed_pair(&mut self, x_1e9: i64, y_1e9: i64) {
-        self.push_pair(x_1e9, y_1e9);
+        self.seed_pair_at(0, x_1e9, y_1e9);
+    }
+
+    /// [`Self::seed_pair`], carrying the expiry the pair came from.
+    pub fn seed_pair_at(&mut self, expiry_ts_ms: u64, x_1e9: i64, y_1e9: i64) {
+        self.push_pair(expiry_ts_ms, x_1e9, y_1e9);
         self.refit();
     }
 
@@ -433,7 +459,7 @@ impl VolEngine {
                 }
             }
         }
-        self.push_pair(self.pend_x_1e9, y);
+        self.push_pair(self.pend_expiry_ms, self.pend_x_1e9, y);
         self.refit();
         self.armed = false;
     }
@@ -466,12 +492,72 @@ impl VolEngine {
     }
 
     #[inline]
-    fn push_pair(&mut self, x_1e9: i64, y_1e9: i64) {
+    fn push_pair(&mut self, expiry_ts_ms: u64, x_1e9: i64, y_1e9: i64) {
+        self.pair_ts_ms[self.pair_head] = expiry_ts_ms;
         self.pair_x_1e9[self.pair_head] = x_1e9;
         self.pair_y_1e9[self.pair_head] = y_1e9;
         self.pair_head = (self.pair_head + 1) % PAIR_RING;
         if self.n_pairs < PAIR_RING {
             self.n_pairs += 1;
+        }
+    }
+
+    /// Chronological index of ring slot `i` — the ring is written in
+    /// order and wraps, so once it is full the oldest entry sits at the
+    /// head.
+    #[inline]
+    const fn chrono(head: usize, n: usize, cap: usize, i: usize) -> usize {
+        if n < cap {
+            i
+        } else {
+            (head + i) % cap
+        }
+    }
+
+    /// The `i`-th fitted pair in CHRONOLOGICAL order:
+    /// `(expiry_ts_ms, x_1e9, y_1e9)`. For writing the engine's state
+    /// back out; the fit itself never needs an order.
+    #[must_use]
+    pub fn pair_at(&self, i: usize) -> Option<(u64, i64, i64)> {
+        if i >= self.n_pairs {
+            return None;
+        }
+        let k = Self::chrono(self.pair_head, self.n_pairs, PAIR_RING, i);
+        Some((self.pair_ts_ms[k], self.pair_x_1e9[k], self.pair_y_1e9[k]))
+    }
+
+    /// The `i`-th QLIKE observation in CHRONOLOGICAL order:
+    /// `(iv_1e9, har_1e9)`.
+    #[must_use]
+    pub fn qlike_at(&self, i: usize) -> Option<(i64, i64)> {
+        if i >= self.q_n {
+            return None;
+        }
+        let k = Self::chrono(self.q_head, self.q_n, QLIKE_RING, i);
+        Some((self.qlike_iv_1e9[k], self.qlike_har_1e9[k]))
+    }
+
+    /// QLIKE observations held.
+    #[inline]
+    #[must_use]
+    pub const fn n_qlike(&self) -> usize {
+        self.q_n
+    }
+
+    /// V8a: replay one QLIKE observation from persisted state, oldest
+    /// first.
+    ///
+    /// Kill criterion 3 is stated over a trailing SIXTY settled
+    /// expiries — twenty days of live running at an 8 h campaign, across
+    /// every restart in between. A window that starts empty at every
+    /// boot can never fill, so the halt it feeds could never arm. This
+    /// is the entry point that makes it able to.
+    pub fn seed_qlike(&mut self, iv_1e9: i64, har_1e9: i64) {
+        self.qlike_iv_1e9[self.q_head] = iv_1e9;
+        self.qlike_har_1e9[self.q_head] = har_1e9;
+        self.q_head = (self.q_head + 1) % QLIKE_RING;
+        if self.q_n < QLIKE_RING {
+            self.q_n += 1;
         }
     }
 
@@ -816,6 +902,81 @@ mod tests {
         let c2 = e.qlike_counters();
         assert_eq!(c2.n as usize, QLIKE_RING);
         assert!(c2.har_beats_iv, "a full window of wins arms the tell");
+    }
+
+    // ---------------- V8a: state read-back ----------------
+
+    #[test]
+    fn pairs_and_qlike_read_back_in_chronological_order_across_a_wrap() {
+        // The rings are written in order and wrap; once full the oldest
+        // entry sits at the head. Reading them back out of order would
+        // write a state file that replays as a different history than
+        // the one that produced it.
+        let mut e = VolEngine::new();
+        let mut i = 0u64;
+        while i < PAIR_RING as u64 + 37 {
+            e.seed_pair_at(1_000 + i, 30_000_000_000 + i as i64, 31_000_000_000 + i as i64);
+            i += 1;
+        }
+        assert_eq!(e.n_pairs(), PAIR_RING);
+        // The oldest surviving pair is #37, the newest is the last one.
+        assert_eq!(e.pair_at(0).unwrap().0, 1_000 + 37);
+        assert_eq!(e.pair_at(PAIR_RING - 1).unwrap().0, 1_000 + PAIR_RING as u64 + 36);
+        assert_eq!(e.pair_at(PAIR_RING), None);
+        // Strictly increasing all the way through — that IS chronology.
+        let mut k = 1usize;
+        while k < PAIR_RING {
+            assert!(
+                e.pair_at(k).unwrap().0 > e.pair_at(k - 1).unwrap().0,
+                "pair {k} out of order"
+            );
+            k += 1;
+        }
+
+        let mut q = VolEngine::new();
+        let mut j = 0i64;
+        while j < QLIKE_RING as i64 + 11 {
+            q.seed_qlike(j, j + 1_000_000);
+            j += 1;
+        }
+        assert_eq!(q.n_qlike(), QLIKE_RING);
+        assert_eq!(q.qlike_at(0).unwrap().0, 11);
+        assert_eq!(q.qlike_at(QLIKE_RING - 1).unwrap().0, QLIKE_RING as i64 + 10);
+        assert_eq!(q.qlike_at(QLIKE_RING), None);
+    }
+
+    #[test]
+    fn a_seeded_qlike_window_arms_the_kill_tell() {
+        // The point of persisting it: sixty settlements take twenty days
+        // and every restart in between would otherwise reset the window,
+        // so the halt could never arm. Replayed, it can.
+        let mut e = VolEngine::new();
+        let mut i = 0usize;
+        while i < QLIKE_RING {
+            // IV scores better than HAR on every expiry.
+            e.seed_qlike(1_000_000, 900_000_000);
+            i += 1;
+        }
+        let c = e.qlike_counters();
+        assert_eq!(c.n as usize, QLIKE_RING);
+        assert!(!c.har_beats_iv, "a replayed losing window still loses");
+        assert_eq!(c.iv_mean_1e9, 1_000_000);
+        assert_eq!(c.har_mean_1e9, 900_000_000);
+    }
+
+    #[test]
+    fn a_settled_pair_carries_the_expiry_it_was_armed_with() {
+        let mut e = VolEngine::new();
+        walk(&mut e, 1_500, 41);
+        e.arm_hold_at(1_789_027_200_000, TAU_8H, 600_000_000)
+            .expect("armed");
+        e.observe_settlement(1_200_000_000_000);
+        assert_eq!(e.pair_at(0).unwrap().0, 1_789_027_200_000);
+        // The plain `arm_hold` stamps 0 — the parity fixture and the
+        // unit tests do not carry provenance and do not need it.
+        e.arm_hold(TAU_8H, 600_000_000).expect("armed");
+        e.observe_settlement(1_200_000_000_000);
+        assert_eq!(e.pair_at(1).unwrap().0, 0);
     }
 
     #[test]

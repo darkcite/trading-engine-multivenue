@@ -2505,9 +2505,29 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             tracing::error!(error = ?e, "vrp: artifact refused");
             return EngineLoopResult::Failed("vrp: artifact refused by the strategy");
         }
-        for (_, x, y) in &boot.seed {
-            set.vrp_mut().seed_pair(*x, *y);
+        for (ts_ms, x, y) in &boot.seed {
+            set.vrp_mut().seed_pair_at(*ts_ms, *x, *y);
         }
+        // V8a: the engine's OWN history on top of the worker's
+        // bootstrap — the pairs it formed itself, the QLIKE window kill
+        // criterion 3 is measured over, and any campaign that was open
+        // when the process went down. A state file the engine cannot
+        // read exactly is a position nobody is tracking, so a malformed
+        // one refuses the boot.
+        let restored = match boot.state.as_deref() {
+            Some(text) => match set.vrp_mut().restore_state(text) {
+                Ok(r) => r,
+                Err(reason) => {
+                    tracing::error!(
+                        reason,
+                        path = %boot.state_path.display(),
+                        "vrp: state refused"
+                    );
+                    return EngineLoopResult::Failed("vrp: state file refused by the strategy");
+                }
+            },
+            None => strategy_vrp::VrpRestored::default(),
+        };
         tracing::info!(
             hash = %format_hex32(&boot.hash),
             chain_rows = boot.registry.len(),
@@ -2523,6 +2543,29 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             path = %boot.seed_path.display(),
             "vrp: seed applied"
         );
+        tracing::info!(
+            pairs = restored.pairs,
+            qlike = restored.qlike,
+            campaign = restored.campaign,
+            campaign_resolved = restored.campaign_resolved,
+            killed = restored.killed,
+            total_pairs = set.vrp().n_pairs(),
+            path = %boot.state_path.display(),
+            "vrp: state restored"
+        );
+        if restored.campaign && !restored.campaign_resolved {
+            tracing::warn!(
+                "vrp: the restored campaign's contract is no longer in the chain — the \
+                 settle rung will close it out at the first index"
+            );
+        }
+        obs.vrp_state_path = Some(boot.state_path.clone());
+        if restored.killed {
+            tracing::warn!(
+                "vrp: kill criterion 3 was ARMED before this restart — the member will not \
+                 enter. Investigate before clearing the state file."
+            );
+        }
     }
     if !cross_groups.is_empty() {
         if let Err(reason) = configure_cross_arb(set.cross_arb_mut(), &cfg, cross_groups) {
@@ -3112,6 +3155,10 @@ pub struct Observability {
     /// as `fills_capture` (bin opens, engine loop takes ownership).
     /// `None` in tests and in tools that replay rather than run.
     pub orders_capture: Option<SlotCapture<Order>>,
+    /// VRP V8a: where the VRP member's persisted state is written.
+    /// `None` = no VRP member is configured, and the engine writes
+    /// nothing. Set by the set builder from the boot bundle.
+    pub vrp_state_path: Option<std::path::PathBuf>,
 }
 
 impl Observability {
@@ -3672,6 +3719,11 @@ pub struct VrpMetricIds {
     /// `engine_vrp_settled_otm_total` (VX — an OTM expiry is free, so
     /// this counts positions that ended with no fill at all)
     pub settled_otm: core_metrics::CounterId,
+    /// `engine_vrp_settled_unpriced_total` (V8a). **Non-zero is a
+    /// reconciliation item, not a routine counter:** an in-the-money
+    /// expiry whose contract had already rolled off the chain, so the
+    /// value could not be recorded.
+    pub settled_unpriced: core_metrics::CounterId,
     /// `engine_vrp_killed` (gauge; kill criterion 3 has HALTED the
     /// member — sticky until a restart)
     pub killed: core_metrics::GaugeId,
@@ -3705,6 +3757,7 @@ fn register_vrp_metrics(
     let caps_rejected = one("engine_vrp_caps_rejected_total")?;
     let settled_itm = one("engine_vrp_settled_itm_total")?;
     let settled_otm = one("engine_vrp_settled_otm_total")?;
+    let settled_unpriced = one("engine_vrp_settled_unpriced_total")?;
     let mut g = |name: &str| -> Result<core_metrics::GaugeId, &'static str> {
         reg.register_gauge(name).map_err(|_| "register vrp gauge")
     };
@@ -3723,11 +3776,44 @@ fn register_vrp_metrics(
         caps_rejected,
         settled_itm,
         settled_otm,
+        settled_unpriced,
         killed: g("engine_vrp_killed")?,
         qlike_iv_1e6: g("engine_vrp_qlike_iv_1e6")?,
         qlike_har_1e6: g("engine_vrp_qlike_har_1e6")?,
         qlike_har_beats_iv: g("engine_vrp_qlike_har_beats_iv")?,
     })
+}
+
+/// VRP V8a: rewrite `vrp-state.tsv` when, and only when, the member's
+/// state epoch moved.
+///
+/// Same 5 s cadence as the metrics mirror, and for the same reason: it
+/// is the cold path the engine already visits. A quiet engine writes
+/// nothing at all — the epoch is the member's own answer to "did
+/// anything that outlives this process change", so there is no polling
+/// of contents and no guessing.
+///
+/// A failed write is LOGGED, never fatal. The alternative is taking a
+/// running engine down over a full disk while it holds a position, which
+/// is strictly worse than losing the ability to restore one.
+fn write_vrp_state_if_changed<S: strategy_core::StrategyCounters>(
+    path: Option<&std::path::Path>,
+    strat: &S,
+    last_epoch: &mut u64,
+    buf: &mut String,
+) {
+    let Some(path) = path else { return };
+    let epoch = strategy_core::StrategyCounters::vrp_state_epoch(strat);
+    if epoch == *last_epoch {
+        return;
+    }
+    if !strategy_core::StrategyCounters::render_vrp_state(strat, buf) {
+        return;
+    }
+    match crate::vrp_boot::write_state(path, buf) {
+        Ok(()) => *last_epoch = epoch,
+        Err(reason) => tracing::warn!(reason, "vrp: state write failed — will retry"),
+    }
 }
 
 /// Mirror the VRP family as monotonic deltas of the cumulative strategy
@@ -3768,6 +3854,8 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.settled_itm.saturating_sub(last.settled_itm));
     reg.counter(ids.settled_otm)
         .inc(cur.settled_otm.saturating_sub(last.settled_otm));
+    reg.counter(ids.settled_unpriced)
+        .inc(cur.settled_unpriced.saturating_sub(last.settled_unpriced));
     reg.gauge(ids.killed).set(cur.killed as i64);
     reg.gauge(ids.qlike_iv_1e6).set(cur.qlike_iv_1e6);
     reg.gauge(ids.qlike_har_1e6).set(cur.qlike_har_1e6);
@@ -4608,6 +4696,13 @@ where
     // ICDP I4 slot-6 family delta snapshot (same bookkeeping).
     let mut icdp_last = strategy_core::IcdpCounters::default();
     let mut vrp_last = strategy_core::VrpCounters::default();
+    // VRP V8a: the persisted-state writer. The epoch starts at whatever
+    // the member came up with, so a boot that changed nothing rewrites
+    // nothing — the first write is a real state change, not a restart.
+    let vrp_state_path = obs.vrp_state_path.clone();
+    let mut vrp_state_epoch =
+        strategy_core::StrategyCounters::vrp_state_epoch(eng.strategy());
+    let mut vrp_state_buf = String::new();
     let mut regime_last = strategy_core::RegimeCounters::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
@@ -4695,6 +4790,12 @@ where
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
+                write_vrp_state_if_changed(
+                    vrp_state_path.as_deref(),
+                    eng.strategy(),
+                    &mut vrp_state_epoch,
+                    &mut vrp_state_buf,
+                );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
 
                 // Per-ingress connection state — real per-thread

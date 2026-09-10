@@ -289,9 +289,16 @@ pub fn load_seed(path: &Path) -> Result<Vec<(u64, i64, i64)>, VrpError> {
     parse_seed(&src)
 }
 
-/// Default seed location beside `vrp.toml`.
+/// Default seed location beside `vrp.toml` — the WORKER's bootstrap cut.
 pub fn default_seed_path() -> Result<String, super::ConfigError> {
     super::expand_tilde("~/multivenue/vrp-seed.tsv")
+}
+
+/// V8a: default location of the ENGINE's own persisted state, beside the
+/// seed. Written by the engine, read by the engine, never hand-authored
+/// — the seed bootstraps a first boot, this carries everything since.
+pub fn default_state_path() -> Result<String, super::ConfigError> {
+    super::expand_tilde("~/multivenue/vrp-state.tsv")
 }
 
 #[cfg(test)]

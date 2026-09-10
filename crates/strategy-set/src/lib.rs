@@ -659,6 +659,15 @@ impl StrategyCounters for StrategySet {
     fn vrp_counters(&self) -> strategy_core::VrpCounters {
         self.vrp.vrp_counters()
     }
+    /// VRP V8a: slot 1's persisted state.
+    #[inline]
+    fn vrp_state_epoch(&self) -> u64 {
+        StrategyCounters::vrp_state_epoch(&self.vrp)
+    }
+    #[inline]
+    fn render_vrp_state(&self, out: &mut String) -> bool {
+        StrategyCounters::render_vrp_state(&self.vrp, out)
+    }
     /// RG2: the detector's observables + per-slot gates.
     fn regime_counters(&self) -> RegimeCounters {
         let mut c = RegimeCounters::default();

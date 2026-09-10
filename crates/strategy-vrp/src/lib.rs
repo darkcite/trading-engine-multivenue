@@ -100,6 +100,7 @@
 //! | an entry (or a growing hedge) over a risk-policy cap | refused | `caps_rejected` |
 //! | kill criterion 3: a full trailing-60 window where the forecast stopped beating IV | HALT for the life of the process | `killed` |
 //! | at expiry with no usable index | settlement DEFERRED to the next record | `stale_skips` |
+//! | at expiry ITM with the contract rolled off the chain (restored campaign) | position closed, value NOT recorded — reconcile by hand | `settled_unpriced` |
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -116,7 +117,7 @@ use core_types::{
     SYMBOL_ID_NONE,
 };
 use core_types::{Fill, OptSummary, Signal};
-use opt_registry::{OptRegistry, RIGHT_CALL};
+use opt_registry::{OptRegistry, RIGHT_CALL, RIGHT_PUT};
 use strategy_core::{Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
 /// The counters the engine mirrors (defined in `strategy-core` so the
@@ -156,6 +157,29 @@ pub const ORDER_TTL_NS: u64 = 60_000_000_000;
 /// **an option expiring out of the money is free** — which is why an OTM
 /// expiry here emits no order at all rather than a zero-priced one.
 ///
+/// V8a: `vrp-state.tsv` format version. Bump on any row-shape change;
+/// the parser refuses anything else rather than guessing.
+pub const VRP_STATE_VERSION: u32 = 1;
+
+/// What a [`VrpStrategy::restore_state`] replay put back, for the boot
+/// tell. An operator reading `pairs=0 campaign=false` after a restart
+/// knows the member came up cold.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VrpRestored {
+    /// Fitted pairs replayed.
+    pub pairs: usize,
+    /// QLIKE observations replayed.
+    pub qlike: usize,
+    /// A campaign was carried across the restart.
+    pub campaign: bool,
+    /// That campaign's contract is still in the boot chain. `false`
+    /// means the expiry has rolled off and the settle rung will close
+    /// the position out at the first index it sees.
+    pub campaign_resolved: bool,
+    /// Kill criterion 3 was already armed before the restart.
+    pub killed: bool,
+}
+
 /// `side` value for a flat campaign.
 pub const SIDE_FLAT: i8 = 0;
 /// `side` value for LONG vol — implied vol was BELOW the band, so we buy
@@ -260,6 +284,13 @@ pub struct VrpStrategy {
     selected_sym: SymbolId,
     /// Expiry of the selected option, wall ns.
     expiry_ns: u64,
+    /// Strike and right of the selected option, held HERE rather than
+    /// looked up per use. Two reasons: it takes a registry lookup off
+    /// the settle path, and it lets a campaign restored from persisted
+    /// state settle even when the instrument itself is gone from the
+    /// chain — which is exactly the case that state exists for.
+    selected_strike_1e6: i64,
+    selected_right: u8,
     /// The last mark seen for [`Self::selected_sym`].
     last_mark: OptMarkCache,
 
@@ -302,6 +333,11 @@ pub struct VrpStrategy {
     orders_emitted: u64,
     orders_dropped: u64,
     next_oid: u64,
+    /// V8a: bumped whenever persisted state changes — a campaign
+    /// opening, a hedge moving, a settlement folding in, the kill
+    /// arming. The cli watches it and rewrites `vrp-state.tsv`; it never
+    /// has to guess when something happened.
+    state_epoch: u64,
 }
 
 impl Default for VrpStrategy {
@@ -328,6 +364,8 @@ impl VrpStrategy {
             last_underlying_wall_ns: 0,
             selected_sym: SYMBOL_ID_NONE,
             expiry_ns: 0,
+            selected_strike_1e6: 0,
+            selected_right: RIGHT_CALL,
             last_mark: OptMarkCache::default(),
             side: SIDE_FLAT,
             killed: false,
@@ -343,6 +381,7 @@ impl VrpStrategy {
             orders_emitted: 0,
             orders_dropped: 0,
             next_oid: 1,
+            state_epoch: 0,
         }
     }
 
@@ -397,6 +436,12 @@ impl VrpStrategy {
         self.vol.seed_pair(x_1e9, y_1e9);
     }
 
+    /// [`Self::seed_pair`], carrying the expiry the pair came from so
+    /// the member can write its own history back out (V8a).
+    pub fn seed_pair_at(&mut self, expiry_ts_ms: u64, x_1e9: i64, y_1e9: i64) {
+        self.vol.seed_pair_at(expiry_ts_ms, x_1e9, y_1e9);
+    }
+
     /// The artifact hash this member booted with.
     #[must_use]
     pub const fn hash(&self) -> [u8; 32] {
@@ -437,6 +482,197 @@ impl VrpStrategy {
     #[must_use]
     pub const fn selected_sym(&self) -> SymbolId {
         self.selected_sym
+    }
+
+    // -----------------------------------------------------------
+    // V8a: persisted state
+    // -----------------------------------------------------------
+
+    #[inline]
+    fn bump_state(&mut self) {
+        self.state_epoch = self.state_epoch.wrapping_add(1);
+    }
+
+    /// Bumped whenever persisted state changes. The cli watches this and
+    /// rewrites `vrp-state.tsv`; it never has to guess when something
+    /// happened, and an unchanged epoch means an unchanged file.
+    #[inline]
+    #[must_use]
+    pub const fn state_epoch(&self) -> u64 {
+        self.state_epoch
+    }
+
+    /// Render the member's whole persisted state into `out`.
+    ///
+    /// **Why this exists.** Two things the member owns outlive a
+    /// process: the QLIKE window kill criterion 3 is measured over
+    /// (sixty settled expiries — twenty days of live running, across
+    /// every restart in between), and an OPEN campaign. Without the
+    /// first, the halt can never arm. Without the second, a restart in
+    /// the middle of an 8 h hold orphans a live position: the next boot
+    /// knows nothing about it, never hedges it again and never settles
+    /// it.
+    ///
+    /// The campaign is keyed by `(expiry_ns, strike, right)` rather than
+    /// by symbol, because Deribit option ordinals reshuffle at every
+    /// boot — a persisted `SymbolId` would name a different instrument
+    /// tomorrow. Those three fields name the contract itself.
+    ///
+    /// Cold path: called at most once per state change, off the tick
+    /// loop, so a `String` is fine here and nowhere else in this crate.
+    pub fn render_state(&self, out: &mut String) -> bool {
+        use core::fmt::Write as _;
+        if !self.configured {
+            return false;
+        }
+        out.clear();
+        out.push_str(
+            "# vrp-state.tsv — written by the engine, read at boot. Not for hand editing.\n\
+             # V version | P expiry_ts_ms x_1e9 y_1e9 | Q qlike_iv_1e9 qlike_har_1e9\n\
+             # K killed | C expiry_ns strike_1e6 right side opt_qty_1e6 perp_qty_1e6 next_rebalance_ns\n",
+        );
+        let _ = writeln!(out, "V\t{VRP_STATE_VERSION}");
+        if self.killed {
+            out.push_str("K\t1\n");
+        }
+        let mut i = 0usize;
+        while let Some((ts, x, y)) = self.vol.pair_at(i) {
+            let _ = writeln!(out, "P\t{ts}\t{x}\t{y}");
+            i += 1;
+        }
+        i = 0;
+        while let Some((iv, har)) = self.vol.qlike_at(i) {
+            let _ = writeln!(out, "Q\t{iv}\t{har}");
+            i += 1;
+        }
+        if self.selected_sym != SYMBOL_ID_NONE {
+            let _ = writeln!(
+                out,
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                self.expiry_ns,
+                self.selected_strike_1e6,
+                self.selected_right,
+                self.side,
+                self.opt_pos_qty_1e6,
+                self.perp_pos_qty_1e6,
+                self.next_rebalance_wall_ns
+            );
+        }
+        true
+    }
+
+    /// Replay a state file rendered by [`Self::render_state`].
+    ///
+    /// Boot path — call after [`Self::configure`] and before
+    /// `on_start`. Fail-closed: an unknown tag, a bad version, a
+    /// malformed field or a campaign the registry cannot place is an
+    /// error, and the caller refuses the boot. A state file the engine
+    /// cannot read EXACTLY is a position nobody is tracking.
+    ///
+    /// A campaign whose instrument is no longer in the chain is still
+    /// restored — `selected_sym` stays [`SYMBOL_ID_NONE`] and the
+    /// settle rung, which reads the persisted strike and right rather
+    /// than the registry, closes it out at the first index. That is the
+    /// engine-down-across-expiry path, and it is the whole reason the
+    /// campaign is keyed by contract and not by symbol.
+    pub fn restore_state(&mut self, text: &str) -> Result<VrpRestored, &'static str> {
+        if !self.configured {
+            return Err("vrp: restore before configure");
+        }
+        let mut seen_version = false;
+        let mut st = VrpRestored::default();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut f = line.split('\t');
+            let tag = f.next().unwrap_or("");
+            let num = |t: Option<&str>| -> Result<i64, &'static str> {
+                t.ok_or("vrp state: short row")?
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| "vrp state: not an integer")
+            };
+            match tag {
+                "V" => {
+                    if num(f.next())? != i64::from(VRP_STATE_VERSION) {
+                        return Err("vrp state: unknown version");
+                    }
+                    seen_version = true;
+                }
+                "K" => {
+                    if num(f.next())? != 0 {
+                        self.killed = true;
+                        self.counters.killed = 1;
+                        st.killed = true;
+                    }
+                }
+                "P" => {
+                    let ts = num(f.next())?;
+                    let x = num(f.next())?;
+                    let y = num(f.next())?;
+                    if ts < 0 {
+                        return Err("vrp state: negative expiry stamp");
+                    }
+                    self.vol.seed_pair_at(ts as u64, x, y);
+                    st.pairs += 1;
+                }
+                "Q" => {
+                    let iv = num(f.next())?;
+                    let har = num(f.next())?;
+                    self.vol.seed_qlike(iv, har);
+                    st.qlike += 1;
+                }
+                "C" => {
+                    let expiry_ns = num(f.next())?;
+                    let strike = num(f.next())?;
+                    let right = num(f.next())?;
+                    let side = num(f.next())?;
+                    let opt_qty = num(f.next())?;
+                    let perp_qty = num(f.next())?;
+                    let next_reb = num(f.next())?;
+                    if expiry_ns <= 0 || strike <= 0 {
+                        return Err("vrp state: campaign expiry/strike must be positive");
+                    }
+                    if right != i64::from(RIGHT_CALL) && right != i64::from(RIGHT_PUT) {
+                        return Err("vrp state: campaign right is neither call nor put");
+                    }
+                    if !(SIDE_SHORT_VOL..=SIDE_LONG_VOL).contains(&(side as i8)) {
+                        return Err("vrp state: campaign side out of range");
+                    }
+                    self.expiry_ns = expiry_ns as u64;
+                    self.selected_strike_1e6 = strike;
+                    self.selected_right = right as u8;
+                    self.side = side as i8;
+                    self.opt_pos_qty_1e6 = opt_qty;
+                    self.perp_pos_qty_1e6 = perp_qty;
+                    self.next_rebalance_wall_ns = next_reb.max(0) as u64;
+                    self.entry_done = opt_qty != 0;
+                    self.selected_sym = self.find_contract(self.expiry_ns, strike, right as u8);
+                    st.campaign = true;
+                    st.campaign_resolved = self.selected_sym != SYMBOL_ID_NONE;
+                }
+                _ => return Err("vrp state: unknown row tag"),
+            }
+        }
+        if !seen_version {
+            return Err("vrp state: no version row");
+        }
+        self.refresh_qlike();
+        Ok(st)
+    }
+
+    /// The chain row for a contract, by the three fields that name it
+    /// across boots. `SYMBOL_ID_NONE` when the chain no longer carries
+    /// it — an expiry that has already rolled off.
+    fn find_contract(&self, expiry_ns: u64, strike_1e6: i64, right: u8) -> SymbolId {
+        for row in self.registry.rows() {
+            if row.expiry_ns == expiry_ns && row.strike_1e6 == strike_1e6 && row.right == right {
+                return row.sym;
+            }
+        }
+        SYMBOL_ID_NONE
     }
 
     // -----------------------------------------------------------
@@ -594,6 +830,7 @@ impl VrpStrategy {
         }
         self.perp_pos_qty_1e6 = target_1e6;
         self.counters.hedges = self.counters.hedges.wrapping_add(1);
+        self.bump_state();
         true
     }
 
@@ -609,11 +846,14 @@ impl VrpStrategy {
         debug_assert_eq!(self.perp_pos_qty_1e6, 0, "campaign ended holding a hedge");
         self.selected_sym = SYMBOL_ID_NONE;
         self.expiry_ns = 0;
+        self.selected_strike_1e6 = 0;
+        self.selected_right = RIGHT_CALL;
         self.side = SIDE_FLAT;
         self.entry_done = false;
         self.flatten_pending = false;
         self.last_mark = OptMarkCache::default();
         self.next_rebalance_wall_ns = 0;
+        self.bump_state();
     }
 
     /// Unwind both legs at the last known marks.
@@ -627,6 +867,7 @@ impl VrpStrategy {
                 if self.submit(ctx, order) {
                     self.opt_pos_qty_1e6 = 0;
                     self.counters.exits = self.counters.exits.wrapping_add(1);
+                    self.bump_state();
                     any = true;
                 }
             }
@@ -711,7 +952,11 @@ impl VrpStrategy {
     /// E−ε law on the same instant, because at or after expiry there is
     /// no mark to unwind against — the instrument is cash now.
     fn maybe_settle<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) -> bool {
-        if self.selected_sym == SYMBOL_ID_NONE || self.expiry_ns == 0 || wall_ns < self.expiry_ns {
+        // Keyed on the EXPIRY, not the symbol: a campaign restored
+        // across a restart may have no symbol at all, because Deribit
+        // drops an instrument from the chain once it expires — which is
+        // exactly the case this rung exists for.
+        if self.expiry_ns == 0 || wall_ns < self.expiry_ns {
             return false;
         }
         // Nothing held: the E−ε law already did its job, so expiry is
@@ -721,18 +966,31 @@ impl VrpStrategy {
             self.end_campaign();
             return true;
         }
-        let Some(row) = self.registry.get(self.selected_sym).copied() else {
-            return false;
-        };
         let Some(s_1e6) = self.settle_index_1e6() else {
             // No index we can stand behind. DEFER — a settlement priced
             // off a number the member invented is worse than a late one.
             self.counters.stale_skips = self.counters.stale_skips.wrapping_add(1);
             return false;
         };
-        let value_1e6 = Self::intrinsic_1e6(s_1e6, row.strike_1e6, row.right);
+        let value_1e6 =
+            Self::intrinsic_1e6(s_1e6, self.selected_strike_1e6, self.selected_right);
         if self.opt_pos_qty_1e6 != 0 {
-            if value_1e6 > 0 {
+            if self.selected_sym == SYMBOL_ID_NONE {
+                // The contract has rolled off the chain, so there is no
+                // symbol to submit against — and submitting against the
+                // PERSISTED one would be worse than not submitting:
+                // Deribit option ordinals reshuffle at every boot, so
+                // that number names a different instrument today.
+                //
+                // Close the position out of our own book and count it as
+                // what it is: an expiry whose value we could not record.
+                // An operator reconciles it by hand. OTM needs no order,
+                // so this only ever bites in the money.
+                self.opt_pos_qty_1e6 = 0;
+                self.counters.settled_unpriced =
+                    self.counters.settled_unpriced.wrapping_add(1);
+                self.bump_state();
+            } else if value_1e6 > 0 {
                 // ITM: book the intrinsic. A closing order at the
                 // settlement price is how a paper member says "this
                 // position became cash at this value".
@@ -746,6 +1004,7 @@ impl VrpStrategy {
                 }
                 self.opt_pos_qty_1e6 = 0;
                 self.counters.settled_itm = self.counters.settled_itm.wrapping_add(1);
+                self.bump_state();
             } else {
                 // OTM: the option is worth nothing and the venue charges
                 // nothing. There is no order to place — a zero-priced
@@ -753,6 +1012,7 @@ impl VrpStrategy {
                 // book value that expired.
                 self.opt_pos_qty_1e6 = 0;
                 self.counters.settled_otm = self.counters.settled_otm.wrapping_add(1);
+                self.bump_state();
             }
         }
         if self.perp_pos_qty_1e6 != 0 {
@@ -777,6 +1037,7 @@ impl VrpStrategy {
             self.vol.observe_settlement(rv);
             self.counters.settlements = self.counters.settlements.wrapping_add(1);
             self.refresh_qlike();
+            self.bump_state();
         }
     }
 
@@ -807,6 +1068,7 @@ impl VrpStrategy {
         if q.n as usize >= core_vol::QLIKE_RING && !q.har_beats_iv {
             self.killed = true;
             self.counters.killed = 1;
+            self.bump_state();
         }
     }
 
@@ -837,8 +1099,13 @@ impl VrpStrategy {
             Some((sym, expiry_ns, _)) => {
                 self.selected_sym = sym;
                 self.expiry_ns = expiry_ns;
+                if let Some(row) = self.registry.get(sym) {
+                    self.selected_strike_1e6 = row.strike_1e6;
+                    self.selected_right = row.right;
+                }
                 self.entry_done = false;
                 self.flatten_pending = false;
+                self.bump_state();
             }
             None => self.counters.no_selection = self.counters.no_selection.wrapping_add(1),
         }
@@ -916,7 +1183,11 @@ impl VrpStrategy {
         // hold, so arm before the position exists — but only once the
         // trade is authorised, or an armed forecast would pair an `x`
         // with a hold that never happened.
-        if self.vol.arm_hold(self.params.tau_ns, iv).is_none() {
+        if self
+            .vol
+            .arm_hold_at(self.expiry_ns / 1_000_000, self.params.tau_ns, iv)
+            .is_none()
+        {
             self.counters.no_bounds = self.counters.no_bounds.wrapping_add(1);
             return;
         }
@@ -926,6 +1197,7 @@ impl VrpStrategy {
         self.side = side;
         self.opt_pos_qty_1e6 = qty;
         self.counters.entries = self.counters.entries.wrapping_add(1);
+        self.bump_state();
         self.next_rebalance_wall_ns = wall_ns + self.params.rebalance_ns;
         // The first hedge goes out on the same instant as the entry.
         let target = Self::hedge_target_1e6(self.opt_pos_qty_1e6, self.last_mark.delta_1e9);
@@ -969,6 +1241,14 @@ impl StrategyCounters for VrpStrategy {
     #[inline]
     fn vrp_counters(&self) -> VrpCounters {
         self.counters
+    }
+    #[inline]
+    fn vrp_state_epoch(&self) -> u64 {
+        self.state_epoch
+    }
+    #[inline]
+    fn render_vrp_state(&self, out: &mut String) -> bool {
+        self.render_state(out)
     }
 }
 
@@ -1053,7 +1333,11 @@ impl Strategy for VrpStrategy {
         let wall_ns = self.anchor.wall_of(now);
         let underlying_px_1e6 = opt.underlying_px_1e9 / 1_000;
 
-        if self.selected_sym == SYMBOL_ID_NONE {
+        // `expiry_ns`, not the symbol: a restored campaign whose
+        // contract has rolled off the chain still OWNS the member until
+        // the settle rung closes it, and starting a new campaign on top
+        // of it would lose the old position.
+        if self.expiry_ns == 0 {
             self.select(ctx, wall_ns, underlying_px_1e6);
         }
         if opt.sym != self.selected_sym {
@@ -1921,6 +2205,235 @@ mod tests {
         assert!(ctx.orders.is_empty());
         assert_eq!(m.vrp_counters().settled_itm, 0);
         assert_eq!(m.vrp_counters().settled_otm, 0);
+    }
+
+    // ---------------- V8a: persisted state ----------------
+
+    fn fresh_member(ctx: &mut RecCtx) -> VrpStrategy {
+        let mut m = VrpStrategy::new();
+        m.configure(
+            VrpParams::default(),
+            registry(),
+            perp_sym(),
+            perp_sym(),
+            WallAnchor::new(MONO0, WALL0),
+            [7u8; 32],
+        )
+        .expect("configure");
+        let _ = ctx;
+        m
+    }
+
+    #[test]
+    fn a_live_campaign_round_trips_through_the_state_file() {
+        // The defect this exists to prevent: a restart in the middle of
+        // an 8 h hold. The next boot knows nothing about the position,
+        // never hedges it again and never settles it — the member is
+        // flat in its own head while the venue says otherwise.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let m = campaign_at_expiry(&mut ctx, params);
+        // Push the forecast forward so there is a QLIKE row too.
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+        assert!(text.contains("V\t1"), "{text}");
+
+        let mut boot = fresh_member(&mut ctx);
+        let r = boot.restore_state(&text).expect("restores");
+        assert!(r.campaign, "the campaign came back");
+        assert!(r.campaign_resolved, "and the chain still carries it");
+        assert_eq!(r.pairs, m.n_pairs());
+        assert_eq!(boot.n_pairs(), m.n_pairs());
+        assert_eq!(boot.selected_sym(), m.selected_sym());
+        assert_eq!(boot.opt_pos_qty_1e6(), m.opt_pos_qty_1e6());
+        assert_eq!(boot.perp_pos_qty_1e6(), m.perp_pos_qty_1e6());
+        assert_eq!(boot.side(), m.side());
+        assert_eq!(boot.expiry_ns, m.expiry_ns);
+        assert_eq!(boot.selected_strike_1e6, m.selected_strike_1e6);
+        // And the restored member renders the SAME state — a round trip
+        // that drifted would compound at every restart.
+        let mut again = String::new();
+        assert!(boot.render_state(&mut again));
+        assert_eq!(again, text, "render → restore → render must be a fixpoint");
+    }
+
+    #[test]
+    fn a_restored_campaign_settles_even_when_its_contract_is_gone() {
+        // The engine-down-across-expiry path, and the reason the
+        // campaign is keyed by (expiry, strike, right) rather than by
+        // SymbolId: option ordinals reshuffle at every boot, and by the
+        // time the process comes back the expiry may have rolled off the
+        // chain entirely. The persisted strike and right are enough to
+        // settle it.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let m = campaign_at_expiry(&mut ctx, params);
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+
+        // A boot whose chain no longer holds that expiry at all.
+        let mut boot = VrpStrategy::new();
+        let mut reg = OptRegistry::new();
+        reg.insert(OptInstrument::new(
+            opt_sym(30),
+            perp_sym(),
+            VenueId::Deribit as u8,
+            EXPIRY + 7 * 86_400_000_000_000_000 / 1_000,
+            79_000_000_000,
+            RIGHT_CALL,
+            1_000_000_000,
+        ))
+        .expect("next week's chain");
+        boot.configure(
+            params,
+            reg,
+            perp_sym(),
+            perp_sym(),
+            WallAnchor::new(MONO0, WALL0),
+            [0; 32],
+        )
+        .expect("configure");
+        let r = boot.restore_state(&text).expect("restores");
+        assert!(r.campaign);
+        assert!(!r.campaign_resolved, "the contract is gone from the chain");
+        assert_eq!(boot.selected_sym(), SYMBOL_ID_NONE);
+        assert_eq!(boot.opt_pos_qty_1e6(), m.opt_pos_qty_1e6(), "still held");
+
+        // The first tick after expiry closes it. The option leg cannot
+        // be PRICED — there is no symbol to submit against, and the
+        // persisted one names a different instrument on this boot — so
+        // it is counted as a reconciliation item rather than booked at a
+        // number nobody can trade. The hedge, which trades a perp whose
+        // sym IS stable, unwinds normally.
+        let late = EXPIRY + 3_600_000_000_000;
+        ctx.orders.clear();
+        ctx.now = mono_of(late);
+        boot.on_tick(&tick(late, 81_000_000_000, false), &mut ctx);
+        assert_eq!(boot.vrp_counters().settled_unpriced, 1);
+        assert_eq!(boot.vrp_counters().settled_itm, 0);
+        assert_eq!(ctx.orders.len(), 1, "the hedge only");
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        assert_eq!(boot.opt_pos_qty_1e6(), 0);
+        assert_eq!(boot.perp_pos_qty_1e6(), 0);
+        assert_eq!(boot.selected_sym(), SYMBOL_ID_NONE);
+        assert_eq!(boot.expiry_ns, 0, "the campaign ended");
+    }
+
+    #[test]
+    fn a_restored_campaign_settles_normally_when_its_contract_is_still_there() {
+        // The common case: a restart between the entry and the expiry.
+        // The contract is still in the chain, so the settle rung prices
+        // it exactly as it would have without the restart.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let m = campaign_at_expiry(&mut ctx, params);
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+
+        let mut boot = fresh_member(&mut ctx);
+        let r = boot.restore_state(&text).expect("restores");
+        assert!(r.campaign_resolved);
+        ctx.orders.clear();
+        ctx.now = mono_of(EXPIRY);
+        boot.on_tick(&tick(EXPIRY, 81_000_000_000, false), &mut ctx);
+        assert_eq!(boot.vrp_counters().settled_itm, 1);
+        assert_eq!(boot.vrp_counters().settled_unpriced, 0);
+        assert_eq!(ctx.orders.len(), 2);
+        assert_eq!(ctx.orders[0].px.raw(), 2_000_000_000, "81,000 − 79,000");
+    }
+
+    #[test]
+    fn the_kill_survives_a_restart() {
+        // Kill criterion 3 is measured over SIXTY settled expiries —
+        // twenty days at an 8 h campaign, across every restart in
+        // between. A window that starts empty at every boot can never
+        // fill, so the halt it feeds could never arm. This is the test
+        // that says it now can.
+        let mut ctx = RecCtx::new();
+        let mut m = fresh_member(&mut ctx);
+        let mut i = 0usize;
+        while i < core_vol::QLIKE_RING {
+            m.vol.seed_qlike(1_000_000, 900_000_000); // IV wins every time
+            i += 1;
+        }
+        m.refresh_qlike();
+        assert!(m.is_killed());
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+        assert!(text.contains("K\t1"), "{text}");
+
+        let mut boot = fresh_member(&mut ctx);
+        assert!(!boot.is_killed(), "a fresh member is not halted");
+        let r = boot.restore_state(&text).expect("restores");
+        assert!(r.killed);
+        assert_eq!(r.qlike, core_vol::QLIKE_RING);
+        assert!(boot.is_killed(), "the halt survived the restart");
+        assert_eq!(boot.vrp_counters().qlike_har_beats_iv, 0);
+    }
+
+    #[test]
+    fn a_malformed_state_file_refuses_rather_than_guessing() {
+        // A state file the engine cannot read EXACTLY is a position
+        // nobody is tracking. Every one of these is a boot refusal.
+        let mut ctx = RecCtx::new();
+        for bad in [
+            "P\t1\t2\t3\n",                              // no version row
+            "V\t2\n",                                      // a version we do not know
+            "V\t1\nZ\t1\n",                               // an unknown tag
+            "V\t1\nP\t1\t2\n",                           // a short pair row
+            "V\t1\nP\t1\tx\t3\n",                       // not an integer
+            "V\t1\nP\t-1\t2\t3\n",                      // a negative expiry stamp
+            "V\t1\nC\t0\t1\t0\t1\t1\t1\t1\n",        // expiry 0
+            "V\t1\nC\t1\t0\t0\t1\t1\t1\t1\n",        // strike 0
+            "V\t1\nC\t1\t1\t9\t1\t1\t1\t1\n",        // right is neither
+            "V\t1\nC\t1\t1\t0\t7\t1\t1\t1\n",        // side out of range
+        ] {
+            let mut m = fresh_member(&mut ctx);
+            assert!(
+                m.restore_state(bad).is_err(),
+                "must refuse {bad:?} — a state file the engine cannot read exactly \
+                 is a position nobody is tracking"
+            );
+        }
+        // Comments and blank lines are skipped, and a bare version row
+        // is a legal empty history.
+        let mut m = fresh_member(&mut ctx);
+        let r = m.restore_state("# hello\n\nV\t1\n").expect("legal");
+        assert_eq!(r.pairs, 0);
+        assert!(!r.campaign);
+        assert!(!r.killed);
+    }
+
+    #[test]
+    fn the_state_epoch_moves_only_when_something_persistable_happens() {
+        // The cli writes the file when this moves and never otherwise,
+        // so a quiet engine writes nothing at all.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, mut wall) = member(&mut ctx, params);
+        let quiet = m.state_epoch();
+        // A thousand ordinary ticks: the forecast ingests, nothing
+        // persistable changes.
+        let mut i = 0usize;
+        while i < 1_000 {
+            m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+            wall += MINUTE_NS;
+            i += 1;
+        }
+        assert_eq!(m.state_epoch(), quiet, "ticks alone are not state");
+
+        // Selecting IS.
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        assert!(m.state_epoch() > quiet, "a selection is state");
+        let after_select = m.state_epoch();
+
+        // So is an entry, and so is a hedge.
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert!(m.state_epoch() > after_select + 1, "entry AND hedge");
     }
 
     // ---------------- the fail-closed table ----------------

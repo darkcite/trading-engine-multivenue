@@ -120,6 +120,11 @@ pub struct VrpBoot {
     /// even when nothing was there — "no pairs, from here" is the tell
     /// an operator needs to fix a cold boot.
     pub seed_path: PathBuf,
+    /// V8a: the engine's own persisted state, verbatim. `None` = a
+    /// first boot with no history.
+    pub state: Option<String>,
+    /// Where that state lives, and where the engine writes it back.
+    pub state_path: PathBuf,
     /// Resolved `underlying_descriptor`.
     pub underlying_sym: SymbolId,
     /// Resolved `hedge_descriptor`.
@@ -221,6 +226,8 @@ pub fn load_vrp_boot(
         },
     };
     let seed = loaded.map(|s| s.rows).unwrap_or_default();
+    let state_path = PathBuf::from(default_state_path()?);
+    let state = read_state(&state_path)?;
     Ok(Some(VrpBoot {
         params: strategy_vrp::VrpParams {
             theta_1e9: file.theta_1e9,
@@ -234,11 +241,57 @@ pub fn load_vrp_boot(
         registry,
         seed,
         seed_path: seed_path_used,
+        state,
+        state_path,
         underlying_sym,
         hedge_sym,
         hash: core_crypto::sha256(&bytes),
         rows_refused,
     }))
+}
+
+// ---------------------------------------------------------------
+// V8a: the engine's own state file
+// ---------------------------------------------------------------
+
+/// Default location of the member's persisted state, beside `vrp.toml`.
+///
+/// Two files, one writer each, and that is deliberate.
+/// `vrp-seed.tsv` is the WORKER's bootstrap cut — fitted pairs replayed
+/// out of `candles.db` so a first boot is not blind for two months —
+/// and the engine only ever reads it. `vrp-state.tsv` is the ENGINE's
+/// own history: the pairs it formed itself, the QLIKE window kill
+/// criterion 3 is measured over, and any campaign that was open when
+/// the process went down. When both exist the state file wins, because
+/// it contains everything the seed did plus what happened since.
+pub fn default_state_path() -> Result<String, String> {
+    core_config::vrp::default_state_path().map_err(|e| e.to_string())
+}
+
+/// Read the state file. An absent file is `Ok(None)` — a first boot has
+/// no history, which is normal and not an error.
+pub fn read_state(path: &Path) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|e| format!("vrp: {}: {e}", path.display()))
+}
+
+/// Write the state file atomically — a temp file beside it, then a
+/// rename.
+///
+/// A boot that read a half-written state file would replay a partial
+/// history as if it were the whole one: a short QLIKE window that can
+/// never arm the halt, or worse, a campaign row that got cut in half
+/// and takes the boot down. `rename` on the same filesystem is atomic,
+/// so a reader sees either the old file or the new one and never a
+/// third thing.
+pub fn write_state(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("tsv.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("vrp: {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("vrp: {}: {e}", path.display()))
 }
 
 /// The one-line tell, rendered identically wherever it is printed.
