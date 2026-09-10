@@ -94,10 +94,17 @@ pub const AUDIT_PNL_VERSION: u32 = 1;
 
 /// `Order.strategy_id` display names (strategy-set slot order; the
 /// wire slots are pinned in core-types / strategy-set).
+///
+/// **Slot 1 changed meaning on 2026-09-10 (VRP V7).** The slot NUMBER is
+/// wire-stable, but the member behind it went from `strategy-ev` to
+/// `strategy-vrp`, so rows in a capture taken BEFORE that date are EV
+/// rows wearing this label. `docs/migration.md` records the boundary;
+/// there is no way to tell from the row itself, which is exactly why the
+/// boundary is written down.
 fn strategy_label(id: u8) -> &'static str {
     match id {
         0 => "latency-arb",
-        1 => "ev",
+        1 => "vrp",
         2 => "cross-arb",
         3 => "rule-tree",
         4 => "ai-exec",

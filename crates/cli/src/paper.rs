@@ -2452,7 +2452,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     disp: D,
     obs: Observability,
     requested_mask: u8,
-    ev_artifacts: Option<&std::path::Path>,
+    vrp: Option<&crate::vrp_boot::VrpBoot>,
     cross_groups: &[&[core_types::SymbolId]],
     rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
     icdp: Option<&strategy_icdp::IcdpParams>,
@@ -2463,8 +2463,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
     let mut configured =
         strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
-    if ev_artifacts.is_some() {
-        configured |= strategy_set::BIT_EV;
+    if vrp.is_some() {
+        configured |= strategy_set::BIT_VRP;
     }
     if !cross_groups.is_empty() {
         configured |= strategy_set::BIT_CROSS_ARB;
@@ -2488,10 +2488,41 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if let Err(reason) = configure_latency_arb(set.latency_arb_mut(), &cfg) {
         return EngineLoopResult::Failed(reason);
     }
-    if let Some(path) = ev_artifacts {
-        if let Err(reason) = configure_ev(set.ev_mut(), &cfg, path) {
-            return EngineLoopResult::Failed(reason);
+    if let Some(boot) = vrp {
+        // VRP V7: the wall anchor is taken HERE, once, right before the
+        // engine loop starts — the member maps every tick's monotonic
+        // stamp to wall time through it, and every expiry instant it
+        // compares against is wall.
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.vrp_mut().configure(
+            boot.params,
+            boot.registry.clone(),
+            boot.underlying_sym,
+            boot.hedge_sym,
+            anchor,
+            boot.hash,
+        ) {
+            tracing::error!(error = ?e, "vrp: artifact refused");
+            return EngineLoopResult::Failed("vrp: artifact refused by the strategy");
         }
+        for (_, x, y) in &boot.seed {
+            set.vrp_mut().seed_pair(*x, *y);
+        }
+        tracing::info!(
+            hash = %format_hex32(&boot.hash),
+            chain_rows = boot.registry.len(),
+            chain_rows_refused = boot.rows_refused,
+            seed_pairs = set.vrp().n_pairs(),
+            tau_ns = boot.params.tau_ns,
+            theta_1e9 = boot.params.theta_1e9,
+            "vrp: artifact configured"
+        );
+        tracing::info!(
+            seed_pairs = boot.seed.len(),
+            decisive = boot.seed.len() >= core_vol::MIN_PAIRS,
+            path = %boot.seed_path.display(),
+            "vrp: seed applied"
+        );
     }
     if !cross_groups.is_empty() {
         if let Err(reason) = configure_cross_arb(set.cross_arb_mut(), &cfg, cross_groups) {
@@ -2592,7 +2623,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     tracing::info!(
         mask,
         latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
-        ev = mask & strategy_set::BIT_EV != 0,
+        vrp = mask & strategy_set::BIT_VRP != 0,
         cross_arb = mask & strategy_set::BIT_CROSS_ARB != 0,
         rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
@@ -2643,7 +2674,7 @@ pub struct RegimeBoot {
 /// labelled (the worker's RG8 gates), never at boot.
 const REQUIRE_LABEL_SLOTS: [u8; 5] = [
     strategy_set::SLOT_LATENCY_ARB,
-    strategy_set::SLOT_EV,
+    strategy_set::SLOT_VRP,
     strategy_set::SLOT_CROSS_ARB,
     strategy_set::SLOT_RULE_TREE,
     strategy_set::SLOT_ICDP,
@@ -2720,9 +2751,9 @@ impl Observability {
             let strategy_latency_arb = reg
                 .register_gauge("engine_strategy_latency_arb_active")
                 .map_err(|_| "register engine_strategy_latency_arb_active")?;
-            let strategy_ev = reg
-                .register_gauge("engine_strategy_ev_active")
-                .map_err(|_| "register engine_strategy_ev_active")?;
+            let strategy_vrp = reg
+                .register_gauge("engine_strategy_vrp_active")
+                .map_err(|_| "register engine_strategy_vrp_active")?;
             let strategy_cross_arb = reg
                 .register_gauge("engine_strategy_cross_arb_active")
                 .map_err(|_| "register engine_strategy_cross_arb_active")?;
@@ -2871,6 +2902,7 @@ impl Observability {
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
             let icdp = register_icdp_metrics(&mut reg)?;
+            let vrp = register_vrp_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let fills_capture = {
                 let io_errors = reg
@@ -2904,7 +2936,7 @@ impl Observability {
                 ack_p50_ns,
                 ack_p99_ns,
                 strategy_latency_arb,
-                strategy_ev,
+                strategy_vrp,
                 strategy_cross_arb,
                 strategy_rule_tree,
                 strategy_set,
@@ -2949,6 +2981,7 @@ impl Observability {
                 strategy_enabled_mask,
                 vm,
                 icdp,
+                vrp,
                 regime,
             });
         }
@@ -3147,7 +3180,7 @@ pub struct EngineCounters {
     /// Active-strategy indicator — latency-arb (B).
     pub strategy_latency_arb: core_metrics::GaugeId,
     /// Active-strategy indicator — ev (A).
-    pub strategy_ev: core_metrics::GaugeId,
+    pub strategy_vrp: core_metrics::GaugeId,
     /// Active-strategy indicator — cross-arb (C).
     pub strategy_cross_arb: core_metrics::GaugeId,
     /// Active-strategy indicator — rule-tree (D).
@@ -3260,6 +3293,8 @@ pub struct EngineCounters {
     pub vm: VmMetricIds,
     /// ICDP I4: the `engine_icdp_*_total` family (slot 6).
     pub icdp: IcdpMetricIds,
+    /// VRP V7: the `engine_vrp_*` family (slot 1).
+    pub vrp: VrpMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
 }
@@ -3590,6 +3625,142 @@ fn register_vm_metrics(
         rows_active,
         table_epoch,
     })
+}
+
+// ---------------------------------------------------------------
+// VRP V7 — slot-1 observability (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// Registry handles for the VRP family (`engine_vrp_*`), mirrored like
+/// the ICDP family through the `StrategyCounters` default accessor
+/// `vrp_counters` (zeros on every boot without a configured slot-1
+/// member).
+///
+/// The two QLIKE rows are GAUGES, not counters: they are trailing means,
+/// not accumulations, and `qlike_har_beats_iv` reading 0 on a full
+/// window is **kill criterion 3** — E1 has stopped holding and the
+/// member has no edge left to harvest. That is the one number on this
+/// dashboard an operator is expected to act on.
+#[derive(Copy, Clone, Debug)]
+pub struct VrpMetricIds {
+    /// `engine_vrp_decisions_total`
+    pub decisions: core_metrics::CounterId,
+    /// `engine_vrp_entries_total`
+    pub entries: core_metrics::CounterId,
+    /// `engine_vrp_hedges_total`
+    pub hedges: core_metrics::CounterId,
+    /// `engine_vrp_exits_total`
+    pub exits: core_metrics::CounterId,
+    /// `engine_vrp_holds_total`
+    pub holds: core_metrics::CounterId,
+    /// `engine_vrp_no_bounds_total`
+    pub no_bounds: core_metrics::CounterId,
+    /// `engine_vrp_stale_skips_total`
+    pub stale_skips: core_metrics::CounterId,
+    /// `engine_vrp_no_selection_total`
+    pub no_selection: core_metrics::CounterId,
+    /// `engine_vrp_regime_blocked_total`
+    pub regime_blocked: core_metrics::CounterId,
+    /// `engine_vrp_regime_exits_total`
+    pub regime_exits: core_metrics::CounterId,
+    /// `engine_vrp_settlements_total`
+    pub settlements: core_metrics::CounterId,
+    /// `engine_vrp_caps_rejected_total`
+    pub caps_rejected: core_metrics::CounterId,
+    /// `engine_vrp_killed` (gauge; kill criterion 3 has HALTED the
+    /// member — sticky until a restart)
+    pub killed: core_metrics::GaugeId,
+    /// `engine_vrp_qlike_iv_1e6` (gauge)
+    pub qlike_iv_1e6: core_metrics::GaugeId,
+    /// `engine_vrp_qlike_har_1e6` (gauge)
+    pub qlike_har_1e6: core_metrics::GaugeId,
+    /// `engine_vrp_qlike_har_beats_iv` (gauge; kill criterion 3)
+    pub qlike_har_beats_iv: core_metrics::GaugeId,
+}
+
+/// Register the VRP family. Boot-only.
+fn register_vrp_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<VrpMetricIds, &'static str> {
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name)
+            .map_err(|_| "register vrp counter")
+    };
+    let decisions = one("engine_vrp_decisions_total")?;
+    let entries = one("engine_vrp_entries_total")?;
+    let hedges = one("engine_vrp_hedges_total")?;
+    let exits = one("engine_vrp_exits_total")?;
+    let holds = one("engine_vrp_holds_total")?;
+    let no_bounds = one("engine_vrp_no_bounds_total")?;
+    let stale_skips = one("engine_vrp_stale_skips_total")?;
+    let no_selection = one("engine_vrp_no_selection_total")?;
+    let regime_blocked = one("engine_vrp_regime_blocked_total")?;
+    let regime_exits = one("engine_vrp_regime_exits_total")?;
+    let settlements = one("engine_vrp_settlements_total")?;
+    let caps_rejected = one("engine_vrp_caps_rejected_total")?;
+    let mut g = |name: &str| -> Result<core_metrics::GaugeId, &'static str> {
+        reg.register_gauge(name).map_err(|_| "register vrp gauge")
+    };
+    Ok(VrpMetricIds {
+        decisions,
+        entries,
+        hedges,
+        exits,
+        holds,
+        no_bounds,
+        stale_skips,
+        no_selection,
+        regime_blocked,
+        regime_exits,
+        settlements,
+        caps_rejected,
+        killed: g("engine_vrp_killed")?,
+        qlike_iv_1e6: g("engine_vrp_qlike_iv_1e6")?,
+        qlike_har_1e6: g("engine_vrp_qlike_har_1e6")?,
+        qlike_har_beats_iv: g("engine_vrp_qlike_har_beats_iv")?,
+    })
+}
+
+/// Mirror the VRP family as monotonic deltas of the cumulative strategy
+/// counters, plus the three QLIKE gauges as levels. 5 s cadence — cold
+/// path.
+fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &VrpMetricIds,
+    strat: &S,
+    last: &mut strategy_core::VrpCounters,
+) {
+    let cur = strat.vrp_counters();
+    reg.counter(ids.decisions)
+        .inc(cur.decisions.saturating_sub(last.decisions));
+    reg.counter(ids.entries)
+        .inc(cur.entries.saturating_sub(last.entries));
+    reg.counter(ids.hedges)
+        .inc(cur.hedges.saturating_sub(last.hedges));
+    reg.counter(ids.exits)
+        .inc(cur.exits.saturating_sub(last.exits));
+    reg.counter(ids.holds)
+        .inc(cur.holds.saturating_sub(last.holds));
+    reg.counter(ids.no_bounds)
+        .inc(cur.no_bounds.saturating_sub(last.no_bounds));
+    reg.counter(ids.stale_skips)
+        .inc(cur.stale_skips.saturating_sub(last.stale_skips));
+    reg.counter(ids.no_selection)
+        .inc(cur.no_selection.saturating_sub(last.no_selection));
+    reg.counter(ids.regime_blocked)
+        .inc(cur.regime_blocked.saturating_sub(last.regime_blocked));
+    reg.counter(ids.regime_exits)
+        .inc(cur.regime_exits.saturating_sub(last.regime_exits));
+    reg.counter(ids.settlements)
+        .inc(cur.settlements.saturating_sub(last.settlements));
+    reg.counter(ids.caps_rejected)
+        .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
+    reg.gauge(ids.killed).set(cur.killed as i64);
+    reg.gauge(ids.qlike_iv_1e6).set(cur.qlike_iv_1e6);
+    reg.gauge(ids.qlike_har_1e6).set(cur.qlike_har_1e6);
+    reg.gauge(ids.qlike_har_beats_iv)
+        .set(cur.qlike_har_beats_iv as i64);
+    *last = cur;
 }
 
 // ---------------------------------------------------------------
@@ -4423,6 +4594,7 @@ where
     let mut vm_last = VmCountersSnapshot::default();
     // ICDP I4 slot-6 family delta snapshot (same bookkeeping).
     let mut icdp_last = strategy_core::IcdpCounters::default();
+    let mut vrp_last = strategy_core::VrpCounters::default();
     let mut regime_last = strategy_core::RegimeCounters::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
@@ -4492,8 +4664,8 @@ where
                 let kind = strategy_core::StrategyCounters::strategy_kind(eng.strategy());
                 reg.gauge(ids.strategy_latency_arb)
                     .set(if kind == "latency-arb" { 1 } else { 0 });
-                reg.gauge(ids.strategy_ev)
-                    .set(if kind == "ev" { 1 } else { 0 });
+                reg.gauge(ids.strategy_vrp)
+                    .set(if kind == "vrp" { 1 } else { 0 });
                 reg.gauge(ids.strategy_cross_arb)
                     .set(if kind == "cross-arb" { 1 } else { 0 });
                 reg.gauge(ids.strategy_rule_tree)
@@ -4509,6 +4681,7 @@ where
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
+                mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
 
                 // Per-ingress connection state — real per-thread

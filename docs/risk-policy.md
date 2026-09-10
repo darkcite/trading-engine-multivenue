@@ -25,6 +25,33 @@ frozen-surface amendment with this ruling cited in the pin tests).
 | max single-order notional    | $10 000   | rule 7 + VM clamp + gates            |
 | max OOS drawdown (gate)      | $7 500    | `GateThresholds` (15% of book)       |
 
+**VRP V7 (2026-09-10) — slot 1 enforces the three notional lines in the
+member.** `strategy-vrp` is the second coded order-submission path after
+`strategy-icdp`, and it mirrors the same three caps as constants
+(`strategy_vrp::{CAP_LEG_1E6, CAP_SYM_1E6, CAP_TABLE_1E6}`). Two things
+are specific to it and are the reason it needed its own line here:
+
+* **It gates on the WORST case, not the current one.** The member's
+  hedge is sized off the option's delta, and delta walks to 1 as the
+  option goes in the money — so an entry is authorised only if the
+  position it commits to is still legal at Δ = 1. Refusing at the
+  decision is the only fail-closed choice: entering and clamping the
+  hedge later would leave a naked option position wearing a hedged
+  one's name. Refusals are counted (`engine_vrp_caps_rejected_total`).
+* **The measured size is not a legal size.** One Deribit inverse
+  contract is one whole coin of underlying exposure, so its worst-case
+  hedge is ~$79 000 at the measured index — eight times the
+  single-order cap. The edge spec reports bps of spot per trade, which
+  is scale-free, so the shipped `vrp.toml` size is **0.1 contracts**
+  (worst case $7 900), the largest tenth-of-a-contract step that fits.
+  `core_config::vrp` refuses a `qty_1e6` above one contract at boot, and
+  the runtime gate refuses the rest.
+
+A cap never blocks an EXIT: the member's unwind path and any hedge move
+that REDUCES the position are exempt, the same exemption
+`strategy-icdp`'s `exit_position` has. A cap that can stop a position
+being closed is not a risk control.
+
 Paper mode treats every fill as real for P&L accounting so the caps are
 exercised on the same code path that live mode will use. Statistical
 gates (OOS > 0, ≥ 50 trades, ≥ 1 trading day) are scale-independent.
@@ -87,6 +114,44 @@ open, stop ingesting rules) on any of the following:
 
 Halt is **sticky**: it requires a manual engine restart. No "auto-resume"
 logic is permitted — a halted engine means a human investigates.
+
+### Member-scoped halt: VRP kill criterion 3 (2026-09-10)
+
+`strategy-vrp` (slot 1) carries its own sticky halt, scoped to the
+member rather than the engine, because what dies is one mechanism and
+not the process:
+
+7. **The VRP forecast stops beating implied vol.** Over a FULL trailing
+   60 settled expiries, the member's own QLIKE is no longer below the
+   venue's implied-vol QLIKE ⇒ the member halts: no new entries, ever,
+   until a restart. Open campaigns still unwind through their normal
+   exit law — a halt must never strand a position.
+
+This is pre-registered kill criterion 3 of the edge spec: E1 (short-dated
+implied vol is beaten by a plain fitted HAR) is the entire mechanism the
+lane monetises, and a member that keeps selling premium without it is
+not running the strategy that was measured. Enforced in
+`strategy_vrp::VrpStrategy::refresh_qlike`; visible as
+`engine_vrp_killed` (gauge, 1 = halted) beside
+`engine_vrp_qlike_iv_1e6` / `engine_vrp_qlike_har_1e6`. The halt is
+armed only on a full window — a half-filled comparison is not evidence
+that a mechanism has died.
+
+> **Not yet enforceable — a V8 precondition, stated plainly.** The QLIKE
+> window lives in `core_vol::VolEngine` and is zeroed at construction;
+> the V5 boot seed restores the fitted `(x, y)` pairs but NOT the
+> window. With the standing restart cadence (`scripts/daily-restart.sh`,
+> five slots a day) and an 8 h campaign, sixty settlements cannot
+> accumulate inside one process, so trigger 7 **cannot arm as deployed
+> today** and its halt would in any case be cleared by the next
+> scheduled restart — which is the "auto-resume" the section above
+> forbids. Two things must land before the lane is enabled at V8: the
+> QLIKE window must persist across restarts (alongside the pair seed),
+> and `engine_vrp_killed` must carry an operator-facing alert so a halt
+> is seen rather than erased. The member-side code is written and tested
+> so that closing this is a seed change, not a strategy change. **Until
+> both land, kill criterion 3 is an operator obligation — read the two
+> QLIKE gauges — not an engine control.**
 
 ## Signing-key handling
 

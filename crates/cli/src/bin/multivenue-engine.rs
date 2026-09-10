@@ -403,6 +403,13 @@ struct RunArgs {
     /// exactly, refuses the boot.
     #[arg(long)]
     vrp_seed: Option<PathBuf>,
+    /// VRP V7: `vrp.toml` — the VRP member's parameter artifact
+    /// (`~/multivenue/vrp.toml` by default). ABSENT at the default
+    /// location = the member is not configured and its enable bit is
+    /// never set (the `icdp.toml` law); an explicit path that does not
+    /// exist, or any file that does not parse, refuses the boot.
+    #[arg(long)]
+    vrp: Option<PathBuf>,
     /// Cadence in seconds for periodic HdrHistogram dumps. `0`
     /// disables dumping (default). When >0, the engine writes the
     /// three latency histograms (ingest→strategy, strategy→submit,
@@ -2031,11 +2038,12 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        (name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp"), _live) => {
+        (name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp" | "vrp" | "ai+vrp"), _live) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // latency-arb from the mandatory pair flags, ev/cross-arb/
+            // latency-arb from the mandatory pair flags, cross-arb /
             // rule-tree only when their config flags are present,
+            // vrp only when `vrp.toml` resolves (VRP V7: slot 1),
             // ai-exec and vm unconditionally (neither has boot
             // config; items 8 / 8g-6) (members without config boot
             // inert; see engine_loop_set_full docs). `ai-exec` (item
@@ -2047,7 +2055,6 @@ fn run(args: RunArgs) -> ExitCode {
             // live arm.
             let requested =
                 strategy_set::mask_for_name(name).expect("matched names are valid mask names");
-            let ev_path = args.artifacts_path.clone();
             let owned_groups: Vec<Vec<core_types::SymbolId>> = match args.groups.as_deref() {
                 Some(spec) => spec
                     .split(';')
@@ -2104,20 +2111,28 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            // VRP V5: the member's boot seed. An ABSENT default file is
-            // legal — a cold boot must be, the engine restarts about
-            // three times a day — and the member simply holds. A file
-            // that is present and unreadable refuses the boot: a seed
-            // the engine cannot read exactly is a fit nobody measured.
-            let vrp_seed = match cli::vrp_boot::load_vrp_seed(args.vrp_seed.as_deref()) {
+            // VRP V7: the member's artifact, its chain table and its
+            // boot seed, all resolved against the same descriptor table
+            // (D-6 truth). An ABSENT default `vrp.toml` leaves the
+            // member unconfigured and its bit unset (the `icdp.toml`
+            // law); an ABSENT seed is legal too — a cold boot must be,
+            // the engine restarts about three times a day — and the
+            // member simply holds. A file that is PRESENT and
+            // unreadable refuses the boot in both cases: a seed the
+            // engine cannot read exactly is a fit nobody measured.
+            let vrp_boot = match cli::vrp_boot::load_vrp_boot(
+                args.vrp.as_deref(),
+                args.vrp_seed.as_deref(),
+                &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                &discovery.deribit_options,
+            ) {
                 Ok(v) => v,
                 Err(reason) => {
-                    error!(reason, "vrp: seed refused — boot aborted");
+                    error!(reason, "vrp: artifact refused — boot aborted");
                     join_reverse(handles);
                     return ExitCode::from(1);
                 }
             };
-            info!("{}", cli::vrp_boot::render_seed_tell(vrp_seed.as_ref()));
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
@@ -2131,7 +2146,7 @@ fn run(args: RunArgs) -> ExitCode {
                 clob_dispatcher::PaperDispatcher::new(),
                 obs,
                 requested,
-                ev_path.as_deref(),
+                vrp_boot.as_ref(),
                 &groups_ref,
                 rules,
                 icdp_params.as_ref(),

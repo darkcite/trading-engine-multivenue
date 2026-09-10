@@ -557,6 +557,13 @@ pub struct VrpCounters {
     pub regime_exits: u64,
     /// Settled expiries folded back into the forecast.
     pub settlements: u64,
+    /// Entries refused by a `docs/risk-policy.md` notional cap.
+    pub caps_rejected: u64,
+    /// `1` once kill criterion 3 has HALTED the member: a full
+    /// trailing-60 window in which the forecast no longer beat implied
+    /// vol. Sticky — it takes a restart to clear, exactly like the
+    /// engine's own halt.
+    pub killed: u64,
     /// Kill criterion 3 (edge spec §5.3): trailing-60 mean QLIKE of the
     /// venue's implied vol, ×1e6. Lower is better.
     pub qlike_iv_1e6: i64,

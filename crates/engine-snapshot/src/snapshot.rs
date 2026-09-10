@@ -36,9 +36,13 @@ pub const BOOT_TEXT_MAX: usize = 48;
 pub const RUN_DIR_MAX: usize = 160;
 
 /// Slot → member name (the `strategy-set` slot map).
+/// **Slot 1 changed meaning on 2026-09-10 (VRP V7)**: the NUMBER is
+/// wire-stable, the member behind it went from `strategy-ev` to
+/// `strategy-vrp`. A snapshot taken before that date names an EV member
+/// under this slot; `docs/migration.md` records the boundary.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "latency-arb",
-    "ev",
+    "vrp",
     "cross-arb",
     "rule-tree",
     "ai-exec",

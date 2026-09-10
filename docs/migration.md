@@ -6,6 +6,70 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — **strategy slot 1 changes meaning: `ev` → `vrp`** (VRP V7)
+
+**What changed**
+- `crates/strategy-set` drops `strategy-ev` and composes
+  `strategy-vrp` at slot 1. The slot NUMBER is unchanged and wire-stable:
+  `Order.strategy_id` 1, `AiCmd::strategy_id` 1 and the enable bit
+  `1 << 1 = 2` all mean exactly what they meant. **What changed is the
+  member behind the number.**
+- `mask_for_name`: `"ev"` is GONE (returns `None`); `"vrp"` = 2 and
+  `"ai+vrp"` = 50 are new. `"all"` is unchanged at 127 and now composes
+  vrp. `SLOT_VRP` / `BIT_VRP` are the primary constant names;
+  `SLOT_EV` / `BIT_EV` remain as identical-valued aliases for readers of
+  pre-boundary captures.
+- New flag `--vrp <path>` on `run`. An ABSENT `~/multivenue/vrp.toml`
+  leaves the member unconfigured and its bit unset — the `icdp.toml` law.
+  `scripts/engine-wrapper.sh` accepts `STRATEGY=ai+vrp` and
+  `STRATEGY=vrp` (still `--paper`, never `--live`).
+- New metric family `engine_vrp_*` (11 counters + 4 gauges). The gauge
+  `engine_strategy_ev_active` is **renamed** `engine_strategy_vrp_active`.
+- `regime.toml`: the coded-member label key is now `[labels.vrp]`.
+  **`[labels.ev]` refuses the boot** ("unknown coded member") rather than
+  silently gating a different strategy with a label that was evidenced
+  for the old one.
+- Slot-1 display names follow: `audit-pnl`'s `strategy_label(1)` and
+  `engine_snapshot::SLOT_NAMES[1]` both read `vrp`.
+- **`crates/strategy-ev` stays**: workspace member, source, tests, and
+  the standalone `--strategy ev` engine loop. Only the SET stopped
+  referencing it.
+
+**Why**
+Operator ruling O-D2. The EV member was never enabled in the composed
+mask and the VRP lane needed a slot; reusing the number keeps every wire
+value and capture format stable while the member behind it changes.
+
+**Ripple effects — the boundary**
+- **A capture taken BEFORE 2026-09-10 carries EV rows under slot 1; one
+  taken after carries VRP rows.** There is no way to tell from a row
+  itself — the `strategy_id` byte is the same. That is exactly why this
+  entry exists. `audit-pnl` labels every slot-1 row `vrp`, so a
+  pre-boundary root's report names a member that did not produce it.
+- Any dashboard panel or alert on `engine_strategy_ev_active` must move
+  to `engine_strategy_vrp_active`.
+- Any `~/multivenue/regime.toml` carrying `[labels.ev]` must be renamed
+  to `[labels.vrp]` before the next boot, or the boot refuses. Under
+  `[labels] require = 1` slot 1 still needs a label.
+
+**Risk policy**
+`docs/risk-policy.md` is updated in this same change: the three notional
+caps now name `strategy-vrp` as an enforcement site (it gates on the
+worst-case Δ = 1 hedge, refusing the entry rather than clamping the
+hedge), and **kill criterion 3 is added to the kill-switch triggers** as
+a member-scoped sticky halt — the VRP member stops entering for good
+once a full trailing-60 window shows its forecast no longer beating
+implied vol. The shipped `vrp.toml` size is 0.1 contracts, not the edge
+spec's nominal 1.0: one contract's worst-case hedge is eight times the
+$10 000 single-order cap.
+
+**Operator action**
+- Before the next boot with the VRP lane on: rename `[labels.ev]` →
+  `[labels.vrp]` in `~/multivenue/regime.toml` if it exists.
+- Repoint any `engine_strategy_ev_active` dashboard panel.
+- Nothing else. Slot 1 has never been enabled in a live mask, so no
+  running configuration changes until the V8 operator gate.
+
 ## 2026-09-10 — new crate `strategy-vrp` (VRP V6)
 
 **What changed**

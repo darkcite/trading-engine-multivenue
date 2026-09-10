@@ -88,7 +88,7 @@ fund_p70_1e9 = 0
 require = 1
 
 # ---- optional overrides of the coded members' regime labels (§4.2) ----
-# One `[labels.<member>]` table per coded member (latency_arb, ev,
+# One `[labels.<member>]` table per coded member (latency_arb, vrp,
 # cross_arb, rule_tree, ai_exec, icdp): `off = "soft" | "hard"` and up to
 # four product terms `term1..term4`, each a list of label strings in the
 # §3.3 grammar `[fast:|slow:]dim:(*|!v|v1|v2…)` (∃-semantics across

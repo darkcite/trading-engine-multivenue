@@ -47,7 +47,12 @@ pub struct ResolvedRegime {
 fn coded_member_slot(name: &str) -> Option<u8> {
     Some(match name {
         "latency_arb" => strategy_set::SLOT_LATENCY_ARB,
-        "ev" => strategy_set::SLOT_EV,
+        // VRP V7: slot 1 is the VRP member. `ev` is deliberately GONE:
+        // a label evidenced for the EV member must not silently gate a
+        // different strategy, so an old `regime.toml` carrying
+        // `[labels.ev]` refuses the boot with "unknown coded member"
+        // rather than applying to the VRP member.
+        "vrp" => strategy_set::SLOT_VRP,
         "cross_arb" => strategy_set::SLOT_CROSS_ARB,
         "rule_tree" => strategy_set::SLOT_RULE_TREE,
         "ai_exec" => strategy_set::SLOT_AI_EXEC,

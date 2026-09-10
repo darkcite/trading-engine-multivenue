@@ -120,7 +120,7 @@ use opt_registry::{OptInstrument, OptRegistry};
 /// chains (`BTC_USDC-10SEP26-79000-C`), which are quoted differently and
 /// do NOT carry this contract size. An instrument that would break the
 /// assumption cannot enter the registry in the first place.
-pub const DERIBIT_OPT_CONTRACT_SIZE_1E9: i64 = 1_000_000_000;
+pub use opt_registry::DERIBIT_OPT_CONTRACT_SIZE_1E9;
 
 /// Why a captured option summary produced no synthetic mark tick.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

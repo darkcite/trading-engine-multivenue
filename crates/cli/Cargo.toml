@@ -41,6 +41,7 @@ strategy-set         = { workspace = true }
 # 8h backtest harness (cli::backtest): drives the real ruleset VM
 # offline and hashes the candidate artifact exactly like the worker.
 strategy-vm          = { workspace = true }
+strategy-vrp         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }

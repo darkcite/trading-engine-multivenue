@@ -17,8 +17,8 @@
 //! epsilon_ns            = 300000000000     # exit this long before expiry
 //! selection_ns          = 600000000000     # pick the strike this long before E−τ
 //! rebalance_ns          = 3600000000000    # hedge check cadence (hourly)
-//! qty_1e6               = 1000000          # one contract
-//! band_qty_1e6          = 50000            # hedge rebalance band
+//! qty_1e6               = 100000           # 0.1 contracts (see the size note)
+//! band_qty_1e6          = 5000             # hedge rebalance band
 //! underlying_descriptor = "deribit:BTC-PERPETUAL"
 //! hedge_descriptor      = "deribit:BTC-PERPETUAL"
 //! ```
@@ -36,6 +36,14 @@
 use std::path::Path;
 
 use super::icdp::{parse_int, parse_value, strip_comment, IcdpError, Value};
+
+/// Hard ceiling on `qty_1e6`: one contract ×1e6. A contract is one
+/// whole coin of underlying exposure, so this is not the risk limit —
+/// `strategy-vrp` refuses an entry whose worst-case hedge breaches
+/// `docs/risk-policy.md`, and at a realistic index even one contract
+/// does. This exists so a typed extra zero is caught at boot rather
+/// than silently at every decision.
+pub const VRP_QTY_MAX_1E6: i64 = 1_000_000;
 
 /// Parse / load failure. Reuses [`IcdpError`]'s shape so the two
 /// artifacts report identically; the message names the file.
@@ -203,9 +211,12 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
             file.rebalance_ns, file.tau_ns
         )));
     }
-    if file.qty_1e6 <= 0 {
+    if file.qty_1e6 <= 0 || file.qty_1e6 > VRP_QTY_MAX_1E6 {
         return Err(err(format!(
-            "`qty_1e6` must be > 0 (got {})",
+            "`qty_1e6` must be in 1..={VRP_QTY_MAX_1E6} (got {}) — one contract is one \
+             whole coin of underlying exposure, and the binding limit is the runtime \
+             notional cap, which refuses an entry whose worst-case (delta = 1) hedge \
+             would breach `docs/risk-policy.md`",
             file.qty_1e6
         )));
     }
@@ -295,8 +306,8 @@ tau_ns                = 28800000000000
 epsilon_ns            = 300000000000
 selection_ns          = 600000000000
 rebalance_ns          = 3600000000000
-qty_1e6               = 1000000
-band_qty_1e6          = 50000
+qty_1e6               = 100000
+band_qty_1e6          = 5000
 underlying_descriptor = \"deribit:BTC-PERPETUAL\"
 hedge_descriptor      = \"deribit:BTC-PERPETUAL\"
 ";
@@ -306,8 +317,8 @@ hedge_descriptor      = \"deribit:BTC-PERPETUAL\"
         let f = parse(GOOD).expect("parses");
         assert_eq!(f.theta_1e9, 100_000_000);
         assert_eq!(f.tau_ns, 28_800_000_000_000);
-        assert_eq!(f.qty_1e6, 1_000_000);
-        assert_eq!(f.band_qty_1e6, 50_000);
+        assert_eq!(f.qty_1e6, 100_000);
+        assert_eq!(f.band_qty_1e6, 5_000);
         assert_eq!(f.hedge_descriptor, "deribit:BTC-PERPETUAL");
     }
 
@@ -349,14 +360,20 @@ hedge_descriptor      = \"deribit:BTC-PERPETUAL\"
     #[test]
     fn nonsense_values_are_fatal() {
         assert!(parse(&GOOD.replace("theta_1e9             = 100000000", "theta_1e9             = 0")).is_err());
-        assert!(parse(&GOOD.replace("qty_1e6               = 1000000", "qty_1e6               = 0")).is_err());
-        assert!(parse(&GOOD.replace("band_qty_1e6          = 50000", "band_qty_1e6          = 0")).is_err());
+        assert!(parse(&GOOD.replace("qty_1e6               = 100000", "qty_1e6               = 0")).is_err());
+        // A typed extra zero is caught at boot, not at every decision.
+        assert!(
+            parse(&GOOD.replace("qty_1e6               = 100000", "qty_1e6               = 10000000"))
+                .is_err(),
+            "10 contracts is a typo, not a size"
+        );
+        assert!(parse(&GOOD.replace("band_qty_1e6          = 5000", "band_qty_1e6          = 0")).is_err());
         // ε ≥ τ would exit before it entered.
         assert!(parse(&GOOD.replace("epsilon_ns            = 300000000000", "epsilon_ns            = 28800000000000")).is_err());
         // A rebalance cadence longer than the hold never fires.
         assert!(parse(&GOOD.replace("rebalance_ns          = 3600000000000", "rebalance_ns          = 99800000000000")).is_err());
         // A missing key is fatal, not defaulted.
-        assert!(parse(&GOOD.replace("qty_1e6               = 1000000\n", "")).is_err());
+        assert!(parse(&GOOD.replace("qty_1e6               = 100000\n", "")).is_err());
     }
 
     #[test]

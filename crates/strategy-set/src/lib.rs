@@ -17,7 +17,7 @@
 //! | slot | member | status |
 //! |---|---|---|
 //! | 0 | `strategy-latency-arb` | built |
-//! | 1 | `strategy-ev` | built |
+//! | 1 | `strategy-vrp` | built (VRP V7, 2026-09-10 — **was `strategy-ev`**) |
 //! | 2 | `strategy-cross-arb` | built |
 //! | 3 | `strategy-rule-tree` | built |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
@@ -98,7 +98,7 @@ use strategy_core::{
 // into the trait's POD — the two capacities must agree.
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
 use strategy_cross_arb::CrossArb;
-use strategy_ev::EvStrategy;
+use strategy_vrp::VrpStrategy;
 use strategy_icdp::IcdpStrategy;
 use strategy_latency_arb::LatencyArb;
 use strategy_rule_tree::RuleTree;
@@ -110,8 +110,17 @@ use strategy_vm::VmStrategy;
 
 /// Slot index of the latency-arb member.
 pub const SLOT_LATENCY_ARB: u8 = 0;
-/// Slot index of the ev member.
-pub const SLOT_EV: u8 = 1;
+/// Slot index of the VRP member.
+///
+/// **The swap boundary.** Slot 1 was `strategy-ev` until 2026-09-10
+/// (VRP V7). The NUMBER is wire-stable — `Order.strategy_id` 1 and
+/// `AiCmd::strategy_id` 1 still mean "slot 1" — so a capture taken
+/// before that date carries EV rows under this slot and one taken after
+/// carries VRP rows. `docs/migration.md` records the boundary.
+pub const SLOT_VRP: u8 = 1;
+/// Slot 1 under its pre-2026-09-10 name, for readers of pre-boundary
+/// captures and configs. Identical value.
+pub const SLOT_EV: u8 = SLOT_VRP;
 /// Slot index of the cross-arb member.
 pub const SLOT_CROSS_ARB: u8 = 2;
 /// Slot index of the rule-tree member.
@@ -128,8 +137,10 @@ pub const SLOT_ICDP: u8 = 6;
 
 /// Enable-mask bit for the latency-arb member.
 pub const BIT_LATENCY_ARB: u8 = 1 << SLOT_LATENCY_ARB;
-/// Enable-mask bit for the ev member.
-pub const BIT_EV: u8 = 1 << SLOT_EV;
+/// Enable-mask bit for the VRP member (slot 1 — see [`SLOT_VRP`]).
+pub const BIT_VRP: u8 = 1 << SLOT_VRP;
+/// Slot 1's bit under its pre-2026-09-10 name. Identical value.
+pub const BIT_EV: u8 = BIT_VRP;
 /// Enable-mask bit for the cross-arb member.
 pub const BIT_CROSS_ARB: u8 = 1 << SLOT_CROSS_ARB;
 /// Enable-mask bit for the rule-tree member.
@@ -143,12 +154,10 @@ pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
 
 /// Every built member's bit (slots 0–6).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_EV | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_LATENCY_ARB | BIT_VRP | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
 
 /// Latency-arb slot capacity inside the set (design §7 sketch).
 pub const SET_LATENCY_ARB_SLOTS: usize = 64;
-/// Ev slot capacity inside the set (design §7 sketch).
-pub const SET_EV_SLOTS: usize = 8;
 /// Cross-arb group capacity inside the set.
 pub const SET_CROSS_ARB_GROUPS: usize = 8;
 /// Cross-arb per-group member capacity inside the set.
@@ -169,7 +178,6 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 pub fn mask_for_name(name: &str) -> Option<u8> {
     match name {
         "latency-arb" => Some(BIT_LATENCY_ARB),
-        "ev" => Some(BIT_EV),
         "cross-arb" => Some(BIT_CROSS_ARB),
         "rule-tree" => Some(BIT_RULE_TREE),
         "ai-exec" => Some(BIT_AI_EXEC),
@@ -183,6 +191,11 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
         // `--paper`); `icdp` alone boots it bare.
         "icdp" => Some(BIT_ICDP),
         "ai+icdp" => Some(BIT_AI_EXEC | BIT_VM | BIT_ICDP),
+        // VRP V7: slot 1 is the VRP member. `ev` is GONE as a name —
+        // an operator who types it must get a boot refusal, not a
+        // different strategy than the one they asked for.
+        "vrp" => Some(BIT_VRP),
+        "ai+vrp" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP),
         "all" => Some(BUILT_MASK),
         _ => None,
     }
@@ -196,7 +209,7 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
 /// map, routing and boot semantics.
 pub struct StrategySet {
     latency_arb: LatencyArb<SET_LATENCY_ARB_SLOTS>,
-    ev: EvStrategy<SET_EV_SLOTS>,
+    vrp: VrpStrategy,
     cross_arb: CrossArb<SET_CROSS_ARB_GROUPS, SET_CROSS_ARB_MEMBERS>,
     rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
@@ -244,7 +257,7 @@ impl StrategySet {
         let m = initial_mask & BUILT_MASK;
         Self {
             latency_arb: LatencyArb::new(),
-            ev: EvStrategy::new(),
+            vrp: VrpStrategy::new(),
             cross_arb: CrossArb::new(),
             rule_tree: RuleTree::new(),
             ai_exec: AiExec::new(),
@@ -299,7 +312,7 @@ impl StrategySet {
     pub fn set_regime_label(&mut self, slot: u8, set: RegimeLabelSet) -> bool {
         let ok = match slot {
             SLOT_LATENCY_ARB => self.latency_arb.set_regime_label(set),
-            SLOT_EV => self.ev.set_regime_label(set),
+            SLOT_VRP => self.vrp.set_regime_label(set),
             SLOT_CROSS_ARB => self.cross_arb.set_regime_label(set),
             SLOT_RULE_TREE => self.rule_tree.set_regime_label(set),
             SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
@@ -340,7 +353,7 @@ impl StrategySet {
 
     fn pull_regime_labels(&mut self) {
         self.regime_labels[SLOT_LATENCY_ARB as usize] = self.latency_arb.regime_label();
-        self.regime_labels[SLOT_EV as usize] = self.ev.regime_label();
+        self.regime_labels[SLOT_VRP as usize] = self.vrp.regime_label();
         self.regime_labels[SLOT_CROSS_ARB as usize] = self.cross_arb.regime_label();
         self.regime_labels[SLOT_RULE_TREE as usize] = self.rule_tree.regime_label();
         self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
@@ -409,9 +422,9 @@ impl StrategySet {
             SLOT_LATENCY_ARB => self
                 .latency_arb
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB)),
-            SLOT_EV => self
-                .ev
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_EV)),
+            SLOT_VRP => self
+                .vrp
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
             SLOT_CROSS_ARB => self
                 .cross_arb
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB)),
@@ -456,10 +469,16 @@ impl StrategySet {
         &mut self.latency_arb
     }
 
-    /// Configure the ev member (boot-only).
+    /// Configure the VRP member (boot-only).
     #[inline]
-    pub fn ev_mut(&mut self) -> &mut EvStrategy<SET_EV_SLOTS> {
-        &mut self.ev
+    pub fn vrp_mut(&mut self) -> &mut VrpStrategy {
+        &mut self.vrp
+    }
+
+    /// The VRP member (cli: the boot tell's artifact hash).
+    #[inline]
+    pub fn vrp(&self) -> &VrpStrategy {
+        &self.vrp
     }
 
     /// Configure the cross-arb member (boot-only).
@@ -518,7 +537,7 @@ impl StrategySet {
         }
         let bit = match slot {
             SLOT_LATENCY_ARB => BIT_LATENCY_ARB,
-            SLOT_EV => BIT_EV,
+            SLOT_VRP => BIT_VRP,
             SLOT_CROSS_ARB => BIT_CROSS_ARB,
             SLOT_RULE_TREE => BIT_RULE_TREE,
             SLOT_AI_EXEC => BIT_AI_EXEC,
@@ -559,7 +578,7 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn orders_emitted(&self) -> u64 {
         self.latency_arb.orders_emitted()
-            + self.ev.orders_emitted()
+            + self.vrp.orders_emitted()
             + self.cross_arb.orders_emitted()
             + self.rule_tree.orders_emitted()
             + self.ai_exec.orders_emitted()
@@ -569,7 +588,7 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn orders_dropped(&self) -> u64 {
         self.latency_arb.orders_dropped()
-            + self.ev.orders_dropped()
+            + self.vrp.orders_dropped()
             + self.cross_arb.orders_dropped()
             + self.rule_tree.orders_dropped()
             + self.ai_exec.orders_dropped()
@@ -635,6 +654,11 @@ impl StrategyCounters for StrategySet {
     fn icdp_counters(&self) -> strategy_core::IcdpCounters {
         self.icdp.icdp_counters()
     }
+    /// VRP V7: slot 1's observables.
+    #[inline]
+    fn vrp_counters(&self) -> strategy_core::VrpCounters {
+        self.vrp.vrp_counters()
+    }
     /// RG2: the detector's observables + per-slot gates.
     fn regime_counters(&self) -> RegimeCounters {
         let mut c = RegimeCounters::default();
@@ -691,7 +715,7 @@ impl StrategyCounters for StrategySet {
                 self.latency_arb.orders_emitted(),
                 self.latency_arb.orders_dropped(),
             ),
-            SLOT_EV => (self.ev.orders_emitted(), self.ev.orders_dropped()),
+            SLOT_VRP => (self.vrp.orders_emitted(), self.vrp.orders_dropped()),
             SLOT_CROSS_ARB => (
                 self.cross_arb.orders_emitted(),
                 self.cross_arb.orders_dropped(),
@@ -786,8 +810,8 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_start(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB))?;
         }
-        if self.initial & BIT_EV != 0 {
-            self.ev.on_start(&mut StampCtx::new(&mut *ctx, SLOT_EV))?;
+        if self.initial & BIT_VRP != 0 {
+            self.vrp.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VRP))?;
         }
         if self.initial & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -820,9 +844,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -852,9 +876,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -897,9 +921,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -931,9 +955,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -965,9 +989,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -997,9 +1021,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -1075,8 +1099,8 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -1128,9 +1152,9 @@ impl Strategy for StrategySet {
             self.latency_arb
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         }
-        if self.enabled & BIT_EV != 0 {
-            self.ev
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_EV));
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
         if self.enabled & BIT_CROSS_ARB != 0 {
             self.cross_arb
@@ -1169,7 +1193,7 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
-        let v = self.ev.timer_period_ns();
+        let v = self.vrp.timer_period_ns();
         if v < min {
             min = v;
         }
@@ -1202,7 +1226,7 @@ impl Strategy for StrategySet {
         // day; today all six are no-ops).
         self.latency_arb
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
-        self.ev.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_EV));
+        self.vrp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VRP));
         self.cross_arb
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         self.rule_tree
@@ -1305,13 +1329,24 @@ mod tests {
     #[test]
     fn initial_mask_from_names() {
         assert_eq!(mask_for_name("latency-arb"), Some(BIT_LATENCY_ARB));
-        assert_eq!(mask_for_name("ev"), Some(BIT_EV));
+        // VRP V7: slot 1 is the VRP member and `ev` is gone as a NAME.
+        // An operator who types the old one gets a boot refusal rather
+        // than a different strategy than the one they asked for.
+        assert_eq!(mask_for_name("ev"), None);
+        assert_eq!(mask_for_name("vrp"), Some(BIT_VRP));
+        assert_eq!(mask_for_name("vrp"), Some(2), "the slot NUMBER is wire-stable");
+        assert_eq!(
+            mask_for_name("ai+vrp"),
+            Some(BIT_AI_EXEC | BIT_VM | BIT_VRP)
+        );
+        assert_eq!(mask_for_name("ai+vrp"), Some(50));
         assert_eq!(mask_for_name("cross-arb"), Some(BIT_CROSS_ARB));
         assert_eq!(mask_for_name("rule-tree"), Some(BIT_RULE_TREE));
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
+        assert_eq!(mask_for_name("all"), Some(127), "every built slot 0..=6");
         // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
         // (operator ruling 2026-09-02).
         const _: () = assert!(
@@ -1484,7 +1519,7 @@ mod tests {
         assert_eq!(s.enabled_mask(), 0, "enable refused while halted");
         assert_eq!(s.enable_refused_total(), 1);
         assert_eq!(StrategyCounters::ai_enable_refused(&s), 1);
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_EV), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_VRP), &mut c);
         assert_eq!(s.enable_refused_total(), 2);
     }
 

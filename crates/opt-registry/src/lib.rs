@@ -404,6 +404,16 @@ impl OptRegistry {
     }
 }
 
+/// Deribit's BTC and ETH option contract size ×1e9: **1.0 coin**.
+///
+/// This is not an assumption a caller has to check. Deribit's only
+/// options with a different size are the USDC-LINEAR chains, and
+/// [`name::parse_deribit_descriptor`] refuses those names outright — so
+/// any descriptor that parses into an [`OptInstrument`] is a 1.0-coin
+/// inverse option. Both the harness (which sees only an instrument name
+/// in `instrument-manifest.tsv`) and the live boot path use it.
+pub const DERIBIT_OPT_CONTRACT_SIZE_1E9: i64 = 1_000_000_000;
+
 // ---------------------------------------------------------------
 // The denomination law (VRP V2a, relocated here at V6)
 // ---------------------------------------------------------------

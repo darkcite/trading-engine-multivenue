@@ -26,6 +26,8 @@
 
 use std::path::{Path, PathBuf};
 
+use core_types::SymbolId;
+use opt_registry::{OptInstrument, OptRegistry, DERIBIT_OPT_CONTRACT_SIZE_1E9};
 use tracing::{info, warn};
 
 /// A loaded seed: the pairs in file order plus where they came from.
@@ -98,6 +100,145 @@ pub fn load_vrp_seed(seed_path: Option<&Path>) -> Result<Option<VrpSeed>, String
         );
     }
     Ok(Some(seed))
+}
+
+
+// ---------------------------------------------------------------
+// The boot bundle (VRP V7)
+// ---------------------------------------------------------------
+
+/// Everything the member needs to be configured, resolved against the
+/// live boot universe.
+pub struct VrpBoot {
+    /// Parameters translated out of `vrp.toml`.
+    pub params: strategy_vrp::VrpParams,
+    /// The boot-built option table for the selected chain.
+    pub registry: OptRegistry,
+    /// Seed pairs in file order (may be empty — a cold boot is legal).
+    pub seed: Vec<(u64, i64, i64)>,
+    /// Where the seed came from, for the boot tell. The default path
+    /// even when nothing was there — "no pairs, from here" is the tell
+    /// an operator needs to fix a cold boot.
+    pub seed_path: PathBuf,
+    /// Resolved `underlying_descriptor`.
+    pub underlying_sym: SymbolId,
+    /// Resolved `hedge_descriptor`.
+    pub hedge_sym: SymbolId,
+    /// SHA-256 of the exact `vrp.toml` bytes.
+    pub hash: [u8; 32],
+    /// Chain rows the parser refused (a non-inverse name, or a name it
+    /// does not recognise). Counted, never guessed at.
+    pub rows_refused: usize,
+}
+
+/// Build the option table for the live chain.
+///
+/// `deribit_options` is boot discovery's `(instrument_name, sym)` list
+/// in allocation order. Contract size is
+/// [`DERIBIT_OPT_CONTRACT_SIZE_1E9`], and that is a PROOF rather than an
+/// assumption: the only Deribit options with a different size are the
+/// USDC-LINEAR chains, whose names the descriptor parser refuses — so a
+/// row that lands in this table is a 1.0-coin inverse option by
+/// construction. A name that does not parse is counted, not guessed.
+pub fn build_registry(
+    deribit_options: &[(String, SymbolId)],
+    hedge_sym: SymbolId,
+) -> (OptRegistry, usize) {
+    let mut reg = OptRegistry::new();
+    let mut refused = 0usize;
+    for (name, sym) in deribit_options {
+        let Some(row) = OptInstrument::from_descriptor(
+            *sym,
+            hedge_sym,
+            core_types::VenueId::Deribit as u8,
+            name.as_bytes(),
+            DERIBIT_OPT_CONTRACT_SIZE_1E9,
+        ) else {
+            refused += 1;
+            continue;
+        };
+        if reg.insert(row).is_err() {
+            refused += 1;
+        }
+    }
+    (reg, refused)
+}
+
+/// Resolve the whole VRP boot: `vrp.toml`, its descriptors, the chain
+/// table and the seed.
+///
+/// * `Some(path)` — an EXPLICIT `--vrp`: every failure refuses the boot.
+/// * `None` — the default location. An ABSENT file yields `Ok(None)`:
+///   the member simply is not configured, exactly as `icdp.toml` works,
+///   and the cli then never sets its enable bit. A file that is present
+///   and invalid still refuses the boot.
+pub fn load_vrp_boot(
+    path: Option<&Path>,
+    seed_path: Option<&Path>,
+    resolve: &dyn Fn(&str) -> Option<SymbolId>,
+    deribit_options: &[(String, SymbolId)],
+) -> Result<Option<VrpBoot>, String> {
+    let (path, explicit): (PathBuf, bool) = match path {
+        Some(p) => (p.to_path_buf(), true),
+        None => {
+            let d = core_config::vrp::default_vrp_path().map_err(|e| e.to_string())?;
+            (PathBuf::from(d), false)
+        }
+    };
+    if !path.exists() {
+        if explicit {
+            return Err(format!("vrp: {} does not exist", path.display()));
+        }
+        info!(path = %path.display(), "vrp: artifact absent — the member is not configured");
+        return Ok(None);
+    }
+    let (file, bytes) = core_config::vrp::load(&path).map_err(|e| e.to_string())?;
+    let underlying_sym = resolve(&file.underlying_descriptor).ok_or_else(|| {
+        format!(
+            "vrp: `{}` is not in the boot universe",
+            file.underlying_descriptor
+        )
+    })?;
+    let hedge_sym = resolve(&file.hedge_descriptor)
+        .ok_or_else(|| format!("vrp: `{}` is not in the boot universe", file.hedge_descriptor))?;
+    let (registry, rows_refused) = build_registry(deribit_options, hedge_sym);
+    if registry.is_empty() {
+        return Err(format!(
+            "vrp: the options chain is empty ({} of {} rows refused) — the member \
+             cannot select an instrument",
+            rows_refused,
+            deribit_options.len()
+        ));
+    }
+    let loaded = load_vrp_seed(seed_path)?;
+    let seed_path_used = match loaded.as_ref() {
+        Some(s) => s.path.clone(),
+        None => match seed_path {
+            Some(p) => p.to_path_buf(),
+            None => PathBuf::from(
+                core_config::vrp::default_seed_path().map_err(|e| e.to_string())?,
+            ),
+        },
+    };
+    let seed = loaded.map(|s| s.rows).unwrap_or_default();
+    Ok(Some(VrpBoot {
+        params: strategy_vrp::VrpParams {
+            theta_1e9: file.theta_1e9,
+            tau_ns: file.tau_ns,
+            epsilon_ns: file.epsilon_ns,
+            selection_ns: file.selection_ns,
+            rebalance_ns: file.rebalance_ns,
+            qty_1e6: file.qty_1e6,
+            band_qty_1e6: file.band_qty_1e6,
+        },
+        registry,
+        seed,
+        seed_path: seed_path_used,
+        underlying_sym,
+        hedge_sym,
+        hash: core_crypto::sha256(&bytes),
+        rows_refused,
+    }))
 }
 
 /// The one-line tell, rendered identically wherever it is printed.

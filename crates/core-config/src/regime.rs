@@ -138,9 +138,15 @@ const PROFILE_KEYS: [&str; 22] = [
     "stretch_exit_k_1e9",
 ];
 
+/// The coded members a `[labels.<member>]` section may name.
+///
+/// **VRP V7 (2026-09-10): slot 1 is `vrp`, and `ev` is GONE from this
+/// list on purpose.** Keeping both would let a label evidenced for the
+/// EV member silently gate a different strategy; `docs/migration.md`
+/// records the boundary and the operator action (rename the section).
 const MEMBER_NAMES: [&str; 6] = [
     "latency_arb",
-    "ev",
+    "vrp",
     "cross_arb",
     "rule_tree",
     "ai_exec",
@@ -679,6 +685,23 @@ mod tests {
             Err(e) => assert!(e.0.contains(needle), "got `{}`, wanted `{needle}`", e.0),
             Ok(_) => panic!("expected an error containing `{needle}`"),
         }
+    }
+
+    /// VRP V7: slot 1's label section is `[labels.vrp]`, and
+    /// `[labels.ev]` is refused HERE, at the grammar, not one layer
+    /// later — a label evidenced for the EV member must never gate a
+    /// different strategy, and `[labels] require = 1` needs a spelling
+    /// that works.
+    #[test]
+    fn slot_one_is_labelled_vrp_and_ev_is_refused() {
+        let with = |member: &str| {
+            format!("{EXAMPLE}\n[labels.{member}]\noff = \"soft\"\nterm1 = [\"fast:shape:trend\"]\n")
+        };
+        let ok = parse(&with("vrp")).expect("[labels.vrp] must parse");
+        assert_eq!(ok.labels.len(), 1);
+        assert_eq!(ok.labels[0].member, "vrp");
+        let err = parse(&with("ev")).expect_err("[labels.ev] must be refused");
+        assert!(err.0.contains("unknown coded member"), "{}", err.0);
     }
 
     #[test]

@@ -349,6 +349,7 @@ dependencies = [
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
+ "strategy-vrp",
  "tracing",
  "tracing-subscriber",
  "tui",
@@ -1841,11 +1842,11 @@ dependencies = [
  "strategy-ai-exec",
  "strategy-core",
  "strategy-cross-arb",
- "strategy-ev",
  "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-vm",
+ "strategy-vrp",
 ]
 
 [[package]]

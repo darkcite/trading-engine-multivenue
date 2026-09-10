@@ -87,6 +87,8 @@
 //! | sym not in the registry | record ignored | — |
 //! | regime gate closed | no entry | `regime_blocked` |
 //! | regime gate HARD closed | flatten now | `regime_exits` |
+//! | an entry (or a growing hedge) over a risk-policy cap | refused | `caps_rejected` |
+//! | kill criterion 3: a full trailing-60 window where the forecast stopped beating IV | HALT for the life of the process | `killed` |
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -122,6 +124,24 @@ pub const MARK_STALE_NS: u64 = 30_000_000_000;
 /// across a rebalance boundary and be double-counted.
 pub const ORDER_TTL_NS: u64 = 60_000_000_000;
 
+/// Risk-policy caps mirrored (`docs/risk-policy.md`), USD ×1e6 — the
+/// same three lines `strategy-icdp` enforces, because a second
+/// order-submission path that does not enforce them is a hole in the
+/// policy, not a new strategy.
+///
+/// The BINDING one here is the hedge, not the option. A 1.0-contract
+/// Deribit inverse option is one whole coin of underlying exposure, so
+/// at Δ = 1 its hedge is a one-coin perp order — about $79 000 at the
+/// measured index, eight times the single-order cap. The member
+/// therefore refuses an ENTRY whose worst-case (Δ = 1) hedge would
+/// breach a cap, rather than entering and clamping the hedge: a half
+/// hedge is a naked option position wearing a hedged one's name.
+pub const CAP_LEG_1E6: i64 = 10_000_000_000;
+/// Per-instrument net notional cap USD ×1e6.
+pub const CAP_SYM_1E6: i64 = 20_000_000_000;
+/// Table cap USD ×1e6 (both legs together).
+pub const CAP_TABLE_1E6: i64 = 100_000_000_000;
+
 /// `side` value for a flat campaign.
 pub const SIDE_FLAT: i8 = 0;
 /// `side` value for LONG vol — implied vol was BELOW the band, so we buy
@@ -156,9 +176,17 @@ pub struct VrpParams {
 }
 
 impl Default for VrpParams {
-    /// The edge spec's measured configuration: θ = 0.10, τ = 8 h, ε =
-    /// 5 min, selection 10 min out, hourly rebalance, one contract, a
-    /// band of 10 % of one contract's delta at Δ = 0.5.
+    /// The edge spec's measured configuration — θ = 0.10, τ = 8 h,
+    /// ε = 5 min, selection 10 min out, hourly rebalance — at the
+    /// largest size the risk policy permits.
+    ///
+    /// **The size is 0.1 contracts, not the spec's 1.0.** The spec
+    /// reports bps of spot per trade, which is scale-free, so the size
+    /// is ours to choose; the cap arithmetic chooses it. One contract's
+    /// worst-case (Δ = 1) hedge is one coin — about $79 000 at the
+    /// measured index, eight times [`CAP_LEG_1E6`]. `0.1` is the
+    /// largest tenth-of-a-contract step whose worst case ($7 900) fits
+    /// inside it; `0.2` ($15 800) does not. The band scales with it.
     fn default() -> Self {
         Self {
             theta_1e9: 100_000_000,
@@ -166,8 +194,8 @@ impl Default for VrpParams {
             epsilon_ns: 300_000_000_000,
             selection_ns: 600_000_000_000,
             rebalance_ns: 3_600_000_000_000,
-            qty_1e6: 1_000_000,
-            band_qty_1e6: 50_000,
+            qty_1e6: 100_000,
+            band_qty_1e6: 5_000,
         }
     }
 }
@@ -221,6 +249,23 @@ pub struct VrpStrategy {
     /// Campaign state.
     side: i8,
     entry_done: bool,
+    /// Kill criterion 3 fired: a FULL trailing-60 window in which the
+    /// forecast no longer beat implied vol. E1 is the whole mechanism;
+    /// without it there is nothing to harvest and premium does not make
+    /// up for it, so once this is set the member never enters again.
+    ///
+    /// **Scope: this process.** The QLIKE window lives in
+    /// [`core_vol::VolEngine`] and is zeroed by `new()`; the V5 boot seed
+    /// restores the fitted pairs but NOT the window. With the standing
+    /// restart cadence (`scripts/daily-restart.sh`, five slots a day)
+    /// and an 8 h campaign, sixty settlements cannot accumulate inside
+    /// one process — so as deployed today this flag cannot arm, and the
+    /// halt is a control the lane does not yet have. Persisting the
+    /// window across restarts is a named V8 precondition
+    /// (`docs/risk-policy.md`, kill-switch trigger 7). The code is here,
+    /// tested and correct, so that closing that gap is a seed change and
+    /// not a strategy change.
+    killed: bool,
     /// The campaign is unwinding: every record retries the flatten until
     /// the book is actually flat. Set by the E−ε law and by a
     /// hard-closed regime gate — a submit ring that was full must never
@@ -267,6 +312,7 @@ impl VrpStrategy {
             expiry_ns: 0,
             last_mark: OptMarkCache::default(),
             side: SIDE_FLAT,
+            killed: false,
             entry_done: false,
             flatten_pending: false,
             configured: false,
@@ -345,6 +391,12 @@ impl VrpStrategy {
         self.vol.n_pairs()
     }
 
+    /// Whether kill criterion 3 has halted the member.
+    #[must_use]
+    pub const fn is_killed(&self) -> bool {
+        self.killed
+    }
+
     /// The current campaign's side.
     #[must_use]
     pub const fn side(&self) -> i8 {
@@ -385,6 +437,16 @@ impl VrpStrategy {
     pub fn hedge_target_1e6(opt_pos_qty_1e6: i64, delta_1e9: i32) -> i64 {
         let t = -(opt_pos_qty_1e6 as i128) * delta_1e9 as i128;
         core_regime::math::floor_div(t, 1_000_000_000) as i64
+    }
+
+    /// USD ×1e6 notional of `qty_1e6` units at `px_1e6`. `i128`
+    /// intermediate, saturating — a notional that cannot be represented
+    /// is treated as infinite, which refuses rather than admits.
+    #[inline]
+    #[must_use]
+    pub fn notional_1e6(px_1e6: i64, qty_1e6: i64) -> i64 {
+        let n = (px_1e6 as i128 * qty_1e6.unsigned_abs() as i128) / 1_000_000;
+        i64::try_from(n).unwrap_or(i64::MAX)
     }
 
     /// Whether a hedge move is worth paying the spread for.
@@ -454,6 +516,37 @@ impl VrpStrategy {
             return false;
         }
         let px = self.last_mark.underlying_px_1e9 / 1_000;
+        // Belt and braces against a corrupt frame. The entry gate proved
+        // this position is legal at Δ = 1, so these can only bind on a
+        // |delta| > 1 the venue should never send — but `delta_1e9` is a
+        // saturating `i32` off the wire with no range check anywhere in
+        // the tree, so "should never" is not a guard.
+        //
+        // The SINGLE-ORDER cap applies to the order, unconditionally.
+        // Sizing it off the position's magnitude was the hole: a move
+        // from +0.1 to −0.09 shrinks the position and still emits a
+        // 0.19-contract order. A genuine reduction can never exceed the
+        // position it unwinds, so an unconditional test on `delta`
+        // cannot block an exit.
+        if Self::notional_1e6(px, delta) > CAP_LEG_1E6 {
+            self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
+            return false;
+        }
+        // The per-symbol and table caps bound the RESULTING position, so
+        // they apply only to a move that grows it — a cap must never be
+        // the reason a position cannot be closed (the ICDP precedent,
+        // where `exit_position` is exempt).
+        let grows = target_1e6.unsigned_abs() > self.perp_pos_qty_1e6.unsigned_abs();
+        if grows {
+            let hedge_notional = Self::notional_1e6(px, target_1e6);
+            let opt_notional = Self::notional_1e6(self.last_mark.px_usd_1e6, self.opt_pos_qty_1e6);
+            if hedge_notional > CAP_SYM_1E6
+                || hedge_notional.saturating_add(opt_notional) > CAP_TABLE_1E6
+            {
+                self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
+                return false;
+            }
+        }
         let Some(order) = self.ioc(self.hedge_sym, px, delta, now) else {
             return false;
         };
@@ -544,12 +637,26 @@ impl VrpStrategy {
         self.vol.har_1e9(self.params.tau_ns)
     }
 
+    /// Refresh the kill-criterion-3 tell, and ARM the halt when it
+    /// fires.
+    ///
+    /// Edge spec §5.3: "HAR no longer beats IV out of sample at 4–8 h
+    /// over a trailing 60 expiries ⇒ halt". Not "warn", not "put a
+    /// number on a dashboard" — halt. `har_beats_iv` is false while the
+    /// window is still filling, so the halt is armed only on a FULL
+    /// window; once armed it holds for the life of the process (see
+    /// [`VrpStrategy::killed`] for why that is not yet the same thing as
+    /// sticky, and what closes the gap).
     #[inline]
     fn refresh_qlike(&mut self) {
         let q = self.vol.qlike_counters();
         self.counters.qlike_iv_1e6 = q.iv_mean_1e9 / 1_000;
         self.counters.qlike_har_1e6 = q.har_mean_1e9 / 1_000;
         self.counters.qlike_har_beats_iv = u64::from(q.har_beats_iv);
+        if q.n as usize >= core_vol::QLIKE_RING && !q.har_beats_iv {
+            self.killed = true;
+            self.counters.killed = 1;
+        }
     }
 
     /// The selection law: at the first summary inside the selection
@@ -598,6 +705,11 @@ impl VrpStrategy {
         self.entry_done = true;
         self.counters.decisions = self.counters.decisions.wrapping_add(1);
 
+        if self.killed {
+            // Kill criterion 3, sticky. No counter here: `killed` is
+            // already 1 and the entries counter simply stops moving.
+            return;
+        }
         if !self.regime_open {
             self.counters.regime_blocked = self.counters.regime_blocked.wrapping_add(1);
             return;
@@ -624,18 +736,41 @@ impl VrpStrategy {
             self.counters.holds = self.counters.holds.wrapping_add(1);
             return;
         };
-        // Arm the forecast BEFORE the position exists: the regressor
-        // must be formed from minutes strictly before the hold.
-        if self.vol.arm_hold(self.params.tau_ns, iv).is_none() {
-            self.counters.no_bounds = self.counters.no_bounds.wrapping_add(1);
+        let qty = self.params.qty_1e6 * side as i64;
+        // The policy gate, at the ONE instant that can grow the book.
+        // Worst case, not current case: the hedge is sized off delta,
+        // and delta walks to 1 as the option goes in the money, so an
+        // entry is legal only if the position it commits us to is still
+        // legal at Δ = 1. Refusing here is the only fail-closed choice —
+        // clamping the hedge later would leave a naked option.
+        let underlying_1e6 = self.last_mark.underlying_px_1e9 / 1_000;
+        let opt_notional = Self::notional_1e6(self.last_mark.px_usd_1e6, qty);
+        let hedge_worst_1e6 = Self::notional_1e6(underlying_1e6, self.params.qty_1e6);
+        // `CAP_LEG_1E6 < CAP_SYM_1E6`, so a hedge inside the single-order
+        // cap is inside the per-symbol cap by construction; the table cap
+        // is the only one that needs both legs.
+        if opt_notional > CAP_LEG_1E6
+            || hedge_worst_1e6 > CAP_LEG_1E6
+            || opt_notional.saturating_add(hedge_worst_1e6) > CAP_TABLE_1E6
+        {
+            self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
             return;
         }
-        let qty = self.params.qty_1e6 * side as i64;
+        // Arm only once the trade is authorised: an armed forecast with
+        // no position would pair an x with a hold that never happened.
         let sym = self.selected_sym;
         let px = self.last_mark.px_usd_1e6;
         let Some(order) = self.ioc(sym, px, qty, now) else {
             return;
         };
+        // The regressor must be formed from minutes strictly BEFORE the
+        // hold, so arm before the position exists — but only once the
+        // trade is authorised, or an armed forecast would pair an `x`
+        // with a hold that never happened.
+        if self.vol.arm_hold(self.params.tau_ns, iv).is_none() {
+            self.counters.no_bounds = self.counters.no_bounds.wrapping_add(1);
+            return;
+        }
         if !self.submit(ctx, order) {
             return;
         }
@@ -1183,16 +1318,16 @@ mod tests {
         );
         assert_eq!(o.px.raw(), 300_200_000);
 
-        // The hedge: short 1 contract at Δ = 0.5 ⇒ LONG 0.5 perp.
+        // The hedge: short 0.1 contracts at Δ = 0.5 ⇒ LONG 0.05 perp.
         let h = ctx.orders[1];
         assert_eq!(h.sym, perp_sym());
         assert_eq!(h.side, Side::Bid);
-        assert_eq!(h.qty.raw(), 500_000);
+        assert_eq!(h.qty.raw(), 50_000);
         assert_eq!(h.kind, 1);
         assert_eq!(h.ttl_ns, ORDER_TTL_NS);
         assert_eq!(h.px.raw(), 79_000_000_000, "hedged at the venue's own underlying");
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
-        assert_eq!(m.perp_pos_qty_1e6(), 500_000);
+        assert_eq!(m.perp_pos_qty_1e6(), 50_000);
 
         // --- three hourly rebalances, each on a moved delta ---
         ctx.orders.clear();
@@ -1276,9 +1411,156 @@ mod tests {
         assert_eq!(m.side(), SIDE_LONG_VOL);
         assert_eq!(m.opt_pos_qty_1e6(), params.qty_1e6);
         assert_eq!(ctx.orders[0].side, Side::Bid, "long vol buys the option");
-        // Long 1 contract at Δ = 0.5 ⇒ SHORT 0.5 perp.
-        assert_eq!(m.perp_pos_qty_1e6(), -500_000);
+        // Long 0.1 contracts at Δ = 0.5 ⇒ SHORT 0.05 perp.
+        assert_eq!(m.perp_pos_qty_1e6(), -50_000);
         assert_eq!(ctx.orders[1].side, Side::Ask);
+    }
+
+    // ---------------- the risk-policy caps ----------------
+
+    #[test]
+    fn the_notional_helper_saturates_rather_than_wraps() {
+        assert_eq!(VrpStrategy::notional_1e6(300_200_000, 100_000), 30_020_000);
+        assert_eq!(VrpStrategy::notional_1e6(79_000_000_000, 100_000), 7_900_000_000);
+        // Sign of the quantity is irrelevant — a short is as much
+        // notional as a long.
+        assert_eq!(
+            VrpStrategy::notional_1e6(79_000_000_000, -100_000),
+            7_900_000_000
+        );
+        // A notional that cannot be represented reads as infinite, so a
+        // cap test refuses rather than admits.
+        assert_eq!(VrpStrategy::notional_1e6(i64::MAX, i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn the_default_size_is_the_largest_the_caps_permit() {
+        // 0.1 contracts: worst-case hedge $7,900 at the measured index,
+        // inside the $10,000 single-order cap. 0.2 would be $15,800.
+        let p = VrpParams::default();
+        assert_eq!(p.qty_1e6, 100_000);
+        let idx = 79_000_000_000i64; // $79,000 ×1e6
+        assert!(VrpStrategy::notional_1e6(idx, p.qty_1e6) <= CAP_LEG_1E6);
+        assert!(VrpStrategy::notional_1e6(idx, 2 * p.qty_1e6) > CAP_LEG_1E6);
+        // And the spec's nominal one contract is eight times over.
+        assert!(VrpStrategy::notional_1e6(idx, 1_000_000) > 8 * CAP_LEG_1E6 / 10);
+    }
+
+    #[test]
+    fn an_entry_whose_worst_case_hedge_breaches_a_cap_is_refused() {
+        // The gate is on the WORST case, not the current one: delta
+        // walks to 1 as the option goes in the money, so an entry is
+        // legal only if the position is still legal there. A half hedge
+        // is a naked option wearing a hedged one's name.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            qty_1e6: 1_000_000, // one contract — eight times the cap
+            band_qty_1e6: 50_000,
+            ..VrpParams::default()
+        };
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        // A quoted IV far above the band: the decision WANTS to trade.
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().decisions, 1, "the decision ran");
+        assert_eq!(m.vrp_counters().caps_rejected, 1);
+        assert_eq!(m.vrp_counters().entries, 0);
+        assert_eq!(m.side(), SIDE_FLAT);
+        assert!(ctx.orders.is_empty(), "nothing reached the dispatcher");
+        // And nothing was armed: an armed forecast with no position
+        // would pair an x with a hold that never happened.
+        assert!(!m.vol.is_armed());
+    }
+
+    #[test]
+    fn the_default_size_passes_the_same_gate() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().caps_rejected, 0);
+        assert_eq!(m.vrp_counters().entries, 1);
+        assert_eq!(ctx.orders.len(), 2);
+        // The hedge itself is inside the single-order cap.
+        let h = ctx.orders[1];
+        assert!(
+            VrpStrategy::notional_1e6(h.px.raw(), h.qty.raw()) <= CAP_LEG_1E6,
+            "hedge notional {} over the cap",
+            VrpStrategy::notional_1e6(h.px.raw(), h.qty.raw())
+        );
+    }
+
+    #[test]
+    fn a_cap_never_blocks_an_exit() {
+        // A cap must never be the reason a position cannot be closed.
+        // Drive the hedge to a size the cap would refuse to GROW to,
+        // then confirm the unwind still goes out.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_ne!(m.perp_pos_qty_1e6(), 0);
+        ctx.orders.clear();
+        let exit = EXPIRY - params.epsilon_ns;
+        ctx.now = mono_of(exit);
+        m.on_tick(&tick(exit, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "the hedge unwound");
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+    }
+
+    // ---------------- kill criterion 3 ----------------
+
+    #[test]
+    fn a_full_window_without_the_edge_halts_the_member_for_good() {
+        // Edge spec §5.3: "HAR no longer beats IV out of sample at 4–8 h
+        // over a trailing 60 expiries ⇒ halt". Not warn — halt, because
+        // E1 is the entire mechanism. (The window is per-process today;
+        // see `VrpStrategy::killed` and the V8 precondition.)
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        assert!(!m.is_killed());
+
+        // Settle a full window in which the IV was the better forecast
+        // every time: quote an implied vol AT the realisation while the
+        // member's own fit is far away.
+        let mut settled = 0usize;
+        while settled < core_vol::QLIKE_RING {
+            let rv = 1_200_000_000_000i64;
+            let iv = (rv as i128 * 33_102_114_736i128 / 10_000_000_000_000i128) as i64;
+            m.vol.arm_hold(TAU, iv).expect("armed");
+            m.vol.observe_settlement(rv);
+            m.refresh_qlike();
+            settled += 1;
+        }
+        assert_eq!(m.vrp_counters().qlike_har_beats_iv, 0);
+        assert_eq!(m.vrp_counters().killed, 1);
+        assert!(m.is_killed(), "a full window without the edge halts");
+
+        // And the halt REFUSES entries, whatever the quote says.
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().entries, 0);
+        assert!(ctx.orders.is_empty());
+        assert!(m.is_killed(), "nothing clears it inside this process");
     }
 
     // ---------------- the fail-closed table ----------------
