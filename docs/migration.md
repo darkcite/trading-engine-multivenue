@@ -6,6 +6,63 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — `detail_version: 5` — harness option marks are USD, not coin (VRP V2a)
+
+**What changed**
+- The two option mark-tick synthesis sites — `crates/cli/src/backtest.rs`
+  (`load_run`) and `crates/cli/src/audit_pnl.rs` (`load_run_events`) — no
+  longer rescale a captured `OptSummary.mark_px_1e9` with `/ 1_000`. They
+  call one shared helper, `crates/cli/src/backtest/opt.rs`
+  `synth_mark_usd_1e6`, which applies the denomination law
+  `premium_usd = mark_coin × underlying_px × contract_size` in `i128`.
+- `--emit-detail` sidecar `detail_version` **4 → 5**. Schema-1 (stdout) is
+  unchanged and `AUDIT_PNL_VERSION` stays `1` — no key was removed and none
+  changed type; the bump exists because the MEANING of a price on an option
+  sym changed.
+- New crate dependency for `cli`: `opt-registry` (VRP V1). Each run builds
+  its own `OptRegistry` from that run's `instrument-manifest.tsv`.
+
+**Why**
+Deribit options are inverse: quoted, margined and settled in the base coin
+with a 1-coin multiplier, so a mark of `0.00038 BTC` at BTC = $79,000 is a
+**$30** premium. `FillEngine` books `notional = px × qty` as USD by
+assertion (`backtest/fill.rs:53`). The old rescale therefore understated the
+option leg by the underlying price — about **79,000×** for BTC — while the
+perp hedge leg was already USD. A delta-hedged run would have reported
+essentially pure hedge P&L with the option contributing nothing, and nothing
+in the output would have said so.
+
+**Ripple effects**
+- **A `Price` on a Deribit option sym is now USD ×1e6.** `FeatId::MarkPx`
+  (`strategy-vm/src/features.rs:794`) is UNCHANGED and still returns the raw
+  coin `mark_px_1e9` — it is a wire value and rulesets that reference it are
+  hash-pinned. The two now mean different things on the same instrument;
+  that is deliberate.
+- Option marks are produced for **Deribit only**. A marked option record
+  from any other venue is skipped and counted, never guessed at:
+  `underlying_px_1e9` is venue-inconsistent by construction (OKX puts
+  `fwdPx` there and supplies no mark at all; Binance-eapi quotes in USDT).
+- New additive counter `opts_unconverted` on both reports — marked option
+  records that could not be denominated (foreign venue, a sym the run's
+  manifest never named, a missing underlying, an unrepresentable premium).
+  A venue that sends no mark is NOT counted. Both reports emit the line
+  **only when it is non-zero**, so a root carrying no option records renders
+  byte-identically to before this change.
+- Contract size offline is the venue constant `1.0` coin
+  (`DERIBIT_OPT_CONTRACT_SIZE_1E9`), because `instrument-manifest.tsv`
+  carries only the instrument name. What makes that safe is that
+  `opt-registry`'s parser refuses Deribit's USDC-LINEAR chains
+  (`BTC_USDC-…`), which do not carry that size. The live boot path (V7)
+  will use `DeribitInstrumentRow::contract_size_1e9` instead.
+- Registries are built **per run**: option ordinals reshuffle at every boot
+  by design (chain roll — `crates/cli/src/options_manifest.rs:8-11`).
+
+**Operator action**
+None. Options were never traded live, so no existing report's traded P&L
+moves. Reports over roots that CAPTURED options will show different option
+mark-tick prices — those rows previously held a coin number labelled as
+dollars.
+
 ## 2026-09-05 — `archive_manifest_version: 1` (object-storage archive)
 
 **What changed**

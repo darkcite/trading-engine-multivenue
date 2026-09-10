@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, Price, Qty, Side, Tick,
-    VenueId, OPT_SUMMARY_FLAG_MARK_PX, REGIME_PROFILES, SYMBOL_ID_NONE,
+    VenueId, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
@@ -343,6 +343,12 @@ struct RunLoad {
     /// `<venue>-opt-summary.pmlr` for option syms without a tick
     /// lane; these syms execute under the mark-fill law.
     opt_synth_ticks: u64,
+    /// VRP V2a: option records that CARRIED a mark and still could not
+    /// be denominated in USD — a foreign venue, a sym this run's
+    /// manifest never named, a missing underlying, or an
+    /// unrepresentable premium. A venue that sends no mark at all (OKX)
+    /// is deliberately NOT counted here.
+    opts_unconverted: u64,
     /// VT4: per-lane stale accounting (the harness re-judge).
     stale: [crate::backtest::stale::StaleStats; VENUE_LABELS.len()],
     /// RG3: funding prints loaded, `SetRegime` frames loaded (clamped
@@ -370,6 +376,19 @@ fn load_run_events(
     let (manifest, malformed) = read_run_manifest(&run.path);
     load.manifest = manifest.is_some();
     load.manifest_malformed = malformed;
+    // VRP V2a: this run's option registry, built from the SAME manifest
+    // the sym resolution uses. Per run by necessity — option ordinals
+    // reshuffle at every boot (`options_manifest.rs:8-11`). A run with
+    // no manifest gets an EMPTY registry and every option record then
+    // skips as `Unregistered` and is counted: fail closed, never priced
+    // against a guess.
+    let opt_reg = match manifest.as_ref() {
+        Some(m) => {
+            let rows: Vec<(u32, &String)> = m.iter().map(|(k, v)| (*k, v)).collect();
+            crate::backtest::opt::registry_from_manifest_rows(&rows)
+        }
+        None => opt_registry::OptRegistry::new(),
+    };
 
     let resolve =
         |sym: u32, interner: &mut SymInterner, load: &mut RunLoad| -> Result<u32, HarnessError> {
@@ -432,15 +451,25 @@ fn load_run_events(
             continue;
         };
         for (i, o) in reader.records().iter().enumerate() {
-            if o.flags & OPT_SUMMARY_FLAG_MARK_PX == 0 || o.mark_px_1e9 <= 0 {
-                continue;
-            }
+            // VRP V2a — THE DENOMINATION LAW. This was a pure rescale
+            // (`o.mark_px_1e9 / 1_000`) that booked a COIN premium as
+            // if it were dollars, understating the option leg by the
+            // underlying price (~79,000x for BTC).
+            // `opt::synth_mark_usd_1e6` is shared with `backtest` so the
+            // two entry points cannot drift, and it is keyed on the
+            // run's OWN raw sym — the dense id below is a root-scoped
+            // rename the registry knows nothing about.
+            let mark_1e6 = match crate::backtest::opt::synth_mark_usd_1e6(o, &opt_reg) {
+                Ok(px) => px,
+                Err(skip) => {
+                    if skip.is_unconverted() {
+                        load.opts_unconverted += 1;
+                    }
+                    continue;
+                }
+            };
             let dense = resolve(o.sym, interner, &mut load)?;
             if tick_syms.contains(&dense) {
-                continue;
-            }
-            let mark_1e6 = o.mark_px_1e9 / 1_000;
-            if mark_1e6 <= 0 {
                 continue;
             }
             mark_fill_syms.insert(dense);
@@ -704,6 +733,17 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             report(&format!(
                 "audit-pnl: run-{}: opt-synth-ticks={} (D-7 mark books)",
                 l.epoch_ns, l.opt_synth_ticks
+            ));
+        }
+        // VRP V2a: emitted only when it fires, so a run carrying no
+        // option records reports exactly as it did before the
+        // denomination law landed.
+        if l.opts_unconverted > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: opts-unconverted={} (marked option records \
+                 not denominable in USD: foreign venue, unregistered sym, or \
+                 no underlying)",
+                l.epoch_ns, l.opts_unconverted
             ));
         }
         // VT4: the per-lane stale verdict of the re-judge — a stale

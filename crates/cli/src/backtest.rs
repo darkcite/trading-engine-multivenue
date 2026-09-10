@@ -45,6 +45,8 @@
 
 pub mod fill;
 pub mod funding;
+/// VRP V2a: the option denomination law + the per-run option registry.
+pub mod opt;
 pub mod regime;
 pub mod stale;
 
@@ -522,6 +524,12 @@ struct RunSummary {
     depths: u64,
     opts: u64,
     opt_synth_ticks: u64,
+    /// VRP V2a: option records that CARRIED a mark and still could not
+    /// be denominated in USD — a foreign venue, a sym the run's
+    /// manifest never named, a missing underlying, or an unrepresentable
+    /// premium. A venue that simply sends no mark (OKX) is NOT counted
+    /// here; `opts` already shows those records arrived.
+    opts_unconverted: u64,
     remapped_syms: u64,
     /// VM2 V7: records DROPPED because their run-manifest descriptor
     /// is absent from the binding (newest) manifest — a DEAD
@@ -560,6 +568,7 @@ fn load_run(
     run: &RunDir,
     remap: &BTreeMap<u32, u32>,
     dead: &BTreeSet<u32>,
+    opt_reg: &opt_registry::OptRegistry,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
@@ -569,6 +578,7 @@ fn load_run(
     let mut judge = stale::StaleJudge::new(stale_after_ms);
     let mut summary_extra = (0u64, 0u64, 0u64, 0u64, 0u64); // ev, dp, op, synth, remapped
     let mut dropped_foreign = 0u64;
+    let mut opts_unconverted = 0u64;
     let mut any_file = false;
     let map_sym = |sym: u32, remapped: &mut u64, dropped: &mut u64| -> Option<u32> {
         match remap.get(&sym) {
@@ -768,15 +778,31 @@ fn load_run(
                     payload: RecPayload::Opt(op),
                 });
                 summary_extra.2 += 1;
-                let has_mark =
-                    op.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && op.mark_px_1e9 > 0;
-                if has_mark && !tick_syms.contains(&op.sym) {
+                if !tick_syms.contains(&op.sym) {
                     // Zero-spread mark tick: the fill engine executes
                     // these syms under the D-7 mark-fill law (the
                     // harness registers them); the vm prices its
                     // option legs at Mid = mark.
-                    let mark_1e6 = op.mark_px_1e9 / 1_000;
-                    if mark_1e6 > 0 {
+                    //
+                    // VRP V2a — THE DENOMINATION LAW. This was a pure
+                    // rescale (`mark_px_1e9 / 1_000`) that booked a
+                    // COIN premium as if it were dollars, understating
+                    // the option leg by the underlying price (~79,000x
+                    // for BTC). `opt::synth_mark_usd_1e6` is the one
+                    // place the conversion, the per-venue dispatch and
+                    // the registry lookup live, shared with `audit-pnl`
+                    // so the two entry points cannot drift.
+                    //
+                    // Keyed on `o.sym` — the run's OWN raw symbol.
+                    // `op.sym` has already been remapped to the binding
+                    // manifest and would miss this run's registry.
+                    let converted = opt::synth_mark_usd_1e6(o, opt_reg);
+                    if let Err(skip) = converted {
+                        if skip.is_unconverted() {
+                            opts_unconverted += 1;
+                        }
+                    }
+                    if let Ok(mark_1e6) = converted {
                         let venue = VenueId::from_u8(op.venue).unwrap_or(VenueId::Deribit);
                         let t = Tick::new(
                             op.ts_ns,
@@ -811,6 +837,7 @@ fn load_run(
             depths: summary_extra.1,
             opts: summary_extra.2,
             opt_synth_ticks: summary_extra.3,
+            opts_unconverted,
             remapped_syms: summary_extra.4,
             dropped_foreign,
             stale: judge.stats,
@@ -847,21 +874,27 @@ fn load_and_merge(
     for run in runs {
         let mut remap: BTreeMap<u32, u32> = BTreeMap::new();
         let mut dead: BTreeSet<u32> = BTreeSet::new();
-        for (sym, desc) in read_manifest_rows(&run.path) {
-            match newest_by_desc.get(&desc) {
+        let manifest_rows = read_manifest_rows(&run.path);
+        for (sym, desc) in &manifest_rows {
+            match newest_by_desc.get(desc) {
                 Some(new_sym) => {
-                    remap.insert(sym, *new_sym);
+                    remap.insert(*sym, *new_sym);
                 }
                 None => {
                     // VM2 V7: the binding manifest no longer carries
                     // this descriptor — DEAD instrument; its records
                     // drop rather than leak into whichever current
                     // instrument reuses the ordinal (§6 law).
-                    dead.insert(sym);
+                    dead.insert(*sym);
                 }
             }
         }
-        let (recs, summary) = load_run(run, &remap, &dead, stale_after_ms)?;
+        // VRP V2a: the option registry is per RUN, from that run's OWN
+        // manifest. Option ordinals reshuffle at every boot by design
+        // (chain roll — `options_manifest.rs:8-11`), so a run's records
+        // are only ever priced against the names that boot allocated.
+        let opt_reg = opt::registry_from_manifest_rows(&manifest_rows);
+        let (recs, summary) = load_run(run, &remap, &dead, &opt_reg, stale_after_ms)?;
         summaries.push(summary);
         if recs.is_empty() {
             continue; // header-only files everywhere: run holds no records
@@ -1206,6 +1239,9 @@ pub struct HarnessStats {
     pub merged_opts: u64,
     /// D-7 synthetic option mark-ticks synthesized.
     pub opt_synth_ticks: u64,
+    /// VRP V2a: option records that carried a mark and could NOT be
+    /// denominated in USD (see `RunSummary::opts_unconverted`).
+    pub opts_unconverted: u64,
     /// Syms remapped through the per-run manifest join.
     pub remapped_syms: u64,
     /// VM2 V7: dead-descriptor records dropped (§6 law; see
@@ -1720,6 +1756,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         merged_depths: run_summaries.iter().map(|r| r.depths).sum(),
         merged_opts: run_summaries.iter().map(|r| r.opts).sum(),
         opt_synth_ticks: run_summaries.iter().map(|r| r.opt_synth_ticks).sum(),
+        opts_unconverted: run_summaries.iter().map(|r| r.opts_unconverted).sum(),
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
@@ -2043,6 +2080,17 @@ fn render_summary(
         stats.remapped_syms,
         stats.dropped_foreign
     ));
+    // VRP V2a: appended only when it fires, so a root carrying no
+    // option records renders exactly as it did before the denomination
+    // law landed (the byte-identical guard rests on this).
+    if stats.opts_unconverted > 0 {
+        s.push_str(&format!(
+            "options: opts_unconverted={} (marked records that could not be \
+             denominated in USD — foreign venue, unregistered sym, or no \
+             underlying)\n",
+            stats.opts_unconverted
+        ));
+    }
     for (i, r) in runs.iter().enumerate() {
         s.push_str(&format!("  run[{i}] epoch_ns={}", r.epoch_ns));
         for (lord, label) in VENUE_LABELS.iter().enumerate() {
@@ -2191,7 +2239,7 @@ fn render_detail(
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
         concat!(
-            "{{\"detail_version\":4,",
+            "{{\"detail_version\":5,",
             "\"ruleset_hash\":\"{hash}\",",
             "\"split\":\"{split}\",",
             "\"model\":{{",

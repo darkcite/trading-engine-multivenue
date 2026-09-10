@@ -333,6 +333,7 @@ dependencies = [
  "ingress-rpc",
  "libc",
  "mio 0.8.11",
+ "opt-registry",
  "proptest",
  "research-artifacts",
  "rustls",
