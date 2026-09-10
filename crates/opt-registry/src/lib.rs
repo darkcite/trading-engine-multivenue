@@ -403,3 +403,49 @@ impl OptRegistry {
         self.get(sym).is_some()
     }
 }
+
+// ---------------------------------------------------------------
+// The denomination law (VRP V2a, relocated here at V6)
+// ---------------------------------------------------------------
+
+/// `premium_usd = mark_coin × underlying_px × contract_size`, at ×1e6.
+///
+/// Deribit options are INVERSE: quoted, margined and settled in the base
+/// coin with a one-coin multiplier, so a mark of `0.00038 BTC` at
+/// BTC = $79,000 is a **$30** premium, not `$0.00038`. This is the one
+/// function in the tree that knows that, because the contract size it
+/// needs lives on [`OptInstrument`] and nowhere else. The harness
+/// (`cli::backtest::opt`) and the live `strategy-vrp` both call it, so a
+/// paper submit and a replayed fill cannot disagree about what a premium
+/// is worth.
+///
+/// Inputs are ×1e9 (coin price), ×1e9 (underlying) and ×1e9 (size),
+/// giving a ×1e27 product wanted at ×1e6 — hence the `1e21` divisor.
+/// Truncating division floors a positive result, so the USD premium is
+/// never overstated.
+///
+/// CHECKED, and not defensively: `i64::MAX × i64::MAX × 1e9` is ~8.5e46
+/// and overflows `i128` itself (max ~1.7e38). Real inputs peak near
+/// 3e28, but these bytes come off a capture file or a venue frame — a
+/// corrupt or hostile record must yield `None`, not a debug panic and
+/// not a wrapped negative that the `<= 0` test would then read as merely
+/// unpriceable.
+///
+/// Returns `None` rather than a fallback: a caller must skip and count,
+/// never book the raw coin number as if it were dollars.
+#[inline]
+#[must_use]
+pub fn coin_to_usd_1e6(coin_1e9: i64, underlying_px_1e9: i64, cs_1e9: i64) -> Option<i64> {
+    if coin_1e9 <= 0 || underlying_px_1e9 <= 0 || cs_1e9 <= 0 {
+        return None;
+    }
+    const SCALE_1E21: i128 = 1_000_000_000_000_000_000_000;
+    let usd_1e6 = (coin_1e9 as i128)
+        .checked_mul(underlying_px_1e9 as i128)?
+        .checked_mul(cs_1e9 as i128)?
+        / SCALE_1E21;
+    if usd_1e6 <= 0 {
+        return None;
+    }
+    i64::try_from(usd_1e6).ok()
+}

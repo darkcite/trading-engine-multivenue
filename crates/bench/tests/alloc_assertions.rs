@@ -4436,3 +4436,146 @@ fn vol_engine_minute_and_bounds_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "core-vol hot bytes should be zero: saw {bytes}");
 }
+
+/// VRP V6: the member's two live callbacks allocate nothing.
+///
+/// `on_tick` runs on every underlying quote for the life of the process
+/// and `on_opt_summary` on every option ticker frame of the selected
+/// chain; both sit inside the engine's single-threaded loop. The member
+/// is boxed because its inline forecast rings and option table are ~24
+/// KiB — `configure` may allocate, which is exactly why the guard opens
+/// after it.
+#[test]
+fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
+    use core_types::{make_symbol_id, OptSummary, Price, Qty, Tick, OPT_SUMMARY_FLAG_MARK_PX};
+    use opt_registry::{OptInstrument, RIGHT_CALL, RIGHT_PUT};
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    const MONO0: u64 = 3_191_000_000_000_000;
+    const EXPIRY: u64 = 1_789_027_200_000_000_000;
+    const WALL0: u64 = EXPIRY - 172_800_000_000_000;
+    const MINUTE_NS: u64 = 60_000_000_000;
+
+    struct SinkCtx {
+        n: u64,
+        now: u64,
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, _order: core_types::Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let perp = make_symbol_id(VenueId::Deribit, 1);
+    let mut reg = opt_registry::OptRegistry::new();
+    let mut k = 0u32;
+    while k < 16 {
+        reg.insert(OptInstrument::new(
+            make_symbol_id(VenueId::Deribit, 513 + k),
+            perp,
+            VenueId::Deribit as u8,
+            EXPIRY,
+            (77_000 + 250 * k as i64) * 1_000_000,
+            if k % 2 == 0 { RIGHT_CALL } else { RIGHT_PUT },
+            1_000_000_000,
+        ))
+        .expect("boot insert");
+        k += 1;
+    }
+
+    let mut m = Box::new(strategy_vrp::VrpStrategy::new());
+    m.configure(
+        strategy_vrp::VrpParams::default(),
+        reg,
+        perp,
+        perp,
+        core_time::WallAnchor::new(MONO0, WALL0),
+        [0u8; 32],
+    )
+    .expect("configure");
+
+    let mono_of = |wall: u64| MONO0.wrapping_add(wall.wrapping_sub(WALL0));
+    let mk_tick = |wall: u64, px: i64| {
+        Tick::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            perp,
+            0,
+            Price::from_raw(px - 500_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(px + 500_000),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let mk_opt = |wall: u64, sym: u32, iv: i64| {
+        OptSummary::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            sym,
+            OPT_SUMMARY_FLAG_MARK_PX,
+            3_800_000,
+            iv,
+            79_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+
+    let mut ctx = SinkCtx { n: 0, now: MONO0 };
+    // Boot: warm the ring and seed a fit. Not measured.
+    let mut wall = WALL0;
+    let mut px = 79_000_000_000i64;
+    let mut s = 20_260_910i64;
+    let mut i = 0usize;
+    while i < 1_442 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+        m.on_tick(&mk_tick(wall, px), &mut ctx);
+        wall += MINUTE_NS;
+        i += 1;
+    }
+    let mut j = 0i64;
+    while j < 60 {
+        m.seed_pair(24_000_000_000 + j * 11_000_000, 24_100_000_000 + j * 9_000_000);
+        j += 1;
+    }
+
+    // Measured: the two live callbacks, driven through a full campaign
+    // (selection, the entry decision, hedges, the E−ε unwind) so the
+    // gate covers the branches that submit, not only the ones that skip.
+    let g = AllocGuard::new();
+    let start = EXPIRY - 28_800_000_000_000 - 600_000_000_000;
+    let mut w = start;
+    let mut n = 0usize;
+    while n < 4_000 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+        ctx.now = mono_of(w);
+        m.on_opt_summary(&mk_opt(w, make_symbol_id(VenueId::Deribit, 513 + 8), 5_000_000_000), &mut ctx);
+        m.on_tick(&mk_tick(w, px), &mut ctx);
+        w += 7_500_000_000; // 7.5 s: 4000 steps span the whole 8 h hold
+        n += 1;
+    }
+    let counters = m.vrp_counters();
+    std::hint::black_box((ctx.n, counters));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(counters.decisions > 0, "the gate must measure a real decision");
+    assert!(ctx.n > 0, "the gate must measure real submits");
+    assert_eq!(
+        allocs, 0,
+        "strategy-vrp callbacks allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "strategy-vrp hot bytes should be zero: saw {bytes}");
+}

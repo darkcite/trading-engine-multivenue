@@ -49,6 +49,7 @@ strategy-cross-arb   = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }
+strategy-vrp         = { workspace = true }
 research-artifacts   = { workspace = true }
 engine               = { workspace = true }
 signer-eip712        = { workspace = true }

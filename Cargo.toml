@@ -29,8 +29,9 @@ members = [
     # shared boot-only options-chain selection law (M2 close extraction)
     "crates/options-select",
     # VRP V1: option sym -> (expiry, strike, right, contract size) table
-    "crates/core-vol",
     "crates/opt-registry",
+    # VRP V4: the integer HAR/OLS volatility forecast
+    "crates/core-vol",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -44,6 +45,7 @@ members = [
     "crates/strategy-rule-tree",
     "crates/strategy-set",
     "crates/strategy-vm",
+    "crates/strategy-vrp",
 
     # --- execution ---
     "crates/clob-dispatcher",
@@ -171,6 +173,7 @@ strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
 strategy-vm           = { path = "crates/strategy-vm" }
+strategy-vrp          = { path = "crates/strategy-vrp" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 signer-eip712   = { path = "crates/signer-eip712" }

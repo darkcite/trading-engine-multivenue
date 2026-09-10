@@ -195,6 +195,13 @@ pub trait StrategyCounters {
         IcdpCounters::default()
     }
 
+    /// VRP V6: the VRP member's observables (`engine_vrp_*`), mirrored
+    /// by the cli's generic 5 s block exactly like [`Self::icdp_counters`].
+    #[inline]
+    fn vrp_counters(&self) -> VrpCounters {
+        VrpCounters::default()
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -519,6 +526,47 @@ pub struct IcdpCounters {
     /// RG2: positions exited early by a hard-closed gate
     /// (`engine_icdp_regime_exits_total`).
     pub regime_exits: u64,
+}
+
+/// VRP V6 counters (`engine_vrp_*`), mirrored by the cli's generic 5 s
+/// block. Defined HERE rather than in `strategy-vrp` for the same reason
+/// [`IcdpCounters`] is: the cli must never name a member crate.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VrpCounters {
+    /// Entry instants evaluated (the two-compare decision ran).
+    pub decisions: u64,
+    /// Option entries submitted.
+    pub entries: u64,
+    /// Hedge orders submitted (entry hedge + rebalances + unwind).
+    pub hedges: u64,
+    /// Exits submitted at E−ε.
+    pub exits: u64,
+    /// Decisions that HELD: the quoted implied vol was inside the band.
+    pub holds: u64,
+    /// Decisions refused because the forecast had no bounds (a cold
+    /// ring or fewer than 60 fitted pairs — ABSENT DATA HOLDS).
+    pub no_bounds: u64,
+    /// Decisions or rebalances skipped on a stale option mark.
+    pub stale_skips: u64,
+    /// Expiries where no instrument passed the selection law.
+    pub no_selection: u64,
+    /// Decisions refused because the member's regime gate was closed.
+    pub regime_blocked: u64,
+    /// Campaigns flattened early by a hard-closed gate.
+    pub regime_exits: u64,
+    /// Settled expiries folded back into the forecast.
+    pub settlements: u64,
+    /// Kill criterion 3 (edge spec §5.3): trailing-60 mean QLIKE of the
+    /// venue's implied vol, ×1e6. Lower is better.
+    pub qlike_iv_1e6: i64,
+    /// Trailing-60 mean QLIKE of this member's own forecast, ×1e6.
+    pub qlike_har_1e6: i64,
+    /// `1` once a FULL trailing-60 window shows the forecast still
+    /// beating implied vol; `0` while the window fills OR once the
+    /// mechanism has stopped holding. **A `0` on a full window is the
+    /// halt tell** — E1 is gone and the member has no edge to harvest.
+    pub qlike_har_beats_iv: u64,
 }
 
 // ---------------------------------------------------------------

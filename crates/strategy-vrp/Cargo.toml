@@ -1,0 +1,20 @@
+[package]
+name         = "strategy-vrp"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Delta-hedged variance-risk-premium member (VRP V6): one daily short-dated Deribit option per expiry, entered only when the venue's implied vol leaves an integer HAR forecast's band, hedged on the hour against the venue's own BS delta, exited at E-epsilon."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-regime = { workspace = true }
+core-time = { workspace = true }
+core-types = { workspace = true }
+core-vol = { workspace = true }
+opt-registry = { workspace = true }
+strategy-core = { workspace = true }

@@ -162,6 +162,7 @@ dependencies = [
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
+ "strategy-vrp",
 ]
 
 [[package]]
@@ -1856,6 +1857,18 @@ dependencies = [
  "core-time",
  "core-types",
  "proptest",
+ "strategy-core",
+]
+
+[[package]]
+name = "strategy-vrp"
+version = "0.1.0"
+dependencies = [
+ "core-regime",
+ "core-time",
+ "core-types",
+ "core-vol",
+ "opt-registry",
  "strategy-core",
 ]
 

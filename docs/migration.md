@@ -6,6 +6,54 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — new crate `strategy-vrp` (VRP V6)
+
+**What changed**
+- New workspace member `crates/strategy-vrp`: the delta-hedged
+  variance-risk-premium member. One short-dated Deribit option per daily
+  expiry, entered only when the venue's implied vol leaves the band
+  `core-vol`'s forecast opens around it, delta-hedged on the hour against
+  the venue's own BS delta, exited at `E − ε`.
+- `strategy-core` gains `VrpCounters` and a defaulted
+  `StrategyCounters::vrp_counters()` accessor — defined there, like
+  `IcdpCounters`, so the cli never names a member crate.
+- The coin→USD denomination law moved from `cli::backtest::opt` to
+  `opt_registry::coin_to_usd_1e6`, the crate that owns contract size.
+  `cli::backtest::opt::coin_mark_to_usd_1e6` now delegates to it, so the
+  live member and the harness cannot drift about what a premium is worth.
+- New alloc gate `vrp_member_tick_and_opt_summary_are_zero_alloc`; the
+  gate count rises 44 → 45.
+
+**Why**
+Written from the `Strategy` trait up rather than adapted from
+`strategy-ev` (operator ruling O-D2): the two strategies share a slot
+number and nothing else, and a copied file carries its previous
+assumptions invisibly.
+
+**The four doctrine clauses, verbatim in the crate header**
+1. Paper has no fills — SUBMIT is the position event, and only V8's
+   shadow reconciliation will ever check that assumption.
+2. The book is USD-denominated, so the plain unadjusted BS delta is the
+   correct hedge ratio; Deribit's account-level `DeltaTotal` carries an
+   inverse-contract adjustment that must NOT be applied here.
+3. Deribit option marks are coin-denominated; every USD number in the
+   crate goes through `opt_registry::coin_to_usd_1e6`.
+4. E1 is the mechanism and E2 the monetisation, so the QLIKE comparison
+   is computed beside the bounds and exposed as a LIVE counter
+   (`qlike_har_beats_iv`) — kill criterion 3 must be visible on a
+   dashboard, not discoverable in a later report.
+
+**Ripple effects**
+- **Nothing is composed.** `strategy-vrp` is not referenced by
+  `strategy-set`; a boot cannot be disturbed by this commit. V7 does the
+  binding.
+- The member's public state (`side`, positions, selected sym, counters)
+  is read-only from outside — the cli reads counters through the
+  `StrategyCounters` accessor.
+
+**Operator action**
+None. The member is unreachable until V7 binds it and V8 enables it.
+
 ## 2026-09-10 — `vrp-seed.tsv` + `--vrp-seed` (VRP V5)
 
 **What changed**

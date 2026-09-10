@@ -177,27 +177,11 @@ impl OptSkip {
 #[inline]
 #[must_use]
 pub fn coin_mark_to_usd_1e6(mark_px_1e9: i64, underlying_px_1e9: i64, cs_1e9: i64) -> Option<i64> {
-    if mark_px_1e9 <= 0 || underlying_px_1e9 <= 0 || cs_1e9 <= 0 {
-        return None;
-    }
-    // 1e9 (mark) × 1e9 (underlying) × 1e9 (size) → ×1e27; the result is
-    // wanted at ×1e6, hence the 1e21 divisor.
-    //
-    // CHECKED, and not defensively: `i64::MAX × i64::MAX × 1e9` is
-    // ~8.5e46 and overflows i128 itself (max ~1.7e38). Real inputs peak
-    // near 3e28, but these bytes come off a capture file — a corrupt or
-    // hostile record must yield `None`, not a debug panic and not a
-    // wrapped negative that the `<= 0` test below would then read as
-    // merely unpriceable.
-    const SCALE_1E21: i128 = 1_000_000_000_000_000_000_000;
-    let usd_1e6 = (mark_px_1e9 as i128)
-        .checked_mul(underlying_px_1e9 as i128)?
-        .checked_mul(cs_1e9 as i128)?
-        / SCALE_1E21;
-    if usd_1e6 <= 0 {
-        return None;
-    }
-    i64::try_from(usd_1e6).ok()
+    // VRP V6: the law itself moved to `opt_registry`, the crate that
+    // owns contract size, so the live member and the harness share ONE
+    // definition of what a premium is worth. This name stays as the
+    // harness's spelling of it, and its tests below still pin the law.
+    opt_registry::coin_to_usd_1e6(mark_px_1e9, underlying_px_1e9, cs_1e9)
 }
 
 /// The USD ×1e6 mark for one captured option summary, or the reason it
