@@ -130,6 +130,14 @@ struct AuditPnlArgs {
     /// off.
     #[arg(long)]
     opt_fee: Vec<String>,
+    /// VRP V3: `--option-spread-frac <ppm>` — the ASSUMED crossed
+    /// option spread, parts-per-million of premium (`50000` = 5 %),
+    /// charged as half on each side of the D-7 synthetic mark tick.
+    /// Absent = 0 = the D-7 floor alone, the optimistic rung. The
+    /// option spread is ASSUMED, never measured: the capture holds no
+    /// options book. Max 1000000 (100 %).
+    #[arg(long)]
+    option_spread_frac: Option<u32>,
     /// RG3: `<path>` = a `regime.toml` artifact to replay the regime
     /// detector from (refusals fatal); `off` = regime-blind; absent =
     /// the default artifact when it exists and resolves on this root.
@@ -183,6 +191,14 @@ struct BacktestArgs {
     /// off.
     #[arg(long)]
     opt_fee: Vec<String>,
+    /// VRP V3: `--option-spread-frac <ppm>` — the ASSUMED crossed
+    /// option spread, parts-per-million of premium (`50000` = 5 %),
+    /// charged as half on each side of the D-7 synthetic mark tick.
+    /// Absent = 0 = the D-7 floor alone, the optimistic rung. The
+    /// option spread is ASSUMED, never measured: the capture holds no
+    /// options book. Max 1000000 (100 %).
+    #[arg(long)]
+    option_spread_frac: Option<u32>,
     /// §5 rich-detail sidecar path (per-symbol/IS metrics). Declared
     /// now; the sidecar is written starting H2.
     #[arg(long)]
@@ -447,6 +463,7 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         latency_ns_venue: args.latency_ns_venue,
         stale_after_ms: args.stale_after_ms,
         opt_fee: args.opt_fee,
+        option_spread_frac_1e6: args.option_spread_frac,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
     };
@@ -498,6 +515,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         latency_ns_venue: args.latency_ns_venue,
         stale_after_ms: args.stale_after_ms,
         opt_fee: args.opt_fee,
+        option_spread_frac_1e6: args.option_spread_frac,
         emit_detail: args.emit_detail,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,

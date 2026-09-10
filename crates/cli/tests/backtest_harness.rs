@@ -124,6 +124,7 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         latency_ns_venue: Vec::new(),
         stale_after_ms: Vec::new(),
         opt_fee: Vec::new(),
+        option_spread_frac_1e6: None,
         emit_detail: None,
         // RG3: hermetic — never consult the operator's default artifact
         // from a test (legacy fixtures carry no labelled row, so `off`
@@ -769,7 +770,19 @@ fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
     assert_eq!(out_a.schema1, out_b.schema1);
     // Versioned separately from schema-1; carries the operator detail
     // the frozen stdout must NOT carry (§5).
-    assert!(a.starts_with("{\"detail_version\":5,"), "VRP V2a bumped the sidecar version (VT4: 2, I1: 3, RG3: 4)");
+    assert!(
+        a.starts_with("{\"detail_version\":6,"),
+        "VRP V3 bumped the sidecar version (VT4: 2, I1: 3, RG3: 4, VRP V2a: 5)"
+    );
+    // VRP V3: the model carries the ladder rung it ran at, and the
+    // `options` block carries the standing D-7 assumption verbatim —
+    // an option-free root still says so, with zero syms and zero fills.
+    assert!(a.contains("\"opt_spread_frac_1e6\":0,"), "{a}");
+    assert!(
+        a.contains("\"options\":{\"mark_syms\":0,\"mark_fills\":0,\"spread_frac_1e6\":0,"),
+        "{a}"
+    );
+    assert!(a.contains("ASSUMED spread — upper bound"), "{a}");
     assert!(a.contains("\"regime\":{\"mode\":\"off\","), "{a}");
     assert!(a.contains("\"canceled_end\":1"));
     assert!(
@@ -850,7 +863,7 @@ fn vt4_stale_tick_neither_fills_nor_marks_and_is_reported() {
     assert!(out.summary.contains("stale_after_ms pm=1000 bn=1000 okx=400 deribit=600 hl=700 bybit=500"));
     // sidecar v2: the model's thresholds + the per-run lane block.
     let d = std::fs::read_to_string(&detail).expect("sidecar");
-    assert!(d.starts_with("{\"detail_version\":5,"));
+    assert!(d.starts_with("{\"detail_version\":6,"));
     assert!(d.contains("\"stale_after_ms\":{\"pm\":1000,\"bn\":1000,\"okx\":400,\"deribit\":600,\"hl\":700,\"bybit\":500}"), "{d}");
     assert!(d.contains(&format!(
         "\"stale\":{{\"ticks_skipped\":1,\"runs\":[{{\"epoch_ns\":{PNL_EPOCH_RUN_0},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}},{{\"epoch_ns\":{PNL_EPOCH_RUN_1},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":1,\"stale_time_bps\":4285,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}}]}}"
@@ -1044,6 +1057,7 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         latency_ns_venue: Vec::new(),
         stale_after_ms: Vec::new(),
         opt_fee: Vec::new(),
+        option_spread_frac_1e6: None,
         emit_detail: None,
         regime: RegimeMode::Off,
         regime_seed: None,
@@ -1364,7 +1378,55 @@ fn v5_option_mark_fill_law_executes_and_counts() {
     assert_eq!(s.vm_orders_emitted, 1, "priced at Mid = mark");
     assert_eq!(s.mark_fills, 1, "the D-7 law executed");
     assert_eq!(s.fills_total, 1);
+    assert_eq!(s.opt_mark_syms, 1, "one sym registered under the law");
+
+    // VRP V3: the standing assumption is PRINTED wherever it can shape
+    // a number, and it names the ladder rung it ran at.
+    assert!(
+        s_has(&out.summary, "OPTIONS MARK-FILL LAW (D-7)")
+            && s_has(&out.summary, "1 option sym(s)")
+            && s_has(&out.summary, "ASSUMED spread — upper bound")
+            && s_has(&out.summary, "--option-spread-frac unset")
+            && s_has(&out.summary, "mark_fills=1"),
+        "{}",
+        out.summary
+    );
+
+    // The ladder (edge spec §5): our row rests a BID, so a wider
+    // assumed spread makes the buy cross HIGHER while the position is
+    // still valued at mark — the option leg moves monotonically DOWN,
+    // never up, and the 0 rung is therefore the upper bound.
+    let zero_rung = s.oos_net_pnl_1e6;
+    let mut prev = zero_rung;
+    for frac in [20_000u32, 50_000, 100_000] {
+        let mut c = v5_cfg(&ruleset, &root, "0/100");
+        c.option_spread_frac_1e6 = Some(frac);
+        let o = cli::backtest::run(&c).expect("harness ok");
+        assert_eq!(o.stats.mark_fills, 1, "the law still executes at f={frac}");
+        assert!(
+            o.stats.oos_net_pnl_1e6 <= prev,
+            "the ladder must never move UP: f={frac} gave {} after {prev}",
+            o.stats.oos_net_pnl_1e6
+        );
+        assert!(
+            s_has(&o.summary, &format!("--option-spread-frac {frac} =")),
+            "{}",
+            o.summary
+        );
+        prev = o.stats.oos_net_pnl_1e6;
+    }
+    assert!(
+        prev < zero_rung,
+        "10 % crossed must cost strictly more than the D-7 floor: {prev} vs {zero_rung}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `str::contains` with a name, so the ladder assertions above read as
+/// one obligation rather than five.
+fn s_has(hay: &str, needle: &str) -> bool {
+    hay.contains(needle)
 }
 
 /// The §6 replay half: option/instrument ordinals that reshuffle
@@ -1593,7 +1655,7 @@ fn rg3_declared_regime_gates_labelled_rows_and_off_strips_them() {
         on.summary
     );
     let d = std::fs::read_to_string(&detail).expect("sidecar");
-    assert!(d.starts_with("{\"detail_version\":5,"));
+    assert!(d.starts_with("{\"detail_version\":6,"));
     assert!(
         d.contains("\"regime\":{\"mode\":\"artifact\",\"artifact_sha256\":\""),
         "{d}"

@@ -186,6 +186,10 @@ pub struct BacktestConfig {
     /// (or `<venue>:off`) — the venue's capped OPTION trade fee.
     /// Absent = the Deribit default; additive, never worker-parsed.
     pub opt_fee: Vec<String>,
+    /// VRP V3: `--option-spread-frac <ppm>` — the ASSUMED crossed
+    /// option spread as parts-per-million of premium. `None` = 0 =
+    /// the D-7 floor alone.
+    pub option_spread_frac_1e6: Option<u32>,
     /// `--emit-detail` sidecar path — declared per §5; written in H2.
     pub emit_detail: Option<PathBuf>,
     /// RG3: `--regime` (`docs/regime-and-dashboard-plan.md` §4.8 — the
@@ -314,12 +318,30 @@ pub struct ModelParams {
     /// `--opt-fee <venue>:<index_bps>:<prem_bps>` overrides; `off`
     /// deactivates.
     pub opt_fee: [OptFee; 7],
+    /// VRP V3: `--option-spread-frac` — parts-per-million of the
+    /// PREMIUM for the FULL crossed option spread, half charged on
+    /// each side of the D-7 synthetic mark tick
+    /// ([`fill::opt_half_spread_1e6`]). `0` = the D-7 floor alone,
+    /// which is what every report before the flag used. The option
+    /// spread is ASSUMED, never measured: no options book exists in
+    /// the capture, so this is a ladder input, not an observation.
+    pub opt_spread_frac_1e6: u32,
 }
+
+/// VRP V3: the largest `--option-spread-frac` the parser accepts —
+/// 1e6 ppm = a 100 % crossed spread, i.e. a half-spread of exactly
+/// the mark. Anything larger prices the bid at or below zero and
+/// would overflow the `mark ± h` arithmetic; it is a typo, not a
+/// ladder rung.
+pub const OPT_SPREAD_FRAC_MAX: u32 = 1_000_000;
 
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
             fee_bps: [(0, 0); 7],
+            // VRP V3: the ladder's optimistic rung — the D-7 floor
+            // alone. Widening is opt-in and one-way.
+            opt_spread_frac_1e6: 0,
             opt_fee: {
                 let mut t = [OptFee::OFF; 7];
                 t[VenueId::Deribit as usize] = OptFee::DERIBIT;
@@ -359,16 +381,25 @@ pub(crate) fn model_venue(label: &str) -> Option<usize> {
 
 /// Fold the §4 flag overrides onto the defaults. Precedence: defaults
 /// → `--latency-ns` (global) → `--latency-ns-venue` / `--fee-bps` /
-/// `--stale-after-ms` / `--opt-fee` (later occurrences of a repeated
-/// flag win).
+/// `--stale-after-ms` / `--opt-fee` / `--option-spread-frac` (later
+/// occurrences of a repeated flag win).
 pub fn parse_model_params(
     fee_specs: &[String],
     latency_global: Option<u64>,
     latency_specs: &[String],
     stale_specs: &[String],
     opt_fee_specs: &[String],
+    opt_spread_frac_1e6: Option<u32>,
 ) -> Result<ModelParams, HarnessError> {
     let mut p = ModelParams::default();
+    if let Some(f) = opt_spread_frac_1e6 {
+        if f > OPT_SPREAD_FRAC_MAX {
+            return Err(HarnessError::Usage(format!(
+                "bad --option-spread-frac {f}: ppm of premium, max {OPT_SPREAD_FRAC_MAX} (100%)"
+            )));
+        }
+        p.opt_spread_frac_1e6 = f;
+    }
     for spec in stale_specs {
         let (v, ms) = spec.split_once(':').ok_or_else(|| {
             HarnessError::Usage(format!("bad --stale-after-ms {spec:?}: want <venue>:<ms>"))
@@ -1396,6 +1427,10 @@ pub struct HarnessStats {
     pub dropped_foreign: u64,
     /// D-7 mark-law fills executed (> 0 ⇒ the assumption printed).
     pub mark_fills: u64,
+    /// VRP V3: option syms REGISTERED under the D-7 mark-fill law.
+    /// Registration, not fills, is what makes the assumption able to
+    /// shape a number, so the assumption line is keyed on this.
+    pub opt_mark_syms: u64,
     /// VT4: ticks the fill model skipped as STALE (no mark, no fill).
     pub stale_ticks_skipped: u64,
     /// I1: IoC orders filled at their activation touch.
@@ -1533,6 +1568,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &cfg.latency_ns_venue,
         &cfg.stale_after_ms,
         &cfg.opt_fee,
+        cfg.option_spread_frac_1e6,
     )?;
 
     // Candidate bytes + identity (§3.5): full SHA-256 is schema-1's
@@ -1920,6 +1956,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
+        opt_mark_syms: mark_fill_syms.len() as u64,
         stale_ticks_skipped: outcome.stale_ticks_skipped,
         ioc_fills: outcome.ioc_fills,
         ioc_canceled: outcome.ioc_canceled,
@@ -2258,6 +2295,16 @@ fn render_summary(
             stats.opts_unconverted
         ));
     }
+    // VRP V3: the D-7 obligation — the assumption is PRINTED wherever
+    // it can shape a number, and it names the ladder rung it ran at.
+    // Conditional, so an option-free root renders as it always did.
+    if stats.opt_mark_syms > 0 {
+        s.push_str(&opt::render_opt_mark_law(
+            stats.opt_mark_syms as usize,
+            model.opt_spread_frac_1e6,
+        ));
+        s.push_str(&format!(" mark_fills={}\n", stats.mark_fills));
+    }
     for (i, r) in runs.iter().enumerate() {
         s.push_str(&format!("  run[{i}] epoch_ns={}", r.epoch_ns));
         for (lord, label) in VENUE_LABELS.iter().enumerate() {
@@ -2388,8 +2435,10 @@ fn render_summary(
 /// `fills.ioc_canceled`, `fills.ttl_expired` and the `oos.fee_ladder`
 /// array of net P&L at flat 0 / 1 / 2 bps per side; 4 since RG3 — the
 /// additive `regime` block: mode, artifact hash, seed, gate counters
-/// and the per-profile minutes-per-word histogram), operator/session
-/// surface, never parsed by the worker. Hand-rendered like schema-1 — every value is
+/// and the per-profile minutes-per-word histogram; 5 since VRP V2a —
+/// option marks are USD; 6 since VRP V3 — `model.opt_spread_frac_1e6`
+/// and the `options` block carrying the standing D-7 assumption
+/// verbatim), operator/session surface, never parsed by the worker. Hand-rendered like schema-1 — every value is
 /// numeric, a fixed label, the validated split echo, or the hash hex;
 /// USD values are the same fixed-point renders as the stderr summary.
 #[allow(clippy::too_many_arguments)] // one sidecar = one render of every section
@@ -2406,7 +2455,7 @@ fn render_detail(
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
         concat!(
-            "{{\"detail_version\":5,",
+            "{{\"detail_version\":6,",
             "\"ruleset_hash\":\"{hash}\",",
             "\"split\":\"{split}\",",
             "\"model\":{{",
@@ -2414,6 +2463,7 @@ fn render_detail(
             "\"fee_bps\":{{\"pm\":[{fpm0},{fpm1}],\"bn\":[{fbn0},{fbn1}],\"okx\":[{fokx0},{fokx1}],",
             "\"deribit\":[{fde0},{fde1}],\"hl\":[{fhl0},{fhl1}]}},",
             "\"open_order_caps\":[{cap_sym},{cap_tot}],",
+            "\"opt_spread_frac_1e6\":{osf},",
             "\"stale_after_ms\":{{\"pm\":{spm},\"bn\":{sbn},\"okx\":{sokx},\"deribit\":{sde},",
             "\"hl\":{shl},\"bybit\":{sby}}}}},",
             "\"stale\":{{\"ticks_skipped\":{sts},\"runs\":[{sruns}]}},",
@@ -2424,6 +2474,8 @@ fn render_detail(
             "\"canceled_end\":{cend},\"peak_open_total\":{pot},\"peak_open_per_sym\":{pos}}},",
             "\"fills\":{{\"total\":{ft},\"oos\":{fo},\"ioc\":{fioc},\"ioc_canceled\":{fiocc},",
             "\"ttl_expired\":{fttl}}},",
+            "\"options\":{{\"mark_syms\":{oms},\"mark_fills\":{omf},",
+            "\"spread_frac_1e6\":{osf},\"law\":\"{olaw}\"}},",
             "\"oos\":{{\"net_pnl_usd\":{onet},\"realized_usd\":{orl},\"fees_usd\":{ofe},",
             "\"markout_usd\":{oun},\"max_drawdown_usd\":{odd},\"trades\":{otr},",
             "\"trading_days\":{oda},\"fee_ladder_net_usd\":[{ol0},{ol1},{ol2}]}},",
@@ -2434,6 +2486,13 @@ fn render_detail(
         ),
         hash = hash_hex,
         split = split,
+        osf = model.opt_spread_frac_1e6,
+        oms = stats.opt_mark_syms,
+        omf = stats.mark_fills,
+        olaw = opt::render_opt_mark_law(
+            stats.opt_mark_syms as usize,
+            model.opt_spread_frac_1e6
+        ),
         lpm = model.latency_ns[VenueId::Polymarket as usize],
         lbn = model.latency_ns[VenueId::Binance as usize],
         lokx = model.latency_ns[VenueId::Okx as usize],
@@ -2621,6 +2680,7 @@ mod tests {
             &["deribit:42".to_owned()],
             &["okx:250".to_owned(), "bn:0".to_owned(), "okx:300".to_owned()],
             &[],
+            None,
         )
         .unwrap();
         // Global latency replaced every TRADEABLE slot (the Ai dead
@@ -2644,7 +2704,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_model_params(&[bad_fee.to_owned()], None, &[], &[], &[]),
+                    parse_model_params(&[bad_fee.to_owned()], None, &[], &[], &[], None),
                     Err(HarnessError::Usage(_))
                 ),
                 "fee spec {bad_fee:?} must be a usage error"
@@ -2653,7 +2713,7 @@ mod tests {
         for bad_lat in ["pm", "pm:1:2", "rpc:5", "nope:5", "pm:x"] {
             assert!(
                 matches!(
-                    parse_model_params(&[], None, &[bad_lat.to_owned()], &[], &[]),
+                    parse_model_params(&[], None, &[bad_lat.to_owned()], &[], &[], None),
                     Err(HarnessError::Usage(_))
                 ),
                 "latency spec {bad_lat:?} must be a usage error"
@@ -2662,12 +2722,30 @@ mod tests {
         for bad_stale in ["okx", "mars:400", "okx:fast", "okx:-1"] {
             assert!(
                 matches!(
-                    parse_model_params(&[], None, &[], &[bad_stale.to_owned()], &[]),
+                    parse_model_params(&[], None, &[], &[bad_stale.to_owned()], &[], None),
                     Err(HarnessError::Usage(_))
                 ),
                 "stale spec {bad_stale:?} must be a usage error"
             );
         }
+        // VRP V3: a ppm above 100 % is a typo, not a ladder rung.
+        assert!(matches!(
+            parse_model_params(&[], None, &[], &[], &[], Some(OPT_SPREAD_FRAC_MAX + 1)),
+            Err(HarnessError::Usage(_))
+        ));
+        assert_eq!(
+            parse_model_params(&[], None, &[], &[], &[], Some(OPT_SPREAD_FRAC_MAX))
+                .unwrap()
+                .opt_spread_frac_1e6,
+            OPT_SPREAD_FRAC_MAX
+        );
+        // Absent = the D-7 floor alone, bit for bit with pre-V3.
+        assert_eq!(
+            parse_model_params(&[], None, &[], &[], &[], None)
+                .unwrap()
+                .opt_spread_frac_1e6,
+            0
+        );
     }
 
     // ---------------- run-dir names (§3.1) ----------------

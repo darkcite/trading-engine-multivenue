@@ -223,13 +223,42 @@ const EMPTY_OPEN: OpenOrder = OpenOrder {
     client_oid: 0,
 };
 
-/// D-7 half-spread (VM2 V5): `max(0.5% of mark, 1 tick)` ×1e6 —
+/// D-7 half-spread FLOOR (VM2 V5): `max(0.5% of mark, 1 tick)` ×1e6 —
 /// flat per venue by ruling; the 1-tick floor stands in for the
 /// "1 IV-tick equivalent" at these mark scales (documented
 /// implementation choice, printed with every report that used it).
 #[inline]
 pub fn mark_half_spread_1e6(mark_1e6: i64) -> i64 {
     (mark_1e6 / 200).max(1)
+}
+
+/// VRP V3: the half-spread actually charged at a D-7 synthetic option
+/// tick — `bid = mark − h`, `ask = mark + h`.
+///
+/// `frac_1e6` is `--option-spread-frac`: parts-per-million of the
+/// PREMIUM for the FULL crossed spread, so half of it lands on each
+/// side (`50_000` = 5 % crossed = 2.5 % per crossing). `0` = the D-7
+/// floor alone, which is what every report before this flag used —
+/// the flag can only ever WIDEN, never narrow, so the 0 rung is the
+/// optimistic bound of the ladder.
+///
+/// The widened leg is ceil-rounded — a wider spread is the
+/// conservative rounding — and the parser caps `frac_1e6` at
+/// [`crate::backtest::OPT_SPREAD_FRAC_MAX`], so `h ≤ mark / 2` and the
+/// `mark ± h` one line below in the mark-fill pass stays in `i64` for
+/// any mark under ⅔ `i64::MAX`. That bound is $6.1e12 of premium per
+/// contract at ×1e6 — the same order of headroom the pre-existing
+/// `mark + mark/200` floor already assumed.
+#[inline]
+pub fn opt_half_spread_1e6(mark_1e6: i64, frac_1e6: u32) -> i64 {
+    let floor = mark_half_spread_1e6(mark_1e6);
+    if frac_1e6 == 0 || mark_1e6 <= 0 {
+        return floor;
+    }
+    let num = mark_1e6 as i128 * frac_1e6 as i128;
+    let widened = (num + (2_000_000 - 1)) / 2_000_000;
+    debug_assert!(widened <= i64::MAX as i128, "frac capped at parse");
+    (widened as i64).max(floor)
 }
 
 /// One synthesized fill (§3.6.4 feedback + accounting input).
@@ -791,7 +820,8 @@ impl FillEngine {
         // zero-spread marks; displayed-size budgets are meaningless).
         if two_sided && self.mark_fill_syms.contains(&sym) {
             let mark = *self.marks_1e6.get(&sym).expect("mark just written");
-            let h = mark_half_spread_1e6(mark);
+            // VRP V3: the D-7 floor, widened by --option-spread-frac.
+            let h = opt_half_spread_1e6(mark, self.params.opt_spread_frac_1e6);
             let mut i = 0usize;
             while i < self.open_len {
                 let o = self.open[i];
@@ -1140,6 +1170,113 @@ mod tests {
         assert_eq!(o.fee_for(okx, notional, 1_000_000, 5), fee_ceil_1e12(notional, 5));
     }
 
+    // -------------- VRP V3: the assumed option spread --------------
+
+    /// The ladder the edge spec reports (0 / 2 / 5 / 10 % crossed) is
+    /// exact, monotone, and one-way: the flag can only WIDEN the D-7
+    /// floor, which is what makes the 0 rung an upper bound on the edge
+    /// rather than a middle estimate of it.
+    #[test]
+    fn option_spread_ladder_is_monotone_and_first_order_exact() {
+        // The measured median 8 h ATM premium, $219.07.
+        const MARK: i64 = 219_070_000;
+        let h = |f: u32| opt_half_spread_1e6(MARK, f);
+
+        // 0 = the D-7 floor alone: 0.5 % of mark, per side.
+        assert_eq!(h(0), MARK / 200);
+        assert_eq!(h(0), 1_095_350);
+        // frac is the CROSSED spread; half lands on each side.
+        assert_eq!(h(20_000), 2_190_700, "2 % crossed = 1 % per side");
+        assert_eq!(h(50_000), 5_476_750, "5 % crossed = 2.5 % per side");
+        assert_eq!(h(100_000), 10_953_500, "10 % crossed = 5 % per side");
+
+        // Strictly non-decreasing across the whole ladder.
+        let mut f = 0u32;
+        let mut prev = h(0);
+        while f <= 200_000 {
+            let cur = h(f);
+            assert!(cur >= prev, "ladder must never narrow: f={f}");
+            assert!(cur >= MARK / 200, "never below the D-7 floor: f={f}");
+            prev = cur;
+            f += 1_000;
+        }
+
+        // A rung under the floor cannot narrow it — 0.5 % crossed is
+        // 0.25 % per side, which the floor swallows.
+        assert_eq!(h(5_000), MARK / 200);
+        // A rung far under the floor is swallowed whole.
+        assert_eq!(h(1), MARK / 200);
+        // The 1-tick floor still holds at a mark of one tick, and a
+        // non-positive mark can never produce a negative half-spread.
+        assert_eq!(opt_half_spread_1e6(1, 0), 1);
+        assert_eq!(opt_half_spread_1e6(1, 500_000), 1);
+        assert_eq!(opt_half_spread_1e6(0, 500_000), 1);
+        assert_eq!(opt_half_spread_1e6(-5, 500_000), 1);
+        // Ceil, not floor: the widened leg rounds AGAINST us
+        // (3 x 100 % / 2 = 1.5 -> 2).
+        assert_eq!(opt_half_spread_1e6(3, crate::backtest::OPT_SPREAD_FRAC_MAX), 2);
+        // The parser cap means the widest legal rung is exactly half
+        // the mark — $1M of premium, 100 % crossed.
+        assert_eq!(
+            opt_half_spread_1e6(1_000_000_000_000, crate::backtest::OPT_SPREAD_FRAC_MAX),
+            500_000_000_000
+        );
+    }
+
+    /// The ladder where it actually costs money: a round trip through
+    /// the D-7 mark-fill pass pays exactly `2 × h` per contract, so the
+    /// option leg moves down by `premium × f` per round trip and by
+    /// `premium × f/2` per crossing — the first-order magnitude the
+    /// edge spec's ladder table is built from.
+    #[test]
+    fn a_mark_fill_round_trip_pays_exactly_the_crossed_spread() {
+        const MARK: i64 = 219_070_000;
+        const QTY: i64 = 1_000_000; // one contract
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+
+        let round_trip = |frac: u32| -> (i64, i64) {
+            let mut params = ModelParams {
+                latency_ns: [0; 7],
+                opt_spread_frac_1e6: frac,
+                ..ModelParams::default()
+            };
+            // Isolate the spread: the capped fee has its own tests.
+            params.opt_fee[VenueId::Deribit as usize] = crate::backtest::OptFee::OFF;
+            let mut e = FillEngine::new(params, 0);
+            e.set_mark_fill_sym(sym);
+
+            let mut out = Vec::new();
+            e.intake(&order(sym, Side::Bid, MARK, QTY, 1), 0);
+            e.on_record(&tick(sym, MARK, QTY, MARK, QTY), 10, 0, &mut out);
+            assert_eq!(out.len(), 1, "the buy fills at the mark tick");
+            let buy = out[0].px_1e6;
+
+            out.clear();
+            e.intake(&order(sym, Side::Ask, MARK, QTY, 2), 20);
+            e.on_record(&tick(sym, MARK, QTY, MARK, QTY), 30, 0, &mut out);
+            assert_eq!(out.len(), 1, "the sell fills at the mark tick");
+            (buy, out[0].px_1e6)
+        };
+
+        let mut prev_cost = i64::MIN;
+        for frac in [0u32, 20_000, 50_000, 100_000] {
+            let (buy, sell) = round_trip(frac);
+            let h = opt_half_spread_1e6(MARK, frac);
+            assert_eq!(buy, MARK + h, "a buy crosses UP by h at f={frac}");
+            assert_eq!(sell, MARK - h, "a sell crosses DOWN by h at f={frac}");
+            let cost = buy - sell;
+            assert_eq!(cost, 2 * h, "round trip pays the full crossed spread");
+            assert!(cost > prev_cost, "the ladder must move DOWN at f={frac}");
+            prev_cost = cost;
+        }
+
+        // The exact rungs, in dollars of premium per contract:
+        // 2 % of $219.07 = $4.3814, 5 % = $10.9535, 10 % = $21.907.
+        assert_eq!(round_trip(20_000).0 - round_trip(20_000).1, 4_381_400);
+        assert_eq!(round_trip(50_000).0 - round_trip(50_000).1, 10_953_500);
+        assert_eq!(round_trip(100_000).0 - round_trip(100_000).1, 21_907_000);
+    }
+
     /// The fee scales with size and never rounds in our favour.
     #[test]
     fn the_option_fee_scales_and_rounds_against_us() {
@@ -1199,7 +1336,7 @@ mod tests {
             fee_bps: [(0, 0); 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
-            opt_fee: ModelParams::default().opt_fee,
+            ..ModelParams::default()
         };
         FillEngine::new(p, boundary)
     }
@@ -1308,7 +1445,7 @@ mod tests {
             fee_bps: [(maker, taker); 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
-            opt_fee: ModelParams::default().opt_fee,
+            ..ModelParams::default()
         };
         FillEngine::new(p, boundary)
     }
@@ -1653,7 +1790,7 @@ mod tests {
             fee_bps: [(50, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // PM maker 50 bps
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
-            opt_fee: ModelParams::default().opt_fee,
+            ..ModelParams::default()
         };
         let mut e = FillEngine::new(p, 0); // all OOS
         let mut out = Vec::new();
@@ -1692,7 +1829,7 @@ mod tests {
             fee_bps: [(50, 0), (10, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
             latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
-            opt_fee: ModelParams::default().opt_fee,
+            ..ModelParams::default()
         };
         let mut e = FillEngine::new(p, 0);
         let mut out = Vec::new();
@@ -1984,7 +2121,7 @@ mod tests {
                 fee_bps: [(maker_bps, 0); 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
-                opt_fee: ModelParams::default().opt_fee,
+                ..ModelParams::default()
             };
             let mut e = FillEngine::new(params, u64::MAX / 2);
             let mut out = Vec::new();
@@ -2055,7 +2192,7 @@ mod tests {
                 fee_bps: [(0, taker_bps); 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
-                opt_fee: ModelParams::default().opt_fee,
+                ..ModelParams::default()
             };
             let mut e = FillEngine::new(params, u64::MAX / 2);
             let mut out = Vec::new();
@@ -2137,7 +2274,7 @@ mod tests {
                 fee_bps: [(maker_bps, 0); 7],
                 latency_ns: [0; 7],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
-                opt_fee: ModelParams::default().opt_fee,
+                ..ModelParams::default()
             };
             let mut e = FillEngine::new(params, 0);
             let mut out = Vec::new();

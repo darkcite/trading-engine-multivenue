@@ -6,6 +6,56 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — `detail_version: 6` — the assumed option spread is a flag (VRP V3)
+
+**What changed**
+- New flag `--option-spread-frac <ppm>` on `backtest` and `audit-pnl`
+  (not on `run`). It is the ASSUMED **crossed** option spread in
+  parts-per-million of premium — `50000` = 5 % — and half of it is
+  charged on each side of the D-7 synthetic option tick:
+  `bid = mark − h`, `ask = mark + h`. The parser rejects anything above
+  `1000000` (100 %).
+- `crates/cli/src/backtest/fill.rs` gains `opt_half_spread_1e6`, which
+  takes the **larger** of the old D-7 floor (`max(0.5 % of mark, 1
+  tick)`) and `mark × frac / 2`, ceil-rounded. The flag can therefore
+  only ever WIDEN: `--option-spread-frac 0` (the default) reproduces
+  every pre-V3 number bit for bit, and the 0 rung of the ladder is an
+  **upper bound** on the edge, not a middle estimate of it.
+- Both reports now print ONE identical assumption sentence, rendered by
+  the shared `backtest::opt::render_opt_mark_law`, naming the rung the
+  run executed at. It is printed whenever any option sym was registered
+  under the D-7 law — registration, not fills, is what makes the
+  assumption able to shape a number.
+- `--emit-detail` sidecar `detail_version` **5 → 6**:
+  `model.opt_spread_frac_1e6` and a new `options` block
+  (`mark_syms`, `mark_fills`, `spread_frac_1e6`, `law`).
+- `audit-pnl` stdout gains an `options` object with the same three
+  values, emitted **only** when option syms were registered, so
+  `audit_pnl_version` stays `1` and an option-free root renders
+  byte-identically.
+
+**Why**
+No options book exists anywhere in the capture — Deribit's TAIL rows
+carry a top-of-book quote and a mark, never a ladder — so every option
+fill in either report is a MODEL fill at `mark ± half-spread`. That
+half-spread was a hard-coded 0.5 % with no way to ask what the cell is
+worth if the real spread is 2 %, 5 % or 10 %. The edge spec's headline
+number is only meaningful next to that ladder, and a number whose
+assumption cannot be varied cannot be falsified.
+
+**Ripple effects**
+- Default behaviour is unchanged: schema-1 stdout, `AUDIT_PNL_VERSION`,
+  the `run` surface and the frozen worker argv are all untouched.
+- The sidecar changes for EVERY root, option-carrying or not — that is
+  what the version bump is for. The `options` block on an option-free
+  root reads `mark_syms: 0, mark_fills: 0`.
+- First-order magnitude, for reading the ladder: a round trip pays
+  exactly `2h` per contract, so the option leg moves down by
+  `premium × frac` per round trip and `premium × frac/2` per crossing.
+
+**Operator action**
+None. To reproduce a pre-V3 number, omit the flag (or pass `0`).
+
 ## 2026-09-10 — Deribit option trade fees are now CAPPED (VRP V2b)
 
 **What changed**

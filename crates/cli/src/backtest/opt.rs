@@ -393,6 +393,57 @@ impl UnderlyingBook {
     }
 }
 
+// ---------------------------------------------------------------
+// The D-7 standing assumption (VRP V3)
+// ---------------------------------------------------------------
+
+/// Render a ppm fraction as a percentage, integer-only and exact:
+/// `50_000` -> `"5%"`, `12_500` -> `"1.25%"`.
+#[inline]
+fn fmt_pct_ppm(ppm: u32) -> String {
+    let whole = ppm / 10_000;
+    let frac = ppm % 10_000;
+    if frac == 0 {
+        return format!("{whole}%");
+    }
+    let mut f = format!("{frac:04}");
+    while f.ends_with('0') {
+        f.pop();
+    }
+    format!("{whole}.{f}%")
+}
+
+/// The standing D-7 assumption line, rendered IDENTICALLY by
+/// `backtest` and `audit-pnl` so an operator diffing the two surfaces
+/// sees one sentence, not two paraphrases.
+///
+/// There is no options book anywhere in the capture — Deribit's TAIL
+/// rows carry a top-of-book quote and a mark, never a ladder — so
+/// every option fill in either report is a MODEL fill at
+/// `mark ± half-spread`. `frac_1e6` is the assumed CROSSED spread in
+/// parts-per-million of premium (`--option-spread-frac`); `0` is the
+/// D-7 floor alone, and because the flag can only widen, the `0` rung
+/// is the optimistic end of the ladder — an upper bound on the edge,
+/// not a measurement of it.
+pub fn render_opt_mark_law(n_syms: usize, frac_1e6: u32) -> String {
+    let spread = if frac_1e6 == 0 {
+        "max(0.5% of mark, 1 tick) per side (the D-7 floor; --option-spread-frac unset)".to_owned()
+    } else {
+        format!(
+            "max(0.5% of mark, 1 tick, {} of mark) per side (--option-spread-frac {} = {} crossed)",
+            fmt_pct_ppm(frac_1e6 / 2),
+            frac_1e6,
+            fmt_pct_ppm(frac_1e6)
+        )
+    };
+    format!(
+        "OPTIONS MARK-FILL LAW (D-7): {n_syms} option sym(s) execute at mark ± {spread}, \
+         with TAKER fees, and are valued at mark — no options book exists in the capture, \
+         so option fills are D-7 mark-fills at an ASSUMED spread — upper bound. The \
+         assumption applies wherever these syms filled."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +758,38 @@ mod tests {
         let mut t2 = tick(sym, 2_000, 10_000, 10_000);
         assert_eq!(b.convert_quote(&mut t2), QuoteFix::Converted);
         assert_eq!(t2.bid_px.raw(), 800_000_000);
+    }
+
+    // ---------------- the D-7 assumption line (V3) ----------------
+
+    #[test]
+    fn pct_ppm_renders_exactly_and_trims() {
+        assert_eq!(fmt_pct_ppm(0), "0%");
+        assert_eq!(fmt_pct_ppm(20_000), "2%");
+        assert_eq!(fmt_pct_ppm(50_000), "5%");
+        assert_eq!(fmt_pct_ppm(100_000), "10%");
+        assert_eq!(fmt_pct_ppm(1_000_000), "100%");
+        assert_eq!(fmt_pct_ppm(12_500), "1.25%");
+        assert_eq!(fmt_pct_ppm(25_000), "2.5%");
+        assert_eq!(fmt_pct_ppm(1), "0.0001%");
+    }
+
+    #[test]
+    fn mark_law_names_the_ladder_rung_it_ran_at() {
+        // The obligation: the words a reader greps for are present at
+        // EVERY rung, and the rung itself is named.
+        let zero = render_opt_mark_law(3, 0);
+        assert!(zero.contains("OPTIONS MARK-FILL LAW (D-7)"), "{zero}");
+        assert!(zero.contains("ASSUMED spread — upper bound"), "{zero}");
+        assert!(zero.contains("3 option sym(s)"), "{zero}");
+        assert!(zero.contains("--option-spread-frac unset"), "{zero}");
+
+        let five = render_opt_mark_law(1, 50_000);
+        assert!(five.contains("ASSUMED spread — upper bound"), "{five}");
+        // 5 % crossed is 2.5 % per side — both halves are stated so a
+        // reader never has to guess which one the flag meant.
+        assert!(five.contains("2.5% of mark) per side"), "{five}");
+        assert!(five.contains("--option-spread-frac 50000 = 5% crossed"), "{five}");
     }
 
     #[test]

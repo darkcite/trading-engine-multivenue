@@ -124,6 +124,10 @@ pub struct AuditPnlConfig {
     /// VRP V2b: repeatable `--opt-fee <venue>:<index_bps>:<prem_bps>`
     /// (or `<venue>:off`).
     pub opt_fee: Vec<String>,
+    /// VRP V3: `--option-spread-frac <ppm>` — the ASSUMED crossed
+    /// option spread as parts-per-million of premium. `None` = 0 =
+    /// the D-7 floor alone.
+    pub option_spread_frac_1e6: Option<u32>,
     /// RG3: `--regime` (the backtest's law, [`RegimeMode`]).
     pub regime: RegimeMode,
     /// RG3: `--regime-seed <path>` (default = the first run's own
@@ -758,6 +762,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         &cfg.latency_ns_venue,
         &cfg.stale_after_ms,
         &cfg.opt_fee,
+        cfg.option_spread_frac_1e6,
     )?;
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut interner = SymInterner::default();
@@ -836,8 +841,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // D-7 obligation: the assumption is PRINTED wherever it can
         // shape numbers.
         report(&format!(
-            "audit-pnl: OPTIONS MARK-FILL LAW (D-7): {} option sym(s) execute at              mark ± max(0.5%, 1 tick) with TAKER fees and value at mark — no real              options book exists in the capture; assumption applies wherever these              syms filled",
-            mark_fill_syms.len()
+            "audit-pnl: {}",
+            crate::backtest::opt::render_opt_mark_law(
+                mark_fill_syms.len(),
+                params.opt_spread_frac_1e6
+            )
         ));
     }
 
@@ -850,6 +858,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 latency_ns: params.latency_ns,
                 stale_after_ms: params.stale_after_ms,
                 opt_fee: params.opt_fee,
+                opt_spread_frac_1e6: params.opt_spread_frac_1e6,
             },
             0,
         );
@@ -1194,10 +1203,25 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     json.push_str(&format!(
         "{{\"audit_pnl_version\":{AUDIT_PNL_VERSION},\"runs\":{},\"window\":{{\"wall_first_ns\":{wall_first},\
          \"wall_last_ns\":{wall_last},\"utc_days\":{utc_days}}},\"paper\":{{\"fills\":{paper_fills},\
-         \"net_usd\":\"{}\"}},\"strategies\":[",
+         \"net_usd\":\"{}\"}},",
         loads.len(),
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_net_1e12)),
     ));
+    // VRP V3: additive, and emitted ONLY when option syms were
+    // registered — a root that captured no options renders exactly as
+    // it did before the flag, so `audit_pnl_version` stays 1.
+    if !mark_fill_syms.is_empty() {
+        json.push_str(&format!(
+            "\"options\":{{\"mark_syms\":{},\"spread_frac_1e6\":{},\"law\":\"{}\"}},",
+            mark_fill_syms.len(),
+            params.opt_spread_frac_1e6,
+            crate::backtest::opt::render_opt_mark_law(
+                mark_fill_syms.len(),
+                params.opt_spread_frac_1e6
+            )
+        ));
+    }
+    json.push_str("\"strategies\":[");
     for (i, (sid, row)) in rows.iter().enumerate() {
         if i > 0 {
             json.push(',');
