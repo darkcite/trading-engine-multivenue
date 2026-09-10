@@ -168,6 +168,17 @@ fn fee_ceil_1e12(notional_1e12: i128, bps: u32) -> i128 {
     (notional_1e12 * bps as i128 + 9_999) / 10_000
 }
 
+/// VX: the same ceil at a tenth of a basis point, for the settlement
+/// leg. Deribit settles at 0.00015 of the index — exactly half its
+/// 0.0003 trade rate, and half of 3 bps is not an integer number of
+/// bps. A finer unit stores the law; rounding it to 1 or 2 bps would
+/// mis-state every expiry by a third.
+#[inline]
+fn fee_ceil_tenth_bps_1e12(notional_1e12: i128, tenth_bps: u32) -> i128 {
+    debug_assert!(notional_1e12 >= 0);
+    (notional_1e12 * tenth_bps as i128 + 99_999) / 100_000
+}
+
 // ---------------------------------------------------------------
 // Open-order table (§4.1)
 // ---------------------------------------------------------------
@@ -578,6 +589,12 @@ pub struct FillEngine {
     /// Its presence is what marks a sym as fee-capped — an empty map is
     /// the pre-V2b model exactly.
     opt_index_1e6: BTreeMap<u32, i64>,
+    /// VX: expiry instant per option sym, so a fill AT OR AFTER it is
+    /// priced as a SETTLEMENT rather than a trade. Derived, not
+    /// flagged: the venue's own rule is "an option stops trading at
+    /// expiry", so the timestamp is the classification and no wire
+    /// field has to carry one.
+    opt_expiry_ns: BTreeMap<u32, u64>,
     mark_fills: u64,
     fills_total: u64,
     oos_trades: u64,
@@ -613,6 +630,7 @@ impl FillEngine {
             oos_days: BTreeSet::new(),
             mark_fill_syms: BTreeSet::new(),
             opt_index_1e6: BTreeMap::new(),
+            opt_expiry_ns: BTreeMap::new(),
             mark_fills: 0,
             fills_total: 0,
             oos_trades: 0,
@@ -956,7 +974,14 @@ impl FillEngine {
     /// has given it an index (`set_opt_index`); every other sym takes
     /// the flat-bps path byte-for-byte as before.
     #[inline]
-    fn fee_for(&self, sym: u32, notional_1e12: i128, fill_qty: i64, fee_bps: u32) -> i128 {
+    fn fee_for(
+        &self,
+        sym: u32,
+        notional_1e12: i128,
+        fill_qty: i64,
+        fee_bps: u32,
+        wall_ns: u64,
+    ) -> i128 {
         let venue = model_venue_byte(sym) as usize;
         let Some(&index_1e6) = self.opt_index_1e6.get(&sym) else {
             return fee_ceil_1e12(notional_1e12, fee_bps);
@@ -966,7 +991,19 @@ impl FillEngine {
             _ => return fee_ceil_1e12(notional_1e12, fee_bps),
         };
         let index_notional_1e12 = index_1e6 as i128 * fill_qty as i128;
-        let index_leg = fee_ceil_1e12(index_notional_1e12, f.index_bps);
+        // VX: at or after expiry the instrument no longer trades — the
+        // fill IS the cash settlement, and the venue charges half the
+        // index rate for it. The premium cap is the same 12.5 %, taken
+        // against the settlement value rather than a premium.
+        let settling = self
+            .opt_expiry_ns
+            .get(&sym)
+            .is_some_and(|&e| e > 0 && wall_ns >= e);
+        let index_leg = if settling {
+            fee_ceil_tenth_bps_1e12(index_notional_1e12, f.settle_index_tenth_bps)
+        } else {
+            fee_ceil_1e12(index_notional_1e12, f.index_bps)
+        };
         let premium_cap = fee_ceil_1e12(notional_1e12, f.prem_bps);
         index_leg.min(premium_cap)
     }
@@ -976,6 +1013,15 @@ impl FillEngine {
     pub fn set_opt_index(&mut self, sym: u32, index_1e6: i64) {
         if index_1e6 > 0 {
             self.opt_index_1e6.insert(sym, index_1e6);
+        }
+    }
+
+    /// VX: record an option sym's expiry, so a fill at or after it is
+    /// charged the venue's SETTLEMENT rate rather than its trade rate.
+    /// From the run's own registry; boot of the replay loop.
+    pub fn set_opt_expiry(&mut self, sym: u32, expiry_ns: u64) {
+        if expiry_ns > 0 {
+            self.opt_expiry_ns.insert(sym, expiry_ns);
         }
     }
 
@@ -991,7 +1037,7 @@ impl FillEngine {
     ) {
         debug_assert!(fill_px > 0 && fill_qty > 0);
         let notional_1e12 = fill_px as i128 * fill_qty as i128;
-        let fee_1e12 = self.fee_for(o.sym, notional_1e12, fill_qty, fee_bps);
+        let fee_1e12 = self.fee_for(o.sym, notional_1e12, fill_qty, fee_bps, wall_ns);
         self.full
             .apply_fill(o.sym, o.side, fill_px, fill_qty, fee_1e12, mark);
         self.bounds_refresh(o.sym, mark);
@@ -1111,7 +1157,7 @@ mod tests {
             let notional = premium_usd_1e6 as i128 * QTY_1E6 as i128;
             // 999 = a flat bps that would be wrong either way, so a
             // result matching it would mean the option law never ran.
-            e.fee_for(sym, notional, QTY_1E6, 999)
+            e.fee_for(sym, notional, QTY_1E6, 999, 0)
         };
 
         // INDEX BINDS — the measured median 8 h ATM premium, $219.07.
@@ -1137,8 +1183,8 @@ mod tests {
         let e = FillEngine::new(ModelParams::default(), 0);
         let perp = core_types::make_symbol_id(VenueId::Deribit, 1);
         let notional = 78_235_000_000i128 * 1_000_000i128;
-        assert_eq!(e.fee_for(perp, notional, 1_000_000, 5), fee_ceil_1e12(notional, 5));
-        assert_eq!(e.fee_for(perp, notional, 1_000_000, 0), 0);
+        assert_eq!(e.fee_for(perp, notional, 1_000_000, 5, 0), fee_ceil_1e12(notional, 5));
+        assert_eq!(e.fee_for(perp, notional, 1_000_000, 0, 0), 0);
     }
 
     /// `--opt-fee <venue>:off` returns that venue's options to the flat
@@ -1150,14 +1196,14 @@ mod tests {
 
         let mut on = FillEngine::new(ModelParams::default(), 0);
         on.set_opt_index(sym, 79_000_000_000);
-        assert_eq!(on.fee_for(sym, notional, 1_000_000, 5), 23_700_000_000_000);
+        assert_eq!(on.fee_for(sym, notional, 1_000_000, 5, 0), 23_700_000_000_000);
 
         let mut params = ModelParams::default();
         params.opt_fee[VenueId::Deribit as usize] = crate::backtest::OptFee::OFF;
         let mut off = FillEngine::new(params, 0);
         off.set_opt_index(sym, 79_000_000_000);
         assert_eq!(
-            off.fee_for(sym, notional, 1_000_000, 5),
+            off.fee_for(sym, notional, 1_000_000, 5, 0),
             fee_ceil_1e12(notional, 5),
             "off must be the flat path exactly"
         );
@@ -1167,7 +1213,69 @@ mod tests {
         let okx = core_types::make_symbol_id(VenueId::Okx, 513);
         let mut o = FillEngine::new(ModelParams::default(), 0);
         o.set_opt_index(okx, 79_000_000_000);
-        assert_eq!(o.fee_for(okx, notional, 1_000_000, 5), fee_ceil_1e12(notional, 5));
+        assert_eq!(o.fee_for(okx, notional, 1_000_000, 5, 0), fee_ceil_1e12(notional, 5));
+    }
+
+    /// VX: at or after expiry the fill IS the cash settlement, and the
+    /// venue charges HALF its index rate for it. The premium cap is
+    /// unchanged at 12.5 %, taken against the settlement value.
+    #[test]
+    fn a_fill_at_expiry_pays_the_settlement_rate_not_the_trade_rate() {
+        const INDEX_1E6: i64 = 79_000_000_000; // $79,000
+        const QTY_1E6: i64 = 1_000_000;
+        const EXPIRY: u64 = 1_789_027_200_000_000_000;
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        e.set_opt_index(sym, INDEX_1E6);
+        e.set_opt_expiry(sym, EXPIRY);
+
+        let fee = |value_1e6: i64, wall: u64| {
+            let notional = value_1e6 as i128 * QTY_1E6 as i128;
+            e.fee_for(sym, notional, QTY_1E6, 999, wall)
+        };
+
+        // A trade one nanosecond before expiry: the index leg at 3 bps
+        // = $23.70 (the V2b number), because the premium cap on a
+        // $1,000 intrinsic is $125.
+        assert_eq!(fee(1_000_000_000, EXPIRY - 1), 23_700_000_000_000);
+        // The SAME fill at expiry: 1.5 bps = $11.85, exactly half.
+        assert_eq!(fee(1_000_000_000, EXPIRY), 11_850_000_000_000);
+        assert_eq!(fee(1_000_000_000, EXPIRY + 3_600_000_000_000), 11_850_000_000_000);
+
+        // Deep OTM-adjacent: a $50 settlement value caps at 12.5 % =
+        // $6.25, which binds below the $11.85 index leg — the cap works
+        // the same way on the settlement side.
+        assert_eq!(fee(50_000_000, EXPIRY), 6_250_000_000_000);
+        // The settlement crossover is at value = index x 15/12500 =
+        // 0.12 % of the index, half the trade crossover's 0.24 %.
+        assert_eq!(fee(94_800_000, EXPIRY), 11_850_000_000_000);
+        assert!(fee(94_790_000, EXPIRY) < 11_850_000_000_000);
+        assert_eq!(94_800_000i64 * 12_500, INDEX_1E6 * 15);
+
+        // A sym with no expiry recorded is never a settlement.
+        let plain = core_types::make_symbol_id(VenueId::Deribit, 514);
+        let mut e2 = FillEngine::new(ModelParams::default(), 0);
+        e2.set_opt_index(plain, INDEX_1E6);
+        let n = 1_000_000_000i128 * QTY_1E6 as i128;
+        assert_eq!(
+            e2.fee_for(plain, n, QTY_1E6, 999, EXPIRY + 1),
+            23_700_000_000_000,
+            "no expiry known ⇒ the trade rate, never a guess"
+        );
+    }
+
+    /// The tenth-of-a-bp ceil is a ceil, and it is the finer unit the
+    /// settlement rate actually needs.
+    #[test]
+    fn the_settlement_ceil_rounds_up_at_a_tenth_of_a_bp() {
+        assert_eq!(fee_ceil_tenth_bps_1e12(100_000, 15), 15);
+        assert_eq!(fee_ceil_tenth_bps_1e12(100_001, 15), 16, "ceil, not floor");
+        assert_eq!(fee_ceil_tenth_bps_1e12(0, 15), 0);
+        assert_eq!(fee_ceil_tenth_bps_1e12(1, 0), 0);
+        // 15 tenths is exactly half of 3 bps — the relationship the
+        // unit exists to preserve.
+        let n = 79_000_000_000_000_000i128;
+        assert_eq!(fee_ceil_tenth_bps_1e12(n, 15) * 2, fee_ceil_1e12(n, 3));
     }
 
     // -------------- VRP V3: the assumed option spread --------------
@@ -1283,11 +1391,11 @@ mod tests {
         let mut e = FillEngine::new(ModelParams::default(), 0);
         let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
         e.set_opt_index(sym, 79_000_000_000);
-        let one = e.fee_for(sym, 219_070_000i128 * 1_000_000, 1_000_000, 999);
-        let ten = e.fee_for(sym, 219_070_000i128 * 10_000_000, 10_000_000, 999);
+        let one = e.fee_for(sym, 219_070_000i128 * 1_000_000, 1_000_000, 999, 0);
+        let ten = e.fee_for(sym, 219_070_000i128 * 10_000_000, 10_000_000, 999, 0);
         assert_eq!(ten, one * 10);
         // Ceil: a premium that divides badly still rounds up.
-        let odd = e.fee_for(sym, 7i128, 1, 999);
+        let odd = e.fee_for(sym, 7i128, 1, 999, 0);
         assert!(odd > 0, "a non-zero notional never yields a zero fee");
     }
 

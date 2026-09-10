@@ -63,7 +63,17 @@
 //!                     on entry, submit the option IoC + the first hedge
 //! every rebalance_ns  re-hedge if |target − current| ≥ band
 //! E − ε               unwind both legs
+//! E                   still holding? European CASH SETTLE at intrinsic
 //! ```
+//!
+//! The settle rung (VX, operator ruling O-D4) is the last word on a
+//! position, not an alternative exit. The member aims to be flat by
+//! E − ε; the rung exists because "aims to" is not "is" — a submit ring
+//! that stayed full, a data gap that swallowed the ε instant, an option
+//! lane that went quiet. At expiry the instrument stops being tradeable
+//! and becomes `max(0, S − K)` in cash, so the member books that and
+//! nothing else. An expiry that passes with no records at all settles on
+//! the first record after it, tick or summary, rather than being missed.
 //!
 //! ## Hot-path rules
 //!
@@ -89,6 +99,7 @@
 //! | regime gate HARD closed | flatten now | `regime_exits` |
 //! | an entry (or a growing hedge) over a risk-policy cap | refused | `caps_rejected` |
 //! | kill criterion 3: a full trailing-60 window where the forecast stopped beating IV | HALT for the life of the process | `killed` |
+//! | at expiry with no usable index | settlement DEFERRED to the next record | `stale_skips` |
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -142,6 +153,14 @@ pub const CAP_SYM_1E6: i64 = 20_000_000_000;
 /// Table cap USD ×1e6 (both legs together).
 pub const CAP_TABLE_1E6: i64 = 100_000_000_000;
 
+/// VX: Deribit's settlement schedule, for the record — the member emits
+/// the settling order and the harness's fill engine charges the fee, so
+/// these numbers live in `cli::backtest::fill` and are repeated here
+/// only so a reader of this crate knows what an expiry costs:
+/// `min(0.00015 × index, 0.125 × settlement value)` per contract, and
+/// **an option expiring out of the money is free** — which is why an OTM
+/// expiry here emits no order at all rather than a zero-priced one.
+///
 /// `side` value for a flat campaign.
 pub const SIDE_FLAT: i8 = 0;
 /// `side` value for LONG vol — implied vol was BELOW the band, so we buy
@@ -238,6 +257,9 @@ pub struct VrpStrategy {
     /// Minute-roll state for the forecast's ingest.
     minute_id: u64,
     last_underlying_mid_1e6: i64,
+    /// Wall instant of that mid, so the settle rung can pick whichever
+    /// of the two index sources is FRESHER.
+    last_underlying_wall_ns: u64,
 
     /// The selected option for the current campaign.
     selected_sym: SymbolId,
@@ -308,6 +330,7 @@ impl VrpStrategy {
             hedge_sym: SYMBOL_ID_NONE,
             minute_id: 0,
             last_underlying_mid_1e6: 0,
+            last_underlying_wall_ns: 0,
             selected_sym: SYMBOL_ID_NONE,
             expiry_ns: 0,
             last_mark: OptMarkCache::default(),
@@ -618,15 +641,127 @@ impl VrpStrategy {
         // Fold the settled hold back into the forecast. `observe_settlement`
         // ignores an unarmed engine, so a campaign that never entered
         // contributes nothing — which is right: there was no hold.
-        if self.vol.is_armed() {
-            if let Some(rv) = self.realised_rv_1e9() {
-                self.vol.observe_settlement(rv);
-                self.counters.settlements = self.counters.settlements.wrapping_add(1);
-                self.refresh_qlike();
-            }
-        }
+        self.settle_forecast();
         self.end_campaign();
         true
+    }
+
+    /// The best index this member can stand behind right now: whichever
+    /// of its two sources is FRESHER — the last option record's own
+    /// `underlying_px_1e9`, or the last fresh mid of the underlying's
+    /// tick lane.
+    ///
+    /// Freshness, not preference: the option lane can go quiet for hours
+    /// while the perp keeps printing, and settling an expiry against an
+    /// eight-hour-old forward would book a payoff the option did not
+    /// have. `None` when there is neither, at which point the member
+    /// defers rather than settling against a number it made up.
+    #[inline]
+    fn settle_index_1e6(&self) -> Option<i64> {
+        let from_opt = (self.last_mark.underlying_px_1e9 > 0)
+            .then_some((self.last_mark.wall_ns, self.last_mark.underlying_px_1e9 / 1_000));
+        let from_tick = (self.last_underlying_mid_1e6 > 0)
+            .then_some((self.last_underlying_wall_ns, self.last_underlying_mid_1e6));
+        match (from_opt, from_tick) {
+            (Some((wo, po)), Some((wt, pt))) => Some(if wt >= wo { pt } else { po }),
+            (Some((_, po)), None) => Some(po),
+            (None, Some((_, pt))) => Some(pt),
+            (None, None) => None,
+        }
+    }
+
+    /// European cash settlement value of one unit at index `s_1e6`:
+    /// `max(0, S − K)` for a call, `max(0, K − S)` for a put.
+    #[inline]
+    #[must_use]
+    pub const fn intrinsic_1e6(s_1e6: i64, strike_1e6: i64, right: u8) -> i64 {
+        let v = if right == RIGHT_CALL {
+            s_1e6 - strike_1e6
+        } else {
+            strike_1e6 - s_1e6
+        };
+        if v > 0 {
+            v
+        } else {
+            0
+        }
+    }
+
+    /// VX: the European cash settle. Returns true when the campaign
+    /// ended here.
+    ///
+    /// Runs on ANY callback, so an expiry that passed while no record
+    /// arrived settles on the first one after it. It runs BEFORE the
+    /// E−ε law on the same instant, because at or after expiry there is
+    /// no mark to unwind against — the instrument is cash now.
+    fn maybe_settle<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) -> bool {
+        if self.selected_sym == SYMBOL_ID_NONE || self.expiry_ns == 0 || wall_ns < self.expiry_ns {
+            return false;
+        }
+        // Nothing held: the E−ε law already did its job, so expiry is
+        // just the end of the campaign.
+        if self.opt_pos_qty_1e6 == 0 && self.perp_pos_qty_1e6 == 0 {
+            self.settle_forecast();
+            self.end_campaign();
+            return true;
+        }
+        let Some(row) = self.registry.get(self.selected_sym).copied() else {
+            return false;
+        };
+        let Some(s_1e6) = self.settle_index_1e6() else {
+            // No index we can stand behind. DEFER — a settlement priced
+            // off a number the member invented is worse than a late one.
+            self.counters.stale_skips = self.counters.stale_skips.wrapping_add(1);
+            return false;
+        };
+        let value_1e6 = Self::intrinsic_1e6(s_1e6, row.strike_1e6, row.right);
+        if self.opt_pos_qty_1e6 != 0 {
+            if value_1e6 > 0 {
+                // ITM: book the intrinsic. A closing order at the
+                // settlement price is how a paper member says "this
+                // position became cash at this value".
+                let closing = -self.opt_pos_qty_1e6;
+                let sym = self.selected_sym;
+                let Some(order) = self.ioc(sym, value_1e6, closing, now) else {
+                    return false;
+                };
+                if !self.submit(ctx, order) {
+                    return false; // ring full — retry on the next record
+                }
+                self.opt_pos_qty_1e6 = 0;
+                self.counters.settled_itm = self.counters.settled_itm.wrapping_add(1);
+            } else {
+                // OTM: the option is worth nothing and the venue charges
+                // nothing. There is no order to place — a zero-priced
+                // one would be a fiction, and a mark-priced one would
+                // book value that expired.
+                self.opt_pos_qty_1e6 = 0;
+                self.counters.settled_otm = self.counters.settled_otm.wrapping_add(1);
+            }
+        }
+        if self.perp_pos_qty_1e6 != 0 {
+            self.last_mark.underlying_px_1e9 = s_1e6.saturating_mul(1_000);
+            if !self.move_hedge(ctx, 0, now) {
+                return false; // the hedge still stands; retry
+            }
+        }
+        self.settle_forecast();
+        self.end_campaign();
+        true
+    }
+
+    /// Fold a finished hold back into the forecast. Shared by the E−ε
+    /// exit and the settle rung so a campaign contributes exactly once
+    /// however it ended.
+    fn settle_forecast(&mut self) {
+        if !self.vol.is_armed() {
+            return;
+        }
+        if let Some(rv) = self.realised_rv_1e9() {
+            self.vol.observe_settlement(rv);
+            self.counters.settlements = self.counters.settlements.wrapping_add(1);
+            self.refresh_qlike();
+        }
     }
 
     /// Realised vol over the hold that just ended, raw bps ×1e9 — the
@@ -855,6 +990,7 @@ impl Strategy for VrpStrategy {
             if self.minute_id == 0 {
                 self.minute_id = minute;
                 self.last_underlying_mid_1e6 = mid;
+                self.last_underlying_wall_ns = wall_ns;
             } else if minute != self.minute_id {
                 // The CLOSE of a minute is its last mid, so the roll
                 // publishes the value carried across the boundary, not
@@ -863,6 +999,10 @@ impl Strategy for VrpStrategy {
                 self.minute_id = minute;
             }
             self.last_underlying_mid_1e6 = mid;
+            self.last_underlying_wall_ns = wall_ns;
+        }
+        if self.maybe_settle(ctx, wall_ns, now) {
+            return;
         }
         self.maybe_rebalance(ctx, wall_ns, now);
         self.maybe_exit(ctx, wall_ns, now);
@@ -913,6 +1053,9 @@ impl Strategy for VrpStrategy {
             delta_1e9: opt.delta_1e9,
             _pad: [0; 4],
         };
+        if self.maybe_settle(ctx, wall_ns, now) {
+            return;
+        }
         self.decide(ctx, wall_ns, now);
         self.maybe_exit(ctx, wall_ns, now);
     }
@@ -1561,6 +1704,179 @@ mod tests {
         assert_eq!(m.vrp_counters().entries, 0);
         assert!(ctx.orders.is_empty());
         assert!(m.is_killed(), "nothing clears it inside this process");
+    }
+
+    // ---------------- VX: European cash settlement ----------------
+
+    #[test]
+    fn intrinsic_is_the_european_payoff_and_never_negative() {
+        // A call is worth S − K when that is positive and nothing when
+        // it is not; a put is the mirror. There is no time value at
+        // expiry, which is the whole point of settling rather than
+        // marking.
+        let k = 79_000_000_000i64;
+        assert_eq!(VrpStrategy::intrinsic_1e6(80_000_000_000, k, RIGHT_CALL), 1_000_000_000);
+        assert_eq!(VrpStrategy::intrinsic_1e6(78_000_000_000, k, RIGHT_CALL), 0);
+        assert_eq!(VrpStrategy::intrinsic_1e6(k, k, RIGHT_CALL), 0, "ATM is worthless");
+        assert_eq!(VrpStrategy::intrinsic_1e6(78_000_000_000, k, RIGHT_PUT), 1_000_000_000);
+        assert_eq!(VrpStrategy::intrinsic_1e6(80_000_000_000, k, RIGHT_PUT), 0);
+        assert_eq!(VrpStrategy::intrinsic_1e6(k, k, RIGHT_PUT), 0);
+    }
+
+    /// Drive a campaign to a held position and then jump straight past
+    /// expiry without ever passing E−ε — the "engine was down / the
+    /// lane went quiet" path the settle rung exists for.
+    fn campaign_at_expiry(ctx: &mut RecCtx, params: VrpParams) -> VrpStrategy {
+        let (mut m, _) = member(ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), ctx);
+        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "the campaign is open");
+        ctx.orders.clear();
+        m
+    }
+
+    #[test]
+    fn an_in_the_money_expiry_settles_at_intrinsic() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = campaign_at_expiry(&mut ctx, params);
+        // The index closes $1,500 above the 79,000 strike.
+        let s_1e6 = 80_500_000_000i64;
+        ctx.now = mono_of(EXPIRY);
+        let mut o = summary(EXPIRY, opt_sym(4), 5_000_000_000, 500_000_000);
+        o.underlying_px_1e9 = s_1e6.saturating_mul(1_000);
+        m.on_opt_summary(&o, &mut ctx);
+
+        assert_eq!(m.vrp_counters().settled_itm, 1);
+        assert_eq!(m.vrp_counters().settled_otm, 0);
+        assert_eq!(ctx.orders.len(), 2, "the option's cash value and the hedge");
+        // The option leg books max(0, S − K) = $1,500, not a mark.
+        assert_eq!(ctx.orders[0].sym, opt_sym(4));
+        assert_eq!(ctx.orders[0].px.raw(), 1_500_000_000);
+        assert_eq!(ctx.orders[0].side, Side::Bid, "buying back the short");
+        assert_eq!(ctx.orders[0].qty.raw(), params.qty_1e6);
+        assert_eq!(ctx.orders[1].sym, perp_sym());
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+        assert_eq!(m.perp_pos_qty_1e6(), 0);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
+        // And the hold still fed the forecast.
+        assert_eq!(m.vrp_counters().settlements, 1);
+    }
+
+    #[test]
+    fn an_out_of_the_money_expiry_emits_no_order_at_all() {
+        // The option is worth nothing and the venue charges nothing for
+        // an OTM expiry, so there is no fill to price. A zero-priced
+        // order would be a fiction and a mark-priced one would book
+        // value that expired.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = campaign_at_expiry(&mut ctx, params);
+        let s_1e6 = 77_500_000_000i64; // below the 79,000 strike
+        ctx.now = mono_of(EXPIRY);
+        let mut o = summary(EXPIRY, opt_sym(4), 5_000_000_000, 500_000_000);
+        o.underlying_px_1e9 = s_1e6.saturating_mul(1_000);
+        m.on_opt_summary(&o, &mut ctx);
+
+        assert_eq!(m.vrp_counters().settled_otm, 1);
+        assert_eq!(m.vrp_counters().settled_itm, 0);
+        assert_eq!(ctx.orders.len(), 1, "ONLY the hedge unwinds");
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "the option expired worthless");
+        assert_eq!(m.perp_pos_qty_1e6(), 0);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
+    }
+
+    #[test]
+    fn an_at_the_money_expiry_is_out_of_the_money() {
+        // S == K pays nothing. The boundary is worth pinning: a `>=`
+        // here would book a zero-priced order every time the index
+        // closes exactly on the strike.
+        let mut ctx = RecCtx::new();
+        let mut m = campaign_at_expiry(&mut ctx, VrpParams::default());
+        ctx.now = mono_of(EXPIRY);
+        let mut o = summary(EXPIRY, opt_sym(4), 5_000_000_000, 500_000_000);
+        o.underlying_px_1e9 = 79_000_000_000i64.saturating_mul(1_000);
+        m.on_opt_summary(&o, &mut ctx);
+        assert_eq!(m.vrp_counters().settled_otm, 1);
+        assert_eq!(ctx.orders.len(), 1, "hedge only");
+    }
+
+    #[test]
+    fn an_expiry_that_passed_unseen_settles_on_the_next_record() {
+        // The E−ε instant went by with no record at all — a data gap,
+        // or the process was elsewhere. The next record after expiry is
+        // an underlying TICK, not an option summary, so the settle rung
+        // has to work off the tick lane's own mid.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = campaign_at_expiry(&mut ctx, params);
+        let s_1e6 = 81_000_000_000i64;
+        let late = EXPIRY + 6 * 3_600_000_000_000; // six hours late
+        ctx.now = mono_of(late);
+        m.on_tick(&tick(late, s_1e6, false), &mut ctx);
+
+        assert_eq!(m.vrp_counters().settled_itm, 1, "settled on a TICK");
+        assert_eq!(ctx.orders.len(), 2);
+        // Priced off the FRESHER of the two index sources: the tick
+        // that arrived six hours after the option lane went quiet.
+        // 81,000 − 79,000 = $2,000.
+        assert_eq!(ctx.orders[0].px.raw(), 2_000_000_000);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
+    }
+
+    #[test]
+    fn an_expiry_with_no_index_defers_rather_than_inventing_one() {
+        // A settlement priced off a number the member made up is worse
+        // than a late one.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = VrpStrategy::new();
+        m.configure(
+            params,
+            registry(),
+            perp_sym(),
+            perp_sym(),
+            WallAnchor::new(MONO0, WALL0),
+            [0; 32],
+        )
+        .expect("configure");
+        // Force a campaign into existence with a position but no index:
+        // hand-set the state the way a restart-with-persistence would.
+        m.selected_sym = opt_sym(4);
+        m.expiry_ns = EXPIRY;
+        m.opt_pos_qty_1e6 = -params.qty_1e6;
+        ctx.now = mono_of(EXPIRY + 1);
+        let before = m.vrp_counters().stale_skips;
+        assert!(!m.maybe_settle(&mut ctx, EXPIRY + 1, mono_of(EXPIRY + 1)));
+        assert_eq!(m.vrp_counters().stale_skips, before + 1);
+        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "still held");
+        assert!(ctx.orders.is_empty());
+        assert_ne!(m.selected_sym(), SYMBOL_ID_NONE, "campaign still open");
+    }
+
+    #[test]
+    fn a_flat_campaign_at_expiry_just_ends() {
+        // The E−ε law already unwound: expiry is bookkeeping, not a
+        // trade, and it must not emit an order for a position that is
+        // not there.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = campaign_at_expiry(&mut ctx, params);
+        let exit = EXPIRY - params.epsilon_ns;
+        ctx.now = mono_of(exit);
+        m.on_tick(&tick(exit, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "E−ε ended it");
+        ctx.orders.clear();
+        ctx.now = mono_of(EXPIRY);
+        m.on_tick(&tick(EXPIRY, 79_000_000_000, false), &mut ctx);
+        assert!(ctx.orders.is_empty());
+        assert_eq!(m.vrp_counters().settled_itm, 0);
+        assert_eq!(m.vrp_counters().settled_otm, 0);
     }
 
     // ---------------- the fail-closed table ----------------

@@ -6,6 +6,63 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — European cash settlement at expiry (VRP VX, ruling O-D4)
+
+**What changed**
+- `strategy-vrp` gains the settle rung. On the first callback — tick OR
+  option summary — with `wall_ns >= expiry_ns` while still holding, the
+  member books the European payoff `max(0, S − K)` (call; mirrored for a
+  put) at the freshest index it has, flattens the hedge, folds the hold
+  into the forecast and ends the campaign. New counters `settled_itm` /
+  `settled_otm` (`engine_vrp_settled_itm_total`, `_otm_total`).
+- **An OTM expiry emits no order at all.** The option is worth nothing
+  and the venue charges nothing for it, so there is no fill to price: a
+  zero-priced order would be a fiction and a mark-priced one would book
+  value that expired.
+- `ModelParams::opt_fee` gains `settle_index_tenth_bps` (Deribit 15 =
+  0.00015 = 1.5 bps). `FillEngine` gains `set_opt_expiry`, and a fill on
+  an option sym AT OR AFTER its expiry is priced as a SETTLEMENT:
+  `min(0.00015 × index, 0.125 × settlement value)` instead of the trade
+  law's `min(0.0003 × index, 0.125 × premium)`. Both harness loaders
+  populate the expiry map from the run's own registry — `backtest` keyed
+  on the remapped sym (a chain that rolled across boots is one
+  instrument), `audit-pnl` on the interned dense sym.
+- New `fee_ceil_tenth_bps_1e12`, because the venue's settlement rate is
+  exactly half its trade rate and half of 3 bps is not an integer number
+  of bps. Rounding it to 1 or 2 would mis-state every expiry by a third.
+
+**Why**
+Operator ruling O-D4. The member's normal exit is E − ε, and V0(b)
+measured that choice; VX is not an alternative exit but the last word on
+a position that is still open at expiry — a submit ring that stayed
+full, a data gap that swallowed the ε instant, an option lane that went
+quiet. At expiry the instrument stops being tradeable and becomes cash,
+so the member books cash.
+
+**Ripple effects**
+- **The settlement classifier is derived, not flagged.** No new wire
+  field: the venue's own rule is "an option stops trading at expiry", so
+  a fill's timestamp against the registry's `expiry_ns` IS the
+  classification. A sym with no expiry recorded is never a settlement —
+  the trade rate, never a guess.
+- The settlement crossover sits at `value = index × 15/12500` = 0.12 %
+  of the index, exactly half the trade crossover's 0.24 %.
+- `--opt-fee <venue>:<index_bps>:<prem_bps>` carries the settlement leg
+  with it (`settle_index_tenth_bps = index_bps × 5`, the venue's half
+  relationship), so a fee sweep cannot leave the two disagreeing.
+- Reports over roots with no option records are unchanged: `fee_for`
+  cannot reach the settlement branch without an index AND an expiry.
+- The member picks the FRESHER of its two index sources (the option
+  record's forward, the underlying tick's mid) rather than preferring
+  one. The option lane can go quiet for hours while the perp keeps
+  printing, and settling against an eight-hour-old forward would book a
+  payoff the option did not have. With neither, the settlement is
+  DEFERRED to the next record and counted — a settlement priced off an
+  invented number is worse than a late one.
+
+**Operator action**
+None.
+
 ## 2026-09-10 — **strategy slot 1 changes meaning: `ev` → `vrp`** (VRP V7)
 
 **What changed**

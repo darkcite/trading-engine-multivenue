@@ -386,6 +386,7 @@ fn load_run_events(
     interner: &mut SymInterner,
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
     opt_index_1e6: &mut BTreeMap<u32, i64>,
+    opt_expiry_ns: &mut BTreeMap<u32, u64>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
@@ -489,6 +490,9 @@ fn load_run_events(
                     if o.underlying_px_1e9 > 0 {
                         opt_index_1e6.insert(dense, o.underlying_px_1e9 / 1_000);
                     }
+                    // VX: the expiry, so a fill at or after it is
+                    // charged the venue's SETTLEMENT rate.
+                    opt_expiry_ns.insert(dense, row.expiry_ns);
                 }
             }
             // VRP V2a — THE DENOMINATION LAW. This was a pure rescale
@@ -695,6 +699,7 @@ fn load_and_merge_events(
     interner: &mut SymInterner,
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
     opt_index_1e6: &mut BTreeMap<u32, i64>,
+    opt_expiry_ns: &mut BTreeMap<u32, u64>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
@@ -703,7 +708,14 @@ fn load_and_merge_events(
     let mut prev_last_virt: u64 = 0;
     for run in runs {
         let (evs, mut load) =
-            load_run_events(run, interner, mark_fill_syms, opt_index_1e6, stale_after_ms)?;
+            load_run_events(
+                run,
+                interner,
+                mark_fill_syms,
+                opt_index_1e6,
+                opt_expiry_ns,
+                stale_after_ms,
+            )?;
         if evs.is_empty() {
             loads.push(load);
             continue;
@@ -778,11 +790,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut interner = SymInterner::default();
     let mut mark_fill_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut opt_index_1e6: BTreeMap<u32, i64> = BTreeMap::new();
+    let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
     let (merged, loads) = load_and_merge_events(
         &runs,
         &mut interner,
         &mut mark_fill_syms,
         &mut opt_index_1e6,
+        &mut opt_expiry_ns,
         params.stale_after_ms,
     )?;
 
@@ -880,6 +894,10 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // VRP V2b: the index leg of the venue's capped option fee.
         for (sym, index_1e6) in &opt_index_1e6 {
             e.set_opt_index(*sym, *index_1e6);
+        }
+        // VX: the settlement rate's classifier.
+        for (sym, expiry_ns) in &opt_expiry_ns {
+            e.set_opt_expiry(*sym, *expiry_ns);
         }
         e
     };

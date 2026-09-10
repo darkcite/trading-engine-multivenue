@@ -3667,6 +3667,11 @@ pub struct VrpMetricIds {
     pub settlements: core_metrics::CounterId,
     /// `engine_vrp_caps_rejected_total`
     pub caps_rejected: core_metrics::CounterId,
+    /// `engine_vrp_settled_itm_total` (VX)
+    pub settled_itm: core_metrics::CounterId,
+    /// `engine_vrp_settled_otm_total` (VX — an OTM expiry is free, so
+    /// this counts positions that ended with no fill at all)
+    pub settled_otm: core_metrics::CounterId,
     /// `engine_vrp_killed` (gauge; kill criterion 3 has HALTED the
     /// member — sticky until a restart)
     pub killed: core_metrics::GaugeId,
@@ -3698,6 +3703,8 @@ fn register_vrp_metrics(
     let regime_exits = one("engine_vrp_regime_exits_total")?;
     let settlements = one("engine_vrp_settlements_total")?;
     let caps_rejected = one("engine_vrp_caps_rejected_total")?;
+    let settled_itm = one("engine_vrp_settled_itm_total")?;
+    let settled_otm = one("engine_vrp_settled_otm_total")?;
     let mut g = |name: &str| -> Result<core_metrics::GaugeId, &'static str> {
         reg.register_gauge(name).map_err(|_| "register vrp gauge")
     };
@@ -3714,6 +3721,8 @@ fn register_vrp_metrics(
         regime_exits,
         settlements,
         caps_rejected,
+        settled_itm,
+        settled_otm,
         killed: g("engine_vrp_killed")?,
         qlike_iv_1e6: g("engine_vrp_qlike_iv_1e6")?,
         qlike_har_1e6: g("engine_vrp_qlike_har_1e6")?,
@@ -3755,6 +3764,10 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.settlements.saturating_sub(last.settlements));
     reg.counter(ids.caps_rejected)
         .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
+    reg.counter(ids.settled_itm)
+        .inc(cur.settled_itm.saturating_sub(last.settled_itm));
+    reg.counter(ids.settled_otm)
+        .inc(cur.settled_otm.saturating_sub(last.settled_otm));
     reg.gauge(ids.killed).set(cur.killed as i64);
     reg.gauge(ids.qlike_iv_1e6).set(cur.qlike_iv_1e6);
     reg.gauge(ids.qlike_har_1e6).set(cur.qlike_har_1e6);

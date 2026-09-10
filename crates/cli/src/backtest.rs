@@ -275,15 +275,27 @@ pub struct OptFee {
     pub index_bps: u32,
     /// Basis points of the premium notional (Deribit 1250 = 12.5 %).
     pub prem_bps: u32,
+    /// VX: TENTHS of a basis point of the index notional for a
+    /// SETTLEMENT rather than a trade (Deribit 15 = 0.00015 = 1.5 bps).
+    /// Tenths because the venue's settlement rate is exactly half its
+    /// trade rate and half of 3 bps is not an integer number of bps —
+    /// the unit exists so the law is stored, not rounded.
+    pub settle_index_tenth_bps: u32,
     /// False = this venue's options take the flat `fee_bps` path.
     pub active: bool,
 }
 
 impl OptFee {
-    /// The venue's published option schedule.
+    /// The venue's published option schedule:
+    /// `trade = min(0.0003 × index, 0.125 × premium)`,
+    /// `ITM settlement = min(0.00015 × index, 0.125 × value)`,
+    /// and an option expiring OTM is free (which needs no rate — the
+    /// member emits no order for a worthless option, so no fill and no
+    /// fee ever exist).
     pub const DERIBIT: Self = Self {
         index_bps: 3,
         prem_bps: 1250,
+        settle_index_tenth_bps: 15,
         active: true,
     };
     /// Flat-bps path (every venue whose option economics we do not
@@ -291,6 +303,7 @@ impl OptFee {
     pub const OFF: Self = Self {
         index_bps: 0,
         prem_bps: 0,
+        settle_index_tenth_bps: 0,
         active: false,
     };
 }
@@ -487,6 +500,12 @@ pub fn parse_model_params(
         p.opt_fee[vi] = OptFee {
             index_bps,
             prem_bps,
+            // The venue's settlement rate is exactly half its trade
+            // rate, so an override of the index leg carries the
+            // settlement leg with it — which is what an experimenter
+            // sweeping the fee wants, and it keeps the two from
+            // silently disagreeing.
+            settle_index_tenth_bps: index_bps.saturating_mul(5),
             active: true,
         };
     }
@@ -684,6 +703,7 @@ fn load_run(
     remap: &BTreeMap<u32, u32>,
     dead: &BTreeSet<u32>,
     opt_reg: &opt_registry::OptRegistry,
+    opt_expiry_ns: &mut BTreeMap<u32, u64>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
@@ -907,6 +927,10 @@ fn load_run(
                 if o.venue == VenueId::Deribit as u8 {
                     if let Some(row) = opt_reg.get(o.sym) {
                         und.observe(op.sym, o.ts_ns, o.underlying_px_1e9, row.contract_size_1e9);
+                        // VX: the expiry, keyed on the REMAPPED sym for
+                        // the same reason — that is what the fills the
+                        // fee law prices will carry.
+                        opt_expiry_ns.insert(op.sym, row.expiry_ns);
                     }
                 }
                 if !tick_syms.contains(&op.sym) {
@@ -1032,6 +1056,7 @@ fn load_run(
 fn load_and_merge(
     runs: &[RunDir],
     stale_after_ms: [u32; 7],
+    opt_expiry_ns: &mut BTreeMap<u32, u64>,
 ) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
     // manifest join — each run's `<sym>\t<descriptor>` rows joined
@@ -1070,7 +1095,8 @@ fn load_and_merge(
         // (chain roll — `options_manifest.rs:8-11`), so a run's records
         // are only ever priced against the names that boot allocated.
         let opt_reg = opt::registry_from_manifest_rows(&manifest_rows);
-        let (recs, summary) = load_run(run, &remap, &dead, &opt_reg, stale_after_ms)?;
+        let (recs, summary) =
+            load_run(run, &remap, &dead, &opt_reg, opt_expiry_ns, stale_after_ms)?;
         summaries.push(summary);
         if recs.is_empty() {
             continue; // header-only files everywhere: run holds no records
@@ -1589,7 +1615,9 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
 
     // Capture discovery + merge + rebase (§3.1–§3.3).
     let runs = discover_runs(&cfg.replay_dir)?;
-    let (merged, run_summaries) = load_and_merge(&runs, model.stale_after_ms)?;
+    let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
+    let (merged, run_summaries) =
+        load_and_merge(&runs, model.stale_after_ms, &mut opt_expiry_ns)?;
     let universe = derive_universe(&merged);
 
     // The REUSED validator (§3.5) — same byte scanner, same reject
@@ -1724,6 +1752,13 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
                 engine.set_opt_index(o.sym, o.underlying_px_1e9 / 1_000);
             }
         }
+    }
+    // VX: the expiries, so a fill at or after one is charged the venue's
+    // SETTLEMENT rate rather than its trade rate. Collected during the
+    // merge from each run's OWN registry and keyed on the remapped sym,
+    // because a chain that rolled across boots is one instrument here.
+    for (sym, expiry_ns) in &opt_expiry_ns {
+        engine.set_opt_expiry(*sym, *expiry_ns);
     }
     for sym in &mark_fill_syms {
         engine.set_mark_fill_sym(*sym);

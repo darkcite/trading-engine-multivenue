@@ -559,6 +559,13 @@ pub struct VrpCounters {
     pub settlements: u64,
     /// Entries refused by a `docs/risk-policy.md` notional cap.
     pub caps_rejected: u64,
+    /// VX: campaigns that reached expiry still holding and cash-settled
+    /// IN the money (a closing order at intrinsic value).
+    pub settled_itm: u64,
+    /// VX: campaigns that reached expiry still holding and expired OUT
+    /// of the money — the option is worth nothing, so there is no order
+    /// and, per the venue's schedule, no fee.
+    pub settled_otm: u64,
     /// `1` once kill criterion 3 has HALTED the member: a full
     /// trailing-60 window in which the forecast no longer beat implied
     /// vol. Sticky — it takes a restart to clear, exactly like the
