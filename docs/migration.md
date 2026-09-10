@@ -6,6 +6,46 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — Deribit position caps are in COINS (operator amendment)
+
+**What changed**
+- New shared table `strategy_core::{VenueCaps, CAPS_BASE, CAPS_DERIBIT,
+  caps_for_venue, caps_for_sym}`. Deribit: **1 whole coin** per order and
+  per symbol, **$250 000** book total. Every other venue keeps the base
+  tier ($10k / $20k / $100k), unchanged.
+- `strategy-vrp` and `strategy-icdp` both read that table.
+  `strategy_icdp::{CAP_LEG_1E6, CAP_SYM_1E6, CAP_TABLE_1E6}` are now
+  re-exports of `CAPS_BASE`'s fields, so the two members cannot drift.
+- `vrp.toml.example` size returns to **one contract** (`qty_1e6 =
+  1000000`) with `band_qty_1e6 = 50000` — the edge spec's measured
+  configuration, now exactly on the cap rather than eight times over it.
+
+**Why a different unit for one venue**
+A Deribit inverse contract IS one whole coin: its size is a coin count
+and its dollar value moves with the index. A dollar cap therefore shrinks
+the permitted size as the coin rises, and the member starts refusing at a
+price nobody chose. A coin cap is the venue's own unit and holds at any
+index.
+
+**Ripple effects**
+- `0` in a unit means "this member cannot express this venue's cap",
+  never "unlimited". `strategy-icdp` sizes in dollars, so it now REFUSES
+  a Deribit instrument at `configure` instead of reading Deribit's
+  `leg_usd_1e6 == 0` as no limit. No behaviour change today — `icdp.toml`
+  carries no Deribit instrument — but a future one is a boot refusal
+  with a message, not a silent unbounded order.
+- **The VM clamp and the ruleset validator are deliberately NOT
+  amended.** `strategy_vm::POLICY_SINGLE_ORDER_CAP_1E6` and
+  `ingress_ai::RULE_*_MAX_RISK_1E6` keep $10k / $20k / $100k; they are an
+  independent tighten-only layer over AI-pushed rows, with hash-pinned
+  rulesets and a proptest depending on those numbers. An AI-pushed VM row
+  on a Deribit option is still capped at $10 000.
+- Reports and gates over non-Deribit venues are byte-identical.
+
+**Operator action**
+None beyond the `vrp.toml` you install at V8 — the example already
+carries the amended size.
+
 ## 2026-09-10 — European cash settlement at expiry (VRP VX, ruling O-D4)
 
 **What changed**

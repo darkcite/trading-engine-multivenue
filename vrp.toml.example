@@ -33,24 +33,23 @@ selection_ns          = 600000000000
 # Delta-hedge rebalance cadence (hourly).
 rebalance_ns          = 3600000000000
 
-# Option position size ×1e6. 0.1 contracts.
+# Option position size ×1e6. One contract — the edge spec's measured
+# configuration, and exactly the Deribit per-order cap.
 #
-# The edge spec reports bps of spot per trade, which is scale-free, so
-# the size is ours to choose — and docs/risk-policy.md chooses it. One
-# contract is one whole coin of underlying exposure, so its worst-case
-# (delta = 1) hedge is a one-coin perp order: about $79,000 at the
-# measured index, eight times the $10,000 single-order cap. 0.1 is the
-# largest tenth-of-a-contract step whose worst case ($7,900) fits; 0.2
-# ($15,800) does not. The member REFUSES an entry whose worst-case
-# hedge would breach a cap, so a larger number here does not buy size,
-# it buys a counted refusal at every decision.
-qty_1e6               = 100000
+# A Deribit inverse contract is one whole coin of underlying exposure,
+# so at delta = 1 the hedge is a one-coin perp order. The operator's
+# 2026-09-10 amendment sets the Deribit cap at one whole coin per order
+# and per symbol, in the venue's own unit, so this size sits precisely
+# ON the line rather than over it. Anything larger is REFUSED at the
+# decision and counted (engine_vrp_caps_rejected_total) — a bigger
+# number here buys a refusal, not size.
+qty_1e6               = 1000000
 
 # Hedge rebalance band ×1e6: rebalance only once the target has moved
 # this far. Default = 10 % of one contract's delta at Δ = 0.5. A zero
 # band would rebalance on every tick and pay the spread for nothing, so
 # it is refused. Scales with qty_1e6 above.
-band_qty_1e6          = 5000
+band_qty_1e6          = 50000
 
 # The instrument whose 1-minute closes feed the forecast, and the
 # instrument the delta hedge trades. §9.4 descriptors, resolved against

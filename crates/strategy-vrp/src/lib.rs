@@ -135,23 +135,18 @@ pub const MARK_STALE_NS: u64 = 30_000_000_000;
 /// across a rebalance boundary and be double-counted.
 pub const ORDER_TTL_NS: u64 = 60_000_000_000;
 
-/// Risk-policy caps mirrored (`docs/risk-policy.md`), USD ×1e6 — the
-/// same three lines `strategy-icdp` enforces, because a second
-/// order-submission path that does not enforce them is a hole in the
-/// policy, not a new strategy.
-///
-/// The BINDING one here is the hedge, not the option. A 1.0-contract
-/// Deribit inverse option is one whole coin of underlying exposure, so
-/// at Δ = 1 its hedge is a one-coin perp order — about $79 000 at the
-/// measured index, eight times the single-order cap. The member
-/// therefore refuses an ENTRY whose worst-case (Δ = 1) hedge would
-/// breach a cap, rather than entering and clamping the hedge: a half
-/// hedge is a naked option position wearing a hedged one's name.
-pub const CAP_LEG_1E6: i64 = 10_000_000_000;
-/// Per-instrument net notional cap USD ×1e6.
-pub const CAP_SYM_1E6: i64 = 20_000_000_000;
-/// Table cap USD ×1e6 (both legs together).
-pub const CAP_TABLE_1E6: i64 = 100_000_000_000;
+// The caps come from `strategy_core::risk` — ONE table, read by every
+// coded member, so a second order-submission path cannot quietly run to
+// a different policy than the first. Deribit is SIZE-capped at one whole
+// coin per order and per symbol (operator amendment 2026-09-10), which
+// is the venue's own unit: a Deribit inverse contract IS a coin, so the
+// cap does not move with the index.
+//
+// The BINDING check here is the hedge, not the option. At Δ = 1 a
+// one-contract option's hedge is a one-coin perp order, so the member
+// refuses an ENTRY whose WORST-CASE hedge would breach a cap rather
+// than entering and clamping the hedge later: a half hedge is a naked
+// option position wearing a hedged one's name.
 
 /// VX: Deribit's settlement schedule, for the record — the member emits
 /// the settling order and the harness's fill engine charges the fee, so
@@ -195,17 +190,17 @@ pub struct VrpParams {
 }
 
 impl Default for VrpParams {
-    /// The edge spec's measured configuration — θ = 0.10, τ = 8 h,
-    /// ε = 5 min, selection 10 min out, hourly rebalance — at the
-    /// largest size the risk policy permits.
+    /// The edge spec's measured configuration, at the size the risk
+    /// policy permits: θ = 0.10, τ = 8 h, ε = 5 min, selection 10 min
+    /// out, hourly rebalance, **one contract**, and a band of 10 % of
+    /// one contract's delta at Δ = 0.5.
     ///
-    /// **The size is 0.1 contracts, not the spec's 1.0.** The spec
-    /// reports bps of spot per trade, which is scale-free, so the size
-    /// is ours to choose; the cap arithmetic chooses it. One contract's
-    /// worst-case (Δ = 1) hedge is one coin — about $79 000 at the
-    /// measured index, eight times [`CAP_LEG_1E6`]. `0.1` is the
-    /// largest tenth-of-a-contract step whose worst case ($7 900) fits
-    /// inside it; `0.2` ($15 800) does not. The band scales with it.
+    /// One contract is one whole coin of underlying exposure, which is
+    /// exactly the Deribit per-order cap after the operator's
+    /// 2026-09-10 amendment ([`strategy_core::CAPS_DERIBIT`]). The
+    /// worst-case hedge at Δ = 1 is therefore precisely at the line, not
+    /// over it — a size above this refuses at the decision and is
+    /// counted.
     fn default() -> Self {
         Self {
             theta_1e9: 100_000_000,
@@ -213,8 +208,8 @@ impl Default for VrpParams {
             epsilon_ns: 300_000_000_000,
             selection_ns: 600_000_000_000,
             rebalance_ns: 3_600_000_000_000,
-            qty_1e6: 100_000,
-            band_qty_1e6: 5_000,
+            qty_1e6: 1_000_000,
+            band_qty_1e6: 50_000,
         }
     }
 }
@@ -472,6 +467,26 @@ impl VrpStrategy {
         i64::try_from(n).unwrap_or(i64::MAX)
     }
 
+    /// Whether one order of `qty_1e6` units and `notional_1e6` dollars
+    /// is inside `caps`, in whichever unit that venue is capped in.
+    ///
+    /// A venue capped in the OTHER unit refuses — a `0` there means
+    /// "this unit does not apply here", never "unlimited", and reading
+    /// it as unlimited is the one mistake this shape exists to prevent.
+    #[inline]
+    #[must_use]
+    pub fn size_ok(caps: strategy_core::VenueCaps, qty_1e6: i64, notional_1e6: i64) -> bool {
+        let q = qty_1e6.unsigned_abs();
+        if caps.leg_qty_1e6 > 0 {
+            return q <= caps.leg_qty_1e6.unsigned_abs()
+                && q <= caps.sym_qty_1e6.unsigned_abs();
+        }
+        if caps.leg_usd_1e6 > 0 {
+            return notional_1e6 <= caps.leg_usd_1e6 && notional_1e6 <= caps.sym_usd_1e6;
+        }
+        false
+    }
+
     /// Whether a hedge move is worth paying the spread for.
     #[inline]
     #[must_use]
@@ -545,13 +560,14 @@ impl VrpStrategy {
         // saturating `i32` off the wire with no range check anywhere in
         // the tree, so "should never" is not a guard.
         //
-        // The SINGLE-ORDER cap applies to the order, unconditionally.
+        let caps = strategy_core::caps_for_sym(self.hedge_sym);
+        // The SINGLE-ORDER cap applies to the ORDER, unconditionally.
         // Sizing it off the position's magnitude was the hole: a move
         // from +0.1 to −0.09 shrinks the position and still emits a
-        // 0.19-contract order. A genuine reduction can never exceed the
+        // 0.19-coin order. A genuine reduction can never exceed the
         // position it unwinds, so an unconditional test on `delta`
         // cannot block an exit.
-        if Self::notional_1e6(px, delta) > CAP_LEG_1E6 {
+        if !Self::size_ok(caps, delta, Self::notional_1e6(px, delta)) {
             self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
             return false;
         }
@@ -563,8 +579,8 @@ impl VrpStrategy {
         if grows {
             let hedge_notional = Self::notional_1e6(px, target_1e6);
             let opt_notional = Self::notional_1e6(self.last_mark.px_usd_1e6, self.opt_pos_qty_1e6);
-            if hedge_notional > CAP_SYM_1E6
-                || hedge_notional.saturating_add(opt_notional) > CAP_TABLE_1E6
+            if !Self::size_ok(caps, target_1e6, hedge_notional)
+                || hedge_notional.saturating_add(opt_notional) > caps.table_usd_1e6
             {
                 self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
                 return false;
@@ -876,17 +892,15 @@ impl VrpStrategy {
         // Worst case, not current case: the hedge is sized off delta,
         // and delta walks to 1 as the option goes in the money, so an
         // entry is legal only if the position it commits us to is still
-        // legal at Δ = 1. Refusing here is the only fail-closed choice —
-        // clamping the hedge later would leave a naked option.
+        // legal at Δ = 1 — where the hedge is exactly `qty_1e6` coins.
         let underlying_1e6 = self.last_mark.underlying_px_1e9 / 1_000;
         let opt_notional = Self::notional_1e6(self.last_mark.px_usd_1e6, qty);
         let hedge_worst_1e6 = Self::notional_1e6(underlying_1e6, self.params.qty_1e6);
-        // `CAP_LEG_1E6 < CAP_SYM_1E6`, so a hedge inside the single-order
-        // cap is inside the per-symbol cap by construction; the table cap
-        // is the only one that needs both legs.
-        if opt_notional > CAP_LEG_1E6
-            || hedge_worst_1e6 > CAP_LEG_1E6
-            || opt_notional.saturating_add(hedge_worst_1e6) > CAP_TABLE_1E6
+        let opt_caps = strategy_core::caps_for_sym(self.selected_sym);
+        let hedge_caps = strategy_core::caps_for_sym(self.hedge_sym);
+        if !Self::size_ok(opt_caps, self.params.qty_1e6, opt_notional)
+            || !Self::size_ok(hedge_caps, self.params.qty_1e6, hedge_worst_1e6)
+            || opt_notional.saturating_add(hedge_worst_1e6) > hedge_caps.table_usd_1e6
         {
             self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
             return;
@@ -1461,16 +1475,16 @@ mod tests {
         );
         assert_eq!(o.px.raw(), 300_200_000);
 
-        // The hedge: short 0.1 contracts at Δ = 0.5 ⇒ LONG 0.05 perp.
+        // The hedge: short 1 contract at Δ = 0.5 ⇒ LONG 0.5 perp.
         let h = ctx.orders[1];
         assert_eq!(h.sym, perp_sym());
         assert_eq!(h.side, Side::Bid);
-        assert_eq!(h.qty.raw(), 50_000);
+        assert_eq!(h.qty.raw(), 500_000);
         assert_eq!(h.kind, 1);
         assert_eq!(h.ttl_ns, ORDER_TTL_NS);
         assert_eq!(h.px.raw(), 79_000_000_000, "hedged at the venue's own underlying");
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
-        assert_eq!(m.perp_pos_qty_1e6(), 50_000);
+        assert_eq!(m.perp_pos_qty_1e6(), 500_000);
 
         // --- three hourly rebalances, each on a moved delta ---
         ctx.orders.clear();
@@ -1554,8 +1568,8 @@ mod tests {
         assert_eq!(m.side(), SIDE_LONG_VOL);
         assert_eq!(m.opt_pos_qty_1e6(), params.qty_1e6);
         assert_eq!(ctx.orders[0].side, Side::Bid, "long vol buys the option");
-        // Long 0.1 contracts at Δ = 0.5 ⇒ SHORT 0.05 perp.
-        assert_eq!(m.perp_pos_qty_1e6(), -50_000);
+        // Long 1 contract at Δ = 0.5 ⇒ SHORT 0.5 perp.
+        assert_eq!(m.perp_pos_qty_1e6(), -500_000);
         assert_eq!(ctx.orders[1].side, Side::Ask);
     }
 
@@ -1577,16 +1591,45 @@ mod tests {
     }
 
     #[test]
-    fn the_default_size_is_the_largest_the_caps_permit() {
-        // 0.1 contracts: worst-case hedge $7,900 at the measured index,
-        // inside the $10,000 single-order cap. 0.2 would be $15,800.
+    fn the_default_size_is_exactly_the_deribit_cap() {
+        // One contract = one whole coin = exactly the Deribit per-order
+        // and per-symbol cap (operator amendment 2026-09-10). The cap is
+        // in the venue's own unit, so this holds at any index — which is
+        // the point of capping a coin-denominated instrument in coins.
         let p = VrpParams::default();
-        assert_eq!(p.qty_1e6, 100_000);
-        let idx = 79_000_000_000i64; // $79,000 ×1e6
-        assert!(VrpStrategy::notional_1e6(idx, p.qty_1e6) <= CAP_LEG_1E6);
-        assert!(VrpStrategy::notional_1e6(idx, 2 * p.qty_1e6) > CAP_LEG_1E6);
-        // And the spec's nominal one contract is eight times over.
-        assert!(VrpStrategy::notional_1e6(idx, 1_000_000) > 8 * CAP_LEG_1E6 / 10);
+        assert_eq!(p.qty_1e6, 1_000_000);
+        let caps = strategy_core::caps_for_venue(VenueId::Deribit as u8);
+        assert_eq!(caps.leg_qty_1e6, 1_000_000);
+        assert_eq!(caps.sym_qty_1e6, 1_000_000);
+        assert_eq!(caps.leg_usd_1e6, 0, "Deribit is size-capped, not notional-capped");
+        for idx in [50_000_000_000i64, 79_000_000_000, 250_000_000_000] {
+            let n = VrpStrategy::notional_1e6(idx, p.qty_1e6);
+            assert!(VrpStrategy::size_ok(caps, p.qty_1e6, n), "one coin fits at ${idx}");
+            assert!(
+                !VrpStrategy::size_ok(caps, p.qty_1e6 + 1, n),
+                "a hair over one coin does not, at ${idx}"
+            );
+        }
+        // Every other venue keeps the base tier, in dollars.
+        let base = strategy_core::caps_for_venue(VenueId::Binance as u8);
+        assert_eq!(base.leg_usd_1e6, 10_000_000_000);
+        assert_eq!(base.leg_qty_1e6, 0, "size-capping is Deribit-only");
+        assert!(VrpStrategy::size_ok(base, 999, 10_000_000_000));
+        assert!(!VrpStrategy::size_ok(base, 999, 10_000_000_001));
+    }
+
+    #[test]
+    fn a_venue_capped_in_the_other_unit_refuses() {
+        // `0` means "this unit does not apply here", never "unlimited".
+        let neither = strategy_core::VenueCaps {
+            leg_usd_1e6: 0,
+            leg_qty_1e6: 0,
+            sym_usd_1e6: 0,
+            sym_qty_1e6: 0,
+            table_usd_1e6: 0,
+        };
+        assert!(!VrpStrategy::size_ok(neither, 1, 1));
+        assert!(!VrpStrategy::size_ok(neither, 0, 0));
     }
 
     #[test]
@@ -1597,7 +1640,7 @@ mod tests {
         // is a naked option wearing a hedged one's name.
         let mut ctx = RecCtx::new();
         let params = VrpParams {
-            qty_1e6: 1_000_000, // one contract — eight times the cap
+            qty_1e6: 1_500_000, // one and a half coins — over the cap
             band_qty_1e6: 50_000,
             ..VrpParams::default()
         };
@@ -1635,10 +1678,11 @@ mod tests {
         assert_eq!(ctx.orders.len(), 2);
         // The hedge itself is inside the single-order cap.
         let h = ctx.orders[1];
+        let caps = strategy_core::caps_for_sym(perp_sym());
         assert!(
-            VrpStrategy::notional_1e6(h.px.raw(), h.qty.raw()) <= CAP_LEG_1E6,
-            "hedge notional {} over the cap",
-            VrpStrategy::notional_1e6(h.px.raw(), h.qty.raw())
+            VrpStrategy::size_ok(caps, h.qty.raw(), VrpStrategy::notional_1e6(h.px.raw(), h.qty.raw())),
+            "hedge of {} over the cap",
+            h.qty.raw()
         );
     }
 

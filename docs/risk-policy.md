@@ -25,27 +25,58 @@ frozen-surface amendment with this ruling cited in the pin tests).
 | max single-order notional    | $10 000   | rule 7 + VM clamp + gates            |
 | max OOS drawdown (gate)      | $7 500    | `GateThresholds` (15% of book)       |
 
-**VRP V7 (2026-09-10) — slot 1 enforces the three notional lines in the
-member.** `strategy-vrp` is the second coded order-submission path after
-`strategy-icdp`, and it mirrors the same three caps as constants
-(`strategy_vrp::{CAP_LEG_1E6, CAP_SYM_1E6, CAP_TABLE_1E6}`). Two things
-are specific to it and are the reason it needed its own line here:
+### Deribit is capped in COINS, not dollars (operator amendment, 2026-09-10)
+
+| cap                        | Deribit   | every other venue |
+| -------------------------- | --------- | ----------------- |
+| max single-order size      | **1 coin**| n/a               |
+| max net per-symbol size    | **1 coin**| n/a               |
+| max single-order notional  | n/a       | $10 000           |
+| max net notional per symbol| n/a       | $20 000           |
+| max net notional total     | **$250 000** | $100 000       |
+
+**Why a different unit.** A Deribit inverse contract IS one whole coin:
+its size is a coin count and its dollar value moves with the index.
+Capping it in dollars means the permitted size shrinks as the coin
+rises, so the member starts refusing at a price nobody chose. Capping it
+in coins is the venue's own unit and does not move.
+
+**The one table.** Both figures live in `strategy_core::{CAPS_BASE,
+CAPS_DERIBIT}` and are read through `caps_for_venue` / `caps_for_sym`.
+`strategy-vrp` and `strategy-icdp` both read that table — a second
+order-submission path that runs to its own numbers is a hole in this
+document, not a new strategy. `0` in a unit means **"this member cannot
+express this venue's cap"**, never "unlimited": `strategy-icdp` sizes
+every position in dollars, so it REFUSES a Deribit instrument at
+`configure` rather than reading Deribit's `leg_usd_1e6 == 0` as no
+limit. Giving icdp a Deribit lane means giving it the index and
+converting.
+
+**Deliberately NOT amended: the VM clamp and the ruleset validator.**
+`strategy_vm::POLICY_SINGLE_ORDER_CAP_1E6` and
+`ingress_ai::{RULE_ROW_MAX_RISK_1E6, RULE_SYM_MAX_RISK_1E6,
+RULE_TABLE_MAX_RISK_1E6}` keep the base $10k / $20k / $100k lines. They
+are an independent, tighten-only defence layer over AI-PUSHED rows —
+hash-pinned rulesets and a proptest depend on those numbers — and the
+amendment was asked for on the coded VRP lane. **An AI-pushed VM row on
+a Deribit option is therefore still capped at $10 000.** Raising that is
+a separate ruling with its own re-pinning.
+
+**How `strategy-vrp` applies it.** Two things are specific to the member:
 
 * **It gates on the WORST case, not the current one.** The member's
   hedge is sized off the option's delta, and delta walks to 1 as the
   option goes in the money — so an entry is authorised only if the
-  position it commits to is still legal at Δ = 1. Refusing at the
-  decision is the only fail-closed choice: entering and clamping the
-  hedge later would leave a naked option position wearing a hedged
-  one's name. Refusals are counted (`engine_vrp_caps_rejected_total`).
-* **The measured size is not a legal size.** One Deribit inverse
-  contract is one whole coin of underlying exposure, so its worst-case
-  hedge is ~$79 000 at the measured index — eight times the
-  single-order cap. The edge spec reports bps of spot per trade, which
-  is scale-free, so the shipped `vrp.toml` size is **0.1 contracts**
-  (worst case $7 900), the largest tenth-of-a-contract step that fits.
-  `core_config::vrp` refuses a `qty_1e6` above one contract at boot, and
-  the runtime gate refuses the rest.
+  position it commits to is still legal at Δ = 1, where the hedge is
+  exactly `qty_1e6` coins. Refusing at the decision is the only
+  fail-closed choice: entering and clamping the hedge later would leave
+  a naked option position wearing a hedged one's name. Refusals are
+  counted (`engine_vrp_caps_rejected_total`).
+* **The shipped size sits precisely ON the line.** `vrp.toml`'s
+  `qty_1e6 = 1000000` is one contract = one coin = the per-order cap, so
+  the edge spec's measured configuration runs unmodified.
+  `core_config::vrp` refuses anything above one contract at boot; the
+  runtime gate, which knows the venue and the side, refuses the rest.
 
 A cap never blocks an EXIT: the member's unwind path and any hedge move
 that REDUCES the position are exempt, the same exemption

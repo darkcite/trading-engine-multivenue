@@ -74,13 +74,24 @@ const LATE_NUM: u64 = 4;
 const LATE_DEN: u64 = 5;
 /// Quiet-instrument sweep cadence (ticks of ANY sym).
 const SWEEP_EVERY: u32 = 256;
-/// Risk-policy caps mirrored (docs/risk-policy.md): per leg, per sym,
-/// per table — USD ×1e6.
-pub const CAP_LEG_1E6: i64 = 10_000_000_000;
+/// Risk-policy caps (`docs/risk-policy.md`), read from the ONE shared
+/// table in `strategy-core` so a second order-submission path cannot
+/// quietly run to a different policy than the first.
+///
+/// These are the BASE tier, in dollars — which is what this member can
+/// test, because it sizes every position by a USD notional from
+/// `icdp.toml`. A venue capped in the venue's own unit instead (Deribit,
+/// one whole coin per order since the operator's 2026-09-10 amendment)
+/// has `leg_usd_1e6 == 0`, and [`Self::configure`] REFUSES such an
+/// instrument rather than reading that zero as unlimited: a member that
+/// cannot express a venue's cap has no business trading there. Giving
+/// this member a Deribit lane means giving it the index and converting,
+/// which is a change nobody has asked for.
+pub const CAP_LEG_1E6: i64 = strategy_core::CAPS_BASE.leg_usd_1e6;
 /// Per-instrument cap USD ×1e6.
-pub const CAP_SYM_1E6: i64 = 20_000_000_000;
+pub const CAP_SYM_1E6: i64 = strategy_core::CAPS_BASE.sym_usd_1e6;
 /// Table cap USD ×1e6.
-pub const CAP_TABLE_1E6: i64 = 100_000_000_000;
+pub const CAP_TABLE_1E6: i64 = strategy_core::CAPS_BASE.table_usd_1e6;
 
 const POS_NONE: u8 = 0;
 const POS_LONG: u8 = 1;
@@ -440,8 +451,21 @@ impl IcdpStrategy {
             if p.sym == SYMBOL_ID_NONE {
                 return Err(StrategyError::Config("icdp: unresolved instrument"));
             }
-            if p.notional_1e6 <= 0 || p.notional_1e6 > CAP_LEG_1E6 {
-                return Err(StrategyError::Config("icdp: notional outside (0, $10k]"));
+            // Venue-aware since the 2026-09-10 amendment: a venue whose
+            // cap is expressed in the venue's own unit rather than in
+            // dollars has `leg_usd_1e6 == 0`, and this member sizes
+            // every position in dollars. Refuse rather than read that
+            // zero as unlimited — the zero means "this member cannot
+            // express this venue's cap", which is a reason not to trade
+            // there, not a licence to trade unbounded.
+            let caps = strategy_core::caps_for_sym(p.sym);
+            if caps.leg_usd_1e6 <= 0 {
+                return Err(StrategyError::Config(
+                    "icdp: this venue is size-capped, not notional-capped — icdp sizes in USD",
+                ));
+            }
+            if p.notional_1e6 <= 0 || p.notional_1e6 > caps.leg_usd_1e6 {
+                return Err(StrategyError::Config("icdp: notional outside (0, the venue cap]"));
             }
             if p.thr <= 0 {
                 return Err(StrategyError::Config("icdp: threshold must be positive"));

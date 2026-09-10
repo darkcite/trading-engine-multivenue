@@ -33,8 +33,8 @@ use core_time::NsTs;
 use core_types::regime::REL_UNKNOWN;
 use core_types::{
     AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet, RegimeWord,
-    RuleTableV2, Signal, SymbolId, Tick, REGIME_OFF_HARD, REGIME_OFF_SOFT, REGIME_PROFILES,
-    SYMBOL_ID_NONE,
+    RuleTableV2, Signal, SymbolId, Tick, VenueId, REGIME_OFF_HARD, REGIME_OFF_SOFT,
+    REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
@@ -581,6 +581,87 @@ pub struct VrpCounters {
     /// mechanism has stopped holding. **A `0` on a full window is the
     /// halt tell** — E1 is gone and the member has no edge to harvest.
     pub qlike_har_beats_iv: u64,
+}
+
+// ---------------------------------------------------------------
+// risk — the venue-aware notional caps (`docs/risk-policy.md`)
+// ---------------------------------------------------------------
+
+/// One venue's position limits, as the coded members enforce them.
+///
+/// Two units, because two kinds of instrument. A Polymarket token or a
+/// USDT-margined perp is naturally sized in DOLLARS, so its cap is a
+/// notional. A Deribit inverse contract is one whole coin by
+/// construction — its "size" is a coin count and its dollar value moves
+/// with the index — so capping it in dollars means the effective size
+/// shrinks as the coin rises and the member starts refusing at a price
+/// nobody chose. Deribit is therefore SIZE-capped and everything else
+/// NOTIONAL-capped.
+///
+/// `0` means "this unit does not apply here", and a member that can only
+/// test the absent unit must REFUSE rather than read the zero as
+/// unlimited. That is the whole reason the field is zero and not
+/// `i64::MAX`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VenueCaps {
+    /// Max single-order notional USD ×1e6; `0` = size-capped venue.
+    pub leg_usd_1e6: i64,
+    /// Max single-order size ×1e6 in the instrument's own unit;
+    /// `0` = notional-capped venue.
+    pub leg_qty_1e6: i64,
+    /// Max net per-symbol notional USD ×1e6; `0` = size-capped venue.
+    pub sym_usd_1e6: i64,
+    /// Max net per-symbol size ×1e6; `0` = notional-capped venue.
+    pub sym_qty_1e6: i64,
+    /// Max total book notional USD ×1e6. Always dollars — a book total
+    /// has to be in one currency.
+    pub table_usd_1e6: i64,
+}
+
+/// The base tier (operator ruling 2026-08-29, $50k research book):
+/// $10 000 per order, $20 000 per symbol, $100 000 total.
+pub const CAPS_BASE: VenueCaps = VenueCaps {
+    leg_usd_1e6: 10_000_000_000,
+    leg_qty_1e6: 0,
+    sym_usd_1e6: 20_000_000_000,
+    sym_qty_1e6: 0,
+    table_usd_1e6: 100_000_000_000,
+};
+
+/// Deribit (operator amendment 2026-09-10): **one whole coin** per order
+/// and per symbol, with a $250 000 book total.
+///
+/// A Deribit inverse contract IS one coin, so this is the venue's own
+/// natural unit and it does not move with the index. The book total
+/// stays in dollars and is sized so one full delta-hedged campaign — a
+/// one-coin hedge plus its premium — fits with room for the hedge to
+/// walk as delta does.
+pub const CAPS_DERIBIT: VenueCaps = VenueCaps {
+    leg_usd_1e6: 0,
+    leg_qty_1e6: 1_000_000,
+    sym_usd_1e6: 0,
+    sym_qty_1e6: 1_000_000,
+    table_usd_1e6: 250_000_000_000,
+};
+
+/// The caps that apply to an order on `venue_byte`
+/// ([`core_types::VenueId`] as a raw byte).
+#[inline]
+#[must_use]
+pub const fn caps_for_venue(venue_byte: u8) -> VenueCaps {
+    if venue_byte == VenueId::Deribit as u8 {
+        CAPS_DERIBIT
+    } else {
+        CAPS_BASE
+    }
+}
+
+/// The caps for the venue `sym` belongs to.
+#[inline]
+#[must_use]
+pub fn caps_for_sym(sym: SymbolId) -> VenueCaps {
+    caps_for_venue(core_types::symbol_venue_byte(sym))
 }
 
 // ---------------------------------------------------------------
