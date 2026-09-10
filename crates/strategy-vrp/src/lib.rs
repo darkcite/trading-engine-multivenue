@@ -1079,7 +1079,24 @@ impl VrpStrategy {
     fn select<C: Ctx>(&mut self, _ctx: &mut C, wall_ns: u64, underlying_px_1e6: i64) {
         let open_from = self.params.tau_ns + self.params.selection_ns;
         let mut best: Option<(SymbolId, u64, i64)> = None;
+        // Whether ANY expiry is inside the selection window right now.
+        // For ~23 h 50 m of every day none is, and that is the member
+        // working — not a failure to select. Counting a "no selection"
+        // on every option record in between would run the counter into
+        // the millions and bury the one case that matters: an expiry
+        // was due and nothing in the chain was tradeable for us.
+        let mut any_due = false;
         for row in self.registry.rows() {
+            if row.expiry_ns <= wall_ns {
+                continue;
+            }
+            let lead = row.expiry_ns - wall_ns;
+            if lead > open_from || lead < self.params.tau_ns {
+                continue;
+            }
+            // An expiry IS due. Everything below is about whether THIS
+            // instrument is one we may trade.
+            any_due = true;
             // THE UNDERLYING FILTER, and it is load-bearing. The live
             // Deribit ladder is on for BTC **and** ETH
             // (`options_underlyings`), so without this the member can
@@ -1092,14 +1109,7 @@ impl VrpStrategy {
             // The evidence covers BTC only (edge spec §7: no ETH), so
             // this is also where that restriction is enforced rather
             // than assumed.
-            if row.underlying_sym != self.hedge_sym {
-                continue;
-            }
-            if row.right != RIGHT_CALL || row.expiry_ns <= wall_ns {
-                continue;
-            }
-            let lead = row.expiry_ns - wall_ns;
-            if lead > open_from || lead < self.params.tau_ns {
+            if row.underlying_sym != self.hedge_sym || row.right != RIGHT_CALL {
                 continue;
             }
             let d = (row.strike_1e6 - underlying_px_1e6).abs();
@@ -1122,7 +1132,14 @@ impl VrpStrategy {
                 self.flatten_pending = false;
                 self.bump_state();
             }
-            None => self.counters.no_selection = self.counters.no_selection.wrapping_add(1),
+            // An expiry was due and nothing in the chain was tradeable
+            // for us — the chain rolled without our currency, or it
+            // carries no calls at that expiry. THAT is worth a counter.
+            None if any_due => {
+                self.counters.no_selection = self.counters.no_selection.wrapping_add(1);
+            }
+            // No expiry due. The normal state, all day.
+            None => {}
         }
     }
 
@@ -2480,6 +2497,63 @@ mod tests {
         ctx.now = mono_of(entry);
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
         assert!(m.state_epoch() > after_select + 1, "entry AND hedge");
+    }
+
+    #[test]
+    fn no_selection_counts_expiries_not_records() {
+        // For ~23 h 50 m of every day no expiry is inside the selection
+        // window, and that is the member working. Counting a "no
+        // selection" on every option record in between runs the counter
+        // into the millions and buries the one case that matters.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+
+        // Far from any expiry: a hundred records, no counter movement.
+        let quiet = EXPIRY - 10 * 3_600_000_000_000; // 10 h out
+        let mut i = 0usize;
+        while i < 100 {
+            ctx.now = mono_of(quiet);
+            m.on_opt_summary(&summary(quiet, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+            i += 1;
+        }
+        assert_eq!(m.vrp_counters().no_selection, 0, "a quiet market is not a failure");
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
+
+        // An expiry IS due, but the chain carries nothing we may trade —
+        // every row belongs to another underlying. THAT counts.
+        let mut foreign = VrpStrategy::new();
+        let mut reg = OptRegistry::new();
+        let eth_perp = make_symbol_id(VenueId::Deribit, 2);
+        let mut k = 0u32;
+        while k < 4 {
+            reg.insert(OptInstrument::new(
+                opt_sym(40 + k),
+                eth_perp,
+                VenueId::Deribit as u8,
+                EXPIRY,
+                (3_000 + 100 * k as i64) * 1_000_000,
+                RIGHT_CALL,
+                1_000_000_000,
+            ))
+            .expect("eth chain");
+            k += 1;
+        }
+        foreign
+            .configure(
+                params,
+                reg,
+                perp_sym(),
+                perp_sym(),
+                WallAnchor::new(MONO0, WALL0),
+                [0; 32],
+            )
+            .expect("configure");
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        foreign.on_opt_summary(&summary(sel, opt_sym(40), 700_000_000, 500_000_000), &mut ctx);
+        assert_eq!(foreign.vrp_counters().no_selection, 1, "an expiry rolled without us");
+        assert_eq!(foreign.selected_sym(), SYMBOL_ID_NONE);
     }
 
     #[test]

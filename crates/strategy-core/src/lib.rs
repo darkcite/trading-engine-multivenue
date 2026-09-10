@@ -570,7 +570,13 @@ pub struct VrpCounters {
     pub no_bounds: u64,
     /// Decisions or rebalances skipped on a stale option mark.
     pub stale_skips: u64,
-    /// Expiries where no instrument passed the selection law.
+    /// An expiry was inside the selection window and NOTHING in the
+    /// chain was tradeable for this member — it rolled without our
+    /// currency, or carries no calls at that expiry.
+    ///
+    /// Not "no expiry is due", which is the normal state for ~23 h 50 m
+    /// of every day and is not counted at all. A rising value here is a
+    /// chain problem, not a quiet market.
     pub no_selection: u64,
     /// Decisions refused because the member's regime gate was closed.
     pub regime_blocked: u64,

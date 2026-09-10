@@ -6,6 +6,54 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — `engine_vrp_no_selection_total` counts expiries, not records
+
+**What changed**
+
+- `strategy-vrp`'s selection law now evaluates the TIME window before the
+  currency and right filters, and increments `no_selection` only when an
+  expiry was inside the window and nothing in the chain was tradeable for
+  this member.
+- Previously every option record seen while no expiry was due incremented
+  the counter.
+
+**Why — the metric contradicted its own definition**
+
+The counter is documented as "expiries where no instrument passed the
+selection law". For ~23 h 50 m of every day no expiry is inside the
+selection window at all, which is the member working, not the member
+failing. On the live engine it reached **1537 in the first 20 s after
+boot** — a rate set by the Deribit summary feed, not by anything about
+the chain. An operator watching that has to learn to ignore it, and
+ignoring it is the same as not having it: the one case the counter
+exists to surface — the chain rolled without our currency, or carries no
+calls at that expiry — would have been invisible inside the noise.
+
+**Ripple effects**
+
+- `engine_vrp_no_selection_total` is a COUNTER whose meaning changed
+  between builds. Anything comparing across the 2026-09-10 boundary sees
+  it drop to 0 and stay there; that is the fix, not a stall. Treat
+  pre-fix samples as a different series.
+- Nothing else reads it — no gate, no kill criterion, no state file.
+- Selection behaviour is byte-identical: the same instrument is chosen by
+  the same tie-breaks. Only the ORDER of the filters moved, and the time
+  filter is a total predicate on `expiry_ns`/`lead`, so no row's verdict
+  changes.
+
+**Migration steps**
+
+1. Rebuild and restart the engine (`pkill -TERM -f "multivenue-engine run"`;
+   launchd `KeepAlive` relaunches it).
+2. Re-baseline any alert on `engine_vrp_no_selection_total`. The expected
+   steady-state value is `0`.
+
+**Rollback**
+
+- Revert the commit; the counter returns to per-record counting. No
+  on-disk format, config key or wire format is involved, and
+  `vrp-state.tsv` is untouched (`VRP_STATE_VERSION` stays `1`).
+
 ## 2026-09-10 — the VRP chain is restricted to ONE currency (V8b)
 
 **What changed**
