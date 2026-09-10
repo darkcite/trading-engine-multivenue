@@ -1,0 +1,15 @@
+[package]
+name         = "core-vol"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Integer volatility forecast engine (VRP V4): a rolling HAR over 1-minute returns, an OLS fit in log space, and the decision bounds the VRP member compares implied vol against. No floats anywhere on the path; no allocation after new()."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-regime = { workspace = true }

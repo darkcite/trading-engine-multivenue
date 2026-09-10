@@ -6,6 +6,59 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — new crate `core-vol` + `~/multivenue/vrp.toml` (VRP V4)
+
+**What changed**
+- New workspace member `crates/core-vol`: the integer volatility forecast.
+  A rolling HAR over 1-minute returns (`[i64; 1536]` ring, three window
+  sums rolled in O(1)), an OLS fit in log space over a 128-pair ring, and
+  `bounds(tau_ns, theta_1e9)` returning the two `i64` an annualised
+  `mark_iv_1e9` is compared against. `core_vol::fx` carries integer
+  `log2/exp2/ln/exp` on 257-entry Q32 tables. No floats outside
+  `#[cfg(test)]`; nothing allocates after `VolEngine::new`.
+- New config namespace: `core_config::vrp` parses `~/multivenue/vrp.toml`
+  (template: `vrp.toml.example`) — the same hand-written TOML SUBSET as
+  `icdp.toml`, integers only, unknown/missing/duplicate keys fatal. Keys:
+  `theta_1e9`, `tau_ns`, `epsilon_ns`, `selection_ns`, `rebalance_ns`,
+  `qty_1e6`, `band_qty_1e6`, `underlying_descriptor`,
+  `hedge_descriptor`. It also carries `parse_seed_row` for V5's
+  `vrp-seed.tsv`.
+- `core-config` gains a dependency on `core-vol`, for one reason:
+  `tau_ns` is validated by `core_vol::tenor_of`, the same function the
+  forecast consults. **Only 4 h and 8 h exist.** E1 — the fact the lane
+  monetises — is measured at 4 h and 8 h and is absent by 12 h, so kill
+  criterion 4 forbids the longer cells, and there is exactly one place in
+  the tree that knows it.
+- New Python mirror `claude_worker.vol_ref` implementing the identical
+  integer law, and a shared parity fixture
+  `claude-worker/tests/fixtures/vol/parity-1.{input,expected}.tsv`. The
+  expected file is written by the RUST side
+  (`CORE_VOL_PARITY_WRITE=1 cargo nextest run -p core-vol --test parity`)
+  and asserted by both `crates/core-vol/tests/parity.rs` and
+  `claude-worker/tests/test_vol_ref.py`.
+- New alloc gate `vol_engine_minute_and_bounds_are_zero_alloc`; the gate
+  count rises 43 → 44.
+
+**Why**
+The seed the engine boots from (V5) is cut by the Python; the pairs the
+engine forms afterwards continue the same series. If the two
+implementations disagree by one unit anywhere, the line the engine trades
+on is not the line the research measured — and nothing else in the lane
+would notice. Integers across both languages plus a fixture written by one
+and asserted by both is the only arrangement where that cannot happen
+quietly.
+
+**Ripple effects**
+- Nothing is wired into the engine yet. `core-vol` is a leaf crate with
+  one consumer (`core-config`, for the tenor check); no strategy composes
+  it and no boot path reads `vrp.toml` until V7.
+- `docs/local-setup.md` gains nothing yet — `vrp.toml` is only required
+  once the member is composed (V8, operator-gated).
+
+**Operator action**
+None yet. When the lane reaches V8, copy `vrp.toml.example` to
+`~/multivenue/vrp.toml` beside `universe.toml` and `icdp.toml`.
+
 ## 2026-09-10 — `detail_version: 6` — the assumed option spread is a flag (VRP V3)
 
 **What changed**

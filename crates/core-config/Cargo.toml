@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 core-regime = { workspace = true }
 core-types = { workspace = true }
+core-vol = { workspace = true }
 dotenvy = { workspace = true }
 zeroize = { workspace = true }
 

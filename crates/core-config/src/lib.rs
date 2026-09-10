@@ -33,6 +33,8 @@ pub mod icdp;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
 pub mod universe;
+/// VRP V4: the VRP member's parameter artifact (`vrp.toml`) + seed rows.
+pub mod vrp;
 
 // ---------------------------------------------------------------
 // Error type

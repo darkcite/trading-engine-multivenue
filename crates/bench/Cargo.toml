@@ -37,6 +37,7 @@ core-time            = { workspace = true }
 # RG1 gate 41: the regime evaluator's tick + minute-roll path.
 core-regime          = { workspace = true }
 # VRP V1 gate 44: the option registry's hot lookups.
+core-vol             = { workspace = true }
 opt-registry         = { workspace = true }
 book-builder         = { workspace = true }
 strategy-ai-exec     = { workspace = true }

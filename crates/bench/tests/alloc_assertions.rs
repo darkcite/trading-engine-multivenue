@@ -4369,3 +4369,70 @@ fn opt_registry_lookups_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "opt-registry lookup bytes should be zero: saw {bytes}");
 }
+
+/// VRP V4: the forecast's two hot entries — the per-minute fold and the
+/// per-expiry bound query — allocate nothing.
+///
+/// `on_minute_close` runs once a minute for the life of the process and
+/// `bounds` runs at every entry decision; both live inside the engine's
+/// single-threaded loop, so an allocation in either is a page fault and
+/// a lock the strategy loop cannot afford. The engine is boxed because
+/// its inline rings are ~16 KiB — construction may allocate (it does,
+/// once, for the box), which is exactly why the guard opens after it.
+#[test]
+fn vol_engine_minute_and_bounds_are_zero_alloc() {
+    const TAU_8H: u64 = 28_800_000_000_000;
+    const THETA: i64 = 100_000_000;
+
+    let mut e = Box::new(core_vol::VolEngine::new());
+    // Boot: warm the ring past a full wrap, then seed a fit. Neither is
+    // measured — the seed replay is a boot path (V5).
+    let mut px = 79_000_000_000i64;
+    let mut s = 20_260_910i64;
+    let mut i = 0usize;
+    while i < 2_000 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s >> 40) % 40_000_000) - 20_000_000).max(1_000_000_000);
+        e.on_minute_close(px);
+        i += 1;
+    }
+    let x0 = e.x_1e9(TAU_8H).expect("warm ring");
+    let mut k = 0usize;
+    while k < core_vol::MIN_PAIRS {
+        e.seed_pair(x0 + k as i64 * 31_000_000, x0 + k as i64 * 26_000_000);
+        k += 1;
+    }
+    assert!(e.fit().is_some(), "the gate must measure a FITTED engine");
+
+    let g = AllocGuard::new();
+    let mut lo_acc: i64 = 0;
+    let mut hi_acc: i64 = 0;
+    let mut n = 0usize;
+    while n < 5_000 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s >> 40) % 40_000_000) - 20_000_000).max(1_000_000_000);
+        e.on_minute_close(px);
+        // The decision path: bounds, then the two i64 compares the
+        // member actually makes against a quoted IV.
+        if let Some((lo, hi)) = e.bounds(TAU_8H, THETA) {
+            lo_acc = lo_acc.wrapping_add(lo);
+            hi_acc = hi_acc.wrapping_add(hi);
+        }
+        n += 1;
+    }
+    // And the kill tell, which the member reads every decision.
+    let q = e.qlike_counters();
+    std::hint::black_box((lo_acc, hi_acc, q));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(lo_acc != 0 && hi_acc != 0, "the gate must measure real work");
+    assert_eq!(
+        allocs, 0,
+        "core-vol minute/bounds allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "core-vol hot bytes should be zero: saw {bytes}");
+}

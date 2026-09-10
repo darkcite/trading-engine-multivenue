@@ -29,6 +29,7 @@ members = [
     # shared boot-only options-chain selection law (M2 close extraction)
     "crates/options-select",
     # VRP V1: option sym -> (expiry, strike, right, contract size) table
+    "crates/core-vol",
     "crates/opt-registry",
 
     # --- book + strategies ---
@@ -146,6 +147,7 @@ core-ring    = { path = "crates/core-ring" }
 core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
+core-vol     = { path = "crates/core-vol" }
 
 ingress-ai         = { path = "crates/ingress-ai" }
 ingress-binance    = { path = "crates/ingress-binance" }
