@@ -1080,6 +1080,21 @@ impl VrpStrategy {
         let open_from = self.params.tau_ns + self.params.selection_ns;
         let mut best: Option<(SymbolId, u64, i64)> = None;
         for row in self.registry.rows() {
+            // THE UNDERLYING FILTER, and it is load-bearing. The live
+            // Deribit ladder is on for BTC **and** ETH
+            // (`options_underlyings`), so without this the member can
+            // select an ETH call and hedge it with the BTC perp — a
+            // cross-asset naked position that every other check in this
+            // crate would wave through, because every other check is
+            // about size, staleness or timing. `underlying_sym` is the
+            // instrument's OWN hedge leg, set per row at boot.
+            //
+            // The evidence covers BTC only (edge spec §7: no ETH), so
+            // this is also where that restriction is enforced rather
+            // than assumed.
+            if row.underlying_sym != self.hedge_sym {
+                continue;
+            }
             if row.right != RIGHT_CALL || row.expiry_ns <= wall_ns {
                 continue;
             }
@@ -1465,8 +1480,39 @@ mod tests {
     /// 8 calls at tomorrow's — so the selection law has to choose, not
     /// merely accept what it is handed.
     fn registry() -> OptRegistry {
+        registry_with_foreign(false)
+    }
+
+    /// The same chain, optionally with another currency's options mixed
+    /// in — an ETH ladder at ETH strikes and an EARLIER expiry, which is
+    /// what `universe.toml`'s `options_underlyings = ["BTC", "ETH"]`
+    /// actually produces.
+    fn registry_with_foreign(foreign: bool) -> OptRegistry {
         let mut r = OptRegistry::new();
         let perp = perp_sym();
+        if foreign {
+            // Nearest expiry wins before nearest strike, so an ETH call
+            // expiring SOONER beats every BTC row on the first tie-break
+            // — this is the row that would have been selected.
+            let eth_perp = make_symbol_id(VenueId::Deribit, 2);
+            let mut j = 0u32;
+            while j < 4 {
+                r.insert(OptInstrument::new(
+                    opt_sym(40 + j),
+                    eth_perp,
+                    VenueId::Deribit as u8,
+                    // Five minutes earlier — INSIDE the selection
+                    // window, so the TAU/selection filters let it
+                    // through and only the underlying filter stops it.
+                    EXPIRY - 300_000_000_000,
+                    (3_000 + 100 * j as i64) * 1_000_000,
+                    RIGHT_CALL,
+                    1_000_000_000,
+                ))
+                .expect("eth chain");
+                j += 1;
+            }
+        }
         let mut k = 0u32;
         while k < 8 {
             let strike = (77_000 + 500 * k as i64) * 1_000_000;
@@ -2434,6 +2480,65 @@ mod tests {
         ctx.now = mono_of(entry);
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
         assert!(m.state_epoch() > after_select + 1, "entry AND hedge");
+    }
+
+    #[test]
+    fn another_currencys_option_is_never_selected() {
+        // The live ladder is on for BTC AND ETH. Without the underlying
+        // filter the member selects an ETH call — it expires sooner, and
+        // "nearest expiry" is the first tie-break — and then hedges it
+        // with the BTC perp. That is a cross-asset naked position, and
+        // no size, staleness or timing check in this crate would catch
+        // it, because none of them is about WHAT the instrument is.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = VrpStrategy::new();
+        m.configure(
+            params,
+            registry_with_foreign(true),
+            perp_sym(),
+            perp_sym(),
+            WallAnchor::new(MONO0, WALL0),
+            [0; 32],
+        )
+        .expect("configure");
+        // Warm enough to select; the decision itself is not the point.
+        let mut wall = WALL0;
+        let mut i = 0usize;
+        while i < 1_442 {
+            m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+            wall += MINUTE_NS;
+            i += 1;
+        }
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+
+        let picked = m.selected_sym();
+        assert_ne!(picked, SYMBOL_ID_NONE, "a BTC call is still selectable");
+        let row = m.registry.get(picked).expect("registered");
+        assert_eq!(
+            row.underlying_sym,
+            perp_sym(),
+            "the selected option's own hedge leg must BE our hedge leg"
+        );
+        assert_eq!(row.expiry_ns, EXPIRY, "not the ETH row's earlier expiry");
+        // Prove the ETH row really was a candidate: the same law with
+        // the underlying filter removed would have taken it, because
+        // nearest expiry is the first tie-break.
+        let eth = m
+            .registry
+            .rows()
+            .iter()
+            .find(|r| r.underlying_sym != perp_sym())
+            .expect("the ETH ladder is in the table");
+        assert!(eth.expiry_ns < row.expiry_ns, "and it expires sooner");
+        let lead = eth.expiry_ns - sel;
+        assert!(
+            lead >= params.tau_ns && lead <= params.tau_ns + params.selection_ns,
+            "inside the selection window, so nothing else would have refused it"
+        );
+        assert_eq!(row.strike_1e6, 79_000_000_000, "the BTC ATM strike");
     }
 
     // ---------------- the fail-closed table ----------------

@@ -136,7 +136,17 @@ pub struct VrpBoot {
     pub rows_refused: usize,
 }
 
-/// Build the option table for the live chain.
+/// The currency prefix of a Deribit descriptor: `deribit:BTC-PERPETUAL`
+/// → `BTC`. `None` when the descriptor has no venue prefix or no
+/// currency segment.
+fn currency_of(descriptor: &str) -> Option<&str> {
+    let name = descriptor.split_once(':').map_or(descriptor, |(_, n)| n);
+    let ccy = name.split('-').next()?;
+    (!ccy.is_empty() && ccy.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(ccy)
+}
+
+/// Build the option table for the live chain, **restricted to the
+/// hedge instrument's own currency**.
 ///
 /// `deribit_options` is boot discovery's `(instrument_name, sym)` list
 /// in allocation order. Contract size is
@@ -145,13 +155,29 @@ pub struct VrpBoot {
 /// USDC-LINEAR chains, whose names the descriptor parser refuses — so a
 /// row that lands in this table is a 1.0-coin inverse option by
 /// construction. A name that does not parse is counted, not guessed.
+///
+/// **Why the currency filter.** The live ladder is on for BTC AND ETH
+/// (`universe.toml [deribit] options_underlyings`). A table holding both
+/// lets the member select an ETH call and hedge it with the BTC perp —
+/// a cross-asset naked position that no size, staleness or timing check
+/// would catch. It also blows the 128-row table on a two-currency
+/// chain. Rows of another currency are skipped and counted, exactly like
+/// a name that does not parse, and the member re-checks
+/// `underlying_sym` itself: two layers, because this one is not
+/// recoverable in flight.
 pub fn build_registry(
     deribit_options: &[(String, SymbolId)],
+    hedge_descriptor: &str,
     hedge_sym: SymbolId,
 ) -> (OptRegistry, usize) {
     let mut reg = OptRegistry::new();
     let mut refused = 0usize;
+    let want = currency_of(hedge_descriptor);
     for (name, sym) in deribit_options {
+        if want.is_none() || currency_of(name) != want {
+            refused += 1;
+            continue;
+        }
         let Some(row) = OptInstrument::from_descriptor(
             *sym,
             hedge_sym,
@@ -206,11 +232,13 @@ pub fn load_vrp_boot(
     })?;
     let hedge_sym = resolve(&file.hedge_descriptor)
         .ok_or_else(|| format!("vrp: `{}` is not in the boot universe", file.hedge_descriptor))?;
-    let (registry, rows_refused) = build_registry(deribit_options, hedge_sym);
+    let (registry, rows_refused) =
+        build_registry(deribit_options, &file.hedge_descriptor, hedge_sym);
     if registry.is_empty() {
         return Err(format!(
-            "vrp: the options chain is empty ({} of {} rows refused) — the member \
-             cannot select an instrument",
+            "vrp: the options chain holds no {} option ({} of {} rows refused) — the \
+             member cannot select an instrument",
+            currency_of(&file.hedge_descriptor).unwrap_or("?"),
             rows_refused,
             deribit_options.len()
         ));
@@ -314,6 +342,61 @@ pub fn render_seed_tell(seed: Option<&VrpSeed>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chain_is_restricted_to_the_hedge_instruments_currency() {
+        // `universe.toml [deribit] options_underlyings = ["BTC", "ETH"]`
+        // means boot discovery hands us BOTH ladders. A table holding
+        // both lets the member hedge an ETH call with the BTC perp, and
+        // it blows the 128-row table on a two-currency chain.
+        let perp = core_types::make_symbol_id(core_types::VenueId::Deribit, 1);
+        let mut chain: Vec<(String, SymbolId)> = Vec::new();
+        let mut k = 0u32;
+        while k < 6 {
+            chain.push((
+                format!("BTC-10SEP26-{}-C", 78_000 + 500 * k),
+                core_types::make_symbol_id(core_types::VenueId::Deribit, 513 + k),
+            ));
+            chain.push((
+                format!("ETH-10SEP26-{}-C", 3_000 + 100 * k),
+                core_types::make_symbol_id(core_types::VenueId::Deribit, 600 + k),
+            ));
+            k += 1;
+        }
+        // …and a USDC-linear name, which the parser refuses on its own.
+        chain.push((
+            "BTC_USDC-10SEP26-79000-C".to_owned(),
+            core_types::make_symbol_id(core_types::VenueId::Deribit, 700),
+        ));
+
+        let (reg, refused) = build_registry(&chain, "deribit:BTC-PERPETUAL", perp);
+        assert_eq!(reg.len(), 6, "the six BTC calls, and only those");
+        assert_eq!(refused, 7, "six ETH rows plus the USDC-linear name");
+        for row in reg.rows() {
+            assert_eq!(row.underlying_sym, perp);
+            assert!(row.strike_1e6 >= 78_000_000_000, "a BTC strike, not an ETH one");
+        }
+
+        // The same chain read for the ETH perp picks the other ladder.
+        let eth = core_types::make_symbol_id(core_types::VenueId::Deribit, 2);
+        let (eth_reg, _) = build_registry(&chain, "deribit:ETH-PERPETUAL", eth);
+        assert_eq!(eth_reg.len(), 6);
+        for row in eth_reg.rows() {
+            assert!(row.strike_1e6 <= 3_500_000_000, "an ETH strike");
+        }
+    }
+
+    #[test]
+    fn the_currency_prefix_is_read_off_the_descriptor() {
+        assert_eq!(currency_of("deribit:BTC-PERPETUAL"), Some("BTC"));
+        assert_eq!(currency_of("BTC-10SEP26-79000-C"), Some("BTC"));
+        assert_eq!(currency_of("deribit:ETH-PERPETUAL"), Some("ETH"));
+        // A USDC-linear name reads as its own "currency" and therefore
+        // never matches a plain one — belt and braces over the parser.
+        assert_eq!(currency_of("BTC_USDC-PERPETUAL"), None);
+        assert_eq!(currency_of("deribit:"), None);
+        assert_eq!(currency_of("-"), None);
+    }
 
     fn tmp(name: &str, body: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("vrp-boot-{name}-{}.tsv", std::process::id()));

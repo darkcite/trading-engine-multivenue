@@ -6,6 +6,46 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — the VRP chain is restricted to ONE currency (V8b)
+
+**What changed**
+- `cli::vrp_boot::build_registry` now takes the hedge DESCRIPTOR and
+  admits only options of that instrument's currency; every other row is
+  skipped and counted in the existing `chain_rows_refused` boot tell.
+- `strategy-vrp`'s selection law re-checks it: a row whose
+  `underlying_sym` is not the member's own hedge leg is never a
+  candidate.
+
+**Why — this was a live defect, not a hardening**
+`~/multivenue/universe.toml` has
+`[deribit] options_underlyings = ["BTC", "ETH"]`, so boot discovery
+hands the engine BOTH ladders. The selection law's first tie-break is
+nearest expiry, and its second is nearest strike to the underlying — so
+an ETH call expiring sooner than the BTC one would have been selected
+and then delta-hedged with `deribit:BTC-PERPETUAL`. That is a
+cross-asset naked position, and **nothing else in the member would have
+caught it**: every other check is about size, staleness or timing, none
+about what the instrument is. Deribit's BTC and ETH dailies happen to
+share an 08:00 UTC expiry today, which would have masked it — the law
+must not depend on that coincidence.
+
+It also matters mechanically: `OptRegistry` holds 128 rows, and a
+two-currency chain can exceed that, silently dropping instruments.
+
+**Ripple effects**
+- The evidence covers BTC only (edge spec §7: no ETH), so this is also
+  where that restriction is enforced rather than assumed. Trading the
+  ETH chain means pointing `vrp.toml`'s two descriptors at ETH — one
+  edit, and the registry follows.
+- A `vrp.toml` whose hedge descriptor has no option chain now fails the
+  boot with the currency named, instead of building an empty table.
+- Boot tell `chain_rows_refused` now includes the other currency's rows;
+  a BTC+ETH ladder reports roughly half the chain refused, which is
+  correct and expected.
+
+**Operator action**
+None.
+
 ## 2026-09-10 — `vrp-state.tsv`: the VRP member's state survives a restart (V8a)
 
 **What changed**
