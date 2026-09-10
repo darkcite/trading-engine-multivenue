@@ -545,6 +545,10 @@ pub struct FillEngine {
     oos_days: BTreeSet<u64>,
     /// D-7 mark-fill sym class (options with a synthetic mark book).
     mark_fill_syms: BTreeSet<u32>,
+    /// VRP V2b: last index/underlying reference px ×1e6 per OPTION sym.
+    /// Its presence is what marks a sym as fee-capped — an empty map is
+    /// the pre-V2b model exactly.
+    opt_index_1e6: BTreeMap<u32, i64>,
     mark_fills: u64,
     fills_total: u64,
     oos_trades: u64,
@@ -579,6 +583,7 @@ impl FillEngine {
             dd: DdTracker::new(),
             oos_days: BTreeSet::new(),
             mark_fill_syms: BTreeSet::new(),
+            opt_index_1e6: BTreeMap::new(),
             mark_fills: 0,
             fills_total: 0,
             oos_trades: 0,
@@ -908,6 +913,42 @@ impl FillEngine {
     /// `fee_bps` on the notional) in both books, the bounds/drawdown
     /// trackers and the day set, and hand it to the vm feedback.
     #[allow(clippy::too_many_arguments)]
+    /// §4.3 fee, with the VRP V2b OPTION law layered on top.
+    ///
+    /// Deribit charges an option trade `min(0.03 % of the INDEX,
+    /// 12.5 % of the PREMIUM)` per contract. A flat bps cannot express
+    /// that, and the two legs cross: the cap binds only while the
+    /// premium is under `index_bps / prem_bps` of the index — 0.24 % of
+    /// index at the venue's own numbers. **Both regimes occur in real
+    /// data** (measured at the F4 8 h entry instant over 180 daily
+    /// expiries: the index leg binds 56 %, the cap 44 %), so neither is
+    /// "the" case. A sym is option-classed exactly when the replay loop
+    /// has given it an index (`set_opt_index`); every other sym takes
+    /// the flat-bps path byte-for-byte as before.
+    #[inline]
+    fn fee_for(&self, sym: u32, notional_1e12: i128, fill_qty: i64, fee_bps: u32) -> i128 {
+        let venue = model_venue_byte(sym) as usize;
+        let Some(&index_1e6) = self.opt_index_1e6.get(&sym) else {
+            return fee_ceil_1e12(notional_1e12, fee_bps);
+        };
+        let f = match self.params.opt_fee.get(venue) {
+            Some(f) if f.active && index_1e6 > 0 => *f,
+            _ => return fee_ceil_1e12(notional_1e12, fee_bps),
+        };
+        let index_notional_1e12 = index_1e6 as i128 * fill_qty as i128;
+        let index_leg = fee_ceil_1e12(index_notional_1e12, f.index_bps);
+        let premium_cap = fee_ceil_1e12(notional_1e12, f.prem_bps);
+        index_leg.min(premium_cap)
+    }
+
+    /// Record the index/underlying reference for an OPTION sym. Boot of
+    /// the replay loop; presence also classes the sym as fee-capped.
+    pub fn set_opt_index(&mut self, sym: u32, index_1e6: i64) {
+        if index_1e6 > 0 {
+            self.opt_index_1e6.insert(sym, index_1e6);
+        }
+    }
+
     fn book_fill(
         &mut self,
         o: &OpenOrder,
@@ -920,7 +961,7 @@ impl FillEngine {
     ) {
         debug_assert!(fill_px > 0 && fill_qty > 0);
         let notional_1e12 = fill_px as i128 * fill_qty as i128;
-        let fee_1e12 = fee_ceil_1e12(notional_1e12, fee_bps);
+        let fee_1e12 = self.fee_for(o.sym, notional_1e12, fill_qty, fee_bps);
         self.full
             .apply_fill(o.sym, o.side, fill_px, fill_qty, fee_1e12, mark);
         self.bounds_refresh(o.sym, mark);
@@ -1013,6 +1054,106 @@ impl FillEngine {
 
 #[cfg(test)]
 mod tests {
+    // ---------------------------------------------------------------
+    // VRP V2b — the venue's CAPPED option trade fee
+    // ---------------------------------------------------------------
+
+    /// Both regimes of `min(0.03 % of index, 12.5 % of premium)`, pinned
+    /// as exact ×1e12 integers.
+    ///
+    /// **Which leg binds is NOT a constant, and the build card got it
+    /// backwards.** The guide asserts the 12.5 % cap binds at the 4 h/8 h
+    /// ATM strike, on a quoted premium of $30. Measured at the F4 8 h
+    /// entry instant over 180 daily expiries, the median premium is
+    /// $219.07 — 7× that — and the INDEX leg binds on 56 % of expiries
+    /// against the cap's 44 %. The crossover is exact and is what this
+    /// test pins: the cap binds only while
+    /// `premium < index × index_bps / prem_bps` = 0.24 % of the index.
+    #[test]
+    fn option_fee_pins_both_regimes_and_the_crossover() {
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        const INDEX_1E6: i64 = 79_000_000_000; // $79,000
+        const QTY_1E6: i64 = 1_000_000; // one contract
+        e.set_opt_index(sym, INDEX_1E6);
+
+        let fee = |premium_usd_1e6: i64| {
+            let notional = premium_usd_1e6 as i128 * QTY_1E6 as i128;
+            // 999 = a flat bps that would be wrong either way, so a
+            // result matching it would mean the option law never ran.
+            e.fee_for(sym, notional, QTY_1E6, 999)
+        };
+
+        // INDEX BINDS — the measured median 8 h ATM premium, $219.07.
+        // 0.03 % x $79,000 = $23.70 ; 12.5 % x $219.07 = $27.38.
+        assert_eq!(fee(219_070_000), 23_700_000_000_000);
+        // CAP BINDS — the guide's $30 premium.
+        // 0.03 % x $79,000 = $23.70 ; 12.5 % x $30 = $3.75.
+        assert_eq!(fee(30_000_000), 3_750_000_000_000);
+        // THE CROSSOVER, exactly: premium = index x 3/1250 = $189.60.
+        // Both legs equal there; a cent either side flips which binds.
+        assert_eq!(fee(189_600_000), 23_700_000_000_000);
+        assert!(fee(189_590_000) < 23_700_000_000_000, "below: the cap binds");
+        assert_eq!(fee(189_610_000), 23_700_000_000_000, "above: the index binds");
+        // And the crossover is 0.24 % of the index, as documented.
+        assert_eq!(189_600_000i64 * 1250, INDEX_1E6 * 3);
+    }
+
+    /// A sym with no index — every non-option instrument — takes the
+    /// flat-bps path byte-for-byte. This is what keeps every existing
+    /// report unchanged.
+    #[test]
+    fn a_sym_without_an_index_is_unaffected_by_the_option_law() {
+        let e = FillEngine::new(ModelParams::default(), 0);
+        let perp = core_types::make_symbol_id(VenueId::Deribit, 1);
+        let notional = 78_235_000_000i128 * 1_000_000i128;
+        assert_eq!(e.fee_for(perp, notional, 1_000_000, 5), fee_ceil_1e12(notional, 5));
+        assert_eq!(e.fee_for(perp, notional, 1_000_000, 0), 0);
+    }
+
+    /// `--opt-fee <venue>:off` returns that venue's options to the flat
+    /// path, and a venue with no schedule never had one.
+    #[test]
+    fn the_option_law_can_be_switched_off_per_venue() {
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        let notional = 219_070_000i128 * 1_000_000i128;
+
+        let mut on = FillEngine::new(ModelParams::default(), 0);
+        on.set_opt_index(sym, 79_000_000_000);
+        assert_eq!(on.fee_for(sym, notional, 1_000_000, 5), 23_700_000_000_000);
+
+        let mut params = ModelParams::default();
+        params.opt_fee[VenueId::Deribit as usize] = crate::backtest::OptFee::OFF;
+        let mut off = FillEngine::new(params, 0);
+        off.set_opt_index(sym, 79_000_000_000);
+        assert_eq!(
+            off.fee_for(sym, notional, 1_000_000, 5),
+            fee_ceil_1e12(notional, 5),
+            "off must be the flat path exactly"
+        );
+
+        // An OKX option sym: no schedule, so the flat path even with an
+        // index present.
+        let okx = core_types::make_symbol_id(VenueId::Okx, 513);
+        let mut o = FillEngine::new(ModelParams::default(), 0);
+        o.set_opt_index(okx, 79_000_000_000);
+        assert_eq!(o.fee_for(okx, notional, 1_000_000, 5), fee_ceil_1e12(notional, 5));
+    }
+
+    /// The fee scales with size and never rounds in our favour.
+    #[test]
+    fn the_option_fee_scales_and_rounds_against_us() {
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        e.set_opt_index(sym, 79_000_000_000);
+        let one = e.fee_for(sym, 219_070_000i128 * 1_000_000, 1_000_000, 999);
+        let ten = e.fee_for(sym, 219_070_000i128 * 10_000_000, 10_000_000, 999);
+        assert_eq!(ten, one * 10);
+        // Ceil: a premium that divides badly still rounds up.
+        let odd = e.fee_for(sym, 7i128, 1, 999);
+        assert!(odd > 0, "a non-zero notional never yields a zero fee");
+    }
+
     use super::*;
     use core_types::{make_symbol_id, Price, Qty, VenueId};
 
@@ -1058,6 +1199,7 @@ mod tests {
             fee_bps: [(0, 0); 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
+            opt_fee: ModelParams::default().opt_fee,
         };
         FillEngine::new(p, boundary)
     }
@@ -1166,6 +1308,7 @@ mod tests {
             fee_bps: [(maker, taker); 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
+            opt_fee: ModelParams::default().opt_fee,
         };
         FillEngine::new(p, boundary)
     }
@@ -1510,6 +1653,7 @@ mod tests {
             fee_bps: [(50, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // PM maker 50 bps
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
+            opt_fee: ModelParams::default().opt_fee,
         };
         let mut e = FillEngine::new(p, 0); // all OOS
         let mut out = Vec::new();
@@ -1548,6 +1692,7 @@ mod tests {
             fee_bps: [(50, 0), (10, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
             latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
+            opt_fee: ModelParams::default().opt_fee,
         };
         let mut e = FillEngine::new(p, 0);
         let mut out = Vec::new();
@@ -1839,6 +1984,7 @@ mod tests {
                 fee_bps: [(maker_bps, 0); 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
+                opt_fee: ModelParams::default().opt_fee,
             };
             let mut e = FillEngine::new(params, u64::MAX / 2);
             let mut out = Vec::new();
@@ -1909,6 +2055,7 @@ mod tests {
                 fee_bps: [(0, taker_bps); 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
+                opt_fee: ModelParams::default().opt_fee,
             };
             let mut e = FillEngine::new(params, u64::MAX / 2);
             let mut out = Vec::new();
@@ -1990,6 +2137,7 @@ mod tests {
                 fee_bps: [(maker_bps, 0); 7],
                 latency_ns: [0; 7],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
+                opt_fee: ModelParams::default().opt_fee,
             };
             let mut e = FillEngine::new(params, 0);
             let mut out = Vec::new();

@@ -6,6 +6,51 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — Deribit option trade fees are now CAPPED (VRP V2b)
+
+**What changed**
+- `crates/cli/src/backtest/fill.rs` gains `FillEngine::fee_for`, which sits
+  between `book_fill` and `fee_ceil_1e12`. A sym that has been given an
+  index price (`FillEngine::set_opt_index`) and whose venue has an ACTIVE
+  `ModelParams::opt_fee` row pays
+  `min(index_bps × index × qty, prem_bps × premium × qty)`, each leg
+  ceil-rounded in `i128`. Every other sym takes the flat `fee_bps` path
+  it always took, byte for byte.
+- New `ModelParams::opt_fee: [OptFee; 7]`, indexed by venue byte.
+  **Deribit is ACTIVE by default** at its published schedule —
+  `index_bps = 3` (0.03 % of the index) capped at `prem_bps = 1250`
+  (12.5 % of the premium). Every other venue is `OFF`.
+- New flag `--opt-fee <venue>:<index_bps>:<prem_bps>` (and
+  `<venue>:off`) on `backtest` and `audit-pnl` **only**. It is
+  deliberately NOT on `run`: the live engine does not price options.
+- Both loaders now carry the per-sym index. `backtest` populates it in the
+  replay pre-pass; `audit-pnl` threads an `opt_index_1e6` map out of
+  `load_run_events`. The index is `OptSummary.underlying_px_1e9 / 1_000`
+  — the same forward Deribit itself charges against.
+
+**Why**
+Deribit's option fee is `min(0.0003 × index, 0.125 × premium)`, not a flat
+bps of notional. At these strikes the two legs cross at
+`premium = index × 3 / 1250` = **0.24 % of the index** — $189.60 at an index
+of $79,000. Below that premium the 12.5 % cap binds; above it the index leg
+binds. The measured median premium on the captured chain is $219.07, i.e.
+just above the crossover, so BOTH regimes occur inside a single window and
+a flat-bps model is wrong in both directions. With the default
+`fee_bps = (0, 0)`, option fills previously paid **nothing at all**.
+
+**Ripple effects**
+- A backtest or audit-pnl over a root that CAPTURED options now charges the
+  option leg. Roots with no option records are unaffected — `fee_for`
+  cannot fire without an index, and only option syms are given one.
+- The `run` surface, schema-1 stdout keys, `AUDIT_PNL_VERSION` and
+  `detail_version` are all unchanged: this adds a cost, not a field.
+- Settlement fees (`min(0.00015 × index, 0.125 × value)`, OTM expiry free)
+  are NOT here — they belong to the expiry path (VX), not the trade path.
+
+**Operator action**
+None. Options were never traded live. To reproduce a pre-V2b number over an
+option-carrying root, pass `--opt-fee deribit:off`.
+
 ## 2026-09-10 — `detail_version: 5` — harness option marks are USD, not coin (VRP V2a)
 
 **What changed**

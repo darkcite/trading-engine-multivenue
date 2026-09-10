@@ -121,6 +121,9 @@ pub struct AuditPnlConfig {
     pub latency_ns_venue: Vec<String>,
     /// VT4: repeatable `--stale-after-ms <venue>:<ms>` overrides.
     pub stale_after_ms: Vec<String>,
+    /// VRP V2b: repeatable `--opt-fee <venue>:<index_bps>:<prem_bps>`
+    /// (or `<venue>:off`).
+    pub opt_fee: Vec<String>,
     /// RG3: `--regime` (the backtest's law, [`RegimeMode`]).
     pub regime: RegimeMode,
     /// RG3: `--regime-seed <path>` (default = the first run's own
@@ -368,6 +371,7 @@ fn load_run_events(
     run: &RunDir,
     interner: &mut SymInterner,
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
+    opt_index_1e6: &mut BTreeMap<u32, i64>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
@@ -467,6 +471,10 @@ fn load_run_events(
                 if let Some(row) = opt_reg.get(o.sym) {
                     let dense = resolve(o.sym, interner, &mut load)?;
                     und.observe(dense, o.ts_ns, o.underlying_px_1e9, row.contract_size_1e9);
+                    // VRP V2b: the index leg of the capped option fee.
+                    if o.underlying_px_1e9 > 0 {
+                        opt_index_1e6.insert(dense, o.underlying_px_1e9 / 1_000);
+                    }
                 }
             }
             // VRP V2a — THE DENOMINATION LAW. This was a pure rescale
@@ -672,6 +680,7 @@ fn load_and_merge_events(
     runs: &[RunDir],
     interner: &mut SymInterner,
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
+    opt_index_1e6: &mut BTreeMap<u32, i64>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
@@ -679,7 +688,8 @@ fn load_and_merge_events(
     let mut loads: Vec<RunLoad> = Vec::with_capacity(runs.len());
     let mut prev_last_virt: u64 = 0;
     for run in runs {
-        let (evs, mut load) = load_run_events(run, interner, mark_fill_syms, stale_after_ms)?;
+        let (evs, mut load) =
+            load_run_events(run, interner, mark_fill_syms, opt_index_1e6, stale_after_ms)?;
         if evs.is_empty() {
             loads.push(load);
             continue;
@@ -747,12 +757,19 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         cfg.latency_ns,
         &cfg.latency_ns_venue,
         &cfg.stale_after_ms,
+        &cfg.opt_fee,
     )?;
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut interner = SymInterner::default();
     let mut mark_fill_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let (merged, loads) =
-        load_and_merge_events(&runs, &mut interner, &mut mark_fill_syms, params.stale_after_ms)?;
+    let mut opt_index_1e6: BTreeMap<u32, i64> = BTreeMap::new();
+    let (merged, loads) = load_and_merge_events(
+        &runs,
+        &mut interner,
+        &mut mark_fill_syms,
+        &mut opt_index_1e6,
+        params.stale_after_ms,
+    )?;
 
     for l in &loads {
         report(&format!(
@@ -832,6 +849,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 fee_bps: params.fee_bps,
                 latency_ns: params.latency_ns,
                 stale_after_ms: params.stale_after_ms,
+                opt_fee: params.opt_fee,
             },
             0,
         );
@@ -839,6 +857,10 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // the mark-fill law.
         for sym in &mark_fill_syms {
             e.set_mark_fill_sym(*sym);
+        }
+        // VRP V2b: the index leg of the venue's capped option fee.
+        for (sym, index_1e6) in &opt_index_1e6 {
+            e.set_opt_index(*sym, *index_1e6);
         }
         e
     };

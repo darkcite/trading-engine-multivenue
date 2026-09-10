@@ -123,6 +123,7 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         latency_ns: None,
         latency_ns_venue: Vec::new(),
         stale_after_ms: Vec::new(),
+        opt_fee: Vec::new(),
         emit_detail: None,
         // RG3: hermetic — never consult the operator's default artifact
         // from a test (legacy fixtures carry no labelled row, so `off`
@@ -1042,6 +1043,7 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         latency_ns: Some(0),
         latency_ns_venue: Vec::new(),
         stale_after_ms: Vec::new(),
+        opt_fee: Vec::new(),
         emit_detail: None,
         regime: RegimeMode::Off,
         regime_seed: None,

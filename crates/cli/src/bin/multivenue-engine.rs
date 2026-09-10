@@ -123,6 +123,13 @@ struct AuditPnlArgs {
     /// (defaults = the venue table; 0 = never stale).
     #[arg(long)]
     stale_after_ms: Vec<String>,
+    /// VRP V2b: repeatable `--opt-fee <venue>:<index_bps>:<prem_bps>`
+    /// — the venue's CAPPED option trade fee, `min(index_bps of the
+    /// index notional, prem_bps of the premium)`. `<venue>:off` takes
+    /// the flat `--fee-bps` path. Absent = Deribit 3:1250, all others
+    /// off.
+    #[arg(long)]
+    opt_fee: Vec<String>,
     /// RG3: `<path>` = a `regime.toml` artifact to replay the regime
     /// detector from (refusals fatal); `off` = regime-blind; absent =
     /// the default artifact when it exists and resolves on this root.
@@ -169,6 +176,13 @@ struct BacktestArgs {
     /// stale-blind and say so on stderr.
     #[arg(long)]
     stale_after_ms: Vec<String>,
+    /// VRP V2b: repeatable `--opt-fee <venue>:<index_bps>:<prem_bps>`
+    /// — the venue's CAPPED option trade fee, `min(index_bps of the
+    /// index notional, prem_bps of the premium)`. `<venue>:off` takes
+    /// the flat `--fee-bps` path. Absent = Deribit 3:1250, all others
+    /// off.
+    #[arg(long)]
+    opt_fee: Vec<String>,
     /// §5 rich-detail sidecar path (per-symbol/IS metrics). Declared
     /// now; the sidecar is written starting H2.
     #[arg(long)]
@@ -432,6 +446,7 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         latency_ns: args.latency_ns,
         latency_ns_venue: args.latency_ns_venue,
         stale_after_ms: args.stale_after_ms,
+        opt_fee: args.opt_fee,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
     };
@@ -482,6 +497,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         latency_ns: args.latency_ns,
         latency_ns_venue: args.latency_ns_venue,
         stale_after_ms: args.stale_after_ms,
+        opt_fee: args.opt_fee,
         emit_detail: args.emit_detail,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,

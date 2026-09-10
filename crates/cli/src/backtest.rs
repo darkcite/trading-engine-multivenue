@@ -182,6 +182,10 @@ pub struct BacktestConfig {
     /// VT4: repeatable `--stale-after-ms <venue>:<ms>` overrides of the
     /// harness's re-judge thresholds (defaults = the venue table).
     pub stale_after_ms: Vec<String>,
+    /// VRP V2b: repeatable `--opt-fee <venue>:<index_bps>:<prem_bps>`
+    /// (or `<venue>:off`) — the venue's capped OPTION trade fee.
+    /// Absent = the Deribit default; additive, never worker-parsed.
+    pub opt_fee: Vec<String>,
     /// `--emit-detail` sidecar path — declared per §5; written in H2.
     pub emit_detail: Option<PathBuf>,
     /// RG3: `--regime` (`docs/regime-and-dashboard-plan.md` §4.8 — the
@@ -254,6 +258,36 @@ pub fn parse_split(s: &str) -> Result<Split, HarnessError> {
 // stderr so a stubbed override is never silently "applied").
 // ---------------------------------------------------------------
 
+/// VRP V2b: the venue's option trade-fee law, integer only.
+///
+/// `min(index_bps of the INDEX notional, prem_bps of the PREMIUM
+/// notional)`. Deribit: 3 bps of index, 12.5 % of premium.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OptFee {
+    /// Basis points of the index notional (Deribit 3 = 0.03 %).
+    pub index_bps: u32,
+    /// Basis points of the premium notional (Deribit 1250 = 12.5 %).
+    pub prem_bps: u32,
+    /// False = this venue's options take the flat `fee_bps` path.
+    pub active: bool,
+}
+
+impl OptFee {
+    /// The venue's published option schedule.
+    pub const DERIBIT: Self = Self {
+        index_bps: 3,
+        prem_bps: 1250,
+        active: true,
+    };
+    /// Flat-bps path (every venue whose option economics we do not
+    /// express).
+    pub const OFF: Self = Self {
+        index_bps: 0,
+        prem_bps: 0,
+        active: false,
+    };
+}
+
 /// Fee + latency-penalty tables, indexed by [`VenueId`] byte
 /// (0..=6 since WS9; **slot 5 = Ai is a DEAD slot** — the command
 /// feed never trades — kept so the venue byte indexes directly).
@@ -274,12 +308,23 @@ pub struct ModelParams {
     /// doctrine-4 table the ingress uses); `--stale-after-ms
     /// <venue>:<ms>` overrides.
     pub stale_after_ms: [u32; 7],
+    /// VRP V2b: per-venue OPTION trade fee. Only Deribit is active by
+    /// default — the lane is Deribit-only (ruling O‑D1) and no other
+    /// venue's option economics are expressed here.
+    /// `--opt-fee <venue>:<index_bps>:<prem_bps>` overrides; `off`
+    /// deactivates.
+    pub opt_fee: [OptFee; 7],
 }
 
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
             fee_bps: [(0, 0); 7],
+            opt_fee: {
+                let mut t = [OptFee::OFF; 7];
+                t[VenueId::Deribit as usize] = OptFee::DERIBIT;
+                t
+            },
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             // Δ_venue = feed one-way p50 + REST request RTT p50 / 2,
             // rounded up to 10 ms (docs/venue-latency.md §2), MEASURED
@@ -314,12 +359,14 @@ pub(crate) fn model_venue(label: &str) -> Option<usize> {
 
 /// Fold the §4 flag overrides onto the defaults. Precedence: defaults
 /// → `--latency-ns` (global) → `--latency-ns-venue` / `--fee-bps` /
-/// `--stale-after-ms` (later occurrences of a repeated flag win).
+/// `--stale-after-ms` / `--opt-fee` (later occurrences of a repeated
+/// flag win).
 pub fn parse_model_params(
     fee_specs: &[String],
     latency_global: Option<u64>,
     latency_specs: &[String],
     stale_specs: &[String],
+    opt_fee_specs: &[String],
 ) -> Result<ModelParams, HarnessError> {
     let mut p = ModelParams::default();
     for spec in stale_specs {
@@ -378,6 +425,36 @@ pub fn parse_model_params(
             HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable taker bps"))
         })?;
         p.fee_bps[vi] = (mk, tk);
+    }
+    for spec in opt_fee_specs {
+        let mut it = spec.split(':');
+        let (v, a, b) = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(v), Some("off"), None, None) => (v, "", ""),
+            (Some(v), Some(a), Some(b), None) => (v, a, b),
+            _ => {
+                return Err(HarnessError::Usage(format!(
+                    "bad --opt-fee {spec:?}: want <venue>:<index_bps>:<prem_bps> or <venue>:off"
+                )))
+            }
+        };
+        let vi = model_venue(v).ok_or_else(|| {
+            HarnessError::Usage(format!("bad --opt-fee {spec:?}: unknown venue {v:?}"))
+        })?;
+        if a.is_empty() {
+            p.opt_fee[vi] = OptFee::OFF;
+            continue;
+        }
+        let index_bps: u32 = a.parse().map_err(|_| {
+            HarnessError::Usage(format!("bad --opt-fee {spec:?}: unparseable index bps"))
+        })?;
+        let prem_bps: u32 = b.parse().map_err(|_| {
+            HarnessError::Usage(format!("bad --opt-fee {spec:?}: unparseable premium bps"))
+        })?;
+        p.opt_fee[vi] = OptFee {
+            index_bps,
+            prem_bps,
+            active: true,
+        };
     }
     Ok(p)
 }
@@ -1455,6 +1532,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         cfg.latency_ns,
         &cfg.latency_ns_venue,
         &cfg.stale_after_ms,
+        &cfg.opt_fee,
     )?;
 
     // Candidate bytes + identity (§3.5): full SHA-256 is schema-1's
@@ -1595,6 +1673,16 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         if let RecPayload::Opt(o) = &rec.payload {
             if o.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && o.mark_px_1e9 > 0 {
                 mark_fill_syms.insert(o.sym);
+            }
+            // VRP V2b: the index leg of the venue's capped option fee.
+            // Presence of an index is what classes a sym as
+            // fee-capped, so only Deribit options get one. The field is
+            // the expiry's FORWARD rather than the spot index (V0(a),
+            // measured −2.22 bps of basis); at a $23.70 index leg that
+            // is half a cent, and `index_price` is parsed by nothing in
+            // the tree — documented rather than plumbed.
+            if o.venue == VenueId::Deribit as u8 && o.underlying_px_1e9 > 0 {
+                engine.set_opt_index(o.sym, o.underlying_px_1e9 / 1_000);
             }
         }
     }
@@ -2532,6 +2620,7 @@ mod tests {
             Some(1_000),
             &["deribit:42".to_owned()],
             &["okx:250".to_owned(), "bn:0".to_owned(), "okx:300".to_owned()],
+            &[],
         )
         .unwrap();
         // Global latency replaced every TRADEABLE slot (the Ai dead
@@ -2555,7 +2644,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_model_params(&[bad_fee.to_owned()], None, &[], &[]),
+                    parse_model_params(&[bad_fee.to_owned()], None, &[], &[], &[]),
                     Err(HarnessError::Usage(_))
                 ),
                 "fee spec {bad_fee:?} must be a usage error"
@@ -2564,7 +2653,7 @@ mod tests {
         for bad_lat in ["pm", "pm:1:2", "rpc:5", "nope:5", "pm:x"] {
             assert!(
                 matches!(
-                    parse_model_params(&[], None, &[bad_lat.to_owned()], &[]),
+                    parse_model_params(&[], None, &[bad_lat.to_owned()], &[], &[]),
                     Err(HarnessError::Usage(_))
                 ),
                 "latency spec {bad_lat:?} must be a usage error"
@@ -2573,7 +2662,7 @@ mod tests {
         for bad_stale in ["okx", "mars:400", "okx:fast", "okx:-1"] {
             assert!(
                 matches!(
-                    parse_model_params(&[], None, &[], &[bad_stale.to_owned()]),
+                    parse_model_params(&[], None, &[], &[bad_stale.to_owned()], &[]),
                     Err(HarnessError::Usage(_))
                 ),
                 "stale spec {bad_stale:?} must be a usage error"
