@@ -349,6 +349,10 @@ struct RunLoad {
     /// unrepresentable premium. A venue that sends no mark at all (OKX)
     /// is deliberately NOT counted here.
     opts_unconverted: u64,
+    /// VRP V2a: option QUOTE ticks converted from coin to USD, and
+    /// those DROPPED because no underlying was known at their instant.
+    opt_quotes_converted: u64,
+    opt_quotes_dropped: u64,
     /// VT4: per-lane stale accounting (the harness re-judge).
     stale: [crate::backtest::stale::StaleStats; VENUE_LABELS.len()],
     /// RG3: funding prints loaded, `SetRegime` frames loaded (clamped
@@ -389,6 +393,9 @@ fn load_run_events(
         }
         None => opt_registry::OptRegistry::new(),
     };
+    // VRP V2a: the per-sym underlying timeline the option QUOTE lane
+    // needs, filled from this run's OptSummary records below.
+    let mut und = crate::backtest::opt::UnderlyingBook::new();
 
     let resolve =
         |sym: u32, interner: &mut SymInterner, load: &mut RunLoad| -> Result<u32, HarnessError> {
@@ -451,6 +458,17 @@ fn load_run_events(
             continue;
         };
         for (i, o) in reader.records().iter().enumerate() {
+            // VRP V2a: every registered Deribit option contributes its
+            // underlying/forward to the timeline, whether or not its own
+            // mark converts — the QUOTE ticks for this sym are priced
+            // off it. Keyed on the DENSE sym, which is what the ticks
+            // already in `evs` carry.
+            if o.venue == VenueId::Deribit as u8 {
+                if let Some(row) = opt_reg.get(o.sym) {
+                    let dense = resolve(o.sym, interner, &mut load)?;
+                    und.observe(dense, o.ts_ns, o.underlying_px_1e9, row.contract_size_1e9);
+                }
+            }
             // VRP V2a — THE DENOMINATION LAW. This was a pure rescale
             // (`o.mark_px_1e9 / 1_000`) that booked a COIN premium as
             // if it were dollars, understating the option leg by the
@@ -494,6 +512,42 @@ fn load_run_events(
             load.opt_synth_ticks += 1;
             load.ticks += 1;
         }
+    }
+    // VRP V2a — THE OPTION QUOTE LANE. Deribit option rows subscribe to
+    // `quote` AND `ticker` (`ingress-deribit/src/run_loop.rs:815-820`),
+    // so every option sym has a REAL tick lane carrying COIN bid/ask —
+    // the path option prices actually take into `FillEngine`, since the
+    // D-7 synthesis above is suppressed for exactly these syms. Applied
+    // here rather than at load time because a `Tick` has no underlying:
+    // the timeline is complete only once this run's summaries are read.
+    // Only REAL venue ticks are touched (lord < 200); the synthetic
+    // mark ticks at lord 200+ are already USD.
+    und.seal();
+    if !und.is_empty() {
+        let mut converted = 0u64;
+        let mut dropped = 0u64;
+        evs.retain_mut(|e| {
+            if e.class != CLASS_TICK || e.lord >= 200 {
+                return true;
+            }
+            let Payload::Tick(t) = &mut e.payload else {
+                return true;
+            };
+            match und.convert_quote(t) {
+                crate::backtest::opt::QuoteFix::Converted => {
+                    converted += 1;
+                    true
+                }
+                crate::backtest::opt::QuoteFix::Unpriceable => {
+                    dropped += 1;
+                    false
+                }
+                crate::backtest::opt::QuoteFix::NotAnOption => true,
+            }
+        });
+        load.opt_quotes_converted = converted;
+        load.opt_quotes_dropped = dropped;
+        load.ticks = load.ticks.saturating_sub(dropped);
     }
     load.stale = judge.stats;
     if load.ticks == 0 {
@@ -738,6 +792,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // VRP V2a: emitted only when it fires, so a run carrying no
         // option records reports exactly as it did before the
         // denomination law landed.
+        if l.opt_quotes_converted > 0 || l.opt_quotes_dropped > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: opt-quote-ticks-usd={} dropped={} (option quotes \
+                 are COIN on the wire)",
+                l.epoch_ns, l.opt_quotes_converted, l.opt_quotes_dropped
+            ));
+        }
         if l.opts_unconverted > 0 {
             report(&format!(
                 "audit-pnl: run-{}: opts-unconverted={} (marked option records \

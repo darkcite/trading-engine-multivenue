@@ -21,6 +21,22 @@ Each entry is atomic: one version bump per section. Do not batch.
   sym changed.
 - New crate dependency for `cli`: `opt-registry` (VRP V1). Each run builds
   its own `OptRegistry` from that run's `instrument-manifest.tsv`.
+- **The option QUOTE tick lane is converted too, and it is the lane that
+  actually runs.** Deribit TAIL rows subscribe to `quote` AND `ticker`
+  (`ingress-deribit/src/run_loop.rs:815-820`): the ticker feeds
+  `OptSummary`, the quote feeds a real `Tick` whose bid/ask are equally
+  coin-denominated. Because every option sym therefore HAS a tick lane,
+  `tick_syms` suppresses the D-7 synthesis for all of them and
+  `opt_synth_ticks` is 0 on any real capture — so converting only the two
+  synthesis sites would have fixed nothing that executes. Both loaders now
+  build an `UnderlyingBook` (a per-sym timeline of `underlying_px_1e9`
+  from that run's own summaries) and convert every real option quote tick
+  after loading. A quote with no underlying known at or before its instant
+  is DROPPED rather than guessed. Additive counters
+  `opt_quotes_converted` / `opt_quotes_dropped`, emitted only when
+  non-zero.
+- The DEPTH lane needs no equivalent: measured, `deribit-depth.pmlr`
+  carries only the 9 static instruments and no options.
 
 **Why**
 Deribit options are inverse: quoted, margined and settled in the base coin
@@ -60,8 +76,15 @@ in the output would have said so.
 **Operator action**
 None. Options were never traded live, so no existing report's traded P&L
 moves. Reports over roots that CAPTURED options will show different option
-mark-tick prices — those rows previously held a coin number labelled as
-dollars.
+prices — those rows previously held a coin number labelled as dollars.
+
+Verified on `run-1788984954632200000` (0.98 h): the option-free root is
+byte-identical before/after on all four output surfaces, while the root
+with options reports `quote_ticks_usd=56562 quote_ticks_dropped=196` from
+`backtest` and the identical pair from `audit-pnl` — two independently
+written loaders in different symbol spaces agreeing, and both matching a
+from-scratch reconstruction off the raw capture (64 quotes preceding their
+sym's first underlying print + 132 one-sided books = 196).
 
 ## 2026-09-05 — `archive_manifest_version: 1` (object-storage archive)
 

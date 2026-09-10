@@ -530,6 +530,10 @@ struct RunSummary {
     /// premium. A venue that simply sends no mark (OKX) is NOT counted
     /// here; `opts` already shows those records arrived.
     opts_unconverted: u64,
+    /// VRP V2a: option QUOTE ticks converted from coin to USD, and
+    /// those DROPPED because no underlying was known at their instant.
+    opt_quotes_converted: u64,
+    opt_quotes_dropped: u64,
     remapped_syms: u64,
     /// VM2 V7: records DROPPED because their run-manifest descriptor
     /// is absent from the binding (newest) manifest — a DEAD
@@ -579,6 +583,12 @@ fn load_run(
     let mut summary_extra = (0u64, 0u64, 0u64, 0u64, 0u64); // ev, dp, op, synth, remapped
     let mut dropped_foreign = 0u64;
     let mut opts_unconverted = 0u64;
+    // VRP V2a: the per-sym underlying timeline the option QUOTE lane
+    // needs. Populated from this run's OptSummary records below, then
+    // applied to the ticks already loaded.
+    let mut und = opt::UnderlyingBook::new();
+    let mut opt_quotes_converted = 0u64;
+    let mut opt_quotes_dropped = 0u64;
     let mut any_file = false;
     let map_sym = |sym: u32, remapped: &mut u64, dropped: &mut u64| -> Option<u32> {
         match remap.get(&sym) {
@@ -778,6 +788,16 @@ fn load_run(
                     payload: RecPayload::Opt(op),
                 });
                 summary_extra.2 += 1;
+                // VRP V2a: every registered Deribit option contributes
+                // its underlying/forward to the timeline, whether or not
+                // its own mark converts — the QUOTE ticks for this sym
+                // are priced off it. Keyed on the REMAPPED sym, because
+                // that is what the ticks in `recs` carry.
+                if o.venue == VenueId::Deribit as u8 {
+                    if let Some(row) = opt_reg.get(o.sym) {
+                        und.observe(op.sym, o.ts_ns, o.underlying_px_1e9, row.contract_size_1e9);
+                    }
+                }
                 if !tick_syms.contains(&op.sym) {
                     // Zero-spread mark tick: the fill engine executes
                     // these syms under the D-7 mark-fill law (the
@@ -827,6 +847,49 @@ fn load_run(
             }
         }
     }
+    // VRP V2a — THE OPTION QUOTE LANE.
+    //
+    // Deribit TAIL rows subscribe to `quote` AND `ticker`
+    // (`ingress-deribit/src/run_loop.rs:815-820`), so every option sym
+    // has a REAL tick lane whose bid/ask are coin-denominated. That is
+    // the path option prices actually take into `FillEngine` — the D-7
+    // synthesis above is suppressed for exactly these syms by
+    // `tick_syms`, so `opt_synth_ticks` is 0 on any real capture.
+    //
+    // Converted here rather than at load time because a `Tick` carries
+    // no underlying: the timeline is only complete once this run's
+    // OptSummary records have been read. Only REAL venue ticks are
+    // touched (`lord < VENUE_LABELS.len()`); the synthetic mark ticks
+    // at lord 40+ were already denominated by `synth_mark_usd_1e6` and
+    // must not be converted twice.
+    //
+    // A quote with no underlying known at or before its instant is
+    // DROPPED, not guessed: leaving it would book a coin number as
+    // dollars, which is the defect this whole module exists to remove.
+    und.seal();
+    if !und.is_empty() {
+        let lanes = VENUE_LABELS.len() as u8;
+        recs.retain_mut(|r| {
+            if r.lord >= lanes {
+                return true;
+            }
+            let RecPayload::Tick(t) = &mut r.payload else {
+                return true;
+            };
+            match und.convert_quote(t) {
+                opt::QuoteFix::Converted => {
+                    opt_quotes_converted += 1;
+                    true
+                }
+                opt::QuoteFix::Unpriceable => {
+                    opt_quotes_dropped += 1;
+                    false
+                }
+                opt::QuoteFix::NotAnOption => true,
+            }
+        });
+    }
+
     order_run(&mut recs);
     Ok((
         recs,
@@ -838,6 +901,8 @@ fn load_run(
             opts: summary_extra.2,
             opt_synth_ticks: summary_extra.3,
             opts_unconverted,
+            opt_quotes_converted,
+            opt_quotes_dropped,
             remapped_syms: summary_extra.4,
             dropped_foreign,
             stale: judge.stats,
@@ -1242,6 +1307,11 @@ pub struct HarnessStats {
     /// VRP V2a: option records that carried a mark and could NOT be
     /// denominated in USD (see `RunSummary::opts_unconverted`).
     pub opts_unconverted: u64,
+    /// VRP V2a: option QUOTE ticks converted coin -> USD, and dropped
+    /// for want of an underlying at their instant.
+    pub opt_quotes_converted: u64,
+    /// VRP V2a: option quote ticks dropped for want of an underlying.
+    pub opt_quotes_dropped: u64,
     /// Syms remapped through the per-run manifest join.
     pub remapped_syms: u64,
     /// VM2 V7: dead-descriptor records dropped (§6 law; see
@@ -1757,6 +1827,8 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         merged_opts: run_summaries.iter().map(|r| r.opts).sum(),
         opt_synth_ticks: run_summaries.iter().map(|r| r.opt_synth_ticks).sum(),
         opts_unconverted: run_summaries.iter().map(|r| r.opts_unconverted).sum(),
+        opt_quotes_converted: run_summaries.iter().map(|r| r.opt_quotes_converted).sum(),
+        opt_quotes_dropped: run_summaries.iter().map(|r| r.opt_quotes_dropped).sum(),
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
@@ -2083,6 +2155,13 @@ fn render_summary(
     // VRP V2a: appended only when it fires, so a root carrying no
     // option records renders exactly as it did before the denomination
     // law landed (the byte-identical guard rests on this).
+    if stats.opt_quotes_converted > 0 || stats.opt_quotes_dropped > 0 {
+        s.push_str(&format!(
+            "options: quote_ticks_usd={} quote_ticks_dropped={} (option quotes are \
+             COIN on the wire; converted off the run's own underlying timeline)\n",
+            stats.opt_quotes_converted, stats.opt_quotes_dropped
+        ));
+    }
     if stats.opts_unconverted > 0 {
         s.push_str(&format!(
             "options: opts_unconverted={} (marked records that could not be \

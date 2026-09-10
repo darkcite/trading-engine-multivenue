@@ -64,13 +64,46 @@
 //! the tree; capturing it would be an ingress change this magnitude does
 //! not justify.
 //!
+//! # The QUOTE lane carries the same defect — and is the live one
+//!
+//! Deribit TAIL rows subscribe to **`quote` AND `ticker`**
+//! (`ingress-deribit/src/run_loop.rs:815-820`). The ticker feeds
+//! `OptSummary`; the quote feeds a real [`Tick`] carrying the option's
+//! own best bid/ask — **also coin-denominated**. Measured on
+//! `run-1788984954632200000`: all 64 option syms appear in
+//! `deribit-ticks.pmlr` (56 626 quote ticks), e.g.
+//! `BTC-10SEP26-77500-C` bid `0.008000` / ask `0.011500` sitting beside
+//! `BTC-PERPETUAL` at `78235.000000` in the same file.
+//!
+//! Because every option sym therefore HAS a tick lane, the D-7 synthesis
+//! above is suppressed for all of them (`tick_syms`), and
+//! `opt_synth_ticks` is 0 on any real capture. **So the quote lane is
+//! where option prices actually reach `FillEngine`, and converting only
+//! the synthesis sites would fix nothing that runs.**
+//!
+//! A `Tick` carries no underlying price, so the conversion needs
+//! [`UnderlyingBook`] — a per-sym timeline of `underlying_px_1e9` built
+//! from the run's own `OptSummary` records and read at the tick's
+//! `ts_ns`. Per SYM, not per currency: `underlying_price` is the forward
+//! for THAT expiry, so two expiries on one coin have different values.
+//!
+//! The real bid/ask is converted rather than discarded, deliberately:
+//! those quotes are the only measurement of the option SPREAD that
+//! exists, and the spread is the VRP lane's largest unmeasured cost.
+//!
+//! The depth lane needs no such treatment — measured, `deribit-depth.pmlr`
+//! carries only the 9 static instruments, no options.
+//!
 //! # Doctrine
 //!
 //! Offline path — this module allocates freely (the registry build reads
-//! a manifest) and is never on the hot path. No `unsafe`. The arithmetic
-//! is **i128 by necessity**, not by taste: see [`coin_mark_to_usd_1e6`].
+//! a manifest, the underlying book holds one timeline per option) and is
+//! never on the hot path. No `unsafe`. The arithmetic is **i128 by
+//! necessity**, not by taste: see [`coin_mark_to_usd_1e6`].
 
-use core_types::{OptSummary, VenueId, OPT_SUMMARY_FLAG_MARK_PX};
+use std::collections::BTreeMap;
+
+use core_types::{OptSummary, Price, SymbolId, Tick, VenueId, OPT_SUMMARY_FLAG_MARK_PX};
 use opt_registry::{OptInstrument, OptRegistry};
 
 /// Contract size the harness assumes for a Deribit option, ×1e9.
@@ -222,6 +255,142 @@ pub fn registry_from_manifest_rows<S: AsRef<str>>(rows: &[(u32, S)]) -> OptRegis
         let _ = reg.insert(row);
     }
     reg
+}
+
+/// Coin-denominated option QUOTE price ×1e6 → USD ×1e6.
+///
+/// A `Tick`'s prices are ×1e6 (not ×1e9 like `OptSummary.mark_px_1e9`),
+/// so the divisor is 1e18 rather than [`coin_mark_to_usd_1e6`]'s 1e21:
+///
+/// ```text
+/// usd_1e6 = px_coin_1e6 × underlying_px_1e9 × cs_1e9 / 1e18
+/// ```
+///
+/// Worked, from the capture: `8_000` (0.008 coin) at an underlying of
+/// `78_229_410_000_000` with a 1-coin contract = `625_835_280` — $625.84.
+///
+/// Checked throughout, for the same reason as the mark conversion: these
+/// are bytes off a capture file.
+#[inline]
+#[must_use]
+pub fn quote_px_usd_1e6(px_coin_1e6: i64, underlying_px_1e9: i64, cs_1e9: i64) -> Option<i64> {
+    if px_coin_1e6 <= 0 || underlying_px_1e9 <= 0 || cs_1e9 <= 0 {
+        return None;
+    }
+    const SCALE_1E18: i128 = 1_000_000_000_000_000_000;
+    let usd_1e6 = (px_coin_1e6 as i128)
+        .checked_mul(underlying_px_1e9 as i128)?
+        .checked_mul(cs_1e9 as i128)?
+        / SCALE_1E18;
+    if usd_1e6 <= 0 {
+        return None;
+    }
+    i64::try_from(usd_1e6).ok()
+}
+
+/// What [`UnderlyingBook::convert_quote`] did to a tick.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QuoteFix {
+    /// Not an option this book knows — left untouched.
+    NotAnOption,
+    /// Both sides converted from coin to USD.
+    Converted,
+    /// An option quote with no honest USD price: no underlying is known
+    /// at or before this tick's instant, or a side does not convert.
+    /// The caller must DROP the tick — leaving it would book a coin
+    /// number as dollars, which is the whole defect.
+    Unpriceable,
+}
+
+/// Per-sym timeline of `underlying_px_1e9`, built from a run's captured
+/// `OptSummary` records so option QUOTE ticks can be denominated.
+///
+/// Keyed in the CALLER's symbol space: `backtest` remaps syms to the
+/// binding manifest and `audit-pnl` interns them to dense ids, and both
+/// populate this book with the same sym they later look up. Boot/offline
+/// — allocates freely.
+#[derive(Default)]
+pub struct UnderlyingBook {
+    /// sym → (ts_ns, underlying_px_1e9), ascending after `seal`.
+    marks: BTreeMap<SymbolId, Vec<(u64, i64)>>,
+    /// sym → contract size ×1e9 (from the run's registry).
+    cs: BTreeMap<SymbolId, i64>,
+}
+
+impl UnderlyingBook {
+    /// An empty book.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True when the book holds no option at all — the caller can then
+    /// skip the whole fix-up pass.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cs.is_empty()
+    }
+
+    /// Number of option syms known.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cs.len()
+    }
+
+    /// Record one observation. Called once per captured option summary.
+    pub fn observe(&mut self, sym: SymbolId, ts_ns: u64, underlying_px_1e9: i64, cs_1e9: i64) {
+        self.cs.insert(sym, cs_1e9);
+        if underlying_px_1e9 > 0 {
+            self.marks.entry(sym).or_default().push((ts_ns, underlying_px_1e9));
+        }
+    }
+
+    /// Sort and compress each timeline. Must be called before any
+    /// [`Self::convert_quote`]. Consecutive repeats of the same
+    /// underlying collapse — the live capture pushes a summary every
+    /// 100 ms against an underlying that moves far more slowly, so this
+    /// typically drops the timeline by an order of magnitude.
+    pub fn seal(&mut self) {
+        for v in self.marks.values_mut() {
+            v.sort_unstable_by_key(|(ts, _)| *ts);
+            v.dedup_by_key(|(_, u)| *u);
+        }
+    }
+
+    /// The last underlying at or before `ts_ns`, if any.
+    #[must_use]
+    pub fn at(&self, sym: SymbolId, ts_ns: u64) -> Option<i64> {
+        let v = self.marks.get(&sym)?;
+        // partition_point: first index whose ts > ts_ns.
+        let i = v.partition_point(|(ts, _)| *ts <= ts_ns);
+        if i == 0 {
+            return None; // the tick predates every observation
+        }
+        Some(v[i - 1].1)
+    }
+
+    /// Convert one tick's prices in place when it is an option quote.
+    ///
+    /// Returns [`QuoteFix::Unpriceable`] rather than guessing when no
+    /// underlying is known yet for that sym — a quote that arrives
+    /// before the first summary of the run has no honest USD value.
+    pub fn convert_quote(&self, t: &mut Tick) -> QuoteFix {
+        let Some(&cs) = self.cs.get(&t.sym) else {
+            return QuoteFix::NotAnOption;
+        };
+        let Some(u) = self.at(t.sym, t.ts_ns) else {
+            return QuoteFix::Unpriceable;
+        };
+        let (Some(bid), Some(ask)) = (
+            quote_px_usd_1e6(t.bid_px.raw(), u, cs),
+            quote_px_usd_1e6(t.ask_px.raw(), u, cs),
+        ) else {
+            return QuoteFix::Unpriceable;
+        };
+        t.bid_px = Price::from_raw(bid);
+        t.ask_px = Price::from_raw(ask);
+        QuoteFix::Converted
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +586,127 @@ mod tests {
             reg.get(base + 1).expect("call").contract_size_1e9,
             DERIBIT_OPT_CONTRACT_SIZE_1E9
         );
+    }
+
+    // ---------------------------------------------------------------
+    // the QUOTE lane — the path that actually runs
+    // ---------------------------------------------------------------
+
+    /// The worked case straight out of the capture:
+    /// `BTC-10SEP26-77500-C` quoted bid 0.008000 coin against an
+    /// underlying of 78 229.41 is a **$625.84** bid.
+    #[test]
+    fn quote_conversion_matches_the_captured_row() {
+        assert_eq!(quote_px_usd_1e6(8_000, 78_229_410_000_000, CS), Some(625_835_280));
+        assert_eq!(quote_px_usd_1e6(11_500, 78_229_410_000_000, CS), Some(899_638_215));
+        // The defect it replaces booked 8_000 -> $0.008.
+        assert_eq!(8_000i64, 8_000);
+    }
+
+    #[test]
+    fn quote_conversion_refuses_rather_than_wrapping() {
+        assert_eq!(quote_px_usd_1e6(0, 78_229_410_000_000, CS), None);
+        assert_eq!(quote_px_usd_1e6(-1, 78_229_410_000_000, CS), None);
+        assert_eq!(quote_px_usd_1e6(8_000, 0, CS), None);
+        assert_eq!(quote_px_usd_1e6(8_000, 78_229_410_000_000, 0), None);
+        // Overflows the i128 product.
+        assert_eq!(quote_px_usd_1e6(i64::MAX, i64::MAX, CS), None);
+        // Rounds below one micro-dollar.
+        assert_eq!(quote_px_usd_1e6(1, 1, 1), None);
+    }
+
+    fn tick(sym: u32, ts: u64, bid: i64, ask: i64) -> Tick {
+        Tick::new(
+            ts,
+            VenueId::Deribit,
+            sym,
+            0,
+            Price::from_raw(bid),
+            core_types::Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            core_types::Qty::from_raw(1_000_000),
+        )
+    }
+
+    #[test]
+    fn underlying_book_reads_the_last_value_at_or_before_the_tick() {
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        let mut b = UnderlyingBook::new();
+        b.observe(sym, 100, 78_000_000_000_000, CS);
+        b.observe(sym, 300, 79_000_000_000_000, CS);
+        b.observe(sym, 200, 78_500_000_000_000, CS); // out of order on purpose
+        b.seal();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.at(sym, 99), None, "a tick before every observation");
+        assert_eq!(b.at(sym, 100), Some(78_000_000_000_000));
+        assert_eq!(b.at(sym, 250), Some(78_500_000_000_000));
+        assert_eq!(b.at(sym, 10_000), Some(79_000_000_000_000), "carries forward");
+        assert_eq!(b.at(core_types::make_symbol_id(VenueId::Deribit, 999), 200), None);
+    }
+
+    #[test]
+    fn seal_compresses_a_flat_underlying() {
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        let mut b = UnderlyingBook::new();
+        for i in 0..1_000u64 {
+            b.observe(sym, i, 78_000_000_000_000, CS);
+        }
+        b.observe(sym, 1_000, 78_500_000_000_000, CS);
+        b.seal();
+        // 1000 identical observations collapse to one, and the change
+        // that follows survives.
+        assert_eq!(b.at(sym, 500), Some(78_000_000_000_000));
+        assert_eq!(b.at(sym, 1_000), Some(78_500_000_000_000));
+    }
+
+    #[test]
+    fn convert_quote_prices_options_and_leaves_everything_else_alone() {
+        let opt = core_types::make_symbol_id(VenueId::Deribit, 513);
+        let perp = core_types::make_symbol_id(VenueId::Deribit, 1);
+        let mut b = UnderlyingBook::new();
+        b.observe(opt, 100, 78_229_410_000_000, CS);
+        b.seal();
+
+        // An option quote is converted from coin to USD.
+        let mut t = tick(opt, 200, 8_000, 11_500);
+        assert_eq!(b.convert_quote(&mut t), QuoteFix::Converted);
+        assert_eq!(t.bid_px.raw(), 625_835_280);
+        assert_eq!(t.ask_px.raw(), 899_638_215);
+
+        // The perp — already USD — must not be touched.
+        let mut p = tick(perp, 200, 78_235_000_000, 78_235_500_000);
+        assert_eq!(b.convert_quote(&mut p), QuoteFix::NotAnOption);
+        assert_eq!(p.bid_px.raw(), 78_235_000_000);
+        assert_eq!(p.ask_px.raw(), 78_235_500_000);
+
+        // An option quote BEFORE the first summary has no honest price.
+        let mut early = tick(opt, 50, 8_000, 11_500);
+        assert_eq!(b.convert_quote(&mut early), QuoteFix::Unpriceable);
+        assert_eq!(early.bid_px.raw(), 8_000, "left untouched for the caller to drop");
+
+        // A one-sided or zero quote is unpriceable, not silently half-fixed.
+        let mut zero = tick(opt, 200, 0, 11_500);
+        assert_eq!(b.convert_quote(&mut zero), QuoteFix::Unpriceable);
+        assert_eq!(zero.ask_px.raw(), 11_500, "no side is rewritten on failure");
+    }
+
+    /// The ordering property that matters: the book must never read an
+    /// underlying from the FUTURE of the tick it is pricing.
+    #[test]
+    fn the_book_never_reads_a_future_underlying() {
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+        let mut b = UnderlyingBook::new();
+        for (ts, u) in [(1_000u64, 70_000_000_000_000i64), (2_000, 80_000_000_000_000)] {
+            b.observe(sym, ts, u, CS);
+        }
+        b.seal();
+        // At 1_999 the 80k print has not happened yet.
+        let mut t = tick(sym, 1_999, 10_000, 10_000);
+        assert_eq!(b.convert_quote(&mut t), QuoteFix::Converted);
+        assert_eq!(t.bid_px.raw(), 700_000_000, "priced off 70k, not 80k");
+        let mut t2 = tick(sym, 2_000, 10_000, 10_000);
+        assert_eq!(b.convert_quote(&mut t2), QuoteFix::Converted);
+        assert_eq!(t2.bid_px.raw(), 800_000_000);
     }
 
     #[test]
