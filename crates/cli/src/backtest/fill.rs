@@ -405,6 +405,49 @@ impl Book {
             k += 1;
         }
     }
+
+    /// VX-A: European cash settlement. The contract ceases to exist at
+    /// `value_1e6`, so the whole position closes and its entire
+    /// contribution moves from unrealized into realized.
+    ///
+    /// Unlike [`Book::apply_fill`] this accepts a value of ZERO,
+    /// because an OTM option settling worthless is the ORDINARY case
+    /// and a zero-priced fill would be a fiction — the venue prints no
+    /// trade and the member emits no order. It is also not counted as
+    /// a fill, because it is not one.
+    ///
+    /// Cash-conserving by the same identity `apply_fill` keeps: the
+    /// contribution goes from `qty × mark − cost` to `value × qty −
+    /// cost` and then to zero, so equity moves by exactly
+    /// `qty × (value − mark)`. Returns the qty closed.
+    fn settle(&mut self, sym: u32, value_1e6: i64, mark_1e6: i64, fee_1e12: i128) -> i64 {
+        debug_assert!(value_1e6 >= 0 && fee_1e12 >= 0);
+        let Some(e) = self.entries.get_mut(&sym) else {
+            return 0;
+        };
+        let qty = e.qty_1e6;
+        if qty == 0 {
+            return 0;
+        }
+        let pre_contrib = qty as i128 * mark_1e6 as i128 - e.cost_1e12;
+        // Mirrors apply_fill's reduce branch at c == |qty|: the whole
+        // cost basis leaves and `value × qty − cost` enters realized.
+        let realized_delta = value_1e6 as i128 * qty as i128 - e.cost_1e12;
+        e.realized_1e12 += realized_delta;
+        e.fees_1e12 += fee_1e12;
+        e.cost_1e12 = 0;
+        e.qty_1e6 = 0;
+        self.realized_sum_1e12 += realized_delta;
+        self.fees_sum_1e12 += fee_1e12;
+        self.unreal_sum_1e12 -= pre_contrib;
+        let notional_1e12 = value_1e6 as i128 * i128::from(qty.unsigned_abs());
+        let mut k = 0usize;
+        while k < FEE_LADDER_BPS.len() {
+            self.fees_ladder_1e12[k] += fee_ceil_1e12(notional_1e12, FEE_LADDER_BPS[k]);
+            k += 1;
+        }
+        qty
+    }
 }
 
 // ---------------------------------------------------------------
@@ -536,6 +579,12 @@ pub struct ModelOutcome {
     /// evidence (an IoC emitted into a stale interval that outlived its
     /// bar, typically).
     pub ttl_expired: u64,
+    /// VX-A: option positions closed by the expiry settlement sweep —
+    /// contracts that reached expiry still held, closed at their
+    /// European cash value instead of marking out at the last mid the
+    /// tape happened to carry. > 0 obliges the caller to PRINT it: it
+    /// means the window contains an expiry the intents did not close.
+    pub opt_settled: u64,
     /// §4.3 fee ladder: OOS equity re-priced at flat
     /// [`FEE_LADDER_BPS`] per side (same fills, same marks).
     pub oos_net_ladder_1e12: [i128; 3],
@@ -595,6 +644,24 @@ pub struct FillEngine {
     /// expiry", so the timestamp is the classification and no wire
     /// field has to carry one.
     opt_expiry_ns: BTreeMap<u32, u64>,
+    /// VX-A: the European cash settlement value ×1e6 per option sym.
+    /// Only the CALLER knows the strike, the right and the settlement
+    /// index, so the value arrives ready-made and the model supplies
+    /// the clock, the fee schedule and the accounting. Presence is
+    /// what makes a sym settleable — a sym with an expiry but no value
+    /// is left alone and marks out at its last mid, exactly as before.
+    opt_settle_1e6: BTreeMap<u32, i64>,
+    /// VX-A: syms already pinned to their settlement value.
+    settled: BTreeSet<u32>,
+    /// VX-A: the earliest expiry still un-pinned, so the per-record
+    /// cost of the whole rung is ONE integer compare. `u64::MAX` =
+    /// nothing pending.
+    settle_due_ns: u64,
+    /// VX-A: the last wall instant any record carried, so `finish`
+    /// can never settle an expiry the window did not reach.
+    last_wall_ns: u64,
+    /// VX-A: option positions closed by the settlement sweep.
+    opt_settled: u64,
     mark_fills: u64,
     fills_total: u64,
     oos_trades: u64,
@@ -631,6 +698,11 @@ impl FillEngine {
             mark_fill_syms: BTreeSet::new(),
             opt_index_1e6: BTreeMap::new(),
             opt_expiry_ns: BTreeMap::new(),
+            opt_settle_1e6: BTreeMap::new(),
+            settled: BTreeSet::new(),
+            settle_due_ns: u64::MAX,
+            last_wall_ns: 0,
+            opt_settled: 0,
             mark_fills: 0,
             fills_total: 0,
             oos_trades: 0,
@@ -809,6 +881,17 @@ impl FillEngine {
             }
             i += 1;
         }
+        // ---- (0b) VX-A expiry settlement sweep ----
+        // A clock fact like the TTL sweep above, so it runs on stale
+        // and one-sided ticks too — and, unlike every other pass here,
+        // on records of OTHER syms. It has to: Deribit removes an
+        // expired instrument from the chain, so its own tape stops,
+        // and a sweep that waited for one of its records would never
+        // fire on the one contract it exists for.
+        self.last_wall_ns = wall_ns;
+        if wall_ns >= self.settle_due_ns {
+            self.settle_pass(wall_ns);
+        }
         if tick.is_stale() {
             self.stale_ticks_skipped += 1;
             return;
@@ -818,7 +901,11 @@ impl FillEngine {
         let two_sided = bid > 0 && ask > 0;
 
         // ---- (a) mark update (§4.5: "every tick of a held sym") ----
-        if two_sided {
+        // VX-A: a SETTLED sym no longer marks. At expiry the contract
+        // became cash at a known value, and Deribit's own removal lag
+        // is 9–19 min — so late quotes for an expired instrument DO
+        // arrive, and moving the mark to one would un-settle it.
+        if two_sided && !self.settled.contains(&sym) {
             let mid = tick.mid().raw();
             let old = self.marks_1e6.insert(sym, mid).unwrap_or(mid);
             if self.full.on_mark(sym, old, mid) {
@@ -839,7 +926,16 @@ impl FillEngine {
         if two_sided && self.mark_fill_syms.contains(&sym) {
             let mark = *self.marks_1e6.get(&sym).expect("mark just written");
             // VRP V3: the D-7 floor, widened by --option-spread-frac.
-            let h = opt_half_spread_1e6(mark, self.params.opt_spread_frac_1e6);
+            // VX-A: EXCEPT on a settled sym. A European cash settlement
+            // is not a trade — there is no book to cross and the venue
+            // credits the intrinsic exactly — so charging the assumed
+            // option spread on it would invent a cost the settlement
+            // does not have.
+            let h = if self.settled.contains(&sym) {
+                0
+            } else {
+                opt_half_spread_1e6(mark, self.params.opt_spread_frac_1e6)
+            };
             let mut i = 0usize;
             while i < self.open_len {
                 let o = self.open[i];
@@ -1022,6 +1118,125 @@ impl FillEngine {
     pub fn set_opt_expiry(&mut self, sym: u32, expiry_ns: u64) {
         if expiry_ns > 0 {
             self.opt_expiry_ns.insert(sym, expiry_ns);
+            self.refresh_settle_due();
+        }
+    }
+
+    /// VX-A: the European cash settlement value ×1e6 for one option
+    /// sym — `max(0, S − K)` for a call, `max(0, K − S)` for a put, at
+    /// the settlement index.
+    ///
+    /// ZERO is the common case (an OTM daily) and it is the whole
+    /// point: it is what makes a short call that expired worthless
+    /// keep its entire premium instead of marking out at whatever mid
+    /// the tape last carried before the instrument rolled off. A
+    /// negative value is a caller bug — intrinsic is floored at zero
+    /// by definition — and is refused rather than booked.
+    pub fn set_opt_settle(&mut self, sym: u32, value_1e6: i64) {
+        debug_assert!(value_1e6 >= 0, "intrinsic is floored at zero");
+        if value_1e6 < 0 {
+            return;
+        }
+        self.opt_settle_1e6.insert(sym, value_1e6);
+        self.refresh_settle_due();
+    }
+
+    /// VX-A: pin every settleable sym whose expiry the clock has
+    /// reached to its European cash value, then refresh the watermark.
+    ///
+    /// Pinning is a MARK move, NOT a close. The member's own ITM
+    /// settlement is a logged closing intent at that same price, and
+    /// closing the position here would leave that intent to open a
+    /// fresh one in the opposite direction. So the mark moves now —
+    /// which is what makes the closing intent fill at the settlement
+    /// price and the settlement fee rate — and whatever is still open
+    /// at the end of the replay is closed by [`Self::settle_expired`].
+    fn settle_pass(&mut self, wall_ns: u64) {
+        let mut due: Vec<(u32, i64)> = Vec::new();
+        for (sym, value) in &self.opt_settle_1e6 {
+            if self.settled.contains(sym) {
+                continue;
+            }
+            if let Some(&e) = self.opt_expiry_ns.get(sym) {
+                if e > 0 && wall_ns >= e {
+                    due.push((*sym, *value));
+                }
+            }
+        }
+        for (sym, value) in due {
+            let old = self.marks_1e6.insert(sym, value).unwrap_or(value);
+            if self.full.on_mark(sym, old, value) {
+                self.bounds_refresh(sym, value);
+            }
+            if self.oos.on_mark(sym, old, value) {
+                self.dd.sample(self.oos.equity_1e12());
+            }
+            self.settled.insert(sym);
+        }
+        self.refresh_settle_due();
+    }
+
+    /// VX-A: the earliest expiry still un-pinned. Recomputed only when
+    /// the table or the pinned set changes, so the hot path pays one
+    /// compare against it and nothing else.
+    fn refresh_settle_due(&mut self) {
+        let mut next = u64::MAX;
+        for sym in self.opt_settle_1e6.keys() {
+            if self.settled.contains(sym) {
+                continue;
+            }
+            if let Some(&e) = self.opt_expiry_ns.get(sym) {
+                if e > 0 && e < next {
+                    next = e;
+                }
+            }
+        }
+        self.settle_due_ns = next;
+    }
+
+    /// VX-A: close every settled option position at its European cash
+    /// value, charging the venue's SETTLEMENT rate (`fee_for` switches
+    /// to it on its own, because the fill instant is the expiry).
+    ///
+    /// Runs at the end of the replay, never at the expiry instant, so
+    /// the member's logged closing intent always gets first refusal on
+    /// the position — the sweep can only ever close what the intents
+    /// did not. An OTM settlement costs nothing and the capped-fee
+    /// formula yields that with no special case: the premium cap is
+    /// 12.5 % of a settlement value of zero.
+    fn settle_expired(&mut self) {
+        if self.last_wall_ns == 0 {
+            return;
+        }
+        self.settle_pass(self.last_wall_ns);
+        let syms: Vec<u32> = self.settled.iter().copied().collect();
+        for sym in syms {
+            let Some(&value) = self.opt_settle_1e6.get(&sym) else {
+                continue;
+            };
+            let mark = *self.marks_1e6.get(&sym).unwrap_or(&value);
+            let expiry = self.opt_expiry_ns.get(&sym).copied().unwrap_or(0);
+            let qty_full = self.full.entries.get(&sym).map_or(0, |e| e.qty_1e6);
+            let qty_oos = self.oos.entries.get(&sym).map_or(0, |e| e.qty_1e6);
+            if qty_full == 0 && qty_oos == 0 {
+                continue;
+            }
+            // fee_bps 0, not the venue's taker rate: a sym we can
+            // settle is by construction one the option-fee table
+            // covers, and charging a PERP taker rate on an option
+            // settlement would be worse than charging nothing.
+            if qty_full != 0 {
+                let n = value as i128 * i128::from(qty_full.unsigned_abs());
+                let fee = self.fee_for(sym, n, qty_full.abs(), 0, expiry);
+                self.full.settle(sym, value, mark, fee);
+            }
+            if qty_oos != 0 {
+                let n = value as i128 * i128::from(qty_oos.unsigned_abs());
+                let fee = self.fee_for(sym, n, qty_oos.abs(), 0, expiry);
+                self.oos.settle(sym, value, mark, fee);
+                self.dd.sample(self.oos.equity_1e12());
+            }
+            self.opt_settled = self.opt_settled.wrapping_add(1);
         }
     }
 
@@ -1064,6 +1279,10 @@ impl FillEngine {
     /// effect), read the books at last marks (the mark-out is exactly
     /// the standing unrealized sum) and hand back every scalar.
     pub fn finish(&mut self) -> ModelOutcome {
+        // VX-A: settle BEFORE the cancel sweep and the book read — an
+        // expired contract is cash, not an open position marked at a
+        // mid that no longer means anything.
+        self.settle_expired();
         self.canceled_end = self.open_len as u64;
         self.open_len = 0;
         ModelOutcome {
@@ -1093,6 +1312,7 @@ impl FillEngine {
             ioc_fills: self.ioc_fills,
             ioc_canceled: self.ioc_canceled,
             ttl_expired: self.ttl_expired,
+            opt_settled: self.opt_settled,
             oos_net_ladder_1e12: [
                 self.oos.equity_ladder_1e12(0),
                 self.oos.equity_ladder_1e12(1),
@@ -1261,6 +1481,238 @@ mod tests {
             e2.fee_for(plain, n, QTY_1E6, 999, EXPIRY + 1),
             23_700_000_000_000,
             "no expiry known ⇒ the trade rate, never a guess"
+        );
+    }
+
+
+    // ---------------------------------------------------------------
+    // VX-A — the expiry settlement rung
+    // ---------------------------------------------------------------
+    //
+    // Before this rung the model replayed intents and nothing else, so
+    // a contract that reached expiry still held stayed OPEN in the book
+    // and marked out at whatever mid the tape last carried. For the one
+    // case that matters most — a short call that expired worthless —
+    // that is the whole premium booked as a loss it never took, because
+    // Deribit removes the instrument from the chain and the last mid it
+    // printed is a live option's price, not a dead one's.
+
+    const OPT_ORD: u32 = 513;
+    const OPT_INDEX_1E6: i64 = 79_000_000_000; // $79,000
+    const OPT_PREM_1E6: i64 = 219_070_000; // the measured median 8 h ATM premium
+    const OPT_QTY_1E6: i64 = 1_000_000; // one contract = one coin
+    const OPT_EXPIRY_NS: u64 = 1_000_000;
+
+    fn opt_sym() -> u32 {
+        make_symbol_id(VenueId::Deribit, OPT_ORD)
+    }
+
+    /// Zero latency, zero flat fee, the venue's option schedule live.
+    fn opt_engine() -> FillEngine {
+        let p = ModelParams {
+            fee_bps: [(0, 0); 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+            ..ModelParams::default()
+        };
+        let mut e = FillEngine::new(p, 0);
+        let sym = opt_sym();
+        e.set_mark_fill_sym(sym);
+        e.set_opt_index(sym, OPT_INDEX_1E6);
+        e.set_opt_expiry(sym, OPT_EXPIRY_NS);
+        e
+    }
+
+    /// Sell one contract at `OPT_PREM_1E6`, let the D-7 pass fill it,
+    /// walk the mark down to `last_mark`, then push the clock past the
+    /// expiry on ANOTHER sym's record (the expiring instrument's own
+    /// tape has stopped, which is the point). Returns the fill price.
+    fn short_a_call_through_expiry(e: &mut FillEngine, last_mark: i64) -> i64 {
+        let sym = opt_sym();
+        let mut out = Vec::new();
+        e.intake(&order(sym, Side::Ask, OPT_PREM_1E6, OPT_QTY_1E6, 1), 0);
+        e.on_record(
+            &tick(sym, OPT_PREM_1E6, OPT_QTY_1E6, OPT_PREM_1E6, OPT_QTY_1E6),
+            1,
+            1,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the D-7 pass fills at the mark");
+        let fill_px = out[0].px_1e6;
+        // The last quote the chain carried before the roll-off.
+        e.on_record(&tick(sym, last_mark, OPT_QTY_1E6, last_mark, OPT_QTY_1E6), 2, 2, &mut out);
+        // Some other instrument keeps printing across the expiry.
+        e.on_record(
+            &tick(BN_SYM, 100_000_000, 1_000_000, 100_100_000, 1_000_000),
+            OPT_EXPIRY_NS,
+            OPT_EXPIRY_NS,
+            &mut out,
+        );
+        fill_px
+    }
+
+    /// THE test. Two engines, one tape, one difference: whether the
+    /// caller supplied the European cash value. The gap between them is
+    /// exactly the mark-out that was never real.
+    #[test]
+    fn an_otm_expiry_keeps_the_premium_instead_of_marking_out() {
+        // OTM: max(0, 79,000 − 80,000) = 0.
+        let mut settled = opt_engine();
+        settled.set_opt_settle(opt_sym(), 0);
+        let mut unsettled = opt_engine();
+
+        const LAST_MARK: i64 = OPT_PREM_1E6 / 2;
+        let fill_px = short_a_call_through_expiry(&mut settled, LAST_MARK);
+        assert_eq!(fill_px, short_a_call_through_expiry(&mut unsettled, LAST_MARK));
+
+        let a = settled.finish();
+        let b = unsettled.finish();
+
+        assert_eq!(a.opt_settled, 1, "the contract expired held");
+        assert_eq!(b.opt_settled, 0, "no value supplied ⇒ the old behaviour");
+        assert_eq!(a.oos_unreal_1e12, 0, "settled ⇒ nothing left to mark out");
+        assert_eq!(
+            settled.per_sym_detail()[0].pos_qty_1e6,
+            0,
+            "an expired contract is not an open position"
+        );
+        assert_ne!(unsettled.per_sym_detail()[0].pos_qty_1e6, 0);
+        // The short keeps the WHOLE premium it sold for.
+        assert_eq!(
+            a.oos_realized_1e12,
+            i128::from(fill_px) * i128::from(OPT_QTY_1E6)
+        );
+        // And the gap is exactly the phantom mark-out: one contract at
+        // the last mid the dead instrument happened to print.
+        assert_eq!(
+            a.oos_net_1e12 - b.oos_net_1e12,
+            i128::from(LAST_MARK) * i128::from(OPT_QTY_1E6)
+        );
+        // An OTM settlement costs nothing, and the capped-fee formula
+        // gives that with no special case: 12.5 % of a value of zero.
+        assert_eq!(a.oos_fees_1e12, b.oos_fees_1e12, "no settlement fee OTM");
+    }
+
+    /// In the money the position closes at intrinsic and pays the
+    /// venue's SETTLEMENT rate — not the trade rate, and not the
+    /// assumed option spread, because a cash settlement crosses no book.
+    #[test]
+    fn an_itm_expiry_settles_at_intrinsic_on_the_settlement_rate() {
+        const VALUE_1E6: i64 = 500_000_000; // $500 intrinsic
+        let mut e = opt_engine();
+        e.set_opt_settle(opt_sym(), VALUE_1E6);
+        let fill_px = short_a_call_through_expiry(&mut e, OPT_PREM_1E6);
+        let o = e.finish();
+
+        assert_eq!(o.opt_settled, 1);
+        assert_eq!(o.oos_unreal_1e12, 0);
+        // realized = value × qty − cost, and the short paid `value` to
+        // close what it sold for `fill_px`.
+        assert_eq!(
+            o.oos_realized_1e12,
+            i128::from(fill_px - VALUE_1E6) * i128::from(OPT_QTY_1E6)
+        );
+        // Fees are the entry at the TRADE rate plus the settlement at
+        // the SETTLEMENT rate — the classifier is the instant, and
+        // fee_for is the only thing that decides it.
+        let sym = opt_sym();
+        let entry = e.fee_for(
+            sym,
+            i128::from(fill_px) * i128::from(OPT_QTY_1E6),
+            OPT_QTY_1E6,
+            0,
+            0,
+        );
+        let settle = e.fee_for(
+            sym,
+            i128::from(VALUE_1E6) * i128::from(OPT_QTY_1E6),
+            OPT_QTY_1E6,
+            0,
+            OPT_EXPIRY_NS,
+        );
+        assert!(settle > 0 && settle < entry, "settlement is the cheaper rate");
+        assert_eq!(o.oos_fees_1e12, entry + settle);
+    }
+
+    /// The member's own ITM settlement is a LOGGED closing intent at the
+    /// same price. It must win, and the sweep must then find nothing —
+    /// otherwise the position is closed twice and the intent reopens it
+    /// in the opposite direction.
+    #[test]
+    fn a_logged_closing_intent_wins_and_the_sweep_does_not_double_count() {
+        const VALUE_1E6: i64 = 500_000_000;
+        let sym = opt_sym();
+        let mut e = opt_engine();
+        e.set_opt_settle(sym, VALUE_1E6);
+        let fill_px = short_a_call_through_expiry(&mut e, OPT_PREM_1E6);
+
+        // The member buys its short back at the settlement price, and
+        // the chain still prints for a few minutes (Deribit's removal
+        // lag) so the intent has a record to fill on.
+        let mut out = Vec::new();
+        e.intake(
+            &order(sym, Side::Bid, VALUE_1E6, OPT_QTY_1E6, 2),
+            OPT_EXPIRY_NS,
+        );
+        e.on_record(
+            &tick(sym, OPT_PREM_1E6, OPT_QTY_1E6, OPT_PREM_1E6, OPT_QTY_1E6),
+            OPT_EXPIRY_NS + 1,
+            OPT_EXPIRY_NS + 1,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the closing intent filled");
+        assert_eq!(
+            out[0].px_1e6, VALUE_1E6,
+            "at the PINNED settlement value, and with no half-spread — \
+             a post-expiry quote must not price a settlement"
+        );
+
+        let o = e.finish();
+        assert_eq!(o.opt_settled, 0, "the intent closed it; the sweep found nothing");
+        assert_eq!(e.per_sym_detail()[0].pos_qty_1e6, 0);
+        assert_eq!(
+            o.oos_realized_1e12,
+            i128::from(fill_px - VALUE_1E6) * i128::from(OPT_QTY_1E6),
+            "same P&L either way — which is the point"
+        );
+    }
+
+    /// An expiry the window never reached is not settled. The sweep is
+    /// bounded by the last wall instant the tape actually carried, so a
+    /// short window can never book a payoff from the future.
+    #[test]
+    fn an_expiry_beyond_the_window_is_never_settled() {
+        let sym = opt_sym();
+        let mut e = opt_engine();
+        e.set_opt_expiry(sym, OPT_EXPIRY_NS * 100);
+        e.set_opt_settle(sym, 0);
+        let mut out = Vec::new();
+        e.intake(&order(sym, Side::Ask, OPT_PREM_1E6, OPT_QTY_1E6, 1), 0);
+        e.on_record(
+            &tick(sym, OPT_PREM_1E6, OPT_QTY_1E6, OPT_PREM_1E6, OPT_QTY_1E6),
+            1,
+            1,
+            &mut out,
+        );
+        let o = e.finish();
+        assert_eq!(o.opt_settled, 0, "the window ended long before expiry");
+        assert_ne!(e.per_sym_detail()[0].pos_qty_1e6, 0, "still open, still marked");
+    }
+
+    /// A sym with an expiry but NO settlement value behaves exactly as
+    /// it did before this rung existed. That is what keeps every
+    /// pre-VX-A report reproducible.
+    #[test]
+    fn an_expiry_without_a_value_is_the_pre_rung_model_exactly() {
+        let mut e = opt_engine();
+        let fill_px = short_a_call_through_expiry(&mut e, OPT_PREM_1E6 / 4);
+        let o = e.finish();
+        assert_eq!(o.opt_settled, 0);
+        assert_eq!(
+            o.oos_unreal_1e12,
+            i128::from(-OPT_QTY_1E6) * i128::from(OPT_PREM_1E6 / 4)
+                + i128::from(fill_px) * i128::from(OPT_QTY_1E6),
+            "marks out at the last mid, unchanged"
         );
     }
 

@@ -68,6 +68,63 @@
 
 use std::collections::BTreeMap;
 use std::io;
+
+/// VX-A: everything needed to turn one expired option sym into a
+/// European cash value, gathered while its own records were still
+/// arriving. Kept per DENSE sym, which is what the merged stream and
+/// the fill engines carry.
+#[derive(Copy, Clone, Debug)]
+struct OptSettleRef {
+    /// The last underlying/index this instrument printed at or before
+    /// its expiry, ×1e6. Meaningless unless `index_wall_ns > 0`.
+    index_1e6: i64,
+    /// WALL instant of that index, and the flag for whether one was
+    /// ever found: `0` means no index at or before the expiry exists in
+    /// this root, which is a REFUSAL — the contract is left unsettled
+    /// and marks out exactly as it did before the rung.
+    ///
+    /// It has to be a wall: an `OptSummary.ts_ns` is the ENGINE's
+    /// monotonic stamp and an `expiry_ns` is a wall epoch, so comparing
+    /// the two directly is a category error that silently admits every
+    /// record (the first cut of this code did exactly that, and the
+    /// live table reported settlement indices "1785368505 s before
+    /// expiry" — fifty-six years, which is the epoch itself).
+    index_wall_ns: u64,
+    strike_1e6: i64,
+    right: u8,
+    expiry_ns: u64,
+}
+
+/// VX-A: one underlying observation awaiting a wall stamp. The rebase
+/// `wall = run.epoch_ns + (raw_ts − ts_first)` needs the run's first
+/// tick, which is only known once the run's events are sorted, so the
+/// observations are collected first and resolved after.
+#[derive(Copy, Clone, Debug)]
+struct OptSettleCand {
+    sym: u32,
+    raw_ts_ns: u64,
+    index_1e6: i64,
+}
+
+impl OptSettleRef {
+    /// European cash value of ONE unit: `max(0, S − K)` for a call,
+    /// `max(0, K − S)` for a put. The same law the member settles by
+    /// (`strategy_vrp::VrpStrategy::intrinsic_1e6`), restated here
+    /// because the harness must not depend on a strategy crate.
+    #[inline]
+    fn value_1e6(&self) -> i64 {
+        let v = if self.right == opt_registry::RIGHT_CALL {
+            self.index_1e6 - self.strike_1e6
+        } else {
+            self.strike_1e6 - self.index_1e6
+        };
+        if v > 0 {
+            v
+        } else {
+            0
+        }
+    }
+}
 use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
@@ -387,6 +444,7 @@ fn load_run_events(
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
     opt_index_1e6: &mut BTreeMap<u32, i64>,
     opt_expiry_ns: &mut BTreeMap<u32, u64>,
+    opt_settle_ref: &mut BTreeMap<u32, OptSettleRef>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
@@ -415,6 +473,9 @@ fn load_run_events(
     // VRP V2a: the per-sym underlying timeline the option QUOTE lane
     // needs, filled from this run's OptSummary records below.
     let mut und = crate::backtest::opt::UnderlyingBook::new();
+    // VX-A: settlement-index observations for THIS run, resolved to
+    // wall instants once the run's first tick is known (below).
+    let mut settle_cand: Vec<OptSettleCand> = Vec::new();
 
     let resolve =
         |sym: u32, interner: &mut SymInterner, load: &mut RunLoad| -> Result<u32, HarnessError> {
@@ -493,6 +554,29 @@ fn load_run_events(
                     // VX: the expiry, so a fill at or after it is
                     // charged the venue's SETTLEMENT rate.
                     opt_expiry_ns.insert(dense, row.expiry_ns);
+                    // VX-A: the settlement reference. Only contracts
+                    // whose expiry this run's clock can actually REACH
+                    // are candidates — an expiry that fell before the
+                    // run began belongs to an earlier run, and pinning
+                    // it here would settle on the run's very first
+                    // record. The index itself is stamped later, once
+                    // the rebase is knowable.
+                    if row.expiry_ns >= run.epoch_ns {
+                        opt_settle_ref.entry(dense).or_insert(OptSettleRef {
+                            index_1e6: 0,
+                            index_wall_ns: 0,
+                            strike_1e6: row.strike_1e6,
+                            right: row.right,
+                            expiry_ns: row.expiry_ns,
+                        });
+                        if o.underlying_px_1e9 > 0 {
+                            settle_cand.push(OptSettleCand {
+                                sym: dense,
+                                raw_ts_ns: o.ts_ns,
+                                index_1e6: o.underlying_px_1e9 / 1_000,
+                            });
+                        }
+                    }
                 }
             }
             // VRP V2a — THE DENOMINATION LAW. This was a pure rescale
@@ -688,6 +772,27 @@ fn load_run_events(
     // §3.2 total order, extended: (ts, class, lord, idx) — unique by
     // construction, so sort_unstable stays deterministic.
     evs.sort_unstable_by_key(|e| (e.ts_ns, e.class, e.lord, e.idx));
+    // VX-A: stamp every settlement candidate with its WALL instant and
+    // keep, per contract, the latest one at or before its own expiry.
+    // `wall = run.epoch_ns + (raw_ts − ts_first)` is the same rebase
+    // the merge applies, so the two clocks agree by construction rather
+    // than by coincidence. Deribit keeps printing an expired instrument
+    // for 9–19 min after settlement, and on a $79k index the drift over
+    // that lag is worth more than the option's whole premium — so the
+    // cut-off is the point of the rung, not a nicety.
+    if !evs.is_empty() {
+        let ts_first = evs[0].ts_ns;
+        for c in &settle_cand {
+            let Some(r) = opt_settle_ref.get_mut(&c.sym) else {
+                continue;
+            };
+            let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
+            if wall <= r.expiry_ns && wall >= r.index_wall_ns {
+                r.index_1e6 = c.index_1e6;
+                r.index_wall_ns = wall;
+            }
+        }
+    }
     Ok((evs, load))
 }
 
@@ -700,6 +805,7 @@ fn load_and_merge_events(
     mark_fill_syms: &mut std::collections::BTreeSet<u32>,
     opt_index_1e6: &mut BTreeMap<u32, i64>,
     opt_expiry_ns: &mut BTreeMap<u32, u64>,
+    opt_settle_ref: &mut BTreeMap<u32, OptSettleRef>,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
@@ -714,6 +820,7 @@ fn load_and_merge_events(
                 mark_fill_syms,
                 opt_index_1e6,
                 opt_expiry_ns,
+                opt_settle_ref,
                 stale_after_ms,
             )?;
         if evs.is_empty() {
@@ -791,12 +898,14 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let mut mark_fill_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut opt_index_1e6: BTreeMap<u32, i64> = BTreeMap::new();
     let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut opt_settle_ref: BTreeMap<u32, OptSettleRef> = BTreeMap::new();
     let (merged, loads) = load_and_merge_events(
         &runs,
         &mut interner,
         &mut mark_fill_syms,
         &mut opt_index_1e6,
         &mut opt_expiry_ns,
+        &mut opt_settle_ref,
         params.stale_after_ms,
     )?;
 
@@ -872,6 +981,52 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             )
         ));
     }
+    // VX-A obligation, the same shape as the D-7 one: a settlement
+    // value SHAPES numbers, so it is printed with the reference it was
+    // computed from and how stale that reference was. A settlement
+    // priced off an index minutes old is not wrong, but the operator
+    // is the one who gets to decide that.
+    // The window's last wall instant bounds what can ever settle: the
+    // engine pins on `wall >= expiry` and `finish` is capped at the
+    // last record it saw, so a contract expiring after the window is
+    // carried but never applied. Reporting its "value" anyway would
+    // read as a settlement the report used, so only the ones the clock
+    // actually reaches are printed.
+    let window_end_ns = merged[merged.len() - 1].wall_ns;
+    let reaches = |r: &OptSettleRef| r.expiry_ns <= window_end_ns;
+    let reached = opt_settle_ref.values().filter(|r| reaches(r)).count();
+    let settleable = opt_settle_ref
+        .values()
+        .filter(|r| reaches(r) && r.index_wall_ns > 0)
+        .count();
+    if reached > 0 {
+        report(&format!(
+            "audit-pnl: opt settlement table: {settleable} of {reached} contract(s) reaching \
+             expiry inside the window — European cash at the LAST index at/before each \
+             expiry; {} refused (no index at/before expiry in this root), {} expire after \
+             the window and are never settled",
+            reached - settleable,
+            opt_settle_ref.len() - reached
+        ));
+        for (sym, r) in opt_settle_ref
+            .iter()
+            .filter(|(_, r)| reaches(r) && r.index_wall_ns > 0)
+        {
+            let lag_s = r.expiry_ns.saturating_sub(r.index_wall_ns) / 1_000_000_000;
+            report(&format!(
+                "audit-pnl:   sym={sym:#010x} {} K={} S={} value={} (index {} s before expiry)",
+                if r.right == opt_registry::RIGHT_CALL {
+                    "call"
+                } else {
+                    "put"
+                },
+                fmt_usd_1e6(r.strike_1e6),
+                fmt_usd_1e6(r.index_1e6),
+                fmt_usd_1e6(r.value_1e6()),
+                lag_s,
+            ));
+        }
+    }
 
     // Engines: per strategy_id, plus per (vm, hash128). ModelParams
     // fields are Copy arrays — rebuild per engine (derive-agnostic).
@@ -898,6 +1053,19 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // VX: the settlement rate's classifier.
         for (sym, expiry_ns) in &opt_expiry_ns {
             e.set_opt_expiry(*sym, *expiry_ns);
+        }
+        // VX-A: the European cash value each expiry settles at, so a
+        // contract still held at expiry becomes cash instead of an
+        // open position marked at a mid that no longer means anything.
+        for (sym, r) in &opt_settle_ref {
+            // No index at or before the expiry ⇒ no settlement. The
+            // contract marks out as it did before the rung, which is
+            // the honest outcome: a settlement priced off a number the
+            // capture does not contain is worse than a late mark-out.
+            if r.index_wall_ns == 0 || r.expiry_ns > window_end_ns {
+                continue;
+            }
+            e.set_opt_settle(*sym, r.value_1e6());
         }
         e
     };
@@ -1141,7 +1309,8 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         let o = &row.outcome;
         report(&format!(
             "audit-pnl: strategy {sid} ({}): orders={} fills={} trades={} days={} net={} \
-             (realized={} fees={} markout={}) max_dd={} canceled_end={} caps_rejected={} unroutable={}",
+             (realized={} fees={} markout={}) max_dd={} canceled_end={} caps_rejected={} \
+             unroutable={} opt_settled={}",
             row.label,
             o.orders_is + o.orders_oos,
             o.fills_total,
@@ -1155,6 +1324,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             o.canceled_end,
             o.rejected_sym_cap + o.rejected_total_cap,
             o.unroutable,
+            o.opt_settled,
         ));
         // I1: taker surface + the §4.3 fee ladder — printed for EVERY
         // strategy so a number positive only at 0 bps is visible as such.
@@ -1260,7 +1430,8 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
              \"trading_days\":{},\"net_usd\":\"{}\",\"realized_usd\":\"{}\",\"fees_usd\":\"{}\",\
              \"markout_usd\":\"{}\",\"max_drawdown_usd\":\"{}\",\"canceled_end\":{},\
              \"rejected_caps\":{},\"unroutable\":{},\"ioc_fills\":{},\"ioc_canceled\":{},\
-             \"ttl_expired\":{},\"fee_ladder_net_usd\":[\"{}\",\"{}\",\"{}\"],\
+             \"ttl_expired\":{},\"opt_settled\":{},\
+             \"fee_ladder_net_usd\":[\"{}\",\"{}\",\"{}\"],\
              \"per_day_net_usd\":[",
             row.label,
             o.orders_is + o.orders_oos,
@@ -1278,6 +1449,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             o.ioc_fills,
             o.ioc_canceled,
             o.ttl_expired,
+            o.opt_settled,
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[0])),
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[1])),
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[2])),

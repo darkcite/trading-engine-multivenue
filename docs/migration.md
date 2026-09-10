@@ -6,6 +6,66 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-10 — audit-pnl SETTLES expired options instead of marking them out (VX-A)
+
+**What changed**
+
+- `backtest::fill::FillEngine` gains `set_opt_settle(sym, value_1e6)` and an
+  expiry settlement rung. When the replay clock reaches a settleable
+  contract's expiry the mark is PINNED to its European cash value and stops
+  moving; whatever position is still open at the end of the replay is closed
+  at that value, charged the venue's SETTLEMENT rate (`fee_for` already
+  switched on the instant — that part shipped with VX).
+- The D-7 assumed half-spread is not charged on a settled sym. A cash
+  settlement crosses no book.
+- `audit-pnl` computes the value from `options-manifest.tsv` (strike, right)
+  and the last underlying the instrument printed **at or before its own
+  expiry**, wall-stamped through the same `run.epoch_ns + (raw_ts −
+  ts_first)` rebase the merge uses.
+- `ModelOutcome` and the audit's per-strategy JSON gain `opt_settled`.
+
+**Why**
+
+`audit-pnl` replays intents and never closed a position on its own, so a
+contract that reached expiry still held stayed OPEN and marked out at the
+last mid the tape carried. Deribit removes an expired instrument from the
+chain, so that mid is a live option's price, not a dead one's.
+
+For the VRP member's ordinary outcome — a short call that expires
+worthless — that booked the whole premium as a loss it never took. The
+member zeroes such a position in its own book with NO order, deliberately
+(`maybe_settle`'s OTM branch: a zero-priced order is a fiction and a
+mark-priced one would book value that expired), so nothing in the intent
+log could ever have told the harness. `settled_otm` and
+`settled_unpriced` were the only tells, and they are counters on the
+engine, not inputs to the report.
+
+**Ripple effects**
+
+- Any window containing an option expiry with a position open at that
+  instant now reports a DIFFERENT, correct net. Windows with no such expiry
+  are byte-identical: the rung is inert without a settlement value, and no
+  value is supplied for a contract whose expiry the window never reaches.
+- The per-strategy JSON gains a key. Readers that match on an exact key set
+  need updating; `opt_settled > 0` obliges the reader to look, because it
+  means the intents did not close a contract that expired.
+- The settlement table is PRINTED with the index it used and how many
+  seconds before expiry that index was — the same obligation the D-7 mark
+  law carries. Measured on the 2026-09-10 00:01→08:31Z run: 32 contracts
+  reached expiry in-window, index lag **20–21 s**.
+
+**Migration steps**
+
+1. Rebuild. A report regenerated over a window containing an expiry will
+   differ from one produced before this commit; that is the fix.
+
+**Rollback**
+
+- Revert the commit. No on-disk format, config key or wire format is
+  involved — `engine-orders.pmlr`, `options-manifest.tsv` and
+  `vrp-state.tsv` are untouched — and the engine loop never loads this
+  code, so a running engine is unaffected either way.
+
 ## 2026-09-10 — `engine_vrp_no_selection_total` counts expiries, not records
 
 **What changed**
