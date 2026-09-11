@@ -49,6 +49,16 @@ PAIR_RING = 128
 MIN_PAIRS = 60
 QLIKE_RING = 60
 HAR_WINDOWS = (60, 240, 1440)
+
+#: Minute closes the HAR needs before it can forecast at all — mirrors
+#: ``core_vol::HAR_WARM_MINUTES``, which is the longest HAR window.
+#:
+#: Operationally load-bearing, not a detail: the engine's restart lane
+#: fires five times a UTC day with a longest gap of 7 h 35 m, so an
+#: engine warming only from its own uptime can never reach it. That is
+#: what kept the first live campaign from trading.
+HAR_WARM_MINUTES = max(HAR_WINDOWS)
+
 BPS_1E9_PER_UNIT = 10_000_000_000_000
 
 LN2_1E9 = 693_147_181

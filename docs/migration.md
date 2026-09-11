@@ -6,6 +6,75 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-11 — `vrp-state.tsv` v1 → v2 and `vrp-seed.tsv` v1 → v2 (W1–W5)
+
+**What changed**
+
+- `VRP_STATE_VERSION` 1 → **2**. New `R <min_ts_ms> <r_1e9>` rows carry the
+  HAR's rolling minute window. A v2 reader accepts v1 (no `R` rows = a cold
+  window, which is what v1 always meant) and REFUSES anything above 2.
+- `vrp-seed.tsv` is now TAGGED and versioned: `V 2`, then `P <expiry_ts_ms>
+  <x_1e9> <y_1e9>`, then `R <min_ts_ms> <r_1e9>`. A v1 seed — bare triples —
+  still parses.
+- `core-vol` gains `seed_return`, `on_minute_close_at`, `ret_chrono`,
+  `n_returns`, `last_min_ts_ms`, `is_warm` and the public
+  `HAR_WARM_MINUTES`.
+- `cli::vrp_boot` reconciles the two window sources and hands the member one
+  contiguous series; `VrpBoot` gains `window`, `window_from_seed`,
+  `window_from_state`.
+- **The member's state epoch now moves on every minute close.** It has to:
+  otherwise the `R` rows only reach disk when a campaign happens to move the
+  epoch — a few times a day — and the whole fix is inert. One ~40 KB
+  tmp+rename per minute, on the observability cadence.
+
+**Why — the member could never have traded**
+
+`core_vol::har_1e9` returns `None` while `minutes < 1440`, `minutes` counted
+from process start, and nothing persisted it. The restart lane fires five
+times a UTC day (00:10 / 08:30 / 16:05 / 20:15 / 21:15) with a longest gap
+of 7 h 35 m = **455 minutes**. 1440 was unreachable.
+
+The first live campaign proved it. At 00:00:00Z on 2026-09-11 the member
+selected the right instrument — `vrp-state.tsv` carried `C … 76500000000 0`,
+the $76,500 call expiring 08:00Z — reached the decision with a fresh mark and
+a fresh IV, and produced `decisions=1 entries=0 holds=0 **no_bounds=1**`.
+Everything worked except the one thing that had never been able to work.
+
+The seed gave the member its fitted LINE (90 pairs) but never its current
+**x**, because `x = ln(har_now)` and `har_now` needs the 24 h window.
+
+Same defect class as V8a, where kill criterion 3 could never arm for the same
+reason. V8a fixed the pairs and the QLIKE ring and did not fix this.
+
+**Ripple effects**
+
+- **A v1 binary refuses a v2 seed** (`parse_seed_row` wants exactly three
+  fields). That is the point of the bump, and it dictates the deploy order:
+  **binary first, then re-cut the seed.** Doing it the other way round takes
+  the engine down on its next restart.
+- A v1 `vrp-state.tsv` upgrades silently on the first write.
+- `docs/vrp-warmup-plan.md` carries the full design and the one known
+  limitation left in place (a multi-minute gap in the perp tape publishes one
+  close, not several, so `minutes` counts observed rolls rather than wall
+  minutes — predates this change and alters the measured edge's input if
+  touched).
+
+**Migration steps**
+
+1. Rebuild and install the binary.
+2. Re-cut the seed: `python -m claude_worker.vrp_seed seed-out --db
+   ~/multivenue/worker/candles.db --descriptor deribit:BTC-PERPETUAL --out
+   ~/multivenue/vrp-seed.tsv`. It now reports window minutes and holes, and
+   warns when the window is under 1440.
+3. Restart. The boot tell is `vrp: forecast WARM minutes=… from_seed=…
+   from_state=…`, or `vrp: forecast COLD … short_by=…`.
+
+**Rollback**
+
+- Revert the commit AND re-cut the seed with the old cutter — a v2 seed left
+  in place will refuse a v1 binary's boot. `vrp-state.tsv` can be deleted
+  instead; the member then boots cold, which is where it was before.
+
 ## 2026-09-10 — audit-pnl SETTLES expired options instead of marking them out (VX-A)
 
 **What changed**

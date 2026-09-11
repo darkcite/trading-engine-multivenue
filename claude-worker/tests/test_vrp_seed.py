@@ -232,21 +232,31 @@ def test_the_written_file_round_trips_through_the_engines_parser(tmp_path: pathl
         claude_worker.vrp_seed.SeedRow(_EXPIRY_MS - _DAY_MS, 24_659_086_751, 24_700_000_000),
         claude_worker.vrp_seed.SeedRow(_EXPIRY_MS, 24_671_149_241, -5),
     ]
+    window = [
+        claude_worker.vrp_seed.WindowRow(_EXPIRY_MS, -700),
+        claude_worker.vrp_seed.WindowRow(_EXPIRY_MS + 60_000, 1_250),
+    ]
     out = tmp_path / claude_worker.vrp_seed.SEED_FILE
-    claude_worker.vrp_seed.write_seed_tsv(out, rows)
+    claude_worker.vrp_seed.write_seed_tsv(out, rows, window)
     body = [
         line
         for line in out.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     ]
+    # W4: the file is TAGGED and versioned. `V` first, then the pairs
+    # oldest first, then the rolling window oldest first.
     assert body == [
-        f"{_EXPIRY_MS - _DAY_MS}\t24659086751\t24700000000",
-        f"{_EXPIRY_MS}\t24671149241\t-5",
+        f"V\t{claude_worker.vrp_seed.SEED_VERSION}",
+        f"P\t{_EXPIRY_MS - _DAY_MS}\t24659086751\t24700000000",
+        f"P\t{_EXPIRY_MS}\t24671149241\t-5",
+        f"R\t{_EXPIRY_MS}\t-700",
+        f"R\t{_EXPIRY_MS + 60_000}\t1250",
     ]
     for line in body:
         parts = line.split("\t")
-        assert len(parts) == 3
-        assert all(p.lstrip("-").isdigit() for p in parts)
+        want = {"V": 2, "P": 4, "R": 3}[parts[0]]
+        assert len(parts) == want, line
+        assert all(p.lstrip("-").isdigit() for p in parts[1:]), line
 
 
 def test_the_cut_is_oldest_first_and_bounded(tmp_path: pathlib.Path) -> None:
@@ -268,3 +278,101 @@ def test_the_cut_is_oldest_first_and_bounded(tmp_path: pathlib.Path) -> None:
     assert [r.expiry_ts_ms for r in rows] == sorted(r.expiry_ts_ms for r in rows)
     assert rows[-1].expiry_ts_ms == _EXPIRY_MS
     assert stats.emitted >= 3
+
+
+# ---------------------------------------------------------------------
+# W4 — the rolling window cut
+# ---------------------------------------------------------------------
+
+
+def test_the_window_is_contiguous_and_stamped_like_the_engine(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Each return is stamped with the minute that CLOSED to produce it.
+
+    The engine stamps ``minute_id * 60_000`` where ``minute_id`` is the
+    minute whose close it just published, so a return between closes
+    ``i-1`` and ``i`` carries minute ``i``'s open. If the two sides
+    disagree on this the boot merge cannot line the series up, and the
+    window silently ends up a splice of two offset histories.
+    """
+    first = 1_789_000_000_000
+    closes = _tape(200)
+    db = tmp_path / "candles.db"
+    _make_db(db, "deribit:BTC-PERPETUAL", first, closes)
+    conn = sqlite3.connect(db)
+    try:
+        rows = claude_worker.vrp_seed.window_returns(
+            conn, "deribit:BTC-PERPETUAL", first + 200 * _MINUTE_MS, 500
+        )
+    finally:
+        conn.close()
+
+    assert len(rows) == len(closes) - 1, "N closes make N-1 returns"
+    assert rows[0].min_ts_ms == first + _MINUTE_MS, "the CLOSING minute, not the opening one"
+    for i, row in enumerate(rows, start=1):
+        assert row.min_ts_ms == first + i * _MINUTE_MS
+        assert row.r_1e9 == claude_worker.vol_ref.ret_bps_1e9(closes[i - 1], closes[i])
+    for prev, cur in itertools.pairwise(rows):
+        assert cur.min_ts_ms - prev.min_ts_ms == _MINUTE_MS
+
+
+def test_a_hole_truncates_the_window_rather_than_splicing_across_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A return only exists between ADJACENT minutes.
+
+    ``Sigma r^2`` is a sum over consecutive minutes. A return computed
+    across a ten-minute hole is not one of those, and counting it would
+    let the window claim a span it does not have.
+    """
+    first = 1_789_000_000_000
+    closes = _tape(120)
+    db = tmp_path / "candles.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE candles (venue TEXT, descriptor TEXT, tf TEXT,"
+            " open_ts INTEGER, c REAL, PRIMARY KEY (venue, descriptor, tf, open_ts))"
+        )
+        # Minutes 0..49 and 60..119: a ten-minute hole at 50.
+        keep = [i for i in range(120) if i < 50 or i >= 60]
+        conn.executemany(
+            "INSERT INTO candles (venue, descriptor, tf, open_ts, c) VALUES (?,?,?,?,?)",
+            [
+                ("deribit", "d", "1m", first + i * _MINUTE_MS, closes[i] / 1_000_000)
+                for i in keep
+            ],
+        )
+        conn.commit()
+        stats = claude_worker.vrp_seed.CutStats()
+        rows = claude_worker.vrp_seed.window_returns(
+            conn, "d", first + 120 * _MINUTE_MS, 500, stats
+        )
+    finally:
+        conn.close()
+
+    assert stats.window_holes == 1
+    # Only the run AFTER the hole survives: minutes 61..119 inclusive.
+    assert len(rows) == 59
+    assert rows[0].min_ts_ms == first + 61 * _MINUTE_MS
+    assert rows[-1].min_ts_ms == first + 119 * _MINUTE_MS
+    assert stats.window_minutes == len(rows)
+
+
+def test_the_cut_window_is_long_enough_to_boot_warm(tmp_path: pathlib.Path) -> None:
+    """The default cut clears ``HAR_WARM_MINUTES`` with room to spare.
+
+    A window one minute short forecasts NOTHING, which is exactly the
+    state the member sat in for its whole first live day.
+    """
+    first = 1_789_000_000_000
+    n = claude_worker.vrp_seed.WINDOW_MINUTES_DEFAULT + 10
+    db = tmp_path / "candles.db"
+    _make_db(db, "d", first, _tape(n))
+    conn = sqlite3.connect(db)
+    try:
+        rows = claude_worker.vrp_seed.window_returns(conn, "d", first + n * _MINUTE_MS)
+    finally:
+        conn.close()
+    assert len(rows) >= claude_worker.vol_ref.HAR_WARM_MINUTES

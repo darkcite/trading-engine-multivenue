@@ -254,6 +254,126 @@ pub fn parse_seed_row(line: &str, ln: usize) -> Result<(u64, i64, i64), VrpError
     }
 }
 
+/// W3: one minute's return, stamped with the minute it belongs to
+/// (ms since the epoch) so two independently-cut series can be lined
+/// up against each other.
+pub type MinuteReturn = (u64, i64);
+
+/// The step between consecutive minute stamps. A series is CONTIGUOUS
+/// when every neighbouring pair differs by exactly this.
+pub const MINUTE_STEP_MS: u64 = 60_000;
+
+/// W3: pull the `R <min_ts_ms> <r_1e9>` rows out of a seed or state
+/// file, oldest first.
+///
+/// Every other tag is ignored rather than refused, because this runs
+/// over BOTH files and neither one is only returns: `vrp-seed.tsv`
+/// also carries the fitted pairs, `vrp-state.tsv` also carries the
+/// QLIKE window, the kill flag and the live campaign.
+///
+/// Rows must be strictly increasing in time. They are replayed into a
+/// ring whose eviction arm assumes chronological order, so an
+/// out-of-order file is not a cosmetic problem — it evicts the wrong
+/// return and silently produces a different window.
+pub fn parse_returns(src: &str) -> Result<Vec<MinuteReturn>, VrpError> {
+    let mut out: Vec<MinuteReturn> = Vec::new();
+    let mut prev_ts = 0u64;
+    for (i, raw) in src.lines().enumerate() {
+        let ln = i + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split('\t');
+        if it.next() != Some("R") {
+            continue;
+        }
+        let (a, b, rest) = (it.next(), it.next(), it.next());
+        let (Some(a), Some(b), None) = (a, b, rest) else {
+            return Err(err(format!("line {ln}: want `R<TAB>min_ts_ms<TAB>r_1e9`")));
+        };
+        let ts = parse_int(a, ln)?;
+        if ts <= 0 {
+            return Err(err(format!("line {ln}: min_ts_ms must be > 0")));
+        }
+        let ts = ts as u64;
+        if ts <= prev_ts && prev_ts != 0 {
+            return Err(err(format!(
+                "line {ln}: return rows must be strictly increasing in min_ts_ms \
+                 (got {ts} after {prev_ts})"
+            )));
+        }
+        prev_ts = ts;
+        out.push((ts, parse_int(b, ln)?));
+    }
+    Ok(out)
+}
+
+/// W3: reconcile the two rolling-window sources into the one series the
+/// member replays, newest last, and say where each kept minute came
+/// from.
+///
+/// `seed` is the worker's cut from `candles.db` — a full day, but as
+/// stale as the last hourly refresh. `state` is what the engine itself
+/// wrote before it went down — current to the second, but only as long
+/// as the last uptime, which on this fleet can be twenty minutes.
+/// NEITHER is enough alone, which is why both exist.
+///
+/// The rules, in order:
+///
+/// 1. **Union by minute.** Where both carry the same minute, `state`
+///    wins: it is the engine's own observation of the live tape, and
+///    the candle is a REST-derived aggregate of that same minute. The
+///    two are different derivations of the same quantity, so a union
+///    splices two series — a handful of splice points move a
+///    1440-minute `Σ r²` by far less than a cold window that cannot
+///    forecast at all, and the caller reports the split.
+/// 2. **Longest contiguous suffix.** A gap means the window is not the
+///    24 h it would claim to be, so everything at or before the newest
+///    gap is dropped rather than silently counted.
+/// 3. **Capped** at the ring the member replays into.
+///
+/// Returns `(merged, from_seed, from_state)` over the KEPT rows.
+#[must_use]
+pub fn merge_returns(
+    seed: &[MinuteReturn],
+    state: &[MinuteReturn],
+    cap: usize,
+) -> (Vec<MinuteReturn>, usize, usize) {
+    let mut by_min: std::collections::BTreeMap<u64, (i64, bool)> =
+        std::collections::BTreeMap::new();
+    for (ts, r) in seed {
+        by_min.insert(*ts, (*r, false));
+    }
+    // Second, so a shared minute resolves to the engine's own view.
+    for (ts, r) in state {
+        by_min.insert(*ts, (*r, true));
+    }
+    let all: Vec<(u64, i64, bool)> = by_min.iter().map(|(t, (r, s))| (*t, *r, *s)).collect();
+    if all.is_empty() || cap == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    // Walk back from the newest while the step stays exactly one minute.
+    let mut start = all.len() - 1;
+    while start > 0 && all.len() - start < cap && all[start].0 - all[start - 1].0 == MINUTE_STEP_MS
+    {
+        start -= 1;
+    }
+    let kept = &all[start..];
+    let mut from_seed = 0usize;
+    let mut from_state = 0usize;
+    let mut merged = Vec::with_capacity(kept.len());
+    for (ts, r, is_state) in kept {
+        if *is_state {
+            from_state += 1;
+        } else {
+            from_seed += 1;
+        }
+        merged.push((*ts, *r));
+    }
+    (merged, from_seed, from_state)
+}
+
 /// Parse a whole `vrp-seed.tsv`: `#` comments and blank lines skipped,
 /// every other line an `expiry_ts_ms\tx_1e9\ty_1e9` triple. Rows are
 /// returned in FILE order, which the cutter writes oldest first — the
@@ -268,7 +388,16 @@ pub fn parse_seed(src: &str) -> Result<Vec<(u64, i64, i64)>, VrpError> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let row = parse_seed_row(line, ln)?;
+        // W3: a v2 seed is TAGGED — `V`, `P` and `R` rows side by
+        // side. A v1 seed is bare triples. Both parse here; only the
+        // `P` rows are pairs either way.
+        let mut head = line.split('\t');
+        let body = match head.next() {
+            Some("R") | Some("V") => continue,
+            Some("P") => line.get(2..).unwrap_or("").trim(),
+            _ => line,
+        };
+        let row = parse_seed_row(body, ln)?;
         if row.0 <= prev_ts && prev_ts != 0 {
             return Err(err(format!(
                 "line {ln}: seed rows must be strictly increasing in expiry_ts_ms \
@@ -413,4 +542,114 @@ hedge_descriptor      = \"deribit:BTC-PERPETUAL\"
         // than silently seeding a shorter history.
         assert!(parse_seed("1000\t1\t2\nnonsense\n").is_err());
     }
+
+    // ---------------------------------------------------------------
+    // W3 — reconciling the two rolling-window sources
+    // ---------------------------------------------------------------
+
+    const T0: u64 = 1_789_000_000_000;
+
+    fn series(from_min: u64, n: u64, val: i64) -> Vec<MinuteReturn> {
+        (0..n)
+            .map(|i| (T0 + (from_min + i) * MINUTE_STEP_MS, val))
+            .collect()
+    }
+
+    #[test]
+    fn parse_returns_reads_r_rows_and_ignores_everything_else() {
+        let src = "# a comment\nV\t2\nP\t1789000000000\t1\t2\n\
+                   R\t1789000000000\t-500\nQ\t1\t2\nR\t1789000060000\t700\n";
+        let got = parse_returns(src).expect("parses");
+        assert_eq!(got, vec![(1_789_000_000_000, -500), (1_789_000_060_000, 700)]);
+        // And a v2 SEED — tagged, with both row kinds — still yields
+        // its pairs. (`Q` above is a state-file tag; `parse_seed` is
+        // for seed files and refuses tags it was never given.)
+        let seed_v2 = "# cut by the worker\nV\t2\nP\t1789000000000\t1\t2\n\
+                       R\t1789000000000\t-500\n";
+        assert_eq!(parse_seed(seed_v2).expect("pairs"), vec![(1_789_000_000_000, 1, 2)]);
+        assert_eq!(parse_returns(seed_v2).expect("returns").len(), 1);
+        // A v1 seed — bare triples, every seed cut before 2026-09-11 —
+        // still parses, and simply carries no window.
+        assert_eq!(parse_seed("1000\t1\t2\n").expect("v1"), vec![(1000, 1, 2)]);
+        assert!(parse_returns("1000\t1\t2\n").expect("v1").is_empty());
+    }
+
+    #[test]
+    fn parse_returns_refuses_disorder_and_a_zero_stamp() {
+        // The ring's eviction arm assumes chronological order, so a
+        // shuffled file does not produce an odd window — it produces a
+        // DIFFERENT one, silently.
+        assert!(parse_returns("R\t1789000060000\t1\nR\t1789000000000\t2\n").is_err());
+        assert!(parse_returns("R\t1789000000000\t1\nR\t1789000000000\t2\n").is_err());
+        assert!(parse_returns("R\t0\t1\n").is_err(), "0 is not a minute");
+        assert!(parse_returns("R\t1789000000000\n").is_err(), "short row");
+        assert!(parse_returns("R\t1789000000000\t1\t2\n").is_err(), "long row");
+    }
+
+    /// Where both sources carry the same minute the ENGINE's own view
+    /// wins: it observed the live tape, the candle is a REST-derived
+    /// aggregate of that same minute.
+    #[test]
+    fn the_engine_wins_a_shared_minute_and_the_seed_fills_the_rest() {
+        // Seed: minutes 0..100 as −1. State: minutes 90..100 as +1.
+        let seed = series(0, 100, -1);
+        let state = series(90, 10, 1);
+        let (merged, from_seed, from_state) = merge_returns(&seed, &state, 1_000);
+        assert_eq!(merged.len(), 100, "union, not concatenation");
+        assert_eq!(from_state, 10);
+        assert_eq!(from_seed, 90);
+        assert_eq!(merged[89], (T0 + 89 * MINUTE_STEP_MS, -1), "seed-only minute");
+        assert_eq!(merged[90], (T0 + 90 * MINUTE_STEP_MS, 1), "contested ⇒ state");
+        assert_eq!(merged[99], (T0 + 99 * MINUTE_STEP_MS, 1));
+    }
+
+    /// Neither source is enough alone, which is the whole reason both
+    /// exist: the state covers only the last uptime, the seed only up
+    /// to the worker's last hourly refresh.
+    #[test]
+    fn the_two_sources_together_span_what_neither_covers() {
+        // The worker's cut ends an hour ago; the engine booted 20 min ago.
+        let seed = series(0, 1_380, 7); // 23 h, stale by 60 min
+        let state = series(1_380, 60, 9); // the last hour, live
+        let (merged, from_seed, from_state) = merge_returns(&seed, &state, 1_536);
+        assert_eq!(merged.len(), 1_440, "a full 24 h window from two partial ones");
+        assert_eq!((from_seed, from_state), (1_380, 60));
+    }
+
+    /// A gap means the window is not the 24 h it would claim to be, so
+    /// everything at or before the newest gap is dropped rather than
+    /// silently counted as contiguous.
+    #[test]
+    fn a_gap_truncates_to_the_newest_contiguous_run() {
+        let mut rows = series(0, 50, 1);
+        rows.extend(series(60, 30, 2)); // 10-minute hole at 50..60
+        let (merged, _, _) = merge_returns(&rows, &[], 1_000);
+        assert_eq!(merged.len(), 30, "only the run AFTER the hole survives");
+        assert_eq!(merged[0], (T0 + 60 * MINUTE_STEP_MS, 2));
+        // Contiguous by construction.
+        for w in merged.windows(2) {
+            assert_eq!(w[1].0 - w[0].0, MINUTE_STEP_MS);
+        }
+    }
+
+    #[test]
+    fn the_merge_is_capped_by_the_ring_and_keeps_the_newest() {
+        let rows = series(0, 2_000, 3);
+        let (merged, _, _) = merge_returns(&rows, &[], 1_536);
+        assert_eq!(merged.len(), 1_536);
+        assert_eq!(
+            merged[merged.len() - 1].0,
+            T0 + 1_999 * MINUTE_STEP_MS,
+            "the newest minute is always kept"
+        );
+    }
+
+    #[test]
+    fn an_empty_merge_is_empty_not_a_panic() {
+        assert_eq!(merge_returns(&[], &[], 1_536).0.len(), 0);
+        assert_eq!(merge_returns(&series(0, 10, 1), &[], 0).0.len(), 0);
+        // A single minute is trivially contiguous.
+        assert_eq!(merge_returns(&series(0, 1, 5), &[], 16).0.len(), 1);
+    }
+
 }

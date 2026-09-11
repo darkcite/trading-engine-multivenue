@@ -35,6 +35,11 @@ use tracing::{info, warn};
 pub struct VrpSeed {
     /// `(expiry_ts_ms, x_1e9, y_1e9)`, oldest first.
     pub rows: Vec<(u64, i64, i64)>,
+    /// W3: `(min_ts_ms, r_1e9)` rolling-window returns, oldest first.
+    /// Empty for a v1 (untagged) seed, which is every seed cut before
+    /// 2026-09-11 — legal, and simply means the window has only the
+    /// engine's own state to draw on.
+    pub returns: Vec<core_config::vrp::MinuteReturn>,
     /// The file actually read.
     pub path: PathBuf,
 }
@@ -84,12 +89,16 @@ pub fn load_vrp_seed(seed_path: Option<&Path>) -> Result<Option<VrpSeed>, String
         info!(path = %path.display(), "vrp: seed absent — the member holds until it has 60 pairs");
         return Ok(None);
     }
-    let rows = core_config::vrp::load_seed(&path).map_err(|e| e.to_string())?;
-    let seed = VrpSeed { rows, path };
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| format!("vrp: seed {}: {e}", path.display()))?;
+    let rows = core_config::vrp::parse_seed(&src).map_err(|e| e.to_string())?;
+    let returns = core_config::vrp::parse_returns(&src).map_err(|e| e.to_string())?;
+    let seed = VrpSeed { rows, returns, path };
     info!(
         path = %seed.path.display(),
         pairs = seed.len(),
         decisive = seed.is_decisive(),
+        window_minutes = seed.returns.len(),
         "vrp: seed applied"
     );
     if !seed.is_decisive() {
@@ -134,6 +143,19 @@ pub struct VrpBoot {
     /// Chain rows the parser refused (a non-inverse name, or a name it
     /// does not recognise). Counted, never guessed at.
     pub rows_refused: usize,
+    /// W3: the reconciled rolling window, oldest first and contiguous —
+    /// what the member replays to arrive WARM instead of spending 24 h
+    /// it never gets before the next restart.
+    pub window: Vec<core_config::vrp::MinuteReturn>,
+    /// Kept minutes taken from the worker's `candles.db` cut. The two
+    /// sources are different derivations of the same quantity — a
+    /// capture mid-roll versus a REST candle close — so the split is
+    /// something an operator is entitled to see rather than infer.
+    pub window_from_seed: usize,
+    /// Kept minutes taken from `vrp-state.tsv` — the engine's own view
+    /// of the live tape, which wins wherever both sources carry the
+    /// same minute.
+    pub window_from_state: usize,
 }
 
 /// The currency prefix of a Deribit descriptor: `deribit:BTC-PERPETUAL`
@@ -253,9 +275,26 @@ pub fn load_vrp_boot(
             ),
         },
     };
+    let seed_returns = loaded
+        .as_ref()
+        .map(|s| s.returns.clone())
+        .unwrap_or_default();
     let seed = loaded.map(|s| s.rows).unwrap_or_default();
     let state_path = PathBuf::from(default_state_path()?);
     let state = read_state(&state_path)?;
+    // W3: the rolling window is the ONE thing with two sources, and
+    // reconciling them needs both series in hand before any of them is
+    // pushed — which is why it happens here and not in the member's
+    // line-at-a-time parser.
+    let state_returns = match state.as_deref() {
+        Some(text) => core_config::vrp::parse_returns(text).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let (window, window_from_seed, window_from_state) = core_config::vrp::merge_returns(
+        &seed_returns,
+        &state_returns,
+        core_vol::MINUTE_RING,
+    );
     Ok(Some(VrpBoot {
         params: strategy_vrp::VrpParams {
             theta_1e9: file.theta_1e9,
@@ -268,6 +307,9 @@ pub fn load_vrp_boot(
         },
         registry,
         seed,
+        window,
+        window_from_seed,
+        window_from_state,
         seed_path: seed_path_used,
         state,
         state_path,

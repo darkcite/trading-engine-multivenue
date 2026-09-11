@@ -2508,6 +2508,17 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         for (ts_ms, x, y) in &boot.seed {
             set.vrp_mut().seed_pair_at(*ts_ms, *x, *y);
         }
+        // W2/W3: the HAR's rolling window, reconciled at boot from the
+        // worker's candle cut and the engine's own last state. Replayed
+        // BEFORE the first live minute close, because the ring's
+        // eviction arm assumes chronological order.
+        //
+        // Without this the member starts every boot with `minutes = 0`
+        // against a 24 h warm-up, and the restart lane fires five times
+        // a UTC day with a longest gap of 7 h 35 m — so the forecast
+        // never exists and the member never trades. That is what the
+        // first live campaign did on 2026-09-11.
+        let seeded_minutes = set.vrp_mut().seed_returns(&boot.window);
         // V8a: the engine's OWN history on top of the worker's
         // bootstrap — the pairs it formed itself, the QLIKE window kill
         // criterion 3 is measured over, and any campaign that was open
@@ -2549,10 +2560,36 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             campaign = restored.campaign,
             campaign_resolved = restored.campaign_resolved,
             killed = restored.killed,
+            returns = restored.returns,
             total_pairs = set.vrp().n_pairs(),
             path = %boot.state_path.display(),
             "vrp: state restored"
         );
+        // W2: the warm-up state, on EVERY boot. The member spent its
+        // whole first live day cold and said nothing — `no_bounds` was
+        // the only tell, and it is indistinguishable from every other
+        // cause.
+        if set.vrp().vol_is_warm() {
+            tracing::info!(
+                minutes = set.vrp().vol_minutes(),
+                seeded = seeded_minutes,
+                from_seed = boot.window_from_seed,
+                from_state = boot.window_from_state,
+                last_min_ts_ms = set.vrp().vol_last_min_ts_ms(),
+                "vrp: forecast WARM"
+            );
+        } else {
+            tracing::warn!(
+                minutes = set.vrp().vol_minutes(),
+                need = core_vol::HAR_WARM_MINUTES,
+                short_by = set.vrp().vol_short_by(),
+                seeded = seeded_minutes,
+                from_seed = boot.window_from_seed,
+                from_state = boot.window_from_state,
+                "vrp: forecast COLD — every decision refuses with no_bounds until the \
+                 window fills. Re-cut the seed if this does not clear."
+            );
+        }
         if restored.campaign && !restored.campaign_resolved {
             tracing::warn!(
                 "vrp: the restored campaign's contract is no longer in the chain — the \

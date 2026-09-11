@@ -52,10 +52,21 @@ import claude_worker.vol_ref
 SEED_FILE: str = "vrp-seed.tsv"
 
 #: Header line; the parser skips `#` lines.
+#: Seed-file format version. 1 was bare ``expiry_ts_ms x_1e9 y_1e9``
+#: triples; 2 is TAGGED and adds the ``R`` rows that carry the HAR's
+#: rolling minute window. The bump is deliberate and one-way: a binary
+#: older than 2026-09-11 refuses a v2 seed outright, which is what stops
+#: it booting with a window it cannot account for. Deploy the binary
+#: first, then re-cut the seed.
+SEED_VERSION: int = 2
+
 SEED_HEADER: str = (
-    "# vrp-seed.tsv - expiry_ts_ms\tx_1e9\ty_1e9 (VRP V5).\n"
+    "# vrp-seed.tsv (VRP V5 + W4) - TAGGED rows, oldest first.\n"
+    "#   V <version>\n"
+    "#   P <expiry_ts_ms> <x_1e9> <y_1e9>   the fitted pairs\n"
+    "#   R <min_ts_ms> <r_1e9>              the HAR's rolling window\n"
     "# Written by claude_worker.vrp_seed from candles.db, using the same\n"
-    "# integer law core_vol runs. Oldest first. Never tracked by git.\n"
+    "# integer law core_vol runs. Never tracked by git.\n"
 )
 
 #: Expiries to emit by default. 60 is the engine's MIN_PAIRS, so the
@@ -70,6 +81,15 @@ _DAY_MS: int = 86_400_000
 #: Two closes make one return; one close makes none.
 _MIN_CLOSES_FOR_A_RETURN: int = 2
 
+#: Minute returns to cut for the rolling window.
+#:
+#: ``core_vol::HAR_WARM_MINUTES`` is 1440 and N closes make N-1 returns,
+#: so 1441 closes is the smallest cut that arrives WARM. We take a
+#: little more than that: the engine's own state file covers the tail,
+#: and a few spare minutes absorb a hole in candles.db without dropping
+#: the whole window back under the gate.
+WINDOW_MINUTES_DEFAULT: int = 1560
+
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class SeedRow:
@@ -78,6 +98,20 @@ class SeedRow:
     expiry_ts_ms: int
     x_1e9: int
     y_1e9: int
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class WindowRow:
+    """One minute's return for the HAR's rolling window.
+
+    ``min_ts_ms`` is the OPEN of the minute that closed to produce this
+    return, which is exactly what the engine stamps
+    (``minute_id * 60_000``). The two sides must agree on this or the
+    boot merge cannot line the series up.
+    """
+
+    min_ts_ms: int
+    r_1e9: int
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -93,6 +127,7 @@ class CutSpec:
     descriptor: str
     tau_ns: int = claude_worker.vol_ref.TAU_8H_NS
     pairs: int = PAIRS_DEFAULT
+    window_minutes: int = WINDOW_MINUTES_DEFAULT
 
 
 @dataclasses.dataclass(slots=True)
@@ -104,6 +139,12 @@ class CutStats:
     skipped_unsettled: int = 0
     skipped_short_history: int = 0
     skipped_short_hold: int = 0
+    #: W4: minutes emitted for the rolling window.
+    window_minutes: int = 0
+    #: W4: holes in candles.db that truncated the window. A hole means
+    #: the run before it is NOT contiguous with the run after, and a
+    #: window that claims 24 h it does not have is worse than a short one.
+    window_holes: int = 0
 
 
 def closes_1e6(
@@ -211,6 +252,45 @@ def pair_for_expiry(
     return SeedRow(expiry_ts_ms, x, y)
 
 
+def window_returns(
+    conn: sqlite3.Connection,
+    descriptor: str,
+    now_ms: int,
+    minutes: int = WINDOW_MINUTES_DEFAULT,
+    stats: CutStats | None = None,
+) -> list[WindowRow]:
+    """The trailing rolling window, oldest first and CONTIGUOUS.
+
+    A return only exists between two adjacent minutes. Where candles.db
+    has a hole the two closes either side are not adjacent, so the run
+    breaks and everything before the newest break is dropped rather than
+    spliced across the gap -- the engine's ``Sigma r^2`` is a sum over
+    consecutive minutes, and a spliced return is not one of them.
+    """
+    since = now_ms - (minutes + 1) * _MINUTE_MS
+    closes = closes_1e6(conn, descriptor, since, now_ms + _MINUTE_MS)
+    if len(closes) < _MIN_CLOSES_FOR_A_RETURN:
+        return []
+    run: list[WindowRow] = []
+    holes = 0
+    i = 1
+    while i < len(closes):
+        prev_ts, prev_px = closes[i - 1]
+        ts, px = closes[i]
+        if ts - prev_ts != _MINUTE_MS:
+            # Not adjacent: no return exists across the hole, and the
+            # run so far can no longer reach the present contiguously.
+            holes += 1
+            run = []
+        else:
+            run.append(WindowRow(ts, claude_worker.vol_ref.ret_bps_1e9(prev_px, px)))
+        i += 1
+    if stats is not None:
+        stats.window_holes = holes
+        stats.window_minutes = len(run)
+    return run
+
+
 def cut_rows(
     db_path: pathlib.Path,
     spec: CutSpec,
@@ -235,13 +315,20 @@ def cut_rows(
     return rows[-spec.pairs :], stats
 
 
-def write_seed_tsv(path: pathlib.Path, rows: typing.Sequence[SeedRow]) -> None:
+def write_seed_tsv(
+    path: pathlib.Path,
+    rows: typing.Sequence[SeedRow],
+    window: typing.Sequence[WindowRow] = (),
+) -> None:
     """Atomic write (tmp + rename) so a boot never reads a torn file."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         f.write(SEED_HEADER)
+        f.write(f"V\t{SEED_VERSION}\n")
         for r in rows:
-            f.write(f"{r.expiry_ts_ms}\t{r.x_1e9}\t{r.y_1e9}\n")
+            f.write(f"P\t{r.expiry_ts_ms}\t{r.x_1e9}\t{r.y_1e9}\n")
+        for w in window:
+            f.write(f"R\t{w.min_ts_ms}\t{w.r_1e9}\n")
     os.replace(tmp, path)
 
 
@@ -252,8 +339,14 @@ def seed_out(
     now_ms: int | None = None,
 ) -> tuple[int, CutStats]:
     """The ``seed-out`` lane: returns ``(rows written, stats)``."""
-    rows, stats = cut_rows(db_path, spec, now_ms)
-    write_seed_tsv(out_path, rows)
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    rows, stats = cut_rows(db_path, spec, now)
+    conn = sqlite3.connect(db_path)
+    try:
+        window = window_returns(conn, spec.descriptor, now, spec.window_minutes, stats)
+    finally:
+        conn.close()
+    write_seed_tsv(out_path, rows, window)
     return len(rows), stats
 
 
@@ -291,10 +384,16 @@ def seed_for_window(
     been fitted yet. Nothing written when there is nothing to write.
     """
     descriptor, tau_ns = read_vrp_toml(vrp_path)
-    rows, stats = cut_rows(db_path, CutSpec(descriptor, tau_ns), now_ms)
-    if not rows:
+    spec = CutSpec(descriptor, tau_ns)
+    rows, stats = cut_rows(db_path, spec, now_ms)
+    conn = sqlite3.connect(db_path)
+    try:
+        window = window_returns(conn, descriptor, now_ms, spec.window_minutes, stats)
+    finally:
+        conn.close()
+    if not rows and not window:
         return 0, stats
-    write_seed_tsv(run_dir / SEED_FILE, rows)
+    write_seed_tsv(run_dir / SEED_FILE, rows, window)
     return len(rows), stats
 
 
@@ -308,16 +407,25 @@ def main(argv: list[str] | None = None) -> int:
     out.add_argument("--out", required=True, type=pathlib.Path)
     out.add_argument("--tau-ns", type=int, default=claude_worker.vol_ref.TAU_8H_NS)
     out.add_argument("--pairs", type=int, default=PAIRS_DEFAULT)
+    out.add_argument("--window-minutes", type=int, default=WINDOW_MINUTES_DEFAULT)
     out.add_argument("--now-ms", type=int, default=None)
     args = ap.parse_args(argv)
 
-    spec = CutSpec(args.descriptor, args.tau_ns, args.pairs)
+    spec = CutSpec(args.descriptor, args.tau_ns, args.pairs, args.window_minutes)
     n, stats = seed_out(args.db, spec, args.out, args.now_ms)
     print(
-        f"vrp-seed: {n} pair(s) -> {args.out} "
+        f"vrp-seed: {n} pair(s) + {stats.window_minutes} window minute(s) -> {args.out} "
         f"(considered={stats.expiries_considered} unsettled={stats.skipped_unsettled} "
-        f"short_history={stats.skipped_short_history} short_hold={stats.skipped_short_hold})"
+        f"short_history={stats.skipped_short_history} short_hold={stats.skipped_short_hold} "
+        f"window_holes={stats.window_holes})"
     )
+    if stats.window_minutes < claude_worker.vol_ref.HAR_WARM_MINUTES:
+        print(
+            f"vrp-seed: WARNING the window is {stats.window_minutes} minute(s); the "
+            f"member needs {claude_worker.vol_ref.HAR_WARM_MINUTES} before it can "
+            "forecast at all",
+            file=sys.stderr,
+        )
     if n < claude_worker.vol_ref.MIN_PAIRS:
         print(
             f"vrp-seed: WARNING only {n} pair(s); the member needs "

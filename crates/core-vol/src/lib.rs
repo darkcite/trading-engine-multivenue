@@ -66,6 +66,17 @@ pub mod fx;
 /// exact instead of approximate.
 pub const MINUTE_RING: usize = 1536;
 
+/// Minute closes the HAR needs before it can forecast at all — the
+/// longest window, so 24 h.
+///
+/// W1: this is a PUBLIC constant because the number is operationally
+/// load-bearing, not an implementation detail. The engine's restart
+/// lane fires five times a UTC day with a longest gap of 7 h 35 m, so
+/// an engine that warms only from its own uptime can never reach it.
+/// Anything that boots a [`VolEngine`] has to be able to say how far
+/// short it is.
+pub const HAR_WARM_MINUTES: u64 = HAR_WINDOWS[HAR_WINDOWS.len() - 1] as u64;
+
 /// Fitted (x, y) pair ring — one pair per settled expiry.
 pub const PAIR_RING: usize = 128;
 
@@ -160,6 +171,15 @@ pub struct VolEngine {
     minutes: u64,
     /// Previous close ×1e6; `0` = no previous close yet.
     prev_px_1e6: i64,
+    /// W1: the minute the newest return belongs to, ms since the epoch;
+    /// `0` = unknown (the legacy [`Self::on_minute_close`] path and the
+    /// parity fixture, neither of which carries a clock).
+    ///
+    /// Carried so a restored window can be COMPARED with another
+    /// source's — the merge at boot has to know which series is fresher
+    /// and whether the two are contiguous. Nothing in the forecast
+    /// reads it.
+    last_min_ts_ms: u64,
     /// Per-minute returns, bps ×1e9.
     ret_1e9: [i64; MINUTE_RING],
     /// Fitted pairs, ×1e9.
@@ -206,6 +226,7 @@ impl VolEngine {
             a_1e9: 0,
             minutes: 0,
             prev_px_1e6: 0,
+            last_min_ts_ms: 0,
             ret_1e9: [0; MINUTE_RING],
             pair_x_1e9: [0; PAIR_RING],
             pair_y_1e9: [0; PAIR_RING],
@@ -235,6 +256,13 @@ impl VolEngine {
     /// be a price, and `ret_bps_1e9` divides by it.
     #[inline]
     pub fn on_minute_close(&mut self, px_1e6: i64) {
+        self.on_minute_close_at(px_1e6, 0);
+    }
+
+    /// W1: [`Self::on_minute_close`] with the minute this close belongs
+    /// to, ms since the epoch. Same law — the timestamp is recorded and
+    /// never used by the forecast.
+    pub fn on_minute_close_at(&mut self, px_1e6: i64, min_ts_ms: u64) {
         if px_1e6 <= 0 {
             return;
         }
@@ -244,7 +272,29 @@ impl VolEngine {
         }
         let r = core_regime::math::ret_bps_1e9(self.prev_px_1e6, px_1e6);
         self.prev_px_1e6 = px_1e6;
+        self.push_return(r, min_ts_ms);
+    }
 
+    /// W1: push a return the caller already holds, as if this minute had
+    /// just closed.
+    ///
+    /// This is how a window survives a restart, and it takes RETURNS
+    /// rather than closes on purpose. `sum_sq` is never read from a
+    /// file — every restored return goes through the same push the live
+    /// path uses, so the three accumulators, the ring and `minutes`
+    /// cannot disagree with each other by construction. A corrupt file
+    /// can make the window WRONG; it cannot make it INCONSISTENT.
+    ///
+    /// Replay must be chronological, oldest first, or the eviction arm
+    /// below drops the wrong return.
+    pub fn seed_return(&mut self, r_1e9: i64, min_ts_ms: u64) {
+        self.push_return(r_1e9, min_ts_ms);
+    }
+
+    /// The ring write and the three rolling sums. One body, so the live
+    /// path and the restore path cannot drift.
+    #[inline]
+    fn push_return(&mut self, r: i64, min_ts_ms: u64) {
         let k = self.minutes; // this return's global index
         let slot = (k % MINUTE_RING as u64) as usize;
         self.ret_1e9[slot] = r;
@@ -261,6 +311,51 @@ impl VolEngine {
             w += 1;
         }
         self.minutes = k + 1;
+        // A 0 means "no clock" (the legacy entry point, the parity
+        // fixture) and must never clobber a real stamp.
+        if min_ts_ms > 0 {
+            self.last_min_ts_ms = min_ts_ms;
+        }
+    }
+
+    /// W1: the minute of the newest return, ms since the epoch; `0` when
+    /// no stamped return has been seen.
+    #[inline]
+    #[must_use]
+    pub const fn last_min_ts_ms(&self) -> u64 {
+        self.last_min_ts_ms
+    }
+
+    /// W1: how many returns the ring still holds.
+    #[inline]
+    #[must_use]
+    pub const fn n_returns(&self) -> usize {
+        if self.minutes < MINUTE_RING as u64 {
+            self.minutes as usize
+        } else {
+            MINUTE_RING
+        }
+    }
+
+    /// W1: the `i`-th retained return in CHRONOLOGICAL order, oldest
+    /// first — the order [`Self::seed_return`] wants them back in.
+    #[inline]
+    #[must_use]
+    pub fn ret_chrono(&self, i: usize) -> Option<i64> {
+        let n = self.n_returns();
+        if i >= n {
+            return None;
+        }
+        let oldest = self.minutes - n as u64;
+        Some(self.ret_1e9[((oldest + i as u64) % MINUTE_RING as u64) as usize])
+    }
+
+    /// W1: whether the HAR can forecast at all. False is the state the
+    /// member spent its entire first day in without ever saying so.
+    #[inline]
+    #[must_use]
+    pub const fn is_warm(&self) -> bool {
+        self.minutes >= HAR_WARM_MINUTES
     }
 
     /// Minutes of return history observed.
@@ -659,6 +754,130 @@ mod tests {
             e.on_minute_close(px);
             i += 1;
         }
+    }
+
+
+    // ---------------------------------------------------------------
+    // W1 — the window has to survive a restart
+    // ---------------------------------------------------------------
+
+    /// A deterministic walk that also STAMPS each minute, so the
+    /// restored series can be compared with the live one on the clock
+    /// as well as on the numbers.
+    fn walk_at(e: &mut VolEngine, minutes: usize, seed: i64, t0_ms: u64) {
+        let mut px = 79_000_000_000i64;
+        let mut s = seed;
+        let mut i = 0usize;
+        while i < minutes {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let step = ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000;
+            px += step;
+            if px < 1_000_000_000 {
+                px = 1_000_000_000;
+            }
+            e.on_minute_close_at(px, t0_ms + i as u64 * 60_000);
+            i += 1;
+        }
+    }
+
+    /// THE test. A window rebuilt from its own returns is the same
+    /// window — same forecast, same regressor, same bounds, same count,
+    /// same clock. This is what a restart has to preserve, and what
+    /// nothing preserved before W1.
+    #[test]
+    fn a_reseeded_window_is_indistinguishable_from_the_live_one() {
+        const T0: u64 = 1_789_000_000_000;
+        let mut live = VolEngine::new();
+        walk_at(&mut live, 2_000, 42, T0); // past MINUTE_RING, so it wrapped
+        assert!(live.is_warm());
+        assert_eq!(live.n_returns(), MINUTE_RING, "the ring is full and wrapped");
+
+        // Drain it the way `render_state` will, oldest first, and feed
+        // it back the way `restore_state` will.
+        let mut restored = VolEngine::new();
+        let mut i = 0usize;
+        while let Some(r) = live.ret_chrono(i) {
+            restored.seed_return(r, T0 + (2_000 - MINUTE_RING + i) as u64 * 60_000);
+            i += 1;
+        }
+        assert_eq!(i, MINUTE_RING);
+
+        assert_eq!(restored.minutes(), MINUTE_RING as u64);
+        assert!(restored.is_warm(), "warm again WITHOUT waiting 24 h");
+        assert_eq!(restored.last_min_ts_ms(), live.last_min_ts_ms());
+        // The forecast is the thing that matters, and it is identical.
+        assert_eq!(restored.har_1e9(TAU_8H), live.har_1e9(TAU_8H));
+        assert_eq!(restored.har_1e9(TAU_4H), live.har_1e9(TAU_4H));
+        assert_eq!(restored.x_1e9(TAU_8H), live.x_1e9(TAU_8H));
+        // Every retained return came back in the same order.
+        let mut j = 0usize;
+        while j < MINUTE_RING {
+            assert_eq!(restored.ret_chrono(j), live.ret_chrono(j), "slot {j}");
+            j += 1;
+        }
+    }
+
+    /// The gate the member sat behind for a whole day, pinned: one
+    /// minute short is cold, and the boundary is exactly 1440.
+    #[test]
+    fn the_har_is_cold_until_exactly_har_warm_minutes() {
+        const T0: u64 = 1_789_000_000_000;
+        let mut e = VolEngine::new();
+        // `on_minute_close` spends its first call priming prev_px, so
+        // N closes make N−1 returns.
+        walk_at(&mut e, HAR_WARM_MINUTES as usize, 7, T0);
+        assert_eq!(e.minutes(), HAR_WARM_MINUTES - 1);
+        assert!(!e.is_warm(), "one minute short is cold");
+        assert!(e.har_1e9(TAU_8H).is_none(), "and a cold window forecasts NOTHING");
+        assert!(e.bounds(TAU_8H, THETA).is_none(), "which is the no_bounds arm");
+
+        walk_at(&mut e, 1, 8, T0 + HAR_WARM_MINUTES * 60_000);
+        assert_eq!(e.minutes(), HAR_WARM_MINUTES);
+        assert!(e.is_warm());
+        assert!(e.har_1e9(TAU_8H).is_some(), "warm ⇒ a forecast exists");
+    }
+
+    /// `ret_chrono` is oldest-first across the wrap, and it stops at
+    /// what the ring still holds rather than at what it has ever seen.
+    #[test]
+    fn ret_chrono_is_oldest_first_and_bounded_by_the_ring() {
+        let mut e = VolEngine::new();
+        // Hand-push a countable series: return k has value k.
+        let mut k = 0i64;
+        while k < MINUTE_RING as i64 + 500 {
+            e.seed_return(k, 1_789_000_000_000 + k as u64 * 60_000);
+            k += 1;
+        }
+        assert_eq!(e.minutes(), MINUTE_RING as u64 + 500);
+        assert_eq!(e.n_returns(), MINUTE_RING, "bounded by the ring, not by history");
+        // The oldest SURVIVOR is 500, and the newest is the last pushed.
+        assert_eq!(e.ret_chrono(0), Some(500));
+        assert_eq!(e.ret_chrono(MINUTE_RING - 1), Some(MINUTE_RING as i64 + 499));
+        assert_eq!(e.ret_chrono(MINUTE_RING), None, "past the ring is None");
+        // Strictly increasing across the wrap — the order is the point.
+        let mut i = 1usize;
+        while i < MINUTE_RING {
+            assert!(e.ret_chrono(i) > e.ret_chrono(i - 1), "out of order at {i}");
+            i += 1;
+        }
+    }
+
+    /// A stamp of 0 means "no clock" and must never clobber a real one:
+    /// the parity fixture and the legacy entry point both push unstamped.
+    #[test]
+    fn an_unstamped_return_never_clobbers_the_clock() {
+        let mut e = VolEngine::new();
+        e.seed_return(1_000, 1_789_000_000_000);
+        assert_eq!(e.last_min_ts_ms(), 1_789_000_000_000);
+        e.seed_return(1_000, 0);
+        assert_eq!(
+            e.last_min_ts_ms(),
+            1_789_000_000_000,
+            "the unstamped push still counts as a minute, but carries no clock"
+        );
+        assert_eq!(e.minutes(), 2);
     }
 
     #[test]

@@ -157,9 +157,22 @@ pub const ORDER_TTL_NS: u64 = 60_000_000_000;
 /// **an option expiring out of the money is free** — which is why an OTM
 /// expiry here emits no order at all rather than a zero-priced one.
 ///
-/// V8a: `vrp-state.tsv` format version. Bump on any row-shape change;
-/// the parser refuses anything else rather than guessing.
-pub const VRP_STATE_VERSION: u32 = 1;
+/// `vrp-state.tsv` format version. Bump on any row-shape change.
+///
+/// **1 → 2 (W2, 2026-09-11):** added the `R` rows that carry the HAR's
+/// rolling minute returns. Without them `minutes` restarted at zero on
+/// every boot, and the restart lane fires five times a UTC day with a
+/// longest gap of 7 h 35 m against a 24 h warm-up — so the forecast
+/// could never exist and the member could never trade. That is not a
+/// hypothetical: it is what the first live campaign did.
+///
+/// A v2 reader accepts v1 (a file with no `R` rows is simply a cold
+/// window, which is what every v1 file already meant) and REFUSES
+/// anything above 2 rather than guessing at rows it does not know. A v1
+/// reader refuses a v2 file outright, which is the point of the bump —
+/// a binary rolled back below this change must not silently read a
+/// window it cannot account for.
+pub const VRP_STATE_VERSION: u32 = 2;
 
 /// What a [`VrpStrategy::restore_state`] replay put back, for the boot
 /// tell. An operator reading `pairs=0 campaign=false` after a restart
@@ -178,6 +191,12 @@ pub struct VrpRestored {
     pub campaign_resolved: bool,
     /// Kill criterion 3 was already armed before the restart.
     pub killed: bool,
+    /// W2: `R` rows seen. They are validated here and replayed by the
+    /// boot path, so this is what the FILE carried, not what the window
+    /// ended up with — the merge with the worker's seed decides that.
+    pub returns: usize,
+    /// W2: the newest `R` row's minute, ms since the epoch.
+    pub last_return_ts_ms: u64,
 }
 
 /// `side` value for a flat campaign.
@@ -442,6 +461,55 @@ impl VrpStrategy {
         self.vol.seed_pair_at(expiry_ts_ms, x_1e9, y_1e9);
     }
 
+    /// W2: replay the merged rolling window into the forecast. Boot
+    /// path, once, BEFORE any live minute close.
+    ///
+    /// `rows` must be chronological and contiguous — `cli::vrp_boot`
+    /// guarantees both when it reconciles the worker's seed with the
+    /// engine's own last state. Returns how many minutes went in.
+    ///
+    /// This is the whole of the W2 fix. Everything else in this commit
+    /// exists to get a correct `rows` to this call.
+    pub fn seed_returns(&mut self, rows: &[(u64, i64)]) -> usize {
+        let mut i = 0usize;
+        while i < rows.len() {
+            let (ts, r) = rows[i];
+            self.vol.seed_return(r, ts);
+            i += 1;
+        }
+        rows.len()
+    }
+
+    /// W2: minutes in the rolling window right now.
+    #[must_use]
+    pub const fn vol_minutes(&self) -> u64 {
+        self.vol.minutes()
+    }
+
+    /// W2: whether the HAR can forecast at all.
+    ///
+    /// False is the state this member spent its entire first live day
+    /// in without ever saying so — `no_bounds` was the only tell, and it
+    /// is indistinguishable from every other cause. Every boot reports
+    /// this now.
+    #[must_use]
+    pub const fn vol_is_warm(&self) -> bool {
+        self.vol.is_warm()
+    }
+
+    /// W2: minutes still needed before the forecast exists; `0` = warm.
+    #[must_use]
+    pub const fn vol_short_by(&self) -> u64 {
+        core_vol::HAR_WARM_MINUTES.saturating_sub(self.vol.minutes())
+    }
+
+    /// W2: the minute of the newest return in the window, ms since the
+    /// epoch; `0` when nothing stamped has been seen.
+    #[must_use]
+    pub const fn vol_last_min_ts_ms(&self) -> u64 {
+        self.vol.last_min_ts_ms()
+    }
+
     /// The artifact hash this member booted with.
     #[must_use]
     pub const fn hash(&self) -> [u8; 32] {
@@ -529,7 +597,8 @@ impl VrpStrategy {
         out.push_str(
             "# vrp-state.tsv — written by the engine, read at boot. Not for hand editing.\n\
              # V version | P expiry_ts_ms x_1e9 y_1e9 | Q qlike_iv_1e9 qlike_har_1e9\n\
-             # K killed | C expiry_ns strike_1e6 right side opt_qty_1e6 perp_qty_1e6 next_rebalance_ns\n",
+             # K killed | C expiry_ns strike_1e6 right side opt_qty_1e6 perp_qty_1e6 next_rebalance_ns\n\
+             # R min_ts_ms r_1e9 (W2: the HAR's rolling window, oldest first)\n",
         );
         let _ = writeln!(out, "V\t{VRP_STATE_VERSION}");
         if self.killed {
@@ -544,6 +613,23 @@ impl VrpStrategy {
         while let Some((iv, har)) = self.vol.qlike_at(i) {
             let _ = writeln!(out, "Q\t{iv}\t{har}");
             i += 1;
+        }
+        // W2: the rolling window, oldest first — the order
+        // `seed_return` needs them back in. Unstamped returns (the
+        // parity fixture, a unit test) are skipped rather than written
+        // with a 0 stamp: a row the merge cannot place in time is worse
+        // than one fewer minute.
+        let mut m = 0usize;
+        let n_ret = self.vol.n_returns();
+        let last_ts = self.vol.last_min_ts_ms();
+        if last_ts > 0 {
+            let oldest_ts = last_ts.saturating_sub((n_ret.saturating_sub(1)) as u64 * 60_000);
+            while m < n_ret {
+                if let Some(r) = self.vol.ret_chrono(m) {
+                    let _ = writeln!(out, "R\t{}\t{r}", oldest_ts + m as u64 * 60_000);
+                }
+                m += 1;
+            }
         }
         if self.selected_sym != SYMBOL_ID_NONE {
             let _ = writeln!(
@@ -596,10 +682,34 @@ impl VrpStrategy {
             };
             match tag {
                 "V" => {
-                    if num(f.next())? != i64::from(VRP_STATE_VERSION) {
-                        return Err("vrp state: unknown version");
+                    // Accept anything this binary fully understands and
+                    // refuse what it does not. A v1 file has no `R`
+                    // rows, which is exactly the cold window v1 always
+                    // meant — readable. A v3 file has rows this code has
+                    // never seen, and reading it would mean guessing.
+                    let v = num(f.next())?;
+                    if v < 1 || v > i64::from(VRP_STATE_VERSION) {
+                        return Err("vrp state: unsupported version");
                     }
                     seen_version = true;
+                }
+                // W2: validated and COUNTED here, replayed by the boot
+                // path. The rolling window is the one thing with two
+                // sources — this file and the worker's seed — and
+                // reconciling them needs both series in hand before any
+                // of them is pushed, which a line-at-a-time parser
+                // cannot do. `cli::vrp_boot` owns that merge.
+                "R" => {
+                    let ts = num(f.next())?;
+                    let _r = num(f.next())?;
+                    if ts <= 0 {
+                        return Err("vrp state: return min_ts_ms must be > 0");
+                    }
+                    if ts <= st.last_return_ts_ms as i64 && st.last_return_ts_ms != 0 {
+                        return Err("vrp state: return rows must increase in min_ts_ms");
+                    }
+                    st.last_return_ts_ms = ts as u64;
+                    st.returns += 1;
                 }
                 "K" => {
                     if num(f.next())? != 0 {
@@ -1321,8 +1431,22 @@ impl Strategy for VrpStrategy {
                 // The CLOSE of a minute is its last mid, so the roll
                 // publishes the value carried across the boundary, not
                 // the first quote of the new minute.
-                self.vol.on_minute_close(self.last_underlying_mid_1e6);
+                // W2: stamped, so the close can be written to
+                // `vrp-state.tsv` and lined up against the worker's
+                // seed at the next boot. `minute_id` is the minute
+                // that just CLOSED, not the one opening.
+                self.vol.on_minute_close_at(
+                    self.last_underlying_mid_1e6,
+                    self.minute_id.saturating_mul(MINUTE_NS / 1_000_000),
+                );
                 self.minute_id = minute;
+                // W2: the window CHANGED, so the state file has to be
+                // rewritten. Without this the `R` rows would only ever
+                // be persisted when a campaign happened to move the
+                // epoch — which is a few times a day at most, and would
+                // have left the whole fix inert. Once a minute, on the
+                // observability cadence, off the tick path.
+                self.bump_state();
             }
             self.last_underlying_mid_1e6 = mid;
             self.last_underlying_wall_ns = wall_ns;
@@ -2299,10 +2423,15 @@ mod tests {
         // Push the forecast forward so there is a QLIKE row too.
         let mut text = String::new();
         assert!(m.render_state(&mut text));
-        assert!(text.contains("V\t1"), "{text}");
+        assert!(text.contains("V\t2"), "{text}");
 
         let mut boot = fresh_member(&mut ctx);
         let r = boot.restore_state(&text).expect("restores");
+        // W2: `restore_state` validates and COUNTS the `R` rows; the
+        // boot path replays them, because the rolling window is the one
+        // thing with two sources and reconciling them needs both series
+        // in hand. A round trip therefore has to do what the boot does.
+        assert_eq!(boot.seed_returns(&r_rows(&text)), r.returns);
         assert!(r.campaign, "the campaign came back");
         assert!(r.campaign_resolved, "and the chain still carries it");
         assert_eq!(r.pairs, m.n_pairs());
@@ -2441,7 +2570,8 @@ mod tests {
         let mut ctx = RecCtx::new();
         for bad in [
             "P\t1\t2\t3\n",                              // no version row
-            "V\t2\n",                                      // a version we do not know
+            "V\t3\n",                                      // a version we do not know
+            "V\t0\n",                                      // nor is 0 a version
             "V\t1\nZ\t1\n",                               // an unknown tag
             "V\t1\nP\t1\t2\n",                           // a short pair row
             "V\t1\nP\t1\tx\t3\n",                       // not an integer
@@ -2469,21 +2599,52 @@ mod tests {
 
     #[test]
     fn the_state_epoch_moves_only_when_something_persistable_happens() {
-        // The cli writes the file when this moves and never otherwise,
-        // so a quiet engine writes nothing at all.
+        // The cli writes the file when this moves and never otherwise.
+        //
+        // W2 CHANGED THIS LAW, deliberately. A minute close is now
+        // persistable, because the rolling window is persisted state —
+        // if the epoch stayed put through a minute roll, the `R` rows
+        // would only ever reach disk when a campaign happened to move
+        // it, which is a few times a day, and the whole warm-up fix
+        // would be inert. The write is once a minute on the
+        // observability cadence, off the tick path.
         let mut ctx = RecCtx::new();
         let params = VrpParams::default();
         let (mut m, mut wall) = member(&mut ctx, params);
+        // `member` leaves `wall` one minute past its last tick, so the
+        // first tick here closes that minute. Absorb it, THEN measure.
+        m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
         let quiet = m.state_epoch();
-        // A thousand ordinary ticks: the forecast ingests, nothing
-        // persistable changes.
+        // Many ticks INSIDE one minute are still not state.
         let mut i = 0usize;
-        while i < 1_000 {
-            m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
-            wall += MINUTE_NS;
+        while i < 100 {
+            m.on_tick(&tick(wall, 79_000_000_000 + i as i64, false), &mut ctx);
             i += 1;
         }
-        assert_eq!(m.state_epoch(), quiet, "ticks alone are not state");
+        assert_eq!(m.state_epoch(), quiet, "ticks inside a minute are not state");
+
+        // Crossing a minute boundary IS.
+        let before_minutes = m.vol_minutes();
+        wall += MINUTE_NS;
+        m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.vol_minutes(), before_minutes + 1, "a return was pushed");
+        assert!(m.state_epoch() > quiet, "a minute close is state (W2)");
+        let quiet = m.state_epoch();
+
+        // Advance FIRST, so every one of these ticks crosses a
+        // boundary and the count is exact.
+        let mut i = 0usize;
+        while i < 1_000 {
+            wall += MINUTE_NS;
+            m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+            i += 1;
+        }
+        assert_eq!(
+            m.state_epoch(),
+            quiet + 1_000,
+            "exactly one epoch per minute closed — no more, no less"
+        );
+        let quiet = m.state_epoch();
 
         // Selecting IS.
         let sel = EXPIRY - TAU - params.selection_ns / 2;
@@ -2497,6 +2658,144 @@ mod tests {
         ctx.now = mono_of(entry);
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
         assert!(m.state_epoch() > after_select + 1, "entry AND hedge");
+    }
+
+
+    // ---------------------------------------------------------------
+    // W2 — the rolling window has to survive a restart
+    // ---------------------------------------------------------------
+
+    /// Pull the `R` rows back out of a rendered state file, the way
+    /// `cli::vrp_boot` does through `core_config::vrp::parse_returns`.
+    /// Spelled out here so this crate stays free of that dependency.
+    fn r_rows(text: &str) -> Vec<(u64, i64)> {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let mut f = line.split('\t');
+            if f.next() != Some("R") {
+                continue;
+            }
+            let ts: u64 = f.next().expect("ts").parse().expect("ts int");
+            let r: i64 = f.next().expect("r").parse().expect("r int");
+            assert!(f.next().is_none(), "an R row has exactly two fields");
+            out.push((ts, r));
+        }
+        out
+    }
+
+    /// THE W2 test. Warm a member the slow way, write its state, and
+    /// boot a fresh one from it — the second member is warm IMMEDIATELY,
+    /// with the same forecast.
+    ///
+    /// Before W2 the second member started at `minutes = 0` against a
+    /// 24 h warm-up, and the restart lane never left it 24 h. That is
+    /// not a hypothetical: it is exactly what the 2026-09-11 campaign
+    /// did — `decisions=1 entries=0 holds=0 no_bounds=1`.
+    #[test]
+    fn a_restart_keeps_the_forecast_warm() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, mut wall) = member(&mut ctx, params);
+
+        let mut px = 79_000_000_000i64;
+        let mut s = 20_260_911i64;
+        let mut i = 0usize;
+        while i < 1_500 {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+            m.on_tick(&tick(wall, px, false), &mut ctx);
+            wall += MINUTE_NS;
+            i += 1;
+        }
+        assert!(m.vol_is_warm(), "the slow way works — it just takes 24 h");
+        assert_eq!(m.vol_short_by(), 0);
+
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+        let rows = r_rows(&text);
+        // RETAINED, not observed: the ring holds MINUTE_RING at most,
+        // and `member()` already walked it past that before this test
+        // added 1_500 more.
+        assert_eq!(rows.len(), core_vol::MINUTE_RING, "every retained minute");
+        assert!(m.vol_minutes() as usize > rows.len(), "the ring wrapped");
+        // Stamped and contiguous — the merge depends on both.
+        let mut j = 1usize;
+        while j < rows.len() {
+            assert_eq!(rows[j].0 - rows[j - 1].0, 60_000, "contiguous at row {j}");
+            j += 1;
+        }
+        assert_eq!(rows[rows.len() - 1].0, m.vol_last_min_ts_ms());
+
+        // The restart. `fresh_member` is what a boot actually looks
+        // like: configured, and knowing nothing.
+        let mut boot = fresh_member(&mut ctx);
+        assert!(!boot.vol_is_warm(), "a fresh member is cold — that is the defect");
+        assert_eq!(boot.vol_short_by(), core_vol::HAR_WARM_MINUTES);
+
+        let restored = boot.restore_state(&text).expect("restores");
+        assert_eq!(restored.returns, rows.len(), "counted, not replayed");
+        assert!(!boot.vol_is_warm(), "restore_state does NOT replay them");
+        assert_eq!(boot.seed_returns(&rows), rows.len());
+
+        assert!(boot.vol_is_warm(), "warm on the FIRST tick after a restart");
+        // The restored member has only what the ring carried, which is
+        // the point: the forecast reads at most the last 1440 returns,
+        // so a wrapped ring is a COMPLETE restore of everything that
+        // can affect it.
+        assert_eq!(boot.vol_minutes() as usize, rows.len());
+        assert_eq!(boot.vol_last_min_ts_ms(), m.vol_last_min_ts_ms());
+        // And it is the same forecast, not merely a warm one.
+        assert_eq!(
+            boot.vol.har_1e9(params.tau_ns),
+            m.vol.har_1e9(params.tau_ns),
+            "identical forecast"
+        );
+        assert_eq!(
+            boot.vol.x_1e9(params.tau_ns),
+            m.vol.x_1e9(params.tau_ns),
+            "identical regressor"
+        );
+    }
+
+    /// A v1 file — every file written before 2026-09-11 — still loads.
+    /// It simply carries no window, which is what v1 always meant.
+    #[test]
+    fn a_v1_state_file_still_loads_as_a_cold_window() {
+        let mut ctx = RecCtx::new();
+        let mut m = fresh_member(&mut ctx);
+        let r = m
+            .restore_state("V\t1\nP\t1789000000000\t1000\t2000\n")
+            .expect("v1 is readable");
+        assert_eq!(r.pairs, 1);
+        assert_eq!(r.returns, 0);
+        assert!(!m.vol_is_warm());
+    }
+
+    /// A file from a FUTURE writer is refused rather than half-read.
+    /// That is the whole reason the version moved: a binary rolled back
+    /// below W2 must not silently read a window it cannot account for.
+    #[test]
+    fn a_future_state_version_is_refused() {
+        let mut ctx = RecCtx::new();
+        let mut m = fresh_member(&mut ctx);
+        assert!(m.restore_state("V\t3\n").is_err(), "v3 is not readable here");
+        assert!(m.restore_state("V\t0\n").is_err(), "nor is a nonsense version");
+        assert!(m.restore_state("V\t2\n").is_ok(), "v2 is this binary's own");
+    }
+
+    /// Out-of-order `R` rows are refused. The ring's eviction arm
+    /// assumes chronological order, so a shuffled file does not produce
+    /// a cosmetically odd window — it produces a DIFFERENT one, quietly.
+    #[test]
+    fn out_of_order_returns_are_refused() {
+        let mut ctx = RecCtx::new();
+        let mut m = fresh_member(&mut ctx);
+        assert!(m
+            .restore_state("V\t2\nR\t1789000060000\t10\nR\t1789000000000\t20\n")
+            .is_err());
+        assert!(m.restore_state("V\t2\nR\t0\t10\n").is_err(), "a 0 stamp is not a minute");
     }
 
     #[test]
