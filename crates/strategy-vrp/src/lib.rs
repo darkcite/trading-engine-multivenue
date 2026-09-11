@@ -166,13 +166,21 @@ pub const ORDER_TTL_NS: u64 = 60_000_000_000;
 /// could never exist and the member could never trade. That is not a
 /// hypothetical: it is what the first live campaign did.
 ///
-/// A v2 reader accepts v1 (a file with no `R` rows is simply a cold
-/// window, which is what every v1 file already meant) and REFUSES
-/// anything above 2 rather than guessing at rows it does not know. A v1
-/// reader refuses a v2 file outright, which is the point of the bump —
-/// a binary rolled back below this change must not silently read a
-/// window it cannot account for.
-pub const VRP_STATE_VERSION: u32 = 2;
+/// **2 → 3 (W6, 2026-09-11):** the `C` row gained an eighth field,
+/// `entry_done`. It had been DERIVED from `opt_qty != 0`, so a campaign
+/// that decided and HELD left nothing to restore and the next boot
+/// decided it again. On 2026-09-11 that put on a live position at
+/// 06:01Z against an 08:00Z expiry — a 1 h 56 m hold gated by an 8 h
+/// forecast.
+///
+/// A reader accepts every version at or below its own and REFUSES
+/// anything above it rather than guessing at rows it does not know. A
+/// v2 `C` row (seven fields) still loads, with `entry_done` derived as
+/// v2 meant it; a v1 file has no `R` rows and is simply a cold window,
+/// which is what v1 always meant. An older binary refuses a newer file
+/// outright, which is the point of the bump — a binary rolled back
+/// below a change must not silently read state it cannot account for.
+pub const VRP_STATE_VERSION: u32 = 3;
 
 /// What a [`VrpStrategy::restore_state`] replay put back, for the boot
 /// tell. An operator reading `pairs=0 campaign=false` after a restart
@@ -598,7 +606,8 @@ impl VrpStrategy {
             "# vrp-state.tsv — written by the engine, read at boot. Not for hand editing.\n\
              # V version | P expiry_ts_ms x_1e9 y_1e9 | Q qlike_iv_1e9 qlike_har_1e9\n\
              # K killed | C expiry_ns strike_1e6 right side opt_qty_1e6 perp_qty_1e6 next_rebalance_ns\n\
-             # R min_ts_ms r_1e9 (W2: the HAR's rolling window, oldest first)\n",
+             # R min_ts_ms r_1e9 (W2: the HAR's rolling window, oldest first)\n\
+             # C gained an 8th field, entry_done, in v3 (W6).\n",
         );
         let _ = writeln!(out, "V\t{VRP_STATE_VERSION}");
         if self.killed {
@@ -634,14 +643,15 @@ impl VrpStrategy {
         if self.selected_sym != SYMBOL_ID_NONE {
             let _ = writeln!(
                 out,
-                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 self.expiry_ns,
                 self.selected_strike_1e6,
                 self.selected_right,
                 self.side,
                 self.opt_pos_qty_1e6,
                 self.perp_pos_qty_1e6,
-                self.next_rebalance_wall_ns
+                self.next_rebalance_wall_ns,
+                u8::from(self.entry_done)
             );
         }
         true
@@ -742,6 +752,19 @@ impl VrpStrategy {
                     let opt_qty = num(f.next())?;
                     let perp_qty = num(f.next())?;
                     let next_reb = num(f.next())?;
+                    // W6: eighth field. ABSENT on a v2 row, where it
+                    // was derived — and that derivation is exactly the
+                    // defect, because a campaign that decided and HELD
+                    // has no position to derive it from.
+                    let entry_done = match f.next() {
+                        Some(s) => {
+                            s.trim()
+                                .parse::<i64>()
+                                .map_err(|_| "vrp state: not an integer")?
+                                != 0
+                        }
+                        None => opt_qty != 0,
+                    };
                     if expiry_ns <= 0 || strike <= 0 {
                         return Err("vrp state: campaign expiry/strike must be positive");
                     }
@@ -758,7 +781,7 @@ impl VrpStrategy {
                     self.opt_pos_qty_1e6 = opt_qty;
                     self.perp_pos_qty_1e6 = perp_qty;
                     self.next_rebalance_wall_ns = next_reb.max(0) as u64;
-                    self.entry_done = opt_qty != 0;
+                    self.entry_done = entry_done;
                     self.selected_sym = self.find_contract(self.expiry_ns, strike, right as u8);
                     st.campaign = true;
                     st.campaign_resolved = self.selected_sym != SYMBOL_ID_NONE;
@@ -1013,6 +1036,16 @@ impl VrpStrategy {
         true
     }
 
+    /// W6: the last instant at which this campaign's decision is still
+    /// the trade the forecast describes. `E − τ + selection`.
+    #[inline]
+    #[must_use]
+    fn entry_deadline_ns(&self) -> u64 {
+        self.expiry_ns
+            .saturating_sub(self.params.tau_ns)
+            .saturating_add(self.params.selection_ns)
+    }
+
     /// The best index this member can stand behind right now: whichever
     /// of its two sources is FRESHER — the last option record's own
     /// `underlying_px_1e9`, or the last fresh mid of the underlying's
@@ -1260,6 +1293,25 @@ impl VrpStrategy {
         }
         if wall_ns + self.params.tau_ns < self.expiry_ns {
             return; // not yet at the entry instant
+        }
+        // W6: and not LATE. `τ` is not a start line, it is the HORIZON
+        // — `bounds` is a variance forecast for a τ-long hold and the
+        // edge was measured on one. Coming back from a restart with two
+        // hours left and entering on an eight-hour forecast is a
+        // different trade wearing the same gate.
+        //
+        // The grace is the selection window, so the decision band
+        // `[E−τ, E−τ+selection]` mirrors the selection band that ends
+        // at `E−τ`. A restart takes 10–40 s; ten minutes is room for
+        // several.
+        if wall_ns > self.entry_deadline_ns() {
+            // The campaign's one decision is SPENT, not deferred: left
+            // undecided it would be retried on every record until
+            // expiry, and each retry is the same wrong trade.
+            self.entry_done = true;
+            self.counters.decisions_late = self.counters.decisions_late.wrapping_add(1);
+            self.bump_state();
+            return;
         }
         // One decision per campaign, whatever it decides.
         self.entry_done = true;
@@ -2423,7 +2475,7 @@ mod tests {
         // Push the forecast forward so there is a QLIKE row too.
         let mut text = String::new();
         assert!(m.render_state(&mut text));
-        assert!(text.contains("V\t2"), "{text}");
+        assert!(text.contains("V\t3"), "{text}");
 
         let mut boot = fresh_member(&mut ctx);
         let r = boot.restore_state(&text).expect("restores");
@@ -2570,7 +2622,7 @@ mod tests {
         let mut ctx = RecCtx::new();
         for bad in [
             "P\t1\t2\t3\n",                              // no version row
-            "V\t3\n",                                      // a version we do not know
+            "V\t4\n",                                      // a version we do not know
             "V\t0\n",                                      // nor is 0 a version
             "V\t1\nZ\t1\n",                               // an unknown tag
             "V\t1\nP\t1\t2\n",                           // a short pair row
@@ -2683,6 +2735,100 @@ mod tests {
         out
     }
 
+    // ---------------------------------------------------------------
+    // W6 — a decision is spent once, and only near E−τ
+    // ---------------------------------------------------------------
+
+    /// A campaign whose decision instant is reached LATE is spent
+    /// unused, not taken.
+    ///
+    /// `τ` is the horizon, not a start line: `bounds` is a variance
+    /// forecast for a τ-long hold and the edge was measured on one.
+    /// On 2026-09-11 a restart re-reached this campaign at 06:01Z
+    /// against an 08:00Z expiry and entered — a 1 h 56 m hold gated by
+    /// an 8 h forecast.
+    #[test]
+    fn a_late_decision_is_spent_not_taken() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+
+        // Select inside the proper window.
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        assert_ne!(m.selected_sym(), SYMBOL_ID_NONE, "selected");
+
+        // Then come back one second past the deadline.
+        let late = EXPIRY - TAU + params.selection_ns + 1_000_000_000;
+        ctx.now = mono_of(late);
+        let orders_before = ctx.orders.len();
+        m.on_opt_summary(&summary(late, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+
+        assert_eq!(m.vrp_counters().decisions_late, 1, "counted as late");
+        assert_eq!(m.vrp_counters().decisions, 0, "and never decided");
+        assert_eq!(m.vrp_counters().entries, 0, "no position on a stale horizon");
+        assert_eq!(ctx.orders.len(), orders_before, "and no order at all");
+
+        // SPENT, not deferred: further records must not retry it, or
+        // every one of them is the same wrong trade.
+        let later = late + 60_000_000_000;
+        ctx.now = mono_of(later);
+        m.on_opt_summary(&summary(later, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().decisions_late, 1, "counted once, not per record");
+        assert_eq!(m.vrp_counters().entries, 0);
+    }
+
+    /// Just inside the deadline still trades — the bound is a grace
+    /// window for a restart, not a new refusal.
+    #[test]
+    fn a_decision_just_inside_the_deadline_is_still_taken() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+
+        let edge = EXPIRY - TAU + params.selection_ns;
+        ctx.now = mono_of(edge);
+        m.on_opt_summary(&summary(edge, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().decisions_late, 0, "on the line is inside it");
+        assert_eq!(m.vrp_counters().decisions, 1, "and it decided");
+    }
+
+    /// THE W6 state test. A campaign that decided and HELD carries no
+    /// position, so v2 had nothing to derive `entry_done` from and the
+    /// next boot decided it all over again. v3 persists the flag.
+    #[test]
+    fn a_spent_decision_survives_a_restart() {
+        let mut ctx = RecCtx::new();
+        // A held campaign: selected, decided, no position.
+        let v3 = format!("V\t3\nC\t{EXPIRY}\t79000000000\t0\t0\t0\t0\t0\t1\n");
+        let mut m = fresh_member(&mut ctx);
+        let r = m.restore_state(&v3).expect("restores");
+        assert!(r.campaign);
+
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().decisions, 0, "the decision was already spent");
+        assert_eq!(m.vrp_counters().entries, 0, "so no position is opened");
+
+        // The v2 shape — seven fields, flag derived — is what produced
+        // the live defect, and it still loads for readability.
+        let v2 = format!("V\t2\nC\t{EXPIRY}\t79000000000\t0\t0\t0\t0\t0\n");
+        let mut old = fresh_member(&mut ctx);
+        old.restore_state(&v2).expect("v2 still readable");
+        ctx.now = mono_of(entry);
+        old.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(
+            old.vrp_counters().decisions,
+            1,
+            "v2 re-decides — this is the defect v3 exists to end"
+        );
+    }
+
     /// THE W2 test. Warm a member the slow way, write its state, and
     /// boot a fresh one from it — the second member is warm IMMEDIATELY,
     /// with the same forecast.
@@ -2780,9 +2926,10 @@ mod tests {
     fn a_future_state_version_is_refused() {
         let mut ctx = RecCtx::new();
         let mut m = fresh_member(&mut ctx);
-        assert!(m.restore_state("V\t3\n").is_err(), "v3 is not readable here");
+        assert!(m.restore_state("V\t4\n").is_err(), "v4 is not readable here");
         assert!(m.restore_state("V\t0\n").is_err(), "nor is a nonsense version");
-        assert!(m.restore_state("V\t2\n").is_ok(), "v2 is this binary's own");
+        assert!(m.restore_state("V\t3\n").is_ok(), "v3 is this binary's own");
+        assert!(m.restore_state("V\t2\n").is_ok(), "and it still reads v2");
     }
 
     /// Out-of-order `R` rows are refused. The ring's eviction arm
@@ -2793,9 +2940,9 @@ mod tests {
         let mut ctx = RecCtx::new();
         let mut m = fresh_member(&mut ctx);
         assert!(m
-            .restore_state("V\t2\nR\t1789000060000\t10\nR\t1789000000000\t20\n")
+            .restore_state("V\t3\nR\t1789000060000\t10\nR\t1789000000000\t20\n")
             .is_err());
-        assert!(m.restore_state("V\t2\nR\t0\t10\n").is_err(), "a 0 stamp is not a minute");
+        assert!(m.restore_state("V\t3\nR\t0\t10\n").is_err(), "a 0 stamp is not a minute");
     }
 
     #[test]

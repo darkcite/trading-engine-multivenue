@@ -403,7 +403,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="lane", required=True)
     out = sub.add_parser("seed-out", help="cut vrp-seed.tsv from candles.db")
     out.add_argument("--db", required=True, type=pathlib.Path)
-    out.add_argument("--descriptor", required=True)
+    # W7: exactly one of these. `--vrp` reads the descriptor and tenor
+    # from vrp.toml, which is the engine's own source of truth -- the
+    # hourly cut must not carry a second copy that can drift from it
+    # (switching the member to ETH is one edit to that file, and a
+    # hardcoded descriptor here would silently keep seeding BTC).
+    out.add_argument("--descriptor", default=None)
+    out.add_argument("--vrp", type=pathlib.Path, default=None)
     out.add_argument("--out", required=True, type=pathlib.Path)
     out.add_argument("--tau-ns", type=int, default=claude_worker.vol_ref.TAU_8H_NS)
     out.add_argument("--pairs", type=int, default=PAIRS_DEFAULT)
@@ -411,7 +417,17 @@ def main(argv: list[str] | None = None) -> int:
     out.add_argument("--now-ms", type=int, default=None)
     args = ap.parse_args(argv)
 
-    spec = CutSpec(args.descriptor, args.tau_ns, args.pairs, args.window_minutes)
+    if (args.descriptor is None) == (args.vrp is None):
+        print(
+            "vrp-seed: pass exactly one of --descriptor or --vrp",
+            file=sys.stderr,
+        )
+        return 2
+    if args.vrp is not None:
+        descriptor, tau_ns = read_vrp_toml(args.vrp)
+    else:
+        descriptor, tau_ns = args.descriptor, args.tau_ns
+    spec = CutSpec(descriptor, tau_ns, args.pairs, args.window_minutes)
     n, stats = seed_out(args.db, spec, args.out, args.now_ms)
     print(
         f"vrp-seed: {n} pair(s) + {stats.window_minutes} window minute(s) -> {args.out} "

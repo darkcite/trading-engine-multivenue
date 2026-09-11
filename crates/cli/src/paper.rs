@@ -3729,6 +3729,8 @@ fn register_vm_metrics(
 pub struct VrpMetricIds {
     /// `engine_vrp_decisions_total`
     pub decisions: core_metrics::CounterId,
+    /// `engine_vrp_decisions_late_total`
+    pub decisions_late: core_metrics::CounterId,
     /// `engine_vrp_entries_total`
     pub entries: core_metrics::CounterId,
     /// `engine_vrp_hedges_total`
@@ -3781,6 +3783,7 @@ fn register_vrp_metrics(
             .map_err(|_| "register vrp counter")
     };
     let decisions = one("engine_vrp_decisions_total")?;
+    let decisions_late = one("engine_vrp_decisions_late_total")?;
     let entries = one("engine_vrp_entries_total")?;
     let hedges = one("engine_vrp_hedges_total")?;
     let exits = one("engine_vrp_exits_total")?;
@@ -3800,6 +3803,7 @@ fn register_vrp_metrics(
     };
     Ok(VrpMetricIds {
         decisions,
+        decisions_late,
         entries,
         hedges,
         exits,
@@ -3865,6 +3869,8 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
     let cur = strat.vrp_counters();
     reg.counter(ids.decisions)
         .inc(cur.decisions.saturating_sub(last.decisions));
+    reg.counter(ids.decisions_late)
+        .inc(cur.decisions_late.saturating_sub(last.decisions_late));
     reg.counter(ids.entries)
         .inc(cur.entries.saturating_sub(last.entries));
     reg.counter(ids.hedges)

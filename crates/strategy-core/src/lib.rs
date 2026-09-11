@@ -578,6 +578,17 @@ pub struct VrpCounters {
     /// of every day and is not counted at all. A rising value here is a
     /// chain problem, not a quiet market.
     pub no_selection: u64,
+    /// W6: campaigns whose decision instant was reached too LATE to
+    /// act on — the engine was down across `E−τ` and came back with
+    /// less of the hold left than the forecast was made over.
+    ///
+    /// `τ` is not a start line, it is the horizon: the bounds are a
+    /// variance forecast for a τ-long hold, and the edge was measured
+    /// on one. Entering an hour before expiry on an eight-hour forecast
+    /// is a different trade wearing the same gate, so the campaign is
+    /// spent unused and counted here instead. Non-zero means a restart
+    /// straddled a decision instant.
+    pub decisions_late: u64,
     /// Decisions refused because the member's regime gate was closed.
     pub regime_blocked: u64,
     /// Campaigns flattened early by a hard-closed gate.

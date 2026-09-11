@@ -376,3 +376,62 @@ def test_the_cut_window_is_long_enough_to_boot_warm(tmp_path: pathlib.Path) -> N
     finally:
         conn.close()
     assert len(rows) >= claude_worker.vol_ref.HAR_WARM_MINUTES
+
+
+def test_seed_out_takes_the_descriptor_from_vrp_toml(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W7: the hourly cut reads vrp.toml rather than carrying a copy.
+
+    Switching the member to another currency is one edit to that file
+    (the V8b law). A descriptor hardcoded in the cron would keep seeding
+    the old one, and the engine would boot warm on a window belonging to
+    an instrument it no longer trades.
+    """
+    first = 1_789_000_000_000
+    db = tmp_path / "candles.db"
+    _make_db(db, "deribit:ETH-PERPETUAL", first, _tape(200))
+    vrp = tmp_path / "vrp.toml"
+    vrp.write_text(
+        "[vrp]\n"
+        'underlying_descriptor = "deribit:ETH-PERPETUAL"\n'
+        'hedge_descriptor = "deribit:ETH-PERPETUAL"\n'
+        "tau_ns = 28800000000000\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "vrp-seed.tsv"
+    rc = claude_worker.vrp_seed.main(
+        [
+            "seed-out",
+            "--db",
+            str(db),
+            "--vrp",
+            str(vrp),
+            "--out",
+            str(out),
+            "--now-ms",
+            str(first + 200 * _MINUTE_MS),
+        ]
+    )
+    assert rc == 0
+    body = out.read_text(encoding="utf-8")
+    assert f"V\t{claude_worker.vrp_seed.SEED_VERSION}" in body
+    assert body.count("\nR\t") == 199, "the ETH window was cut, N-1 returns"
+
+
+def test_seed_out_refuses_both_or_neither_source(tmp_path: pathlib.Path) -> None:
+    """Exactly one of --descriptor / --vrp, so there is one source."""
+    db = tmp_path / "candles.db"
+    _make_db(db, "d", 1_789_000_000_000, _tape(10))
+    out = tmp_path / "vrp-seed.tsv"
+    assert claude_worker.vrp_seed.main(["seed-out", "--db", str(db), "--out", str(out)]) == 2
+    vrp = tmp_path / "vrp.toml"
+    vrp.write_text(
+        '[vrp]\nunderlying_descriptor = "d"\ntau_ns = 28800000000000\n', encoding="utf-8"
+    )
+    assert (
+        claude_worker.vrp_seed.main(
+            ["seed-out", "--db", str(db), "--out", str(out), "--descriptor", "d", "--vrp", str(vrp)]
+        )
+        == 2
+    )

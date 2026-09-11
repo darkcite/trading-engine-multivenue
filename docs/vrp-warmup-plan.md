@@ -137,3 +137,20 @@ the perp tape produces ONE close, not the several the wall clock passed.
 That predates this plan and changes the measured edge's input if
 touched, so it stays — recorded here so the next reader does not mistake
 it for part of the fix.
+
+## 9. W6–W7 (2026-09-11, after the first live trade)
+
+The warm-up fix worked and the member traded the same day — but from a
+re-decide, not from its own decision instant. `entry_done` was derived
+from the position, so a campaign that decided and HELD left nothing to
+restore, and the 06:01Z restart decided it again: short the $76,500 call
+1 h 56 m before expiry on an 8 h forecast.
+
+| # | What |
+|---|---|
+| **W6** | `C` row gains `entry_done` (state v3); `decide` bounded to `[E−τ, E−τ+selection]`; a late campaign is SPENT and counted in `engine_vrp_decisions_late_total`. |
+| **W7** | `candles-cycle.sh` cuts `vrp-seed.tsv` hourly; `seed-out --vrp` reads the descriptor from `vrp.toml` so the cron carries no second copy. |
+
+Still open: the ruling-3 sweep for other members holding process-local
+state that assumes more uptime than the gap between restart slots, and
+an operator ALERT on `engine_vrp_killed`.

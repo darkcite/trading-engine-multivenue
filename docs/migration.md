@@ -6,6 +6,60 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-11 — `vrp-state.tsv` v2 → v3: a decision is spent once (W6–W7)
+
+**What changed**
+
+- `VRP_STATE_VERSION` 2 → **3**. The `C` row gained an eighth field,
+  `entry_done`. A v2 row (seven fields) still loads, with the flag derived
+  from `opt_qty != 0` exactly as v2 meant it.
+- `decide` now refuses a LATE decision: the band is `[E−τ, E−τ+selection]`,
+  mirroring the selection band that ends at `E−τ`. A campaign reached past
+  the deadline is SPENT — marked decided, counted, never retried.
+- New counter and metric: `engine_vrp_decisions_late_total`.
+- **W7:** `scripts/candles-cycle.sh` now cuts `vrp-seed.tsv` hourly, and
+  `vrp_seed seed-out` gained `--vrp <path>` so the descriptor and tenor come
+  from `vrp.toml` rather than a second copy in the cron.
+
+**Why — this one traded**
+
+`entry_done` was derived from the position, so a campaign that decided and
+HELD left nothing to derive it from and the next boot decided it again. At
+06:01Z on 2026-09-11 a restart re-reached the `BTC-11SEP26` campaign and
+entered: short one $76,500 call, hedged long 0.975 BTC of perp, **1 h 56 m
+before an 08:00Z expiry, gated and sized by an 8 h variance forecast.**
+
+`τ` is the horizon, not a start line. `bounds` forecasts variance over a
+τ-long hold and the edge was measured on one, so an entry taken hours late
+is a different trade wearing the same gate. Both halves are needed: the
+persisted flag stops a restart re-deciding, the deadline stops a boot that
+first reaches the campaign late from entering at all.
+
+This was called out as "minor, not harmful" when the re-decide was first
+noticed on 2026-09-10. That was wrong, and it put on a live position.
+
+**Ripple effects**
+
+- A v2 binary refuses a v3 state file — the point of the bump. A v3 binary
+  reads v1, v2 and v3.
+- `engine_vrp_decisions_late_total > 0` means a restart straddled a decision
+  instant and that day's campaign was skipped. Expected to stay 0 now that
+  the day-boundary restart moved to 00:10.
+- The hourly seed cut bounds seed staleness to an hour. It matters only when
+  `vrp-state.tsv` is lost — with the state file intact the window carries
+  itself across restarts — but in that case a stale seed boots the member
+  WARM on old returns, and nothing refuses it.
+
+**Migration steps**
+
+1. Rebuild and install; restart. The next state write is v3.
+2. No action for the seed — the hourly cycle now keeps it current.
+
+**Rollback**
+
+- Revert and delete `vrp-state.tsv` (a v2 binary refuses a v3 file). The
+  member then boots cold and re-seeds from `vrp-seed.tsv`.
+
 ## 2026-09-11 — `vrp-state.tsv` v1 → v2 and `vrp-seed.tsv` v1 → v2 (W1–W5)
 
 **What changed**

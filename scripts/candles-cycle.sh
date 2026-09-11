@@ -33,6 +33,22 @@ fi
 cd claude-worker || exit 78
 uv run python -m claude_worker.candles ||
   echo "candles-cycle: candles failed (non-fatal; next hour retries)" >&2
+# W7 (2026-09-11): the VRP boot seed rides the same serialized window,
+# immediately after the gap-fill so it cuts the freshest candles.
+#
+# It used to be cut BY HAND only. The engine's own vrp-state.tsv carries
+# the rolling window across a restart, so a stale seed costs nothing
+# while that file survives -- but lose it (a fresh machine, a wiped
+# state dir) and the member boots WARM on whatever the seed last held,
+# forecasting today's vol from however old those returns are. Nothing
+# refuses that; only `last_min_ts_ms` in the boot tell reveals it.
+# Hourly bounds the exposure to an hour. Atomic (tmp + rename), so a
+# boot never reads a torn file.
+uv run python -m claude_worker.vrp_seed seed-out \
+  --db "$HOME/multivenue/worker/candles.db" \
+  --vrp "$HOME/multivenue/vrp.toml" \
+  --out "$HOME/multivenue/vrp-seed.tsv" ||
+  echo "candles-cycle: vrp_seed failed (non-fatal; next hour retries)" >&2
 # D3: the IV digest rides the same serialized window.
 uv run python -m claude_worker.iv_digest ||
   echo "candles-cycle: iv_digest failed (non-fatal; next hour retries)" >&2
