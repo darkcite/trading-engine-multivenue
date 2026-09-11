@@ -101,6 +101,7 @@ pub enum OkxDiscoveryErr {
 pub struct OkxDiscovery {
     rows: Vec<OkxInstrumentRow>,
     universe_live: u32,
+    universe_nameless: u32,
 }
 
 impl OkxDiscovery {
@@ -109,6 +110,7 @@ impl OkxDiscovery {
         Self {
             rows: Vec::with_capacity(OKX_DISCOVERY_ROWS_CAP),
             universe_live: 0,
+            universe_nameless: 0,
         }
     }
 
@@ -156,14 +158,22 @@ impl OkxDiscovery {
                 b']' => break,
                 b'{' => {
                     let (row, end) = parse_row(body, i, mode)?;
-                    if self.rows.len() >= OKX_DISCOVERY_ROWS_CAP {
-                        return Err(OkxDiscoveryErr::TooMany);
+                    match row {
+                        Some(row) => {
+                            if self.rows.len() >= OKX_DISCOVERY_ROWS_CAP {
+                                return Err(OkxDiscoveryErr::TooMany);
+                            }
+                            if row.live {
+                                self.universe_live += 1;
+                            }
+                            self.rows.push(row);
+                            added += 1;
+                        }
+                        // A NAMELESS row. See `parse_row`: it names no
+                        // instrument, so it is counted and dropped
+                        // rather than failing the page.
+                        None => self.universe_nameless += 1,
                     }
-                    if row.live {
-                        self.universe_live += 1;
-                    }
-                    self.rows.push(row);
-                    added += 1;
                     i = skip_ws(body, end);
                     if i < body.len() && body[i] == b',' {
                         i += 1;
@@ -191,6 +201,14 @@ impl OkxDiscovery {
     #[inline]
     pub fn universe_total(&self) -> u32 {
         self.rows.len() as u32
+    }
+
+    /// Rows dropped for carrying an EMPTY `instId` — see `parse_row`.
+    /// Reported so a venue that starts emitting them in bulk is
+    /// visible rather than merely survivable.
+    #[inline]
+    pub fn universe_nameless(&self) -> u32 {
+        self.universe_nameless
     }
 
     /// Rows with `state == "live"` — the §6.1 coverage-report
@@ -306,7 +324,7 @@ fn parse_row(
     body: &[u8],
     pos: usize,
     mode: RowMode,
-) -> Result<(OkxInstrumentRow, usize), OkxDiscoveryErr> {
+) -> Result<(Option<OkxInstrumentRow>, usize), OkxDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
 
@@ -355,11 +373,16 @@ fn parse_row(
                 match key {
                     b"instId" => {
                         let (s, end) = quoted_span(body, i)?;
-                        if s.is_empty() || s.len() > OKX_INST_ID_MAX {
+                        if s.len() > OKX_INST_ID_MAX {
                             return Err(OkxDiscoveryErr::BadRow);
                         }
-                        inst_id[..s.len()].copy_from_slice(s);
-                        inst_id_len = s.len() as u8;
+                        // EMPTY is legal and means "skip", handled at
+                        // the end of the row. Parsing continues so the
+                        // cursor still lands on the next row.
+                        if !s.is_empty() {
+                            inst_id[..s.len()].copy_from_slice(s);
+                            inst_id_len = s.len() as u8;
+                        }
                         i = end;
                     }
                     b"instType" => {
@@ -447,8 +470,18 @@ fn parse_row(
         }
     }
 
+    // A row with an EMPTY `instId` names no instrument: it cannot be
+    // stored, subscribed to, or collided with. OKX emits one on the
+    // FUTURES page as a `preopen` placeholder — every field blank —
+    // and treating it as a contract violation took the whole page
+    // down, and with it the engine's boot (2026-09-11 05:52Z outage).
+    //
+    // This does NOT relax the tick/lot contract below: that still
+    // holds for every row that names a real instrument. It is the
+    // same distinction the `live &&` guard already makes — a claim
+    // about a real instrument is binding, a placeholder is not.
     if inst_id_len == 0 {
-        return Err(OkxDiscoveryErr::BadRow);
+        return Ok((None, i));
     }
     if !tick_sz_seen || !lot_sz_seen {
         return Err(OkxDiscoveryErr::BadRow);
@@ -493,7 +526,7 @@ fn parse_row(
         strike_1e9: strike.unwrap_or(0),
         exp_ms: exp_ms.unwrap_or(0),
     };
-    Ok((row, i))
+    Ok((Some(row), i))
 }
 
 /// Read a quoted string value at `pos` (must point at `"`). Returns
@@ -607,15 +640,67 @@ mod tests {
         );
     }
 
+
+    /// OKX serves a NAMELESS placeholder on the live FUTURES page: a
+    /// `preopen` row whose every field, `instId` included, is the empty
+    /// string. Treating it as a contract violation refused the whole
+    /// page, which refused boot discovery, which stopped the engine
+    /// booting at all — a nine-minute production outage on 2026-09-11.
+    ///
+    /// A row that names no instrument cannot be stored, subscribed to,
+    /// or collided with. It is counted and dropped.
+    #[test]
+    fn a_nameless_row_is_skipped_not_a_violation() {
+        let mut d = OkxDiscovery::new();
+        // The exact shape the venue sends, beside a real row.
+        let added = d
+            .ingest_body(
+                br#"{"code":"0","data":[
+                {"instId":"BTC-USD-260327","instType":"FUTURES","state":"live","ctVal":"100","lotSz":"1","tickSz":"0.1"},
+                {"instId":"","instType":"FUTURES","state":"preopen","ctVal":"","lotSz":"","tickSz":""}
+                ]}"#,
+            )
+            .expect("the page must PARSE, not refuse");
+        assert_eq!(added, 1, "only the row that names something");
+        assert_eq!(d.universe_total(), 1);
+        assert_eq!(d.universe_live(), 1);
+        assert_eq!(d.universe_nameless(), 1, "counted, so a flood is visible");
+        assert!(d.find(b"BTC-USD-260327").is_some(), "the real row survived");
+        // A row missing the key entirely is the same case.
+        let mut d2 = OkxDiscovery::new();
+        assert_eq!(
+            d2.ingest_body(
+                br#"{"code":"0","data":[{"instType":"SPOT","state":"live","tickSz":"1","lotSz":"1"}]}"#
+            )
+            .expect("parses"),
+            0
+        );
+        assert_eq!(d2.universe_nameless(), 1);
+    }
+
+    /// The tolerance above is NARROW. A row that DOES name an
+    /// instrument still has to honour the tick/lot contract — that is
+    /// the claim the venue is making about something real, and it stays
+    /// binding.
+    #[test]
+    fn a_named_live_row_still_owes_a_tick_and_a_lot() {
+        let mut d = OkxDiscovery::new();
+        assert_eq!(
+            d.ingest_body(
+                br#"{"code":"0","data":[{"instId":"BTC-USDT","instType":"SPOT","state":"live","tickSz":"","lotSz":""}]}"#
+            )
+            .unwrap_err(),
+            OkxDiscoveryErr::BadRow,
+            "a LIVE named row with no tick/lot is still a violation"
+        );
+    }
+
     #[test]
     fn ingest_rejects_row_contract_violations() {
         let mut d = OkxDiscovery::new();
-        // Missing instId.
-        assert_eq!(
-            d.ingest_body(br#"{"code":"0","data":[{"instType":"SPOT","state":"live","tickSz":"1","lotSz":"1"}]}"#)
-                .unwrap_err(),
-            OkxDiscoveryErr::BadRow
-        );
+        // A row with NO instId key at all, and one with an EMPTY
+        // instId, are both SKIPS rather than violations — see
+        // `a_nameless_row_is_skipped_not_a_violation`.
         // Unknown instType (OPTION not fetched in Phase 8).
         assert_eq!(
             d.ingest_body(br#"{"code":"0","data":[{"instId":"X","instType":"OPTION","state":"live","tickSz":"1","lotSz":"1"}]}"#)
