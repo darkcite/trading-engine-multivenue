@@ -345,7 +345,8 @@ pub struct VrpStrategy {
     /// the book is actually flat. Set by the E−ε law and by a
     /// hard-closed regime gate — a submit ring that was full must never
     /// leave a position behind with nothing coming back for it.
-    flatten_pending: bool,
+    /// Y1: no NEW hedge inside ε of expiry (see `maybe_freeze_hedge`).
+    hedge_frozen: bool,
     configured: bool,
     regime_open: bool,
     /// Signed option position ×1e6 (positive = long the option).
@@ -397,7 +398,7 @@ impl VrpStrategy {
             side: SIDE_FLAT,
             killed: false,
             entry_done: false,
-            flatten_pending: false,
+            hedge_frozen: false,
             configured: false,
             regime_open: true,
             opt_pos_qty_1e6: 0,
@@ -983,15 +984,25 @@ impl VrpStrategy {
         self.selected_right = RIGHT_CALL;
         self.side = SIDE_FLAT;
         self.entry_done = false;
-        self.flatten_pending = false;
+        self.hedge_frozen = false;
         self.last_mark = OptMarkCache::default();
         self.next_rebalance_wall_ns = 0;
         self.bump_state();
     }
 
     /// Unwind both legs at the last known marks.
+    /// Y1: close BOTH legs now, whatever it costs. The RISK exit, and
+    /// the only path that still crosses the option spread to get out.
+    ///
+    /// This is not the campaign's economic exit — that is settlement
+    /// (`maybe_freeze_hedge`). This runs when the regime gate slams
+    /// shut, where the question is not "is this the best price" but
+    /// "get out". Paying the spread twice is the correct price of an
+    /// unplanned exit; the whole X0 finding is that paying it on a
+    /// PLANNED one destroys the edge.
+    ///
+    /// Returns true once both legs are flat.
     fn flatten<C: Ctx>(&mut self, ctx: &mut C, now: NsTs) -> bool {
-        let mut any = false;
         if self.opt_pos_qty_1e6 != 0 && self.last_mark.px_usd_1e6 > 0 {
             let closing = -self.opt_pos_qty_1e6;
             let px = self.last_mark.px_usd_1e6;
@@ -1001,39 +1012,51 @@ impl VrpStrategy {
                     self.opt_pos_qty_1e6 = 0;
                     self.counters.exits = self.counters.exits.wrapping_add(1);
                     self.bump_state();
-                    any = true;
                 }
             }
         }
-        if self.perp_pos_qty_1e6 != 0 && self.move_hedge(ctx, 0, now) {
-            any = true;
+        if self.perp_pos_qty_1e6 != 0 {
+            self.move_hedge(ctx, 0, now);
         }
-        any
+        self.opt_pos_qty_1e6 == 0 && self.perp_pos_qty_1e6 == 0
     }
 
-    /// The E−ε exit, plus the settlement fold that keeps the forecast
-    /// learning. Returns true when the campaign ended.
-    fn maybe_exit<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) -> bool {
-        if self.selected_sym == SYMBOL_ID_NONE {
-            return false;
+    /// Y1: freeze the hedge ε before expiry. NOT an exit — settlement is
+    /// the only way a campaign ends now.
+    ///
+    /// **Why the E−ε unwind is gone.** It bought the option back five
+    /// minutes before expiry, crossing the option spread a SECOND time.
+    /// The lane plan's §3.4 ruled that acceptable — *"economically
+    /// near-identical to cash settlement"* — and at the 0 % spread it
+    /// then assumed, it was: −0.73 bps. V2a measured the real book the
+    /// next day (near-ATM 4–12 h calls, median 25 % crossed) and that
+    /// gap became the whole edge. Re-measured 2026-09-11 at the ATM
+    /// rung, per expiry:
+    ///
+    /// ```text
+    ///   settle    +3.658 bps   (t +1.67)
+    ///   fair_eps  −2.198 bps   (t −0.79)   <- what this rung used to do
+    /// ```
+    ///
+    /// Holding to expiry crosses the spread ONCE. The venue settles an
+    /// ITM option at intrinsic and an OTM one at nothing, and
+    /// [`Self::maybe_settle`] already books both.
+    ///
+    /// The hedge still runs to expiry — that is what the measured arm
+    /// does — but no NEW hedge goes on inside ε, because a hedge put on
+    /// in the last minutes cannot be unwound before settlement and
+    /// delta is least stable exactly there. The measured arm never
+    /// rebalances that late either (the schedule is hourly), so this
+    /// changes no economics; it is a rail, not a policy.
+    fn maybe_freeze_hedge(&mut self, wall_ns: u64) {
+        if self.selected_sym == SYMBOL_ID_NONE || self.hedge_frozen {
+            return;
         }
-        if !self.flatten_pending && wall_ns + self.params.epsilon_ns < self.expiry_ns {
-            return false;
+        if wall_ns + self.params.epsilon_ns < self.expiry_ns {
+            return;
         }
-        self.flatten_pending = true;
-        self.flatten(ctx, now);
-        if self.opt_pos_qty_1e6 != 0 || self.perp_pos_qty_1e6 != 0 {
-            // The submit ring was full. Keep the campaign open and retry
-            // on the next record: abandoning a live position because one
-            // submit failed is strictly worse than trying again.
-            return false;
-        }
-        // Fold the settled hold back into the forecast. `observe_settlement`
-        // ignores an unarmed engine, so a campaign that never entered
-        // contributes nothing — which is right: there was no hold.
-        self.settle_forecast();
-        self.end_campaign();
-        true
+        self.hedge_frozen = true;
+        self.bump_state();
     }
 
     /// W6: the last instant at which this campaign's decision is still
@@ -1272,7 +1295,7 @@ impl VrpStrategy {
                     self.selected_right = row.right;
                 }
                 self.entry_done = false;
-                self.flatten_pending = false;
+                self.hedge_frozen = false;
                 self.bump_state();
             }
             // An expiry was due and nothing in the chain was tradeable
@@ -1288,7 +1311,7 @@ impl VrpStrategy {
 
     /// The two-compare decision at `E − τ`, and the entry it authorises.
     fn decide<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) {
-        if self.entry_done || self.flatten_pending || self.selected_sym == SYMBOL_ID_NONE {
+        if self.entry_done || self.hedge_frozen || self.selected_sym == SYMBOL_ID_NONE {
             return;
         }
         if wall_ns + self.params.tau_ns < self.expiry_ns {
@@ -1400,7 +1423,7 @@ impl VrpStrategy {
 
     /// The hourly hedge check.
     fn maybe_rebalance<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) {
-        if self.opt_pos_qty_1e6 == 0 || wall_ns < self.next_rebalance_wall_ns {
+        if self.opt_pos_qty_1e6 == 0 || self.hedge_frozen || wall_ns < self.next_rebalance_wall_ns {
             return;
         }
         self.next_rebalance_wall_ns = wall_ns + self.params.rebalance_ns;
@@ -1506,8 +1529,8 @@ impl Strategy for VrpStrategy {
         if self.maybe_settle(ctx, wall_ns, now) {
             return;
         }
+        self.maybe_freeze_hedge(wall_ns);
         self.maybe_rebalance(ctx, wall_ns, now);
-        self.maybe_exit(ctx, wall_ns, now);
     }
 
     /// The option lane: cache the mark, select at the window, decide at
@@ -1563,7 +1586,7 @@ impl Strategy for VrpStrategy {
             return;
         }
         self.decide(ctx, wall_ns, now);
-        self.maybe_exit(ctx, wall_ns, now);
+        self.maybe_freeze_hedge(wall_ns);
     }
 
     #[inline]
@@ -1606,9 +1629,16 @@ impl Strategy for VrpStrategy {
         let wall_ns = self.anchor.wall_of(now);
         // Unwind NOW rather than at E−ε, through the same retrying path
         // the exit law uses.
-        self.flatten_pending = true;
+        self.hedge_frozen = true;
         self.counters.regime_exits = self.counters.regime_exits.wrapping_add(1);
-        self.maybe_exit(ctx, wall_ns, now);
+        if self.selected_sym != SYMBOL_ID_NONE && self.flatten(ctx, now) {
+            // Flat: fold the hold back into the forecast and close the
+            // campaign. Not flat (the submit ring was full) — the next
+            // record retries, exactly as the old exit rung did.
+            self.settle_forecast();
+            self.end_campaign();
+        }
+        let _ = wall_ns;
     }
 
     fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
@@ -2037,21 +2067,31 @@ mod tests {
         }
         assert_eq!(m.vrp_counters().hedges, 4, "the entry hedge plus three");
 
-        // --- the E−ε exit ---
+        // --- E−ε freezes the hedge; it does NOT exit (Y1) ---
         ctx.orders.clear();
-        let exit_wall = EXPIRY - params.epsilon_ns;
-        ctx.now = mono_of(exit_wall);
-        m.on_tick(&tick(exit_wall, 79_000_000_000, false), &mut ctx);
-        assert_eq!(ctx.orders.len(), 2, "both legs unwind");
-        assert_eq!(ctx.orders[0].sym, opt_sym(4));
-        assert_eq!(ctx.orders[0].side, Side::Bid, "buying back the short");
-        assert_eq!(ctx.orders[0].qty.raw(), params.qty_1e6);
-        assert_eq!(ctx.orders[1].sym, perp_sym());
-        assert_eq!(ctx.orders[1].side, Side::Ask, "selling the long hedge");
-        assert_eq!(m.opt_pos_qty_1e6(), 0);
-        assert_eq!(m.perp_pos_qty_1e6(), 0);
+        let eps_wall = EXPIRY - params.epsilon_ns;
+        ctx.now = mono_of(eps_wall);
+        m.on_tick(&tick(eps_wall, 79_000_000_000, false), &mut ctx);
+        assert!(ctx.orders.is_empty(), "E−ε trades NOTHING now");
+        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "still short into expiry");
+        assert_ne!(m.selected_sym(), SYMBOL_ID_NONE, "campaign still open");
+
+        // --- settlement is the terminal rung ---
+        // Well above the ATM strike, so the short call settles IN the
+        // money and the venue's cash settlement is a real number.
+        let itm = 90_000_000_000i64;
+        ctx.now = mono_of(EXPIRY);
+        m.on_tick(&tick(EXPIRY, itm, false), &mut ctx);
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "the option became cash");
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "and the hedge came off");
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
-        assert_eq!(m.vrp_counters().exits, 1);
+        assert_eq!(m.vrp_counters().settled_itm, 1, "settled, not unwound");
+        assert_eq!(
+            m.vrp_counters().exits,
+            0,
+            "`exits` is the RISK exit only — a planned campaign never crosses \
+             the option spread to get out"
+        );
         // And the settled hold went back into the forecast.
         assert_eq!(m.vrp_counters().settlements, 1);
         assert_eq!(m.n_pairs(), 61);
@@ -2225,10 +2265,15 @@ mod tests {
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
         assert_ne!(m.perp_pos_qty_1e6(), 0);
         ctx.orders.clear();
-        let exit = EXPIRY - params.epsilon_ns;
-        ctx.now = mono_of(exit);
-        m.on_tick(&tick(exit, 79_000_000_000, false), &mut ctx);
-        assert_eq!(m.perp_pos_qty_1e6(), 0, "the hedge unwound");
+        // Y1: the unwind happens at SETTLEMENT, not at E−ε. E−ε only
+        // freezes the hedge, so the position is still on there.
+        let eps = EXPIRY - params.epsilon_ns;
+        ctx.now = mono_of(eps);
+        m.on_tick(&tick(eps, 79_000_000_000, false), &mut ctx);
+        assert_ne!(m.perp_pos_qty_1e6(), 0, "still hedged into expiry");
+        ctx.now = mono_of(EXPIRY);
+        m.on_tick(&tick(EXPIRY, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "the hedge unwound at settlement");
         assert_eq!(m.opt_pos_qty_1e6(), 0);
     }
 
@@ -2428,20 +2473,33 @@ mod tests {
 
     #[test]
     fn a_flat_campaign_at_expiry_just_ends() {
-        // The E−ε law already unwound: expiry is bookkeeping, not a
-        // trade, and it must not emit an order for a position that is
-        // not there.
+        // Y1: a campaign that decided and HELD carries no position, so
+        // expiry is pure bookkeeping — it closes the campaign and must
+        // not emit an order for something that is not there.
+        //
+        // (Under the old E−ε law this case was reached by unwinding
+        // first. There is no unwind now, so the flat campaign has to be
+        // a genuinely flat one.)
         let mut ctx = RecCtx::new();
-        let params = VrpParams::default();
-        let mut m = campaign_at_expiry(&mut ctx, params);
-        let exit = EXPIRY - params.epsilon_ns;
-        ctx.now = mono_of(exit);
-        m.on_tick(&tick(exit, 79_000_000_000, false), &mut ctx);
-        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "E−ε ended it");
+        let mut m = fresh_member(&mut ctx);
+        let held = format!("V\t3\nC\t{EXPIRY}\t79000000000\t0\t0\t0\t0\t0\t1\n");
+        m.restore_state(&held).expect("restores");
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+        assert_eq!(m.perp_pos_qty_1e6(), 0);
+
+        let eps = EXPIRY - VrpParams::default().epsilon_ns;
+        ctx.now = mono_of(eps);
+        m.on_tick(&tick(eps, 79_000_000_000, false), &mut ctx);
+        assert_ne!(
+            m.selected_sym(),
+            SYMBOL_ID_NONE,
+            "E−ε freezes the hedge; it does NOT end the campaign"
+        );
         ctx.orders.clear();
         ctx.now = mono_of(EXPIRY);
         m.on_tick(&tick(EXPIRY, 79_000_000_000, false), &mut ctx);
-        assert!(ctx.orders.is_empty());
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "settlement ended it");
+        assert!(ctx.orders.is_empty(), "nothing held ⇒ nothing to trade");
         assert_eq!(m.vrp_counters().settled_itm, 0);
         assert_eq!(m.vrp_counters().settled_otm, 0);
     }
@@ -3206,19 +3264,22 @@ mod tests {
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
 
-        // The exit instant arrives with the ring full.
+        // Y1: the terminal rung is SETTLEMENT, so that is where a full
+        // ring has to be survived. Expiry arrives with it full.
         ctx.full = true;
         ctx.orders.clear();
-        let exit = EXPIRY - params.epsilon_ns;
-        ctx.now = mono_of(exit);
-        m.on_tick(&tick(exit, 79_000_000_000, false), &mut ctx);
-        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "still holding");
+        ctx.now = mono_of(EXPIRY);
+        m.on_tick(&tick(EXPIRY, 79_000_000_000, false), &mut ctx);
         assert_ne!(m.selected_sym(), SYMBOL_ID_NONE, "campaign still open");
         assert!(m.orders_dropped() > 0);
+        assert!(
+            m.opt_pos_qty_1e6() != 0 || m.perp_pos_qty_1e6() != 0,
+            "a refused submit must NOT be taken as a closed position"
+        );
 
-        // The ring drains; the very next tick completes the unwind.
+        // The ring drains; the very next record completes the settlement.
         ctx.full = false;
-        m.on_tick(&tick(exit + 1_000_000_000, 79_000_000_000, false), &mut ctx);
+        m.on_tick(&tick(EXPIRY + 1_000_000_000, 79_000_000_000, false), &mut ctx);
         assert_eq!(m.opt_pos_qty_1e6(), 0);
         assert_eq!(m.perp_pos_qty_1e6(), 0);
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);

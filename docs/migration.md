@@ -6,6 +6,58 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-11 — the VRP campaign exits at SETTLEMENT, not at E−ε (Y1)
+
+**What changed**
+
+- The E−ε unwind is gone. `maybe_exit` is replaced by `maybe_freeze_hedge`,
+  which only stops NEW hedging inside ε; it places no order and does not end
+  the campaign.
+- `maybe_settle` at `E` is now the only terminal rung for a planned
+  campaign: it books the option's intrinsic (ITM) or zeroes it (OTM),
+  flattens the perp, folds the hold into the forecast and closes the
+  campaign.
+- `flatten()` survives for the **regime hard exit only** — the risk path,
+  where crossing the spread to get out is the correct price.
+- `flatten_pending` → `hedge_frozen`.
+
+**Why**
+
+The E−ε unwind bought the option back five minutes before expiry, crossing
+the option spread a SECOND time. Lane plan §3.4 ruled that acceptable —
+*"economically near-identical to cash settlement"* — and at the 0 % spread
+it assumed, it was: −0.73 bps. V2a measured the real book the next day
+(near-ATM 4–12 h calls, **median 25 % crossed**) and that gap became the
+whole edge. Re-measured 2026-09-11 at the ATM rung, per expiry:
+
+```
+  settle    +3.658 bps  (t +1.67)
+  fair_eps  −2.198 bps  (t −0.79)   <- what this rung did
+```
+
+Holding to expiry crosses the spread once. The member was built to a ruling
+its own evidence had superseded, and it shipped the negative arm.
+
+**Ripple effects**
+
+- **`engine_vrp_exits_total` changes meaning.** It was "the planned E−ε
+  unwind"; it is now "the regime RISK exit" and should read 0 in normal
+  operation. A non-zero value is a regime slam, not a campaign ending.
+  Campaign endings are `settlements` / `settled_itm` / `settled_otm`.
+- The member now carries its option position THROUGH expiry, so the
+  settlement rungs are exercised on every campaign rather than only when
+  the unwind failed. `settled_unpriced` becoming non-zero is now a real
+  operational signal (the contract rolled off the chain before settling).
+- No on-disk format changes; `VRP_STATE_VERSION` stays 3.
+
+**Migration steps**
+
+1. Rebuild and restart. Re-baseline any alert on `engine_vrp_exits_total`.
+
+**Rollback**
+
+- Revert the commit. No format or config change is involved.
+
 ## 2026-09-11 — `vrp-state.tsv` v2 → v3: a decision is spent once (W6–W7)
 
 **What changed**
