@@ -2413,6 +2413,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     obs: Observability,
     requested_mask: u8,
     vrp: Option<&crate::vrp_boot::VrpBoot>,
+    xsd: Option<&crate::xsd_boot::XsdBoot>,
     rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
@@ -2424,6 +2425,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if vrp.is_some() {
         configured |= strategy_set::BIT_VRP;
+    }
+    if xsd.is_some() {
+        configured |= strategy_set::BIT_XSD;
     }
     if rules.is_some() {
         configured |= strategy_set::BIT_RULE_TREE;
@@ -2587,6 +2591,69 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             "icdp: artifact configured"
         );
     }
+    if let Some(boot) = xsd {
+        // XSD-3: the wall anchor is taken HERE, once — the member's hour
+        // grid is UTC-aligned from this instant on (the icdp law). The
+        // seed fills buckets strictly before the boot hour (the bundle
+        // dropped anything else); the state restores under the same
+        // table hash or flattens under a changed one.
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.xsd_mut().configure(anchor, &boot.params, &boot.table) {
+            tracing::error!(error = %e, "xsd: artifact refused");
+            return EngineLoopResult::Failed("xsd: artifact refused by the strategy");
+        }
+        let mut i = 0usize;
+        while i < boot.seed.len() {
+            let (sym, hour, close) = boot.seed[i];
+            set.xsd_mut().seed_close(sym, hour, close);
+            i += 1;
+        }
+        let mut restored = 0usize;
+        let mut r = 0usize;
+        while r < boot.restore.len() {
+            if let Err(reason) = set.xsd_mut().restore_position(&boot.restore[r], boot.restore_flatten) {
+                tracing::error!(reason, "xsd: state file refused by the strategy");
+                return EngineLoopResult::Failed("xsd: state file refused by the strategy");
+            }
+            restored += 1;
+            r += 1;
+        }
+        let x = set.xsd();
+        let c = *x.counters();
+        tracing::info!(
+            hash = %format_hex32(x.params_hash()),
+            table_hash = %format_hex32(x.table_hash()),
+            targets = x.targets(),
+            pairs = x.pairs(),
+            syms = x.syms(),
+            rows_dropped = boot.rows_dropped,
+            seed_rows = c.seed_rows,
+            seed_dropped = c.seed_dropped + boot.seed_dropped as u64,
+            z_window_h = boot.params.z_window_h,
+            grid_n = boot.params.grid_n,
+            anchor_wall_ns = anchor.wall_ns,
+            params = %boot.params_path.display(),
+            table = %boot.table_path.display(),
+            seed = %boot.seed_path.display(),
+            "xsd: artifact configured"
+        );
+        if !boot.state_present {
+            tracing::info!(path = %boot.state_path.display(), "xsd: no state — first boot under this table");
+        } else if boot.restore_flatten {
+            tracing::warn!(
+                positions_to_flatten = restored,
+                path = %boot.state_path.display(),
+                "xsd: state discarded (table hash changed) — every listed position exits at its first fresh tick"
+            );
+        } else {
+            tracing::info!(positions = restored, path = %boot.state_path.display(), "xsd: state restored");
+        }
+        obs.xsd_state = Some(XsdStateSink {
+            path: boot.state_path.clone(),
+            table_hash: boot.table.hash,
+            descriptors: boot.descriptors.clone(),
+        });
+    }
     // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
     // `[labels.*]` overrides, seed, and print the boot tells. An
     // absent artifact leaves it unconfigured: every word UNKNOWN,
@@ -2655,6 +2722,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         mask,
         latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
         vrp = mask & strategy_set::BIT_VRP != 0,
+        xsd = mask & strategy_set::BIT_XSD != 0,
         rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
@@ -2697,15 +2765,15 @@ pub struct RegimeBoot {
 }
 
 /// RG8: the coded members the `[labels] require` law covers — the ones
-/// that carry their OWN signal (slots 0, 1, 3 + icdp; slot 2 is vacant
-/// since XSD-S and joins the list when `strategy-xsd` lands). `ai-exec` (slot 4) is
+/// that carry their OWN signal (slots 0–3 + icdp). `ai-exec` (slot 4) is
 /// exempt: it carries the worker's intent lanes, which gate themselves
 /// through `regime_allows()` (their `REGIME_LABEL`); the vm (slot 5) is
 /// held to the law upstream — every row of a staged table must be
 /// labelled (the worker's RG8 gates), never at boot.
-const REQUIRE_LABEL_SLOTS: [u8; 4] = [
+const REQUIRE_LABEL_SLOTS: [u8; 5] = [
     strategy_set::SLOT_LATENCY_ARB,
     strategy_set::SLOT_VRP,
+    strategy_set::SLOT_XSD,
     strategy_set::SLOT_RULE_TREE,
     strategy_set::SLOT_ICDP,
 ];
@@ -2930,6 +2998,7 @@ impl Observability {
             let vm = register_vm_metrics(&mut reg)?;
             let icdp = register_icdp_metrics(&mut reg)?;
             let vrp = register_vrp_metrics(&mut reg)?;
+            let xsd = register_xsd_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let fills_capture = {
                 let io_errors = reg
@@ -3008,6 +3077,7 @@ impl Observability {
                 vm,
                 icdp,
                 vrp,
+                xsd,
                 regime,
             });
         }
@@ -3142,6 +3212,22 @@ pub struct Observability {
     /// `None` = no VRP member is configured, and the engine writes
     /// nothing. Set by the set builder from the boot bundle.
     pub vrp_state_path: Option<std::path::PathBuf>,
+    /// XSD-3: where and how the xsd member's positions are persisted.
+    /// `None` = no xsd member is configured. Set by the set builder.
+    pub xsd_state: Option<XsdStateSink>,
+}
+
+/// XSD-3: the state writer's identity — the path, the table hash the
+/// file is stamped with, and the descriptor of every target (the file
+/// speaks descriptors, never `SymbolId`s).
+#[derive(Clone, Debug)]
+pub struct XsdStateSink {
+    /// `~/multivenue/xsd-state.tsv` by default.
+    pub path: std::path::PathBuf,
+    /// The booted table's hash.
+    pub table_hash: [u8; 32],
+    /// `(target sym, descriptor)` for every table target.
+    pub descriptors: Vec<(SymbolId, String)>,
 }
 
 impl Observability {
@@ -3323,6 +3409,8 @@ pub struct EngineCounters {
     pub icdp: IcdpMetricIds,
     /// VRP V7: the `engine_vrp_*` family (slot 1).
     pub vrp: VrpMetricIds,
+    /// XSD-3: the `engine_xsd_*` family (slot 2).
+    pub xsd: XsdMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
 }
@@ -3957,6 +4045,193 @@ fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
     reg.counter(ids.regime_exits)
         .inc(cur.regime_exits.saturating_sub(last.regime_exits));
     *last = cur;
+}
+
+/// XSD-3: the `engine_xsd_*` family (slot 2). Counters mirror the
+/// member's cumulative [`strategy_core::XsdCounters`] as deltas; the two
+/// levels (`pairs_warm`, `positions`) are gauges.
+#[derive(Copy, Clone, Debug)]
+pub struct XsdMetricIds {
+    /// `engine_xsd_rolls_total`
+    pub rolls: core_metrics::CounterId,
+    /// `engine_xsd_decisions_total`
+    pub decisions: core_metrics::CounterId,
+    /// `engine_xsd_entries_decided_total`
+    pub entries_decided: core_metrics::CounterId,
+    /// `engine_xsd_adds_decided_total`
+    pub adds_decided: core_metrics::CounterId,
+    /// `engine_xsd_entries_total`
+    pub entries: core_metrics::CounterId,
+    /// `engine_xsd_adds_total`
+    pub adds: core_metrics::CounterId,
+    /// `engine_xsd_exits_revert_total`
+    pub exits_revert: core_metrics::CounterId,
+    /// `engine_xsd_exits_stop_total`
+    pub exits_stop: core_metrics::CounterId,
+    /// `engine_xsd_exits_maxhold_total`
+    pub exits_maxhold: core_metrics::CounterId,
+    /// `engine_xsd_exits_rotation_total`
+    pub exits_rotation: core_metrics::CounterId,
+    /// `engine_xsd_exits_regime_total`
+    pub exits_regime: core_metrics::CounterId,
+    /// `engine_xsd_intents_carried_total`
+    pub intents_carried: core_metrics::CounterId,
+    /// `engine_xsd_entries_cancelled_total`
+    pub entries_cancelled: core_metrics::CounterId,
+    /// `engine_xsd_caps_rejected_total`
+    pub caps_rejected: core_metrics::CounterId,
+    /// `engine_xsd_holds_absent_total`
+    pub holds_absent: core_metrics::CounterId,
+    /// `engine_xsd_regime_blocked_total`
+    pub regime_blocked: core_metrics::CounterId,
+    /// `engine_xsd_seed_rows_total`
+    pub seed_rows: core_metrics::CounterId,
+    /// `engine_xsd_seed_dropped_total`
+    pub seed_dropped: core_metrics::CounterId,
+    /// `engine_xsd_pairs_warm` (level)
+    pub pairs_warm: core_metrics::GaugeId,
+    /// `engine_xsd_positions` (level: entered targets)
+    pub positions: core_metrics::GaugeId,
+}
+
+/// Register the XSD family. Boot-only.
+fn register_xsd_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<XsdMetricIds, &'static str> {
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name).map_err(|_| "register xsd counter")
+    };
+    let rolls = one("engine_xsd_rolls_total")?;
+    let decisions = one("engine_xsd_decisions_total")?;
+    let entries_decided = one("engine_xsd_entries_decided_total")?;
+    let adds_decided = one("engine_xsd_adds_decided_total")?;
+    let entries = one("engine_xsd_entries_total")?;
+    let adds = one("engine_xsd_adds_total")?;
+    let exits_revert = one("engine_xsd_exits_revert_total")?;
+    let exits_stop = one("engine_xsd_exits_stop_total")?;
+    let exits_maxhold = one("engine_xsd_exits_maxhold_total")?;
+    let exits_rotation = one("engine_xsd_exits_rotation_total")?;
+    let exits_regime = one("engine_xsd_exits_regime_total")?;
+    let intents_carried = one("engine_xsd_intents_carried_total")?;
+    let entries_cancelled = one("engine_xsd_entries_cancelled_total")?;
+    let caps_rejected = one("engine_xsd_caps_rejected_total")?;
+    let holds_absent = one("engine_xsd_holds_absent_total")?;
+    let regime_blocked = one("engine_xsd_regime_blocked_total")?;
+    let seed_rows = one("engine_xsd_seed_rows_total")?;
+    let seed_dropped = one("engine_xsd_seed_dropped_total")?;
+    let pairs_warm = reg
+        .register_gauge("engine_xsd_pairs_warm")
+        .map_err(|_| "register engine_xsd_pairs_warm")?;
+    let positions = reg
+        .register_gauge("engine_xsd_positions")
+        .map_err(|_| "register engine_xsd_positions")?;
+    Ok(XsdMetricIds {
+        rolls,
+        decisions,
+        entries_decided,
+        adds_decided,
+        entries,
+        adds,
+        exits_revert,
+        exits_stop,
+        exits_maxhold,
+        exits_rotation,
+        exits_regime,
+        intents_carried,
+        entries_cancelled,
+        caps_rejected,
+        holds_absent,
+        regime_blocked,
+        seed_rows,
+        seed_dropped,
+        pairs_warm,
+        positions,
+    })
+}
+
+/// Mirror the XSD family as monotonic deltas of the cumulative strategy
+/// counters, plus the two levels. 5 s cadence — cold path.
+fn mirror_xsd_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &XsdMetricIds,
+    strat: &S,
+    last: &mut strategy_core::XsdCounters,
+) {
+    let cur = strat.xsd_counters();
+    reg.counter(ids.rolls).inc(cur.rolls.saturating_sub(last.rolls));
+    reg.counter(ids.decisions)
+        .inc(cur.decisions.saturating_sub(last.decisions));
+    reg.counter(ids.entries_decided)
+        .inc(cur.entries_decided.saturating_sub(last.entries_decided));
+    reg.counter(ids.adds_decided)
+        .inc(cur.adds_decided.saturating_sub(last.adds_decided));
+    reg.counter(ids.entries).inc(cur.entries.saturating_sub(last.entries));
+    reg.counter(ids.adds).inc(cur.adds.saturating_sub(last.adds));
+    reg.counter(ids.exits_revert)
+        .inc(cur.exits_revert.saturating_sub(last.exits_revert));
+    reg.counter(ids.exits_stop)
+        .inc(cur.exits_stop.saturating_sub(last.exits_stop));
+    reg.counter(ids.exits_maxhold)
+        .inc(cur.exits_maxhold.saturating_sub(last.exits_maxhold));
+    reg.counter(ids.exits_rotation)
+        .inc(cur.exits_rotation.saturating_sub(last.exits_rotation));
+    reg.counter(ids.exits_regime)
+        .inc(cur.exits_regime.saturating_sub(last.exits_regime));
+    reg.counter(ids.intents_carried)
+        .inc(cur.intents_carried.saturating_sub(last.intents_carried));
+    reg.counter(ids.entries_cancelled)
+        .inc(cur.entries_cancelled.saturating_sub(last.entries_cancelled));
+    reg.counter(ids.caps_rejected)
+        .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
+    reg.counter(ids.holds_absent)
+        .inc(cur.holds_absent.saturating_sub(last.holds_absent));
+    reg.counter(ids.regime_blocked)
+        .inc(cur.regime_blocked.saturating_sub(last.regime_blocked));
+    reg.counter(ids.seed_rows)
+        .inc(cur.seed_rows.saturating_sub(last.seed_rows));
+    reg.counter(ids.seed_dropped)
+        .inc(cur.seed_dropped.saturating_sub(last.seed_dropped));
+    reg.gauge(ids.pairs_warm).set(cur.pairs_warm as i64);
+    // Entered targets = the view's count (a level, cheap: one pass over
+    // ≤ 128 machines, no rendering).
+    let mut none: [strategy_core::XsdPositionView; 0] = [];
+    reg.gauge(ids.positions)
+        .set(strat.xsd_positions_view(&mut none) as i64);
+    *last = cur;
+}
+
+/// XSD-3: rewrite `xsd-state.tsv` when the member's persisted-state
+/// epoch moved (the `write_vrp_state_if_changed` law: a quiet engine
+/// writes nothing; a failed write is logged, never fatal).
+fn write_xsd_state_if_changed<S: strategy_core::StrategyCounters>(
+    sink: Option<&XsdStateSink>,
+    strat: &S,
+    last_epoch: &mut u64,
+    buf: &mut String,
+    views: &mut [strategy_core::XsdPositionView],
+) {
+    let Some(sink) = sink else { return };
+    let epoch = strategy_core::StrategyCounters::xsd_state_epoch(strat);
+    if epoch == *last_epoch {
+        return;
+    }
+    let n = strategy_core::StrategyCounters::xsd_positions_view(strat, views) as usize;
+    let n = n.min(views.len());
+    let descriptor_of = |sym: SymbolId| -> Option<&str> {
+        let mut i = 0usize;
+        while i < sink.descriptors.len() {
+            if sink.descriptors[i].0 == sym {
+                return Some(sink.descriptors[i].1.as_str());
+            }
+            i += 1;
+        }
+        None
+    };
+    crate::xsd_boot::render_state(&sink.table_hash, &descriptor_of, &views[..n], buf);
+    match crate::xsd_boot::write_state(&sink.path, buf) {
+        Ok(()) => *last_epoch = epoch,
+        Err(reason) => tracing::warn!(reason, "xsd: state write failed — will retry"),
+    }
 }
 
 // ---------------------------------------------------------------
@@ -4690,6 +4965,14 @@ where
     let mut vrp_state_epoch =
         strategy_core::StrategyCounters::vrp_state_epoch(eng.strategy());
     let mut vrp_state_buf = String::new();
+    // XSD-3: the same epoch-gated writer for slot 2 (positions rendered
+    // with descriptors through the boot sink; the view buffer is
+    // allocated once here and reused).
+    let mut xsd_last = strategy_core::XsdCounters::default();
+    let xsd_sink = obs.xsd_state.clone();
+    let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
+    let mut xsd_state_buf = String::new();
+    let mut xsd_views = vec![strategy_core::XsdPositionView::default(); strategy_xsd::XSD_MAX_TARGETS];
     let mut regime_last = strategy_core::RegimeCounters::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
@@ -4780,6 +5063,14 @@ where
                     eng.strategy(),
                     &mut vrp_state_epoch,
                     &mut vrp_state_buf,
+                );
+                mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
+                write_xsd_state_if_changed(
+                    xsd_sink.as_ref(),
+                    eng.strategy(),
+                    &mut xsd_state_epoch,
+                    &mut xsd_state_buf,
+                    &mut xsd_views,
                 );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
 

@@ -18,21 +18,18 @@
 //! |---|---|---|
 //! | 0 | `strategy-latency-arb` | built |
 //! | 1 | `strategy-vrp` | built (VRP V7, 2026-09-10 — **was `strategy-ev`**) |
-//! | 2 | *vacant — held for `strategy-xsd`* | vacated 2026-09-12 (XSD-S) — **was `strategy-cross-arb`**; the member lands in XSD-3 |
+//! | 2 | `strategy-xsd` | built (XSD-3, 2026-09-12 — **was `strategy-cross-arb`**, unlinked at XSD-S the same day) — configured only when `~/multivenue/xsd.toml` + `xsd-table.tsv` resolve |
 //! | 3 | `strategy-rule-tree` | built |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
 //! | 5 | `strategy-vm` | built (8g item 6) |
 //! | 6 | `strategy-icdp` | built (ICDP I4, 2026-09-03) — configured only when `~/multivenue/icdp.toml` resolves |
 //!
-//! Two slots carry no member today. Slot 7 is reserved: no bit
-//! constant is defined (the cli cannot express it via
-//! [`mask_for_name`]). Slot 2 is VACANT since 2026-09-12 (XSD-S):
-//! `strategy-cross-arb` was unlinked from the set (the crate stays in
-//! the workspace — the `strategy-ev` precedent) and the slot is held
-//! for `strategy-xsd`; [`SLOT_XSD`] / [`BIT_XSD`] exist so the wiring
-//! phase (XSD-3) changes no number, but the bit is OUTSIDE
-//! [`BUILT_MASK`] until the member lands. An `EnableStrategy`
-//! targeting either slot is refused (counted).
+//! Slot 7 is the only reserved value: no member exists behind it, no
+//! bit constant is defined (the cli cannot express it via
+//! [`mask_for_name`]), and an `EnableStrategy` targeting it is
+//! refused (counted). Slot 2 changed hands on 2026-09-12:
+//! `strategy-cross-arb` was unlinked (the crate stays in the workspace
+//! — the `strategy-ev` precedent) and `strategy-xsd` took the number.
 //!
 //! ## AI command routing (`on_ai`, §7)
 //!
@@ -103,6 +100,7 @@ use strategy_core::{
 // into the trait's POD — the two capacities must agree.
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
 use strategy_vrp::VrpStrategy;
+use strategy_xsd::XsdStrategy;
 use strategy_icdp::IcdpStrategy;
 use strategy_latency_arb::LatencyArb;
 use strategy_rule_tree::RuleTree;
@@ -155,8 +153,6 @@ pub const BIT_VRP: u8 = 1 << SLOT_VRP;
 /// Slot 1's bit under its pre-2026-09-10 name. Identical value.
 pub const BIT_EV: u8 = BIT_VRP;
 /// Enable-mask bit for the xsd member (slot 2 — see [`SLOT_XSD`]).
-/// OUTSIDE [`BUILT_MASK`] until XSD-3 wires the member: today
-/// [`StrategySet::new`] clears it and `EnableStrategy` refuses it.
 pub const BIT_XSD: u8 = 1 << SLOT_XSD;
 /// Enable-mask bit for the rule-tree member.
 pub const BIT_RULE_TREE: u8 = 1 << SLOT_RULE_TREE;
@@ -167,10 +163,9 @@ pub const BIT_VM: u8 = 1 << SLOT_VM;
 /// Enable-mask bit for the icdp member (ICDP I4).
 pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
 
-/// Every built member's bit (slots 0, 1, 3–6; slot 2 is vacant until
-/// XSD-3 — see [`SLOT_XSD`]).
+/// Every built member's bit (slots 0–6).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_VRP | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_LATENCY_ARB | BIT_VRP | BIT_XSD | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
 
 /// Latency-arb slot capacity inside the set (design §7 sketch).
 pub const SET_LATENCY_ARB_SLOTS: usize = 64;
@@ -190,9 +185,12 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 pub fn mask_for_name(name: &str) -> Option<u8> {
     match name {
         "latency-arb" => Some(BIT_LATENCY_ARB),
-        // XSD-S (2026-09-12): `cross-arb` is GONE as a name — slot 2 is
-        // vacant until `strategy-xsd` lands (XSD-3), and an operator who
-        // types the old one must get a boot refusal, not a silent no-op.
+        // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
+        // is GONE as a name — an operator who types the old one gets a
+        // boot refusal, not a different strategy than the one asked for.
+        "xsd" => Some(BIT_XSD),
+        "ai+xsd" => Some(BIT_AI_EXEC | BIT_VM | BIT_XSD),
+        "ai+vrp+xsd" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD),
         "rule-tree" => Some(BIT_RULE_TREE),
         "ai-exec" => Some(BIT_AI_EXEC),
         "vm" => Some(BIT_VM),
@@ -224,6 +222,7 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
 pub struct StrategySet {
     latency_arb: LatencyArb<SET_LATENCY_ARB_SLOTS>,
     vrp: VrpStrategy,
+    xsd: XsdStrategy,
     rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
     vm: VmStrategy,
@@ -271,6 +270,7 @@ impl StrategySet {
         Self {
             latency_arb: LatencyArb::new(),
             vrp: VrpStrategy::new(),
+            xsd: XsdStrategy::new(),
             rule_tree: RuleTree::new(),
             ai_exec: AiExec::new(),
             vm: VmStrategy::new(),
@@ -325,6 +325,7 @@ impl StrategySet {
         let ok = match slot {
             SLOT_LATENCY_ARB => self.latency_arb.set_regime_label(set),
             SLOT_VRP => self.vrp.set_regime_label(set),
+            SLOT_XSD => self.xsd.set_regime_label(set),
             SLOT_RULE_TREE => self.rule_tree.set_regime_label(set),
             SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
             SLOT_ICDP => self.icdp.set_regime_label(set),
@@ -365,7 +366,7 @@ impl StrategySet {
     fn pull_regime_labels(&mut self) {
         self.regime_labels[SLOT_LATENCY_ARB as usize] = self.latency_arb.regime_label();
         self.regime_labels[SLOT_VRP as usize] = self.vrp.regime_label();
-        self.regime_labels[SLOT_XSD as usize] = RegimeLabelSet::ANY; // vacant until XSD-3
+        self.regime_labels[SLOT_XSD as usize] = self.xsd.regime_label();
         self.regime_labels[SLOT_RULE_TREE as usize] = self.rule_tree.regime_label();
         self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
         self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
@@ -436,6 +437,9 @@ impl StrategySet {
             SLOT_VRP => self
                 .vrp
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
+            SLOT_XSD => self
+                .xsd
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
             SLOT_RULE_TREE => self
                 .rule_tree
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE)),
@@ -489,6 +493,18 @@ impl StrategySet {
         &self.vrp
     }
 
+    /// Configure the xsd member (boot-only).
+    #[inline]
+    pub fn xsd_mut(&mut self) -> &mut XsdStrategy {
+        &mut self.xsd
+    }
+
+    /// The xsd member (cli: boot tells).
+    #[inline]
+    pub fn xsd(&self) -> &XsdStrategy {
+        &self.xsd
+    }
+
     /// Configure the rule-tree member (boot-only).
     #[inline]
     pub fn rule_tree_mut(&mut self) -> &mut RuleTree<SET_RULE_TREE_SLOTS> {
@@ -540,12 +556,13 @@ impl StrategySet {
         let bit = match slot {
             SLOT_LATENCY_ARB => BIT_LATENCY_ARB,
             SLOT_VRP => BIT_VRP,
+            SLOT_XSD => BIT_XSD,
             SLOT_RULE_TREE => BIT_RULE_TREE,
             SLOT_AI_EXEC => BIT_AI_EXEC,
             SLOT_VM => BIT_VM,
             SLOT_ICDP => BIT_ICDP,
-            // Slots with no member behind them — the reserved 7 and the
-            // vacant 2 (XSD-S, until XSD-3) — refuse and count.
+            // Reserved slot (7): no member behind it — refuse and
+            // count.
             _ => {
                 self.enable_refused = self.enable_refused.wrapping_add(1);
                 return;
@@ -580,6 +597,7 @@ impl StrategyCounters for StrategySet {
     fn orders_emitted(&self) -> u64 {
         self.latency_arb.orders_emitted()
             + self.vrp.orders_emitted()
+            + self.xsd.orders_emitted()
             + self.rule_tree.orders_emitted()
             + self.ai_exec.orders_emitted()
             + self.vm.orders_emitted()
@@ -589,6 +607,7 @@ impl StrategyCounters for StrategySet {
     fn orders_dropped(&self) -> u64 {
         self.latency_arb.orders_dropped()
             + self.vrp.orders_dropped()
+            + self.xsd.orders_dropped()
             + self.rule_tree.orders_dropped()
             + self.ai_exec.orders_dropped()
             + self.vm.orders_dropped()
@@ -667,6 +686,19 @@ impl StrategyCounters for StrategySet {
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
     }
+    /// XSD-3: slot 2's observables + persisted state.
+    #[inline]
+    fn xsd_counters(&self) -> strategy_core::XsdCounters {
+        self.xsd.xsd_counters()
+    }
+    #[inline]
+    fn xsd_state_epoch(&self) -> u64 {
+        StrategyCounters::xsd_state_epoch(&self.xsd)
+    }
+    #[inline]
+    fn xsd_positions_view(&self, out: &mut [strategy_core::XsdPositionView]) -> u32 {
+        StrategyCounters::xsd_positions_view(&self.xsd, out)
+    }
     /// RG2: the detector's observables + per-slot gates.
     fn regime_counters(&self) -> RegimeCounters {
         let mut c = RegimeCounters::default();
@@ -724,6 +756,7 @@ impl StrategyCounters for StrategySet {
                 self.latency_arb.orders_dropped(),
             ),
             SLOT_VRP => (self.vrp.orders_emitted(), self.vrp.orders_dropped()),
+            SLOT_XSD => (self.xsd.orders_emitted(), self.xsd.orders_dropped()),
             SLOT_RULE_TREE => (
                 self.rule_tree.orders_emitted(),
                 self.rule_tree.orders_dropped(),
@@ -817,6 +850,9 @@ impl Strategy for StrategySet {
         if self.initial & BIT_VRP != 0 {
             self.vrp.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VRP))?;
         }
+        if self.initial & BIT_XSD != 0 {
+            self.xsd.on_start(&mut StampCtx::new(&mut *ctx, SLOT_XSD))?;
+        }
         if self.initial & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_start(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE))?;
@@ -848,6 +884,10 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -875,6 +915,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
+        }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
@@ -917,6 +961,10 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -946,6 +994,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
+        }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
@@ -977,6 +1029,10 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -1004,6 +1060,10 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
+        }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
@@ -1078,6 +1138,9 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -1128,6 +1191,10 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -1165,6 +1232,10 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
+        let v = self.xsd.timer_period_ns();
+        if v < min {
+            min = v;
+        }
         let v = self.rule_tree.timer_period_ns();
         if v < min {
             min = v;
@@ -1191,6 +1262,7 @@ impl Strategy for StrategySet {
         self.latency_arb
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         self.vrp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VRP));
+        self.xsd.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XSD));
         self.rule_tree
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         self.ai_exec
@@ -1288,6 +1360,11 @@ mod tests {
         )
     }
 
+    /// The set's timer cadence with every member unconfigured.
+    fn s_timer_without_xsd() -> u64 {
+        StrategySet::new(0).timer_period_ns()
+    }
+
     #[test]
     fn initial_mask_from_names() {
         assert_eq!(mask_for_name("latency-arb"), Some(BIT_LATENCY_ARB));
@@ -1302,24 +1379,24 @@ mod tests {
             Some(BIT_AI_EXEC | BIT_VM | BIT_VRP)
         );
         assert_eq!(mask_for_name("ai+vrp"), Some(50));
-        // XSD-S (2026-09-12): slot 2 is vacant — `cross-arb` is gone as
-        // a NAME and refuses the boot; `xsd` arrives with the member
-        // (XSD-3). The live masks do not move.
+        // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
+        // is gone as a NAME and refuses the boot. The live masks do not
+        // move.
         assert_eq!(mask_for_name("cross-arb"), None);
-        assert_eq!(mask_for_name("xsd"), None, "no member behind slot 2 yet");
+        assert_eq!(mask_for_name("xsd"), Some(BIT_XSD));
+        assert_eq!(mask_for_name("xsd"), Some(4), "slot 2's bit is wire-stable across the swap");
+        assert_eq!(mask_for_name("ai+xsd"), Some(BIT_AI_EXEC | BIT_VM | BIT_XSD));
+        assert_eq!(mask_for_name("ai+xsd"), Some(52));
+        assert_eq!(mask_for_name("ai+vrp+xsd"), Some(54));
         assert_eq!(mask_for_name("ai"), Some(48));
+        assert_eq!(mask_for_name("ai+vrp"), Some(50));
         assert_eq!(mask_for_name("ai+icdp"), Some(112));
-        assert_eq!(BIT_XSD, 4, "slot 2's bit is wire-stable across the swap");
         assert_eq!(mask_for_name("rule-tree"), Some(BIT_RULE_TREE));
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
-        assert_eq!(
-            mask_for_name("all"),
-            Some(123),
-            "every built slot 0..=6 minus the vacant slot 2 (XSD-S)"
-        );
+        assert_eq!(mask_for_name("all"), Some(127), "every built slot 0..=6");
         // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
         // (operator ruling 2026-09-02).
         const _: () = assert!(
@@ -1342,7 +1419,7 @@ mod tests {
         let s = StrategySet::new(0b1000_0000);
         assert_eq!(s.enabled_mask(), 0, "reserved bit 7 cleared");
         let s = StrategySet::new(BIT_XSD);
-        assert_eq!(s.enabled_mask(), 0, "slot 2 is vacant until XSD-3 (XSD-S)");
+        assert_eq!(s.enabled_mask(), BIT_XSD, "slot 2 is built now (XSD-3)");
         let s = StrategySet::new(BIT_ICDP);
         assert_eq!(s.enabled_mask(), BIT_ICDP, "slot 6 is built now (ICDP I4)");
         let s = StrategySet::new(BIT_AI_EXEC);
@@ -1508,17 +1585,18 @@ mod tests {
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 7), &mut c);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 9), &mut c);
-        // XSD-S: the vacant slot 2 refuses the same way until the xsd
-        // member lands (XSD-3) — no silent enable of nothing.
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XSD), &mut c);
         assert_eq!(s.enabled_mask(), 0);
-        assert_eq!(s.enable_refused_total(), 3);
+        assert_eq!(s.enable_refused_total(), 2);
         assert!(!s.is_halted(), "reserved-slot refusal is not a halt");
         // Slot 6 enables (an unconfigured icdp member is inert: it
-        // registers nothing and never fires).
+        // registers nothing and never fires); slot 2 likewise (XSD-3: an
+        // unconfigured xsd member maps no sym and arms no timer).
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_ICDP), &mut c);
         assert_eq!(s.enabled_mask(), BIT_ICDP);
-        assert_eq!(s.enable_refused_total(), 3);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XSD), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_ICDP | BIT_XSD);
+        assert_eq!(s.enable_refused_total(), 2);
+        assert_eq!(s.timer_period_ns(), s_timer_without_xsd(), "an unconfigured xsd arms no timer");
     }
 
     #[test]

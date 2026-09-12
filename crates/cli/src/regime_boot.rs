@@ -53,9 +53,9 @@ fn coded_member_slot(name: &str) -> Option<u8> {
         // `[labels.ev]` refuses the boot with "unknown coded member"
         // rather than applying to the VRP member.
         "vrp" => strategy_set::SLOT_VRP,
-        // XSD-S (2026-09-12): slot 2 is vacant — `cross_arb` is gone for
-        // the same reason `ev` is; `xsd` joins here when the member lands
-        // (XSD-3).
+        // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross_arb`
+        // is gone for the same reason `ev` is.
+        "xsd" => strategy_set::SLOT_XSD,
         "rule_tree" => strategy_set::SLOT_RULE_TREE,
         "ai_exec" => strategy_set::SLOT_AI_EXEC,
         "icdp" => strategy_set::SLOT_ICDP,

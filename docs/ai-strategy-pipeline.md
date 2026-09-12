@@ -408,13 +408,13 @@ to enabled members in slot order:
 |---|---|---|
 | 0 | 1 | `latency-arb` |
 | 1 | 2 | `vrp` (VRP V7, 2026-09-10 — was `ev`) |
-| 2 | 4 | *vacant* — held for `xsd` (XSD-S, 2026-09-12 — was `cross-arb`; wired in XSD-3) |
+| 2 | 4 | `xsd` — the cross-sectional dislocation member (XSD-S/XSD-3, 2026-09-12 — was `cross-arb`; configured only when `~/multivenue/xsd.toml` + `xsd-table.tsv` resolve) |
 | 3 | 8 | `rule-tree` |
 | 4 | 16 | `ai-exec` — the s4 Intent lane |
 | 5 | 32 | `vm` — the ruleset VM |
 | 6 | 64 | `icdp` — the intrabar candle-direction member (ICDP I3, 2026-09-03; configured only when `~/multivenue/icdp.toml` resolves) |
 
-`--strategy all` requests 123 (every built slot; 2 is vacant), but slots 1/3 need `vrp.toml` / `--rules-path`,
+`--strategy all` requests 127, but slots 1/2/3 need `vrp.toml` / `xsd.toml`+`xsd-table.tsv` / `--rules-path`,
 which the launchd wrapper does not pass. **Since the operator ruling of 2026-09-02 the wrapper boots
 the mask named in `~/multivenue/strategy.conf` — `STRATEGY=ai+icdp` = 112 (`ai_exec=true vm=true
 icdp=true`, every Rust-coded legacy strategy DISABLED at boot).** Disabling slot 5 gives **80**;

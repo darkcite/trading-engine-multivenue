@@ -350,6 +350,7 @@ dependencies = [
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xsd",
  "tracing",
  "tracing-subscriber",
  "tui",
@@ -1846,6 +1847,7 @@ dependencies = [
  "strategy-rule-tree",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xsd",
 ]
 
 [[package]]

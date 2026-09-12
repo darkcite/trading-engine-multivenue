@@ -100,9 +100,13 @@ STRATEGY="ai"
 if [ -f "$HOME/multivenue/strategy.conf" ]; then
   . "$HOME/multivenue/strategy.conf"
 fi
+# XSD-3 (2026-09-12): the slot-2 cross-sectional member joins the
+# allow-list (`ai+xsd`, `ai+vrp+xsd`, `xsd`); it boots only when
+# ~/multivenue/xsd.toml + xsd-table.tsv resolve (absent ⇒ the bit stays
+# unset, the rest of the mask boots). Paper only, like every member.
 case "$STRATEGY" in
-  ai|ai+icdp|icdp|ai+vrp|vrp) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp)" >&2; exit 78 ;;
+  ai|ai+icdp|icdp|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd)" >&2; exit 78 ;;
 esac
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's

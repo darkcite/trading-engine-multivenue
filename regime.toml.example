@@ -77,7 +77,7 @@ fund_p70_1e9 = 0
 
 # ---- RG8 (operator ruling 2026-09-05): labels are enforced everywhere ----
 # `require = 1` makes the engine REFUSE to boot an ENABLED signal-carrying
-# coded member (latency_arb, vrp, rule_tree, icdp) whose label is
+# coded member (latency_arb, vrp, xsd, rule_tree, icdp) whose label is
 # still ANY — label it below or leave it out of the mask. ai_exec is
 # exempt (its intents carry the lane's own label) and the vm's rows are
 # held to the law upstream (every row of a staged table must carry
@@ -88,9 +88,8 @@ fund_p70_1e9 = 0
 require = 1
 
 # ---- optional overrides of the coded members' regime labels (§4.2) ----
-# One `[labels.<member>]` table per coded member (latency_arb, vrp,
-# rule_tree, ai_exec, icdp — slot 2 is vacant since XSD-S 2026-09-12; `xsd`
-# joins when the member lands): `off = "soft" | "hard"` and up to
+# One `[labels.<member>]` table per coded member (latency_arb, vrp, xsd,
+# rule_tree, ai_exec, icdp): `off = "soft" | "hard"` and up to
 # four product terms `term1..term4`, each a list of label strings in the
 # §3.3 grammar `[fast:|slow:]dim:(*|!v|v1|v2…)` (∃-semantics across
 # terms; `rel:` is not allowed here — coded members are not per-symbol).

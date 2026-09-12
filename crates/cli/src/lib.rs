@@ -47,6 +47,7 @@ pub mod sigint;
 pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;
+pub mod xsd_boot;
 
 pub use paper::{
     boot_discovery, boot_info, build_ai_universe, build_deribit_symbol_table,

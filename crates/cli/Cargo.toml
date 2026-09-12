@@ -41,6 +41,7 @@ strategy-set         = { workspace = true }
 # offline and hashes the candidate artifact exactly like the worker.
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
+strategy-xsd         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }

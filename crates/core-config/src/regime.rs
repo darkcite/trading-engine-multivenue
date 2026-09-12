@@ -62,7 +62,7 @@ impl From<IcdpError> for RegimeConfigError {
 /// One `[labels.<member>]` override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelOverride {
-    /// The coded member's name (`latency_arb`, `vrp`, `rule_tree`,
+    /// The coded member's name (`latency_arb`, `vrp`, `xsd`, `rule_tree`,
     /// `ai_exec`, `icdp`).
     pub member: String,
     /// The parsed label set.
@@ -145,11 +145,12 @@ const PROFILE_KEYS: [&str; 22] = [
 /// EV member silently gate a different strategy; `docs/migration.md`
 /// records the boundary and the operator action (rename the section).
 ///
-/// **XSD-S (2026-09-12): `cross_arb` is GONE the same way** — slot 2 is
-/// vacant until `strategy-xsd` lands (XSD-3), when `xsd` joins this list.
-const MEMBER_NAMES: [&str; 5] = [
+/// **XSD-S/XSD-3 (2026-09-12): `cross_arb` is GONE the same way and
+/// slot 2 is `xsd`.**
+const MEMBER_NAMES: [&str; 6] = [
     "latency_arb",
     "vrp",
+    "xsd",
     "rule_tree",
     "ai_exec",
     "icdp",
@@ -706,17 +707,18 @@ mod tests {
         assert!(err.0.contains("unknown coded member"), "{}", err.0);
     }
 
-    /// XSD-S (2026-09-12): slot 2 is vacant — `[labels.cross_arb]` is
-    /// refused at the grammar for the same reason `[labels.ev]` is, and
-    /// `[labels.xsd]` is not accepted before the member exists (XSD-3).
+    /// XSD-S/XSD-3 (2026-09-12): slot 2 is `xsd` — `[labels.xsd]` parses
+    /// and `[labels.cross_arb]` is refused at the grammar for the same
+    /// reason `[labels.ev]` is.
     #[test]
-    fn slot_two_is_vacant_cross_arb_and_xsd_are_refused() {
+    fn slot_two_is_labelled_xsd_and_cross_arb_is_refused() {
         let with = |member: &str| {
             format!("{EXAMPLE}\n[labels.{member}]\noff = \"soft\"\nterm1 = [\"fast:shape:trend\"]\n")
         };
+        let ok = parse(&with("xsd")).expect("[labels.xsd] must parse");
+        assert_eq!(ok.labels.len(), 1);
+        assert_eq!(ok.labels[0].member, "xsd");
         let err = parse(&with("cross_arb")).expect_err("[labels.cross_arb] must be refused");
-        assert!(err.0.contains("unknown coded member"), "{}", err.0);
-        let err = parse(&with("xsd")).expect_err("[labels.xsd] must be refused until XSD-3");
         assert!(err.0.contains("unknown coded member"), "{}", err.0);
     }
 

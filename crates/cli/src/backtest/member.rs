@@ -77,6 +77,9 @@ use super::{
 pub enum MemberKind {
     /// Slot 6, `crates/strategy-icdp` — params from `icdp.toml`.
     Icdp,
+    /// Slot 2, `crates/strategy-xsd` — params from `xsd.toml`, the
+    /// table from `xsd-table.tsv`, an optional seed (XSD-3).
+    Xsd,
 }
 
 impl MemberKind {
@@ -84,6 +87,7 @@ impl MemberKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "icdp" => Some(Self::Icdp),
+            "xsd" => Some(Self::Xsd),
             _ => None,
         }
     }
@@ -92,17 +96,24 @@ impl MemberKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Icdp => "icdp",
+            Self::Xsd => "xsd",
         }
     }
 }
 
-/// `--member <kind>` plus the member's parameter file.
+/// `--member <kind>` plus the member's artifacts.
 #[derive(Clone, Debug)]
 pub struct MemberSpec {
     /// Which member.
     pub kind: MemberKind,
-    /// Its parameter artifact (`--icdp <path>` for icdp).
+    /// Its parameter artifact (`--icdp <path>` for icdp, `--xsd <path>`
+    /// for xsd).
     pub params: PathBuf,
+    /// xsd only: `--xsd-table <path>` (default `~/multivenue/xsd-table.tsv`).
+    pub table: Option<PathBuf>,
+    /// xsd only: `--xsd-seed <path>` (default `~/multivenue/xsd-seed.tsv`;
+    /// absent = no seed).
+    pub seed: Option<PathBuf>,
 }
 
 /// Round-trip counter over synthesized fills, member-agnostic: a
@@ -403,6 +414,78 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 );
                 (hash_hex, line, out, counters)
             }
+            MemberKind::Xsd => {
+                // The boot bundle law, offline: descriptors resolve against
+                // the capture's newest manifest; the seed keeps only hours
+                // before the replay's first wall hour (the boot-hour rule);
+                // no state file — a replay always starts flat.
+                let boot_hour = (merged[0].wall_ns / strategy_xsd::HOUR_NS) as i64;
+                let no_state = std::path::Path::new("/nonexistent/xsd-state.tsv");
+                let bundle = crate::xsd_boot::load_xsd_boot(
+                    Some(&spec.params),
+                    spec.table.as_deref(),
+                    spec.seed.as_deref(),
+                    Some(no_state),
+                    &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    boot_hour,
+                )
+                .map_err(HarnessError::Usage)?
+                .ok_or_else(|| {
+                    HarnessError::Usage("xsd: table absent — nothing to drive".to_owned())
+                })?;
+                let hash_hex = hex_lower(&bundle.params.hash);
+                let mut strat = strategy_xsd::XsdStrategy::new();
+                strat
+                    .configure(WallAnchor::new(0, 0), &bundle.params, &bundle.table)
+                    .map_err(|e| HarnessError::Usage(format!("xsd: configure refused: {e}")))?;
+                for (sym, hour, close) in &bundle.seed {
+                    strat.seed_close(*sym, *hour, *close);
+                }
+                strat
+                    .on_start(&mut ctx)
+                    .map_err(|e| HarnessError::Internal(format!("xsd on_start failed: {e}")))?;
+                let line = format!(
+                    "member: xsd params={} hash={} table={} table_hash={} targets={} pairs={} syms={} \
+                     rows_dropped={} seed_rows={} seed_dropped={} z_window_h={} grid_n={} boot_hour={} \
+                     anchor=wall (identity)",
+                    spec.params.display(),
+                    hash_hex,
+                    bundle.table_path.display(),
+                    hex_lower(&bundle.table.hash),
+                    strat.targets(),
+                    strat.pairs(),
+                    strat.syms(),
+                    bundle.rows_dropped,
+                    strat.counters().seed_rows,
+                    strat.counters().seed_dropped + bundle.seed_dropped as u64,
+                    bundle.params.z_window_h,
+                    bundle.params.grid_n,
+                    boot_hour,
+                );
+                let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
+                let c = *strat.counters();
+                let counters = format!(
+                    "member: xsd rolls={} decisions={} entries={} adds={} exits_revert={} exits_stop={} \
+                     exits_maxhold={} exits_regime={} intents_carried={} entries_cancelled={} caps_rejected={} \
+                     holds_absent={} pairs_warm={} positions_open={} orders_emitted={} regime=not-replayed(v1)",
+                    c.rolls,
+                    c.decisions,
+                    c.entries,
+                    c.adds,
+                    c.exits_revert,
+                    c.exits_stop,
+                    c.exits_maxhold,
+                    c.exits_regime,
+                    c.intents_carried,
+                    c.entries_cancelled,
+                    c.caps_rejected,
+                    c.holds_absent,
+                    c.pairs_warm,
+                    strat.positions(),
+                    out.orders_emitted,
+                );
+                (hash_hex, line, out, counters)
+            }
         };
     let outcome: ModelOutcome = engine.finish();
     let oos_round_trips = drive_out.round_trips - drive_out.rt_at_boundary;
@@ -673,15 +756,18 @@ mod tests {
     #[test]
     fn member_kind_tokens() {
         assert_eq!(MemberKind::parse("icdp"), Some(MemberKind::Icdp));
+        assert_eq!(MemberKind::parse("xsd"), Some(MemberKind::Xsd));
         assert_eq!(MemberKind::parse("vrp"), None);
         assert_eq!(MemberKind::parse(""), None);
         assert_eq!(MemberKind::Icdp.label(), "icdp");
+        assert_eq!(MemberKind::Xsd.label(), "xsd");
     }
 
     #[test]
     fn unknown_member_kind_is_refused_by_the_bin_grammar() {
         // The bin refuses before reaching `run_member`; the enum has no
         // fallback variant by construction.
-        assert!(MemberKind::parse("xsd").is_none());
+        assert!(MemberKind::parse("vrp").is_none());
+        assert!(MemberKind::parse("cross-arb").is_none());
     }
 }

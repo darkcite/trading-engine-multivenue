@@ -22,3 +22,4 @@ strategy-icdp        = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
+strategy-xsd         = { workspace = true }

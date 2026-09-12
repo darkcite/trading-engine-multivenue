@@ -173,6 +173,20 @@ struct BacktestArgs {
     /// `--member icdp`: the parameter artifact (`icdp.toml`).
     #[arg(long, requires = "member")]
     icdp: Option<PathBuf>,
+    /// `--member xsd`: the parameter artifact (`xsd.toml`; default
+    /// `~/multivenue/xsd.toml`).
+    #[arg(long, requires = "member")]
+    xsd: Option<PathBuf>,
+    /// `--member xsd`: the target / partner / β table (default
+    /// `~/multivenue/xsd-table.tsv`); descriptors resolve against the
+    /// capture's newest manifest.
+    #[arg(long, requires = "member")]
+    xsd_table: Option<PathBuf>,
+    /// `--member xsd`: hourly closes that warm the z rings (default
+    /// `~/multivenue/xsd-seed.tsv`; absent = the member warms from the
+    /// replay alone — rows at or after the replay's first hour drop).
+    #[arg(long, requires = "member")]
+    xsd_seed: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     #[arg(long)]
@@ -417,6 +431,32 @@ struct RunArgs {
     /// exist, or any file that does not parse, refuses the boot.
     #[arg(long)]
     vrp: Option<PathBuf>,
+    /// XSD-3: `xsd.toml` — the cross-sectional member's parameter
+    /// artifact (`~/multivenue/xsd.toml` by default). ABSENT at the
+    /// default location = the member is not configured and its enable
+    /// bit is never set (the `icdp.toml` law); an explicit path that
+    /// does not exist, or a file that does not parse, refuses the boot.
+    #[arg(long)]
+    xsd: Option<PathBuf>,
+    /// XSD-3: `xsd-table.tsv` — the worker's monthly target / partner /
+    /// β table (`~/multivenue/xsd-table.tsv` by default). Absent at the
+    /// default location = not configured (same as no `xsd.toml`); rows
+    /// whose descriptors are not in the boot universe are dropped and
+    /// counted; the file's sha256 is the table identity the state file
+    /// must match.
+    #[arg(long)]
+    xsd_table: Option<PathBuf>,
+    /// XSD-3: `xsd-seed.tsv` — hourly closes that warm the z rings
+    /// (`~/multivenue/xsd-seed.tsv` by default). Absent is LEGAL (the
+    /// member warms live); rows at or after the boot hour are dropped.
+    #[arg(long)]
+    xsd_seed: Option<PathBuf>,
+    /// XSD-3: `xsd-state.tsv` — the engine's own persisted positions
+    /// (`~/multivenue/xsd-state.tsv` by default), restored under the
+    /// same table hash, flattened under a changed one; a row the boot
+    /// universe cannot name refuses the boot.
+    #[arg(long)]
+    xsd_state: Option<PathBuf>,
     /// Cadence in seconds for periodic HdrHistogram dumps. `0`
     /// disables dumping (default). When >0, the engine writes the
     /// three latency histograms (ingest→strategy, strategy→submit,
@@ -551,7 +591,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         None => None,
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
-                eprintln!("backtest: unknown --member {name:?} (known: icdp)");
+                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd)");
                 return ExitCode::from(1);
             };
             let params = match kind {
@@ -565,8 +605,23 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         }
                     },
                 },
+                cli::backtest::member::MemberKind::Xsd => match args.xsd.clone() {
+                    Some(p) => p,
+                    None => match core_config::xsd::default_xsd_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member xsd needs --xsd <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
             };
-            Some(cli::backtest::member::MemberSpec { kind, params })
+            Some(cli::backtest::member::MemberSpec {
+                kind,
+                params,
+                table: args.xsd_table.clone(),
+                seed: args.xsd_seed.clone(),
+            })
         }
     };
     let cfg = cli::backtest::BacktestConfig {
@@ -2046,7 +2101,11 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        (name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp" | "vrp" | "ai+vrp"), _live) => {
+        (
+            name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp" | "vrp" | "ai+vrp" | "xsd"
+            | "ai+xsd" | "ai+vrp+xsd"),
+            _live,
+        ) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
             // latency-arb from the mandatory pair flags, rule-tree
@@ -2128,6 +2187,31 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // XSD-3: the member's four artifacts, resolved against the
+            // same descriptor table; only when the bit is requested
+            // (`--strategy ai` never touches the files). An ABSENT
+            // default `xsd.toml` or table leaves the member unconfigured
+            // and its bit unset (the vrp law); a present-and-wrong file
+            // refuses the boot.
+            let xsd_boot = if requested & strategy_set::BIT_XSD != 0 {
+                match cli::xsd_boot::load_xsd_boot(
+                    args.xsd.as_deref(),
+                    args.xsd_table.as_deref(),
+                    args.xsd_seed.as_deref(),
+                    args.xsd_state.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    cli::xsd_boot::wall_hour_now(),
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "xsd: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
@@ -2142,6 +2226,7 @@ fn run(args: RunArgs) -> ExitCode {
                 obs,
                 requested,
                 vrp_boot.as_ref(),
+                xsd_boot.as_ref(),
                 rules,
                 icdp_params.as_ref(),
                 regime_boot.as_ref(),

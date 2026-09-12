@@ -110,6 +110,8 @@ fn member_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
         member: Some(MemberSpec {
             kind: MemberKind::Icdp,
             params: toml.to_path_buf(),
+            table: None,
+            seed: None,
         }),
     }
 }
@@ -250,5 +252,172 @@ fn real_binary_member_grammar() {
         .expect("spawn");
     assert!(!conflict.status.success());
     assert!(conflict.stdout.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------
+// XSD-3: `--member xsd` on the same arm.
+// ---------------------------------------------------------------
+
+const XSD_A: u32 = (1 << 24) | 512; // binance-usdm:aaausdt
+const XSD_B: u32 = (1 << 24) | 513; // binance-usdm:bbbusdt
+const HOUR_S: u64 = 3_600;
+/// The wall hour the capture starts in (`EPOCH_NS` is 810 s into it).
+const XSD_H0: u64 = EPOCH_NS / 1_000_000_000 / HOUR_S;
+
+const XSD_TOML: &str = "[xsd]\n\
+z_window_h = 96\n\
+z_enter_1e9 = 3000000000\n\
+z_exit_1e9 = 0\n\
+z_stop_1e9 = 1000000000000\n\
+consensus = 1\n\
+grid_n = 1\n\
+grid_step_1e9 = 500000000\n\
+max_hold_s = 864000\n\
+cooldown_s = 3600\n\
+ttl_s = 300\n\
+position_usd_1e6 = 1000000000\n\
+max_positions = 82\n\
+max_gross_usd_1e6 = 100000000000\n\
+direction = 1\n";
+
+fn xsd_tick(sym: u32, wall_s: u64, mid_1e6: i64, seq: u32) -> Tick {
+    // Payload ts = mono; the harness maps the first record to EPOCH_NS.
+    let ts_ns = (wall_s - EPOCH_NS / 1_000_000_000) * 1_000_000_000;
+    Tick::new(
+        ts_ns,
+        VenueId::Binance,
+        sym,
+        seq,
+        Price::from_raw(mid_1e6 - 10_000),
+        Qty::from_raw(10_000_000),
+        Price::from_raw(mid_1e6 + 10_000),
+        Qty::from_raw(10_000_000),
+    )
+}
+
+/// Two perps over four wall hours: A dislocates +5 % during hour H0 (a
+/// long entry decided at the H0+1 boundary, priced by A's first tick of
+/// that hour), collapses during H0+1 (a revert exit at H0+2). The seed
+/// carries 95 wobbling hours so the window is exactly 96 deep at the
+/// first roll.
+fn build_xsd_capture(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let run = root.join(format!("run-{EPOCH_NS}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    std::fs::write(
+        run.join("instrument-manifest.tsv"),
+        format!("{XSD_A}\tbinance-usdm:aaausdt\n{XSD_B}\tbinance-usdm:bbbusdt\n"),
+    )
+    .expect("manifest");
+    let h = |k: u64| (XSD_H0 + k) * HOUR_S;
+    let t0 = EPOCH_NS / 1_000_000_000;
+    let ticks = [
+        xsd_tick(XSD_A, t0, 100_000_000, 1),
+        xsd_tick(XSD_B, t0 + 1, 100_000_000, 2),
+        xsd_tick(XSD_A, h(0) + 3_500, 105_000_000, 3), // H0 closes: A 105, B 100
+        xsd_tick(XSD_B, h(0) + 3_501, 100_000_000, 4),
+        xsd_tick(XSD_A, h(1) + 5, 105_100_000, 5), // roll → ENTER; priced at this ask
+        xsd_tick(XSD_A, h(1) + 10, 105_100_000, 6), // the IoC fills at the touch
+        xsd_tick(XSD_B, h(1) + 11, 100_000_000, 7),
+        xsd_tick(XSD_A, h(1) + 3_500, 100_000_000, 8), // H0+1 closes: A back at 100
+        xsd_tick(XSD_B, h(1) + 3_501, 100_000_000, 9),
+        xsd_tick(XSD_A, h(2) + 5, 100_000_000, 10), // roll → EXIT revert; priced at this bid
+        xsd_tick(XSD_A, h(2) + 10, 100_000_000, 11), // the exit fills
+        xsd_tick(XSD_B, h(2) + 11, 100_000_000, 12),
+        xsd_tick(XSD_A, h(3) + 5, 100_000_000, 13),
+        xsd_tick(XSD_B, h(3) + 6, 100_000_000, 14),
+    ];
+    let path = run.join("bn-ticks.pmlr");
+    let mut w = PmlrWriter::open(&path, SlotKind::Tick, EPOCH_NS).expect("open writer");
+    for t in &ticks {
+        w.append(t).expect("append");
+    }
+    w.flush().expect("flush");
+    let toml = root.join("xsd.toml");
+    std::fs::write(&toml, XSD_TOML).expect("write xsd.toml");
+    let table = root.join("xsd-table.tsv");
+    std::fs::write(
+        &table,
+        "# target\tpartner\tbeta_1e9\nbinance-usdm:aaausdt\tbinance-usdm:bbbusdt\t1000000000\n\
+         binance-usdm:aaausdt\tbinance-usdm:zzzusdt\t1000000000\n",
+    )
+    .expect("write table");
+    let seed = root.join("xsd-seed.tsv");
+    let mut s = String::from("# descriptor\topen_ms\tclose_1e6\n");
+    let mut k = 0u64;
+    while k < 95 {
+        let hour = XSD_H0 - 95 + k;
+        let a = if k % 2 == 0 { 100_000_000 } else { 100_200_000 };
+        s.push_str(&format!("binance-usdm:aaausdt\t{}\t{a}\n", hour * HOUR_S * 1_000));
+        s.push_str(&format!("binance-usdm:bbbusdt\t{}\t100000000\n", hour * HOUR_S * 1_000));
+        k += 1;
+    }
+    // A seed row AT the boot hour must be dropped, never trusted.
+    s.push_str(&format!("binance-usdm:aaausdt\t{}\t999000000\n", XSD_H0 * HOUR_S * 1_000));
+    std::fs::write(&seed, s).expect("write seed");
+    (root.to_path_buf(), toml, table, seed)
+}
+
+#[test]
+fn xsd_member_enters_and_reverts_on_the_wall_hour_grid() {
+    let root = unique_root("xsd");
+    let (replay, toml, table, seed) = build_xsd_capture(&root);
+    let mut cfg = member_cfg(&replay, &toml);
+    cfg.member = Some(MemberSpec {
+        kind: MemberKind::Xsd,
+        params: toml.clone(),
+        table: Some(table),
+        seed: Some(seed),
+    });
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+    let hash = core_crypto::sha256(XSD_TOML.as_bytes());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        out.schema1.starts_with(&format!("{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",\"split\":\"0/100\",")),
+        "schema1: {}",
+        out.schema1
+    );
+    assert!(out.summary.contains("member: xsd params="), "{}", out.summary);
+    assert!(
+        out.summary.contains(" targets=1 pairs=1 syms=2 rows_dropped=1 seed_rows=190 seed_dropped=1 "),
+        "{}",
+        out.summary
+    );
+    // Three rolls (H0+1, +2, +3): one entry, one revert exit, no stop.
+    assert!(
+        out.summary.contains(" rolls=3 decisions=3 entries=1 adds=0 exits_revert=1 exits_stop=0 "),
+        "{}",
+        out.summary
+    );
+    assert!(out.summary.contains(" positions_open=0 orders_emitted=2 "), "{}", out.summary);
+    assert_eq!(out.stats.fills_total, 2, "{}", out.summary);
+    assert_eq!(out.stats.ioc_fills, 2, "{}", out.summary);
+    assert_eq!(out.stats.oos_round_trips, 1, "{}", out.summary);
+    assert!(out.schema1.contains("\"round_trips\":1,\"legs\":2}"), "{}", out.schema1);
+    // Bought ~9.5 units at 105.11, sold at 99.99: ≈ −$48.7 at zero fee.
+    let key = "\"net_pnl_usd\":";
+    let i = out.schema1.find(key).expect("net field") + key.len();
+    let j = out.schema1[i..].find(',').expect("comma") + i;
+    let net: f64 = out.schema1[i..j].parse().expect("json number");
+    assert!((-49.5..=-48.0).contains(&net), "net {net}: {}", out.schema1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn xsd_member_without_a_table_is_refused_with_a_reason() {
+    let root = unique_root("xsd-notable");
+    let (replay, toml, _table, seed) = build_xsd_capture(&root);
+    let mut cfg = member_cfg(&replay, &toml);
+    cfg.member = Some(MemberSpec {
+        kind: MemberKind::Xsd,
+        params: toml.clone(),
+        table: Some(root.join("absent-table.tsv")),
+        seed: Some(seed),
+    });
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("an explicit absent table must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("does not exist"), "{msg}");
     let _ = std::fs::remove_dir_all(&root);
 }

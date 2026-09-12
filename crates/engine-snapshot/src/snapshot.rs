@@ -40,9 +40,9 @@ pub const RUN_DIR_MAX: usize = 160;
 /// wire-stable, the member behind it went from `strategy-ev` to
 /// `strategy-vrp`. A snapshot taken before that date names an EV member
 /// under this slot; `docs/migration.md` records the boundary.
-/// **Slot 2 changed meaning on 2026-09-12 (XSD-S)**: `strategy-cross-arb`
-/// was unlinked and the slot is held for `strategy-xsd` (wired in XSD-3;
-/// vacant in between — its row reads all zeros).
+/// **Slot 2 changed meaning on 2026-09-12 (XSD-S/XSD-3)**:
+/// `strategy-cross-arb` was unlinked and `strategy-xsd` took the number
+/// the same day.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "latency-arb",
     "vrp",

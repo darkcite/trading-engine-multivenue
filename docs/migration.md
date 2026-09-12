@@ -6,6 +6,78 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — slot 2 WIRED: `strategy-xsd` in the set, four operator artifacts, `--member xsd` (XSD-3)
+
+**What changed**
+
+- `strategy-set`: `BIT_XSD` (4) is back in `BUILT_MASK` (`all` = 127 again);
+  `mask_for_name` accepts `xsd` (4), `ai+xsd` (52), `ai+vrp+xsd` (54);
+  `StrategySet` owns an `XsdStrategy` at slot 2 with the full fan-out,
+  `xsd_mut()` / `xsd()`, `slot_counters`, label + gate routing;
+  `StrategyCounters::{xsd_counters, xsd_state_epoch, xsd_positions_view}`
+  forward to the member. `ai` 48 / `ai+vrp` 50 / `ai+icdp` 112 unchanged.
+- cli: `crates/cli/src/xsd_boot.rs` resolves the member's artifacts (all
+  under `~/multivenue/`, none in git): `xsd.toml` (integer params —
+  ABSENT default ⇒ not configured, bit unset; `xsd.toml.example`),
+  `xsd-table.tsv` (`target \t partner \t beta_1e9 [\t rank \t t_adf_1e6]`;
+  unresolvable rows dropped + counted, zero usable ⇒ refuse; sha256 of the
+  bytes = the table identity), `xsd-seed.tsv` (`descriptor \t open_ms \t
+  close_1e6`; rows at/after the boot hour dropped; absent legal),
+  `xsd-state.tsv` (engine-written: `V 1` · `H <table_hash>` · `P descriptor
+  side d grid_units qty_1e6 notional_1e6 entry_hour last_add_hour`; restored
+  under the same hash, FLATTENED under a changed one at each target's first
+  fresh tick; a descriptor the universe lacks REFUSES the boot — move the
+  file aside). Flags `--xsd` / `--xsd-table` / `--xsd-seed` / `--xsd-state`
+  on `run`; the set builder configures + seeds + restores and prints
+  `xsd: artifact configured hash=… table_hash=… targets= pairs= syms=
+  rows_dropped= seed_rows= seed_dropped=` and one of `xsd: no state` /
+  `xsd: state restored positions=N` / `xsd: state discarded (table hash
+  changed) positions_to_flatten=N`; the 5 s block rewrites the state file
+  when the member's epoch moves (atomic rename, failures logged).
+- Metrics: `engine_xsd_{rolls,decisions,entries_decided,adds_decided,entries,
+  adds,exits_revert,exits_stop,exits_maxhold,exits_rotation,exits_regime,
+  intents_carried,entries_cancelled,caps_rejected,holds_absent,
+  regime_blocked,seed_rows,seed_dropped}_total` + gauges
+  `engine_xsd_pairs_warm`, `engine_xsd_positions`. `/state` shows the slot
+  through the generic per-slot row (a dedicated xsd block is deferred with
+  the TUI row — the `"v": 1` contract is untouched).
+- Regime: `[labels.xsd]` accepted (`core-config::regime` MEMBER_NAMES,
+  `regime_boot`); slot 2 joins RG8's `require = 1` list.
+- Harness: `backtest --member xsd [--xsd <toml>] [--xsd-table <tsv>]
+  [--xsd-seed <tsv>]` on the Tier-3 arm — descriptors resolve against the
+  capture's newest manifest, the seed keeps hours before the replay's first
+  wall hour, no state file (a replay starts flat). The frozen worker argv is
+  untouched.
+- `scripts/engine-wrapper.sh` allow-list gains `ai+xsd`, `ai+vrp+xsd`, `xsd`.
+  `~/multivenue/strategy.conf` is NOT changed by this entry (`ai+vrp` stays
+  live until XSD-5).
+
+**Why**
+
+Ruling R3 (slot 2) + doc 08 phase XSD-3: the member proven bit-identical to
+the research (XSD-2) gets its boot path, so XSD-4's worker artifacts and
+XSD-5's paper run have something to feed.
+
+**Ripple effects**
+
+- A boot with the xsd bit requested and NO `xsd.toml` / table at the default
+  paths behaves like a boot without the bit (the vrp law) — `--strategy
+  ai+vrp+xsd` on today's host boots `ai+vrp` and logs `xsd: artifact absent`.
+- `EnableStrategy` for slot 2 now enables an (unconfigured, inert) member
+  instead of a counted refusal — the pre-XSD-S behaviour.
+- A `regime.toml` with `[labels] require = 1` refuses an `xsd`-carrying
+  mask until `[labels.xsd]` is written (R8: xsd boots ANY today).
+
+**Migration steps**
+
+1. `cargo build --release -p cli` (the harness and the boot path).
+2. Nothing else until XSD-4 writes the artifacts.
+
+**Rollback**
+
+- Revert the commit; no on-disk format moved. A stray `xsd-state.tsv` is
+  ignored by a binary without the flag.
+
 ## 2026-09-12 — strategy-set slot 2: `cross-arb` OUT, held for `xsd` (XSD-S)
 
 **What changed**
