@@ -43,6 +43,7 @@
 //! timelines are copied out of the mmap'd capture, ~80 B per tick).
 //! Nothing here is reachable from a hot path.
 
+pub mod binary;
 pub mod fill;
 pub mod funding;
 /// XSD-F/Tier 3: `--member <name>` — the harness drives a coded member.
@@ -1238,6 +1239,7 @@ fn load_and_merge(
     stale_after_ms: [u32; 7],
     opt_out: &mut opt::OptLoadOut,
     sym_class: &mut BTreeMap<u32, InstrumentClass>,
+    binary_underlying: &mut BTreeMap<u32, u32>,
 ) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
     // manifest join — each run's `<sym>\t<descriptor>` rows joined
@@ -1249,6 +1251,10 @@ fn load_and_merge(
         .into_iter()
         .map(|(sym, desc)| (desc, sym))
         .collect();
+    // BIN15 O3: a rolling slot's UNDERLYING, out of the same
+    // descriptor table. The roll event carries a family index, which
+    // means nothing across runs; the descriptor carries the coin.
+    *binary_underlying = binary::underlying_map(&newest_by_desc);
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedRec> = Vec::new();
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(runs.len());
@@ -1830,8 +1836,14 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut opt_out = opt::OptLoadOut::default();
     let mut sym_class: BTreeMap<u32, InstrumentClass> = BTreeMap::new();
-    let (merged, run_summaries) =
-        load_and_merge(&runs, model.stale_after_ms, &mut opt_out, &mut sym_class)?;
+    let mut binary_underlying: BTreeMap<u32, u32> = BTreeMap::new();
+    let (merged, run_summaries) = load_and_merge(
+        &runs,
+        model.stale_after_ms,
+        &mut opt_out,
+        &mut sym_class,
+        &mut binary_underlying,
+    )?;
     let universe = derive_universe(&merged);
 
     // The REUSED validator (§3.5) — same byte scanner, same reject
@@ -1961,6 +1973,17 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &opt_out.terms,
         window_end_wall_ns,
     );
+    // BIN15 O3: the per-INSTANCE binary schedule. Same shape and the
+    // same reason as the option model above — one helper, three
+    // surfaces — but a queue per sym, because a rolling slot settles
+    // once per period rather than once ever.
+    let binary_model = binary::register_binary_model(
+        &mut engine,
+        &merged,
+        &binary_underlying,
+        window_end_wall_ns,
+    );
+    let binary_line = render_binary_line(&binary_model);
     // R5: the per-contract settlement table. Built here, where the
     // refs are, because `OptModelRegistration` exists precisely so each
     // report surface can print the numbers the engine was configured
@@ -2325,6 +2348,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             hash_hex: &hash_hex,
             regime: &regime_report,
             opt_settle_lines: &opt_settle_lines,
+            binary_line: &binary_line,
         },
     );
     Ok(BacktestOutput {
@@ -2537,6 +2561,29 @@ struct SummaryExtras<'a> {
     /// samples, `settle=last` otherwise). Empty on an option-free root,
     /// which is what keeps that root's report byte-identical.
     opt_settle_lines: &'a [String],
+    /// BIN15 O3: the binary instance census, EMPTY on a root with no
+    /// rolling slots — which is what keeps that root's report
+    /// byte-identical to the pre-BIN15 one.
+    binary_line: &'a str,
+}
+
+/// BIN15 O3: the binary instance census, or "" when the root holds no
+/// rolling slots at all.
+///
+/// `unsettleable > 0` is the number an operator has to read: those
+/// instances' positions marked out at the last book price instead of
+/// at a payout, because this window does not hold their settlement
+/// evidence. It is not an error — a ≤ 2 h window legitimately cuts
+/// through expiries — but it bounds what the P&L of a binary member
+/// can be said to mean.
+pub(crate) fn render_binary_line(reg: &binary::BinaryRegistration) -> String {
+    if reg.instances == 0 {
+        return String::new();
+    }
+    format!(
+        "binary: instances={} settled={} unsettleable={}",
+        reg.instances, reg.settled, reg.unsettleable
+    )
 }
 
 /// Deterministic human summary (stderr; §10 harness observability).
@@ -2552,6 +2599,7 @@ fn render_summary(
         hash_hex,
         regime,
         opt_settle_lines,
+        binary_line,
     } = *extras;
     let mut s = String::with_capacity(2048);
     s.push_str(&format!(
@@ -2622,6 +2670,10 @@ fn render_summary(
             s.push_str(line);
             s.push('\n');
         }
+    }
+    if !binary_line.is_empty() {
+        s.push_str(binary_line);
+        s.push('\n');
     }
     for (i, r) in runs.iter().enumerate() {
         s.push_str(&format!("  run[{i}] epoch_ns={}", r.epoch_ns));

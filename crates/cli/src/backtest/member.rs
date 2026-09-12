@@ -327,8 +327,14 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut opt_out = crate::backtest::opt::OptLoadOut::default();
     let mut sym_class: BTreeMap<u32, InstrumentClass> = BTreeMap::new();
-    let (merged, run_summaries) =
-        load_and_merge(&runs, model.stale_after_ms, &mut opt_out, &mut sym_class)?;
+    let mut binary_underlying: BTreeMap<u32, u32> = BTreeMap::new();
+    let (merged, run_summaries) = load_and_merge(
+        &runs,
+        model.stale_after_ms,
+        &mut opt_out,
+        &mut sym_class,
+        &mut binary_underlying,
+    )?;
     let universe = derive_universe(&merged);
     let descriptors = manifest_descriptor_table(&runs);
 
@@ -368,6 +374,19 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     );
     for (sym, class) in &sym_class {
         engine.set_sym_class(*sym, *class);
+    }
+    // BIN15 O3: the binary schedule, on the same arm and from the same
+    // helper as the VM path. The class assignments above come FIRST —
+    // the grid law keys on a known class.
+    let binary_model = crate::backtest::binary::register_binary_model(
+        &mut engine,
+        &merged,
+        &binary_underlying,
+        window_end_wall_ns,
+    );
+    let binary_line = crate::backtest::render_binary_line(&binary_model);
+    if !binary_line.is_empty() {
+        eprintln!("{binary_line}");
     }
 
     // ---- the member ----

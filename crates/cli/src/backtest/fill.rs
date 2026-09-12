@@ -602,6 +602,17 @@ pub struct ModelOutcome {
     /// dead book at a price the contract can no longer trade at. The
     /// cash settlement already happened; nothing can execute after it.
     pub settled_sym_orders_canceled: u64,
+    /// BIN15 O3: orders refused because they missed the HIP-4 venue
+    /// grid — off the 1e-4 price tick, a fractional contract, outside
+    /// the `[0.001, 0.999]` band, or under the 10 USDC minimum. The
+    /// venue would have rejected them, so scoring them as fills would
+    /// invent P&L the strategy could never have had. Prediction-class
+    /// syms only; every other class is untouched.
+    pub prediction_grid_refused: u64,
+    /// BIN15 O3: binary instances closed at their settlement value.
+    /// Unlike `opt_settled` this can exceed the number of SYMS — one
+    /// rolling slot settles once per period.
+    pub binary_settled: u64,
     /// XSD-F: fills charged the venue's DEAREST class because the sym's
     /// class was unknown (no manifest row, or a descriptor shape the law
     /// does not know). > 0 under per-class fees is a tell to print — the
@@ -612,6 +623,40 @@ pub struct ModelOutcome {
     pub oos_net_ladder_1e12: [i128; 3],
     /// Fee ladder for the full book.
     pub full_net_ladder_1e12: [i128; 3],
+}
+
+// ---------------------------------------------------------------
+// BIN15 O3: the HIP-4 prediction grid + per-instance settlement
+// ---------------------------------------------------------------
+
+/// Price tick of a HIP-4 outcome market: 1e-4 ⇒ 100 in ×1e6 units.
+pub const PREDICTION_TICK_1E6: i64 = 100;
+/// Size lot: whole contracts ⇒ 1e6 in ×1e6 units.
+pub const PREDICTION_LOT_1E6: i64 = 1_000_000;
+/// Tradable price band, ×1e6: `[0.001, 0.999]`.
+pub const PREDICTION_PX_MIN_1E6: i64 = 1_000;
+/// Upper end of the band.
+pub const PREDICTION_PX_MAX_1E6: i64 = 999_000;
+/// Minimum order notional: 10 USDC, ×1e6.
+pub const PREDICTION_MIN_NOTIONAL_1E6: i64 = 10_000_000;
+
+/// One instance's settlement schedule on a ROLLING slot.
+///
+/// The slot-reuse law is why this is a queue and not a field: a
+/// 15-minute family's sym hosts 96 instances a day, each with its own
+/// expiry and its own binary outcome. An option settles once and stays
+/// settled ([`FillEngine::settle_pass`]); a binary slot settles,
+/// **un-settles**, and trades the next instance.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BinarySettle {
+    /// Wall ns from which the instance no longer trades — the venue
+    /// clears the book at expiry.
+    pub halt_ns: u64,
+    /// Wall ns at which the value is known (expiry + the settlement
+    /// TWAP window; equal to `halt_ns` when the family settles at `T`).
+    pub settle_ns: u64,
+    /// The binary payout: 0 or 1_000_000 (×1e6 of one USDC).
+    pub value_1e6: i64,
 }
 
 /// One per-sym row for the `--emit-detail` sidecar (full book, sorted
@@ -675,6 +720,18 @@ pub struct FillEngine {
     opt_settle_1e6: BTreeMap<u32, i64>,
     /// VX-A: syms already pinned to their settlement value.
     settled: BTreeSet<u32>,
+    /// BIN15 O3: per-sym settlement schedules, oldest first. A sym is
+    /// present only while it has instances left to settle.
+    binary_settle: BTreeMap<u32, Vec<BinarySettle>>,
+    /// Earliest `halt_ns` or `settle_ns` still pending, so the hot
+    /// path pays one compare (the `settle_due_ns` pattern).
+    binary_due_ns: u64,
+    /// Syms halted by a binary instance's expiry — a SUBSET of
+    /// `settled` that this engine put there and will take back out
+    /// when the instance settles.
+    binary_halted: BTreeSet<u32>,
+    prediction_grid_refused: u64,
+    binary_settled: u64,
     /// VX-A: the earliest expiry still un-pinned, so the per-record
     /// cost of the whole rung is ONE integer compare. `u64::MAX` =
     /// nothing pending.
@@ -737,6 +794,11 @@ impl FillEngine {
             opt_expiry_ns: BTreeMap::new(),
             opt_settle_1e6: BTreeMap::new(),
             settled: BTreeSet::new(),
+            binary_settle: BTreeMap::new(),
+            binary_due_ns: u64::MAX,
+            binary_halted: BTreeSet::new(),
+            prediction_grid_refused: 0,
+            binary_settled: 0,
             settle_due_ns: u64::MAX,
             last_wall_ns: 0,
             opt_settled: 0,
@@ -814,6 +876,14 @@ impl FillEngine {
             || (order.kind != ORDER_KIND_MAKER && order.kind != ORDER_KIND_IOC)
         {
             self.unroutable += 1;
+            return;
+        }
+        // BIN15 O3: the HIP-4 venue grid. The venue refuses these
+        // outright, so filling them would invent P&L the strategy
+        // could never have had. Prediction class on Hyperliquid only —
+        // every other venue and class takes the branch below unchanged.
+        if self.off_prediction_grid(order.sym, venue_byte, px, qty) {
+            self.prediction_grid_refused += 1;
             return;
         }
         let mut sym_count = 0usize;
@@ -928,6 +998,13 @@ impl FillEngine {
         self.last_wall_ns = wall_ns;
         if wall_ns >= self.settle_due_ns {
             self.settle_pass(wall_ns);
+        }
+        // BIN15 O3: the binary schedule. A clock fact like the option
+        // sweep above, and for the same reason it runs on records of
+        // OTHER syms: the venue clears a HIP-4 book at expiry, so the
+        // settling instrument's own tape has already stopped.
+        if wall_ns >= self.binary_due_ns {
+            self.binary_pass(wall_ns);
         }
         if tick.is_stale() {
             self.stale_ticks_skipped += 1;
@@ -1267,6 +1344,147 @@ impl FillEngine {
         }
     }
 
+    /// BIN15 O3: whether an order misses the HIP-4 grid.
+    ///
+    /// Keyed on the KNOWN class, like [`Self::fee_rate_for`]: a sym
+    /// whose class the descriptor law could not read is not gridded,
+    /// because guessing a venue's tick from an unknown shape is how a
+    /// harness silently drops orders it should have filled.
+    #[inline]
+    fn off_prediction_grid(&self, sym: u32, venue_byte: u8, px: i64, qty: i64) -> bool {
+        if venue_byte != core_types::VenueId::Hyperliquid as u8
+            || self.sym_class.get(&sym) != Some(&InstrumentClass::Prediction)
+        {
+            return false;
+        }
+        px % PREDICTION_TICK_1E6 != 0
+            || qty % PREDICTION_LOT_1E6 != 0
+            || !(PREDICTION_PX_MIN_1E6..=PREDICTION_PX_MAX_1E6).contains(&px)
+            || (px as i128 * qty as i128) / 1_000_000 < i128::from(PREDICTION_MIN_NOTIONAL_1E6)
+    }
+
+    /// BIN15 O3: append one instance's settlement schedule for `sym`.
+    ///
+    /// Entries are kept sorted by `halt_ns` and consumed oldest-first,
+    /// which is what makes a rolling slot replayable: the same sym
+    /// halts, settles, and then trades its successor. Offline/boot
+    /// path (may allocate).
+    pub fn set_binary_settle(&mut self, sym: u32, s: BinarySettle) {
+        debug_assert!(s.settle_ns >= s.halt_ns);
+        debug_assert!(s.value_1e6 == 0 || s.value_1e6 == 1_000_000);
+        let q = self.binary_settle.entry(sym).or_default();
+        let at = q.partition_point(|e| e.halt_ns <= s.halt_ns);
+        q.insert(at, s);
+        self.refresh_binary_due();
+    }
+
+    /// The earliest binary halt/settle instant still pending.
+    fn refresh_binary_due(&mut self) {
+        let mut next = u64::MAX;
+        for (sym, q) in &self.binary_settle {
+            let Some(head) = q.first() else {
+                continue;
+            };
+            // A halted sym is waiting for its SETTLE instant; an
+            // untouched one for its HALT.
+            let due = if self.binary_halted.contains(sym) {
+                head.settle_ns
+            } else {
+                head.halt_ns
+            };
+            if due < next {
+                next = due;
+            }
+        }
+        self.binary_due_ns = next;
+    }
+
+    /// BIN15 O3: run every binary instance whose instant has passed.
+    ///
+    /// Two transitions, in this order for each sym's head entry:
+    ///
+    /// * `wall ≥ settle_ns` — pin the mark to the payout, close
+    ///   whatever is still open at it (charging the class's CLOSING
+    ///   pair, per the charge-once law), pop the entry and take the
+    ///   sym back OUT of `settled` so the next instance trades. The
+    ///   un-settling is the whole difference from the option law.
+    /// * else `wall ≥ halt_ns` — halt: the venue clears the book at
+    ///   expiry, so the F12 guard set is exactly the right place for
+    ///   it, and no fill can happen until the settle above.
+    fn binary_pass(&mut self, wall_ns: u64) {
+        loop {
+            let mut settle_now: Option<(u32, BinarySettle)> = None;
+            let mut halt_now: Option<u32> = None;
+            for (sym, q) in &self.binary_settle {
+                let Some(head) = q.first() else {
+                    continue;
+                };
+                if wall_ns >= head.settle_ns {
+                    settle_now = Some((*sym, *head));
+                    break;
+                }
+                if wall_ns >= head.halt_ns && !self.binary_halted.contains(sym) {
+                    halt_now = Some(*sym);
+                    break;
+                }
+            }
+            if let Some((sym, head)) = settle_now {
+                self.settle_binary(sym, &head);
+                if let Some(q) = self.binary_settle.get_mut(&sym) {
+                    q.remove(0);
+                    if q.is_empty() {
+                        self.binary_settle.remove(&sym);
+                    }
+                }
+                // The slot trades again the moment its successor is
+                // bound — nothing else un-settles a sym.
+                self.binary_halted.remove(&sym);
+                self.settled.remove(&sym);
+                continue;
+            }
+            if let Some(sym) = halt_now {
+                self.binary_halted.insert(sym);
+                self.settled.insert(sym);
+                continue;
+            }
+            break;
+        }
+        self.refresh_binary_due();
+    }
+
+    /// Close `sym`'s position at one instance's payout.
+    fn settle_binary(&mut self, sym: u32, s: &BinarySettle) {
+        let value = s.value_1e6;
+        let old = self.marks_1e6.insert(sym, value).unwrap_or(value);
+        if self.full.on_mark(sym, old, value) {
+            self.bounds_refresh(sym, value);
+        }
+        if self.oos.on_mark(sym, old, value) {
+            self.dd.sample(self.oos.equity_1e12());
+        }
+        let qty_full = self.full.entries.get(&sym).map_or(0, |e| e.qty_1e6);
+        let qty_oos = self.oos.entries.get(&sym).map_or(0, |e| e.qty_1e6);
+        if qty_full == 0 && qty_oos == 0 {
+            return;
+        }
+        // Settlement is a CLOSING fill by definition (§3.4) — the
+        // charge-once law's `prediction` pair, never `prediction_open`.
+        let venue = model_venue_byte(sym);
+        let taker = self.fee_rate_for(venue, sym, false).1;
+        if qty_full != 0 {
+            let n = value as i128 * i128::from(qty_full.unsigned_abs());
+            let fee = self.fee_for(sym, n, qty_full.abs(), taker, s.settle_ns);
+            self.full.settle(sym, value, value, fee);
+        }
+        if qty_oos != 0 {
+            let n = value as i128 * i128::from(qty_oos.unsigned_abs());
+            let fee = self.fee_for(sym, n, qty_oos.abs(), taker, s.settle_ns);
+            self.oos.settle(sym, value, value, fee);
+            self.dd.sample(self.oos.equity_1e12());
+        }
+        self.binary_settled = self.binary_settled.wrapping_add(1);
+    }
+
     /// Record the index/underlying reference for an OPTION sym. Boot of
     /// the replay loop; presence also classes the sym as fee-capped.
     pub fn set_opt_index(&mut self, sym: u32, index_1e6: i64) {
@@ -1489,6 +1707,8 @@ impl FillEngine {
             ioc_canceled: self.ioc_canceled,
             ttl_expired: self.ttl_expired,
             opt_settled: self.opt_settled,
+            prediction_grid_refused: self.prediction_grid_refused,
+            binary_settled: self.binary_settled,
             settled_sym_orders_canceled: self.settled_sym_orders_canceled,
             fee_class_unknown_fills: self.fee_class_unknown_fills,
             oos_net_ladder_1e12: [
@@ -1889,6 +2109,234 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(e.is_opening_fill(sym, Side::Bid));
         assert!(!e.is_opening_fill(sym, Side::Ask));
+    }
+
+    // ---- BIN15 O3: the HIP-4 grid + per-instance settlement ------
+
+    /// A rolling slot on Hyperliquid: prediction class, the
+    /// charge-once pair (free to open, 2/5 to close).
+    fn hl_slot_sym() -> u32 {
+        make_symbol_id(VenueId::Hyperliquid, 4096)
+    }
+
+    fn binary_engine() -> FillEngine {
+        let mut p = ModelParams {
+            fee_bps: [[(0, 0); 5]; 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+            ..ModelParams::default()
+        };
+        let hl = VenueId::Hyperliquid as usize;
+        p.fee_bps[hl][InstrumentClass::Prediction.index()] = (2, 5);
+        p.fee_open_bps[hl][InstrumentClass::Prediction.index()] = Some((0, 0));
+        let mut e = FillEngine::new(p, u64::MAX / 2);
+        e.set_sym_class(hl_slot_sym(), InstrumentClass::Prediction);
+        e
+    }
+
+    /// A grid-legal buy: 0.50, 100 whole contracts, $50 notional.
+    fn grid_bid(oid: u64) -> Order {
+        order(hl_slot_sym(), Side::Bid, 500_000, 100_000_000, oid)
+    }
+
+    /// A tick whose ask strictly crosses 0.50.
+    fn crossing_tick() -> Tick {
+        tick(hl_slot_sym(), 300_000, 500_000_000, 400_000, 500_000_000)
+    }
+
+    /// The slot-reuse law: one sym, three instances, each settling on
+    /// its own schedule, and the slot TRADING AGAIN in between. This
+    /// is the whole difference from the option law, where a settled
+    /// sym stays settled forever.
+    #[test]
+    fn a_binary_slot_settles_each_instance_and_trades_the_next() {
+        let sym = hl_slot_sym();
+        let mut e = binary_engine();
+        // Three instances, 1 s apart, each with a 60 ms settlement
+        // window (the shape, not the venue's scale).
+        for (i, value) in [(1u64, 1_000_000i64), (2, 0), (3, 1_000_000)] {
+            e.set_binary_settle(
+                sym,
+                BinarySettle {
+                    halt_ns: i * 1_000_000_000,
+                    settle_ns: i * 1_000_000_000 + 60_000_000,
+                    value_1e6: value,
+                },
+            );
+        }
+        let mut out = Vec::new();
+
+        // Instance 1: fills, then halts, then settles at 1.0.
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, 500_000_000, &mut out);
+        assert_eq!(out.len(), 1, "the slot trades while its instance is live");
+        assert_eq!(out[0].px_1e6, 500_000);
+        assert_eq!(out[0].fee_1e12, 0, "opening a HIP-4 position is free");
+
+        // Halted: past the expiry, before the value is known. A
+        // resting order must not fill against the cleared book.
+        e.intake(&grid_bid(2), 20);
+        e.on_record(&crossing_tick(), 30, 1_010_000_000, &mut out);
+        assert!(out.is_empty(), "no fill while the instance is halted");
+
+        // Settled: the position closes at the payout and the slot
+        // comes back OUT of the settled set.
+        e.on_record(&crossing_tick(), 40, 1_070_000_000, &mut out);
+        assert!(out.is_empty(), "a settlement is not a market fill");
+
+        // Instance 2 trades — the proof the slot un-settled.
+        e.intake(&grid_bid(3), 50);
+        e.on_record(&crossing_tick(), 60, 1_500_000_000, &mut out);
+        assert_eq!(out.len(), 1, "the NEXT instance trades on the same sym");
+        // ... and settles worthless.
+        e.on_record(&crossing_tick(), 70, 2_070_000_000, &mut out);
+
+        // Instance 3, same again.
+        e.intake(&grid_bid(4), 80);
+        e.on_record(&crossing_tick(), 90, 2_500_000_000, &mut out);
+        assert_eq!(out.len(), 1);
+        e.on_record(&crossing_tick(), 100, 3_070_000_000, &mut out);
+
+        let o = e.finish();
+        assert_eq!(o.binary_settled, 3, "each instance settled once");
+        // Three opening fills at 0.50 (the halted one never filled).
+        assert_eq!(o.fills_total, 3);
+        // Bought 100 contracts at 0.50 three times = $150 out; two
+        // settled at 1.0 (+$200) and one at 0 (+$0), so realised is
+        // +$50 before the closing fees.
+        let paid_1e12: i128 = 3 * 500_000i128 * 100_000_000i128;
+        let got_1e12: i128 = 2 * 1_000_000i128 * 100_000_000i128;
+        assert_eq!(o.full_realized_1e12, got_1e12 - paid_1e12);
+        assert!(o.full_fees_1e12 > 0, "the closing legs paid");
+        // Nothing is left open: every instance closed at its payout.
+        assert_eq!(o.full_unreal_1e12, 0);
+    }
+
+    /// The venue refuses these outright, so filling them would invent
+    /// P&L the strategy never could have had — and every other class
+    /// must be untouched by the gate.
+    #[test]
+    fn grid_refusals_are_counted_and_bit_identical_elsewhere() {
+        let sym = hl_slot_sym();
+        let mut e = binary_engine();
+        // Off the 1e-4 tick; a fractional contract; below the band;
+        // above the band; under the 10 USDC minimum.
+        for (px, qty) in [
+            (500_050i64, 100_000_000i64),
+            (500_000, 100_500_000),
+            (900, 100_000_000),
+            (999_100, 100_000_000),
+            (500_000, 1_000_000),
+        ] {
+            e.intake(&order(sym, Side::Bid, px, qty, 1), 1);
+        }
+        let mut out = Vec::new();
+        e.on_record(&crossing_tick(), 10, 1, &mut out);
+        assert!(out.is_empty(), "nothing off-grid may fill");
+        let o = e.finish();
+        assert_eq!(o.prediction_grid_refused, 5);
+        assert_eq!(o.fills_total, 0);
+
+        // The band's edges and the exact minimum are LEGAL — and the
+        // two constraints INTERACT: at 0.001 the 10 USDC floor takes
+        // 10 000 contracts, so a 100-lot order at the bottom of the
+        // band is refused for its notional, not for its price.
+        let mut e = binary_engine();
+        e.intake(&order(sym, Side::Bid, 999_000, 100_000_000, 1), 1);
+        e.intake(&order(sym, Side::Bid, 1_000, 10_000_000_000, 2), 2);
+        // 0.50 x 20 contracts = exactly $10.
+        e.intake(&order(sym, Side::Bid, 500_000, 20_000_000, 3), 3);
+        assert_eq!(e.finish().prediction_grid_refused, 0);
+        let mut e = binary_engine();
+        e.intake(&order(sym, Side::Bid, 1_000, 100_000_000, 1), 1);
+        assert_eq!(
+            e.finish().prediction_grid_refused,
+            1,
+            "0.001 x 100 contracts is $0.10 — under the venue minimum"
+        );
+
+        // Bit-identical elsewhere: the same off-grid numbers on a PERP
+        // and on a sym of unknown class are untouched, because the
+        // venue's grid is not theirs.
+        let mut e = binary_engine();
+        let perp = make_symbol_id(VenueId::Hyperliquid, 1);
+        e.set_sym_class(perp, InstrumentClass::Perp);
+        let unknown = make_symbol_id(VenueId::Hyperliquid, 2);
+        let pm = make_symbol_id(VenueId::Polymarket, 1);
+        e.set_sym_class(pm, InstrumentClass::Prediction);
+        for s in [perp, unknown, pm] {
+            e.intake(&order(s, Side::Bid, 500_050, 100_500_000, 1), 1);
+        }
+        let o = e.finish();
+        assert_eq!(
+            o.prediction_grid_refused, 0,
+            "a perp, an unknown class and another venue's prediction are not gridded"
+        );
+        assert_eq!(o.unroutable, 0);
+    }
+
+    /// Charge-once, end to end: the opening leg is free and the
+    /// SETTLEMENT pays the closing pair — on the payout notional, not
+    /// on the entry price.
+    #[test]
+    fn settlement_fill_pays_the_closing_pair_only() {
+        let sym = hl_slot_sym();
+        let mut e = binary_engine();
+        e.set_binary_settle(
+            sym,
+            BinarySettle {
+                halt_ns: 1_000_000_000,
+                settle_ns: 1_000_000_000,
+                value_1e6: 1_000_000,
+            },
+        );
+        let mut out = Vec::new();
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, 500_000_000, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].fee_1e12, 0, "nothing to open");
+        e.on_record(&crossing_tick(), 20, 1_000_000_000, &mut out);
+
+        let o = e.finish();
+        assert_eq!(o.binary_settled, 1);
+        // The closing TAKER pair (5 bps) on the payout notional:
+        // 1.0 x 100 contracts = $100 -> ceil(100e12 * 5 / 10_000).
+        let notional_1e12: i128 = 1_000_000i128 * 100_000_000i128;
+        assert_eq!(o.full_fees_1e12, fee_ceil_1e12(notional_1e12, 5));
+        // An OTM settlement is free, because the notional is zero.
+        let mut e = binary_engine();
+        e.set_binary_settle(
+            sym,
+            BinarySettle {
+                halt_ns: 1_000_000_000,
+                settle_ns: 1_000_000_000,
+                value_1e6: 0,
+            },
+        );
+        let mut out = Vec::new();
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, 500_000_000, &mut out);
+        e.on_record(&crossing_tick(), 20, 1_000_000_000, &mut out);
+        let o = e.finish();
+        assert_eq!(o.binary_settled, 1);
+        assert_eq!(o.full_fees_1e12, 0, "a worthless payout costs nothing");
+        // And the loss is the whole premium.
+        assert_eq!(o.full_realized_1e12, -(500_000i128 * 100_000_000i128));
+    }
+
+    /// A schedule the engine was never given changes nothing: no
+    /// binary syms ⇒ the binary pass never runs, which is what keeps
+    /// every existing root byte-identical.
+    #[test]
+    fn a_root_with_no_binary_instances_is_untouched() {
+        let mut e = binary_engine();
+        let mut out = Vec::new();
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, u64::MAX / 2, &mut out);
+        assert_eq!(out.len(), 1);
+        let o = e.finish();
+        assert_eq!(o.binary_settled, 0);
+        assert_eq!(o.prediction_grid_refused, 0);
     }
 
     /// Zero latency, zero flat fee, the venue's option schedule live.

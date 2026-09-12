@@ -6,6 +6,107 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — harness: the HIP-4 price/size grid, per-instance binary settlement from `InstrumentRoll` + `Mark`, charge-once on the settlement leg (BIN15 O3)
+
+**Offline only.** No engine code, no wire layout, no capture file, no
+restart. Every existing root replays byte for byte — see the guard
+below.
+
+**What changed**
+
+- **The venue's GRID is now refused, not filled.** A `Prediction`-class
+  order on Hyperliquid is rejected when it is off the 1e-4 price tick,
+  a fractional contract, outside `[0.001, 0.999]`, or under the 10 USDC
+  minimum — counted in the new `ModelOutcome::prediction_grid_refused`.
+  The venue would refuse these outright, so filling them invents P&L
+  the strategy could never have had. The two constraints INTERACT: at
+  0.001 the notional floor takes 10 000 contracts, so a 100-lot order
+  at the bottom of the band is refused for its size, not its price.
+  Keyed on the KNOWN class, like `fee_rate_for` — an unknown-class sym
+  is not gridded, because guessing a venue's tick from a shape the
+  descriptor law could not read is how a harness silently drops orders
+  it should have filled. Every other venue and class is untouched.
+
+- **Per-instance settlement: a QUEUE per sym, not a field.** This is
+  the one real difference from the option law. An option settles once
+  and stays settled; a rolling HIP-4 slot hosts 96 instances a day, so
+  `FillEngine` gained `set_binary_settle(sym, BinarySettle { halt_ns,
+  settle_ns, value_1e6 })` — entries sorted by `halt_ns`, consumed
+  oldest-first. At `halt_ns` the sym enters the F12 guard set (the
+  venue clears the book at expiry, so no fill may happen); at
+  `settle_ns` the mark is pinned to the payout, whatever is open closes
+  at it, and **the sym comes back OUT of the settled set** so the next
+  instance trades. `ModelOutcome::binary_settled` counts the
+  settlements, and unlike `opt_settled` it can exceed the number of
+  syms.
+
+- **The payout comes from our own tape.** New
+  `crates/cli/src/backtest/binary.rs` reads the run's
+  `ChannelId::InstrumentRoll` events (created rolls only — the settled
+  rows name the instance that is ending, which the created row already
+  described) and computes each instance's value from the
+  `ChannelId::Mark` series of its UNDERLYING perp: the MEAN over
+  `[expiry, expiry + twap]`, or the last mark at or before the expiry
+  when the family settles at `T`. `>= strike` settles ITM (the venue's
+  own rule).
+
+  **An instance whose evidence this window does not hold is COUNTED,
+  never guessed.** Fewer than 3 marks in the window, or a settlement
+  instant past the window's end, leaves it unregistered: its position
+  marks out at the last book price, which is the honest answer when the
+  payout is unknown. Scoring it as worthless would be a 100 %
+  directional opinion dressed up as arithmetic. The stderr report line
+  `binary: instances=N settled=M unsettleable=U` is what an operator
+  reads for this, and `unsettleable > 0` bounds what a binary member's
+  P&L can be said to mean over a ≤ 2 h window that cuts through
+  expiries.
+
+- **A slot's underlying comes from the DESCRIPTOR**, not the event:
+  `hyperliquid:out:BTC:15m[yes]` names both the slot and the coin, and
+  the same table carries `hyperliquid:BTC`. The roll event carries a
+  family INDEX, which means nothing across runs — `binary::underlying_map`
+  is the resolution, built from the load pass's existing
+  descriptor→sym join.
+
+**BYTE-IDENTITY GUARD — PASSED.** The standing 8-window VM pool,
+before and after O3 on the same command
+(`backtest --ruleset fde6f733… --replay-dir ~/multivenue/worker/windows/
+--split 0/100 --emit-detail`):
+
+| artifact | sha256 (16) | verdict |
+|---|---|---|
+| schema-1 stdout | `188d18e3b1ded762` | unchanged |
+| detail sidecar | `e3f6b8efd7b7a1d0` | unchanged |
+
+`188d18e3…` is the same schema-1 hash the VRP lane recorded for this
+pool at P1 and P2 — so BIN15 O1, O2 and O3 have now all left it
+untouched. The `binary:` line is ABSENT on that root (no rolling slots
+in it), which is what keeps its stderr identical too.
+
+**Deviations from the plan, recorded**
+
+1. **The `audit-pnl` surface is NOT wired** (the plan names three).
+   That surface has its own loader, which today admits only Funding and
+   AssetCtx channel events into its `Payload`; admitting
+   `InstrumentRoll` and `Mark` means widening its event filter and its
+   interner keying. Nothing produces a binary fill for it to score
+   until O5 enables paper, so this is an **O5 prerequisite**, not a
+   silent gap. `backtest` and `backtest --member` both have it.
+2. **No `SynthFill.origin` field.** The plan asked for a settlement
+   `SynthFill` tagged `settlement`; `SynthFill` has no origin concept,
+   and adding one would change the `--emit-detail` schema. The option
+   precedent closes through `Book::settle` and counts it, which is what
+   binaries do — a settlement is not a market fill, and the sidecar's
+   fill rows stay fills.
+3. The §5.2 integration test runs over a synthetic MERGED timeline
+   in-crate rather than a written run dir: driving an order into a PMLR
+   root needs a VM ruleset that trades a prediction descriptor, and no
+   member does until O4. The manifest join and the PMLR I/O it skips
+   are already pinned by `crates/cli/tests/backtest_harness.rs`.
+4. `unpack_roll_seq` is restated in `backtest::binary` rather than
+   imported: the harness must not depend on an ingress crate (the
+   `OptSettleRef`-restates-the-intrinsic precedent).
+
 ## 2026-09-12 — Hyperliquid rolling-instrument families: `HL_MAX_COINS` 16 → 32, the ack mask splits, `ChannelId::InstrumentRoll = 13`, HL `Mark` rows (BIN15 O2)
 
 **What changed**
