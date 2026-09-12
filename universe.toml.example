@@ -91,6 +91,23 @@ options_underlyings = []   # e.g. ["BTC", "ETH"]
 # Coins; HIP-4 "#<enc>" outcome coins and spot "@<idx>" pairs are
 # ordinary items.
 coins = []
+# BIN15 O2: ROLLING HIP-4 families, "<out|native>:<COIN>:<15m|1d>".
+# Only those two pairings exist on the venue; the crossed forms refuse
+# the boot. Absent or empty is the pre-BIN15 boot, bit for bit.
+#
+# A family is NOT an instrument. It owns two reserved SymbolId slots
+# (Yes and No) from an ordinal pool above every `coins` ordinal, and
+# the venue coin under those slots is REBOUND as instances are created
+# and settle — the BTC 15-minute family rolls 96 times a day. Every
+# rebind is captured as a `ChannelId::InstrumentRoll` event, which is
+# what tells an offline reader which instance a slot meant at a time;
+# `instrument-manifest.tsv` stays two columns and names only the slot.
+#
+# Cost: two rows of the 32-row coin table per family, three
+# subscriptions per row. A family whose instance is not live on the
+# venue at boot starts DORMANT and subscribes nothing until its next
+# `outcomeCreated` push.
+rolling = []
 
 [bybit]
 # WS9: the sixth venue. UPPERCASE venue symbols ([A-Z0-9] — topics

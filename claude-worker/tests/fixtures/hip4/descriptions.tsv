@@ -1,0 +1,28 @@
+# BIN15 O2 — the SHARED HIP-4 description fixture.
+#
+# Read by BOTH `crates/ingress-hyperliquid/src/discovery.rs` (the
+# engine's grammar) and `claude-worker/tests/test_hip4.py` (the
+# mirror). A row is:
+#
+#   <outcome>\t<description>\t<grammar>\t<underlying>\t<strike_1e6>\t<expiry_ns>\t<twap_s>\t<period_s>
+#
+# grammar: unknown | out_binary_price | out_price_touch | native_price_binary
+#
+# The first two rows are VERBATIM venue captures (2026-09-12); the rest
+# exercise the laws: unknown keys are skipped, free text that contains a
+# key name is not a field, a present-but-unparseable required key
+# demotes the grammar, and a coin wider than the fixed field is a
+# contract change rather than a truncation.
+2649	perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630	out_binary_price	BTC	77177000000	1789194600000000000	60	0
+2638	perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77003|time:20260912-0615	out_binary_price	BTC	77003000000	1789193700000000000	60	0
+4211	class:priceBinary|underlying:ETH|expiry:20260913-0600|targetPrice:2510.5|period:1d	native_price_binary	ETH	2510500000	1789279200000000000	0	86400
+77	class:priceBinary|underlying:SOL|expiry:20260912-0630|targetPrice:78.553|period:15m	native_price_binary	SOL	78553000	1789194600000000000	0	900
+78	perp:HYPE|priceDescription:HYPE mark|target:44.25	out_price_touch	HYPE	44250000	0	0	0
+2	perp:BTC|newKeyTheVenueAdded:whatever|seconds:60|nested:a:b:c|threshold:77177|time:20260912-0630	out_binary_price	BTC	77177000000	1789194600000000000	60	0
+3	perp:BTC|seconds:60|threshold:not-a-price|time:20260912-0630	unknown	BTC	0	1789194600000000000	60	0
+4	perp:BTC|priceDescription:threshold:99 is not the strike|target:5	out_price_touch	BTC	5000000	0	0	0
+5	perp:SIXTEENCHARCOIN|target:1	out_price_touch	SIXTEENCHARCOIN	1000000	0	0	0
+6	perp:SIXTEENCHARCOINX|target:1	unknown		1000000	0	0	0
+7		unknown		0	0	0	0
+8	whatever	unknown		0	0	0	0
+9	perp:BTC|seconds:60|threshold:77177|time:20261301-0000	unknown	BTC	77177000000	0	60	0

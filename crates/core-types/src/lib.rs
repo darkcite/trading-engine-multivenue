@@ -899,6 +899,29 @@ pub enum ChannelId {
     /// options-underlyings list (the offline identity — the boot log
     /// + universe file resolve it), `venue_time_ms` = venue ts.
     VolIndex = 12,
+    /// BIN15 O2: a ROLLING instrument family's slot changed which
+    /// venue instrument it means.
+    ///
+    /// HIP-4 outcome markets on Hyperliquid are born and die on a
+    /// schedule (the 15-minute BTC family creates the next instance at
+    /// the previous one's expiry), so a fixed `SymbolId` slot cannot
+    /// name one instrument for the life of a capture. This event is
+    /// the offline record of WHICH instance a slot meant from when,
+    /// and it is the only thing that makes a captured slot sym
+    /// interpretable after the fact.
+    ///
+    /// `sym` = the family's **Yes** slot sym (the No leg is the next
+    /// ordinal); `venue_time_ms` = 0 (the venue's push carries no
+    /// time); `v0` = strike ×1e6; `v1` = expiry ns; and `venue_seq`
+    /// packs the identity:
+    ///
+    /// | bits | field |
+    /// |---|---|
+    /// | 0..32 | outcome id (`enc` = `10 * id`, Yes side) |
+    /// | 32..48 | settlement TWAP seconds (`seconds:`, 0 = settle at `T`) |
+    /// | 48..56 | family index in the boot `rolling` list |
+    /// | 56..64 | 0 = created, 1 = settled |
+    InstrumentRoll = 13,
 }
 
 impl ChannelId {
@@ -919,6 +942,7 @@ impl ChannelId {
             10 => Some(Self::BookGap),
             11 => Some(Self::SubDrop),
             12 => Some(Self::VolIndex),
+            13 => Some(Self::InstrumentRoll),
             _ => None,
         }
     }
@@ -940,6 +964,7 @@ impl ChannelId {
             Self::BookGap => "book_gap",
             Self::SubDrop => "sub_drop",
             Self::VolIndex => "vol_index",
+            Self::InstrumentRoll => "instrument_roll",
         }
     }
 }
@@ -1246,7 +1271,7 @@ pub const EVENT_RING_SIZE: usize = 1024;
 /// Bit for `channel` in a venue-event lane mask (WS10-A gating knob:
 /// an ingress pushes a [`ChannelEvent`] onto its lane only when the
 /// channel's bit is set in the spawn-time `event_mask`). `ChannelId`
-/// discriminants are ≤ 12, so `u16` covers the whole enum.
+/// discriminants are ≤ 13, so `u16` covers the whole enum.
 #[inline]
 pub const fn event_lane_bit(ch: ChannelId) -> u16 {
     1u16 << (ch as u16)
@@ -3244,6 +3269,7 @@ mod channel_event_tests {
             ChannelId::BookGap,
             ChannelId::SubDrop,
             ChannelId::VolIndex,
+            ChannelId::InstrumentRoll,
         ];
         let mut i = 0;
         while i < all.len() {
@@ -3252,7 +3278,7 @@ mod channel_event_tests {
             assert!(!c.as_str().is_empty());
             i += 1;
         }
-        assert_eq!(ChannelId::from_u8(13), None);
+        assert_eq!(ChannelId::from_u8(14), None);
         assert_eq!(ChannelId::from_u8(255), None);
     }
 

@@ -185,8 +185,10 @@ pub struct HlDiscovery {
     /// Builder-dex names: (name bytes, valid len). Null slots are
     /// counted by the ingest return value but not stored.
     dexs: Vec<([u8; DEX_NAME_MAX], u8)>,
-    /// HIP-4 outcomes: (outcome id, side count from `sideSpecs`).
-    outcomes: Vec<(u32, u8)>,
+    /// HIP-4 outcomes: (outcome id, side count from `sideSpecs`,
+    /// parsed description). BIN15 O2 added the third member — the
+    /// rolling families adopt their live instance from it at boot.
+    outcomes: Vec<(u32, u8, HlOutcomeSpec)>,
 }
 
 impl HlDiscovery {
@@ -421,7 +423,7 @@ impl HlDiscovery {
                 let side = (enc % 10) as u8;
                 let mut k = 0;
                 while k < self.outcomes.len() {
-                    let (id, n_sides) = self.outcomes[k];
+                    let (id, n_sides, _spec) = self.outcomes[k];
                     if id == outcome {
                         if side >= n_sides {
                             return None;
@@ -504,6 +506,25 @@ impl HlDiscovery {
     #[inline]
     pub fn universe_total(&self) -> u32 {
         (self.perps.len() + self.spots.len() + self.outcomes.len() * 2) as u32
+    }
+
+    /// BIN15 O2: every outcome row whose description parsed to a
+    /// KNOWN grammar.
+    ///
+    /// This is what lets a rolling family be subscribed at the FIRST
+    /// `Steady` instead of waiting up to a whole period for the next
+    /// lifecycle push — `HlFamilyTable::bind_live` picks its instance
+    /// out of this list by expiry. Boot-time; this module may
+    /// allocate by doctrine (module docs).
+    #[must_use]
+    pub fn outcome_specs(&self) -> Vec<HlOutcomeSpec> {
+        let mut out = Vec::with_capacity(self.outcomes.len());
+        for (_id, _sides, spec) in &self.outcomes {
+            if spec.grammar != HlOutcomeGrammar::Unknown {
+                out.push(*spec);
+            }
+        }
+        out
     }
 
     /// Per-class counts for the §6.1 coverage log line:
@@ -1089,12 +1110,20 @@ fn parse_dex_row(
 
 /// Parse one `outcomeMeta.outcomes` row starting at `pos` (must point
 /// at `{`). Returns `((outcome_id, n_sides), end)`.
-fn parse_outcome_row(body: &[u8], pos: usize) -> Result<((u32, u8), usize), HlDiscoveryErr> {
+fn parse_outcome_row(
+    body: &[u8],
+    pos: usize,
+) -> Result<((u32, u8, HlOutcomeSpec), usize), HlDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
 
     let mut outcome: Option<u32> = None;
     let mut n_sides: Option<u8> = None;
+    // BIN15 O2: the boot needs each row's ECONOMICS, not just its id
+    // — a rolling family adopts its live instance from the discovery
+    // body so it is subscribed at the first `Steady` instead of
+    // waiting up to a whole period for the next lifecycle push.
+    let mut desc: Option<(usize, usize)> = None;
 
     loop {
         i = skip_ws(body, i);
@@ -1130,9 +1159,18 @@ fn parse_outcome_row(body: &[u8], pos: usize) -> Result<((u32, u8), usize), HlDi
                         n_sides = Some(n as u8);
                         i = end;
                     }
+                    b"description" => {
+                        // Arbitrary text; the skipper is escape-aware
+                        // via skip_string, and the span between the
+                        // quotes is the grammar's input.
+                        let start = skip_ws(body, i);
+                        let end = skip_json_value(body, i).ok_or(HlDiscoveryErr::BadRow)?;
+                        if body.get(start) == Some(&b'"') && end > start + 1 {
+                            desc = Some((start + 1, end - 1));
+                        }
+                        i = end;
+                    }
                     _ => {
-                        // description is arbitrary text — the skipper
-                        // is escape-aware via skip_string.
                         i = skip_json_value(body, i).ok_or(HlDiscoveryErr::BadRow)?;
                     }
                 }
@@ -1143,7 +1181,11 @@ fn parse_outcome_row(body: &[u8], pos: usize) -> Result<((u32, u8), usize), HlDi
 
     let id = outcome.ok_or(HlDiscoveryErr::BadRow)?;
     let sides = n_sides.ok_or(HlDiscoveryErr::BadRow)?;
-    Ok(((id, sides), i))
+    let spec = match desc {
+        Some((a, b)) if b <= body.len() => parse_outcome_spec(id, &body[a..b]),
+        _ => HlOutcomeSpec::empty(id),
+    };
+    Ok(((id, sides, spec), i))
 }
 
 // ---------------------------------------------------------------
@@ -1883,6 +1925,45 @@ mod tests {
         let s = parse_outcome_spec(6, b"perp:SIXTEENCHARCOINX|target:1");
         assert_eq!(s.underlying_len, 0);
         assert_eq!(s.grammar, HlOutcomeGrammar::Unknown);
+    }
+
+    /// The SHARED description fixture, also read by
+    /// `claude-worker/tests/test_hip4.py`. One file, two grammars: if
+    /// they ever disagree the engine and every offline consumer are
+    /// pricing different instruments.
+    #[test]
+    fn every_shared_fixture_description_parses_as_the_fixture_says() {
+        const FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../claude-worker/tests/fixtures/hip4/descriptions.tsv"
+        );
+        let text = std::fs::read_to_string(FIXTURE).expect("shared fixture present");
+        let mut rows = 0usize;
+        for line in text.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 8, "want 8 columns: {line}");
+            let outcome: u32 = f[0].parse().expect("outcome");
+            let want_grammar = match f[2] {
+                "unknown" => HlOutcomeGrammar::Unknown,
+                "out_binary_price" => HlOutcomeGrammar::OutBinaryPrice,
+                "out_price_touch" => HlOutcomeGrammar::OutPriceTouch,
+                "native_price_binary" => HlOutcomeGrammar::NativePriceBinary,
+                other => panic!("unknown grammar label {other}"),
+            };
+            let got = parse_outcome_spec(outcome, f[1].as_bytes());
+            assert_eq!(got.outcome, outcome, "{line}");
+            assert_eq!(got.grammar, want_grammar, "{line}");
+            assert_eq!(got.underlying_bytes(), f[3].as_bytes(), "{line}");
+            assert_eq!(got.strike_1e6, f[4].parse::<i64>().unwrap(), "{line}");
+            assert_eq!(got.expiry_ns, f[5].parse::<u64>().unwrap(), "{line}");
+            assert_eq!(got.twap_s, f[6].parse::<u32>().unwrap(), "{line}");
+            assert_eq!(got.period_s, f[7].parse::<u32>().unwrap(), "{line}");
+            rows += 1;
+        }
+        assert!(rows >= 12, "fixture too small: {rows}");
     }
 
     #[test]

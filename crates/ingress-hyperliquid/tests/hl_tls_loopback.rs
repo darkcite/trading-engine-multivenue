@@ -697,3 +697,465 @@ fn missed_acks_fail_session() {
     assert_eq!(status.msgs_total(), 0);
     assert_eq!(status.parse_errors_total(), 0);
 }
+
+// ---------------------------------------------------------------
+// BIN15 O2 — the rolling-instrument family
+// ---------------------------------------------------------------
+
+/// A capture that keeps the `ChannelEvent`s it is handed. The roll's
+/// whole purpose is an OFFLINE record, so the only honest way to test
+/// it is to read what capture received.
+#[derive(Default)]
+struct EventRecorder {
+    events: Vec<core_types::ChannelEvent>,
+}
+
+impl core_types::Capture for EventRecorder {
+    fn event(&mut self, e: &core_types::ChannelEvent) {
+        self.events.push(*e);
+    }
+}
+
+/// The live description of outcome 2649 (venue-probed 2026-09-12) and
+/// the same grammar one roll later.
+const DESC_2649: &[u8] =
+    b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630";
+const DESC_2650: &[u8] =
+    b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645";
+
+/// The LIVE lifecycle frames: an array of kind-keyed objects, no
+/// `coin`, no top-level `time`.
+fn created_frame(outcome: u32, desc: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(br#"{"channel":"outcomeMetaUpdates","data":[{"outcomeCreated":{"outcome":"#);
+    v.extend_from_slice(outcome.to_string().as_bytes());
+    v.extend_from_slice(br#","name":"template:binaryPrice","description":""#);
+    v.extend_from_slice(desc);
+    v.extend_from_slice(
+        br#"","sideSpecs":[{"name":"template:Yes"},{"name":"template:No"}],"quoteToken":"USDC","venue":"out","deployerFeeScale":"1.0"}}]}"#,
+    );
+    v
+}
+
+fn settled_frame(outcome: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(br#"{"channel":"outcomeMetaUpdates","data":[{"outcomeSettled":"#);
+    v.extend_from_slice(outcome.to_string().as_bytes());
+    v.extend_from_slice(b"}]}");
+    v
+}
+
+/// BTC plus one `out:BTC:15m` family bound to outcome 2649 — the
+/// shape a boot leaves behind after `bind_live`.
+/// 2649's expiry, as the grammar parses it: 2026-09-12T06:30:00Z.
+const EXPIRY_2649_NS: u64 = 1_789_194_600_000_000_000;
+
+/// An anchor that maps the CURRENT monotonic instant to one minute
+/// before 2649 expires — so the scripted lifecycle frames land inside
+/// the family's window deterministically, whatever the wall clock of
+/// the machine running the test says.
+fn wall_anchor_one_minute_before_expiry() -> core_time::WallAnchor {
+    core_time::WallAnchor::new(
+        core_time::now_ns(),
+        EXPIRY_2649_NS - 60_000_000_000,
+    )
+}
+
+fn coins_and_family_bound_to_2649() -> (HlCoinTable, ingress_hyperliquid::family::HlFamilyTable) {
+    use ingress_hyperliquid::discovery::parse_outcome_spec;
+    use ingress_hyperliquid::family::{rolling_sym, HlFamilyTable};
+    let mut coins = HlCoinTable::new();
+    coins.insert(b"BTC", SYM_BTC).expect("BTC");
+    let yes = coins.reserve(rolling_sym(0, 0)).expect("reserve yes");
+    let no = coins.reserve(rolling_sym(0, 1)).expect("reserve no");
+    let mut families = HlFamilyTable::new();
+    let (kind, und, period) = HlFamilyTable::parse_key(b"out:BTC:15m").expect("key");
+    families
+        .push(
+            kind,
+            und,
+            period,
+            [yes as u8, no as u8],
+            [rolling_sym(0, 0), rolling_sym(0, 1)],
+        )
+        .expect("push");
+    let spec = parse_outcome_spec(2649, DESC_2649);
+    assert_eq!(spec.expiry_ns, EXPIRY_2649_NS);
+    // One minute before 2649 expires — inside its window.
+    assert_eq!(
+        families.bind_live(&[spec], EXPIRY_2649_NS - 60_000_000_000, &mut coins),
+        1
+    );
+    (coins, families)
+}
+
+/// BTC (4) + the family's two bound coins (3 each) + the two globals.
+const EXP_SUBS_BTC_FAMILY: [&[u8]; 12] = [
+    br#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"#,
+    br#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#,
+    br#"{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}"#,
+    br#"{"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}"#,
+    br##"{"method":"subscribe","subscription":{"type":"bbo","coin":"#26490"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#26490"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"trades","coin":"#26490"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"bbo","coin":"#26491"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#26491"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"trades","coin":"#26491"}}"##,
+    br#"{"method":"subscribe","subscription":{"type":"allMids"}}"#,
+    br#"{"method":"subscribe","subscription":{"type":"outcomeMetaUpdates"}}"#,
+];
+
+/// The roll's own twelve client frames, in order: the outgoing
+/// instance's six unsubscribes, then the incoming one's six
+/// subscribes.
+const EXP_ROLL_FRAMES: [&[u8]; 12] = [
+    br##"{"method":"unsubscribe","subscription":{"type":"bbo","coin":"#26490"}}"##,
+    br##"{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"#26490"}}"##,
+    br##"{"method":"unsubscribe","subscription":{"type":"trades","coin":"#26490"}}"##,
+    br##"{"method":"unsubscribe","subscription":{"type":"bbo","coin":"#26491"}}"##,
+    br##"{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"#26491"}}"##,
+    br##"{"method":"unsubscribe","subscription":{"type":"trades","coin":"#26491"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"bbo","coin":"#26500"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#26500"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"trades","coin":"#26500"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"bbo","coin":"#26501"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#26501"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"trades","coin":"#26501"}}"##,
+];
+
+/// A family's instance settles and its successor is created, mid
+/// session: the outgoing coins are unsubscribed, the incoming ones
+/// bound and subscribed, both transitions recorded as
+/// `InstrumentRoll` events, and a push for the NEW coin resolves to
+/// the family's stable slot sym.
+#[test]
+fn a_roll_rebinds_unsubscribes_subscribes_and_emits_the_event() {
+    use ingress_hyperliquid::family::{rolling_sym, unpack_roll_seq};
+
+    let cert = make_cert();
+    let server_cfg = build_server_config(&cert);
+    let client_cfg = build_client_config(&cert);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let client_done = Arc::new(AtomicBool::new(false));
+    let client_done_server = client_done.clone();
+    let server = thread::spawn(move || -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let (mut sock, _peer) = listener.accept().expect("accept");
+        let mut conn = ServerConnection::new(server_cfg).expect("server conn");
+        let mut stream = Stream::new(&mut conn, &mut sock);
+
+        serve_ws_upgrade(&mut stream);
+        let subscribes = read_and_check_subscribes(&mut stream, &EXP_SUBS_BTC_FAMILY);
+        for sub in &subscribes {
+            write_sub_ack(&mut stream, sub);
+        }
+        stream.flush().expect("flush acks");
+
+        // The venue's own order at a quarter-hour: the old instance
+        // settles, then the new one is created in the same burst.
+        stream
+            .write_all(&build_unmasked_text_frame(&settled_frame(2649)))
+            .expect("write settled");
+        stream
+            .write_all(&build_unmasked_text_frame(&created_frame(2650, DESC_2650)))
+            .expect("write created");
+        stream.flush().expect("flush lifecycle");
+
+        // The roll's twelve frames come back on the wire.
+        let roll_frames = read_and_check_subscribes(&mut stream, &EXP_ROLL_FRAMES);
+
+        // A push for the INCOMING coin must reach the family's slot.
+        let bbo_new = br##"{"channel":"bbo","data":{"coin":"#26500","time":1789195000000,"bbo":[{"px":"0.41","sz":"120.0","n":2},{"px":"0.44","sz":"80.0","n":1}]}}"##;
+        stream
+            .write_all(&build_unmasked_text_frame(bbo_new))
+            .expect("write new bbo");
+        stream.flush().expect("flush bbo");
+
+        // The roll frames above are this test's verification sync:
+        // the client can only have sent them after draining the
+        // lifecycle pushes. No ping probe — a keepalive firing between
+        // the acks and the lifecycle burst would land in the middle of
+        // the frames under test.
+        stream.write_all(&[0x88, 0x00]).expect("write close");
+        stream.flush().expect("flush close");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client_done_server.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = sock.shutdown(Shutdown::Both);
+        (subscribes, roll_frames)
+    });
+
+    let server_name: ServerName<'static> = ServerName::try_from("localhost")
+        .expect("server name")
+        .to_owned();
+    let mut transport =
+        TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
+
+    let (coins, families) = coins_and_family_bound_to_2649();
+    let roll_status = Arc::new(ingress_hyperliquid::family::HlRollStatus::new());
+    let mut driver = Driver::new(0x8D02, coins, GENEROUS_NS, GENEROUS_NS);
+    driver.set_families(
+        families,
+        roll_status.clone(),
+        wall_anchor_one_minute_before_expiry(),
+    );
+
+    let status = IngressStatus::new();
+    let ring: Arc<Ring<Tick, TICK_RING_CAP>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let mut recorder = EventRecorder::default();
+
+    let mut poll = mio::Poll::new().expect("mio poll");
+    let mut events = mio::Events::with_capacity(16);
+    let token = mio::Token(0);
+    let stop = StopFlag::new(false);
+    // No ping inside the scripted window (the roll frames are the
+    // sync); the idle budget still bounds a wedged session.
+    let mut keepalive = Keepalive::new(KeepaliveCfg {
+        ping_interval_ns: 30_000_000_000,
+        idle_timeout_ns: 60_000_000_000,
+    });
+
+    let res = run(
+        &mut transport,
+        &mut driver,
+        b"localhost",
+        b"/ws",
+        &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
+        &mut poll,
+        &mut events,
+        token,
+        &stop,
+        &status,
+        &mut keepalive,
+        &mut recorder,
+    );
+    client_done.store(true, Ordering::Release);
+    let (subscribes, roll_frames) = server.join().expect("server thread");
+
+    assert_eq!(res, RunResult::Disconnected);
+    // The boot binding put the family's two coins on the wire beside
+    // the configured perp — 12 subscriptions, not 6.
+    assert_eq!(subscribes.len(), 12);
+    assert!(driver.is_verified(), "a bound family verifies like any coin");
+    // The roll: six unsubscribes for the outgoing instance, then six
+    // subscribes for the incoming one, in that order (byte-checked
+    // server-side; re-asserted here where a failure reads best).
+    assert_eq!(roll_frames.len(), 12);
+    assert!(
+        roll_frames[..6]
+            .iter()
+            .all(|f| contains(f, b"unsubscribe")),
+        "the outgoing instance is dropped first"
+    );
+    assert!(
+        roll_frames[6..]
+            .iter()
+            .all(|f| !contains(f, b"unsubscribe")),
+        "then the incoming one is subscribed"
+    );
+
+    // Two InstrumentRoll events, settled then created, with the exact
+    // payload packing.
+    let rolls: Vec<_> = recorder
+        .events
+        .iter()
+        .filter(|e| e.channel == core_types::ChannelId::InstrumentRoll as u8)
+        .collect();
+    assert_eq!(rolls.len(), 2, "one settled, one created");
+
+    let (id, twap, fam, settled) = unpack_roll_seq(rolls[0].venue_seq);
+    assert_eq!((id, twap, fam, settled), (2649, 60, 0, true));
+    assert_eq!(rolls[0].sym, rolling_sym(0, 0), "the Yes slot names the family");
+    assert_eq!(rolls[0].v0, 77_177_000_000, "strike x1e6");
+    assert_eq!(rolls[0].v1, 1_789_194_600_000_000_000, "expiry ns");
+    assert_eq!(rolls[0].venue_time_ms, 0, "the venue push carries no time");
+
+    let (id, twap, fam, settled) = unpack_roll_seq(rolls[1].venue_seq);
+    assert_eq!((id, twap, fam, settled), (2650, 60, 0, false));
+    assert_eq!(rolls[1].sym, rolling_sym(0, 0));
+    assert_eq!(rolls[1].v0, 77_201_000_000);
+    // One 15-minute period later than 2649.
+    assert_eq!(rolls[1].v1 - rolls[0].v1, 900 * 1_000_000_000);
+
+    // The push for the NEW coin arrived on the family's stable slot.
+    let tick = cons.try_pop().expect("a tick for the rolled slot");
+    assert_eq!(tick.sym, rolling_sym(0, 0));
+    assert_eq!(tick.bid_px.raw(), 410_000);
+    assert_eq!(tick.ask_px.raw(), 440_000);
+
+    // Counters: one roll, nothing ignored (every push matched), no
+    // ack timeout (the budget is generous), nothing dormant.
+    assert_eq!(roll_status.rolls_total(), 1);
+    assert_eq!(roll_status.rolls_ignored_unmatched(), 0);
+    assert_eq!(roll_status.family_ack_timeouts(), 0);
+    assert_eq!(roll_status.families_dormant(), 0);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.gaps_total(), 0);
+}
+
+/// A family with no live instance subscribes NOTHING — its reserved
+/// rows are invisible to the subscribe sweep and to the ack mask, so
+/// the session verifies on the configured coins alone. And a repeated
+/// `outcomeCreated` for the instance already held is idempotent: the
+/// venue re-pushes on reconnect, and a second rebind would churn the
+/// wire for no change.
+#[test]
+fn a_dormant_family_subscribes_nothing_and_repeats_are_idempotent() {
+    use ingress_hyperliquid::family::{rolling_sym, HlFamilyTable};
+
+    let cert = make_cert();
+    let server_cfg = build_server_config(&cert);
+    let client_cfg = build_client_config(&cert);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let client_done = Arc::new(AtomicBool::new(false));
+    let client_done_server = client_done.clone();
+    let server = thread::spawn(move || -> Vec<Vec<u8>> {
+        let (mut sock, _peer) = listener.accept().expect("accept");
+        let mut conn = ServerConnection::new(server_cfg).expect("server conn");
+        let mut stream = Stream::new(&mut conn, &mut sock);
+
+        serve_ws_upgrade(&mut stream);
+        // A dormant family adds nothing: BTC's four + the two globals.
+        let subscribes = read_and_check_subscribes(&mut stream, &EXP_SUBS_BTC_ONLY);
+        for sub in &subscribes {
+            write_sub_ack(&mut stream, sub);
+        }
+        // A created push for a family we do not configure (SOL), then
+        // one for BTC — the first is ignored, the second rolls.
+        stream
+            .write_all(&build_unmasked_text_frame(&created_frame(
+                9001,
+                b"perp:SOL|priceDescription:x|seconds:60|threshold:200|time:20260912-0630",
+            )))
+            .expect("write foreign");
+        stream
+            .write_all(&build_unmasked_text_frame(&created_frame(2649, DESC_2649)))
+            .expect("write created");
+        // And the SAME push again: idempotent, no second roll.
+        stream
+            .write_all(&build_unmasked_text_frame(&created_frame(2649, DESC_2649)))
+            .expect("write repeat");
+        stream.flush().expect("flush");
+
+        let after = read_and_check_subscribes(&mut stream, &EXP_ROLL_SUBS_2649);
+
+        // The roll frames above are this test's verification sync:
+        // the client can only have sent them after draining the
+        // lifecycle pushes. No ping probe — a keepalive firing between
+        // the acks and the lifecycle burst would land in the middle of
+        // the frames under test.
+        stream.write_all(&[0x88, 0x00]).expect("write close");
+        stream.flush().expect("flush close");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client_done_server.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = sock.shutdown(Shutdown::Both);
+        after
+    });
+
+    let server_name: ServerName<'static> = ServerName::try_from("localhost")
+        .expect("server name")
+        .to_owned();
+    let mut transport =
+        TlsTransport::connect(addr, server_name, client_cfg).expect("TlsTransport::connect");
+
+    // Reserved but UNBOUND — the dormant boot.
+    let mut coins = HlCoinTable::new();
+    coins.insert(b"BTC", SYM_BTC).expect("BTC");
+    let yes = coins.reserve(rolling_sym(0, 0)).expect("yes");
+    let no = coins.reserve(rolling_sym(0, 1)).expect("no");
+    let mut families = HlFamilyTable::new();
+    let (kind, und, period) = HlFamilyTable::parse_key(b"out:BTC:15m").expect("key");
+    families
+        .push(
+            kind,
+            und,
+            period,
+            [yes as u8, no as u8],
+            [rolling_sym(0, 0), rolling_sym(0, 1)],
+        )
+        .expect("push");
+    assert_eq!(families.dormant_count(), 1);
+
+    let roll_status = Arc::new(ingress_hyperliquid::family::HlRollStatus::new());
+    let mut driver = Driver::new(0x8D03, coins, GENEROUS_NS, GENEROUS_NS);
+    driver.set_families(
+        families,
+        roll_status.clone(),
+        wall_anchor_one_minute_before_expiry(),
+    );
+    assert_eq!(roll_status.families_dormant(), 1, "published at attach");
+
+    let status = IngressStatus::new();
+    let ring: Arc<Ring<Tick, TICK_RING_CAP>> = Ring::new();
+    let (mut prod, _cons) = ring.split();
+    let mut recorder = EventRecorder::default();
+    let mut poll = mio::Poll::new().expect("mio poll");
+    let mut events = mio::Events::with_capacity(16);
+    let token = mio::Token(0);
+    let stop = StopFlag::new(false);
+    // No ping inside the scripted window (the roll frames are the
+    // sync); the idle budget still bounds a wedged session.
+    let mut keepalive = Keepalive::new(KeepaliveCfg {
+        ping_interval_ns: 30_000_000_000,
+        idle_timeout_ns: 60_000_000_000,
+    });
+
+    let res = run(
+        &mut transport,
+        &mut driver,
+        b"localhost",
+        b"/ws",
+        &mut prod,
+        &mut event_lane(),
+        core_types::EVENT_LANE_FUNDING | core_types::EVENT_LANE_ASSET_CTX,
+        &mut poll,
+        &mut events,
+        token,
+        &stop,
+        &status,
+        &mut keepalive,
+        &mut recorder,
+    );
+    client_done.store(true, Ordering::Release);
+    let after = server.join().expect("server thread");
+
+    assert_eq!(res, RunResult::Disconnected);
+    // The dormant family cost nothing at boot, and verification did
+    // not wait on it.
+    assert!(driver.is_verified());
+    // Exactly ONE roll's worth of subscribes — six, not twelve: the
+    // first push was another deployer's and the third was a repeat.
+    assert_eq!(after.len(), 6);
+    assert_eq!(roll_status.rolls_total(), 1, "one roll, not two");
+    assert_eq!(roll_status.rolls_ignored_unmatched(), 1, "the SOL market");
+    assert_eq!(roll_status.families_dormant(), 0, "bound by the roll");
+    let rolls = recorder
+        .events
+        .iter()
+        .filter(|e| e.channel == core_types::ChannelId::InstrumentRoll as u8)
+        .count();
+    assert_eq!(rolls, 1);
+    assert_eq!(status.parse_errors_total(), 0);
+}
+
+/// The incoming instance's six subscribes, for the dormant-boot case.
+const EXP_ROLL_SUBS_2649: [&[u8]; 6] = [
+    br##"{"method":"subscribe","subscription":{"type":"bbo","coin":"#26490"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#26490"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"trades","coin":"#26490"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"bbo","coin":"#26491"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#26491"}}"##,
+    br##"{"method":"subscribe","subscription":{"type":"trades","coin":"#26491"}}"##,
+];

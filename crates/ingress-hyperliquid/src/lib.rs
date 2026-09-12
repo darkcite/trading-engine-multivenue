@@ -103,6 +103,7 @@
 )]
 
 pub mod discovery;
+pub mod family;
 pub mod run_loop;
 
 pub use run_loop::{
@@ -125,7 +126,14 @@ pub const HL_COIN_MAX: usize = 24;
 
 /// Maximum number of configured coins per connection. Fixed-cap
 /// tables everywhere; boot fails fast beyond this.
-pub const HL_MAX_COINS: usize = 16;
+///
+/// **16 → 32 (BIN15 O2.)** A rolling HIP-4 family costs TWO rows
+/// (its Yes and No legs), and the eight families ruled for BIN15
+/// would alone exhaust the old cap before a single perp was
+/// configured. 32 × [`CHANNELS_PER_COIN`] = 128 fills [`MaskBits`]
+/// exactly, which is why the two venue-global ack bits had to move
+/// out of it into [`GlobalBits`].
+pub const HL_MAX_COINS: usize = 32;
 
 /// Client keepalive probe — Hyperliquid wants the JSON text frame
 /// `{"method":"ping"}` (venue cuts at 60 s idle; cli sends at 50 s).
@@ -757,12 +765,26 @@ pub enum CoinTableErr {
     TooLong,
     /// Coin empty.
     Empty,
+    /// BIN15 O2: [`HlCoinTable::rebind`] named a row that does not
+    /// exist. A programming error, not operator input — the family
+    /// table hands back the indices [`HlCoinTable::reserve`] returned.
+    NoSuchRow,
 }
 
-/// Fixed-capacity `coin → SymbolId` map. Linear scan (N ≤ 16).
-/// Single-owner: built at boot, read by the ingress thread. HIP-4
-/// `#<enc>`, spot `@<idx>` and HIP-3 `dex:COIN` strings are ordinary
-/// rows — no special surface.
+/// Fixed-capacity `coin → SymbolId` map. Linear scan (N ≤ 32).
+/// HIP-4 `#<enc>`, spot `@<idx>` and HIP-3 `dex:COIN` strings are
+/// ordinary rows — no special surface.
+///
+/// A row may be **EMPTY** (`len` byte 0) since BIN15 O2: a RESERVED
+/// slot whose `SymbolId` is fixed for the life of the process while
+/// the venue instrument it names comes and goes. That is what makes
+/// a rolling family expressible — the strategy and every capture
+/// consumer address a stable sym, and the coin under it is rebound
+/// as instances are created and settle.
+///
+/// Ownership: [`Self::insert`] and [`Self::reserve`] are BOOT-time;
+/// [`Self::rebind`] is **ingress-thread only** (it runs inside the
+/// `outcomeMetaUpdates` arm). Everything else is a read.
 pub struct HlCoinTable {
     rows: [(u8, [u8; HL_COIN_MAX], SymbolId); HL_MAX_COINS],
     len: usize,
@@ -775,6 +797,48 @@ impl HlCoinTable {
             rows: [(0, [0; HL_COIN_MAX], 0); HL_MAX_COINS],
             len: 0,
         }
+    }
+
+    /// Reserve an EMPTY row bound to `sym` and return its index.
+    ///
+    /// BIN15 O2: the slot exists from boot so that `SymbolId` is
+    /// stable, but names no venue instrument until [`Self::rebind`]
+    /// writes one. A reserved row is skipped by [`Self::lookup`],
+    /// [`expected_mask`] and the run loop's subscribe sweep, so a
+    /// dormant family costs nothing on the wire. Boot-time only.
+    pub fn reserve(&mut self, sym: SymbolId) -> Result<usize, CoinTableErr> {
+        if self.len >= HL_MAX_COINS {
+            return Err(CoinTableErr::Full);
+        }
+        let idx = self.len;
+        let row = &mut self.rows[idx];
+        row.0 = 0;
+        row.1 = [0; HL_COIN_MAX];
+        row.2 = sym;
+        self.len += 1;
+        Ok(idx)
+    }
+
+    /// Point row `idx` at `coin`, keeping its `SymbolId`.
+    ///
+    /// An EMPTY `coin` unbinds the row (the slot stays reserved).
+    /// **Ingress-thread only** — this is the roll. Allocation-free.
+    pub fn rebind(&mut self, idx: usize, coin: &[u8]) -> Result<(), CoinTableErr> {
+        if idx >= self.len {
+            return Err(CoinTableErr::NoSuchRow);
+        }
+        if coin.len() > HL_COIN_MAX {
+            return Err(CoinTableErr::TooLong);
+        }
+        let row = &mut self.rows[idx];
+        row.0 = coin.len() as u8;
+        row.1 = [0; HL_COIN_MAX];
+        let mut k = 0usize;
+        while k < coin.len() {
+            row.1[k] = coin[k];
+            k += 1;
+        }
+        Ok(())
     }
 
     /// Register `coin → sym`. Boot-time only.
@@ -797,10 +861,14 @@ impl HlCoinTable {
     }
 
     /// Resolve a coin to its symbol. Hot path: length gate first,
-    /// then bytewise compare.
+    /// then bytewise compare. EMPTY (reserved) rows never match —
+    /// including against an empty needle.
     #[inline]
     pub fn lookup(&self, coin: &[u8]) -> Option<SymbolId> {
         let n = coin.len();
+        if n == 0 {
+            return None;
+        }
         let mut i = 0;
         while i < self.len {
             let row = &self.rows[i];
@@ -812,7 +880,8 @@ impl HlCoinTable {
         None
     }
 
-    /// Row accessor for subscribe building: `(coin, sym)`.
+    /// Row accessor for subscribe building: `(coin, sym)`. The coin
+    /// is EMPTY for a reserved row — callers must skip those.
     #[inline]
     pub fn get(&self, idx: usize) -> Option<(&[u8], SymbolId)> {
         if idx >= self.len {
@@ -840,6 +909,9 @@ impl HlCoinTable {
     #[inline]
     pub fn index_of_coin(&self, coin: &[u8]) -> Option<usize> {
         let n = coin.len();
+        if n == 0 {
+            return None;
+        }
         let mut i = 0;
         while i < self.len {
             let row = &self.rows[i];
@@ -874,16 +946,26 @@ impl Default for HlCoinTable {
 // Ack-verification mask (§ Subscribe acks, module doc)
 // ---------------------------------------------------------------
 
-/// Expected/found subscription bitmask. Per-coin channels occupy
-/// bits `coin_idx * CHANNELS_PER_COIN + channel`; the two global
-/// channels sit above [`ALL_MIDS_BIT`] / [`OUTCOME_META_BIT`].
-/// 16 coins × 4 + 2 = 66 bits ⇒ `u128`.
+/// Expected/found bitmask for the **per-coin** subscriptions: bit
+/// `coin_idx * CHANNELS_PER_COIN + channel`.
+///
+/// BIN15 O2 raised [`HL_MAX_COINS`] to 32, so 32 × 4 = 128 bits fill
+/// a `u128` EXACTLY and the two venue-global channels no longer fit
+/// above them. They moved to their own [`GlobalBits`] byte rather
+/// than this widening to a hand-rolled 256-bit word: the per-coin
+/// mask is read on every subscribe ack, and one machine word is what
+/// keeps that free.
 pub type MaskBits = u128;
 
+/// Expected/found bitmask for the two venue-GLOBAL subscriptions
+/// (`allMids`, `outcomeMetaUpdates`), which resolve no coin. Split
+/// out of [`MaskBits`] by BIN15 O2 — see that type's doc.
+pub type GlobalBits = u8;
+
 /// Mask bit for the global `allMids` subscription.
-pub const ALL_MIDS_BIT: MaskBits = 1u128 << (HL_MAX_COINS * CHANNELS_PER_COIN);
+pub const ALL_MIDS_BIT: GlobalBits = 1;
 /// Mask bit for the global `outcomeMetaUpdates` subscription.
-pub const OUTCOME_META_BIT: MaskBits = 1u128 << (HL_MAX_COINS * CHANNELS_PER_COIN + 1);
+pub const OUTCOME_META_BIT: GlobalBits = 2;
 
 /// Mask bit for `(coin_idx, per-coin channel)`. Debug-asserts the
 /// channel is per-coin and the index in range.
@@ -894,13 +976,22 @@ pub fn bit_of(coin_idx: usize, channel: HlChannel) -> MaskBits {
     1u128 << (coin_idx * CHANNELS_PER_COIN + channel as usize)
 }
 
-/// Expected-ack mask for a configured table: bbo + l2Book + trades
-/// per coin, activeAssetCtx per perp coin ([`coin_wants_asset_ctx`]),
-/// plus the two global channels.
-pub fn expected_mask(coins: &HlCoinTable) -> MaskBits {
-    let mut m: MaskBits = ALL_MIDS_BIT | OUTCOME_META_BIT;
+/// Expected-ack masks for a configured table: bbo + l2Book + trades
+/// per BOUND coin, activeAssetCtx per perp coin
+/// ([`coin_wants_asset_ctx`]), plus the two global channels.
+///
+/// Returns `(per-coin, global)`. EMPTY (reserved) rows contribute
+/// nothing — a dormant family is not waited on, which is what lets a
+/// session verify while a family has no live instance.
+pub fn expected_mask(coins: &HlCoinTable) -> (MaskBits, GlobalBits) {
+    let mut m: MaskBits = 0;
+    let g: GlobalBits = ALL_MIDS_BIT | OUTCOME_META_BIT;
     let mut i = 0;
     while let Some((coin, _sym)) = coins.get(i) {
+        if coin.is_empty() {
+            i += 1;
+            continue;
+        }
         m |= bit_of(i, HlChannel::Bbo);
         m |= bit_of(i, HlChannel::L2Book);
         m |= bit_of(i, HlChannel::Trades);
@@ -909,7 +1000,7 @@ pub fn expected_mask(coins: &HlCoinTable) -> MaskBits {
         }
         i += 1;
     }
-    m
+    (m, g)
 }
 
 // ---------------------------------------------------------------
@@ -967,6 +1058,22 @@ impl HlStaleness {
             self.last_advance_ns[i] = now_ns;
             i += 1;
         }
+    }
+
+    /// Re-baseline ONE coin's cadence at `now_ns`.
+    ///
+    /// BIN15 O2: when a rolling family rebinds a slot, the new
+    /// instrument inherits the old one's staleness stamps. The old
+    /// coin stopped publishing at its expiry, so without this the
+    /// dead instance's silence condemns the fresh one and kills the
+    /// session at the first roll. Out-of-range or disarmed is a
+    /// no-op.
+    pub fn reset(&mut self, coin_idx: usize, now_ns: u64) {
+        if !self.armed || coin_idx >= self.n {
+            return;
+        }
+        self.last_venue_ts_ns[coin_idx] = 0;
+        self.last_advance_ns[coin_idx] = now_ns;
     }
 
     /// Disarm (reconnect teardown).
@@ -1039,6 +1146,35 @@ pub fn write_subscribe(dst: &mut [u8], channel: HlChannel, coin: Option<&[u8]>) 
         dst,
         n,
         b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"",
+    )?;
+    n = push_bytes(dst, n, channel.wire_name())?;
+    if let Some(c) = coin {
+        n = push_bytes(dst, n, b"\",\"coin\":\"")?;
+        n = push_bytes(dst, n, c)?;
+    }
+    n = push_bytes(dst, n, b"\"}}")?;
+    Some(n)
+}
+
+/// Render `{"method":"unsubscribe","subscription":{…}}` into `dst`.
+///
+/// BIN15 O2: when a rolling family's instance settles, its two coins
+/// must stop consuming a subscription slot on the venue side before
+/// the next instance's are opened. The frame is [`write_subscribe`]'s
+/// with one verb changed, and the venue's echo is deliberately
+/// IGNORED — `parse_sub_response` matches only `"method":"subscribe"`,
+/// so an unsubscribe ack cannot disturb the ack mask and none is
+/// awaited.
+#[inline]
+pub fn write_unsubscribe(dst: &mut [u8], channel: HlChannel, coin: Option<&[u8]>) -> Option<usize> {
+    if channel.per_coin() != coin.is_some() {
+        return None;
+    }
+    let mut n = 0;
+    n = push_bytes(
+        dst,
+        n,
+        b"{\"method\":\"unsubscribe\",\"subscription\":{\"type\":\"",
     )?;
     n = push_bytes(dst, n, channel.wire_name())?;
     if let Some(c) = coin {
@@ -1414,7 +1550,7 @@ mod tests {
         let mut t = HlCoinTable::new();
         t.insert(b"BTC", 1).unwrap();
         t.insert(b"#330", 2).unwrap();
-        let m = expected_mask(&t);
+        let (m, g) = expected_mask(&t);
         assert_ne!(m & bit_of(0, HlChannel::Bbo), 0);
         assert_ne!(m & bit_of(0, HlChannel::L2Book), 0);
         assert_ne!(m & bit_of(0, HlChannel::Trades), 0);
@@ -1425,10 +1561,120 @@ mod tests {
             0,
             "outcome coin: no ctx"
         );
-        assert_ne!(m & ALL_MIDS_BIT, 0);
-        assert_ne!(m & OUTCOME_META_BIT, 0);
-        // Exactly 4 + 3 + 2 bits set.
-        assert_eq!(m.count_ones(), 9);
+        assert_ne!(g & ALL_MIDS_BIT, 0);
+        assert_ne!(g & OUTCOME_META_BIT, 0);
+        // Exactly 4 + 3 per-coin bits; the two globals are their own
+        // byte since BIN15 O2.
+        assert_eq!(m.count_ones(), 7);
+        assert_eq!(g.count_ones(), 2);
+    }
+
+    #[test]
+    fn thirty_two_coins_times_four_channels_fill_the_mask_exactly() {
+        // The reason the global bits had to move: bit_of(31, Trades)
+        // is the TOP bit of the u128, so nothing else fits in it.
+        assert_eq!(HL_MAX_COINS * CHANNELS_PER_COIN, 128);
+        assert_eq!(
+            bit_of(HL_MAX_COINS - 1, HlChannel::ActiveAssetCtx),
+            1u128 << 127
+        );
+        assert_eq!(bit_of(0, HlChannel::Bbo), 1u128);
+        // And the globals are disjoint one-hot bits of their own byte.
+        assert_eq!(ALL_MIDS_BIT & OUTCOME_META_BIT, 0);
+        assert_eq!((ALL_MIDS_BIT | OUTCOME_META_BIT).count_ones(), 2);
+    }
+
+    // ---- reserved slots + rebinding (BIN15 O2) --------------------
+
+    #[test]
+    fn a_reserved_row_is_invisible_until_it_is_rebound() {
+        let mut t = HlCoinTable::new();
+        t.insert(b"BTC", 7).unwrap();
+        let slot = t.reserve(4096).unwrap();
+        assert_eq!(slot, 1);
+        assert_eq!(t.len(), 2);
+        // Reserved: no coin resolves to it, not even the empty one.
+        assert_eq!(t.lookup(b""), None);
+        assert_eq!(t.index_of_coin(b""), None);
+        assert!(t.get(slot).unwrap().0.is_empty());
+        assert_eq!(t.get(slot).unwrap().1, 4096);
+        // ... and it is not waited on.
+        let (m, _g) = expected_mask(&t);
+        assert_eq!(m & bit_of(slot, HlChannel::Bbo), 0);
+        assert_eq!(m.count_ones(), 4, "BTC's four channels only");
+
+        // Bound: it resolves, keeps its sym, and joins the mask.
+        t.rebind(slot, b"#26490").unwrap();
+        assert_eq!(t.lookup(b"#26490"), Some(4096));
+        assert_eq!(t.index_of_coin(b"#26490"), Some(slot));
+        let (m, _g) = expected_mask(&t);
+        assert_ne!(m & bit_of(slot, HlChannel::Bbo), 0);
+        // An outcome coin takes no activeAssetCtx.
+        assert_eq!(m & bit_of(slot, HlChannel::ActiveAssetCtx), 0);
+        assert_eq!(m.count_ones(), 7);
+
+        // Rebound again: the OLD coin stops resolving, the sym holds.
+        t.rebind(slot, b"#26500").unwrap();
+        assert_eq!(t.lookup(b"#26490"), None);
+        assert_eq!(t.lookup(b"#26500"), Some(4096));
+        // Unbound by an empty coin; the slot survives.
+        t.rebind(slot, b"").unwrap();
+        assert_eq!(t.lookup(b"#26500"), None);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.get(slot).unwrap().1, 4096);
+        // Bad input.
+        assert_eq!(t.rebind(9, b"BTC"), Err(CoinTableErr::NoSuchRow));
+        assert_eq!(
+            t.rebind(slot, &[b'A'; HL_COIN_MAX + 1]),
+            Err(CoinTableErr::TooLong)
+        );
+    }
+
+    #[test]
+    fn staleness_reset_rebaselines_one_coin_only() {
+        let mut s = HlStaleness::new(1_000);
+        s.arm(10_000, 2);
+        s.on_l2book(0, 1, 10_000);
+        s.on_l2book(1, 1, 10_000);
+        // Both coins go stale at the same instant.
+        assert_eq!(s.first_stale(11_500), Some(0));
+        // Re-baselining coin 0 leaves coin 1 stale — the roll must not
+        // excuse the coins it did not touch.
+        s.reset(0, 11_500);
+        assert_eq!(s.first_stale(11_500), Some(1));
+        s.reset(1, 11_500);
+        assert_eq!(s.first_stale(11_500), None);
+        // Out of range and disarmed are no-ops.
+        s.reset(99, 12_000);
+        let mut d = HlStaleness::new(1_000);
+        d.reset(0, 1);
+        assert_eq!(d.first_stale(u64::MAX), None);
+    }
+
+    #[test]
+    fn unsubscribe_is_the_subscribe_frame_with_one_verb_changed() {
+        let mut sub_buf = [0u8; 160];
+        let mut unsub_buf = [0u8; 160];
+        let ns = write_subscribe(&mut sub_buf, HlChannel::Bbo, Some(b"#26490")).unwrap();
+        let nu = write_unsubscribe(&mut unsub_buf, HlChannel::Bbo, Some(b"#26490")).unwrap();
+        assert_eq!(
+            &unsub_buf[..nu],
+            br##"{"method":"unsubscribe","subscription":{"type":"bbo","coin":"#26490"}}"##
+        );
+        // Identical but for the verb.
+        let a = core::str::from_utf8(&sub_buf[..ns]).unwrap();
+        let b = core::str::from_utf8(&unsub_buf[..nu]).unwrap();
+        assert_eq!(a.replace("\"subscribe\"", "\"unsubscribe\""), b);
+        // The global form takes no coin, and the arity rule holds.
+        let n = write_unsubscribe(&mut unsub_buf, HlChannel::AllMids, None).unwrap();
+        assert_eq!(
+            &unsub_buf[..n],
+            br#"{"method":"unsubscribe","subscription":{"type":"allMids"}}"#
+        );
+        assert!(write_unsubscribe(&mut unsub_buf, HlChannel::Bbo, None).is_none());
+        assert!(write_unsubscribe(&mut unsub_buf, HlChannel::AllMids, Some(b"BTC")).is_none());
+        // An unsubscribe echo is NOT an ack (the parser gates on the verb).
+        assert!(parse_sub_response(&unsub_buf[..n]).is_none());
     }
 
     // ---- staleness monitor ---------------------------------------

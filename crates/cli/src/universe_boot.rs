@@ -70,6 +70,11 @@ pub struct BootUniverse {
     pub deribit_spec: Option<String>,
     /// Hyperliquid comma spec (None = venue off).
     pub hl_spec: Option<String>,
+    /// BIN15 O2: `[hyperliquid] rolling` family keys, in file order.
+    /// Empty = no rolling families = the pre-BIN15 boot. Config-file
+    /// only: a rolling family is a capture-and-strategy contract, not
+    /// something to spell on a command line.
+    pub hl_rolling: Vec<String>,
     /// Effective OKX depth-channel toggle (flag OR config).
     pub okx_depth: bool,
     /// M2.2 capped options-chain policy for OKX (config-file only;
@@ -178,6 +183,7 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 okx_spec: flag_spec(f.okx_symbols),
                 deribit_spec: flag_spec(f.deribit_symbols),
                 hl_spec: flag_spec(f.hl_coins),
+                hl_rolling: Vec::new(),
                 okx_depth: f.okx_depth,
                 deribit_depth: f.deribit_depth,
                 okx_options: universe::OptionsPolicy::default(),
@@ -264,6 +270,7 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 okx_spec: okx_flag.or_else(|| join_or_none(&u.okx_instruments)),
                 deribit_spec: deribit_flag.or_else(|| join_or_none(&u.deribit_instruments)),
                 hl_spec: flag_spec(f.hl_coins).or_else(|| join_or_none(&u.hl_coins)),
+                hl_rolling: u.hl_rolling.clone(),
                 okx_depth: f.okx_depth || u.okx_depth,
                 deribit_depth: f.deribit_depth || u.deribit_depth,
                 okx_options,

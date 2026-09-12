@@ -1191,10 +1191,19 @@ fn run(args: RunArgs) -> ExitCode {
     const HL_WS_PATH: &str = "/ws";
     let hl_boot = match boot.hl_spec.as_deref().map(str::trim) {
         Some(spec) if !spec.is_empty() => {
-            let coins = match cli::build_hl_coin_table(spec) {
+            let mut coins = match cli::build_hl_coin_table(spec) {
                 Ok(t) => t,
                 Err(reason) => {
                     error!(reason, spec, "bad --hl-coins");
+                    return ExitCode::from(1);
+                }
+            };
+            // BIN15 O2: reserve the rolling families' slots AFTER the
+            // configured coins, so no configured sym moves.
+            let families = match cli::build_hl_families(&boot.hl_rolling, &mut coins) {
+                Ok(t) => t,
+                Err(reason) => {
+                    error!(reason, "bad [hyperliquid] rolling");
                     return ExitCode::from(1);
                 }
             };
@@ -1212,7 +1221,7 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            Some((coins, hl_ep))
+            Some((coins, families, hl_ep))
         }
         _ => None,
     };
@@ -1239,7 +1248,7 @@ fn run(args: RunArgs) -> ExitCode {
         &bn_syms,
         okx_boot.as_ref().map(|(t, _)| t),
         deribit_boot.as_ref().map(|(t, _)| t),
-        hl_boot.as_ref().map(|(t, _)| t),
+        hl_boot.as_ref().map(|(t, _f, _e)| t),
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
     // grammar's stage-time resolution — same allocation truth as the
@@ -1727,9 +1736,61 @@ fn run(args: RunArgs) -> ExitCode {
     }
 
     // Hyperliquid rides core 7 per the §9 core map.
-    if let Some((hl_coins, hl_ep)) = hl_boot {
+    let hl_wall_anchor = core_time::WallAnchor::now();
+    if let Some((mut hl_coins, mut hl_families, hl_ep)) = hl_boot {
+        // BIN15 O2: adopt each family's LIVE instance out of the
+        // discovery body, so the first `Steady` subscribes it instead
+        // of waiting up to a whole period for the venue's next
+        // lifecycle push. A family with no match boots dormant.
+        if !hl_families.is_empty() {
+            // WALL clock: a HIP-4 expiry is an epoch instant, and
+            // this anchor is the one the ingress will judge rolls
+            // against for the life of the process.
+            let bound = hl_families.bind_live(
+                &discovery.hl_outcome_specs,
+                hl_wall_anchor.wall_ns,
+                &mut hl_coins,
+            );
+            info!(
+                families = hl_families.len(),
+                bound,
+                dormant = hl_families.dormant_count(),
+                candidates = discovery.hl_outcome_specs.len(),
+                "hyperliquid: rolling families bound"
+            );
+            for f in 0..hl_families.len() {
+                let Some(row) = hl_families.get(f) else {
+                    continue;
+                };
+                let underlying = core::str::from_utf8(row.underlying_bytes()).unwrap_or("?");
+                if row.dormant {
+                    info!(
+                        family = f,
+                        underlying,
+                        period_s = row.period_s,
+                        sym_yes = row.sym[0],
+                        sym_no = row.sym[1],
+                        "hyperliquid: family dormant (no live instance)"
+                    );
+                } else {
+                    info!(
+                        family = f,
+                        underlying,
+                        period_s = row.period_s,
+                        sym_yes = row.sym[0],
+                        sym_no = row.sym[1],
+                        live = row.live.outcome,
+                        strike_1e6 = row.live.strike_1e6,
+                        expiry_ns = row.live.expiry_ns,
+                        twap_s = row.live.twap_s,
+                        "hyperliquid: family live"
+                    );
+                }
+            }
+        }
         info!(
             coins = hl_coins.len(),
+            families = hl_families.len(),
             stale_after_ms = stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             "hyperliquid: starting ingress thread"
         );
@@ -1737,6 +1798,9 @@ fn run(args: RunArgs) -> ExitCode {
             hl_ep,
             tls_config.clone(),
             hl_coins,
+            hl_families,
+            statuses.hl_roll.clone(),
+            hl_wall_anchor,
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,

@@ -354,10 +354,15 @@ pub struct IngressStatusSet {
     pub bybit: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
+    /// BIN15 O2: the Hyperliquid ROLL counters. Venue-specific, so
+    /// they could not live in the size-locked generic
+    /// [`IngressStatus`] slot; they ride here so the metrics
+    /// publisher reaches them the same way.
+    pub hl_roll: Arc<ingress_hyperliquid::family::HlRollStatus>,
 }
 
 impl IngressStatusSet {
-    /// Allocate all seven slots (boot only).
+    /// Allocate all seven slots + the HL roll counters (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -367,6 +372,7 @@ impl IngressStatusSet {
             hyperliquid: Arc::new(IngressStatus::new()),
             bybit: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
+            hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
         }
     }
 }
@@ -1484,9 +1490,73 @@ pub fn build_hl_coin_table(spec: &str) -> Result<ingress_hyperliquid::HlCoinTabl
             Err(ingress_hyperliquid::CoinTableErr::Empty) => {
                 return Err("hl: empty coin in --hl-coins");
             }
+            // BIN15 O2 added the variant; `insert` never returns it
+            // (it names a row, and insert appends one).
+            Err(ingress_hyperliquid::CoinTableErr::NoSuchRow) => {
+                return Err("hl: coin table row missing (unreachable from insert)");
+            }
         }
     }
     Ok(table)
+}
+
+/// BIN15 O2: reserve two coin-table slots per ROLLING family and
+/// build the family table.
+///
+/// Reserved rows come AFTER every configured coin, so the configured
+/// coins keep the ordinals they always had and a family's presence
+/// changes no existing sym. The slot syms come from the rolling pool
+/// (`family::rolling_sym`), which is the same law
+/// `core_config::universe` used to write the manifest rows — the two
+/// must agree or an offline consumer reads the wrong instrument.
+///
+/// Fails fast on a bad key, on more families than
+/// [`ingress_hyperliquid::family::HL_MAX_FAMILIES`], and on a coin
+/// table that cannot hold `coins + 2 × families`.
+pub fn build_hl_families(
+    rolling: &[String],
+    coins: &mut ingress_hyperliquid::HlCoinTable,
+) -> Result<ingress_hyperliquid::family::HlFamilyTable, String> {
+    use ingress_hyperliquid::family::{rolling_sym, HlFamilyTable, HL_MAX_FAMILIES};
+    let mut families = HlFamilyTable::new();
+    if rolling.is_empty() {
+        return Ok(families);
+    }
+    if rolling.len() > HL_MAX_FAMILIES {
+        return Err(format!(
+            "hl: {} rolling families exceeds HL_MAX_FAMILIES ({HL_MAX_FAMILIES})",
+            rolling.len()
+        ));
+    }
+    let need = coins.len() + 2 * rolling.len();
+    if need > ingress_hyperliquid::HL_MAX_COINS {
+        return Err(format!(
+            "hl: {} coins + 2 x {} rolling families = {need} rows exceeds HL_MAX_COINS ({})",
+            coins.len(),
+            rolling.len(),
+            ingress_hyperliquid::HL_MAX_COINS
+        ));
+    }
+    for (f, key) in rolling.iter().enumerate() {
+        let (kind, underlying, period_s) = HlFamilyTable::parse_key(key.as_bytes())
+            .ok_or_else(|| format!("hl: bad rolling family `{key}`"))?;
+        let yes = coins
+            .reserve(rolling_sym(f, 0))
+            .map_err(|e| format!("hl: reserving `{key}` [yes]: {e:?}"))?;
+        let no = coins
+            .reserve(rolling_sym(f, 1))
+            .map_err(|e| format!("hl: reserving `{key}` [no]: {e:?}"))?;
+        families
+            .push(
+                kind,
+                underlying,
+                period_s,
+                [yes as u8, no as u8],
+                [rolling_sym(f, 0), rolling_sym(f, 1)],
+            )
+            .map_err(|e| format!("hl: registering `{key}`: {e:?}"))?;
+    }
+    Ok(families)
 }
 
 /// Spawn the Hyperliquid public-WS ingress thread (Phase 8d). One
@@ -1500,6 +1570,9 @@ pub fn spawn_hyperliquid(
     ep: WssEndpoint,
     tls_config: RustlsConfig,
     coins: ingress_hyperliquid::HlCoinTable,
+    families: ingress_hyperliquid::family::HlFamilyTable,
+    roll_status: Arc<ingress_hyperliquid::family::HlRollStatus>,
+    wall_anchor: core_time::WallAnchor,
     stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
@@ -1539,6 +1612,10 @@ pub fn spawn_hyperliquid(
             );
             // VT2: venue default or the operator's `--stale-after-ms hl:<ms>`.
             driver.set_stale_after_ms(stale_after_ms);
+            // BIN15 O2: rolling families. An empty table leaves every
+            // path in the driver exactly as it was before BIN15.
+            let has_families = !families.is_empty();
+            driver.set_families(families, roll_status, wall_anchor);
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -1572,7 +1649,19 @@ pub fn spawn_hyperliquid(
                     &mut event_tx,
                     // VM2 V2: HL funding rides AssetCtx — the lane
                     // mask carries both bits (feature-engine law).
-                    EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX,
+                    // BIN15 O2: with rolling families configured the
+                    // lane also carries the roll and the MARK — a
+                    // member cannot price a HIP-4 binary without the
+                    // strike's reference, and cannot know which
+                    // instance its slot holds without the roll.
+                    if has_families {
+                        EVENT_LANE_FUNDING
+                            | EVENT_LANE_ASSET_CTX
+                            | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
+                            | core_types::event_lane_bit(core_types::ChannelId::Mark)
+                    } else {
+                        EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
+                    },
                     &mut poll,
                     &mut events,
                     token,
@@ -2939,6 +3028,22 @@ impl Observability {
             let ingress_hyperliquid_state = reg
                 .register_gauge("engine_ingress_hyperliquid_state")
                 .map_err(|_| "register engine_ingress_hyperliquid_state")?;
+            // BIN15 O2: the rolling families' own tells. `rolls_total`
+            // should step once per family per period; `ignored` counts
+            // the other deployers' markets on the shared lifecycle
+            // channel and is expected to be large.
+            let ingress_hl_rolls = reg
+                .register_gauge("engine_ingress_hyperliquid_rolls_total")
+                .map_err(|_| "register engine_ingress_hyperliquid_rolls_total")?;
+            let ingress_hl_rolls_ignored = reg
+                .register_gauge("engine_ingress_hyperliquid_rolls_ignored_unmatched_total")
+                .map_err(|_| "register engine_ingress_hyperliquid_rolls_ignored_unmatched_total")?;
+            let ingress_hl_family_ack_timeouts = reg
+                .register_gauge("engine_ingress_hyperliquid_family_ack_timeouts_total")
+                .map_err(|_| "register engine_ingress_hyperliquid_family_ack_timeouts_total")?;
+            let ingress_hl_families_dormant = reg
+                .register_gauge("engine_ingress_hyperliquid_families_dormant")
+                .map_err(|_| "register engine_ingress_hyperliquid_families_dormant")?;
             let ingress_bybit_state = reg
                 .register_gauge("engine_ingress_bybit_state")
                 .map_err(|_| "register engine_ingress_bybit_state")?;
@@ -3107,6 +3212,10 @@ impl Observability {
                 ingress_okx_state,
                 ingress_deribit_state,
                 ingress_hyperliquid_state,
+                ingress_hl_rolls,
+                ingress_hl_rolls_ignored,
+                ingress_hl_family_ack_timeouts,
+                ingress_hl_families_dormant,
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_last_tick_age,
@@ -3379,6 +3488,14 @@ pub struct EngineCounters {
     pub ingress_deribit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Hyperliquid public WS.
     pub ingress_hyperliquid_state: core_metrics::GaugeId,
+    /// BIN15 O2: `engine_ingress_hyperliquid_rolls_total`.
+    pub ingress_hl_rolls: core_metrics::GaugeId,
+    /// BIN15 O2: `engine_ingress_hyperliquid_rolls_ignored_unmatched_total`.
+    pub ingress_hl_rolls_ignored: core_metrics::GaugeId,
+    /// BIN15 O2: `engine_ingress_hyperliquid_family_ack_timeouts_total`.
+    pub ingress_hl_family_ack_timeouts: core_metrics::GaugeId,
+    /// BIN15 O2: `engine_ingress_hyperliquid_families_dormant` (gauge).
+    pub ingress_hl_families_dormant: core_metrics::GaugeId,
     /// WS9: per-ingress state gauge, Bybit v5 public WS.
     pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
@@ -5440,6 +5557,14 @@ where
                     reg.gauge(ids.ingress_okx_state).set(ing.okx.state() as i64);
                     reg.gauge(ids.ingress_deribit_state)
                         .set(ing.deribit.state() as i64);
+                    reg.gauge(ids.ingress_hl_rolls)
+                        .set(ing.hl_roll.rolls_total() as i64);
+                    reg.gauge(ids.ingress_hl_rolls_ignored)
+                        .set(ing.hl_roll.rolls_ignored_unmatched() as i64);
+                    reg.gauge(ids.ingress_hl_family_ack_timeouts)
+                        .set(ing.hl_roll.family_ack_timeouts() as i64);
+                    reg.gauge(ids.ingress_hl_families_dormant)
+                        .set(ing.hl_roll.families_dormant() as i64);
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_bybit_state)
@@ -5879,6 +6004,13 @@ pub mod boot_discovery {
         /// Hyperliquid's coin table is still built by
         /// [`super::build_hl_coin_table`] exactly as before.
         pub hl: Option<VenueCoverage>,
+        /// BIN15 O2: HL outcome rows whose description parsed to a
+        /// KNOWN grammar. The rolling families bind their live
+        /// instance out of this at boot, so a family is subscribed at
+        /// the first `Steady` rather than after up to a whole period
+        /// of waiting for the next lifecycle push. Empty when the
+        /// venue is off or no row parsed.
+        pub hl_outcome_specs: Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
         /// Binance coverage (M1 exchangeInfo audit); `None` when the
         /// caller skipped it (legacy flag boots keep their historical
         /// zero-REST Binance behavior — config boots audit).
@@ -6468,12 +6600,14 @@ pub mod boot_discovery {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
     fn run_hl(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
         spec: &str,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
+        out_specs: &mut Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
     ) -> Result<VenueCoverage, &'static str> {
         let (host, port) = split_host_port(&cfg.hyperliquid_api_host, 443)?;
         let mut d = HlDiscovery::new();
@@ -6504,6 +6638,12 @@ pub mod boot_discovery {
                 "hl: discovery parse failed"
             })?;
         }
+
+        // BIN15 O2: hand the parsed outcome economics back before the
+        // discovery table is dropped — the rolling families' boot
+        // binding reads this instead of waiting a whole period for the
+        // venue's next lifecycle push.
+        *out_specs = d.outcome_specs();
 
         let configured: Vec<&str> = spec
             .split(',')
@@ -6876,8 +7016,16 @@ pub mod boot_discovery {
             Vec::new()
         };
 
+        let mut hl_outcome_specs = Vec::new();
         let hl = match hl_spec.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(spec) => Some(run_hl(cfg, tls_config, spec, &mut buf, &mut any_missing)?),
+            Some(spec) => Some(run_hl(
+                cfg,
+                tls_config,
+                spec,
+                &mut buf,
+                &mut any_missing,
+                &mut hl_outcome_specs,
+            )?),
             None => None,
         };
 
@@ -6943,6 +7091,7 @@ pub mod boot_discovery {
             deribit,
             deribit_options,
             hl,
+            hl_outcome_specs,
             bn,
             bn_options,
             bybit: bybit_cov,

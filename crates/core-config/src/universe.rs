@@ -123,6 +123,23 @@ const PM_TOKEN_LEN_MAX: usize = 80;
 const BN_SYMBOL_LEN_MAX: usize = 32;
 const INSTRUMENT_LEN_MAX: usize = 48;
 const HL_COIN_LEN_MAX: usize = 32;
+
+/// BIN15 O2: cap on `[hyperliquid] rolling` entries.
+///
+/// MIRRORS `ingress_hyperliquid::family::HL_MAX_FAMILIES` — this
+/// crate cannot depend on an ingress crate, so the number lives twice
+/// and the boot's own `HlFamilyTable::push` refuses anything this
+/// check let through (the same split as `coins`, whose real cap is
+/// `HL_MAX_COINS`, enforced in the cli's coin-table build).
+const HL_ROLLING_MAX: usize = 8;
+
+/// BIN15 O2: ordinal base of the rolling slot pool.
+///
+/// MIRRORS `ingress_hyperliquid::family::HL_ROLLING_ORDINAL_BASE`.
+/// Above every `coins` ordinal (1-based, capped by
+/// [`VENUE_LIST_MAX`]), so a family slot can never alias a
+/// configured perp.
+const HL_ROLLING_ORDINAL_BASE: u32 = 4096;
 const OPT_UNDERLYING_LEN_MAX: usize = 24;
 
 // ---------------------------------------------------------------
@@ -279,6 +296,16 @@ pub struct Universe {
     /// `[hyperliquid] coins` — coin names (HIP-4 `#<enc>` and spot
     /// `@<idx>` forms are ordinary items) in file order.
     pub hl_coins: Vec<String>,
+    /// BIN15 O2: `[hyperliquid] rolling` — ROLLING HIP-4 families as
+    /// `<out|native>:<COIN>:<15m|1d>`, in file order. Absent or empty
+    /// is the pre-BIN15 boot, bit for bit.
+    ///
+    /// A family is not an instrument: it is a pair of reserved
+    /// `SymbolId` slots whose venue coin is rebound as instances are
+    /// created and settle (`ingress_hyperliquid::family`). Each entry
+    /// therefore allocates TWO manifest rows — `[yes]` and `[no]` —
+    /// from the rolling ordinal pool, above every `coins` ordinal.
+    pub hl_rolling: Vec<String>,
     /// WS9: `[bybit] spot` — UPPERCASE venue symbols in file order.
     pub bybit_spot: Vec<String>,
     /// WS9: `[bybit] linear` — UPPERCASE linear-perp symbols in file
@@ -409,6 +436,7 @@ enum Slot {
     DeribitOptExpiries,
     DeribitOptStrikes,
     HlCoins,
+    HlRolling,
     BybitSpot,
     BybitLinear,
     PairsMap,
@@ -426,6 +454,8 @@ enum ElemKind {
     BybitSymbol,
     Instrument,
     HlCoin,
+    /// BIN15 O2: a rolling-family key, `<out|native>:<COIN>:<15m|1d>`.
+    HlRolling,
     OptUnderlying,
     PairRef,
 }
@@ -462,6 +492,7 @@ struct Builder {
     deribit_opt_expiries: Option<u32>,
     deribit_opt_strikes: Option<u32>,
     hl_coins: Option<Vec<String>>,
+    hl_rolling: Option<Vec<String>>,
     bybit_spot: Option<Vec<String>>,
     bybit_linear: Option<Vec<String>>,
     pairs_map: Option<Vec<String>>,
@@ -621,6 +652,7 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Deribit, "options_expiries") => Some(Slot::DeribitOptExpiries),
         (Section::Deribit, "options_strikes") => Some(Slot::DeribitOptStrikes),
         (Section::Hyperliquid, "coins") => Some(Slot::HlCoins),
+        (Section::Hyperliquid, "rolling") => Some(Slot::HlRolling),
         (Section::Bybit, "spot") => Some(Slot::BybitSpot),
         (Section::Bybit, "linear") => Some(Slot::BybitLinear),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
@@ -643,6 +675,7 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::BybitSpot | Slot::BybitLinear => ElemKind::BybitSymbol,
         Slot::OkxInstr | Slot::DeribitInstr | Slot::DeribitCombos => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
+        Slot::HlRolling => ElemKind::HlRolling,
         Slot::BnOptUnderlyings | Slot::OkxOptUnderlyings | Slot::DeribitOptUnderlyings => {
             ElemKind::OptUnderlying
         }
@@ -762,6 +795,7 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::BybitSymbol => validate_bybit_symbol(s, line_no),
         ElemKind::Instrument => validate_name(s, INSTRUMENT_LEN_MAX, "instrument", line_no),
         ElemKind::HlCoin => validate_name(s, HL_COIN_LEN_MAX, "coin", line_no),
+        ElemKind::HlRolling => validate_hl_rolling(s, line_no),
         ElemKind::OptUnderlying => {
             validate_name(s, OPT_UNDERLYING_LEN_MAX, "options underlying", line_no)
         }
@@ -870,6 +904,49 @@ fn validate_bn_dated_symbol(s: &str, line_no: usize) -> Result<(), UniverseError
     }
 }
 
+/// BIN15 O2: `<out|native>:<COIN>:<15m|1d>`.
+///
+/// The crossed forms (`out:…:1d`, `native:…:15m`) are REFUSED: neither
+/// exists on the venue, and accepting one would mean guessing which
+/// settlement law it followed. Mirrors
+/// `ingress_hyperliquid::family::HlFamilyTable::parse_key`, which
+/// refuses the same set at boot.
+fn validate_hl_rolling(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let mut it = s.split(':');
+    let deployer = it.next().unwrap_or("");
+    let underlying = it.next().unwrap_or("");
+    let period = it.next().unwrap_or("");
+    if it.next().is_some() {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: want <out|native>:<COIN>:<15m|1d>"),
+        ));
+    }
+    let pairing_ok = matches!((deployer, period), ("out", "15m") | ("native", "1d"));
+    if !pairing_ok {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: only `out:<COIN>:15m` and `native:<COIN>:1d` exist"),
+        ));
+    }
+    if underlying.is_empty() || underlying.len() > 15 {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: underlying must be 1..=15 bytes"),
+        ));
+    }
+    if !underlying
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return Err(err(
+            line_no,
+            format!("rolling family `{s}`: underlying must be [A-Z0-9]"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_name(s: &str, max: usize, what: &str, line_no: usize) -> Result<(), UniverseError> {
     let ok = !s.is_empty()
         && s.len() <= max
@@ -967,6 +1044,11 @@ fn store_array(
         Slot::HlCoins => {
             if b.hl_coins.replace(items).is_some() {
                 return Err(dup("coins"));
+            }
+        }
+        Slot::HlRolling => {
+            if b.hl_rolling.replace(items).is_some() {
+                return Err(dup("rolling"));
             }
         }
         Slot::BybitSpot => {
@@ -1114,6 +1196,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let deribit_instruments = b.deribit_instr.unwrap_or_default();
     let deribit_combos = b.deribit_combos.unwrap_or_default();
     let hl_coins = b.hl_coins.unwrap_or_default();
+    let hl_rolling = b.hl_rolling.unwrap_or_default();
     let bybit_spot = b.bybit_spot.unwrap_or_default();
     let bybit_linear = b.bybit_linear.unwrap_or_default();
 
@@ -1134,6 +1217,11 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     )?;
     check_cap(deribit_combos.len(), DERIBIT_COMBOS_MAX, "Deribit combos")?;
     check_cap(hl_coins.len(), VENUE_LIST_MAX, "Hyperliquid coins")?;
+    check_cap(
+        hl_rolling.len(),
+        HL_ROLLING_MAX,
+        "Hyperliquid rolling families",
+    )?;
     // WS9: per-CONNECTION table capacity, tighter than the shared
     // list max (crates/ingress-bybit BYBIT_MAX_SYMBOLS = 64).
     check_cap(bybit_spot.len(), 64, "Bybit spot symbols")?;
@@ -1169,6 +1257,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         }
     }
     check_unique(&hl_coins, "Hyperliquid coin")?;
+    check_unique(&hl_rolling, "Hyperliquid rolling family")?;
     check_unique(&bybit_spot, "Bybit spot symbol")?;
     check_unique(&bybit_linear, "Bybit linear symbol")?;
     // WS5 note: `usdm` and `usdm_dated` cannot overlap BY ALPHABET —
@@ -1238,6 +1327,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         okx_options,
         bn_options,
         hl_coins,
+        hl_rolling,
         bybit_spot,
         bybit_linear,
         pairs,
@@ -1430,6 +1520,24 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // BIN15 O2: two rows per ROLLING family — the reserved Yes/No
+    // slots. The manifest stays TWO COLUMNS: which instance a slot
+    // means at a time is a `ChannelId::InstrumentRoll` event, never a
+    // third column here.
+    for i in 0..u.hl_rolling.len() {
+        let key = &u.hl_rolling[i];
+        for (side, tag) in ["yes", "no"].iter().enumerate() {
+            let name = format!("{key}[{tag}]");
+            out.hl.push(Instrument {
+                sym: make_symbol_id(
+                    VenueId::Hyperliquid,
+                    HL_ROLLING_ORDINAL_BASE + (2 * i + side) as u32,
+                ),
+                descriptor: format!("hyperliquid:{name}"),
+                name,
+            });
+        }
+    }
     // WS9: Bybit — spot from ordinal 1, linear from its own block
     // (the Binance spot/usdm split; venue byte 6).
     for i in 0..u.bybit_spot.len() {
@@ -1582,6 +1690,7 @@ options_strikes = 8
 
 [hyperliquid]
 coins = ["BTC", "#330"]
+rolling = ["out:BTC:15m", "native:ETH:1d"]
 
 [pairs]
 map = ["0:0", "1:1"]
@@ -1617,6 +1726,7 @@ map = ["0:0", "1:1"]
         assert!(u.deribit_options.enabled());
         assert_eq!(u.deribit_options.per_underlying_cap(), 32);
         assert_eq!(u.hl_coins, vec!["BTC", "#330"]);
+        assert_eq!(u.hl_rolling, vec!["out:BTC:15m", "native:ETH:1d"]);
         assert_eq!(u.pairs, vec![(0, 0), (1, 1)]);
     }
 
@@ -1644,6 +1754,25 @@ map = ["0:0", "1:1"]
         assert_eq!(a.okx[1].descriptor, "okx:ETH-USDT-SWAP");
         assert_eq!(a.deribit[0].sym, make_symbol_id(VenueId::Deribit, 1));
         assert_eq!(a.hl[1].descriptor, "hyperliquid:#330");
+        // BIN15 O2: two reserved rows per rolling family, from the
+        // pool base, after every configured coin.
+        assert_eq!(a.hl.len(), 2 + 4);
+        assert_eq!(a.hl[2].descriptor, "hyperliquid:out:BTC:15m[yes]");
+        assert_eq!(a.hl[2].name, "out:BTC:15m[yes]");
+        assert_eq!(
+            a.hl[2].sym,
+            make_symbol_id(VenueId::Hyperliquid, HL_ROLLING_ORDINAL_BASE)
+        );
+        assert_eq!(a.hl[3].descriptor, "hyperliquid:out:BTC:15m[no]");
+        assert_eq!(
+            a.hl[3].sym,
+            make_symbol_id(VenueId::Hyperliquid, HL_ROLLING_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.hl[5].descriptor, "hyperliquid:native:ETH:1d[no]");
+        assert_eq!(
+            a.hl[5].sym,
+            make_symbol_id(VenueId::Hyperliquid, HL_ROLLING_ORDINAL_BASE + 3)
+        );
         // Pairs resolve to (yes sym, spot sym).
         assert_eq!(
             a.pairs,
@@ -1766,6 +1895,59 @@ map = ["0:0", "1:1"]
         let src = "[binance]\nspot = [\n  \"btcusdt\",  # main\n\n  \"ethusdt\",\n]\n";
         let u = parse(src).unwrap();
         assert_eq!(u.binance_spot, vec!["btcusdt", "ethusdt"]);
+    }
+
+    /// BIN15 O2: the `rolling` key's grammar. Absent is the pre-BIN15
+    /// boot; only the two pairings the venue actually deploys are
+    /// accepted; duplicates and over-capacity refuse.
+    #[test]
+    fn rolling_families_parse_and_refuse_every_other_shape() {
+        let u = parse("[hyperliquid]\ncoins = [\"BTC\"]\n").unwrap();
+        assert!(u.hl_rolling.is_empty(), "absent = empty = bit-identical");
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.hl.len(), 1, "no rolling rows without the key");
+
+        let u = parse(
+            "[hyperliquid]\nrolling = [\"out:BTC:15m\", \"native:HYPE:1d\"]\n",
+        )
+        .unwrap();
+        assert_eq!(u.hl_rolling, vec!["out:BTC:15m", "native:HYPE:1d"]);
+        // Families alone (no coins) still allocate their slots.
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.hl.len(), 4);
+        assert_eq!(
+            a.hl[0].sym,
+            make_symbol_id(VenueId::Hyperliquid, HL_ROLLING_ORDINAL_BASE)
+        );
+
+        for bad in [
+            "rolling = [\"out:BTC:1d\"]",
+            "rolling = [\"native:BTC:15m\"]",
+            "rolling = [\"out:BTC\"]",
+            "rolling = [\"out:BTC:15m:x\"]",
+            "rolling = [\"out::15m\"]",
+            "rolling = [\"out:btc:15m\"]",
+            "rolling = [\"out:BTC:1h\"]",
+            "rolling = [\"someone:BTC:15m\"]",
+            "rolling = [\"out:SIXTEENCHARCOINX:15m\"]",
+        ] {
+            let src = format!("[hyperliquid]\n{bad}\n");
+            assert!(parse(&src).is_err(), "{bad}");
+        }
+        assert!(parse(
+            "[hyperliquid]\nrolling = [\"out:BTC:15m\", \"out:BTC:15m\"]\n"
+        )
+        .is_err());
+        let mut many = String::from("[hyperliquid]\nrolling = [");
+        for i in 0..=HL_ROLLING_MAX {
+            many.push_str(&format!("\"out:C{i}:15m\","));
+        }
+        many.push_str("]\n");
+        assert!(parse(&many).is_err(), "over HL_ROLLING_MAX");
+        assert!(parse(
+            "[hyperliquid]\nrolling = [\"out:BTC:15m\"]\nrolling = [\"native:ETH:1d\"]\n"
+        )
+        .is_err());
     }
 
     #[test]

@@ -6,6 +6,125 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — Hyperliquid rolling-instrument families: `HL_MAX_COINS` 16 → 32, the ack mask splits, `ChannelId::InstrumentRoll = 13`, HL `Mark` rows (BIN15 O2)
+
+**What changed**
+
+- **`ChannelId::InstrumentRoll = 13` (NEW, additive).** A rolling HIP-4
+  family's `SymbolId` slot is stable for the life of the process while
+  the venue instrument under it changes — 96 times a day for the BTC
+  15-minute family. `instrument-manifest.tsv` is two columns by law and
+  names only the slot, so this event is the ONLY record of which
+  instance a slot meant at a time. `venue_seq` packs
+  `outcome | twap_s << 32 | family << 48 | settled << 56`; `sym` is the
+  family's Yes slot; `v0` strike ×1e6; `v1` expiry ns. Two events per
+  roll, in the venue's order: the outgoing instance's `settled`, then
+  the successor's `created`. `ChannelId::from_u8(13)` now resolves —
+  **a reader that treated 13 as corrupt must be updated**; nothing in
+  tree did.
+
+- **Hyperliquid now emits `ChannelId::Mark` rows** (channel 2, which
+  already existed for OKX/Binance), beside its AssetCtx row and off the
+  same `activeAssetCtx` frame: `v0` = `markPx` ×1e6, `v1` = `oraclePx`
+  ×1e6. The ctx parser always lifted both and capture never carried
+  either — and a HIP-4 strike IS the perp mark at creation while its
+  settlement is a mark TWAP, so neither was reconstructible from our own
+  tape. **CAPTURE SIZE: ≈ 3 rows/s per perp ⇒ ≈ 16 MB/day/perp of
+  `hl-events.pmlr`** (≈ 66 MB/day for four perps). Always captured;
+  on the event lane only when rolling families are configured.
+
+- **`HL_MAX_COINS` 16 → 32, and the ack mask SPLIT in two.** A family
+  costs two coin rows (Yes and No), and the eight ruled families would
+  alone exhaust 16. 32 × `CHANNELS_PER_COIN` = 128 fills `MaskBits`
+  (`u128`) EXACTLY, so the two venue-global ack bits no longer fit above
+  the per-coin ones: `ALL_MIDS_BIT` / `OUTCOME_META_BIT` are now
+  `GlobalBits` (`u8`) values 1 and 2, `expected_mask` returns
+  `(MaskBits, GlobalBits)`, and a session verifies on
+  `found == expected && found_global == expected_global`. In-process
+  only — no captured byte changes. `MAX_SUBS` follows the constant to
+  130, and **`TX_BUF_SIZE` 16 KiB → 64 KiB**: 130 subscribes queue in
+  one drive cycle (≈ 13 KiB, which 16 KiB barely covered) and a roll
+  queues 12 more mid-session; a full tx is a session-killing
+  `io::Error`, so the margin is worth the 48 KiB.
+
+- **Coin-table rows may now be EMPTY.** `HlCoinTable::reserve(sym)`
+  appends a reserved row (stable sym, no instrument) and `rebind(idx,
+  coin)` points it at one, keeping the sym; `lookup`, `index_of_coin`,
+  `expected_mask` and the subscribe sweep all skip empty rows, so a
+  DORMANT family costs nothing on the wire and is not waited on for
+  verification. `CoinTableErr` gains `NoSuchRow` (a programming error,
+  not operator input) — **exhaustive matches on that enum need the new
+  arm**; the one in `build_hl_coin_table` was updated.
+
+- **New universe key `[hyperliquid] rolling`** —
+  `<out|native>:<COIN>:<15m|1d>`, capped at 8, unique, validated at
+  parse. **Absent or empty is the pre-BIN15 boot, bit for bit.** The
+  crossed forms (`out:…:1d`, `native:…:15m`) are REFUSED: neither
+  exists on the venue, and accepting one would mean guessing its
+  settlement law. Each entry allocates TWO manifest rows —
+  `hyperliquid:out:BTC:15m[yes]` / `[no]` — from an ordinal pool based
+  at **4096**, above every `coins` ordinal, so no configured sym moves.
+  Config-file only: a rolling family is a capture-and-strategy
+  contract, not something to spell on a command line.
+
+- **A WALL-CLOCK law, and the defect it prevents.** A HIP-4 expiry is an
+  epoch instant (`time:20260912-0630`); every clock in the ingress loop
+  is monotonic-since-boot. Comparing them directly makes every expiry
+  look 55 years away and a family matches NOTHING, silently. The driver
+  now carries a `core_time::WallAnchor` taken at `set_families` (boot,
+  two syscalls, never re-taken — a reconnect is not a new clock) and
+  judges `match_spec` on `wall_of(now)`. The loopback roll test caught
+  this; it is pinned by an injected anchor so the scenario is
+  deterministic on any machine.
+
+- **New metrics** (gauges, read from an `Arc<HlRollStatus>` on the
+  status set — `IngressStatus` is size-locked at 128 B and venue-generic,
+  so venue counters could not go there):
+  `engine_ingress_hyperliquid_rolls_total`,
+  `..._rolls_ignored_unmatched_total` (the other deployers' markets on
+  the shared lifecycle channel — **expected to be large**),
+  `..._family_ack_timeouts_total`, `..._families_dormant`.
+
+- **`claude_worker.pmlr` gained a ChannelEvent reader** (`channel_events()`,
+  `ChannelEventRec`) — there was none at all before; every consumer that
+  needed events read ticks. New module `claude_worker.hip4`: the
+  description grammar as the Python MIRROR (pinned against the engine by
+  one shared fixture, `claude-worker/tests/fixtures/hip4/descriptions.tsv`,
+  read by both suites), plus `read_rolls(run_dir)` / `instance_at()` —
+  the sidecar every offline consumer uses to know which instance a slot
+  meant. The capture catalog needed NO change: it is channel-agnostic by
+  design (its own module docs say so).
+
+- **Gate counts moved.** Alloc gate **50 → 51**
+  (`hl_family_roll_is_zero_alloc`); `audit-replay`'s venue×channel
+  matrix gains an `instrument_roll` column (9 → 10).
+
+**Deviations from the plan, recorded**
+
+1. Families attach through `Driver::set_families(families, roll_status,
+   wall)` rather than as a 5th `Driver::new` parameter. Zero churn on
+   the five existing call sites, and "no call ⇒ pre-BIN15 behaviour" is
+   the same absent-is-bit-identical shape the VRP and regime lanes use.
+2. The roll alloc gate drives **64** rolls, not 1 000: the whole
+   scripted stream is injected before the guard opens
+   (`inject_incoming` may copy, so it cannot be measured) and one
+   `drive_one` may consume every frame at once — 64 rolls is what
+   `TX_BUF_SIZE` holds in a single drain. The law under test is
+   per-roll allocation, which 64 exercises exactly as 1 000 would.
+3. `AiCmdKind::SetBinarySpec = 13` (the worker's spec override, ruling
+   O-Q2) is **NOT built**: §4 of the spec never specifies it and §4.7's
+   acceptance does not mention it. Byte 13 of `AiCmdKind` stays
+   unclaimed rather than being improvised.
+4. `HL_ROLLING_MAX` (8) and `HL_ROLLING_ORDINAL_BASE` (4096) are
+   MIRRORED in `core_config::universe` — that crate cannot depend on an
+   ingress crate. The same split as `coins`, whose real cap
+   (`HL_MAX_COINS`) is enforced in the cli's table build; boot refuses
+   anything the looser check let through.
+
+**To activate.** Add `rolling = [...]` under `[hyperliquid]` in
+`~/multivenue/universe.toml` and restart. Nothing else changes: without
+the key every path above is the pre-BIN15 one.
+
 ## 2026-09-12 — HIP-4 outcome grammar; `outcomeMetaUpdates` read at its LIVE shape; `hl.prediction` fee class with a charge-once open pair (BIN15 O1)
 
 **What changed**

@@ -290,6 +290,20 @@ class Reader:
             _ORDER.unpack_from(self._map, self._offset(index, SLOT_KIND_ORDER, "order"))
         )
 
+    def channel_event(self, index: int) -> "ChannelEventRec":
+        """Decode slot ``index`` as a ChannelEvent (BIN15 O2)."""
+        return ChannelEventRec._make(
+            _CHANNEL_EVENT.unpack_from(
+                self._map,
+                self._offset(index, SLOT_KIND_CHANNEL_EVENT, "channel event"),
+            )
+        )
+
+    def channel_events(self) -> typing.Iterator["ChannelEventRec"]:
+        """All ChannelEvent records, in file order (BIN15 O2)."""
+        for i in range(self._count):
+            yield self.channel_event(i)
+
     def ticks(self) -> typing.Iterator[TickRec]:
         """All Tick records, in file order."""
         for i in range(self._count):
@@ -309,6 +323,43 @@ class Reader:
         """All Order records, in file order (VM2 V6)."""
         for i in range(self._count):
             yield self.order(i)
+
+
+# ---------------------------------------------------------------------------
+# BIN15 O2: the kind-5 ChannelEvent decode. There was no event reader
+# at all before — every consumer that needed one read ticks. The
+# rolling families' whole offline contract is an event
+# (``ChannelId::InstrumentRoll``), so one exists now.
+# ---------------------------------------------------------------------------
+
+# ts u64 · sym u32 · venue u8 · channel u8 · pad2 · venue_seq u64 ·
+# venue_time_ms u64 · v0 i64 · v1 i64 · 16 B tail pad.
+# docs/wire-format.md `ChannelEvent`.
+_CHANNEL_EVENT: struct.Struct = struct.Struct("<QIBB2xQQqq16x")
+assert _CHANNEL_EVENT.size == SLOT_SIZE
+
+
+class ChannelEventRec(typing.NamedTuple):
+    """One `ChannelEvent` slot (wire-format.md). Field meanings are
+    per-``channel``; see that document's ChannelId table."""
+
+    ts_ns: int
+    sym: int
+    venue: int
+    channel: int
+    venue_seq: int
+    venue_time_ms: int
+    v0: int
+    v1: int
+
+
+#: ``ChannelEventRec.channel``: HIP-4 outcome lifecycle (HL).
+CHANNEL_OUTCOME_META: int = 7
+#: ``ChannelEventRec.channel``: a rolling family's slot changed
+#: instrument (BIN15 O2).
+CHANNEL_INSTRUMENT_ROLL: int = 13
+#: ``ChannelEventRec.channel``: mark price.
+CHANNEL_MARK: int = 2
 
 
 # ---------------------------------------------------------------------------

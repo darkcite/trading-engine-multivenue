@@ -2143,6 +2143,186 @@ fn hl_parsers_are_zero_alloc() {
     assert_eq!(bytes, 0, "hl parser bytes should be zero: saw {bytes}");
 }
 
+/// BIN15 O2: the family ROLL through the driver's real message path
+/// — 64 rolls, zero allocations.
+///
+/// A roll rebinds two coin-table rows, queues six unsubscribes and
+/// six subscribes, re-baselines two staleness stamps and emits an
+/// `InstrumentRoll` event, all on the ingress thread inside the
+/// `outcomeMetaUpdates` arm. Every one of those is a fixed-capacity
+/// write; this gate is what keeps it that way.
+///
+/// 64 rolls rather than the plan's 1 000: the whole scripted stream
+/// is injected before the guard opens (`inject_incoming` may copy, so
+/// it cannot be measured), and one `drive_one` may then consume every
+/// frame at once — 64 rolls is what `TX_BUF_SIZE` holds in a single
+/// drain. The law under test is per-roll allocation, which 64
+/// exercises exactly as 1 000 would.
+#[test]
+fn hl_family_roll_is_zero_alloc() {
+    use ingress_hyperliquid::family::{rolling_sym, HlFamilyTable, HlRollStatus};
+    use ingress_hyperliquid::run_loop as hwl;
+
+    // ---- boot (NOT measured) ----
+    let mut transport = TestTransport::with_capacity(512 * 1024);
+    let sym_btc: SymbolId = (4 << 24) | 1;
+    let mut coins = ingress_hyperliquid::HlCoinTable::new();
+    coins.insert(b"BTC", sym_btc).unwrap();
+    let yes = coins.reserve(rolling_sym(0, 0)).unwrap();
+    let no = coins.reserve(rolling_sym(0, 1)).unwrap();
+    let mut families = HlFamilyTable::new();
+    let (kind, und, period) = HlFamilyTable::parse_key(b"out:BTC:15m").unwrap();
+    families
+        .push(
+            kind,
+            und,
+            period,
+            [yes as u8, no as u8],
+            [rolling_sym(0, 0), rolling_sym(0, 1)],
+        )
+        .unwrap();
+
+    // 2026-09-12T06:30:00Z, and an anchor 30 s before it: both
+    // scripted instances (06:30 and 06:45) sit inside the family's
+    // one-period window, deterministically, whatever this machine's
+    // wall clock says.
+    const EXPIRY_2649_NS: u64 = 1_789_194_600_000_000_000;
+    let wall = core_time::WallAnchor::new(core_time::now_ns(), EXPIRY_2649_NS - 30_000_000_000);
+    let roll_status = std::sync::Arc::new(HlRollStatus::new());
+
+    let mut driver = hwl::Driver::new(0x0B15u64, coins, u64::MAX / 4, u64::MAX / 4);
+    driver.set_families(families, roll_status.clone(), wall);
+    hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+
+    let (mut hl_etx, _herx) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let status = core_metrics::IngressStatus::new();
+    let ring: std::sync::Arc<Ring<Tick, { hwl::TICK_RING_CAP }>> = Ring::new();
+    let (mut prod, _cons) = ring.split();
+    let lane = core_types::EVENT_LANE_FUNDING
+        | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll);
+
+    // Handshake.
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &mut hl_etx,
+        lane,
+        &status,
+        &mut core_types::NullCapture,
+    )
+    .unwrap();
+    let mut scratch = [0u8; 16384];
+    let _ = transport.drain_outgoing(&mut scratch);
+    let key = core_net::sec_websocket_key_from_seed(0x0B15u64);
+    let accept = core_net::expected_accept(&key);
+    let mut resp = [0u8; 256];
+    let mut n = 0;
+    for src in [
+        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
+        &b"Upgrade: websocket\r\n"[..],
+        &b"Connection: Upgrade\r\n"[..],
+        &b"Sec-WebSocket-Accept: "[..],
+        &accept[..],
+        &b"\r\n\r\n"[..],
+    ] {
+        resp[n..n + src.len()].copy_from_slice(src);
+        n += src.len();
+    }
+    transport.inject_incoming(&resp[..n]);
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &mut hl_etx,
+        lane,
+        &status,
+        &mut core_types::NullCapture,
+    )
+    .unwrap();
+    assert_eq!(driver.state(), hwl::State::Steady);
+    let _ = transport.drain_outgoing(&mut scratch);
+
+    // The two live created shapes, alternating: each one changes the
+    // family's live instance, so each is a real roll.
+    const CREATED_2649: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeCreated":{"outcome":2649,"name":"template:binaryPrice","description":"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630","sideSpecs":[{"name":"template:Yes"},{"name":"template:No"}],"quoteToken":"USDC","venue":"out","deployerFeeScale":"1.0"}}]}"##;
+    const CREATED_2650: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeCreated":{"outcome":2650,"name":"template:binaryPrice","description":"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645","sideSpecs":[{"name":"template:Yes"},{"name":"template:No"}],"quoteToken":"USDC","venue":"out","deployerFeeScale":"1.0"}}]}"##;
+    const ROLLS: usize = 64;
+
+    fn push_text_frame(stream: &mut Vec<u8>, body: &[u8]) {
+        stream.push(0x81);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            assert!(body.len() <= u16::MAX as usize);
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+    let mut stream: Vec<u8> = Vec::with_capacity(128 * 1024);
+    for i in 0..ROLLS {
+        push_text_frame(
+            &mut stream,
+            if i % 2 == 0 {
+                CREATED_2650
+            } else {
+                CREATED_2649
+            },
+        );
+    }
+    let injected = transport.inject_incoming(&stream);
+    assert_eq!(injected, stream.len(), "transport must hold the script");
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+    let mut drives = 0u32;
+    let mut out_scratch = [0u8; 16384];
+    while transport.incoming_len() > 0 {
+        hwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut hl_etx,
+            lane,
+            &status,
+            &mut core_types::NullCapture,
+        )
+        .unwrap();
+        // Keep the wire moving: the rolls' own frames leave through
+        // here, and draining is stack-scratch only.
+        let _ = transport.drain_outgoing(&mut out_scratch);
+        drives += 1;
+        assert!(drives <= 4_096, "scripted stream failed to drain");
+    }
+    // The non-fatal family ack pass runs inside the window too.
+    hwl::roll_health(
+        &mut driver,
+        &status,
+        &mut core_types::NullCapture,
+        core_time::now_ns(),
+    )
+    .unwrap();
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        roll_status.rolls_total(),
+        ROLLS as u64,
+        "every scripted push must have rolled"
+    );
+    assert_eq!(roll_status.rolls_ignored_unmatched(), 0);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(allocs, 0, "hl family roll allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "hl family roll bytes should be zero: saw {bytes}");
+}
+
 /// BIN15 O1: the LIVE `outcomeMetaUpdates` shapes through the
 /// lifecycle parser, the zero-copy description accessor and the
 /// description grammar — 10 000 iterations, zero allocations. The

@@ -827,7 +827,7 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
     // ---- coverage matrix ------------------------------------------
     // Venue-driven sections render only when venue files exist — an
     // ai-cmds-only run (8g §9) skips straight to its own section.
-    const MATRIX_CHANNELS: [ChannelId; 9] = [
+    const MATRIX_CHANNELS: [ChannelId; 10] = [
         ChannelId::Trade,
         ChannelId::Book,
         ChannelId::Mark,
@@ -837,6 +837,9 @@ pub fn run_audit(dir: &Path) -> io::Result<String> {
         ChannelId::AllMids,
         ChannelId::OutcomeMeta,
         ChannelId::PriceChange,
+        // BIN15 O2: without this column a rolling family's capture
+        // reads as a sym whose meaning changed for no visible reason.
+        ChannelId::InstrumentRoll,
     ];
     if !audits.is_empty() {
         report.push_str("\n== venue x channel coverage (message counts) ==\n");
