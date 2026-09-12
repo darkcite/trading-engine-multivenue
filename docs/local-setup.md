@@ -321,6 +321,35 @@ Operational laws:
   1 m candles (≈ 1.5 s, one page per instrument) right before every
   boot so the seed reaches the boot minute — the fast profile no longer
   spends its first hour UNKNOWN after a restart.
+- **xsd lane** (XSD-4, statarb doc 08 §3.7; `claude_worker.xsd_author`
+  MODULE — never a verb: `candles.db` in, TSVs out, no `state.db` /
+  `ai.sock` / seq namespace). The slot-2 cross-sectional member boots
+  only when `~/multivenue/xsd.toml` (copy `xsd.toml.example`) and
+  `~/multivenue/xsd-table.tsv` exist and `strategy.conf` names a mask
+  with `xsd` (`ai+vrp+xsd` = 54 is the live one). The table is
+  AUTHORED, never hand-written: `~/multivenue/xsd-universe.tsv` (one
+  descriptor per line — the research's 110 usdm names, exported once by
+  the vault's `xsd_universe_export.py`) →
+  `uv run python -m claude_worker.xsd_author author` (the research
+  screen over the last 2160 hourly closes; ≈ 0.3 s; writes NOTHING and
+  exits 3 when the screen finds no rows — the old table stays) →
+  `… seed-out` (800 trailing hourly closes of the table's descriptors,
+  so the 720 h z windows are warm at the first roll — the wrapper runs
+  this before EVERY boot when a table exists) → restart. `… status`
+  prints age / rows / hash / `rotation_due`. The **table's sha256 is its
+  identity**: the engine restores `xsd-state.tsv` positions under the
+  same hash and flattens them under a new one, so writing a new table IS
+  the rotation. Rotation is automatic — `scripts/daily-restart.sh` re-runs
+  `author` at the 0010 slot (before the drain) when the table is ≥ 30 days
+  old or absent; a hand rotation any time is the same `author` + restart.
+  Boot tells: `xsd: artifact configured hash=… table_hash=… targets= pairs=
+  syms= rows_dropped= seed_rows= seed_dropped=` and one of `xsd: no state`
+  / `state restored positions=N` / `state discarded (table hash changed)`;
+  metrics `engine_xsd_*` (`pairs_warm` should equal `pairs` right after a
+  seeded boot). A descriptor in `xsd-state.tsv` the universe no longer has
+  REFUSES the boot — move the file aside. `numpy` is a base worker
+  dependency since this lane; a plain `uv sync` drops the optional
+  `kronos` group, so forecaster hosts re-run `uv sync --group kronos`.
 
 ## Troubleshooting
 

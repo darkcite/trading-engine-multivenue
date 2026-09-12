@@ -62,6 +62,25 @@ if [ -f "$HOME/multivenue/regime.toml" ]; then
     echo "engine-wrapper: regime seed export failed — the detector warms live" >&2
 fi
 
+# XSD-4 (statarb doc 08 §3.7): the slot-2 xsd member's warm-up seed —
+# the trailing 800 hourly closes of every descriptor its table names,
+# exported from candles.db right before the boot so the 720 h z windows
+# are warm at the first roll (without it the member is blind for 30
+# days after every restart — three restarts a day would never let it
+# trade). Best-effort like the regime seed: no table ⇒ nothing to
+# export; a failed export leaves a stale or absent seed and the member
+# warms live (boot tell `xsd: … seed_rows=0`). Rows at or after the
+# boot hour are refused by the engine; the lane never writes them.
+# DERIVED data (candles), never a capture window — the ≤ 2 h law holds.
+# The TABLE itself is rotated by daily-restart.sh at the 00:10Z slot
+# (monthly, by the file's age), never here.
+if [ -f "$HOME/multivenue/xsd-table.tsv" ]; then
+  ( cd claude-worker && uv run python -m claude_worker.xsd_author seed-out \
+      --table "$HOME/multivenue/xsd-table.tsv" \
+      --out "$HOME/multivenue/xsd-seed.tsv" ) ||
+    echo "engine-wrapper: xsd seed export failed — the member warms live" >&2
+fi
+
 # M5-prep #7b (operator ruling 7(b); remediation plan 2026-08-28): a
 # committed ruleset's table is IN-MEMORY — every boot must re-stage +
 # re-commit the registry's active ruleset or nothing AI-authored

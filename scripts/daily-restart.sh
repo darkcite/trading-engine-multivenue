@@ -80,11 +80,13 @@ slot_mark() {
 
 drain=0
 retention=0
+rotate=0
 fired=""
 if slot_ready 0010; then
   slot_mark 0010
   drain=1
   retention=1
+  rotate=1
   fired="$fired 0010"
 fi
 if slot_ready 0830; then
@@ -110,6 +112,43 @@ if slot_ready 2115; then
   slot_mark 2115
   drain=1
   fired="$fired 2115"
+fi
+
+# XSD-4 (statarb doc 08 §3.7; operator ruling 2026-09-12 "automatic
+# monthly at the 00:10Z restart"): the xsd member's TABLE ROTATION.
+# Once a UTC day, at the 0010 slot and BEFORE the drain, re-run the
+# research screen when the standing table is >= 30 days old (the
+# research's 30-day trading window) or absent — the wrapper's boot
+# that follows reads the new table, its seed-out covers the new
+# descriptors, and the engine flattens every position held under the
+# old hash (`xsd: state discarded (table hash changed)`), which is the
+# research's fold-end behaviour. The screen writes NOTHING when it
+# finds no rows (exit 3 — the old table stays, the boot restores under
+# the old hash), so a data hole can never brick the member. Runs only
+# when the member is configured (xsd.toml + xsd-universe.tsv present)
+# and no worker verb is live; the release dir on PATH is not needed
+# (candles.db in, TSV out — no engine spawn). Seconds of numpy work;
+# the 60 s StartInterval never overlaps itself.
+if [ "$rotate" = 1 ] && [ -f "$HOME/multivenue/xsd.toml" ] && [ -f "$HOME/multivenue/xsd-universe.tsv" ]; then
+  if pgrep -f 'claude[-_]worke[r]' >/dev/null 2>&1; then
+    echo "daily-restart: xsd rotation skipped — worker busy (next 0010 retries)" >&2
+  else
+    (
+      cd "$REPO_DIR/claude-worker" || exit 0
+      export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+      status="$(uv run python -m claude_worker.xsd_author status --table "$HOME/multivenue/xsd-table.tsv" 2>/dev/null)"
+      echo "daily-restart: $status" >&2
+      case "$status" in
+        *rotation_due=yes*|*"table absent"*)
+          echo "daily-restart: xsd table rotation — re-running the screen" >&2
+          uv run python -m claude_worker.xsd_author author \
+              --universe "$HOME/multivenue/xsd-universe.tsv" \
+              --out "$HOME/multivenue/xsd-table.tsv" >&2 ||
+            echo "daily-restart: xsd rotation failed (non-fatal; the old table boots)" >&2
+          ;;
+      esac
+    )
+  fi
 fi
 
 if [ "$drain" = 1 ]; then

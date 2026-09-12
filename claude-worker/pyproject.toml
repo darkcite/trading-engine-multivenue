@@ -29,6 +29,12 @@ dependencies = [
     "typer>=0.27.1",
     # Structured logging — offline-only, never in any engine hot path.
     "structlog>=26.1.0",
+    # The xsd member's table screen (`claude_worker.xsd_author`, XSD-4):
+    # Engle-Granger over an N x N x W formation window is einsum work —
+    # seconds in numpy, minutes in pure Python. Offline only; the engine
+    # reads the resulting TSVs and never links it. Same floor as the kronos
+    # group so one resolution serves both.
+    "numpy>=2.5",
 ]
 
 # Deferred from item 2 by design (no dangling entry point before cli.py

@@ -6,6 +6,79 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — xsd artifacts authored by the worker, boot seed + monthly rotation hooks, `numpy` a base dependency (XSD-4)
+
+**What changed**
+
+- `claude-worker/src/claude_worker/xsd_author.py` (NEW module, not a
+  verb — it touches no `state.db`, no `ai.sock`, no seq namespace):
+  `python -m claude_worker.xsd_author author | seed-out | status`.
+  `author` writes `~/multivenue/xsd-table.tsv` from ONE formation window
+  (2160 hourly closes, `candles.db` only) with the research screen's
+  arithmetic (statarb doc 07 §3.2 / the vault's `sa_screen.py`: OLS β on
+  log closes, batched Engle-Granger ADF, admissibility |corr| ≥ 0.30 ·
+  half-life 2–240 h · σ ≥ 25 bps · ¼ ≤ |β| ≤ 4 · median dollar volume ≥
+  $5M/24 per bar, K = 3 most negative ADF per target) plus three laws the
+  engine forced: every name must close ≥ $0.005 over the whole window
+  (×1e6 `Price` quantisation — the parity finding), a target with fewer
+  than K admissible partners is OUT, and a name missing ≤ 3 bars of the
+  window is gap-filled (forward, leading bars backward; a REST-lane
+  artefact, not a market gap) while more missing bars drop it. The header
+  carries the window and every knob but NO timestamp, so the same window
+  renders the same bytes; **the file's sha256 is the table identity** the
+  engine restores positions under. `author` NEVER writes an empty table
+  (exit 3, the old file stays — the engine would refuse the boot on one).
+  `seed-out` writes `~/multivenue/xsd-seed.tsv` (800 trailing complete
+  hours of the table's descriptors, `descriptor \t open_ms \t close_1e6`,
+  never the in-progress hour). `status` prints age / rows / hash /
+  `rotation_due=yes|no` (30 days). `~/multivenue/xsd-universe.tsv` is the
+  screen's input (one descriptor per line; the research's 110 names,
+  exported once by the vault one-shot). Tests `tests/test_xsd_author.py`.
+- `scripts/engine-wrapper.sh`: after the regime seed, before the recommit,
+  `xsd_author seed-out` when `xsd-table.tsv` exists — best-effort; a failed
+  export boots with the member warming live (`seed_rows=0`).
+- `scripts/daily-restart.sh`: at the **0010 slot only, BEFORE the drain**,
+  when `xsd.toml` + `xsd-universe.tsv` exist and no worker verb is live:
+  `status`, and on `rotation_due=yes` / `table absent` re-run `author`.
+  The boot that follows reads the new table, seeds its descriptors, and
+  the engine flattens positions held under the old hash (`xsd: state
+  discarded (table hash changed)`) — the research's fold end. Operator
+  ruling 2026-09-12: automatic, monthly, at the 00:10Z restart.
+- `claude-worker/pyproject.toml`: `numpy>=2.5` moves into the BASE
+  dependencies (it was `kronos`-group only). `uv.lock` re-resolved (2 lines).
+  **Host note:** a plain `uv sync` UNINSTALLS the non-default groups — on
+  the forecaster host re-run `uv sync --group kronos` afterwards (done on
+  the Mac 2026-09-12; torch/pandas/einops restored).
+- `~/multivenue/xsd.toml` installed from `xsd.toml.example` (the ruled
+  operating point: $1,000 per grid unit, grid 1, 82 positions, $100k gross).
+  `~/multivenue/strategy.conf` = `ai+vrp+xsd` (mask 54) — live at the
+  XSD-5 restart.
+
+**Why**
+
+Doc 08 phase XSD-4 + the operator's 2026-09-12 rulings: the member is
+inert without a table; the table must come from the same arithmetic the
+research was proven on; a 720 h z window without a seed is 30 days blind
+after every restart (three a day); rotation is the research's 30-day
+trading window.
+
+**Migration**
+
+- Worker hosts: `cd claude-worker && uv sync` (numpy). Kronos hosts:
+  `uv sync --group kronos`.
+- First table: `~/multivenue/research/.venv/bin/python
+  docs/research/statarb/bin/xsd_universe_export.py` (vault) →
+  `uv run python -m claude_worker.xsd_author author` → `seed-out` →
+  `cp xsd.toml.example ~/multivenue/xsd.toml` → restart. The 2026-09-12
+  live table: universe 110 → alive 52 / targets 46 / rows 138 (price law
+  18, liquidity 40, fewer-than-K 6, gap-filled 8, holes 0), hash
+  `25ff43ef…`; seed 48 descriptors × 800 h = 38,400 rows.
+- Dropping the member: `STRATEGY=ai+vrp` in `strategy.conf` + restart
+  (the artifacts may stay; the wrapper's seed-out then costs a second).
+- No wire, ring or schema change; every capture / backtest / worker
+  frozen surface is byte-identical. Engine untouched (no relink needed
+  beyond the XSD-3 binary already linked).
+
 ## 2026-09-12 — slot 2 WIRED: `strategy-xsd` in the set, four operator artifacts, `--member xsd` (XSD-3)
 
 **What changed**

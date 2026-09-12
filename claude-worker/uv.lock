@@ -138,6 +138,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "httpx" },
+    { name = "numpy" },
     { name = "structlog" },
     { name = "typer" },
 ]
@@ -162,6 +163,7 @@ kronos = [
 requires-dist = [
     { name = "anthropic", specifier = ">=1.4.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "numpy", specifier = ">=2.5" },
     { name = "structlog", specifier = ">=26.1.0" },
     { name = "typer", specifier = ">=0.27.1" },
 ]
