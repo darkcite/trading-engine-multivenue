@@ -133,6 +133,7 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         regime_seed: None,
         vrp_seed: None,
         funding_seed: None,
+        member: None,
     }
 }
 
@@ -1064,6 +1065,7 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         regime_seed: None,
         vrp_seed: None,
         funding_seed: None,
+        member: None,
     }
 }
 

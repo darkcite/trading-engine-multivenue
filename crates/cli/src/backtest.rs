@@ -45,6 +45,8 @@
 
 pub mod fill;
 pub mod funding;
+/// XSD-F/Tier 3: `--member <name>` — the harness drives a coded member.
+pub mod member;
 /// VRP V2a: the option denomination law + the per-run option registry.
 pub mod opt;
 pub mod regime;
@@ -200,6 +202,11 @@ pub struct BacktestConfig {
     /// RG3: `--regime-seed <path>` (default = the first run's own
     /// `regime-seed.tsv`, else warm live).
     pub regime_seed: Option<PathBuf>,
+    /// Tier 3 (statarb doc 08 §6.2): `--member <icdp>` + its parameter
+    /// file — the verb drives that coded member instead of the VM
+    /// ([`member::run_member`]); `ruleset` is then unused. Absent = the
+    /// frozen VM path, byte for byte.
+    pub member: Option<member::MemberSpec>,
     /// VRP V5: `--vrp-seed <path>` (default = the run's own
     /// `vrp-seed.tsv`, else the member holds).
     pub vrp_seed: Option<PathBuf>,

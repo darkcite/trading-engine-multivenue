@@ -160,9 +160,19 @@ struct AuditPnlArgs {
 
 #[derive(Debug, Parser)]
 struct BacktestArgs {
-    /// Candidate ruleset JSON artifact (8g §4.1 grammar).
+    /// Candidate ruleset JSON artifact (8g §4.1 grammar). Required
+    /// unless `--member` names a coded member (Tier 3).
+    #[arg(long, required_unless_present = "member", conflicts_with = "member")]
+    ruleset: Option<PathBuf>,
+    /// Tier 3 (statarb doc 08 §6.2): drive a CODED member through the
+    /// harness instead of the ruleset VM — `icdp` (with `--icdp <toml>`;
+    /// default `~/multivenue/icdp.toml`). Additive: the frozen worker
+    /// argv never passes it.
     #[arg(long)]
-    ruleset: PathBuf,
+    member: Option<String>,
+    /// `--member icdp`: the parameter artifact (`icdp.toml`).
+    #[arg(long, requires = "member")]
+    icdp: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     #[arg(long)]
@@ -540,8 +550,32 @@ fn capture_catalog(args: CaptureCatalogArgs) -> ExitCode {
 /// reason to stderr only and exits nonzero (the worker maps every
 /// nonzero to `BacktestError` — "harness output untrusted").
 fn backtest(args: BacktestArgs) -> ExitCode {
+    // Tier 3: `--member <kind>` selects the coded-member arm; the
+    // parameter file is the member's own boot artifact.
+    let member = match args.member.as_deref() {
+        None => None,
+        Some(name) => {
+            let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
+                eprintln!("backtest: unknown --member {name:?} (known: icdp)");
+                return ExitCode::from(1);
+            };
+            let params = match kind {
+                cli::backtest::member::MemberKind::Icdp => match args.icdp.clone() {
+                    Some(p) => p,
+                    None => match core_config::icdp::default_icdp_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member icdp needs --icdp <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
+            };
+            Some(cli::backtest::member::MemberSpec { kind, params })
+        }
+    };
     let cfg = cli::backtest::BacktestConfig {
-        ruleset: args.ruleset,
+        ruleset: args.ruleset.unwrap_or_default(),
         replay_dir: args.replay_dir,
         split: args.split,
         fee_bps: args.fee_bps,
@@ -555,8 +589,13 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         regime_seed: args.regime_seed,
         vrp_seed: args.vrp_seed,
         funding_seed: args.funding_seed,
+        member,
     };
-    match cli::backtest::run(&cfg) {
+    let result = match cfg.member.as_ref() {
+        Some(spec) => cli::backtest::member::run_member(&cfg, spec),
+        None => cli::backtest::run(&cfg),
+    };
+    match result {
         Ok(out) => {
             eprint!("{}", out.summary);
             println!("{}", out.schema1);
