@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
-description  = "Delta-hedged variance-risk-premium member (VRP V6): one daily short-dated Deribit option per expiry, entered only when the venue's implied vol leaves an integer HAR forecast's band, hedged on the hour against the venue's own BS delta, exited at E-epsilon."
+description  = "Delta-hedged variance-risk-premium member (VRP V6): one daily short-dated Deribit option per expiry, entered only when the venue's implied vol leaves an integer HAR forecast's band, hedged on the hour against the venue's own BS delta, and HELD TO SETTLEMENT (the E-epsilon unwind was retired by Y1)."
 
 [lib]
 path = "src/lib.rs"

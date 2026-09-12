@@ -2,8 +2,14 @@
 #
 # Copy to ~/multivenue/vrp.toml beside universe.toml. Parsed by
 # `core_config::vrp` — a TOML SUBSET, integers only. A float anywhere,
-# an unknown key, a duplicate key or a missing key is FATAL at boot;
-# nothing here defaults silently.
+# an unknown key or a duplicate key is FATAL at boot, and so is a
+# missing REQUIRED key; nothing here defaults silently.
+#
+# OPTIONAL keys are marked as such below. An optional key that is absent
+# means exactly the behaviour the file had before that key existed, so a
+# `vrp.toml` written for an older binary boots bit-identically on a
+# newer one (the core-regime hysteresis precedent). The boot tell prints
+# every effective value either way.
 #
 # The engine hashes the exact bytes it booted with and prints the hash
 # in the `vrp: artifact configured hash=…` boot tell, so a report can
@@ -24,10 +30,20 @@ theta_1e9             = 100000000
 # this, and it rejects anything else here at boot.
 tau_ns                = 28800000000000
 
-# Exit ε before expiry rather than holding to settlement (5 min).
+# ε before expiry. NOT an exit any more (Y1): the E−ε unwind crossed the
+# option spread a SECOND time and at the real book that second crossing
+# was the whole edge (settle +3.658 bps against fair_eps −2.198). ε now
+# FREEZES the hedge — no new hedge goes on this close to expiry, because
+# it could not be unwound before settlement and delta is least stable
+# exactly there — and the campaign ends at cash settlement (5 min).
 epsilon_ns            = 300000000000
 
-# Pick the strike this long before the entry instant E−τ (10 min).
+# Pick the strike this long before the entry instant E−τ, and the width
+# of the decision band `[E−τ, E−τ+selection]` after it (10 min). Must be
+# smaller than `tau_ns − epsilon_ns`: the decision band has to close
+# before the hedge freezes, or a campaign could authorise an entry it
+# may not hedge. Zero is refused — a zero-width band makes every
+# campaign silently `decisions_late`.
 selection_ns          = 600000000000
 
 # Delta-hedge rebalance cadence (hourly).
@@ -47,8 +63,9 @@ qty_1e6               = 1000000
 
 # Hedge rebalance band ×1e6: rebalance only once the target has moved
 # this far. Default = 10 % of one contract's delta at Δ = 0.5. A zero
-# band would rebalance on every tick and pay the spread for nothing, so
-# it is refused. Scales with qty_1e6 above.
+# band would rebalance on every tick and pay the spread for nothing, and
+# a band wider than the whole position never rebalances at all — both
+# are refused. Scales with qty_1e6 above.
 band_qty_1e6          = 50000
 
 # The instrument whose 1-minute closes feed the forecast, and the
@@ -56,3 +73,23 @@ band_qty_1e6          = 50000
 # the boot universe.
 underlying_descriptor = "deribit:BTC-PERPETUAL"
 hedge_descriptor      = "deribit:BTC-PERPETUAL"
+
+# OPTIONAL. Which arms of the band may be traded:
+#
+#   "both"  — enter on `iv > hi` (short vol) AND on `iv < lo` (long
+#             vol). The default, what an absent key means, and the shape
+#             every number measured to date was measured on.
+#   "short" — short vol only. The VRP is a SHORT-vol premium; the long
+#             arm is the model's bet against it, and the long side has
+#             never been measured on clean quote data at all (it was
+#             18–39 % of trades in the last-trade series the entry rule
+#             was cut from).
+#   "long"  — long vol only. Present for symmetry and for a deliberate
+#             research arm, not for a shape anyone has evidence for.
+#
+# A refused arm is a HOLD and is counted separately as
+# `engine_vrp_holds_side_total` — "the band said trade and policy said
+# no" is a different fact from "the band said hold", and one counter for
+# both would hide which.
+#
+# sides                 = "both"

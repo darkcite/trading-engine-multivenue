@@ -123,8 +123,20 @@ pub struct VrpBoot {
     pub params: strategy_vrp::VrpParams,
     /// The boot-built option table for the selected chain.
     pub registry: OptRegistry,
-    /// Seed pairs in file order (may be empty — a cold boot is legal).
-    pub seed: Vec<(u64, i64, i64)>,
+    /// F2: the MERGED fitted pairs, oldest first — the worker's seed
+    /// unioned with the engine's own `P` rows by `expiry_ts_ms`, state
+    /// winning on a collision, capped at [`core_vol::PAIR_RING`].
+    ///
+    /// Renamed from `seed` because it is no longer the seed: the member
+    /// pushes exactly these and the state file's `P` rows are counted
+    /// there, not pushed. Pushing both put 38 expiries into the OLS
+    /// twice at every boot.
+    pub pairs: Vec<(u64, i64, i64)>,
+    /// Kept pairs that came from the worker's `vrp-seed.tsv`.
+    pub pairs_from_seed: usize,
+    /// Kept pairs that came from `vrp-state.tsv` — the engine's own
+    /// settlements, which win wherever both sources carry an expiry.
+    pub pairs_from_state: usize,
     /// Where the seed came from, for the boot tell. The default path
     /// even when nothing was there — "no pairs, from here" is the tell
     /// an operator needs to fix a cold boot.
@@ -217,6 +229,23 @@ pub fn build_registry(
     (reg, refused)
 }
 
+/// F19: whether this boot asked for the member at all.
+///
+/// `load_vrp_boot` used to run for EVERY set boot regardless of the
+/// requested mask, with three consequences, all live: `STRATEGY=ai`
+/// with a present-but-corrupt `vrp.toml` REFUSED the boot, so the
+/// wrapper's documented rollback ("drop the mask back to `ai`") could
+/// not escape a corrupt VRP file and KeepAlive looped; the member was
+/// configured, seeded and restored even when its bit was clear, so a
+/// runtime `EnableStrategy(1)` would have traded an armed member nobody
+/// enabled; and `ai+vrp` with an ABSENT artifact booted silently as
+/// `ai`. The icdp and xsd boots have always been gated; this is the
+/// same gate.
+#[must_use]
+pub fn vrp_wanted(requested: u8) -> bool {
+    requested & strategy_set::BIT_VRP != 0
+}
+
 /// Resolve the whole VRP boot: `vrp.toml`, its descriptors, the chain
 /// table and the seed.
 ///
@@ -228,6 +257,7 @@ pub fn build_registry(
 pub fn load_vrp_boot(
     path: Option<&Path>,
     seed_path: Option<&Path>,
+    state_path: Option<&Path>,
     resolve: &dyn Fn(&str) -> Option<SymbolId>,
     deribit_options: &[(String, SymbolId)],
 ) -> Result<Option<VrpBoot>, String> {
@@ -280,7 +310,13 @@ pub fn load_vrp_boot(
         .map(|s| s.returns.clone())
         .unwrap_or_default();
     let seed = loaded.map(|s| s.rows).unwrap_or_default();
-    let state_path = PathBuf::from(default_state_path()?);
+    // F22: the state path is EXPLICIT, or derived from the artifact's
+    // own directory when the artifact was explicit. It used to be
+    // hard-wired to `~/multivenue/vrp-state.tsv`, so any `--vrp
+    // <other.toml>` smoke boot read AND REWROTE the live engine's
+    // state — a second process writing the file that says what the
+    // standing engine is holding.
+    let state_path = resolve_state_path(state_path, &path, explicit)?;
     let state = read_state(&state_path)?;
     // W3: the rolling window is the ONE thing with two sources, and
     // reconciling them needs both series in hand before any of them is
@@ -295,6 +331,15 @@ pub fn load_vrp_boot(
         &state_returns,
         core_vol::MINUTE_RING,
     );
+    // F2: the fitted pairs have the same two sources and the same
+    // problem, so they get the same treatment — union by expiry here,
+    // once, instead of two unconditional pushes at boot.
+    let state_pairs = match state.as_deref() {
+        Some(text) => core_config::vrp::parse_pairs(text).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let (pairs, pairs_from_seed, pairs_from_state) =
+        core_config::vrp::merge_pairs(&seed, &state_pairs, core_vol::PAIR_RING);
     Ok(Some(VrpBoot {
         params: strategy_vrp::VrpParams {
             theta_1e9: file.theta_1e9,
@@ -304,9 +349,12 @@ pub fn load_vrp_boot(
             rebalance_ns: file.rebalance_ns,
             qty_1e6: file.qty_1e6,
             band_qty_1e6: file.band_qty_1e6,
+            sides: file.sides,
         },
         registry,
-        seed,
+        pairs,
+        pairs_from_seed,
+        pairs_from_state,
         window,
         window_from_seed,
         window_from_state,
@@ -338,6 +386,30 @@ pub fn default_state_path() -> Result<String, String> {
     core_config::vrp::default_state_path().map_err(|e| e.to_string())
 }
 
+/// F22: where this boot's state file lives.
+///
+/// * `Some(p)` — an explicit `--vrp-state`: that file, whatever else.
+/// * `None` with an EXPLICIT `--vrp <path>` — `vrp-state.tsv` beside
+///   that artifact. A smoke boot on its own `vrp.toml` must not read
+///   and rewrite the standing engine's state, and "beside the artifact"
+///   is the rule that needs no second flag to be safe.
+/// * `None` with the default artifact — the default state path.
+pub fn resolve_state_path(
+    state_path: Option<&Path>,
+    artifact: &Path,
+    artifact_explicit: bool,
+) -> Result<PathBuf, String> {
+    if let Some(p) = state_path {
+        return Ok(p.to_path_buf());
+    }
+    if artifact_explicit {
+        if let Some(dir) = artifact.parent() {
+            return Ok(dir.join("vrp-state.tsv"));
+        }
+    }
+    Ok(PathBuf::from(default_state_path()?))
+}
+
 /// Read the state file. An absent file is `Ok(None)` — a first boot has
 /// no history, which is normal and not an error.
 pub fn read_state(path: &Path) -> Result<Option<String>, String> {
@@ -359,23 +431,34 @@ pub fn read_state(path: &Path) -> Result<Option<String>, String> {
 /// so a reader sees either the old file or the new one and never a
 /// third thing.
 pub fn write_state(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("tsv.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("vrp: {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("vrp: {}: {e}", path.display()))
+    crate::state_file::write_atomic(path, text).map_err(|e| format!("vrp: {e}"))
 }
 
 /// The one-line tell, rendered identically wherever it is printed.
+///
+/// F2: it names the MERGE, not the seed file, because "90 seed pairs"
+/// and "128 pairs in the ring" were both true at every boot and neither
+/// said that 38 expiries had been counted twice.
 #[must_use]
-pub fn render_seed_tell(seed: Option<&VrpSeed>) -> String {
+pub fn render_seed_tell(seed: Option<&VrpSeed>, boot: Option<&VrpBoot>) -> String {
+    let merged = match boot {
+        Some(b) => format!(
+            " pairs={} pairs_from_seed={} pairs_from_state={}",
+            b.pairs.len(),
+            b.pairs_from_seed,
+            b.pairs_from_state
+        ),
+        None => String::new(),
+    };
     match seed {
         Some(s) => format!(
-            "vrp: seed applied pairs={} decisive={} from {}",
+            "vrp: seed applied seed_pairs={} decisive={} from {}{merged}",
             s.len(),
             s.is_decisive(),
             s.path.display()
         ),
         None => format!(
-            "vrp: seed absent — the member holds until it has {} pairs",
+            "vrp: seed absent — the member holds until it has {} pairs{merged}",
             core_vol::MIN_PAIRS
         ),
     }
@@ -464,7 +547,7 @@ mod tests {
         let seed = load_vrp_seed(Some(&p)).expect("loads").expect("present");
         assert_eq!(seed.len(), 10);
         assert!(!seed.is_decisive(), "10 pairs is not 60");
-        assert!(render_seed_tell(Some(&seed)).contains("pairs=10 decisive=false"));
+        assert!(render_seed_tell(Some(&seed), None).contains("seed_pairs=10 decisive=false"));
         let _ = std::fs::remove_file(&p);
     }
 
@@ -516,8 +599,157 @@ mod tests {
 
     #[test]
     fn the_absent_tell_names_what_it_is_waiting_for() {
-        let tell = render_seed_tell(None);
+        let tell = render_seed_tell(None, None);
         assert!(tell.contains("seed absent"), "{tell}");
         assert!(tell.contains(&core_vol::MIN_PAIRS.to_string()), "{tell}");
+    }
+
+    // ---------------- P0: F19, F22, F2 ----------------
+
+    /// F19: the member's artifacts are only read when its bit is asked
+    /// for.
+    ///
+    /// `load_vrp_boot` used to run for every set boot, so `STRATEGY=ai`
+    /// with a present-but-corrupt `vrp.toml` REFUSED the boot — and the
+    /// wrapper's documented rollback IS "drop the mask back to `ai`",
+    /// which could therefore never escape a corrupt VRP file while
+    /// KeepAlive relaunched into the same refusal.
+    #[test]
+    fn ai_boot_ignores_a_corrupt_vrp_toml() {
+        assert!(!vrp_wanted(strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM));
+        assert!(!vrp_wanted(0));
+        assert!(vrp_wanted(strategy_set::BIT_VRP));
+        assert!(vrp_wanted(
+            strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_VRP
+        ));
+        // The live masks, by name: `ai` never reads the file, `ai+vrp`
+        // and `ai+vrp+xsd` do.
+        assert!(!vrp_wanted(48));
+        assert!(vrp_wanted(50));
+        assert!(vrp_wanted(54));
+    }
+
+    /// F22: the state path follows the ARTIFACT, so a smoke boot on its
+    /// own `vrp.toml` cannot read and rewrite the standing engine's
+    /// state — which is the file that says what it is holding.
+    #[test]
+    fn state_path_follows_the_explicit_artifact() {
+        let dir = std::env::temp_dir().join(format!("vrp-state-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let artifact = dir.join("vrp.toml");
+
+        // Explicit artifact, no explicit state ⇒ beside the artifact.
+        let p = resolve_state_path(None, &artifact, true).expect("resolves");
+        assert_eq!(p, dir.join("vrp-state.tsv"));
+
+        // Explicit state always wins.
+        let elsewhere = dir.join("somewhere-else.tsv");
+        let p = resolve_state_path(Some(&elsewhere), &artifact, true).expect("resolves");
+        assert_eq!(p, elsewhere);
+
+        // The DEFAULT artifact keeps the default state path — the live
+        // engine's own file, and the only case that may touch it.
+        let p = resolve_state_path(None, &artifact, false).expect("resolves");
+        assert_eq!(p, PathBuf::from(default_state_path().expect("default")));
+        assert_ne!(p, dir.join("vrp-state.tsv"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F2: the boot union. The live defect, exactly: a 90-pair seed and
+    /// a state file that renders the whole ring produced 128 pairs at
+    /// every boot, 38 of them counted twice.
+    #[test]
+    fn the_boot_unions_the_seed_and_the_state_by_expiry() {
+        let seed: Vec<(u64, i64, i64)> = (0..90u64)
+            .map(|i| (1_700_000_000_000 + i * 86_400_000, 24_000 + i as i64, 28_000 + i as i64))
+            .collect();
+        // The state is that same ring plus one settlement since.
+        let mut state_rows = seed.clone();
+        state_rows.push((1_700_000_000_000 + 90 * 86_400_000, 24_090, 28_090));
+        let mut state_text = String::from("V\t4\n");
+        for (ts, x, y) in &state_rows {
+            state_text.push_str(&format!("P\t{ts}\t{x}\t{y}\n"));
+        }
+        let parsed = core_config::vrp::parse_pairs(&state_text).expect("parses");
+        assert_eq!(parsed.len(), 91);
+
+        let (pairs, from_seed, from_state) =
+            core_config::vrp::merge_pairs(&seed, &parsed, core_vol::PAIR_RING);
+        assert_eq!(pairs.len(), 91, "91 expiries, not 180 and not 128");
+        assert_eq!(from_state, 91, "the engine's own settlements win");
+        assert_eq!(from_seed, 0);
+    }
+
+    /// P0.5: the state grammar is parsed twice — once by
+    /// `core_config::vrp` on the boot path, once by the member's own
+    /// line-at-a-time `restore_state`. The member must not depend on
+    /// `core-config` (a strategy that can read files can block a hot
+    /// path), so the two parsers stay separate and are pinned EQUAL
+    /// here instead: every row shape, and the same verdict from both.
+    #[test]
+    fn state_row_grammar_is_the_same_on_both_sides() {
+        // (row, whether both parsers must accept it)
+        let cases: [(&str, bool); 12] = [
+            ("P\t1000\t10\t11\n", true),
+            ("P\t0\t10\t11\n", false),
+            ("P\t-1\t10\t11\n", false),
+            ("P\t1000\t10\n", false),
+            ("P\t1000\tx\t11\n", false),
+            ("P\t2000\t1\t2\nP\t1000\t3\t4\n", false),
+            ("P\t1000\t1\t2\nP\t1000\t3\t4\n", false),
+            ("R\t1789000000000\t5\n", true),
+            ("R\t0\t5\n", false),
+            ("R\t1789000060000\t5\nR\t1789000000000\t6\n", false),
+            ("P\t1000\t1\t2\nR\t1789000000000\t5\n", true),
+            ("", true),
+        ];
+        let mut member = strategy_vrp::VrpStrategy::new();
+        member
+            .configure(
+                strategy_vrp::VrpParams::default(),
+                one_row_registry(),
+                core_types::make_symbol_id(core_types::VenueId::Deribit, 1),
+                core_types::make_symbol_id(core_types::VenueId::Deribit, 1),
+                core_time::WallAnchor::new(0, 0),
+                [0; 32],
+            )
+            .expect("configure");
+        for (rows, ok) in cases {
+            let text = format!("V\t4\n{rows}");
+            let config_ok = core_config::vrp::parse_pairs(&text).is_ok()
+                && core_config::vrp::parse_returns(&text).is_ok();
+            let mut fresh = strategy_vrp::VrpStrategy::new();
+            fresh
+                .configure(
+                    strategy_vrp::VrpParams::default(),
+                    one_row_registry(),
+                    core_types::make_symbol_id(core_types::VenueId::Deribit, 1),
+                    core_types::make_symbol_id(core_types::VenueId::Deribit, 1),
+                    core_time::WallAnchor::new(0, 0),
+                    [0; 32],
+                )
+                .expect("configure");
+            let member_ok = fresh.restore_state(&text).is_ok();
+            assert_eq!(config_ok, ok, "core-config verdict on {rows:?}");
+            assert_eq!(member_ok, ok, "member verdict on {rows:?}");
+        }
+        let _ = member;
+    }
+
+    /// A one-row chain, enough for `configure` to accept.
+    fn one_row_registry() -> OptRegistry {
+        let mut reg = OptRegistry::new();
+        let perp = core_types::make_symbol_id(core_types::VenueId::Deribit, 1);
+        reg.insert(OptInstrument::new(
+            core_types::make_symbol_id(core_types::VenueId::Deribit, 513),
+            perp,
+            core_types::VenueId::Deribit as u8,
+            1_789_000_000_000_000_000,
+            79_000_000_000,
+            opt_registry::RIGHT_CALL,
+            DERIBIT_OPT_CONTRACT_SIZE_1E9,
+        ))
+        .expect("one row");
+        reg
     }
 }

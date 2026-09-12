@@ -44,6 +44,7 @@ pub mod paper;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;
+pub mod state_file;
 pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;

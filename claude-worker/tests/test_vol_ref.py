@@ -56,6 +56,13 @@ def _replay(name: str) -> list[str]:
             engine.arm_hold(tau_ns, int(f[1]))
         elif op == "S":
             engine.observe_settlement(int(f[1]))
+        elif op == "R":
+            # F1: settle from the engine's OWN realised window -- the law
+            # the member uses live. 0 when the window is absent, which
+            # observe_settlement ignores by contract.
+            engine.observe_settlement(engine.realised_since_arm_1e9() or 0)
+        elif op == "D":
+            engine.disarm()
         elif op == "Q":
             fit = engine.fit()
             a = None if fit is None else fit[0]
@@ -82,6 +89,7 @@ def _replay(name: str) -> list[str]:
                         str(q[2]),
                         "1" if q[3] else "0",
                         "1" if engine.armed else "0",
+                        _opt(engine.realised_since_arm_1e9()),
                     ]
                 )
             )
@@ -108,6 +116,55 @@ def test_forecast_law_matches_the_shared_fixture(name: str) -> None:
     assert len(got) == len(want), f"{name}: row count drifted"
     for g, w in zip(got, want, strict=True):
         assert g == w, f"{name}: the forecast law drifted from the Rust"
+
+
+def test_the_settlement_y_is_the_holds_own_returns_not_the_forecast() -> None:
+    """F1: ``y`` is realised vol over the hold, never the HAR forecast.
+
+    Live, the member paired ``x = ln(HAR at entry)`` with
+    ``y = ln(HAR at expiry)`` -- two smoothed values sharing 16 of 24
+    hours of window. The fitted slope drifts toward 1 as those pairs
+    displace the seed's, and kill criterion 3 scores a forecast against
+    itself: the host read ``qlike_har`` 0.000362 against ``qlike_iv``
+    0.1255. This pins the quantity the seed cutter forms.
+    """
+    engine = claude_worker.vol_ref.VolEngine()
+    px = 79_000_000_000
+    for i in range(1_600):
+        px += 3_000_000 if i % 3 else -5_000_000
+        engine.on_minute_close(px)
+    assert engine.realised_since_arm_1e9() is None, "nothing armed"
+    assert engine.arm_hold(claude_worker.vol_ref.TAU_8H_NS, 600_000_000) is not None
+    assert engine.realised_since_arm_1e9() is None, "the hold has not run"
+
+    tau_min = claude_worker.vol_ref.tenor_of(claude_worker.vol_ref.TAU_8H_NS)[0]
+    hold: list[int] = [px]  # the close the hold's first return is formed against
+    for i in range(tau_min):
+        px += 4_000_000 if i % 2 else -3_000_000
+        hold.append(px)
+        engine.on_minute_close(px)
+
+    # Independently, from the CLOSES -- exactly what
+    # vrp_seed.realised_rv_1e9 computes over candles.db.
+    acc = 0
+    prev = hold[0]
+    for close in hold[1:]:
+        r = claude_worker.vol_ref.ret_bps_1e9(prev, close)
+        acc += r * r
+        prev = close
+    want = claude_worker.vol_ref.isqrt_i64(acc)
+    assert want > 0
+    assert engine.realised_since_arm_1e9() == want
+    assert engine.realised_since_arm_1e9() != engine.har_1e9(
+        claude_worker.vol_ref.TAU_8H_NS
+    ), "y must not be the forecast"
+
+    # F4: disarming drops the hold without forming a pair.
+    engine.disarm()
+    assert not engine.armed
+    assert engine.realised_since_arm_1e9() is None
+    engine.observe_settlement(want)
+    assert engine.pair_x_1e9 == []
 
 
 def test_the_constant_tables_are_the_same_two_tables() -> None:

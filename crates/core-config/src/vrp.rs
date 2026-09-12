@@ -21,7 +21,16 @@
 //! band_qty_1e6          = 50000            # hedge rebalance band
 //! underlying_descriptor = "deribit:BTC-PERPETUAL"
 //! hedge_descriptor      = "deribit:BTC-PERPETUAL"
+//! sides                 = "both"           # OPTIONAL: both | short | long
 //! ```
+//!
+//! ## Optional keys are absent-is-bit-identical
+//!
+//! `sides` is the first key this artifact carries that a live file may
+//! not have. Absent means [`strategy_vrp::SIDES_BOTH`] in spirit — the
+//! shape every measurement to date was made on — so an existing
+//! `vrp.toml` boots to exactly the behaviour it booted to before. The
+//! `core-regime` hysteresis keys set that precedent and it holds here.
 //!
 //! ## `tau_ns` is checked against the evidence, not against a range
 //!
@@ -80,6 +89,10 @@ pub struct VrpFile {
     pub underlying_descriptor: String,
     /// §9.4 descriptor of the instrument the delta hedge trades.
     pub hedge_descriptor: String,
+    /// Q4: which arms of the band may be traded — `0` both (the
+    /// default, and what an absent key means), `1` short vol only,
+    /// `2` long vol only.
+    pub sides: u8,
 }
 
 /// Default location beside `universe.toml`.
@@ -97,7 +110,7 @@ pub fn load(path: &Path) -> Result<(VrpFile, Vec<u8>), VrpError> {
     Ok((file, bytes))
 }
 
-const VRP_KEYS: [&str; 9] = [
+const VRP_KEYS: [&str; 10] = [
     "theta_1e9",
     "tau_ns",
     "epsilon_ns",
@@ -107,7 +120,17 @@ const VRP_KEYS: [&str; 9] = [
     "band_qty_1e6",
     "underlying_descriptor",
     "hedge_descriptor",
+    "sides",
 ];
+
+/// `sides` values, mirroring `strategy_vrp::SIDES_*`. The member owns
+/// the constants; this is the grammar that reaches them.
+const SIDES_NAMES: [(&str, u8); 3] = [("both", 0), ("short", 1), ("long", 2)];
+
+/// Upper bound on `theta_1e9`: `ln 2 ≈ 0.69` doubles the forecast, and
+/// θ = 2.0 log points is a band no implied vol on a traded chain can
+/// leave. A θ past this is a typed extra zero, not a policy.
+pub const VRP_THETA_MAX_1E9: i64 = 2_000_000_000;
 
 fn take_int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, VrpError> {
     match kv.iter().find(|(k, _, _)| k == key) {
@@ -117,9 +140,41 @@ fn take_int(kv: &[(String, Value, usize)], key: &str) -> Result<i64, VrpError> {
     }
 }
 
+/// F24: strictly positive. The message always said "must be > 0" and
+/// the code accepted 0, which is not cosmetic: `selection_ns = 0` makes
+/// the decision band zero-width so every campaign is silently
+/// `decisions_late`, and `rebalance_ns = 0` re-hedges on every tick.
 fn take_pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, VrpError> {
     let v = take_int(kv, key)?;
+    if v <= 0 {
+        return Err(err(format!("`{key}` must be > 0 (got {v})")));
+    }
     u64::try_from(v).map_err(|_| err(format!("`{key}` must be > 0 (got {v})")))
+}
+
+/// Q4/Q12: an OPTIONAL string key. Absent is not an error — it is the
+/// default the caller names.
+fn take_opt_enum(
+    kv: &[(String, Value, usize)],
+    key: &str,
+    names: &[(&str, u8)],
+    default: u8,
+) -> Result<u8, VrpError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        None => Ok(default),
+        Some((_, Value::Str(v), l)) => names
+            .iter()
+            .find(|(n, _)| *n == v.as_str())
+            .map(|(_, code)| *code)
+            .ok_or_else(|| {
+                let allowed: Vec<&str> = names.iter().map(|(n, _)| *n).collect();
+                err(format!(
+                    "line {l}: `{key}` must be one of {} (got `{v}`)",
+                    allowed.join(" | ")
+                ))
+            }),
+        Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be a string"))),
+    }
 }
 
 fn take_str(kv: &[(String, Value, usize)], key: &str) -> Result<String, VrpError> {
@@ -184,11 +239,12 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
         band_qty_1e6: take_int(&kv, "band_qty_1e6")?,
         underlying_descriptor: take_str(&kv, "underlying_descriptor")?,
         hedge_descriptor: take_str(&kv, "hedge_descriptor")?,
+        sides: take_opt_enum(&kv, "sides", &SIDES_NAMES, 0)?,
     };
 
-    if file.theta_1e9 <= 0 {
+    if file.theta_1e9 <= 0 || file.theta_1e9 > VRP_THETA_MAX_1E9 {
         return Err(err(format!(
-            "`theta_1e9` must be > 0 (got {})",
+            "`theta_1e9` must be in 1..={VRP_THETA_MAX_1E9} (got {})",
             file.theta_1e9
         )));
     }
@@ -220,11 +276,23 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
             file.qty_1e6
         )));
     }
-    if file.band_qty_1e6 <= 0 {
+    if file.band_qty_1e6 <= 0 || file.band_qty_1e6 > file.qty_1e6 {
         return Err(err(format!(
-            "`band_qty_1e6` must be > 0 (got {}) — a zero band rebalances on \
-             every tick and pays the spread for nothing",
-            file.band_qty_1e6
+            "`band_qty_1e6` must be in 1..=`qty_1e6` {} (got {}) — a zero band \
+             rebalances on every tick and pays the spread for nothing, and a band \
+             wider than the whole position never rebalances at all",
+            file.qty_1e6, file.band_qty_1e6
+        )));
+    }
+    // F24: the decision band `[E−τ, E−τ+selection]` must close BEFORE
+    // the hedge freezes at `E−ε`, or a campaign could authorise an entry
+    // it may not hedge.
+    if file.selection_ns >= file.tau_ns.saturating_sub(file.epsilon_ns) {
+        return Err(err(format!(
+            "`selection_ns` {} must be < `tau_ns` − `epsilon_ns` ({}) — the decision \
+             band has to close before the hedge freezes at E−ε",
+            file.selection_ns,
+            file.tau_ns.saturating_sub(file.epsilon_ns)
         )));
     }
     if file.underlying_descriptor.is_empty() || file.hedge_descriptor.is_empty() {
@@ -232,6 +300,12 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
     }
     Ok(file)
 }
+
+/// The newest `vrp-seed.tsv` grammar this binary reads — the worker's
+/// `claude_worker.vrp_seed.SEED_VERSION`. A v1 seed is bare triples; a
+/// v2 seed is TAGGED (`V`/`P`/`R`). Anything higher carries rows this
+/// code has never seen, and reading it would mean guessing.
+pub const SEED_VERSION_MAX: i64 = 2;
 
 /// Parse one `expiry_ts_ms\tx_1e9\ty_1e9` seed row (V5's `vrp-seed.tsv`).
 /// Integers only — the seed is fitted output, and a float parser on the
@@ -374,6 +448,107 @@ pub fn merge_returns(
     (merged, from_seed, from_state)
 }
 
+/// F2: pull the `P <expiry_ts_ms> <x_1e9> <y_1e9>` rows out of a STATE
+/// file, oldest first. The shape [`parse_returns`] has for `R` rows, and
+/// for the same reason: the state file is not only pairs.
+///
+/// Rows must be strictly increasing in `expiry_ts_ms`. The engine writes
+/// its pair ring in chronological order and one expiry settles once, so
+/// a repeat or a reversal is a corrupt file, not an unusual one.
+pub fn parse_pairs(src: &str) -> Result<Vec<(u64, i64, i64)>, VrpError> {
+    let mut out: Vec<(u64, i64, i64)> = Vec::new();
+    let mut prev_ts = 0u64;
+    for (i, raw) in src.lines().enumerate() {
+        let ln = i + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split('\t');
+        if it.next() != Some("P") {
+            continue;
+        }
+        let (a, b, c, rest) = (it.next(), it.next(), it.next(), it.next());
+        let (Some(a), Some(b), Some(c), None) = (a, b, c, rest) else {
+            return Err(err(format!(
+                "line {ln}: want `P<TAB>expiry_ts_ms<TAB>x_1e9<TAB>y_1e9`"
+            )));
+        };
+        let ts = parse_int(a, ln)?;
+        if ts <= 0 {
+            return Err(err(format!("line {ln}: expiry_ts_ms must be > 0")));
+        }
+        let ts = ts as u64;
+        if ts <= prev_ts && prev_ts != 0 {
+            return Err(err(format!(
+                "line {ln}: pair rows must be strictly increasing in expiry_ts_ms \
+                 (got {ts} after {prev_ts})"
+            )));
+        }
+        prev_ts = ts;
+        out.push((ts, parse_int(b, ln)?, parse_int(c, ln)?));
+    }
+    Ok(out)
+}
+
+/// F2: reconcile the two fitted-pair sources into the one series the
+/// member replays, oldest first.
+///
+/// The engine used to push BOTH: the worker's seed at boot, and then
+/// every `P` row of its own state file — which renders the WHOLE ring
+/// and is therefore a superset of that same seed. `push_pair` has no
+/// identity by expiry, so shared expiries went into the OLS twice. Live
+/// proof, every boot since 2026-09-11: `seed applied seed_pairs=90 …
+/// state restored pairs=90 … total_pairs=128` — 38 expiries counted
+/// twice, and after F1 with two DIFFERENT `y` each.
+///
+/// The rules, mirroring [`merge_returns`]:
+///
+/// 1. **Union by `expiry_ts_ms`.** On a collision `state` wins: it is
+///    the engine's own settlement of that expiry, formed from the
+///    minutes it actually observed.
+/// 2. **Chronological**, oldest first — the ring is order-sensitive
+///    once it wraps.
+/// 3. **Capped** at the ring, keeping the NEWEST `cap`.
+///
+/// Returns `(merged, from_seed, from_state)` over the KEPT rows.
+#[must_use]
+pub fn merge_pairs(
+    seed: &[(u64, i64, i64)],
+    state: &[(u64, i64, i64)],
+    cap: usize,
+) -> (Vec<(u64, i64, i64)>, usize, usize) {
+    if cap == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    let mut by_expiry: std::collections::BTreeMap<u64, (i64, i64, bool)> =
+        std::collections::BTreeMap::new();
+    for (ts, x, y) in seed {
+        by_expiry.insert(*ts, (*x, *y, false));
+    }
+    // Second, so a shared expiry resolves to the engine's own settlement.
+    for (ts, x, y) in state {
+        by_expiry.insert(*ts, (*x, *y, true));
+    }
+    let all: Vec<(u64, i64, i64, bool)> = by_expiry
+        .iter()
+        .map(|(t, (x, y, s))| (*t, *x, *y, *s))
+        .collect();
+    let start = all.len().saturating_sub(cap);
+    let mut from_seed = 0usize;
+    let mut from_state = 0usize;
+    let mut merged = Vec::with_capacity(all.len() - start);
+    for (ts, x, y, is_state) in &all[start..] {
+        if *is_state {
+            from_state += 1;
+        } else {
+            from_seed += 1;
+        }
+        merged.push((*ts, *x, *y));
+    }
+    (merged, from_seed, from_state)
+}
+
 /// Parse a whole `vrp-seed.tsv`: `#` comments and blank lines skipped,
 /// every other line an `expiry_ts_ms\tx_1e9\ty_1e9` triple. Rows are
 /// returned in FILE order, which the cutter writes oldest first — the
@@ -393,7 +568,21 @@ pub fn parse_seed(src: &str) -> Result<Vec<(u64, i64, i64)>, VrpError> {
         // `P` rows are pairs either way.
         let mut head = line.split('\t');
         let body = match head.next() {
-            Some("R") | Some("V") => continue,
+            Some("R") => continue,
+            // F25: the state file's version row is checked and the
+            // seed's was not, so a v3 seed written by a newer worker
+            // would have been read as a v2 one — silently, on the boot
+            // path, into the fit the member trades on.
+            Some("V") => {
+                let v = parse_int(head.next().unwrap_or("").trim(), ln)?;
+                if !(1..=SEED_VERSION_MAX).contains(&v) {
+                    return Err(err(format!(
+                        "line {ln}: seed version {v} is not one this binary reads \
+                         (1..={SEED_VERSION_MAX})"
+                    )));
+                }
+                continue;
+            }
             Some("P") => line.get(2..).unwrap_or("").trim(),
             _ => line,
         };
@@ -652,4 +841,130 @@ hedge_descriptor      = \"deribit:BTC-PERPETUAL\"
         assert_eq!(merge_returns(&series(0, 1, 5), &[], 16).0.len(), 1);
     }
 
+    // ---------------- F2 / F24 / F25 / Q4 ----------------
+
+    #[test]
+    fn merge_pairs_unions_by_expiry_and_state_wins() {
+        let seed = [(1u64, 10i64, 11i64), (2, 20, 21)];
+        let state = [(2u64, 200i64, 201i64), (3, 30, 31)];
+        let (merged, from_seed, from_state) = merge_pairs(&seed, &state, 128);
+        assert_eq!(
+            merged,
+            vec![(1, 10, 11), (2, 200, 201), (3, 30, 31)],
+            "union by expiry, chronological, and the ENGINE's settlement wins"
+        );
+        assert_eq!((from_seed, from_state), (1, 2));
+        // The live shape: the state file renders the whole ring, so it
+        // is a superset of the seed plus whatever settled since.
+        let seed: Vec<(u64, i64, i64)> =
+            (0..90u64).map(|i| (1_000 + i, i as i64, -(i as i64))).collect();
+        let mut state = seed.clone();
+        state.push((2_000, 7, 8));
+        let (merged, from_seed, from_state) = merge_pairs(&seed, &state, 128);
+        assert_eq!(merged.len(), 91, "91 expiries, not 181");
+        assert_eq!((from_seed, from_state), (0, 91), "state won every collision");
+    }
+
+    #[test]
+    fn merge_pairs_keeps_the_newest_and_survives_the_empty_cases() {
+        let seed: Vec<(u64, i64, i64)> =
+            (0..200u64).map(|i| (1_000 + i, i as i64, 0)).collect();
+        let (merged, _, _) = merge_pairs(&seed, &[], 128);
+        assert_eq!(merged.len(), 128);
+        assert_eq!(merged[127].0, 1_199, "the newest expiry is always kept");
+        assert_eq!(merged[0].0, 1_072);
+        assert!(merge_pairs(&[], &[], 128).0.is_empty());
+        assert!(merge_pairs(&seed, &[], 0).0.is_empty());
+    }
+
+    #[test]
+    fn parse_pairs_reads_only_p_rows_and_refuses_a_shuffled_file() {
+        let src = "# a state file\nV\t4\nR\t1789000000000\t5\n\
+                   P\t1000\t10\t11\nQ\t1\t2\nP\t2000\t20\t21\nK\t1\n";
+        assert_eq!(
+            parse_pairs(src).expect("parses"),
+            vec![(1_000, 10, 11), (2_000, 20, 21)]
+        );
+        // The ring is order-sensitive once it wraps and one expiry
+        // settles exactly once.
+        assert!(parse_pairs("P\t2000\t1\t2\nP\t1000\t3\t4\n").is_err());
+        assert!(parse_pairs("P\t1000\t1\t2\nP\t1000\t3\t4\n").is_err());
+        assert!(parse_pairs("P\t0\t1\t2\n").is_err(), "an unstamped pair");
+        assert!(parse_pairs("P\t1000\t1\n").is_err(), "a short row");
+        assert!(parse_pairs("P\t1000\t1\t2\t3\n").is_err(), "a long row");
+        assert!(parse_pairs("").expect("empty is legal").is_empty());
+    }
+
+    /// Rewrite one `[vrp]` key's value, keeping every other line.
+    fn with_key(key: &str, value: &str) -> String {
+        let mut out = String::new();
+        for line in GOOD.lines() {
+            if line.trim_start().starts_with(key) && line.contains('=') {
+                out.push_str(&format!("{key} = {value}\n"));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn zero_is_refused_for_every_positive_key() {
+        // F24: the message always said "must be > 0" and the code took
+        // 0. `selection_ns = 0` makes the decision band zero-width, so
+        // every campaign is silently `decisions_late`; `rebalance_ns =
+        // 0` re-hedges on every tick.
+        for key in ["tau_ns", "epsilon_ns", "selection_ns", "rebalance_ns"] {
+            let e = parse(&with_key(key, "0"))
+                .expect_err("a zero must be refused");
+            assert!(e.0.contains(key), "the message names the key: {}", e.0);
+        }
+        // And the rewriter leaves an artifact it does not match alone.
+        assert!(parse(&with_key("nothing_here", "0")).is_ok());
+    }
+
+    #[test]
+    fn the_new_bounds_refuse_what_the_runtime_would_have_to_catch() {
+        // θ past 2.0 log points is a typed extra zero, not a policy.
+        assert!(parse(&with_key("theta_1e9", "2000000001")).is_err());
+        assert!(
+            parse(&with_key("theta_1e9", "2000000000")).is_ok(),
+            "the boundary itself is legal"
+        );
+        // A band wider than the whole position never rebalances.
+        assert!(parse(&with_key("band_qty_1e6", "1000001")).is_err());
+        assert!(parse(&with_key("band_qty_1e6", "1000000")).is_ok(), "equal is legal");
+        // The decision band has to close before the hedge freezes at E−ε.
+        assert!(parse(&with_key("selection_ns", "28500000000000")).is_err());
+    }
+
+    #[test]
+    fn seed_version_3_is_refused() {
+        // The state file's version row was checked and the seed's was
+        // not, so a v3 seed from a newer worker would have been read as
+        // a v2 one — silently, on the boot path, into the fit.
+        assert!(parse_seed("V\t2\nP\t1000\t1\t2\n").is_ok());
+        assert!(parse_seed("V\t1\nP\t1000\t1\t2\n").is_ok());
+        let e = parse_seed("V\t3\nP\t1000\t1\t2\n").expect_err("v3 is not readable");
+        assert!(e.0.contains("seed version"), "{}", e.0);
+        assert!(parse_seed("V\t0\n").is_err());
+        assert!(parse_seed("V\tx\n").is_err());
+    }
+
+    #[test]
+    fn sides_is_optional_and_absent_is_both() {
+        // Q12: an existing `vrp.toml` boots to exactly what it booted
+        // to before — the core-regime hysteresis precedent.
+        assert_eq!(parse(GOOD).expect("parses").sides, 0);
+        for (name, code) in [("both", 0u8), ("short", 1), ("long", 2)] {
+            let src = format!("{GOOD}sides = \"{name}\"\n");
+            assert_eq!(parse(&src).expect("parses").sides, code, "{name}");
+        }
+        let src = format!("{GOOD}sides = \"neither\"\n");
+        let e = parse(&src).expect_err("an unknown arm is refused");
+        assert!(e.0.contains("both | short | long"), "{}", e.0);
+        let src = format!("{GOOD}sides = 1\n");
+        assert!(parse(&src).is_err(), "and it is a string key");
+    }
 }

@@ -12,9 +12,12 @@
 #         0010, NOT 0000 (operator ruling 2026-09-10): the VRP
 #         member's decision instant is E−τ = 00:00Z for the 08:00Z
 #         Deribit daily, so a drain on that same second costs the
-#         entry a 10–40 s dark window and re-decides a HOLD
-#         (`entry_done` is derived from the restored position, so a
-#         hold leaves nothing to restore). The campaign itself
+#         entry a 10–40 s dark window and re-decides a HOLD.
+#         (`entry_done` has been PERSISTED since W6 and is written
+#         the instant the decision is spent since F20, so a hold no
+#         longer leaves nothing to restore — the slot still moves,
+#         because a dark window over E−τ is its own cost.)
+#         The campaign itself
 #         SURVIVES the collision — selection is persisted and the
 #         contract re-resolved by (expiry, strike, right) — but
 #         nothing in this slot is time-critical to the second, so

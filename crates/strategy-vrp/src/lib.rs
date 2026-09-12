@@ -6,8 +6,12 @@
 //! One short-dated Deribit option per daily expiry, entered only when
 //! the venue's own implied vol leaves the band an integer HAR forecast
 //! opens around it, delta-hedged on the hour against the venue's own
-//! Black-Scholes delta, and exited at `E − ε` rather than held to
-//! settlement.
+//! Black-Scholes delta, and HELD TO SETTLEMENT.
+//!
+//! F32: the `E − ε` unwind is GONE (Y1). It crossed the option spread a
+//! second time, and at the real book measured in V2a that second
+//! crossing was the whole edge (`settle +3.658 bps` against
+//! `fair_eps −2.198`). `ε` now only freezes the hedge.
 //!
 //! ## The doctrine this member is written under
 //!
@@ -16,14 +20,21 @@
 //! crate can catch, because each one encodes a measurement made
 //! elsewhere.
 //!
-//! 1. **Paper has no fills — SUBMIT is the position event.** The paper
-//!    dispatcher never returns a fill, so [`VrpStrategy::on_fill`] is a
-//!    documented no-op and every position this member believes it holds
-//!    was created by a successful `ctx.submit`. That is an ASSUMPTION,
-//!    and the only thing that will ever check it is V8's shadow
-//!    reconciliation against the offline replay. Until then, a divergence
-//!    between this member's position and the harness's is a real defect
-//!    wearing the shape of a rounding difference.
+//! 1. **P0 INTERIM — positions are inferred from submits, and that is
+//!    known to be wrong.** The paper dispatcher returns no fill, so
+//!    [`VrpStrategy::on_fill`] is a no-op and every position this member
+//!    believes it holds was created by a successful `ctx.submit`.
+//!    F7 measured what that costs: the option entry is an IoC AT THE
+//!    MARK, the fill law is touch-or-better, and on a positive spread a
+//!    mid-priced IoC never fills. Two live campaigns in a row show
+//!    `orders=2 fills=1` in the harness — the option cancelled, the
+//!    perp hedge filled — so the model held a NAKED PERP while this
+//!    member's state file said "long call, hedged".
+//!
+//!    Every campaign before P1 is therefore a measurement of the
+//!    PIPELINE, not of P&L. P1 lands the engine-side paper matcher on
+//!    the harness's own fill law and makes `on_fill` real; this clause
+//!    is rewritten then.
 //!
 //! 2. **The book is USD-denominated, so the plain unadjusted BS delta
 //!    from the venue is the correct hedge ratio.** Deribit reports an
@@ -60,10 +71,11 @@
 //! ```text
 //! E − τ − selection   pick the ATM call of the next daily expiry
 //! E − τ               decide: IV > hi ⇒ short vol; IV < lo ⇒ long vol; else HOLD
+//!                     (and `sides` may refuse one of the two)
 //!                     on entry, submit the option IoC + the first hedge
 //! every rebalance_ns  re-hedge if |target − current| ≥ band
-//! E − ε               unwind both legs
-//! E                   still holding? European CASH SETTLE at intrinsic
+//! E − ε               FREEZE the hedge (no new hedge this close to E)
+//! E                   European CASH SETTLE at intrinsic
 //! ```
 //!
 //! The settle rung (VX, operator ruling O-D4) is the last word on a
@@ -180,7 +192,7 @@ pub const ORDER_TTL_NS: u64 = 60_000_000_000;
 /// which is what v1 always meant. An older binary refuses a newer file
 /// outright, which is the point of the bump — a binary rolled back
 /// below a change must not silently read state it cannot account for.
-pub const VRP_STATE_VERSION: u32 = 3;
+pub const VRP_STATE_VERSION: u32 = 4;
 
 /// What a [`VrpStrategy::restore_state`] replay put back, for the boot
 /// tell. An operator reading `pairs=0 campaign=false` after a restart
@@ -205,6 +217,12 @@ pub struct VrpRestored {
     pub returns: usize,
     /// W2: the newest `R` row's minute, ms since the epoch.
     pub last_return_ts_ms: u64,
+    /// F2: the newest `P` row's expiry stamp, ms since the epoch. The
+    /// pairs themselves are NOT pushed here — `cli::vrp_boot` unions
+    /// them with the worker's seed — so this is what the FILE carried.
+    pub last_pair_ts_ms: u64,
+    /// F3: the `X` row's close, ×1e6; `0` when the file had none.
+    pub prev_px_1e6: i64,
 }
 
 /// `side` value for a flat campaign.
@@ -214,6 +232,18 @@ pub const SIDE_FLAT: i8 = 0;
 pub const SIDE_LONG_VOL: i8 = 1;
 /// `side` value for SHORT vol — implied vol was ABOVE the band.
 pub const SIDE_SHORT_VOL: i8 = -1;
+
+/// [`VrpParams::sides`]: take both arms of the band. The default, and
+/// what every measurement to date was made on.
+pub const SIDES_BOTH: u8 = 0;
+/// [`VrpParams::sides`]: SHORT vol only — enter on `iv > hi`, hold on
+/// `iv < lo`. The VRP is a short-vol premium; the long arm is the
+/// model's bet against it, and R4 re-cuts whether that arm survives on
+/// clean quote data.
+pub const SIDES_SHORT: u8 = 1;
+/// [`VrpParams::sides`]: LONG vol only. Present for symmetry and for a
+/// deliberate research arm; not a shape anyone has evidence for.
+pub const SIDES_LONG: u8 = 2;
 
 /// The member's parameters, as parsed from `vrp.toml`
 /// (`core_config::vrp`) and handed in at [`VrpStrategy::configure`].
@@ -238,6 +268,12 @@ pub struct VrpParams {
     pub qty_1e6: i64,
     /// Hedge rebalance band ×1e6.
     pub band_qty_1e6: i64,
+    /// Q4: which arms of the band may be traded —
+    /// [`SIDES_BOTH`] (default), [`SIDES_SHORT`] or [`SIDES_LONG`].
+    /// A refused arm is a HOLD and is counted separately
+    /// ([`VrpCounters::holds_side`]), because "the band said trade and
+    /// policy said no" is a different fact from "the band said hold".
+    pub sides: u8,
 }
 
 impl Default for VrpParams {
@@ -261,6 +297,7 @@ impl Default for VrpParams {
             rebalance_ns: 3_600_000_000_000,
             qty_1e6: 1_000_000,
             band_qty_1e6: 50_000,
+            sides: SIDES_BOTH,
         }
     }
 }
@@ -303,6 +340,14 @@ pub struct VrpStrategy {
     /// Minute-roll state for the forecast's ingest.
     minute_id: u64,
     last_underlying_mid_1e6: i64,
+    /// F8: the perp's own TOUCH. The hedge used to be priced at the
+    /// option's FORWARD (`last_mark.underlying_px_1e9 / 1_000`), which
+    /// V0 measured 2.22 bps BELOW the perp mid — so a hedge SELL
+    /// (`bid ≥ px`) filled and a hedge BUY (`ask ≤ px`) almost never
+    /// did, and the hedge ratcheted short in the model. `0` = no fresh
+    /// perp tick yet, which is a reason not to submit.
+    last_underlying_bid_1e6: i64,
+    last_underlying_ask_1e6: i64,
     /// Wall instant of that mid, so the settle rung can pick whichever
     /// of the two index sources is FRESHER.
     last_underlying_wall_ns: u64,
@@ -329,17 +374,17 @@ pub struct VrpStrategy {
     /// without it there is nothing to harvest and premium does not make
     /// up for it, so once this is set the member never enters again.
     ///
-    /// **Scope: this process.** The QLIKE window lives in
-    /// [`core_vol::VolEngine`] and is zeroed by `new()`; the V5 boot seed
-    /// restores the fitted pairs but NOT the window. With the standing
-    /// restart cadence (`scripts/daily-restart.sh`, five slots a day)
-    /// and an 8 h campaign, sixty settlements cannot accumulate inside
-    /// one process — so as deployed today this flag cannot arm, and the
-    /// halt is a control the lane does not yet have. Persisting the
-    /// window across restarts is a named V8 precondition
-    /// (`docs/risk-policy.md`, kill-switch trigger 7). The code is here,
-    /// tested and correct, so that closing that gap is a seed change and
-    /// not a strategy change.
+    /// **Scope: across restarts, since V8a.** F32: the note that used
+    /// to sit here said the QLIKE window could never fill because it
+    /// was zeroed by `new()` at every boot. V8a persists it — the `Q`
+    /// rows of `vrp-state.tsv` are replayed by `restore_state` — so
+    /// sixty settlements DO accumulate and the halt can arm. The flag
+    /// itself is persisted as `K` and restored with them.
+    ///
+    /// What remains scoped to the process is the flag's CLEARING: once
+    /// set it is never unset here, and a `K 1` file keeps it set at the
+    /// next boot. Clearing it is an operator edit of the state file,
+    /// deliberately (`docs/risk-policy.md`, kill-switch trigger 7).
     killed: bool,
     /// The campaign is unwinding: every record retries the flatten until
     /// the book is actually flat. Set by the E−ε law and by a
@@ -355,6 +400,15 @@ pub struct VrpStrategy {
     perp_pos_qty_1e6: i64,
     /// Next hedge check, wall ns.
     next_rebalance_wall_ns: u64,
+    /// F31: the selection window `[E−τ−selection, E−τ)` of the next
+    /// expiry, computed once per campaign instead of re-scanning the
+    /// whole chain on every option record. For ~23 h 50 m of every day
+    /// no expiry is due, and `select` used to walk the registry anyway
+    /// — per-record work in an idle state, against the no-iterator rule.
+    ///
+    /// Both `0` means "recompute at the next record".
+    next_select_open_ns: u64,
+    next_select_close_ns: u64,
 
     regime_label: RegimeLabelSet,
     counters: VrpCounters,
@@ -389,6 +443,8 @@ impl VrpStrategy {
             hedge_sym: SYMBOL_ID_NONE,
             minute_id: 0,
             last_underlying_mid_1e6: 0,
+            last_underlying_bid_1e6: 0,
+            last_underlying_ask_1e6: 0,
             last_underlying_wall_ns: 0,
             selected_sym: SYMBOL_ID_NONE,
             expiry_ns: 0,
@@ -404,6 +460,8 @@ impl VrpStrategy {
             opt_pos_qty_1e6: 0,
             perp_pos_qty_1e6: 0,
             next_rebalance_wall_ns: 0,
+            next_select_open_ns: 0,
+            next_select_close_ns: 0,
             regime_label: RegimeLabelSet::ANY,
             counters: VrpCounters::default(),
             orders_emitted: 0,
@@ -439,6 +497,11 @@ impl VrpStrategy {
         if params.qty_1e6 <= 0 || params.band_qty_1e6 <= 0 || params.theta_1e9 <= 0 {
             return Err(StrategyError::Config(
                 "vrp: qty_1e6, band_qty_1e6 and theta_1e9 must all be > 0",
+            ));
+        }
+        if params.sides > SIDES_LONG {
+            return Err(StrategyError::Config(
+                "vrp: sides must be both, short or long",
             ));
         }
         if registry.is_empty() {
@@ -493,6 +556,14 @@ impl VrpStrategy {
     #[must_use]
     pub const fn vol_minutes(&self) -> u64 {
         self.vol.minutes()
+    }
+
+    /// F3: splices in the rolling window — minutes that were not the
+    /// one after the last. Non-zero after a restart is normal; a value
+    /// that keeps climbing while the engine is up is a feed problem.
+    #[must_use]
+    pub const fn vol_gaps(&self) -> u64 {
+        self.vol.gaps()
     }
 
     /// W2: whether the HAR can forecast at all.
@@ -608,7 +679,9 @@ impl VrpStrategy {
              # V version | P expiry_ts_ms x_1e9 y_1e9 | Q qlike_iv_1e9 qlike_har_1e9\n\
              # K killed | C expiry_ns strike_1e6 right side opt_qty_1e6 perp_qty_1e6 next_rebalance_ns\n\
              # R min_ts_ms r_1e9 (W2: the HAR's rolling window, oldest first)\n\
-             # C gained an 8th field, entry_done, in v3 (W6).\n",
+             # X last_min_ts_ms prev_px_1e6 (F3: the close the next return is formed against)\n\
+             # C gained an 8th field, entry_done, in v3 (W6).\n\
+             # v4 (F3): R stamps are the minutes that HAPPENED, never back-derived; X is new.\n",
         );
         let _ = writeln!(out, "V\t{VRP_STATE_VERSION}");
         if self.killed {
@@ -629,17 +702,29 @@ impl VrpStrategy {
         // parity fixture, a unit test) are skipped rather than written
         // with a 0 stamp: a row the merge cannot place in time is worse
         // than one fewer minute.
+        //
+        // F3: the stamp comes OFF THE RING with the return. It used to
+        // be back-derived as `last − (n−1−i)·60 000`, which labels every
+        // hole contiguous — and there is a hole at every boot. The merge
+        // in `cli::vrp_boot` (state wins) then overwrote the worker's
+        // correct minutes with shifted ones, and its contiguity walk
+        // could not see it.
         let mut m = 0usize;
         let n_ret = self.vol.n_returns();
-        let last_ts = self.vol.last_min_ts_ms();
-        if last_ts > 0 {
-            let oldest_ts = last_ts.saturating_sub((n_ret.saturating_sub(1)) as u64 * 60_000);
-            while m < n_ret {
-                if let Some(r) = self.vol.ret_chrono(m) {
-                    let _ = writeln!(out, "R\t{}\t{r}", oldest_ts + m as u64 * 60_000);
+        while m < n_ret {
+            if let Some((ts, r)) = self.vol.ret_chrono(m) {
+                if ts > 0 {
+                    let _ = writeln!(out, "R\t{ts}\t{r}");
                 }
-                m += 1;
             }
+            m += 1;
+        }
+        // F3: the close the FIRST live return after the next boot is
+        // formed against. Without it that close only primes `prev_px`
+        // and the minute is lost — five times a day.
+        let prev_px = self.vol.prev_px_1e6();
+        if prev_px > 0 {
+            let _ = writeln!(out, "X\t{}\t{prev_px}", self.vol.last_min_ts_ms());
         }
         if self.selected_sym != SYMBOL_ID_NONE {
             let _ = writeln!(
@@ -696,7 +781,7 @@ impl VrpStrategy {
                     // Accept anything this binary fully understands and
                     // refuse what it does not. A v1 file has no `R`
                     // rows, which is exactly the cold window v1 always
-                    // meant — readable. A v3 file has rows this code has
+                    // meant — readable. A v5 file has rows this code has
                     // never seen, and reading it would mean guessing.
                     let v = num(f.next())?;
                     if v < 1 || v > i64::from(VRP_STATE_VERSION) {
@@ -729,15 +814,41 @@ impl VrpStrategy {
                         st.killed = true;
                     }
                 }
+                // F2: validated and COUNTED here, NOT pushed — the
+                // same reasoning as the `R` arm above. The state file
+                // renders the WHOLE pair ring, so it is a superset of
+                // the worker's seed, and pushing both put 38 expiries
+                // into the OLS twice (live: `seed_pairs=90 … state
+                // restored pairs=90 … total_pairs=128` at every boot,
+                // from a 90-pair seed). `cli::vrp_boot` owns the union
+                // by `expiry_ts_ms`, state winning on a collision.
                 "P" => {
                     let ts = num(f.next())?;
-                    let x = num(f.next())?;
-                    let y = num(f.next())?;
-                    if ts < 0 {
-                        return Err("vrp state: negative expiry stamp");
+                    let _x = num(f.next())?;
+                    let _y = num(f.next())?;
+                    if ts <= 0 {
+                        return Err("vrp state: pair expiry stamp must be > 0");
                     }
-                    self.vol.seed_pair_at(ts as u64, x, y);
+                    // The pair ring is order-sensitive once it wraps and
+                    // one expiry settles exactly once, so a repeat or a
+                    // reversal is a corrupt file — the same law the `R`
+                    // rows are held to, and the law `parse_pairs`
+                    // enforces on the boot path.
+                    if ts <= st.last_pair_ts_ms as i64 && st.last_pair_ts_ms != 0 {
+                        return Err("vrp state: pair rows must increase in expiry_ts_ms");
+                    }
+                    st.last_pair_ts_ms = ts as u64;
                     st.pairs += 1;
+                }
+                // F3: the close the first live return is formed against.
+                "X" => {
+                    let ts = num(f.next())?;
+                    let px = num(f.next())?;
+                    if ts < 0 || px <= 0 {
+                        return Err("vrp state: X row needs a positive prev close");
+                    }
+                    self.vol.seed_prev_px(px);
+                    st.prev_px_1e6 = px;
                 }
                 "Q" => {
                     let iv = num(f.next())?;
@@ -918,12 +1029,30 @@ impl VrpStrategy {
 
     /// Move the perp position to `target_1e6`, paper-accounting the
     /// move on a successful submit (doctrine clause 1).
+    ///
+    /// F8: priced at the PERP'S OWN TOUCH — a BUY at the ask, a SELL at
+    /// the bid — because that is where a taker hedge can actually fill.
+    /// It used to be priced at the option record's FORWARD, which V0
+    /// measured 2.22 bps below the perp mid: under the touch-or-better
+    /// fill law a SELL (`bid ≥ px`) filled and a BUY (`ask ≤ px`)
+    /// almost never did, so the modelled hedge ratcheted short.
     fn move_hedge<C: Ctx>(&mut self, ctx: &mut C, target_1e6: i64, now: NsTs) -> bool {
         let delta = target_1e6 - self.perp_pos_qty_1e6;
         if delta == 0 {
             return false;
         }
-        let px = self.last_mark.underlying_px_1e9 / 1_000;
+        // The executable side of the perp's own book. No fresh perp
+        // tick ⇒ no hedge: a price nobody quoted is not a hedge, it is
+        // a wish.
+        let px = if delta > 0 {
+            self.last_underlying_ask_1e6
+        } else {
+            self.last_underlying_bid_1e6
+        };
+        if px <= 0 {
+            self.counters.stale_skips = self.counters.stale_skips.wrapping_add(1);
+            return false;
+        }
         // Belt and braces against a corrupt frame. The entry gate proved
         // this position is legal at Δ = 1, so these can only bind on a
         // |delta| > 1 the venue should never send — but `delta_1e9` is a
@@ -987,6 +1116,10 @@ impl VrpStrategy {
         self.hedge_frozen = false;
         self.last_mark = OptMarkCache::default();
         self.next_rebalance_wall_ns = 0;
+        // F31: the window this campaign used is spent; the next option
+        // record recomputes it for the next expiry.
+        self.next_select_open_ns = 0;
+        self.next_select_close_ns = 0;
         self.bump_state();
     }
 
@@ -1182,7 +1315,10 @@ impl VrpStrategy {
             }
         }
         if self.perp_pos_qty_1e6 != 0 {
-            self.last_mark.underlying_px_1e9 = s_1e6.saturating_mul(1_000);
+            // F8: the unwind is a REAL order at the perp's own touch,
+            // like every other hedge. Overwriting the option record's
+            // forward with the settlement index to steer `move_hedge`
+            // priced the unwind at a number the perp book never quoted.
             if !self.move_hedge(ctx, 0, now) {
                 return false; // the hedge still stands; retry
             }
@@ -1199,20 +1335,42 @@ impl VrpStrategy {
         if !self.vol.is_armed() {
             return;
         }
-        if let Some(rv) = self.realised_rv_1e9() {
-            self.vol.observe_settlement(rv);
-            self.counters.settlements = self.counters.settlements.wrapping_add(1);
-            self.refresh_qlike();
-            self.bump_state();
+        match self.realised_rv_1e9() {
+            Some(rv) => {
+                self.vol.observe_settlement(rv);
+                self.counters.settlements = self.counters.settlements.wrapping_add(1);
+                self.refresh_qlike();
+            }
+            // F1/F4: the hold ended with no realised window to pair its
+            // `x` against — the engine was down across part of it, or
+            // the settlement arrived on an option record before the
+            // last minute had rolled. There is no honest `y`, so the
+            // hold forms NO pair and the arm is dropped rather than
+            // left to be paired with the next campaign's settlement.
+            //
+            // The tell is `settled_itm + settled_otm` moving while
+            // `settlements` does not.
+            None => self.vol.disarm(),
         }
+        self.bump_state();
     }
 
     /// Realised vol over the hold that just ended, raw bps ×1e9 — the
-    /// forecast's own `rv` over τ, read straight off the ring so the
-    /// `y` this member forms is the same quantity the seed cutter forms.
+    /// sum of THAT HOLD'S OWN returns, so the `y` this member forms is
+    /// the quantity the seed cutter forms (`vrp_seed.realised_rv_1e9`).
+    ///
+    /// F1: this used to return `har_1e9(τ)`, the HAR FORECAST evaluated
+    /// at expiry. Live pairs were therefore `(ln HAR(E−τ), ln HAR(E))`
+    /// — two smoothed values sharing 16 of 24 hours of window — while
+    /// the seed's were `(ln HAR, ln RV)`. Two consequences, both live:
+    /// the OLS slope drifts toward 1 as live pairs displace seed pairs,
+    /// and kill criterion 3 scores QLIKE against a `y` that is almost
+    /// `σ̂` itself (the host read `qlike_har` 0.000362 against
+    /// `qlike_iv` 0.1255 — a 347× gap no honest forecast produces, and
+    /// `har_beats_iv` that could never go false).
     #[inline]
     fn realised_rv_1e9(&self) -> Option<i64> {
-        self.vol.har_1e9(self.params.tau_ns)
+        self.vol.realised_since_arm_1e9()
     }
 
     /// Refresh the kill-criterion-3 tell, and ARM the halt when it
@@ -1238,6 +1396,53 @@ impl VrpStrategy {
         }
     }
 
+    /// F31: recompute `[E−τ−selection, E−τ)` for the nearest expiry
+    /// still ahead of `wall_ns`.
+    ///
+    /// The chain scan happens HERE — once per campaign — instead of on
+    /// every option record while no campaign is open, which is ~23 h
+    /// 50 m of every day. When the chain carries no future expiry at
+    /// all (an empty registry, or an engine down long enough that every
+    /// listed expiry has passed) the window is closed and retried in a
+    /// minute rather than on the next record.
+    fn refresh_select_window(&mut self, wall_ns: u64) {
+        // OURS first: the live ladder is on for BTC AND ETH, and a
+        // window computed from an ETH expiry would close before our own
+        // expiry ever opened one.
+        let mut nearest: u64 = 0;
+        // ANY, as the fallback: a chain that carries no row of ours at
+        // all is exactly the `no_selection` case, and `select` has to
+        // run inside a window to count it. `right` is never filtered
+        // here for the same reason.
+        let mut nearest_any: u64 = 0;
+        for row in self.registry.rows() {
+            if row.expiry_ns <= wall_ns {
+                continue;
+            }
+            if nearest_any == 0 || row.expiry_ns < nearest_any {
+                nearest_any = row.expiry_ns;
+            }
+            if row.underlying_sym != self.hedge_sym {
+                continue;
+            }
+            if nearest == 0 || row.expiry_ns < nearest {
+                nearest = row.expiry_ns;
+            }
+        }
+        if nearest == 0 {
+            nearest = nearest_any;
+        }
+        if nearest == 0 {
+            self.next_select_open_ns = u64::MAX;
+            self.next_select_close_ns = wall_ns.saturating_add(MINUTE_NS);
+            return;
+        }
+        self.next_select_close_ns = nearest.saturating_sub(self.params.tau_ns);
+        self.next_select_open_ns = self
+            .next_select_close_ns
+            .saturating_sub(self.params.selection_ns);
+    }
+
     /// The selection law: at the first summary inside the selection
     /// window, the nearest-strike CALL of the nearest expiry still ahead
     /// of us. Nearest strike to the record's own underlying reference —
@@ -1252,6 +1457,7 @@ impl VrpStrategy {
         // the millions and bury the one case that matters: an expiry
         // was due and nothing in the chain was tradeable for us.
         let mut any_due = false;
+        self.counters.select_scans = self.counters.select_scans.wrapping_add(1);
         for row in self.registry.rows() {
             if row.expiry_ns <= wall_ns {
                 continue;
@@ -1337,8 +1543,17 @@ impl VrpStrategy {
             return;
         }
         // One decision per campaign, whatever it decides.
+        //
+        // F20: persisted IMMEDIATELY. A HOLD, a kill, a regime block, a
+        // stale mark, `no_bounds` or a caps refusal all end here with no
+        // position to derive the flag from, and the epoch used to move
+        // only when the next minute closed. With no flush at shutdown
+        // (F18) the 00:10Z drain sits on the edge of the decision band
+        // `[E−τ, E−τ+selection]`, so the reboot restored `entry_done=0`
+        // and the campaign decided a second time — the W6 defect again.
         self.entry_done = true;
         self.counters.decisions = self.counters.decisions.wrapping_add(1);
+        self.bump_state();
 
         if self.killed {
             // Kill criterion 3, sticky. No counter here: `killed` is
@@ -1371,6 +1586,16 @@ impl VrpStrategy {
             self.counters.holds = self.counters.holds.wrapping_add(1);
             return;
         };
+        // Q4: policy may refuse an arm the band opened. Counted apart
+        // from `holds` — "the band said trade and policy said no" is a
+        // different fact from "the band said hold", and R4 decides the
+        // default from clean quote data.
+        if (side == SIDE_LONG_VOL && self.params.sides == SIDES_SHORT)
+            || (side == SIDE_SHORT_VOL && self.params.sides == SIDES_LONG)
+        {
+            self.counters.holds_side = self.counters.holds_side.wrapping_add(1);
+            return;
+        }
         let qty = self.params.qty_1e6 * side as i64;
         // The policy gate, at the ONE instant that can grow the book.
         // Worst case, not current case: the hedge is sized off delta,
@@ -1409,6 +1634,10 @@ impl VrpStrategy {
             return;
         }
         if !self.submit(ctx, order) {
+            // F4: the submit ring was full, so there is no hold. An
+            // engine left armed would pair this `x` with a position
+            // that never existed at the next settlement.
+            self.vol.disarm();
             return;
         }
         self.side = side;
@@ -1494,6 +1723,10 @@ impl Strategy for VrpStrategy {
         let bid = tick.bid_px.raw();
         let ask = tick.ask_px.raw();
         if !tick.is_stale() && bid > 0 && ask > 0 {
+            // F8: the hedge is a taker order, so it needs the touch,
+            // not the mid — and never the option record's forward.
+            self.last_underlying_bid_1e6 = bid;
+            self.last_underlying_ask_1e6 = ask;
             // Integer mid, floored — the same mid the ICDP feature law
             // and the regime law use.
             let mid = (bid + ask) >> 1;
@@ -1569,7 +1802,15 @@ impl Strategy for VrpStrategy {
         // the settle rung closes it, and starting a new campaign on top
         // of it would lose the old position.
         if self.expiry_ns == 0 {
-            self.select(ctx, wall_ns, underlying_px_1e6);
+            // F31: scan the chain only inside the selection window. The
+            // window itself is recomputed once it has passed — which is
+            // once per campaign, not once per record.
+            if wall_ns >= self.next_select_close_ns {
+                self.refresh_select_window(wall_ns);
+            }
+            if wall_ns >= self.next_select_open_ns && wall_ns < self.next_select_close_ns {
+                self.select(ctx, wall_ns, underlying_px_1e6);
+            }
         }
         if opt.sym != self.selected_sym {
             return;
@@ -1843,10 +2084,18 @@ mod tests {
             i += 1;
         }
         // Fit a line through 60 seeded pairs around the live regressor.
+        // F2: STAMPED, because the engine only ever pushes stamped
+        // pairs (`seed_pair_at` from the merged boot set, or the armed
+        // expiry at a settlement) and the v4 state grammar refuses a
+        // `P` row with stamp 0. One expiry a day, oldest first.
         let x = m.vol.x_1e9(params.tau_ns).expect("warm ring");
         let mut k = 0i64;
         while k < 60 {
-            m.seed_pair(x - 300_000_000 + k * 11_000_000, x + k * 9_000_000);
+            m.seed_pair_at(
+                SEED_PAIR_TS0_MS + k as u64 * 86_400_000,
+                x - 300_000_000 + k * 11_000_000,
+                x + k * 9_000_000,
+            );
             k += 1;
         }
         assert!(m.vol.fit().is_some(), "the test needs a fitted member");
@@ -2003,6 +2252,16 @@ mod tests {
         // so the member is SHORT vol.
         let entry_wall = EXPIRY - TAU;
         ctx.now = mono_of(entry_wall);
+        // F8: one known perp quote first, so the hedge's price is
+        // pinned to the perp's own touch instead of to wherever the
+        // warm-up random walk happened to end. The member prices the
+        // hedge off THIS lane now, never off the option's forward. A
+        // minute BEFORE the entry, so the hold's own first minute still
+        // rolls inside the walk below.
+        m.on_tick(
+            &tick(entry_wall - MINUTE_NS, 79_000_000_000, false),
+            &mut ctx,
+        );
         m.on_opt_summary(
             &summary(entry_wall, opt_sym(4), 5_000_000_000, 500_000_000),
             &mut ctx,
@@ -2035,46 +2294,60 @@ mod tests {
         assert_eq!(h.qty.raw(), 500_000);
         assert_eq!(h.kind, 1);
         assert_eq!(h.ttl_ns, ORDER_TTL_NS);
-        assert_eq!(h.px.raw(), 79_000_000_000, "hedged at the venue's own underlying");
+        // F8: at the perp's own ASK (`tick()` quotes ±$0.50 around the
+        // mid), not at the option record's forward. The forward is
+        // 2.22 bps BELOW the perp mid, so a hedge BUY priced there
+        // almost never fills under the touch-or-better law while a
+        // hedge SELL always does — the modelled hedge ratcheted short.
+        assert_eq!(h.px.raw(), 79_000_500_000, "hedge BUY at the perp ASK");
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
         assert_eq!(m.perp_pos_qty_1e6(), 500_000);
 
-        // --- three hourly rebalances, each on a moved delta ---
+        // --- the hold, minute by minute; the delta moves on the hour ---
+        // F1: `y` is realised vol over the hold's OWN minutes, so a
+        // campaign that never ran its minutes forms no pair. Walking
+        // them also makes the rebalance test real — the member
+        // re-hedges on the first tick after the hour, not on a
+        // hand-placed one — and it walks THROUGH `E−ε`, so the freeze
+        // is observed where it happens.
         ctx.orders.clear();
-        let mut hedges = 0usize;
-        let mut hour = 1u64;
-        while hour <= 3 {
-            let wall = entry_wall + hour * params.rebalance_ns;
-            // A summary moves the delta, then a tick crosses the hour.
+        let tau_min = core_vol::tenor_of(params.tau_ns).expect("tenor").tau_min as u64;
+        let per_hour = params.rebalance_ns / MINUTE_NS;
+        let mut seen_hours = 0usize;
+        let mut k = 0u64;
+        while k < tau_min {
+            let wall = entry_wall + k * MINUTE_NS;
             ctx.now = mono_of(wall);
-            let delta = 500_000_000 + hour as i64 * 100_000_000;
-            m.on_opt_summary(&summary(wall, opt_sym(4), 5_000_000_000, delta), &mut ctx);
-            m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
-            assert_eq!(
-                m.perp_pos_qty_1e6(),
-                VrpStrategy::hedge_target_1e6(-params.qty_1e6, delta as i32),
-                "hour {hour}: the hedge tracks the venue's delta"
-            );
-            hedges += 1;
-            hour += 1;
+            let hour = k / per_hour;
+            if k > 0 && k % per_hour == 0 && hour <= 3 {
+                // The venue's delta moves, then the tick crosses the hour.
+                let delta = 500_000_000 + hour as i64 * 100_000_000;
+                m.on_opt_summary(&summary(wall, opt_sym(4), 5_000_000_000, delta), &mut ctx);
+                m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+                assert_eq!(
+                    m.perp_pos_qty_1e6(),
+                    VrpStrategy::hedge_target_1e6(-params.qty_1e6, delta as i32),
+                    "hour {hour}: the hedge tracks the venue's delta"
+                );
+                seen_hours += 1;
+            } else {
+                m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+            }
+            k += 1;
         }
-        assert_eq!(hedges, 3);
-        assert_eq!(ctx.orders.len(), 3, "one hedge per breached band");
+        assert_eq!(seen_hours, 3);
+        assert_eq!(ctx.orders.len(), 3, "one hedge per breached band, and no more");
         for o in &ctx.orders {
             assert_eq!(o.sym, perp_sym());
             assert_eq!(o.kind, 1);
             assert_eq!(o.ttl_ns, ORDER_TTL_NS);
         }
         assert_eq!(m.vrp_counters().hedges, 4, "the entry hedge plus three");
-
-        // --- E−ε freezes the hedge; it does NOT exit (Y1) ---
-        ctx.orders.clear();
-        let eps_wall = EXPIRY - params.epsilon_ns;
-        ctx.now = mono_of(eps_wall);
-        m.on_tick(&tick(eps_wall, 79_000_000_000, false), &mut ctx);
-        assert!(ctx.orders.is_empty(), "E−ε trades NOTHING now");
+        // Y1: `E−ε` froze the hedge on the way past and traded NOTHING.
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "still short into expiry");
         assert_ne!(m.selected_sym(), SYMBOL_ID_NONE, "campaign still open");
+        assert_eq!(m.vrp_counters().exits, 0);
+        ctx.orders.clear();
 
         // --- settlement is the terminal rung ---
         // Well above the ATM strike, so the short call settles IN the
@@ -2134,6 +2407,250 @@ mod tests {
         // Long 1 contract at Δ = 0.5 ⇒ SHORT 0.5 perp.
         assert_eq!(m.perp_pos_qty_1e6(), -500_000);
         assert_eq!(ctx.orders[1].side, Side::Ask);
+    }
+
+    // ---------------- P0: F8, Q4, F20, F31, F2, F3 ----------------
+
+    /// F8: the hedge is a taker order, so it has to be priced where a
+    /// taker can fill — the PERP's own touch. It used to be priced at
+    /// the option record's forward, which V0 measured 2.22 bps below
+    /// the perp mid: under the touch-or-better fill law a hedge SELL
+    /// (`bid ≥ px`) filled and a hedge BUY (`ask ≤ px`) almost never
+    /// did, so the modelled hedge ratcheted short while the member
+    /// believed it was flat.
+    #[test]
+    fn the_hedge_is_priced_at_the_perp_touch_not_the_forward() {
+        let params = VrpParams::default();
+        // (a) SHORT vol ⇒ the hedge BUYS ⇒ the perp ASK.
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        let h = ctx.orders[1];
+        assert_eq!(h.side, Side::Bid);
+        assert_eq!(h.px.raw(), 79_000_500_000, "the ASK, not the mid or the forward");
+
+        // (b) LONG vol ⇒ the hedge SELLS ⇒ the perp BID.
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, params);
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), 1_000, 500_000_000), &mut ctx);
+        let h = ctx.orders[1];
+        assert_eq!(h.side, Side::Ask);
+        assert_eq!(h.px.raw(), 78_999_500_000, "the BID");
+
+        // (c) No perp tick at all: no hedge, and it says so. A price
+        // nobody quoted is not a hedge.
+        let mut ctx = RecCtx::new();
+        let mut m = VrpStrategy::new();
+        m.configure(
+            params,
+            registry(),
+            perp_sym(),
+            perp_sym(),
+            WallAnchor::new(MONO0, WALL0),
+            [7u8; 32],
+        )
+        .expect("configure");
+        let before = m.vrp_counters().stale_skips;
+        ctx.now = mono_of(entry);
+        let now = ctx.now;
+        assert!(!m.move_hedge(&mut ctx, 500_000, now));
+        assert!(ctx.orders.is_empty(), "no touch ⇒ no order");
+        assert_eq!(m.vrp_counters().stale_skips, before + 1);
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "and no phantom position");
+    }
+
+    /// Q4: policy may refuse an arm the band opened, and that is a
+    /// DIFFERENT fact from the band saying hold — one is a config
+    /// choice, the other a strategy outcome, and one counter for both
+    /// would hide which.
+    #[test]
+    fn sides_short_holds_a_long_signal_and_counts_it() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            sides: SIDES_SHORT,
+            ..VrpParams::default()
+        };
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        // Implied vol far BELOW the band — the long-vol arm.
+        m.on_opt_summary(&summary(entry, opt_sym(4), 1_000, 500_000_000), &mut ctx);
+        assert_eq!(m.side(), SIDE_FLAT, "the long arm is refused");
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+        assert!(ctx.orders.is_empty());
+        assert_eq!(m.vrp_counters().holds_side, 1, "counted as a POLICY hold");
+        assert_eq!(m.vrp_counters().holds, 0, "not as a band hold");
+        assert_eq!(m.vrp_counters().decisions, 1, "the decision still ran");
+        assert!(!m.vol.is_armed(), "and nothing was armed for it");
+
+        // The same tape with the SHORT arm still trades.
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, params);
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.side(), SIDE_SHORT_VOL);
+        assert_eq!(m.vrp_counters().holds_side, 0);
+    }
+
+    /// F20: a spent decision is persisted at the instant it is spent.
+    ///
+    /// A HOLD, a kill, a regime block, a stale mark, `no_bounds` or a
+    /// caps refusal all end with no position to derive `entry_done`
+    /// from, and the epoch used to move only when the next minute
+    /// closed. With no flush at shutdown the 00:10Z drain sits on the
+    /// edge of the decision band, so the reboot restored
+    /// `entry_done = 0` and the campaign decided a second time.
+    #[test]
+    fn a_hold_is_persisted_before_the_next_minute_closes() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let (lo, hi) = m.vol.bounds(TAU, params.theta_1e9).expect("bounds");
+        let iv = lo + (hi - lo) / 2;
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        let before = m.state_epoch();
+        m.on_opt_summary(&summary(entry, opt_sym(4), iv, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().holds, 1, "the band held");
+        assert!(
+            m.state_epoch() > before,
+            "and the spent decision reached the state epoch immediately"
+        );
+        // It is IN the rendered file, not merely pending.
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+        let c = text
+            .lines()
+            .find(|l| l.starts_with("C\t"))
+            .expect("a campaign row");
+        assert!(c.ends_with("\t1"), "entry_done is persisted as 1: {c}");
+    }
+
+    /// F31: the chain scan runs inside the selection window and nowhere
+    /// else. It used to run on EVERY option record while no campaign
+    /// was open — ~23 h 50 m of every day — which is per-record work in
+    /// an idle state, against the no-iterator rule.
+    #[test]
+    fn selection_runs_only_inside_its_window() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+
+        // Ten thousand records, ten hours out. Not one scan.
+        let quiet = EXPIRY - 10 * 3_600_000_000_000;
+        let mut i = 0usize;
+        while i < 10_000 {
+            ctx.now = mono_of(quiet);
+            m.on_opt_summary(&summary(quiet, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+            i += 1;
+        }
+        assert_eq!(m.vrp_counters().select_scans, 0, "idle means idle");
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
+
+        // One record inside the window, and it selects.
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.selected_sym(), opt_sym(4));
+        assert_eq!(m.vrp_counters().select_scans, 1, "exactly one scan");
+
+        // And with a campaign open, no further scans at all.
+        let mut j = 0usize;
+        while j < 100 {
+            m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+            j += 1;
+        }
+        assert_eq!(m.vrp_counters().select_scans, 1);
+    }
+
+    /// F2: the state file renders the WHOLE pair ring, so it is a
+    /// superset of the worker's seed. `restore_state` counts those rows
+    /// and pushes none — the union belongs to `cli::vrp_boot`, which
+    /// has both series in hand. Pushing both put 38 expiries into the
+    /// OLS twice at every live boot.
+    #[test]
+    fn a_restored_state_never_grows_the_pair_ring() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let m = campaign_at_expiry(&mut ctx, params);
+        let before = m.n_pairs();
+        assert_eq!(before, 60, "the helper seeds sixty");
+
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+        assert_eq!(p_rows(&text).len(), before, "every pair is written out");
+
+        let mut boot = fresh_member(&mut ctx);
+        for (ts, x, y) in p_rows(&text) {
+            boot.seed_pair_at(ts, x, y);
+        }
+        let seeded = boot.n_pairs();
+        let r = boot.restore_state(&text).expect("restores");
+        assert_eq!(r.pairs, before, "counted");
+        assert_eq!(boot.n_pairs(), seeded, "and NOT pushed a second time");
+        assert_eq!(r.last_pair_ts_ms, SEED_PAIR_TS0_MS + 59 * 86_400_000);
+    }
+
+    /// F3: the state file carries the close the first live return after
+    /// the next boot is formed against. Without it that close only
+    /// primes `prev_px` and the minute is lost — five times a day on
+    /// the standing restart lane.
+    #[test]
+    fn the_state_file_carries_the_close_the_next_return_needs() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (m, _) = member(&mut ctx, params);
+        let mut text = String::new();
+        assert!(m.render_state(&mut text));
+        let x = text
+            .lines()
+            .find(|l| l.starts_with("X\t"))
+            .expect("an X row");
+        let mut f = x.split('\t');
+        assert_eq!(f.next(), Some("X"));
+        let ts: u64 = f.next().expect("ts").parse().expect("int");
+        let px: i64 = f.next().expect("px").parse().expect("int");
+        assert!(f.next().is_none(), "an X row has exactly two fields");
+        assert_eq!(ts, m.vol_last_min_ts_ms());
+        assert!(px > 0);
+
+        // A restored member forms a return on its FIRST live close.
+        let mut boot = fresh_member(&mut ctx);
+        boot.seed_returns(&r_rows(&text));
+        let r = boot.restore_state(&text).expect("restores");
+        assert_eq!(r.prev_px_1e6, px);
+        let minutes = boot.vol_minutes();
+        let next = ts * 1_000_000 + MINUTE_NS;
+        ctx.now = mono_of(next);
+        boot.on_tick(&tick(next, px + 7_000_000, false), &mut ctx);
+        ctx.now = mono_of(next + MINUTE_NS);
+        boot.on_tick(&tick(next + MINUTE_NS, px + 9_000_000, false), &mut ctx);
+        assert_eq!(
+            boot.vol_minutes(),
+            minutes + 1,
+            "the first live close formed a return instead of only priming prev_px"
+        );
+        assert_eq!(boot.vol_gaps(), 0, "and it was contiguous");
     }
 
     // ---------------- the risk-policy caps ----------------
@@ -2347,6 +2864,24 @@ mod tests {
         ctx.now = mono_of(entry);
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), ctx);
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "the campaign is open");
+        // F1: the hold's own minutes. `y` is now realised vol over
+        // `[arm, arm + τ)` — the quantity the seed cutter forms — so a
+        // campaign that never ran its minutes has no `y` and forms no
+        // pair. `tau_min` rolls, the last one a minute before expiry,
+        // which leaves the campaign open for the caller to settle.
+        let tau_min = core_vol::tenor_of(params.tau_ns).expect("tradeable tenor").tau_min as u64;
+        let mut k = 0u64;
+        while k < tau_min {
+            let wall = entry + k * MINUTE_NS;
+            ctx.now = mono_of(wall);
+            m.on_tick(&tick(wall, 79_000_000_000, false), ctx);
+            k += 1;
+        }
+        assert!(
+            m.vol.realised_since_arm_1e9().is_some(),
+            "the hold has to have run its minutes"
+        );
+        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "and still be open");
         ctx.orders.clear();
         m
     }
@@ -2533,15 +3068,18 @@ mod tests {
         // Push the forecast forward so there is a QLIKE row too.
         let mut text = String::new();
         assert!(m.render_state(&mut text));
-        assert!(text.contains("V\t3"), "{text}");
+        assert!(text.contains("V\t4"), "{text}");
 
         let mut boot = fresh_member(&mut ctx);
         let r = boot.restore_state(&text).expect("restores");
-        // W2: `restore_state` validates and COUNTS the `R` rows; the
-        // boot path replays them, because the rolling window is the one
-        // thing with two sources and reconciling them needs both series
-        // in hand. A round trip therefore has to do what the boot does.
+        // W2/F2: `restore_state` validates and COUNTS the `R` and `P`
+        // rows; the boot path replays them, because BOTH have two
+        // sources and reconciling them needs each series in hand. A
+        // round trip therefore has to do what the boot does.
         assert_eq!(boot.seed_returns(&r_rows(&text)), r.returns);
+        for (ts, x, y) in p_rows(&text) {
+            boot.seed_pair_at(ts, x, y);
+        }
         assert!(r.campaign, "the campaign came back");
         assert!(r.campaign_resolved, "and the chain still carries it");
         assert_eq!(r.pairs, m.n_pairs());
@@ -2680,12 +3218,15 @@ mod tests {
         let mut ctx = RecCtx::new();
         for bad in [
             "P\t1\t2\t3\n",                              // no version row
-            "V\t4\n",                                      // a version we do not know
+            "V\t5\n",                                      // a version we do not know
             "V\t0\n",                                      // nor is 0 a version
             "V\t1\nZ\t1\n",                               // an unknown tag
             "V\t1\nP\t1\t2\n",                           // a short pair row
             "V\t1\nP\t1\tx\t3\n",                       // not an integer
             "V\t1\nP\t-1\t2\t3\n",                      // a negative expiry stamp
+            "V\t1\nP\t0\t2\t3\n",                       // F2: an UNSTAMPED pair
+            "V\t4\nX\t1\t0\n",                           // F3: a non-positive prev close
+            "V\t4\nX\t1\n",                               // F3: a short X row
             "V\t1\nC\t0\t1\t0\t1\t1\t1\t1\n",        // expiry 0
             "V\t1\nC\t1\t0\t0\t1\t1\t1\t1\n",        // strike 0
             "V\t1\nC\t1\t1\t9\t1\t1\t1\t1\n",        // right is neither
@@ -2778,6 +3319,30 @@ mod tests {
     /// Pull the `R` rows back out of a rendered state file, the way
     /// `cli::vrp_boot` does through `core_config::vrp::parse_returns`.
     /// Spelled out here so this crate stays free of that dependency.
+    /// F2: the `P` rows of a state file. `restore_state` COUNTS them
+    /// and pushes none — `cli::vrp_boot` merges them with the worker's
+    /// seed — so a round trip in a test has to replay them the way the
+    /// boot path does, exactly as it already does for `R`.
+    fn p_rows(text: &str) -> Vec<(u64, i64, i64)> {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let mut f = line.split('\t');
+            if f.next() != Some("P") {
+                continue;
+            }
+            let ts: u64 = f.next().expect("ts").parse().expect("ts int");
+            let x: i64 = f.next().expect("x").parse().expect("x int");
+            let y: i64 = f.next().expect("y").parse().expect("y int");
+            assert!(f.next().is_none(), "a P row has exactly three fields");
+            out.push((ts, x, y));
+        }
+        out
+    }
+
+    /// Base expiry stamp for the tests' seeded pairs — one a day, the
+    /// cadence the worker's seed cutter uses.
+    const SEED_PAIR_TS0_MS: u64 = 1_700_000_000_000;
+
     fn r_rows(text: &str) -> Vec<(u64, i64)> {
         let mut out = Vec::new();
         for line in text.lines() {
@@ -2984,10 +3549,11 @@ mod tests {
     fn a_future_state_version_is_refused() {
         let mut ctx = RecCtx::new();
         let mut m = fresh_member(&mut ctx);
-        assert!(m.restore_state("V\t4\n").is_err(), "v4 is not readable here");
+        assert!(m.restore_state("V\t5\n").is_err(), "v5 is not readable here");
         assert!(m.restore_state("V\t0\n").is_err(), "nor is a nonsense version");
-        assert!(m.restore_state("V\t3\n").is_ok(), "v3 is this binary's own");
-        assert!(m.restore_state("V\t2\n").is_ok(), "and it still reads v2");
+        assert!(m.restore_state("V\t4\n").is_ok(), "v4 is this binary's own");
+        assert!(m.restore_state("V\t3\n").is_ok(), "and it still reads v3");
+        assert!(m.restore_state("V\t2\n").is_ok(), "and v2");
     }
 
     /// Out-of-order `R` rows are refused. The ring's eviction arm
@@ -2998,9 +3564,17 @@ mod tests {
         let mut ctx = RecCtx::new();
         let mut m = fresh_member(&mut ctx);
         assert!(m
-            .restore_state("V\t3\nR\t1789000060000\t10\nR\t1789000000000\t20\n")
+            .restore_state("V\t4\nR\t1789000060000\t10\nR\t1789000000000\t20\n")
             .is_err());
-        assert!(m.restore_state("V\t3\nR\t0\t10\n").is_err(), "a 0 stamp is not a minute");
+        assert!(m.restore_state("V\t4\nR\t0\t10\n").is_err(), "a 0 stamp is not a minute");
+        // F2: the same law for pairs — the ring is order-sensitive once
+        // it wraps, and one expiry settles exactly once.
+        assert!(m
+            .restore_state("V\t4\nP\t2000\t1\t2\nP\t1000\t3\t4\n")
+            .is_err());
+        assert!(m
+            .restore_state("V\t4\nP\t1000\t1\t2\nP\t1000\t3\t4\n")
+            .is_err(), "an expiry settles once");
     }
 
     #[test]

@@ -6,6 +6,137 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `vrp-state.tsv` v3 → v4; the settlement `y` is REALISED vol; one push per pair; the VRP boot is mask-gated (VRP P0 / R0)
+
+**What changed**
+
+- **`core-vol`: the settlement `y`.** `VolEngine` gained `pend_arm_k` /
+  `pend_tau_min` (recorded in `arm_hold_at`) and
+  `realised_since_arm_1e9()` — `isqrt(Σ r²)` over the `tau_min` returns
+  pushed since the arm, `None` before the hold is over or once its
+  oldest minute has left the ring. `VrpStrategy::realised_rv_1e9` now
+  calls it. It used to call `har_1e9(τ)`, the HAR FORECAST evaluated at
+  expiry, so live pairs were `(ln HAR(E−τ), ln HAR(E))` — two smoothed
+  values sharing 16 of 24 hours of window — while the worker's seed
+  pairs were `(ln HAR, ln RV)`. Two live consequences: the OLS slope
+  drifts toward 1 as live pairs displace seed pairs, and kill criterion
+  3 scored QLIKE against a `y` that was almost `σ̂` itself (the host read
+  `engine_vrp_qlike_har_1e6` 362 against `qlike_iv_1e6` 125503 — a 347×
+  gap, and a `har_beats_iv` that could never go false). **Every `P` and
+  `Q` row the engine has formed to date is in the wrong domain and must
+  be stripped from `~/multivenue/vrp-state.tsv` at the next restart.**
+- `VolEngine::disarm()` (F4), called on a failed submit and whenever a
+  hold ends with no realised window: an armed engine with no position
+  would pair its `x` against a hold nobody held.
+- **`core-vol` parity floors (F5).** `ln_sigma_hat_1e9` and `qlike_1e9`
+  used `/` on a signed intermediate where the Python mirror uses `//`.
+  Both are now `core_regime::math::floor_div`. This changes no value on
+  the existing corpus (`b > 0`, `ln_u > 0` throughout) and changes the
+  value on a downward-sloping fit and on every settlement whose realised
+  vol came in UNDER the forecast. `claude-worker/tests/fixtures/vol/parity-1`
+  was regenerated with `CORE_VOL_PARITY_WRITE=1` and now carries both
+  branches plus a completed 8 h hold; the emitted row gained a 15th
+  column, `realised`. Regenerate with
+  `CORE_VOL_PARITY_WRITE=1 cargo nextest run -p core-vol --test parity`
+  then `cd claude-worker && uv run pytest tests/test_vol_ref.py`.
+- **`vrp-state.tsv` VERSION 3 → 4.** Two changes:
+  - `R` stamps are the minutes that HAPPENED. `VolEngine` keeps
+    `ret_ts_ms` beside `ret_1e9` (12 KiB) and `ret_chrono` returns
+    `(min_ts_ms, r_1e9)`. `render_state` used to back-derive the stamps
+    as `last − (n−1−i)·60 000`, which labels every hole contiguous — and
+    there is a hole at every boot — after which `merge_returns` (state
+    wins) overwrote the worker's correct minutes with shifted ones.
+    `VolEngine::gaps()` counts a non-contiguous push; the boot tell
+    prints `gaps=`.
+  - A new `X <last_min_ts_ms> <prev_px_1e6>` row carries the close the
+    first live return after the next boot is formed against
+    (`VolEngine::seed_prev_px`). Without it that close only primed
+    `prev_px` and the minute was lost — five times a day.
+  A v4 reader accepts v1–v4 and refuses v5. An older binary refuses a v4
+  file outright, which is the point of the bump.
+- **One push per pair (F2).** `restore_state`'s `P` arm now VALIDATES and
+  COUNTS its rows and pushes none of them — the `R` arm's law, for the
+  same reason. `core_config::vrp::{parse_pairs, merge_pairs}` union the
+  worker's seed with the state's rows by `expiry_ts_ms` (state wins,
+  chronological, capped at `PAIR_RING`), and `cli::vrp_boot` pushes the
+  union once. `VrpBoot.seed` is renamed `VrpBoot.pairs` and gains
+  `pairs_from_seed` / `pairs_from_state`. Live proof of the defect, at
+  every boot since 2026-09-11: `seed applied seed_pairs=90 … state
+  restored pairs=90 … total_pairs=128` from a 90-pair seed — 38 expiries
+  in the OLS twice. Both parsers now also refuse a repeated or reversed
+  expiry.
+- **The boot is mask-gated (F19).** `cli::vrp_boot::vrp_wanted(requested)`
+  gates the whole load, as icdp and xsd already were, and a
+  requested-but-absent artifact REFUSES the boot. Before this,
+  `STRATEGY=ai` with a present-but-corrupt `vrp.toml` refused the boot —
+  so the wrapper's documented rollback, "drop the mask back to `ai`",
+  could not escape a corrupt VRP file while KeepAlive relaunched into
+  the same refusal — and `ai+vrp` with an ABSENT `vrp.toml` booted
+  silently as `ai`.
+- **`--vrp-state <path>` (F22).** The state path was hard-wired to
+  `~/multivenue/vrp-state.tsv`, so any `--vrp <other.toml>` smoke boot
+  read AND REWROTE the standing engine's state. It now follows the
+  artifact's own directory when `--vrp` is explicit, or the new flag.
+- **State durability, both writers (F18/F21/F23).** New
+  `crates/cli/src/state_file.rs` `write_atomic` = write, **`sync_all`**,
+  rename; `vrp_boot::write_state` and `xsd_boot::write_state` are
+  one-line wrappers over it (on APFS a crash between write and rename
+  could leave a zero-length file, which boots as "first boot"
+  silently). Both writers moved OUT of the `--metrics` gate in
+  `paper.rs` — position persistence depended on an observability flag —
+  and are now called from ONE `flush_member_state!` site, in the 5 s
+  report block beside the capture flushes and again **unconditionally
+  after `eng.stop()`**. The restart lane SIGTERMs five times a UTC day
+  and the 00:10Z slot sits on the edge of the VRP decision band, so an
+  entry at 00:09:57 was never written and the reboot restored
+  `entry_done = 0`. A failing state write now warns once a minute per
+  writer instead of every 5 s.
+- **Member (F8/F20/F31, Q4).** The perp hedge is priced at the PERP's own
+  touch — a BUY at the ask, a SELL at the bid — and not at the option
+  record's forward, which V0 measured 2.22 bps below the perp mid (under
+  touch-or-better a hedge SELL filled and a hedge BUY almost never did,
+  so the modelled hedge ratcheted short); no fresh perp tick ⇒ no hedge,
+  counted. A spent decision is persisted the instant it is spent
+  (`bump_state()` after `entry_done = true`). The chain scan runs only
+  inside the selection window, recomputed once per campaign
+  (`engine_vrp_select_scans_total`) instead of on every option record
+  for ~23 h 50 m a day.
+- **`vrp.toml` gains OPTIONAL `sides = "both" | "short" | "long"`** (Q4;
+  default `both`, absent = bit-identical — the core-regime hysteresis
+  precedent). A refused arm is a HOLD counted as
+  `engine_vrp_holds_side_total`, distinct from `holds`. New parser
+  bounds (F24/F25): `take_pos_u64` refuses 0 (it accepted it while the
+  message said otherwise — `selection_ns = 0` made every campaign
+  silently `decisions_late`), `theta_1e9 ≤ 2e9`, `band_qty_1e6 ≤
+  qty_1e6`, `selection_ns < tau_ns − epsilon_ns`, and the SEED's `V` row
+  is version-checked (`SEED_VERSION_MAX = 2`) as the state's always was.
+- Metrics: `engine_vrp_holds_side_total`, `engine_vrp_select_scans_total`
+  (the family is now 18 counters + 4 gauges). Boot tells gain
+  `pairs=/pairs_from_seed=/pairs_from_state=`, `gaps=`, `prev_px_1e6=`.
+
+**Operator action**
+
+1. Relink (`cargo build --release -p cli`) — G0.
+2. Re-cut the seed: `python -m claude_worker.vrp_seed seed-out …`.
+3. **STRIP `~/multivenue/vrp-state.tsv` to its `V`, `R` and `X` rows**
+   between the SIGTERM and the KeepAlive relaunch (back the file up
+   first). The `P` and `Q` rows are in the wrong domain (F1) and the `P`
+   rows are double-counted (F2); `R` rows are unaffected. Do the restart
+   outside `[23:35, 00:15]Z` and `[07:00, 08:35]Z`, with no open
+   campaign (`grep '^C' vrp-state.tsv` empty).
+4. Expect `vrp: seed applied … pairs_from_seed=90 pairs_from_state=0
+   pairs=90`, `vrp: state restored pairs=0 qlike=0 … returns=1536`,
+   `vrp: forecast WARM … gaps=0`, `composed mask=… vrp=true`.
+
+**What did NOT change**
+
+The forecast law itself on the existing corpus (the floor_div fix is a
+no-op on every value in `parity-1` before this commit's additions), the
+`R`-row grammar, `vrp-seed.tsv`'s format, the QLIKE ring, the caps, the
+regime gate, and every other member. `strategy-xsd`'s own
+`render_state` / `parse_state` are untouched — only the durability of
+the write it goes through changed.
+
 ## 2026-09-12 — xsd artifacts authored by the worker, boot seed + monthly rotation hooks, `numpy` a base dependency (XSD-4)
 
 **What changed**
@@ -786,7 +917,8 @@ None.
   leaves the member unconfigured and its bit unset — the `icdp.toml` law.
   `scripts/engine-wrapper.sh` accepts `STRATEGY=ai+vrp` and
   `STRATEGY=vrp` (still `--paper`, never `--live`).
-- New metric family `engine_vrp_*` (11 counters + 4 gauges). The gauge
+- New metric family `engine_vrp_*` (18 counters + 4 gauges as of P0;
+  the line below described the family at V6, when it was 11 + 4). The gauge
   `engine_strategy_ev_active` is **renamed** `engine_strategy_vrp_active`.
 - `regime.toml`: the coded-member label key is now `[labels.vrp]`.
   **`[labels.ev]` refuses the boot** ("unknown coded member") rather than

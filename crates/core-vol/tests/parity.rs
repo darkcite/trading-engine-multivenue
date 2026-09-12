@@ -4,7 +4,8 @@
 //! Rust ↔ Python parity of the VRP V4 forecast law.
 //!
 //! Consumes `claude-worker/tests/fixtures/vol/parity-<n>.input.tsv` — a
-//! tape of ops (close, seed pair, arm, settle, emit) — and asserts every
+//! tape of ops (close, seed pair, arm, settle, settle-from-ring,
+//! disarm, emit) — and asserts every
 //! emitted state row against `parity-<n>.expected.tsv`, the SAME pair
 //! `claude-worker/tests/test_vol_ref.py` checks. The expected file is
 //! (re)written by THIS harness under `CORE_VOL_PARITY_WRITE=1`: the
@@ -64,6 +65,14 @@ fn run(name: &str) -> Vec<String> {
                 e.arm_hold(tau_ns, f[1].parse().unwrap());
             }
             "S" => e.observe_settlement(f[1].parse().unwrap()),
+            // F1: settle from the engine's OWN realised window — the
+            // law the member uses live. `0` when the window is absent,
+            // which `observe_settlement` ignores by contract.
+            "R" => {
+                let rv = e.realised_since_arm_1e9().unwrap_or(0);
+                e.observe_settlement(rv);
+            }
+            "D" => e.disarm(),
             "Q" => {
                 let (a, b) = match e.fit() {
                     Some((a, b)) => (Some(a), Some(b)),
@@ -75,7 +84,7 @@ fn run(name: &str) -> Vec<String> {
                 };
                 let q = e.qlike_counters();
                 out.push(format!(
-                    "{row}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{row}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     e.minutes(),
                     e.n_pairs(),
                     opt(e.har_1e9(tau_ns)),
@@ -90,6 +99,7 @@ fn run(name: &str) -> Vec<String> {
                     q.har_mean_1e9,
                     u8::from(q.har_beats_iv),
                     u8::from(e.is_armed()),
+                    opt(e.realised_since_arm_1e9()),
                 ));
                 row += 1;
             }
@@ -108,7 +118,7 @@ fn check(name: &str) {
             "# {name}.expected.tsv — WRITTEN by crates/core-vol/tests/parity.rs \
              (CORE_VOL_PARITY_WRITE=1).\n\
              # row minutes n_pairs har x a b ln_sigma_hat iv_lo iv_hi \
-             qlike_n qlike_iv qlike_har har_beats_iv armed\n"
+             qlike_n qlike_iv qlike_har har_beats_iv armed realised\n"
         );
         for l in &got {
             text.push_str(l);
@@ -179,5 +189,35 @@ fn the_fixture_exercises_every_branch_it_claims_to() {
         cell(&rows[n - 2], 2),
         "an unarmed settlement must not form a pair"
     );
-    assert_eq!(cell(&rows[n - 1], 13), "0", "and must leave nothing armed");
+    // Column 14 is `armed` (13 is `har_beats_iv`) — this assertion read
+    // the wrong column before the `realised` column was added, and both
+    // happened to be "0".
+    assert_eq!(cell(&rows[n - 1], 14), "0", "and must leave nothing armed");
+
+    // ---- F1/F4/F5: the tape must reach each new branch ----
+    // A hold that ran its full tenor reports a realised vol...
+    let full = rows
+        .iter()
+        .find(|r| cell(r, 14) == "1" && cell(r, 15) != "-")
+        .expect("an armed row whose hold has completed");
+    let rv: i64 = cell(full, 15).parse().unwrap();
+    assert!(rv > 0);
+    // ...and it is not the forecast. F1 in one assertion.
+    assert_ne!(cell(full, 15), cell(full, 3), "y must not be the HAR");
+    // A hold that has not run reports ABSENT, not a short window.
+    assert!(
+        rows.iter().any(|r| cell(r, 14) == "1" && cell(r, 15) == "-"),
+        "an armed row whose hold is still open"
+    );
+    // Nothing armed ⇒ nothing realised, on every row.
+    assert!(
+        rows.iter().all(|r| cell(r, 14) == "1" || cell(r, 15) == "-"),
+        "a disarmed engine must report no realised window"
+    );
+    // F5: a fit that slopes DOWN, so `b·x` is negative and the floored
+    // division is the only one that matches the Python.
+    assert!(
+        rows.iter().any(|r| cell(r, 6).starts_with('-') && cell(r, 6) != "-"),
+        "the tape must contain a negative slope"
+    );
 }

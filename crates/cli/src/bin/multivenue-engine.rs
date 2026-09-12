@@ -431,6 +431,14 @@ struct RunArgs {
     /// exist, or any file that does not parse, refuses the boot.
     #[arg(long)]
     vrp: Option<PathBuf>,
+    /// F22: `vrp-state.tsv` — the VRP member's OWN persisted state (the
+    /// pairs it formed, the QLIKE window, an open campaign). Default:
+    /// beside the `--vrp` artifact when that was explicit, else
+    /// `~/multivenue/vrp-state.tsv`. The path used to be hard-wired, so
+    /// any `--vrp <other.toml>` smoke boot read AND REWROTE the standing
+    /// engine's state.
+    #[arg(long)]
+    vrp_state: Option<PathBuf>,
     /// XSD-3: `xsd.toml` — the cross-sectional member's parameter
     /// artifact (`~/multivenue/xsd.toml` by default). ABSENT at the
     /// default location = the member is not configured and its enable
@@ -2167,26 +2175,52 @@ fn run(args: RunArgs) -> ExitCode {
             };
             // VRP V7: the member's artifact, its chain table and its
             // boot seed, all resolved against the same descriptor table
-            // (D-6 truth). An ABSENT default `vrp.toml` leaves the
-            // member unconfigured and its bit unset (the `icdp.toml`
-            // law); an ABSENT seed is legal too — a cold boot must be,
-            // the engine restarts about three times a day — and the
-            // member simply holds. A file that is PRESENT and
-            // unreadable refuses the boot in both cases: a seed the
-            // engine cannot read exactly is a fit nobody measured.
-            let vrp_boot = match cli::vrp_boot::load_vrp_boot(
-                args.vrp.as_deref(),
-                args.vrp_seed.as_deref(),
-                &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
-                &discovery.deribit_options,
-            ) {
-                Ok(v) => v,
-                Err(reason) => {
-                    error!(reason, "vrp: artifact refused — boot aborted");
-                    join_reverse(handles);
-                    return ExitCode::from(1);
+            // (D-6 truth). F19: ONLY when the bit is requested. This
+            // ran for every set boot, so `STRATEGY=ai` with a
+            // present-but-corrupt `vrp.toml` refused the boot — and the
+            // wrapper's documented rollback IS "drop the mask back to
+            // `ai`", which could therefore never escape a corrupt VRP
+            // file while KeepAlive relaunched into the same refusal. It
+            // also configured, seeded and restored a member whose bit
+            // was clear, so a runtime `EnableStrategy(1)` would have
+            // traded an armed member nobody enabled.
+            //
+            // An ABSENT seed is still legal — a cold boot must be, the
+            // engine restarts about three times a day — and the member
+            // simply holds. A file that is PRESENT and unreadable
+            // refuses the boot: a seed the engine cannot read exactly is
+            // a fit nobody measured.
+            let vrp_boot = if cli::vrp_boot::vrp_wanted(requested) {
+                match cli::vrp_boot::load_vrp_boot(
+                    args.vrp.as_deref(),
+                    args.vrp_seed.as_deref(),
+                    args.vrp_state.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &discovery.deribit_options,
+                ) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        error!(reason, "vrp: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
                 }
+            } else {
+                None
             };
+            // F19: requested-but-absent REFUSES (the icdp law). The old
+            // shape booted `ai+vrp` silently as `ai` when the default
+            // `vrp.toml` was missing — `configured` simply lacked the
+            // bit, the composed mask was still non-zero, and nothing
+            // said the strategy the operator asked for was not there.
+            if cli::vrp_boot::vrp_wanted(requested) && vrp_boot.is_none() {
+                error!(
+                    "vrp: requested by --strategy but the artifact is absent \
+                     (~/multivenue/vrp.toml or --vrp) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // XSD-3: the member's four artifacts, resolved against the
             // same descriptor table; only when the bit is requested
             // (`--strategy ai` never touches the files). An ABSENT

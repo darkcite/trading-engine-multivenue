@@ -586,7 +586,10 @@ pub struct VrpCounters {
     pub entries: u64,
     /// Hedge orders submitted (entry hedge + rebalances + unwind).
     pub hedges: u64,
-    /// Exits submitted at E−ε.
+    /// Exits submitted by the RISK unwind only — a hard-closed regime
+    /// gate. F32: this is NOT the `E−ε` exit; Y1 retired that rung and
+    /// a campaign now ends at settlement. A non-zero value here means a
+    /// gate slammed shut mid-hold, not that a campaign closed normally.
     pub exits: u64,
     /// Decisions that HELD: the quoted implied vol was inside the band.
     pub holds: u64,
@@ -651,6 +654,15 @@ pub struct VrpCounters {
     /// mechanism has stopped holding. **A `0` on a full window is the
     /// halt tell** — E1 is gone and the member has no edge to harvest.
     pub qlike_har_beats_iv: u64,
+    /// Q4: decisions where the band opened an arm and `sides` policy
+    /// refused it. Distinct from [`Self::holds`], which is the band
+    /// itself saying hold — one is a strategy fact, the other a config
+    /// one, and reading them as one number hides which.
+    pub holds_side: u64,
+    /// F31: chain scans run by the selection law. Bounded by ONE per
+    /// campaign plus the records inside a 10-minute selection window;
+    /// it used to run on every option record for ~23 h 50 m a day.
+    pub select_scans: u64,
 }
 
 /// XSD counters (`engine_xsd_*`), mirrored by the cli's generic 5 s

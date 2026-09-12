@@ -2465,7 +2465,12 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             tracing::error!(error = ?e, "vrp: artifact refused");
             return EngineLoopResult::Failed("vrp: artifact refused by the strategy");
         }
-        for (ts_ms, x, y) in &boot.seed {
+        // F2: the MERGED pairs — the worker's seed unioned with the
+        // engine's own `P` rows by expiry, state winning. `restore_state`
+        // below counts the file's `P` rows and pushes none of them; the
+        // two unconditional pushes put 38 expiries into the OLS twice at
+        // every boot (`seed_pairs=90 … pairs=90 … total_pairs=128`).
+        for (ts_ms, x, y) in &boot.pairs {
             set.vrp_mut().seed_pair_at(*ts_ms, *x, *y);
         }
         // W2/W3: the HAR's rolling window, reconciled at boot from the
@@ -2509,8 +2514,11 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             "vrp: artifact configured"
         );
         tracing::info!(
-            seed_pairs = boot.seed.len(),
-            decisive = boot.seed.len() >= core_vol::MIN_PAIRS,
+            seed_pairs = boot.pairs_from_seed + boot.pairs_from_state,
+            pairs = boot.pairs.len(),
+            pairs_from_seed = boot.pairs_from_seed,
+            pairs_from_state = boot.pairs_from_state,
+            decisive = boot.pairs.len() >= core_vol::MIN_PAIRS,
             path = %boot.seed_path.display(),
             "vrp: seed applied"
         );
@@ -2521,6 +2529,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             campaign_resolved = restored.campaign_resolved,
             killed = restored.killed,
             returns = restored.returns,
+            prev_px_1e6 = restored.prev_px_1e6,
+            gaps = set.vrp().vol_gaps(),
             total_pairs = set.vrp().n_pairs(),
             path = %boot.state_path.display(),
             "vrp: state restored"
@@ -3771,6 +3781,12 @@ pub struct VrpMetricIds {
     pub exits: core_metrics::CounterId,
     /// `engine_vrp_holds_total`
     pub holds: core_metrics::CounterId,
+    /// `engine_vrp_holds_side_total` (Q4 — the band opened an arm that
+    /// `sides` policy refuses)
+    pub holds_side: core_metrics::CounterId,
+    /// `engine_vrp_select_scans_total` (F31 — chain scans by the
+    /// selection law; bounded by the selection window)
+    pub select_scans: core_metrics::CounterId,
     /// `engine_vrp_no_bounds_total`
     pub no_bounds: core_metrics::CounterId,
     /// `engine_vrp_stale_skips_total`
@@ -3820,6 +3836,8 @@ fn register_vrp_metrics(
     let hedges = one("engine_vrp_hedges_total")?;
     let exits = one("engine_vrp_exits_total")?;
     let holds = one("engine_vrp_holds_total")?;
+    let holds_side = one("engine_vrp_holds_side_total")?;
+    let select_scans = one("engine_vrp_select_scans_total")?;
     let no_bounds = one("engine_vrp_no_bounds_total")?;
     let stale_skips = one("engine_vrp_stale_skips_total")?;
     let no_selection = one("engine_vrp_no_selection_total")?;
@@ -3840,6 +3858,8 @@ fn register_vrp_metrics(
         hedges,
         exits,
         holds,
+        holds_side,
+        select_scans,
         no_bounds,
         stale_skips,
         no_selection,
@@ -3874,6 +3894,8 @@ fn write_vrp_state_if_changed<S: strategy_core::StrategyCounters>(
     strat: &S,
     last_epoch: &mut u64,
     buf: &mut String,
+    last_warn_ns: &mut u64,
+    now: u64,
 ) {
     let Some(path) = path else { return };
     let epoch = strategy_core::StrategyCounters::vrp_state_epoch(strat);
@@ -3885,8 +3907,20 @@ fn write_vrp_state_if_changed<S: strategy_core::StrategyCounters>(
     }
     match crate::vrp_boot::write_state(path, buf) {
         Ok(()) => *last_epoch = epoch,
-        Err(reason) => tracing::warn!(reason, "vrp: state write failed — will retry"),
+        Err(reason) => warn_state_write("vrp", &reason, last_warn_ns, now),
     }
+}
+
+/// F18: a failing state write repeats every 5 s for as long as the
+/// cause lasts — a full disk lasts hours. One line a minute per writer
+/// says the same thing and leaves the log readable.
+fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
+    const STATE_WARN_PERIOD_NS: u64 = 60_000_000_000;
+    if *last_warn_ns != 0 && now.saturating_sub(*last_warn_ns) < STATE_WARN_PERIOD_NS {
+        return;
+    }
+    *last_warn_ns = now.max(1);
+    tracing::warn!(kind, reason, "state write failed — will retry");
 }
 
 /// Mirror the VRP family as monotonic deltas of the cumulative strategy
@@ -3911,6 +3945,10 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.exits.saturating_sub(last.exits));
     reg.counter(ids.holds)
         .inc(cur.holds.saturating_sub(last.holds));
+    reg.counter(ids.holds_side)
+        .inc(cur.holds_side.saturating_sub(last.holds_side));
+    reg.counter(ids.select_scans)
+        .inc(cur.select_scans.saturating_sub(last.select_scans));
     reg.counter(ids.no_bounds)
         .inc(cur.no_bounds.saturating_sub(last.no_bounds));
     reg.counter(ids.stale_skips)
@@ -4209,6 +4247,8 @@ fn write_xsd_state_if_changed<S: strategy_core::StrategyCounters>(
     last_epoch: &mut u64,
     buf: &mut String,
     views: &mut [strategy_core::XsdPositionView],
+    last_warn_ns: &mut u64,
+    now: u64,
 ) {
     let Some(sink) = sink else { return };
     let epoch = strategy_core::StrategyCounters::xsd_state_epoch(strat);
@@ -4230,7 +4270,7 @@ fn write_xsd_state_if_changed<S: strategy_core::StrategyCounters>(
     crate::xsd_boot::render_state(&sink.table_hash, &descriptor_of, &views[..n], buf);
     match crate::xsd_boot::write_state(&sink.path, buf) {
         Ok(()) => *last_epoch = epoch,
-        Err(reason) => tracing::warn!(reason, "xsd: state write failed — will retry"),
+        Err(reason) => warn_state_write("xsd", &reason, last_warn_ns, now),
     }
 }
 
@@ -4972,7 +5012,36 @@ where
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
     let mut xsd_state_buf = String::new();
-    let mut xsd_views = vec![strategy_core::XsdPositionView::default(); strategy_xsd::XSD_MAX_TARGETS];
+    let mut xsd_views =
+        vec![strategy_core::XsdPositionView::default(); strategy_xsd::XSD_MAX_TARGETS];
+    let mut vrp_state_warn_ns: u64 = 0;
+    let mut xsd_state_warn_ns: u64 = 0;
+    // F18/F21: ONE call site for every member's persisted state, so a
+    // third member cannot be added to one of the two places and not the
+    // other. A macro rather than a closure because it borrows `eng`
+    // alongside code that also borrows `eng` mutably; it expands to the
+    // same two epoch-gated calls either way.
+    macro_rules! flush_member_state {
+        () => {{
+            write_vrp_state_if_changed(
+                vrp_state_path.as_deref(),
+                eng.strategy(),
+                &mut vrp_state_epoch,
+                &mut vrp_state_buf,
+                &mut vrp_state_warn_ns,
+                now_ns(),
+            );
+            write_xsd_state_if_changed(
+                xsd_sink.as_ref(),
+                eng.strategy(),
+                &mut xsd_state_epoch,
+                &mut xsd_state_buf,
+                &mut xsd_views,
+                &mut xsd_state_warn_ns,
+                now_ns(),
+            );
+        }};
+    }
     let mut regime_last = strategy_core::RegimeCounters::default();
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
@@ -5008,6 +5077,15 @@ where
             // not an observability option.
             eng.maybe_flush_fill_capture(now);
             eng.maybe_flush_order_capture(now);
+            // F21: and the members' own persisted state, for the same
+            // reason. It used to sit inside `if let (Some(reg),
+            // Some(ids)) = (obs.metrics, obs.counter_ids)`, which made
+            // POSITION PERSISTENCE depend on `--metrics` — a flag that
+            // is on by default and is therefore exactly the kind of
+            // coupling nobody notices until it is off. Capture flushes
+            // were hoisted out of that gate deliberately; these belong
+            // beside them.
+            flush_member_state!();
 
             let ticks = eng.ticks_dispatched;
             let signals = eng.signals_dispatched;
@@ -5058,20 +5136,7 @@ where
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
-                write_vrp_state_if_changed(
-                    vrp_state_path.as_deref(),
-                    eng.strategy(),
-                    &mut vrp_state_epoch,
-                    &mut vrp_state_buf,
-                );
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
-                write_xsd_state_if_changed(
-                    xsd_sink.as_ref(),
-                    eng.strategy(),
-                    &mut xsd_state_epoch,
-                    &mut xsd_state_buf,
-                    &mut xsd_views,
-                );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
 
                 // Per-ingress connection state — real per-thread
@@ -5223,6 +5288,17 @@ where
         std::thread::yield_now();
     }
 
+    // F18: THE DRAIN LAW. The restart lane SIGTERMs five times a UTC
+    // day and the state writer ran only on the 5 s report cadence, so
+    // up to five seconds of campaign state was lost at every one of
+    // them. The 00:10Z slot sits ON the edge of the VRP decision band
+    // `[E−τ, E−τ+selection]`: an entry at 00:09:57 with the drain at
+    // 00:10:00 was never written, the reboot restored `entry_done = 0`,
+    // and the campaign came back as an orphaned option and hedge that
+    // nothing would re-hedge or settle.
+    //
+    // Unconditional, and a no-op on an unchanged epoch.
+    flush_member_state!();
     eng.stop();
     let total = EngineLoopResult::Done(EngineLoopStats {
         iterations: eng.iterations,

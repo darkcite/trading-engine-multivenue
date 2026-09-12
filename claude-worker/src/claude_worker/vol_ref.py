@@ -34,6 +34,8 @@ The law itself (all scalings pinned, ``docs/research`` build card 2.3)::
     har_tau  = isqrt((rv60^2/60 + rv240^2/240 + rv1440^2/1440) / 3 * tau_min)
     x        = ln(har_tau)                                x 1e9
     y        = ln(realised vol over the hold)             x 1e9, same domain
+               formed by realised_since_arm_1e9 / realised_rv_1e9 -- the
+               hold's OWN returns -- and never by har_1e9, a forecast (F1)
     b        = sum(dx*dy) * 1e9 / sum(dx*dx)              x 1e9
     a        = ybar - b*xbar/1e9                          x 1e9
     ln_sig   = a + b*x/1e9                                x 1e9
@@ -198,6 +200,10 @@ class VolEngine:
         self.pend_x_1e9 = 0
         self.pend_ln_sigma_1e9 = None
         self.pend_rv_iv_1e9 = 0
+        # F1: the armed hold's realised window, [pend_arm_k,
+        # pend_arm_k + pend_tau_min) in global minute indices.
+        self.pend_arm_k = 0
+        self.pend_tau_min = 0
         self.armed = False
         self.fitted = False
 
@@ -289,6 +295,10 @@ class VolEngine:
         t = tenor_of(tau_ns)
         if x is None or t is None:
             return None
+        # F1: the realised window opens at the NEXT minute to close, so
+        # it can never contain a minute that closed before the entry.
+        self.pend_arm_k = self.minutes
+        self.pend_tau_min = t[0]
         self.pend_x_1e9 = x
         self.pend_ln_sigma_1e9 = self.ln_sigma_hat_1e9(tau_ns)
         if mark_iv_1e9 > 0:
@@ -298,6 +308,36 @@ class VolEngine:
             self.pend_rv_iv_1e9 = 0
         self.armed = True
         return x
+
+    def realised_since_arm_1e9(self):
+        """Realised vol of the ARMED hold, raw bps x1e9.
+
+        ``isqrt(sum r_k^2)`` over the ``pend_tau_min`` returns pushed
+        since ``arm_hold`` -- the same quantity ``vrp_seed.realised_rv_1e9``
+        forms from ``candles.db``, and NOT ``har_1e9``, which is a
+        forecast (F1).
+
+        ``None`` when nothing is armed, when fewer than ``tau_min``
+        returns have arrived (the hold is not over), or when the oldest
+        of them has left the ring.
+        """
+        if not self.armed or self.pend_tau_min <= 0:
+            return None
+        tau = self.pend_tau_min
+        elapsed = self.minutes - self.pend_arm_k
+        if elapsed < tau or elapsed > MINUTE_RING:
+            return None
+        acc = 0
+        for k in range(self.pend_arm_k, self.pend_arm_k + tau):
+            r = self.ret_1e9[k % MINUTE_RING]
+            acc += r * r
+        rv = isqrt_i64(acc)
+        return rv if rv > 0 else None
+
+    def disarm(self):
+        """F4: drop an armed hold without forming a pair -- the submit
+        the arm was made for did not happen."""
+        self.armed = False
 
     def seed_pair(self, x_1e9, y_1e9):
         """Append a pre-formed pair (the V5 boot seed) and refit."""

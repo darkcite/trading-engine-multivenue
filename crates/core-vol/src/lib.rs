@@ -31,6 +31,13 @@
 //! iv_lo/hi   = exp(ln σ̂ ∓ θ) × ANNUALISE / 1e13            annualised fraction ×1e9
 //! ```
 //!
+//! `y` is formed by [`VolEngine::realised_since_arm_1e9`] — the sum of
+//! the hold's OWN returns — and NEVER by [`VolEngine::har_1e9`], which
+//! is a forecast. Regressing a forecast on itself drives the fitted
+//! slope toward 1 as live pairs displace seed pairs and turns kill
+//! criterion 3 into a tautology; the live host read `qlike_har`
+//! 0.000362 against `qlike_iv` 0.1255 for exactly that reason.
+//!
 //! `x` and `y` are both `ln` of a RAW `bps×1e9` integer, so the constant
 //! `ln(1e13)` they share is absorbed into the intercept `a` and cancels
 //! out of every forecast. That is deliberate: it removes a
@@ -182,6 +189,17 @@ pub struct VolEngine {
     last_min_ts_ms: u64,
     /// Per-minute returns, bps ×1e9.
     ret_1e9: [i64; MINUTE_RING],
+    /// F3: the minute each return belongs to, ms since the epoch, in
+    /// step with [`Self::ret_1e9`]. `0` = unstamped (the legacy
+    /// [`Self::on_minute_close`] path and the parity fixture).
+    ///
+    /// 12 KiB, and it buys the one thing a fabricated stamp cannot: a
+    /// persisted window whose minutes are the minutes that happened.
+    /// `render_state` used to back-derive them as
+    /// `last − (n−1−i)·60 000`, which labels every hole contiguous —
+    /// and there is a hole at every boot. The merge against the
+    /// worker's seed then let the shifted series win.
+    ret_ts_ms: [u64; MINUTE_RING],
     /// Fitted pairs, ×1e9.
     pair_x_1e9: [i64; PAIR_RING],
     pair_y_1e9: [i64; PAIR_RING],
@@ -205,6 +223,17 @@ pub struct VolEngine {
     pend_x_1e9: i64,
     pend_ln_sigma_1e9: i64,
     pend_rv_iv_1e9: i64,
+    /// F1: the global minute index at which the armed hold began —
+    /// `minutes` as of [`Self::arm_hold_at`]. The hold's realised
+    /// window is `[pend_arm_k, pend_arm_k + pend_tau_min)`: exactly the
+    /// returns that closed INSIDE the hold, never one from before it.
+    pend_arm_k: u64,
+    /// F1: τ of the armed hold in minutes; `0` until something arms.
+    pend_tau_min: u32,
+    /// F3: returns whose minute was not `last + 60 000` — a splice in
+    /// the window. COUNTED, never reset: the roll law is unchanged (the
+    /// W-plan §8 kept it), but a spliced window is no longer invisible.
+    gaps: u64,
     /// Whether a hold is armed, and whether the fit is usable.
     armed: bool,
     fitted: bool,
@@ -228,6 +257,7 @@ impl VolEngine {
             prev_px_1e6: 0,
             last_min_ts_ms: 0,
             ret_1e9: [0; MINUTE_RING],
+            ret_ts_ms: [0; MINUTE_RING],
             pair_x_1e9: [0; PAIR_RING],
             pair_y_1e9: [0; PAIR_RING],
             pair_ts_ms: [0; PAIR_RING],
@@ -241,6 +271,9 @@ impl VolEngine {
             pend_x_1e9: 0,
             pend_ln_sigma_1e9: 0,
             pend_rv_iv_1e9: 0,
+            pend_arm_k: 0,
+            pend_tau_min: 0,
+            gaps: 0,
             armed: false,
             fitted: false,
         }
@@ -297,7 +330,19 @@ impl VolEngine {
     fn push_return(&mut self, r: i64, min_ts_ms: u64) {
         let k = self.minutes; // this return's global index
         let slot = (k % MINUTE_RING as u64) as usize;
+        // F3: a minute that is not the one after the last is a SPLICE —
+        // a restart's hole, a re-seed, a feed outage. Count it; do not
+        // reset, because the rolling sums stay exact either way and the
+        // operator's question is "is this window continuous", not "is it
+        // valid".
+        if min_ts_ms > 0
+            && self.last_min_ts_ms > 0
+            && min_ts_ms != self.last_min_ts_ms + 60_000
+        {
+            self.gaps = self.gaps.wrapping_add(1);
+        }
         self.ret_1e9[slot] = r;
+        self.ret_ts_ms[slot] = min_ts_ms;
         let sq = r as i128 * r as i128;
 
         let mut w = 0usize;
@@ -315,6 +360,34 @@ impl VolEngine {
         // fixture) and must never clobber a real stamp.
         if min_ts_ms > 0 {
             self.last_min_ts_ms = min_ts_ms;
+        }
+    }
+
+    /// F3: returns whose minute was not contiguous with the one before
+    /// it. Non-zero means the persisted window is spliced — which is
+    /// normal after a restart and a problem if it keeps climbing.
+    #[inline]
+    #[must_use]
+    pub const fn gaps(&self) -> u64 {
+        self.gaps
+    }
+
+    /// F3: the close the next return will be formed against; `0` when
+    /// no close has been seen.
+    #[inline]
+    #[must_use]
+    pub const fn prev_px_1e6(&self) -> i64 {
+        self.prev_px_1e6
+    }
+
+    /// F3: restore the close the next return is formed against, so the
+    /// FIRST live close after a restart forms a return instead of only
+    /// priming `prev_px`. Without it every boot drops a minute — five a
+    /// day on the standing restart lane — and the rendered file labels
+    /// the hole contiguous.
+    pub fn seed_prev_px(&mut self, px_1e6: i64) {
+        if px_1e6 > 0 {
+            self.prev_px_1e6 = px_1e6;
         }
     }
 
@@ -339,15 +412,21 @@ impl VolEngine {
 
     /// W1: the `i`-th retained return in CHRONOLOGICAL order, oldest
     /// first — the order [`Self::seed_return`] wants them back in.
+    ///
+    /// F3: `(min_ts_ms, r_1e9)`. The stamp is the minute the return was
+    /// pushed WITH, never one derived from position in the ring; `0`
+    /// means the return arrived unstamped and a writer must skip it
+    /// rather than invent a minute for it.
     #[inline]
     #[must_use]
-    pub fn ret_chrono(&self, i: usize) -> Option<i64> {
+    pub fn ret_chrono(&self, i: usize) -> Option<(u64, i64)> {
         let n = self.n_returns();
         if i >= n {
             return None;
         }
         let oldest = self.minutes - n as u64;
-        Some(self.ret_1e9[((oldest + i as u64) % MINUTE_RING as u64) as usize])
+        let slot = ((oldest + i as u64) % MINUTE_RING as u64) as usize;
+        Some((self.ret_ts_ms[slot], self.ret_1e9[slot]))
     }
 
     /// W1: whether the HAR can forecast at all. False is the state the
@@ -418,7 +497,13 @@ impl VolEngine {
             return None;
         }
         let x = self.x_1e9(tau_ns)?;
-        Some(self.a_1e9 + ((self.b_1e9 as i128 * x as i128) / 1_000_000_000) as i64)
+        // F5: FLOOR, not truncate. Python's `//` floors and this line
+        // is half of the parity contract; `b` is negative whenever the
+        // fitted cloud slopes down, and `/` would round the other way
+        // on exactly those fits.
+        let scaled =
+            core_regime::math::floor_div(self.b_1e9 as i128 * x as i128, 1_000_000_000);
+        Some(self.a_1e9 + scaled as i64)
     }
 
     /// The regressor `x = ln(har_τ)` ×1e9. Public because the parity
@@ -484,6 +569,12 @@ impl VolEngine {
     ) -> Option<i64> {
         let x = self.x_1e9(tau_ns)?;
         let t = tenor_of(tau_ns)?;
+        // F1: the realised window opens at the NEXT minute to close.
+        // `minutes` is the index `push_return` will write next, so the
+        // hold owns `[pend_arm_k, pend_arm_k + tau_min)` and can never
+        // include a minute that closed before the entry decision.
+        self.pend_arm_k = self.minutes;
+        self.pend_tau_min = t.tau_min as u32;
         self.pend_expiry_ms = expiry_ts_ms;
         self.pend_x_1e9 = x;
         // The fit may not exist yet; the pair is still worth forming,
@@ -510,6 +601,71 @@ impl VolEngine {
     #[must_use]
     pub const fn is_armed(&self) -> bool {
         self.armed
+    }
+
+    /// F1: the realised vol of the ARMED hold, raw `bps ×1e9` —
+    /// `isqrt(Σ r_k²)` over the `pend_tau_min` returns pushed since
+    /// [`Self::arm_hold_at`].
+    ///
+    /// This is the `y` the worker's seed cutter forms
+    /// (`vrp_seed.realised_rv_1e9`): the same quantity, over the same
+    /// returns, in the same raw domain. It is NOT [`Self::har_1e9`],
+    /// which is a FORECAST — see the crate header for what pairing a
+    /// forecast with itself did to the live fit.
+    ///
+    /// `None` when nothing is armed; when fewer than `tau_min` returns
+    /// have arrived since the arm (the hold is not over, and a short
+    /// window is not a realised vol — ABSENT DATA HOLDS); or when the
+    /// oldest return of the window has already left the ring, which
+    /// takes a settlement more than `MINUTE_RING − tau_min` minutes
+    /// late.
+    ///
+    /// Cold path: once per campaign, at most [`MINUTE_RING`] adds.
+    #[must_use]
+    pub fn realised_since_arm_1e9(&self) -> Option<i64> {
+        if !self.armed {
+            return None;
+        }
+        let tau = self.pend_tau_min as u64;
+        if tau == 0 {
+            return None;
+        }
+        let have = self.minutes.saturating_sub(self.pend_arm_k);
+        if have < tau {
+            return None;
+        }
+        // The oldest return of the window sits at index `pend_arm_k`
+        // and the ring retains `[minutes − MINUTE_RING, minutes)`, so
+        // this one compare covers the whole window.
+        if self.minutes - self.pend_arm_k > MINUTE_RING as u64 {
+            return None;
+        }
+        let mut acc: i128 = 0;
+        let mut k = self.pend_arm_k;
+        let end = self.pend_arm_k + tau;
+        while k < end {
+            let r = self.ret_1e9[(k % MINUTE_RING as u64) as usize] as i128;
+            acc += r * r;
+            k += 1;
+        }
+        let rv = core_regime::math::isqrt_i128(acc);
+        if rv <= 0 {
+            None
+        } else {
+            Some(rv)
+        }
+    }
+
+    /// F4: drop an armed hold WITHOUT forming a pair — the submit that
+    /// the arm was made for did not happen.
+    ///
+    /// [`Self::arm_hold_at`] necessarily runs before the order goes
+    /// out, because the `x` has to be formed from minutes that closed
+    /// before the entry. If the submit then fails, the engine is armed
+    /// against a position that does not exist, and the next settlement
+    /// would pair that `x` with a hold nobody held.
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 
     /// Append a pre-formed `(x, y)` pair — the V5 boot seed, where the
@@ -708,7 +864,12 @@ impl VolEngine {
 pub fn qlike_1e9(ln_rv_1e9: i64, ln_sigma_1e9: i64) -> i64 {
     let ln_u = (ln_rv_1e9 - ln_sigma_1e9).saturating_mul(2);
     // ×1e9 output via the scaling identity in `fx`.
-    let arg = (ln_u as i128 * 1_000_000_000) / fx::LN2_1E9 as i128 + fx::LOG2_1E9_1E9 as i128;
+    // F5: FLOOR, not truncate. `ln_u` is negative on every settlement
+    // whose realised vol came in under the forecast — about half of
+    // them — and `/` truncates toward zero there while the Python
+    // mirror floors.
+    let arg = core_regime::math::floor_div(ln_u as i128 * 1_000_000_000, fx::LN2_1E9 as i128)
+        + fx::LOG2_1E9_1E9 as i128;
     let u = if arg < 0 {
         0
     } else if arg > i64::MAX as i128 {
@@ -798,8 +959,11 @@ mod tests {
         // it back the way `restore_state` will.
         let mut restored = VolEngine::new();
         let mut i = 0usize;
-        while let Some(r) = live.ret_chrono(i) {
-            restored.seed_return(r, T0 + (2_000 - MINUTE_RING + i) as u64 * 60_000);
+        // F3: the stamp comes back off the ring with the return, so
+        // the restored window carries the minutes that happened rather
+        // than minutes derived from a position in an array.
+        while let Some((ts, r)) = live.ret_chrono(i) {
+            restored.seed_return(r, ts);
             i += 1;
         }
         assert_eq!(i, MINUTE_RING);
@@ -853,8 +1017,17 @@ mod tests {
         assert_eq!(e.minutes(), MINUTE_RING as u64 + 500);
         assert_eq!(e.n_returns(), MINUTE_RING, "bounded by the ring, not by history");
         // The oldest SURVIVOR is 500, and the newest is the last pushed.
-        assert_eq!(e.ret_chrono(0), Some(500));
-        assert_eq!(e.ret_chrono(MINUTE_RING - 1), Some(MINUTE_RING as i64 + 499));
+        assert_eq!(
+            e.ret_chrono(0),
+            Some((1_789_000_000_000 + 500 * 60_000, 500))
+        );
+        assert_eq!(
+            e.ret_chrono(MINUTE_RING - 1),
+            Some((
+                1_789_000_000_000 + (MINUTE_RING as u64 + 499) * 60_000,
+                MINUTE_RING as i64 + 499
+            ))
+        );
         assert_eq!(e.ret_chrono(MINUTE_RING), None, "past the ring is None");
         // Strictly increasing across the wrap — the order is the point.
         let mut i = 1usize;
@@ -862,6 +1035,8 @@ mod tests {
             assert!(e.ret_chrono(i) > e.ret_chrono(i - 1), "out of order at {i}");
             i += 1;
         }
+        // Contiguous the whole way, so nothing was counted as a splice.
+        assert_eq!(e.gaps(), 0);
     }
 
     /// A stamp of 0 means "no clock" and must never clobber a real one:
@@ -1196,6 +1371,215 @@ mod tests {
         e.arm_hold(TAU_8H, 600_000_000).expect("armed");
         e.observe_settlement(1_200_000_000_000);
         assert_eq!(e.pair_at(1).unwrap().0, 0);
+    }
+
+    // ---------------- F1/F4/F5: the settlement y ----------------
+
+    /// The `y` a settlement forms must be the realised vol of the hold
+    /// the member actually held — the sum of that window's OWN returns —
+    /// and nothing else. This test recomputes it by hand from
+    /// `ret_chrono` so a change to the ring maths cannot quietly agree
+    /// with itself.
+    #[test]
+    fn realised_since_arm_is_the_sum_of_the_holds_own_returns() {
+        let mut e = VolEngine::new();
+        assert_eq!(e.realised_since_arm_1e9(), None, "nothing armed");
+        walk(&mut e, 1_600, 7);
+        let before = e.minutes();
+        e.arm_hold(TAU_8H, 600_000_000).expect("armed");
+        assert_eq!(
+            e.realised_since_arm_1e9(),
+            None,
+            "a hold that has not run is not a realised vol"
+        );
+        let tau_min = tenor_of(TAU_8H).unwrap().tau_min as usize;
+        walk(&mut e, tau_min, 9);
+        assert_eq!(e.minutes(), before + tau_min as u64);
+
+        // By hand, from the chronological view: the last `tau_min`
+        // returns are exactly the hold's.
+        let n = e.n_returns();
+        let mut acc: i128 = 0;
+        let mut i = n - tau_min;
+        while i < n {
+            let r = e.ret_chrono(i).unwrap().1 as i128;
+            acc += r * r;
+            i += 1;
+        }
+        let want = core_regime::math::isqrt_i128(acc);
+        assert!(want > 0);
+        assert_eq!(e.realised_since_arm_1e9(), Some(want));
+
+        // Minutes past the hold belong to the next campaign, not this
+        // one: the window is closed, not trailing.
+        let fixed = e.realised_since_arm_1e9();
+        walk(&mut e, 10, 11);
+        assert_eq!(e.realised_since_arm_1e9(), fixed, "the window is closed");
+
+        // And it is emphatically not the forecast.
+        assert_ne!(
+            e.realised_since_arm_1e9(),
+            e.har_1e9(TAU_8H),
+            "y must not be har_1e9 — that is F1"
+        );
+
+        // Settling with it forms the pair and disarms.
+        let y_rv = e.realised_since_arm_1e9().unwrap();
+        let pairs = e.n_pairs();
+        e.observe_settlement(y_rv);
+        assert_eq!(e.n_pairs(), pairs + 1);
+        assert!(!e.is_armed());
+        assert_eq!(e.pair_at(pairs).unwrap().2, fx::ln_1e9(y_rv as u64));
+        assert_eq!(e.realised_since_arm_1e9(), None, "disarmed");
+    }
+
+    /// A settlement that arrives so late the hold has left the ring has
+    /// no realised vol to report. ABSENT DATA HOLDS: it must say so
+    /// rather than sum whatever happens to sit in those slots now.
+    #[test]
+    fn realised_since_arm_is_none_once_the_window_is_evicted() {
+        let mut e = VolEngine::new();
+        walk(&mut e, 1_500, 13);
+        e.arm_hold(TAU_8H, 600_000_000).expect("armed");
+        let arm_k = e.minutes();
+        walk(&mut e, 480, 17);
+        assert!(e.realised_since_arm_1e9().is_some(), "resident");
+        // Walk until the oldest minute of the hold is exactly the
+        // oldest the ring still holds — the last resident instant.
+        walk(&mut e, MINUTE_RING - 480, 19);
+        assert_eq!(e.minutes() - arm_k, MINUTE_RING as u64);
+        assert!(
+            e.realised_since_arm_1e9().is_some(),
+            "the boundary minute is still resident"
+        );
+        walk(&mut e, 1, 23);
+        assert_eq!(
+            e.realised_since_arm_1e9(),
+            None,
+            "one minute past the ring and the window is gone"
+        );
+    }
+
+    /// F4: `arm_hold_at` has to run before the submit, because `x` may
+    /// only see minutes that closed before the entry. A submit that
+    /// then fails must leave nothing armed, or the next settlement
+    /// pairs that `x` with a hold nobody held.
+    #[test]
+    fn disarm_drops_the_hold_without_forming_a_pair() {
+        let mut e = VolEngine::new();
+        walk(&mut e, 1_600, 29);
+        e.arm_hold(TAU_8H, 600_000_000).expect("armed");
+        assert!(e.is_armed());
+        e.disarm();
+        assert!(!e.is_armed());
+        assert_eq!(e.n_pairs(), 0);
+        assert_eq!(e.realised_since_arm_1e9(), None);
+        // And the settlement that would have followed changes nothing.
+        e.observe_settlement(1_200_000_000_000);
+        assert_eq!(e.n_pairs(), 0, "a disarmed hold forms no pair");
+        assert_eq!(e.n_qlike(), 0);
+    }
+
+    /// F5: both sides of the parity contract FLOOR. These are the two
+    /// signed intermediates where Rust's `/` and Python's `//` disagree,
+    /// pinned against the floored value AND against the truncating one
+    /// so the test would fail if the fix were reverted.
+    #[test]
+    fn the_two_signed_divisions_floor_like_the_python_mirror() {
+        // (a) ln_sigma_hat with a NEGATIVE slope. Build a cloud that
+        // slopes down, so `b < 0` and `b·x` is negative.
+        let mut e = VolEngine::new();
+        walk(&mut e, 1_600, 31);
+        let mut i = 0i64;
+        while i < MIN_PAIRS as i64 {
+            // x rises, y falls: a real downward fit.
+            e.seed_pair(24_000_000_000 + i * 7_000_001, 28_000_000_000 - i * 3_000_007);
+            i += 1;
+        }
+        let (a, b) = e.fit().expect("fitted");
+        assert!(b < 0, "the cloud must slope down: b = {b}");
+        let x = e.x_1e9(TAU_8H).expect("x");
+        let prod = b as i128 * x as i128;
+        assert!(prod < 0, "the intermediate must be negative");
+        let floored = a + core_regime::math::floor_div(prod, 1_000_000_000) as i64;
+        let truncated = a + (prod / 1_000_000_000) as i64;
+        assert_eq!(e.ln_sigma_hat_1e9(TAU_8H), Some(floored));
+        assert_ne!(floored, truncated, "the fixture must separate the two laws");
+
+        // (b) qlike with ln_rv < ln_sigma, i.e. a NEGATIVE ln_u — every
+        // settlement whose realised vol came in under the forecast.
+        let ln_rv = 27_000_000_001i64;
+        let ln_sigma = 27_400_000_000i64;
+        let ln_u = (ln_rv - ln_sigma).saturating_mul(2);
+        assert!(ln_u < 0);
+        let arg_floor =
+            core_regime::math::floor_div(ln_u as i128 * 1_000_000_000, fx::LN2_1E9 as i128)
+                + fx::LOG2_1E9_1E9 as i128;
+        let arg_trunc = (ln_u as i128 * 1_000_000_000) / fx::LN2_1E9 as i128
+            + fx::LOG2_1E9_1E9 as i128;
+        assert_ne!(arg_floor, arg_trunc, "the inputs must separate the two laws");
+        let want = i64::try_from(fx::exp2_1e9(arg_floor as i64))
+            .unwrap_or(i64::MAX)
+            .saturating_sub(ln_u)
+            .saturating_sub(1_000_000_000);
+        assert_eq!(qlike_1e9(ln_rv, ln_sigma), want);
+    }
+
+    /// F3: a spliced window carries the minutes that happened, says so,
+    /// and comes back the same on the other side of a restart.
+    #[test]
+    fn a_reseeded_window_carries_real_stamps_and_counts_its_holes() {
+        const T0: u64 = 1_789_000_000_000;
+        let mut e = VolEngine::new();
+        e.seed_return(100, T0);
+        e.seed_return(200, T0 + 60_000);
+        assert_eq!(e.gaps(), 0, "contiguous so far");
+        // A three-minute hole — a restart, a feed outage, a re-seed.
+        e.seed_return(300, T0 + 4 * 60_000);
+        assert_eq!(e.gaps(), 1, "the splice is visible");
+        e.seed_return(400, T0 + 5 * 60_000);
+        assert_eq!(e.gaps(), 1, "and is not counted twice");
+
+        // The stamps rendered are the stamps pushed, hole included —
+        // the old back-derived `last − (n−1−i)·60_000` labelled this
+        // series contiguous.
+        assert_eq!(e.ret_chrono(0), Some((T0, 100)));
+        assert_eq!(e.ret_chrono(2), Some((T0 + 4 * 60_000, 300)));
+        assert_eq!(e.last_min_ts_ms(), T0 + 5 * 60_000);
+
+        let mut back = VolEngine::new();
+        let mut i = 0usize;
+        while let Some((ts, r)) = e.ret_chrono(i) {
+            back.seed_return(r, ts);
+            i += 1;
+        }
+        assert_eq!(back.gaps(), 1, "the restored window has the same hole");
+        let mut j = 0usize;
+        while j < i {
+            assert_eq!(back.ret_chrono(j), e.ret_chrono(j), "slot {j}");
+            j += 1;
+        }
+    }
+
+    /// F3: without the persisted `prev_px` the first live close after a
+    /// restart only primes the engine, so every boot drops a minute —
+    /// five a day on the standing restart lane.
+    #[test]
+    fn the_first_live_close_after_a_restart_forms_a_return() {
+        let mut cold = VolEngine::new();
+        cold.on_minute_close_at(79_000_000_000, 1_789_000_000_000);
+        assert_eq!(cold.minutes(), 0, "a cold engine spends its first close");
+
+        let mut warm = VolEngine::new();
+        warm.seed_return(1_000, 1_789_000_000_000);
+        warm.seed_prev_px(79_000_000_000);
+        assert_eq!(warm.prev_px_1e6(), 79_000_000_000);
+        warm.on_minute_close_at(79_100_000_000, 1_789_000_060_000);
+        assert_eq!(warm.minutes(), 2, "the first live close formed a return");
+        assert_eq!(warm.gaps(), 0, "and it was contiguous");
+        // A non-positive seed is ignored rather than trusted.
+        warm.seed_prev_px(0);
+        assert_eq!(warm.prev_px_1e6(), 79_100_000_000);
     }
 
     #[test]
