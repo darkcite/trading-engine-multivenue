@@ -6,6 +6,107 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `core-vol` gains the 15 m tenor and a fourth HAR window; 4 h/8 h bit-identical; `sigma_hat_1e9`; IV-optional arming pinned (BIN15 O4a)
+
+**No wire layout, no on-disk format, no config key, no restart.** The
+persisted vol window is a series of RETURNS (`ret_chrono` out,
+`seed_return` in) and the rolling sums are rebuilt from it, so the new
+15-minute sum warms itself on the next boot from the file that is
+already there. Nothing to migrate; this entry exists because a HAR
+window is a law, and because the 4 h/8 h forecast had to be proved
+unmoved rather than asserted.
+
+**What changed**
+
+- **`HAR_WINDOWS` is `[15, 60, 240, 1440]`** — the 15-minute term
+  appended at the FRONT, and `sum_sq` widened to four. `HAR_WARM_MINUTES`
+  is still the LAST element, so warm-up is still 1440 minutes.
+
+- **Which windows a tenor folds is now `Tenor::first_window`, not the
+  array's length.** 4 h and 8 h carry `first_window = 1`: they fold
+  `w ∈ {1, 2, 3}` — the same three squares over the same three windows
+  — and divide by the same 3. 15 m carries `0`: four terms over 4.
+  `har_1e9` divides by `HAR_WINDOWS.len() - first_window`, so the
+  divisor is not a literal any more and cannot drift from the fold.
+
+- **`tenor_of` accepts `900_000_000_000`** with
+  `ANNUALISE_15M_1E9 = 187_253_838_412`. That constant comes out of the
+  same 525 960-minute year as the other two and is rounded the same way:
+  `sqrt(525960/15) × 1e9 = 187_253_838_411.93`, against
+  `...602.98 → 46_813_459_603` (4 h) and `...736.07 → 33_102_114_736`
+  (8 h). A test reproduces all three from `isqrt(525960/τ_min × 1e18)`.
+  The doc above `tenor_of` now says WHY 15 m is allowed where 12 h is
+  not: kill criterion 4 forbids the longer *IV* cells because E1 is
+  measured at 4 h/8 h and gone by 12 h; BIN15's comparator is a venue's
+  binary book, not an implied vol, so kill-4 does not bind it.
+
+- **`VolEngine::sigma_hat_1e9(tau_ns)`** — `exp(ln σ̂)`, raw `bps ×1e9`,
+  no annualiser and no band. `bounds` exists for the VRP lane, which
+  compares against a Deribit implied vol; BIN15 needs the per-τ vol
+  itself to build a per-minute variance for its binary pricer. Same
+  saturation law as `annualised_1e9` (both ends of `exp_1e9`'s range
+  mean "the fit ran off the table"), and a cold-path contract: once per
+  minute per underlying, never per tick.
+
+- **IV-optional arming is PINNED, not added.** `arm_hold_at_with_offset`
+  already stored `pend_rv_iv_1e9 = 0` for `mark_iv_1e9 <= 0`, and
+  `observe_settlement` already scored QLIKE only when
+  `pend_rv_iv_1e9 > 0`. A HIP-4 outcome market has no implied vol, so
+  that is the normal BIN15 case, and it is now a documented law with a
+  test on both sides: the hold still forms its `(x, y)` pair and still
+  refits — that is the forecast the member trades — and scores NO QLIKE
+  row, because scoring a zero would make the HAR look infinitely better
+  than an IV nobody quoted.
+
+**BIT-IDENTITY GUARD — PASSED, and stronger than a diff.** The
+instruction was to regenerate `parity-1` and diff every 4 h/8 h row
+against HEAD's. Instead the file was **never regenerated**:
+`claude-worker/tests/fixtures/vol/parity-1.expected.tsv` is untouched at
+its HEAD bytes and both halves of the parity pair are green against it
+(`cargo nextest run -p core-vol --test parity`, `uv run pytest
+tests/test_vol_ref.py`). A file that was never written cannot have been
+written back to the same content by accident, so this proves what a diff
+would have proved and one thing more.
+
+To keep it provable, `CORE_VOL_PARITY_WRITE` now takes a FIXTURE NAME
+(`=parity-15m`); `=1` still writes all of them, for a deliberate law
+change. A lane adding a fixture names its own and cannot silently
+re-bless the other lane's tape.
+
+**New fixture `parity-15m`** (19 `Q` rows, 17 `G` rows, 1 658 closes, so
+the minute ring wraps): the cold row, a warm-ring-unfitted row, the fit,
+**eight IV-less holds settled from the engine's own window with
+`qlike_n` staying 0**, four IV-bearing holds taking it to 5, an `O`
+regime offset in force, a `D` disarm forming no pair, an explicit `S`
+settlement and a settlement with nothing armed. `G` is a NEW op with its
+OWN row shape (`row G sigma_hat ln_sigma_hat`) — deliberately not a new
+column on the `Q` row, because a column would have changed every
+`parity-1` row and destroyed the guard above.
+
+**Python mirror** (`claude_worker.vol_ref`): `HAR_WINDOWS`, `sum_sq`
+sized from it, `tenor_of` returning a 3-tuple `(tau_min, annualise_1e9,
+first_window)` — existing callers index `[0]`/`[1]` and are unaffected —
+`har_1e9` folding from `first_window`, and `sigma_hat_1e9`.
+
+**Operator-visible consequence, deliberate and worth knowing.**
+`tenor_of` is the validator for `vrp.toml`'s `tau_ns`
+(`core_config::vrp`) and for `Bin15Params`/`VrpParams` at boot. So a
+`vrp.toml` written with `tau_ns = 900000000000` is now ACCEPTED where it
+used to be refused. No existing file changes meaning and no live config
+uses that value; the VRP lane's own files were not touched. Flagged
+rather than guarded because the guard would have to live in
+`core-config::vrp`, which this lane must not edit, and because
+`tenor_of` is deliberately one shared list of the tenors the crate can
+forecast — not a per-lane allow-list.
+
+**Tests pinning it:** `the_15m_window_is_additive_for_the_longer_tenors`
+(folds the three long windows by hand and demands `har_1e9` to the unit,
+then demands 15 m differ), `sigma_hat_is_the_exponential_of_the_log_forecast`,
+`an_iv_less_hold_forms_a_pair_and_no_qlike_row`,
+`only_the_measured_tenors_exist` (extended with the `first_window` split
+and the annualiser reproduction) — each with a same-named mirror in
+`claude-worker/tests/test_vol_ref.py`.
+
 ## 2026-09-12 — harness: the HIP-4 price/size grid, per-instance binary settlement from `InstrumentRoll` + `Mark`, charge-once on the settlement leg (BIN15 O3)
 
 **Offline only.** No engine code, no wire layout, no capture file, no

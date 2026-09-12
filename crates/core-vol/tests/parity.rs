@@ -5,12 +5,19 @@
 //!
 //! Consumes `claude-worker/tests/fixtures/vol/parity-<n>.input.tsv` — a
 //! tape of ops (close, seed pair, arm, settle, settle-from-ring,
-//! disarm, emit) — and asserts every
+//! disarm, emit, sigma-emit) — and asserts every
 //! emitted state row against `parity-<n>.expected.tsv`, the SAME pair
 //! `claude-worker/tests/test_vol_ref.py` checks. The expected file is
-//! (re)written by THIS harness under `CORE_VOL_PARITY_WRITE=1`: the
-//! engine's code is the law, and the worker follows it. A change in
+//! (re)written by THIS harness under
+//! `CORE_VOL_PARITY_WRITE=<fixture name>` — or `=1` for ALL of them:
+//! the engine's code is the law, and the worker follows it. A change in
 //! either implementation shows up as a red on one side.
+//!
+//! **Regenerate ONE fixture, not all of them.** `parity-1` is the VRP
+//! lane's 8 h tape and its rows are a standing bit-identity guard
+//! (BIN15 O4a added a 15-minute HAR term and proved it additive by
+//! leaving that file untouched and still green). `=1` exists for a
+//! deliberate law change; a lane adding a fixture names its own.
 //!
 //! Why a shared fixture and not two independent test suites: the seed
 //! the engine boots with (V5) is cut by the Python, and the pairs the
@@ -27,7 +34,7 @@ const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../claude-worker/tests/fixtures/vol/"
 );
-const FIXTURES: [&str; 1] = ["parity-1"];
+const FIXTURES: [&str; 2] = ["parity-1", "parity-15m"];
 
 fn opt(v: Option<i64>) -> String {
     match v {
@@ -78,6 +85,17 @@ fn run(name: &str) -> Vec<String> {
                 e.observe_settlement(rv);
             }
             "D" => e.disarm(),
+            // BIN15 O4a: σ̂ over τ, the raw per-τ vol the binary pricer
+            // consumes. Its own row shape, so a tape without `G` —
+            // `parity-1` — keeps rows the VRP lane already pinned.
+            "G" => {
+                out.push(format!(
+                    "{row}\tG\t{}\t{}",
+                    opt(e.sigma_hat_1e9(tau_ns)),
+                    opt(e.ln_sigma_hat_1e9(tau_ns)),
+                ));
+                row += 1;
+            }
             "Q" => {
                 let (a, b) = match e.fit() {
                     Some((a, b)) => (Some(a), Some(b)),
@@ -118,12 +136,14 @@ fn run(name: &str) -> Vec<String> {
 fn check(name: &str) {
     let got = run(name);
     let expected = format!("{FIXTURE_DIR}{name}.expected.tsv");
-    if std::env::var("CORE_VOL_PARITY_WRITE").as_deref() == Ok("1") {
+    let write = std::env::var("CORE_VOL_PARITY_WRITE").unwrap_or_default();
+    if write == "1" || write == name {
         let mut text = format!(
             "# {name}.expected.tsv — WRITTEN by crates/core-vol/tests/parity.rs \
-             (CORE_VOL_PARITY_WRITE=1).\n\
+             (CORE_VOL_PARITY_WRITE={name}).\n\
              # row minutes n_pairs har x a b ln_sigma_hat iv_lo iv_hi \
-             qlike_n qlike_iv qlike_har har_beats_iv armed realised\n"
+             qlike_n qlike_iv qlike_har har_beats_iv armed realised\n\
+             # a `G` row is instead: row G sigma_hat ln_sigma_hat\n"
         );
         for l in &got {
             text.push_str(l);

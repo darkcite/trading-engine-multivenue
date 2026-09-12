@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! r_k        = ret_bps_1e9(prev_close, close)             bps ×1e9
-//! rv_W       = isqrt( Σ_{k∈W} r_k² )                      W ∈ {60, 240, 1440}
+//! rv_W       = isqrt( Σ_{k∈W} r_k² )                  W ∈ {15, 60, 240, 1440}
 //! har_τ      = isqrt( (rv60²/60 + rv240²/240 + rv1440²/1440) / 3 × τ_min )
 //! x          = ln(har_τ)                                  ×1e9
 //! y          = ln(realised vol over the hold)              ×1e9, same domain
@@ -52,7 +52,7 @@
 //!   integer path is proved against the reference it replaced.
 //! * **Transcendentals happen at the per-expiry boundary, never per
 //!   tick.** [`VolEngine::on_minute_close`] is an add, a subtract and
-//!   three squares; the hot decision downstream is two `i64` compares.
+//!   four squares; the hot decision downstream is two `i64` compares.
 //! * **ABSENT DATA HOLDS.** Fewer than [`MIN_PAIRS`] fitted pairs, or a
 //!   minute ring not yet full, and [`VolEngine::bounds`] is `None`. It
 //!   never extrapolates, never back-fills, never guesses.
@@ -95,7 +95,15 @@ pub const MIN_PAIRS: usize = 60;
 pub const QLIKE_RING: usize = 60;
 
 /// The HAR component windows, in minutes.
-pub const HAR_WINDOWS: [usize; 3] = [60, 240, 1440];
+///
+/// BIN15 O4a appended the 15-minute term at the FRONT, and which
+/// windows a tenor folds is [`Tenor::first_window`], not this array's
+/// length: 4 h and 8 h start at index 1 and fold the same three terms
+/// they always did, so their forecast is bit-identical. Only the 15 m
+/// tenor folds all four (`docs/research/outcome/03-implementation-spec-2026-09-12.md`
+/// §6.1). The array stays ascending and its LAST element is still the
+/// warm-up length, so [`HAR_WARM_MINUTES`] is unchanged at 1440.
+pub const HAR_WINDOWS: [usize; 4] = [15, 60, 240, 1440];
 
 /// Nanoseconds in a minute.
 pub const MINUTE_NS: u64 = 60_000_000_000;
@@ -109,6 +117,16 @@ pub const ANNUALISE_4H_1E9: i64 = 46_813_459_603;
 /// `sqrt(365.25 × 3) × 1e9` — the 8 h annualiser.
 pub const ANNUALISE_8H_1E9: i64 = 33_102_114_736;
 
+/// `sqrt(525_960 / 15) × 1e9` — the 15 m annualiser (BIN15 O4a).
+///
+/// The same 525 960-minute year that produced the two above, rounded
+/// the same way: `sqrt(525960/240) × 1e9 = 46_813_459_602.98` →
+/// [`ANNUALISE_4H_1E9`], `sqrt(525960/480) × 1e9 = 33_102_114_736.07`
+/// → [`ANNUALISE_8H_1E9`], `sqrt(525960/15) × 1e9 =
+/// 187_253_838_411.93` → this. Stated as a constant because τ is fixed
+/// at boot and a runtime `sqrt` on the decision path would be a float.
+pub const ANNUALISE_15M_1E9: i64 = 187_253_838_412;
+
 /// A tenor the crate will forecast for: its length in minutes and the
 /// precomputed `1/sqrt(τ / 1 year)` that turns a realised vol over τ
 /// into an annualised fraction. Precomputed because τ is fixed at boot
@@ -120,21 +138,47 @@ pub struct Tenor {
     pub tau_min: i64,
     /// `1/sqrt(τ / 1 year) × 1e9`.
     pub annualise_1e9: i64,
+    /// The first index of [`HAR_WINDOWS`] this tenor folds.
+    ///
+    /// A component window longer than τ still carries information (that
+    /// is the HAR's whole claim), but a window SHORTER than the forecast
+    /// horizon by more than an order of magnitude is noise the longer
+    /// tenors were measured without. So 4 h and 8 h keep their three
+    /// terms (`1`) and the 15 m tenor takes all four (`0`).
+    pub first_window: u8,
 }
 
-/// The ONLY tenors this crate forecasts, and why: E1 is measured at 4 h
-/// and 8 h and is gone by 12 h (edge spec §1), so kill criterion 4
-/// forbids trading the longer cells. Anything else is `None`.
+/// The ONLY tenors this crate forecasts, and why.
+///
+/// 4 h and 8 h are the VRP lane's tenors: E1 (HAR beats implied vol) is
+/// measured there and gone by 12 h, so kill criterion 4 forbids the
+/// longer IV cells.
+///
+/// **15 m is the BIN15 lane's tenor: its comparator is a venue's binary
+/// book, not an implied vol, and kill-4 does not bind it**
+/// (`docs/research/outcome/03-implementation-spec-2026-09-12.md` §6).
+/// Its forecast is consumed by [`VolEngine::sigma_hat_1e9`] and priced
+/// against a HIP-4 outcome market; no `mark_iv` exists to compare, which
+/// is exactly why arming is IV-optional (see [`VolEngine::arm_hold_at`]).
+///
+/// Anything else is `None`.
 #[inline]
 pub const fn tenor_of(tau_ns: u64) -> Option<Tenor> {
     match tau_ns {
+        900_000_000_000 => Some(Tenor {
+            tau_min: 15,
+            annualise_1e9: ANNUALISE_15M_1E9,
+            first_window: 0,
+        }),
         14_400_000_000_000 => Some(Tenor {
             tau_min: 240,
             annualise_1e9: ANNUALISE_4H_1E9,
+            first_window: 1,
         }),
         28_800_000_000_000 => Some(Tenor {
             tau_min: 480,
             annualise_1e9: ANNUALISE_8H_1E9,
+            first_window: 1,
         }),
         _ => None,
     }
@@ -170,7 +214,7 @@ pub struct QlikeCounters {
 #[repr(C, align(64))]
 pub struct VolEngine {
     /// Rolling `Σ r²` over each of [`HAR_WINDOWS`], in step.
-    sum_sq: [i128; 3],
+    sum_sq: [i128; 4],
     /// Fitted slope and intercept ×1e9.
     b_1e9: i64,
     a_1e9: i64,
@@ -250,7 +294,7 @@ impl VolEngine {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            sum_sq: [0; 3],
+            sum_sq: [0; 4],
             b_1e9: 0,
             a_1e9: 0,
             minutes: 0,
@@ -280,9 +324,9 @@ impl VolEngine {
     }
 
     /// Feed one 1-minute close, ×1e6. The first call only seeds
-    /// `prev_px`; every later one forms a return and rolls the three
-    /// sums in O(1) — an add, three squares and (once the windows fill)
-    /// three subtracts. No division, no transcendental, no branch on
+    /// `prev_px`; every later one forms a return and rolls the four
+    /// sums in O(1) — an add, four squares and (once the windows fill)
+    /// four subtracts. No division, no transcendental, no branch on
     /// data beyond the window-warm tests.
     ///
     /// A non-positive close is IGNORED rather than trusted: it cannot
@@ -314,7 +358,7 @@ impl VolEngine {
     /// This is how a window survives a restart, and it takes RETURNS
     /// rather than closes on purpose. `sum_sq` is never read from a
     /// file — every restored return goes through the same push the live
-    /// path uses, so the three accumulators, the ring and `minutes`
+    /// path uses, so the four accumulators, the ring and `minutes`
     /// cannot disagree with each other by construction. A corrupt file
     /// can make the window WRONG; it cannot make it INCONSISTENT.
     ///
@@ -324,7 +368,7 @@ impl VolEngine {
         self.push_return(r_1e9, min_ts_ms);
     }
 
-    /// The ring write and the three rolling sums. One body, so the live
+    /// The ring write and the four rolling sums. One body, so the live
     /// path and the restore path cannot drift.
     #[inline]
     fn push_return(&mut self, r: i64, min_ts_ms: u64) {
@@ -467,6 +511,13 @@ impl VolEngine {
     /// domain. `None` until the longest window is full — a partial
     /// 1440-minute sum is not a day's realised vol, it is a smaller
     /// window wearing its name.
+    ///
+    /// BIN15 O4a: the fold starts at [`Tenor::first_window`] and divides
+    /// by the number of terms actually folded. For 4 h and 8 h that is
+    /// `w ∈ {1, 2, 3}` over three terms — the same three squares over
+    /// the same three windows, divided by the same 3 — so every 4 h/8 h
+    /// number this function ever returned is unchanged to the bit. The
+    /// 15 m tenor folds `w ∈ {0, 1, 2, 3}` and divides by 4.
     #[must_use]
     pub fn har_1e9(&self, tau_ns: u64) -> Option<i64> {
         let t = tenor_of(tau_ns)?;
@@ -474,14 +525,17 @@ impl VolEngine {
         if self.minutes < longest {
             return None;
         }
+        let first = t.first_window as usize;
+        debug_assert!(first < HAR_WINDOWS.len());
+        let terms = (HAR_WINDOWS.len() - first) as i128;
         let mut mean_sq: i128 = 0;
-        let mut w = 0usize;
+        let mut w = first;
         while w < HAR_WINDOWS.len() {
             let rv = core_regime::math::isqrt_i128(self.sum_sq[w]) as i128;
             mean_sq += rv * rv / HAR_WINDOWS[w] as i128;
             w += 1;
         }
-        let var_tau = mean_sq / 3 * t.tau_min as i128;
+        let var_tau = mean_sq / terms * t.tau_min as i128;
         let har = core_regime::math::isqrt_i128(var_tau);
         if har <= 0 {
             return None;
@@ -504,6 +558,32 @@ impl VolEngine {
         let scaled =
             core_regime::math::floor_div(self.b_1e9 as i128 * x as i128, 1_000_000_000);
         Some(self.a_1e9 + scaled as i64)
+    }
+
+    /// BIN15 O4a: `σ̂` over τ — the fitted forecast back out of the log
+    /// domain, raw `bps ×1e9`, i.e. `exp(ln σ̂)`.
+    ///
+    /// [`Self::bounds`] is the VRP lane's consumer and wants an
+    /// ANNUALISED fraction to compare with an implied vol. BIN15 has no
+    /// implied vol to compare: it needs the raw per-τ vol to build a
+    /// per-minute variance for its own pricer, so it takes `exp` and
+    /// nothing else — no annualiser, no band. `None` on exactly the same
+    /// conditions as [`Self::ln_sigma_hat_1e9`].
+    ///
+    /// Cold path by contract: the member calls it once per minute per
+    /// underlying, never per tick, because `exp_1e9` is the expensive
+    /// half of this crate.
+    #[must_use]
+    pub fn sigma_hat_1e9(&self, tau_ns: u64) -> Option<i64> {
+        let ln = self.ln_sigma_hat_1e9(tau_ns)?;
+        // The same saturation law as `annualised_1e9`: both ends of
+        // `exp_1e9`'s range mean "the fit ran off the table", and a
+        // saturated vol is not a forecast.
+        let sigma = fx::exp_1e9(ln);
+        if sigma == 0 || sigma == u64::MAX {
+            return None;
+        }
+        i64::try_from(sigma).ok().filter(|v| *v > 0)
     }
 
     /// The regressor `x = ln(har_τ)` ×1e9. Public because the parity
@@ -583,6 +663,17 @@ impl VolEngine {
 
     /// [`Self::arm_hold`], recording WHICH expiry the hold belongs to so
     /// the pair it forms can be written back out and read in again.
+    ///
+    /// **Arming is IV-optional** (BIN15 O4a pins it; the behaviour is
+    /// unchanged): `mark_iv_1e9 <= 0` means "no implied vol exists for
+    /// this instrument", which is the normal case for a HIP-4 outcome
+    /// market. Such a hold still forms its `(x, y)` pair and still
+    /// refits — that is the forecast the member trades — but it scores
+    /// NO QLIKE row, because kill criterion 3 compares the HAR against
+    /// a venue's implied vol and there is nothing to compare against.
+    /// Scoring a zero would make the HAR look infinitely better than an
+    /// IV nobody quoted. Pinned by
+    /// `an_iv_less_hold_forms_a_pair_and_no_qlike_row`.
     pub fn arm_hold_at(
         &mut self,
         expiry_ts_ms: u64,
@@ -926,10 +1017,11 @@ mod tests {
 
     const TAU_8H: u64 = 28_800_000_000_000;
     const TAU_4H: u64 = 14_400_000_000_000;
+    const TAU_15M: u64 = 900_000_000_000;
     const THETA: i64 = 100_000_000; // θ = 0.10
 
     /// A deterministic integer walk — no rng, no float, reproducible on
-    /// any host. `step` cycles a small pattern so the three windows see
+    /// any host. `step` cycles a small pattern so all four windows see
     /// genuinely different variance.
     fn walk(e: &mut VolEngine, minutes: usize, seed: i64) {
         let mut px = 79_000_000_000i64; // $79,000 ×1e6
@@ -1098,14 +1190,148 @@ mod tests {
     fn only_the_measured_tenors_exist() {
         // E1 lives at 4 h and 8 h and is gone by 12 h (edge spec §1);
         // kill criterion 4 forbids the longer cells. The crate refuses
-        // them rather than trusting a caller.
+        // them rather than trusting a caller. 15 m is BIN15's tenor and
+        // kill-4 does not bind it — its comparator is a binary book.
+        assert!(tenor_of(TAU_15M).is_some());
         assert!(tenor_of(TAU_4H).is_some());
         assert!(tenor_of(TAU_8H).is_some());
         assert!(tenor_of(43_200_000_000_000).is_none(), "12 h is not traded");
         assert!(tenor_of(86_400_000_000_000).is_none(), "24 h is not traded");
         assert!(tenor_of(0).is_none());
+        assert!(tenor_of(1_800_000_000_000).is_none(), "30 m is not a tenor");
         assert_eq!(tenor_of(TAU_8H).unwrap().tau_min, 480);
         assert_eq!(tenor_of(TAU_4H).unwrap().tau_min, 240);
+        assert_eq!(tenor_of(TAU_15M).unwrap().tau_min, 15);
+        // The window split IS the bit-identity contract.
+        assert_eq!(tenor_of(TAU_15M).unwrap().first_window, 0, "15 m folds all four");
+        assert_eq!(tenor_of(TAU_4H).unwrap().first_window, 1, "4 h skips the 15-min term");
+        assert_eq!(tenor_of(TAU_8H).unwrap().first_window, 1, "8 h skips the 15-min term");
+        // The annualisers all come out of the same 525 960-minute year:
+        // `isqrt(525960/tau_min * 1e18)` reproduces each to within the
+        // rounding of the last digit.
+        let mut i = 0usize;
+        while i < 3 {
+            let (tau, want) = match i {
+                0 => (TAU_15M, ANNUALISE_15M_1E9),
+                1 => (TAU_4H, ANNUALISE_4H_1E9),
+                _ => (TAU_8H, ANNUALISE_8H_1E9),
+            };
+            let t = tenor_of(tau).unwrap();
+            assert_eq!(t.annualise_1e9, want);
+            let repro = core_regime::math::isqrt_i128(
+                525_960i128 * 1_000_000_000_000_000_000 / t.tau_min as i128,
+            ) as i64;
+            assert!(
+                (t.annualise_1e9 - repro).abs() <= 1,
+                "tau_min {} annualiser {} vs reproduced {repro}",
+                t.tau_min,
+                t.annualise_1e9
+            );
+            i += 1;
+        }
+    }
+
+    /// BIN15 O4a. The 15-minute HAR term is additive: adding it must not
+    /// move a single 4 h or 8 h number, because `first_window` skips it
+    /// and the divisor stays 3. This is the in-crate half of the guard
+    /// the parity fixture pins from outside.
+    #[test]
+    fn the_15m_window_is_additive_for_the_longer_tenors() {
+        let mut e = VolEngine::new();
+        walk(&mut e, HAR_WARM_MINUTES as usize + 300, 11);
+        // Fold the three long windows by hand, exactly as the pre-O4a
+        // body did: w over [60, 240, 1440], divided by 3.
+        let mut i = 1usize;
+        let mut want_mean_sq: i128 = 0;
+        while i < HAR_WINDOWS.len() {
+            let rv = core_regime::math::isqrt_i128(e.sum_sq[i]) as i128;
+            want_mean_sq += rv * rv / HAR_WINDOWS[i] as i128;
+            i += 1;
+        }
+        let mut k = 0usize;
+        while k < 2 {
+            let (tau, tau_min) = if k == 0 { (TAU_4H, 240i128) } else { (TAU_8H, 480i128) };
+            let want = core_regime::math::isqrt_i128(want_mean_sq / 3 * tau_min);
+            assert_eq!(
+                e.har_1e9(tau),
+                Some(want),
+                "the {tau_min}-minute tenor must fold three terms over 3"
+            );
+            k += 1;
+        }
+        // And 15 m is a DIFFERENT number: four terms over 4. If these
+        // were equal the new window would be doing nothing.
+        let mut j = 0usize;
+        let mut all_mean_sq: i128 = 0;
+        while j < HAR_WINDOWS.len() {
+            let rv = core_regime::math::isqrt_i128(e.sum_sq[j]) as i128;
+            all_mean_sq += rv * rv / HAR_WINDOWS[j] as i128;
+            j += 1;
+        }
+        assert_eq!(
+            e.har_1e9(TAU_15M),
+            Some(core_regime::math::isqrt_i128(all_mean_sq / 4 * 15))
+        );
+        assert_ne!(all_mean_sq, want_mean_sq, "the 15-min term must carry variance");
+        // The 15-minute sum is a real rolling window: it holds exactly
+        // 15 squares once the ring has more than 15 returns.
+        assert!(e.sum_sq[0] > 0);
+        assert!(e.sum_sq[0] < e.sum_sq[1], "15 min holds less variance than 60");
+    }
+
+    /// BIN15 O4a. `σ̂` is `exp(ln σ̂)` and nothing else: no annualiser,
+    /// no band, `None` on exactly the conditions that make `ln σ̂` None.
+    #[test]
+    fn sigma_hat_is_the_exponential_of_the_log_forecast() {
+        let mut e = VolEngine::new();
+        assert_eq!(e.sigma_hat_1e9(TAU_15M), None, "cold engine forecasts nothing");
+        walk(&mut e, HAR_WARM_MINUTES as usize + 200, 23);
+        assert!(e.har_1e9(TAU_15M).is_some(), "the HAR itself is ready");
+        assert_eq!(e.sigma_hat_1e9(TAU_15M), None, "but an unfitted engine holds");
+        let mut i = 0usize;
+        while i < MIN_PAIRS {
+            e.seed_pair(2_000_000_000 + i as i64 * 1_000_000, 1_900_000_000 + i as i64 * 900_000);
+            i += 1;
+        }
+        let ln = e.ln_sigma_hat_1e9(TAU_15M).expect("fitted");
+        assert_eq!(e.sigma_hat_1e9(TAU_15M), Some(fx::exp_1e9(ln) as i64));
+        assert_eq!(e.sigma_hat_1e9(4_000_000_000), None, "an untraded τ is None");
+    }
+
+    /// BIN15 O4a pins behaviour that already held: a hold armed WITHOUT
+    /// an implied vol still forms its pair and refits, and scores no
+    /// QLIKE row. A HIP-4 outcome market has no `mark_iv` to compare.
+    #[test]
+    fn an_iv_less_hold_forms_a_pair_and_no_qlike_row() {
+        let mut e = VolEngine::new();
+        // +1: the first close only seeds `prev_px`, so N closes form N−1
+        // returns and the 1440-minute window needs one more.
+        walk(&mut e, HAR_WARM_MINUTES as usize + 1, 41);
+        let mut i = 0usize;
+        while i < MIN_PAIRS {
+            e.seed_pair(2_000_000_000 + i as i64 * 1_000_000, 1_900_000_000 + i as i64 * 900_000);
+            i += 1;
+        }
+        let pairs_before = e.n_pairs();
+        assert!(e.fit().is_some(), "a fit exists, so a QLIKE row COULD be scored");
+        // mark_iv = 0 is "no implied vol for this instrument".
+        assert!(e.arm_hold_at(0, TAU_15M, 0).is_some(), "the hold still arms");
+        walk(&mut e, 15, 43);
+        let rv = e.realised_since_arm_1e9().expect("the 15-minute window closed");
+        e.observe_settlement(rv);
+        assert_eq!(e.n_pairs(), pairs_before + 1, "the pair IS formed");
+        assert_eq!(
+            e.qlike_counters().n,
+            0,
+            "and nothing is scored against an implied vol nobody quoted"
+        );
+        assert!(!e.is_armed());
+        // The same settlement WITH an implied vol does score.
+        assert!(e.arm_hold_at(0, TAU_15M, 500_000_000).is_some());
+        walk(&mut e, 15, 47);
+        let rv = e.realised_since_arm_1e9().expect("window");
+        e.observe_settlement(rv);
+        assert_eq!(e.qlike_counters().n, 1, "an IV-bearing hold scores one row");
     }
 
     #[test]

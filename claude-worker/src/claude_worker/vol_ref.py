@@ -30,8 +30,10 @@ Mirrored operations, and why each is bit-exact across the two languages:
 The law itself (all scalings pinned, ``docs/research`` build card 2.3)::
 
     r_k      = ret_bps_1e9(prev, cur)                     bps x 1e9
-    rv_W     = isqrt(sum r_k^2)                           W in {60,240,1440}
-    har_tau  = isqrt((rv60^2/60 + rv240^2/240 + rv1440^2/1440) / 3 * tau_min)
+    rv_W     = isqrt(sum r_k^2)                        W in {15,60,240,1440}
+    har_tau  = isqrt(sum_{w >= first_window}(rv_w^2/w) / terms * tau_min)
+               4 h / 8 h: first_window 1, terms 3 -- the three-window law
+               unchanged to the bit. 15 m: first_window 0, terms 4.
     x        = ln(har_tau)                                x 1e9
     y        = ln(realised vol over the hold)             x 1e9, same domain
                formed by realised_since_arm_1e9 / realised_rv_1e9 -- the
@@ -50,7 +52,12 @@ MINUTE_RING = 1536
 PAIR_RING = 128
 MIN_PAIRS = 60
 QLIKE_RING = 60
-HAR_WINDOWS = (60, 240, 1440)
+#: BIN15 O4a appended the 15-minute term at the FRONT. Which windows a
+#: tenor folds is its ``first_window``, not this tuple's length: 4 h and
+#: 8 h start at index 1 and fold the same three terms they always did,
+#: so their forecast is bit-identical (the standing ``parity-1`` fixture
+#: is the proof -- it was never regenerated). Only 15 m folds all four.
+HAR_WINDOWS = (15, 60, 240, 1440)
 
 #: Minute closes the HAR needs before it can forecast at all — mirrors
 #: ``core_vol::HAR_WARM_MINUTES``, which is the longest HAR window.
@@ -69,17 +76,24 @@ LOG2_UNDEFINED = -(2**63)
 
 ANNUALISE_4H_1E9 = 46_813_459_603
 ANNUALISE_8H_1E9 = 33_102_114_736
+#: ``sqrt(525_960 / 15) * 1e9`` -- the 15 m annualiser (BIN15 O4a), out
+#: of the same 525 960-minute year as the two above and rounded the same
+#: way (``...411.93`` -> ``...412``).
+ANNUALISE_15M_1E9 = 187_253_838_412
 
+TAU_15M_NS = 900_000_000_000
 TAU_4H_NS = 14_400_000_000_000
 TAU_8H_NS = 28_800_000_000_000
 
-# (tau_min, annualise_1e9) for the ONLY tenors the lane trades. E1 is
-# measured at 4 h and 8 h and is gone by 12 h, and kill criterion 4
-# forbids the longer cells -- so they are absent here too, not merely
-# discouraged.
+# (tau_min, annualise_1e9, first_window) for the ONLY tenors the lane
+# trades. E1 is measured at 4 h and 8 h and is gone by 12 h, and kill
+# criterion 4 forbids the longer cells -- so they are absent here too,
+# not merely discouraged. 15 m is BIN15's tenor: its comparator is a
+# venue's binary book, not an implied vol, so kill-4 does not bind it.
 TENORS = {
-    TAU_4H_NS: (240, ANNUALISE_4H_1E9),
-    TAU_8H_NS: (480, ANNUALISE_8H_1E9),
+    TAU_15M_NS: (15, ANNUALISE_15M_1E9, 0),
+    TAU_4H_NS: (240, ANNUALISE_4H_1E9, 1),
+    TAU_8H_NS: (480, ANNUALISE_8H_1E9, 1),
 }
 
 I64_MAX = 2**63 - 1
@@ -94,7 +108,12 @@ EXP2_TAB = tuple(round(math.pow(2, i / 256) * (1 << 32)) for i in range(257))
 
 
 def tenor_of(tau_ns):
-    """``(tau_min, annualise_1e9)`` for a traded tenor, else ``None``."""
+    """``(tau_min, annualise_1e9, first_window)`` for a traded tenor.
+
+    ``None`` for anything else. The third element is the first index of
+    ``HAR_WINDOWS`` the tenor folds (BIN15 O4a); callers that predate it
+    index ``[0]``/``[1]`` and are unaffected.
+    """
     return TENORS.get(tau_ns)
 
 
@@ -187,7 +206,7 @@ class VolEngine:
     """
 
     def __init__(self):
-        self.sum_sq = [0, 0, 0]
+        self.sum_sq = [0] * len(HAR_WINDOWS)
         self.a_1e9 = 0
         self.b_1e9 = 0
         self.minutes = 0
@@ -210,7 +229,7 @@ class VolEngine:
     # -- ingest ----------------------------------------------------
 
     def on_minute_close(self, px_1e6):
-        """Feed one 1-minute close x1e6; rolls the three window sums."""
+        """Feed one 1-minute close x1e6; rolls all four window sums."""
         if px_1e6 <= 0:
             return
         if self.prev_px_1e6 <= 0:
@@ -231,15 +250,22 @@ class VolEngine:
     # -- forecast --------------------------------------------------
 
     def har_1e9(self, tau_ns):
-        """HAR forecast of realised vol over tau, raw bps x 1e9."""
+        """HAR forecast of realised vol over tau, raw bps x 1e9.
+
+        BIN15 O4a: the fold starts at the tenor's ``first_window`` and
+        divides by the number of terms actually folded -- three over
+        [60, 240, 1440] for 4 h and 8 h, which is what it always was.
+        """
         t = tenor_of(tau_ns)
         if t is None or self.minutes < HAR_WINDOWS[-1]:
             return None
+        first = t[2]
+        terms = len(HAR_WINDOWS) - first
         mean_sq = 0
-        for w, win in enumerate(HAR_WINDOWS):
+        for w in range(first, len(HAR_WINDOWS)):
             rv = isqrt_i64(self.sum_sq[w])
-            mean_sq += rv * rv // win
-        har = isqrt_i64(mean_sq // 3 * t[0])
+            mean_sq += rv * rv // HAR_WINDOWS[w]
+        har = isqrt_i64(mean_sq // terms * t[0])
         return har if har > 0 else None
 
     def x_1e9(self, tau_ns):
@@ -293,6 +319,23 @@ class VolEngine:
         if lo is None or hi is None:
             return None
         return (lo, hi)
+
+    def sigma_hat_1e9(self, tau_ns):
+        """BIN15 O4a: ``sigma_hat`` over tau -- ``exp(ln sigma_hat)``.
+
+        The raw per-tau vol, no annualiser and no band: BIN15 has no
+        implied vol to compare against, it needs the number itself to
+        build a per-minute variance for its binary pricer. ``None`` on
+        exactly the conditions that make ``ln_sigma_hat_1e9`` None, plus
+        the same saturation law as ``_annualised_1e9``.
+        """
+        ln = self.ln_sigma_hat_1e9(tau_ns)
+        if ln is None:
+            return None
+        sigma = exp_1e9(ln)
+        if sigma in (0, U64_MASK) or sigma > I64_MAX:
+            return None
+        return sigma if sigma > 0 else None
 
     @staticmethod
     def _annualised_1e9(ln_v_1e9, annualise_1e9):
