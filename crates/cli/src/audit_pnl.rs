@@ -126,7 +126,12 @@ fn strategy_label(id: u8) -> &'static str {
         0 => "latency-arb",
         1 => "vrp",
         2 => "xsd",
-        3 => "rule-tree",
+        // BIN15 O4b (2026-09-12): slot 3 is bin15. The NUMBER is
+        // wire-stable, so a capture taken before that date carries
+        // rule-tree rows under this label and one taken after
+        // carries bin15 rows — `docs/migration.md` records the
+        // boundary, exactly as it does for slots 1 and 2.
+        3 => "bin15",
         4 => "ai-exec",
         5 => "vm",
         6 => "icdp",

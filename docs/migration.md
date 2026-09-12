@@ -6,6 +6,177 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `crates/strategy-bin15` takes slot 3 from `strategy-rule-tree`; `AiCmdKind::SetBinarySpec = 13`; `bin15.toml`; `--member bin15` (BIN15 O4b)
+
+**This phase DOES change the wire** (unlike O3 and O4a): `AiCmd.kind`
+gains `13 = SetBinarySpec`. It is additive — byte 13 was unassigned, the
+frame is the same 64 bytes, and no existing kind moved — so an old
+worker and a new engine interoperate in both directions. `docs/wire-format.md`
+carries the row.
+
+**THE HEADLINE IS THE SLOT BOUNDARY.** `SLOT_BIN15 = 3` / `BIT_BIN15 = 8`
+replace `SLOT_RULE_TREE` / `BIT_RULE_TREE` (ruling O-Q1, the XSD-S
+precedent). `strategy-rule-tree` is UNLINKED from `strategy-set` — the
+crate and its tests stay in the tree — and **`--strategy rule-tree` is
+now a boot refusal**, `mask_for_name("rule-tree")` returning `None`.
+Mask 8 means bin15 from this commit on, and a mask NUMBER recorded
+before it does not mean what it says: `audit-pnl`'s slot label 3 reads
+`"bin15"` where it read `"rule-tree"`, so a report over capture from
+before this commit mislabels slot 3. Nothing ever ran in that slot
+live (`all` has been 123/127 without it), so the boundary is
+book-keeping rather than data loss — but it is a boundary, and the date
+is this commit's.
+
+New mask names: `bin15` 8, `ai+bin15` 56, `ai+vrp+bin15` 58,
+`ai+xsd+bin15` 60, `ai+vrp+xsd+bin15` 62. `scripts/engine-wrapper.sh`
+allow-lists all five. **bin15 REFUSES a boot whose artifact is absent
+when its bit was requested** (the icdp/F19 law) where xsd clears the bit
+instead — booting `ai+bin15` as `ai` is how an operator comes to watch a
+member that was never there.
+
+**What changed, beyond the slot**
+
+- **`bin15.toml` + `bin15.toml.example`** (`core_config::bin15`) — the
+  artifact, integer-only, hashed by BYTES into the boot tell
+  (`bin15: artifact configured hash=… families=… dormant=… seeds=… daily_seeds=…`).
+  The three lookup tables and the knobs are DATA, re-cut without a
+  rebuild by `python -m claude_worker.bin15_fit artifact`.
+
+  **Every array is ONE LINE, deliberately.** `core_config::icdp::parse_value`
+  (which this grammar reuses) reads an array off a single trimmed line;
+  a pretty-printed multi-line array is an unterminated array to it. The
+  committed example's `phi_lut` line is 32 786 characters and that is
+  not an oversight to tidy up.
+
+- **DEVIATION, recorded: the lookup tables' provenance.** Spec §6.3 names
+  `bin/bt15.py`'s walk-forward fit as the source. That one-shot is
+  git-excluded research and is not in this tree, so it cannot be
+  imported or re-run. It does not need to be — the spec states every
+  number: Φ is the standard normal CDF (mathematics, not a fit),
+  computed exactly in `decimal` at 60 digits; the recalibration is the
+  three stated slopes 1.104 / 1.165 / 1.219 through the middle of the
+  unit interval, clamped at both ends; `scale_1e9 = 980000000`;
+  `hour_ln_off_1e9` is OMITTED, and absent means zero, which is
+  bit-identical to no hour-of-day correction. An operator re-fitting
+  later passes `--slope-early` / `--scale-1e9`; no code changes.
+
+- **`scale_1e9` was refused by its own grammar.** `BIN15_KEYS` listed 20
+  keys and not that one, while `parse` read it with `opt_int` — so the
+  ONE artifact the fitter writes was rejected at the key check before
+  any bound could be tested, and every bound-level test passed. Fixed
+  (21 keys); `core_config::bin15` now compiles in
+  `bin15.toml.example` and asserts it parses, which is the test that
+  catches this class.
+
+- **DEFECT FIXED: σ̂ was 10 000× too large.** `refresh_sigma` squared
+  `core-vol`'s σ̂ and divided by the tenor's minutes. But `core-vol`
+  reports vol in RAW BPS ×1e9 — a fraction ×1e13, because one bp is
+  1e-4 — while `price::fair_value` wants a per-minute variance as a
+  fraction² ×1e18. The square therefore had to come down by 1e8
+  (`BPS2_TO_FRAC2_1E8`). Without it every `d` collapsed toward zero and
+  the member priced EVERY binary at almost exactly 0.5, while
+  `reprices`, `takes_submitted` and `takes_filled` all climbed exactly
+  as they would if it were working — a spread harvester with a
+  model-shaped counter set. Pinned from both ends by
+  `the_per_minute_variance_is_in_the_pricers_units_not_core_vols`: an
+  exact identity against `sigma_hat_1e9`, and a realistic 25 bps lead
+  landing at 1.6σ rather than a rounding error. **Nothing short of
+  predicting the number catches this**, which is why the harness arm
+  was what found it.
+
+- **DEFECT FIXED: `log_moneyness_1e9` overflowed `i128`.** `u * u` ran
+  BEFORE the range check, so a mis-parsed `threshold:` of 0.000001
+  against a BTC mark (`u ≈ 7.7e19`, square 6e39 against a 1.7e38
+  ceiling) panicked in debug and wrapped in release. The range check now
+  comes first (`U_CLAMP_1E9`, `|u| ≤ 100`), and beyond the band the
+  answer is `None` — ABSENT DATA HOLDS — rather than a saturated
+  near-certainty the member would cross a book for. Found by the parity
+  fixture, which feeds it deliberately.
+
+- **DEFECT FIXED: one seed file cannot serve two tenors.** Boot pushed
+  the same `(x, y)` cloud into BOTH forecast engines of an underlying. A
+  pair is tenor-specific — `x = ln har_τ`, `y = ln` realised over that
+  same `τ`; the 15 m tenor folds four HAR windows and the 8 h tenor
+  folds three — so the daily line was fitted on the 15 m regressor, and
+  because both are log-vols of the same series the result looked
+  plausible. **New on-disk file: `bin15-seed-<COIN>-1d.tsv`**, the 8 h
+  tenor's pairs, read beside `bin15-seed-<COIN>.tsv` and pushed only to
+  `FAMILY_NATIVE_DAILY`. Both files are OPTIONAL and absent means that
+  tenor holds until its own pairs accrue, which is the same law an
+  absent seed always had — so **nothing to migrate, and a host with only
+  the 15 m file loses nothing it had**. The minute window stays in the
+  15 m file alone: it is a property of the price series, not of the
+  horizon, and replaying one underlying's minutes twice would push them
+  through a ring that assumes chronological order. `V 2 / R / P` is the
+  VRP seed grammar unchanged, written by `vrp_seed.write_seed_tsv`
+  itself rather than a second copy of it.
+
+- **`backtest --member bin15`** (`--bin15 <toml>`, `--bin15-seed-dir <dir>`)
+  on the Tier-3 arm. Offline the artifact's own `families` list plays
+  the part `universe.toml`'s `[hyperliquid] rolling` plays at boot, and
+  the Yes ordinals are a pure function of the family index
+  (`family::rolling_sym`), so a replay rebuilds them without the file.
+  The order check still has something real to check — **the CAPTURE's
+  family indices**: a window that rolls family 5 against an artifact
+  configuring four refuses the run, because binding nothing for it and
+  reporting a clean zero looks exactly like a member with nothing to do.
+  `--bin15-seed-dir` defaults to the FIRST run directory, not
+  `~/multivenue`: a replay is a closed world, and folding the live cut
+  into a backtest of a month-old window replays a forecast that had not
+  been fitted yet.
+
+- **HARNESS MERGE WIDENED, and the restriction on it is load-bearing.**
+  `load_run` kept only `Funding` and `AssetCtx` event channels, so
+  `InstrumentRoll` and `Mark` never reached the merge — O3's settlement
+  registration and the bin15 member both read `merged`, so a capture
+  full of rolls merged to nothing. `InstrumentRoll` is now kept
+  unconditionally; **`Mark` is kept ONLY for a HIP-4 UNDERLYING**.
+  That is not tidiness: `Mark` is also OKX's mark-price channel, which
+  every historical root carries in bulk and which no consumer reads, and
+  admitting those would add records to the merge on every root ever
+  captured — moving `merged_records`, the IS/OOS boundary and therefore
+  every pooled VM number. A root with no HIP-4 instrument has an empty
+  underlying set and merges byte for byte as it always did; the standing
+  8-window pooled guards were re-run at this commit and are unchanged.
+
+- **The calibration ledger.** `--emit-detail` gains an additive
+  top-level `bin15_ledger` array on `--member bin15` runs only
+  (`{ts_ns, family, outcome, tau_ns, p_hat_1e6, p_raw_1e6, arm, y}`,
+  one sample per live instance per 30 s). `detail_version` STAYS 7: a
+  key that appears only on one member's runs is additive, and a bump
+  would move the pooled sidecar guard and the three tests that pin the
+  prefix. `render_detail` gained a trailing `extra: &str`; the VM path
+  passes `""`, so its bytes are unchanged. A row is written only when
+  the record it sits on actually RE-PRICED the instance — `p_hat`
+  survives a held re-price (the tail, a cold forecast, a one-sided
+  book), and a sample taken whenever one merely exists records a belief
+  nobody acted on against a `tau` it no longer has. `y` is joined from
+  the harness's own settlement map, so a `p̂` is scored against the
+  number the fill model paid out; `null` where the window cannot derive
+  the payout.
+
+- **`engine_bin15_*`: 22 counters + 32 per-family gauges**
+  (`engine_bin15_f<0..7>_{p_hat_1e6,pos_yes_1e6,pos_no_1e6,live_outcome}`).
+  Registration is unconditional like every other family's, so a mask
+  without slot 3 still exposes the rows at zero — which is what lets an
+  operator tell "off" from "broken". **Headroom note, measured at this
+  commit: the live engine registered 198 counters before this family
+  and 220 after, against `MAX_COUNTERS = 256` — 36 left.** The next
+  member that needs more has to raise the constant rather than discover
+  `RegErr::Full` at a live boot, which refuses the boot. Pinned by
+  `the_bin15_family_is_22_counters_and_32_gauges`.
+
+- `strategy-core` gains `Bin15FamilyView` + `bin15_counters()` /
+  `bin15_families_view()` trait defaults; `engine-snapshot`'s
+  `SLOT_NAMES[3]` is `"bin15"`; `regime.toml`'s `[labels.rule_tree]`
+  section is now `[labels.bin15]` — **an operator file carrying the old
+  key is refused at the grammar**, which is the one config edit this
+  commit requires of a host that had one (no live `regime.toml` did).
+
+**No restart is required by this commit and none was performed.** Slot 3
+is unconfigured without `~/multivenue/bin15.toml`, which no host has;
+the live mask is 54 and does not include bit 8. Going live is O5.
+
 ## 2026-09-12 — `core-vol` gains the 15 m tenor and a fourth HAR window; 4 h/8 h bit-identical; `sigma_hat_1e9`; IV-optional arming pinned (BIN15 O4a)
 
 **No wire layout, no on-disk format, no config key, no restart.** The

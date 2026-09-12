@@ -84,6 +84,10 @@ pub enum MemberKind {
     /// fitted pairs from `vrp-seed.tsv`, the option chain from the
     /// capture's newest manifest (VRP P2.3).
     Vrp,
+    /// Slot 3, `crates/strategy-bin15` — params and lookup tables from
+    /// `bin15.toml`, the per-underlying forecast seeds from
+    /// `bin15-seed-<COIN>[-1d].tsv` (BIN15 O4b).
+    Bin15,
 }
 
 impl MemberKind {
@@ -93,6 +97,7 @@ impl MemberKind {
             "icdp" => Some(Self::Icdp),
             "xsd" => Some(Self::Xsd),
             "vrp" => Some(Self::Vrp),
+            "bin15" => Some(Self::Bin15),
             _ => None,
         }
     }
@@ -103,6 +108,7 @@ impl MemberKind {
             Self::Icdp => "icdp",
             Self::Xsd => "xsd",
             Self::Vrp => "vrp",
+            Self::Bin15 => "bin15",
         }
     }
 }
@@ -128,6 +134,15 @@ pub struct MemberSpec {
     /// by nothing. It is routed here, which is the only arm that can
     /// construct the member.
     pub vrp_seed: Option<PathBuf>,
+    /// bin15 only: `--bin15-seed-dir <dir>` — the directory holding
+    /// `bin15-seed-<COIN>.tsv` and `bin15-seed-<COIN>-1d.tsv`.
+    ///
+    /// Defaults to the FIRST run directory, not `~/multivenue`: a
+    /// replay is a closed world, and silently folding the operator's
+    /// live seeds into a backtest of a month-old window is how a
+    /// forecast that had not been fitted yet comes to price it. Pass
+    /// `--bin15-seed-dir ~/multivenue` to use the live cut deliberately.
+    pub bin15_seed_dir: Option<PathBuf>,
 }
 
 /// Round-trip counter over synthesized fills, member-agnostic: a
@@ -173,6 +188,26 @@ fn drive<S: Strategy>(
     engine: &mut FillEngine,
     merged: &[MergedRec],
     boundary_virt: u64,
+) -> DriveOutcome {
+    // The closure's argument types come from `drive_with`'s bound, so
+    // the three arms that keep no ledger are untouched by O4b.
+    drive_with(strat, ctx, engine, merged, boundary_virt, &mut |_, _| {})
+}
+
+/// [`drive`], plus an observer called once per record AFTER the record
+/// and its fills have reached the member.
+///
+/// BIN15 O4b needs it: the calibration ledger is a TIME SERIES of what
+/// the member believed, so it cannot be reconstructed from the member's
+/// end state, and a `p̂` sampled before the record would be scored
+/// against a market the member had not seen yet.
+fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
+    strat: &mut S,
+    ctx: &mut BacktestCtx,
+    engine: &mut FillEngine,
+    merged: &[MergedRec],
+    boundary_virt: u64,
+    observe: &mut O,
 ) -> DriveOutcome {
     let period = strat.timer_period_ns();
     let mut next_timer: u64 = if period == u64::MAX || period == 0 {
@@ -255,6 +290,7 @@ fn drive<S: Strategy>(
                 consumed += 1;
             }
         }
+        observe(rec, strat);
     }
     let last_wall = merged[merged.len() - 1].wall_ns;
     ctx.now_ns = last_wall;
@@ -310,6 +346,62 @@ fn load_icdp_params(
         };
     }
     Ok((params, bytes))
+}
+
+/// How often the BIN15 calibration ledger samples one live instance.
+///
+/// 30 s over a 15-minute instance is about 30 rows per instance across
+/// every phase boundary — enough to fit the per-phase calibration table
+/// the O5 desk gate (G6.1) reads, and few enough that a pooled
+/// eight-window run's sidecar stays a file an operator can open.
+const BIN15_LEDGER_PERIOD_NS: u64 = 30_000_000_000;
+
+/// One calibration-ledger row: what the member believed about one live
+/// instance at one instant.
+///
+/// `y` is NOT here — it is joined at render time from the harness's own
+/// settlement map, so the realised value a `p̂` is scored against is
+/// the number the fill model actually paid out and not a second
+/// derivation of it.
+#[derive(Copy, Clone, Debug)]
+struct Bin15LedgerRow {
+    ts_ns: u64,
+    family: u8,
+    outcome: u32,
+    tau_ns: u64,
+    p_hat_1e6: i64,
+    p_raw_1e6: i64,
+    arm: u8,
+}
+
+/// The `bin15_ledger` block of the detail sidecar (O4b; spec §6.6).
+///
+/// `y` is `null` for an instance whose settlement this window cannot
+/// derive — its expiry or TWAP window falls outside the capture. A null
+/// is the honest state of such a row and the ledger merge drops it;
+/// inventing a payout is how a calibration table comes out flattering.
+fn render_bin15_ledger(
+    rows: &[Bin15LedgerRow],
+    y_by_outcome: &BTreeMap<u32, i64>,
+) -> String {
+    let mut s = String::with_capacity(64 + rows.len() * 112);
+    s.push_str("\"bin15_ledger\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let y = match y_by_outcome.get(&r.outcome) {
+            Some(v) => v.to_string(),
+            None => "null".to_owned(),
+        };
+        s.push_str(&format!(
+            "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"tau_ns\":{},\
+             \"p_hat_1e6\":{},\"p_raw_1e6\":{},\"arm\":{},\"y\":{}}}",
+            r.ts_ns, r.family, r.outcome, r.tau_ns, r.p_hat_1e6, r.p_raw_1e6, r.arm, y
+        ));
+    }
+    s.push(']');
+    s
 }
 
 /// The member arm. Same contract as [`super::run`]: schema-1 on
@@ -392,6 +484,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     // ---- the member ----
     let mut ctx = BacktestCtx::new();
     ctx.now_ns = merged[0].wall_ns;
+    // BIN15 O4b: the calibration ledger, filled by the bin15 arm and
+    // empty for every other member.
+    let mut bin15_ledger: Vec<Bin15LedgerRow> = Vec::new();
     let (hash_hex, member_line, drive_out, member_counters): (String, String, DriveOutcome, String) =
         match spec.kind {
             MemberKind::Icdp => {
@@ -659,6 +754,206 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 );
                 (hash_hex, line, out, counters)
             }
+            MemberKind::Bin15 => {
+                // OFFLINE THE UNIVERSE IS THE ARTIFACT. There is no
+                // `universe.toml` in a replay, and a rolling slot has no
+                // stable descriptor to resolve — its venue coin is
+                // rebound per instance. But the Yes ordinals are a pure
+                // function of the family INDEX (`family::rolling_sym`),
+                // which is the same reserved pool the boot universe
+                // allocates and the same index `InstrumentRoll` carries
+                // in its `venue_seq`. So the artifact's own list plays
+                // the part `[hyperliquid] rolling` plays at boot, and
+                // the order check below still has something real to
+                // check: the CAPTURE's family indices.
+                let (file, _) = core_config::bin15::load(&spec.params).map_err(|e| {
+                    HarnessError::Usage(format!("--bin15 {}: {e}", spec.params.display()))
+                })?;
+                let rolling: Vec<String> = file.families.clone();
+                let rolling_syms: Vec<u32> = (0..rolling.len())
+                    .map(|f| ingress_hyperliquid::family::rolling_sym(f, 0))
+                    .collect();
+                // THE MISMATCH CHECK. A capture that rolled family 5
+                // against an artifact configuring four families would
+                // bind nothing for it and report a clean zero — the
+                // member would look correct and be blind. Refuse.
+                let instances = crate::backtest::binary::instances_from_events(&merged);
+                let mut named: BTreeSet<usize> = BTreeSet::new();
+                for inst in &instances {
+                    named.insert(inst.family as usize);
+                }
+                if let Some(&top) = named.iter().next_back() {
+                    if top >= rolling.len() {
+                        return Err(HarnessError::Usage(format!(
+                            "bin15: the capture rolls family index {top} but \
+                             `{}` configures only {} families ({:?}) — the member \
+                             indexes families by the ingress's own index, so a \
+                             short list binds nothing for the missing ones and \
+                             reports a clean zero",
+                            spec.params.display(),
+                            rolling.len(),
+                            rolling,
+                        )));
+                    }
+                }
+                // A replay is a closed world: the seeds come from the
+                // window unless the operator names a directory.
+                let seed_dir: PathBuf = spec
+                    .bin15_seed_dir
+                    .clone()
+                    .unwrap_or_else(|| runs[0].path.clone());
+                let boot = crate::bin15_boot::load_bin15_boot(
+                    Some(&spec.params),
+                    Some(&seed_dir),
+                    &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &rolling,
+                    &rolling_syms,
+                )
+                .map_err(HarnessError::Usage)?
+                .ok_or_else(|| {
+                    HarnessError::Usage("bin15: artifact absent — nothing to drive".to_owned())
+                })?;
+                let hash_hex = hex_lower(&boot.hash);
+                let mut strat: Box<strategy_bin15::Bin15Strategy> =
+                    Box::new(strategy_bin15::Bin15Strategy::new());
+                let luts = Box::new((*boot.luts).clone());
+                // Identity anchor: the member reads WALL instants from
+                // every payload (the drive rewrites `ts_ns`), so
+                // mono == wall and every expiry compare — which is an
+                // EPOCH instant on this venue — is in the capture's own
+                // clock.
+                strat
+                    .configure(boot.params, luts, WallAnchor::new(0, 0))
+                    .map_err(|e| HarnessError::Usage(format!("bin15: configure refused: {e}")))?;
+                let mut u = 0usize;
+                while u < boot.seeds.len() {
+                    let seed = &boot.seeds[u];
+                    strat.seed_returns(u, &seed.returns);
+                    // Per tenor, as at boot: a quarter-hour pair is not
+                    // an eight-hour pair.
+                    strat.seed_pairs(u, strategy_bin15::FAMILY_OUT_15M, &seed.pairs_15m);
+                    strat.seed_pairs(
+                        u,
+                        strategy_bin15::FAMILY_NATIVE_DAILY,
+                        &seed.pairs_daily,
+                    );
+                    u += 1;
+                }
+                strat
+                    .on_start(&mut ctx)
+                    .map_err(|e| HarnessError::Internal(format!("bin15 on_start failed: {e}")))?;
+                let seeded = boot.seeds.iter().filter(|s| !s.is_empty()).count();
+                let line = format!(
+                    "member: bin15 params={} hash={} families={} underlyings={} \
+                     instances={} seeds={} seed_dir={} anchor=wall (identity)",
+                    spec.params.display(),
+                    hash_hex,
+                    boot.params.n_families,
+                    boot.params.n_underlyings,
+                    instances.len(),
+                    seeded,
+                    seed_dir.display(),
+                );
+                // The calibration ledger (spec §6.6): one sample per
+                // live instance per 30 s, recorded from inside the
+                // drive because it is a time series of belief.
+                let mut ledger: Vec<Bin15LedgerRow> = Vec::new();
+                let mut last_sample: [u64; strategy_bin15::BIN15_MAX_FAMILIES] =
+                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
+                let out = {
+                    let ledger_ref = &mut ledger;
+                    let last_ref = &mut last_sample;
+                    let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
+                        let mut f = 0usize;
+                        while f < s.n_families() {
+                            let Some(fam) = s.family(f) else { break };
+                            // Only a FRESH price, and that is the whole
+                            // discipline of the row. `p_hat` survives a
+                            // held re-price — inside the tail, on a cold
+                            // forecast, on a one-sided book — so a
+                            // sample taken whenever one merely EXISTS
+                            // records what the member believed minutes
+                            // ago against a `tau` it no longer has. The
+                            // calibration table would then be fitted on
+                            // beliefs nobody acted on. `p_ts_ns ==
+                            // rec.wall_ns` is exactly "this record
+                            // re-priced it".
+                            if fam.is_live()
+                                && fam.p_ts_ns == rec.wall_ns
+                                && rec.wall_ns
+                                    >= last_ref[f].saturating_add(BIN15_LEDGER_PERIOD_NS)
+                            {
+                                last_ref[f] = rec.wall_ns;
+                                ledger_ref.push(Bin15LedgerRow {
+                                    ts_ns: rec.wall_ns,
+                                    family: f as u8,
+                                    outcome: fam.live.outcome,
+                                    // The PRICING horizon, not the time
+                                    // to expiry: it is what `p̂` was
+                                    // computed at and which
+                                    // recalibration phase applied, and a
+                                    // calibration table keyed on
+                                    // anything else is keyed on the
+                                    // wrong thing.
+                                    tau_ns: fam
+                                        .live
+                                        .expiry_ns
+                                        .saturating_sub(rec.wall_ns)
+                                        .saturating_add(fam.live.twap_ns / 3),
+                                    p_hat_1e6: fam.p_hat_1e6,
+                                    p_raw_1e6: fam.p_raw_1e6,
+                                    arm: fam.arm,
+                                });
+                            }
+                            f += 1;
+                        }
+                    };
+                    drive_with(
+                        &mut *strat,
+                        &mut ctx,
+                        &mut engine,
+                        &merged,
+                        boundary_virt,
+                        &mut observe,
+                    )
+                };
+                bin15_ledger = ledger;
+                let c = strat.counters();
+                let counters = format!(
+                    "member: bin15 reprices={} rolls={} rolls_settled={} spec_overrides={} \
+                     spec_refused={} takes_submitted={} takes_filled={} takes_unfilled={} \
+                     quotes_submitted={} quotes_filled={} quotes_expired={} closes_submitted={} \
+                     skipped_tau={} skipped_tail={} skipped_stale={} skipped_book={} \
+                     skipped_inventory={} skipped_cap={} skipped_grid={} families_dormant={} \
+                     fills={} unknown_fills={} ledger_rows={} orders_emitted={} \
+                     regime=not-replayed(v1)",
+                    c.reprices,
+                    c.rolls,
+                    c.rolls_settled,
+                    c.spec_overrides,
+                    c.spec_refused,
+                    c.takes_submitted,
+                    c.takes_filled,
+                    c.takes_unfilled,
+                    c.quotes_submitted,
+                    c.quotes_filled,
+                    c.quotes_expired,
+                    c.closes_submitted,
+                    c.skipped_tau,
+                    c.skipped_tail,
+                    c.skipped_stale,
+                    c.skipped_book,
+                    c.skipped_inventory,
+                    c.skipped_cap,
+                    c.skipped_grid,
+                    c.families_dormant,
+                    c.fills,
+                    c.unknown_fills,
+                    bin15_ledger.len(),
+                    out.orders_emitted,
+                );
+                (hash_hex, line, out, counters)
+            }
         };
     let outcome: ModelOutcome = engine.finish();
     let oos_round_trips = drive_out.round_trips - drive_out.rt_at_boundary;
@@ -775,6 +1070,21 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
             &engine,
             &run_summaries,
             &regime_report,
+            // Additive and bin15-only: every other member passes an
+            // empty block, so their sidecars are byte-identical to
+            // before O4b.
+            &if bin15_ledger.is_empty() {
+                String::new()
+            } else {
+                render_bin15_ledger(
+                    &bin15_ledger,
+                    &crate::backtest::binary::settle_values_by_outcome(
+                        &merged,
+                        &binary_underlying,
+                        window_end_wall_ns,
+                    ),
+                )
+            },
         );
         std::fs::write(detail_path, detail).map_err(|e| {
             HarnessError::Usage(format!(

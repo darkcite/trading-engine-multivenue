@@ -56,7 +56,11 @@ fn coded_member_slot(name: &str) -> Option<u8> {
         // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross_arb`
         // is gone for the same reason `ev` is.
         "xsd" => strategy_set::SLOT_XSD,
-        "rule_tree" => strategy_set::SLOT_RULE_TREE,
+        // BIN15 O4b (2026-09-12): slot 3 is bin15. `rule_tree` is
+        // GONE as a label name — a `regime.toml [labels.rule_tree]`
+        // section now refuses the boot rather than labelling a
+        // member that no longer sits there.
+        "bin15" => strategy_set::SLOT_BIN15,
         "ai_exec" => strategy_set::SLOT_AI_EXEC,
         "icdp" => strategy_set::SLOT_ICDP,
         _ => return None,

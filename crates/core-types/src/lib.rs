@@ -1225,6 +1225,25 @@ pub enum AiCmdKind {
     /// [`STRATEGY_SLOT_NONE`] (set-level), `sym`/`side` none. The
     /// engine drain's TTL-on-pop law applies unchanged.
     SetRegime = 12,
+    /// BIN15 O4b (`docs/research/outcome/03-implementation-spec-2026-09-12.md`
+    /// §6.4.2): OVERRIDE which HIP-4 instance a rolling slot means,
+    /// without waiting for the venue's own lifecycle push.
+    ///
+    /// `strategy_id` = 3 (the bin15 slot) ENFORCED, `sym` = the
+    /// family's **Yes** slot (the No leg is the next ordinal), `px` =
+    /// strike ×1e6, `qty` = expiry ns, `ttl_ns` = the outcome id,
+    /// `param_id` = settlement TWAP seconds, `flags` bit 0 = CLEAR the
+    /// slot instead of binding it, `side` none.
+    ///
+    /// `qty` carries an ABSOLUTE expiry, not an age, because a binary's
+    /// expiry is the venue's own wall-clock instant and re-deriving it
+    /// from `now` would move it by the frame's queue time — the
+    /// opposite trade-off from [`Self::PositionSeed`], where the age
+    /// spelling exists precisely to avoid crossing the wall clock. The
+    /// engine refuses `qty <= now`, so a stale frame cannot bind a
+    /// dead instance. Shape refusals are counted
+    /// (`Bin15Counters::spec_refused`) and change nothing.
+    SetBinarySpec = 13,
 }
 
 impl AiCmdKind {
@@ -1252,6 +1271,7 @@ impl AiCmdKind {
             10 => Some(Self::FundingSeed),
             11 => Some(Self::PositionSeed),
             12 => Some(Self::SetRegime),
+            13 => Some(Self::SetBinarySpec),
             _ => None,
         }
     }
@@ -1304,6 +1324,13 @@ pub const OPT_RING_SIZE: usize = 4096;
 /// Valid on `SetFairValue` / `SetBias` / `SetRegime` only.
 pub const AI_CMD_FLAG_EXPIRE_ON_SILENCE: u16 = 1 << 0;
 
+/// [`AiCmdKind::SetBinarySpec`] `flags` bit 0: CLEAR the slot's live
+/// instance instead of binding a new one (BIN15 O4b). Shares bit 0 with
+/// [`AI_CMD_FLAG_EXPIRE_ON_SILENCE`] because `flags` is interpreted
+/// per-kind and the two kinds are disjoint — the same convention the
+/// `param_id` field already follows.
+pub const AI_CMD_FLAG_CLEAR_SPEC: u16 = 1 << 0;
+
 /// `AiCmd::strategy_id` sentinel meaning "no strategy slot".
 pub const STRATEGY_SLOT_NONE: u8 = 0xFF;
 
@@ -1320,6 +1347,11 @@ pub const STRATEGY_SLOT_AI_EXEC: u8 = 4;
 /// `RulesetStage` / `RulesetCommit` commands must target exactly
 /// this slot.
 pub const STRATEGY_SLOT_VM: u8 = 5;
+
+/// Strategy-set slot of `strategy-bin15` (BIN15 O4b, 2026-09-12 — the
+/// slot `strategy-rule-tree` held until it was unlinked).
+/// [`AiCmdKind::SetBinarySpec`] commands must target exactly this slot.
+pub const STRATEGY_SLOT_BIN15: u8 = 3;
 
 /// `AiCmd::side` sentinel meaning "no side" (every kind except
 /// `OrderIntent`).
@@ -1763,6 +1795,53 @@ impl AiCmd {
                 }
                 if self.flags & !AI_CMD_FLAG_EXPIRE_ON_SILENCE != 0 {
                     return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+            }
+            AiCmdKind::SetBinarySpec => {
+                // BIN15 O4b §6.4.2. What is checkable WITHOUT a clock is
+                // checked here; `qty > now` is the member's, because
+                // this function is also run offline against captured
+                // frames whose `now` is the replay's, not this
+                // process's. A wire gate that read the real clock would
+                // refuse every captured frame on sight.
+                if self.strategy_id != STRATEGY_SLOT_BIN15 {
+                    return Err(AiCmdShapeError::BadStrategySlot(self.strategy_id));
+                }
+                if self.sym == SYMBOL_ID_NONE {
+                    return Err(AiCmdShapeError::BadSym(self.sym));
+                }
+                if self.side != AI_SIDE_NONE {
+                    return Err(AiCmdShapeError::BadSide(self.side));
+                }
+                if self.ttl_ns == 0 {
+                    return Err(AiCmdShapeError::BadTtl(self.ttl_ns));
+                }
+                if self.flags & !AI_CMD_FLAG_CLEAR_SPEC != 0 {
+                    return Err(AiCmdShapeError::BadFlags(self.flags));
+                }
+                // Settlement TWAP seconds; 0 = settle at T.
+                if self.param_id > 3600 {
+                    return Err(AiCmdShapeError::BadParamId(self.param_id));
+                }
+                // A CLEAR carries no instance, so strike and expiry are
+                // ignored — and must be zero rather than stale.
+                if self.flags & AI_CMD_FLAG_CLEAR_SPEC != 0 {
+                    if self.px != 0 {
+                        return Err(AiCmdShapeError::BadPx(self.px));
+                    }
+                    if self.qty != 0 {
+                        return Err(AiCmdShapeError::BadQty(self.qty));
+                    }
+                } else {
+                    // Strike ×1e6, $1 … $10 m: the HIP-4 threshold is a
+                    // price in the underlying, and a zero or negative
+                    // one would price every binary at 1.
+                    if self.px < 1_000_000 || self.px > 10_000_000_000_000 {
+                        return Err(AiCmdShapeError::BadPx(self.px));
+                    }
+                    if self.qty <= 0 {
+                        return Err(AiCmdShapeError::BadQty(self.qty));
+                    }
                 }
             }
         }
@@ -3451,6 +3530,22 @@ mod ai_cmd_tests {
             // RG0 §4.4: declare the FAST profile — px = declared word
             // (SOURCE empty), qty = sender-measured state word, ttl
             // 15 min, param_id = profile 0.
+            // BIN15 O4b §6.4.2: bind outcome 2649 Yes at strike
+            // $77,177 expiring at a fixed future ns, 60 s TWAP.
+            AiCmdKind::SetBinarySpec => AiCmd::new(
+                1,
+                1,
+                4096,
+                77_177_000_000,
+                1_789_194_600_000_000_000,
+                2649,
+                kind,
+                VenueId::Ai,
+                STRATEGY_SLOT_BIN15,
+                AI_SIDE_NONE,
+                60,
+                0,
+            ),
             AiCmdKind::SetRegime => AiCmd::new(
                 1,
                 1,
@@ -3483,7 +3578,7 @@ mod ai_cmd_tests {
         .0 & !(0xFFu64 << 48),
     );
 
-    const ALL_KINDS: [AiCmdKind; 13] = [
+    const ALL_KINDS: [AiCmdKind; 14] = [
         AiCmdKind::Heartbeat,
         AiCmdKind::EnableStrategy,
         AiCmdKind::DisableStrategy,
@@ -3497,7 +3592,104 @@ mod ai_cmd_tests {
         AiCmdKind::FundingSeed,
         AiCmdKind::PositionSeed,
         AiCmdKind::SetRegime,
+        AiCmdKind::SetBinarySpec,
     ];
+
+    #[test]
+    fn set_binary_spec_shape_rules() {
+        let ok = valid(AiCmdKind::SetBinarySpec);
+        assert_eq!(ok.validate_shape(), Ok(()));
+
+        // The slot is the gate: only bin15 may rebind a binary slot.
+        let mut wrong_slot = ok;
+        wrong_slot.strategy_id = STRATEGY_SLOT_VM;
+        assert_eq!(
+            wrong_slot.validate_shape(),
+            Err(AiCmdShapeError::BadStrategySlot(STRATEGY_SLOT_VM))
+        );
+
+        // The sym NAMES the slot, so it cannot be absent.
+        let mut no_sym = ok;
+        no_sym.sym = SYMBOL_ID_NONE;
+        assert_eq!(
+            no_sym.validate_shape(),
+            Err(AiCmdShapeError::BadSym(SYMBOL_ID_NONE))
+        );
+
+        // A strike outside $1 … $10 m is refused on both ends.
+        let mut zero_strike = ok;
+        zero_strike.px = 0;
+        assert!(matches!(
+            zero_strike.validate_shape(),
+            Err(AiCmdShapeError::BadPx(0))
+        ));
+        let mut huge_strike = ok;
+        huge_strike.px = 10_000_000_000_001;
+        assert!(matches!(
+            huge_strike.validate_shape(),
+            Err(AiCmdShapeError::BadPx(_))
+        ));
+
+        // Expiry must be positive; `qty > now` is the member's check,
+        // deliberately not this one — see the arm's comment.
+        let mut no_expiry = ok;
+        no_expiry.qty = 0;
+        assert!(matches!(
+            no_expiry.validate_shape(),
+            Err(AiCmdShapeError::BadQty(0))
+        ));
+
+        // The outcome id rides in `ttl_ns`, so a zero there is not an
+        // instance. (The drain's TTL-on-pop law does not apply: this
+        // kind is consumed by the member, not held.)
+        let mut no_outcome = ok;
+        no_outcome.ttl_ns = 0;
+        assert!(matches!(
+            no_outcome.validate_shape(),
+            Err(AiCmdShapeError::BadTtl(0))
+        ));
+
+        // A TWAP longer than an hour is not a settlement window.
+        let mut long_twap = ok;
+        long_twap.param_id = 3_601;
+        assert!(matches!(
+            long_twap.validate_shape(),
+            Err(AiCmdShapeError::BadParamId(3_601))
+        ));
+        let mut hour_twap = ok;
+        hour_twap.param_id = 3_600;
+        assert_eq!(hour_twap.validate_shape(), Ok(()), "one hour is the edge");
+
+        // A CLEAR carries NO instance: strike and expiry must be zero
+        // rather than stale, so a clear frame can never be replayed as
+        // a bind of whatever the sender happened to leave in the field.
+        let mut clear = ok;
+        clear.flags = AI_CMD_FLAG_CLEAR_SPEC;
+        assert!(matches!(
+            clear.validate_shape(),
+            Err(AiCmdShapeError::BadPx(_))
+        ));
+        clear.px = 0;
+        clear.qty = 0;
+        assert_eq!(clear.validate_shape(), Ok(()));
+
+        // No other flag bit is defined for this kind.
+        let mut bad_flags = ok;
+        bad_flags.flags = 1 << 3;
+        assert!(matches!(
+            bad_flags.validate_shape(),
+            Err(AiCmdShapeError::BadFlags(_))
+        ));
+
+        // And a side is meaningless here — the sym is the Yes leg and
+        // the No leg is the next ordinal.
+        let mut sided = ok;
+        sided.side = Side::Bid as u8;
+        assert!(matches!(
+            sided.validate_shape(),
+            Err(AiCmdShapeError::BadSide(_))
+        ));
+    }
 
     #[test]
     fn set_regime_shape_rules() {
@@ -3700,9 +3892,9 @@ mod ai_cmd_tests {
         // No `Resume` kind exists ANYWHERE in the table: halt is
         // sticky by design (risk-policy) — the wire cannot express
         // it. VM2 appended FundingSeed=10/PositionSeed=11, RG0
-        // appended SetRegime=12 (append-only ABI); the first
-        // unassigned byte is now 13.
-        assert_eq!(AiCmdKind::from_u8(13), None);
+        // appended SetRegime=12, BIN15 O4b appended SetBinarySpec=13
+        // (append-only ABI); the first unassigned byte is now 14.
+        assert_eq!(AiCmdKind::from_u8(14), None);
         assert_eq!(AiCmdKind::from_u8(0xFF), None);
     }
 
@@ -3777,10 +3969,11 @@ mod ai_cmd_tests {
 
     #[test]
     fn validate_rejects_unknown_kind_byte() {
-        // 13 = first unassigned kind byte after RG0's SetRegime = 12.
+        // 14 = first unassigned kind byte after BIN15 O4b's
+        // SetBinarySpec = 13.
         let mut c = valid(AiCmdKind::Heartbeat);
-        c.kind = 13;
-        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(13)));
+        c.kind = 14;
+        assert_eq!(c.validate_shape(), Err(AiCmdShapeError::UnknownKind(14)));
     }
 
     #[test]
@@ -4034,10 +4227,13 @@ mod vm2_v1_tests {
         assert_eq!(AiCmdKind::from_u8(11), Some(AiCmdKind::PositionSeed));
         assert_eq!(AiCmdKind::FundingSeed.to_u8(), 10);
         assert_eq!(AiCmdKind::PositionSeed.to_u8(), 11);
-        // RG0 appended SetRegime = 12; 13 is the first unassigned byte.
+        // RG0 appended SetRegime = 12, BIN15 O4b SetBinarySpec = 13;
+        // 14 is the first unassigned byte.
         assert_eq!(AiCmdKind::from_u8(12), Some(AiCmdKind::SetRegime));
         assert_eq!(AiCmdKind::SetRegime.to_u8(), 12);
-        assert_eq!(AiCmdKind::from_u8(13), None);
+        assert_eq!(AiCmdKind::from_u8(13), Some(AiCmdKind::SetBinarySpec));
+        assert_eq!(AiCmdKind::SetBinarySpec.to_u8(), 13);
+        assert_eq!(AiCmdKind::from_u8(14), None);
     }
 
     fn funding_seed() -> AiCmd {

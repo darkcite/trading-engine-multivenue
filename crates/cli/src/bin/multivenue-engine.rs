@@ -159,8 +159,8 @@ struct BacktestArgs {
     ruleset: Option<PathBuf>,
     /// Tier 3 (statarb doc 08 §6.2): drive a CODED member through the
     /// harness instead of the ruleset VM — `icdp` (with `--icdp <toml>`;
-    /// default `~/multivenue/icdp.toml`). Additive: the frozen worker
-    /// argv never passes it.
+    /// default `~/multivenue/icdp.toml`), `xsd`, `vrp`, `bin15`.
+    /// Additive: the frozen worker argv never passes it.
     #[arg(long)]
     member: Option<String>,
     /// `--member icdp`: the parameter artifact (`icdp.toml`).
@@ -180,6 +180,16 @@ struct BacktestArgs {
     /// replay alone — rows at or after the replay's first hour drop).
     #[arg(long, requires = "member")]
     xsd_seed: Option<PathBuf>,
+    /// `--member bin15`: the parameter artifact (`bin15.toml`; default
+    /// `~/multivenue/bin15.toml`).
+    #[arg(long, requires = "member")]
+    bin15: Option<PathBuf>,
+    /// `--member bin15`: the directory holding `bin15-seed-<COIN>.tsv`
+    /// and `bin15-seed-<COIN>-1d.tsv`. Default = the FIRST run
+    /// directory, so a replay is a closed world; pass
+    /// `~/multivenue` to fold the live cut in deliberately.
+    #[arg(long, requires = "member")]
+    bin15_seed_dir: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     #[arg(long)]
@@ -391,8 +401,25 @@ struct RunArgs {
     artifacts_path: Option<PathBuf>,
     /// Path to claude-worker rule JSON. Required for
     /// `--strategy rule-tree`.
+    ///
+    /// The STANDALONE rule-tree loop only. Slot 3 of the strategy set
+    /// is `strategy-bin15` since BIN15 O4b — `strategy-rule-tree` is
+    /// unlinked from the set, though the crate still builds and this
+    /// bare loop still runs.
     #[arg(long)]
     rules_path: Option<PathBuf>,
+    /// BIN15 O4b: the slot-3 parameter artifact
+    /// (`~/multivenue/bin15.toml` by default). Read only when the
+    /// requested mask carries the bin15 bit (`--strategy bin15` /
+    /// `ai+bin15` / … / `all`); an absent or unresolvable artifact
+    /// refuses the boot with the bit set — never a silent no-op.
+    #[arg(long)]
+    bin15: Option<PathBuf>,
+    /// BIN15 O4b: directory holding `bin15-seed-<COIN>.tsv`
+    /// (`~/multivenue/` by default). An ABSENT seed is legal — a cold
+    /// boot must be — and the member holds until its HAR window warms.
+    #[arg(long)]
+    bin15_seed_dir: Option<PathBuf>,
     /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
     /// by default). Read only when the requested mask carries the icdp
     /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
@@ -596,7 +623,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         None => None,
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
-                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd, vrp)");
+                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15)");
                 return ExitCode::from(1);
             };
             let params = match kind {
@@ -630,6 +657,16 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         }
                     },
                 },
+                cli::backtest::member::MemberKind::Bin15 => match args.bin15.clone() {
+                    Some(p) => p,
+                    None => match core_config::bin15::default_bin15_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member bin15 needs --bin15 <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
             };
             Some(cli::backtest::member::MemberSpec {
                 kind,
@@ -637,6 +674,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                 table: args.xsd_table.clone(),
                 seed: args.xsd_seed.clone(),
                 vrp_seed: args.vrp_seed.clone(),
+                bin15_seed_dir: args.bin15_seed_dir.clone(),
             })
         }
     };
@@ -2187,8 +2225,8 @@ fn run(args: RunArgs) -> ExitCode {
         ) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // latency-arb from the mandatory pair flags, rule-tree
-            // only when its config flag is present, vrp only when
+            // latency-arb from the mandatory pair flags, bin15 only
+            // when its artifact resolves, vrp only when
             // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
             // artifact resolves (slot 2 is vacant — XSD-S),
             // ai-exec and vm unconditionally (neither has boot
@@ -2202,16 +2240,6 @@ fn run(args: RunArgs) -> ExitCode {
             // live arm.
             let requested =
                 strategy_set::mask_for_name(name).expect("matched names are valid mask names");
-            // Rule mapping: same v1 shape as the standalone rule-tree
-            // arm (every rule → --polymarket-sym-id, "halving" kw).
-            let mut kw = [0u8; 16];
-            let n = b"halving".len().min(16);
-            kw[..n].copy_from_slice(&b"halving"[..n]);
-            let mapping = vec![(boot.allocated.pm_tokens[0].sym, kw, n as u8)];
-            let rules = args
-                .rules_path
-                .as_deref()
-                .map(|rp| (rp, mapping.as_slice()));
             // ICDP I5: resolve the artifact against the SAME
             // descriptor table the ruleset validator uses (D-6 truth).
             // Only when the bit is requested — `--strategy ai` never
@@ -2317,6 +2345,43 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 None
             };
+            // BIN15 O4b: slot 3's artifact, resolved against the same
+            // descriptor table. The Yes slots come from the UNIVERSE
+            // (the rolling ordinals it allocated), not from a
+            // descriptor: a rolling slot's venue coin is rebound per
+            // instance, so it has no stable descriptor to resolve.
+            let rolling_syms: Vec<core_types::SymbolId> = (0..boot.hl_rolling.len())
+                .map(|f| ingress_hyperliquid::family::rolling_sym(f, 0))
+                .collect();
+            let bin15_boot = if cli::bin15_boot::bin15_wanted(requested) {
+                match cli::bin15_boot::load_bin15_boot(
+                    args.bin15.as_deref(),
+                    args.bin15_seed_dir.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &boot.hl_rolling,
+                    &rolling_syms,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "bin15: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            // F19 / the icdp law: requested-but-absent REFUSES. Booting
+            // `ai+bin15` silently as `ai` is how an operator comes to
+            // watch a member that was never there.
+            if cli::bin15_boot::bin15_wanted(requested) && bin15_boot.is_none() {
+                error!(
+                    "bin15: requested by --strategy but the artifact is absent \
+                     (~/multivenue/bin15.toml or --bin15) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
@@ -2332,7 +2397,7 @@ fn run(args: RunArgs) -> ExitCode {
                 requested,
                 vrp_boot.as_ref(),
                 xsd_boot.as_ref(),
-                rules,
+                bin15_boot.as_ref(),
                 icdp_params.as_ref(),
                 regime_boot.as_ref(),
             )

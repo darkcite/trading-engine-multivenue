@@ -837,6 +837,7 @@ struct RunSummary {
 /// depth = 16+vi, opt = 24+vi, synthetic mark-ticks = 40+vi — ticks
 /// sort first at equal (ts, venue), preserving the book-before-
 /// analytics reading order.
+#[allow(clippy::too_many_arguments)]
 fn load_run(
     run: &RunDir,
     remap: &BTreeMap<u32, u32>,
@@ -844,6 +845,7 @@ fn load_run(
     opt_reg: &opt_registry::OptRegistry,
     opt_out: &mut opt::OptLoadOut,
     stale_after_ms: [u32; 7],
+    binary_underlyings: &BTreeSet<u32>,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
@@ -982,8 +984,29 @@ fn load_run(
                 )));
             }
             for (i, e) in reader.records().iter().enumerate() {
-                let keep =
-                    e.channel == ChannelId::Funding as u8 || e.channel == ChannelId::AssetCtx as u8;
+                // The channels a REPLAY consumes. Funding and AssetCtx
+                // are the vm's; `InstrumentRoll` is the HIP-4 lifecycle
+                // that the binary settlement law (O3) and the bin15
+                // member (O4b) both read — without it, a capture full
+                // of rolls merges to nothing and the member reports a
+                // clean zero, which is what it did until O4b came
+                // looking for a fill it could predict.
+                //
+                // `Mark` is admitted ONLY for a HIP-4 UNDERLYING, and
+                // that restriction is load-bearing rather than tidy:
+                // `Mark` is also OKX's mark-price channel, which every
+                // historical root carries in bulk and which no consumer
+                // reads. Admitting those would add records to the merge
+                // on every root ever captured — moving `merged_records`,
+                // the IS/OOS boundary and therefore every pooled VM
+                // number, for a channel nothing looks at. A root with no
+                // HIP-4 instrument has an empty set here and merges
+                // byte for byte as it always did.
+                let is_mark = e.channel == ChannelId::Mark as u8;
+                let keep = e.channel == ChannelId::Funding as u8
+                    || e.channel == ChannelId::AssetCtx as u8
+                    || e.channel == ChannelId::InstrumentRoll as u8
+                    || is_mark;
                 if !keep {
                     continue;
                 }
@@ -993,6 +1016,11 @@ fn load_run(
                         Some(s) => s,
                         None => continue,
                     };
+                }
+                // Post-remap, because the set is keyed on the newest
+                // manifest's ordinals like everything else downstream.
+                if is_mark && !binary_underlyings.contains(&ev.sym) {
+                    continue;
                 }
                 recs.push(MergeKeyed {
                     ts_ns: e.ts_ns,
@@ -1255,6 +1283,10 @@ fn load_and_merge(
     // descriptor table. The roll event carries a family index, which
     // means nothing across runs; the descriptor carries the coin.
     *binary_underlying = binary::underlying_map(&newest_by_desc);
+    // The UNDERLYING syms, for the `Mark` admission rule in `load_run`.
+    // Empty on every root without a HIP-4 instrument, which is what
+    // keeps those roots' merges byte-identical.
+    let binary_underlyings: BTreeSet<u32> = binary_underlying.values().copied().collect();
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedRec> = Vec::new();
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(runs.len());
@@ -1294,7 +1326,15 @@ fn load_and_merge(
         // its records through `Unregistered`, which reads exactly like
         // "not an option at all" — so it is counted, not swallowed.
         let (opt_reg, registry_refused) = opt::registry_from_manifest_rows(&manifest_rows);
-        let (recs, mut summary) = load_run(run, &remap, &dead, &opt_reg, opt_out, stale_after_ms)?;
+        let (recs, mut summary) = load_run(
+            run,
+            &remap,
+            &dead,
+            &opt_reg,
+            opt_out,
+            stale_after_ms,
+            &binary_underlyings,
+        )?;
         summary.opt_registry_refused = registry_refused;
         summaries.push(summary);
         if recs.is_empty() {
@@ -2328,6 +2368,9 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             &engine,
             &run_summaries,
             &regime_report,
+            // The VM path has no additive block, so its bytes are the
+            // bytes the pooled guard hashes.
+            "",
         );
         std::fs::write(detail_path, detail).map_err(|e| {
             HarnessError::Usage(format!(
@@ -2818,6 +2861,7 @@ fn render_detail(
     engine: &FillEngine,
     runs: &[RunSummary],
     regime: &RegimeReport,
+    extra: &str,
 ) -> String {
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
@@ -2947,6 +2991,16 @@ fn render_detail(
     }
     s.push_str("],");
     s.push_str(&render_regime_detail(stats, regime));
+    // BIN15 O4b: ONE additive top-level block, supplied by the caller
+    // and EMPTY for every caller that has none — so the VM path's bytes
+    // are unchanged and the standing pooled-sidecar guard still reads
+    // `e3f6b8efd7b7a1d0`. `detail_version` deliberately stays 7: a key
+    // that appears only on one member's runs is additive, and a bump
+    // would move that guard and the three tests that pin the prefix.
+    if !extra.is_empty() {
+        s.push(',');
+        s.push_str(extra);
+    }
     s.push_str("}\n");
     s
 }

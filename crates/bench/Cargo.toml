@@ -41,6 +41,7 @@ core-vol             = { workspace = true }
 opt-registry         = { workspace = true }
 book-builder         = { workspace = true }
 strategy-ai-exec     = { workspace = true }
+strategy-bin15       = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }

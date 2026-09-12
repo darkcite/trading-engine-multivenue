@@ -458,8 +458,9 @@ fn preview(payload: &[u8]) -> String {
 
 /// Short per-kind labels, index = `AiCmd::kind` byte (wire-format §3
 /// order). Unknown bytes are counted separately. Sized by the last
-/// appended kind (`SetRegime = 12`, RG0) — the pre-RG0 table stopped at
-/// `Halt` and indexed out of bounds on a captured seed (kinds 10/11).
+/// appended kind (`SetBinarySpec = 13`, BIN15 O4b) — the pre-RG0 table
+/// stopped at `Halt` and indexed out of bounds on a captured seed
+/// (kinds 10/11).
 const AI_KIND_LABELS: [&str; AI_KIND_COUNT] = [
     "HB",
     "Enable",
@@ -474,10 +475,13 @@ const AI_KIND_LABELS: [&str; AI_KIND_COUNT] = [
     "FundSeed",
     "PosSeed",
     "SetRegime",
+    "BinSpec",
 ];
 
-/// `AiCmdKind::SetRegime as usize + 1` — every wire kind has a label.
-const AI_KIND_COUNT: usize = AiCmdKind::SetRegime as usize + 1;
+/// `AiCmdKind::SetBinarySpec as usize + 1` — every wire kind has a
+/// label. Derived from the LAST kind, so appending one is a compile
+/// error until the label is written.
+const AI_KIND_COUNT: usize = AiCmdKind::SetBinarySpec as usize + 1;
 
 /// Cap on rendered TTL'd-at-pop previews (tap-preview convention).
 const MAX_TTL_PREVIEWS: usize = 8;

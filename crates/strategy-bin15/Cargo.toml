@@ -1,0 +1,17 @@
+[package]
+name         = "strategy-bin15"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "BIN15 rolling-binary member: HIP-4 outcome markets priced off a core-vol 15 m forecast, IoC taker + paper maker arms (slot 3)"
+
+[dependencies]
+core-fill     = { workspace = true }
+core-regime   = { workspace = true }
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+core-vol      = { workspace = true }
+strategy-core = { workspace = true }

@@ -112,6 +112,7 @@ fn member_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
             table: None,
             seed: None,
             vrp_seed: None,
+            bin15_seed_dir: None,
         }),
     }
 }
@@ -369,6 +370,7 @@ fn xsd_member_enters_and_reverts_on_the_wall_hour_grid() {
         table: Some(table),
         seed: Some(seed),
         vrp_seed: None,
+        bin15_seed_dir: None,
     });
     let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
     let hash = core_crypto::sha256(XSD_TOML.as_bytes());
@@ -415,6 +417,7 @@ fn xsd_member_without_a_table_is_refused_with_a_reason() {
         table: Some(root.join("absent-table.tsv")),
         seed: Some(seed),
         vrp_seed: None,
+        bin15_seed_dir: None,
     });
     let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
         Ok(_) => panic!("an explicit absent table must refuse the run"),
@@ -677,6 +680,7 @@ fn vrp_cfg(replay: &Path, toml: &Path, seed: Option<PathBuf>) -> BacktestConfig 
         table: None,
         seed: None,
         vrp_seed: seed,
+        bin15_seed_dir: None,
     });
     cfg
 }
@@ -744,5 +748,341 @@ fn member_vrp_refuses_a_missing_chain() {
         Err(e) => format!("{e}"),
     };
     assert!(msg.contains("options chain holds no BTC option"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------
+// BIN15 O4b (spec §6.6) — `backtest --member bin15`
+// ---------------------------------------------------------------
+//
+// One synthetic Hyperliquid run carrying the three channels the member
+// reads: an `InstrumentRoll` created row that binds the instance, the
+// underlying's `Mark` series that prices it, and ticks on both binary
+// legs. The forecast arrives WARM from the seed the worker cuts, which
+// is the only way a 15-minute member can price inside a ≤ 2 h window —
+// 1 440 minutes of HAR warm-up do not fit in one.
+//
+// The tape is arranged so the fair value is not a matter of opinion:
+// the strike sits 11 % below the mark, which is tens of standard
+// deviations at a 20 bps quarter-hour, so `d` saturates the table's
+// clamp and the Yes leg is worth 1.0. A resident ask at 0.40 is
+// therefore 60 c wrong, the member takes it, and the instance settles
+// in the money for a payout the arithmetic can be checked by hand.
+
+/// 2026-09-12T06:00:00Z — minute- and hour-aligned, so the member's
+/// minute grid rolls cleanly under the identity wall anchor.
+const BIN15_EPOCH_NS: u64 = 1_789_192_800_000_000_000;
+const BIN15_EPOCH_MS: u64 = BIN15_EPOCH_NS / 1_000_000;
+
+/// The instance: expires 600 s in, settles over a 60 s mark TWAP.
+const BIN15_EXPIRY_NS: u64 = BIN15_EPOCH_NS + 600_000_000_000;
+const BIN15_TWAP_S: u16 = 60;
+const BIN15_OUTCOME: u32 = 2650;
+/// 11 % below the mark: a certainty at any plausible 15 m volatility.
+const BIN15_STRIKE_1E6: i64 = 70_000_000_000;
+const BIN15_MARK_1E6: i64 = 79_000_000_000;
+
+/// Per-minute return that makes σ over a quarter-hour 20 bps:
+/// `σ_min = 20/√15 = 5.164 bps`, and the seed carries returns directly.
+const BIN15_R_1E9: i64 = 5_164_000_000;
+
+const BIN15_EXAMPLE: &str = include_str!("../../../bin15.toml.example");
+
+/// The committed example with some knob lines rewritten. Comments and
+/// the 33 KB table lines pass through untouched, so what the test
+/// drives is the SHIPPED Φ and the shipped recalibration.
+fn bin15_artifact(overrides: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(BIN15_EXAMPLE.len());
+    for line in BIN15_EXAMPLE.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            if let Some(key) = line.split('=').next().map(str::trim) {
+                if let Some((k, v)) = overrides.iter().find(|(k, _)| *k == key) {
+                    out.push_str(&format!("{k} = {v}\n"));
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn bin15_yes_sym() -> u32 {
+    ingress_hyperliquid::family::rolling_sym(0, 0)
+}
+
+fn bin15_no_sym() -> u32 {
+    ingress_hyperliquid::family::rolling_sym(0, 1)
+}
+
+fn bin15_btc_sym() -> u32 {
+    core_types::make_symbol_id(VenueId::Hyperliquid, 3)
+}
+
+fn bin15_at(secs: u64) -> u64 {
+    BIN15_EPOCH_NS + secs * 1_000_000_000
+}
+
+fn bin15_at_ms(ms: u64) -> u64 {
+    BIN15_EPOCH_NS + ms * 1_000_000
+}
+
+fn bin15_roll(family: u8, settled: bool) -> core_types::ChannelEvent {
+    let seq = u64::from(BIN15_OUTCOME)
+        | (u64::from(BIN15_TWAP_S) << 32)
+        | (u64::from(family) << 48)
+        | (u64::from(settled) << 56);
+    core_types::ChannelEvent::new(
+        bin15_at(0),
+        VenueId::Hyperliquid,
+        core_types::ChannelId::InstrumentRoll,
+        bin15_yes_sym(),
+        seq,
+        0,
+        BIN15_STRIKE_1E6,
+        BIN15_EXPIRY_NS as i64,
+    )
+}
+
+fn bin15_mark(at_s: u64) -> core_types::ChannelEvent {
+    core_types::ChannelEvent::new(
+        bin15_at(at_s),
+        VenueId::Hyperliquid,
+        core_types::ChannelId::Mark,
+        bin15_btc_sym(),
+        0,
+        0,
+        BIN15_MARK_1E6,
+        0,
+    )
+}
+
+fn bin15_tick(sym: u32, at_ms: u64, bid_1e6: i64, ask_1e6: i64, seq: u32) -> Tick {
+    Tick::new(
+        bin15_at_ms(at_ms),
+        VenueId::Hyperliquid,
+        sym,
+        seq,
+        Price::from_raw(bid_1e6),
+        Qty::from_raw(100_000_000),
+        Price::from_raw(ask_1e6),
+        Qty::from_raw(100_000_000),
+    )
+}
+
+/// The seed the worker's `bin15_seed` lane writes: 1 441 stamped
+/// returns to fill the HAR window, and 60 pairs ON THE IDENTITY LINE
+/// (`y = x`), so the fit is `a = 0, b = 1` and `ln σ̂` IS `ln har` —
+/// the fixture cannot drift into an extrapolation nobody intended.
+fn bin15_seed_text() -> String {
+    let mut s = String::from("V\t2\n");
+    let mut k = 0u64;
+    while k < 60 {
+        let x = 23_000_000_000i64 + k as i64 * 100_000_000;
+        s.push_str(&format!(
+            "P\t{}\t{x}\t{x}\n",
+            BIN15_EPOCH_MS - (60 - k) * 900_000
+        ));
+        k += 1;
+    }
+    let mut i = 0u64;
+    while i < 1_441 {
+        let r = if i % 2 == 0 { BIN15_R_1E9 } else { -BIN15_R_1E9 };
+        s.push_str(&format!("R\t{}\t{r}\n", BIN15_EPOCH_MS - (1_441 - i) * 60_000));
+        i += 1;
+    }
+    s
+}
+
+/// `(replay root, bin15.toml)`. `family` is the byte the roll carries —
+/// 0 for the happy path, anything else for the mismatch test.
+fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf, PathBuf) {
+    let run = root.join(format!("run-{BIN15_EPOCH_NS}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    std::fs::write(
+        run.join("instrument-manifest.tsv"),
+        format!(
+            "{}\thyperliquid:out:BTC:15m[yes]\n{}\thyperliquid:out:BTC:15m[no]\n{}\thyperliquid:BTC\n",
+            bin15_yes_sym(),
+            bin15_no_sym(),
+            bin15_btc_sym(),
+        ),
+    )
+    .expect("manifest");
+
+    // The events: the roll that binds the instance, then the marks.
+    // Two marks in different minutes are what publish σ̂ (the
+    // transcendentals run once a minute, never per tick), and the four
+    // after expiry are the settlement TWAP.
+    let mut events = vec![bin15_roll(family, false), bin15_mark(1), bin15_mark(61)];
+    for at in [600u64, 620, 640, 660] {
+        events.push(bin15_mark(at));
+    }
+    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, BIN15_EPOCH_NS)
+        .expect("open events");
+    for e in &events {
+        w.append(e).expect("append event");
+    }
+    w.flush().expect("flush events");
+
+    // The books. BOTH legs must be actionable before either arm fires:
+    // a one-sided family is a book the member refuses to price against.
+    // The second Yes tick is 300 ms after the first, not a second: the
+    // IoC carries `requote_ttl_ns` (1 s) and can only fill on a LATER
+    // record, so a tick exactly one second out expires it instead.
+    let ticks = [
+        bin15_tick(bin15_no_sym(), 62_000, 390_000, 600_000, 1),
+        bin15_tick(bin15_yes_sym(), 63_000, 300_000, 400_000, 2), // 60 c wrong ⇒ take
+        bin15_tick(bin15_yes_sym(), 63_300, 300_000, 400_000, 3), // the IoC fills here
+        // Past the settlement instant, so the window HOLDS the payout.
+        bin15_tick(bin15_yes_sym(), 661_000, 300_000, 400_000, 4),
+    ];
+    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, BIN15_EPOCH_NS)
+        .expect("open ticks");
+    for t in &ticks {
+        w.append(t).expect("append tick");
+    }
+    w.flush().expect("flush ticks");
+
+    std::fs::write(run.join("bin15-seed-BTC.tsv"), bin15_seed_text()).expect("seed");
+    let toml = root.join("bin15.toml");
+    std::fs::write(
+        &toml,
+        bin15_artifact(&[
+            ("families", families_toml),
+            ("underlying", "[\"hyperliquid:BTC\"]"),
+            // Arm A only, and never the null arm: this test is about
+            // the pricer reaching a book, not about the A/B design.
+            ("maker_enabled", "0"),
+            ("null_arm", "0"),
+            // $40 is exactly 100 contracts at 0.40, so the clip that
+            // trades is bounded by all three of the resting ask size,
+            // `clip_qty_1e6` and the cap room — and the P&L below is a
+            // whole number of contracts rather than a cap remainder.
+            ("cap_instance_usd_1e6", "40000000"),
+            ("cap_day_usd_1e6", "40000000"),
+        ]),
+    )
+    .expect("write bin15.toml");
+    (root.to_path_buf(), toml)
+}
+
+fn bin15_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
+    let mut cfg = member_cfg(replay, toml);
+    cfg.fee_bps = vec!["hl:0:0".to_owned()];
+    cfg.stale_after_ms = vec!["hl:0".to_owned()];
+    cfg.member = Some(MemberSpec {
+        kind: MemberKind::Bin15,
+        params: toml.to_path_buf(),
+        table: None,
+        seed: None,
+        vrp_seed: None,
+        bin15_seed_dir: None,
+    });
+    cfg
+}
+
+#[test]
+fn member_bin15_prices_takes_and_settles_on_a_synthetic_root() {
+    let root = unique_root("bin15");
+    let (replay, toml) = build_bin15_capture(&root, 0, "[\"out:BTC:15m\"]");
+    let mut cfg = bin15_cfg(&replay, &toml);
+    cfg.emit_detail = Some(root.join("detail.json"));
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+
+    // Schema-1's identity is the artifact's own bytes — the same hash
+    // the boot tell stamps.
+    let hash = core_crypto::sha256(std::fs::read(&toml).expect("read toml").as_slice());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        out.schema1.contains(&format!("\"ruleset_hash\":\"{hex}\"")),
+        "schema1: {}",
+        out.schema1
+    );
+    // The boot line: one family, one underlying, one instance, seeded.
+    assert!(out.summary.contains("member: bin15 params="), "{}", out.summary);
+    assert!(
+        out.summary.contains(" families=1 underlyings=1 instances=1 seeds=1 "),
+        "{}",
+        out.summary
+    );
+    assert!(out.summary.contains("anchor=wall (identity)"), "{}", out.summary);
+
+    // It priced, and it took exactly once: one pending take per family,
+    // and after the fill the bid is never rich enough to close.
+    assert!(out.summary.contains(" rolls=1 "), "{}", out.summary);
+    assert!(out.summary.contains(" takes_submitted=1 takes_filled=1 "), "{}", out.summary);
+    assert!(out.summary.contains(" takes_unfilled=0 "), "{}", out.summary);
+    // ONE take, though the edge is 60 c and there are two Yes ticks:
+    // the second re-price sees the first IoC still pending and holds.
+    // One pending take per family is what stops a member from
+    // committing the same clip twice while an intent is in flight —
+    // the fill arrives AFTER `on_tick` in the drive, so the pending is
+    // still live when the second tick re-prices.
+    assert!(out.summary.contains(" skipped_cap=0 "), "{}", out.summary);
+    assert!(out.summary.contains(" quotes_submitted=0 "), "maker was off: {}", out.summary);
+    assert!(out.summary.contains(" unknown_fills=0 "), "{}", out.summary);
+    assert_eq!(out.stats.fills_total, 1, "{}", out.summary);
+    assert_eq!(out.stats.ioc_fills, 1, "{}", out.summary);
+
+    // The arithmetic, by hand: 100 contracts bought at 0.40 against a
+    // strike 11 % in the money, settling at 1.0 ⇒ +$60 at zero fee.
+    let key = "\"net_pnl_usd\":";
+    let i = out.schema1.find(key).expect("net field") + key.len();
+    let j = out.schema1[i..].find(',').expect("comma") + i;
+    let net: f64 = out.schema1[i..j].parse().expect("json number");
+    assert!((59.0..=61.0).contains(&net), "net {net}: {}", out.schema1);
+
+    // The calibration ledger (the O5 / G6.1 instrument). It is
+    // additive: `detail_version` stays 7.
+    let detail = std::fs::read_to_string(root.join("detail.json")).expect("detail");
+    assert!(detail.starts_with("{\"detail_version\":7,"), "{detail}");
+    assert!(detail.contains("\"bin15_ledger\":["), "no ledger: {detail}");
+    assert!(
+        detail.contains(&format!("\"outcome\":{BIN15_OUTCOME}")),
+        "the ledger names the instance: {detail}"
+    );
+    // `y` is the payout the fill model actually used, not a second
+    // derivation of it — this instance settled in the money.
+    assert!(detail.contains("\"y\":1000000"), "ledger y: {detail}");
+    // A priced row carries a fair value nowhere near a coin flip: the
+    // strike is 11 % below the mark, so Φ saturates its clamp.
+    assert!(detail.contains("\"p_raw_1e6\":999979"), "ledger p_raw: {detail}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn member_bin15_refuses_a_family_mismatch() {
+    // The capture rolls family 1; the artifact configures one family,
+    // so index 1 does not exist. Binding nothing for it and reporting a
+    // clean zero would look exactly like a member that had nothing to
+    // do, which is why this refuses instead.
+    let root = unique_root("bin15-mismatch");
+    let (replay, toml) = build_bin15_capture(&root, 1, "[\"out:BTC:15m\"]");
+    let cfg = bin15_cfg(&replay, &toml);
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("a capture naming an unconfigured family must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("rolls family index 1"), "{msg}");
+    assert!(msg.contains("configures only 1 families"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn member_bin15_refuses_a_permuted_family_list() {
+    // The order check at boot: the artifact's list plays the part
+    // `universe.toml`'s `rolling` plays live, and a key that is not a
+    // family key at all is refused before any slot is bound.
+    let root = unique_root("bin15-badkey");
+    let (replay, toml) = build_bin15_capture(&root, 0, "[\"out:BTC:1d\"]");
+    let cfg = bin15_cfg(&replay, &toml);
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("a crossed family key must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("crossed forms are refused"), "{msg}");
     let _ = std::fs::remove_dir_all(&root);
 }

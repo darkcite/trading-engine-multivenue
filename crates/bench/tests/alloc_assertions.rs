@@ -5451,3 +5451,270 @@ fn vrp_member_p4_decision_paths_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "P4 decision-path hot bytes should be zero: saw {bytes}");
 }
+
+/// Gate 52 (BIN15 O4b, spec §6.4): the bin15 member's live callbacks at
+/// full width — eight families over four underlyings, 100 rolls, 10 000
+/// `Mark` events with their per-minute forecast refresh, both binary
+/// legs ticking, both arms armed, the 1 s timer sweeping pendings, and
+/// every order it emits coming straight back as a fill.
+///
+/// The boot box is not measured: the lookup tables are 17 KiB on the
+/// heap by design (`Box<Bin15Luts>`), the two `VolEngine`s per
+/// underlying are boxed, and the seeds replay 1 441 returns and 60
+/// pairs per underlying per tenor. All of that happens before the
+/// guard, which is the point — after `configure` the member must never
+/// allocate again.
+///
+/// What this gate actually protects: the re-price runs on EVERY mark of
+/// EVERY underlying (one mark moves every binary struck against it), so
+/// a member with eight families on four coins re-prices twenty thousand
+/// times over this tape. An allocation anywhere on that path — a `Vec`
+/// for the arms' candidate list, a `format!` in a counter's name, a
+/// `Box` for a pending — would be invisible at the call site and fatal
+/// at 4 marks a second per coin.
+#[test]
+fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
+    use core_types::{make_symbol_id, ChannelEvent, ChannelId, Order};
+    use strategy_bin15::{
+        price, Bin15Params, Bin15Strategy, FAMILY_NATIVE_DAILY, FAMILY_OUT_15M,
+        BIN15_MAX_FAMILIES, BIN15_MAX_UNDERLYINGS,
+    };
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    const MONO0: u64 = 4_100_000_000_000_000;
+    const WALL0: u64 = 1_789_171_200_000_000_000; // 2026-09-12 00:00:00Z
+    /// Marks per instance, one a second.
+    const MARKS_PER_ROLL: u64 = 100;
+    const ROLLS: usize = 100;
+
+    struct SinkCtx {
+        n: u64,
+        last: Option<Order>,
+        now: u64,
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            self.last = Some(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let under_sym = |u: usize| make_symbol_id(VenueId::Hyperliquid, 3 + u as u32);
+    let yes_sym = |f: usize| make_symbol_id(VenueId::Hyperliquid, 400 + 2 * f as u32);
+
+    // Eight families over four underlyings: the 15 m four and the
+    // native-daily four, so both tenors of every coin are live at once
+    // — which is ruling O-Q7's shape and the reason a `MarkState`
+    // carries two forecast engines.
+    let mut params = Bin15Params::default();
+    let mut f = 0usize;
+    while f < BIN15_MAX_FAMILIES {
+        params.sym_yes[f] = yes_sym(f);
+        params.sym_no[f] = yes_sym(f) + 1;
+        params.family_underlying[f] = (f % BIN15_MAX_UNDERLYINGS) as u8;
+        params.family_kind[f] = if f < 4 {
+            FAMILY_OUT_15M
+        } else {
+            FAMILY_NATIVE_DAILY
+        };
+        f += 1;
+    }
+    params.n_families = BIN15_MAX_FAMILIES;
+    let mut u = 0usize;
+    while u < BIN15_MAX_UNDERLYINGS {
+        params.underlying_sym[u] = under_sym(u);
+        u += 1;
+    }
+    params.n_underlyings = BIN15_MAX_UNDERLYINGS;
+    // A daily family's floors are an hour, which no gate window reaches;
+    // shrink them so one tape exercises both kinds' arms.
+    params.tau_min_take_ns = [60_000_000_000, 60_000_000_000];
+    params.tau_min_quote_ns = [120_000_000_000, 120_000_000_000];
+    params.maker_enabled = 1;
+    params.null_arm = 1;
+    params.cap_instance_usd_1e6 = 1_000_000_000;
+    params.cap_day_usd_1e6 = 1_000_000_000_000;
+
+    // A real CDF shape, boxed before the guard.
+    let mut luts = Box::new(price::Bin15Luts::identity());
+    let mut i = 0usize;
+    while i < price::PHI_POINTS {
+        luts.phi[i] = (500_000 + (i as i64 * 499_950) / (price::PHI_POINTS as i64 - 1)) as u32;
+        i += 1;
+    }
+    let mut m = Bin15Strategy::new();
+    m.configure(params, luts, core_time::WallAnchor::new(MONO0, WALL0))
+        .expect("configure");
+
+    // Boot seeds (not measured): 1 441 stamped returns fill the HAR
+    // window and 60 pairs on the identity line fit the forecast, per
+    // underlying and per tenor.
+    let mut u = 0usize;
+    while u < BIN15_MAX_UNDERLYINGS {
+        let mut rets: Vec<(u64, i64)> = Vec::with_capacity(1_441);
+        let mut k = 0u64;
+        while k < 1_441 {
+            let r = if k % 2 == 0 { 5_164_000_000 } else { -5_164_000_000 };
+            rets.push((WALL0 / 1_000_000 - (1_441 - k) * 60_000, r));
+            k += 1;
+        }
+        m.seed_returns(u, &rets);
+        let mut pairs: Vec<(u64, i64, i64)> = Vec::with_capacity(60);
+        let mut k = 0i64;
+        while k < 60 {
+            let x = 23_000_000_000 + k * 100_000_000;
+            pairs.push((WALL0 / 1_000_000 - (60 - k as u64) * 900_000, x, x));
+            k += 1;
+        }
+        m.seed_pairs(u, FAMILY_OUT_15M, &pairs);
+        m.seed_pairs(u, FAMILY_NATIVE_DAILY, &pairs);
+        u += 1;
+    }
+
+    let at = |secs: u64| MONO0 + secs * 1_000_000_000;
+    let mark_ev = |u: usize, px_1e6: i64, ts: u64| {
+        ChannelEvent::new(
+            ts,
+            VenueId::Hyperliquid,
+            ChannelId::Mark,
+            under_sym(u),
+            0,
+            0,
+            px_1e6,
+            0,
+        )
+    };
+    let roll_ev = |fam: usize, outcome: u32, strike_1e6: i64, expiry_wall: u64, settled: bool| {
+        let seq = u64::from(outcome)
+            | (60u64 << 32)
+            | ((fam as u64) << 48)
+            | (u64::from(settled) << 56);
+        ChannelEvent::new(
+            at(0),
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            yes_sym(fam),
+            seq,
+            0,
+            strike_1e6,
+            expiry_wall as i64,
+        )
+    };
+    let leg_tick = |sym: SymbolId, ts: u64, bid_1e6: i64, ask_1e6: i64| {
+        Tick::new(
+            ts,
+            VenueId::Hyperliquid,
+            sym,
+            0,
+            Price::from_raw(bid_1e6),
+            Qty::from_raw(100_000_000),
+            Price::from_raw(ask_1e6),
+            Qty::from_raw(100_000_000),
+        )
+    };
+
+    let mut ctx = SinkCtx {
+        n: 0,
+        last: None,
+        now: at(0),
+    };
+    // One mark per underlying before the guard, so the first measured
+    // mark is a minute ROLL and not a cold first sighting.
+    let mut u = 0usize;
+    while u < BIN15_MAX_UNDERLYINGS {
+        m.on_venue_event(&mark_ev(u, 79_000_000_000, at(0)), &mut ctx);
+        u += 1;
+    }
+
+    // Measured.
+    let g = AllocGuard::new();
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut mark_px = [79_000_000_000i64; BIN15_MAX_UNDERLYINGS];
+    let mut marks_seen = 0u64;
+    let mut roll = 0usize;
+    while roll < ROLLS {
+        let fam = roll % BIN15_MAX_FAMILIES;
+        let t0 = 1 + roll as u64 * MARKS_PER_ROLL;
+        let outcome = 2_600 + roll as u32;
+        ctx.now = at(t0);
+        // The outgoing instance settles, then the successor binds — the
+        // venue's own order inside one push burst.
+        if roll >= BIN15_MAX_FAMILIES {
+            m.on_venue_event(
+                &roll_ev(fam, 2_600 + (roll - BIN15_MAX_FAMILIES) as u32, 0, 0, true),
+                &mut ctx,
+            );
+        }
+        // A strike 10 % below the mark: the Yes leg is a certainty, so
+        // a resident ask at 0.40 is always takeable and the arms run
+        // every time rather than only when the walk happens to cross.
+        m.on_venue_event(
+            &roll_ev(
+                fam,
+                outcome,
+                71_000_000_000,
+                WALL0 + (t0 + 900) * 1_000_000_000,
+                false,
+            ),
+            &mut ctx,
+        );
+        let mut k = 0u64;
+        while k < MARKS_PER_ROLL {
+            let ts = at(t0 + k);
+            ctx.now = ts;
+            let ui = (roll + k as usize) % BIN15_MAX_UNDERLYINGS;
+            mark_px[ui] = (mark_px[ui] + (next() % 20_000_001) as i64 - 10_000_000)
+                .max(60_000_000_000);
+            m.on_venue_event(&mark_ev(ui, mark_px[ui], ts), &mut ctx);
+            marks_seen += 1;
+            // Both legs tick every tenth second; both must be
+            // actionable before either arm fires.
+            if k % 10 == 0 {
+                m.on_tick(&leg_tick(yes_sym(fam) + 1, ts, 390_000, 600_000), &mut ctx);
+                m.on_tick(&leg_tick(yes_sym(fam), ts, 300_000, 400_000), &mut ctx);
+                // Every order comes straight back as a full fill, so
+                // `book_fill` — which moves the position and clears the
+                // pending — is inside the guard too.
+                if let Some(o) = ctx.last.take() {
+                    let fill =
+                        core_types::Fill::new(ts, o.sym, o.side, o.px, o.qty, o.client_oid);
+                    m.on_fill(&fill, &mut ctx);
+                }
+                m.on_timer(ts, &mut ctx);
+            }
+            k += 1;
+        }
+        roll += 1;
+    }
+    let counters = m.bin15_counters();
+    std::hint::black_box((ctx.n, counters));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(marks_seen, ROLLS as u64 * MARKS_PER_ROLL, "10 000 marks");
+    assert_eq!(counters.rolls, ROLLS as u64, "every roll bound an instance");
+    assert!(counters.rolls_settled > 0, "and the predecessors settled");
+    assert!(
+        counters.reprices > 10_000,
+        "one mark re-prices every family on its underlying: saw {}",
+        counters.reprices
+    );
+    assert!(counters.takes_submitted > 0, "the gate must measure real takes");
+    assert!(counters.takes_filled > 0, "and real fills");
+    assert!(counters.quotes_submitted > 0, "and Arm B");
+    assert!(ctx.n > 0, "the gate must measure real submits");
+    assert_eq!(
+        allocs, 0,
+        "strategy-bin15 callbacks allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "strategy-bin15 hot bytes should be zero: saw {bytes}");
+}

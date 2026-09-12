@@ -302,6 +302,49 @@ pub fn register_binary_model(
     reg
 }
 
+/// `outcome → settlement value ×1e6`, for every instance this window
+/// can settle.
+///
+/// The SAME law [`register_binary_model`] registers on the engine, read
+/// out by outcome id rather than by sym: the BIN15 calibration ledger
+/// (O4b) records a `p̂` against the instance that produced it, and the
+/// realised `y` it is scored against has to be the number the harness
+/// actually paid out — not a second derivation of it that could differ
+/// on a thin mark series or a TWAP window the capture only half covers.
+///
+/// An unsettleable instance is simply absent: its ledger rows carry no
+/// `y`, which is the honest state of a window whose evidence ends
+/// before the expiry.
+///
+/// DOCTRINE: offline path — allocates freely.
+#[must_use]
+pub fn settle_values_by_outcome(
+    merged: &[MergedRec],
+    underlying_of: &BTreeMap<u32, u32>,
+    window_end_wall_ns: u64,
+) -> BTreeMap<u32, i64> {
+    let mut out: BTreeMap<u32, i64> = BTreeMap::new();
+    let instances = instances_from_events(merged);
+    if instances.is_empty() {
+        return out;
+    }
+    let marks = marks_by_sym(merged);
+    let empty: Vec<(u64, i64)> = Vec::new();
+    for inst in &instances {
+        if inst.settle_ns() > window_end_wall_ns || inst.expiry_ns == 0 {
+            continue;
+        }
+        let series = underlying_of
+            .get(&inst.sym_yes)
+            .and_then(|u| marks.get(u))
+            .unwrap_or(&empty);
+        if let Some(value) = settle_value(series, inst) {
+            out.insert(inst.outcome, value);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

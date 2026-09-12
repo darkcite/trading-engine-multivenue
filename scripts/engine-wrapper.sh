@@ -123,9 +123,19 @@ fi
 # allow-list (`ai+xsd`, `ai+vrp+xsd`, `xsd`); it boots only when
 # ~/multivenue/xsd.toml + xsd-table.tsv resolve (absent ⇒ the bit stays
 # unset, the rest of the mask boots). Paper only, like every member.
+#
+# BIN15 O4b (2026-09-12): the slot-3 rolling-binary member joins with
+# five names (`bin15`, `ai+bin15`, `ai+vrp+bin15`, `ai+xsd+bin15`,
+# `ai+vrp+xsd+bin15`). UNLIKE xsd, an absent ~/multivenue/bin15.toml
+# with the bit REQUESTED refuses the boot rather than clearing the bit
+# (the icdp/F19 law) — booting `ai+bin15` silently as `ai` is how an
+# operator comes to watch a member that was never there. `rule-tree` is
+# GONE from the set: slot 3 is bin15, and the name was never in this
+# allow-list.
 case "$STRATEGY" in
   ai|ai+icdp|icdp|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd)" >&2; exit 78 ;;
+  bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15)" >&2; exit 78 ;;
 esac
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's

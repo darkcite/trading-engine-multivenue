@@ -19,7 +19,7 @@
 //! | 0 | `strategy-latency-arb` | built |
 //! | 1 | `strategy-vrp` | built (VRP V7, 2026-09-10 — **was `strategy-ev`**) |
 //! | 2 | `strategy-xsd` | built (XSD-3, 2026-09-12 — **was `strategy-cross-arb`**, unlinked at XSD-S the same day) — configured only when `~/multivenue/xsd.toml` + `xsd-table.tsv` resolve |
-//! | 3 | `strategy-rule-tree` | built |
+//! | 3 | `strategy-bin15` | built (BIN15 O4b, 2026-09-12 — **was `strategy-rule-tree`**, unlinked the same day) — configured only when `~/multivenue/bin15.toml` + its seeds resolve |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
 //! | 5 | `strategy-vm` | built (8g item 6) |
 //! | 6 | `strategy-icdp` | built (ICDP I4, 2026-09-03) — configured only when `~/multivenue/icdp.toml` resolves |
@@ -103,7 +103,7 @@ use strategy_vrp::VrpStrategy;
 use strategy_xsd::XsdStrategy;
 use strategy_icdp::IcdpStrategy;
 use strategy_latency_arb::LatencyArb;
-use strategy_rule_tree::RuleTree;
+use strategy_bin15::Bin15Strategy;
 use strategy_vm::VmStrategy;
 
 // ---------------------------------------------------------------
@@ -134,8 +134,19 @@ pub const SLOT_EV: u8 = SLOT_VRP;
 /// rows, and between the two the slot emits nothing. `docs/migration.md`
 /// records the boundary.
 pub const SLOT_XSD: u8 = 2;
-/// Slot index of the rule-tree member.
-pub const SLOT_RULE_TREE: u8 = 3;
+/// Slot index of the bin15 member.
+///
+/// Slot 3 changed hands on 2026-09-12 (BIN15 O4b): it was
+/// `strategy-rule-tree`, which is now UNLINKED — the crate remains a
+/// workspace member and still builds and tests, but nothing depends on
+/// it and no mask name reaches it. The NUMBER is wire-stable
+/// — `Order.strategy_id` 3 and `AiCmd::strategy_id` 3 still mean
+/// "slot 3" — so a capture taken before that date carries rule-tree
+/// rows under this slot and one taken after carries bin15 rows.
+/// `docs/migration.md` records the boundary. Pinned in `core-types` as
+/// [`core_types::STRATEGY_SLOT_BIN15`], because `SetBinarySpec` shape
+/// enforcement depends on it.
+pub const SLOT_BIN15: u8 = core_types::STRATEGY_SLOT_BIN15;
 /// Slot index of the ai-exec member (wire value pinned in
 /// `core-types` — `OrderIntent` shape enforcement depends on it).
 pub const SLOT_AI_EXEC: u8 = STRATEGY_SLOT_AI_EXEC;
@@ -154,8 +165,8 @@ pub const BIT_VRP: u8 = 1 << SLOT_VRP;
 pub const BIT_EV: u8 = BIT_VRP;
 /// Enable-mask bit for the xsd member (slot 2 — see [`SLOT_XSD`]).
 pub const BIT_XSD: u8 = 1 << SLOT_XSD;
-/// Enable-mask bit for the rule-tree member.
-pub const BIT_RULE_TREE: u8 = 1 << SLOT_RULE_TREE;
+/// Enable-mask bit for the bin15 member (slot 3 — see [`SLOT_BIN15`]).
+pub const BIT_BIN15: u8 = 1 << SLOT_BIN15;
 /// Enable-mask bit for the ai-exec member (item 8).
 pub const BIT_AI_EXEC: u8 = 1 << SLOT_AI_EXEC;
 /// Enable-mask bit for the vm member (8g item 6).
@@ -165,12 +176,10 @@ pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
 
 /// Every built member's bit (slots 0–6).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_VRP | BIT_XSD | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_LATENCY_ARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
 
 /// Latency-arb slot capacity inside the set (design §7 sketch).
 pub const SET_LATENCY_ARB_SLOTS: usize = 64;
-/// Rule-tree slot capacity inside the set (design §7 sketch).
-pub const SET_RULE_TREE_SLOTS: usize = 8;
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
 pub const SET_AI_EXEC_SLOTS: usize = 64;
@@ -191,7 +200,17 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
         "xsd" => Some(BIT_XSD),
         "ai+xsd" => Some(BIT_AI_EXEC | BIT_VM | BIT_XSD),
         "ai+vrp+xsd" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD),
-        "rule-tree" => Some(BIT_RULE_TREE),
+        // BIN15 O4b (2026-09-12): slot 3 is the bin15 member;
+        // `rule-tree` is GONE as a name — an operator who types the old
+        // one gets a boot refusal, not a different strategy than the
+        // one asked for. The same law XSD-S and VRP V7 applied.
+        "bin15" => Some(BIT_BIN15),
+        "ai+bin15" => Some(BIT_AI_EXEC | BIT_VM | BIT_BIN15),
+        "ai+vrp+bin15" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_BIN15),
+        "ai+xsd+bin15" => Some(BIT_AI_EXEC | BIT_VM | BIT_XSD | BIT_BIN15),
+        "ai+vrp+xsd+bin15" => {
+            Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15)
+        }
         "ai-exec" => Some(BIT_AI_EXEC),
         "vm" => Some(BIT_VM),
         // AI-pushed lanes only (operator ruling 2026-09-02: Rust-coded
@@ -223,7 +242,7 @@ pub struct StrategySet {
     latency_arb: LatencyArb<SET_LATENCY_ARB_SLOTS>,
     vrp: VrpStrategy,
     xsd: XsdStrategy,
-    rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
+    bin15: Bin15Strategy,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
     vm: VmStrategy,
     icdp: IcdpStrategy,
@@ -274,7 +293,7 @@ impl StrategySet {
             latency_arb: LatencyArb::new(),
             vrp: VrpStrategy::new(),
             xsd: XsdStrategy::new(),
-            rule_tree: RuleTree::new(),
+            bin15: Bin15Strategy::new(),
             ai_exec: AiExec::new(),
             vm: VmStrategy::new(),
             icdp: IcdpStrategy::new(),
@@ -330,7 +349,7 @@ impl StrategySet {
             SLOT_LATENCY_ARB => self.latency_arb.set_regime_label(set),
             SLOT_VRP => self.vrp.set_regime_label(set),
             SLOT_XSD => self.xsd.set_regime_label(set),
-            SLOT_RULE_TREE => self.rule_tree.set_regime_label(set),
+            SLOT_BIN15 => self.bin15.set_regime_label(set),
             SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
             SLOT_ICDP => self.icdp.set_regime_label(set),
             _ => false,
@@ -371,7 +390,7 @@ impl StrategySet {
         self.regime_labels[SLOT_LATENCY_ARB as usize] = self.latency_arb.regime_label();
         self.regime_labels[SLOT_VRP as usize] = self.vrp.regime_label();
         self.regime_labels[SLOT_XSD as usize] = self.xsd.regime_label();
-        self.regime_labels[SLOT_RULE_TREE as usize] = self.rule_tree.regime_label();
+        self.regime_labels[SLOT_BIN15 as usize] = self.bin15.regime_label();
         self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
         self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
         self.regime_labels[SLOT_ICDP as usize] = self.icdp.regime_label();
@@ -447,9 +466,9 @@ impl StrategySet {
             SLOT_XSD => self
                 .xsd
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
-            SLOT_RULE_TREE => self
-                .rule_tree
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE)),
+            SLOT_BIN15 => self
+                .bin15
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
             SLOT_AI_EXEC => self
                 .ai_exec
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
@@ -501,9 +520,9 @@ impl StrategySet {
             SLOT_XSD => self
                 .xsd
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
-            SLOT_RULE_TREE => self
-                .rule_tree
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE)),
+            SLOT_BIN15 => self
+                .bin15
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
             SLOT_AI_EXEC => self
                 .ai_exec
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
@@ -550,10 +569,10 @@ impl StrategySet {
         &self.xsd
     }
 
-    /// Configure the rule-tree member (boot-only).
+    /// Configure the bin15 member (boot-only).
     #[inline]
-    pub fn rule_tree_mut(&mut self) -> &mut RuleTree<SET_RULE_TREE_SLOTS> {
-        &mut self.rule_tree
+    pub fn bin15_mut(&mut self) -> &mut Bin15Strategy {
+        &mut self.bin15
     }
 
     /// Configure the ai-exec member (boot-only).
@@ -602,7 +621,7 @@ impl StrategySet {
             SLOT_LATENCY_ARB => BIT_LATENCY_ARB,
             SLOT_VRP => BIT_VRP,
             SLOT_XSD => BIT_XSD,
-            SLOT_RULE_TREE => BIT_RULE_TREE,
+            SLOT_BIN15 => BIT_BIN15,
             SLOT_AI_EXEC => BIT_AI_EXEC,
             SLOT_VM => BIT_VM,
             SLOT_ICDP => BIT_ICDP,
@@ -643,7 +662,7 @@ impl StrategyCounters for StrategySet {
         self.latency_arb.orders_emitted()
             + self.vrp.orders_emitted()
             + self.xsd.orders_emitted()
-            + self.rule_tree.orders_emitted()
+            + self.bin15.orders_emitted()
             + self.ai_exec.orders_emitted()
             + self.vm.orders_emitted()
             + self.icdp.orders_emitted()
@@ -653,7 +672,7 @@ impl StrategyCounters for StrategySet {
         self.latency_arb.orders_dropped()
             + self.vrp.orders_dropped()
             + self.xsd.orders_dropped()
-            + self.rule_tree.orders_dropped()
+            + self.bin15.orders_dropped()
             + self.ai_exec.orders_dropped()
             + self.vm.orders_dropped()
             + self.icdp.orders_dropped()
@@ -747,6 +766,15 @@ impl StrategyCounters for StrategySet {
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
     }
+    /// BIN15 O4b: slot 3's observables.
+    #[inline]
+    fn bin15_counters(&self) -> strategy_core::Bin15Counters {
+        self.bin15.bin15_counters()
+    }
+    #[inline]
+    fn bin15_families_view(&self, out: &mut [strategy_core::Bin15FamilyView]) -> u32 {
+        self.bin15.bin15_families_view(out)
+    }
     /// XSD-3: slot 2's observables + persisted state.
     #[inline]
     fn xsd_counters(&self) -> strategy_core::XsdCounters {
@@ -818,9 +846,9 @@ impl StrategyCounters for StrategySet {
             ),
             SLOT_VRP => (self.vrp.orders_emitted(), self.vrp.orders_dropped()),
             SLOT_XSD => (self.xsd.orders_emitted(), self.xsd.orders_dropped()),
-            SLOT_RULE_TREE => (
-                self.rule_tree.orders_emitted(),
-                self.rule_tree.orders_dropped(),
+            SLOT_BIN15 => (
+                self.bin15.orders_emitted(),
+                self.bin15.orders_dropped(),
             ),
             SLOT_AI_EXEC => (
                 self.ai_exec.orders_emitted(),
@@ -914,9 +942,9 @@ impl Strategy for StrategySet {
         if self.initial & BIT_XSD != 0 {
             self.xsd.on_start(&mut StampCtx::new(&mut *ctx, SLOT_XSD))?;
         }
-        if self.initial & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE))?;
+        if self.initial & BIT_BIN15 != 0 {
+            self.bin15
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_BIN15))?;
         }
         if self.initial & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -949,9 +977,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -981,9 +1009,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1026,9 +1054,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1060,9 +1088,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1094,9 +1122,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1151,9 +1179,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1227,9 +1255,9 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_XSD != 0 {
             self.xsd.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1281,9 +1309,9 @@ impl Strategy for StrategySet {
             self.xsd
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_RULE_TREE != 0 {
-            self.rule_tree
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
         if self.enabled & BIT_AI_EXEC != 0 {
             self.ai_exec
@@ -1322,7 +1350,7 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
-        let v = self.rule_tree.timer_period_ns();
+        let v = self.bin15.timer_period_ns();
         if v < min {
             min = v;
         }
@@ -1349,8 +1377,8 @@ impl Strategy for StrategySet {
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         self.vrp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VRP));
         self.xsd.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XSD));
-        self.rule_tree
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
+        self.bin15
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         self.ai_exec
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
@@ -1477,7 +1505,12 @@ mod tests {
         assert_eq!(mask_for_name("ai"), Some(48));
         assert_eq!(mask_for_name("ai+vrp"), Some(50));
         assert_eq!(mask_for_name("ai+icdp"), Some(112));
-        assert_eq!(mask_for_name("rule-tree"), Some(BIT_RULE_TREE));
+        assert_eq!(mask_for_name("bin15"), Some(BIT_BIN15));
+        assert_eq!(mask_for_name("rule-tree"), None, "the old name is GONE");
+        assert_eq!(
+            mask_for_name("ai+vrp+xsd+bin15"),
+            Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15)
+        );
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
@@ -1529,7 +1562,7 @@ mod tests {
         ));
 
         // Unconfigured members outside the initial mask are skipped —
-        // vrp/rule-tree would all fail validation here.
+        // vrp/bin15 would all fail validation here.
         let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
         assert!(s.on_start(&mut ctx()).is_ok());
     }

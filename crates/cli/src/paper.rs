@@ -2516,7 +2516,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     requested_mask: u8,
     vrp: Option<&crate::vrp_boot::VrpBoot>,
     xsd: Option<&crate::xsd_boot::XsdBoot>,
-    rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
+    bin15: Option<&crate::bin15_boot::Bin15Boot>,
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
 ) -> EngineLoopResult {
@@ -2531,8 +2531,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if xsd.is_some() {
         configured |= strategy_set::BIT_XSD;
     }
-    if rules.is_some() {
-        configured |= strategy_set::BIT_RULE_TREE;
+    if bin15.is_some() {
+        configured |= strategy_set::BIT_BIN15;
     }
     if icdp.is_some() {
         configured |= strategy_set::BIT_ICDP;
@@ -2719,12 +2719,41 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             );
         }
     }
-    if let Some((rules_path, sym_for_rule)) = rules {
-        if let Err(reason) =
-            configure_rule_tree(set.rule_tree_mut(), &cfg, rules_path, sym_for_rule)
-        {
-            return EngineLoopResult::Failed(reason);
+    if let Some(boot) = bin15 {
+        // BIN15 O4b. The wall anchor is taken HERE, once, right before
+        // the engine loop starts — the minute grid is UTC-aligned from
+        // this instant on, and replay rebuilds the same anchor from the
+        // harness rebase (the ICDP I2 precedent, and the same reason O2
+        // threads a `WallAnchor` into the HL driver: the venue's expiry
+        // is an EPOCH instant and `now_ns()` is not).
+        let anchor = core_time::WallAnchor::now();
+        // The LUT box moves into the member, so it is cloned out of the
+        // boot struct here — 17 KiB, once, at boot.
+        let luts = Box::new((*boot.luts).clone());
+        if let Err(e) = set.bin15_mut().configure(boot.params, luts, anchor) {
+            tracing::error!(error = %e, "bin15: configure failed");
+            return EngineLoopResult::Failed("engine_loop_set: bin15 configure rejected");
         }
+        let mut u = 0usize;
+        while u < boot.seeds.len() {
+            let seed = &boot.seeds[u];
+            // The minute window is a property of the PRICE SERIES, so
+            // both forecast engines replay it. Replayed before any
+            // pair, because the ring's eviction arm assumes
+            // chronological order.
+            set.bin15_mut().seed_returns(u, &seed.returns);
+            // The pairs are PER TENOR. Pushing one cloud into both —
+            // which this did until O4b — fits the daily line on the 15 m
+            // regressor, and both being log-vols of the same series is
+            // exactly why nothing downstream would notice.
+            set.bin15_mut()
+                .seed_pairs(u, strategy_bin15::FAMILY_OUT_15M, &seed.pairs_15m);
+            set.bin15_mut()
+                .seed_pairs(u, strategy_bin15::FAMILY_NATIVE_DAILY, &seed.pairs_daily);
+            u += 1;
+        }
+        let dormant = set.bin15_mut().counters().families_dormant as usize;
+        tracing::info!("{}", crate::bin15_boot::render_boot_tell(boot, dormant));
     }
     if let Some(params) = icdp {
         // ICDP I2/I4: the wall anchor is taken HERE, once, right
@@ -2878,7 +2907,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
         vrp = mask & strategy_set::BIT_VRP != 0,
         xsd = mask & strategy_set::BIT_XSD != 0,
-        rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
+        bin15 = mask & strategy_set::BIT_BIN15 != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
         icdp = mask & strategy_set::BIT_ICDP != 0,
@@ -2929,7 +2958,7 @@ const REQUIRE_LABEL_SLOTS: [u8; 5] = [
     strategy_set::SLOT_LATENCY_ARB,
     strategy_set::SLOT_VRP,
     strategy_set::SLOT_XSD,
-    strategy_set::SLOT_RULE_TREE,
+    strategy_set::SLOT_BIN15,
     strategy_set::SLOT_ICDP,
 ];
 
@@ -3170,6 +3199,7 @@ impl Observability {
             let icdp = register_icdp_metrics(&mut reg)?;
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
+            let bin15 = register_bin15_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             let fills_capture = {
@@ -3254,6 +3284,7 @@ impl Observability {
                 icdp,
                 vrp,
                 xsd,
+                bin15,
                 regime,
                 paper_matcher,
             });
@@ -3596,6 +3627,8 @@ pub struct EngineCounters {
     pub vrp: VrpMetricIds,
     /// XSD-3: the `engine_xsd_*` family (slot 2).
     pub xsd: XsdMetricIds,
+    /// BIN15 O4b: the `engine_bin15_*` family (slot 3).
+    pub bin15: Bin15MetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
     /// X1: the `engine_paper_matcher_*` family + the set's
@@ -4458,6 +4491,274 @@ fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
     reg.counter(ids.regime_exits)
         .inc(cur.regime_exits.saturating_sub(last.regime_exits));
     *last = cur;
+}
+
+/// BIN15 O4b: the `engine_bin15_*` family (slot 3). Counters mirror the
+/// member's cumulative [`strategy_core::Bin15Counters`] as deltas; the
+/// per-family rows are gauges, because every one of them is a LEVEL —
+/// what a slot holds right now, not how often it changed.
+#[derive(Copy, Clone, Debug)]
+pub struct Bin15MetricIds {
+    /// `engine_bin15_reprices_total`
+    pub reprices: core_metrics::CounterId,
+    /// `engine_bin15_rolls_total`
+    pub rolls: core_metrics::CounterId,
+    /// `engine_bin15_rolls_settled_total`
+    pub rolls_settled: core_metrics::CounterId,
+    /// `engine_bin15_spec_overrides_total`
+    pub spec_overrides: core_metrics::CounterId,
+    /// `engine_bin15_spec_refused_total`
+    pub spec_refused: core_metrics::CounterId,
+    /// `engine_bin15_takes_submitted_total`
+    pub takes_submitted: core_metrics::CounterId,
+    /// `engine_bin15_takes_filled_total`
+    pub takes_filled: core_metrics::CounterId,
+    /// `engine_bin15_takes_unfilled_total`
+    pub takes_unfilled: core_metrics::CounterId,
+    /// `engine_bin15_quotes_submitted_total`
+    pub quotes_submitted: core_metrics::CounterId,
+    /// `engine_bin15_quotes_filled_total`
+    pub quotes_filled: core_metrics::CounterId,
+    /// `engine_bin15_quotes_expired_total`
+    pub quotes_expired: core_metrics::CounterId,
+    /// `engine_bin15_closes_submitted_total`
+    pub closes_submitted: core_metrics::CounterId,
+    /// `engine_bin15_skipped_tau_total`
+    pub skipped_tau: core_metrics::CounterId,
+    /// `engine_bin15_skipped_tail_total`
+    pub skipped_tail: core_metrics::CounterId,
+    /// `engine_bin15_skipped_stale_total`
+    pub skipped_stale: core_metrics::CounterId,
+    /// `engine_bin15_skipped_book_total`
+    pub skipped_book: core_metrics::CounterId,
+    /// `engine_bin15_skipped_inventory_total`
+    pub skipped_inventory: core_metrics::CounterId,
+    /// `engine_bin15_skipped_cap_total`
+    pub skipped_cap: core_metrics::CounterId,
+    /// `engine_bin15_skipped_grid_total`
+    pub skipped_grid: core_metrics::CounterId,
+    /// `engine_bin15_families_dormant_total`
+    pub families_dormant: core_metrics::CounterId,
+    /// `engine_bin15_fills_total`
+    pub fills: core_metrics::CounterId,
+    /// `engine_bin15_unknown_fills_total`
+    pub unknown_fills: core_metrics::CounterId,
+    /// Per family: `p_hat_1e6`, `pos_yes_1e6`, `pos_no_1e6`,
+    /// `live_outcome`, in that order.
+    pub families: [[core_metrics::GaugeId; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES],
+}
+
+/// Families the `engine_bin15_f<n>_*` rows cover. Mirrors
+/// `strategy_core::BIN15_VIEW_FAMILIES` and ruling O-Q7's eight.
+pub const BIN15_METRIC_FAMILIES: usize = strategy_core::BIN15_VIEW_FAMILIES;
+
+/// Gauges per family.
+pub const BIN15_FAMILY_GAUGES: usize = 4;
+
+/// The per-family gauge names, written out rather than formatted.
+///
+/// `register_gauge` copies the name into a fixed buffer, so a built
+/// string would work — and would also mean the only list of what this
+/// engine exposes lived in a loop. An operator greps `/metrics` names;
+/// these are the names.
+const BIN15_GAUGE_NAMES: [[&str; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES] = [
+    [
+        "engine_bin15_f0_p_hat_1e6",
+        "engine_bin15_f0_pos_yes_1e6",
+        "engine_bin15_f0_pos_no_1e6",
+        "engine_bin15_f0_live_outcome",
+    ],
+    [
+        "engine_bin15_f1_p_hat_1e6",
+        "engine_bin15_f1_pos_yes_1e6",
+        "engine_bin15_f1_pos_no_1e6",
+        "engine_bin15_f1_live_outcome",
+    ],
+    [
+        "engine_bin15_f2_p_hat_1e6",
+        "engine_bin15_f2_pos_yes_1e6",
+        "engine_bin15_f2_pos_no_1e6",
+        "engine_bin15_f2_live_outcome",
+    ],
+    [
+        "engine_bin15_f3_p_hat_1e6",
+        "engine_bin15_f3_pos_yes_1e6",
+        "engine_bin15_f3_pos_no_1e6",
+        "engine_bin15_f3_live_outcome",
+    ],
+    [
+        "engine_bin15_f4_p_hat_1e6",
+        "engine_bin15_f4_pos_yes_1e6",
+        "engine_bin15_f4_pos_no_1e6",
+        "engine_bin15_f4_live_outcome",
+    ],
+    [
+        "engine_bin15_f5_p_hat_1e6",
+        "engine_bin15_f5_pos_yes_1e6",
+        "engine_bin15_f5_pos_no_1e6",
+        "engine_bin15_f5_live_outcome",
+    ],
+    [
+        "engine_bin15_f6_p_hat_1e6",
+        "engine_bin15_f6_pos_yes_1e6",
+        "engine_bin15_f6_pos_no_1e6",
+        "engine_bin15_f6_live_outcome",
+    ],
+    [
+        "engine_bin15_f7_p_hat_1e6",
+        "engine_bin15_f7_pos_yes_1e6",
+        "engine_bin15_f7_pos_no_1e6",
+        "engine_bin15_f7_live_outcome",
+    ],
+];
+
+/// Register the BIN15 family. Boot-only.
+///
+/// 22 counters and 32 gauges. Registration is UNCONDITIONAL like every
+/// other family's — a mask that excludes slot 3 still exposes the rows
+/// at zero, which is what lets an operator tell "off" from "broken".
+fn register_bin15_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<Bin15MetricIds, &'static str> {
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name)
+            .map_err(|_| "register bin15 counter")
+    };
+    let reprices = one("engine_bin15_reprices_total")?;
+    let rolls = one("engine_bin15_rolls_total")?;
+    let rolls_settled = one("engine_bin15_rolls_settled_total")?;
+    let spec_overrides = one("engine_bin15_spec_overrides_total")?;
+    let spec_refused = one("engine_bin15_spec_refused_total")?;
+    let takes_submitted = one("engine_bin15_takes_submitted_total")?;
+    let takes_filled = one("engine_bin15_takes_filled_total")?;
+    let takes_unfilled = one("engine_bin15_takes_unfilled_total")?;
+    let quotes_submitted = one("engine_bin15_quotes_submitted_total")?;
+    let quotes_filled = one("engine_bin15_quotes_filled_total")?;
+    let quotes_expired = one("engine_bin15_quotes_expired_total")?;
+    let closes_submitted = one("engine_bin15_closes_submitted_total")?;
+    let skipped_tau = one("engine_bin15_skipped_tau_total")?;
+    let skipped_tail = one("engine_bin15_skipped_tail_total")?;
+    let skipped_stale = one("engine_bin15_skipped_stale_total")?;
+    let skipped_book = one("engine_bin15_skipped_book_total")?;
+    let skipped_inventory = one("engine_bin15_skipped_inventory_total")?;
+    let skipped_cap = one("engine_bin15_skipped_cap_total")?;
+    let skipped_grid = one("engine_bin15_skipped_grid_total")?;
+    let families_dormant = one("engine_bin15_families_dormant_total")?;
+    let fills = one("engine_bin15_fills_total")?;
+    let unknown_fills = one("engine_bin15_unknown_fills_total")?;
+    let mut families = [[core_metrics::GaugeId::default(); BIN15_FAMILY_GAUGES];
+        BIN15_METRIC_FAMILIES];
+    let mut f = 0usize;
+    while f < BIN15_METRIC_FAMILIES {
+        let mut g = 0usize;
+        while g < BIN15_FAMILY_GAUGES {
+            families[f][g] = reg
+                .register_gauge(BIN15_GAUGE_NAMES[f][g])
+                .map_err(|_| "register bin15 gauge")?;
+            g += 1;
+        }
+        f += 1;
+    }
+    Ok(Bin15MetricIds {
+        reprices,
+        rolls,
+        rolls_settled,
+        spec_overrides,
+        spec_refused,
+        takes_submitted,
+        takes_filled,
+        takes_unfilled,
+        quotes_submitted,
+        quotes_filled,
+        quotes_expired,
+        closes_submitted,
+        skipped_tau,
+        skipped_tail,
+        skipped_stale,
+        skipped_book,
+        skipped_inventory,
+        skipped_cap,
+        skipped_grid,
+        families_dormant,
+        fills,
+        unknown_fills,
+        families,
+    })
+}
+
+/// Mirror the BIN15 family as monotonic deltas of the cumulative
+/// strategy counters, plus the per-family levels. 5 s cadence — cold
+/// path.
+fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &Bin15MetricIds,
+    strat: &S,
+    last: &mut strategy_core::Bin15Counters,
+) {
+    let cur = strat.bin15_counters();
+    reg.counter(ids.reprices)
+        .inc(cur.reprices.saturating_sub(last.reprices));
+    reg.counter(ids.rolls)
+        .inc(cur.rolls.saturating_sub(last.rolls));
+    reg.counter(ids.rolls_settled)
+        .inc(cur.rolls_settled.saturating_sub(last.rolls_settled));
+    reg.counter(ids.spec_overrides)
+        .inc(cur.spec_overrides.saturating_sub(last.spec_overrides));
+    reg.counter(ids.spec_refused)
+        .inc(cur.spec_refused.saturating_sub(last.spec_refused));
+    reg.counter(ids.takes_submitted)
+        .inc(cur.takes_submitted.saturating_sub(last.takes_submitted));
+    reg.counter(ids.takes_filled)
+        .inc(cur.takes_filled.saturating_sub(last.takes_filled));
+    reg.counter(ids.takes_unfilled)
+        .inc(cur.takes_unfilled.saturating_sub(last.takes_unfilled));
+    reg.counter(ids.quotes_submitted)
+        .inc(cur.quotes_submitted.saturating_sub(last.quotes_submitted));
+    reg.counter(ids.quotes_filled)
+        .inc(cur.quotes_filled.saturating_sub(last.quotes_filled));
+    reg.counter(ids.quotes_expired)
+        .inc(cur.quotes_expired.saturating_sub(last.quotes_expired));
+    reg.counter(ids.closes_submitted)
+        .inc(cur.closes_submitted.saturating_sub(last.closes_submitted));
+    reg.counter(ids.skipped_tau)
+        .inc(cur.skipped_tau.saturating_sub(last.skipped_tau));
+    reg.counter(ids.skipped_tail)
+        .inc(cur.skipped_tail.saturating_sub(last.skipped_tail));
+    reg.counter(ids.skipped_stale)
+        .inc(cur.skipped_stale.saturating_sub(last.skipped_stale));
+    reg.counter(ids.skipped_book)
+        .inc(cur.skipped_book.saturating_sub(last.skipped_book));
+    reg.counter(ids.skipped_inventory)
+        .inc(cur.skipped_inventory.saturating_sub(last.skipped_inventory));
+    reg.counter(ids.skipped_cap)
+        .inc(cur.skipped_cap.saturating_sub(last.skipped_cap));
+    reg.counter(ids.skipped_grid)
+        .inc(cur.skipped_grid.saturating_sub(last.skipped_grid));
+    reg.counter(ids.families_dormant)
+        .inc(cur.families_dormant.saturating_sub(last.families_dormant));
+    reg.counter(ids.fills)
+        .inc(cur.fills.saturating_sub(last.fills));
+    reg.counter(ids.unknown_fills)
+        .inc(cur.unknown_fills.saturating_sub(last.unknown_fills));
+    *last = cur;
+    // The levels. A family the member does not configure keeps its row
+    // at zero rather than disappearing: a missing series reads as a
+    // scrape problem, a zero reads as a dormant slot.
+    let mut view = [strategy_core::Bin15FamilyView::default(); BIN15_METRIC_FAMILIES];
+    let n = strat.bin15_families_view(&mut view) as usize;
+    let mut f = 0usize;
+    while f < BIN15_METRIC_FAMILIES {
+        let v = if f < n {
+            view[f]
+        } else {
+            strategy_core::Bin15FamilyView::default()
+        };
+        reg.gauge(ids.families[f][0]).set(v.p_hat_1e6);
+        reg.gauge(ids.families[f][1]).set(v.pos_yes_1e6);
+        reg.gauge(ids.families[f][2]).set(v.pos_no_1e6);
+        reg.gauge(ids.families[f][3]).set(i64::from(v.live_outcome));
+        f += 1;
+    }
 }
 
 /// XSD-3: the `engine_xsd_*` family (slot 2). Counters mirror the
@@ -5389,6 +5690,10 @@ where
     // with descriptors through the boot sink; the view buffer is
     // allocated once here and reused).
     let mut xsd_last = strategy_core::XsdCounters::default();
+    // BIN15 O4b: slot 3's counter baseline. No state writer — a binary
+    // instance dies at its own expiry, so there is nothing an epoch
+    // could carry across a restart that the next roll does not rebind.
+    let mut bin15_last = strategy_core::Bin15Counters::default();
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
     let mut xsd_state_buf = String::new();
@@ -5532,6 +5837,7 @@ where
                 mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
+                mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
                 // X1: what the paper matcher did. `ioc_canceled` is the
                 // F7 counter — a mid-priced IoC on a real spread never
                 // fills, and the member used to call that a position.
@@ -7646,6 +7952,106 @@ mod tests {
         assert!(parse_ai_hmac_key(&long).is_err(), "too long");
         let bad = "0g0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
         assert!(parse_ai_hmac_key(bad).is_err(), "non-hex nibble");
+    }
+
+    /// O4b: the family's SIZE, and the headroom it leaves.
+    ///
+    /// The registry is a fixed array (`MAX_COUNTERS` 256, `MAX_GAUGES`
+    /// 384) and registration is unconditional, so every family a lane
+    /// adds is paid for at every boot whatever the mask. Measured on the
+    /// live engine at the O4b battery: 198 counters before this family,
+    /// 220 after — **36 counters of headroom left**. The next member
+    /// that needs more than that has to raise `MAX_COUNTERS` rather than
+    /// discover `RegErr::Full` at a live boot, which is a refused
+    /// registration and therefore a refused boot.
+    #[test]
+    fn the_bin15_family_is_22_counters_and_32_gauges() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let before_c = reg.counters_len();
+        let before_g = reg.gauges_len();
+        let ids = register_bin15_metrics(&mut reg).expect("register bin15");
+        assert_eq!(reg.counters_len() - before_c, 22, "the counter block");
+        assert_eq!(reg.gauges_len() - before_g, 32, "8 families x 4 levels");
+        // Every per-family gauge is a DISTINCT name: a copy-paste that
+        // reused one would silently publish two families as one.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut f = 0usize;
+        while f < BIN15_METRIC_FAMILIES {
+            let mut g = 0usize;
+            while g < BIN15_FAMILY_GAUGES {
+                assert!(
+                    seen.insert(BIN15_GAUGE_NAMES[f][g]),
+                    "duplicate gauge name {}",
+                    BIN15_GAUGE_NAMES[f][g]
+                );
+                g += 1;
+            }
+            f += 1;
+        }
+        assert_eq!(seen.len(), 32);
+        // And the ids are usable: a level written is a level read back.
+        reg.gauge(ids.families[7][3]).set(2650);
+        assert_eq!(reg.gauge(ids.families[7][3]).get(), 2650);
+        assert_eq!(reg.gauge(ids.families[0][3]).get(), 0);
+    }
+
+    /// The mirror is a DELTA of cumulative counters and a SET of
+    /// levels, and a dormant family keeps its row at zero rather than
+    /// vanishing — a missing series reads as a scrape problem.
+    #[test]
+    fn the_bin15_mirror_publishes_deltas_and_holds_dormant_rows_at_zero() {
+        struct Fake {
+            c: strategy_core::Bin15Counters,
+            view: [strategy_core::Bin15FamilyView; 2],
+        }
+        impl strategy_core::StrategyCounters for Fake {
+            fn orders_emitted(&self) -> u64 {
+                0
+            }
+            fn orders_dropped(&self) -> u64 {
+                0
+            }
+            fn strategy_kind(&self) -> &'static str {
+                "fake"
+            }
+            fn bin15_counters(&self) -> strategy_core::Bin15Counters {
+                self.c
+            }
+            fn bin15_families_view(&self, out: &mut [strategy_core::Bin15FamilyView]) -> u32 {
+                out[..2].copy_from_slice(&self.view);
+                2
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let ids = register_bin15_metrics(&mut reg).expect("register");
+        let mut last = strategy_core::Bin15Counters::default();
+        let mut f = Fake {
+            c: strategy_core::Bin15Counters::default(),
+            view: [strategy_core::Bin15FamilyView::default(); 2],
+        };
+        f.c.reprices = 7;
+        f.c.takes_filled = 2;
+        f.view[0] = strategy_core::Bin15FamilyView {
+            live_outcome: 2650,
+            _pad: [0; 4],
+            p_hat_1e6: 894_000,
+            pos_yes_1e6: 100_000_000,
+            pos_no_1e6: 0,
+        };
+        mirror_bin15_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.reprices).get(), 7);
+        assert_eq!(reg.counter(ids.takes_filled).get(), 2);
+        assert_eq!(reg.gauge(ids.families[0][0]).get(), 894_000);
+        assert_eq!(reg.gauge(ids.families[0][3]).get(), 2650);
+        // Families the member does not configure stay at zero.
+        assert_eq!(reg.gauge(ids.families[5][3]).get(), 0);
+        // A second mirror with the SAME cumulative counters adds
+        // nothing: the block publishes deltas, not the totals.
+        mirror_bin15_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.reprices).get(), 7, "a delta, not a total");
+        f.c.reprices = 10;
+        mirror_bin15_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.reprices).get(), 10);
     }
 
     #[test]

@@ -48,7 +48,8 @@ pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
     "latency-arb",
     "vrp",
     "xsd",
-    "rule-tree",
+    // BIN15 O4b (2026-09-12): slot 3 was `rule-tree`.
+    "bin15",
     "ai-exec",
     "vm",
     "icdp",

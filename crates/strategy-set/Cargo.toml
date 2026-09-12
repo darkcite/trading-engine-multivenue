@@ -19,7 +19,7 @@ strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-latency-arb = { workspace = true }
 strategy-icdp        = { workspace = true }
-strategy-rule-tree   = { workspace = true }
+strategy-bin15       = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }

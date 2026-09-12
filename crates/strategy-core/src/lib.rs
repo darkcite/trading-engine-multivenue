@@ -283,6 +283,23 @@ pub trait StrategyCounters {
         0
     }
 
+    /// BIN15 O4b: the member's observables (`engine_bin15_*`), mirrored
+    /// by the cli's generic 5 s block exactly like [`Self::xsd_counters`].
+    #[inline]
+    fn bin15_counters(&self) -> Bin15Counters {
+        Bin15Counters::default()
+    }
+
+    /// BIN15 O4b: copy the per-family view into `out`, returning how
+    /// many families are CONFIGURED (not how many are live — a dormant
+    /// slot still has a row, because "no instance" is the observation).
+    /// Cold path.
+    #[inline]
+    fn bin15_families_view(&self, out: &mut [Bin15FamilyView]) -> u32 {
+        let _ = out;
+        0
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -856,6 +873,91 @@ pub struct XsdCounters {
     pub seed_rows: u64,
     /// Seed rows dropped (unknown sym, duplicate hour, older than the ring).
     pub seed_dropped: u64,
+}
+
+/// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
+/// block. Defined HERE for the reason [`IcdpCounters`] is.
+///
+/// Every `skipped_*` is a REASON, not a total: the sum of them is the
+/// number of re-price attempts that produced no intent, and an operator
+/// looking at a silent member needs to know WHICH gate held. A single
+/// `skipped_total` would make "the book is one-sided" and "the caps are
+/// full" the same observable, and they call for opposite actions.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bin15Counters {
+    /// Re-prices that produced a `p_hat` (the pricer ran to the end).
+    pub reprices: u64,
+    /// `InstrumentRoll` created events bound to a family.
+    pub rolls: u64,
+    /// `InstrumentRoll` settled events that closed a live instance.
+    pub rolls_settled: u64,
+    /// `SetBinarySpec` frames accepted.
+    pub spec_overrides: u64,
+    /// `SetBinarySpec` frames refused on shape.
+    pub spec_refused: u64,
+    /// Arm A IoCs emitted.
+    pub takes_submitted: u64,
+    /// Arm A IoCs that filled (any quantity).
+    pub takes_filled: u64,
+    /// Arm A IoCs that reached their deadline unfilled.
+    pub takes_unfilled: u64,
+    /// Arm B resting quotes emitted.
+    pub quotes_submitted: u64,
+    /// Arm B quotes that filled (any quantity).
+    pub quotes_filled: u64,
+    /// Arm B quotes that reached their TTL unfilled.
+    pub quotes_expired: u64,
+    /// Closing takes emitted (the only sell the member ever sends).
+    pub closes_submitted: u64,
+    /// Re-prices held: `τ` under the arm's minimum.
+    pub skipped_tau: u64,
+    /// Re-prices held: inside `tail_refuse_ns`.
+    pub skipped_tail: u64,
+    /// Re-prices held: the underlying mark or a touch is stale.
+    pub skipped_stale: u64,
+    /// Re-prices held: the binary book is one-sided or empty.
+    pub skipped_book: u64,
+    /// Re-prices held: a closing take with nothing to close.
+    pub skipped_inventory: u64,
+    /// Re-prices held: a notional cap left no room.
+    pub skipped_cap: u64,
+    /// Re-prices held: the price or size fell off the HIP-4 grid.
+    pub skipped_grid: u64,
+    /// Configured families with no live instance (a level, not a total).
+    pub families_dormant: u64,
+    /// Fills matched to one of this member's pendings.
+    pub fills: u64,
+    /// Fills whose `order_id` matched no pending. Non-zero means the
+    /// member's own book of intents disagrees with the dispatcher's.
+    pub unknown_fills: u64,
+}
+
+/// Families one BIN15 view carries. Mirrors
+/// `strategy_bin15::BIN15_MAX_FAMILIES`; a mismatch is a compile error
+/// at the member's own `debug_assert`, not a silent truncation.
+pub const BIN15_VIEW_FAMILIES: usize = 8;
+
+/// One BIN15 family as `/metrics` reads it (O4b). POD.
+///
+/// The four numbers an operator watching a live member needs: WHICH
+/// instance a slot holds, what the member thinks it is worth, and what
+/// it holds of each leg. `live_outcome == 0` is a dormant slot, which
+/// is a level and not an error — a family with no instance on the
+/// venue is the normal state of six of the eight.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bin15FamilyView {
+    /// The venue's own id for the live instance; `0` = dormant.
+    pub live_outcome: u32,
+    /// Explicit padding — always zero.
+    pub _pad: [u8; 4],
+    /// Last fair value ×1e6.
+    pub p_hat_1e6: i64,
+    /// Yes contracts held ×1e6, from fills.
+    pub pos_yes_1e6: i64,
+    /// No contracts held ×1e6, from fills.
+    pub pos_no_1e6: i64,
 }
 
 /// One entered XSD position as the cli persists it (`xsd-state.tsv`)
