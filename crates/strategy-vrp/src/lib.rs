@@ -2225,6 +2225,15 @@ impl VrpStrategy {
             self.counters.regime_blocked = self.counters.regime_blocked.wrapping_add(1);
             return;
         }
+        // F30: UNREACHABLE as the member is wired today — `decide` runs
+        // only from `on_opt_summary`, which has just refreshed
+        // `last_mark` from the very record that brought us here, so the
+        // price is positive and the age is zero by construction. Kept
+        // because it is two compares on a once-per-campaign path and it
+        // is the guard that would have to hold the day `decide` is
+        // reached from a tick; the live `stale_skips` come from the
+        // REBALANCE and SETTLE rungs, which run on the perp lane and
+        // can genuinely find the option mark stale.
         if self.last_mark.px_usd_1e6 <= 0
             || self.last_mark.iv_1e9 <= 0
             || wall_ns.saturating_sub(self.last_mark.wall_ns) > MARK_STALE_NS
@@ -2550,6 +2559,27 @@ impl StrategyCounters for VrpStrategy {
         self.last_settle_value_1e6
     }
     #[inline]
+    fn vrp_snapshot_view(&self) -> strategy_core::VrpSnapshotView {
+        strategy_core::VrpSnapshotView {
+            hash: self.hash,
+            expiry_ns: self.expiry_ns,
+            state_epoch: self.state_epoch,
+            opt_oid: self.opt_pending.oid,
+            hedge_oid: self.hedge_pending.oid,
+            strike_1e6: self.selected_strike_1e6,
+            opt_qty_1e6: self.opt_pos_qty_1e6,
+            perp_qty_1e6: self.perp_pos_qty_1e6,
+            regime_offset_1e9: self.last_regime_off_1e9,
+            last_settle_value_1e6: self.last_settle_value_1e6,
+            selected_sym: self.selected_sym,
+            right: self.selected_right,
+            side: self.side,
+            entry_done: u8::from(self.entry_done),
+            configured: u8::from(self.configured),
+            _pad: [0; 8],
+        }
+    }
+    #[inline]
     fn vrp_regime_offset_1e6(&self) -> i64 {
         // 1e9 → 1e6, floor (never truncate-toward-zero: a negative
         // intercept must round the same way a positive one does).
@@ -2683,7 +2713,10 @@ impl Strategy for VrpStrategy {
             || opt.mark_iv_1e9 <= 0
             || opt.underlying_px_1e9 <= 0
         {
-            self.counters.stale_skips = self.counters.stale_skips.wrapping_add(1);
+            // F30: a record that carried nothing usable. Routine — the
+            // venue publishes summaries for instruments with no book —
+            // and NOT a decision this member wanted and could not take.
+            self.counters.records_ignored = self.counters.records_ignored.wrapping_add(1);
             return;
         }
         // Doctrine clause 3: the ONE conversion, shared with the harness.
@@ -2692,7 +2725,9 @@ impl Strategy for VrpStrategy {
             opt.underlying_px_1e9,
             row.contract_size_1e9,
         ) else {
-            self.counters.stale_skips = self.counters.stale_skips.wrapping_add(1);
+            // F30: the price does not convert — the record is noise,
+            // not a lost decision.
+            self.counters.records_ignored = self.counters.records_ignored.wrapping_add(1);
             return;
         };
         let now = opt.ts_ns;
@@ -5288,7 +5323,12 @@ mod tests {
         stale.flags = 0;
         m.on_opt_summary(&stale, &mut ctx);
         assert_eq!(m.vrp_counters().entries, 0);
-        assert!(m.vrp_counters().stale_skips >= 1);
+        // F30: the record was dropped on arrival, so it is
+        // `records_ignored`. The decision never ran — which is the law
+        // this test pins: a record the member cannot price does not
+        // become an entry.
+        assert!(m.vrp_counters().records_ignored >= 1);
+        assert_eq!(m.vrp_counters().decisions, 0);
         assert!(ctx.orders.is_empty());
     }
 
@@ -5305,7 +5345,10 @@ mod tests {
         o2.mark_iv_1e9 = 700_000_000;
         o2.underlying_px_1e9 = 0;
         m.on_opt_summary(&o2, &mut ctx);
-        assert_eq!(m.vrp_counters().stale_skips, 3);
+        // F30: these are RECORDS that carried nothing usable, not
+        // decisions the member wanted and could not take.
+        assert_eq!(m.vrp_counters().records_ignored, 3);
+        assert_eq!(m.vrp_counters().stale_skips, 0);
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "nothing was selected");
         assert!(ctx.orders.is_empty());
     }
@@ -5339,6 +5382,108 @@ mod tests {
 
     /// The §3.3 train-only fast-profile `vol:high` coefficient.
     const OFF_FAST_HIGH_1E9: i64 = -99_000_000;
+
+    // ---------------- P6: observability ----------------
+
+    #[test]
+    fn a_useless_record_is_ignored_and_a_lost_decision_is_a_stale_skip() {
+        // F30: both used to be `stale_skips`, and the venue publishes
+        // summaries for instruments with no book all day — so the
+        // number an operator watched for "we could not decide" was
+        // dominated by "the venue sent noise".
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, VrpParams::default());
+        let w = EXPIRY - TAU - 300_000_000_000;
+
+        // A summary with no mark flag, and one with a zero IV: records
+        // that carried nothing usable.
+        let mut bad = summary(w, opt_sym(4), 700_000_000, 500_000_000);
+        bad.flags = 0;
+        m.on_opt_summary(&bad, &mut ctx);
+        let mut zero_iv = summary(w, opt_sym(4), 0, 500_000_000);
+        zero_iv.flags = OPT_SUMMARY_FLAG_MARK_PX;
+        m.on_opt_summary(&zero_iv, &mut ctx);
+        assert_eq!(m.vrp_counters().records_ignored, 2);
+        assert_eq!(m.vrp_counters().stale_skips, 0, "nothing was decided");
+
+        // Now the other half: a REBALANCE the member wanted and could
+        // not take. It runs on the perp lane, so it is the rung that
+        // can find its own option mark stale.
+        let params = VrpParams::default();
+        let mut ctx2 = RecCtx::new();
+        let (mut m2, _) = member(&mut ctx2, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx2.now = mono_of(sel);
+        m2.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx2);
+        let entry = EXPIRY - TAU;
+        ctx2.now = mono_of(entry);
+        m2.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx2);
+        ctx2.orders.clear();
+        m2.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx2);
+        let n = fill_from(&mut m2, &mut ctx2, 0, mono_of(entry));
+        fill_from(&mut m2, &mut ctx2, n - 1, mono_of(entry));
+        assert_ne!(m2.opt_pos_qty_1e6(), 0, "a real position");
+        let ignored2 = m2.vrp_counters().records_ignored;
+        // A rebalance is due, and the option lane has been quiet for
+        // longer than a mark stays good.
+        let late = entry + params.rebalance_ns + MARK_STALE_NS + MINUTE_NS;
+        ctx2.now = mono_of(late);
+        m2.on_tick(&tick(late, 79_500_000_000, false), &mut ctx2);
+        assert!(
+            m2.vrp_counters().stale_skips >= 1,
+            "{:?}",
+            m2.vrp_counters()
+        );
+        assert_eq!(
+            m2.vrp_counters().records_ignored,
+            ignored2,
+            "a tick is not an option record"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_view_is_the_campaign_at_one_instant() {
+        // P6: `/state` shows WHICH contract is held. The counters never
+        // did, and the failure modes an operator reads — a naked hedge,
+        // a stuck leg — are relationships between these fields.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let v = strategy_core::StrategyCounters::vrp_snapshot_view(&m);
+        assert_eq!(v.configured, 1);
+        assert_eq!(v.expiry_ns, 0, "no campaign yet");
+        assert_eq!(v.side, SIDE_FLAT);
+
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+
+        // Entry submitted, nothing filled: the view says exactly that.
+        let v = strategy_core::StrategyCounters::vrp_snapshot_view(&m);
+        assert_eq!(v.expiry_ns, EXPIRY);
+        assert_eq!(v.selected_sym, m.selected_sym());
+        assert_eq!(v.right, RIGHT_CALL);
+        assert_eq!(v.side, SIDE_SHORT_VOL);
+        assert_eq!(v.entry_done, 1);
+        assert_eq!(v.opt_qty_1e6, 0, "submitted, not filled");
+        assert_ne!(v.opt_oid, 0, "a leg IS in flight");
+        assert_eq!(v.hedge_oid, 0, "and the hedge waits on its fill");
+        assert!(v.strike_1e6 > 0);
+
+        // Fill both legs: the view now carries a position on each.
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        fill_from(&mut m, &mut ctx, n - 1, mono_of(entry));
+        let v = strategy_core::StrategyCounters::vrp_snapshot_view(&m);
+        assert_eq!(v.opt_qty_1e6, -params.qty_1e6);
+        assert_ne!(v.perp_qty_1e6, 0, "and it is HEDGED");
+        assert_eq!(v.opt_oid, 0, "nothing left in flight");
+        assert!(v.state_epoch > 0);
+    }
 
     // ---------------- P5: the shared helpers ----------------
 

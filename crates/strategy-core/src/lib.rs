@@ -230,6 +230,14 @@ pub trait StrategyCounters {
         0
     }
 
+    /// P6: the VRP member's non-counter observables, all from ONE
+    /// instant. `Default` (every field zero) for a strategy that is not
+    /// the set, or a set with no VRP member.
+    #[inline]
+    fn vrp_snapshot_view(&self) -> VrpSnapshotView {
+        VrpSnapshotView::default()
+    }
+
     /// X1: fills that reached the strategy SET stamped for a slot that
     /// is not enabled, or not built. Non-zero means an order outlived a
     /// `DisableStrategy`, or a stamp is wrong.
@@ -623,8 +631,21 @@ pub struct VrpCounters {
     /// Decisions refused because the forecast had no bounds (a cold
     /// ring or fewer than 60 fitted pairs — ABSENT DATA HOLDS).
     pub no_bounds: u64,
-    /// Decisions or rebalances skipped on a stale option mark.
+    /// F30: DECISIONS, rebalances and settlements skipped because the
+    /// member's own cached mark was stale or absent — an action it
+    /// wanted to take and could not. Non-zero at a decision instant is
+    /// a campaign lost.
+    ///
+    /// Distinct from [`Self::records_ignored`], which counts option
+    /// RECORDS that carried nothing usable. Reading the two as one
+    /// number hid the difference between "the venue sent noise" and
+    /// "we could not decide", and the venue sends noise all day.
     pub stale_skips: u64,
+    /// F30: option records DROPPED on arrival — no mark flag, a
+    /// non-positive mark, IV or underlying, or a coin price that does
+    /// not convert. Routine: Deribit publishes summaries for
+    /// instruments with no book. It costs nothing and decides nothing.
+    pub records_ignored: u64,
     /// An expiry was inside the selection window and NOTHING in the
     /// chain was tradeable for this member — it rolled without our
     /// currency, or carries no calls at that expiry.
@@ -744,6 +765,51 @@ pub struct VrpCounters {
     /// number that says how much of the strategy the fee load eats;
     /// counted on top of [`Self::holds`], never instead of it.
     pub holds_cost: u64,
+}
+
+/// P6: everything `/state` shows about the VRP member (slot 1) that is
+/// NOT a counter — the artifact it booted with, the campaign in force,
+/// the orders in flight, and the two gauges.
+///
+/// One POD rather than a dozen trait accessors: the snapshot is filled
+/// once per publish and every field has to come from the same instant,
+/// or an operator reads a strike from one campaign against a position
+/// from the next.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VrpSnapshotView {
+    /// SHA-256 of the `vrp.toml` bytes (all-zero = unconfigured).
+    pub hash: [u8; 32],
+    /// Campaign expiry, WALL ns (0 = no campaign).
+    pub expiry_ns: u64,
+    /// V8a state epoch — moves whenever the persisted state changes.
+    pub state_epoch: u64,
+    /// `client_oid` of the option leg in flight (0 = none).
+    pub opt_oid: u64,
+    /// `client_oid` of the hedge leg in flight (0 = none).
+    pub hedge_oid: u64,
+    /// Selected contract's strike ×1e6.
+    pub strike_1e6: i64,
+    /// SIGNED option position ×1e6.
+    pub opt_qty_1e6: i64,
+    /// SIGNED perp hedge position ×1e6.
+    pub perp_qty_1e6: i64,
+    /// R3: the regime intercept in force at the last decision ×1e9.
+    pub regime_offset_1e9: i64,
+    /// X1: cash the last settlement booked ×1e6.
+    pub last_settle_value_1e6: i64,
+    /// Selected option sym (`SYMBOL_ID_NONE` = nothing selected).
+    pub selected_sym: SymbolId,
+    /// `opt_registry::RIGHT_CALL` / `RIGHT_PUT`.
+    pub right: u8,
+    /// `SIDE_SHORT_VOL` / `SIDE_LONG_VOL` / `SIDE_FLAT`.
+    pub side: i8,
+    /// 1 once this campaign's ONE decision has been taken.
+    pub entry_done: u8,
+    /// 1 once `configure` succeeded.
+    pub configured: u8,
+    /// Explicit padding — always zero.
+    pub _pad: [u8; 8],
 }
 
 /// XSD counters (`engine_xsd_*`), mirrored by the cli's generic 5 s

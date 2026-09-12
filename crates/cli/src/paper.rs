@@ -3893,8 +3893,12 @@ pub struct VrpMetricIds {
     pub regime_offset_1e6: core_metrics::GaugeId,
     /// `engine_vrp_no_bounds_total`
     pub no_bounds: core_metrics::CounterId,
-    /// `engine_vrp_stale_skips_total`
+    /// `engine_vrp_stale_skips_total` (F30 — DECISIONS lost to a stale
+    /// mark; non-zero at a decision instant is a campaign lost)
     pub stale_skips: core_metrics::CounterId,
+    /// `engine_vrp_records_ignored_total` (F30 — option records that
+    /// carried nothing usable; routine)
+    pub records_ignored: core_metrics::CounterId,
     /// `engine_vrp_no_selection_total`
     pub no_selection: core_metrics::CounterId,
     /// `engine_vrp_regime_blocked_total`
@@ -3957,6 +3961,7 @@ fn register_vrp_metrics(
     let holds_cost = one("engine_vrp_holds_cost_total")?;
     let no_bounds = one("engine_vrp_no_bounds_total")?;
     let stale_skips = one("engine_vrp_stale_skips_total")?;
+    let records_ignored = one("engine_vrp_records_ignored_total")?;
     let no_selection = one("engine_vrp_no_selection_total")?;
     let regime_blocked = one("engine_vrp_regime_blocked_total")?;
     let regime_exits = one("engine_vrp_regime_exits_total")?;
@@ -3992,6 +3997,7 @@ fn register_vrp_metrics(
         holds_cost,
         no_bounds,
         stale_skips,
+        records_ignored,
         no_selection,
         regime_blocked,
         regime_exits,
@@ -4199,6 +4205,8 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.no_bounds.saturating_sub(last.no_bounds));
     reg.counter(ids.stale_skips)
         .inc(cur.stale_skips.saturating_sub(last.stale_skips));
+    reg.counter(ids.records_ignored)
+        .inc(cur.records_ignored.saturating_sub(last.records_ignored));
     reg.counter(ids.no_selection)
         .inc(cur.no_selection.saturating_sub(last.no_selection));
     reg.counter(ids.regime_blocked)
@@ -4826,6 +4834,11 @@ fn fill_snapshot<S, D>(
     out.icdp.instruments = Sc::icdp_instruments(strat);
     out.icdp.counters = Sc::icdp_counters(strat);
 
+    // P6: slot 1. Both halves come from the same publish instant, so a
+    // strike and the position held against it can never disagree.
+    out.vrp.counters = Sc::vrp_counters(strat);
+    out.vrp.view = Sc::vrp_snapshot_view(strat);
+
     let st = eng.ai_status();
     let a = &mut out.ai;
     a.cmds = st.cmds();
@@ -5371,10 +5384,22 @@ where
 
                 // Active-strategy gauges — flip exactly one to 1.
                 let kind = strategy_core::StrategyCounters::strategy_kind(eng.strategy());
+                let live_mask = strategy_core::StrategyCounters::enabled_mask(eng.strategy());
                 reg.gauge(ids.strategy_latency_arb)
-                    .set(if kind == "latency-arb" { 1 } else { 0 });
-                reg.gauge(ids.strategy_vrp)
-                    .set(if kind == "vrp" { 1 } else { 0 });
+                    .set(i64::from(
+                        kind == "latency-arb"
+                            || live_mask & u64::from(strategy_set::BIT_LATENCY_ARB) != 0,
+                    ));
+                // F29: the live engine runs the SET, so `kind` is
+                // "set" and this gauge read 0 for the whole life of the
+                // member — an alert on "is the VRP member running"
+                // could never fire. It now answers the question it
+                // names: the bare strategy IS vrp, or the set has slot
+                // 1 ENABLED right now (a runtime `DisableStrategy`
+                // drops it back to 0, which is the point).
+                reg.gauge(ids.strategy_vrp).set(i64::from(
+                    kind == "vrp" || live_mask & u64::from(strategy_set::BIT_VRP) != 0,
+                ));
                 reg.gauge(ids.strategy_rule_tree)
                     .set(if kind == "rule-tree" { 1 } else { 0 });
                 reg.gauge(ids.strategy_set)

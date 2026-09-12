@@ -112,7 +112,7 @@ fn render_frame(f: &mut ratatui::Frame<'_>, s: &EngineSnapshot) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),  // header
+            Constraint::Length(7),  // header
             Constraint::Length(11), // strategies + recent orders
             Constraint::Min(6),     // ruleset rows
             Constraint::Length(10), // latency + ingress
@@ -169,6 +169,7 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &En
         )),
         ratatui::text::Line::from(format!("regime {}", regime_chip(s, 0))),
         ratatui::text::Line::from(format!("       {}", regime_chip(s, 1))),
+        ratatui::text::Line::from(vrp_chip(s)),
     ];
     let p = Paragraph::new(lines).block(
         Block::default()
@@ -176,6 +177,98 @@ fn render_header(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s: &En
             .title(" multivenue-engine "),
     );
     f.render_widget(p, area);
+}
+
+/// P6: slot 1 in one line — the campaign in force, then the numbers an
+/// operator watches for it.
+///
+/// `vrp: 79000C exp +5h12m SHORT opt -0.100 perp +0.049 | dec 3 hold
+/// 2(cost 1) ent 1/1 hdg 1 | settle 2(itm 1 otm 1) | off -0.099`
+///
+/// The campaign half is what the counters never showed: WHICH contract,
+/// and what sits on each leg. A naked hedge — the F7 defect, live for
+/// two campaigns — reads here as `opt 0.000` beside a non-zero `perp`.
+fn vrp_chip(s: &EngineSnapshot) -> String {
+    let v = &s.vrp.view;
+    let c = &s.vrp.counters;
+    if v.configured == 0 {
+        return "vrp: (unconfigured)".to_owned();
+    }
+    let mut out = String::from("vrp: ");
+    if v.expiry_ns == 0 {
+        out.push_str("(no campaign)");
+    } else {
+        let right = if v.right == 0 { 'C' } else { 'P' };
+        let side = match v.side {
+            x if x < 0 => "SHORT",
+            x if x > 0 => "LONG",
+            _ => "FLAT",
+        };
+        let to_exp = v.expiry_ns.saturating_sub(s.wall_ns) / 1_000_000_000;
+        out.push_str(&format!(
+            "{}{right} exp +{} {side} opt {} perp {}",
+            v.strike_1e6 / 1_000_000,
+            format_dur_s(to_exp),
+            qty6(v.opt_qty_1e6),
+            qty6(v.perp_qty_1e6),
+        ));
+        if v.entry_done == 0 {
+            out.push_str(" undecided");
+        }
+        if v.opt_oid != 0 || v.hedge_oid != 0 {
+            out.push_str(" pending");
+        }
+    }
+    out.push_str(&format!(
+        " | dec {} hold {}(cost {}) ent {}/{} hdg {} | settle {}(itm {} otm {}) | off {}",
+        c.decisions,
+        c.holds,
+        c.holds_cost,
+        c.entries,
+        c.entries_submitted,
+        c.hedges,
+        c.settlements,
+        c.settled_itm,
+        c.settled_otm,
+        signed_1e9(v.regime_offset_1e9),
+    ));
+    // The three that are operator ALERTS, printed only when non-zero so
+    // a healthy engine's line stays readable (docs/risk-policy.md).
+    if c.hedge_abandoned != 0 {
+        out.push_str(&format!("  !hedge_abandoned {}", c.hedge_abandoned));
+    }
+    if c.settled_unpriced != 0 {
+        out.push_str(&format!("  !settled_unpriced {}", c.settled_unpriced));
+    }
+    if c.killed != 0 {
+        out.push_str("  !KILLED");
+    }
+    out
+}
+
+/// A signed ×1e6 quantity as `±d.dddddd`.
+fn qty6(v_1e6: i64) -> String {
+    let neg = v_1e6 < 0;
+    let a = v_1e6.unsigned_abs();
+    format!(
+        "{}{}.{:06}",
+        if neg { '-' } else { '+' },
+        a / 1_000_000,
+        a % 1_000_000
+    )
+}
+
+/// A signed ×1e9 log offset as `±0.ddd` (three places is all the §3.3
+/// fit has).
+fn signed_1e9(v_1e9: i64) -> String {
+    let neg = v_1e9 < 0;
+    let a = v_1e9.unsigned_abs();
+    format!(
+        "{}{}.{:03}",
+        if neg { '-' } else { '+' },
+        a / 1_000_000_000,
+        (a % 1_000_000_000) / 1_000_000
+    )
 }
 
 /// `fast: trend=BULL shape=MIXED vol=LOW fund=? level=? stretch=NEUTRAL [measured] decl 0s/0s`
@@ -601,6 +694,45 @@ mod tests {
         assert_eq!(format_dur_s(312), "5m12s");
         assert_eq!(format_dur_s(3 * 3_600 + 4 * 60), "3h04m");
         assert_eq!(format_dur_s(2 * 86_400 + 3_600), "2d01h");
+    }
+
+    #[test]
+    fn the_vrp_chip_shows_the_campaign_and_flags_the_alerts() {
+        let mut s = Box::new(EngineSnapshot::empty());
+        assert_eq!(vrp_chip(&s), "vrp: (unconfigured)");
+
+        s.vrp.view.configured = 1;
+        assert!(vrp_chip(&s).starts_with("vrp: (no campaign)"));
+
+        s.wall_ns = 1_789_027_200_000_000_000 - 18_000_000_000_000; // E−5h
+        let v = &mut s.vrp.view;
+        v.expiry_ns = 1_789_027_200_000_000_000;
+        v.strike_1e6 = 79_000_000_000;
+        v.right = 0;
+        v.side = -1;
+        v.opt_qty_1e6 = -100_000;
+        v.perp_qty_1e6 = 49_000;
+        v.entry_done = 1;
+        v.regime_offset_1e9 = -99_000_000;
+        let line = vrp_chip(&s);
+        assert!(line.contains("79000C exp +5h00m SHORT"), "{line}");
+        assert!(line.contains("opt -0.100000 perp +0.049000"), "{line}");
+        assert!(line.contains("off -0.099"), "{line}");
+        assert!(!line.contains('!'), "a healthy line carries no alert: {line}");
+
+        // THE failure this panel exists for: a hedge with no option
+        // behind it — the F7 defect, live for two campaigns.
+        s.vrp.view.opt_qty_1e6 = 0;
+        assert!(vrp_chip(&s).contains("opt +0.000000 perp +0.049000"));
+
+        // The three alerts print only when non-zero.
+        s.vrp.counters.hedge_abandoned = 1;
+        s.vrp.counters.settled_unpriced = 2;
+        s.vrp.counters.killed = 1;
+        let line = vrp_chip(&s);
+        assert!(line.contains("!hedge_abandoned 1"), "{line}");
+        assert!(line.contains("!settled_unpriced 2"), "{line}");
+        assert!(line.contains("!KILLED"), "{line}");
     }
 
     #[test]

@@ -736,6 +736,10 @@ impl StrategyCounters for StrategySet {
         StrategyCounters::vrp_regime_offset_1e6(&self.vrp)
     }
     #[inline]
+    fn vrp_snapshot_view(&self) -> strategy_core::VrpSnapshotView {
+        StrategyCounters::vrp_snapshot_view(&self.vrp)
+    }
+    #[inline]
     fn fills_unrouted(&self) -> u64 {
         self.fills_unrouted
     }

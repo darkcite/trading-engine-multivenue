@@ -13,7 +13,8 @@
 
 use core_types::{Fill, Order};
 use strategy_core::{
-    IcdpCounters, RegimeCounters, RegimeRelView, SlotCounters, VmRowView,
+    IcdpCounters, RegimeCounters, RegimeRelView, SlotCounters, VmRowView, VrpCounters,
+    VrpSnapshotView,
 };
 
 /// JSON schema version of `/state` (`"v"`). Bump on any field removal
@@ -279,6 +280,22 @@ pub struct IcdpSnapshot {
     pub _pad: u32,
 }
 
+/// P6: the VRP member (slot 1).
+///
+/// The whole campaign in one place, because the failure modes an
+/// operator has to read — a naked hedge, a stuck pending leg, an
+/// unpriced expiry — are relationships BETWEEN these fields, not any
+/// one of them. Counters alone never showed which contract was held.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct VrpSnapshot {
+    /// The member's diagnostic counters.
+    pub counters: VrpCounters,
+    /// The artifact, the campaign, the legs in flight and the gauges —
+    /// all read at ONE instant.
+    pub view: VrpSnapshotView,
+}
+
 /// The AI command plane (`AiIngressStatus` cumulative counters + the
 /// two engine-side values).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -457,6 +474,8 @@ pub struct EngineSnapshot {
     pub vm: VmSnapshot,
     /// The icdp member.
     pub icdp: IcdpSnapshot,
+    /// The VRP member.
+    pub vrp: VrpSnapshot,
     /// The AI plane.
     pub ai: AiSnapshot,
     /// Per-venue ingress health (order = [`VENUE_NAMES`]).
@@ -492,6 +511,7 @@ impl EngineSnapshot {
             slots: [SlotCounters::default(); SNAPSHOT_SLOTS],
             vm: VmSnapshot::empty(),
             icdp: IcdpSnapshot::default(),
+            vrp: VrpSnapshot::default(),
             ai: AiSnapshot::default(),
             ingress: [IngressSnapshot::default(); SNAPSHOT_VENUES],
             capture: CaptureSnapshot::default(),

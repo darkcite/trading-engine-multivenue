@@ -44,11 +44,18 @@ uv run python -m claude_worker.candles ||
 # refuses that; only `last_min_ts_ms` in the boot tell reveals it.
 # Hourly bounds the exposure to an hour. Atomic (tmp + rename), so a
 # boot never reads a torn file.
-uv run python -m claude_worker.vrp_seed seed-out \
-  --db "$HOME/multivenue/worker/candles.db" \
-  --vrp "$HOME/multivenue/vrp.toml" \
-  --out "$HOME/multivenue/vrp-seed.tsv" ||
-  echo "candles-cycle: vrp_seed failed (non-fatal; next hour retries)" >&2
+#
+# F27: guarded on the artifact. `seed-out --vrp` REQUIRES vrp.toml and
+# exits non-zero without it, so on a host that does not run the member
+# this line printed a failure every hour -- noise that trains an
+# operator to ignore the one hour it means something.
+if [ -f "$HOME/multivenue/vrp.toml" ]; then
+  uv run python -m claude_worker.vrp_seed seed-out \
+    --db "$HOME/multivenue/worker/candles.db" \
+    --vrp "$HOME/multivenue/vrp.toml" \
+    --out "$HOME/multivenue/vrp-seed.tsv" ||
+    echo "candles-cycle: vrp_seed failed (non-fatal; next hour retries)" >&2
+fi
 # D3: the IV digest rides the same serialized window.
 uv run python -m claude_worker.iv_digest ||
   echo "candles-cycle: iv_digest failed (non-fatal; next hour retries)" >&2

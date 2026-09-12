@@ -589,7 +589,8 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     "member: vrp decisions={} decisions_late={} entries={} entries_submitted={} \
                      entries_unfilled={} hedges={} hedge_unfilled={} hedge_abandoned={} exits={} \
                      holds={} holds_side={} no_bounds={} no_selection={} select_scans={} \
-                     stale_skips={} regime_blocked={} regime_exits={} settlements={} \
+                     records_ignored={} stale_skips={} regime_blocked={} regime_exits={} \
+                     settlements={} \
                      settled_itm={} settled_otm={} settled_unpriced={} qlike_har_beats_iv={} \
                      killed={} caps_rejected={} fills={} fills_ignored={} orders_emitted={} \
                      entry_maker_submitted={} entry_crossed={} entry_cost_refused={} \
@@ -611,6 +612,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     c.no_bounds,
                     c.no_selection,
                     c.select_scans,
+                    c.records_ignored,
                     c.stale_skips,
                     c.regime_blocked,
                     c.regime_exits,

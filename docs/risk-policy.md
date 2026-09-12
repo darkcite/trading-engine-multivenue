@@ -184,6 +184,24 @@ section above requires, not an auto-resume.
 > `engine_vrp_qlike_har_1e6` is an operator obligation on top of the
 > engine control.
 
+### VRP member alerts (2026-09-12)
+
+Three VRP counters are ALERTS, not observability. Each names a state the
+engine cannot fix for itself, and each is printed on the TUI's `vrp:`
+line only when it is non-zero.
+
+| counter | what it means | what to do |
+|---|---|---|
+| `engine_vrp_hedge_abandoned_total` | a hedge target was given up on after `HEDGE_RETRIES_MAX` — **the book is not at its delta target and no order is chasing it** | flatten or hedge the slot 1 perp position by hand, then read `engine_vrp_hedge_unfilled_total` and the venue's book depth to see whether the size is simply too large for the touch |
+| `engine_vrp_entries_unfilled_total` | an option entry met no fill by its deadline. ONE is routine at a maker entry (`entry_mode = maker`); a run of them means the member is resting where nobody trades | compare with `engine_vrp_entry_maker_submitted_total` and `engine_vrp_entry_crossed_total`. All three moving together is the fallback working; `entries_unfilled` alone climbing with `entry_fallback = abandon` is a campaign lost every day |
+| `engine_vrp_settled_unpriced_total` | an ITM expiry settled with no symbol to price it — **the value was NOT recorded** | reconcile that expiry by hand from the state-file backup's `C` row (see the F26 entry in `docs/local-setup.md`) |
+
+Two more are diagnostics rather than alerts, and are worth a weekly
+read: `engine_vrp_holds_cost_total` (HOLDs that θ alone would have
+traded — the fee load, measured) and
+`engine_vrp_settle_index_fallback_total` (settlements priced off the
+last print because the 30-minute delivery window was thin).
+
 ## Signing-key handling
 
 - The EIP-712 signing key is loaded from the project-root `.env` file only.

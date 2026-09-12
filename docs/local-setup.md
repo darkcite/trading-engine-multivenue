@@ -361,6 +361,19 @@ Operational laws:
   iteration first reported a non-zero delta.
 - **Engine can't read `.env`**: confirm `chmod 600 .env` and that the
   process's cwd is the project root.
+- **F26 — `engine_vrp_settled_unpriced_total` is non-zero**: an expiry
+  that was IN the money reached settlement while the member no longer
+  had a symbol for its contract, so the position was closed out of the
+  member's own book and **the cash value was not recorded**. The shape
+  that produces it is a deferred 08:00Z settle (no option record arrived
+  at the instant) followed by the 08:30Z reboot: Deribit drops an
+  expired instrument from the boot chain, so the restored campaign has
+  an expiry and no sym. **Reconcile that one expiry by hand**: the `C`
+  row of the pre-restart backup of `~/multivenue/vrp-state.tsv` (the
+  restart procedure keeps one) names the strike, the right and the side;
+  price it against the venue's own delivery index for that expiry and
+  post the difference to the day's P&L manually. Any non-zero value here
+  is a reconciliation item, not a routine counter.
 
 ## Kronos forecast sidecar (optional)
 

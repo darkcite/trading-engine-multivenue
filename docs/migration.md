@@ -6,6 +6,99 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `/state` gains a `vrp` object; `stale_skips` splits in two; `engine_strategy_vrp_active` starts telling the truth (VRP P6)
+
+**What changed**
+
+- **`/state` gains a `"vrp"` object.** ADDITIVE — `"v": 1` stays, no
+  reader breaks, and `engine-snapshot` is still inside its 32 KB bound.
+  It carries the member's counters plus what the counters never said:
+
+  ```json
+  "vrp":{"configured":1,"hash":"…","state_epoch":9,
+         "regime_offset_1e9":-99000000,"last_settle_value_1e6":1250000,
+         "campaign":{"expiry_ns":"…","sym":50332169,"strike_1e6":79000000000,
+                     "right":0,"side":-1,"opt_qty_1e6":-100000,
+                     "perp_qty_1e6":49000,"entry_done":1},
+         "pending":{"opt_oid":"77","hedge_oid":"0"}, … }
+  ```
+
+  WHICH contract is held, at what strike, with what on each leg, and
+  what is still in flight. The failure modes an operator has to read are
+  relationships between those fields — a **naked hedge** is
+  `opt_qty_1e6 == 0` beside a non-zero `perp_qty_1e6` (the F7 defect,
+  live for two campaigns before P1), and a **stuck leg** is an
+  `opt_oid`/`hedge_oid` that does not clear. The byte-exact pin test in
+  `crates/engine-snapshot/tests/encode.rs` is extended, not regenerated:
+  the head pin is untouched because the section is appended after
+  `icdp`.
+
+- **The TUI gains a `vrp:` line** (header grows from 6 rows to 7) — the
+  campaign, then `dec/hold(cost)/ent/hdg/settle` and the regime offset.
+  `hedge_abandoned`, `settled_unpriced` and `killed` print there ONLY
+  when non-zero, so a healthy line stays readable and an unhealthy one
+  is unmissable.
+
+- **OPERATOR-VISIBLE — `engine_vrp_stale_skips_total` splits in two**
+  (F30). It used to count both "the venue sent an option record with
+  nothing usable in it" and "a rung wanted to act and the mark it needed
+  was stale". Deribit publishes summaries for instruments with no book
+  all day, so the first drowned the second, and the number an operator
+  watched for lost decisions was dominated by routine noise. From this
+  release:
+
+  | counter | what it counts |
+  |---|---|
+  | `engine_vrp_records_ignored_total` | option records DROPPED on arrival — no mark flag, a non-positive mark/IV/underlying, or a coin price that does not convert. **Routine.** |
+  | `engine_vrp_stale_skips_total` | a rebalance or a settlement skipped because the member's own cached mark was stale or absent. **An action it wanted to take and could not.** |
+
+  **Expect `stale_skips` to drop to near zero and `records_ignored` to
+  carry the old volume.** That is the split, not a fix. Any alert or
+  dashboard reading `engine_vrp_stale_skips_total` should be left
+  pointed at it — it now means what its name says.
+
+  One honest note recorded with the split: the DECISION rung's own stale
+  guard is unreachable as the member is wired today. `decide` runs only
+  from `on_opt_summary`, which has just refreshed the cached mark from
+  the very record that brought it there, so the price is positive and
+  the age is zero by construction. The guard is kept (two compares on a
+  once-per-campaign path, and it is what would have to hold the day
+  `decide` is reached from a tick) and commented as such. The live
+  `stale_skips` come from the rebalance and settle rungs, which run on
+  the perp lane.
+
+- **OPERATOR-VISIBLE — `engine_strategy_vrp_active` was always 0**
+  (F29). It was set from `strategy_kind == "vrp"`, and the live engine
+  runs the SET, whose kind is `"set"` — so a gauge named "is the VRP
+  member active" could never read 1, and an alert on it could never
+  fire. It now reads 1 when the bare strategy is `vrp` **or** the set
+  has slot 1 enabled right now; a runtime `DisableStrategy(1)` drops it
+  back to 0, which is the point. `engine_strategy_latency_arb_active`
+  had the same defect and is fixed the same way.
+
+**Ops**
+
+- `scripts/candles-cycle.sh` guards the VRP seed cut on
+  `[ -f ~/multivenue/vrp.toml ]` (F27). `seed-out --vrp` REQUIRES the
+  artifact and exits non-zero without it, so on a host that does not run
+  the member the cycle printed a failure every hour — noise that trains
+  an operator to ignore the one hour it means something.
+- `docs/local-setup.md` gains the F26 runbook entry for
+  `engine_vrp_settled_unpriced_total`: what produces it (a deferred
+  08:00Z settle followed by the 08:30Z reboot, after which Deribit has
+  dropped the expired instrument from the boot chain), and how to
+  reconcile that one expiry by hand from the state-file backup's `C`
+  row.
+- `docs/risk-policy.md` gains a **VRP member alerts** table:
+  `hedge_abandoned`, `entries_unfilled` and `settled_unpriced`, each
+  with what it means and what to do, plus `holds_cost` and
+  `settle_index_fallback` as weekly diagnostics.
+
+**Action required**: none at boot. After the next restart, expect
+`engine_vrp_stale_skips_total` to go quiet and
+`engine_vrp_records_ignored_total` to carry its old rate, and expect
+`engine_strategy_vrp_active` to read 1 for the first time.
+
 ## 2026-09-12 — VRP config errors stop blaming `icdp.toml`; the live chain stops parsing instrument names (VRP P5)
 
 **What changed**

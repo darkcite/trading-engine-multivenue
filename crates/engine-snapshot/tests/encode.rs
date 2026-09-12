@@ -180,6 +180,67 @@ fn full_snapshot_one_byte_short_is_refused() {
     assert_eq!(encode_state_json(&s, &mut exact), Ok(n));
 }
 
+/// P6: the `vrp` object. Additive — `"v":1` stays — so this is a
+/// `contains` pin rather than a new head. The campaign half is the
+/// point: counters alone never said WHICH contract was held, and the
+/// failure modes an operator reads (a naked hedge, a stuck leg) are
+/// relationships between these fields.
+#[test]
+fn the_vrp_section_renders_the_campaign_and_its_counters() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    let v = &mut s.vrp.view;
+    v.configured = 1;
+    v.hash = [0x5a; 32];
+    v.state_epoch = 9;
+    v.expiry_ns = 1_789_027_200_000_000_000;
+    v.selected_sym = 0x0300_0209;
+    v.strike_1e6 = 79_000_000_000;
+    v.right = 0;
+    v.side = -1;
+    v.opt_qty_1e6 = -100_000;
+    v.perp_qty_1e6 = 49_000;
+    v.entry_done = 1;
+    v.opt_oid = 77;
+    v.hedge_oid = 0;
+    v.regime_offset_1e9 = -99_000_000;
+    v.last_settle_value_1e6 = 1_250_000;
+    let c = &mut s.vrp.counters;
+    c.decisions = 3;
+    c.holds = 2;
+    c.holds_cost = 1;
+    c.entries_submitted = 1;
+    c.entries = 1;
+    c.records_ignored = 4_242;
+    c.stale_skips = 0;
+
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+        body.contains(concat!(
+            "\"vrp\":{\"configured\":1,",
+            "\"hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\",",
+            "\"state_epoch\":9,\"regime_offset_1e9\":-99000000,",
+            "\"last_settle_value_1e6\":1250000,",
+            "\"campaign\":{\"expiry_ns\":\"1789027200000000000\",\"sym\":50332169,",
+            "\"strike_1e6\":79000000000,\"right\":0,\"side\":-1,",
+            "\"opt_qty_1e6\":-100000,\"perp_qty_1e6\":49000,\"entry_done\":1},",
+            "\"pending\":{\"opt_oid\":\"77\",\"hedge_oid\":\"0\"},",
+            "\"decisions\":3,\"decisions_late\":0,\"holds\":2,\"holds_side\":0,",
+            "\"holds_cost\":1,"
+        )),
+        "vrp schema drift; got: {body}"
+    );
+    // F30: the two are separate numbers, and the one that matters is
+    // the small one.
+    assert!(body.contains("\"records_ignored\":4242,\"stale_skips\":0,"));
+    // The unconfigured default still renders, and says so.
+    let empty = Box::new(EngineSnapshot::empty());
+    let n = encode_state_json(&empty, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains("\"vrp\":{\"configured\":0,"));
+}
+
 /// The schema pin: a fixed small snapshot renders byte-exact. Any
 /// change here is a `/state` schema change — bump `SNAPSHOT_SCHEMA`
 /// and the worker/page readers together.
