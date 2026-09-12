@@ -1883,7 +1883,7 @@ worker-side layers are the enforcement that is live.
   members, 3 day reports, 40 recent orders, 6 venues UP, the two vm
   rows with their gate bytes) — the frozen record (page + both JSON
   documents, self-replaying `index.html`) is in the vault at
-  `docs/research/rg6-dashboard-live-2026-09-05/` (git-excluded; the
+  `docs/research/regime/rg6-dashboard-live-2026-09-05/` (git-excluded; the
   §7 "screenshot in the vault" tell). **`com.multivenue.dashboard`
   BOOTSTRAPPED 08:19Z on operator approval (pid 77305, `state =
   running`, guard silent, all routes 200) and RG6 COMMITTED as
@@ -2192,7 +2192,7 @@ worker-side layers are the enforcement that is live.
   (windows 9, counted 9, failed 7, need 8)`. The FAST profile breaks the
   ≤ 2 flips bound on `shape` (3–7 per window) and `trend` (3–6); the
   SLOW profile passes everywhere (≤ 1). Root causes (vault:
-  `docs/research/rg7-soak-flicker-2026-09-07.md`, replayed by a
+  `docs/research/regime/rg7-soak-flicker-2026-09-07.md`, replayed by a
   `tools_` one-shot per `docs/arch/research-tools-exclusion-plan.md` —
   both git-excluded): (1) §3.5 is
   half-implemented — only SHAPE has enter/exit bands; TREND / VOL /
