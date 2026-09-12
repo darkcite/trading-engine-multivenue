@@ -1,4 +1,5 @@
-# ~/multivenue/fees.toml — the operator's fee tier per venue (ICDP I6, D2/D6).
+# ~/multivenue/fees.toml — the operator's fee tier per venue × INSTRUMENT CLASS
+# (ICDP I6, D2/D6; D2-AMEND 2026-09-04; XSD-F fee classes 2026-09-12, ruling R4).
 # DATA, not source: read by `python -m claude_worker.pnl_report --closed-day`
 # (the nightly lane) and passed to `audit-pnl` as `--fee-bps <venue>:<maker>:<taker>`.
 # Integer basis points per side. The harness defaults stay 0/0 and the fee
@@ -12,11 +13,13 @@
 # line below is re-derived from that venue's own published regular/base-tier
 # schedule. Three laws:
 #
-#   L1  ONE SLOT PER VENUE. `ModelParams::fee_bps` is indexed by `VenueId`
-#       (7 slots), so a venue whose STRATEGIES take both spot and perp legs
-#       gets ONE number: the DEARER of the two. Over-charging a perp leg
-#       understates P&L; under-charging a spot leg flatters it, and only the
-#       second direction can talk us into a losing strategy.
+#   L1  RETIRED 2026-09-12 (XSD-F). It read: "ONE SLOT PER VENUE — a venue
+#       whose strategies take both spot and perp legs gets the DEARER number".
+#       `ModelParams::fee_bps` is now indexed by venue AND class, so every
+#       class carries its own published number and nothing is over-charged.
+#       The bare `[fees]` line per venue is KEPT as the value every class
+#       inherits when the venue's table below does not name it — and it is
+#       what pre-XSD-F readers still see, so it stays the dearest class.
 #   L2  TRADED legs decide, not the universe. `universe.toml` carries
 #       capture-only instruments (e.g. bybit spot) that no strategy sends an
 #       order to. Those do not pull the venue's number up. If a strategy ever
@@ -57,6 +60,77 @@
 # not machine-readable on 2026-09-04. It does not matter here: the spot tier is
 # strictly dearer and binds the slot under L1. Re-check before ever moving `bn`
 # down to a perp-only number.
+#
+# ============================================================================
+# XSD-F (2026-09-12, operator ruling R4): FEES PER VENUE × INSTRUMENT CLASS.
+# ============================================================================
+#
+# Grammar (read by `claude_worker.pnl_report.load_fee_flags`, emitted as the
+# harness's repeatable flags — later flags win):
+#
+#   [fees]                    bare line per venue = EVERY class of that venue
+#   <venue> = "<maker>:<taker>"             -> --fee-bps <venue>:<m>:<t>
+#   [fees.<venue>]            one class each; absent class inherits the bare line
+#   spot | perp | dated | option | prediction = "<maker>:<taker>"
+#                                            -> --fee-bps <venue>.<class>:<m>:<t>
+#   option_cap = "<index_bps>:<premium_cap_bps>"
+#                                            -> --opt-fee <venue>:<index_bps>:<cap>
+#     the venue's CAPPED option law: min(index_bps × underlying, cap × premium)
+#     per contract. The harness applies it to a sym whose underlying index it
+#     observed in the capture (Deribit today); an option sym without an index
+#     falls back to the venue's flat `option`/bare pair on PREMIUM notional —
+#     which under-charges an option, so `option_cap` is the one to write. (A
+#     distinct KEY rather than a value shape, so a section-blind `key = "m:t"`
+#     reader of this file never trips on it.)
+#
+# The CLASS of a sym is its descriptor's (core-config `instrument_class`, mirrored
+# in `claude_worker.instrument_class`, one shared fixture): `binance:` spot,
+# `binance-usdm:` perp (`_yymmdd` dated), `binance-opt:` option, `okx:` by instId
+# shape, `deribit:` by name, `hyperliquid:` perp, `bybit:` spot, `bybit-linear:`
+# perp (`-DDMMMYY` dated), a bare token id prediction. A sym whose class the law
+# does not know is charged the venue's DEAREST class and counted
+# (`fee_class_unknown`) — never silently the cheapest.
+#
+# L2 (traded legs decide) and L3 (round UP to the whole bp) STAND.
+#
+# Derived 2026-09-12 from each venue's published regular/base tier (sources and
+# dates below; L3 applied). RE-DERIVE before any member trades a class that is
+# not traded today (options on bn/okx/bybit, dated futures anywhere).
+#
+#   venue    class        published (maker / taker)                 bps    source
+#   -------  -----------  ----------------------------------------  -----  -----------------------------------------
+#   pm       prediction   0 / 0.07·p·(1−p) of notional (p 0.50)    0:350  CLOB fee doc (D2-AMEND, unchanged; caveat below)
+#   bn       spot         0.1000 % / 0.1000 %                       10:10  binance.com/en/fee/trading (2026-09-04)
+#   bn       perp         0.0200 % / 0.0500 % USDⓈ-M regular         2:5   support FAQ 360033544231; operator 2026-09-12
+#   bn       dated        USDⓈ-M delivery = the same fee table        2:5   same table (delivery rides the USDⓈ-M schedule)
+#   bn       option_cap   0.024 % of index, cap 10 % of premium      3:1000  support FAQ 5326e5de… (0.024 % -> 3 under L3;
+#                         exercise 0.015 %, cap 10 %)                       exercise not modelled: eapi is capture-only)
+#   okx      spot         0.080 % / 0.100 % Lv1                      8:10  okx.com/fees Lv1 (2026-09-04)
+#   okx      perp         0.020 % / 0.050 % Lv1                      2:5   okx.com/fees Lv1
+#   okx      dated        expiry futures 0.020 % / 0.050 % Lv1       2:5   okx.com/fees Lv1
+#   okx      option_cap   0.030 % / 0.030 % of underlying (Lv1,      3:700  help "okx-to-adjust-options-trading-fees"
+#                         since 2025-02-10), cap 7 % of premium              (2025-02-10) + "…parameters for options fee
+#                         (since 2025-05-15)                                 calculation" (cap 12.5 % -> 7 %, 2025-05-15)
+#   deribit  spot         published 0.02 % / 0.05 %; API reports    2:5    api/v2 get_instruments kind=spot -> 0.0/0.0
+#                         0.0/0.0 (WAIVED, 2026-09-12)                       (waived); the unwaived rate is carried (caveat)
+#   deribit  perp         0.015 % / 0.035 % (BTC-PERPETUAL)          2:4   api/v2 get_instrument BTC-PERPETUAL (2026-09-12)
+#   deribit  dated        0.015 % / 0.035 % (every dated future)     2:4   api/v2 get_instruments kind=future (2026-09-12)
+#   deribit  option_cap   0.03 % / 0.03 % of underlying, cap         3:1250  api/v2 get_instruments kind=option (0.0003);
+#                         12.5 % of premium; settlement 0.015 %             the harness's DERIBIT constant (VRP V2b/VX)
+#   hl       spot         0.040 % / 0.070 % tier 0                   4:7   hyperliquid docs /trading/fees (2026-09-12)
+#   hl       perp         0.015 % / 0.045 % tier 0                   2:5   hyperliquid docs /trading/fees
+#   bybit    spot         0.1000 % / 0.1000 % non-VIP               10:10  help "Trading-Fee-Structure" (2026-09-12)
+#   bybit    perp         0.0200 % / 0.0550 % non-VIP                2:6   help "Trading-Fee-Structure"
+#   bybit    dated        futures 0.0200 % / 0.0550 % non-VIP        2:6   help "Trading-Fee-Structure"
+#   bybit    option_cap   0.02 % / 0.03 % of index, cap 7 %         3:700  help "Bybit-Option-Fees-Explained" (taker under
+#                         of option price; delivery 0.015 %                 L3; delivery not modelled)
+#
+# The bare `[fees]` lines are the D2-AMEND values UNCHANGED (the dearest TRADED
+# class per venue, L2) — they are what a pre-XSD-F reader still charges every
+# class, and the value any class the venue's table does not name inherits.
+# Every traded class is named below, so the bare line decides nothing for the
+# harness today; it exists for older readers and for classes nobody trades.
+#
 [fees]
 pm = "0:350"
 bn = "10:10"
@@ -64,3 +138,34 @@ okx = "8:10"
 deribit = "2:5"
 hl = "2:5"
 bybit = "2:6"
+
+[fees.pm]
+prediction = "0:350"
+
+[fees.bn]
+spot = "10:10"
+perp = "2:5"
+dated = "2:5"
+option_cap = "3:1000"
+
+[fees.okx]
+spot = "8:10"
+perp = "2:5"
+dated = "2:5"
+option_cap = "3:700"
+
+[fees.deribit]
+spot = "2:5"
+perp = "2:4"
+dated = "2:4"
+option_cap = "3:1250"
+
+[fees.hl]
+spot = "4:7"
+perp = "2:5"
+
+[fees.bybit]
+spot = "10:10"
+perp = "2:6"
+dated = "2:6"
+option_cap = "3:700"

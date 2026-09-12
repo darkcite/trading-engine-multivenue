@@ -108,8 +108,9 @@ struct AuditPnlArgs {
     /// --replay-dir`.
     #[arg(long)]
     dir: PathBuf,
-    /// Repeatable `--fee-bps <venue>:<maker>:<taker>` overrides
-    /// (same grammar as the backtest arm).
+    /// Repeatable `--fee-bps <venue>[.<class>]:<maker>:<taker>` overrides
+    /// (same grammar as the backtest arm; XSD-F: a bare venue sets every
+    /// class, `<venue>.<class>` one of spot|perp|dated|option|prediction).
     #[arg(long)]
     fee_bps: Vec<String>,
     /// Global activation-Δ override, ns (same as backtest).
@@ -171,9 +172,10 @@ struct BacktestArgs {
     /// verbatim into the schema-1 report.
     #[arg(long)]
     split: String,
-    /// §4.3 fee override `<venue>:<maker_bps>:<taker_bps>`,
-    /// repeatable (venues: pm|bn|okx|deribit|hl). Defaults all 0/0.
-    /// Parsed but UNUSED by the H1 hold model (consumed from H2).
+    /// §4.3 fee override `<venue>[.<class>]:<maker_bps>:<taker_bps>`,
+    /// repeatable (venues: pm|bn|okx|deribit|hl|bybit; XSD-F classes:
+    /// spot|perp|dated|option|prediction — a bare venue sets all five).
+    /// Defaults all 0/0.
     #[arg(long)]
     fee_bps: Vec<String>,
     /// §4.4 global latency-penalty override in ns (default per-venue:

@@ -56,9 +56,9 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, OptSummary, Order, Price,
-    Qty, RegimeTerm, RuleTableV2, Tick, VenueId, AI_SIDE_NONE, REGIME_OFF_SOFT, STRATEGY_SLOT_VM,
-    SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, InstrumentClass,
+    OptSummary, Order, Price, Qty, RegimeTerm, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
+    INSTRUMENT_CLASSES, REGIME_OFF_SOFT, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -172,7 +172,9 @@ pub struct BacktestConfig {
     pub replay_dir: PathBuf,
     /// Split spec, echoed VERBATIM into schema-1 after validation.
     pub split: String,
-    /// Repeatable `--fee-bps <venue>:<maker>:<taker>` overrides.
+    /// Repeatable `--fee-bps <venue>[.<class>]:<maker>:<taker>` overrides
+    /// (XSD-F: a bare `<venue>:` sets every class, `<venue>.<class>:`
+    /// one class — see [`ModelParams::fee_bps`]).
     pub fee_bps: Vec<String>,
     /// Global `--latency-ns` override (applies to all venues).
     pub latency_ns: Option<u64>,
@@ -313,10 +315,18 @@ impl OptFee {
 /// feed never trades — kept so the venue byte indexes directly).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ModelParams {
-    /// `(maker_bps, taker_bps)` per venue. §4.3 defaults: all 0/0
-    /// (Polymarket's current CLOB fee schedule; CEX venues cannot
-    /// execute until 8j).
-    pub fee_bps: [(u32, u32); 7],
+    /// `(maker_bps, taker_bps)` per venue × per [`InstrumentClass`]
+    /// (XSD-F, statarb doc 08 §4 — operator ruling R4 2026-09-12).
+    /// §4.3 defaults: all 0/0. Before XSD-F this was ONE pair per
+    /// venue and the D2-AMEND law L1 put the DEARER class in the slot,
+    /// which charged every Binance perp leg the spot tier (10 bps
+    /// instead of 5). `--fee-bps <venue>:<m>:<t>` still sets all five
+    /// classes at once (bit-identical to the old flag);
+    /// `--fee-bps <venue>.<class>:<m>:<t>` sets one. The class of a
+    /// sym comes from its descriptor ([`core_config::instrument_class`]);
+    /// a sym of unknown class is charged the venue's DEAREST class
+    /// ([`fill::FillEngine::fee_rate`]).
+    pub fee_bps: [[(u32, u32); INSTRUMENT_CLASSES]; 7],
     /// Activation penalty Δ ns per venue (§4.4). **A MEASUREMENT of the
     /// deployment host + network, not a constant** — see
     /// `docs/venue-latency.md` and the provenance on [`Default`].
@@ -354,7 +364,7 @@ pub const OPT_SPREAD_FRAC_MAX: u32 = 1_000_000;
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
-            fee_bps: [(0, 0); 7],
+            fee_bps: [[(0, 0); INSTRUMENT_CLASSES]; 7],
             // VRP V3: the ladder's optimistic rung — the D-7 floor
             // alone. Widening is opt-in and one-way.
             opt_spread_frac_1e6: 0,
@@ -393,6 +403,71 @@ pub(crate) fn model_venue(label: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// XSD-F: the venue's dearest `(maker, taker)` across its classes — the
+/// number the pre-XSD-F one-slot table carried under D2-AMEND L1, kept
+/// for the legacy report fields. Dearest by TAKER, then maker.
+pub(crate) fn dearest_fee(model: &ModelParams, venue: VenueId) -> (u32, u32) {
+    let row = &model.fee_bps[venue as usize];
+    let mut best = row[0];
+    let mut i = 1usize;
+    while i < INSTRUMENT_CLASSES {
+        if row[i].1 > best.1 || (row[i].1 == best.1 && row[i].0 > best.0) {
+            best = row[i];
+        }
+        i += 1;
+    }
+    best
+}
+
+/// XSD-F: the fee table as `venue=spot:m:t,perp:m:t,…` per venue, with
+/// a venue whose five classes agree printed once (`bn=10:10`), so a
+/// legacy-flag run renders exactly the old `bn=10:10` token.
+pub(crate) fn render_fee_table_text(model: &ModelParams) -> String {
+    let mut out = String::new();
+    for (label, venue) in MODEL_VENUE_LABELS {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let row = &model.fee_bps[venue as usize];
+        out.push_str(label);
+        out.push('=');
+        if row.iter().all(|c| *c == row[0]) {
+            out.push_str(&format!("{}:{}", row[0].0, row[0].1));
+        } else {
+            for (i, class) in core_types::ALL_CLASSES.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!("{}:{}:{}", class.label(), row[i].0, row[i].1));
+            }
+        }
+    }
+    out
+}
+
+/// XSD-F: the fee table as JSON — `{"pm":{"spot":[m,t],…},…}` — the
+/// additive `fee_classes` block of the detail sidecar and the audit-pnl
+/// report.
+pub(crate) fn render_fee_table_json(model: &ModelParams) -> String {
+    let mut out = String::from("{");
+    for (vi, (label, venue)) in MODEL_VENUE_LABELS.iter().enumerate() {
+        if vi > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("\"{label}\":{{"));
+        let row = &model.fee_bps[*venue as usize];
+        for (i, class) in core_types::ALL_CLASSES.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"{}\":[{},{}]", class.label(), row[i].0, row[i].1));
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
 }
 
 /// Fold the §4 flag overrides onto the defaults. Precedence: defaults
@@ -454,12 +529,27 @@ pub fn parse_model_params(
     }
     for spec in fee_specs {
         let mut it = spec.split(':');
-        let (v, mk, tk) = match (it.next(), it.next(), it.next(), it.next()) {
-            (Some(v), Some(mk), Some(tk), None) => (v, mk, tk),
+        let (vc, mk, tk) = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(vc), Some(mk), Some(tk), None) => (vc, mk, tk),
             _ => {
                 return Err(HarnessError::Usage(format!(
-                    "bad --fee-bps {spec:?}: want <venue>:<maker_bps>:<taker_bps>"
+                    "bad --fee-bps {spec:?}: want <venue>[.<class>]:<maker_bps>:<taker_bps>"
                 )))
+            }
+        };
+        // XSD-F: `<venue>` = every class (the pre-XSD-F flag, bit for
+        // bit); `<venue>.<class>` = that class alone. Later flags win,
+        // so `bn:10:10 bn.perp:2:5` reads as "spot tier everywhere on
+        // Binance except perps".
+        let (v, class) = match vc.split_once('.') {
+            None => (vc, None),
+            Some((v, c)) => {
+                let class = InstrumentClass::parse_label(c).ok_or_else(|| {
+                    HarnessError::Usage(format!(
+                        "bad --fee-bps {spec:?}: unknown class {c:?} (spot|perp|dated|option|prediction)"
+                    ))
+                })?;
+                (v, Some(class))
             }
         };
         let vi = model_venue(v).ok_or_else(|| {
@@ -471,7 +561,10 @@ pub fn parse_model_params(
         let tk: u32 = tk.parse().map_err(|_| {
             HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable taker bps"))
         })?;
-        p.fee_bps[vi] = (mk, tk);
+        match class {
+            None => p.fee_bps[vi] = [(mk, tk); INSTRUMENT_CLASSES],
+            Some(c) => p.fee_bps[vi][c.index()] = (mk, tk),
+        }
     }
     for spec in opt_fee_specs {
         let mut it = spec.split(':');
@@ -1057,6 +1150,7 @@ fn load_and_merge(
     runs: &[RunDir],
     stale_after_ms: [u32; 7],
     opt_expiry_ns: &mut BTreeMap<u32, u64>,
+    sym_class: &mut BTreeMap<u32, InstrumentClass>,
 ) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
     // manifest join — each run's `<sym>\t<descriptor>` rows joined
@@ -1080,6 +1174,15 @@ fn load_and_merge(
             match newest_by_desc.get(desc) {
                 Some(new_sym) => {
                     remap.insert(*sym, *new_sym);
+                    // XSD-F: the fee class rides the descriptor (the
+                    // descriptor law), keyed on the REMAPPED sym the
+                    // fill model sees. A shape the law does not know
+                    // stays absent ⇒ the dearest-class reading.
+                    if let Some(class) =
+                        core_config::instrument_class::class_of_descriptor(desc)
+                    {
+                        sym_class.insert(*new_sym, class);
+                    }
                 }
                 None => {
                     // VM2 V7: the binding manifest no longer carries
@@ -1468,6 +1571,9 @@ pub struct HarnessStats {
     pub ioc_canceled: u64,
     /// I1: orders canceled by `ttl_ns`.
     pub ttl_expired: u64,
+    /// XSD-F: fills charged the venue's dearest class for want of a
+    /// known class (see `fill::ModelOutcome::fee_class_unknown_fills`).
+    pub fee_class_unknown_fills: u64,
     /// I1 §4.3 fee ladder: OOS net ×1e6 (floor) at flat 0 / 1 / 2 bps
     /// per side — the same fills as `oos_net_pnl_1e6`, re-priced.
     pub oos_net_ladder_1e6: [i64; 3],
@@ -1616,8 +1722,13 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     // Capture discovery + merge + rebase (§3.1–§3.3).
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
-    let (merged, run_summaries) =
-        load_and_merge(&runs, model.stale_after_ms, &mut opt_expiry_ns)?;
+    let mut sym_class: BTreeMap<u32, InstrumentClass> = BTreeMap::new();
+    let (merged, run_summaries) = load_and_merge(
+        &runs,
+        model.stale_after_ms,
+        &mut opt_expiry_ns,
+        &mut sym_class,
+    )?;
     let universe = derive_universe(&merged);
 
     // The REUSED validator (§3.5) — same byte scanner, same reject
@@ -1759,6 +1870,10 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     // because a chain that rolled across boots is one instrument here.
     for (sym, expiry_ns) in &opt_expiry_ns {
         engine.set_opt_expiry(*sym, *expiry_ns);
+    }
+    // XSD-F: the per-sym fee class (descriptor law over the manifests).
+    for (sym, class) in &sym_class {
+        engine.set_sym_class(*sym, *class);
     }
     for sym in &mark_fill_syms {
         engine.set_mark_fill_sym(*sym);
@@ -1999,6 +2114,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         ioc_fills: outcome.ioc_fills,
         ioc_canceled: outcome.ioc_canceled,
         ttl_expired: outcome.ttl_expired,
+        fee_class_unknown_fills: outcome.fee_class_unknown_fills,
         oos_net_ladder_1e6: [
             usd_1e12_to_1e6_floor(outcome.oos_net_ladder_1e12[0]),
             usd_1e12_to_1e6_floor(outcome.oos_net_ladder_1e12[1]),
@@ -2375,24 +2491,14 @@ fn render_summary(
     ));
     s.push_str(&render_regime_summary(stats, regime));
     s.push_str(&format!(
-        "model: latency_ns pm={} bn={} okx={} deribit={} hl={}; fee_bps pm={}:{} bn={}:{} \
-         okx={}:{} deribit={}:{} hl={}:{}; open-order caps {}/sym {} total; \
+        "model: latency_ns pm={} bn={} okx={} deribit={} hl={}; fee_bps {}; open-order caps {}/sym {} total; \
          stale_after_ms pm={} bn={} okx={} deribit={} hl={} bybit={} (stale ticks skipped: {})\n",
         model.latency_ns[VenueId::Polymarket as usize],
         model.latency_ns[VenueId::Binance as usize],
         model.latency_ns[VenueId::Okx as usize],
         model.latency_ns[VenueId::Deribit as usize],
         model.latency_ns[VenueId::Hyperliquid as usize],
-        model.fee_bps[VenueId::Polymarket as usize].0,
-        model.fee_bps[VenueId::Polymarket as usize].1,
-        model.fee_bps[VenueId::Binance as usize].0,
-        model.fee_bps[VenueId::Binance as usize].1,
-        model.fee_bps[VenueId::Okx as usize].0,
-        model.fee_bps[VenueId::Okx as usize].1,
-        model.fee_bps[VenueId::Deribit as usize].0,
-        model.fee_bps[VenueId::Deribit as usize].1,
-        model.fee_bps[VenueId::Hyperliquid as usize].0,
-        model.fee_bps[VenueId::Hyperliquid as usize].1,
+        render_fee_table_text(model),
         MAX_OPEN_PER_SYM,
         MAX_OPEN_TOTAL,
         model.stale_after_ms[VenueId::Polymarket as usize],
@@ -2416,13 +2522,20 @@ fn render_summary(
         stats.peak_open_per_sym
     ));
     s.push_str(&format!(
-        "fills: total={} oos={} mark={} ioc={} ioc_canceled={} ttl_expired={}\n",
+        "fills: total={} oos={} mark={} ioc={} ioc_canceled={} ttl_expired={}{}\n",
         stats.fills_total,
         stats.fills_oos,
         stats.mark_fills,
         stats.ioc_fills,
         stats.ioc_canceled,
-        stats.ttl_expired
+        stats.ttl_expired,
+        // XSD-F: printed only when it happened — a fill charged the
+        // dearest class because its sym's class was unknown.
+        if stats.fee_class_unknown_fills > 0 {
+            format!(" fee_class_unknown={}", stats.fee_class_unknown_fills)
+        } else {
+            String::new()
+        }
     ));
     s.push_str(&format!(
         "oos: net_pnl={} (realized={} fees={} markout={}), max_drawdown={}, trades={}, \
@@ -2493,13 +2606,14 @@ fn render_detail(
     let mut s = String::with_capacity(4096);
     s.push_str(&format!(
         concat!(
-            "{{\"detail_version\":6,",
+            "{{\"detail_version\":7,",
             "\"ruleset_hash\":\"{hash}\",",
             "\"split\":\"{split}\",",
             "\"model\":{{",
             "\"latency_ns\":{{\"pm\":{lpm},\"bn\":{lbn},\"okx\":{lokx},\"deribit\":{lde},\"hl\":{lhl}}},",
             "\"fee_bps\":{{\"pm\":[{fpm0},{fpm1}],\"bn\":[{fbn0},{fbn1}],\"okx\":[{fokx0},{fokx1}],",
             "\"deribit\":[{fde0},{fde1}],\"hl\":[{fhl0},{fhl1}]}},",
+            "\"fee_classes\":{fcls},",
             "\"open_order_caps\":[{cap_sym},{cap_tot}],",
             "\"opt_spread_frac_1e6\":{osf},",
             "\"stale_after_ms\":{{\"pm\":{spm},\"bn\":{sbn},\"okx\":{sokx},\"deribit\":{sde},",
@@ -2511,7 +2625,7 @@ fn render_detail(
             "\"rejected_sym_cap\":{rsc},\"rejected_total_cap\":{rtc},\"unroutable\":{unr},",
             "\"canceled_end\":{cend},\"peak_open_total\":{pot},\"peak_open_per_sym\":{pos}}},",
             "\"fills\":{{\"total\":{ft},\"oos\":{fo},\"ioc\":{fioc},\"ioc_canceled\":{fiocc},",
-            "\"ttl_expired\":{fttl}}},",
+            "\"ttl_expired\":{fttl},\"fee_class_unknown\":{fcu}}},",
             "\"options\":{{\"mark_syms\":{oms},\"mark_fills\":{omf},",
             "\"spread_frac_1e6\":{osf},\"law\":\"{olaw}\"}},",
             "\"oos\":{{\"net_pnl_usd\":{onet},\"realized_usd\":{orl},\"fees_usd\":{ofe},",
@@ -2536,16 +2650,20 @@ fn render_detail(
         lokx = model.latency_ns[VenueId::Okx as usize],
         lde = model.latency_ns[VenueId::Deribit as usize],
         lhl = model.latency_ns[VenueId::Hyperliquid as usize],
-        fpm0 = model.fee_bps[VenueId::Polymarket as usize].0,
-        fpm1 = model.fee_bps[VenueId::Polymarket as usize].1,
-        fbn0 = model.fee_bps[VenueId::Binance as usize].0,
-        fbn1 = model.fee_bps[VenueId::Binance as usize].1,
-        fokx0 = model.fee_bps[VenueId::Okx as usize].0,
-        fokx1 = model.fee_bps[VenueId::Okx as usize].1,
-        fde0 = model.fee_bps[VenueId::Deribit as usize].0,
-        fde1 = model.fee_bps[VenueId::Deribit as usize].1,
-        fhl0 = model.fee_bps[VenueId::Hyperliquid as usize].0,
-        fhl1 = model.fee_bps[VenueId::Hyperliquid as usize].1,
+        // XSD-F: the legacy per-venue pair is the venue's DEAREST class
+        // (exactly what the one-slot field meant under D2-AMEND L1);
+        // `fee_classes` carries the table itself.
+        fpm0 = dearest_fee(model, VenueId::Polymarket).0,
+        fpm1 = dearest_fee(model, VenueId::Polymarket).1,
+        fbn0 = dearest_fee(model, VenueId::Binance).0,
+        fbn1 = dearest_fee(model, VenueId::Binance).1,
+        fokx0 = dearest_fee(model, VenueId::Okx).0,
+        fokx1 = dearest_fee(model, VenueId::Okx).1,
+        fde0 = dearest_fee(model, VenueId::Deribit).0,
+        fde1 = dearest_fee(model, VenueId::Deribit).1,
+        fhl0 = dearest_fee(model, VenueId::Hyperliquid).0,
+        fhl1 = dearest_fee(model, VenueId::Hyperliquid).1,
+        fcls = render_fee_table_json(model),
         cap_sym = MAX_OPEN_PER_SYM,
         cap_tot = MAX_OPEN_TOTAL,
         spm = model.stale_after_ms[VenueId::Polymarket as usize],
@@ -2575,6 +2693,7 @@ fn render_detail(
         fioc = stats.ioc_fills,
         fiocc = stats.ioc_canceled,
         fttl = stats.ttl_expired,
+        fcu = stats.fee_class_unknown_fills,
         ol0 = fmt_usd_1e6(stats.oos_net_ladder_1e6[0]),
         ol1 = fmt_usd_1e6(stats.oos_net_ladder_1e6[1]),
         ol2 = fmt_usd_1e6(stats.oos_net_ladder_1e6[2]),
@@ -2699,7 +2818,7 @@ mod tests {
     #[test]
     fn model_params_defaults_pin_measured_table() {
         let p = ModelParams::default();
-        assert_eq!(p.fee_bps, [(0, 0); 7]);
+        assert_eq!(p.fee_bps, [[(0, 0); INSTRUMENT_CLASSES]; 7]);
         // The 2026-09-03 measurement (docs/venue-latency.md §3); slot 5
         // = Ai (dead, 0), slot 6 = Bybit. A new deployment re-measures
         // and re-pins — this test exists so the table never drifts
@@ -2724,15 +2843,64 @@ mod tests {
         // Global latency replaced every TRADEABLE slot (the Ai dead
         // slot stays 0 — WS9), then deribit won on top.
         assert_eq!(p.latency_ns, [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000]);
-        assert_eq!(p.fee_bps[VenueId::Polymarket as usize], (0, 10));
-        assert_eq!(p.fee_bps[VenueId::Hyperliquid as usize], (3, 4));
-        assert_eq!(p.fee_bps[VenueId::Binance as usize], (0, 0));
+        // XSD-F: a bare `<venue>:` spec sets every class of the venue.
+        assert_eq!(p.fee_bps[VenueId::Polymarket as usize], [(0, 10); INSTRUMENT_CLASSES]);
+        assert_eq!(p.fee_bps[VenueId::Hyperliquid as usize], [(3, 4); INSTRUMENT_CLASSES]);
+        assert_eq!(p.fee_bps[VenueId::Binance as usize], [(0, 0); INSTRUMENT_CLASSES]);
         // VT4: stale thresholds default to the venue table; overrides
         // replace only the named venue, the last spec wins, 0 is legal.
         assert_eq!(p.stale_after_ms[VenueId::Okx as usize], 300);
         assert_eq!(p.stale_after_ms[VenueId::Binance as usize], 0);
         assert_eq!(p.stale_after_ms[VenueId::Bybit as usize], 500);
         assert_eq!(p.stale_after_ms[VenueId::Ai as usize], 0);
+    }
+
+    #[test]
+    fn model_params_fee_classes_layer_over_the_bare_venue() {
+        // XSD-F: `bn:10:10 bn.perp:2:5` = the spot tier everywhere on
+        // Binance except perps; order matters (later wins); a class
+        // spec on an untouched venue leaves its other classes at 0/0.
+        let p = parse_model_params(
+            &[
+                "bn:10:10".to_owned(),
+                "bn.perp:2:5".to_owned(),
+                "okx.dated:2:5".to_owned(),
+                "bn.perp:3:6".to_owned(),
+            ],
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let bn = p.fee_bps[VenueId::Binance as usize];
+        assert_eq!(bn[InstrumentClass::Spot.index()], (10, 10));
+        assert_eq!(bn[InstrumentClass::Perp.index()], (3, 6));
+        assert_eq!(bn[InstrumentClass::Dated.index()], (10, 10));
+        assert_eq!(bn[InstrumentClass::Option.index()], (10, 10));
+        assert_eq!(bn[InstrumentClass::Prediction.index()], (10, 10));
+        let okx = p.fee_bps[VenueId::Okx as usize];
+        assert_eq!(okx[InstrumentClass::Dated.index()], (2, 5));
+        assert_eq!(okx[InstrumentClass::Perp.index()], (0, 0));
+        assert_eq!(dearest_fee(&p, VenueId::Binance), (10, 10));
+        assert_eq!(dearest_fee(&p, VenueId::Okx), (2, 5));
+        // A class-agreeing venue prints once; a split venue prints per class.
+        let text = render_fee_table_text(&p);
+        assert!(text.contains("pm=0:0 bn=spot:10:10,perp:3:6,dated:10:10,option:10:10,prediction:10:10 "), "{text}");
+        assert!(text.contains("okx=spot:0:0,perp:0:0,dated:2:5,option:0:0,prediction:0:0 deribit=0:0"), "{text}");
+        let json = render_fee_table_json(&p);
+        assert!(json.starts_with("{\"pm\":{\"spot\":[0,0],"), "{json}");
+        assert!(json.contains("\"bn\":{\"spot\":[10,10],\"perp\":[3,6],\"dated\":[10,10],\"option\":[10,10],\"prediction\":[10,10]}"), "{json}");
+        // The legacy single-slot text is reproduced exactly by a bare spec.
+        let legacy = parse_model_params(&["bn:10:10".to_owned()], None, &[], &[], &[], None).unwrap();
+        assert!(render_fee_table_text(&legacy).contains(" bn=10:10 "));
+        for bad in ["bn.perps:2:5", "bn.:2:5", ".perp:2:5", "bn.perp.x:2:5"] {
+            assert!(
+                parse_model_params(&[bad.to_owned()], None, &[], &[], &[], None).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

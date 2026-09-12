@@ -94,7 +94,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use core_types::{symbol_venue_byte, Order, Side, Tick, SYMBOL_ID_NONE};
+use core_types::{symbol_venue_byte, InstrumentClass, Order, Side, Tick, SYMBOL_ID_NONE};
 
 use crate::backtest::ModelParams;
 
@@ -585,6 +585,11 @@ pub struct ModelOutcome {
     /// tape happened to carry. > 0 obliges the caller to PRINT it: it
     /// means the window contains an expiry the intents did not close.
     pub opt_settled: u64,
+    /// XSD-F: fills charged the venue's DEAREST class because the sym's
+    /// class was unknown (no manifest row, or a descriptor shape the law
+    /// does not know). > 0 under per-class fees is a tell to print — the
+    /// number is conservative, not wrong, but it is not the class tier.
+    pub fee_class_unknown_fills: u64,
     /// §4.3 fee ladder: OOS equity re-priced at flat
     /// [`FEE_LADDER_BPS`] per side (same fills, same marks).
     pub oos_net_ladder_1e12: [i128; 3],
@@ -662,6 +667,13 @@ pub struct FillEngine {
     last_wall_ns: u64,
     /// VX-A: option positions closed by the settlement sweep.
     opt_settled: u64,
+    /// XSD-F: fee class per sym, from the run manifest's descriptor
+    /// through the descriptor law ([`core_config::instrument_class`]).
+    /// A sym absent here is charged the venue's DEAREST class and
+    /// counted in `fee_class_unknown_fills` — the conservative reading
+    /// of a manifest-less run, never a silent guess.
+    sym_class: BTreeMap<u32, InstrumentClass>,
+    fee_class_unknown_fills: u64,
     mark_fills: u64,
     fills_total: u64,
     oos_trades: u64,
@@ -703,6 +715,8 @@ impl FillEngine {
             settle_due_ns: u64::MAX,
             last_wall_ns: 0,
             opt_settled: 0,
+            sym_class: BTreeMap::new(),
+            fee_class_unknown_fills: 0,
             mark_fills: 0,
             fills_total: 0,
             oos_trades: 0,
@@ -947,7 +961,7 @@ impl FillEngine {
                     Side::Bid => mark + h,
                     Side::Ask => (mark - h).max(1),
                 };
-                let taker_bps = self.params.fee_bps[o.venue as usize].1;
+                let taker_bps = self.fee_rate(o.venue, o.sym).1;
                 self.book_fill(&o, fill_px, o.remaining_1e6, taker_bps, mark, wall_ns, out);
                 self.mark_fills += 1;
                 // Full fill: compact (FIFO preserved).
@@ -999,7 +1013,7 @@ impl FillEngine {
                     _ => (0, 0),
                 };
                 if fill_qty > 0 {
-                    let taker_bps = self.params.fee_bps[o.venue as usize].1;
+                    let taker_bps = self.fee_rate(o.venue, o.sym).1;
                     self.book_fill(&o, fill_px, fill_qty, taker_bps, mark, wall_ns, out);
                     self.ioc_fills += 1;
                 } else {
@@ -1027,7 +1041,7 @@ impl FillEngine {
                 i += 1;
                 continue;
             }
-            let maker_bps = self.params.fee_bps[o.venue as usize].0;
+            let maker_bps = self.fee_rate(o.venue, o.sym).0;
             self.book_fill(&o, o.px_1e6, fill_qty, maker_bps, mark, wall_ns, out);
             let remaining = o.remaining_1e6 - fill_qty;
             if remaining > 0 {
@@ -1102,6 +1116,46 @@ impl FillEngine {
         };
         let premium_cap = fee_ceil_1e12(notional_1e12, f.prem_bps);
         index_leg.min(premium_cap)
+    }
+
+    /// XSD-F: record a sym's fee class (boot of the replay loop, from
+    /// the run manifest through the descriptor law). Unset syms take
+    /// the venue's dearest class — see [`Self::fee_rate`].
+    pub fn set_sym_class(&mut self, sym: u32, class: InstrumentClass) {
+        self.sym_class.insert(sym, class);
+    }
+
+    /// XSD-F: the `(maker_bps, taker_bps)` an order on `sym` at `venue`
+    /// is charged: its class's pair when the class is known, else the
+    /// venue's dearest pair (dearest by taker, then maker — the pre-XSD-F
+    /// one-slot number under D2-AMEND L1). Under a bare `--fee-bps
+    /// <venue>:m:t` every class holds the same pair, so this is
+    /// bit-identical to the old `fee_bps[venue]` read either way — and
+    /// an unknown class is then not worth a tell: the counter moves only
+    /// when the venue's classes DISAGREE, i.e. when the class would have
+    /// changed the number.
+    #[inline]
+    fn fee_rate(&mut self, venue: u8, sym: u32) -> (u32, u32) {
+        let row = &self.params.fee_bps[venue as usize];
+        match self.sym_class.get(&sym) {
+            Some(c) => row[c.index()],
+            None => {
+                let mut best = row[0];
+                let mut split = false;
+                let mut i = 1usize;
+                while i < row.len() {
+                    split |= row[i] != row[0];
+                    if row[i].1 > best.1 || (row[i].1 == best.1 && row[i].0 > best.0) {
+                        best = row[i];
+                    }
+                    i += 1;
+                }
+                if split {
+                    self.fee_class_unknown_fills += 1;
+                }
+                best
+            }
+        }
     }
 
     /// Record the index/underlying reference for an OPTION sym. Boot of
@@ -1313,6 +1367,7 @@ impl FillEngine {
             ioc_canceled: self.ioc_canceled,
             ttl_expired: self.ttl_expired,
             opt_settled: self.opt_settled,
+            fee_class_unknown_fills: self.fee_class_unknown_fills,
             oos_net_ladder_1e12: [
                 self.oos.equity_ladder_1e12(0),
                 self.oos.equity_ladder_1e12(1),
@@ -1507,10 +1562,43 @@ mod tests {
         make_symbol_id(VenueId::Deribit, OPT_ORD)
     }
 
+    /// XSD-F: the class lookup — a known class takes its pair; an unknown
+    /// class takes the venue's DEAREST pair (by taker, then maker) and is
+    /// counted only when the venue's classes disagree (under a uniform
+    /// row the class could not have changed the number).
+    #[test]
+    fn fee_rate_is_per_class_with_a_dearest_fallback() {
+        let mut p = ModelParams {
+            fee_bps: [[(0, 0); 5]; 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+            ..ModelParams::default()
+        };
+        let bn = VenueId::Binance as usize;
+        p.fee_bps[bn] = [(10, 10), (2, 5), (2, 5), (3, 3), (10, 10)];
+        // Same taker as spot, larger maker: the tie-break picks it.
+        p.fee_bps[bn][InstrumentClass::Prediction.index()] = (11, 10);
+        let mut e = FillEngine::new(p, 0);
+        let spot = make_symbol_id(VenueId::Binance, 7);
+        let perp = make_symbol_id(VenueId::Binance, 600);
+        let unknown = make_symbol_id(VenueId::Binance, 601);
+        e.set_sym_class(spot, InstrumentClass::Spot);
+        e.set_sym_class(perp, InstrumentClass::Perp);
+        assert_eq!(e.fee_rate(VenueId::Binance as u8, spot), (10, 10));
+        assert_eq!(e.fee_rate(VenueId::Binance as u8, perp), (2, 5));
+        assert_eq!(e.fee_class_unknown_fills, 0);
+        assert_eq!(e.fee_rate(VenueId::Binance as u8, unknown), (11, 10));
+        assert_eq!(e.fee_class_unknown_fills, 1);
+        // A venue with a uniform row: the fallback is the row, uncounted.
+        let okx_unknown = make_symbol_id(VenueId::Okx, 5);
+        assert_eq!(e.fee_rate(VenueId::Okx as u8, okx_unknown), (0, 0));
+        assert_eq!(e.fee_class_unknown_fills, 1);
+    }
+
     /// Zero latency, zero flat fee, the venue's option schedule live.
     fn opt_engine() -> FillEngine {
         let p = ModelParams {
-            fee_bps: [(0, 0); 7],
+            fee_bps: [[(0, 0); 5]; 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
@@ -1893,7 +1981,7 @@ mod tests {
     /// (still never fills on it — the pass precedes the emit).
     fn engine_zero_delta(boundary: u64) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [(0, 0); 7],
+            fee_bps: [[(0, 0); 5]; 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
@@ -2002,7 +2090,7 @@ mod tests {
 
     fn engine_fees(boundary: u64, maker: u32, taker: u32) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [(maker, taker); 7],
+            fee_bps: [[(maker, taker); 5]; 7],
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
@@ -2347,7 +2435,7 @@ mod tests {
     #[test]
     fn maker_fee_charges_on_fill_notional() {
         let p = ModelParams {
-            fee_bps: [(50, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // PM maker 50 bps
+            fee_bps: [[(50, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]], // PM maker 50 bps
             latency_ns: [0; 7],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
@@ -2386,7 +2474,7 @@ mod tests {
         assert_eq!(model_venue_byte(BN_SYM), 1);
         let p = ModelParams {
             // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
-            fee_bps: [(50, 0), (10, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)],
+            fee_bps: [[(50, 0); 5], [(10, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]],
             latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
@@ -2678,7 +2766,7 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [(maker_bps, 0); 7],
+                fee_bps: [[(maker_bps, 0); 5]; 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
@@ -2749,7 +2837,7 @@ mod tests {
             taker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [(0, taker_bps); 7],
+                fee_bps: [[(0, taker_bps); 5]; 7],
                 latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
@@ -2831,7 +2919,7 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [(maker_bps, 0); 7],
+                fee_bps: [[(maker_bps, 0); 5]; 7],
                 latency_ns: [0; 7],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()

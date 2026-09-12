@@ -909,6 +909,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         params.stale_after_ms,
     )?;
 
+    // XSD-F: dense sym → fee class over the whole root's descriptor set.
+    let sym_class: BTreeMap<u32, core_types::InstrumentClass> = interner
+        .desc_by_dense
+        .iter()
+        .filter_map(|(dense, desc)| {
+            core_config::instrument_class::class_of_descriptor(desc).map(|c| (*dense, c))
+        })
+        .collect();
+
     for l in &loads {
         report(&format!(
             "audit-pnl: run-{}: ticks={} orders={} fills={} commits={} manifest={}{}{}{}",
@@ -1053,6 +1062,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // VX: the settlement rate's classifier.
         for (sym, expiry_ns) in &opt_expiry_ns {
             e.set_opt_expiry(*sym, *expiry_ns);
+        }
+        // XSD-F: the per-sym fee class — every interned descriptor
+        // through the descriptor law. The `run-<epoch>/sym-<hex>`
+        // namespace of a manifest-less run is not a shape the law
+        // knows, so those syms stay unclassed (dearest class, counted).
+        for (dense, class) in &sym_class {
+            e.set_sym_class(*dense, *class);
         }
         // VX-A: the European cash value each expiry settles at, so a
         // contract still held at expiry becomes cash instead of an
@@ -1329,11 +1345,16 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // I1: taker surface + the §4.3 fee ladder — printed for EVERY
         // strategy so a number positive only at 0 bps is visible as such.
         report(&format!(
-            "audit-pnl:   ioc_fills={} ioc_canceled={} ttl_expired={} | fee ladder (net, flat \
+            "audit-pnl:   ioc_fills={} ioc_canceled={} ttl_expired={}{} | fee ladder (net, flat \
              bps/side): 0={} 1={} 2={} tier={}",
             o.ioc_fills,
             o.ioc_canceled,
             o.ttl_expired,
+            if o.fee_class_unknown_fills > 0 {
+                format!(" fee_class_unknown={}", o.fee_class_unknown_fills)
+            } else {
+                String::new()
+            },
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[0])),
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[1])),
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_ladder_1e12[2])),
@@ -1404,6 +1425,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
          \"net_usd\":\"{}\"}},",
         loads.len(),
         fmt_usd_1e6(usd_1e12_to_1e6_floor(paper_net_1e12)),
+    ));
+    // XSD-F: additive — the fee table the run was priced under, per
+    // venue × class, and the fills charged the dearest class for want
+    // of a known class (summed over every engine). `audit_pnl_version`
+    // stays 1: nothing existing moved.
+    json.push_str(&format!(
+        "\"fee_classes\":{},\"fee_class_unknown_fills\":{},",
+        crate::backtest::render_fee_table_json(&params),
+        rows.iter().map(|(_, r)| r.outcome.fee_class_unknown_fills).sum::<u64>(),
     ));
     // VRP V3: additive, and emitted ONLY when option syms were
     // registered — a root that captured no options renders exactly as

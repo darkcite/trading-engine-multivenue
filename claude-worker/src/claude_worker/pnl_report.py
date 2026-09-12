@@ -166,35 +166,86 @@ def run_once(
 
 FEES_PATH_DEFAULT: str = "~/multivenue/fees.toml"
 FEE_VENUES: tuple[str, ...] = ("pm", "bn", "okx", "deribit", "hl", "bybit")
+#: XSD-F: the instrument classes a `[fees.<venue>]` table may name — the
+#: harness's `--fee-bps <venue>.<class>` grammar (core_types::InstrumentClass).
+FEE_CLASSES: tuple[str, ...] = ("spot", "perp", "dated", "option", "prediction")
+
+
+def _pair(val: str, where: str) -> tuple[int, int]:
+    maker, sep, taker = val.partition(":")
+    if not sep or not maker.isdigit() or not taker.isdigit():
+        raise ValueError(f'{where}: want "<maker>:<taker>" integer bps')
+    return int(maker), int(taker)
 
 
 def load_fee_flags(path: pathlib.Path) -> list[str]:
-    """``[fees]`` section of ``fees.toml``: ``<venue> = "<maker>:<taker>"``
-    (integer bps) → repeatable ``--fee-bps <venue>:<maker>:<taker>`` argv.
-    A malformed line is fatal (a silently dropped tier would print a
-    zero-fee number as if it were the operator's)."""
+    """``fees.toml`` → the harness's repeatable fee argv.
+
+    v1 (D2/D2-AMEND): ``[fees]`` ``<venue> = "<maker>:<taker>"`` (integer
+    bps) → ``--fee-bps <venue>:<maker>:<taker>`` — ONE pair per venue,
+    which the harness applies to every instrument class of the venue.
+
+    v2 (XSD-F, 2026-09-12): an OPTIONAL ``[fees.<venue>]`` table per venue
+    names the classes — ``spot`` · ``perp`` · ``dated`` · ``option`` ·
+    ``prediction`` — each ``"<maker>:<taker>"`` →
+    ``--fee-bps <venue>.<class>:<maker>:<taker>``; a sixth key
+    ``option_cap = "<index_bps>:<prem_bps>"`` carries the venue's CAPPED
+    option law → ``--opt-fee <venue>:<index_bps>:<prem_bps>`` (the flat
+    ``option`` pair stays the fallback the harness charges an option whose
+    index it never saw). A distinct key, not a value shape, so a
+    section-blind ``key = "m:t"`` reader never trips on it.
+    Bare lines are emitted FIRST, class lines after, so a class overrides
+    its venue's bare pair in argv order (the harness's later-wins law); a
+    class absent from the table inherits the bare line. Emission order is
+    the file's order within each of the two groups.
+
+    A malformed line, an unknown venue, class or key is fatal (a silently
+    dropped tier would print a zero-fee number as if it were the
+    operator's).
+    """
     text = path.read_text(encoding="utf-8")
-    flags: list[str] = []
-    in_fees = False
+    bare: list[str] = []
+    classes: list[str] = []
+    section: str | None = None
     for idx, raw in enumerate(text.splitlines()):
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
+        where = f"{path}:{idx + 1}"
         if line.startswith("["):
-            in_fees = line == "[fees]"
+            head = line.strip("[]").strip()
+            if head == "fees":
+                section = "fees"
+            elif head.startswith("fees."):
+                venue = head[len("fees.") :]
+                if venue not in FEE_VENUES:
+                    raise ValueError(f"{where}: unknown fees venue table {head!r}")
+                section = venue
+            else:
+                section = None
             continue
-        if not in_fees:
+        if section is None:
             continue
         key, sep, val = line.partition("=")
         key = key.strip()
         val = val.strip().strip('"')
-        if not sep or key not in FEE_VENUES:
-            raise ValueError(f"{path}:{idx + 1}: unknown fees key {key!r}")
-        maker, sep2, taker = val.partition(":")
-        if not sep2 or not maker.isdigit() or not taker.isdigit():
-            raise ValueError(f"{path}:{idx + 1}: want \"<maker>:<taker>\" integer bps")
-        flags.extend(("--fee-bps", f"{key}:{int(maker)}:{int(taker)}"))
-    return flags
+        if not sep:
+            raise ValueError(f"{where}: want key = value")
+        if section == "fees":
+            if key not in FEE_VENUES:
+                raise ValueError(f"{where}: unknown fees key {key!r}")
+            maker, taker = _pair(val, where)
+            bare.extend(("--fee-bps", f"{key}:{maker}:{taker}"))
+            continue
+        if key == "option_cap":
+            index_bps, prem_bps = _pair(val, where)
+            classes.extend(("--opt-fee", f"{section}:{index_bps}:{prem_bps}"))
+            continue
+        if key not in FEE_CLASSES:
+            raise ValueError(f"{where}: unknown class {key!r} (want one of {FEE_CLASSES} or option_cap)")
+        maker, taker = _pair(val, where)
+        classes.extend(("--fee-bps", f"{section}.{key}:{maker}:{taker}"))
+    return bare + classes
 
 
 def _day_of(epoch_ns: int) -> str:

@@ -35,6 +35,10 @@ pub use regime::{
     RegimeLabel, RegimeLabelSet, RegimeRel, RegimeTerm, RegimeWord, REGIME_OFF_HARD,
     REGIME_OFF_SOFT, REGIME_PROFILES,
 };
+/// Instrument fee class (XSD-F, statarb doc 08 §4): the second index of
+/// the harness fee table beside [`VenueId`].
+pub mod instrument_class;
+pub use instrument_class::{InstrumentClass, ALL_CLASSES, INSTRUMENT_CLASSES};
 
 // ---------------------------------------------------------------
 // Identifiers

@@ -404,3 +404,49 @@ def test_latest_report_regimes_reads_the_merged_profiles(tmp_path):
     assert claude_worker.pnl_report.latest_report_regimes(reports) == [{"profile": "fast", "words": []}]
     (reports / "pnl-2026-09-06.json").write_text("{not json")
     assert claude_worker.pnl_report.latest_report_regimes(reports) == []
+
+
+def test_load_fee_flags_v2_class_tables(tmp_path: pathlib.Path) -> None:
+    """XSD-F: bare lines first (every class of the venue), class lines
+    after (later wins in the harness), `option_cap = "I:P"` becomes the
+    venue's capped option law; legacy files render exactly as before;
+    unknown venue tables / classes / malformed pairs are fatal."""
+    fees = tmp_path / "fees.toml"
+    fees.write_text(
+        "[fees]\n"
+        'pm = "0:350"\n'
+        'bn = "10:10"   # bare = every class\n'
+        "[fees.bn]\n"
+        'perp = "2:5"\n'
+        'dated = "2:5"\n'
+        'option_cap = "3:1000"\n'
+        "[fees.deribit]\n"
+        'perp = "2:4"\n'
+        'spot = "2:5"\n'
+        "[other]\n"
+        'x = "1:2"\n',
+        encoding="utf-8",
+    )
+    flags = claude_worker.pnl_report.load_fee_flags(fees)
+    assert flags == [
+        "--fee-bps", "pm:0:350",
+        "--fee-bps", "bn:10:10",
+        "--fee-bps", "bn.perp:2:5",
+        "--fee-bps", "bn.dated:2:5",
+        "--opt-fee", "bn:3:1000",
+        "--fee-bps", "deribit.perp:2:4",
+        "--fee-bps", "deribit.spot:2:5",
+    ]
+    # v1 file: byte-identical flags to the pre-XSD-F reader.
+    fees.write_text('[fees]\npm = "0:0"\nbn = "2:5"\n', encoding="utf-8")
+    assert claude_worker.pnl_report.load_fee_flags(fees) == ["--fee-bps", "pm:0:0", "--fee-bps", "bn:2:5"]
+    for bad in (
+        "[fees.kraken]\nspot = \"1:2\"\n",
+        "[fees.bn]\nperps = \"1:2\"\n",
+        "[fees.bn]\nperp = \"1\"\n",
+        "[fees.bn]\noption_cap = \"3\"\n",
+        "[fees]\nbn = \"a:b\"\n",
+    ):
+        fees.write_text(bad, encoding="utf-8")
+        with pytest.raises(ValueError):
+            claude_worker.pnl_report.load_fee_flags(fees)

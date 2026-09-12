@@ -30,6 +30,9 @@ use std::path::Path;
 use zeroize::Zeroize;
 
 pub mod icdp;
+/// XSD-F: the descriptor law — an instrument's fee class from its §9.4
+/// descriptor (mirrored in `claude_worker.instrument_class`).
+pub mod instrument_class;
 /// RG2: the regime detector's parameter artifact (`regime.toml`) + seed file.
 pub mod regime;
 pub mod universe;

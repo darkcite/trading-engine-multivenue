@@ -772,7 +772,7 @@ fn emit_detail_sidecar_is_written_versioned_and_deterministic() {
     // Versioned separately from schema-1; carries the operator detail
     // the frozen stdout must NOT carry (§5).
     assert!(
-        a.starts_with("{\"detail_version\":6,"),
+        a.starts_with("{\"detail_version\":7,"),
         "VRP V3 bumped the sidecar version (VT4: 2, I1: 3, RG3: 4, VRP V2a: 5)"
     );
     // VRP V3: the model carries the ladder rung it ran at, and the
@@ -864,7 +864,7 @@ fn vt4_stale_tick_neither_fills_nor_marks_and_is_reported() {
     assert!(out.summary.contains("stale_after_ms pm=1000 bn=1000 okx=400 deribit=600 hl=700 bybit=500"));
     // sidecar v2: the model's thresholds + the per-run lane block.
     let d = std::fs::read_to_string(&detail).expect("sidecar");
-    assert!(d.starts_with("{\"detail_version\":6,"));
+    assert!(d.starts_with("{\"detail_version\":7,"));
     assert!(d.contains("\"stale_after_ms\":{\"pm\":1000,\"bn\":1000,\"okx\":400,\"deribit\":600,\"hl\":700,\"bybit\":500}"), "{d}");
     assert!(d.contains(&format!(
         "\"stale\":{{\"ticks_skipped\":1,\"runs\":[{{\"epoch_ns\":{PNL_EPOCH_RUN_0},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}},{{\"epoch_ns\":{PNL_EPOCH_RUN_1},\"lanes\":{{\"pm\":{{\"ticks\":4,\"stale_ticks\":1,\"stale_time_bps\":4285,\"stale_blind\":false}},\"bn\":{{\"ticks\":1,\"stale_ticks\":0,\"stale_time_bps\":0,\"stale_blind\":false}}}}}}]}}"
@@ -1657,7 +1657,7 @@ fn rg3_declared_regime_gates_labelled_rows_and_off_strips_them() {
         on.summary
     );
     let d = std::fs::read_to_string(&detail).expect("sidecar");
-    assert!(d.starts_with("{\"detail_version\":6,"));
+    assert!(d.starts_with("{\"detail_version\":7,"));
     assert!(
         d.contains("\"regime\":{\"mode\":\"artifact\",\"artifact_sha256\":\""),
         "{d}"

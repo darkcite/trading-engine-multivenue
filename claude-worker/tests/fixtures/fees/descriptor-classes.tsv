@@ -1,0 +1,45 @@
+# descriptor-classes.tsv — the SHARED descriptor→class fixture (XSD-F, 2026-09-12).
+# Read by crates/core-config/src/instrument_class.rs (tests) AND
+# claude-worker/tests/test_instrument_class.py; both laws must agree on every row.
+# One representative per live descriptor SHAPE, taken from the 2026-09-12 boot's
+# instrument-manifest.tsv (360 rows, 124 usdm), plus the shapes the universe grammar
+# admits but the live file does not carry today (dated on bn/okx/deribit/bybit) and
+# the shapes the law must REFUSE (`none`).
+# <descriptor><TAB><spot|perp|dated|option|prediction|none>
+105554486916384658090975601083014063097607795931086109853984637938068004048895	prediction
+46488324645933523958593550894838915289234229077163376307500833705434477665486	prediction
+binance:btcusdt	spot
+binance:nvdabusdt	spot
+binance-usdm:btcusdt	perp
+binance-usdm:1000ratsusdt	perp
+binance-usdm:nvdausdt	perp
+binance-usdm:btcusdt_260327	dated
+binance-opt:BTC-260912-76500-C	option
+binance-opt:BTC-260912-76750-P	option
+okx:BTC-USDT	spot
+okx:ETH-USDT-SWAP	perp
+okx:BTC-USDT-260926	dated
+okx:BTC-USD-260912-77000-C	option
+okx:BTC-USD-260912-77000-P	option
+deribit:BTC-PERPETUAL	perp
+deribit:BTC_USDC-PERPETUAL	perp
+deribit:ETH_USDC-PERPETUAL	perp
+deribit:BTC_USDC	spot
+deribit:BTC-26SEP26	dated
+deribit:BTC-1OCT26	dated
+deribit:BTC-26SEP26-80000-C	option
+deribit:ETH-12SEP26-4300-P	option
+hyperliquid:BTC	perp
+hyperliquid:XRP	perp
+bybit:BTCUSDT	spot
+bybit-linear:BTCUSDT	perp
+bybit-linear:SOLUSDT	perp
+bybit-linear:BTCUSDT-26SEP25	dated
+run-1789187999444152000/sym-0x0200000a	none
+kraken:XBTUSD	none
+binance:	none
+okx:BTC	none
+okx:BTC-USD-FOO-77000-C	none
+deribit:BTC	none
+deribit:BTC-FS-26SEP26_PERP	none
+12ab	none
