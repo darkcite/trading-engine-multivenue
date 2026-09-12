@@ -8,6 +8,7 @@ expect (Binance klines fixtures mirror the venue docs)."""
 import json
 import pathlib
 import sqlite3
+import typing
 
 import tests.craft
 
@@ -930,3 +931,139 @@ def test_main_no_lanes_and_unusable_universe(tmp_path: pathlib.Path) -> None:
         ["--universe", str(tmp_path / "absent.toml"), "--db", str(tmp_path / "c.db")]
     )
     assert rc2 == 1
+
+
+# ---- base-timeframe policy (XSD-1) --------------------------------------
+
+
+def usdm_target(sym: str = "btcusdt") -> claude_worker.candles.LaneTarget:
+    return claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_BINANCE, f"binance-usdm:{sym}", sym.upper()
+    )
+
+
+def usdm_lane(*targets: claude_worker.candles.LaneTarget) -> claude_worker.candles.Lane:
+    return claude_worker.candles.Lane(
+        "binance-usdm", claude_worker.frames.VENUE_BINANCE, list(targets), backward=False
+    )
+
+
+def test_tf_policy_absent_file_is_the_9_5_law(tmp_path: pathlib.Path) -> None:
+    policy, problem = claude_worker.candles.read_tf_policy(tmp_path / "absent.toml")
+    assert problem is None
+    assert policy == claude_worker.candles.DEFAULT_POLICY
+    lane = usdm_lane(usdm_target())
+    assert claude_worker.candles.tfs_for(policy, lane, lane.targets[0]) == ("1m", "1h", "1d")
+
+
+def test_tf_policy_lane_default_and_instrument_override(tmp_path: pathlib.Path) -> None:
+    """Lane default narrows every instrument; an instrument line wins
+    over the lane default; a lane the file does not name keeps §9.5;
+    the tuple is always in FETCHED_TFS order whatever the file's order;
+    the symbol matches case-insensitively (universe.toml writes
+    lowercase, the venue request form is uppercase)."""
+    f = tmp_path / "candles.toml"
+    f.write_text(
+        '[binance-usdm]\ntfs = ["1d", "1h"]\n'
+        '[binance-usdm.instruments]\nbtcusdt = ["1m", "1h", "1d"]\n'
+        'cotiusdt = ["1d"]\n',
+        encoding="utf-8",
+    )
+    policy, problem = claude_worker.candles.read_tf_policy(f)
+    assert problem is None
+    btc, coti, era = usdm_target("btcusdt"), usdm_target("cotiusdt"), usdm_target("erausdt")
+    lane = usdm_lane(btc, coti, era)
+    tfs_for = claude_worker.candles.tfs_for
+    assert tfs_for(policy, lane, btc) == ("1m", "1h", "1d")
+    assert tfs_for(policy, lane, coti) == ("1d",)
+    assert tfs_for(policy, lane, era) == ("1h", "1d")
+    spot = bn_target()
+    assert tfs_for(policy, bn_lane(spot), spot) == ("1m", "1h", "1d")
+
+
+def test_tf_policy_unusable_file_is_ignored_whole(tmp_path: pathlib.Path) -> None:
+    """A malformed entry never narrows anything: the whole file falls
+    back to §9.5 with a reason (best-effort law) — for every malformed
+    shape: bad TOML, a non-table section, an unknown tf, an empty list,
+    an unknown key, a non-table instruments value."""
+    cases = [
+        ("this is [not toml", "not TOML"),
+        ('binance-usdm = "x"\n', "not a table"),
+        ('[binance-usdm]\ntfs = ["2h"]\n', "non-empty list"),
+        ("[binance-usdm]\ntfs = []\n", "non-empty list"),
+        ("[binance-usdm]\nbogus = 1\n", "unknown key"),
+        ("[binance-usdm]\ninstruments = 3\n", "not a table"),
+        ('[binance-usdm.instruments]\nbtcusdt = "1h"\n', "non-empty list"),
+    ]
+    for text, needle in cases:
+        f = tmp_path / "p.toml"
+        f.write_text(text, encoding="utf-8")
+        policy, problem = claude_worker.candles.read_tf_policy(f)
+        assert policy == claude_worker.candles.DEFAULT_POLICY, text
+        assert problem is not None and needle in problem, (text, problem)
+
+
+def test_run_cycle_policy_narrows_calls_and_demand(tmp_path: pathlib.Path) -> None:
+    """Under a `1h,1d` lane default only those two bases are requested
+    per instrument, the budget demand shrinks with them (2 × 2 per
+    target, floor 1 ⇒ 4 calls, no BUDGET line), and the default policy
+    reproduces the pre-policy lane (3 calls)."""
+    conn = db(tmp_path)
+    coti = usdm_target("cotiusdt")
+    lanes = [usdm_lane(coti)]
+    calls: list[str] = []
+
+    def get(url: str) -> str:
+        calls.append(url)
+        return klines_json([])
+
+    base = http_none()
+    http = claude_worker.candles.Http(get=get, post=base.post, hosts=base.hosts)
+    lines: list[str] = []
+    policy = claude_worker.candles.TfPolicy({"binance-usdm": ("1h", "1d")}, {})
+    claude_worker.candles.run_cycle(conn, lanes, http, NOW, 1, {}, lines.append, policy)
+    assert len(calls) == 2
+    assert all("interval=1m" not in u for u in calls)
+    assert sum("BUDGET" in line for line in lines) == 0
+    assert not any(" 1m:" in line for line in lines)
+    calls.clear()
+    claude_worker.candles.run_cycle(conn, lanes, http, NOW, 1, {}, lines.append)
+    assert len(calls) == 3
+    assert any("interval=1m" in u for u in calls)
+
+
+def test_main_reads_policy_and_reports(
+    tmp_path: pathlib.Path,
+    capsys: object,
+    monkeypatch: object,
+) -> None:
+    """`--policy` (and the env default path) is read once per cycle;
+    an unusable file is a stderr tell + the §9.5 bases, exit 0. The
+    transport is the injected none-http (no live call)."""
+    universe = tmp_path / "u.toml"
+    universe.write_text('[binance]\nusdm = ["cotiusdt"]\n', encoding="utf-8")
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[binance-usdm]\ntfs = []\n", encoding="utf-8")
+    mp = typing.cast(typing.Any, monkeypatch)
+    mp.setattr(claude_worker.candles, "make_http", lambda client, env: http_none())
+    # The C5 tail must never walk the operator's live replay root or
+    # market map from a test: point both at absent paths (reported skips).
+    mp.setenv("CLAUDE_WORKER_REPLAY_DIR", str(tmp_path / "no-logs"))
+    mp.setenv("CLAUDE_WORKER_MARKET_MAP", str(tmp_path / "no-map.json"))
+    rc = claude_worker.candles.main(
+        [
+            "--universe",
+            str(universe),
+            "--db",
+            str(tmp_path / "c.db"),
+            "--now-ms",
+            str(NOW),
+            "--policy",
+            str(bad),
+            "--budget-per-h",
+            "0",
+        ]
+    )
+    assert rc == 0
+    err = typing.cast(typing.Any, capsys).readouterr().err
+    assert "policy" in err and "ignored" in err

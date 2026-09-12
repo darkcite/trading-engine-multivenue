@@ -274,6 +274,16 @@ Operational laws:
   the Binance REST-vs-socket drift report (WARN over
   `CLAUDE_WORKER_CANDLES_DRIFT_WARN_BPS`). One-shot full-history PM
   fold: `uv run python -m claude_worker.candles --capture-backfill`.
+  **Base-timeframe policy (2026-09-12):** an OPTIONAL
+  `~/multivenue/candles.toml` (copy `candles.toml.example`;
+  `--policy <path>` / `CLAUDE_WORKER_CANDLES_POLICY` override) narrows
+  which of the 1m/1h/1d bases a lane or an instrument fetches — used for
+  research-breadth instruments whose only consumer is hourly (the 110
+  usdm `xsd` targets fetch `["1h", "1d"]`). Absent file = the §9.5 law
+  bit for bit; an unusable file is a stderr tell and is ignored whole.
+  Worker-only by design: the engine's universe parser refuses unknown
+  keys, so this knob lives outside `universe.toml` and can never refuse
+  a boot.
 - **Regime lane** (RG5, `docs/regime-and-dashboard-plan.md` §5.1;
   `claude_worker.regime` MODULE — never a verb; 5-minute
   `com.multivenue.regime` agent via `scripts/regime-cycle.sh`, installed

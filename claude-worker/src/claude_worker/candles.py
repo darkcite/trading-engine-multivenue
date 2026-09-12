@@ -24,6 +24,21 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
   cheap; OKX's backward 100-row pages make it expensive, so OKX 1d
   is bounded to 400 d — the §9.5 cheapness carve-out). 5m/15m/4h are
   NEVER fetched (derived exactly, C5).
+- **Base-timeframe POLICY (XSD-1, 2026-09-12)**: an OPTIONAL worker-
+  owned file ``~/multivenue/candles.toml`` (``CLAUDE_WORKER_CANDLES_
+  POLICY`` overrides the path) narrows WHICH bases a lane or an
+  instrument fetches — a research-breadth universe (110 usdm perps
+  whose only consumer is an hourly member) must not accrete 1 m rows
+  forever (~1,440 rows/day/instrument). Grammar: ``[<lane>] tfs =
+  ["1h","1d"]`` sets the lane default, ``[<lane>.instruments] <sym> =
+  [...]`` overrides one instrument (venue-symbol form as written in
+  ``universe.toml``). Absent file, absent lane, absent instrument =
+  the §9.5 law above, bit for bit. The file is NOT part of
+  ``universe.toml`` on purpose: the engine's universe parser refuses
+  unknown keys, and this knob must never be able to refuse a boot.
+  Derived tfs follow their bases (no 1 m ⇒ no 5 m/15 m; 4 h still
+  derives from 1 h). An unusable policy file is reported and IGNORED
+  (best-effort law) — never a narrower fetch by accident.
 - **§9.6 gap-fill**: per (descriptor, tf): ``SELECT max(open_ts)`` →
   request ONLY the missing window (re-requesting the stored max bar
   itself, which may have been OPEN at the last cycle) → paginate
@@ -97,6 +112,10 @@ MS_1D: int = 86_400_000
 # §9.5 fetch bases: tf -> bar ms.
 FETCHED_TFS: dict[str, int] = {"1m": MS_1M, "1h": MS_1H, "1d": MS_1D}
 
+# Base-timeframe policy file (module docstring, "Base-timeframe POLICY").
+POLICY_ENV: str = "CLAUDE_WORKER_CANDLES_POLICY"
+DEFAULT_POLICY_PATH: str = "~/multivenue/candles.toml"
+
 # §9.6 bounded-backfill horizons (config-tunable via env; ms; None =
 # listing lifetime).
 BACKFILL_1M_H_ENV: str = "CLAUDE_WORKER_CANDLES_BACKFILL_1M_H"
@@ -168,6 +187,94 @@ class Lane(typing.NamedTuple):
     venue: int
     targets: list[LaneTarget]
     backward: bool
+
+
+class TfPolicy(typing.NamedTuple):
+    """Which §9.5 bases each lane / instrument fetches (module
+    docstring, "Base-timeframe POLICY"). Keys of ``instruments`` are
+    ``(lane name, venue symbol as written in universe.toml)``; values
+    are FETCHED_TFS keys in FETCHED_TFS order. Empty = the §9.5 law."""
+
+    lanes: dict[str, tuple[str, ...]]
+    instruments: dict[tuple[str, str], tuple[str, ...]]
+
+
+DEFAULT_POLICY: TfPolicy = TfPolicy({}, {})
+ALL_TFS: tuple[str, ...] = tuple(FETCHED_TFS)
+
+
+def _policy_tfs(raw: object) -> tuple[str, ...] | None:
+    """A policy value → ordered base tuple; ``None`` = malformed
+    (not a list, an unknown tf, or empty — a lane that fetches nothing
+    is a universe.toml decision, never a policy one)."""
+    if not isinstance(raw, list):
+        return None
+    items = typing.cast(list[object], raw)
+    if not items or any(not isinstance(x, str) or x not in FETCHED_TFS for x in items):
+        return None
+    chosen = {typing.cast(str, x) for x in items}
+    return tuple(tf for tf in ALL_TFS if tf in chosen)
+
+
+def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
+    """Parse the optional policy file. Returns ``(policy, problem)``:
+    a missing file is ``(DEFAULT_POLICY, None)``; an unusable file or
+    a malformed entry is ``(DEFAULT_POLICY, <reason>)`` — the WHOLE
+    file is ignored, so a typo can only widen a fetch back to the
+    §9.5 law, never silently narrow another lane."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return DEFAULT_POLICY, None
+    except (OSError, UnicodeDecodeError) as e:
+        return DEFAULT_POLICY, f"unreadable ({e})"
+    try:
+        obj = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return DEFAULT_POLICY, f"not TOML ({e})"
+    lanes: dict[str, tuple[str, ...]] = {}
+    instruments: dict[tuple[str, str], tuple[str, ...]] = {}
+    for lane_name, sec in obj.items():
+        if not isinstance(sec, dict):
+            return DEFAULT_POLICY, f"[{lane_name}] is not a table"
+        section = typing.cast(dict[str, object], sec)
+        for key, val in section.items():
+            if key == "tfs":
+                tfs = _policy_tfs(val)
+                if tfs is None:
+                    return DEFAULT_POLICY, f"[{lane_name}] tfs must be a non-empty list of {list(ALL_TFS)}"
+                lanes[lane_name] = tfs
+            elif key == "instruments":
+                if not isinstance(val, dict):
+                    return DEFAULT_POLICY, f"[{lane_name}.instruments] is not a table"
+                for sym, sym_val in typing.cast(dict[str, object], val).items():
+                    tfs = _policy_tfs(sym_val)
+                    if tfs is None:
+                        return (
+                            DEFAULT_POLICY,
+                            f"[{lane_name}.instruments] {sym} must be a non-empty list of {list(ALL_TFS)}",
+                        )
+                    instruments[(lane_name, sym)] = tfs
+            else:
+                return DEFAULT_POLICY, f"[{lane_name}] unknown key `{key}`"
+    return TfPolicy(lanes, instruments), None
+
+
+def tfs_for(policy: TfPolicy, lane: Lane, target: LaneTarget) -> tuple[str, ...]:
+    """The bases one (lane, instrument) fetches: instrument override →
+    lane default → the §9.5 law. Instruments match on the venue symbol
+    as written in universe.toml (``LaneTarget.instrument`` is the
+    venue's request form, which upper-cases Binance symbols — compare
+    case-insensitively so ``btcusdt`` and ``BTCUSDT`` are one key)."""
+    sym = target.instrument
+    hit = policy.instruments.get((lane.name, sym))
+    if hit is None:
+        hit = policy.instruments.get((lane.name, sym.lower()))
+    if hit is None:
+        hit = policy.instruments.get((lane.name, sym.upper()))
+    if hit is not None:
+        return hit
+    return policy.lanes.get(lane.name, ALL_TFS)
 
 
 # ---- store ---------------------------------------------------------------
@@ -1074,6 +1181,7 @@ def run_cycle(
     budget_per_h: int,
     env: collections.abc.Mapping[str, str],
     report: collections.abc.Callable[[str], None],
+    policy: TfPolicy = DEFAULT_POLICY,
 ) -> None:
     """One §9.6 cycle over every lane × target × base tf. Budgets are
     per REST HOST ([`budget_key`]), DEMAND-SIZED: ``max(budget_per_h,
@@ -1091,11 +1199,15 @@ def run_cycle(
     otherwise be discarded every cycle behind the same earlier
     siblings (observed live 2026-08-22: okx ETH-USDT-SWAP's 29-page
     1m walk vs 27 remaining) — rotation lets every target lead a
-    cycle eventually, so every backfill completes."""
+    cycle eventually, so every backfill completes. ``policy`` narrows
+    the bases per lane / instrument (``tfs_for``); the default policy
+    is the §9.5 law and this function is then bit-identical to the
+    pre-policy lane."""
     demand: dict[str, int] = {}
     for lane in lanes:
         key = budget_key(lane.name)
-        demand[key] = demand.get(key, 0) + 2 * len(FETCHED_TFS) * len(lane.targets)
+        for target in lane.targets:
+            demand[key] = demand.get(key, 0) + 2 * len(tfs_for(policy, lane, target))
     budgets: dict[str, claude_worker.features.RestBudget] = {}
     for lane in lanes:
         key = budget_key(lane.name)
@@ -1111,7 +1223,7 @@ def run_cycle(
         rot = (now_ms // 3_600_000) % len(lane.targets) if lane.targets else 0
         rotated = lane.targets[rot:] + lane.targets[:rot]
         for target in rotated:
-            for tf in FETCHED_TFS:
+            for tf in tfs_for(policy, lane, target):
                 if lane.backward:
                     st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env)
                 else:
@@ -1171,6 +1283,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--universe", default=None)
     parser.add_argument("--db", default=None)
     parser.add_argument("--budget-per-h", type=int, default=None)
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help="base-timeframe policy file (default ~/multivenue/candles.toml; absent = §9.5)",
+    )
     parser.add_argument("--now-ms", type=int, default=None, help="tests only")
     parser.add_argument(
         "--capture-backfill",
@@ -1195,6 +1312,21 @@ def main(argv: list[str] | None = None) -> int:
     if not lanes:
         print(f"candles: no candle-lane instruments in {universe}", file=sys.stderr)
         return 0
+    policy_path = pathlib.Path(
+        args.policy or env.get(POLICY_ENV, "") or DEFAULT_POLICY_PATH
+    ).expanduser()
+    policy, problem = read_tf_policy(policy_path)
+    if problem is not None:
+        print(
+            f"candles: policy {policy_path} ignored — {problem}; fetching the §9.5 bases",
+            file=sys.stderr,
+        )
+    elif policy != DEFAULT_POLICY:
+        print(
+            f"candles: policy {policy_path}: lanes={len(policy.lanes)}"
+            f" instruments={len(policy.instruments)}",
+            file=sys.stderr,
+        )
     conn = open_db(db_path)
     try:
         with httpx.Client() as client:
@@ -1206,6 +1338,7 @@ def main(argv: list[str] | None = None) -> int:
                 budget,
                 env,
                 lambda line: print(line, file=sys.stderr),
+                policy,
             )
         # C5 tail: PM capture store + BN drift + §9.5 derive.
         replay_root = pathlib.Path(

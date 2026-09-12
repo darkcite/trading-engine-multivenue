@@ -104,4 +104,19 @@ case "$STRATEGY" in
   ai|ai+icdp|icdp|ai+vrp|vrp) ;;
   *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp)" >&2; exit 78 ;;
 esac
+
+# XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's
+# 256-descriptor SOFT limit, and the Binance lane is ONE socket per
+# instrument per channel — the 110-perp research universe (124 usdm ×
+# {bookTicker, markPrice} + spot + eapi ≈ 254 sockets, plus ~50 capture
+# files, UDS, metrics) overran it at boot: `connect failed … Too many
+# open files` on every slot past ~200, `ingress-ai: run loop error;
+# rebinding` (the command plane could not bind), `vrp: state write
+# failed`. Raise the soft limit here, before the exec, so the engine is
+# born with headroom: 8192 is >30× today's need and far under
+# `kern.maxfilesperproc`. Soft only (`-S`) — never lowers the hard
+# limit. A refused raise is a tell, not a refusal to boot.
+ulimit -S -n 8192 ||
+  echo "engine-wrapper: ulimit -n 8192 refused (hard=$(ulimit -Hn)) — booting with $(ulimit -Sn)" >&2
+echo "engine-wrapper: fd soft limit $(ulimit -Sn) (hard $(ulimit -Hn))" >&2
 exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY"

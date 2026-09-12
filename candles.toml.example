@@ -1,0 +1,45 @@
+# ~/multivenue/candles.toml — the candles lane's base-timeframe POLICY (XSD-1,
+# 2026-09-12). OPTIONAL. DATA, not source: read once per cycle by
+# `python -m claude_worker.candles` (`--policy <path>` or
+# `CLAUDE_WORKER_CANDLES_POLICY` override the path).
+#
+# WHY IT EXISTS. The §9.5 law fetches THREE bases for every instrument the
+# universe names: 1m (48 h backfill, then every cycle forever), 1h (90 d),
+# 1d (listing lifetime). A research-breadth universe — the 110 Binance USDⓈ-M
+# perps the `xsd` member needs as TARGETS, whose only consumer is an HOURLY
+# strategy — would accrete ~1,440 1m rows per instrument per day with no
+# reader. This file narrows the bases per LANE or per INSTRUMENT.
+#
+# WHY IT IS NOT IN universe.toml. The engine's universe parser refuses unknown
+# keys and sections, so a worker-only knob there could refuse an engine boot.
+# This file is read by the worker alone; the engine never opens it.
+#
+# LAWS.
+#   * Absent file, absent lane, absent instrument = the §9.5 law, bit for bit.
+#   * An instrument line wins over its lane's default.
+#   * Values are a NON-EMPTY subset of ["1m", "1h", "1d"] — any order; the lane
+#     always fetches in 1m → 1h → 1d order. Derived tfs follow their bases:
+#     no 1m ⇒ no 5m/15m rows for that instrument; 4h still derives from 1h.
+#   * Instruments are the venue symbol AS WRITTEN in universe.toml
+#     (`btcusdt`, `BTC-USDT-SWAP`, `BTC-PERPETUAL`, `BTC`); Binance symbols
+#     match case-insensitively.
+#   * An UNUSABLE file (not TOML, unknown key, unknown tf, empty list, a
+#     non-table) is reported on stderr and IGNORED WHOLE — a typo can only
+#     widen a fetch back to §9.5, never silently narrow another lane.
+#
+# Lane names = the candles lane names: binance · binance-usdm · okx · deribit ·
+# hyperliquid · bybit · bybit-linear.
+#
+# Consumers that READ 1m from candles.db today (keep their instruments at the
+# full law): the regime seed (`regime.toml [breadth] members`), the ICDP
+# artifact fit (its 8 majors), the nightly drift check. Nothing reads 1m for
+# the research-breadth perps.
+
+[binance-usdm]
+# Lane default stays the §9.5 law (nothing narrowed for the majors).
+tfs = ["1m", "1h", "1d"]
+
+[binance-usdm.instruments]
+# The xsd research-breadth targets: hourly member ⇒ 1h + 1d only. One line per
+# instrument; the xsd authoring lane writes this block from its universe.
+# cotiusdt = ["1h", "1d"]
