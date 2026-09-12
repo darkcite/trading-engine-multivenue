@@ -2561,9 +2561,14 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // Drain our pong replies out of the transport (stack scratch).
     let mut out_scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut out_scratch);
-    // Drain the bbo ticks — two per cycle. try_pop is zero-alloc
+    // Drain the ticks — THREE per cycle. try_pop is zero-alloc
     // (asserted by the ring test above), so popping inside the guard
     // keeps the window honest.
+    //
+    // BIN15 O8: two bbo frames plus the HIP-4 coin's `l2Book`, which
+    // now carries that leg's touch because the venue publishes its
+    // `bbo` one-sided. `L2_BTC` still yields no tick — a perp's touch
+    // comes from bbo alone, so no perp number moved.
     let mut acc: i64 = 0;
     let mut popped: usize = 0;
     while let Some(t) = cons.try_pop() {
@@ -2574,9 +2579,10 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
 
     let (allocs, bytes, _deallocs) = g.delta();
     // Steady state consumed the whole script: one tick per bbo frame
-    // (both coins — HIP-4 flows the same path), every ack verified,
-    // every frame counted, no losses, no staleness trips.
-    assert_eq!(popped, 2 * CYCLES);
+    // (both coins — HIP-4 flows the same path) plus the HIP-4
+    // `l2Book` touch (BIN15 O8), every ack verified, every frame
+    // counted, no losses, no staleness trips.
+    assert_eq!(popped, 3 * CYCLES);
     assert!(driver.is_verified());
     // 9 acks + per cycle: bbo(1) + l2Book(1) + trades rows(2) +
     // bbo(1) + l2Book(1) = 6. WS Pings are activity, not messages.

@@ -261,6 +261,17 @@ pub fn coin_wants_asset_ctx(coin: &[u8]) -> bool {
     !matches!(coin.first(), Some(b'#') | Some(b'@'))
 }
 
+/// Whether `coin` names a HIP-4 outcome leg (`#<enc>`).
+///
+/// BIN15 O8: these are the coins whose `bbo` the venue publishes
+/// ONE-SIDED — see [`parse_l2book_header`]'s note and the run loop's
+/// `Bbo`/`L2Book` arms.
+#[inline]
+#[must_use]
+pub fn is_outcome_coin(coin: &[u8]) -> bool {
+    matches!(coin.first(), Some(b'#'))
+}
+
 // ---------------------------------------------------------------
 // Frame PODs — one cache line each, explicit padding
 // ---------------------------------------------------------------
@@ -305,8 +316,12 @@ pub struct HlL2BookFrame {
     pub n_bids: u16,
     /// Ask levels in this snapshot (venue caps at 20).
     pub n_asks: u16,
+    /// BIN15 O8: best bid size ×1e6 (0 = side empty).
+    pub best_bid_sz_1e6: i64,
+    /// BIN15 O8: best ask size ×1e6 (0 = side empty).
+    pub best_ask_sz_1e6: i64,
     // Explicit tail padding.
-    _pad: [u8; 32],
+    _pad: [u8; 16],
 }
 
 /// Parsed `trades` row.
@@ -496,17 +511,25 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<HlBboFrame> {
 /// Parse an `l2Book` snapshot into its [`HlL2BookFrame`] header.
 /// `levels` is `[bids, asks]`, each best-first; levels themselves
 /// stay in the rx buffer (§4.5).
+///
+/// BIN15 O8: the best price AND SIZE of each side are carried out,
+/// because for a HIP-4 outcome leg this snapshot is the only
+/// two-sided touch the venue publishes — its `bbo` sends the ask as
+/// `null`. Probed live 2026-09-12 on `#27760`: `bbo` gave
+/// `[{"px":"0.5",...}, null]` while `l2Book` on the same coin in the
+/// same second had six asks, best `0.69`.
 #[inline]
 pub fn parse_l2book_header(payload: &[u8], sym: SymbolId) -> Option<HlL2BookFrame> {
     let pos = find_field(payload, b"\"levels\":")?;
     if *payload.get(pos)? != b'[' {
         return None;
     }
-    let (n_bids, best_bid_px_1e6, _bsz, bids_end) = scan_side_levels(payload, pos + 1)?;
+    let (n_bids, best_bid_px_1e6, best_bid_sz_1e6, bids_end) = scan_side_levels(payload, pos + 1)?;
     if *payload.get(bids_end)? != b',' {
         return None;
     }
-    let (n_asks, best_ask_px_1e6, _asz, _asks_end) = scan_side_levels(payload, bids_end + 1)?;
+    let (n_asks, best_ask_px_1e6, best_ask_sz_1e6, _asks_end) =
+        scan_side_levels(payload, bids_end + 1)?;
     let ts_ns = scan_bare_ms_to_ns(payload, b"\"time\":")?;
     Some(HlL2BookFrame {
         ts_ns,
@@ -515,7 +538,9 @@ pub fn parse_l2book_header(payload: &[u8], sym: SymbolId) -> Option<HlL2BookFram
         sym,
         n_bids,
         n_asks,
-        _pad: [0; 32],
+        best_bid_sz_1e6,
+        best_ask_sz_1e6,
+        _pad: [0; 16],
     })
 }
 
@@ -1721,6 +1746,23 @@ mod tests {
     /// connection at `arm + budget` on a metronome. That is what
     /// happened on 2026-09-12: six reserved rows behind three dormant
     /// families trip-looped Hyperliquid every 11.5 s.
+    /// BIN15 O8: the header carries each side's best SIZE, not just
+    /// its price — an outcome leg's touch is built from it.
+    #[test]
+    fn l2book_header_carries_both_sides_price_and_size() {
+        let p = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1}]]}}"##;
+        let f = parse_l2book_header(p, 7).expect("header");
+        assert_eq!(f.best_bid_px_1e6, 500_000);
+        assert_eq!(f.best_bid_sz_1e6, 64_000_000);
+        assert_eq!(f.best_ask_px_1e6, 690_000);
+        assert_eq!(f.best_ask_sz_1e6, 69_000_000);
+        assert_eq!(f.n_bids, 2);
+        assert_eq!(f.n_asks, 1);
+        assert!(is_outcome_coin(b"#330"));
+        assert!(!is_outcome_coin(b"BTC"));
+        assert!(!is_outcome_coin(b"@1"), "a spot pair is not an outcome leg");
+    }
+
     #[test]
     fn a_reserved_row_is_never_stale_until_it_is_rebound() {
         let mut coins = named_coins(1);

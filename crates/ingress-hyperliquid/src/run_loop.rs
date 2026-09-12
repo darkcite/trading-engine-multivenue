@@ -70,8 +70,9 @@ use crate::family::{
 };
 use crate::{
     bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, outcome_meta_description,
-    parse_active_asset_ctx, parse_all_mids, parse_bbo, parse_l2book_header, parse_outcome_meta,
-    parse_sub_response, parse_trade, sub_id_of, write_subscribe, write_unsubscribe, GlobalBits,
+    is_outcome_coin, parse_active_asset_ctx, parse_all_mids, parse_bbo, parse_l2book_header,
+    parse_outcome_meta, parse_sub_response, parse_trade, sub_id_of, write_subscribe,
+    write_unsubscribe, GlobalBits,
     HlChannel, HlCoinTable, HlMsgKind, HlStaleness, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN,
     HL_MAX_COINS, OUTCOME_CREATED, OUTCOME_ENC_NONE, OUTCOME_META_BIT, OUTCOME_SETTLED,
     PING_PAYLOAD,
@@ -914,8 +915,15 @@ enum Dispatch {
     VenueError,
     /// `bbo` push became a Tick.
     Bbo { tick: Tick },
-    /// `l2Book` snapshot header (staleness food).
-    L2Book { coin_idx: u8, venue_ts_ns: u64 },
+    /// `l2Book` snapshot header (staleness food), plus — BIN15 O8 —
+    /// the touch it yields for a HIP-4 outcome leg, whose `bbo` the
+    /// venue publishes one-sided. `None` for every other coin, which
+    /// keeps `bbo` the sole tick source for perps.
+    L2Book {
+        coin_idx: u8,
+        venue_ts_ns: u64,
+        tick: Option<Tick>,
+    },
     /// `trades` push scanned.
     Trades { scan: TradeScan },
     /// `activeAssetCtx` / `allMids` / `outcomeMetaUpdates` push
@@ -1261,6 +1269,25 @@ fn handle_data_frame<C: Capture>(
                     }) {
                         Some((sym, Some(coin_idx))) => match channel {
                             HlChannel::Bbo => match parse_bbo(payload, sym) {
+                                // BIN15 O8: the venue sends a HIP-4
+                                // outcome leg's ask as `null`, so a
+                                // bbo touch here would pin `ask = 0`
+                                // and no arm could ever read the book
+                                // as actionable. The l2Book arm below
+                                // carries the real two-sided touch.
+                                // Kept as a CONDITION rather than a
+                                // blanket skip so the moment the venue
+                                // publishes both sides, bbo resumes
+                                // being the faster source.
+                                Some(f)
+                                    if f.ask_px_1e6 == 0
+                                        && drv
+                                            .coins
+                                            .get(coin_idx)
+                                            .is_some_and(|(c, _)| is_outcome_coin(c)) =>
+                                {
+                                    Dispatch::Nothing
+                                }
                                 Some(f) => {
                                     // VT2: one parse-complete stamp
                                     // serves the tick AND the judgement;
@@ -1305,9 +1332,41 @@ fn handle_data_frame<C: Capture>(
                                         f.n_bids as i64,
                                         f.n_asks as i64,
                                     ));
+                                    // BIN15 O8: for a HIP-4 outcome
+                                    // leg this snapshot is the only
+                                    // two-sided touch the venue
+                                    // publishes. Same stamp + staleness
+                                    // judgement the bbo arm applies.
+                                    let touch = if drv
+                                        .coins
+                                        .get(coin_idx)
+                                        .is_some_and(|(c, _)| is_outcome_coin(c))
+                                        && f.best_bid_px_1e6 > 0
+                                        && f.best_ask_px_1e6 > f.best_bid_px_1e6
+                                    {
+                                        let now = now_ns();
+                                        let venue_time_ms = f.ts_ns / 1_000_000;
+                                        let judged =
+                                            drv.feed_clock.judge(venue_time_ms, now);
+                                        Some(Tick::new_stamped(
+                                            now,
+                                            VenueId::Hyperliquid,
+                                            sym,
+                                            venue_time_ms as u32,
+                                            Price::from_raw(f.best_bid_px_1e6),
+                                            Qty::from_raw(f.best_bid_sz_1e6),
+                                            Price::from_raw(f.best_ask_px_1e6),
+                                            Qty::from_raw(f.best_ask_sz_1e6),
+                                            venue_time_ms,
+                                            (judged.stale as u8) * TICK_FLAG_STALE,
+                                        ))
+                                    } else {
+                                        None
+                                    };
                                     Dispatch::L2Book {
                                         coin_idx: coin_idx as u8,
                                         venue_ts_ns: f.ts_ns,
+                                        tick: touch,
                                     }
                                 }
                                 None => Dispatch::Nothing,
@@ -1498,11 +1557,25 @@ fn handle_data_frame<C: Capture>(
         Dispatch::L2Book {
             coin_idx,
             venue_ts_ns,
+            tick,
         } => {
             status.add_msgs(1);
             status.add_ticks(1);
             drv.staleness
                 .on_l2book(coin_idx as usize, venue_ts_ns, now_ns());
+            // BIN15 O8: the outcome leg's touch travels the same road
+            // as a bbo tick — capture BEFORE the push, ring drops
+            // counted, never blocking.
+            if let Some(t) = tick {
+                if t.is_stale() {
+                    status.inc_stale_ticks();
+                }
+                status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
+                capture.tick(&t);
+                if producer.try_push(t).is_err() {
+                    status.inc_ring_drops();
+                }
+            }
         }
         Dispatch::Trades { scan } => {
             status.add_msgs(scan.rows_parsed as u64);
@@ -2177,6 +2250,73 @@ mod tests {
         assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
         assert_eq!(tick.bid_px.raw(), 400_000);
         assert_eq!(tick.ask_px.raw(), 600_000);
+    }
+
+    /// BIN15 O8: a HIP-4 outcome leg's touch comes from `l2Book`,
+    /// because the venue publishes its `bbo` ONE-SIDED.
+    ///
+    /// The payloads are the live 2026-09-12 probe of `#27760`, retyped
+    /// onto this driver's `#330`: `bbo` carried
+    /// `[{"px":"0.5",...}, null]` while `l2Book` on the same coin in
+    /// the same second had six asks, best `0.69`. Before this every
+    /// outcome tick pinned `ask = 0`, so `Touch::actionable` was false
+    /// on every reprice and bin15 skipped 2,938 times in 27 minutes
+    /// without submitting a single order.
+    #[test]
+    fn a_one_sided_outcome_bbo_is_dropped_and_l2book_carries_the_touch() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = verified_driver();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+
+        // (1) The venue's one-sided bbo must NOT reach the ring: a
+        // touch with `ask = 0` is worse than no touch at all.
+        inject_text(
+            &mut t,
+            br##"{"channel":"bbo","data":{"coin":"#330","time":1789252917210,"bbo":[{"px":"0.5","sz":"64.0","n":1},null]}}"##,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        assert!(
+            cons.try_pop().is_none(),
+            "a one-sided outcome touch must never reach the ring"
+        );
+
+        // (2) The l2Book snapshot carries the real two-sided touch.
+        inject_text(
+            &mut t,
+            br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1},{"px":"0.7","sz":"69.0","n":1}]]}}"##,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        let tick = cons.try_pop().expect("l2Book must yield the outcome touch");
+        assert_eq!(tick.sym, SYM_HIP4);
+        assert_eq!(tick.bid_px.raw(), 500_000);
+        assert_eq!(tick.ask_px.raw(), 690_000, "the ask the bbo dropped");
+        assert_eq!(tick.bid_qty.raw(), 64_000_000);
+        assert_eq!(tick.ask_qty.raw(), 69_000_000);
+
+        // (3) A PERP's l2Book must not produce a tick — bbo stays its
+        // sole source, so no existing venue number moves.
+        inject_text(
+            &mut t,
+            br#"{"channel":"l2Book","data":{"coin":"BTC","time":1789252941097,"levels":[[{"px":"1.0","sz":"1.0","n":1}],[{"px":"2.0","sz":"1.0","n":1}]]}}"#,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        assert!(
+            cons.try_pop().is_none(),
+            "a perp's touch still comes from bbo alone"
+        );
+
+        // (4) A TWO-SIDED outcome bbo is still a tick: the drop is a
+        // condition on the frame, not a blanket rule, so the faster
+        // source resumes the moment the venue publishes both sides.
+        inject_text(
+            &mut t,
+            br##"{"channel":"bbo","data":{"coin":"#330","time":1789252950000,"bbo":[{"px":"0.51","sz":"10.0","n":1},{"px":"0.68","sz":"11.0","n":1}]}}"##,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        let tick = cons.try_pop().expect("a two-sided outcome bbo is still a tick");
+        assert_eq!(tick.bid_px.raw(), 510_000);
+        assert_eq!(tick.ask_px.raw(), 680_000);
     }
 
     #[test]
