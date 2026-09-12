@@ -35,6 +35,36 @@ use core_net::TlsTransport;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// BIN15 O5 (2026-09-12): the composed-set names this binary will boot.
+///
+/// This list MUST mirror `strategy_set::mask_for_name`, minus
+/// `latency-arb`, which has its own paper arm above and no set arm.
+/// It lives here as a named const rather than as match literals so the
+/// `strategy_name_pin` tests below can read it: the arm and the mask
+/// table DID drift once. The five bin15 names reached `mask_for_name`
+/// and the wrapper allow-list but never the match arm, so
+/// `--strategy ai+vrp+xsd+bin15` refused the boot at 2026-09-12T20:04:42Z
+/// and the whole set — ai-exec, vm, vrp, xsd and bin15 — went dark
+/// behind a live capture that looked healthy.
+const STRATEGY_SET_NAMES: &[&str] = &[
+    "all",
+    "ai",
+    "ai-exec",
+    "vm",
+    "icdp",
+    "ai+icdp",
+    "vrp",
+    "ai+vrp",
+    "xsd",
+    "ai+xsd",
+    "ai+vrp+xsd",
+    "bin15",
+    "ai+bin15",
+    "ai+vrp+bin15",
+    "ai+xsd+bin15",
+    "ai+vrp+xsd+bin15",
+];
+
 /// Top-level CLI.
 #[derive(Debug, Parser)]
 #[command(name = "multivenue-engine", version)]
@@ -2218,11 +2248,7 @@ fn run(args: RunArgs) -> ExitCode {
                 )
             }
         }
-        (
-            name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp" | "vrp" | "ai+vrp" | "xsd"
-            | "ai+xsd" | "ai+vrp+xsd"),
-            _live,
-        ) => {
+        (name, _live) if STRATEGY_SET_NAMES.contains(&name) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
             // latency-arb from the mandatory pair flags, bin15 only
@@ -2477,4 +2503,95 @@ fn load_icdp_params(
         );
     }
     Ok(params)
+}
+#[cfg(test)]
+mod strategy_name_pin {
+    //! BIN15 O5: the regression pin for the arm/mask drift recorded on
+    //! `STRATEGY_SET_NAMES`. A name that the mask table accepts but this
+    //! binary will not boot is a silent dark-engine bug — the wrapper
+    //! passes the name, the process starts, capture runs, and only the
+    //! mask gauge says the strategies never composed.
+
+    /// The one deliberate asymmetry: `latency-arb` is a mask name but
+    /// has its own `("latency-arb", false)` paper arm, never a set arm.
+    const EXEMPT: &[&str] = &["latency-arb"];
+
+    /// Every bootable name must be a name the mask table can resolve —
+    /// the arm body `expect`s exactly this.
+    #[test]
+    fn every_bootable_name_resolves_to_a_mask() {
+        let mut i = 0;
+        while i < super::STRATEGY_SET_NAMES.len() {
+            let name = super::STRATEGY_SET_NAMES[i];
+            assert!(
+                strategy_set::mask_for_name(name).is_some(),
+                "{name} is bootable but mask_for_name does not know it"
+            );
+            assert!(
+                !EXEMPT.contains(&name),
+                "{name} is exempt and must not also be bootable"
+            );
+            i += 1;
+        }
+    }
+
+    /// Every name the mask table accepts must be bootable or exempt.
+    /// This is the direction that failed on 2026-09-12.
+    #[test]
+    fn every_mask_name_is_bootable_or_exempt() {
+        let mut i = 0;
+        while i < strategy_set::MASK_TABLE.len() {
+            let (name, _mask) = strategy_set::MASK_TABLE[i];
+            assert!(
+                super::STRATEGY_SET_NAMES.contains(&name) || EXEMPT.contains(&name),
+                "mask_for_name accepts {name} but the boot arm refuses it"
+            );
+            i += 1;
+        }
+    }
+
+    /// The bin15 names specifically, spelled out, so the 2026-09-12
+    /// omission cannot come back unnoticed even if both lists are edited.
+    #[test]
+    fn the_five_bin15_names_boot() {
+        let want = [
+            ("bin15", strategy_set::BIT_BIN15),
+            (
+                "ai+bin15",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_BIN15,
+            ),
+            (
+                "ai+vrp+bin15",
+                strategy_set::BIT_AI_EXEC
+                    | strategy_set::BIT_VM
+                    | strategy_set::BIT_VRP
+                    | strategy_set::BIT_BIN15,
+            ),
+            (
+                "ai+xsd+bin15",
+                strategy_set::BIT_AI_EXEC
+                    | strategy_set::BIT_VM
+                    | strategy_set::BIT_XSD
+                    | strategy_set::BIT_BIN15,
+            ),
+            (
+                "ai+vrp+xsd+bin15",
+                strategy_set::BIT_AI_EXEC
+                    | strategy_set::BIT_VM
+                    | strategy_set::BIT_VRP
+                    | strategy_set::BIT_XSD
+                    | strategy_set::BIT_BIN15,
+            ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(
+                super::STRATEGY_SET_NAMES.contains(&name),
+                "{name} is not in STRATEGY_SET_NAMES"
+            );
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
 }

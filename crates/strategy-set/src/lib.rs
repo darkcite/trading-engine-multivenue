@@ -187,49 +187,73 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 // engine's fixed sym slots — so the old `SET_VM_SLOTS = 512` law
 // retired with it.)
 
+/// Every `--strategy` name the engine resolves, with the enable mask
+/// it composes.
+///
+/// This table is the ONE source of truth for the name set:
+/// `mask_for_name` scans it and the cli's boot arm pins itself against
+/// it, so a name can never again resolve here while refusing to boot.
+/// Boot-only — a linear scan over a handful of entries, never hot.
+pub const MASK_TABLE: &[(&str, u8)] = &[
+    ("latency-arb", BIT_LATENCY_ARB),
+    // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
+    // is GONE as a name — an operator who types the old one gets a
+    // boot refusal, not a different strategy than the one asked for.
+    ("xsd", BIT_XSD),
+    ("ai+xsd", BIT_AI_EXEC | BIT_VM | BIT_XSD),
+    ("ai+vrp+xsd", BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD),
+    // BIN15 O4b (2026-09-12): slot 3 is the bin15 member;
+    // `rule-tree` is GONE as a name — an operator who types the old
+    // one gets a boot refusal, not a different strategy than the
+    // one asked for. The same law XSD-S and VRP V7 applied.
+    ("bin15", BIT_BIN15),
+    ("ai+bin15", BIT_AI_EXEC | BIT_VM | BIT_BIN15),
+    ("ai+vrp+bin15", BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_BIN15),
+    ("ai+xsd+bin15", BIT_AI_EXEC | BIT_VM | BIT_XSD | BIT_BIN15),
+    (
+        "ai+vrp+xsd+bin15",
+        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15,
+    ),
+    ("ai-exec", BIT_AI_EXEC),
+    ("vm", BIT_VM),
+    // AI-pushed lanes only (operator ruling 2026-09-02: Rust-coded
+    // strategies disabled at boot; the engine executes only what
+    // the AI command plane pushes — ai-exec intents + VM rulesets).
+    ("ai", BIT_AI_EXEC | BIT_VM),
+    // ICDP I4: the operator opts the intrabar member in beside
+    // the AI lanes (paper only — the wrapper refuses it without
+    // `--paper`); `icdp` alone boots it bare.
+    ("icdp", BIT_ICDP),
+    ("ai+icdp", BIT_AI_EXEC | BIT_VM | BIT_ICDP),
+    // VRP V7: slot 1 is the VRP member. `ev` is GONE as a name —
+    // an operator who types it must get a boot refusal, not a
+    // different strategy than the one they asked for.
+    ("vrp", BIT_VRP),
+    ("ai+vrp", BIT_AI_EXEC | BIT_VM | BIT_VRP),
+    ("all", BUILT_MASK),
+];
+
 /// Map a `--strategy` value to an initial enable mask (design §7:
 /// single name = single bit, back-compatible; `all` = all built
 /// members). `None` for unknown names — the cli rejects those at
 /// boot exactly as before.
+///
+/// BIN15 O5 (2026-09-12): this body was a `match` whose arms the cli
+/// duplicated as boot-arm literals. The two drifted — the five bin15
+/// names landed here and in the wrapper allow-list but never in the
+/// arm — and `--strategy ai+vrp+xsd+bin15` refused the boot with every
+/// member dark behind a capture that still looked healthy.
+/// `MASK_TABLE` above is now the only list.
 pub fn mask_for_name(name: &str) -> Option<u8> {
-    match name {
-        "latency-arb" => Some(BIT_LATENCY_ARB),
-        // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
-        // is GONE as a name — an operator who types the old one gets a
-        // boot refusal, not a different strategy than the one asked for.
-        "xsd" => Some(BIT_XSD),
-        "ai+xsd" => Some(BIT_AI_EXEC | BIT_VM | BIT_XSD),
-        "ai+vrp+xsd" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD),
-        // BIN15 O4b (2026-09-12): slot 3 is the bin15 member;
-        // `rule-tree` is GONE as a name — an operator who types the old
-        // one gets a boot refusal, not a different strategy than the
-        // one asked for. The same law XSD-S and VRP V7 applied.
-        "bin15" => Some(BIT_BIN15),
-        "ai+bin15" => Some(BIT_AI_EXEC | BIT_VM | BIT_BIN15),
-        "ai+vrp+bin15" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_BIN15),
-        "ai+xsd+bin15" => Some(BIT_AI_EXEC | BIT_VM | BIT_XSD | BIT_BIN15),
-        "ai+vrp+xsd+bin15" => {
-            Some(BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15)
+    let mut i = 0;
+    while i < MASK_TABLE.len() {
+        let (candidate, mask) = MASK_TABLE[i];
+        if candidate == name {
+            return Some(mask);
         }
-        "ai-exec" => Some(BIT_AI_EXEC),
-        "vm" => Some(BIT_VM),
-        // AI-pushed lanes only (operator ruling 2026-09-02: Rust-coded
-        // strategies disabled at boot; the engine executes only what
-        // the AI command plane pushes — ai-exec intents + VM rulesets).
-        "ai" => Some(BIT_AI_EXEC | BIT_VM),
-        // ICDP I4: the operator opts the intrabar member in beside
-        // the AI lanes (paper only — the wrapper refuses it without
-        // `--paper`); `icdp` alone boots it bare.
-        "icdp" => Some(BIT_ICDP),
-        "ai+icdp" => Some(BIT_AI_EXEC | BIT_VM | BIT_ICDP),
-        // VRP V7: slot 1 is the VRP member. `ev` is GONE as a name —
-        // an operator who types it must get a boot refusal, not a
-        // different strategy than the one they asked for.
-        "vrp" => Some(BIT_VRP),
-        "ai+vrp" => Some(BIT_AI_EXEC | BIT_VM | BIT_VRP),
-        "all" => Some(BUILT_MASK),
-        _ => None,
+        i += 1;
     }
+    None
 }
 
 // ---------------------------------------------------------------
@@ -2515,6 +2539,47 @@ mod tests {
                 REL_UNKNOWN,
                 REL_UNKNOWN
             ));
+        }
+    }
+
+    /// BIN15 O5: `MASK_TABLE` is the only name list, so it must not
+    /// carry a name twice — a duplicate would silently shadow the
+    /// second mask under the linear scan.
+    #[test]
+    fn mask_table_has_no_duplicate_names() {
+        let mut i = 0;
+        while i < MASK_TABLE.len() {
+            let mut j = i + 1;
+            while j < MASK_TABLE.len() {
+                assert_ne!(MASK_TABLE[i].0, MASK_TABLE[j].0, "duplicate name in MASK_TABLE");
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// Every table row must resolve through `mask_for_name` to its own
+    /// mask — the scan and the table cannot disagree.
+    #[test]
+    fn mask_table_and_mask_for_name_agree() {
+        let mut i = 0;
+        while i < MASK_TABLE.len() {
+            let (name, mask) = MASK_TABLE[i];
+            assert_eq!(mask_for_name(name), Some(mask), "{name}");
+            assert!(!name.is_empty(), "an empty name would shadow the None case");
+            i += 1;
+        }
+    }
+
+    /// Every mask in the table must be built — a name that composes a
+    /// reserved slot would boot a member that does not exist.
+    #[test]
+    fn every_table_mask_is_built() {
+        let mut i = 0;
+        while i < MASK_TABLE.len() {
+            let (name, mask) = MASK_TABLE[i];
+            assert_eq!(mask & !BUILT_MASK, 0, "{name} composes an unbuilt slot");
+            i += 1;
         }
     }
 }
