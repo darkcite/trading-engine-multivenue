@@ -459,3 +459,25 @@ pub fn coin_to_usd_1e6(coin_1e9: i64, underlying_px_1e9: i64, cs_1e9: i64) -> Op
     }
     i64::try_from(usd_1e6).ok()
 }
+
+/// P5: European cash settlement value of ONE unit at index `s_1e6`:
+/// `max(0, S − K)` for a call, `max(0, K − S)` for a put.
+///
+/// THE settlement law, here rather than on a member, because the
+/// harness settles by it too and must not depend on a strategy crate.
+/// It had two verbatim copies before P5 — `VrpStrategy::intrinsic_1e6`
+/// and `OptSettleRef::value_1e6`'s body.
+#[inline]
+#[must_use]
+pub const fn intrinsic_1e6(s_1e6: i64, strike_1e6: i64, right: u8) -> i64 {
+    let v = if right == RIGHT_CALL {
+        s_1e6 - strike_1e6
+    } else {
+        strike_1e6 - s_1e6
+    };
+    if v > 0 {
+        v
+    } else {
+        0
+    }
+}

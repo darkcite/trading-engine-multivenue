@@ -272,18 +272,13 @@ pub fn registry_from_manifest_rows<S: AsRef<str>>(rows: &[(u32, S)]) -> (OptRegi
 #[inline]
 #[must_use]
 pub fn quote_px_usd_1e6(px_coin_1e6: i64, underlying_px_1e9: i64, cs_1e9: i64) -> Option<i64> {
-    if px_coin_1e6 <= 0 || underlying_px_1e9 <= 0 || cs_1e9 <= 0 {
-        return None;
-    }
-    const SCALE_1E18: i128 = 1_000_000_000_000_000_000;
-    let usd_1e6 = (px_coin_1e6 as i128)
-        .checked_mul(underlying_px_1e9 as i128)?
-        .checked_mul(cs_1e9 as i128)?
-        / SCALE_1E18;
-    if usd_1e6 <= 0 {
-        return None;
-    }
-    i64::try_from(usd_1e6).ok()
+    // P5: ONE conversion in the tree. A quote price is coin ×1e6 and
+    // `coin_to_usd_1e6` takes coin ×1e9, so the only thing this wrapper
+    // does is carry the three orders of magnitude between them —
+    // CHECKED, because a corrupt capture must give `None` here exactly
+    // as it does there.
+    let coin_1e9 = px_coin_1e6.checked_mul(1_000)?;
+    opt_registry::coin_to_usd_1e6(coin_1e9, underlying_px_1e9, cs_1e9)
 }
 
 /// What [`UnderlyingBook::convert_quote`] did to a tick.
@@ -619,24 +614,14 @@ impl OptSettleRef {
         }
     }
 
-    /// European cash value of ONE unit: `max(0, S − K)` for a call,
-    /// `max(0, K − S)` for a put. The same law the member settles by
-    /// (`strategy_vrp::VrpStrategy::intrinsic_1e6`), restated here
-    /// because the harness must not depend on a strategy crate.
+    /// European cash value of ONE unit at [`Self::settle_index_1e6`].
+    /// P5: `opt_registry::intrinsic_1e6` IS the law — the member calls
+    /// the same function, and the harness reaches it without depending
+    /// on a strategy crate.
     #[inline]
     #[must_use]
     pub fn value_1e6(&self) -> i64 {
-        let s_1e6 = self.settle_index_1e6();
-        let v = if self.right == opt_registry::RIGHT_CALL {
-            s_1e6 - self.strike_1e6
-        } else {
-            self.strike_1e6 - s_1e6
-        };
-        if v > 0 {
-            v
-        } else {
-            0
-        }
+        opt_registry::intrinsic_1e6(self.settle_index_1e6(), self.strike_1e6, self.right)
     }
 
     /// True when this contract can actually settle inside a window

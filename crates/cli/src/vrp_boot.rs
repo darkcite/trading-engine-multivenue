@@ -152,9 +152,18 @@ pub struct VrpBoot {
     pub hedge_sym: SymbolId,
     /// SHA-256 of the exact `vrp.toml` bytes.
     pub hash: [u8; 32],
-    /// Chain rows the parser refused (a non-inverse name, or a name it
-    /// does not recognise). Counted, never guessed at.
+    /// Chain rows the registry refused (a non-inverse name, a name it
+    /// does not recognise, or numeric terms it cannot represent).
+    /// Counted, never guessed at.
     pub rows_refused: usize,
+    /// P5.2: chain rows built by parsing the instrument NAME because
+    /// discovery carried no numeric terms for them. Zero on a live
+    /// boot, where the venue's own `strike`/`expiration_timestamp`
+    /// travel with the sym; equal to the chain length offline, where a
+    /// capture's options manifest holds names and nothing else. A
+    /// non-zero value on a LIVE boot means discovery dropped fields it
+    /// used to carry.
+    pub rows_from_name: usize,
     /// W3: the reconciled rolling window, oldest first and contiguous —
     /// what the member replays to arrive WARM instead of spending 24 h
     /// it never gets before the next restart.
@@ -200,25 +209,49 @@ fn currency_of(descriptor: &str) -> Option<&str> {
 /// `underlying_sym` itself: two layers, because this one is not
 /// recoverable in flight.
 pub fn build_registry(
-    deribit_options: &[(String, SymbolId)],
+    deribit_options: &[crate::paper::DiscoveredOption],
     hedge_descriptor: &str,
     hedge_sym: SymbolId,
-) -> (OptRegistry, usize) {
+) -> (OptRegistry, usize, usize) {
     let mut reg = OptRegistry::new();
     let mut refused = 0usize;
+    let mut rows_from_name = 0usize;
     let want = currency_of(hedge_descriptor);
-    for (name, sym) in deribit_options {
+    for (name, sym, strike_1e9, expiration_ts_ms, right) in deribit_options {
         if want.is_none() || currency_of(name) != want {
             refused += 1;
             continue;
         }
-        let Some(row) = OptInstrument::from_descriptor(
-            *sym,
-            hedge_sym,
-            core_types::VenueId::Deribit as u8,
-            name.as_bytes(),
-            DERIBIT_OPT_CONTRACT_SIZE_1E9,
-        ) else {
+        // P5.2: the venue's own numbers when discovery carried them.
+        // The instrument NAME is a fallback, not the law: it is what an
+        // offline surface has (a capture's options manifest holds names
+        // and nothing else), and what a live boot had before the terms
+        // travelled with the sym.
+        let row = if *strike_1e9 > 0 && *expiration_ts_ms > 0 {
+            OptInstrument::from_discovery(
+                *sym,
+                hedge_sym,
+                core_types::VenueId::Deribit as u8,
+                *expiration_ts_ms,
+                *strike_1e9,
+                *right == opt_registry::RIGHT_CALL,
+                DERIBIT_OPT_CONTRACT_SIZE_1E9,
+            )
+        } else {
+            rows_from_name += 1;
+            OptInstrument::from_descriptor(
+                *sym,
+                hedge_sym,
+                core_types::VenueId::Deribit as u8,
+                name.as_bytes(),
+                DERIBIT_OPT_CONTRACT_SIZE_1E9,
+            )
+        };
+        // A field that is PRESENT and unrepresentable is a refusal, not
+        // a reason to go back to the name: `from_discovery` refuses a
+        // row rather than rounding it, and a boot that quietly re-derived
+        // the same row from its name would defeat that.
+        let Some(row) = row else {
             refused += 1;
             continue;
         };
@@ -226,7 +259,7 @@ pub fn build_registry(
             refused += 1;
         }
     }
-    (reg, refused)
+    (reg, refused, rows_from_name)
 }
 
 /// F19: whether this boot asked for the member at all.
@@ -259,7 +292,7 @@ pub fn load_vrp_boot(
     seed_path: Option<&Path>,
     state_path: Option<&Path>,
     resolve: &dyn Fn(&str) -> Option<SymbolId>,
-    deribit_options: &[(String, SymbolId)],
+    deribit_options: &[crate::paper::DiscoveredOption],
 ) -> Result<Option<VrpBoot>, String> {
     let (path, explicit): (PathBuf, bool) = match path {
         Some(p) => (p.to_path_buf(), true),
@@ -284,7 +317,7 @@ pub fn load_vrp_boot(
     })?;
     let hedge_sym = resolve(&file.hedge_descriptor)
         .ok_or_else(|| format!("vrp: `{}` is not in the boot universe", file.hedge_descriptor))?;
-    let (registry, rows_refused) =
+    let (registry, rows_refused, rows_from_name) =
         build_registry(deribit_options, &file.hedge_descriptor, hedge_sym);
     if registry.is_empty() {
         return Err(format!(
@@ -373,6 +406,7 @@ pub fn load_vrp_boot(
         hedge_sym,
         hash: core_crypto::sha256(&bytes),
         rows_refused,
+        rows_from_name,
     }))
 }
 
@@ -483,16 +517,25 @@ mod tests {
         // both lets the member hedge an ETH call with the BTC perp, and
         // it blows the 128-row table on a two-currency chain.
         let perp = core_types::make_symbol_id(core_types::VenueId::Deribit, 1);
-        let mut chain: Vec<(String, SymbolId)> = Vec::new();
+        // P5.2: an OFFLINE chain — names and syms, no numeric terms,
+        // exactly what a capture's options manifest carries. Every row
+        // therefore goes through the name parser, and says so.
+        let mut chain: Vec<crate::paper::DiscoveredOption> = Vec::new();
         let mut k = 0u32;
         while k < 6 {
             chain.push((
                 format!("BTC-10SEP26-{}-C", 78_000 + 500 * k),
                 core_types::make_symbol_id(core_types::VenueId::Deribit, 513 + k),
+                0,
+                0,
+                0,
             ));
             chain.push((
                 format!("ETH-10SEP26-{}-C", 3_000 + 100 * k),
                 core_types::make_symbol_id(core_types::VenueId::Deribit, 600 + k),
+                0,
+                0,
+                0,
             ));
             k += 1;
         }
@@ -500,11 +543,19 @@ mod tests {
         chain.push((
             "BTC_USDC-10SEP26-79000-C".to_owned(),
             core_types::make_symbol_id(core_types::VenueId::Deribit, 700),
+            0,
+            0,
+            0,
         ));
 
-        let (reg, refused) = build_registry(&chain, "deribit:BTC-PERPETUAL", perp);
+        let (reg, refused, from_name) = build_registry(&chain, "deribit:BTC-PERPETUAL", perp);
         assert_eq!(reg.len(), 6, "the six BTC calls, and only those");
         assert_eq!(refused, 7, "six ETH rows plus the USDC-linear name");
+        assert_eq!(
+            from_name, 6,
+            "the six BTC rows — the currency filter refuses the others \
+             BEFORE the parser sees them"
+        );
         for row in reg.rows() {
             assert_eq!(row.underlying_sym, perp);
             assert!(row.strike_1e6 >= 78_000_000_000, "a BTC strike, not an ETH one");
@@ -512,11 +563,64 @@ mod tests {
 
         // The same chain read for the ETH perp picks the other ladder.
         let eth = core_types::make_symbol_id(core_types::VenueId::Deribit, 2);
-        let (eth_reg, _) = build_registry(&chain, "deribit:ETH-PERPETUAL", eth);
+        let (eth_reg, _, _) = build_registry(&chain, "deribit:ETH-PERPETUAL", eth);
         assert_eq!(eth_reg.len(), 6);
         for row in eth_reg.rows() {
             assert!(row.strike_1e6 <= 3_500_000_000, "an ETH strike");
         }
+    }
+
+    #[test]
+    fn the_live_chain_uses_the_venues_numbers_and_the_name_only_as_a_fallback() {
+        // P5.2: discovery already parsed `strike` and
+        // `expiration_timestamp` out of the venue's REST JSON. When the
+        // boot carries them, the registry must use THEM — and land on
+        // exactly the row the name parser used to produce, or this
+        // change moved a strike.
+        let perp = core_types::make_symbol_id(core_types::VenueId::Deribit, 1);
+        let sym = core_types::make_symbol_id(core_types::VenueId::Deribit, 513);
+        let name = "BTC-10SEP26-79000-C".to_owned();
+        // 2026-09-10 08:00:00 UTC, the expiry that name encodes.
+        let exp_ms = 1_789_027_200_000i64;
+        let live = vec![(
+            name.clone(),
+            sym,
+            79_000_000_000_000i64,
+            exp_ms,
+            opt_registry::RIGHT_CALL,
+        )];
+        let offline = vec![(name, sym, 0i64, 0i64, 0u8)];
+
+        let (live_reg, live_refused, live_from_name) =
+            build_registry(&live, "deribit:BTC-PERPETUAL", perp);
+        let (off_reg, off_refused, off_from_name) =
+            build_registry(&offline, "deribit:BTC-PERPETUAL", perp);
+        assert_eq!((live_refused, live_from_name), (0, 0), "the venue's own numbers");
+        assert_eq!((off_refused, off_from_name), (0, 1), "the name parser");
+        assert_eq!(live_reg.len(), 1);
+        assert_eq!(off_reg.len(), 1);
+        let a = live_reg.rows()[0];
+        let b = off_reg.rows()[0];
+        assert_eq!(a.strike_1e6, b.strike_1e6, "same strike");
+        assert_eq!(a.expiry_ns, b.expiry_ns, "same expiry");
+        assert_eq!(a.right, b.right, "same right");
+        assert_eq!(a.strike_1e6, 79_000_000_000);
+        assert_eq!(a.expiry_ns, exp_ms as u64 * 1_000_000);
+
+        // A PRESENT but unrepresentable field is a refusal, not a
+        // reason to fall back to the name: a boot must not quietly
+        // rebuild a row `from_discovery` just rejected.
+        let bad = vec![(
+            "BTC-10SEP26-79000-C".to_owned(),
+            sym,
+            79_000_000_000_001i64, // not a whole 1e-6 of a dollar
+            exp_ms,
+            opt_registry::RIGHT_CALL,
+        )];
+        let (bad_reg, bad_refused, bad_from_name) =
+            build_registry(&bad, "deribit:BTC-PERPETUAL", perp);
+        assert!(bad_reg.is_empty());
+        assert_eq!((bad_refused, bad_from_name), (1, 0));
     }
 
     #[test]

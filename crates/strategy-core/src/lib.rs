@@ -896,6 +896,44 @@ pub fn caps_for_sym(sym: SymbolId) -> VenueCaps {
     caps_for_venue(core_types::symbol_venue_byte(sym))
 }
 
+/// P5: the ONE order-size law, beside the caps table it reads.
+///
+/// Every member that sizes an order asks the same two questions — what
+/// is this worth, and does it fit — and the answers must not differ by
+/// member. They lived on `VrpStrategy` until P5; icdp asked the second
+/// one by hand.
+pub mod risk {
+    /// USD ×1e6 notional of `qty_1e6` units at `px_1e6`. `i128`
+    /// intermediate, saturating — a notional that cannot be represented
+    /// is treated as INFINITE, which refuses rather than admits.
+    #[inline]
+    #[must_use]
+    pub fn notional_1e6(px_1e6: i64, qty_1e6: i64) -> i64 {
+        let n = (px_1e6 as i128 * qty_1e6.unsigned_abs() as i128) / 1_000_000;
+        i64::try_from(n).unwrap_or(i64::MAX)
+    }
+
+    /// Whether one order of `qty_1e6` units and `notional_1e6` dollars
+    /// is inside `caps`, in whichever unit that venue is capped in.
+    ///
+    /// A venue capped in the OTHER unit refuses — a `0` there means
+    /// "this unit does not apply here", never "unlimited", and reading
+    /// it as unlimited is the one mistake this shape exists to prevent.
+    #[inline]
+    #[must_use]
+    pub fn size_ok(caps: super::VenueCaps, qty_1e6: i64, notional_1e6: i64) -> bool {
+        let q = qty_1e6.unsigned_abs();
+        if caps.leg_qty_1e6 > 0 {
+            return q <= caps.leg_qty_1e6.unsigned_abs()
+                && q <= caps.sym_qty_1e6.unsigned_abs();
+        }
+        if caps.leg_usd_1e6 > 0 {
+            return notional_1e6 <= caps.leg_usd_1e6 && notional_1e6 <= caps.sym_usd_1e6;
+        }
+        false
+    }
+}
+
 // ---------------------------------------------------------------
 // CooldownGate — shared helper for per-slot emit cooldowns
 // ---------------------------------------------------------------

@@ -48,12 +48,12 @@ pub const INSTRUMENT_MANIFEST_FILE: &str = "instrument-manifest.tsv";
 /// (each already in allocation order). Empty when no options were
 /// selected — callers skip the write then.
 pub fn render(
-    deribit: &[(String, SymbolId)],
+    deribit: &[crate::paper::DiscoveredOption],
     okx: &[(String, SymbolId)],
     bn: &[(String, SymbolId, u8)],
 ) -> String {
     let mut out = String::new();
-    for (name, sym) in deribit {
+    for (name, sym, ..) in deribit {
         push_row(&mut out, "deribit", *sym, name);
     }
     for (name, sym) in okx {
@@ -71,7 +71,7 @@ pub fn render(
 /// the worker namespaces). Emission order = allocation order.
 pub fn render_instruments(
     allocated: &AllocatedUniverse,
-    deribit_opts: &[(String, SymbolId)],
+    deribit_opts: &[crate::paper::DiscoveredOption],
     okx_opts: &[(String, SymbolId)],
     bn_opts: &[(String, SymbolId, u8)],
 ) -> String {
@@ -110,7 +110,7 @@ pub fn render_instruments(
     for i in &allocated.bybit_linear {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
-    for (name, sym) in deribit_opts {
+    for (name, sym, ..) in deribit_opts {
         let desc = format!("deribit:{name}");
         push_desc_row(&mut out, *sym, &desc);
     }
@@ -135,7 +135,7 @@ pub fn render_instruments(
 #[allow(clippy::too_many_arguments)]
 pub fn build_descriptor_entries(
     allocated: &AllocatedUniverse,
-    deribit_opts: &[(String, SymbolId)],
+    deribit_opts: &[crate::paper::DiscoveredOption],
     okx_opts: &[(String, SymbolId)],
     bn_opts: &[(String, SymbolId, u8)],
     okx_depth: bool,
@@ -169,7 +169,7 @@ pub fn build_descriptor_entries(
     {
         push(i.descriptor.clone(), i.sym);
     }
-    for (name, sym) in deribit_opts {
+    for (name, sym, ..) in deribit_opts {
         push(format!("deribit:{name}"), *sym);
     }
     for (name, sym) in okx_opts {
@@ -209,8 +209,20 @@ mod tests {
     #[test]
     fn renders_all_three_venues_in_allocation_order() {
         let deribit = vec![
-            ("BTC-27MAR26-100000-C".to_string(), 0x0300_0201u32),
-            ("BTC-27MAR26-100000-P".to_string(), 0x0300_0202u32),
+            (
+                "BTC-27MAR26-100000-C".to_string(),
+                0x0300_0201u32,
+                100_000_000_000_000i64,
+                1_774_598_400_000i64,
+                opt_registry::RIGHT_CALL,
+            ),
+            (
+                "BTC-27MAR26-100000-P".to_string(),
+                0x0300_0202u32,
+                100_000_000_000_000i64,
+                1_774_598_400_000i64,
+                opt_registry::RIGHT_PUT,
+            ),
         ];
         let okx = vec![("BTC-USD-260327-100000-C".to_string(), 0x0200_0201u32)];
         let bn = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
@@ -271,7 +283,13 @@ mod tests {
             name: "ADAUSDT".to_string(),
             descriptor: "bybit-linear:ADAUSDT".to_string(),
         });
-        let deribit_opts = vec![("BTC-27MAR26-100000-C".to_string(), 0x0300_0201u32)];
+        let deribit_opts = vec![(
+            "BTC-27MAR26-100000-C".to_string(),
+            0x0300_0201u32,
+            100_000_000_000_000i64,
+            1_774_598_400_000i64,
+            opt_registry::RIGHT_CALL,
+        )];
         let bn_opts = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
         let body = render_instruments(&alloc, &deribit_opts, &[], &bn_opts);
         let want = format!(

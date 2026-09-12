@@ -310,6 +310,64 @@ fn finish_instrument(
     Ok(inst)
 }
 
+/// P5: the ONE single-section key/value loop, beside the `strip_comment`
+/// / `parse_value` primitives every config in this crate already shares.
+///
+/// Parses a file that is exactly one `[section]` of known keys and
+/// returns its `(key, value, line)` triples in file order. Refuses an
+/// unknown section, a second copy of the section, a key before the
+/// header, an unknown key and a duplicate key — a config that is wrong
+/// must not boot half-read.
+///
+/// Lives here rather than in the caller because this is the shape every
+/// single-section config in the tree has; `vrp.rs` had the only copy.
+pub(crate) fn parse_single_section(
+    src: &str,
+    section: &str,
+    keys: &[&str],
+) -> Result<Vec<(String, Value, usize)>, IcdpError> {
+    let mut kv: Vec<(String, Value, usize)> = Vec::new();
+    let mut in_section = false;
+    for (i, raw) in src.lines().enumerate() {
+        let ln = i + 1;
+        let line = strip_comment(raw);
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[') {
+            let name = name
+                .strip_suffix(']')
+                .ok_or_else(|| IcdpError(format!("line {ln}: unterminated section header")))?;
+            if name != section {
+                return Err(IcdpError(format!("line {ln}: unknown section `[{name}]`")));
+            }
+            if in_section {
+                return Err(IcdpError(format!("line {ln}: duplicate `[{section}]`")));
+            }
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            return Err(IcdpError(format!("line {ln}: key outside `[{section}]`")));
+        }
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| IcdpError(format!("line {ln}: expected `key = value`")))?;
+        let k = k.trim().to_owned();
+        if !keys.contains(&k.as_str()) {
+            return Err(IcdpError(format!("line {ln}: unknown key `{k}`")));
+        }
+        if kv.iter().any(|(existing, _, _)| *existing == k) {
+            return Err(IcdpError(format!("line {ln}: duplicate key `{k}`")));
+        }
+        kv.push((k, parse_value(v, ln)?, ln));
+    }
+    if !in_section {
+        return Err(IcdpError(format!("missing `[{section}]` section")));
+    }
+    Ok(kv)
+}
+
 /// Parse the artifact text.
 pub fn parse(src: &str) -> Result<IcdpFile, IcdpError> {
     #[derive(PartialEq, Eq)]

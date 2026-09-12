@@ -503,12 +503,17 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 // be built for it — so the chain row count is printed
                 // and a campaign on a missing expiry simply never
                 // selects.
-                let chain: Vec<(String, core_types::SymbolId)> = super::read_manifest_rows(
+                // P5.2: a capture's options manifest carries the
+                // instrument NAME and nothing else, so the registry
+                // builds these rows by parsing it — zeros here are
+                // "discovery told us nothing", which is the truth
+                // offline, and `rows_from_name` counts them.
+                let chain: Vec<crate::paper::DiscoveredOption> = super::read_manifest_rows(
                     &runs[runs.len() - 1].path,
                 )
                 .into_iter()
                 .filter(|(_, d)| d.starts_with("deribit:"))
-                .map(|(sym, d)| (d, sym))
+                .map(|(sym, d)| (d, sym, 0i64, 0i64, 0u8))
                 .collect();
                 let seed = match spec.vrp_seed.clone() {
                     Some(p) => Some(p),
@@ -556,13 +561,15 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     .on_start(&mut ctx)
                     .map_err(|e| HarnessError::Internal(format!("vrp on_start failed: {e}")))?;
                 let line = format!(
-                    "member: vrp params={} hash={} chain_rows={} chain_refused={} seed={} \
+                    "member: vrp params={} hash={} chain_rows={} chain_refused={} \
+                     chain_from_name={} seed={} \
                      seed_pairs={} pairs={} window_minutes={} warm={} tau_ns={} theta_1e9={} \
                      sides={} root=run-dirs (Q3) anchor=wall (identity)",
                     spec.params.display(),
                     hash_hex,
                     boot.registry.len(),
                     boot.rows_refused,
+                    boot.rows_from_name,
                     boot.seed_path.display(),
                     boot.pairs_from_seed,
                     strat.n_pairs(),

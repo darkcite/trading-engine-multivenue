@@ -6,6 +6,75 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — VRP config errors stop blaming `icdp.toml`; the live chain stops parsing instrument names (VRP P5)
+
+**What changed**
+
+- **OPERATOR-VISIBLE — every VRP config refusal named the wrong file.**
+  `core_config::vrp::VrpError` was `pub type VrpError = IcdpError`, and
+  `IcdpError`'s `Display` writes `"icdp.toml: {msg}"`. So a bad
+  `vrp.toml`, `vrp-seed.tsv` or `vrp-state.tsv` refused the boot with a
+  message pointing an operator at a file they had not touched. It is now
+  its own newtype and its messages read `vrp: line 12: unknown key
+  ...`. The message BODIES are unchanged, and `VrpError(pub String)`
+  keeps the `.0` field callers and tests already use.
+
+- **The live boot no longer parses option instrument NAMES.**
+  `boot_discovery::Outcome::deribit_options` was
+  `Vec<(String, SymbolId)>`; it is now `cli::paper::DiscoveredOption =
+  (String, SymbolId, strike_1e9, expiration_ts_ms, right)`. Discovery
+  already parsed those three numbers out of the venue's REST JSON and
+  threw them away, and `vrp_boot::build_registry` then recovered them by
+  taking the instrument name apart again — two laws for one fact, one of
+  them a string parser. The registry now uses the venue's numbers
+  through `OptInstrument::from_discovery` and falls back to the name
+  parser ONLY when a field is absent, counting those rows.
+  - `build_registry` returns `(registry, refused, rows_from_name)`.
+  - `VrpBoot` gains `rows_from_name`; the boot tell gains
+    `chain_rows_from_name` and `backtest --member vrp` gains
+    `chain_from_name=`.
+  - **Expect `chain_rows_from_name=0` on a live boot.** Non-zero there
+    means discovery dropped fields it used to carry. Offline it equals
+    the chain length by design: a capture's options manifest holds names
+    and nothing else, so the harness keeps the name parser.
+  - A field that is PRESENT and unrepresentable is a REFUSAL, not a
+    reason to fall back — `from_discovery` refuses a row rather than
+    rounding it, and quietly rebuilding that row from its name would
+    defeat the check.
+
+**De-duplication (no behaviour change; each item is byte-identical by
+construction)**
+
+- The minute roll is `core_time::BarClock` at `tf = 60 s`, `delta = 0`.
+  `bar_id(mono)` IS `anchor.wall_of(mono) / MINUTE_NS`, the division the
+  member spelled out; `the_bar_clock_roll_is_the_division_it_replaces`
+  pins the two over a full day of instants either side of every
+  boundary, because a roll that moved by one would re-key every `R` row
+  in `vrp-state.tsv` against the worker's seed.
+- `notional_1e6` / `size_ok` move from `VrpStrategy` to
+  `strategy_core::risk`, beside the caps table they read. icdp's config
+  leg check calls `size_ok` instead of comparing by hand — strictly
+  stronger, since the per-SYMBOL cap is now checked too.
+- `intrinsic_1e6` moves to `opt_registry`. It had two verbatim copies:
+  the member's and `OptSettleRef::value_1e6`'s body. The harness reaches
+  it there without depending on a strategy crate, which is why the copy
+  existed.
+- `backtest::opt::quote_px_usd_1e6` is now
+  `coin_to_usd_1e6(px_1e6 × 1000, u, cs)` — ONE conversion in the tree.
+  The wrapper carries the three orders of magnitude between a quote
+  price (coin ×1e6) and a mark (coin ×1e9), checked, so a corrupt
+  capture still yields `None`.
+- The single-section TOML loop is `icdp::parse_single_section(src,
+  section, keys)`, beside the `strip_comment` / `parse_value` primitives
+  every config in the crate already shares. `vrp.rs` held the only copy;
+  every message it produced is unchanged with `vrp` substituted for the
+  section name.
+
+**No action required.** Nothing here changes a decision, a price or a
+fill. The one thing to watch after the next restart is
+`chain_rows_from_name` in the `vrp: artifact configured` tell: it should
+read 0.
+
 ## 2026-09-12 — the VRP decision moves to a regime-corrected band, a median IV and a cost-aware θ; settlement moves to the venue's delivery TWAP (VRP P4 / R3, R5, R6, R7)
 
 **What changed**

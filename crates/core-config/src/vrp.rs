@@ -44,7 +44,7 @@
 
 use std::path::Path;
 
-use super::icdp::{parse_int, parse_value, strip_comment, IcdpError, Value};
+use super::icdp::{parse_int, parse_single_section, IcdpError, Value};
 
 /// Hard ceiling on `qty_1e6`: one contract ×1e6 — which is also exactly
 /// the Deribit per-order cap after the operator's 2026-09-10 amendment
@@ -54,16 +54,36 @@ use super::icdp::{parse_int, parse_value, strip_comment, IcdpError, Value};
 /// a counted refusal at every decision for the rest of the day.
 pub const VRP_QTY_MAX_1E6: i64 = 1_000_000;
 
-/// Parse / load failure. Reuses [`IcdpError`]'s shape so the two
-/// artifacts report identically; the message names the file.
-pub type VrpError = IcdpError;
+/// Parse / load failure for every VRP config surface — `vrp.toml`,
+/// `vrp-seed.tsv` and `vrp-state.tsv`.
+///
+/// P5: its OWN type. It used to be `pub type VrpError = IcdpError`, and
+/// `IcdpError`'s `Display` writes `"icdp.toml: {msg}"` — so every VRP
+/// config refusal an operator ever read named the wrong file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VrpError(pub String);
 
-/// Build a [`VrpError`]. A type alias cannot be a tuple constructor, and
-/// a second error enum for the same failure mode would be a second thing
-/// to keep in sync.
-#[inline]
+impl ::core::fmt::Display for VrpError {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        write!(f, "vrp: {}", self.0)
+    }
+}
+
+impl std::error::Error for VrpError {}
+
+impl From<IcdpError> for VrpError {
+    /// The shared TOML primitives (`parse_value`, `parse_int`,
+    /// `parse_single_section`) speak `IcdpError`; nothing they say is
+    /// icdp-specific, so their messages carry across unchanged and only
+    /// the file name in front of them changes.
+    fn from(e: IcdpError) -> Self {
+        Self(e.0)
+    }
+}
+
+/// Build a [`VrpError`] from an owned message.
 fn err(msg: String) -> VrpError {
-    IcdpError(msg)
+    VrpError(msg)
 }
 
 /// The parsed artifact.
@@ -284,45 +304,10 @@ fn take_str(kv: &[(String, Value, usize)], key: &str) -> Result<String, VrpError
 /// duplicate keys, a float anywhere, or a `tau_ns` the evidence does not
 /// support are all FATAL.
 pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
-    let mut kv: Vec<(String, Value, usize)> = Vec::new();
-    let mut in_section = false;
-    for (i, raw) in src.lines().enumerate() {
-        let ln = i + 1;
-        let line = strip_comment(raw);
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(name) = line.strip_prefix('[') {
-            let name = name
-                .strip_suffix(']')
-                .ok_or_else(|| err(format!("line {ln}: unterminated section header")))?;
-            if name != "vrp" {
-                return Err(err(format!("line {ln}: unknown section `[{name}]`")));
-            }
-            if in_section {
-                return Err(err(format!("line {ln}: duplicate `[vrp]`")));
-            }
-            in_section = true;
-            continue;
-        }
-        if !in_section {
-            return Err(err(format!("line {ln}: key outside `[vrp]`")));
-        }
-        let (k, v) = line
-            .split_once('=')
-            .ok_or_else(|| err(format!("line {ln}: expected `key = value`")))?;
-        let k = k.trim().to_owned();
-        if !VRP_KEYS.contains(&k.as_str()) {
-            return Err(err(format!("line {ln}: unknown key `{k}`")));
-        }
-        if kv.iter().any(|(existing, _, _)| *existing == k) {
-            return Err(err(format!("line {ln}: duplicate key `{k}`")));
-        }
-        kv.push((k, parse_value(v, ln)?, ln));
-    }
-    if !in_section {
-        return Err(err("missing `[vrp]` section".to_owned()));
-    }
+    // P5: the single-section loop is shared (`icdp::parse_single_section`)
+    // — every message it produces is the one this function produced
+    // before, with `vrp` substituted for the section name.
+    let kv = parse_single_section(src, "vrp", &VRP_KEYS)?;
 
     let file = VrpFile {
         theta_1e9: take_int(&kv, "theta_1e9")?,

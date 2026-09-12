@@ -127,7 +127,7 @@
     clippy::missing_safety_doc
 )]
 
-use core_time::{NsTs, WallAnchor};
+use core_time::{BarClock, NsTs, WallAnchor};
 use core_types::{
     Order, Price, Qty, RegimeLabelSet, Side, SymbolId, Tick, VenueId, OPT_SUMMARY_FLAG_MARK_PX,
     SYMBOL_ID_NONE,
@@ -514,6 +514,12 @@ pub struct VrpStrategy {
     registry: OptRegistry,
     params: VrpParams,
     anchor: WallAnchor,
+    /// P5: the minute grid the close law rolls on — `BarClock` at
+    /// `tf = 60 s`, `delta = 0`. `bar_id(mono)` IS
+    /// `anchor.wall_of(mono) / MINUTE_NS`, the division this member used
+    /// to spell out, so the roll is byte-identical and there is one
+    /// bar-grid law in the tree instead of two.
+    bar: BarClock,
     /// SHA-256 of the `vrp.toml` bytes this member booted with.
     hash: [u8; 32],
 
@@ -675,6 +681,7 @@ impl VrpStrategy {
             registry: OptRegistry::new(),
             params: VrpParams::default(),
             anchor: WallAnchor::new(0, 0),
+            bar: BarClock::new(WallAnchor::new(0, 0), MINUTE_NS, 0),
             hash: [0; 32],
             underlying_sym: SYMBOL_ID_NONE,
             hedge_sym: SYMBOL_ID_NONE,
@@ -771,6 +778,7 @@ impl VrpStrategy {
         self.underlying_sym = underlying_sym;
         self.hedge_sym = hedge_sym;
         self.anchor = anchor;
+        self.bar = BarClock::new(anchor, MINUTE_NS, 0);
         self.hash = hash;
         self.configured = true;
         Ok(())
@@ -1212,36 +1220,6 @@ impl VrpStrategy {
         core_regime::math::floor_div(t, 1_000_000_000) as i64
     }
 
-    /// USD ×1e6 notional of `qty_1e6` units at `px_1e6`. `i128`
-    /// intermediate, saturating — a notional that cannot be represented
-    /// is treated as infinite, which refuses rather than admits.
-    #[inline]
-    #[must_use]
-    pub fn notional_1e6(px_1e6: i64, qty_1e6: i64) -> i64 {
-        let n = (px_1e6 as i128 * qty_1e6.unsigned_abs() as i128) / 1_000_000;
-        i64::try_from(n).unwrap_or(i64::MAX)
-    }
-
-    /// Whether one order of `qty_1e6` units and `notional_1e6` dollars
-    /// is inside `caps`, in whichever unit that venue is capped in.
-    ///
-    /// A venue capped in the OTHER unit refuses — a `0` there means
-    /// "this unit does not apply here", never "unlimited", and reading
-    /// it as unlimited is the one mistake this shape exists to prevent.
-    #[inline]
-    #[must_use]
-    pub fn size_ok(caps: strategy_core::VenueCaps, qty_1e6: i64, notional_1e6: i64) -> bool {
-        let q = qty_1e6.unsigned_abs();
-        if caps.leg_qty_1e6 > 0 {
-            return q <= caps.leg_qty_1e6.unsigned_abs()
-                && q <= caps.sym_qty_1e6.unsigned_abs();
-        }
-        if caps.leg_usd_1e6 > 0 {
-            return notional_1e6 <= caps.leg_usd_1e6 && notional_1e6 <= caps.sym_usd_1e6;
-        }
-        false
-    }
-
     /// Whether a hedge move is worth paying the spread for.
     #[inline]
     #[must_use]
@@ -1562,7 +1540,7 @@ impl VrpStrategy {
         // 0.19-coin order. A genuine reduction can never exceed the
         // position it unwinds, so an unconditional test on `delta`
         // cannot block an exit.
-        if !Self::size_ok(caps, delta, Self::notional_1e6(px, delta)) {
+        if !strategy_core::risk::size_ok(caps, delta, strategy_core::risk::notional_1e6(px, delta)) {
             self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
             return false;
         }
@@ -1572,9 +1550,9 @@ impl VrpStrategy {
         // where `exit_position` is exempt).
         let grows = target_1e6.unsigned_abs() > self.perp_pos_qty_1e6.unsigned_abs();
         if grows {
-            let hedge_notional = Self::notional_1e6(px, target_1e6);
-            let opt_notional = Self::notional_1e6(self.last_mark.px_usd_1e6, self.opt_pos_qty_1e6);
-            if !Self::size_ok(caps, target_1e6, hedge_notional)
+            let hedge_notional = strategy_core::risk::notional_1e6(px, target_1e6);
+            let opt_notional = strategy_core::risk::notional_1e6(self.last_mark.px_usd_1e6, self.opt_pos_qty_1e6);
+            if !strategy_core::risk::size_ok(caps, target_1e6, hedge_notional)
                 || hedge_notional.saturating_add(opt_notional) > caps.table_usd_1e6
             {
                 self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
@@ -1910,23 +1888,6 @@ impl VrpStrategy {
         self.settle_twap.sum_dt = self.settle_twap.sum_dt.saturating_add(dt);
     }
 
-    /// European cash settlement value of one unit at index `s_1e6`:
-    /// `max(0, S − K)` for a call, `max(0, K − S)` for a put.
-    #[inline]
-    #[must_use]
-    pub const fn intrinsic_1e6(s_1e6: i64, strike_1e6: i64, right: u8) -> i64 {
-        let v = if right == RIGHT_CALL {
-            s_1e6 - strike_1e6
-        } else {
-            strike_1e6 - s_1e6
-        };
-        if v > 0 {
-            v
-        } else {
-            0
-        }
-    }
-
     /// VX: the European cash settle. Returns true when the campaign
     /// ended here.
     ///
@@ -1956,7 +1917,7 @@ impl VrpStrategy {
             return false;
         };
         let value_1e6 =
-            Self::intrinsic_1e6(s_1e6, self.selected_strike_1e6, self.selected_right);
+            opt_registry::intrinsic_1e6(s_1e6, self.selected_strike_1e6, self.selected_right);
         if self.opt_pos_qty_1e6 != 0 {
             if self.selected_sym == SYMBOL_ID_NONE {
                 // The contract has rolled off the chain, so there is no
@@ -2330,12 +2291,12 @@ impl VrpStrategy {
         // entry is legal only if the position it commits us to is still
         // legal at Δ = 1 — where the hedge is exactly `qty_1e6` coins.
         let underlying_1e6 = self.last_mark.underlying_px_1e9 / 1_000;
-        let opt_notional = Self::notional_1e6(self.last_mark.px_usd_1e6, qty);
-        let hedge_worst_1e6 = Self::notional_1e6(underlying_1e6, self.params.qty_1e6);
+        let opt_notional = strategy_core::risk::notional_1e6(self.last_mark.px_usd_1e6, qty);
+        let hedge_worst_1e6 = strategy_core::risk::notional_1e6(underlying_1e6, self.params.qty_1e6);
         let opt_caps = strategy_core::caps_for_sym(self.selected_sym);
         let hedge_caps = strategy_core::caps_for_sym(self.hedge_sym);
-        if !Self::size_ok(opt_caps, self.params.qty_1e6, opt_notional)
-            || !Self::size_ok(hedge_caps, self.params.qty_1e6, hedge_worst_1e6)
+        if !strategy_core::risk::size_ok(opt_caps, self.params.qty_1e6, opt_notional)
+            || !strategy_core::risk::size_ok(hedge_caps, self.params.qty_1e6, hedge_worst_1e6)
             || opt_notional.saturating_add(hedge_worst_1e6) > hedge_caps.table_usd_1e6
         {
             self.counters.caps_rejected = self.counters.caps_rejected.wrapping_add(1);
@@ -2668,7 +2629,7 @@ impl Strategy for VrpStrategy {
             // Integer mid, floored — the same mid the ICDP feature law
             // and the regime law use.
             let mid = (bid + ask) >> 1;
-            let minute = wall_ns / MINUTE_NS;
+            let minute = self.bar.bar_id(now);
             if self.minute_id == 0 {
                 self.minute_id = minute;
                 self.last_underlying_mid_1e6 = mid;
@@ -3908,17 +3869,17 @@ mod tests {
 
     #[test]
     fn the_notional_helper_saturates_rather_than_wraps() {
-        assert_eq!(VrpStrategy::notional_1e6(300_200_000, 100_000), 30_020_000);
-        assert_eq!(VrpStrategy::notional_1e6(79_000_000_000, 100_000), 7_900_000_000);
+        assert_eq!(strategy_core::risk::notional_1e6(300_200_000, 100_000), 30_020_000);
+        assert_eq!(strategy_core::risk::notional_1e6(79_000_000_000, 100_000), 7_900_000_000);
         // Sign of the quantity is irrelevant — a short is as much
         // notional as a long.
         assert_eq!(
-            VrpStrategy::notional_1e6(79_000_000_000, -100_000),
+            strategy_core::risk::notional_1e6(79_000_000_000, -100_000),
             7_900_000_000
         );
         // A notional that cannot be represented reads as infinite, so a
         // cap test refuses rather than admits.
-        assert_eq!(VrpStrategy::notional_1e6(i64::MAX, i64::MAX), i64::MAX);
+        assert_eq!(strategy_core::risk::notional_1e6(i64::MAX, i64::MAX), i64::MAX);
     }
 
     #[test]
@@ -3934,10 +3895,10 @@ mod tests {
         assert_eq!(caps.sym_qty_1e6, 1_000_000);
         assert_eq!(caps.leg_usd_1e6, 0, "Deribit is size-capped, not notional-capped");
         for idx in [50_000_000_000i64, 79_000_000_000, 250_000_000_000] {
-            let n = VrpStrategy::notional_1e6(idx, p.qty_1e6);
-            assert!(VrpStrategy::size_ok(caps, p.qty_1e6, n), "one coin fits at ${idx}");
+            let n = strategy_core::risk::notional_1e6(idx, p.qty_1e6);
+            assert!(strategy_core::risk::size_ok(caps, p.qty_1e6, n), "one coin fits at ${idx}");
             assert!(
-                !VrpStrategy::size_ok(caps, p.qty_1e6 + 1, n),
+                !strategy_core::risk::size_ok(caps, p.qty_1e6 + 1, n),
                 "a hair over one coin does not, at ${idx}"
             );
         }
@@ -3945,8 +3906,8 @@ mod tests {
         let base = strategy_core::caps_for_venue(VenueId::Binance as u8);
         assert_eq!(base.leg_usd_1e6, 10_000_000_000);
         assert_eq!(base.leg_qty_1e6, 0, "size-capping is Deribit-only");
-        assert!(VrpStrategy::size_ok(base, 999, 10_000_000_000));
-        assert!(!VrpStrategy::size_ok(base, 999, 10_000_000_001));
+        assert!(strategy_core::risk::size_ok(base, 999, 10_000_000_000));
+        assert!(!strategy_core::risk::size_ok(base, 999, 10_000_000_001));
     }
 
     #[test]
@@ -3959,8 +3920,8 @@ mod tests {
             sym_qty_1e6: 0,
             table_usd_1e6: 0,
         };
-        assert!(!VrpStrategy::size_ok(neither, 1, 1));
-        assert!(!VrpStrategy::size_ok(neither, 0, 0));
+        assert!(!strategy_core::risk::size_ok(neither, 1, 1));
+        assert!(!strategy_core::risk::size_ok(neither, 0, 0));
     }
 
     #[test]
@@ -4015,7 +3976,7 @@ mod tests {
         let h = ctx.orders[1];
         let caps = strategy_core::caps_for_sym(perp_sym());
         assert!(
-            VrpStrategy::size_ok(caps, h.qty.raw(), VrpStrategy::notional_1e6(h.px.raw(), h.qty.raw())),
+            strategy_core::risk::size_ok(caps, h.qty.raw(), strategy_core::risk::notional_1e6(h.px.raw(), h.qty.raw())),
             "hedge of {} over the cap",
             h.qty.raw()
         );
@@ -4111,12 +4072,12 @@ mod tests {
         // expiry, which is the whole point of settling rather than
         // marking.
         let k = 79_000_000_000i64;
-        assert_eq!(VrpStrategy::intrinsic_1e6(80_000_000_000, k, RIGHT_CALL), 1_000_000_000);
-        assert_eq!(VrpStrategy::intrinsic_1e6(78_000_000_000, k, RIGHT_CALL), 0);
-        assert_eq!(VrpStrategy::intrinsic_1e6(k, k, RIGHT_CALL), 0, "ATM is worthless");
-        assert_eq!(VrpStrategy::intrinsic_1e6(78_000_000_000, k, RIGHT_PUT), 1_000_000_000);
-        assert_eq!(VrpStrategy::intrinsic_1e6(80_000_000_000, k, RIGHT_PUT), 0);
-        assert_eq!(VrpStrategy::intrinsic_1e6(k, k, RIGHT_PUT), 0);
+        assert_eq!(opt_registry::intrinsic_1e6(80_000_000_000, k, RIGHT_CALL), 1_000_000_000);
+        assert_eq!(opt_registry::intrinsic_1e6(78_000_000_000, k, RIGHT_CALL), 0);
+        assert_eq!(opt_registry::intrinsic_1e6(k, k, RIGHT_CALL), 0, "ATM is worthless");
+        assert_eq!(opt_registry::intrinsic_1e6(78_000_000_000, k, RIGHT_PUT), 1_000_000_000);
+        assert_eq!(opt_registry::intrinsic_1e6(80_000_000_000, k, RIGHT_PUT), 0);
+        assert_eq!(opt_registry::intrinsic_1e6(k, k, RIGHT_PUT), 0);
     }
 
     /// Drive a campaign to a held position and then jump straight past
@@ -5378,6 +5339,63 @@ mod tests {
 
     /// The §3.3 train-only fast-profile `vol:high` coefficient.
     const OFF_FAST_HIGH_1E9: i64 = -99_000_000;
+
+    // ---------------- P5: the shared helpers ----------------
+
+    #[test]
+    fn the_bar_clock_roll_is_the_division_it_replaces() {
+        // P5.1: `BarClock::bar_id` at tf = 60 s, delta = 0 IS
+        // `anchor.wall_of(mono) / MINUTE_NS`. Pinned over a whole day of
+        // instants either side of every boundary, because a minute roll
+        // that moved by one would re-key every `R` row in
+        // `vrp-state.tsv` against the worker's seed.
+        let anchor = WallAnchor::new(MONO0, WALL0);
+        let bar = BarClock::new(anchor, MINUTE_NS, 0);
+        let mut k = 0u64;
+        while k < 1_440 {
+            for off in [0u64, 1, MINUTE_NS / 2, MINUTE_NS - 1] {
+                let wall = WALL0 + k * MINUTE_NS + off;
+                let mono = mono_of(wall);
+                assert_eq!(
+                    bar.bar_id(mono),
+                    anchor.wall_of(mono) / MINUTE_NS,
+                    "wall {wall}"
+                );
+            }
+            k += 1;
+        }
+    }
+
+    #[test]
+    fn the_shared_risk_helpers_are_the_ones_the_member_uses() {
+        // P5.3: `notional_1e6` / `size_ok` moved to `strategy_core::risk`
+        // whole. A Deribit sym is QTY-capped, so its notional does not
+        // gate; a base-venue sym is USD-capped, so its qty does not.
+        let deribit = strategy_core::caps_for_sym(perp_sym());
+        assert!(deribit.leg_qty_1e6 > 0 && deribit.leg_usd_1e6 == 0);
+        assert!(strategy_core::risk::size_ok(deribit, 1_000_000, i64::MAX));
+        assert!(!strategy_core::risk::size_ok(deribit, 1_000_001, 0));
+        // A cap of 0 in a unit means "not expressed here", never
+        // "unlimited" — the one mistake the shape exists to prevent.
+        let neither = strategy_core::VenueCaps {
+            leg_usd_1e6: 0,
+            leg_qty_1e6: 0,
+            sym_usd_1e6: 0,
+            sym_qty_1e6: 0,
+            table_usd_1e6: 0,
+        };
+        assert!(!strategy_core::risk::size_ok(neither, 1, 1));
+        // Notional saturates rather than wrapping: unrepresentable is
+        // INFINITE, which refuses.
+        assert_eq!(
+            strategy_core::risk::notional_1e6(300_200_000, 100_000),
+            30_020_000
+        );
+        assert_eq!(
+            strategy_core::risk::notional_1e6(i64::MAX, i64::MAX),
+            i64::MAX
+        );
+    }
 
     // ---------------- R6: the median implied vol ----------------
 

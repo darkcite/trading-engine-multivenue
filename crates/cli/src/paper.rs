@@ -1217,6 +1217,19 @@ pub fn build_deribit_symbol_table(
     Ok(table)
 }
 
+/// P5.2: one selected Deribit option as DISCOVERY saw it — the
+/// instrument name, the sym this boot allocated for it, and the venue's
+/// own numeric terms: `strike` ×1e9, `expiration_timestamp` in ms, and
+/// [`opt_registry::RIGHT_CALL`] / [`opt_registry::RIGHT_PUT`].
+///
+/// The terms ride along because the boot already parsed them out of the
+/// venue's REST JSON; without them `vrp_boot::build_registry` has to
+/// parse the instrument NAME back apart to recover the same three
+/// numbers, which is a second law for one fact. Offline surfaces (the
+/// harness, `audit-pnl`) still parse the name, because a capture's
+/// options manifest carries names and nothing else.
+pub type DiscoveredOption = (String, core_types::SymbolId, i64, i64, u8);
+
 /// M2.1: append the discovered capped options chain to a Deribit
 /// symbol table (after every static insert; quote-only subscription
 /// rows). `pairs` comes from `boot_discovery::Outcome::deribit_options`
@@ -1225,9 +1238,9 @@ pub fn build_deribit_symbol_table(
 /// contract violation) and on the options-block cap.
 pub fn extend_deribit_table_with_options(
     table: &mut ingress_deribit::DeribitSymbolTable,
-    pairs: &[(String, core_types::SymbolId)],
+    pairs: &[DiscoveredOption],
 ) -> Result<(), &'static str> {
-    for (name, sym) in pairs {
+    for (name, sym, ..) in pairs {
         if table.lookup(name.as_bytes()).is_some() {
             return Err("deribit: duplicate instrument in discovered options chain");
         }
@@ -2508,6 +2521,11 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             hash = %format_hex32(&boot.hash),
             chain_rows = boot.registry.len(),
             chain_rows_refused = boot.rows_refused,
+            // P5.2: 0 on a live boot — the venue's own strike and
+            // expiry travel with the sym. Non-zero means discovery
+            // dropped fields it used to carry and the chain was rebuilt
+            // by parsing instrument names.
+            chain_rows_from_name = boot.rows_from_name,
             seed_pairs = set.vrp().n_pairs(),
             tau_ns = boot.params.tau_ns,
             theta_1e9 = boot.params.theta_1e9,
@@ -5831,7 +5849,7 @@ pub mod boot_discovery {
         /// [`OPT_ORDINAL_BASE`]). Empty when the policy is disabled.
         /// The bin appends these to the deribit symbol table via
         /// `insert_option` (quote-only subscription).
-        pub deribit_options: Vec<(String, SymbolId)>,
+        pub deribit_options: Vec<super::DiscoveredOption>,
         /// Hyperliquid coverage; `None` when `--hl-coins` is unset.
         /// Hyperliquid's coin table is still built by
         /// [`super::build_hl_coin_table`] exactly as before.
@@ -6323,13 +6341,13 @@ pub mod boot_discovery {
         policy: &OptionsPolicy,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
-    ) -> Result<Vec<(String, SymbolId)>, &'static str> {
+    ) -> Result<Vec<super::DiscoveredOption>, &'static str> {
         let (host, port) = split_host_port(&cfg.deribit_rest_host, 443)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let mut out: Vec<(String, SymbolId)> = Vec::new();
+        let mut out: Vec<super::DiscoveredOption> = Vec::new();
         let mut k = 0u32;
         for ccy in &policy.underlyings {
             // Venue rate-limits public/get_* to 1 req/s — pace before
@@ -6381,7 +6399,22 @@ pub mod boot_discovery {
                     .map_err(|_| "deribit: non-utf8 option instrument name")?;
                 let sym = make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + k + 1);
                 k += 1;
-                out.push((name.to_string(), sym));
+                // P5.2: the venue's OWN numeric terms travel with the
+                // name. They were parsed out of this row's REST JSON a
+                // moment ago and thrown away, and the VRP boot then
+                // re-derived them by parsing the name back apart — two
+                // laws for one fact, one of them a string parser.
+                out.push((
+                    name.to_string(),
+                    sym,
+                    row.strike_1e9,
+                    row.expiration_ts_ms,
+                    if row.is_call {
+                        opt_registry::RIGHT_CALL
+                    } else {
+                        opt_registry::RIGHT_PUT
+                    },
+                ));
             }
             tracing::info!(
                 venue = "deribit",
@@ -7682,10 +7715,16 @@ mod tests {
             (
                 "BTC-27MAR26-100000-C".to_string(),
                 make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 1),
+                100_000_000_000_000i64,
+                1_774_598_400_000i64,
+                opt_registry::RIGHT_CALL,
             ),
             (
                 "BTC-27MAR26-100000-P".to_string(),
                 make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 2),
+                100_000_000_000_000i64,
+                1_774_598_400_000i64,
+                opt_registry::RIGHT_PUT,
             ),
         ];
         extend_deribit_table_with_options(&mut t, &pairs).unwrap();
@@ -7709,11 +7748,14 @@ mod tests {
             Some("deribit: duplicate instrument in discovered options chain")
         );
         // Options-block cap refuses boot with the actionable message.
-        let mut big: Vec<(String, core_types::SymbolId)> = Vec::new();
+        let mut big: Vec<DiscoveredOption> = Vec::new();
         for i in 0..ingress_deribit::DERIBIT_OPT_MAX {
             big.push((
                 format!("X{i}-C"),
                 make_symbol_id(VenueId::Deribit, OPT_ORDINAL_BASE + 100 + i as u32),
+                100_000_000_000_000i64,
+                1_774_598_400_000i64,
+                opt_registry::RIGHT_CALL,
             ));
         }
         let e = extend_deribit_table_with_options(&mut t, &big)

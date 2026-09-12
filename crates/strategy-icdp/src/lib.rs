@@ -464,7 +464,16 @@ impl IcdpStrategy {
                     "icdp: this venue is size-capped, not notional-capped — icdp sizes in USD",
                 ));
             }
-            if p.notional_1e6 <= 0 || p.notional_1e6 > caps.leg_usd_1e6 {
+            // P5: the ONE order-size law. The qty argument is 0
+            // because this is a CONFIG check with no order in hand —
+            // legal only because the guard above has already refused
+            // every qty-capped venue, so `size_ok` can only take its
+            // notional branch here. It is strictly stronger than the
+            // hand-rolled compare it replaces: the per-SYMBOL cap is
+            // checked too.
+            if p.notional_1e6 <= 0
+                || !strategy_core::risk::size_ok(caps, 0, p.notional_1e6)
+            {
                 return Err(StrategyError::Config("icdp: notional outside (0, the venue cap]"));
             }
             if p.thr <= 0 {
