@@ -38,6 +38,7 @@ pub mod regime;
 pub mod universe;
 /// VRP V4: the VRP member's parameter artifact (`vrp.toml`) + seed rows.
 pub mod vrp;
+pub mod xsd;
 
 // ---------------------------------------------------------------
 // Error type

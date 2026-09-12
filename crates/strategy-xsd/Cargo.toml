@@ -1,0 +1,15 @@
+[package]
+name         = "strategy-xsd"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "XSD cross-sectional dislocation strategy: hourly pairwise z on fixed hedge ratios, consensus entry, grid, IoC intents (slot 2)"
+
+[dependencies]
+core-regime   = { workspace = true }
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }

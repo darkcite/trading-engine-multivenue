@@ -6,6 +6,146 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — strategy-set slot 2: `cross-arb` OUT, held for `xsd` (XSD-S)
+
+**What changed**
+
+- `strategy-cross-arb` is UNLINKED from the composed set (the `strategy-ev`
+  precedent of 2026-09-10): the crate stays in the workspace (its own tests and
+  the bench alloc gate keep it honest) but `strategy-set` and `cli` no longer
+  depend on it. Slot 2 is VACANT — `SLOT_XSD = 2` / `BIT_XSD = 4` are defined
+  and the number is wire-stable, but the bit is OUTSIDE `BUILT_MASK` until the
+  member lands (XSD-3): `StrategySet::new` clears it, `EnableStrategy` for slot
+  2 is refused and counted (`engine_ai_enable_refused_total`) exactly like the
+  reserved slot 7.
+- `--strategy cross-arb` is a BOOT REFUSAL ("unknown --strategy value"): the
+  standalone arm, `engine_loop_cross_arb_full`, `configure_cross_arb`, the
+  `--groups <SPEC>` flag and the `cross_groups` parameter of
+  `engine_loop_set_full` are gone; `config.example.toml` loses
+  `[strategy.cross_arb]`. `xsd` / `ai+xsd` / `ai+vrp+xsd` are NOT accepted yet —
+  a name with no member behind it would boot an inert set and read as "running".
+- Labels: `[labels.cross_arb]` in `regime.toml` is refused at the grammar
+  ("unknown coded member" — the `[labels.ev]` law); `[labels.xsd]` is refused
+  too until XSD-3. The RG8 `require = 1` slot list drops slot 2 for now.
+- Display: `audit_pnl::strategy_label(2)` = `"xsd"`, `engine-snapshot`
+  `SLOT_NAMES[2]` = `"xsd"` (`/state` `"v": 1` is unchanged in shape — one
+  string differs), the worker dashboard's slot array (`ev` → `vrp`, `cross-arb`
+  → `xsd` — the slot-1 word had been missed at VRP V7), `docs/wire-format.md`
+  offset-41 legend. The `engine_strategy_cross_arb_active` gauge is REMOVED
+  (it could only ever flip for the standalone arm).
+- Masks: `ai` 48, `ai+vrp` 50, `ai+icdp` 112 are bit-identical; `all` is
+  **123** (was 127 with the slot filled) — the vacated bit is simply absent.
+
+**Why**
+
+Operator ruling R3 (2026-09-12): the xsd member takes slot 2 rather than slot
+7 (Kronos's) or a `u16` widening — cross-arb never ran under any live mask
+since the 2026-09-02 "AI lanes only" ruling and its `--groups` config was
+never passed by the wrapper. The swap lands in two commits so the vacated
+state is its own gate: every existing mask bit-identical, then the member.
+
+**Ripple effects**
+
+- A capture taken BEFORE this boundary carries cross-arb rows under
+  `Order.strategy_id` 2 and an `audit-pnl` on it labels them `xsd`; there is
+  no way to tell from the row itself — the boundary date is the record. Live
+  captures carried no slot-2 rows since 2026-09-02 (cross-arb was never in the
+  booted mask), so the practical blast radius is the reader's label only.
+- Between XSD-S and XSD-3 an `EnableStrategy` for slot 2 is a counted refusal
+  (previously a silent enable of an unconfigured, inert member).
+- A `regime.toml` carrying `[labels.cross_arb]` refuses the boot — rename or
+  drop the section (the live file carries none).
+
+**Migration steps**
+
+1. `cargo build --release -p cli`; the live `~/multivenue/strategy.conf`
+   (`STRATEGY=ai+vrp`) needs no change — its mask is unchanged.
+2. Nothing else: no operator file names `cross_arb` / `--groups`.
+
+**Rollback**
+
+- Revert the commit; no on-disk format moved.
+
+## 2026-09-12 — harness fees per venue × INSTRUMENT CLASS; `fees.toml` v2; detail sidecar v7 (XSD-F)
+
+**What changed**
+
+- `ModelParams::fee_bps` is `[[(maker, taker); INSTRUMENT_CLASSES]; 7]` —
+  indexed by `VenueId` AND `core_types::InstrumentClass` (`spot` 0 · `perp` 1 ·
+  `dated` 2 · `option` 3 · `prediction` 4; new module
+  `core_types::instrument_class`). It was one pair per venue.
+- `--fee-bps <venue>[.<class>]:<maker>:<taker>` on `backtest` and `audit-pnl`:
+  a bare `<venue>:` sets all five classes (the old flag, bit for bit);
+  `<venue>.<class>:` sets one. Later flags win, so `bn:10:10 bn.perp:2:5` is
+  "spot tier on Binance except perps".
+- The class of a sym is its manifest descriptor's, through the DESCRIPTOR LAW
+  `core_config::instrument_class::class_of_descriptor` (mirrored in
+  `claude_worker.instrument_class`; both pinned by the shared fixture
+  `claude-worker/tests/fixtures/fees/descriptor-classes.tsv`). A sym whose
+  class is unknown (no manifest row, or a shape the law does not know — the
+  `run-<epoch>/sym-<hex>` namespace of a manifest-less run) is charged the
+  venue's DEAREST class and counted: `fee_class_unknown=` on the fills summary
+  line (backtest) and the `ioc_fills=` line (audit-pnl), only when non-zero.
+- `fees.toml` v2: the `[fees]` bare lines stay; an optional `[fees.<venue>]`
+  table names classes (`"m:t"`), and `option_cap = "<index_bps>:<prem_bps>"`
+  emits `--opt-fee <venue>:<index_bps>:<prem_bps>` (the venue's capped option
+  law; a distinct key so a section-blind `key = "m:t"` reader never trips). `claude_worker.pnl_report.load_fee_flags` emits bare lines first,
+  class lines after. `fees.toml.example` rewritten with every class per venue
+  derived from the published schedules (sources + dates in the header);
+  **D2-AMEND law L1 ("one slot per venue ⇒ the dearer class") is RETIRED**;
+  L2 and L3 stand.
+- Reports: the `--emit-detail` sidecar is `detail_version` **7** — the legacy
+  per-venue `model.fee_bps` pair now prints the venue's DEAREST class (what the
+  one-slot field meant under L1) and an additive `model.fee_classes` object
+  carries the table; `fills.fee_class_unknown` added. The audit-pnl stdout JSON
+  gains additive `fee_classes` + `fee_class_unknown_fills` (`audit_pnl_version`
+  stays 1). The stderr `model:` line prints `fee_bps <venue>=m:t` when a
+  venue's classes agree and `<venue>=spot:m:t,perp:m:t,…` when they differ.
+
+**Why**
+
+Statarb doc 08 §0.2 C7 / §4: the research charged the correct USDⓈ-M perp
+taker (5 bps) while the harness charged every Binance perp leg the spot tier
+(10 bps) because the table had one slot per venue and L1 put the dearer class
+in it — every gate report on a perp member was understated by 5 bps on gross.
+The `xsd` member (110 usdm perps as targets) cannot be gated under that model;
+the operator ruled (R4, 2026-09-12) per-class fees with every class derived now.
+
+**Ripple effects**
+
+- A run under the LEGACY flags (`--fee-bps bn:10:10`, …) is bit-identical: a
+  bare spec fills all five classes, so `fee_rate` returns the same pair for every
+  sym, and the model summary token `bn=10:10` is unchanged.
+- Under the v2 file, Binance/OKX/Bybit/Deribit PERP legs are charged 2:5 / 2:5
+  / 2:6 / 2:4 instead of 10:10 / 8:10 / 2:6 / 2:5 — every perp member's tier
+  number moves UP (less fee) by the difference; spot legs are unchanged.
+- The `--opt-fee` flags now emitted from `fees.toml` for bn/okx/bybit activate
+  those venues' capped option law in `ModelParams`; the fill model applies it
+  only to syms whose underlying index the replay observed (Deribit today), so
+  nothing changes for them until an options member on those venues exists.
+- Manifest-less (pre-D3) roots: every sym is unclassed ⇒ charged the dearest
+  class = the L1 number ⇒ identical to before; the `fee_class_unknown` counter
+  says so.
+- `instrument-manifest.tsv` is UNCHANGED (two columns; every reader is strict
+  about that — a third column was considered and rejected for exactly that
+  reason; the descriptor law needs nothing the manifest does not carry).
+
+**Migration steps**
+
+1. `cargo build --release -p cli` (the harness), rerun the worker pytest.
+2. Copy `fees.toml.example` over `~/multivenue/fees.toml` (keep the old file as
+   `fees.toml.bak-<ts>`); the nightly `pnl_report` picks it up at the next
+   0020Z slot. Any script that reads `fees.toml` with a bare-line-only parser
+   keeps working (the bare lines are unchanged).
+3. Re-read every perp member's tier numbers from the first v2 day report — they
+   are the first honest ones.
+
+**Rollback**
+
+- Restore `fees.toml.bak-<ts>` (the bare-line file): the new harness charges
+  exactly the old numbers. Reverting the commit is not required for a fee
+  rollback.
+
 ## 2026-09-11 — the VRP campaign exits at SETTLEMENT, not at E−ε (Y1)
 
 **What changed**
@@ -159,7 +299,7 @@ reason. V8a fixed the pairs and the QLIKE ring and did not fix this.
   **binary first, then re-cut the seed.** Doing it the other way round takes
   the engine down on its next restart.
 - A v1 `vrp-state.tsv` upgrades silently on the first write.
-- `docs/vrp-warmup-plan.md` carries the full design and the one known
+- `docs/research/vrp/vrp-warmup-plan.md` (vault) carries the full design and the one known
   limitation left in place (a multi-minute gap in the perp tape publishes one
   close, not several, so `minutes` counts observed rolls rather than wall
   minutes — predates this change and alters the measured edge's input if

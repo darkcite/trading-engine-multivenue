@@ -1,0 +1,41 @@
+# xsd.toml — the cross-sectional dislocation member's parameters (slot 2).
+#
+# Copy to ~/multivenue/xsd.toml. Read ONCE at boot by `multivenue-engine run`
+# when the requested mask carries the xsd bit (XSD-3 wiring: `--strategy xsd`
+# / `ai+xsd` / `ai+vrp+xsd`; `--xsd <path>` overrides). Integer TOML subset
+# (`core-config::xsd`): every value is a whole number in the unit its key
+# names — ×1e9 for z thresholds and bps, ×1e6 USD for sizes, seconds for
+# durations (hour-counted ones must be whole hours). Floats, strings and
+# unknown keys refuse the boot.
+#
+# The three companion artifacts (all under ~/multivenue/, none in git):
+#   xsd-table.tsv  target_descriptor \t partner_descriptor \t beta_1e9 [\t rank \t t_adf_1e6]
+#                  — the worker's monthly screen (≤ 128 targets × 3 partners);
+#                  sha256 of the file = the table hash in the boot tell.
+#   xsd-seed.tsv   descriptor \t open_ms \t close_1e6 — the last z_window_h
+#                  (+ slack) hourly closes per descriptor, cut by the worker at
+#                  every restart (`seed-out --xsd`); rows must be OLDER than the
+#                  boot hour.
+#   xsd-state.tsv  written by the engine on every position change; restored at
+#                  boot ONLY under the same table hash, otherwise every listed
+#                  position is flattened at its target's first fresh tick.
+#
+# The operating point below is the research's F7 (doc 07 §3.4) with the
+# operator's R7 (grid_n = 1) and R8 (label ANY) rulings.
+
+[xsd]
+z_window_h = 720              # rolling z window, hours (40..=2160)
+z_enter_1e9 = 3000000000      # entry when #{k : z_k ≥ 3.0} ≥ consensus (or the mirror)
+z_exit_1e9 = 0                # revert exit when z̄·d ≤ 0.0
+z_stop_1e9 = 5000000000       # stop exit when |z|̄ ≥ 5.0 (must exceed z_enter)
+consensus = 1                 # partners that must agree (1..=3)
+grid_n = 1                    # grid depth; 1 = no scale-in (R7); ≤ 8
+grid_step_1e9 = 500000000     # rung g adds at |z|̄ ≥ z_enter + g·0.5
+max_hold_s = 864000           # 240 h, counted from the entry DECISION hour
+cooldown_s = 3600             # 1 h = the research's `t = x + 1` re-entry law
+ttl_s = 300                   # Order.ttl_ns of every IoC (the I1 fill law)
+position_usd_1e6 = 1000000000 # $1,000 per grid unit (≤ the $10k per-order cap)
+max_positions = 82            # simultaneously entered targets (the measured peak)
+max_gross_usd_1e6 = 100000000000  # $100,000 book cap (≤ the risk-policy table cap)
+direction = 1                 # +1 momentum: BUY a positive dislocation (F7); -1 revert
+slip_1e9 = 0                  # optional: limit offset from the touch, bps ×1e9

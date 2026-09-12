@@ -4579,3 +4579,153 @@ fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "strategy-vrp hot bytes should be zero: saw {bytes}");
 }
+
+/// Gate 46 (XSD-2, statarb doc 08 §3.9): the xsd member's live callbacks
+/// at full capacity — 128 targets × 3 partners over 130 syms with a
+/// 720-hour window — through 24 hourly rolls (each `O(pairs × window)`),
+/// ~6,000 ticks, entries, exits and a regime flip. The boot box, the
+/// table and the seed are not measured.
+#[test]
+fn xsd_member_tick_roll_and_regime_are_zero_alloc() {
+    use core_types::{make_symbol_id, Price, Qty, Tick, RegimeWord, REGIME_OFF_HARD};
+    use strategy_core::{Ctx, RegimeGate, Strategy, StrategyCounters, SubmitErr};
+    use strategy_xsd::{XsdParams, XsdStrategy, XsdTable, XsdTableRow, HOUR_NS, XSD_MAX_TARGETS};
+
+    const MONO0: u64 = 3_191_000_000_000_000;
+    const WALL0: u64 = 1_789_171_200_000_000_000; // 2026-09-12 00:00:00Z
+    const HOUR0: i64 = (WALL0 / HOUR_NS) as i64;
+    const N_SYMS: usize = XSD_MAX_TARGETS + 2;
+    const WINDOW: u32 = 720;
+
+    struct SinkCtx {
+        n: u64,
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, _order: core_types::Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            0
+        }
+    }
+
+    let sym_of = |i: usize| make_symbol_id(VenueId::Binance, 512 + i as u32);
+    let mut table = XsdTable::EMPTY;
+    let mut t = 0usize;
+    while t < XSD_MAX_TARGETS {
+        let mut k = 0usize;
+        while k < 3 {
+            table.rows[table.n] = XsdTableRow {
+                target: sym_of(t),
+                partner: sym_of((t + 1 + k) % N_SYMS),
+                beta_1e9: 1_000_000_000,
+            };
+            table.n += 1;
+            k += 1;
+        }
+        t += 1;
+    }
+    table.hash = [1; 32];
+    let params = XsdParams {
+        z_window_h: WINDOW,
+        z_enter_1e9: 3_000_000_000,
+        z_exit_1e9: 0,
+        z_stop_1e9: 5_000_000_000,
+        consensus: 1,
+        grid_n: 3,
+        grid_step_1e9: 500_000_000,
+        max_hold_h: 240,
+        cooldown_h: 1,
+        ttl_ns: 300_000_000_000,
+        position_usd_1e6: 1_000_000_000,
+        max_positions: 82,
+        max_gross_usd_1e6: 100_000_000_000,
+        direction: 1,
+        slip_1e9: 0,
+        hash: [2; 32],
+    };
+    let mut m = XsdStrategy::new();
+    m.configure(core_time::WallAnchor::new(MONO0, WALL0), &params, &table)
+        .expect("configure");
+
+    // Boot seed: 720 hours of a noisy walk per sym (not measured).
+    let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut px = [100_000_000i64; N_SYMS];
+    let mut h = HOUR0 - WINDOW as i64;
+    while h < HOUR0 {
+        let mut i = 0usize;
+        while i < N_SYMS {
+            px[i] = (px[i] + (next() % 100_001) as i64 - 50_000).max(50_000_000);
+            assert!(m.seed_close(sym_of(i), h, px[i]));
+            i += 1;
+        }
+        h += 1;
+    }
+
+    let mono_at = |hour: i64, off: u64| MONO0 + (hour - HOUR0) as u64 * HOUR_NS + off;
+    let mk_tick = |i: usize, ts: u64, p: i64| {
+        Tick::new(
+            ts,
+            VenueId::Binance,
+            sym_of(i),
+            0,
+            Price::from_raw(p - 1_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(p + 1_000),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let mut ctx = SinkCtx { n: 0 };
+    m.on_timer(mono_at(HOUR0, 1), &mut ctx);
+
+    // Measured: 24 live hours. Every fourth target dislocates +20 % for
+    // two hours from hour 2 (entries, then stops or adds), snaps back
+    // (revert exits); a hard-closed gate at hour 12 flattens whatever is
+    // still open, reopened at hour 13.
+    let g = AllocGuard::new();
+    let mut hour = HOUR0;
+    while hour < HOUR0 + 24 {
+        let rel = hour - HOUR0;
+        let mut i = 0usize;
+        while i < N_SYMS {
+            let mut p = (px[i] + (next() % 100_001) as i64 - 50_000).max(50_000_000);
+            if i % 4 == 0 && (2..4).contains(&rel) {
+                p = p * 120 / 100;
+            }
+            m.on_tick(&mk_tick(i, mono_at(hour, 1_000_000_000 + i as u64), p), &mut ctx);
+            m.on_tick(&mk_tick(i, mono_at(hour, 3_599_000_000_000 + i as u64), p), &mut ctx);
+            px[i] = p;
+            i += 1;
+        }
+        if rel == 12 {
+            let hard = RegimeGate::new([RegimeWord::UNKNOWN; 4], false, REGIME_OFF_HARD);
+            m.on_regime(hard, &mut ctx);
+        }
+        if rel == 13 {
+            m.on_regime(RegimeGate::OPEN_UNKNOWN, &mut ctx);
+        }
+        hour += 1;
+        m.on_timer(mono_at(hour, 1), &mut ctx);
+    }
+    let counters = m.xsd_counters();
+    std::hint::black_box((ctx.n, counters));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(counters.rolls, 24, "every boundary rolled");
+    assert!(counters.entries > 0, "the gate must measure real entries");
+    let exits = counters.exits_revert + counters.exits_stop + counters.exits_maxhold + counters.exits_regime;
+    assert!(exits > 0, "the gate must measure real exits");
+    assert!(ctx.n > 0, "the gate must measure real submits");
+    assert_eq!(
+        allocs, 0,
+        "strategy-xsd callbacks allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "strategy-xsd hot bytes should be zero: saw {bytes}");
+}

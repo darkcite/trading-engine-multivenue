@@ -223,6 +223,31 @@ pub trait StrategyCounters {
         false
     }
 
+    /// XSD (slot 2, statarb doc 08): the cross-sectional member's
+    /// observables (`engine_xsd_*`), mirrored like [`Self::icdp_counters`].
+    #[inline]
+    fn xsd_counters(&self) -> XsdCounters {
+        XsdCounters::default()
+    }
+
+    /// XSD: the member's persisted-state epoch (the
+    /// [`Self::vrp_state_epoch`] law — bumped on every position change;
+    /// the cli rewrites `xsd-state.tsv` only when it moved).
+    #[inline]
+    fn xsd_state_epoch(&self) -> u64 {
+        0
+    }
+
+    /// XSD: copy the entered positions into `out`, returning how many
+    /// exist. The cli renders `xsd-state.tsv` from this view with the
+    /// DESCRIPTORS it resolved at boot (a persisted `SymbolId` would name
+    /// a different instrument after a universe reorder). Cold path.
+    #[inline]
+    fn xsd_positions_view(&self, out: &mut [XsdPositionView]) -> u32 {
+        let _ = out;
+        0
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -626,6 +651,75 @@ pub struct VrpCounters {
     /// mechanism has stopped holding. **A `0` on a full window is the
     /// halt tell** — E1 is gone and the member has no edge to harvest.
     pub qlike_har_beats_iv: u64,
+}
+
+/// XSD counters (`engine_xsd_*`), mirrored by the cli's generic 5 s
+/// block. Defined HERE for the reason [`IcdpCounters`] is.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XsdCounters {
+    /// Hour boundaries rolled.
+    pub rolls: u64,
+    /// Pairs whose z was finite at the last roll (a level, not a total).
+    pub pairs_warm: u64,
+    /// Target decisions evaluated (one per target per roll).
+    pub decisions: u64,
+    /// ENTER decisions.
+    pub entries_decided: u64,
+    /// ADD decisions.
+    pub adds_decided: u64,
+    /// Entry IoCs emitted (the logical position opened).
+    pub entries: u64,
+    /// Grid-unit IoCs emitted.
+    pub adds: u64,
+    /// Exits emitted: `z̄ · d ≤ z_out`.
+    pub exits_revert: u64,
+    /// Exits emitted: `|z|̄ ≥ z_stop`.
+    pub exits_stop: u64,
+    /// Exits emitted: held `≥ max_hold_h`.
+    pub exits_maxhold: u64,
+    /// Exits emitted: restored under a changed table hash.
+    pub exits_rotation: u64,
+    /// Exits emitted: the regime gate hard-closed.
+    pub exits_regime: u64,
+    /// Pending intents that crossed a roll unpriced (no fresh tick in
+    /// the hour) and were carried into the next one.
+    pub intents_carried: u64,
+    /// Unfilled entries superseded by their own exit signal.
+    pub entries_cancelled: u64,
+    /// Intents refused by a notional / position cap.
+    pub caps_rejected: u64,
+    /// Decisions that HELD because no partner z was finite.
+    pub holds_absent: u64,
+    /// Entries refused by a closed regime gate.
+    pub regime_blocked: u64,
+    /// Seed rows that landed in a bucket.
+    pub seed_rows: u64,
+    /// Seed rows dropped (unknown sym, duplicate hour, older than the ring).
+    pub seed_dropped: u64,
+}
+
+/// One entered XSD position as the cli persists it (`xsd-state.tsv`)
+/// and `/state` shows it. POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XsdPositionView {
+    /// The target.
+    pub sym: SymbolId,
+    /// `1` long, `2` short.
+    pub side: u8,
+    /// Entry z-sign (`+1` / `−1`).
+    pub d: i8,
+    /// Grid units filled.
+    pub grid_units: u8,
+    /// Coins ×1e6 held.
+    pub qty_1e6: i64,
+    /// Notional ×1e6 booked against the caps.
+    pub notional_1e6: i64,
+    /// Boundary hour of the entry decision.
+    pub entry_hour: i64,
+    /// Boundary hour of the last add (`entry_hour` when none).
+    pub last_add_hour: i64,
 }
 
 // ---------------------------------------------------------------
@@ -1223,6 +1317,13 @@ mod tests {
         assert_eq!(s.vm_orders_emitted(), 0);
         assert_eq!(s.vm_orders_dropped(), 0);
         assert_eq!(s.vm_commit_dropped(), 0);
+        // XSD (slot 2): the same posture — zero counters, no state, no
+        // positions, and the view buffer is left untouched.
+        assert_eq!(s.xsd_counters(), XsdCounters::default());
+        assert_eq!(s.xsd_state_epoch(), 0);
+        let mut out = [XsdPositionView::default(); 2];
+        assert_eq!(s.xsd_positions_view(&mut out), 0);
+        assert_eq!(out, [XsdPositionView::default(); 2]);
     }
 
     #[test]

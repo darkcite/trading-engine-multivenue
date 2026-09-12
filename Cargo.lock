@@ -163,6 +163,7 @@ dependencies = [
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xsd",
 ]
 
 [[package]]
@@ -1868,6 +1869,16 @@ dependencies = [
  "core-types",
  "core-vol",
  "opt-registry",
+ "strategy-core",
+]
+
+[[package]]
+name = "strategy-xsd"
+version = "0.1.0"
+dependencies = [
+ "core-regime",
+ "core-time",
+ "core-types",
  "strategy-core",
 ]
 

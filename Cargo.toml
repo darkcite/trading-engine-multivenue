@@ -46,6 +46,7 @@ members = [
     "crates/strategy-set",
     "crates/strategy-vm",
     "crates/strategy-vrp",
+    "crates/strategy-xsd",
 
     # --- execution ---
     "crates/clob-dispatcher",
@@ -174,6 +175,7 @@ strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }
 strategy-vm           = { path = "crates/strategy-vm" }
 strategy-vrp          = { path = "crates/strategy-vrp" }
+strategy-xsd          = { path = "crates/strategy-xsd" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 signer-eip712   = { path = "crates/signer-eip712" }
