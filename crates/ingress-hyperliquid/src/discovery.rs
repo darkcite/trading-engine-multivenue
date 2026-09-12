@@ -526,6 +526,380 @@ impl Default for HlDiscovery {
 }
 
 // ---------------------------------------------------------------
+// HIP-4 outcome descriptions (BIN15 O1)
+// ---------------------------------------------------------------
+
+/// Capacity of [`HlOutcomeSpec::underlying`].
+pub const HL_OUTCOME_UNDERLYING_MAX: usize = 15;
+
+/// Deployer grammar of a HIP-4 outcome `description`.
+///
+/// A HIP-4 market carries its whole economics — underlying, strike,
+/// expiry, settlement window — inside ONE `|`-delimited `key:value`
+/// string, and it is the KEY SET, not any field of its own, that says
+/// which law prices it. Live-probed on the venue 2026-09-12.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HlOutcomeGrammar {
+    /// No known key set matched. Whatever parsed is still reported —
+    /// the caller decides whether a half-known row is usable.
+    Unknown = 0,
+    /// `out` deployer, binary price: `perp:<COIN>` +
+    /// `priceDescription:<text>` + `seconds:<n>` + `threshold:<px>` +
+    /// `time:<YYYYMMDD-HHMM>`.
+    OutBinaryPrice = 1,
+    /// `out` deployer, price touch: `perp:<COIN>` + `target:<px>`.
+    OutPriceTouch = 2,
+    /// HyperCore's own recurring binary: `class:priceBinary` +
+    /// `underlying:<COIN>` + `expiry:<YYYYMMDD-HHMM>` +
+    /// `targetPrice:<px>` + `period:<1d|15m|…>`.
+    NativePriceBinary = 3,
+}
+
+/// One parsed outcome description: 64 B, `#[repr(C)]`, POD.
+///
+/// Absent fields are 0 — never a sentinel, never an error. A field
+/// that is PRESENT but unparseable also stays 0 **and** demotes
+/// [`Self::grammar`] to [`HlOutcomeGrammar::Unknown`], so a venue
+/// contract change reads as "unknown shape" rather than as a
+/// silently wrong strike.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HlOutcomeSpec {
+    /// Outcome id (`"outcome":N`); 0 = unknown.
+    pub outcome: u32,
+    /// Which key set matched.
+    pub grammar: HlOutcomeGrammar,
+    /// Bytes of [`Self::underlying`] in use; 0 when absent, empty, or
+    /// wider than [`HL_OUTCOME_UNDERLYING_MAX`].
+    pub underlying_len: u8,
+    /// Underlying coin bytes (`perp:` / `underlying:`), left-aligned.
+    pub underlying: [u8; HL_OUTCOME_UNDERLYING_MAX],
+    // 3 bytes of interior padding here — the `i64` below is 8-aligned.
+    /// Strike/target ×1e6 (`threshold:` / `target:` / `targetPrice:`);
+    /// 0 = absent.
+    pub strike_1e6: i64,
+    /// Expiry (`time:` / `expiry:`, `YYYYMMDD-HHMM` UTC) in ns since
+    /// the epoch; 0 = absent.
+    pub expiry_ns: u64,
+    /// Settlement TWAP length in seconds (`seconds:`); 0 = absent.
+    /// The native recurring rows carry no `seconds` key and settle at
+    /// `T` from the last mark at/before `T` (venue-verified).
+    pub twap_s: u32,
+    /// Recurrence period in seconds (`period:`); 0 = absent.
+    pub period_s: u32,
+    /// Explicit tail padding.
+    _pad: [u8; 16],
+}
+
+const _: () = assert!(::core::mem::size_of::<HlOutcomeSpec>() == 64);
+
+impl HlOutcomeSpec {
+    /// The all-zero spec for `outcome` — what a description with
+    /// nothing parseable in it returns.
+    #[must_use]
+    pub const fn empty(outcome: u32) -> Self {
+        Self {
+            outcome,
+            grammar: HlOutcomeGrammar::Unknown,
+            underlying_len: 0,
+            underlying: [0; HL_OUTCOME_UNDERLYING_MAX],
+            strike_1e6: 0,
+            expiry_ns: 0,
+            twap_s: 0,
+            period_s: 0,
+            _pad: [0; 16],
+        }
+    }
+
+    /// The underlying-coin bytes actually in use.
+    #[must_use]
+    pub fn underlying_bytes(&self) -> &[u8] {
+        let n = self.underlying_len as usize;
+        debug_assert!(n <= HL_OUTCOME_UNDERLYING_MAX);
+        &self.underlying[..n.min(HL_OUTCOME_UNDERLYING_MAX)]
+    }
+}
+
+/// Parse a HIP-4 outcome `description` VALUE (raw bytes, no quotes).
+///
+/// Never errors and never allocates. The description is a
+/// `|`-delimited list of `key:value` fields, tokenised in place;
+/// unknown keys are skipped and a key whose value does not parse
+/// leaves its field 0.
+///
+/// Tokenising — rather than searching the whole string for each key —
+/// is deliberate: `priceDescription` is free text, so a description
+/// whose prose happened to contain `threshold:` would otherwise be
+/// read as the strike.
+#[must_use]
+pub fn parse_outcome_spec(outcome: u32, description: &[u8]) -> HlOutcomeSpec {
+    let mut spec = HlOutcomeSpec::empty(outcome);
+    // Presence flags are set only when the value also PARSED, so a
+    // malformed required field cannot produce a confident grammar.
+    let mut perp = false;
+    let mut underlying = false;
+    let mut threshold = false;
+    let mut target = false;
+    let mut target_price = false;
+    let mut seconds = false;
+    let mut time = false;
+    let mut expiry = false;
+    let mut price_binary = false;
+
+    let mut i = 0usize;
+    while i < description.len() {
+        let end = token_end(description, i);
+        let (key, val) = split_kv(description, i, end);
+        if key == b"perp" {
+            perp |= set_underlying(&mut spec, val);
+        } else if key == b"underlying" {
+            underlying |= set_underlying(&mut spec, val);
+        } else if key == b"threshold" {
+            threshold |= set_strike(&mut spec, val);
+        } else if key == b"target" {
+            target |= set_strike(&mut spec, val);
+        } else if key == b"targetPrice" {
+            target_price |= set_strike(&mut spec, val);
+        } else if key == b"seconds" {
+            if let Some(v) = scan_u32_exact(val) {
+                spec.twap_s = v;
+                seconds = true;
+            }
+        } else if key == b"period" {
+            spec.period_s = scan_period_s(val);
+        } else if key == b"time" {
+            if let Some(ns) = parse_hl_time_ns(val) {
+                spec.expiry_ns = ns;
+                time = true;
+            }
+        } else if key == b"expiry" {
+            if let Some(ns) = parse_hl_time_ns(val) {
+                spec.expiry_ns = ns;
+                expiry = true;
+            }
+        } else if key == b"class" {
+            price_binary |= val == b"priceBinary";
+        }
+        // `end == len` on the last token makes this `len + 1` and the
+        // loop exits; otherwise it steps past the `|`.
+        i = end + 1;
+    }
+
+    spec.grammar = if perp && threshold && seconds && time {
+        HlOutcomeGrammar::OutBinaryPrice
+    } else if perp && target {
+        HlOutcomeGrammar::OutPriceTouch
+    } else if price_binary && underlying && expiry && target_price {
+        HlOutcomeGrammar::NativePriceBinary
+    } else {
+        HlOutcomeGrammar::Unknown
+    };
+    spec
+}
+
+/// `YYYYMMDD-HHMM` (UTC) → ns since the epoch.
+///
+/// `None` on a malformed byte, an impossible civil date (30 Feb, a
+/// non-leap 29 Feb), a year before 1970, or a year whose nanosecond
+/// count would not fit a `u64`. Pure integer arithmetic
+/// (days-from-civil, no table, no floats); `const` so a caller can
+/// pin an expiry at compile time.
+#[must_use]
+pub const fn parse_hl_time_ns(b: &[u8]) -> Option<u64> {
+    if b.len() != 13 || b[8] != b'-' {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < 13 {
+        if i != 8 {
+            let c = b[i];
+            if c < b'0' || c > b'9' {
+                return None;
+            }
+        }
+        i += 1;
+    }
+    let year =
+        ascii_digit(b[0]) * 1000 + ascii_digit(b[1]) * 100 + ascii_digit(b[2]) * 10 + ascii_digit(b[3]);
+    let month = ascii_digit(b[4]) * 10 + ascii_digit(b[5]);
+    let day = ascii_digit(b[6]) * 10 + ascii_digit(b[7]);
+    let hour = ascii_digit(b[9]) * 10 + ascii_digit(b[10]);
+    let minute = ascii_digit(b[11]) * 10 + ascii_digit(b[12]);
+    if year < 1970 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 {
+        return None;
+    }
+    if day > days_in_month(year, month) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    let secs = days as u64 * 86_400 + hour as u64 * 3_600 + minute as u64 * 60;
+    if secs > u64::MAX / 1_000_000_000 {
+        return None;
+    }
+    Some(secs * 1_000_000_000)
+}
+
+/// One validated ASCII digit as an `i64`.
+const fn ascii_digit(c: u8) -> i64 {
+    (c - b'0') as i64
+}
+
+const fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+const fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Hinnant's `days_from_civil`: days since 1970-01-01 for a
+/// proleptic-Gregorian Y-M-D.
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Index of the next `|` at or after `from`, else the length.
+fn token_end(b: &[u8], from: usize) -> usize {
+    match memchr::memchr(b'|', &b[from..]) {
+        Some(off) => from + off,
+        None => b.len(),
+    }
+}
+
+/// Split `b[start..end]` at its FIRST `:`. A token with no colon
+/// yields an empty key, which matches nothing.
+fn split_kv(b: &[u8], start: usize, end: usize) -> (&[u8], &[u8]) {
+    let tok = &b[start..end];
+    match memchr::memchr(b':', tok) {
+        Some(off) => (&tok[..off], &tok[off + 1..]),
+        None => (&[], tok),
+    }
+}
+
+/// Copy an underlying-coin value in. Rejects empty and over-wide
+/// values: a coin that does not fit is a contract change, not a
+/// truncation candidate, so the field stays empty and the grammar
+/// goes [`HlOutcomeGrammar::Unknown`].
+fn set_underlying(spec: &mut HlOutcomeSpec, val: &[u8]) -> bool {
+    if val.is_empty() || val.len() > HL_OUTCOME_UNDERLYING_MAX {
+        return false;
+    }
+    let mut k = 0usize;
+    while k < val.len() {
+        spec.underlying[k] = val[k];
+        k += 1;
+    }
+    spec.underlying_len = val.len() as u8;
+    true
+}
+
+fn set_strike(spec: &mut HlOutcomeSpec, val: &[u8]) -> bool {
+    match scan_px_1e6(val) {
+        Some(v) => {
+            spec.strike_1e6 = v;
+            true
+        }
+        None => false,
+    }
+}
+
+/// `[-]int[.frac]` → ×1e6, truncating past six decimals. Integer
+/// arithmetic only; `None` on junk, trailing bytes, or overflow.
+fn scan_px_1e6(val: &[u8]) -> Option<i64> {
+    let mut i = 0usize;
+    let neg = !val.is_empty() && val[0] == b'-';
+    if neg {
+        i = 1;
+    }
+    let digits_start = i;
+    let mut units: i64 = 0;
+    while i < val.len() && val[i].is_ascii_digit() {
+        units = units
+            .checked_mul(10)?
+            .checked_add((val[i] - b'0') as i64)?;
+        i += 1;
+    }
+    if i == digits_start {
+        return None;
+    }
+    units = units.checked_mul(1_000_000)?;
+    if i < val.len() && val[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        let mut weight: i64 = 100_000;
+        while i < val.len() && val[i].is_ascii_digit() {
+            if weight >= 1 {
+                units = units.checked_add((val[i] - b'0') as i64 * weight)?;
+                weight /= 10;
+            }
+            i += 1;
+        }
+        if i == frac_start {
+            return None;
+        }
+    }
+    if i != val.len() {
+        return None;
+    }
+    Some(if neg { -units } else { units })
+}
+
+/// All-digit `u32` spanning the whole token. The 10-digit cap keeps
+/// [`scan_u64`]'s wrapping multiply out of range.
+fn scan_u32_exact(val: &[u8]) -> Option<u32> {
+    if val.is_empty() || val.len() > 10 {
+        return None;
+    }
+    let (v, end) = scan_u64(val, 0)?;
+    if end != val.len() {
+        return None;
+    }
+    u32::try_from(v).ok()
+}
+
+/// `<n><s|m|h|d>` → seconds; 0 on anything else.
+fn scan_period_s(val: &[u8]) -> u32 {
+    if val.len() < 2 || val.len() > 11 {
+        return 0;
+    }
+    let Some((n, end)) = scan_u64(val, 0) else {
+        return 0;
+    };
+    if end + 1 != val.len() {
+        return 0;
+    }
+    let mult: u64 = match val[end] {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3_600,
+        b'd' => 86_400,
+        _ => return 0,
+    };
+    u32::try_from(n.saturating_mul(mult)).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------
 // Row parsers — okx-discovery key-loop shape, one per object kind
 // ---------------------------------------------------------------
 
@@ -1405,6 +1779,152 @@ mod tests {
         // (per-dex universes unfetched in v1 — method docs).
         assert_eq!(d.universe_total(), 9);
     }
+
+    // ---- HIP-4 outcome descriptions (BIN15 O1) -------------------
+
+    /// The live `outcomeCreated` description for outcome 2649,
+    /// captured verbatim from the venue 2026-09-12.
+    const DESC_2649: &[u8] =
+        b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630";
+    /// The next instance in the same rolling family, reconstructed
+    /// from the captured lifecycle facts (2650: threshold 77201,
+    /// expiry 06:45) — same grammar, one roll later.
+    const DESC_2650: &[u8] =
+        b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645";
+
+    #[test]
+    fn out_binary_price_rows_parse_every_field() {
+        let s = parse_outcome_spec(2649, DESC_2649);
+        assert_eq!(s.outcome, 2649);
+        assert_eq!(s.grammar, HlOutcomeGrammar::OutBinaryPrice);
+        assert_eq!(s.underlying_bytes(), b"BTC");
+        assert_eq!(s.strike_1e6, 77_177_000_000);
+        assert_eq!(s.expiry_ns, 1_789_194_600_000_000_000);
+        assert_eq!(s.twap_s, 60);
+        assert_eq!(s.period_s, 0);
+
+        let s = parse_outcome_spec(2650, DESC_2650);
+        assert_eq!(s.grammar, HlOutcomeGrammar::OutBinaryPrice);
+        assert_eq!(s.strike_1e6, 77_201_000_000);
+        // One 15 m roll later than 2649.
+        assert_eq!(s.expiry_ns - 1_789_194_600_000_000_000, 900 * 1_000_000_000);
+    }
+
+    #[test]
+    fn native_price_binary_rows_carry_a_period_and_a_fractional_strike() {
+        let s = parse_outcome_spec(
+            4211,
+            b"class:priceBinary|underlying:ETH|expiry:20260913-0600|targetPrice:2510.5|period:1d",
+        );
+        assert_eq!(s.grammar, HlOutcomeGrammar::NativePriceBinary);
+        assert_eq!(s.underlying_bytes(), b"ETH");
+        assert_eq!(s.strike_1e6, 2_510_500_000);
+        assert_eq!(s.expiry_ns, 1_789_279_200_000_000_000);
+        // No `seconds` key: settles AT T, not over a window.
+        assert_eq!(s.twap_s, 0);
+        assert_eq!(s.period_s, 86_400);
+    }
+
+    #[test]
+    fn period_units_and_touch_rows() {
+        let s = parse_outcome_spec(
+            77,
+            b"class:priceBinary|underlying:SOL|expiry:20260912-0630|targetPrice:78.553|period:15m",
+        );
+        assert_eq!(s.grammar, HlOutcomeGrammar::NativePriceBinary);
+        assert_eq!(s.strike_1e6, 78_553_000);
+        assert_eq!(s.period_s, 900);
+
+        let s = parse_outcome_spec(78, b"perp:HYPE|priceDescription:HYPE mark|target:44.25");
+        assert_eq!(s.grammar, HlOutcomeGrammar::OutPriceTouch);
+        assert_eq!(s.underlying_bytes(), b"HYPE");
+        assert_eq!(s.strike_1e6, 44_250_000);
+        assert_eq!(s.expiry_ns, 0);
+    }
+
+    #[test]
+    fn an_empty_or_unknown_description_is_unknown_not_a_panic() {
+        let s = parse_outcome_spec(1, b"");
+        assert_eq!(s.grammar, HlOutcomeGrammar::Unknown);
+        assert_eq!(s, HlOutcomeSpec::empty(1));
+
+        // Unknown keys in the middle are skipped; the known ones still
+        // land and the grammar still resolves.
+        let s = parse_outcome_spec(
+            2,
+            b"perp:BTC|newKeyTheVenueAdded:whatever|seconds:60|nested:a:b:c|threshold:77177|time:20260912-0630",
+        );
+        assert_eq!(s.grammar, HlOutcomeGrammar::OutBinaryPrice);
+        assert_eq!(s.strike_1e6, 77_177_000_000);
+        assert_eq!(s.twap_s, 60);
+
+        // A required key present but UNPARSEABLE demotes the grammar
+        // rather than reporting a confident wrong strike.
+        let s = parse_outcome_spec(3, b"perp:BTC|seconds:60|threshold:not-a-price|time:20260912-0630");
+        assert_eq!(s.grammar, HlOutcomeGrammar::Unknown);
+        assert_eq!(s.strike_1e6, 0);
+        assert_eq!(s.twap_s, 60);
+
+        // Free text that merely CONTAINS a key name is not a field:
+        // tokenising on `|` is what makes this true.
+        let s = parse_outcome_spec(4, b"perp:BTC|priceDescription:threshold:99 is not the strike|target:5");
+        assert_eq!(s.grammar, HlOutcomeGrammar::OutPriceTouch);
+        assert_eq!(s.strike_1e6, 5_000_000);
+
+        // A coin that exactly FILLS the 15-byte field still parses.
+        let s = parse_outcome_spec(5, b"perp:FIFTEEN_CHARS|target:1");
+        assert_eq!(s.underlying_bytes(), b"FIFTEEN_CHARS");
+        assert_eq!(s.grammar, HlOutcomeGrammar::OutPriceTouch);
+        let exact = parse_outcome_spec(5, b"perp:SIXTEENCHARCOIN|target:1");
+        assert_eq!(exact.underlying_len, HL_OUTCOME_UNDERLYING_MAX as u8);
+        assert_eq!(exact.underlying_bytes(), b"SIXTEENCHARCOIN");
+        assert_eq!(exact.grammar, HlOutcomeGrammar::OutPriceTouch);
+        // One byte wider is a contract change, not a truncation.
+        let s = parse_outcome_spec(6, b"perp:SIXTEENCHARCOINX|target:1");
+        assert_eq!(s.underlying_len, 0);
+        assert_eq!(s.grammar, HlOutcomeGrammar::Unknown);
+    }
+
+    #[test]
+    fn hl_time_is_exact_integer_civil_arithmetic() {
+        assert_eq!(parse_hl_time_ns(b"20260912-0630"), Some(1_789_194_600_000_000_000));
+        assert_eq!(parse_hl_time_ns(b"20261001-0000"), Some(1_790_812_800_000_000_000));
+        assert_eq!(parse_hl_time_ns(b"19700101-0000"), Some(0));
+        // A real 29 Feb parses; the same date in a non-leap year does not.
+        assert_eq!(parse_hl_time_ns(b"20240229-1200"), Some(1_709_208_000_000_000_000));
+        assert_eq!(parse_hl_time_ns(b"20260229-0000"), None);
+        // Malformed inputs.
+        assert_eq!(parse_hl_time_ns(b"2026091-0630"), None); // short
+        assert_eq!(parse_hl_time_ns(b"20260912_0630"), None); // separator
+        assert_eq!(parse_hl_time_ns(b"2026091a-0630"), None); // non-digit
+        assert_eq!(parse_hl_time_ns(b"20261301-0000"), None); // month 13
+        assert_eq!(parse_hl_time_ns(b"20260012-0000"), None); // month 0
+        assert_eq!(parse_hl_time_ns(b"20260912-2400"), None); // hour 24
+        assert_eq!(parse_hl_time_ns(b"20260912-0660"), None); // minute 60
+        assert_eq!(parse_hl_time_ns(b"19690101-0000"), None); // pre-epoch
+        assert_eq!(parse_hl_time_ns(b""), None);
+    }
+
+    #[test]
+    fn strike_scanner_truncates_past_six_decimals_and_rejects_junk() {
+        assert_eq!(scan_px_1e6(b"77177"), Some(77_177_000_000));
+        assert_eq!(scan_px_1e6(b"0.001"), Some(1_000));
+        assert_eq!(scan_px_1e6(b"1.2345678"), Some(1_234_567)); // 7th decimal dropped
+        assert_eq!(scan_px_1e6(b"-3.5"), Some(-3_500_000));
+        assert_eq!(scan_px_1e6(b""), None);
+        assert_eq!(scan_px_1e6(b"."), None);
+        assert_eq!(scan_px_1e6(b"1."), None);
+        assert_eq!(scan_px_1e6(b"1.2.3"), None);
+        assert_eq!(scan_px_1e6(b"1e5"), None);
+        assert_eq!(scan_px_1e6(b"99999999999999999999"), None); // overflow
+        assert_eq!(scan_period_s(b"1d"), 86_400);
+        assert_eq!(scan_period_s(b"15m"), 900);
+        assert_eq!(scan_period_s(b"1h"), 3_600);
+        assert_eq!(scan_period_s(b"30s"), 30);
+        assert_eq!(scan_period_s(b"1w"), 0);
+        assert_eq!(scan_period_s(b"d"), 0);
+        assert_eq!(scan_period_s(b"15"), 0);
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1439,6 +1959,30 @@ mod proptests {
             let _ = d.resolve(&input);
             let (p, s, _dx, o) = d.counts();
             prop_assert_eq!(d.universe_total(), p + s + 2 * o);
+        }
+
+        /// `parse_outcome_spec` is total: every byte string returns a
+        /// spec, and an `Unknown` grammar never carries a strike or an
+        /// expiry the caller could mistake for a parsed one.
+        #[test]
+        fn outcome_spec_never_panics(input in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let s = parse_outcome_spec(7, &input);
+            prop_assert_eq!(s.outcome, 7);
+            prop_assert!(s.underlying_len as usize <= HL_OUTCOME_UNDERLYING_MAX);
+            prop_assert_eq!(s.underlying_bytes().len(), s.underlying_len as usize);
+            if s.grammar != HlOutcomeGrammar::Unknown {
+                prop_assert!(s.underlying_len > 0);
+            }
+        }
+
+        /// `parse_hl_time_ns` is total, and every value it accepts
+        /// round-trips through the civil-date arithmetic as a whole
+        /// number of minutes.
+        #[test]
+        fn hl_time_never_panics(input in proptest::collection::vec(any::<u8>(), 0..32)) {
+            if let Some(ns) = parse_hl_time_ns(&input) {
+                prop_assert_eq!(ns % (60 * 1_000_000_000), 0);
+            }
         }
     }
 }

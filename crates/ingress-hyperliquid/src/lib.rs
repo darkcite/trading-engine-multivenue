@@ -111,7 +111,7 @@ pub use run_loop::{
 };
 
 use core_net::SubId;
-use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte};
+use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte, skip_ws};
 use core_types::{NsTs, SymbolId};
 
 // ---------------------------------------------------------------
@@ -368,8 +368,11 @@ pub const OUTCOME_ENC_NONE: u32 = u32::MAX;
 pub struct HlOutcomeMetaFrame {
     /// Venue event time (`time`, ms) converted to ns; 0 when absent.
     pub ts_ns: NsTs,
-    /// Outcome encoding from a `#<enc>` coin;
-    /// [`OUTCOME_ENC_NONE`] when absent.
+    /// Outcome encoding — `10 * outcome_id`, i.e. the **Yes** side
+    /// (`#<enc>`; the No side is `enc + 1`). Read from the live
+    /// shape's `"outcome"` / `"outcomeSettled"` id, falling back to a
+    /// legacy `"coin":"#<enc>"`. [`OUTCOME_ENC_NONE`] when the push
+    /// names no outcome at all (the `question*` kinds).
     pub enc: u32,
     /// Lifecycle kind: [`OUTCOME_CREATED`] / [`OUTCOME_SETTLED`] /
     /// [`QUESTION_UPDATED`] / [`QUESTION_SETTLED`].
@@ -611,20 +614,7 @@ pub fn parse_outcome_meta(payload: &[u8]) -> Option<HlOutcomeMetaFrame> {
     } else {
         return None;
     };
-    let enc = match find_field(payload, b"\"coin\":") {
-        Some(p) => {
-            let p = skip_byte(payload, p, b'"');
-            if payload.get(p) == Some(&b'#') {
-                match scan_u64(payload, p + 1) {
-                    Some((v, _)) if v <= u32::MAX as u64 => v as u32,
-                    _ => OUTCOME_ENC_NONE,
-                }
-            } else {
-                OUTCOME_ENC_NONE
-            }
-        }
-        None => OUTCOME_ENC_NONE,
-    };
+    let enc = outcome_enc(payload, kind);
     let ts_ns = scan_bare_ms_to_ns(payload, b"\"time\":").unwrap_or(0);
     Some(HlOutcomeMetaFrame {
         ts_ns,
@@ -632,6 +622,94 @@ pub fn parse_outcome_meta(payload: &[u8]) -> Option<HlOutcomeMetaFrame> {
         kind,
         _pad: [0; 51],
     })
+}
+
+/// The outcome id an `outcomeMetaUpdates` element names.
+///
+/// The live shape (venue-probed 2026-09-12) carries it as
+/// `"outcome":N` inside the `outcomeCreated` object and as the bare
+/// integer after `"outcomeSettled":`. The kind-specific key is tried
+/// first, then the generic `"outcome"` key — so a future settled push
+/// that wraps the id in an object is read correctly too. `"outcome":`
+/// cannot false-match `"outcomeCreated":` or `"outcomeMetaUpdates"`:
+/// the needle ends in `":` and those keys continue with a letter.
+#[inline]
+fn outcome_id(payload: &[u8], kind: u8) -> Option<u32> {
+    let specific: &[u8] = match kind {
+        OUTCOME_SETTLED => b"\"outcomeSettled\":",
+        _ => b"\"outcome\":",
+    };
+    for needle in [specific, b"\"outcome\":".as_slice()] {
+        if let Some(pos) = find_field(payload, needle) {
+            if let Some((v, _)) = scan_u64(payload, skip_ws(payload, pos)) {
+                if let Ok(id) = u32::try_from(v) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `enc` for an `outcomeMetaUpdates` push: `10 * id` from the live
+/// shape, else the legacy `"coin":"#<enc>"` scan (the pre-2026-09-12
+/// fixture shape carries no outcome id at all), else
+/// [`OUTCOME_ENC_NONE`].
+#[inline]
+fn outcome_enc(payload: &[u8], kind: u8) -> u32 {
+    if let Some(id) = outcome_id(payload, kind) {
+        if let Some(enc) = id.checked_mul(10) {
+            debug_assert_ne!(enc, OUTCOME_ENC_NONE);
+            return enc;
+        }
+    }
+    let Some(p) = find_field(payload, b"\"coin\":") else {
+        return OUTCOME_ENC_NONE;
+    };
+    let p = skip_byte(payload, p, b'"');
+    if payload.get(p) != Some(&b'#') {
+        return OUTCOME_ENC_NONE;
+    }
+    match scan_u64(payload, p + 1) {
+        Some((v, _)) if v <= u32::MAX as u64 => v as u32,
+        _ => OUTCOME_ENC_NONE,
+    }
+}
+
+/// The outcome id and the raw `description` VALUE of an
+/// `outcomeCreated` push, **borrowed from the rx buffer**.
+///
+/// Zero copy by design: the returned slice points into `payload`, so
+/// the caller must hand it to
+/// [`discovery::parse_outcome_spec`](crate::discovery::parse_outcome_spec)
+/// — which copies out only the fixed-size fields it needs — before
+/// the connection reads over that buffer.
+///
+/// `None` for every other lifecycle kind, and for a created push
+/// whose description is absent, not a string, or unterminated.
+#[inline]
+#[must_use]
+pub fn outcome_meta_description(payload: &[u8]) -> Option<(u32, &[u8])> {
+    // Created pushes only — the same shape `parse_sub_response` uses.
+    memchr::memmem::find(payload, b"\"outcomeCreated\"")?;
+    let id = outcome_id(payload, OUTCOME_CREATED)?;
+    let pos = find_field(payload, b"\"description\":")?;
+    let q = skip_ws(payload, pos);
+    if payload.get(q) != Some(&b'"') {
+        return None;
+    }
+    let start = q + 1;
+    let mut i = start;
+    while i < payload.len() {
+        match payload[i] {
+            // A JSON escape consumes the next byte, so an escaped
+            // quote cannot terminate the value.
+            b'\\' => i += 2,
+            b'"' => return Some((id, &payload[start..i])),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Parse a `subscriptionResponse` echo: returns the acknowledged
@@ -1012,6 +1090,13 @@ mod tests {
         br#"{"channel":"error","data":"Already subscribed: {\"type\":\"bbo\",\"coin\":\"BTC\"}"}"#;
     const PONG: &[u8] = br#"{"channel":"pong"}"#;
     const OUTCOME: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"kind":"outcomeCreated","coin":"#330","time":1723600000000}]}"##;
+    /// The LIVE `outcomeMetaUpdates` shapes, captured verbatim from
+    /// the venue 2026-09-12: `data` is an array of
+    /// `{"outcomeCreated":{…}}` / `{"outcomeSettled":<id>}` elements
+    /// with NO `coin` key and NO top-level `time`.
+    const OUTCOME_LIVE_CREATED: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeCreated":{"outcome":2649,"name":"template:binaryPrice","description":"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630","sideSpecs":[{"name":"template:Yes"},{"name":"template:No"}],"quoteToken":"USDC","venue":"out","deployerFeeScale":"1.0"}}]}"##;
+    const OUTCOME_LIVE_SETTLED: &[u8] =
+        br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeSettled":2638}]}"##;
 
     // ---- classify -------------------------------------------------
 
@@ -1199,6 +1284,62 @@ mod tests {
     fn parse_outcome_meta_rejects_unknown_kind() {
         assert!(parse_outcome_meta(
             br#"{"channel":"outcomeMetaUpdates","data":[{"kind":"other"}]}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_outcome_meta_reads_the_live_shape() {
+        // The live created push: the id lives INSIDE the created
+        // object and `enc` is its Yes side, `10 * 2649`.
+        let f = parse_outcome_meta(OUTCOME_LIVE_CREATED).unwrap();
+        assert_eq!(f.kind, OUTCOME_CREATED);
+        assert_eq!(f.enc, 26_490);
+        // The live shape carries no top-level `time`.
+        assert_eq!(f.ts_ns, 0);
+
+        let f = parse_outcome_meta(OUTCOME_LIVE_SETTLED).unwrap();
+        assert_eq!(f.kind, OUTCOME_SETTLED);
+        assert_eq!(f.enc, 26_380);
+        assert_eq!(f.ts_ns, 0);
+
+        // A settled push that wraps the id in an object still reads.
+        let f = parse_outcome_meta(
+            br#"{"channel":"outcomeMetaUpdates","data":[{"outcomeSettled":{"outcome":2638}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(f.enc, 26_380);
+    }
+
+    #[test]
+    fn outcome_meta_description_is_borrowed_and_created_only() {
+        let (id, desc) = outcome_meta_description(OUTCOME_LIVE_CREATED).unwrap();
+        assert_eq!(id, 2649);
+        assert_eq!(
+            desc,
+            b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630"
+        );
+        // Borrowed, not copied: the slice points into the payload.
+        let base = OUTCOME_LIVE_CREATED.as_ptr() as usize;
+        let at = desc.as_ptr() as usize;
+        assert!(at > base && at < base + OUTCOME_LIVE_CREATED.len());
+
+        // The grammar parser consumes exactly these bytes.
+        let spec = crate::discovery::parse_outcome_spec(id, desc);
+        assert_eq!(spec.grammar, crate::discovery::HlOutcomeGrammar::OutBinaryPrice);
+        assert_eq!(spec.strike_1e6, 77_177_000_000);
+        assert_eq!(spec.twap_s, 60);
+
+        // Every other kind, and the legacy shape (no description).
+        assert!(outcome_meta_description(OUTCOME_LIVE_SETTLED).is_none());
+        assert!(outcome_meta_description(OUTCOME).is_none());
+        // Unterminated / non-string descriptions are refused.
+        assert!(outcome_meta_description(
+            br#"{"data":[{"outcomeCreated":{"outcome":1,"description":"unterminated}}]}"#
+        )
+        .is_none());
+        assert!(outcome_meta_description(
+            br#"{"data":[{"outcomeCreated":{"outcome":1,"description":null}}]}"#
         )
         .is_none());
     }

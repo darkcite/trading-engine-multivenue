@@ -41,8 +41,11 @@ use core_types::InstrumentClass;
 /// * `deribit:<name>` — `…-PERPETUAL` → `Perp`; `…-C` / `…-P` →
 ///   `Option`; `BASE-DDMMMYY` → `Dated`; `BASE_QUOTE` (underscore,
 ///   no dash) → `Spot`;
-/// * `hyperliquid:<coin>` → `Perp` (the `coins` list is the perp
-///   universe);
+/// * `hyperliquid:<coin>` — `#<enc>` (a HIP-4 outcome leg) and the
+///   `out:` / `native:` rolling-family slot descriptors →
+///   `Prediction`; everything else → `Perp` (the `coins` list is the
+///   perp universe). `@<idx>` spot coins read as `Perp` — a KNOWN
+///   mis-class, see [`hl_class`];
 /// * `bybit:<sym>` → `Spot`; `bybit-linear:<sym>` → `Dated` when the
 ///   symbol carries `-DDMMMYY`, else `Perp`.
 #[must_use]
@@ -70,7 +73,7 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
         "binance-opt" => Some(InstrumentClass::Option),
         "okx" => okx_class(name),
         "deribit" => deribit_class(name),
-        "hyperliquid" => Some(InstrumentClass::Perp),
+        "hyperliquid" => Some(hl_class(name)),
         "bybit" => Some(InstrumentClass::Spot),
         "bybit-linear" => Some(if has_dash_ddmmmyy(name) {
             InstrumentClass::Dated
@@ -78,6 +81,26 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
             InstrumentClass::Perp
         }),
         _ => None,
+    }
+}
+
+/// Hyperliquid coins: `BTC` (perp), `#<enc>` (one leg of a HIP-4
+/// outcome — a binary prediction market), and the BIN15 rolling-family
+/// slot descriptors `out:<COIN>:<period>[<side>]` /
+/// `native:<COIN>:<period>[<side>]`, whose member instance is whatever
+/// `#<enc>` is live in that family at the time.
+///
+/// `@<idx>` (spot) returns `Perp`, which is WRONG and deliberately
+/// left alone: no Hyperliquid spot leg has ever been traded here, and
+/// re-classing one would move a fee class on a live venue for no
+/// current caller. The shared fixture pins today's answer so that
+/// changing it has to be a deliberate fixture edit rather than a
+/// silent drift.
+fn hl_class(name: &str) -> InstrumentClass {
+    if name.starts_with('#') || name.starts_with("out:") || name.starts_with("native:") {
+        InstrumentClass::Prediction
+    } else {
+        InstrumentClass::Perp
     }
 }
 
@@ -207,6 +230,12 @@ mod tests {
         assert_eq!(class_of_descriptor("deribit:BTC-1OCT26"), Some(Dated));
         assert_eq!(class_of_descriptor("deribit:BTC-26SEP26-80000-C"), Some(Opt));
         assert_eq!(class_of_descriptor("hyperliquid:BTC"), Some(Perp));
+        assert_eq!(class_of_descriptor("hyperliquid:#26490"), Some(Prediction));
+        assert_eq!(class_of_descriptor("hyperliquid:#26491"), Some(Prediction));
+        assert_eq!(class_of_descriptor("hyperliquid:out:BTC:15m[yes]"), Some(Prediction));
+        assert_eq!(class_of_descriptor("hyperliquid:native:ETH:1d[no]"), Some(Prediction));
+        // Known mis-class, pinned so a change is deliberate (`hl_class`).
+        assert_eq!(class_of_descriptor("hyperliquid:@1338"), Some(Perp));
         assert_eq!(class_of_descriptor("bybit:BTCUSDT"), Some(Spot));
         assert_eq!(class_of_descriptor("bybit-linear:BTCUSDT"), Some(Perp));
         assert_eq!(class_of_descriptor("bybit-linear:BTCUSDT-26SEP25"), Some(Dated));

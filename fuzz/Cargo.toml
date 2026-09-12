@@ -248,6 +248,13 @@ doc    = false
 bench  = false
 
 [[bin]]
+name   = "hl_outcome_spec"
+path   = "fuzz_targets/hl_outcome_spec.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
 name   = "pm_gamma_markets"
 path   = "fuzz_targets/pm_gamma_markets.rs"
 test   = false

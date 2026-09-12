@@ -163,6 +163,16 @@ option_cap = "3:1250"
 [fees.hl]
 spot = "4:7"
 perp = "2:5"
+# HIP-4 outcome markets (BIN15): fees only on close/settle (Hyperliquid
+# docs, trading/fees section "outcome trading"); base tier
+# 0.015 %/0.045 % => 2:5 by L3 (round UP to the whole bp).
+# UNVERIFIED on a live fill (ruling O-Q8) — no BIN15 order has been
+# filled on this venue yet, so both rows are carried, not measured.
+# `<class>_open` is the CHARGE-ONCE key: it becomes
+# `--fee-bps hl.prediction.open:<m>:<t>`, and its absence leaves the
+# class charging its ordinary pair on both legs (bit-identical).
+prediction = "2:5"        # closing fills and settlement
+prediction_open = "0:0"   # opening fills (HIP-4 charges nothing to open)
 
 [fees.bybit]
 spot = "10:10"

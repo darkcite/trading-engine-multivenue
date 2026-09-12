@@ -450,3 +450,47 @@ def test_load_fee_flags_v2_class_tables(tmp_path: pathlib.Path) -> None:
         fees.write_text(bad, encoding="utf-8")
         with pytest.raises(ValueError):
             claude_worker.pnl_report.load_fee_flags(fees)
+
+
+def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
+    """BIN15 O1: `<class>_open` becomes the harness's
+    `--fee-bps <venue>.<class>.open` pair; the ordinary class line is
+    emitted independently; an unknown class in the `_open` key is fatal;
+    and a file without any `_open` key renders byte-identically to the
+    pre-BIN15 reader."""
+    fees = tmp_path / "fees.toml"
+    fees.write_text(
+        "[fees]\n"
+        'hl = "2:5"\n'
+        "[fees.hl]\n"
+        'perp = "2:5"\n'
+        'prediction = "2:5"\n'
+        'prediction_open = "0:0"\n',
+        encoding="utf-8",
+    )
+    assert claude_worker.pnl_report.load_fee_flags(fees) == [
+        "--fee-bps", "hl:2:5",
+        "--fee-bps", "hl.perp:2:5",
+        "--fee-bps", "hl.prediction:2:5",
+        "--fee-bps", "hl.prediction.open:0:0",
+    ]
+    # The shipped example parses, and carries the charge-once pair.
+    example = pathlib.Path(__file__).resolve().parents[2] / "fees.toml.example"
+    flags = claude_worker.pnl_report.load_fee_flags(example)
+    assert "--fee-bps" in flags
+    assert "hl.prediction:2:5" in flags
+    assert "hl.prediction.open:0:0" in flags
+    # Absent `_open` keys: nothing about the rendering changes.
+    fees.write_text('[fees]\nhl = "2:5"\n[fees.hl]\nprediction = "2:5"\n', encoding="utf-8")
+    assert claude_worker.pnl_report.load_fee_flags(fees) == [
+        "--fee-bps", "hl:2:5",
+        "--fee-bps", "hl.prediction:2:5",
+    ]
+    for bad in (
+        '[fees.hl]\npredictions_open = "0:0"\n',
+        '[fees.hl]\n_open = "0:0"\n',
+        '[fees.hl]\nprediction_open = "0"\n',
+    ):
+        fees.write_text(bad, encoding="utf-8")
+        with pytest.raises(ValueError):
+            claude_worker.pnl_report.load_fee_flags(fees)

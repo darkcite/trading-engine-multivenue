@@ -194,6 +194,14 @@ def load_fee_flags(path: pathlib.Path) -> list[str]:
     ``option`` pair stays the fallback the harness charges an option whose
     index it never saw). A distinct key, not a value shape, so a
     section-blind ``key = "m:t"`` reader never trips on it.
+    BIN15 (2026-09-12): a key ``<class>_open`` carries that class's
+    CHARGE-ONCE opening pair -> ``--fee-bps <venue>.<class>.open:<m>:<t>``.
+    HIP-4 outcome markets charge nothing to open and the whole fee on the
+    close or the settlement, which a single per-class pair cannot express.
+    Absent, the class charges its ordinary pair on both legs and the
+    harness is bit-identical to every pre-BIN15 run. Shaped ``"m:t"`` like
+    every other tier so a section-blind reader never trips on it.
+
     Bare lines are emitted FIRST, class lines after, so a class overrides
     its venue's bare pair in argv order (the harness's later-wins law); a
     class absent from the table inherits the bare line. Emission order is
@@ -241,8 +249,15 @@ def load_fee_flags(path: pathlib.Path) -> list[str]:
             index_bps, prem_bps = _pair(val, where)
             classes.extend(("--opt-fee", f"{section}:{index_bps}:{prem_bps}"))
             continue
+        if key.endswith("_open"):
+            cls = key[: -len("_open")]
+            if cls not in FEE_CLASSES:
+                raise ValueError(f"{where}: unknown class {cls!r} in {key!r} (want one of {FEE_CLASSES})")
+            maker, taker = _pair(val, where)
+            classes.extend(("--fee-bps", f"{section}.{cls}.open:{maker}:{taker}"))
+            continue
         if key not in FEE_CLASSES:
-            raise ValueError(f"{where}: unknown class {key!r} (want one of {FEE_CLASSES} or option_cap)")
+            raise ValueError(f"{where}: unknown class {key!r} (want one of {FEE_CLASSES}, <class>_open or option_cap)")
         maker, taker = _pair(val, where)
         classes.extend(("--fee-bps", f"{section}.{key}:{maker}:{taker}"))
     return bare + classes

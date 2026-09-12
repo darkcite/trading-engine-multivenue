@@ -2143,6 +2143,43 @@ fn hl_parsers_are_zero_alloc() {
     assert_eq!(bytes, 0, "hl parser bytes should be zero: saw {bytes}");
 }
 
+/// BIN15 O1: the LIVE `outcomeMetaUpdates` shapes through the
+/// lifecycle parser, the zero-copy description accessor and the
+/// description grammar — 10 000 iterations, zero allocations. The
+/// grammar parser runs on the ingress thread the moment a roll lands,
+/// so "boot-only module" is not a licence for it to allocate.
+#[test]
+fn hl_outcome_meta_parsers_are_zero_alloc() {
+    let created: &[u8] = br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeCreated":{"outcome":2649,"name":"template:binaryPrice","description":"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630","sideSpecs":[{"name":"template:Yes"},{"name":"template:No"}],"quoteToken":"USDC","venue":"out","deployerFeeScale":"1.0"}}]}"##;
+    let settled: &[u8] =
+        br##"{"channel":"outcomeMetaUpdates","data":[{"outcomeSettled":2638}]}"##;
+    let native: &[u8] =
+        b"class:priceBinary|underlying:ETH|expiry:20260913-0600|targetPrice:2510.5|period:1d";
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..10_000u32 {
+        let c = ingress_hyperliquid::parse_outcome_meta(created).unwrap();
+        acc = acc.wrapping_add(c.enc as i64);
+        let s = ingress_hyperliquid::parse_outcome_meta(settled).unwrap();
+        acc = acc.wrapping_add(s.enc as i64);
+        let (id, desc) = ingress_hyperliquid::outcome_meta_description(created).unwrap();
+        acc = acc.wrapping_add(id as i64 + desc.len() as i64);
+        let spec = ingress_hyperliquid::discovery::parse_outcome_spec(id, desc);
+        acc = acc.wrapping_add(spec.strike_1e6 ^ spec.expiry_ns as i64);
+        let n = ingress_hyperliquid::discovery::parse_outcome_spec(1, native);
+        acc = acc.wrapping_add(n.strike_1e6 + n.period_s as i64);
+        std::hint::black_box(ingress_hyperliquid::discovery::parse_hl_time_ns(
+            b"20260912-0630",
+        ));
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(allocs, 0, "hl outcome parsers allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "hl outcome parser bytes should be zero: saw {bytes}");
+}
+
 /// Drive the Hyperliquid ingress run-loop through 1 000+
 /// pre-injected steady-state frames (all 9 subscriptionResponse
 /// acks — verification + staleness arming happen **inside** the

@@ -177,7 +177,7 @@ pub struct BacktestConfig {
     pub replay_dir: PathBuf,
     /// Split spec, echoed VERBATIM into schema-1 after validation.
     pub split: String,
-    /// Repeatable `--fee-bps <venue>[.<class>]:<maker>:<taker>` overrides
+    /// Repeatable `--fee-bps <venue>[.<class>[.open]]:<maker>:<taker>` overrides
     /// (XSD-F: a bare `<venue>:` sets every class, `<venue>.<class>:`
     /// one class — see [`ModelParams::fee_bps`]).
     pub fee_bps: Vec<String>,
@@ -334,6 +334,19 @@ pub struct ModelParams {
     /// a sym of unknown class is charged the venue's DEAREST class
     /// ([`fill::FillEngine::fee_rate`]).
     pub fee_bps: [[(u32, u32); INSTRUMENT_CLASSES]; 7],
+    /// BIN15 O1: the pair charged on an **opening** fill, per venue ×
+    /// class; `None` = "same as [`Self::fee_bps`]", which every venue
+    /// and class carried before BIN15 and which is bit-identical to
+    /// the pre-BIN15 harness.
+    ///
+    /// HIP-4 outcome markets on Hyperliquid charge NOTHING to open and
+    /// the whole fee on the close or the settlement — the CHARGE-ONCE
+    /// law. A flat per-class pair cannot express that, because it is
+    /// the same instrument on both legs; only the direction of the fill
+    /// relative to the position already held distinguishes them.
+    /// `--fee-bps <venue>.<class>.open:<m>:<t>` sets it; a bare
+    /// `<venue>` or `<venue>.<class>` flag never does.
+    pub fee_open_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; 7],
     /// Activation penalty Δ ns per venue (§4.4). **A MEASUREMENT of the
     /// deployment host + network, not a constant** — see
     /// `docs/venue-latency.md` and the provenance on [`Default`].
@@ -372,6 +385,7 @@ impl Default for ModelParams {
     fn default() -> Self {
         Self {
             fee_bps: [[(0, 0); INSTRUMENT_CLASSES]; 7],
+            fee_open_bps: [[None; INSTRUMENT_CLASSES]; 7],
             // VRP V3: the ladder's optimistic rung — the D-7 floor
             // alone. Widening is opt-in and one-way.
             opt_spread_frac_1e6: 0,
@@ -543,7 +557,7 @@ pub fn parse_model_params(
             (Some(vc), Some(mk), Some(tk), None) => (vc, mk, tk),
             _ => {
                 return Err(HarnessError::Usage(format!(
-                    "bad --fee-bps {spec:?}: want <venue>[.<class>]:<maker_bps>:<taker_bps>"
+                    "bad --fee-bps {spec:?}: want <venue>[.<class>[.open]]:<maker_bps>:<taker_bps>"
                 )))
             }
         };
@@ -551,15 +565,23 @@ pub fn parse_model_params(
         // bit); `<venue>.<class>` = that class alone. Later flags win,
         // so `bn:10:10 bn.perp:2:5` reads as "spot tier everywhere on
         // Binance except perps".
-        let (v, class) = match vc.split_once('.') {
-            None => (vc, None),
-            Some((v, c)) => {
+        // BIN15 O1: a trailing `.open` names the OPENING pair of that
+        // class (the charge-once law) instead of its ordinary pair. It
+        // requires a class — `<venue>.open` reads as an unknown class,
+        // which is the error the operator wants to see.
+        let (v, class, opening) = match vc.split_once('.') {
+            None => (vc, None, false),
+            Some((v, rest)) => {
+                let (c, opening) = match rest.strip_suffix(".open") {
+                    Some(c) => (c, true),
+                    None => (rest, false),
+                };
                 let class = InstrumentClass::parse_label(c).ok_or_else(|| {
                     HarnessError::Usage(format!(
                         "bad --fee-bps {spec:?}: unknown class {c:?} (spot|perp|dated|option|prediction)"
                     ))
                 })?;
-                (v, Some(class))
+                (v, Some(class), opening)
             }
         };
         let vi = model_venue(v).ok_or_else(|| {
@@ -571,9 +593,10 @@ pub fn parse_model_params(
         let tk: u32 = tk.parse().map_err(|_| {
             HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable taker bps"))
         })?;
-        match class {
-            None => p.fee_bps[vi] = [(mk, tk); INSTRUMENT_CLASSES],
-            Some(c) => p.fee_bps[vi][c.index()] = (mk, tk),
+        match (class, opening) {
+            (None, _) => p.fee_bps[vi] = [(mk, tk); INSTRUMENT_CLASSES],
+            (Some(c), false) => p.fee_bps[vi][c.index()] = (mk, tk),
+            (Some(c), true) => p.fee_open_bps[vi][c.index()] = Some((mk, tk)),
         }
     }
     for spec in opt_fee_specs {
@@ -3042,6 +3065,57 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// BIN15 O1: `<venue>.<class>.open` sets the OPENING pair and
+    /// nothing else — the ordinary table is untouched, every other
+    /// venue/class keeps `None`, and a bare or class-only flag never
+    /// creates an open pair (which is what makes the harness
+    /// bit-identical for every pre-BIN15 row).
+    #[test]
+    fn fee_flag_grammar_accepts_the_open_suffix() {
+        let p = parse_model_params(
+            &[
+                "hl:2:5".to_owned(),
+                "hl.prediction:2:5".to_owned(),
+                "hl.prediction.open:0:0".to_owned(),
+            ],
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let hl = VenueId::Hyperliquid as usize;
+        let pred = InstrumentClass::Prediction.index();
+        assert_eq!(p.fee_bps[hl][pred], (2, 5), "ordinary pair untouched");
+        assert_eq!(p.fee_open_bps[hl][pred], Some((0, 0)));
+        // Every other class of the venue, and every other venue.
+        assert_eq!(p.fee_open_bps[hl][InstrumentClass::Perp.index()], None);
+        assert_eq!(p.fee_open_bps[VenueId::Binance as usize], [None; INSTRUMENT_CLASSES]);
+        // A bare venue spec sets all five ordinary pairs and NO open pair.
+        let bare = parse_model_params(&["hl:3:7".to_owned()], None, &[], &[], &[], None).unwrap();
+        assert_eq!(bare.fee_bps[hl], [(3, 7); INSTRUMENT_CLASSES]);
+        assert_eq!(bare.fee_open_bps[hl], [None; INSTRUMENT_CLASSES]);
+        // The default table carries no open pair at all.
+        assert_eq!(
+            ModelParams::default().fee_open_bps,
+            [[None; INSTRUMENT_CLASSES]; 7]
+        );
+        // `.open` needs a class; the report renderers are untouched
+        // (schema-1 stdout is frozen).
+        for bad in ["hl.open:0:0", "hl.prediction.opened:0:0", "hl.prediction.open.open:0:0"] {
+            assert!(
+                parse_model_params(&[bad.to_owned()], None, &[], &[], &[], None).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(render_fee_table_json(&p), render_fee_table_json(&{
+            let mut q = p;
+            q.fee_open_bps = [[None; INSTRUMENT_CLASSES]; 7];
+            q
+        }));
     }
 
     #[test]

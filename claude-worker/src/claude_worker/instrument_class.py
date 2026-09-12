@@ -66,6 +66,19 @@ def _deribit(name: str) -> str | None:
     return None
 
 
+def _hyperliquid(name: str) -> str:
+    """Hyperliquid coins: ``#<enc>`` (a HIP-4 outcome leg) and the
+    ``out:``/``native:`` rolling-family slot descriptors are prediction
+    markets; everything else is a perp.
+
+    ``@<idx>`` (spot) returns ``perp`` — a known mis-class, mirrored
+    from the Rust law deliberately so both sides stay bit-identical.
+    """
+    if name.startswith("#") or name.startswith("out:") or name.startswith("native:"):
+        return "prediction"
+    return "perp"
+
+
 def _dash_ddmmmyy(name: str) -> bool:
     base, sep, tail = name.partition("-")
     return bool(sep) and bool(base) and _is_ddmmmyy(tail)
@@ -91,7 +104,7 @@ def class_of_descriptor(descriptor: str) -> str | None:
     if ns == "deribit":
         return _deribit(name)
     if ns == "hyperliquid":
-        return "perp"
+        return _hyperliquid(name)
     if ns == "bybit":
         return "spot"
     if ns == "bybit-linear":

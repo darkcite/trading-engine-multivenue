@@ -6,6 +6,105 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — HIP-4 outcome grammar; `outcomeMetaUpdates` read at its LIVE shape; `hl.prediction` fee class with a charge-once open pair (BIN15 O1)
+
+**What changed**
+
+- **`parse_outcome_meta` now reads the shape the venue actually sends.**
+  This is a PARSER CORRECTION, not a format bump. The live
+  `outcomeMetaUpdates` push (probed 2026-09-12) is
+  `{"data":[{"outcomeCreated":{"outcome":N,…}}]}` or
+  `{"data":[{"outcomeSettled":N}]}` — an array of kind-keyed objects with
+  **no `coin` key and no top-level `time`**. The pre-BIN15 parser looked
+  only for `"coin":"#<enc>"`, so on every live frame it returned
+  `enc = OUTCOME_ENC_NONE` and `ts_ns = 0`; the in-tree fixture that
+  carried `"coin":"#330"` was not the venue's shape. `enc` is now
+  `10 * outcome_id` (the **Yes** side; No is `enc + 1`), read from the
+  kind's own key with the generic `"outcome"` key as a second try, and
+  the legacy coin scan kept as the fallback so the old fixture still
+  parses to `enc = 330` byte for byte.
+
+  **Operator-visible consequence: none in capture.** `enc` is not a
+  captured field — `ChannelId::OutcomeMeta` resolves its `sym` through a
+  `#<enc>` coin key, which the live shape does not have, so those rows
+  keep `sym = SYMBOL_ID_NONE`. Mapping an enc to a slot sym is BIN15 O2
+  (the rolling-instrument pool); `docs/wire-format.md`'s ChannelId row is
+  clarified, not changed.
+
+- **New, additive: the outcome DESCRIPTION grammar.**
+  `ingress_hyperliquid::outcome_meta_description` hands back the raw
+  `description` value **borrowed from the rx buffer** (zero copy), and
+  `discovery::{HlOutcomeSpec, parse_outcome_spec, parse_hl_time_ns}`
+  parse it. A HIP-4 market carries its whole economics in that one
+  `|`-delimited `key:value` string, so the key SET is what identifies
+  the law: `perp:`+`threshold:`+`seconds:`+`time:` ⇒ `OutBinaryPrice`,
+  `perp:`+`target:` ⇒ `OutPriceTouch`,
+  `class:priceBinary`+`underlying:`+`expiry:`+`targetPrice:` ⇒
+  `NativePriceBinary`, anything else ⇒ `Unknown`. Two laws worth
+  knowing: the string is TOKENISED on `|` rather than searched key by
+  key (`priceDescription` is free text, and prose containing
+  `threshold:` must not become the strike), and a required key that is
+  PRESENT but unparseable demotes the grammar to `Unknown` instead of
+  reporting a confident wrong number. `parse_hl_time_ns` is integer
+  days-from-civil, `const`, and rejects impossible dates.
+
+- **`core_config::instrument_class`: the `hyperliquid` namespace is no
+  longer uniformly `Perp`.** `#<enc>` and the `out:` / `native:`
+  rolling-family slot descriptors class as **`Prediction`**; everything
+  else stays `Perp`. Mirrored in `claude_worker.instrument_class` and
+  pinned by the one shared fixture
+  (`claude-worker/tests/fixtures/fees/descriptor-classes.tsv`, now 43
+  rows), which both suites read.
+
+  **KNOWN MIS-CLASS, deliberately left: `hyperliquid:@<idx>` (spot)
+  still classes as `Perp`.** No Hyperliquid spot leg has ever been
+  traded here and re-classing one would move a fee class on a live
+  venue for no current caller. The fixture pins today's answer so that
+  changing it has to be a deliberate fixture edit — the XSD-F precedent.
+
+- **`fees.toml` gains a CHARGE-ONCE key shape: `<class>_open`.**
+  `fees.toml.example` `[fees.hl]` now carries
+  `prediction = "2:5"` and `prediction_open = "0:0"`, with the source
+  line and an **UNVERIFIED** mark (ruling O-Q8 — no BIN15 order has been
+  filled on this venue, so both rows are carried, not measured).
+  HIP-4 charges nothing to open and the whole fee on the close or the
+  settlement; a single per-class pair cannot express that, because it is
+  the same instrument on both legs and only the fill's direction
+  relative to the position already held tells them apart.
+
+  Plumbing: `ModelParams::fee_open_bps: [[Option<(u32,u32)>; 5]; 7]`,
+  the flag grammar `--fee-bps <venue>.<class>.open:<m>:<t>` (the bare
+  and `<venue>.<class>` forms are unchanged and never set an open pair),
+  `claude_worker.pnl_report.load_fee_flags` mapping the key, and
+  `FillEngine::fee_rate_for(venue, sym, opening)` beside `fee_rate`.
+  `opening` is computed from the model's OWN position in the full book
+  before the fill — never from the submit.
+
+  **BIT-IDENTICAL for every pre-BIN15 row**, and the tests say so:
+  `absent_open_pair_is_bit_identical` walks all 7 venues × 5 classes and
+  both fill directions with no open pair set and requires
+  `fee_rate_for == fee_rate`, and compares end-to-end fee TOTALS with
+  the field absent against an open pair that merely restates its class
+  pair. Two deliberate narrowings: the dearest-class FALLBACK is not
+  eligible for an open pair (with no single known class there is nothing
+  to read, and charging a guess as "free to open" would flatter P&L),
+  and `fee_class_unknown_fills` still moves exactly as before because
+  `fee_rate` runs first on every path. Schema-1 stdout and the
+  `render_fee_table_{text,json}` renderers are UNTOUCHED — a test pins
+  that the JSON is identical with and without the new field.
+
+- **Gate counts moved.** `crates/bench/tests/alloc_assertions.rs` gains
+  `hl_outcome_meta_parsers_are_zero_alloc` (the two live frames through
+  the lifecycle parser, the zero-copy accessor and the grammar, 10 000
+  iterations): **the alloc gate goes 49 → 50**. A new fuzz target
+  `fuzz/fuzz_targets/hl_outcome_spec.rs` is registered in
+  `fuzz/Cargo.toml` with the literal `license = "Apache-2.0"` key (that
+  manifest cannot inherit — cargo-fuzz excludes it from the workspace).
+
+**Nothing to do.** No wire layout changed, no capture file changed, no
+engine restart is required by this entry, and a `fees.toml` without a
+`<class>_open` key behaves exactly as it did.
+
 ## 2026-09-12 — `/state` gains a `vrp` object; `stale_skips` splits in two; `engine_strategy_vrp_active` starts telling the truth (VRP P6)
 
 **What changed**

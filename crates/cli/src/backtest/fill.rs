@@ -335,6 +335,17 @@ impl Book {
         self.realized_sum_1e12 - self.fees_ladder_1e12[k] + self.unreal_sum_1e12
     }
 
+    /// The signed position held in `sym`; 0 when the book has never
+    /// held it. BIN15 O1 reads this BEFORE a fill to tell an opening
+    /// fill from a closing one.
+    #[inline]
+    fn pos_qty_1e6(&self, sym: u32) -> i64 {
+        match self.entries.get(&sym) {
+            Some(e) => e.qty_1e6,
+            None => 0,
+        }
+    }
+
     /// Mark move for `sym`: adjust the running unrealized sum.
     /// Returns true when the book holds the sym (caller samples).
     fn on_mark(&mut self, sym: u32, old_mark_1e6: i64, new_mark_1e6: i64) -> bool {
@@ -978,7 +989,8 @@ impl FillEngine {
                     Side::Bid => (mark + h).max(1),
                     Side::Ask => (mark - h).max(1),
                 };
-                let taker_bps = self.fee_rate(o.venue, o.sym).1;
+                let opening = self.is_opening_fill(o.sym, o.side);
+                let taker_bps = self.fee_rate_for(o.venue, o.sym, opening).1;
                 self.book_fill(&o, fill_px, o.remaining_1e6, taker_bps, mark, wall_ns, out);
                 self.mark_fills += 1;
                 // Full fill: compact (FIFO preserved).
@@ -1055,7 +1067,8 @@ impl FillEngine {
                     &mut bid_budget,
                 ) {
                     core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
-                        let taker_bps = self.fee_rate(o.venue, o.sym).1;
+                        let opening = self.is_opening_fill(o.sym, o.side);
+                        let taker_bps = self.fee_rate_for(o.venue, o.sym, opening).1;
                         self.book_fill(&o, px_1e6, qty_1e6, taker_bps, mark, wall_ns, out);
                         self.ioc_fills += 1;
                     }
@@ -1075,7 +1088,8 @@ impl FillEngine {
                 &mut bid_budget,
             ) {
                 core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
-                    let maker_bps = self.fee_rate(o.venue, o.sym).0;
+                    let opening = self.is_opening_fill(o.sym, o.side);
+                    let maker_bps = self.fee_rate_for(o.venue, o.sym, opening).0;
                     self.book_fill(&o, px_1e6, qty_1e6, maker_bps, mark, wall_ns, out);
                     let remaining = o.remaining_1e6 - qty_1e6;
                     if remaining > 0 {
@@ -1203,6 +1217,53 @@ impl FillEngine {
                 }
                 best
             }
+        }
+    }
+
+    /// BIN15 O1: whether a fill on `side` INCREASES the position the
+    /// model already holds in `sym` (or opens it from flat).
+    ///
+    /// The model's OWN position decides, read from the full book before
+    /// the fill is applied — never the intent that produced the order
+    /// (a submit is not a position). A `Bid` adds, so it opens while
+    /// the position is long or flat; an `Ask` opens while it is short
+    /// or flat.
+    #[inline]
+    fn is_opening_fill(&self, sym: u32, side: Side) -> bool {
+        let pos = self.full.pos_qty_1e6(sym);
+        if pos == 0 {
+            return true;
+        }
+        match side {
+            Side::Bid => pos > 0,
+            Side::Ask => pos < 0,
+        }
+    }
+
+    /// [`Self::fee_rate`] with the BIN15 O1 charge-once distinction: a
+    /// class carrying an explicit OPEN pair charges it on a fill that
+    /// increases the position, and its ordinary pair on one that
+    /// reduces or closes it.
+    ///
+    /// Absent open pair ⇒ exactly [`Self::fee_rate`], which is every
+    /// venue and class that existed before BIN15 — and the
+    /// dearest-class fallback is deliberately NOT eligible for an open
+    /// pair: with no single known class there is no open pair to read,
+    /// and charging a guess as "free to open" would flatter P&L.
+    /// `fee_class_unknown_fills` therefore still moves exactly as it
+    /// did, because [`Self::fee_rate`] runs first either way.
+    #[inline]
+    fn fee_rate_for(&mut self, venue: u8, sym: u32, opening: bool) -> (u32, u32) {
+        let ordinary = self.fee_rate(venue, sym);
+        if !opening {
+            return ordinary;
+        }
+        let Some(class) = self.sym_class.get(&sym).copied() else {
+            return ordinary;
+        };
+        match self.params.fee_open_bps[venue as usize][class.index()] {
+            Some(pair) => pair,
+            None => ordinary,
         }
     }
 
@@ -1655,6 +1716,179 @@ mod tests {
         let okx_unknown = make_symbol_id(VenueId::Okx, 5);
         assert_eq!(e.fee_rate(VenueId::Okx as u8, okx_unknown), (0, 0));
         assert_eq!(e.fee_class_unknown_fills, 1);
+    }
+
+    // ---- BIN15 O1: the charge-once fee class -------------------
+
+    /// A prediction sym on Polymarket (the class exists on every
+    /// venue; PM is the one whose rows predate BIN15).
+    fn pred_sym() -> u32 {
+        make_symbol_id(VenueId::Polymarket, 1)
+    }
+
+    /// Open one contract, then close it, and return the fee of each
+    /// fill in order. Both are MAKER fills at our own limit on a
+    /// strict cross, so each pays its pair's maker column.
+    ///
+    /// `on_record` CLEARS `out` at the top — the vec is one record's
+    /// fills, never a run's — so each leg is read before the next
+    /// record is fed.
+    fn open_then_close_fees(p: ModelParams) -> Vec<i128> {
+        let sym = pred_sym();
+        let mut e = FillEngine::new(p, u64::MAX / 2);
+        e.set_sym_class(sym, InstrumentClass::Prediction);
+        let mut out = Vec::new();
+        let mut fees = Vec::new();
+
+        // Open: our bid at 0.50 is crossed by an ask at 0.40.
+        e.intake(&order(sym, Side::Bid, 500_000, 1_000_000, 1), 1_000);
+        e.on_record(
+            &tick(sym, 300_000, 5_000_000, 400_000, 5_000_000),
+            2_000,
+            2_000,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the opening fill");
+        assert_eq!(out[0].side as u8, Side::Bid as u8);
+        assert_eq!(out[0].px_1e6, 500_000, "a maker fills at its own limit");
+        fees.push(out[0].fee_1e12);
+
+        // Close: our ask at 0.40 is crossed by a bid at 0.50.
+        e.intake(&order(sym, Side::Ask, 400_000, 1_000_000, 2), 3_000);
+        e.on_record(
+            &tick(sym, 500_000, 5_000_000, 600_000, 5_000_000),
+            4_000,
+            4_000,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the closing fill");
+        assert_eq!(out[0].side as u8, Side::Ask as u8);
+        assert_eq!(out[0].px_1e6, 400_000);
+        fees.push(out[0].fee_1e12);
+        fees
+    }
+
+    fn pred_params(open_pair: Option<(u32, u32)>) -> ModelParams {
+        let mut p = ModelParams {
+            fee_bps: [[(0, 0); 5]; 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+            ..ModelParams::default()
+        };
+        let pm = VenueId::Polymarket as usize;
+        p.fee_bps[pm][InstrumentClass::Prediction.index()] = (2, 5);
+        p.fee_open_bps[pm][InstrumentClass::Prediction.index()] = open_pair;
+        p
+    }
+
+    #[test]
+    fn an_opening_prediction_fill_is_free_when_the_open_pair_is_zero() {
+        // HIP-4's law: nothing to open, the whole fee on the close.
+        let fees = open_then_close_fees(pred_params(Some((0, 0))));
+        assert_eq!(fees[0], 0, "opening fill pays the open pair (0 bps)");
+        // 0.40 × 1 contract = 4e11, at 2 bps maker.
+        assert_eq!(fees[1], fee_ceil_1e12(400_000 * 1_000_000, 2));
+        assert_eq!(fees[1], 80_000_000);
+    }
+
+    #[test]
+    fn a_closing_prediction_fill_pays_the_class_pair() {
+        // With no open pair BOTH legs pay the class pair — the shape
+        // every venue had before BIN15.
+        let fees = open_then_close_fees(pred_params(None));
+        assert_eq!(fees[0], fee_ceil_1e12(500_000 * 1_000_000, 2));
+        assert_eq!(fees[0], 100_000_000);
+        assert_eq!(fees[1], 80_000_000);
+    }
+
+    /// The bit-identity law: `fee_open_bps` absent must charge exactly
+    /// what the pre-BIN15 harness charged, and an open pair that
+    /// merely restates its class pair must change nothing — for every
+    /// venue, every class, and both fill directions.
+    #[test]
+    fn absent_open_pair_is_bit_identical() {
+        let without = open_then_close_fees(pred_params(None));
+        let restated = open_then_close_fees(pred_params(Some((2, 5))));
+        assert_eq!(without, restated);
+
+        // The table-level statement: with no open pair anywhere,
+        // `fee_rate_for` IS `fee_rate` for every venue × class and
+        // both directions, and the unknown-class counter is untouched
+        // by the new path.
+        let mut p = ModelParams {
+            fee_bps: [[(0, 0); 5]; 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+            ..ModelParams::default()
+        };
+        let mut v = 0usize;
+        while v < 7 {
+            let mut c = 0usize;
+            while c < 5 {
+                p.fee_bps[v][c] = ((v * 5 + c) as u32, (v * 5 + c + 1) as u32);
+                c += 1;
+            }
+            v += 1;
+        }
+        let classes = [
+            InstrumentClass::Spot,
+            InstrumentClass::Perp,
+            InstrumentClass::Dated,
+            InstrumentClass::Option,
+            InstrumentClass::Prediction,
+        ];
+        let mut e = FillEngine::new(p, 0);
+        let mut ord = 0u32;
+        for venue in [
+            VenueId::Polymarket,
+            VenueId::Binance,
+            VenueId::Okx,
+            VenueId::Deribit,
+            VenueId::Hyperliquid,
+            VenueId::Bybit,
+        ] {
+            for class in classes {
+                ord += 1;
+                let sym = make_symbol_id(venue, ord);
+                e.set_sym_class(sym, class);
+                let want = e.fee_rate(venue as u8, sym);
+                assert_eq!(e.fee_rate_for(venue as u8, sym, true), want, "{venue:?} {class:?} open");
+                assert_eq!(e.fee_rate_for(venue as u8, sym, false), want, "{venue:?} {class:?} close");
+            }
+        }
+        // An unknown class is never eligible for an open pair, even
+        // when one is set: there is no single class to read it from.
+        let pm = VenueId::Polymarket as usize;
+        let mut p2 = e.params;
+        p2.fee_open_bps[pm][InstrumentClass::Prediction.index()] = Some((0, 0));
+        let mut e2 = FillEngine::new(p2, 0);
+        let unknown = make_symbol_id(VenueId::Polymarket, 9_999);
+        assert_eq!(
+            e2.fee_rate_for(VenueId::Polymarket as u8, unknown, true),
+            e2.fee_rate(VenueId::Polymarket as u8, unknown)
+        );
+    }
+
+    #[test]
+    fn opening_is_decided_by_the_position_not_the_side() {
+        let sym = pred_sym();
+        let mut e = FillEngine::new(pred_params(None), u64::MAX / 2);
+        // Flat: either side opens.
+        assert!(e.is_opening_fill(sym, Side::Bid));
+        assert!(e.is_opening_fill(sym, Side::Ask));
+        // Long one contract: a bid adds, an ask reduces.
+        e.set_sym_class(sym, InstrumentClass::Prediction);
+        let mut out = Vec::new();
+        e.intake(&order(sym, Side::Bid, 500_000, 1_000_000, 1), 1_000);
+        e.on_record(
+            &tick(sym, 300_000, 5_000_000, 400_000, 5_000_000),
+            2_000,
+            2_000,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(e.is_opening_fill(sym, Side::Bid));
+        assert!(!e.is_opening_fill(sym, Side::Ask));
     }
 
     /// Zero latency, zero flat fee, the venue's option schedule live.

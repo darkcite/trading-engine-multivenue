@@ -31,6 +31,12 @@ deribit:BTC-26SEP26-80000-C	option
 deribit:ETH-12SEP26-4300-P	option
 hyperliquid:BTC	perp
 hyperliquid:XRP	perp
+hyperliquid:#26490	prediction
+hyperliquid:#26491	prediction
+hyperliquid:out:BTC:15m[yes]	prediction
+hyperliquid:out:BTC:15m[no]	prediction
+hyperliquid:native:BTC:1d[yes]	prediction
+hyperliquid:@1338	perp
 bybit:BTCUSDT	spot
 bybit-linear:BTCUSDT	perp
 bybit-linear:SOLUSDT	perp
