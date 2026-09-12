@@ -210,9 +210,6 @@ pub struct BacktestConfig {
     /// ([`member::run_member`]); `ruleset` is then unused. Absent = the
     /// frozen VM path, byte for byte.
     pub member: Option<member::MemberSpec>,
-    /// VRP V5: `--vrp-seed <path>` (default = the run's own
-    /// `vrp-seed.tsv`, else the member holds).
-    pub vrp_seed: Option<PathBuf>,
     /// The funding seed (`backtest::funding`): `--funding-seed <path>`
     /// (default = the first run's own `funding-seed.tsv`, else none —
     /// the funding features warm from the window's own prints as
@@ -710,10 +707,14 @@ pub(crate) fn discover_runs(replay_dir: &Path) -> Result<Vec<RunDir>, HarnessErr
 /// records beside ticks, so every §1.1 feature evaluates in replay
 /// exactly as live (§1.5).
 #[derive(Copy, Clone, Debug)]
-enum RecPayload {
+pub enum RecPayload {
+    /// A book tick (real, or a D-7 synthetic option mark tick).
     Tick(Tick),
+    /// A funding / asset-ctx channel print.
     Event(ChannelEvent),
+    /// A depth snapshot.
     Depth(DepthTopK),
+    /// A captured option summary (ticker lane).
     Opt(OptSummary),
     /// RG3: a captured `SetRegime` frame (`ai-cmds.pmlr`, kind 12 only).
     Regime(AiCmd),
@@ -740,10 +741,10 @@ fn order_run(recs: &mut [MergeKeyed]) {
 /// rewritten to the virtual clock; `wall_ns` is the §3.3 wall mapping
 /// (`epoch_ns_0 + (virt − VIRT_T0)`), kept for UTC-day reporting.
 #[derive(Copy, Clone, Debug)]
-struct MergedRec {
-    payload: RecPayload,
-    virt_ns: u64,
-    wall_ns: u64,
+pub struct MergedRec {
+    pub(crate) payload: RecPayload,
+    pub(crate) virt_ns: u64,
+    pub(crate) wall_ns: u64,
 }
 
 /// Per-run load summary for the stderr report.
@@ -770,6 +771,14 @@ struct RunSummary {
     /// those DROPPED because no underlying was known at their instant.
     opt_quotes_converted: u64,
     opt_quotes_dropped: u64,
+    /// F13: option QUOTE ticks dropped because their sym printed a
+    /// Deribit summary in this run and the registry has no row for it —
+    /// coin numbers with nothing to convert them by.
+    opt_quotes_unregistered: u64,
+    /// F13: manifest rows the parser accepted and the registry TABLE
+    /// refused (full, out of window, venue mismatch). Filled by the
+    /// caller, which is where the registry is built.
+    opt_registry_refused: u64,
     remapped_syms: u64,
     /// VM2 V7: records DROPPED because their run-manifest descriptor
     /// is absent from the binding (newest) manifest — a DEAD
@@ -809,7 +818,7 @@ fn load_run(
     remap: &BTreeMap<u32, u32>,
     dead: &BTreeSet<u32>,
     opt_reg: &opt_registry::OptRegistry,
-    opt_expiry_ns: &mut BTreeMap<u32, u64>,
+    opt_out: &mut opt::OptLoadOut,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
@@ -826,6 +835,10 @@ fn load_run(
     let mut und = opt::UnderlyingBook::new();
     let mut opt_quotes_converted = 0u64;
     let mut opt_quotes_dropped = 0u64;
+    // F13: option syms that printed a Deribit summary in this run and
+    // have no registry row — their quote ticks cannot be denominated.
+    let mut unregistered_opt_syms: BTreeSet<u32> = BTreeSet::new();
+    let mut opt_quotes_unregistered = 0u64;
     let mut any_file = false;
     let map_sym = |sym: u32, remapped: &mut u64, dropped: &mut u64| -> Option<u32> {
         match remap.get(&sym) {
@@ -1031,12 +1044,29 @@ fn load_run(
                 // are priced off it. Keyed on the REMAPPED sym, because
                 // that is what the ticks in `recs` carry.
                 if o.venue == VenueId::Deribit as u8 {
+                    // F13: a Deribit option with no registry row has
+                    // no contract size and no underlying timeline, so
+                    // its QUOTE ticks carry coin numbers nothing can
+                    // honestly convert. Recorded here; dropped below.
+                    if opt_reg.get(o.sym).is_none() {
+                        unregistered_opt_syms.insert(op.sym);
+                    }
                     if let Some(row) = opt_reg.get(o.sym) {
                         und.observe(op.sym, o.ts_ns, o.underlying_px_1e9, row.contract_size_1e9);
-                        // VX: the expiry, keyed on the REMAPPED sym for
-                        // the same reason — that is what the fills the
-                        // fee law prices will carry.
-                        opt_expiry_ns.insert(op.sym, row.expiry_ns);
+                        // VX / VX-A: the expiry that classes a fill as
+                        // a settlement, and the strike and right the
+                        // European cash value needs — keyed on the
+                        // REMAPPED sym for the same reason as the
+                        // underlying: that is what the fills the fee
+                        // and settlement laws price will carry.
+                        opt_out.terms.insert(
+                            op.sym,
+                            opt::OptTerms {
+                                strike_1e6: row.strike_1e6,
+                                right: row.right,
+                                expiry_ns: row.expiry_ns,
+                            },
+                        );
                     }
                 }
                 if !tick_syms.contains(&op.sym) {
@@ -1083,7 +1113,18 @@ fn load_run(
                             payload: RecPayload::Tick(t),
                         });
                         summary_extra.3 += 1;
+                        // F9: the mark-fill law applies to EXACTLY the
+                        // syms a mark tick was synthesised for.
+                        opt_out.synth_syms.insert(op.sym);
                     }
+                } else if !unregistered_opt_syms.contains(&op.sym) {
+                    // VRP V2a: this sym's prices reach `FillEngine`
+                    // through its own top of book, so a zero-spread
+                    // mark-fill registration would overwrite them.
+                    // F13: unless the registry has no row for it, in
+                    // which case those quotes are dropped and the sym
+                    // has no priced lane at all.
+                    opt_out.quote_lane_syms.insert(op.sym);
                 }
             }
         }
@@ -1108,7 +1149,7 @@ fn load_run(
     // DROPPED, not guessed: leaving it would book a coin number as
     // dollars, which is the defect this whole module exists to remove.
     und.seal();
-    if !und.is_empty() {
+    if !und.is_empty() || !unregistered_opt_syms.is_empty() {
         let lanes = VENUE_LABELS.len() as u8;
         recs.retain_mut(|r| {
             if r.lord >= lanes {
@@ -1117,6 +1158,14 @@ fn load_run(
             let RecPayload::Tick(t) = &mut r.payload else {
                 return true;
             };
+            // F13: before `convert_quote` — an unregistered sym is
+            // `NotAnOption` to the book, which would leave a COIN
+            // number in a USD field, the exact defect this pass
+            // exists to remove.
+            if unregistered_opt_syms.contains(&t.sym) {
+                opt_quotes_unregistered += 1;
+                return false;
+            }
             match und.convert_quote(t) {
                 opt::QuoteFix::Converted => {
                     opt_quotes_converted += 1;
@@ -1144,6 +1193,8 @@ fn load_run(
             opts_unconverted,
             opt_quotes_converted,
             opt_quotes_dropped,
+            opt_quotes_unregistered,
+            opt_registry_refused: 0,
             remapped_syms: summary_extra.4,
             dropped_foreign,
             stale: judge.stats,
@@ -1162,7 +1213,7 @@ fn load_run(
 fn load_and_merge(
     runs: &[RunDir],
     stale_after_ms: [u32; 7],
-    opt_expiry_ns: &mut BTreeMap<u32, u64>,
+    opt_out: &mut opt::OptLoadOut,
     sym_class: &mut BTreeMap<u32, InstrumentClass>,
 ) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
@@ -1210,9 +1261,12 @@ fn load_and_merge(
         // manifest. Option ordinals reshuffle at every boot by design
         // (chain roll — `options_manifest.rs:8-11`), so a run's records
         // are only ever priced against the names that boot allocated.
-        let opt_reg = opt::registry_from_manifest_rows(&manifest_rows);
-        let (recs, summary) =
-            load_run(run, &remap, &dead, &opt_reg, opt_expiry_ns, stale_after_ms)?;
+        // F13: a row the parser accepted and the TABLE refused prices
+        // its records through `Unregistered`, which reads exactly like
+        // "not an option at all" — so it is counted, not swallowed.
+        let (opt_reg, registry_refused) = opt::registry_from_manifest_rows(&manifest_rows);
+        let (recs, mut summary) = load_run(run, &remap, &dead, &opt_reg, opt_out, stale_after_ms)?;
+        summary.opt_registry_refused = registry_refused;
         summaries.push(summary);
         if recs.is_empty() {
             continue; // header-only files everywhere: run holds no records
@@ -1257,7 +1311,7 @@ fn load_and_merge(
 /// `<sym>\t<descriptor>` rows of one run's `instrument-manifest.tsv`
 /// (empty when absent/unreadable; malformed lines skipped — the
 /// manifest reader law).
-fn read_manifest_rows(dir: &Path) -> Vec<(u32, String)> {
+pub(crate) fn read_manifest_rows(dir: &Path) -> Vec<(u32, String)> {
     let path = dir.join("instrument-manifest.tsv");
     let mut out = Vec::new();
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -1565,6 +1619,12 @@ pub struct HarnessStats {
     pub opt_quotes_converted: u64,
     /// VRP V2a: option quote ticks dropped for want of an underlying.
     pub opt_quotes_dropped: u64,
+    /// F13: option quote ticks dropped because their sym printed a
+    /// Deribit summary and the registry has no row for it.
+    pub opt_quotes_unregistered: u64,
+    /// F13: manifest rows the parser accepted and the registry TABLE
+    /// refused, summed over the runs.
+    pub opt_registry_refused: u64,
     /// Syms remapped through the per-run manifest join.
     pub remapped_syms: u64,
     /// VM2 V7: dead-descriptor records dropped (§6 law; see
@@ -1575,7 +1635,18 @@ pub struct HarnessStats {
     /// VRP V3: option syms REGISTERED under the D-7 mark-fill law.
     /// Registration, not fills, is what makes the assumption able to
     /// shape a number, so the assumption line is keyed on this.
+    ///
+    /// VRP P2.1 (F9): EXACTLY the syms a D-7 mark tick was synthesised
+    /// for. It used to be every option sym carrying a mark, which since
+    /// VRP V2a is every Deribit option — they all have a quote lane.
     pub opt_mark_syms: u64,
+    /// VRP P2.1: option syms priced by their own REAL top of book.
+    pub opt_quote_lane_syms: u64,
+    /// VRP P2.1 (F10): contracts the replay actually SETTLED — pinned
+    /// to their European cash value at expiry and closed there instead
+    /// of marking out at whatever mid the dead instrument last printed.
+    /// Zero on every root before P2.1: only `audit-pnl` ever settled.
+    pub opt_settled: u64,
     /// VT4: ticks the fill model skipped as STALE (no mark, no fill).
     pub stale_ticks_skipped: u64,
     /// I1: IoC orders filled at their activation touch.
@@ -1734,14 +1805,10 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
 
     // Capture discovery + merge + rebase (§3.1–§3.3).
     let runs = discover_runs(&cfg.replay_dir)?;
-    let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut opt_out = opt::OptLoadOut::default();
     let mut sym_class: BTreeMap<u32, InstrumentClass> = BTreeMap::new();
-    let (merged, run_summaries) = load_and_merge(
-        &runs,
-        model.stale_after_ms,
-        &mut opt_expiry_ns,
-        &mut sym_class,
-    )?;
+    let (merged, run_summaries) =
+        load_and_merge(&runs, model.stale_after_ms, &mut opt_out, &mut sym_class)?;
     let universe = derive_universe(&merged);
 
     // The REUSED validator (§3.5) — same byte scanner, same reject
@@ -1857,39 +1924,23 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
     //    model's §4.1 intake with `t_active = now + Δ_venue`; an order
     //    therefore can never fill on its own emitting tick.
     let mut engine = FillEngine::new(model, boundary_virt);
-    // D-7: register mark-filled option syms (any sym that produced a
-    // synthetic mark-tick this root — collected from the payloads).
-    let mut mark_fill_syms: BTreeSet<u32> = BTreeSet::new();
-    for rec in &merged {
-        if let RecPayload::Opt(o) = &rec.payload {
-            if o.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && o.mark_px_1e9 > 0 {
-                mark_fill_syms.insert(o.sym);
-            }
-            // VRP V2b: the index leg of the venue's capped option fee.
-            // Presence of an index is what classes a sym as
-            // fee-capped, so only Deribit options get one. The field is
-            // the expiry's FORWARD rather than the spot index (V0(a),
-            // measured −2.22 bps of basis); at a $23.70 index leg that
-            // is half a cent, and `index_price` is parsed by nothing in
-            // the tree — documented rather than plumbed.
-            if o.venue == VenueId::Deribit as u8 && o.underlying_px_1e9 > 0 {
-                engine.set_opt_index(o.sym, o.underlying_px_1e9 / 1_000);
-            }
-        }
-    }
-    // VX: the expiries, so a fill at or after one is charged the venue's
-    // SETTLEMENT rate rather than its trade rate. Collected during the
-    // merge from each run's OWN registry and keyed on the remapped sym,
-    // because a chain that rolled across boots is one instrument here.
-    for (sym, expiry_ns) in &opt_expiry_ns {
-        engine.set_opt_expiry(*sym, *expiry_ns);
-    }
+    // VRP P2.1 (F9, F10): the whole option model — mark-fill law,
+    // capped-fee index leg, expiry classifier and European cash
+    // settlement — in ONE place, shared with `--member` and
+    // `audit-pnl`. The window's last wall instant bounds what can ever
+    // settle: `FillEngine` pins on `wall >= expiry` and `finish` is
+    // capped at the last record it saw.
+    let window_end_wall_ns = merged[merged.len() - 1].wall_ns;
+    let opt_model = opt::register_option_model(
+        &mut engine,
+        &merged,
+        &opt_out.synth_syms,
+        &opt_out.terms,
+        window_end_wall_ns,
+    );
     // XSD-F: the per-sym fee class (descriptor law over the manifests).
     for (sym, class) in &sym_class {
         engine.set_sym_class(*sym, *class);
-    }
-    for sym in &mark_fill_syms {
-        engine.set_mark_fill_sym(*sym);
     }
     // The funding seed (docs on `backtest::funding`): the flag wins,
     // else the first run's own `funding-seed.tsv` when it exists (the
@@ -2119,10 +2170,15 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         opts_unconverted: run_summaries.iter().map(|r| r.opts_unconverted).sum(),
         opt_quotes_converted: run_summaries.iter().map(|r| r.opt_quotes_converted).sum(),
         opt_quotes_dropped: run_summaries.iter().map(|r| r.opt_quotes_dropped).sum(),
+        opt_quotes_unregistered: run_summaries.iter().map(|r| r.opt_quotes_unregistered).sum(),
+        opt_registry_refused: run_summaries.iter().map(|r| r.opt_registry_refused).sum(),
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
-        opt_mark_syms: mark_fill_syms.len() as u64,
+        opt_mark_syms: opt_model.mark_fill_syms.len() as u64,
+        opt_quote_lane_syms: opt_out.quote_lane_syms.len() as u64,
+        opt_settled: outcome.opt_settled,
+
         stale_ticks_skipped: outcome.stale_ticks_skipped,
         ioc_fills: outcome.ioc_fills,
         ioc_canceled: outcome.ioc_canceled,
@@ -2454,6 +2510,16 @@ fn render_summary(
             stats.opt_quotes_converted, stats.opt_quotes_dropped
         ));
     }
+    // F13: an unregistered option's quotes are COIN with nothing to
+    // convert them by, and a refused registry row is why. Appended
+    // only when it fires, so the byte-identical guard still rests on
+    // an option-free root rendering as it always did.
+    if stats.opt_quotes_unregistered > 0 || stats.opt_registry_refused > 0 {
+        s.push_str(&format!(
+            "options: quote_ticks_unregistered={} registry_refused={} (a Deribit              option summary with no registry row: its quotes are COIN and are              DROPPED rather than booked as dollars)\n",
+            stats.opt_quotes_unregistered, stats.opt_registry_refused
+        ));
+    }
     if stats.opts_unconverted > 0 {
         s.push_str(&format!(
             "options: opts_unconverted={} (marked records that could not be \
@@ -2465,12 +2531,22 @@ fn render_summary(
     // VRP V3: the D-7 obligation — the assumption is PRINTED wherever
     // it can shape a number, and it names the ladder rung it ran at.
     // Conditional, so an option-free root renders as it always did.
-    if stats.opt_mark_syms > 0 {
+    //
+    // VRP P2.1: the gate is now "this root carried options at all",
+    // because after F9 the mark-fill count is 0 on every real capture
+    // and the operator still needs to see which lane priced them.
+    if stats.opt_mark_syms > 0 || stats.opt_quote_lane_syms > 0 || stats.opt_settled > 0 {
         s.push_str(&opt::render_opt_mark_law(
             stats.opt_mark_syms as usize,
             model.opt_spread_frac_1e6,
         ));
-        s.push_str(&format!(" mark_fills={}\n", stats.mark_fills));
+        s.push_str(&format!(
+            " mark_fills={} opt_mark_syms={} quote_lane_syms={} opt_settled={}\n",
+            stats.mark_fills,
+            stats.opt_mark_syms,
+            stats.opt_quote_lane_syms,
+            stats.opt_settled
+        ));
     }
     for (i, r) in runs.iter().enumerate() {
         s.push_str(&format!("  run[{i}] epoch_ns={}", r.epoch_ns));

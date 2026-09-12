@@ -248,3 +248,116 @@ def test_cut_run_writes_the_windows_own_funding_seed_from_the_funding_table(tmp_
     claude_worker.candles.open_db(db2).close()
     out_bare = claude_worker.window_root.cut_run(run, tmp_path / "roots3", 0.0, 7200.0, seed=(tmp_path / "nope.toml", db2))
     assert not (out_bare / claude_worker.seeds.FUNDING_SEED_FILE).exists()
+
+
+# ---------------------------------------------------------------
+# VRP P2.4 — the campaign pool
+# ---------------------------------------------------------------
+
+TAU_8H_NS = 28_800_000_000_000
+SELECTION_NS = 600_000_000_000
+VRP_TOML = (
+    "[vrp]\n"
+    "theta_1e9             = 100000000\n"
+    f"tau_ns                = {TAU_8H_NS}\n"
+    "epsilon_ns            = 300000000000\n"
+    f"selection_ns          = {SELECTION_NS}\n"
+    "rebalance_ns          = 3600000000000\n"
+    "qty_1e6               = 1000000\n"
+    "band_qty_1e6          = 50000\n"
+    'underlying_descriptor = "deribit:BTC-PERPETUAL"\n'
+    'hedge_descriptor      = "deribit:BTC-PERPETUAL"\n'
+)
+
+
+def test_campaign_cut_emits_nine_windows_all_under_two_hours(tmp_path):
+    """The nine instants a VRP campaign decides at, and nothing between.
+
+    The whole point of the campaign pool: the nine hours between the
+    entry and the expiry cannot be replayed under the 2 h capture law,
+    and do not need to be — the member acts at the decision instant, at
+    each hour boundary, and at the settlement.
+    """
+    # A UTC day whose 08:00Z expiry the capture covers end to end.
+    day_ms = 1_788_000_000_000 // 86_400_000 * 86_400_000 + 12 * 3_600_000
+    expiry_ns = claude_worker.window_root.campaign_expiry_ns(day_ms)
+    assert expiry_ns % 86_400_000_000_000 == 8 * 3_600_000_000_000, "08:00Z"
+
+    ws = claude_worker.window_root.campaign_windows(day_ms, TAU_8H_NS, SELECTION_NS)
+    assert len(ws) == claude_worker.window_root.CAMPAIGN_WINDOWS_PER_DAY == 9
+    assert [w.label for w in ws] == [
+        "decide",
+        "hedge-01",
+        "hedge-02",
+        "hedge-03",
+        "hedge-04",
+        "hedge-05",
+        "hedge-06",
+        "hedge-07",
+        "settle",
+    ]
+    # Every slice is far below the 2 h law, and they are in wall order.
+    for w in ws:
+        assert 0 < (w.to_ns - w.from_ns) <= claude_worker.window_root.WINDOW_MAX_S * 1e9
+    assert all(a.from_ns < b.from_ns for a, b in zip(ws[:-1], ws[1:], strict=True))
+    # The decision slice brackets the entry instant on both sides.
+    entry_ns = expiry_ns - TAU_8H_NS
+    assert ws[0].from_ns < entry_ns - SELECTION_NS
+    assert ws[0].to_ns > entry_ns + SELECTION_NS
+    # The settlement slice opens BEFORE the expiry: the member settles
+    # at the last index it was told about, and the first record at the
+    # expiry instant is a perp tick, not a summary.
+    assert ws[-1].from_ns < expiry_ns < ws[-1].to_ns
+
+    # One run covering the whole campaign, one tick a minute.
+    epoch_ns = ws[0].from_ns - 600 * S
+    ts = [1_000 + k * 60 * S for k in range(((ws[-1].to_ns - epoch_ns) // (60 * S)) + 2)]
+    run = tests.craft.write_run(tmp_path / "logs", epoch_ns, ts)
+    (run / "instrument-manifest.tsv").write_text("42\tderibit:BTC-PERPETUAL\n")
+    vrp = tmp_path / "vrp.toml"
+    vrp.write_text(VRP_TOML)
+
+    lines: list[str] = []
+    pool = tmp_path / "windows-vrp"
+    made = claude_worker.window_root.campaign_cut(
+        tmp_path / "logs", pool, day_ms, vrp, None, report=lines.append
+    )
+    assert len(made) == 9, lines
+    assert [p.name for p in made] == sorted(p.name for p in made), "cuts are in wall order"
+    # Each cut is a run directory the harness accepts, named for the
+    # window's own wall epoch, and each is under the 2 h law.
+    for w, cut in zip(ws, made, strict=True):
+        assert cut.is_dir()
+        assert cut.name == f"run-{w.from_ns}"
+        span = claude_worker.window_root.run_span(cut)
+        assert span is not None, cut.name
+        assert (span[1] - span[0]) <= claude_worker.window_root.WINDOW_MAX_S * S
+        assert (cut / "instrument-manifest.tsv").is_file()
+    assert any("campaign-pool: cut" in line and "(decide)" in line for line in lines)
+    assert any("(settle)" in line for line in lines)
+
+    # Pruning is by COUNT, newest kept — a byte budget would prune a
+    # day's campaign in half and leave a settlement with no entry.
+    kept = claude_worker.window_root.campaign_prune(pool, 4, report=lines.append)
+    assert [p.name for p in kept] == [p.name for p in made[-4:]]
+
+
+def test_campaign_cut_skips_a_slice_no_run_covers(tmp_path):
+    """A campaign the capture missed is a day with no evidence, not an
+    error — the slices that DO have a run are still cut."""
+    day_ms = 1_788_000_000_000 // 86_400_000 * 86_400_000 + 12 * 3_600_000
+    ws = claude_worker.window_root.campaign_windows(day_ms, TAU_8H_NS, SELECTION_NS)
+    # A run that starts only at the fourth slice.
+    epoch_ns = ws[3].from_ns
+    ts = [1_000 + k * 60 * S for k in range(((ws[-1].to_ns - epoch_ns) // (60 * S)) + 2)]
+    run = tests.craft.write_run(tmp_path / "logs", epoch_ns, ts)
+    (run / "instrument-manifest.tsv").write_text("42\tderibit:BTC-PERPETUAL\n")
+    vrp = tmp_path / "vrp.toml"
+    vrp.write_text(VRP_TOML)
+
+    lines: list[str] = []
+    made = claude_worker.window_root.campaign_cut(
+        tmp_path / "logs", tmp_path / "windows-vrp", day_ms, vrp, None, report=lines.append
+    )
+    assert len(made) == 6, lines
+    assert sum("has no run - skipped" in line for line in lines) == 3

@@ -38,12 +38,15 @@ Offline tool — allocation is fine; never imported by the engine.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import argparse
 import mmap
 import os
 import pathlib
 import shutil
 import sqlite3
 import struct
+import sys
+import time
 import typing
 
 import claude_worker.iv_digest
@@ -459,3 +462,241 @@ def symlink_root(dst: pathlib.Path, windows: typing.Iterable[pathlib.Path]) -> p
     for w in windows:
         (dst / w.name).symlink_to(w.resolve(), target_is_directory=True)
     return dst
+
+
+# ---------------------------------------------------------------
+# VRP P2.4 — the CAMPAIGN pool
+# ---------------------------------------------------------------
+#
+# A VRP campaign is nine instants spread over nine hours, and the ≤ 2 h
+# capture law forbids replaying the nine hours between them. So the pool
+# for this member is not "the newest k complete 2 h windows" — it is the
+# NINE slices a campaign actually decides in, cut per UTC day:
+#
+#   * the decision window `[entry - selection - pad, entry + selection
+#     + pad]`, where `entry = expiry - tau`,
+#     which holds the strike selection AND the entry;
+#   * the first `pad` after every hour boundary strictly between the
+#     entry and the expiry — the delta-hedge rebalance instants;
+#   * `[expiry - settle_pre, expiry + settle_post]` - the settlement
+#     and the unwind.
+#
+# `backtest --member vrp --replay-dir <pool>` replays them as ONE
+# timeline (the harness carries state across runs, and the member's
+# clock is wall), so a hedge fires on a tick inside an hour-open slice
+# and the settlement on the first record after the expiry, as live.
+#
+# The minutes BETWEEN the slices are not in the pool, so the member's
+# own 24 h warm-up cannot come from the tape — it comes from each
+# window's `vrp-seed.tsv`, which `cut_run` already writes from
+# `candles.db` as of that window's first instant.
+
+VRP_POOL_DIRNAME: str = "windows-vrp"
+#: Deribit settles its daily options at 08:00 UTC.
+VRP_EXPIRY_HOUR_UTC: int = 8
+#: Slack on each side of the decision window, and the length of each
+#: hour-open hedge slice.
+CAMPAIGN_PAD_S: float = 300.0
+#: `[expiry - this, expiry + CAMPAIGN_SETTLE_POST_S]` - the settlement
+#: slice. It opens BEFORE the expiry so the member's last index is the
+#: one it settles at (the first record at the expiry instant is a perp
+#: tick, not a summary), and closes well after so the perp unwind has
+#: ticks to fill against.
+CAMPAIGN_SETTLE_PRE_S: float = 600.0
+CAMPAIGN_SETTLE_POST_S: float = 1200.0
+#: Campaign windows per UTC day: 1 decision + 7 hedge instants + 1
+#: settlement, at the artifact's 8 h τ.
+CAMPAIGN_WINDOWS_PER_DAY: int = 9
+#: Five days of campaigns — the retention the pool is pruned to, by
+#: COUNT, exactly as the VM pool is.
+CAMPAIGN_POOL_DAYS: int = 5
+
+
+class CampaignWindow(typing.NamedTuple):
+    """One campaign slice as WALL instants, with the name of the instant
+    it exists for (`decide`, `hedge-03`, `settle`)."""
+
+    from_ns: int
+    to_ns: int
+    label: str
+
+
+def campaign_expiry_ns(day_ms: int) -> int:
+    """The daily expiry of the UTC day containing `day_ms`: 08:00Z."""
+    day0_ms = (day_ms // 86_400_000) * 86_400_000
+    return (day0_ms + VRP_EXPIRY_HOUR_UTC * 3_600_000) * 1_000_000
+
+
+def campaign_windows(day_ms: int, tau_ns: int, selection_ns: int) -> list[CampaignWindow]:
+    """The nine slices of the campaign settling on the UTC day containing
+    `day_ms`, in wall order.
+
+    Every slice is far below the 2 h law by construction; the assertion
+    is in the test, not here, because a τ the engine refuses never
+    reaches this function.
+    """
+    expiry_ns = campaign_expiry_ns(day_ms)
+    entry_ns = expiry_ns - tau_ns
+    pad_ns = int(CAMPAIGN_PAD_S * 1e9)
+    out: list[CampaignWindow] = [
+        CampaignWindow(entry_ns - selection_ns - pad_ns, entry_ns + selection_ns + pad_ns, "decide")
+    ]
+    # The rebalance instants: every hour boundary strictly inside
+    # (entry, expiry). At τ = 8 h and an 08:00Z expiry that is 01:00Z
+    # through 07:00Z — seven of them.
+    hour_ns = 3_600_000_000_000
+    h = (entry_ns // hour_ns + 1) * hour_ns
+    while h < expiry_ns:
+        out.append(CampaignWindow(h, h + pad_ns, f"hedge-{(h // hour_ns) % 24:02d}"))
+        h += hour_ns
+    out.append(
+        CampaignWindow(
+            expiry_ns - int(CAMPAIGN_SETTLE_PRE_S * 1e9),
+            expiry_ns + int(CAMPAIGN_SETTLE_POST_S * 1e9),
+            "settle",
+        )
+    )
+    return out
+
+
+def _run_covering(logs_dir: pathlib.Path, wall_ns: int) -> tuple[pathlib.Path, int, int] | None:
+    """The run whose captured span contains `wall_ns`, as
+    `(run_dir, epoch_ns, end_wall_ns)`; None when no run covers it.
+
+    The run's wall clock is `epoch + (ts - ts_first)`, so its span in
+    wall time is `[epoch, epoch + (ts_last - ts_first)]`.
+    """
+    best: tuple[pathlib.Path, int, int] | None = None
+    for run_dir in logs_dir.glob("run-*"):
+        if not run_dir.is_dir():
+            continue
+        try:
+            epoch_ns = int(run_dir.name[4:])
+        except ValueError:
+            continue
+        span = run_span(run_dir)
+        if span is None:
+            continue
+        end_ns = epoch_ns + (span[1] - span[0])
+        if epoch_ns <= wall_ns <= end_ns and (best is None or epoch_ns > best[1]):
+            best = (run_dir, epoch_ns, end_ns)
+    return best
+
+
+def campaign_cut(  # noqa: PLR0913 - one parameter per cut input, deliberately
+    logs_dir: pathlib.Path,
+    pool_dir: pathlib.Path,
+    day_ms: int,
+    vrp_path: pathlib.Path,
+    seed: tuple[pathlib.Path, pathlib.Path] | None,
+    *,
+    report: typing.Callable[[str], None] | None = None,
+) -> list[pathlib.Path]:
+    """Cut one UTC day's campaign into `pool_dir`; returns the cuts made,
+    oldest first.
+
+    A slice no run covers is SKIPPED and reported — a campaign the
+    capture missed is not an error, it is a day with no evidence. A
+    slice that starts inside a run and outlives it is clamped to that
+    run: the harness replays the runs in epoch order anyway, so the
+    remainder arrives as the next run's own records.
+    """
+    descriptor, tau_ns = claude_worker.vrp_seed.read_vrp_toml(vrp_path)
+    selection_ns = claude_worker.vrp_seed.read_selection_ns(vrp_path)
+    del descriptor  # the cut is a function of the clock alone
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    made: list[pathlib.Path] = []
+    for w in campaign_windows(day_ms, tau_ns, selection_ns):
+        found = _run_covering(logs_dir, w.from_ns)
+        if found is None:
+            if report is not None:
+                report(f"campaign-pool: {w.label} {w.from_ns} has no run - skipped")
+            continue
+        run_dir, epoch_ns, end_ns = found
+        from_s = (w.from_ns - epoch_ns) / 1e9
+        to_s = (min(w.to_ns, end_ns) - epoch_ns) / 1e9
+        if to_s <= from_s:
+            if report is not None:
+                report(f"campaign-pool: {w.label} is empty in {run_dir.name} - skipped")
+            continue
+        cut = cut_run(run_dir, pool_dir, from_s, to_s, report=report, seed=seed, vrp=vrp_path)
+        made.append(cut)
+        if report is not None:
+            report(
+                f"campaign-pool: cut {cut.name} ({w.label}) <- {run_dir.name}"
+                f" {from_s:.0f}..{to_s:.0f} s"
+            )
+    return sorted(made, key=lambda p: p.name)
+
+
+def campaign_prune(
+    pool_dir: pathlib.Path,
+    k: int,
+    report: typing.Callable[[str], None] | None = None,
+) -> list[pathlib.Path]:
+    """Keep the newest `k` cuts in the campaign pool, by COUNT — the VM
+    pool's law, for the same reason: a byte budget would prune a day's
+    campaign in half and leave a settlement with no entry."""
+    if k <= 0:
+        raise WindowError("pool size must be positive")
+    have = pool_windows(pool_dir)
+    for path in have[: max(0, len(have) - k)]:
+        shutil.rmtree(path, ignore_errors=True)
+        if report is not None:
+            report(f"campaign-pool: pruned {path.name} (beyond the newest {k})")
+    return pool_windows(pool_dir)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: `--campaign vrp` cuts one UTC day's campaign pool.
+
+    Offline tool, run by hand or by a daily lane — never by the engine.
+    """
+    ap = argparse.ArgumentParser(prog="claude_worker.window_root")
+    ap.add_argument(
+        "--campaign",
+        required=True,
+        choices=("vrp",),
+        help="which member's campaign shape to cut",
+    )
+    ap.add_argument("--logs", required=True, type=pathlib.Path, help="the capture log root")
+    ap.add_argument(
+        "--pool",
+        type=pathlib.Path,
+        default=None,
+        help=f"the campaign pool (default: <db dir>/{VRP_POOL_DIRNAME})",
+    )
+    ap.add_argument("--db", required=True, type=pathlib.Path, help="candles.db, for the seeds")
+    ap.add_argument("--vrp", required=True, type=pathlib.Path, help="vrp.toml")
+    ap.add_argument("--regime", type=pathlib.Path, default=None, help="regime.toml, for the seed")
+    ap.add_argument(
+        "--day-ms",
+        type=int,
+        default=None,
+        help="any instant in the UTC day whose 08:00Z expiry to cut (default: now)",
+    )
+    ap.add_argument(
+        "--keep-days",
+        type=int,
+        default=CAMPAIGN_POOL_DAYS,
+        help="campaign days to retain (pruned by COUNT)",
+    )
+    args = ap.parse_args(argv)
+
+    pool = args.pool if args.pool is not None else args.db.parent / VRP_POOL_DIRNAME
+    day_ms = args.day_ms if args.day_ms is not None else int(time.time() * 1000)
+    seed = (args.regime, args.db) if args.regime is not None else (args.db, args.db)
+    made = campaign_cut(
+        args.logs, pool, day_ms, args.vrp, seed, report=lambda line: print(line, file=sys.stderr)
+    )
+    kept = campaign_prune(
+        pool,
+        args.keep_days * CAMPAIGN_WINDOWS_PER_DAY,
+        report=lambda line: print(line, file=sys.stderr),
+    )
+    print(f"campaign-pool: {len(made)} cut(s) this day, {len(kept)} window(s) in {pool}")
+    return 0 if made else 1
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI
+    raise SystemExit(main())

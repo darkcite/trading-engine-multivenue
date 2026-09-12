@@ -585,6 +585,12 @@ pub struct ModelOutcome {
     /// tape happened to carry. > 0 obliges the caller to PRINT it: it
     /// means the window contains an expiry the intents did not close.
     pub opt_settled: u64,
+    /// F12: open orders canceled because their sym had already SETTLED.
+    /// Deribit keeps quoting an expired instrument for 9–19 min, so a
+    /// resting order on a settled sym would otherwise fill against a
+    /// dead book at a price the contract can no longer trade at. The
+    /// cash settlement already happened; nothing can execute after it.
+    pub settled_sym_orders_canceled: u64,
     /// XSD-F: fills charged the venue's DEAREST class because the sym's
     /// class was unknown (no manifest row, or a descriptor shape the law
     /// does not know). > 0 under per-class fees is a tell to print — the
@@ -667,6 +673,14 @@ pub struct FillEngine {
     last_wall_ns: u64,
     /// VX-A: option positions closed by the settlement sweep.
     opt_settled: u64,
+    /// F12: orders canceled because their sym had already settled.
+    settled_sym_orders_canceled: u64,
+    /// F15: the per-sym underlying timeline in WALL time, so the
+    /// capped option fee's index leg is read at the FILL instant
+    /// rather than from whatever index the run last printed. Absent =
+    /// the last-index fallback (`opt_index_1e6`), which is what every
+    /// surface did before.
+    opt_index_book: Option<crate::backtest::opt::UnderlyingBook>,
     /// XSD-F: fee class per sym, from the run manifest's descriptor
     /// through the descriptor law ([`core_config::instrument_class`]).
     /// A sym absent here is charged the venue's DEAREST class and
@@ -715,6 +729,8 @@ impl FillEngine {
             settle_due_ns: u64::MAX,
             last_wall_ns: 0,
             opt_settled: 0,
+            settled_sym_orders_canceled: 0,
+            opt_index_book: None,
             sym_class: BTreeMap::new(),
             fee_class_unknown_fills: 0,
             mark_fills: 0,
@@ -953,8 +969,13 @@ impl FillEngine {
                     i += 1;
                     continue;
                 }
+                // F17: both sides floor at one micro-dollar. On a
+                // SETTLED OTM contract the mark IS zero and `h` is
+                // zero with it, so a resting BID priced at `mark + h`
+                // booked a fill at a price of nothing — a number the
+                // accounting cannot mean.
                 let fill_px = match o.side {
-                    Side::Bid => mark + h,
+                    Side::Bid => (mark + h).max(1),
                     Side::Ask => (mark - h).max(1),
                 };
                 let taker_bps = self.fee_rate(o.venue, o.sym).1;
@@ -967,6 +988,28 @@ impl FillEngine {
         }
 
         // ---- (b) fill pass: strict-cross makers + IoC takers ----
+        //
+        // F12: not on a SETTLED sym. The contract became cash at its
+        // expiry; Deribit then keeps quoting the dead instrument for
+        // 9–19 min, and since VRP V2a those quotes are a real tick
+        // lane — so without this an order resting across an expiry
+        // filled against a book that no longer exists, at a premium
+        // the holder can no longer receive. The order is canceled and
+        // counted, which is also what the live matcher does to it (the
+        // I1 TTL outlives nothing).
+        if self.settled.contains(&sym) {
+            let mut i = 0usize;
+            while i < self.open_len {
+                if self.open[i].sym == sym {
+                    self.remove_open(i);
+                    self.settled_sym_orders_canceled += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            return;
+        }
+
         // Two-sided ticks only, same as the mark: a one-sided book is
         // not trusted as fill evidence (the 8e preopen lesson; also
         // every fill needs the mark this record just wrote). Fewer
@@ -1087,8 +1130,19 @@ impl FillEngine {
         wall_ns: u64,
     ) -> i128 {
         let venue = model_venue_byte(sym) as usize;
-        let Some(&index_1e6) = self.opt_index_1e6.get(&sym) else {
+        // Presence of an index is what CLASSES a sym as fee-capped;
+        // `opt_index_1e6` stays that classifier and the fallback value.
+        let Some(&last_index_1e6) = self.opt_index_1e6.get(&sym) else {
             return fee_ceil_1e12(notional_1e12, fee_bps);
+        };
+        // F15: the index leg is a fraction of the index notional AT
+        // THE FILL, so reading the run's LAST index charged an 8 h-old
+        // campaign's opening trade at the index it closed on. The book
+        // is wall-stamped; a fill before the first observation falls
+        // back to the last index, which is what every surface did.
+        let index_1e6 = match self.opt_index_book.as_ref() {
+            Some(b) => b.at(sym, wall_ns).map_or(last_index_1e6, |u| u / 1_000),
+            None => last_index_1e6,
         };
         let f = match self.params.opt_fee.get(venue) {
             Some(f) if f.active && index_1e6 > 0 => *f,
@@ -1158,6 +1212,19 @@ impl FillEngine {
         if index_1e6 > 0 {
             self.opt_index_1e6.insert(sym, index_1e6);
         }
+    }
+
+    /// F15: attach the WALL-stamped underlying timeline the capped
+    /// option fee's index leg is read from at each fill instant.
+    ///
+    /// Owned rather than borrowed: `FillEngine` is constructed, moved
+    /// and stored in several shapes (`audit-pnl` builds one per
+    /// strategy and per ruleset hash), and a lifetime parameter on it
+    /// would reach every one of them to refine a fee by basis points.
+    /// The book is two maps of a deduped timeline over at most a few
+    /// dozen option syms — offline, and never on a hot path.
+    pub fn attach_underlying_book(&mut self, book: crate::backtest::opt::UnderlyingBook) {
+        self.opt_index_book = Some(book);
     }
 
     /// VX: record an option sym's expiry, so a fill at or after it is
@@ -1361,6 +1428,7 @@ impl FillEngine {
             ioc_canceled: self.ioc_canceled,
             ttl_expired: self.ttl_expired,
             opt_settled: self.opt_settled,
+            settled_sym_orders_canceled: self.settled_sym_orders_canceled,
             fee_class_unknown_fills: self.fee_class_unknown_fills,
             oos_net_ladder_1e12: [
                 self.oos.equity_ladder_1e12(0),
@@ -1673,6 +1741,159 @@ mod tests {
         // An OTM settlement costs nothing, and the capped-fee formula
         // gives that with no special case: 12.5 % of a value of zero.
         assert_eq!(a.oos_fees_1e12, b.oos_fees_1e12, "no settlement fee OTM");
+    }
+
+    /// F12: once a sym has SETTLED, nothing on it can execute.
+    ///
+    /// Deribit keeps quoting an expired instrument for 9–19 min, and
+    /// since VRP V2a those quotes are a real tick lane — so an order
+    /// resting across an expiry used to fill against a book that no
+    /// longer exists, at a premium the holder can no longer receive.
+    #[test]
+    fn a_settled_sym_fills_nothing_in_pass_b() {
+        let sym = opt_sym();
+        // NOT a mark-fill sym: after F9 every real Deribit option is
+        // priced by its own quote lane, which is pass (b).
+        let p = ModelParams {
+            fee_bps: [[(0, 0); 5]; 7],
+            latency_ns: [0; 7],
+            stale_after_ms: VenueId::stale_after_ms_defaults(),
+            ..ModelParams::default()
+        };
+        let mut e = FillEngine::new(p, 0);
+        e.set_opt_index(sym, OPT_INDEX_1E6);
+        e.set_opt_expiry(sym, OPT_EXPIRY_NS);
+        e.set_opt_settle(sym, 0); // expired worthless
+
+        let mut out = Vec::new();
+        // A resting BID that any live quote would cross.
+        e.intake(&order(sym, Side::Bid, OPT_PREM_1E6, OPT_QTY_1E6, 1), 0);
+        // The clock crosses the expiry on ANOTHER sym: the contract
+        // settles, and our order is still open.
+        e.on_record(
+            &tick(BN_SYM, 100_000_000, 1_000_000, 100_100_000, 1_000_000),
+            OPT_EXPIRY_NS,
+            OPT_EXPIRY_NS,
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing has filled yet");
+        // The dead instrument keeps quoting, deep below our bid.
+        e.on_record(
+            &tick(sym, 1_000, OPT_QTY_1E6, 2_000, OPT_QTY_1E6),
+            OPT_EXPIRY_NS + 1,
+            OPT_EXPIRY_NS + 1,
+            &mut out,
+        );
+        assert!(out.is_empty(), "a settled sym fills nothing");
+        let o = e.finish();
+        assert_eq!(o.settled_sym_orders_canceled, 1, "the order was canceled");
+        assert_eq!(o.fills_total, 0);
+        assert_eq!(
+            e.per_sym_detail().iter().filter(|d| d.sym == sym).count(),
+            0,
+            "and no position was ever opened"
+        );
+    }
+
+    /// F17: on a settled OTM contract the mark IS zero, so a resting
+    /// BID priced at `mark + h` booked a fill at a price of nothing.
+    #[test]
+    fn a_settled_otm_bid_never_prices_at_zero() {
+        let sym = opt_sym();
+        let mut e = opt_engine(); // mark-fill sym ⇒ pass (b′)
+        e.set_opt_settle(sym, 0);
+        let mut out = Vec::new();
+        // Cross the expiry on another sym so the contract settles and
+        // its mark is pinned to the intrinsic — zero.
+        e.on_record(
+            &tick(BN_SYM, 100_000_000, 1_000_000, 100_100_000, 1_000_000),
+            OPT_EXPIRY_NS,
+            OPT_EXPIRY_NS,
+            &mut out,
+        );
+        out.clear();
+        e.intake(&order(sym, Side::Bid, OPT_PREM_1E6, OPT_QTY_1E6, 1), 0);
+        // A post-expiry quote of the dead instrument still runs the
+        // D-7 pass for a registered mark-fill sym.
+        e.on_record(
+            &tick(sym, 1_000, OPT_QTY_1E6, 1_000, OPT_QTY_1E6),
+            OPT_EXPIRY_NS + 1,
+            OPT_EXPIRY_NS + 1,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the D-7 pass executed");
+        assert_eq!(
+            out[0].px_1e6, 1,
+            "a settled OTM bid floors at one micro-dollar, never zero"
+        );
+    }
+
+    /// F14: `finish` is what runs the settlement sweep, so the per-sym
+    /// rows are only true after it. `audit-pnl` read them before.
+    #[test]
+    fn per_sym_rows_are_read_after_settlement() {
+        let mut e = opt_engine();
+        e.set_opt_settle(opt_sym(), 0);
+        let _ = short_a_call_through_expiry(&mut e, OPT_PREM_1E6 / 2);
+        // BEFORE `finish`: the contract is pinned but the sweep has
+        // not closed it — the position is still open.
+        assert_ne!(
+            e.per_sym_detail()[0].pos_qty_1e6,
+            0,
+            "the sweep has not run yet"
+        );
+        let o = e.finish();
+        assert_eq!(o.opt_settled, 1);
+        assert_eq!(
+            e.per_sym_detail()[0].pos_qty_1e6,
+            0,
+            "and after it the expired contract is flat"
+        );
+    }
+
+    /// F15: the capped fee's index leg is a fraction of the index
+    /// NOTIONAL, so reading the run's LAST index charged an 8 h-old
+    /// campaign's opening trade at the index it closed on.
+    #[test]
+    fn the_fee_index_is_read_at_the_fill_instant() {
+        const QTY_1E6: i64 = 1_000_000;
+        const EXPIRY: u64 = 1_789_027_200_000_000_000;
+        const OPEN_WALL: u64 = EXPIRY - 28_800_000_000_000; // E - 8 h
+        let sym = core_types::make_symbol_id(VenueId::Deribit, 513);
+
+        // The index moved from $60,000 at the open to $79,000 at the
+        // close — a 32 % move, which is 32 % of the index leg.
+        let mut book = crate::backtest::opt::UnderlyingBook::new();
+        book.observe(sym, OPEN_WALL, 60_000_000_000_000, 1_000_000_000);
+        book.observe(sym, EXPIRY - 1_000, 79_000_000_000_000, 1_000_000_000);
+        book.seal();
+
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        e.set_opt_index(sym, 79_000_000_000); // the LAST index
+        e.set_opt_expiry(sym, EXPIRY);
+        // A $1,000 intrinsic: the premium cap ($125) never binds, so
+        // the fee IS the index leg and the difference is visible.
+        let notional = 1_000_000_000i128 * QTY_1E6 as i128;
+        let last_index_fee = e.fee_for(sym, notional, QTY_1E6, 999, OPEN_WALL);
+        assert_eq!(last_index_fee, 23_700_000_000_000, "3 bps of $79,000");
+
+        e.attach_underlying_book(book);
+        let at_instant_fee = e.fee_for(sym, notional, QTY_1E6, 999, OPEN_WALL);
+        assert_eq!(at_instant_fee, 18_000_000_000_000, "3 bps of $60,000");
+        // At the close the two agree, which is why the defect hid.
+        // (One ns BEFORE expiry: at expiry the fill is a SETTLEMENT and
+        // takes half the index rate — a different law, tested above.)
+        assert_eq!(
+            e.fee_for(sym, notional, QTY_1E6, 999, EXPIRY - 1),
+            23_700_000_000_000
+        );
+        // A fill before the first observation falls back to the last
+        // index — what every surface did before this rung.
+        assert_eq!(
+            e.fee_for(sym, notional, QTY_1E6, 999, OPEN_WALL - 1),
+            23_700_000_000_000,
+            "no observation at or before the instant ⇒ the fallback"
+        );
     }
 
     /// In the money the position closes at intrinsic and pays the

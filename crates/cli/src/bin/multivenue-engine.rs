@@ -135,8 +135,9 @@ struct AuditPnlArgs {
     /// option spread, parts-per-million of premium (`50000` = 5 %),
     /// charged as half on each side of the D-7 synthetic mark tick.
     /// Absent = 0 = the D-7 floor alone, the optimistic rung. The
-    /// option spread is ASSUMED, never measured: the capture holds no
-    /// options book. Max 1000000 (100 %).
+    /// option spread is ASSUMED, never measured: the capture carries a
+    /// top-of-book quote and a mark, never depth, so there is no size
+    /// behind the touch to cross. Max 1000000 (100 %).
     #[arg(long)]
     option_spread_frac: Option<u32>,
     /// RG3: `<path>` = a `regime.toml` artifact to replay the regime
@@ -148,14 +149,6 @@ struct AuditPnlArgs {
     /// the first run directory's own `regime-seed.tsv`, else warm live).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
-    /// VRP V5: the worker-written boot seed
-    /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
-    /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
-    /// (cold boot; the member holds until it has 60 pairs); an explicit
-    /// path that does not exist, or any file that does not parse
-    /// exactly, refuses the boot.
-    #[arg(long)]
-    vrp_seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -229,8 +222,9 @@ struct BacktestArgs {
     /// option spread, parts-per-million of premium (`50000` = 5 %),
     /// charged as half on each side of the D-7 synthetic mark tick.
     /// Absent = 0 = the D-7 floor alone, the optimistic rung. The
-    /// option spread is ASSUMED, never measured: the capture holds no
-    /// options book. Max 1000000 (100 %).
+    /// option spread is ASSUMED, never measured: the capture carries a
+    /// top-of-book quote and a mark, never depth, so there is no size
+    /// behind the touch to cross. Max 1000000 (100 %).
     #[arg(long)]
     option_spread_frac: Option<u32>,
     /// §5 rich-detail sidecar path (per-symbol/IS metrics). Declared
@@ -248,12 +242,16 @@ struct BacktestArgs {
     /// the first run directory's own `regime-seed.tsv`, else warm live).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
-    /// VRP V5: the worker-written boot seed
-    /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
-    /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
-    /// (cold boot; the member holds until it has 60 pairs); an explicit
-    /// path that does not exist, or any file that does not parse
-    /// exactly, refuses the boot.
+    /// `--member vrp`: the parameter artifact (`vrp.toml`; default
+    /// `~/multivenue/vrp.toml`).
+    #[arg(long)]
+    vrp: Option<PathBuf>,
+    /// `--member vrp`: the worker-written boot seed — the settled
+    /// `(x, y)` pairs the member's forecast is fitted from. Default =
+    /// the FIRST run directory's own `vrp-seed.tsv` when it exists (the
+    /// window cut writes one), else a cold boot: LEGAL, and the member
+    /// holds until it has 60 pairs. An explicit path that does not
+    /// exist, or any file that does not parse exactly, refuses the run.
     #[arg(long)]
     vrp_seed: Option<PathBuf>,
     /// `funding-seed.tsv` replayed through the vm's live `FundingSeed`
@@ -552,7 +550,6 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         option_spread_frac_1e6: args.option_spread_frac,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
-        vrp_seed: args.vrp_seed,
     };
     let mut report = |line: &str| eprintln!("{line}");
     match cli::audit_pnl::run(&cfg, &mut report) {
@@ -599,7 +596,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         None => None,
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
-                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd)");
+                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd, vrp)");
                 return ExitCode::from(1);
             };
             let params = match kind {
@@ -623,12 +620,23 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         }
                     },
                 },
+                cli::backtest::member::MemberKind::Vrp => match args.vrp.clone() {
+                    Some(p) => p,
+                    None => match core_config::vrp::default_vrp_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member vrp needs --vrp <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
             };
             Some(cli::backtest::member::MemberSpec {
                 kind,
                 params,
                 table: args.xsd_table.clone(),
                 seed: args.xsd_seed.clone(),
+                vrp_seed: args.vrp_seed.clone(),
             })
         }
     };
@@ -645,7 +653,6 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         emit_detail: args.emit_detail,
         regime: cli::backtest::regime::RegimeMode::parse(args.regime.as_deref()),
         regime_seed: args.regime_seed,
-        vrp_seed: args.vrp_seed,
         funding_seed: args.funding_seed,
         member,
     };

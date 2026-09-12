@@ -202,9 +202,9 @@ def test_positions_from_golden_fills(tmp_path: pathlib.Path) -> None:
 
 def test_position_views_marked() -> None:
     fills = [
-        claude_worker.pmlr.FillRec(1, PM7, 0, 480_000, 20_000_000, 1),
-        claude_worker.pmlr.FillRec(2, PM7, 0, 500_000, 10_000_000, 2),
-        claude_worker.pmlr.FillRec(3, PM7, 1, 520_000, 15_000_000, 3),
+        claude_worker.pmlr.FillRec(1, PM7, 0, 0xFF, 0, 480_000, 20_000_000, 1),
+        claude_worker.pmlr.FillRec(2, PM7, 0, 0xFF, 0, 500_000, 10_000_000, 2),
+        claude_worker.pmlr.FillRec(3, PM7, 1, 0xFF, 0, 520_000, 15_000_000, 3),
     ]
     positions = claude_worker.features.reconstruct_positions(fills)
     views = claude_worker.features.position_views(positions, {PM7: 510_000})
@@ -219,7 +219,7 @@ def test_position_views_marked() -> None:
 
 
 def test_position_view_no_mark_carried_at_cost() -> None:
-    fills = [claude_worker.pmlr.FillRec(1, PM7, 0, 486_667, 3_000_000, 1)]
+    fills = [claude_worker.pmlr.FillRec(1, PM7, 0, 0xFF, 0, 486_667, 3_000_000, 1)]
     positions = claude_worker.features.reconstruct_positions(fills)
     views = claude_worker.features.position_views(positions, {})
     view = views[PM7]

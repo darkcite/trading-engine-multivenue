@@ -69,32 +69,6 @@
 use std::collections::BTreeMap;
 use std::io;
 
-/// VX-A: everything needed to turn one expired option sym into a
-/// European cash value, gathered while its own records were still
-/// arriving. Kept per DENSE sym, which is what the merged stream and
-/// the fill engines carry.
-#[derive(Copy, Clone, Debug)]
-struct OptSettleRef {
-    /// The last underlying/index this instrument printed at or before
-    /// its expiry, ×1e6. Meaningless unless `index_wall_ns > 0`.
-    index_1e6: i64,
-    /// WALL instant of that index, and the flag for whether one was
-    /// ever found: `0` means no index at or before the expiry exists in
-    /// this root, which is a REFUSAL — the contract is left unsettled
-    /// and marks out exactly as it did before the rung.
-    ///
-    /// It has to be a wall: an `OptSummary.ts_ns` is the ENGINE's
-    /// monotonic stamp and an `expiry_ns` is a wall epoch, so comparing
-    /// the two directly is a category error that silently admits every
-    /// record (the first cut of this code did exactly that, and the
-    /// live table reported settlement indices "1785368505 s before
-    /// expiry" — fifty-six years, which is the epoch itself).
-    index_wall_ns: u64,
-    strike_1e6: i64,
-    right: u8,
-    expiry_ns: u64,
-}
-
 /// VX-A: one underlying observation awaiting a wall stamp. The rebase
 /// `wall = run.epoch_ns + (raw_ts − ts_first)` needs the run's first
 /// tick, which is only known once the run's events are sorted, so the
@@ -106,25 +80,6 @@ struct OptSettleCand {
     index_1e6: i64,
 }
 
-impl OptSettleRef {
-    /// European cash value of ONE unit: `max(0, S − K)` for a call,
-    /// `max(0, K − S)` for a put. The same law the member settles by
-    /// (`strategy_vrp::VrpStrategy::intrinsic_1e6`), restated here
-    /// because the harness must not depend on a strategy crate.
-    #[inline]
-    fn value_1e6(&self) -> i64 {
-        let v = if self.right == opt_registry::RIGHT_CALL {
-            self.index_1e6 - self.strike_1e6
-        } else {
-            self.strike_1e6 - self.index_1e6
-        };
-        if v > 0 {
-            v
-        } else {
-            0
-        }
-    }
-}
 use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
@@ -134,6 +89,9 @@ use core_types::{
 };
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
+// VRP P2.1: the option model lives in ONE module; this surface
+// shares its settlement law rather than carrying a second copy.
+use crate::backtest::opt::{OptSettleRef, OptTerms};
 use crate::backtest::fill::{FillEngine, ModelOutcome, DAY_NS};
 use crate::backtest::regime::{
     load_set_regime_frames, profile_name, word_string, RegimeMode, RegimeReplay,
@@ -202,9 +160,6 @@ pub struct AuditPnlConfig {
     /// RG3: `--regime-seed <path>` (default = the first run's own
     /// `regime-seed.tsv`, else warm live).
     pub regime_seed: Option<PathBuf>,
-    /// VRP V5: `--vrp-seed <path>` (default = the run's own
-    /// `vrp-seed.tsv`, else the member holds).
-    pub vrp_seed: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------
@@ -406,6 +361,21 @@ fn open_checked<R: core_types::AsBytes>(
     Ok(Some(reader))
 }
 
+/// VRP P2.1/P2.2: the option model's out-params for one audit root,
+/// as ONE bundle. Four `&mut` maps threaded separately pushed the two
+/// loaders past clippy's argument limit and read as noise at every
+/// call site; the fields carry the names the model uses.
+#[derive(Default)]
+struct AuditOptOut {
+    mark_fill_syms: std::collections::BTreeSet<u32>,
+    index_1e6: BTreeMap<u32, i64>,
+    expiry_ns: BTreeMap<u32, u64>,
+    settle_ref: BTreeMap<u32, OptSettleRef>,
+    /// F15: the WALL-stamped underlying timeline the capped option
+    /// fee's index leg is read from at each fill instant.
+    index_book: crate::backtest::opt::UnderlyingBook,
+}
+
 /// Per-run load stats (stderr surface).
 #[derive(Clone, Debug, Default)]
 struct RunLoad {
@@ -432,6 +402,14 @@ struct RunLoad {
     /// those DROPPED because no underlying was known at their instant.
     opt_quotes_converted: u64,
     opt_quotes_dropped: u64,
+    /// F13: option QUOTE ticks DROPPED because their sym produced a
+    /// Deribit summary in this run and the registry has no row for it —
+    /// the prices are coin-denominated and there is nothing honest to
+    /// convert them with.
+    opt_quotes_unregistered: u64,
+    /// F13: manifest rows the parser accepted and the registry TABLE
+    /// refused (full, out of window, venue mismatch).
+    opt_registry_refused: u64,
     /// VT4: per-lane stale accounting (the harness re-judge).
     stale: [crate::backtest::stale::StaleStats; VENUE_LABELS.len()],
     /// RG3: funding prints loaded, `SetRegime` frames loaded (clamped
@@ -446,10 +424,7 @@ struct RunLoad {
 fn load_run_events(
     run: &RunDir,
     interner: &mut SymInterner,
-    mark_fill_syms: &mut std::collections::BTreeSet<u32>,
-    opt_index_1e6: &mut BTreeMap<u32, i64>,
-    opt_expiry_ns: &mut BTreeMap<u32, u64>,
-    opt_settle_ref: &mut BTreeMap<u32, OptSettleRef>,
+    opt_out: &mut AuditOptOut,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
@@ -468,19 +443,29 @@ fn load_run_events(
     // no manifest gets an EMPTY registry and every option record then
     // skips as `Unregistered` and is counted: fail closed, never priced
     // against a guess.
-    let opt_reg = match manifest.as_ref() {
+    // F13: a row the parser accepted and the TABLE refused is counted;
+    // its records would otherwise price through `Unregistered`, which
+    // reads exactly like "not an option at all".
+    let (opt_reg, registry_refused) = match manifest.as_ref() {
         Some(m) => {
             let rows: Vec<(u32, &String)> = m.iter().map(|(k, v)| (*k, v)).collect();
             crate::backtest::opt::registry_from_manifest_rows(&rows)
         }
-        None => opt_registry::OptRegistry::new(),
+        None => (opt_registry::OptRegistry::new(), 0),
     };
+    load.opt_registry_refused += registry_refused;
     // VRP V2a: the per-sym underlying timeline the option QUOTE lane
     // needs, filled from this run's OptSummary records below.
     let mut und = crate::backtest::opt::UnderlyingBook::new();
+    // F13: option syms that printed a Deribit summary in this run and
+    // have no registry row — their quote ticks cannot be denominated.
+    let mut unregistered_opt_syms: std::collections::BTreeSet<u32> =
+        std::collections::BTreeSet::new();
     // VX-A: settlement-index observations for THIS run, resolved to
     // wall instants once the run's first tick is known (below).
     let mut settle_cand: Vec<OptSettleCand> = Vec::new();
+    // F15: every underlying observation, for the wall-stamped fee book.
+    let mut fee_cand: Vec<OptSettleCand> = Vec::new();
 
     let resolve =
         |sym: u32, interner: &mut SymInterner, load: &mut RunLoad| -> Result<u32, HarnessError> {
@@ -549,16 +534,34 @@ fn load_run_events(
             // off it. Keyed on the DENSE sym, which is what the ticks
             // already in `evs` carry.
             if o.venue == VenueId::Deribit as u8 {
+                // F13: a Deribit option with no registry row has no
+                // contract size and no underlying timeline, so its
+                // QUOTE ticks carry coin numbers nothing can honestly
+                // convert. Recorded here; dropped below.
+                if opt_reg.get(o.sym).is_none() {
+                    let dense = resolve(o.sym, interner, &mut load)?;
+                    unregistered_opt_syms.insert(dense);
+                }
                 if let Some(row) = opt_reg.get(o.sym) {
                     let dense = resolve(o.sym, interner, &mut load)?;
                     und.observe(dense, o.ts_ns, o.underlying_px_1e9, row.contract_size_1e9);
                     // VRP V2b: the index leg of the capped option fee.
                     if o.underlying_px_1e9 > 0 {
-                        opt_index_1e6.insert(dense, o.underlying_px_1e9 / 1_000);
+                        opt_out.index_1e6.insert(dense, o.underlying_px_1e9 / 1_000);
+                        // F15: the same observation, kept for the
+                        // WALL-stamped book the fee reads at the fill
+                        // instant. The wall rebase is only knowable
+                        // once the run's first tick is, so it is
+                        // resolved below beside the settlement index.
+                        fee_cand.push(OptSettleCand {
+                            sym: dense,
+                            raw_ts_ns: o.ts_ns,
+                            index_1e6: o.underlying_px_1e9 / 1_000,
+                        });
                     }
                     // VX: the expiry, so a fill at or after it is
                     // charged the venue's SETTLEMENT rate.
-                    opt_expiry_ns.insert(dense, row.expiry_ns);
+                    opt_out.expiry_ns.insert(dense, row.expiry_ns);
                     // VX-A: the settlement reference. Only contracts
                     // whose expiry this run's clock can actually REACH
                     // are candidates — an expiry that fell before the
@@ -567,13 +570,11 @@ fn load_run_events(
                     // record. The index itself is stamped later, once
                     // the rebase is knowable.
                     if row.expiry_ns >= run.epoch_ns {
-                        opt_settle_ref.entry(dense).or_insert(OptSettleRef {
-                            index_1e6: 0,
-                            index_wall_ns: 0,
+                        opt_out.settle_ref.entry(dense).or_insert(OptSettleRef::of(OptTerms {
                             strike_1e6: row.strike_1e6,
                             right: row.right,
                             expiry_ns: row.expiry_ns,
-                        });
+                        }));
                         if o.underlying_px_1e9 > 0 {
                             settle_cand.push(OptSettleCand {
                                 sym: dense,
@@ -605,7 +606,7 @@ fn load_run_events(
             if tick_syms.contains(&dense) {
                 continue;
             }
-            mark_fill_syms.insert(dense);
+            opt_out.mark_fill_syms.insert(dense);
             let venue = VenueId::from_u8(o.venue).unwrap_or(VenueId::Deribit);
             let t = Tick::new(
                 o.ts_ns,
@@ -638,9 +639,10 @@ fn load_run_events(
     // Only REAL venue ticks are touched (lord < 200); the synthetic
     // mark ticks at lord 200+ are already USD.
     und.seal();
-    if !und.is_empty() {
+    if !und.is_empty() || !unregistered_opt_syms.is_empty() {
         let mut converted = 0u64;
         let mut dropped = 0u64;
+        let mut unregistered = 0u64;
         evs.retain_mut(|e| {
             if e.class != CLASS_TICK || e.lord >= 200 {
                 return true;
@@ -648,6 +650,13 @@ fn load_run_events(
             let Payload::Tick(t) = &mut e.payload else {
                 return true;
             };
+            // F13: before `convert_quote` — an unregistered sym is
+            // `NotAnOption` to the book, which would leave a COIN
+            // number in a USD field.
+            if unregistered_opt_syms.contains(&t.sym) {
+                unregistered += 1;
+                return false;
+            }
             match und.convert_quote(t) {
                 crate::backtest::opt::QuoteFix::Converted => {
                     converted += 1;
@@ -662,7 +671,8 @@ fn load_run_events(
         });
         load.opt_quotes_converted = converted;
         load.opt_quotes_dropped = dropped;
-        load.ticks = load.ticks.saturating_sub(dropped);
+        load.opt_quotes_unregistered = unregistered;
+        load.ticks = load.ticks.saturating_sub(dropped + unregistered);
     }
     load.stale = judge.stats;
     if load.ticks == 0 {
@@ -788,7 +798,7 @@ fn load_run_events(
     if !evs.is_empty() {
         let ts_first = evs[0].ts_ns;
         for c in &settle_cand {
-            let Some(r) = opt_settle_ref.get_mut(&c.sym) else {
+            let Some(r) = opt_out.settle_ref.get_mut(&c.sym) else {
                 continue;
             };
             let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
@@ -796,6 +806,19 @@ fn load_run_events(
                 r.index_1e6 = c.index_1e6;
                 r.index_wall_ns = wall;
             }
+        }
+        // F15: the same rebase, for the fee book. `index_1e6 * 1_000`
+        // is the round trip of `underlying_px_1e9 / 1_000` that the
+        // fee reads back, so the number the fee sees is exactly the
+        // number the summary carried.
+        for c in &fee_cand {
+            let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
+            opt_out.index_book.observe(
+                c.sym,
+                wall,
+                c.index_1e6 * 1_000,
+                crate::backtest::opt::DERIBIT_OPT_CONTRACT_SIZE_1E9,
+            );
         }
     }
     Ok((evs, load))
@@ -807,10 +830,7 @@ fn load_run_events(
 fn load_and_merge_events(
     runs: &[RunDir],
     interner: &mut SymInterner,
-    mark_fill_syms: &mut std::collections::BTreeSet<u32>,
-    opt_index_1e6: &mut BTreeMap<u32, i64>,
-    opt_expiry_ns: &mut BTreeMap<u32, u64>,
-    opt_settle_ref: &mut BTreeMap<u32, OptSettleRef>,
+    opt_out: &mut AuditOptOut,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
@@ -819,15 +839,7 @@ fn load_and_merge_events(
     let mut prev_last_virt: u64 = 0;
     for run in runs {
         let (evs, mut load) =
-            load_run_events(
-                run,
-                interner,
-                mark_fill_syms,
-                opt_index_1e6,
-                opt_expiry_ns,
-                opt_settle_ref,
-                stale_after_ms,
-            )?;
+            load_run_events(run, interner, opt_out, stale_after_ms)?;
         if evs.is_empty() {
             loads.push(load);
             continue;
@@ -900,19 +912,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     )?;
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut interner = SymInterner::default();
-    let mut mark_fill_syms: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut opt_index_1e6: BTreeMap<u32, i64> = BTreeMap::new();
-    let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut opt_settle_ref: BTreeMap<u32, OptSettleRef> = BTreeMap::new();
-    let (merged, loads) = load_and_merge_events(
-        &runs,
-        &mut interner,
-        &mut mark_fill_syms,
-        &mut opt_index_1e6,
-        &mut opt_expiry_ns,
-        &mut opt_settle_ref,
-        params.stale_after_ms,
-    )?;
+    let mut opt_out = AuditOptOut::default();
+    let (merged, loads) =
+        load_and_merge_events(&runs, &mut interner, &mut opt_out, params.stale_after_ms)?;
+    // F15: one seal for the whole root — the timelines are per sym and
+    // the runs are concatenated in epoch order, so wall stamps are
+    // already ascending; `seal` also collapses the repeats (the live
+    // capture pushes a summary every 100 ms against an underlying that
+    // moves far more slowly).
+    opt_out.index_book.seal();
 
     // XSD-F: dense sym → fee class over the whole root's descriptor set.
     let sym_class: BTreeMap<u32, core_types::InstrumentClass> = interner
@@ -968,6 +976,16 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 l.epoch_ns, l.opt_quotes_converted, l.opt_quotes_dropped
             ));
         }
+        // F13: the same tell the backtest prints, in this surface's
+        // shape — appended only when it fires.
+        if l.opt_quotes_unregistered > 0 || l.opt_registry_refused > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: opt-quote-ticks-unregistered={} registry-refused={} \
+                 (a Deribit option summary with no registry row: its quotes are COIN \
+                 and are DROPPED rather than booked as dollars)",
+                l.epoch_ns, l.opt_quotes_unregistered, l.opt_registry_refused
+            ));
+        }
         if l.opts_unconverted > 0 {
             report(&format!(
                 "audit-pnl: run-{}: opts-unconverted={} (marked option records \
@@ -984,13 +1002,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             crate::backtest::render_stale_line(&l.stale)
         ));
     }
-    if !mark_fill_syms.is_empty() {
+    if !opt_out.mark_fill_syms.is_empty() {
         // D-7 obligation: the assumption is PRINTED wherever it can
         // shape numbers.
         report(&format!(
             "audit-pnl: {}",
             crate::backtest::opt::render_opt_mark_law(
-                mark_fill_syms.len(),
+                opt_out.mark_fill_syms.len(),
                 params.opt_spread_frac_1e6
             )
         ));
@@ -1008,8 +1026,14 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // actually reaches are printed.
     let window_end_ns = merged[merged.len() - 1].wall_ns;
     let reaches = |r: &OptSettleRef| r.expiry_ns <= window_end_ns;
-    let reached = opt_settle_ref.values().filter(|r| reaches(r)).count();
-    let settleable = opt_settle_ref
+    debug_assert!(
+        opt_out.settle_ref
+            .values()
+            .all(|r| r.settleable(window_end_ns) == (reaches(r) && r.index_wall_ns > 0)),
+        "the report's predicate and the applied law must agree"
+    );
+    let reached = opt_out.settle_ref.values().filter(|r| reaches(r)).count();
+    let settleable = opt_out.settle_ref
         .values()
         .filter(|r| reaches(r) && r.index_wall_ns > 0)
         .count();
@@ -1020,9 +1044,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
              expiry; {} refused (no index at/before expiry in this root), {} expire after \
              the window and are never settled",
             reached - settleable,
-            opt_settle_ref.len() - reached
+            opt_out.settle_ref.len() - reached
         ));
-        for (sym, r) in opt_settle_ref
+        for (sym, r) in opt_out.settle_ref
             .iter()
             .filter(|(_, r)| reaches(r) && r.index_wall_ns > 0)
         {
@@ -1057,15 +1081,21 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         );
         // D-7: every engine executes registered option syms under
         // the mark-fill law.
-        for sym in &mark_fill_syms {
+        for sym in &opt_out.mark_fill_syms {
             e.set_mark_fill_sym(*sym);
         }
         // VRP V2b: the index leg of the venue's capped option fee.
-        for (sym, index_1e6) in &opt_index_1e6 {
+        for (sym, index_1e6) in &opt_out.index_1e6 {
             e.set_opt_index(*sym, *index_1e6);
         }
+        // F15: and the wall-stamped timeline it is read from at each
+        // fill instant. Cloned per engine — this surface builds one
+        // per strategy, per ruleset hash and per regime word.
+        if !opt_out.index_book.is_empty() {
+            e.attach_underlying_book(opt_out.index_book.clone());
+        }
         // VX: the settlement rate's classifier.
-        for (sym, expiry_ns) in &opt_expiry_ns {
+        for (sym, expiry_ns) in &opt_out.expiry_ns {
             e.set_opt_expiry(*sym, *expiry_ns);
         }
         // XSD-F: the per-sym fee class — every interned descriptor
@@ -1078,16 +1108,12 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // VX-A: the European cash value each expiry settles at, so a
         // contract still held at expiry becomes cash instead of an
         // open position marked at a mid that no longer means anything.
-        for (sym, r) in &opt_settle_ref {
-            // No index at or before the expiry ⇒ no settlement. The
-            // contract marks out as it did before the rung, which is
-            // the honest outcome: a settlement priced off a number the
-            // capture does not contain is worse than a late mark-out.
-            if r.index_wall_ns == 0 || r.expiry_ns > window_end_ns {
-                continue;
-            }
-            e.set_opt_settle(*sym, r.value_1e6());
-        }
+        // No index at or before the expiry ⇒ no settlement: the
+        // contract marks out as it did before the rung, which is the
+        // honest outcome, since a settlement priced off a number the
+        // capture does not contain is worse than a late mark-out.
+        // VRP P2.1 (F10): the same call `backtest` and `--member` make.
+        crate::backtest::opt::apply_settlements(&mut e, &opt_out.settle_ref, window_end_ns);
         e
     };
     let mut engines: BTreeMap<u8, FillEngine> = BTreeMap::new();
@@ -1248,6 +1274,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let engine_ids: Vec<u8> = engines.keys().copied().collect();
     for sid in engine_ids {
         let eng = engines.get_mut(&sid).expect("keyed");
+        // F14: `finish` is what runs the VX-A settlement sweep and the
+        // end-of-window close, so reading the per-sym rows BEFORE it
+        // reported an expired contract as an open position — the one
+        // thing VX-A exists to stop — and a position the close had not
+        // yet realised. `fill.rs`'s own tests always call it in this
+        // order; this surface was the exception.
+        let outcome = eng.finish();
         let per_sym: Vec<(String, i64, i128, u64)> = eng
             .per_sym_detail()
             .iter()
@@ -1260,7 +1293,6 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 )
             })
             .collect();
-        let outcome = eng.finish();
         // Day buckets: equity deltas between consecutive snapshots.
         let mut per_day: Vec<(u64, i64)> = Vec::new();
         let mut prev_eq: i128 = 0;
@@ -1443,13 +1475,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // VRP V3: additive, and emitted ONLY when option syms were
     // registered — a root that captured no options renders exactly as
     // it did before the flag, so `audit_pnl_version` stays 1.
-    if !mark_fill_syms.is_empty() {
+    if !opt_out.mark_fill_syms.is_empty() {
         json.push_str(&format!(
             "\"options\":{{\"mark_syms\":{},\"spread_frac_1e6\":{},\"law\":\"{}\"}},",
-            mark_fill_syms.len(),
+            opt_out.mark_fill_syms.len(),
             params.opt_spread_frac_1e6,
             crate::backtest::opt::render_opt_mark_law(
-                mark_fill_syms.len(),
+                opt_out.mark_fill_syms.len(),
                 params.opt_spread_frac_1e6
             )
         ));

@@ -131,7 +131,6 @@ fn cfg(ruleset: &Path, replay_dir: &Path, split: &str) -> BacktestConfig {
         // is bit-identical to a blind replay).
         regime: RegimeMode::Off,
         regime_seed: None,
-        vrp_seed: None,
         funding_seed: None,
         member: None,
     }
@@ -1063,7 +1062,6 @@ fn v5_cfg(ruleset: &Path, replay: &Path, split: &str) -> BacktestConfig {
         emit_detail: None,
         regime: RegimeMode::Off,
         regime_seed: None,
-        vrp_seed: None,
         funding_seed: None,
         member: None,
     }
@@ -1431,6 +1429,294 @@ fn v5_option_mark_fill_law_executes_and_counts() {
 /// one obligation rather than five.
 fn s_has(hay: &str, needle: &str) -> bool {
     hay.contains(needle)
+}
+
+/// VRP P2.1 (F9): the D-7 mark-fill law applies to EXACTLY the syms a
+/// mark tick was synthesised for.
+///
+/// Every Deribit option has carried a real quote lane since VRP V2a
+/// (`ingress-deribit` subscribes to `quote` AND `ticker`), so the
+/// synthesis is suppressed for all of them and `opt_synth_ticks` is 0
+/// on any real capture. Registering them for mark-fills anyway — which
+/// is what the harness did — overwrote the option's own top of book
+/// with a zero-spread mark on every summary record, on both the VM and
+/// the `--member` arm.
+#[test]
+fn mark_fill_syms_are_only_the_synthesised_ones() {
+    let root = unique_root("p21-marklaw");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+    let opt_sym = (3u32 << 24) | 700;
+
+    let ruleset = root.join("iv.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"iv","instrument":"deribit:BTC-27MAR26-60000-C","feature":"mark_iv","enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    write_ticks(
+        &run0,
+        "bn",
+        EPOCH_RUN_0,
+        &[mk_tick(500, VenueId::Binance, V5_REF, 1, 490_000, 510_000)],
+    );
+    let mk_opt = |ts: u64, mark_1e9: i64| {
+        core_types::OptSummary::new(
+            ts,
+            VenueId::Deribit,
+            opt_sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            mark_1e9,
+            650_000_000,
+            65_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+    let opath = run0.join("deribit-opt-summary.pmlr");
+    let mut w = PmlrWriter::open(&opath, SlotKind::OptSummary, EPOCH_RUN_0).expect("open opt");
+    w.append(&mk_opt(1_000, 50_000_000)).expect("append");
+    w.append(&mk_opt(2_000, 40_000_000)).expect("append");
+    w.flush().expect("flush");
+
+    // The ONE difference from `v5_option_mark_fill_law_executes_and_counts`:
+    // this option has its own quote lane, exactly as the live capture
+    // does. Coin-denominated (0.045 / 0.055 BTC), at instants at or
+    // after the first summary so the underlying timeline can price
+    // them.
+    write_ticks(
+        &run0,
+        "deribit",
+        EPOCH_RUN_0,
+        &[
+            v5_tick(1_500, VenueId::Deribit, opt_sym, 1, 45_000, 55_000),
+            v5_tick(2_500, VenueId::Deribit, opt_sym, 2, 45_000, 55_000),
+        ],
+    );
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.merged_opts, 2, "both summaries merged");
+    assert_eq!(
+        s.opt_synth_ticks, 0,
+        "a sym with a tick lane is never synthesised — the V2a law"
+    );
+    assert_eq!(
+        s.opt_mark_syms, 0,
+        "nothing was synthesised, so nothing executes under D-7"
+    );
+    assert_eq!(
+        s.opt_quote_lane_syms, 1,
+        "the option is priced by its own top of book"
+    );
+    assert_eq!(s.mark_fills, 0, "no mark-fill can happen with no mark sym");
+    assert_eq!(
+        s.opt_quotes_converted, 2,
+        "both quote ticks converted coin -> USD"
+    );
+    // The report names the lane each option's price took.
+    assert!(
+        s_has(&out.summary, "opt_mark_syms=0 quote_lane_syms=1"),
+        "{}",
+        out.summary
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// VRP P2.2 (F13): an option QUOTE tick whose sym printed a Deribit
+/// summary in the run and has NO registry row is DROPPED and counted.
+///
+/// `UnderlyingBook::convert_quote` answers `NotAnOption` for a sym it
+/// does not know, and the pass took that as "leave it alone" — so a
+/// COIN bid/ask (0.045 BTC) stayed in a field the fill model books as
+/// DOLLARS. That is the same units defect VRP V2a exists to remove,
+/// reached by the one path V2a did not close.
+#[test]
+fn an_unregistered_option_quote_is_dropped_and_counted() {
+    let root = unique_root("p22-unreg");
+    let run0 = root.join(format!("run-{EPOCH_RUN_0}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    let opt_sym = (3u32 << 24) | 700;
+    // The manifest names the option sym with a descriptor the option
+    // parser REFUSES (a USDC-linear chain), so the sym resolves for the
+    // merge and carries no registry row — exactly the live shape when a
+    // chain rolls between the manifest write and the tick.
+    std::fs::write(
+        run0.join("instrument-manifest.tsv"),
+        format!(
+            "{V5_SYM}\tokx:BTC-USDT-SWAP\n{V5_REF}\tbinance-usdm:btcusdt\n{opt_sym}\tderibit:BTC_USDC-27MAR26-60000-C\n"
+        ),
+    )
+    .expect("manifest");
+
+    let ruleset = root.join("mid.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"mid","instrument":"okx:BTC-USDT-SWAP","feature":"mid","enter":1000000.0,"horizon_ms":10,"max_risk_usd":100.0}]}"#,
+    )
+    .expect("ruleset");
+
+    write_ticks(
+        &run0,
+        "bn",
+        EPOCH_RUN_0,
+        &[mk_tick(500, VenueId::Binance, V5_REF, 1, 490_000, 510_000)],
+    );
+    // Two COIN-denominated option quotes — 0.045 / 0.055 BTC. Booked
+    // as dollars they are a $0.045 option; there is nothing in the run
+    // that can convert them.
+    write_ticks(
+        &run0,
+        "deribit",
+        EPOCH_RUN_0,
+        &[
+            v5_tick(1_500, VenueId::Deribit, opt_sym, 1, 45_000, 55_000),
+            v5_tick(2_500, VenueId::Deribit, opt_sym, 2, 45_000, 55_000),
+        ],
+    );
+    let mk_opt = |ts: u64| {
+        core_types::OptSummary::new(
+            ts,
+            VenueId::Deribit,
+            opt_sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            50_000_000,
+            650_000_000,
+            65_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+    let opath = run0.join("deribit-opt-summary.pmlr");
+    let mut w = PmlrWriter::open(&opath, SlotKind::OptSummary, EPOCH_RUN_0).expect("open opt");
+    w.append(&mk_opt(1_000)).expect("append");
+    w.flush().expect("flush");
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.merged_opts, 1, "the summary is still merged");
+    assert_eq!(
+        s.opt_quotes_unregistered, 2,
+        "both coin quotes dropped rather than booked as dollars"
+    );
+    assert_eq!(s.opt_quotes_converted, 0, "there was nothing to convert");
+    assert_eq!(
+        s.opt_quote_lane_syms, 0,
+        "a sym whose quotes are dropped has no priced lane at all"
+    );
+    assert_eq!(s.opt_mark_syms, 0, "and nothing was synthesised for it");
+    assert!(
+        s_has(&out.summary, "quote_ticks_unregistered=2"),
+        "{}",
+        out.summary
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// VRP P2.1 (F10): a contract held through its expiry becomes CASH at
+/// the European intrinsic, in `backtest` as it already did in
+/// `audit-pnl`.
+///
+/// Before this, `set_opt_settle` was called from `audit_pnl.rs` alone:
+/// the harness carried an expired option as an open position marked at
+/// whatever mid the dead instrument last printed (Deribit keeps
+/// quoting 9-19 min past settlement), so the two surfaces disagreed on
+/// every campaign that reached an expiry.
+#[test]
+fn backtest_settles_an_option_held_through_expiry() {
+    // `deribit:BTC-27MAR26-60000-C` expires 2026-03-27T08:00:00Z. The
+    // run's epoch sits just before it so the window's wall clock
+    // actually crosses the expiry — the fixtures' 1970 epoch never
+    // reaches any real chain date.
+    const EXPIRY_NS: u64 = 1_774_598_400_000_000_000;
+    const EPOCH: u64 = EXPIRY_NS - 400_000_000_000; // E - 400 s
+
+    let root = unique_root("p21-settle");
+    let run0 = root.join(format!("run-{EPOCH}"));
+    std::fs::create_dir_all(&run0).expect("mkdir");
+    v5_write_manifest(&run0);
+    let opt_sym = (3u32 << 24) | 700;
+
+    let ruleset = root.join("iv.json");
+    std::fs::write(
+        &ruleset,
+        r#"{"rows":[{"name":"iv","instrument":"deribit:BTC-27MAR26-60000-C","feature":"mark_iv","enter":0.0,"horizon_ms":86400000,"max_risk_usd":100.0,"side":"bid"}]}"#,
+    )
+    .expect("ruleset");
+
+    // ts_first = 500 ⇒ wall = EPOCH + (ts - 500). The last tick sits
+    // 500 s in, which is 100 s PAST the expiry.
+    write_ticks(
+        &run0,
+        "bn",
+        EPOCH,
+        &[
+            mk_tick(500, VenueId::Binance, V5_REF, 1, 490_000, 510_000),
+            mk_tick(
+                500 + 500_000_000_000,
+                VenueId::Binance,
+                V5_REF,
+                2,
+                490_000,
+                510_000,
+            ),
+        ],
+    );
+    // Two records, both before the expiry: the row fires at the first
+    // (Mid = mark 0.05 coin = $3 250) and the resting bid mark-fills
+    // at the second (mark 0.04 coin = $2 600). Nothing closes it —
+    // the horizon is 24 h and the window is 500 s.
+    let mk_opt = |ts: u64, mark_1e9: i64| {
+        core_types::OptSummary::new(
+            ts,
+            VenueId::Deribit,
+            opt_sym,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            mark_1e9,
+            650_000_000,
+            65_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+    let opath = run0.join("deribit-opt-summary.pmlr");
+    let mut w = PmlrWriter::open(&opath, SlotKind::OptSummary, EPOCH).expect("open opt");
+    w.append(&mk_opt(1_000, 50_000_000)).expect("append");
+    w.append(&mk_opt(2_000, 40_000_000)).expect("append");
+    w.flush().expect("flush");
+
+    let out = cli::backtest::run(&v5_cfg(&ruleset, &root, "0/100")).expect("harness ok");
+    let s = out.stats;
+    assert_eq!(s.opt_synth_ticks, 2, "no quote lane ⇒ both marks synthesised");
+    assert_eq!(s.opt_mark_syms, 1, "so this sym DOES execute under D-7");
+    assert_eq!(s.mark_fills, 1, "the buy filled");
+    assert_eq!(s.opt_settled, 1, "and the contract expired still held");
+    // Index 65 000, strike 60 000, call ⇒ intrinsic $5 000, and the
+    // position is CASH, not an open leg marked at a dead mid.
+    assert!(
+        s_has(&out.summary, "opt_settled=1"),
+        "{}",
+        out.summary
+    );
+    assert_eq!(
+        s.position_rows, 0,
+        "an expired contract is not an open position"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The §6 replay half: option/instrument ordinals that reshuffle

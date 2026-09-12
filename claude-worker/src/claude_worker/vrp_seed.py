@@ -369,6 +369,21 @@ def read_vrp_toml(path: pathlib.Path) -> tuple[str, int]:
     return descriptor, tau_ns
 
 
+def read_selection_ns(path: pathlib.Path) -> int:
+    """``selection_ns`` from ``vrp.toml`` - how long before the entry
+    instant the member picks its strike.
+
+    Read separately from :func:`read_vrp_toml` because only the CAMPAIGN
+    cut needs it: the seed cut is a function of ``τ`` alone.
+    """
+    obj = tomllib.loads(path.read_text(encoding="utf-8"))
+    section = obj.get("vrp", {})
+    selection_ns = section.get("selection_ns")
+    if not isinstance(selection_ns, int) or selection_ns <= 0:
+        raise ValueError(f"{path}: `selection_ns` {selection_ns!r} must be a positive integer")
+    return selection_ns
+
+
 def seed_for_window(
     run_dir: pathlib.Path,
     db_path: pathlib.Path,

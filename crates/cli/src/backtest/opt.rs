@@ -101,10 +101,13 @@
 //! never on the hot path. No `unsafe`. The arithmetic is **i128 by
 //! necessity**, not by taste: see [`coin_mark_to_usd_1e6`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use core_types::{OptSummary, Price, SymbolId, Tick, VenueId, OPT_SUMMARY_FLAG_MARK_PX};
 use opt_registry::{OptInstrument, OptRegistry};
+
+use crate::backtest::fill::FillEngine;
+use crate::backtest::{MergedRec, RecPayload};
 
 /// Contract size the harness assumes for a Deribit option, ×1e9.
 ///
@@ -220,9 +223,18 @@ pub fn synth_mark_usd_1e6(o: &OptSummary, reg: &OptRegistry) -> Result<i64, OptS
 /// Ordinals reshuffle every boot by design (chain roll —
 /// `crates/cli/src/options_manifest.rs:8-11`), which is exactly why this
 /// is built PER RUN from that run's own manifest.
+///
+/// F13: the refused inserts are RETURNED, not swallowed. A refusal is
+/// a row the parser accepted and the table would not take (full, out
+/// of window, venue mismatch), and its records then price through
+/// [`OptSkip::Unregistered`] — which used to be indistinguishable from
+/// "not an option at all". A descriptor the PARSER refuses is not
+/// counted: that is every non-Deribit-option row in the manifest, by
+/// design.
 #[must_use]
-pub fn registry_from_manifest_rows<S: AsRef<str>>(rows: &[(u32, S)]) -> OptRegistry {
+pub fn registry_from_manifest_rows<S: AsRef<str>>(rows: &[(u32, S)]) -> (OptRegistry, u64) {
     let mut reg = OptRegistry::new();
+    let mut refused = 0u64;
     for (sym, desc) in rows {
         let Some(row) = OptInstrument::from_descriptor(
             *sym,
@@ -236,9 +248,11 @@ pub fn registry_from_manifest_rows<S: AsRef<str>>(rows: &[(u32, S)]) -> OptRegis
         ) else {
             continue;
         };
-        let _ = reg.insert(row);
+        if reg.insert(row).is_err() {
+            refused += 1;
+        }
     }
-    reg
+    (reg, refused)
 }
 
 /// Coin-denominated option QUOTE price ×1e6 → USD ×1e6.
@@ -293,7 +307,7 @@ pub enum QuoteFix {
 /// binding manifest and `audit-pnl` interns them to dense ids, and both
 /// populate this book with the same sym they later look up. Boot/offline
 /// — allocates freely.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct UnderlyingBook {
     /// sym → (ts_ns, underlying_px_1e9), ascending after `seal`.
     marks: BTreeMap<SymbolId, Vec<(u64, i64)>>,
@@ -401,10 +415,12 @@ fn fmt_pct_ppm(ppm: u32) -> String {
 /// `backtest` and `audit-pnl` so an operator diffing the two surfaces
 /// sees one sentence, not two paraphrases.
 ///
-/// There is no options book anywhere in the capture — Deribit's TAIL
-/// rows carry a top-of-book quote and a mark, never a ladder — so
-/// every option fill in either report is a MODEL fill at
-/// `mark ± half-spread`. `frac_1e6` is the assumed CROSSED spread in
+/// The capture carries no option LADDER — Deribit's TAIL rows carry a
+/// top-of-book quote and a mark, never depth — so every option fill in
+/// either report is a MODEL fill at `mark ± half-spread`. The real
+/// quote lane exists and is where option prices reach `FillEngine`
+/// (VRP V2a); what is missing is size behind the touch.
+/// `frac_1e6` is the assumed CROSSED spread in
 /// parts-per-million of premium (`--option-spread-frac`); `0` is the
 /// D-7 floor alone, and because the flag can only widen, the `0` rung
 /// is the optimistic end of the ladder — an upper bound on the edge,
@@ -426,6 +442,251 @@ pub fn render_opt_mark_law(n_syms: usize, frac_1e6: u32) -> String {
          so option fills are D-7 mark-fills at an ASSUMED spread — upper bound. The \
          assumption applies wherever these syms filled."
     )
+}
+
+// ---------------------------------------------------------------
+// The option MODEL registration (VRP P2.1 — F9, F10)
+// ---------------------------------------------------------------
+
+/// The static terms of one registered option, carried out of the load
+/// pass beside the records themselves.
+///
+/// [`OptSummary`] carries neither strike nor right — they live in the
+/// per-run [`OptRegistry`], which the merged stream has already left
+/// behind by the time the fill model is configured. Threading the
+/// terms out at load time is what lets ONE helper configure the whole
+/// option model for all three report surfaces.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OptTerms {
+    /// Strike ×1e6.
+    pub strike_1e6: i64,
+    /// [`opt_registry::RIGHT_CALL`] or [`opt_registry::RIGHT_PUT`].
+    pub right: u8,
+    /// Expiry, WALL ns since the epoch.
+    pub expiry_ns: u64,
+}
+
+/// VRP P2.1: everything the load pass hands the option model, as one
+/// out-param.
+///
+/// Three `&mut` maps threaded through `load_run` and `load_and_merge`
+/// separately would push both past clippy's argument limit and read as
+/// noise at every call site; the fields carry the names the model uses.
+#[derive(Default, Debug)]
+pub struct OptLoadOut {
+    /// Static terms per registered option sym, in the REMAPPED sym
+    /// space — that is what the fills the fee and settlement laws price
+    /// will carry.
+    pub terms: BTreeMap<u32, OptTerms>,
+    /// F9: the option syms the load pass SYNTHESISED a D-7 mark tick
+    /// for — no tick lane of their own, and a mark that converts. These
+    /// and only these execute under the mark-fill law.
+    pub synth_syms: BTreeSet<u32>,
+    /// Option syms whose prices arrive on a REAL quote lane (VRP V2a).
+    /// Printed beside `synth_syms` so the report says which of the two
+    /// paths each option's price actually took.
+    pub quote_lane_syms: BTreeSet<u32>,
+}
+
+/// VX-A: everything needed to turn one expired option sym into a
+/// European cash value, gathered while its own records were still
+/// arriving. Keyed per sym in the CALLER's space — `backtest` remaps
+/// to the binding manifest, `audit-pnl` interns to dense ids, and both
+/// populate and look up with the same sym.
+#[derive(Copy, Clone, Debug)]
+pub struct OptSettleRef {
+    /// The last underlying/index this instrument printed at or before
+    /// its expiry, ×1e6. Meaningless unless `index_wall_ns > 0`.
+    pub index_1e6: i64,
+    /// WALL instant of that index, and the flag for whether one was
+    /// ever found: `0` means no index at or before the expiry exists in
+    /// this root, which is a REFUSAL — the contract is left unsettled
+    /// and marks out exactly as it did before the rung.
+    ///
+    /// It has to be a wall: an `OptSummary.ts_ns` is the ENGINE's
+    /// monotonic stamp and an `expiry_ns` is a wall epoch, so comparing
+    /// the two directly is a category error that silently admits every
+    /// record (the first cut of this code did exactly that, and the
+    /// live table reported settlement indices "1785368505 s before
+    /// expiry" — fifty-six years, which is the epoch itself).
+    pub index_wall_ns: u64,
+    /// Strike ×1e6.
+    pub strike_1e6: i64,
+    /// [`opt_registry::RIGHT_CALL`] or [`opt_registry::RIGHT_PUT`].
+    pub right: u8,
+    /// Expiry, WALL ns since the epoch.
+    pub expiry_ns: u64,
+}
+
+impl OptSettleRef {
+    /// The terms alone, with no index observed yet.
+    #[must_use]
+    pub const fn of(t: OptTerms) -> Self {
+        Self {
+            index_1e6: 0,
+            index_wall_ns: 0,
+            strike_1e6: t.strike_1e6,
+            right: t.right,
+            expiry_ns: t.expiry_ns,
+        }
+    }
+
+    /// European cash value of ONE unit: `max(0, S − K)` for a call,
+    /// `max(0, K − S)` for a put. The same law the member settles by
+    /// (`strategy_vrp::VrpStrategy::intrinsic_1e6`), restated here
+    /// because the harness must not depend on a strategy crate.
+    #[inline]
+    #[must_use]
+    pub fn value_1e6(&self) -> i64 {
+        let v = if self.right == opt_registry::RIGHT_CALL {
+            self.index_1e6 - self.strike_1e6
+        } else {
+            self.strike_1e6 - self.index_1e6
+        };
+        if v > 0 {
+            v
+        } else {
+            0
+        }
+    }
+
+    /// True when this contract can actually settle inside a window
+    /// ending at `window_end_wall_ns`: an index at or before its expiry
+    /// exists in the root, and the clock reaches the expiry.
+    ///
+    /// A contract expiring after the window is carried but never
+    /// applied (`FillEngine` pins on `wall >= expiry` and `finish` is
+    /// capped at the last record it saw), and a contract with no index
+    /// at or before its expiry is REFUSED rather than priced off a
+    /// number the capture does not contain.
+    #[must_use]
+    pub const fn settleable(&self, window_end_wall_ns: u64) -> bool {
+        self.index_wall_ns > 0 && self.expiry_ns <= window_end_wall_ns
+    }
+}
+
+/// What [`register_option_model`] registered — returned so each report
+/// surface can print the same numbers it configured the engine with.
+pub struct OptModelRegistration {
+    /// F9: the syms that execute under the D-7 mark-fill law. These are
+    /// EXACTLY the syms the load pass synthesised a mark tick for — an
+    /// option with a real quote lane is priced by its own top of book
+    /// (VRP V2a), and registering it here would overwrite those quotes
+    /// with a zero-spread mark on every summary record.
+    pub mark_fill_syms: BTreeSet<u32>,
+    /// VX-A: the settlement reference per option sym.
+    pub settle_refs: BTreeMap<u32, OptSettleRef>,
+    /// VRP V2b: the index leg of the venue's capped option fee, ×1e6 —
+    /// the LAST index each sym printed (F15 moves this to the fill
+    /// instant).
+    pub index_1e6: BTreeMap<u32, i64>,
+}
+
+/// VX-A / F10: pin every settleable contract to its European cash
+/// value. Returns how many were applied.
+///
+/// Shared by all three surfaces so a contract held through expiry
+/// becomes cash in exactly one way, whichever report is looking.
+pub fn apply_settlements(
+    engine: &mut FillEngine,
+    refs: &BTreeMap<u32, OptSettleRef>,
+    window_end_wall_ns: u64,
+) -> usize {
+    let mut n = 0usize;
+    for (sym, r) in refs {
+        if !r.settleable(window_end_wall_ns) {
+            continue;
+        }
+        engine.set_opt_settle(*sym, r.value_1e6());
+        n += 1;
+    }
+    n
+}
+
+/// Configure the ONE option model a report surface runs under: the D-7
+/// mark-fill registration (F9), the capped-fee index leg, the expiry
+/// classifier, and the European cash settlement (F10).
+///
+/// `backtest`, `backtest --member` and `audit-pnl` all went their own
+/// way here: the first two registered EVERY option sym carrying a mark
+/// as a mark-fill sym — which since VRP V2a is every Deribit option,
+/// because they all have a quote lane — and neither settled anything
+/// at all, so an option held through its expiry marked out at whatever
+/// mid the tape last carried. This is that model, written once.
+///
+/// One pass over `merged` collects both indices: the LAST index per sym
+/// (the fee leg) and the last index at or before each expiry (the
+/// settlement reference, P4.2 replaces it with the TWAP).
+pub fn register_option_model(
+    engine: &mut FillEngine,
+    merged: &[MergedRec],
+    synth_syms: &BTreeSet<u32>,
+    opt_terms: &BTreeMap<u32, OptTerms>,
+    window_end_wall_ns: u64,
+) -> OptModelRegistration {
+    let mut settle_refs: BTreeMap<u32, OptSettleRef> = BTreeMap::new();
+    for (sym, t) in opt_terms {
+        engine.set_opt_expiry(*sym, t.expiry_ns);
+        settle_refs.insert(*sym, OptSettleRef::of(*t));
+    }
+    let mut index_1e6: BTreeMap<u32, i64> = BTreeMap::new();
+    // F15: the same observations, kept as a WALL-stamped timeline, so
+    // the capped fee's index leg is read at the fill instant instead
+    // of from whatever index the run last printed.
+    let mut fee_book = UnderlyingBook::new();
+    let mut i = 0usize;
+    while i < merged.len() {
+        let rec = &merged[i];
+        i += 1;
+        let RecPayload::Opt(o) = &rec.payload else {
+            continue;
+        };
+        // Presence of an index is what classes a sym as fee-capped, so
+        // only Deribit options get one. The field is the expiry's
+        // FORWARD rather than the spot index (V0(a), measured −2.22 bps
+        // of basis); at a $23.70 index leg that is half a cent, and
+        // `index_price` is parsed by nothing in the tree — documented
+        // rather than plumbed.
+        if o.venue != VenueId::Deribit as u8 || o.underlying_px_1e9 <= 0 {
+            continue;
+        }
+        let idx_1e6 = o.underlying_px_1e9 / 1_000;
+        index_1e6.insert(o.sym, idx_1e6);
+        fee_book.observe(
+            o.sym,
+            rec.wall_ns,
+            o.underlying_px_1e9,
+            DERIBIT_OPT_CONTRACT_SIZE_1E9,
+        );
+        // VX-A: the settlement reference. Deribit keeps printing an
+        // expired instrument for 9–19 min after settlement, and on a
+        // $79k index the drift over that lag is worth more than the
+        // option's whole premium — so the cut-off is the point of the
+        // rung, not a nicety. `wall_ns` is already the §3.3 rebase, so
+        // the two clocks agree by construction.
+        if let Some(r) = settle_refs.get_mut(&o.sym) {
+            if rec.wall_ns <= r.expiry_ns && rec.wall_ns >= r.index_wall_ns {
+                r.index_1e6 = idx_1e6;
+                r.index_wall_ns = rec.wall_ns;
+            }
+        }
+    }
+    for (sym, idx) in &index_1e6 {
+        engine.set_opt_index(*sym, *idx);
+    }
+    for sym in synth_syms {
+        engine.set_mark_fill_sym(*sym);
+    }
+    fee_book.seal();
+    if !fee_book.is_empty() {
+        engine.attach_underlying_book(fee_book);
+    }
+    apply_settlements(engine, &settle_refs, window_end_wall_ns);
+    OptModelRegistration {
+        mark_fill_syms: synth_syms.clone(),
+        settle_refs,
+        index_1e6,
+    }
 }
 
 #[cfg(test)]
@@ -526,7 +787,7 @@ mod tests {
     }
 
     fn one_row_registry(sym: u32) -> OptRegistry {
-        registry_from_manifest_rows(&[(sym, "deribit:BTC-10SEP26-79000-C")])
+        registry_from_manifest_rows(&[(sym, "deribit:BTC-10SEP26-79000-C")]).0
     }
 
     #[test]
@@ -610,7 +871,7 @@ mod tests {
             (core_types::make_symbol_id(VenueId::Deribit, 1), "deribit:BTC-PERPETUAL"),
             (7, "binance:btcusdt"),
         ];
-        let reg = registry_from_manifest_rows(&rows);
+        let (reg, _refused) = registry_from_manifest_rows(&rows);
         assert_eq!(reg.len(), 2);
         assert!(reg.is_option(base + 1));
         assert!(reg.is_option(base + 2));

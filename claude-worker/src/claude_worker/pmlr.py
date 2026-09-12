@@ -108,12 +108,30 @@ class TickRec(typing.NamedTuple):
         return total // 2 if total >= 0 else -((-total) // 2)
 
 
+#: ``FillRec.origin``: the venue reported this fill.
+FILL_ORIGIN_VENUE: int = 0
+#: ``FillRec.origin``: the engine's own paper matcher modelled it (X1).
+FILL_ORIGIN_PAPER: int = 1
+#: ``FillRec.strategy_id``: the fill carries no member attribution.
+STRATEGY_ID_NONE: int = 0xFF
+
+
 class FillRec(typing.NamedTuple):
-    """One `Fill` slot. ``side``: 0 = Bid (buy), 1 = Ask (sell)."""
+    """One `Fill` slot. ``side``: 0 = Bid (buy), 1 = Ask (sell).
+
+    X1 (VRP P1): ``strategy_id`` at offset 13 and ``origin`` at offset
+    14 were explicit zeroed padding before the engine modelled its own
+    paper fills, so every capture in existence reads
+    ``(STRATEGY_ID_NONE, FILL_ORIGIN_VENUE)`` there — wire-additive, and
+    the reader-compat surface is zero because paper mode never
+    persisted a fill at all.
+    """
 
     ts_ns: int
     sym: int
     side: int
+    strategy_id: int
+    origin: int
     px: int
     qty: int
     order_id: int
@@ -159,7 +177,7 @@ _HEADER: struct.Struct = struct.Struct("<4sHBxQ")
 # ts u64 · sym u32 · venue_seq u32 · 4×i64 · venue u8 · flags u8 (VT1) ·
 # pad 6 · venue_time_ms u64 (VT1) — the whole 64-B slot is field-covered.
 _TICK: struct.Struct = struct.Struct("<QIIqqqqBB6xQ")
-_FILL: struct.Struct = struct.Struct("<QIB3xqqQ")
+_FILL: struct.Struct = struct.Struct("<QIBBBxqqQ")
 _AI_CMD: struct.Struct = struct.Struct("<QIIqqQBBBBHH")
 # VM2 V6: kind-3 Order (engine-orders.pmlr, M4.1) — ts u64 · sym u32 ·
 # side u8 · kind u8 · pad2 · px i64 · qty i64 · client_oid u64 ·

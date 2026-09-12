@@ -57,9 +57,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use core_time::WallAnchor;
-use core_types::{Fill, InstrumentClass, Price, Qty, VenueId};
+use core_types::{Fill, InstrumentClass, Price, Qty};
 use ingress_ai::DescriptorTable;
-use strategy_core::Strategy;
+use strategy_core::{Strategy, StrategyCounters};
 
 use super::fill::{
     usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor, FillEngine, ModelOutcome, SynthFill,
@@ -80,6 +80,10 @@ pub enum MemberKind {
     /// Slot 2, `crates/strategy-xsd` — params from `xsd.toml`, the
     /// table from `xsd-table.tsv`, an optional seed (XSD-3).
     Xsd,
+    /// Slot 1, `crates/strategy-vrp` — params from `vrp.toml`, the
+    /// fitted pairs from `vrp-seed.tsv`, the option chain from the
+    /// capture's newest manifest (VRP P2.3).
+    Vrp,
 }
 
 impl MemberKind {
@@ -88,6 +92,7 @@ impl MemberKind {
         match s {
             "icdp" => Some(Self::Icdp),
             "xsd" => Some(Self::Xsd),
+            "vrp" => Some(Self::Vrp),
             _ => None,
         }
     }
@@ -97,6 +102,7 @@ impl MemberKind {
         match self {
             Self::Icdp => "icdp",
             Self::Xsd => "xsd",
+            Self::Vrp => "vrp",
         }
     }
 }
@@ -114,6 +120,14 @@ pub struct MemberSpec {
     /// xsd only: `--xsd-seed <path>` (default `~/multivenue/xsd-seed.tsv`;
     /// absent = no seed).
     pub seed: Option<PathBuf>,
+    /// vrp only: `--vrp-seed <path>` — the worker-written fitted pairs.
+    /// Absent = the FIRST run directory's own `vrp-seed.tsv` when it
+    /// exists (the window cut writes one), else a cold boot.
+    ///
+    /// F16: `BacktestConfig.vrp_seed` was declared at VRP V5 and read
+    /// by nothing. It is routed here, which is the only arm that can
+    /// construct the member.
+    pub vrp_seed: Option<PathBuf>,
 }
 
 /// Round-trip counter over synthesized fills, member-agnostic: a
@@ -311,14 +325,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
         cfg.option_spread_frac_1e6,
     )?;
     let runs = discover_runs(&cfg.replay_dir)?;
-    let mut opt_expiry_ns: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut opt_out = crate::backtest::opt::OptLoadOut::default();
     let mut sym_class: BTreeMap<u32, InstrumentClass> = BTreeMap::new();
-    let (merged, run_summaries) = load_and_merge(
-        &runs,
-        model.stale_after_ms,
-        &mut opt_expiry_ns,
-        &mut sym_class,
-    )?;
+    let (merged, run_summaries) =
+        load_and_merge(&runs, model.stale_after_ms, &mut opt_out, &mut sym_class)?;
     let universe = derive_universe(&merged);
     let descriptors = manifest_descriptor_table(&runs);
 
@@ -343,26 +353,21 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     }
 
     // ---- the fill model, configured exactly as the VM path ----
+    // VRP P2.1 (F9, F10): the SAME helper the VM path calls. This arm
+    // carried a byte-for-byte copy of the VM's inline loop, so the F9
+    // over-registration and the missing settlement were duplicated
+    // here; one helper is what makes that impossible to reintroduce.
     let mut engine = FillEngine::new(model, boundary_virt);
-    let mut mark_fill_syms: BTreeSet<u32> = BTreeSet::new();
-    for rec in &merged {
-        if let RecPayload::Opt(o) = &rec.payload {
-            if o.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && o.mark_px_1e9 > 0 {
-                mark_fill_syms.insert(o.sym);
-            }
-            if o.venue == VenueId::Deribit as u8 && o.underlying_px_1e9 > 0 {
-                engine.set_opt_index(o.sym, o.underlying_px_1e9 / 1_000);
-            }
-        }
-    }
-    for (sym, expiry_ns) in &opt_expiry_ns {
-        engine.set_opt_expiry(*sym, *expiry_ns);
-    }
+    let window_end_wall_ns = merged[merged.len() - 1].wall_ns;
+    let opt_model = crate::backtest::opt::register_option_model(
+        &mut engine,
+        &merged,
+        &opt_out.synth_syms,
+        &opt_out.terms,
+        window_end_wall_ns,
+    );
     for (sym, class) in &sym_class {
         engine.set_sym_class(*sym, *class);
-    }
-    for sym in &mark_fill_syms {
-        engine.set_mark_fill_sym(*sym);
     }
 
     // ---- the member ----
@@ -486,6 +491,135 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 );
                 (hash_hex, line, out, counters)
             }
+            MemberKind::Vrp => {
+                // The boot bundle law, offline (Q10): params from the
+                // artifact, the fitted pairs from the worker's seed,
+                // the option chain from the capture's NEWEST manifest —
+                // and NO state, because a replay always starts flat
+                // (the XSD law, same reason).
+                //
+                // V0 C2: an expiry the newest manifest does not carry is
+                // not replayable — its ordinals are gone and no row can
+                // be built for it — so the chain row count is printed
+                // and a campaign on a missing expiry simply never
+                // selects.
+                let chain: Vec<(String, core_types::SymbolId)> = super::read_manifest_rows(
+                    &runs[runs.len() - 1].path,
+                )
+                .into_iter()
+                .filter(|(_, d)| d.starts_with("deribit:"))
+                .map(|(sym, d)| (d, sym))
+                .collect();
+                let seed = match spec.vrp_seed.clone() {
+                    Some(p) => Some(p),
+                    None => {
+                        // The window cut writes one per window; the
+                        // first run dir's is the campaign's own.
+                        let p = runs[0].path.join("vrp-seed.tsv");
+                        p.exists().then_some(p)
+                    }
+                };
+                let no_state = std::path::Path::new("/nonexistent/vrp-state.tsv");
+                let boot = crate::vrp_boot::load_vrp_boot(
+                    Some(&spec.params),
+                    seed.as_deref(),
+                    Some(no_state),
+                    &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &chain,
+                )
+                .map_err(HarnessError::Usage)?
+                .ok_or_else(|| {
+                    HarnessError::Usage("vrp: artifact absent — nothing to drive".to_owned())
+                })?;
+                let hash_hex = hex_lower(&boot.hash);
+                let mut strat = strategy_vrp::VrpStrategy::new();
+                // Identity anchor: the member reads WALL instants from
+                // every payload (the drive rewrites `ts_ns`), so
+                // mono == wall and every expiry compare is in the same
+                // clock as the capture's.
+                strat
+                    .configure(
+                        boot.params,
+                        boot.registry.clone(),
+                        boot.underlying_sym,
+                        boot.hedge_sym,
+                        WallAnchor::new(0, 0),
+                        boot.hash,
+                    )
+                    .map_err(|e| HarnessError::Usage(format!("vrp: configure refused: {e}")))?;
+                // F2: the MERGED pairs, pushed exactly once.
+                for (ts_ms, x, y) in &boot.pairs {
+                    strat.seed_pair_at(*ts_ms, *x, *y);
+                }
+                let seeded_minutes = strat.seed_returns(&boot.window);
+                strat
+                    .on_start(&mut ctx)
+                    .map_err(|e| HarnessError::Internal(format!("vrp on_start failed: {e}")))?;
+                let line = format!(
+                    "member: vrp params={} hash={} chain_rows={} chain_refused={} seed={} \
+                     seed_pairs={} pairs={} window_minutes={} warm={} tau_ns={} theta_1e9={} \
+                     sides={} root=run-dirs (Q3) anchor=wall (identity)",
+                    spec.params.display(),
+                    hash_hex,
+                    boot.registry.len(),
+                    boot.rows_refused,
+                    boot.seed_path.display(),
+                    boot.pairs_from_seed,
+                    strat.n_pairs(),
+                    seeded_minutes,
+                    strat.vol_is_warm(),
+                    boot.params.tau_ns,
+                    boot.params.theta_1e9,
+                    match boot.params.sides {
+                        strategy_vrp::SIDES_SHORT => "short",
+                        strategy_vrp::SIDES_LONG => "long",
+                        _ => "both",
+                    },
+                );
+                let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
+                let c = strat.vrp_counters();
+                let counters = format!(
+                    "member: vrp decisions={} decisions_late={} entries={} entries_submitted={} \
+                     entries_unfilled={} hedges={} hedge_unfilled={} hedge_abandoned={} exits={} \
+                     holds={} holds_side={} no_bounds={} no_selection={} select_scans={} \
+                     stale_skips={} regime_blocked={} regime_exits={} settlements={} \
+                     settled_itm={} settled_otm={} settled_unpriced={} qlike_har_beats_iv={} \
+                     killed={} caps_rejected={} fills={} fills_ignored={} orders_emitted={} \
+                     vol_minutes={} vol_warm={} vol_gaps={} pairs={} regime=not-replayed(v1)",
+                    c.decisions,
+                    c.decisions_late,
+                    c.entries,
+                    c.entries_submitted,
+                    c.entries_unfilled,
+                    c.hedges,
+                    c.hedge_unfilled,
+                    c.hedge_abandoned,
+                    c.exits,
+                    c.holds,
+                    c.holds_side,
+                    c.no_bounds,
+                    c.no_selection,
+                    c.select_scans,
+                    c.stale_skips,
+                    c.regime_blocked,
+                    c.regime_exits,
+                    c.settlements,
+                    c.settled_itm,
+                    c.settled_otm,
+                    c.settled_unpriced,
+                    c.qlike_har_beats_iv,
+                    c.killed,
+                    c.caps_rejected,
+                    c.fills,
+                    c.fills_ignored,
+                    out.orders_emitted,
+                    strat.vol_minutes(),
+                    strat.vol_is_warm(),
+                    strat.vol_gaps(),
+                    strat.n_pairs(),
+                );
+                (hash_hex, line, out, counters)
+            }
         };
     let outcome: ModelOutcome = engine.finish();
     let oos_round_trips = drive_out.round_trips - drive_out.rt_at_boundary;
@@ -546,10 +680,15 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
         opts_unconverted: run_summaries.iter().map(|r| r.opts_unconverted).sum(),
         opt_quotes_converted: run_summaries.iter().map(|r| r.opt_quotes_converted).sum(),
         opt_quotes_dropped: run_summaries.iter().map(|r| r.opt_quotes_dropped).sum(),
+        opt_quotes_unregistered: run_summaries.iter().map(|r| r.opt_quotes_unregistered).sum(),
+        opt_registry_refused: run_summaries.iter().map(|r| r.opt_registry_refused).sum(),
         remapped_syms: run_summaries.iter().map(|r| r.remapped_syms).sum(),
         dropped_foreign: run_summaries.iter().map(|r| r.dropped_foreign).sum(),
         mark_fills: outcome.mark_fills,
-        opt_mark_syms: mark_fill_syms.len() as u64,
+        opt_mark_syms: opt_model.mark_fill_syms.len() as u64,
+        opt_quote_lane_syms: opt_out.quote_lane_syms.len() as u64,
+        opt_settled: outcome.opt_settled,
+
         stale_ticks_skipped: outcome.stale_ticks_skipped,
         ioc_fills: outcome.ioc_fills,
         ioc_canceled: outcome.ioc_canceled,
@@ -757,17 +896,19 @@ mod tests {
     fn member_kind_tokens() {
         assert_eq!(MemberKind::parse("icdp"), Some(MemberKind::Icdp));
         assert_eq!(MemberKind::parse("xsd"), Some(MemberKind::Xsd));
-        assert_eq!(MemberKind::parse("vrp"), None);
+        // P2.3 (Q10): the VRP member is drivable offline.
+        assert_eq!(MemberKind::parse("vrp"), Some(MemberKind::Vrp));
         assert_eq!(MemberKind::parse(""), None);
         assert_eq!(MemberKind::Icdp.label(), "icdp");
         assert_eq!(MemberKind::Xsd.label(), "xsd");
+        assert_eq!(MemberKind::Vrp.label(), "vrp");
     }
 
     #[test]
     fn unknown_member_kind_is_refused_by_the_bin_grammar() {
         // The bin refuses before reaching `run_member`; the enum has no
         // fallback variant by construction.
-        assert!(MemberKind::parse("vrp").is_none());
+        assert!(MemberKind::parse("VRP").is_none());
         assert!(MemberKind::parse("cross-arb").is_none());
     }
 }

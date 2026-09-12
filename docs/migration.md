@@ -6,6 +6,136 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `backtest` and `audit-pnl` share ONE option model; `--member vrp`; the campaign pool (VRP P2)
+
+**What changed**
+
+- **One option-model registration (F9, F10).** `backtest::opt` gains
+  `OptTerms`, `OptLoadOut`, `OptModelRegistration`,
+  `register_option_model` and `apply_settlements`, and `OptSettleRef`
+  (with `value_1e6`) MOVES there from `audit_pnl.rs`. All three report
+  surfaces — `backtest`, `backtest --member` and `audit-pnl` — now
+  configure the mark-fill law, the capped-fee index leg, the expiry
+  classifier and the European cash settlement from that one place.
+  - **F9:** the D-7 mark-fill law now applies to EXACTLY the syms the
+    load pass SYNTHESISED a mark tick for. It used to apply to every
+    option sym carrying a mark, which since VRP V2a is every Deribit
+    option — they all have a quote lane — so a zero-spread mark tick
+    overwrote the option's own top of book on every summary record.
+    On any real capture the synthesised set is EMPTY, so
+    `opt_mark_syms` reads 0 where it used to read the whole chain.
+  - **F10:** `set_opt_settle` was called from `audit_pnl.rs` alone. A
+    contract held through its expiry now becomes cash at the European
+    intrinsic in the backtest too, instead of marking out at whatever
+    mid the dead instrument last printed (Deribit keeps quoting an
+    expired instrument for 9–19 min).
+  - The two byte-for-byte copies of the inline registration loop (in
+    `backtest.rs` and `backtest/member.rs`) are gone.
+- **Fill-engine fixes.**
+  - **F12:** a SETTLED sym fills nothing in pass (b) — every open order
+    on it is canceled and counted `settled_sym_orders_canceled`.
+  - **F13:** an option QUOTE tick whose sym printed a Deribit summary in
+    the run and has no registry row is DROPPED and counted
+    (`opt_quotes_unregistered`); `registry_from_manifest_rows` returns
+    its refused inserts (`opt_registry_refused`). Both printed. Before
+    this the book answered `NotAnOption` and left a COIN number in a USD
+    field — the units defect V2a exists to remove, by the one path V2a
+    did not close.
+  - **F14:** `audit-pnl` calls `finish()` BEFORE `per_sym_detail()`.
+    `finish` is what runs the settlement sweep, so the rows it printed
+    showed an expired contract as an open position.
+  - **F15:** the capped option fee's index leg is read at the FILL
+    instant from a wall-stamped `UnderlyingBook`
+    (`FillEngine::attach_underlying_book`), not from whatever index the
+    run last printed. Absent book ⇒ the last-index fallback, byte for
+    byte as before.
+  - **F17:** `Side::Bid => (mark + h).max(1)` — on a settled OTM
+    contract the mark IS zero, and a resting bid booked a fill at a
+    price of nothing.
+- **`backtest --member vrp` (Q10; F16 closed).** `MemberKind::Vrp`
+  drives `strategy-vrp` through the harness on the wall clock:
+  `vrp.toml` via `--vrp`, the fitted pairs via `--vrp-seed` (default:
+  the FIRST run dir's own `vrp-seed.tsv`), the option chain from the
+  capture's NEWEST manifest, identity `WallAnchor`, and NO state — a
+  replay always starts flat (the XSD law). `BacktestConfig.vrp_seed`
+  and `AuditPnlConfig.vrp_seed` were declared at VRP V5 and read by
+  nothing; the first moves to `MemberSpec.vrp_seed`, the second is
+  DELETED along with `audit-pnl --vrp-seed` — that verb replays logged
+  orders and never constructs the member.
+- **The campaign pool (`window_root --campaign vrp`).** A VRP campaign
+  is nine instants over nine hours and the ≤ 2 h capture law forbids
+  replaying the hours between them, so the pool for this member is the
+  NINE slices it decides in, per UTC day: the decision window
+  `[entry − selection − 5 min, entry + selection + 5 min]`, the first
+  5 min after every hour boundary strictly inside `(entry, expiry)`,
+  and `[expiry − 10 min, expiry + 20 min]`. Pool
+  `~/multivenue/worker/windows-vrp/`, pruned by COUNT
+  (5 days × 9 windows). Each cut gets its own `vrp-seed.tsv` as of its
+  first instant, which is where the member's 24 h warm-up comes from —
+  the tape between the slices is not in the pool.
+- **`claude_worker.vrp_shadow`** reconciles the engine's own book
+  (`engine-orders.pmlr` + `engine-fills.pmlr`, attributed to slot 1)
+  against `audit-pnl` replaying the same capture: per-sym fills, per-sym
+  position, and the order count that frames them. Exit 0 only when every
+  leg agrees. This is the V8 acceptance instrument and P1's live one.
+- **`pmlr.FillRec` gains `strategy_id` and `origin`** — the Python
+  mirror of P1's wire-additive `Fill` change. Every capture written
+  before P1 reads `(STRATEGY_ID_NONE, FILL_ORIGIN_VENUE)` there,
+  because those three bytes were explicit zeroed padding.
+
+**The guards (P2's binding gates)**
+
+Two roots, before and after. The option-free root is one VM pool window
+with its `*-opt-summary.pmlr` files truncated to their headers and
+`options-manifest.tsv` emptied — no option record reaches the model, so
+the whole change is inert and every surface must be identical:
+
+```sh
+E=./target/release/multivenue-engine
+RS=~/multivenue/artifacts/rulesets/fde6f733e72649e0c6452b009d0f7c3c.json
+$E backtest --ruleset $RS --replay-dir <option-free root> --split 0/100 \
+   --emit-detail <sidecar> > <stdout>          # surfaces 1 and 2
+$E backtest --member xsd --replay-dir <option-free root> --split 0/100   # surface 3
+$E audit-pnl --dir <option-free root>                                    # surface 4
+$E backtest --ruleset $RS --replay-dir ~/multivenue/worker/windows/ \
+   --split 0/100 --emit-detail <sidecar> > <stdout>   # the 8-window pool
+```
+
+| surface | sha256 |
+|---|---|
+| option-free schema-1 stdout | `0ad5feaf672b2f78addb4ab43b8fde5c47fe38d36b1d2ac1d820217083b2759d` |
+| option-free detail sidecar (v7) | `3fca866e051381ee931d58a6701ea13dcd2f01a2e1bce58dbed25032200bf392` |
+| option-free `--member xsd` schema-1 | `da67d68d20b3b63649d2bde1a7b123d5ab10377d9b76e91809dff5cde9eb1ccc` |
+| option-free `audit-pnl` stdout | `65d46286eb82cc569b5eab0c9bdfb48feb7de907385ad66fdb00736cb0dbc098` |
+| 8-window pool schema-1 stdout | `188d18e3b1ded76256ea0f5206c29880195b2af3686745ecbe85f85ce9105189` |
+
+All five identical before and after. The pool's DETAIL sidecar is NOT
+identical and must not be: it carries `"options":{"mark_syms":…}`, which
+goes 64 → 0 on that root (`8695c421…` → `e3f6b8ef…`). That number
+changing is the F9 fix, and the report now says it in one line:
+`opt_mark_syms=0 quote_lane_syms=122`.
+
+**What did NOT change**
+
+`detail_version` stays **7** and `audit_pnl_version` stays **1**: the
+new counts (`opt_mark_syms`, `quote_lane_syms`, `opt_settled`,
+`quote_ticks_unregistered`, `registry_refused`) are printed on the human
+report only, because the JSON surfaces are what the guards above pin.
+The rendered `OPTIONS MARK-FILL LAW (D-7)` sentence is unchanged for the
+same reason — it is inside the guarded sidecar; the misleading "no
+options book exists in the capture" wording is corrected in the doc
+comments and in `--option-spread-frac`'s `--help` instead.
+
+**Operator action**
+
+- `audit-pnl --vrp-seed` is GONE. Any script passing it must drop the
+  flag; it never did anything.
+- `backtest --member vrp` is new and additive — the frozen worker argv
+  never passes `--member`.
+- Reports over option-carrying roots will show `opt_mark_syms=0` where
+  they used to show the chain size, and may now show `opt_settled=N`
+  where an expiry falls inside the window. Both are the fix.
+
 ## 2026-09-12 — the engine MODELS its paper fills; `Fill` carries its origin and its member (VRP P1 / X1)
 
 **What changed**

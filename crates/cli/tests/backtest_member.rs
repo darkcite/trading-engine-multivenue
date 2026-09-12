@@ -105,13 +105,13 @@ fn member_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
         emit_detail: None,
         regime: RegimeMode::Off,
         regime_seed: None,
-        vrp_seed: None,
         funding_seed: None,
         member: Some(MemberSpec {
             kind: MemberKind::Icdp,
             params: toml.to_path_buf(),
             table: None,
             seed: None,
+            vrp_seed: None,
         }),
     }
 }
@@ -368,6 +368,7 @@ fn xsd_member_enters_and_reverts_on_the_wall_hour_grid() {
         params: toml.clone(),
         table: Some(table),
         seed: Some(seed),
+        vrp_seed: None,
     });
     let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
     let hash = core_crypto::sha256(XSD_TOML.as_bytes());
@@ -413,11 +414,335 @@ fn xsd_member_without_a_table_is_refused_with_a_reason() {
         params: toml.clone(),
         table: Some(root.join("absent-table.tsv")),
         seed: Some(seed),
+        vrp_seed: None,
     });
     let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
         Ok(_) => panic!("an explicit absent table must refuse the run"),
         Err(e) => format!("{e}"),
     };
     assert!(msg.contains("does not exist"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------
+// VRP P2.3 (Q10) — `backtest --member vrp`
+// ---------------------------------------------------------------
+//
+// A whole campaign on a synthetic root: 34 h of one-minute Deribit perp
+// closes (the HAR's 24 h warm-up plus the 8 h hold), one option's
+// ticker summaries and its REAL quote lane, and a chain of two expiries
+// so the selection law has to choose. The member selects at
+// `E − τ − selection/2`, decides at `E − τ` against a 500 % quoted IV
+// it cannot possibly agree with, its entry IoC fills against the option
+// book, the hedge goes out FROM that fill (X1), and the contract is
+// still held at `E`, where it settles for cash.
+
+/// `deribit:BTC-27MAR26-79000-C` expires 2026-03-27T08:00:00Z.
+const VRP_EXPIRY_NS: u64 = 1_774_598_400_000_000_000;
+/// The run's epoch: 34 h before the expiry, so the 24 h warm-up
+/// finishes with two hours to spare before the selection window opens.
+const VRP_EPOCH_NS: u64 = VRP_EXPIRY_NS - 122_400_000_000_000;
+const VRP_PERP: u32 = (3 << 24) | 1;
+const VRP_OPT: u32 = (3 << 24) | 700;
+const VRP_OPT_FAR: u32 = (3 << 24) | 701;
+
+const VRP_TOML: &str = "[vrp]\n\
+theta_1e9             = 100000000\n\
+tau_ns                = 28800000000000\n\
+epsilon_ns            = 300000000000\n\
+selection_ns          = 600000000000\n\
+rebalance_ns          = 3600000000000\n\
+qty_1e6               = 1000000\n\
+band_qty_1e6          = 50000\n\
+underlying_descriptor = \"deribit:BTC-PERPETUAL\"\n\
+hedge_descriptor      = \"deribit:BTC-PERPETUAL\"\n\
+sides                 = \"both\"\n";
+
+/// A deep two-sided book — every leg of the campaign fills in one tick.
+fn vrp_tick(ts_ns: u64, sym: u32, seq: u32, bid: i64, ask: i64) -> Tick {
+    Tick::new(
+        ts_ns,
+        VenueId::Deribit,
+        sym,
+        seq,
+        Price::from_raw(bid),
+        Qty::from_raw(100_000_000_000_000),
+        Price::from_raw(ask),
+        Qty::from_raw(100_000_000_000_000),
+    )
+}
+
+/// One ticker summary of `sym`: mark 0.0038 BTC, the quoted IV and
+/// delta the caller wants, against an underlying of `index_1e9`.
+fn vrp_summary(
+    ts_ns: u64,
+    sym: u32,
+    iv_1e9: i64,
+    delta_1e9: i64,
+    index_1e9: i64,
+) -> core_types::OptSummary {
+    core_types::OptSummary::new(
+        ts_ns,
+        VenueId::Deribit,
+        sym,
+        core_types::OPT_SUMMARY_FLAG_MARK_PX,
+        3_800_000, // 0.0038 BTC ⇒ ~$300 at $79,000
+        iv_1e9,
+        index_1e9,
+        0,
+        delta_1e9,
+        1,
+        1,
+        -1,
+    )
+}
+
+/// Build the campaign root. Returns `(replay_dir, vrp.toml, vrp-seed.tsv)`.
+fn build_vrp_capture(root: &Path, with_chain: bool) -> (PathBuf, PathBuf, PathBuf) {
+    let run = root.join(format!("run-{VRP_EPOCH_NS}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    let mut manifest = format!("{VRP_PERP}\tderibit:BTC-PERPETUAL\n");
+    if with_chain {
+        manifest.push_str(&format!("{VRP_OPT}\tderibit:BTC-27MAR26-79000-C\n"));
+        manifest.push_str(&format!("{VRP_OPT_FAR}\tderibit:BTC-28MAR26-79000-C\n"));
+    }
+    std::fs::write(run.join("instrument-manifest.tsv"), manifest).expect("manifest");
+    std::fs::write(
+        run.join("options-manifest.tsv"),
+        if with_chain {
+            format!(
+                "deribit\t{VRP_OPT}\tBTC-27MAR26-79000-C\nderibit\t{VRP_OPT_FAR}\tBTC-28MAR26-79000-C\n"
+            )
+        } else {
+            String::new()
+        },
+    )
+    .expect("options manifest");
+
+    // ---- the perp lane: 2041 one-minute closes, EPOCH .. E ----
+    //
+    // The walk matters: a flat tape has zero realised variance, the HAR
+    // is then 0 and the member reports `no_bounds` forever. The step is
+    // ~$20/min on $79,000 — about 2.5 bps, which is the live scale.
+    //
+    // THREE ticks a minute, not one: every leg is an IoC with a 60 s
+    // TTL, so a lane that prints once a minute gives a hedge emitted
+    // just after a print a single chance to be judged before its own
+    // TTL cancels it. The live Deribit perp prints many times a second.
+    const STEP_NS: u64 = 20_000_000_000;
+    let steps = 122_400_000_000_000 / STEP_NS + 15; // EPOCH .. E + 5 min
+    let mut perp: Vec<Tick> = Vec::with_capacity(steps as usize + 1);
+    let mut px = 79_000_000_000i64;
+    let mut s = 20_260_912i64;
+    let mut k = 0u64;
+    while k <= steps {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 14_000_000) as i64 - 7_000_000).max(1_000_000_000);
+        perp.push(vrp_tick(
+            500 + k * STEP_NS,
+            VRP_PERP,
+            k as u32,
+            px - 500_000,
+            px + 500_000,
+        ));
+        k += 1;
+    }
+    // The option's REAL quote lane (VRP V2a): COIN-denominated, 0.005 /
+    // 0.006 BTC ⇒ $395 / $474 at $79,000. The entry IoC rests at the
+    // MARK (~$300), so the bid crosses it and the leg fills.
+    //
+    // Only after the first summary: a quote with no underlying known at
+    // or before its instant is dropped, by the denomination law.
+    const SELECT_OFF: u64 = 122_400_000_000_000 - 28_800_000_000_000 - 300_000_000_000;
+    const ENTRY_OFF: u64 = 122_400_000_000_000 - 28_800_000_000_000;
+    let mut opt_ticks: Vec<Tick> = Vec::new();
+    let mut j = 0u64;
+    while j < 8 {
+        opt_ticks.push(vrp_tick(
+            500 + SELECT_OFF + 1_000_000_000 + j * 1_000_000_000,
+            VRP_OPT,
+            j as u32,
+            5_000,
+            6_000,
+        ));
+        j += 1;
+    }
+    j = 0;
+    while j < 8 {
+        opt_ticks.push(vrp_tick(
+            500 + ENTRY_OFF + 1_000_000_000 + j * 1_000_000_000,
+            VRP_OPT,
+            100 + j as u32,
+            5_000,
+            6_000,
+        ));
+        j += 1;
+    }
+    let mut w = PmlrWriter::open(run.join("deribit-ticks.pmlr"), SlotKind::Tick, VRP_EPOCH_NS)
+        .expect("open ticks");
+    // §3.2 orders within a file by (ts, idx), so append in ts order.
+    let mut all: Vec<Tick> = perp;
+    all.extend(opt_ticks);
+    all.sort_by_key(|t| t.ts_ns);
+    for t in &all {
+        w.append(t).expect("append tick");
+    }
+    w.flush().expect("flush ticks");
+
+    // ---- the ticker lane: select, decide, settle ----
+    let summaries = [
+        // Inside `[E−τ−selection, E−τ]`: the member picks the strike.
+        vrp_summary(
+            500 + SELECT_OFF,
+            VRP_OPT,
+            700_000_000,
+            500_000_000,
+            79_000_000_000_000,
+        ),
+        // At E−τ: 500 % quoted IV against a ~20 % forecast ⇒ SELL vol.
+        vrp_summary(
+            500 + ENTRY_OFF,
+            VRP_OPT,
+            5_000_000_000,
+            500_000_000,
+            79_000_000_000_000,
+        ),
+        // Closing in: the index ends $1,500 above the 79,000 strike.
+        // These have to land BEFORE the expiry instant — the member
+        // settles on the first record at or after E, which is a perp
+        // tick, and it settles at the last index it was told about.
+        vrp_summary(
+            500 + 122_400_000_000_000 - 10_000_000_000,
+            VRP_OPT,
+            5_000_000_000,
+            500_000_000,
+            80_500_000_000_000,
+        ),
+        vrp_summary(
+            500 + 122_400_000_000_000 - 1_000_000_000,
+            VRP_OPT,
+            5_000_000_000,
+            500_000_000,
+            80_500_000_000_000,
+        ),
+        vrp_summary(
+            500 + 122_400_000_000_000,
+            VRP_OPT,
+            5_000_000_000,
+            500_000_000,
+            80_500_000_000_000,
+        ),
+    ];
+    let mut w = PmlrWriter::open(
+        run.join("deribit-opt-summary.pmlr"),
+        SlotKind::OptSummary,
+        VRP_EPOCH_NS,
+    )
+    .expect("open opt");
+    for o in &summaries {
+        w.append(o).expect("append summary");
+    }
+    w.flush().expect("flush opt");
+
+    // ---- the artifacts ----
+    let toml = root.join("vrp.toml");
+    std::fs::write(&toml, VRP_TOML).expect("write vrp.toml");
+    // 60 fitted pairs ON the identity line y = x: the OLS fit is then
+    // a = 0, b = 1, so `ln σ̂` IS `ln har` at any regressor — the band
+    // is the live HAR itself and the fixture cannot drift into an
+    // extrapolation nobody intended.
+    let seed_path = run.join("vrp-seed.tsv");
+    let mut seed = String::from("V\t2\n");
+    let mut i = 0u64;
+    while i < 60 {
+        let x = 14_000_000_000i64 + i as i64 * 100_000_000;
+        seed.push_str(&format!(
+            "P\t{}\t{x}\t{x}\n",
+            1_700_000_000_000u64 + i * 86_400_000
+        ));
+        i += 1;
+    }
+    std::fs::write(&seed_path, seed).expect("write vrp-seed.tsv");
+    (root.to_path_buf(), toml, seed_path)
+}
+
+fn vrp_cfg(replay: &Path, toml: &Path, seed: Option<PathBuf>) -> BacktestConfig {
+    let mut cfg = member_cfg(replay, toml);
+    cfg.fee_bps = vec!["deribit:0:0".to_owned()];
+    cfg.member = Some(MemberSpec {
+        kind: MemberKind::Vrp,
+        params: toml.to_path_buf(),
+        table: None,
+        seed: None,
+        vrp_seed: seed,
+    });
+    cfg
+}
+
+#[test]
+fn member_vrp_drives_a_campaign_on_a_synthetic_root() {
+    let root = unique_root("vrp");
+    let (replay, toml, seed) = build_vrp_capture(&root, true);
+    let cfg = vrp_cfg(&replay, &toml, Some(seed));
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+
+    // The boot line names the chain it resolved and the warm forecast.
+    assert!(out.summary.contains("member: vrp params="), "{}", out.summary);
+    assert!(out.summary.contains("chain_rows=2"), "{}", out.summary);
+    assert!(out.summary.contains("pairs=60"), "{}", out.summary);
+    // `warm=` on the boot line is the SEEDED window: this root carries
+    // no `R` rows, so the member warms from the replay's own closes —
+    // which the counters line reports after the drive.
+    assert!(out.summary.contains("warm=false"), "{}", out.summary);
+    assert!(out.summary.contains("vol_warm=true"), "{}", out.summary);
+    assert!(out.summary.contains("sides=both"), "{}", out.summary);
+    assert!(out.summary.contains("root=run-dirs (Q3)"), "{}", out.summary);
+
+    let c = &out.summary;
+    let field = |name: &str| -> u64 {
+        let key = format!(" {name}=");
+        let i = c.find(&key).unwrap_or_else(|| panic!("{name}: {c}")) + key.len();
+        let j = c[i..]
+            .find(|ch: char| !ch.is_ascii_digit())
+            .map_or(c.len(), |k| k + i);
+        c[i..j].parse().unwrap_or_else(|_| panic!("{name}: {c}"))
+    };
+    assert!(field("select_scans") >= 1, "{c}");
+    assert_eq!(field("decisions"), 1, "one decision at E−τ: {c}");
+    assert_eq!(field("no_bounds"), 0, "the forecast exists: {c}");
+    assert_eq!(field("holds"), 0, "500 % IV is outside any sane band: {c}");
+    assert!(field("entries_submitted") >= 1, "{c}");
+    assert_eq!(field("entries"), 1, "and the campaign opened: {c}");
+    assert_eq!(field("settlements"), 1, "the contract expired held: {c}");
+    // The index closed $1,500 above the 79,000 strike.
+    assert_eq!(field("settled_itm"), 1, "settled in the money: {c}");
+    assert_eq!(field("settled_otm"), 0, "{c}");
+    assert_eq!(field("settled_unpriced"), 0, "{c}");
+    // X1: the hedge goes out FROM the option fill and completes — an
+    // abandoned hedge is a naked perp, which is the F7 defect.
+    assert!(field("hedges") >= 1, "the delta hedge went out: {c}");
+    assert_eq!(field("hedge_abandoned"), 0, "{c}");
+    assert!(field("fills") >= 2, "both legs filled: {c}");
+    assert_eq!(field("fills_ignored"), 0, "{c}");
+    assert!(field("vol_minutes") >= 1_440, "warmed from the replay: {c}");
+    // The report is the VM's own shape.
+    assert!(out.schema1.contains("\"schema_version\":1"), "{}", out.schema1);
+    assert!(out.schema1.contains("\"position_rows\":1"), "{}", out.schema1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn member_vrp_refuses_a_missing_chain() {
+    let root = unique_root("vrp-nochain");
+    let (replay, toml, seed) = build_vrp_capture(&root, false);
+    let cfg = vrp_cfg(&replay, &toml, Some(seed));
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("a root whose manifest carries no option chain must refuse"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("options chain holds no BTC option"), "{msg}");
     let _ = std::fs::remove_dir_all(&root);
 }
