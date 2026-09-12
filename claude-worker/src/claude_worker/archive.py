@@ -395,8 +395,16 @@ class PushResult:
     parts: int
     elapsed_s: float
     skipped: bool = False
+    # Set ONLY when a sweep passed a run over for a reason worth naming:
+    # "empty" = the dir holds no eligible file (a restart that died before the
+    # first capture write). A reason is a TELL, never a stop — see
+    # `push_pending`. Left empty everywhere else, the already-complete skip
+    # included, so the line an operator has read for months does not move.
+    reason: str = ""
 
     def tell(self) -> str:
+        if self.skipped and self.reason == "empty":
+            return f"archive: run={self.run} no files to push — skipped"
         if self.skipped:
             return f"archive: run={self.run} already complete"
         ratio = (self.size_bytes / self.stored_bytes) if self.stored_bytes else 0.0
@@ -594,13 +602,30 @@ class Archiver:
         ``on_result`` is called as each run lands rather than at the end. A
         backfill is hours of work; without it the operator watches a silent log
         and cannot tell progress from a hang.
+
+        An empty run dir is reported and passed over, never refused.
         """
         runs = claude_worker.features.run_dirs(root)
         out: list[PushResult] = []
         for run_dir in runs[:-1]:  # never the newest (S-LAW 4)
             if budget is not None and budget.spent():
                 raise ArchiveError("budget spent between runs", EXIT_BUDGET)
-            result = self.push_run(run_dir, budget=budget, dry_run=dry_run)
+            # An EMPTY run dir is SKIPPED here, never refused. `push_run`
+            # raises EXIT_REFUSED on one because an operator who names an empty
+            # dir wants to hear about it — but a sweep that stops on one is a
+            # poison pill: the 0-file dir a dying restart left behind
+            # (run-1789056366351990000, 2026-09-10 16:06Z) aborted EVERY daily
+            # cycle for two days with exit 2 and stranded the 26 runs / 21 GiB
+            # queued behind it, while retention — which deletes only what
+            # `verify` confirms — could free nothing. A real upload failure
+            # still stops the sweep (S-LAW 5, resume tomorrow); having nothing
+            # to upload is not a failure.
+            if not eligible_files(run_dir, self.cfg.skip_globs):
+                result = PushResult(
+                    run_dir.name, 0, 0, 0, 0, 0.0, skipped=True, reason="empty"
+                )
+            else:
+                result = self.push_run(run_dir, budget=budget, dry_run=dry_run)
             out.append(result)
             if on_result is not None:
                 on_result(result)

@@ -360,6 +360,60 @@ def test_push_pending_never_includes_the_newest_run(tmp_path: pathlib.Path) -> N
     assert cfg.index_key(f"run-{EPOCH_NS + 2 * 10**12}") not in fake.objects
 
 
+def test_push_pending_skips_an_empty_run_and_keeps_going(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The poison pill. A restart that dies before its first capture write
+    leaves a 0-file `run-<epoch_ns>` dir. `push_run` refuses one (the operator
+    lane), so for two days in 2026-09 the daily sweep hit that dir, exited 2,
+    and never reached the 26 runs queued behind it — while retention, gated on
+    `verify`, could free nothing. The sweep must report it and walk on."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    make_run(logs, f"run-{EPOCH_NS}")
+    empty = logs / f"run-{EPOCH_NS + 10**12}"
+    empty.mkdir(parents=True)
+    behind = f"run-{EPOCH_NS + 2 * 10**12}"
+    make_run(logs, behind)
+    make_run(logs, f"run-{EPOCH_NS + 3 * 10**12}")  # newest, never swept
+
+    results = archiver.push_pending(logs)
+
+    assert [r.run for r in results] == [
+        f"run-{EPOCH_NS}",
+        empty.name,
+        behind,
+    ]
+    hole = results[1]
+    assert hole.skipped and hole.reason == "empty" and hole.files == 0
+    assert hole.tell() == f"archive: run={empty.name} no files to push — skipped"
+    # The whole point: the run BEHIND the empty dir is complete in the bucket.
+    assert cfg.index_key(behind) in fake.objects
+    assert cfg.index_key(f"run-{EPOCH_NS}") in fake.objects
+    # And the empty dir itself put nothing anywhere.
+    assert cfg.index_key(empty.name) not in fake.objects
+    assert cfg.manifest_key(empty.name) not in fake.objects
+
+
+def test_push_run_still_refuses_an_empty_run(tmp_path: pathlib.Path) -> None:
+    """The operator lane keeps its error: `push-run <empty dir>` is a typo or a
+    wrecked run, and exit 2 is the honest answer. Only the SWEEP skips."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    empty = logs / f"run-{EPOCH_NS}"
+    empty.mkdir(parents=True)
+    make_run(logs, f"run-{EPOCH_NS + 10**12}")  # so `empty` is not the newest
+    with pytest.raises(claude_worker.archive.ArchiveError) as caught:
+        archiver.push_run(empty, with_catalog=False)
+    assert caught.value.code == claude_worker.archive.EXIT_REFUSED
+    assert "no files to push" in str(caught.value)
+    assert fake.count("PUT") == 0
+
+
 def test_free_space_floor_refuses_and_touches_nothing(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

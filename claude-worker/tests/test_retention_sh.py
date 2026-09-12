@@ -167,6 +167,92 @@ def test_missing_archiver_falls_back_to_compress_and_never_deletes_unverified(
 
 
 # --------------------------------------------------------------------------
+# the empty-run-dir pill
+# --------------------------------------------------------------------------
+
+
+def seed_pattern(
+    tmp_path: pathlib.Path, has_files: tuple[bool, ...]
+) -> tuple[pathlib.Path, list[str]]:
+    """Run dirs oldest-first, each either seeded with a capture file or left
+    empty. The LAST one is the live capture the sweep never considers."""
+    root = tmp_path / "logs"
+    root.mkdir(parents=True)
+    names: list[str] = []
+    for i, seeded in enumerate(has_files):
+        run = root / f"run-{1_690_000_000_000_000_000 + i * 10**12}"
+        run.mkdir()
+        if seeded:
+            (run / "pm-ticks.pmlr").write_bytes(b"PMLR" + b"\x00" * 60)
+        names.append(run.name)
+    return root, names
+
+
+def s3_conf(tmp_path: pathlib.Path) -> pathlib.Path:
+    return write_conf(
+        tmp_path / "retention.conf",
+        MIN_FREE_GIB=999999,  # force the pressure branch
+        TARGET_FREE_GIB=999999,  # never satisfied -> walk every candidate
+        PROTECT_DAYS=0,
+        ARCHIVE_MODE="s3",
+    )
+
+
+def test_an_empty_run_dir_is_removed_and_never_offered_to_verify(
+    tmp_path: pathlib.Path,
+) -> None:
+    root, names = seed_pattern(tmp_path, (True, False, True, True))
+    home = fake_home(tmp_path, exit_code=0)
+    stub_log = tmp_path / "stub.log"
+    done = run_script(SCRIPT, root, s3_conf(tmp_path), home, stub_log)
+    assert done.returncode == 0
+    # Everything swept; only the live newest survives.
+    assert sorted(p.name for p in root.iterdir()) == [names[3]]
+    assert f"{names[1]} is empty (a boot that died) — removed" in done.stderr
+    log = stub_log.read_text(encoding="utf-8")
+    assert log.count("verify") == 2, "the empty dir must never reach the bucket"
+    assert names[1] not in log
+
+
+@pytest.mark.parametrize("code", [1, 3])
+def test_an_empty_run_dir_does_not_park_the_sweep(
+    code: int, tmp_path: pathlib.Path
+) -> None:
+    """The 2026-09-10 pill, stage B. An empty run dir can never verify — stage A
+    refuses a run with no files, so no index object can exist — so before this
+    it took the `NOT verified — stopping` branch every night, oldest-first, and
+    nothing behind it was ever freed. It must be passed over, and the sweep must
+    still stop at the first run that genuinely is not in the bucket."""
+    root, names = seed_pattern(tmp_path, (False, True, True))
+    home = fake_home(tmp_path, exit_code=code)
+    stub_log = tmp_path / "stub.log"
+    done = run_script(SCRIPT, root, s3_conf(tmp_path), home, stub_log)
+    assert done.returncode == 0
+    assert not (root / names[0]).exists(), "the empty dir is gone"
+    assert (root / names[1] / "pm-ticks.pmlr").is_file(), "no capture data lost"
+    assert "NOT verified" in done.stderr
+    log = stub_log.read_text(encoding="utf-8")
+    assert log.count("verify") == 1
+    assert names[1] in log, "the sweep advanced past the hole before stopping"
+
+
+def test_a_dir_rmdir_refuses_is_skipped_not_forced(tmp_path: pathlib.Path) -> None:
+    """`rmdir` is the losslessness proof: it refuses a non-empty directory. What
+    it refuses is left exactly as it was, and the sweep still walks on."""
+    root, names = seed_pattern(tmp_path, (False, True, True))
+    (root / names[0] / "leftovers").mkdir()  # no capture file, but not empty
+    home = fake_home(tmp_path, exit_code=1)
+    stub_log = tmp_path / "stub.log"
+    done = run_script(SCRIPT, root, s3_conf(tmp_path), home, stub_log)
+    assert done.returncode == 0
+    assert (root / names[0] / "leftovers").is_dir(), "nothing forced"
+    assert f"{names[0]} holds no capture file — skipping" in done.stderr
+    log = stub_log.read_text(encoding="utf-8")
+    assert log.count("verify") == 1
+    assert names[1] in log
+
+
+# --------------------------------------------------------------------------
 # the S-LAW 2 proof: compress mode is unchanged
 # --------------------------------------------------------------------------
 

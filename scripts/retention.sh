@@ -88,6 +88,33 @@ for d in ${(f)candidates}; do
     echo "retention: $name is ${age_days}d old (<= protect ${PROTECT_DAYS}d) — stopping" >&2
     break # older→newer order: everything after is younger
   fi
+  # An EMPTY run dir holds nothing to archive, and it must never stop the
+  # sweep. The engine creates `run-<epoch_ns>` eagerly at boot, BEFORE the
+  # venue discovery and every artifact law, so a boot that dies after that
+  # point leaves a 0-file dir behind — and launchd's KeepAlive leaves one per
+  # attempt (nine on 2026-09-11, an OKX discovery BadRow). In s3 mode such a
+  # dir can NEVER verify: stage A refuses a run with no files, so no index
+  # object exists to find, and the `break` below would park the sweep on it
+  # every night and free nothing. Stage A had the same pill and was fixed the
+  # same way.
+  #
+  # `rmdir`, never `rm`: it REFUSES a non-empty directory, so the command is
+  # itself the proof that no capture data was lost. If it refuses (a dotfile,
+  # a subdirectory, a permission), we skip and walk on rather than force it.
+  # This does not weaken S-LAW 3 — there is no copy to lose. The check sits
+  # AFTER the protect-days break on purpose: a dir the live engine created
+  # seconds ago is empty for the moment between `create_dir_all` and its
+  # first `PmlrCapture::open`, and PROTECT_DAYS plus the newest-dir exclusion
+  # are what keep that window out of reach.
+  contents=("$d"/*(-.DN))
+  if (( ${#contents} == 0 )); then
+    if rmdir "$d" 2>/dev/null; then
+      echo "retention: $name is empty (a boot that died) — removed" >&2
+    else
+      echo "retention: $name holds no capture file — skipping" >&2
+    fi
+    continue
+  fi
   if [ "$ARCHIVE_MODE" = "s3" ]; then
     # S-LAW 3: delete only what the bucket verifiably holds. `break`, not
     # `continue` — this loop runs oldest-first, so an unverified oldest means
