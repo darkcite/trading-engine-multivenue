@@ -1040,9 +1040,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     if reached > 0 {
         report(&format!(
             "audit-pnl: opt settlement table: {settleable} of {reached} contract(s) reaching \
-             expiry inside the window — European cash at the LAST index at/before each \
-             expiry; {} refused (no index at/before expiry in this root), {} expire after \
-             the window and are never settled",
+             expiry inside the window — European cash at the venue's 30-minute delivery \
+             TWAP of the expiry's FORWARD (`settle=twap30`), or at the LAST index \
+             at/before the expiry when the window carries under 10 min of samples \
+             (`settle=last`); {} refused (no index at/before expiry in this root), {} \
+             expire after the window and are never settled",
             reached - settleable,
             opt_out.settle_ref.len() - reached
         ));
@@ -1052,15 +1054,18 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         {
             let lag_s = r.expiry_ns.saturating_sub(r.index_wall_ns) / 1_000_000_000;
             report(&format!(
-                "audit-pnl:   sym={sym:#010x} {} K={} S={} value={} (index {} s before expiry)",
+                "audit-pnl:   sym={sym:#010x} {} K={} S={} value={} settle={} \
+                 (covered {} s of 1800; last index {} s before expiry)",
                 if r.right == opt_registry::RIGHT_CALL {
                     "call"
                 } else {
                     "put"
                 },
                 fmt_usd_1e6(r.strike_1e6),
-                fmt_usd_1e6(r.index_1e6),
+                fmt_usd_1e6(r.settle_index_1e6()),
                 fmt_usd_1e6(r.value_1e6()),
+                r.settle_law(),
+                r.twap_sum_dt / 1_000_000_000,
                 lag_s,
             ));
         }

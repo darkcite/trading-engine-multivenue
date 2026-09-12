@@ -5034,3 +5034,203 @@ fn xsd_member_tick_roll_and_regime_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "strategy-xsd hot bytes should be zero: saw {bytes}");
 }
+
+/// Gate 49 (VRP P4): the member's DECISION paths at full width — the
+/// regime view pushed on a minute cadence (R3), the selection window's
+/// implied-vol ring and its insertion-sorted median (R6), the venue's
+/// 30-minute delivery TWAP (R5) and the cost term (R7) — over a whole
+/// campaign, selection through settlement. The warm-up and the boot box
+/// are not measured.
+///
+/// The median is the one that had to be gated: it copies 64 `i64`s to
+/// the stack and sorts them in place, once per campaign, and an
+/// implementation that reached for a `Vec` would read identically at
+/// the call site.
+#[test]
+fn vrp_member_p4_decision_paths_are_zero_alloc() {
+    use core_types::{make_symbol_id, OptSummary, Price, Qty, Tick, OPT_SUMMARY_FLAG_MARK_PX};
+    use opt_registry::{OptInstrument, RIGHT_CALL, RIGHT_PUT};
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    const MONO0: u64 = 3_191_000_000_000_000;
+    const EXPIRY: u64 = 1_789_027_200_000_000_000;
+    const WALL0: u64 = EXPIRY - 172_800_000_000_000;
+    const MINUTE_NS: u64 = 60_000_000_000;
+
+    struct SinkCtx {
+        n: u64,
+        now: u64,
+        last: Option<core_types::Order>,
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            self.last = Some(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let perp = make_symbol_id(VenueId::Deribit, 1);
+    let opt = make_symbol_id(VenueId::Deribit, 513 + 8);
+    let mut reg = opt_registry::OptRegistry::new();
+    let mut k = 0u32;
+    while k < 16 {
+        reg.insert(OptInstrument::new(
+            make_symbol_id(VenueId::Deribit, 513 + k),
+            perp,
+            VenueId::Deribit as u8,
+            EXPIRY,
+            (77_000 + 250 * k as i64) * 1_000_000,
+            if k % 2 == 0 { RIGHT_CALL } else { RIGHT_PUT },
+            1_000_000_000,
+        ))
+        .expect("boot insert");
+        k += 1;
+    }
+
+    // R3: the §3.3 train-only fast-profile intercepts, so the offset in
+    // force at the decision is non-zero and the arm is scored on it.
+    let mut regime_off = [[0i64; 3]; 2];
+    regime_off[0][core_types::regime::VOL_LOW as usize] = 20_000_000;
+    regime_off[0][core_types::regime::VOL_HIGH as usize] = -99_000_000;
+    regime_off[1][core_types::regime::VOL_LOW as usize] = 77_000_000;
+    regime_off[1][core_types::regime::VOL_HIGH as usize] = -165_000_000;
+
+    let mut m = Box::new(strategy_vrp::VrpStrategy::new());
+    m.configure(
+        strategy_vrp::VrpParams {
+            regime_off_1e9: regime_off,
+            ..strategy_vrp::VrpParams::default()
+        },
+        reg,
+        perp,
+        perp,
+        core_time::WallAnchor::new(MONO0, WALL0),
+        [0u8; 32],
+    )
+    .expect("configure");
+
+    // The view the set pushes on every minute roll: `vol:high` fast,
+    // `vol:low` slow — both profiles speaking, so both table rows are
+    // read and the offsets ADD.
+    let mut view = core_regime::RegimeView::UNKNOWN;
+    view.configured = 1;
+    view.effective[0] =
+        core_types::RegimeWord::EMPTY.with_dim(core_types::regime::DIM_VOL, core_types::regime::VOL_HIGH);
+    view.effective[1] =
+        core_types::RegimeWord::EMPTY.with_dim(core_types::regime::DIM_VOL, core_types::regime::VOL_LOW);
+
+    let mono_of = |wall: u64| MONO0.wrapping_add(wall.wrapping_sub(WALL0));
+    let mk_tick = |wall: u64, px: i64| {
+        Tick::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            perp,
+            0,
+            Price::from_raw(px - 500_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(px + 500_000),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let mk_opt = |wall: u64, iv: i64, under: i64| {
+        OptSummary::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            opt,
+            OPT_SUMMARY_FLAG_MARK_PX,
+            3_800_000,
+            iv,
+            under,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+
+    let mut ctx = SinkCtx { n: 0, now: MONO0, last: None };
+    let mut wall = WALL0;
+    let mut px = 79_000_000_000i64;
+    let mut s = 20_260_914i64;
+    let mut i = 0usize;
+    while i < 1_442 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+        m.on_tick(&mk_tick(wall, px), &mut ctx);
+        wall += MINUTE_NS;
+        i += 1;
+    }
+    let mut j = 0i64;
+    while j < 60 {
+        m.seed_pair(24_000_000_000 + j * 11_000_000, 24_100_000_000 + j * 9_000_000);
+        j += 1;
+    }
+
+    let g = AllocGuard::new();
+    // Selection window open through settlement: 8 h 10 m at 15 s a step.
+    let start = EXPIRY - 28_800_000_000_000 - 600_000_000_000;
+    let mut w = start;
+    let mut n = 0usize;
+    while n < 2_100 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+        ctx.now = mono_of(w);
+        // R3: the set pushes the view on the minute roll, never per
+        // tick — four steps apart at 15 s is exactly that cadence.
+        if n % 4 == 0 {
+            m.set_regime_view(&view);
+        }
+        // R5/R6: the summary feeds the implied-vol ring and, in the
+        // last half hour, the delivery TWAP.
+        m.on_opt_summary(&mk_opt(w, 5_000_000_000, px * 1_000), &mut ctx);
+        m.on_tick(&mk_tick(w, px), &mut ctx);
+        if n % 2 == 0 {
+            if let Some(o) = ctx.last.take() {
+                let f = core_types::Fill::new(
+                    mono_of(w),
+                    o.sym,
+                    o.side,
+                    o.px,
+                    o.qty,
+                    o.client_oid,
+                )
+                .with_attribution(1, core_types::FILL_ORIGIN_PAPER);
+                m.on_fill(&f, &mut ctx);
+            }
+        } else {
+            ctx.last = None;
+        }
+        w += 15_000_000_000;
+        n += 1;
+    }
+    let counters = m.vrp_counters();
+    let off = m.last_regime_offset_1e9();
+    std::hint::black_box((ctx.n, counters, off));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(counters.decisions > 0, "a real decision: {counters:?}");
+    assert_eq!(
+        counters.iv_median_fallback, 0,
+        "R6: the median must have SORTED, not fallen back: {counters:?}"
+    );
+    assert_eq!(
+        off,
+        -99_000_000 + 77_000_000,
+        "R3: both profiles' intercepts were in force at the decision"
+    );
+    assert!(ctx.n > 0, "real submits");
+    assert_eq!(
+        allocs, 0,
+        "strategy-vrp P4 decision paths allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "P4 decision-path hot bytes should be zero: saw {bytes}");
+}

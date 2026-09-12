@@ -529,8 +529,30 @@ impl VolEngine {
     /// fitted pairs.
     #[must_use]
     pub fn bounds(&self, tau_ns: u64, theta_1e9: i64) -> Option<(i64, i64)> {
+        self.bounds_with_offset(tau_ns, theta_1e9, 0)
+    }
+
+    /// R3: [`Self::bounds`] with an additive offset on `ln σ̂`.
+    ///
+    /// The regime-edge §3.3 fit measures what the CURRENT volatility
+    /// word says about the next window's realised vol, over and above
+    /// what the HAR already knows — so the correction belongs on the
+    /// forecast, in the same log-vol domain, and nowhere else. The
+    /// target of that fit is log realised VOL, not log variance
+    /// (`rg_lib.fwd_rv` returns `sqrt(Σ r²)` and `rg_har.build` takes
+    /// its `log`), so its coefficients enter here unhalved.
+    ///
+    /// `off_1e9 == 0` is [`Self::bounds`] bit for bit, which is what
+    /// makes an absent `regime_*` key inert.
+    #[must_use]
+    pub fn bounds_with_offset(
+        &self,
+        tau_ns: u64,
+        theta_1e9: i64,
+        off_1e9: i64,
+    ) -> Option<(i64, i64)> {
         let t = tenor_of(tau_ns)?;
-        let ln_sigma = self.ln_sigma_hat_1e9(tau_ns)?;
+        let ln_sigma = self.ln_sigma_hat_1e9(tau_ns)?.saturating_add(off_1e9);
         let lo = Self::annualised_1e9(ln_sigma - theta_1e9, t.annualise_1e9)?;
         let hi = Self::annualised_1e9(ln_sigma + theta_1e9, t.annualise_1e9)?;
         Some((lo, hi))
@@ -567,6 +589,23 @@ impl VolEngine {
         tau_ns: u64,
         mark_iv_1e9: i64,
     ) -> Option<i64> {
+        self.arm_hold_at_with_offset(expiry_ts_ms, tau_ns, mark_iv_1e9, 0)
+    }
+
+    /// R3: [`Self::arm_hold_at`], scoring the OFFSET forecast.
+    ///
+    /// The QLIKE comparison exists to judge the forecast the member
+    /// actually decided on (kill criterion 3). Arming with the
+    /// uncorrected `ln σ̂` while deciding on the corrected one would
+    /// score a forecaster nobody is running — and would do it silently,
+    /// because both numbers are plausible.
+    pub fn arm_hold_at_with_offset(
+        &mut self,
+        expiry_ts_ms: u64,
+        tau_ns: u64,
+        mark_iv_1e9: i64,
+        off_1e9: i64,
+    ) -> Option<i64> {
         let x = self.x_1e9(tau_ns)?;
         let t = tenor_of(tau_ns)?;
         // F1: the realised window opens at the NEXT minute to close.
@@ -580,7 +619,7 @@ impl VolEngine {
         // The fit may not exist yet; the pair is still worth forming,
         // it just scores no QLIKE this expiry.
         self.pend_ln_sigma_1e9 = match self.ln_sigma_hat_1e9(tau_ns) {
-            Some(v) => v,
+            Some(v) => v.saturating_add(off_1e9),
             None => i64::MIN,
         };
         // Implied vol back into the realised-vol domain: the exact

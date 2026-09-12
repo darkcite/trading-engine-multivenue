@@ -1938,6 +1938,31 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &opt_out.terms,
         window_end_wall_ns,
     );
+    // R5: the per-contract settlement table. Built here, where the
+    // refs are, because `OptModelRegistration` exists precisely so each
+    // report surface can print the numbers the engine was configured
+    // with rather than a second opinion of them.
+    let mut opt_settle_lines: Vec<String> = Vec::new();
+    for (sym, r) in &opt_model.settle_refs {
+        if !r.settleable(window_end_wall_ns) {
+            continue;
+        }
+        opt_settle_lines.push(format!(
+            "   settle sym={sym:#010x} {} K={} S={} value={} settle={} \
+             (covered {} s of {})",
+            if r.right == opt_registry::RIGHT_CALL {
+                "call"
+            } else {
+                "put"
+            },
+            fmt_usd_1e6(r.strike_1e6),
+            fmt_usd_1e6(r.settle_index_1e6()),
+            fmt_usd_1e6(r.value_1e6()),
+            r.settle_law(),
+            r.twap_sum_dt / 1_000_000_000,
+            opt::SETTLE_TWAP_WINDOW_NS / 1_000_000_000,
+        ));
+    }
     // XSD-F: the per-sym fee class (descriptor law over the manifests).
     for (sym, class) in &sym_class {
         engine.set_sym_class(*sym, *class);
@@ -2273,8 +2298,11 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &model,
         &run_summaries,
         &stats,
-        &hash_hex,
-        &regime_report,
+        &SummaryExtras {
+            hash_hex: &hash_hex,
+            regime: &regime_report,
+            opt_settle_lines: &opt_settle_lines,
+        },
     );
     Ok(BacktestOutput {
         schema1,
@@ -2472,6 +2500,22 @@ fn render_stale_runs_json(runs: &[RunSummary]) -> String {
     s
 }
 
+/// The non-`Copy` half of what the stderr summary renders — bundled
+/// because [`HarnessStats`] is `Copy` by design and these are not, and
+/// because six arguments is the limit the lint sets.
+struct SummaryExtras<'a> {
+    /// Hex SHA-256 of the ruleset.
+    hash_hex: &'a str,
+    /// RG3: the regime replay's own report.
+    regime: &'a RegimeReport,
+    /// R5: one line per contract the replay SETTLED — terms, the index
+    /// it settled at, and WHICH law priced it (`settle=twap30` when the
+    /// venue's 30-minute delivery window carried at least 10 min of
+    /// samples, `settle=last` otherwise). Empty on an option-free root,
+    /// which is what keeps that root's report byte-identical.
+    opt_settle_lines: &'a [String],
+}
+
 /// Deterministic human summary (stderr; §10 harness observability).
 fn render_summary(
     cfg: &BacktestConfig,
@@ -2479,9 +2523,13 @@ fn render_summary(
     model: &ModelParams,
     runs: &[RunSummary],
     stats: &HarnessStats,
-    hash_hex: &str,
-    regime: &RegimeReport,
+    extras: &SummaryExtras<'_>,
 ) -> String {
+    let SummaryExtras {
+        hash_hex,
+        regime,
+        opt_settle_lines,
+    } = *extras;
     let mut s = String::with_capacity(2048);
     s.push_str(&format!(
         "backtest H2 (strict-cross maker model): ruleset sha256 {hash_hex}\n"
@@ -2547,6 +2595,10 @@ fn render_summary(
             stats.opt_quote_lane_syms,
             stats.opt_settled
         ));
+        for line in opt_settle_lines {
+            s.push_str(line);
+            s.push('\n');
+        }
     }
     for (i, r) in runs.iter().enumerate() {
         s.push_str(&format!("  run[{i}] epoch_ns={}", r.epoch_ns));

@@ -347,6 +347,13 @@ pub struct VrpParams {
     pub opt_fee_index_bps: u32,
     /// See [`Self::opt_fee_index_bps`].
     pub opt_fee_prem_bps: u32,
+    /// R3: additive offsets on `ln σ̂`, ×1e9 log-vol, indexed
+    /// `[profile][VOL value]` — profile 0 = fast, 1 = slow; VOL
+    /// [`core_types::regime::VOL_LOW`] / `VOL_NORMAL` / `VOL_HIGH`.
+    /// `normal` is 0 by construction (the §3.3 fit's base) and so is
+    /// UNKNOWN, so an all-zero table is bit-identical to no regime
+    /// correction at all.
+    pub regime_off_1e9: [[i64; 3]; 2],
 }
 
 impl Default for VrpParams {
@@ -378,8 +385,67 @@ impl Default for VrpParams {
             hedge_patience_ns: 30_000_000_000,
             opt_fee_index_bps: 3,
             opt_fee_prem_bps: 1_250,
+            regime_off_1e9: [[0; 3]; 2],
         }
     }
+}
+
+/// R3: the VOL value byte a member stores when the detector has not
+/// spoken. Not a value in [`core_types::regime`]'s VOL space — it is
+/// the ABSENCE of one, and it maps to a zero offset.
+pub const VOL_UNKNOWN_BYTE: u8 = 0xFF;
+
+/// R6: how many of the selected contract's implied-vol prints the
+/// decision keeps. One campaign's selection window is minutes long and
+/// Deribit prints a summary every few seconds, so the ring wraps and
+/// the newest 64 are what the median sees.
+pub const IV_RING: usize = 64;
+/// R6: the fewest samples that make a median worth taking. Below this
+/// the decision uses the last quoted implied vol and says so.
+pub const IV_MEDIAN_MIN_SAMPLES: usize = 8;
+
+/// R5: the venue's delivery window — Deribit settles a daily expiry on
+/// the average of its own index over the **30 minutes** before expiry,
+/// not on the last print. 30 min in ns.
+pub const SETTLE_TWAP_WINDOW_NS: u64 = 1_800_000_000_000;
+/// R5: the least covered time that makes the average worth trusting. A
+/// window with fewer than 10 minutes of samples behind it is a handful
+/// of prints, not a TWAP, and the member falls back to the P0 law.
+pub const SETTLE_TWAP_MIN_NS: u64 = 600_000_000_000;
+/// R5: the most weight ONE sample may carry. The option lane goes quiet
+/// for minutes at a time; without a cap a single stale print before a
+/// gap would carry the whole average.
+pub const SETTLE_TWAP_DT_CAP_NS: u64 = 60_000_000_000;
+
+/// R5: the running delivery average of the selected contract's own
+/// forward (`OptSummary::underlying_px_1e9`) over the venue's 30-minute
+/// settlement window.
+///
+/// Each sample carries the wall gap BEHIND it — the interval it is the
+/// newest evidence for — capped at [`SETTLE_TWAP_DT_CAP_NS`]. The first
+/// sample in the window has no interval behind it and weighs nothing;
+/// it only anchors the next one.
+///
+/// V0 (a): the member averages the option record's `underlying_px_1e9`,
+/// which is the FORWARD, not the index Deribit actually delivers
+/// against. The engine does not capture the index; measured basis is
+/// −2.2 bps. Both the member and the harness use the same proxy, so
+/// they agree with each other, and both are biased the same way against
+/// the venue.
+///
+/// Campaign state: [`VrpStrategy::end_campaign`] resets it, and a
+/// restart INSIDE the window loses it — which shows up as
+/// `settle_index_fallback`, not as a silent change of law.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct SettleTwap {
+    /// Σ `underlying_px_1e9 × dt_ns`. `i128` because 1e14 × 6e10 is
+    /// past `i64` inside one window.
+    sum_px_dt: i128,
+    /// Σ `dt_ns` — the covered time, not the elapsed time.
+    sum_dt: u64,
+    /// Wall instant of the newest in-window sample; 0 = none yet.
+    last_wall_ns: u64,
 }
 
 /// X1: one leg the member has ASKED for and not yet been given.
@@ -477,6 +543,22 @@ pub struct VrpStrategy {
     /// Wall instant of that option touch, so a stale one can be told
     /// from a fresh one by the same 30 s law the mark uses.
     last_opt_touch_wall_ns: u64,
+    /// R3: the detector's effective VOL value per profile, as of the
+    /// R5: the delivery TWAP of the selected contract's forward.
+    settle_twap: SettleTwap,
+    /// R6: the selected contract's implied-vol prints since selection,
+    /// newest-wrapping. Only the first `iv_ring_len` entries are live.
+    iv_ring: [i64; IV_RING],
+    /// R6: write pointer into [`Self::iv_ring`] (wraps at [`IV_RING`]).
+    iv_ring_w: usize,
+    /// R6: live entries in [`Self::iv_ring`], capped at [`IV_RING`].
+    iv_ring_len: usize,
+    /// last view push. [`VOL_UNKNOWN_BYTE`] until the detector speaks,
+    /// which is a ZERO offset — never a guess at `normal`.
+    vol_word: [u8; 2],
+    /// R3: the offset in force at the last decision, ×1e9. Reported,
+    /// not read — the decision recomputes it.
+    last_regime_off_1e9: i64,
     /// R2: the hedge in flight is a RESTING order. Its expiry is not a
     /// failure — it is the handover to the unconditional cross, and the
     /// two together are ONE attempt against the retry budget.
@@ -603,6 +685,12 @@ impl VrpStrategy {
             last_opt_bid_1e6: 0,
             last_opt_ask_1e6: 0,
             last_opt_touch_wall_ns: 0,
+            settle_twap: SettleTwap::default(),
+            iv_ring: [0; IV_RING],
+            iv_ring_w: 0,
+            iv_ring_len: 0,
+            vol_word: [VOL_UNKNOWN_BYTE; 2],
+            last_regime_off_1e9: 0,
             hedge_maker_pending: false,
             entry_maker_deadline_wall_ns: 0,
             last_underlying_wall_ns: 0,
@@ -1281,6 +1369,50 @@ impl VrpStrategy {
         }
     }
 
+    /// R3: take the detector's view. Called by the set on every minute
+    /// roll, effective change and declaration — never per tick.
+    ///
+    /// Only the VOL dimension is read. The regime-edge §3.3 fit is the
+    /// only one that measured a vol-word intercept on realised vol; the
+    /// other dimensions have no coefficient in this member and storing
+    /// them would invite one to be invented.
+    pub fn set_regime_view(&mut self, view: &core_regime::RegimeView) {
+        let mut p = 0usize;
+        while p < self.vol_word.len() {
+            self.vol_word[p] = view.effective[p]
+                .value_of(core_types::regime::DIM_VOL)
+                .unwrap_or(VOL_UNKNOWN_BYTE);
+            p += 1;
+        }
+    }
+
+    /// R3: the additive `ln σ̂` offset the current words imply.
+    ///
+    /// Profiles ADD: the fast and slow judgements are independent
+    /// measurements of the same quantity in the §3.3 fit, which
+    /// estimated them jointly. UNKNOWN and `normal` contribute zero,
+    /// which is what makes a member with no detector, or an all-zero
+    /// table, bit-identical to the uncorrected law.
+    #[inline]
+    fn regime_offset_1e9(&self) -> i64 {
+        let mut off = 0i64;
+        let mut p = 0usize;
+        while p < self.vol_word.len() {
+            let v = self.vol_word[p];
+            if (v as usize) < self.params.regime_off_1e9[p].len() {
+                off = off.saturating_add(self.params.regime_off_1e9[p][v as usize]);
+            }
+            p += 1;
+        }
+        off
+    }
+
+    /// R3: the offset in force at the last decision, ×1e9.
+    #[must_use]
+    pub const fn last_regime_offset_1e9(&self) -> i64 {
+        self.last_regime_off_1e9
+    }
+
     /// R1: how long a maker entry may rest.
     ///
     /// `entry_patience_ns == 0` means "the whole remaining decision
@@ -1523,6 +1655,14 @@ impl VrpStrategy {
         self.entry_done = false;
         self.hedge_frozen = false;
         self.last_mark = OptMarkCache::default();
+        // R5: the delivery window belonged to the expiry that just
+        // ended. Nothing of it may price the next one.
+        self.settle_twap = SettleTwap::default();
+        // R6: and neither may its implied-vol prints. Only the length
+        // is reset — the ring's stale contents are unreachable behind
+        // it, and zeroing 64 i64s per campaign buys nothing.
+        self.iv_ring_w = 0;
+        self.iv_ring_len = 0;
         // R1: the previous campaign's option touch is not this one's.
         self.last_opt_bid_1e6 = 0;
         self.last_opt_ask_1e6 = 0;
@@ -1649,17 +1789,125 @@ impl VrpStrategy {
     /// have. `None` when there is neither, at which point the member
     /// defers rather than settling against a number it made up.
     #[inline]
-    fn settle_index_1e6(&self) -> Option<i64> {
+    fn settle_index_1e6(&mut self) -> Option<i64> {
+        // R5: the venue delivers on the 30-minute average of its own
+        // index. Settling on the last print instead is a basis bet
+        // nobody took — measured at 3.4 bps of the premium over the
+        // captured window, one-sided, and free to remove.
+        if self.settle_twap.sum_dt >= SETTLE_TWAP_MIN_NS {
+            let avg_1e6 = self.settle_twap.sum_px_dt
+                / (self.settle_twap.sum_dt as i128 * 1_000);
+            if let Ok(v) = i64::try_from(avg_1e6) {
+                if v > 0 {
+                    return Some(v);
+                }
+            }
+        }
+        // The P0 law: whichever source is FRESHER — the last option
+        // record's own `underlying_px_1e9`, or the last fresh mid of the
+        // underlying's tick lane. Freshness, not preference: the option
+        // lane can go quiet for hours while the perp keeps printing, and
+        // settling against an eight-hour-old forward would book a payoff
+        // the option did not have.
         let from_opt = (self.last_mark.underlying_px_1e9 > 0)
             .then_some((self.last_mark.wall_ns, self.last_mark.underlying_px_1e9 / 1_000));
         let from_tick = (self.last_underlying_mid_1e6 > 0)
             .then_some((self.last_underlying_wall_ns, self.last_underlying_mid_1e6));
-        match (from_opt, from_tick) {
+        let fallback = match (from_opt, from_tick) {
             (Some((wo, po)), Some((wt, pt))) => Some(if wt >= wo { pt } else { po }),
             (Some((_, po)), None) => Some(po),
             (None, Some((_, pt))) => Some(pt),
             (None, None) => None,
+        };
+        if fallback.is_some() {
+            // Counted only when the fallback actually SETTLES something:
+            // `maybe_settle` retries on every record until it has an
+            // index, and a deferred settle is `stale_skips`, not this.
+            self.counters.settle_index_fallback =
+                self.counters.settle_index_fallback.wrapping_add(1);
         }
+        fallback
+    }
+
+    /// R6: keep the selected contract's implied-vol print.
+    ///
+    /// Only until the campaign decides: after `entry_done` the ring is
+    /// history, and letting it keep moving would make a restored
+    /// campaign's `/state` disagree with the decision it already took.
+    #[inline]
+    fn push_iv(&mut self, iv_1e9: i64) {
+        if self.entry_done || iv_1e9 <= 0 {
+            return;
+        }
+        self.iv_ring[self.iv_ring_w] = iv_1e9;
+        self.iv_ring_w = (self.iv_ring_w + 1) % IV_RING;
+        if self.iv_ring_len < IV_RING {
+            self.iv_ring_len += 1;
+        }
+    }
+
+    /// R6: the implied vol THE DECISION runs on — the median of the
+    /// selection window's prints.
+    ///
+    /// One decision per campaign rides on one number, and the last
+    /// print before it is whatever the venue happened to publish at
+    /// that second: a single wide quote at E−τ used to be enough to
+    /// open or close a campaign. The median of the window cannot be
+    /// moved by one print at all.
+    ///
+    /// Cold by construction — once per campaign — so an insertion sort
+    /// over a stack copy is the right sort: no allocation, no
+    /// comparator, and monotone data (which this is) costs one pass.
+    fn decide_iv_1e9(&mut self) -> i64 {
+        if self.iv_ring_len < IV_MEDIAN_MIN_SAMPLES {
+            self.counters.iv_median_fallback =
+                self.counters.iv_median_fallback.wrapping_add(1);
+            return self.last_mark.iv_1e9;
+        }
+        let n = self.iv_ring_len;
+        let mut buf = [0i64; IV_RING];
+        let mut i = 0usize;
+        while i < n {
+            buf[i] = self.iv_ring[i];
+            i += 1;
+        }
+        let mut j = 1usize;
+        while j < n {
+            let v = buf[j];
+            let mut k = j;
+            while k > 0 && buf[k - 1] > v {
+                buf[k] = buf[k - 1];
+                k -= 1;
+            }
+            buf[k] = v;
+            j += 1;
+        }
+        // Lower median on an even count: the decision must be one of
+        // the venue's OWN prints, never an average of two of them.
+        buf[(n - 1) / 2]
+    }
+
+    /// R5: fold one option record's forward into the delivery average.
+    /// A no-op outside `[expiry − 30 min, expiry)`, which is every
+    /// record of all but the last half hour of a campaign.
+    #[inline]
+    fn accumulate_settle_twap(&mut self, wall_ns: u64, underlying_px_1e9: i64) {
+        if self.expiry_ns == 0
+            || wall_ns >= self.expiry_ns
+            || wall_ns < self.expiry_ns.saturating_sub(SETTLE_TWAP_WINDOW_NS)
+        {
+            return;
+        }
+        let prev = self.settle_twap.last_wall_ns;
+        self.settle_twap.last_wall_ns = wall_ns;
+        if prev == 0 || wall_ns <= prev {
+            // First sample in the window (no interval behind it), or a
+            // record that did not advance the wall clock. Anchor only.
+            return;
+        }
+        let dt = (wall_ns - prev).min(SETTLE_TWAP_DT_CAP_NS);
+        self.settle_twap.sum_px_dt += underlying_px_1e9 as i128 * dt as i128;
+        self.settle_twap.sum_dt = self.settle_twap.sum_dt.saturating_add(dt);
     }
 
     /// European cash settlement value of one unit at index `s_1e6`:
@@ -2023,20 +2271,47 @@ impl VrpStrategy {
             self.counters.stale_skips = self.counters.stale_skips.wrapping_add(1);
             return;
         }
-        let Some((lo, hi)) = self.vol.bounds(self.params.tau_ns, self.params.theta_1e9) else {
+        // R3: the regime's own correction to the forecast, in the same
+        // log-vol domain the fit measured it in.
+        let regime_off = self.regime_offset_1e9();
+        self.last_regime_off_1e9 = regime_off;
+        let Some((lo, hi)) =
+            self.vol
+                .bounds_with_offset(self.params.tau_ns, self.params.theta_1e9, regime_off)
+        else {
             self.counters.no_bounds = self.counters.no_bounds.wrapping_add(1);
             return;
         };
+        // R7: the band the COMPARISON runs at — θ widened by what the
+        // round trip costs. θ itself is never changed (edge spec §2.2);
+        // `(lo, hi)` above stays the θ-only band so a HOLD can say
+        // whether the cost is what closed it.
+        let theta_eff = self.theta_eff_1e9(self.last_mark.px_usd_1e6, wall_ns);
+        let cost_band =
+            self.vol
+                .bounds_with_offset(self.params.tau_ns, theta_eff, regime_off);
+        // R6: THE decision runs on the MEDIAN of the selection window's
+        // implied-vol prints, not on whatever the venue published at
+        // this second. One wide quote used to be enough to open or
+        // close a campaign.
+        let iv = self.decide_iv_1e9();
         // THE decision: two i64 compares. Everything transcendental
-        // already happened, at the per-expiry boundary.
-        let iv = self.last_mark.iv_1e9;
-        let side = if iv > hi {
-            SIDE_SHORT_VOL
-        } else if iv < lo {
-            SIDE_LONG_VOL
-        } else {
-            self.counters.holds = self.counters.holds.wrapping_add(1);
-            return;
+        // already happened — the forecast at the per-expiry boundary,
+        // the cost term once, just above.
+        let side = match cost_band {
+            Some((_, hi_c)) if iv > hi_c => SIDE_SHORT_VOL,
+            Some((lo_c, _)) if iv < lo_c => SIDE_LONG_VOL,
+            _ => {
+                // R7: a band so wide it overflowed is a cost the trade
+                // could never have paid — the same verdict, reached
+                // sooner. Either way, say whether θ alone would have
+                // traded this: that difference IS the fee load.
+                if iv > hi || iv < lo {
+                    self.counters.holds_cost = self.counters.holds_cost.wrapping_add(1);
+                }
+                self.counters.holds = self.counters.holds.wrapping_add(1);
+                return;
+            }
         };
         // Q4: policy may refuse an arm the band opened. Counted apart
         // from `holds` — "the band said trade and policy said no" is a
@@ -2091,7 +2366,12 @@ impl VrpStrategy {
         // with a hold that never happened.
         if self
             .vol
-            .arm_hold_at(self.expiry_ns / 1_000_000, self.params.tau_ns, iv)
+            .arm_hold_at_with_offset(
+                self.expiry_ns / 1_000_000,
+                self.params.tau_ns,
+                iv,
+                regime_off,
+            )
             .is_none()
         {
             self.counters.no_bounds = self.counters.no_bounds.wrapping_add(1);
@@ -2233,7 +2513,10 @@ impl VrpStrategy {
             return false;
         }
         let theta_eff = self.theta_eff_1e9(px, wall_ns);
-        let Some((lo, hi)) = self.vol.bounds(self.params.tau_ns, theta_eff) else {
+        let Some((lo, hi)) =
+            self.vol
+                .bounds_with_offset(self.params.tau_ns, theta_eff, self.last_regime_off_1e9)
+        else {
             return false;
         };
         let iv = self.last_mark.iv_1e9;
@@ -2304,6 +2587,12 @@ impl StrategyCounters for VrpStrategy {
     #[inline]
     fn vrp_last_settle_value_1e6(&self) -> i64 {
         self.last_settle_value_1e6
+    }
+    #[inline]
+    fn vrp_regime_offset_1e6(&self) -> i64 {
+        // 1e9 → 1e6, floor (never truncate-toward-zero: a negative
+        // intercept must round the same way a positive one does).
+        core_regime::math::floor_div(self.last_regime_off_1e9 as i128, 1_000) as i64
     }
     #[inline]
     fn vrp_state_epoch(&self) -> u64 {
@@ -2475,6 +2764,12 @@ impl Strategy for VrpStrategy {
             delta_1e9: opt.delta_1e9,
             _pad: [0; 4],
         };
+        // R5: before the settle rung, so the last record inside the
+        // window is in the average that prices the expiry.
+        self.accumulate_settle_twap(wall_ns, opt.underlying_px_1e9);
+        // R6: and before the decide rung, so the record that triggers
+        // the decision is one of the prints the median sees.
+        self.push_iv(opt.mark_iv_1e9);
         self.sweep_pendings(ctx, wall_ns, now);
         if self.maybe_settle(ctx, wall_ns, now) {
             return;
@@ -4020,9 +4315,16 @@ mod tests {
         };
         let (mut m, entry) = maker_ready(&mut ctx, params);
         ctx.now = mono_of(entry);
-        // An IV only just outside the band: it clears theta, and the
-        // cost term is what takes it away.
-        let (_lo, hi) = m.vol.bounds(params.tau_ns, params.theta_1e9).expect("bounds");
+        // An IV only just outside the band AT THE DECISION, where the
+        // option touch is not yet fresh and the cost is fees alone
+        // (R7). What the fallback then adds is the spread — which is
+        // the whole point of this test.
+        let theta_dec = m.theta_eff_1e9(m.last_mark.px_usd_1e6, entry);
+        assert!(theta_dec > params.theta_1e9, "fees alone already widen it");
+        let (_lo, hi) = m
+            .vol
+            .bounds_with_offset(params.tau_ns, theta_dec, 0)
+            .expect("bounds");
         let iv = hi + hi / 1_000;
         m.on_opt_summary(&summary(entry, opt_sym(4), iv, 500_000_000), &mut ctx);
         assert_eq!(ctx.orders.len(), 1, "the band opened: {:?}", m.vrp_counters());
@@ -5057,6 +5359,435 @@ mod tests {
         assert_eq!(m.vrp_counters().stale_skips, 0, "not a mark problem");
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
         assert!(ctx.orders.is_empty());
+    }
+
+    /// R3: a view whose fast word says `vol:<fast>` and whose slow word
+    /// says `vol:<slow>`. [`VOL_UNKNOWN_BYTE`] leaves that profile's
+    /// word UNKNOWN — the detector has not spoken about it.
+    fn vol_view(fast: u8, slow: u8) -> core_regime::RegimeView {
+        let mut v = core_regime::RegimeView::UNKNOWN;
+        v.configured = 1;
+        if fast != VOL_UNKNOWN_BYTE {
+            v.effective[0] = RegimeWord::EMPTY.with_dim(core_types::regime::DIM_VOL, fast);
+        }
+        if slow != VOL_UNKNOWN_BYTE {
+            v.effective[1] = RegimeWord::EMPTY.with_dim(core_types::regime::DIM_VOL, slow);
+        }
+        v
+    }
+
+    /// The §3.3 train-only fast-profile `vol:high` coefficient.
+    const OFF_FAST_HIGH_1E9: i64 = -99_000_000;
+
+    // ---------------- R6: the median implied vol ----------------
+
+    #[test]
+    fn a_spike_in_the_last_summary_does_not_flip_a_hold() {
+        // R6: one decision per campaign rides on one number, and the
+        // last print before it is whatever the venue happened to
+        // publish at that second. The median of the window cannot be
+        // moved by one print at all.
+        let mut ctx = RecCtx::new();
+        // R7's cost term is measured by its own tests; zero the fees so
+        // this one moves exactly one thing.
+        let params = VrpParams {
+            opt_fee_index_bps: 0,
+            opt_fee_prem_bps: 0,
+            ..VrpParams::default()
+        };
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let (_lo, hi) = m
+            .vol
+            .bounds(params.tau_ns, params.theta_1e9)
+            .expect("warm bounds");
+
+        // Nine more prints INSIDE the band, one every 30 s — the last
+        // of them 30 s short of the decision instant.
+        let inside = hi - hi / 10;
+        let mut k = 1u64;
+        while k < 10 {
+            let w = sel + k * 30_000_000_000;
+            ctx.now = mono_of(w);
+            m.on_opt_summary(&summary(w, opt_sym(4), inside, 500_000_000), &mut ctx);
+            k += 1;
+        }
+        assert_eq!(m.iv_ring_len, 10, "ten prints, none of them lost");
+        assert_eq!(m.vrp_counters().decisions, 0, "none of them decided");
+
+        // The decision instant, with ONE wide print: four times the band.
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), hi * 4, 500_000_000), &mut ctx);
+
+        assert_eq!(m.vrp_counters().decisions, 1);
+        assert_eq!(
+            m.vrp_counters().holds,
+            1,
+            "the median held: {:?}",
+            m.vrp_counters()
+        );
+        assert_eq!(m.vrp_counters().holds_cost, 0, "the fees are zero here");
+        assert_eq!(m.vrp_counters().entries_submitted, 0);
+        assert_eq!(m.iv_ring_len, 11, "and the spike makes eleven");
+        assert_eq!(m.vrp_counters().iv_median_fallback, 0, "eleven is a median");
+        assert!(ctx.orders.is_empty());
+        // ...and the last print ALONE — the number the old law decided
+        // on — would have opened the campaign.
+        assert!(m.last_mark.iv_1e9 > hi, "the spike is outside the band");
+    }
+
+    #[test]
+    fn a_thin_selection_window_decides_on_the_last_print_and_says_so() {
+        // R6: below the floor there is no median to take. The decision
+        // still happens — it just says which number it used.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            opt_fee_index_bps: 0,
+            opt_fee_prem_bps: 0,
+            ..VrpParams::default()
+        };
+        let (mut m, _) = member(&mut ctx, params);
+        let (lo, hi) = {
+            let (probe, _) = member(&mut RecCtx::new(), params);
+            probe
+                .vol
+                .bounds(params.tau_ns, params.theta_1e9)
+                .expect("warm bounds")
+        };
+        assert!(lo < hi);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), hi * 4, 500_000_000), &mut ctx);
+        assert!(m.iv_ring_len < IV_MEDIAN_MIN_SAMPLES);
+        assert_eq!(m.vrp_counters().iv_median_fallback, 1);
+        assert_eq!(m.vrp_counters().entries_submitted, 1, "and it traded");
+    }
+
+    // ---------------- R7: the cost term ----------------
+
+    #[test]
+    fn a_hold_says_whether_the_cost_closed_the_band() {
+        // R7: θ opened the band and the round trip closed it again.
+        // That difference IS the fee load, and it is the number the
+        // R4b diagnosis turns on — so it is counted, not inferred.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let (_lo, hi) = m
+            .vol
+            .bounds(params.tau_ns, params.theta_1e9)
+            .expect("warm bounds");
+        // A tenth of a percent outside θ's band — and nowhere near
+        // outside the band the fees put around it.
+        let iv = hi + hi / 1_000;
+        let silent = core_regime::RegimeView::UNKNOWN;
+        assert_eq!(run_campaign(params, silent, iv).0, 0, "the cost held it");
+
+        // The same tape with the fees zeroed trades — which is what
+        // makes `holds_cost` a measurement rather than a label.
+        let free = VrpParams {
+            opt_fee_index_bps: 0,
+            opt_fee_prem_bps: 0,
+            ..VrpParams::default()
+        };
+        assert_eq!(run_campaign(free, silent, iv).0, 1, "θ alone takes it");
+
+        // And the counter says so, on the member that held.
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        m.on_opt_summary(&summary(entry, opt_sym(4), iv, 500_000_000), &mut ctx);
+        let c = m.vrp_counters();
+        assert_eq!(c.holds, 1, "{c:?}");
+        assert_eq!(c.holds_cost, 1, "θ alone would have traded it");
+        assert_eq!(c.entries_submitted, 0);
+        assert!(
+            m.theta_eff_1e9(m.last_mark.px_usd_1e6, entry) > params.theta_1e9,
+            "the cost term is what widened the band"
+        );
+    }
+
+    // ---------------- R5: the delivery TWAP ----------------
+
+    #[test]
+    fn the_settle_index_is_the_delivery_twap_when_the_window_is_covered() {
+        // R5: Deribit delivers on the average of its index over the 30
+        // minutes before expiry. Settling on the last print instead is
+        // a basis bet nobody took.
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, VrpParams::default());
+        m.expiry_ns = EXPIRY;
+
+        // 30 samples, one a minute, walking $79,000 → $80,450.
+        let mut k = 0u64;
+        while k < 30 {
+            let wall = EXPIRY - SETTLE_TWAP_WINDOW_NS + k * 60_000_000_000;
+            m.accumulate_settle_twap(wall, 79_000_000_000_000 + k as i64 * 50_000_000_000);
+            k += 1;
+        }
+        // 29 weighted samples (the first anchors only), 60 s each.
+        assert_eq!(m.settle_twap.sum_dt, 29 * 60_000_000_000);
+        // Each sample carries the minute BEHIND it, so the average runs
+        // over prints 1..=29: 79,050 … 80,450, mean 79,750.
+        assert_eq!(m.settle_index_1e6(), Some(79_750_000_000));
+        assert_eq!(
+            m.vrp_counters().settle_index_fallback,
+            0,
+            "the TWAP priced it"
+        );
+        // The harness computes the same number from the same samples.
+        assert_eq!(m.settle_twap.sum_dt, 29 * 60_000_000_000);
+    }
+
+    #[test]
+    fn a_thin_delivery_window_falls_back_to_the_last_print() {
+        // Under 10 minutes of samples is a handful of prints, not an
+        // average — so the P0 law prices it, and SAYS so.
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, VrpParams::default());
+        m.expiry_ns = EXPIRY;
+        let mut k = 0u64;
+        while k < 6 {
+            let wall = EXPIRY - 6 * 60_000_000_000 + k * 60_000_000_000;
+            m.accumulate_settle_twap(wall, 79_000_000_000_000 + k as i64 * 50_000_000_000);
+            k += 1;
+        }
+        assert_eq!(m.settle_twap.sum_dt, 5 * 60_000_000_000);
+        // The P0 law reads the FRESHER of the two sources; give it one.
+        m.last_mark.underlying_px_1e9 = 79_250_000_000_000;
+        m.last_mark.wall_ns = EXPIRY - 60_000_000_000;
+        assert_eq!(m.settle_index_1e6(), Some(79_250_000_000));
+        assert_eq!(m.vrp_counters().settle_index_fallback, 1);
+        // No index at all is a DEFER, not a fallback.
+        let mut ctx2 = RecCtx::new();
+        let (mut m2, _) = member(&mut ctx2, VrpParams::default());
+        m2.expiry_ns = EXPIRY;
+        m2.last_underlying_mid_1e6 = 0;
+        assert_eq!(m2.settle_index_1e6(), None);
+        assert_eq!(m2.vrp_counters().settle_index_fallback, 0);
+    }
+
+    #[test]
+    fn the_delivery_window_caps_a_gap_and_ends_at_the_expiry() {
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, VrpParams::default());
+        m.expiry_ns = EXPIRY;
+        // Outside the window: no weight at all.
+        m.accumulate_settle_twap(EXPIRY - 4 * 3_600_000_000_000, 70_000_000_000_000);
+        assert_eq!(m.settle_twap.sum_dt, 0);
+        assert_eq!(m.settle_twap.last_wall_ns, 0, "and no anchor either");
+        // Two samples 20 minutes apart INSIDE it: the second carries
+        // 60 s, not 20 min — one stale print before a gap must not
+        // carry the whole average.
+        m.accumulate_settle_twap(EXPIRY - 25 * 60_000_000_000, 79_000_000_000_000);
+        m.accumulate_settle_twap(EXPIRY - 5 * 60_000_000_000, 80_000_000_000_000);
+        assert_eq!(m.settle_twap.sum_dt, SETTLE_TWAP_DT_CAP_NS);
+        // AT expiry and after: the window is half-open, and a dead
+        // instrument's prints (Deribit keeps printing for 9–19 min) are
+        // not delivery evidence.
+        m.accumulate_settle_twap(EXPIRY, 99_000_000_000_000);
+        m.accumulate_settle_twap(EXPIRY + 600_000_000_000, 99_000_000_000_000);
+        assert_eq!(m.settle_twap.sum_dt, SETTLE_TWAP_DT_CAP_NS);
+        // A new campaign starts from nothing.
+        m.opt_pos_qty_1e6 = 0;
+        m.perp_pos_qty_1e6 = 0;
+        m.end_campaign();
+        assert_eq!(m.settle_twap, SettleTwap::default());
+    }
+
+    #[test]
+    fn regime_offsets_move_the_band_and_only_the_band() {
+        // R3: `vol:high` on the fast profile subtracts 0.099 log points
+        // from ln σ̂. Both edges of the band are annualised(exp(ln σ̂ ±
+        // θ)), so BOTH move by exp(−0.099) ≈ 0.9057 and the width —
+        // which is exp(2θ), the θ the operator set — does not move at
+        // all. Nothing else in the member reads the offset.
+        let mut ctx = RecCtx::new();
+        // R7's cost term widens the SAME band this test moves, and it
+        // is measured by its own tests. Zero the fees so this one moves
+        // exactly one thing.
+        let free = VrpParams {
+            opt_fee_index_bps: 0,
+            opt_fee_prem_bps: 0,
+            ..VrpParams::default()
+        };
+        let mut params = free;
+        params.regime_off_1e9[0][core_types::regime::VOL_HIGH as usize] = OFF_FAST_HIGH_1E9;
+        let (mut m, _) = member(&mut ctx, params);
+
+        // Before any view: UNKNOWN is zero by construction, so the band
+        // is the uncorrected one.
+        assert_eq!(m.regime_offset_1e9(), 0, "no view yet");
+        let (lo0, hi0) = m
+            .vol
+            .bounds(params.tau_ns, params.theta_1e9)
+            .expect("warm bounds");
+        assert_eq!(
+            m.vol
+                .bounds_with_offset(params.tau_ns, params.theta_1e9, 0),
+            Some((lo0, hi0)),
+            "a zero offset is `bounds` bit for bit"
+        );
+
+        m.set_regime_view(&vol_view(
+            core_types::regime::VOL_HIGH,
+            core_types::regime::VOL_NORMAL,
+        ));
+        assert_eq!(
+            m.regime_offset_1e9(),
+            OFF_FAST_HIGH_1E9,
+            "fast high fires; slow normal is zero by construction"
+        );
+        let (lo1, hi1) = m
+            .vol
+            .bounds_with_offset(params.tau_ns, params.theta_1e9, m.regime_offset_1e9())
+            .expect("warm bounds");
+
+        // exp(−0.099) ×1e9 — the band is SCALED, not shifted, because
+        // the offset is additive in the LOG domain. `fx::exp_1e9`
+        // answers in RAW units (it is the inverse of `fx::ln_1e9`, which
+        // logs a raw integer), so the ×1e9 scale has to be carried in
+        // through `ln(1e9)` and read back out of the product.
+        let k_1e9 =
+            core_vol::fx::exp_1e9(core_vol::fx::ln_1e9(1_000_000_000) + OFF_FAST_HIGH_1E9) as i128;
+        let want_lo = (lo0 as i128 * k_1e9 / 1_000_000_000) as i64;
+        let want_hi = (hi0 as i128 * k_1e9 / 1_000_000_000) as i64;
+        assert!((lo1 - want_lo).abs() <= want_lo / 100_000, "lo scales");
+        assert!((hi1 - want_hi).abs() <= want_hi / 100_000, "hi scales");
+        assert!(hi1 < hi0 && lo1 < lo0, "a negative intercept lowers both");
+        // The WIDTH is untouched: hi/lo is exp(2θ) either way.
+        let w0 = (hi0 as i128 * 1_000_000_000) / lo0 as i128;
+        let w1 = (hi1 as i128 * 1_000_000_000) / lo1 as i128;
+        assert!((w0 - w1).abs() <= w0 / 100_000, "θ is not touched");
+
+        // ...and only the band: an IV above BOTH `hi`s produces the
+        // same campaign either way — same side, same qty, same limit.
+        let silent = core_regime::RegimeView::UNKNOWN;
+        let high = vol_view(
+            core_types::regime::VOL_HIGH,
+            core_types::regime::VOL_NORMAL,
+        );
+        let above = hi0 + hi0 / 4;
+        let plain = run_campaign(free, silent, above);
+        let shifted = run_campaign(params, high, above);
+        assert_eq!(plain.0, 1, "the uncorrected band opens too, up here");
+        assert_eq!(plain, shifted, "above both bands, nothing differs");
+
+        // An IV BETWEEN them is the whole point: the corrected member
+        // takes the short the uncorrected one refuses.
+        let between = (hi1 + hi0) / 2;
+        assert!(between > hi1 && between < hi0);
+        assert_eq!(
+            run_campaign(free, silent, between).0,
+            0,
+            "uncorrected: the band holds"
+        );
+        assert_eq!(
+            run_campaign(params, high, between).0,
+            1,
+            "corrected: the band opens"
+        );
+        // The table alone is inert without a word, and a word alone is
+        // inert without a table — both halves are load-bearing.
+        assert_eq!(run_campaign(params, silent, between).0, 0, "no word");
+        assert_eq!(
+            run_campaign(free, high, between).0,
+            0,
+            "no table"
+        );
+    }
+
+    #[test]
+    fn unknown_regime_is_zero_offset() {
+        // A configured table plus a silent detector must be bit
+        // identical to no table at all — there is no "default word".
+        let mut ctx = RecCtx::new();
+        // `core-config` exposes `*_vol_low_*` and `*_vol_high_*` only,
+        // so index `VOL_NORMAL` is structurally zero — the baseline the
+        // §3.3 fit measured everything else against.
+        let params = VrpParams {
+            regime_off_1e9: [[7_000_000, 0, -99_000_000]; 2],
+            ..VrpParams::default()
+        };
+        let (mut m, _) = member(&mut ctx, params);
+
+        assert_eq!(m.regime_offset_1e9(), 0, "before any push");
+        m.set_regime_view(&core_regime::RegimeView::UNKNOWN);
+        assert_eq!(m.regime_offset_1e9(), 0, "the no-detector view");
+        m.set_regime_view(&vol_view(VOL_UNKNOWN_BYTE, VOL_UNKNOWN_BYTE));
+        assert_eq!(m.regime_offset_1e9(), 0, "configured but silent");
+
+        // `vol:normal` is zero by construction on BOTH profiles, so a
+        // fully-spoken normal view is inert too.
+        m.set_regime_view(&vol_view(
+            core_types::regime::VOL_NORMAL,
+            core_types::regime::VOL_NORMAL,
+        ));
+        assert_eq!(m.regime_offset_1e9(), 0, "vol:normal is the baseline");
+
+        // Both profiles speaking a non-normal word ADD.
+        m.set_regime_view(&vol_view(
+            core_types::regime::VOL_LOW,
+            core_types::regime::VOL_HIGH,
+        ));
+        assert_eq!(m.regime_offset_1e9(), 7_000_000 + -99_000_000);
+
+        // A decision with no view stores zero on the gauge path.
+        let mut ctx2 = RecCtx::new();
+        let (mut m2, _) = member(&mut ctx2, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx2.now = mono_of(sel);
+        m2.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx2);
+        ctx2.now = mono_of(EXPIRY - TAU);
+        m2.on_opt_summary(
+            &summary(EXPIRY - TAU, opt_sym(4), 700_000_000, 500_000_000),
+            &mut ctx2,
+        );
+        assert!(m2.vrp_counters().decisions > 0, "a decision ran");
+        assert_eq!(m2.last_regime_offset_1e9(), 0);
+        assert_eq!(
+            strategy_core::StrategyCounters::vrp_regime_offset_1e6(&m2),
+            0
+        );
+    }
+
+    /// Run one selection→decision at `iv_1e9` and report
+    /// `(entries_submitted, the first order's side, qty, limit)` — the
+    /// whole observable footprint of a VRP entry.
+    fn run_campaign(
+        params: VrpParams,
+        view: core_regime::RegimeView,
+        iv_1e9: i64,
+    ) -> (u64, i8, i64, i64) {
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, params);
+        m.set_regime_view(&view);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), iv_1e9, 500_000_000), &mut ctx);
+        let n = m.vrp_counters().entries_submitted;
+        match ctx.orders.first() {
+            Some(o) => (n, o.side as i8, o.qty.raw(), o.px.raw()),
+            None => (n, 0, 0, 0),
+        }
     }
 
     #[test]

@@ -43,6 +43,10 @@ fn run(name: &str) -> Vec<String> {
 
     let mut tau_ns: u64 = 0;
     let mut theta_1e9: i64 = 0;
+    // R3: the regime's log-vol intercept in force, sticky until the
+    // next `O`. Zero for every row the fixture wrote before P4.1, which
+    // is what keeps those rows bit-identical.
+    let mut off_1e9: i64 = 0;
     let mut e = VolEngine::new();
     let mut out: Vec<String> = Vec::new();
     let mut row = 0usize;
@@ -62,8 +66,9 @@ fn run(name: &str) -> Vec<String> {
             "C" => e.on_minute_close(f[1].parse().unwrap()),
             "P" => e.seed_pair(f[1].parse().unwrap(), f[2].parse().unwrap()),
             "A" => {
-                e.arm_hold(tau_ns, f[1].parse().unwrap());
+                e.arm_hold_at_with_offset(0, tau_ns, f[1].parse().unwrap(), off_1e9);
             }
+            "O" => off_1e9 = f[1].parse().unwrap(),
             "S" => e.observe_settlement(f[1].parse().unwrap()),
             // F1: settle from the engine's OWN realised window — the
             // law the member uses live. `0` when the window is absent,
@@ -78,7 +83,7 @@ fn run(name: &str) -> Vec<String> {
                     Some((a, b)) => (Some(a), Some(b)),
                     None => (None, None),
                 };
-                let (lo, hi) = match e.bounds(tau_ns, theta_1e9) {
+                let (lo, hi) = match e.bounds_with_offset(tau_ns, theta_1e9, off_1e9) {
                     Some((lo, hi)) => (Some(lo), Some(hi)),
                     None => (None, None),
                 };
@@ -193,6 +198,29 @@ fn the_fixture_exercises_every_branch_it_claims_to() {
     // the wrong column before the `realised` column was added, and both
     // happened to be "0".
     assert_eq!(cell(&rows[n - 1], 14), "0", "and must leave nothing armed");
+    // R3: somewhere in the tape two rows share a fit and a forecast but
+    // NOT a band — that pair is the regime intercept, and nothing else
+    // in the law can produce it.
+    let mut i = 1usize;
+    let mut found = false;
+    while i < n {
+        let (a, b) = (&rows[i - 1], &rows[i]);
+        if cell(a, 7) == cell(b, 7) && cell(a, 5) == cell(b, 5) && cell(a, 8) != cell(b, 8) {
+            let lo_a: i64 = cell(a, 8).parse().unwrap();
+            let lo_b: i64 = cell(b, 8).parse().unwrap();
+            let hi_a: i64 = cell(a, 9).parse().unwrap();
+            let hi_b: i64 = cell(b, 9).parse().unwrap();
+            // exp(−0.099) ≈ 0.905743, to a part in 1e5, on BOTH edges:
+            // the offset SCALES the band, it does not widen it.
+            let k = |x: i64, y: i64| (x as i128 * 1_000_000_000) / y as i128;
+            assert!((k(lo_b, lo_a) - 905_742_878).abs() <= 10_000, "lo scales");
+            assert!((k(hi_b, hi_a) - 905_742_878).abs() <= 10_000, "hi scales");
+            found = true;
+            break;
+        }
+        i += 1;
+    }
+    assert!(found, "the tape must exercise a regime intercept (`O`)");
 
     // ---- F1/F4/F5: the tape must reach each new branch ----
     // A hold that ran its full tenor reports a realised vol...

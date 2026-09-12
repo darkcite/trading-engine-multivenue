@@ -586,7 +586,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                      settled_itm={} settled_otm={} settled_unpriced={} qlike_har_beats_iv={} \
                      killed={} caps_rejected={} fills={} fills_ignored={} orders_emitted={} \
                      entry_maker_submitted={} entry_crossed={} entry_cost_refused={} \
-                     hedge_crossed={} vol_minutes={} vol_warm={} vol_gaps={} pairs={} \
+                     hedge_crossed={} settle_index_fallback={} iv_median_fallback={} \
+                     holds_cost={} vol_minutes={} vol_warm={} \
+                     vol_gaps={} pairs={} \
                      regime=not-replayed(v1)",
                     c.decisions,
                     c.decisions_late,
@@ -619,6 +621,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     c.entry_crossed,
                     c.entry_cost_refused,
                     c.hedge_crossed,
+                    c.settle_index_fallback,
+                    c.iv_median_fallback,
+                    c.holds_cost,
                     strat.vol_minutes(),
                     strat.vol_is_warm(),
                     strat.vol_gaps(),

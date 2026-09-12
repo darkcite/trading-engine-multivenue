@@ -2537,6 +2537,20 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             opt_fee_prem_bps = boot.params.opt_fee_prem_bps,
             "vrp: execution modes"
         );
+        // R3: the four effective log-vol intercepts. An all-zero table
+        // is bit-identical to no table at all, so the tell is the only
+        // way to tell a loaded correction from a missing one.
+        tracing::info!(
+            regime_fast_vol_low_1e9 =
+                boot.params.regime_off_1e9[0][core_types::regime::VOL_LOW as usize],
+            regime_fast_vol_high_1e9 =
+                boot.params.regime_off_1e9[0][core_types::regime::VOL_HIGH as usize],
+            regime_slow_vol_low_1e9 =
+                boot.params.regime_off_1e9[1][core_types::regime::VOL_LOW as usize],
+            regime_slow_vol_high_1e9 =
+                boot.params.regime_off_1e9[1][core_types::regime::VOL_HIGH as usize],
+            "vrp: regime intercepts"
+        );
         tracing::info!(
             seed_pairs = boot.pairs_from_seed + boot.pairs_from_state,
             pairs = boot.pairs.len(),
@@ -3842,9 +3856,23 @@ pub struct VrpMetricIds {
     /// `engine_vrp_hedge_crossed_total` (R2 — a maker hedge that had to
     /// cross; the share of the maker saving that is not real)
     pub hedge_crossed: core_metrics::CounterId,
+    /// `engine_vrp_settle_index_fallback_total` (R5 — a settlement
+    /// priced off the LAST print because the 30-minute delivery window
+    /// carried under 10 min of samples)
+    pub settle_index_fallback: core_metrics::CounterId,
+    /// `engine_vrp_iv_median_fallback_total` (R6 — a decision taken on
+    /// the LAST quoted implied vol for want of a median)
+    pub iv_median_fallback: core_metrics::CounterId,
+    /// `engine_vrp_holds_cost_total` (R7 — a HOLD that θ ALONE would
+    /// have traded: the fee load, measured)
+    pub holds_cost: core_metrics::CounterId,
     /// `engine_vrp_last_settle_value_1e6` (X1 gauge — the cash the last
     /// settlement booked; no order is emitted for it)
     pub last_settle_value_1e6: core_metrics::GaugeId,
+    /// `engine_vrp_regime_offset_1e6` (R3 gauge — the regime's log-vol
+    /// intercept in force at the last decision; 0 = no table, no
+    /// detector, or `vol:normal`)
+    pub regime_offset_1e6: core_metrics::GaugeId,
     /// `engine_vrp_no_bounds_total`
     pub no_bounds: core_metrics::CounterId,
     /// `engine_vrp_stale_skips_total`
@@ -3906,6 +3934,9 @@ fn register_vrp_metrics(
     let entry_crossed = one("engine_vrp_entry_crossed_total")?;
     let entry_cost_refused = one("engine_vrp_entry_cost_refused_total")?;
     let hedge_crossed = one("engine_vrp_hedge_crossed_total")?;
+    let settle_index_fallback = one("engine_vrp_settle_index_fallback_total")?;
+    let iv_median_fallback = one("engine_vrp_iv_median_fallback_total")?;
+    let holds_cost = one("engine_vrp_holds_cost_total")?;
     let no_bounds = one("engine_vrp_no_bounds_total")?;
     let stale_skips = one("engine_vrp_stale_skips_total")?;
     let no_selection = one("engine_vrp_no_selection_total")?;
@@ -3938,6 +3969,9 @@ fn register_vrp_metrics(
         entry_crossed,
         entry_cost_refused,
         hedge_crossed,
+        settle_index_fallback,
+        iv_median_fallback,
+        holds_cost,
         no_bounds,
         stale_skips,
         no_selection,
@@ -3953,6 +3987,7 @@ fn register_vrp_metrics(
         qlike_har_1e6: g("engine_vrp_qlike_har_1e6")?,
         qlike_har_beats_iv: g("engine_vrp_qlike_har_beats_iv")?,
         last_settle_value_1e6: g("engine_vrp_last_settle_value_1e6")?,
+        regime_offset_1e6: g("engine_vrp_regime_offset_1e6")?,
     })
 }
 
@@ -4136,6 +4171,12 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.entry_cost_refused.saturating_sub(last.entry_cost_refused));
     reg.counter(ids.hedge_crossed)
         .inc(cur.hedge_crossed.saturating_sub(last.hedge_crossed));
+    reg.counter(ids.settle_index_fallback)
+        .inc(cur.settle_index_fallback.saturating_sub(last.settle_index_fallback));
+    reg.counter(ids.iv_median_fallback)
+        .inc(cur.iv_median_fallback.saturating_sub(last.iv_median_fallback));
+    reg.counter(ids.holds_cost)
+        .inc(cur.holds_cost.saturating_sub(last.holds_cost));
     reg.counter(ids.no_bounds)
         .inc(cur.no_bounds.saturating_sub(last.no_bounds));
     reg.counter(ids.stale_skips)
@@ -4163,6 +4204,8 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .set(cur.qlike_har_beats_iv as i64);
     reg.gauge(ids.last_settle_value_1e6)
         .set(strategy_core::StrategyCounters::vrp_last_settle_value_1e6(strat));
+    reg.gauge(ids.regime_offset_1e6)
+        .set(strategy_core::StrategyCounters::vrp_regime_offset_1e6(strat));
     *last = cur;
 }
 

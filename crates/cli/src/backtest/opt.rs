@@ -488,6 +488,17 @@ pub struct OptLoadOut {
     pub quote_lane_syms: BTreeSet<u32>,
 }
 
+/// R5: Deribit's delivery window — the average of its index over the
+/// **30 minutes** before expiry. Restated here, like [`OptSettleRef`]
+/// restates the intrinsic, because the harness must not depend on a
+/// strategy crate; `strategy_vrp::SETTLE_TWAP_WINDOW_NS` is the same
+/// number, and `crates/cli/tests/backtest_harness.rs` pins the pair.
+pub const SETTLE_TWAP_WINDOW_NS: u64 = 1_800_000_000_000;
+/// R5: the least covered time that makes the average worth trusting.
+pub const SETTLE_TWAP_MIN_NS: u64 = 600_000_000_000;
+/// R5: the most weight ONE sample may carry.
+pub const SETTLE_TWAP_DT_CAP_NS: u64 = 60_000_000_000;
+
 /// VX-A: everything needed to turn one expired option sym into a
 /// European cash value, gathered while its own records were still
 /// arriving. Keyed per sym in the CALLER's space — `backtest` remaps
@@ -516,6 +527,16 @@ pub struct OptSettleRef {
     pub right: u8,
     /// Expiry, WALL ns since the epoch.
     pub expiry_ns: u64,
+    /// R5: Σ `underlying_px_1e9 × dt_ns` over `[expiry − 30 min,
+    /// expiry)`. `i128` because 1e14 × 6e10 is past `i64` inside one
+    /// window.
+    pub twap_sum_px_dt: i128,
+    /// R5: Σ `dt_ns` — the COVERED time inside the window, not the
+    /// elapsed time. Below [`SETTLE_TWAP_MIN_NS`] the average is a
+    /// handful of prints and [`Self::settle_index_1e6`] falls back.
+    pub twap_sum_dt: u64,
+    /// R5: wall instant of the newest in-window sample; 0 = none yet.
+    pub twap_last_wall_ns: u64,
 }
 
 impl OptSettleRef {
@@ -528,6 +549,73 @@ impl OptSettleRef {
             strike_1e6: t.strike_1e6,
             right: t.right,
             expiry_ns: t.expiry_ns,
+            twap_sum_px_dt: 0,
+            twap_sum_dt: 0,
+            twap_last_wall_ns: 0,
+        }
+    }
+
+    /// R5: fold one record of this instrument into BOTH settlement
+    /// laws — the P0 last-print-at-or-before-expiry, and the venue's
+    /// 30-minute delivery average.
+    ///
+    /// The two live in one place so the harness cannot drift from the
+    /// member: `strategy_vrp::VrpStrategy::accumulate_settle_twap` is
+    /// this arithmetic, sample for sample, cap for cap.
+    pub fn observe(&mut self, wall_ns: u64, underlying_px_1e9: i64) {
+        if underlying_px_1e9 <= 0 {
+            return;
+        }
+        // P0: the LAST print at or before the expiry. Deribit keeps
+        // printing an expired instrument for 9–19 min after settlement,
+        // so the cut-off is the point of the rung.
+        if wall_ns <= self.expiry_ns && wall_ns >= self.index_wall_ns {
+            self.index_1e6 = underlying_px_1e9 / 1_000;
+            self.index_wall_ns = wall_ns;
+        }
+        // R5: the delivery window. Each sample carries the wall gap
+        // BEHIND it — the interval it is the newest evidence for —
+        // capped, because the option lane goes quiet for minutes at a
+        // time and one stale print before a gap must not carry the
+        // whole average. The first sample in the window has no interval
+        // behind it: it anchors, and weighs nothing.
+        if wall_ns >= self.expiry_ns
+            || wall_ns < self.expiry_ns.saturating_sub(SETTLE_TWAP_WINDOW_NS)
+        {
+            return;
+        }
+        let prev = self.twap_last_wall_ns;
+        self.twap_last_wall_ns = wall_ns;
+        if prev == 0 || wall_ns <= prev {
+            return;
+        }
+        let dt = (wall_ns - prev).min(SETTLE_TWAP_DT_CAP_NS);
+        self.twap_sum_px_dt += underlying_px_1e9 as i128 * dt as i128;
+        self.twap_sum_dt = self.twap_sum_dt.saturating_add(dt);
+    }
+
+    /// R5: the index this contract settles at ×1e6 — the delivery TWAP
+    /// when the window is covered, the P0 last print otherwise.
+    #[must_use]
+    pub fn settle_index_1e6(&self) -> i64 {
+        if self.twap_sum_dt >= SETTLE_TWAP_MIN_NS {
+            let avg = self.twap_sum_px_dt / (self.twap_sum_dt as i128 * 1_000);
+            if let Ok(v) = i64::try_from(avg) {
+                if v > 0 {
+                    return v;
+                }
+            }
+        }
+        self.index_1e6
+    }
+
+    /// R5: which law priced this contract — `twap30` or `last`.
+    #[must_use]
+    pub const fn settle_law(&self) -> &'static str {
+        if self.twap_sum_dt >= SETTLE_TWAP_MIN_NS {
+            "twap30"
+        } else {
+            "last"
         }
     }
 
@@ -538,10 +626,11 @@ impl OptSettleRef {
     #[inline]
     #[must_use]
     pub fn value_1e6(&self) -> i64 {
+        let s_1e6 = self.settle_index_1e6();
         let v = if self.right == opt_registry::RIGHT_CALL {
-            self.index_1e6 - self.strike_1e6
+            s_1e6 - self.strike_1e6
         } else {
-            self.strike_1e6 - self.index_1e6
+            self.strike_1e6 - s_1e6
         };
         if v > 0 {
             v
@@ -665,10 +754,7 @@ pub fn register_option_model(
         // rung, not a nicety. `wall_ns` is already the §3.3 rebase, so
         // the two clocks agree by construction.
         if let Some(r) = settle_refs.get_mut(&o.sym) {
-            if rec.wall_ns <= r.expiry_ns && rec.wall_ns >= r.index_wall_ns {
-                r.index_1e6 = idx_1e6;
-                r.index_wall_ns = rec.wall_ns;
-            }
+            r.observe(rec.wall_ns, o.underlying_px_1e9);
         }
     }
     for (sym, idx) in &index_1e6 {
@@ -694,6 +780,100 @@ mod tests {
     use super::*;
 
     const CS: i64 = DERIBIT_OPT_CONTRACT_SIZE_1E9;
+
+    /// R5: 2026-09-10 08:00:00 UTC, a Deribit daily settle.
+    const R5_EXPIRY: u64 = 1_789_027_200_000_000_000;
+
+    fn settle_ref() -> OptSettleRef {
+        OptSettleRef::of(OptTerms {
+            strike_1e6: 79_000_000_000,
+            right: opt_registry::RIGHT_CALL,
+            expiry_ns: R5_EXPIRY,
+        })
+    }
+
+    /// The harness restates the member's constants (it must not depend
+    /// on a strategy crate), so something has to hold the two copies
+    /// together. This is that something.
+    #[test]
+    fn the_delivery_window_matches_the_members() {
+        assert_eq!(SETTLE_TWAP_WINDOW_NS, strategy_vrp::SETTLE_TWAP_WINDOW_NS);
+        assert_eq!(SETTLE_TWAP_MIN_NS, strategy_vrp::SETTLE_TWAP_MIN_NS);
+        assert_eq!(SETTLE_TWAP_DT_CAP_NS, strategy_vrp::SETTLE_TWAP_DT_CAP_NS);
+        assert_eq!(SETTLE_TWAP_WINDOW_NS, 30 * 60 * 1_000_000_000);
+        assert_eq!(SETTLE_TWAP_MIN_NS, 10 * 60 * 1_000_000_000);
+    }
+
+    /// R5: a covered window settles on the AVERAGE, not the last print.
+    #[test]
+    fn the_delivery_twap_prices_a_covered_window() {
+        let mut r = settle_ref();
+        // 30 samples, one a minute, walking $79,000 → $80,450. The last
+        // print is $80,450; the time-weighted average over the samples
+        // that carry weight is the middle of the walk.
+        let mut k = 0u64;
+        while k < 30 {
+            let wall = R5_EXPIRY - SETTLE_TWAP_WINDOW_NS + k * 60_000_000_000;
+            r.observe(wall, 79_000_000_000_000 + k as i64 * 50_000_000_000);
+            k += 1;
+        }
+        // 29 weighted samples (the first anchors only), each 60 s.
+        assert_eq!(r.twap_sum_dt, 29 * 60_000_000_000);
+        assert_eq!(r.settle_law(), "twap30");
+        // Each sample carries the minute BEHIND it, so the average runs
+        // over prints 1..=29: 79,050 … 80,450, mean 79,750.
+        assert_eq!(r.settle_index_1e6(), 79_750_000_000);
+        // The P0 law is still recorded, and still says the last print.
+        assert_eq!(r.index_1e6, 80_450_000_000);
+        // ...and the value follows the TWAP, not the last print.
+        assert_eq!(r.value_1e6(), 750_000_000);
+    }
+
+    /// R5: a thin window is a handful of prints, not an average.
+    #[test]
+    fn a_thin_delivery_window_falls_back_to_the_last_print() {
+        let mut r = settle_ref();
+        // Five minutes of samples: under the 10-minute floor.
+        let mut k = 0u64;
+        while k < 6 {
+            let wall = R5_EXPIRY - 6 * 60_000_000_000 + k * 60_000_000_000;
+            r.observe(wall, 79_000_000_000_000 + k as i64 * 50_000_000_000);
+            k += 1;
+        }
+        assert_eq!(r.twap_sum_dt, 5 * 60_000_000_000);
+        assert_eq!(r.settle_law(), "last");
+        assert_eq!(r.settle_index_1e6(), r.index_1e6);
+        assert_eq!(r.index_1e6, 79_250_000_000);
+    }
+
+    /// R5: one sample may not carry the whole window, and nothing
+    /// outside `[expiry − 30 min, expiry)` may carry any of it.
+    #[test]
+    fn the_delivery_window_caps_a_gap_and_ignores_what_is_outside_it() {
+        let mut r = settle_ref();
+        // Well before the window: P0 sees it, the TWAP does not.
+        r.observe(R5_EXPIRY - 4 * 3_600_000_000_000, 70_000_000_000_000);
+        assert_eq!(r.twap_sum_dt, 0);
+        assert_eq!(r.index_1e6, 70_000_000_000);
+        // Two samples 20 minutes apart INSIDE the window: the second
+        // carries 60 s, not 20 min.
+        r.observe(R5_EXPIRY - 25 * 60_000_000_000, 79_000_000_000_000);
+        r.observe(R5_EXPIRY - 5 * 60_000_000_000, 80_000_000_000_000);
+        assert_eq!(r.twap_sum_dt, SETTLE_TWAP_DT_CAP_NS);
+        // AT expiry: still "at or before", so the P0 law takes it — but
+        // the delivery window is half-open and does not.
+        r.observe(R5_EXPIRY, 90_000_000_000_000);
+        assert_eq!(r.twap_sum_dt, SETTLE_TWAP_DT_CAP_NS);
+        assert_eq!(r.index_1e6, 90_000_000_000);
+        // AFTER expiry: Deribit keeps printing an expired instrument
+        // for 9–19 min, and none of it is evidence for either law.
+        r.observe(R5_EXPIRY + 600_000_000_000, 99_000_000_000_000);
+        assert_eq!(r.twap_sum_dt, SETTLE_TWAP_DT_CAP_NS);
+        assert_eq!(
+            r.index_1e6, 90_000_000_000,
+            "a dead instrument's prints are not evidence"
+        );
+    }
 
     /// THE pinned example (edge spec §6.1 / implementer guide §2.1):
     /// 0.00038 BTC at $79,000 is $30.02, and the intermediate product

@@ -121,6 +121,12 @@ pub struct VrpFile {
     pub opt_fee_index_bps: u32,
     /// See [`Self::opt_fee_index_bps`].
     pub opt_fee_prem_bps: u32,
+    /// P4.1 (R3): additive offsets on `ln σ̂`, ×1e9 log-vol, indexed
+    /// `[profile][VOL value]` — profile 0 = fast, 1 = slow; VOL 0 =
+    /// low, 1 = normal, 2 = high. `vol:normal` and UNKNOWN are 0 by
+    /// construction (the regime-edge §3.3 fit is stated against the
+    /// normal base), so an absent key set is bit-identical to today.
+    pub regime_off_1e9: [[i64; 3]; 2],
 }
 
 /// Default location beside `universe.toml`.
@@ -138,7 +144,7 @@ pub fn load(path: &Path) -> Result<(VrpFile, Vec<u8>), VrpError> {
     Ok((file, bytes))
 }
 
-const VRP_KEYS: [&str; 17] = [
+const VRP_KEYS: [&str; 21] = [
     "theta_1e9",
     "tau_ns",
     "epsilon_ns",
@@ -156,6 +162,10 @@ const VRP_KEYS: [&str; 17] = [
     "hedge_patience_ns",
     "opt_fee_index_bps",
     "opt_fee_prem_bps",
+    "regime_fast_vol_low_1e9",
+    "regime_fast_vol_high_1e9",
+    "regime_slow_vol_low_1e9",
+    "regime_slow_vol_high_1e9",
 ];
 
 /// `sides` values, mirroring `strategy_vrp::SIDES_*`. The member owns
@@ -203,6 +213,18 @@ fn take_pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, VrpErro
         return Err(err(format!("`{key}` must be > 0 (got {v})")));
     }
     u64::try_from(v).map_err(|_| err(format!("`{key}` must be > 0 (got {v})")))
+}
+
+/// P4.1: an OPTIONAL SIGNED integer key. The regime offsets are
+/// negative on the `high` arms by construction — a high-vol word says
+/// the HAR is over-forecasting — so this one cannot reuse the
+/// non-negative readers above.
+fn take_opt_i64(kv: &[(String, Value, usize)], key: &str, default: i64) -> Result<i64, VrpError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        None => Ok(default),
+        Some((_, Value::Int(v), _)) => Ok(*v),
+        Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
+    }
 }
 
 /// P3.1: an OPTIONAL non-negative integer key, as `u64`.
@@ -324,6 +346,18 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
         )?,
         opt_fee_index_bps: take_opt_u32(&kv, "opt_fee_index_bps", OPT_FEE_INDEX_BPS_DEFAULT)?,
         opt_fee_prem_bps: take_opt_u32(&kv, "opt_fee_prem_bps", OPT_FEE_PREM_BPS_DEFAULT)?,
+        regime_off_1e9: [
+            [
+                take_opt_i64(&kv, "regime_fast_vol_low_1e9", 0)?,
+                0,
+                take_opt_i64(&kv, "regime_fast_vol_high_1e9", 0)?,
+            ],
+            [
+                take_opt_i64(&kv, "regime_slow_vol_low_1e9", 0)?,
+                0,
+                take_opt_i64(&kv, "regime_slow_vol_high_1e9", 0)?,
+            ],
+        ],
     };
 
     if file.theta_1e9 <= 0 || file.theta_1e9 > VRP_THETA_MAX_1E9 {
@@ -394,6 +428,24 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
             "`hedge_patience_ns` {} must be < `rebalance_ns` {} — a hedge still resting              when the next rebalance is due would chase two targets at once",
             file.hedge_patience_ns, file.rebalance_ns
         )));
+    }
+    // P4.1: an offset larger than theta would move the band further
+    // than the parameter that defines it, which is a typed extra zero
+    // rather than a policy. The §3.3 values are all under 0.17.
+    let mut p = 0usize;
+    while p < file.regime_off_1e9.len() {
+        let mut v = 0usize;
+        while v < file.regime_off_1e9[p].len() {
+            let off = file.regime_off_1e9[p][v];
+            if off.saturating_abs() > VRP_THETA_MAX_1E9 {
+                return Err(err(format!(
+                    "`regime_*_vol_*_1e9` {off} exceeds ±{VRP_THETA_MAX_1E9} — an offset \
+                     that large moves the band further than θ itself"
+                )));
+            }
+            v += 1;
+        }
+        p += 1;
     }
     if file.underlying_descriptor.is_empty() || file.hedge_descriptor.is_empty() {
         return Err(err("descriptors must be non-empty".to_owned()));

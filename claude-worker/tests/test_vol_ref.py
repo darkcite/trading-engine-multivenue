@@ -35,6 +35,9 @@ def _replay(name: str) -> list[str]:
     src = (_DIR / f"{name}.input.tsv").read_text(encoding="utf-8")
     tau_ns = 0
     theta_1e9 = 0
+    # R3: the regime's log-vol intercept in force, sticky until the next
+    # ``O``. Zero for every row the fixture wrote before P4.1.
+    off_1e9 = 0
     engine = claude_worker.vol_ref.VolEngine()
     out: list[str] = []
     row = 0
@@ -53,7 +56,9 @@ def _replay(name: str) -> list[str]:
         elif op == "P":
             engine.seed_pair(int(f[1]), int(f[2]))
         elif op == "A":
-            engine.arm_hold(tau_ns, int(f[1]))
+            engine.arm_hold_with_offset(tau_ns, int(f[1]), off_1e9)
+        elif op == "O":
+            off_1e9 = int(f[1])
         elif op == "S":
             engine.observe_settlement(int(f[1]))
         elif op == "R":
@@ -67,7 +72,7 @@ def _replay(name: str) -> list[str]:
             fit = engine.fit()
             a = None if fit is None else fit[0]
             b = None if fit is None else fit[1]
-            bounds = engine.bounds(tau_ns, theta_1e9)
+            bounds = engine.bounds_with_offset(tau_ns, theta_1e9, off_1e9)
             lo = None if bounds is None else bounds[0]
             hi = None if bounds is None else bounds[1]
             q = engine.qlike_counters()

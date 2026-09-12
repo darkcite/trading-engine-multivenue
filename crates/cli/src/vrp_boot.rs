@@ -357,6 +357,7 @@ pub fn load_vrp_boot(
             hedge_patience_ns: file.hedge_patience_ns,
             opt_fee_index_bps: file.opt_fee_index_bps,
             opt_fee_prem_bps: file.opt_fee_prem_bps,
+            regime_off_1e9: file.regime_off_1e9,
         },
         registry,
         pairs,

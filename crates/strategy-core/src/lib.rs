@@ -219,6 +219,17 @@ pub trait StrategyCounters {
         0
     }
 
+    /// R3 (P4.1): the regime's log-vol intercept in force at the VRP
+    /// member's LAST decision, ×1e6. Zero when no offset is configured,
+    /// when the detector has not spoken, or when the effective word is
+    /// `vol:normal` — all three are the same number by construction, so
+    /// the gauge alone does not say which; the `vrp: regime intercepts`
+    /// boot tell says whether a table is loaded at all.
+    #[inline]
+    fn vrp_regime_offset_1e6(&self) -> i64 {
+        0
+    }
+
     /// X1: fills that reached the strategy SET stamped for a slot that
     /// is not enabled, or not built. Non-zero means an order outlived a
     /// `DisableStrategy`, or a stamp is wrong.
@@ -716,6 +727,23 @@ pub struct VrpCounters {
     /// error, but the number that says how much of the maker saving is
     /// real.
     pub hedge_crossed: u64,
+    /// R5: settlements priced off the LAST print because the 30-minute
+    /// delivery TWAP had less than 10 minutes of samples behind it — a
+    /// quiet option lane, or a restart inside the window. Not an error;
+    /// the number that says how much of the settled P&L is measured
+    /// against the venue's own delivery law and how much is a proxy.
+    pub settle_index_fallback: u64,
+    /// R6: decisions taken on the LAST quoted implied vol because the
+    /// selection window held fewer than
+    /// `strategy_vrp::IV_MEDIAN_MIN_SAMPLES` samples of it. The median
+    /// exists so one wide print at the decision instant cannot flip a
+    /// campaign; below the floor there is no median to take.
+    pub iv_median_fallback: u64,
+    /// R7: HOLDs that θ ALONE would have traded — the band opened, and
+    /// the round-trip cost of the option leg closed it again. The
+    /// number that says how much of the strategy the fee load eats;
+    /// counted on top of [`Self::holds`], never instead of it.
+    pub holds_cost: u64,
 }
 
 /// XSD counters (`engine_xsd_*`), mirrored by the cli's generic 5 s

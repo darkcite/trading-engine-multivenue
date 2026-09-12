@@ -265,12 +265,29 @@ class VolEngine:
 
     def bounds(self, tau_ns, theta_1e9):
         """``(iv_lo_1e9, iv_hi_1e9)`` as annualised fractions x1e9."""
+        return self.bounds_with_offset(tau_ns, theta_1e9, 0)
+
+    def bounds_with_offset(self, tau_ns, theta_1e9, off_1e9):
+        """R3: :meth:`bounds` with an additive offset on ``ln sigma_hat``.
+
+        The regime-edge section 3.3 fit measures what the CURRENT
+        volatility word says about the next window's realised vol over
+        and above what the HAR already knows, so the correction belongs
+        on the forecast, in the same log-vol domain, and nowhere else.
+        The target of that fit is log realised VOL, not log variance
+        (``rg_lib.fwd_rv`` returns ``sqrt(sum r^2)`` and ``rg_har.build``
+        takes its ``log``), so its coefficients enter here unhalved.
+
+        ``off_1e9 == 0`` is :meth:`bounds` digit for digit, which is what
+        makes an absent ``regime_*`` key inert.
+        """
         t = tenor_of(tau_ns)
         if t is None:
             return None
         ln_sigma = self.ln_sigma_hat_1e9(tau_ns)
         if ln_sigma is None:
             return None
+        ln_sigma += off_1e9
         lo = self._annualised_1e9(ln_sigma - theta_1e9, t[1])
         hi = self._annualised_1e9(ln_sigma + theta_1e9, t[1])
         if lo is None or hi is None:
@@ -291,6 +308,16 @@ class VolEngine:
 
     def arm_hold(self, tau_ns, mark_iv_1e9):
         """Stash the regressor, the forecast and the quoted implied vol."""
+        return self.arm_hold_with_offset(tau_ns, mark_iv_1e9, 0)
+
+    def arm_hold_with_offset(self, tau_ns, mark_iv_1e9, off_1e9):
+        """R3: :meth:`arm_hold`, scoring the OFFSET forecast.
+
+        The QLIKE comparison exists to judge the forecast the member
+        actually decided on (kill criterion 3). Arming with the
+        uncorrected ``ln sigma_hat`` while deciding on the corrected one
+        would score a forecaster nobody is running.
+        """
         x = self.x_1e9(tau_ns)
         t = tenor_of(tau_ns)
         if x is None or t is None:
@@ -300,7 +327,8 @@ class VolEngine:
         self.pend_arm_k = self.minutes
         self.pend_tau_min = t[0]
         self.pend_x_1e9 = x
-        self.pend_ln_sigma_1e9 = self.ln_sigma_hat_1e9(tau_ns)
+        ln_sigma = self.ln_sigma_hat_1e9(tau_ns)
+        self.pend_ln_sigma_1e9 = None if ln_sigma is None else ln_sigma + off_1e9
         if mark_iv_1e9 > 0:
             rv = (mark_iv_1e9 * BPS_1E9_PER_UNIT) // t[1]
             self.pend_rv_iv_1e9 = rv if rv <= I64_MAX else 0

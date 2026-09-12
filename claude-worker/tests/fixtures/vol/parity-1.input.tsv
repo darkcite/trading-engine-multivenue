@@ -3323,3 +3323,18 @@ P	24889000127	27618999111
 Q
 S	1234567890123
 Q
+# --- R3 (P4.1): the regime's log-vol intercept on ln sigma_hat. The
+# `O` op sets the offset in force; it is sticky until the next `O`,
+# and 0 for every row above, which is what keeps them bit-identical.
+O	-99000000
+Q
+# Arm at the CORRECTED forecast: QLIKE must judge the forecaster the
+# member actually decided on, not the uncorrected one.
+A	600000000
+S	27000000000
+Q
+# Back to 0: the same fit, the baseline band. Only lo/hi move.
+O	0
+Q
+S	1234567890123
+Q

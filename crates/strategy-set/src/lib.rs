@@ -401,16 +401,19 @@ impl StrategySet {
             self.regime_gates[slot] = self.judge_slot(slot);
             slot += 1;
         }
-        self.push_vm_regime_view();
+        self.push_regime_views();
     }
 
-    /// RG3: the set→vm seam — hand the vm the detector's current view
-    /// (effective words + per-member REL) so its rows re-judge. Called
-    /// on every minute roll, effective change and declaration
-    /// regardless of slot 5's own (always-ANY) gate; never per tick.
-    fn push_vm_regime_view(&mut self) {
+    /// RG3: the set→member seam — hand the view-consuming members the
+    /// detector's current view (effective words + per-member REL) so the
+    /// vm's rows re-judge and the vrp's band picks up its regime
+    /// intercept (P4.1). Called on every minute roll, effective change
+    /// and declaration regardless of either slot's own gate; never per
+    /// tick.
+    fn push_regime_views(&mut self) {
         let view = self.regime.view();
         self.vm.set_regime_view(&view);
+        self.vrp.set_regime_view(&view);
     }
 
     /// Re-judge every slot and fan `on_regime` out to the ENABLED
@@ -430,7 +433,7 @@ impl StrategySet {
             }
             slot += 1;
         }
-        self.push_vm_regime_view();
+        self.push_regime_views();
     }
 
     fn deliver_gate<C: Ctx>(&mut self, slot: u8, gate: RegimeGate, ctx: &mut C) {
@@ -727,6 +730,10 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vrp_last_settle_value_1e6(&self) -> i64 {
         self.vrp.last_settle_value_1e6()
+    }
+    #[inline]
+    fn vrp_regime_offset_1e6(&self) -> i64 {
+        StrategyCounters::vrp_regime_offset_1e6(&self.vrp)
     }
     #[inline]
     fn fills_unrouted(&self) -> u64 {
@@ -1256,7 +1263,7 @@ impl Strategy for StrategySet {
         if self.regime.on_timer(now_ns) != 0 {
             self.refresh_gates(ctx);
         } else if self.regime.minutes_judged() != minutes_before {
-            self.push_vm_regime_view();
+            self.push_regime_views();
         }
         if self.enabled & BIT_LATENCY_ARB != 0 {
             self.latency_arb

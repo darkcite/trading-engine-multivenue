@@ -6,6 +6,124 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — the VRP decision moves to a regime-corrected band, a median IV and a cost-aware θ; settlement moves to the venue's delivery TWAP (VRP P4 / R3, R5, R6, R7)
+
+**What changed**
+
+- **`vrp.toml` gains four OPTIONAL keys** (`core_config::vrp` `VRP_KEYS`
+  17 → 21), all ×1e9 additive offsets on `ln σ̂`. Absent keys are `0`,
+  and a zero offset is `bounds` **bit for bit**, so an existing file
+  still parses and decides exactly as it did:
+
+  | key | §3.3 train-only value | applies when |
+  |---|---|---|
+  | `regime_fast_vol_low_1e9` | `20000000` | fast profile's effective word is `vol:low` |
+  | `regime_fast_vol_high_1e9` | `-99000000` | fast profile's effective word is `vol:high` |
+  | `regime_slow_vol_low_1e9` | `77000000` | slow profile's effective word is `vol:low` |
+  | `regime_slow_vol_high_1e9` | `-165000000` | slow profile's effective word is `vol:high` |
+
+  `vol:normal` and UNKNOWN are `0` **by construction** — there is no key
+  for them, because the §3.3 fit measured everything else against
+  `vol:normal` as the baseline. The two profiles' offsets ADD. A value
+  past ±`VRP_THETA_MAX_1E9` is REFUSED at boot: an intercept larger than
+  the widest legal θ is a units error, not a correction.
+
+  **The live file sets none of these**, so P4 changes no decision until
+  an operator adds them. The four values above are the ones to paste.
+
+- **The §3.3 target is log realised VOL, not log variance.** Confirmed
+  from the regime-edge source before a line was written:
+  `rg_lib.fwd_rv` returns `sqrt(Σ r²)` and `rg_har.build` takes its
+  `log`. The coefficients therefore enter `vrp.toml` **unhalved**. Had
+  the fit been on log variance every number above would be half what it
+  is, and nothing in the engine could have told the difference — which
+  is why this sentence exists.
+
+- **`core_vol::VolEngine` gains `bounds_with_offset` and
+  `arm_hold_at_with_offset`**; `bounds`/`arm_hold_at` delegate with `0`
+  and are unchanged. The QLIKE comparison scores the **offset** forecast
+  (`pend_ln_sigma += off` at arm): kill criterion 3 exists to judge the
+  forecaster the member actually decided on, and arming on the
+  uncorrected `ln σ̂` would score one nobody is running. Mirrored in
+  `claude_worker.vol_ref` (`bounds_with_offset`, `arm_hold_with_offset`)
+  and pinned by the shared fixture, which gains an `O <off_1e9>` op —
+  sticky, `0` for every row written before P4, so rows 0–16 of
+  `parity-1.expected.tsv` are byte-identical.
+
+- **OPERATOR-VISIBLE — settlement now prices at the venue's DELIVERY
+  TWAP.** Deribit settles a daily expiry on the average of its index
+  over the 30 minutes before expiry, not on the last print. Both the
+  member and the harness now accumulate `Σ px·dt / Σ dt` over
+  `[expiry − 30 min, expiry)`, each sample carrying the wall gap BEHIND
+  it capped at 60 s, and settle on that average whenever the window
+  carries at least **10 minutes** of samples. Below the floor the P0 law
+  (the last index at/before expiry) still prices it, and says so:
+  counter `engine_vrp_settle_index_fallback_total`, and `settle=last`
+  instead of `settle=twap30` on the harness's per-contract line. A
+  restart INSIDE the window loses the accumulator, which shows up as a
+  fallback rather than as a silent change of law.
+
+  **V0 (a) — the documented proxy.** Both sides average the option
+  record's `underlying_px_1e9`, which is the expiry's **FORWARD**, not
+  the index Deribit delivers against; the engine does not capture the
+  index. Measured basis: **−2.2 bps**. Harness and member use the same
+  proxy, so they agree with each other, and both are biased the same way
+  against the venue.
+
+- **The decision runs on the MEDIAN implied vol of the selection
+  window**, not on whatever the venue published at E−τ. The member keeps
+  the selected contract's last 64 `mark_iv_1e9` prints in a wrapping
+  ring and takes the lower median of the filled prefix (stack copy,
+  insertion sort, once per campaign — gate 49 pins zero allocations).
+  One decision per campaign used to ride on one print, and a single wide
+  quote at the decision instant was enough to open or close it. Below 8
+  samples there is no median to take: the last print decides and
+  `engine_vrp_iv_median_fallback_total` moves.
+
+- **The comparison runs at a COST-AWARE band.** `θ` itself is never
+  changed (edge spec §2.2); the band the comparison uses is
+  `θ + ln((premium + c)/premium)` where `c` is the half-spread of the
+  option's own touch plus `min(opt_fee_index_bps × index,
+  opt_fee_prem_bps × premium)/1e4`. R4b's diagnosis is that the side
+  call is 78 % right and still loses 8.4 bps because fees are 13–50 % of
+  the premium — so a campaign the cost cannot pay for is not an edge,
+  and `engine_vrp_holds_cost_total` counts exactly the HOLDs that θ
+  ALONE would have traded. **This tightens live behaviour with the live
+  file unchanged**: at the current fee keys a decision must clear roughly
+  8 % more than θ alone asked for. That is the intended effect and the
+  only P4 item that moves a live number without an operator edit.
+
+**Ripple**
+
+- New counters on `strategy_core::VrpCounters` (and therefore on the
+  `backtest --member vrp` counters line and the `engine_vrp_*` family):
+  `settle_index_fallback`, `iv_median_fallback`, `holds_cost`. New gauge
+  `engine_vrp_regime_offset_1e6` = the intercept in force at the last
+  decision. New boot tell `vrp: regime intercepts` prints the four
+  effective values — an all-zero table is bit-identical to no table, so
+  the tell is the only way to tell a loaded correction from a missing
+  one.
+- `strategy-set`: `push_vm_regime_view` → `push_regime_views`, now
+  pushing the view to the vrp member as well as the vm (three call
+  sites: boot, gate refresh, minute roll). Same cadence as before —
+  minute roll, effective change, declaration; never per tick.
+- Harness: `OptSettleRef` gains the accumulator and `observe()`, which
+  is now the ONE place both settlement laws live; `audit-pnl` and
+  `backtest` print `settle=twap30|last` with the covered seconds per
+  contract. `HarnessStats` is `Copy` by design, so the per-contract
+  lines travel in a new `SummaryExtras` bundle rather than in it.
+- `crates/cli/src/backtest/opt.rs` restates the three delivery-window
+  constants (the harness must not depend on a strategy crate);
+  `the_delivery_window_matches_the_members` holds the two copies
+  together.
+- Gate 49 `vrp_member_p4_decision_paths_are_zero_alloc` — the regime
+  push on a minute cadence, the ring, the median sort, the TWAP and the
+  cost term over a whole campaign: 0 allocations, 0 B.
+
+**No action required** unless you want the regime correction: add the
+four keys above to `~/multivenue/vrp.toml`. Everything else takes effect
+at the next boot.
+
 ## 2026-09-12 — `vrp.toml` gains the EXECUTION modes; the hedge now RESTS by default (VRP P3 / R1, R2)
 
 **What changed**
