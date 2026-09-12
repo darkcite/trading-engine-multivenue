@@ -274,6 +274,16 @@ pub struct FamilyState {
     pub notional_instance_1e6: i64,
     /// The `p̂` the resting quotes were built from ×1e6, per side.
     pub last_quote_p_1e6: [i64; QUOTE_SIDES],
+    /// BIN15 O6: the standardised distance the last reprice priced at
+    /// ×1e6 (the pricer's `d`, already clamped).
+    pub d_1e6: i64,
+    /// BIN15 O6: σ√τ ×1e9 behind that `d` — a small denominator is
+    /// what an overconfident forecast looks like.
+    pub den_1e9: i64,
+    /// BIN15 O6: the mark the last reprice used ×1e6.
+    pub mark_1e6: i64,
+    /// BIN15 O6: the pricing horizon the last reprice used, ns.
+    pub last_tau_ns: u64,
 }
 
 impl Default for FamilyState {
@@ -297,6 +307,10 @@ impl Default for FamilyState {
             pend_quote: [PendingLeg::default(); QUOTE_SIDES],
             notional_instance_1e6: 0,
             last_quote_p_1e6: [0; QUOTE_SIDES],
+            d_1e6: 0,
+            den_1e9: 0,
+            mark_1e6: 0,
+            last_tau_ns: 0,
         }
     }
 }
@@ -327,6 +341,13 @@ impl FamilyState {
         self.pend_quote = [PendingLeg::default(); QUOTE_SIDES];
         self.notional_instance_1e6 = 0;
         self.last_quote_p_1e6 = [0; QUOTE_SIDES];
+        // BIN15 O6: the diagnostics describe the instance that is
+        // going away, so they go with it — a stale `d` read against
+        // the successor's strike is worse than no reading at all.
+        self.d_1e6 = 0;
+        self.den_1e9 = 0;
+        self.mark_1e6 = 0;
+        self.last_tau_ns = 0;
     }
 }
 
@@ -1073,6 +1094,13 @@ impl Bin15Strategy {
         self.fam[idx].p_hat_1e6 = fair.p_hat_1e6;
         self.fam[idx].p_raw_1e6 = fair.p_raw_1e6;
         self.fam[idx].p_ts_ns = now;
+        // BIN15 O6: every input the fair value was built from, kept
+        // for `/metrics`. Four stores on a path that already wrote
+        // three; no allocation and no branch.
+        self.fam[idx].d_1e6 = fair.d_1e6;
+        self.fam[idx].den_1e9 = fair.den_1e9;
+        self.fam[idx].mark_1e6 = mark;
+        self.fam[idx].last_tau_ns = tau_ns;
         self.counters.reprices = self.counters.reprices.wrapping_add(1);
         self.arm_take(ctx, idx, tau_ns, now);
         if self.params.maker_enabled == 1 {
@@ -1565,10 +1593,16 @@ impl StrategyCounters for Bin15Strategy {
         while i < n {
             out[i] = strategy_core::Bin15FamilyView {
                 live_outcome: self.fam[i].live.outcome,
-                _pad: [0; 4],
+                tau_s: u32::try_from(self.fam[i].last_tau_ns / 1_000_000_000)
+                    .unwrap_or(u32::MAX),
                 p_hat_1e6: self.fam[i].p_hat_1e6,
                 pos_yes_1e6: self.fam[i].pos_yes_1e6,
                 pos_no_1e6: self.fam[i].pos_no_1e6,
+                p_raw_1e6: self.fam[i].p_raw_1e6,
+                strike_1e6: self.fam[i].live.strike_1e6,
+                mark_1e6: self.fam[i].mark_1e6,
+                d_1e6: self.fam[i].d_1e6,
+                den_1e9: self.fam[i].den_1e9,
             };
             i += 1;
         }
@@ -2382,9 +2416,10 @@ mod tests {
         m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
         let fam = m.family(0).expect("f");
         assert!(fam.p_ts_ns != 0, "the instance priced");
-        // With a LINEAR Φ, `p_raw` pins `d` exactly — it is the only
-        // place `d` is observable without widening the member's state
-        // for a test's benefit.
+        // With a LINEAR Φ, `p_raw` pins `d` exactly. (BIN15 O6 also
+        // publishes `d` and its denominator outright — see the test
+        // below — but this assertion stays on `p_raw` because that is
+        // the number the SCALE bug moved.)
         assert!(
             (690_000..=705_000).contains(&fam.p_raw_1e6),
             "p_raw {} — a 25 bps lead at 1.6σ must not price like a coin flip",
@@ -2394,6 +2429,59 @@ mod tests {
             fam.p_hat_1e6, fam.p_raw_1e6,
             "the identity recalibration leaves it alone"
         );
+    }
+
+    /// BIN15 O6: a repriced family publishes every input behind its
+    /// fair value, and drops them when the instance settles.
+    ///
+    /// The sibling test above can only infer `d` from `p_raw`, and
+    /// says so. These gauges are that gap closed. The reason they
+    /// exist: on 2026-09-12 a live `p̂` sat at exactly 1e6 for minutes
+    /// and nothing on the box could say whether σ̂ was too small or the
+    /// move was real — answering it took an offline replay.
+    #[test]
+    fn a_repriced_family_publishes_every_input_and_drops_them_at_settle() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        // Same σ̂ and geometry as the scale test above.
+        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
+        m.on_venue_event(
+            &roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false),
+            &mut c,
+        );
+        m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
+
+        let mut view = [strategy_core::Bin15FamilyView::default(); 8];
+        let n = m.bin15_families_view(&mut view) as usize;
+        assert!(n >= 1, "the configured family is in the view");
+        let v = view[0];
+        let fam = *m.family(0).expect("f");
+        assert_eq!(v.live_outcome, 2650);
+        assert_eq!(v.strike_1e6, 79_000_000_000, "the instance's threshold");
+        assert_eq!(v.mark_1e6, 79_197_500_000, "the mark the reprice used");
+        // τ = 600 s expiry − the 62 s mark, plus a third of a zero TWAP.
+        assert_eq!(v.tau_s, 538);
+        assert!(v.den_1e9 > 0, "σ√τ must be readable, not inferred");
+        assert!(v.d_1e6 > 0, "a mark above the strike is a positive d");
+        assert_eq!(v.p_raw_1e6, fam.p_raw_1e6);
+        assert_eq!(v.p_hat_1e6, fam.p_hat_1e6);
+        // The published pair reproduces the published `d`: that is the
+        // whole point — a reader can redo the member's division.
+        let x_1e9 = price::log_moneyness_1e9(v.mark_1e6, v.strike_1e6).expect("x");
+        let redone = (i128::from(x_1e9) * 1_000_000) / i128::from(v.den_1e9);
+        assert_eq!(redone as i64, v.d_1e6, "d = x / (σ√τ), both published");
+
+        // Settle: the diagnostics describe the instance, so they go
+        // with it. A denominator left behind would read as a live one.
+        m.on_venue_event(&roll_event(0, 2650, 0, 0, 0, true), &mut c);
+        let n = m.bin15_families_view(&mut view) as usize;
+        assert!(n >= 1);
+        assert_eq!(view[0].live_outcome, 0, "dormant");
+        assert_eq!(view[0].den_1e9, 0);
+        assert_eq!(view[0].mark_1e6, 0);
+        assert_eq!(view[0].strike_1e6, 0);
+        assert_eq!(view[0].d_1e6, 0);
+        assert_eq!(view[0].tau_s, 0);
     }
 
     #[test]

@@ -940,9 +940,13 @@ pub const BIN15_VIEW_FAMILIES: usize = 8;
 
 /// One BIN15 family as `/metrics` reads it (O4b). POD.
 ///
-/// The four numbers an operator watching a live member needs: WHICH
-/// instance a slot holds, what the member thinks it is worth, and what
-/// it holds of each leg. `live_outcome == 0` is a dormant slot, which
+/// What an operator watching a live member needs: WHICH instance a
+/// slot holds, what the member thinks it is worth, what it holds of
+/// each leg, and — since BIN15 O6 — every input the fair value was
+/// built from (`mark`, `strike`, `tau_s`, `den_1e9`) plus the `d_1e6`
+/// and `p_raw_1e6` between them. Those six exist so that a `p̂`
+/// sitting at 0 or 1e6 can be explained from `/metrics` alone;
+/// before them it took an offline replay. `live_outcome == 0` is a dormant slot, which
 /// is a level and not an error — a family with no instance on the
 /// venue is the normal state of six of the eight.
 #[repr(C)]
@@ -950,14 +954,28 @@ pub const BIN15_VIEW_FAMILIES: usize = 8;
 pub struct Bin15FamilyView {
     /// The venue's own id for the live instance; `0` = dormant.
     pub live_outcome: u32,
-    /// Explicit padding — always zero.
-    pub _pad: [u8; 4],
+    /// Whole seconds of pricing horizon at the last reprice (time to
+    /// expiry plus a third of the settlement TWAP window). `0` when
+    /// the family has never priced.
+    pub tau_s: u32,
     /// Last fair value ×1e6.
     pub p_hat_1e6: i64,
     /// Yes contracts held ×1e6, from fills.
     pub pos_yes_1e6: i64,
     /// No contracts held ×1e6, from fills.
     pub pos_no_1e6: i64,
+    /// BIN15 O6: last RAW (pre-recalibration) fair value ×1e6.
+    /// Against `p_hat_1e6` it says what the recal table did.
+    pub p_raw_1e6: i64,
+    /// BIN15 O6: the live instance's threshold ×1e6; `0` when dormant.
+    pub strike_1e6: i64,
+    /// BIN15 O6: the underlying mark the last reprice used ×1e6.
+    pub mark_1e6: i64,
+    /// BIN15 O6: the standardised distance to the strike ×1e6 — the
+    /// `z` the Φ lookup was taken at, clamped as the pricer clamps it.
+    pub d_1e6: i64,
+    /// BIN15 O6: σ√τ ×1e9, the denominator behind `d_1e6`.
+    pub den_1e9: i64,
 }
 
 /// One entered XSD position as the cli persists it (`xsd-state.tsv`)

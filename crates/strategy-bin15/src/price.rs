@@ -195,6 +195,14 @@ pub struct Fair {
     pub p_raw_1e6: i64,
     /// The standardised distance to the strike ×1e6, clamped.
     pub d_1e6: i64,
+    /// BIN15 O6: σ√τ ×1e9 — the denominator `d_1e6` was divided by.
+    ///
+    /// Carried out of the pricer so a LIVE reader can separate an
+    /// overconfident forecast (a small denominator) from a genuine
+    /// move (a large numerator). Without it, a `p̂` pinned at 0 or
+    /// 1e6 is indistinguishable between the two, and telling them
+    /// apart previously needed an offline replay of the run.
+    pub den_1e9: i64,
 }
 
 /// Price one binary.
@@ -246,6 +254,7 @@ pub fn fair_value(
         p_hat_1e6: p_hat_1e6.clamp(0, 1_000_000),
         p_raw_1e6,
         d_1e6,
+        den_1e9,
     })
 }
 

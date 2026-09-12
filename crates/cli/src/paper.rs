@@ -4552,8 +4552,10 @@ pub struct Bin15MetricIds {
 /// `strategy_core::BIN15_VIEW_FAMILIES` and ruling O-Q7's eight.
 pub const BIN15_METRIC_FAMILIES: usize = strategy_core::BIN15_VIEW_FAMILIES;
 
-/// Gauges per family.
-pub const BIN15_FAMILY_GAUGES: usize = 4;
+/// Gauges per family. BIN15 O6 raised this from 4: the first four
+/// say WHAT the member believes, the six added say WHY, so a
+/// pinned `p̂` is explainable from a scrape instead of a replay.
+pub const BIN15_FAMILY_GAUGES: usize = 10;
 
 /// The per-family gauge names, written out rather than formatted.
 ///
@@ -4567,48 +4569,96 @@ const BIN15_GAUGE_NAMES: [[&str; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES] = 
         "engine_bin15_f0_pos_yes_1e6",
         "engine_bin15_f0_pos_no_1e6",
         "engine_bin15_f0_live_outcome",
+        "engine_bin15_f0_p_raw_1e6",
+        "engine_bin15_f0_strike_1e6",
+        "engine_bin15_f0_mark_1e6",
+        "engine_bin15_f0_d_1e6",
+        "engine_bin15_f0_den_1e9",
+        "engine_bin15_f0_tau_s",
     ],
     [
         "engine_bin15_f1_p_hat_1e6",
         "engine_bin15_f1_pos_yes_1e6",
         "engine_bin15_f1_pos_no_1e6",
         "engine_bin15_f1_live_outcome",
+        "engine_bin15_f1_p_raw_1e6",
+        "engine_bin15_f1_strike_1e6",
+        "engine_bin15_f1_mark_1e6",
+        "engine_bin15_f1_d_1e6",
+        "engine_bin15_f1_den_1e9",
+        "engine_bin15_f1_tau_s",
     ],
     [
         "engine_bin15_f2_p_hat_1e6",
         "engine_bin15_f2_pos_yes_1e6",
         "engine_bin15_f2_pos_no_1e6",
         "engine_bin15_f2_live_outcome",
+        "engine_bin15_f2_p_raw_1e6",
+        "engine_bin15_f2_strike_1e6",
+        "engine_bin15_f2_mark_1e6",
+        "engine_bin15_f2_d_1e6",
+        "engine_bin15_f2_den_1e9",
+        "engine_bin15_f2_tau_s",
     ],
     [
         "engine_bin15_f3_p_hat_1e6",
         "engine_bin15_f3_pos_yes_1e6",
         "engine_bin15_f3_pos_no_1e6",
         "engine_bin15_f3_live_outcome",
+        "engine_bin15_f3_p_raw_1e6",
+        "engine_bin15_f3_strike_1e6",
+        "engine_bin15_f3_mark_1e6",
+        "engine_bin15_f3_d_1e6",
+        "engine_bin15_f3_den_1e9",
+        "engine_bin15_f3_tau_s",
     ],
     [
         "engine_bin15_f4_p_hat_1e6",
         "engine_bin15_f4_pos_yes_1e6",
         "engine_bin15_f4_pos_no_1e6",
         "engine_bin15_f4_live_outcome",
+        "engine_bin15_f4_p_raw_1e6",
+        "engine_bin15_f4_strike_1e6",
+        "engine_bin15_f4_mark_1e6",
+        "engine_bin15_f4_d_1e6",
+        "engine_bin15_f4_den_1e9",
+        "engine_bin15_f4_tau_s",
     ],
     [
         "engine_bin15_f5_p_hat_1e6",
         "engine_bin15_f5_pos_yes_1e6",
         "engine_bin15_f5_pos_no_1e6",
         "engine_bin15_f5_live_outcome",
+        "engine_bin15_f5_p_raw_1e6",
+        "engine_bin15_f5_strike_1e6",
+        "engine_bin15_f5_mark_1e6",
+        "engine_bin15_f5_d_1e6",
+        "engine_bin15_f5_den_1e9",
+        "engine_bin15_f5_tau_s",
     ],
     [
         "engine_bin15_f6_p_hat_1e6",
         "engine_bin15_f6_pos_yes_1e6",
         "engine_bin15_f6_pos_no_1e6",
         "engine_bin15_f6_live_outcome",
+        "engine_bin15_f6_p_raw_1e6",
+        "engine_bin15_f6_strike_1e6",
+        "engine_bin15_f6_mark_1e6",
+        "engine_bin15_f6_d_1e6",
+        "engine_bin15_f6_den_1e9",
+        "engine_bin15_f6_tau_s",
     ],
     [
         "engine_bin15_f7_p_hat_1e6",
         "engine_bin15_f7_pos_yes_1e6",
         "engine_bin15_f7_pos_no_1e6",
         "engine_bin15_f7_live_outcome",
+        "engine_bin15_f7_p_raw_1e6",
+        "engine_bin15_f7_strike_1e6",
+        "engine_bin15_f7_mark_1e6",
+        "engine_bin15_f7_d_1e6",
+        "engine_bin15_f7_den_1e9",
+        "engine_bin15_f7_tau_s",
     ],
 ];
 
@@ -4757,6 +4807,16 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         reg.gauge(ids.families[f][1]).set(v.pos_yes_1e6);
         reg.gauge(ids.families[f][2]).set(v.pos_no_1e6);
         reg.gauge(ids.families[f][3]).set(i64::from(v.live_outcome));
+        // BIN15 O6: the inputs. `d_1e6` and `den_1e9` are the pair that
+        // separates "the move was real" from "the forecast was
+        // overconfident"; `mark`/`strike`/`tau_s` let the reader
+        // recompute `d` by hand and check the member's arithmetic.
+        reg.gauge(ids.families[f][4]).set(v.p_raw_1e6);
+        reg.gauge(ids.families[f][5]).set(v.strike_1e6);
+        reg.gauge(ids.families[f][6]).set(v.mark_1e6);
+        reg.gauge(ids.families[f][7]).set(v.d_1e6);
+        reg.gauge(ids.families[f][8]).set(v.den_1e9);
+        reg.gauge(ids.families[f][9]).set(i64::from(v.tau_s));
         f += 1;
     }
 }
@@ -7964,14 +8024,23 @@ mod tests {
     /// that needs more than that has to raise `MAX_COUNTERS` rather than
     /// discover `RegErr::Full` at a live boot, which is a refused
     /// registration and therefore a refused boot.
+    ///
+    /// BIN15 O6 took the per-family levels from 4 to 10, so this block
+    /// is 80 gauges. Measured on the live engine the same day: 200
+    /// gauges in use before the change, 248 after — **136 of headroom
+    /// left**, and the counter side did not move.
     #[test]
-    fn the_bin15_family_is_22_counters_and_32_gauges() {
+    fn the_bin15_family_is_22_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
         assert_eq!(reg.counters_len() - before_c, 22, "the counter block");
-        assert_eq!(reg.gauges_len() - before_g, 32, "8 families x 4 levels");
+        assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
+        assert!(
+            reg.gauges_len() <= core_metrics::MAX_GAUGES,
+            "the block must fit the fixed registry"
+        );
         // Every per-family gauge is a DISTINCT name: a copy-paste that
         // reused one would silently publish two families as one.
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -7988,7 +8057,7 @@ mod tests {
             }
             f += 1;
         }
-        assert_eq!(seen.len(), 32);
+        assert_eq!(seen.len(), 80);
         // And the ids are usable: a level written is a level read back.
         reg.gauge(ids.families[7][3]).set(2650);
         assert_eq!(reg.gauge(ids.families[7][3]).get(), 2650);
@@ -8033,18 +8102,33 @@ mod tests {
         f.c.takes_filled = 2;
         f.view[0] = strategy_core::Bin15FamilyView {
             live_outcome: 2650,
-            _pad: [0; 4],
+            tau_s: 640,
             p_hat_1e6: 894_000,
             pos_yes_1e6: 100_000_000,
             pos_no_1e6: 0,
+            p_raw_1e6: 857_000,
+            strike_1e6: 77_131_000_000,
+            mark_1e6: 77_170_500_000,
+            d_1e6: 1_240_000,
+            den_1e9: 318_000,
         };
         mirror_bin15_metrics(&reg, &ids, &f, &mut last);
         assert_eq!(reg.counter(ids.reprices).get(), 7);
         assert_eq!(reg.counter(ids.takes_filled).get(), 2);
         assert_eq!(reg.gauge(ids.families[0][0]).get(), 894_000);
         assert_eq!(reg.gauge(ids.families[0][3]).get(), 2650);
+        // BIN15 O6: the six that explain the fair value. `p_raw` under
+        // `p_hat` is the recal table sharpening the forecast, which is
+        // exactly the effect the live gauges exist to show.
+        assert_eq!(reg.gauge(ids.families[0][4]).get(), 857_000);
+        assert_eq!(reg.gauge(ids.families[0][5]).get(), 77_131_000_000);
+        assert_eq!(reg.gauge(ids.families[0][6]).get(), 77_170_500_000);
+        assert_eq!(reg.gauge(ids.families[0][7]).get(), 1_240_000);
+        assert_eq!(reg.gauge(ids.families[0][8]).get(), 318_000);
+        assert_eq!(reg.gauge(ids.families[0][9]).get(), 640);
         // Families the member does not configure stay at zero.
         assert_eq!(reg.gauge(ids.families[5][3]).get(), 0);
+        assert_eq!(reg.gauge(ids.families[5][8]).get(), 0, "no denominator, no reading");
         // A second mirror with the SAME cumulative counters adds
         // nothing: the block publishes deltas, not the totals.
         mirror_bin15_metrics(&reg, &ids, &f, &mut last);
