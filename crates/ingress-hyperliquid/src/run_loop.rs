@@ -688,6 +688,13 @@ fn perform_roll<C: Capture>(
         drv.roll_status.inc_rolls();
         drv.roll_status
             .set_dormant(drv.families.dormant_count() as u64);
+    } else {
+        // BIN15 O7: a settled instance stops publishing while keeping
+        // its coins bound, so the staleness monitor must stop judging
+        // it until the successor rebinds (which calls `reset`). See
+        // `HlStaleness::unwatch`.
+        drv.staleness.unwatch(coin_idx[0]);
+        drv.staleness.unwatch(coin_idx[1]);
     }
 
     // (e) The offline record: which instance this slot means from now.
@@ -863,7 +870,7 @@ pub fn session_health(drv: &mut Driver, status: &IngressStatus, now_ns: u64) -> 
     if !drv.verified {
         if drv.found == drv.expected && drv.found_global == drv.expected_global {
             drv.verified = true;
-            drv.staleness.arm(now_ns, drv.coins.len());
+            drv.staleness.arm(now_ns, &drv.coins);
         } else if now_ns.saturating_sub(drv.steady_since_ns) > drv.sub_ack_budget_ns {
             return Some(RunResult::Error);
         }
@@ -2185,7 +2192,7 @@ mod tests {
         let t0 = now_ns();
         d.staleness = HlStaleness::new(crate::HL_STALENESS_BUDGET_NS);
         d.staleness
-            .arm(t0.saturating_sub(crate::HL_STALENESS_BUDGET_NS), 2);
+            .arm(t0.saturating_sub(crate::HL_STALENESS_BUDGET_NS), &d.coins);
 
         inject_text(
             &mut t,
@@ -2607,7 +2614,7 @@ mod tests {
         let mut d = verified_driver();
         // Tiny staleness budget so the armed monitor trips fast.
         d.staleness = HlStaleness::new(1);
-        d.staleness.arm(now_ns(), 2);
+        d.staleness.arm(now_ns(), &d.coins);
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let stop = StopFlag::new(false);

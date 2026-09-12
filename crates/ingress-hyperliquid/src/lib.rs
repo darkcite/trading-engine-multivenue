@@ -929,6 +929,19 @@ impl HlCoinTable {
         self.len
     }
 
+    /// Whether row `idx` NAMES a venue instrument.
+    ///
+    /// A row that [`Self::reserve`] created for a dormant rolling
+    /// family names nothing until [`Self::rebind`] writes one, and is
+    /// skipped by [`Self::lookup`], [`expected_mask`] and the run
+    /// loop's subscribe sweep for exactly that reason — it is not on
+    /// the wire, so nothing about it can ever arrive.
+    #[inline]
+    #[must_use]
+    pub fn is_named(&self, idx: usize) -> bool {
+        idx < self.len && self.rows[idx].0 != 0
+    }
+
     /// Whether the table is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -1030,9 +1043,18 @@ pub struct HlStaleness {
     budget_ns: u64,
     n: usize,
     armed: bool,
+    /// BIN15 O7: bit `i` set ⇔ row `i` NAMES an instrument and is
+    /// therefore judged. See [`Self::arm`].
+    watched: u32,
     last_venue_ts_ns: [u64; HL_MAX_COINS],
     last_advance_ns: [u64; HL_MAX_COINS],
 }
+
+// `watched` is a u32 bitmask over the coin table.
+const _: () = assert!(
+    HL_MAX_COINS <= 32,
+    "HlStaleness::watched is a u32 — widen it with HL_MAX_COINS"
+);
 
 impl HlStaleness {
     /// New, disarmed monitor with the given budget.
@@ -1041,21 +1063,42 @@ impl HlStaleness {
             budget_ns,
             n: 0,
             armed: false,
+            watched: 0,
             last_venue_ts_ns: [0; HL_MAX_COINS],
             last_advance_ns: [0; HL_MAX_COINS],
         }
     }
 
-    /// Arm for `n_coins` coins with `now_ns` as every coin's
-    /// baseline (all subscriptions just verified).
-    pub fn arm(&mut self, now_ns: u64, n_coins: usize) {
-        debug_assert!(n_coins <= HL_MAX_COINS);
-        self.n = n_coins.min(HL_MAX_COINS);
+    /// Arm over `coins` with `now_ns` as every coin's baseline (all
+    /// subscriptions just verified).
+    ///
+    /// BIN15 O7 — **only rows that NAME an instrument are judged.**
+    /// A row reserved for a dormant rolling family is not subscribed
+    /// (`HlCoinTable::reserve`'s own contract), so no `l2Book` can
+    /// ever arrive for it and its deadline passes at `arm + budget`
+    /// by construction, every time, for as long as the family stays
+    /// dormant. Watching one cost the 2026-09-12 BIN15 go-live: the
+    /// eight rolling families reserved sixteen slots, three families
+    /// had no live instance, and the six empty rows tripped the WHOLE
+    /// connection on a **11.5 s metronome** (the 10 s budget plus the
+    /// reconnect) — 279 trips in one hour against 1-5 per DAY before
+    /// them, cascading into venue-side closes. The monitor exists to
+    /// catch a subscription that died, and a row that was never on
+    /// the wire cannot have died. A row joins the watch set when
+    /// [`Self::reset`] marks it rebound.
+    pub fn arm(&mut self, now_ns: u64, coins: &HlCoinTable) {
+        let n = coins.len().min(HL_MAX_COINS);
+        debug_assert!(coins.len() <= HL_MAX_COINS);
+        self.n = n;
         self.armed = true;
+        self.watched = 0;
         let mut i = 0;
-        while i < self.n {
+        while i < n {
             self.last_venue_ts_ns[i] = 0;
             self.last_advance_ns[i] = now_ns;
+            if coins.is_named(i) {
+                self.watched |= 1u32 << i;
+            }
             i += 1;
         }
     }
@@ -1074,12 +1117,36 @@ impl HlStaleness {
         }
         self.last_venue_ts_ns[coin_idx] = 0;
         self.last_advance_ns[coin_idx] = now_ns;
+        // BIN15 O7: a reset follows a rebind, so the row names an
+        // instrument now even if it was reserved and empty at `arm`.
+        // This is how a family that was dormant at boot starts being
+        // judged the moment it goes live.
+        self.watched |= 1u32 << coin_idx;
+    }
+
+    /// BIN15 O7: stop judging one row without disturbing its stamps.
+    ///
+    /// For a SETTLED rolling instance. It stops publishing but keeps
+    /// its coins bound and subscribed — unsubscribing would open a
+    /// window with no subscription for no gain — so from the
+    /// monitor's side it is indistinguishable from a dead feed.
+    /// Judging it would condemn the session for the whole interval
+    /// between settlement and the successor's `outcomeCreated`, and
+    /// forever when no successor comes, which is how a family ends.
+    /// [`Self::reset`] puts the row back under watch when the
+    /// successor binds. Out-of-range or disarmed is a no-op.
+    pub fn unwatch(&mut self, coin_idx: usize) {
+        if !self.armed || coin_idx >= self.n {
+            return;
+        }
+        self.watched &= !(1u32 << coin_idx);
     }
 
     /// Disarm (reconnect teardown).
     pub fn disarm(&mut self) {
         self.armed = false;
         self.n = 0;
+        self.watched = 0;
     }
 
     /// Whether the monitor is armed.
@@ -1110,7 +1177,10 @@ impl HlStaleness {
         }
         let mut i = 0;
         while i < self.n {
-            if now_ns.saturating_sub(self.last_advance_ns[i]) > self.budget_ns {
+            // BIN15 O7: an unwatched row names no instrument.
+            if self.watched & (1u32 << i) != 0
+                && now_ns.saturating_sub(self.last_advance_ns[i]) > self.budget_ns
+            {
                 return Some(i);
             }
             i += 1;
@@ -1630,10 +1700,65 @@ mod tests {
         );
     }
 
+    /// `n` NAMED coins — what the monitor is meant to judge.
+    pub(crate) fn named_coins(n: usize) -> HlCoinTable {
+        let mut t = HlCoinTable::new();
+        let mut i = 0usize;
+        while i < n {
+            let name = [b'C', b'0' + (i as u8)];
+            t.insert(&name, 100 + i as SymbolId).expect("insert");
+            i += 1;
+        }
+        t
+    }
+
+    /// BIN15 O7: the go-live regression, as a test.
+    ///
+    /// A dormant rolling family's row is RESERVED — bound to a
+    /// `SymbolId` so the sym is stable, naming no venue instrument,
+    /// and deliberately absent from the subscribe sweep. Nothing can
+    /// ever arrive for it, so judging it means tripping the whole
+    /// connection at `arm + budget` on a metronome. That is what
+    /// happened on 2026-09-12: six reserved rows behind three dormant
+    /// families trip-looped Hyperliquid every 11.5 s.
+    #[test]
+    fn a_reserved_row_is_never_stale_until_it_is_rebound() {
+        let mut coins = named_coins(1);
+        let reserved = coins.reserve(4242).expect("reserve");
+        assert!(coins.is_named(0), "the perp names an instrument");
+        assert!(!coins.is_named(reserved), "the dormant slot names none");
+
+        let mut s = HlStaleness::new(1_000);
+        s.arm(10_000, &coins);
+        // Far past the budget with NOTHING delivered: the named coin
+        // is stale, the reserved one is not — and must not be, or it
+        // alone would condemn the session forever.
+        assert_eq!(s.first_stale(99_999), Some(0), "the named coin is judged");
+        s.on_l2book(0, 1, 99_999);
+        assert_eq!(
+            s.first_stale(100_100),
+            None,
+            "a reserved row must never trip the connection"
+        );
+
+        // The family goes live: rebind + reset brings it under watch.
+        coins.rebind(reserved, b"@2750").expect("rebind");
+        s.reset(reserved, 100_100);
+        assert_eq!(s.first_stale(100_500), None, "inside budget");
+        // Keep the named coin fresh so the next assertion can only be
+        // about the row that just went live.
+        s.on_l2book(0, 2, 100_900);
+        assert_eq!(
+            s.first_stale(101_200),
+            Some(reserved),
+            "once live it is judged like any other coin"
+        );
+    }
+
     #[test]
     fn staleness_reset_rebaselines_one_coin_only() {
         let mut s = HlStaleness::new(1_000);
-        s.arm(10_000, 2);
+        s.arm(10_000, &named_coins(2));
         s.on_l2book(0, 1, 10_000);
         s.on_l2book(1, 1, 10_000);
         // Both coins go stale at the same instant.
@@ -1683,7 +1808,7 @@ mod tests {
     fn staleness_fires_only_when_armed_and_budget_exceeded() {
         let mut s = HlStaleness::new(1_000);
         assert_eq!(s.first_stale(u64::MAX), None, "disarmed never fires");
-        s.arm(10_000, 2);
+        s.arm(10_000, &named_coins(2));
         assert!(s.is_armed());
         assert_eq!(s.first_stale(10_500), None, "inside budget");
         assert_eq!(s.first_stale(11_001), Some(0), "budget exceeded");
@@ -1697,7 +1822,7 @@ mod tests {
     #[test]
     fn staleness_ignores_non_advancing_venue_time() {
         let mut s = HlStaleness::new(1_000);
-        s.arm(0, 1);
+        s.arm(0, &named_coins(1));
         s.on_l2book(0, 5_000, 500);
         // Same venue time again much later — deadline must NOT refresh.
         s.on_l2book(0, 5_000, 900);
@@ -1829,7 +1954,7 @@ mod proptests {
         ) {
             let budget = step_ns * 2;
             let mut s = HlStaleness::new(budget);
-            s.arm(0, 1);
+            s.arm(0, &crate::tests::named_coins(1));
             let mut now = 0u64;
             let mut venue = 0u64;
             let mut k = 0;
