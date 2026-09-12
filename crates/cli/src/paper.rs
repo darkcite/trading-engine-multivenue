@@ -2326,46 +2326,6 @@ pub fn engine_loop_ev_full<D: OrderDispatch>(
     run_engine_loop(cons, disp, strat, obs)
 }
 
-/// Run Strategy C (cross-market arbitrage). `groups` is a flat
-/// `&[&[SymbolId]]`, one group per outer slice. Up to 8 groups of
-/// up to 8 members each.
-pub fn engine_loop_cross_arb_full<D: OrderDispatch>(
-    cons: Consumers,
-    cfg: EngineConfig,
-    disp: D,
-    obs: Observability,
-    groups: &[&[core_types::SymbolId]],
-) -> EngineLoopResult {
-    if groups.is_empty() {
-        return EngineLoopResult::Failed("engine_loop_cross_arb: no groups configured");
-    }
-    let mut strat: strategy_cross_arb::CrossArb<8, 8> = strategy_cross_arb::CrossArb::new();
-    if let Err(reason) = configure_cross_arb(&mut strat, &cfg, groups) {
-        return EngineLoopResult::Failed(reason);
-    }
-    run_engine_loop(cons, disp, strat, obs)
-}
-
-/// Configure a cross-arb instance (params + groups). Shared by the
-/// standalone path and the Phase-8f set builder.
-fn configure_cross_arb<const N: usize, const M: usize>(
-    strat: &mut strategy_cross_arb::CrossArb<N, M>,
-    cfg: &EngineConfig,
-    groups: &[&[core_types::SymbolId]],
-) -> Result<(), &'static str> {
-    strat.set_threshold(cfg.threshold_1e6);
-    strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
-    strat.set_cooldown_ns(cfg.cooldown_ns);
-    for g in groups {
-        if let Err(e) = strat.register_group(g) {
-            tracing::error!(error = ?e, "cross-arb: register_group failed");
-            return Err("engine_loop_cross_arb: register rejected");
-        }
-    }
-    tracing::info!(groups = groups.len(), "cross-arb: registered groups");
-    Ok(())
-}
-
 /// Run Strategy D (rule-tree). `rules_path` points at a JSON-
 /// array file as emitted by `claude-worker/rule_parser.py`. Each
 /// rule's first 16 ASCII bytes of `trigger` are used as the
@@ -2432,9 +2392,9 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — latency-arb always (pairs are mandatory), ev with
-/// `--artifacts-path`, cross-arb with `--groups`, rule-tree with
-/// `--rules-path`, **ai-exec and vm unconditionally** (neither has
+/// was provided — latency-arb always (pairs are mandatory), vrp when
+/// `vrp.toml` resolves, rule-tree with `--rules-path`, icdp when its
+/// artifact resolves, **ai-exec and vm unconditionally** (neither has
 /// boot config: ai-exec's universe arrives over UDS at runtime and
 /// its `on_start` validates parameters only; vm boots inert until a
 /// ruleset table is staged + committed — 8g §7.3, normal, not an
@@ -2453,7 +2413,6 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     obs: Observability,
     requested_mask: u8,
     vrp: Option<&crate::vrp_boot::VrpBoot>,
-    cross_groups: &[&[core_types::SymbolId]],
     rules: Option<(&std::path::Path, &[(core_types::SymbolId, [u8; 16], u8)])>,
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
@@ -2465,9 +2424,6 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if vrp.is_some() {
         configured |= strategy_set::BIT_VRP;
-    }
-    if !cross_groups.is_empty() {
-        configured |= strategy_set::BIT_CROSS_ARB;
     }
     if rules.is_some() {
         configured |= strategy_set::BIT_RULE_TREE;
@@ -2604,11 +2560,6 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             );
         }
     }
-    if !cross_groups.is_empty() {
-        if let Err(reason) = configure_cross_arb(set.cross_arb_mut(), &cfg, cross_groups) {
-            return EngineLoopResult::Failed(reason);
-        }
-    }
     if let Some((rules_path, sym_for_rule)) = rules {
         if let Err(reason) =
             configure_rule_tree(set.rule_tree_mut(), &cfg, rules_path, sym_for_rule)
@@ -2704,7 +2655,6 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         mask,
         latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
         vrp = mask & strategy_set::BIT_VRP != 0,
-        cross_arb = mask & strategy_set::BIT_CROSS_ARB != 0,
         rule_tree = mask & strategy_set::BIT_RULE_TREE != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
@@ -2747,15 +2697,15 @@ pub struct RegimeBoot {
 }
 
 /// RG8: the coded members the `[labels] require` law covers — the ones
-/// that carry their OWN signal (slots 0–3 + icdp). `ai-exec` (slot 4) is
+/// that carry their OWN signal (slots 0, 1, 3 + icdp; slot 2 is vacant
+/// since XSD-S and joins the list when `strategy-xsd` lands). `ai-exec` (slot 4) is
 /// exempt: it carries the worker's intent lanes, which gate themselves
 /// through `regime_allows()` (their `REGIME_LABEL`); the vm (slot 5) is
 /// held to the law upstream — every row of a staged table must be
 /// labelled (the worker's RG8 gates), never at boot.
-const REQUIRE_LABEL_SLOTS: [u8; 5] = [
+const REQUIRE_LABEL_SLOTS: [u8; 4] = [
     strategy_set::SLOT_LATENCY_ARB,
     strategy_set::SLOT_VRP,
-    strategy_set::SLOT_CROSS_ARB,
     strategy_set::SLOT_RULE_TREE,
     strategy_set::SLOT_ICDP,
 ];
@@ -2834,9 +2784,6 @@ impl Observability {
             let strategy_vrp = reg
                 .register_gauge("engine_strategy_vrp_active")
                 .map_err(|_| "register engine_strategy_vrp_active")?;
-            let strategy_cross_arb = reg
-                .register_gauge("engine_strategy_cross_arb_active")
-                .map_err(|_| "register engine_strategy_cross_arb_active")?;
             let strategy_rule_tree = reg
                 .register_gauge("engine_strategy_rule_tree_active")
                 .map_err(|_| "register engine_strategy_rule_tree_active")?;
@@ -3017,7 +2964,6 @@ impl Observability {
                 ack_p99_ns,
                 strategy_latency_arb,
                 strategy_vrp,
-                strategy_cross_arb,
                 strategy_rule_tree,
                 strategy_set,
                 ingress_polymarket_state,
@@ -3265,8 +3211,6 @@ pub struct EngineCounters {
     pub strategy_latency_arb: core_metrics::GaugeId,
     /// Active-strategy indicator — ev (A).
     pub strategy_vrp: core_metrics::GaugeId,
-    /// Active-strategy indicator — cross-arb (C).
-    pub strategy_cross_arb: core_metrics::GaugeId,
     /// Active-strategy indicator — rule-tree (D).
     pub strategy_rule_tree: core_metrics::GaugeId,
     /// Active-strategy indicator — the Phase-8f composed set.
@@ -4817,8 +4761,6 @@ where
                     .set(if kind == "latency-arb" { 1 } else { 0 });
                 reg.gauge(ids.strategy_vrp)
                     .set(if kind == "vrp" { 1 } else { 0 });
-                reg.gauge(ids.strategy_cross_arb)
-                    .set(if kind == "cross-arb" { 1 } else { 0 });
                 reg.gauge(ids.strategy_rule_tree)
                     .set(if kind == "rule-tree" { 1 } else { 0 });
                 reg.gauge(ids.strategy_set)

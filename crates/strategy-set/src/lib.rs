@@ -18,16 +18,21 @@
 //! |---|---|---|
 //! | 0 | `strategy-latency-arb` | built |
 //! | 1 | `strategy-vrp` | built (VRP V7, 2026-09-10 — **was `strategy-ev`**) |
-//! | 2 | `strategy-cross-arb` | built |
+//! | 2 | *vacant — held for `strategy-xsd`* | vacated 2026-09-12 (XSD-S) — **was `strategy-cross-arb`**; the member lands in XSD-3 |
 //! | 3 | `strategy-rule-tree` | built |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
 //! | 5 | `strategy-vm` | built (8g item 6) |
 //! | 6 | `strategy-icdp` | built (ICDP I4, 2026-09-03) — configured only when `~/multivenue/icdp.toml` resolves |
 //!
-//! Slot 7 is the only reserved value: no member exists behind it, no
-//! bit constant is defined (the cli cannot express it via
-//! [`mask_for_name`]), and an `EnableStrategy` targeting it is
-//! refused (counted).
+//! Two slots carry no member today. Slot 7 is reserved: no bit
+//! constant is defined (the cli cannot express it via
+//! [`mask_for_name`]). Slot 2 is VACANT since 2026-09-12 (XSD-S):
+//! `strategy-cross-arb` was unlinked from the set (the crate stays in
+//! the workspace — the `strategy-ev` precedent) and the slot is held
+//! for `strategy-xsd`; [`SLOT_XSD`] / [`BIT_XSD`] exist so the wiring
+//! phase (XSD-3) changes no number, but the bit is OUTSIDE
+//! [`BUILT_MASK`] until the member lands. An `EnableStrategy`
+//! targeting either slot is refused (counted).
 //!
 //! ## AI command routing (`on_ai`, §7)
 //!
@@ -97,7 +102,6 @@ use strategy_core::{
 // RG6: `regime_rel_view` copies the detector's view arrays straight
 // into the trait's POD — the two capacities must agree.
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
-use strategy_cross_arb::CrossArb;
 use strategy_vrp::VrpStrategy;
 use strategy_icdp::IcdpStrategy;
 use strategy_latency_arb::LatencyArb;
@@ -121,8 +125,17 @@ pub const SLOT_VRP: u8 = 1;
 /// Slot 1 under its pre-2026-09-10 name, for readers of pre-boundary
 /// captures and configs. Identical value.
 pub const SLOT_EV: u8 = SLOT_VRP;
-/// Slot index of the cross-arb member.
-pub const SLOT_CROSS_ARB: u8 = 2;
+/// Slot index of the xsd member (cross-sectional dislocation; the
+/// statarb lane's coded member).
+///
+/// **The second swap boundary.** Slot 2 was `strategy-cross-arb` until
+/// 2026-09-12 (XSD-S; operator ruling R3 = reuse slot 2). The NUMBER is
+/// wire-stable — `Order.strategy_id` 2 and `AiCmd::strategy_id` 2 still
+/// mean "slot 2" — so a capture taken before that date carries
+/// cross-arb rows under this slot, one taken after XSD-3 carries XSD
+/// rows, and between the two the slot emits nothing. `docs/migration.md`
+/// records the boundary.
+pub const SLOT_XSD: u8 = 2;
 /// Slot index of the rule-tree member.
 pub const SLOT_RULE_TREE: u8 = 3;
 /// Slot index of the ai-exec member (wire value pinned in
@@ -141,8 +154,10 @@ pub const BIT_LATENCY_ARB: u8 = 1 << SLOT_LATENCY_ARB;
 pub const BIT_VRP: u8 = 1 << SLOT_VRP;
 /// Slot 1's bit under its pre-2026-09-10 name. Identical value.
 pub const BIT_EV: u8 = BIT_VRP;
-/// Enable-mask bit for the cross-arb member.
-pub const BIT_CROSS_ARB: u8 = 1 << SLOT_CROSS_ARB;
+/// Enable-mask bit for the xsd member (slot 2 — see [`SLOT_XSD`]).
+/// OUTSIDE [`BUILT_MASK`] until XSD-3 wires the member: today
+/// [`StrategySet::new`] clears it and `EnableStrategy` refuses it.
+pub const BIT_XSD: u8 = 1 << SLOT_XSD;
 /// Enable-mask bit for the rule-tree member.
 pub const BIT_RULE_TREE: u8 = 1 << SLOT_RULE_TREE;
 /// Enable-mask bit for the ai-exec member (item 8).
@@ -152,16 +167,13 @@ pub const BIT_VM: u8 = 1 << SLOT_VM;
 /// Enable-mask bit for the icdp member (ICDP I4).
 pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
 
-/// Every built member's bit (slots 0–6).
+/// Every built member's bit (slots 0, 1, 3–6; slot 2 is vacant until
+/// XSD-3 — see [`SLOT_XSD`]).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_VRP | BIT_CROSS_ARB | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_LATENCY_ARB | BIT_VRP | BIT_RULE_TREE | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
 
 /// Latency-arb slot capacity inside the set (design §7 sketch).
 pub const SET_LATENCY_ARB_SLOTS: usize = 64;
-/// Cross-arb group capacity inside the set.
-pub const SET_CROSS_ARB_GROUPS: usize = 8;
-/// Cross-arb per-group member capacity inside the set.
-pub const SET_CROSS_ARB_MEMBERS: usize = 8;
 /// Rule-tree slot capacity inside the set (design §7 sketch).
 pub const SET_RULE_TREE_SLOTS: usize = 8;
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
@@ -178,7 +190,9 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 pub fn mask_for_name(name: &str) -> Option<u8> {
     match name {
         "latency-arb" => Some(BIT_LATENCY_ARB),
-        "cross-arb" => Some(BIT_CROSS_ARB),
+        // XSD-S (2026-09-12): `cross-arb` is GONE as a name — slot 2 is
+        // vacant until `strategy-xsd` lands (XSD-3), and an operator who
+        // types the old one must get a boot refusal, not a silent no-op.
         "rule-tree" => Some(BIT_RULE_TREE),
         "ai-exec" => Some(BIT_AI_EXEC),
         "vm" => Some(BIT_VM),
@@ -210,7 +224,6 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
 pub struct StrategySet {
     latency_arb: LatencyArb<SET_LATENCY_ARB_SLOTS>,
     vrp: VrpStrategy,
-    cross_arb: CrossArb<SET_CROSS_ARB_GROUPS, SET_CROSS_ARB_MEMBERS>,
     rule_tree: RuleTree<SET_RULE_TREE_SLOTS>,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
     vm: VmStrategy,
@@ -258,7 +271,6 @@ impl StrategySet {
         Self {
             latency_arb: LatencyArb::new(),
             vrp: VrpStrategy::new(),
-            cross_arb: CrossArb::new(),
             rule_tree: RuleTree::new(),
             ai_exec: AiExec::new(),
             vm: VmStrategy::new(),
@@ -313,7 +325,6 @@ impl StrategySet {
         let ok = match slot {
             SLOT_LATENCY_ARB => self.latency_arb.set_regime_label(set),
             SLOT_VRP => self.vrp.set_regime_label(set),
-            SLOT_CROSS_ARB => self.cross_arb.set_regime_label(set),
             SLOT_RULE_TREE => self.rule_tree.set_regime_label(set),
             SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
             SLOT_ICDP => self.icdp.set_regime_label(set),
@@ -354,7 +365,7 @@ impl StrategySet {
     fn pull_regime_labels(&mut self) {
         self.regime_labels[SLOT_LATENCY_ARB as usize] = self.latency_arb.regime_label();
         self.regime_labels[SLOT_VRP as usize] = self.vrp.regime_label();
-        self.regime_labels[SLOT_CROSS_ARB as usize] = self.cross_arb.regime_label();
+        self.regime_labels[SLOT_XSD as usize] = RegimeLabelSet::ANY; // vacant until XSD-3
         self.regime_labels[SLOT_RULE_TREE as usize] = self.rule_tree.regime_label();
         self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
         self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
@@ -425,9 +436,6 @@ impl StrategySet {
             SLOT_VRP => self
                 .vrp
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
-            SLOT_CROSS_ARB => self
-                .cross_arb
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB)),
             SLOT_RULE_TREE => self
                 .rule_tree
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE)),
@@ -481,12 +489,6 @@ impl StrategySet {
         &self.vrp
     }
 
-    /// Configure the cross-arb member (boot-only).
-    #[inline]
-    pub fn cross_arb_mut(&mut self) -> &mut CrossArb<SET_CROSS_ARB_GROUPS, SET_CROSS_ARB_MEMBERS> {
-        &mut self.cross_arb
-    }
-
     /// Configure the rule-tree member (boot-only).
     #[inline]
     pub fn rule_tree_mut(&mut self) -> &mut RuleTree<SET_RULE_TREE_SLOTS> {
@@ -538,13 +540,12 @@ impl StrategySet {
         let bit = match slot {
             SLOT_LATENCY_ARB => BIT_LATENCY_ARB,
             SLOT_VRP => BIT_VRP,
-            SLOT_CROSS_ARB => BIT_CROSS_ARB,
             SLOT_RULE_TREE => BIT_RULE_TREE,
             SLOT_AI_EXEC => BIT_AI_EXEC,
             SLOT_VM => BIT_VM,
             SLOT_ICDP => BIT_ICDP,
-            // Reserved slot (7): no member behind it — refuse and
-            // count.
+            // Slots with no member behind them — the reserved 7 and the
+            // vacant 2 (XSD-S, until XSD-3) — refuse and count.
             _ => {
                 self.enable_refused = self.enable_refused.wrapping_add(1);
                 return;
@@ -579,7 +580,6 @@ impl StrategyCounters for StrategySet {
     fn orders_emitted(&self) -> u64 {
         self.latency_arb.orders_emitted()
             + self.vrp.orders_emitted()
-            + self.cross_arb.orders_emitted()
             + self.rule_tree.orders_emitted()
             + self.ai_exec.orders_emitted()
             + self.vm.orders_emitted()
@@ -589,7 +589,6 @@ impl StrategyCounters for StrategySet {
     fn orders_dropped(&self) -> u64 {
         self.latency_arb.orders_dropped()
             + self.vrp.orders_dropped()
-            + self.cross_arb.orders_dropped()
             + self.rule_tree.orders_dropped()
             + self.ai_exec.orders_dropped()
             + self.vm.orders_dropped()
@@ -725,10 +724,6 @@ impl StrategyCounters for StrategySet {
                 self.latency_arb.orders_dropped(),
             ),
             SLOT_VRP => (self.vrp.orders_emitted(), self.vrp.orders_dropped()),
-            SLOT_CROSS_ARB => (
-                self.cross_arb.orders_emitted(),
-                self.cross_arb.orders_dropped(),
-            ),
             SLOT_RULE_TREE => (
                 self.rule_tree.orders_emitted(),
                 self.rule_tree.orders_dropped(),
@@ -822,10 +817,6 @@ impl Strategy for StrategySet {
         if self.initial & BIT_VRP != 0 {
             self.vrp.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VRP))?;
         }
-        if self.initial & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB))?;
-        }
         if self.initial & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_start(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE))?;
@@ -857,10 +848,6 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
-        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -888,10 +875,6 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
@@ -934,10 +917,6 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
-        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -967,10 +946,6 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
@@ -1002,10 +977,6 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
-        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -1033,10 +1004,6 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
@@ -1111,10 +1078,6 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VRP != 0 {
             self.vrp.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
-        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -1165,10 +1128,6 @@ impl Strategy for StrategySet {
             self.vrp
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_CROSS_ARB != 0 {
-            self.cross_arb
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
-        }
         if self.enabled & BIT_RULE_TREE != 0 {
             self.rule_tree
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
@@ -1206,10 +1165,6 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
-        let v = self.cross_arb.timer_period_ns();
-        if v < min {
-            min = v;
-        }
         let v = self.rule_tree.timer_period_ns();
         if v < min {
             min = v;
@@ -1236,8 +1191,6 @@ impl Strategy for StrategySet {
         self.latency_arb
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
         self.vrp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VRP));
-        self.cross_arb
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_CROSS_ARB));
         self.rule_tree
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE));
         self.ai_exec
@@ -1349,13 +1302,24 @@ mod tests {
             Some(BIT_AI_EXEC | BIT_VM | BIT_VRP)
         );
         assert_eq!(mask_for_name("ai+vrp"), Some(50));
-        assert_eq!(mask_for_name("cross-arb"), Some(BIT_CROSS_ARB));
+        // XSD-S (2026-09-12): slot 2 is vacant — `cross-arb` is gone as
+        // a NAME and refuses the boot; `xsd` arrives with the member
+        // (XSD-3). The live masks do not move.
+        assert_eq!(mask_for_name("cross-arb"), None);
+        assert_eq!(mask_for_name("xsd"), None, "no member behind slot 2 yet");
+        assert_eq!(mask_for_name("ai"), Some(48));
+        assert_eq!(mask_for_name("ai+icdp"), Some(112));
+        assert_eq!(BIT_XSD, 4, "slot 2's bit is wire-stable across the swap");
         assert_eq!(mask_for_name("rule-tree"), Some(BIT_RULE_TREE));
         assert_eq!(mask_for_name("ai-exec"), Some(BIT_AI_EXEC));
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
-        assert_eq!(mask_for_name("all"), Some(127), "every built slot 0..=6");
+        assert_eq!(
+            mask_for_name("all"),
+            Some(123),
+            "every built slot 0..=6 minus the vacant slot 2 (XSD-S)"
+        );
         // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
         // (operator ruling 2026-09-02).
         const _: () = assert!(
@@ -1377,6 +1341,8 @@ mod tests {
         assert_eq!(s.enabled_mask(), BUILT_MASK);
         let s = StrategySet::new(0b1000_0000);
         assert_eq!(s.enabled_mask(), 0, "reserved bit 7 cleared");
+        let s = StrategySet::new(BIT_XSD);
+        assert_eq!(s.enabled_mask(), 0, "slot 2 is vacant until XSD-3 (XSD-S)");
         let s = StrategySet::new(BIT_ICDP);
         assert_eq!(s.enabled_mask(), BIT_ICDP, "slot 6 is built now (ICDP I4)");
         let s = StrategySet::new(BIT_AI_EXEC);
@@ -1400,7 +1366,7 @@ mod tests {
         ));
 
         // Unconfigured members outside the initial mask are skipped —
-        // ev/cross/rule-tree would all fail validation here.
+        // vrp/rule-tree would all fail validation here.
         let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
         assert!(s.on_start(&mut ctx()).is_ok());
     }
@@ -1542,14 +1508,17 @@ mod tests {
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 7), &mut c);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 9), &mut c);
+        // XSD-S: the vacant slot 2 refuses the same way until the xsd
+        // member lands (XSD-3) — no silent enable of nothing.
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XSD), &mut c);
         assert_eq!(s.enabled_mask(), 0);
-        assert_eq!(s.enable_refused_total(), 2);
+        assert_eq!(s.enable_refused_total(), 3);
         assert!(!s.is_halted(), "reserved-slot refusal is not a halt");
         // Slot 6 enables (an unconfigured icdp member is inert: it
         // registers nothing and never fires).
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_ICDP), &mut c);
         assert_eq!(s.enabled_mask(), BIT_ICDP);
-        assert_eq!(s.enable_refused_total(), 2);
+        assert_eq!(s.enable_refused_total(), 3);
     }
 
     #[test]

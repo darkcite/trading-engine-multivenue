@@ -24,8 +24,8 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use cli::{
-    boot_info, engine_loop_cross_arb_full, engine_loop_ev_full, engine_loop_full,
-    engine_loop_rule_tree_full, engine_loop_set_full, install_sigint_handler, join_reverse,
+    boot_info, engine_loop_ev_full, engine_loop_full, engine_loop_rule_tree_full,
+    engine_loop_set_full, install_sigint_handler, join_reverse,
     spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
     state_writer, Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher,
     Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
@@ -377,11 +377,6 @@ struct RunArgs {
     /// `--strategy ev`.
     #[arg(long)]
     artifacts_path: Option<PathBuf>,
-    /// Comma-separated group spec for `--strategy cross-arb`,
-    /// e.g. `"10,11,12;20,21"`. Each `;`-delimited slice is one
-    /// MarketGroup of comma-delimited SymbolIds.
-    #[arg(long)]
-    groups: Option<String>,
     /// Path to claude-worker rule JSON. Required for
     /// `--strategy rule-tree`.
     #[arg(long)]
@@ -1994,37 +1989,9 @@ fn run(args: RunArgs) -> ExitCode {
                 obs,
             )
         }
-        ("cross-arb", _live) => {
-            let spec = match args.groups.as_deref() {
-                Some(s) => s,
-                None => {
-                    error!("--strategy cross-arb requires --groups <SPEC>");
-                    join_reverse(handles);
-                    return ExitCode::from(1);
-                }
-            };
-            // Parse "10,11,12;20,21" into owned Vec<Vec<SymbolId>>.
-            let owned: Vec<Vec<core_types::SymbolId>> = spec
-                .split(';')
-                .map(|grp| {
-                    grp.split(',')
-                        .filter_map(|s| s.trim().parse::<u32>().ok())
-                        .collect()
-                })
-                .filter(|v: &Vec<u32>| !v.is_empty())
-                .collect();
-            let groups_ref: Vec<&[core_types::SymbolId]> =
-                owned.iter().map(|v| v.as_slice()).collect();
-            info!(groups = groups_ref.len(), "cross-arb: parsed groups");
-            info!("running cross-arb PAPER — no orders will be submitted");
-            engine_loop_cross_arb_full(
-                cons,
-                engine_cfg,
-                clob_dispatcher::PaperDispatcher::new(),
-                obs,
-                &groups_ref,
-            )
-        }
+        // XSD-S (2026-09-12): `cross-arb` has no arm any more — slot 2 is
+        // vacant until `strategy-xsd` lands (XSD-3) and the name falls
+        // through to the "unknown --strategy" refusal below, on purpose.
         ("rule-tree", _live) => {
             let rp = match args.rules_path.as_deref() {
                 Some(p) => p,
@@ -2082,9 +2049,10 @@ fn run(args: RunArgs) -> ExitCode {
         (name @ ("all" | "ai" | "ai-exec" | "vm" | "icdp" | "ai+icdp" | "vrp" | "ai+vrp"), _live) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // latency-arb from the mandatory pair flags, cross-arb /
-            // rule-tree only when their config flags are present,
-            // vrp only when `vrp.toml` resolves (VRP V7: slot 1),
+            // latency-arb from the mandatory pair flags, rule-tree
+            // only when its config flag is present, vrp only when
+            // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
+            // artifact resolves (slot 2 is vacant — XSD-S),
             // ai-exec and vm unconditionally (neither has boot
             // config; items 8 / 8g-6) (members without config boot
             // inert; see engine_loop_set_full docs). `ai-exec` (item
@@ -2096,20 +2064,6 @@ fn run(args: RunArgs) -> ExitCode {
             // live arm.
             let requested =
                 strategy_set::mask_for_name(name).expect("matched names are valid mask names");
-            let owned_groups: Vec<Vec<core_types::SymbolId>> = match args.groups.as_deref() {
-                Some(spec) => spec
-                    .split(';')
-                    .map(|grp| {
-                        grp.split(',')
-                            .filter_map(|s| s.trim().parse::<u32>().ok())
-                            .collect()
-                    })
-                    .filter(|v: &Vec<u32>| !v.is_empty())
-                    .collect(),
-                None => Vec::new(),
-            };
-            let groups_ref: Vec<&[core_types::SymbolId]> =
-                owned_groups.iter().map(|v| v.as_slice()).collect();
             // Rule mapping: same v1 shape as the standalone rule-tree
             // arm (every rule → --polymarket-sym-id, "halving" kw).
             let mut kw = [0u8; 16];
@@ -2188,7 +2142,6 @@ fn run(args: RunArgs) -> ExitCode {
                 obs,
                 requested,
                 vrp_boot.as_ref(),
-                &groups_ref,
                 rules,
                 icdp_params.as_ref(),
                 regime_boot.as_ref(),

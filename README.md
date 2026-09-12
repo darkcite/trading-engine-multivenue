@@ -198,8 +198,9 @@ crates/
                      hyperliquid, rpc + ingress-ai (UDS/HMAC command plane)
   options-select/    Boot-only options-chain selection law (shared by venues)
   book-builder/      Order-book construction
-  strategy-*/        core, latency-arb, cross-arb, ev, rule-tree, vm (ruleset VM),
-                     set (mask-49 composed set), ai-exec
+  strategy-*/        core, latency-arb, vrp, rule-tree, vm (ruleset VM), icdp,
+                     set (the composed set), ai-exec; cross-arb + ev stay in
+                     the workspace but are unlinked from the set
   research-artifacts/ Ruleset artifacts + validation
   signer-eip712/     EIP-712 signer (secp256k1 + tiny-keccak, no ethers/alloy)
   clob-dispatcher/   Persistent HTTP/2 client, preallocated buffers

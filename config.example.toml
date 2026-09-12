@@ -61,12 +61,6 @@ qty_1e6 = 10000000
 # Cooldown between emits per market (nanoseconds).
 cooldown_ns = 250000000
 
-[strategy.cross_arb]
-# Comma-separated group spec: ";"-delimited groups, ","-delimited
-# member SymbolIds inside each group. Forwarded as
-# `--groups "10,11,12;20,21,22"`.
-# groups = "10,11,12;20,21,22"
-
 [strategy.ev]
 # Path to claude-worker-emitted NDJSON tag artifacts. Required
 # when `--strategy ev`.

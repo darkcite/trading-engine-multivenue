@@ -158,11 +158,16 @@ pub const AUDIT_PNL_VERSION: u32 = 1;
 /// rows wearing this label. `docs/migration.md` records the boundary;
 /// there is no way to tell from the row itself, which is exactly why the
 /// boundary is written down.
+///
+/// **Slot 2 changed meaning on 2026-09-12 (XSD-S).** `strategy-cross-arb`
+/// was unlinked and the slot is held for `strategy-xsd`: rows under slot
+/// 2 in a capture taken BEFORE that date are cross-arb rows wearing this
+/// label; between XSD-S and the XSD-3 wiring the slot emits nothing.
 fn strategy_label(id: u8) -> &'static str {
     match id {
         0 => "latency-arb",
         1 => "vrp",
-        2 => "cross-arb",
+        2 => "xsd",
         3 => "rule-tree",
         4 => "ai-exec",
         5 => "vm",
