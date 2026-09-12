@@ -93,6 +93,34 @@ pub struct VrpFile {
     /// default, and what an absent key means), `1` short vol only,
     /// `2` long vol only.
     pub sides: u8,
+    /// P3.1 (R1): how the option ENTRY is executed — `0` IoC at the
+    /// mark (the default, and what an absent key means), `1` a resting
+    /// maker order at the edge-derived limit.
+    pub entry_mode: u8,
+    /// P3.1: how long a maker entry rests before the fallback fires.
+    /// `0` = the remaining decision band, which is the whole time the
+    /// member is allowed to enter in.
+    pub entry_patience_ns: u64,
+    /// P3.1: what an unfilled maker entry does — `0` abandon (the
+    /// default: a HOLD, exactly as an unfilled IoC), `1` cross once at
+    /// the touch, and only if the signal still clears the cost gate
+    /// THERE.
+    pub entry_fallback: u8,
+    /// P3.1 (R2): how the delta HEDGE is executed — `0` taker at the
+    /// touch, `1` a resting maker order at the passive side. Default
+    /// `1`, measured: P3.0's frontier puts the hedge at 1.83 bps of
+    /// spot against 5.12 for the taker, and the hedge ERROR the band
+    /// buys is ~100× smaller than either.
+    pub hedge_mode: u8,
+    /// P3.1: how long a maker hedge rests before it crosses. The
+    /// fallback is UNCONDITIONAL — a hedge must complete.
+    pub hedge_patience_ns: u64,
+    /// P3.1 (R7's inputs): the venue's capped option trade fee, used by
+    /// the COST term alone — `min(index_bps of the index notional,
+    /// prem_bps of the premium)`. Deribit: 3 and 1250.
+    pub opt_fee_index_bps: u32,
+    /// See [`Self::opt_fee_index_bps`].
+    pub opt_fee_prem_bps: u32,
 }
 
 /// Default location beside `universe.toml`.
@@ -110,7 +138,7 @@ pub fn load(path: &Path) -> Result<(VrpFile, Vec<u8>), VrpError> {
     Ok((file, bytes))
 }
 
-const VRP_KEYS: [&str; 10] = [
+const VRP_KEYS: [&str; 17] = [
     "theta_1e9",
     "tau_ns",
     "epsilon_ns",
@@ -121,11 +149,36 @@ const VRP_KEYS: [&str; 10] = [
     "underlying_descriptor",
     "hedge_descriptor",
     "sides",
+    "entry_mode",
+    "entry_patience_ns",
+    "entry_fallback",
+    "hedge_mode",
+    "hedge_patience_ns",
+    "opt_fee_index_bps",
+    "opt_fee_prem_bps",
 ];
 
 /// `sides` values, mirroring `strategy_vrp::SIDES_*`. The member owns
 /// the constants; this is the grammar that reaches them.
 const SIDES_NAMES: [(&str, u8); 3] = [("both", 0), ("short", 1), ("long", 2)];
+/// P3.1 `entry_mode`, mirroring `strategy_vrp::ENTRY_MODE_*`.
+const ENTRY_MODE_NAMES: [(&str, u8); 2] = [("ioc", 0), ("maker", 1)];
+/// P3.1 `entry_fallback`, mirroring `strategy_vrp::ENTRY_FALLBACK_*`.
+const ENTRY_FALLBACK_NAMES: [(&str, u8); 2] = [("abandon", 0), ("cross", 1)];
+/// P3.1 `hedge_mode`, mirroring `strategy_vrp::HEDGE_MODE_*`.
+const HEDGE_MODE_NAMES: [(&str, u8); 2] = [("taker", 0), ("maker", 1)];
+
+/// P3.0's measured default for `hedge_patience_ns`: 30 s. The frontier
+/// is flat between 30 s and 60 s and both sit at a third of the taker
+/// cost, so the shorter wait is taken — it is the one that carries less
+/// unhedged exposure for the same money.
+pub const HEDGE_PATIENCE_DEFAULT_NS: u64 = 30_000_000_000;
+/// P3.0's measured default for `hedge_mode`: maker.
+pub const HEDGE_MODE_DEFAULT: u8 = 1;
+/// Deribit's capped option trade fee, used by the cost term only.
+pub const OPT_FEE_INDEX_BPS_DEFAULT: u32 = 3;
+/// See [`OPT_FEE_INDEX_BPS_DEFAULT`].
+pub const OPT_FEE_PREM_BPS_DEFAULT: u32 = 1250;
 
 /// Upper bound on `theta_1e9`: `ln 2 ≈ 0.69` doubles the forecast, and
 /// θ = 2.0 log points is a band no implied vol on a traded chain can
@@ -150,6 +203,26 @@ fn take_pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, VrpErro
         return Err(err(format!("`{key}` must be > 0 (got {v})")));
     }
     u64::try_from(v).map_err(|_| err(format!("`{key}` must be > 0 (got {v})")))
+}
+
+/// P3.1: an OPTIONAL non-negative integer key, as `u64`.
+fn take_opt_u64(kv: &[(String, Value, usize)], key: &str, default: u64) -> Result<u64, VrpError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        None => Ok(default),
+        Some((_, Value::Int(v), l)) => u64::try_from(*v)
+            .map_err(|_| err(format!("line {l}: `{key}` must be >= 0 (got {v})"))),
+        Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
+    }
+}
+
+/// P3.1: an OPTIONAL non-negative integer key, as `u32`.
+fn take_opt_u32(kv: &[(String, Value, usize)], key: &str, default: u32) -> Result<u32, VrpError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        None => Ok(default),
+        Some((_, Value::Int(v), l)) => u32::try_from(*v)
+            .map_err(|_| err(format!("line {l}: `{key}` must be in 0..=u32::MAX (got {v})"))),
+        Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
+    }
 }
 
 /// Q4/Q12: an OPTIONAL string key. Absent is not an error — it is the
@@ -240,6 +313,17 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
         underlying_descriptor: take_str(&kv, "underlying_descriptor")?,
         hedge_descriptor: take_str(&kv, "hedge_descriptor")?,
         sides: take_opt_enum(&kv, "sides", &SIDES_NAMES, 0)?,
+        entry_mode: take_opt_enum(&kv, "entry_mode", &ENTRY_MODE_NAMES, 0)?,
+        entry_patience_ns: take_opt_u64(&kv, "entry_patience_ns", 0)?,
+        entry_fallback: take_opt_enum(&kv, "entry_fallback", &ENTRY_FALLBACK_NAMES, 0)?,
+        hedge_mode: take_opt_enum(&kv, "hedge_mode", &HEDGE_MODE_NAMES, HEDGE_MODE_DEFAULT)?,
+        hedge_patience_ns: take_opt_u64(
+            &kv,
+            "hedge_patience_ns",
+            HEDGE_PATIENCE_DEFAULT_NS,
+        )?,
+        opt_fee_index_bps: take_opt_u32(&kv, "opt_fee_index_bps", OPT_FEE_INDEX_BPS_DEFAULT)?,
+        opt_fee_prem_bps: take_opt_u32(&kv, "opt_fee_prem_bps", OPT_FEE_PREM_BPS_DEFAULT)?,
     };
 
     if file.theta_1e9 <= 0 || file.theta_1e9 > VRP_THETA_MAX_1E9 {
@@ -293,6 +377,22 @@ pub fn parse(src: &str) -> Result<VrpFile, VrpError> {
              band has to close before the hedge freezes at E−ε",
             file.selection_ns,
             file.tau_ns.saturating_sub(file.epsilon_ns)
+        )));
+    }
+    // P3.1: a maker entry has to be able to rest INSIDE the decision
+    // band, or its fallback is the only path that ever runs.
+    if file.entry_patience_ns > file.selection_ns {
+        return Err(err(format!(
+            "`entry_patience_ns` {} exceeds `selection_ns` {} — a maker entry cannot              rest past the decision band it was authorised in",
+            file.entry_patience_ns, file.selection_ns
+        )));
+    }
+    // A maker hedge that outlives its own rebalance cadence would have
+    // two hedges chasing two targets.
+    if file.hedge_patience_ns >= file.rebalance_ns {
+        return Err(err(format!(
+            "`hedge_patience_ns` {} must be < `rebalance_ns` {} — a hedge still resting              when the next rebalance is due would chase two targets at once",
+            file.hedge_patience_ns, file.rebalance_ns
         )));
     }
     if file.underlying_descriptor.is_empty() || file.hedge_descriptor.is_empty() {

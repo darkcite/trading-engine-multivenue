@@ -2513,6 +2513,30 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             theta_1e9 = boot.params.theta_1e9,
             "vrp: artifact configured"
         );
+        // R1/R2: the EXECUTION modes, printed on every boot. A member
+        // that rests its entry behaves visibly differently from one
+        // that crosses, and an operator reading a campaign back has to
+        // be able to tell which one produced it.
+        tracing::info!(
+            entry_mode = match boot.params.entry_mode {
+                strategy_vrp::ENTRY_MODE_MAKER => "maker",
+                _ => "ioc",
+            },
+            entry_patience_ns = boot.params.entry_patience_ns,
+            entry_fallback = match boot.params.entry_fallback {
+                strategy_vrp::ENTRY_FALLBACK_CROSS => "cross",
+                _ => "abandon",
+            },
+            hedge_mode = match boot.params.hedge_mode {
+                strategy_vrp::HEDGE_MODE_MAKER => "maker",
+                _ => "taker",
+            },
+            hedge_patience_ns = boot.params.hedge_patience_ns,
+            band_qty_1e6 = boot.params.band_qty_1e6,
+            opt_fee_index_bps = boot.params.opt_fee_index_bps,
+            opt_fee_prem_bps = boot.params.opt_fee_prem_bps,
+            "vrp: execution modes"
+        );
         tracing::info!(
             seed_pairs = boot.pairs_from_seed + boot.pairs_from_state,
             pairs = boot.pairs.len(),
@@ -3807,6 +3831,17 @@ pub struct VrpMetricIds {
     pub fills: core_metrics::CounterId,
     /// `engine_vrp_fills_ignored_total` (X1 — matched no leg in flight)
     pub fills_ignored: core_metrics::CounterId,
+    /// `engine_vrp_entry_maker_submitted_total` (R1 — entries posted as
+    /// a RESTING order; `entries_submitted` minus this crossed)
+    pub entry_maker_submitted: core_metrics::CounterId,
+    /// `engine_vrp_entry_crossed_total` (R1 — the fallback fired)
+    pub entry_crossed: core_metrics::CounterId,
+    /// `engine_vrp_entry_cost_refused_total` (R1 — the fallback REFUSED:
+    /// crossing would not have cleared the cost gate)
+    pub entry_cost_refused: core_metrics::CounterId,
+    /// `engine_vrp_hedge_crossed_total` (R2 — a maker hedge that had to
+    /// cross; the share of the maker saving that is not real)
+    pub hedge_crossed: core_metrics::CounterId,
     /// `engine_vrp_last_settle_value_1e6` (X1 gauge — the cash the last
     /// settlement booked; no order is emitted for it)
     pub last_settle_value_1e6: core_metrics::GaugeId,
@@ -3867,6 +3902,10 @@ fn register_vrp_metrics(
     let hedge_abandoned = one("engine_vrp_hedge_abandoned_total")?;
     let fills = one("engine_vrp_fills_total")?;
     let fills_ignored = one("engine_vrp_fills_ignored_total")?;
+    let entry_maker_submitted = one("engine_vrp_entry_maker_submitted_total")?;
+    let entry_crossed = one("engine_vrp_entry_crossed_total")?;
+    let entry_cost_refused = one("engine_vrp_entry_cost_refused_total")?;
+    let hedge_crossed = one("engine_vrp_hedge_crossed_total")?;
     let no_bounds = one("engine_vrp_no_bounds_total")?;
     let stale_skips = one("engine_vrp_stale_skips_total")?;
     let no_selection = one("engine_vrp_no_selection_total")?;
@@ -3895,6 +3934,10 @@ fn register_vrp_metrics(
         hedge_abandoned,
         fills,
         fills_ignored,
+        entry_maker_submitted,
+        entry_crossed,
+        entry_cost_refused,
+        hedge_crossed,
         no_bounds,
         stale_skips,
         no_selection,
@@ -4085,6 +4128,14 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
     reg.counter(ids.fills).inc(cur.fills.saturating_sub(last.fills));
     reg.counter(ids.fills_ignored)
         .inc(cur.fills_ignored.saturating_sub(last.fills_ignored));
+    reg.counter(ids.entry_maker_submitted)
+        .inc(cur.entry_maker_submitted.saturating_sub(last.entry_maker_submitted));
+    reg.counter(ids.entry_crossed)
+        .inc(cur.entry_crossed.saturating_sub(last.entry_crossed));
+    reg.counter(ids.entry_cost_refused)
+        .inc(cur.entry_cost_refused.saturating_sub(last.entry_cost_refused));
+    reg.counter(ids.hedge_crossed)
+        .inc(cur.hedge_crossed.saturating_sub(last.hedge_crossed));
     reg.counter(ids.no_bounds)
         .inc(cur.no_bounds.saturating_sub(last.no_bounds));
     reg.counter(ids.stale_skips)

@@ -6,6 +6,87 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `vrp.toml` gains the EXECUTION modes; the hedge now RESTS by default (VRP P3 / R1, R2)
+
+**What changed**
+
+- **`vrp.toml` gains seven OPTIONAL keys** (`core_config::vrp`
+  `VRP_KEYS` 10 → 17). Absent keys take the defaults below, so an
+  existing file still parses byte for byte:
+
+  | key | values | default |
+  |---|---|---|
+  | `entry_mode` | `ioc` \| `maker` | **`ioc`** — unchanged |
+  | `entry_patience_ns` | integer ns | `0` = the whole remaining decision band |
+  | `entry_fallback` | `abandon` \| `cross` | **`abandon`** — unchanged |
+  | `hedge_mode` | `taker` \| `maker` | **`maker`** — CHANGED, see below |
+  | `hedge_patience_ns` | integer ns | `30_000_000_000` (30 s) |
+  | `opt_fee_index_bps` | integer | `3` (Deribit) |
+  | `opt_fee_prem_bps` | integer | `1250` (Deribit) |
+
+  New refusals: `entry_patience_ns > selection_ns` (a maker entry cannot
+  rest past the band that authorised it) and
+  `hedge_patience_ns >= rebalance_ns` (a hedge still resting when the
+  next rebalance is due would chase two targets).
+
+- **OPERATOR ACTION — `hedge_mode` defaults to `maker`.** At the next
+  boot the delta hedge RESTS at the passive side of the perp touch for
+  30 s before crossing, instead of taking at the touch immediately.
+  P3.0 measured that at **1.83 bps of spot per campaign against 5.12**
+  for the taker, with a hedge error ~100× smaller than the difference
+  (`docs/research/vrp/vrp-p30-execution-2026-09-12.md`). To keep the old
+  behaviour, add `hedge_mode = "taker"` to `~/multivenue/vrp.toml`.
+  The **fallback is unconditional**: a rest that reaches its deadline
+  crosses at the then-current touch, so the hedge still always
+  completes. The rest and its cross are ONE attempt against
+  `HEDGE_RETRIES_MAX` — charging the handover a retry would spend the
+  ladder on a mode change.
+
+- **`band_qty_1e6`'s measured value is 150000**, not the 50000 the live
+  file sets. The live file sets it EXPLICITLY, so nothing moves until an
+  operator edits that line; the number is recorded so the edit is a
+  decision rather than a guess.
+
+- **The member reads the selected option's own QUOTE lane.**
+  `VrpStrategy::on_tick` gains a branch for `selected_sym` that caches
+  its touch. **The denomination law applies there too** — an option
+  quote is COIN on the wire (VRP V2a), so it is converted through
+  `opt_registry::coin_to_usd_1e6` against the last summary's underlying,
+  and a quote arriving before the first summary of the campaign is
+  DROPPED rather than booked as dollars.
+
+- **The maker entry's limit**: short vol rests an ASK at
+  `max(mark, bid)`, long vol a BID at `min(mark, ask)` — never worse
+  than the mark the decision was taken at, and never marketable on
+  arrival (the maker law needs a STRICT cross).
+
+- **The cross fallback is a DECISION, not a retry.** It fires only if
+  the signal still clears a COST-AWARE band at the touch price:
+  `theta_eff = theta + ln((premium + cost)/premium)` where `cost` is the
+  crossed half-spread plus the venue's capped fee. `theta` itself is
+  never changed (edge spec §2.2). A refusal is a HOLD and is counted
+  apart from a plain unfilled entry.
+
+- **Four new counters / metrics**, all additive:
+  `engine_vrp_entry_maker_submitted_total`,
+  `engine_vrp_entry_crossed_total`,
+  `engine_vrp_entry_cost_refused_total`,
+  `engine_vrp_hedge_crossed_total`. The boot log gains a
+  `vrp: execution modes` line naming every one of the seven keys in
+  force.
+
+**What did NOT change**
+
+The entry path's default (`ioc` at the mark), `vrp-state.tsv` v4, the
+seed grammar, the caps, the regime gate, every harness surface, and
+`detail_version` 7 / `audit_pnl_version` 1. Three member tests that pin
+the TAKER ladder now say `hedge_mode = HEDGE_MODE_TAKER` explicitly
+rather than inheriting it — the law they pin is unchanged.
+
+**Gates**: nextest 1876 (+8) · alloc **48/48** 0 B/op (gate 48 = the
+execution modes, including the option quote lane's conversion) · lint ·
+license 328.
+
 ## 2026-09-12 — `backtest` and `audit-pnl` share ONE option model; `--member vrp`; the campaign pool (VRP P2)
 
 **What changed**

@@ -267,6 +267,36 @@ pub const SIDES_SHORT: u8 = 1;
 /// deliberate research arm; not a shape anyone has evidence for.
 pub const SIDES_LONG: u8 = 2;
 
+/// [`VrpParams::entry_mode`]: cross at the mark with an IoC. The
+/// default, and every measurement to date.
+pub const ENTRY_MODE_IOC: u8 = 0;
+/// [`VrpParams::entry_mode`]: rest a MAKER order at the edge-derived
+/// limit (R1). P3.0 measured a ~58 % fill inside a 10 min rest, each
+/// fill saving the crossed half-spread — 2.87 bps of spot.
+pub const ENTRY_MODE_MAKER: u8 = 1;
+
+/// [`VrpParams::entry_fallback`]: an unfilled maker entry is a HOLD.
+/// The default: it is exactly what an unfilled IoC already does.
+pub const ENTRY_FALLBACK_ABANDON: u8 = 0;
+/// [`VrpParams::entry_fallback`]: cross ONCE at the touch — and only
+/// if the signal still clears the cost gate at that price, because the
+/// edge that authorised a fill at the mark need not survive the spread.
+pub const ENTRY_FALLBACK_CROSS: u8 = 1;
+
+/// [`VrpParams::hedge_mode`]: IoC at the perp's own touch.
+pub const HEDGE_MODE_TAKER: u8 = 0;
+/// [`VrpParams::hedge_mode`]: rest at the PASSIVE side of the perp's
+/// touch (a BUY at the bid, a SELL at the ask) and cross on the
+/// patience deadline. The default — P3.0's frontier puts this at
+/// 1.83 bps of spot against 5.12 for the taker, and the hedge error it
+/// gives up is ~100× smaller than the money it saves.
+pub const HEDGE_MODE_MAKER: u8 = 1;
+
+/// `Order.kind` of a RESTING order — the maker half of the I1 law,
+/// judged by `core_fill::judge_maker` on a STRICT cross at its own
+/// limit.
+pub use core_fill::ORDER_KIND_MAKER;
+
 /// The member's parameters, as parsed from `vrp.toml`
 /// (`core_config::vrp`) and handed in at [`VrpStrategy::configure`].
 ///
@@ -296,6 +326,27 @@ pub struct VrpParams {
     /// ([`VrpCounters::holds_side`]), because "the band said trade and
     /// policy said no" is a different fact from "the band said hold".
     pub sides: u8,
+    /// R1: [`ENTRY_MODE_IOC`] (default) or [`ENTRY_MODE_MAKER`].
+    pub entry_mode: u8,
+    /// R1: [`ENTRY_FALLBACK_ABANDON`] (default) or
+    /// [`ENTRY_FALLBACK_CROSS`].
+    pub entry_fallback: u8,
+    /// R2: [`HEDGE_MODE_TAKER`] or [`HEDGE_MODE_MAKER`] (default).
+    pub hedge_mode: u8,
+    /// R1: how long a maker entry rests. `0` = the whole remaining
+    /// decision band, which is the only window the entry is authorised
+    /// in anyway.
+    pub entry_patience_ns: u64,
+    /// R2: how long a maker hedge rests before it crosses. The cross
+    /// is UNCONDITIONAL — a hedge must complete.
+    pub hedge_patience_ns: u64,
+    /// R7's input: the venue's capped option trade fee, `min(index_bps
+    /// of the index notional, prem_bps of the premium)`. Used by the
+    /// COST term alone — the member does not book fees, the harness
+    /// does.
+    pub opt_fee_index_bps: u32,
+    /// See [`Self::opt_fee_index_bps`].
+    pub opt_fee_prem_bps: u32,
 }
 
 impl Default for VrpParams {
@@ -320,6 +371,13 @@ impl Default for VrpParams {
             qty_1e6: 1_000_000,
             band_qty_1e6: 50_000,
             sides: SIDES_BOTH,
+            entry_mode: ENTRY_MODE_IOC,
+            entry_fallback: ENTRY_FALLBACK_ABANDON,
+            hedge_mode: HEDGE_MODE_MAKER,
+            entry_patience_ns: 0,
+            hedge_patience_ns: 30_000_000_000,
+            opt_fee_index_bps: 3,
+            opt_fee_prem_bps: 1_250,
         }
     }
 }
@@ -409,6 +467,25 @@ pub struct VrpStrategy {
     /// perp tick yet, which is a reason not to submit.
     last_underlying_bid_1e6: i64,
     last_underlying_ask_1e6: i64,
+    /// R1: the SELECTED OPTION's own touch, in USD ×1e6, from its quote
+    /// lane (VRP V2a — every Deribit option has one). A maker entry
+    /// rests against this; the cost term prices the crossed half-spread
+    /// from it. `0` on either side = no fresh option quote, which is a
+    /// reason to fall back to the mark, never to guess.
+    last_opt_bid_1e6: i64,
+    last_opt_ask_1e6: i64,
+    /// Wall instant of that option touch, so a stale one can be told
+    /// from a fresh one by the same 30 s law the mark uses.
+    last_opt_touch_wall_ns: u64,
+    /// R2: the hedge in flight is a RESTING order. Its expiry is not a
+    /// failure — it is the handover to the unconditional cross, and the
+    /// two together are ONE attempt against the retry budget.
+    hedge_maker_pending: bool,
+    /// R1: the maker entry's own deadline, wall ns. `0` = no maker
+    /// entry is resting. Distinct from `opt_pending.deadline_wall_ns`,
+    /// which is when the member gives up on the leg ENTIRELY: this is
+    /// when the FALLBACK fires.
+    entry_maker_deadline_wall_ns: u64,
     /// Wall instant of that mid, so the settle rung can pick whichever
     /// of the two index sources is FRESHER.
     last_underlying_wall_ns: u64,
@@ -424,6 +501,10 @@ pub struct VrpStrategy {
     /// chain — which is exactly the case that state exists for.
     selected_strike_1e6: i64,
     selected_right: u8,
+    /// R1: contract size ×1e9 of the selected option, cached for the
+    /// same reason as the strike — the quote lane converts on EVERY
+    /// tick, and a registry lookup per tick is a lookup per tick.
+    selected_cs_1e9: i64,
     /// The last mark seen for [`Self::selected_sym`].
     last_mark: OptMarkCache,
 
@@ -519,11 +600,17 @@ impl VrpStrategy {
             last_underlying_mid_1e6: 0,
             last_underlying_bid_1e6: 0,
             last_underlying_ask_1e6: 0,
+            last_opt_bid_1e6: 0,
+            last_opt_ask_1e6: 0,
+            last_opt_touch_wall_ns: 0,
+            hedge_maker_pending: false,
+            entry_maker_deadline_wall_ns: 0,
             last_underlying_wall_ns: 0,
             selected_sym: SYMBOL_ID_NONE,
             expiry_ns: 0,
             selected_strike_1e6: 0,
             selected_right: RIGHT_CALL,
+            selected_cs_1e9: 0,
             last_mark: OptMarkCache::default(),
             side: SIDE_FLAT,
             killed: false,
@@ -990,6 +1077,10 @@ impl VrpStrategy {
                     self.next_rebalance_wall_ns = next_reb.max(0) as u64;
                     self.entry_done = entry_done;
                     self.selected_sym = self.find_contract(self.expiry_ns, strike, right as u8);
+                    self.selected_cs_1e9 = self
+                        .registry
+                        .get(self.selected_sym)
+                        .map_or(0, |r| r.contract_size_1e9);
                     st.campaign = true;
                     st.campaign_resolved = self.selected_sym != SYMBOL_ID_NONE;
                 }
@@ -1122,6 +1213,156 @@ impl VrpStrategy {
         )
     }
 
+    /// R1/R2: a RESTING order — the maker half of the I1 law. Judged by
+    /// `core_fill::judge_maker` on a STRICT cross at its own limit, so
+    /// a limit sitting exactly ON the touch does not fill on arrival;
+    /// it waits for the book to come through it.
+    fn maker(
+        &mut self,
+        sym: SymbolId,
+        px_1e6: i64,
+        qty_1e6: i64,
+        ttl_ns: u64,
+        now: NsTs,
+    ) -> Option<Order> {
+        if qty_1e6 == 0 || px_1e6 <= 0 || ttl_ns == 0 {
+            return None;
+        }
+        let side = if qty_1e6 > 0 { Side::Bid } else { Side::Ask };
+        let venue = VenueId::from_u8(core_types::symbol_venue_byte(sym))?;
+        let oid = self.next_oid();
+        Some(
+            Order::new(
+                now,
+                venue,
+                sym,
+                side,
+                ORDER_KIND_MAKER,
+                Price::from_raw(px_1e6),
+                Qty::from_raw(qty_1e6.abs()),
+                oid,
+            )
+            .with_ttl_ns(ttl_ns),
+        )
+    }
+
+    /// R1: is the selected option's own touch fresh enough to rest
+    /// against? The same 30 s law the mark uses — a quote older than
+    /// that means the lane is broken, not slow.
+    #[inline]
+    const fn opt_touch_fresh(&self, wall_ns: u64) -> bool {
+        self.last_opt_bid_1e6 > 0
+            && self.last_opt_ask_1e6 >= self.last_opt_bid_1e6
+            && wall_ns.saturating_sub(self.last_opt_touch_wall_ns) <= MARK_STALE_NS
+    }
+
+    /// R1: the maker entry's limit for `side`.
+    ///
+    /// Short vol SELLS the option, so it rests an ASK at
+    /// `max(mark, bid)`; long vol BUYS, so it rests a BID at
+    /// `min(mark, ask)`. Never worse than the mark — the mark is the
+    /// price the decision was taken at, and resting through it would
+    /// trade an edge the signal never claimed. Never through the touch
+    /// either: `max(mark, bid)` is at or above the bid and
+    /// `min(mark, ask)` at or below the ask, and the maker law needs a
+    /// STRICT cross, so neither is marketable on arrival.
+    #[inline]
+    const fn entry_limit_1e6(&self, side: i8, mark_1e6: i64) -> i64 {
+        if side == SIDE_SHORT_VOL {
+            if self.last_opt_bid_1e6 > mark_1e6 {
+                self.last_opt_bid_1e6
+            } else {
+                mark_1e6
+            }
+        } else if self.last_opt_ask_1e6 > 0 && self.last_opt_ask_1e6 < mark_1e6 {
+            self.last_opt_ask_1e6
+        } else {
+            mark_1e6
+        }
+    }
+
+    /// R1: how long a maker entry may rest.
+    ///
+    /// `entry_patience_ns == 0` means "the whole remaining decision
+    /// band", which is the only window the entry is authorised in
+    /// anyway: resting past `E − τ + selection` would fill an order the
+    /// decision no longer stands behind. A configured patience is
+    /// clamped to the same edge for the same reason.
+    fn entry_patience_ns(&self, wall_ns: u64) -> u64 {
+        let band_close = self
+            .expiry_ns
+            .saturating_sub(self.params.tau_ns)
+            .saturating_add(self.params.selection_ns);
+        let remaining = band_close.saturating_sub(wall_ns);
+        let want = if self.params.entry_patience_ns == 0 {
+            remaining
+        } else {
+            self.params.entry_patience_ns.min(remaining)
+        };
+        // A zero-length rest is not a maker order; give it the IoC's own
+        // TTL so the leg still has a deadline the sweep can read.
+        want.max(1).min(ORDER_TTL_NS.max(remaining))
+    }
+
+    /// R7's cost term: what one round of this campaign's option leg
+    /// costs in USD ×1e6 at `px_1e6` — the crossed HALF-spread plus the
+    /// venue's capped trade fee.
+    ///
+    /// The member does not book fees (the harness does); this exists so
+    /// a decision can be told apart from a decision that pays for
+    /// itself. With no fresh option touch the spread term is 0 and the
+    /// fee term alone stands, which is the conservative direction: it
+    /// never invents a cost that would block a trade.
+    fn opt_cost_1e6(&self, px_1e6: i64, wall_ns: u64) -> i64 {
+        let half_spread = if self.opt_touch_fresh(wall_ns) {
+            (self.last_opt_ask_1e6 - self.last_opt_bid_1e6) / 2
+        } else {
+            0
+        };
+        let index_1e6 = self.last_mark.underlying_px_1e9 / 1_000;
+        let index_leg = (index_1e6 as i128 * i128::from(self.params.opt_fee_index_bps)) / 10_000;
+        let prem_leg = (px_1e6 as i128 * i128::from(self.params.opt_fee_prem_bps)) / 10_000;
+        let fee = if index_leg < prem_leg { index_leg } else { prem_leg };
+        half_spread.saturating_add(i64::try_from(fee).unwrap_or(i64::MAX))
+    }
+
+    /// R7: the band half-width a decision at `px_1e6` must clear for
+    /// the trade to pay for itself — `θ + ln((premium + cost)/premium)`.
+    ///
+    /// θ itself is never changed (edge spec §2.2): this is the band the
+    /// COMPARISON runs at, and the parameter stays what the operator
+    /// set. `fx::ln_1e9` is integer and cold — once per decision.
+    fn theta_eff_1e9(&self, px_1e6: i64, wall_ns: u64) -> i64 {
+        if px_1e6 <= 0 {
+            return self.params.theta_1e9;
+        }
+        let cost = self.opt_cost_1e6(px_1e6, wall_ns);
+        if cost <= 0 {
+            return self.params.theta_1e9;
+        }
+        let ratio_1e9 = ((px_1e6 as i128 + cost as i128) * 1_000_000_000) / px_1e6 as i128;
+        let Ok(ratio) = u64::try_from(ratio_1e9) else {
+            return self.params.theta_1e9;
+        };
+        // `fx::ln_1e9` is `ln` of the RAW integer, so a fixed-point
+        // ratio needs its scale taken back out: `ln(r) = ln(r×1e9) −
+        // ln(1e9)`. Without that subtraction the band widens by 20.7
+        // log points and `bounds` overflows to `None` — which reads as
+        // a forecast failure, not a cost refusal.
+        let ln_scale = core_vol::fx::ln_1e9(1_000_000_000);
+        let ln_ratio = core_vol::fx::ln_1e9(ratio);
+        if ln_ratio == core_vol::fx::LOG2_UNDEFINED
+            || ln_scale == core_vol::fx::LOG2_UNDEFINED
+        {
+            return self.params.theta_1e9;
+        }
+        let ln = ln_ratio - ln_scale;
+        if ln <= 0 {
+            return self.params.theta_1e9;
+        }
+        self.params.theta_1e9.saturating_add(ln)
+    }
+
     /// Move the perp position to `target_1e6`, paper-accounting the
     /// move on a successful submit (doctrine clause 1).
     ///
@@ -1132,6 +1373,21 @@ impl VrpStrategy {
     /// fill law a SELL (`bid ≥ px`) filled and a BUY (`ask ≤ px`)
     /// almost never did, so the modelled hedge ratcheted short.
     fn move_hedge<C: Ctx>(&mut self, ctx: &mut C, target_1e6: i64, now: NsTs) -> bool {
+        self.move_hedge_as(ctx, target_1e6, now, false)
+    }
+
+    /// [`Self::move_hedge`], with the execution mode forced.
+    ///
+    /// `force_taker` is the R2 fallback: a resting hedge that reached
+    /// its patience deadline crosses, unconditionally and at the
+    /// THEN-current touch. A hedge must complete.
+    fn move_hedge_as<C: Ctx>(
+        &mut self,
+        ctx: &mut C,
+        target_1e6: i64,
+        now: NsTs,
+        force_taker: bool,
+    ) -> bool {
         // X1: one hedge order in flight at a time. A second would
         // double the move when both fill, which is exactly the class of
         // defect inferring positions from submits produced.
@@ -1193,23 +1449,53 @@ impl VrpStrategy {
                 return false;
             }
         }
-        let Some(order) = self.ioc(self.hedge_sym, px, delta, now) else {
+        // R2: a maker hedge rests at the PASSIVE side of the same touch
+        // — a BUY at the bid, a SELL at the ask — and crosses on the
+        // patience deadline. P3.0 priced that at 1.83 bps of spot
+        // against 5.12 for the taker, and the hedge error it gives up
+        // is ~100x smaller than the money it saves. The FALLBACK is
+        // unconditional (`sweep_pendings`): a hedge must complete.
+        let maker_hedge = !force_taker
+            && self.params.hedge_mode == HEDGE_MODE_MAKER
+            && self.params.hedge_patience_ns > 0;
+        let (limit, order) = if maker_hedge {
+            let l = if delta > 0 {
+                self.last_underlying_bid_1e6
+            } else {
+                self.last_underlying_ask_1e6
+            };
+            (
+                l,
+                self.maker(self.hedge_sym, l, delta, self.params.hedge_patience_ns, now),
+            )
+        } else {
+            (px, self.ioc(self.hedge_sym, px, delta, now))
+        };
+        let Some(order) = order else {
             return false;
         };
         let oid = order.client_oid;
         if !self.submit(ctx, order) {
             return false;
         }
+        if force_taker {
+            self.counters.hedge_crossed = self.counters.hedge_crossed.wrapping_add(1);
+        }
+        self.hedge_maker_pending = maker_hedge;
         // X1: the POSITION does not move here. A submit is an intent;
         // `on_fill` is where the book changes.
         self.hedge_pending = PendingLeg {
             oid,
             qty_1e6: delta,
-            px_1e6: px,
+            px_1e6: limit,
             deadline_wall_ns: self
                 .anchor
                 .wall_of(now)
-                .saturating_add(ORDER_TTL_NS)
+                .saturating_add(if maker_hedge {
+                    self.params.hedge_patience_ns
+                } else {
+                    ORDER_TTL_NS
+                })
                 .saturating_add(ACTIVATION_SLACK_NS),
             filled_1e6: 0,
         };
@@ -1232,10 +1518,17 @@ impl VrpStrategy {
         self.expiry_ns = 0;
         self.selected_strike_1e6 = 0;
         self.selected_right = RIGHT_CALL;
+        self.selected_cs_1e9 = 0;
         self.side = SIDE_FLAT;
         self.entry_done = false;
         self.hedge_frozen = false;
         self.last_mark = OptMarkCache::default();
+        // R1: the previous campaign's option touch is not this one's.
+        self.last_opt_bid_1e6 = 0;
+        self.last_opt_ask_1e6 = 0;
+        self.last_opt_touch_wall_ns = 0;
+        self.hedge_maker_pending = false;
+        self.entry_maker_deadline_wall_ns = 0;
         self.next_rebalance_wall_ns = 0;
         // X1: nothing of this campaign may chase a fill into the next
         // one. Both legs are flat by the debug_asserts above.
@@ -1657,6 +1950,7 @@ impl VrpStrategy {
                 if let Some(row) = self.registry.get(sym) {
                     self.selected_strike_1e6 = row.strike_1e6;
                     self.selected_right = row.right;
+                    self.selected_cs_1e9 = row.contract_size_1e9;
                 }
                 self.entry_done = false;
                 self.hedge_frozen = false;
@@ -1776,7 +2070,19 @@ impl VrpStrategy {
         // no position would pair an x with a hold that never happened.
         let sym = self.selected_sym;
         let px = self.last_mark.px_usd_1e6;
-        let Some(order) = self.ioc(sym, px, qty, now) else {
+        // R1: `maker` rests at the edge-derived limit for the whole
+        // decision band (or `entry_patience_ns` of it); `ioc` crosses at
+        // the mark, which is every measurement to date.
+        let maker_entry = self.params.entry_mode == ENTRY_MODE_MAKER
+            && self.opt_touch_fresh(wall_ns);
+        let (limit, order) = if maker_entry {
+            let l = self.entry_limit_1e6(side, px);
+            let ttl = self.entry_patience_ns(wall_ns);
+            (l, self.maker(sym, l, qty, ttl, now))
+        } else {
+            (px, self.ioc(sym, px, qty, now))
+        };
+        let Some(order) = order else {
             return;
         };
         // The regressor must be formed from minutes strictly BEFORE the
@@ -1800,6 +2106,16 @@ impl VrpStrategy {
             return;
         }
         self.side = side;
+        if maker_entry {
+            self.counters.entry_maker_submitted =
+                self.counters.entry_maker_submitted.wrapping_add(1);
+            // R1: the FALLBACK's own deadline — distinct from the leg's.
+            self.entry_maker_deadline_wall_ns = wall_ns
+                .saturating_add(self.entry_patience_ns(wall_ns))
+                .saturating_add(ACTIVATION_SLACK_NS);
+        } else {
+            self.entry_maker_deadline_wall_ns = 0;
+        }
         // X1: the position does NOT move here, and NO HEDGE GOES OUT.
         //
         // This is the F7 fix. The entry is an IoC, the fill law is
@@ -1810,9 +2126,13 @@ impl VrpStrategy {
         self.opt_pending = PendingLeg {
             oid,
             qty_1e6: qty,
-            px_1e6: px,
+            px_1e6: limit,
             deadline_wall_ns: wall_ns
-                .saturating_add(ORDER_TTL_NS)
+                .saturating_add(if maker_entry {
+                    self.entry_patience_ns(wall_ns)
+                } else {
+                    ORDER_TTL_NS
+                })
                 .saturating_add(ACTIVATION_SLACK_NS),
             filled_1e6: 0,
         };
@@ -1830,18 +2150,40 @@ impl VrpStrategy {
     /// Deribit drops an expired contract from the chain.
     fn sweep_pendings<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) {
         if self.opt_pending.is_open() && wall_ns >= self.opt_pending.deadline_wall_ns {
-            // The entry met no fill. The campaign is a HOLD: there is
-            // no position, so there is no hold for the forecast to
-            // score, and v1 does not retry — a second crossing of the
-            // same book is R1's question, not this phase's.
+            // The entry met no fill. R1 decides what happens next.
+            let was_maker = self.entry_maker_deadline_wall_ns > 0;
+            let qty = self.opt_pending.qty_1e6;
+            let side = self.side;
             self.opt_pending = PendingLeg::NONE;
-            self.counters.entries_unfilled = self.counters.entries_unfilled.wrapping_add(1);
-            self.vol.disarm();
-            self.side = SIDE_FLAT;
+            self.entry_maker_deadline_wall_ns = 0;
+            let crossed = was_maker
+                && self.params.entry_fallback == ENTRY_FALLBACK_CROSS
+                && self.cross_entry(ctx, side, qty, wall_ns, now);
+            if !crossed {
+                // A HOLD: there is no position, so there is no hold for
+                // the forecast to score.
+                self.counters.entries_unfilled = self.counters.entries_unfilled.wrapping_add(1);
+                self.vol.disarm();
+                self.side = SIDE_FLAT;
+            }
             self.bump_state();
         }
         if self.hedge_pending.is_open() && wall_ns >= self.hedge_pending.deadline_wall_ns {
+            let was_maker = self.hedge_maker_pending;
             self.hedge_pending = PendingLeg::NONE;
+            self.hedge_maker_pending = false;
+            if was_maker {
+                // R2: the rest expired. That is the HANDOVER, not a
+                // failure — the resting order and the cross that
+                // follows it are ONE attempt, so the retry budget is
+                // untouched. Charging the handover a retry would spend
+                // the ladder on a mode change and leave a real
+                // non-fill with nothing left to chase it.
+                let target = self.hedge_target_1e6;
+                self.move_hedge_as(ctx, target, now, true);
+                self.bump_state();
+                return;
+            }
             self.counters.hedge_unfilled = self.counters.hedge_unfilled.wrapping_add(1);
             if self.hedge_retries < HEDGE_RETRIES_MAX {
                 self.hedge_retries += 1;
@@ -1855,6 +2197,70 @@ impl VrpStrategy {
             }
             self.bump_state();
         }
+    }
+
+    /// R1: the one crossing an unfilled maker entry is allowed.
+    ///
+    /// **And only if the signal still clears the cost gate AT THE TOUCH
+    /// PRICE.** The edge that authorised a fill at the mark need not
+    /// survive the half-spread plus the fee — that is the whole reason
+    /// the fallback is a decision rather than a retry. A refusal is a
+    /// HOLD and is counted apart from a plain unfilled entry, because
+    /// "nobody came to my price" and "crossing would not have paid" are
+    /// different facts about the same campaign.
+    fn cross_entry<C: Ctx>(
+        &mut self,
+        ctx: &mut C,
+        side: i8,
+        qty_1e6: i64,
+        wall_ns: u64,
+        now: NsTs,
+    ) -> bool {
+        if qty_1e6 == 0 || side == SIDE_FLAT {
+            return false;
+        }
+        // The price a cross would actually get: the executable side of
+        // the option's own touch, falling back to the mark when no fresh
+        // quote exists (the same law `move_hedge` runs under).
+        let px = if !self.opt_touch_fresh(wall_ns) {
+            self.last_mark.px_usd_1e6
+        } else if side == SIDE_SHORT_VOL {
+            self.last_opt_bid_1e6
+        } else {
+            self.last_opt_ask_1e6
+        };
+        if px <= 0 || self.last_mark.iv_1e9 <= 0 {
+            return false;
+        }
+        let theta_eff = self.theta_eff_1e9(px, wall_ns);
+        let Some((lo, hi)) = self.vol.bounds(self.params.tau_ns, theta_eff) else {
+            return false;
+        };
+        let iv = self.last_mark.iv_1e9;
+        let still = if side == SIDE_SHORT_VOL { iv > hi } else { iv < lo };
+        if !still {
+            self.counters.entry_cost_refused =
+                self.counters.entry_cost_refused.wrapping_add(1);
+            return false;
+        }
+        let Some(order) = self.ioc(self.selected_sym, px, qty_1e6, now) else {
+            return false;
+        };
+        let oid = order.client_oid;
+        if !self.submit(ctx, order) {
+            return false;
+        }
+        self.counters.entry_crossed = self.counters.entry_crossed.wrapping_add(1);
+        self.opt_pending = PendingLeg {
+            oid,
+            qty_1e6,
+            px_1e6: px,
+            deadline_wall_ns: wall_ns
+                .saturating_add(ORDER_TTL_NS)
+                .saturating_add(ACTIVATION_SLACK_NS),
+            filled_1e6: 0,
+        };
+        true
     }
 
     /// The hourly hedge check.
@@ -1926,7 +2332,39 @@ impl Strategy for VrpStrategy {
     /// member does happens on an [`OptSummary`].
     #[inline]
     fn on_tick<C: Ctx>(&mut self, tick: &Tick, ctx: &mut C) {
-        if !self.configured || tick.sym != self.underlying_sym {
+        if !self.configured {
+            return;
+        }
+        // R1: the selected option's own quote lane. Cached and nothing
+        // else — the option lane drives no decision; the DECISION runs
+        // off `on_opt_summary`, which is where the mark and the IV are.
+        //
+        // THE DENOMINATION LAW APPLIES HERE TOO. An option quote is
+        // COIN on the wire (VRP V2a), exactly like the mark, and the
+        // whole of V2a exists because a coin number booked as dollars
+        // understates the leg by the underlying price. The conversion
+        // needs an underlying and a contract size, which only the last
+        // SUMMARY carries — so a quote that arrives before the first
+        // summary of the campaign is dropped rather than guessed at.
+        if self.selected_sym != SYMBOL_ID_NONE && tick.sym == self.selected_sym {
+            let (b, a) = (tick.bid_px.raw(), tick.ask_px.raw());
+            if !tick.is_stale() && b > 0 && a > 0 && a >= b {
+                let u = self.last_mark.underlying_px_1e9;
+                let cs = self.selected_cs_1e9;
+                if let (Some(bid), Some(ask)) = (
+                    b.checked_mul(1_000)
+                        .and_then(|c| opt_registry::coin_to_usd_1e6(c, u, cs)),
+                    a.checked_mul(1_000)
+                        .and_then(|c| opt_registry::coin_to_usd_1e6(c, u, cs)),
+                ) {
+                    self.last_opt_bid_1e6 = bid;
+                    self.last_opt_ask_1e6 = ask;
+                    self.last_opt_touch_wall_ns = self.anchor.wall_of(tick.ts_ns);
+                }
+            }
+            return;
+        }
+        if tick.sym != self.underlying_sym {
             return;
         }
         let now = tick.ts_ns;
@@ -2544,7 +2982,13 @@ mod tests {
     #[test]
     fn one_campaign_selects_enters_hedges_and_exits() {
         let mut ctx = RecCtx::new();
-        let params = VrpParams::default();
+        // These three pin the TAKER ladder, which is what they were
+        // written for; R2 made `maker` the DEFAULT, so they say so
+        // rather than inheriting it.
+        let params = VrpParams {
+            hedge_mode: HEDGE_MODE_TAKER,
+            ..VrpParams::default()
+        };
         let (mut m, _) = member(&mut ctx, params);
         assert!(m.on_start(&mut ctx).is_ok());
 
@@ -2758,7 +3202,13 @@ mod tests {
     /// believed it was flat.
     #[test]
     fn the_hedge_is_priced_at_the_perp_touch_not_the_forward() {
-        let params = VrpParams::default();
+        // These three pin the TAKER ladder, which is what they were
+        // written for; R2 made `maker` the DEFAULT, so they say so
+        // rather than inheriting it.
+        let params = VrpParams {
+            hedge_mode: HEDGE_MODE_TAKER,
+            ..VrpParams::default()
+        };
         // (a) SHORT vol ⇒ the hedge BUYS ⇒ the perp ASK.
         let mut ctx = RecCtx::new();
         let (mut m, _) = member(&mut ctx, params);
@@ -3045,7 +3495,13 @@ mod tests {
     #[test]
     fn an_unfilled_hedge_retries_at_the_touch_then_alerts() {
         let mut ctx = RecCtx::new();
-        let params = VrpParams::default();
+        // These three pin the TAKER ladder, which is what they were
+        // written for; R2 made `maker` the DEFAULT, so they say so
+        // rather than inheriting it.
+        let params = VrpParams {
+            hedge_mode: HEDGE_MODE_TAKER,
+            ..VrpParams::default()
+        };
         let (mut m, _) = member(&mut ctx, params);
         let sel = EXPIRY - TAU - params.selection_ns / 2;
         ctx.now = mono_of(sel);
@@ -3413,6 +3869,277 @@ mod tests {
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "and still be open");
         ctx.orders.clear();
         m
+    }
+
+    // ---------------- R1 / R2: execution modes ----------------
+    //
+    // R4 put 2.87 bps of spot on crossing the option spread and ~3 on
+    // the perp hedge, against a 5.93 bps gross short-vol edge. These
+    // are the two knobs that attack them.
+
+    /// An option QUOTE tick for the selected sym. COIN on the wire, as
+    /// the venue sends it (VRP V2a) — the member converts.
+    fn opt_tick(wall_ns: u64, sym: SymbolId, bid_coin_1e6: i64, ask_coin_1e6: i64) -> Tick {
+        Tick::new(
+            mono_of(wall_ns),
+            VenueId::Deribit,
+            sym,
+            0,
+            Price::from_raw(bid_coin_1e6),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask_coin_1e6),
+            Qty::from_raw(1_000_000),
+        )
+    }
+
+    /// A member positioned at the selection instant with its option
+    /// touch cached, ready to decide. Returns `(member, entry_wall)`.
+    fn maker_ready(ctx: &mut RecCtx, params: VrpParams) -> (VrpStrategy, u64) {
+        let (mut m, _) = member(ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), ctx);
+        // The quote lane, AFTER the first summary: the conversion needs
+        // an underlying, and one that arrives before it is dropped.
+        ctx.now = mono_of(sel + 1_000_000_000);
+        m.on_tick(&opt_tick(sel + 1_000_000_000, opt_sym(4), 3_600, 4_000), ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry - MINUTE_NS);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), ctx);
+        // The option touch has to be FRESH at the decision instant —
+        // the same 30 s law the mark runs under. A quote cached at the
+        // selection window is five minutes old by then.
+        m.on_tick(&opt_tick(entry - 1_000_000_000, opt_sym(4), 3_600, 4_000), ctx);
+        ctx.orders.clear();
+        (m, entry)
+    }
+
+    #[test]
+    fn the_entry_limit_is_never_inside_the_touch() {
+        // mark 0.0038 coin at $79,000 = $300.20; the touch is
+        // 0.0036 / 0.0040 coin = $284.40 / $316.00.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            entry_mode: ENTRY_MODE_MAKER,
+            ..VrpParams::default()
+        };
+        let (m, _entry) = maker_ready(&mut ctx, params);
+        let mark = m.last_mark.px_usd_1e6;
+        assert!(mark > 0, "the mark is cached");
+        assert!(m.last_opt_bid_1e6 > 0 && m.last_opt_ask_1e6 > m.last_opt_bid_1e6);
+
+        // SHORT vol sells: the ask rests at max(mark, bid) — at or above
+        // the bid, so the maker law's STRICT cross cannot fill it on
+        // arrival, and never below the mark the decision was taken at.
+        let l_short = m.entry_limit_1e6(SIDE_SHORT_VOL, mark);
+        assert!(l_short >= m.last_opt_bid_1e6, "never through the bid");
+        assert!(l_short >= mark, "never worse than the mark");
+        // LONG vol buys: the bid rests at min(mark, ask).
+        let l_long = m.entry_limit_1e6(SIDE_LONG_VOL, mark);
+        assert!(l_long <= m.last_opt_ask_1e6, "never through the ask");
+        assert!(l_long <= mark, "never worse than the mark");
+
+        // And with the touch INSIDE the mark on one side, the better of
+        // the two wins rather than the touch blindly.
+        let mut m2 = m;
+        m2.last_opt_bid_1e6 = mark + 1_000_000;
+        assert_eq!(
+            m2.entry_limit_1e6(SIDE_SHORT_VOL, mark),
+            mark + 1_000_000,
+            "a bid above the mark is a better sell than the mark"
+        );
+    }
+
+    #[test]
+    fn a_maker_entry_rests_then_abandons_or_crosses_by_policy() {
+        // --- abandon (the default) ---
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            entry_mode: ENTRY_MODE_MAKER,
+            entry_fallback: ENTRY_FALLBACK_ABANDON,
+            ..VrpParams::default()
+        };
+        let (mut m, entry) = maker_ready(&mut ctx, params);
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(ctx.orders.len(), 1, "one entry, resting");
+        assert_eq!(ctx.orders[0].kind, ORDER_KIND_MAKER, "it RESTS");
+        assert_eq!(m.vrp_counters().entry_maker_submitted, 1);
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "no fill, no position");
+        // Nobody comes to it. Past the deadline it is a HOLD.
+        let late = entry + params.selection_ns + 2 * ACTIVATION_SLACK_NS;
+        ctx.now = mono_of(late);
+        m.on_tick(&tick(late, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.vrp_counters().entries_unfilled, 1);
+        assert_eq!(m.vrp_counters().entry_crossed, 0, "abandon does not cross");
+        assert_eq!(ctx.orders.len(), 1, "and emits nothing further");
+
+        // --- cross ---
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            entry_mode: ENTRY_MODE_MAKER,
+            entry_fallback: ENTRY_FALLBACK_CROSS,
+            ..VrpParams::default()
+        };
+        let (mut m, entry) = maker_ready(&mut ctx, params);
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(ctx.orders[0].kind, ORDER_KIND_MAKER);
+        // Keep the option touch fresh across the deadline, or the cross
+        // has no price to read.
+        let late = entry + params.selection_ns + 2 * ACTIVATION_SLACK_NS;
+        ctx.now = mono_of(late - 1_000_000_000);
+        m.on_tick(
+            &opt_tick(late - 1_000_000_000, opt_sym(4), 3_600, 4_000),
+            &mut ctx,
+        );
+        ctx.now = mono_of(late);
+        m.on_tick(&tick(late, 79_000_000_000, false), &mut ctx);
+        // 500 % IV against a ~20 % forecast clears the cost gate by a
+        // wide margin, so the fallback fires.
+        assert_eq!(m.vrp_counters().entry_crossed, 1, "{:?}", m.vrp_counters());
+        assert_eq!(m.vrp_counters().entries_unfilled, 0, "a cross is not a hold");
+        assert_eq!(ctx.orders.len(), 2);
+        assert_eq!(ctx.orders[1].kind, ORDER_KIND_IOC, "the fallback CROSSES");
+        assert_eq!(
+            ctx.orders[1].px.raw(),
+            m.last_opt_bid_1e6,
+            "a short-vol cross sells at the BID, the executable side"
+        );
+    }
+
+    #[test]
+    fn a_cross_that_would_not_pay_for_itself_is_refused() {
+        // R7's gate, on the one path P3 uses it: the edge that
+        // authorised a fill at the mark need not survive the spread.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            entry_mode: ENTRY_MODE_MAKER,
+            entry_fallback: ENTRY_FALLBACK_CROSS,
+            ..VrpParams::default()
+        };
+        let (mut m, entry) = maker_ready(&mut ctx, params);
+        ctx.now = mono_of(entry);
+        // An IV only just outside the band: it clears theta, and the
+        // cost term is what takes it away.
+        let (_lo, hi) = m.vol.bounds(params.tau_ns, params.theta_1e9).expect("bounds");
+        let iv = hi + hi / 1_000;
+        m.on_opt_summary(&summary(entry, opt_sym(4), iv, 500_000_000), &mut ctx);
+        assert_eq!(ctx.orders.len(), 1, "the band opened: {:?}", m.vrp_counters());
+        let late = entry + params.selection_ns + 2 * ACTIVATION_SLACK_NS;
+        ctx.now = mono_of(late - 1_000_000_000);
+        m.on_tick(
+            &opt_tick(late - 1_000_000_000, opt_sym(4), 3_600, 4_000),
+            &mut ctx,
+        );
+        ctx.now = mono_of(late);
+        m.on_tick(&tick(late, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.vrp_counters().entry_cost_refused, 1, "{:?}", m.vrp_counters());
+        assert_eq!(m.vrp_counters().entry_crossed, 0);
+        assert_eq!(m.vrp_counters().entries_unfilled, 1, "a refusal is a HOLD");
+        assert_eq!(ctx.orders.len(), 1, "and nothing was emitted");
+        // The gate is the COST, not theta: theta alone would have taken it.
+        assert!(
+            m.theta_eff_1e9(m.last_mark.px_usd_1e6, late) > params.theta_1e9,
+            "the cost term widened the band"
+        );
+    }
+
+    #[test]
+    fn a_maker_hedge_always_completes_by_the_fallback() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams {
+            hedge_mode: HEDGE_MODE_MAKER,
+            hedge_patience_ns: 30_000_000_000,
+            ..VrpParams::default()
+        };
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        // The option leg fills; the hedge goes out FROM that fill (X1).
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        assert_eq!(ctx.orders.len(), n);
+        let hedge = ctx.orders[n - 1];
+        assert_eq!(hedge.kind, ORDER_KIND_MAKER, "it RESTS at the touch");
+        assert_eq!(
+            hedge.px.raw(),
+            79_000_000_000 - 500_000,
+            "a BUY rests at the PASSIVE side, which is the BID"
+        );
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "resting is not filled");
+
+        // Nobody fills it. The patience deadline CROSSES, unconditionally.
+        let late = entry + params.hedge_patience_ns + 2 * ACTIVATION_SLACK_NS;
+        ctx.now = mono_of(late);
+        m.on_tick(&tick(late, 79_000_000_000, false), &mut ctx);
+        // R2: the rest expiring is the HANDOVER, not a non-fill — the
+        // retry budget is untouched, which is what leaves the ladder
+        // intact for a cross that genuinely does not fill.
+        assert_eq!(m.vrp_counters().hedge_unfilled, 0, "{:?}", m.vrp_counters());
+        assert_eq!(m.vrp_counters().hedge_crossed, 1, "{:?}", m.vrp_counters());
+        let cross = *ctx.orders.last().expect("a fallback order");
+        assert_eq!(cross.kind, ORDER_KIND_IOC, "the fallback crosses");
+        fill_all(&mut m, &mut ctx, mono_of(late));
+        assert_eq!(m.perp_pos_qty_1e6(), 500_000, "and the hedge COMPLETED");
+    }
+
+    #[test]
+    fn the_ioc_entry_path_is_untouched_by_the_new_keys() {
+        // The default is what every measurement to date was made on, and
+        // a new key must not move it.
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        assert_eq!(params.entry_mode, ENTRY_MODE_IOC);
+        assert_eq!(params.entry_fallback, ENTRY_FALLBACK_ABANDON);
+        let (mut m, entry) = maker_ready(&mut ctx, params);
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(ctx.orders.len(), 1);
+        assert_eq!(ctx.orders[0].kind, ORDER_KIND_IOC, "still an IoC");
+        assert_eq!(
+            ctx.orders[0].px.raw(),
+            m.last_mark.px_usd_1e6,
+            "still at the MARK"
+        );
+        assert_eq!(m.vrp_counters().entry_maker_submitted, 0);
+    }
+
+    #[test]
+    fn an_option_quote_is_converted_from_coin_before_it_is_cached() {
+        // VRP V2a, on the one lane that did not have it: a quote is COIN
+        // on the wire and booking it as dollars understates the leg by
+        // the underlying price.
+        let mut ctx = RecCtx::new();
+        let (m, _entry) = maker_ready(&mut ctx, VrpParams::default());
+        // 0.0036 coin at $79,000 x contract size 1.0 = $284.40.
+        assert_eq!(m.last_opt_bid_1e6, 284_400_000);
+        assert_eq!(m.last_opt_ask_1e6, 316_000_000);
+        assert!(
+            m.last_opt_bid_1e6 > 1_000_000,
+            "a coin number booked as dollars would be ~0.0036"
+        );
+    }
+
+    #[test]
+    fn an_option_quote_before_the_first_summary_is_dropped() {
+        // The conversion needs an underlying, and only a SUMMARY carries
+        // one. A quote that arrives first is dropped, never guessed at.
+        let mut ctx = RecCtx::new();
+        let (mut m, _) = member(&mut ctx, VrpParams::default());
+        let sel = EXPIRY - TAU - VrpParams::default().selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        // Selection happened, but wipe the mark to simulate "no summary
+        // for this instrument yet".
+        m.last_mark = OptMarkCache::default();
+        m.on_tick(&opt_tick(sel + 1, opt_sym(4), 3_600, 4_000), &mut ctx);
+        assert_eq!(m.last_opt_bid_1e6, 0, "dropped, not booked as dollars");
     }
 
     #[test]

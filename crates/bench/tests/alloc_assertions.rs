@@ -4698,6 +4698,193 @@ fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
     assert_eq!(bytes, 0, "strategy-vrp hot bytes should be zero: saw {bytes}");
 }
 
+/// Gate 46b (VRP P3.1, R1/R2): the same member under the EXECUTION
+/// modes — a resting option entry with the cross fallback, a resting
+/// hedge with its unconditional cross, and the option QUOTE lane
+/// feeding `on_tick` on every step.
+///
+/// The quote lane is the part that matters here: it is a new branch on
+/// the hottest callback the member has, it runs a `checked_mul` and two
+/// `coin_to_usd_1e6` conversions per tick, and `opt_cost_1e6` /
+/// `theta_eff_1e9` reach `fx::ln_1e9` on the fallback path. None of
+/// that may allocate.
+#[test]
+fn vrp_member_execution_modes_are_zero_alloc() {
+    use core_types::{make_symbol_id, OptSummary, Price, Qty, Tick, OPT_SUMMARY_FLAG_MARK_PX};
+    use opt_registry::{OptInstrument, RIGHT_CALL, RIGHT_PUT};
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    const MONO0: u64 = 3_191_000_000_000_000;
+    const EXPIRY: u64 = 1_789_027_200_000_000_000;
+    const WALL0: u64 = EXPIRY - 172_800_000_000_000;
+    const MINUTE_NS: u64 = 60_000_000_000;
+
+    struct SinkCtx {
+        n: u64,
+        now: u64,
+        last: Option<core_types::Order>,
+    }
+    impl Ctx for SinkCtx {
+        fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
+            self.n += 1;
+            self.last = Some(order);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let perp = make_symbol_id(VenueId::Deribit, 1);
+    let opt = make_symbol_id(VenueId::Deribit, 513 + 8);
+    let mut reg = opt_registry::OptRegistry::new();
+    let mut k = 0u32;
+    while k < 16 {
+        reg.insert(OptInstrument::new(
+            make_symbol_id(VenueId::Deribit, 513 + k),
+            perp,
+            VenueId::Deribit as u8,
+            EXPIRY,
+            (77_000 + 250 * k as i64) * 1_000_000,
+            if k % 2 == 0 { RIGHT_CALL } else { RIGHT_PUT },
+            1_000_000_000,
+        ))
+        .expect("boot insert");
+        k += 1;
+    }
+
+    let mut m = Box::new(strategy_vrp::VrpStrategy::new());
+    m.configure(
+        strategy_vrp::VrpParams {
+            entry_mode: strategy_vrp::ENTRY_MODE_MAKER,
+            entry_fallback: strategy_vrp::ENTRY_FALLBACK_CROSS,
+            hedge_mode: strategy_vrp::HEDGE_MODE_MAKER,
+            ..strategy_vrp::VrpParams::default()
+        },
+        reg,
+        perp,
+        perp,
+        core_time::WallAnchor::new(MONO0, WALL0),
+        [0u8; 32],
+    )
+    .expect("configure");
+
+    let mono_of = |wall: u64| MONO0.wrapping_add(wall.wrapping_sub(WALL0));
+    let mk_tick = |wall: u64, px: i64| {
+        Tick::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            perp,
+            0,
+            Price::from_raw(px - 500_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(px + 500_000),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    // The option's own quote lane: COIN on the wire, as the venue sends
+    // it. 0.0036 / 0.0040 BTC around a 0.0038 mark.
+    let mk_opt_tick = |wall: u64| {
+        Tick::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            opt,
+            0,
+            Price::from_raw(3_600),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(4_000),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let mk_opt = |wall: u64, iv: i64| {
+        OptSummary::new(
+            mono_of(wall),
+            VenueId::Deribit,
+            opt,
+            OPT_SUMMARY_FLAG_MARK_PX,
+            3_800_000,
+            iv,
+            79_000_000_000_000,
+            0,
+            500_000_000,
+            1,
+            1,
+            -1,
+        )
+    };
+
+    let mut ctx = SinkCtx { n: 0, now: MONO0, last: None };
+    let mut wall = WALL0;
+    let mut px = 79_000_000_000i64;
+    let mut s = 20_260_913i64;
+    let mut i = 0usize;
+    while i < 1_442 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+        m.on_tick(&mk_tick(wall, px), &mut ctx);
+        wall += MINUTE_NS;
+        i += 1;
+    }
+    let mut j = 0i64;
+    while j < 60 {
+        m.seed_pair(24_000_000_000 + j * 11_000_000, 24_100_000_000 + j * 9_000_000);
+        j += 1;
+    }
+
+    let g = AllocGuard::new();
+    let start = EXPIRY - 28_800_000_000_000 - 600_000_000_000;
+    let mut w = start;
+    let mut n = 0usize;
+    while n < 4_000 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        px = (px + ((s as u64 >> 32) % 40_000_000) as i64 - 20_000_000).max(1_000_000_000);
+        ctx.now = mono_of(w);
+        m.on_opt_summary(&mk_opt(w, 5_000_000_000), &mut ctx);
+        // The new branch: the selected option's own quote, converted.
+        m.on_tick(&mk_opt_tick(w), &mut ctx);
+        m.on_tick(&mk_tick(w, px), &mut ctx);
+        // Every OTHER order fills, so the sweep, the cross fallback and
+        // the maker handover all run inside the guard.
+        if n % 2 == 0 {
+            if let Some(o) = ctx.last.take() {
+                let f = core_types::Fill::new(
+                    mono_of(w),
+                    o.sym,
+                    o.side,
+                    o.px,
+                    o.qty,
+                    o.client_oid,
+                )
+                .with_attribution(1, core_types::FILL_ORIGIN_PAPER);
+                m.on_fill(&f, &mut ctx);
+            }
+        } else {
+            ctx.last = None;
+        }
+        w += 7_500_000_000;
+        n += 1;
+    }
+    let counters = m.vrp_counters();
+    std::hint::black_box((ctx.n, counters));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(counters.decisions > 0, "a real decision");
+    assert!(
+        counters.entry_maker_submitted > 0,
+        "the gate must measure a RESTING entry: {counters:?}"
+    );
+    assert!(ctx.n > 0, "real submits");
+    assert_eq!(
+        allocs, 0,
+        "strategy-vrp execution modes allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "execution-mode hot bytes should be zero: saw {bytes}");
+}
+
 /// Gate 46 (XSD-2, statarb doc 08 §3.9): the xsd member's live callbacks
 /// at full capacity — 128 targets × 3 partners over 130 syms with a
 /// 720-hour window — through 24 hourly rolls (each `O(pairs × window)`),

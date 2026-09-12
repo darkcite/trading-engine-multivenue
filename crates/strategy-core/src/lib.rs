@@ -700,6 +700,22 @@ pub struct VrpCounters {
     /// flight — a late partial after a deadline, or a mis-stamped
     /// fill. Counted, never booked.
     pub fills_ignored: u64,
+    /// R1: entries submitted as a RESTING maker order rather than an
+    /// IoC. `entries_submitted − entry_maker_submitted` is the number
+    /// that crossed at the mark.
+    pub entry_maker_submitted: u64,
+    /// R1: unfilled maker entries the fallback CROSSED at the touch.
+    pub entry_crossed: u64,
+    /// R1: unfilled maker entries the fallback REFUSED to cross,
+    /// because the signal no longer cleared the cost gate at the touch
+    /// price. Counted apart from `entries_unfilled`: "nobody came to my
+    /// price" and "crossing would not have paid" are different facts.
+    pub entry_cost_refused: u64,
+    /// R2: hedges that crossed after a maker rest expired. A hedge must
+    /// complete, so this is the unconditional fallback firing — not an
+    /// error, but the number that says how much of the maker saving is
+    /// real.
+    pub hedge_crossed: u64,
 }
 
 /// XSD counters (`engine_xsd_*`), mirrored by the cli's generic 5 s
