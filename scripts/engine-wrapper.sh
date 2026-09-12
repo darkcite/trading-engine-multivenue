@@ -81,6 +81,30 @@ if [ -f "$HOME/multivenue/xsd-table.tsv" ]; then
     echo "engine-wrapper: xsd seed export failed — the member warms live" >&2
 fi
 
+# BIN15 O5 (spec §7.1): the slot-3 member's warm-up seeds — 1 441
+# stamped minute returns to fill the HAR window and 128 fitted pairs per
+# tenor, cut from candles.db right before the boot. Without them the
+# forecast needs 24 h of live minutes and 60 quarter-hours of settled
+# pairs, and the restart lane fires three times a UTC day, so the member
+# would never price at all. Best-effort like the two above: no
+# `bin15.toml` ⇒ nothing to export; a failed export leaves a stale or
+# absent seed and the member holds until its own window warms (boot tell
+# `bin15: … seeds=0 daily_seeds=0`).
+#
+# TWO files per coin, and the second is not optional decoration: a pair
+# belongs to ONE tenor, so the 15 m families read
+# `bin15-seed-<COIN>.tsv` and the native-daily ones read
+# `bin15-seed-<COIN>-1d.tsv`. `seed-all` writes exactly the set the
+# artifact's `underlying` list implies, under the names boot looks up.
+# DERIVED data (candles), never a capture window — the ≤ 2 h law holds.
+if [ -f "$HOME/multivenue/bin15.toml" ]; then
+  ( cd claude-worker && uv run python -m claude_worker.bin15_seed seed-all \
+      --db "$HOME/multivenue/worker/candles.db" \
+      --bin15 "$HOME/multivenue/bin15.toml" \
+      --dir "$HOME/multivenue" ) ||
+    echo "engine-wrapper: bin15 seed export failed — the member warms live" >&2
+fi
+
 # M5-prep #7b (operator ruling 7(b); remediation plan 2026-08-28): a
 # committed ruleset's table is IN-MEMORY — every boot must re-stage +
 # re-commit the registry's active ruleset or nothing AI-authored

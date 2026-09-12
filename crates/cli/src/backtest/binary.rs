@@ -224,26 +224,59 @@ pub fn settle_value(marks: &[(u64, i64)], inst: &BinaryInstance) -> Option<i64> 
 pub fn underlying_map(by_descriptor: &BTreeMap<String, u32>) -> BTreeMap<u32, u32> {
     let mut out: BTreeMap<u32, u32> = BTreeMap::new();
     for (desc, sym) in by_descriptor {
-        let Some(body) = desc.strip_prefix("hyperliquid:") else {
+        let Some(under) = underlying_descriptor_of(desc) else {
             continue;
         };
-        let Some(key) = body.strip_suffix("[yes]") else {
-            continue;
-        };
-        if !(key.starts_with("out:") || key.starts_with("native:")) {
-            continue;
-        }
-        // `<deployer>:<COIN>:<period>`
-        let mut parts = key.split(':');
-        let _deployer = parts.next();
-        let Some(coin) = parts.next() else {
-            continue;
-        };
-        if let Some(&perp) = by_descriptor.get(&format!("hyperliquid:{coin}")) {
+        if let Some(&perp) = by_descriptor.get(&under) {
             out.insert(*sym, perp);
         }
     }
     out
+}
+
+/// The UNDERLYING descriptor a HIP-4 Yes-leg descriptor prices off, or
+/// `None` when this is not a Yes leg.
+///
+/// `hyperliquid:out:BTC:15m[yes]` → `hyperliquid:BTC`. One parse, two
+/// callers: [`underlying_map`] keys the backtest merge's `Mark`
+/// admission on it, and `audit_pnl` keys its own on the same law — two
+/// copies is how the two surfaces come to disagree about which marks
+/// are even in the window.
+#[must_use]
+pub fn underlying_descriptor_of(desc: &str) -> Option<String> {
+    let body = desc.strip_prefix("hyperliquid:")?;
+    let key = body.strip_suffix("[yes]")?;
+    if !(key.starts_with("out:") || key.starts_with("native:")) {
+        return None;
+    }
+    // `<deployer>:<COIN>:<period>`
+    let mut parts = key.split(':');
+    let _deployer = parts.next();
+    let coin = parts.next()?;
+    let period = parts.next()?;
+    if period.is_empty() || parts.next().is_some() || coin.is_empty() {
+        return None;
+    }
+    Some(format!("hyperliquid:{coin}"))
+}
+
+/// The No-leg descriptor paired with a Yes-leg one, or `None` when this
+/// is not a Yes leg.
+///
+/// The two legs of one outcome are complementary by construction, and
+/// the Yes leg is the pair's NAME everywhere else in the lane — the
+/// roll event carries it, the artifact's slot table starts from it, and
+/// `SetBinarySpec` refuses anything else. Offline, `sym_no = sym_yes +
+/// 1` holds only where syms are the universe's own ordinals; a surface
+/// that INTERNS by descriptor (audit-pnl) has to pair them by name, and
+/// this is that name.
+#[must_use]
+pub fn no_descriptor_of(desc: &str) -> Option<String> {
+    let body = desc.strip_suffix("[yes]")?;
+    // Refuse anything that is not a HIP-4 Yes leg, so the two laws
+    // cannot disagree about what a pair even is.
+    underlying_descriptor_of(desc)?;
+    Some(format!("{body}[no]"))
 }
 
 /// Register every instance this window can settle on the engine.
@@ -260,14 +293,38 @@ pub fn register_binary_model(
     underlying_of: &BTreeMap<u32, u32>,
     window_end_wall_ns: u64,
 ) -> BinaryRegistration {
-    let mut reg = BinaryRegistration::default();
     let instances = instances_from_events(merged);
     if instances.is_empty() {
-        return reg;
+        return BinaryRegistration::default();
     }
     let marks = marks_by_sym(merged);
+    apply_binary_settlements(engine, &instances, &marks, underlying_of, window_end_wall_ns)
+}
+
+/// Register a settlement schedule on one fill engine.
+///
+/// The law, once, for every surface that scores a binary: `backtest`
+/// and `backtest --member` reach it through [`register_binary_model`]
+/// (which reads the instances and marks out of `merged`), and
+/// `audit_pnl` reaches it directly, because that surface INTERNS its
+/// syms by descriptor and builds the same two collections its own way.
+/// One law and two collectors; not two laws.
+///
+/// `marks` must be ASCENDING in `ts` per sym: a zero-TWAP instance
+/// settles at the last mark at or before its expiry, which is a scan
+/// that trusts the order.
+///
+/// DOCTRINE: offline path — allocates freely.
+pub fn apply_binary_settlements(
+    engine: &mut FillEngine,
+    instances: &[BinaryInstance],
+    marks: &BTreeMap<u32, Vec<(u64, i64)>>,
+    underlying_of: &BTreeMap<u32, u32>,
+    window_end_wall_ns: u64,
+) -> BinaryRegistration {
+    let mut reg = BinaryRegistration::default();
     let empty: Vec<(u64, i64)> = Vec::new();
-    for inst in &instances {
+    for inst in instances {
         reg.instances += 1;
         if inst.settle_ns() > window_end_wall_ns || inst.expiry_ns == 0 {
             reg.unsettleable += 1;

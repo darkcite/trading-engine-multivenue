@@ -381,6 +381,44 @@ struct AuditOptOut {
     index_book: crate::backtest::opt::UnderlyingBook,
 }
 
+/// BIN15 O5a: the HIP-4 settlement schedule, collected the way THIS
+/// surface has to collect it.
+///
+/// `backtest` reads the instances and the marks out of its own `merged`
+/// timeline, where a sym is the universe's ordinal and the No leg is
+/// therefore `sym_yes + 1`. This surface INTERNS by descriptor, so
+/// neither holds: the legs are paired by NAME
+/// (`binary::no_descriptor_of`) and the underlying is found by name too
+/// (`binary::underlying_descriptor_of`). Same law, different collector
+/// — which is exactly why the law lives in `backtest::binary` and the
+/// collectors do not duplicate it.
+///
+/// Nothing here enters the event stream. A `Mark` has no consumer in
+/// the replay loop and an `InstrumentRoll` has none either; only the
+/// SCHEDULE is needed, and building it in its own pass is what keeps
+/// every existing audit-pnl number byte-identical (the 8-window pool
+/// hashed `725d1d2748de79df` before this lane and after it).
+#[derive(Default)]
+struct AuditBinOut {
+    /// Every instance the roll rows named, dense syms, deduped by
+    /// outcome (the venue's own identity for the instrument).
+    instances: Vec<crate::backtest::binary::BinaryInstance>,
+    /// The underlying's mark series per dense sym, ASCENDING in ts —
+    /// which `settle_value` relies on for a zero-TWAP instance.
+    marks: BTreeMap<u32, Vec<(u64, i64)>>,
+    /// Yes-leg dense sym → its underlying's dense sym.
+    underlying_of: BTreeMap<u32, u32>,
+    /// Roll rows read (created only; settled rows name the predecessor).
+    rolls: u64,
+    /// Mark rows kept — HIP-4 underlyings only.
+    marks_kept: u64,
+    /// Roll rows dropped because the Yes leg had no resolvable
+    /// descriptor pair or no underlying in the manifest. Non-zero means
+    /// the capture names a family whose manifest rows are incomplete,
+    /// and its positions will mark out instead of settling.
+    rolls_unpaired: u64,
+}
+
 /// Per-run load stats (stderr surface).
 #[derive(Clone, Debug, Default)]
 struct RunLoad {
@@ -430,6 +468,7 @@ fn load_run_events(
     run: &RunDir,
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
+    bin_out: &mut AuditBinOut,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
@@ -826,6 +865,119 @@ fn load_run_events(
             );
         }
     }
+    // BIN15 O5a: the HIP-4 settlement schedule. A separate pass over the
+    // same event files, deliberately: nothing in the replay loop
+    // consumes a `Mark` or an `InstrumentRoll`, so admitting them to
+    // `evs` would change the merged stream (and therefore the regime
+    // replay's input and every number downstream) to carry records
+    // nobody reads.
+    //
+    // `Mark` is kept ONLY for a HIP-4 UNDERLYING, the same restriction
+    // the backtest merge applies and for the same reason: `Mark` is
+    // also OKX's mark-price channel, which every historical root
+    // carries in bulk.
+    if !evs.is_empty() {
+        let ts_first = evs[0].ts_ns;
+        let wall_of = |raw: u64| run.epoch_ns + raw.saturating_sub(ts_first);
+        // The underlyings this run's manifest actually names, by
+        // descriptor — built from the manifest, which is read at the
+        // top of this function, so the filter never needs a sym it has
+        // not interned yet.
+        // Only underlyings the manifest ACTUALLY carries. A family whose
+        // underlying this capture never recorded cannot be settled at
+        // all — there is no mark series to average — and saying so
+        // through `rolls_unpaired` is the difference between a counter
+        // that names a real hole and one that can never fire.
+        //
+        // The NO leg is deliberately NOT required here: its descriptor
+        // is derived from the Yes leg's by name, and a settlement
+        // registered for a sym nobody traded is harmless, while
+        // refusing the whole instance over a missing manifest row would
+        // make a perfectly settleable Yes position mark out.
+        let mut under_desc: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        if let Some(m) = manifest.as_ref() {
+            let have: std::collections::BTreeSet<&str> =
+                m.values().map(String::as_str).collect();
+            for desc in m.values() {
+                if let Some(u) = crate::backtest::binary::underlying_descriptor_of(desc) {
+                    if have.contains(u.as_str()) {
+                        under_desc.insert(u);
+                    }
+                }
+            }
+        }
+        for label in &VENUE_LABELS {
+            let path = run.path.join(format!("{label}-events.pmlr"));
+            let Some(reader) = open_checked::<ChannelEvent>(&path, SlotKind::Event, run.epoch_ns)?
+            else {
+                continue;
+            };
+            for e in reader.records() {
+                if e.venue != core_types::VenueId::Hyperliquid as u8 || e.sym == SYMBOL_ID_NONE {
+                    continue;
+                }
+                let desc = manifest.as_ref().and_then(|m| m.get(&e.sym));
+                if e.channel == ChannelId::InstrumentRoll as u8 {
+                    let (outcome, twap_s, family, settled) =
+                        crate::backtest::binary::unpack_roll_seq(e.venue_seq);
+                    if settled || outcome == 0 || e.v1 <= 0 {
+                        continue;
+                    }
+                    bin_out.rolls += 1;
+                    // The Yes leg is the pair's NAME; both legs and the
+                    // underlying are resolved by descriptor, because a
+                    // dense ordinal carries no pool arithmetic.
+                    let Some(yes_desc) = desc else {
+                        bin_out.rolls_unpaired += 1;
+                        continue;
+                    };
+                    let (Some(no_desc), Some(u_desc)) = (
+                        crate::backtest::binary::no_descriptor_of(yes_desc),
+                        crate::backtest::binary::underlying_descriptor_of(yes_desc),
+                    ) else {
+                        bin_out.rolls_unpaired += 1;
+                        continue;
+                    };
+                    if !under_desc.contains(&u_desc) {
+                        bin_out.rolls_unpaired += 1;
+                        continue;
+                    }
+                    let venue_byte = crate::backtest::fill::model_venue_byte(e.sym);
+                    let sym_yes = interner.intern(venue_byte, yes_desc)?;
+                    let sym_no = interner.intern(venue_byte, &no_desc)?;
+                    let sym_u = interner.intern(venue_byte, &u_desc)?;
+                    if bin_out.instances.iter().any(|i| i.outcome == outcome) {
+                        continue; // one created row per instance
+                    }
+                    bin_out.underlying_of.insert(sym_yes, sym_u);
+                    bin_out.instances.push(crate::backtest::binary::BinaryInstance {
+                        sym_yes,
+                        sym_no,
+                        family: family as u8,
+                        outcome,
+                        strike_1e6: e.v0,
+                        created_ns: wall_of(e.ts_ns),
+                        expiry_ns: e.v1 as u64,
+                        twap_ns: u64::from(twap_s) * 1_000_000_000,
+                    });
+                } else if e.channel == ChannelId::Mark as u8 && e.v0 > 0 {
+                    let Some(d) = desc else { continue };
+                    if !under_desc.contains(d) {
+                        continue;
+                    }
+                    let venue_byte = crate::backtest::fill::model_venue_byte(e.sym);
+                    let sym = interner.intern(venue_byte, d)?;
+                    bin_out
+                        .marks
+                        .entry(sym)
+                        .or_default()
+                        .push((wall_of(e.ts_ns), e.v0));
+                    bin_out.marks_kept += 1;
+                }
+            }
+        }
+    }
     Ok((evs, load))
 }
 
@@ -836,6 +988,7 @@ fn load_and_merge_events(
     runs: &[RunDir],
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
+    bin_out: &mut AuditBinOut,
     stale_after_ms: [u32; 7],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
@@ -844,7 +997,7 @@ fn load_and_merge_events(
     let mut prev_last_virt: u64 = 0;
     for run in runs {
         let (evs, mut load) =
-            load_run_events(run, interner, opt_out, stale_after_ms)?;
+            load_run_events(run, interner, opt_out, bin_out, stale_after_ms)?;
         if evs.is_empty() {
             loads.push(load);
             continue;
@@ -918,8 +1071,17 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let runs = discover_runs(&cfg.replay_dir)?;
     let mut interner = SymInterner::default();
     let mut opt_out = AuditOptOut::default();
+    // BIN15 O5a: the HIP-4 settlement schedule, collected in its own
+    // pass and applied to every engine this surface builds.
+    let mut bin_out = AuditBinOut::default();
     let (merged, loads) =
-        load_and_merge_events(&runs, &mut interner, &mut opt_out, params.stale_after_ms)?;
+        load_and_merge_events(
+            &runs,
+            &mut interner,
+            &mut opt_out,
+            &mut bin_out,
+            params.stale_after_ms,
+        )?;
     // F15: one seal for the whole root — the timelines are per sym and
     // the runs are concatenated in epoch order, so wall stamps are
     // already ascending; `seal` also collapses the repeats (the live
@@ -936,6 +1098,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         })
         .collect();
 
+    // BIN15 O5a: ASCENDING marks per sym. They arrive in file order
+    // within a run and runs are processed in epoch order, so this is
+    // already true — but `settle_value` scans for "the last mark at or
+    // before the expiry" on a zero-TWAP instance, and a scan that
+    // trusts an invariant should not have to trust that nothing ever
+    // reorders the loader.
+    for v in bin_out.marks.values_mut() {
+        v.sort_unstable_by_key(|(ts, _)| *ts);
+    }
     for l in &loads {
         report(&format!(
             "audit-pnl: run-{}: ticks={} orders={} fills={} commits={} manifest={}{}{}{}",
@@ -1030,6 +1201,56 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // read as a settlement the report used, so only the ones the clock
     // actually reaches are printed.
     let window_end_ns = merged[merged.len() - 1].wall_ns;
+    // The obligation line, the shape of the option one: what the
+    // schedule holds and what it could not settle. SILENT when the
+    // root carries no HIP-4 instrument, which is every root before
+    // slot 3 goes live — an unconditional zero line on every nightly
+    // report would be noise.
+    if bin_out.rolls > 0 {
+        let bin_reaches = bin_out
+            .instances
+            .iter()
+            .filter(|i| i.settle_ns() <= window_end_ns)
+            .count();
+        // SETTLEABLE is the number that matters: an instance can reach
+        // its settlement instant inside the window and still have no
+        // payout, because the window does not hold enough of its
+        // underlying's marks to average. Those mark out, and the gap
+        // between these two numbers is where a report quietly stops
+        // being about settlements.
+        let bin_settleable = bin_out
+            .instances
+            .iter()
+            .filter(|i| {
+                i.settle_ns() <= window_end_ns
+                    && i.expiry_ns != 0
+                    && bin_out
+                        .underlying_of
+                        .get(&i.sym_yes)
+                        .and_then(|u| bin_out.marks.get(u))
+                        .and_then(|m| crate::backtest::binary::settle_value(m, i))
+                        .is_some()
+            })
+            .count();
+        // An unpaired roll's positions MARK OUT instead of settling:
+        // its manifest is missing the [no] leg or the underlying.
+        let unpaired = if bin_out.rolls_unpaired > 0 {
+            " (UNPAIRED rolls mark out instead of settling)"
+        } else {
+            ""
+        };
+        report(&format!(
+            "audit-pnl: bin15 settlement table: {} of {} instance(s) settleable ({} reaching their instant) from {} roll row(s), marks={} unpaired_rolls={}{}",
+            bin_settleable,
+            bin_out.instances.len(),
+            bin_reaches,
+            bin_out.rolls,
+            bin_out.marks_kept,
+            bin_out.rolls_unpaired,
+            unpaired,
+        ));
+    }
+
     let reaches = |r: &OptSettleRef| r.expiry_ns <= window_end_ns;
     debug_assert!(
         opt_out.settle_ref
@@ -1127,6 +1348,22 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // capture does not contain is worse than a late mark-out.
         // VRP P2.1 (F10): the same call `backtest` and `--member` make.
         crate::backtest::opt::apply_settlements(&mut e, &opt_out.settle_ref, window_end_ns);
+        // BIN15 O5a: the HIP-4 payout each instance settles at, so a
+        // binary still held at its expiry becomes cash instead of an
+        // open position marked at a book the venue CLEARED at `T`. The
+        // same `backtest::binary` law both harness arms register, on a
+        // schedule this surface collected by descriptor.
+        //
+        // O3 named this surface's absence as the O5 prerequisite rather
+        // than a gap, because nothing produced a binary fill for it to
+        // score until slot 3 could trade. It can now.
+        crate::backtest::binary::apply_binary_settlements(
+            &mut e,
+            &bin_out.instances,
+            &bin_out.marks,
+            &bin_out.underlying_of,
+            window_end_ns,
+        );
         e
     };
     let mut engines: BTreeMap<u8, FillEngine> = BTreeMap::new();

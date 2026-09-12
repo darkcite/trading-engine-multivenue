@@ -74,6 +74,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 
 import argparse
 import dataclasses
+import os
 import pathlib
 import sqlite3
 import sys
@@ -83,6 +84,11 @@ import typing
 
 import claude_worker.vol_ref
 import claude_worker.vrp_seed
+
+#: The live candles database. `~/multivenue/candles.db` is a 0-byte
+#: stray; the real one is under `worker/`, and the same constant in
+#: `xsd_author` is the precedent — one spelling, not one per caller.
+DEFAULT_DB: str = "~/multivenue/worker/candles.db"
 
 #: Pairs to emit by default. ``core_vol``'s pair ring is 128 and the
 #: spec asks for 128, so the default cut fills it exactly.
@@ -399,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="lane", required=True)
 
     one = sub.add_parser("seed-out", help="cut one bin15-seed-<COIN>[-1d].tsv")
-    one.add_argument("--db", required=True, type=pathlib.Path)
+    one.add_argument("--db", default=None, type=pathlib.Path)
     one.add_argument("--family", required=True)
     one.add_argument("--descriptor", default=None)
     one.add_argument("--out", required=True, type=pathlib.Path)
@@ -410,15 +416,16 @@ def main(argv: list[str] | None = None) -> int:
     one.add_argument("--no-window", dest="window", action="store_false", default=None)
 
     every = sub.add_parser("seed-all", help="every file bin15.toml implies")
-    every.add_argument("--db", required=True, type=pathlib.Path)
+    every.add_argument("--db", default=None, type=pathlib.Path)
     every.add_argument("--bin15", required=True, type=pathlib.Path)
     every.add_argument("--dir", required=True, type=pathlib.Path)
     every.add_argument("--pairs", type=int, default=PAIRS_DEFAULT)
     every.add_argument("--now-ms", type=int, default=None)
 
     args = ap.parse_args(argv)
+    db = args.db or pathlib.Path(os.path.expanduser(DEFAULT_DB))
     if args.lane == "seed-all":
-        written = seed_all(args.db, args.bin15, args.dir, args.pairs, args.now_ms)
+        written = seed_all(db, args.bin15, args.dir, args.pairs, args.now_ms)
         if not written:
             print("bin15-seed: bin15.toml implied no seed file", file=sys.stderr)
             return 3
@@ -434,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     descriptor = args.descriptor or fam.default_descriptor
     spec = CutSpec(fam, descriptor, args.pairs, args.window_minutes)
-    n, stats = seed_out(args.db, spec, args.out, args.now_ms, args.window)
+    n, stats = seed_out(db, spec, args.out, args.now_ms, args.window)
     print(_report(str(args.out), n, stats))
     _warn(n, stats, stats.window_minutes > 0)
     return 0

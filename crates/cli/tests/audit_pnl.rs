@@ -674,3 +674,273 @@ fn option_intents_mark_fill_and_print_the_d7_assumption() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------
+// BIN15 O5a — the HIP-4 settlement surface
+// ---------------------------------------------------------------
+//
+// O3 shipped the per-instance binary settlement on both harness arms
+// and named THIS surface's absence as the O5 prerequisite: nothing
+// produced a binary fill for it to score until slot 3 could trade. It
+// can now, and a position held through its expiry has to become CASH —
+// the venue clears the book at `T`, so marking it out at the last price
+// the tape carried is marking it against a book that no longer exists.
+//
+// The collector here is not the backtest's. This surface INTERNS by
+// descriptor, so the No leg is paired by NAME and the underlying is
+// found by name; only the LAW (`backtest::binary::apply_binary_settlements`)
+// is shared. That split is the thing these tests pin.
+
+/// Hyperliquid activation Δ default = 600 ms (§4.4 table).
+const HL_DELTA: u64 = 600_000_000;
+
+/// The rolling pool's reserved ordinals, WITH the venue byte: the fill
+/// model asserts `order.venue == symbol_venue_byte(order.sym)`, because
+/// the engine derives one from the other and a capture that disagreed
+/// would be a capture of orders no engine could have emitted.
+const HL_YES: u32 = core_types::make_symbol_id(VenueId::Hyperliquid, 900);
+const HL_NO: u32 = core_types::make_symbol_id(VenueId::Hyperliquid, 901);
+const HL_BTC: u32 = core_types::make_symbol_id(VenueId::Hyperliquid, 3);
+const BIN_OUTCOME: u32 = 2650;
+/// A strike far below the mark: the Yes leg settles at 1.0.
+const BIN_STRIKE_1E6: i64 = 70_000_000_000;
+const BIN_MARK_1E6: i64 = 79_000_000_000;
+/// The instance expires 40 s into the run and TWAPs over 10 s.
+const BIN_EXPIRY_OFF: u64 = 40_000_000_000;
+const BIN_TWAP_S: u16 = 10;
+
+fn hl_tick(ts: u64, sym: u32, bid: i64, ask: i64) -> Tick {
+    Tick::new(
+        ts,
+        VenueId::Hyperliquid,
+        sym,
+        1,
+        Price::from_raw(bid),
+        Qty::from_raw(100_000_000),
+        Price::from_raw(ask),
+        Qty::from_raw(100_000_000),
+    )
+}
+
+fn hl_order(ts: u64, sym: u32, side: Side, px: i64, qty: i64, oid: u64) -> Order {
+    let mut o = Order::new(
+        ts,
+        VenueId::Hyperliquid,
+        sym,
+        side,
+        0,
+        Price::from_raw(px),
+        Qty::from_raw(qty),
+        oid,
+    );
+    o.strategy_id = 3; // bin15
+    o
+}
+
+fn write_events(dir: &Path, epoch: u64, evs: &[core_types::ChannelEvent]) {
+    let mut w = PmlrWriter::open(dir.join("hl-events.pmlr"), SlotKind::Event, epoch).unwrap();
+    for e in evs {
+        w.append(e).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+fn bin_roll(ts: u64, sym: u32, settled: bool) -> core_types::ChannelEvent {
+    // Family index 0 occupies bits 48..56 and is left implicit: the
+    // `rolling` list has one entry in these fixtures.
+    let seq = u64::from(BIN_OUTCOME)
+        | (u64::from(BIN_TWAP_S) << 32)
+        | (u64::from(settled) << 56);
+    core_types::ChannelEvent::new(
+        ts,
+        VenueId::Hyperliquid,
+        core_types::ChannelId::InstrumentRoll,
+        sym,
+        seq,
+        0,
+        BIN_STRIKE_1E6,
+        (EPOCH_1 + BIN_EXPIRY_OFF) as i64,
+    )
+}
+
+fn bin_mark(ts: u64, sym: u32, px_1e6: i64) -> core_types::ChannelEvent {
+    core_types::ChannelEvent::new(
+        ts,
+        VenueId::Hyperliquid,
+        core_types::ChannelId::Mark,
+        sym,
+        0,
+        0,
+        px_1e6,
+        0,
+    )
+}
+
+/// The manifest rows a live HIP-4 family writes (O2's convention).
+///
+/// `with_underlying` is the one that matters: the No leg's descriptor
+/// is DERIVED from the Yes leg's by name, so its manifest row is
+/// optional, but without the underlying there is no mark series and
+/// nothing to settle against.
+fn bin_manifest(dir: &Path, with_underlying: bool) {
+    let mut rows: Vec<(u32, &str)> = vec![
+        (HL_YES, "hyperliquid:out:BTC:15m[yes]"),
+        (HL_NO, "hyperliquid:out:BTC:15m[no]"),
+    ];
+    if with_underlying {
+        rows.push((HL_BTC, "hyperliquid:BTC"));
+    }
+    manifest(dir, &rows);
+}
+
+#[test]
+fn a_binary_held_through_expiry_settles_at_the_payout_not_the_last_book() {
+    let root = tmp_root("bin15-settle");
+    let dir = run_dir(&root, EPOCH_1);
+    bin_manifest(&dir, true);
+    // The roll binds the instance at the run's start; the marks after
+    // the expiry are the settlement TWAP (>= SETTLE_MIN_MARKS of them).
+    write_events(
+        &dir,
+        EPOCH_1,
+        &[
+            bin_roll(1_000, HL_YES, false),
+            bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 3_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 7_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+        ],
+    );
+    // The Yes book: an ask at 0.40 that the order crosses, then a LAST
+    // tick at 0.20/0.22 — deliberately far below the payout, so a
+    // mark-out and a settlement cannot be confused for each other.
+    write_ticks(
+        &dir,
+        "hl",
+        EPOCH_1,
+        &[
+            hl_tick(1_000, HL_YES, 390_000, 410_000),
+            // STRICTLY below the 0.40 limit: the §4 cross is strict, so
+            // an ask EQUAL to the limit does not fill — and the order
+            // would then fill on the last tick instead, after the
+            // settlement pass, which reads exactly like a settlement
+            // that did not happen.
+            hl_tick(2_000 + HL_DELTA + 10, HL_YES, 380_000, 390_000),
+            hl_tick(BIN_EXPIRY_OFF + 12_000_000_000, HL_YES, 200_000, 220_000),
+        ],
+    );
+    // 100 contracts bought at 0.40.
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[hl_order(2_000, HL_YES, Side::Bid, 400_000, 100_000_000, 11)],
+    );
+    let (json, lines) = run_report(&root);
+
+    // The schedule was built, from THIS surface's own collector.
+    let sched = lines
+        .iter()
+        .find(|l| l.contains("bin15 settlement table"))
+        .unwrap_or_else(|| panic!("no schedule line: {lines:#?}"));
+    assert!(sched.contains("1 of 1 instance(s) settleable"), "{sched}");
+    assert!(sched.contains("(1 reaching their instant)"), "{sched}");
+    assert!(sched.contains("unpaired_rolls=0"), "{sched}");
+
+    // The P&L: 100 contracts at 0.40 settling at 1.0 = +$60. A
+    // mark-out against that last 0.21 mid would have been −$19.
+    assert!(
+        json.contains("\"strategy_id\":3,\"label\":\"bin15\",\"orders\":1,\"fills\":1"),
+        "json: {json}"
+    );
+    assert!(json.contains("\"net_usd\":\"60.0\""), "json: {json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_roll_whose_underlying_is_not_in_the_manifest_is_counted_not_guessed() {
+    // Without the underlying's own row there is no mark series to
+    // settle against, so the instance cannot be scheduled at all. It is
+    // COUNTED and the positions mark out — the honest outcome, and loud.
+    let root = tmp_root("bin15-unpaired");
+    let dir = run_dir(&root, EPOCH_1);
+    bin_manifest(&dir, false);
+    write_events(
+        &dir,
+        EPOCH_1,
+        &[
+            bin_roll(1_000, HL_YES, false),
+            bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 5_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+        ],
+    );
+    write_ticks(
+        &dir,
+        "hl",
+        EPOCH_1,
+        &[
+            hl_tick(1_000, HL_YES, 390_000, 410_000),
+            // STRICTLY below the 0.40 limit: the §4 cross is strict, so
+            // an ask EQUAL to the limit does not fill — and the order
+            // would then fill on the last tick instead, after the
+            // settlement pass, which reads exactly like a settlement
+            // that did not happen.
+            hl_tick(2_000 + HL_DELTA + 10, HL_YES, 380_000, 390_000),
+            hl_tick(BIN_EXPIRY_OFF + 12_000_000_000, HL_YES, 200_000, 220_000),
+        ],
+    );
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[hl_order(2_000, HL_YES, Side::Bid, 400_000, 100_000_000, 11)],
+    );
+    let (json, lines) = run_report(&root);
+    let sched = lines
+        .iter()
+        .find(|l| l.contains("bin15 settlement table"))
+        .unwrap_or_else(|| panic!("no schedule line: {lines:#?}"));
+    assert!(sched.contains("unpaired_rolls=1"), "{sched}");
+    assert!(sched.contains("UNPAIRED rolls mark out"), "{sched}");
+    assert!(sched.contains("0 of 0 instance(s) settleable"), "{sched}");
+    // It marked out against the last mid (0.21) instead of settling:
+    // (0.21 − 0.40) x 100 = −$19.
+    assert!(json.contains("\"net_usd\":\"-19.0\""), "json: {json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_root_with_no_hip4_instrument_says_nothing_and_changes_nothing() {
+    // The regression guard in test form: every root captured before
+    // slot 3 goes live has no HIP-4 family, so the surface must be
+    // SILENT about binaries and its numbers must be what they were.
+    // (The 8-window pool's own JSON was verified byte-identical across
+    // this lane at `725d1d2748de79df`.)
+    let root = tmp_root("bin15-absent");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(42, "PMTOK")]);
+    write_ticks(
+        &dir,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(2_000 + PM_DELTA + 10, 42, 350_000, 1_000_000, 380_000, 50_000_000),
+            pm_tick(2_000 + PM_DELTA + 20, 42, 590_000, 1_000_000, 610_000, 1_000_000),
+        ],
+    );
+    write_orders(
+        &dir,
+        EPOCH_1,
+        &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 7, 0)],
+    );
+    let (json, lines) = run_report(&root);
+    assert!(
+        !lines.iter().any(|l| l.contains("bin15")),
+        "a root with no HIP-4 instrument must not mention bin15: {lines:#?}"
+    );
+    // Byte for byte the golden above.
+    assert!(json.contains("\"net_usd\":\"1.0\""), "json: {json}");
+    let _ = std::fs::remove_dir_all(&root);
+}

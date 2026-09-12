@@ -6,6 +6,103 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — `audit-pnl` settles HIP-4 binaries; the calibration ledger; the boot seed hook (BIN15 O5)
+
+**No wire change, no schema bump, no restart.** `audit_pnl_version` stays
+1, `detail_version` stays 7, and `docs/wire-format.md` is untouched by
+this phase — stated explicitly because the phase before it DID change the
+wire. What changes is a REPORT surface's arithmetic on roots that carry a
+HIP-4 instrument, and no root does until the operator's go-live restart.
+
+**The prerequisite O3 named.** O3's deviation 1 recorded that the
+`audit-pnl` surface was not wired for binaries and that this was "an O5
+prerequisite, not a silent gap", because nothing produced a binary fill
+for it to score. It does now, so a position held through its expiry
+becomes CASH at the payout instead of marking out at a book the venue
+CLEARED at `T`. On the synthetic root that pins it, the difference is
++$60 against −$19 on the same tape.
+
+**The collector is not the backtest's, and that split is deliberate.**
+`backtest` reads instances and marks out of its own `merged` timeline,
+where a sym is the universe's ordinal and the No leg is therefore
+`sym_yes + 1`. `audit-pnl` INTERNS by descriptor, so neither holds: the
+legs are paired by NAME (`binary::no_descriptor_of`) and the underlying
+is found by name (`binary::underlying_descriptor_of`). Both surfaces then
+call ONE law, `binary::apply_binary_settlements` — which
+`register_binary_model` is now expressed in terms of. Two collectors, one
+law; not two laws.
+
+- **The schedule is built in its own pass and never enters the event
+  stream.** Nothing in the replay loop consumes a `Mark` or an
+  `InstrumentRoll`, so admitting them to `evs` would change the merged
+  stream — and therefore the regime replay's input and every number
+  downstream — to carry records nobody reads. **`Mark` is kept ONLY for
+  a HIP-4 underlying the manifest actually carries**, the same
+  restriction the backtest merge got at O4b and for the same reason
+  (`Mark` is also OKX's mark-price channel). **Guard: the 8-window pool's
+  `audit-pnl` JSON is byte-identical across this lane at
+  `725d1d2748de79df`.**
+
+- **A roll whose UNDERLYING is not in the manifest is counted, not
+  guessed** (`unpaired_rolls`) — there is no mark series to settle
+  against, so its positions mark out and the report says so. The `[no]`
+  row is deliberately NOT required: its descriptor is derived from the
+  Yes leg's by name, a settlement registered for a sym nobody traded is
+  harmless, and refusing the whole instance over a missing manifest row
+  would make a perfectly settleable Yes position mark out.
+
+- **New stderr line, silent when there is nothing to say:**
+  `audit-pnl: bin15 settlement table: N of M instance(s) settleable (K reaching their instant) from R roll row(s), marks=… unpaired_rolls=…`.
+  SETTLEABLE is the number that matters — an instance can reach its
+  settlement instant inside the window and still have no payout, because
+  the window does not hold enough of its underlying's marks to average.
+  Every root captured before slot 3 goes live prints nothing at all.
+
+- **`pnl_report`'s `bin15` row needed no change.** It reads `label`
+  straight from the audit-pnl JSON, and `strategy_label(3)` became
+  `"bin15"` at O4b. The day report carries the row the moment slot 3
+  emits an order.
+
+- **`claude_worker.bin15_ledger` (NEW)** — merges `--emit-detail`
+  sidecars into `~/multivenue/worker/bin15/ledger.tsv` (worker state,
+  never git) and reads G6.1 out of it: the per-phase calibration table
+  and a PASS / FAIL / INSUFFICIENT verdict, exit 0 only on PASS (the
+  regime-soak law — a gate that exits 0 on "not measured yet" is a gate a
+  script passes by not measuring). Merging is deduplicated by
+  `(ts_ns, family, outcome)` and EXISTING wins, because a re-cut window
+  can carry a row whose `y` is unknown again and letting it overwrite
+  would quietly un-settle the ledger.
+
+  **What it cannot answer, recorded so nobody asks it to:** G6.2 (Arm A
+  ≥ +2 c/contract) and G6.3 (Arm B paired model − null ≥ 0) are P&L
+  questions about FILLS and are read from the day report's `bin15` rows.
+  A per-arm Brier score off the ledger would look like an answer and
+  would not be one — the member computes the same `p_hat` under both
+  arms, so their beliefs are the same distribution by construction.
+
+- **`scripts/engine-wrapper.sh` cuts the bin15 seeds before every boot**,
+  beside the regime and xsd hooks and with the same best-effort law (no
+  `bin15.toml` ⇒ nothing to export; a failure leaves the member to warm
+  live). TWO files per coin: a pair belongs to one tenor.
+  `claude_worker.bin15_seed.DEFAULT_DB` is `~/multivenue/worker/candles.db`,
+  the same spelling `xsd_author` uses — the sibling `~/multivenue/candles.db`
+  is a 0-byte stray on this host and seeding from it would produce an
+  empty seed and a silent cold boot.
+
+**DEFERRED, deliberately.** `engine-snapshot`'s `Bin15Snapshot` (spec
+§7.4, marked optional there): the per-family gauges
+`engine_bin15_f<n>_{p_hat_1e6,pos_yes_1e6,pos_no_1e6,live_outcome}` already
+publish the same four numbers, and `/state` carries a byte-exact `"v": 1`
+contract that is not worth moving for a duplicate view before the member
+has traded once.
+
+**STILL THE OPERATOR'S, and this session did none of it:** installing
+`~/multivenue/bin15.toml`, adding the eight families to `universe.toml`
+`[hyperliquid] rolling`, setting `strategy.conf` to mask 62, and the
+restart. The desk gate (G6.1–G6.4) cannot be evaluated until live capture
+accrues ≥ 200 settled instances; the 8 standing pool windows carry no
+HIP-4 instrument, so `--member bin15` on them yields an empty ledger.
+
 ## 2026-09-12 — `crates/strategy-bin15` takes slot 3 from `strategy-rule-tree`; `AiCmdKind::SetBinarySpec = 13`; `bin15.toml`; `--member bin15` (BIN15 O4b)
 
 **This phase DOES change the wire** (unlike O3 and O4a): `AiCmd.kind`

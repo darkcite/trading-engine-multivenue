@@ -19,6 +19,7 @@ import sqlite3
 import pytest
 
 import claude_worker.bin15_seed
+import claude_worker.xsd_author
 import claude_worker.vol_ref
 import claude_worker.vrp_seed
 
@@ -324,6 +325,14 @@ def test_a_short_history_is_counted_not_invented(tmp_path: pathlib.Path) -> None
     # The file is still written, and boot reads it as a cold tenor
     # rather than a malformed one.
     assert out.is_file()
+
+
+def test_the_default_db_is_the_live_one_not_the_stray() -> None:
+    """`~/multivenue/candles.db` is a 0-byte stray on this host; the
+    real database lives under `worker/`. One spelling, shared with
+    `xsd_author`, so the wrapper and the module cannot disagree."""
+    assert claude_worker.bin15_seed.DEFAULT_DB == "~/multivenue/worker/candles.db"
+    assert claude_worker.bin15_seed.DEFAULT_DB == claude_worker.xsd_author.DEFAULT_DB
 
 
 def test_the_cli_cuts_a_file_and_refuses_a_bad_family(tmp_path: pathlib.Path) -> None:
