@@ -316,6 +316,7 @@ dependencies = [
  "clob-dispatcher",
  "core-config",
  "core-crypto",
+ "core-fill",
  "core-io",
  "core-latency",
  "core-metrics",
@@ -360,6 +361,7 @@ dependencies = [
 name = "clob-dispatcher"
 version = "0.1.0"
 dependencies = [
+ "core-fill",
  "core-net",
  "core-parse",
  "core-ring",
@@ -414,6 +416,13 @@ dependencies = [
 [[package]]
 name = "core-crypto"
 version = "0.1.0"
+
+[[package]]
+name = "core-fill"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+]
 
 [[package]]
 name = "core-io"
@@ -1804,6 +1813,7 @@ dependencies = [
 name = "strategy-icdp"
 version = "0.1.0"
 dependencies = [
+ "core-fill",
  "core-regime",
  "core-time",
  "core-types",
@@ -1866,6 +1876,7 @@ dependencies = [
 name = "strategy-vrp"
 version = "0.1.0"
 dependencies = [
+ "core-fill",
  "core-regime",
  "core-time",
  "core-types",
@@ -1878,6 +1889,7 @@ dependencies = [
 name = "strategy-xsd"
 version = "0.1.0"
 dependencies = [
+ "core-fill",
  "core-regime",
  "core-time",
  "core-types",

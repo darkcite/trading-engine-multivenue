@@ -211,6 +211,22 @@ pub trait StrategyCounters {
         0
     }
 
+    /// X1: the cash the VRP member's last settlement booked ×1e6. No
+    /// order is emitted for it (a European settlement is not a trade),
+    /// so this gauge is the only place it shows.
+    #[inline]
+    fn vrp_last_settle_value_1e6(&self) -> i64 {
+        0
+    }
+
+    /// X1: fills that reached the strategy SET stamped for a slot that
+    /// is not enabled, or not built. Non-zero means an order outlived a
+    /// `DisableStrategy`, or a stamp is wrong.
+    #[inline]
+    fn fills_unrouted(&self) -> u64 {
+        0
+    }
+
     /// VRP V8a: render that state. `false` = there is nothing to
     /// persist (no VRP member, or it is unconfigured), and the cli
     /// leaves the file alone.
@@ -663,6 +679,27 @@ pub struct VrpCounters {
     /// campaign plus the records inside a 10-minute selection window;
     /// it used to run on every option record for ~23 h 50 m a day.
     pub select_scans: u64,
+    /// X1: option entries SUBMITTED. `entries` counts the ones that
+    /// FILLED, so `entries_submitted − entries` is the F7 gap — the
+    /// number the member used to report as `entries` outright.
+    pub entries_submitted: u64,
+    /// X1: entries that met no fill by their deadline. The campaign is
+    /// a HOLD; the forecast is disarmed; there is no retry in v1.
+    pub entries_unfilled: u64,
+    /// X1: hedge orders that met no fill by their deadline and were
+    /// retried at the then-current touch.
+    pub hedge_unfilled: u64,
+    /// X1: a hedge target GIVEN UP ON after `HEDGE_RETRIES_MAX`. The
+    /// book is not at its delta target and no order is chasing it.
+    /// **Any non-zero value is an operator alert** — see
+    /// `docs/risk-policy.md`.
+    pub hedge_abandoned: u64,
+    /// X1: modelled fills this member consumed (both legs).
+    pub fills: u64,
+    /// X1: fills that reached this member and matched NO leg in
+    /// flight — a late partial after a deadline, or a mis-stamped
+    /// fill. Counted, never booked.
+    pub fills_ignored: u64,
 }
 
 /// XSD counters (`engine_xsd_*`), mirrored by the cli's generic 5 s

@@ -120,7 +120,7 @@ pub const HOUR_NS: u64 = 3_600_000_000_000;
 /// The set's roll poll cadence (the `REGIME_TIMER_NS` precedent).
 pub const XSD_TIMER_NS: u64 = 1_000_000_000;
 /// `Order.kind` of every order this member emits (the I1 IoC law).
-pub const ORDER_KIND_IOC: u8 = 1;
+pub use core_fill::ORDER_KIND_IOC;
 /// An empty hourly bucket. `ln1e9(1) == 0` is the only log that
 /// collides — a price of one micro-dollar, which no perp quotes;
 /// [`XsdStrategy::seed_close`] and the roll treat it as absent.

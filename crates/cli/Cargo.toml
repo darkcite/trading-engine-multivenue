@@ -28,6 +28,8 @@ core-time            = { workspace = true }
 core-types           = { workspace = true }
 # VRP V1: option sym -> (expiry, strike, right, contract size).
 core-vol             = { workspace = true }
+# VRP X1: the ONE modelled fill law, shared with the paper dispatcher.
+core-fill            = { workspace = true }
 opt-registry         = { workspace = true }
 engine               = { workspace = true }
 engine-snapshot      = { workspace = true }

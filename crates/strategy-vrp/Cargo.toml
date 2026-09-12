@@ -15,6 +15,7 @@ path = "src/lib.rs"
 core-regime = { workspace = true }
 core-time = { workspace = true }
 core-types = { workspace = true }
+core-fill     = { workspace = true }
 core-vol = { workspace = true }
 opt-registry = { workspace = true }
 strategy-core = { workspace = true }

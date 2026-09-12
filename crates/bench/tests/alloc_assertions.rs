@@ -4445,6 +4445,103 @@ fn vol_engine_minute_and_bounds_are_zero_alloc() {
 /// is boxed because its inline forecast rings and option table are ~24
 /// KiB — `configure` may allocate, which is exactly why the guard opens
 /// after it.
+/// X1 gate: the engine-side paper matcher.
+///
+/// It runs on EVERY tick of every sym the engine receives — the hottest
+/// place a new allocation could hide — and it holds two fixed arrays and
+/// nothing else. Drives all four verdict kinds, the TTL sweep, both cap
+/// refusals and the unroutable path.
+#[test]
+fn paper_matcher_submit_observe_pump_is_zero_alloc() {
+    use clob_dispatcher::PaperMatcher;
+    use core_types::{make_symbol_id, Order, Price, Qty, Side, Tick};
+
+    let sym = make_symbol_id(VenueId::Deribit, 1);
+    let mut m = Box::new(PaperMatcher::new());
+
+    let mk_order = |kind: u8, side: Side, px: i64, qty: i64, oid: u64, ttl: u64, ts: u64| {
+        let mut o = Order::new(
+            ts,
+            VenueId::Deribit,
+            sym,
+            side,
+            kind,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        );
+        o.ttl_ns = ttl;
+        o.strategy_id = 1;
+        o
+    };
+    let mk_tick = |bid: i64, ask: i64, qty: i64| {
+        Tick::new(
+            0,
+            VenueId::Deribit,
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(qty),
+            Price::from_raw(ask),
+            Qty::from_raw(qty),
+        )
+    };
+
+    let g = AllocGuard::new();
+    let mut oid = 1u64;
+    let mut i = 0usize;
+    let mut fills = 0u64;
+    while i < 10_000 {
+        let ts = 1_000_000_000 * i as u64;
+        // Four kinds of order, so every verdict arm is exercised: a
+        // marketable IoC, a doomed mid-priced IoC (the F7 shape), a
+        // maker that rests, and one with a TTL that will expire.
+        m.submit(&mk_order(1, Side::Bid, 101_000_000, 600_000, oid, 0, ts), ts);
+        oid += 1;
+        m.submit(&mk_order(1, Side::Bid, 100_000_000, 600_000, oid, 0, ts), ts);
+        oid += 1;
+        m.submit(&mk_order(0, Side::Ask, 200_000_000, 600_000, oid, 0, ts), ts);
+        oid += 1;
+        m.submit(&mk_order(1, Side::Ask, 1_000_000, 600_000, oid, 1_000, ts), ts);
+        oid += 1;
+        // Every fifth pass, overrun both caps and the unroutable path.
+        if i % 5 == 0 {
+            let mut k = 0usize;
+            while k < 12 {
+                m.submit(&mk_order(0, Side::Ask, 500_000_000, 100_000, oid, 0, ts), ts);
+                oid += 1;
+                k += 1;
+            }
+            m.submit(&mk_order(2, Side::Bid, 1_000_000, 1_000, oid, 0, ts), ts);
+            oid += 1;
+            m.submit(&mk_order(1, Side::Bid, 0, 1_000, oid, 0, ts), ts);
+            oid += 1;
+        }
+        // Judge them, twice — the second pass sweeps the TTL.
+        m.observe_tick(&mk_tick(99_000_000, 101_000_000, 1_000_000), ts + 300_000_000);
+        m.observe_tick(&mk_tick(99_000_000, 100_000_000, 1_000_000), ts + 900_000_000);
+        while m.try_next_fill().is_some() {
+            fills += 1;
+        }
+        i += 1;
+    }
+    let c = m.counters;
+    std::hint::black_box((fills, c));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(c.fills > 0, "the gate must measure real fills");
+    assert!(c.ioc_canceled > 0, "and real cancels (the F7 path)");
+    assert!(c.ttl_expired > 0, "and the TTL sweep");
+    assert!(c.rejected_open_cap > 0, "and a cap refusal");
+    assert!(c.unroutable > 0, "and an unmodellable order");
+    assert_eq!(c.out_overflow, 0, "the out ring must never overflow");
+    assert_eq!(
+        allocs, 0,
+        "paper matcher allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "paper matcher hot bytes should be zero: saw {bytes}");
+}
+
 #[test]
 fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
     use core_types::{make_symbol_id, OptSummary, Price, Qty, Tick, OPT_SUMMARY_FLAG_MARK_PX};
@@ -4459,10 +4556,14 @@ fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
     struct SinkCtx {
         n: u64,
         now: u64,
+        /// X1: the last order submitted, so the gate can feed its fill
+        /// straight back — `on_fill` is a hot path now.
+        last: Option<core_types::Order>,
     }
     impl Ctx for SinkCtx {
-        fn submit(&mut self, _order: core_types::Order) -> Result<(), SubmitErr> {
+        fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
             self.n += 1;
+            self.last = Some(order);
             Ok(())
         }
         fn now_ns(&self) -> u64 {
@@ -4528,7 +4629,7 @@ fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
         )
     };
 
-    let mut ctx = SinkCtx { n: 0, now: MONO0 };
+    let mut ctx = SinkCtx { n: 0, now: MONO0, last: None };
     // Boot: warm the ring and seed a fit. Not measured.
     let mut wall = WALL0;
     let mut px = 79_000_000_000i64;
@@ -4564,6 +4665,22 @@ fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
         ctx.now = mono_of(w);
         m.on_opt_summary(&mk_opt(w, make_symbol_id(VenueId::Deribit, 513 + 8), 5_000_000_000), &mut ctx);
         m.on_tick(&mk_tick(w, px), &mut ctx);
+        // X1: the position path. Every order the member just emitted
+        // comes straight back as a full fill, so `on_fill` — which now
+        // moves the book and can submit the hedge — is inside the
+        // guard too.
+        if let Some(o) = ctx.last.take() {
+            let f = core_types::Fill::new(
+                mono_of(w),
+                o.sym,
+                o.side,
+                o.px,
+                o.qty,
+                o.client_oid,
+            )
+            .with_attribution(1, core_types::FILL_ORIGIN_PAPER);
+            m.on_fill(&f, &mut ctx);
+        }
         w += 7_500_000_000; // 7.5 s: 4000 steps span the whole 8 h hold
         n += 1;
     }
@@ -4573,6 +4690,7 @@ fn vrp_member_tick_and_opt_summary_are_zero_alloc() {
     let (allocs, bytes, _deallocs) = g.delta();
     assert!(counters.decisions > 0, "the gate must measure a real decision");
     assert!(ctx.n > 0, "the gate must measure real submits");
+    assert!(counters.fills > 0, "and real FILLS — X1's whole path");
     assert_eq!(
         allocs, 0,
         "strategy-vrp callbacks allocated {allocs} times ({bytes} B)"

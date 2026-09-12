@@ -20,21 +20,25 @@
 //! crate can catch, because each one encodes a measurement made
 //! elsewhere.
 //!
-//! 1. **P0 INTERIM — positions are inferred from submits, and that is
-//!    known to be wrong.** The paper dispatcher returns no fill, so
-//!    [`VrpStrategy::on_fill`] is a no-op and every position this member
-//!    believes it holds was created by a successful `ctx.submit`.
-//!    F7 measured what that costs: the option entry is an IoC AT THE
-//!    MARK, the fill law is touch-or-better, and on a positive spread a
-//!    mid-priced IoC never fills. Two live campaigns in a row show
-//!    `orders=2 fills=1` in the harness — the option cancelled, the
-//!    perp hedge filled — so the model held a NAKED PERP while this
-//!    member's state file said "long call, hedged".
+//! 1. **POSITIONS COME FROM FILLS.** The engine's paper dispatcher
+//!    models fills with the harness's own law (`core-fill`), so a
+//!    SUBMIT is an intent and a FILL is a position — and the two are
+//!    not the same event. [`VrpStrategy::on_fill`] is where this
+//!    member's book moves; nothing else moves it.
 //!
-//!    Every campaign before P1 is therefore a measurement of the
-//!    PIPELINE, not of P&L. P1 lands the engine-side paper matcher on
-//!    the harness's own fill law and makes `on_fill` real; this clause
-//!    is rewritten then.
+//!    This clause used to say the opposite, and F7 measured what that
+//!    cost. The option entry is an IoC AT THE MARK, the fill law is
+//!    touch-or-better, and on a positive spread a mid-priced IoC never
+//!    fills — while the perp hedge, priced at the option's forward,
+//!    filled on one side. Two live campaigns in a row: `orders=2
+//!    fills=1 ioc_canceled=1`, the model holding a naked short 0.69
+//!    BTC while this member's own state file said "long call, hedged".
+//!
+//!    So the hedge is submitted from `on_fill`, once the option
+//!    exists, never from the entry submit. An entry that meets no fill
+//!    by its deadline is a HOLD ([`VrpCounters::entries_unfilled`]),
+//!    because the matcher signals a cancel only by absence and the
+//!    clock is the only thing that can say so.
 //!
 //! 2. **The book is USD-denominated, so the plain unadjusted BS delta
 //!    from the venue is the correct hedge ratio.** Deribit reports an
@@ -142,6 +146,24 @@ pub const MINUTE_NS: u64 = 60_000_000_000;
 /// How long an option mark stays usable. Deribit's ticker cadence is
 /// sub-second; a mark this old means the lane is broken, not slow.
 pub const MARK_STALE_NS: u64 = 30_000_000_000;
+
+/// `Order.kind` of every order this member submits (the I1 IoC law) —
+/// the SAME constant the harness and the paper dispatcher judge it by.
+pub use core_fill::ORDER_KIND_IOC;
+
+/// X1: how long after an order's TTL the member waits before calling
+/// it unfilled. The matcher judges an IoC at the first fresh two-sided
+/// tick after Δ_venue and reports nothing when it cancels — absence is
+/// the only signal — so the member infers the cancel from the clock.
+/// Two seconds of slack over the TTL covers Δ_deribit (220 ms) and a
+/// quiet book.
+pub const ACTIVATION_SLACK_NS: u64 = 2_000_000_000;
+
+/// X1: how many times a hedge target is chased at the touch before the
+/// member gives up on it and counts [`VrpCounters::hedge_abandoned`].
+/// A rebalance is discretionary; an UNWIND (target 0) resets the budget
+/// on every attempt, because the hedge must complete.
+pub const HEDGE_RETRIES_MAX: u8 = 3;
 
 /// TTL on every order this member submits (I1 model rule). One minute:
 /// long enough to cross, short enough that an unfilled intent cannot sit
@@ -302,6 +324,45 @@ impl Default for VrpParams {
     }
 }
 
+/// X1: one leg the member has ASKED for and not yet been given.
+///
+/// A submit is an intent. The position moves when a fill arrives, and
+/// until then this is what is outstanding. `oid == 0` means nothing is
+/// in flight on that leg.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingLeg {
+    /// `client_oid` of the order, echoed back as `Fill::order_id`.
+    pub oid: u64,
+    /// SIGNED size asked for ×1e6 — the sign is the side.
+    pub qty_1e6: i64,
+    /// Limit the order was submitted at ×1e6.
+    pub px_1e6: i64,
+    /// Wall instant after which an absent fill means a CANCEL: the
+    /// matcher never reports one, so the clock is the only signal.
+    pub deadline_wall_ns: u64,
+    /// SIGNED quantity filled so far ×1e6.
+    pub filled_1e6: i64,
+}
+
+impl PendingLeg {
+    /// Nothing in flight.
+    pub const NONE: Self = Self {
+        oid: 0,
+        qty_1e6: 0,
+        px_1e6: 0,
+        deadline_wall_ns: 0,
+        filled_1e6: 0,
+    };
+
+    /// Whether a leg is outstanding.
+    #[inline]
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.oid != 0
+    }
+}
+
 /// The last option mark this member saw, in both denominations.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -395,9 +456,22 @@ pub struct VrpStrategy {
     configured: bool,
     regime_open: bool,
     /// Signed option position ×1e6 (positive = long the option).
+    /// X1: moved by FILLS, never by submits.
     opt_pos_qty_1e6: i64,
-    /// Signed perp position ×1e6.
+    /// Signed perp position ×1e6. X1: moved by FILLS.
     perp_pos_qty_1e6: i64,
+    /// X1: the option entry in flight, if any.
+    opt_pending: PendingLeg,
+    /// X1: the hedge order in flight, if any.
+    hedge_pending: PendingLeg,
+    /// X1: the perp position the hedge is currently chasing, and how
+    /// many attempts it has spent on it. The budget resets when the
+    /// target CHANGES and on every unwind (target 0), because an unwind
+    /// must complete.
+    hedge_target_1e6: i64,
+    hedge_retries: u8,
+    /// X1: the intrinsic the last settlement booked ×1e6 (a P6 gauge).
+    last_settle_value_1e6: i64,
     /// Next hedge check, wall ns.
     next_rebalance_wall_ns: u64,
     /// F31: the selection window `[E−τ−selection, E−τ)` of the next
@@ -459,6 +533,11 @@ impl VrpStrategy {
             regime_open: true,
             opt_pos_qty_1e6: 0,
             perp_pos_qty_1e6: 0,
+            opt_pending: PendingLeg::NONE,
+            hedge_pending: PendingLeg::NONE,
+            hedge_target_1e6: 0,
+            hedge_retries: 0,
+            last_settle_value_1e6: 0,
             next_rebalance_wall_ns: 0,
             next_select_open_ns: 0,
             next_select_close_ns: 0,
@@ -556,6 +635,14 @@ impl VrpStrategy {
     #[must_use]
     pub const fn vol_minutes(&self) -> u64 {
         self.vol.minutes()
+    }
+
+    /// X1: the intrinsic the last settlement booked ×1e6 — the cash
+    /// the option became, for which no order is emitted. `0` after an
+    /// OTM expiry, which is the same thing said in dollars.
+    #[must_use]
+    pub const fn last_settle_value_1e6(&self) -> i64 {
+        self.last_settle_value_1e6
     }
 
     /// F3: splices in the rolling window — minutes that were not the
@@ -757,6 +844,14 @@ impl VrpStrategy {
     /// than the registry, closes it out at the first index. That is the
     /// engine-down-across-expiry path, and it is the whole reason the
     /// campaign is keyed by contract and not by symbol.
+    ///
+    /// X1: the PENDING legs are deliberately NOT persisted. The
+    /// matcher's open table is process-local and every order this
+    /// member emits carries a 60 s TTL, so an order in flight when the
+    /// process went down is dead by construction — restoring one would
+    /// be waiting for a fill that can never arrive. A restored campaign
+    /// therefore comes back with both legs empty, and a campaign with
+    /// `entry_done` and no option position is a HOLD.
     pub fn restore_state(&mut self, text: &str) -> Result<VrpRestored, &'static str> {
         if !self.configured {
             return Err("vrp: restore before configure");
@@ -1018,7 +1113,7 @@ impl VrpStrategy {
                 venue,
                 sym,
                 side,
-                1, // IoC
+                ORDER_KIND_IOC,
                 Price::from_raw(px_1e6),
                 Qty::from_raw(qty_1e6.abs()),
                 oid,
@@ -1037,6 +1132,19 @@ impl VrpStrategy {
     /// fill law a SELL (`bid ≥ px`) filled and a BUY (`ask ≤ px`)
     /// almost never did, so the modelled hedge ratcheted short.
     fn move_hedge<C: Ctx>(&mut self, ctx: &mut C, target_1e6: i64, now: NsTs) -> bool {
+        // X1: one hedge order in flight at a time. A second would
+        // double the move when both fill, which is exactly the class of
+        // defect inferring positions from submits produced.
+        if self.hedge_pending.is_open() {
+            return false;
+        }
+        // A NEW target, or any unwind, refreshes the retry budget: a
+        // rebalance is discretionary, but a hedge that has to come OFF
+        // must complete.
+        if target_1e6 != self.hedge_target_1e6 || target_1e6 == 0 {
+            self.hedge_target_1e6 = target_1e6;
+            self.hedge_retries = 0;
+        }
         let delta = target_1e6 - self.perp_pos_qty_1e6;
         if delta == 0 {
             return false;
@@ -1088,10 +1196,23 @@ impl VrpStrategy {
         let Some(order) = self.ioc(self.hedge_sym, px, delta, now) else {
             return false;
         };
+        let oid = order.client_oid;
         if !self.submit(ctx, order) {
             return false;
         }
-        self.perp_pos_qty_1e6 = target_1e6;
+        // X1: the POSITION does not move here. A submit is an intent;
+        // `on_fill` is where the book changes.
+        self.hedge_pending = PendingLeg {
+            oid,
+            qty_1e6: delta,
+            px_1e6: px,
+            deadline_wall_ns: self
+                .anchor
+                .wall_of(now)
+                .saturating_add(ORDER_TTL_NS)
+                .saturating_add(ACTIVATION_SLACK_NS),
+            filled_1e6: 0,
+        };
         self.counters.hedges = self.counters.hedges.wrapping_add(1);
         self.bump_state();
         true
@@ -1116,6 +1237,12 @@ impl VrpStrategy {
         self.hedge_frozen = false;
         self.last_mark = OptMarkCache::default();
         self.next_rebalance_wall_ns = 0;
+        // X1: nothing of this campaign may chase a fill into the next
+        // one. Both legs are flat by the debug_asserts above.
+        self.opt_pending = PendingLeg::NONE;
+        self.hedge_pending = PendingLeg::NONE;
+        self.hedge_target_1e6 = 0;
+        self.hedge_retries = 0;
         // F31: the window this campaign used is spent; the next option
         // record recomputes it for the next expiry.
         self.next_select_open_ns = 0;
@@ -1136,13 +1263,29 @@ impl VrpStrategy {
     ///
     /// Returns true once both legs are flat.
     fn flatten<C: Ctx>(&mut self, ctx: &mut C, now: NsTs) -> bool {
-        if self.opt_pos_qty_1e6 != 0 && self.last_mark.px_usd_1e6 > 0 {
+        if self.opt_pos_qty_1e6 != 0 && self.last_mark.px_usd_1e6 > 0 && !self.opt_pending.is_open()
+        {
             let closing = -self.opt_pos_qty_1e6;
             let px = self.last_mark.px_usd_1e6;
             let sym = self.selected_sym;
             if let Some(order) = self.ioc(sym, px, closing, now) {
+                let oid = order.client_oid;
                 if self.submit(ctx, order) {
-                    self.opt_pos_qty_1e6 = 0;
+                    // X1: the position moves on the FILL. `flatten`
+                    // returns false until it does, and the caller
+                    // retries on every record — which is the Y1 law
+                    // ("get out", whatever it costs) unchanged.
+                    self.opt_pending = PendingLeg {
+                        oid,
+                        qty_1e6: closing,
+                        px_1e6: px,
+                        deadline_wall_ns: self
+                            .anchor
+                            .wall_of(now)
+                            .saturating_add(ORDER_TTL_NS)
+                            .saturating_add(ACTIVATION_SLACK_NS),
+                        filled_1e6: 0,
+                    };
                     self.counters.exits = self.counters.exits.wrapping_add(1);
                     self.bump_state();
                 }
@@ -1286,22 +1429,26 @@ impl VrpStrategy {
                 // An operator reconciles it by hand. OTM needs no order,
                 // so this only ever bites in the money.
                 self.opt_pos_qty_1e6 = 0;
+                self.opt_pending = PendingLeg::NONE;
                 self.counters.settled_unpriced =
                     self.counters.settled_unpriced.wrapping_add(1);
                 self.bump_state();
             } else if value_1e6 > 0 {
-                // ITM: book the intrinsic. A closing order at the
-                // settlement price is how a paper member says "this
-                // position became cash at this value".
-                let closing = -self.opt_pos_qty_1e6;
-                let sym = self.selected_sym;
-                let Some(order) = self.ioc(sym, value_1e6, closing, now) else {
-                    return false;
-                };
-                if !self.submit(ctx, order) {
-                    return false; // ring full — retry on the next record
-                }
+                // ITM: the position BECAME CASH at the intrinsic. X1:
+                // no order is emitted for it, deliberately.
+                //
+                // A European cash settlement is not a trade. The old
+                // closing IoC at `value` would be judged against the
+                // venue's POST-EXPIRY quotes — Deribit keeps quoting
+                // for 9–19 min (F12) — so it could fill at the ask
+                // when the ask was cheaper than settlement, booking a
+                // trade the venue cannot execute, or fill twice at two
+                // different prices. The harness settles the same
+                // position from the capture by itself (VX-A), so an
+                // order here would also be a second settlement.
                 self.opt_pos_qty_1e6 = 0;
+                self.opt_pending = PendingLeg::NONE;
+                self.last_settle_value_1e6 = value_1e6;
                 self.counters.settled_itm = self.counters.settled_itm.wrapping_add(1);
                 self.bump_state();
             } else {
@@ -1310,20 +1457,31 @@ impl VrpStrategy {
                 // one would be a fiction, and a mark-priced one would
                 // book value that expired.
                 self.opt_pos_qty_1e6 = 0;
+                self.opt_pending = PendingLeg::NONE;
+                self.last_settle_value_1e6 = 0;
                 self.counters.settled_otm = self.counters.settled_otm.wrapping_add(1);
                 self.bump_state();
             }
         }
+        // X1: the HOLD ended at E, so it folds into the forecast here —
+        // not when the perp finishes unwinding, which can take several
+        // more records. `settle_forecast` is armed-guarded, so a later
+        // record cannot fold the same hold twice.
+        self.settle_forecast();
         if self.perp_pos_qty_1e6 != 0 {
             // F8: the unwind is a REAL order at the perp's own touch,
             // like every other hedge. Overwriting the option record's
             // forward with the settlement index to steer `move_hedge`
             // priced the unwind at a number the perp book never quoted.
-            if !self.move_hedge(ctx, 0, now) {
-                return false; // the hedge still stands; retry
-            }
+            //
+            // X1: and the position is flat when that order FILLS, not
+            // when it is submitted — so the campaign does not end here.
+            // Every later record retries until the book is actually
+            // flat, which is the same "retry on the next record" law
+            // this rung always had.
+            self.move_hedge(ctx, 0, now);
+            return false;
         }
-        self.settle_forecast();
         self.end_campaign();
         true
     }
@@ -1633,6 +1791,7 @@ impl VrpStrategy {
             self.counters.no_bounds = self.counters.no_bounds.wrapping_add(1);
             return;
         }
+        let oid = order.client_oid;
         if !self.submit(ctx, order) {
             // F4: the submit ring was full, so there is no hold. An
             // engine left armed would pair this `x` with a position
@@ -1641,13 +1800,61 @@ impl VrpStrategy {
             return;
         }
         self.side = side;
-        self.opt_pos_qty_1e6 = qty;
-        self.counters.entries = self.counters.entries.wrapping_add(1);
-        self.bump_state();
+        // X1: the position does NOT move here, and NO HEDGE GOES OUT.
+        //
+        // This is the F7 fix. The entry is an IoC, the fill law is
+        // touch-or-better, and a mid-priced IoC on a real spread does
+        // not fill — so hedging on the submit put a naked perp on
+        // against an option the model never held. Twice, live. The
+        // hedge is submitted from `on_fill`, once the option exists.
+        self.opt_pending = PendingLeg {
+            oid,
+            qty_1e6: qty,
+            px_1e6: px,
+            deadline_wall_ns: wall_ns
+                .saturating_add(ORDER_TTL_NS)
+                .saturating_add(ACTIVATION_SLACK_NS),
+            filled_1e6: 0,
+        };
+        self.counters.entries_submitted = self.counters.entries_submitted.wrapping_add(1);
         self.next_rebalance_wall_ns = wall_ns + self.params.rebalance_ns;
-        // The first hedge goes out on the same instant as the entry.
-        let target = Self::hedge_target_1e6(self.opt_pos_qty_1e6, self.last_mark.delta_1e9);
-        self.move_hedge(ctx, target, now);
+        self.bump_state();
+    }
+
+    /// X1: the deadline sweep — the matcher signals a cancel only by
+    /// ABSENCE, so the clock is what turns an unanswered order into a
+    /// decision.
+    ///
+    /// Runs on every callback, because a member that only noticed on
+    /// its own instrument's records would never notice at all once
+    /// Deribit drops an expired contract from the chain.
+    fn sweep_pendings<C: Ctx>(&mut self, ctx: &mut C, wall_ns: u64, now: NsTs) {
+        if self.opt_pending.is_open() && wall_ns >= self.opt_pending.deadline_wall_ns {
+            // The entry met no fill. The campaign is a HOLD: there is
+            // no position, so there is no hold for the forecast to
+            // score, and v1 does not retry — a second crossing of the
+            // same book is R1's question, not this phase's.
+            self.opt_pending = PendingLeg::NONE;
+            self.counters.entries_unfilled = self.counters.entries_unfilled.wrapping_add(1);
+            self.vol.disarm();
+            self.side = SIDE_FLAT;
+            self.bump_state();
+        }
+        if self.hedge_pending.is_open() && wall_ns >= self.hedge_pending.deadline_wall_ns {
+            self.hedge_pending = PendingLeg::NONE;
+            self.counters.hedge_unfilled = self.counters.hedge_unfilled.wrapping_add(1);
+            if self.hedge_retries < HEDGE_RETRIES_MAX {
+                self.hedge_retries += 1;
+                let target = self.hedge_target_1e6;
+                self.move_hedge(ctx, target, now);
+            } else {
+                // The book is not at its delta target and nothing is
+                // chasing it. An operator alert, not a routine counter
+                // (docs/risk-policy.md).
+                self.counters.hedge_abandoned = self.counters.hedge_abandoned.wrapping_add(1);
+            }
+            self.bump_state();
+        }
     }
 
     /// The hourly hedge check.
@@ -1687,6 +1894,10 @@ impl StrategyCounters for VrpStrategy {
     #[inline]
     fn vrp_counters(&self) -> VrpCounters {
         self.counters
+    }
+    #[inline]
+    fn vrp_last_settle_value_1e6(&self) -> i64 {
+        self.last_settle_value_1e6
     }
     #[inline]
     fn vrp_state_epoch(&self) -> u64 {
@@ -1759,6 +1970,9 @@ impl Strategy for VrpStrategy {
             self.last_underlying_mid_1e6 = mid;
             self.last_underlying_wall_ns = wall_ns;
         }
+        // X1: an order that met no fill by its deadline is a decision,
+        // and the clock is the only thing that says so.
+        self.sweep_pendings(ctx, wall_ns, now);
         if self.maybe_settle(ctx, wall_ns, now) {
             return;
         }
@@ -1823,6 +2037,7 @@ impl Strategy for VrpStrategy {
             delta_1e9: opt.delta_1e9,
             _pad: [0; 4],
         };
+        self.sweep_pendings(ctx, wall_ns, now);
         if self.maybe_settle(ctx, wall_ns, now) {
             return;
         }
@@ -1833,10 +2048,61 @@ impl Strategy for VrpStrategy {
     #[inline]
     fn on_signal<C: Ctx>(&mut self, _signal: &Signal, _ctx: &mut C) {}
 
-    /// Doctrine clause 1: paper has no fills. SUBMIT is the position
-    /// event, and this callback is deliberately empty — not forgotten.
+    /// X1: THE position event.
+    ///
+    /// The set routes an attributed fill to this slot alone, so every
+    /// fill arriving here was asked for by this member — but it is
+    /// still matched by `order_id` against the leg in flight, because
+    /// a fill for an order this member has already given up on must
+    /// not move the book.
     #[inline]
-    fn on_fill<C: Ctx>(&mut self, _fill: &Fill, _ctx: &mut C) {}
+    fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C) {
+        if !self.configured {
+            return;
+        }
+        let now = fill.ts_ns;
+        // SIGNED by the side the fill came back on.
+        let signed = match fill.side {
+            Side::Bid => fill.qty.raw(),
+            Side::Ask => -fill.qty.raw(),
+        };
+        if self.opt_pending.is_open() && fill.order_id == self.opt_pending.oid {
+            self.counters.fills = self.counters.fills.wrapping_add(1);
+            self.opt_pos_qty_1e6 = self.opt_pos_qty_1e6.saturating_add(signed);
+            self.opt_pending.filled_1e6 = self.opt_pending.filled_1e6.saturating_add(signed);
+            let complete = self.opt_pending.filled_1e6 == self.opt_pending.qty_1e6;
+            let was_entry = self.opt_pending.qty_1e6 == self.params.qty_1e6 * self.side as i64
+                && self.side != SIDE_FLAT;
+            if complete {
+                self.opt_pending = PendingLeg::NONE;
+            }
+            self.bump_state();
+            if complete && was_entry && self.opt_pos_qty_1e6 != 0 {
+                // The option EXISTS now, so the hedge has something to
+                // hedge. This is the order that used to go out on the
+                // submit, against nothing.
+                self.counters.entries = self.counters.entries.wrapping_add(1);
+                let target =
+                    Self::hedge_target_1e6(self.opt_pos_qty_1e6, self.last_mark.delta_1e9);
+                self.move_hedge(ctx, target, now);
+            }
+            return;
+        }
+        if self.hedge_pending.is_open() && fill.order_id == self.hedge_pending.oid {
+            self.counters.fills = self.counters.fills.wrapping_add(1);
+            self.perp_pos_qty_1e6 = self.perp_pos_qty_1e6.saturating_add(signed);
+            self.hedge_pending.filled_1e6 = self.hedge_pending.filled_1e6.saturating_add(signed);
+            if self.hedge_pending.filled_1e6 == self.hedge_pending.qty_1e6 {
+                self.hedge_pending = PendingLeg::NONE;
+            }
+            self.bump_state();
+            return;
+        }
+        // A fill for an order this member is no longer chasing — a
+        // late partial after a deadline, or another member's if a
+        // stamp is wrong. Counted, never booked.
+        self.counters.fills_ignored = self.counters.fills_ignored.wrapping_add(1);
+    }
 
     #[inline]
     fn on_timer<C: Ctx>(&mut self, _now_ns: NsTs, _ctx: &mut C) {}
@@ -1931,6 +2197,50 @@ mod tests {
             self.now
         }
     }
+
+    /// X1: the fill the paper matcher would produce for `order` if it
+    /// were marketable — at the order's own limit, in full.
+    ///
+    /// Tests that want a POSITION have to deliver one now: a submit is
+    /// an intent. This is the matcher's `push_fill` in one line, with
+    /// the attribution the set would have routed on.
+    fn fill_of(order: &Order, ts_ns: NsTs) -> Fill {
+        Fill::new(
+            ts_ns,
+            order.sym,
+            order.side,
+            order.px,
+            order.qty,
+            order.client_oid,
+        )
+        .with_attribution(SLOT_VRP_ID, core_types::FILL_ORIGIN_PAPER)
+    }
+
+    /// Deliver a full fill for every recorded order from `start`
+    /// onward, oldest first, LEAVING the recorder intact so a test can
+    /// still assert on what was submitted. Returns the new length —
+    /// filling can itself submit (the entry's hedge), so the caller
+    /// passes that back in to fill the next wave.
+    fn fill_from(m: &mut VrpStrategy, ctx: &mut RecCtx, start: usize, ts_ns: NsTs) -> usize {
+        let batch: Vec<Order> = ctx.orders[start..].to_vec();
+        for o in &batch {
+            let f = fill_of(o, ts_ns);
+            m.on_fill(&f, ctx);
+        }
+        ctx.orders.len()
+    }
+
+    /// `fill_from` over everything recorded, then clear. For helpers
+    /// that want a position and do not assert on the orders.
+    fn fill_all(m: &mut VrpStrategy, ctx: &mut RecCtx, ts_ns: NsTs) -> usize {
+        let n = ctx.orders.len();
+        fill_from(m, ctx, 0, ts_ns);
+        ctx.orders.clear();
+        n
+    }
+
+    /// This member's slot, as the set stamps it.
+    const SLOT_VRP_ID: u8 = 1;
 
     fn perp_sym() -> SymbolId {
         make_symbol_id(VenueId::Deribit, 1)
@@ -2268,9 +2578,17 @@ mod tests {
         );
         assert_eq!(m.side(), SIDE_SHORT_VOL, "IV above the band ⇒ sell vol");
         assert_eq!(m.vrp_counters().decisions, 1);
-        assert_eq!(m.vrp_counters().entries, 1);
         assert_eq!(m.vrp_counters().holds, 0);
-        assert_eq!(ctx.orders.len(), 2, "the option leg and its first hedge");
+        // X1: ONE order so far — the entry INTENT. The hedge does not
+        // go out until the option exists, which is the F7 fix.
+        assert_eq!(m.vrp_counters().entries_submitted, 1);
+        assert_eq!(m.vrp_counters().entries, 0, "nothing has filled yet");
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "a submit is not a position");
+        assert_eq!(ctx.orders.len(), 1, "the option leg, alone");
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry_wall));
+        assert_eq!(m.vrp_counters().entries, 1, "the entry FILLED");
+        assert_eq!(n, 2, "and only then does the hedge go out");
+        fill_from(&mut m, &mut ctx, n - 1, mono_of(entry_wall));
 
         // The option submit, field by field.
         let o = ctx.orders[0];
@@ -2322,8 +2640,12 @@ mod tests {
             if k > 0 && k % per_hour == 0 && hour <= 3 {
                 // The venue's delta moves, then the tick crosses the hour.
                 let delta = 500_000_000 + hour as i64 * 100_000_000;
+                let before = ctx.orders.len();
                 m.on_opt_summary(&summary(wall, opt_sym(4), 5_000_000_000, delta), &mut ctx);
                 m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+                // X1: the rebalance is an order; the book moves when it
+                // fills.
+                fill_from(&mut m, &mut ctx, before, mono_of(wall));
                 assert_eq!(
                     m.perp_pos_qty_1e6(),
                     VrpStrategy::hedge_target_1e6(-params.qty_1e6, delta as i32),
@@ -2356,18 +2678,30 @@ mod tests {
         ctx.now = mono_of(EXPIRY);
         m.on_tick(&tick(EXPIRY, itm, false), &mut ctx);
         assert_eq!(m.opt_pos_qty_1e6(), 0, "the option became cash");
-        assert_eq!(m.perp_pos_qty_1e6(), 0, "and the hedge came off");
-        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
         assert_eq!(m.vrp_counters().settled_itm, 1, "settled, not unwound");
+        assert_eq!(
+            m.last_settle_value_1e6(),
+            11_000_000_000,
+            "90,000 − 79,000, booked as cash with NO order"
+        );
+        // And the settled hold went back into the forecast the moment
+        // the hold ended, not when the last leg came off.
+        assert_eq!(m.vrp_counters().settlements, 1);
+        assert_eq!(m.n_pairs(), 61);
+        // X1: the hedge is a real order. It comes off when it FILLS,
+        // and the record after that ends the campaign.
+        assert_eq!(ctx.orders.len(), 1, "the perp unwind, and only that");
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        fill_from(&mut m, &mut ctx, 0, mono_of(EXPIRY));
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "and the hedge came off");
+        m.on_tick(&tick(EXPIRY + 1_000_000_000, itm, false), &mut ctx);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
         assert_eq!(
             m.vrp_counters().exits,
             0,
             "`exits` is the RISK exit only — a planned campaign never crosses \
              the option spread to get out"
         );
-        // And the settled hold went back into the forecast.
-        assert_eq!(m.vrp_counters().settlements, 1);
-        assert_eq!(m.n_pairs(), 61);
     }
 
     #[test]
@@ -2400,11 +2734,15 @@ mod tests {
         m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
         let entry = EXPIRY - TAU;
         ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 1_000, 500_000_000), &mut ctx);
         assert_eq!(m.side(), SIDE_LONG_VOL);
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
         assert_eq!(m.opt_pos_qty_1e6(), params.qty_1e6);
         assert_eq!(ctx.orders[0].side, Side::Bid, "long vol buys the option");
         // Long 1 contract at Δ = 0.5 ⇒ SHORT 0.5 perp.
+        fill_from(&mut m, &mut ctx, n - 1, mono_of(entry));
         assert_eq!(m.perp_pos_qty_1e6(), -500_000);
         assert_eq!(ctx.orders[1].side, Side::Ask);
     }
@@ -2432,6 +2770,9 @@ mod tests {
         m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
         ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        // X1: the hedge only exists once the option does.
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        assert_eq!(n, 2, "entry filled ⇒ hedge submitted");
         let h = ctx.orders[1];
         assert_eq!(h.side, Side::Bid);
         assert_eq!(h.px.raw(), 79_000_500_000, "the ASK, not the mid or the forward");
@@ -2445,6 +2786,8 @@ mod tests {
         m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
         ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 1_000, 500_000_000), &mut ctx);
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        assert_eq!(n, 2, "entry filled ⇒ hedge submitted");
         let h = ctx.orders[1];
         assert_eq!(h.side, Side::Ask);
         assert_eq!(h.px.raw(), 78_999_500_000, "the BID");
@@ -2653,6 +2996,163 @@ mod tests {
         assert_eq!(boot.vol_gaps(), 0, "and it was contiguous");
     }
 
+    // ---------------- X1: positions come from fills ----------------
+
+    /// X1/F7: an entry that meets no fill is a HOLD. The matcher
+    /// reports a cancel only by ABSENCE, so the clock is what turns an
+    /// unanswered order into a decision — and the forecast must be
+    /// disarmed, or its `x` would be paired with a hold nobody held.
+    #[test]
+    fn an_unfilled_entry_is_a_hold_and_disarms_the_forecast() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        assert_eq!(m.vrp_counters().entries_submitted, 1);
+        assert_eq!(ctx.orders.len(), 1, "the entry, and NO hedge");
+        assert!(m.vol.is_armed(), "armed against a hold that may happen");
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+
+        // Nothing fills. The deadline passes.
+        let late = entry + ORDER_TTL_NS + ACTIVATION_SLACK_NS + 1;
+        ctx.now = mono_of(late);
+        m.on_tick(&tick(late, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.vrp_counters().entries_unfilled, 1);
+        assert_eq!(m.vrp_counters().entries, 0, "`entries` counts FILLS");
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+        assert_eq!(m.perp_pos_qty_1e6(), 0, "and NOTHING was hedged");
+        assert!(!m.vol.is_armed(), "the forecast is disarmed");
+        assert_eq!(m.side(), SIDE_FLAT);
+        assert_eq!(ctx.orders.len(), 1, "no retry in v1");
+
+        // The campaign's decision stays spent — it does not re-decide.
+        ctx.now = mono_of(late + MINUTE_NS);
+        m.on_opt_summary(
+            &summary(late + MINUTE_NS, opt_sym(4), 5_000_000_000, 500_000_000),
+            &mut ctx,
+        );
+        assert_eq!(m.vrp_counters().decisions, 1, "one decision per campaign");
+        assert_eq!(m.vrp_counters().entries_submitted, 1);
+    }
+
+    /// X1: a hedge that meets no fill is retried at the THEN-current
+    /// touch, and given up on after `HEDGE_RETRIES_MAX` with an alert.
+    #[test]
+    fn an_unfilled_hedge_retries_at_the_touch_then_alerts() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        // Fill the ENTRY only; the hedge it triggers goes unanswered.
+        fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
+        assert_eq!(ctx.orders.len(), 2, "entry + its hedge");
+
+        // Each deadline: one more attempt, at the touch of the moment.
+        let mut wall = entry;
+        let mut r = 0u8;
+        while r < HEDGE_RETRIES_MAX {
+            wall += ORDER_TTL_NS + ACTIVATION_SLACK_NS + 1;
+            ctx.now = mono_of(wall);
+            // The book has MOVED since the last attempt.
+            let px = 79_000_000_000 + (r as i64 + 1) * 10_000_000;
+            m.on_tick(&tick(wall, px, false), &mut ctx);
+            assert_eq!(
+                m.vrp_counters().hedge_unfilled as u8,
+                r + 1,
+                "retry {r}: the unfilled hedge is counted"
+            );
+            let last = ctx.orders.last().expect("a retry order");
+            assert_eq!(last.sym, perp_sym());
+            assert_eq!(last.px.raw(), px + 500_000, "at the THEN-current ask");
+            assert_eq!(m.perp_pos_qty_1e6(), 0, "still unhedged");
+            r += 1;
+        }
+        assert_eq!(m.vrp_counters().hedge_abandoned, 0, "not yet");
+
+        // One more deadline and the member gives up on the target.
+        wall += ORDER_TTL_NS + ACTIVATION_SLACK_NS + 1;
+        ctx.now = mono_of(wall);
+        let before = ctx.orders.len();
+        m.on_tick(&tick(wall, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.vrp_counters().hedge_abandoned, 1, "the operator alert");
+        assert_eq!(ctx.orders.len(), before, "and nothing is chasing it");
+        assert_eq!(m.perp_pos_qty_1e6(), 0);
+    }
+
+    /// X1: a fill this member is not chasing is counted, never booked.
+    #[test]
+    fn a_fill_for_another_member_is_ignored() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let (mut m, _) = member(&mut ctx, params);
+        let sel = EXPIRY - TAU - params.selection_ns / 2;
+        ctx.now = mono_of(sel);
+        m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
+        let entry = EXPIRY - TAU;
+        ctx.now = mono_of(entry);
+        m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        let mine = ctx.orders[0];
+
+        // Same sym, same size, a DIFFERENT order id.
+        let stranger = Fill::new(
+            mono_of(entry),
+            mine.sym,
+            mine.side,
+            mine.px,
+            mine.qty,
+            mine.client_oid ^ 0xDEAD,
+        )
+        .with_attribution(SLOT_VRP_ID, core_types::FILL_ORIGIN_PAPER);
+        m.on_fill(&stranger, &mut ctx);
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "not my order, not my position");
+        assert_eq!(m.vrp_counters().fills_ignored, 1);
+        assert_eq!(m.vrp_counters().fills, 0);
+        assert_eq!(ctx.orders.len(), 1, "and no hedge went out for it");
+
+        // Mine still works.
+        fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
+        assert_eq!(m.vrp_counters().fills, 1);
+    }
+
+    /// X1: a European cash settlement is not a trade, so no order is
+    /// emitted for it — the harness settles the same position from the
+    /// capture by itself, and a closing IoC would be judged against
+    /// post-expiry quotes (F12) that can be cheaper than settlement.
+    #[test]
+    fn settlement_emits_no_option_order() {
+        let mut ctx = RecCtx::new();
+        let params = VrpParams::default();
+        let mut m = campaign_at_expiry(&mut ctx, params);
+        ctx.now = mono_of(EXPIRY);
+        let mut o = summary(EXPIRY, opt_sym(4), 5_000_000_000, 500_000_000);
+        o.underlying_px_1e9 = 90_000_000_000i64.saturating_mul(1_000);
+        m.on_opt_summary(&o, &mut ctx);
+        assert_eq!(m.vrp_counters().settled_itm, 1);
+        for order in &ctx.orders {
+            assert_eq!(
+                order.sym,
+                perp_sym(),
+                "the ONLY order a settlement emits is the perp unwind"
+            );
+        }
+        assert_eq!(m.opt_pos_qty_1e6(), 0);
+        assert_eq!(m.last_settle_value_1e6(), 11_000_000_000);
+    }
+
     // ---------------- the risk-policy caps ----------------
 
     #[test]
@@ -2752,10 +3252,14 @@ mod tests {
         m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
         let entry = EXPIRY - TAU;
         ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
         assert_eq!(m.vrp_counters().caps_rejected, 0);
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
         assert_eq!(m.vrp_counters().entries, 1);
-        assert_eq!(ctx.orders.len(), 2);
+        assert_eq!(n, 2);
+        fill_from(&mut m, &mut ctx, n - 1, mono_of(entry));
         // The hedge itself is inside the single-order cap.
         let h = ctx.orders[1];
         let caps = strategy_core::caps_for_sym(perp_sym());
@@ -2779,7 +3283,11 @@ mod tests {
         m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
         let entry = EXPIRY - TAU;
         ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        fill_from(&mut m, &mut ctx, n - 1, mono_of(entry));
         assert_ne!(m.perp_pos_qty_1e6(), 0);
         ctx.orders.clear();
         // Y1: the unwind happens at SETTLEMENT, not at E−ε. E−ε only
@@ -2788,10 +3296,18 @@ mod tests {
         ctx.now = mono_of(eps);
         m.on_tick(&tick(eps, 79_000_000_000, false), &mut ctx);
         assert_ne!(m.perp_pos_qty_1e6(), 0, "still hedged into expiry");
+        ctx.orders.clear();
+        // X1: settlement SUBMITS the unwind; the book is flat when it
+        // fills, and the next record ends the campaign.
         ctx.now = mono_of(EXPIRY);
         m.on_tick(&tick(EXPIRY, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "the option became cash, no order");
+        assert_eq!(ctx.orders.len(), 1, "the perp unwind, and only that");
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        fill_from(&mut m, &mut ctx, 0, mono_of(EXPIRY));
         assert_eq!(m.perp_pos_qty_1e6(), 0, "the hedge unwound at settlement");
-        assert_eq!(m.opt_pos_qty_1e6(), 0);
+        m.on_tick(&tick(EXPIRY + 1_000_000_000, 79_000_000_000, false), &mut ctx);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
     }
 
     // ---------------- kill criterion 3 ----------------
@@ -2862,8 +3378,18 @@ mod tests {
         m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), ctx);
         let entry = EXPIRY - TAU;
         ctx.now = mono_of(entry);
+        // A known perp quote first, so the hedge has a touch to price at.
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), ctx);
+        ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), ctx);
+        // X1: the submit is an INTENT. The option leg fills first, and
+        // the hedge only goes out because it did.
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "no fill, no position");
+        let n = fill_from(&mut m, ctx, 0, mono_of(entry));
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6, "the campaign is open");
+        fill_from(&mut m, ctx, n - 1, mono_of(entry));
+        ctx.orders.clear();
+        assert_eq!(m.perp_pos_qty_1e6(), 500_000, "hedged at delta 0.5");
         // F1: the hold's own minutes. `y` is now realised vol over
         // `[arm, arm + τ)` — the quantity the seed cutter forms — so a
         // campaign that never ran its minutes has no `y` and forms no
@@ -2875,6 +3401,9 @@ mod tests {
             let wall = entry + k * MINUTE_NS;
             ctx.now = mono_of(wall);
             m.on_tick(&tick(wall, 79_000_000_000, false), ctx);
+            // X1: a rebalance that fires has to FILL, or the deadline
+            // sweep would count it unfilled and retry it.
+            fill_all(&mut m, ctx, mono_of(wall));
             k += 1;
         }
         assert!(
@@ -2900,18 +3429,23 @@ mod tests {
 
         assert_eq!(m.vrp_counters().settled_itm, 1);
         assert_eq!(m.vrp_counters().settled_otm, 0);
-        assert_eq!(ctx.orders.len(), 2, "the option's cash value and the hedge");
-        // The option leg books max(0, S − K) = $1,500, not a mark.
-        assert_eq!(ctx.orders[0].sym, opt_sym(4));
-        assert_eq!(ctx.orders[0].px.raw(), 1_500_000_000);
-        assert_eq!(ctx.orders[0].side, Side::Bid, "buying back the short");
-        assert_eq!(ctx.orders[0].qty.raw(), params.qty_1e6);
-        assert_eq!(ctx.orders[1].sym, perp_sym());
-        assert_eq!(m.opt_pos_qty_1e6(), 0);
-        assert_eq!(m.perp_pos_qty_1e6(), 0);
-        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
-        // And the hold still fed the forecast.
+        // X1: the option leg books max(0, S − K) = $1,500 as CASH, with
+        // NO ORDER. A European settlement is not a trade: a closing IoC
+        // would be judged against the venue's post-expiry quotes — it
+        // keeps quoting for 9–19 min (F12) — and could fill cheaper
+        // than settlement, or twice at two prices, while the harness
+        // settles the same position from the capture by itself (VX-A).
+        assert_eq!(ctx.orders.len(), 1, "the perp unwind, and only that");
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        assert_eq!(m.opt_pos_qty_1e6(), 0, "the option became cash");
+        assert_eq!(m.last_settle_value_1e6(), 1_500_000_000, "at the intrinsic");
+        // And the hold fed the forecast the moment it settled.
         assert_eq!(m.vrp_counters().settlements, 1);
+        // The perp comes off on its fill, and the record after ends it.
+        fill_from(&mut m, &mut ctx, 0, mono_of(EXPIRY));
+        assert_eq!(m.perp_pos_qty_1e6(), 0);
+        m.on_tick(&tick(EXPIRY + 1_000_000_000, 80_500_000_000, false), &mut ctx);
+        assert_eq!(m.selected_sym(), SYMBOL_ID_NONE, "the campaign ended");
     }
 
     #[test]
@@ -2934,7 +3468,10 @@ mod tests {
         assert_eq!(ctx.orders.len(), 1, "ONLY the hedge unwinds");
         assert_eq!(ctx.orders[0].sym, perp_sym());
         assert_eq!(m.opt_pos_qty_1e6(), 0, "the option expired worthless");
+        assert_eq!(m.last_settle_value_1e6(), 0, "and at nothing");
+        fill_from(&mut m, &mut ctx, 0, mono_of(EXPIRY));
         assert_eq!(m.perp_pos_qty_1e6(), 0);
+        m.on_tick(&tick(EXPIRY + 1_000_000_000, 77_500_000_000, false), &mut ctx);
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
     }
 
@@ -2968,11 +3505,16 @@ mod tests {
         m.on_tick(&tick(late, s_1e6, false), &mut ctx);
 
         assert_eq!(m.vrp_counters().settled_itm, 1, "settled on a TICK");
-        assert_eq!(ctx.orders.len(), 2);
-        // Priced off the FRESHER of the two index sources: the tick
+        // X1: the option became CASH — no order — so the only order is
+        // the perp unwind.
+        assert_eq!(ctx.orders.len(), 1);
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        // Valued off the FRESHER of the two index sources: the tick
         // that arrived six hours after the option lane went quiet.
         // 81,000 − 79,000 = $2,000.
-        assert_eq!(ctx.orders[0].px.raw(), 2_000_000_000);
+        assert_eq!(m.last_settle_value_1e6(), 2_000_000_000);
+        fill_from(&mut m, &mut ctx, 0, mono_of(late));
+        m.on_tick(&tick(late + 1_000_000_000, s_1e6, false), &mut ctx);
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
     }
 
@@ -3154,7 +3696,9 @@ mod tests {
         assert_eq!(ctx.orders.len(), 1, "the hedge only");
         assert_eq!(ctx.orders[0].sym, perp_sym());
         assert_eq!(boot.opt_pos_qty_1e6(), 0);
+        fill_from(&mut boot, &mut ctx, 0, mono_of(late));
         assert_eq!(boot.perp_pos_qty_1e6(), 0);
+        boot.on_tick(&tick(late + 1_000_000_000, 81_000_000_000, false), &mut ctx);
         assert_eq!(boot.selected_sym(), SYMBOL_ID_NONE);
         assert_eq!(boot.expiry_ns, 0, "the campaign ended");
     }
@@ -3178,8 +3722,14 @@ mod tests {
         boot.on_tick(&tick(EXPIRY, 81_000_000_000, false), &mut ctx);
         assert_eq!(boot.vrp_counters().settled_itm, 1);
         assert_eq!(boot.vrp_counters().settled_unpriced, 0);
-        assert_eq!(ctx.orders.len(), 2);
-        assert_eq!(ctx.orders[0].px.raw(), 2_000_000_000, "81,000 − 79,000");
+        // X1: cash, not a trade — the perp unwind is the only order.
+        assert_eq!(ctx.orders.len(), 1);
+        assert_eq!(ctx.orders[0].sym, perp_sym());
+        assert_eq!(
+            boot.last_settle_value_1e6(),
+            2_000_000_000,
+            "81,000 − 79,000"
+        );
     }
 
     #[test]
@@ -3810,19 +4360,28 @@ mod tests {
         ctx2.now = mono_of(sel);
         m2.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx2);
         ctx2.now = mono_of(entry);
-        m2.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx2);
-        assert_eq!(m2.opt_pos_qty_1e6(), -params.qty_1e6);
+        m2.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx2);
         ctx2.orders.clear();
-        ctx2.now = mono_of(entry + 60_000_000_000);
+        m2.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx2);
+        let n = fill_from(&mut m2, &mut ctx2, 0, mono_of(entry));
+        fill_from(&mut m2, &mut ctx2, n - 1, mono_of(entry));
+        assert_eq!(m2.opt_pos_qty_1e6(), -params.qty_1e6);
+        assert_ne!(m2.perp_pos_qty_1e6(), 0);
+        ctx2.orders.clear();
+        let hard = entry + 60_000_000_000;
+        ctx2.now = mono_of(hard);
         m2.on_regime(
             RegimeGate::new([RegimeWord(0); 4], false, core_types::REGIME_OFF_HARD),
             &mut ctx2,
         );
+        // X1: a hard gate SUBMITS both unwinds now — the book is flat
+        // when they fill, and `flatten` retries on every record until
+        // it is. "Get out" is the law; the fill is when you are out.
         assert_eq!(ctx2.orders.len(), 2, "a hard gate unwinds both legs NOW");
+        assert_eq!(m2.vrp_counters().regime_exits, 1);
+        fill_from(&mut m2, &mut ctx2, 0, mono_of(hard));
         assert_eq!(m2.opt_pos_qty_1e6(), 0);
         assert_eq!(m2.perp_pos_qty_1e6(), 0);
-        assert_eq!(m2.selected_sym(), SYMBOL_ID_NONE);
-        assert_eq!(m2.vrp_counters().regime_exits, 1);
     }
 
     #[test]
@@ -3835,8 +4394,13 @@ mod tests {
         m.on_opt_summary(&summary(sel, opt_sym(4), 700_000_000, 500_000_000), &mut ctx);
         let entry = EXPIRY - TAU;
         ctx.now = mono_of(entry);
+        m.on_tick(&tick(entry - MINUTE_NS, 79_000_000_000, false), &mut ctx);
+        ctx.orders.clear();
         m.on_opt_summary(&summary(entry, opt_sym(4), 5_000_000_000, 500_000_000), &mut ctx);
+        let n = fill_from(&mut m, &mut ctx, 0, mono_of(entry));
+        fill_from(&mut m, &mut ctx, n - 1, mono_of(entry));
         assert_eq!(m.opt_pos_qty_1e6(), -params.qty_1e6);
+        assert_ne!(m.perp_pos_qty_1e6(), 0);
 
         // Y1: the terminal rung is SETTLEMENT, so that is where a full
         // ring has to be survived. Expiry arrives with it full.
@@ -3847,15 +4411,19 @@ mod tests {
         assert_ne!(m.selected_sym(), SYMBOL_ID_NONE, "campaign still open");
         assert!(m.orders_dropped() > 0);
         assert!(
-            m.opt_pos_qty_1e6() != 0 || m.perp_pos_qty_1e6() != 0,
+            m.perp_pos_qty_1e6() != 0,
             "a refused submit must NOT be taken as a closed position"
         );
 
-        // The ring drains; the very next record completes the settlement.
+        // The ring drains; the unwind goes out, fills, and the record
+        // after that ends the campaign.
         ctx.full = false;
         m.on_tick(&tick(EXPIRY + 1_000_000_000, 79_000_000_000, false), &mut ctx);
+        assert_eq!(ctx.orders.len(), 1, "the perp unwind");
+        fill_from(&mut m, &mut ctx, 0, mono_of(EXPIRY + 1_000_000_000));
         assert_eq!(m.opt_pos_qty_1e6(), 0);
         assert_eq!(m.perp_pos_qty_1e6(), 0);
+        m.on_tick(&tick(EXPIRY + 2_000_000_000, 79_000_000_000, false), &mut ctx);
         assert_eq!(m.selected_sym(), SYMBOL_ID_NONE);
     }
 

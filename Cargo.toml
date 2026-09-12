@@ -32,6 +32,9 @@ members = [
     "crates/opt-registry",
     # VRP V4: the integer HAR/OLS volatility forecast
     "crates/core-vol",
+    # VRP X1: the ONE modelled fill law, shared by the offline harness
+    # and the engine's paper dispatcher
+    "crates/core-fill",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -151,6 +154,7 @@ core-simd    = { path = "crates/core-simd" }
 core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 core-vol     = { path = "crates/core-vol" }
+core-fill    = { path = "crates/core-fill" }
 
 ingress-ai         = { path = "crates/ingress-ai" }
 ingress-binance    = { path = "crates/ingress-binance" }

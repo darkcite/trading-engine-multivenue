@@ -69,19 +69,32 @@ a v2 file replays under the v2 law — never stale.
 |     16 |    40 | payload  | `[u8; 40]`     | opaque; interpretation by source       |
 |     56 |     8 | _pad1    | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)  |
 
-### `Fill` — 64 bytes
+### `Fill` — 64 bytes (layout amended X1, pre-first-capture — see docs/migration.md)
 
-| offset | bytes | field     | type           | notes                           |
-| -----: | ----: | --------- | -------------- | ------------------------------- |
-|      0 |     8 | ts_ns     | `u64` NsTs     |                                 |
-|      8 |     4 | sym       | `u32` SymbolId | venue-namespaced (venue in sym) |
-|     12 |     1 | side      | `u8`           | `Side` (Bid=0, Ask=1)           |
-|     13 |     3 | _pad0     | `[u8; 3]`      | explicit, zeroed                |
-|     16 |     8 | px        | `i64` Price    | fixed-point ×1e6                |
-|     24 |     8 | qty       | `i64` Qty      | fixed-point ×1e6                |
-|     32 |     8 | order_id  | `u64`          | engine-assigned client oid      |
-|     40 |    16 | _pad1     | `[u8; 16]`     | explicit, zeroed                |
-|     56 |     8 | _pad2     | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1) |
+`engine-fills.pmlr` has been HEADER-ONLY for the whole life of paper
+mode: the paper dispatcher returned no fill, so no Fill slot has ever
+been persisted. `strategy_id` and `origin` therefore take two bytes of
+what was explicit zeroed padding with **zero reader-compat surface** —
+the same situation `Order.strategy_id` was in at M4.1.
+
+| offset | bytes | field       | type           | notes                                            |
+| -----: | ----: | ----------- | -------------- | ------------------------------------------------ |
+|      0 |     8 | ts_ns       | `u64` NsTs     |                                                  |
+|      8 |     4 | sym         | `u32` SymbolId | venue-namespaced (venue in sym)                  |
+|     12 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1)                            |
+|     13 |     1 | strategy_id | `u8`           | X1: emitting slot; `0xFF` = unattributed         |
+|     14 |     1 | origin      | `u8`           | X1: 0 = venue fill, 1 = MODELLED by the paper matcher |
+|     15 |     1 | _pad0       | `[u8; 1]`      | explicit, zeroed                                 |
+|     16 |     8 | px          | `i64` Price    | fixed-point ×1e6                                 |
+|     24 |     8 | qty         | `i64` Qty      | fixed-point ×1e6                                 |
+|     32 |     8 | order_id    | `u64`          | engine-assigned client oid                       |
+|     40 |    16 | _pad1       | `[u8; 16]`     | explicit, zeroed                                 |
+|     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)            |
+
+`origin` is load-bearing for any audit that will see both sources in one
+stream once Stage-3 lands: a modelled fill and a real one are not the
+same evidence, and a reader that cannot tell them apart is auditing
+nothing.
 
 ### `Order` — 64 bytes (layout amended M4.1, pre-first-capture — see docs/migration.md)
 

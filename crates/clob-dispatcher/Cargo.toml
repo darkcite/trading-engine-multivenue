@@ -17,6 +17,8 @@ core-parse    = { workspace = true }
 core-ring     = { workspace = true }
 core-time     = { workspace = true }
 core-types    = { workspace = true }
+# VRP X1: the ONE modelled fill law, shared with the offline harness.
+core-fill     = { workspace = true }
 signer-eip712 = { workspace = true }
 memchr        = { workspace = true }
 mio           = { workspace = true }

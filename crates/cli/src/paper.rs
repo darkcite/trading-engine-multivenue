@@ -3010,6 +3010,7 @@ impl Observability {
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
+            let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             let fills_capture = {
                 let io_errors = reg
                     .register_gauge("engine_fills_capture_io_errors")
@@ -3089,6 +3090,7 @@ impl Observability {
                 vrp,
                 xsd,
                 regime,
+                paper_matcher,
             });
         }
         if enable_metrics {
@@ -3423,6 +3425,9 @@ pub struct EngineCounters {
     pub xsd: XsdMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
+    /// X1: the `engine_paper_matcher_*` family + the set's
+    /// `engine_set_fills_unrouted_total`.
+    pub paper_matcher: PaperMatcherMetricIds,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -3787,6 +3792,24 @@ pub struct VrpMetricIds {
     /// `engine_vrp_select_scans_total` (F31 — chain scans by the
     /// selection law; bounded by the selection window)
     pub select_scans: core_metrics::CounterId,
+    /// `engine_vrp_entries_submitted_total` (X1 — intents; `entries`
+    /// counts the ones that FILLED, and the gap is F7)
+    pub entries_submitted: core_metrics::CounterId,
+    /// `engine_vrp_entries_unfilled_total` (X1)
+    pub entries_unfilled: core_metrics::CounterId,
+    /// `engine_vrp_hedge_unfilled_total` (X1)
+    pub hedge_unfilled: core_metrics::CounterId,
+    /// `engine_vrp_hedge_abandoned_total` (X1). **Non-zero is an
+    /// operator alert** — the book is off its delta target and nothing
+    /// is chasing it (`docs/risk-policy.md`).
+    pub hedge_abandoned: core_metrics::CounterId,
+    /// `engine_vrp_fills_total` (X1 — modelled fills consumed)
+    pub fills: core_metrics::CounterId,
+    /// `engine_vrp_fills_ignored_total` (X1 — matched no leg in flight)
+    pub fills_ignored: core_metrics::CounterId,
+    /// `engine_vrp_last_settle_value_1e6` (X1 gauge — the cash the last
+    /// settlement booked; no order is emitted for it)
+    pub last_settle_value_1e6: core_metrics::GaugeId,
     /// `engine_vrp_no_bounds_total`
     pub no_bounds: core_metrics::CounterId,
     /// `engine_vrp_stale_skips_total`
@@ -3838,6 +3861,12 @@ fn register_vrp_metrics(
     let holds = one("engine_vrp_holds_total")?;
     let holds_side = one("engine_vrp_holds_side_total")?;
     let select_scans = one("engine_vrp_select_scans_total")?;
+    let entries_submitted = one("engine_vrp_entries_submitted_total")?;
+    let entries_unfilled = one("engine_vrp_entries_unfilled_total")?;
+    let hedge_unfilled = one("engine_vrp_hedge_unfilled_total")?;
+    let hedge_abandoned = one("engine_vrp_hedge_abandoned_total")?;
+    let fills = one("engine_vrp_fills_total")?;
+    let fills_ignored = one("engine_vrp_fills_ignored_total")?;
     let no_bounds = one("engine_vrp_no_bounds_total")?;
     let stale_skips = one("engine_vrp_stale_skips_total")?;
     let no_selection = one("engine_vrp_no_selection_total")?;
@@ -3860,6 +3889,12 @@ fn register_vrp_metrics(
         holds,
         holds_side,
         select_scans,
+        entries_submitted,
+        entries_unfilled,
+        hedge_unfilled,
+        hedge_abandoned,
+        fills,
+        fills_ignored,
         no_bounds,
         stale_skips,
         no_selection,
@@ -3874,7 +3909,97 @@ fn register_vrp_metrics(
         qlike_iv_1e6: g("engine_vrp_qlike_iv_1e6")?,
         qlike_har_1e6: g("engine_vrp_qlike_har_1e6")?,
         qlike_har_beats_iv: g("engine_vrp_qlike_har_beats_iv")?,
+        last_settle_value_1e6: g("engine_vrp_last_settle_value_1e6")?,
     })
+}
+
+/// X1: the paper matcher's family. Boot-only.
+#[derive(Copy, Clone, Debug)]
+pub struct PaperMatcherMetricIds {
+    /// `engine_paper_matcher_intake_total`
+    pub intake: core_metrics::CounterId,
+    /// `engine_paper_matcher_fills_total`
+    pub fills: core_metrics::CounterId,
+    /// `engine_paper_matcher_ioc_canceled_total` — **the F7 counter**.
+    /// A mid-priced IoC on a real spread lives here, and the VRP
+    /// member's option entry did, twice, while the member believed it
+    /// held the position.
+    pub ioc_canceled: core_metrics::CounterId,
+    /// `engine_paper_matcher_ttl_expired_total`
+    pub ttl_expired: core_metrics::CounterId,
+    /// `engine_paper_matcher_rejected_open_cap_total`
+    pub rejected_open_cap: core_metrics::CounterId,
+    /// `engine_paper_matcher_unroutable_total`
+    pub unroutable: core_metrics::CounterId,
+    /// `engine_paper_matcher_out_overflow_total` — must stay 0.
+    pub out_overflow: core_metrics::CounterId,
+    /// `engine_paper_matcher_open_orders` (gauge)
+    pub open_orders: core_metrics::GaugeId,
+    /// `engine_set_fills_unrouted_total` — fills stamped for a slot
+    /// that is not enabled, or not built.
+    pub fills_unrouted: core_metrics::CounterId,
+}
+
+/// Register the paper-matcher family. Boot-only.
+fn register_paper_matcher_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<PaperMatcherMetricIds, &'static str> {
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name)
+            .map_err(|_| "register paper matcher counter")
+    };
+    let intake = one("engine_paper_matcher_intake_total")?;
+    let fills = one("engine_paper_matcher_fills_total")?;
+    let ioc_canceled = one("engine_paper_matcher_ioc_canceled_total")?;
+    let ttl_expired = one("engine_paper_matcher_ttl_expired_total")?;
+    let rejected_open_cap = one("engine_paper_matcher_rejected_open_cap_total")?;
+    let unroutable = one("engine_paper_matcher_unroutable_total")?;
+    let out_overflow = one("engine_paper_matcher_out_overflow_total")?;
+    let fills_unrouted = one("engine_set_fills_unrouted_total")?;
+    Ok(PaperMatcherMetricIds {
+        intake,
+        fills,
+        ioc_canceled,
+        ttl_expired,
+        rejected_open_cap,
+        unroutable,
+        out_overflow,
+        fills_unrouted,
+        open_orders: reg
+            .register_gauge("engine_paper_matcher_open_orders")
+            .map_err(|_| "register paper matcher gauge")?,
+    })
+}
+
+/// X1: mirror the matcher's counters as monotonic deltas.
+fn mirror_paper_matcher_metrics(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &PaperMatcherMetricIds,
+    cur: clob_dispatcher::MatcherCounters,
+    open_orders: usize,
+    fills_unrouted: u64,
+    last: &mut clob_dispatcher::MatcherCounters,
+    last_unrouted: &mut u64,
+) {
+    reg.counter(ids.intake)
+        .inc(cur.intake.saturating_sub(last.intake));
+    reg.counter(ids.fills)
+        .inc(cur.fills.saturating_sub(last.fills));
+    reg.counter(ids.ioc_canceled)
+        .inc(cur.ioc_canceled.saturating_sub(last.ioc_canceled));
+    reg.counter(ids.ttl_expired)
+        .inc(cur.ttl_expired.saturating_sub(last.ttl_expired));
+    reg.counter(ids.rejected_open_cap)
+        .inc(cur.rejected_open_cap.saturating_sub(last.rejected_open_cap));
+    reg.counter(ids.unroutable)
+        .inc(cur.unroutable.saturating_sub(last.unroutable));
+    reg.counter(ids.out_overflow)
+        .inc(cur.out_overflow.saturating_sub(last.out_overflow));
+    reg.counter(ids.fills_unrouted)
+        .inc(fills_unrouted.saturating_sub(*last_unrouted));
+    reg.gauge(ids.open_orders).set(open_orders as i64);
+    *last = cur;
+    *last_unrouted = fills_unrouted;
 }
 
 /// VRP V8a: rewrite `vrp-state.tsv` when, and only when, the member's
@@ -3949,6 +4074,17 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.holds_side.saturating_sub(last.holds_side));
     reg.counter(ids.select_scans)
         .inc(cur.select_scans.saturating_sub(last.select_scans));
+    reg.counter(ids.entries_submitted)
+        .inc(cur.entries_submitted.saturating_sub(last.entries_submitted));
+    reg.counter(ids.entries_unfilled)
+        .inc(cur.entries_unfilled.saturating_sub(last.entries_unfilled));
+    reg.counter(ids.hedge_unfilled)
+        .inc(cur.hedge_unfilled.saturating_sub(last.hedge_unfilled));
+    reg.counter(ids.hedge_abandoned)
+        .inc(cur.hedge_abandoned.saturating_sub(last.hedge_abandoned));
+    reg.counter(ids.fills).inc(cur.fills.saturating_sub(last.fills));
+    reg.counter(ids.fills_ignored)
+        .inc(cur.fills_ignored.saturating_sub(last.fills_ignored));
     reg.counter(ids.no_bounds)
         .inc(cur.no_bounds.saturating_sub(last.no_bounds));
     reg.counter(ids.stale_skips)
@@ -3974,6 +4110,8 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
     reg.gauge(ids.qlike_har_1e6).set(cur.qlike_har_1e6);
     reg.gauge(ids.qlike_har_beats_iv)
         .set(cur.qlike_har_beats_iv as i64);
+    reg.gauge(ids.last_settle_value_1e6)
+        .set(strategy_core::StrategyCounters::vrp_last_settle_value_1e6(strat));
     *last = cur;
 }
 
@@ -5016,6 +5154,9 @@ where
         vec![strategy_core::XsdPositionView::default(); strategy_xsd::XSD_MAX_TARGETS];
     let mut vrp_state_warn_ns: u64 = 0;
     let mut xsd_state_warn_ns: u64 = 0;
+    // X1: the paper matcher's delta snapshot.
+    let mut matcher_last = clob_dispatcher::MatcherCounters::default();
+    let mut fills_unrouted_last: u64 = 0;
     // F18/F21: ONE call site for every member's persisted state, so a
     // third member cannot be added to one of the two places and not the
     // other. A macro rather than a closure because it borrows `eng`
@@ -5137,6 +5278,18 @@ where
                 mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
+                // X1: what the paper matcher did. `ioc_canceled` is the
+                // F7 counter — a mid-priced IoC on a real spread never
+                // fills, and the member used to call that a position.
+                mirror_paper_matcher_metrics(
+                    reg,
+                    &ids.paper_matcher,
+                    clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
+                    clob_dispatcher::OrderDispatch::open_paper_orders(eng.dispatcher()),
+                    strategy_core::StrategyCounters::fills_unrouted(eng.strategy()),
+                    &mut matcher_last,
+                    &mut fills_unrouted_last,
+                );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
 
                 // Per-ingress connection state — real per-thread

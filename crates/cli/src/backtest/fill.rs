@@ -98,12 +98,11 @@ use core_types::{symbol_venue_byte, InstrumentClass, Order, Side, Tick, SYMBOL_I
 
 use crate::backtest::ModelParams;
 
-/// §4.1 cap: max open orders per symbol (risk-policy mirror).
-// Operator ruling 2026-08-29 ($50k tier): 4 -> 8.
-pub const MAX_OPEN_PER_SYM: usize = 8;
-/// §4.1 cap: max total open orders (risk-policy mirror).
-// Operator ruling 2026-08-29 ($50k tier): 32 -> 64.
-pub const MAX_OPEN_TOTAL: usize = 64;
+// §4.1 caps (risk-policy mirror; operator ruling 2026-08-29, $50k
+// tier: 4 -> 8 and 32 -> 64). X1: they live in `core-fill` now, with
+// the fill law itself, so the engine's paper dispatcher is bounded by
+// the same numbers this harness is.
+pub use core_fill::{MAX_OPEN_PER_SYM, MAX_OPEN_TOTAL};
 /// WS9: number of TRADEABLE venues (pm, bn, okx, deribit, hl,
 /// bybit). NOT a venue-byte bound any more — `Ai = 5` sits inside
 /// the byte range while `Bybit = 6` trades; use
@@ -183,10 +182,11 @@ fn fee_ceil_tenth_bps_1e12(notional_1e12: i128, tenth_bps: u32) -> i128 {
 // Open-order table (§4.1)
 // ---------------------------------------------------------------
 
-/// `Order.kind` of a post-only maker (the VM's only primitive).
-pub const ORDER_KIND_MAKER: u8 = 0;
-/// `Order.kind` of an immediate-or-cancel taker (I1; ICDP's primitive).
-pub const ORDER_KIND_IOC: u8 = 1;
+// X1: the two modeled kinds live in `core-fill` with the law that
+// judges them. They were defined here, in `strategy-icdp` and in
+// `strategy-xsd` — three copies of `= 1`, which is three places for a
+// renumbering to land in two.
+pub use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 /// Fee-ladder columns: flat bps per side (maker == taker) — §4.3.
 pub const FEE_LADDER_BPS: [u32; 3] = [0, 1, 2];
 
@@ -814,11 +814,7 @@ impl FillEngine {
         self.open[self.open_len] = OpenOrder {
             seq: self.seq_next,
             t_active_ns: emit_virt.saturating_add(self.params.latency_ns[venue]),
-            expiry_ns: if order.ttl_ns == 0 {
-                0
-            } else {
-                emit_virt.saturating_add(order.ttl_ns)
-            },
+            expiry_ns: core_fill::expiry_at(emit_virt, order.ttl_ns),
             sym: order.sym,
             side: order.side,
             kind: order.kind,
@@ -888,7 +884,7 @@ impl FillEngine {
         let mut i = 0usize;
         while i < self.open_len {
             let o = self.open[i];
-            if o.sym == sym && o.expiry_ns != 0 && virt_ns >= o.expiry_ns {
+            if o.sym == sym && core_fill::expired_at(virt_ns, o.expiry_ns) {
                 self.ttl_expired += 1;
                 self.remove_open(i);
                 continue;
@@ -982,8 +978,15 @@ impl FillEngine {
         // size, our ASKs the printed bid size — FIFO in emit order
         // (the table IS emit-ordered by construction), makers and
         // IoCs alike.
-        let mut ask_budget = tick.ask_qty.raw().max(0);
-        let mut bid_budget = tick.bid_qty.raw().max(0);
+        //
+        // X1: the verdicts below come from `core-fill`, which is the
+        // same law the engine's `PaperDispatcher` runs. A paper
+        // position and its replayed fill cannot disagree about a
+        // price, a size or a cancel, because there is no second
+        // implementation to disagree with.
+        let touch = core_fill::Touch::of(tick);
+        let mut ask_budget = touch.ask_qty_1e6;
+        let mut bid_budget = touch.bid_qty_1e6;
         // Fills only happen at a two-sided tick of the sym, which just
         // refreshed the mark above.
         let mark = *self.marks_1e6.get(&sym).expect("fill implies a mark");
@@ -997,59 +1000,50 @@ impl FillEngine {
             if o.kind == ORDER_KIND_IOC {
                 // I1: judged ONCE, here, at the first fresh two-sided
                 // tick at/after activation. Marketable ⇒ fill at the
-                // touch (`<=`/`>=`: a taker takes the touch); the
-                // remainder — or the whole order — cancels.
-                let (fill_px, fill_qty) = match o.side {
-                    Side::Bid if ask <= o.px_1e6 && ask_budget > 0 => {
-                        let q = o.remaining_1e6.min(ask_budget);
-                        ask_budget -= q;
-                        (ask, q)
+                // touch; the remainder — or the whole order — cancels.
+                // An IoC never rests, so there is no `Wait` arm to
+                // write: `judge_ioc` cannot return one.
+                match core_fill::judge_ioc(
+                    o.side,
+                    o.px_1e6,
+                    o.remaining_1e6,
+                    touch,
+                    &mut ask_budget,
+                    &mut bid_budget,
+                ) {
+                    core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                        let taker_bps = self.fee_rate(o.venue, o.sym).1;
+                        self.book_fill(&o, px_1e6, qty_1e6, taker_bps, mark, wall_ns, out);
+                        self.ioc_fills += 1;
                     }
-                    Side::Ask if bid >= o.px_1e6 && bid_budget > 0 => {
-                        let q = o.remaining_1e6.min(bid_budget);
-                        bid_budget -= q;
-                        (bid, q)
-                    }
-                    _ => (0, 0),
-                };
-                if fill_qty > 0 {
-                    let taker_bps = self.fee_rate(o.venue, o.sym).1;
-                    self.book_fill(&o, fill_px, fill_qty, taker_bps, mark, wall_ns, out);
-                    self.ioc_fills += 1;
-                } else {
-                    self.ioc_canceled += 1;
+                    _ => self.ioc_canceled += 1,
                 }
                 self.remove_open(i);
                 continue;
             }
-            let fill_qty = match o.side {
-                // Strict cross only: `<`, never `<=` (touch ⇒ infinite
-                // queue ahead, §4.2). `ask/bid > 0` held by `two_sided`.
-                Side::Bid if ask < o.px_1e6 && ask_budget > 0 => {
-                    let q = o.remaining_1e6.min(ask_budget);
-                    ask_budget -= q;
-                    q
+            // Strict cross only — never the touch (§4.2) — and the fill
+            // is at OUR limit, because a maker is the one being crossed.
+            match core_fill::judge_maker(
+                o.side,
+                o.px_1e6,
+                o.remaining_1e6,
+                touch,
+                &mut ask_budget,
+                &mut bid_budget,
+            ) {
+                core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                    let maker_bps = self.fee_rate(o.venue, o.sym).0;
+                    self.book_fill(&o, px_1e6, qty_1e6, maker_bps, mark, wall_ns, out);
+                    let remaining = o.remaining_1e6 - qty_1e6;
+                    if remaining > 0 {
+                        self.open[i].remaining_1e6 = remaining;
+                        i += 1;
+                    } else {
+                        // Compact: the next order slides into slot i.
+                        self.remove_open(i);
+                    }
                 }
-                Side::Ask if bid > o.px_1e6 && bid_budget > 0 => {
-                    let q = o.remaining_1e6.min(bid_budget);
-                    bid_budget -= q;
-                    q
-                }
-                _ => 0,
-            };
-            if fill_qty <= 0 {
-                i += 1;
-                continue;
-            }
-            let maker_bps = self.fee_rate(o.venue, o.sym).0;
-            self.book_fill(&o, o.px_1e6, fill_qty, maker_bps, mark, wall_ns, out);
-            let remaining = o.remaining_1e6 - fill_qty;
-            if remaining > 0 {
-                self.open[i].remaining_1e6 = remaining;
-                i += 1;
-            } else {
-                // Compact: the next order slides into slot i.
-                self.remove_open(i);
+                _ => i += 1,
             }
         }
     }

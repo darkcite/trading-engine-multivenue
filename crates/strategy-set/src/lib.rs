@@ -239,6 +239,9 @@ pub struct StrategySet {
     /// Refused `EnableStrategy` commands (halted or reserved/unknown
     /// slot). Mirrored to `engine_ai_enable_refused_total`.
     enable_refused: u64,
+    /// X1: fills stamped for a slot that is not enabled, or not built.
+    /// Mirrored to `engine_set_fills_unrouted_total`.
+    fills_unrouted: u64,
     /// RG2: the regime detector (boot-boxed; inert until
     /// [`Self::configure_regime`] — every word UNKNOWN, every gate open
     /// for the unconstrained members that exist today).
@@ -279,6 +282,7 @@ impl StrategySet {
             initial: m,
             halted: false,
             enable_refused: 0,
+            fills_unrouted: 0,
             regime: RegimeState::new_boxed(),
             regime_labels: [RegimeLabelSet::ANY; 8],
             regime_gates: [RegimeGate::OPEN_UNKNOWN; 8],
@@ -481,6 +485,44 @@ impl StrategySet {
         &mut self.latency_arb
     }
 
+    /// X1: deliver an attributed fill to exactly one enabled slot.
+    #[inline(always)]
+    fn route_fill_to_slot<C: Ctx>(&mut self, slot: u8, fill: &Fill, ctx: &mut C) {
+        match slot {
+            SLOT_LATENCY_ARB => self
+                .latency_arb
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB)),
+            SLOT_VRP => self
+                .vrp
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
+            SLOT_XSD => self
+                .xsd
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
+            SLOT_RULE_TREE => self
+                .rule_tree
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_RULE_TREE)),
+            SLOT_AI_EXEC => self
+                .ai_exec
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
+            SLOT_VM => self.vm.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
+            SLOT_ICDP => self
+                .icdp
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_ICDP)),
+            // Slot 7 is not built. A fill stamped with it is a bug
+            // upstream, not a member to deliver to.
+            _ => self.fills_unrouted = self.fills_unrouted.wrapping_add(1),
+        }
+    }
+
+    /// X1: fills that reached the set stamped for a slot that is not
+    /// enabled (or not built). Non-zero means an order outlived a
+    /// `DisableStrategy`, or a stamp is wrong.
+    #[inline]
+    #[must_use]
+    pub const fn fills_unrouted(&self) -> u64 {
+        self.fills_unrouted
+    }
+
     /// Configure the VRP member (boot-only).
     #[inline]
     pub fn vrp_mut(&mut self) -> &mut VrpStrategy {
@@ -681,6 +723,14 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vrp_state_epoch(&self) -> u64 {
         StrategyCounters::vrp_state_epoch(&self.vrp)
+    }
+    #[inline]
+    fn vrp_last_settle_value_1e6(&self) -> i64 {
+        self.vrp.last_settle_value_1e6()
+    }
+    #[inline]
+    fn fills_unrouted(&self) -> u64 {
+        self.fills_unrouted
     }
     #[inline]
     fn render_vrp_state(&self, out: &mut String) -> bool {
@@ -1051,8 +1101,33 @@ impl Strategy for StrategySet {
         }
     }
 
+    /// X1: an ATTRIBUTED fill goes to its slot ALONE.
+    ///
+    /// `Fill::strategy_id` mirrors `Order::strategy_id`, which the
+    /// set's own `StampCtx` already stamps on every submit, so the
+    /// paper matcher can hand a fill back to the member that asked for
+    /// it. Fanning it out instead would give slot 1's option fill to
+    /// slot 5 as well, and a member that infers a position from a
+    /// callback would book someone else's trade.
+    ///
+    /// A fill for a DISABLED slot is counted (`fills_unrouted`) rather
+    /// than delivered: the member is not running, and silently dropping
+    /// it would hide a live order outliving a `DisableStrategy`.
+    ///
+    /// `STRATEGY_ID_NONE` still fans out. That is every VENUE fill —
+    /// nothing on the wire says who asked — and the pre-X1 behaviour
+    /// for every member that has not opted in.
     #[inline(always)]
     fn on_fill<C: Ctx>(&mut self, fill: &Fill, ctx: &mut C) {
+        if fill.strategy_id != core_types::STRATEGY_ID_NONE {
+            let slot = fill.strategy_id;
+            if slot >= 8 || self.enabled & (1u8 << slot) == 0 {
+                self.fills_unrouted = self.fills_unrouted.wrapping_add(1);
+                return;
+            }
+            self.route_fill_to_slot(slot, fill, ctx);
+            return;
+        }
         if self.enabled & BIT_LATENCY_ARB != 0 {
             self.latency_arb
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
@@ -1465,6 +1540,52 @@ mod tests {
         feed_trigger(&mut s, &mut c);
         assert_eq!(c.submitted, 0);
         assert_eq!(s.orders_emitted(), 0);
+    }
+
+    /// X1: an ATTRIBUTED fill reaches its slot and nobody else.
+    ///
+    /// Without this, the paper matcher's fill for slot 1's option would
+    /// also be handed to slot 5, and a member that infers a position
+    /// from a callback would book someone else's trade.
+    #[test]
+    fn an_attributed_fill_reaches_only_its_own_slot() {
+        let fill_for = |slot: u8| {
+            core_types::Fill::new(
+                1,
+                7,
+                Side::Bid,
+                core_types::Price::from_raw(1_000_000),
+                core_types::Qty::from_raw(1_000_000),
+                99,
+            )
+            .with_attribution(slot, core_types::FILL_ORIGIN_PAPER)
+        };
+
+        // A fill for a DISABLED slot is counted, never delivered.
+        let mut s = StrategySet::new(BIT_LATENCY_ARB);
+        let mut c = ctx();
+        s.on_fill(&fill_for(SLOT_VRP), &mut c);
+        assert_eq!(s.fills_unrouted(), 1, "slot 1 is not enabled here");
+
+        // And a slot that is not BUILT at all.
+        s.on_fill(&fill_for(7), &mut c);
+        assert_eq!(s.fills_unrouted(), 2, "slot 7 does not exist");
+        s.on_fill(&fill_for(200), &mut c);
+        assert_eq!(s.fills_unrouted(), 3, "nor does slot 200");
+
+        // An UNATTRIBUTED fill — every venue fill — still fans out, and
+        // is never counted unrouted.
+        let venue = core_types::Fill::new(
+            1,
+            7,
+            Side::Bid,
+            core_types::Price::from_raw(1_000_000),
+            core_types::Qty::from_raw(1_000_000),
+            99,
+        );
+        assert_eq!(venue.strategy_id, core_types::STRATEGY_ID_NONE);
+        s.on_fill(&venue, &mut c);
+        assert_eq!(s.fills_unrouted(), 3, "a venue fill is not unrouted");
     }
 
     /// M4.1: ctx double that RECORDS submitted orders (attribution pin).

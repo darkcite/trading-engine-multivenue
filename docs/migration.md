@@ -6,6 +6,112 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-12 — the engine MODELS its paper fills; `Fill` carries its origin and its member (VRP P1 / X1)
+
+**What changed**
+
+- **New crate `crates/core-fill` — the ONE modelled fill law.** IoC
+  judged once at the touch, makers on a STRICT cross at their own
+  limit, one shared displayed-size budget per tick in emit order, the
+  I1 TTL, and `is_fill_evidence` (a stale or one-sided tick fills
+  nothing). It also owns `ORDER_KIND_MAKER/IOC`, `MAX_OPEN_PER_SYM/TOTAL`
+  and `ACTIVATION_NS_DEFAULT` — the MEASURED activation table, which
+  `ModelParams::default()` now reads from here so a re-measurement
+  cannot land in the harness and not in the engine.
+  `cli::backtest::fill` pass (b) calls it; `strategy-icdp`,
+  `strategy-xsd` and `strategy-vrp` import `ORDER_KIND_IOC` instead of
+  each defining `= 1`.
+- **`PaperMatcher` in `clob-dispatcher`, and `PaperDispatcher` uses it.**
+  `OrderDispatch` gains defaulted `observe_tick` / `matcher_counters` /
+  `open_paper_orders`; the engine calls `disp.observe_tick(&t, now)` in
+  the tick-lane drain, immediately before `strat.on_tick`. So the fills
+  the existing pump has always popped are now real in paper mode, and
+  `engine-fills.pmlr` stops being header-only.
+  **The matcher is engine-wide**: VM, ai-exec, icdp and xsd get fills
+  too. Their `on_fill` remains a no-op — consuming them is each lane's
+  own decision, and XSD doc 09 §3.3(ii) records the same F7-class
+  defect waiting there.
+- **`Fill` gains `strategy_id` (offset 13) and `origin` (offset 14)**,
+  wire-additive into what was explicit zeroed padding; `Fill::new`
+  defaults them to `STRATEGY_ID_NONE` / `FILL_ORIGIN_VENUE`, and
+  `with_attribution` stamps a modelled one. No capture in existence
+  carries anything there — paper mode never persisted a fill — so the
+  reader-compat surface is zero, exactly as `Order.strategy_id` at
+  M4.1. `docs/wire-format.md` updated.
+- **`StrategySet::on_fill` routes an ATTRIBUTED fill to its slot alone**
+  (`STRATEGY_ID_NONE` still fans out — that is every venue fill). A
+  fill for a disabled or unbuilt slot is counted
+  `engine_set_fills_unrouted_total`, never delivered.
+- **VRP: positions come from FILLS (F7).** The member's doctrine clause
+  1 said the opposite and was wrong. What changed in the member:
+  - the entry submit sets `opt_pending` and **emits no hedge** — the
+    hedge goes out from `on_fill`, once the option exists. Hedging on
+    the submit is what put a naked perp on against an option the model
+    never held, twice, live (`orders=2 fills=1 ioc_canceled=1`);
+  - `move_hedge` sets `hedge_pending` and never moves `perp_pos`; one
+    hedge order in flight at a time;
+  - `on_fill` matches `Fill::order_id` against the leg in flight and
+    moves the book; a fill for no leg is `fills_ignored`;
+  - a `sweep_pendings` on every callback turns an unanswered order into
+    a decision — the matcher signals a cancel only by ABSENCE. An
+    unfilled entry is a HOLD (`entries_unfilled`) and DISARMS the
+    forecast; an unfilled hedge retries at the then-current touch up to
+    `HEDGE_RETRIES_MAX = 3`, then counts `hedge_abandoned` (an operator
+    alert). Deadline = `submit + ORDER_TTL_NS + ACTIVATION_SLACK_NS`;
+  - **settlement emits NO option order.** The position becomes cash at
+    the intrinsic (`engine_vrp_last_settle_value_1e6`). A closing IoC
+    would be judged against the venue's post-expiry quotes — Deribit
+    keeps quoting 9–19 min (F12) — so it could fill cheaper than
+    settlement or twice at two prices, while the harness settles the
+    same position from the capture by itself (VX-A). The hold folds
+    into the forecast AT EXPIRY; the perp unwind is a real order and
+    the campaign ends when it fills;
+  - pending legs are deliberately NOT persisted: every order carries a
+    60 s TTL and the matcher's table is process-local, so an order in
+    flight at a restart is dead by construction.
+- Metrics: `engine_paper_matcher_{intake,fills,ioc_canceled,ttl_expired,rejected_open_cap,unroutable,out_overflow}_total`
+  + `engine_paper_matcher_open_orders`, `engine_set_fills_unrouted_total`,
+  and on the VRP family `entries_submitted`, `entries_unfilled`,
+  `hedge_unfilled`, `hedge_abandoned`, `fills`, `fills_ignored`,
+  `last_settle_value_1e6`. **`engine_paper_matcher_ioc_canceled_total`
+  is the F7 counter** and `entries_submitted − entries` is the gap the
+  member used to report as `entries` outright.
+
+**The byte-identity guard (P1's binding gate)**
+
+The harness's own output is UNCHANGED by all of the above. Run on the
+8-window VM pool, before and after:
+
+```sh
+./target/release/multivenue-engine backtest \
+  --ruleset ~/multivenue/artifacts/rulesets/fde6f733e72649e0c6452b009d0f7c3c.json \
+  --replay-dir ~/multivenue/worker/windows/ --split 0/100 \
+  --emit-detail <sidecar> > <stdout>
+```
+
+| surface | sha256 |
+|---|---|
+| schema-1 stdout, before AND after | `188d18e3b1ded76256ea0f5206c29880195b2af3686745ecbe85f85ce9105189` |
+| detail sidecar (v7), before AND after | `8695c421afb111d9b2ccfdfa138d38684d341de797a75a68a43de54b0a76762f` |
+
+`diff` empty on both. The only stderr differences are log timestamps and
+the sidecar's own filename.
+
+**Operator action**
+
+None at the artifact level — no file format changed and `vrp.toml` is
+untouched. The next restart makes the matcher live, after which
+`engine_vrp_entries_total` counts FILLS and will read lower than it did:
+that is the defect being measured, not a regression.
+
+**What did NOT change**
+
+The harness's fill law (the guard above is the proof), `vrp-state.tsv`
+v4, the seed grammar, the caps, the regime gate, and every other
+member's behaviour. The live dispatcher is untouched — `observe_tick`
+defaults to nothing, because a live dispatcher learns about fills from
+the venue and has no business inventing them from a book.
+
 ## 2026-09-12 — `vrp-state.tsv` v3 → v4; the settlement `y` is REALISED vol; one push per pair; the VRP boot is mask-gated (VRP P0 / R0)
 
 **What changed**

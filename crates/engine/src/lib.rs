@@ -408,6 +408,22 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         let now = now_ns();
                         self.ingest_lat.record(now.saturating_sub(t.ts_ns));
                         self.touch_sym_bucket(t.sym, now);
+                        // X1: the dispatcher sees the tick FIRST, so a
+                        // PAPER one can judge its open orders against
+                        // it (`core_fill` — the harness's own law). A
+                        // live dispatcher's default impl does nothing.
+                        //
+                        // Order of effects inside one iteration: this
+                        // tick judges pending orders, the member's
+                        // `on_tick` runs next, and the fills it
+                        // produced are pumped at the END of the
+                        // iteration — so a member always sees the tick
+                        // before the fill that tick caused. That is an
+                        // ordering NO member may depend on: the
+                        // harness drives marks, fills and the member
+                        // callback in its own order, and only the
+                        // resulting position has to agree.
+                        self.disp.observe_tick(&t, now);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,

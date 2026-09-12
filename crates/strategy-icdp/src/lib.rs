@@ -67,7 +67,7 @@ pub const ICDP_NF: usize = 5;
 /// Fixed-point scale of every feature, weight, threshold (×1e9).
 pub const SCALE_1E9: i64 = 1_000_000_000;
 /// `Order.kind` of the IoC intents this strategy emits (I1 law).
-pub const ORDER_KIND_IOC: u8 = 1;
+pub use core_fill::ORDER_KIND_IOC;
 /// Last-fifth-of-the-bar law: a decision tick arriving at/after
 /// `open + 4/5 tf` is LATE — the bar is skipped (quiet instrument).
 const LATE_NUM: u64 = 4;

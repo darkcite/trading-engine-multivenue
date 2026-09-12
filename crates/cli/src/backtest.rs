@@ -120,7 +120,10 @@ const MODEL_VENUE_LABELS: [(&str, VenueId); 6] = [
     ("bybit", VenueId::Bybit),
 ];
 
-/// ns per millisecond, for the §4.4 default table.
+/// ns per millisecond. TEST-ONLY since X1: the §4.4 default table moved
+/// to `core_fill::ACTIVATION_NS_DEFAULT`, so the only remaining users
+/// are the tests that pin it.
+#[cfg(test)]
 const MS: u64 = 1_000_000;
 
 // ---------------------------------------------------------------
@@ -393,7 +396,10 @@ impl Default for ModelParams {
             // Slot 5 = Ai is dead (0). Pre-2026-09-03 the table was
             // the §4.4 assumption (pm 200 / bn·okx·deribit·bybit 100 /
             // hl 600). RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.
-            latency_ns: [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS],
+            // X1: ONE table, both consumers — `core-fill` owns it so a
+            // re-measurement cannot land in the harness and not in the
+            // engine's paper dispatcher.
+            latency_ns: core_fill::ACTIVATION_NS_DEFAULT,
         }
     }
 }

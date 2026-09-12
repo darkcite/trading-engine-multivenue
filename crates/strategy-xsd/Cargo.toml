@@ -12,4 +12,5 @@ description  = "XSD cross-sectional dislocation strategy: hourly pairwise z on f
 core-regime   = { workspace = true }
 core-time     = { workspace = true }
 core-types    = { workspace = true }
+core-fill     = { workspace = true }
 strategy-core = { workspace = true }

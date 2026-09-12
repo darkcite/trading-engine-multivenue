@@ -12,6 +12,7 @@ description  = "ICDP intrabar candle-direction strategy: bar clock, L1 features,
 core-regime   = { workspace = true }
 core-time     = { workspace = true }
 core-types    = { workspace = true }
+core-fill     = { workspace = true }
 strategy-core = { workspace = true }
 
 [dev-dependencies]

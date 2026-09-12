@@ -590,8 +590,28 @@ pub struct Fill {
     pub sym: SymbolId,
     /// Bid or ask.
     pub side: Side,
+    /// X1: the strategy-set slot this fill belongs to, mirroring
+    /// [`Order::strategy_id`]; [`STRATEGY_ID_NONE`] (`0xFF`) =
+    /// unattributed, which is every VENUE fill (nobody stamps them) and
+    /// every fill a bare single-strategy boot produces.
+    ///
+    /// The set routes an attributed fill to that slot ALONE. Without
+    /// it a fan-out would hand slot 1's option fill to slot 5 as well,
+    /// and a member that infers a position from a callback would book
+    /// someone else's trade.
+    ///
+    /// Wire-additive: this byte was explicit zeroed padding, and paper
+    /// mode has never persisted a fill (`engine-fills.pmlr` is
+    /// header-only), so no capture in existence carries anything here.
+    pub strategy_id: u8,
+    /// X1: where the fill came from — [`FILL_ORIGIN_VENUE`] (`0`) for a
+    /// real venue report, [`FILL_ORIGIN_PAPER`] (`1`) for one the
+    /// paper dispatcher MODELLED. An audit that cannot tell the two
+    /// apart is an audit of nothing, and Stage-3 will have both in one
+    /// stream.
+    pub origin: u8,
     /// Padding for alignment.
-    _pad0: [u8; 3],
+    _pad0: [u8; 1],
     /// Fill price.
     pub px: Price,
     /// Fill quantity.
@@ -619,7 +639,9 @@ impl Fill {
             ts_ns,
             sym,
             side,
-            _pad0: [0; 3],
+            strategy_id: STRATEGY_ID_NONE,
+            origin: FILL_ORIGIN_VENUE,
+            _pad0: [0; 1],
             px,
             qty,
             order_id,
@@ -627,7 +649,27 @@ impl Fill {
             _pad2: [0; 8],
         }
     }
+
+    /// X1: the same fill, attributed. Used by the paper dispatcher,
+    /// which knows which member's order it just judged; a venue fill
+    /// keeps [`Fill::new`]'s `0xFF` / [`FILL_ORIGIN_VENUE`], because
+    /// nothing on the wire tells us who asked for it.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_attribution(self, strategy_id: u8, origin: u8) -> Self {
+        Self {
+            strategy_id,
+            origin,
+            ..self
+        }
+    }
 }
+
+/// [`Fill::origin`]: a real fill report from a venue.
+pub const FILL_ORIGIN_VENUE: u8 = 0;
+/// [`Fill::origin`]: a fill the paper dispatcher MODELLED through
+/// `core_fill`'s law. Never a trade that happened.
+pub const FILL_ORIGIN_PAPER: u8 = 1;
 
 /// An order request from a strategy, handed off to `clob-dispatcher`.
 #[derive(Copy, Clone, Debug)]
@@ -2720,6 +2762,48 @@ mod tests {
         assert_eq!(::core::mem::align_of::<Fill>(), 64);
     }
 
+    /// X1: `strategy_id` and `origin` are WIRE-ADDITIVE — they occupy
+    /// two bytes of what was explicit zeroed padding, at offsets 13 and
+    /// 14, and every other field is exactly where it was. Pinned by
+    /// OFFSET, the way `docs/wire-format.md` states the law, because a
+    /// reader of an old capture has the offsets and not the names.
+    #[test]
+    fn fill_attribution_is_wire_additive() {
+        let f = Fill::new(
+            0x0102_0304_0506_0708,
+            0x1112_1314,
+            Side::Ask,
+            Price::from_raw(0x2122_2324_2526_2728),
+            Qty::from_raw(0x3132_3334_3536_3738),
+            0x4142_4344_4546_4748,
+        );
+        let base = &f as *const Fill as usize;
+        assert_eq!(&f.ts_ns as *const _ as usize - base, 0);
+        assert_eq!(&f.sym as *const _ as usize - base, 8);
+        assert_eq!(&f.side as *const _ as usize - base, 12);
+        assert_eq!(&f.strategy_id as *const _ as usize - base, 13, "was padding");
+        assert_eq!(&f.origin as *const _ as usize - base, 14, "was padding");
+        assert_eq!(&f.px as *const _ as usize - base, 16, "unmoved");
+        assert_eq!(&f.qty as *const _ as usize - base, 24, "unmoved");
+        assert_eq!(&f.order_id as *const _ as usize - base, 32, "unmoved");
+        assert_eq!(::core::mem::size_of::<Fill>(), 64);
+
+        // The defaults are what a capture written before X1 means.
+        assert_eq!(f.strategy_id, STRATEGY_ID_NONE, "unattributed");
+        assert_eq!(f.origin, FILL_ORIGIN_VENUE, "a venue fill");
+
+        let stamped = f.with_attribution(1, FILL_ORIGIN_PAPER);
+        assert_eq!(stamped.strategy_id, 1);
+        assert_eq!(stamped.origin, FILL_ORIGIN_PAPER);
+        // Attribution changes attribution and nothing else.
+        assert_eq!(stamped.ts_ns, f.ts_ns);
+        assert_eq!(stamped.sym, f.sym);
+        assert_eq!(stamped.side, f.side);
+        assert_eq!(stamped.px.raw(), f.px.raw());
+        assert_eq!(stamped.qty.raw(), f.qty.raw());
+        assert_eq!(stamped.order_id, f.order_id);
+    }
+
     #[test]
     fn order_size_is_one_cache_line() {
         assert_eq!(::core::mem::size_of::<Order>(), 64);
@@ -2869,7 +2953,7 @@ mod tests {
         // compiler-inserted padding would break the AsBytes contract.
         // Tick: 8+4+4+8+8+8+8+1+1+6+8 = 64 (VT1: +flags, +venue_time_ms).
         // Signal: 8+4+1+1+2+40+8 = 64.
-        // Fill: 8+4+1+3+8+8+8+16+8 = 64.
+        // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin).
         // Order: 8+4+1+1+2+8+8+8+1+1+14+8 = 64 (M4.1: +strategy_id).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
         assert_eq!(::core::mem::size_of::<Signal>(), 64);
