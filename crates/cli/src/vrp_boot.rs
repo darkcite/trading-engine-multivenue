@@ -667,11 +667,17 @@ mod tests {
     fn a_full_seed_is_decisive_and_arrives_in_file_order() {
         let mut body = String::new();
         for i in 0..core_vol::MIN_PAIRS as u64 {
+            // BIN15 P1b (F5): the x's have to VARY. The old fixture
+            // stepped them by 1e-6 in log — sixty readings of the same
+            // number — and the engine now holds on such a cloud rather
+            // than dividing by nearly nothing. 0.02 per step is an
+            // x-spread of ~0.35 rms, which is the shape the live 8 h
+            // pairs actually have (0.416 measured 2026-09-13).
             body.push_str(&format!(
                 "{}\t{}\t{}\n",
                 1_000 + i,
-                30_000_000_000 + i as i64 * 1_000,
-                31_000_000_000 + i as i64 * 900
+                30_000_000_000 + i as i64 * 20_000_000,
+                31_000_000_000 + i as i64 * 18_000_000
             ));
         }
         let p = tmp("full", &body);
@@ -687,7 +693,11 @@ mod tests {
             e.seed_pair(*x, *y);
         }
         assert_eq!(e.n_pairs(), core_vol::MIN_PAIRS);
-        assert!(e.fit().is_some(), "a decisive seed must produce a fit");
+        let (_, b) = e.fit().expect("a decisive seed must produce a fit");
+        assert!(
+            (core_vol::B_MIN_1E9..=core_vol::B_MAX_1E9).contains(&b),
+            "and a fit inside the P1b bound: {b}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

@@ -90,6 +90,29 @@ pub const PAIR_RING: usize = 128;
 /// Pairs required before a fit is trusted (build card §2.3).
 pub const MIN_PAIRS: usize = 60;
 
+/// BIN15 P1b (F5): the least the OLS slope may be, ×1e9.
+///
+/// Zero. A NEGATIVE slope says "the higher the HAR forecast, the lower
+/// the realised vol", which no volatility series has ever done and
+/// which inverts the forecast on every future expiry.
+pub const B_MIN_1E9: i64 = 0;
+
+/// The most the OLS slope may be, ×1e9 — 2.0.
+///
+/// The regression is `ln realised` on `ln HAR`, two logs of the same
+/// quantity, so the honest slope lives near 1. Two is already a
+/// generous mean-reversion overshoot; past it the number is an artefact
+/// of a degenerate regressor, and an unbounded one exponentiates into a
+/// sigma the tape never supported.
+pub const B_MAX_1E9: i64 = 2_000_000_000;
+
+/// The least root-mean-square spread of the regressor a fit may be
+/// taken on, ×1e9 — 0.01 in log, i.e. the x's varied by about 1 %.
+///
+/// Below it the pairs are the same point sixty times over and the
+/// slope is division by nearly nothing.
+pub const X_SPREAD_MIN_1E9: i64 = 10_000_000;
+
 /// Trailing window of the QLIKE comparison — kill criterion 3 is
 /// stated over "a trailing 60 expiries", so the ring is 60.
 pub const QLIKE_RING: usize = 60;
@@ -976,7 +999,30 @@ impl VolEngine {
             self.fitted = false;
             return;
         }
-        let b = core_regime::math::floor_div(sxy * 1_000_000_000, sxx);
+        // BIN15 P1b (F5): a REGRESSOR FLOOR, not just a non-zero test.
+        // `sxx == 0` only catches x's that are bit-identical; sixty
+        // log-vols that differ in the ninth decimal are numerically
+        // distinct and give a slope of hundreds, which then multiplies
+        // the forecast into a sigma nothing in the tape supports. The
+        // floor asks for real dispersion: Sxx >= n * X_SPREAD_MIN_1E9^2
+        // is a root-mean-square deviation of at least 0.01 in log,
+        // i.e. the regressor actually varied by ~1 %.
+        if sxx < n * (X_SPREAD_MIN_1E9 as i128) * (X_SPREAD_MIN_1E9 as i128) {
+            self.fitted = false;
+            return;
+        }
+        // The slope, then CLAMPED — before the intercept is formed, so
+        // `a` is the intercept OF THE LINE THE ENGINE WILL USE and not
+        // of a line it just rejected. A HAR log-vol regressed on its own
+        // lagged log-vol has a slope in [0, 1] by construction and
+        // anything up to 2 is a defensible mean-reversion overshoot; a
+        // slope of 40 is an artefact of a degenerate x, and it is the
+        // one that made sigma_hat 1e4 too large without moving a single
+        // counter. ABSENT DATA HOLDS is the shape of the branch above;
+        // this is its arithmetic twin — an untrustworthy fit becomes a
+        // BOUNDED one rather than a wild one.
+        let b = core_regime::math::floor_div(sxy * 1_000_000_000, sxx)
+            .clamp(B_MIN_1E9 as i128, B_MAX_1E9 as i128);
         let a = ybar - core_regime::math::floor_div(b * xbar, 1_000_000_000);
         self.b_1e9 = i64::try_from(b).unwrap_or(0);
         self.a_1e9 = i64::try_from(a).unwrap_or(0);
@@ -1749,10 +1795,78 @@ mod tests {
     /// signed intermediates where Rust's `/` and Python's `//` disagree,
     /// pinned against the floored value AND against the truncating one
     /// so the test would fail if the fix were reverted.
+    /// BIN15 P1b (F5): a regressor that barely moved is NOT a fit.
+    ///
+    /// Sixty pairs whose x's differ in the ninth decimal pass the old
+    /// `sxx == 0` test and divide by nearly nothing; the slope that
+    /// comes out is an artefact, and the sigma it forecasts is the
+    /// silent 1e4-too-large failure of law 3. ABSENT DATA HOLDS: the
+    /// engine reports NO fit rather than a wild one.
+    #[test]
+    fn a_regressor_that_never_varied_is_not_a_fit() {
+        let mut e = VolEngine::new();
+        walk(&mut e, 1_600, 31);
+        let mut i = 0i64;
+        while i < MIN_PAIRS as i64 {
+            // x spread is 60 units of 1e-9 — numerically distinct,
+            // economically identical.
+            e.seed_pair(24_000_000_000 + i, 28_000_000_000 + i * 3_000_007);
+            i += 1;
+        }
+        assert_eq!(e.fit(), None, "a degenerate regressor must hold, not forecast");
+        assert_eq!(e.ln_sigma_hat_1e9(TAU_8H), None, "and nothing downstream prices");
+
+        // The same sixty pairs with a REAL 1 % spread do fit.
+        let mut e2 = VolEngine::new();
+        walk(&mut e2, 1_600, 31);
+        let mut i = 0i64;
+        while i < MIN_PAIRS as i64 {
+            e2.seed_pair(24_000_000_000 + i * 7_000_001, 28_000_000_000 + i * 3_000_007);
+            i += 1;
+        }
+        let (_, b) = e2.fit().expect("a real cloud fits");
+        assert!((B_MIN_1E9..=B_MAX_1E9).contains(&b), "and inside the bound: {b}");
+    }
+
+    /// The slope clamp, both ends, and the intercept formed FROM THE
+    /// CLAMPED SLOPE — which is the half that is easy to get wrong. An
+    /// `a` derived from the raw slope and a `b` that was clamped
+    /// describe a line neither the data nor the bound ever proposed.
+    #[test]
+    fn the_slope_is_clamped_and_the_intercept_follows_it() {
+        let mut e = VolEngine::new();
+        walk(&mut e, 1_600, 31);
+        // y rises ten times faster than x: an unbounded OLS gives ~10.
+        let mut i = 0i64;
+        while i < MIN_PAIRS as i64 {
+            e.seed_pair(24_000_000_000 + i * 10_000_000, 28_000_000_000 + i * 100_000_000);
+            i += 1;
+        }
+        let (a, b) = e.fit().expect("fitted");
+        assert_eq!(b, B_MAX_1E9, "the slope is capped at 2.0");
+        // xbar and ybar over the seeded cloud, recomputed here.
+        let n = MIN_PAIRS as i128;
+        let sx: i128 = (0..n).map(|k| 24_000_000_000i128 + k * 10_000_000).sum();
+        let sy: i128 = (0..n).map(|k| 28_000_000_000i128 + k * 100_000_000).sum();
+        let xbar = core_regime::math::floor_div(sx, n);
+        let ybar = core_regime::math::floor_div(sy, n);
+        let want =
+            ybar - core_regime::math::floor_div(B_MAX_1E9 as i128 * xbar, 1_000_000_000);
+        assert_eq!(i128::from(a), want, "the intercept is consistent with the CLAMPED slope");
+    }
+
     #[test]
     fn the_two_signed_divisions_floor_like_the_python_mirror() {
-        // (a) ln_sigma_hat with a NEGATIVE slope. Build a cloud that
-        // slopes down, so `b < 0` and `b·x` is negative.
+        // (a) BIN15 P1b (F5) CHANGED WHAT THIS HALF CAN SHOW. A
+        // downward-sloping cloud used to fit `b < 0`, which made `b·x`
+        // negative and separated floor from truncate inside
+        // `ln_sigma_hat_1e9`. The slope is now clamped to
+        // `[B_MIN_1E9, B_MAX_1E9]`, so the engine can no longer form a
+        // negative product at all: "the higher the forecast, the lower
+        // the realised vol" is a fit to refuse, not a fit to floor
+        // correctly. What the same fixture proves now is the clamp
+        // itself; the floor law of that division is asserted directly
+        // below, and (b) still drives the qlike one through the engine.
         let mut e = VolEngine::new();
         walk(&mut e, 1_600, 31);
         let mut i = 0i64;
@@ -1762,14 +1876,21 @@ mod tests {
             i += 1;
         }
         let (a, b) = e.fit().expect("fitted");
-        assert!(b < 0, "the cloud must slope down: b = {b}");
+        assert_eq!(b, B_MIN_1E9, "a downward cloud clamps to the floor, not below it");
         let x = e.x_1e9(TAU_8H).expect("x");
-        let prod = b as i128 * x as i128;
-        assert!(prod < 0, "the intermediate must be negative");
-        let floored = a + core_regime::math::floor_div(prod, 1_000_000_000) as i64;
-        let truncated = a + (prod / 1_000_000_000) as i64;
-        assert_eq!(e.ln_sigma_hat_1e9(TAU_8H), Some(floored));
-        assert_ne!(floored, truncated, "the fixture must separate the two laws");
+        assert_eq!(
+            e.ln_sigma_hat_1e9(TAU_8H),
+            Some(a + core_regime::math::floor_div(b as i128 * x as i128, 1_000_000_000) as i64)
+        );
+        // The division is still a FLOOR, on the negative products the
+        // engine no longer produces but the function still has to be
+        // right about.
+        let prod = -7_000_000_001i128 * 24_000_000_007i128;
+        assert_ne!(
+            core_regime::math::floor_div(prod, 1_000_000_000),
+            prod / 1_000_000_000,
+            "the fixture must separate the two laws"
+        );
 
         // (b) qlike with ln_rv < ln_sigma, i.e. a NEGATIVE ln_u — every
         // settlement whose realised vol came in under the forecast.

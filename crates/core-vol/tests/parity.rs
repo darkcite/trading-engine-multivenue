@@ -171,6 +171,45 @@ fn forecast_law_matches_the_shared_fixtures() {
     }
 }
 
+/// BIN15 P1b (F5): the slope clamp must be BIT-INERT on healthy fits.
+///
+/// `core-vol` also serves the VRP lane (4 h / 8 h), and a clamp that
+/// moved a single fitted `b` there would silently re-price two live
+/// campaigns. The fixture rows above already prove bit-identity — they
+/// carry `a` and `b` per emitted row and they are unchanged — so this
+/// test states the OTHER half explicitly: every fit the shared tapes
+/// produce already lives inside `[B_MIN_1E9, B_MAX_1E9]`, i.e. the
+/// clamp never engages on real data.
+///
+/// A red here is NOT a test to fix. It means a fixture fit sits outside
+/// the bound, which means the VRP lane has been trading a slope the
+/// bound calls broken — an operator finding, and its own investigation.
+#[test]
+fn every_fitted_slope_on_the_shared_tapes_is_already_inside_the_clamp() {
+    for name in FIXTURES {
+        let mut seen = 0usize;
+        for row in run(name) {
+            let f: Vec<&str> = row.split('\t').collect();
+            // `G` rows carry no fit; state rows put `b` in column 6.
+            if f.len() < 7 || f[1] == "G" || f[6] == "-" {
+                continue;
+            }
+            let b: i64 = f[6].parse().expect("b is an integer");
+            assert!(
+                (core_vol::B_MIN_1E9..=core_vol::B_MAX_1E9).contains(&b),
+                "{name}: fitted slope {b} is outside [{}, {}] — the clamp is NOT \
+                 bit-inert on this tape, which means the lane that trades it has \
+                 been trading a broken fit. Surface to the operator; do not widen \
+                 the bound to make this pass",
+                core_vol::B_MIN_1E9,
+                core_vol::B_MAX_1E9
+            );
+            seen += 1;
+        }
+        assert!(seen > 0, "{name}: no fitted row — the guard would be vacuous");
+    }
+}
+
 /// The fixture has to be a real exercise of the law, not a tape that
 /// happens to run. These are the properties the rows must show, checked
 /// against the file itself so a regenerated fixture cannot quietly
@@ -262,10 +301,37 @@ fn the_fixture_exercises_every_branch_it_claims_to() {
         rows.iter().all(|r| cell(r, 14) == "1" || cell(r, 15) == "-"),
         "a disarmed engine must report no realised window"
     );
-    // F5: a fit that slopes DOWN, so `b·x` is negative and the floored
-    // division is the only one that matches the Python.
+    // BIN15 P1b (F5) REPLACED WHAT THIS PINS, and the reason is on the
+    // record. The tape carries six rows whose raw OLS slope is NEGATIVE
+    // (−0.4286 and −0.3092): F5 put them there so `b·x` went negative
+    // and the floored division could be told from the truncated one.
+    // The slope is now clamped to `[B_MIN_1E9, B_MAX_1E9]`, so those
+    // rows fit at exactly 0 — "the higher the forecast, the lower the
+    // realised vol" is a fit to refuse, not a fit to floor correctly.
+    //
+    // Verified before the fixture was regenerated (operator ruling
+    // 2026-09-13): the LIVE 8 h fit off `~/multivenue/vrp-state.tsv`
+    // is b = 0.909931 on 90 pairs with an x-spread of 0.416 in log, so
+    // the clamp and the spread floor are bit-inert on real VRP data and
+    // no historical VRP number moves. The exposure was this synthetic
+    // tape alone.
+    //
+    // What the tape must still contain is the CLAMP ENGAGING — a
+    // downward cloud pinned at the floor rather than trading inverted.
     assert!(
-        rows.iter().any(|r| cell(r, 6).starts_with('-') && cell(r, 6) != "-"),
-        "the tape must contain a negative slope"
+        rows.iter().any(|r| cell(r, 6) == core_vol::B_MIN_1E9.to_string()),
+        "the tape must still drive a downward cloud into the clamp"
+    );
+    // And every fit on it is inside the bound, which is the property
+    // `every_fitted_slope_on_the_shared_tapes_is_already_inside_the_clamp`
+    // states for both tapes.
+    assert!(
+        rows.iter()
+            .filter(|r| cell(r, 6) != "-")
+            .all(|r| {
+                let b: i64 = cell(r, 6).parse().unwrap();
+                (core_vol::B_MIN_1E9..=core_vol::B_MAX_1E9).contains(&b)
+            }),
+        "a fitted slope escaped the clamp"
     );
 }

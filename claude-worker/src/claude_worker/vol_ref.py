@@ -51,6 +51,14 @@ import math
 MINUTE_RING = 1536
 PAIR_RING = 128
 MIN_PAIRS = 60
+#: BIN15 P1b (F5): the OLS slope bound and the regressor-spread floor,
+#: mirroring ``core_vol::{B_MIN_1E9, B_MAX_1E9, X_SPREAD_MIN_1E9}``. A
+#: negative slope inverts the forecast; an unbounded one exponentiates
+#: into a sigma the tape never supported; a regressor that never varied
+#: is division by nearly nothing. All three hold instead.
+B_MIN_1E9 = 0
+B_MAX_1E9 = 2_000_000_000
+X_SPREAD_MIN_1E9 = 10_000_000
 QLIKE_RING = 60
 #: BIN15 O4a appended the 15-minute term at the FRONT. Which windows a
 #: tenor folds is its ``first_window``, not this tuple's length: 4 h and
@@ -469,7 +477,13 @@ class VolEngine:
         if sxx == 0:
             self.fitted = False
             return
-        b = (sxy * 1_000_000_000) // sxx
+        # BIN15 P1b (F5), mirroring ``core_vol::VolEngine::refit``: a
+        # regressor floor, then the slope clamp BEFORE the intercept is
+        # formed, so ``a`` belongs to the line the engine will use.
+        if sxx < n * X_SPREAD_MIN_1E9 * X_SPREAD_MIN_1E9:
+            self.fitted = False
+            return
+        b = min(max((sxy * 1_000_000_000) // sxx, B_MIN_1E9), B_MAX_1E9)
         a = ybar - (b * xbar) // 1_000_000_000
         self.b_1e9 = b
         self.a_1e9 = a
