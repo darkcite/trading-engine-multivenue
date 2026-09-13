@@ -22,15 +22,29 @@
 #         contract re-resolved by (expiry, strike, right) — but
 #         nothing in this slot is time-critical to the second, so
 #         the slot moves rather than the measured edge.
-#   0830  Defect A revival: options settle 08:00Z on Deribit+OKX and
+#   0833  Defect A revival: options settle 08:00Z on Deribit+OKX and
 #         the frozen boot-time chain kills both sessions; a restart
-#         re-runs discovery onto a live chain. 08:30 — not 08:05 —
+#         re-runs discovery onto a live chain. 08:33 — not 08:05 —
 #         clears Deribit's 9–19 min post-settlement removal lag.
+#         0833, NOT 0830 (BIN15 P5.1, operator ruling 2026-09-13):
+#         a 15-minute binary expiring at 08:30 settles on the mean
+#         mark over [08:30:00, 08:31:00], which sat EXACTLY inside
+#         this slot's drain — so no window ever held that instance's
+#         settlement and its P&L was reported nowhere (the defect-6
+#         class). 00:10 and 16:05 are already off the 15 m grid;
+#         this one was not. Nothing here is time-critical to the
+#         second, so the slot moves rather than the measurement.
+#         MIGRATION: the 0830 stamp is orphaned and the new 0833
+#         stamp SEEDS on its first tick (no fire), by the same
+#         deploy-safety law as any new slot.
 #   1605  Defect B revival: PM up/down dailies resolve 16:00Z; the
 #         wrapper's per-boot refresh subscribes the market that went
 #         live at 16:00Z.
 #   0020  ACTION slot (no drain): nightly shadow-P&L report for the
-#         closed UTC day (M4 D2 — claude_worker.pnl_report module).
+#         closed UTC day (M4 D2 — claude_worker.pnl_report module),
+#         then the BIN15 accrual — the closed day's HIP-4 instances
+#         merged into the calibration ledger and the entry store
+#         before retention sweeps the run dirs to object storage.
 #
 # Restart slots SIGTERM the engine (M1d-proven clean drain — capture
 # flushed, run dir sealed); launchd KeepAlive relaunches through
@@ -92,10 +106,10 @@ if slot_ready 0010; then
   rotate=1
   fired="$fired 0010"
 fi
-if slot_ready 0830; then
-  slot_mark 0830
+if slot_ready 0833; then
+  slot_mark 0833
   drain=1
-  fired="$fired 0830"
+  fired="$fired 0833"
 fi
 if slot_ready 1605; then
   slot_mark 1605
@@ -197,6 +211,27 @@ if slot_ready 0020; then
       # with the operator's tier from ~/multivenue/fees.toml when present.
       uv run python -m claude_worker.pnl_report --closed-day >&2 ||
         echo "daily-restart: pnl_report failed (non-fatal; tomorrow retries)" >&2
+      # BIN15 accrual (operator 2026-09-13, "keep it working to collect
+      # data"): turn the closed day's HIP-4 capture into ledger rows and
+      # entry rows before retention can sweep the run dirs.
+      #
+      # It has to live HERE, in the 0020 ACTION slot: retention runs at
+      # 0010 and protects one day, so a run from yesterday is still on
+      # disk ten minutes later with ~24 h of margin — but only just, and
+      # once it is archived the evidence costs an S3 pull to recover.
+      # The lane is a SAMPLE SIZE problem (32 settled entries gave a
+      # 95 % interval of 51-82 % on the hit rate), so the whole point is
+      # that every day's evidence lands in one small permanent file.
+      #
+      # Idempotent by construction: both merges dedupe, so a re-run adds
+      # nothing and can never un-settle a row. Non-fatal like the report
+      # above — a failed night is retried by tomorrow's, because the
+      # capture is what is precious, not the derivation.
+      if [ -f "$HOME/multivenue/bin15.toml" ]; then
+        echo "daily-restart: 0020 bin15 accrual (closed UTC day)" >&2
+        uv run python -m claude_worker.bin15_accrue accrue >&2 ||
+          echo "daily-restart: bin15 accrual failed (non-fatal; tomorrow retries)" >&2
+      fi
     )
   fi
 fi
