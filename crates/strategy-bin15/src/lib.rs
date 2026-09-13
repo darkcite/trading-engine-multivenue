@@ -284,6 +284,12 @@ pub struct FamilyState {
     pub mark_1e6: i64,
     /// BIN15 O6: the pricing horizon the last reprice used, ns.
     pub last_tau_ns: u64,
+    /// BIN15 O9: `1` once this instance's COVERAGE ENTRY has been
+    /// emitted. Its own flag rather than a test on
+    /// `notional_instance_1e6`, because the MAKER arm books notional
+    /// too — a resting quote would otherwise read as "already
+    /// entered" and the coverage entry would never fire.
+    pub covered: u8,
 }
 
 impl Default for FamilyState {
@@ -311,6 +317,7 @@ impl Default for FamilyState {
             den_1e9: 0,
             mark_1e6: 0,
             last_tau_ns: 0,
+            covered: 0,
         }
     }
 }
@@ -348,6 +355,9 @@ impl FamilyState {
         self.den_1e9 = 0;
         self.mark_1e6 = 0;
         self.last_tau_ns = 0;
+        // BIN15 O9: the successor is its own instance and gets its own
+        // coverage entry.
+        self.covered = 0;
     }
 }
 
@@ -434,6 +444,13 @@ pub struct Bin15Params {
     pub cap_instance_usd_1e6: i64,
     /// Notional cap per UTC day ×1e6.
     pub cap_day_usd_1e6: i64,
+    /// BIN15 O9: the COVERAGE-ENTRY notional ×1e6 USD. `0` = off.
+    ///
+    /// When positive, a 15 m family takes a position on EVERY instance
+    /// at this notional, on whichever side `p̂` prefers, WITHOUT
+    /// requiring the touch to offer `e_take` of edge. See
+    /// [`Bin15Strategy::arm_take`]'s coverage block for why.
+    pub entry_usd_1e6: i64,
     /// `1` = Arm B on.
     pub maker_enabled: u8,
     /// `1` = alternate model / null arm by instance parity.
@@ -466,6 +483,7 @@ impl Default for Bin15Params {
             clip_qty_1e6: 500_000_000,
             cap_instance_usd_1e6: 1_000_000_000,
             cap_day_usd_1e6: 5_000_000_000,
+            entry_usd_1e6: 0,
             maker_enabled: 1,
             null_arm: 1,
             _pad: [0; 6],
@@ -563,6 +581,14 @@ impl Bin15Strategy {
             || params.cap_day_usd_1e6 <= 0
         {
             return Err(StrategyError::Config("bin15: a cap or clip is not positive"));
+        }
+        if params.entry_usd_1e6 < 0 {
+            return Err(StrategyError::Config("bin15: entry_usd_1e6 is negative"));
+        }
+        if params.entry_usd_1e6 > params.cap_instance_usd_1e6 {
+            return Err(StrategyError::Config(
+                "bin15: entry_usd_1e6 over the per-instance cap — every entry would be clipped",
+            ));
         }
         if params.e_take_1e6 < GRID_TICK_1E6 {
             return Err(StrategyError::Config("bin15: e_take under one tick"));
@@ -1178,6 +1204,43 @@ impl Bin15Strategy {
         {
             let qty = self.fam[idx].pos_no_1e6.min(no.touch.bid_qty_1e6);
             self.emit_take(ctx, idx, false, Side::Ask, no.touch.bid_1e6, qty, now, true);
+            return;
+        }
+        // BIN15 O9 — the COVERAGE ENTRY (operator ruling 2026-09-13).
+        //
+        // A 15 m family takes a position on EVERY instance, at a fixed
+        // `entry_usd_1e6` notional, on whichever side `p̂` prefers, and
+        // WITHOUT requiring the touch to offer `e_take` of edge. The
+        // point is evidence, not edge: of the 33 instances in the
+        // 2026-09-12 capture, 22 drew no order at all, so two thirds of
+        // the calibration ledger was never written and the G6.1 gate
+        // (200 settled instances per phase) could not accrue. P&L under
+        // this rule is a CALIBRATION DIAGNOSTIC, not a strategy result.
+        //
+        // `notional_instance_1e6 == 0` is the once-per-instance test:
+        // `clear_instance` zeroes it at every roll, so the entry fires
+        // on the first actionable reprice of each instance and never
+        // again. The caps still bind — an entry that cannot fit under
+        // them is counted `skipped_cap` like any other.
+        if self.params.entry_usd_1e6 > 0
+            && self.fam[idx].kind == FAMILY_OUT_15M
+            && self.fam[idx].covered == 0
+        {
+            let want_yes = p_hat >= ONE_1E6 / 2;
+            let touch = if want_yes { yes } else { no };
+            let px = touch.touch.ask_1e6;
+            // Contracts ×1e6 the entry notional buys at that ask, then
+            // bounded by the resting size and by the caps' own room.
+            let want = (self.params.entry_usd_1e6 as i128 * 1_000_000) / px as i128;
+            let want = i64::try_from(want).unwrap_or(i64::MAX);
+            let qty = want
+                .min(touch.touch.ask_qty_1e6)
+                .min(self.cap_room_1e6(idx, px));
+            // Marked BEFORE the emit: a coverage entry the caps or the
+            // grid refuse is still this instance's one attempt, and
+            // retrying it on every reprice would spray the book.
+            self.fam[idx].covered = 1;
+            self.emit_take(ctx, idx, want_yes, Side::Bid, px, qty, now, false);
             return;
         }
         // Then the opening takes.
@@ -2482,6 +2545,99 @@ mod tests {
         assert_eq!(view[0].strike_1e6, 0);
         assert_eq!(view[0].d_1e6, 0);
         assert_eq!(view[0].tau_s, 0);
+    }
+
+    /// BIN15 O9: the coverage entry takes EVERY 15 m instance at the
+    /// fixed notional, on the side `p̂` prefers, with no edge required
+    /// — and exactly once per instance.
+    ///
+    /// Why it exists: 22 of the 33 instances in the 2026-09-12 capture
+    /// drew no order at all, so two thirds of the calibration ledger
+    /// was never written.
+    #[test]
+    fn the_coverage_entry_takes_every_instance_once_at_the_fixed_size() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        m.params.entry_usd_1e6 = 50_000_000; // $50
+        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
+        // A mark well ABOVE the strike ⇒ p̂ > 0.5 ⇒ the YES side.
+        m.on_venue_event(
+            &roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false),
+            &mut c,
+        );
+        m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
+        // A two-sided book with NO edge on either leg: p̂ ≈ 0.697, so
+        // a YES ask of 0.69 and a NO ask of 0.30 both sit inside
+        // `e_take` (0.03) of fair. The edge arm cannot fire here — any
+        // order is the coverage entry's.
+        m.on_tick(&tick(yes_sym(0), 680_000, 690_000, 1_000_000_000, at(63), false), &mut c);
+        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(63), false), &mut c);
+        m.on_venue_event(&mark_event(79_197_500_000, at(64)), &mut c);
+
+        // The MAKER arm also quotes here; the coverage entry is the
+        // taker, so count those.
+        let takes = |c: &RecCtx| -> Vec<core_types::Order> {
+            c.orders
+                .iter()
+                .filter(|o| o.kind == ORDER_KIND_IOC)
+                .copied()
+                .collect()
+        };
+        let t = takes(&c);
+        assert_eq!(t.len(), 1, "one coverage entry, not one per reprice");
+        let o = t[0];
+        assert_eq!(o.sym, yes_sym(0), "p̂ > 0.5 takes the YES leg");
+        assert_eq!(o.side, Side::Bid);
+        assert_eq!(o.px.raw(), 690_000, "lifts the ask");
+        // $50 / 0.69 = 72.46 contracts, floored to the venue's lot.
+        assert_eq!(o.qty.raw(), 72_000_000, "$50 at 0.69 is 72 contracts");
+
+        // A second reprice must NOT enter again: the instance is taken.
+        m.on_venue_event(&mark_event(79_198_000_000, at(70)), &mut c);
+        assert_eq!(takes(&c).len(), 1, "once per instance");
+
+        // The NEXT instance is entered afresh.
+        m.on_venue_event(&roll_event(0, 2650, 0, 0, 0, true), &mut c);
+        m.on_venue_event(
+            &roll_event(0, 2651, 0, 79_000_000_000, expiry(1500), false),
+            &mut c,
+        );
+        // The settle feeds the realised vol back into the forecast,
+        // which drops the hand-set σ̂ this test stands on — put it back,
+        // exactly as at the top, or the successor never prices.
+        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
+        m.on_venue_event(&mark_event(79_197_500_000, at(962)), &mut c);
+        m.on_tick(&tick(yes_sym(0), 680_000, 690_000, 1_000_000_000, at(963), false), &mut c);
+        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(963), false), &mut c);
+        // Immediately before the reprice: the settle fed realised vol
+        // back into the forecast and a mark can refresh σ̂ from it, so
+        // the hand-set value has to be the last word.
+        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
+        m.on_venue_event(&mark_event(79_197_500_000, at(964)), &mut c);
+        assert_eq!(takes(&c).len(), 2, "the successor is its own instance");
+    }
+
+    /// BIN15 O9: `entry_usd_1e6 = 0` is the pre-2026-09-13 law bit for
+    /// bit — no coverage entry, the edge arm alone decides.
+    #[test]
+    fn a_zero_entry_notional_is_the_edge_law_unchanged() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        assert_eq!(m.params.entry_usd_1e6, 0, "off by default");
+        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
+        m.on_venue_event(
+            &roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false),
+            &mut c,
+        );
+        m.on_venue_event(&mark_event(79_197_500_000, at(62)), &mut c);
+        // The same no-edge book the coverage test uses.
+        m.on_tick(&tick(yes_sym(0), 680_000, 690_000, 1_000_000_000, at(63), false), &mut c);
+        m.on_tick(&tick(no_sym(0), 290_000, 300_000, 1_000_000_000, at(63), false), &mut c);
+        m.on_venue_event(&mark_event(79_197_500_000, at(64)), &mut c);
+        assert!(
+            c.orders.iter().all(|o| o.kind != ORDER_KIND_IOC),
+            "no taker order without edge when the coverage entry is off"
+        );
     }
 
     #[test]

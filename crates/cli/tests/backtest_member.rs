@@ -963,6 +963,10 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
             // whole number of contracts rather than a cap remainder.
             ("cap_instance_usd_1e6", "40000000"),
             ("cap_day_usd_1e6", "40000000"),
+            // BIN15 O9: the EDGE law, not the coverage entry — this
+            // fixture is about the pricer reaching a book, and a $50
+            // coverage entry would not fit the $40 cap above anyway.
+            ("entry_usd_1e6", "0"),
         ]),
     )
     .expect("write bin15.toml");

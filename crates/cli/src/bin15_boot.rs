@@ -259,6 +259,9 @@ pub fn load_bin15_boot(
     params.clip_qty_1e6 = file.clip_qty_1e6;
     params.cap_instance_usd_1e6 = file.cap_instance_usd_1e6;
     params.cap_day_usd_1e6 = file.cap_day_usd_1e6;
+    // BIN15 O9: 0 in an artifact written before 2026-09-13, which is
+    // the edge law bit for bit.
+    params.entry_usd_1e6 = file.entry_usd_1e6;
     params.maker_enabled = file.maker_enabled;
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
@@ -370,10 +373,25 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
     for b in &boot.hash {
         hex.push_str(&format!("{b:02x}"));
     }
+    // BIN15 O9: the ENTRY LAW is on the boot line, because "what size
+    // do we take, and on what" is the first question asked of this
+    // member and the artifact hash alone does not answer it.
+    // `entry_usd=0` means the edge law alone (pre-2026-09-13 shape).
+    let entry = if boot.params.entry_usd_1e6 > 0 {
+        format!(
+            "every-15m@${}",
+            boot.params.entry_usd_1e6 / 1_000_000
+        )
+    } else {
+        String::from("edge-only")
+    };
     format!(
         "bin15: artifact configured hash={hex} families={} dormant={dormant} \
-         seeds={seeded} daily_seeds={daily}",
-        boot.resolved
+         seeds={seeded} daily_seeds={daily} entry={entry} \
+         cap_instance=${} cap_day=${}",
+        boot.resolved,
+        boot.params.cap_instance_usd_1e6 / 1_000_000,
+        boot.params.cap_day_usd_1e6 / 1_000_000
     )
 }
 

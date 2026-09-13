@@ -60,7 +60,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 21] = [
+const BIN15_KEYS: [&str; 22] = [
     "families",
     "underlying",
     "tau_ns",
@@ -87,6 +87,10 @@ const BIN15_KEYS: [&str; 21] = [
     // refused at the grammar before any bound could be checked. An
     // optional key still has to be a KNOWN key.
     "scale_1e9",
+    // BIN15 O9: the coverage-entry notional. Optional; absent = 0 =
+    // the edge law alone, which is what every artifact before
+    // 2026-09-13 carries.
+    "entry_usd_1e6",
 ];
 
 /// `bin15.toml` as parsed. The strings stay descriptors: resolving them
@@ -132,6 +136,8 @@ pub struct Bin15File {
     pub hour_ln_off_1e9: [i64; HOURS],
     /// Variance-ratio scale on σ̂ ×1e9; `1e9` when absent.
     pub scale_1e9: i64,
+    /// BIN15 O9: coverage-entry notional ×1e6 USD; `0` = off.
+    pub entry_usd_1e6: i64,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -310,6 +316,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         ],
         hour_ln_off_1e9: hour,
         scale_1e9: opt_int(&kv, "scale_1e9", 1_000_000_000)?,
+        entry_usd_1e6: opt_int(&kv, "entry_usd_1e6", 0)?,
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -377,6 +384,19 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
              be positive — a zero cap is a member that cannot trade, spelled as if \
              it could",
         ));
+    }
+    if file.entry_usd_1e6 < 0 {
+        return Err(err(format!(
+            "`entry_usd_1e6` must not be negative (got {}); absent means 0 = off",
+            file.entry_usd_1e6
+        )));
+    }
+    if file.entry_usd_1e6 > file.cap_instance_usd_1e6 {
+        return Err(err(format!(
+            "`entry_usd_1e6` {} exceeds `cap_instance_usd_1e6` {} — every coverage \
+             entry would be clipped by the cap it is meant to sit under",
+            file.entry_usd_1e6, file.cap_instance_usd_1e6
+        )));
     }
     if file.cap_instance_usd_1e6 > file.cap_day_usd_1e6 {
         return Err(err(format!(

@@ -116,6 +116,10 @@ KNOBS: tuple[tuple[str, int], ...] = (
     ("clip_qty_1e6", 500_000_000),
     ("cap_instance_usd_1e6", 1_000_000_000),
     ("cap_day_usd_1e6", 5_000_000_000),
+    # BIN15 O9 (operator ruling 2026-09-13): the coverage-entry
+    # notional, x1e6 USD. 50000000 = $50 on EVERY 15 m instance,
+    # regardless of edge. 0 would be the pre-2026-09-13 edge law.
+    ("entry_usd_1e6", 50_000_000),
     ("maker_enabled", 1),
     ("null_arm", 1),
 )
