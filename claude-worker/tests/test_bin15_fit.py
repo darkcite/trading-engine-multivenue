@@ -60,9 +60,13 @@ def test_phi_is_strictly_increasing_where_the_cdf_still_moves() -> None:
 @pytest.mark.parametrize(
     ("slope", "at_075"),
     [
-        (claude_worker.bin15_fit.SLOPE_EARLY_MILLI, 776_000),
-        (claude_worker.bin15_fit.SLOPE_MID_MILLI, 791_250),
-        (claude_worker.bin15_fit.SLOPE_LATE_MILLI, 804_750),
+        # BIN15 P1a (F1): the shipped slopes are IDENTITY. 0.5 + 0.25 s
+        # at s = 1.000 is 0.75; at s = 1.032 (the largest slope the
+        # function will build) it is 0.758.
+        (claude_worker.bin15_fit.SLOPE_EARLY_MILLI, 750_000),
+        (claude_worker.bin15_fit.SLOPE_MID_MILLI, 750_000),
+        (claude_worker.bin15_fit.SLOPE_LATE_MILLI, 750_000),
+        (1_032, 758_000),
     ],
 )
 def test_each_recal_table_carries_its_stated_slope(slope: int, at_075: int) -> None:
@@ -73,6 +77,41 @@ def test_each_recal_table_carries_its_stated_slope(slope: int, at_075: int) -> N
     assert all(t[i + 1] >= t[i] for i in range(len(t) - 1)), "monotone"
     # p = 0.75 under slope s lands at 0.5 + 0.25 s.
     assert t[48] == at_075
+
+
+def test_no_interior_bucket_may_be_certain() -> None:
+    """BIN15 P1a (F1): only ``[0]`` and ``[64]`` may be 0 or 1e6.
+
+    The withdrawn 1.104 / 1.165 / 1.219 slopes clamped four interior
+    buckets flat at 1e6, so the member published ``p_hat = 1.000000``
+    off a raw price of 0.984 — a certainty the pricer never held, and
+    one that beats every ask the venue can quote. ``core_config::bin15``
+    now refuses such an artifact at the grammar; this is the same law on
+    the side that WRITES it.
+    """
+    for slope in (1, 500, 1_000, 1_032):
+        t = claude_worker.bin15_fit.recal_table_1e6(slope)
+        assert t[0] == 0 and t[-1] == 1_000_000
+        for k in range(1, claude_worker.bin15_fit.RECAL_POINTS - 1):
+            assert (
+                claude_worker.bin15_fit.GRID_TICK_1E6
+                <= t[k]
+                <= 1_000_000 - claude_worker.bin15_fit.GRID_TICK_1E6
+            ), f"slope {slope} bucket {k} = {t[k]}"
+
+
+def test_a_slope_that_runs_off_the_interval_is_refused_not_clamped() -> None:
+    """The three WITHDRAWN slopes, by name, plus the exact bound.
+
+    Clamping such a slope is the silent failure: the table still parses,
+    still looks monotone, and quietly asserts certainty. So the fitter
+    refuses to build one at all.
+    """
+    for slope in (1_104, 1_165, 1_219, 1_033):
+        with pytest.raises(ValueError, match="pin interior certainty"):
+            claude_worker.bin15_fit.recal_table_1e6(slope)
+    # 1032 is the largest that stays inside, and it builds.
+    assert claude_worker.bin15_fit.recal_table_1e6(1_032)[63] < 1_000_000
 
 
 def test_every_recal_table_is_antisymmetric_so_yes_and_no_price_to_one() -> None:
@@ -168,7 +207,7 @@ def test_the_cli_writes_an_artifact_atomically(tmp_path: pathlib.Path) -> None:
     # A re-fit is a flag, not a code change.
     assert (
         claude_worker.bin15_fit.main(
-            ["artifact", "--out", str(out), "--slope-early", "1200", "--scale-1e9", "1000000000"]
+            ["artifact", "--out", str(out), "--slope-early", "1020", "--scale-1e9", "1000000000"]
         )
         == 0
     )

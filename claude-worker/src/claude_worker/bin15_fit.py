@@ -22,12 +22,18 @@ to be: the spec states every number the tables require.
   matters, because the engine hashes these BYTES and the boot tell names
   the hash.
 * The recalibration is the fitted part, and the fit is three numbers:
-  the slopes **1.104 / 1.165 / 1.219** (early / mid / late), which the
-  backtest measured as the under-confidence of the raw lognormal price.
-  The table is that slope through the middle of the unit interval,
-  clamped at both ends: ``p' = clamp(0.5 + slope * (p - 0.5), 0, 1)``.
-  A slope over 1 pushes confidence OUTWARD, which is what an
-  under-confident model needs.
+  the slopes (early / mid / late). The table is that slope through the
+  middle of the unit interval, with the ENDPOINTS pinned and every
+  interior bucket held one venue tick inside them. A slope over 1
+  pushes confidence OUTWARD, which is what an under-confident model
+  needs — up to the point where the outward push runs off the end of
+  the unit interval, which :func:`recal_table_1e6` refuses rather than
+  clamps (BIN15 P1a / F1).
+* **The 1.104 / 1.165 / 1.219 slopes are WITHDRAWN (2026-09-13).** They
+  were measured on ~33 instances and they manufactured certainty in the
+  tails; the shipped slopes are 1.000 (identity) until an empirical
+  re-fit off the accumulated calibration ledger exists. See
+  :data:`SLOPE_EARLY_MILLI`.
 * ``scale_1e9`` is the stated variance-ratio scale, **0.98**.
 * ``hour_ln_off_1e9`` is OMITTED. The parser's law is "absent optional =
   bit-identical to the stated default", and the stated default is zero,
@@ -37,7 +43,8 @@ to be: the spec states every number the tables require.
 
 Re-fitting later is an artifact edit and a restart, never a code
 change: pass ``--slope-early`` / ``--slope-mid`` / ``--slope-late``
-(milli-units, so 1104 is 1.104) and ``--scale-1e9``.
+(milli-units, so 1020 is 1.020; the bound is 1032) and
+``--scale-1e9``.
 
 **The one-line law.** ``core_config::icdp::parse_value`` — which
 ``core_config::bin15`` reuses — reads an array by stripping ``[`` and
@@ -78,12 +85,30 @@ PHI_STEP_1E6: int = 1_000
 #: Recalibration bucket width in ``p`` ×1e6: ``1e6 / 64``.
 RECAL_STEP_1E6: int = 15_625
 
-#: Fitted recalibration slopes in MILLI-units, per phase. 1104 is
-#: 1.104. Integers because the artifact is integer-only and a slope
+#: Recalibration slopes in MILLI-units, per phase. 1000 is 1.000 =
+#: IDENTITY. Integers because the artifact is integer-only and a slope
 #: spelled as a float would be rounded somewhere invisible.
-SLOPE_EARLY_MILLI: int = 1_104
-SLOPE_MID_MILLI: int = 1_165
-SLOPE_LATE_MILLI: int = 1_219
+#:
+#: **BIN15 P1a (F1), 2026-09-13 — the fitted 1104 / 1165 / 1219 are
+#: WITHDRAWN.** They came from ~33 instances and they are a MID-RANGE
+#: correction extrapolated into the tails, where the raw lognormal
+#: price is over-confident rather than under-confident. Their arithmetic
+#: consequence is the reason they are gone: at a slope of 1.104 the
+#: bucket at p = 63/64 recalibrates to 1.0349, which :func:`recal_table_1e6`
+#: then clamps to exactly 1e6 — the member publishing CERTAINTY, and the
+#: entry rule of §0 (``p > a``) reading a manufactured 1.0 as an
+#: unbeatable edge over any ask. Identity plus the P6 evaluation is
+#: honest; amplified certainty is not. A re-fit ships new numbers here
+#: and re-cuts the artifact; it is never a code change.
+SLOPE_EARLY_MILLI: int = 1_000
+SLOPE_MID_MILLI: int = 1_000
+SLOPE_LATE_MILLI: int = 1_000
+
+#: BIN15 P1a: the recalibration grid tick x1e6 — one HIP-4 price tick
+#: (1e-4). Mirrors ``strategy_bin15::GRID_TICK_1E6``. Interior buckets
+#: are clamped one tick inside [0, 1e6] so no fitted slope can publish a
+#: probability the venue cannot even quote.
+GRID_TICK_1E6: int = 100
 
 #: The stated variance-ratio scale on σ̂, ×1e9 (0.98).
 SCALE_1E9_DEFAULT: int = 980_000_000
@@ -115,11 +140,38 @@ KNOBS: tuple[tuple[str, int], ...] = (
     ("requote_thr_1e6", 5_000),
     ("clip_qty_1e6", 500_000_000),
     ("cap_instance_usd_1e6", 1_000_000_000),
-    ("cap_day_usd_1e6", 5_000_000_000),
+    # OPERATOR RULING 2026-09-13: $30,000/day.
+    #
+    # The entry law alone wants $19,200 (4 live 15 m families x 96
+    # instances x $50), so $30,000 leaves **$10,800 of HEADROOM** — and
+    # the headroom is the point. Arm B's resting BIDS book day room too,
+    # and a maker quote that FILLS is exposure that is never released,
+    # so a cap set to exactly the entry want would have had the two arms
+    # competing for the last dollar late in a full day. At the maker's
+    # 500-contract clip near $0.50 (~$250 a quote) $10,800 is ~43 filled
+    # maker bids a day across every family, against a venue thin enough
+    # to print single-digit trades per instance.
+    #
+    # The superseded numbers, for the record: $5,000 (the O9 default,
+    # which rationed the day after its first quarter and censored the
+    # calibration ledger — F2) and $19,200 (the exact-fit ruling of the
+    # same afternoon).
+    ("cap_day_usd_1e6", 30_000_000_000),
+    # BIN15 P0 (F4): the underlying mark's shelf life, ns. 5 s is two
+    # to five missed Hyperliquid mark prints. Past this age the member
+    # HOLDS instead of pricing four families off a frozen number while
+    # their books track reality.
+    ("mark_stale_ns", 5_000_000_000),
     # BIN15 O9 (operator ruling 2026-09-13): the coverage-entry
     # notional, x1e6 USD. 50000000 = $50 on EVERY 15 m instance,
     # regardless of edge. 0 would be the pre-2026-09-13 edge law.
     ("entry_usd_1e6", 50_000_000),
+    # BIN15 P3 (F6): the coverage entry's margin over its own belief,
+    # x1e6. 20000 = 2 c. The entry fires only when `ask <= p_hat -
+    # e_entry`, which is the `p > a` profitability bar plus model error
+    # and the exit-leg fee. Distinct from `e_take_1e6` (3 c), which is
+    # the opportunistic taker's edge hunt.
+    ("e_entry_1e6", 20_000),
     ("maker_enabled", 1),
     ("null_arm", 1),
 )
@@ -227,21 +279,52 @@ def phi_table_1e6() -> tuple[int, ...]:
 
 
 def recal_table_1e6(slope_milli: int) -> tuple[int, ...]:
-    """``p' ×1e6`` at ``p = 0, 1/64, …, 1`` for one fitted slope.
+    """``p' ×1e6`` at ``p = 0, 1/64, …, 1`` for one recalibration slope.
 
-    ``p' = clamp(0.5 + slope * (p - 0.5), 0, 1)``. The clamp is what
-    pins both ends for any slope over 1, which is exactly the shape
-    ``core_config::bin15::table`` demands (``[0] == 0``,
-    ``[64] == 1e6``, monotone).
+    ``p' = 0.5 + slope * (p - 0.5)``, clamped — and **BIN15 P1a (F1)
+    changed what the clamp is**. Only the two ENDPOINTS may be certain:
+    ``[0] == 0`` and ``[64] == 1e6`` are the buckets where the raw price
+    itself said 0 or 1. Every interior bucket is clamped to
+    ``[GRID_TICK_1E6, 1e6 - GRID_TICK_1E6]``, one venue tick inside the
+    unit interval.
+
+    The old law clamped the whole table at ``[0, 1e6]``, so a slope over
+    ~1.032 turned the two buckets nearest the ends into flat certainty:
+    the member published ``p_hat = 1.000000`` off a raw price of 0.984,
+    and a probability of exactly one beats every ask there is. A
+    recalibration may sharpen a belief; it may not manufacture one the
+    model never held.
+
+    A slope whose UNCLAMPED value at bucket 63 would exceed 1e6 is
+    REFUSED rather than clamped, because clamping it is precisely the
+    silent failure above — the caller asked for a table this function
+    cannot honestly produce. The bound is 1032 milli-units
+    (``0.5 + slope * (63/64 - 0.5) <= 1``), which is why the withdrawn
+    1104 / 1165 / 1219 raise here.
     """
     if slope_milli <= 0:
         raise ValueError(f"slope_milli must be positive, got {slope_milli}")
+    top = 500_000 + round_half_away(
+        (63 * RECAL_STEP_1E6 - 500_000) * slope_milli, 1_000
+    )
+    if top > 1_000_000:
+        raise ValueError(
+            f"slope_milli {slope_milli} recalibrates bucket 63 to {top} > 1000000: "
+            "the table would pin interior certainty, which is a belief the model "
+            "never held. Re-fit the slope (bound 1032) or ship identity (1000)."
+        )
     out: list[int] = []
     k = 0
     while k < RECAL_POINTS:
         p = k * RECAL_STEP_1E6
         v = 500_000 + round_half_away((p - 500_000) * slope_milli, 1_000)
-        out.append(min(max(v, 0), 1_000_000))
+        if k == 0:
+            v = 0
+        elif k == RECAL_POINTS - 1:
+            v = 1_000_000
+        else:
+            v = min(max(v, GRID_TICK_1E6), 1_000_000 - GRID_TICK_1E6)
+        out.append(v)
         k += 1
     return tuple(out)
 

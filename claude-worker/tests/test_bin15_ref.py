@@ -116,12 +116,30 @@ def test_recal_pins_both_ends_and_clamps_out_of_range() -> None:
         assert lut.recal_1e6(phase, 500_000) == 500_000, "the middle is fixed"
         assert lut.recal_1e6(phase, -5) == 0
         assert lut.recal_1e6(phase, 2_000_000) == 1_000_000
-        assert lut.recal_1e6(phase, 750_000) > 750_000, "a slope over 1 pushes outward"
-    # Later phases are MORE under-confident, so they push harder.
-    early = lut.recal_1e6(claude_worker.bin15_ref.PHASE_EARLY, 750_000)
-    mid = lut.recal_1e6(claude_worker.bin15_ref.PHASE_MID, 750_000)
-    late = lut.recal_1e6(claude_worker.bin15_ref.PHASE_LATE, 750_000)
-    assert early < mid < late
+        # BIN15 P1a (F1): the SHIPPED slopes are identity (1.000), so a
+        # raw 0.75 stays 0.75. The withdrawn 1.104 / 1.165 / 1.219
+        # pushed it outward -- and pushed the tail buckets clean off the
+        # unit interval, which is why they are gone. This assertion
+        # follows the artifact, so a re-fit that ships a sharper slope
+        # is a deliberate edit here.
+        assert lut.recal_1e6(phase, 750_000) == 750_000, "identity leaves it alone"
+
+
+def test_no_shipped_recal_bucket_pins_interior_certainty() -> None:
+    """BIN15 P1a (F1): the mirror's own copy of the shipped tables.
+
+    ``core_config::bin15::table`` refuses an artifact whose interior
+    buckets are 0 or 1e6, and the fitter cannot build one. This is the
+    third place the law is checked, on the numbers the mirror actually
+    prices with -- because the failure it prevents (``p_hat = 1.000000``
+    off a raw 0.984) is invisible in every counter the member has.
+    """
+    lut = _shipped_luts()
+    for phase in range(claude_worker.bin15_ref.PHASES):
+        table = lut.recal[phase]
+        assert table[0] == 0 and table[-1] == 1_000_000, "only the ends are certain"
+        for k in range(1, len(table) - 1):
+            assert 0 < table[k] < 1_000_000, f"recal[{phase}][{k}] = {table[k]}"
 
 
 def test_the_phase_boundaries_are_where_the_spec_says() -> None:

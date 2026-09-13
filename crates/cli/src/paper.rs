@@ -4529,6 +4529,8 @@ pub struct Bin15MetricIds {
     pub skipped_tail: core_metrics::CounterId,
     /// `engine_bin15_skipped_stale_total`
     pub skipped_stale: core_metrics::CounterId,
+    /// `engine_bin15_skipped_mark_stale_total`
+    pub skipped_mark_stale: core_metrics::CounterId,
     /// `engine_bin15_skipped_book_total`
     pub skipped_book: core_metrics::CounterId,
     /// `engine_bin15_skipped_inventory_total`
@@ -4537,6 +4539,8 @@ pub struct Bin15MetricIds {
     pub skipped_cap: core_metrics::CounterId,
     /// `engine_bin15_skipped_grid_total`
     pub skipped_grid: core_metrics::CounterId,
+    /// `engine_bin15_skipped_entry_price_total`
+    pub skipped_entry_price: core_metrics::CounterId,
     /// `engine_bin15_families_dormant_total`
     pub families_dormant: core_metrics::CounterId,
     /// `engine_bin15_fills_total`
@@ -4689,10 +4693,12 @@ fn register_bin15_metrics(
     let skipped_tau = one("engine_bin15_skipped_tau_total")?;
     let skipped_tail = one("engine_bin15_skipped_tail_total")?;
     let skipped_stale = one("engine_bin15_skipped_stale_total")?;
+    let skipped_mark_stale = one("engine_bin15_skipped_mark_stale_total")?;
     let skipped_book = one("engine_bin15_skipped_book_total")?;
     let skipped_inventory = one("engine_bin15_skipped_inventory_total")?;
     let skipped_cap = one("engine_bin15_skipped_cap_total")?;
     let skipped_grid = one("engine_bin15_skipped_grid_total")?;
+    let skipped_entry_price = one("engine_bin15_skipped_entry_price_total")?;
     let families_dormant = one("engine_bin15_families_dormant_total")?;
     let fills = one("engine_bin15_fills_total")?;
     let unknown_fills = one("engine_bin15_unknown_fills_total")?;
@@ -4725,10 +4731,12 @@ fn register_bin15_metrics(
         skipped_tau,
         skipped_tail,
         skipped_stale,
+        skipped_mark_stale,
         skipped_book,
         skipped_inventory,
         skipped_cap,
         skipped_grid,
+        skipped_entry_price,
         families_dormant,
         fills,
         unknown_fills,
@@ -4776,6 +4784,8 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.skipped_tail.saturating_sub(last.skipped_tail));
     reg.counter(ids.skipped_stale)
         .inc(cur.skipped_stale.saturating_sub(last.skipped_stale));
+    reg.counter(ids.skipped_mark_stale)
+        .inc(cur.skipped_mark_stale.saturating_sub(last.skipped_mark_stale));
     reg.counter(ids.skipped_book)
         .inc(cur.skipped_book.saturating_sub(last.skipped_book));
     reg.counter(ids.skipped_inventory)
@@ -4784,6 +4794,8 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.skipped_cap.saturating_sub(last.skipped_cap));
     reg.counter(ids.skipped_grid)
         .inc(cur.skipped_grid.saturating_sub(last.skipped_grid));
+    reg.counter(ids.skipped_entry_price)
+        .inc(cur.skipped_entry_price.saturating_sub(last.skipped_entry_price));
     reg.counter(ids.families_dormant)
         .inc(cur.families_dormant.saturating_sub(last.families_dormant));
     reg.counter(ids.fills)
@@ -8029,13 +8041,17 @@ mod tests {
     /// is 80 gauges. Measured on the live engine the same day: 200
     /// gauges in use before the change, 248 after — **136 of headroom
     /// left**, and the counter side did not move.
+    ///
+    /// BIN15 P0 (F4) added `skipped_mark_stale` and P3 (F6) added
+    /// `skipped_entry_price`: 22 → **24 counters**, so 222 in use and
+    /// **34 of headroom left**. The gauge side did not move.
     #[test]
-    fn the_bin15_family_is_22_counters_and_80_gauges() {
+    fn the_bin15_family_is_24_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 22, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 24, "the counter block");
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,

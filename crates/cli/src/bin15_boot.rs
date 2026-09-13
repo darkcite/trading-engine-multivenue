@@ -262,6 +262,16 @@ pub fn load_bin15_boot(
     // BIN15 O9: 0 in an artifact written before 2026-09-13, which is
     // the edge law bit for bit.
     params.entry_usd_1e6 = file.entry_usd_1e6;
+    // BIN15 P0 (F4): absent in an artifact written before 2026-09-13,
+    // where the parser supplies the stated 5 s default. That is a
+    // BEHAVIOUR CHANGE for such an artifact, deliberately: the old
+    // behaviour was pricing off a mark of any age.
+    params.mark_stale_ns = file.mark_stale_ns;
+    // BIN15 P3 (F6): absent in an artifact written before 2026-09-13,
+    // where the parser supplies the stated 2 c. That is a BEHAVIOUR
+    // CHANGE for such an artifact, deliberately: the old behaviour was
+    // paying whatever the book asked.
+    params.e_entry_1e6 = file.e_entry_1e6;
     params.maker_enabled = file.maker_enabled;
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
@@ -378,9 +388,14 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
     // member and the artifact hash alone does not answer it.
     // `entry_usd=0` means the edge law alone (pre-2026-09-13 shape).
     let entry = if boot.params.entry_usd_1e6 > 0 {
+        // BIN15 P3 (F6): the BOUND is part of the entry law, so it is
+        // on the line beside the size. "$50 on every instance" and
+        // "$50 on every instance whose ask clears the model by 2 c"
+        // are different strategies.
         format!(
-            "every-15m@${}",
-            boot.params.entry_usd_1e6 / 1_000_000
+            "every-15m@${}<=p_hat-{}c",
+            boot.params.entry_usd_1e6 / 1_000_000,
+            boot.params.e_entry_1e6 / 10_000
         )
     } else {
         String::from("edge-only")
@@ -388,10 +403,80 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
     format!(
         "bin15: artifact configured hash={hex} families={} dormant={dormant} \
          seeds={seeded} daily_seeds={daily} entry={entry} \
-         cap_instance=${} cap_day=${}",
+         cap_instance=${} cap_day=${} mark_stale_ms={}{}",
         boot.resolved,
         boot.params.cap_instance_usd_1e6 / 1_000_000,
-        boot.params.cap_day_usd_1e6 / 1_000_000
+        boot.params.cap_day_usd_1e6 / 1_000_000,
+        boot.params.mark_stale_ns / 1_000_000,
+        day_cap_warning(&boot.params)
+    )
+}
+
+/// Instances a 15 m family opens in one UTC day: 96 quarter-hours.
+pub const INSTANCES_PER_DAY_15M: i64 = 96;
+
+/// BIN15 P2 (F2): the entry law's own arithmetic, checked against the
+/// day cap at boot.
+///
+/// The coverage entry takes `entry_usd` on EVERY 15 m instance, so a
+/// live 15 m family WANTS `96 × entry_usd` of day room. Four families
+/// at $50 want $19,200 against a $5,000 cap: the member would trade
+/// the first quarter of the day and refuse the rest — and the
+/// instances it refuses are precisely the ones the calibration gate
+/// needs, which is F2's ledger censoring arriving through the front
+/// door instead of the back one.
+///
+/// A WARNING and not a refusal, deliberately: rationing is a legitimate
+/// operator choice (it is what a risk cap is FOR), and the plan's own
+/// suggested ruling — BTC-only for the first evaluation round, one
+/// family at $4,800/day — is a universe edit, not an artifact edit. But
+/// it may not be silent, because a silently rationed day looks
+/// identical to a quiet market on every counter the member publishes.
+#[must_use]
+pub fn day_cap_warning(params: &strategy_bin15::Bin15Params) -> String {
+    if params.entry_usd_1e6 <= 0 {
+        return String::new();
+    }
+    let mut live_15m = 0i64;
+    let mut f = 0usize;
+    while f < params.n_families {
+        if params.family_kind[f] == strategy_bin15::FAMILY_OUT_15M {
+            live_15m += 1;
+        }
+        f += 1;
+    }
+    let want = live_15m
+        .saturating_mul(INSTANCES_PER_DAY_15M)
+        .saturating_mul(params.entry_usd_1e6 / 1_000_000);
+    let cap = params.cap_day_usd_1e6 / 1_000_000;
+    if want < cap {
+        return format!(" entry_day_want=${want} (fits, ${} headroom)", cap - want);
+    }
+    if want == cap {
+        // The ruled shape (operator, 2026-09-13): the cap is set to
+        // exactly what the entry law wants. That is deliberate and it
+        // is also TIGHT — Arm B's resting BIDS reserve day room too,
+        // and a maker fill is real exposure that is never released. So
+        // with the maker on, an exactly-fitting cap will ration late in
+        // the day, and the operator has to know which of the two arms
+        // gets the last dollar.
+        return format!(
+            " entry_day_want=${want} (fits EXACTLY{})",
+            if params.maker_enabled == 1 {
+                " — no headroom for the maker arm, which also books day room"
+            } else {
+                ", maker off"
+            }
+        );
+    }
+    format!(
+        " entry_day_want=${want} OVER cap_day=${cap} - WARNING: {live_15m} live \
+         15 m famil{} x {INSTANCES_PER_DAY_15M} instances x ${} exceeds the day cap, \
+         so the cap will RATION the day and the instances it refuses are the ones \
+         the calibration gate needs. Raise cap_day_usd_1e6, lower entry_usd_1e6, or \
+         run fewer 15 m families",
+        if live_15m == 1 { "y" } else { "ies" },
+        params.entry_usd_1e6 / 1_000_000
     )
 }
 
@@ -472,6 +557,145 @@ mod tests {
             "hyperliquid:HYPE" => Some(703),
             _ => None,
         }
+    }
+
+    /// BIN15 P1a (F1), END TO END on the SHIPPED artifact.
+    ///
+    /// The whole chain — the file the operator installs, the grammar
+    /// that admits it, the LUT the member prices with — must be unable
+    /// to publish certainty from a raw price that is merely high. The
+    /// withdrawn late table recalibrated a raw 0.95 to 1.000000, and a
+    /// `p̂` of exactly one beats every ask the venue can quote, so §0's
+    /// `p > a` entry rule read it as a free lunch on every instance.
+    ///
+    /// The bound is one venue tick inside the interval, checked at the
+    /// deepest raw price the pricer can produce (Φ clamps at
+    /// `D_CLAMP_1E6`) in the phase that pushed hardest.
+    #[test]
+    fn the_shipped_artifact_cannot_publish_certainty_from_a_finite_edge() {
+        let (dir, artifact) = scratch("nocertainty", &[]);
+        let boot = load_bin15_boot(
+            Some(&artifact),
+            Some(&dir),
+            &resolver,
+            &rolling(),
+            &rolling_syms(),
+        )
+        .expect("load")
+        .expect("configured");
+        // A LATE-phase 15 m instance (τ under the mid boundary). Sweep
+        // the mark up and take the first belief at or past 0.95 — the
+        // plan's own fixture, and the raw price the withdrawn late
+        // table recalibrated to exactly 1.000000.
+        let tau_late = 60_000_000_000u64;
+        let sig2 = 1_000_000_000_000i128;
+        let k = 79_000_000_000i64;
+        let mut bump = 0i64;
+        let deep = loop {
+            let f = strategy_bin15::price::fair_value(&boot.luts, k + bump, k, tau_late, sig2)
+                .expect("fair");
+            if f.p_raw_1e6 >= 950_000 {
+                break f;
+            }
+            bump += 1_000_000;
+            assert!(bump < 10_000_000_000, "the sweep must reach 0.95");
+        };
+        assert!(
+            deep.p_hat_1e6 <= 999_900,
+            "a raw {} recalibrated to {} — one tick inside is the bound",
+            deep.p_raw_1e6,
+            deep.p_hat_1e6
+        );
+        assert_eq!(deep.p_hat_1e6, deep.p_raw_1e6, "identity leaves the belief alone");
+        // At the very deepest the pricer can go, the published number
+        // is Φ's own ceiling (999_979) and NEVER 1e6. The distinction
+        // is the whole of F1: a belief the model actually holds may sit
+        // near one; a recalibration may not put it there.
+        let ceiling =
+            strategy_bin15::price::fair_value(&boot.luts, k + 40_000_000_000, k, tau_late, sig2)
+                .expect("fair");
+        assert!(
+            ceiling.p_hat_1e6 < 1_000_000,
+            "certainty is never published: {}",
+            ceiling.p_hat_1e6
+        );
+        assert_eq!(ceiling.p_hat_1e6, ceiling.p_raw_1e6, "and it is Φ's number, not the table's");
+        // The same on the way down: a raw price near zero may not
+        // recalibrate to a free buy of the No leg either.
+        let g = strategy_bin15::price::fair_value(&boot.luts, k - 40_000_000_000, k, tau_late, sig2)
+            .expect("fair");
+        assert!(g.p_hat_1e6 > 0, "the shipped table published {}", g.p_hat_1e6);
+        // And the interior of every shipped phase table is open.
+        let mut ph = 0usize;
+        while ph < core_config::bin15::PHASES {
+            let mut i = 1usize;
+            while i < core_config::bin15::RECAL_POINTS - 1 {
+                assert!(
+                    boot.luts.recal[ph][i] > 0 && boot.luts.recal[ph][i] < 1_000_000,
+                    "recal[{ph}][{i}] pins certainty"
+                );
+                i += 1;
+            }
+            ph += 1;
+        }
+    }
+
+    /// BIN15 P2 (F2): the entry law's arithmetic against the day cap,
+    /// on the boot line where the operator will actually read it.
+    #[test]
+    fn the_boot_line_says_whether_the_entry_law_fits_the_day_cap() {
+        let mut p = strategy_bin15::Bin15Params {
+            n_families: 4,
+            family_kind: [strategy_bin15::FAMILY_OUT_15M; strategy_bin15::BIN15_MAX_FAMILIES],
+            entry_usd_1e6: 50_000_000,   // $50
+            cap_day_usd_1e6: 5_000_000_000, // $5 000
+            ..strategy_bin15::Bin15Params::default()
+        };
+        // Four families x 96 instances x $50 = $19 200 against $5 000.
+        let w = day_cap_warning(&p);
+        assert!(w.contains("entry_day_want=$19200"), "{w}");
+        assert!(w.contains("OVER cap_day=$5000"), "{w}");
+        assert!(w.contains("WARNING"), "{w}");
+        assert!(w.contains("4 live 15 m families"), "{w}");
+        assert!(!w.contains("  "), "no doubled spaces: {w}");
+
+        // The RULED shape (operator, 2026-09-13): $30,000, which is the
+        // $19,200 the entry law wants plus $10,800 for the maker arm.
+        p.cap_day_usd_1e6 = 30_000_000_000;
+        let w = day_cap_warning(&p);
+        assert!(w.contains("entry_day_want=$19200 (fits, $10800 headroom)"), "{w}");
+        assert!(!w.contains("WARNING"), "{w}");
+        assert!(!w.contains("EXACTLY"), "{w}");
+        // The SUPERSEDED exact-fit shape still has its own tell, because
+        // a cap set to exactly the entry want leaves the two arms
+        // competing for the last dollar and the operator must see that.
+        p.cap_day_usd_1e6 = 19_200_000_000;
+        let w = day_cap_warning(&p);
+        assert!(w.contains("entry_day_want=$19200 (fits EXACTLY"), "{w}");
+        assert!(w.contains("no headroom for the maker arm"), "{w}");
+        assert!(!w.contains("WARNING"), "{w}");
+        // Same exact cap, maker off: the entry arm has the day to itself.
+        p.maker_enabled = 0;
+        assert!(day_cap_warning(&p).contains("(fits EXACTLY, maker off)"));
+        p.maker_enabled = 1;
+
+        // The alternative ruling the plan suggested: BTC only under the
+        // old $5 000, which fits with room to spare.
+        p.cap_day_usd_1e6 = 5_000_000_000;
+        p.n_families = 1;
+        let w = day_cap_warning(&p);
+        assert!(w.contains("entry_day_want=$4800 (fits, $200 headroom)"), "{w}");
+        assert!(!w.contains("WARNING"), "{w}");
+
+        // A daily family opens one instance a day, not 96, so it does
+        // not enter the arithmetic at all.
+        p.n_families = 2;
+        p.family_kind[1] = strategy_bin15::FAMILY_NATIVE_DAILY;
+        assert!(day_cap_warning(&p).contains("$4800 (fits, $200 headroom)"));
+
+        // And with the entry law off there is nothing to say.
+        p.entry_usd_1e6 = 0;
+        assert_eq!(day_cap_warning(&p), "");
     }
 
     #[test]

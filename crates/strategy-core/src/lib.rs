@@ -916,6 +916,12 @@ pub struct Bin15Counters {
     pub skipped_tail: u64,
     /// Re-prices held: the underlying mark or a touch is stale.
     pub skipped_stale: u64,
+    /// BIN15 P0 (F4): re-prices held because the underlying mark is
+    /// OLDER than `mark_stale_ns`. Distinct from `skipped_stale`: that
+    /// one means no mark at all, this one means a mark the tape has
+    /// left behind, which is the failure that prices four families off
+    /// a frozen number while their books track reality.
+    pub skipped_mark_stale: u64,
     /// Re-prices held: the binary book is one-sided or empty.
     pub skipped_book: u64,
     /// Re-prices held: a closing take with nothing to close.
@@ -924,6 +930,16 @@ pub struct Bin15Counters {
     pub skipped_cap: u64,
     /// Re-prices held: the price or size fell off the HIP-4 grid.
     pub skipped_grid: u64,
+    /// BIN15 P3 (F6): coverage entries NOT taken because the ask did
+    /// not clear `p̂ − e_entry`.
+    ///
+    /// Not a defect — it is the arm working. The bar is `p > a` plus a
+    /// margin, so an instance whose favourite is priced at or above the
+    /// model's own belief is one the member declines to pay for. A
+    /// counter that stays at zero while entries fire on every instance
+    /// means the bound is not binding and the arm is a market order
+    /// wearing a price limit.
+    pub skipped_entry_price: u64,
     /// Configured families with no live instance (a level, not a total).
     pub families_dormant: u64,
     /// Fills matched to one of this member's pendings.

@@ -60,7 +60,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 22] = [
+const BIN15_KEYS: [&str; 24] = [
     "families",
     "underlying",
     "tau_ns",
@@ -91,6 +91,17 @@ const BIN15_KEYS: [&str; 22] = [
     // the edge law alone, which is what every artifact before
     // 2026-09-13 carries.
     "entry_usd_1e6",
+    // BIN15 P0 (F4): the underlying mark's shelf life. Optional; absent
+    // = the STATED default 5 s, which is the parser's law for an
+    // optional key — and the only honest default, because an artifact
+    // written before this key existed was priced by a member with no
+    // age gate at all and must not silently keep that behaviour.
+    "mark_stale_ns",
+    // BIN15 P3 (F6): the coverage entry's price bound. Optional; absent
+    // = the STATED default 20000 (2 c). An artifact written before this
+    // key existed drove an arm that paid ANY ask, so the default has to
+    // be the bound and not "off".
+    "e_entry_1e6",
 ];
 
 /// `bin15.toml` as parsed. The strings stay descriptors: resolving them
@@ -138,6 +149,12 @@ pub struct Bin15File {
     pub scale_1e9: i64,
     /// BIN15 O9: coverage-entry notional ×1e6 USD; `0` = off.
     pub entry_usd_1e6: i64,
+    /// BIN15 P0 (F4): the oldest an underlying mark may be and still
+    /// price a binary, ns. Absent = [`MARK_STALE_NS_DEFAULT`].
+    pub mark_stale_ns: u64,
+    /// BIN15 P3 (F6): the coverage entry's margin over its own belief
+    /// ×1e6. Absent = [`E_ENTRY_1E6_DEFAULT`].
+    pub e_entry_1e6: i64,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -193,6 +210,37 @@ fn opt_int(kv: &[(String, Value, usize)], key: &str, default: i64) -> Result<i64
     }
 }
 
+/// BIN15 P0 (F4): the stated default shelf life of an underlying mark,
+/// ns. Hyperliquid prints a mark every 1-3 s, so 5 s is two to five
+/// missed prints — past ordinary jitter, well short of a dead feed.
+pub const MARK_STALE_NS_DEFAULT: u64 = 5_000_000_000;
+
+/// The floor `mark_stale_ns` may be configured at, ns: one mark
+/// interval. Below it the gate fires between two healthy prints.
+pub const MARK_STALE_NS_MIN: u64 = 1_000_000_000;
+
+/// BIN15 P3 (F6): the stated margin the coverage entry demands over its
+/// own belief before paying an ask ×1e6 — 2 cents.
+///
+/// The entry's bar is `p > a` (buying at ask `a` with belief `p` has an
+/// EV per dollar of premium of `p/a − 1`). This is the cushion on top:
+/// model error plus the exit-leg fee at the operator tier.
+pub const E_ENTRY_1E6_DEFAULT: i64 = 20_000;
+
+fn opt_pos_u64(
+    kv: &[(String, Value, usize)],
+    key: &str,
+    default: u64,
+) -> Result<u64, Bin15Error> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        Some((_, Value::Int(v), _)) => {
+            u64::try_from(*v).map_err(|_| err(format!("`{key}` must be positive (got {v})")))
+        }
+        Some((_, _, l)) => Err(err(format!("line {l}: `{key}` must be an integer"))),
+        None => Ok(default),
+    }
+}
+
 fn pos_u64(kv: &[(String, Value, usize)], key: &str) -> Result<u64, Bin15Error> {
     let v = int(kv, key)?;
     u64::try_from(v).map_err(|_| err(format!("`{key}` must be positive (got {v})")))
@@ -219,6 +267,7 @@ fn table(
     n: usize,
     first: Option<u32>,
     last_min: Option<u32>,
+    interior_open: bool,
 ) -> Result<Vec<u32>, Bin15Error> {
     let v = ints(kv, key)?;
     if v.len() != n {
@@ -260,6 +309,31 @@ fn table(
                 n - 1,
                 out[n - 1]
             )));
+        }
+    }
+    // BIN15 P1a (F1): a recalibration table may pin certainty ONLY at
+    // the two endpoints, where the raw price itself said 0 or 1. An
+    // INTERIOR bucket at 0 or 1e6 is a recalibration asserting a
+    // certainty the model never held — which is exactly what the old
+    // `clamp(.., 0, 1e6)` fitter produced for every slope over ~1.032,
+    // and what the §0 entry rule then reads as an unbeatable edge over
+    // any ask. This bound is a BOOT REFUSAL for such an artifact, and
+    // that is the point: the live file has to be re-cut, not tolerated.
+    if interior_open {
+        let mut i = 1usize;
+        while i < n - 1 {
+            if out[i] == 0 || out[i] == 1_000_000 {
+                return Err(err(format!(
+                    "`{key}`[{i}] = {} pins CERTAINTY on an interior bucket. Only \
+                     [0] and [{}] may be 0 or 1000000; an interior 0/1 is a \
+                     recalibration manufacturing a belief the pricer never had. \
+                     Re-cut the artifact (`python -m claude_worker.bin15_fit \
+                     artifact`) — its slope bound is 1032 milli-units",
+                    out[i],
+                    n - 1
+                )));
+            }
+            i += 1;
         }
     }
     Ok(out)
@@ -308,15 +382,17 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         cap_day_usd_1e6: int(&kv, "cap_day_usd_1e6")?,
         maker_enabled: flag(&kv, "maker_enabled")?,
         null_arm: flag(&kv, "null_arm")?,
-        phi_lut: table(&kv, "phi_lut", PHI_POINTS, Some(500_000), Some(999_900))?,
+        phi_lut: table(&kv, "phi_lut", PHI_POINTS, Some(500_000), Some(999_900), false)?,
         recal: [
-            table(&kv, "recal_early", RECAL_POINTS, Some(0), Some(1_000_000))?,
-            table(&kv, "recal_mid", RECAL_POINTS, Some(0), Some(1_000_000))?,
-            table(&kv, "recal_late", RECAL_POINTS, Some(0), Some(1_000_000))?,
+            table(&kv, "recal_early", RECAL_POINTS, Some(0), Some(1_000_000), true)?,
+            table(&kv, "recal_mid", RECAL_POINTS, Some(0), Some(1_000_000), true)?,
+            table(&kv, "recal_late", RECAL_POINTS, Some(0), Some(1_000_000), true)?,
         ],
         hour_ln_off_1e9: hour,
         scale_1e9: opt_int(&kv, "scale_1e9", 1_000_000_000)?,
         entry_usd_1e6: opt_int(&kv, "entry_usd_1e6", 0)?,
+        mark_stale_ns: opt_pos_u64(&kv, "mark_stale_ns", MARK_STALE_NS_DEFAULT)?,
+        e_entry_1e6: opt_int(&kv, "e_entry_1e6", E_ENTRY_1E6_DEFAULT)?,
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -405,6 +481,47 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
             file.cap_instance_usd_1e6, file.cap_day_usd_1e6
         )));
     }
+    // BIN15 P0 (F4). A gate under one mark interval holds on every
+    // ordinary print gap and the member never prices; a gate at or over
+    // the take floor cannot fire before `tau_min_take_ns` has already
+    // closed the arm, which is a gate spelled as if it worked.
+    if file.mark_stale_ns < MARK_STALE_NS_MIN {
+        return Err(err(format!(
+            "`mark_stale_ns` {} is under {MARK_STALE_NS_MIN} (one Hyperliquid mark \
+             interval) — a gate that fires between two ordinary prints holds the \
+             member on every tick",
+            file.mark_stale_ns
+        )));
+    }
+    if file.mark_stale_ns >= file.tau_min_take_ns {
+        return Err(err(format!(
+            "`mark_stale_ns` {} must be under `tau_min_take_ns` {} — a staleness \
+             gate wider than the take window can never hold a take, so it is a \
+             gate that does nothing and reads as if it did",
+            file.mark_stale_ns, file.tau_min_take_ns
+        )));
+    }
+    // BIN15 P3 (F6). One venue tick, because a margin under the price
+    // granularity is a margin the venue cannot express; and under half
+    // the interval, because a bound of 0.5 or more can never be cleared
+    // by any ask on the preferred side (`belief` is at most 1e6 and the
+    // ask is at least one tick).
+    if file.e_entry_1e6 < 100 {
+        return Err(err(format!(
+            "`e_entry_1e6` must be at least 100 (one 1e-4 tick); got {}. Zero would \
+             make the coverage entry pay ANY ask, which is the market order this \
+             bound exists to stop",
+            file.e_entry_1e6
+        )));
+    }
+    if file.e_entry_1e6 >= 500_000 {
+        return Err(err(format!(
+            "`e_entry_1e6` {} is at or over half the interval — no ask on the \
+             preferred side can ever clear it, so the entry arm would never fire \
+             and every instance would read as a quiet book",
+            file.e_entry_1e6
+        )));
+    }
     if file.scale_1e9 <= 0 {
         return Err(err(format!(
             "`scale_1e9` must be positive (got {}); absent means 1000000000",
@@ -442,10 +559,32 @@ mod tests {
         assert_eq!(f.phi_lut[PHI_POINTS - 1], 999_979, "Phi(4.096)");
         // The three recalibration slopes, read back off their own
         // tables: p = 0.75 under a slope s lands at 0.5 + 0.25 s.
+        //
+        // BIN15 P1a (F1): the shipped slopes are 1.000 — IDENTITY. The
+        // fitted 1.104 / 1.165 / 1.219 are withdrawn; they were
+        // measured on ~33 instances and their tables pinned interior
+        // certainty, which the grammar now refuses outright. A re-fit
+        // off the accumulated ledger edits these three numbers and
+        // re-cuts the artifact.
         let at_075 = |ph: usize| f.recal[ph][48];
-        assert_eq!(at_075(0), 776_000, "early slope 1.104");
-        assert_eq!(at_075(1), 791_250, "mid slope 1.165");
-        assert_eq!(at_075(2), 804_750, "late slope 1.219");
+        assert_eq!(at_075(0), 750_000, "early slope 1.000 (identity)");
+        assert_eq!(at_075(1), 750_000, "mid slope 1.000 (identity)");
+        assert_eq!(at_075(2), 750_000, "late slope 1.000 (identity)");
+        // And no interior bucket is certain, on any phase — the bound
+        // the parser enforces, read off the file the operator ships.
+        let mut ph = 0usize;
+        while ph < PHASES {
+            let mut k = 1usize;
+            while k < RECAL_POINTS - 1 {
+                assert!(
+                    f.recal[ph][k] > 0 && f.recal[ph][k] < 1_000_000,
+                    "recal[{ph}][{k}] = {} pins certainty",
+                    f.recal[ph][k]
+                );
+                k += 1;
+            }
+            ph += 1;
+        }
         // Antisymmetry about (0.5, 0.5): Yes and No price to one.
         let mut ph = 0usize;
         while ph < PHASES {
@@ -465,8 +604,15 @@ mod tests {
     }
 
     /// A minimal artifact whose tables are the shipped SHAPE (a real
-    /// CDF ramp and a slope-1.104 recalibration), built here so the
-    /// test does not depend on the example file.
+    /// CDF ramp and an identity recalibration), built here so the test
+    /// does not depend on the example file.
+    ///
+    /// BIN15 P1a (F1): `recal` mirrors the fitter's law — endpoints
+    /// pinned, every interior bucket held one venue tick inside them —
+    /// because that law is now a PARSER bound and a helper built the
+    /// old way produces an artifact the grammar refuses. Which is the
+    /// point: [`an_artifact_that_pins_interior_certainty_is_refused`]
+    /// builds one deliberately.
     fn artifact() -> String {
         let mut phi: Vec<String> = Vec::with_capacity(PHI_POINTS);
         let mut i = 0usize;
@@ -476,17 +622,7 @@ mod tests {
             phi.push(v.to_string());
             i += 1;
         }
-        let recal = |slope: i64| {
-            let mut t: Vec<String> = Vec::with_capacity(RECAL_POINTS);
-            let mut k = 0usize;
-            while k < RECAL_POINTS {
-                let p = k as i64 * 15_625;
-                let v = (500_000 + (p - 500_000) * slope / 1_000).clamp(0, 1_000_000);
-                t.push(v.to_string());
-                k += 1;
-            }
-            t.join(", ")
-        };
+        let recal = |slope: i64| recal_with(slope, true);
         format!(
             "[bin15]\n\
              families = [\"out:BTC:15m\"]\n\
@@ -509,10 +645,78 @@ mod tests {
              recal_mid = [{}]\n\
              recal_late = [{}]\n",
             phi.join(", "),
-            recal(1_104),
-            recal(1_165),
-            recal(1_219),
+            recal(1_000),
+            recal(1_000),
+            recal(1_000),
         )
+    }
+
+    /// One recalibration table as text. `interior_open` false is the
+    /// WITHDRAWN law — a flat `clamp(.., 0, 1e6)` that pins interior
+    /// buckets at certainty for any slope over ~1.032.
+    fn recal_with(slope: i64, interior_open: bool) -> String {
+        let mut t: Vec<String> = Vec::with_capacity(RECAL_POINTS);
+        let mut k = 0usize;
+        while k < RECAL_POINTS {
+            let p = k as i64 * 15_625;
+            let raw = 500_000 + (p - 500_000) * slope / 1_000;
+            let v = if !interior_open {
+                raw.clamp(0, 1_000_000)
+            } else if k == 0 {
+                0
+            } else if k == RECAL_POINTS - 1 {
+                1_000_000
+            } else {
+                raw.clamp(100, 999_900)
+            };
+            t.push(v.to_string());
+            k += 1;
+        }
+        t.join(", ")
+    }
+
+    /// BIN15 P1a (F1). The artifact that was LIVE on 2026-09-12 carried
+    /// slope-1.104 / 1.165 / 1.219 tables whose end buckets were
+    /// clamped flat at 0 and 1e6, so the member published `p̂ = 1.000000`
+    /// off a raw price of 0.984 — a certainty the pricer never held, and
+    /// one that beats every ask the venue can quote. The grammar now
+    /// refuses it, which means that artifact REFUSES THE BOOT until it
+    /// is re-cut. That refusal is the fix, not a side effect of it.
+    #[test]
+    fn an_artifact_that_pins_interior_certainty_is_refused() {
+        let good = artifact();
+        assert!(parse(&good).is_ok(), "the identity artifact parses");
+        let bad = good.replace(
+            &format!("recal_early = [{}]", recal_with(1_000, true)),
+            &format!("recal_early = [{}]", recal_with(1_104, false)),
+        );
+        assert_ne!(bad, good, "the substitution must have happened");
+        let e = parse(&bad).expect_err("the withdrawn shape must be refused");
+        assert!(e.0.contains("CERTAINTY"), "{}", e.0);
+        // And the reason is INTERIOR, not the endpoints: the accepted
+        // table IS 0 at [0] and 1e6 at [64] — pinned ends are the law,
+        // pinned interiors are the defect.
+        let f = parse(&good).expect("parse");
+        assert_eq!(f.recal[2][0], 0);
+        assert_eq!(f.recal[2][RECAL_POINTS - 1], 1_000_000);
+    }
+
+    /// The slope the fitter may still ship — 1032 milli-units is the
+    /// largest whose bucket-63 value stays under 1e6 — parses, and the
+    /// one above it cannot even be built by the fitter (that bound is
+    /// tested on the Python side). Here we prove the PARSER accepts a
+    /// sharpened-but-honest table, so the bound above is not a blanket
+    /// ban on recalibration.
+    #[test]
+    fn a_sharpened_table_that_stays_inside_the_interval_parses() {
+        let good = artifact().replace(
+            &format!("recal_mid = [{}]", recal_with(1_000, true)),
+            &format!("recal_mid = [{}]", recal_with(1_032, true)),
+        );
+        let f = parse(&good).expect("a 1.032 table is honest");
+        assert_eq!(f.recal[1][0], 0);
+        assert_eq!(f.recal[1][RECAL_POINTS - 1], 1_000_000);
+        assert!(f.recal[1][63] < 1_000_000 && f.recal[1][63] > f.recal[1][62]);
     }
 
     #[test]
