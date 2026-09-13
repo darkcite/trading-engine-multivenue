@@ -1521,6 +1521,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // Rows.
     let day0 = wall_first / DAY_NS;
     let mut rows: Vec<(u8, KeyRow)> = Vec::new();
+    // BIN15 P5 (F7): see `crate::backtest::fill::BinaryFillId`.
+    let mut binary_fills: Vec<crate::backtest::fill::BinaryFillId> = Vec::new();
+    let mut binary_fills_undigested: u64 = 0;
     let engine_ids: Vec<u8> = engines.keys().copied().collect();
     for sid in engine_ids {
         let eng = engines.get_mut(&sid).expect("keyed");
@@ -1531,6 +1534,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         // yet realised. `fill.rs`'s own tests always call it in this
         // order; this surface was the exception.
         let outcome = eng.finish();
+        // BIN15 P5 (F7): the fill identities, collected BEFORE the
+        // engine is dropped. One list across every strategy in the
+        // root, because a duplicate is a duplicate whoever emitted it.
+        binary_fills.extend_from_slice(eng.binary_fills());
+        binary_fills_undigested += outcome.binary_fills_undigested;
         let per_sym: Vec<(String, i64, i128, u64)> = eng
             .per_sym_detail()
             .iter()
@@ -1735,6 +1743,31 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 params.opt_spread_frac_1e6
             )
         ));
+    }
+    // BIN15 P5 (F7): additive, and emitted ONLY when the root held
+    // prediction-class fills — a root without binaries renders exactly
+    // as it did before, so `audit_pnl_version` stays 1.
+    //
+    // The day merge (`claude_worker.pnl_report`) dedupes these across
+    // the run's ≤ 2 h units by `(oid, ts_ns, sym, qty)`. O10's carry
+    // head deliberately overlaps the tail of one unit with the head of
+    // the next so an open binary finds its own settlement, and that
+    // overlap is exactly how one entry can be counted twice.
+    if !binary_fills.is_empty() || binary_fills_undigested > 0 {
+        binary_fills.sort_unstable();
+        json.push_str("\"binary_fills\":{\"undigested\":");
+        json.push_str(&binary_fills_undigested.to_string());
+        json.push_str(",\"rows\":[");
+        for (i, f) in binary_fills.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                "{{\"oid\":{},\"ts_ns\":{},\"sym\":{},\"qty_1e6\":{}}}",
+                f.client_oid, f.ts_ns, f.sym, f.qty_1e6
+            ));
+        }
+        json.push_str("]},");
     }
     json.push_str("\"strategies\":[");
     for (i, (sid, row)) in rows.iter().enumerate() {

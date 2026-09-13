@@ -372,6 +372,89 @@ struct Bin15LedgerRow {
     p_hat_1e6: i64,
     p_raw_1e6: i64,
     arm: u8,
+    /// BIN15 P3.3 (F6): `1` once this instance's coverage entry has
+    /// been submitted, `0` before it and `0` for every instance the
+    /// price bound declined to pay for.
+    ///
+    /// The ledger is OBSERVATION-based and stays that way — G6.1 counts
+    /// every settled instance the member priced, whether or not it
+    /// bought one. That is what lets the $50 arm exist ONLY to earn:
+    /// it no longer has to trade in order for the instance to be
+    /// measured, which is the bias F6 named. This column is what makes
+    /// the two populations separable afterwards — is the model's skill
+    /// on the instances it paid for the same as on the ones it passed?
+    entered: u8,
+    /// BIN15 P6 (the skill test): the VENUE's own mid on the Yes book
+    /// at this instant ×1e6, or `-1` when the book was not two-sided.
+    ///
+    /// The go/no-go is `Brier(p̂) < Brier(venue mid)` out of sample, and
+    /// that comparison has to be made at the SAME instants or it is not
+    /// a comparison. Carrying the mid on the row is what makes the gate
+    /// computable from the ledger alone, instead of from a second pass
+    /// over the capture that could align differently.
+    mid_1e6: i64,
+}
+
+/// One COVERAGE ENTRY, as the member placed it.
+///
+/// The ledger answers "what did the member believe"; this answers "what
+/// did it DO about it" — when in the instance's life the order went in,
+/// on which side, at what price, and (joined at render) how the
+/// instance actually settled. Three questions the ledger cannot answer
+/// on its own, because a 30 s sample grid cannot time an order and
+/// carries no price.
+#[derive(Copy, Clone, Debug)]
+struct Bin15EntryRow {
+    ts_ns: u64,
+    family: u8,
+    outcome: u32,
+    /// The instance's own start: its expiry less the 15 m tenor. Used
+    /// rather than `created_ns` because the roll event can arrive a
+    /// second or two after the venue created the instance, and an
+    /// offset measured from our own receipt would flatter itself.
+    start_ns: u64,
+    expiry_ns: u64,
+    /// `1` the member bought YES, `0` NO.
+    is_yes: u8,
+    px_1e6: i64,
+    qty_1e6: i64,
+    p_hat_1e6: i64,
+}
+
+/// The `bin15_entries` block of the detail sidecar.
+fn render_bin15_entries(
+    rows: &[Bin15EntryRow],
+    y_by_outcome: &BTreeMap<u32, i64>,
+) -> String {
+    let mut s = String::with_capacity(64 + rows.len() * 160);
+    s.push_str("\"bin15_entries\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let y = match y_by_outcome.get(&r.outcome) {
+            Some(v) => v.to_string(),
+            None => "null".to_owned(),
+        };
+        s.push_str(&format!(
+            "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
+             \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
+             \"qty_1e6\":{},\"p_hat_1e6\":{},\"y\":{}}}",
+            r.ts_ns,
+            r.family,
+            r.outcome,
+            r.start_ns,
+            r.expiry_ns,
+            r.ts_ns.saturating_sub(r.start_ns) / 1_000_000_000,
+            r.is_yes,
+            r.px_1e6,
+            r.qty_1e6,
+            r.p_hat_1e6,
+            y
+        ));
+    }
+    s.push(']');
+    s
 }
 
 /// The `bin15_ledger` block of the detail sidecar (O4b; spec §6.6).
@@ -396,8 +479,18 @@ fn render_bin15_ledger(
         };
         s.push_str(&format!(
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"tau_ns\":{},\
-             \"p_hat_1e6\":{},\"p_raw_1e6\":{},\"arm\":{},\"y\":{}}}",
-            r.ts_ns, r.family, r.outcome, r.tau_ns, r.p_hat_1e6, r.p_raw_1e6, r.arm, y
+             \"p_hat_1e6\":{},\"p_raw_1e6\":{},\"arm\":{},\"entered\":{},\
+             \"mid_1e6\":{},\"y\":{}}}",
+            r.ts_ns,
+            r.family,
+            r.outcome,
+            r.tau_ns,
+            r.p_hat_1e6,
+            r.p_raw_1e6,
+            r.arm,
+            r.entered,
+            r.mid_1e6,
+            y
         ));
     }
     s.push(']');
@@ -487,6 +580,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     // BIN15 O4b: the calibration ledger, filled by the bin15 arm and
     // empty for every other member.
     let mut bin15_ledger: Vec<Bin15LedgerRow> = Vec::new();
+    let mut bin15_entries: Vec<Bin15EntryRow> = Vec::new();
     let (hash_hex, member_line, drive_out, member_counters): (String, String, DriveOutcome, String) =
         match spec.kind {
             MemberKind::Icdp => {
@@ -860,9 +954,18 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 let mut ledger: Vec<Bin15LedgerRow> = Vec::new();
                 let mut last_sample: [u64; strategy_bin15::BIN15_MAX_FAMILIES] =
                     [0; strategy_bin15::BIN15_MAX_FAMILIES];
+                // The coverage entries, caught on the `covered` 0 -> 1
+                // edge. That flag is set ONLY after a submitted emit
+                // (BIN15 P3/F6), so an edge is an order that really
+                // went to the ring — not an attempt the caps refused.
+                let mut entries: Vec<Bin15EntryRow> = Vec::new();
+                let mut was_covered: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
+                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
                 let out = {
                     let ledger_ref = &mut ledger;
                     let last_ref = &mut last_sample;
+                    let entries_ref = &mut entries;
+                    let cov_ref = &mut was_covered;
                     let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
                         let mut f = 0usize;
                         while f < s.n_families() {
@@ -903,8 +1006,48 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                                     p_hat_1e6: fam.p_hat_1e6,
                                     p_raw_1e6: fam.p_raw_1e6,
                                     arm: fam.arm,
+                                    entered: fam.covered,
+                                    // The Yes book's mid, or -1 when
+                                    // the venue is not two-sided. A
+                                    // one-sided book has no mid, and
+                                    // inventing one would flatter the
+                                    // benchmark the model is scored
+                                    // against.
+                                    mid_1e6: if fam.touch_yes.actionable() {
+                                        (fam.touch_yes.touch.bid_1e6
+                                            + fam.touch_yes.touch.ask_1e6)
+                                            / 2
+                                    } else {
+                                        -1
+                                    },
                                 });
                             }
+                            // The entry edge. `pend_take` still holds
+                            // the order that set the flag — the emit
+                            // books the pending before returning — so
+                            // the price and size are the ones actually
+                            // submitted, not a re-derivation.
+                            if fam.is_live()
+                                && fam.covered == 1
+                                && cov_ref[f] == 0
+                                && fam.pend_take.live()
+                            {
+                                entries_ref.push(Bin15EntryRow {
+                                    ts_ns: rec.wall_ns,
+                                    family: f as u8,
+                                    outcome: fam.live.outcome,
+                                    start_ns: fam
+                                        .live
+                                        .expiry_ns
+                                        .saturating_sub(strategy_bin15::TAU_15M_NS),
+                                    expiry_ns: fam.live.expiry_ns,
+                                    is_yes: fam.pend_take.is_yes,
+                                    px_1e6: fam.pend_take.px_1e6,
+                                    qty_1e6: fam.pend_take.qty_1e6,
+                                    p_hat_1e6: fam.p_hat_1e6,
+                                });
+                            }
+                            cov_ref[f] = fam.covered;
                             f += 1;
                         }
                     };
@@ -918,13 +1061,16 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     )
                 };
                 bin15_ledger = ledger;
+                bin15_entries = entries;
                 let c = strat.counters();
                 let counters = format!(
                     "member: bin15 reprices={} rolls={} rolls_settled={} spec_overrides={} \
                      spec_refused={} takes_submitted={} takes_filled={} takes_unfilled={} \
                      quotes_submitted={} quotes_filled={} quotes_expired={} closes_submitted={} \
-                     skipped_tau={} skipped_tail={} skipped_stale={} skipped_book={} \
-                     skipped_inventory={} skipped_cap={} skipped_grid={} families_dormant={} \
+                     skipped_tau={} skipped_tail={} skipped_stale={} \
+                     skipped_mark_stale={} skipped_book={} \
+                     skipped_inventory={} skipped_cap={} skipped_grid={} \
+                     skipped_entry_price={} families_dormant={} \
                      fills={} unknown_fills={} ledger_rows={} orders_emitted={} \
                      regime=not-replayed(v1)",
                     c.reprices,
@@ -942,10 +1088,12 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     c.skipped_tau,
                     c.skipped_tail,
                     c.skipped_stale,
+                    c.skipped_mark_stale,
                     c.skipped_book,
                     c.skipped_inventory,
                     c.skipped_cap,
                     c.skipped_grid,
+                    c.skipped_entry_price,
                     c.families_dormant,
                     c.fills,
                     c.unknown_fills,
@@ -956,6 +1104,13 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
             }
         };
     let outcome: ModelOutcome = engine.finish();
+    // BIN15 P4a + P5 (F3, F7): the post-run binary numbers, on the same
+    // stderr the pre-run census already went to.
+    let binary_outcome_line =
+        crate::backtest::render_binary_outcome_line(&binary_model, &engine, &outcome);
+    if !binary_outcome_line.is_empty() {
+        eprintln!("{binary_outcome_line}");
+    }
     let oos_round_trips = drive_out.round_trips - drive_out.rt_at_boundary;
 
     let vals = ReportValues {
@@ -1076,13 +1231,15 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
             &if bin15_ledger.is_empty() {
                 String::new()
             } else {
-                render_bin15_ledger(
-                    &bin15_ledger,
-                    &crate::backtest::binary::settle_values_by_outcome(
-                        &merged,
-                        &binary_underlying,
-                        window_end_wall_ns,
-                    ),
+                let y = crate::backtest::binary::settle_values_by_outcome(
+                    &merged,
+                    &binary_underlying,
+                    window_end_wall_ns,
+                );
+                format!(
+                    "{},{}",
+                    render_bin15_ledger(&bin15_ledger, &y),
+                    render_bin15_entries(&bin15_entries, &y)
                 )
             },
         );

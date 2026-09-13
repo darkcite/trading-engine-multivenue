@@ -2227,6 +2227,14 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         }
     }
     let outcome: ModelOutcome = engine.finish();
+    // BIN15 P4a + P5 (F3, F7): after the engine has run, and BEFORE the
+    // books are read for the report, because the open cost of an
+    // unsettled instance is exactly what the report cannot otherwise
+    // account for.
+    let binary_outcome_line = render_binary_outcome_line(&binary_model, &engine, &outcome);
+    if !binary_outcome_line.is_empty() {
+        eprintln!("{binary_outcome_line}");
+    }
 
     // ---- §5 report from the §4 model (fixed-point renders only) ----
     let vals = ReportValues {
@@ -2392,6 +2400,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             regime: &regime_report,
             opt_settle_lines: &opt_settle_lines,
             binary_line: &binary_line,
+            binary_outcome_line: &binary_outcome_line,
         },
     );
     Ok(BacktestOutput {
@@ -2608,6 +2617,9 @@ struct SummaryExtras<'a> {
     /// rolling slots — which is what keeps that root's report
     /// byte-identical to the pre-BIN15 one.
     binary_line: &'a str,
+    /// BIN15 P4a + P5: the post-run binary numbers. "" for a root with
+    /// no binaries, which keeps every other summary byte-identical.
+    binary_outcome_line: &'a str,
 }
 
 /// BIN15 O3: the binary instance census, or "" when the root holds no
@@ -2629,6 +2641,55 @@ pub(crate) fn render_binary_line(reg: &binary::BinaryRegistration) -> String {
     )
 }
 
+/// BIN15 P4a + P5 (F3, F7): what the run learned about its binaries
+/// AFTER the fill engine ran. "" when the root held no binaries, so
+/// every non-binary root's summary is byte-identical to before.
+///
+/// Two numbers an operator has to see:
+///
+/// * `short_refused` — ask fills the harness clipped because the
+///   running long did not cover them. The venue rejects such an order
+///   outright, so a paper fill of one is a fabricated trade; non-zero
+///   here means the strategy asked for something impossible and says
+///   how much.
+/// * `unsettled_open` — instances whose payout this window cannot
+///   derive, WITH the cost of whatever is still open on them. A ≤ 2 h
+///   window legitimately cuts through expiries, so this is not an
+///   error; a nonzero cost is P&L reported NOWHERE, and it is the tell
+///   that defect-6's class (an expiry sitting inside the daily restart
+///   drain) has fired again.
+///
+/// DOCTRINE: offline path — allocates freely.
+pub(crate) fn render_binary_outcome_line(
+    reg: &binary::BinaryRegistration,
+    engine: &fill::FillEngine,
+    outcome: &fill::ModelOutcome,
+) -> String {
+    if reg.instances == 0 {
+        return String::new();
+    }
+    let mut open_instances = 0u64;
+    let mut cost_1e12: i128 = 0;
+    for inst in &reg.unsettled {
+        let (qy, cy) = engine.open_position(inst.sym_yes);
+        let (qn, cn) = engine.open_position(inst.sym_no);
+        if qy != 0 || qn != 0 {
+            open_instances += 1;
+            cost_1e12 += cy + cn;
+        }
+    }
+    format!(
+        "binary: short_refused={}/{} contracts settled_instances={} \
+         unsettled_open={}/{} cost={}",
+        outcome.prediction_short_refused_fills,
+        outcome.prediction_short_refused_1e6 / 1_000_000,
+        outcome.binary_settled,
+        open_instances,
+        reg.unsettleable,
+        fmt_usd_1e6(fill::usd_1e12_to_1e6_floor(cost_1e12)),
+    )
+}
+
 /// Deterministic human summary (stderr; §10 harness observability).
 fn render_summary(
     cfg: &BacktestConfig,
@@ -2643,6 +2704,7 @@ fn render_summary(
         regime,
         opt_settle_lines,
         binary_line,
+        binary_outcome_line,
     } = *extras;
     let mut s = String::with_capacity(2048);
     s.push_str(&format!(
@@ -2716,6 +2778,10 @@ fn render_summary(
     }
     if !binary_line.is_empty() {
         s.push_str(binary_line);
+        s.push('\n');
+    }
+    if !binary_outcome_line.is_empty() {
+        s.push_str(binary_outcome_line);
         s.push('\n');
     }
     for (i, r) in runs.iter().enumerate() {

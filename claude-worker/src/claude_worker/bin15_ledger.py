@@ -66,11 +66,29 @@ Y_UNKNOWN: int = -1
 HEADER: str = (
     "# bin15 ledger — one row per live instance per 30 s, merged from\n"
     "#   `backtest --member bin15 --emit-detail` sidecars.\n"
-    "# ts_ns\tfamily\toutcome\ttau_ns\tp_hat_1e6\tp_raw_1e6\tarm\ty\n"
+    "# ts_ns\tfamily\toutcome\ttau_ns\tp_hat_1e6\tp_raw_1e6\tarm\tentered\tmid_1e6\ty\n"
     "# y: 1000000 settled ITM, 0 settled OTM, -1 the window could not\n"
     "# derive the payout (its expiry or TWAP falls outside the window).\n"
+    "# entered: 1 once the instance's $50 coverage entry was submitted, 0\n"
+    "# before it, 0 for one the price bound declined to pay for (BIN15\n"
+    "# P3/F6), -1 for a row written before the column existed. A row is an\n"
+    "# OBSERVATION either way: G6.1 counts settled instances, not fills.\n"
+    "# mid_1e6: the venue's own Yes mid at this instant, -1 when the book\n"
+    "# was not two-sided. The skill gate is Brier(p_hat) < Brier(mid) at\n"
+    "# the SAME instants, so the benchmark travels on the row.\n"
     "# Worker state. Never git; findings go to docs/research/outcome/.\n"
 )
+
+#: `entered` for a row written before the column existed (an 8-column
+#: ledger, or a pre-P3 sidecar). Not 0: "we do not know" and "the member
+#: declined to pay" are different facts, and a split by `entered` must
+#: not quietly file the first as the second.
+ENTERED_UNKNOWN: int = -1
+
+#: `mid_1e6` for a row whose book was one-sided, or that predates the
+#: column. A one-sided book has NO mid and inventing one would flatter
+#: the benchmark the model is scored against.
+MID_UNKNOWN: int = -1
 
 #: G6.1's bound: 3 cents, ×1e6.
 G61_MAX_ERR_1E6: int = 30_000
@@ -97,6 +115,8 @@ class Row:
     p_raw_1e6: int
     arm: int
     y: int
+    entered: int = ENTERED_UNKNOWN
+    mid_1e6: int = MID_UNKNOWN
 
     @property
     def key(self) -> tuple[int, int, int]:
@@ -111,7 +131,8 @@ class Row:
     def tsv(self) -> str:
         return (
             f"{self.ts_ns}\t{self.family}\t{self.outcome}\t{self.tau_ns}\t"
-            f"{self.p_hat_1e6}\t{self.p_raw_1e6}\t{self.arm}\t{self.y}\n"
+            f"{self.p_hat_1e6}\t{self.p_raw_1e6}\t{self.arm}\t{self.entered}\t"
+            f"{self.mid_1e6}\t{self.y}\n"
         )
 
 
@@ -143,6 +164,8 @@ def rows_from_sidecar(text: str) -> list[Row]:
                 p_raw_1e6=int(r["p_raw_1e6"]),
                 arm=int(r.get("arm", 0)),
                 y=Y_UNKNOWN if y is None else int(y),
+                entered=int(r.get("entered", ENTERED_UNKNOWN)),
+                mid_1e6=int(r.get("mid_1e6", MID_UNKNOWN)),
             )
         )
     return out
@@ -158,9 +181,19 @@ def read_ledger(path: pathlib.Path) -> list[Row]:
         if not s or s.startswith("#"):
             continue
         f = s.split("\t")
-        if len(f) != 8:
-            raise ValueError(f"{path}: want 8 columns, got {len(f)}: {s!r}")
-        out.append(Row(*(int(v) for v in f)))
+        # 8 columns is a ledger written before BIN15 P3/P6 added
+        # `entered` and `mid_1e6`; its rows are real observations and stay
+        # readable, they simply do not know which of them were paid for or
+        # what the venue was asking at the time.
+        v = [int(x) for x in f]
+        if len(f) == 8:
+            out.append(
+                Row(*v[:7], y=v[7], entered=ENTERED_UNKNOWN, mid_1e6=MID_UNKNOWN)
+            )
+            continue
+        if len(f) != 10:
+            raise ValueError(f"{path}: want 8 or 10 columns, got {len(f)}: {s!r}")
+        out.append(Row(*v[:7], entered=v[7], mid_1e6=v[8], y=v[9]))
     return out
 
 
@@ -373,9 +406,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.lane == "status":
         instances = collections.Counter(r.outcome for r in rows)
         settled = {r.outcome for r in rows if r.settled}
+        # BIN15 P3.3 (F6): the two populations, side by side. An
+        # instance is ENTERED if any of its rows says so — the flag goes
+        # up mid-instance and never comes down.
+        entered = {r.outcome for r in rows if r.entered == 1}
+        unknown = {r.outcome for r in rows if r.entered == ENTERED_UNKNOWN}
         print(
             f"bin15-ledger: {path} rows={len(rows)} instances={len(instances)} "
-            f"settled_instances={len(settled)} families={len({r.family for r in rows})}"
+            f"settled_instances={len(settled)} families={len({r.family for r in rows})} "
+            f"entered_instances={len(entered)} "
+            f"settled_and_entered={len(settled & entered)} "
+            f"entered_unknown={len(unknown)}"
         )
         return 0
 

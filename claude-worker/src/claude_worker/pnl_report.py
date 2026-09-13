@@ -392,6 +392,59 @@ def _render_regime(acc: dict) -> dict:
     return {"modes": acc["modes"], **{k: acc[k] for k in _REGIME_SUM_KEYS}, "profiles": profiles}
 
 
+def _merge_binary_fills(runs: list[tuple[str, dict]]) -> dict | None:
+    """BIN15 P5 (F7): dedupe prediction-class FILLS across the day's units.
+
+    A day is audited as several bounded units of the same run, and O10's
+    carry head deliberately overlaps the tail of one unit with the head
+    of the next so an open binary can find its own settlement. That
+    overlap is what makes a re-cut safe and it is also how one entry can
+    land in two units — after which the day's binary numbers say a trade
+    happened twice, and nothing in the report contradicts them.
+
+    Identity is ``(oid, ts_ns, sym, qty_1e6)``: the tuple that makes a
+    fill itself rather than a fill-shaped total. This does NOT rewrite
+    the summed P&L — the units' own numbers are what the harness
+    produced — it says how many of the day's binary fills were counted
+    more than once, so a report that is double-counting says so instead
+    of reading clean.
+
+    ``None`` when no unit carried the block, which is every root without
+    binaries: the merged report is then byte-identical to a pre-P5 one.
+    """
+    seen: set[tuple[int, int, int, int]] = set()
+    rows = 0
+    duplicates = 0
+    undigested = 0
+    present = False
+    for _name, obj in runs:
+        block = obj.get("binary_fills")
+        if not isinstance(block, dict):
+            continue
+        present = True
+        undigested += int(block.get("undigested", 0) or 0)
+        for r in block.get("rows") or []:
+            key = (
+                int(r["oid"]),
+                int(r["ts_ns"]),
+                int(r["sym"]),
+                int(r["qty_1e6"]),
+            )
+            rows += 1
+            if key in seen:
+                duplicates += 1
+            else:
+                seen.add(key)
+    if not present:
+        return None
+    return {
+        "rows": rows,
+        "unique": len(seen),
+        "duplicates": duplicates,
+        "undigested": undigested,
+    }
+
+
 def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
     """Fold per-run audit-pnl JSONs into one day report (same top-level
     shape, ``audit_pnl_version`` 1, additive keys). Sums are exact to
@@ -455,10 +508,12 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
             "fee_ladder_net_usd": [f"{v:.6f}" for v in acc["fee_ladder_net_usd"]],
             "per_day_net_usd": [{"day": 0, "net_usd": f"{acc['net_usd']:.6f}"}],
         })
+    binary_fills = _merge_binary_fills(runs)
     return {
         "audit_pnl_version": AUDIT_PNL_VERSION,
         "day": day,
         "runs": len(runs),
+        **({"binary_fills": binary_fills} if binary_fills is not None else {}),
         "window": {"wall_first_ns": wall_first, "wall_last_ns": wall_last, "utc_days": 1},
         "paper": {"fills": paper_fills, "net_usd": f"{paper_net:.6f}"},
         "strategies": strategies,
@@ -674,6 +729,24 @@ def run_day(
             f"worst_run_dd={row['max_drawdown_usd']} ioc_fills={row['ioc_fills']} "
             f"ioc_canceled={row['ioc_canceled']} ttl_expired={row['ttl_expired']} "
             f"ladder(0/1/2 bps)={row['fee_ladder_net_usd']}"
+        )
+    bf = merged.get("binary_fills")
+    if isinstance(bf, dict):
+        note = ""
+        if bf["duplicates"]:
+            note = (
+                f" — WARNING: {bf['duplicates']} binary fill(s) appear in more than "
+                "one unit, so this day's binary P&L is DOUBLE-COUNTED by that much. "
+                "Re-cut the overlapping windows or read the per-unit numbers."
+            )
+        if bf["undigested"]:
+            note += (
+                f" — {bf['undigested']} fill(s) were not named individually, so the "
+                "duplicate check is incomplete."
+            )
+        head.append(
+            f"binary fills: rows={bf['rows']} unique={bf['unique']} "
+            f"duplicates={bf['duplicates']}{note}"
         )
     head.extend(regime_head_lines(merged))
     summary_path.write_text("\n".join(head) + "\n\n" + "\n".join(summaries), encoding="utf-8")

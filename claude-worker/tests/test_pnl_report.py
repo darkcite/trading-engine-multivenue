@@ -500,3 +500,56 @@ def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
         fees.write_text(bad, encoding="utf-8")
         with pytest.raises(ValueError):
             claude_worker.pnl_report.load_fee_flags(fees)
+
+
+def _bf(oid: int, ts: int, sym: int = 900, qty: int = 50_000_000) -> dict:
+    return {"oid": oid, "ts_ns": ts, "sym": sym, "qty_1e6": qty}
+
+
+def test_binary_fills_are_deduped_across_overlapping_units() -> None:
+    """BIN15 P5 (F7): a fill that lands in two units is counted once.
+
+    O10's carry head deliberately overlaps the tail of one unit with the
+    head of the next so an open binary finds its own settlement. That
+    overlap is what makes a re-cut safe and it is also how one entry can
+    be counted twice — after which the day's binary numbers say a trade
+    happened that never did, and nothing else in the report contradicts
+    them.
+    """
+    unit_a = {"binary_fills": {"undigested": 0, "rows": [_bf(1, 100), _bf(2, 200)]}}
+    unit_b = {"binary_fills": {"undigested": 0, "rows": [_bf(2, 200), _bf(3, 300)]}}
+    merged = claude_worker.pnl_report.merge_reports("2026-09-13", [("a", unit_a), ("b", unit_b)])
+    bf = merged["binary_fills"]
+    assert bf["rows"] == 4
+    assert bf["unique"] == 3
+    assert bf["duplicates"] == 1, "the carried fill is named once, not twice"
+    assert bf["undigested"] == 0
+
+
+def test_a_same_oid_at_a_different_instant_is_a_different_fill() -> None:
+    """Identity is the whole tuple. A marketable IoC that sweeps two
+    price levels answers with two prints under ONE oid, and both are
+    real — collapsing them by oid would erase a fill that happened."""
+    unit = {
+        "binary_fills": {
+            "undigested": 0,
+            "rows": [_bf(1, 100, qty=20_000_000), _bf(1, 101, qty=30_000_000)],
+        }
+    }
+    merged = claude_worker.pnl_report.merge_reports("2026-09-13", [("a", unit)])
+    assert merged["binary_fills"]["duplicates"] == 0
+    assert merged["binary_fills"]["unique"] == 2
+
+
+def test_a_root_without_binaries_carries_no_block() -> None:
+    """Additive: a report built from units that never saw a binary is
+    byte-identical to a pre-P5 one."""
+    merged = claude_worker.pnl_report.merge_reports("2026-09-13", [("a", {}), ("b", {})])
+    assert "binary_fills" not in merged
+
+
+def test_an_undigested_count_is_carried_so_the_check_is_not_claimed_clean() -> None:
+    unit = {"binary_fills": {"undigested": 7, "rows": [_bf(1, 100)]}}
+    merged = claude_worker.pnl_report.merge_reports("2026-09-13", [("a", unit)])
+    assert merged["binary_fills"]["undigested"] == 7
+

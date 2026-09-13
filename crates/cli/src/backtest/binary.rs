@@ -73,7 +73,7 @@ impl BinaryInstance {
 }
 
 /// What [`register_binary_model`] configured, for the report line.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BinaryRegistration {
     /// Instances the capture named.
     pub instances: u64,
@@ -84,6 +84,18 @@ pub struct BinaryRegistration {
     /// the expiry (or its TWAP window) falls outside it, or the
     /// underlying's mark series is too thin. Left unregistered.
     pub unsettleable: u64,
+    /// BIN15 P5 (F7): WHICH instances those were.
+    ///
+    /// A count alone lets an unsettleable instance vanish: its position
+    /// marks out at the last book price, the row disappears from every
+    /// per-instance report, and a defect-6-class bug — an expiry that
+    /// lands inside the daily restart drain, so NO window ever holds
+    /// its settlement — reads as a quiet day rather than as P&L
+    /// reported nowhere. Carrying the identities lets the summary and
+    /// the sidecar say what was left open and at what cost.
+    ///
+    /// DOCTRINE: offline path — allocates freely.
+    pub unsettled: Vec<BinaryInstance>,
 }
 
 /// Least marks a TWAP settlement is computed from.
@@ -328,6 +340,7 @@ pub fn apply_binary_settlements(
         reg.instances += 1;
         if inst.settle_ns() > window_end_wall_ns || inst.expiry_ns == 0 {
             reg.unsettleable += 1;
+            reg.unsettled.push(*inst);
             continue;
         }
         let series = underlying_of
@@ -336,6 +349,7 @@ pub fn apply_binary_settlements(
             .unwrap_or(&empty);
         let Some(value) = settle_value(series, inst) else {
             reg.unsettleable += 1;
+            reg.unsettled.push(*inst);
             continue;
         };
         engine.set_binary_settle(
@@ -597,7 +611,8 @@ mod tests {
             BinaryRegistration {
                 instances: 2,
                 settled: 2,
-                unsettleable: 0
+                unsettleable: 0,
+                unsettled: Vec::new()
             }
         );
 

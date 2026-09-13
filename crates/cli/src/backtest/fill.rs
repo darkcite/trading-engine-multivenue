@@ -527,6 +527,36 @@ impl BoundsTracker {
 // Outcome surfaces
 // ---------------------------------------------------------------
 
+/// BIN15 P5 (F7): the identity of ONE prediction-class fill.
+///
+/// A day report merges several ≤ 2 h units of the same run, and O10's
+/// carry head deliberately overlaps the tail of one unit with the head
+/// of the next so an open binary can find its own settlement. Overlap
+/// is what makes a re-cut safe and it is also what makes DOUBLE
+/// COUNTING possible: the same entry can appear in two units, and the
+/// day's binary numbers then say a trade happened twice.
+///
+/// `(client_oid, ts_ns, sym, qty_1e6)` is the tuple that makes a fill
+/// itself rather than a fill-shaped total, so the merge can tell one
+/// print from two.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BinaryFillId {
+    /// The emitting order's `client_oid`.
+    pub client_oid: u64,
+    /// Wall ns the fill was booked at.
+    pub ts_ns: u64,
+    /// The prediction-class sym.
+    pub sym: u32,
+    /// Contracts ×1e6, signed by side (`Ask` negative).
+    pub qty_1e6: i64,
+}
+
+/// The most prediction-class fills one engine will name individually.
+/// Past it the digest counts instead of listing — a day report is not
+/// a trade blotter, and the merge only needs the identities it can
+/// actually compare.
+pub const BINARY_FILL_DIGEST_MAX: usize = 100_000;
+
 /// Scalar results of the model after `finish` (×1e12 kept exact; the
 /// render layer converts with explicit direction).
 #[derive(Copy, Clone, Debug)]
@@ -609,6 +639,26 @@ pub struct ModelOutcome {
     /// invent P&L the strategy could never have had. Prediction-class
     /// syms only; every other class is untouched.
     pub prediction_grid_refused: u64,
+    /// BIN15 P4a (F3): contracts ×1e6 of ASK fills on a prediction-class
+    /// sym that were DROPPED because the harness's own running long did
+    /// not cover them.
+    ///
+    /// A HIP-4 position cannot go negative: the two sides of a binary
+    /// are two separate instruments and the venue rejects a sell of
+    /// something you do not hold, outright, at submit. A paper fill of
+    /// one is a FABRICATED TRADE — and not a small one, because the
+    /// fabricated short then marks out against the settlement and books
+    /// a P&L with no position behind it. Non-zero here means the
+    /// strategy asked for something the venue would have refused, and
+    /// the number it would have refused.
+    pub prediction_short_refused_1e6: i64,
+    /// BIN15 P4a: how many such fills were clipped (whole or partial).
+    pub prediction_short_refused_fills: u64,
+    /// BIN15 P5 (F7): prediction-class fills this engine booked but did
+    /// NOT name in its digest, because the digest was full. A non-zero
+    /// value means the day merge's duplicate check is incomplete and
+    /// says so rather than claiming a clean merge.
+    pub binary_fills_undigested: u64,
     /// BIN15 O3: binary instances closed at their settlement value.
     /// Unlike `opt_settled` this can exceed the number of SYMS — one
     /// rolling slot settles once per period.
@@ -731,6 +781,12 @@ pub struct FillEngine {
     /// when the instance settles.
     binary_halted: BTreeSet<u32>,
     prediction_grid_refused: u64,
+    /// BIN15 P4a (F3): see [`ModelOutcome::prediction_short_refused_1e6`].
+    prediction_short_refused_1e6: i64,
+    prediction_short_refused_fills: u64,
+    /// BIN15 P5 (F7): see [`BinaryFillId`]. Offline path — allocates.
+    binary_fills: Vec<BinaryFillId>,
+    binary_fills_undigested: u64,
     binary_settled: u64,
     /// VX-A: the earliest expiry still un-pinned, so the per-record
     /// cost of the whole rung is ONE integer compare. `u64::MAX` =
@@ -798,6 +854,10 @@ impl FillEngine {
             binary_due_ns: u64::MAX,
             binary_halted: BTreeSet::new(),
             prediction_grid_refused: 0,
+            prediction_short_refused_1e6: 0,
+            prediction_short_refused_fills: 0,
+            binary_fills: Vec::new(),
+            binary_fills_undigested: 0,
             binary_settled: 0,
             settle_due_ns: u64::MAX,
             last_wall_ns: 0,
@@ -1363,6 +1423,32 @@ impl FillEngine {
             || (px as i128 * qty as i128) / 1_000_000 < i128::from(PREDICTION_MIN_NOTIONAL_1E6)
     }
 
+    /// BIN15 P5 (F7): every prediction-class fill this engine booked,
+    /// in the order it booked them. See [`BinaryFillId`].
+    ///
+    /// DOCTRINE: offline path.
+    #[must_use]
+    pub fn binary_fills(&self) -> &[BinaryFillId] {
+        &self.binary_fills
+    }
+
+    /// BIN15 P5 (F7): the FULL book's holding in `sym` — signed
+    /// contracts ×1e6 and the signed open cost ×1e12.
+    ///
+    /// The open cost is what an unsettled instance's position was paid
+    /// for, which is the number the day report has to carry when the
+    /// payout is unknowable: "$412 of entries whose outcome this window
+    /// cannot see" is a report; a silently vanished row is not.
+    ///
+    /// DOCTRINE: offline path.
+    #[must_use]
+    pub fn open_position(&self, sym: u32) -> (i64, i128) {
+        match self.full.entries.get(&sym) {
+            Some(e) => (e.qty_1e6, e.cost_1e12),
+            None => (0, 0),
+        }
+    }
+
     /// BIN15 O3: append one instance's settlement schedule for `sym`.
     ///
     /// Entries are kept sorted by `halt_ns` and consumed oldest-first,
@@ -1645,6 +1731,36 @@ impl FillEngine {
         out: &mut Vec<SynthFill>,
     ) {
         debug_assert!(fill_px > 0 && fill_qty > 0);
+        // BIN15 P4a (F3): THE VENUE HAS NO SHORT on a prediction-class
+        // instrument. An ask beyond the running long is an order the
+        // venue rejects at submit, so a paper fill of it invents a
+        // trade — and the invented short then settles at the payout and
+        // books P&L against a position that never existed. The clamp is
+        // on the FULL book, because that book is the physical holding;
+        // the OOS book is an accounting scope that starts flat at the
+        // boundary and is not what the venue would have looked at.
+        //
+        // The remainder is DROPPED, not deferred: the venue refused the
+        // whole order, and the displayed size it consumed upstream is
+        // the conservative direction to be wrong in.
+        let fill_qty = if o.side == Side::Ask
+            && self.sym_class.get(&o.sym) == Some(&InstrumentClass::Prediction)
+        {
+            let held = self.full.pos_qty_1e6(o.sym).max(0);
+            let allowed = fill_qty.min(held);
+            if allowed < fill_qty {
+                self.prediction_short_refused_1e6 = self
+                    .prediction_short_refused_1e6
+                    .saturating_add(fill_qty - allowed);
+                self.prediction_short_refused_fills += 1;
+            }
+            if allowed <= 0 {
+                return;
+            }
+            allowed
+        } else {
+            fill_qty
+        };
         let notional_1e12 = fill_px as i128 * fill_qty as i128;
         let fee_1e12 = self.fee_for(o.sym, notional_1e12, fill_qty, fee_bps, wall_ns);
         self.full
@@ -1658,6 +1774,23 @@ impl FillEngine {
             self.oos_days.insert(wall_ns / DAY_NS);
         }
         self.fills_total += 1;
+        // BIN15 P5 (F7): name every prediction-class fill so a day
+        // merge over OVERLAPPING units can tell a re-cut from a repeat.
+        if self.sym_class.get(&o.sym) == Some(&InstrumentClass::Prediction) {
+            if self.binary_fills.len() < BINARY_FILL_DIGEST_MAX {
+                self.binary_fills.push(BinaryFillId {
+                    client_oid: o.client_oid,
+                    ts_ns: wall_ns,
+                    sym: o.sym,
+                    qty_1e6: match o.side {
+                        Side::Bid => fill_qty,
+                        Side::Ask => -fill_qty,
+                    },
+                });
+            } else {
+                self.binary_fills_undigested += 1;
+            }
+        }
         out.push(SynthFill {
             sym: o.sym,
             side: o.side,
@@ -1708,6 +1841,9 @@ impl FillEngine {
             ttl_expired: self.ttl_expired,
             opt_settled: self.opt_settled,
             prediction_grid_refused: self.prediction_grid_refused,
+            prediction_short_refused_1e6: self.prediction_short_refused_1e6,
+            prediction_short_refused_fills: self.prediction_short_refused_fills,
+            binary_fills_undigested: self.binary_fills_undigested,
             binary_settled: self.binary_settled,
             settled_sym_orders_canceled: self.settled_sym_orders_canceled,
             fee_class_unknown_fills: self.fee_class_unknown_fills,
@@ -2142,6 +2278,89 @@ mod tests {
     /// A tick whose ask strictly crosses 0.50.
     fn crossing_tick() -> Tick {
         tick(hl_slot_sym(), 300_000, 500_000_000, 400_000, 500_000_000)
+    }
+
+    /// BIN15 P4a (F3): the venue has NO SHORT, so neither does the
+    /// harness.
+    ///
+    /// A HIP-4 position cannot go negative — the two sides of a binary
+    /// are two separate instruments, and the venue rejects a sell of
+    /// something you do not hold at submit. The harness used to fill it
+    /// anyway: the O10 window's reported −$73.28 carried a 138-contract
+    /// paper SHORT that the venue would never have accepted, and that
+    /// fabricated position then settled at the payout and booked P&L
+    /// with nothing behind it.
+    ///
+    /// Now the ask is clamped at the running long, the remainder is
+    /// dropped, and the drop is COUNTED — because a strategy asking for
+    /// something impossible is a finding, not a rounding.
+    #[test]
+    fn an_ask_beyond_the_running_long_is_refused_not_filled() {
+        let sym = hl_slot_sym();
+        let mut e = binary_engine();
+        let mut out = Vec::new();
+        // Flat, and an ask of 100 contracts: the venue refuses it
+        // ENTIRELY, so nothing fills and nothing is counted as a trade.
+        e.intake(&order(sym, Side::Ask, 400_000, 100_000_000, 1), 1_000);
+        e.on_record(
+            &tick(sym, 500_000, 500_000_000, 600_000, 500_000_000),
+            2_000,
+            2_000,
+            &mut out,
+        );
+        assert!(out.is_empty(), "a short from flat is not a fill: {out:?}");
+        assert!(
+            e.full.pos_qty_1e6(sym) >= 0,
+            "position went negative: {}",
+            e.full.pos_qty_1e6(sym)
+        );
+        assert_eq!(e.prediction_short_refused_fills, 1);
+        assert_eq!(e.prediction_short_refused_1e6, 100_000_000);
+
+        // Buy 60, then try to sell 100: 60 fill, 40 are refused.
+        e.intake(&grid_bid(2), 3_000);
+        e.on_record(&crossing_tick(), 4_000, 4_000, &mut out);
+        let bought = e.full.pos_qty_1e6(sym);
+        assert_eq!(bought, 100_000_000, "the buy is untouched");
+        out.clear();
+        e.intake(&order(sym, Side::Ask, 300_000, 140_000_000, 3), 5_000);
+        e.on_record(
+            &tick(sym, 400_000, 500_000_000, 500_000, 500_000_000),
+            6_000,
+            6_000,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the coverable part DOES fill");
+        assert_eq!(out[0].qty_1e6, 100_000_000, "clamped at the holding");
+        assert_eq!(e.full.pos_qty_1e6(sym), 0, "flat, never short");
+        assert_eq!(e.prediction_short_refused_fills, 2);
+        assert_eq!(
+            e.prediction_short_refused_1e6,
+            100_000_000 + 40_000_000,
+            "and the refused contracts are named"
+        );
+    }
+
+    /// The clamp is PREDICTION-CLASS ONLY. A perp short is an ordinary
+    /// position and must still fill from flat, or the law would have
+    /// silently rewritten every other lane's P&L.
+    #[test]
+    fn a_short_on_any_other_class_is_untouched() {
+        let sym = make_symbol_id(VenueId::Binance, 7);
+        let mut e = FillEngine::new(pred_params(None), u64::MAX / 2);
+        e.set_sym_class(sym, InstrumentClass::Perp);
+        let mut out = Vec::new();
+        e.intake(&order(sym, Side::Ask, 400_000, 100_000_000, 1), 1_000);
+        e.on_record(
+            &tick(sym, 500_000, 500_000_000, 600_000, 500_000_000),
+            2_000,
+            2_000,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "a perp short is a position, not an error");
+        assert_eq!(e.full.pos_qty_1e6(sym), -100_000_000);
+        assert_eq!(e.prediction_short_refused_fills, 0);
+        assert_eq!(e.finish().prediction_short_refused_1e6, 0);
     }
 
     /// The slot-reuse law: one sym, three instances, each settling on

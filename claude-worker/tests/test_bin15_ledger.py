@@ -242,3 +242,143 @@ def test_a_missing_sidecar_is_refused(tmp_path: pathlib.Path) -> None:
         )
         == 2
     )
+
+
+def test_a_pre_p3_ledger_still_reads_and_says_it_does_not_know(tmp_path) -> None:
+    """BIN15 P3.3 (F6): the ``entered`` column is ADDITIVE.
+
+    An eight-column ledger was written before the column existed. Its
+    rows are real observations and must keep reading; what they cannot
+    say is which instances were paid for, and the marker for that is
+    -1 and not 0 — "we do not know" and "the member declined to pay"
+    are different facts and a split by ``entered`` must not file the
+    first as the second.
+    """
+    old = tmp_path / "ledger.tsv"
+    old.write_text(
+        "# a pre-P3 ledger\n"
+        "1000\t0\t7\t900000000000\t600000\t580000\t0\t1000000\n"
+        "2000\t0\t7\t600000000000\t610000\t590000\t0\t1000000\n",
+        encoding="utf-8",
+    )
+    rows = claude_worker.bin15_ledger.read_ledger(old)
+    assert len(rows) == 2
+    assert all(r.entered == claude_worker.bin15_ledger.ENTERED_UNKNOWN for r in rows)
+    assert all(r.settled for r in rows)
+    # And the calibration still runs over them: the gate counts settled
+    # observations, never fills.
+    table = claude_worker.bin15_ledger.calibration(rows)
+    assert sum(t.rows for t in table) == 2
+
+
+def test_entered_round_trips_through_the_sidecar_and_the_file(tmp_path) -> None:
+    """The column survives sidecar -> merge -> file -> read."""
+    sidecar = json.dumps(
+        {
+            "bin15_ledger": [
+                {
+                    "ts_ns": 1000,
+                    "family": 0,
+                    "outcome": 7,
+                    "tau_ns": 900_000_000_000,
+                    "p_hat_1e6": 600_000,
+                    "p_raw_1e6": 580_000,
+                    "arm": 0,
+                    "entered": 0,
+                    "y": 1_000_000,
+                },
+                {
+                    "ts_ns": 2000,
+                    "family": 0,
+                    "outcome": 7,
+                    "tau_ns": 600_000_000_000,
+                    "p_hat_1e6": 610_000,
+                    "p_raw_1e6": 590_000,
+                    "arm": 0,
+                    "entered": 1,
+                    "y": 1_000_000,
+                },
+            ]
+        }
+    )
+    rows = claude_worker.bin15_ledger.rows_from_sidecar(sidecar)
+    assert [r.entered for r in rows] == [0, 1]
+    path = tmp_path / "ledger.tsv"
+    merged, added = claude_worker.bin15_ledger.merge([], rows)
+    assert added == 2
+    claude_worker.bin15_ledger.write_ledger(path, merged)
+    back = claude_worker.bin15_ledger.read_ledger(path)
+    assert [r.entered for r in back] == [0, 1]
+    assert [r.y for r in back] == [1_000_000, 1_000_000]
+    # The instance was ENTERED (the flag goes up mid-instance and never
+    # comes down), and it is settled, so it counts in both populations.
+    assert {r.outcome for r in back if r.entered == 1} == {7}
+
+
+def test_a_sidecar_without_the_column_is_unknown_not_zero() -> None:
+    sidecar = json.dumps(
+        {
+            "bin15_ledger": [
+                {
+                    "ts_ns": 1000,
+                    "family": 0,
+                    "outcome": 7,
+                    "tau_ns": 900_000_000_000,
+                    "p_hat_1e6": 600_000,
+                    "p_raw_1e6": 580_000,
+                    "arm": 0,
+                    "y": None,
+                }
+            ]
+        }
+    )
+    rows = claude_worker.bin15_ledger.rows_from_sidecar(sidecar)
+    assert rows[0].entered == claude_worker.bin15_ledger.ENTERED_UNKNOWN
+    assert rows[0].mid_1e6 == claude_worker.bin15_ledger.MID_UNKNOWN
+    assert not rows[0].settled
+
+
+def test_the_venue_mid_travels_on_the_row_and_round_trips(tmp_path) -> None:
+    """BIN15 P6: the skill gate is ``Brier(p_hat) < Brier(venue mid)`` at
+    the SAME instants, so the benchmark has to be on the row. A
+    one-sided book has no mid and says so with -1 rather than a made-up
+    number that would flatter whichever side it favoured."""
+    sidecar = json.dumps(
+        {
+            "bin15_ledger": [
+                {
+                    "ts_ns": 1000,
+                    "family": 0,
+                    "outcome": 7,
+                    "tau_ns": 900_000_000_000,
+                    "p_hat_1e6": 600_000,
+                    "p_raw_1e6": 580_000,
+                    "arm": 0,
+                    "entered": 1,
+                    "mid_1e6": 615_000,
+                    "y": 1_000_000,
+                },
+                {
+                    "ts_ns": 2000,
+                    "family": 0,
+                    "outcome": 7,
+                    "tau_ns": 600_000_000_000,
+                    "p_hat_1e6": 610_000,
+                    "p_raw_1e6": 590_000,
+                    "arm": 0,
+                    "entered": 1,
+                    "mid_1e6": -1,
+                    "y": 1_000_000,
+                },
+            ]
+        }
+    )
+    rows = claude_worker.bin15_ledger.rows_from_sidecar(sidecar)
+    assert [r.mid_1e6 for r in rows] == [615_000, -1]
+    path = tmp_path / "ledger.tsv"
+    merged, _ = claude_worker.bin15_ledger.merge([], rows)
+    claude_worker.bin15_ledger.write_ledger(path, merged)
+    back = claude_worker.bin15_ledger.read_ledger(path)
+    assert [r.mid_1e6 for r in back] == [615_000, -1]
+    assert [r.entered for r in back] == [1, 1]
+
