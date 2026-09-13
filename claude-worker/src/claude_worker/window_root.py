@@ -50,6 +50,7 @@ import time
 import typing
 
 import claude_worker.iv_digest
+import claude_worker.hip4
 import claude_worker.regime
 import claude_worker.seeds
 import claude_worker.vrp_seed
@@ -226,6 +227,7 @@ def cut_run(
     report: typing.Callable[[str], None] | None = None,
     seed: tuple[pathlib.Path, pathlib.Path] | None = None,
     vrp: pathlib.Path | None = None,
+    empty: frozenset[str] = frozenset(),
 ) -> pathlib.Path:
     """Materialise the window ``[from_s, to_s)`` of ``run_dir`` under
     ``dst_root`` as ``run-<epoch + from_s>``; returns the new run dir.
@@ -266,7 +268,15 @@ def cut_run(
         if (run_dir / m).is_file():
             shutil.copyfile(run_dir / m, out_dir / m)
     for p in sorted(run_dir.glob("*.pmlr")):
-        total, kept = _cut_file(p, out_dir / p.name, lo_ts, hi_ts, new_epoch)
+        # BIN15 O10: a file named in `empty` is cut over a range that
+        # selects NOTHING, so the window carries a valid-but-empty one
+        # rather than no file at all — a consumer that expects the
+        # name still finds it. Used for the carry head's
+        # `engine-orders.pmlr`: the head exists to SETTLE a position
+        # opened in the previous run, and replaying its orders too
+        # would count them in two units.
+        a, b = (hi_ts, hi_ts) if p.name in empty else (lo_ts, hi_ts)
+        total, kept = _cut_file(p, out_dir / p.name, a, b, new_epoch)
         if report is not None:
             report(f"window-root: {run_dir.name} {p.name} {total} -> {kept} ({from_s:.0f}..{to_s:.0f} s)")
     if seed is not None and seed[0].is_file() and seed[1].is_file():
@@ -344,6 +354,71 @@ def pool_dir_for(db_path: pathlib.Path) -> pathlib.Path:
     """``<worker dir>/windows`` beside ``state.db`` (the ``regime_dir_for``
     precedent — no new env key)."""
     return db_path.parent / POOL_DIRNAME
+
+
+#: BIN15 O10: files the carry head deliberately carries EMPTY.
+CARRY_EMPTY: frozenset[str] = frozenset({"engine-orders.pmlr"})
+
+#: BIN15 O10: slack past the last carried settlement instant, so the
+#: TWAP window is fully inside the head even with a late mark.
+CARRY_MARGIN_S: float = 30.0
+
+
+def carry_wanted(run_dir: pathlib.Path) -> bool:
+    """BIN15 O10: whether ``run_dir`` ends with a HIP-4 instance still
+    open — i.e. whether a carry head would change the audit."""
+    return bool(claude_worker.hip4.open_at_end(run_dir))
+
+
+def carry_head(
+    dst_root: pathlib.Path,
+    run_dir: pathlib.Path,
+    next_run: pathlib.Path,
+    report: typing.Callable[[str], None] | None = None,
+) -> pathlib.Path | None:
+    """BIN15 O10: add the head of ``next_run`` to ``dst_root`` so the
+    HIP-4 instances still open at ``run_dir``'s end can SETTLE.
+
+    A 15 m binary opened in the last minutes of a run settles in the
+    NEXT one. `audit-pnl` merges every run dir in a root onto one
+    virtual timeline with one fill engine per strategy, so putting the
+    two together is all it takes for the payout to find its entry —
+    without it the entry books as markout in one unit and the payout
+    lands on a flat book in the next, and the trade's P&L is reported
+    nowhere (the 2026-09-12 −8.35 was exactly this).
+
+    The head carries ticks and events but an EMPTY `engine-orders.pmlr`
+    (`CARRY_EMPTY`), so `next_run`'s own orders are still counted
+    exactly once — in `next_run`'s own unit.
+
+    Returns the cut, or ``None`` when nothing is open, the venue clock
+    cannot be read, or the settlement instant precedes the next run.
+    """
+    carried = claude_worker.hip4.open_at_end(run_dir)
+    if not carried:
+        return None
+    off = claude_worker.hip4.venue_wall_offset_ns(next_run)
+    span = run_span(next_run)
+    if off is None or span is None:
+        if report is not None:
+            report(f"window-root: {next_run.name}: no venue clock — carry head skipped")
+        return None
+    start_wall = span[0] + off
+    need_wall = max(r.expiry_ns + r.twap_s * 1_000_000_000 for r in carried)
+    carry_s = (need_wall - start_wall) / 1e9 + CARRY_MARGIN_S
+    if carry_s <= 0:
+        return None
+    carry_s = min(carry_s, WINDOW_MAX_S, (span[1] - span[0]) / 1e9)
+    if carry_s <= 0:
+        return None
+    cut = cut_run(next_run, dst_root, 0.0, carry_s, report=None, empty=CARRY_EMPTY)
+    if report is not None:
+        names = ",".join(str(r.outcome) for r in carried)
+        report(
+            f"window-root: carry head {next_run.name} 0..{carry_s:.0f}s"
+            f" to settle {len(carried)} open instance(s) [{names}]"
+        )
+    return cut
 
 
 def complete_windows(run_dir: pathlib.Path, window_s: float = WINDOW_MAX_S) -> list[tuple[float, float]]:

@@ -214,7 +214,13 @@ def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
     seen: list[tuple[str, int]] = []
 
     def fn(argv):
-        d = pathlib.Path(argv[3])
+        # BIN15 O10: a unit is a ROOT holding its run dir(s), so the
+        # cut is one level down — the shape `audit-pnl --dir` already
+        # documents for a replay root.
+        root = pathlib.Path(argv[3])
+        runs = sorted(q for q in root.iterdir() if q.name.startswith("run-"))
+        assert len(runs) == 1, runs
+        d = runs[0]
         n = len(list(claude_worker.pmlr.Reader(d / "pm-ticks.pmlr").ticks()))
         seen.append((d.name, n))
         assert (d / "instrument-manifest.tsv").is_file()
@@ -226,7 +232,7 @@ def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
     rc = claude_worker.pnl_report.run_day(logs, tmp_path / "reports", day, lines.append, run_fn=fn, window_root=root)
     assert rc == 0, lines
     assert seen == [(f"run-{epoch}", 2), (f"run-{epoch + 7_200 * 10**9}", 1)]
-    assert not any(root.glob("run-*")), "window cuts are deleted after their audit"
+    assert not any(root.glob("unit-*")), "window units are deleted after their audit"
     obj = json.loads((tmp_path / "reports" / f"pnl-{day}.json").read_text())
     assert obj["runs"] == 2
     assert [r["run"] for r in obj["runs_detail"]] == [f"run-{epoch}@0s", f"run-{epoch}@7200s"]

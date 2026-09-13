@@ -529,11 +529,22 @@ def _audit_units(
     run_dir: pathlib.Path,
     window_root: pathlib.Path | None,
     report: typing.Callable[[str], None],
+    next_run: pathlib.Path | None = None,
 ) -> list[tuple[str, pathlib.Path, bool]]:
     """(label, dir to audit, is_temporary) per ≤ 2 h window of the run —
     the capture-window law; a run without ticks (or windowing off)
     audits as-is. Every cut carries its own ``regime-seed.tsv`` when the
-    artifact + candles.db exist (RG3)."""
+    artifact + candles.db exist (RG3).
+
+    BIN15 O10: a unit is a ROOT that may hold more than one run dir.
+    When HIP-4 instances are still open at the run's end, the head of
+    ``next_run`` — ticks and events, an EMPTY orders file — joins the
+    last unit so those positions SETTLE against their own entry.
+    `audit-pnl` merges every run dir in a root onto one virtual
+    timeline with one fill engine per strategy, so that is all it
+    takes. Without it the entry books as markout in one unit and the
+    payout lands on a flat book in the next.
+    """
     if window_root is None:
         return [(run_dir.name, run_dir, False)]
     try:
@@ -541,18 +552,54 @@ def _audit_units(
     except claude_worker.window_root.WindowError as exc:
         report(f"pnl-report: {run_dir.name}: cannot window ({exc}) — auditing whole")
         return [(run_dir.name, run_dir, False)]
-    if len(windows) <= 1:
+    carried = (
+        claude_worker.window_root.carry_wanted(run_dir) if next_run is not None else False
+    )
+    if len(windows) <= 1 and not carried:
+        # The fast path: nothing open, one window — audit the run in
+        # place and copy nothing.
         return [(run_dir.name, run_dir, False)]
     units: list[tuple[str, pathlib.Path, bool]] = []
     seed = regime_seed_inputs()
-    for lo, hi in windows:
+    if len(windows) <= 1:
+        # One window, but something is open: a unit root holding a
+        # SYMLINK to the run (no copy) plus the carry head.
+        root = window_root / f"unit-{run_dir.name}"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        (root / run_dir.name).symlink_to(run_dir, target_is_directory=True)
+        _carry(root, run_dir, next_run, report)
+        return [(run_dir.name, root, True)]
+    for i, (lo, hi) in enumerate(windows):
+        root = window_root / f"unit-{run_dir.name}-{lo:.0f}"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
         try:
-            cut = claude_worker.window_root.cut_run(run_dir, window_root, lo, hi, seed=seed)
+            claude_worker.window_root.cut_run(run_dir, root, lo, hi, seed=seed)
         except claude_worker.window_root.WindowError as exc:
             report(f"pnl-report: {run_dir.name}: window {lo:.0f}..{hi:.0f} s failed ({exc})")
+            shutil.rmtree(root, ignore_errors=True)
             continue
-        units.append((f"{run_dir.name}@{lo:.0f}s", cut, True))
+        if i == len(windows) - 1:
+            _carry(root, run_dir, next_run, report)
+        units.append((f"{run_dir.name}@{lo:.0f}s", root, True))
     return units
+
+
+def _carry(
+    root: pathlib.Path,
+    run_dir: pathlib.Path,
+    next_run: pathlib.Path | None,
+    report: typing.Callable[[str], None],
+) -> None:
+    """BIN15 O10: best-effort carry head; a failure costs the old
+    markout-only shape, never the unit."""
+    if next_run is None:
+        return
+    try:
+        claude_worker.window_root.carry_head(root, run_dir, next_run, report=report)
+    except claude_worker.window_root.WindowError as exc:
+        report(f"pnl-report: {run_dir.name}: carry head failed ({exc}) — markout only")
 
 
 def run_day(
@@ -582,8 +629,9 @@ def run_day(
     failed: list[str] = []
     summaries: list[str] = []
     units: list[tuple[str, pathlib.Path, bool]] = []
-    for run_dir in runs:
-        units.extend(_audit_units(run_dir, window_root, report))
+    for i, run_dir in enumerate(runs):
+        nxt = runs[i + 1] if i + 1 < len(runs) else None
+        units.extend(_audit_units(run_dir, window_root, report, next_run=nxt))
     for label, unit_dir, temporary in units:
         argv = [claude_worker.backtest.ENGINE_BINARY, "audit-pnl", "--dir", str(unit_dir)] + flags
         code, out, err = fn(argv)

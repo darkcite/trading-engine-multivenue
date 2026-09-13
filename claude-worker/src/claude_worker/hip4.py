@@ -28,9 +28,13 @@ Offline only -- nothing here runs in the engine.
 
 import dataclasses
 import pathlib
+import statistics
 import typing
 
 import claude_worker.pmlr
+
+#: Ticks sampled when fitting the venue-wall offset (BIN15 O10).
+_OFFSET_SAMPLES: int = 4000
 
 #: Grammar of a parsed description -- mirrors ``HlOutcomeGrammar``.
 GRAMMAR_UNKNOWN: int = 0
@@ -240,6 +244,81 @@ def unpack_roll_seq(seq: int) -> tuple[int, int, int, bool]:
         (seq >> 48) & 0xFF,
         bool((seq >> 56) & 1),
     )
+
+
+def venue_wall_offset_ns(run_dir: pathlib.Path) -> int | None:
+    """Nanoseconds to ADD to a capture's monotonic stamp to get the
+    VENUE's wall clock, or ``None`` when the run carries no venue time.
+
+    A HIP-4 expiry is a wall instant; every stamp in a capture is
+    monotonic-since-boot. The v3 tick's ``venue_time_ms`` is the venue's
+    own clock against that stamp, so their median difference is the
+    mapping — accurate to the feed delay (~100-300 ms on this venue).
+
+    NOT ``pmlr.run_anchor_ns``: that anchor is the run's FIRST TICK,
+    which arrives 10-18 s after the run directory's epoch, so pairing
+    the two reads ~15 s early — enough to miss a 60 s TWAP window's
+    edge. Measured against the settled rolls, this mapping puts every
+    settlement publication 6-14 s AFTER its expiry, which is the
+    venue's own lag; the anchor mapping put them BEFORE it, which is
+    impossible.
+    """
+    f = run_dir / "hl-ticks.pmlr"
+    if not f.is_file():
+        return None
+    offs: list[int] = []
+    try:
+        with claude_worker.pmlr.Reader(f) as reader:
+            if not reader.has_venue_time or len(reader) == 0:
+                return None
+            n = len(reader)
+            step = max(1, n // _OFFSET_SAMPLES)
+            for i in range(0, n, step):
+                tick = reader.tick(i)
+                if tick.venue_time_ms:
+                    offs.append(tick.venue_time_ms * 1_000_000 - tick.ts_ns)
+    except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+        return None
+    return int(statistics.median(offs)) if offs else None
+
+
+def open_at_end(run_dir: pathlib.Path) -> list[Roll]:
+    """Instances CREATED in ``run_dir`` whose settlement instant falls
+    after the run's last record — the positions a per-run audit can
+    open but never close.
+
+    Empty when the run carries no rolls, or no venue time to place
+    them on the wall clock.
+    """
+    off = venue_wall_offset_ns(run_dir)
+    if off is None:
+        return []
+    last = _last_mono_ts(run_dir)
+    if last is None:
+        return []
+    end_wall = last + off
+    out: list[Roll] = []
+    for roll in read_rolls(run_dir):
+        if roll.settled or not roll.expiry_ns:
+            continue
+        if roll.expiry_ns + roll.twap_s * 1_000_000_000 > end_wall:
+            out.append(roll)
+    return out
+
+
+def _last_mono_ts(run_dir: pathlib.Path) -> int | None:
+    """The newest monotonic stamp across the run's tick files."""
+    last: int | None = None
+    for path in sorted(run_dir.glob("*-ticks.pmlr")):
+        try:
+            with claude_worker.pmlr.Reader(path) as reader:
+                if len(reader) == 0:
+                    continue
+                ts = reader.tick(len(reader) - 1).ts_ns
+        except (claude_worker.pmlr.PmlrError, OSError, ValueError):
+            continue
+        last = ts if last is None else max(last, ts)
+    return last
 
 
 def read_rolls(run_dir: pathlib.Path, venue: str = "hl") -> list[Roll]:

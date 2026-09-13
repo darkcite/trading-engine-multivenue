@@ -361,3 +361,29 @@ def test_campaign_cut_skips_a_slice_no_run_covers(tmp_path):
     )
     assert len(made) == 6, lines
     assert sum("has no run - skipped" in line for line in lines) == 3
+
+
+def test_carry_head_is_skipped_when_nothing_is_open(tmp_path):
+    """BIN15 O10: a run with no HIP-4 instance open at its end needs no
+    carry head, and `carry_wanted` says so without building one."""
+    run = _mk_run(tmp_path, [1_000, 1_000 + 60 * S])
+    nxt = tests.craft.write_run(tmp_path / "logs2", EPOCH + 7_200 * S, [1_000, 1_000 + 60 * S])
+    assert claude_worker.window_root.carry_wanted(run) is False
+    root = tmp_path / "unit"
+    root.mkdir()
+    assert claude_worker.window_root.carry_head(root, run, nxt) is None
+    assert not list(root.iterdir()), "nothing open, nothing carried"
+
+
+def test_an_empty_cut_file_is_valid_and_holds_no_records(tmp_path):
+    """BIN15 O10: `cut_run(empty=...)` writes a readable pmlr with zero
+    records, so the carry head can carry the venue's marks WITHOUT
+    replaying the next run's orders — which would count them twice."""
+    run = _mk_run(tmp_path, [1_000, 1_000 + 60 * S, 1_000 + 120 * S])
+    cut = claude_worker.window_root.cut_run(
+        run, tmp_path / "dst", 0.0, 600.0, empty=frozenset({"pm-ticks.pmlr"})
+    )
+    with claude_worker.pmlr.Reader(cut / "pm-ticks.pmlr") as reader:
+        assert len(reader) == 0, "the named file is emptied"
+    others = [q for q in cut.glob("*.pmlr") if q.name != "pm-ticks.pmlr"]
+    assert others, "the cut still carries the rest of the run"
