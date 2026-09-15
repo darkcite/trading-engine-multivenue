@@ -1,0 +1,13 @@
+[package]
+name         = "exec-hyperliquid"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Hyperliquid L1 exchange actions: zero-alloc msgpack encoding, the action hash and the Agent EIP-712 signature (E2). No network."
+
+[dependencies]
+signer-eip712 = { workspace = true }
+secp256k1     = { workspace = true }

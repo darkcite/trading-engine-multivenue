@@ -13,6 +13,7 @@ authors = ["Anton (darkcite) <qqq.darkcite@gmail.com>"]
 cargo-fuzz = true
 
 [dependencies]
+exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
 
@@ -285,6 +286,13 @@ bench  = false
 [[bin]]
 name   = "deribit_book_levels"
 path   = "fuzz_targets/deribit_book_levels.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hl_msgpack_encode"
+path   = "fuzz_targets/hl_msgpack_encode.rs"
 test   = false
 doc    = false
 bench  = false

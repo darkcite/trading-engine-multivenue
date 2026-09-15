@@ -5886,3 +5886,183 @@ fn routed_dispatch_steady_state() {
         "RoutedDispatcher hot bytes should be zero: saw {bytes}"
     );
 }
+
+/// E2 gate 54 — encoding AND signing a Hyperliquid action allocates
+/// nothing.
+///
+/// This is the live order path: every order the member emits is built
+/// into a stack buffer, msgpack-encoded, keccak-hashed with its nonce
+/// and vault tail, wrapped in the `Agent` EIP-712 envelope and signed.
+/// All of it runs on the dispatcher worker thread, per order.
+///
+/// The signing key is parsed ONCE outside the guard, exactly as the
+/// dispatcher parses it once at boot — `secp256k1`'s context is cached
+/// behind a `OnceLock`, so the first signature of the process warms it
+/// and every later one is allocation-free. The warm-up call below is
+/// what makes that explicit rather than accidental.
+#[test]
+fn hl_action_encode_sign() {
+    use exec_hyperliquid::action::{
+        encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order,
+        CancelByCloidWire, CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
+    };
+    use exec_hyperliquid::sign::{sign_action, Network, Vault};
+    use exec_hyperliquid::Nonce;
+
+    const KEY: [u8; 32] = [0x11; 32];
+    const HIP4_YES: u32 = 100_032_530;
+    const HIP4_NO: u32 = 100_032_531;
+
+    // Boot-time work, outside the measurement window — as it is live.
+    let sk = signer_eip712::parse_secret_key(&KEY).expect("key");
+    let mut buf = [0u8; MAX_ACTION];
+    let mut nonce = Nonce::new();
+
+    // Warm the cached secp256k1 signing context and the cached EIP-712
+    // domain separator. Both are `OnceLock`s initialised on first use;
+    // measuring that first use would be measuring boot, not the hot
+    // path.
+    {
+        let n = encode_order(
+            &mut buf,
+            &[OrderWire::new(HIP4_YES, true, 50_000_000, 100_000_000, Tif::Ioc)],
+            b"na",
+        )
+        .expect("warm encode");
+        let _ = sign_action(&sk, &buf[..n], 1, Vault::None, None, Network::Mainnet)
+            .expect("warm sign");
+    }
+
+    let cloid = [
+        0x4d, 0x56, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
+    ];
+
+    let g = AllocGuard::new();
+
+    let mut sigs: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut i = 0u64;
+    while i < 2_000 {
+        let now_ms = 1_789_000_000_000 + i;
+
+        // Arm A / coverage: an IoC take with a client id.
+        let n = encode_order(
+            &mut buf,
+            &[
+                OrderWire::new(HIP4_YES, true, 45_670_000 + (i as i64 % 100), 100_000_000, Tif::Ioc)
+                    .with_cloid(cloid),
+            ],
+            b"na",
+        )
+        .expect("encode order");
+        let sig = sign_action(
+            &sk,
+            &buf[..n],
+            nonce.next(now_ms),
+            Vault::None,
+            None,
+            Network::Mainnet,
+        )
+        .expect("sign order");
+        bytes = bytes.wrapping_add(n as u64);
+        sigs = sigs.wrapping_add(u64::from(sig[64]));
+
+        // Arm B: a post-only maker quote, then the requote that LAW E-7
+        // says must be a MODIFY rather than a cancel plus a place.
+        let n = encode_order(
+            &mut buf,
+            &[OrderWire::new(HIP4_NO, false, 60_000_000, 100_000_000, Tif::Alo).with_cloid(cloid)],
+            b"na",
+        )
+        .expect("encode quote");
+        let sig = sign_action(
+            &sk,
+            &buf[..n],
+            nonce.next(now_ms),
+            Vault::None,
+            None,
+            Network::Mainnet,
+        )
+        .expect("sign quote");
+        bytes = bytes.wrapping_add(n as u64);
+        sigs = sigs.wrapping_add(u64::from(sig[64]));
+
+        let n = encode_batch_modify(
+            &mut buf,
+            &[ModifyWire {
+                order: OrderWire::new(HIP4_NO, false, 60_100_000, 100_000_000, Tif::Alo)
+                    .with_cloid(cloid),
+                oid: 0,
+                oid_cloid: cloid,
+                oid_is_cloid: true,
+            }],
+        )
+        .expect("encode modify");
+        let sig = sign_action(
+            &sk,
+            &buf[..n],
+            nonce.next(now_ms),
+            Vault::None,
+            None,
+            Network::Testnet,
+        )
+        .expect("sign modify");
+        bytes = bytes.wrapping_add(n as u64);
+        sigs = sigs.wrapping_add(u64::from(sig[64]));
+
+        // The roll's cancel-all, both forms, and the vault + expiry
+        // tails so no branch of the hash builder escapes the guard.
+        if i % 8 == 0 {
+            let n = encode_cancel(
+                &mut buf,
+                &[
+                    CancelWire { asset: HIP4_YES, oid: i },
+                    CancelWire { asset: HIP4_NO, oid: i + 1 },
+                ],
+            )
+            .expect("encode cancel");
+            let sig = sign_action(
+                &sk,
+                &buf[..n],
+                nonce.next(now_ms),
+                Vault::Address([9u8; 20]),
+                Some(now_ms + 60_000),
+                Network::Mainnet,
+            )
+            .expect("sign cancel");
+            bytes = bytes.wrapping_add(n as u64);
+            sigs = sigs.wrapping_add(u64::from(sig[64]));
+
+            let n = encode_cancel_by_cloid(
+                &mut buf,
+                &[CancelByCloidWire { asset: HIP4_YES, cloid }],
+            )
+            .expect("encode cancel-by-cloid");
+            let sig = sign_action(
+                &sk,
+                &buf[..n],
+                nonce.next(now_ms),
+                Vault::None,
+                Some(now_ms + 60_000),
+                Network::Mainnet,
+            )
+            .expect("sign cancel-by-cloid");
+            bytes = bytes.wrapping_add(n as u64);
+            sigs = sigs.wrapping_add(u64::from(sig[64]));
+        }
+        i += 1;
+    }
+    std::hint::black_box((sigs, bytes, nonce.last()));
+
+    let (allocs, alloc_bytes, _deallocs) = g.delta();
+    assert!(bytes > 0, "the gate must have encoded something");
+    assert!(sigs > 0, "and signed something");
+    assert_eq!(
+        allocs, 0,
+        "hl action encode+sign allocated {allocs} times ({alloc_bytes} B)"
+    );
+    assert_eq!(
+        alloc_bytes, 0,
+        "hl action encode+sign bytes should be zero: saw {alloc_bytes}"
+    );
+}

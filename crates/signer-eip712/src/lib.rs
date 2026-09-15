@@ -40,6 +40,10 @@
     clippy::undocumented_unsafe_blocks
 )]
 
+/// Hyperliquid's `Agent` EIP-712 envelope (E2). Additive: nothing
+/// in the Polymarket path changes.
+pub mod hyperliquid;
+
 use std::sync::OnceLock;
 
 pub use secp256k1::SecretKey;
