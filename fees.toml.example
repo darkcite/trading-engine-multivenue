@@ -182,6 +182,25 @@ perp = "2:5"
 # builds no signer, cancel or dispatch path (Stage-3). A paper fill
 # cannot verify a fee.
 #
+# MEASURED 2026-09-15, and this row is now the only one in this file
+# that is. `exec-smoke --fill` bought 2 of a live HIP-4 outcome leg at
+# 0.68 on testnet -- a CROSSING (taker) fill, the expensive side -- and
+# the venue reported:
+#
+#       "fee": "0.0",  "feeToken": "USDC"
+#
+# So the row does not change: it was already 0:0, corrected from the
+# docs the day before. What changes is its standing. Plan SS6.5 says
+# MEASURE, do not read, and until this fill there was nothing in the
+# repo that could measure a fee at all. Two documents agreeing is
+# weaker evidence than one fill, and the pair they replaced was itself
+# a plausible-sounding inference from a neighbouring schedule.
+#
+# Caveat kept deliberately: this is TESTNET. It agrees with both
+# published sources, which is why it is recorded as confirmation
+# rather than as a new value -- but a mainnet HIP-4 fill has still
+# never been measured by anything here.
+#
 # The BUILDER fee is the one charge that survives, and only for an order
 # carrying a builder code. Ours do not.
 #

@@ -382,6 +382,27 @@ pub trait OrderDispatch {
         false
     }
 
+    /// A venue event the dispatcher may need to act on.
+    ///
+    /// Defaulted to a no-op, like [`Self::on_idle`], because every
+    /// dispatcher that models rather than trades ignores it. The one
+    /// implementor is the Hyperliquid arm, which needs
+    /// `ChannelId::InstrumentRoll` to bind its asset table — LAW E-4
+    /// says an asset id is bound by a roll and never derived, and this
+    /// is how the roll reaches the thing that binds.
+    ///
+    /// **Called BEFORE the strategy sees the same event**, and that
+    /// ordering is load-bearing rather than incidental: a member handed
+    /// a roll may submit into the new instance in the same call, and a
+    /// dispatcher that had not yet bound would refuse the order it was
+    /// just told how to route. `engine` pins the order with a test.
+    ///
+    /// On the engine thread, like `submit` — not the worker's. The
+    /// `--exec` path has no worker (see [`Self::on_idle`]), so this is
+    /// the only hook that actually reaches the live arm today.
+    #[inline]
+    fn on_venue_event(&mut self, _event: &core_types::ChannelEvent) {}
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly

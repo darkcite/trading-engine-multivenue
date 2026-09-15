@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use clob_dispatcher::{DispatchError, DispatchStats, OrderDispatch};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::Producer;
-use core_types::{Fill, NsTs, Order, Side, Tick};
+use core_types::{ChannelEvent, ChannelId, Fill, NsTs, Order, Side, Tick, VenueId};
 
 use crate::action::{encode_order, OrderWire, Tif, MAX_ACTION};
 use crate::asset::AssetTable;
@@ -95,6 +95,13 @@ pub struct HlExecCounters {
     pub rejected: u64,
     /// Submits refused locally, before any packet left.
     pub refused_local: u64,
+    /// The subset of [`Self::refused_local`] that were LAW E-4
+    /// staleness refusals — the order named an instance the table has
+    /// rolled past. **The most important refusal this module makes**,
+    /// and the reason it is not merely folded into the total: an order
+    /// that would have gone to someone else's market must not read
+    /// like a full ring.
+    pub refused_stale: u64,
     /// Venue fills routed into fill lane 3.
     pub fills_booked: u64,
     /// Venue fills that were NOT ours — counted, never routed.
@@ -139,6 +146,21 @@ pub struct HlExecCounters {
     pub ws_connect_failures: u64,
     /// Encode or sign refusals — local, before anything was sent.
     pub encode_failures: u64,
+    /// `outcomeCreated` rolls that bound BOTH legs.
+    pub rolls_bound: u64,
+    /// `outcomeSettled` rolls. The binding is deliberately KEPT — see
+    /// [`HlExchange::on_venue_event`].
+    pub rolls_settled: u64,
+    /// Rolls that bound nothing: no outcome id, an id past the u32
+    /// bound, or a table with no room for BOTH legs. The name is
+    /// exact: everything that can fail is checked before the first
+    /// mutation, so a refused roll really did bind nothing.
+    ///
+    /// An unbound leg silently books no fills, so this wants to be
+    /// loud — and today it is not. Like every counter here it reaches
+    /// no gauge until `stats()` is wired (risk-policy pre-arming item
+    /// 5), so it is visible to a test and not to an operator.
+    pub rolls_refused: u64,
 }
 
 /// The live Hyperliquid dispatcher.
@@ -500,10 +522,31 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
         // 1. LAW E-4 — bound, never derived. An unbound symbol is a
         //    refusal, not an arithmetic problem.
+        //
+        //    THE INSTANCE COMES FROM THE ORDER. This read `0` until the
+        //    roll handler existed, which was harmless only while the
+        //    table was empty: a hardcoded 0 compares 0 to 0 forever, so
+        //    the staleness check LAW E-4 exists for could never fire
+        //    and a stale asset id would have sailed through. The member
+        //    already states which instance it believes it is trading,
+        //    in `client_oid`'s low bits (`core_types::instance_of`), so
+        //    the table is asked about THAT one — and a table that has
+        //    rolled refuses instead of sending an order to someone
+        //    else's market.
         let asset = self
             .assets
-            .lookup(order.sym, 0)
-            .map_err(|_| {
+            .lookup(order.sym, core_types::instance_of(order.client_oid))
+            .map_err(|e| {
+                // A STALE instance gets its own counter. It is the one
+                // thing this module exists to catch — an order naming
+                // an instance that has rolled is an order bound for
+                // someone else's market — and folded into
+                // `refused_local` it is indistinguishable from a spent
+                // budget or an unbound symbol. This diff is what makes
+                // it reachable for the first time.
+                if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
+                    self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 DispatchError::NoLiveRoute
             })?;
@@ -626,11 +669,135 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     fn observe_tick(&mut self, _tick: &Tick, _now_ns: NsTs) {}
 
     /// The worker's idle moment is this arm's only thread.
+    /// LAW E-4's writer. A roll is the ONLY thing that may bind an
+    /// asset id, and this is where it lands.
+    ///
+    /// One event binds BOTH legs: the wire carries the family's Yes
+    /// symbol and the No leg is the next ordinal, which is the boot
+    /// ordinal law (`4096 + 2*family + side`) and not an inference of
+    /// this crate's — the ingress assigns them adjacently and
+    /// `bin15_boot` copies them out that way.
+    ///
+    /// A SETTLED roll binds nothing and unbinds nothing, deliberately.
+    /// `unbind` clears `prev_coin`, which is exactly the one-generation
+    /// memory that lets a fill still in flight across the roll resolve
+    /// (see [`AssetTable::sym_of_coin`]); the venue itself keeps a
+    /// settled instance's coins subscribed, and the successor's `bind`
+    /// overwrites in place and carries the old name forward. Dropping
+    /// the binding here would throw away a real fill to tidy a table.
+    fn on_venue_event(&mut self, event: &ChannelEvent) {
+        if event.channel != ChannelId::InstrumentRoll as u8 {
+            return;
+        }
+        if event.venue != VenueId::Hyperliquid as u8 {
+            return;
+        }
+        let (outcome, settled) = unpack_roll(event.venue_seq);
+        if settled {
+            self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
+            return;
+        }
+        // A created roll with no outcome names nothing. Refuse rather
+        // than bind slot 0 of somebody's market.
+        if outcome == 0 {
+            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+            return;
+        }
+        // BOTH LEGS OR NEITHER. Everything that can fail is computed
+        // and checked before the first mutation, because a table left
+        // holding the Yes leg and not the No would book one side of a
+        // position and count the other as a stranger's fill — while
+        // `rolls_refused` said nothing had been bound.
+        //
+        // The YES leg is what the wire carries; NO is the next ordinal
+        // (the boot ordinal law, not an inference of this crate's).
+        // `sym + 1` is the NO leg — but `sym` comes off the wire, and
+        // this crate has twice refused an unchecked add on exactly
+        // this kind of value. Release sets `overflow-checks = false`,
+        // the ordinal field is 24 bits, and `SYMBOL_ID_NONE` is
+        // `u32::MAX`, so an unchecked `+ 1` could carry out of the
+        // ordinal into the VENUE byte and bind a leg in another
+        // venue's namespace. Refused at runtime in every profile, the
+        // same ruling `AssetTable::asset_id` got.
+        let ord = core_types::symbol_ordinal(event.sym);
+        if event.sym == core_types::SYMBOL_ID_NONE || ord >= core_types::SYMBOL_ORDINAL_MASK {
+            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+            return;
+        }
+        let syms = [event.sym, event.sym + 1];
+        let mut coins = [[0u8; crate::asset::COIN_MAX]; 2];
+        let mut lens = [0usize; 2];
+        let mut assets = [0u32; 2];
+        for side in 0usize..2 {
+            let Some(a) = AssetTable::asset_id(outcome, side as u8) else {
+                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+                return;
+            };
+            let Some(n) = AssetTable::outcome_coin(outcome, side as u8, &mut coins[side]) else {
+                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+                return;
+            };
+            assets[side] = a;
+            lens[side] = n;
+        }
+        if !self.assets.would_fit(&syms) {
+            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+            return;
+        }
+
+        // From here nothing can fail: both names are non-empty and
+        // within COIN_MAX by construction, and the slots are known to
+        // be available. A failure here would be a bug in `bind`, and
+        // `debug_assert!` is how this file says so.
+        for side in 0usize..2 {
+            let r = self.assets.bind(
+                syms[side],
+                assets[side],
+                u64::from(outcome),
+                &coins[side][..lens[side]],
+            );
+            debug_assert!(r.is_ok(), "a prechecked bind failed: {r:?}");
+            if r.is_err() {
+                // Unreachable by construction, and `debug_assert!` is a
+                // no-op in the profile that trades — so this is the
+                // RELEASE behaviour on a `bind` bug. Roll the first leg
+                // back rather than return a half-bound family while
+                // the counter says nothing was bound.
+                // Index loop, per the doctrine — and clippy's
+                // `iter().take(side)` would borrow `syms` across the
+                // `&mut self.assets` call anyway.
+                #[allow(clippy::needless_range_loop)]
+                for done in 0usize..side {
+                    self.assets.unbind(syms[done]);
+                }
+                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+                return;
+            }
+        }
+        self.counters.rolls_bound = self.counters.rolls_bound.wrapping_add(1);
+    }
+
     fn on_idle(&mut self) -> bool {
         let worked = self.pump_user_events();
         self.persist_budget();
         worked
     }
+}
+
+/// The `InstrumentRoll` `venue_seq` layout, bits 0..32 and 56.
+///
+/// **Duplicated from `ingress_hyperliquid::family::pack_roll_seq`, not
+/// imported** — §6.1 forbids this crate depending on the market-data
+/// crate, and `strategy_bin15` re-writes the same unpack for the same
+/// reason. `a_hand_built_roll_seq_unpacks_the_way_the_ingress_packs_it`
+/// is what keeps the three in agreement.
+///
+/// Bits 0..32 are the **outcome id**, NOT `enc`. `AssetTable::asset_id`
+/// and `outcome_coin` do the `× 10 + side` themselves, so feeding them
+/// `enc` would be a silent tenfold error naming a real other market.
+#[inline]
+const fn unpack_roll(seq: u64) -> (u32, bool) {
+    ((seq & 0xFFFF_FFFF) as u32, (seq >> 56) & 1 == 1)
 }
 
 /// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.
@@ -707,7 +874,8 @@ mod tests {
     #[test]
     fn a_spent_budget_refuses_before_the_signer_is_touched() {
         let mut x = exchange();
-        x.assets_mut().bind(42, 3, 0, b"#42").expect("bind");
+        // Instance 7 — the same instance `order()`'s client_oid names.
+        x.assets_mut().bind(42, 3, 7, b"#42").expect("bind");
         // A cold budget has zero headroom by construction.
         assert!(x.budget_remaining() <= 0);
         let e = x.submit(&order(42, ORDER_KIND_MAKER)).unwrap_err();
@@ -746,7 +914,7 @@ mod tests {
     #[test]
     fn an_overflowing_price_is_refused_rather_than_clamped() {
         let mut x = exchange();
-        x.assets_mut().bind(9, 3, 0, b"#9").expect("bind");
+        x.assets_mut().bind(9, 3, 7, b"#9").expect("bind");
         let mut o = order(9, ORDER_KIND_MAKER);
         o.px = Price::from_raw(i64::MAX);
         // Refused for SOME local reason before anything is sent; the
@@ -915,6 +1083,15 @@ mod tests {
         assert_eq!(c.refused_local, 0);
         assert_eq!(c.rejected, 0);
         assert_eq!(core::mem::align_of::<HlExecCounters>(), 64);
+        // Pinned, not merely aligned. The block is copied whole on
+        // every `/metrics` publish, and it has already grown from two
+        // cache lines to three; the next field should be a decision
+        // rather than a surprise.
+        assert_eq!(
+            core::mem::size_of::<HlExecCounters>(),
+            192,
+            "HlExecCounters changed size — 17 u64 in three 64-byte lines"
+        );
     }
 
     /// **An UNBOUND coin still books nothing.** That property is the
@@ -923,6 +1100,182 @@ mod tests {
     /// moves a position the member never took, silently and
     /// permanently, while a fill not booked is caught by
     /// reconciliation inside a minute.
+    fn roll(outcome: u32, family: u8, settled: bool, sym: u32) -> ChannelEvent {
+        // Built the way `ingress_hyperliquid::family::pack_roll_seq`
+        // builds it, from its own source, NOT by calling our unpack in
+        // reverse — a test that inverts the thing under test proves
+        // only that it is self-consistent.
+        let seq = u64::from(outcome)
+            | ((60u64 & 0xFFFF) << 32)
+            | ((u64::from(family) & 0xFF) << 48)
+            | ((settled as u64) << 56);
+        ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym,
+            seq,
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+
+    /// The layout is DUPLICATED from the ingress (§6.1 forbids the
+    /// dependency), so it is held honest here against a `venue_seq`
+    /// built the ingress's way.
+    #[test]
+    fn a_hand_built_roll_seq_unpacks_the_way_the_ingress_packs_it() {
+        // The ingress's own pinned vector: pack_roll_seq(2649, 60, 0, false).
+        let seq = 2649u64 | (60u64 << 32);
+        assert_eq!(unpack_roll(seq), (2649, false));
+        // The settled bit is bit 56, and the family byte must not leak
+        // into the outcome id.
+        let seq = 19_418u64 | (60u64 << 32) | (7u64 << 48) | (1u64 << 56);
+        assert_eq!(unpack_roll(seq), (19_418, true));
+        // Bits 0..32 are the OUTCOME ID, not `enc`. Confusing them is a
+        // silent tenfold error naming a real other market.
+        let (o, _) = unpack_roll(u64::from(u32::MAX));
+        assert_eq!(o, u32::MAX);
+    }
+
+    /// LAW E-4's writer. One roll binds BOTH legs, and the No leg is
+    /// the next ordinal.
+    #[test]
+    fn a_created_roll_binds_both_legs_of_the_family() {
+        let mut x = exchange();
+        assert!(x.assets().is_empty());
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+
+        assert_eq!(x.counters().rolls_bound, 1);
+        assert_eq!(x.counters().rolls_refused, 0);
+        assert_eq!(x.assets().len(), 2, "one roll, two legs");
+
+        // The venue's OWN names, in the FILL namespace.
+        assert_eq!(x.assets().sym_of_coin(b"#194180"), Some(4096), "Yes");
+        assert_eq!(x.assets().sym_of_coin(b"#194181"), Some(4097), "No is the next ordinal");
+
+        // And the asset ids the venue will accept.
+        assert_eq!(x.assets().lookup(4096, 19_418), Ok(100_194_180));
+        assert_eq!(x.assets().lookup(4097, 19_418), Ok(100_194_181));
+    }
+
+    /// The instance is the OUTCOME ID, and `submit` asks for the one
+    /// the order names. This is LAW E-4 actually doing its job: before
+    /// the roll handler existed the lookup passed a hardcoded 0, so a
+    /// stale asset id could never have been caught.
+    #[test]
+    fn an_order_naming_a_rolled_instance_is_refused() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+
+        // An order that names the LIVE instance resolves.
+        assert_eq!(x.assets().lookup(4096, 19_418), Ok(100_194_180));
+        // The quarter rolls.
+        x.on_venue_event(&roll(19_419, 0, false, 4096));
+        assert_eq!(x.assets().lookup(4096, 19_419), Ok(100_194_190));
+
+        // An order still naming the OLD instance is refused — this is
+        // the order that would have gone to someone else's market.
+        let mut o = order(4096, ORDER_KIND_MAKER);
+        o.client_oid = 19_418;
+        assert!(x.submit(&o).is_err());
+        assert_eq!(x.counters().submitted, 0);
+        assert!(
+            matches!(
+                x.assets().lookup(4096, core_types::instance_of(o.client_oid)),
+                Err(crate::asset::AssetError::StaleInstance { .. })
+            ),
+            "the refusal must be STALE, not merely unbound"
+        );
+    }
+
+    /// A settled roll keeps the binding. Dropping it would throw away
+    /// the one-generation memory a fill in flight depends on.
+    #[test]
+    fn a_settled_roll_keeps_the_binding_it_was_told_about() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        x.on_venue_event(&roll(19_418, 0, true, 4096));
+
+        assert_eq!(x.counters().rolls_settled, 1);
+        assert_eq!(x.counters().rolls_bound, 1, "a settlement binds nothing");
+        assert_eq!(
+            x.assets().sym_of_coin(b"#194180"),
+            Some(4096),
+            "a fill still in flight across the settlement must resolve"
+        );
+    }
+
+    /// A roll binds both legs or neither. A table with room for one
+    /// must leave the Yes leg unbound rather than half-bind the
+    /// family — and `rolls_refused` must then be telling the truth.
+    #[test]
+    fn a_roll_that_cannot_fit_both_legs_binds_neither() {
+        let mut x = exchange();
+        // Fill the table to one free slot.
+        for i in 0..(crate::asset::ASSET_SLOTS as u32 - 1) {
+            x.assets_mut()
+                .bind(i + 100, 100_000_000 + i, 1, b"#0")
+                .expect("bind");
+        }
+        let before = x.assets().len();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+
+        assert_eq!(x.counters().rolls_refused, 1);
+        assert_eq!(x.counters().rolls_bound, 0);
+        assert_eq!(x.assets().len(), before, "a refused roll must bind NEITHER leg");
+        assert_eq!(x.assets().sym_of_coin(b"#194180"), None, "not even the Yes leg");
+    }
+
+    /// `sym + 1` on a wire-derived symbol. `SYMBOL_ID_NONE` is
+    /// `u32::MAX` and the ordinal field is 24 bits, so an unchecked
+    /// add could carry into the VENUE byte and bind a leg in another
+    /// venue's namespace — silently, because release disables overflow
+    /// checks. This is the same defect class `asset_id` was hardened
+    /// against, so it gets the same runtime refusal.
+    #[test]
+    fn a_symbol_that_cannot_take_a_no_leg_is_refused() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, core_types::SYMBOL_ID_NONE));
+        assert_eq!(x.counters().rolls_refused, 1);
+        assert!(x.assets().is_empty(), "SYMBOL_ID_NONE must bind nothing");
+
+        // The top of the ordinal field: +1 would carry into the venue
+        // byte and name another venue's symbol.
+        let top = core_types::make_symbol_id(VenueId::Hyperliquid, core_types::SYMBOL_ORDINAL_MASK);
+        x.on_venue_event(&roll(19_418, 0, false, top));
+        assert_eq!(x.counters().rolls_refused, 2);
+        assert!(x.assets().is_empty());
+
+        // One below the top still binds — the guard refuses the wrap,
+        // not the range.
+        let ok = core_types::make_symbol_id(
+            VenueId::Hyperliquid,
+            core_types::SYMBOL_ORDINAL_MASK - 1,
+        );
+        x.on_venue_event(&roll(19_418, 0, false, ok));
+        assert_eq!(x.counters().rolls_bound, 1);
+    }
+
+    #[test]
+    fn a_roll_naming_no_outcome_binds_nothing() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(0, 0, false, 4096));
+        assert_eq!(x.counters().rolls_refused, 1);
+        assert!(x.assets().is_empty(), "slot 0 of somebody's market");
+        // Another venue's event on the same channel is not ours.
+        let mut e = roll(19_418, 0, false, 4096);
+        e.venue = VenueId::Binance as u8;
+        x.on_venue_event(&e);
+        assert!(x.assets().is_empty());
+        // Nor is another channel.
+        let mut e = roll(19_418, 0, false, 4096);
+        e.channel = ChannelId::Mark as u8;
+        x.on_venue_event(&e);
+        assert!(x.assets().is_empty());
+    }
+
     #[test]
     fn a_coin_no_roll_bound_is_never_booked_against_a_guess() {
         let mut x = exchange();

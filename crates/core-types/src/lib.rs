@@ -671,6 +671,74 @@ pub const FILL_ORIGIN_VENUE: u8 = 0;
 /// `core_fill`'s law. Never a trade that happened.
 pub const FILL_ORIGIN_PAPER: u8 = 1;
 
+/// [`Order::client_oid`] bits 0..32: the **instance** the member
+/// believes it is trading.
+///
+/// A convention, not a law of the type — the rest of `client_oid` is
+/// the member's own business. It lives here because two crates that
+/// **cannot see each other** depend on agreeing about it:
+/// `strategy-bin15` writes the HIP-4 outcome id into these bits, and
+/// `exec-hyperliquid` reads them to ask its asset table for that
+/// instance (LAW E-4: an order whose asset id was bound for a
+/// DIFFERENT instance is refused, never sent).
+///
+/// Duplicating it in both crates is the pattern this repo uses for a
+/// shared *bound*, held honest by a re-derivation test. That is the
+/// wrong tool here: a bound that drifts fails a test, while a
+/// convention that drifts refuses every order — or, far worse, accepts
+/// an order against an instance that has already rolled, which is a
+/// real order on someone else's market. So it has one definition.
+///
+/// **There is no opt-out.** The roll handler binds the instance it was
+/// told about, never `0`, so a member that does not write these bits
+/// does not quietly get `0` — it gets whatever its low 32 bits happen
+/// to hold. A monotonic counter, which is the natural reading of
+/// "idempotency key" on the field itself, would name a different
+/// instance on every order and be refused each time. That is
+/// fail-closed, so it cannot trade by accident; it is written down
+/// because the failure would otherwise look like a broken dispatcher
+/// rather than a missing convention.
+pub const OID_INSTANCE_MASK: u64 = 0xFFFF_FFFF;
+
+/// The instance an order names — [`OID_INSTANCE_MASK`] applied.
+#[inline]
+#[must_use]
+pub const fn instance_of(client_oid: u64) -> u64 {
+    client_oid & OID_INSTANCE_MASK
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::{instance_of, OID_INSTANCE_MASK};
+
+    /// The mask matters only when the HIGH bits are populated, which
+    /// is the case every real `client_oid` is in — `strategy_bin15`
+    /// packs a side bit at 48, a family at 32..48 and a sequence at
+    /// 49..63 alongside the instance. A test that masks a bare small
+    /// integer would pass against a mask of `u64::MAX`.
+    #[test]
+    fn the_instance_survives_a_fully_populated_client_oid() {
+        const INSTANCE: u64 = 19_418;
+        let oid = (1u64 << 63)          // arm
+            | (0x2FFFu64 << 49)         // sequence
+            | (1u64 << 48)              // side
+            | (7u64 << 32)              // family
+            | INSTANCE;
+        assert_eq!(instance_of(oid), INSTANCE, "the high bits leaked into the instance");
+        assert_ne!(oid, INSTANCE, "the fixture must actually have high bits set");
+
+        // The boundary: the mask is exactly 32 bits wide.
+        assert_eq!(instance_of(u64::MAX), u64::from(u32::MAX));
+        assert_eq!(instance_of(1u64 << 32), 0, "bit 32 is NOT part of the instance");
+        assert_eq!(instance_of(0xFFFF_FFFF), 0xFFFF_FFFF);
+        assert_eq!(OID_INSTANCE_MASK, 0xFFFF_FFFF);
+
+        // An order that carries no instance convention asks for 0,
+        // which is what a table bound with instance 0 answers for.
+        assert_eq!(instance_of(0), 0);
+    }
+}
+
 /// An order request from a strategy, handed off to `clob-dispatcher`.
 #[derive(Copy, Clone, Debug)]
 #[repr(C, align(64))]
@@ -690,6 +758,11 @@ pub struct Order {
     /// Quantity.
     pub qty: Qty,
     /// Client-assigned idempotency key.
+    ///
+    /// Opaque to the engine, but bits 0..32 are a SHARED CONVENTION —
+    /// see [`OID_INSTANCE_MASK`]. Defined here rather than in the
+    /// member that writes it, because the crate that READS it
+    /// (`exec-hyperliquid`) cannot see that member.
     pub client_oid: u64,
     /// Target venue ([`VenueId`] as raw byte). The engine's
     /// `VenueRouter` dispatches on this byte (Phase 8j).

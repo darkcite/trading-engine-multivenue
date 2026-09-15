@@ -708,22 +708,14 @@ barrier") and the prediction has come true.
 
 What is NOT built, and is required before any mainnet order:
 
-1. **The roll handler that calls `AssetTable::bind`.** The coin →
-   `SymbolId` *resolution* is built (see "The fill path's LAW E-4"
-   below) and a bound coin does reach fill lane 3. But **nothing in
-   this workspace binds a leg from a real `outcomeCreated` event**, so
-   in production the table is EMPTY and every venue fill is still
-   counted `fills_unresolved` and booked never. `fills_booked` remains
-   structurally zero and must not be read as a live number.
+1. ~~**The roll handler.**~~ **BUILT** — see "The roll handler" below.
+   The table now binds from a real `InstrumentRoll` event.
 
-   That is the correct code state — counted-not-booked is strictly
-   safer than misattributed — but note the operator hazard it creates,
-   because it is the reason this item stays on the list: with
-   `stats()` returning zeros (item 5), an armed slot in this state
-   shows an operator zero fills forever, with no way to tell "nothing
-   traded" from "every fill was dropped on the floor" while the venue
-   holds real positions the engine's view has at zero. **Do not arm a
-   slot before the roll handler exists.**
+   It still binds nothing in production, for a different and narrower
+   reason than before: **nothing constructs `HlExchange`**. That is
+   E7's arming-path change (item 2). The handler is correct and
+   unreachable, which is the state every other piece of this arm is in.
+
 2. **The dispatcher-worker wiring on the `--exec` path.** `on_idle`
    exists and `RoutedDispatcher` forwards it, but that path hands its
    dispatcher straight to the engine loop with no `DispatcherWorker`,
@@ -741,13 +733,18 @@ What is NOT built, and is required before any mainnet order:
    zeros, so `HlExecCounters` reaches no gauge. A live arm today would
    report zero submits and zero fills forever.
 6. The worker-side `origin` split of §6.4.
-7. **Settlement booking.** The operator ruled that a settlement should
+7. **A settled instance stays ORDER-authorising** until the member
+   zeroes its own instance — see the settled-roll residue above. The
+   table has no notion of "this instance is over", and a dropped
+   settled roll leaves the member and the binder agreeing on a dead
+   one.
+8. **Settlement booking.** The operator ruled that a settlement should
    book like any other fill; the code counts and discards it, because
    the row carries no cloid and LAW E-9 forbids putting an
    unattributed fill in the lane. Needs a deliberate attribution
    mechanism — resolving the slot from the symbol's binding is the
    obvious candidate — not an inference.
-8. **The `Fill::order_id` convention.** FIXED 2026-09-15, recorded
+9. **The `Fill::order_id` convention.** FIXED 2026-09-15, recorded
    here because of what it implies about the class of defect. Engine
    wide, `order_id` is the MEMBER'S `client_oid`: the paper matcher
    stamps `o.client_oid`, the backtest stamps `f.client_oid`, and
@@ -857,6 +854,94 @@ The fixtures are now **captured venue output**, not invention —
 `userws::tests::the_real_venue_shape_scans` carries three verbatim rows
 from the testnet API, and `recon.rs` keeps `+<enc>` because balances
 really are spelled that way.
+
+### The roll handler — where a binding comes from
+
+`AssetTable::bind` had no production caller, so the fill path could
+resolve a coin in principle and never in fact. The binding needs
+`outcome_id → SymbolId`, which is engine-side knowledge, while §6.1
+forbids `exec-hyperliquid` depending on `ingress-hyperliquid`.
+
+**The wire already carries both.** `InstrumentRoll` sets `sym` to the
+family's YES leg and packs the outcome id into `venue_seq` bits 0..32;
+the NO leg is the next ordinal by the boot ordinal law. So nothing has
+to be derived or looked up — the event states the pair `bind` wants.
+
+**And the two ends are already on one thread.** `Engine` owns
+`D: OrderDispatch`, and on the `--exec` path `RoutedDispatcher` runs
+INLINE on the engine thread. A ring would have been machinery for a
+boundary that does not exist. So: `OrderDispatch::on_venue_event`,
+defaulted to a no-op like `on_idle`, called from the engine's event
+drain, forwarded by the router, implemented by the live arm.
+
+**Ordering is load-bearing.** The dispatcher is told BEFORE the
+strategy. A member handed a roll may submit into the new instance in
+the same call — `on_venue_event` gives it a ctx with `submit` — so
+strategy-first would refuse the order against a table the dispatcher
+was about to fill in. `engine::a_roll_binds_before_the_strategy_can_act`
+holds it, and was verified to fail with the two lines swapped.
+
+A **settled** roll binds nothing and unbinds nothing. `unbind` clears
+`prev_coin`, which is exactly the one-generation memory that lets a
+fill still in flight across the roll resolve; the venue itself keeps a
+settled instance's coins subscribed, and the successor's `bind`
+overwrites in place and carries the old name forward. Dropping the
+binding would throw away a real fill to tidy a table.
+
+**The residue, stated rather than left implicit.** That reasoning is
+about FILLS; the same binding also stays ORDER-authorising. Between a
+settlement and the successor's created roll, `lookup` will happily
+answer for the settled instance — so what actually refuses an order
+into a dead market is **the member zeroing its own instance**
+(`strategy_bin15::clear_instance` clears `live.outcome`, after which
+`next_oid` names instance 0 and the table returns `StaleInstance`).
+That is a member-side guarantee, not a table-side one, and it has two
+consequences worth naming:
+
+- A future Hyperliquid member that does **not** zero its instance on
+  settlement reopens the window. Nothing in `exec-hyperliquid` would
+  catch it.
+- If the settled `InstrumentRoll` is dropped from the event ring
+  (`inc_event_ring_drops`) or masked off, **both** the member and the
+  binder miss it. The member keeps naming the settled outcome, the
+  table keeps answering for it, and the two agree on a dead instance
+  until the successor's created roll rebinds.
+
+Neither is solved here. Both go on the pre-arming list rather than
+being argued away — the fill-side reasoning for keeping the binding is
+sound, and it is not a reason to claim the order side is covered.
+
+#### The trap it had to clear: `instance = 0`
+
+`submit` looked the asset up with `lookup(order.sym, 0)` — the
+instance hardcoded. That was harmless only while the table was empty,
+and it was not a small thing: **a hardcoded 0 compares 0 to 0 forever,
+so LAW E-4's staleness check could never fire.** The law's whole
+purpose — refusing an order whose asset id was bound for an instance
+that has since rolled, because that is a real order on someone else's
+market — was inert.
+
+Binding with `instance = 0` would have preserved the inertness. Instead
+the instance now comes from the order: the member already states which
+one it believes it is trading, in `client_oid`'s low bits. That
+convention moved to `core_types::OID_INSTANCE_MASK`, beside the field
+itself, because the two crates that must agree about it **cannot see
+each other** — and a convention that drifts does not fail a test, it
+refuses every order or, worse, accepts one against an instance that has
+rolled. `an_order_naming_a_rolled_instance_is_refused` is the test that
+was impossible to write before.
+
+#### Fees: measured, and the row does not move
+
+The same phase-D fill reported `"fee": "0.0"` on a CROSSING (taker)
+leg. HIP-4 fees really are zero. `fees.toml` already said `0:0` —
+corrected from the docs on 2026-09-14, superseding a `2:5` pair
+inferred from the perp schedule — so **the delta on every BIN15 replay
+is exactly nothing**. What changed is the row's standing: §6.5 says
+measure rather than read, and until this fill nothing in the repo could
+measure a fee at all, because every BIN15 fill in existence is paper.
+The caveat stays: this is testnet, and a mainnet HIP-4 fill has still
+never been measured here.
 
 ### Phase D — the round trip LAW E-9 rests on, finally measured
 

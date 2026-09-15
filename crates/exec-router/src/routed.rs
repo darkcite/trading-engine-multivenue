@@ -184,6 +184,16 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         a | b
     }
 
+    /// Both arms, unconditionally. No short-circuit subtlety here —
+    /// this returns nothing, so there is no `|` vs `||` trap the way
+    /// there is in `on_idle`; the only requirement is that the LIVE
+    /// arm is never skipped, because it is the one that binds.
+    #[inline]
+    fn on_venue_event(&mut self, event: &core_types::ChannelEvent) {
+        self.paper.on_venue_event(event);
+        self.live.on_venue_event(event);
+    }
+
     fn exec_counters(&self) -> ExecCounters {
         let c = self.counters;
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];

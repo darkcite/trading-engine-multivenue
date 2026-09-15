@@ -340,6 +340,63 @@ impl AssetTable {
         Err(AssetError::Full)
     }
 
+    /// Could `syms` ALL be bound right now?
+    ///
+    /// A roll binds two legs and must do so atomically — a table left
+    /// holding the Yes leg of an instance and not the No leg would
+    /// book one side of a position and count the other as a stranger's
+    /// fill. `bind` cannot promise that by itself: it rebinds a live
+    /// symbol in place (free) but consumes a slot for a new one, so
+    /// whether the pair fits depends on which of them the table
+    /// already holds. This answers that question BEFORE the first
+    /// mutation, which is the only point at which the answer is still
+    /// free to act on.
+    ///
+    /// Duplicate symbols in `syms` are counted once — binding the same
+    /// symbol twice consumes one slot, not two.
+    #[must_use]
+    pub fn would_fit(&self, syms: &[u32]) -> bool {
+        let mut free = ASSET_SLOTS - self.len;
+        let mut i = 0usize;
+        while i < syms.len() {
+            // Already counted this one?
+            let mut dup = false;
+            let mut j = 0usize;
+            while j < i {
+                if syms[j] == syms[i] {
+                    dup = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !dup && !self.holds(syms[i]) {
+                if free == 0 {
+                    return false;
+                }
+                free -= 1;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Is `sym` bound right now, under any instance?
+    #[inline]
+    #[must_use]
+    pub fn holds(&self, sym: u32) -> bool {
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: `i` is bounded by the loop condition and the
+            // array is exactly ASSET_SLOTS long.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.sym == sym {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Release a symbol — a settled instance whose leg is gone.
     pub fn unbind(&mut self, sym: u32) -> bool {
         for s in self.slots.iter_mut() {
@@ -715,6 +772,32 @@ mod tests {
             None,
             "two prev-generation claimants must not be guessed between"
         );
+    }
+
+    /// A roll binds two legs or neither. `would_fit` is what lets the
+    /// caller find that out before the first mutation.
+    #[test]
+    fn would_fit_answers_for_a_pair_before_anything_is_bound() {
+        let mut t = AssetTable::new();
+        assert!(t.would_fit(&[1, 2]), "an empty table fits a pair");
+
+        // Fill every slot but one.
+        for i in 0..(ASSET_SLOTS as u32 - 1) {
+            t.bind(i + 100, 100_000_000 + i, 1, b"#0").unwrap();
+        }
+        assert!(t.would_fit(&[1]), "one free slot fits one new symbol");
+        assert!(!t.would_fit(&[1, 2]), "one free slot does NOT fit two");
+
+        // A symbol the table already holds costs nothing to rebind.
+        assert!(
+            t.would_fit(&[100, 1]),
+            "rebinding a live symbol consumes no slot"
+        );
+        // And a duplicate is one symbol, not two.
+        assert!(t.would_fit(&[1, 1]), "the same symbol twice is one slot");
+
+        assert!(t.holds(100));
+        assert!(!t.holds(1));
     }
 
     /// A binding with no name would authorise ORDERS for a leg whose

@@ -149,7 +149,13 @@ const OID_SIDE_SHIFT: u32 = 48;
 /// `client_oid` bits 32..48: the family index.
 const OID_FAMILY_SHIFT: u32 = 32;
 /// `client_oid` bits 0..32: the outcome id.
-const OID_OUTCOME_MASK: u64 = 0xFFFF_FFFF;
+///
+/// **The engine-wide instance convention**, not this member's private
+/// layout — `exec-hyperliquid` reads these bits to ask its asset table
+/// which instance an order names (LAW E-4), and it cannot see this
+/// crate. Defined in `core-types` next to the field itself so the two
+/// readers cannot drift apart.
+use core_types::OID_INSTANCE_MASK as OID_OUTCOME_MASK;
 
 /// Nanoseconds in a day — the day-cap epoch.
 const DAY_NS: u64 = 86_400_000_000_000;

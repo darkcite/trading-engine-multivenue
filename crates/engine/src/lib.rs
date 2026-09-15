@@ -542,6 +542,17 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 match self.event_lanes[lane].try_pop() {
                     Some(e) => {
                         let now = now_ns();
+                        // THE DISPATCHER FIRST, and the order is
+                        // load-bearing. A roll tells the live arm how
+                        // to route an instance (LAW E-4: bound, never
+                        // derived) and tells the member that the
+                        // instance exists — and a member handed a roll
+                        // may submit into it in this very call, via the
+                        // ctx below. Strategy-first would refuse that
+                        // order against a table it was about to fill
+                        // in. `a_roll_binds_before_the_strategy_can_act`
+                        // holds this.
+                        self.disp.on_venue_event(&e);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
@@ -1781,6 +1792,121 @@ mod tests {
         // in strategy-set tests).
         assert_eq!(o.strategy_id, core_types::STRATEGY_ID_NONE);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Records the ORDER in which the dispatcher and the strategy were
+    /// told about a venue event.
+    #[derive(Default)]
+    struct OrderWitness {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+    impl OrderDispatch for OrderWitness {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            self.log.borrow_mut().push("submit");
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+        fn on_venue_event(&mut self, _e: &ChannelEvent) {
+            self.log.borrow_mut().push("dispatcher");
+        }
+    }
+
+    /// A member that SUBMITS on a roll — the case the ordering exists
+    /// for.
+    struct SubmitsOnRoll {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+    impl strategy_core::StrategyCounters for SubmitsOnRoll {}
+    impl Strategy for SubmitsOnRoll {
+        fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
+            Ok(())
+        }
+        fn on_tick<C: Ctx>(&mut self, _t: &Tick, _ctx: &mut C) {}
+        fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {}
+        fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {}
+        fn on_timer<C: Ctx>(&mut self, _now: NsTs, _ctx: &mut C) {}
+        fn timer_period_ns(&self) -> u64 {
+            0
+        }
+        fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+        fn on_venue_event<C: Ctx>(&mut self, _e: &ChannelEvent, ctx: &mut C) {
+            self.log.borrow_mut().push("strategy");
+            let o = Order::new(
+                1,
+                VenueId::Hyperliquid,
+                4096,
+                Side::Bid,
+                0,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                19_418,
+            );
+            let _ = ctx.submit(o);
+        }
+    }
+
+    /// **The property the roll handler's whole design rests on.**
+    ///
+    /// A roll tells the live arm how to route an instance and tells the
+    /// member that the instance exists. The member may submit into it
+    /// in the same call — so if the strategy ran first, its order would
+    /// be refused against an asset table the dispatcher was about to
+    /// fill in. Bind, then act.
+    #[test]
+    fn a_roll_binds_before_the_strategy_can_act() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_tp, tc) = split_tick_lanes();
+        let (mut ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitsOnRoll {
+                log: std::rc::Rc::clone(&log),
+            },
+            OrderWitness {
+                log: std::rc::Rc::clone(&log),
+            },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+
+        let ev = ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            core_types::ChannelId::InstrumentRoll,
+            4096,
+            19_418,
+            0,
+            1,
+            1,
+        );
+        ep[tick_lane_of(VenueId::Hyperliquid).unwrap()]
+            .try_push(ev)
+            .unwrap();
+        eng.tick(16);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["dispatcher", "strategy", "submit"],
+            "the dispatcher must be bound BEFORE a member can submit into the instance"
+        );
     }
 
     /// Dispatcher that refuses everything — capture-what-was-accepted

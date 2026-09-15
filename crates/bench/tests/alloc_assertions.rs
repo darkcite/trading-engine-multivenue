@@ -6366,3 +6366,93 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "hl exchange route_frame bytes should be zero: saw {bytes}");
 }
+
+/// E4 gate 57 — the roll hook allocates nothing, on EITHER path.
+///
+/// `OrderDispatch::on_venue_event` is called for **every** venue event
+/// on every lane, from the engine tick loop — funding and mark flow
+/// continuously, and only a handful of events a day are rolls. So the
+/// early-return path is the hot one and the binding path is the rare
+/// one, and both are measured here: a table that allocated while
+/// binding would do it at every quarter-hour roll, on the thread that
+/// also signs and submits.
+#[test]
+fn hl_exchange_roll_hook_is_zero_alloc() {
+    use core_ring::Ring;
+    use core_types::{ChannelEvent, ChannelId, Fill, VenueId};
+    use exec_hyperliquid::config::{HlConfig, Scope};
+    use exec_hyperliquid::exchange::HlExchange;
+    use clob_dispatcher::OrderDispatch;
+
+    fn roll(outcome: u32, settled: bool, sym: u32) -> ChannelEvent {
+        let seq = u64::from(outcome) | (60u64 << 32) | ((settled as u64) << 56);
+        ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym,
+            seq,
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+    // The event the hook sees thousands of times for every roll.
+    let funding = ChannelEvent::new(
+        1,
+        VenueId::Hyperliquid,
+        ChannelId::Funding,
+        7,
+        0,
+        0,
+        125,
+        0,
+    );
+
+    let cfg = HlConfig::new(
+        Scope::Testnet,
+        exec_hyperliquid::config::HOST_TESTNET,
+        'b',
+        [0x55; 32],
+        [0x66; 20],
+    )
+    .expect("cfg");
+    let (p, _c) = Ring::<Fill, 64>::new().split();
+    let mut x = HlExchange::<64>::new(
+        &cfg,
+        core_net::TlsTransport::default_client_config(),
+        p,
+        std::env::temp_dir().join(format!("mv-gate57-{}.state", std::process::id())),
+        100,
+    )
+    .expect("build");
+
+    // Prime both paths once; the first pass through any code is the
+    // one allowed to be cold.
+    x.on_venue_event(&roll(19_418, false, 4096));
+    x.on_venue_event(&funding);
+
+    let g = AllocGuard::new();
+    for i in 0..2_000u32 {
+        // The hot path: not a roll, not ours — returns immediately.
+        x.on_venue_event(&funding);
+        // The rare path: a real roll, binding both legs. Rebinding the
+        // SAME symbols in place is what a quarter-hour roll does.
+        x.on_venue_event(&roll(19_418 + (i & 7), false, 4096));
+        x.on_venue_event(&roll(19_418 + (i & 7), true, 4096));
+    }
+    std::hint::black_box(x.counters());
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "hl exchange roll hook allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl exchange roll hook bytes should be zero: saw {bytes}");
+    assert!(
+        x.counters().rolls_bound >= 2_000,
+        "the binding path must actually have run: {}",
+        x.counters().rolls_bound
+    );
+    assert_eq!(x.counters().rolls_refused, 0);
+}
