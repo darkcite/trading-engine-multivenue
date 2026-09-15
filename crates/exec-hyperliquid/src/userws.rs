@@ -90,6 +90,18 @@ pub struct UserFill {
     pub time_ms: u64,
     /// Buy side.
     pub is_buy: bool,
+    /// The row is the venue SETTLING the instance, not a trade —
+    /// `dir: "Settlement"`, at px 1.0 for the winning side and 0.0 for
+    /// the loser, selling the whole position back.
+    ///
+    /// **Measured, not assumed** (testnet, 2026-09-15): settlement
+    /// really does arrive down `userFills` like any other fill, and
+    /// both sides come through as `side: "A"`. It is BOOKED like any
+    /// other fill by operator ruling — the venue is the truth, and the
+    /// payout is exactly a sale at 1.0 or 0.0 — and this flag exists
+    /// so that a settlement is never merely *inferred* from a price of
+    /// 1.0, which a genuine trade can also print.
+    pub is_settlement: bool,
 }
 
 impl UserFill {
@@ -182,15 +194,46 @@ pub fn to_fill(f: &UserFill, sym: SymbolId, now_ns: NsTs) -> Result<Routed, Conv
         return Err(ConvertErr::ZeroQuantity);
     }
     let side = if f.is_buy { Side::Bid } else { Side::Ask };
-    let base = Fill::new(now_ns, sym, side, Price::from_raw(px), Qty::from_raw(qty), f.oid);
+    let mk = |order_id: u64| {
+        Fill::new(
+            now_ns,
+            sym,
+            side,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            order_id,
+        )
+    };
     match f.cloid.as_ref().map(decode_cloid) {
-        Some(Owner::Ours { strategy_id, .. }) => Ok(Routed::Slot(
-            base.with_attribution(strategy_id, FILL_ORIGIN_VENUE),
+        // **`client_oid`, NOT the venue oid.** `Fill::order_id` is the
+        // MEMBER'S id by engine-wide convention: the paper matcher
+        // stamps `o.client_oid` (clob-dispatcher), the backtest
+        // stamps `f.client_oid`, and `strategy_bin15::PendingLeg::oid`
+        // is documented as "the `client_oid` submitted" and is what
+        // `book_fill` matches on.
+        //
+        // Stamping the venue's oid here — which this did until the
+        // review that found it — means every live fill misses every
+        // pending leg, so the member books NOTHING while the venue
+        // holds real size. The paper arm and the live arm would
+        // describe different worlds, which is the shape LAW E-1
+        // exists to forbid. The value was always in hand: the cloid
+        // decodes to it (LAW E-9), and it was being discarded.
+        Some(Owner::Ours {
+            strategy_id,
+            client_oid,
+        }) => Ok(Routed::Slot(
+            mk(client_oid).with_attribution(strategy_id, FILL_ORIGIN_VENUE),
         )),
         // STRATEGY_ID_NONE here is for the TAPE only. See the type's
         // docs: pushed into the lane it would fan out to every member.
+        //
+        // The VENUE oid is the right id on this arm: there is no
+        // client_oid to carry (that is what makes the fill foreign),
+        // and the venue's own id is what a reader would reconcile
+        // against.
         _ => Ok(Routed::TapeOnly(
-            base.with_attribution(STRATEGY_ID_NONE, FILL_ORIGIN_VENUE),
+            mk(f.oid).with_attribution(STRATEGY_ID_NONE, FILL_ORIGIN_VENUE),
         )),
     }
 }
@@ -273,6 +316,11 @@ pub fn scan_user_fills(
             _ => return Err(ScanErr::Malformed),
         };
         let cloid = string_field(obj, b"\"cloid\"").and_then(|s| from_hex(s.of(obj)));
+        // `dir` is descriptive on the wire ("Buy", "Sell",
+        // "Settlement", "Open Long", ...), so an unknown value is NOT
+        // a refusal — only the settlement case is load-bearing here.
+        let is_settlement = string_field(obj, b"\"dir\"")
+            .is_some_and(|d| d.of(obj) == b"Settlement");
 
         if n >= out.len() {
             return Err(ScanErr::Malformed);
@@ -290,6 +338,7 @@ pub fn scan_user_fills(
             fee_1e8: fee,
             time_ms,
             is_buy,
+            is_settlement,
         };
         n += 1;
         i = end;
@@ -508,13 +557,17 @@ mod tests {
     use crate::cloid::encode as encode_cloid;
 
     fn frame_with(cloid_hex: &str, snapshot: bool) -> Vec<u8> {
+        // `#<enc>` — the FILL namespace, measured against the live
+        // testnet venue. (`+<enc>` is the BALANCE namespace and belongs
+        // in `recon.rs`'s fixtures, not here.) Doubled hashes because
+        // the `"#` inside the coin closes a `r#"..."#` literal.
         format!(
-            r#"{{"channel":"userFills","data":{{"isSnapshot":{snapshot},"user":"0xabc","fills":[
-              {{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,
+            r##"{{"channel":"userFills","data":{{"isSnapshot":{snapshot},"user":"0xabc","fills":[
+              {{"coin":"#32530","px":"0.47","sz":"25","side":"B","time":1757942400000,
                 "oid":77216390,"tid":9001,"fee":"0.0123","cloid":"{cloid_hex}"}},
-              {{"coin":"+3254","px":"0.53","sz":"25","side":"A","time":1757942400001,
+              {{"coin":"#32540","px":"0.53","sz":"25","side":"A","time":1757942400001,
                 "oid":77216391,"tid":9002,"fee":"0.0"}}
-            ]}}}}"#
+            ]}}}}"##
         )
         .into_bytes()
     }
@@ -527,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn a_real_frame_scans_with_full_wire_precision() {
+    fn a_synthetic_frame_scans_with_full_wire_precision() {
         let f = frame_with(&ours_hex(), false);
         let mut out = [UserFill::default(); 8];
         let (n, snap) = scan_user_fills(&f, &mut out).expect("scan");
@@ -540,7 +593,7 @@ mod tests {
         assert_eq!(out[0].sz_1e8, 2_500_000_000);
         assert_eq!(out[0].fee_1e8, 1_230_000, "the fee is MEASURED, not assumed");
         assert!(out[0].is_buy);
-        assert_eq!(out[0].coin.of(&f), b"+3253");
+        assert_eq!(out[0].coin.of(&f), b"#32530");
 
         assert!(!out[1].is_buy);
         assert_eq!(out[1].cloid, None, "the venue may omit a cloid");
@@ -737,6 +790,122 @@ mod tests {
             ..UserFill::default()
         };
         let _ = huge.notional_usdc_1e6();
+    }
+
+    /// REAL rows, captured from the testnet venue 2026-09-15 for an
+    /// account that actually holds outcome legs. Not hand-written:
+    /// every prior fixture in this file spelled an outcome coin
+    /// `+<enc>`, which is the BALANCE namespace — `userFills` uses
+    /// `#<enc>`. A fixture we invented agreed with a plan sentence
+    /// and with nothing else.
+    ///
+    /// The third row is the other find: **settlement arrives as a
+    /// FILL**, `dir: "Settlement"` at px 0.0 or 1.0.
+    /// `UserFill` is copied out of `scratch` once per row and the
+    /// scratch is `SNAPSHOT_RING` long, so its size is a real cost,
+    /// not a curiosity. Pinned the way `core_types::Fill` is pinned.
+    /// The `is_settlement` flag landed in existing padding and changed
+    /// nothing; the next field might not, and nothing else would say
+    /// so.
+    /// `Fill::order_id` is the MEMBER'S id, engine-wide. The paper
+    /// matcher stamps `o.client_oid` and `book_fill` matches on it, so
+    /// an arm that stamped the venue's oid would book nothing at all
+    /// while the venue held real size.
+    #[test]
+    fn a_booked_fill_carries_the_client_oid_not_the_venue_oid() {
+        const CLIENT_OID: u64 = 0xDEAD_BEEF;
+        const VENUE_OID: u64 = 77_216_390;
+        let c = encode_cloid(3, CLIENT_OID);
+        let mut f = UserFill {
+            tid: 1,
+            oid: VENUE_OID,
+            cloid: Some(c),
+            px_1e8: 47_000_000,
+            sz_1e8: 2_500_000_000,
+            ..UserFill::default()
+        };
+        match to_fill(&f, 7, 1).expect("converts") {
+            Routed::Slot(fill) => {
+                assert_eq!(
+                    fill.order_id, CLIENT_OID,
+                    "a booked fill must carry the id the MEMBER submitted"
+                );
+                assert_ne!(fill.order_id, VENUE_OID);
+                assert_eq!(fill.strategy_id, 3);
+            }
+            Routed::TapeOnly(_) => panic!("our own cloid must route to the slot"),
+        }
+
+        // The foreign arm keeps the VENUE oid — there is no client id
+        // to carry, and the venue's own is what a reader reconciles
+        // against.
+        f.cloid = None;
+        match to_fill(&f, 7, 1).expect("converts") {
+            Routed::TapeOnly(fill) => assert_eq!(fill.order_id, VENUE_OID),
+            Routed::Slot(_) => panic!("a cloid-less fill is not ours"),
+        }
+    }
+
+    #[test]
+    fn a_user_fill_stays_the_size_it_was() {
+        assert_eq!(
+            core::mem::size_of::<UserFill>(),
+            88,
+            "UserFill changed size — check what it costs across a \
+             SNAPSHOT_RING-long scratch before accepting it"
+        );
+    }
+
+    #[test]
+    fn the_real_venue_shape_scans() {
+        // NOTE the DOUBLED hashes. An outcome coin renders as
+        // `"#118441"`, and the `"#` inside it closes a `br#"..."#`
+        // literal — every fixture in this repo that carries a `#`
+        // coin needs `br##"..."##`.
+        const REAL: &[u8] = br##"{"channel":"userFills","data":{"isSnapshot":false,"user":"0x047a","fills":[{"coin":"#118441","px":"0.88","sz":"12.0","side":"A","time":1786380674040,"startPosition":"42.0","dir":"Sell","closedPnl":"4.56","hash":"0x65b3","oid":57678782990,"crossed":false,"fee":"0.0","tid":229944652074215,"feeToken":"USDC","twapId":null},{"coin":"#118440","px":"1.0","sz":"42.0","side":"A","time":1786671271762,"startPosition":"42.0","dir":"Settlement","closedPnl":"21.0","hash":"0x218c","oid":57825119690,"crossed":true,"fee":"0.0","tid":783857055371202,"feeToken":"USDC","twapId":null},{"coin":"#118441","px":"0.0","sz":"30.0","side":"A","time":1786671271762,"startPosition":"30.0","dir":"Settlement","closedPnl":"-15.0","hash":"0x218c","oid":57825119692,"crossed":true,"fee":"0.0","tid":157237469828273,"feeToken":"USDC","twapId":null}]}}"##;
+        let mut out = [UserFill::default(); 8];
+        let (n, snap) = scan_user_fills(REAL, &mut out).expect("the real venue shape must scan");
+        assert_eq!(n, 3, "all three real rows");
+        assert!(!snap);
+
+        assert_eq!(out[0].coin.of(REAL), b"#118441", "the FILL namespace is '#'");
+        assert_eq!(out[0].px_1e8, 88_000_000);
+        assert_eq!(out[0].sz_1e8, 1_200_000_000);
+        assert_eq!(out[0].tid, 229_944_652_074_215);
+        assert_eq!(out[0].oid, 57_678_782_990);
+        assert!(!out[0].is_buy);
+        assert_eq!(out[0].time_ms, 1_786_380_674_040);
+        assert_eq!(out[0].cloid, None, "not our order");
+
+        // Settlement rows. px 1.0 is the winning side paying out, px
+        // 0.0 the losing side going to zero. Both are real rows the
+        // lane will see every quarter hour, and the ZERO is the one
+        // that matters: it must scan rather than be mistaken for a
+        // malformed frame.
+        assert_eq!(out[1].px_1e8, 100_000_000);
+        assert_eq!(out[2].px_1e8, 0, "a settled loser prices at zero");
+        assert_eq!(out[2].sz_1e8, 3_000_000_000);
+
+        // Settlement is FLAGGED, never inferred from the price: row 1
+        // prints at 1.0 and so can a genuine trade.
+        assert!(!out[0].is_settlement, "a Sell is not a settlement");
+        assert!(out[1].is_settlement, "the winning side, paid out at 1.0");
+        assert!(out[2].is_settlement, "the losing side, written to 0.0");
+        // Both sides arrive as SELLS — the position is sold back.
+        assert!(!out[1].is_buy && !out[2].is_buy);
+
+        // And the behaviour the operator ruling turns on: a settlement
+        // carries NO CLOID, because the venue generated the order. So
+        // it takes the foreign arm and is counted, not booked. The
+        // ruling ("book it") is RECORDED and NOT IMPLEMENTED — doing
+        // it means attributing a cloid-less fill to a slot, which is
+        // what LAW E-9's containment forbids. This test is what stops
+        // the two drifting apart silently.
+        assert_eq!(out[1].cloid, None, "the venue owns the settlement order");
+        assert!(
+            matches!(to_fill(&out[1], 7, 1), Ok(Routed::TapeOnly(_))),
+            "a settlement must not reach a slot until attribution is decided"
+        );
     }
 
     #[test]

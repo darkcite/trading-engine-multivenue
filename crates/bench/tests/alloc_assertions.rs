@@ -6166,7 +6166,9 @@ fn hl_user_fill_lane_is_zero_alloc() {
     use exec_hyperliquid::userws::{owner_of, scan_user_fills, to_fill, TidRing, UserFill};
     use exec_hyperliquid::AddressBudget;
 
-    const FILLS: &[u8] = br#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc","fills":[{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":77216390,"tid":9001,"fee":"0.0123","cloid":"0x4d560300000000000000000012345678"},{"coin":"+3254","px":"0.53","sz":"25","side":"A","time":1757942400001,"oid":77216391,"tid":9002,"fee":"0.0"}]}}"#;
+    // `#<enc>` is the FILL namespace; the STATE body below keeps
+    // `+<enc>`, which is the BALANCE namespace. Both measured.
+    const FILLS: &[u8] = br##"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc","fills":[{"coin":"#32530","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":77216390,"tid":9001,"fee":"0.0123","cloid":"0x4d560300000000000000000012345678"},{"coin":"#32540","px":"0.53","sz":"25","side":"A","time":1757942400001,"oid":77216391,"tid":9002,"fee":"0.0"},{"coin":"#32540","px":"1.0","sz":"25","side":"A","time":1757942400002,"oid":77216392,"tid":9003,"dir":"Settlement","fee":"0.0"}]}}"##;
     const STATE: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"1234.56","hold":"12.00"},{"coin":"+3253","token":107,"total":"10.00000001","hold":"0.0"}]}"#;
 
     let mut fills = [UserFill::default(); 8];
@@ -6259,7 +6261,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
                 // OUR cloid (magic 'M','V', slot 3) — without it the
                 // rows route as foreign and never reach the lane, so
                 // the measured region would stop at a counter.
-                r#"{{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":{},"tid":{},"fee":"0.01","cloid":"0x4d560300000000000000000012345678"}}"#,
+                r##"{{"coin":"#32530","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":{},"tid":{},"fee":"0.01","cloid":"0x4d560300000000000000000012345678"}}"##,
                 base_tid + i,
                 base_tid + i
             ));
@@ -6277,7 +6279,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     // measure as far as the unresolved counter.
     let mut assets = AssetTable::new();
     assets
-        .bind(7, AssetTable::asset_id(3253, 0).expect("in range"), 1, b"+3253")
+        .bind(7, AssetTable::asset_id(3253, 0).expect("in range"), 1, b"#32530")
         .expect("bind");
 
     // Every buffer preallocated, exactly as `HlExchange::new` does it.

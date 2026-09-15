@@ -73,6 +73,12 @@
 //! * The **reconciliation timer** (§6.2) and the **tape write** for a
 //!   foreign fill (§6.1). Both are recorded as open in
 //!   `docs/risk-policy.md`.
+//! * **Settlement booking.** The venue delivers settlement down
+//!   `userFills` (`dir: "Settlement"`, px 1.0 or 0.0) with NO cloid,
+//!   so it takes the foreign arm: counted, never booked. The operator
+//!   ruled it should book; doing so needs a way to attribute a
+//!   venue-originated fill to a slot without tripping LAW E-9's
+//!   `STRATEGY_ID_NONE` fan-out. Recorded in `docs/risk-policy.md`.
 //!
 //! ## What E4 added, and what still cannot reach the engine
 //!

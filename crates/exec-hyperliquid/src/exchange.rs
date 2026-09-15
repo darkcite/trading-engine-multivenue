@@ -116,6 +116,12 @@ pub struct HlExecCounters {
     /// snapshot in silence is precisely the failure this counter
     /// exists to make loud.
     pub fills_scan_failed: u64,
+    /// Fills that were the venue SETTLING an instance rather than a
+    /// trade. **Booked like any other fill** (operator ruling,
+    /// 2026-09-15: the venue is the truth, and a payout is exactly a
+    /// sale at 1.0 or 0.0) — counted separately only so an operator
+    /// watching a position go flat can tell settlement from a trade.
+    pub fills_settlement: u64,
     /// Fills whose VENUE TIMESTAMP did not convert to nanoseconds.
     /// The fill is still booked, stamped with the local receive clock:
     /// a position is real whatever the venue says the time was, and a
@@ -352,6 +358,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             }
             if !is_snapshot {
                 budget.on_venue_fill(f.notional_usdc_1e6());
+            }
+            if f.is_settlement {
+                counters.fills_settlement = counters.fills_settlement.wrapping_add(1);
             }
             // `checked_`, not `saturating_`, for the same reason
             // `submit` uses it on price and qty: a clamp is a wrong
@@ -698,7 +707,7 @@ mod tests {
     #[test]
     fn a_spent_budget_refuses_before_the_signer_is_touched() {
         let mut x = exchange();
-        x.assets_mut().bind(42, 3, 0, b"+42").expect("bind");
+        x.assets_mut().bind(42, 3, 0, b"#42").expect("bind");
         // A cold budget has zero headroom by construction.
         assert!(x.budget_remaining() <= 0);
         let e = x.submit(&order(42, ORDER_KIND_MAKER)).unwrap_err();
@@ -737,7 +746,7 @@ mod tests {
     #[test]
     fn an_overflowing_price_is_refused_rather_than_clamped() {
         let mut x = exchange();
-        x.assets_mut().bind(9, 3, 0, b"+9").expect("bind");
+        x.assets_mut().bind(9, 3, 0, b"#9").expect("bind");
         let mut o = order(9, ORDER_KIND_MAKER);
         o.px = Price::from_raw(i64::MAX);
         // Refused for SOME local reason before anything is sent; the
@@ -919,16 +928,16 @@ mod tests {
         let mut x = exchange();
         // One leg bound; everything else must resolve to nothing.
         x.assets_mut()
-            .bind(42, 100_032_530, 7, b"+32530")
+            .bind(42, 100_032_530, 7, b"#32530")
             .expect("bind");
-        for coin in [&b"BTC"[..], b"+3253", b"USDC", b"", b"\xff\xfe", b"+32531"] {
+        for coin in [&b"BTC"[..], b"#3253", b"USDC", b"", b"\xff\xfe", b"#32531"] {
             assert_eq!(
                 x.assets().sym_of_coin(coin),
                 None,
                 "a coin name resolved to a symbol no roll bound"
             );
         }
-        assert_eq!(x.assets().sym_of_coin(b"+32530"), Some(42));
+        assert_eq!(x.assets().sym_of_coin(b"#32530"), Some(42));
     }
 
     /// End to end: a fill whose coin IS bound reaches fill lane 3.
@@ -938,9 +947,9 @@ mod tests {
     fn a_fill_whose_coin_is_bound_reaches_the_lane() {
         let mut x = exchange();
         x.assets_mut()
-            .bind(42, 100_032_530, 7, b"+32530")
+            .bind(42, 100_032_530, 7, b"#32530")
             .expect("bind");
-        let frame = br#"{"channel":"userFills","data":{"fills":[{"coin":"+32530","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":77,"tid":9001,"cloid":"0x4d560300000000000000000012345678"}]}}"#;
+        let frame = br##"{"channel":"userFills","data":{"fills":[{"coin":"#32530","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":77,"tid":9001,"cloid":"0x4d560300000000000000000012345678"}]}}"##;
         assert_eq!(x.route_fills(frame), 1, "the fill did not reach the lane");
         assert_eq!(x.counters().fills_booked, 1);
         assert_eq!(x.counters().fills_unresolved, 0);

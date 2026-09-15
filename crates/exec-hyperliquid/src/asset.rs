@@ -37,11 +37,32 @@ pub const OUTCOME_ID_MAX: u32 = (u32::MAX - ASSET_BASE - 9) / 10;
 
 /// Longest venue coin name a slot can hold, in bytes.
 ///
-/// The venue echoes outcome legs as `+<enc>` (§6.2 of the plan) and
-/// perps by name (`BTC`). Twenty bytes covers an eleven-digit `+<enc>`
-/// with room over; a longer name is REFUSED at bind time rather than
+/// Twenty bytes covers an eleven-digit `#<enc>` with room over, and
+/// every perp name; a longer name is REFUSED at bind time rather than
 /// truncated, because a truncated name is a name that can collide.
 pub const COIN_MAX: usize = 20;
+
+/// The venue has TWO namespaces for the same outcome leg, and they are
+/// not interchangeable. **Measured against the live testnet venue on
+/// 2026-09-15**, on one account holding one leg:
+///
+/// | endpoint                  | spelling for `enc = 112410` |
+/// |---------------------------|------------------------------|
+/// | `l2Book`, `userFills`     | `#112410`                    |
+/// | `spotClearinghouseState`  | `+112410`                    |
+///
+/// This module's table resolves **fills**, so it stores `#<enc>`.
+/// Reconciliation reads balances and wants `+<enc>` — see
+/// [`AssetTable::outcome_balance_coin`].
+///
+/// The distinction is not cosmetic: the plan recorded only the `+`
+/// form, and every hand-written `userFills` fixture in this crate
+/// inherited it. They agreed with a sentence in a document and with
+/// nothing else. The cost of the mistake was one edit in one helper —
+/// which is the whole reason the table BINDS the name instead of
+/// deriving it at fill time. Had the fill path parsed `+<enc>`
+/// directly, the mistake would have been silent non-booking at best.
+const _NAMESPACE_NOTE: () = ();
 
 /// Why a lookup did not produce an asset id.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -191,8 +212,13 @@ impl AssetTable {
         Some(ASSET_BASE + 10 * outcome_id + side as u32)
     }
 
-    /// The venue's coin name for an outcome leg, rendered into
+    /// The venue's **fill-side** coin name for an outcome leg —
+    /// `#<enc>`, what `userFills` and `l2Book` echo — rendered into
     /// `out`, returning the written length.
+    ///
+    /// This is the one a roll handler binds, because the table
+    /// resolves fills. For the balance namespace see
+    /// [`Self::outcome_balance_coin`].
     ///
     /// The mirror of [`Self::asset_id`] and held to the same rule: it
     /// exists so a ROLL HANDLER has one place to compute the name, and
@@ -213,8 +239,26 @@ impl AssetTable {
         if outcome_id > OUTCOME_ID_MAX || side > 9 {
             return None;
         }
-        let enc = 10 * outcome_id + side as u32;
-        out[0] = b'+';
+        Self::render_enc(b'#', 10 * outcome_id + side as u32, out)
+    }
+
+    /// The venue's **balance-side** coin name — `+<enc>`, what
+    /// `spotClearinghouseState` reports. Reconciliation's namespace,
+    /// never the fill path's.
+    #[must_use]
+    pub fn outcome_balance_coin(
+        outcome_id: u32,
+        side: u8,
+        out: &mut [u8; COIN_MAX],
+    ) -> Option<usize> {
+        if outcome_id > OUTCOME_ID_MAX || side > 9 {
+            return None;
+        }
+        Self::render_enc(b'+', 10 * outcome_id + side as u32, out)
+    }
+
+    fn render_enc(prefix: u8, enc: u32, out: &mut [u8; COIN_MAX]) -> Option<usize> {
+        out[0] = prefix;
         let mut digits = [0u8; 10];
         let mut n = 0usize;
         let mut v = enc;
@@ -452,7 +496,7 @@ mod tests {
     #[test]
     fn a_stale_instance_is_refused_even_though_the_symbol_is_bound() {
         let mut t = AssetTable::new();
-        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"+32530").unwrap();
+        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"#32530").unwrap();
         assert_eq!(t.lookup(42, 1_000), Ok(100_032_530));
         // The quarter rolled. The caller still believes in the old one.
         assert_eq!(
@@ -468,9 +512,9 @@ mod tests {
     #[test]
     fn a_roll_rebinds_in_place() {
         let mut t = AssetTable::new();
-        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"+32530").unwrap();
+        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"#32530").unwrap();
         assert_eq!(t.len(), 1);
-        t.bind(42, AssetTable::asset_id(3254, 0).expect("in range"), 1_001, b"+32540").unwrap();
+        t.bind(42, AssetTable::asset_id(3254, 0).expect("in range"), 1_001, b"#32540").unwrap();
         assert_eq!(t.len(), 1, "a roll must not consume a second slot");
         assert_eq!(t.lookup(42, 1_001), Ok(100_032_540));
         assert!(t.lookup(42, 1_000).is_err(), "the old instance is gone");
@@ -479,7 +523,7 @@ mod tests {
     #[test]
     fn unbind_frees_the_slot() {
         let mut t = AssetTable::new();
-        t.bind(7, 100_000_001, 1, b"+1").unwrap();
+        t.bind(7, 100_000_001, 1, b"#1").unwrap();
         assert!(t.unbind(7));
         assert!(t.is_empty());
         assert_eq!(t.lookup(7, 1), Err(AssetError::Unbound));
@@ -490,11 +534,11 @@ mod tests {
     fn a_full_table_refuses_rather_than_evicting() {
         let mut t = AssetTable::new();
         for i in 0..ASSET_SLOTS as u32 {
-            t.bind(i, 100_000_000 + i, 1, b"+0").unwrap();
+            t.bind(i, 100_000_000 + i, 1, b"#0").unwrap();
         }
         // Evicting here would unbind a leg that may have an order in
         // flight against it.
-        assert_eq!(t.bind(999, 1, 1, b"+9"), Err(AssetError::Full));
+        assert_eq!(t.bind(999, 1, 1, b"#9"), Err(AssetError::Full));
         // And everything already bound still resolves.
         assert_eq!(t.lookup(0, 1), Ok(100_000_000));
     }
@@ -518,10 +562,14 @@ mod tests {
     fn the_coin_name_matches_the_asset_formula() {
         let mut out = [0u8; COIN_MAX];
         let n = AssetTable::outcome_coin(3253, 0, &mut out).expect("in range");
-        assert_eq!(&out[..n], b"+32530");
+        assert_eq!(&out[..n], b"#32530", "the FILL namespace");
         assert_eq!(AssetTable::asset_id(3253, 0).expect("in range"), ASSET_BASE + 32_530);
         let n = AssetTable::outcome_coin(0, 0, &mut out).expect("in range");
-        assert_eq!(&out[..n], b"+0");
+        assert_eq!(&out[..n], b"#0");
+        // The BALANCE namespace is the same enc behind a different
+        // prefix — measured on one testnet account holding one leg.
+        let n = AssetTable::outcome_balance_coin(3253, 0, &mut out).expect("in range");
+        assert_eq!(&out[..n], b"+32530", "spotClearinghouseState uses '+'");
 
         // The bound itself, and one past it.
         let n = AssetTable::outcome_coin(OUTCOME_ID_MAX, 9, &mut out).expect("at the bound");
@@ -560,14 +608,14 @@ mod tests {
     #[test]
     fn an_unbound_coin_resolves_to_nothing() {
         let mut t = AssetTable::new();
-        t.bind(42, 100_032_530, 1, b"+32530").unwrap();
-        assert_eq!(t.sym_of_coin(b"+32530"), Some(42));
-        assert_eq!(t.sym_of_coin(b"+99999"), None, "never bound");
+        t.bind(42, 100_032_530, 1, b"#32530").unwrap();
+        assert_eq!(t.sym_of_coin(b"#32530"), Some(42));
+        assert_eq!(t.sym_of_coin(b"#99999"), None, "never bound");
         assert_eq!(t.sym_of_coin(b"BTC"), None, "a perp we do not trade");
         assert_eq!(t.sym_of_coin(b""), None);
         // A PREFIX must not match: truncation is how a name collides.
-        assert_eq!(t.sym_of_coin(b"+3253"), None);
-        assert_eq!(t.sym_of_coin(b"+325300"), None);
+        assert_eq!(t.sym_of_coin(b"#3253"), None);
+        assert_eq!(t.sym_of_coin(b"#325300"), None);
     }
 
     /// A fill still in flight when the quarter rolls is a position the
@@ -577,13 +625,13 @@ mod tests {
     #[test]
     fn a_fill_from_the_instance_that_just_rolled_still_resolves() {
         let mut t = AssetTable::new();
-        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"+32530")
+        t.bind(42, AssetTable::asset_id(3253, 0).expect("in range"), 1_000, b"#32530")
             .unwrap();
-        t.bind(42, AssetTable::asset_id(3254, 0).expect("in range"), 1_001, b"+32540")
+        t.bind(42, AssetTable::asset_id(3254, 0).expect("in range"), 1_001, b"#32540")
             .unwrap();
-        assert_eq!(t.sym_of_coin(b"+32540"), Some(42), "the live leg");
+        assert_eq!(t.sym_of_coin(b"#32540"), Some(42), "the live leg");
         assert_eq!(
-            t.sym_of_coin(b"+32530"),
+            t.sym_of_coin(b"#32530"),
             Some(42),
             "a late fill from the instance that just ended is OURS"
         );
@@ -593,9 +641,9 @@ mod tests {
             "the forward direction must NOT have grown a memory"
         );
         // Two generations back is gone.
-        t.bind(42, AssetTable::asset_id(3255, 0).expect("in range"), 1_002, b"+32550")
+        t.bind(42, AssetTable::asset_id(3255, 0).expect("in range"), 1_002, b"#32550")
             .unwrap();
-        assert_eq!(t.sym_of_coin(b"+32530"), None, "only ONE generation");
+        assert_eq!(t.sym_of_coin(b"#32530"), None, "only ONE generation");
     }
 
     /// **The bug this two-pass scan exists for.** A dead
@@ -607,16 +655,16 @@ mod tests {
     fn a_live_owner_outranks_another_slots_previous_generation() {
         let mut t = AssetTable::new();
         // Slot 0: sym 42 rolls off "+A", which becomes its prev.
-        t.bind(42, 100_000_010, 1, b"+A").unwrap();
-        t.bind(42, 100_000_020, 2, b"+B").unwrap();
+        t.bind(42, 100_000_010, 1, b"#A").unwrap();
+        t.bind(42, 100_000_020, 2, b"#B").unwrap();
         // Slot 1: "+A" is now LIVE for a different symbol.
-        t.bind(99, 100_000_030, 3, b"+A").unwrap();
+        t.bind(99, 100_000_030, 3, b"#A").unwrap();
         assert_eq!(
-            t.sym_of_coin(b"+A"),
+            t.sym_of_coin(b"#A"),
             Some(99),
             "a dead prev-generation name beat the live owner"
         );
-        assert_eq!(t.sym_of_coin(b"+B"), Some(42));
+        assert_eq!(t.sym_of_coin(b"#B"), Some(42));
     }
 
     /// The mirror: slot order must be irrelevant, so binding the same
@@ -625,11 +673,11 @@ mod tests {
     fn slot_order_does_not_decide_which_symbol_a_coin_belongs_to() {
         let mut t = AssetTable::new();
         // Slot 0 holds the LIVE "+A" this time.
-        t.bind(99, 100_000_030, 3, b"+A").unwrap();
-        t.bind(42, 100_000_010, 1, b"+Z").unwrap();
-        t.bind(42, 100_000_020, 2, b"+B").unwrap();
-        assert_eq!(t.sym_of_coin(b"+A"), Some(99));
-        assert_eq!(t.sym_of_coin(b"+Z"), Some(42), "one generation back");
+        t.bind(99, 100_000_030, 3, b"#A").unwrap();
+        t.bind(42, 100_000_010, 1, b"#Z").unwrap();
+        t.bind(42, 100_000_020, 2, b"#B").unwrap();
+        assert_eq!(t.sym_of_coin(b"#A"), Some(99));
+        assert_eq!(t.sym_of_coin(b"#Z"), Some(42), "one generation back");
     }
 
     /// Two live slots claiming the same current name is a state no
@@ -638,10 +686,10 @@ mod tests {
     #[test]
     fn an_ambiguous_current_name_resolves_to_nothing() {
         let mut t = AssetTable::new();
-        t.bind(1, 100_000_010, 1, b"+DUP").unwrap();
-        t.bind(2, 100_000_020, 1, b"+DUP").unwrap();
+        t.bind(1, 100_000_010, 1, b"#DUP").unwrap();
+        t.bind(2, 100_000_020, 1, b"#DUP").unwrap();
         assert_eq!(
-            t.sym_of_coin(b"+DUP"),
+            t.sym_of_coin(b"#DUP"),
             None,
             "a guess between two live claimants is exactly what must not happen"
         );
@@ -655,15 +703,15 @@ mod tests {
     #[test]
     fn a_name_two_symbols_both_rolled_off_resolves_to_nothing() {
         let mut t = AssetTable::new();
-        t.bind(1, 100_000_010, 1, b"+A").unwrap();
-        t.bind(1, 100_000_020, 2, b"+B").unwrap();
-        t.bind(2, 100_000_030, 1, b"+A").unwrap();
-        t.bind(2, 100_000_040, 2, b"+C").unwrap();
+        t.bind(1, 100_000_010, 1, b"#A").unwrap();
+        t.bind(1, 100_000_020, 2, b"#B").unwrap();
+        t.bind(2, 100_000_030, 1, b"#A").unwrap();
+        t.bind(2, 100_000_040, 2, b"#C").unwrap();
         // "+A" is now nobody's CURRENT name and two symbols' previous.
-        assert_eq!(t.sym_of_coin(b"+B"), Some(1));
-        assert_eq!(t.sym_of_coin(b"+C"), Some(2));
+        assert_eq!(t.sym_of_coin(b"#B"), Some(1));
+        assert_eq!(t.sym_of_coin(b"#C"), Some(2));
         assert_eq!(
-            t.sym_of_coin(b"+A"),
+            t.sym_of_coin(b"#A"),
             None,
             "two prev-generation claimants must not be guessed between"
         );
@@ -693,9 +741,9 @@ mod tests {
     #[test]
     fn unbind_forgets_the_coin_too() {
         let mut t = AssetTable::new();
-        t.bind(7, 100_000_001, 1, b"+1").unwrap();
-        assert_eq!(t.sym_of_coin(b"+1"), Some(7));
+        t.bind(7, 100_000_001, 1, b"#1").unwrap();
+        assert_eq!(t.sym_of_coin(b"#1"), Some(7));
         assert!(t.unbind(7));
-        assert_eq!(t.sym_of_coin(b"+1"), None, "a settled leg is GONE");
+        assert_eq!(t.sym_of_coin(b"#1"), None, "a settled leg is GONE");
     }
 }

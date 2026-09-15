@@ -741,6 +741,26 @@ What is NOT built, and is required before any mainnet order:
    zeros, so `HlExecCounters` reaches no gauge. A live arm today would
    report zero submits and zero fills forever.
 6. The worker-side `origin` split of §6.4.
+7. **Settlement booking.** The operator ruled that a settlement should
+   book like any other fill; the code counts and discards it, because
+   the row carries no cloid and LAW E-9 forbids putting an
+   unattributed fill in the lane. Needs a deliberate attribution
+   mechanism — resolving the slot from the symbol's binding is the
+   obvious candidate — not an inference.
+8. **The `Fill::order_id` convention.** FIXED 2026-09-15, recorded
+   here because of what it implies about the class of defect. Engine
+   wide, `order_id` is the MEMBER'S `client_oid`: the paper matcher
+   stamps `o.client_oid`, the backtest stamps `f.client_oid`, and
+   `strategy_bin15::PendingLeg::oid` is documented as "the
+   `client_oid` submitted" and is what `book_fill` matches on. The
+   Hyperliquid arm stamped the VENUE oid, while the real `client_oid`
+   sat decoded in `Owner::Ours` and was discarded. Every live fill
+   would have missed every pending leg, so the member would have
+   reported zero inventory while the venue held real size — the paper
+   arm and the live arm describing different worlds, which is the
+   shape LAW E-1 exists to forbid. **It was invisible to every gate**:
+   the paper path was untouched and correct, and nothing exercised the
+   live path end to end.
 
 **The fill path allocated, and the gate that should have said so was
 measuring something else.** The first revision of `pump_user_events`
@@ -806,12 +826,89 @@ and must book; an order placed on a rolled instance is the catastrophe
 LAW E-4 exists for. Two generations back is forgotten, so the memory
 cannot grow into a way to trade a settled market.
 
+### The venue has TWO coin namespaces, and the plan recorded one
+
+**Measured against the live testnet venue, 2026-09-15**, on one account
+holding one outcome leg — both spellings observed for the same `enc`:
+
+| endpoint                             | spelling for `enc = 112410` |
+|--------------------------------------|------------------------------|
+| `l2Book`, `userFills`                | `#112410`                    |
+| `spotClearinghouseState`             | `+112410`                    |
+
+The plan records only the `+` form (§6.2, "outcome legs appear as
+`+<enc>` coins"), which is correct **for balances** and wrong for
+fills. Every hand-written `userFills` fixture in `exec-hyperliquid`
+had inherited it — including one named `a_real_frame_scans_...`, which
+was not real. They agreed with a sentence in a document and with
+nothing else.
+
+**This is the case the "bind, don't derive" design was built for, and
+it is worth being precise about what it bought.** Had the fill path
+parsed `+<enc>` directly, every venue fill would have failed to resolve
+— silently, counted as `fills_unresolved`, with `fills_booked` sitting
+at zero and looking exactly like a quiet market. Instead the cost was
+one edit in one helper (`outcome_coin` renders `#`,
+`outcome_balance_coin` renders `+` for reconciliation) and a fixture
+sweep. Nothing was ever misbooked, because nothing could be: the table
+answers only for names a roll bound.
+
+The fixtures are now **captured venue output**, not invention —
+`userws::tests::the_real_venue_shape_scans` carries three verbatim rows
+from the testnet API, and `recon.rs` keeps `+<enc>` because balances
+really are spelled that way.
+
+### Settlement arrives as a FILL
+
+The same capture turned up something the plan does not mention:
+**`userFills` carries settlement**, `dir: "Settlement"`, at px `1.0`
+for the winning side and `0.0` for the loser, both as `side: "A"` —
+the position sold back.
+
+**Operator ruling 2026-09-15: book it like any other fill** — the
+venue is the truth, and a binary payout is exactly a sale at 1.0 or
+0.0. **RECORDED, NOT IMPLEMENTED**, and the gap is not an oversight:
+
+A settlement row **carries no cloid** — the venue generated the order,
+not us. `to_fill` attributes from the cloid alone, so the row takes the
+foreign arm, becomes `Routed::TapeOnly`, and is counted
+(`fills_settlement`, `fills_foreign`) and **never pushed into lane 3**.
+Implementing the ruling means attributing a venue-originated,
+cloid-less fill to a slot, which is exactly what LAW E-9's containment
+forbids: `STRATEGY_ID_NONE` in the lane fans the fill out to EVERY
+member. That needs a deliberate mechanism — most likely resolving the
+slot from the symbol's binding rather than the cloid — and it is on the
+pre-arming list below rather than inferred here.
+
+`UserFill::is_settlement` records the flag so a settlement is never
+*inferred* from a price of 1.0, which a genuine trade can also print.
+`fills_settlement` counts every settlement row seen, booked or not, so
+it is **not** comparable with `fills_booked`.
+
+**What actually happens today, checked rather than assumed.** The
+earlier draft of this section claimed the hazard was a short sale
+against zero inventory. It is not, in either event order.
+`strategy_bin15::book_fill` matches `fill.order_id` against
+`pend_take.oid` / `pend_quote[].oid`; a settlement's id matches no
+pending leg, so it falls through to `unknown_fills` and
+`apply_position` is never reached — nothing underflows and the
+never-sells-short assertion never fires. A fill arriving for a cleared
+instance is **silently dropped**, which is the real failure mode and a
+quieter one.
+
+Note the second-order effect: `clear_instance()` wipes `pend_take` and
+`pend_quote`, so after a roll **every** late fill for that instance —
+settlement or a genuine trade — lands in `unknown_fills`. That defeats
+the one-generation memory `sym_of_coin` was built for: the exec layer
+resolves the late fill correctly and the member then forgets the order
+it belonged to. **Resolve this before a slot is armed**, not after.
+
 *The bug the second review caught.* The first version of
 `sym_of_coin` tested the current and previous names at equal
 precedence inside one scan, so a **dead** previous-generation name on a
 lower-index slot outranked a **live** current name on a higher one:
-with slot 0 as `{sym: 42, prev_coin: "+A"}` and slot 1 as
-`{sym: 99, coin: "+A"}`, a fill for `+A` resolved to 42. Not `None` and
+with slot 0 as `{sym: 42, prev_coin: "A"}` and slot 1 as
+`{sym: 99, coin: "A"}`, a fill for `A` resolved to 42. Not `None` and
 not the right symbol — confidently wrong, on the fill path, which is
 the single failure this design exists to prevent, and the one case
 where byte comparison was *not* safer than the arithmetic it replaced.
