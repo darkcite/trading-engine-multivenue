@@ -738,12 +738,14 @@ What is NOT built, and is required before any mainnet order:
    table has no notion of "this instance is over", and a dropped
    settled roll leaves the member and the binder agreeing on a dead
    one.
-8. **Settlement booking.** The operator ruled that a settlement should
-   book like any other fill; the code counts and discards it, because
-   the row carries no cloid and LAW E-9 forbids putting an
-   unattributed fill in the lane. Needs a deliberate attribution
-   mechanism — resolving the slot from the symbol's binding is the
-   obvious candidate — not an inference.
+8. ~~**Settlement booking.**~~ **BUILT** — see "Settlement arrives as
+   a FILL" above. Two residues stay open: the `dir: "Settlement"`
+   single-string threat model, and `unknown_fills` in `strategy-bin15`
+   now counting settlements, which dilutes a counter whose meaning is
+   "a fill the engine did not order". The second wants a settlement
+   marker on `Fill`, which changes the `origin` byte's contract that
+   the worker's frozen surfaces read — an operator decision, not an
+   inference.
 9. **The `Fill::order_id` convention.** FIXED 2026-09-15, recorded
    here because of what it implies about the class of defect. Engine
    wide, `order_id` is the MEMBER'S `client_oid`: the paper matcher
@@ -1026,18 +1028,107 @@ the position sold back.
 
 **Operator ruling 2026-09-15: book it like any other fill** — the
 venue is the truth, and a binary payout is exactly a sale at 1.0 or
-0.0. **RECORDED, NOT IMPLEMENTED**, and the gap is not an oversight:
+0.0. **IMPLEMENTED**, by resolving the slot from the SYMBOL.
 
-A settlement row **carries no cloid** — the venue generated the order,
-not us. `to_fill` attributes from the cloid alone, so the row takes the
-foreign arm, becomes `Routed::TapeOnly`, and is counted
-(`fills_settlement`, `fills_foreign`) and **never pushed into lane 3**.
-Implementing the ruling means attributing a venue-originated,
-cloid-less fill to a slot, which is exactly what LAW E-9's containment
-forbids: `STRATEGY_ID_NONE` in the lane fans the fill out to EVERY
-member. That needs a deliberate mechanism — most likely resolving the
-slot from the symbol's binding rather than the cloid — and it is on the
-pre-arming list below rather than inferred here.
+#### The mechanism
+
+A settlement row carries no cloid — the venue generated the order, not
+us — so `to_fill` has nothing to attribute from and the row would take
+the foreign arm forever. The slot therefore comes from the asset-table
+binding:
+
+- `AssetTable::note_owner(sym, strategy_id)` runs in the **accepted**
+  arm of `submit`, never at intent. An order the budget, the scale
+  guards, the signer, the transport or the venue itself refused never
+  traded, and a leg we have not traded must not absorb a settlement.
+- `AssetTable::owner_of_sym(sym)` reads it back in `route_frame`.
+- `userws::to_fill_as` converts with that explicitly supplied slot.
+
+#### Why this does not punch a hole in LAW E-9
+
+It is a SECOND attribution path, and LAW E-9 exists to forbid exactly
+that, so the gate is narrow and every neighbouring case keeps the old
+behaviour. The gate is `is_settlement && cloid.is_none()`:
+
+| row | outcome |
+|---|---|
+| settlement, leg we trade | attributed to the owner, booked |
+| settlement, leg we do not | `fills_unowned`, booked nowhere |
+| cloid-less row that is NOT a settlement | foreign, as before |
+| `dir` absent entirely | reads as not-a-settlement — fails closed |
+| settlement that DOES carry a cloid | attributed from the cloid, which is strictly better |
+
+`to_fill_as` is the only function anywhere that takes a caller-supplied
+slot, and it **refuses at runtime in every profile** — not under
+`debug_assert!`, which release compiles out — both a non-settlement row
+(`ConvertErr::NotSettlement`) and `STRATEGY_ID_NONE`
+(`ConvertErr::NoSlot`, the fan-out sentinel).
+
+Ownership's lifecycle: learned only on acceptance; **survives a roll by
+design**, because the member trading the Yes leg of one instance is the
+member trading the Yes leg of its successor; cleared only by `unbind`.
+Two members trading one symbol marks the slot CONTESTED — sticky, never
+un-contested, counted `owner_contested` — and `owner_of_sym` answers
+`None` thereafter, so its settlements are counted and never booked. That
+is the same rule `sym_of_coin` applies to an ambiguous coin: a guess
+between two claimants is the misattribution this module exists to
+prevent. One symbol belongs to one member; a contest is a configuration
+error, not a market event.
+
+#### The threat model, stated rather than left implicit
+
+The gate rests on one venue-controlled byte-compare against
+`dir: "Settlement"`.
+
+- If the venue **renamed** the string, the row falls back to foreign —
+  the safe direction, and exactly the pre-ruling behaviour.
+- If the venue sent `dir: "Settlement"` on a cloid-less row that was
+  really a trade, it would be booked to the owning slot. **"No cloid"
+  is not a second independent check**: the venue omits the cloid for
+  every order we did not place, so the two halves of the gate are not
+  independent. That is the residue of accepting the ruling, and it is
+  recorded rather than argued away.
+
+#### What booking achieves, and what it does not
+
+This is the load-bearing justification, and it is written down so the
+next reader does not re-derive it.
+
+**It achieves the TAPE.** The engine captures every lane-3 fill to
+`engine-fills.pmlr` *before* the strategy sees it, so lane arrival alone
+is enough. Pre-ruling the settlement was `Routed::TapeOnly`, which is
+never pushed into the lane, so it reached the capture not at all.
+Downstream, `audit_pnl`'s fold reads only `px`, `qty`, `side` and `sym`:
+a settlement at side Ask credits `px × qty` and drives `paper_qty[sym]`
+to zero. **The mark-out is the sharper half** — without the settlement
+fill, `paper_qty[sym]` stays at N and is marked at a stale last mid on a
+market that no longer exists. The settlement is what retires that
+phantom position.
+
+**It does NOT close the member's in-memory position.** `to_fill_as`
+stamps the VENUE's oid (a settlement matches no pending leg of the
+member's, and pretending otherwise would collide with a real
+`client_oid`), so `strategy_bin15::book_fill` finds no match, counts it
+`unknown_fills`, and never reaches `apply_position`. The member is
+flattened instead by `clear_instance()` on the roll, which zeroes
+`pos_yes_1e6`/`pos_no_1e6`. Either arrival order ends flat. **The
+outcome is right by both paths and the mechanisms are different**, and
+"book it like any other fill" without this paragraph would be a claim
+the code does not support.
+
+One consequence stays open: `unknown_fills` now counts settlements,
+diluting a counter whose meaning is "a fill the engine did not order".
+It is a reporting cost and not a live hazard — the counter reaches a
+gauge and no halt, and kill-switch trigger 3 is not wired for this
+member. Fixing it properly means marking a settlement on the `Fill`
+itself, which changes the `origin`/`strategy_id` byte contract that the
+worker's frozen surfaces read — an **operator decision**, not an
+inference, and on the pre-arming list.
+
+`fills_unowned` and `owner_contested` join `fills_settlement` as
+counters that, like every other counter here, reach no gauge until
+`stats()` is wired (pre-arming item 5) — visible to a test and not to
+an operator.
 
 `UserFill::is_settlement` records the flag so a settlement is never
 *inferred* from a price of 1.0, which a genuine trade can also print.

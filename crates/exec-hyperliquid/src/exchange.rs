@@ -55,7 +55,7 @@ use crate::nonce::Nonce;
 use crate::request::{envelope, order_json};
 use crate::response::{scan, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
-use crate::userws::{scan_user_fills, to_fill, Routed, TidRing, UserFill, SNAPSHOT_RING};
+use crate::userws::{scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING};
 use crate::userws_conn::UserWs;
 
 /// Engine 1e6 → venue 1e8.
@@ -129,6 +129,18 @@ pub struct HlExecCounters {
     /// sale at 1.0 or 0.0) — counted separately only so an operator
     /// watching a position go flat can tell settlement from a trade.
     pub fills_settlement: u64,
+    /// Symbols two different strategy slots have both traded. The
+    /// binding stops naming an owner, so their settlements are counted
+    /// and never booked — guessing between two claimants is the
+    /// misattribution this module exists to prevent. **A
+    /// configuration error, not a market event**: one symbol belongs
+    /// to one member.
+    pub owner_contested: u64,
+    /// Settlements for a leg NO member has ever traded, so
+    /// the binding records no owner. Counted, never booked: a position
+    /// cannot exist in a leg nothing traded, and guessing a slot is the
+    /// misattribution this module exists to prevent.
+    pub fills_unowned: u64,
     /// Fills whose VENUE TIMESTAMP did not convert to nanoseconds.
     /// The fill is still booked, stamped with the local receive clock:
     /// a position is real whatever the venue says the time was, and a
@@ -412,6 +424,38 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     counters.fills_unresolved.wrapping_add(1);
                 continue;
             };
+            // A SETTLEMENT has no cloid — the venue placed the order,
+            // not us — so `to_fill` routes it to the tape-only arm and
+            // it never reaches lane 3 at all. Operator ruling
+            // 2026-09-15: book it, the venue is the truth. The slot
+            // comes from the BINDING, which learned it from an order
+            // the VENUE ACCEPTED — never from the fill, and never from
+            // a submit that was merely attempted. A leg nothing has
+            // traded still books nothing.
+            if f.is_settlement && f.cloid.is_none() {
+                match assets.owner_of_sym(sym) {
+                    Some(slot) => match to_fill_as(&f, sym, ts, slot) {
+                        Ok(fill) => {
+                            if fills.try_push(fill).is_err() {
+                                counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
+                            } else {
+                                counters.fills_booked = counters.fills_booked.wrapping_add(1);
+                                booked += 1;
+                            }
+                        }
+                        Err(_) => {
+                            counters.fills_refused = counters.fills_refused.wrapping_add(1);
+                        }
+                    },
+                    // Never traded by any member we know of. Counted,
+                    // not guessed — STRATEGY_ID_NONE in the lane would
+                    // fan it out to everybody.
+                    None => {
+                        counters.fills_unowned = counters.fills_unowned.wrapping_add(1);
+                    }
+                }
+                continue;
+            }
             match to_fill(&f, sym, ts) {
                 Ok(Routed::Slot(fill)) => {
                     if fills.try_push(fill).is_err() {
@@ -630,6 +674,18 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             // order; it never books a fill.
             Ok(HlResponse::Ok(ok)) if ok.accepted() => {
                 self.counters.submitted = self.counters.submitted.wrapping_add(1);
+                // WHO trades this leg — recorded on ACCEPTANCE, not on
+                // intent. The venue settles a binary with a cloid-less
+                // fill, so attribution has to come from somewhere that
+                // is not the fill, and the only authority that cannot
+                // be wrong is a member whose order the venue took. A
+                // submit refused by the budget, the scale guards, the
+                // signer or the venue never traded, and a leg we have
+                // not traded must not absorb a settlement.
+                if self.assets.note_owner(order.sym, order.strategy_id) {
+                    self.counters.owner_contested =
+                        self.counters.owner_contested.wrapping_add(1);
+                }
                 Ok(())
             }
             // The venue understood us and said NO. Distinct from an
@@ -1187,6 +1243,157 @@ mod tests {
                 Err(crate::asset::AssetError::StaleInstance { .. })
             ),
             "the refusal must be STALE, not merely unbound"
+        );
+    }
+
+    /// **The operator ruling, end to end.** A settlement carries no
+    /// cloid, so nothing in the fill can say whose position closed.
+    /// The slot is learned on the way OUT — from an order the member
+    /// actually submitted — and read on the way back IN.
+    #[test]
+    fn a_settlement_books_against_the_slot_that_traded_the_leg() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+
+        // A leg nothing has traded books NOTHING, however real the
+        // settlement is.
+        const SETTLE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"1.0","sz":"2.0","side":"A","time":1757942400000,"oid":88,"tid":5001,"dir":"Settlement","fee":"0.0"}]}}"##;
+        assert_eq!(x.route_fills(SETTLE), 0);
+        assert_eq!(x.counters().fills_unowned, 1, "no member has traded this leg");
+        assert_eq!(x.counters().fills_booked, 0);
+        assert_eq!(x.counters().fills_settlement, 1, "still SEEN");
+
+        // Now a member owns the leg.
+        // Ownership now comes from an order the VENUE ACCEPTED, which
+        // a unit test cannot produce — so it is stated directly. That
+        // is the honest shape: the test asserts what happens once a
+        // member has traded the leg, not that a refused submit teaches
+        // the table (it must not, and `note_owner`'s caller is what
+        // holds that).
+        assert!(!x.assets_mut().note_owner(4096, 3), "not contested");
+        assert_eq!(
+            x.assets().owner_of_sym(4096),
+            Some(3),
+            "the table must learn the owner from the order"
+        );
+
+        // A DIFFERENT tid, so the ring does not dedupe it.
+        const SETTLE2: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"1.0","sz":"2.0","side":"A","time":1757942400000,"oid":89,"tid":5002,"dir":"Settlement","fee":"0.0"}]}}"##;
+        assert_eq!(x.route_fills(SETTLE2), 1, "the settlement must now BOOK");
+        assert_eq!(x.counters().fills_booked, 1);
+        assert_eq!(x.counters().fills_unowned, 1, "unchanged");
+        assert_eq!(x.counters().fills_foreign, 0, "it must NOT go to the tape arm");
+    }
+
+    /// The narrowness IS the safety. A cloid-less row that is not a
+    /// settlement is an order some other system placed on this
+    /// account; attributing it by symbol would book a stranger's trade
+    /// against a member, which is what LAW E-9 forbids.
+    #[test]
+    fn a_cloidless_row_that_is_not_a_settlement_is_still_foreign() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        // Ownership now comes from an order the VENUE ACCEPTED, which
+        // a unit test cannot produce — so it is stated directly. That
+        // is the honest shape: the test asserts what happens once a
+        // member has traded the leg, not that a refused submit teaches
+        // the table (it must not, and `note_owner`'s caller is what
+        // holds that).
+        assert!(!x.assets_mut().note_owner(4096, 3), "not contested");
+        assert_eq!(x.assets().owner_of_sym(4096), Some(3), "owner is known");
+
+        // Same leg, same account, no cloid — but `dir` says trade.
+        const OTHER: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.7","sz":"2.0","side":"B","time":1757942400000,"oid":90,"tid":5003,"dir":"Buy","fee":"0.0"}]}}"##;
+        assert_eq!(x.route_fills(OTHER), 0, "not ours to book");
+        assert_eq!(x.counters().fills_foreign, 1);
+        assert_eq!(x.counters().fills_booked, 0);
+    }
+
+    /// **A submit the venue never took must teach the table nothing.**
+    /// Ownership is what lets a cloid-less settlement be booked, so a
+    /// leg we merely TRIED to trade must not absorb one. The first
+    /// version of this recorded ownership at intent, right after the
+    /// asset lookup and before every other refusal.
+    #[test]
+    fn a_refused_submit_leaves_the_leg_unowned() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+
+        // Refused by the BUDGET — after the asset lookup succeeded,
+        // which is exactly where the old `note_owner` sat.
+        assert!(x.budget_remaining() <= 0, "a cold budget refuses");
+        let mut o = order(4096, ORDER_KIND_MAKER);
+        o.client_oid = 19_418;
+        o.strategy_id = 3;
+        assert_eq!(x.submit(&o).unwrap_err(), DispatchError::SlotDisabled);
+        assert_eq!(
+            x.assets().owner_of_sym(4096),
+            None,
+            "a submit the venue never saw must not claim the leg"
+        );
+
+        // Refused for an UNBOUND symbol — before the lookup.
+        let mut o2 = order(9_999, ORDER_KIND_MAKER);
+        o2.strategy_id = 3;
+        assert!(x.submit(&o2).is_err());
+        assert_eq!(x.assets().owner_of_sym(9_999), None);
+
+        // And so its settlement books nothing.
+        const SETTLE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"1.0","sz":"2.0","side":"A","time":1757942400000,"oid":88,"tid":8001,"dir":"Settlement","fee":"0.0"}]}}"##;
+        assert_eq!(x.route_fills(SETTLE), 0);
+        assert_eq!(x.counters().fills_unowned, 1);
+    }
+
+    /// Two members on one symbol is a configuration error, and the
+    /// table refuses to pick between them — the same rule
+    /// `sym_of_coin` applies to an ambiguous coin.
+    #[test]
+    fn a_leg_two_members_trade_stops_naming_an_owner() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        assert!(!x.assets_mut().note_owner(4096, 3));
+        assert_eq!(x.assets().owner_of_sym(4096), Some(3));
+
+        // A second member trades the same leg.
+        assert!(x.assets_mut().note_owner(4096, 5), "must report the contest");
+        assert_eq!(
+            x.assets().owner_of_sym(4096),
+            None,
+            "a contested leg must name NO owner rather than the last writer"
+        );
+        // And it stays contested — the first member trading again does
+        // not win it back.
+        assert!(!x.assets_mut().note_owner(4096, 3));
+        assert_eq!(x.assets().owner_of_sym(4096), None);
+
+        // So its settlements are counted, never booked.
+        const SETTLE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"1.0","sz":"2.0","side":"A","time":1757942400000,"oid":88,"tid":7001,"dir":"Settlement","fee":"0.0"}]}}"##;
+        assert_eq!(x.route_fills(SETTLE), 0);
+        assert_eq!(x.counters().fills_unowned, 1);
+        assert_eq!(x.counters().fills_booked, 0);
+    }
+
+    /// The owner survives the quarter-hour roll — the member trading
+    /// the Yes leg of one instance is the member trading the Yes leg
+    /// of its successor.
+    #[test]
+    fn the_owner_survives_a_roll() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        // Ownership now comes from an order the VENUE ACCEPTED, which
+        // a unit test cannot produce — so it is stated directly. That
+        // is the honest shape: the test asserts what happens once a
+        // member has traded the leg, not that a refused submit teaches
+        // the table (it must not, and `note_owner`'s caller is what
+        // holds that).
+        assert!(!x.assets_mut().note_owner(4096, 3), "not contested");
+        assert_eq!(x.assets().owner_of_sym(4096), Some(3));
+
+        x.on_venue_event(&roll(19_419, 0, false, 4096));
+        assert_eq!(
+            x.assets().owner_of_sym(4096),
+            Some(3),
+            "a roll must not make the successor's settlement unattributable"
         );
     }
 

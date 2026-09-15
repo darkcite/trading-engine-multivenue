@@ -35,6 +35,15 @@ pub const ASSET_BASE: u32 = 100_000_000;
 /// holds the two in agreement by re-deriving it.
 pub const OUTCOME_ID_MAX: u32 = (u32::MAX - ASSET_BASE - 9) / 10;
 
+/// [`AssetSlot::owner`] when more than one strategy slot has traded
+/// the symbol.
+///
+/// A distinct value rather than reverting to `STRATEGY_ID_NONE`: the
+/// two mean different things, and only this one is a state worth
+/// counting. `0xFE` cannot collide with a real slot — the set is
+/// eight wide.
+const OWNER_CONTESTED: u8 = 0xFE;
+
 /// Longest venue coin name a slot can hold, in bytes.
 ///
 /// Twenty bytes covers an eleven-digit `#<enc>` with room over, and
@@ -134,7 +143,12 @@ struct AssetSlot {
     live: bool,
     coin_len: u8,
     prev_coin_len: u8,
-    _pad: [u8; 5],
+    /// The strategy slot that has actually SUBMITTED against this leg,
+    /// or `STRATEGY_ID_NONE`. Learned from our own orders — see
+    /// [`AssetTable::note_owner`] — never from a roll, which carries
+    /// no slot, and never from a fill.
+    owner: u8,
+    _pad: [u8; 4],
 }
 
 impl Default for AssetSlot {
@@ -154,7 +168,8 @@ impl AssetSlot {
         live: false,
         coin_len: 0,
         prev_coin_len: 0,
-        _pad: [0; 5],
+        owner: core_types::STRATEGY_ID_NONE,
+        _pad: [0; 4],
     };
 }
 
@@ -314,6 +329,9 @@ impl AssetTable {
                 // The roll: the name this slot held becomes the
                 // previous generation, so a fill still in flight from
                 // the instance that just ended can still be resolved.
+                // `owner` is deliberately NOT cleared: the member
+                // trading the Yes leg of one instance is the member
+                // trading the Yes leg of its successor.
                 s.prev_coin = s.coin;
                 s.prev_coin_len = s.coin_len;
                 s.coin = [0; COIN_MAX];
@@ -378,6 +396,86 @@ impl AssetTable {
             i += 1;
         }
         true
+    }
+
+    /// Record which strategy slot trades `sym`, learned from an order
+    /// the slot actually submitted.
+    ///
+    /// **The settlement problem.** The venue settles a binary by
+    /// emitting a FILL with no cloid — it placed the order, not us — so
+    /// LAW E-9's attribution has nothing to read, and
+    /// `STRATEGY_ID_NONE` in the lane would fan the fill out to EVERY
+    /// member. The slot has to come from somewhere else, and the only
+    /// authority that cannot be wrong about who trades a leg is the
+    /// member that has been sending orders for it.
+    ///
+    /// So the owner is learned from an order the venue ACCEPTED, and
+    /// read back at settlement. Acceptance rather than submission is
+    /// the point: a submit that the budget, the scale guards, the
+    /// signer or the venue itself refused never traded, and a leg we
+    /// have not traded must not absorb a settlement.
+    ///
+    /// Survives a roll. `bind` keeps it, because the member trading
+    /// the Yes leg of one instance is the member trading the Yes leg
+    /// of its successor — that is what a family IS.
+    ///
+    /// **A contested leg is refused, not overwritten.** Two members
+    /// trading one symbol is a state no configuration should produce,
+    /// and picking between them is precisely the misattribution this
+    /// module exists to prevent — the same rule [`Self::sym_of_coin`]
+    /// applies to an ambiguous coin. The slot is marked contested and
+    /// [`Self::owner_of_sym`] answers `None` for it thereafter, so its
+    /// settlements are counted and never booked. Returns whether the
+    /// call was a contested rejection, so a caller can count it.
+    #[inline]
+    pub fn note_owner(&mut self, sym: u32, strategy_id: u8) -> bool {
+        if strategy_id == core_types::STRATEGY_ID_NONE {
+            return false;
+        }
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: `i` is bounded by the loop condition and the
+            // array is exactly ASSET_SLOTS long.
+            let s = unsafe { self.slots.get_unchecked_mut(i) };
+            if s.live && s.sym == sym {
+                if s.owner == OWNER_CONTESTED {
+                    return false;
+                }
+                if s.owner != core_types::STRATEGY_ID_NONE && s.owner != strategy_id {
+                    s.owner = OWNER_CONTESTED;
+                    return true;
+                }
+                s.owner = strategy_id;
+                return false;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The strategy slot that trades `sym`, if one has submitted.
+    ///
+    /// Read ONLY for a settlement — see [`Self::note_owner`]. A normal
+    /// fill still needs its cloid, because a cloid-less non-settlement
+    /// row is an order some other system placed on this account, and
+    /// attributing that to a member would book a stranger's trade.
+    #[inline]
+    #[must_use]
+    pub fn owner_of_sym(&self, sym: u32) -> Option<u8> {
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: as above.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live
+                && s.sym == sym
+                && s.owner != core_types::STRATEGY_ID_NONE
+                && s.owner != OWNER_CONTESTED
+            {
+                return Some(s.owner);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Is `sym` bound right now, under any instance?

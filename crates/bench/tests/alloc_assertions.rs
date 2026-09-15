@@ -6266,6 +6266,20 @@ fn hl_exchange_route_frame_is_zero_alloc() {
                 base_tid + i
             ));
         }
+        // Two SETTLEMENT rows — the venue's own, cloid-less, at 1.0
+        // for the winner and 0.0 for the loser. They take the
+        // attribute-by-symbol branch, which is otherwise unmeasured.
+        // Their tids ride `base_tid` too, or the priming frame and the
+        // measured frame would share them and the dedupe ring would
+        // eat the second pair — correctly, which is how the first
+        // version of this fixture came out two short.
+        for k in 0..2u64 {
+            f.push_str(&format!(
+                r##",{{"coin":"#32530","px":"{px}","sz":"25","side":"A","time":1757942400000,"oid":{t},"tid":{t},"dir":"Settlement","fee":"0.0"}}"##,
+                px = if k == 0 { "1.0" } else { "0.0" },
+                t = base_tid + 900_000 + k,
+            ));
+        }
         f.push_str("]}}");
         f.into_bytes()
     }
@@ -6281,6 +6295,10 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     assets
         .bind(7, AssetTable::asset_id(3253, 0).expect("in range"), 1, b"#32530")
         .expect("bind");
+    // An owner, so the SETTLEMENT rows below take the attribute-by-
+    // symbol branch rather than stopping at `fills_unowned`. Without
+    // this the branch is in the fixture and not in the measurement.
+    assets.note_owner(7, 3);
 
     // Every buffer preallocated, exactly as `HlExchange::new` does it.
     let mut scratch: Vec<UserFill> = vec![UserFill::default(); SNAPSHOT_RING];
@@ -6350,10 +6368,16 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     // nothing. A gate's own coverage claim is worth exactly as much as
     // the assertion that holds it.
     assert_eq!(
-        counters.fills_booked, 800,
-        "expected 400 primed + 400 fresh rows BOOKED and then pure dedupe; saw {}",
+        counters.fills_booked, 804,
+        "expected 400 primed + 400 fresh rows, plus 2 settlements each, BOOKED and then \
+         pure dedupe; saw {}",
         counters.fills_booked
     );
+    assert_eq!(
+        counters.fills_settlement, 4,
+        "the settlement branch must have been INSIDE the measured region too"
+    );
+    assert_eq!(counters.fills_unowned, 0, "the leg has an owner");
     assert_eq!(
         counters.fills_unresolved, 0,
         "the coin is bound; nothing should have failed to resolve"

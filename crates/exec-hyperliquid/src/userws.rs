@@ -132,6 +132,19 @@ pub enum ConvertErr {
     /// past the zero check, which only ever tested for zero. Side is
     /// carried by `side`, never by the sign of a number.
     Negative,
+    /// [`to_fill_as`] was handed a row that is not a settlement.
+    ///
+    /// The whole reason attribution-by-symbol is permitted at all is
+    /// that a settlement's order was placed by the VENUE against a
+    /// position that is unambiguously ours. A cloid-less row that is
+    /// not a settlement is an order some other system placed on this
+    /// account, and booking it by symbol is the stranger's trade LAW
+    /// E-9 forbids.
+    NotSettlement,
+    /// [`to_fill_as`] was handed [`STRATEGY_ID_NONE`] — the fan-out
+    /// sentinel. In the lane it would deliver the fill to EVERY
+    /// member.
+    NoSlot,
 }
 
 /// Where a converted fill is allowed to go.
@@ -236,6 +249,64 @@ pub fn to_fill(f: &UserFill, sym: SymbolId, now_ns: NsTs) -> Result<Routed, Conv
             mk(f.oid).with_attribution(STRATEGY_ID_NONE, FILL_ORIGIN_VENUE),
         )),
     }
+}
+
+/// Convert a fill and attribute it to a slot the CALLER supplies.
+///
+/// The narrow companion to [`to_fill`], and narrow on purpose. `to_fill`
+/// reads the cloid, which is the only honest answer for a fill someone
+/// placed — LAW E-9 exists because a fill attributed by anything softer
+/// than the cloid can book a stranger's trade against a member.
+///
+/// A SETTLEMENT is the one row where that reasoning does not apply: the
+/// venue placed the order, so there is no cloid to read, and the
+/// position being closed is unambiguously ours. The caller supplies the
+/// slot from the asset-table binding, which learned it from orders the
+/// member actually sent. **Nothing else may use this** — a cloid-less
+/// row that is NOT a settlement is an order some other system placed on
+/// this account, and attributing it by symbol would book exactly the
+/// stranger's trade LAW E-9 forbids.
+///
+/// `order_id` is the VENUE's oid: a settlement matches no pending leg
+/// of the member's, and pretending otherwise would collide with a real
+/// `client_oid`.
+///
+/// # Errors
+/// As [`to_fill`], plus [`ConvertErr::NotSettlement`] for a row this
+/// may not attribute and [`ConvertErr::NoSlot`] for the fan-out
+/// sentinel — both refused in EVERY profile.
+pub fn to_fill_as(
+    f: &UserFill,
+    sym: SymbolId,
+    now_ns: NsTs,
+    strategy_id: u8,
+) -> Result<Fill, ConvertErr> {
+    // REFUSED at runtime in every profile, not under `debug_assert!`.
+    // Release turns debug assertions off, and this function is `pub`
+    // in a `pub` module: it returns a lane-3-eligible `Fill` with a
+    // CALLER-SUPPLIED slot, which is the exact shape LAW E-9 exists to
+    // forbid. Today's caller gates correctly; the function must not
+    // depend on that. Same ruling `AssetTable::asset_id` got, for the
+    // same reason.
+    if !f.is_settlement {
+        return Err(ConvertErr::NotSettlement);
+    }
+    if strategy_id == STRATEGY_ID_NONE {
+        return Err(ConvertErr::NoSlot);
+    }
+    if f.px_1e8 < 0 || f.sz_1e8 < 0 {
+        return Err(ConvertErr::Negative);
+    }
+    let px = f.px_1e8 / WIRE_TO_ENGINE;
+    let qty = f.sz_1e8 / WIRE_TO_ENGINE;
+    if qty == 0 {
+        return Err(ConvertErr::ZeroQuantity);
+    }
+    let side = if f.is_buy { Side::Bid } else { Side::Ask };
+    Ok(
+        Fill::new(now_ns, sym, side, Price::from_raw(px), Qty::from_raw(qty), f.oid)
+            .with_attribution(strategy_id, FILL_ORIGIN_VENUE),
+    )
 }
 
 /// Is this fill one of ours, and whose?
