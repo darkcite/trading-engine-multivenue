@@ -60,10 +60,15 @@
 //!   forwards it — but that path hands its dispatcher straight to the
 //!   engine loop with no `DispatcherWorker`, so nothing calls the hook
 //!   there yet. Wiring it changes the arming path and belongs to E7.
-//! * The **coin → `SymbolId` binding**. `exchange::resolve_sym` is a
-//!   fail-closed stub returning `None`, so no venue fill is booked at
-//!   all today. A guessed symbol moves a position the member never
-//!   took, silently and permanently; a missing fill is caught by
+//! * The **roll handler** that calls [`asset::AssetTable::bind`].
+//!   The coin → `SymbolId` resolution itself IS built —
+//!   [`asset::AssetTable::sym_of_coin`] answers by comparing bytes
+//!   against what a roll bound, never by parsing `+<enc>` — but
+//!   nothing in this workspace yet binds a leg from a real
+//!   `outcomeCreated` event, so in production the table is empty and
+//!   every fill is still counted `fills_unresolved`. That is the
+//!   correct state: a guessed symbol moves a position the member never
+//!   took, silently and permanently, while a missing fill is caught by
 //!   reconciliation inside a minute.
 //! * The **reconciliation timer** (§6.2) and the **tape write** for a
 //!   foreign fill (§6.1). Both are recorded as open in

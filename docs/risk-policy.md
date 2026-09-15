@@ -708,12 +708,22 @@ barrier") and the prediction has come true.
 
 What is NOT built, and is required before any mainnet order:
 
-1. **The coin → `SymbolId` binding.** `exchange::resolve_sym` is a
-   fail-closed stub returning `None`, so **nothing is booked into fill
-   lane 3 at all today** — `fills_booked` is structurally zero and must
-   not be read as a live number. A guessed symbol moves a position the
-   member never took, silently and permanently; a missing fill is
-   caught by reconciliation inside a minute.
+1. **The roll handler that calls `AssetTable::bind`.** The coin →
+   `SymbolId` *resolution* is built (see "The fill path's LAW E-4"
+   below) and a bound coin does reach fill lane 3. But **nothing in
+   this workspace binds a leg from a real `outcomeCreated` event**, so
+   in production the table is EMPTY and every venue fill is still
+   counted `fills_unresolved` and booked never. `fills_booked` remains
+   structurally zero and must not be read as a live number.
+
+   That is the correct code state — counted-not-booked is strictly
+   safer than misattributed — but note the operator hazard it creates,
+   because it is the reason this item stays on the list: with
+   `stats()` returning zeros (item 5), an armed slot in this state
+   shows an operator zero fills forever, with no way to tell "nothing
+   traded" from "every fill was dropped on the floor" while the venue
+   holds real positions the engine's view has at zero. **Do not arm a
+   slot before the roll handler exists.**
 2. **The dispatcher-worker wiring on the `--exec` path.** `on_idle`
    exists and `RoutedDispatcher` forwards it, but that path hands its
    dispatcher straight to the engine loop with no `DispatcherWorker`,
@@ -758,6 +768,82 @@ directly over a 400-row snapshot-sized frame, and was verified to FAIL
 (200 allocations, 8.3 MB) when a single `payload.to_vec()` is
 reintroduced — a gate whose failure has never been observed is a claim,
 not a check.
+
+### The fill path's LAW E-4 — `AssetTable::sym_of_coin`
+
+The venue echoes a coin name in every `userFills` row; the engine
+routes on its own `SymbolId`. Resolving one to the other was the last
+thing standing between the live arm and a booked fill, and there were
+two ways to do it.
+
+The tempting one is arithmetic. The plan states the encoding twice
+(§"Asset id for a HIP-4 leg", and §6.2's "outcome legs appear as
+`+<enc>` coins"), `ingress-hyperliquid` already implements
+`100_000_000 + enc`, and parsing `+<enc>` back out is four lines. **It
+is not what this does.** A fill booked against the wrong symbol moves a
+position the member never took, silently, in the tape, forever — and
+reconciliation, the backstop that catches a *missing* fill inside a
+minute, catches a misattributed one never. An encoding we have not yet
+seen on a real outcome position is not a foundation to put that on.
+
+So the coin name is **bound, not derived**, by exactly the discipline
+LAW E-4 applies to asset ids in the other direction: the roll event
+that supplies the asset id supplies the venue's name for the leg,
+`AssetTable` stores it, and `sym_of_coin` answers by **comparing
+bytes**. A coin no roll bound resolves to nothing and its fill is
+counted (`fills_unresolved`), never booked. `AssetTable::outcome_coin`
+exists so a roll handler has one place to compute `+<enc>` — the mirror
+of `asset_id`, and like it, deliberately unreachable from the fill
+path. **If the venue spells an outcome leg differently from what the
+plan records, the failure is a counted non-booking and one edit in the
+roll handler, not a misattributed position.**
+
+*One deliberate asymmetry.* `sym_of_coin` remembers the previous
+generation of each slot's name; `lookup` — which authorises ORDERS —
+does not, and still refuses a stale instance outright. A fill arriving
+just after the quarter-hour roll is a position the member really took
+and must book; an order placed on a rolled instance is the catastrophe
+LAW E-4 exists for. Two generations back is forgotten, so the memory
+cannot grow into a way to trade a settled market.
+
+*The bug the second review caught.* The first version of
+`sym_of_coin` tested the current and previous names at equal
+precedence inside one scan, so a **dead** previous-generation name on a
+lower-index slot outranked a **live** current name on a higher one:
+with slot 0 as `{sym: 42, prev_coin: "+A"}` and slot 1 as
+`{sym: 99, coin: "+A"}`, a fill for `+A` resolved to 42. Not `None` and
+not the right symbol — confidently wrong, on the fill path, which is
+the single failure this design exists to prevent, and the one case
+where byte comparison was *not* safer than the arithmetic it replaced.
+It is now two passes: every slot's current generation first, then one
+generation back only if nothing live owns the name. A coin claimed by
+two live slots is ambiguous and resolves to `None`. Both properties are
+held by tests that were verified to FAIL against the single-pass form,
+returning exactly `Some(42)` and `Some(1)` where the fix returns
+`Some(99)` and `None`. The gap that let it through was narrow and worth
+naming: every test bound exactly ONE symbol, so the only configuration
+in which the function can be wrong was never constructed.
+
+Three smaller things fell out of writing it. `outcome_coin` first
+computed `10 * outcome_id + side` unchecked; its own test caught the
+overflow, and it now refuses an id past `OUTCOME_ID_MAX` by writing no
+name at all. `asset_id` had the same latent wrap, and it now refuses at
+**runtime in every profile** rather than under `debug_assert!` — the
+release profile sets `overflow-checks = false`, so a debug-only guard
+is a no-op in the artifact that actually trades, and the wrap does not
+land somewhere harmless: it lands in the low `u32` range, the PERP
+asset-id space, where a nonsense outcome id becomes a valid BTC or ETH
+asset id. A name that fails to render is harmless; an order placed on
+someone else's market is the thing LAW E-4 exists for. And `bind` now
+refuses an EMPTY coin name, because binding an asset id with no name
+authorises orders for a leg whose fills can never resolve — a roll
+handler written as `bind(.., &out[..n.unwrap_or(0)])` would land
+exactly there, silently.
+
+Gate 56 now measures the **whole** book path —
+`to_fill`, the cloid attribution, `try_push` into the lane and
+`on_venue_fill` against the budget — which was unreachable while the
+resolver was a `None` stub; 800 fills book inside the guard at 0 B/op.
 
 **`fills_bad_ts`** is new alongside it. The venue's millisecond stamp
 was converted with `saturating_mul`, which clamps a corrupt value to

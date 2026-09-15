@@ -204,6 +204,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         &mut self.assets
     }
 
+    /// The asset table, read-only — what the fill path resolves coin
+    /// names against.
+    #[inline]
+    #[must_use]
+    pub const fn assets(&self) -> &AssetTable {
+        &self.assets
+    }
+
     /// Operator counters.
     #[inline]
     #[must_use]
@@ -249,6 +257,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         Self::route_frame(
             payload,
             recv_ns,
+            &self.assets,
             &mut self.scratch,
             &mut self.seen,
             &mut self.budget,
@@ -272,9 +281,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// `&mut self` router cannot be called from inside
     /// [`UserWs::pump`]'s closure — and the copy that used to buy its
     /// way around that was a heap `Vec` grown per frame, on the one
-    /// thread that also signs and submits. Taking the five fields this
-    /// needs (none of which is `ws`) lets the scan read the socket's
-    /// own receive buffer in place: zero copy, zero allocation.
+    /// thread that also signs and submits. Taking the six fields this
+    /// needs (none of which is `ws`, and `assets` only by shared
+    /// reference) lets the scan read the socket's own receive buffer
+    /// in place: zero copy, zero allocation.
     ///
     /// Public so the allocation gate can measure THIS function rather
     /// than a lookalike. The audit that produced this shape also found
@@ -290,6 +300,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     pub fn route_frame(
         payload: &[u8],
         recv_ns: NsTs,
+        assets: &AssetTable,
         scratch: &mut [UserFill],
         seen: &mut TidRing<SNAPSHOT_RING>,
         budget: &mut AddressBudget,
@@ -357,16 +368,15 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 }
             };
 
-            // THE SYMBOL. The venue echoes a COIN NAME ("BTC",
-            // "+3253"); the engine routes on its own `SymbolId`, and
-            // nothing yet maps one to the other.
-            //
-            // So the fill is counted and NOT booked. A fill booked
+            // THE SYMBOL. The venue echoes a COIN NAME; the engine
+            // routes on its own `SymbolId`. The table answers by
+            // COMPARING BYTES against what a roll bound — never by
+            // parsing `+<enc>` back into an asset id. A fill booked
             // against the wrong symbol moves a position the member
-            // never took, silently, in the tape, forever. A missing
-            // fill is caught by reconciliation inside a minute; a
-            // misattributed one is caught by nobody.
-            let Some(sym) = resolve_sym(f.coin.of(payload)) else {
+            // never took, silently, in the tape, forever; a missing
+            // fill is caught by reconciliation inside a minute, a
+            // misattributed one by nobody.
+            let Some(sym) = assets.sym_of_coin(f.coin.of(payload)) else {
                 counters.fills_unresolved =
                     counters.fills_unresolved.wrapping_add(1);
                 continue;
@@ -428,7 +438,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
 
         // ZERO COPY. Each payload is routed from the socket's own
         // receive buffer, inside the pump's closure. `ws` is borrowed
-        // by `pump`; the five fields the router needs are borrowed
+        // by `pump`; the six fields the router needs are borrowed
         // beside it, which is what the destructuring below is for.
         //
         // An earlier revision staged the frames into a `Vec` first,
@@ -440,6 +450,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let recv_ns = now_ns();
         let Self {
             ws,
+            assets,
             scratch,
             seen,
             budget,
@@ -448,7 +459,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             ..
         } = self;
         let r = ws.pump(PUMP_BUDGET, |payload| {
-            Self::route_frame(payload, recv_ns, scratch, seen, budget, fills, counters);
+            Self::route_frame(
+                payload, recv_ns, assets, scratch, seen, budget, fills, counters,
+            );
         });
         match r {
             Ok(n) => n > 0,
@@ -611,19 +624,6 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     }
 }
 
-/// Coin name → engine `SymbolId`.
-///
-/// **Not implemented, deliberately.** It returns `None` for every
-/// input, so every venue fill is counted as unresolved and none is
-/// booked. That is the fail-closed placeholder for a binding that
-/// belongs with the roll event, and it is a function rather than an
-/// inline `None` so that the day it is implemented there is exactly
-/// one place to do it — and so the compiler points here.
-#[inline]
-fn resolve_sym(_coin: &[u8]) -> Option<u32> {
-    None
-}
-
 /// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.
 fn now_ns() -> NsTs {
     std::time::SystemTime::now()
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn a_spent_budget_refuses_before_the_signer_is_touched() {
         let mut x = exchange();
-        x.assets_mut().bind(42, 3, 0).expect("bind");
+        x.assets_mut().bind(42, 3, 0, b"+42").expect("bind");
         // A cold budget has zero headroom by construction.
         assert!(x.budget_remaining() <= 0);
         let e = x.submit(&order(42, ORDER_KIND_MAKER)).unwrap_err();
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn an_overflowing_price_is_refused_rather_than_clamped() {
         let mut x = exchange();
-        x.assets_mut().bind(9, 3, 0).expect("bind");
+        x.assets_mut().bind(9, 3, 0, b"+9").expect("bind");
         let mut o = order(9, ORDER_KIND_MAKER);
         o.px = Price::from_raw(i64::MAX);
         // Refused for SOME local reason before anything is sent; the
@@ -828,6 +828,7 @@ mod tests {
         let recv_ns = now_ns();
         let HlExchange {
             ws,
+            assets,
             scratch,
             seen,
             budget,
@@ -841,7 +842,7 @@ mod tests {
         let _borrowed = &mut *ws;
         let mut feed = |payload: &[u8]| {
             HlExchange::<64>::route_frame(
-                payload, recv_ns, scratch, seen, budget, fills, counters,
+                payload, recv_ns, assets, scratch, seen, budget, fills, counters,
             );
         };
         feed(&frame[..]);
@@ -907,19 +908,44 @@ mod tests {
         assert_eq!(core::mem::align_of::<HlExecCounters>(), 64);
     }
 
-    /// **The symbol binding is not implemented, and the arm is
-    /// fail-closed about it.** A fill booked against a guessed symbol
+    /// **An UNBOUND coin still books nothing.** That property is the
+    /// whole reason the table answers by comparing bytes rather than
+    /// by parsing `+<enc>`: a fill booked against a guessed symbol
     /// moves a position the member never took, silently and
-    /// permanently; a fill not booked is caught by reconciliation
-    /// inside a minute.
+    /// permanently, while a fill not booked is caught by
+    /// reconciliation inside a minute.
     #[test]
-    fn no_coin_name_resolves_yet_so_nothing_is_booked_against_a_guess() {
-        for coin in [&b"BTC"[..], b"+3253", b"USDC", b"", b"\xff\xfe"] {
+    fn a_coin_no_roll_bound_is_never_booked_against_a_guess() {
+        let mut x = exchange();
+        // One leg bound; everything else must resolve to nothing.
+        x.assets_mut()
+            .bind(42, 100_032_530, 7, b"+32530")
+            .expect("bind");
+        for coin in [&b"BTC"[..], b"+3253", b"USDC", b"", b"\xff\xfe", b"+32531"] {
             assert_eq!(
-                resolve_sym(coin),
+                x.assets().sym_of_coin(coin),
                 None,
-                "a coin name resolved to a symbol nothing has bound"
+                "a coin name resolved to a symbol no roll bound"
             );
         }
+        assert_eq!(x.assets().sym_of_coin(b"+32530"), Some(42));
+    }
+
+    /// End to end: a fill whose coin IS bound reaches fill lane 3.
+    /// Until this passed, `fills_booked` was structurally zero and the
+    /// whole live fill path was source code nothing exercised.
+    #[test]
+    fn a_fill_whose_coin_is_bound_reaches_the_lane() {
+        let mut x = exchange();
+        x.assets_mut()
+            .bind(42, 100_032_530, 7, b"+32530")
+            .expect("bind");
+        let frame = br#"{"channel":"userFills","data":{"fills":[{"coin":"+32530","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":77,"tid":9001,"cloid":"0x4d560300000000000000000012345678"}]}}"#;
+        assert_eq!(x.route_fills(frame), 1, "the fill did not reach the lane");
+        assert_eq!(x.counters().fills_booked, 1);
+        assert_eq!(x.counters().fills_unresolved, 0);
+        // Replaying the same tid books nothing more (LAW E-5).
+        assert_eq!(x.route_fills(frame), 0, "a replayed tid double-booked");
+        assert_eq!(x.counters().fills_booked, 1);
     }
 }

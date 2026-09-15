@@ -6241,6 +6241,7 @@ fn hl_user_fill_lane_is_zero_alloc() {
 fn hl_exchange_route_frame_is_zero_alloc() {
     use core_ring::Ring;
     use core_types::Fill;
+    use exec_hyperliquid::asset::AssetTable;
     use exec_hyperliquid::exchange::{HlExchange, HlExecCounters};
     use exec_hyperliquid::userws::{TidRing, UserFill, SNAPSHOT_RING};
     use exec_hyperliquid::AddressBudget;
@@ -6255,7 +6256,10 @@ fn hl_exchange_route_frame_is_zero_alloc() {
                 f.push(',');
             }
             f.push_str(&format!(
-                r#"{{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":{},"tid":{},"fee":"0.01"}}"#,
+                // OUR cloid (magic 'M','V', slot 3) — without it the
+                // rows route as foreign and never reach the lane, so
+                // the measured region would stop at a counter.
+                r#"{{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":{},"tid":{},"fee":"0.01","cloid":"0x4d560300000000000000000012345678"}}"#,
                 base_tid + i,
                 base_tid + i
             ));
@@ -6265,6 +6269,16 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     }
     let frame = venue_frame(1);
     let prime = venue_frame(1_000_000);
+
+    // The coin IS bound, so the measured region runs the whole book
+    // path — `to_fill`, the cloid attribution, `try_push` into the
+    // lane and `on_venue_fill` against the budget. Until the symbol
+    // binding existed this was unreachable and the gate could only
+    // measure as far as the unresolved counter.
+    let mut assets = AssetTable::new();
+    assets
+        .bind(7, AssetTable::asset_id(3253, 0).expect("in range"), 1, b"+3253")
+        .expect("bind");
 
     // Every buffer preallocated, exactly as `HlExchange::new` does it.
     let mut scratch: Vec<UserFill> = vec![UserFill::default(); SNAPSHOT_RING];
@@ -6288,6 +6302,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     let _ = HlExchange::<1024>::route_frame(
         &prime,
         1,
+        &assets,
         &mut scratch,
         &mut seen,
         &mut budget,
@@ -6301,6 +6316,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
         acc = acc.wrapping_add(HlExchange::<1024>::route_frame(
             &frame,
             i,
+            &assets,
             &mut scratch,
             &mut seen,
             &mut budget,
@@ -6311,6 +6327,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
         acc = acc.wrapping_add(HlExchange::<1024>::route_frame(
             br#"{"channel":"orderUpdates","data":[]}"#,
             i,
+            &assets,
             &mut scratch,
             &mut seen,
             &mut budget,
@@ -6324,16 +6341,22 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     let (allocs, bytes, _deallocs) = g.delta();
 
     // The comment above claims the measured region covers BOTH the
-    // fresh-tid path and the dedupe path. Pin it: 400 rows are fresh
-    // on the priming frame and 400 on measured iteration 0; every
+    // fresh-tid path and the dedupe path, and that the rows reach the
+    // LANE rather than stopping at a counter. Pin both: 400 rows book
+    // on the priming frame and 400 on measured iteration 0, and every
     // later iteration must short-circuit at the dedupe and add
-    // nothing. A gate's own coverage claim is worth exactly as much
-    // as the assertion that holds it.
+    // nothing. A gate's own coverage claim is worth exactly as much as
+    // the assertion that holds it.
     assert_eq!(
-        counters.fills_unresolved, 800,
-        "expected 400 primed + 400 fresh rows and then pure dedupe; saw {}",
-        counters.fills_unresolved
+        counters.fills_booked, 800,
+        "expected 400 primed + 400 fresh rows BOOKED and then pure dedupe; saw {}",
+        counters.fills_booked
     );
+    assert_eq!(
+        counters.fills_unresolved, 0,
+        "the coin is bound; nothing should have failed to resolve"
+    );
+    assert_eq!(counters.fills_dropped, 0, "the lane is 1024 and took 800");
 
     assert_eq!(
         allocs, 0,
