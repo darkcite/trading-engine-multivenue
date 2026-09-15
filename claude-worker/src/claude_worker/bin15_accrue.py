@@ -486,11 +486,11 @@ def main(argv: list[str] | None = None) -> int:
     ac.add_argument("--bin15", default=None)
     ac.add_argument("--ledger", default=None)
     ac.add_argument("--entries", default=None)
-    ac.add_argument("--fee-bps", default="hl.prediction:2:5")
+    ac.add_argument("--fee-bps", default="hl.prediction:0:0")
 
     rp = sub.add_parser("report", help="the three questions, with the error bar")
     rp.add_argument("--entries", default=None)
-    rp.add_argument("--fee-bps-exit", type=int, default=5)
+    rp.add_argument("--fee-bps-exit", type=int, default=0)
 
     st = sub.add_parser("status", help="rows, instances, settled, days")
     st.add_argument("--entries", default=None)

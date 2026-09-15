@@ -484,7 +484,10 @@ def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
     example = pathlib.Path(__file__).resolve().parents[2] / "fees.toml.example"
     flags = claude_worker.pnl_report.load_fee_flags(example)
     assert "--fee-bps" in flags
-    assert "hl.prediction:2:5" in flags
+    # HIP-4 fees are ZERO (2026-09-14, venue docs) -- the example
+    # carries 0:0 on both legs, and the charge-once PAIR is still
+    # emitted so the grammar stays exercised.
+    assert "hl.prediction:0:0" in flags
     assert "hl.prediction.open:0:0" in flags
     # Absent `_open` keys: nothing about the rendering changes.
     fees.write_text('[fees]\nhl = "2:5"\n[fees.hl]\nprediction = "2:5"\n', encoding="utf-8")

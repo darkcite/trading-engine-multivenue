@@ -119,6 +119,8 @@
 #                         12.5 % of premium; settlement 0.015 %             the harness's DERIBIT constant (VRP V2b/VX)
 #   hl       spot         0.040 % / 0.070 % tier 0                   4:7   hyperliquid docs /trading/fees (2026-09-12)
 #   hl       perp         0.015 % / 0.045 % tier 0                   2:5   hyperliquid docs /trading/fees
+#   hl       prediction   ZERO while HIP-4 is in initial testing       0:0   hyperliquid docs HIP-4 (2026-09-14);
+#                         (builder fee only, with a builder code)             QuickNode HIP-4 guide. WATCH: testing-only
 #   bybit    spot         0.1000 % / 0.1000 % non-VIP               10:10  help "Trading-Fee-Structure" (2026-09-12)
 #   bybit    perp         0.0200 % / 0.0550 % non-VIP                2:6   help "Trading-Fee-Structure"
 #   bybit    dated        futures 0.0200 % / 0.0550 % non-VIP        2:6   help "Trading-Fee-Structure"
@@ -163,16 +165,38 @@ option_cap = "3:1250"
 [fees.hl]
 spot = "4:7"
 perp = "2:5"
-# HIP-4 outcome markets (BIN15): fees only on close/settle (Hyperliquid
-# docs, trading/fees section "outcome trading"); base tier
-# 0.015 %/0.045 % => 2:5 by L3 (round UP to the whole bp).
-# UNVERIFIED on a live fill (ruling O-Q8) — no BIN15 order has been
-# filled on this venue yet, so both rows are carried, not measured.
-# `<class>_open` is the CHARGE-ONCE key: it becomes
-# `--fee-bps hl.prediction.open:<m>:<t>`, and its absence leaves the
-# class charging its ordinary pair on both legs (bit-identical).
-prediction = "2:5"        # closing fills and settlement
-prediction_open = "0:0"   # opening fills (HIP-4 charges nothing to open)
+# HIP-4 outcome markets (BIN15): **FEES ARE ZERO.**
+#
+#   "Fees are currently zero for outcome markets for initial testing."
+#       -- Hyperliquid docs, HIP-4: Outcome markets
+#   "Unlike perps and spot, HIP-4 charges no fee to open a position
+#    (the builder fee still applies)."
+#       -- QuickNode, HIP-4 trading guide
+#
+# VERIFIED against both, 2026-09-14. This SUPERSEDES the 2:5 pair that
+# stood here from BIN15 O5 (2026-09-12). That pair was derived from the
+# PERP tier (0.015 %/0.045 %) on the assumption that outcome markets ride
+# the same schedule; they do not, and ruling O-Q8 already flagged it
+# UNVERIFIED. It was never measured -- and it could not have been: every
+# BIN15 fill in existence is PAPER (`origin = 1`), because the member
+# builds no signer, cancel or dispatch path (Stage-3). A paper fill
+# cannot verify a fee.
+#
+# The BUILDER fee is the one charge that survives, and only for an order
+# carrying a builder code. Ours do not.
+#
+# WATCH THIS ROW. "currently ... for initial testing" is a launch
+# condition with a date on it. Any strategy sized on zero fees must
+# re-clear its bar the day a schedule appears.
+#
+# Both rows are KEPT at 0:0 rather than deleted: without them a bin15
+# fill falls to the venue's DEAREST known class (spot 4:7) on BOTH legs
+# and `fee_class_unknown_fills` counts it. `<class>_open` is the
+# CHARGE-ONCE key -- it becomes `--fee-bps hl.prediction.open:<m>:<t>`,
+# and keeping the structure means only ONE number moves if a fee ever
+# lands.
+prediction = "0:0"        # closing fills and settlement -- zero (testing)
+prediction_open = "0:0"   # opening fills -- HIP-4 charges nothing to open
 
 [fees.bybit]
 spot = "10:10"
