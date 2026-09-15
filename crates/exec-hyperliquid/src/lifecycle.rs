@@ -216,6 +216,87 @@ pub fn run_on(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The three actions a run would send, built and shown but not sent.
+///
+/// Phase C is the one thing in this lane that can create state on a
+/// funded account, and its inputs are four numbers typed on a command
+/// line. A transposed price or a size off by a decimal is a plausible
+/// mistake and an expensive one, so there is a way to see exactly what
+/// would go on the wire first.
+///
+/// Needs no key, no network and no account — so it can be run before
+/// any of those exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    /// The `order` action, as JSON.
+    pub place: String,
+    /// The `batchModify` action, as JSON.
+    pub modify: String,
+    /// The `cancelByCloid` action, as JSON.
+    pub cancel: String,
+    /// The price as the VENUE will read it, after wire rendering.
+    pub px: String,
+    /// The modified price, likewise.
+    pub px2: String,
+    /// The size as the venue will read it.
+    pub sz: String,
+}
+
+/// Build the three actions without sending or signing anything.
+pub fn preview(spec: LifecycleSpec) -> Result<Preview, SmokeErr> {
+    if spec.sz_1e8 <= 0 || spec.px_1e8 <= 0 || spec.px2_1e8 <= 0 {
+        return Err(SmokeErr::Lifecycle {
+            stage: "spec",
+            msg: "price and size must both be positive".to_owned(),
+        });
+    }
+    // A FIXED cloid, not a fresh one: a preview that changed on every
+    // run would be useless to diff, and nothing here reaches a venue.
+    let cloid = [0u8; 16];
+    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Alo)
+        .with_cloid(cloid);
+    let replacement =
+        OrderWire::new(spec.asset, spec.is_buy, spec.px2_1e8, spec.sz_1e8, Tif::Alo)
+            .with_cloid(cloid);
+
+    let mut buf = [0u8; MAX_ACTION];
+    let n = order_json(&mut buf, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    let place = String::from_utf8_lossy(&buf[..n]).to_string();
+
+    let m = [ModifyWire {
+        order: replacement,
+        oid: 0,
+        oid_cloid: [0u8; 16],
+        oid_is_cloid: false,
+    }];
+    let n = batch_modify_json(&mut buf, &m).map_err(|_| SmokeErr::Encode)?;
+    let modify = String::from_utf8_lossy(&buf[..n]).to_string();
+
+    let c = [CancelByCloidWire {
+        asset: spec.asset,
+        cloid,
+    }];
+    let n = cancel_by_cloid_json(&mut buf, &c).map_err(|_| SmokeErr::Encode)?;
+    let cancel = String::from_utf8_lossy(&buf[..n]).to_string();
+
+    // Rendered through the SAME WireNum the signed action uses, so
+    // what is shown is what the venue reads — not a re-derivation that
+    // could round differently and reassure about the wrong number.
+    Ok(Preview {
+        place,
+        modify,
+        cancel,
+        px: wire_str(spec.px_1e8),
+        px2: wire_str(spec.px2_1e8),
+        sz: wire_str(spec.sz_1e8),
+    })
+}
+
+fn wire_str(v_1e8: i64) -> String {
+    let w = crate::wire::WireNum::from_1e8(v_1e8);
+    String::from_utf8_lossy(w.as_bytes()).to_string()
+}
+
 fn modify(
     http: &mut HlHttp,
     sk: &secp256k1::SecretKey,
@@ -397,6 +478,55 @@ mod tests {
         ] {
             let e = run(&c, tls.clone(), bad).expect_err("must refuse");
             assert!(matches!(e, SmokeErr::Lifecycle { stage: "spec", .. }), "{e:?}");
+        }
+    }
+
+    /// The preview must show the numbers the VENUE will read, not the
+    /// integers that were typed — that is the whole point of looking.
+    #[test]
+    fn the_preview_shows_the_wire_form_of_every_number() {
+        let p = preview(spec()).expect("preview");
+        assert_eq!(p.px, "0.01");
+        assert_eq!(p.px2, "0.02");
+        assert_eq!(p.sz, "10");
+        // And those same strings are what the action carries.
+        assert!(p.place.contains(r#""p":"0.01""#), "{}", p.place);
+        assert!(p.place.contains(r#""s":"10""#), "{}", p.place);
+        assert!(p.modify.contains(r#""p":"0.02""#), "{}", p.modify);
+        // Post-only, always.
+        assert!(p.place.contains("Alo"), "{}", p.place);
+        assert!(p.modify.contains("Alo"), "{}", p.modify);
+        // The asset the operator stated, in all three — but note the
+        // KEY is not the same in all three. `order` and `batchModify`
+        // spell it "a"; `cancelByCloid` spells it "asset". That is the
+        // venue SDK's own inconsistency, reproduced deliberately
+        // because the msgpack of these actions is what the signature
+        // covers (LAW E-3) — so both spellings are pinned here rather
+        // than tidied into one.
+        let short = format!(r#""a":{}"#, spec().asset);
+        assert!(p.place.contains(&short), "{}", p.place);
+        assert!(p.modify.contains(&short), "{}", p.modify);
+        let long = format!(r#""asset":{}"#, spec().asset);
+        assert!(p.cancel.contains(&long), "{}", p.cancel);
+        assert!(
+            !p.cancel.contains(&short),
+            "cancelByCloid must NOT use the short key: {}",
+            p.cancel
+        );
+    }
+
+    /// A preview is worthless if it can differ from what would be
+    /// sent, so it refuses the same specs the real run refuses.
+    #[test]
+    fn the_preview_refuses_what_the_run_refuses() {
+        for bad in [
+            LifecycleSpec { sz_1e8: 0, ..spec() },
+            LifecycleSpec { px_1e8: -1, ..spec() },
+        ] {
+            assert!(matches!(
+                preview(bad),
+                Err(SmokeErr::Lifecycle { stage: "spec", .. })
+            ));
         }
     }
 

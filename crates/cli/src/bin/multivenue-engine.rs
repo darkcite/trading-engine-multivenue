@@ -181,6 +181,19 @@ struct ExecSmokeArgs {
     /// is the side that rests safely BELOW the market.
     #[arg(long, default_value_t = false, requires = "lifecycle")]
     sell: bool,
+
+    /// Show exactly what phase C WOULD send, and send nothing.
+    ///
+    /// Phase C is the only thing here that can create state on a
+    /// funded account, and its inputs are four numbers typed on a
+    /// command line — a transposed price or a size off by a decimal is
+    /// a plausible mistake and an expensive one. This prints the three
+    /// actions, with every number rendered the way the VENUE will read
+    /// it rather than the way it was typed.
+    ///
+    /// Needs no key, no network and no account.
+    #[arg(long, default_value_t = false, requires = "lifecycle")]
+    dry_run: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -743,6 +756,43 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
              refused by the venue rather than filled — but choose one that rests."
         );
         return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+
+    // A dry run reaches no venue and needs no credentials, so it
+    // happens before anything that could fail for an unrelated reason.
+    if args.dry_run {
+        let spec = exec_hyperliquid::LifecycleSpec {
+            asset: args.asset,
+            px_1e8: args.px.unwrap_or(0),
+            px2_1e8: args.px2.unwrap_or(0),
+            sz_1e8: args.sz.unwrap_or(0),
+            is_buy: !args.sell,
+        };
+        return match exec_hyperliquid::lifecycle::preview(spec) {
+            Ok(p) => {
+                eprintln!(
+                    "exec-smoke DRY RUN — nothing was sent.\n\
+                     \x20 asset {asset}\n\
+                     \x20 {side} {sz} @ {px}, then modified to {px2}\n\
+                     \x20 post-only (ALO): a price that would cross is REFUSED by the venue, \
+                     not filled\n\
+                     \x20 the cancel goes by CLOID, so a modify issuing a new oid cannot strand it",
+                    asset = args.asset,
+                    side = if args.sell { "SELL" } else { "BUY" },
+                    sz = p.sz,
+                    px = p.px,
+                    px2 = p.px2,
+                );
+                println!("{}", p.place);
+                println!("{}", p.modify);
+                println!("{}", p.cancel);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8)
+            }
+        };
     }
 
     let scope = Scope::Testnet;

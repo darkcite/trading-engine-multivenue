@@ -303,3 +303,10 @@ path   = "fuzz_targets/hl_exchange_response.rs"
 test   = false
 doc    = false
 bench  = false
+
+[[bin]]
+name   = "hl_request_json"
+path   = "fuzz_targets/hl_request_json.rs"
+test   = false
+doc    = false
+bench  = false

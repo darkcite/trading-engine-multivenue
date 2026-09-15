@@ -199,7 +199,10 @@ EXEC_GATE_PENDING="$STATE/exec-gate-pending"
 EXEC_GATE_FAILS="$STATE/exec-gate-fails"
 EXEC_GATE_NEXT="$STATE/exec-gate-next"
 EXEC_GATE_RED="$STATE/exec-gate-RED"
+EXEC_GATE_VETTED="$STATE/exec-gate-vetted-sha256"
 EXEC_GATE_ALERT_AFTER=3
+# How long a passing venue verdict stands for one unchanged artifact.
+EXEC_GATE_VET_TTL_MIN=1440
 
 # WHICH FILE ARMS THE FLEET IS NOT KNOWABLE FROM HERE.
 #
@@ -269,6 +272,46 @@ exec_gate_clear() {
 }
 
 # 0 = the binary is proven and the restart may proceed.
+# THE GATE VETS AN ARTIFACT, NOT A MOMENT.
+#
+# "The release binary passed" is a claim about a FILE, so the file is
+# what gets recorded — its sha256 — rather than a timestamp attached to
+# a name that can come to mean a different file. Two things follow:
+#
+#   a REBUILD invalidates the pass immediately. The digest no longer
+#   matches, so the next fired slot re-proves the new artifact against
+#   the venue rather than inheriting a verdict earned by the old one.
+#   That is the provenance hole this closes.
+#
+#   an UNCHANGED binary is not re-probed. Five restart slots a day were
+#   spending ten signed POSTs to re-prove the same bytes; now they
+#   spend two, once, and the TTL below re-proves it daily anyway. The
+#   venue's request budget is address-based and finite, so a gate that
+#   asks the same question ten times a day is spending the budget it
+#   depends on.
+#
+# WHAT THIS DOES NOT CLOSE: between the drain and the wrapper's exec
+# there are still seconds in which a build could land, and only the
+# WRAPPER checking this digest before exec would close that. The
+# wrapper is the file that arms the fleet — E4's change, not one to
+# make by inference now. The digest is recorded here so E4 has
+# something to check against. docs/risk-policy.md records the residue.
+exec_gate_release_sha() {
+  shasum -a 256 "$REPO_DIR/target/release/multivenue-engine" 2>/dev/null | cut -d" " -f1
+}
+
+# 0 = this exact artifact already holds a venue verdict, still in date.
+exec_gate_already_vetted() {
+  local sha age
+  sha="$(exec_gate_release_sha)"
+  [ -n "$sha" ] || return 1
+  [ -f "$EXEC_GATE_VETTED" ] || return 1
+  [ "$(cat "$EXEC_GATE_VETTED")" = "$sha" ] || return 1
+  # find -mmin is the portable-enough way to age a file in a script
+  # that already assumes macOS + zsh.
+  [ -z "$(find "$EXEC_GATE_VETTED" -mmin "+$EXEC_GATE_VET_TTL_MIN" 2>/dev/null)" ]
+}
+
 exec_gate_pass() {
   local rc now next
   # Free half, every time. NOTE the explicit `rc=$?` on the line after
@@ -281,6 +324,13 @@ exec_gate_pass() {
     exec_gate_note_failure "$rc" "offline self-test"
     return 1
   fi
+  # Already proven, and the artifact has not changed since. Do not
+  # spend two more venue requests saying so.
+  if exec_gate_already_vetted; then
+    echo "daily-restart: exec gate — this exact binary already holds a venue verdict (${$(exec_gate_release_sha)[1,16]}…)" >&2
+    return 0
+  fi
+
   now="$(date -u +%s)"
   if [ -f "$EXEC_GATE_NEXT" ]; then
     next="$(cat "$EXEC_GATE_NEXT")"
@@ -293,6 +343,8 @@ exec_gate_pass() {
   rc=$?
   if [ "$rc" = 0 ]; then
     exec_gate_clear
+    # Record WHICH artifact earned this verdict.
+    exec_gate_release_sha > "$EXEC_GATE_VETTED"
     return 0
   fi
   exec_gate_note_failure "$rc" "venue phase"

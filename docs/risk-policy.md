@@ -518,11 +518,26 @@ selftest`) rather than left to `cargo nextest`: the release artifact
 certifies itself, rather than being certified by a test suite that may
 not have been run against it.
 
-What the gate still does not cover: it vets the binary at
-`target/release` and then drains; launchd relaunches whatever is on
-disk at relaunch time, and the gate records no hash of what it vetted.
-The window is seconds and the fleet is single-operator, so this is
-recorded rather than closed.
+**The gate vets an ARTIFACT, not a moment.** "The release binary
+passed" is a claim about a FILE, so the file is what is recorded — its
+sha256, in `state/exec-gate-vetted-sha256`. Two things follow:
+
+- **A rebuild invalidates the pass immediately.** The digest no longer
+  matches, so the next fired slot re-proves the NEW artifact against
+  the venue rather than inheriting a verdict earned by the old one.
+- **An unchanged binary is not re-probed.** Five restart slots a day
+  were spending ten signed POSTs re-proving the same bytes; now they
+  spend two, once, and a 24-hour TTL re-proves it daily regardless.
+  The venue's request budget is address-based and finite, so a gate
+  that asks the same question ten times a day is spending the budget
+  it depends on.
+
+What this still does not close: between the drain and the wrapper's
+`exec` there are seconds in which a build could land. Closing that
+means the WRAPPER verifying this digest before exec, and the wrapper is
+the file that arms the fleet — E4's change, not one to make by
+inference now. The digest is recorded so E4 has something to check
+against.
 
 ### A new operator control that can stop the production engine
 
@@ -608,7 +623,13 @@ Four things keep it from costing anything real:
 3. **The operator states the market and both prices.** Nothing is
    derived: LAW E-4 forbids deriving an asset id, and a price this code
    guessed would be the one number capable of turning a test into a
-   trade.
+   trade. Because those inputs are four numbers typed on a command
+   line — where a transposed price or a size off by a decimal is a
+   plausible and expensive mistake — `--dry-run` prints the three
+   actions it would send, with every number rendered **the way the
+   venue will read it** rather than the way it was typed, and reaches
+   no network. It needs no key and no account, so it can be run before
+   either exists.
 4. **It cleans up after itself.** Any failure after the place attempts
    a cancel before returning, and if that cancel also fails it says in
    so many words that an order may still be resting and must be
