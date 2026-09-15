@@ -6066,3 +6066,84 @@ fn hl_action_encode_sign() {
         "hl action encode+sign bytes should be zero: saw {alloc_bytes}"
     );
 }
+
+/// Gate 54 (E3): the Hyperliquid exchange arm's per-order cycle.
+///
+/// `HlHttp::post` cannot be driven here without a server, and the TLS
+/// loopback test covers its behaviour. What CAN be pinned — and what
+/// actually runs per order — is the pair either side of the socket:
+/// building the signed JSON body, and scanning the venue's answer.
+///
+/// Both are supposed to be pure index arithmetic over caller-owned
+/// buffers. `scan` in particular returns `Span` OFFSETS rather than
+/// owned bytes precisely so that reading a rejection message costs
+/// nothing; this assertion is what stops a later "just return a
+/// String, it's only the error path" from landing unnoticed — the
+/// error path is the one that runs when the venue is having a bad day
+/// and we are sending the most orders.
+#[test]
+fn hl_exchange_encode_and_scan_are_zero_alloc() {
+    use exec_hyperliquid::action::{encode_cancel, encode_order, CancelWire, OrderWire, Tif, MAX_ACTION};
+    use exec_hyperliquid::request::{cancel_json, envelope, order_json};
+    use exec_hyperliquid::response::{scan, HlResponse};
+
+    const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
+
+    let orders = [OrderWire::new(HIP4_YES, true, 48_000_000, 2_500_000_000, Tif::Alo)];
+    let cancels = [CancelWire {
+        asset: HIP4_YES,
+        oid: 987_654_321,
+    }];
+    let sig = [0x12u8; 65];
+
+    // The three answers the venue actually sends, including the two
+    // that look like successes and are not.
+    let ack: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77216390}}]}}}"#;
+    let item_err: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order must have minimum value of $10."}]}}}"#;
+    let top_err: &[u8] = br#"{"status":"err","response":"Unable to recover signer."}"#;
+
+    let mut mp = [0u8; MAX_ACTION];
+    let mut aj = [0u8; MAX_ACTION];
+    let mut body = [0u8; exec_hyperliquid::MAX_REQ_BODY];
+
+    // Prime every path once — one-time setup must not be counted.
+    let n = encode_order(&mut mp, &orders, b"na").unwrap();
+    let m = order_json(&mut aj, &orders, b"na").unwrap();
+    let _ = envelope(&mut body, &aj[..m], 1, &sig, None, None).unwrap();
+    std::hint::black_box(n);
+    let _ = scan(ack).unwrap();
+
+    let g = AllocGuard::new();
+    let mut acc: usize = 0;
+    for i in 0..10_000u32 {
+        let n = encode_order(&mut mp, &orders, b"na").unwrap();
+        let m = order_json(&mut aj, &orders, b"na").unwrap();
+        let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
+        acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
+
+        let n = encode_cancel(&mut mp, &cancels).unwrap();
+        let m = cancel_json(&mut aj, &cancels).unwrap();
+        let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
+        acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
+
+        // Scanning is per-order too, and the error paths most of all.
+        for bytes in [ack, item_err, top_err] {
+            match scan(bytes) {
+                Ok(HlResponse::Ok(ok)) => {
+                    acc = acc.wrapping_add(ok.statuses as usize);
+                    acc = acc.wrapping_add(ok.first_error.of(bytes).len());
+                }
+                Ok(HlResponse::Err { msg }) => acc = acc.wrapping_add(msg.of(bytes).len()),
+                Err(_) => acc = acc.wrapping_add(1),
+            }
+        }
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "hl exchange encode/scan allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl exchange encode/scan bytes should be zero: saw {bytes}");
+}

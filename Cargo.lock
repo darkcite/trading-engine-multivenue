@@ -331,6 +331,7 @@ dependencies = [
  "core-vol",
  "engine",
  "engine-snapshot",
+ "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
@@ -716,8 +717,15 @@ dependencies = [
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
+ "core-config",
+ "core-net",
+ "core-types",
+ "mio 0.8.11",
+ "rcgen",
+ "rustls",
  "secp256k1",
  "signer-eip712",
+ "zeroize",
 ]
 
 [[package]]

@@ -16,6 +16,11 @@
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
 //!   (non-secret) config.
+//! * `exec-smoke` — the E3 TESTNET-ONLY signature gate. Proves this
+//!   binary can produce a signature the venue verifies AND that the
+//!   venue rejects a corrupted one. It cannot reach mainnet: it reads
+//!   its own `HYPERLIQUID_TESTNET_*` variables and refuses any
+//!   configuration that is not the testnet host + testnet source.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -109,6 +114,35 @@ enum Cmd {
     /// per-strategy / per-ruleset-hash modeled P&L beside the paper
     /// view. JSON on stdout, human summary on stderr.
     AuditPnl(AuditPnlArgs),
+    /// E3 execution gate: sign a probe action against Hyperliquid
+    /// TESTNET and assert the venue verifies it — then assert it
+    /// REJECTS a deliberately corrupted one. Costs nothing and needs
+    /// no balance: the probe cancels an order id that cannot exist,
+    /// so what is under test is the signature, not the order.
+    ///
+    /// TESTNET ONLY, by construction. There is no flag that points
+    /// this at production.
+    ExecSmoke(ExecSmokeArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ExecSmokeArgs {
+    /// Venue asset id the probe cancel names. It need not exist —
+    /// the cancel is expected to fail on the ORDER, not the
+    /// signature — so the default is fine unless you are debugging.
+    #[arg(long, default_value_t = 0u32)]
+    asset: u32,
+    /// Run ONLY the offline self-test: reproduce the 25 SDK
+    /// known-answer vectors and rebuild one action per type from
+    /// inputs, asserting the venue's exact msgpack.
+    ///
+    /// No network, no credentials, no venue. This is the form CI runs
+    /// on every commit touching `exec-hyperliquid` / `signer-eip712`,
+    /// because CI has no testnet key and should not have one — and it
+    /// is the half that catches LAW E-3 across ALL action types, which
+    /// the network probe structurally cannot (it sends one action).
+    #[arg(long, default_value_t = false)]
+    offline: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -612,6 +646,98 @@ fn main() -> ExitCode {
             // Same stdout-purity law: JSON only on stdout.
             init_tracing_stderr();
             audit_pnl(args)
+        }
+        Cmd::ExecSmoke(args) => {
+            // Same law again: one line of JSON on stdout for CI, the
+            // human report on stderr.
+            init_tracing_stderr();
+            exec_smoke(args)
+        }
+    }
+}
+
+/// E3 arm: the TESTNET-ONLY signature gate.
+///
+/// Exit codes are `exec_hyperliquid::EXIT_*` and `scripts/exec-smoke.sh`
+/// branches on them. Any non-zero code refuses an armed restart — a
+/// relinked binary that cannot sign a testnet order must never be
+/// allowed to sign a mainnet one.
+///
+/// It reads the process environment and never opens `.env` itself:
+/// the wrapper sources it. Code that opened the operator's secrets
+/// file would be one refactor away from logging it.
+fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
+    use exec_hyperliquid::{HlConfig, Scope};
+
+    // The offline half needs nothing: not a key, not a host, not a
+    // socket. Do it before anything can fail for a reason that has
+    // nothing to do with this binary's signing.
+    if args.offline {
+        return match exec_hyperliquid::smoke::self_test_only() {
+            Ok(r) => {
+                println!(
+                    "{{\"selftest_rows\":{},\"selftest_encoders\":{},\"passed\":true}}",
+                    r.rows, r.encoders
+                );
+                info!(
+                    rows = r.rows,
+                    encoders = r.encoders,
+                    "exec-smoke: OFFLINE SELF-TEST PASSED — this binary reproduces the venue \
+                     SDK's bytes for every action type"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                ExitCode::from(e.code() as u8)
+            }
+        };
+    }
+
+    let scope = Scope::Testnet;
+    let cfg = match HlConfig::from_env(scope) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("exec-smoke: {e}");
+            eprintln!(
+                "exec-smoke: this gate reads its OWN variables, disjoint from the live arm's:\n\
+                 \x20 {key}   (required) the TESTNET agent/API wallet private key\n\
+                 \x20 {addr}  (required) the TESTNET master account address\n\
+                 \x20 {host}  (optional, defaults to the testnet host)\n\
+                 \x20 {src}   (optional, defaults to \"b\")",
+                key = scope.agent_key_var(),
+                addr = scope.master_addr_var(),
+                host = scope.host_var(),
+                src = scope.source_var(),
+            );
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    // Debug redacts the key and shows the derived agent address —
+    // which is the thing to check against the venue's API page.
+    info!(?cfg, "exec-smoke: testnet configuration");
+
+    let tls = TlsTransport::default_client_config();
+    match exec_hyperliquid::smoke::run(&cfg, tls, args.asset) {
+        Ok(report) => {
+            println!("{}", report.to_json());
+            if !report.passed() {
+                error!("exec-smoke: report did not pass; refusing");
+                return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+            }
+            info!(
+                host = %report.host,
+                agent = %report.agent,
+                selftest_rows = report.selftest_rows,
+                rejected_with = %report.corruption_message,
+                "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
+                 corrupted one"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("{e}");
+            ExitCode::from(e.code() as u8)
         }
     }
 }

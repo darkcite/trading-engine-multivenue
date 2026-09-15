@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! Hyperliquid L1 execution — the signing half (E2).
+//! Hyperliquid L1 execution — signing (E2) and the exchange arm (E3).
 //!
-//! E2 builds everything needed to produce a byte-exact, correctly
-//! signed exchange action, and **nothing that can send one**. There is
-//! no socket, no TLS, no HTTP and no host name in this crate: the
-//! network arm lands in E3. Not one byte leaves the host from here.
+//! E2 built everything needed to produce a byte-exact, correctly
+//! signed exchange action and nothing that could send one. **E3 adds
+//! the thing that sends it**: a mio + rustls HTTP/1.1 client
+//! ([`http`]), the JSON request bodies ([`request`]), a fail-closed
+//! answer scanner ([`response`]), the host/source interlock
+//! ([`config`]) and the testnet gate ([`smoke`]).
+//!
+//! What has NOT changed is that nothing in this crate is reachable
+//! from the engine yet: `cli::exec_boot::LIVE_ARM_VENUES` is still
+//! empty, and a compile-time assertion holds it empty. The exchange
+//! arm exists, is tested against a real TLS server, and is wired to
+//! exactly one caller — the smoke, which cannot reach mainnet.
 //!
 //! ## The one hard problem
 //!
@@ -36,12 +44,22 @@
 //! signature over the wrong bytes, which is strictly worse than no
 //! order at all.
 //!
+//! ## The second hard problem: an answer that lies about itself
+//!
+//! Hyperliquid returns **HTTP 200 for rejections**, and buries
+//! per-order errors *inside* a `status:"ok"` envelope. Two traps, one
+//! shape. [`response::scan`] is therefore fail-closed: every shape it
+//! does not positively recognise as an acceptance is a refusal, and
+//! [`response::tests`] fuzzes it against arbitrary bytes to prove it
+//! never panics and never invents an acceptance.
+//!
 //! ## What is deliberately NOT here
 //!
-//! * `http.rs` — the TLS arm and `POST /exchange` (E3).
-//! * `response.rs` — the zero-alloc response scanner (E3).
 //! * `userws.rs` — the `userFills` lane feeding engine fill lane 3 (E4).
 //! * `budget.rs` — the address request-budget governor (E4).
+//! * `HlExchange: OrderDispatch` — the engine-facing dispatcher (E4).
+//!   It is not built speculatively: it belongs where the engine can
+//!   actually reach it.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -49,9 +67,15 @@
 
 pub mod action;
 pub mod asset;
+pub mod config;
+pub mod http;
 pub mod msgpack;
 pub mod nonce;
+pub mod request;
+pub mod response;
+pub mod selftest;
 pub mod sign;
+pub mod smoke;
 pub mod wire;
 
 pub use action::{
@@ -59,7 +83,17 @@ pub use action::{
     CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 pub use asset::{AssetError, AssetTable, ASSET_SLOTS};
+pub use config::{
+    ConfigErr, HlConfig, Scope, ENV_AGENT_KEY, ENV_HOST, ENV_MASTER_ADDR, ENV_SOURCE,
+    ENV_T_AGENT_KEY, ENV_T_HOST, ENV_T_MASTER_ADDR, ENV_T_SOURCE, HOST_MAINNET, HOST_TESTNET,
+};
+pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::Nonce;
+pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
+pub use response::{scan, HlOk, HlResponse, ScanErr, Span};
+pub use selftest::{SelfTestErr, SelfTestReport};
 pub use sign::{connection_id, sign_action, Network, Vault};
+pub use smoke::{SmokeErr, SmokeReport, EXIT_CORRUPT_ACCEPTED, EXIT_FAILED, EXIT_NOT_VERIFIED,
+    EXIT_PASS, EXIT_UNREACHABLE};
 pub use wire::{WireNum, WIRE_SCALE};

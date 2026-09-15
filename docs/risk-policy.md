@@ -384,13 +384,38 @@ hard-coded `--paper`, not the flag's own design.
 
 ## Signing-key handling
 
-- The EIP-712 signing key is loaded from the project-root `.env` file only.
+- The EIP-712 signing key is loaded from the process environment, which
+  the wrapper populates from `.env` (project root, or
+  `~/multivenue/.env` for the managed fleet). **No code opens that file
+  to read a key** — code that did would be one refactor away from
+  logging it.
+  *(Amended 2026-09-15, E3: this bullet used to say "project-root
+  `.env` only". The managed fleet has sourced `~/multivenue/.env` since
+  the launchd lane existed, so the old wording described a setup that
+  had not been true for some time.)*
 - Boot-time: the key is `mlock`'d into its own page (see
   `crates/core-config::SecretKeyBytes`).
 - Drop: the key page is zeroized and `munlock`'d.
 - Debug: the `Secrets` struct has a custom `Debug` impl that redacts the
   key. Any code that formats or logs the key without redaction fails the
   `risk-reviewer` subagent check.
+- **There is more than one signing key.** Since E3 the Hyperliquid
+  agent wallet lives in `exec_hyperliquid::HlConfig`, and it uses the
+  SAME `core_config::SecretKeyBytes` — the same `mlock`, the same
+  zeroize-on-drop — rather than a second implementation. Two
+  implementations of a key's memory handling is one more than can be
+  audited, and E4 puts a MAINNET key in that struct.
+- The intermediate hex `String` the environment hands us is zeroized
+  after parsing. Without that, the key sits in freed heap for the life
+  of the process.
+- **No error message echoes the VALUE of a variable** — only its name,
+  and for the source variable its length. The likeliest operator
+  mistake is pasting a key into the wrong variable, and an error that
+  helpfully quoted it would put the key in the launchd log.
+- The limit of all of this, stated so nobody over-reads it: the value
+  is also in the process `environ` block, which we do not own and
+  cannot erase. Zeroizing our copies is defence in depth, not a claim
+  that the key is unreachable from a core dump.
 
 ## Phased loosening
 
@@ -411,3 +436,169 @@ The E1 execution-routing phase (2026-09-15) satisfies precondition 2 by the
 satisfied by ruling O-E4, which holds the caps at their measured paper
 values rather than widening them. **No subsequent E-phase may arm a venue
 without its own entry here first.**
+
+The E3 exchange-arm phase (2026-09-15) satisfies precondition 2 by the
+"Hyperliquid exchange arm" section below. It widens nothing, so
+preconditions 1 and 3 do not arise: ruling O-E4's caps are untouched,
+`exec.toml.example` is unchanged, and kill-switch triggers 7 and 8
+remain PARSED-not-ENFORCED.
+
+## The Hyperliquid exchange arm (E3, 2026-09-15) — BUILT, not ARMED
+
+E3 builds the thing that can send an order and does not connect it to
+anything that would. It adds a mio + rustls `POST /exchange` client, the
+JSON request bodies, a fail-closed scanner for the venue's answers, the
+host/source interlock, and a testnet gate that runs before every armed
+restart.
+
+**No slot can be armed.** `cli::exec_boot::LIVE_ARM_VENUES` is still
+empty, and the compile-time assertion that holds it empty is still
+there — E3 did **not** delete it. Deleting that assertion remains the
+reviewable moment, and it belongs to E4.
+
+### The five mechanisms that keep this off mainnet
+
+Named individually, so that a future edit to any one of them is
+visibly a policy change and not a refactor:
+
+1. **The guard.** `exec_hyperliquid::smoke::run` refuses unless
+   `HlConfig::is_testnet()`, which requires BOTH the testnet host and
+   the testnet `source` — two independent fields. It is the first
+   statement in the function, before the key is parsed or a socket is
+   opened.
+2. **Disjoint credentials.** The gate reads `HYPERLIQUID_TESTNET_*`,
+   which the live arm never reads, and vice versa. This is not
+   tidiness: if the gate shared `HYPERLIQUID_EXCHANGE_HOST` with the
+   live arm, then the day a slot is armed — and that host becomes
+   mainnet — the gate would begin refusing itself on its own guard and
+   block every restart, at exactly the moment it first carries weight.
+   An operator facing a permanently red gate removes the gate.
+3. **The host/source interlock.** `HlConfig::new` refuses a mainnet
+   host with a testnet source and a testnet host with a mainnet source.
+   The loud failure it prevents is a 100 % rejection rate; the quiet
+   one, which is worse, is a testnet `source` pointed at the mainnet
+   host.
+4. **The empty `LIVE_ARM_VENUES`**, above.
+5. **The signature is computed over the testnet `source` byte.** Even a
+   redirected socket would carry a signature that recovers to a
+   different address on mainnet, so the probe is not replayable to
+   production. This is the strongest of the five and the only one that
+   holds without trusting any host string.
+
+### The smoke is not an order path
+
+It signs exactly one action type: a `cancel`. **A cancel can only
+reduce exposure, never open a position.** It needs no balance, no
+faucet and no registered agent.
+
+Note what the justification is NOT: the probe names order id 1, and
+order ids are a global sequence, so id 1 did exist at genesis. "The oid
+cannot exist" would be a false argument. The true one is the paragraph
+above, plus the fact that the account is a separate testnet account.
+
+### What the gate proves, and what it does not
+
+The gate has two halves and they cover different things.
+
+- **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
+  the binary reproduces all 25 known-answer vectors the official
+  `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
+  from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify` —
+  demanding the SDK's exact msgpack. **This is the half that covers LAW
+  E-3 for orders.**
+- **Venue** (two signed POSTs): the venue verifies a good signature and
+  rejects a corrupted one.
+
+The distinction matters because msgpack key order is **per action
+type**. The venue half signs a cancel, so it structurally cannot see a
+reordering of `OrderWire`'s keys — a rebuild that broke every order
+this engine sends would leave the network probe perfectly green. That
+is why the vectors are embedded in the binary (`exec_hyperliquid::
+selftest`) rather than left to `cargo nextest`: the release artifact
+certifies itself, rather than being certified by a test suite that may
+not have been run against it.
+
+What the gate still does not cover: it vets the binary at
+`target/release` and then drains; launchd relaunches whatever is on
+disk at relaunch time, and the gate records no hash of what it vetted.
+The window is seconds and the fleet is single-operator, so this is
+recorded rather than closed.
+
+### A new operator control that can stop the production engine
+
+`scripts/daily-restart.sh` will **defer the restart** when
+`~/multivenue/exec.toml` names a live slot and the gate does not pass.
+This is the second control in this file, after `mode = "off"`, that can
+have a consequence nobody asked for, so it gets the same explicit
+treatment.
+
+- **What triggers it:** any non-zero exit from the gate — a missing or
+  stale binary, absent credentials, a failed offline self-test, a
+  phase-A or phase-B failure, **or an unreachable venue**. It fails
+  closed on purpose: an unproven binary is unproven whatever the
+  reason, and the engine already running keeps trading under the binary
+  that was vetted when it booted.
+- **What it does NOT stop:** retention and the xsd table rotation. They
+  have nothing to do with signing, and a gate that silently stopped the
+  disk-pressure sweep would turn a signing problem into a full disk on
+  a laptop-hosted engine.
+- **The restart is deferred, never consumed.** The fired slots stay
+  stamped — so the once-a-day laws hold — and the owed restart is
+  recorded in `state/exec-gate-pending` and taken the minute the gate
+  goes green.
+- **Backoff is mandatory, not politeness.** Hyperliquid's request
+  budget is ADDRESS-based, and an exhausted address drops to one
+  request per ten seconds, which is below what the gate needs to pass.
+  A gate retrying every 60 s would spend ~2,880 requests a day and
+  within days exhaust the very budget it needs to go green — a
+  transient failure repairing itself into a permanent one. So: 1, 5, 15
+  then 60 minutes, and the free offline half still runs on every
+  attempt.
+- **There is no paging lane.** After three consecutive failures the
+  gate writes `state/exec-gate-RED`, which is a file somebody has to
+  look at. This file's own standard — *a halt nobody is paged for is a
+  halt discovered in a weekly report* — is not met here, and that is a
+  known gap rather than a solved problem.
+- **The trigger errs toward running the gate.** Arming is
+  `--exec <path>` plus `--arm-live` on the engine's command line, and
+  `--exec` has **no default path by design** — an artifact that
+  auto-loads from a well-known path is one filesystem accident away
+  from arming a slot nobody meant to arm. Which file arms the fleet is
+  therefore not knowable from the restart lane, so the gate does not
+  guess: it scans **every `~/multivenue/exec*.toml`** and arms on any
+  of them, and an existing-but-unreadable one arms it too, because
+  "cannot be shown inert" is not "is inert".
+  The asymmetry is deliberate and is the whole design: a false positive
+  costs one four-second probe against testnet, a false negative puts an
+  unvetted signer on the fleet. The residue is that a stale
+  `exec*.toml` marked live defers restarts for a fleet that is entirely
+  paper — which is the safe direction, and is why `enabled = 0` exists
+  as a one-line way to say so. *(Operator ruling 2026-09-15: fix now
+  rather than defer to E4.)*
+
+### Credentials the gate requires
+
+`HYPERLIQUID_TESTNET_AGENT_KEY` and `HYPERLIQUID_TESTNET_MASTER_ADDR`
+are required; `HYPERLIQUID_TESTNET_EXCHANGE_HOST` and
+`HYPERLIQUID_TESTNET_SOURCE` default to the testnet host and `"b"`.
+They are documented in `.env.example` and `docs/local-setup.md`,
+because an undocumented credential whose absence defers every restart
+is the wedge described above waiting to happen.
+
+### Deviation from plan §5.1, recorded
+
+The plan's E3 exit gate asks for a signed order ACCEPTED with its oid
+echoed back, and modify + cancel-by-cloid round-tripping. **That was
+not built.** It requires a funded testnet account with a registered
+agent wallet, which did not exist when E3 was written, and building it
+would have meant placing real orders from a cron-reachable path.
+
+What was built instead proves more than the signature half of that gate
+and costs nothing: the venue naming our own recovered address is
+positive evidence of the entire msgpack → keccak → EIP-712 → secp256k1
+chain, and the embedded SDK vectors cover every action type rather than
+the three the round-trip would have touched. The lifecycle half — that
+the venue's *order state machine* behaves as expected — remains
+unproven and is **phase C**, to be run once the testnet account exists.
+E3's exit gate is therefore met in its signature half only, and must
+not later be read as met in full.

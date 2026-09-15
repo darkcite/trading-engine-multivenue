@@ -63,6 +63,13 @@
 # (fires within 60 s). The legacy single stamp `last-restart-utc-day`
 # is ignored and left in place.
 #
+# EXECUTION GATE (E3): when ANY ~/multivenue/exec*.toml marks a slot
+# LIVE, a fired restart slot must first prove the release binary still
+# signs the way the venue expects (scripts/exec-smoke.sh). A failure
+# DEFERS the drain — and only the drain: retention and the xsd rotation
+# keep running, and the owed restart is taken the minute the gate goes
+# green. See the block below for the backoff and why it is mandatory.
+#
 # StartInterval (not StartCalendarInterval) because launchd calendar
 # fires in LOCAL time — a UTC-day law must not bend to DST.
 set -u
@@ -129,6 +136,198 @@ if slot_ready 2115; then
   slot_mark 2115
   drain=1
   fired="$fired 2115"
+fi
+
+# ---------------------------------------------------------------------
+# E3 PRE-RESTART EXECUTION GATE (real-execution plan §5).
+#
+#   A relinked binary that cannot sign a TESTNET order must never be
+#   allowed to sign a MAINNET one.
+#
+# A restart is the moment the fleet picks up whatever is in
+# target/release. If a rebuild broke the signing path — and LAW E-3
+# (msgpack key order is part of the signature) has NO compile-time
+# guard, so reordering two struct fields is enough — the engine that
+# comes back signs valid signatures over digests the venue never
+# computed. Every order rejected, and nothing in the boot tell says why.
+#
+# So: when exec.toml marks any slot LIVE, prove the binary BEFORE
+# handing it the fleet.
+#
+# TWO HALVES, AND ONLY ONE OF THEM COSTS ANYTHING
+#   offline  the binary reproduces the 25 SDK known-answer vectors and
+#            rebuilds one action per TYPE from inputs. This is the half
+#            that covers LAW E-3 for ORDERS — the network probe sends a
+#            cancel, so it structurally cannot. Free, no venue, no key.
+#   venue    a good signature is verified and a corrupted one rejected.
+#            Two signed POSTs. No balance, no registered agent.
+#
+# The offline half runs on EVERY attempt. The venue half is rate-limited
+# (below), so the offline half is what keeps a red gate diagnosable
+# while we are deliberately not talking to the venue.
+#
+# WHY THE BACKOFF IS NOT OPTIONAL
+# Hyperliquid's request budget is ADDRESS-based: 10,000 plus one per
+# USDC of lifetime volume, and an exhausted address drops to ONE request
+# every 10 seconds. The venue half needs two sequential posts inside a
+# 5 s deadline. So a gate that retried every 60 s would spend ~2,880
+# requests a day and, within days, exhaust the very budget it needs to
+# go green — a failure that repairs itself into a permanent one. Hence
+# 1, 5, 15 then 60 minutes.
+#
+# WHAT A RED GATE DOES AND DOES NOT STOP
+# It defers the RESTART, and nothing else. Retention and the xsd table
+# rotation still run: they have nothing to do with signing, and a gate
+# that silently stopped the disk-pressure sweep would turn a signing
+# problem into a full disk on a laptop-hosted engine. The restart is
+# recorded as OWED in exec-gate-pending and taken the minute the gate
+# goes green — so the slots are deferred, never consumed and never lost.
+#
+# FAIL-CLOSED, including on an unreachable venue: an unproven binary is
+# unproven whatever the reason. The engine already running is untouched
+# and keeps trading under the binary that was vetted when IT booted.
+# Refusing the restart costs a stale boot chain, which costs a dark
+# member, which costs nothing. Handing the fleet an unproven signer
+# costs money.
+#
+# THERE IS NO PAGING LANE. After EXEC_GATE_ALERT_AFTER consecutive
+# failures this writes state/exec-gate-RED, which is a file an operator
+# has to look at. docs/risk-policy.md records that as a known gap.
+# ---------------------------------------------------------------------
+EXEC_TOML="${MULTIVENUE_EXEC_TOML:-$HOME/multivenue/exec.toml}"
+EXEC_GATE_PENDING="$STATE/exec-gate-pending"
+EXEC_GATE_FAILS="$STATE/exec-gate-fails"
+EXEC_GATE_NEXT="$STATE/exec-gate-next"
+EXEC_GATE_RED="$STATE/exec-gate-RED"
+EXEC_GATE_ALERT_AFTER=3
+
+# WHICH FILE ARMS THE FLEET IS NOT KNOWABLE FROM HERE.
+#
+# Arming is `--exec <path>` plus `--arm-live` on the engine's command
+# line, and `--exec` has NO DEFAULT PATH by design (exec.toml.example:
+# "an artifact that auto-loads from a well-known path is one filesystem
+# accident away from arming a slot nobody meant to arm"). So a gate
+# that only ever read ~/multivenue/exec.toml would be SKIPPED ENTIRELY
+# by an operator who armed with exec-live.toml — silently, and in the
+# one direction that matters.
+#
+# So this scans EVERY exec*.toml beside it and arms on any of them.
+# The asymmetry is deliberate: a false positive costs one 4-second
+# probe against testnet, and a false negative costs an unvetted signer
+# on the fleet.
+#
+# For the same reason an EXISTING but UNREADABLE file arms the gate. It
+# cannot be shown inert, and "cannot be shown inert" is not "is inert".
+#
+# An ABSENT file is every slot paper (exec.toml.example, grammar law 2)
+# and `enabled = 0` makes the whole file inert, so neither needs a gate.
+EXEC_GATE_TRIGGER=""
+exec_gate_armed() {
+  local f
+  # (N) is zsh's null_glob for this glob alone: no matches expands to
+  # nothing rather than erroring under the default nomatch.
+  for f in "$EXEC_TOML" "$HOME"/multivenue/exec*.toml(N); do
+    [ -f "$f" ] || continue
+    if [ ! -r "$f" ]; then
+      EXEC_GATE_TRIGGER="$f (UNREADABLE — arming the gate rather than assuming it is inert)"
+      return 0
+    fi
+    if grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*0' "$f"; then
+      continue
+    fi
+    if grep -Eq '^[[:space:]]*mode[[:space:]]*=[[:space:]]*"live"' "$f"; then
+      EXEC_GATE_TRIGGER="$f"
+      return 0
+    fi
+  done
+  EXEC_GATE_TRIGGER=""
+  return 1
+}
+
+exec_gate_note_failure() {
+  local rc="$1" where="$2" n delay
+  n=1
+  [ -f "$EXEC_GATE_FAILS" ] && n=$(( $(cat "$EXEC_GATE_FAILS") + 1 ))
+  echo "$n" > "$EXEC_GATE_FAILS"
+  case "$n" in
+    1) delay=60 ;;
+    2) delay=300 ;;
+    3) delay=900 ;;
+    *) delay=3600 ;;
+  esac
+  echo "$(( $(date -u +%s) + delay ))" > "$EXEC_GATE_NEXT"
+  echo "daily-restart: exec gate FAILED at the $where (exit $rc), attempt $n; next venue attempt in $((delay / 60)) min" >&2
+  if [ "$n" -ge "$EXEC_GATE_ALERT_AFTER" ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) exec gate RED: $where exit $rc, $n consecutive failures" \
+      > "$EXEC_GATE_RED"
+    echo "daily-restart: *** $EXEC_GATE_RED written — restarts are deferred until this clears ***" >&2
+  fi
+}
+
+exec_gate_clear() {
+  rm -f "$EXEC_GATE_FAILS" "$EXEC_GATE_NEXT" "$EXEC_GATE_RED"
+}
+
+# 0 = the binary is proven and the restart may proceed.
+exec_gate_pass() {
+  local rc now next
+  # Free half, every time. NOTE the explicit `rc=$?` on the line after
+  # the command: inside an `if ! cmd; then` branch `$?` is the status of
+  # the `if`, which is 0 — so capturing it there reported every failure
+  # as "exit 0" and threw away the one number that says WHAT broke.
+  "$SCRIPTS_DIR/exec-smoke.sh" --offline >/dev/null
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    exec_gate_note_failure "$rc" "offline self-test"
+    return 1
+  fi
+  now="$(date -u +%s)"
+  if [ -f "$EXEC_GATE_NEXT" ]; then
+    next="$(cat "$EXEC_GATE_NEXT")"
+    if [ "$now" -lt "$next" ]; then
+      echo "daily-restart: exec gate backing off — $(( (next - now + 59) / 60 )) min until the next venue attempt" >&2
+      return 1
+    fi
+  fi
+  "$SCRIPTS_DIR/exec-smoke.sh" >/dev/null
+  rc=$?
+  if [ "$rc" = 0 ]; then
+    exec_gate_clear
+    return 0
+  fi
+  exec_gate_note_failure "$rc" "venue phase"
+  return 1
+}
+
+if [ "$drain" = 1 ] || [ -f "$EXEC_GATE_PENDING" ]; then
+  if exec_gate_armed; then
+    echo "daily-restart: $EXEC_GATE_TRIGGER marks a slot LIVE — the execution gate decides this restart" >&2
+    if exec_gate_pass; then
+      echo "daily-restart: exec gate PASSED — restart may proceed" >&2
+      if [ -f "$EXEC_GATE_PENDING" ]; then
+        echo "daily-restart: taking the restart owed from$(cat "$EXEC_GATE_PENDING")" >&2
+        fired="$fired$(cat "$EXEC_GATE_PENDING")"
+        rm -f "$EXEC_GATE_PENDING"
+        drain=1
+      fi
+    else
+      if [ "$drain" = 1 ]; then
+        # Record the restart as OWED. The slots stay stamped, so
+        # retention and the xsd rotation keep their once-a-day law.
+        echo "$fired" >> "$EXEC_GATE_PENDING"
+        echo "daily-restart: restart DEFERRED (slots$fired owed); retention and rotation still run" >&2
+      fi
+      drain=0
+    fi
+  else
+    # Not armed. Any pending restart is moot — the binary it was
+    # waiting on cannot reach a venue.
+    if [ -f "$EXEC_GATE_PENDING" ]; then
+      echo "daily-restart: no live slot any more — dropping the deferred restart and clearing the gate" >&2
+    fi
+    rm -f "$EXEC_GATE_PENDING"
+    exec_gate_clear
+  fi
 fi
 
 # XSD-4 (statarb doc 08 §3.7; operator ruling 2026-09-12 "automatic

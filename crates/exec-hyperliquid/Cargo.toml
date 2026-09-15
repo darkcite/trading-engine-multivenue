@@ -6,8 +6,20 @@ rust-version.workspace = true
 license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
-description  = "Hyperliquid L1 exchange actions: zero-alloc msgpack encoding, the action hash and the Agent EIP-712 signature (E2). No network."
+description  = "Hyperliquid L1 execution: zero-alloc msgpack encoding, the action hash and the Agent EIP-712 signature (E2), plus the mio+rustls exchange arm, fail-closed response scanner and testnet gate (E3)."
 
 [dependencies]
 signer-eip712 = { workspace = true }
+# E3: the agent key lives in core_config::SecretKeyBytes — the ONE
+# mlock'd, zeroize-on-drop representation docs/risk-policy.md allows a
+# signing key to have after boot. Not reimplemented here.
+core-config   = { workspace = true }
+zeroize       = { workspace = true }
 secp256k1     = { workspace = true }
+core-net      = { workspace = true }
+core-types    = { workspace = true }
+mio           = { workspace = true }
+rustls        = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }

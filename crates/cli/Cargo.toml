@@ -49,6 +49,10 @@ core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
 exec-router          = { workspace = true }
+# E3: the `exec-smoke` arm — the TESTNET-ONLY signature gate. This is
+# the crate's ONLY caller in the binary; the engine's dispatch path
+# does not reach it (LIVE_ARM_VENUES is empty and asserted so).
+exec-hyperliquid     = { workspace = true }
 book-builder         = { workspace = true }
 core-metrics         = { workspace = true }
 core-latency         = { workspace = true }

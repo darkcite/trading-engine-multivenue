@@ -161,8 +161,14 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
+ "core-config",
+ "core-net",
+ "core-types",
+ "mio",
+ "rustls",
  "secp256k1",
  "signer-eip712",
+ "zeroize",
 ]
 
 [[package]]

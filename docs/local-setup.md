@@ -40,6 +40,14 @@ chmod 600 .env
 #   ANTHROPIC_API_KEY       — read by `claude-worker serve` ONLY (verbs never need it)
 #   AI_INGRESS_HMAC_KEY     — 64 hex chars shared by engine + worker (8f AI lane)
 #   ALCHEMY_API_KEY         — managed Polygon RPC (free tier)
+#   HYPERLIQUID_TESTNET_AGENT_KEY   — E3 execution gate (any valid
+#                             secp256k1 key; needs no balance and no
+#                             registered agent). ONLY needed once
+#                             exec.toml marks a slot live — but then it
+#                             is needed, or restarts defer. See
+#                             docs/risk-policy.md "The Hyperliquid
+#                             exchange arm (E3)".
+#   HYPERLIQUID_TESTNET_MASTER_ADDR — the testnet master account address
 
 # 2. Build the workspace (debug first, release next).
 cargo build --workspace

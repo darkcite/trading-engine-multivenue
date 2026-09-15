@@ -337,7 +337,14 @@ pub struct SecretKeyBytes {
 
 impl SecretKeyBytes {
     /// Move `raw` into an mlock'd allocation, zeroize the caller's copy.
-    fn new_locked(mut raw: [u8; 32]) -> Result<Self, ConfigError> {
+    ///
+    /// Public since E3: `docs/risk-policy.md` names THIS type as the
+    /// one representation a signing key may have after boot, so a
+    /// second key — the Hyperliquid agent wallet in
+    /// `exec_hyperliquid::HlConfig` — must be able to use it rather
+    /// than reimplement it. Two mlock/zeroize implementations is one
+    /// more than can be audited.
+    pub fn new_locked(mut raw: [u8; 32]) -> Result<Self, ConfigError> {
         let mut b: Box<[u8; 32]> = Box::new([0u8; 32]);
         b.copy_from_slice(&raw);
         raw.zeroize();
@@ -361,8 +368,11 @@ impl SecretKeyBytes {
         Ok(Self { inner: b, mlocked })
     }
 
+    /// Read-only view of the 32 bytes. Callers must not copy them into
+    /// an unlocked buffer that outlives the call.
     #[inline]
-    fn bytes(&self) -> &[u8; 32] {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8; 32] {
         &self.inner
     }
 }

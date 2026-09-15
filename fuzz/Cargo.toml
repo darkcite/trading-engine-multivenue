@@ -296,3 +296,10 @@ path   = "fuzz_targets/hl_msgpack_encode.rs"
 test   = false
 doc    = false
 bench  = false
+
+[[bin]]
+name   = "hl_exchange_response"
+path   = "fuzz_targets/hl_exchange_response.rs"
+test   = false
+doc    = false
+bench  = false
