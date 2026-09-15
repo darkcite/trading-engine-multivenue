@@ -858,6 +858,80 @@ The fixtures are now **captured venue output**, not invention —
 from the testnet API, and `recon.rs` keeps `+<enc>` because balances
 really are spelled that way.
 
+### Phase D — the round trip LAW E-9 rests on, finally measured
+
+`exec-smoke --fill` places ONE IoC that is **meant to trade**. It is
+separate from `--lifecycle` rather than a flag on it because the two
+are opposite in intent: `--lifecycle` places a POST-ONLY order and
+treats a fill as a failure, which tests the lifecycle without trading.
+Phase D trades on purpose, for one reason — **nothing else proves that
+our own cloid survives the round trip**, and LAW E-9's whole
+attribution model rests on it.
+
+An IoC either trades or is gone, so unlike the post-only probe this one
+should not be able to strand a resting order — and it therefore carries
+no cleanup path. **That is a property of the order type, not a
+guarantee this code enforces**: `FillReport::any_resting` exists
+precisely because a venue that rested an IoC would have done what the
+order type forbids, and if that ever happens the order is on the book
+with nothing behind it. The CLI exits nonzero and says so; recovery is
+a cancel-by-cloid, which is possible because the cloid is deterministic
+from the two numbers that placed it (`cloid::encode(slot, client_oid)`,
+defaulting to 3 and 1). A loopback test drives that branch.
+
+Three guards, because this is the only path in the repo that executes
+by design:
+
+- **A dry run**, `--fill --dry-run`. `--lifecycle` has one, with the
+  rationale that "a transposed price or a size off by a decimal is a
+  plausible mistake and an expensive one" — which was written for the
+  case where post-only makes a wrong price a REFUSAL. On this path the
+  same typo trades, so the rationale applies with more force, and the
+  preview prints the **notional**, which is the number a misplaced
+  decimal corrupts.
+- **A notional ceiling**, `MAX_FILL_NOTIONAL_1E8` = $100, checked
+  before anything is signed and shared with the dry run so the
+  rehearsal refuses what the send refuses. It is a **typo limit, not a
+  risk limit**: every cap that matters lives in `strategy-*` and the
+  ruleset validator, and this path traverses none of them. An
+  unbounded `i64` on the only executing path is not defensible even on
+  testnet, because the shape is what a mainnet variant would copy.
+- **Tests on the guards themselves.** Mainnet refusal on both
+  `run_fill` and the `run_fill_on` seam, the oversized-notional
+  refusal (including that `i64::MAX × i64::MAX` cannot wrap past the
+  ceiling), and the loopback cases above. The repo's own standard is
+  that an unexercised guard is a claim about source code.
+
+The operator states the market, the crossing price and the size; this
+code does not read the book and will not guess a price.
+
+**Run 2026-09-15, testnet, bought 2 of a live MLB outcome leg at 0.68.**
+The results, which are now the crate's fixtures rather than invention:
+
+- The cloid we signed — `0x4d560300000000000000000000000001` — came
+  back down `userFills` **byte for byte**, and decodes to
+  `Owner::Ours { strategy_id: 3, client_oid: 1 }`. LAW E-9 is measured,
+  not asserted. `userws::tests::our_own_cloid_survives_the_venue_round_trip`
+  carries the row verbatim.
+- **Both namespaces, one account, one moment**: the fill says
+  `#194180`; `spotClearinghouseState` for the same leg says `+194180`,
+  total `2.0`, `entryNtl 1.36`. That is the table above, confirmed on
+  our own balance rather than a stranger's.
+- USDC went 999.00 → 997.64. Exactly 2 × 0.68.
+
+Two venue constraints fell out of it:
+
+- **Minimum order value is 1 USDC.** The first attempt (size 1 at 0.68
+  = $0.68) was REFUSED with "Order must have minimum value of 1 USDC".
+  This is a real sizing constraint, not a testnet quirk to ignore: a
+  clip priced near the bottom of a binary's range can breach it, and
+  the refusal costs a round trip and a nonce. **Size the clip against
+  the price, not against the unit count.**
+- **`fee: "0.0"`** on a crossing (taker) fill. HIP-4 fees really are
+  zero on the wire, which is the fact `fees.toml`'s 2:5 contradicts
+  (see the BIN15 intraday note). Measured, per plan §6.5 — not read
+  from a doc.
+
 ### Settlement arrives as a FILL
 
 The same capture turned up something the plan does not mention:

@@ -157,7 +157,12 @@ impl core::fmt::Display for SmokeErr {
             SmokeErr::SelfTest(e) => write!(f, "exec-smoke: {e}"),
             SmokeErr::Lifecycle { stage, msg } => write!(
                 f,
-                "exec-smoke: PHASE C FAILED at the {stage} stage: {msg}"
+                // The phase is named from the STAGE rather than
+                // hard-coded: `--fill` (phase D) shares this error,
+                // and a failure that names the wrong phase sends an
+                // operator to read the wrong code.
+                "exec-smoke: PHASE {phase} FAILED at the {stage} stage: {msg}",
+                phase = if stage.starts_with("fill") { 'D' } else { 'C' }
             ),
             SmokeErr::Encode => write!(f, "exec-smoke: action did not fit its buffer"),
             SmokeErr::Sign => write!(f, "exec-smoke: signing failed"),

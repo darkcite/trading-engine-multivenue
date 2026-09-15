@@ -99,8 +99,12 @@ fi
 # must not claim a venue verification that never happened — a gate that
 # overstates what it proved is worse than one that proves less.
 offline=0
+dry=0
 for a in "$@"; do
   [ "$a" = "--offline" ] && offline=1
+  # A dry run reaches no venue either, and must not inherit the
+  # message that says one verified us. Same rule as --offline.
+  [ "$a" = "--dry-run" ] && dry=1
 done
 
 # One line of JSON on stdout for CI; the human report on stderr.
@@ -108,7 +112,9 @@ done
 rc=$?
 
 case "$rc" in
-  0)  if [ "$offline" = 1 ]; then
+  0)  if [ "$dry" = 1 ]; then
+        echo "exec-smoke: DRY RUN — nothing was sent and NOTHING was verified; the action above is what would go on the wire" >&2
+      elif [ "$offline" = 1 ]; then
         echo "exec-smoke: PASS (offline) — this binary reproduces the venue SDK's bytes for every action type; the venue was NOT contacted" >&2
       else
         echo "exec-smoke: PASS — this binary's signature is verified by the venue" >&2

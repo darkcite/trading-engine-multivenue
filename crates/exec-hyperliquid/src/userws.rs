@@ -807,6 +807,64 @@ mod tests {
     /// The `is_settlement` flag landed in existing padding and changed
     /// nothing; the next field might not, and nothing else would say
     /// so.
+    /// **OUR OWN fill, captured from the testnet venue on
+    /// 2026-09-15** — the row the engine placed, verbatim, after
+    /// `exec-smoke --fill` bought 2 of a live MLB outcome leg at 0.68.
+    ///
+    /// This is the round trip LAW E-9 rests on, and until this row
+    /// existed it rested on source code: the cloid we signed came back
+    /// down `userFills` byte for byte, decodes to our magic, our slot
+    /// and our client id, and `to_fill` books it to that slot.
+    ///
+    /// It also pins both namespaces from ONE account at ONE moment:
+    /// this fill says `#194180`, while `spotClearinghouseState` for
+    /// the same account and the same leg says `+194180` with a total
+    /// of 2.0 — which is why `recon.rs` keeps `+` and this file uses
+    /// `#`.
+    #[test]
+    fn our_own_cloid_survives_the_venue_round_trip() {
+        const OURS: &[u8] = br##"{"channel":"userFills","data":{"isSnapshot":false,"user":"0x4479d9f28d76907ab21ec895ba10cf7b4ec65644","fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1789496840296,"startPosition":"0.0","dir":"Buy","closedPnl":"0.0","hash":"0x4b5317c8","oid":60205675696,"crossed":true,"fee":"0.0","tid":463533693056746,"cloid":"0x4d560300000000000000000000000001","feeToken":"USDC","twapId":null}]}}"##;
+
+        let mut out = [UserFill::default(); 4];
+        let (n, snap) = scan_user_fills(OURS, &mut out).expect("our own fill must scan");
+        assert_eq!(n, 1);
+        assert!(!snap);
+
+        let f = out[0];
+        assert_eq!(f.coin.of(OURS), b"#194180");
+        assert_eq!(f.px_1e8, 68_000_000);
+        assert_eq!(f.sz_1e8, 200_000_000);
+        assert!(f.is_buy);
+        assert!(!f.is_settlement);
+        assert_eq!(f.fee_1e8, 0, "HIP-4 fees really are zero on the wire");
+        assert_eq!(f.oid, 60_205_675_696);
+
+        // THE ROUND TRIP. We signed this cloid; the venue echoed it.
+        assert_eq!(
+            owner_of(&f),
+            crate::cloid::Owner::Ours {
+                strategy_id: 3,
+                client_oid: 1,
+            },
+            "the cloid we signed did not decode back to the slot we sent"
+        );
+
+        // And it books to that slot, carrying the CLIENT oid.
+        match to_fill(&f, 7, 1).expect("converts") {
+            Routed::Slot(fill) => {
+                assert_eq!(fill.strategy_id, 3);
+                assert_eq!(fill.order_id, 1, "the member's id, not the venue's");
+                assert_eq!(fill.qty.raw(), 2_000_000);
+                assert_eq!(fill.px.raw(), 680_000);
+            }
+            Routed::TapeOnly(_) => panic!("our own fill must reach the slot"),
+        }
+
+        // $1.36 of notional — which the venue's own balance echoed
+        // back as entryNtl 1.36 for `+194180`.
+        assert_eq!(f.notional_usdc_1e6(), 1_360_000);
+    }
+
     /// `Fill::order_id` is the MEMBER'S id, engine-wide. The paper
     /// matcher stamps `o.client_oid` and `book_fill` matches on it, so
     /// an arm that stamped the venue's oid would book nothing at all

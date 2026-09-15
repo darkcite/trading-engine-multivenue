@@ -26,7 +26,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, Stream};
 
 use exec_hyperliquid::config::{HlConfig, Scope, HOST_TESTNET};
-use exec_hyperliquid::lifecycle::{run_on, LifecycleSpec};
+use exec_hyperliquid::lifecycle::{run_fill_on, run_on, FillSpec, LifecycleSpec};
 use exec_hyperliquid::smoke::SmokeErr;
 use exec_hyperliquid::HlHttp;
 
@@ -162,6 +162,112 @@ fn spec() -> LifecycleSpec {
 
 fn client(port: u16, tls: Arc<ClientConfig>) -> HlHttp {
     HlHttp::new("localhost", port, tls).expect("construct")
+}
+
+fn fill_spec() -> FillSpec {
+    FillSpec {
+        asset: 100_000_000 + 10 * 3253,
+        px_1e8: 68_000_000,
+        sz_1e8: 200_000_000,
+        is_buy: true,
+        strategy_id: 3,
+        client_oid: 1,
+    }
+}
+
+/// PHASE D's happy path: one request, the venue says filled, and the
+/// cloid the caller gets back is the one to look for in `userFills`.
+#[test]
+fn a_fill_takes_exactly_one_request_and_returns_the_cloid_it_sent() {
+    let (port, tls, served) = boot(&[FILLED]);
+    let mut http = client(port, tls);
+    let r = run_fill_on(&cfg(), &mut http, fill_spec()).expect("fill");
+
+    assert!(r.any_filled);
+    assert!(!r.any_resting, "an IoC must not rest");
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "phase D is ONE request — no modify, no cancel, nothing to clean up"
+    );
+    // Deterministic from the two numbers that placed it, which is what
+    // makes a stranded order recoverable if the venue ever rests one.
+    assert_eq!(r.cloid, exec_hyperliquid::cloid::encode(3, 1));
+}
+
+/// **The branch the review asked for.** An IoC that RESTS is the venue
+/// doing what the order type forbids, and the order is then on the
+/// book with no cleanup path behind it. `run_fill_on` must surface it
+/// rather than swallow it — the CLI turns this into a nonzero exit.
+#[test]
+fn an_ioc_that_rested_is_reported_not_swallowed() {
+    let (port, tls, _) = boot(&[PLACED]);
+    let mut http = client(port, tls);
+    let r = run_fill_on(&cfg(), &mut http, fill_spec()).expect("the venue answered ok");
+    assert!(r.any_resting, "the caller must be able to SEE that it rested");
+    assert!(!r.any_filled);
+    assert_ne!(r.oid, 0, "and must know which order to cancel");
+}
+
+/// A venue refusal on the trading path is an error, not a quiet
+/// `any_filled: false`.
+#[test]
+fn a_refused_fill_is_an_error() {
+    let (port, tls, _) = boot(&[REJECTED]);
+    let mut http = client(port, tls);
+    let e = run_fill_on(&cfg(), &mut http, fill_spec()).expect_err("refused");
+    assert!(
+        matches!(e, SmokeErr::Lifecycle { stage: "fill", .. }),
+        "{e:?}"
+    );
+}
+
+/// **Proof that the SEND calls the ceiling, not just that the ceiling
+/// exists.** `check_fill_spec` is tested directly and through
+/// `preview_fill`, but until this ran, deleting the call inside
+/// `run_fill_on` left every test in the suite green — the guard was a
+/// claim about source code. `served == 0` is the assertion that
+/// matters: the socket is standing by with a `FILLED` answer, and the
+/// refusal happens before a byte reaches it.
+#[test]
+fn an_oversized_fill_never_reaches_the_socket() {
+    let (port, tls, served) = boot(&[FILLED]);
+    let mut http = client(port, tls);
+    let mut s = fill_spec();
+    s.sz_1e8 = 200_000_000_000; // a size off by three decimals
+    let e = run_fill_on(&cfg(), &mut http, s).expect_err("the ceiling must refuse this");
+    assert!(
+        matches!(
+            e,
+            SmokeErr::Lifecycle {
+                stage: "fill-spec",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        0,
+        "the refusal must happen BEFORE anything is signed or sent"
+    );
+}
+
+/// The guard restated on the public seam, not assumed from `run_fill`.
+#[test]
+fn the_loopback_seam_still_refuses_mainnet() {
+    let (port, tls, _) = boot(&[FILLED]);
+    let mut http = client(port, tls);
+    let m = HlConfig::new(
+        Scope::Live,
+        exec_hyperliquid::config::HOST_MAINNET,
+        'a',
+        KEY,
+        ADDR,
+    )
+    .expect("cfg");
+    let e = run_fill_on(&m, &mut http, fill_spec()).expect_err("mainnet must be refused");
+    assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
 }
 
 #[test]

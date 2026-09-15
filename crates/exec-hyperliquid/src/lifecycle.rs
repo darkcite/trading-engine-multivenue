@@ -426,6 +426,232 @@ fn post(
 /// the high bytes are a fixed marker that says "exec-smoke placed
 /// this" — an order found resting on the account can be traced back
 /// here rather than guessed at.
+/// The largest notional phase D will send, 1e8-scaled: **$100**.
+///
+/// Not a risk limit — it is a TYPO limit. Every cap that matters lives
+/// in `strategy-*` and the ruleset validator, and this path traverses
+/// none of them: it is an operator typing four numbers on a command
+/// line straight into an order that is DESIGNED to execute. A size off
+/// by a decimal is the plausible mistake, and on this path it does not
+/// bounce off post-only — it trades.
+///
+/// The value is deliberately small. Phase D exists to prove a cloid
+/// round trip, and $100 is two orders of magnitude more than that
+/// needs. Raising it is an edit here, in the open, rather than a
+/// number that was never there.
+///
+/// **A MAINNET VARIANT MUST NOT COPY THIS CONST.** It is a single
+/// global ceiling, which is the wrong shape for real caps: those are
+/// per-venue and per-unit (`strategy_core::caps_for_venue`, and
+/// Deribit is capped in coins rather than dollars). A second
+/// order-submission path running to its own numbers is precisely the
+/// hole `docs/risk-policy.md` warns about. Anything that trades for
+/// real reads `caps_for_venue`; this number exists only because phase
+/// D traverses none of that machinery and an unbounded `i64` on an
+/// executing path is indefensible even on testnet.
+pub const MAX_FILL_NOTIONAL_1E8: i128 = 100 * 100_000_000;
+
+/// What the operator must state to make a REAL TRADE. Nothing here is
+/// derived, for the same reason nothing in [`LifecycleSpec`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillSpec {
+    /// Venue asset id. **Bound by the operator, never derived**
+    /// (LAW E-4).
+    pub asset: u32,
+    /// A price that CROSSES the book, 1e8-scaled. The operator states
+    /// it, having looked at the book — this code does not read the
+    /// book and does not guess, because the one number able to turn a
+    /// test into an expensive trade is the price.
+    pub px_1e8: i64,
+    /// Size, 1e8-scaled.
+    pub sz_1e8: i64,
+    /// Buy side.
+    pub is_buy: bool,
+    /// The slot the cloid will name (LAW E-9). The point of this probe
+    /// is that the cloid comes back down `userFills` and decodes to
+    /// this, so it is OUR magic, not the smoke's.
+    pub strategy_id: u8,
+    /// The member's own id for the order — what `Fill::order_id` must
+    /// carry when the fill is booked.
+    pub client_oid: u64,
+}
+
+/// What the trade observed. **The ACK, not the fill** (LAW E-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillReport {
+    /// The cloid sent — look for this in `userFills`.
+    pub cloid: [u8; 16],
+    /// The oid the venue echoed.
+    pub oid: u64,
+    /// The venue said `filled`.
+    pub any_filled: bool,
+    /// The venue said `resting`. **An IoC should never rest**; if this
+    /// is true the venue did something the order type forbids — and
+    /// the order is then ON THE BOOK. There is no cleanup path here
+    /// (an IoC is not supposed to need one), so the caller must cancel
+    /// it. The cloid is deterministic — `cloid::encode(strategy_id,
+    /// client_oid)` — so it can be cancelled by cloid from the same
+    /// two numbers that placed it.
+    pub any_resting: bool,
+}
+
+/// The spec checks, shared by [`run_fill_on`] and [`preview_fill`] so
+/// a dry run cannot pass inputs the real send would refuse.
+///
+/// # Errors
+/// Non-positive price or size, or a notional over
+/// [`MAX_FILL_NOTIONAL_1E8`].
+fn check_fill_spec(spec: FillSpec) -> Result<(), SmokeErr> {
+    if spec.sz_1e8 <= 0 || spec.px_1e8 <= 0 {
+        return Err(SmokeErr::Lifecycle {
+            stage: "fill-spec",
+            msg: "price and size must both be positive".to_owned(),
+        });
+    }
+    // i128 so the multiply cannot wrap before the comparison — the
+    // guard would otherwise be defeated by exactly the mistyped size
+    // it exists to catch.
+    let notional = i128::from(spec.px_1e8) * i128::from(spec.sz_1e8) / 100_000_000;
+    if notional > MAX_FILL_NOTIONAL_1E8 {
+        return Err(SmokeErr::Lifecycle {
+            stage: "fill-spec",
+            msg: format!(
+                "notional {notional} exceeds the phase D ceiling of {MAX_FILL_NOTIONAL_1E8} \
+                 (1e8-scaled). This is a TYPO limit, not a risk limit: phase D trades on \
+                 purpose and nothing else on this path is capped. Raise \
+                 MAX_FILL_NOTIONAL_1E8 deliberately if you mean it."
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// What phase D WOULD send, and sends nothing.
+///
+/// The same rationale `--lifecycle` has for a dry run, and more of it:
+/// there a mistyped price is REFUSED by post-only and the venue's
+/// price band, so the dry run guards the weaker case. Here the same
+/// typo **executes**. The notional is rendered because that is the
+/// number a decimal slip corrupts, and the action goes through the
+/// same `order_json` the signed send uses, so what is printed is what
+/// the venue would read.
+///
+/// # Errors
+/// As [`check_fill_spec`].
+pub fn preview_fill(spec: FillSpec) -> Result<FillPreview, SmokeErr> {
+    check_fill_spec(spec)?;
+    let cloid = crate::cloid::encode(spec.strategy_id, spec.client_oid);
+    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Ioc)
+        .with_cloid(cloid);
+    let mut buf = [0u8; MAX_ACTION];
+    let n = order_json(&mut buf, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    let mut hex = [0u8; 34];
+    let hn = crate::cloid::to_hex(&cloid, &mut hex);
+    Ok(FillPreview {
+        place: String::from_utf8_lossy(&buf[..n]).to_string(),
+        px: wire_str(spec.px_1e8),
+        sz: wire_str(spec.sz_1e8),
+        notional: wire_str(
+            ((i128::from(spec.px_1e8) * i128::from(spec.sz_1e8)) / 100_000_000) as i64,
+        ),
+        cloid: String::from_utf8_lossy(&hex[..hn]).to_string(),
+    })
+}
+
+/// What [`preview_fill`] renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillPreview {
+    /// The `order` action, as JSON.
+    pub place: String,
+    /// The price as the VENUE will read it.
+    pub px: String,
+    /// The size as the venue will read it.
+    pub sz: String,
+    /// `px × sz` — the number a misplaced decimal corrupts.
+    pub notional: String,
+    /// The cloid, hex. This is what to look for in `userFills`.
+    pub cloid: String,
+}
+
+/// Place ONE IoC that is meant to trade, and report the venue's ACK.
+///
+/// Separate from [`run`] rather than a flag on it, because they are
+/// opposite in intent. `run` places a POST-ONLY order and treats a
+/// fill as a failure — it tests the lifecycle without trading. This
+/// deliberately trades, and exists for one reason: **nothing else
+/// proves that our own cloid survives the round trip and comes back
+/// down `userFills`** (LAW E-9). The fill lane's attribution rests
+/// entirely on that, and until this ran it rested on source code.
+///
+/// Why an IoC rather than a crossing limit: an IoC either trades or is
+/// gone, so this probe — unlike the post-only one — carries no cleanup
+/// path. **That is a property of the ORDER TYPE, not a guarantee this
+/// code enforces.** A venue that rested one anyway would leave the
+/// order on the book with nothing behind it; [`FillReport::any_resting`]
+/// is how the caller finds out, and the cloid is deterministic from
+/// `(strategy_id, client_oid)` so it can still be cancelled by cloid.
+///
+/// **This is the ACK.** Per LAW E-5 the fill itself is whatever
+/// `userFills` says; a caller that wants proof reads the stream.
+///
+/// # Errors
+/// Not testnet, a non-positive price or size, or the venue refused the
+/// action.
+pub fn run_fill(
+    cfg: &HlConfig,
+    tls: Arc<rustls::ClientConfig>,
+    spec: FillSpec,
+) -> Result<FillReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    run_fill_on(cfg, &mut http, spec)
+}
+
+/// The same trade over a caller-supplied transport — the seam the
+/// loopback test drives (`tests/hl_lifecycle_loopback.rs`). The
+/// `is_testnet` guard runs here too.
+///
+/// # Errors
+/// As [`run_fill`].
+pub fn run_fill_on(
+    cfg: &HlConfig,
+    http: &mut HlHttp,
+    spec: FillSpec,
+) -> Result<FillReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    check_fill_spec(spec)?;
+
+    let sk = cfg.secret_key().map_err(SmokeErr::Config)?;
+    // OUR magic, so the echo decodes through `cloid::decode` exactly
+    // as a live fill would.
+    let cloid = crate::cloid::encode(spec.strategy_id, spec.client_oid);
+    let mut nonces = crate::nonce::Nonce::new();
+
+    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Ioc)
+        .with_cloid(cloid);
+    let mut mp = [0u8; MAX_ACTION];
+    let mut aj = [0u8; MAX_ACTION];
+    let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    let aj_n = order_json(&mut aj, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    let ok = post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "fill")?;
+
+    Ok(FillReport {
+        cloid,
+        oid: ok.oid,
+        any_filled: ok.any_filled,
+        any_resting: ok.any_resting,
+    })
+}
+
+/// A cloid for the smoke's own probes. **Deliberately NOT our magic**
+/// — this is not a slot, so the high bytes are a fixed marker and the
+/// low ones a timestamp, and `cloid::decode` reads it as `Foreign`.
+/// [`FillSpec`] is the opposite case: it carries the REAL magic
+/// precisely so the echo decodes to a slot.
 fn fresh_cloid() -> [u8; 16] {
     let mut c = [0u8; 16];
     c[0] = 0xE3; // the phase that placed it
@@ -433,6 +659,107 @@ fn fresh_cloid() -> [u8; 16] {
     let ms = crate::smoke::now_ms().to_be_bytes();
     c[8..16].copy_from_slice(&ms);
     c
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    use crate::config::{Scope, HOST_MAINNET};
+
+    const KEY: [u8; 32] = [0x55; 32];
+    const ADDR: [u8; 20] = [0x66; 20];
+
+    fn spec() -> FillSpec {
+        FillSpec {
+            asset: 100_194_180,
+            px_1e8: 68_000_000,
+            sz_1e8: 200_000_000,
+            is_buy: true,
+            strategy_id: 3,
+            client_oid: 1,
+        }
+    }
+
+    /// The trading path gets the SAME mainnet refusal the post-only
+    /// path has — checked here rather than assumed from the fact that
+    /// the two functions look alike.
+    #[test]
+    fn mainnet_is_refused_on_the_trading_path_too() {
+        let tls = core_net::TlsTransport::default_client_config();
+        let m = HlConfig::new(Scope::Live, HOST_MAINNET, 'a', KEY, ADDR).expect("cfg");
+        let e = run_fill(&m, tls, spec()).expect_err("mainnet must be refused");
+        assert!(
+            matches!(e, SmokeErr::NotTestnet(_)),
+            "phase D must be as unreachable from mainnet as phase C: {e:?}"
+        );
+    }
+
+    /// A notional over the ceiling is refused BEFORE anything is
+    /// signed — the point of a typo limit is that it costs nothing.
+    #[test]
+    fn an_oversized_notional_is_refused_before_anything_is_signed() {
+        let mut s = spec();
+        // A size off by three decimals: $1.36 becomes $1,360.
+        s.sz_1e8 = 200_000_000_000;
+        match check_fill_spec(s) {
+            Err(SmokeErr::Lifecycle { stage, msg }) => {
+                assert_eq!(stage, "fill-spec");
+                assert!(msg.contains("ceiling"), "the message must say what it refused: {msg}");
+            }
+            other => panic!("a 1,360 USDC order was not refused: {other:?}"),
+        }
+        // And the guard cannot be defeated by an overflow.
+        let mut s = spec();
+        s.sz_1e8 = i64::MAX;
+        s.px_1e8 = i64::MAX;
+        assert!(check_fill_spec(s).is_err(), "i64::MAX squared must not wrap past the ceiling");
+    }
+
+    #[test]
+    fn a_nonsense_fill_spec_is_refused() {
+        for (px, sz) in [(0, 1), (1, 0), (-1, 1), (1, -1)] {
+            let mut s = spec();
+            s.px_1e8 = px;
+            s.sz_1e8 = sz;
+            assert!(check_fill_spec(s).is_err(), "px={px} sz={sz} was accepted");
+        }
+    }
+
+    /// The dry run must refuse exactly what the real send refuses, or
+    /// it is a rehearsal of a different action.
+    #[test]
+    fn the_dry_run_refuses_what_the_send_refuses() {
+        let mut s = spec();
+        s.sz_1e8 = 200_000_000_000;
+        assert!(preview_fill(s).is_err());
+        let p = preview_fill(spec()).expect("a valid spec previews");
+        assert_eq!(p.notional, "1.36", "the number a decimal slip corrupts");
+        assert_eq!(p.px, "0.68");
+        assert_eq!(p.sz, "2");
+        assert_eq!(p.cloid, "0x4d560300000000000000000000000001");
+        assert!(p.place.contains("\"Ioc\""), "phase D is an IoC: {}", p.place);
+        assert!(!p.place.contains("Alo"), "a post-only preview would be the wrong rehearsal");
+    }
+
+    /// The preview renders the REAL magic, so the echo it tells the
+    /// operator to look for is the one the venue will send back.
+    #[test]
+    fn the_previewed_cloid_decodes_to_the_slot_it_names() {
+        let c = crate::cloid::encode(3, 1);
+        assert_eq!(
+            crate::cloid::decode(&c),
+            crate::cloid::Owner::Ours {
+                strategy_id: 3,
+                client_oid: 1
+            }
+        );
+        // And it is NOT the smoke's foreign marker.
+        assert!(matches!(
+            crate::cloid::decode(&fresh_cloid()),
+            crate::cloid::Owner::Foreign
+        ));
+    }
+
 }
 
 #[cfg(test)]

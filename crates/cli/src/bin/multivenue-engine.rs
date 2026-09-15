@@ -177,9 +177,10 @@ struct ExecSmokeArgs {
     #[arg(long, requires = "lifecycle")]
     sz: Option<i64>,
 
-    /// Rest on the ask instead of the bid. The default is a BID, which
-    /// is the side that rests safely BELOW the market.
-    #[arg(long, default_value_t = false, requires = "lifecycle")]
+    /// Sell instead of buy. For `--lifecycle` this rests on the ask
+    /// rather than the bid (the default BID is the side that rests
+    /// safely BELOW the market); for `--fill` it crosses the bid.
+    #[arg(long, default_value_t = false)]
     sell: bool,
 
     /// Show exactly what phase C WOULD send, and send nothing.
@@ -192,17 +193,66 @@ struct ExecSmokeArgs {
     /// it rather than the way it was typed.
     ///
     /// Needs no key, no network and no account.
-    #[arg(long, default_value_t = false, requires = "lifecycle")]
+    ///
+    /// Works for `--fill` too, and matters MORE there: a post-only
+    /// order with a mistyped price is refused by the venue, while an
+    /// IoC with a mistyped price trades. The fill preview prints the
+    /// NOTIONAL, which is the number a misplaced decimal corrupts.
+    #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// PHASE D: place ONE IoC that is meant to TRADE, and report the
+    /// venue's ACK.
+    ///
+    /// **This spends testnet balance on purpose.** It is the only
+    /// thing here that proves our own cloid survives the round trip
+    /// and comes back down `userFills` — LAW E-9's attribution rests
+    /// on that, and without this probe it rests on source code.
+    ///
+    /// An IoC either trades or is gone, so unlike `--lifecycle` this
+    /// carries no cleanup path — a property of the ORDER TYPE, not one
+    /// this code enforces. If the venue rests one anyway, the exit is
+    /// nonzero and names the oid; the cloid is deterministic from
+    /// `--fill-slot` and `--fill-cloid`, so it can be cancelled.
+    ///
+    /// You state the market, the price and the size: the price must
+    /// CROSS the book, and this code does not read the book and will
+    /// not guess it. Capped at $100 notional — a typo limit, not a
+    /// risk limit. Rehearse with `--dry-run` first.
+    ///
+    /// Per LAW E-5 the ACK is not the fill. Read `userFills` (or run
+    /// `--watch` in another shell) for that.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["offline", "lifecycle"])]
+    fill: bool,
+
+    /// Phase D crossing price, 1e8-scaled. Must cross the book.
+    #[arg(long, requires = "fill")]
+    fill_px: Option<i64>,
+
+    /// Phase D size, 1e8-scaled.
+    #[arg(long, requires = "fill")]
+    fill_sz: Option<i64>,
+
+    /// Phase D slot the cloid names (LAW E-9), so the echo decodes the
+    /// way a live fill would.
+    #[arg(long, default_value_t = 3, requires = "fill")]
+    fill_slot: u8,
+
+    /// Phase D client order id — what `Fill::order_id` must carry when
+    /// the fill is booked.
+    #[arg(long, default_value_t = 1, requires = "fill")]
+    fill_cloid: u64,
 
     /// Subscribe to the USER-EVENT stream (userFills + orderUpdates)
     /// for this many seconds and report what arrives.
     ///
     /// Read-only: it opens a second socket, subscribes for the MASTER
     /// address and prints. It places nothing. Run it alongside
-    /// `--lifecycle` in another shell to watch an order appear and
-    /// disappear on the venue's own stream.
-    #[arg(long)]
+    /// `--lifecycle` or `--fill` in ANOTHER SHELL to watch an order
+    /// appear on the venue's own stream — it conflicts with them here,
+    /// because `--watch` returns before either runs and a combined
+    /// invocation would silently place nothing.
+    #[arg(long, conflicts_with_all = ["lifecycle", "fill"])]
     watch: Option<u64>,
 }
 
@@ -768,8 +818,52 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
         return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
     }
 
+    if args.fill && (args.fill_px.is_none() || args.fill_sz.is_none()) {
+        error!("exec-smoke: --fill needs --fill-px and --fill-sz (both 1e8-scaled)");
+        eprintln!(
+            "exec-smoke: e.g. --fill --asset 100102180 --fill-px 99000000 --fill-sz 100000000\n\
+             exec-smoke: (cross at 0.99, size 1). This TRADES — the price must cross the book."
+        );
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+
     // A dry run reaches no venue and needs no credentials, so it
     // happens before anything that could fail for an unrelated reason.
+    if args.dry_run && args.fill {
+        let spec = exec_hyperliquid::lifecycle::FillSpec {
+            asset: args.asset,
+            px_1e8: args.fill_px.unwrap_or(0),
+            sz_1e8: args.fill_sz.unwrap_or(0),
+            is_buy: !args.sell,
+            strategy_id: args.fill_slot,
+            client_oid: args.fill_cloid,
+        };
+        return match exec_hyperliquid::lifecycle::preview_fill(spec) {
+            Ok(p) => {
+                eprintln!(
+                    "exec-smoke DRY RUN (phase D) — nothing was sent.\n\
+                     \x20 asset {asset}\n\
+                     \x20 {side} {sz} @ {px}  =  {notional} USDC\n\
+                     \x20 IoC: this is MEANT TO TRADE, and an IoC is not meant to rest \
+                     — so there is nothing to cancel afterwards. Check the notional above \
+                     before running it for real\n\
+                     \x20 cloid {cloid} — look for this in userFills",
+                    asset = args.asset,
+                    side = if args.sell { "SELL" } else { "BUY" },
+                    sz = p.sz,
+                    px = p.px,
+                    notional = p.notional,
+                    cloid = p.cloid,
+                );
+                println!("{}", p.place);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("{e}");
+                ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8)
+            }
+        };
+    }
     if args.dry_run {
         let spec = exec_hyperliquid::LifecycleSpec {
             asset: args.asset,
@@ -849,6 +943,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             );
             if args.lifecycle {
                 return exec_lifecycle(&cfg, &args);
+            }
+            if args.fill {
+                return exec_fill(&cfg, &args);
             }
             ExitCode::SUCCESS
         }
@@ -941,6 +1038,62 @@ fn channel_of(p: &[u8]) -> Option<&str> {
     let q1 = rest[c..].iter().position(|&b| b == b'"')? + c + 1;
     let q2 = rest[q1..].iter().position(|&b| b == b'"')? + q1;
     core::str::from_utf8(&rest[q1..q2]).ok()
+}
+
+/// Phase D: place ONE IoC meant to TRADE, and report the ACK.
+///
+/// Runs only after phases A and B, for the same reason phase C does: a
+/// trade placed through a signature the venue cannot verify proves
+/// nothing about the signature and costs balance to learn it.
+fn exec_fill(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    let (Some(px), Some(sz)) = (args.fill_px, args.fill_sz) else {
+        error!("exec-smoke: --fill needs --fill-px and --fill-sz (both 1e8-scaled)");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    };
+    let spec = exec_hyperliquid::lifecycle::FillSpec {
+        asset: args.asset,
+        px_1e8: px,
+        sz_1e8: sz,
+        is_buy: !args.sell,
+        strategy_id: args.fill_slot,
+        client_oid: args.fill_cloid,
+    };
+    info!(?spec, "exec-smoke: phase D — placing an IoC that is MEANT TO TRADE on testnet");
+    let tls = TlsTransport::default_client_config();
+    match exec_hyperliquid::lifecycle::run_fill(cfg, tls, spec) {
+        Ok(r) => {
+            let mut hex = [0u8; 34];
+            let n = exec_hyperliquid::cloid::to_hex(&r.cloid, &mut hex);
+            let cloid = String::from_utf8_lossy(&hex[..n]).to_string();
+            println!(
+                "{{\"cloid\":\"{cloid}\",\"oid\":{},\"any_filled\":{},\"any_resting\":{}}}",
+                r.oid, r.any_filled, r.any_resting
+            );
+            if r.any_resting {
+                error!(?r, "exec-smoke: an IoC RESTED — the venue did what the order type forbids");
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.any_filled {
+                error!(
+                    ?r,
+                    "exec-smoke: the IoC did not trade — the price did not cross. The venue \
+                     reported no resting order either, so this costs nothing but a retry."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            info!(
+                oid = r.oid,
+                cloid = %cloid,
+                "exec-smoke: PHASE D ACK — the venue says filled. Per LAW E-5 that is the ACK, \
+                 NOT the fill: look for this cloid in userFills."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("{e}");
+            ExitCode::from(e.code() as u8)
+        }
+    }
 }
 
 /// Phase C: the order lifecycle round trip. Runs only AFTER phases A
