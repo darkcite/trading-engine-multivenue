@@ -101,6 +101,10 @@ pub const EXIT_UNREACHABLE: i32 = 22;
 /// longer reproduce the SDK's bytes. Needs no network to diagnose and
 /// no venue to blame: the fault is in this artifact.
 pub const EXIT_SELFTEST: i32 = 23;
+/// **Phase C failed** — the order lifecycle did not round-trip. Only
+/// reachable from the opt-in `--lifecycle` form, never from the
+/// pre-restart gate.
+pub const EXIT_LIFECYCLE: i32 = 24;
 
 /// Why a smoke run did not complete.
 #[derive(Debug)]
@@ -131,6 +135,14 @@ pub enum SmokeErr {
     /// **The offline self-test failed** — see [`crate::selftest`]. The
     /// binary did not get as far as the network, and should not.
     SelfTest(crate::selftest::SelfTestErr),
+    /// **Phase C failed** — see [`crate::lifecycle`]. Carries which
+    /// stage broke and the venue's own words.
+    Lifecycle {
+        /// place / modify / cancel / verify / cleanup / spec.
+        stage: &'static str,
+        /// What the venue said, or what we concluded.
+        msg: String,
+    },
 }
 
 impl core::fmt::Display for SmokeErr {
@@ -143,6 +155,10 @@ impl core::fmt::Display for SmokeErr {
             ),
             SmokeErr::Config(e) => write!(f, "exec-smoke: {e}"),
             SmokeErr::SelfTest(e) => write!(f, "exec-smoke: {e}"),
+            SmokeErr::Lifecycle { stage, msg } => write!(
+                f,
+                "exec-smoke: PHASE C FAILED at the {stage} stage: {msg}"
+            ),
             SmokeErr::Encode => write!(f, "exec-smoke: action did not fit its buffer"),
             SmokeErr::Sign => write!(f, "exec-smoke: signing failed"),
             SmokeErr::Http(e) => write!(f, "exec-smoke: {e}"),
@@ -179,6 +195,7 @@ impl SmokeErr {
                 EXIT_CORRUPT_ACCEPTED
             }
             SmokeErr::SelfTest(_) => EXIT_SELFTEST,
+            SmokeErr::Lifecycle { .. } => EXIT_LIFECYCLE,
             SmokeErr::NotTestnet(_)
             | SmokeErr::Config(_)
             | SmokeErr::Encode
@@ -322,7 +339,11 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let aj_n = cancel_json(&mut aj, &cancels).map_err(|_| SmokeErr::Encode)?;
 
     // ---- Phase A: a GOOD signature ---------------------------------
-    let nonce_a = now_ms();
+    // `Nonce` rather than the clock: two requests inside one
+    // millisecond must still carry strictly increasing nonces, and
+    // that is the whole reason the type exists.
+    let mut nonces = crate::nonce::Nonce::new();
+    let nonce_a = nonces.next(now_ms());
     let sig = sign_action(&sk, &mp[..mp_n], nonce_a, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
     let mut body = [0u8; MAX_REQ_BODY];
@@ -359,7 +380,7 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     // Flip one bit of `s`. The result is still a well-formed
     // signature, so the venue must do real work to reject it — which
     // is the point. A malformed blob would only prove it can parse.
-    let nonce_b = now_ms().max(nonce_a + 1);
+    let nonce_b = nonces.next(now_ms());
     let mut bad = sign_action(&sk, &mp[..mp_n], nonce_b, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
     bad[40] ^= 0x01;
@@ -429,7 +450,7 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -512,6 +533,7 @@ mod tests {
         assert_eq!(EXIT_CORRUPT_ACCEPTED, 21);
         assert_eq!(EXIT_UNREACHABLE, 22);
         assert_eq!(EXIT_SELFTEST, 23);
+        assert_eq!(EXIT_LIFECYCLE, 24);
         // 2 is clap's argument-error code. A binary too old to know
         // the `exec-smoke` arm exits 2, and must never be reportable
         // as a signing failure.
@@ -528,6 +550,10 @@ mod tests {
             SmokeErr::SignatureNotVerified(String::new()),
             SmokeErr::CorruptSignatureAccepted,
             SmokeErr::SelfTest(crate::selftest::SelfTestErr::KeyOrder("order")),
+            SmokeErr::Lifecycle {
+                stage: "place",
+                msg: String::new(),
+            },
         ] {
             assert_ne!(e.code(), EXIT_PASS, "{e:?} exits zero");
         }

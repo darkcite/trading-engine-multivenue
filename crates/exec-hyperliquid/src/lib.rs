@@ -69,6 +69,7 @@ pub mod action;
 pub mod asset;
 pub mod config;
 pub mod http;
+pub mod lifecycle;
 pub mod msgpack;
 pub mod nonce;
 pub mod request;
@@ -88,12 +89,15 @@ pub use config::{
     ENV_T_AGENT_KEY, ENV_T_HOST, ENV_T_MASTER_ADDR, ENV_T_SOURCE, HOST_MAINNET, HOST_TESTNET,
 };
 pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
+pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::Nonce;
 pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
 pub use response::{scan, HlOk, HlResponse, ScanErr, Span};
 pub use selftest::{SelfTestErr, SelfTestReport};
 pub use sign::{connection_id, sign_action, Network, Vault};
-pub use smoke::{SmokeErr, SmokeReport, EXIT_CORRUPT_ACCEPTED, EXIT_FAILED, EXIT_NOT_VERIFIED,
-    EXIT_PASS, EXIT_UNREACHABLE};
+pub use smoke::{
+    SmokeErr, SmokeReport, EXIT_CORRUPT_ACCEPTED, EXIT_FAILED, EXIT_LIFECYCLE, EXIT_NOT_VERIFIED,
+    EXIT_PASS, EXIT_SELFTEST, EXIT_UNREACHABLE,
+};
 pub use wire::{WireNum, WIRE_SCALE};

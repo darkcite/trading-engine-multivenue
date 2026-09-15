@@ -585,20 +585,45 @@ They are documented in `.env.example` and `docs/local-setup.md`,
 because an undocumented credential whose absence defers every restart
 is the wedge described above waiting to happen.
 
-### Deviation from plan §5.1, recorded
+### Phase C — the order lifecycle (plan §5.1)
 
 The plan's E3 exit gate asks for a signed order ACCEPTED with its oid
-echoed back, and modify + cancel-by-cloid round-tripping. **That was
-not built.** It requires a funded testnet account with a registered
-agent wallet, which did not exist when E3 was written, and building it
-would have meant placing real orders from a cron-reachable path.
+echoed back, and modify + cancel-by-cloid round-tripping. That is
+**phase C**, and it is BUILT but NOT YET RUN against a funded account.
 
-What was built instead proves more than the signature half of that gate
-and costs nothing: the venue naming our own recovered address is
-positive evidence of the entire msgpack → keccak → EIP-712 → secp256k1
-chain, and the embedded SDK vectors cover every action type rather than
-the three the round-trip would have touched. The lifecycle half — that
-the venue's *order state machine* behaves as expected — remains
-unproven and is **phase C**, to be run once the testnet account exists.
-E3's exit gate is therefore met in its signature half only, and must
-not later be read as met in full.
+It is deliberately **not** part of the pre-restart gate. It costs
+balance, it creates state on the account, and it needs a registered
+agent wallet — none of which the restart lane may depend on. It is
+opt-in (`exec-smoke --lifecycle`) and run by a person.
+
+Four things keep it from costing anything real:
+
+1. The same testnet guard as phases A and B, **checked again** in
+   `lifecycle::run_on` rather than assumed from the caller.
+2. **Post-only (ALO).** A post-only order cannot take liquidity: a
+   price that would cross is REFUSED by the venue, not filled. So the
+   failure mode of a badly chosen price is a refusal, not a position.
+   A fill is treated as a hard stop — if the post-only order traded,
+   nothing measured after it means anything.
+3. **The operator states the market and both prices.** Nothing is
+   derived: LAW E-4 forbids deriving an asset id, and a price this code
+   guessed would be the one number capable of turning a test into a
+   trade.
+4. **It cleans up after itself.** Any failure after the place attempts
+   a cancel before returning, and if that cancel also fails it says in
+   so many words that an order may still be resting and must be
+   cancelled by hand. This path is exercised by
+   `tests/hl_lifecycle_loopback.rs` against a scripted server, because
+   "we call cancel in the error branch" is a claim about source code
+   until something has watched the cancel go out.
+
+The cancel is by **cloid**, not by oid, and that is the point of the
+step: a modify may issue a NEW oid, so a client that tracked only the
+oid it was given at placement could not cancel what it placed. The
+final stage then cancels the same cloid a second time and requires a
+REFUSAL — without which "cancel returned ok" is a claim about a
+response body rather than about the book.
+
+**Until phase C has been run green against a funded testnet account,
+E3's exit gate is met in its signature half only and must not be read
+as met in full.**

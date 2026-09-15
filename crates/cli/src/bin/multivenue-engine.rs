@@ -116,9 +116,12 @@ enum Cmd {
     AuditPnl(AuditPnlArgs),
     /// E3 execution gate: sign a probe action against Hyperliquid
     /// TESTNET and assert the venue verifies it — then assert it
-    /// REJECTS a deliberately corrupted one. Costs nothing and needs
-    /// no balance: the probe cancels an order id that cannot exist,
-    /// so what is under test is the signature, not the order.
+    /// REJECTS a deliberately corrupted one.
+    ///
+    /// Costs nothing and needs no balance, because the probe is a
+    /// CANCEL, and a cancel can only ever reduce exposure — never
+    /// open a position. What is under test is the signature, not the
+    /// order.
     ///
     /// TESTNET ONLY, by construction. There is no flag that points
     /// this at production.
@@ -127,9 +130,11 @@ enum Cmd {
 
 #[derive(Debug, Parser)]
 struct ExecSmokeArgs {
-    /// Venue asset id the probe cancel names. It need not exist —
-    /// the cancel is expected to fail on the ORDER, not the
-    /// signature — so the default is fine unless you are debugging.
+    /// Venue asset id. For the signature probe the cancel is expected
+    /// to fail on the ORDER rather than the signature, so the default
+    /// is fine; for `--lifecycle` this is the market the order is
+    /// placed in and you must state it (LAW E-4: an asset id is bound,
+    /// never derived).
     #[arg(long, default_value_t = 0u32)]
     asset: u32,
     /// Run ONLY the offline self-test: reproduce the 25 SDK
@@ -143,6 +148,39 @@ struct ExecSmokeArgs {
     /// the network probe structurally cannot (it sends one action).
     #[arg(long, default_value_t = false)]
     offline: bool,
+
+    /// Also run PHASE C: place -> modify -> cancel-by-cloid -> verify
+    /// the order is really gone (plan §5.1).
+    ///
+    /// Opt-in and run by a person, never by the restart gate: it costs
+    /// balance and creates state on the account. Needs a FUNDED
+    /// testnet account with a registered agent wallet.
+    ///
+    /// The order is post-only, so a price that would cross is REFUSED
+    /// by the venue rather than filled. Nothing is derived: you state
+    /// the market and both prices, because LAW E-4 forbids deriving an
+    /// asset id and a price this code guessed would be the one number
+    /// able to turn a test into a trade.
+    #[arg(long, default_value_t = false, conflicts_with = "offline")]
+    lifecycle: bool,
+
+    /// Phase C resting price, 1e8-scaled (5000000 = 0.05). Put it far
+    /// enough from the book that a post-only order rests.
+    #[arg(long, requires = "lifecycle")]
+    px: Option<i64>,
+
+    /// Phase C price to modify to, 1e8-scaled.
+    #[arg(long, requires = "lifecycle")]
+    px2: Option<i64>,
+
+    /// Phase C size, 1e8-scaled (1000000000 = 10).
+    #[arg(long, requires = "lifecycle")]
+    sz: Option<i64>,
+
+    /// Rest on the ask instead of the bid. The default is a BID, which
+    /// is the side that rests safely BELOW the market.
+    #[arg(long, default_value_t = false, requires = "lifecycle")]
+    sell: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -694,6 +732,19 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
         };
     }
 
+    // Validate phase C's arguments BEFORE any network work. An
+    // operator who forgot --px should learn that now, not after two
+    // venue round-trips have already run.
+    if args.lifecycle && (args.px.is_none() || args.px2.is_none() || args.sz.is_none()) {
+        error!("exec-smoke: --lifecycle needs --px, --px2 and --sz (all 1e8-scaled)");
+        eprintln!(
+            "exec-smoke: e.g. --lifecycle --asset 100032530 --px 1000000 --px2 2000000 --sz 1000000000\n\
+             exec-smoke: (0.01 -> 0.02, size 10). Post-only, so a price that would cross is \
+             refused by the venue rather than filled — but choose one that rests."
+        );
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+
     let scope = Scope::Testnet;
     let cfg = match HlConfig::from_env(scope) {
         Ok(c) => c,
@@ -732,6 +783,53 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
                 rejected_with = %report.corruption_message,
                 "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
                  corrupted one"
+            );
+            if args.lifecycle {
+                return exec_lifecycle(&cfg, &args);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("{e}");
+            ExitCode::from(e.code() as u8)
+        }
+    }
+}
+
+/// Phase C: the order lifecycle round trip. Runs only AFTER phases A
+/// and B, because a lifecycle measured through a signature the venue
+/// cannot verify measures nothing.
+fn exec_lifecycle(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    // Checked at entry, before any network work; this is the
+    // unwrap-free restatement of that.
+    let (Some(px), Some(px2), Some(sz)) = (args.px, args.px2, args.sz) else {
+        error!("exec-smoke: --lifecycle needs --px, --px2 and --sz (all 1e8-scaled)");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    };
+    let spec = exec_hyperliquid::LifecycleSpec {
+        asset: args.asset,
+        px_1e8: px,
+        px2_1e8: px2,
+        sz_1e8: sz,
+        is_buy: !args.sell,
+    };
+    info!(?spec, "exec-smoke: phase C — placing a POST-ONLY order on testnet");
+    let tls = TlsTransport::default_client_config();
+    match exec_hyperliquid::lifecycle::run(cfg, tls, spec) {
+        Ok(r) => {
+            println!(
+                "{{\"placed_oid\":{},\"modified_oid\":{},\"cancelled\":{},\"verified_gone\":{},\"passed\":{}}}",
+                r.placed_oid, r.modified_oid, r.cancelled, r.verified_gone, r.passed()
+            );
+            if !r.passed() {
+                error!(?r, "exec-smoke: PHASE C did not pass");
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            info!(
+                placed_oid = r.placed_oid,
+                modified_oid = r.modified_oid,
+                "exec-smoke: PHASE C PASSED — placed, modified, cancelled by cloid, and confirmed \
+                 gone"
             );
             ExitCode::SUCCESS
         }
