@@ -42,6 +42,26 @@
 
 use core_parse::{find_field, scan_price_1e8, skip_ws};
 
+/// How many balance rows the reconciler must be able to hold.
+///
+/// **Sized from the venue, not from intuition.** A testnet account
+/// with exactly ONE funded coin came back with FOURTEEN rows — the
+/// venue lists tokens the account has never touched. An array sized
+/// for "the coins we trade" would have refused that body outright,
+/// and on the reconcile path a refusal is a halt.
+///
+/// So this is deliberately far above anything observed: overflow is
+/// correctly an error (a position nobody saw reconciles by not being
+/// there), which makes an undersized buffer a self-inflicted outage.
+/// 256 rows is 6 KiB.
+pub const MAX_SPOT_BALANCES: usize = 256;
+
+// Real headroom above what the venue has actually been observed to
+// send (14 rows for a one-coin account). A compile-time assertion, not
+// a test: an undersized buffer is a halt on the reconcile path, and
+// that must fail the build rather than a test run.
+const _: () = assert!(MAX_SPOT_BALANCES >= 14 * 4);
+
 use crate::response::{ScanErr, Span};
 
 /// One row of the venue's spot balance sheet.
@@ -348,6 +368,48 @@ mod tests {
         }
     }
 
+    /// The venue's OWN answer, captured from testnet.
+    ///
+    /// Everything above is a body I wrote. This is one the venue did.
+    const REAL: &str = include_str!("../tests/fixtures/hl/spot_state_testnet.json");
+
+    #[test]
+    fn the_venues_real_balance_sheet_scans() {
+        let body = REAL.as_bytes();
+        let mut out = [SpotBalance::default(); MAX_SPOT_BALANCES];
+        let n = scan_spot_state(body, &mut out).expect("the venue's own body must scan");
+
+        // FOURTEEN rows for an account holding exactly one coin.
+        assert_eq!(n, 14, "the venue lists more than what you hold");
+
+        let usdc = out[..n]
+            .iter()
+            .find(|b| b.coin.of(body) == b"USDC")
+            .expect("USDC row");
+        assert_eq!(usdc.total_1e8, 99_900_000_000, "999.0 at 1e8");
+        assert_eq!(usdc.hold_1e8, 0);
+        assert_eq!(usdc.free_1e8(), 99_900_000_000);
+
+        // Every other row is a zero the venue volunteered.
+        let zeros = out[..n].iter().filter(|b| b.total_1e8 == 0).count();
+        assert_eq!(zeros, 13);
+    }
+
+    /// The lesson that sizing const exists for: a buffer sized by
+    /// intuition refuses the venue's real answer, and on the reconcile
+    /// path a refusal is a halt.
+    #[test]
+    fn a_buffer_sized_for_what_we_hold_refuses_the_real_body() {
+        let body = REAL.as_bytes();
+        let mut small = [SpotBalance::default(); 8];
+        assert!(
+            scan_spot_state(body, &mut small).is_err(),
+            "an 8-row buffer must refuse rather than silently truncate"
+        );
+        let mut exact = [SpotBalance::default(); 14];
+        assert_eq!(scan_spot_state(body, &mut exact), Ok(14));
+    }
+
     #[test]
     fn the_scanner_never_panics_on_arbitrary_bytes() {
         let mut out = [SpotBalance::default(); 4];
@@ -366,6 +428,12 @@ mod tests {
         // that trusts its own bounds actually breaks.
         for k in 0..BODY.len() {
             let _ = scan_spot_state(&BODY[..k], &mut out);
+        }
+        // Including truncations of the VENUE's own body.
+        let real = REAL.as_bytes();
+        let mut big = [SpotBalance::default(); MAX_SPOT_BALANCES];
+        for k in 0..real.len() {
+            let _ = scan_spot_state(&real[..k], &mut big);
         }
     }
 }

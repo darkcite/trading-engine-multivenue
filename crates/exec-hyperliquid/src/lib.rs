@@ -90,6 +90,7 @@ pub mod selftest;
 pub mod sign;
 pub mod smoke;
 pub mod userws;
+pub mod userws_conn;
 pub mod wire;
 
 pub use action::{
@@ -108,7 +109,7 @@ pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::Nonce;
 pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
-pub use recon::{drift, net_exposure_1e8, scan_spot_state, SpotBalance};
+pub use recon::{drift, net_exposure_1e8, scan_spot_state, SpotBalance, MAX_SPOT_BALANCES};
 pub use response::{scan, HlOk, HlResponse, ScanErr, Span};
 pub use selftest::{SelfTestErr, SelfTestReport};
 pub use sign::{connection_id, sign_action, Network, Vault};
@@ -116,5 +117,6 @@ pub use smoke::{
     SmokeErr, SmokeReport, EXIT_CORRUPT_ACCEPTED, EXIT_FAILED, EXIT_LIFECYCLE, EXIT_NOT_VERIFIED,
     EXIT_PASS, EXIT_SELFTEST, EXIT_UNREACHABLE,
 };
+pub use userws_conn::{UserWs, WsErr, MAX_WS_BUF};
 pub use userws::{owner_of, scan_user_fills, to_fill, ConvertErr, TidRing, UserFill};
 pub use wire::{WireNum, WIRE_SCALE};

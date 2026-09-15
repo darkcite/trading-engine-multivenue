@@ -194,6 +194,16 @@ struct ExecSmokeArgs {
     /// Needs no key, no network and no account.
     #[arg(long, default_value_t = false, requires = "lifecycle")]
     dry_run: bool,
+
+    /// Subscribe to the USER-EVENT stream (userFills + orderUpdates)
+    /// for this many seconds and report what arrives.
+    ///
+    /// Read-only: it opens a second socket, subscribes for the MASTER
+    /// address and prints. It places nothing. Run it alongside
+    /// `--lifecycle` in another shell to watch an order appear and
+    /// disappear on the venue's own stream.
+    #[arg(long)]
+    watch: Option<u64>,
 }
 
 #[derive(Debug, Parser)]
@@ -796,6 +806,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     }
 
     let scope = Scope::Testnet;
+    if let Some(secs) = args.watch {
+        return exec_watch(scope, secs);
+    }
     let cfg = match HlConfig::from_env(scope) {
         Ok(c) => c,
         Err(e) => {
@@ -844,6 +857,90 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             ExitCode::from(e.code() as u8)
         }
     }
+}
+
+/// Watch the user-event stream. Read-only; places nothing.
+fn exec_watch(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
+    use exec_hyperliquid::userws::{scan_user_fills, UserFill};
+    use exec_hyperliquid::{HlConfig, UserWs};
+
+    let cfg = match HlConfig::from_env(scope) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("exec-smoke: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let tls = TlsTransport::default_client_config();
+    let mut ws = match UserWs::new(&cfg.host, 443, tls, &cfg.master_addr) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("{e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_UNREACHABLE as u8);
+        }
+    };
+    info!(
+        host = %cfg.host,
+        master = %ws.master_hex(),
+        "exec-watch: subscribing userFills + orderUpdates (the MASTER address, not the agent)"
+    );
+    if let Err(e) = ws.connect() {
+        error!("{e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_UNREACHABLE as u8);
+    }
+    info!("exec-watch: connected and subscribed");
+
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut msgs = 0usize;
+    let mut fills = [UserFill::default(); exec_hyperliquid::recon::MAX_SPOT_BALANCES];
+    while std::time::Instant::now() < end {
+        let r = ws.pump(std::time::Duration::from_millis(500), |payload| {
+            msgs += 1;
+            let ch = channel_of(payload).unwrap_or("?");
+            match ch {
+                "userFills" => match scan_user_fills(payload, &mut fills) {
+                    Ok((n, snap)) => {
+                        info!(count = n, snapshot = snap, "exec-watch: userFills");
+                        for f in &fills[..n] {
+                            info!(
+                                tid = f.tid,
+                                oid = f.oid,
+                                coin = %String::from_utf8_lossy(f.coin.of(payload)),
+                                px_1e8 = f.px_1e8,
+                                sz_1e8 = f.sz_1e8,
+                                ours = ?exec_hyperliquid::userws::owner_of(f),
+                                "  fill"
+                            );
+                        }
+                    }
+                    Err(e) => error!(?e, "exec-watch: userFills did not scan"),
+                },
+                other => info!(
+                    channel = other,
+                    bytes = payload.len(),
+                    body = %String::from_utf8_lossy(&payload[..payload.len().min(220)]),
+                    "exec-watch: message"
+                ),
+            }
+        });
+        if let Err(e) = r {
+            error!("{e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_UNREACHABLE as u8);
+        }
+    }
+    info!(messages = msgs, "exec-watch: done");
+    ExitCode::SUCCESS
+}
+
+/// `"channel":"<name>"` out of a venue frame, for the log line.
+fn channel_of(p: &[u8]) -> Option<&str> {
+    let k = b"\"channel\"";
+    let i = (0..p.len().saturating_sub(k.len())).find(|&i| &p[i..i + k.len()] == k)?;
+    let rest = &p[i + k.len()..];
+    let c = rest.iter().position(|&b| b == b':')?;
+    let q1 = rest[c..].iter().position(|&b| b == b'"')? + c + 1;
+    let q2 = rest[q1..].iter().position(|&b| b == b'"')? + q1;
+    core::str::from_utf8(&rest[q1..q2]).ok()
 }
 
 /// Phase C: the order lifecycle round trip. Runs only AFTER phases A
