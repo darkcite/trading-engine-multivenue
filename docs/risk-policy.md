@@ -645,9 +645,39 @@ final stage then cancels the same cloid a second time and requires a
 REFUSAL — without which "cancel returned ok" is a claim about a
 response body rather than about the book.
 
-**Until phase C has been run green against a funded testnet account,
-E3's exit gate is met in its signature half only and must not be read
-as met in full.**
+### E3's exit gate is MET IN FULL (2026-09-15)
+
+Phase C ran green against a funded testnet account with a registered
+agent wallet:
+
+```
+{"placed_oid":60196753221,"modified_oid":60196753574,
+ "cancelled":true,"verified_gone":true,"passed":true}
+```
+
+Two things that run told us, neither of which was knowable from the
+documentation:
+
+**1. The modify issued a NEW oid.** `placed_oid` and `modified_oid`
+differ. Cancelling by `oid` would have chased an id the venue no
+longer held, and the order would have been stranded on the book. The
+decision to cancel by CLOID was load-bearing, not stylistic, and this
+is the evidence.
+
+**2. The venue enforces an 80% price band.** The first attempt placed
+a post-only bid at $10,000 against a $76,935 mark — 87% away — and was
+refused with *"Order price cannot be more than 80% away from the
+reference price"*. Nothing was placed, so the cleanup path was not
+exercised.
+
+That band matters beyond this probe: **a resting order far from the
+market is not a way to test safely**, because past 80% the venue
+refuses it outright. Any future probe has to sit inside the band and
+rely on post-only for its safety instead of on distance. The passing
+run used $40,000, 48% below the mark.
+
+E3's exit gate is therefore met in full: the signature half (phases A
+and B) and the lifecycle half (phase C).
 
 ## The live fill lane (E4, 2026-09-15) — BUILT, not ARMED
 
