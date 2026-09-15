@@ -6221,3 +6221,123 @@ fn hl_user_fill_lane_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "hl user-fill lane bytes should be zero: saw {bytes}");
 }
+
+/// E4 gate 56 — routing a user-fill frame through the LIVE ARM's own
+/// router allocates nothing.
+///
+/// Gate 55 measures the fill lane's pieces. This measures
+/// [`HlExchange::route_frame`], the function the socket's pump
+/// actually calls — the distinction is not pedantic. The audit that
+/// prompted this gate found the production path staging every frame
+/// into a heap `Vec` before routing it, on the thread that also signs
+/// and submits, while gate 55 sat green the whole time: it never
+/// touched `HlExchange`. A gate that measures a lookalike is a gate
+/// that reports on code nobody runs.
+///
+/// The frame is SNAPSHOT-SIZED (400 rows) because the reconnect
+/// snapshot is where a per-frame allocation hurts most and where the
+/// scratch buffer is under real pressure.
+#[test]
+fn hl_exchange_route_frame_is_zero_alloc() {
+    use core_ring::Ring;
+    use core_types::Fill;
+    use exec_hyperliquid::exchange::{HlExchange, HlExecCounters};
+    use exec_hyperliquid::userws::{TidRing, UserFill, SNAPSHOT_RING};
+    use exec_hyperliquid::AddressBudget;
+
+    // Built ONCE, outside the guard — 400 rows of venue JSON.
+    // `base_tid` shifts the tid range so two frames can be disjoint.
+    fn venue_frame(base_tid: u64) -> Vec<u8> {
+        let mut f =
+            String::from(r#"{"channel":"userFills","data":{"isSnapshot":false,"fills":["#);
+        for i in 0..400u64 {
+            if i > 0 {
+                f.push(',');
+            }
+            f.push_str(&format!(
+                r#"{{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":{},"tid":{},"fee":"0.01"}}"#,
+                base_tid + i,
+                base_tid + i
+            ));
+        }
+        f.push_str("]}}");
+        f.into_bytes()
+    }
+    let frame = venue_frame(1);
+    let prime = venue_frame(1_000_000);
+
+    // Every buffer preallocated, exactly as `HlExchange::new` does it.
+    let mut scratch: Vec<UserFill> = vec![UserFill::default(); SNAPSHOT_RING];
+    let mut seen: TidRing<SNAPSHOT_RING> = TidRing::new();
+    let mut budget = AddressBudget::restored([0xAB; 20], 1_000_000, 0, 0);
+    let (mut fills, _c) = Ring::<Fill, 1024>::new().split();
+    let mut counters = HlExecCounters::default();
+
+    // Prime with a DIFFERENT frame: the first pass through any code
+    // is the one allowed to be cold, but priming with `frame` itself
+    // would fill `seen` with its tids and every measured pass would
+    // then short-circuit at the dedupe — a gate covering one branch
+    // while its comment claimed two.
+    //
+    // Priming with disjoint tids instead means measured iteration 0
+    // takes the FRESH path (scan, admit, budget credit, per-row
+    // routing) and 1..200 take the dedupe path. Both are measured.
+    // What is NOT reachable from here is `to_fill`/`try_push`: today
+    // `resolve_sym` is a `None` stub, so no row can reach the lane.
+    // Gate 55 measures those functions directly.
+    let _ = HlExchange::<1024>::route_frame(
+        &prime,
+        1,
+        &mut scratch,
+        &mut seen,
+        &mut budget,
+        &mut fills,
+        &mut counters,
+    );
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for i in 0..200u64 {
+        acc = acc.wrapping_add(HlExchange::<1024>::route_frame(
+            &frame,
+            i,
+            &mut scratch,
+            &mut seen,
+            &mut budget,
+            &mut fills,
+            &mut counters,
+        ) as i64);
+        // A frame from another channel takes the early-return branch.
+        acc = acc.wrapping_add(HlExchange::<1024>::route_frame(
+            br#"{"channel":"orderUpdates","data":[]}"#,
+            i,
+            &mut scratch,
+            &mut seen,
+            &mut budget,
+            &mut fills,
+            &mut counters,
+        ) as i64);
+    }
+    std::hint::black_box(acc);
+    std::hint::black_box(&counters);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+
+    // The comment above claims the measured region covers BOTH the
+    // fresh-tid path and the dedupe path. Pin it: 400 rows are fresh
+    // on the priming frame and 400 on measured iteration 0; every
+    // later iteration must short-circuit at the dedupe and add
+    // nothing. A gate's own coverage claim is worth exactly as much
+    // as the assertion that holds it.
+    assert_eq!(
+        counters.fills_unresolved, 800,
+        "expected 400 primed + 400 fresh rows and then pure dedupe; saw {}",
+        counters.fills_unresolved
+    );
+
+    assert_eq!(
+        allocs, 0,
+        "hl exchange route_frame allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl exchange route_frame bytes should be zero: saw {bytes}");
+}

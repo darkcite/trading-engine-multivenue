@@ -296,6 +296,21 @@ pub fn scan_user_fills(
     }
 }
 
+/// Is this frame a `userFills` message at all?
+///
+/// Exists so a caller can tell "this was an `orderUpdates` frame, of
+/// course it did not scan" from "this WAS a userFills frame and it
+/// failed" — two answers `scan_user_fills` gives with the same `Err`,
+/// and conflating them is how a whole snapshot gets discarded in
+/// silence.
+#[must_use]
+pub fn is_user_fills(payload: &[u8]) -> bool {
+    match string_field(payload, b"\"channel\"") {
+        Some(s) => s.of(payload) == b"userFills",
+        None => false,
+    }
+}
+
 /// A ring of recently-seen venue trade ids.
 ///
 /// **It must outlive the socket.** Hyperliquid answers every fresh
@@ -646,6 +661,24 @@ mod tests {
         assert!(ring.admit(5));
         assert_eq!(ring.len(), 4);
         assert!(ring.admit(1), "1 was evicted, so it is new again");
+    }
+
+    #[test]
+    fn a_wrong_channel_is_distinguishable_from_a_failed_scan() {
+        let f = frame_with(&ours_hex(), false);
+        assert!(is_user_fills(&f));
+        assert!(!is_user_fills(
+            br#"{"channel":"orderUpdates","data":[]}"#
+        ));
+        assert!(!is_user_fills(b"{}"));
+        assert!(!is_user_fills(b""));
+        // THE CASE THAT MATTERS: a userFills frame too big for the
+        // caller's buffer still reports as userFills, so the caller
+        // can count the overflow instead of mistaking it for an
+        // orderUpdates frame and discarding a whole snapshot.
+        let mut tiny = [UserFill::default(); 1];
+        assert!(scan_user_fills(&f, &mut tiny).is_err());
+        assert!(is_user_fills(&f), "the overflow must still be identifiable");
     }
 
     /// A frame from another channel must not be half-parsed into fills

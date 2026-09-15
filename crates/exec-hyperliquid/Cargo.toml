@@ -21,6 +21,11 @@ core-net      = { workspace = true }
 core-io       = { workspace = true }
 # E4: the canonical decimal scanners (scan_price_1e8, find_field).
 core-parse    = { workspace = true }
+# E4: the engine-facing dispatcher. `OrderDispatch` and the fill ring.
+# No cycle: clob-dispatcher knows nothing of this crate.
+clob-dispatcher = { workspace = true }
+core-ring     = { workspace = true }
+core-fill     = { workspace = true }
 core-types    = { workspace = true }
 mio           = { workspace = true }
 rustls        = { workspace = true }

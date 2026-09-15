@@ -149,7 +149,16 @@ impl<D: OrderDispatch + Send + 'static> DispatcherWorker<D> {
                     self.stats.store_from(&self.inner.stats());
                 }
                 None => {
-                    thread::sleep(WORKER_IDLE_BACKOFF);
+                    // E4: give the inner dispatcher the idle moment
+                    // before sleeping in it. A live arm uses it to
+                    // pump the venue's user-event socket and run its
+                    // timers; a paper one does nothing and we sleep as
+                    // before. Sleeping only when it reports no work
+                    // keeps a busy stream from being throttled to one
+                    // message per backoff.
+                    if !self.inner.on_idle() {
+                        thread::sleep(WORKER_IDLE_BACKOFF);
+                    }
                 }
             }
         }

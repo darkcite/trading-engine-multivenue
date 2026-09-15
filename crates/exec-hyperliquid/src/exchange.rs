@@ -1,0 +1,925 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Anton (darkcite)
+
+//! `HlExchange` — the engine-facing live dispatcher (plan §6).
+//!
+//! This is the piece the engine can actually reach: an
+//! [`OrderDispatch`] that signs and sends, owns the venue
+//! relationship, and writes venue fills into engine fill lane 3.
+//!
+//! It runs on the dispatcher worker thread and nowhere else. That is
+//! not a style choice — the fill lane needs exactly ONE writer, and
+//! the worker already owns the HTTP socket, the nonce and the budget.
+//! A second thread for the user-event stream would need a lock around
+//! all of it, on the path that books fills.
+//!
+//! ## The laws this file is made of
+//!
+//! * **LAW E-1** — a live slot never falls back to paper. Every
+//!   failure here is a refusal, counted; none is a modelled fill.
+//! * **LAW E-4** — the asset id is BOUND by a roll event, never
+//!   derived. [`submit`](HlExchange::submit) looks it up and refuses
+//!   when it is absent, rather than computing one.
+//! * **LAW E-5** — the HTTP ack binds `cloid → oid` and surfaces
+//!   reject reasons. **It never books a fill.** Fills come from the
+//!   user-event stream alone, so [`try_next_fill`] here always
+//!   returns `None`: booking through both paths is double-counting,
+//!   and this type must not be the one that does it.
+//! * **LAW E-9** — the cloid carries the slot, so the fill that comes
+//!   back an unknown time later can be routed without a table.
+//!
+//! ## Order of operations in a submit, and why
+//!
+//! 1. asset lookup — refuse before anything else is spent;
+//! 2. budget check — **before signing**, because a signed action that
+//!    is then discarded has still burned a nonce;
+//! 3. encode, sign, post;
+//! 4. read the ack fail-closed.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use clob_dispatcher::{DispatchError, DispatchStats, OrderDispatch};
+use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
+use core_ring::Producer;
+use core_types::{Fill, NsTs, Order, Side, Tick};
+
+use crate::action::{encode_order, OrderWire, Tif, MAX_ACTION};
+use crate::asset::AssetTable;
+use crate::budget::{self, AddressBudget};
+use crate::cloid::encode as encode_cloid;
+use crate::config::HlConfig;
+use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::nonce::Nonce;
+use crate::request::{envelope, order_json};
+use crate::response::{scan, HlResponse};
+use crate::sign::{sign_action, Network, Vault};
+use crate::userws::{scan_user_fills, to_fill, Routed, TidRing, UserFill, SNAPSHOT_RING};
+use crate::userws_conn::UserWs;
+
+/// Engine 1e6 → venue 1e8.
+const ENGINE_TO_WIRE: i64 = 100;
+
+/// How often the budget's state file is rewritten.
+const PERSIST_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a single idle pump may spend reading the socket.
+///
+/// A CEILING BETWEEN OPERATIONS, not a hard bound: the underlying
+/// poll blocks for its own slice before this is re-checked, so a quiet
+/// socket costs that slice. It is on the worker's idle path, which is
+/// the right place for a blocking wait — but it is NOT a latency
+/// guarantee and must not be read as one.
+const PUMP_BUDGET: Duration = Duration::from_millis(20);
+
+/// Reconnect backoff for the user-event socket.
+///
+/// Mandatory, not politeness: without it a black-holing socket is
+/// retried every `WORKER_IDLE_BACKOFF` (tens of microseconds) on the
+/// only thread that also submits orders.
+const WS_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+
+/// Counters an operator reads on `/metrics`.
+#[repr(C, align(64))]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct HlExecCounters {
+    /// Orders accepted by the venue.
+    pub submitted: u64,
+    /// Orders the venue refused.
+    pub rejected: u64,
+    /// Submits refused locally, before any packet left.
+    pub refused_local: u64,
+    /// Venue fills routed into fill lane 3.
+    pub fills_booked: u64,
+    /// Venue fills that were NOT ours — counted, never routed.
+    pub fills_foreign: u64,
+    /// Fills the lane could not accept (ring full). **A dropped fill
+    /// is a position the engine does not know it has.**
+    pub fills_dropped: u64,
+    /// Ours, but the venue's coin name could not be resolved to an
+    /// engine symbol. **Counted and NOT booked.**
+    pub fills_unresolved: u64,
+    /// Fills REFUSED by the converter — zero or negative quantity.
+    /// A refusal, not a loss: distinct from [`Self::fills_dropped`],
+    /// whose whole meaning is "a position the engine does not know it
+    /// has". One alarm that is permanently noisy is no alarm.
+    pub fills_refused: u64,
+    /// A frame that WAS `userFills` and could not be scanned —
+    /// overflow, or a shape we refuse. **Never conflated with a frame
+    /// from another channel**, because discarding a whole reconnect
+    /// snapshot in silence is precisely the failure this counter
+    /// exists to make loud.
+    pub fills_scan_failed: u64,
+    /// Fills whose VENUE TIMESTAMP did not convert to nanoseconds.
+    /// The fill is still booked, stamped with the local receive clock:
+    /// a position is real whatever the venue says the time was, and a
+    /// clamped `u64::MAX` would place it around the year 2554 in a
+    /// tape that is read in time order. The counter is the only record
+    /// that the stamp is ours and not the venue's — and it reaches no
+    /// gauge until `stats()` is wired (risk-policy §LAW E-9, item 5),
+    /// so today it is visible to a test and not to an operator.
+    pub fills_bad_ts: u64,
+    /// User-event socket reconnects that SUCCEEDED.
+    pub ws_reconnects: u64,
+    /// Connect attempts that failed. Counted separately, because a
+    /// permanent reconnect loop otherwise shows as zero reconnects and
+    /// looks like a healthy quiet socket.
+    pub ws_connect_failures: u64,
+    /// Encode or sign refusals — local, before anything was sent.
+    pub encode_failures: u64,
+}
+
+/// The live Hyperliquid dispatcher.
+pub struct HlExchange<const FILL_N: usize> {
+    http: HlHttp,
+    ws: UserWs,
+    sk: secp256k1::SecretKey,
+    network: Network,
+    nonce: Nonce,
+    budget: AddressBudget,
+    seen: TidRing<SNAPSHOT_RING>,
+    assets: AssetTable,
+    fills: Producer<Fill, FILL_N>,
+    counters: HlExecCounters,
+    budget_path: PathBuf,
+    last_persist: Instant,
+    /// Consecutive connect failures, indexing [`WS_BACKOFF`].
+    ws_fail_streak: u32,
+    /// Earliest instant a reconnect may be attempted.
+    ws_retry_at: Instant,
+    /// Scratch for one frame's fills. **Boxed and sized for the
+    /// venue's SNAPSHOT**, not for a steady-state frame — see
+    /// [`HlExchange::pump_user_events`].
+    scratch: Box<[UserFill]>,
+}
+
+impl<const FILL_N: usize> HlExchange<FILL_N> {
+    /// Build the arm. Opens nothing; the first submit dials.
+    ///
+    /// # Errors
+    /// The configuration's key is unusable, or a socket could not be
+    /// constructed (bad host).
+    pub fn new(
+        cfg: &HlConfig,
+        tls: Arc<rustls::ClientConfig>,
+        fills: Producer<Fill, FILL_N>,
+        budget_path: PathBuf,
+        floor: u64,
+    ) -> Result<Self, crate::config::ConfigErr> {
+        let sk = cfg.secret_key()?;
+        let http = HlHttp::new(&cfg.host, 443, tls.clone())
+            .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
+        let ws = UserWs::new(&cfg.host, 443, tls, &cfg.master_addr)
+            .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
+        let budget = budget::load(&budget_path, cfg.master_addr, floor);
+        Ok(Self {
+            http,
+            ws,
+            sk,
+            network: cfg.network,
+            nonce: Nonce::new(),
+            budget,
+            seen: TidRing::new(),
+            assets: AssetTable::default(),
+            fills,
+            counters: HlExecCounters::default(),
+            budget_path,
+            last_persist: Instant::now(),
+            ws_fail_streak: 0,
+            ws_retry_at: Instant::now(),
+            scratch: vec![UserFill::default(); SNAPSHOT_RING].into_boxed_slice(),
+        })
+    }
+
+    /// The asset table. **Bound by a roll event, never derived**
+    /// (LAW E-4) — the boot and the roll are what call `bind`.
+    #[inline]
+    pub fn assets_mut(&mut self) -> &mut AssetTable {
+        &mut self.assets
+    }
+
+    /// Operator counters.
+    #[inline]
+    #[must_use]
+    pub fn counters(&self) -> HlExecCounters {
+        self.counters
+    }
+
+    /// Requests believed to remain before the venue's cliff.
+    #[inline]
+    #[must_use]
+    pub fn budget_remaining(&self) -> i64 {
+        self.budget.remaining()
+    }
+
+    /// Map the engine's order kind onto the venue's TIF.
+    ///
+    /// `ORDER_KIND_MAKER` is POST-ONLY, and `Alo` is the only tif that
+    /// guarantees it never takes — a `Gtc` that crossed would pay the
+    /// spread the member's whole edge is made of.
+    ///
+    /// An unknown kind is **refused**, not mapped. The paper arm
+    /// refuses it (`PaperDispatcher::submit` counts it `unroutable`),
+    /// and the two arms disagreeing about the same order is the shape
+    /// LAW E-1 exists to forbid: the order would be dropped in the
+    /// model and RESTING on the venue, so the paper P&L and the real
+    /// book would describe different worlds.
+    #[inline]
+    fn tif_of(kind: u8) -> Option<Tif> {
+        match kind {
+            ORDER_KIND_IOC => Some(Tif::Ioc),
+            ORDER_KIND_MAKER => Some(Tif::Alo),
+            _ => None,
+        }
+    }
+
+    /// Test seam over [`Self::route_frame`]: one frame, one `&mut
+    /// self` call. The production path routes inside the pump's
+    /// closure and never goes through here, which is why this is
+    /// `cfg(test)` rather than dead code left lying around.
+    #[cfg(test)]
+    fn route_fills(&mut self, payload: &[u8]) -> usize {
+        let recv_ns = now_ns();
+        Self::route_frame(
+            payload,
+            recv_ns,
+            &mut self.scratch,
+            &mut self.seen,
+            &mut self.budget,
+            &mut self.fills,
+            &mut self.counters,
+        )
+    }
+
+    /// Route one `userFills` frame into fill lane 3.
+    ///
+    /// **`is_snapshot` matters and is not decoration: a snapshot is
+    /// HISTORY.** Its notional must not be re-added to the budget's
+    /// `traded` on every boot, or five restarts a day would inflate
+    /// the allowance in exactly the permissive direction the budget
+    /// exists to prevent. It is derived INSIDE `scan_user_fills` from
+    /// the payload and is deliberately not a parameter here, so no
+    /// caller can present a snapshot as live trading.
+    ///
+    /// Takes DISJOINT borrows rather than `&mut self`, which is not a
+    /// style choice. The socket's payload borrows the socket, so a
+    /// `&mut self` router cannot be called from inside
+    /// [`UserWs::pump`]'s closure — and the copy that used to buy its
+    /// way around that was a heap `Vec` grown per frame, on the one
+    /// thread that also signs and submits. Taking the five fields this
+    /// needs (none of which is `ws`) lets the scan read the socket's
+    /// own receive buffer in place: zero copy, zero allocation.
+    ///
+    /// Public so the allocation gate can measure THIS function rather
+    /// than a lookalike. The audit that produced this shape also found
+    /// that no gate touched the fill path at all, which made "0 B/op"
+    /// a statement about other code. Publishing it adds no capability:
+    /// every ingredient (`scan_user_fills`, `to_fill`, `TidRing`,
+    /// `AddressBudget::on_venue_fill`, `Producer::try_push`) was
+    /// already public, and every `HlExchange` field is private, so
+    /// this is a NARROWING wrapper over `try_push` — it adds the
+    /// channel test, the strict parse, the tid dedupe, the cloid
+    /// containment and the zero-quantity refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_frame(
+        payload: &[u8],
+        recv_ns: NsTs,
+        scratch: &mut [UserFill],
+        seen: &mut TidRing<SNAPSHOT_RING>,
+        budget: &mut AddressBudget,
+        fills: &mut Producer<Fill, FILL_N>,
+        counters: &mut HlExecCounters,
+    ) -> usize {
+        // `seen` is pinned to SNAPSHOT_RING by its type; `scratch` is
+        // an unsized slice, so the same bound is asserted rather than
+        // constructed. A short scratch still FAILS CLOSED —
+        // `scan_user_fills` refuses the frame at its own bound check
+        // and it is counted `fills_scan_failed` — but that drops a
+        // whole snapshot, which is the failure this file exists to
+        // make loud, so it is worth catching in debug.
+        debug_assert!(
+            scratch.len() >= SNAPSHOT_RING,
+            "scratch must hold a venue SNAPSHOT, not a steady-state frame"
+        );
+        if !crate::userws::is_user_fills(payload) {
+            // An ack, an orderUpdates, a pong. Books nothing, and is
+            // NOT a failure.
+            return 0;
+        }
+        let (n, is_snapshot) = match scan_user_fills(payload, scratch) {
+            Ok(v) => v,
+            Err(_) => {
+                // It WAS a userFills frame and it did not scan. Loud,
+                // and never confused with a frame from another
+                // channel — silently discarding a reconnect snapshot
+                // is the failure this counter exists for.
+                counters.fills_scan_failed =
+                    counters.fills_scan_failed.wrapping_add(1);
+                return 0;
+            }
+        };
+        let mut booked = 0usize;
+        // An INDEX loop, deliberately. clippy wants
+        // `scratch.iter().take(n)`; CLAUDE.md forbids iterator chains
+        // in hot loops, and `scratch` is `SNAPSHOT_RING` long while
+        // `n` is the row count, so the index is also what keeps the
+        // read inside the frame that actually scanned.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            let f = scratch[i];
+            // LAW E-5: the venue's tid is the dedupe key, and the ring
+            // outlives the socket precisely so a reconnect snapshot
+            // cannot re-book.
+            if !seen.admit(f.tid) {
+                continue;
+            }
+            if !is_snapshot {
+                budget.on_venue_fill(f.notional_usdc_1e6());
+            }
+            // `checked_`, not `saturating_`, for the same reason
+            // `submit` uses it on price and qty: a clamp is a wrong
+            // answer that looks like an answer. A venue stamp that
+            // does not fit is garbage, and the fill is booked with the
+            // local receive time rather than dropped — the POSITION is
+            // real either way, and a fill the engine never hears about
+            // is the worse of the two failures.
+            let ts = match f.time_ms.checked_mul(1_000_000) {
+                Some(v) => v,
+                None => {
+                    counters.fills_bad_ts = counters.fills_bad_ts.wrapping_add(1);
+                    recv_ns
+                }
+            };
+
+            // THE SYMBOL. The venue echoes a COIN NAME ("BTC",
+            // "+3253"); the engine routes on its own `SymbolId`, and
+            // nothing yet maps one to the other.
+            //
+            // So the fill is counted and NOT booked. A fill booked
+            // against the wrong symbol moves a position the member
+            // never took, silently, in the tape, forever. A missing
+            // fill is caught by reconciliation inside a minute; a
+            // misattributed one is caught by nobody.
+            let Some(sym) = resolve_sym(f.coin.of(payload)) else {
+                counters.fills_unresolved =
+                    counters.fills_unresolved.wrapping_add(1);
+                continue;
+            };
+            match to_fill(&f, sym, ts) {
+                Ok(Routed::Slot(fill)) => {
+                    if fills.try_push(fill).is_err() {
+                        // A dropped fill is a position the engine does
+                        // not know it has. Reconciliation catches it;
+                        // this counter explains it afterwards.
+                        counters.fills_dropped =
+                            counters.fills_dropped.wrapping_add(1);
+                    } else {
+                        counters.fills_booked =
+                            counters.fills_booked.wrapping_add(1);
+                        booked += 1;
+                    }
+                }
+                Ok(Routed::TapeOnly(_)) => {
+                    // Not ours. Never enters the lane — there,
+                    // STRATEGY_ID_NONE would fan it out to EVERY
+                    // member. (Plan §6.1 also wants it written to the
+                    // tape; that writer does not exist here and is
+                    // recorded as open in docs/risk-policy.md.)
+                    counters.fills_foreign =
+                        counters.fills_foreign.wrapping_add(1);
+                }
+                Err(_) => {
+                    // A REFUSAL (zero or negative quantity), not a
+                    // loss. Kept off `fills_dropped` so that alarm
+                    // keeps meaning "a position we do not know about".
+                    counters.fills_refused =
+                        counters.fills_refused.wrapping_add(1);
+                }
+            }
+        }
+        booked
+    }
+
+    /// Drain the user-event socket into fill lane 3.
+    ///
+    /// Returns whether anything was read.
+    fn pump_user_events(&mut self) -> bool {
+        if !self.ws.is_connected() {
+            if Instant::now() < self.ws_retry_at {
+                return false;
+            }
+            if self.ws.connect().is_err() {
+                self.counters.ws_connect_failures =
+                    self.counters.ws_connect_failures.wrapping_add(1);
+                let i = (self.ws_fail_streak as usize).min(WS_BACKOFF.len() - 1);
+                self.ws_retry_at = Instant::now() + WS_BACKOFF[i];
+                self.ws_fail_streak = self.ws_fail_streak.saturating_add(1);
+                return false;
+            }
+            self.ws_fail_streak = 0;
+            self.counters.ws_reconnects = self.counters.ws_reconnects.wrapping_add(1);
+        }
+
+        // ZERO COPY. Each payload is routed from the socket's own
+        // receive buffer, inside the pump's closure. `ws` is borrowed
+        // by `pump`; the five fields the router needs are borrowed
+        // beside it, which is what the destructuring below is for.
+        //
+        // An earlier revision staged the frames into a `Vec` first,
+        // because `route_fills` took `&mut self`. That allocated on
+        // every frame -- pings and `orderUpdates` included, since the
+        // channel test happens inside the router -- on the thread that
+        // also signs and submits. The borrow, not the copy, was the
+        // actual problem.
+        let recv_ns = now_ns();
+        let Self {
+            ws,
+            scratch,
+            seen,
+            budget,
+            fills,
+            counters,
+            ..
+        } = self;
+        let r = ws.pump(PUMP_BUDGET, |payload| {
+            Self::route_frame(payload, recv_ns, scratch, seen, budget, fills, counters);
+        });
+        match r {
+            Ok(n) => n > 0,
+            Err(_) => {
+                // Any socket failure drops the connection; the next
+                // idle redials, after the backoff. The tid ring
+                // SURVIVES, which is what makes the snapshot safe.
+                self.ws.disconnect();
+                let i = (self.ws_fail_streak as usize).min(WS_BACKOFF.len() - 1);
+                self.ws_retry_at = Instant::now() + WS_BACKOFF[i];
+                self.ws_fail_streak = self.ws_fail_streak.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    fn persist_budget(&mut self) {
+        if self.last_persist.elapsed() < PERSIST_EVERY {
+            return;
+        }
+        self.last_persist = Instant::now();
+        let _ = budget::store(&self.budget_path, &self.budget);
+    }
+}
+
+impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
+    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        // 1. LAW E-4 — bound, never derived. An unbound symbol is a
+        //    refusal, not an arithmetic problem.
+        let asset = self
+            .assets
+            .lookup(order.sym, 0)
+            .map_err(|_| {
+                self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+                DispatchError::NoLiveRoute
+            })?;
+
+        // 2. Budget BEFORE signing: a signed action that is then
+        //    discarded has still burned a nonce.
+        if self.budget.may_submit().is_err() {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            return Err(DispatchError::SlotDisabled);
+        }
+
+        // `checked_mul`, not `saturating_mul`: saturation clamps to
+        // i64::MAX, which is POSITIVE and would sail straight past the
+        // `<= 0` guard below — an overflow guard that cannot catch an
+        // overflow.
+        let (Some(px), Some(sz)) = (
+            order.px.raw().checked_mul(ENGINE_TO_WIRE),
+            order.qty.raw().checked_mul(ENGINE_TO_WIRE),
+        ) else {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        if px <= 0 || sz <= 0 {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        }
+        let Some(tif) = Self::tif_of(order.kind) else {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            return Err(DispatchError::NoLiveRoute);
+        };
+        let wire = OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
+        // 3. LAW E-9 — the slot travels in the cloid, so the fill can
+        //    be routed without a table when it comes back.
+        .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
+
+        // Every local failure from here on bumps a counter. Without
+        // that they are invisible: `stats()` reports nothing for this
+        // arm, so an encode that silently refused every order would
+        // look exactly like an engine that emitted none.
+        let mut mp = [0u8; MAX_ACTION];
+        let mut aj = [0u8; MAX_ACTION];
+        let enc = |r: Result<usize, crate::msgpack::MsgPackErr>,
+                       c: &mut HlExecCounters|
+         -> Result<usize, DispatchError> {
+            r.map_err(|_| {
+                c.encode_failures = c.encode_failures.wrapping_add(1);
+                DispatchError::EncodeOverflow
+            })
+        };
+        let mp_n = enc(encode_order(&mut mp, &[wire], b"na"), &mut self.counters)?;
+        let aj_n = enc(order_json(&mut aj, &[wire], b"na"), &mut self.counters)?;
+
+        // The nonce is taken LAST among the things that can fail, so a
+        // local refusal cannot burn one. (HL only requires strictly
+        // increasing nonces, so a gap is harmless — but not burning
+        // one at all is simpler to reason about.)
+        let mut body = [0u8; MAX_REQ_BODY];
+        let nonce = self.nonce.next(now_ms());
+        let sig = sign_action(&self.sk, &mp[..mp_n], nonce, Vault::None, None, self.network)
+            .map_err(|_| {
+                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+                DispatchError::SignerRejected
+            })?;
+        let n = enc(
+            envelope(&mut body, &aj[..aj_n], nonce, &sig, None, None),
+            &mut self.counters,
+        )?;
+
+        let (_status, range) = self.http.post(&body[..n]).map_err(|_| {
+            self.counters.rejected = self.counters.rejected.wrapping_add(1);
+            DispatchError::Disconnected
+        })?;
+        // Every action that left the host counts against the address,
+        // whatever the venue said about it.
+        self.budget.on_action_sent();
+
+        let resp = self.http.resp();
+        let slice = &resp[range];
+        match scan(slice) {
+            // LAW E-5: this is the ACK. It tells us the venue took the
+            // order; it never books a fill.
+            Ok(HlResponse::Ok(ok)) if ok.accepted() => {
+                self.counters.submitted = self.counters.submitted.wrapping_add(1);
+                Ok(())
+            }
+            // The venue understood us and said NO. Distinct from an
+            // answer we could not read: E6's `halt_on_reject_streak`
+            // counts this one, and conflating the two would have it
+            // halt on a parser bug or miss a venue refusing every
+            // order.
+            Ok(_) => {
+                self.counters.rejected = self.counters.rejected.wrapping_add(1);
+                Err(DispatchError::Http(200))
+            }
+            Err(_) => {
+                self.counters.rejected = self.counters.rejected.wrapping_add(1);
+                Err(DispatchError::JsonMalformed)
+            }
+        }
+    }
+
+    /// **Always `None`, deliberately.**
+    ///
+    /// Fills reach the engine through fill lane 3, written by
+    /// [`HlExchange::pump_user_events`]. Returning them here as well
+    /// would book every venue fill twice — once through the lane and
+    /// once through this call — which is precisely the double-counting
+    /// LAW E-5 exists to prevent.
+    #[inline]
+    fn try_next_fill(&mut self) -> Option<Fill> {
+        None
+    }
+
+    fn stats(&self) -> DispatchStats {
+        DispatchStats::default()
+    }
+
+    /// A live dispatcher invents nothing from a book.
+    #[inline]
+    fn observe_tick(&mut self, _tick: &Tick, _now_ns: NsTs) {}
+
+    /// The worker's idle moment is this arm's only thread.
+    fn on_idle(&mut self) -> bool {
+        let worked = self.pump_user_events();
+        self.persist_budget();
+        worked
+    }
+}
+
+/// Coin name → engine `SymbolId`.
+///
+/// **Not implemented, deliberately.** It returns `None` for every
+/// input, so every venue fill is counted as unresolved and none is
+/// booked. That is the fail-closed placeholder for a binding that
+/// belongs with the roll event, and it is a function rather than an
+/// inline `None` so that the day it is implemented there is exactly
+/// one place to do it — and so the compiler points here.
+#[inline]
+fn resolve_sym(_coin: &[u8]) -> Option<u32> {
+    None
+}
+
+/// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.
+fn now_ns() -> NsTs {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u128::from(NsTs::MAX)) as NsTs)
+        .unwrap_or(0)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Scope, HOST_TESTNET};
+    use core_ring::Ring;
+    use core_types::{Price, Qty, VenueId};
+
+    const KEY: [u8; 32] = [0x21; 32];
+    const ADDR: [u8; 20] = [0x22; 20];
+
+    fn cfg() -> HlConfig {
+        HlConfig::new(Scope::Testnet, HOST_TESTNET, 'b', KEY, ADDR).expect("cfg")
+    }
+
+    fn exchange() -> HlExchange<64> {
+        let (p, _c) = Ring::<Fill, 64>::new().split();
+        let tls = core_net::TlsTransport::default_client_config();
+        HlExchange::new(
+            &cfg(),
+            tls,
+            p,
+            std::env::temp_dir().join(format!("mv-hlx-{}.state", std::process::id())),
+            100,
+        )
+        .expect("build")
+    }
+
+    fn order(sym: u32, kind: u8) -> Order {
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            kind,
+            Price::from_raw(470_000),
+            Qty::from_raw(25_000_000),
+            7,
+        );
+        o.strategy_id = 3;
+        o
+    }
+
+    /// **LAW E-4.** An unbound symbol is refused, and nothing is sent.
+    #[test]
+    fn an_unbound_symbol_is_refused_before_anything_is_signed() {
+        let mut x = exchange();
+        let e = x.submit(&order(42, ORDER_KIND_MAKER)).unwrap_err();
+        assert_eq!(e, DispatchError::NoLiveRoute);
+        assert_eq!(x.counters().refused_local, 1);
+        assert_eq!(x.counters().submitted, 0);
+        // Nothing left the host, so nothing was spent.
+        assert_eq!(x.budget_remaining(), x.budget_remaining());
+    }
+
+    /// **The budget is checked before signing**, so a refusal cannot
+    /// burn a nonce.
+    #[test]
+    fn a_spent_budget_refuses_before_the_signer_is_touched() {
+        let mut x = exchange();
+        x.assets_mut().bind(42, 3, 0).expect("bind");
+        // A cold budget has zero headroom by construction.
+        assert!(x.budget_remaining() <= 0);
+        let e = x.submit(&order(42, ORDER_KIND_MAKER)).unwrap_err();
+        assert_eq!(e, DispatchError::SlotDisabled);
+        assert_eq!(x.counters().refused_local, 1);
+    }
+
+    /// **LAW E-5.** Fills arrive on the lane, never through this call.
+    /// Returning them here as well would book every fill twice.
+    #[test]
+    fn the_dispatcher_never_yields_a_fill_directly() {
+        let mut x = exchange();
+        assert!(x.try_next_fill().is_none());
+        assert!(x.try_next_fill().is_none());
+    }
+
+    /// A post-only maker must never be able to take, and an unknown
+    /// kind must be refused by BOTH arms or they describe different
+    /// worlds.
+    #[test]
+    fn the_tif_mapping_cannot_turn_a_maker_into_a_taker() {
+        assert_eq!(HlExchange::<8>::tif_of(ORDER_KIND_MAKER), Some(Tif::Alo));
+        assert_eq!(HlExchange::<8>::tif_of(ORDER_KIND_IOC), Some(Tif::Ioc));
+        for k in [2u8, 7, 255] {
+            assert_eq!(
+                HlExchange::<8>::tif_of(k),
+                None,
+                "kind {k} was mapped instead of refused; the paper arm refuses it"
+            );
+        }
+    }
+
+    /// `saturating_mul` clamps to a POSITIVE i64::MAX, which would
+    /// sail past a `<= 0` guard — an overflow check that cannot catch
+    /// an overflow.
+    #[test]
+    fn an_overflowing_price_is_refused_rather_than_clamped() {
+        let mut x = exchange();
+        x.assets_mut().bind(9, 3, 0).expect("bind");
+        let mut o = order(9, ORDER_KIND_MAKER);
+        o.px = Price::from_raw(i64::MAX);
+        // Refused for SOME local reason before anything is sent; the
+        // budget is cold here, so assert only that nothing was sent.
+        assert!(x.submit(&o).is_err());
+        assert_eq!(x.counters().submitted, 0);
+        assert_eq!(
+            i64::MAX.checked_mul(ENGINE_TO_WIRE),
+            None,
+            "the guard depends on checked_mul refusing this"
+        );
+    }
+
+    /// The fill router must survive a frame bigger than any buffer a
+    /// steady-state frame would need. This is the bug the review
+    /// found: a 64-slot scratch against a ~2,000-fill snapshot
+    /// discarded every reconnect snapshot in silence.
+    #[test]
+    fn a_snapshot_sized_frame_does_not_vanish() {
+        let mut x = exchange();
+        // 400 fills in one frame — far past any steady-state size.
+        let mut body = String::from(
+            r#"{"channel":"userFills","data":{"isSnapshot":true,"fills":["#,
+        );
+        for i in 0..400u64 {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                r#"{{"coin":"BTC","px":"1","sz":"1","side":"B","time":1,"oid":{},"tid":{}}}"#,
+                i + 1,
+                i + 1
+            ));
+        }
+        body.push_str("]}}");
+        let booked = x.route_fills(body.as_bytes());
+        // Nothing is booked (no symbol binding yet) — but the frame
+        // must have SCANNED, and every row must be accounted for.
+        assert_eq!(booked, 0);
+        assert_eq!(
+            x.counters().fills_scan_failed,
+            0,
+            "a snapshot-sized frame was discarded as unscannable"
+        );
+        assert_eq!(x.counters().fills_unresolved, 400, "every row accounted for");
+    }
+
+    /// A venue timestamp that will not convert must NOT be clamped.
+    ///
+    /// `saturating_mul` would place the fill at `i64::MAX` ns — the
+    /// year 2262 — in a tape that is read in time order. The fill is
+    /// real, so it is still booked; the stamp is local and the counter
+    /// says so.
+    #[test]
+    fn an_unconvertible_venue_timestamp_falls_back_to_the_local_clock() {
+        let mut x = exchange();
+        // u64::MAX ms cannot be multiplied into nanoseconds at all.
+        let body = format!(
+            r#"{{"channel":"userFills","data":{{"fills":[{{"coin":"BTC","px":"1","sz":"1","side":"B","time":{},"oid":1,"tid":1}}]}}}}"#,
+            u64::MAX
+        );
+        x.route_fills(body.as_bytes());
+        assert_eq!(
+            x.counters().fills_bad_ts,
+            1,
+            "an unconvertible venue stamp was accepted silently"
+        );
+        assert_eq!(
+            u64::MAX.checked_mul(1_000_000),
+            None,
+            "the guard depends on checked_mul refusing this"
+        );
+    }
+
+    /// The router reads the socket's OWN receive buffer.
+    ///
+    /// This is the shape of the bug the audit found: `route_fills`
+    /// took `&mut self`, so the pump's closure could not call it, so
+    /// every frame was copied into a heap `Vec` first — on the thread
+    /// that also signs and submits. `route_frame` exists to take
+    /// disjoint borrows instead, and this test is what holds that
+    /// property: it drives the router through a closure of exactly the
+    /// shape [`UserWs::pump`] passes, while `ws` is borrowed.
+    #[test]
+    fn a_frame_routes_from_a_borrowed_slice_with_no_staging_copy() {
+        let mut x = exchange();
+        let frame = br#"{"channel":"userFills","data":{"fills":[{"coin":"BTC","px":"1","sz":"1","side":"B","time":1,"oid":7,"tid":7}]}}"#;
+        let recv_ns = now_ns();
+        let HlExchange {
+            ws,
+            scratch,
+            seen,
+            budget,
+            fills,
+            counters,
+            ..
+        } = &mut x;
+        // `ws` is borrowed for the whole closure, exactly as `pump`
+        // borrows it. If this compiles, the production path needs no
+        // copy; if it stops compiling, the copy is back.
+        let _borrowed = &mut *ws;
+        let mut feed = |payload: &[u8]| {
+            HlExchange::<64>::route_frame(
+                payload, recv_ns, scratch, seen, budget, fills, counters,
+            );
+        };
+        feed(&frame[..]);
+        assert_eq!(x.counters().fills_unresolved, 1, "the frame was routed");
+    }
+
+    /// A frame from another channel is NOT a scan failure — the two
+    /// must stay distinguishable or a discarded snapshot looks like an
+    /// orderUpdates frame.
+    #[test]
+    fn another_channel_is_not_counted_as_a_failure() {
+        let mut x = exchange();
+        assert_eq!(x.route_fills(br#"{"channel":"orderUpdates","data":[]}"#), 0);
+        assert_eq!(x.counters().fills_scan_failed, 0);
+        // But a userFills frame that will not scan IS counted.
+        assert_eq!(
+            x.route_fills(br#"{"channel":"userFills","data":{"fills":[{"coin":"x"}]}}"#),
+            0
+        );
+        assert_eq!(x.counters().fills_scan_failed, 1);
+    }
+
+    /// A SNAPSHOT is history. Re-adding its notional to the budget on
+    /// every boot inflates the allowance — the permissive direction
+    /// the budget module exists to prevent.
+    #[test]
+    fn a_snapshot_does_not_inflate_the_budget() {
+        let mut x = exchange();
+        let before = x.budget_remaining();
+        let snap = br#"{"channel":"userFills","data":{"isSnapshot":true,"fills":[{"coin":"BTC","px":"1000","sz":"1000","side":"B","time":1,"oid":1,"tid":1}]}}"#;
+        x.route_fills(snap);
+        assert_eq!(
+            x.budget_remaining(),
+            before,
+            "a replayed snapshot bought us request budget"
+        );
+        // A LIVE fill does accrue.
+        let live = br#"{"channel":"userFills","data":{"isSnapshot":false,"fills":[{"coin":"BTC","px":"1000","sz":"1000","side":"B","time":1,"oid":2,"tid":2}]}}"#;
+        x.route_fills(live);
+        assert!(x.budget_remaining() > before, "a live fill must earn budget");
+    }
+
+    /// The engine's scale is 1e6; the venue's is 1e8.
+    #[test]
+    fn the_scale_to_the_wire_is_a_hundred() {
+        assert_eq!(ENGINE_TO_WIRE, 100);
+        let o = order(1, ORDER_KIND_MAKER);
+        assert_eq!(o.px.raw() * ENGINE_TO_WIRE, 47_000_000, "0.47");
+        assert_eq!(o.qty.raw() * ENGINE_TO_WIRE, 2_500_000_000, "25 contracts");
+    }
+
+    /// Counters exist so an operator can tell a refusal from a
+    /// rejection from a drop. A dropped fill above all: that is a
+    /// position the engine does not know it has.
+    #[test]
+    fn the_counters_distinguish_every_way_a_fill_can_fail_to_land() {
+        let c = HlExecCounters::default();
+        assert_eq!(c.fills_dropped, 0);
+        assert_eq!(c.fills_foreign, 0);
+        assert_eq!(c.fills_unresolved, 0);
+        assert_eq!(c.refused_local, 0);
+        assert_eq!(c.rejected, 0);
+        assert_eq!(core::mem::align_of::<HlExecCounters>(), 64);
+    }
+
+    /// **The symbol binding is not implemented, and the arm is
+    /// fail-closed about it.** A fill booked against a guessed symbol
+    /// moves a position the member never took, silently and
+    /// permanently; a fill not booked is caught by reconciliation
+    /// inside a minute.
+    #[test]
+    fn no_coin_name_resolves_yet_so_nothing_is_booked_against_a_guess() {
+        for coin in [&b"BTC"[..], b"+3253", b"USDC", b"", b"\xff\xfe"] {
+            assert_eq!(
+                resolve_sym(coin),
+                None,
+                "a coin name resolved to a symbol nothing has bound"
+            );
+        }
+    }
+}

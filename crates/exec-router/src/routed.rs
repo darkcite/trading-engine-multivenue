@@ -164,6 +164,26 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     /// E1: hand the router's counters and the live route map across the
     /// trait boundary, so the engine loop can mirror them to `/metrics`
     /// without knowing this type. **Cold** — the 5 s tick only.
+    /// E4: both arms get the idle moment.
+    ///
+    /// `|` and NOT `||`: short-circuiting would starve the second arm
+    /// every time the first reported work, and the second arm is the
+    /// one that owns a venue socket. A hook that runs only when the
+    /// other arm is quiet is a hook that stops running exactly when
+    /// the engine is busiest.
+    ///
+    /// This forwarding is why the hook exists at all — `RoutedDispatcher`
+    /// is what the `--exec` path wires, so a default `false` here would
+    /// leave a live arm's user-event socket unpumped and its budget
+    /// state file unwritten, which is the "valid, empty and silent"
+    /// failure the user-event module names as the worst one.
+    #[inline]
+    fn on_idle(&mut self) -> bool {
+        let a = self.paper.on_idle();
+        let b = self.live.on_idle();
+        a | b
+    }
+
     fn exec_counters(&self) -> ExecCounters {
         let c = self.counters;
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];

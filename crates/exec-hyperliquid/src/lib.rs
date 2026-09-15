@@ -55,20 +55,29 @@
 //!
 //! ## What is deliberately NOT here
 //!
-//! * `HlExchange: OrderDispatch` — the engine-facing dispatcher (E4).
-//!   It is not built speculatively: it belongs where the engine can
-//!   actually reach it.
-//! * The user-event WS TRANSPORT and the dispatcher worker that owns
-//!   it. [`userws`] is the scanner half only; the socket belongs to
-//!   the worker, which is the single writer of fill lane 3.
+//! * The **dispatcher worker wiring** on the `--exec` path. [`exchange`]
+//!   implements `OrderDispatch::on_idle`, and `RoutedDispatcher`
+//!   forwards it — but that path hands its dispatcher straight to the
+//!   engine loop with no `DispatcherWorker`, so nothing calls the hook
+//!   there yet. Wiring it changes the arming path and belongs to E7.
+//! * The **coin → `SymbolId` binding**. `exchange::resolve_sym` is a
+//!   fail-closed stub returning `None`, so no venue fill is booked at
+//!   all today. A guessed symbol moves a position the member never
+//!   took, silently and permanently; a missing fill is caught by
+//!   reconciliation inside a minute.
+//! * The **reconciliation timer** (§6.2) and the **tape write** for a
+//!   foreign fill (§6.1). Both are recorded as open in
+//!   `docs/risk-policy.md`.
 //!
 //! ## What E4 added, and what still cannot reach the engine
 //!
-//! [`cloid`] (LAW E-9), [`budget`], [`userws`] and [`recon`] are
-//! built and tested, and have **no production caller** — nothing
-//! outside their own tests and the bench gate references them.
-//! `cli::exec_boot::LIVE_ARM_VENUES` is still empty and still
-//! compile-time asserted so.
+//! [`cloid`] (LAW E-9), [`budget`], [`userws`], [`userws_conn`],
+//! [`recon`] and [`exchange`] are built and tested. **The live arm is
+//! now COMPILED INTO the binary** — what keeps it unreachable is that
+//! nothing constructs it, plus `cli::exec_boot::LIVE_ARM_VENUES`
+//! still being empty behind its compile-time assertion. That is a real
+//! reduction in defence depth versus "no arm exists at all", and it is
+//! recorded rather than glossed.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -79,6 +88,7 @@ pub mod asset;
 pub mod budget;
 pub mod cloid;
 pub mod config;
+pub mod exchange;
 pub mod http;
 pub mod lifecycle;
 pub mod msgpack;
@@ -104,6 +114,7 @@ pub use config::{
     ConfigErr, HlConfig, Scope, ENV_AGENT_KEY, ENV_HOST, ENV_MASTER_ADDR, ENV_SOURCE,
     ENV_T_AGENT_KEY, ENV_T_HOST, ENV_T_MASTER_ADDR, ENV_T_SOURCE, HOST_MAINNET, HOST_TESTNET,
 };
+pub use exchange::{HlExchange, HlExecCounters};
 pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};

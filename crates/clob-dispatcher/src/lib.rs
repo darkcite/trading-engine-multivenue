@@ -343,6 +343,45 @@ pub trait OrderDispatch {
         0
     }
 
+    /// E4: the worker has nothing to submit right now.
+    ///
+    /// Defaulted to nothing, like every other hook on this trait. A
+    /// LIVE dispatcher overrides it, because it owns sockets the
+    /// engine never touches — the venue's user-event stream, the
+    /// reconciliation timer, the budget's state file — and those need
+    /// a thread to run on. The worker's idle moment IS that thread.
+    ///
+    /// Why here rather than a second thread: the dispatcher worker
+    /// already owns the venue relationship (HTTP, nonce, budget), and
+    /// the fill lane needs exactly ONE writer. A second thread would
+    /// need a lock around all of it, on the path that books fills.
+    ///
+    /// Called instead of sleeping, so an implementation that returns
+    /// immediately must not spin — `DispatcherWorker::run` sleeps only
+    /// when this reports it did nothing.
+    ///
+    /// **It also BLOCKS.** An implementation may poll a socket or
+    /// fsync a state file here, on the same thread that submits
+    /// orders. That is the right thread for it — the alternative is a
+    /// lock on the fill path — but the idle wait is no longer tens of
+    /// microseconds, and a caller that needs a bound must impose one.
+    ///
+    /// **WHERE IT DOES NOT REACH, TODAY.** `DispatcherWorker` is
+    /// constructed in exactly one production place: the legacy
+    /// Polymarket `--live` path. The `--exec` path hands its
+    /// `RoutedDispatcher` straight to the engine loop, so nothing
+    /// calls this hook there — which is the one path that can arm
+    /// Hyperliquid. `RoutedDispatcher` forwards `on_idle` to both arms
+    /// so the plumbing is ready, but the worker that would drive it is
+    /// not wired on that path, and wiring it is an arming-path change
+    /// that belongs with E7 rather than being inferred here.
+    ///
+    /// Returns whether it did any work.
+    #[inline]
+    fn on_idle(&mut self) -> bool {
+        false
+    }
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly

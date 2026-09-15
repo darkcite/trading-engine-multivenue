@@ -280,10 +280,17 @@ artifact `~/multivenue/exec.toml`, grammar in `exec.toml.example`). Three
 modes: `paper` (the default for every unanswerable question), `live`,
 `off`.
 
-**Nothing in E1 can place a real order.** No live execution arm is
-compiled for any venue — `cli::exec_boot::LIVE_ARM_VENUES` is empty and a
-test asserts it — so any artifact marking a slot `live` REFUSES the boot
-and names the phase (E2 signing, E3 HTTP) that will supply the arm.
+**Nothing in E1 can place a real order.** `cli::exec_boot::LIVE_ARM_VENUES`
+is empty and a compile-time assertion holds it empty, so any artifact
+marking a slot `live` REFUSES the boot and names the phase that will
+supply the arm.
+
+*(Amended 2026-09-15, E4: this paragraph used to say "no live
+execution arm is compiled for any venue". That is no longer true —
+`exec_hyperliquid::HlExchange` IS compiled into the binary. What keeps
+it unreachable is that nothing constructs it, plus the empty const.
+The barrier holds, but it is now ONE barrier where it used to be two,
+which is exactly what `exec_boot.rs` warned would happen.)*
 Arming needs two switches that must name the same set exactly,
 `exec.toml` and `--arm-live`, plus — in the managed fleet — a third edit
 to `scripts/engine-wrapper.sh`, which passes `--paper` and never
@@ -688,11 +695,83 @@ it is not made by inference — it needs an explicit operator decision,
 recorded here, and it has not been taken.
 
 What is built: the cloid law, the request-budget governor, the
-user-event scanner that turns venue fills into engine fills, and the
-reconciliation parser. What is NOT built, and is required before any
-mainnet order: the user-event WS transport and the dispatcher worker
-that owns it, `HlExchange: OrderDispatch`, and the worker-side
-`origin` split of §6.4.
+user-event scanner AND its socket, the reconciliation parser, and
+`HlExchange: OrderDispatch` — the live arm itself.
+
+**The live arm is now COMPILED INTO the binary.** What keeps it
+unreachable is that nothing constructs it, plus the empty
+`LIVE_ARM_VENUES` behind its compile-time assertion. That is a real
+reduction in defence depth against the earlier state, where no arm
+existed to construct, and it is recorded here rather than glossed —
+`exec_boot.rs` predicted exactly this ("this const becomes the WHOLE
+barrier") and the prediction has come true.
+
+What is NOT built, and is required before any mainnet order:
+
+1. **The coin → `SymbolId` binding.** `exchange::resolve_sym` is a
+   fail-closed stub returning `None`, so **nothing is booked into fill
+   lane 3 at all today** — `fills_booked` is structurally zero and must
+   not be read as a live number. A guessed symbol moves a position the
+   member never took, silently and permanently; a missing fill is
+   caught by reconciliation inside a minute.
+2. **The dispatcher-worker wiring on the `--exec` path.** `on_idle`
+   exists and `RoutedDispatcher` forwards it, but that path hands its
+   dispatcher straight to the engine loop with no `DispatcherWorker`,
+   so the hook reaches nothing there. Until it is wired, a live arm's
+   user-event socket would never be pumped — and `submit`'s blocking
+   HTTPS POST would run on the engine tick loop, against §6.2's "the
+   engine data path makes no syscalls". Wiring it is an arming-path
+   change and belongs to E7.
+3. **The reconciliation timer** (§6.2). The parser and
+   `net_exposure_1e8` exist with no caller.
+4. **The tape write for a foreign fill.** LAW E-9 requires one; today
+   it is counted (`fills_foreign`) and discarded. A count says a
+   stranger's fill happened but not what it was.
+5. **`/metrics` for the live arm.** `HlExchange::stats()` returns
+   zeros, so `HlExecCounters` reaches no gauge. A live arm today would
+   report zero submits and zero fills forever.
+6. The worker-side `origin` split of §6.4.
+
+**The fill path allocated, and the gate that should have said so was
+measuring something else.** The first revision of `pump_user_events`
+staged every WS frame into a heap `Vec` before routing it, because
+`route_fills` took `&mut self` and the payload borrows the socket.
+That allocated on every frame — pings and `orderUpdates` included,
+since the channel test happens inside the router — on the one thread
+that also signs and submits orders. It survived review and it survived
+"56/56 at 0 B/op", because no allocation gate touched `HlExchange` at
+all: gate 55 measures the fill lane's *pieces*, and a gate that
+measures a lookalike reports on code nobody runs.
+
+The fix is `HlExchange::route_frame`, which takes the five fields it
+needs as disjoint borrows instead of `&mut self`, so the scan reads the
+socket's own receive buffer in place — zero copy, per §"all networking
+is zero-copy", and no allocation. It is **`pub`**, so the gate measures
+the real function rather than a copy of it; that widening adds no
+capability, because every ingredient it uses was already public and
+every `HlExchange` field is private, which makes it a NARROWING wrapper
+over `Producer::try_push` (it adds the channel test, the strict parse,
+the tid dedupe, the cloid containment and the zero-quantity refusal).
+**Gate 56**
+(`hl_exchange_route_frame_is_zero_alloc`) measures that function
+directly over a 400-row snapshot-sized frame, and was verified to FAIL
+(200 allocations, 8.3 MB) when a single `payload.to_vec()` is
+reintroduced — a gate whose failure has never been observed is a claim,
+not a check.
+
+**`fills_bad_ts`** is new alongside it. The venue's millisecond stamp
+was converted with `saturating_mul`, which clamps a corrupt value to
+`u64::MAX` ns rather than refusing it — a wrong answer that looks like
+an answer, and one that would place the fill around the year 2554 in a
+tape read in time order. It is now `checked_mul`, and a stamp that will not
+convert books the fill against the LOCAL receive clock and counts it:
+the position is real whatever the venue says the time was, and a fill
+the engine never hears about is the worse of the two failures. The
+conversion sits ABOVE the `resolve_sym` guard deliberately — a corrupt
+stamp is a venue data-quality fact, not something to learn only once
+symbols are bound. Note the honest limit: like every other counter
+here, `fills_bad_ts` reaches no gauge until `stats()` is wired (item 5
+above), so today it is visible to a test and not to an operator.
 
 ### LAW E-9 — the cloid encodes the slot
 
@@ -730,9 +809,10 @@ precisely the evidence reconciliation exists to catch, and both
 attributing it and fanning it out destroy that evidence at the moment
 it appears.
 
-*(The counter and the tape write themselves belong to the worker,
-which E4 does not build. What E4 guarantees is that the worker cannot
-reach the lane with a foreign fill by accident.)*
+*(The counter exists — `HlExecCounters::fills_foreign`. **The tape
+write does not**, and is listed above as required before any mainnet
+order. What E4 guarantees today is the narrower thing: the worker
+cannot reach the lane with a foreign fill by accident.)*
 
 The reserved bytes must be zero for the same reason: our encoder never
 writes a dirty reserve, so neither did we.

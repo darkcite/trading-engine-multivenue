@@ -717,10 +717,13 @@ dependencies = [
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
+ "clob-dispatcher",
  "core-config",
+ "core-fill",
  "core-io",
  "core-net",
  "core-parse",
+ "core-ring",
  "core-types",
  "mio 0.8.11",
  "rcgen",
