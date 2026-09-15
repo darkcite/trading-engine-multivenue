@@ -648,3 +648,153 @@ response body rather than about the book.
 **Until phase C has been run green against a funded testnet account,
 E3's exit gate is met in its signature half only and must not be read
 as met in full.**
+
+## The live fill lane (E4, 2026-09-15) — BUILT, not ARMED
+
+**`cli::exec_boot::LIVE_ARM_VENUES` is still empty and the
+compile-time assertion holding it empty is untouched.** E4 did not
+widen it. That edit is the moment this engine can move real money, and
+it is not made by inference — it needs an explicit operator decision,
+recorded here, and it has not been taken.
+
+What is built: the cloid law, the request-budget governor, the
+user-event scanner that turns venue fills into engine fills, and the
+reconciliation parser. What is NOT built, and is required before any
+mainnet order: the user-event WS transport and the dispatcher worker
+that owns it, `HlExchange: OrderDispatch`, and the worker-side
+`origin` split of §6.4.
+
+### LAW E-9 — the cloid encodes the slot
+
+The venue echoes a client id and nothing else we chose, and the
+engine's fill fan-out routes by `strategy_id`. So the slot travels
+inside the cloid:
+
+```
+byte  0    1    2      3..7            8..15
+     0x4D 0x56  slot   reserved 0      client_oid, big-endian
+```
+
+Recovery is a shift and a mask — no table, no allocation, no lock on
+the fill path. It also gives cross-slot uniqueness the moment a second
+slot arms, and makes engine-origin orders recognisable on the venue's
+own books during an incident.
+
+**A cloid without the `MV` marker is NOT ours**, and the obvious
+handling of that is a trap worth recording, because the review pass
+found it in the first draft of this very section.
+
+Stamping `STRATEGY_ID_NONE` and pushing the fill into lane 3 reads
+like containment. It is the opposite: in `strategy_set::on_fill` that
+sentinel is the **fan-out** branch, delivered to *every* enabled
+member. The one value that looks like "belongs to nobody" hands a
+stranger's fill to all seven slots at once.
+
+So the containment is in the type, not in a comment.
+`exec_hyperliquid::userws::to_fill` returns `Routed`, and only
+`Routed::Slot` carries a fill the worker may push into lane 3.
+`Routed::TapeOnly` is a foreign fill: **counted, written to the tape,
+and never admitted to the lane.** Both the unit tests and the fuzz
+target assert that directly, because a fill the engine did not order is
+precisely the evidence reconciliation exists to catch, and both
+attributing it and fanning it out destroy that evidence at the moment
+it appears.
+
+*(The counter and the tape write themselves belong to the worker,
+which E4 does not build. What E4 guarantees is that the worker cannot
+reach the lane with a foreign fill by accident.)*
+
+The reserved bytes must be zero for the same reason: our encoder never
+writes a dirty reserve, so neither did we.
+
+### LAW E-5 — the HTTP response is the ACK, the WS stream is the FILL
+
+The exchange reply to a place carries `resting` / `filled` / `error`;
+it binds `cloid → oid` and surfaces reject reasons. **It never books a
+fill.** Two sources for one fill is double-counting, and the tape is
+the record.
+
+The dedupe key is the venue's own `tid`, and **the ring that holds it
+must outlive the socket**. Hyperliquid answers every fresh
+subscription with a snapshot of recent fills, so a dedupe that reset on
+reconnect would double-book at exactly the moment the engine had just
+lost and regained its view of the account.
+
+**The ring must also be at least as large as the venue's snapshot
+bound** — a correctness requirement, not a tuning knob. That snapshot
+runs to ~2,000 fills; a smaller ring evicts its own earliest rows while
+still reading the same snapshot, and the next reconnect re-admits and
+re-books them. `SNAPSHOT_RING` (4,096) is the production size.
+
+### The scale conversion, and the fill that must not be booked
+
+The venue quotes 1e8; the engine's `Price` is 1e-6 USDC and its `Qty`
+is contracts × 1e6. A fill whose size is non-zero on the wire but
+rounds to zero at the engine's scale is **refused**, not booked — a
+zero-quantity fill is a trade that reports as having happened and
+moved nothing, and it would sit in the tape forever looking like one.
+
+### The request-budget governor
+
+Hyperliquid meters L1 actions **per address**: `10,000 + one per USDC
+of lifetime volume`, and an exhausted address drops to one request
+every ten seconds — below what this engine needs to place, cancel or
+reconcile. That is a cliff, not a rate limit, and it does not clear on
+reconnect.
+
+- **Cancels are exempt.** A halted engine must always be able to
+  flatten; a governor that refused a cancel would strand the very
+  position it was protecting.
+- **Volume is counted from VENUE FILLS ONLY**, never from what the
+  engine believes it traded. The number exists to predict the venue's
+  accounting, and the engine's beliefs are what reconciliation doubts.
+- **A cold boot assumes the worst.** No state file, or one written for
+  a different address, starts at `spent = initial_buffer` — zero
+  headroom until venue fills accumulate. Assuming the full grant on
+  the strength of a missing file is how a budget gets spent twice.
+  `dailyUserVlm` is a DAILY figure and the venue exposes no lifetime
+  query, so the allowance cannot be recomputed at boot — it has to be
+  remembered, durably, which is why this owns a state file at all.
+- **Cold is an absorbing state, and the ramp needs a seeding step.**
+  Headroom rises only with venue fills, and venue fills require
+  submits — so a genuine first boot with no state file can never
+  permit one. That is fail-closed and therefore safe, but it is not
+  self-clearing: E7's first step must seed `exec-budget.state` with the
+  address's real figures, or the first armed boot will refuse every
+  order and look like a bug.
+- **`spent_requests` is `u64` and must be clamped, not cast.** A cast
+  to `i64` wraps negative above `i64::MAX`, turning the subtraction
+  into an addition: a maximally-spent address then reports ~10,000
+  requests of headroom. That was a real defect in the first draft, and
+  the test that covered it called `remaining()` without asserting on
+  the answer.
+
+### Reconciliation is fail-closed, and "empty" is not a safe default
+
+An unparseable balance sheet is an ERROR, never an empty one. The
+failure that motivates this: when the engine also holds nothing, an
+empty-on-junk scanner reports zero drift having read nothing at all —
+loudest exactly when it was working, silent exactly when it was
+broken. A balance list longer than the caller's buffer is an error for
+the same reason: a position nobody saw is a position that reconciles by
+not being there.
+
+**HIP-4 netting: exposure is `|yes − no|`,** because equal legs are
+riskless collateral. The reconciler and the risk gate must compute it
+the same way or they will disagree with the venue — and a disagreement
+between two of our own components, about a number the venue is the
+authority on, is the worst possible place to find a bug. E6 must use
+`exec_hyperliquid::recon::net_exposure_1e8` rather than restate it.
+
+### One shared implementation, not two
+
+`write_atomic` (temp file → `sync_all` → rename) moved from `cli` down
+to `core-io` so the budget's state file uses the same one the VRP and
+xsd state files use. The xsd path did NOT use it until this change:
+`cli::xsd_boot::write_state` was a second copy with **no `sync_all`**,
+live on the path that persists xsd positions. It survived because
+nothing made the two copies share code. That function's entire point is a `sync_all` that
+was once missing, and a second copy is how that bug comes back. Its
+temp name now APPENDS `.tmp` rather than replacing the extension —
+the old form was right for `*.tsv` and silently wrong for anything
+else.

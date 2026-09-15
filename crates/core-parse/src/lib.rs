@@ -150,6 +150,43 @@ pub fn scan_price_1e9(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
     Some((signed, end))
 }
 
+/// Parse a decimal number like `"123.45"` and return it scaled by
+/// `1e8` as `i64`. Same contract as [`scan_price_1e6`].
+///
+/// Added in E4 for Hyperliquid, whose wire scale is 1e8 throughout:
+/// order prices and sizes render at eight decimals, and the balances
+/// reconciliation compares against are quoted the same way. Parsing
+/// them at 1e6 would truncate the last two digits of every size, and
+/// a reconciler that truncates is one that reports drift it invented.
+#[inline]
+pub fn scan_price_1e8(buf: &[u8], pos: Pos) -> Option<(i64, Pos)> {
+    const SCALE: u64 = 100_000_000;
+
+    if pos >= buf.len() {
+        return None;
+    }
+    let (negative, start) = if buf[pos] == b'-' {
+        (true, pos + 1)
+    } else {
+        (false, pos)
+    };
+    let (int_part, mid) = scan_u64(buf, start)?;
+
+    let (frac_scaled, end) = if mid < buf.len() && buf[mid] == b'.' {
+        scan_fractional_n(buf, mid + 1, 8)?
+    } else {
+        (0u64, mid)
+    };
+
+    let mag_i64 = int_part
+        .checked_mul(SCALE)
+        .and_then(|x| x.checked_add(frac_scaled))
+        .and_then(|x| i64::try_from(x).ok())?;
+
+    let signed = if negative { -mag_i64 } else { mag_i64 };
+    Some((signed, end))
+}
+
 /// Scan up to six fractional digits and return their value as an
 /// integer scaled to 1e-6. If fewer than six are present we pad with
 /// zeros; if more, we truncate (ingress data sometimes over-specifies).
@@ -522,6 +559,41 @@ fn skip_number(buf: &[u8], pos: Pos) -> Option<Pos> {
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
+
+#[cfg(test)]
+mod e4_tests {
+    use super::*;
+
+    /// The scale Hyperliquid quotes everything at.
+    #[test]
+    fn scan_price_1e8_matches_the_venue_scale() {
+        assert_eq!(scan_price_1e8(b"0", 0), Some((0, 1)));
+        assert_eq!(scan_price_1e8(b"1", 0), Some((100_000_000, 1)));
+        assert_eq!(scan_price_1e8(b"0.01", 0), Some((1_000_000, 4)));
+        assert_eq!(scan_price_1e8(b"123.45", 0), Some((12_345_000_000, 6)));
+        assert_eq!(scan_price_1e8(b"-2.5", 0), Some((-250_000_000, 4)));
+        // Eight decimals exactly — the wire's full resolution.
+        assert_eq!(scan_price_1e8(b"0.00000001", 0), Some((1, 10)));
+        // A ninth digit truncates rather than rounding: the venue's
+        // own rendering never produces one, and inventing a count of
+        // precision would be worse than dropping it.
+        assert_eq!(scan_price_1e8(b"0.000000019", 0), Some((1, 11)));
+        // Short fractions zero-pad.
+        assert_eq!(scan_price_1e8(b"1.5", 0), Some((150_000_000, 3)));
+        // Refusals, not guesses.
+        assert_eq!(scan_price_1e8(b"", 0), None);
+        assert_eq!(scan_price_1e8(b"x", 0), None);
+        assert_eq!(scan_price_1e8(b"-", 0), None);
+    }
+
+    /// 1e6 would silently drop the last two digits of every HL size.
+    #[test]
+    fn the_1e6_scanner_would_have_truncated_a_venue_size() {
+        let s = b"0.00000001";
+        assert_eq!(scan_price_1e6(s, 0).map(|x| x.0), Some(0));
+        assert_eq!(scan_price_1e8(s, 0).map(|x| x.0), Some(1));
+    }
+}
 
 #[cfg(test)]
 mod tests {

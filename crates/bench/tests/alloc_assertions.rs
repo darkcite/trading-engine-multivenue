@@ -6147,3 +6147,77 @@ fn hl_exchange_encode_and_scan_are_zero_alloc() {
     );
     assert_eq!(bytes, 0, "hl exchange encode/scan bytes should be zero: saw {bytes}");
 }
+
+/// Gate 55 (E4): the live fill lane's per-fill work.
+///
+/// Everything here runs once per venue fill, on the dispatcher worker
+/// thread that also owns the exchange socket. A `String` on this path
+/// would allocate on every print the venue sends, and the moments that
+/// produce the most prints are the moments the engine can least afford
+/// it — a sweeping IoC answers with several.
+///
+/// `scan_user_fills` returning `Span` offsets rather than owned coin
+/// names is what makes that possible, and this is the assertion that
+/// stops a later "just return a String, it's only the coin name".
+#[test]
+fn hl_user_fill_lane_is_zero_alloc() {
+    use exec_hyperliquid::cloid::{decode as decode_cloid, encode as encode_cloid};
+    use exec_hyperliquid::recon::{scan_spot_state, SpotBalance};
+    use exec_hyperliquid::userws::{owner_of, scan_user_fills, to_fill, TidRing, UserFill};
+    use exec_hyperliquid::AddressBudget;
+
+    const FILLS: &[u8] = br#"{"channel":"userFills","data":{"isSnapshot":false,"user":"0xabc","fills":[{"coin":"+3253","px":"0.47","sz":"25","side":"B","time":1757942400000,"oid":77216390,"tid":9001,"fee":"0.0123","cloid":"0x4d560300000000000000000012345678"},{"coin":"+3254","px":"0.53","sz":"25","side":"A","time":1757942400001,"oid":77216391,"tid":9002,"fee":"0.0"}]}}"#;
+    const STATE: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"1234.56","hold":"12.00"},{"coin":"+3253","token":107,"total":"10.00000001","hold":"0.0"}]}"#;
+
+    let mut fills = [UserFill::default(); 8];
+    let mut bal = [SpotBalance::default(); 8];
+    let mut ring: TidRing<{ exec_hyperliquid::userws::SNAPSHOT_RING }> = TidRing::new();
+    let mut budget = AddressBudget::restored([0xAB; 20], 100, 0, 0);
+
+    // Prime every path once.
+    let _ = scan_user_fills(FILLS, &mut fills).unwrap();
+    let _ = scan_spot_state(STATE, &mut bal).unwrap();
+    let _ = decode_cloid(&encode_cloid(3, 1));
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for i in 0..10_000u64 {
+        let (n, _snap) = scan_user_fills(FILLS, &mut fills).unwrap();
+        for f in &fills[..n] {
+            // Attribution, dedupe, conversion, budget — the whole
+            // per-fill cycle.
+            let _ = owner_of(f);
+            let fresh = ring.admit(f.tid ^ i);
+            if let Ok(r) = to_fill(f, 7, i) {
+                let fill = r.fill();
+                acc = acc.wrapping_add(fill.qty.raw()).wrapping_add(fill.strategy_id as i64);
+                acc = acc.wrapping_add(r.for_lane().is_some() as i64);
+            }
+            if fresh {
+                budget.on_venue_fill(f.notional_usdc_1e6());
+            }
+            acc = acc.wrapping_add(f.coin.of(FILLS).len() as i64);
+        }
+        budget.on_action_sent();
+        acc = acc.wrapping_add(budget.remaining());
+
+        let n = scan_spot_state(STATE, &mut bal).unwrap();
+        for b in &bal[..n] {
+            acc = acc.wrapping_add(b.free_1e8());
+            acc = acc.wrapping_add(b.coin.of(STATE).len() as i64);
+        }
+
+        let c = encode_cloid((i & 7) as u8, i);
+        if let exec_hyperliquid::cloid::Owner::Ours { strategy_id, .. } = decode_cloid(&c) {
+            acc = acc.wrapping_add(strategy_id as i64);
+        }
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "hl user-fill lane allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl user-fill lane bytes should be zero: saw {bytes}");
+}

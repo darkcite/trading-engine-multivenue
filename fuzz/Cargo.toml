@@ -310,3 +310,10 @@ path   = "fuzz_targets/hl_request_json.rs"
 test   = false
 doc    = false
 bench  = false
+
+[[bin]]
+name   = "hl_user_events"
+path   = "fuzz_targets/hl_user_events.rs"
+test   = false
+doc    = false
+bench  = false

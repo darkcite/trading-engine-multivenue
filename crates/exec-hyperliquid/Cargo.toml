@@ -17,6 +17,10 @@ core-config   = { workspace = true }
 zeroize       = { workspace = true }
 secp256k1     = { workspace = true }
 core-net      = { workspace = true }
+# E4: the ONE durable state-file write (temp -> sync_all -> rename).
+core-io       = { workspace = true }
+# E4: the canonical decimal scanners (scan_price_1e8, find_field).
+core-parse    = { workspace = true }
 core-types    = { workspace = true }
 mio           = { workspace = true }
 rustls        = { workspace = true }

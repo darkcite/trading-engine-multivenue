@@ -162,7 +162,9 @@ name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
  "core-config",
+ "core-io",
  "core-net",
+ "core-parse",
  "core-types",
  "mio",
  "rustls",

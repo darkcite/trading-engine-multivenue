@@ -55,11 +55,20 @@
 //!
 //! ## What is deliberately NOT here
 //!
-//! * `userws.rs` — the `userFills` lane feeding engine fill lane 3 (E4).
-//! * `budget.rs` — the address request-budget governor (E4).
 //! * `HlExchange: OrderDispatch` — the engine-facing dispatcher (E4).
 //!   It is not built speculatively: it belongs where the engine can
 //!   actually reach it.
+//! * The user-event WS TRANSPORT and the dispatcher worker that owns
+//!   it. [`userws`] is the scanner half only; the socket belongs to
+//!   the worker, which is the single writer of fill lane 3.
+//!
+//! ## What E4 added, and what still cannot reach the engine
+//!
+//! [`cloid`] (LAW E-9), [`budget`], [`userws`] and [`recon`] are
+//! built and tested, and have **no production caller** — nothing
+//! outside their own tests and the bench gate references them.
+//! `cli::exec_boot::LIVE_ARM_VENUES` is still empty and still
+//! compile-time asserted so.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -67,16 +76,20 @@
 
 pub mod action;
 pub mod asset;
+pub mod budget;
+pub mod cloid;
 pub mod config;
 pub mod http;
 pub mod lifecycle;
 pub mod msgpack;
 pub mod nonce;
+pub mod recon;
 pub mod request;
 pub mod response;
 pub mod selftest;
 pub mod sign;
 pub mod smoke;
+pub mod userws;
 pub mod wire;
 
 pub use action::{
@@ -84,6 +97,8 @@ pub use action::{
     CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 pub use asset::{AssetError, AssetTable, ASSET_SLOTS};
+pub use budget::{AddressBudget, BudgetErr, BudgetGauge, INITIAL_BUFFER};
+pub use cloid::{decode as decode_cloid, encode as encode_cloid, Owner, MAGIC as CLOID_MAGIC};
 pub use config::{
     ConfigErr, HlConfig, Scope, ENV_AGENT_KEY, ENV_HOST, ENV_MASTER_ADDR, ENV_SOURCE,
     ENV_T_AGENT_KEY, ENV_T_HOST, ENV_T_MASTER_ADDR, ENV_T_SOURCE, HOST_MAINNET, HOST_TESTNET,
@@ -93,6 +108,7 @@ pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::Nonce;
 pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
+pub use recon::{drift, net_exposure_1e8, scan_spot_state, SpotBalance};
 pub use response::{scan, HlOk, HlResponse, ScanErr, Span};
 pub use selftest::{SelfTestErr, SelfTestReport};
 pub use sign::{connection_id, sign_action, Network, Vault};
@@ -100,4 +116,5 @@ pub use smoke::{
     SmokeErr, SmokeReport, EXIT_CORRUPT_ACCEPTED, EXIT_FAILED, EXIT_LIFECYCLE, EXIT_NOT_VERIFIED,
     EXIT_PASS, EXIT_SELFTEST, EXIT_UNREACHABLE,
 };
+pub use userws::{owner_of, scan_user_fills, to_fill, ConvertErr, TidRing, UserFill};
 pub use wire::{WireNum, WIRE_SCALE};

@@ -368,9 +368,12 @@ pub fn load_xsd_boot(
 /// Write the state file atomically (temp beside it, then rename) — the
 /// `vrp_boot::write_state` law; a reader sees the old file or the new.
 pub fn write_state(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("tsv.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("xsd: {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("xsd: {}: {e}", path.display()))
+    // Was a SECOND copy of the temp-then-rename dance, with no
+    // `sync_all` — the exact defect `core_io::state_file` was written
+    // to fix, still live on the path that persists xsd POSITIONS. It
+    // survived because nothing made the two copies share code; now
+    // they do.
+    crate::state_file::write_atomic(path, text).map_err(|e| format!("xsd: {e}"))
 }
 
 /// Lower-hex of a 32-byte hash.
