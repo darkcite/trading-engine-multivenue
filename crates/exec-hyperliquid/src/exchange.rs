@@ -61,6 +61,32 @@ use crate::userws_conn::UserWs;
 /// Engine 1e6 → venue 1e8.
 const ENGINE_TO_WIRE: i64 = 100;
 
+/// Venue 1e8 → engine 1e6, for a QUANTITY off the balance sheet.
+const WIRE_TO_ENGINE_QTY: i64 = 100;
+
+/// A booked fill's SIGNED contribution to a position, 1e6.
+///
+/// Side comes from the venue row rather than the converted `Fill`, so
+/// the ledger and the lane cannot disagree about direction through two
+/// readings of the same byte.
+#[inline]
+fn signed_qty_1e6(f: &UserFill, fill: &Fill) -> i64 {
+    let q = fill.qty.raw();
+    if f.is_buy {
+        q
+    } else {
+        -q
+    }
+}
+
+/// How often reconciliation asks the venue what it holds.
+///
+/// Once a minute, weight 2 — negligible against the address budget,
+/// and the cadence §6.2 specifies. It is a CEILING on frequency, not a
+/// guarantee of it: the check rides the idle path, so a saturated
+/// worker reconciles later rather than not at all.
+const RECON_EVERY: Duration = Duration::from_secs(60);
+
 /// How often the budget's state file is rewritten.
 const PERSIST_EVERY: Duration = Duration::from_secs(5);
 
@@ -129,6 +155,27 @@ pub struct HlExecCounters {
     /// sale at 1.0 or 0.0) — counted separately only so an operator
     /// watching a position go flat can tell settlement from a trade.
     pub fills_settlement: u64,
+    /// Reconciliation cycles that COMPLETED — the venue answered and
+    /// the answer parsed.
+    pub recon_ok: u64,
+    /// Reconciliation cycles that did not complete: the venue was
+    /// unreachable, answered with something unparseable, or the reply
+    /// overflowed the scratch. **Counted, never retried in a tight
+    /// loop** — the next idle tries again a minute later.
+    pub recon_failed: u64,
+    /// Legs where the venue's balance and this arm's own booked
+    /// quantity DISAGREED at the last reconciliation.
+    ///
+    /// **The single most valuable number this arm produces.** It
+    /// catches a lost fill, a double-counted fill, a wrong asset id and
+    /// a stale position view with one comparison, and it is the only
+    /// check independent of every belief the engine holds — the
+    /// comparison is against what we BOOKED, not what a member thinks.
+    pub recon_drift_legs: u64,
+    /// The largest single-leg disagreement seen, 1e6. Not a running
+    /// total: a drift that appears and is corrected still leaves its
+    /// mark here.
+    pub recon_drift_max_1e6: i64,
     /// Symbols two different strategy slots have both traded. The
     /// binding stops naming an owner, so their settlements are counted
     /// and never booked — guessing between two claimants is the
@@ -193,6 +240,16 @@ pub struct HlExchange<const FILL_N: usize> {
     ws_fail_streak: u32,
     /// Earliest instant a reconnect may be attempted.
     ws_retry_at: Instant,
+    /// When reconciliation last ran.
+    last_recon: Instant,
+    /// The MASTER account reconciliation asks about — the agent signs
+    /// on its behalf and the venue reports balances under it.
+    master_addr: [u8; 20],
+    /// Scratch for one `spotClearinghouseState` answer. Boxed and
+    /// sized for the venue's full reply, which is NOT the number of
+    /// coins we hold — a one-coin account came back with fourteen
+    /// rows.
+    bal: Box<[crate::recon::SpotBalance]>,
     /// Scratch for one frame's fills. **Boxed and sized for the
     /// venue's SNAPSHOT**, not for a steady-state frame — see
     /// [`HlExchange::pump_user_events`].
@@ -234,6 +291,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             ws_fail_streak: 0,
             ws_retry_at: Instant::now(),
             scratch: vec![UserFill::default(); SNAPSHOT_RING].into_boxed_slice(),
+            last_recon: Instant::now(),
+            master_addr: cfg.master_addr,
+            bal: vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES]
+                .into_boxed_slice(),
         })
     }
 
@@ -297,7 +358,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         Self::route_frame(
             payload,
             recv_ns,
-            &self.assets,
+            &mut self.assets,
             &mut self.scratch,
             &mut self.seen,
             &mut self.budget,
@@ -322,9 +383,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// [`UserWs::pump`]'s closure — and the copy that used to buy its
     /// way around that was a heap `Vec` grown per frame, on the one
     /// thread that also signs and submits. Taking the six fields this
-    /// needs (none of which is `ws`, and `assets` only by shared
-    /// reference) lets the scan read the socket's own receive buffer
-    /// in place: zero copy, zero allocation.
+    /// needs (none of which is `ws`) lets the scan read the socket's
+    /// own receive buffer in place: zero copy, zero allocation.
+    ///
+    /// `assets` is `&mut` because a BOOKED fill feeds the reconciler's
+    /// ledger — the table is both what resolves a coin and what
+    /// records what we hold in it.
     ///
     /// Public so the allocation gate can measure THIS function rather
     /// than a lookalike. The audit that produced this shape also found
@@ -340,7 +404,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     pub fn route_frame(
         payload: &[u8],
         recv_ns: NsTs,
-        assets: &AssetTable,
+        assets: &mut AssetTable,
         scratch: &mut [UserFill],
         seen: &mut TidRing<SNAPSHOT_RING>,
         budget: &mut AddressBudget,
@@ -419,7 +483,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // never took, silently, in the tape, forever; a missing
             // fill is caught by reconciliation inside a minute, a
             // misattributed one by nobody.
-            let Some(sym) = assets.sym_of_coin(f.coin.of(payload)) else {
+            // `current` says whether the coin matched the leg live
+            // NOW or the one that just rolled off. A late fill from the
+            // ended instance still books into the lane and the tape —
+            // that is what the one-generation memory is FOR — but it
+            // must not credit the successor's ledger, which `bind` just
+            // zeroed and whose venue balance will never contain it.
+            let Some((sym, current)) = assets.sym_of_coin_gen(f.coin.of(payload)) else {
                 counters.fills_unresolved =
                     counters.fills_unresolved.wrapping_add(1);
                 continue;
@@ -440,6 +510,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                                 counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
                             } else {
                                 counters.fills_booked = counters.fills_booked.wrapping_add(1);
+                                if current {
+                                    assets.book_qty(sym, signed_qty_1e6(&f, &fill));
+                                }
                                 booked += 1;
                             }
                         }
@@ -467,6 +540,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                     } else {
                         counters.fills_booked =
                             counters.fills_booked.wrapping_add(1);
+                        // The RECONCILER's own side of the comparison,
+                        // fed only from fills that actually entered the
+                        // lane — a dropped or refused fill is not a
+                        // position.
+                        if current {
+                            assets.book_qty(sym, signed_qty_1e6(&f, &fill));
+                        }
                         booked += 1;
                     }
                 }
@@ -551,6 +631,106 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 false
             }
         }
+    }
+
+    /// Ask the venue what it actually holds, and compare.
+    ///
+    /// §6.2, and the plan calls it "the single most valuable safety net
+    /// in the plan" for a reason: one comparison catches a lost fill, a
+    /// double-counted fill, a wrong asset id and a stale position view,
+    /// and it is the only check independent of every belief the engine
+    /// holds.
+    ///
+    /// **Independent means what it says.** The comparison is between
+    /// the venue's balance and what THIS ARM BOOKED into the lane —
+    /// not the member's position. A reconciler that asked the member
+    /// would be agreeing with itself.
+    ///
+    /// It does NOT halt. `halt_on_recon_drift_usd_1e6` is an
+    /// arming-path decision and nothing is armed; a halt inferred here
+    /// would be a policy this file invented. Drift is counted and the
+    /// worst magnitude kept.
+    ///
+    /// On the IDLE path, which is where a blocking HTTPS round trip
+    /// belongs. `HlHttp`'s response buffer holds only the last answer,
+    /// so this must consume it before the next submit — both live on
+    /// one thread and this one runs between order batches, so they are
+    /// serialised by construction.
+    fn reconcile(&mut self) {
+        if self.last_recon.elapsed() < RECON_EVERY {
+            return;
+        }
+        self.last_recon = Instant::now();
+
+        let mut req = [0u8; crate::recon::MAX_STATE_REQ];
+        let Ok(n) = crate::recon::spot_state_request(&mut req, &self.master_addr) else {
+            self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
+            return;
+        };
+        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+            self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
+            return;
+        };
+        let body = &self.http.resp()[range];
+        let Ok(rows) = crate::recon::scan_spot_state(body, &mut self.bal) else {
+            self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
+            return;
+        };
+        self.counters.recon_ok = self.counters.recon_ok.wrapping_add(1);
+        let (legs, worst) = Self::compare(&self.assets, &self.bal[..rows], body);
+        self.counters.recon_drift_legs = legs;
+        if worst > self.counters.recon_drift_max_1e6 {
+            self.counters.recon_drift_max_1e6 = worst;
+        }
+    }
+
+    /// The comparison itself, split out of the I/O.
+    ///
+    /// Public so it can be TESTED and MEASURED without a venue —
+    /// `reconcile` needs a socket, and a comparison that has only ever
+    /// run behind one is a claim about source code. Returns
+    /// `(legs that disagreed, worst magnitude 1e6)`.
+    ///
+    /// A leg the venue does not mention reads as ZERO, which is the
+    /// right reading and is itself a drift if we booked something.
+    #[must_use]
+    pub fn compare(
+        assets: &AssetTable,
+        bal: &[crate::recon::SpotBalance],
+        body: &[u8],
+    ) -> (u64, i64) {
+        let mut drift_legs = 0u64;
+        let mut worst = 0i64;
+        assets.for_each_live(|_sym, coin, booked_1e6| {
+            let mut venue_1e6 = 0i64;
+            let mut i = 0usize;
+            while i < bal.len() {
+                if crate::recon::same_leg(bal[i].coin.of(body), coin) {
+                    // TOTAL, not free. `free = total - hold`, and
+                    // `hold` is what a RESTING order has committed —
+                    // on spot, an ask holds the base token. The ledger
+                    // is a pure position from fills and knows nothing
+                    // about encumbrance, so comparing against `free`
+                    // would report drift equal to the resting size for
+                    // as long as a quote is live: continuously, for a
+                    // maker, and in the "we booked more than the venue
+                    // holds" direction — which is the signature of a
+                    // double-counted fill. The sheet is 1e8; the
+                    // engine is 1e6.
+                    venue_1e6 = bal[i].total_1e8 / WIRE_TO_ENGINE_QTY;
+                    break;
+                }
+                i += 1;
+            }
+            let d = crate::recon::drift(booked_1e6, venue_1e6);
+            if d != 0 {
+                drift_legs += 1;
+                if d > worst {
+                    worst = d;
+                }
+            }
+        });
+        (drift_legs, worst)
     }
 
     fn persist_budget(&mut self) {
@@ -836,6 +1016,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     fn on_idle(&mut self) -> bool {
         let worked = self.pump_user_events();
         self.persist_budget();
+        self.reconcile();
         worked
     }
 }
@@ -1146,7 +1327,7 @@ mod tests {
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
             192,
-            "HlExecCounters changed size — 17 u64 in three 64-byte lines"
+            "HlExecCounters changed size — 24 u64 in three 64-byte lines"
         );
     }
 
@@ -1307,6 +1488,161 @@ mod tests {
         assert_eq!(x.route_fills(OTHER), 0, "not ours to book");
         assert_eq!(x.counters().fills_foreign, 1);
         assert_eq!(x.counters().fills_booked, 0);
+    }
+
+    /// **The check that believes nothing**, driven against a real
+    /// `spotClearinghouseState` body.
+    #[test]
+    fn reconciliation_finds_the_drift_it_exists_to_find() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+
+        // The venue's own shape: USDC plus both legs, BALANCE
+        // namespace (`+`), 1e8 quantities.
+        const SHEET: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"},{"coin":"+194180","total":"2.0","hold":"0.0"},{"coin":"+194181","total":"0.0","hold":"0.0"}]}"#;
+        let mut bal = [crate::recon::SpotBalance::default(); 8];
+        let n = crate::recon::scan_spot_state(SHEET, &mut bal).expect("scans");
+
+        // We booked nothing; the venue says we hold 2 of the Yes leg.
+        // That is a LOST FILL, and it is exactly what this check is
+        // for.
+        let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], SHEET);
+        assert_eq!(legs, 1, "one leg disagreed");
+        assert_eq!(worst, 2_000_000, "2.0 at 1e6");
+
+        // Book the fill the venue already knew about, and they agree.
+        const BUY: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(BUY), 1);
+        let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], SHEET);
+        assert_eq!(legs, 0, "the books now agree");
+        assert_eq!(worst, 0);
+
+        // A DOUBLE-COUNTED fill is caught in the other direction.
+        const BUY2: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":2,"tid":2,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(BUY2), 1);
+        let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], SHEET);
+        assert_eq!(legs, 1, "we now believe twice what the venue holds");
+        assert_eq!(worst, 2_000_000);
+    }
+
+    /// **An ENCUMBRANCE is not a position change.** `free = total -
+    /// hold`, and `hold` is what a resting order has committed — on
+    /// spot an ask holds the base token. The ledger is a pure position
+    /// from fills. Comparing against `free` reported drift equal to
+    /// the resting size for as long as a quote was live, which for a
+    /// maker is continuously, and in the direction that looks like a
+    /// double-counted fill.
+    ///
+    /// Every fixture in the first version of this file set
+    /// `"hold":"0.0"`, which is why it passed.
+    #[test]
+    fn a_resting_order_is_not_drift() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        const BUY: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(BUY), 1);
+
+        // The venue holds 2, and 1 of them is committed to a resting
+        // ask. The POSITION is still 2.
+        const SHEET: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"},{"coin":"+194180","total":"2.0","hold":"1.0"}]}"#;
+        let mut bal = [crate::recon::SpotBalance::default(); 8];
+        let n = crate::recon::scan_spot_state(SHEET, &mut bal).expect("scans");
+        assert_eq!(bal[1].hold_1e8, 100_000_000, "the fixture must HAVE a hold");
+        assert_eq!(bal[1].free_1e8(), 100_000_000, "which free would report as 1");
+
+        let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], SHEET);
+        assert_eq!(
+            (legs, worst),
+            (0, 0),
+            "a live quote is not a lost fill — this is what `free` got wrong"
+        );
+    }
+
+    /// A fill from the instance that just rolled off still books into
+    /// the lane and the tape — that is what the one-generation memory
+    /// is for — but it must NOT credit the successor's ledger, which
+    /// `bind` just zeroed and whose venue balance will never contain
+    /// it. Left uncorrected it is permanent drift, and
+    /// `recon_drift_max_1e6` is a high-water mark that never clears.
+    #[test]
+    fn a_late_fill_from_the_old_instance_books_but_does_not_credit_the_successor() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        // The quarter rolls. `#194180` is now the PREVIOUS name.
+        x.on_venue_event(&roll(19_419, 0, false, 4096));
+        assert_eq!(x.assets().booked_qty(4096), Some(0), "a new instance starts flat");
+
+        // A fill for the leg that just ended, arriving late.
+        const LATE: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(LATE), 1, "it must still reach the lane");
+        assert_eq!(x.counters().fills_booked, 1);
+        assert_eq!(
+            x.assets().booked_qty(4096),
+            Some(0),
+            "and must NOT appear in the successor's position"
+        );
+
+        // A fill for the CURRENT leg does credit it.
+        const NOW: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194190","px":"0.68","sz":"3.0","side":"B","time":1757942400000,"oid":2,"tid":2,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(NOW), 1);
+        assert_eq!(x.assets().booked_qty(4096), Some(3_000_000));
+    }
+
+    /// A leg the venue does not mention reads as ZERO — and that is a
+    /// drift, not a pass, if we booked something.
+    #[test]
+    fn a_leg_the_venue_does_not_mention_is_a_drift() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        const BUY: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(BUY), 1);
+
+        // A sheet with no outcome legs at all.
+        const EMPTY: &[u8] = br#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}]}"#;
+        let mut bal = [crate::recon::SpotBalance::default(); 8];
+        let n = crate::recon::scan_spot_state(EMPTY, &mut bal).expect("scans");
+        let (legs, worst) = HlExchange::<64>::compare(x.assets(), &bal[..n], EMPTY);
+        assert_eq!(legs, 1, "silence is not agreement");
+        assert_eq!(worst, 2_000_000);
+    }
+
+    /// The reconciler's own side of the comparison is fed from fills
+    /// that ENTERED THE LANE, and from nothing else — that is what
+    /// makes the check independent of what any member believes.
+    #[test]
+    fn the_ledger_follows_booked_fills_and_resets_on_a_roll() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(19_418, 0, false, 4096));
+        assert_eq!(x.assets().booked_qty(4096), Some(0));
+
+        // A BUY of 2 that books.
+        const BUY: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.68","sz":"2.0","side":"B","time":1757942400000,"oid":1,"tid":1,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(BUY), 1);
+        assert_eq!(x.assets().booked_qty(4096), Some(2_000_000), "+2 at 1e6");
+
+        // A SELL of 1 that books — direction comes from the venue row.
+        const SELL: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.70","sz":"1.0","side":"A","time":1757942400000,"oid":2,"tid":2,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
+        assert_eq!(x.route_fills(SELL), 1);
+        assert_eq!(x.assets().booked_qty(4096), Some(1_000_000), "+2 -1");
+
+        // A fill that does NOT book moves nothing. This one is
+        // foreign: same leg, no cloid, not a settlement.
+        const FOREIGN: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194180","px":"0.70","sz":"9.0","side":"B","time":1757942400000,"oid":3,"tid":3,"dir":"Buy"}]}}"##;
+        assert_eq!(x.route_fills(FOREIGN), 0);
+        assert_eq!(
+            x.assets().booked_qty(4096),
+            Some(1_000_000),
+            "a fill we did not book is not a position we hold"
+        );
+
+        // The quarter rolls: a NEW instance is a NEW position.
+        x.on_venue_event(&roll(19_419, 0, false, 4096));
+        assert_eq!(
+            x.assets().booked_qty(4096),
+            Some(0),
+            "carrying the old quantity forward would have the reconciler \
+             comparing a settled position against a fresh balance forever"
+        );
     }
 
     /// **A submit the venue never took must teach the table nothing.**

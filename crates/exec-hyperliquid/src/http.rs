@@ -54,6 +54,21 @@ pub const REQ_DEADLINE: Duration = Duration::from_secs(5);
 /// different API, not a deployment choice.
 pub const EXCHANGE_PATH: &[u8] = b"/exchange";
 
+/// The `/info` path — READ-ONLY, unsigned, and the only other path
+/// this client may use.
+///
+/// Still not configurable. Two named constants is not the same thing
+/// as a settable path: the caller picks between two APIs this crate
+/// knows, and nothing outside can introduce a third.
+///
+/// **Shares the connection and the response buffer with
+/// [`EXCHANGE_PATH`].** [`HlHttp::resp`] holds only the last answer, so
+/// an `/info` read must be consumed before the next order goes out.
+/// Both callers live on one thread and one is on the idle path, so
+/// they are naturally serialised — but that is a property of the
+/// caller, not of this type.
+pub const INFO_PATH: &[u8] = b"/info";
+
 /// Why an HTTP cycle failed.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -157,9 +172,26 @@ impl HlHttp {
     /// Returns `(http_status, body_range)` into [`Self::resp`]. **The
     /// status is not a verdict** — see the module note.
     pub fn post(&mut self, body: &[u8]) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
+        self.post_to(EXCHANGE_PATH, body)
+    }
+
+    /// One request/response cycle against `path`, which must be
+    /// [`EXCHANGE_PATH`] or [`INFO_PATH`].
+    ///
+    /// # Errors
+    /// As [`Self::post`].
+    pub fn post_to(
+        &mut self,
+        path: &'static [u8],
+        body: &[u8],
+    ) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
+        debug_assert!(
+            path == EXCHANGE_PATH || path == INFO_PATH,
+            "this client knows two APIs and no others"
+        );
         let deadline = Instant::now() + REQ_DEADLINE;
         self.ensure_connected(deadline)?;
-        match self.cycle(body, deadline) {
+        match self.cycle(path, body, deadline) {
             Ok(v) => Ok(v),
             Err(e) => {
                 // Any failure closes the connection. A half-read
@@ -181,10 +213,11 @@ impl HlHttp {
 
     fn cycle(
         &mut self,
+        path: &'static [u8],
         body: &[u8],
         deadline: Instant,
     ) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
-        let header_len = self.write_header(body.len())?;
+        let header_len = self.write_header(path, body.len())?;
         {
             let t = self.transport.as_mut().ok_or(HttpErr::Disconnected)?;
             // Header and body as one logical frame: a partial write
@@ -195,13 +228,13 @@ impl HlHttp {
         self.read_response(deadline)
     }
 
-    fn write_header(&mut self, body_len: usize) -> Result<usize, HttpErr> {
+    fn write_header(&mut self, path: &'static [u8], body_len: usize) -> Result<usize, HttpErr> {
         let mut len_buf = [0u8; 20];
         let len_str = format_u64_into(&mut len_buf, body_len as u64);
         let host = self.host.as_bytes();
         let parts: [&[u8]; 11] = [
             b"POST ",
-            EXCHANGE_PATH,
+            path,
             b" HTTP/1.1\r\n",
             b"Host: ",
             host,
@@ -421,7 +454,7 @@ mod tests {
     fn the_header_is_well_formed_and_bounded() {
         let cfg = TlsTransport::default_client_config();
         let mut h = HlHttp::new("127.0.0.1", 1, cfg).expect("loopback resolves");
-        let n = h.write_header(42).expect("fits");
+        let n = h.write_header(EXCHANGE_PATH, 42).expect("fits");
         let s = String::from_utf8_lossy(&h.req_header[..n]).to_string();
         assert!(s.starts_with("POST /exchange HTTP/1.1\r\n"), "{s}");
         assert!(s.contains("Host: 127.0.0.1\r\n"), "{s}");
@@ -437,7 +470,7 @@ mod tests {
         let mut h = HlHttp::new("127.0.0.1", 1, cfg).expect("loopback");
         // Shrink the buffer to force the overflow path.
         h.req_header = vec![0u8; 8].into_boxed_slice();
-        assert_eq!(h.write_header(1), Err(HttpErr::Overflow));
+        assert_eq!(h.write_header(EXCHANGE_PATH, 1), Err(HttpErr::Overflow));
     }
 
     #[test]

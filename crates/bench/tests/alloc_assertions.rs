@@ -6322,7 +6322,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     let _ = HlExchange::<1024>::route_frame(
         &prime,
         1,
-        &assets,
+        &mut assets,
         &mut scratch,
         &mut seen,
         &mut budget,
@@ -6336,7 +6336,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
         acc = acc.wrapping_add(HlExchange::<1024>::route_frame(
             &frame,
             i,
-            &assets,
+            &mut assets,
             &mut scratch,
             &mut seen,
             &mut budget,
@@ -6347,7 +6347,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
         acc = acc.wrapping_add(HlExchange::<1024>::route_frame(
             br#"{"channel":"orderUpdates","data":[]}"#,
             i,
-            &assets,
+            &mut assets,
             &mut scratch,
             &mut seen,
             &mut budget,
@@ -6479,4 +6479,78 @@ fn hl_exchange_roll_hook_is_zero_alloc() {
         x.counters().rolls_bound
     );
     assert_eq!(x.counters().rolls_refused, 0);
+}
+
+/// E4 gate 59 — the reconciler's COMPARISON allocates nothing.
+///
+/// `reconcile()` itself needs a socket, so what is measured here is the
+/// half that runs after the answer arrives: the scan into a
+/// preallocated sheet and the per-leg walk. Split out as
+/// `HlExchange::compare` precisely so it could be measured — a
+/// comparison that has only ever run behind an HTTPS round trip is a
+/// claim about source code, which is the failure this lane has already
+/// made three times.
+#[test]
+fn hl_exchange_reconcile_compare_is_zero_alloc() {
+    use exec_hyperliquid::asset::AssetTable;
+    use exec_hyperliquid::exchange::HlExchange;
+    use exec_hyperliquid::recon::{scan_spot_state, SpotBalance, MAX_SPOT_BALANCES};
+
+    // The venue's own shape, BALANCE namespace, with the fourteen-row
+    // padding a one-coin account really came back with.
+    let mut sheet = String::from(r#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}"#);
+    for i in 0..8u32 {
+        sheet.push_str(&format!(
+            r#",{{"coin":"+{}","total":"2.0","hold":"0.0"}}"#,
+            194_180 + i
+        ));
+    }
+    sheet.push_str("]}");
+    let sheet = sheet.into_bytes();
+
+    let mut assets = AssetTable::new();
+    for f in 0..4u32 {
+        let outcome = 19_418 + f;
+        for side in 0u8..2 {
+            let mut coin = [0u8; exec_hyperliquid::asset::COIN_MAX];
+            let n = AssetTable::outcome_coin(outcome, side, &mut coin).expect("in range");
+            assets
+                .bind(
+                    4096 + 2 * f + u32::from(side),
+                    AssetTable::asset_id(outcome, side).expect("in range"),
+                    u64::from(outcome),
+                    &coin[..n],
+                )
+                .expect("bind");
+            assets.book_qty(4096 + 2 * f + u32::from(side), 1_000_000);
+        }
+    }
+
+    let mut bal = vec![SpotBalance::default(); MAX_SPOT_BALANCES];
+    // Prime: the first pass through any code is the one allowed to be
+    // cold.
+    let n = scan_spot_state(&sheet, &mut bal).expect("scans");
+    let _ = HlExchange::<64>::compare(&assets, &bal[..n], &sheet);
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for _ in 0..2_000u32 {
+        let n = scan_spot_state(&sheet, &mut bal).expect("scans");
+        let (legs, worst) = HlExchange::<64>::compare(&assets, &bal[..n], &sheet);
+        acc = acc.wrapping_add(legs as i64).wrapping_add(worst);
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "hl reconcile compare allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl reconcile compare bytes should be zero: saw {bytes}");
+    // And the comparison must actually have found the drift, or the
+    // guard measured a walk that returned early.
+    let n = scan_spot_state(&sheet, &mut bal).expect("scans");
+    let (legs, worst) = HlExchange::<64>::compare(&assets, &bal[..n], &sheet);
+    assert_eq!(legs, 8, "every leg disagrees: booked 1.0, venue says 2.0");
+    assert_eq!(worst, 1_000_000);
 }

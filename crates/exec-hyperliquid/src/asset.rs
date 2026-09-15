@@ -178,6 +178,16 @@ impl AssetSlot {
 #[derive(Copy, Clone)]
 pub struct AssetTable {
     slots: [AssetSlot; ASSET_SLOTS],
+    /// What THIS ARM believes it holds in each leg, 1e6, from fills it
+    /// booked and nothing else. Parallel to `slots` rather than a
+    /// field on one, because `AssetSlot` is exactly a cache line and a
+    /// ledger entry would push it over.
+    ///
+    /// The reconciler's own side of the comparison. Deliberately NOT
+    /// the member's position: the whole value of reconciliation is
+    /// that it is independent of every belief the engine holds, and a
+    /// comparison against the member's view would agree with itself.
+    booked_1e6: [i64; ASSET_SLOTS],
     len: usize,
 }
 
@@ -197,6 +207,7 @@ impl AssetTable {
     pub const fn new() -> Self {
         Self {
             slots: [AssetSlot::EMPTY; ASSET_SLOTS],
+            booked_1e6: [0; ASSET_SLOTS],
             len: 0,
         }
     }
@@ -324,14 +335,15 @@ impl AssetTable {
         if coin.len() > COIN_MAX {
             return Err(AssetError::CoinTooLong);
         }
-        for s in self.slots.iter_mut() {
+        // Index loops: the ledger is a parallel array, so the slot's
+        // position is what ties the two together.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..ASSET_SLOTS {
+            let s = &mut self.slots[i];
             if s.live && s.sym == sym {
                 // The roll: the name this slot held becomes the
                 // previous generation, so a fill still in flight from
                 // the instance that just ended can still be resolved.
-                // `owner` is deliberately NOT cleared: the member
-                // trading the Yes leg of one instance is the member
-                // trading the Yes leg of its successor.
                 s.prev_coin = s.coin;
                 s.prev_coin_len = s.coin_len;
                 s.coin = [0; COIN_MAX];
@@ -339,10 +351,20 @@ impl AssetTable {
                 s.coin_len = coin.len() as u8;
                 s.asset = asset;
                 s.instance = instance;
+                // The LEDGER is zeroed: a new instance is a NEW
+                // position, and carrying the old one forward would
+                // have the reconciler comparing a settled quantity
+                // against a fresh venue balance forever. (`owner` is
+                // deliberately NOT cleared — the member trading the
+                // Yes leg of one instance is the member trading the
+                // Yes leg of its successor.)
+                self.booked_1e6[i] = 0;
                 return Ok(());
             }
         }
-        for s in self.slots.iter_mut() {
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..ASSET_SLOTS {
+            let s = &mut self.slots[i];
             if !s.live {
                 *s = AssetSlot::EMPTY;
                 s.sym = sym;
@@ -351,6 +373,7 @@ impl AssetTable {
                 s.coin[..coin.len()].copy_from_slice(coin);
                 s.coin_len = coin.len() as u8;
                 s.live = true;
+                self.booked_1e6[i] = 0;
                 self.len += 1;
                 return Ok(());
             }
@@ -396,6 +419,61 @@ impl AssetTable {
             i += 1;
         }
         true
+    }
+
+    /// Add a booked fill's signed quantity to this arm's own view of
+    /// `sym`, 1e6. Positive for a buy.
+    ///
+    /// Called ONLY when a fill actually enters the lane — a refused or
+    /// dropped fill is not a position. This is the reconciler's side
+    /// of the comparison, and its value depends entirely on it
+    /// recording what we BOOKED rather than what we believe.
+    #[inline]
+    pub fn book_qty(&mut self, sym: u32, signed_qty_1e6: i64) {
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: `i` is bounded by the loop condition and the
+            // array is exactly ASSET_SLOTS long.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.sym == sym {
+                self.booked_1e6[i] = self.booked_1e6[i].saturating_add(signed_qty_1e6);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// This arm's own booked position in `sym`, 1e6.
+    #[inline]
+    #[must_use]
+    pub fn booked_qty(&self, sym: u32) -> Option<i64> {
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: as above.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.sym == sym {
+                return Some(self.booked_1e6[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Walk every live leg as `(sym, coin, booked_1e6)`.
+    ///
+    /// For the reconciler, which has to ask about each leg the venue
+    /// might report. Zero-alloc: the closure sees borrowed bytes.
+    #[inline]
+    pub fn for_each_live<F: FnMut(u32, &[u8], i64)>(&self, mut f: F) {
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: as above.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live {
+                f(s.sym, &s.coin[..usize::from(s.coin_len)], self.booked_1e6[i]);
+            }
+            i += 1;
+        }
     }
 
     /// Record which strategy slot trades `sym`, learned from an order
@@ -497,9 +575,11 @@ impl AssetTable {
 
     /// Release a symbol — a settled instance whose leg is gone.
     pub fn unbind(&mut self, sym: u32) -> bool {
-        for s in self.slots.iter_mut() {
-            if s.live && s.sym == sym {
-                *s = AssetSlot::EMPTY;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..ASSET_SLOTS {
+            if self.slots[i].live && self.slots[i].sym == sym {
+                self.slots[i] = AssetSlot::EMPTY;
+                self.booked_1e6[i] = 0;
                 self.len -= 1;
                 return true;
             }
@@ -547,13 +627,31 @@ impl AssetTable {
     #[inline]
     #[must_use]
     pub fn sym_of_coin(&self, coin: &[u8]) -> Option<u32> {
+        self.sym_of_coin_gen(coin).map(|(sym, _)| sym)
+    }
+
+    /// As [`Self::sym_of_coin`], but says WHICH GENERATION matched:
+    /// `true` for the leg live right now, `false` for the one that
+    /// just rolled off.
+    ///
+    /// The caller needs the difference for exactly one thing — the
+    /// reconciler's ledger. A late fill from the instance that just
+    /// ended still resolves (that is the whole reason the previous
+    /// name is kept) and still belongs in the lane and the tape, but
+    /// it is NOT a position in the successor, whose ledger `bind` just
+    /// zeroed. Crediting it there would leave a phantom quantity the
+    /// venue's sheet never contains — permanent drift, and
+    /// `recon_drift_max_1e6` is a high-water mark that never clears.
+    #[inline]
+    #[must_use]
+    pub fn sym_of_coin_gen(&self, coin: &[u8]) -> Option<(u32, bool)> {
         if coin.is_empty() || coin.len() > COIN_MAX {
             return None;
         }
         let n = coin.len();
 
         // Pass 1 — the CURRENT generation, every slot.
-        let mut hit: Option<u32> = None;
+        let mut hit: Option<(u32, bool)> = None;
         let mut i = 0usize;
         while i < ASSET_SLOTS {
             // SAFETY: `i` is bounded by the loop condition and the
@@ -563,7 +661,7 @@ impl AssetTable {
                 if hit.is_some() {
                     return None;
                 }
-                hit = Some(s.sym);
+                hit = Some((s.sym, true));
             }
             i += 1;
         }
@@ -581,7 +679,7 @@ impl AssetTable {
                 if hit.is_some() {
                     return None;
                 }
-                hit = Some(s.sym);
+                hit = Some((s.sym, false));
             }
             i += 1;
         }

@@ -254,9 +254,93 @@ pub fn drift(ours: i64, venue: i64) -> i64 {
     ours.saturating_sub(venue).saturating_abs()
 }
 
+/// Bytes a `spotClearinghouseState` request needs.
+pub const MAX_STATE_REQ: usize = 96;
+
+/// Render `{"type":"spotClearinghouseState","user":"0x<40 hex>"}`.
+///
+/// Zero-alloc, into a caller-provided buffer. The address is rendered
+/// here rather than carried as a string because the config holds the
+/// 20 raw bytes and a second representation is a second thing to keep
+/// in agreement.
+///
+/// # Errors
+/// The buffer is shorter than [`MAX_STATE_REQ`].
+pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
+    const HEAD: &[u8] = br#"{"type":"spotClearinghouseState","user":"0x"#;
+    const TAIL: &[u8] = br#""}"#;
+    let n = HEAD.len() + 40 + TAIL.len();
+    if out.len() < n {
+        return Err(ScanErr::Malformed);
+    }
+    out[..HEAD.len()].copy_from_slice(HEAD);
+    let mut i = HEAD.len();
+    for b in master {
+        out[i] = HEX[usize::from(b >> 4)];
+        out[i + 1] = HEX[usize::from(b & 0x0F)];
+        i += 2;
+    }
+    out[i..i + TAIL.len()].copy_from_slice(TAIL);
+    Ok(n)
+}
+
+const HEX: [u8; 16] = *b"0123456789abcdef";
+
+/// Does a BALANCE-namespace coin name refer to the same leg as a
+/// FILL-namespace one?
+///
+/// The venue spells one outcome leg two ways — `#<enc>` in `userFills`
+/// and `l2Book`, `+<enc>` in `spotClearinghouseState` — **measured on
+/// one account holding one leg, 2026-09-15**. The `enc` is the leg's
+/// identity and the prefix is the namespace, so two names match when
+/// the prefixes are the two known ones and the digits are equal.
+///
+/// This is the one place the two namespaces are allowed to meet, and
+/// it compares bytes rather than parsing either into a number: a
+/// leading zero or a stray sign would otherwise make two different
+/// names compare equal.
+#[inline]
+#[must_use]
+pub fn same_leg(balance_coin: &[u8], fill_coin: &[u8]) -> bool {
+    matches!(balance_coin.first(), Some(b'+'))
+        && matches!(fill_coin.first(), Some(b'#'))
+        && balance_coin.len() > 1
+        && balance_coin[1..] == fill_coin[1..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_request_names_the_master_in_lower_hex() {
+        let mut buf = [0u8; MAX_STATE_REQ];
+        let n = spot_state_request(&mut buf, &[0xAB; 20]).expect("fits");
+        let s = core::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(
+            s,
+            "{\"type\":\"spotClearinghouseState\",\"user\":\"0xabababababababababababababababababababab\"}"
+        );
+        assert!(n <= MAX_STATE_REQ);
+        // A buffer one byte short is refused, not truncated.
+        let mut small = [0u8; 8];
+        assert!(spot_state_request(&mut small, &[0xAB; 20]).is_err());
+    }
+
+    /// The two namespaces meet in exactly one function, and it
+    /// compares BYTES — parsing either side into a number would make
+    /// `+032530` and `#32530` compare equal.
+    #[test]
+    fn the_two_namespaces_match_on_the_enc_and_nothing_else() {
+        assert!(same_leg(b"+32530", b"#32530"));
+        assert!(!same_leg(b"+32530", b"#32531"), "different leg");
+        assert!(!same_leg(b"+032530", b"#32530"), "a leading zero is a different name");
+        assert!(!same_leg(b"#32530", b"#32530"), "a fill name is not a balance name");
+        assert!(!same_leg(b"+32530", b"+32530"), "and vice versa");
+        assert!(!same_leg(b"USDC", b"#32530"));
+        assert!(!same_leg(b"+", b"#"), "an empty enc matches nothing");
+        assert!(!same_leg(b"", b"#32530"));
+    }
 
     const BODY: &[u8] = br#"{"balances":[
         {"coin":"USDC","token":0,"total":"1234.56","hold":"12.00","entryNtl":"0.0"},

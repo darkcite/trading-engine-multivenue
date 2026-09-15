@@ -724,8 +724,19 @@ What is NOT built, and is required before any mainnet order:
    HTTPS POST would run on the engine tick loop, against §6.2's "the
    engine data path makes no syscalls". Wiring it is an arming-path
    change and belongs to E7.
-3. **The reconciliation timer** (§6.2). The parser and
-   `net_exposure_1e8` exist with no caller.
+3. ~~**The reconciliation timer** (§6.2).~~ **BUILT** — see
+   "Reconciliation" above. What is NOT built is the HALT: drift is
+   counted and never acted on, because `halt_on_recon_drift_usd_1e6`
+   is an arming-path decision — and note the units: the counter is a
+   contract QUANTITY at 1e6, the threshold is named `..._usd_1e6`, so
+   E6 must convert. **USDC is also not compared**, though plan §6.2
+   asks for it, so a wrong-price/right-quantity fill reconciles clean.
+   And the check is blind to everything downstream of `try_push`, so a
+   stale MEMBER view — which plan §6.2's version would have caught — is
+   not covered. `net_exposure_1e8` also still has no
+   caller — the netting rule (equal Yes+No on one outcome is riskless
+   collateral) belongs with the risk gate, which reads positions this
+   arm does not own.
 4. **The tape write for a foreign fill.** LAW E-9 requires one; today
    it is counted (`fills_foreign`) and discarded. A count says a
    stranger's fill happened but not what it was.
@@ -1018,6 +1029,105 @@ Two venue constraints fell out of it:
   zero on the wire, which is the fact `fees.toml`'s 2:5 contradicts
   (see the BIN15 intraday note). Measured, per plan §6.5 — not read
   from a doc.
+
+### Reconciliation — the one check that believes nothing
+
+§6.2 calls this "the single most valuable safety net in the plan", and
+the reason is what it is independent OF. **One claim in that sentence
+does not survive this implementation, and it is named here rather than
+inherited.**
+
+What it catches: a lost fill (the socket never delivered it), a fill
+whose coin did not resolve, a refused conversion, a dedupe
+double-book, a wrong asset id (both legs move), and a ring overflow.
+Everything, that is, between the venue and `try_push`.
+
+What it is BLIND to: everything downstream of `try_push`. A fill this
+arm booked correctly into a lane nobody drained — or one the member
+discards — leaves the ledger and the venue in perfect agreement. That
+is not hypothetical: after `clear_instance()` every late fill lands in
+`unknown_fills` and is dropped, as recorded below, and reconciliation
+does not backstop it.
+
+So the plan's "catches a **stale position view**" is the claim this
+design gives up. Plan §6.2 compares against "the member's position for
+that instance"; this compares against what the arm itself wrote to the
+lane. **That is a deliberate change, not an implementation detail**: a
+reconciler that asked the member would be agreeing with itself, and the
+independence is worth more than the coverage — but the coverage is
+genuinely lost and a future reader must not assume otherwise.
+
+**So the comparison is against what this arm BOOKED**, not against the
+member's position. `AssetTable` carries a per-leg ledger fed only when
+a fill actually enters lane 3 — a dropped, refused or foreign fill is
+not a position — and the roll ZEROES it, because a new instance is a
+new position and carrying the old quantity forward would have the
+reconciler comparing a settled position against a fresh balance
+forever. A reconciler that asked the member would be agreeing with
+itself.
+
+Once a minute on the idle path (weight 2, negligible): `POST /info
+{"type":"spotClearinghouseState"}`, rendered zero-alloc from the
+config's raw 20 address bytes, then every live leg compared against the
+venue's own sheet. A leg the venue does not mention reads as zero —
+which is the right reading, and is itself a drift if we booked
+something.
+
+**USDC is NOT compared.** Plan §6.2 asks for two comparisons — the
+USDC spot balance against the engine's cash view, and each leg against
+its position — and only the second is built. The consequence is
+concrete: a fill at the WRONG PRICE with the right quantity reconciles
+clean, because nothing reads cash. On the pre-arming list.
+
+**The two namespaces meet here and nowhere else.** The sheet spells a
+leg `+<enc>` while the table holds `#<enc>`, so `recon::same_leg`
+compares the bytes AFTER the prefix, having checked both prefixes are
+the two known ones. It does not parse either side into a number: that
+would make `+032530` and `#32530` compare equal, and a leg is not
+identified by the value of its digits.
+
+`/info` shares the connection and the response buffer with
+`/exchange` — `HlHttp::resp` holds only the last answer — so a
+reconciliation must consume its reply before the next order goes out.
+Both callers live on one thread and this one runs between order
+batches, so they are serialised by construction; that is a property of
+the caller and it is written down rather than assumed.
+
+**It does NOT halt.** `halt_on_recon_drift_usd_1e6` is an arming-path
+decision and nothing is armed, so a halt inferred here would be a
+policy this file invented. Drift is counted per leg
+(`recon_drift_legs`) with the worst magnitude kept
+(`recon_drift_max_1e6`), alongside `recon_ok` and `recon_failed` — a
+venue that is unreachable or answers with something unparseable is
+counted and retried at the next cadence, never in a tight loop. Like
+every counter here they reach no gauge until `stats()` is wired
+(pre-arming item 5).
+
+**Units, because the name of the cap it will feed does not match.**
+`recon_drift_max_1e6` is a CONTRACT QUANTITY at 1e6, while E6's
+threshold is `halt_on_recon_drift_usd_1e6`. For a 0..1 binary the
+quantity is a conservative bound on the dollar figure, but they are not
+the same number and **E6 must convert before comparing**.
+
+Two things the comparison had to get right, both of which the first
+version got wrong and both of which now have a test verified to fail
+against the old behaviour:
+
+- **Total, not free.** `free = total - hold`, and `hold` is what a
+  RESTING order has committed — on spot an ask holds the base token.
+  The ledger is a pure position and knows nothing about encumbrance, so
+  comparing against `free` reported drift equal to the resting size for
+  as long as a quote was live: continuously, for a maker, and in the
+  direction that looks like a double-counted fill. It passed because
+  every fixture written for it set `"hold":"0.0"`.
+- **A late fill does not credit its successor.** `sym_of_coin` keeps
+  one generation so a fill from the instance that just ended still
+  resolves — and it must still reach the lane and the tape. But `bind`
+  zeroes the ledger on a roll, so crediting that fill to the successor
+  leaves a phantom quantity the venue's sheet will never contain:
+  permanent drift, in a high-water mark that never clears.
+  `sym_of_coin_gen` reports WHICH generation matched, and the ledger
+  takes only the current one.
 
 ### Settlement arrives as a FILL
 
