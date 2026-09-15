@@ -1,0 +1,221 @@
+# exec.toml — per-strategy execution mode (E1, real-execution plan §3.3)
+#
+# The live file is ~/multivenue/exec.toml and is NOT tracked. This
+# example is, and it ships SAFE: nothing is armed. Copy it, then edit
+# the copy.
+#
+#     cp exec.toml.example ~/multivenue/exec.toml
+#
+# There is deliberately NO default path: `--exec` must name its file
+# explicitly, unlike every other artifact the engine loads. An artifact
+# that auto-loads from a well-known path is one filesystem accident away
+# from arming a slot nobody meant to arm.
+#
+# Note also that scripts/engine-wrapper.sh — which is what launchd
+# actually runs — passes `--paper` and never passes `--exec`. Arming the
+# managed fleet therefore takes a THIRD edit, to that wrapper.
+#
+#
+# WHAT THIS FILE IS FOR
+# ---------------------
+# The engine runs ONE process with several strategy members composed
+# into slots. Until this file existed, execution mode was a single
+# process-wide `--paper` / `--live` flag: it could arm every member or
+# none. This file moves the decision to the member, so one slot can
+# trade real money while the others keep modelling.
+#
+# The routing key is `Order.strategy_id` — the slot byte every order
+# already carries and that the strategy set already stamps. Nothing on
+# the wire changed to make this work.
+#
+#
+# ARMING TAKES TWO SWITCHES THAT MUST AGREE
+# -----------------------------------------
+# This file alone arms nothing. The command line alone arms nothing.
+#
+#     multivenue-engine run --strategy ai+vrp+xsd+bin15 \
+#         --exec ~/multivenue/exec.toml \
+#         --arm-live 3
+#
+# `--arm-live` must name EXACTLY the set of slots this file marks
+# live. Artifact says live and the flag omits the slot -> boot refusal.
+# Flag names a slot the file calls paper -> boot refusal. That is
+# deliberate: a single edit, in either place, can never arm anything.
+#
+# This is also why execution lives in its own file rather than as a
+# key in strategy.conf — a typo in the strategy selector must not be
+# able to reach real money.
+#
+#
+# THE SLOT MAP (must match `strategy-set`)
+# ----------------------------------------
+#   0  latency-arb      4  ai-exec
+#   1  vrp              5  vm
+#   2  xsd              6  icdp
+#   3  bin15            7  (reserved)
+#
+#
+# THE THREE GRAMMAR LAWS
+# ----------------------
+# 1. An optional key must still be a KNOWN key. An unknown key or an
+#    unknown section REFUSES the boot — it is never ignored. (A key the
+#    parser read but had left out of its key list once refused the only
+#    artifact the fitter wrote: BIN15 O4b. Hence the law.)
+# 2. Absent = a STATED default, and the default is always the safe one.
+#    An absent slot is paper. An ABSENT FILE is every slot paper, which
+#    is the engine's behaviour bit for bit before this file existed.
+# 3. Nothing is clamped at boot. Every bound is checked at parse, with
+#    its line number, so a bad number refuses loudly instead of being
+#    quietly reduced and discovered later in a report.
+#
+#
+# [exec] — the policy section. REQUIRED (even if empty).
+[exec]
+
+# enabled: 1 (default) or 0.
+#
+# `enabled = 0` makes the WHOLE file inert — every slot paper — without
+# touching a single slot section. It is the one-line kill switch: flip
+# it, restart, and every member is modelling again with the live
+# configuration still on disk, intact, ready to be re-armed.
+enabled = 1
+
+
+# ---------------------------------------------------------------------
+# [exec.slot.<n>] — one section per slot you want to say something
+# about. Every key below is optional. Omit the section entirely and the
+# slot is paper.
+# ---------------------------------------------------------------------
+
+# Slot 3 — bin15 (Outcome.xyz HIP-4 on Hyperliquid).
+#
+# SHIPPED AS PAPER. Change `mode` to "live" only when the live arm for
+# the venue actually exists in the binary (E2/E3) — until then a live
+# slot REFUSES the boot rather than booting inert, and says so.
+[exec.slot.3]
+
+# mode: "paper" (default) | "live" | "off"
+#
+#   paper — orders go to the paper matcher. What every slot does unless
+#           told otherwise.
+#   live  — orders go to the venue. Needs `venues`, needs --arm-live to
+#           name this slot, and needs a compiled live arm.
+#   off   — the slot may not trade at all; every order is refused and
+#           counted. Not the same as paper: `off` is "stop", paper is
+#           "model it". Use it to silence a member without rebuilding
+#           the strategy mask.
+#
+#           *** USE `off` ONLY ON A FLAT SLOT. ***
+#
+#           `off` refuses EVERY order — entries and EXITS alike. An
+#           Order carries no reduce-only bit today, so the dispatcher
+#           cannot tell an exit from an entry. It also does NOT cancel
+#           orders already resting.
+#
+#           This is a deliberate, documented exception to the standing
+#           law in docs/risk-policy.md that "a cap never blocks an
+#           EXIT": `off` is not a cap, it is an operator stop, and it
+#           is the only control in this file that can strand a
+#           position. Worse, members clear their logical position when
+#           they submit an exit whether or not the submit succeeded, so
+#           flipping a holding slot to `off` silently desynchronises
+#           the member from the book.
+#
+#           To stop a slot that HOLDS a position, set it to `paper`
+#           (or stop the engine) and let the member's own exit law
+#           unwind. The reduce-only exemption lands with E6.
+mode = "paper"
+
+# name: which member the operator believes occupies this slot.
+# REQUIRED whenever `mode = "live"`; checked at boot against the
+# binary's own slot map, and a mismatch REFUSES the boot.
+#
+# Why a name as well as a number: slot numbers get REASSIGNED. Slot 1
+# went ev -> vrp on 2026-09-10; slot 2 went cross-arb -> xsd and slot 3
+# went rule-tree -> bin15 on 2026-09-12. An exec.toml written against
+# one map and reused after the next reassignment would arm a DIFFERENT
+# member, silently. The name turns that into a refusal.
+name = "bin15"
+
+# venues: which venues this slot may reach when live. Required for
+# `mode = "live"` (a live slot with no venue could only ever refuse its
+# own orders, so it is a parse error rather than a puzzle at runtime).
+#
+# Known spellings — the same ones universe.toml uses:
+#   polymarket  binance  okx  deribit  hyperliquid  ai  bybit
+#
+# A LIVE SLOT NEVER FALLS BACK TO PAPER (law E-1). An order naming a
+# venue not listed here is refused and counted, never modelled — a
+# modelled fill wearing live semantics would put a trade that never
+# happened into the P&L.
+venues = ["hyperliquid"]
+
+# --- Risk-gate clamps ------------------------------------------------
+# Defence in depth OVER the member's own caps, and computed from VENUE
+# fills rather than from what the member believes. A member bug that
+# forgets its own cap still cannot spend more than these say.
+#
+# *** IN E1 THESE CAPS ARE A DECLARATION. NOTHING CLAMPS TO THEM. ***
+#
+# They are parsed, bounds-checked and published in the boot tell — and
+# enforced by nothing. The risk gate is E6. Until it ships, the only
+# limits in force on a slot are the MEMBER's own, from its own artifact
+# (bin15.toml's cap_instance_usd_1e6 / cap_day_usd_1e6 carry the same
+# numbers and ARE enforced by the member).
+#
+# The boot tell says so out loud — it prints `caps-DECLARED-NOT-ENFORCED`
+# and a WARNING line — precisely so that nobody reads a cap here and
+# believes a clamp exists. When E6 lands the token becomes
+# `caps-ENFORCED` and the warning goes away.
+#
+# These caps are PER SLOT, not global. `max_open_orders = 64` here is
+# not risk-policy.md's global "max total open orders 64": eight slots at
+# 64 is 512. The global line still binds.
+#
+# `0` means UNSET, and unset must NEVER come to mean "unlimited" — the
+# same ruling risk-policy.md already made for the Deribit coin caps. A
+# live slot must state max_order_usd_1e6 and cap_instance_usd_1e6
+# non-zero or the boot is refused.
+#
+# They are written here now so that arming later changes one word, not a
+# whole file.
+
+# Largest single order, USD x1e6. 100000000 = $100.
+# REQUIRED (non-zero) for a live slot: `0` means UNSET here and unset
+# must never come to mean "unlimited" — the same ruling risk-policy.md
+# already made for the Deribit coin caps.
+max_order_usd_1e6 = 100000000
+
+# Most orders this slot may have resting at once.
+max_open_orders = 64
+
+# Day turnover ceiling, USD x1e6. 30000000000 = $30,000.
+# Ruling O-E4: the caps stay EXACTLY as paper for the live ramp. The
+# ramp throttles on which arms are enabled, not by shrinking caps.
+# Note a day cap is a TURNOVER limit, not a funding requirement — it is
+# not how much has to be on deposit.
+cap_day_usd_1e6 = 30000000000
+
+# Per-instance ceiling, USD x1e6. 1000000000 = $1,000.
+# REQUIRED (non-zero) for a live slot, for the same reason as above.
+cap_instance_usd_1e6 = 1000000000
+
+# Hyperliquid's request budget is address-based: 10,000 + one request
+# per USDC of lifetime volume, and an exhausted address falls to ONE
+# request every 10 seconds. Stop placing when the remaining budget
+# drops below this, so a bad fill rate cannot brick the address.
+# Consumed by the budget governor in E4.
+request_budget_floor = 2000
+
+# Consecutive venue rejections that trip a STICKY halt (E6).
+halt_on_reject_streak = 5
+
+# Divergence between our position and the venue's, USD x1e6, that trips
+# a sticky halt (E6). 5000000 = $5.
+halt_on_recon_drift_usd_1e6 = 5000000
+
+
+# Slot 1 — vrp. Explicit is better than default: writing it down means
+# a reader of this file knows the slot was considered, not forgotten.
+[exec.slot.1]
+mode = "paper"

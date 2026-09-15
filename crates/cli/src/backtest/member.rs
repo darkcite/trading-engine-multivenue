@@ -642,7 +642,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
                     boot_hour,
                 )
-                .map_err(HarnessError::Usage)?
+                // The harness replays a FIXED capture, so an empty
+                // chain there is a property of the window the caller
+                // chose, not a transient venue condition to route
+                // around: both causes are a usage error here.
+                .map_err(|e| HarnessError::Usage(e.to_string()))?
                 .ok_or_else(|| {
                     HarnessError::Usage("xsd: table absent — nothing to drive".to_owned())
                 })?;
@@ -740,7 +744,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
                     &chain,
                 )
-                .map_err(HarnessError::Usage)?
+                // The harness replays a FIXED capture, so an empty
+                // chain there is a property of the window the caller
+                // chose, not a transient venue condition to route
+                // around: both causes are a usage error here.
+                .map_err(|e| HarnessError::Usage(e.to_string()))?
                 .ok_or_else(|| {
                     HarnessError::Usage("vrp: artifact absent — nothing to drive".to_owned())
                 })?;
@@ -903,7 +911,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     &rolling,
                     &rolling_syms,
                 )
-                .map_err(HarnessError::Usage)?
+                // The harness replays a FIXED capture, so an empty
+                // chain there is a property of the window the caller
+                // chose, not a transient venue condition to route
+                // around: both causes are a usage error here.
+                .map_err(|e| HarnessError::Usage(e.to_string()))?
                 .ok_or_else(|| {
                     HarnessError::Usage("bin15: artifact absent — nothing to drive".to_owned())
                 })?;

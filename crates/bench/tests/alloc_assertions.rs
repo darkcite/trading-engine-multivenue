@@ -5724,3 +5724,165 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
     );
     assert_eq!(bytes, 0, "strategy-bin15 hot bytes should be zero: saw {bytes}");
 }
+
+/// E1 gate 53 — the execution router's steady state allocates nothing.
+///
+/// `RoutedDispatcher::submit` is on the engine's hot path: every order
+/// every member emits passes through it. It must cost one masked byte
+/// load from the route table, one branch and one delegated call — and
+/// zero bytes.
+///
+/// The loop below exercises all four routing outcomes in the same
+/// measurement window, because the refusal paths are the ones that
+/// could plausibly allocate (they build no message today, and this is
+/// what keeps it that way):
+///
+/// * a PAPER slot -> the paper matcher;
+/// * a LIVE slot on its own venue -> the live arm;
+/// * a LIVE slot on a venue it has no route to -> refused
+///   (`NoLiveRoute`, LAW E-1 — never a paper fallback);
+/// * an OFF slot -> refused (`SlotDisabled`);
+/// * plus `observe_tick`, `try_next_fill`, `matcher_counters` and
+///   `open_paper_orders`, which every 5 s metrics tick calls.
+///
+/// `stats()` is deliberately OUTSIDE the guard: `DispatchStats::merged`
+/// is a cold-path field-wise sum called once per 5 s tick, not per
+/// order, and holding it to the hot-path budget would be measuring the
+/// wrong thing.
+#[test]
+fn routed_dispatch_steady_state() {
+    use clob_dispatcher::{DispatchError, OrderDispatch, PaperDispatcher};
+    use core_types::{Price, Qty, Side, Tick, VenueId, STRATEGY_ID_NONE};
+    use exec_router::{ExecMode, ExecRoute, NullLiveDispatcher, RoutedDispatcher};
+
+    const SYM: core_types::SymbolId = 42;
+
+    // Boot-time construction — outside the measurement window, as the
+    // engine's own boot is.
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            3,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            100_000_000,
+            64,
+        )
+        .expect("boot: slot 3 live");
+    route
+        .set_slot(6, ExecMode::Off, &[], 0, 0)
+        .expect("boot: slot 6 off");
+
+    let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), NullLiveDispatcher::new());
+
+    // Warm the paper matcher's open table so `observe_tick` has real
+    // work to do inside the guard rather than walking an empty list.
+    let mut warm = 0u64;
+    while warm < 16 {
+        let mut o = core_types::Order::new(
+            1_000 + warm,
+            VenueId::Polymarket,
+            SYM,
+            Side::Bid,
+            0,
+            Price::from_raw(400_000),
+            Qty::from_raw(1_000_000),
+            warm,
+        );
+        o.strategy_id = 0;
+        let _ = d.submit(&o);
+        warm += 1;
+    }
+
+    let g = AllocGuard::new();
+
+    let mut paper = 0u64;
+    let mut live = 0u64;
+    let mut no_route = 0u64;
+    let mut off = 0u64;
+    let mut fills = 0u64;
+    let mut open_acc = 0u64;
+
+    let mut i = 0u64;
+    while i < 10_000 {
+        // Cycle the four outcomes deterministically.
+        let (slot, venue) = match i & 3 {
+            0 => (0u8, VenueId::Polymarket),          // paper
+            1 => (3u8, VenueId::Hyperliquid),         // live -> null arm
+            2 => (3u8, VenueId::Binance),             // live, no route
+            _ => (6u8, VenueId::Hyperliquid),         // off
+        };
+        let mut o = core_types::Order::new(
+            2_000 + i,
+            venue,
+            SYM,
+            if i & 1 == 0 { Side::Bid } else { Side::Ask },
+            0,
+            Price::from_raw(400_000 + (i as i64 % 1_000)),
+            Qty::from_raw(1_000_000),
+            1_000 + i,
+        );
+        o.strategy_id = slot;
+        match d.submit(&o) {
+            Ok(()) => paper += 1,
+            Err(DispatchError::NoLiveRoute) => {
+                // Both the "wrong venue" case and the null live arm
+                // land here in E1 — the arm refuses everything.
+                if venue == VenueId::Binance {
+                    no_route += 1;
+                } else {
+                    live += 1;
+                }
+            }
+            Err(DispatchError::SlotDisabled) => off += 1,
+            Err(e) => panic!("unexpected dispatch error {e:?}"),
+        }
+
+        // An un-stamped order every 16th pass: the fail-closed path.
+        if i % 16 == 0 {
+            let mut u = o;
+            u.strategy_id = STRATEGY_ID_NONE;
+            let _ = d.submit(&u);
+        }
+
+        // The tick the paper matcher judges its open table against.
+        let t = Tick::new(
+            2_000 + i,
+            VenueId::Polymarket,
+            SYM,
+            i as u32,
+            Price::from_raw(399_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(401_000),
+            Qty::from_raw(1_000_000),
+        );
+        d.observe_tick(&t, 2_000 + i);
+        while let Some(f) = d.try_next_fill() {
+            fills += 1;
+            std::hint::black_box(f.order_id);
+        }
+        open_acc = open_acc.wrapping_add(d.open_paper_orders() as u64);
+        std::hint::black_box(d.matcher_counters().intake);
+        std::hint::black_box(d.exec_counters().live_submits);
+        i += 1;
+    }
+    std::hint::black_box((paper, live, no_route, off, fills, open_acc));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+
+    // Every routing outcome must actually have been exercised, or the
+    // zero below would be measuring a path that never ran.
+    assert!(paper > 0, "the paper arm must have taken orders");
+    assert!(live > 0, "the live arm must have been reached");
+    assert!(no_route > 0, "LAW E-1's refusal path must have fired");
+    assert!(off > 0, "the off-slot refusal must have fired");
+
+    assert_eq!(
+        allocs, 0,
+        "RoutedDispatcher steady state allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "RoutedDispatcher hot bytes should be zero: saw {bytes}"
+    );
+}

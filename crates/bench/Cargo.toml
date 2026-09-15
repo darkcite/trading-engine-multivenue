@@ -47,6 +47,8 @@ strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-icdp        = { workspace = true }
 strategy-cross-arb   = { workspace = true }
+# E1 gate 53: the execution router's hot path.
+exec-router          = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

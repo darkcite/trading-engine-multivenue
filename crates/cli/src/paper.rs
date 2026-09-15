@@ -2996,7 +2996,14 @@ fn format_u64_into(buf: &mut [u8; 32], mut v: u64) -> &[u8] {
 impl Observability {
     /// Build the registry + the `/state` snapshot cell (both `None`
     /// unless `enable_metrics`). Boot-only; allocates once.
-    pub fn build(enable_metrics: bool) -> Result<Self, &'static str> {
+    /// `exec_modes` — E1: the per-slot `ExecMode` bytes when an
+    /// `exec.toml` is in force, `None` when there is no `--exec`.
+    /// `None` registers NOTHING, which is what keeps `/metrics`
+    /// byte-identical to a pre-E1 binary's on an unconfigured boot.
+    pub fn build(
+        enable_metrics: bool,
+        exec_modes: Option<[u8; clob_dispatcher::EXEC_COUNTER_SLOTS]>,
+    ) -> Result<Self, &'static str> {
         let mut out = Observability::default();
         if enable_metrics {
             let mut reg = core_metrics::MetricsRegistry::new();
@@ -3202,6 +3209,13 @@ impl Observability {
             let bin15 = register_bin15_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
+            // E1: only when a router is actually in force. A boot with
+            // no `--exec` reports `configured == 0` here and registers
+            // NOTHING, which is what keeps `/metrics` byte-identical.
+            let exec = match exec_modes.as_ref() {
+                None => None,
+                Some(m) => Some(register_exec_metrics(&mut reg, m)?),
+            };
             let fills_capture = {
                 let io_errors = reg
                     .register_gauge("engine_fills_capture_io_errors")
@@ -3287,6 +3301,7 @@ impl Observability {
                 bin15,
                 regime,
                 paper_matcher,
+                exec,
             });
         }
         if enable_metrics {
@@ -3634,6 +3649,66 @@ pub struct EngineCounters {
     /// X1: the `engine_paper_matcher_*` family + the set's
     /// `engine_set_fills_unrouted_total`.
     pub paper_matcher: PaperMatcherMetricIds,
+    /// E1: the `engine_exec_*` family. `None` on a boot with NO
+    /// `--exec`, and that is load-bearing: nothing is registered, so
+    /// `/metrics` is byte-identical to a pre-E1 binary's. This is the
+    /// metric half of the E1 acceptance gate.
+    pub exec: Option<ExecMetricIds>,
+}
+
+/// E1: the execution router's metric family. Boot-only.
+///
+/// `core-metrics` registers FIXED names — there is no label mechanism
+/// (`MAX_COUNTERS = 256`, `MAX_GAUGES = 384`, `NAME_MAX = 63`), so the
+/// per-slot names are generated as whole strings at boot, one
+/// `register_counter` call each, and never formatted again. The
+/// per-slot family is registered for LIVE slots ONLY: an all-paper
+/// artifact costs five names, not forty.
+#[derive(Copy, Clone, Debug)]
+pub struct ExecMetricIds {
+    /// `engine_exec_configured` (gauge) — 1 while a route table is in
+    /// force. The one-glance "is this engine routing?" answer.
+    pub configured: GaugeId,
+    /// `engine_exec_live_submits_total`
+    pub live_submits: core_metrics::CounterId,
+    /// `engine_exec_paper_submits_total`
+    pub paper_submits: core_metrics::CounterId,
+    /// `engine_exec_refused_off_total`
+    pub refused_off: core_metrics::CounterId,
+    /// `engine_exec_refused_no_route_total` — **the LAW E-1 counter.**
+    /// A live slot's order that named a venue with no route. Must stay
+    /// 0; anything else is a routing bug, and the order was refused
+    /// rather than quietly modelled.
+    pub refused_no_route: core_metrics::CounterId,
+    /// Index = slot. `Some` only for LIVE slots — a paper or off slot
+    /// costs no metric names at all (plan §3.5).
+    ///
+    /// Fixed array rather than a `Vec` so [`MetricIds`] stays `Copy`,
+    /// which the engine loop relies on.
+    pub slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS],
+}
+
+/// E1: one live slot's metric handles.
+///
+/// Names: `engine_exec_slot<N>_mode`,
+/// `engine_exec_slot<N>_live_submits_total`,
+/// `engine_exec_slot<N>_refused_total`.
+///
+/// DEFERRED to the phase that can actually move them, rather than
+/// registered here reading a permanent zero: `_live_acks_total` /
+/// `_rej_venue_total` (E3, the HTTP arm), `_rej_gate_total` /
+/// `_halted` / `_recon_drift_usd_1e6` (E6, the risk gate),
+/// `engine_exec_hl_budget_remaining` / `engine_exec_hl_nonce_last`
+/// (E4, the governor). Registering a name that can only read zero
+/// spends scarce registry room and tells an operator nothing.
+#[derive(Copy, Clone, Debug)]
+pub struct ExecSlotMetricIds {
+    /// `engine_exec_slot<N>_mode` — 0 paper / 1 live / 2 off.
+    pub mode: GaugeId,
+    /// `engine_exec_slot<N>_live_submits_total`
+    pub live_submits: core_metrics::CounterId,
+    /// `engine_exec_slot<N>_refused_total`
+    pub refused: core_metrics::CounterId,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -4221,6 +4296,86 @@ fn register_paper_matcher_metrics(
             .register_gauge("engine_paper_matcher_open_orders")
             .map_err(|_| "register paper matcher gauge")?,
     })
+}
+
+/// E1: register the `engine_exec_*` family. Boot-only, and only when a
+/// route table is in force.
+///
+/// Per-slot names are built here as fixed strings — `core-metrics` has
+/// no label mechanism, so `engine_exec_slot3_mode` is a whole name
+/// registered once, not `engine_exec_slot_mode{slot="3"}`. Only LIVE
+/// slots get a per-slot family (plan §3.5): today that is at most one.
+fn register_exec_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+    modes: &[u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+) -> Result<ExecMetricIds, &'static str> {
+    let configured = reg
+        .register_gauge("engine_exec_configured")
+        .map_err(|_| "register engine_exec_configured")?;
+    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
+        reg.register_counter(name).map_err(|_| "register exec counter")
+    };
+    let live_submits = one("engine_exec_live_submits_total")?;
+    let paper_submits = one("engine_exec_paper_submits_total")?;
+    let refused_off = one("engine_exec_refused_off_total")?;
+    let refused_no_route = one("engine_exec_refused_no_route_total")?;
+
+    let mut slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS] =
+        [None; clob_dispatcher::EXEC_COUNTER_SLOTS];
+    for (slot, mode) in modes.iter().enumerate() {
+        // 1 == ExecMode::Live. Paper and Off slots cost no names.
+        if *mode != 1 {
+            continue;
+        }
+        slots[slot] = Some(ExecSlotMetricIds {
+            mode: reg
+                .register_gauge(&format!("engine_exec_slot{slot}_mode"))
+                .map_err(|_| "register exec slot gauge")?,
+            live_submits: reg
+                .register_counter(&format!("engine_exec_slot{slot}_live_submits_total"))
+                .map_err(|_| "register exec slot counter")?,
+            refused: reg
+                .register_counter(&format!("engine_exec_slot{slot}_refused_total"))
+                .map_err(|_| "register exec slot counter")?,
+        });
+    }
+    Ok(ExecMetricIds {
+        configured,
+        live_submits,
+        paper_submits,
+        refused_off,
+        refused_no_route,
+        slots,
+    })
+}
+
+/// E1: mirror the router's counters as monotonic deltas, same shape and
+/// cadence as every other family here.
+fn mirror_exec_metrics(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &ExecMetricIds,
+    cur: clob_dispatcher::ExecCounters,
+    last: &mut clob_dispatcher::ExecCounters,
+) {
+    reg.gauge(ids.configured).set(i64::from(cur.configured));
+    reg.counter(ids.live_submits)
+        .inc(cur.live_submits.saturating_sub(last.live_submits));
+    reg.counter(ids.paper_submits)
+        .inc(cur.paper_submits.saturating_sub(last.paper_submits));
+    reg.counter(ids.refused_off)
+        .inc(cur.refused_off.saturating_sub(last.refused_off));
+    reg.counter(ids.refused_no_route)
+        .inc(cur.refused_no_route.saturating_sub(last.refused_no_route));
+    for (s, slot) in ids.slots.iter().enumerate() {
+        let Some(slot) = slot else { continue };
+        reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
+        reg.counter(slot.live_submits).inc(
+            cur.live_submits_by_slot[s].saturating_sub(last.live_submits_by_slot[s]),
+        );
+        reg.counter(slot.refused)
+            .inc(cur.refused_by_slot[s].saturating_sub(last.refused_by_slot[s]));
+    }
+    *last = cur;
 }
 
 /// X1: mirror the matcher's counters as monotonic deltas.
@@ -5776,6 +5931,8 @@ where
     // X1: the paper matcher's delta snapshot.
     let mut matcher_last = clob_dispatcher::MatcherCounters::default();
     let mut fills_unrouted_last: u64 = 0;
+    // E1: the router's previous snapshot, for the monotonic deltas.
+    let mut exec_last = clob_dispatcher::ExecCounters::default();
     // F18/F21: ONE call site for every member's persisted state, so a
     // third member cannot be added to one of the two places and not the
     // other. A macro rather than a closure because it borrows `eng`
@@ -5923,6 +6080,17 @@ where
                     &mut fills_unrouted_last,
                 );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
+                // E1: the router's own counters. Absent family = no
+                // `--exec` = nothing to mirror, and no branch cost that
+                // a pre-E1 boot did not already pay.
+                if let Some(ex) = ids.exec.as_ref() {
+                    mirror_exec_metrics(
+                        reg,
+                        ex,
+                        clob_dispatcher::OrderDispatch::exec_counters(eng.dispatcher()),
+                        &mut exec_last,
+                    );
+                }
 
                 // Per-ingress connection state — real per-thread
                 // status slots (D7 fix). Gauge value = IngressState:
@@ -6157,9 +6325,94 @@ where
 // Shutdown helpers
 // ---------------------------------------------------------------
 
+/// How long the process will wait for its threads to join before it
+/// kills itself.
+///
+/// Generous — a healthy ingress thread notices `SHUTDOWN` within one
+/// mio cycle, so this only ever elapses when a thread is genuinely
+/// stuck. It is a backstop, not a timeout anybody should hit.
+pub const JOIN_GRACE: Duration = Duration::from_secs(20);
+
+/// Exit code when [`JOIN_GRACE`] elapses and the process force-exits.
+/// Distinct from the ordinary boot-abort `1` so an operator reading
+/// `launchctl list` can tell "refused to boot" from "would not die".
+pub const EXIT_JOIN_TIMEOUT: i32 = 75;
+
 /// Join `handles` in reverse boot order. Errors are logged, never
 /// propagated — we're already shutting down.
+///
+/// ## Why this signals shutdown first
+///
+/// Every ingress run-loop polls [`SHUTDOWN`] and returns when it is
+/// set. The NORMAL shutdown path sets it (SIGINT, or the engine loop
+/// returning) before it gets here — but the ~30 **boot-abort** sites do
+/// not: they hit a refusal, call this, and return an exit code. Joining
+/// threads that were never asked to stop blocks forever.
+///
+/// Observed live 2026-09-15: a Deribit outage left the options chain
+/// empty, the VRP member correctly refused the boot, and the process
+/// then sat at 15–21 % CPU for **seven minutes** wedged right here.
+/// Because it never exited, launchd KeepAlive could not relaunch it, so
+/// the engine stayed down long after the venue had recovered — a
+/// transient outage turned into an engine that needed a human. Worse,
+/// `/state` was already serving (the metrics thread starts before the
+/// engine loop), so a monitor saw a live-looking engine reporting a
+/// zeroed boot block.
+///
+/// Signalling here rather than at each of the 30 call sites is
+/// deliberate: it is one place that cannot be forgotten by the 31st.
+/// It is idempotent, and on the normal path the flag is already set.
+///
+/// ## Why there is a watchdog
+///
+/// A thread that ignores the flag — blocked in a syscall with no
+/// timeout — would still hang the join. **The process MUST reach exit**,
+/// because a supervisor can only restart a process that dies. After
+/// [`JOIN_GRACE`] the watchdog force-exits with [`EXIT_JOIN_TIMEOUT`].
+/// Fail-fast beats a graceful wait that never ends.
 pub fn join_reverse(handles: Vec<JoinHandle<()>>) {
+    // Nothing spawned, nothing to stop, and no reason to touch a
+    // process-wide flag: return before either step below.
+    if handles.is_empty() {
+        return;
+    }
+
+    // (1) Tell the threads to stop. On a boot abort nothing else has.
+    signal_shutdown();
+
+    // (2) The backstop.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done_w = done.clone();
+        let n = handles.len();
+        // Detached on purpose: it must outlive nothing and be joined by
+        // nobody, or it becomes the hang it exists to prevent.
+        let _ = thread::Builder::new()
+            .name("join-watchdog".into())
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + JOIN_GRACE;
+                while std::time::Instant::now() < deadline {
+                    if done_w.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if !done_w.load(Ordering::Acquire) {
+                    // `eprintln!` rather than `tracing`: the subscriber
+                    // may itself be waiting on a thread we are about to
+                    // kill, and this line is the only evidence of why
+                    // the process died.
+                    eprintln!(
+                        "join-watchdog: {n} thread(s) did not stop within {}s after SHUTDOWN \
+                         — force-exiting with {EXIT_JOIN_TIMEOUT} so the supervisor can \
+                         relaunch. This is a BUG: some thread is not polling the flag.",
+                        JOIN_GRACE.as_secs()
+                    );
+                    std::process::exit(EXIT_JOIN_TIMEOUT);
+                }
+            });
+    }
+
     for h in handles.into_iter().rev() {
         let name = h.thread().name().unwrap_or("<unnamed>").to_string();
         if let Err(e) = h.join() {
@@ -6168,6 +6421,8 @@ pub fn join_reverse(handles: Vec<JoinHandle<()>>) {
             tracing::info!(thread = %name, "thread joined");
         }
     }
+    // (3) Disarm.
+    done.store(true, Ordering::Release);
 }
 
 /// Force shutdown — used by tests and the second-press SIGINT path.
@@ -8211,6 +8466,87 @@ mod tests {
         SHUTDOWN.store(false, Ordering::Release);
     }
 
+    /// The 2026-09-15 hang, as a test.
+    ///
+    /// A boot abort joins ingress threads that nobody asked to stop.
+    /// Every real ingress loop polls `SHUTDOWN`, so this spawns a
+    /// thread with exactly that shape: it spins until the flag is set.
+    /// Before the fix, `join_reverse` blocked on it forever and the
+    /// process never reached exit — which is why launchd could not
+    /// relaunch the engine after Deribit recovered.
+    ///
+    /// **TERMINATION IS THE ASSERTION.** The threads below exit only
+    /// when `SHUTDOWN` is set, and nothing but `join_reverse` sets it —
+    /// so if this test returns at all, the fix works. A regression
+    /// HANGS rather than fails, which the runner reports as a timeout:
+    /// the honest signal for "the process would not die".
+    ///
+    /// Deliberately NOT asserted: the value of `SHUTDOWN` afterwards.
+    /// It is a process-wide static that several tests in this binary
+    /// flip, so reading it back would make this test order-dependent
+    /// and tell us nothing the threads' own exit has not already
+    /// proved.
+    #[test]
+    fn join_reverse_stops_threads_that_were_never_told_to_stop() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Establish the precondition this test needs, whatever any
+        // sibling left behind: nobody has signalled shutdown yet.
+        crate::SHUTDOWN.store(false, Ordering::Release);
+
+        static SPINS: AtomicUsize = AtomicUsize::new(0);
+        SPINS.store(0, Ordering::Release);
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("fake-ingress-{i}"))
+                    .spawn(|| {
+                        // An ingress run-loop in miniature.
+                        while !crate::shutdown_requested() {
+                            SPINS.fetch_add(1, Ordering::Relaxed);
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        // Let them actually get going, so the join has something to
+        // wait for rather than racing a thread that never started.
+        while SPINS.load(Ordering::Acquire) < 3 {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Nobody has signalled shutdown. Before the fix this never
+        // returned.
+        // Nobody has signalled shutdown. Before the fix, this call
+        // never returned.
+        join_reverse(handles);
+
+        // Reaching this line is the whole proof. The count is checked
+        // only to be sure the threads really ran, so that a future
+        // edit cannot make this pass by spawning nothing.
+        assert!(
+            SPINS.load(Ordering::Acquire) >= 3,
+            "the fake ingress threads never ran, so nothing was proved"
+        );
+    }
+
+    /// The empty case must NOT touch the process-wide flag — a boot
+    /// that spawned nothing has nothing to stop, and mutating a global
+    /// on the way past would be a surprise.
+    #[test]
+    fn join_reverse_with_no_handles_leaves_the_shutdown_flag_alone() {
+        crate::SHUTDOWN.store(false, Ordering::Release);
+        join_reverse(Vec::new());
+        assert!(
+            !crate::shutdown_requested(),
+            "a boot that spawned nothing has nothing to stop"
+        );
+        crate::SHUTDOWN.store(false, Ordering::Release);
+    }
+
     #[test]
     fn join_reverse_handles_empty_vec() {
         join_reverse(Vec::new());
@@ -8931,7 +9267,7 @@ mod tests {
     /// `table_push_fail`), and the registry encodes them.
     #[test]
     fn observability_build_registers_section9_rows() {
-        let obs = Observability::build(true).unwrap();
+        let obs = Observability::build(true, None).unwrap();
         let reg = obs.metrics.as_ref().unwrap();
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).unwrap();
@@ -8949,6 +9285,82 @@ mod tests {
             "engine_ai_table_push_fail_total",
         ] {
             assert!(text.contains(name), "missing §9 row {name}");
+        }
+    }
+
+    /// E1, the metric half of the acceptance gate: with NO `--exec`
+    /// the registry must not grow a single name. `/metrics` from a
+    /// post-E1 binary on an unconfigured boot is byte-identical to a
+    /// pre-E1 binary's.
+    #[test]
+    fn no_exec_artifact_registers_no_exec_metrics() {
+        let obs = Observability::build(true, None).unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            !text.contains("engine_exec_"),
+            "an unconfigured boot must register NO engine_exec_* name"
+        );
+    }
+
+    /// With an artifact present, the global family registers — and the
+    /// per-slot family registers for LIVE slots ONLY (plan §3.5).
+    #[test]
+    fn an_exec_artifact_registers_the_global_family_and_only_live_slots() {
+        // slot 3 live, slot 6 off, everything else paper.
+        let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        modes[3] = 1;
+        modes[6] = 2;
+        let obs = Observability::build(true, Some(modes)).unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        for name in [
+            "engine_exec_configured",
+            "engine_exec_live_submits_total",
+            "engine_exec_paper_submits_total",
+            "engine_exec_refused_off_total",
+            "engine_exec_refused_no_route_total",
+            "engine_exec_slot3_mode",
+            "engine_exec_slot3_live_submits_total",
+            "engine_exec_slot3_refused_total",
+        ] {
+            assert!(text.contains(name), "missing exec row {name}");
+        }
+        // Paper and OFF slots cost no names.
+        for absent in [
+            "engine_exec_slot0_mode",
+            "engine_exec_slot1_mode",
+            "engine_exec_slot6_mode",
+            "engine_exec_slot6_refused_total",
+        ] {
+            assert!(!text.contains(absent), "must NOT register {absent}");
+        }
+    }
+
+    /// Every E1 metric name fits `core_metrics::NAME_MAX`.
+    #[test]
+    fn every_exec_metric_name_fits_the_registry() {
+        for slot in 0..clob_dispatcher::EXEC_COUNTER_SLOTS {
+            for n in [
+                format!("engine_exec_slot{slot}_mode"),
+                format!("engine_exec_slot{slot}_live_submits_total"),
+                format!("engine_exec_slot{slot}_refused_total"),
+            ] {
+                assert!(n.len() <= core_metrics::NAME_MAX, "{n} is {} bytes", n.len());
+            }
+        }
+        for n in [
+            "engine_exec_configured",
+            "engine_exec_live_submits_total",
+            "engine_exec_paper_submits_total",
+            "engine_exec_refused_off_total",
+            "engine_exec_refused_no_route_total",
+        ] {
+            assert!(n.len() <= core_metrics::NAME_MAX);
         }
     }
 }

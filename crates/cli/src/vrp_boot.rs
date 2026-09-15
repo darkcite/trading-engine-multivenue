@@ -279,6 +279,49 @@ pub fn vrp_wanted(requested: u8) -> bool {
     requested & strategy_set::BIT_VRP != 0
 }
 
+/// Why a VRP boot did not produce a member.
+///
+/// The distinction is the whole point: **an operator mistake and a
+/// venue condition are not the same failure and must not have the same
+/// consequence.**
+///
+/// * [`VrpBootError::Refused`] — the artifact is missing where it was
+///   named, unreadable, or internally wrong. That is something a human
+///   did, the engine cannot guess what they meant, and the F19
+///   requested-but-absent law applies: REFUSE the boot.
+/// * [`VrpBootError::VenueChainEmpty`] — the artifact is perfectly
+///   good; the VENUE has no options chain to select from. Nothing a
+///   human did, nothing a human can fix, and it clears by itself when
+///   the venue comes back. Refusing here takes down xsd, bin15, ai and
+///   vm — four healthy members and all six venues' capture — because a
+///   fifth member's exchange is in maintenance.
+///
+/// Operator ruling 2026-09-15: the second case drops slot 1 and boots
+/// the rest. See `docs/risk-policy.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VrpBootError {
+    /// Operator error. Refuses the boot.
+    Refused(String),
+    /// The venue supplied no usable options chain. Drops slot 1.
+    VenueChainEmpty(String),
+}
+
+impl std::fmt::Display for VrpBootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VrpBootError::Refused(s) | VrpBootError::VenueChainEmpty(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::error::Error for VrpBootError {}
+
+impl From<String> for VrpBootError {
+    fn from(s: String) -> Self {
+        VrpBootError::Refused(s)
+    }
+}
+
 /// Resolve the whole VRP boot: `vrp.toml`, its descriptors, the chain
 /// table and the seed.
 ///
@@ -293,7 +336,7 @@ pub fn load_vrp_boot(
     state_path: Option<&Path>,
     resolve: &dyn Fn(&str) -> Option<SymbolId>,
     deribit_options: &[crate::paper::DiscoveredOption],
-) -> Result<Option<VrpBoot>, String> {
+) -> Result<Option<VrpBoot>, VrpBootError> {
     let (path, explicit): (PathBuf, bool) = match path {
         Some(p) => (p.to_path_buf(), true),
         None => {
@@ -303,7 +346,10 @@ pub fn load_vrp_boot(
     };
     if !path.exists() {
         if explicit {
-            return Err(format!("vrp: {} does not exist", path.display()));
+            return Err(VrpBootError::Refused(format!(
+                "vrp: {} does not exist",
+                path.display()
+            )));
         }
         info!(path = %path.display(), "vrp: artifact absent — the member is not configured");
         return Ok(None);
@@ -320,13 +366,19 @@ pub fn load_vrp_boot(
     let (registry, rows_refused, rows_from_name) =
         build_registry(deribit_options, &file.hedge_descriptor, hedge_sym);
     if registry.is_empty() {
-        return Err(format!(
+        // NOT a refusal. The artifact is fine; the venue has no chain.
+        // Observed 2026-09-15: Deribit went into `system_maintenance`,
+        // its options chain came back empty, and this refusal took the
+        // WHOLE engine down — including four members that do not touch
+        // Deribit at all.
+        return Err(VrpBootError::VenueChainEmpty(format!(
             "vrp: the options chain holds no {} option ({} of {} rows refused) — the \
-             member cannot select an instrument",
+             member cannot select an instrument. The artifact is fine; the VENUE has \
+             supplied no chain (maintenance, or a chain that has not published yet).",
             currency_of(&file.hedge_descriptor).unwrap_or("?"),
             rows_refused,
             deribit_options.len()
-        ));
+        )));
     }
     let loaded = load_vrp_seed(seed_path)?;
     let seed_path_used = match loaded.as_ref() {
@@ -724,6 +776,64 @@ mod tests {
         let tell = render_seed_tell(None, None);
         assert!(tell.contains("seed absent"), "{tell}");
         assert!(tell.contains(&core_vol::MIN_PAIRS.to_string()), "{tell}");
+    }
+
+    // -------- 2026-09-15: venue outage vs operator error --------
+
+    /// The distinction the whole drop rule rests on.
+    ///
+    /// An artifact problem and a venue problem arrive at the same
+    /// function and must leave it as DIFFERENT types, because they have
+    /// different consequences: one refuses the boot, the other drops
+    /// one slot and lets four healthy members keep running. Matching on
+    /// a message string would put that decision one typo away from
+    /// inverting.
+    #[test]
+    fn an_explicit_missing_artifact_is_refused_not_dropped() {
+        let missing = PathBuf::from("/nonexistent/vrp.toml");
+        // `VrpBoot` is not `Debug`, so unwrap the Result by hand.
+        let err = match load_vrp_boot(Some(&missing), None, None, &|_d: &str| None, &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("an explicit path that does not exist must fail"),
+        };
+        assert!(
+            matches!(err, VrpBootError::Refused(_)),
+            "operator error must REFUSE, never drop: got {err:?}"
+        );
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    /// The two variants are not interchangeable, and `From<String>`
+    /// defaults to the SAFE one — a future `?` on a bare String error
+    /// inside this module refuses the boot rather than silently
+    /// becoming a drop.
+    #[test]
+    fn a_bare_string_error_defaults_to_refusing() {
+        let e: VrpBootError = String::from("something went wrong").into();
+        assert!(
+            matches!(e, VrpBootError::Refused(_)),
+            "the safe default is Refused"
+        );
+        assert_ne!(
+            VrpBootError::Refused(String::from("x")),
+            VrpBootError::VenueChainEmpty(String::from("x")),
+            "same text, different meaning — they must not compare equal"
+        );
+    }
+
+    /// The empty-chain message has to say WHOSE fault it is, because
+    /// the operator reading it at 3 a.m. needs to know whether to fix
+    /// a file or wait for an exchange.
+    #[test]
+    fn the_empty_chain_error_says_the_artifact_is_fine() {
+        let e = VrpBootError::VenueChainEmpty(String::from(
+            "vrp: the options chain holds no BTC option (0 of 0 rows refused) — the \
+             member cannot select an instrument. The artifact is fine; the VENUE has \
+             supplied no chain (maintenance, or a chain that has not published yet).",
+        ));
+        let s = e.to_string();
+        assert!(s.contains("The artifact is fine"), "{s}");
+        assert!(s.contains("VENUE"), "{s}");
     }
 
     // ---------------- P0: F19, F22, F2 ----------------

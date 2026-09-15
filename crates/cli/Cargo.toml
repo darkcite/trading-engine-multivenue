@@ -48,6 +48,7 @@ strategy-xsd         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
+exec-router          = { workspace = true }
 book-builder         = { workspace = true }
 core-metrics         = { workspace = true }
 core-latency         = { workspace = true }

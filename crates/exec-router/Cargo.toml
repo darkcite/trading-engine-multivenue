@@ -1,0 +1,13 @@
+[package]
+name         = "exec-router"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Per-strategy execution routing (E1): the boot-fixed slot -> paper/live/off table and the compositing dispatcher over it."
+
+[dependencies]
+clob-dispatcher = { workspace = true }
+core-types      = { workspace = true }

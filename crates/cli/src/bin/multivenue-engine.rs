@@ -313,8 +313,31 @@ struct RunArgs {
     paper: bool,
     /// Live mode — sign + POST orders to Polymarket's CLOB. Requires
     /// a valid `.env` with `POLYMARKET_EIP712_KEY`. Default OFF.
-    #[arg(long, default_value_t = false)]
+    ///
+    /// DEPRECATED (E1): this is the legacy PROCESS-WIDE switch and it
+    /// can only arm every member or none. Per-strategy routing lives in
+    /// `--exec`, which this conflicts with — mixing a global live flag
+    /// with a per-slot route table is ambiguous by construction.
+    #[arg(long, default_value_t = false, conflicts_with = "exec")]
     live: bool,
+    /// E1: per-strategy execution artifact (`exec.toml`; grammar in
+    /// `exec.toml.example`). ABSENT = every slot paper = the engine's
+    /// behaviour before E1, bit for bit.
+    ///
+    /// This is one of TWO switches; it arms nothing on its own. See
+    /// `--arm-live`.
+    #[arg(long)]
+    exec: Option<PathBuf>,
+    /// E1: the slots this command line agrees to arm, e.g.
+    /// `--arm-live 3` or `--arm-live 3,5`.
+    ///
+    /// Must name EXACTLY the set of slots `--exec`'s artifact marks
+    /// live. Artifact says live and this omits the slot -> boot
+    /// refusal; this names a slot the artifact calls paper -> boot
+    /// refusal. Neither switch alone can arm anything, which is the
+    /// point: no single edit reaches real money.
+    #[arg(long, requires = "exec")]
+    arm_live: Option<String>,
     /// Universe config file (M1; TOML subset — see
     /// `universe.toml.example`). Explicit path must exist. Absent:
     /// `~/multivenue/universe.toml` is used IF present, else the
@@ -1422,14 +1445,52 @@ fn run(args: RunArgs) -> ExitCode {
     // — Part B.4's two §6.5 capture gauges are set from inside each
     // spawn wrapper thread itself, so the registry + gauge ids must
     // already exist at spawn time.
+    // E1: the execution route table. Resolved HERE — before the
+    // metric registry is built, before any socket opens — for two
+    // reasons. (1) The registry is boot-only-insertion, and whether
+    // the `engine_exec_*` family exists at all depends on this
+    // artifact: no `--exec` registers NOTHING, which is what keeps
+    // `/metrics` byte-identical to a pre-E1 binary. (2) A disagreement
+    // between the two arming switches, or a live slot with no compiled
+    // arm, should abort before the engine has done anything at all,
+    // not after it is already streaming six venues.
+    let exec_boot = match cli::exec_boot::resolve(args.exec.as_deref(), args.arm_live.as_deref()) {
+        Ok(e) => e,
+        Err(reason) => {
+            error!(reason, "exec: artifact refused — boot aborted");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
+    let exec_modes = exec_boot.as_ref().map(|b| {
+        let mut m = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        for (slot, dst) in m.iter_mut().enumerate() {
+            *dst = b
+                .route
+                .mode_at(slot)
+                .unwrap_or(exec_router::ExecMode::Paper)
+                .as_u8();
+        }
+        m
+    });
     let enable_metrics = args.metrics || args.tui;
-    let obs = match Observability::build(enable_metrics) {
+    let obs = match Observability::build(enable_metrics, exec_modes) {
         // RG6: the `/state` boot identity (pid, anchor, binary link
         // time, git sha, run dir, `--strategy`); masks + regime hash
         // are stamped by the set arm below.
         Ok(o) => o
             .with_ingress_statuses(statuses.clone())
-            .with_boot_info(boot_info(&run_dir, epoch_ns, &args.strategy, !args.live)),
+            // `boot.paper` feeds `/state`, the TUI and the 9292
+            // dashboard, and is documented "1 = paper mode (no live
+            // dispatcher)". `--exec` can arm a slot without ever
+            // setting `--live`, so asking `!args.live` alone would
+            // report PAPER on an engine that is routing real orders.
+            .with_boot_info(boot_info(
+                &run_dir,
+                epoch_ns,
+                &args.strategy,
+                !args.live && !exec_boot.as_ref().is_some_and(cli::exec_boot::ExecBoot::any_live),
+            )),
         Err(reason) => {
             error!(reason, "observability build failed");
             join_reverse(handles);
@@ -2172,6 +2233,20 @@ fn run(args: RunArgs) -> ExitCode {
         );
     }
 
+    // `--exec` is honoured ONLY by the composed strategy-set arm — it
+    // is the only arm that builds a `RoutedDispatcher`. Accepting the
+    // flag for `latency-arb` / `rule-tree` / `ev` and then routing
+    // nothing would be the worst kind of silent no-op: the operator
+    // passed an arming artifact and the engine ignored it.
+    if args.exec.is_some() && !STRATEGY_SET_NAMES.contains(&args.strategy.as_str()) {
+        error!(
+            strategy = %args.strategy,
+            "exec: --exec is only supported by the composed strategy set \
+             (the other arms have no routed dispatcher) — boot aborted"
+        );
+        join_reverse(handles);
+        return ExitCode::from(1);
+    }
     let strategy_choice = args.strategy.as_str();
     let result = match (strategy_choice, args.live) {
         ("latency-arb", true) => match boot_queued_live(&cfg, tls_config.clone()) {
@@ -2315,6 +2390,11 @@ fn run(args: RunArgs) -> ExitCode {
             // simply holds. A file that is PRESENT and unreadable
             // refuses the boot: a seed the engine cannot read exactly is
             // a fit nobody measured.
+            // Operator ruling 2026-09-15: an EMPTY VENUE CHAIN drops
+            // slot 1 and lets the rest of the engine boot; an artifact
+            // problem still refuses. `vrp_dropped_chain_empty` carries
+            // that decision to the F19 check below and to `/metrics`.
+            let mut vrp_dropped_chain_empty = false;
             let vrp_boot = if cli::vrp_boot::vrp_wanted(requested) {
                 match cli::vrp_boot::load_vrp_boot(
                     args.vrp.as_deref(),
@@ -2324,10 +2404,34 @@ fn run(args: RunArgs) -> ExitCode {
                     &discovery.deribit_options,
                 ) {
                     Ok(v) => v,
-                    Err(reason) => {
+                    // Operator error. F19 stands: refuse.
+                    Err(cli::vrp_boot::VrpBootError::Refused(reason)) => {
                         error!(reason, "vrp: artifact refused — boot aborted");
                         join_reverse(handles);
                         return ExitCode::from(1);
+                    }
+                    // Venue condition. Drop slot 1, boot the rest.
+                    //
+                    // This is a DELIBERATE, operator-ruled departure
+                    // from F19, and the whole objection to it is that a
+                    // silently-dropped member is one nobody notices. So
+                    // it is not silent: ERROR level, the reason in
+                    // full, what is being given up, and what will bring
+                    // it back. `/state` shows it too — `requested_mask`
+                    // keeps the vrp bit (it IS what was asked for)
+                    // while `enabled_mask` does not, and that
+                    // divergence is the machine-readable signal.
+                    Err(cli::vrp_boot::VrpBootError::VenueChainEmpty(reason)) => {
+                        error!(
+                            reason,
+                            "vrp: DROPPED from this boot — the venue supplied no options \
+                             chain. Slot 1 will NOT trade for the life of this run (the \
+                             chain is discovered once, at boot). Every other member boots \
+                             normally. The next restart picks vrp up again if the venue \
+                             has recovered by then."
+                        );
+                        vrp_dropped_chain_empty = true;
+                        None
                     }
                 }
             } else {
@@ -2338,7 +2442,14 @@ fn run(args: RunArgs) -> ExitCode {
             // `vrp.toml` was missing — `configured` simply lacked the
             // bit, the composed mask was still non-zero, and nothing
             // said the strategy the operator asked for was not there.
-            if cli::vrp_boot::vrp_wanted(requested) && vrp_boot.is_none() {
+            // `vrp_dropped_chain_empty` is the ONE exemption: the
+            // artifact was there and was good, so "the artifact is
+            // absent" would be a false statement, and the operator has
+            // ruled that a venue outage must not take the engine down.
+            if cli::vrp_boot::vrp_wanted(requested)
+                && vrp_boot.is_none()
+                && !vrp_dropped_chain_empty
+            {
                 error!(
                     "vrp: requested by --strategy but the artifact is absent \
                      (~/multivenue/vrp.toml or --vrp) — boot aborted"
@@ -2414,19 +2525,65 @@ fn run(args: RunArgs) -> ExitCode {
                 obs.boot.regime_hash = rb.hash;
                 obs.boot.regime_configured = 1;
             }
-            info!("running strategy-set PAPER — no orders will be submitted");
-            engine_loop_set_full(
-                cons,
-                engine_cfg,
-                clob_dispatcher::PaperDispatcher::new(),
-                obs,
-                requested,
-                vrp_boot.as_ref(),
-                xsd_boot.as_ref(),
-                bin15_boot.as_ref(),
-                icdp_params.as_ref(),
-                regime_boot.as_ref(),
-            )
+            match exec_boot {
+                // NO `--exec`: the pre-E1 path, untouched. Same
+                // dispatcher type, same call, same everything.
+                None => {
+                    info!("running strategy-set PAPER — no orders will be submitted");
+                    engine_loop_set_full(
+                        cons,
+                        engine_cfg,
+                        clob_dispatcher::PaperDispatcher::new(),
+                        obs,
+                        requested,
+                        vrp_boot.as_ref(),
+                        xsd_boot.as_ref(),
+                        bin15_boot.as_ref(),
+                        icdp_params.as_ref(),
+                        regime_boot.as_ref(),
+                    )
+                }
+                // WITH `--exec`: the same loop over the compositing
+                // dispatcher. `engine_loop_set_full` is generic over
+                // `D: OrderDispatch`, so the loop itself is unchanged —
+                // `RoutedDispatcher` is just another concrete `D`.
+                //
+                // The live arm is `NullLiveDispatcher` in E1: it refuses
+                // every order. That is unreachable on a booted engine
+                // (a live slot with no compiled arm was already refused
+                // above), and it is what makes LAW E-1 — a live slot
+                // never falls back to paper — true by construction
+                // rather than by care.
+                Some(eb) => {
+                    cli::exec_boot::log_boot_tell(&eb);
+                    if eb.any_live() {
+                        info!(
+                            live = %cli::exec_boot::render_slot_mask(eb.live_mask),
+                            "running strategy-set with LIVE slots — real orders will be submitted"
+                        );
+                    } else {
+                        info!(
+                            "running strategy-set PAPER (exec artifact present, nothing armed)                              — no orders will be submitted"
+                        );
+                    }
+                    engine_loop_set_full(
+                        cons,
+                        engine_cfg,
+                        exec_router::RoutedDispatcher::new(
+                            eb.route,
+                            clob_dispatcher::PaperDispatcher::new(),
+                            exec_router::NullLiveDispatcher::new(),
+                        ),
+                        obs,
+                        requested,
+                        vrp_boot.as_ref(),
+                        xsd_boot.as_ref(),
+                        bin15_boot.as_ref(),
+                        icdp_params.as_ref(),
+                        regime_boot.as_ref(),
+                    )
+                }
+            }
         }
         (other, _) => {
             error!(strategy = other, "unknown --strategy value");

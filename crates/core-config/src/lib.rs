@@ -30,6 +30,7 @@ use std::path::Path;
 use zeroize::Zeroize;
 
 pub mod bin15;
+pub mod exec;
 pub mod icdp;
 /// XSD-F: the descriptor law — an instrument's fee class from its §9.4
 /// descriptor (mirrored in `claude_worker.instrument_class`).

@@ -63,6 +63,19 @@ pub enum DispatchError {
     JsonMalformed,
     /// Non-2xx response from the CLOB.
     Http(u16),
+    /// E1: the order's strategy slot is `ExecMode::Off` — the operator
+    /// has stopped that slot. Not an error condition; a refusal.
+    SlotDisabled,
+    /// E1: the order's strategy slot is `ExecMode::Live` but the order
+    /// names a venue the slot has no live route to (or no live arm is
+    /// compiled for it).
+    ///
+    /// **LAW E-1 — a live slot never falls back to paper.** This is
+    /// the error that law is made of: the order is refused and
+    /// counted, never handed to the paper matcher, because a modelled
+    /// fill wearing live semantics would corrupt every downstream
+    /// reader of the tape.
+    NoLiveRoute,
 }
 
 /// Convert a `DispatchError` to the cross-crate
@@ -103,6 +116,15 @@ impl From<DispatchError> for core_net::NetworkErr {
                 };
                 NetworkErr::with_code(NetworkSource::Clob, kind, code)
             }
+            // E1 routing refusals are LOCAL decisions, not network
+            // conditions — the order never left the process. They map
+            // to `Malformed` (the order was not addressable as sent)
+            // rather than to `Disconnected`, so `is_retryable` at the
+            // boundary answers "no": retrying a refused route just
+            // refuses again.
+            DispatchError::SlotDisabled | DispatchError::NoLiveRoute => {
+                NetworkErr::new(NetworkSource::Clob, NetworkErrKind::Malformed)
+            }
         }
     }
 }
@@ -125,6 +147,8 @@ pub struct DispatchStatsAtomic {
     pub(crate) rejected_http_5xx: std::sync::atomic::AtomicU64,
     pub(crate) rejected_malformed: std::sync::atomic::AtomicU64,
     pub(crate) fills_seen: std::sync::atomic::AtomicU64,
+    /// E1: mirrors [`DispatchStats::rejected_routing`].
+    pub(crate) rejected_routing: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchStatsAtomic {
@@ -143,6 +167,7 @@ impl DispatchStatsAtomic {
             rejected_http_5xx: self.rejected_http_5xx.load(Relaxed),
             rejected_malformed: self.rejected_malformed.load(Relaxed),
             fills_seen: self.fills_seen.load(Relaxed),
+            rejected_routing: self.rejected_routing.load(Relaxed),
         }
     }
 
@@ -162,6 +187,7 @@ impl DispatchStatsAtomic {
         self.rejected_http_5xx.store(s.rejected_http_5xx, Relaxed);
         self.rejected_malformed.store(s.rejected_malformed, Relaxed);
         self.fills_seen.store(s.fills_seen, Relaxed);
+        self.rejected_routing.store(s.rejected_routing, Relaxed);
     }
 }
 
@@ -200,6 +226,13 @@ pub struct DispatchStats {
     pub rejected_malformed: u64,
     /// Fills observed.
     pub fills_seen: u64,
+    /// E1: rejected by the execution router before any arm saw the
+    /// order — the slot was `Off`, or it was `Live` with no route to
+    /// the order's venue. Bucketed together rather than split across
+    /// the network/signer/encode causes above, because a routing
+    /// refusal is none of those things and counting it as one would
+    /// send an operator looking at the wrong subsystem.
+    pub rejected_routing: u64,
 }
 
 impl DispatchStats {
@@ -236,8 +269,41 @@ impl DispatchStats {
                     self.rejected_malformed = self.rejected_malformed.wrapping_add(1);
                 }
             }
+            DispatchError::SlotDisabled | DispatchError::NoLiveRoute => {
+                self.rejected_routing = self.rejected_routing.wrapping_add(1);
+            }
         }
         self.rejected = self.rejected.wrapping_add(1);
+    }
+
+    /// E1 (plan §0.1-3): field-wise sum of two snapshots.
+    ///
+    /// `RoutedDispatcher` holds two arms and `/metrics` wants one
+    /// number per counter, so the two are summed here rather than at
+    /// each call site. Saturating, not wrapping: these are
+    /// operator-facing totals and a counter that wrapped to zero
+    /// during an incident is worse than one pinned at the maximum.
+    ///
+    /// **Cold path** — the 5 s metrics tick is the only caller.
+    #[must_use]
+    pub fn merged(self, other: Self) -> Self {
+        Self {
+            accepted: self.accepted.saturating_add(other.accepted),
+            rejected: self.rejected.saturating_add(other.rejected),
+            rejected_queue_full: self
+                .rejected_queue_full
+                .saturating_add(other.rejected_queue_full),
+            rejected_network: self.rejected_network.saturating_add(other.rejected_network),
+            rejected_signer: self.rejected_signer.saturating_add(other.rejected_signer),
+            rejected_encode: self.rejected_encode.saturating_add(other.rejected_encode),
+            rejected_http_4xx: self.rejected_http_4xx.saturating_add(other.rejected_http_4xx),
+            rejected_http_5xx: self.rejected_http_5xx.saturating_add(other.rejected_http_5xx),
+            rejected_malformed: self
+                .rejected_malformed
+                .saturating_add(other.rejected_malformed),
+            fills_seen: self.fills_seen.saturating_add(other.fills_seen),
+            rejected_routing: self.rejected_routing.saturating_add(other.rejected_routing),
+        }
     }
 }
 
@@ -276,6 +342,56 @@ pub trait OrderDispatch {
     fn open_paper_orders(&self) -> usize {
         0
     }
+
+    /// E1: what the execution ROUTER did, when there is one.
+    ///
+    /// Defaulted to an unconfigured set — `configured == 0` — exactly
+    /// as `matcher_counters` defaults to zeros for a dispatcher that
+    /// models nothing. Only `exec_router::RoutedDispatcher` overrides
+    /// it. The cli reads `configured` at boot to decide whether to
+    /// register the `engine_exec_*` metric family at all, which is what
+    /// keeps `/metrics` byte-identical on a boot with no `--exec`.
+    #[inline]
+    fn exec_counters(&self) -> ExecCounters {
+        ExecCounters::default()
+    }
+}
+
+/// Strategy slots [`ExecCounters`] reports on. Mirrors
+/// `exec_router::EXEC_SLOTS`; the two are asserted equal in
+/// `exec-router`'s tests so they cannot drift apart.
+pub const EXEC_COUNTER_SLOTS: usize = 8;
+
+/// E1: the execution router's counters, carried across the
+/// `OrderDispatch` boundary so the engine loop can mirror them to
+/// `/metrics` without knowing the router's concrete type.
+///
+/// Lives here rather than in `exec-router` because `exec-router`
+/// depends on this crate; putting it the other way round would be a
+/// dependency cycle. `MatcherCounters` sits here for the same reason.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecCounters {
+    /// `0` = there is no router (the default). `1` = a router is in
+    /// force. Nothing else distinguishes "router present, idle" from
+    /// "no router" — and the difference decides whether `/metrics`
+    /// grows an `engine_exec_*` family.
+    pub configured: u8,
+    /// Per-slot `ExecMode as u8`. Only meaningful when `configured`.
+    pub modes: [u8; EXEC_COUNTER_SLOTS],
+    /// Orders routed to the live arm.
+    pub live_submits: u64,
+    /// Orders routed to the paper matcher.
+    pub paper_submits: u64,
+    /// Refused because the slot is `Off`.
+    pub refused_off: u64,
+    /// Refused because a live slot named a venue it has no route to
+    /// (LAW E-1 — refused, never downgraded to paper).
+    pub refused_no_route: u64,
+    /// Per-slot live submits.
+    pub live_submits_by_slot: [u64; EXEC_COUNTER_SLOTS],
+    /// Per-slot refusals (off + no-route).
+    pub refused_by_slot: [u64; EXEC_COUNTER_SLOTS],
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as
@@ -635,6 +751,7 @@ impl PaperDispatcher {
                 rejected_http_5xx: 0,
                 rejected_malformed: 0,
                 fills_seen: 0,
+                rejected_routing: 0,
             },
         }
     }

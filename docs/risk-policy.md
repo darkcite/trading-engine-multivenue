@@ -142,6 +142,14 @@ open, stop ingesting rules) on any of the following:
 5. `core-alloc::CountingAllocator` reports any allocation in a tick-loop
    iteration. (debug builds only; release aborts via `panic = "abort"`.)
 6. A `debug_assert!` fails in a strategy's `on_tick`/`on_signal`/`on_fill`.
+7. **(E6, NOT YET ENFORCED)** `halt_on_reject_streak` consecutive venue
+   rejections on a live slot ⇒ sticky per-slot halt.
+8. **(E6, NOT YET ENFORCED)** reconciliation drift between our position and
+   the venue's above `halt_on_recon_drift_usd_1e6` ⇒ sticky per-slot halt.
+
+Triggers 7 and 8 are PARSED from `exec.toml` today (E1) and enforced by
+nothing. E6 adds the enforcement, cancel-all-on-halt and the
+operator-restart requirement; until then neither number is a control.
 
 Halt is **sticky**: it requires a manual engine restart. No "auto-resume"
 logic is permitted — a halted engine means a human investigates.
@@ -202,6 +210,178 @@ traded — the fee load, measured) and
 `engine_vrp_settle_index_fallback_total` (settlements priced off the
 last print because the 30-minute delivery window was thin).
 
+## A venue outage must not take the engine down (operator ruling 2026-09-15)
+
+A Deribit `system_maintenance` window on 2026-09-15 took the ENTIRE engine
+down for roughly ten minutes, and would have kept it down indefinitely. Two
+distinct faults, one ruling each.
+
+### 1. The VRP member is DROPPED when the venue supplies no chain
+
+`crates/cli/src/vrp_boot.rs` used to return one error type for two very
+different things. It now returns two:
+
+| cause | meaning | consequence |
+| --- | --- | --- |
+| `VrpBootError::Refused` | `vrp.toml` is missing where it was named, unreadable, or internally wrong | **REFUSES the boot.** F19 stands: an operator asked for a member and the engine cannot guess what they meant. |
+| `VrpBootError::VenueChainEmpty` | the artifact is good; the VENUE published no options chain | **DROPS slot 1 and boots everything else.** |
+
+**This is a deliberate, operator-ruled departure from the F19
+requested-but-absent law, and it is narrow on purpose.** F19 exists so nobody
+watches a member that was never there — a human error the human must fix.
+A venue in maintenance is not that: nothing a human did, nothing a human can
+fix, and it clears by itself. Refusing there takes down xsd, bin15, ai and vm
+— four healthy members and all six venues' capture — because a fifth member's
+exchange is offline.
+
+**The drop is never silent**, which is the only reason it is safe:
+
+* an **ERROR**-level tell naming the reason in full, what is given up (slot 1
+  will not trade for the life of the run — the chain is discovered once, at
+  boot) and what brings it back (the next restart, if the venue has recovered);
+* `/state` shows it machine-readably: **`requested_mask` keeps the vrp bit**
+  (it IS what was asked for) while **`enabled_mask` does not**. Since the only
+  other cause of an absent vrp aborts the boot outright, that divergence is
+  unambiguous.
+
+The distinction is carried by a TYPE, not by matching on a message string, so
+it cannot be inverted by a typo; `From<String>` defaults to `Refused`, so a
+future bare-string error inside that module refuses rather than silently
+becoming a drop.
+
+**This ruling covers VRP only.** No other member may drop itself on a venue
+condition without its own entry here.
+
+### 2. A boot abort must reach exit
+
+`join_reverse` joined threads that had never been asked to stop. The ~30
+boot-abort sites hit a refusal, called it, and blocked forever: the process sat
+at 15–21 % CPU for **seven minutes** and never exited, so launchd KeepAlive
+could not relaunch it and the engine stayed down long after the venue had
+recovered. `/state` was already serving (the metrics thread starts before the
+engine loop), so a monitor saw a live-looking engine reporting a zeroed boot
+block — `pid 0`, `paper 0`.
+
+`join_reverse` now signals `SHUTDOWN` before joining — once, in the one place
+the 31st abort site cannot forget — and arms a watchdog that force-exits with
+`EXIT_JOIN_TIMEOUT` (75) after `JOIN_GRACE` (20 s) if a thread ignores the flag.
+
+**The process MUST reach exit. A supervisor can only restart a process that
+dies.** Fail-fast beats a graceful wait that never ends — and because KeepAlive
+relaunches on a clean exit, a full venue outage now self-heals: the engine
+retries every boot cycle until the venue is back, with no degradation and no
+policy change.
+
+## Per-strategy execution routing (E1, 2026-09-15) — DECLARED, not ENFORCED
+
+Execution mode moved from one process-wide `--paper` / `--live` flag to a
+**per-slot table keyed on `Order.strategy_id`** (`crates/exec-router`,
+artifact `~/multivenue/exec.toml`, grammar in `exec.toml.example`). Three
+modes: `paper` (the default for every unanswerable question), `live`,
+`off`.
+
+**Nothing in E1 can place a real order.** No live execution arm is
+compiled for any venue — `cli::exec_boot::LIVE_ARM_VENUES` is empty and a
+test asserts it — so any artifact marking a slot `live` REFUSES the boot
+and names the phase (E2 signing, E3 HTTP) that will supply the arm.
+Arming needs two switches that must name the same set exactly,
+`exec.toml` and `--arm-live`, plus — in the managed fleet — a third edit
+to `scripts/engine-wrapper.sh`, which passes `--paper` and never
+`--exec`. `--exec` has no default path, deliberately.
+
+**LAW E-1 — a live slot never falls back to paper.** A live slot whose
+order names a venue it has no route to is refused
+(`DispatchError::NoLiveRoute`) and counted, never handed to the paper
+matcher. A modelled fill wearing live semantics is a trade that never
+happened entering the P&L.
+
+**LAW E-2 — `matcher_counters()` and `open_paper_orders()` report the
+PAPER arm only**, so `/metrics` can never suggest the matcher is
+modelling something a venue is really doing.
+
+**Fail-closed.** An absent artifact, an absent slot, an out-of-range
+`strategy_id`, `STRATEGY_ID_NONE` (`0xFF`) and any unknown mode byte all
+resolve to `paper`. An absent artifact is every slot paper, which is the
+engine's behaviour before E1, bit for bit.
+
+### The E1 caps are a DECLARATION. Nothing clamps to them.
+
+`exec.toml` carries per-slot `max_order_usd_1e6`, `max_open_orders`,
+`cap_day_usd_1e6`, `cap_instance_usd_1e6`, `request_budget_floor`,
+`halt_on_reject_streak` and `halt_on_recon_drift_usd_1e6`. In E1 they are
+PARSED, bounds-checked at boot and published in the boot tell — and
+**enforced by nothing**. Enforcement lands in E6 (the risk gate), as
+clamps inside `RoutedDispatcher::submit` computed from VENUE fills rather
+than from the member's own position view.
+
+Until E6 ships, the only limits in force on any slot are the **member's
+own**, from its own artifact (`bin15.toml`). The boot tell prints
+`caps-DECLARED-NOT-ENFORCED` and a following WARNING line for exactly
+this reason; when E6 lands the token becomes `caps-ENFORCED` and the
+warning is deleted.
+
+**These caps are per SLOT, not global.** `max_open_orders = 64` on a slot
+is not the global "max total open orders 64" above — eight slots at 64 is
+512. The global line still binds, and E6 must enforce both.
+
+**`0` means UNSET, and unset is NEVER "unlimited"** — the same ruling this
+document already made for the Deribit coin caps. A live slot with a zero
+`max_order_usd_1e6` or `cap_instance_usd_1e6` is refused at parse.
+
+**Two cap tables now carry the same names.** `bin15.toml`'s are enforced
+by the member; `exec.toml`'s are the independent second opinion E6 will
+enforce over it. If they ever disagree, that disagreement is itself the
+alarm — E6 refuses the boot on a mismatch.
+
+### Operator ruling O-E4 (2026-09-15) — the live-ramp caps
+
+Per-slot caps for slot 3 (bin15, Hyperliquid), as shipped in
+`exec.toml.example`:
+
+| cap | value | status in E1 |
+| --- | --- | --- |
+| max single-order notional | $100 | declared |
+| max open orders (this slot) | 64 | declared |
+| day turnover | $30,000 | declared |
+| per-instance | $1,000 | declared |
+| request-budget floor | 2,000 requests | declared (E4) |
+| halt on consecutive rejects | 5 | declared (E6) |
+| halt on reconciliation drift | $5 | declared (E6) |
+
+Empirical basis: the caps are **UNCHANGED** from the paper configuration
+the member was measured under — `bin15.toml` carries the identical
+`cap_instance_usd_1e6` and `cap_day_usd_1e6`. Ruling O-E4 is that the
+live ramp throttles by WHICH ARMS ARE ENABLED, never by re-cutting a cap,
+so no cap is widened by going live. A day cap is a TURNOVER limit, not a
+funding requirement.
+
+### `off` is a STOP, and it stops exits too
+
+`mode = "off"` refuses EVERY order from the slot, entries and **exits**
+alike: `Order` carries no reduce-only bit today, so the dispatcher cannot
+tell them apart. It also does not cancel orders already resting.
+
+This is a deliberate, documented **exception** to the standing law above
+that a cap never blocks an exit. `off` is not a cap — it is an operator
+stop, and it is the only control in this file that can strand a position.
+Members clear their logical position when they submit an exit regardless
+of the result, so flipping a holding slot to `off` silently
+desynchronises the member from the book.
+
+**Use `off` only on a flat slot.** To stop a slot that holds a position,
+set it to `paper` (or stop the engine) and let the member's own exit law
+unwind. The reduce-only exemption lands with E6.
+
+### The legacy `--live` flag is outside the interlock
+
+`--live` still reaches the real signer and the real Polymarket CLOB
+through `boot_queued_live` on ONE switch, while the new path requires
+two. `--live` now `conflicts_with = "exec"`, so the two can never be
+combined, but the asymmetry is recorded here deliberately rather than
+left implicit: what keeps the legacy path unreachable in the managed
+fleet is `scripts/engine-wrapper.sh`'s strategy allow-list and its
+hard-coded `--paper`, not the flag's own design.
+
 ## Signing-key handling
 
 - The EIP-712 signing key is loaded from the project-root `.env` file only.
@@ -225,3 +405,9 @@ widening anything. Each subsequent phase (see `PLAN.md`) requires:
 
 No exceptions. A cap change without the above is a kill-switch-trigger bug
 waiting to happen.
+
+The E1 execution-routing phase (2026-09-15) satisfies precondition 2 by the
+"Per-strategy execution routing" section above; preconditions 1 and 3 are
+satisfied by ruling O-E4, which holds the caps at their measured paper
+values rather than widening them. **No subsequent E-phase may arm a venue
+without its own entry here first.**

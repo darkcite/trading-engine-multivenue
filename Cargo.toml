@@ -54,6 +54,7 @@ members = [
 
     # --- execution ---
     "crates/clob-dispatcher",
+    "crates/exec-router",
     "crates/signer-eip712",
 
     # --- engine + UI ---
@@ -184,6 +185,7 @@ strategy-vrp          = { path = "crates/strategy-vrp" }
 strategy-xsd          = { path = "crates/strategy-xsd" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
+exec-router     = { path = "crates/exec-router" }
 signer-eip712   = { path = "crates/signer-eip712" }
 
 engine          = { path = "crates/engine" }
