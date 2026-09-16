@@ -610,8 +610,19 @@ pub struct Fill {
     /// apart is an audit of nothing, and Stage-3 will have both in one
     /// stream.
     pub origin: u8,
-    /// Padding for alignment.
-    _pad0: [u8; 1],
+    /// Bit flags about the fill itself — see [`FILL_FLAG_SETTLEMENT`].
+    ///
+    /// Deliberately NOT part of [`Self::origin`]. That byte answers
+    /// one question ("did a venue report this, or did we model it?")
+    /// and its two values are a documented contract that readers
+    /// across two languages test directly; a third value would break
+    /// every reader that spells "from a venue" as `origin == 0`. A
+    /// fill can be venue-reported AND a settlement, so the two are
+    /// independent and belong in independent bytes.
+    ///
+    /// Wire-additive: this was explicit zeroed padding, so every
+    /// capture in existence reads as "no flags".
+    pub flags: u8,
     /// Fill price.
     pub px: Price,
     /// Fill quantity.
@@ -641,7 +652,7 @@ impl Fill {
             side,
             strategy_id: STRATEGY_ID_NONE,
             origin: FILL_ORIGIN_VENUE,
-            _pad0: [0; 1],
+            flags: 0,
             px,
             qty,
             order_id,
@@ -663,6 +674,25 @@ impl Fill {
             ..self
         }
     }
+
+    /// The same fill, flagged — see [`FILL_FLAG_SETTLEMENT`].
+    ///
+    /// Separate from [`Self::with_attribution`] because the two answer
+    /// different questions and a caller that knows one rarely knows
+    /// the other.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_flags(self, flags: u8) -> Self {
+        Self { flags, ..self }
+    }
+
+    /// Did the VENUE settle an instance, rather than a trade
+    /// happening?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_settlement(&self) -> bool {
+        self.flags & FILL_FLAG_SETTLEMENT != 0
+    }
 }
 
 /// [`Fill::origin`]: a real fill report from a venue.
@@ -670,6 +700,22 @@ pub const FILL_ORIGIN_VENUE: u8 = 0;
 /// [`Fill::origin`]: a fill the paper dispatcher MODELLED through
 /// `core_fill`'s law. Never a trade that happened.
 pub const FILL_ORIGIN_PAPER: u8 = 1;
+
+/// [`Fill::flags`]: the venue SETTLED an instance, rather than a trade
+/// happening.
+///
+/// A binary's payout arrives as an ordinary fill — at 1.0 for the
+/// winning side, 0.0 for the loser, both sold back — with no client
+/// order id, because the venue placed it. It belongs in the tape like
+/// any other fill, and it is exactly what retires a position that
+/// would otherwise be marked at a stale price on a market that no
+/// longer exists.
+///
+/// But a member matching fills to its own resting orders will never
+/// match this one, and counting it "a fill the engine did not order"
+/// makes that counter mean two things. This flag is how a member tells
+/// them apart.
+pub const FILL_FLAG_SETTLEMENT: u8 = 1 << 0;
 
 /// [`Order::client_oid`] bits 0..32: the **instance** the member
 /// believes it is trading.
@@ -2933,6 +2979,39 @@ mod tests {
         assert_eq!(::core::mem::align_of::<Signal>(), 64);
     }
 
+    /// `flags` took the last explicitly-zeroed padding byte, so every
+    /// capture ever written reads as "no flags" — and `origin` did not
+    /// move, which is the contract two languages test directly.
+    #[test]
+    fn the_settlement_flag_is_additive_and_independent_of_origin() {
+        let f = Fill::new(
+            1,
+            7,
+            Side::Bid,
+            Price::from_raw(680_000),
+            Qty::from_raw(2_000_000),
+            42,
+        );
+        assert_eq!(f.flags, 0, "a capture written before this reads as no flags");
+        assert!(!f.is_settlement());
+
+        let s = f.with_flags(FILL_FLAG_SETTLEMENT);
+        assert!(s.is_settlement());
+        assert_eq!(s.origin, f.origin, "the flag must not disturb origin");
+        assert_eq!(s.strategy_id, f.strategy_id);
+
+        // The two bytes answer different questions and compose: a
+        // settlement IS venue-reported.
+        let both = s.with_attribution(3, FILL_ORIGIN_VENUE);
+        assert!(both.is_settlement());
+        assert_eq!(both.origin, FILL_ORIGIN_VENUE);
+        assert_eq!(both.strategy_id, 3);
+        // And a PAPER fill is never one.
+        let paper = f.with_attribution(3, FILL_ORIGIN_PAPER);
+        assert!(!paper.is_settlement());
+        assert_eq!(::core::mem::size_of::<Fill>(), 64, "the line did not grow");
+    }
+
     #[test]
     fn fill_size_is_one_cache_line() {
         assert_eq!(::core::mem::size_of::<Fill>(), 64);
@@ -2960,6 +3039,7 @@ mod tests {
         assert_eq!(&f.side as *const _ as usize - base, 12);
         assert_eq!(&f.strategy_id as *const _ as usize - base, 13, "was padding");
         assert_eq!(&f.origin as *const _ as usize - base, 14, "was padding");
+        assert_eq!(&f.flags as *const _ as usize - base, 15, "was padding");
         assert_eq!(&f.px as *const _ as usize - base, 16, "unmoved");
         assert_eq!(&f.qty as *const _ as usize - base, 24, "unmoved");
         assert_eq!(&f.order_id as *const _ as usize - base, 32, "unmoved");
@@ -3130,7 +3210,8 @@ mod tests {
         // compiler-inserted padding would break the AsBytes contract.
         // Tick: 8+4+4+8+8+8+8+1+1+6+8 = 64 (VT1: +flags, +venue_time_ms).
         // Signal: 8+4+1+1+2+40+8 = 64.
-        // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin).
+        // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin;
+        //       E4: +flags, which took the last explicit pad byte).
         // Order: 8+4+1+1+2+8+8+8+1+1+14+8 = 64 (M4.1: +strategy_id).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
         assert_eq!(::core::mem::size_of::<Signal>(), 64);

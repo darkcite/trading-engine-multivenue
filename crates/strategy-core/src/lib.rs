@@ -946,7 +946,22 @@ pub struct Bin15Counters {
     pub fills: u64,
     /// Fills whose `order_id` matched no pending. Non-zero means the
     /// member's own book of intents disagrees with the dispatcher's.
+    ///
+    /// **A SETTLEMENT is not one of these.** The venue places the
+    /// settling order itself, so it matches no pending by
+    /// construction; counting it here would make this number mean two
+    /// things at once and mask the disagreement it exists to report.
+    /// See [`Self::settlement_fills`].
     pub unknown_fills: u64,
+    /// Fills the VENUE generated to settle an instance
+    /// (`FILL_FLAG_SETTLEMENT`) rather than a trade the member asked
+    /// for.
+    ///
+    /// They reach the tape — which is what retires a position that
+    /// would otherwise be marked at a stale price on a market that no
+    /// longer exists — and they move no member position, because the
+    /// roll's own `clear_instance` is what flattens the family.
+    pub settlement_fills: u64,
 }
 
 /// Families one BIN15 view carries. Mirrors

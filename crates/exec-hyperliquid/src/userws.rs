@@ -305,7 +305,13 @@ pub fn to_fill_as(
     let side = if f.is_buy { Side::Bid } else { Side::Ask };
     Ok(
         Fill::new(now_ns, sym, side, Price::from_raw(px), Qty::from_raw(qty), f.oid)
-            .with_attribution(strategy_id, FILL_ORIGIN_VENUE),
+            .with_attribution(strategy_id, FILL_ORIGIN_VENUE)
+            // FLAGGED, so the member can tell a payout from a trade.
+            // Its `order_id` is the venue's and will match no pending
+            // leg of the member's — without this the member counts it
+            // "a fill the engine did not order", which is true of a
+            // stranger's trade and NOT of our own position resolving.
+            .with_flags(core_types::FILL_FLAG_SETTLEMENT),
     )
 }
 

@@ -4702,6 +4702,13 @@ pub struct Bin15MetricIds {
     pub fills: core_metrics::CounterId,
     /// `engine_bin15_unknown_fills_total`
     pub unknown_fills: core_metrics::CounterId,
+    /// `engine_bin15_settlement_fills_total`
+    ///
+    /// Registered alongside `unknown_fills` deliberately: settlements
+    /// used to be counted there, so leaving this one unpublished would
+    /// move them from a visible series to a field only a unit test can
+    /// see — a regression dressed as a fix.
+    pub settlement_fills: core_metrics::CounterId,
     /// Per family: `p_hat_1e6`, `pos_yes_1e6`, `pos_no_1e6`,
     /// `live_outcome`, in that order.
     pub families: [[core_metrics::GaugeId; BIN15_FAMILY_GAUGES]; BIN15_METRIC_FAMILIES],
@@ -4857,6 +4864,7 @@ fn register_bin15_metrics(
     let families_dormant = one("engine_bin15_families_dormant_total")?;
     let fills = one("engine_bin15_fills_total")?;
     let unknown_fills = one("engine_bin15_unknown_fills_total")?;
+    let settlement_fills = one("engine_bin15_settlement_fills_total")?;
     let mut families = [[core_metrics::GaugeId::default(); BIN15_FAMILY_GAUGES];
         BIN15_METRIC_FAMILIES];
     let mut f = 0usize;
@@ -4895,6 +4903,7 @@ fn register_bin15_metrics(
         families_dormant,
         fills,
         unknown_fills,
+        settlement_fills,
         families,
     })
 }
@@ -4957,6 +4966,8 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.fills.saturating_sub(last.fills));
     reg.counter(ids.unknown_fills)
         .inc(cur.unknown_fills.saturating_sub(last.unknown_fills));
+    reg.counter(ids.settlement_fills)
+        .inc(cur.settlement_fills.saturating_sub(last.settlement_fills));
     *last = cur;
     // The levels. A family the member does not configure keeps its row
     // at zero rather than disappearing: a missing series reads as a
@@ -8300,13 +8311,21 @@ mod tests {
     /// BIN15 P0 (F4) added `skipped_mark_stale` and P3 (F6) added
     /// `skipped_entry_price`: 22 → **24 counters**, so 222 in use and
     /// **34 of headroom left**. The gauge side did not move.
+    ///
+    /// E4 added `settlement_fills`: 24 → **25 counters**, so 223 in use
+    /// against `MAX_COUNTERS = 256` and **33 of headroom left**. The
+    /// gauge side did not move. It is registered rather than left as a
+    /// bare field on purpose — settlements used to be counted in
+    /// `unknown_fills`, which IS published, so an unpublished
+    /// replacement would have moved them from a visible series to a
+    /// field only a unit test can see.
     #[test]
-    fn the_bin15_family_is_24_counters_and_80_gauges() {
+    fn the_bin15_family_is_25_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 24, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 25, "the counter block");
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,

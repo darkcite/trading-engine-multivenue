@@ -84,7 +84,7 @@ the same situation `Order.strategy_id` was in at M4.1.
 |     12 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1)                            |
 |     13 |     1 | strategy_id | `u8`           | X1: emitting slot; `0xFF` = unattributed         |
 |     14 |     1 | origin      | `u8`           | X1: 0 = venue fill, 1 = MODELLED by the paper matcher |
-|     15 |     1 | _pad0       | `[u8; 1]`      | explicit, zeroed                                 |
+|     15 |     1 | flags       | `u8`           | E4: bit 0 = `FILL_FLAG_SETTLEMENT` (the VENUE closed the instance); was `_pad0`, explicit zeroed, so every capture written before E4 reads as no flags |
 |     16 |     8 | px          | `i64` Price    | fixed-point ×1e6                                 |
 |     24 |     8 | qty         | `i64` Qty      | fixed-point ×1e6                                 |
 |     32 |     8 | order_id    | `u64`          | engine-assigned client oid                       |

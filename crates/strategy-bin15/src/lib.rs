@@ -1698,6 +1698,20 @@ impl Bin15Strategy {
         if qty <= 0 {
             return;
         }
+        // A SETTLEMENT is the venue closing the instance, not a trade
+        // this member asked for. It carries the venue's own order id
+        // and matches no pending by construction, so the scan below
+        // would drop it into `unknown_fills` — a counter whose whole
+        // meaning is "my book of intents disagrees with the
+        // dispatcher's". Counted on its own instead.
+        //
+        // It moves NO position here: `clear_instance` on the roll is
+        // what flattens the family, and applying the payout as well
+        // would close the same position twice.
+        if fill.is_settlement() {
+            self.counters.settlement_fills = self.counters.settlement_fills.wrapping_add(1);
+            return;
+        }
         let mut i = 0usize;
         while i < self.params.n_families {
             if self.fam[i].pend_take.oid == fill.order_id {
@@ -2483,6 +2497,66 @@ mod tests {
         assert_eq!(makers[0].px.raw() % GRID_TICK_1E6, 0, "on the 1e-4 grid");
         assert!(makers[0].px.raw() <= 490_000, "never crossing the touch");
         assert!(m.counters().skipped_inventory > 0, "and the ask side says why");
+    }
+
+    /// **A settlement is not "a fill the engine did not order".**
+    ///
+    /// The venue places the settling order itself, so it carries the
+    /// venue's oid and matches no pending by construction — the scan
+    /// would drop it into `unknown_fills`, whose whole meaning is "my
+    /// book of intents disagrees with the dispatcher's". It gets its
+    /// own counter, and it moves NO position: `clear_instance` on the
+    /// roll is what flattens the family, and applying the payout too
+    /// would close the same position twice.
+    #[test]
+    fn a_settlement_is_counted_apart_from_unknown_fills() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 390_000, 400_000);
+        let oid = m.family(0).expect("f").pend_take.oid;
+        m.on_fill(
+            &Fill::new(at(63), yes_sym(0), Side::Bid, Price::from_raw(400_000), Qty::from_raw(25_000_000), oid),
+            &mut c,
+        );
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 25_000_000);
+
+        // The venue settles: its OWN oid, at 1.0, sold back.
+        let settle = Fill::new(
+            at(900),
+            yes_sym(0),
+            Side::Ask,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(25_000_000),
+            0xDEAD_BEEF,
+        )
+        .with_flags(core_types::FILL_FLAG_SETTLEMENT);
+        m.on_fill(&settle, &mut c);
+
+        assert_eq!(m.counters().settlement_fills, 1, "counted as what it is");
+        assert_eq!(
+            m.counters().unknown_fills,
+            0,
+            "and NOT as a disagreement with the dispatcher"
+        );
+        assert_eq!(
+            m.family(0).expect("f").pos_yes_1e6,
+            25_000_000,
+            "the roll flattens the family; the payout must not close it twice"
+        );
+
+        // An unflagged fill with the same unmatched oid IS unknown —
+        // the flag is what distinguishes them, not the oid.
+        let stranger = Fill::new(
+            at(901),
+            yes_sym(0),
+            Side::Ask,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(25_000_000),
+            0xDEAD_BEEF,
+        );
+        m.on_fill(&stranger, &mut c);
+        assert_eq!(m.counters().unknown_fills, 1);
+        assert_eq!(m.counters().settlement_fills, 1, "unchanged");
     }
 
     #[test]

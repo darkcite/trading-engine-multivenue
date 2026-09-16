@@ -750,12 +750,22 @@ What is NOT built, and is required before any mainnet order:
    settled roll leaves the member and the binder agreeing on a dead
    one.
 8. ~~**Settlement booking.**~~ **BUILT** — see "Settlement arrives as
-   a FILL" above. Two residues stay open: the `dir: "Settlement"`
-   single-string threat model, and `unknown_fills` in `strategy-bin15`
-   now counting settlements, which dilutes a counter whose meaning is
-   "a fill the engine did not order". The second wants a settlement
-   marker on `Fill`, which changes the `origin` byte's contract that
-   the worker's frozen surfaces read — an operator decision, not an
+   a FILL" above. One residue stays open: the `dir: "Settlement"`
+   single-string threat model.
+
+   The `unknown_fills` dilution is **also closed**, and the reason it
+   was deferred turned out to be wrong. Operator ruling 2026-09-16: a
+   SEPARATE FLAG on `Fill`, not a third `origin` value. `Fill::_pad0`
+   — one byte of explicit zero at offset 15 since the struct was
+   written — became `flags`, carrying `FILL_FLAG_SETTLEMENT`.
+   **`origin` is untouched**, so the contract two languages test
+   directly is intact, and the Python reader's `_FILL` format string
+   skips byte 15 as padding and always did. No version bump: every
+   capture in existence reads as no flags. `book_fill` now returns on
+   the flag BEFORE the oid scan, counting `settlement_fills` — which
+   also removes a reachable collision, where a settlement's venue oid
+   matching a live `client_oid` could have applied a spurious sell to
+   a pending leg. It was an operator decision, not an
    inference.
 9. **The `Fill::order_id` convention.** FIXED 2026-09-15, recorded
    here because of what it implies about the class of defect. Engine
@@ -1215,29 +1225,34 @@ fill, `paper_qty[sym]` stays at N and is marked at a stale last mid on a
 market that no longer exists. The settlement is what retires that
 phantom position.
 
-**It does NOT close the member's in-memory position.** `to_fill_as`
-stamps the VENUE's oid (a settlement matches no pending leg of the
-member's, and pretending otherwise would collide with a real
-`client_oid`), so `strategy_bin15::book_fill` finds no match, counts it
-`unknown_fills`, and never reaches `apply_position`. The member is
-flattened instead by `clear_instance()` on the roll, which zeroes
-`pos_yes_1e6`/`pos_no_1e6`. Either arrival order ends flat. **The
-outcome is right by both paths and the mechanisms are different**, and
-"book it like any other fill" without this paragraph would be a claim
-the code does not support.
+**It does NOT close the member's in-memory position, deliberately.**
+`to_fill_as` stamps the VENUE's oid — a settlement matches no pending
+leg of the member's, and pretending otherwise would collide with a real
+`client_oid` — and flags the fill `FILL_FLAG_SETTLEMENT`.
+`strategy_bin15::book_fill` tests that flag BEFORE the oid scan,
+counts `settlement_fills`, and returns. The member is flattened instead
+by `clear_instance()` on the roll, which zeroes
+`pos_yes_1e6`/`pos_no_1e6`; applying the payout as well would close the
+same position twice. **All three orderings end flat** — settlement
+first, roll first, or the settled roll DROPPED (the successor's created
+roll clears it). The outcome is right by every path and the mechanisms
+are different, and "book it like any other fill" without this paragraph
+would be a claim the code does not support.
 
-One consequence stays open: `unknown_fills` now counts settlements,
-diluting a counter whose meaning is "a fill the engine did not order".
-It is a reporting cost and not a live hazard — the counter reaches a
-gauge and no halt, and kill-switch trigger 3 is not wired for this
-member. Fixing it properly means marking a settlement on the `Fill`
-itself, which changes the `origin`/`strategy_id` byte contract that the
-worker's frozen surfaces read — an **operator decision**, not an
-inference, and on the pre-arming list.
+The flag also removed a hazard rather than only a counter's ambiguity:
+before it, a settlement whose venue oid happened to equal a live
+`client_oid` would have matched a pending leg and applied a spurious
+sell. The flag test now precedes the scan, so that cannot happen.
 
-`fills_unowned` and `owner_contested` join `fills_settlement` as
-counters that, like every other counter here, reach no gauge until
-`stats()` is wired (pre-arming item 5) — visible to a test and not to
+`settlement_fills` DOES reach a gauge —
+`engine_bin15_settlement_fills_total`, registered beside
+`engine_bin15_unknown_fills_total` on purpose, because settlements used
+to be counted there and leaving the new one unpublished would have
+moved them from a visible series to a field only a unit test can see: a
+regression dressed as a fix. The exec arm's own counters are the
+exception: `fills_unowned` and `owner_contested` join `fills_settlement`
+as counters that reach no gauge until `stats()` is wired (pre-arming
+item 5) — visible to a test and not to
 an operator.
 
 `UserFill::is_settlement` records the flag so a settlement is never
@@ -1249,19 +1264,22 @@ it is **not** comparable with `fills_booked`.
 earlier draft of this section claimed the hazard was a short sale
 against zero inventory. It is not, in either event order.
 `strategy_bin15::book_fill` matches `fill.order_id` against
-`pend_take.oid` / `pend_quote[].oid`; a settlement's id matches no
-pending leg, so it falls through to `unknown_fills` and
-`apply_position` is never reached — nothing underflows and the
-never-sells-short assertion never fires. A fill arriving for a cleared
-instance is **silently dropped**, which is the real failure mode and a
-quieter one.
+`pend_take.oid` / `pend_quote[].oid`; a settlement matches no pending
+leg and, since the flag landed, does not even reach that scan —
+`apply_position` is never reached either way, so nothing underflows and
+the never-sells-short assertion never fires. A GENUINE late trade
+arriving for a cleared instance is still **silently dropped**, which is
+the real failure mode and a quieter one.
 
-Note the second-order effect: `clear_instance()` wipes `pend_take` and
-`pend_quote`, so after a roll **every** late fill for that instance —
-settlement or a genuine trade — lands in `unknown_fills`. That defeats
+Note the second-order effect, now HALF resolved. `clear_instance()`
+wipes `pend_take` and `pend_quote`, so after a roll a late fill for
+that instance matches nothing. A SETTLEMENT is no longer among them —
+the flag routes it out before the scan — but **a genuine late trade
+still lands in `unknown_fills` and moves no position**. That defeats
 the one-generation memory `sym_of_coin` was built for: the exec layer
 resolves the late fill correctly and the member then forgets the order
-it belonged to. **Resolve this before a slot is armed**, not after.
+it belonged to. The remaining half stays on the pre-arming list.
+**Resolve it before a slot is armed**, not after.
 
 *The bug the second review caught.* The first version of
 `sym_of_coin` tested the current and previous names at equal
