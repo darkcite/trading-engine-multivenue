@@ -459,6 +459,27 @@ impl AssetTable {
         None
     }
 
+    /// What `sym` is bound to RIGHT NOW: `(asset, coin, coin_len)`.
+    ///
+    /// For the roll sweep (LAW E-8), which has to name the leg that is
+    /// ENDING — and must do it BEFORE the rebind overwrites the slot.
+    /// It returns the coin bytes rather than letting the caller derive
+    /// a name from the asset id, because a name derived from an id is
+    /// the same class of guess LAW E-4 refuses in the other direction.
+    #[must_use]
+    pub fn bound(&self, sym: u32) -> Option<(u32, [u8; COIN_MAX], u8)> {
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: `i` is bounded by the loop condition.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.sym == sym {
+                return Some((s.asset, s.coin, s.coin_len));
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Walk every live leg as `(sym, coin, booked_1e6)`.
     ///
     /// For the reconciler, which has to ask about each leg the venue

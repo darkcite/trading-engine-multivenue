@@ -26,7 +26,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, Stream};
 
 use exec_hyperliquid::config::{HlConfig, Scope, HOST_TESTNET};
-use exec_hyperliquid::lifecycle::{run_fill_on, run_on, run_requote_on, FillSpec, LifecycleSpec};
+use exec_hyperliquid::lifecycle::{
+    run_fill_on, run_on, run_requote_on, run_sweep_on, FillSpec, LifecycleSpec, SweepSpec,
+};
 use exec_hyperliquid::smoke::SmokeErr;
 use exec_hyperliquid::HlHttp;
 
@@ -698,6 +700,97 @@ fn a_requote_refuses_mainnet() {
     )
     .expect("cfg");
     let e = run_requote_on(&m, &mut http, spec()).expect_err("mainnet must be refused");
+    assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
+    assert_eq!(served.load(Ordering::SeqCst), 0);
+}
+
+
+// ---- Phase G: the roll sweep ----------------------------------------
+
+fn sweep_spec() -> SweepSpec {
+    SweepSpec {
+        asset: 100_000_000 + 10 * 3253,
+        px_1e8: 30_000_000,
+        sz_1e8: 400_000_000,
+        is_buy: true,
+        strategy_id: 3,
+        client_oid: 1,
+    }
+}
+
+/// The open-orders answer the venue gives while our order rests.
+/// `oid` 424242 is what `PLACED` echoes.
+const OPEN_OURS: &[u8] = br##"[{"coin":"#32530","oid":424242,"limitPx":"0.30",
+  "cloid":"0x4d560300000000000000000000000001","isTrigger":false}]"##;
+/// The same order, but the venue omitted the cloid — which is what
+/// plain `openOrders` does, and why the sweep asks for the frontend
+/// variant.
+const OPEN_NO_CLOID: &[u8] = br##"[{"coin":"#32530","oid":424242,"limitPx":"0.30"}]"##;
+const OPEN_EMPTY: &[u8] = b"[]";
+
+/// **The whole sweep, end to end.** Place, enumerate (listed, with the
+/// cloid, and the ARM'S OWN selection picks it), cancel by oid,
+/// enumerate again (gone).
+#[test]
+fn the_sweep_lists_selects_cancels_and_confirms() {
+    let (port, tls, served) = boot(&[PLACED, OPEN_OURS, CANCELLED, OPEN_EMPTY]);
+    let mut http = client(port, tls);
+    let r = run_sweep_on(&cfg(), &mut http, sweep_spec()).expect("sweep");
+
+    assert!(r.listed, "the venue named it, with its cloid");
+    assert!(r.selected, "and recon::ours_on_leg picked it out");
+    assert!(r.cancelled);
+    assert!(r.gone_after, "a SECOND enumerate is what proves it");
+    assert!(!r.unswept);
+    assert!(r.passed());
+    // The leg's name came from the VENUE's row, never derived from the
+    // asset id — that derivation is the guess LAW E-4 refuses.
+    assert_eq!(&r.coin[..r.coin_len as usize], b"#32530");
+    assert_eq!(served.load(Ordering::SeqCst), 4);
+}
+
+/// **Why the sweep asks for `frontendOpenOrders`.** Plain `openOrders`
+/// omits the cloid, and without it the arm cannot tell our order from a
+/// stranger's — so it would sweep nothing, silently, on every roll.
+#[test]
+fn an_answer_without_cloids_selects_nothing_rather_than_guessing() {
+    let (port, tls, _) = boot(&[PLACED, OPEN_NO_CLOID, OPEN_EMPTY]);
+    let mut http = client(port, tls);
+    let r = run_sweep_on(&cfg(), &mut http, sweep_spec()).expect("the venue answered");
+
+    assert!(!r.listed, "no cloid means we cannot claim it");
+    assert!(!r.selected);
+    assert!(!r.passed());
+}
+
+/// **ACKED and GONE are different claims**, which is the entire reason
+/// the probe enumerates a second time. A venue that accepts a cancel
+/// and leaves the order resting would otherwise read as a pass.
+#[test]
+fn a_cancel_that_was_acked_but_left_the_order_resting_is_not_a_pass() {
+    let (port, tls, _) = boot(&[PLACED, OPEN_OURS, CANCELLED, OPEN_OURS, ALREADY_GONE]);
+    let mut http = client(port, tls);
+    let r = run_sweep_on(&cfg(), &mut http, sweep_spec()).expect("the venue answered");
+
+    assert!(r.listed && r.selected && r.cancelled);
+    assert!(!r.gone_after, "it is STILL LISTED");
+    assert!(!r.passed(), "an acked cancel is not evidence");
+}
+
+/// The mainnet guard on this seam too.
+#[test]
+fn a_sweep_refuses_mainnet() {
+    let (port, tls, served) = boot(&[PLACED]);
+    let mut http = client(port, tls);
+    let m = HlConfig::new(
+        Scope::Live,
+        exec_hyperliquid::config::HOST_MAINNET,
+        'a',
+        KEY,
+        ADDR,
+    )
+    .expect("cfg");
+    let e = run_sweep_on(&m, &mut http, sweep_spec()).expect_err("mainnet must be refused");
     assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
     assert_eq!(served.load(Ordering::SeqCst), 0);
 }

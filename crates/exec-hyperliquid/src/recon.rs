@@ -409,6 +409,200 @@ pub fn drift_qty_to_usd_1e6(qty_1e6: i64) -> i64 {
     }
 }
 
+/// One order the venue says is RESTING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenOrder {
+    /// The venue's own name for the leg, as a span into the scanned
+    /// buffer.
+    pub coin: Span,
+    /// The venue order id — what the `cancel` action takes.
+    pub oid: u64,
+    /// The client id, when the row carries one.
+    ///
+    /// **This is why the request asks for `frontendOpenOrders` rather
+    /// than `openOrders`**: only the former echoes the cloid, and
+    /// without it a sweep cannot tell an order THIS ENGINE placed from
+    /// one it did not. Cancelling a stranger's order would be the
+    /// mirror image of booking a stranger's fill.
+    pub cloid: Option<[u8; 16]>,
+}
+
+/// How many resting orders a sweep must be able to hold.
+///
+/// Same lesson as [`MAX_SPOT_BALANCES`] and the same consequence: the
+/// scan REFUSES a body it cannot hold, and on the sweep path a refusal
+/// means the roll leaves quotes on a dead instance. Arm B rests only a
+/// handful per leg at once, but the venue answers for the whole
+/// account, so this is sized far above anything the member alone
+/// explains. 256 rows.
+pub const MAX_OPEN_ORDERS: usize = 256;
+
+/// Bytes a `frontendOpenOrders` request needs.
+pub const MAX_OPEN_ORDERS_REQ: usize = 96;
+
+/// Render `{"type":"frontendOpenOrders","user":"0x<40 hex>"}`.
+///
+/// `frontendOpenOrders`, not `openOrders`: see [`OpenOrder::cloid`].
+///
+/// # Errors
+/// `out` is too small.
+pub fn open_orders_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
+    const HEAD: &[u8] = br#"{"type":"frontendOpenOrders","user":"0x"#;
+    const TAIL: &[u8] = br#""}"#;
+    let n = HEAD.len() + 40 + TAIL.len();
+    if out.len() < n {
+        return Err(ScanErr::Malformed);
+    }
+    out[..HEAD.len()].copy_from_slice(HEAD);
+    let mut i = HEAD.len();
+    for b in master {
+        out[i] = HEX[usize::from(b >> 4)];
+        out[i + 1] = HEX[usize::from(b & 0x0F)];
+        i += 2;
+    }
+    out[i..i + TAIL.len()].copy_from_slice(TAIL);
+    Ok(n)
+}
+
+/// Scan a `frontendOpenOrders` answer.
+///
+/// The body is a TOP-LEVEL ARRAY, unlike `spotClearinghouseState`'s
+/// object — so there is no key to find, and an empty account answers
+/// `[]` rather than omitting a field.
+///
+/// Field-based, like every scanner here: it finds `coin`, `oid` and
+/// `cloid` by name and ignores the dozen other keys the venue sends.
+/// Key ORDER is part of a signature, never part of a response.
+///
+/// **A row with no `oid` is an error, not a skip.** The oid is what the
+/// cancel takes; a row we cannot cancel that we quietly dropped would
+/// make a sweep report success over an order it never touched.
+///
+/// # Errors
+/// Not an array, a truncated body, a row without `coin` or `oid`, or
+/// more rows than `out` can hold. None of them degrade to "no orders" —
+/// see the module docs for why an unreadable body must never read as an
+/// empty one.
+pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, ScanErr> {
+    let mut i = skip_ws(body, 0);
+    if i >= body.len() || body[i] != b'[' {
+        return Err(ScanErr::Malformed);
+    }
+    i += 1;
+    let mut n = 0usize;
+    loop {
+        i = skip_ws(body, i);
+        if i >= body.len() {
+            return Err(ScanErr::Malformed);
+        }
+        if body[i] == b']' {
+            return Ok(n);
+        }
+        if body[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if body[i] != b'{' {
+            return Err(ScanErr::Malformed);
+        }
+        let obj_end = object_end(body, i).ok_or(ScanErr::Malformed)?;
+        let obj = &body[i..obj_end];
+
+        let coin = string_field(obj, b"\"coin\"").ok_or(ScanErr::Malformed)?;
+        let oid = u64_field(obj, b"\"oid\"").ok_or(ScanErr::Malformed)?;
+        // Absent or unparseable means "no client id on this row", which
+        // is a real answer: an order placed from the venue UI has none.
+        // It is NOT ours, and the sweep leaves it alone.
+        let cloid = string_field(obj, b"\"cloid\"").and_then(|s| crate::cloid::from_hex(s.of(obj)));
+
+        if n >= out.len() {
+            return Err(ScanErr::Malformed);
+        }
+        out[n] = OpenOrder {
+            // Shift the span back into `body`'s frame; the caller
+            // resolves against `body`, not against `obj`.
+            coin: Span {
+                start: coin.start + i as u32,
+                end: coin.end + i as u32,
+            },
+            oid,
+            cloid,
+        };
+        n += 1;
+        i = obj_end;
+    }
+}
+
+/// Of the orders the venue says are resting, which are **ours, on this
+/// leg** — returns how many oids were written to `out`.
+///
+/// Two filters, and both matter:
+///
+/// - **The coin must match exactly.** The answer covers the whole
+///   account, and a sweep of one retired leg must not touch another.
+/// - **The cloid must decode as OURS** (LAW E-9). An order placed from
+///   the venue UI carries no cloid and a stranger's carries someone
+///   else's magic; cancelling either would be the mirror image of
+///   booking a stranger's fill.
+///
+/// Pure, so the arm and the testnet probe run the SAME selection — the
+/// same reason [`compare_booked`] lives here rather than on
+/// `HlExchange`. A sweep whose selection was only ever exercised
+/// behind a socket is a claim about source code.
+#[must_use]
+pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let row = rows[i];
+        i += 1;
+        if row.coin.of(body) != coin {
+            continue;
+        }
+        if !matches!(
+            row.cloid.as_ref().map(crate::cloid::decode),
+            Some(crate::cloid::Owner::Ours { .. })
+        ) {
+            continue;
+        }
+        if n >= out.len() {
+            // Unreachable while every caller sizes `out` from
+            // MAX_OPEN_ORDERS — and a full buffer is reported as such
+            // rather than described as safe. `n == out.len()` is how a
+            // caller tells "that was all of them" from "there may be
+            // more", and `sweep_one_pending` keeps the entry pending on
+            // the second. Saying the entry stays pending while doing
+            // nothing to make it so is how the next person who raises
+            // the const inherits a silent truncation.
+            return n;
+        }
+        out[n] = row.oid;
+        n += 1;
+    }
+    n
+}
+
+/// An unsigned integer field, for `oid`. `decimal_field` is for the
+/// venue's quoted decimal STRINGS; this is a bare JSON number.
+fn u64_field(b: &[u8], key: &[u8]) -> Option<u64> {
+    let pos = find_field(b, key)?;
+    let mut i = skip_ws(b, pos);
+    if i >= b.len() || b[i] != b':' {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    let start = i;
+    let mut v: u64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        v = v.checked_mul(10)?.checked_add(u64::from(b[i] - b'0'))?;
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(v)
+}
+
 /// Bytes a `spotClearinghouseState` request needs.
 pub const MAX_STATE_REQ: usize = 96;
 
@@ -663,6 +857,159 @@ mod tests {
         assert_eq!(unreconciled_venue_legs(&empty, &b2[..n2], only_quote), 0);
     }
 
+    /// The shape a sweep reads. `frontendOpenOrders` is a TOP-LEVEL
+    /// ARRAY, and the cloid is the field that makes it usable — without
+    /// it a sweep cannot tell an order this engine placed from one it
+    /// did not.
+    #[test]
+    fn open_orders_scan_with_the_cloid_a_sweep_needs() {
+        let body = br##"[
+          {"coin":"#195641","limitPx":"0.30","oid":60246216459,"origSz":"4.0",
+           "side":"B","sz":"4.0","timestamp":1789531633340,"isTrigger":false,
+           "cloid":"0x4d560300000000000000000000000065","orderType":"Alo"},
+          {"coin":"#195640","limitPx":"0.20","oid":60246216460,"origSz":"9.0",
+           "side":"B","sz":"9.0","timestamp":1789531633341,"isTrigger":false}
+        ]"##;
+        let mut out = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        let n = scan_open_orders(body, &mut out).expect("scans");
+        assert_eq!(n, 2);
+
+        assert_eq!(out[0].coin.of(body), b"#195641");
+        assert_eq!(out[0].oid, 60_246_216_459);
+        assert_eq!(
+            out[0].cloid.expect("a cloid"),
+            crate::cloid::encode(3, 0x65),
+            "and it decodes back to the slot that placed it"
+        );
+
+        // No cloid is a REAL answer, not a parse failure: an order
+        // placed from the venue UI has none, it is not ours, and a
+        // sweep must leave it alone.
+        assert_eq!(out[1].oid, 60_246_216_460);
+        assert!(out[1].cloid.is_none());
+    }
+
+    /// An account with nothing resting answers `[]`. That is a real
+    /// answer and must scan to zero rather than refusing — the sweep
+    /// asks this question after every roll, and most of the time the
+    /// honest answer is "nothing".
+    #[test]
+    fn an_empty_open_orders_answer_is_zero_rows_not_a_refusal() {
+        let mut out = [OpenOrder::default(); 4];
+        assert_eq!(scan_open_orders(b"[]", &mut out).expect("scans"), 0);
+        assert_eq!(scan_open_orders(b"  [ ]  ", &mut out).expect("scans"), 0);
+    }
+
+    /// **A row we cannot cancel is an ERROR, never a skip.** The oid is
+    /// what the cancel takes; a dropped row would have the sweep report
+    /// success over an order it never touched — which is the shape
+    /// "an unreadable answer must never read as an empty one" exists to
+    /// prevent, one level down.
+    #[test]
+    fn a_row_without_an_oid_refuses_rather_than_being_skipped() {
+        let mut out = [OpenOrder::default(); 4];
+        let no_oid = br##"[{"coin":"#195641","limitPx":"0.30"}]"##;
+        assert!(scan_open_orders(no_oid, &mut out).is_err());
+
+        let no_coin = br#"[{"oid":1,"limitPx":"0.30"}]"#;
+        assert!(scan_open_orders(no_coin, &mut out).is_err());
+
+        // Not an array at all.
+        assert!(scan_open_orders(br#"{"orders":[]}"#, &mut out).is_err());
+        // Truncated.
+        assert!(scan_open_orders(br##"[{"coin":"#1","oid":2}"##, &mut out).is_err());
+    }
+
+    /// More rows than the buffer holds REFUSES. An undersized buffer is
+    /// a self-inflicted outage on this path, which is why the const is
+    /// sized far above anything the member alone explains.
+    #[test]
+    fn more_open_orders_than_the_buffer_holds_is_refused() {
+        let mut body = Vec::from(*b"[");
+        for i in 0..5u32 {
+            if i > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(format!(r##"{{"coin":"#1","oid":{i}}}"##).as_bytes());
+        }
+        body.push(b']');
+        let mut small = [OpenOrder::default(); 4];
+        assert!(scan_open_orders(&body, &mut small).is_err());
+        let mut big = [OpenOrder::default(); 8];
+        assert_eq!(scan_open_orders(&body, &mut big).expect("fits"), 5);
+    }
+
+    /// The request the sweep sends, byte for byte — and it asks for the
+    /// FRONTEND variant, because plain `openOrders` omits the cloid.
+    #[test]
+    fn the_open_orders_request_asks_for_the_variant_that_carries_cloids() {
+        let master = [0xABu8; 20];
+        let mut buf = [0u8; MAX_OPEN_ORDERS_REQ];
+        let n = open_orders_request(&mut buf, &master).expect("renders");
+        let s = core::str::from_utf8(&buf[..n]).expect("ascii");
+        // The whole request, byte for byte. A prefix check would pass
+        // against `openOrders` too, and that variant omits the cloid
+        // this sweep exists to read.
+        assert_eq!(
+            s,
+            r#"{"type":"frontendOpenOrders","user":"0xabababababababababababababababababababab"}"#
+        );
+
+        // A buffer too small refuses rather than truncating a request
+        // that would then be signed.
+        let mut tiny = [0u8; 8];
+        assert!(open_orders_request(&mut tiny, &master).is_err());
+    }
+
+    /// **The two filters a sweep lives or dies by.** The venue answers
+    /// for the WHOLE ACCOUNT, so a sweep of one retired leg that
+    /// matched loosely would cancel quotes on a live one — and one
+    /// that ignored the cloid would cancel a stranger's order, the
+    /// mirror image of booking a stranger's fill.
+    #[test]
+    fn a_sweep_selects_only_our_orders_on_the_leg_that_ended() {
+        let ours = {
+            let c = crate::cloid::encode(3, 0x65);
+            let mut h = [0u8; 34];
+            let n = crate::cloid::to_hex(&c, &mut h);
+            String::from_utf8(h[..n].to_vec()).expect("ascii")
+        };
+        let body = format!(
+            r##"[
+              {{"coin":"#195641","oid":11,"cloid":"{ours}"}},
+              {{"coin":"#195641","oid":12,"cloid":"0xabababababababababababababababab"}},
+              {{"coin":"#195641","oid":13}},
+              {{"coin":"#195640","oid":14,"cloid":"{ours}"}},
+              {{"coin":"#195641","oid":15,"cloid":"{ours}"}}
+            ]"##
+        )
+        .into_bytes();
+        let mut rows = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        let n = scan_open_orders(&body, &mut rows).expect("scans");
+        assert_eq!(n, 5);
+
+        let mut out = [0u64; MAX_OPEN_ORDERS];
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", &mut out);
+        assert_eq!(&out[..k], &[11, 15], "ours on THIS leg, and nothing else");
+
+        // 12 is a foreign cloid, 13 has none (placed from the UI), and
+        // 14 is ours on a DIFFERENT leg — a live one this sweep must
+        // not touch.
+        assert!(!out[..k].contains(&12));
+        assert!(!out[..k].contains(&13));
+        assert!(!out[..k].contains(&14));
+
+        // The other leg selects its own, which is the same statement
+        // from the other side.
+        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", &mut out);
+        assert_eq!(&out[..k2], &[14]);
+
+        // A leg with nothing of ours selects nothing rather than
+        // falling back to "cancel what is there".
+        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", &mut out);
+        assert_eq!(k3, 0);
+    }
+
     #[test]
     fn the_venues_real_balance_sheet_scans() {
         let body = REAL.as_bytes();
@@ -713,6 +1060,18 @@ mod tests {
                 *b = x as u8;
             }
             let _ = scan_spot_state(&buf, &mut out);
+            // The sweep's scanner runs on the same path and against
+            // the same venue, so it gets the same treatment.
+            let mut oo = [OpenOrder::default(); 4];
+            let _ = scan_open_orders(&buf, &mut oo);
+        }
+        // And truncations of a well-formed open-orders body, which is
+        // where a scanner that trusts its own bounds actually breaks.
+        const OO: &[u8] = br##"[{"coin":"#195641","limitPx":"0.30","oid":60246216459,
+            "cloid":"0x4d560300000000000000000000000065","isTrigger":false}]"##;
+        let mut oo = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        for k in 0..OO.len() {
+            let _ = scan_open_orders(&OO[..k], &mut oo);
         }
         // And truncations of a valid body, which is where a scanner
         // that trusts its own bounds actually breaks.

@@ -1238,6 +1238,358 @@ pub fn run_requote(
     run_requote_on(cfg, &mut http, spec)
 }
 
+// ---- Phase G: the roll sweep, run by hand --------------------------
+
+/// What the sweep probe needs. Post-only, so it rests rather than
+/// trades — the sweep is about taking orders BACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepSpec {
+    /// Venue asset id. **Bound by the operator, never derived**
+    /// (LAW E-4).
+    pub asset: u32,
+    /// Resting price, 1e8-scaled. Far enough from the market that a
+    /// post-only order rests instead of being refused.
+    pub px_1e8: i64,
+    /// Size, 1e8-scaled.
+    pub sz_1e8: i64,
+    /// Buy side. A resting BID below the market is the safe default.
+    pub is_buy: bool,
+    /// The slot the cloid will carry — **our magic**, because the
+    /// sweep selects on exactly that.
+    pub strategy_id: u8,
+    /// The member's own id for the order.
+    pub client_oid: u64,
+}
+
+/// What the sweep probe observed.
+#[derive(Debug)]
+pub struct SweepReport {
+    /// The cloid placed and then swept.
+    pub cloid: [u8; 16],
+    /// The oid the venue gave it.
+    pub placed_oid: u64,
+    /// The venue's OWN name for the leg — taken from the open-orders
+    /// row that carried our cloid, never derived from the asset id.
+    pub coin: [u8; crate::asset::COIN_MAX],
+    /// How much of `coin` is real.
+    pub coin_len: u8,
+    /// `frontendOpenOrders` listed the order, with our cloid on it.
+    /// **This is the half a plain `openOrders` cannot prove**: that
+    /// variant omits the cloid, and without it a sweep cannot tell our
+    /// order from a stranger's.
+    pub listed: bool,
+    /// [`crate::recon::ours_on_leg`] — the arm's own selection — picked
+    /// it out.
+    pub selected: bool,
+    /// The cancel the sweep would send was accepted.
+    pub cancelled: bool,
+    /// A SECOND enumerate no longer lists it. The proof the sweep
+    /// actually took it off the book rather than merely being told so.
+    pub gone_after: bool,
+    /// The order may still be resting: something went unanswered.
+    pub unswept: bool,
+    /// Why it stopped short, if it did.
+    pub stopped: Option<SmokeErr>,
+}
+
+impl SweepReport {
+    /// Every step, and nothing left behind.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.listed
+            && self.selected
+            && self.cancelled
+            && self.gone_after
+            && !self.unswept
+            && self.stopped.is_none()
+    }
+}
+
+/// **PHASE G — prove the roll sweep against the venue (LAW E-8).**
+///
+/// The sweep takes back every order this engine placed on a leg the
+/// venue has retired. It asks the VENUE what is resting rather than
+/// trusting a table this arm keeps, because a local record disagrees
+/// invisibly — and invisibly is exactly how a restart or a missed ACK
+/// leaves a quote on a dead instance.
+///
+/// That path had never run against a socket. `HlExchange` is where it
+/// lives and E7 gates constructing one, so this probe drives the same
+/// pieces directly: `frontendOpenOrders`, the venue's answer, and
+/// [`crate::recon::ours_on_leg`] — **the arm's own selection function,
+/// not a copy of it**. A selection exercised only behind a socket the
+/// tests cannot reach is a claim about source code.
+///
+/// Five requests:
+///
+/// ```text
+///   place      post-only, OUR magic cloid  -> rests
+///   enumerate  frontendOpenOrders          -> must LIST it, with the cloid
+///              ours_on_leg                 -> must SELECT it
+///   cancel     by oid, as the sweep does   -> accepted
+///   enumerate  again                       -> must NOT list it
+/// ```
+///
+/// **The leg's name comes from the venue's own row**, the one carrying
+/// our cloid — never derived from the asset id. That is what a name
+/// derived from an id would be: the same class of guess LAW E-4
+/// refuses in the other direction. It also makes the probe stronger,
+/// because it proves the coin the venue prints is the coin the
+/// selection matches on.
+///
+/// # Errors
+/// Not testnet, a non-positive price or size, or an encode overflowed
+/// — **only cases where nothing has been sent**. Everything after the
+/// place rides in `stopped`, with the cloid named, because past that
+/// point an order is on the book.
+pub fn run_sweep_on(
+    cfg: &HlConfig,
+    http: &mut HlHttp,
+    spec: SweepSpec,
+) -> Result<SweepReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    if spec.sz_1e8 <= 0 || spec.px_1e8 <= 0 {
+        return Err(SmokeErr::Lifecycle {
+            stage: "spec",
+            msg: "price and size must both be positive".to_owned(),
+        });
+    }
+    let sk = cfg.secret_key().map_err(SmokeErr::Config)?;
+    // OUR magic, because that is exactly what the sweep selects on.
+    let cloid = crate::cloid::encode(spec.strategy_id, spec.client_oid);
+    let mut nonces = crate::nonce::Nonce::new();
+
+    let mut rep = SweepReport {
+        cloid,
+        placed_oid: 0,
+        coin: [0u8; crate::asset::COIN_MAX],
+        coin_len: 0,
+        listed: false,
+        selected: false,
+        cancelled: false,
+        gone_after: false,
+        unswept: false,
+        stopped: None,
+    };
+
+    // ---- place ------------------------------------------------------
+    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Alo)
+        .with_cloid(cloid);
+    let mut mp = [0u8; MAX_ACTION];
+    let mut aj = [0u8; MAX_ACTION];
+    let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    let aj_n = order_json(&mut aj, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    match post(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        &mp[..mp_n],
+        &aj[..aj_n],
+        "place",
+        ItemErrors::AreFailures,
+    ) {
+        Ok(ok) => {
+            rep.placed_oid = ok.oid;
+            if ok.any_filled {
+                rep.stopped = Some(SmokeErr::Lifecycle {
+                    stage: "place",
+                    msg: "the post-only order FILLED — choose a price further from the book"
+                        .to_owned(),
+                });
+            } else if !ok.any_resting {
+                rep.stopped = Some(SmokeErr::Lifecycle {
+                    stage: "place",
+                    msg: "accepted, but the venue says it is not resting".to_owned(),
+                });
+            }
+        }
+        Err(e) => {
+            rep.unswept = true;
+            rep.stopped = Some(e);
+        }
+    }
+    if rep.stopped.is_some() {
+        // Nothing to enumerate, but the order may be out there. Try the
+        // cancel-by-cloid anyway — it needs no oid, which is the whole
+        // reason the durable handle is the client id.
+        sweep_cleanup(http, &sk, cfg, &mut nonces, spec.asset, cloid, &mut rep);
+        return Ok(rep);
+    }
+
+    // ---- enumerate, and let the ARM'S OWN selection decide ----------
+    let mut rows = vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS];
+    match enumerate(http, cfg, &mut rows) {
+        Ok((n, body)) => {
+            // The row carrying OUR cloid names the leg. Taking the name
+            // from the venue rather than deriving it from the asset id
+            // is the point.
+            let mut i = 0usize;
+            while i < n {
+                let r = rows[i];
+                i += 1;
+                if r.cloid != Some(cloid) {
+                    continue;
+                }
+                rep.listed = true;
+                let c = r.coin.of(&body);
+                let k = c.len().min(crate::asset::COIN_MAX);
+                rep.coin[..k].copy_from_slice(&c[..k]);
+                rep.coin_len = u8::try_from(k).unwrap_or(0);
+                break;
+            }
+            if rep.listed {
+                let mut oids = [0u64; crate::recon::MAX_OPEN_ORDERS];
+                let picked = crate::recon::ours_on_leg(
+                    &rows[..n],
+                    &body,
+                    &rep.coin[..rep.coin_len as usize],
+                    &mut oids,
+                );
+                rep.selected = oids[..picked].contains(&rep.placed_oid);
+            }
+        }
+        Err(e) => rep.stopped = Some(e),
+    }
+
+    // ---- cancel, the way the sweep does: BY OID --------------------
+    if rep.selected {
+        let c = [crate::action::CancelWire {
+            asset: spec.asset,
+            oid: rep.placed_oid,
+        }];
+        let mut cmp = [0u8; MAX_ACTION];
+        let mut caj = [0u8; MAX_ACTION];
+        match (
+            crate::action::encode_cancel(&mut cmp, &c),
+            crate::request::cancel_json(&mut caj, &c),
+        ) {
+            (Ok(a), Ok(b)) => match post(
+                http,
+                &sk,
+                cfg,
+                &mut nonces,
+                &cmp[..a],
+                &caj[..b],
+                "cancel",
+                ItemErrors::AreFailures,
+            ) {
+                Ok(ok) => rep.cancelled = ok.errors == 0 && ok.any_success,
+                Err(e) => {
+                    rep.unswept = true;
+                    if rep.stopped.is_none() {
+                        rep.stopped = Some(e);
+                    }
+                }
+            },
+            _ => {
+                if rep.stopped.is_none() {
+                    rep.stopped = Some(SmokeErr::Encode);
+                }
+            }
+        }
+    }
+
+    // ---- enumerate again: it must be GONE --------------------------
+    if rep.cancelled {
+        match enumerate(http, cfg, &mut rows) {
+            Ok((n, body)) => {
+                let _ = &body;
+                let mut still = false;
+                let mut i = 0usize;
+                while i < n {
+                    still |= rows[i].cloid == Some(cloid);
+                    i += 1;
+                }
+                rep.gone_after = !still;
+            }
+            Err(e) => {
+                // We cannot confirm. The order was ACKED as cancelled,
+                // but "acked" and "gone" are different claims and this
+                // probe exists to tell them apart.
+                rep.unswept = true;
+                if rep.stopped.is_none() {
+                    rep.stopped = Some(e);
+                }
+            }
+        }
+    }
+    // Whatever happened, do not leave a post-only order behind.
+    if !rep.gone_after {
+        sweep_cleanup(http, &sk, cfg, &mut nonces, spec.asset, cloid, &mut rep);
+    }
+    Ok(rep)
+}
+
+/// One `frontendOpenOrders` round trip, scanned. Returns the row count
+/// and an OWNED copy of the body, because the caller reads spans out of
+/// it across a later borrow of `http`.
+fn enumerate(
+    http: &mut HlHttp,
+    cfg: &HlConfig,
+    rows: &mut [crate::recon::OpenOrder],
+) -> Result<(usize, Vec<u8>), SmokeErr> {
+    let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
+    let n = crate::recon::open_orders_request(&mut req, &cfg.master_addr)
+        .map_err(|_| SmokeErr::Encode)?;
+    let (_status, range) = http
+        .post_to(crate::http::INFO_PATH, &req[..n])
+        .map_err(SmokeErr::Http)?;
+    let body = http.resp()[range].to_vec();
+    // Fail-closed: an unreadable answer is NOT "nothing is resting".
+    let k = crate::recon::scan_open_orders(&body, rows).map_err(|_| SmokeErr::Unreadable)?;
+    Ok((k, body))
+}
+
+/// Best-effort cancel-by-cloid so a failed probe leaves nothing on the
+/// book. Needs no oid, which is why the client id is the durable
+/// handle.
+fn sweep_cleanup(
+    http: &mut HlHttp,
+    sk: &secp256k1::SecretKey,
+    cfg: &HlConfig,
+    nonces: &mut crate::nonce::Nonce,
+    asset: u32,
+    cloid: [u8; 16],
+    rep: &mut SweepReport,
+) {
+    match cancel(http, sk, cfg, nonces, asset, cloid, "cleanup", ItemErrors::AreData) {
+        // `errors > 0` here means the venue had nothing under that id,
+        // which is the answer we want. Unlike phase F's
+        // `new_cancel_succeeded` this is a CLEANUP rather than an
+        // assertion, so "cancelled it" and "nothing there" are both
+        // clean and neither needs `any_success`. The same narrow
+        // residual applies — a per-item error for an unrelated reason
+        // would read as clean while the order rests — and `gone_after`
+        // is the independent assertion that does not rest on it.
+        Ok(_) => rep.unswept = false,
+        Err(e) => {
+            rep.unswept = true;
+            if rep.stopped.is_none() {
+                rep.stopped = Some(e);
+            }
+        }
+    }
+}
+
+/// [`run_sweep_on`] over a transport this builds.
+///
+/// # Errors
+/// As [`run_sweep_on`].
+pub fn run_sweep(
+    cfg: &HlConfig,
+    tls: Arc<rustls::ClientConfig>,
+    spec: SweepSpec,
+) -> Result<SweepReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    run_sweep_on(cfg, &mut http, spec)
+}
+
 // ---- Phase E: the reconciliation, run by hand ----------------------
 
 /// The first synthetic symbol id the phase E ledger hands out.

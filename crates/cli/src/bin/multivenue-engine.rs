@@ -262,6 +262,26 @@ struct ExecSmokeArgs {
     #[arg(long, default_value_t = 1, requires = "fill")]
     fill_repeat: u32,
 
+    /// PHASE G: prove the ROLL SWEEP against the venue (LAW E-8).
+    ///
+    /// On a roll the arm must take back every order it placed on the
+    /// leg that just ended. It asks the VENUE what is resting rather
+    /// than trusting a table it keeps, because a local record
+    /// disagrees INVISIBLY — which is exactly how a restart or a
+    /// missed ACK leaves a quote on a dead instance.
+    ///
+    /// That path lives in `HlExchange` and E7 gates constructing one,
+    /// so this probe drives the same pieces: `frontendOpenOrders`, and
+    /// `recon::ours_on_leg` — **the arm's own selection, not a copy**.
+    ///
+    /// Five requests, post-only: place with our magic cloid, enumerate
+    /// (must LIST it, with the cloid, and the selection must PICK it),
+    /// cancel by oid as the sweep does, enumerate again (must be GONE).
+    /// The leg's name is taken from the venue's own row, never derived
+    /// from the asset id.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["offline", "lifecycle", "fill", "recon", "requote"])]
+    sweep: bool,
+
     /// PHASE F: prove a requote is a MODIFY that may CHANGE the cloid.
     ///
     /// LAW E-7 makes a live requote a modify rather than a cancel plus
@@ -1032,6 +1052,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             if args.requote {
                 return exec_requote(&cfg, &args);
             }
+            if args.sweep {
+                return exec_sweep(&cfg, &args);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1397,6 +1420,102 @@ fn fill_cloid_hex(slot: u8, client_oid: u64) -> String {
 /// Phase C: the order lifecycle round trip. Runs only AFTER phases A
 /// and B, because a lifecycle measured through a signature the venue
 /// cannot verify measures nothing.
+fn exec_sweep(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    let (Some(px), Some(sz)) = (args.px, args.sz) else {
+        error!("exec-smoke: --sweep needs --px and --sz (both 1e8-scaled)");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    };
+    let spec = exec_hyperliquid::lifecycle::SweepSpec {
+        asset: args.asset,
+        px_1e8: px,
+        sz_1e8: sz,
+        is_buy: !args.sell,
+        strategy_id: args.fill_slot,
+        client_oid: args.fill_cloid,
+    };
+    info!(
+        ?spec,
+        "exec-smoke: phase G — proving the ROLL SWEEP against the venue. POST-ONLY."
+    );
+    let tls = TlsTransport::default_client_config();
+    match exec_hyperliquid::lifecycle::run_sweep(cfg, tls, spec) {
+        Ok(r) => {
+            let cloid = fill_cloid_hex_raw(&r.cloid);
+            let coin = String::from_utf8_lossy(&r.coin[..r.coin_len as usize]).to_string();
+            // UNCONDITIONAL, before every verdict: a post-only order may
+            // be on the book and this line is how it is found.
+            println!(
+                "{{\"cloid\":\"{cloid}\",\"placed_oid\":{},\"coin\":\"{coin}\",\
+                 \"listed\":{},\"selected\":{},\"cancelled\":{},\"gone_after\":{},\
+                 \"unswept\":{},\"stopped\":{},\"passed\":{}}}",
+                r.placed_oid,
+                r.listed,
+                r.selected,
+                r.cancelled,
+                r.gone_after,
+                r.unswept,
+                r.stopped.is_some(),
+                r.passed()
+            );
+            if r.unswept {
+                error!(
+                    cloid = %cloid,
+                    "exec-smoke: PHASE G — a POST-ONLY order may still be resting under the \
+                     cloid above. Cancel it by cloid before running this again."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if let Some(e) = r.stopped.as_ref() {
+                error!(cloid = %cloid, "exec-smoke: PHASE G stopped — {e}");
+                return ExitCode::from(e.code() as u8);
+            }
+            if !r.listed {
+                error!(
+                    cloid = %cloid,
+                    "exec-smoke: PHASE G — the venue did NOT list our order with its cloid. A \
+                     sweep cannot tell our orders from a stranger's without it, which is the \
+                     whole reason it asks for frontendOpenOrders rather than openOrders."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.selected {
+                error!(
+                    cloid = %cloid,
+                    coin = %coin,
+                    "exec-smoke: PHASE G — the venue listed it but recon::ours_on_leg did NOT \
+                     select it. The arm would walk past this order on every roll."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.gone_after {
+                error!(
+                    cloid = %cloid,
+                    "exec-smoke: PHASE G — the cancel was ACKED and the order is STILL LISTED. \
+                     Acked and gone are different claims, which is why this probe asks twice."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.passed() {
+                error!(cloid = %cloid, "exec-smoke: PHASE G did not pass");
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            info!(
+                placed_oid = r.placed_oid,
+                coin = %coin,
+                cloid = %cloid,
+                "exec-smoke: PHASE G PASSED — the venue lists our order WITH its cloid, the \
+                 arm's own selection picks it out of the whole account, the cancel takes it \
+                 off, and a second enumerate confirms it is gone. LAW E-8's sweep is measured."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("{e}");
+            ExitCode::from(e.code() as u8)
+        }
+    }
+}
+
 fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
     let (Some(px), Some(px2), Some(sz)) = (args.px, args.px2, args.sz) else {
         error!("exec-smoke: --requote needs --px, --px2 and --sz (all 1e8-scaled)");

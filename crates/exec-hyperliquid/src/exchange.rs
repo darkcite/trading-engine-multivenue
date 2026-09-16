@@ -53,7 +53,7 @@ use crate::config::HlConfig;
 use crate::http::{HlHttp, MAX_REQ_BODY};
 use crate::nonce::Nonce;
 use crate::request::{envelope, order_json};
-use crate::response::{scan, HlResponse};
+use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
 use crate::userws::{scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING};
 use crate::userws_conn::UserWs;
@@ -208,6 +208,41 @@ pub struct HlExecCounters {
     pub ws_connect_failures: u64,
     /// Encode or sign refusals — local, before anything was sent.
     pub encode_failures: u64,
+    /// Cancels the venue ACCEPTED.
+    pub cancels_sent: u64,
+    /// Cancels refused, locally or by the venue.
+    pub cancels_refused: u64,
+    /// Modifies the venue ACCEPTED (LAW E-7 — a requote is one of
+    /// these, never a cancel plus a place).
+    pub modifies_sent: u64,
+    /// Modifies refused, locally or by the venue.
+    pub modifies_refused: u64,
+    /// Roll sweeps ATTEMPTED (LAW E-8).
+    pub sweeps_run: u64,
+    /// Orders a sweep took off the book.
+    pub sweep_cancelled: u64,
+    /// **Orders a sweep could NOT take off the book**, after its
+    /// retries were spent. Quotes resting on a dead instance, which is
+    /// the number E6's kill switch will read.
+    ///
+    /// **It counts in two units and a threshold must know which.** Two
+    /// paths increment it per ENTRY rather than per order: a queue
+    /// overflow, and a sweep whose retries ran out — and in the
+    /// truncated case one increment can stand for many orders. So it is
+    /// a LOWER BOUND on orders left resting, never an exact count. Same
+    /// trap as `recon_drift_max_qty_1e6` against
+    /// `halt_on_recon_drift_usd_1e6`: two numbers sharing a name and
+    /// meaning different things is how a threshold gets compared to the
+    /// wrong quantity — and the reason the
+    /// sweep counts its failures rather than halting on them: a halt
+    /// invented here would be a policy this file made up, the same
+    /// reasoning that keeps `reconcile` from halting.
+    pub sweep_left: u64,
+    /// Sweeps that could not even enumerate — the venue was unreachable
+    /// or its answer unreadable. Distinct from `sweep_left`: one is
+    /// "we know what is resting and could not cancel it", the other is
+    /// "we do not know what is resting". Retried on the next idle.
+    pub sweep_failed: u64,
     /// `outcomeCreated` rolls that bound BOTH legs.
     pub rolls_bound: u64,
     /// `outcomeSettled` rolls. The binding is deliberately KEPT — see
@@ -224,6 +259,80 @@ pub struct HlExecCounters {
     /// 5), so it is visible to a test and not to an operator.
     pub rolls_refused: u64,
 }
+
+/// Which budget rule an action answers to.
+///
+/// **A cap never blocks an EXIT.** `AddressBudget` has said so since it
+/// was written — `may_cancel` returns `true` unconditionally, with the
+/// note that "a halted engine must be able to flatten" — and until E5
+/// that method had NO CALLERS, because `submit` was the only verb and
+/// it is a submit.
+///
+/// Folding cancels into `may_submit` would invert the rule at exactly
+/// the wrong moment: the engine's cancel verb would stop working at the
+/// budget floor, which is a bad day, and the LAW E-8 sweep would
+/// convert a transient squeeze into `sweep_left` — orders "left resting
+/// on a dead instance", the number E6's kill switch reads — while the
+/// real cause was our own governor, and drop the entry for good.
+///
+/// Cancels still COUNT against the address (`on_action_sent` fires for
+/// every action, cancels included). They are never REFUSED by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spend {
+    /// Anything that can open or move exposure. Refused at the floor.
+    Submit,
+    /// An exit. Counted, never refused.
+    Cancel,
+}
+
+/// A leg whose instance has ENDED and whose resting orders have not
+/// been taken off the book yet (LAW E-8).
+///
+/// The coin bytes are CARRIED rather than derived from the asset id:
+/// a name derived from an id is the same class of guess LAW E-4
+/// refuses in the other direction, and this one is used to decide
+/// which of the venue's open orders to cancel.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PendingSweep {
+    /// The venue asset id, for the cancel wire.
+    asset: u32,
+    /// How many attempts are left before the entry is dropped and
+    /// counted as `sweep_left`.
+    tries: u8,
+    coin_len: u8,
+    _pad: [u8; 2],
+    coin: [u8; crate::asset::COIN_MAX],
+    _pad2: [u8; 8],
+}
+
+impl PendingSweep {
+    const EMPTY: Self = Self {
+        asset: 0,
+        tries: 0,
+        coin_len: 0,
+        _pad: [0; 2],
+        coin: [0; crate::asset::COIN_MAX],
+        _pad2: [0; 8],
+    };
+}
+
+/// How many ended legs can await a sweep at once.
+///
+/// A roll retires two legs, eight families roll on a quarter-hour, and
+/// the idle path drains one per call — so this is far above anything
+/// the member explains. Overflow is counted as `sweep_left` rather
+/// than silently dropped: a leg nobody swept and nobody counted is the
+/// stranded quote LAW E-8 exists to prevent.
+const MAX_PENDING_SWEEPS: usize = 16;
+
+/// Attempts a pending sweep gets before it is given up on and counted.
+///
+/// Bounded because "retry on the next idle" without a bound is a leg
+/// that burns the address budget forever. When they are spent the
+/// entry becomes `sweep_left`, which is precisely the number E6 arms
+/// on.
+const SWEEP_TRIES: u8 = 8;
 
 /// The live Hyperliquid dispatcher.
 pub struct HlExchange<const FILL_N: usize> {
@@ -252,6 +361,13 @@ pub struct HlExchange<const FILL_N: usize> {
     /// sized for the venue's full reply, which is NOT the number of
     /// coins we hold — a one-coin account came back with fourteen
     /// rows.
+    /// Legs whose instance has ENDED and whose resting orders have not
+    /// been swept yet (LAW E-8).
+    sweeps: [PendingSweep; MAX_PENDING_SWEEPS],
+    /// How many of `sweeps` are live.
+    sweeps_n: usize,
+    /// Scratch for one sweep's `frontendOpenOrders` answer.
+    open: Box<[crate::recon::OpenOrder]>,
     bal: Box<[crate::recon::SpotBalance]>,
     /// Scratch for one frame's fills. **Boxed and sized for the
     /// venue's SNAPSHOT**, not for a steady-state frame — see
@@ -296,6 +412,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             scratch: vec![UserFill::default(); SNAPSHOT_RING].into_boxed_slice(),
             last_recon: Instant::now(),
             master_addr: cfg.master_addr,
+            sweeps: [PendingSweep::EMPTY; MAX_PENDING_SWEEPS],
+            sweeps_n: 0,
+            open: vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS]
+                .into_boxed_slice(),
             bal: vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES]
                 .into_boxed_slice(),
         })
@@ -705,6 +825,368 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         crate::recon::compare_booked(assets, bal, body)
     }
 
+    /// Sign, send and read ONE action.
+    ///
+    /// The shared tail of every verb this arm has. It was inline in
+    /// `submit` while `submit` was the only one; E5 adds a cancel and a
+    /// modify, and three copies of the signer-envelope-post-scan
+    /// sequence is three places for a signing detail to drift.
+    ///
+    /// **The budget is checked here, before the signature** — and it is
+    /// the ONLY place that checks it, so the policy lives in one spot.
+    /// A signed action that is then discarded has still burned a nonce.
+    /// Everything a caller can refuse locally — an unbound symbol, a
+    /// price that will not scale — belongs above this call, so a local
+    /// refusal never reaches the budget at all.
+    ///
+    /// Returns the venue's ACK (LAW E-5: an ACK, never a fill).
+    fn send_action(&mut self, mp: &[u8], aj: &[u8], spend: Spend) -> Result<HlOk, DispatchError> {
+        // `Spend`, not the verb's name: see its docs. A cancel is an
+        // EXIT and a cap that can stop a position being closed is not a
+        // risk control.
+        let barred = match spend {
+            Spend::Submit => self.budget.may_submit().is_err(),
+            Spend::Cancel => !self.budget.may_cancel(),
+        };
+        if barred {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            return Err(DispatchError::SlotDisabled);
+        }
+        let mut body = [0u8; MAX_REQ_BODY];
+        let nonce = self.nonce.next(now_ms());
+        let sig =
+            sign_action(&self.sk, mp, nonce, Vault::None, None, self.network).map_err(|_| {
+                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+                DispatchError::SignerRejected
+            })?;
+        let n = envelope(&mut body, aj, nonce, &sig, None, None).map_err(|_| {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            DispatchError::EncodeOverflow
+        })?;
+
+        let (_status, range) = self.http.post(&body[..n]).map_err(|_| {
+            self.counters.rejected = self.counters.rejected.wrapping_add(1);
+            DispatchError::Disconnected
+        })?;
+        // Every action that left the host counts against the address,
+        // whatever the venue said about it.
+        self.budget.on_action_sent();
+
+        let resp = self.http.resp();
+        let slice = &resp[range];
+        match scan(slice) {
+            Ok(HlResponse::Ok(ok)) if ok.accepted() => Ok(ok),
+            // The venue understood us and said NO. Distinct from an
+            // answer we could not read: E6's `halt_on_reject_streak`
+            // counts this one, and conflating the two would have it
+            // halt on a parser bug or miss a venue refusing every
+            // order.
+            Ok(_) => {
+                self.counters.rejected = self.counters.rejected.wrapping_add(1);
+                Err(DispatchError::Http(200))
+            }
+            Err(_) => {
+                self.counters.rejected = self.counters.rejected.wrapping_add(1);
+                Err(DispatchError::JsonMalformed)
+            }
+        }
+    }
+
+    /// Queue a leg whose instance has ended (LAW E-8). Idempotent per
+    /// asset: a second roll before the first was swept must not add a
+    /// second entry racing the first.
+    fn queue_sweep(&mut self, asset: u32, coin: [u8; crate::asset::COIN_MAX], coin_len: u8) {
+        let mut i = 0usize;
+        while i < self.sweeps_n {
+            if self.sweeps[i].asset == asset {
+                return;
+            }
+            i += 1;
+        }
+        if self.sweeps_n >= MAX_PENDING_SWEEPS {
+            // COUNTED, never silently dropped. A leg nobody swept and
+            // nobody counted is the stranded quote this law exists to
+            // prevent.
+            self.counters.sweep_left = self.counters.sweep_left.wrapping_add(1);
+            return;
+        }
+        self.sweeps[self.sweeps_n] = PendingSweep {
+            asset,
+            tries: SWEEP_TRIES,
+            coin_len,
+            _pad: [0; 2],
+            coin,
+            _pad2: [0; 8],
+        };
+        self.sweeps_n += 1;
+    }
+
+    /// Drop entry `i`, keeping the queue contiguous.
+    fn drop_sweep(&mut self, i: usize) {
+        debug_assert!(i < self.sweeps_n);
+        self.sweeps_n -= 1;
+        self.sweeps[i] = self.sweeps[self.sweeps_n];
+        self.sweeps[self.sweeps_n] = PendingSweep::EMPTY;
+    }
+
+    /// **LAW E-8 — take back every order THIS ENGINE placed on a leg
+    /// the venue has retired.** One entry per idle call.
+    ///
+    /// The list of what to cancel comes from the VENUE, not from a
+    /// table this arm keeps. A local record of open orders can
+    /// disagree with the venue — and it disagrees invisibly, which is
+    /// exactly when a restart or a missed ACK makes it matter. Same
+    /// principle as reconciliation: believe the venue.
+    ///
+    /// **Only orders whose cloid decodes as OURS are cancelled.** The
+    /// answer covers the whole account, and cancelling a stranger's
+    /// order would be the mirror image of booking a stranger's fill.
+    ///
+    /// It does NOT halt. `sweep_left` counts what could not be taken
+    /// off the book after the retries are spent, and E6 decides what
+    /// that is worth — a halt inferred here would be a policy this
+    /// file invented, the same reasoning `reconcile` carries.
+    fn sweep_one_pending(&mut self) {
+        if self.sweeps_n == 0 {
+            return;
+        }
+        let e = self.sweeps[0];
+        self.counters.sweeps_run = self.counters.sweeps_run.wrapping_add(1);
+
+        // ---- ask the venue what is resting --------------------------
+        let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
+        let Ok(n) = crate::recon::open_orders_request(&mut req, &self.master_addr) else {
+            self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
+            self.spend_try(0);
+            return;
+        };
+        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+            self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
+            self.spend_try(0);
+            return;
+        };
+        let body = &self.http.resp()[range];
+        let Ok(rows) = crate::recon::scan_open_orders(body, &mut self.open) else {
+            // Fail-closed: an unreadable answer is NOT "nothing is
+            // resting". That reading is what would let a sweep report
+            // success over orders it never saw.
+            self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
+            self.spend_try(0);
+            return;
+        };
+
+        // ---- which of them are ours, on THIS leg --------------------
+        // Collected first: the cancel below borrows `self` mutably,
+        // and the rows borrow the response buffer.
+        let mut oids = [0u64; crate::recon::MAX_OPEN_ORDERS];
+        let k = crate::recon::ours_on_leg(
+            &self.open[..rows],
+            body,
+            &e.coin[..e.coin_len as usize],
+            &mut oids,
+        );
+        if k == 0 {
+            // Nothing of ours resting on a retired leg is the normal
+            // answer and the one this law wants.
+            self.drop_sweep(0);
+            return;
+        }
+        // A FULL selection buffer means there may be more than we were
+        // told about. Unreachable while `oids` is sized from
+        // MAX_OPEN_ORDERS like the row buffer — and the entry is kept
+        // pending anyway, because the alternative is cancelling a
+        // prefix and reporting the leg clean.
+        let truncated = k == oids.len();
+
+        // ---- cancel them, by oid ------------------------------------
+        let mut left = 0u32;
+        let mut j = 0usize;
+        while j < k {
+            let oid = oids[j];
+            j += 1;
+            let c = [crate::action::CancelWire { asset: e.asset, oid }];
+            let mut mp = [0u8; MAX_ACTION];
+            let mut aj = [0u8; MAX_ACTION];
+            let (Ok(mp_n), Ok(aj_n)) = (
+                crate::action::encode_cancel(&mut mp, &c),
+                crate::request::cancel_json(&mut aj, &c),
+            ) else {
+                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+                left += 1;
+                continue;
+            };
+            if self
+                .send_action(&mp[..mp_n], &aj[..aj_n], Spend::Cancel)
+                .is_ok()
+            {
+                self.counters.sweep_cancelled = self.counters.sweep_cancelled.wrapping_add(1);
+            } else {
+                left += 1;
+            }
+        }
+        if left == 0 && !truncated {
+            self.drop_sweep(0);
+        } else {
+            // Retried on the next idle, bounded. `spend_try` counts
+            // them as `sweep_left` when the retries run out.
+            self.spend_try(0);
+        }
+    }
+
+    /// Burn one retry on a pending sweep, counting it as `sweep_left`
+    /// and dropping it when they are spent.
+    fn spend_try(&mut self, i: usize) {
+        if self.sweeps[i].tries > 1 {
+            self.sweeps[i].tries -= 1;
+            return;
+        }
+        self.counters.sweep_left = self.counters.sweep_left.wrapping_add(1);
+        self.drop_sweep(i);
+    }
+
+    /// **Cancel one order this arm placed, BY CLOID.**
+    ///
+    /// By cloid rather than by oid because the oid is not durable: a
+    /// modify issues a NEW one (measured 2026-09-16, phase F), so a
+    /// caller that kept only the oid could not cancel what it had just
+    /// requoted. LAW E-9 puts the slot in the cloid precisely so the
+    /// client id is the handle that survives.
+    ///
+    /// # Errors
+    /// The symbol is unbound or its instance has rolled (LAW E-4), the
+    /// budget is spent, or the venue refused.
+    pub fn cancel_by_cloid(
+        &mut self,
+        sym: u32,
+        strategy_id: u8,
+        client_oid: u64,
+    ) -> Result<(), DispatchError> {
+        let asset = self
+            .assets
+            .lookup(sym, core_types::instance_of(client_oid))
+            .map_err(|e| {
+                if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
+                    self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                }
+                self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+                self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
+                DispatchError::NoLiveRoute
+            })?;
+        let c = [crate::action::CancelByCloidWire {
+            asset,
+            cloid: encode_cloid(strategy_id, client_oid),
+        }];
+        let mut mp = [0u8; MAX_ACTION];
+        let mut aj = [0u8; MAX_ACTION];
+        let (Ok(mp_n), Ok(aj_n)) = (
+            crate::action::encode_cancel_by_cloid(&mut mp, &c),
+            crate::request::cancel_by_cloid_json(&mut aj, &c),
+        ) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        match self.send_action(&mp[..mp_n], &aj[..aj_n], Spend::Cancel) {
+            Ok(_) => {
+                self.counters.cancels_sent = self.counters.cancels_sent.wrapping_add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
+                Err(e)
+            }
+        }
+    }
+
+    /// **LAW E-7 — replace a resting order with a new one.**
+    ///
+    /// One request, not a cancel plus a place. At Arm B's ~333
+    /// reprices per instance that is the difference between fitting
+    /// inside the address budget and not.
+    ///
+    /// The resting order is addressed BY CLOID and the replacement
+    /// carries a DIFFERENT one, so every `userFills` row maps to
+    /// exactly one quote. Both halves were measured against testnet
+    /// before this existed (phase F, `exec-smoke --requote`) — the
+    /// venue does not have to accept a modify that changes the id, and
+    /// nothing in this repo could say that it did until it was asked.
+    ///
+    /// # Errors
+    /// As [`Self::cancel_by_cloid`], plus a price or size that will not
+    /// scale and an order kind with no TIF.
+    pub fn modify(&mut self, prev_client_oid: u64, order: &Order) -> Result<(), DispatchError> {
+        let asset = self
+            .assets
+            .lookup(order.sym, core_types::instance_of(order.client_oid))
+            .map_err(|e| {
+                if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
+                    self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                }
+                self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+                self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+                DispatchError::NoLiveRoute
+            })?;
+        // The same scale guards `submit` has, for the same reason:
+        // saturation clamps to a POSITIVE i64::MAX and would sail past
+        // the `<= 0` check below.
+        let (Some(px), Some(sz)) = (
+            order.px.raw().checked_mul(ENGINE_TO_WIRE),
+            order.qty.raw().checked_mul(ENGINE_TO_WIRE),
+        ) else {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        if px <= 0 || sz <= 0 {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        }
+        let Some(tif) = Self::tif_of(order.kind) else {
+            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
+            self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+            return Err(DispatchError::NoLiveRoute);
+        };
+        let wire = OrderWire::new(asset, order.side == Side::Bid, px, sz, tif)
+            .with_cloid(encode_cloid(order.strategy_id, order.client_oid));
+        let m = [crate::action::ModifyWire {
+            order: wire,
+            oid: 0,
+            oid_cloid: encode_cloid(order.strategy_id, prev_client_oid),
+            oid_is_cloid: true,
+        }];
+        let mut mp = [0u8; MAX_ACTION];
+        let mut aj = [0u8; MAX_ACTION];
+        let (Ok(mp_n), Ok(aj_n)) = (
+            crate::action::encode_batch_modify(&mut mp, &m),
+            crate::request::batch_modify_json(&mut aj, &m),
+        ) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        // A modify can MOVE exposure, so it answers to the submit rule
+        // rather than the exit one — LAW E-7 makes it the requote path,
+        // not a way around the governor.
+        match self.send_action(&mp[..mp_n], &aj[..aj_n], Spend::Submit) {
+            Ok(_) => {
+                self.counters.modifies_sent = self.counters.modifies_sent.wrapping_add(1);
+                // The member has traded this leg — recorded on the same
+                // acceptance rule `submit` uses, because a requote is a
+                // submit that kept its place in the queue.
+                if self.assets.note_owner(order.sym, order.strategy_id) {
+                    self.counters.owner_contested =
+                        self.counters.owner_contested.wrapping_add(1);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+                Err(e)
+            }
+        }
+    }
+
     fn persist_budget(&mut self) {
         if self.last_persist.elapsed() < PERSIST_EVERY {
             return;
@@ -747,12 +1229,10 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                 DispatchError::NoLiveRoute
             })?;
 
-        // 2. Budget BEFORE signing: a signed action that is then
-        //    discarded has still burned a nonce.
-        if self.budget.may_submit().is_err() {
-            self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
-            return Err(DispatchError::SlotDisabled);
-        }
+        // 2. The budget is checked ONCE, inside `send_action` — still
+        //    before the signature, and now in the one place that knows
+        //    whether this action is a submit or an exit. Two checks
+        //    would be two places that have to agree about one policy.
 
         // `checked_mul`, not `saturating_mul`: saturation clamps to
         // i64::MAX, which is POSITIVE and would sail straight past the
@@ -799,63 +1279,20 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         // local refusal cannot burn one. (HL only requires strictly
         // increasing nonces, so a gap is harmless — but not burning
         // one at all is simpler to reason about.)
-        let mut body = [0u8; MAX_REQ_BODY];
-        let nonce = self.nonce.next(now_ms());
-        let sig = sign_action(&self.sk, &mp[..mp_n], nonce, Vault::None, None, self.network)
-            .map_err(|_| {
-                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                DispatchError::SignerRejected
-            })?;
-        let n = enc(
-            envelope(&mut body, &aj[..aj_n], nonce, &sig, None, None),
-            &mut self.counters,
-        )?;
-
-        let (_status, range) = self.http.post(&body[..n]).map_err(|_| {
-            self.counters.rejected = self.counters.rejected.wrapping_add(1);
-            DispatchError::Disconnected
-        })?;
-        // Every action that left the host counts against the address,
-        // whatever the venue said about it.
-        self.budget.on_action_sent();
-
-        let resp = self.http.resp();
-        let slice = &resp[range];
-        match scan(slice) {
-            // LAW E-5: this is the ACK. It tells us the venue took the
-            // order; it never books a fill.
-            Ok(HlResponse::Ok(ok)) if ok.accepted() => {
-                self.counters.submitted = self.counters.submitted.wrapping_add(1);
-                // WHO trades this leg — recorded on ACCEPTANCE, not on
-                // intent. The venue settles a binary with a cloid-less
-                // fill, so attribution has to come from somewhere that
-                // is not the fill, and the only authority that cannot
-                // be wrong is a member whose order the venue took. A
-                // submit refused by the budget, the scale guards, the
-                // signer or the venue never traded, and a leg we have
-                // not traded must not absorb a settlement.
-                if self.assets.note_owner(order.sym, order.strategy_id) {
-                    self.counters.owner_contested =
-                        self.counters.owner_contested.wrapping_add(1);
-                }
-                Ok(())
-            }
-            // The venue understood us and said NO. Distinct from an
-            // answer we could not read: E6's `halt_on_reject_streak`
-            // counts this one, and conflating the two would have it
-            // halt on a parser bug or miss a venue refusing every
-            // order.
-            Ok(_) => {
-                self.counters.rejected = self.counters.rejected.wrapping_add(1);
-                Err(DispatchError::Http(200))
-            }
-            Err(_) => {
-                self.counters.rejected = self.counters.rejected.wrapping_add(1);
-                Err(DispatchError::JsonMalformed)
-            }
+        self.send_action(&mp[..mp_n], &aj[..aj_n], Spend::Submit)?;
+        self.counters.submitted = self.counters.submitted.wrapping_add(1);
+        // WHO trades this leg — recorded on ACCEPTANCE, not on intent.
+        // The venue settles a binary with a cloid-less fill, so
+        // attribution has to come from somewhere that is not the fill,
+        // and the only authority that cannot be wrong is a member whose
+        // order the venue took. A submit refused by the budget, the
+        // scale guards, the signer or the venue never traded, and a leg
+        // we have not traded must not absorb a settlement.
+        if self.assets.note_owner(order.sym, order.strategy_id) {
+            self.counters.owner_contested = self.counters.owner_contested.wrapping_add(1);
         }
+        Ok(())
     }
-
     /// **Always `None`, deliberately.**
     ///
     /// Fills reach the engine through fill lane 3, written by
@@ -953,6 +1390,33 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             return;
         }
 
+        // LAW E-8 — what this roll RETIRES, recorded before the bind
+        // overwrites the slot. Queued rather than swept here: a sweep
+        // is one info round trip plus a cancel per resting order, and
+        // `on_venue_event` runs INLINE ON THE ENGINE THREAD. Blocking
+        // it at roll time is blocking it at the exact moment the
+        // member wants to quote the successor. The idle path is where
+        // a blocking HTTPS round trip belongs — the same reasoning
+        // `reconcile` already carries — and it gives the operator's
+        // "retry on the next idle" ruling for free.
+        // A range loop: it indexes BOTH `syms` and `assets`, so there
+        // is no `- 1` for an off-by-one to hide in. (`syms.iter()`
+        // would borrow `syms` across the `&mut self` call — the same
+        // reason the rollback loop below carries its allow.)
+        for side in 0..syms.len() {
+            if let Some((asset, coin, coin_len)) = self.assets.bound(syms[side]) {
+                // A REPEAT of the roll that is already live retires
+                // nothing. The venue re-sends `outcomeCreated` on a
+                // reconnect snapshot and a replayed ring entry carries
+                // it too — and without this the sweep would enumerate
+                // the account and cancel every one of our quotes on a
+                // LIVE leg, at the moment the member is quoting it.
+                if asset != assets[side] {
+                    self.queue_sweep(asset, coin, coin_len);
+                }
+            }
+        }
+
         // From here nothing can fail: both names are non-empty and
         // within COIN_MAX by construction, and the slots are known to
         // be available. A failure here would be a bug in `bind`, and
@@ -988,6 +1452,11 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     fn on_idle(&mut self) -> bool {
         let worked = self.pump_user_events();
         self.persist_budget();
+        // Before `reconcile`, deliberately: a sweep that leaves quotes
+        // resting is drift the reconciler would then report, and the
+        // useful ordering is to try the fix before measuring the
+        // damage.
+        self.sweep_one_pending();
         self.reconcile();
         worked
     }
@@ -1293,13 +1762,14 @@ mod tests {
         assert_eq!(c.rejected, 0);
         assert_eq!(core::mem::align_of::<HlExecCounters>(), 64);
         // Pinned, not merely aligned. The block is copied whole on
-        // every `/metrics` publish, and it has already grown from two
-        // cache lines to three; the next field should be a decision
-        // rather than a surprise.
+        // every `/metrics` publish, and it has grown from two cache
+        // lines to three and now to FOUR — E5's cancel, modify and
+        // sweep counters. Each growth is meant to be a decision rather
+        // than a surprise, which is what this assertion is for.
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
-            192,
-            "HlExecCounters changed size — 24 u64 in three 64-byte lines"
+            256,
+            "HlExecCounters changed size — 32 u64 in four 64-byte lines"
         );
     }
 
@@ -1309,6 +1779,145 @@ mod tests {
     /// moves a position the member never took, silently and
     /// permanently, while a fill not booked is caught by
     /// reconciliation inside a minute.
+    /// **A roll queues the leg it RETIRES, not the one it creates.**
+    /// The sweep exists to take quotes off a dead instance, and the
+    /// recording has to happen before the rebind overwrites the slot —
+    /// after it, the table names the successor and the ended leg is
+    /// unnameable.
+    #[test]
+    fn a_roll_queues_the_leg_it_retires_before_the_rebind_hides_it() {
+        let mut x = exchange();
+        // First roll: nothing was bound, so nothing is retired.
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        assert_eq!(x.sweeps_n, 0, "a first bind retires nothing");
+        let first = x.assets.bound(4096).expect("bound").0;
+
+        // Second roll onto the SAME symbols: two legs retire.
+        x.on_venue_event(&roll(3254, 0, false, 4096));
+        assert_eq!(x.sweeps_n, 2, "both legs of the ended instance");
+        let queued: Vec<u32> = x.sweeps[..2].iter().map(|e| e.asset).collect();
+        assert!(queued.contains(&first), "the OLD asset id, not the new one");
+        assert!(
+            !queued.contains(&x.assets.bound(4096).expect("rebound").0),
+            "the successor is live and must never be swept"
+        );
+        // And the coin bytes travelled with it, so the sweep can match
+        // the venue's own rows without deriving a name from an id.
+        assert!(x.sweeps[0].coin_len > 1, "a real name, not an empty one");
+        assert_eq!(x.sweeps[0].coin[0], b'#', "the FILL namespace, not `+`");
+    }
+
+    /// **A REPEAT of the live roll retires nothing.** The venue
+    /// re-sends `outcomeCreated` on a reconnect snapshot and a replayed
+    /// ring entry carries it too. Without the guard the queued asset is
+    /// the very one the bind re-establishes as live, and the next idle
+    /// would enumerate the account and cancel every one of our quotes
+    /// on a LIVE leg — at the moment the member is quoting it.
+    #[test]
+    fn a_repeated_roll_never_queues_a_sweep_of_the_live_leg() {
+        let mut x = exchange();
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        assert_eq!(x.sweeps_n, 0);
+
+        // The SAME outcome again, twice.
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        assert_eq!(
+            x.sweeps_n, 0,
+            "the leg the bind re-establishes as live is not retired"
+        );
+
+        // A genuinely NEW outcome still retires the old one.
+        x.on_venue_event(&roll(3254, 0, false, 4096));
+        assert_eq!(x.sweeps_n, 2);
+    }
+
+    /// **A cap never blocks an EXIT.** `AddressBudget::may_cancel` has
+    /// said so since it was written and had no callers until E5; the
+    /// refactor that gave three verbs one tail is exactly where that
+    /// rule could have been inverted. At the floor a submit is refused
+    /// and a cancel is not.
+    ///
+    /// Without this, a transient budget squeeze would turn into
+    /// `sweep_left` — "orders left resting on a dead instance", the
+    /// number E6's kill switch reads — while the real cause was our own
+    /// governor, and the entry would be dropped for good.
+    #[test]
+    fn a_spent_budget_refuses_a_submit_and_never_a_cancel() {
+        let mut x = exchange();
+        // Spend it down to the floor.
+        while x.budget.may_submit().is_ok() {
+            x.budget.on_action_sent();
+        }
+        assert!(x.budget.may_submit().is_err(), "the floor is reached");
+        assert!(x.budget.may_cancel(), "and an exit is still permitted");
+
+        // The submit path refuses locally, before the signer.
+        let before = x.counters.refused_local;
+        let o = order(4096, 0);
+        assert!(x.submit(&o).is_err());
+        assert!(x.counters.refused_local > before);
+
+        // The symbol must be BOUND, or the cancel is refused by the
+        // table before the budget is ever consulted — and the test
+        // would then pass whatever the budget policy is. (It did: this
+        // assertion survived inverting `Spend::Cancel` to the submit
+        // rule, which is exactly the adjacent-measurement shape this
+        // lane keeps producing.)
+        x.assets_mut()
+            .bind(4096, 100_032_530, 3253, b"#32530")
+            .expect("bind");
+
+        // Now the cancel reaches `send_action`, gets PAST the budget,
+        // and fails on the socket instead — there is no server here.
+        // `SlotDisabled` is the budget's refusal, and it must not be
+        // what comes back.
+        let e = x
+            .cancel_by_cloid(4096, 3, 3253)
+            .expect_err("no server to talk to");
+        assert!(
+            !matches!(e, DispatchError::SlotDisabled),
+            "a cancel must never be refused by the cap: {e:?}"
+        );
+    }
+
+    /// The queue is idempotent per asset, bounded, and COUNTS what it
+    /// cannot hold. A leg nobody swept and nobody counted is exactly
+    /// the stranded quote LAW E-8 exists to prevent.
+    #[test]
+    fn the_sweep_queue_dedupes_and_counts_its_own_overflow() {
+        let mut x = exchange();
+        let coin = *b"#1234560000000000000";
+        x.queue_sweep(77, coin, 7);
+        x.queue_sweep(77, coin, 7);
+        assert_eq!(x.sweeps_n, 1, "a second roll before the first swept");
+
+        for a in 100..100 + MAX_PENDING_SWEEPS as u32 {
+            x.queue_sweep(a, coin, 7);
+        }
+        assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
+        assert!(x.counters.sweep_left > 0, "overflow is COUNTED, not dropped");
+    }
+
+    /// "Retry on the next idle" without a bound is a leg that burns the
+    /// address budget forever. When the retries are spent the entry
+    /// becomes `sweep_left` — the number E6 arms on.
+    #[test]
+    fn a_sweep_that_keeps_failing_is_given_up_on_and_counted() {
+        let mut x = exchange();
+        x.queue_sweep(77, *b"#1234560000000000000", 7);
+        assert_eq!(x.sweeps_n, 1);
+
+        for _ in 0..u32::from(SWEEP_TRIES) - 1 {
+            x.spend_try(0);
+            assert_eq!(x.sweeps_n, 1, "still pending while retries remain");
+            assert_eq!(x.counters.sweep_left, 0);
+        }
+        x.spend_try(0);
+        assert_eq!(x.sweeps_n, 0, "given up on");
+        assert_eq!(x.counters.sweep_left, 1, "and counted, exactly once");
+    }
+
     fn roll(outcome: u32, family: u8, settled: bool, sym: u32) -> ChannelEvent {
         // Built the way `ingress_hyperliquid::family::pack_roll_seq`
         // builds it, from its own source, NOT by calling our unpack in

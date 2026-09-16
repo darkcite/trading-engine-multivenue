@@ -1231,6 +1231,102 @@ Two venue constraints fell out of it:
   (see the BIN15 intraday note). Measured, per plan §6.5 — not read
   from a doc.
 
+### LAW E-8 — the roll takes its own quotes back
+
+On a roll and on a settle, every order this engine placed on the leg
+that just ended has to come off the book. `release_pendings` releases
+cap reservations only; in live mode the venue has to be told.
+
+**The list of what to cancel comes from the VENUE.** A table of open
+orders kept by the arm can disagree with the venue — and it disagrees
+*invisibly*, which is exactly how a restart or a missed ACK leaves a
+quote on a dead instance. Same principle as reconciliation: believe the
+venue, not our own record. One `frontendOpenOrders` round trip per
+roll, ~768/day across eight families against a budget of 10,000+.
+
+`frontendOpenOrders` rather than plain `openOrders` because **only that
+variant echoes the cloid**, and without it the sweep cannot tell an
+order this engine placed from one it did not. Cancelling a stranger's
+order would be the mirror image of booking a stranger's fill, so the
+selection (`recon::ours_on_leg`) takes two filters and needs both: the
+coin must match the ended leg exactly, and the cloid must decode as
+OURS (LAW E-9). Deleting either filter fails a test.
+
+**The sweep runs on the IDLE path, not in the roll handler.**
+`on_venue_event` runs inline on the engine thread, and a sweep is one
+info round trip plus a cancel per resting order — blocking it at roll
+time is blocking it at the exact moment the member wants to quote the
+successor. The roll records what it RETIRES (before the rebind
+overwrites the slot, after which the ended leg is unnameable) and the
+idle path drains one entry per call, which is also where `reconcile`
+lives and for the same reason.
+
+**The sweep's cancels are exempt from the submit budget**, and that is
+a risk-policy fact rather than an implementation detail. `AddressBudget`
+has always said so — `may_cancel` returns `true` unconditionally, with
+the note that a halted engine must be able to flatten — but that method
+had **no callers** until E5, because `submit` was the only verb and a
+submit is a submit. Giving three verbs one shared tail is exactly where
+that rule could have been inverted, and for a while it was: cancels
+answered to `may_submit`, so at the budget floor the engine's cancel
+verb stopped working and the sweep converted a transient squeeze into
+`sweep_left` — "orders left resting on a dead instance", the number E6's
+kill switch reads — while the real cause was our own governor, dropping
+the entry for good. `Spend::{Submit, Cancel}` now names which rule an
+action answers to at each call site. Cancels still COUNT against the
+address; they are never REFUSED by it.
+
+**A modify answers to the SUBMIT rule.** LAW E-7 makes it the requote
+path, not a way around the governor — and the budget matters *because*
+Arm B reprices ~333 times per instance, so a modify routed to
+`may_cancel` would let a member reprice past the floor indefinitely,
+which is the address-budget exhaustion the governor exists to prevent.
+**One case this gets wrong, deliberately**: a modify that REDUCES
+exposure — smaller size, or a price further from the market — is
+arguably an exit and is refused at the floor anyway. `Order` carries no
+reduce-only bit, which is the same limitation already recorded for
+`mode = "off"`, so treating every modify as a submit is the fail-closed
+choice with an existing precedent. **When the reduce-only bit lands
+with E6, this is one of the sites to revisit.**
+
+**A repeated roll retires nothing.** The venue re-sends
+`outcomeCreated` on a reconnect snapshot and a replayed ring entry
+carries it too, so the handler compares the bound asset against the one
+it is about to bind. Without that the queued asset is the very one the
+bind re-establishes as live, and the next idle would enumerate the
+account and cancel every quote on a LIVE leg — at the moment the member
+is quoting it.
+
+**It does not halt.** `sweep_left` counts what could not be taken off
+the book once the retries are spent, and E6 decides what that is worth
+— a halt inferred here would be a policy this file invented, the same
+reasoning that keeps `reconcile` from halting. "Retry on the next idle"
+is bounded at `SWEEP_TRIES` = 8, because retrying forever is a leg that
+burns the address budget forever. Queue overflow is counted as
+`sweep_left` too: a leg nobody swept and nobody counted is precisely
+the stranded quote this law exists to prevent.
+
+The counters grew `HlExecCounters` from three cache lines to four. That
+is a decision, not a surprise — the pin assertion exists to make it one.
+
+**Run 2026-09-16, testnet, `exec-smoke --sweep` on outcome 15417:**
+
+```
+{"cloid":"0x4d5603000000000000000000000001f5","placed_oid":60250817976,
+ "coin":"#154170","listed":true,"selected":true,"cancelled":true,
+ "gone_after":true,"unswept":false,"stopped":false,"passed":true}
+```
+
+The venue lists our order **with its cloid**, `recon::ours_on_leg` —
+**the arm's own selection, not a copy of it** — picks it out of the
+whole account, the cancel takes it off, and a **second enumerate**
+confirms it is gone. That last step is the point: *acked* and *gone*
+are different claims, and a venue that accepted a cancel and left the
+order resting would otherwise read as a pass. The leg's name `#154170`
+came from the venue's own row rather than being derived from the asset
+id — that derivation is the same class of guess LAW E-4 refuses in the
+other direction.
+
 ### Phase F — a requote is a MODIFY, and it changes the cloid
 
 LAW E-7 makes a live requote a modify rather than a cancel plus a
