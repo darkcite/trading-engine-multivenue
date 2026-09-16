@@ -239,9 +239,24 @@ struct ExecSmokeArgs {
     fill_slot: u8,
 
     /// Phase D client order id — what `Fill::order_id` must carry when
-    /// the fill is booked.
+    /// the fill is booked. With `--fill-repeat` this is the FIRST id;
+    /// each order gets the next one.
     #[arg(long, default_value_t = 1, requires = "fill")]
     fill_cloid: u64,
+
+    /// Phase D: place this many IoCs, back to back.
+    ///
+    /// E4's exit gate wants reconciliation agreeing over >= 20 fills,
+    /// and one invocation per fill is twenty chances to mistype a
+    /// number. The per-order notional ceiling still applies to EACH
+    /// order, so twenty small fills stay twenty small fills — and the
+    /// batch has its own bound. Each order carries its own cloid, so
+    /// every fill is distinguishable in `userFills`.
+    ///
+    /// The first refusal ENDS the batch: a venue refusing one order
+    /// will likely refuse the rest for the same reason.
+    #[arg(long, default_value_t = 1, requires = "fill")]
+    fill_repeat: u32,
 
     /// Subscribe to the USER-EVENT stream (userFills + orderUpdates)
     /// for this many seconds and report what arrives.
@@ -837,23 +852,28 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             is_buy: !args.sell,
             strategy_id: args.fill_slot,
             client_oid: args.fill_cloid,
+            repeat: args.fill_repeat,
         };
         return match exec_hyperliquid::lifecycle::preview_fill(spec) {
             Ok(p) => {
                 eprintln!(
                     "exec-smoke DRY RUN (phase D) — nothing was sent.\n\
                      \x20 asset {asset}\n\
-                     \x20 {side} {sz} @ {px}  =  {notional} USDC\n\
+                     \x20 {side} {sz} @ {px}  =  {notional} USDC per order\n\
+                     \x20 x{repeat} orders  =  {batch} USDC total\n\
                      \x20 IoC: this is MEANT TO TRADE, and an IoC is not meant to rest \
-                     — so there is nothing to cancel afterwards. Check the notional above \
+                     — so there is nothing to cancel afterwards. Check the totals above \
                      before running it for real\n\
-                     \x20 cloid {cloid} — look for this in userFills",
+                     \x20 cloids {cloid} .. {last} — look for these in userFills",
                     asset = args.asset,
                     side = if args.sell { "SELL" } else { "BUY" },
                     sz = p.sz,
                     px = p.px,
                     notional = p.notional,
+                    repeat = p.repeat,
+                    batch = p.batch_notional,
                     cloid = p.cloid,
+                    last = p.last_cloid,
                 );
                 println!("{}", p.place);
                 ExitCode::SUCCESS
@@ -1057,43 +1077,137 @@ fn exec_fill(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode
         is_buy: !args.sell,
         strategy_id: args.fill_slot,
         client_oid: args.fill_cloid,
+        repeat: args.fill_repeat,
     };
-    info!(?spec, "exec-smoke: phase D — placing an IoC that is MEANT TO TRADE on testnet");
+    info!(?spec, "exec-smoke: phase D — placing IoCs that are MEANT TO TRADE on testnet");
     let tls = TlsTransport::default_client_config();
     match exec_hyperliquid::lifecycle::run_fill(cfg, tls, spec) {
-        Ok(r) => {
+        Ok(run) => {
+            let r = run.report;
             let mut hex = [0u8; 34];
             let n = exec_hyperliquid::cloid::to_hex(&r.cloid, &mut hex);
             let cloid = String::from_utf8_lossy(&hex[..n]).to_string();
+            // UNCONDITIONAL, and before every verdict below. A batch
+            // that stopped has state on the venue; a caller parsing
+            // stdout must see it whatever the exit code turns out to
+            // be, and the shape this replaced printed nothing at all
+            // on exactly that path.
             println!(
-                "{{\"cloid\":\"{cloid}\",\"oid\":{},\"any_filled\":{},\"any_resting\":{}}}",
-                r.oid, r.any_filled, r.any_resting
+                "{{\"cloid\":\"{cloid}\",\"oid\":{},\"attempted\":{},\"sent\":{},\"filled\":{},\
+                 \"any_resting\":{},\"in_doubt\":{},\"stopped\":{}}}",
+                r.oid,
+                r.attempted,
+                r.sent,
+                r.filled,
+                r.any_resting,
+                r.in_doubt,
+                run.stopped.is_some()
             );
+            // Something MAY be on the book: the venue rested one, or a
+            // request went out whose answer we never read. NOT a venue
+            // refusal — that IS an answer, and it says nothing was
+            // placed. A non-crossing price is the most common outcome
+            // of this command, and an alarm that fires on it is an
+            // alarm nobody reads by the twentieth run.
+            if r.any_resting || r.in_doubt {
+                error!(
+                    first = %fill_cloid_hex(args.fill_slot, args.fill_cloid),
+                    last = %fill_cloid_hex(
+                        args.fill_slot,
+                        args.fill_cloid
+                            .saturating_add(u64::from(r.attempted.saturating_sub(1))),
+                    ),
+                    "exec-smoke: an order may be ON THE BOOK. Cancel by cloid across the range \
+                     above before doing anything else."
+                );
+            }
+            // A DIFFERENT fact with a different trigger: the venue has
+            // seen these ids, whether or not it placed anything, and it
+            // refuses a duplicate cloid. True of the benign refusal
+            // too, which is why it is not folded into the alarm above.
+            if r.attempted > 0 && run.stopped.is_some() {
+                warn!(
+                    "exec-smoke: the venue has already seen client ids {}..={}. Re-run with \
+                     --fill-cloid {} or higher, or it will refuse them as duplicates.",
+                    args.fill_cloid,
+                    args.fill_cloid
+                        .saturating_add(u64::from(r.attempted.saturating_sub(1))),
+                    args.fill_cloid.saturating_add(u64::from(r.attempted)),
+                );
+            }
             if r.any_resting {
                 error!(?r, "exec-smoke: an IoC RESTED — the venue did what the order type forbids");
                 return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
             }
-            if !r.any_filled {
+            if let Some(e) = run.stopped.as_ref() {
                 error!(
                     ?r,
-                    "exec-smoke: the IoC did not trade — the price did not cross. The venue \
-                     reported no resting order either, so this costs nothing but a retry."
+                    "exec-smoke: the batch STOPPED at order {} of {} — {e}. The most common \
+                     cause is the price not crossing, which the venue refuses outright and \
+                     which costs nothing but a retry. What printed above is what actually \
+                     happened; this run is NOT >= N fills and must not be counted as one.",
+                    r.attempted,
+                    args.fill_repeat,
+                );
+                return ExitCode::from(e.code() as u8);
+            }
+            if r.filled == 0 {
+                // Reached only when the venue ACKED every order with no
+                // error, yet none filled and none rested — a status the
+                // scanner recognises as neither. The ordinary
+                // did-not-cross case never gets here: the venue REFUSES
+                // it, so it arrives as `stopped` above, carrying the
+                // venue's own words. Fail-closed catch-all.
+                error!(
+                    ?r,
+                    "exec-smoke: every order was ACKED with no error, yet nothing filled and \
+                     nothing rested. The venue returned a status this binary does not \
+                     recognise — do not count this run, and read the raw answer."
                 );
                 return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
             }
+            if r.filled != r.sent {
+                error!(
+                    ?r,
+                    "exec-smoke: only some of the batch traded. Nothing was left resting, but \
+                     the run is NOT >= N fills and must not be counted as one."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            // The next free id, on the SUCCESS path too. The E4 gate
+            // wants >= 20 fills, so the natural workflow is run twenty,
+            // check reconciliation, run twenty more — and a clean run
+            // consumes its ids just as surely as a stopped one. Not an
+            // alarm, so it rides with the ACK rather than as a warning.
             info!(
                 oid = r.oid,
+                filled = r.filled,
                 cloid = %cloid,
+                next_fill_cloid = args.fill_cloid.saturating_add(u64::from(r.attempted)),
                 "exec-smoke: PHASE D ACK — the venue says filled. Per LAW E-5 that is the ACK, \
-                 NOT the fill: look for this cloid in userFills."
+                 NOT the fill: look for these cloids in userFills. A re-run must pass \
+                 --fill-cloid next_fill_cloid or the venue refuses the ids as duplicates."
             );
             ExitCode::SUCCESS
         }
         Err(e) => {
+            // `run_fill` reserves `Err` for the cases where NOTHING was
+            // sent, so there is nothing on the venue to report here.
             error!("{e}");
             ExitCode::from(e.code() as u8)
         }
     }
+}
+
+/// One cloid, rendered the way the venue prints it.
+///
+/// A batch's recovery range is two of these. An operator handed only
+/// its head cannot sweep it, which is why both ends are printed.
+fn fill_cloid_hex(slot: u8, client_oid: u64) -> String {
+    let c = exec_hyperliquid::cloid::encode(slot, client_oid);
+    let mut hex = [0u8; 34];
+    let n = exec_hyperliquid::cloid::to_hex(&c, &mut hex);
+    String::from_utf8_lossy(&hex[..n]).to_string()
 }
 
 /// Phase C: the order lifecycle round trip. Runs only AFTER phases A

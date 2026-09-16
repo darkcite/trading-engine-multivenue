@@ -473,26 +473,109 @@ pub struct FillSpec {
     pub strategy_id: u8,
     /// The member's own id for the order — what `Fill::order_id` must
     /// carry when the fill is booked.
+    ///
+    /// With `repeat > 1` this is the FIRST id; each order gets the
+    /// next one, so every fill is distinguishable in `userFills`.
     pub client_oid: u64,
+    /// How many IoCs to place, back to back.
+    ///
+    /// E4's exit gate wants reconciliation agreeing over >= 20 fills,
+    /// and one invocation per fill is twenty chances to mistype a
+    /// number. Repeating here keeps the per-order ceiling doing its
+    /// job — [`MAX_FILL_NOTIONAL_1E8`] is checked against ONE order,
+    /// not the batch, so twenty small fills stay twenty small fills.
+    ///
+    /// Bounded by [`MAX_FILL_REPEAT`]: a batch is still a number typed
+    /// on a command line.
+    pub repeat: u32,
 }
 
+/// The most IoCs one `--fill` invocation will place.
+///
+/// Sized for the >= 20 the E4 gate asks for, with room to redo a run
+/// that partly failed — and no more. The per-order notional ceiling
+/// bounds each order; this bounds the batch, because `--fill-repeat`
+/// is the one number where a slipped digit multiplies rather than
+/// scales.
+pub const MAX_FILL_REPEAT: u32 = 32;
+
 /// What the trade observed. **The ACK, not the fill** (LAW E-5).
+///
+/// Every field describes what ACTUALLY happened, including when the
+/// batch stopped early — see [`FillRun`]. A report that existed only
+/// on the success path would lose the one case that matters: an order
+/// the venue rested, or one that traded, sitting behind a later
+/// refusal that threw the counts away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FillReport {
-    /// The cloid sent — look for this in `userFills`.
+    /// The cloid of the last order the venue ACKED — look for it in
+    /// `userFills`. The batch numbers its orders
+    /// `client_oid ..< client_oid + attempted`, so a caller holding
+    /// the spec can derive every one of them.
     pub cloid: [u8; 16],
-    /// The oid the venue echoed.
+    /// The oid the venue echoed for that order.
     pub oid: u64,
-    /// The venue said `filled`.
-    pub any_filled: bool,
-    /// The venue said `resting`. **An IoC should never rest**; if this
-    /// is true the venue did something the order type forbids — and
-    /// the order is then ON THE BOOK. There is no cleanup path here
-    /// (an IoC is not supposed to need one), so the caller must cancel
-    /// it. The cloid is deterministic — `cloid::encode(strategy_id,
-    /// client_oid)` — so it can be cancelled by cloid from the same
-    /// two numbers that placed it.
+    /// Requests that LEFT THE PROCESS.
+    ///
+    /// `attempted > sent` means the last one's fate is **unknown**: a
+    /// send that fails after the venue has read it still placed the
+    /// order. Recovery must cover the whole `attempted` range, not the
+    /// `sent` one.
+    ///
+    /// Conservative by one in two sub-cases: a signing or envelope
+    /// failure inside `post` happens before the socket, and this is
+    /// incremented before `post` is called. Sweeping one cloid that
+    /// was never sent costs a lookup; missing one that was costs an
+    /// order. See `in_doubt` for the bit that is actually actionable.
+    pub attempted: u32,
+    /// A request left the process and its fate is **UNKNOWN**.
+    ///
+    /// A venue that ANSWERED — even to refuse — is NOT this: it told
+    /// us nothing was placed. Only a transport failure or an answer we
+    /// could not parse leaves an order genuinely in doubt.
+    ///
+    /// The distinction is the difference between an alarm and noise. A
+    /// non-crossing IoC is REFUSED by the venue, and that is the most
+    /// common outcome of this command; `attempted != sent` alone is
+    /// true then, so warning on it would fire "an order may be on the
+    /// book" on the one run where the venue has just told us the
+    /// opposite — and an alarm that cries wolf on the routine case is
+    /// not guarding the stranded IoC it exists for.
+    pub in_doubt: bool,
+    /// Of those, how many the venue ACKED.
+    pub sent: u32,
+    /// Of those, how many the venue said `filled`.
+    pub filled: u32,
+    /// The venue said `resting` for any of them. **An IoC should never
+    /// rest**; if this is true the venue did something the order type
+    /// forbids — and the order is then ON THE BOOK. There is no
+    /// cleanup path here (an IoC is not supposed to need one), so the
+    /// caller must cancel it. The cloid is deterministic —
+    /// `cloid::encode(strategy_id, client_oid + i)` — so it can be
+    /// cancelled by cloid from the same numbers that placed it.
     pub any_resting: bool,
+}
+
+/// A batch and how it ended.
+///
+/// [`run_fill_on`] returns `Err` **only when nothing left the
+/// process** — a refused spec, a missing key, the mainnet guard. Once
+/// the first request goes out it always returns `Ok`, because by then
+/// there is state on the venue, and an error carrying none of it would
+/// hide exactly what recovery needs.
+///
+/// That distinction is not theoretical. The shape this replaced
+/// accumulated into a local and returned it only on the happy path, so
+/// a batch that had an IoC RESTED at order 4 and was refused at order
+/// 5 reported the refusal and **nothing about the resting order** — on
+/// the one path in this repo that has no cleanup behind it.
+#[derive(Debug)]
+pub struct FillRun {
+    /// Everything the batch actually did.
+    pub report: FillReport,
+    /// Why it stopped short of `repeat`, if it did. `None` means every
+    /// one of the `repeat` orders was sent and ACKED.
+    pub stopped: Option<SmokeErr>,
 }
 
 /// The spec checks, shared by [`run_fill_on`] and [`preview_fill`] so
@@ -511,6 +594,38 @@ fn check_fill_spec(spec: FillSpec) -> Result<(), SmokeErr> {
     // i128 so the multiply cannot wrap before the comparison — the
     // guard would otherwise be defeated by exactly the mistyped size
     // it exists to catch.
+    if spec.repeat == 0 || spec.repeat > MAX_FILL_REPEAT {
+        return Err(SmokeErr::Lifecycle {
+            stage: "fill-spec",
+            msg: format!(
+                "repeat must be 1..={MAX_FILL_REPEAT}; a batch is still a number typed on a \
+                 command line, and this is the one where a slipped digit multiplies"
+            ),
+        });
+    }
+    // The batch numbers its orders `client_oid ..< client_oid +
+    // repeat`. Unchecked, that add WRAPS in release (`overflow-checks
+    // = false`), and a wrapped id is a cloid for an order nobody asked
+    // for — one whose low 32 bits are the roll instance
+    // `core_types::OID_INSTANCE_MASK` names, a meaning agreed between
+    // two crates that cannot see each other. Refused HERE rather than
+    // in the loop, so the dry run refuses exactly what the send does.
+    if spec
+        .client_oid
+        .checked_add(u64::from(spec.repeat).saturating_sub(1))
+        .is_none()
+    {
+        return Err(SmokeErr::Lifecycle {
+            stage: "fill-spec",
+            msg: format!(
+                "client_oid {} + repeat {} overflows u64 — the tail of the batch would carry \
+                 client ids nobody asked for",
+                spec.client_oid, spec.repeat
+            ),
+        });
+    }
+    // Per ORDER, not per batch. The ceiling exists to catch a mistyped
+    // price or size, and twenty small fills are twenty small fills.
     let notional = i128::from(spec.px_1e8) * i128::from(spec.sz_1e8) / 100_000_000;
     if notional > MAX_FILL_NOTIONAL_1E8 {
         return Err(SmokeErr::Lifecycle {
@@ -545,8 +660,18 @@ pub fn preview_fill(spec: FillSpec) -> Result<FillPreview, SmokeErr> {
         .with_cloid(cloid);
     let mut buf = [0u8; MAX_ACTION];
     let n = order_json(&mut buf, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    // The LAST id too. It is the number a cancel-by-cloid recovery
+    // needs, and `check_fill_spec` has already refused the range that
+    // would wrap, so the saturation below is belt.
+    let last = crate::cloid::encode(
+        spec.strategy_id,
+        spec.client_oid
+            .saturating_add(u64::from(spec.repeat).saturating_sub(1)),
+    );
     let mut hex = [0u8; 34];
     let hn = crate::cloid::to_hex(&cloid, &mut hex);
+    let mut lhex = [0u8; 34];
+    let ln = crate::cloid::to_hex(&last, &mut lhex);
     Ok(FillPreview {
         place: String::from_utf8_lossy(&buf[..n]).to_string(),
         px: wire_str(spec.px_1e8),
@@ -554,7 +679,13 @@ pub fn preview_fill(spec: FillSpec) -> Result<FillPreview, SmokeErr> {
         notional: wire_str(
             ((i128::from(spec.px_1e8) * i128::from(spec.sz_1e8)) / 100_000_000) as i64,
         ),
+        batch_notional: wire_str(
+            ((i128::from(spec.px_1e8) * i128::from(spec.sz_1e8) * i128::from(spec.repeat))
+                / 100_000_000) as i64,
+        ),
+        repeat: spec.repeat,
         cloid: String::from_utf8_lossy(&hex[..hn]).to_string(),
+        last_cloid: String::from_utf8_lossy(&lhex[..ln]).to_string(),
     })
 }
 
@@ -567,13 +698,23 @@ pub struct FillPreview {
     pub px: String,
     /// The size as the venue will read it.
     pub sz: String,
-    /// `px × sz` — the number a misplaced decimal corrupts.
+    /// `px × sz` for ONE order — the number a misplaced decimal
+    /// corrupts.
     pub notional: String,
-    /// The cloid, hex. This is what to look for in `userFills`.
+    /// `notional × repeat` — what the whole batch spends.
+    pub batch_notional: String,
+    /// How many orders the batch will place.
+    pub repeat: u32,
+    /// The FIRST cloid, hex. This is what to look for in `userFills`.
     pub cloid: String,
+    /// The LAST cloid the batch will use, hex. Equal to `cloid` when
+    /// `repeat` is 1. Printed because the range — not its head — is
+    /// what a cancel-by-cloid recovery has to sweep.
+    pub last_cloid: String,
 }
 
-/// Place ONE IoC that is meant to trade, and report the venue's ACK.
+/// Place `spec.repeat` IoCs that are meant to trade, and report what
+/// the venue ACKED.
 ///
 /// Separate from [`run`] rather than a flag on it, because they are
 /// opposite in intent. `run` places a POST-ONLY order and treats a
@@ -595,13 +736,15 @@ pub struct FillPreview {
 /// `userFills` says; a caller that wants proof reads the stream.
 ///
 /// # Errors
-/// Not testnet, a non-positive price or size, or the venue refused the
-/// action.
+/// Not testnet, a refused spec, or the transport could not be built —
+/// that is, **only cases where nothing was sent**. A refusal that
+/// arrives mid-batch comes back as [`FillRun::stopped`], carrying the
+/// report of everything that had already happened.
 pub fn run_fill(
     cfg: &HlConfig,
     tls: Arc<rustls::ClientConfig>,
     spec: FillSpec,
-) -> Result<FillReport, SmokeErr> {
+) -> Result<FillRun, SmokeErr> {
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
@@ -619,32 +762,100 @@ pub fn run_fill_on(
     cfg: &HlConfig,
     http: &mut HlHttp,
     spec: FillSpec,
-) -> Result<FillReport, SmokeErr> {
+) -> Result<FillRun, SmokeErr> {
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
     check_fill_spec(spec)?;
 
     let sk = cfg.secret_key().map_err(SmokeErr::Config)?;
-    // OUR magic, so the echo decodes through `cloid::decode` exactly
-    // as a live fill would.
-    let cloid = crate::cloid::encode(spec.strategy_id, spec.client_oid);
     let mut nonces = crate::nonce::Nonce::new();
-
-    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Ioc)
-        .with_cloid(cloid);
     let mut mp = [0u8; MAX_ACTION];
     let mut aj = [0u8; MAX_ACTION];
-    let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
-    let aj_n = order_json(&mut aj, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
-    let ok = post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "fill")?;
 
-    Ok(FillReport {
-        cloid,
-        oid: ok.oid,
-        any_filled: ok.any_filled,
-        any_resting: ok.any_resting,
-    })
+    let mut run = FillRun {
+        report: FillReport {
+            cloid: [0u8; 16],
+            oid: 0,
+            attempted: 0,
+            in_doubt: false,
+            sent: 0,
+            filled: 0,
+            any_resting: false,
+        },
+        stopped: None,
+    };
+    // SEQUENTIAL, one at a time. A batch action would be one signature
+    // and one nonce for twenty orders — faster, and it would make a
+    // partial refusal impossible to read: LAW E-5 says the response is
+    // the ACK, and an ACK covering twenty orders tells you nothing
+    // about which one the venue took.
+    //
+    // **Nothing below this line uses `?`.** Past the first send there
+    // is state on the venue, and `?` would drop the report describing
+    // it — including an IoC the venue rested, on the one path here
+    // that has no cleanup behind it.
+    for i in 0..spec.repeat {
+        // Already refused by `check_fill_spec`; belt, because the
+        // failure is silent in release and the value is a client id.
+        let Some(oid_i) = spec.client_oid.checked_add(u64::from(i)) else {
+            run.stopped = Some(SmokeErr::Lifecycle {
+                stage: "fill",
+                msg: "client_oid + repeat overflowed u64".to_owned(),
+            });
+            break;
+        };
+        // OUR magic, so the echo decodes through `cloid::decode`
+        // exactly as a live fill would — and a DISTINCT client id per
+        // order, so every fill is distinguishable in `userFills`.
+        let cloid = crate::cloid::encode(spec.strategy_id, oid_i);
+        let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Ioc)
+            .with_cloid(cloid);
+        let Ok(mp_n) = encode_order(&mut mp, &[order], b"na") else {
+            run.stopped = Some(SmokeErr::Encode);
+            break;
+        };
+        let Ok(aj_n) = order_json(&mut aj, &[order], b"na") else {
+            run.stopped = Some(SmokeErr::Encode);
+            break;
+        };
+
+        // ATTEMPTED before the send, never after. A request that fails
+        // on the way back was still READ by the venue, and an order
+        // placed by a request whose answer we never saw is the one an
+        // operator most needs to hear about.
+        run.report.attempted += 1;
+
+        // The FIRST refusal ends the batch. A venue refusing one order
+        // will likely refuse the next nineteen for the same reason,
+        // and nineteen more refusals is nineteen more nonces spent to
+        // learn nothing. The report says what happened up to here.
+        let ok = match post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "fill") {
+            Ok(ok) => ok,
+            Err(e) => {
+                // The ONE site that knows which refusals are answers.
+                // `Lifecycle` is the venue's own refusal, envelope- or
+                // item-level: it placed nothing. `Sign` and `Encode`
+                // happen before the socket. Everything else — and
+                // anything added later — defaults to doubt, because an
+                // alarm that a new variant silently disarms is worse
+                // than one that over-fires.
+                run.report.in_doubt = !matches!(
+                    e,
+                    SmokeErr::Lifecycle { .. } | SmokeErr::Sign | SmokeErr::Encode
+                );
+                run.stopped = Some(e);
+                break;
+            }
+        };
+
+        run.report.cloid = cloid;
+        run.report.oid = ok.oid;
+        run.report.sent += 1;
+        run.report.filled += u32::from(ok.any_filled);
+        run.report.any_resting |= ok.any_resting;
+    }
+    Ok(run)
 }
 
 /// A cloid for the smoke's own probes. **Deliberately NOT our magic**
@@ -677,7 +888,94 @@ mod fill_tests {
             is_buy: true,
             strategy_id: 3,
             client_oid: 1,
+            repeat: 1,
         }
+    }
+
+    /// The ceiling is PER ORDER, so a repeat does not scale it — and
+    /// the repeat has its own bound, because it is the one number
+    /// where a slipped digit multiplies rather than scales.
+    #[test]
+    fn the_batch_size_is_bounded_on_its_own() {
+        let mut s = spec();
+        s.repeat = MAX_FILL_REPEAT;
+        assert!(check_fill_spec(s).is_ok(), "the bound itself is usable");
+        s.repeat = MAX_FILL_REPEAT + 1;
+        assert!(check_fill_spec(s).is_err());
+        s.repeat = 0;
+        assert!(check_fill_spec(s).is_err(), "a batch of nothing is a typo");
+
+        let mut s = spec();
+        s.repeat = MAX_FILL_REPEAT;
+        let p = preview_fill(s).expect("previews");
+        assert_eq!(p.notional, "1.36", "one order");
+        assert_eq!(p.batch_notional, "43.52", "and what the batch spends");
+        assert_eq!(p.repeat, MAX_FILL_REPEAT);
+    }
+
+    /// The preview discloses the whole cloid RANGE. Its head alone is
+    /// not enough: a cancel-by-cloid recovery has to sweep to the tail,
+    /// and an operator who cannot see the tail cannot re-run without
+    /// colliding with ids the venue has already seen.
+    #[test]
+    fn the_preview_names_both_ends_of_the_cloid_range() {
+        let one = preview_fill(spec()).expect("previews");
+        assert_eq!(one.cloid, one.last_cloid, "one order has one cloid");
+
+        let mut s = spec();
+        s.repeat = 20;
+        let p = preview_fill(s).expect("previews");
+        assert_ne!(p.cloid, p.last_cloid);
+        let mut hex = [0u8; 34];
+        let n = crate::cloid::to_hex(&crate::cloid::encode(3, 20), &mut hex);
+        assert_eq!(
+            p.last_cloid,
+            String::from_utf8_lossy(&hex[..n]),
+            "client_oid 1 + 20 orders ends at 20"
+        );
+    }
+
+    /// The batch numbers its orders from `client_oid`, and that add is
+    /// UNCHECKED in release (`overflow-checks = false`). Refused in the
+    /// spec check, so the rehearsal refuses what the send would — the
+    /// same shape `asset_id` and `event.sym + 1` were given after both
+    /// shipped able to wrap.
+    #[test]
+    fn a_batch_that_would_wrap_the_client_id_is_refused() {
+        let mut s = spec();
+        s.client_oid = u64::MAX;
+        s.repeat = 1;
+        assert!(
+            check_fill_spec(s).is_ok(),
+            "a single order needs no room above it"
+        );
+
+        s.repeat = 2;
+        assert!(
+            check_fill_spec(s).is_err(),
+            "the second order's id would wrap to 0 — a cloid nobody asked for"
+        );
+        assert!(
+            preview_fill(s).is_err(),
+            "and the rehearsal must refuse exactly what the send does"
+        );
+    }
+
+    /// Every order in a batch gets a DISTINCT cloid, or the fills are
+    /// indistinguishable in `userFills` and the >= 20-fill evidence is
+    /// twenty copies of one row.
+    #[test]
+    fn each_order_in_a_batch_carries_its_own_client_id() {
+        let a = crate::cloid::encode(3, 1);
+        let b = crate::cloid::encode(3, 2);
+        assert_ne!(a, b);
+        assert_eq!(
+            crate::cloid::decode(&b),
+            crate::cloid::Owner::Ours {
+                strategy_id: 3,
+                client_oid: 2
+            }
+        );
     }
 
     /// The trading path gets the SAME mainnet refusal the post-only

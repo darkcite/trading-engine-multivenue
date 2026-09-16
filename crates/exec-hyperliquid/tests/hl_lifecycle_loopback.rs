@@ -172,6 +172,7 @@ fn fill_spec() -> FillSpec {
         is_buy: true,
         strategy_id: 3,
         client_oid: 1,
+        repeat: 1,
     }
 }
 
@@ -181,9 +182,13 @@ fn fill_spec() -> FillSpec {
 fn a_fill_takes_exactly_one_request_and_returns_the_cloid_it_sent() {
     let (port, tls, served) = boot(&[FILLED]);
     let mut http = client(port, tls);
-    let r = run_fill_on(&cfg(), &mut http, fill_spec()).expect("fill");
+    let run = run_fill_on(&cfg(), &mut http, fill_spec()).expect("fill");
+    let r = run.report;
 
-    assert!(r.any_filled);
+    assert!(run.stopped.is_none(), "the batch finished");
+    assert_eq!(r.filled, 1);
+    assert_eq!(r.sent, 1);
+    assert_eq!(r.attempted, 1);
     assert!(!r.any_resting, "an IoC must not rest");
     assert_eq!(
         served.load(Ordering::SeqCst),
@@ -195,6 +200,91 @@ fn a_fill_takes_exactly_one_request_and_returns_the_cloid_it_sent() {
     assert_eq!(r.cloid, exec_hyperliquid::cloid::encode(3, 1));
 }
 
+/// A BATCH is N sequential orders, each its own signature, nonce and
+/// ACK. Not one batched action: LAW E-5 says the response is the ACK,
+/// and an ACK covering twenty orders tells you nothing about which one
+/// the venue took.
+#[test]
+fn a_batch_places_one_request_per_order() {
+    let (port, tls, served) = boot(&[FILLED, FILLED, FILLED]);
+    let mut http = client(port, tls);
+    let mut s = fill_spec();
+    s.repeat = 3;
+    let run = run_fill_on(&cfg(), &mut http, s).expect("batch");
+    let r = run.report;
+
+    assert!(run.stopped.is_none());
+    assert_eq!(r.attempted, 3);
+    assert_eq!(r.sent, 3);
+    assert_eq!(r.filled, 3);
+    assert_eq!(served.load(Ordering::SeqCst), 3, "one request per order");
+    // The LAST cloid is reported; the others are derivable from the
+    // first client id, which is what makes a stranded order
+    // recoverable.
+    assert_eq!(r.cloid, exec_hyperliquid::cloid::encode(3, 3));
+}
+
+/// **The first refusal ENDS the batch — and the batch still reports
+/// what it did.** The earlier shape accumulated into a local and
+/// returned it only on the happy path, so the order that REALLY TRADED
+/// before the refusal came back as an error string and nothing else.
+/// This scripts exactly that: order 1 fills, order 2 is refused.
+#[test]
+fn a_refusal_stops_the_batch_but_never_hides_what_already_happened() {
+    let (port, tls, served) = boot(&[FILLED, REJECTED, FILLED]);
+    let mut http = client(port, tls);
+    let mut s = fill_spec();
+    s.repeat = 3;
+    let run = run_fill_on(&cfg(), &mut http, s).expect("a stopped batch is not an Err");
+
+    let e = run.stopped.as_ref().expect("the refusal must surface");
+    assert!(
+        matches!(e, SmokeErr::Lifecycle { stage: "fill", .. }),
+        "{e:?}"
+    );
+    // The point of the test: the completed fill is STILL REPORTED.
+    assert_eq!(run.report.filled, 1, "order 1 really traded");
+    assert_eq!(run.report.sent, 1, "and exactly one was ACKED");
+    assert_eq!(run.report.attempted, 2, "two requests left the process");
+    assert_eq!(run.report.cloid, exec_hyperliquid::cloid::encode(3, 1));
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "the third order must never have been sent"
+    );
+}
+
+/// **The case the batch invented.** A venue that RESTS an IoC has done
+/// what the order type forbids, leaving an order on the book with no
+/// cleanup behind it — and if a LATER order is then refused, the whole
+/// report used to be discarded with the error. `any_resting` must
+/// survive the stop, or the operator is never told to go cancel it.
+#[test]
+fn a_rest_earlier_in_the_batch_survives_a_refusal_later() {
+    let (port, tls, served) = boot(&[FILLED, PLACED, REJECTED]);
+    let mut http = client(port, tls);
+    let mut s = fill_spec();
+    s.repeat = 3;
+    let run = run_fill_on(&cfg(), &mut http, s).expect("a stopped batch is not an Err");
+
+    assert!(
+        run.stopped.is_some(),
+        "the third order's refusal ended the batch"
+    );
+    assert!(
+        run.report.any_resting,
+        "THE ASSERTION: an IoC is on the book and the caller must hear about it"
+    );
+    assert!(
+        !run.report.in_doubt,
+        "every request was answered — the rest is KNOWN, not doubted"
+    );
+    assert_eq!(run.report.filled, 1);
+    assert_eq!(run.report.sent, 2, "the rest was ACKED too");
+    assert_eq!(run.report.attempted, 3);
+    assert_eq!(served.load(Ordering::SeqCst), 3);
+}
+
 /// **The branch the review asked for.** An IoC that RESTS is the venue
 /// doing what the order type forbids, and the order is then on the
 /// book with no cleanup path behind it. `run_fill_on` must surface it
@@ -203,23 +293,96 @@ fn a_fill_takes_exactly_one_request_and_returns_the_cloid_it_sent() {
 fn an_ioc_that_rested_is_reported_not_swallowed() {
     let (port, tls, _) = boot(&[PLACED]);
     let mut http = client(port, tls);
-    let r = run_fill_on(&cfg(), &mut http, fill_spec()).expect("the venue answered ok");
+    let r = run_fill_on(&cfg(), &mut http, fill_spec())
+        .expect("the venue answered ok")
+        .report;
     assert!(r.any_resting, "the caller must be able to SEE that it rested");
-    assert!(!r.any_filled);
+    assert_eq!(r.filled, 0);
     assert_ne!(r.oid, 0, "and must know which order to cancel");
 }
 
-/// A venue refusal on the trading path is an error, not a quiet
-/// `any_filled: false`.
+/// A venue refusal on the trading path is surfaced, not a quiet
+/// `filled: 0`. It rides in `stopped` rather than `Err` because `Err`
+/// now means the stricter thing: **nothing left the process**. The
+/// report proves that distinction — one request was attempted, none
+/// ACKED.
 #[test]
-fn a_refused_fill_is_an_error() {
+fn a_refused_fill_is_reported_as_a_stop_not_a_silent_zero() {
     let (port, tls, _) = boot(&[REJECTED]);
     let mut http = client(port, tls);
-    let e = run_fill_on(&cfg(), &mut http, fill_spec()).expect_err("refused");
+    let run = run_fill_on(&cfg(), &mut http, fill_spec()).expect("the venue answered");
+    let e = run.stopped.as_ref().expect("refused");
     assert!(
         matches!(e, SmokeErr::Lifecycle { stage: "fill", .. }),
         "{e:?}"
     );
+    assert_eq!(run.report.attempted, 1);
+    assert_eq!(run.report.sent, 0, "a refusal is not an ACK");
+    assert_eq!(run.report.filled, 0);
+    // THE ASSERTION. A non-crossing price is refused exactly like
+    // this, and it is the most common outcome of the whole command. An
+    // operator must NOT be sent hunting for a phantom order on it: the
+    // venue answered, and the answer was that it placed nothing. The
+    // CLI's "an order may be ON THE BOOK" alarm reads this bit, and an
+    // alarm that fires on the routine case is one nobody reads by the
+    // twentieth run.
+    assert!(
+        !run.report.in_doubt,
+        "the venue ANSWERED — a refusal is not doubt"
+    );
+}
+
+/// The other half of that bit. A transport failure means the request
+/// left and we never heard back — the venue may well have placed the
+/// order. That IS doubt, and the alarm must fire.
+///
+/// The fixture: one scripted body, two orders. The second request goes
+/// out, the server is out of answers and drops the socket.
+#[test]
+fn a_send_with_no_answer_is_the_case_the_alarm_exists_for() {
+    let (port, tls, served) = boot(&[FILLED]);
+    let mut http = client(port, tls);
+    let mut s = fill_spec();
+    s.repeat = 2;
+    let run = run_fill_on(&cfg(), &mut http, s).expect("a stopped batch is not an Err");
+
+    assert!(
+        matches!(run.stopped, Some(SmokeErr::Http(_))),
+        "{:?}",
+        run.stopped
+    );
+    assert!(
+        run.report.in_doubt,
+        "no answer came back — order 2 may be on the venue"
+    );
+    assert_eq!(run.report.attempted, 2, "and the range must cover it");
+    assert_eq!(run.report.sent, 1);
+    assert_eq!(run.report.filled, 1, "order 1 still traded");
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+}
+
+/// `Err` means NOTHING WAS SENT, and that has to be observable rather
+/// than documented: the socket is standing by with an answer and never
+/// gets a byte.
+#[test]
+fn an_err_from_the_fill_path_means_nothing_left_the_process() {
+    let (port, tls, served) = boot(&[FILLED]);
+    let mut http = client(port, tls);
+    let mut s = fill_spec();
+    s.client_oid = u64::MAX;
+    s.repeat = 2; // the second id would wrap to 0
+    let e = run_fill_on(&cfg(), &mut http, s).expect_err("the wrap must be refused");
+    assert!(
+        matches!(
+            e,
+            SmokeErr::Lifecycle {
+                stage: "fill-spec",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(served.load(Ordering::SeqCst), 0);
 }
 
 /// **Proof that the SEND calls the ceiling, not just that the ceiling

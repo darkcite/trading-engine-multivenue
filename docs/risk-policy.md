@@ -968,7 +968,8 @@ never been measured here.
 
 ### Phase D — the round trip LAW E-9 rests on, finally measured
 
-`exec-smoke --fill` places ONE IoC that is **meant to trade**. It is
+`exec-smoke --fill` places IoCs that are **meant to trade** — one by
+default, up to `--fill-repeat 32`. It is
 separate from `--lifecycle` rather than a flag on it because the two
 are opposite in intent: `--lifecycle` places a POST-ONLY order and
 treats a fill as a failure, which tests the lifecycle without trading.
@@ -983,11 +984,49 @@ guarantee this code enforces**: `FillReport::any_resting` exists
 precisely because a venue that rested an IoC would have done what the
 order type forbids, and if that ever happens the order is on the book
 with nothing behind it. The CLI exits nonzero and says so; recovery is
-a cancel-by-cloid, which is possible because the cloid is deterministic
-from the two numbers that placed it (`cloid::encode(slot, client_oid)`,
-defaulting to 3 and 1). A loopback test drives that branch.
+a cancel-by-cloid across the batch's whole id RANGE, which is possible
+because every cloid is deterministic from the two numbers that placed
+it — `cloid::encode(slot, client_oid + i)` for `i` in
+`0..attempted`, slot and first id defaulting to 3 and 1. Both ends are
+printed by the dry run and again by the recovery message. A loopback
+test drives that branch.
 
-Three guards, because this is the only path in the repo that executes
+**A batch makes that reporting load-bearing, so `Err` was narrowed to
+mean one thing: nothing left the process.** Anything that goes wrong
+once a request has gone out comes back as `Ok(FillRun)` with
+`stopped: Some(e)` and the report of everything already done. The first
+shape of `--fill-repeat` did the opposite — it accumulated counts into
+a local and returned them only on the happy path — so a batch that had
+an IoC rested at order 4 and was refused at order 5 reported the
+refusal and **nothing about the resting order**, on the one path here
+with no cleanup behind it. The CLI now prints the machine-readable line
+before any verdict, and names both ends of the cloid range whenever
+something may be on the book. `FillReport::attempted` counts requests
+that LEFT, not requests that were ACKED, because a send that fails on
+the way back was still read by the venue: recovery sweeps the attempted
+range. Two loopback cases drive it — `[FILLED, REJECTED, …]` must still
+report the fill, and `[FILLED, PLACED, REJECTED]` must still report the
+rest.
+
+**`attempted != sent` is not an alarm, and conflating the two nearly
+cost the alarm its meaning.** A non-crossing IoC is REFUSED by the
+venue — it arrives as `stopped`, carrying the venue's own words, not as
+a quiet zero-fill — and that is the most common outcome of this
+command. The venue answering "I placed nothing" is the opposite of
+doubt, so a warning keyed on `attempted != sent` would have printed
+*an order may be ON THE BOOK* on every ordinary retry, and the only
+alarm guarding the only unrecoverable state on this path would be one
+nobody reads by the twentieth run. `FillReport::in_doubt` carries the
+actionable bit instead, set at the single site that knows which
+refusals are answers: a transport failure or an unparseable answer is
+doubt; a venue refusal, a signing failure and an encode overflow are
+not, and any variant added later defaults to doubt. The cancel-by-cloid
+alarm reads `any_resting || in_doubt`; the separate advice to advance
+`--fill-cloid` past ids the venue has already seen is a `warn!` on its
+own trigger, because it is true of the benign refusal too. Two loopback
+cases pin the bit in both directions.
+
+Four guards, because this is the only path in the repo that executes
 by design:
 
 - **A dry run**, `--fill --dry-run`. `--lifecycle` has one, with the
@@ -1004,6 +1043,17 @@ by design:
   ruleset validator, and this path traverses none of them. An
   unbounded `i64` on the only executing path is not defensible even on
   testnet, because the shape is what a mainnet variant would copy.
+- **A batch bound**, `MAX_FILL_REPEAT` = 32, also a typo limit. The
+  notional ceiling stays **per order** — twenty small fills are meant
+  to stay twenty small fills, which is the whole point of the flag —
+  so the ceiling on one *invocation* is the product: **$100 × 32 =
+  $3,200**. That is the number one command can spend, written down
+  here because the per-order figure no longer answers the question.
+  The dry run prints both the per-order and the batch notional. The
+  same check refuses a `client_oid` range that would wrap `u64`: the
+  add is unchecked in release (`overflow-checks = false`), and the low
+  32 bits of a client id are the roll instance `OID_INSTANCE_MASK`
+  names.
 - **Tests on the guards themselves.** Mainnet refusal on both
   `run_fill` and the `run_fill_on` seam, the oversized-notional
   refusal (including that `i64::MAX × i64::MAX` cannot wrap past the
