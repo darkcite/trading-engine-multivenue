@@ -1035,7 +1035,8 @@ fn exec_recon(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
             println!(
                 "{{\"rows\":{},\"ours\":{},\"foreign\":{},\"settlements\":{},\
                  \"settlements_unowned\":{},\"legs\":{},\"refused\":{},\"balances\":{},\
-                 \"drift_legs\":{},\"legs_nonzero\":{},\"worst_qty_1e6\":{},\"worst_usd_1e6\":{},\
+                 \"drift_legs\":{},\"legs_nonzero\":{},\"venue_legs_unreconciled\":{},\
+                 \"worst_qty_1e6\":{},\"worst_usd_1e6\":{},\
                  \"agreed\":{}}}",
                 l.rows,
                 l.ours,
@@ -1047,6 +1048,7 @@ fn exec_recon(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
                 r.balances,
                 r.drift_legs,
                 r.legs_nonzero,
+                r.venue_legs_unreconciled,
                 r.worst_qty_1e6,
                 r.worst_usd_1e6,
                 r.agreed(),
@@ -1075,6 +1077,23 @@ fn exec_recon(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
                 );
                 return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
             }
+            // A run that agreed on every leg it LOOKED AT, while the
+            // venue holds a leg it never looked at, has not reconciled
+            // the account. Its own message, because "the ledger and
+            // the venue differ" and "this run did not cover everything
+            // the account holds" need different things done about them.
+            if r.venue_legs_unreconciled > 0 {
+                error!(
+                    venue_legs_unreconciled = r.venue_legs_unreconciled,
+                    legs = l.legs,
+                    balances = r.balances,
+                    "exec-recon: the venue holds outcome legs this run NEVER COMPARED. Phase E \
+                     reaches only the intersection of the userFills snapshot window and our own \
+                     fills, so a position whose trades aged out of that window reads as \
+                     agreement by absence. This is not a pass."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
             if !r.agreed() {
                 error!(
                     legs = l.legs,
@@ -1094,7 +1113,8 @@ fn exec_recon(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
                 settlements = l.settlements,
                 foreign = l.foreign,
                 balances = r.balances,
-                "exec-recon: AGREED on every leg."
+                "exec-recon: AGREED on every leg, and the venue holds no outcome leg this run \
+                 did not compare."
             );
             ExitCode::SUCCESS
         }

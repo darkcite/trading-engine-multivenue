@@ -311,6 +311,56 @@ pub fn compare_booked(
     (drift_legs, worst)
 }
 
+/// Outcome legs the VENUE holds that the comparison never looked at.
+///
+/// **The blind spot `compare_booked` cannot see by construction.** That
+/// function walks OUR legs, and a leg is bound only from fills present
+/// in the `userFills` snapshot — so a position we still hold whose
+/// trades are older than the venue's snapshot depth is never bound,
+/// never compared, and reads as agreement **by absence**. The asymmetry
+/// is not small: a phase E run that compared 2 legs did so against 18
+/// rows of balance sheet.
+///
+/// This is that gap, measured from the side that can see it: every
+/// `+<enc>` row the venue reports with a NON-ZERO holding that matched
+/// no bound leg. Non-zero because a leg the venue holds nothing of has
+/// nothing to reconcile — counting those would bury the real ones in
+/// the settled husks every account accumulates.
+///
+/// Rows that are not outcome legs (`USDC` and friends) are skipped:
+/// this arm's ledger is positions in legs, and a quote-token balance is
+/// not a position it ever claimed to track.
+///
+/// A non-zero answer does not say the ledger is WRONG. It says this run
+/// did not reconcile everything the account holds — which is a
+/// different sentence from "agreed", and the two must not be printed as
+/// if they were the same.
+#[must_use]
+pub fn unreconciled_venue_legs(
+    assets: &crate::asset::AssetTable,
+    bal: &[SpotBalance],
+    body: &[u8],
+) -> u32 {
+    let mut n = 0u32;
+    let mut i = 0usize;
+    while i < bal.len() {
+        let coin = bal[i].coin.of(body);
+        i += 1;
+        // Only outcome legs, and only ones the venue actually holds.
+        if !matches!(coin.first(), Some(b'+')) || bal[i - 1].total_1e8 == 0 {
+            continue;
+        }
+        let mut matched = false;
+        assets.for_each_live(|_sym, bound, _booked| {
+            matched |= same_leg(coin, bound);
+        });
+        if !matched {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 /// The most one HIP-4 outcome contract can ever be worth, 1e6.
 ///
 /// A leg settles to **exactly 0 or 1 USDC** — that is what a binary
@@ -561,6 +611,57 @@ mod tests {
     ///
     /// Everything above is a body I wrote. This is one the venue did.
     const REAL: &str = include_str!("../tests/fixtures/hl/spot_state_testnet.json");
+
+    /// **The blind spot, measured from the side that can see it.**
+    ///
+    /// `compare_booked` walks OUR legs, so a position the venue holds
+    /// whose trades aged out of the `userFills` snapshot is never
+    /// bound, never compared, and reads as agreement BY ABSENCE. A
+    /// phase E run that compared 2 legs did so against 18 balance rows
+    /// — the asymmetry is not small, and nothing in the comparison can
+    /// notice it, because the thing it failed to look at is precisely
+    /// the thing it does not iterate.
+    #[test]
+    fn a_leg_the_venue_holds_and_we_never_bound_is_counted() {
+        let body = br#"{"balances":[
+            {"coin":"USDC","token":0,"total":"968.0386","hold":"0.0"},
+            {"coin":"+195641","token":1,"total":"40.0","hold":"0.0"},
+            {"coin":"+194180","token":2,"total":"7.0","hold":"0.0"},
+            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
+        ]}"#;
+        let mut bal = [SpotBalance::default(); MAX_SPOT_BALANCES];
+        let n = scan_spot_state(body, &mut bal).expect("scans");
+
+        // We bound only the leg our own fills named.
+        let mut a = crate::asset::AssetTable::new();
+        a.bind(4096, 0, 1, b"#195641").expect("binds");
+
+        assert_eq!(
+            unreconciled_venue_legs(&a, &bal[..n], body),
+            1,
+            "`+194180` is a real 7-unit position this run never compared"
+        );
+
+        // A leg the venue holds NOTHING of has nothing to reconcile —
+        // counting settled husks would bury the real ones. `+195720` is
+        // one, and every account accumulates them: the venue's own
+        // sheet volunteers thirteen zeroes for an account holding one
+        // coin.
+        a.bind(4098, 0, 1, b"#194180").expect("binds");
+        assert_eq!(
+            unreconciled_venue_legs(&a, &bal[..n], body),
+            0,
+            "the zero row must not count"
+        );
+
+        // USDC is not a position this arm's ledger ever claimed to
+        // track, so it is skipped rather than counted forever.
+        let only_quote = br#"{"balances":[{"coin":"USDC","token":0,"total":"968.0","hold":"0.0"}]}"#;
+        let mut b2 = [SpotBalance::default(); MAX_SPOT_BALANCES];
+        let n2 = scan_spot_state(only_quote, &mut b2).expect("scans");
+        let empty = crate::asset::AssetTable::new();
+        assert_eq!(unreconciled_venue_legs(&empty, &b2[..n2], only_quote), 0);
+    }
 
     #[test]
     fn the_venues_real_balance_sheet_scans() {

@@ -1015,6 +1015,19 @@ pub struct ReconReport {
     /// would pass on arithmetic alone. This says how much of the
     /// agreement is carrying weight.
     pub legs_nonzero: u32,
+    /// Outcome legs the VENUE holds that this run never compared.
+    ///
+    /// Phase E's reach is the intersection of the `userFills` snapshot
+    /// window and our own fills, so a position we still hold whose
+    /// trades aged out of that window is never bound and reads as
+    /// agreement **by absence**. This is that blind spot measured from
+    /// the side that can see it — see
+    /// [`crate::recon::unreconciled_venue_legs`].
+    ///
+    /// Non-zero does not mean the ledger is wrong. It means this run
+    /// did not reconcile everything the account holds, which is a
+    /// different sentence from "agreed".
+    pub venue_legs_unreconciled: u32,
     /// Worst single-leg disagreement, as a CONTRACT QUANTITY, 1e6.
     pub worst_qty_1e6: i64,
     /// The same number in the unit a halt rule is written in, through
@@ -1024,7 +1037,8 @@ pub struct ReconReport {
 }
 
 impl ReconReport {
-    /// Did the venue and the ledger agree, **over something**?
+    /// Did the venue and the ledger agree, over something, **about
+    /// everything the account holds**?
     ///
     /// `drift_legs == 0` alone answers a different question. It is
     /// accumulated inside `for_each_live`, which does not run at all
@@ -1036,9 +1050,14 @@ impl ReconReport {
     /// Reachable, not theoretical: a wrong master address, an account
     /// nothing has traded, or a snapshot of nothing but settlements all
     /// land there — and this is the E4 exit gate's evidence.
+    /// The third clause is the coverage one: a run that agreed on every
+    /// leg it looked at, while the venue holds a leg it never looked
+    /// at, has not reconciled the account — and E4's exit gate is about
+    /// the account, not about the subset that happened to fit in a
+    /// snapshot.
     #[must_use]
     pub const fn agreed(&self) -> bool {
-        self.ledger.legs > 0 && self.drift_legs == 0
+        self.ledger.legs > 0 && self.drift_legs == 0 && self.venue_legs_unreconciled == 0
     }
 }
 
@@ -1166,6 +1185,8 @@ pub fn run_recon(
     let rows = crate::recon::scan_spot_state(body, &mut bal).map_err(|_| SmokeErr::Unreadable)?;
 
     let (drift_legs, worst) = crate::recon::compare_booked(&assets, &bal[..rows], body);
+    let venue_legs_unreconciled =
+        crate::recon::unreconciled_venue_legs(&assets, &bal[..rows], body);
     let mut legs_nonzero = 0u32;
     assets.for_each_live(|_sym, _coin, booked_1e6| {
         if booked_1e6 != 0 {
@@ -1177,6 +1198,7 @@ pub fn run_recon(
         balances: u32::try_from(rows).unwrap_or(u32::MAX),
         drift_legs,
         legs_nonzero,
+        venue_legs_unreconciled,
         worst_qty_1e6: worst,
         worst_usd_1e6: crate::recon::drift_qty_to_usd_1e6(worst),
     })
@@ -1348,6 +1370,7 @@ mod recon_tests {
                 balances: 18,
                 drift_legs: 0,
                 legs_nonzero: ledger.legs,
+                venue_legs_unreconciled: 0,
                 worst_qty_1e6: 0,
                 worst_usd_1e6: 0,
             }

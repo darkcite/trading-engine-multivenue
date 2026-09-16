@@ -1108,19 +1108,29 @@ Three properties make it worth trusting:
   changed prints `agreed:false` and exits nonzero (see the two runs
   below).
 
-**What phase E does NOT cover, stated plainly.** Its reach is the
-*intersection* of the `userFills` snapshot window and our own fills.
+**Phase E's reach, and the number that measures it.** Its comparison is
+the *intersection* of the `userFills` snapshot window and our own fills:
 `compare_booked` walks OUR legs, and a leg is bound only from rows
 present in the snapshot — so a position we still hold whose trades are
-older than the venue's snapshot depth is never bound, never compared,
-and reads as agreement by absence. The runs below show the asymmetry:
-2 legs compared against 18 balance-sheet rows. A leg that aged out and
-then **settled** is harmless (a HIP-4 binary resolves the whole
-position, so the venue holds nothing either); a leg that aged out and
-is **still open** is the real blind spot. `legs_nonzero` says how much
-of an agreement is carrying weight rather than netting to zero. Closing
-the gap properly means counting `+<enc>` balance rows that matched no
-bound leg — worth doing before E6 arms anything on this number.
+older than the venue's snapshot depth would never be bound, never
+compared, and would read as agreement **by absence**. The asymmetry is
+not small: the runs below compared 2 legs against 18 balance-sheet rows.
+
+`recon::unreconciled_venue_legs` is that blind spot measured from the
+side that can see it — every `+<enc>` row the venue reports with a
+NON-ZERO holding that matched no bound leg. Non-zero because a leg the
+venue holds nothing of has nothing to reconcile, and counting settled
+husks would bury the real ones (the venue's own sheet volunteers
+thirteen zeroes for an account holding one coin). `agreed()` requires it
+to be zero, so **a run that agreed on every leg it looked at, while the
+account holds a leg it never looked at, is not a pass** — E4's gate is
+about the account, not about the subset that fitted in a snapshot.
+
+A leg that aged out and then **settled** was always harmless (a HIP-4
+binary resolves the whole position, so the venue holds nothing either);
+it is the leg that aged out and is **still open** that this catches.
+`legs_nonzero` is the companion number: how much of an agreement is
+carrying weight rather than netting to zero.
 
 The drift is reported **twice**: as a contract quantity, and in USD
 through `recon::drift_qty_to_usd_1e6`. The two are not the same number
