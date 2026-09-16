@@ -26,7 +26,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, Stream};
 
 use exec_hyperliquid::config::{HlConfig, Scope, HOST_TESTNET};
-use exec_hyperliquid::lifecycle::{run_fill_on, run_on, FillSpec, LifecycleSpec};
+use exec_hyperliquid::lifecycle::{run_fill_on, run_on, run_requote_on, FillSpec, LifecycleSpec};
 use exec_hyperliquid::smoke::SmokeErr;
 use exec_hyperliquid::HlHttp;
 
@@ -539,4 +539,165 @@ fn every_request_carries_a_distinct_nonce() {
     // reuse ONE nonce object per request, which would be the bug.
     let r = run_on(&cfg(), &mut http, spec()).expect("round trip");
     assert!(r.passed());
+}
+
+
+// ---- Phase F: the requote -------------------------------------------
+
+/// **The shape the whole probe rests on.** A requote passes only when
+/// the OLD cloid is gone AND the NEW one was really there. Four
+/// requests: place, modify, and two cancels that ARE the assertion.
+#[test]
+fn a_requote_passes_only_when_the_order_actually_moved() {
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, ALREADY_GONE, CANCELLED]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("requote");
+
+    assert!(r.passed());
+    assert!(r.old_cancel_refused, "cancelling the old id was refused");
+    assert!(r.new_cancel_succeeded, "cancelling the new id succeeded");
+    assert_eq!(r.placed_oid, 424242);
+    assert_eq!(served.load(Ordering::SeqCst), 4, "place, modify, verify, cleanup");
+}
+
+/// **A modify that left BOTH orders resting is a leak, not a requote.**
+/// The old id still cancels, so `old_cloid_gone` is false — and a
+/// verdict reading only `new_cloid_lived` would have called this a
+/// pass while two quotes sat on the book under one intent.
+#[test]
+fn a_modify_that_left_both_orders_resting_is_not_a_requote() {
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, CANCELLED, CANCELLED]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("the venue answered");
+
+    assert!(!r.old_cancel_refused, "the old id was still cancellable");
+    assert!(r.new_cancel_succeeded);
+    assert!(!r.passed());
+    // And BOTH were still swept: the cancels are the cleanup, so the
+    // failing path does not strand the very order it just found.
+    assert_eq!(served.load(Ordering::SeqCst), 4);
+}
+
+/// **A modify that killed the old order and created nothing** is the
+/// other half of the asymmetry. The old id is gone — which on its own
+/// looks exactly like success — but nothing answers to the new one.
+#[test]
+fn a_modify_that_created_nothing_is_not_a_requote_either() {
+    let (port, tls, _) = boot(&[PLACED, MODIFIED, ALREADY_GONE, ALREADY_GONE]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("the venue answered");
+
+    assert!(r.old_cancel_refused, "and this alone would have read as a pass");
+    assert!(!r.new_cancel_succeeded);
+    assert!(!r.passed());
+}
+
+/// A post-only requote that TRADES is measuring the market, not the
+/// venue's modify semantics — and it costs balance to learn nothing.
+/// The original must be taken back off the book before returning.
+#[test]
+fn a_requote_that_fills_sweeps_both_ids_rather_than_only_the_old_one() {
+    // place, the filling modify, then BOTH cancels.
+    let (port, tls, served) = boot(&[PLACED, FILLED, ALREADY_GONE, CANCELLED]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
+
+    assert!(
+        matches!(r.stopped, Some(SmokeErr::Lifecycle { stage: "modify", .. })),
+        "{:?}",
+        r.stopped
+    );
+    assert!(!r.passed());
+    // THE POINT: which id survives a failed modify is exactly what is
+    // unknown — the answer may have been lost after the venue acted —
+    // so both are swept. The old shape cancelled only the old one.
+    assert_eq!(served.load(Ordering::SeqCst), 4, "place, modify, and BOTH cancels");
+    assert!(!r.has_unswept(), "both cancels were answered");
+}
+
+/// **The regression the review found.** A transport failure on the
+/// LAST cancel used to return `Err` through a `?`, which left the NEW
+/// id — the one this probe's own hypothesis says is resting — unswept
+/// and, because the cloids come from a timestamp nobody typed,
+/// unnameable. The report must come back carrying both ids and saying
+/// which one went unanswered.
+#[test]
+fn a_cancel_that_never_answers_is_reported_with_the_id_to_go_and_find() {
+    // Three bodies for four requests: the last cancel gets no answer.
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, ALREADY_GONE]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
+
+    assert!(r.old_cancel_refused, "the old id was answered, and refused");
+    assert!(!r.unswept_old);
+    assert!(r.unswept_new, "the new id's cancel never came back");
+    assert!(r.has_unswept());
+    assert!(!r.passed(), "an unswept id is not a pass");
+    assert!(matches!(r.stopped, Some(SmokeErr::Http(_))), "{:?}", r.stopped);
+    // And the id is IN the report, which is the whole recovery path.
+    assert_eq!(r.new_cloid.len(), 16);
+    assert_ne!(r.new_cloid, r.old_cloid, "two distinct ids, both named");
+    assert_eq!(served.load(Ordering::SeqCst), 3);
+}
+
+/// The mainnet guard, on this seam too — checked rather than assumed
+/// from the fact that the three probes look alike.
+/// **The worst case, and the clause nothing else pins.** The socket
+/// dies before either cancel is answered, so TWO post-only orders may
+/// be on the book — and the only way an operator finds them is the two
+/// hex ids in this report, because they are a marker plus a millisecond
+/// nobody typed.
+///
+/// Also the only witness for `!unswept_old` in `passed()`: every other
+/// case answers the third request.
+#[test]
+fn both_ids_go_unswept_when_the_socket_dies_before_either_cancel() {
+    let (port, tls, served) = boot(&[PLACED, MODIFIED]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
+
+    assert!(r.unswept_old, "the old id's cancel never came back");
+    assert!(r.unswept_new, "and the new one was still ATTEMPTED, then did not either");
+    assert!(r.has_unswept());
+    assert!(!r.passed());
+    assert!(!r.old_cancel_refused, "no answer is not evidence the old id is gone");
+    assert!(!r.new_cancel_succeeded);
+    // Both ids are named, which is the entire recovery path.
+    assert_ne!(r.old_cloid, r.new_cloid);
+    assert_eq!(r.old_cloid[0], 0xE3, "a probe id, not one of ours");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
+/// A place whose answer never comes back cannot tell whether the order
+/// is resting. It holds the cloid, so the sweep still runs — walking
+/// away would leave a post-only order under an id nothing prints.
+#[test]
+fn a_place_with_no_answer_still_sweeps_rather_than_returning_err() {
+    let (port, tls, served) = boot(&[]);
+    let mut http = client(port, tls);
+    let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
+
+    assert!(r.stopped.is_some(), "the place failed");
+    assert_eq!(r.placed_oid, 0, "no oid was ever echoed");
+    assert!(r.has_unswept());
+    assert!(!r.passed());
+    assert_ne!(r.old_cloid, r.new_cloid, "and both ids are still named");
+    assert_eq!(served.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_requote_refuses_mainnet() {
+    let (port, tls, served) = boot(&[PLACED]);
+    let mut http = client(port, tls);
+    let m = HlConfig::new(
+        Scope::Live,
+        exec_hyperliquid::config::HOST_MAINNET,
+        'a',
+        KEY,
+        ADDR,
+    )
+    .expect("cfg");
+    let e = run_requote_on(&m, &mut http, spec()).expect_err("mainnet must be refused");
+    assert!(matches!(e, SmokeErr::NotTestnet(_)), "{e:?}");
+    assert_eq!(served.load(Ordering::SeqCst), 0);
 }

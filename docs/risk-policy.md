@@ -1231,6 +1231,109 @@ Two venue constraints fell out of it:
   (see the BIN15 intraday note). Measured, per plan §6.5 — not read
   from a doc.
 
+### Phase F — a requote is a MODIFY, and it changes the cloid
+
+LAW E-7 makes a live requote a modify rather than a cancel plus a
+place: two requests instead of one, and at ~333 reprices per instance
+that is the difference between fitting inside the address budget and
+not. The operator ruling of 2026-09-16 added the second half — the
+replacement carries a **fresh** client id, so every `userFills` row maps
+to exactly one quote instead of to a cloid that has meant several
+different prices.
+
+**Neither half had been measured.** Phase C's modify targets the resting
+order by its VENUE oid and hands the replacement the SAME cloid, so
+nothing in this repo had ever asked the venue the question the ruling
+depends on. If the answer were no, the ruling could not be implemented
+as written — and that is a thing to learn from one testnet probe rather
+than from a live requote lane running at 333 per instance.
+
+`exec-smoke --requote` is four requests, post-only throughout, and **the
+last two are the assertion**:
+
+```text
+  place  cloid A, post-only     -> rests
+  modify BY cloid A -> cloid B  -> ok
+  cancel cloid A                -> must be REFUSED  (A is gone)
+  cancel cloid B                -> must SUCCEED     (B is real)
+```
+
+The asymmetry is the evidence and neither half carries it alone: a
+refusal on A is equally explained by a modify that killed A and created
+nothing, and a success on B is equally explained by a modify that left
+**both** resting — which is a leak, not a requote. Only the pair says
+the order MOVED. Each half is pinned by its own loopback case, and
+reducing `passed()` to either one makes the other case fail.
+
+The probe is self-cleaning because the verification IS the cleanup —
+**and nothing past the place uses `?`**. The first version did, on the
+first cancel, which left the NEW id unswept and unnamed on a transport
+failure: the id the probe's own hypothesis says is resting. Phase C
+gets away with the same shape only because its `?` sits AFTER its
+successful cancel; phase F is the first probe in this lane to hold two
+ids at once, and it swept one. `Err` from `run_requote_on` now means
+**nothing has been sent** — testnet, the spec, the two encodes, and
+nothing else. Every failure from the first request onwards, **the place
+included**, comes back as `Ok` with `stopped` set, `unswept_old` /
+`unswept_new` saying which cancel went unanswered, and **both client
+ids printed**. The place was the last stage still returning `Err` after
+a send, and it had two ways to strand an order: a lost answer, and a
+venue reply saying RESTING with no oid echoed back. The second used to
+share a message with "not resting" — opposite situations, since one
+strands nothing and the other is on the book. Both now fall through to
+the sweep, which needs no oid because it cancels by cloid. That last part is the
+whole recovery path: the ids are a marker plus a millisecond nobody
+typed, so an order left under one of them is otherwise findable only by
+listing open orders in the venue UI.
+
+The field names say what they MEASURE. `old_cancel_refused` is not
+`old_cloid_gone`: a per-item refusal for some reason other than the
+order's non-existence would read the same. That case is narrow rather
+than absent — an envelope-level failure (a rate limit, a rejected
+signature) becomes `stopped` whatever the stage, so what remains is a
+per-item refusal of a well-formed cancel for a cloid this probe built
+itself. Narrow is not impossible, and the honest name is what keeps the
+difference visible.
+
+Three details that are easy to get wrong and are written down rather
+than rediscovered:
+
+- **The two probe cloids are DERIVED, not drawn twice.** `fresh_cloid`
+  is a marker plus a millisecond timestamp and the two calls are
+  microseconds apart, so drawing again would collide most of the time —
+  and a probe whose two ids are equal proves the opposite of what it
+  claims while looking like a pass.
+- **Byte 15 is that timestamp's LSB**, so two runs exactly one
+  millisecond apart can produce swapped pairs — run 1's B is run 2's A.
+  Harmless for a four-round-trip probe that sweeps both ids, and
+  recorded rather than rediscovered.
+- **Whether a per-item error is a failure or the answer is now a
+  PARAMETER**, not a stage-name string compare. `post` used to gate on
+  `stage != "verify" && stage != "cleanup"`, with no compile-time link
+  to any caller — and phase F doubled the number of callers depending
+  on those exact spellings. A stage renamed to `verify-old` would have
+  the venue's "already canceled", the precise answer this probe exists
+  to obtain, come back as an error. `ItemErrors::{AreFailures, AreData}`
+  makes the choice explicit at each call site.
+
+**Run 2026-09-16, testnet, outcome 15417 (asset 100154170), a resting
+bid at 0.30 moved to 0.31:**
+
+```
+{"old_cloid":"0xe35c000000000000000001a0a8cbcf62",
+ "new_cloid":"0xe35c000000000000000001a0a8cbcf63",
+ "placed_oid":60246216459,"modified_oid":60246217044,
+ "old_cancel_refused":true,"new_cancel_succeeded":true,
+ "unswept_old":false,"unswept_new":false,"stopped":false,"passed":true}
+```
+
+**The venue accepts it.** LAW E-7 with a fresh cloid per requote is
+implementable. One thing fell out that the probe was not looking for:
+the modify issued a **new oid** (…459 → …044), which is precisely why
+cancel-by-cloid is the durable handle and an oid captured at placement
+is not — a client that tracked only the oid could not cancel what it
+had just requoted.
+
 ### PAPER and VENUE are two numbers, never one
 
 Plan §6.4. The moment one fill carries `origin = VENUE`, every reader of

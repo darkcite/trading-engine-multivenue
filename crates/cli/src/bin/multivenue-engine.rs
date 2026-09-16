@@ -262,6 +262,31 @@ struct ExecSmokeArgs {
     #[arg(long, default_value_t = 1, requires = "fill")]
     fill_repeat: u32,
 
+    /// PHASE F: prove a requote is a MODIFY that may CHANGE the cloid.
+    ///
+    /// LAW E-7 makes a live requote a modify rather than a cancel plus
+    /// a place — two requests instead of one, at 333 reprices per
+    /// instance. The 2026-09-16 ruling added the second half: the
+    /// replacement carries a FRESH client id, so every `userFills` row
+    /// maps to exactly one quote.
+    ///
+    /// **Neither half has been measured.** `--lifecycle` targets the
+    /// resting order by its VENUE oid and reuses the cloid, so nothing
+    /// here has ever asked the venue whether a modify addressed BY
+    /// CLOID can also change it. If it cannot, the ruling cannot be
+    /// implemented as written.
+    ///
+    /// Four requests, post-only throughout, and the last two ARE the
+    /// assertion: cancelling the old id must be REFUSED and cancelling
+    /// the new one must SUCCEED. Neither half proves it alone — a
+    /// refusal on the old is equally explained by a modify that created
+    /// nothing, and a success on the new by one that left BOTH resting.
+    ///
+    /// Self-cleaning: the verification is the cleanup. Uses the same
+    /// `--px` / `--px2` / `--sz` as `--lifecycle`.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["offline", "lifecycle", "fill", "recon"])]
+    requote: bool,
+
     /// PHASE E: run the RECONCILIATION against the live venue.
     ///
     /// §6.2 calls reconciliation "the single most valuable safety net
@@ -1004,6 +1029,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
             if args.fill {
                 return exec_fill(&cfg, &args);
             }
+            if args.requote {
+                return exec_requote(&cfg, &args);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1351,6 +1379,14 @@ fn exec_fill(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode
 ///
 /// A batch's recovery range is two of these. An operator handed only
 /// its head cannot sweep it, which is why both ends are printed.
+/// The same, for a cloid this code did not build from a slot and an
+/// id — the phase F probe's own, which are a marker plus a timestamp.
+fn fill_cloid_hex_raw(c: &[u8; 16]) -> String {
+    let mut hex = [0u8; 34];
+    let n = exec_hyperliquid::cloid::to_hex(c, &mut hex);
+    String::from_utf8_lossy(&hex[..n]).to_string()
+}
+
 fn fill_cloid_hex(slot: u8, client_oid: u64) -> String {
     let c = exec_hyperliquid::cloid::encode(slot, client_oid);
     let mut hex = [0u8; 34];
@@ -1361,6 +1397,101 @@ fn fill_cloid_hex(slot: u8, client_oid: u64) -> String {
 /// Phase C: the order lifecycle round trip. Runs only AFTER phases A
 /// and B, because a lifecycle measured through a signature the venue
 /// cannot verify measures nothing.
+fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    let (Some(px), Some(px2), Some(sz)) = (args.px, args.px2, args.sz) else {
+        error!("exec-smoke: --requote needs --px, --px2 and --sz (all 1e8-scaled)");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    };
+    let spec = exec_hyperliquid::LifecycleSpec {
+        asset: args.asset,
+        px_1e8: px,
+        px2_1e8: px2,
+        sz_1e8: sz,
+        is_buy: !args.sell,
+    };
+    info!(
+        ?spec,
+        "exec-smoke: phase F — can a modify BY cloid also CHANGE the cloid? POST-ONLY throughout."
+    );
+    let tls = TlsTransport::default_client_config();
+    match exec_hyperliquid::lifecycle::run_requote(cfg, tls, spec) {
+        Ok(r) => {
+            let old = fill_cloid_hex_raw(&r.old_cloid);
+            let new = fill_cloid_hex_raw(&r.new_cloid);
+            // UNCONDITIONAL, and before every verdict. Both ids are
+            // derived from a millisecond nobody typed, so a run that
+            // printed neither left any stranded order unrecoverable by
+            // hand.
+            println!(
+                "{{\"old_cloid\":\"{old}\",\"new_cloid\":\"{new}\",\"placed_oid\":{},\
+                 \"modified_oid\":{},\"old_cancel_refused\":{},\"new_cancel_succeeded\":{},\
+                 \"unswept_old\":{},\"unswept_new\":{},\"stopped\":{},\"passed\":{}}}",
+                r.placed_oid,
+                r.modified_oid,
+                r.old_cancel_refused,
+                r.new_cancel_succeeded,
+                r.unswept_old,
+                r.unswept_new,
+                r.stopped.is_some(),
+                r.passed()
+            );
+            if r.has_unswept() {
+                error!(
+                    old = %old,
+                    new = %new,
+                    unswept_old = r.unswept_old,
+                    unswept_new = r.unswept_new,
+                    "exec-smoke: PHASE F — a cancel was never answered. A POST-ONLY order may \
+                     be on the book under the id(s) above. Cancel it by cloid before running \
+                     this again."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if let Some(e) = r.stopped.as_ref() {
+                error!(old = %old, new = %new, "exec-smoke: PHASE F stopped — {e}");
+                return ExitCode::from(e.code() as u8);
+            }
+            if !r.old_cancel_refused && r.new_cancel_succeeded {
+                error!(
+                    old = %old,
+                    "exec-smoke: PHASE F — the modify left BOTH orders resting. That is a LEAK \
+                     at the VENUE, not a residue here (both were cancelled): two quotes on the \
+                     book under one intent. LAW E-7 cannot be implemented this way."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if r.old_cancel_refused && !r.new_cancel_succeeded {
+                error!(
+                    new = %new,
+                    "exec-smoke: PHASE F — the modify consumed the old order and left NOTHING \
+                     under the new id. A requote that can lose the quote is worse than a cancel \
+                     plus a place."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.passed() {
+                error!(old = %old, new = %new, "exec-smoke: PHASE F did not pass");
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            info!(
+                placed_oid = r.placed_oid,
+                modified_oid = r.modified_oid,
+                old = %old,
+                new = %new,
+                "exec-smoke: PHASE F PASSED — the venue accepts a modify addressed BY cloid that \
+                 gives the replacement a DIFFERENT one. The order MOVED: the old id was refused \
+                 and the new id was really resting. LAW E-7 with a fresh cloid per requote is \
+                 implementable."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("{e}");
+            ExitCode::from(e.code() as u8)
+        }
+    }
+}
+
 fn exec_lifecycle(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
     // Checked at entry, before any network work; this is the
     // unwrap-free restatement of that.

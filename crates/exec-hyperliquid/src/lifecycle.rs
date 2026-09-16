@@ -155,7 +155,7 @@ pub fn run_on(
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
     let aj_n = order_json(&mut aj, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
-    let ok = post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "place")?;
+    let ok = post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "place", ItemErrors::AreFailures)?;
 
     if ok.any_filled {
         // A post-only order should be unable to trade. If one did, the
@@ -188,7 +188,7 @@ pub fn run_on(
     // issued a NEW oid, and a client that tracked only the old one
     // would be unable to cancel what it placed. LAW E-9 puts the slot
     // in the cloid precisely so the client id is the durable handle.
-    let ok = match cancel(http, &sk, cfg, &mut nonces, spec.asset, cloid, "cancel") {
+    let ok = match cancel(http, &sk, cfg, &mut nonces, spec.asset, cloid, "cancel", ItemErrors::AreFailures) {
         Ok(ok) => ok,
         Err(e) => return Err(cleanup(http, &sk, cfg, &mut nonces, spec.asset, cloid, e)),
     };
@@ -204,7 +204,7 @@ pub fn run_on(
     // Cancelling the same cloid again must be REFUSED. A second `ok`
     // here would mean the venue accepts cancels for orders it does not
     // have, and the first `ok` would have proved nothing.
-    let ok = cancel(http, &sk, cfg, &mut nonces, spec.asset, cloid, "verify")?;
+    let ok = cancel(http, &sk, cfg, &mut nonces, spec.asset, cloid, "verify", ItemErrors::AreData)?;
     let verified_gone = ok.errors > 0;
 
     Ok(LifecycleReport {
@@ -319,7 +319,7 @@ fn modify(
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = crate::action::encode_batch_modify(&mut mp, &m).map_err(|_| SmokeErr::Encode)?;
     let aj_n = batch_modify_json(&mut aj, &m).map_err(|_| SmokeErr::Encode)?;
-    let ok = post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], "modify")?;
+    let ok = post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], "modify", ItemErrors::AreFailures)?;
     if ok.any_filled {
         return Err(SmokeErr::Lifecycle {
             stage: "modify",
@@ -346,13 +346,14 @@ fn cancel(
     asset: u32,
     cloid: [u8; 16],
     stage: &'static str,
+    items: ItemErrors,
 ) -> Result<HlOk, SmokeErr> {
     let c = [CancelByCloidWire { asset, cloid }];
     let mut mp = [0u8; MAX_ACTION];
     let mut aj = [0u8; MAX_ACTION];
     let mp_n = encode_cancel_by_cloid(&mut mp, &c).map_err(|_| SmokeErr::Encode)?;
     let aj_n = cancel_by_cloid_json(&mut aj, &c).map_err(|_| SmokeErr::Encode)?;
-    post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], stage)
+    post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], stage, items)
 }
 
 /// Best-effort removal of a resting order after a failure, folding the
@@ -366,7 +367,7 @@ fn cleanup(
     cloid: [u8; 16],
     original: SmokeErr,
 ) -> SmokeErr {
-    match cancel(http, sk, cfg, nonces, asset, cloid, "cleanup") {
+    match cancel(http, sk, cfg, nonces, asset, cloid, "cleanup", ItemErrors::AreData) {
         Ok(ok) if ok.errors == 0 => original,
         _ => SmokeErr::Lifecycle {
             stage: "cleanup",
@@ -381,6 +382,29 @@ fn cleanup(
 /// Sign, send, scan. Every stage goes through here so that the
 /// fail-closed reading of the venue's answer is stated once.
 #[allow(clippy::too_many_arguments)]
+/// Whether a PER-ITEM error in an `ok` envelope is a failure or the
+/// answer being asked for.
+///
+/// Hyperliquid's `status:"ok"` is an envelope verdict, not an
+/// acceptance — a refusal for one order rides INSIDE it. Most stages
+/// want that treated as a failure. Two do not: a cancel issued to
+/// PROVE an order is gone, and a cleanup cancel for an order that may
+/// already have gone, both exist precisely to read `errors > 0`.
+///
+/// **Passed in rather than inferred from the stage name.** This was a
+/// `stage != "verify" && stage != "cleanup"` string compare with no
+/// compile-time link to any caller — and phase F doubled the number of
+/// callers depending on those exact spellings. A stage renamed to
+/// `"verify-old"` would have the venue's "already canceled" — the
+/// precise answer that probe exists to obtain — come back as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemErrors {
+    /// A per-item error means the stage failed.
+    AreFailures,
+    /// A per-item error IS the measurement.
+    AreData,
+}
+
 fn post(
     http: &mut HlHttp,
     sk: &secp256k1::SecretKey,
@@ -389,6 +413,7 @@ fn post(
     action_mp: &[u8],
     action_json: &[u8],
     stage: &'static str,
+    items: ItemErrors,
 ) -> Result<HlOk, SmokeErr> {
     let nonce = nonces.next(crate::smoke::now_ms());
     let sig = sign_action(sk, action_mp, nonce, Vault::None, None, cfg.network)
@@ -405,7 +430,7 @@ fn post(
             // a per-item error rides inside it. The `verify` stage is
             // the one place that WANTS an item error, so it reads
             // `ok.errors` itself.
-            if ok.errors > 0 && stage != "verify" && stage != "cleanup" {
+            if ok.errors > 0 && matches!(items, ItemErrors::AreFailures) {
                 return Err(SmokeErr::Lifecycle {
                     stage,
                     msg: String::from_utf8_lossy(ok.first_error.of(slice)).to_string(),
@@ -830,7 +855,7 @@ pub fn run_fill_on(
         // will likely refuse the next nineteen for the same reason,
         // and nineteen more refusals is nineteen more nonces spent to
         // learn nothing. The report says what happened up to here.
-        let ok = match post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "fill") {
+        let ok = match post(http, &sk, cfg, &mut nonces, &mp[..mp_n], &aj[..aj_n], "fill", ItemErrors::AreFailures) {
             Ok(ok) => ok,
             Err(e) => {
                 // The ONE site that knows which refusals are answers.
@@ -856,6 +881,361 @@ pub fn run_fill_on(
         run.report.any_resting |= ok.any_resting;
     }
     Ok(run)
+}
+
+// ---- Phase F: a requote is a MODIFY, and it changes the cloid ------
+
+/// What the requote round trip observed.
+///
+/// **Carries both client ids.** They come from a millisecond timestamp
+/// the operator never typed and nothing else prints, so an order left
+/// on the book under one of them is recoverable only by listing open
+/// orders in the venue UI and cancelling by oid. A report that named
+/// neither — which is what this was — made every failure path
+/// unrecoverable by hand, on the first probe in this lane to hold two
+/// ids at once.
+#[derive(Debug)]
+pub struct RequoteReport {
+    /// The id the original quote carried.
+    pub old_cloid: [u8; 16],
+    /// The id the replacement carried.
+    pub new_cloid: [u8; 16],
+    /// The oid the venue gave the original quote.
+    pub placed_oid: u64,
+    /// The oid after the modify. The venue issues a NEW one — which is
+    /// why cancel-by-cloid is the durable handle and an oid captured at
+    /// placement is not.
+    pub modified_oid: u64,
+    /// **Cancelling the OLD id came back REFUSED**, which is what the
+    /// modify having consumed it looks like from here.
+    ///
+    /// Named for what it MEASURES, not for what it is taken to mean.
+    /// The two differ in one case: a per-item refusal for a reason
+    /// other than the order's non-existence would read the same. That
+    /// case is narrow rather than absent — an envelope-level failure
+    /// (a rate limit, a rejected signature) is turned into `stopped` by
+    /// `post` whatever the stage, so what remains is a per-item refusal
+    /// of a well-formed cancel for a well-formed cloid this probe
+    /// built itself. Narrow is not the same as impossible, and a field
+    /// called `old_cloid_gone` would have hidden the difference.
+    pub old_cancel_refused: bool,
+    /// **Cancelling the NEW id SUCCEEDED**: there really was an order
+    /// under it. Positive evidence — `errors == 0` alone would also be
+    /// true of an empty or unreadable `statuses` array.
+    pub new_cancel_succeeded: bool,
+    /// The OLD id's cancel never got an answer. **That order may be on
+    /// the book**, under the id above.
+    pub unswept_old: bool,
+    /// The NEW id's cancel never got an answer. Same.
+    pub unswept_new: bool,
+    /// Why the run stopped short, if it did. `Err` from
+    /// [`run_requote_on`] means **nothing was placed**; once there is an
+    /// order on the book the failure rides here, with the report that
+    /// says which ids to go and look for.
+    pub stopped: Option<SmokeErr>,
+}
+
+impl RequoteReport {
+    /// Both halves of the asymmetry, nothing left unswept, and nothing
+    /// stopped it. See [`run_requote_on`] for why neither half proves
+    /// the requote alone.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.old_cancel_refused
+            && self.new_cancel_succeeded
+            && !self.unswept_old
+            && !self.unswept_new
+            && self.stopped.is_none()
+    }
+
+    /// An id whose cancel went unanswered — go and look for it.
+    #[must_use]
+    pub const fn has_unswept(&self) -> bool {
+        self.unswept_old || self.unswept_new
+    }
+}
+
+/// **PHASE F — can a modify addressed BY CLOID also CHANGE the cloid?**
+///
+/// LAW E-7 says a live requote is a modify rather than a cancel plus a
+/// place: two requests instead of one, at 333 reprices per instance, is
+/// the difference between fitting inside the address budget and not.
+/// The operator ruling of 2026-09-16 added the second half — the
+/// replacement carries a **fresh** client id, so every `userFills` row
+/// maps to exactly one quote instead of to a cloid that has meant
+/// several different prices.
+///
+/// **Neither half had been measured.** Phase C's modify targets the
+/// resting order by its VENUE oid and hands the replacement the SAME
+/// cloid, so nothing in this repo had ever asked the venue the question
+/// this ruling depends on. If the answer were no, the ruling could not
+/// be implemented as written — and that is a thing to learn from one
+/// testnet probe rather than from a live requote lane running at 333
+/// per instance.
+///
+/// Four requests, and **the last two ARE the assertion**:
+///
+/// ```text
+///   place  cloid A, post-only     -> rests
+///   modify BY cloid A -> cloid B  -> ok
+///   cancel cloid A                -> must be REFUSED  (A is gone)
+///   cancel cloid B                -> must SUCCEED     (B is real)
+/// ```
+///
+/// The asymmetry is the evidence, and neither half carries it alone: a
+/// refusal on A is equally explained by a modify that killed A and
+/// created nothing, and a success on B is equally explained by a modify
+/// that left BOTH resting — which would be a leak, not a requote. Only
+/// the pair says the order MOVED.
+///
+/// **Both cancels always run, and nothing past the place uses `?`.**
+/// The first version returned on the first cancel's transport failure,
+/// which left the NEW id — the one the probe's own hypothesis says is
+/// resting — unswept and unnamed. Phase C gets away with the same shape
+/// only because its `?` sits AFTER its successful cancel; this one held
+/// two ids and swept one. A failure now comes back as `Ok` with
+/// `stopped` set and both ids printed.
+///
+/// Post-only throughout. A requote that traded would be measuring the
+/// market rather than the venue's modify semantics, and it would cost
+/// balance to learn nothing.
+///
+/// # Errors
+/// Not testnet, a non-positive price or size, the two probe cloids
+/// collided, or an encode overflowed — that is, **only cases where
+/// nothing has been sent**. Every failure from the first request
+/// onwards, the place included, comes back as `Ok` with `stopped` set
+/// and both ids named, because past that point an order may be on the
+/// book.
+pub fn run_requote_on(
+    cfg: &HlConfig,
+    http: &mut HlHttp,
+    spec: LifecycleSpec,
+) -> Result<RequoteReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    if spec.sz_1e8 <= 0 || spec.px_1e8 <= 0 || spec.px2_1e8 <= 0 {
+        return Err(SmokeErr::Lifecycle {
+            stage: "spec",
+            msg: "price and size must both be positive".to_owned(),
+        });
+    }
+
+    let sk = cfg.secret_key().map_err(SmokeErr::Config)?;
+    let old = fresh_cloid();
+    // DERIVED from the first rather than drawn again. `fresh_cloid` is
+    // a marker plus a millisecond timestamp, and these two calls are
+    // microseconds apart — drawing twice would collide most of the
+    // time, and a probe whose two ids are equal proves the opposite of
+    // what it claims while looking like a pass.
+    //
+    // Byte 15 is that timestamp's LSB, so two runs exactly one
+    // millisecond apart can produce swapped pairs (run 1's B is run 2's
+    // A). Harmless for a four-round-trip probe that sweeps both ids,
+    // and recorded here rather than rediscovered.
+    let mut new = old;
+    new[15] ^= 0x01;
+    debug_assert_ne!(old, new);
+    if old == new {
+        return Err(SmokeErr::Lifecycle {
+            stage: "spec",
+            msg: "the two probe cloids are identical".to_owned(),
+        });
+    }
+
+    let mut nonces = crate::nonce::Nonce::new();
+
+    // The report exists BEFORE the first send. Everything below writes
+    // into it and nothing below returns `Err`: past this point a
+    // request may have reached the venue, and a failure carrying no
+    // report leaves an order on the book under an id nothing prints.
+    let mut rep = RequoteReport {
+        old_cloid: old,
+        new_cloid: new,
+        placed_oid: 0,
+        modified_oid: 0,
+        old_cancel_refused: false,
+        new_cancel_succeeded: false,
+        unswept_old: false,
+        unswept_new: false,
+        stopped: None,
+    };
+
+    // ---- place ------------------------------------------------------
+    let order = OrderWire::new(spec.asset, spec.is_buy, spec.px_1e8, spec.sz_1e8, Tif::Alo)
+        .with_cloid(old);
+    let mut mp = [0u8; MAX_ACTION];
+    let mut aj = [0u8; MAX_ACTION];
+    let mp_n = encode_order(&mut mp, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    let aj_n = order_json(&mut aj, &[order], b"na").map_err(|_| SmokeErr::Encode)?;
+    match post(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        &mp[..mp_n],
+        &aj[..aj_n],
+        "place",
+        ItemErrors::AreFailures,
+    ) {
+        Ok(ok) => {
+            rep.placed_oid = ok.oid;
+            if ok.any_filled {
+                rep.stopped = Some(SmokeErr::Lifecycle {
+                    stage: "place",
+                    msg: "the post-only order FILLED — the price crosses the market. Nothing \
+                          after this would mean anything; choose a price further from the book."
+                        .to_owned(),
+                });
+            } else if !ok.any_resting {
+                rep.stopped = Some(SmokeErr::Lifecycle {
+                    stage: "place",
+                    msg: "accepted, but the venue says it is not resting".to_owned(),
+                });
+            } else if ok.oid == 0 {
+                // RESTING with no oid echoed. Split from the case above
+                // because they need opposite things said about them: an
+                // order that is not resting strands nothing, and this
+                // one IS on the book. It is still recoverable — cancel
+                // by cloid needs no oid, which is the whole reason this
+                // probe addresses orders that way — so the sweep below
+                // takes it back rather than the run walking away.
+                rep.stopped = Some(SmokeErr::Lifecycle {
+                    stage: "place",
+                    msg: "RESTING, but with no oid echoed back".to_owned(),
+                });
+            }
+        }
+        Err(e) => {
+            // The request may have reached the venue with the answer
+            // lost. We cannot tell — but we hold the cloid, and the
+            // sweep below is the only thing that can take the order
+            // back if it is there.
+            rep.stopped = Some(e);
+        }
+    }
+
+    // ---- modify BY CLOID, to a DIFFERENT cloid ----------------------
+    // Skipped when the place already went wrong: modifying an order
+    // that filled, or that may not exist, would place a SECOND one.
+    //
+    // A failure here does NOT return either. WHICH id survives is
+    // exactly what is unknown: the modify may have reached the venue
+    // with the answer lost, in which case A is consumed and B is
+    // resting. The sweep tries BOTH.
+    if rep.stopped.is_none() {
+        match modify_to_cloid(http, &sk, cfg, &mut nonces, spec, old, new) {
+            Ok(oid) => rep.modified_oid = oid,
+            Err(e) => rep.stopped = Some(e),
+        }
+    }
+
+    // ---- the assertion, which is also the sweep ---------------------
+    match cancel(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        spec.asset,
+        old,
+        "verify",
+        ItemErrors::AreData,
+    ) {
+        Ok(a) => rep.old_cancel_refused = a.errors > 0,
+        Err(e) => {
+            rep.unswept_old = true;
+            if rep.stopped.is_none() {
+                rep.stopped = Some(e);
+            }
+        }
+    }
+    match cancel(
+        http,
+        &sk,
+        cfg,
+        &mut nonces,
+        spec.asset,
+        new,
+        "cleanup",
+        ItemErrors::AreData,
+    ) {
+        // Positive evidence, not the absence of an error.
+        Ok(b) => rep.new_cancel_succeeded = b.errors == 0 && b.any_success,
+        Err(e) => {
+            rep.unswept_new = true;
+            if rep.stopped.is_none() {
+                rep.stopped = Some(e);
+            }
+        }
+    }
+    Ok(rep)
+}
+
+/// A `batchModify` that addresses the resting order **by cloid** and
+/// gives the replacement a **different** cloid.
+///
+/// Both halves differ from phase C's `modify`, which targets by venue
+/// oid and reuses the id. Split out rather than parameterised onto that
+/// one because phase C is a proven surface whose meaning should not
+/// shift under a new flag.
+fn modify_to_cloid(
+    http: &mut HlHttp,
+    sk: &secp256k1::SecretKey,
+    cfg: &HlConfig,
+    nonces: &mut crate::nonce::Nonce,
+    spec: LifecycleSpec,
+    old: [u8; 16],
+    new: [u8; 16],
+) -> Result<u64, SmokeErr> {
+    let replacement = OrderWire::new(spec.asset, spec.is_buy, spec.px2_1e8, spec.sz_1e8, Tif::Alo)
+        .with_cloid(new);
+    let m = [ModifyWire {
+        order: replacement,
+        oid: 0,
+        oid_cloid: old,
+        oid_is_cloid: true,
+    }];
+    let mut mp = [0u8; MAX_ACTION];
+    let mut aj = [0u8; MAX_ACTION];
+    let mp_n = crate::action::encode_batch_modify(&mut mp, &m).map_err(|_| SmokeErr::Encode)?;
+    let aj_n = batch_modify_json(&mut aj, &m).map_err(|_| SmokeErr::Encode)?;
+    let ok = post(http, sk, cfg, nonces, &mp[..mp_n], &aj[..aj_n], "modify", ItemErrors::AreFailures)?;
+    if ok.any_filled {
+        return Err(SmokeErr::Lifecycle {
+            stage: "modify",
+            msg: "the modified post-only order FILLED — the second price crosses the market"
+                .to_owned(),
+        });
+    }
+    if !ok.any_resting {
+        return Err(SmokeErr::Lifecycle {
+            stage: "modify",
+            msg: "accepted but the order is no longer resting".to_owned(),
+        });
+    }
+    // Not `if ok.oid == 0 { 0 }` — that was a copy artefact from phase
+    // C, where the fallback is the INPUT oid and means something. There
+    // is no input oid here, so the conditional was a no-op dressed up
+    // as a preservation.
+    Ok(ok.oid)
+}
+
+/// [`run_requote_on`] over a transport this builds. The `is_testnet`
+/// guard runs here too.
+///
+/// # Errors
+/// As [`run_requote_on`].
+pub fn run_requote(
+    cfg: &HlConfig,
+    tls: Arc<rustls::ClientConfig>,
+    spec: LifecycleSpec,
+) -> Result<RequoteReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    run_requote_on(cfg, &mut http, spec)
 }
 
 // ---- Phase E: the reconciliation, run by hand ----------------------
