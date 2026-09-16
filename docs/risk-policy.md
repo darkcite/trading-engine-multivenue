@@ -1063,6 +1063,137 @@ by design:
 The operator states the market, the crossing price and the size; this
 code does not read the book and will not guess a price.
 
+### Phase E — the safety net, finally run against a socket
+
+§6.2 calls reconciliation "the single most valuable safety net in the
+plan". Until `exec-smoke --recon` existed it could only run inside a
+live `HlExchange`, which E7 gates — so the check meant to catch a lost
+fill, a double-counted fill, a wrong asset id and a stale position view
+had never once run against a venue. It was a unit test and a claim.
+
+Phase E **reads only**: no order, no signature, no balance spent. It
+takes the `userFills` snapshot, rebuilds this arm's ledger from OUR OWN
+cloids, asks for `spotClearinghouseState`, and compares. It is the one
+phase here that needs no A/B probe first, because it signs nothing.
+
+Three properties make it worth trusting:
+
+- **The ledger is rebuilt from the venue's echo of our cloids**, never
+  from anything a member believes. A reconciler that asked the member
+  would be agreeing with itself.
+- **Two passes, not one.** `userFills` arrives newest-first and a
+  settlement carries no cloid, so it can only be attributed by a symbol
+  an earlier fill bound. A single forward pass would meet a settlement
+  before the trades whose position it settles, count it unowned, and
+  leave the ledger claiming a position the venue has already paid out.
+  Binding is its own pass so the ORDER OF THE SNAPSHOT cannot decide
+  the answer. `a_settlement_ahead_of_its_own_trades_is_still_booked`
+  fails against the single-pass version.
+- **Nothing is dropped.** `ours + foreign + settlements == rows`, and a
+  row that cannot be placed is `refused` — which exits nonzero on its
+  own, because a reconciliation missing rows agrees by having less to
+  disagree with. A `userFills` frame that does not scan, and a snapshot
+  that never arrives, are both errors rather than empty ledgers, for
+  the same reason.
+- **An agreement over nothing is not an agreement.** `drift_legs` is
+  accumulated *inside* `for_each_live`, which does not run when no leg
+  is bound — so zero legs produce zero drift, and a verdict of
+  `drift_legs == 0` alone reads "nothing disagreed" as "the things
+  agreed". Those are the same sentence only over a non-empty set, and
+  the empty one is reachable: a wrong master address, an untraded
+  account, a snapshot of nothing but payouts. `agreed()` therefore
+  requires `legs > 0`, an empty snapshot is refused exactly like a
+  missing one, and `ours == 0` gets its own message. **Measured, not
+  argued**: the same binary against the same venue with one env var
+  changed prints `agreed:false` and exits nonzero (see the two runs
+  below).
+
+**What phase E does NOT cover, stated plainly.** Its reach is the
+*intersection* of the `userFills` snapshot window and our own fills.
+`compare_booked` walks OUR legs, and a leg is bound only from rows
+present in the snapshot — so a position we still hold whose trades are
+older than the venue's snapshot depth is never bound, never compared,
+and reads as agreement by absence. The runs below show the asymmetry:
+2 legs compared against 18 balance-sheet rows. A leg that aged out and
+then **settled** is harmless (a HIP-4 binary resolves the whole
+position, so the venue holds nothing either); a leg that aged out and
+is **still open** is the real blind spot. `legs_nonzero` says how much
+of an agreement is carrying weight rather than netting to zero. Closing
+the gap properly means counting `+<enc>` balance rows that matched no
+bound leg — worth doing before E6 arms anything on this number.
+
+The drift is reported **twice**: as a contract quantity, and in USD
+through `recon::drift_qty_to_usd_1e6`. The two are not the same number
+by accident — `recon_drift_max_qty_1e6` is contracts and
+`halt_on_recon_drift_usd_1e6` is money, and they share a scale suffix,
+so E6's halt rule comparing the raw counter would have been comparing
+contracts to dollars. The factor is the **settle ceiling, 1 USDC per
+contract**, because a HIP-4 leg resolves to exactly 0 or 1. Marking at
+the last trade would be more accurate on average and wrong in the only
+direction that matters: a 40-contract drift on a leg trading at 0.02
+marks to 0.80 USDC and clears a 5 USDC halt, while the position it
+failed to account for is worth 40 if that leg settles YES. At the
+ceiling the conversion is the identity and it can only ever halt EARLY.
+
+**Run 2026-09-16, testnet, immediately after the 20-fill batch — a
+LIVE position:**
+
+```
+{"rows":23,"ours":21,"foreign":0,"settlements":2,
+ "settlements_unowned":0,"legs":2,"refused":0,"balances":18,
+ "drift_legs":0,"worst_qty_1e6":0,"worst_usd_1e6":0,"agreed":true}
+```
+
+Agreed over 21 of our own fills across two legs, against 18 rows of the
+venue's balance sheet. At that moment the venue held `+195641` total
+`40.0` and our ledger said the same 40 — so the agreement was on a real
+open position, not on arithmetic.
+
+**And then the market settled, mid-session.** `#195641` resolved YES:
+one `dir:"Settlement"` row, px `1.0`, sz `40.0`, `closedPnl 8.4` (40
+bought at 0.79 = 31.60, paid out at 1.00 = 40.00). USDC 968.04 →
+1008.01. The next run:
+
+```
+{"rows":23,"ours":21,"foreign":0,"settlements":2,
+ "settlements_unowned":0,"legs":2,"refused":0,"balances":18,
+ "drift_legs":0,"legs_nonzero":0,"worst_qty_1e6":0,
+ "worst_usd_1e6":0,"agreed":true}
+```
+
+Still agreed — and `legs_nonzero: 0` says exactly what changed. Both
+legs now net to zero on our side (+40 −40, +2 −2) and the venue holds
+neither, so this agreement is arithmetic where the earlier one was a
+position. **That is the number doing its job**: without it the two runs
+are indistinguishable, and a reader would take the weaker evidence for
+the stronger. It also means the settlement-books ruling is measured end
+to end on two separate legs: the venue paid out, `build_ledger`
+attributed the payout by symbol with no cloid to go on, and the two
+sides still met at zero.
+
+and the falsification, same binary, same venue, one env var changed:
+
+```
+HYPERLIQUID_TESTNET_MASTER_ADDR=0x…dead
+{"rows":3,"ours":0,"foreign":3,"settlements":0,"settlements_unowned":0,
+ "legs":0,"refused":0,"balances":25,"drift_legs":0,"legs_nonzero":0,
+ "worst_qty_1e6":0,"worst_usd_1e6":0,"agreed":false}
+ERROR the snapshot carried NO fills of ours. Nothing was compared…
+```
+
+Before `agreed()` required `legs > 0`, that second run printed
+`agreed:true` and exited SUCCESS. A gate whose failure has never been
+observed is a claim; this one has now been observed against the venue.
+
+**Agreed on every leg**, over 21 of our own fills across two legs,
+against 18 rows of the venue's balance sheet. The two settlement rows
+were attributed by symbol and booked — `settlements_unowned` is zero —
+so the settlement-books ruling is now measured end to end rather than
+only in a fixture: the leg that settled nets to zero in our ledger and
+the venue agrees it holds nothing.
+
+This closes E4's exit gate as written.
+
 **Run 2026-09-15, testnet, bought 2 of a live MLB outcome leg at 0.68.**
 The results, which are now the crate's fixtures rather than invention:
 
@@ -1157,17 +1288,21 @@ the caller and it is written down rather than assumed.
 decision and nothing is armed, so a halt inferred here would be a
 policy this file invented. Drift is counted per leg
 (`recon_drift_legs`) with the worst magnitude kept
-(`recon_drift_max_1e6`), alongside `recon_ok` and `recon_failed` — a
+(`recon_drift_max_qty_1e6`), alongside `recon_ok` and `recon_failed` — a
 venue that is unreachable or answers with something unparseable is
 counted and retried at the next cadence, never in a tight loop. Like
 every counter here they reach no gauge until `stats()` is wired
 (pre-arming item 5).
 
-**Units, because the name of the cap it will feed does not match.**
-`recon_drift_max_1e6` is a CONTRACT QUANTITY at 1e6, while E6's
-threshold is `halt_on_recon_drift_usd_1e6`. For a 0..1 binary the
-quantity is a conservative bound on the dollar figure, but they are not
-the same number and **E6 must convert before comparing**.
+**Units, because the name of the cap it will feed does not match —
+and the conversion now exists.** `recon_drift_max_qty_1e6` is a CONTRACT
+QUANTITY at 1e6, while E6's threshold is `halt_on_recon_drift_usd_1e6`,
+which is money. The field carries `qty` in its name for that reason,
+and `recon::drift_qty_to_usd_1e6` is the conversion E6 must call — the
+two numbers share a scale suffix, so a halt rule reading the raw
+counter would be comparing contracts to dollars. The factor is the
+settle ceiling of 1 USDC per contract; see Phase E above for why a
+ceiling rather than a mark.
 
 Two things the comparison had to get right, both of which the first
 version got wrong and both of which now have a test verified to fail

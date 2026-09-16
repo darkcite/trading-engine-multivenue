@@ -858,6 +858,330 @@ pub fn run_fill_on(
     Ok(run)
 }
 
+// ---- Phase E: the reconciliation, run by hand ----------------------
+
+/// The first synthetic symbol id the phase E ledger hands out.
+///
+/// **Synthetic on purpose.** A real symbol id comes from a roll event
+/// and the boot ordinal law; the smoke has neither, and inventing one
+/// that LOOKED real is how a number gets believed later. Only the COIN
+/// is real here — and the coin is the only thing
+/// [`crate::recon::compare_booked`] matches on, so the symbol is a
+/// table key and nothing more.
+const SMOKE_SYM_BASE: u32 = 4096;
+
+/// What rebuilding the ledger out of `userFills` observed.
+///
+/// Every row is accounted for: `ours + foreign + settlements == rows`.
+/// A row this cannot classify is `refused`, never dropped — an
+/// unreadable row that read as "no position" would make the
+/// reconciliation agree by having nothing to disagree with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LedgerStats {
+    /// Rows in the snapshot.
+    pub rows: u32,
+    /// Rows whose cloid decodes to OURS (LAW E-9).
+    pub ours: u32,
+    /// Rows carrying a cloid that is not ours. **Counted, never
+    /// booked** — a fill the engine did not order is the evidence
+    /// reconciliation exists to catch.
+    pub foreign: u32,
+    /// Settlement rows. They carry NO cloid, so they are attributed by
+    /// symbol, exactly as the live arm does.
+    pub settlements: u32,
+    /// Settlements on a leg no fill of ours ever bound. Counted, never
+    /// booked.
+    pub settlements_unowned: u32,
+    /// Distinct legs bound.
+    pub legs: u32,
+    /// Rows that could not be placed: the table was full, or the coin
+    /// was unusable.
+    pub refused: u32,
+}
+
+/// A fill's SIGNED contribution to a position, 1e6.
+#[inline]
+fn signed_1e6(f: &crate::userws::UserFill) -> i64 {
+    let q = f.sz_1e8 / crate::recon::WIRE_TO_ENGINE_QTY;
+    if f.is_buy {
+        q
+    } else {
+        -q
+    }
+}
+
+/// Rebuild this arm's position ledger from a `userFills` snapshot.
+///
+/// **Two passes, and the reason is the `sym_of_coin` lesson.** A
+/// settlement carries no cloid, so it can only be attributed by a
+/// symbol some EARLIER fill bound — and `userFills` arrives newest
+/// first, so a single pass would meet the settlement before the trades
+/// that created the position it settles. Binding is therefore its own
+/// pass over our own rows, and booking is a second pass over
+/// everything.
+///
+/// The asset id is left at ZERO rather than derived from the coin.
+/// LAW E-4 forbids deriving one, and this table exists to be compared
+/// against, never to route an order; a zero makes that structural
+/// rather than a promise, because `lookup` would refuse it.
+pub fn build_ledger(
+    fills: &[crate::userws::UserFill],
+    body: &[u8],
+    assets: &mut crate::asset::AssetTable,
+) -> LedgerStats {
+    let mut st = LedgerStats {
+        rows: u32::try_from(fills.len()).unwrap_or(u32::MAX),
+        ..LedgerStats::default()
+    };
+
+    // Pass 1 — bind every leg WE TRADED, and only those. A settlement
+    // is a payout, not a trade: binding from one would create a leg
+    // out of somebody else's position.
+    //
+    // Nothing is counted here. A bind that fails leaves the coin
+    // unresolvable, so pass 2 counts every row on it as `refused` —
+    // once each, which is what makes `refused` a ROW count rather than
+    // a number that means neither rows nor legs.
+    let mut i = 0usize;
+    while i < fills.len() {
+        let f = &fills[i];
+        i += 1;
+        if f.is_settlement
+            || !matches!(crate::userws::owner_of(f), crate::cloid::Owner::Ours { .. })
+        {
+            continue;
+        }
+        let coin = f.coin.of(body);
+        if assets.sym_of_coin(coin).is_some() {
+            continue;
+        }
+        let sym = SMOKE_SYM_BASE.saturating_add(st.legs.saturating_mul(2));
+        if assets.bind(sym, 0, 1, coin).is_ok() {
+            st.legs = st.legs.saturating_add(1);
+        }
+    }
+
+    // Pass 2 — book. Nothing binds here, so a settlement on a leg we
+    // never traded stays unowned rather than inventing a position.
+    let mut i = 0usize;
+    while i < fills.len() {
+        let f = &fills[i];
+        i += 1;
+        let coin = f.coin.of(body);
+        // SETTLEMENT FIRST, before the cloid is even looked at —
+        // the order `strategy_bin15::book_fill` uses. Settlements
+        // measured on testnet carry no cloid, so the two orders agree
+        // today; the smoke exists to validate the live arm, and a
+        // classification that only agrees by coincidence is one that
+        // stops agreeing the day the venue adds one.
+        if f.is_settlement {
+            st.settlements = st.settlements.saturating_add(1);
+            match assets.sym_of_coin(coin) {
+                Some(sym) => assets.book_qty(sym, signed_1e6(f)),
+                None => st.settlements_unowned = st.settlements_unowned.saturating_add(1),
+            }
+            continue;
+        }
+        match crate::userws::owner_of(f) {
+            crate::cloid::Owner::Ours { .. } => {
+                st.ours = st.ours.saturating_add(1);
+                match assets.sym_of_coin(coin) {
+                    Some(sym) => assets.book_qty(sym, signed_1e6(f)),
+                    None => st.refused = st.refused.saturating_add(1),
+                }
+            }
+            crate::cloid::Owner::Foreign => st.foreign = st.foreign.saturating_add(1),
+        }
+    }
+    st
+}
+
+/// What a reconciliation observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconReport {
+    /// How the ledger was rebuilt.
+    pub ledger: LedgerStats,
+    /// Rows on the venue's balance sheet.
+    pub balances: u32,
+    /// Legs where the two disagreed.
+    pub drift_legs: u64,
+    /// Of the legs compared, how many this arm booked a **non-zero**
+    /// position in.
+    ///
+    /// A leg that nets to zero against a venue that does not mention it
+    /// still agrees, and that agreement is real — it is exactly what a
+    /// mis-booked settlement breaks. But it is weaker evidence than a
+    /// live position matching, and a run where every leg netted to zero
+    /// would pass on arithmetic alone. This says how much of the
+    /// agreement is carrying weight.
+    pub legs_nonzero: u32,
+    /// Worst single-leg disagreement, as a CONTRACT QUANTITY, 1e6.
+    pub worst_qty_1e6: i64,
+    /// The same number in the unit a halt rule is written in, through
+    /// [`crate::recon::drift_qty_to_usd_1e6`]. E6's threshold is USD;
+    /// this is what it must be compared against.
+    pub worst_usd_1e6: i64,
+}
+
+impl ReconReport {
+    /// Did the venue and the ledger agree, **over something**?
+    ///
+    /// `drift_legs == 0` alone answers a different question. It is
+    /// accumulated inside `for_each_live`, which does not run at all
+    /// when no leg is bound — so a snapshot with no fills of ours
+    /// produces zero drift over zero legs, and reading that as
+    /// agreement is reading "nothing disagreed" as "the things agreed".
+    /// Those are the same sentence only when the set is non-empty.
+    ///
+    /// Reachable, not theoretical: a wrong master address, an account
+    /// nothing has traded, or a snapshot of nothing but settlements all
+    /// land there — and this is the E4 exit gate's evidence.
+    #[must_use]
+    pub const fn agreed(&self) -> bool {
+        self.ledger.legs > 0 && self.drift_legs == 0
+    }
+}
+
+/// **PHASE E — run the reconciliation by hand, against the real venue.**
+///
+/// §6.2 calls reconciliation "the single most valuable safety net in
+/// the plan", and until this existed it could only run inside a live
+/// `HlExchange` — which E7 gates. So the check that is supposed to
+/// catch a lost fill, a double-counted fill and a wrong asset id had
+/// never once run against a socket. This is that run, and it places no
+/// order and signs nothing: it READS `userFills` and
+/// `spotClearinghouseState` and compares them.
+///
+/// The ledger is rebuilt from our own cloids rather than from anything
+/// the engine believes, which is the whole point — a reconciler that
+/// asked a member would be agreeing with itself.
+///
+/// # Errors
+/// Not testnet, the socket or the info endpoint failed, or **no
+/// snapshot arrived**. That last one is an error rather than an empty
+/// ledger on purpose: an absent snapshot read as "no fills" would make
+/// the comparison pass by having nothing to compare.
+pub fn run_recon(
+    cfg: &HlConfig,
+    tls: Arc<rustls::ClientConfig>,
+    wait: core::time::Duration,
+) -> Result<ReconReport, SmokeErr> {
+    if !cfg.is_testnet() {
+        return Err(SmokeErr::NotTestnet(cfg.host.clone()));
+    }
+    let stage = "recon";
+
+    let mut ws = crate::UserWs::new(&cfg.host, 443, Arc::clone(&tls), &cfg.master_addr).map_err(
+        |e| SmokeErr::Lifecycle {
+            stage,
+            msg: format!("user-event socket: {e:?}"),
+        },
+    )?;
+    ws.connect().map_err(|e| SmokeErr::Lifecycle {
+        stage,
+        msg: format!("subscribe: {e:?}"),
+    })?;
+
+    let mut fills = vec![crate::userws::UserFill::default(); crate::userws::SNAPSHOT_RING];
+    let mut assets = crate::asset::AssetTable::new();
+    let mut ledger = LedgerStats::default();
+    let mut seen = false;
+    let mut bad: Option<String> = None;
+
+    let end = std::time::Instant::now() + wait;
+    while !seen && std::time::Instant::now() < end {
+        let pumped = ws.pump(core::time::Duration::from_millis(500), |payload| {
+            // `pump` drains EVERY completed frame from one read, so the
+            // `while !seen` above guards the next pump, not the next
+            // frame. Two snapshots in one read would call `build_ledger`
+            // twice against the same table: pass 1 would skip every
+            // already-bound coin and pass 2 would book every row a
+            // second time — every position doubled, reported next to a
+            // `legs` of zero.
+            if !crate::userws::is_user_fills(payload) {
+                return;
+            }
+            // The SCAN always runs — `seen` gates only the BUILD below.
+            // Skipping the scan outright would have made this guard
+            // quietly drop an unreadable venue frame as well as a
+            // duplicate snapshot, which is a step back from "an
+            // unreadable answer is never ignored" in exchange for a
+            // property that has nothing to do with it.
+            match crate::userws::scan_user_fills(payload, &mut fills) {
+                // Only the SNAPSHOT, and only the FIRST one. `pump`
+                // drains EVERY completed frame from one read, so
+                // `while !seen` guards the next pump and not the next
+                // frame: two snapshots in one read would book every row
+                // twice against the same table.
+                //
+                // A live row is skipped for a different reason — it is
+                // a position the balance sheet may or may not have
+                // caught up with, and a reconciliation racing its own
+                // inputs proves nothing.
+                Ok((n, true)) if !seen => {
+                    ledger = build_ledger(&fills[..n], payload, &mut assets);
+                    seen = true;
+                }
+                Ok(_) => {}
+                // Fail-closed: a userFills frame that did not scan is
+                // NOT zero fills.
+                Err(e) => bad = Some(format!("userFills did not scan: {e:?}")),
+            }
+        });
+        if let Err(e) = pumped {
+            return Err(SmokeErr::Lifecycle {
+                stage,
+                msg: format!("the user-event stream dropped before the snapshot: {e:?}"),
+            });
+        }
+        if let Some(msg) = bad.take() {
+            return Err(SmokeErr::Lifecycle { stage, msg });
+        }
+    }
+    // `rows == 0` as well as `!seen`: the guard's whole point is the
+    // empty LEDGER, and an empty snapshot frame is a snapshot that
+    // arrived. Testing only arrival would have been a condition whose
+    // message described a stronger property than it checked.
+    if !seen || ledger.rows == 0 {
+        return Err(SmokeErr::Lifecycle {
+            stage,
+            msg: format!(
+                "no userFills snapshot with any rows in it (arrived: {seen}, rows: {}). \
+                 Refusing to reconcile against an empty ledger — it would agree by having \
+                 nothing to compare",
+                ledger.rows
+            ),
+        });
+    }
+
+    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut req = [0u8; crate::recon::MAX_STATE_REQ];
+    let n = crate::recon::spot_state_request(&mut req, &cfg.master_addr)
+        .map_err(|_| SmokeErr::Encode)?;
+    let (_status, range) = http
+        .post_to(crate::http::INFO_PATH, &req[..n])
+        .map_err(SmokeErr::Http)?;
+    let body = &http.resp()[range];
+    let mut bal = vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES];
+    let rows = crate::recon::scan_spot_state(body, &mut bal).map_err(|_| SmokeErr::Unreadable)?;
+
+    let (drift_legs, worst) = crate::recon::compare_booked(&assets, &bal[..rows], body);
+    let mut legs_nonzero = 0u32;
+    assets.for_each_live(|_sym, _coin, booked_1e6| {
+        if booked_1e6 != 0 {
+            legs_nonzero = legs_nonzero.saturating_add(1);
+        }
+    });
+    Ok(ReconReport {
+        ledger,
+        balances: u32::try_from(rows).unwrap_or(u32::MAX),
+        drift_legs,
+        legs_nonzero,
+        worst_qty_1e6: worst,
+        worst_usd_1e6: crate::recon::drift_qty_to_usd_1e6(worst),
+    })
+}
+
 /// A cloid for the smoke's own probes. **Deliberately NOT our magic**
 /// — this is not a slot, so the high bytes are a fixed marker and the
 /// low ones a timestamp, and `cloid::decode` reads it as `Foreign`.
@@ -870,6 +1194,271 @@ fn fresh_cloid() -> [u8; 16] {
     let ms = crate::smoke::now_ms().to_be_bytes();
     c[8..16].copy_from_slice(&ms);
     c
+}
+
+#[cfg(test)]
+mod recon_tests {
+    use super::{build_ledger, signed_1e6, SMOKE_SYM_BASE};
+    use crate::asset::AssetTable;
+    use crate::response::Span;
+    use crate::userws::UserFill;
+
+    /// `#195641` at 0, `#195640` at 8 — two legs in one buffer.
+    const BODY: &[u8] = b"#195641 #195640 ";
+
+    fn span(start: u32, len: u32) -> Span {
+        Span {
+            start,
+            end: start + len,
+        }
+    }
+
+    fn row(coin: Span, cloid: Option<[u8; 16]>, sz_1e8: i64, is_buy: bool) -> UserFill {
+        UserFill {
+            coin,
+            cloid,
+            sz_1e8,
+            is_buy,
+            ..UserFill::default()
+        }
+    }
+
+    fn ours(n: u64) -> Option<[u8; 16]> {
+        Some(crate::cloid::encode(3, n))
+    }
+
+    /// **The two-pass property, and the whole reason for it.**
+    ///
+    /// `userFills` arrives NEWEST FIRST, so a settlement sits ahead of
+    /// the trades whose position it settles. A settlement carries no
+    /// cloid and can only be attributed by a symbol an earlier fill
+    /// bound — so a single forward pass would meet it before the leg
+    /// exists and count it unowned, and the ledger would then claim a
+    /// position the venue has already paid out. Binding is its own
+    /// pass precisely so the ORDER OF THE SNAPSHOT cannot decide this.
+    #[test]
+    fn a_settlement_ahead_of_its_own_trades_is_still_booked() {
+        let leg = span(0, 7);
+        let mut set = row(leg, None, 400_000_000, false); // sells 4 back
+        set.is_settlement = true;
+        let fills = [
+            set,                                    // newest: the settlement
+            row(leg, ours(2), 200_000_000, true),   // +2
+            row(leg, ours(1), 200_000_000, true),   // +2
+        ];
+
+        let mut a = AssetTable::new();
+        let st = build_ledger(&fills, BODY, &mut a);
+
+        assert_eq!(st.legs, 1);
+        assert_eq!(st.ours, 2);
+        assert_eq!(st.settlements, 1);
+        assert_eq!(
+            st.settlements_unowned, 0,
+            "the leg was bound in pass 1, before pass 2 ever saw the settlement"
+        );
+        assert_eq!(
+            a.booked_qty(SMOKE_SYM_BASE),
+            Some(0),
+            "+2 +2 -4: the venue paid it out and the ledger agrees"
+        );
+    }
+
+    /// A cloid that is not ours is COUNTED and never booked. Booking it
+    /// would destroy the evidence reconciliation exists to surface.
+    #[test]
+    fn a_foreign_fill_is_counted_and_never_booked() {
+        let leg = span(0, 7);
+        let fills = [
+            row(leg, ours(1), 200_000_000, true),
+            row(leg, Some([0xAB; 16]), 900_000_000, true),
+            row(leg, None, 900_000_000, true), // no cloid, not a settlement
+        ];
+        let mut a = AssetTable::new();
+        let st = build_ledger(&fills, BODY, &mut a);
+
+        assert_eq!(st.ours, 1);
+        assert_eq!(st.foreign, 2);
+        assert_eq!(st.settlements, 0);
+        assert_eq!(
+            a.booked_qty(SMOKE_SYM_BASE),
+            Some(2_000_000),
+            "only OUR 2 contracts are in the ledger"
+        );
+        assert_eq!(st.rows, 3, "and every row is accounted for");
+        assert_eq!(st.ours + st.foreign + st.settlements, st.rows);
+    }
+
+    /// A settlement on a leg we never traded has no owner to attribute
+    /// it to. Counted, never booked — the alternative is inventing a
+    /// position out of somebody else's payout.
+    #[test]
+    fn a_settlement_on_a_leg_we_never_traded_stays_unowned() {
+        let mine = span(0, 7);
+        let theirs = span(8, 7);
+        let mut set = row(theirs, None, 500_000_000, false);
+        set.is_settlement = true;
+        let fills = [row(mine, ours(1), 200_000_000, true), set];
+
+        let mut a = AssetTable::new();
+        let st = build_ledger(&fills, BODY, &mut a);
+
+        assert_eq!(st.legs, 1, "only the leg WE traded is bound");
+        assert_eq!(st.settlements, 1);
+        assert_eq!(st.settlements_unowned, 1);
+        assert_eq!(a.booked_qty(SMOKE_SYM_BASE), Some(2_000_000));
+        assert!(a.sym_of_coin(theirs.of(BODY)).is_none());
+    }
+
+    /// Sign and scale, which are the two ways a ledger silently
+    /// disagrees with a venue while looking right.
+    #[test]
+    fn a_sell_books_negative_and_the_scale_is_1e6() {
+        assert_eq!(signed_1e6(&row(span(0, 7), None, 200_000_000, true)), 2_000_000);
+        assert_eq!(
+            signed_1e6(&row(span(0, 7), None, 200_000_000, false)),
+            -2_000_000,
+            "a sell REDUCES the position"
+        );
+
+        let leg = span(0, 7);
+        let fills = [
+            row(leg, ours(1), 500_000_000, true),
+            row(leg, ours(2), 200_000_000, false),
+        ];
+        let mut a = AssetTable::new();
+        build_ledger(&fills, BODY, &mut a);
+        assert_eq!(a.booked_qty(SMOKE_SYM_BASE), Some(3_000_000), "5 - 2");
+    }
+
+    /// **An agreement over NOTHING is not an agreement.** `drift_legs`
+    /// is accumulated inside `for_each_live`, which does not run when
+    /// no leg is bound — so every one of these produces zero drift over
+    /// zero legs, and a verdict reading only `drift_legs == 0` calls
+    /// them all a pass. This is the E4 exit gate's evidence, and each
+    /// case below is reachable: an empty snapshot, the wrong master
+    /// address, and an account whose only rows are somebody's payout.
+    #[test]
+    fn a_verdict_over_zero_legs_is_never_an_agreement() {
+        use super::{ReconReport, LedgerStats};
+
+        let verdict = |ledger: LedgerStats| {
+            ReconReport {
+                ledger,
+                balances: 18,
+                drift_legs: 0,
+                legs_nonzero: ledger.legs,
+                worst_qty_1e6: 0,
+                worst_usd_1e6: 0,
+            }
+            .agreed()
+        };
+
+        // (a) nothing at all
+        let mut a = AssetTable::new();
+        let empty = build_ledger(&[], BODY, &mut a);
+        assert_eq!(empty.legs, 0);
+        assert!(!verdict(empty), "an empty snapshot compared nothing");
+
+        // (b) rows, none of them ours — the wrong master address
+        let mut a = AssetTable::new();
+        let st = build_ledger(
+            &[
+                row(span(0, 7), Some([0xAB; 16]), 900_000_000, true),
+                row(span(8, 7), None, 100_000_000, true),
+            ],
+            BODY,
+            &mut a,
+        );
+        assert_eq!(st.foreign, 2);
+        assert_eq!(st.legs, 0, "nothing of ours bound a leg");
+        assert!(!verdict(st), "somebody else's fills are not our agreement");
+
+        // (c) settlements only — a payout on a leg we never traded
+        let mut set = row(span(0, 7), None, 500_000_000, false);
+        set.is_settlement = true;
+        let mut a = AssetTable::new();
+        let st = build_ledger(&[set], BODY, &mut a);
+        assert_eq!(st.settlements_unowned, 1);
+        assert_eq!(st.legs, 0);
+        assert!(!verdict(st));
+
+        // And the control: one real leg, zero drift, IS an agreement.
+        let mut a = AssetTable::new();
+        let st = build_ledger(&[row(span(0, 7), ours(1), 200_000_000, true)], BODY, &mut a);
+        assert_eq!(st.legs, 1);
+        assert!(verdict(st), "a leg that agreed must still read as agreement");
+    }
+
+    /// A settlement is classified BEFORE its cloid is looked at, which
+    /// is the order the live arm uses. Today every measured settlement
+    /// arrives without a cloid, so the two orders agree by coincidence
+    /// — this pins the order itself, against the day one arrives with
+    /// a cloid and the smoke silently reports it as a trade.
+    #[test]
+    fn a_settlement_is_a_settlement_even_carrying_our_cloid() {
+        let leg = span(0, 7);
+        let mut set = row(leg, ours(9), 400_000_000, false);
+        set.is_settlement = true;
+        let fills = [row(leg, ours(1), 400_000_000, true), set];
+
+        let mut a = AssetTable::new();
+        let st = build_ledger(&fills, BODY, &mut a);
+
+        assert_eq!(st.settlements, 1, "the flag decides, not the cloid");
+        assert_eq!(st.ours, 1, "and it is NOT also counted as a trade");
+        assert_eq!(st.ours + st.foreign + st.settlements, st.rows);
+        assert_eq!(a.booked_qty(SMOKE_SYM_BASE), Some(0), "+4 then -4");
+    }
+
+    /// `refused` is a ROW count. A coin that could not bind makes every
+    /// row on it refused, once each — not once in pass 1 and again in
+    /// pass 2 for the same row.
+    #[test]
+    fn refused_counts_rows_once() {
+        // 32 slots; bind 32 distinct legs, then a 33rd that cannot fit.
+        let mut body = Vec::new();
+        let mut spans = Vec::new();
+        for i in 0..33u32 {
+            let start = u32::try_from(body.len()).expect("small");
+            body.extend_from_slice(format!("#{:06}", 100_000 + i).as_bytes());
+            body.push(b' ');
+            spans.push(span(start, 7));
+        }
+        let mut fills = Vec::new();
+        for (i, sp) in spans.iter().enumerate() {
+            fills.push(row(*sp, ours(i as u64 + 1), 100_000_000, true));
+        }
+        // two rows on the leg that will not fit
+        fills.push(row(spans[32], ours(99), 100_000_000, true));
+
+        let mut a = AssetTable::new();
+        let st = build_ledger(&fills, &body, &mut a);
+
+        assert_eq!(st.legs, 32, "the table holds exactly ASSET_SLOTS");
+        assert_eq!(st.ours, 34);
+        assert_eq!(st.refused, 2, "both rows on the unbindable leg, once each");
+    }
+
+    /// Two legs, two slots, and the ledgers do not bleed into each
+    /// other — the failure that would make every drift number wrong at
+    /// once.
+    #[test]
+    fn two_legs_keep_separate_ledgers() {
+        let a_leg = span(0, 7);
+        let b_leg = span(8, 7);
+        let fills = [
+            row(a_leg, ours(1), 200_000_000, true),
+            row(b_leg, ours(2), 700_000_000, true),
+            row(a_leg, ours(3), 100_000_000, true),
+        ];
+        let mut a = AssetTable::new();
+        let st = build_ledger(&fills, BODY, &mut a);
+
+        assert_eq!(st.legs, 2);
+        assert_eq!(a.booked_qty(SMOKE_SYM_BASE), Some(3_000_000));
+        assert_eq!(a.booked_qty(SMOKE_SYM_BASE + 2), Some(7_000_000));
+    }
 }
 
 #[cfg(test)]

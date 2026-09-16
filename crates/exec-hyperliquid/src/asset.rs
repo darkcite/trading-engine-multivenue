@@ -641,7 +641,8 @@ impl AssetTable {
     /// it is NOT a position in the successor, whose ledger `bind` just
     /// zeroed. Crediting it there would leave a phantom quantity the
     /// venue's sheet never contains — permanent drift, and
-    /// `recon_drift_max_1e6` is a high-water mark that never clears.
+    /// `recon_drift_max_qty_1e6` is a high-water mark that never
+    /// clears.
     #[inline]
     #[must_use]
     pub fn sym_of_coin_gen(&self, coin: &[u8]) -> Option<(u32, bool)> {

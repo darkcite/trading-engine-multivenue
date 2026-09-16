@@ -61,9 +61,6 @@ use crate::userws_conn::UserWs;
 /// Engine 1e6 → venue 1e8.
 const ENGINE_TO_WIRE: i64 = 100;
 
-/// Venue 1e8 → engine 1e6, for a QUANTITY off the balance sheet.
-const WIRE_TO_ENGINE_QTY: i64 = 100;
-
 /// A booked fill's SIGNED contribution to a position, 1e6.
 ///
 /// Side comes from the venue row rather than the converted `Fill`, so
@@ -172,10 +169,16 @@ pub struct HlExecCounters {
     /// check independent of every belief the engine holds — the
     /// comparison is against what we BOOKED, not what a member thinks.
     pub recon_drift_legs: u64,
-    /// The largest single-leg disagreement seen, 1e6. Not a running
-    /// total: a drift that appears and is corrected still leaves its
-    /// mark here.
-    pub recon_drift_max_1e6: i64,
+    /// The largest single-leg disagreement seen, as a **CONTRACT
+    /// QUANTITY**, 1e6. Not a running total: a drift that appears and
+    /// is corrected still leaves its mark here.
+    ///
+    /// The name carries the unit because the halt rule E6 will write
+    /// is `halt_on_recon_drift_usd_1e6` — **dollars**, and the two
+    /// share a scale suffix while meaning different things. Put this
+    /// through [`crate::recon::drift_qty_to_usd_1e6`] before comparing
+    /// it to anything denominated in money.
+    pub recon_drift_max_qty_1e6: i64,
     /// Symbols two different strategy slots have both traded. The
     /// binding stops naming an owner, so their settlements are counted
     /// and never booked — guessing between two claimants is the
@@ -679,8 +682,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         self.counters.recon_ok = self.counters.recon_ok.wrapping_add(1);
         let (legs, worst) = Self::compare(&self.assets, &self.bal[..rows], body);
         self.counters.recon_drift_legs = legs;
-        if worst > self.counters.recon_drift_max_1e6 {
-            self.counters.recon_drift_max_1e6 = worst;
+        if worst > self.counters.recon_drift_max_qty_1e6 {
+            self.counters.recon_drift_max_qty_1e6 = worst;
         }
     }
 
@@ -699,38 +702,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         bal: &[crate::recon::SpotBalance],
         body: &[u8],
     ) -> (u64, i64) {
-        let mut drift_legs = 0u64;
-        let mut worst = 0i64;
-        assets.for_each_live(|_sym, coin, booked_1e6| {
-            let mut venue_1e6 = 0i64;
-            let mut i = 0usize;
-            while i < bal.len() {
-                if crate::recon::same_leg(bal[i].coin.of(body), coin) {
-                    // TOTAL, not free. `free = total - hold`, and
-                    // `hold` is what a RESTING order has committed —
-                    // on spot, an ask holds the base token. The ledger
-                    // is a pure position from fills and knows nothing
-                    // about encumbrance, so comparing against `free`
-                    // would report drift equal to the resting size for
-                    // as long as a quote is live: continuously, for a
-                    // maker, and in the "we booked more than the venue
-                    // holds" direction — which is the signature of a
-                    // double-counted fill. The sheet is 1e8; the
-                    // engine is 1e6.
-                    venue_1e6 = bal[i].total_1e8 / WIRE_TO_ENGINE_QTY;
-                    break;
-                }
-                i += 1;
-            }
-            let d = crate::recon::drift(booked_1e6, venue_1e6);
-            if d != 0 {
-                drift_legs += 1;
-                if d > worst {
-                    worst = d;
-                }
-            }
-        });
-        (drift_legs, worst)
+        crate::recon::compare_booked(assets, bal, body)
     }
 
     fn persist_budget(&mut self) {
@@ -1563,7 +1535,8 @@ mod tests {
     /// is for — but it must NOT credit the successor's ledger, which
     /// `bind` just zeroed and whose venue balance will never contain
     /// it. Left uncorrected it is permanent drift, and
-    /// `recon_drift_max_1e6` is a high-water mark that never clears.
+    /// `recon_drift_max_qty_1e6` is a high-water mark that never
+    /// clears.
     #[test]
     fn a_late_fill_from_the_old_instance_books_but_does_not_credit_the_successor() {
         let mut x = exchange();

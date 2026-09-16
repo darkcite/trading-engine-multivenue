@@ -254,6 +254,111 @@ pub fn drift(ours: i64, venue: i64) -> i64 {
     ours.saturating_sub(venue).saturating_abs()
 }
 
+/// The venue quotes quantities 1e8; the engine books them 1e6.
+pub(crate) const WIRE_TO_ENGINE_QTY: i64 = 100;
+
+/// Compare what THIS ARM BOOKED against what the venue says it holds.
+///
+/// Returns `(legs that disagreed, worst magnitude 1e6 as a CONTRACT
+/// QUANTITY)` — put the second through [`drift_qty_to_usd_1e6`] before
+/// comparing it to a money threshold.
+///
+/// Lives here rather than on `HlExchange` because reconciliation is
+/// the one check that should be runnable **without** an exchange: it
+/// needs a table and a balance sheet, not a socket, a signer or a
+/// fill-ring size. `HlExchange::compare` delegates to it, and the
+/// phase-E smoke calls it directly.
+///
+/// A leg the venue does not mention reads as ZERO, which is the right
+/// reading and is itself a drift if we booked something.
+#[must_use]
+pub fn compare_booked(
+    assets: &crate::asset::AssetTable,
+    bal: &[SpotBalance],
+    body: &[u8],
+) -> (u64, i64) {
+    let mut drift_legs = 0u64;
+    let mut worst = 0i64;
+    assets.for_each_live(|_sym, coin, booked_1e6| {
+        let mut venue_1e6 = 0i64;
+        let mut i = 0usize;
+        while i < bal.len() {
+            if same_leg(bal[i].coin.of(body), coin) {
+                // TOTAL, not free. `free = total - hold`, and `hold`
+                // is what a RESTING order has committed — on spot, an
+                // ask holds the base token. The ledger is a pure
+                // position from fills and knows nothing about
+                // encumbrance, so comparing against `free` would
+                // report drift equal to the resting size for as long
+                // as a quote is live: continuously, for a maker, and
+                // in the "we booked more than the venue holds"
+                // direction — which is the signature of a
+                // double-counted fill. The sheet is 1e8; the engine
+                // is 1e6.
+                venue_1e6 = bal[i].total_1e8 / WIRE_TO_ENGINE_QTY;
+                break;
+            }
+            i += 1;
+        }
+        let d = drift(booked_1e6, venue_1e6);
+        if d != 0 {
+            drift_legs += 1;
+            if d > worst {
+                worst = d;
+            }
+        }
+    });
+    (drift_legs, worst)
+}
+
+/// The most one HIP-4 outcome contract can ever be worth, 1e6.
+///
+/// A leg settles to **exactly 0 or 1 USDC** — that is what a binary
+/// outcome market is — so one unit is worth at most one dollar, at
+/// every moment of its life, with no price feed consulted.
+pub const OUTCOME_LEG_CEILING_USD_1E6: i64 = 1_000_000;
+
+/// Convert a drift QUANTITY into the USD the halt rule is written in.
+///
+/// `compare` measures drift in contracts; `halt_on_recon_drift_usd_1e6`
+/// is dollars. Nothing converted between them, so a halt rule reading
+/// the raw counter would have been comparing contracts to dollars —
+/// two numbers that happen to share a scale suffix and mean different
+/// things. This is the conversion, named so a caller cannot skip it by
+/// accident.
+///
+/// **The factor is the CEILING, not a mark.** Marking at the last
+/// trade would be more accurate on average and wrong in the only
+/// direction that matters: a 40-contract drift on a leg trading at
+/// 0.02 would read as 0.80 USDC and clear a 5 USDC halt threshold,
+/// while the position it failed to account for is worth up to 40 USDC
+/// if that leg settles YES. A safety net that under-reports is the
+/// failure it exists to prevent. At the ceiling the conversion is the
+/// identity, and it can only ever halt EARLY.
+///
+/// Valid by construction for everything `AssetTable` holds: the table
+/// binds HIP-4 outcome legs and nothing else (LAW E-4 — an asset id is
+/// bound by a roll event, never derived), and every one of them is a
+/// 0-or-1 contract.
+#[inline(always)]
+#[must_use]
+pub fn drift_qty_to_usd_1e6(qty_1e6: i64) -> i64 {
+    // i128 so the multiply cannot wrap before the divide. At the
+    // ceiling this is the identity, but writing it as an identity
+    // would make the factor invisible to whoever changes it.
+    let usd = i128::from(qty_1e6) * i128::from(OUTCOME_LEG_CEILING_USD_1E6) / 1_000_000;
+    // Saturating rather than `as`: a truncating cast on the halt path
+    // turns an enormous drift into a small one, which is the one
+    // rounding direction this number must never take.
+    if usd > i128::from(i64::MAX) {
+        i64::MAX
+    } else if usd < i128::from(i64::MIN) {
+        i64::MIN
+    } else {
+        usd as i64
+    }
+}
+
 /// Bytes a `spotClearinghouseState` request needs.
 pub const MAX_STATE_REQ: usize = 96;
 
@@ -519,5 +624,56 @@ mod tests {
         for k in 0..real.len() {
             let _ = scan_spot_state(&real[..k], &mut big);
         }
+    }
+    /// **The conversion cannot under-report, which is the only thing
+    /// it must never do.** Marking a drift at the leg's traded price
+    /// is more accurate on average; on a cheap leg it is catastrophic,
+    /// because the contract that drifted is worth 1 USDC if it settles
+    /// YES no matter what it last traded at. Checked against every
+    /// price a leg can have rather than asserted.
+    #[test]
+    fn a_drift_is_never_valued_below_what_it_could_settle_for() {
+        let qty_1e6 = 40_000_000i64; // 40 contracts
+        let ceiling = drift_qty_to_usd_1e6(qty_1e6);
+        assert_eq!(ceiling, 40_000_000, "40 contracts settle for at most 40 USDC");
+
+        let mut px_1e6 = 0i64;
+        while px_1e6 <= 1_000_000 {
+            let marked = i128::from(qty_1e6) * i128::from(px_1e6) / 1_000_000;
+            assert!(
+                marked <= i128::from(ceiling),
+                "marking at {px_1e6} gave {marked}, above the settle ceiling {ceiling}"
+            );
+            px_1e6 += 10_000;
+        }
+
+        // The case that motivated the choice: a 40-contract drift on a
+        // leg trading at 0.02 marks to 0.80 USDC and clears a 5 USDC
+        // halt, while the exposure it failed to account for is 40.
+        let marked_cheap = i128::from(qty_1e6) * 20_000 / 1_000_000;
+        assert_eq!(marked_cheap, 800_000, "0.80 USDC");
+        assert!(ceiling > 5_000_000, "and the ceiling would have halted");
+    }
+
+    /// The factor is 1.0, so the conversion is the identity — and that
+    /// is a PROPERTY OF HIP-4, not of the arithmetic. Pinned so that
+    /// changing the ceiling breaks a test rather than silently
+    /// rescaling every halt threshold in the config.
+    #[test]
+    fn the_ceiling_is_one_dollar_a_contract_and_the_conversion_says_so() {
+        assert_eq!(OUTCOME_LEG_CEILING_USD_1E6, 1_000_000);
+        for q in [0i64, 1, 999_999, 1_000_000, 31_600_000, i64::from(u32::MAX)] {
+            assert_eq!(drift_qty_to_usd_1e6(q), q);
+        }
+    }
+
+    /// A truncating cast on the halt path turns an enormous drift into
+    /// a small one — the one rounding direction this number must never
+    /// take. `i64::MAX` in must not come out negative or small.
+    #[test]
+    fn an_enormous_drift_saturates_rather_than_wrapping_small() {
+        assert_eq!(drift_qty_to_usd_1e6(i64::MAX), i64::MAX);
+        assert_eq!(drift_qty_to_usd_1e6(i64::MIN), i64::MIN);
+        assert!(drift_qty_to_usd_1e6(i64::MAX) > 5_000_000, "still halts");
     }
 }

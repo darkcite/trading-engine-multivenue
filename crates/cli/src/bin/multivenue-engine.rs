@@ -262,6 +262,33 @@ struct ExecSmokeArgs {
     #[arg(long, default_value_t = 1, requires = "fill")]
     fill_repeat: u32,
 
+    /// PHASE E: run the RECONCILIATION against the live venue.
+    ///
+    /// §6.2 calls reconciliation "the single most valuable safety net
+    /// in the plan", and until this existed it could only run inside a
+    /// live `HlExchange` — which E7 gates. So the check meant to catch
+    /// a lost fill, a double-counted fill and a wrong asset id had
+    /// never once run against a socket.
+    ///
+    /// **Reads only.** It takes the `userFills` snapshot, rebuilds this
+    /// arm's ledger from OUR OWN cloids, asks the venue what it holds,
+    /// and compares. No order, no signature, no balance spent — so
+    /// unlike every other phase here it needs no A/B probe first.
+    ///
+    /// Exits nonzero on ANY drift. The worst disagreement is reported
+    /// twice: as a contract quantity, and in USD through the settle
+    /// ceiling, because a halt threshold is written in money.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["offline", "lifecycle", "fill"])]
+    recon: bool,
+
+    /// How long to wait for the `userFills` SNAPSHOT, seconds.
+    ///
+    /// A snapshot that never arrives is an ERROR, never an empty
+    /// ledger: an empty ledger would make the comparison pass by
+    /// having nothing to compare.
+    #[arg(long, default_value_t = 20, requires = "recon")]
+    recon_secs: u64,
+
     /// Subscribe to the USER-EVENT stream (userFills + orderUpdates)
     /// for this many seconds and report what arrives.
     ///
@@ -927,6 +954,12 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     if let Some(secs) = args.watch {
         return exec_watch(scope, secs);
     }
+    // Beside `--watch`, and before the A/B probe on purpose: this
+    // phase signs nothing, so requiring a signature probe to run it
+    // would be ceremony rather than a guard.
+    if args.recon {
+        return exec_recon(scope, args.recon_secs);
+    }
     let cfg = match HlConfig::from_env(scope) {
         Ok(c) => c,
         Err(e) => {
@@ -981,6 +1014,97 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
 }
 
 /// Watch the user-event stream. Read-only; places nothing.
+fn exec_recon(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
+    let cfg = match exec_hyperliquid::HlConfig::from_env(scope) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("exec-smoke: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    info!(
+        host = %cfg.host,
+        secs,
+        "exec-recon: PHASE E — reading userFills + spotClearinghouseState. Places nothing."
+    );
+    let tls = TlsTransport::default_client_config();
+    let wait = std::time::Duration::from_secs(secs);
+    match exec_hyperliquid::lifecycle::run_recon(&cfg, tls, wait) {
+        Ok(r) => {
+            let l = r.ledger;
+            println!(
+                "{{\"rows\":{},\"ours\":{},\"foreign\":{},\"settlements\":{},\
+                 \"settlements_unowned\":{},\"legs\":{},\"refused\":{},\"balances\":{},\
+                 \"drift_legs\":{},\"legs_nonzero\":{},\"worst_qty_1e6\":{},\"worst_usd_1e6\":{},\
+                 \"agreed\":{}}}",
+                l.rows,
+                l.ours,
+                l.foreign,
+                l.settlements,
+                l.settlements_unowned,
+                l.legs,
+                l.refused,
+                r.balances,
+                r.drift_legs,
+                r.legs_nonzero,
+                r.worst_qty_1e6,
+                r.worst_usd_1e6,
+                r.agreed(),
+            );
+            if l.refused > 0 {
+                error!(
+                    refused = l.refused,
+                    "exec-recon: rows the ledger could not place. A reconciliation missing \
+                     rows agrees by having less to disagree with — this is NOT a pass."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            // Distinguishable from a real disagreement on purpose. Both
+            // exit nonzero, but "the ledger and the venue differ" and
+            // "there was no ledger" need different things done about
+            // them, and folding them into one message is how the second
+            // gets read as the first.
+            if l.ours == 0 {
+                error!(
+                    rows = l.rows,
+                    foreign = l.foreign,
+                    settlements = l.settlements,
+                    "exec-recon: the snapshot carried NO fills of ours. Nothing was compared, \
+                     so this is not a pass — check HYPERLIQUID_TESTNET_MASTER_ADDR, or that \
+                     this account has traded at all."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.agreed() {
+                error!(
+                    legs = l.legs,
+                    drift_legs = r.drift_legs,
+                    worst_qty_1e6 = r.worst_qty_1e6,
+                    worst_usd_1e6 = r.worst_usd_1e6,
+                    "exec-recon: the venue and this arm's ledger DISAGREE. That is a lost \
+                     fill, a double-counted fill, a wrong asset id or a stale view — the four \
+                     things this check exists to find."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            info!(
+                legs = l.legs,
+                legs_nonzero = r.legs_nonzero,
+                ours = l.ours,
+                settlements = l.settlements,
+                foreign = l.foreign,
+                balances = r.balances,
+                "exec-recon: AGREED on every leg."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("{e}");
+            ExitCode::from(e.code() as u8)
+        }
+    }
+}
+
 fn exec_watch(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
     use exec_hyperliquid::userws::{scan_user_fills, UserFill};
     use exec_hyperliquid::{HlConfig, UserWs};
