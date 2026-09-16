@@ -1937,3 +1937,196 @@ was once missing, and a second copy is how that bug comes back. Its
 temp name now APPENDS `.tmp` rather than replacing the extension —
 the old form was right for `*.tsv` and silently wrong for anything
 else.
+
+### E5 — the engine learns two verbs (2026-09-16)
+
+The engine could submit and nothing else. Every strategy that wanted
+to move a quote had to let it expire, and every strategy that wanted
+to pull one had to wait for the venue. E5 gives `OrderDispatch` and
+`Ctx` a `cancel` and a `modify`, and makes the PAPER arm implement
+both — a trait method with only a default body is untestable.
+
+#### `Ok` means "this call did it", never "it is not there"
+
+The whole reason these return a `Result` is the difference between
+those two facts. A cancel that finds no resting order returns
+`NoSuchOrder`, not `Ok`: the order is indeed gone, but a *fill* is
+what removed it, and a strategy told `Ok` will go on believing it
+pulled a quote whose fill it has already booked. `no_such_order` is
+therefore an **expected, non-zero counter** — it counts races lost to
+a fill or a TTL, not errors.
+
+`IdentityMismatch` is the opposite: a resting order *does* carry that
+client id, but the request describes a different order.
+`identity_mismatch` **must stay 0**, because nothing in normal
+operation changes an order's identity — any non-zero value names a
+caller that built the wrong request.
+
+#### A `client_oid` is unique only inside its own slot
+
+This nearly shipped wrong. Every member allocates `client_oid` from
+its own counter starting at 1, `strategy-xsd` resets its counter on a
+path that does not clear the open table, and `strategy-bin15` rides a
+14-bit sequence — while **all enabled members share ONE
+`PaperMatcher`**. So id 1 belongs to as many resting orders as there
+are members quoting.
+
+The lookup is therefore keyed on `(client_oid, strategy_id)`. The
+slot is the NAMESPACE, not an assertion the caller is making, which
+is why it belongs in the key while `sym` and `venue` are checked
+*after* the lookup. Keyed on the id alone, a member's correct cancel
+would find another member's order, be reported as `IdentityMismatch`
+— a "not retryable, operator decision" answer that makes the member
+abandon a quote that is still resting — and `identity_mismatch` could
+never have held its must-stay-0 contract, because ordinary
+multi-member operation trips it.
+
+A member that reuses an id while its own first order still rests gets
+`AmbiguousOrder`, not first-wins. Taking back one of two quotes that
+answer to the same name and reporting success leaves the caller
+believing both are gone. `ambiguous_order` must stay 0 too.
+
+#### What a MODIFY may change
+
+Price, size and client id. Nothing else. `core_types::OrderIdentity`
+is the single statement of what "the same order" means — venue, slot,
+sym, side, kind — and it exists as one comparable POD rather than a
+five-way `&&` at each site so that a sixth identity field added later
+updates every arm at once and no arm can quietly compare four of the
+five. A modify that changes any of them is refused, not performed.
+
+#### A reprice does not extend a quote's life
+
+The modified order inherits the ORIGINAL `expiry_ns`, and the
+replacement's own `ttl_ns` is read for nothing. Without this, an Arm
+B repricing every 333 ms would hold a quote forever past the TTL its
+ruleset set — the TTL would stop being a bound.
+
+#### …but the replacement's `ts_ns` IS read, and is load-bearing
+
+An earlier draft of this section said `ts_ns` and `ttl_ns` were both
+"read for nothing". Only `ttl_ns` is. `ts_ns` is the modify's
+decision clock — `PaperDispatcher::modify` passes it as `now_ns`,
+exactly as `submit` passes `order.ts_ns` — and the activation delta
+below is re-armed from it. **A replacement carrying a stale or zero
+`ts_ns` lands with its activation already in the past and is fillable
+at the NEW price on the very next tick**, which is the fabricated
+fill the next paragraph exists to prevent. Stamp it from
+`ctx.now_ns()`.
+
+This is the same contract `submit` has always had; it is written down
+here because the first caller will be a requote loop, which is
+exactly where a reused or forgotten timestamp is easy to write.
+
+#### A reprice re-arms the activation delta
+
+**This is a deliberate departure from "preserve the original
+`ts_ns`".** Δ_venue is the measured time an instruction takes to reach
+the venue, and it is why an order cannot fill on a tick that arrived
+before it. A new price is an instruction like any other: it is not at
+the venue for Δ. Preserving `t_active_ns` across a modify would let
+the paper matcher fill at a price the venue had not yet been told
+about — a fabricated fill, the one class of error the matcher exists
+to prevent.
+
+The cost is that the OLD price, which really is still resting during
+the flight window, cannot fill either, so the model under-fills a
+modify by at most one Δ. Under-filling is recoverable. Inventing a
+fill is not. If E6 or later wants the exact model, it is "the old
+order until `now + Δ`, the new one after" — more machinery than this
+commit should carry, and strictly harder to get right than the
+conservative version.
+
+#### A cancel has NO flight model, and that is a known optimism
+
+`PaperMatcher::cancel` removes the order instantly, while `modify`
+re-arms Δ. In reality the quote rests for another Δ after the cancel
+is sent and can be picked off in that window, so the paper model
+suppresses fills a live boot would take — the optimistic direction,
+and the "paper looks better than live" hazard this file exists to
+name. It is a deliberate omission, not an oversight: E5 has no live
+cancel path to compare against, and a half-modelled flight window
+would be a second number to reconcile. **E6 must revisit it once a
+live cancel exists**, and until then a paper boot's absence of
+cancel-window fills is a modelling artefact, not evidence.
+
+#### A modify can RAISE an order's size
+
+`remaining_1e6` is taken from the replacement, so a modify is a
+resize in both directions. The E6 risk clamps are specified above as
+landing "inside `RoutedDispatcher::submit`" — **a clamp on `submit`
+alone leaves a size-raising path uncapped.** Whatever E6 gates on
+must gate `modify` too.
+
+#### LAW E-1 applies to a cancel, and harder
+
+`RoutedDispatcher` routes a cancel and a modify through the same
+three-way branch as a submit, on the request's own `strategy_id` and
+`venue`. A live slot's verb that names an unrouted venue is refused
+and counted — **never handed to the paper matcher**.
+
+A mis-routed submit invents a fill. A mis-routed cancel invents the
+ABSENCE of one: the matcher would remove a modelled order and report
+success while the real quote stays resting at the venue, and nothing
+downstream can detect the difference. `StampCtx` stamps a cancel's
+`strategy_id` exactly as it stamps an order's, because an unstamped
+cancel would route by slot `0xFF & 7` — a member able to pull another
+member's quote.
+
+#### THE OPEN GAP: `engine-orders.pmlr` cannot express either verb
+
+The intent capture has one record type, `Order`, and no way to say
+"and then I pulled that one" or "and then I moved it to 0.47". The
+moment a boot performs a cancel or a modify, **the capture stops
+describing it**: an offline replay models an order the engine had
+already taken back, or fills the old price of one it had moved.
+
+Appending the replacement Order would be worse, not better — a replay
+would then see two submits and model two resting orders where the
+engine had one that moved. So nothing is appended, and the gap is a
+number instead: `engine::LifecycleCounters::capture_is_incomplete()`,
+mirrored as `engine_lifecycle_cancels_ok_total` and
+`engine_lifecycle_modifies_ok_total`. It reads the `_ok` fields and
+not the `_err` fields, because a refused verb changed nothing and
+leaves the capture correct.
+
+**The gate is manual today.** `capture_is_incomplete()` has no
+non-test caller: what actually reaches an operator is the two
+metrics, and no replay, backtest or audit path consults either. The
+Arm B commit owes it a real consumer.
+
+**The offline harness is the same gap from the other side.**
+`cli::backtest::BacktestCtx` implements neither verb, so it takes the
+`Unsupported` default: the same member that cancels successfully in
+the live paper engine gets `Refused` → `orders_dropped` in the
+harness. Fail-closed, and therefore safe today — but every gate, OOS
+verdict and pin runs through that harness, so the Arm B commit owes
+it the verbs as well as the capture.
+
+**Nothing in the tree emits either verb yet.** E5 commit 3 is
+plumbing behind trait defaults. The commit that makes these counters
+non-zero — bin15's Arm B requote — owes the capture a lifecycle
+record type first, or owes an explicit decision that its boots are
+not replay sources.
+
+#### The parity gate
+
+`crates/clob-dispatcher/tests/paper_replay_parity.rs` fingerprints the
+raw bytes of every `Fill` a scripted stream produces, plus the seven
+pre-E5 matcher counters. The constant was derived by running the same
+script against the tree at `7f30752` — **before** the change — not
+regenerated from the post-change tree, which would pin the new
+behaviour to itself and prove nothing. It is accompanied by a
+non-vacuity test, because a fingerprint over an empty fill stream
+passes forever: the same "agreement over an empty set" that made E4's
+reconciliation report green against a wallet it had never looked at.
+
+#### `SubmitErr` has four names now
+
+`RingFull` used to be the only one, and the engine mapped every
+dispatcher error onto it — a slot the operator switched off arrived at
+a strategy as back-pressure. Harmless while every caller dropped the
+order either way; not harmless the moment a strategy must tell "retry
+later" from "that order is already gone". The mapping is now an
+exhaustive match with no `_` arm, so a new `DispatchError` variant is
+a compile error rather than a silent re-merge.

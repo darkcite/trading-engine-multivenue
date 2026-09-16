@@ -469,7 +469,17 @@ impl<const N: usize> AiExec<N> {
                 self.orders_emitted = self.orders_emitted.wrapping_add(1);
                 self.gate.record_emit(bidx, now);
             }
-            Err(SubmitErr::RingFull) => {
+            // E5: every refusal is the same fact to this member —
+            // the dispatcher did not take the order. Spelled out
+            // rather than `_` so a new `SubmitErr` variant forces
+            // this decision to be made again instead of silently
+            // joining the drop arm.
+            Err(
+                SubmitErr::RingFull
+                | SubmitErr::Unsupported
+                | SubmitErr::NoSuchOrder
+                | SubmitErr::Refused,
+            ) => {
                 self.orders_dropped = self.orders_dropped.wrapping_add(1);
             }
         }
@@ -509,7 +519,17 @@ impl<const N: usize> AiExec<N> {
                 self.intents_honored = self.intents_honored.wrapping_add(1);
                 self.orders_emitted = self.orders_emitted.wrapping_add(1);
             }
-            Err(SubmitErr::RingFull) => {
+            // E5: every refusal is the same fact to this member —
+            // the dispatcher did not take the order. Spelled out
+            // rather than `_` so a new `SubmitErr` variant forces
+            // this decision to be made again instead of silently
+            // joining the drop arm.
+            Err(
+                SubmitErr::RingFull
+                | SubmitErr::Unsupported
+                | SubmitErr::NoSuchOrder
+                | SubmitErr::Refused,
+            ) => {
                 self.orders_dropped = self.orders_dropped.wrapping_add(1);
             }
         }

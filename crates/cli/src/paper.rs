@@ -4265,6 +4265,39 @@ pub struct PaperMatcherMetricIds {
     /// `engine_set_fills_unrouted_total` — fills stamped for a slot
     /// that is not enabled, or not built.
     pub fills_unrouted: core_metrics::CounterId,
+    /// `engine_paper_matcher_cancels_total` (E5) — resting orders the
+    /// matcher took back.
+    pub cancels: core_metrics::CounterId,
+    /// `engine_paper_matcher_modifies_total` (E5) — resting orders
+    /// repriced in place.
+    pub modifies: core_metrics::CounterId,
+    /// `engine_paper_matcher_no_such_order_total` (E5) — lifecycle
+    /// verbs that lost a race to a fill or a TTL. **Expected to be
+    /// non-zero**; it counts races, not errors.
+    pub no_such_order: core_metrics::CounterId,
+    /// `engine_paper_matcher_identity_mismatch_total` (E5) — lifecycle
+    /// verbs that described a different order than the one resting
+    /// under that client id. **Must stay 0**: nothing in normal
+    /// operation changes an order's identity, so a non-zero value
+    /// names a caller that built the wrong request.
+    pub identity_mismatch: core_metrics::CounterId,
+    /// `engine_paper_matcher_ambiguous_order_total` (E5) — lifecycle
+    /// verbs naming an id more than one of that slot's resting orders
+    /// answers to. **Must stay 0**: it means a member reused a client
+    /// id while the first order was still resting.
+    pub ambiguous_order: core_metrics::CounterId,
+    /// `engine_lifecycle_cancels_ok_total` (E5). **Non-zero means
+    /// this boot's `engine-orders.pmlr` is no longer replayable** —
+    /// the capture has no record type for a cancel. Same for
+    /// `modifies_ok`.
+    pub lifecycle_cancels_ok: core_metrics::CounterId,
+    /// `engine_lifecycle_cancels_err_total` (E5).
+    pub lifecycle_cancels_err: core_metrics::CounterId,
+    /// `engine_lifecycle_modifies_ok_total` (E5) — see
+    /// `lifecycle_cancels_ok`.
+    pub lifecycle_modifies_ok: core_metrics::CounterId,
+    /// `engine_lifecycle_modifies_err_total` (E5).
+    pub lifecycle_modifies_err: core_metrics::CounterId,
 }
 
 /// Register the paper-matcher family. Boot-only.
@@ -4283,6 +4316,15 @@ fn register_paper_matcher_metrics(
     let unroutable = one("engine_paper_matcher_unroutable_total")?;
     let out_overflow = one("engine_paper_matcher_out_overflow_total")?;
     let fills_unrouted = one("engine_set_fills_unrouted_total")?;
+    let cancels = one("engine_paper_matcher_cancels_total")?;
+    let modifies = one("engine_paper_matcher_modifies_total")?;
+    let no_such_order = one("engine_paper_matcher_no_such_order_total")?;
+    let identity_mismatch = one("engine_paper_matcher_identity_mismatch_total")?;
+    let ambiguous_order = one("engine_paper_matcher_ambiguous_order_total")?;
+    let lifecycle_cancels_ok = one("engine_lifecycle_cancels_ok_total")?;
+    let lifecycle_cancels_err = one("engine_lifecycle_cancels_err_total")?;
+    let lifecycle_modifies_ok = one("engine_lifecycle_modifies_ok_total")?;
+    let lifecycle_modifies_err = one("engine_lifecycle_modifies_err_total")?;
     Ok(PaperMatcherMetricIds {
         intake,
         fills,
@@ -4292,6 +4334,15 @@ fn register_paper_matcher_metrics(
         unroutable,
         out_overflow,
         fills_unrouted,
+        cancels,
+        modifies,
+        no_such_order,
+        identity_mismatch,
+        ambiguous_order,
+        lifecycle_cancels_ok,
+        lifecycle_cancels_err,
+        lifecycle_modifies_ok,
+        lifecycle_modifies_err,
         open_orders: reg
             .register_gauge("engine_paper_matcher_open_orders")
             .map_err(|_| "register paper matcher gauge")?,
@@ -4385,8 +4436,10 @@ fn mirror_paper_matcher_metrics(
     cur: clob_dispatcher::MatcherCounters,
     open_orders: usize,
     fills_unrouted: u64,
+    lifecycle: engine::LifecycleCounters,
     last: &mut clob_dispatcher::MatcherCounters,
     last_unrouted: &mut u64,
+    last_lifecycle: &mut engine::LifecycleCounters,
 ) {
     reg.counter(ids.intake)
         .inc(cur.intake.saturating_sub(last.intake));
@@ -4404,9 +4457,37 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.out_overflow.saturating_sub(last.out_overflow));
     reg.counter(ids.fills_unrouted)
         .inc(fills_unrouted.saturating_sub(*last_unrouted));
+    reg.counter(ids.cancels)
+        .inc(cur.cancels.saturating_sub(last.cancels));
+    reg.counter(ids.modifies)
+        .inc(cur.modifies.saturating_sub(last.modifies));
+    reg.counter(ids.no_such_order)
+        .inc(cur.no_such_order.saturating_sub(last.no_such_order));
+    reg.counter(ids.identity_mismatch)
+        .inc(cur.identity_mismatch.saturating_sub(last.identity_mismatch));
+    reg.counter(ids.ambiguous_order)
+        .inc(cur.ambiguous_order.saturating_sub(last.ambiguous_order));
+    // E5: the engine-level tally, which counts verbs on BOTH arms —
+    // the matcher family above sees only the paper one, so a live
+    // slot's cancels would otherwise be invisible here.
+    reg.counter(ids.lifecycle_cancels_ok)
+        .inc(lifecycle.cancels_ok.saturating_sub(last_lifecycle.cancels_ok));
+    reg.counter(ids.lifecycle_cancels_err)
+        .inc(lifecycle
+            .cancels_err
+            .saturating_sub(last_lifecycle.cancels_err));
+    reg.counter(ids.lifecycle_modifies_ok)
+        .inc(lifecycle
+            .modifies_ok
+            .saturating_sub(last_lifecycle.modifies_ok));
+    reg.counter(ids.lifecycle_modifies_err)
+        .inc(lifecycle
+            .modifies_err
+            .saturating_sub(last_lifecycle.modifies_err));
     reg.gauge(ids.open_orders).set(open_orders as i64);
     *last = cur;
     *last_unrouted = fills_unrouted;
+    *last_lifecycle = lifecycle;
 }
 
 /// VRP V8a: rewrite `vrp-state.tsv` when, and only when, the member's
@@ -5941,6 +6022,7 @@ where
     let mut xsd_state_warn_ns: u64 = 0;
     // X1: the paper matcher's delta snapshot.
     let mut matcher_last = clob_dispatcher::MatcherCounters::default();
+    let mut lifecycle_last = engine::LifecycleCounters::default();
     let mut fills_unrouted_last: u64 = 0;
     // E1: the router's previous snapshot, for the monotonic deltas.
     let mut exec_last = clob_dispatcher::ExecCounters::default();
@@ -6087,8 +6169,10 @@ where
                     clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
                     clob_dispatcher::OrderDispatch::open_paper_orders(eng.dispatcher()),
                     strategy_core::StrategyCounters::fills_unrouted(eng.strategy()),
+                    eng.lifecycle_counters(),
                     &mut matcher_last,
                     &mut fills_unrouted_last,
+                    &mut lifecycle_last,
                 );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
                 // E1: the router's own counters. Absent family = no

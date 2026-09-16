@@ -879,6 +879,191 @@ impl Order {
 }
 
 // ---------------------------------------------------------------
+// E5 — the two things a strategy can say about an order it already
+// sent: take it back, or replace it.
+// ---------------------------------------------------------------
+
+/// Take back one resting order, named by the client id it was sent
+/// with.
+///
+/// **Why a POD and not four arguments.** Two of the four are `u64`
+/// and would sit adjacent in the call (`ts_ns`, `client_oid`). A
+/// transposed pair compiles, cancels nothing, and reports success —
+/// the exact shape of bug this codebase keeps finding. Named fields
+/// make the transposition impossible to write.
+///
+/// **Why it carries the routing fields.** The router dispatches a
+/// cancel on `strategy_id`/`venue` exactly as it dispatches a
+/// submit, because **LAW E-1 applies to a cancel too**: a live
+/// slot's cancel satisfied by the paper matcher would tell the
+/// strategy its quote was pulled while the venue still holds it —
+/// strictly worse than the submit case, which only invents a fill.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CancelReq {
+    /// When the strategy decided. Bookkeeping only — no cancel path
+    /// judges an order against this.
+    pub ts_ns: NsTs,
+    /// The client id of the order to take back. NOT the venue's oid:
+    /// the engine never learns one, and [`OID_INSTANCE_MASK`] makes
+    /// the client id the durable name across a roll.
+    pub client_oid: u64,
+    /// Market the resting order names. Part of its identity — a
+    /// cancel that names a different market is not a cancel of this
+    /// order.
+    pub sym: SymbolId,
+    /// Target venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// Emitting strategy-set slot, stamped by the set's `StampCtx`
+    /// exactly as on a submit; [`STRATEGY_ID_NONE`] when unstamped.
+    pub strategy_id: u8,
+    /// Explicit tail padding. Always zero.
+    _pad: [u8; 2],
+}
+
+const _: () = assert!(core::mem::size_of::<CancelReq>() == 24);
+
+impl CancelReq {
+    /// Construct without naming the private padding.
+    #[inline(always)]
+    pub const fn new(ts_ns: NsTs, venue: VenueId, sym: SymbolId, client_oid: u64) -> Self {
+        Self {
+            ts_ns,
+            client_oid,
+            sym,
+            venue: venue as u8,
+            strategy_id: STRATEGY_ID_NONE,
+            _pad: [0; 2],
+        }
+    }
+
+    /// The cancel that takes back `order`. The only constructor that
+    /// cannot get the identity fields wrong, because it copies them.
+    #[inline(always)]
+    pub const fn of(order: &Order, ts_ns: NsTs) -> Self {
+        Self {
+            ts_ns,
+            client_oid: order.client_oid,
+            sym: order.sym,
+            venue: order.venue,
+            strategy_id: order.strategy_id,
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Replace one resting order in place — **LAW E-7: a live requote is
+/// a MODIFY, never a cancel followed by a place.**
+///
+/// ## What a modify may change, and what it may not
+///
+/// A modify changes **price, size and client id**. It may not change
+/// the order's *identity* — see [`OrderIdentity`] — because every one
+/// of those fields makes it a different order.
+///
+/// ## `ttl_ns` on the replacement is ignored; `ts_ns` is NOT
+///
+/// `ttl_ns` is read for nothing: a modify inherits the ORIGINAL
+/// order's expiry, so a repricing strategy cannot hold a quote past
+/// the TTL its ruleset gave it by repricing it forever.
+///
+/// **`ts_ns` is load-bearing.** It is the modify's decision clock,
+/// exactly as it is a submit's, and the paper matcher re-arms the
+/// venue activation delta from it — a replacement carrying a stale or
+/// zero `ts_ns` lands with its activation already in the past and
+/// becomes fillable at the new price on the very next tick, which is
+/// a fabricated fill. Stamp it from `ctx.now_ns()`, like any order.
+///
+/// ## Layout
+///
+/// [`Order`] is `align(64)`, so this is two cache lines: the previous
+/// id on the first, the replacement on the second. The gap between
+/// them is compiler-inserted padding, which is why this type is NOT
+/// [`AsBytes`] and never reaches a replay log — it crosses a call,
+/// not a wire.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct ModifyReq {
+    /// The client id of the resting order being replaced.
+    pub prev_client_oid: u64,
+    /// The replacement: new `px`, new `qty`, new `client_oid`, and
+    /// the identity fields which must equal the resting order's.
+    pub order: Order,
+}
+
+const _: () = assert!(core::mem::size_of::<ModifyReq>() == 128);
+const _: () = assert!(core::mem::align_of::<ModifyReq>() == 64);
+
+impl ModifyReq {
+    /// Replace the order resting under `prev_client_oid` with
+    /// `order`.
+    #[inline(always)]
+    pub const fn new(prev_client_oid: u64, order: Order) -> Self {
+        Self {
+            prev_client_oid,
+            order,
+        }
+    }
+
+    /// The identity the replacement claims. Compare it with the
+    /// resting order's [`OrderIdentity`]: equal means this really is
+    /// a modification of that order, unequal means it is a different
+    /// order wearing a modify's clothes.
+    #[inline(always)]
+    #[must_use]
+    pub const fn identity(&self) -> OrderIdentity {
+        OrderIdentity::of(&self.order)
+    }
+}
+
+/// Everything about an order that a MODIFY may not change.
+///
+/// One POD with `derive(PartialEq)` rather than a hand-written
+/// five-way `&&` at each comparison site, for one reason: there is
+/// then exactly ONE statement of what "the same order" means. A
+/// sixth identity field added here updates every arm at once, and no
+/// arm can quietly compare four of the five.
+///
+/// Deliberately NOT included: `px`, `qty` and `client_oid` — the
+/// three things a modify exists to change — and `ts_ns`/`ttl_ns`,
+/// which a modify ignores entirely.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OrderIdentity {
+    /// Market.
+    pub sym: SymbolId,
+    /// Target venue ([`VenueId`] as raw byte) — a changed venue
+    /// crosses execution arms.
+    pub venue: u8,
+    /// Emitting strategy-set slot — a changed slot moves attribution.
+    pub strategy_id: u8,
+    /// Side — the opposite side is the opposite quote, not a reprice.
+    pub side: Side,
+    /// Order-type tag — maker and IoC are judged by different fill
+    /// law, so swapping them is not a reprice either.
+    pub kind: u8,
+}
+
+// 4 + 1 + 1 + 1 + 1 — no padding, so `PartialEq` compares exactly the
+// five fields and nothing uninitialised.
+const _: () = assert!(core::mem::size_of::<OrderIdentity>() == 8);
+
+impl OrderIdentity {
+    /// The identity of `o`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn of(o: &Order) -> Self {
+        Self {
+            sym: o.sym,
+            venue: o.venue,
+            strategy_id: o.strategy_id,
+            side: o.side,
+            kind: o.kind,
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // AsBytes — unsafe marker for zero-copy serialization.
 // ---------------------------------------------------------------
 

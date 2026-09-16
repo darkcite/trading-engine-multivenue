@@ -71,6 +71,24 @@ impl OrderDispatch for NullLiveDispatcher {
         Err(DispatchError::NoLiveRoute)
     }
 
+    /// E5: a live slot's cancel reaching the stub is the same bug as
+    /// a live slot's submit reaching it, and is counted the same way.
+    /// Never `Ok` — a cancel this arm claimed to have performed would
+    /// be a quote the strategy stops tracking and the venue never
+    /// had.
+    #[inline]
+    fn cancel(&mut self, _req: &core_types::CancelReq) -> Result<(), DispatchError> {
+        self.stats.refused = self.stats.refused.saturating_add(1);
+        Err(DispatchError::NoLiveRoute)
+    }
+
+    /// E5: likewise for a modify.
+    #[inline]
+    fn modify(&mut self, _req: &core_types::ModifyReq) -> Result<(), DispatchError> {
+        self.stats.refused = self.stats.refused.saturating_add(1);
+        Err(DispatchError::NoLiveRoute)
+    }
+
     /// No venue, no fills.
     #[inline]
     fn try_next_fill(&mut self) -> Option<Fill> {

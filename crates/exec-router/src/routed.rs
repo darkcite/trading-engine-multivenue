@@ -45,7 +45,7 @@ use crate::route::ExecRoute;
 use clob_dispatcher::{
     DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
 };
-use core_types::{Fill, NsTs, Order, Tick};
+use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Tick};
 
 /// Routes each order to the paper matcher or the live arm according to
 /// the boot-fixed [`ExecRoute`].
@@ -121,6 +121,60 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 }
                 self.counters.on_live_submit(order.strategy_id);
                 self.live.submit(order)
+            }
+        }
+    }
+
+    /// Route one cancel. **LAW E-1 applies to a cancel too, and
+    /// harder.**
+    ///
+    /// A live slot's cancel satisfied by the paper matcher would take
+    /// a modelled order out of a modelled book and report success,
+    /// while the real quote stays resting at the venue — the strategy
+    /// then believes it has no exposure and the venue disagrees. A
+    /// mis-routed submit invents a fill; a mis-routed cancel invents
+    /// the ABSENCE of one, which nothing downstream can detect.
+    ///
+    /// Same three-way branch as `submit`, on the cancel's own
+    /// `strategy_id`/`venue` — which `StampCtx` stamps exactly as it
+    /// stamps an order's.
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        match self.route.mode(req.strategy_id) {
+            ExecMode::Paper => self.paper.cancel(req),
+            ExecMode::Off => {
+                self.counters.on_refused_off(req.strategy_id);
+                Err(DispatchError::SlotDisabled)
+            }
+            ExecMode::Live => {
+                if !self.route.venue_allowed(req.strategy_id, req.venue) {
+                    self.counters.on_refused_no_route(req.strategy_id);
+                    return Err(DispatchError::NoLiveRoute);
+                }
+                self.live.cancel(req)
+            }
+        }
+    }
+
+    /// Route one modify — LAW E-1 and LAW E-7 together. Identical
+    /// branch to `cancel`, on the REPLACEMENT's routing fields: a
+    /// modify carries a whole `Order`, and the slot/venue that own
+    /// the resting order are the slot/venue that own its replacement
+    /// (a modify may not change either — [`core_types::OrderIdentity`]).
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        match self.route.mode(req.order.strategy_id) {
+            ExecMode::Paper => self.paper.modify(req),
+            ExecMode::Off => {
+                self.counters.on_refused_off(req.order.strategy_id);
+                Err(DispatchError::SlotDisabled)
+            }
+            ExecMode::Live => {
+                if !self.route.venue_allowed(req.order.strategy_id, req.order.venue) {
+                    self.counters.on_refused_no_route(req.order.strategy_id);
+                    return Err(DispatchError::NoLiveRoute);
+                }
+                self.live.modify(req)
             }
         }
     }
@@ -238,11 +292,21 @@ mod tests {
     #[derive(Debug, Default)]
     struct SpyLive {
         seen: Vec<u64>,
+        cancelled: Vec<u64>,
+        modified: Vec<(u64, u64)>,
     }
 
     impl OrderDispatch for SpyLive {
         fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
             self.seen.push(order.client_oid);
+            Ok(())
+        }
+        fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+            self.cancelled.push(req.client_oid);
+            Ok(())
+        }
+        fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+            self.modified.push((req.prev_client_oid, req.order.client_oid));
             Ok(())
         }
         fn try_next_fill(&mut self) -> Option<Fill> {
@@ -424,6 +488,118 @@ mod tests {
         assert_eq!(routed.counters().live_submits, 0);
         assert_eq!(routed.counters().refused_off, 0);
         assert_eq!(routed.counters().refused_no_route, 0);
+    }
+
+    // ---------------- E5: routing the lifecycle verbs ----------------
+
+    fn cancel_of(o: &Order) -> CancelReq {
+        CancelReq::of(o, 2_000)
+    }
+
+    /// **LAW E-1 for a cancel, the load-bearing test.**
+    ///
+    /// A mis-routed submit invents a fill. A mis-routed cancel
+    /// invents the ABSENCE of one: the paper matcher would remove a
+    /// modelled order and report success while the real quote stays
+    /// resting at the venue, and nothing downstream can detect the
+    /// difference.
+    #[test]
+    fn a_live_slots_cancel_on_a_wrong_venue_never_reaches_the_paper_matcher() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        // Slot 3 is live for Hyperliquid only. Park a paper order on
+        // the matcher so there is a book for a fall-through to reach.
+        let decoy = order(0, VenueId::Polymarket, 9);
+        assert!(d.submit(&decoy).is_ok());
+        assert_eq!(d.paper().open_paper_orders(), 1);
+
+        let mut c = cancel_of(&order(3, VenueId::Binance, 9));
+        c.strategy_id = 3;
+        assert_eq!(d.cancel(&c), Err(DispatchError::NoLiveRoute));
+        assert!(d.live().cancelled.is_empty(), "never reached the live arm");
+        assert_eq!(
+            d.paper().open_paper_orders(),
+            1,
+            "LAW E-1: the paper matcher must not have taken the cancel either"
+        );
+        // The open count alone would NOT prove that: a fall-through
+        // would have been refused by the matcher's own lookup and
+        // left the count at 1 anyway. These are what prove the
+        // matcher was never asked — every path through
+        // `PaperMatcher::cancel` moves exactly one of them.
+        let mc = d.paper().matcher_counters();
+        assert_eq!(mc.cancels, 0, "the matcher performed no cancel");
+        assert_eq!(mc.no_such_order, 0, "the matcher was never even asked");
+        assert_eq!(mc.identity_mismatch, 0);
+        assert_eq!(mc.ambiguous_order, 0);
+        assert_eq!(d.counters().refused_no_route, 1);
+    }
+
+    #[test]
+    fn a_live_slots_cancel_and_modify_reach_the_live_arm_and_no_other_slots_do() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        let live = order(3, VenueId::Hyperliquid, 1);
+        let mut c = cancel_of(&live);
+        c.strategy_id = 3;
+        assert_eq!(d.cancel(&c), Ok(()));
+        assert_eq!(d.live().cancelled, vec![1]);
+
+        let mut repl = order(3, VenueId::Hyperliquid, 2);
+        repl.strategy_id = 3;
+        assert_eq!(d.modify(&ModifyReq::new(1, repl)), Ok(()));
+        assert_eq!(d.live().modified, vec![(1, 2)]);
+
+        // A paper slot's verbs must not touch the live arm.
+        let paper = order(0, VenueId::Polymarket, 5);
+        assert!(d.submit(&paper).is_ok());
+        assert_eq!(d.cancel(&cancel_of(&paper)), Ok(()));
+        assert_eq!(d.live().cancelled, vec![1], "still only the live one");
+        assert_eq!(d.paper().matcher_counters().cancels, 1);
+    }
+
+    #[test]
+    fn an_off_slots_cancel_and_modify_are_refused_by_both_arms() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(6, ExecMode::Off, &[], 0, 0).unwrap();
+        let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default());
+        let o = order(6, VenueId::Hyperliquid, 5);
+        assert_eq!(d.cancel(&cancel_of(&o)), Err(DispatchError::SlotDisabled));
+        assert_eq!(
+            d.modify(&ModifyReq::new(4, o)),
+            Err(DispatchError::SlotDisabled)
+        );
+        assert!(d.live().cancelled.is_empty());
+        assert!(d.live().modified.is_empty());
+        assert_eq!(d.paper().matcher_counters().cancels, 0);
+        assert_eq!(d.paper().matcher_counters().no_such_order, 0);
+        assert_eq!(d.paper().matcher_counters().identity_mismatch, 0);
+        assert_eq!(d.counters().refused_off, 2);
+    }
+
+    /// The stub live arm must refuse a lifecycle verb exactly as it
+    /// refuses a submit. `Ok` here would be a quote the strategy
+    /// stops tracking and the venue never had.
+    #[test]
+    fn the_null_live_arm_refuses_a_lifecycle_verb_rather_than_swallowing_it() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            NullLiveDispatcher::new(),
+        );
+        let o = order(3, VenueId::Hyperliquid, 1);
+        let mut c = cancel_of(&o);
+        c.strategy_id = 3;
+        assert_eq!(d.cancel(&c), Err(DispatchError::NoLiveRoute));
+        assert_eq!(d.modify(&ModifyReq::new(1, o)), Err(DispatchError::NoLiveRoute));
+        assert_eq!(d.live().refused(), 2);
+        assert_eq!(d.paper().open_paper_orders(), 0);
     }
 
     #[test]

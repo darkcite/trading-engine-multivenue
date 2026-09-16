@@ -32,8 +32,8 @@
 use core_time::NsTs;
 use core_types::regime::REL_UNKNOWN;
 use core_types::{
-    AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet, RegimeWord,
-    RuleTableV2, Signal, SymbolId, Tick, VenueId, REGIME_OFF_HARD, REGIME_OFF_SOFT,
+    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet,
+    RegimeWord, RuleTableV2, Signal, SymbolId, Tick, VenueId, REGIME_OFF_HARD, REGIME_OFF_SOFT,
     REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
@@ -56,12 +56,52 @@ impl ::core::fmt::Display for StrategyError {
 
 impl std::error::Error for StrategyError {}
 
-/// Reason a `ctx.submit` call was rejected.
+/// Reason a `ctx.submit`, `ctx.cancel` or `ctx.modify` call was
+/// rejected.
+///
+/// **Four names for four different facts.** Until E5 there was one
+/// variant and the engine mapped every dispatcher error onto it, so a
+/// disabled slot and a full ring were the same word to a strategy.
+/// That is survivable for a submit (the strategy drops the order
+/// either way) and NOT survivable for a cancel: a strategy that reads
+/// `RingFull` retries later, and a strategy that reads `NoSuchOrder`
+/// knows the order is already gone. The two call for opposite
+/// behaviour, so they get opposite names.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SubmitErr {
     /// The order ring is full — caller must drop the order rather
-    /// than block.
+    /// than block. **Retryable**: the same call may succeed later.
     RingFull,
+    /// The dispatcher in force does not implement this operation at
+    /// all. The default `cancel`/`modify` bodies return this, so a
+    /// dispatcher that has not been taught the verb refuses loudly
+    /// instead of silently doing nothing. **Not retryable.**
+    Unsupported,
+    /// No order with that client id is resting. Either it already
+    /// filled, already expired, or was already taken back — a RACE,
+    /// not a failure. The order is gone, which is what the caller
+    /// wanted; what it must not do is assume its own cancel is what
+    /// removed it. **Not retryable.**
+    NoSuchOrder,
+    /// The dispatcher refused, and repeating the same call will not
+    /// change that. Two kinds of cause land here and the strategy
+    /// cannot tell them apart:
+    ///
+    /// * **operator conditions** — the slot is off, the slot is live
+    ///   with no route to that venue, the venue answered non-2xx, the
+    ///   signer said no;
+    /// * **the caller built a bad request** — the replacement changed
+    ///   the order's identity, its price or size was unmodellable, or
+    ///   the client id named more than one of that slot's resting
+    ///   orders.
+    ///
+    /// The second kind is a bug in the member, and the dispatcher's
+    /// own counters (`identity_mismatch`, `unroutable`,
+    /// `ambiguous_order`) are where it is visible; this variant is
+    /// deliberately NOT the place to branch on it, because a strategy
+    /// that could distinguish its own malformed request would be
+    /// tempted to retry a variation of it. **Not retryable.**
+    Refused,
 }
 
 /// Dispatcher handle passed to every callback. The real implementation
@@ -73,6 +113,45 @@ pub trait Ctx {
     /// when the order ring is full — the strategy is expected to drop
     /// the order rather than block.
     fn submit(&mut self, order: Order) -> Result<(), SubmitErr>;
+
+    /// **E5 — take one resting order back.**
+    ///
+    /// `Ok(())` means *this call* removed the order. It does NOT mean
+    /// "the order is not resting": that weaker fact is
+    /// [`SubmitErr::NoSuchOrder`], and conflating the two is how a
+    /// strategy comes to believe it cancelled a quote that a fill had
+    /// already taken.
+    ///
+    /// Defaulted to [`SubmitErr::Unsupported`] so every existing `Ctx`
+    /// — forty of them, mostly test doubles — keeps compiling, and so
+    /// a ctx that has not been taught the verb says so rather than
+    /// swallowing the request.
+    #[inline]
+    fn cancel(&mut self, _req: CancelReq) -> Result<(), SubmitErr> {
+        Err(SubmitErr::Unsupported)
+    }
+
+    /// **E5, LAW E-7 — replace a resting order in place.**
+    ///
+    /// Two explicit arguments rather than a `ModifyReq`, because at
+    /// the strategy's call site the previous id and the replacement
+    /// are two separate thoughts and the `u64` next to an `Order` is
+    /// unmistakable. The dispatcher boundary pairs them into
+    /// [`core_types::ModifyReq`].
+    ///
+    /// `order.ttl_ns` is IGNORED — a modify inherits the original
+    /// order's expiry, so no amount of repricing extends a quote's
+    /// life past the TTL its ruleset gave it. `order.ts_ns` is NOT
+    /// ignored: it is the decision clock the dispatcher re-arms the
+    /// venue activation delta from, so stamp it from `ctx.now_ns()`
+    /// exactly as on a submit. Everything else about the order's
+    /// identity
+    /// ([`core_types::OrderIdentity`]) must match the resting order;
+    /// only price, size and client id may change.
+    #[inline]
+    fn modify(&mut self, _prev_client_oid: u64, _order: Order) -> Result<(), SubmitErr> {
+        Err(SubmitErr::Unsupported)
+    }
 
     /// Current wall-clock nanoseconds — cheaper than hitting the clock
     /// again from inside a strategy callback.

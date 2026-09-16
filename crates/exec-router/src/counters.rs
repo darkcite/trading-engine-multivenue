@@ -24,10 +24,17 @@ pub struct RouteCounters {
     /// Orders sent to the paper matcher.
     pub paper_submits: u64,
     /// Refused because the slot is [`crate::ExecMode::Off`].
+    ///
+    /// E5: counts refusals of ANY verb — submit, cancel or modify.
+    /// The counter is named for the CONDITION (the slot is off),
+    /// which is the same condition whichever verb ran into it, and
+    /// which is the thing an operator acts on.
     pub refused_off: u64,
-    /// Refused because the slot is live but the order named a venue
+    /// Refused because the slot is live but the request named a venue
     /// the slot has no live route to. **LAW E-1: refused, never
     /// downgraded to paper.**
+    ///
+    /// E5: any verb, as with `refused_off`.
     pub refused_no_route: u64,
     /// Per-slot live submits. Index = `strategy_id`.
     pub live_submits_by_slot: [u64; EXEC_SLOTS],

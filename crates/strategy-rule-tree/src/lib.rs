@@ -323,7 +323,17 @@ impl<const N: usize> Strategy for RuleTree<N> {
                     self.orders_emitted = self.orders_emitted.wrapping_add(1);
                     self.cooldown.record_emit(i, now);
                 }
-                Err(SubmitErr::RingFull) => {
+                // E5: every refusal is the same fact to this member —
+                // the dispatcher did not take the order. Spelled out
+                // rather than `_` so a new `SubmitErr` variant forces
+                // this decision to be made again instead of silently
+                // joining the drop arm.
+                Err(
+                    SubmitErr::RingFull
+                    | SubmitErr::Unsupported
+                    | SubmitErr::NoSuchOrder
+                    | SubmitErr::Refused,
+                ) => {
                     self.orders_dropped = self.orders_dropped.wrapping_add(1);
                 }
             }

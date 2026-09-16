@@ -46,7 +46,9 @@ pub use live::{LiveDispatcher, LiveDispatcherErr, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use queued::{DispatcherWorker, QueuedDispatcher, ORDER_RING_CAP};
 pub use response::{parse_clob_response, ClobResponse, ResponseScanErr};
 
-use core_types::{Fill, NsTs, Order, Price, Qty, Side, SymbolId, Tick};
+use core_types::{
+    CancelReq, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, Tick,
+};
 
 /// Dispatcher error modes.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -76,6 +78,62 @@ pub enum DispatchError {
     /// fill wearing live semantics would corrupt every downstream
     /// reader of the tape.
     NoLiveRoute,
+    /// E5: this dispatcher does not implement the verb that was
+    /// called. The default [`OrderDispatch::cancel`] and
+    /// [`OrderDispatch::modify`] bodies return it, so a dispatcher
+    /// that has not been taught to take an order back refuses loudly
+    /// rather than returning `Ok` and doing nothing.
+    Unsupported,
+    /// E5: no resting order carries that client id. Already filled,
+    /// already expired, or already taken back — a RACE, not a
+    /// failure. Distinct from `Ok` because `Ok` means *this call*
+    /// removed it, and a caller that cannot tell the two apart will
+    /// believe its cancel beat a fill that beat it.
+    NoSuchOrder,
+    /// E5: a resting order of that slot DOES carry that client id,
+    /// but the request describes a different order — see
+    /// [`core_types::OrderIdentity`] for the five fields that make
+    /// one. A modify may change price, size and client id; changing
+    /// anything else is not a modify, and is refused rather than
+    /// performed.
+    ///
+    /// The two verbs compare different subsets, because they assert
+    /// different things. A **modify** carries a whole replacement
+    /// `Order` and therefore asserts all five. A **cancel** carries
+    /// no side and no kind, so it asserts `sym` and `venue` only —
+    /// `strategy_id` is the lookup key rather than an assertion, and
+    /// the two fields a `CancelReq` cannot name are not silently
+    /// treated as claims it made.
+    IdentityMismatch,
+    /// E5: the order is not modellable as built — a non-positive
+    /// price or size, a venue byte with no activation entry, or a
+    /// `kind` that is neither maker nor IoC. The same condition the
+    /// matcher's `unroutable` counter names.
+    ///
+    /// `submit` counts it and returns `Ok` (the INTENT is what the
+    /// capture records, and the harness drops it the same way);
+    /// `modify` returns it, because there `Ok` would claim a resting
+    /// order had been repriced when it had not.
+    ///
+    /// `modify` tests only the price/size half of that list, and that
+    /// is sufficient rather than lazy: the identity check runs first,
+    /// so the replacement's venue and `kind` are already pinned equal
+    /// to the resting order's — which `submit` validated on the way
+    /// in. Price and size are the only two fields a modify can make
+    /// unmodellable.
+    Unroutable,
+    /// E5: MORE THAN ONE resting order answers to that client id
+    /// within that strategy slot, so the request does not name a
+    /// single order.
+    ///
+    /// **Not hypothetical.** Every member allocates `client_oid` from
+    /// its own counter starting at 1, some reset it, and one rides a
+    /// 14-bit sequence — so ids repeat. Slot scoping makes them
+    /// unique in normal operation; this is what is returned when it
+    /// does not. Refused rather than resolved FIFO, because taking
+    /// back one of two identical quotes and reporting success leaves
+    /// the caller believing both are gone.
+    AmbiguousOrder,
 }
 
 /// Convert a `DispatchError` to the cross-crate
@@ -122,7 +180,19 @@ impl From<DispatchError> for core_net::NetworkErr {
             // rather than to `Disconnected`, so `is_retryable` at the
             // boundary answers "no": retrying a refused route just
             // refuses again.
-            DispatchError::SlotDisabled | DispatchError::NoLiveRoute => {
+            //
+            // E5 adds three more local decisions to the same bucket:
+            // an unimplemented verb, an id that is not resting, and a
+            // request that describes a different order. None of them
+            // touched a socket, and none of them becomes true by
+            // being retried.
+            DispatchError::SlotDisabled
+            | DispatchError::NoLiveRoute
+            | DispatchError::Unsupported
+            | DispatchError::NoSuchOrder
+            | DispatchError::IdentityMismatch
+            | DispatchError::Unroutable
+            | DispatchError::AmbiguousOrder => {
                 NetworkErr::new(NetworkSource::Clob, NetworkErrKind::Malformed)
             }
         }
@@ -149,6 +219,8 @@ pub struct DispatchStatsAtomic {
     pub(crate) fills_seen: std::sync::atomic::AtomicU64,
     /// E1: mirrors [`DispatchStats::rejected_routing`].
     pub(crate) rejected_routing: std::sync::atomic::AtomicU64,
+    /// E5: mirrors [`DispatchStats::rejected_lifecycle`].
+    pub(crate) rejected_lifecycle: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchStatsAtomic {
@@ -168,6 +240,7 @@ impl DispatchStatsAtomic {
             rejected_malformed: self.rejected_malformed.load(Relaxed),
             fills_seen: self.fills_seen.load(Relaxed),
             rejected_routing: self.rejected_routing.load(Relaxed),
+            rejected_lifecycle: self.rejected_lifecycle.load(Relaxed),
         }
     }
 
@@ -188,6 +261,8 @@ impl DispatchStatsAtomic {
         self.rejected_malformed.store(s.rejected_malformed, Relaxed);
         self.fills_seen.store(s.fills_seen, Relaxed);
         self.rejected_routing.store(s.rejected_routing, Relaxed);
+        self.rejected_lifecycle
+            .store(s.rejected_lifecycle, Relaxed);
     }
 }
 
@@ -233,6 +308,16 @@ pub struct DispatchStats {
     /// refusal is none of those things and counting it as one would
     /// send an operator looking at the wrong subsystem.
     pub rejected_routing: u64,
+    /// E5: refusals of a LIFECYCLE verb — `cancel` or `modify`. The
+    /// verb is not implemented by this dispatcher, the client id is
+    /// not resting, the request describes a different order, or the
+    /// replacement is not modellable.
+    ///
+    /// Kept apart from `rejected_routing` because a routing refusal
+    /// means an order never left, while these mean an order that DID
+    /// leave could not be acted on afterwards — an operator chasing
+    /// the two looks in different places.
+    pub rejected_lifecycle: u64,
 }
 
 impl DispatchStats {
@@ -272,6 +357,18 @@ impl DispatchStats {
             DispatchError::SlotDisabled | DispatchError::NoLiveRoute => {
                 self.rejected_routing = self.rejected_routing.wrapping_add(1);
             }
+            // E5 lifecycle refusals. Listed one by one rather than
+            // behind a `_` so that a SIXTH variant added later is a
+            // compile error here — the whole point of this match is
+            // that no error may reach `/metrics` without a category
+            // somebody chose for it.
+            DispatchError::Unsupported
+            | DispatchError::NoSuchOrder
+            | DispatchError::IdentityMismatch
+            | DispatchError::Unroutable
+            | DispatchError::AmbiguousOrder => {
+                self.rejected_lifecycle = self.rejected_lifecycle.wrapping_add(1);
+            }
         }
         self.rejected = self.rejected.wrapping_add(1);
     }
@@ -303,6 +400,9 @@ impl DispatchStats {
                 .saturating_add(other.rejected_malformed),
             fills_seen: self.fills_seen.saturating_add(other.fills_seen),
             rejected_routing: self.rejected_routing.saturating_add(other.rejected_routing),
+            rejected_lifecycle: self
+                .rejected_lifecycle
+                .saturating_add(other.rejected_lifecycle),
         }
     }
 }
@@ -313,6 +413,33 @@ pub trait OrderDispatch {
     /// Submit an order. Non-blocking for paper mode; one network
     /// round-trip in live mode.
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError>;
+
+    /// **E5 — take one resting order back.**
+    ///
+    /// `Ok(())` means *this call* removed the order. `NoSuchOrder`
+    /// means it was already gone. The difference is the whole point
+    /// of the method returning a `Result` at all.
+    ///
+    /// Defaulted to [`DispatchError::Unsupported`] rather than
+    /// `Ok(())`: a dispatcher that cannot cancel must say so, because
+    /// a silent success here is a strategy believing a live quote was
+    /// pulled while the venue still holds it.
+    #[inline]
+    fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
+    }
+
+    /// **E5, LAW E-7 — replace a resting order in place.**
+    ///
+    /// Price, size and client id may change; the five fields of
+    /// [`core_types::OrderIdentity`] may not, and
+    /// `req.order.ts_ns`/`ttl_ns` are ignored (the modified order
+    /// keeps the original's expiry). Defaulted like `cancel`, for the
+    /// same reason.
+    #[inline]
+    fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
+    }
 
     /// Pop the next fill, if any.
     fn try_next_fill(&mut self) -> Option<Fill>;
@@ -481,6 +608,32 @@ pub struct MatcherCounters {
     /// Fills dropped because the out ring was full between two pumps.
     /// Must stay 0: the engine pumps every iteration.
     pub out_overflow: u64,
+    /// E5: resting orders this matcher took back on a `cancel`.
+    /// Counts the ones it REMOVED — a cancel that found nothing is
+    /// `no_such_order`, never this.
+    pub cancels: u64,
+    /// E5: resting orders repriced/resized in place on a `modify`.
+    pub modifies: u64,
+    /// E5: cancels and modifies naming a client id that is not
+    /// resting. Expected to be non-zero in normal operation — it is
+    /// the count of races lost to a fill or a TTL, not of errors.
+    pub no_such_order: u64,
+    /// E5: cancels and modifies whose request described a DIFFERENT
+    /// order than the one resting under that slot's client id.
+    /// Unlike `no_such_order` this one is a bug: nothing in normal
+    /// operation changes an order's identity, so any non-zero value
+    /// names a caller that built the wrong request.
+    ///
+    /// The lookup is scoped to the requesting SLOT, so another
+    /// member's order carrying the same id reads as `no_such_order`
+    /// (there is no order of yours with that id) and never as this.
+    pub identity_mismatch: u64,
+    /// E5: cancels and modifies naming an id that more than one of
+    /// that slot's own resting orders answers to. **Must stay 0** —
+    /// it means a member reused a client id while the first order was
+    /// still resting, and until it does the slot cannot name its own
+    /// orders.
+    pub ambiguous_order: u64,
 }
 
 /// One order the paper matcher is holding.
@@ -492,30 +645,58 @@ struct Pending {
     seq: u64,
     /// Virtual activation: `submit + Δ_venue`.
     t_active_ns: u64,
-    /// I1 expiry (`emit + ttl`); 0 = never.
+    /// I1 expiry (`emit + ttl`); 0 = never. **A modify inherits
+    /// this** — see [`PaperMatcher::modify`].
     expiry_ns: u64,
-    sym: SymbolId,
-    side: Side,
-    kind: u8,
-    strategy_id: u8,
-    venue: u8,
     px_1e6: i64,
     remaining_1e6: i64,
     client_oid: u64,
+    /// The five fields a modify may not change. One value so the
+    /// "is this the same order" test is one `==`.
+    ident: OrderIdentity,
+    /// MODEL venue byte — `symbol_venue_byte(sym)`, which indexes the
+    /// activation table. NOT `ident.venue` (the [`core_types::VenueId`]
+    /// the strategy addressed): the two are different namespaces and
+    /// conflating them would index the activation table with a routing
+    /// byte.
+    model_venue: u8,
+    /// Explicit tail padding — makes `Pending` exactly one cache line,
+    /// so the matcher's scan loop touches one line per open order.
+    _pad: [u8; 7],
+}
+
+const _: () = assert!(::core::mem::size_of::<Pending>() == 64);
+
+/// What [`PaperMatcher::find_resting`] found. `Many` is a distinct
+/// answer rather than "the first one", because taking back one of two
+/// quotes that answer to the same name and reporting success leaves
+/// the caller believing both are gone.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Resting {
+    /// Exactly one — its index in the open table.
+    One(usize),
+    /// No resting order of that slot carries that id.
+    None,
+    /// Two or more do, so the request names no single order.
+    Many,
 }
 
 const EMPTY_PENDING: Pending = Pending {
     seq: 0,
     t_active_ns: 0,
     expiry_ns: 0,
-    sym: core_types::SYMBOL_ID_NONE,
-    side: Side::Bid,
-    kind: core_fill::ORDER_KIND_MAKER,
-    strategy_id: core_types::STRATEGY_ID_NONE,
-    venue: 0,
     px_1e6: 0,
     remaining_1e6: 0,
     client_oid: 0,
+    ident: OrderIdentity {
+        sym: core_types::SYMBOL_ID_NONE,
+        venue: 0,
+        strategy_id: core_types::STRATEGY_ID_NONE,
+        side: Side::Bid,
+        kind: core_fill::ORDER_KIND_MAKER,
+    },
+    model_venue: 0,
+    _pad: [0; 7],
 };
 
 const EMPTY_FILL: Fill = Fill::new(
@@ -582,6 +763,11 @@ impl PaperMatcher {
                 ioc_canceled: 0,
                 ttl_expired: 0,
                 out_overflow: 0,
+                cancels: 0,
+                modifies: 0,
+                no_such_order: 0,
+                identity_mismatch: 0,
+                ambiguous_order: 0,
             },
         }
     }
@@ -617,7 +803,7 @@ impl PaperMatcher {
         let mut sym_count = 0usize;
         let mut i = 0usize;
         while i < self.open_len {
-            if self.open[i].sym == order.sym {
+            if self.open[i].ident.sym == order.sym {
                 sym_count += 1;
             }
             i += 1;
@@ -630,18 +816,162 @@ impl PaperMatcher {
             seq: self.seq,
             t_active_ns: now_ns.saturating_add(self.activation_ns[venue as usize]),
             expiry_ns: core_fill::expiry_at(order.ts_ns, order.ttl_ns),
-            sym: order.sym,
-            side: order.side,
-            kind: order.kind,
-            strategy_id: order.strategy_id,
-            venue,
             px_1e6: px,
             remaining_1e6: qty,
             client_oid: order.client_oid,
+            ident: OrderIdentity::of(order),
+            model_venue: venue,
+            _pad: [0; 7],
         };
         self.seq = self.seq.wrapping_add(1);
         self.open_len += 1;
         self.counters.intake = self.counters.intake.wrapping_add(1);
+    }
+
+    /// Which of `strategy_id`'s resting orders carries `client_oid`.
+    ///
+    /// **Keyed on `(client_oid, strategy_id)`, and NOT on the id
+    /// alone.** A `client_oid` is unique only within the member that
+    /// issued it: every member allocates from its own counter
+    /// starting at 1, `strategy-xsd` resets its counter on a reset
+    /// path that does not clear this table, and `strategy-bin15`
+    /// rides a 14-bit sequence. All enabled members share ONE open
+    /// table, so id 1 belongs to as many orders as there are members
+    /// quoting. Searching by id alone would find another slot's order
+    /// and report the caller's own correct cancel as a caller bug —
+    /// and, worse, could take back a quote belonging to a different
+    /// member.
+    ///
+    /// The slot is the NAMESPACE, not an assertion the caller is
+    /// making; that is why it belongs in the key and the remaining
+    /// identity fields do not. `sym` in the key would make a
+    /// right-id/wrong-market request indistinguishable from one whose
+    /// order already filled, and those two need opposite responses —
+    /// so identity is checked *after* the lookup.
+    ///
+    /// Scans the whole table rather than returning the first hit,
+    /// because "more than one" is its own answer
+    /// ([`Resting::Many`]). At most [`core_fill::MAX_OPEN_TOTAL`]
+    /// slots, on a path that runs per requote and not per tick.
+    #[inline]
+    fn find_resting(&self, client_oid: u64, strategy_id: u8) -> Resting {
+        let mut found = Resting::None;
+        let mut i = 0usize;
+        while i < self.open_len {
+            let o = self.open[i];
+            if o.client_oid == client_oid && o.ident.strategy_id == strategy_id {
+                found = match found {
+                    Resting::None => Resting::One(i),
+                    _ => return Resting::Many,
+                };
+            }
+            i += 1;
+        }
+        found
+    }
+
+    /// **E5 — take one resting order back.**
+    ///
+    /// `Ok(())` means this call removed it. It does not mean "the
+    /// order is not resting", which is the weaker fact and has its
+    /// own name.
+    ///
+    /// No fill is produced and no counter of the fill family moves: a
+    /// cancelled order simply stops existing, exactly as the I1 TTL
+    /// sweep treats an expired one.
+    pub fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        let i = match self.find_resting(req.client_oid, req.strategy_id) {
+            Resting::One(i) => i,
+            Resting::None => {
+                self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
+                return Err(DispatchError::NoSuchOrder);
+            }
+            Resting::Many => {
+                self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
+                return Err(DispatchError::AmbiguousOrder);
+            }
+        };
+        // `strategy_id` was the lookup key, so two identity fields are
+        // left for the cancel to assert: `sym` and `venue`. It carries
+        // no side and no kind, so those two are NOT compared — a
+        // cancel does not claim anything about them, and pretending it
+        // did would refuse correct requests.
+        let id = self.open[i].ident;
+        if id.sym != req.sym || id.venue != req.venue {
+            self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
+            return Err(DispatchError::IdentityMismatch);
+        }
+        self.remove_open(i);
+        self.counters.cancels = self.counters.cancels.wrapping_add(1);
+        Ok(())
+    }
+
+    /// **E5, LAW E-7 — replace a resting order in place.**
+    ///
+    /// ## What changes, and what does not
+    ///
+    /// Changed: `px_1e6`, `remaining_1e6`, `client_oid`.
+    ///
+    /// Kept: `expiry_ns` and `seq`. `seq` because the open array is
+    /// itself the FIFO (`remove_open` shifts to preserve it) and
+    /// `core_fill` models no queue at all, so there is no priority to
+    /// lose or gain. `expiry_ns` because **a reprice must not extend a
+    /// quote's life**: an Arm B that repriced every 333 ms could
+    /// otherwise hold a quote forever past the TTL its ruleset set.
+    /// `req.order.ttl_ns` is therefore read for nothing — but
+    /// `req.order.ts_ns` is the caller's decision clock and IS read,
+    /// by [`PaperDispatcher::modify`], as this function's `now_ns`.
+    ///
+    /// Re-armed: `t_active_ns`, to `now + Δ_venue`.
+    ///
+    /// ## Why `t_active_ns` is re-armed and not preserved
+    ///
+    /// Δ is the measured time an instruction takes to reach the
+    /// venue, and it is why an order cannot fill on a tick that
+    /// arrived before it. The new price is an instruction like any
+    /// other: it is not at the venue for Δ. Preserving `t_active_ns`
+    /// would let a modify fill at a price the venue had not yet been
+    /// told about — a fabricated fill, which is the one class of
+    /// error this matcher exists to prevent.
+    ///
+    /// The cost of the conservative choice is that the OLD price,
+    /// which really is still resting during the flight window, cannot
+    /// fill either — so the model under-fills a modify by at most one
+    /// Δ. Under-filling is recoverable; inventing a fill is not.
+    pub fn modify(&mut self, req: &ModifyReq, now_ns: NsTs) -> Result<(), DispatchError> {
+        let i = match self.find_resting(req.prev_client_oid, req.order.strategy_id) {
+            Resting::One(i) => i,
+            Resting::None => {
+                self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
+                return Err(DispatchError::NoSuchOrder);
+            }
+            Resting::Many => {
+                self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
+                return Err(DispatchError::AmbiguousOrder);
+            }
+        };
+        if self.open[i].ident != req.identity() {
+            self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
+            return Err(DispatchError::IdentityMismatch);
+        }
+        let px = req.order.px.raw();
+        let qty = req.order.qty.raw();
+        if px <= 0 || qty <= 0 {
+            // Same bar as `submit`: a non-positive price or size is
+            // not modellable. Same counter, same name — but returned
+            // rather than swallowed, because the resting order is
+            // still there at its old price and a caller told `Ok`
+            // would believe otherwise.
+            self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            return Err(DispatchError::Unroutable);
+        }
+        let venue = self.open[i].model_venue;
+        self.open[i].px_1e6 = px;
+        self.open[i].remaining_1e6 = qty;
+        self.open[i].client_oid = req.order.client_oid;
+        self.open[i].t_active_ns = now_ns.saturating_add(self.activation_ns[venue as usize]);
+        self.counters.modifies = self.counters.modifies.wrapping_add(1);
+        Ok(())
     }
 
     /// Judge every open order of this tick's sym against it.
@@ -655,7 +985,9 @@ impl PaperMatcher {
         let sym = tick.sym;
         let mut i = 0usize;
         while i < self.open_len {
-            if self.open[i].sym == sym && core_fill::expired_at(now_ns, self.open[i].expiry_ns) {
+            if self.open[i].ident.sym == sym
+                && core_fill::expired_at(now_ns, self.open[i].expiry_ns)
+            {
                 self.counters.ttl_expired = self.counters.ttl_expired.wrapping_add(1);
                 self.remove_open(i);
                 continue;
@@ -671,13 +1003,13 @@ impl PaperMatcher {
         let mut i = 0usize;
         while i < self.open_len {
             let o = self.open[i];
-            if o.sym != sym || now_ns < o.t_active_ns {
+            if o.ident.sym != sym || now_ns < o.t_active_ns {
                 i += 1;
                 continue;
             }
-            if o.kind == core_fill::ORDER_KIND_IOC {
+            if o.ident.kind == core_fill::ORDER_KIND_IOC {
                 match core_fill::judge_ioc(
-                    o.side,
+                    o.ident.side,
                     o.px_1e6,
                     o.remaining_1e6,
                     touch,
@@ -695,7 +1027,7 @@ impl PaperMatcher {
                 continue;
             }
             match core_fill::judge_maker(
-                o.side,
+                o.ident.side,
                 o.px_1e6,
                 o.remaining_1e6,
                 touch,
@@ -741,13 +1073,13 @@ impl PaperMatcher {
         let slot = (self.out_head + self.out_len) % core_fill::MAX_OPEN_TOTAL;
         self.out[slot] = Fill::new(
             now_ns,
-            o.sym,
-            o.side,
+            o.ident.sym,
+            o.ident.side,
             Price::from_raw(px_1e6),
             Qty::from_raw(qty_1e6),
             o.client_oid,
         )
-        .with_attribution(o.strategy_id, core_types::FILL_ORIGIN_PAPER);
+        .with_attribution(o.ident.strategy_id, core_types::FILL_ORIGIN_PAPER);
         self.out_len += 1;
         self.counters.fills = self.counters.fills.wrapping_add(1);
     }
@@ -812,6 +1144,7 @@ impl PaperDispatcher {
                 rejected_malformed: 0,
                 fills_seen: 0,
                 rejected_routing: 0,
+                rejected_lifecycle: 0,
             },
         }
     }
@@ -825,6 +1158,39 @@ impl OrderDispatch for PaperDispatcher {
         // INTENT is what the capture records.
         self.matcher.submit(order, order.ts_ns);
         Ok(())
+    }
+
+    /// E5 — straight through to the matcher. **No `stats.accepted`
+    /// bump**: `accepted` counts orders that entered the book, and a
+    /// cancel takes one out. Counting a cancel as an acceptance would
+    /// make `/metrics` show two orders where one was placed and
+    /// pulled.
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        self.matcher.cancel(req)
+    }
+
+    /// E5 — likewise. A modify replaces an order rather than adding
+    /// one, so `accepted` does not move here either; the matcher's
+    /// own `modifies` counter is what records it.
+    ///
+    /// `now_ns` comes from the replacement's `ts_ns` — the same
+    /// source `submit` uses, so a replayed boot judges a modify
+    /// against the same clock it judges a submit against.
+    ///
+    /// **That makes `ts_ns` load-bearing on a modify**, unlike the
+    /// genuinely ignored `ttl_ns`. A replacement carrying a stale or
+    /// zero `ts_ns` re-arms the activation delta into the past and is
+    /// fillable at the NEW price on the next tick. This is the same
+    /// contract `submit` has always had — a submit with a stale
+    /// `ts_ns` activates early in exactly the same way — so it is a
+    /// property of the clock argument, not a hazard E5 introduced. It
+    /// is written down here because the first caller will be a
+    /// requote loop, which is precisely where a reused or forgotten
+    /// timestamp is easy to write.
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        self.matcher.modify(req, req.order.ts_ns)
     }
 
     fn try_next_fill(&mut self) -> Option<Fill> {
@@ -858,7 +1224,7 @@ impl OrderDispatch for PaperDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{Price, Qty, Side, VenueId};
+    use core_types::{Price, Qty, Side, SymbolId, VenueId};
 
     // ---------------- X1: the paper matcher ----------------
 
@@ -1136,5 +1502,431 @@ mod tests {
         // park it in, not a true retryable condition).
         assert_eq!(e.kind, NetworkErrKind::Io);
         assert!(e.is_retryable(), "Io is in the retryable set");
+    }
+
+    // ---------------- E5: cancel and modify ----------------
+
+    /// Δ_deribit is 220 ms. A second window past it, for the tests
+    /// that need "now" to be strictly after a re-armed activation.
+    const AFTER_TWO_DELTAS: NsTs = AFTER_DELTA + 300_000_000;
+
+    fn maker(px: i64, qty: i64, oid: u64, ttl_ns: u64) -> Order {
+        mk_order(Side::Bid, core_fill::ORDER_KIND_MAKER, px, qty, oid, ttl_ns)
+    }
+
+    /// A tick whose ASK is below `px`, so a bid at `px` strictly
+    /// crosses it and the maker law produces a fill.
+    fn crossing_tick(ask: i64) -> Tick {
+        mk_tick(ask - 2_000_000, 5_000_000, ask, 5_000_000)
+    }
+
+    #[test]
+    fn a_cancel_removes_the_resting_order_and_says_that_it_did() {
+        let mut m = PaperMatcher::new();
+        let o = maker(100_000_000, 1_000_000, 42, 0);
+        m.submit(&o, 1_000);
+        assert_eq!(m.open_len(), 1);
+        assert_eq!(m.cancel(&CancelReq::of(&o, 2_000)), Ok(()));
+        assert_eq!(m.open_len(), 0, "the order is gone");
+        assert_eq!(m.counters.cancels, 1);
+        assert_eq!(m.counters.no_such_order, 0);
+        // And it cannot fill afterwards, which is the point.
+        m.observe_tick(&crossing_tick(99_000_000), AFTER_DELTA);
+        assert!(m.try_next_fill().is_none(), "a cancelled order cannot fill");
+    }
+
+    /// **The load-bearing one.** A fill beat the cancel. `Ok` here
+    /// would tell the strategy its own cancel pulled the quote, and
+    /// the strategy would go on believing it has no position — while
+    /// the fill it already booked says otherwise.
+    #[test]
+    fn a_cancel_that_a_fill_beat_is_a_race_and_never_reports_success() {
+        let mut m = PaperMatcher::new();
+        let o = maker(100_000_000, 1_000_000, 7, 0);
+        m.submit(&o, 1_000);
+        m.observe_tick(&crossing_tick(99_000_000), AFTER_DELTA);
+        assert!(m.try_next_fill().is_some(), "it filled first");
+        assert_eq!(m.open_len(), 0);
+
+        assert_eq!(
+            m.cancel(&CancelReq::of(&o, AFTER_DELTA)),
+            Err(DispatchError::NoSuchOrder),
+            "the cancel did NOT remove it — the fill did"
+        );
+        assert_eq!(m.counters.cancels, 0, "nothing was cancelled");
+        assert_eq!(m.counters.no_such_order, 1);
+    }
+
+    #[test]
+    fn a_cancel_naming_the_right_id_on_the_wrong_market_is_refused_not_performed() {
+        let mut m = PaperMatcher::new();
+        let o = maker(100_000_000, 1_000_000, 9, 0);
+        m.submit(&o, 1_000);
+        let mut bad = CancelReq::of(&o, 2_000);
+        bad.sym = 0x0300_0002; // same venue, different instrument
+        assert_eq!(m.cancel(&bad), Err(DispatchError::IdentityMismatch));
+        assert_eq!(m.open_len(), 1, "the real order is untouched");
+        assert_eq!(m.counters.identity_mismatch, 1);
+        assert_eq!(m.counters.cancels, 0);
+        assert_eq!(
+            m.counters.no_such_order, 0,
+            "this is a caller bug, not a lost race — different names"
+        );
+    }
+
+    #[test]
+    fn a_modify_changes_price_size_and_id_and_nothing_else() {
+        let mut m = PaperMatcher::new();
+        let old = maker(100_000_000, 1_000_000, 1, 0);
+        m.submit(&old, 1_000);
+        let mut new = maker(97_000_000, 2_000_000, 2, 0);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(m.modify(&ModifyReq::new(1, new), AFTER_DELTA), Ok(()));
+        assert_eq!(m.open_len(), 1, "replaced in place, not added");
+        assert_eq!(m.counters.modifies, 1);
+        assert_eq!(m.counters.intake, 1, "a modify is not an intake");
+
+        // It now fills at the NEW price and the NEW size, under the
+        // NEW id — after the re-armed delta.
+        m.observe_tick(&crossing_tick(96_000_000), AFTER_TWO_DELTAS);
+        let f = m.try_next_fill().expect("the repriced order fills");
+        assert_eq!(f.order_id, 2, "the new client id books the fill");
+        assert_eq!(
+            f.px.raw(),
+            97_000_000,
+            "a maker fills at its OWN price — and 97M is the new one, \
+             so the reprice really landed"
+        );
+        assert_eq!(f.qty.raw(), 2_000_000, "the new size");
+    }
+
+    /// **The ruling.** A strategy that reprices every 333 ms must not
+    /// be able to keep a quote alive past the TTL its ruleset gave
+    /// it: the modify inherits the ORIGINAL expiry and the
+    /// replacement's own `ttl_ns` is read for nothing.
+    #[test]
+    fn a_modify_inherits_the_original_expiry_and_cannot_extend_a_quotes_life() {
+        let mut m = PaperMatcher::new();
+        // Submitted at ts 1_000 with a 400 ms TTL → expires at
+        // 400_001_000, which AFTER_DELTA (300_001_000) has not
+        // reached but AFTER_TWO_DELTAS (600_001_000) has.
+        let old = maker(100_000_000, 1_000_000, 1, 400_000_000);
+        m.submit(&old, 1_000);
+        // Reprice with a ONE HOUR ttl on the replacement.
+        let mut new = maker(97_000_000, 1_000_000, 2, 3_600_000_000_000);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(m.modify(&ModifyReq::new(1, new), AFTER_DELTA), Ok(()));
+
+        // A stale tick past the ORIGINAL expiry. The TTL sweep runs on
+        // it because expiry is a clock fact.
+        m.observe_tick(&mk_tick(0, 0, 0, 0), AFTER_TWO_DELTAS);
+        assert_eq!(m.open_len(), 0, "the original TTL still fired");
+        assert_eq!(m.counters.ttl_expired, 1);
+        assert!(m.try_next_fill().is_none());
+    }
+
+    /// The conservative half of the modify model: the new price is an
+    /// instruction like any other and is not at the venue for Δ.
+    /// Filling it sooner would be a fabricated fill.
+    #[test]
+    fn a_modify_cannot_fill_at_the_new_price_before_the_venue_could_know_it() {
+        let mut m = PaperMatcher::new();
+        let old = maker(100_000_000, 1_000_000, 1, 0);
+        m.submit(&old, 1_000);
+        let mut new = maker(97_000_000, 1_000_000, 2, 0);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(m.modify(&ModifyReq::new(1, new), AFTER_DELTA), Ok(()));
+
+        // One nanosecond after the modify: the venue cannot have it.
+        m.observe_tick(&crossing_tick(96_000_000), AFTER_DELTA + 1);
+        assert!(
+            m.try_next_fill().is_none(),
+            "a modify that filled instantly would be inventing a fill"
+        );
+        assert_eq!(m.open_len(), 1, "still resting, still waiting on delta");
+
+        // And once the delta has passed, it does fill.
+        m.observe_tick(&crossing_tick(96_000_000), AFTER_TWO_DELTAS);
+        assert!(m.try_next_fill().is_some());
+    }
+
+    /// Four of the five identity fields are ASSERTIONS the modify
+    /// makes about the order it names, and changing one is refused.
+    /// (The fifth, `strategy_id`, is the lookup key — see the test
+    /// below it.)
+    #[test]
+    fn a_modify_that_changes_identity_is_refused_and_leaves_the_order_alone() {
+        for mutate in [0u8, 1, 2, 3] {
+            let mut m = PaperMatcher::new();
+            let old = maker(100_000_000, 1_000_000, 1, 0);
+            m.submit(&old, 1_000);
+            let mut new = maker(97_000_000, 1_000_000, 2, 0);
+            match mutate {
+                0 => new.sym = 0x0300_0002,
+                1 => new.venue = VenueId::Binance as u8,
+                2 => new.side = Side::Ask,
+                _ => new.kind = core_fill::ORDER_KIND_IOC,
+            }
+            assert_eq!(
+                m.modify(&ModifyReq::new(1, new), AFTER_DELTA),
+                Err(DispatchError::IdentityMismatch),
+                "identity field {mutate} must not be changeable by a modify"
+            );
+            assert_eq!(m.open_len(), 1);
+            assert_eq!(m.counters.modifies, 0);
+            assert_eq!(m.counters.identity_mismatch, 1);
+        }
+    }
+
+    /// `strategy_id` is the NAMESPACE the id lives in, so a modify
+    /// naming a different slot is not asking about this order at all
+    /// — it is asking about an id that slot does not hold. The answer
+    /// is `NoSuchOrder`, and `identity_mismatch` stays 0 so its
+    /// must-stay-0 contract survives ordinary multi-member operation.
+    #[test]
+    fn a_modify_that_names_another_slot_is_looking_in_another_namespace() {
+        let mut m = PaperMatcher::new();
+        let old = maker(100_000_000, 1_000_000, 1, 0);
+        m.submit(&old, 1_000);
+        let mut new = maker(97_000_000, 1_000_000, 2, 0);
+        new.strategy_id = 5;
+        assert_eq!(
+            m.modify(&ModifyReq::new(1, new), AFTER_DELTA),
+            Err(DispatchError::NoSuchOrder)
+        );
+        assert_eq!(m.counters.no_such_order, 1);
+        assert_eq!(m.counters.identity_mismatch, 0);
+        assert_eq!(m.open_len(), 1);
+    }
+
+    #[test]
+    fn a_modify_of_an_order_that_already_filled_is_a_race_not_a_reprice() {
+        let mut m = PaperMatcher::new();
+        let old = maker(100_000_000, 1_000_000, 1, 0);
+        m.submit(&old, 1_000);
+        m.observe_tick(&crossing_tick(99_000_000), AFTER_DELTA);
+        assert!(m.try_next_fill().is_some());
+        let mut new = maker(97_000_000, 1_000_000, 2, 0);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(
+            m.modify(&ModifyReq::new(1, new), AFTER_DELTA),
+            Err(DispatchError::NoSuchOrder)
+        );
+        assert_eq!(m.counters.modifies, 0);
+        assert_eq!(m.counters.no_such_order, 1);
+    }
+
+    #[test]
+    fn a_modify_to_a_non_positive_size_is_refused_and_the_old_price_still_rests() {
+        let mut m = PaperMatcher::new();
+        let old = maker(100_000_000, 1_000_000, 1, 0);
+        m.submit(&old, 1_000);
+        let mut new = maker(97_000_000, 0, 2, 0);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(
+            m.modify(&ModifyReq::new(1, new), AFTER_DELTA),
+            Err(DispatchError::Unroutable)
+        );
+        assert_eq!(m.counters.unroutable, 1);
+        assert_eq!(m.counters.modifies, 0);
+        // The ORIGINAL price is still the resting one — `Ok` here
+        // would have told the caller otherwise.
+        m.observe_tick(&crossing_tick(99_000_000), AFTER_DELTA);
+        let f = m.try_next_fill().expect("the original order is intact");
+        assert_eq!(f.order_id, 1, "still the old id");
+        assert_eq!(f.qty.raw(), 1_000_000, "still the old size");
+    }
+
+    /// A dispatcher that has not been taught the verbs must SAY so.
+    /// `Ok(())` as a default would be a strategy believing a quote
+    /// was pulled that nothing ever pulled.
+    #[test]
+    fn the_default_lifecycle_verbs_refuse_rather_than_silently_succeed() {
+        struct Deaf;
+        impl OrderDispatch for Deaf {
+            fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            fn try_next_fill(&mut self) -> Option<Fill> {
+                None
+            }
+            fn stats(&self) -> DispatchStats {
+                DispatchStats::default()
+            }
+        }
+        let mut d = Deaf;
+        let o = maker(100_000_000, 1_000_000, 1, 0);
+        assert_eq!(
+            d.cancel(&CancelReq::of(&o, 1_000)),
+            Err(DispatchError::Unsupported)
+        );
+        assert_eq!(
+            d.modify(&ModifyReq::new(1, o)),
+            Err(DispatchError::Unsupported)
+        );
+    }
+
+    /// A lifecycle refusal is its own `DispatchStats` category. Mixing
+    /// it into `rejected_routing` would send an operator looking at
+    /// the route table for an order that was routed fine and then
+    /// could not be acted on.
+    #[test]
+    fn a_lifecycle_refusal_is_counted_apart_from_a_routing_refusal() {
+        let mut s = DispatchStats::default();
+        s.record_rejection(DispatchError::NoLiveRoute);
+        s.record_rejection(DispatchError::NoSuchOrder);
+        s.record_rejection(DispatchError::IdentityMismatch);
+        s.record_rejection(DispatchError::Unsupported);
+        s.record_rejection(DispatchError::Unroutable);
+        assert_eq!(s.rejected_routing, 1);
+        assert_eq!(s.rejected_lifecycle, 4);
+        assert_eq!(s.rejected, 5);
+    }
+
+    /// The paper dispatcher's `accepted` counts orders that entered
+    /// the book. A cancel takes one out and a modify replaces one, so
+    /// neither may bump it — `/metrics` would otherwise report two
+    /// orders where one was placed and pulled.
+    #[test]
+    fn a_cancel_or_modify_does_not_count_as_an_accepted_order() {
+        let mut d = PaperDispatcher::new();
+        let o = maker(100_000_000, 1_000_000, 1, 0);
+        assert!(d.submit(&o).is_ok());
+        assert_eq!(d.stats().accepted, 1);
+        let mut new = maker(97_000_000, 1_000_000, 2, 0);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(d.modify(&ModifyReq::new(1, new)), Ok(()));
+        assert_eq!(d.stats().accepted, 1, "a modify is not an acceptance");
+        let mut c = CancelReq::of(&o, AFTER_DELTA);
+        c.client_oid = 2;
+        assert_eq!(d.cancel(&c), Ok(()));
+        assert_eq!(d.stats().accepted, 1, "nor is a cancel");
+        assert_eq!(d.open_paper_orders(), 0);
+    }
+
+    /// **The multi-member case, which the first cut got wrong.**
+    ///
+    /// Every member allocates `client_oid` from its own counter
+    /// starting at 1, and all enabled members share ONE open table.
+    /// So id 1 belongs to as many resting orders as there are members
+    /// quoting. A lookup keyed on the id alone finds whichever
+    /// member submitted first — reporting one member's correct cancel
+    /// as a caller bug, and, on a matching identity, taking back the
+    /// wrong member's quote.
+    #[test]
+    fn one_slots_cancel_cannot_touch_another_slots_order_of_the_same_id() {
+        let mut m = PaperMatcher::new();
+        let mut a = maker(100_000_000, 1_000_000, 1, 0);
+        a.strategy_id = 0;
+        let mut b = maker(101_000_000, 1_000_000, 1, 0); // SAME client id
+        b.strategy_id = 5;
+        m.submit(&a, 1_000);
+        m.submit(&b, 1_000);
+        assert_eq!(m.open_len(), 2);
+
+        // Slot 5 cancels ITS id 1. Slot 0's order must survive.
+        assert_eq!(m.cancel(&CancelReq::of(&b, 2_000)), Ok(()));
+        assert_eq!(m.open_len(), 1);
+        m.observe_tick(&crossing_tick(99_000_000), AFTER_DELTA);
+        let f = m.try_next_fill().expect("slot 0's order is still resting");
+        assert_eq!(f.strategy_id, 0, "the WRONG member's quote was pulled");
+        assert_eq!(m.counters.identity_mismatch, 0, "no caller was wrong here");
+    }
+
+    /// The other half: a slot that names an id only ANOTHER slot
+    /// holds is told the order is not there — which is true of its
+    /// own orders — and not that it built a bad request.
+    #[test]
+    fn an_id_that_only_another_slot_holds_reads_as_no_such_order() {
+        let mut m = PaperMatcher::new();
+        let mut a = maker(100_000_000, 1_000_000, 1, 0);
+        a.strategy_id = 0;
+        m.submit(&a, 1_000);
+        let mut c = CancelReq::of(&a, 2_000);
+        c.strategy_id = 5;
+        assert_eq!(m.cancel(&c), Err(DispatchError::NoSuchOrder));
+        assert_eq!(m.counters.no_such_order, 1);
+        assert_eq!(
+            m.counters.identity_mismatch, 0,
+            "must-stay-0 has to survive ordinary multi-member operation"
+        );
+        assert_eq!(m.open_len(), 1);
+    }
+
+    /// A member that reuses a client id while the first order is
+    /// still resting cannot name either of them. Refused rather than
+    /// resolved FIFO: removing one and reporting success would leave
+    /// the caller believing both were gone.
+    #[test]
+    fn a_reused_client_id_within_one_slot_is_ambiguous_not_first_wins() {
+        let mut m = PaperMatcher::new();
+        let a = maker(100_000_000, 1_000_000, 1, 0);
+        let b = maker(101_000_000, 1_000_000, 1, 0); // same slot, same id
+        m.submit(&a, 1_000);
+        m.submit(&b, 1_000);
+        assert_eq!(m.open_len(), 2);
+        assert_eq!(
+            m.cancel(&CancelReq::of(&a, 2_000)),
+            Err(DispatchError::AmbiguousOrder)
+        );
+        let mut new = maker(97_000_000, 1_000_000, 9, 0);
+        new.ts_ns = AFTER_DELTA;
+        assert_eq!(
+            m.modify(&ModifyReq::new(1, new), AFTER_DELTA),
+            Err(DispatchError::AmbiguousOrder)
+        );
+        assert_eq!(m.counters.ambiguous_order, 2);
+        assert_eq!(m.open_len(), 2, "neither was touched");
+    }
+
+    /// **`ts_ns` is the modify's decision clock**, not the ignored
+    /// bookkeeping field `ttl_ns` is. Pinned because three doc sites
+    /// once said both were "read for nothing", and a requote loop
+    /// that believed it would re-arm the activation delta into the
+    /// past — making the repriced order fillable at the NEW price on
+    /// the very next tick.
+    #[test]
+    fn a_modify_whose_ts_ns_is_stale_activates_early_which_is_why_it_is_not_ignored() {
+        let mut m = PaperMatcher::new();
+        let old = maker(100_000_000, 1_000_000, 1, 0);
+        m.submit(&old, 1_000);
+        let mut new = maker(97_000_000, 1_000_000, 2, 0);
+        new.ts_ns = 0; // the mistake this test exists to make visible
+        // The dispatcher passes `req.order.ts_ns` as the clock.
+        assert_eq!(m.modify(&ModifyReq::new(1, new), new.ts_ns), Ok(()));
+        // 0 + Δ is long past, so the reprice is live immediately.
+        m.observe_tick(&crossing_tick(96_000_000), AFTER_DELTA);
+        let f = m
+            .try_next_fill()
+            .expect("a stale ts_ns makes the reprice fill at once");
+        assert_eq!(f.px.raw(), 97_000_000, "at the NEW price, with no flight time");
+
+        // And with the clock stamped correctly it does NOT.
+        let mut m2 = PaperMatcher::new();
+        m2.submit(&old, 1_000);
+        let mut good = maker(97_000_000, 1_000_000, 2, 0);
+        good.ts_ns = AFTER_DELTA;
+        assert_eq!(m2.modify(&ModifyReq::new(1, good), good.ts_ns), Ok(()));
+        m2.observe_tick(&crossing_tick(96_000_000), AFTER_DELTA + 1);
+        assert!(m2.try_next_fill().is_none());
+    }
+
+    /// `Pending` is exactly one cache line and its identity is one
+    /// comparable value — both are load-bearing for the matcher's
+    /// scan loop and for there being ONE statement of what "the same
+    /// order" means.
+    #[test]
+    fn the_open_table_slot_is_one_cache_line_with_one_identity_value() {
+        assert_eq!(::core::mem::size_of::<Pending>(), 64);
+        assert_eq!(::core::mem::size_of::<OrderIdentity>(), 8);
+        let a = maker(1, 1, 1, 0);
+        let mut b = maker(2, 2, 2, 0); // different px, qty, oid
+        assert_eq!(
+            OrderIdentity::of(&a),
+            OrderIdentity::of(&b),
+            "price, size and id are NOT identity"
+        );
+        b.side = Side::Ask;
+        assert_ne!(OrderIdentity::of(&a), OrderIdentity::of(&b));
     }
 }

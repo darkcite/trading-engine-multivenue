@@ -943,6 +943,25 @@ impl<'a, C: Ctx> Ctx for StampCtx<'a, C> {
         order.strategy_id = self.slot;
         self.inner.submit(order)
     }
+    /// E5 — a cancel is stamped exactly as a submit is, and for the
+    /// same reason: the router decides paper-vs-live on this byte,
+    /// and an unstamped cancel would be routed by slot `0xFF & 7`.
+    /// A member that could cancel through the wrong slot's arm is a
+    /// member that can pull another member's quote.
+    #[inline(always)]
+    fn cancel(&mut self, mut req: core_types::CancelReq) -> Result<(), SubmitErr> {
+        req.strategy_id = self.slot;
+        self.inner.cancel(req)
+    }
+    /// E5 — likewise for the replacement carried by a modify. Note
+    /// this stamps the NEW order; the resting order was stamped with
+    /// the same slot when it was submitted, which is what makes the
+    /// dispatcher's identity check pass.
+    #[inline(always)]
+    fn modify(&mut self, prev_client_oid: u64, mut order: Order) -> Result<(), SubmitErr> {
+        order.strategy_id = self.slot;
+        self.inner.modify(prev_client_oid, order)
+    }
     #[inline(always)]
     fn now_ns(&self) -> NsTs {
         self.inner.now_ns()

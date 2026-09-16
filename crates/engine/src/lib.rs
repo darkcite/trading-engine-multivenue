@@ -27,14 +27,15 @@
 
 use std::sync::Arc;
 
-use clob_dispatcher::OrderDispatch;
+use clob_dispatcher::{DispatchError, OrderDispatch};
 use core_io::SlotCapture;
 use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
-    AiCmd, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RuleTableSlot, Signal, Tick, VenueId,
-    AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, OptSummary, Order, RuleTableSlot,
+    Signal, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE,
+    RULE_TABLE_RING_SLOTS,
 };
 use engine_snapshot::{RecentRing, RECENT_FILLS, RECENT_ORDERS};
 use ingress_ai::AiIngressStatus;
@@ -251,6 +252,10 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// 1 s snapshot by value.
     recent_orders: RecentRing<Order, RECENT_ORDERS>,
     recent_fills: RecentRing<Fill, RECENT_FILLS>,
+    /// E5: what the strategy did to orders it had already sent. See
+    /// [`LifecycleCounters`] — the non-zero values are the signal
+    /// that `engine-orders.pmlr` no longer fully describes this boot.
+    lifecycle: LifecycleCounters,
     last_timer_ns: NsTs,
     /// Number of iterations completed (wraps on u64; for paper-mode stats).
     pub iterations: u64,
@@ -344,6 +349,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             order_capture: None,
             recent_orders: RecentRing::new(ZERO_ORDER),
             recent_fills: RecentRing::new(ZERO_FILL),
+            lifecycle: LifecycleCounters::new(),
             last_timer_ns: 0,
             iterations: 0,
             ticks_dispatched: 0,
@@ -367,6 +373,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             decide_lat: &self.decide_lat,
             order_capture: self.order_capture.as_mut(),
             recent_orders: &mut self.recent_orders,
+            lifecycle: &mut self.lifecycle,
             now: now_ns(),
         };
         self.strat.on_start(&mut ctx)
@@ -429,6 +436,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
                             now,
                         };
                         self.strat.on_tick(&t, &mut ctx);
@@ -453,6 +461,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         decide_lat: &self.decide_lat,
                         order_capture: self.order_capture.as_mut(),
                         recent_orders: &mut self.recent_orders,
+                        lifecycle: &mut self.lifecycle,
                         now,
                     };
                     self.strat.on_signal(&s, &mut ctx);
@@ -484,6 +493,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
                             now,
                         };
                         self.strat.on_fill(&f, &mut ctx);
@@ -519,6 +529,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         decide_lat: &self.decide_lat,
                         order_capture: self.order_capture.as_mut(),
                         recent_orders: &mut self.recent_orders,
+                        lifecycle: &mut self.lifecycle,
                         now,
                     };
                     self.strat.on_fill(&f, &mut ctx);
@@ -558,6 +569,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
                             now,
                         };
                         self.strat.on_venue_event(&e, &mut ctx);
@@ -586,6 +598,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
                             now,
                         };
                         self.strat.on_depth(&d, &mut ctx);
@@ -615,6 +628,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
                             now,
                         };
                         self.strat.on_opt_summary(&o, &mut ctx);
@@ -682,6 +696,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
                             now,
                         };
                         self.strat.on_ai(&cmd, &mut ctx);
@@ -704,6 +719,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     decide_lat: &self.decide_lat,
                     order_capture: self.order_capture.as_mut(),
                     recent_orders: &mut self.recent_orders,
+                    lifecycle: &mut self.lifecycle,
                     now,
                 };
                 self.strat.on_timer(now, &mut ctx);
@@ -911,6 +927,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             decide_lat: &self.decide_lat,
             order_capture: self.order_capture.as_mut(),
             recent_orders: &mut self.recent_orders,
+            lifecycle: &mut self.lifecycle,
             now: now_ns(),
         };
         self.strat.on_stop(&mut ctx);
@@ -956,6 +973,17 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn recent_fills(&self) -> &RecentRing<Fill, RECENT_FILLS> {
         &self.recent_fills
     }
+
+    /// E5: what this boot did to orders it had already sent.
+    ///
+    /// Read it to answer one question before trusting a replay of
+    /// this boot's `engine-orders.pmlr`:
+    /// [`LifecycleCounters::capture_is_incomplete`].
+    #[inline]
+    #[must_use]
+    pub const fn lifecycle_counters(&self) -> LifecycleCounters {
+        self.lifecycle
+    }
 }
 
 /// Ring filler for `recent_orders` (never rendered: the ring's
@@ -990,7 +1018,98 @@ struct EngineCtx<'a, D: OrderDispatch> {
     order_capture: Option<&'a mut SlotCapture<Order>>,
     /// RG6 `recent` ring — reborrowed like the intent log.
     recent_orders: &'a mut RecentRing<Order, RECENT_ORDERS>,
+    /// E5 lifecycle tally — reborrowed like the rings.
+    lifecycle: &'a mut LifecycleCounters,
     now: NsTs,
+}
+
+/// **E5 — what the strategy did to orders it had already sent, and
+/// the capture gap that fact opens.**
+///
+/// `engine-orders.pmlr` is a log of SUBMITTED INTENTS. It has one
+/// record type — [`Order`] — and no way to say "and then I pulled
+/// that one" or "and then I moved it to 0.47". So the moment a boot
+/// performs a cancel or a modify, the capture stops describing it:
+/// an offline replay of that capture models an order the engine had
+/// already taken back, or fills the old price of one it had moved.
+///
+/// That divergence is silent by nature, which is why it is a counter.
+/// **`cancels_ok + modifies_ok > 0` means the capture for this boot
+/// is not replayable.** Nothing in the tree emits either verb yet
+/// (E5 commit 3 adds the plumbing only), so the honest reading today
+/// is: these must be zero, and the commit that makes them non-zero
+/// owes the capture a lifecycle record type first.
+///
+/// The `_err` halves are not part of that gap — a refused verb
+/// changed nothing — but they are counted beside their successes so
+/// an operator reading a non-zero `ok` can see how many attempts it
+/// took.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleCounters {
+    /// Cancels the dispatcher performed. **Part of the capture gap.**
+    pub cancels_ok: u64,
+    /// Cancels the dispatcher refused — including the ordinary race
+    /// where a fill beat the cancel.
+    pub cancels_err: u64,
+    /// Modifies the dispatcher performed. **Part of the capture gap.**
+    pub modifies_ok: u64,
+    /// Modifies the dispatcher refused.
+    pub modifies_err: u64,
+}
+
+impl LifecycleCounters {
+    /// All zero.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cancels_ok: 0,
+            cancels_err: 0,
+            modifies_ok: 0,
+            modifies_err: 0,
+        }
+    }
+
+    /// Did this boot do anything the intent capture cannot express?
+    ///
+    /// Reads the two `_ok` fields and NOT the `_err` fields: a
+    /// refused verb left the book exactly as the capture describes
+    /// it, so it does not make the capture wrong.
+    #[inline]
+    #[must_use]
+    pub const fn capture_is_incomplete(&self) -> bool {
+        self.cancels_ok > 0 || self.modifies_ok > 0
+    }
+}
+
+/// Map a dispatcher error onto the strategy-facing one.
+///
+/// **Exhaustive on purpose — no `_` arm.** Before E5 this was
+/// `Err(_) => SubmitErr::RingFull`, which told a strategy that a
+/// disabled slot was back-pressure. That was harmless while
+/// `SubmitErr` had one variant and every caller dropped the order
+/// either way; it stops being harmless the moment a strategy has to
+/// tell "retry later" apart from "that order is already gone". A new
+/// `DispatchError` variant is now a compile error here, which is the
+/// only way this mapping stays honest.
+#[inline(always)]
+fn submit_err_of(e: DispatchError) -> SubmitErr {
+    match e {
+        DispatchError::QueueFull => SubmitErr::RingFull,
+        DispatchError::Unsupported => SubmitErr::Unsupported,
+        DispatchError::NoSuchOrder => SubmitErr::NoSuchOrder,
+        DispatchError::Disconnected
+        | DispatchError::SignerRejected
+        | DispatchError::EncodeOverflow
+        | DispatchError::JsonMalformed
+        | DispatchError::Http(_)
+        | DispatchError::SlotDisabled
+        | DispatchError::NoLiveRoute
+        | DispatchError::IdentityMismatch
+        | DispatchError::Unroutable
+        | DispatchError::AmbiguousOrder => SubmitErr::Refused,
+    }
 }
 
 impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
@@ -1012,9 +1131,58 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
                 self.recent_orders.push(order);
                 Ok(())
             }
-            Err(_) => Err(SubmitErr::RingFull),
+            Err(e) => Err(submit_err_of(e)),
         }
     }
+
+    /// **E5 — take one resting order back.**
+    ///
+    /// No capture append and no `recent_orders` push: both rings hold
+    /// [`Order`]s, and there is no Order to hold. See
+    /// [`LifecycleCounters`] for what that costs and how it is made
+    /// visible.
+    ///
+    /// No decide-latency record either — `decide_lat` measures the
+    /// time a strategy spent between `ctx.now_ns()` and its submit,
+    /// and a `CancelReq`'s `ts_ns` is bookkeeping the strategy is
+    /// free to set from anywhere. Recording it would fold a made-up
+    /// number into the histogram operators read.
+    #[inline(always)]
+    fn cancel(&mut self, req: CancelReq) -> Result<(), SubmitErr> {
+        match self.disp.cancel(&req) {
+            Ok(()) => {
+                self.lifecycle.cancels_ok = self.lifecycle.cancels_ok.wrapping_add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.lifecycle.cancels_err = self.lifecycle.cancels_err.wrapping_add(1);
+                Err(submit_err_of(e))
+            }
+        }
+    }
+
+    /// **E5, LAW E-7 — replace a resting order in place.**
+    ///
+    /// Same capture note as `cancel`: the replacement Order is
+    /// deliberately NOT appended to `engine-orders.pmlr`. Appending
+    /// it would be worse than the gap, not better — a replay would
+    /// then see two submits and model two resting orders where the
+    /// engine had one that moved.
+    #[inline(always)]
+    fn modify(&mut self, prev_client_oid: u64, order: Order) -> Result<(), SubmitErr> {
+        let req = ModifyReq::new(prev_client_oid, order);
+        match self.disp.modify(&req) {
+            Ok(()) => {
+                self.lifecycle.modifies_ok = self.lifecycle.modifies_ok.wrapping_add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.lifecycle.modifies_err = self.lifecycle.modifies_err.wrapping_add(1);
+                Err(submit_err_of(e))
+            }
+        }
+    }
+
     #[inline(always)]
     fn now_ns(&self) -> NsTs {
         self.now
@@ -2184,5 +2352,219 @@ mod tests {
         // `now` < last_touched → saturating_sub returns 0, not
         // wrapping nonsense.
         assert_eq!(eng.max_tick_age_ns(0), 0);
+    }
+
+    // ---------------- E5: the strategy-facing error names ----------------
+
+    /// **The mapping is the point.** Before E5 every dispatcher error
+    /// arrived at a strategy as `RingFull`, which says "retry later"
+    /// about a slot the operator switched off. Each condition now
+    /// carries its own name, and the test names which is which so a
+    /// future edit cannot quietly re-merge them.
+    #[test]
+    fn each_dispatcher_error_reaches_the_strategy_under_its_own_name() {
+        // Retryable back-pressure — and the ONLY thing that is.
+        assert_eq!(submit_err_of(DispatchError::QueueFull), SubmitErr::RingFull);
+
+        // The verb does not exist on this dispatcher.
+        assert_eq!(
+            submit_err_of(DispatchError::Unsupported),
+            SubmitErr::Unsupported
+        );
+
+        // The order is already gone — a race, and the caller must be
+        // able to tell it from back-pressure.
+        assert_eq!(
+            submit_err_of(DispatchError::NoSuchOrder),
+            SubmitErr::NoSuchOrder
+        );
+
+        // Everything else is an operator condition the strategy
+        // cannot act on. `SlotDisabled` is the one that used to read
+        // as `RingFull`.
+        for e in [
+            DispatchError::Disconnected,
+            DispatchError::SignerRejected,
+            DispatchError::EncodeOverflow,
+            DispatchError::JsonMalformed,
+            DispatchError::Http(429),
+            DispatchError::SlotDisabled,
+            DispatchError::NoLiveRoute,
+            DispatchError::IdentityMismatch,
+            DispatchError::Unroutable,
+        ] {
+            assert_eq!(submit_err_of(e), SubmitErr::Refused, "{e:?}");
+        }
+        assert_ne!(
+            submit_err_of(DispatchError::SlotDisabled),
+            SubmitErr::RingFull,
+            "a slot the operator turned off is not back-pressure"
+        );
+    }
+
+    /// A dispatcher that performs both verbs, so the engine's tally
+    /// can be observed. Records nothing else — the counters are what
+    /// is under test.
+    struct LifecycleDispatcher {
+        cancel_ok: bool,
+        modify_ok: bool,
+    }
+    impl OrderDispatch for LifecycleDispatcher {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
+            if self.cancel_ok {
+                Ok(())
+            } else {
+                Err(DispatchError::NoSuchOrder)
+            }
+        }
+        fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
+            if self.modify_ok {
+                Ok(())
+            } else {
+                Err(DispatchError::IdentityMismatch)
+            }
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+    }
+
+    fn lifecycle_ctx<'a>(
+        d: &'a mut LifecycleDispatcher,
+        lat: &'a LatencyTracker<24>,
+        recent: &'a mut RecentRing<Order, RECENT_ORDERS>,
+        lc: &'a mut LifecycleCounters,
+    ) -> EngineCtx<'a, LifecycleDispatcher> {
+        EngineCtx {
+            disp: d,
+            decide_lat: lat,
+            order_capture: None,
+            recent_orders: recent,
+            lifecycle: lc,
+            now: 1_000,
+        }
+    }
+
+    fn a_cancel() -> CancelReq {
+        CancelReq::new(1_000, VenueId::Hyperliquid, 42, 7)
+    }
+
+    fn an_order() -> Order {
+        Order::new(
+            1_000,
+            VenueId::Hyperliquid,
+            42,
+            Side::Bid,
+            0,
+            Price::from_raw(500_000),
+            Qty::from_raw(1_000_000),
+            8,
+        )
+    }
+
+    /// **The capture gap, made into a number.**
+    ///
+    /// `engine-orders.pmlr` has one record type and cannot say "and
+    /// then I pulled that one". A boot that performs either verb has
+    /// a capture that no longer describes it, and an offline replay
+    /// of that capture is wrong in a way nothing else would reveal.
+    #[test]
+    fn a_performed_lifecycle_verb_marks_the_intent_capture_incomplete() {
+        let lat = LatencyTracker::<24>::new();
+        let mut recent = RecentRing::new(ZERO_ORDER);
+        let mut lc = LifecycleCounters::new();
+        let mut d = LifecycleDispatcher {
+            cancel_ok: true,
+            modify_ok: true,
+        };
+        assert!(!lc.capture_is_incomplete(), "a fresh boot is replayable");
+        {
+            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
+            assert_eq!(ctx.cancel(a_cancel()), Ok(()));
+        }
+        assert_eq!(lc.cancels_ok, 1);
+        assert!(lc.capture_is_incomplete());
+
+        let mut lc2 = LifecycleCounters::new();
+        {
+            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc2);
+            assert_eq!(ctx.modify(7, an_order()), Ok(()));
+        }
+        assert_eq!(lc2.modifies_ok, 1);
+        assert!(lc2.capture_is_incomplete());
+    }
+
+    /// The other half, and the one that is easy to get wrong: a
+    /// REFUSED verb changed nothing, so it does not make the capture
+    /// wrong. A `capture_is_incomplete` that read the `_err` fields
+    /// too would condemn every boot that ever lost a race to a fill.
+    #[test]
+    fn a_refused_lifecycle_verb_leaves_the_capture_replayable() {
+        let lat = LatencyTracker::<24>::new();
+        let mut recent = RecentRing::new(ZERO_ORDER);
+        let mut lc = LifecycleCounters::new();
+        let mut d = LifecycleDispatcher {
+            cancel_ok: false,
+            modify_ok: false,
+        };
+        {
+            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
+            assert_eq!(ctx.cancel(a_cancel()), Err(SubmitErr::NoSuchOrder));
+            assert_eq!(ctx.modify(7, an_order()), Err(SubmitErr::Refused));
+        }
+        assert_eq!(lc.cancels_err, 1);
+        assert_eq!(lc.modifies_err, 1);
+        assert_eq!(lc.cancels_ok, 0);
+        assert_eq!(lc.modifies_ok, 0);
+        assert!(
+            !lc.capture_is_incomplete(),
+            "nothing happened, so the capture still describes the boot"
+        );
+    }
+
+    /// Neither verb touches the `recent` ring — it holds `Order`s and
+    /// there is no accepted Order to hold. Pinned so a later edit
+    /// that "helpfully" pushes the replacement does not quietly make
+    /// `/state` show two quotes where one moved.
+    #[test]
+    fn a_lifecycle_verb_does_not_push_onto_the_recent_orders_ring() {
+        let lat = LatencyTracker::<24>::new();
+        let mut recent = RecentRing::new(ZERO_ORDER);
+        let mut lc = LifecycleCounters::new();
+        let mut d = LifecycleDispatcher {
+            cancel_ok: true,
+            modify_ok: true,
+        };
+        let before = recent.total;
+        {
+            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
+            assert_eq!(ctx.cancel(a_cancel()), Ok(()));
+            assert_eq!(ctx.modify(7, an_order()), Ok(()));
+        }
+        assert_eq!(recent.total, before);
+    }
+
+    /// A `Ctx` that never heard of the verbs answers `Unsupported`,
+    /// not `Ok`. Forty `impl Ctx` blocks take these defaults.
+    #[test]
+    fn the_default_ctx_verbs_refuse() {
+        struct Bare;
+        impl Ctx for Bare {
+            fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+                Ok(())
+            }
+            fn now_ns(&self) -> NsTs {
+                0
+            }
+        }
+        let mut b = Bare;
+        assert_eq!(b.cancel(a_cancel()), Err(SubmitErr::Unsupported));
+        assert_eq!(b.modify(7, an_order()), Err(SubmitErr::Unsupported));
     }
 }
