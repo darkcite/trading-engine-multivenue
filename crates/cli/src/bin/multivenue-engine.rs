@@ -201,8 +201,8 @@ struct ExecSmokeArgs {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    /// PHASE D: place ONE IoC that is meant to TRADE, and report the
-    /// venue's ACK.
+    /// PHASE D: place IoCs that are meant to TRADE — one by default,
+    /// up to `--fill-repeat 32` — and report what the venue ACKED.
     ///
     /// **This spends testnet balance on purpose.** It is the only
     /// thing here that proves our own cloid survives the round trip
@@ -212,13 +212,17 @@ struct ExecSmokeArgs {
     /// An IoC either trades or is gone, so unlike `--lifecycle` this
     /// carries no cleanup path — a property of the ORDER TYPE, not one
     /// this code enforces. If the venue rests one anyway, the exit is
-    /// nonzero and names the oid; the cloid is deterministic from
-    /// `--fill-slot` and `--fill-cloid`, so it can be cancelled.
+    /// nonzero and both ends of the cloid range are printed, because
+    /// every cloid is deterministic from `--fill-slot` and
+    /// `--fill-cloid`. A batch that STOPS still reports everything it
+    /// did: a refusal never hides a fill, or a rest, behind it.
     ///
     /// You state the market, the price and the size: the price must
     /// CROSS the book, and this code does not read the book and will
-    /// not guess it. Capped at $100 notional — a typo limit, not a
-    /// risk limit. Rehearse with `--dry-run` first.
+    /// not guess it. Capped at $100 notional PER ORDER and 32 orders
+    /// per invocation — typo limits, not risk limits. Rehearse with
+    /// `--dry-run` first; it prints both the per-order and the batch
+    /// total.
     ///
     /// Per LAW E-5 the ACK is not the fill. Read `userFills` (or run
     /// `--watch` in another shell) for that.
