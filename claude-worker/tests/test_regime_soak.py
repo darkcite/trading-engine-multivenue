@@ -203,7 +203,7 @@ def _pnl_report(reports: pathlib.Path, day: str, with_rows: bool) -> None:
         [{"strategy_id": 5, "label": "vm", "fills": 3, "net_usd": "1.0"}] if with_rows else []
     )
     obj = {
-        "audit_pnl_version": 1,
+        "audit_pnl_version": 2,
         "day": day,
         "regime": {
             "modes": {},

@@ -404,7 +404,7 @@ def test_report_round_trips_through_pnl_report():
     res = _one_result()
     obj = claude_worker.bartest.to_audit_pnl([(9, "kpnl-f1", res)], T0, T0 + 8 * MS_1H)
     merged = claude_worker.pnl_report.merge_reports("2026-09-08", [("kpnl", obj)])
-    assert merged["audit_pnl_version"] == 1
+    assert merged["audit_pnl_version"] == 2
     rows = [r for r in merged["strategies"] if int(r["strategy_id"]) == 9]
     assert len(rows) == 1
     assert float(rows[0]["net_usd"]) == pytest.approx(res.net_usd)

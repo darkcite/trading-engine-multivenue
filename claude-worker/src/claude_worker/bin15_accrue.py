@@ -60,6 +60,7 @@ import typing
 import claude_worker.backtest
 import claude_worker.bin15_ledger
 import claude_worker.bin15_ref
+import claude_worker.fill_origin
 import claude_worker.hip4
 import claude_worker.window_root
 
@@ -70,7 +71,11 @@ DEFAULT_ENTRIES: str = "~/multivenue/worker/bin15/entries.tsv"
 ENTRIES_HEADER: str = (
     "# bin15 entries — one row per COVERAGE ENTRY the member placed,\n"
     "#   merged from `backtest --member bin15 --emit-detail` sidecars.\n"
-    "# ts_ns\toutcome\tfamily\tstart_ns\texpiry_ns\toffset_s\tis_yes\tpx_1e6\tqty_1e6\tp_hat_1e6\ty\n"
+    "# ts_ns\toutcome\tfamily\tstart_ns\texpiry_ns\toffset_s\tis_yes\tpx_1e6\tqty_1e6\tp_hat_1e6\ty\torigin\n"
+    "# origin: 1 PAPER (a modelled fill), 0 VENUE (a real one). NEVER\n"
+    "#   summed together — a mixed total is meaningless (plan §6.4). An\n"
+    "#   11-column row predates the split and reads as PAPER, which is\n"
+    "#   true by construction: no live fill had ever reached this file.\n"
     "# offset_s: seconds from the INSTANCE's start (expiry - 900 s), not\n"
     "#   from our receipt of the roll, which lags the venue a second or two.\n"
     "# y: 1000000 settled ITM, 0 settled OTM, -1 the window could not derive\n"
@@ -80,6 +85,18 @@ ENTRIES_HEADER: str = (
 
 #: `y` for an entry whose instance the window could not settle.
 Y_UNKNOWN: int = claude_worker.bin15_ledger.Y_UNKNOWN
+
+#: ``origin`` values, from the one module that defines them.
+ORIGIN_VENUE: int = claude_worker.fill_origin.VENUE
+ORIGIN_PAPER: int = claude_worker.fill_origin.PAPER
+
+#: What to call each in a number an operator reads.
+ORIGIN_NAMES: dict[int, str] = claude_worker.fill_origin.NAMES
+
+#: Columns a pre-§6.4 entries file has. Every one of them is paper by
+#: construction: the harness models every fill, and no live path had
+#: written here when they were produced.
+LEGACY_COLUMNS: int = 11
 
 #: The 15 m tenor, ns.
 TAU_15M_NS: int = 900_000_000_000
@@ -99,6 +116,11 @@ class Entry(typing.NamedTuple):
     qty_1e6: int
     p_hat_1e6: int
     y: int
+    #: Which ACCOUNTING this entry belongs to. **No default**, on
+    #: purpose: a default is the one place a future producer could get
+    #: PAPER without saying so, which is the silent mislabelling the
+    #: whole split exists to prevent.
+    origin: int
 
     @property
     def settled(self) -> bool:
@@ -108,6 +130,12 @@ class Entry(typing.NamedTuple):
     def won(self) -> bool:
         """Whether the side the member BOUGHT is the side that settled."""
         return (self.y >= 500_000) == (self.is_yes == 1)
+
+    @property
+    def accounting(self) -> str:
+        """``PAPER`` / ``VENUE`` — the word §6.4 says must appear beside
+        every BIN15 dollar figure."""
+        return ORIGIN_NAMES.get(self.origin, f"origin-{self.origin}")
 
     def tsv(self) -> str:
         return "\t".join(str(v) for v in self) + "\n"
@@ -125,6 +153,16 @@ def entries_from_sidecar(text: str) -> list[Entry]:
     out: list[Entry] = []
     for r in block:
         y = r.get("y")
+        if "origin" not in r:
+            # The harness stamps it (`Bin15EntryRow::origin`). A sidecar
+            # without it came from a binary that predates §6.4, and
+            # defaulting it here is exactly the silent mislabelling the
+            # split exists to prevent — so this is an error, not a
+            # fallback. Rebuild the release binary.
+            raise ValueError(
+                "bin15_entries row has no `origin`: this sidecar predates the "
+                "PAPER/VENUE split (plan §6.4). Rebuild the harness."
+            )
         out.append(
             Entry(
                 ts_ns=int(r["ts_ns"]),
@@ -138,6 +176,7 @@ def entries_from_sidecar(text: str) -> list[Entry]:
                 qty_1e6=int(r["qty_1e6"]),
                 p_hat_1e6=int(r["p_hat_1e6"]),
                 y=Y_UNKNOWN if y is None else int(y),
+                origin=int(r["origin"]),
             )
         )
     return out
@@ -153,34 +192,56 @@ def read_entries(path: pathlib.Path) -> list[Entry]:
         if not s or s.startswith("#"):
             continue
         f = s.split("\t")
-        if len(f) != 11:
-            raise ValueError(f"{path}: want 11 columns, got {len(f)}: {s!r}")
-        out.append(Entry(*(int(v) for v in f)))
+        if len(f) == LEGACY_COLUMNS:
+            # Pre-§6.4. PAPER is not an assumption here: the harness
+            # models every fill, so nothing else could have written
+            # these. Anything BUT 11 or 12 is a file this reader does
+            # not understand, and a reader that guesses at a column
+            # count produces a number nobody can defend.
+            out.append(Entry(*(int(v) for v in f), origin=ORIGIN_PAPER))
+        elif len(f) == len(Entry._fields):
+            out.append(Entry(*(int(v) for v in f)))
+        else:
+            raise ValueError(
+                f"{path}: want {len(Entry._fields)} columns "
+                f"(or {LEGACY_COLUMNS} pre-§6.4), got {len(f)}: {s!r}"
+            )
     return out
 
 
 def merge_entries(
     existing: typing.Sequence[Entry], incoming: typing.Sequence[Entry]
 ) -> tuple[list[Entry], int]:
-    """``(merged oldest first, added)``, deduped by OUTCOME.
+    """``(merged oldest first, added)``, deduped by ``(OUTCOME, ORIGIN)``.
 
-    One instance is entered at most once, so the outcome id is the
-    identity. A SETTLED row wins over an unsettled one whichever way
-    round they arrive: a window re-cut later can carry the same entry
-    with its payout now derivable, and that is an upgrade, not a
-    duplicate. Otherwise existing wins, so a re-cut can never un-settle
-    the store.
+    One instance is entered at most once **per accounting**, so the
+    outcome id alone is NOT the identity. The same instance can carry a
+    PAPER entry (what the model would have done, from a replay of that
+    day) and a VENUE entry (what the account actually did) — two
+    different facts about one market, and keying on the outcome alone
+    would let whichever arrived second silently overwrite the other.
+    That is how a mixed number gets built out of two honest halves
+    (plan §6.4).
+
+    A SETTLED row wins over an unsettled one whichever way round they
+    arrive: a window re-cut later can carry the same entry with its
+    payout now derivable, and that is an upgrade, not a duplicate.
+    Otherwise existing wins, so a re-cut can never un-settle the store.
     """
-    by: dict[int, Entry] = {e.outcome: e for e in existing}
+    by: dict[tuple[int, int], Entry] = {(e.outcome, e.origin): e for e in existing}
     added = 0
     for e in incoming:
-        old = by.get(e.outcome)
+        key = (e.outcome, e.origin)
+        old = by.get(key)
         if old is None:
-            by[e.outcome] = e
+            by[key] = e
             added += 1
         elif not old.settled and e.settled:
-            by[e.outcome] = e
-    return sorted(by.values(), key=lambda e: (e.ts_ns, e.outcome)), added
+            by[key] = e
+    return (
+        sorted(by.values(), key=lambda e: (e.ts_ns, e.outcome, e.origin)),
+        added,
+    )
 
 
 def write_entries(path: pathlib.Path, rows: typing.Sequence[Entry]) -> None:
@@ -197,6 +258,23 @@ def write_entries(path: pathlib.Path, rows: typing.Sequence[Entry]) -> None:
 # ---------------------------------------------------------------------
 # driving the harness
 # ---------------------------------------------------------------------
+
+
+def by_origin(
+    entries: typing.Sequence[Entry],
+) -> list[tuple[int, list[Entry]]]:
+    """``[(origin, entries)]``, VENUE first, each non-empty.
+
+    VENUE leads because it is what the account actually did; PAPER is
+    the model's opinion about the same market. An origin with no
+    entries is absent rather than rendered as a row of zeroes — a
+    reader must be able to tell "no live entries yet" from "live
+    entries that netted nothing".
+    """
+    groups: dict[int, list[Entry]] = {}
+    for e in entries:
+        groups.setdefault(e.origin, []).append(e)
+    return [(o, groups[o]) for o in sorted(groups)]
 
 
 def day_of(epoch_ns: int) -> str:
@@ -376,7 +454,27 @@ def needed_n(p: float, edge: float, z: float = 2.0) -> int:
 
 def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
     """The three operator questions, with the error bar that decides
-    whether any of them is an answer yet."""
+    whether any of them is an answer yet.
+
+    **One accounting per call.** §6.4: PAPER and VENUE are never mixed
+    in one number. That is enforced here rather than left to the
+    caller, because every figure below — the hit rate, the cost, the
+    payout, the Wilson interval — is a sum over whatever it is handed,
+    and a function that silently averages a modelled fill with a real
+    one produces a number that looks exactly like the ones that are
+    true. :func:`by_origin` is how a caller splits a store.
+
+    Raises:
+        ValueError: the sequence carries more than one ``origin``.
+    """
+    origins = sorted({e.origin for e in entries})
+    if len(origins) > 1:
+        raise ValueError(
+            "render() was handed a MIXED set ("
+            + ", ".join(ORIGIN_NAMES.get(o, str(o)) for o in origins)
+            + "). PAPER and VENUE are never summed into one number "
+            "(plan §6.4) — split with by_origin() and render each."
+        )
     out: list[str] = []
     settled = [e for e in entries if e.settled]
     days = {day_of(e.ts_ns) for e in entries}
@@ -523,17 +621,29 @@ def main(argv: list[str] | None = None) -> int:
     ent = entries_path(args.entries)
     rows = read_entries(ent)
     if args.lane == "status":
-        settled = [e for e in rows if e.settled]
-        print(
-            f"bin15-accrue: {ent} entries={len(rows)} settled={len(settled)} "
-            f"days={len({day_of(e.ts_ns) for e in rows})} "
-            f"families={len({e.family for e in rows})}"
-        )
+        print(f"bin15-accrue: {ent} entries={len(rows)}")
+        for origin, group in by_origin(rows):
+            settled = [e for e in group if e.settled]
+            print(
+                f"  {ORIGIN_NAMES.get(origin, origin)}: entries={len(group)} "
+                f"settled={len(settled)} "
+                f"days={len({day_of(e.ts_ns) for e in group})} "
+                f"families={len({e.family for e in group})}"
+            )
         return 0
 
     print(f"bin15-accrue: {ent}")
-    for line in render(rows, args.fee_bps_exit):
-        print(f"  {line}")
+    groups = by_origin(rows)
+    if not groups:
+        print("  no entries yet")
+        return 0
+    for origin, group in groups:
+        # The word §6.4 requires beside every BIN15 dollar figure, on
+        # its own line above the figures rather than buried in one of
+        # them, so that quoting a number without it takes effort.
+        print(f"  == {ORIGIN_NAMES.get(origin, origin)} accounting — {len(group)} entr(ies)")
+        for line in render(group, args.fee_bps_exit):
+            print(f"    {line}")
     return 0
 
 

@@ -54,6 +54,7 @@ import time
 import typing
 
 import claude_worker.backtest
+import claude_worker.fill_origin
 import claude_worker.regime
 import claude_worker.window_root
 
@@ -63,7 +64,7 @@ REPLAY_DIR_ENV: str = "CLAUDE_WORKER_REPLAY_DIR"
 DEFAULT_REPLAY_DIR: str = "~/multivenue/logs"
 
 # The stdout schema this writer accepts (audit-pnl contract).
-AUDIT_PNL_VERSION: int = 1
+AUDIT_PNL_VERSION: int = 2
 
 # Generous ceiling for a whole-root replay (offline analytics).
 RUN_TIMEOUT_S: int = 1800
@@ -358,8 +359,21 @@ def _merge_regime(acc: dict, section: dict) -> None:
             wacc["minutes"] += int(w.get("minutes", 0) or 0)
             for srow in w.get("strategies") or []:
                 sid = int(srow.get("strategy_id", 255))
-                sacc = wacc["strategies"].setdefault(sid, {
-                    "strategy_id": sid, "label": srow.get("label", "unknown"),
+                if "origin" not in srow:
+                    raise ValueError(
+                        f"audit-pnl regime strategy row {sid} has no `origin`: this "
+                        "binary predates the PAPER/VENUE split (plan §6.4). Rebuild it."
+                    )
+                # §6.4 — the SAME dollars as the top-level strategy
+                # rows, broken down by regime word instead of merged
+                # flat. Splitting only the top level would leave this
+                # one summing a modelled fill with a real one, in the
+                # same document, for the slot that arms first.
+                sorigin = int(srow["origin"])
+                sacc = wacc["strategies"].setdefault((sid, sorigin), {
+                    "strategy_id": sid, "origin": sorigin,
+                    "accounting": claude_worker.fill_origin.name_of(sorigin),
+                    "label": srow.get("label", "unknown"),
                     **{k: 0 for k in _REGIME_ROW_KEYS}, "net_usd": 0.0,
                     "fee_ladder_net_usd": [0.0, 0.0, 0.0],
                 })
@@ -381,11 +395,13 @@ def _render_regime(acc: dict) -> dict:
         for wacc in sorted(acc["profiles"][pname].values(), key=lambda w: (-w["minutes"], w["bits"])):
             strategies = [
                 {
-                    **{k: s[k] for k in ("strategy_id", "label", *_REGIME_ROW_KEYS)},
+                    **{k: s[k] for k in
+                       ("strategy_id", "origin", "accounting", "label",
+                        *_REGIME_ROW_KEYS)},
                     "net_usd": f"{s['net_usd']:.6f}",
                     "fee_ladder_net_usd": [f"{v:.6f}" for v in s["fee_ladder_net_usd"]],
                 }
-                for s in (wacc["strategies"][sid] for sid in sorted(wacc["strategies"]))
+                for s in (wacc["strategies"][key] for key in sorted(wacc["strategies"]))
             ]
             words.append({**{k: wacc[k] for k in ("word", "bits", "minutes")}, "strategies": strategies})
         profiles.append({"profile": pname, "words": words})
@@ -452,7 +468,12 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
     run — a day-level drawdown across runs is not defined when each run
     starts flat. RG5: the additive ``regime`` key folds every run's
     per-regime section (absent on pre-RG3 reports ⇒ empty profiles)."""
-    by_sid: dict[int, dict] = {}
+    # Keyed by (strategy_id, ORIGIN), never by the id alone. §6.4: a
+    # PAPER number and a VENUE number are two facts about one strategy
+    # and are never summed. Merging on the id alone is precisely how a
+    # mixed total gets built out of two honest halves, so the split is
+    # the merge key rather than a caller's discipline.
+    by_sid: dict[tuple[int, int], dict] = {}
     vm: dict[str, dict] = {}
     regime_acc: dict = {"modes": {}, **{k: 0 for k in _REGIME_SUM_KEYS}, "profiles": {}}
     wall_first = None
@@ -471,8 +492,20 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
         paper_net += _usd(paper.get("net_usd", "0"))
         for row in obj.get("strategies") or []:
             sid = int(row.get("strategy_id", 255))
-            acc = by_sid.setdefault(sid, {
-                "strategy_id": sid, "label": row.get("label", "unknown"),
+            if "origin" not in row:
+                # `audit-pnl` stamps it. A report without it came from a
+                # binary predating §6.4, and defaulting it here would
+                # make the nightly line claim an accounting it never
+                # measured. Rebuild the release binary.
+                raise ValueError(
+                    f"audit-pnl strategy row {sid} has no `origin`: this binary "
+                    "predates the PAPER/VENUE split (plan §6.4). Rebuild it."
+                )
+            origin = int(row["origin"])
+            acc = by_sid.setdefault((sid, origin), {
+                "strategy_id": sid, "origin": origin,
+                "accounting": claude_worker.fill_origin.name_of(origin),
+                "label": row.get("label", "unknown"),
                 **{k: 0 for k in _SUM_KEYS}, **{k: 0.0 for k in _SUM_USD_KEYS},
                 "max_drawdown_usd": 0.0, "trading_days": 1, "runs": 0,
                 "fee_ladder_net_usd": [0.0, 0.0, 0.0],
@@ -488,7 +521,17 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
                 acc["fee_ladder_net_usd"][i] += _usd(ladder[i])
         for row in obj.get("vm_by_ruleset") or []:
             h = str(row.get("hash128", "?"))
-            acc = vm.setdefault(h, {"hash128": h, "orders": 0, "trades": 0, "net_usd": 0.0, "max_drawdown_usd": 0.0})
+            if "origin" not in row:
+                raise ValueError(
+                    f"audit-pnl vm_by_ruleset row {h} has no `origin`: this binary "
+                    "predates the PAPER/VENUE split (plan §6.4). Rebuild it."
+                )
+            # Dollars again, merged by ruleset hash across runs.
+            vorigin = int(row["origin"])
+            acc = vm.setdefault((h, vorigin), {
+                "hash128": h, "origin": vorigin,
+                "accounting": claude_worker.fill_origin.name_of(vorigin),
+                "orders": 0, "trades": 0, "net_usd": 0.0, "max_drawdown_usd": 0.0})
             acc["orders"] += int(row.get("orders", 0) or 0)
             acc["trades"] += int(row.get("trades", 0) or 0)
             acc["net_usd"] += _usd(row.get("net_usd", "0"))
@@ -497,10 +540,11 @@ def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
         if isinstance(section, dict):
             _merge_regime(regime_acc, section)
     strategies = []
-    for sid in sorted(by_sid):
-        acc = by_sid[sid]
+    for key in sorted(by_sid):
+        acc = by_sid[key]
         strategies.append({
-            **{k: acc[k] for k in ("strategy_id", "label", "runs")},
+            **{k: acc[k] for k in
+               ("strategy_id", "origin", "accounting", "label", "runs")},
             **{k: acc[k] for k in _SUM_KEYS},
             **{k: f"{acc[k]:.6f}" for k in _SUM_USD_KEYS},
             "max_drawdown_usd": f"{acc['max_drawdown_usd']:.6f}",
@@ -723,8 +767,13 @@ def run_day(
         f"fee tier flags: {' '.join(flags) if flags else '(none — harness defaults 0/0; read the ladder)'}",
     ]
     for row in merged["strategies"]:
+        # §6.4 — the accounting word sits between the label and the
+        # numbers, so a figure cannot be quoted from this line without
+        # it. One line per (strategy, accounting); there is no combined
+        # line, because the combined number is the one §6.4 forbids.
         head.append(
-            f"strategy {row['strategy_id']} ({row['label']}): runs={row['runs']} orders={row['orders']} "
+            f"strategy {row['strategy_id']} ({row['label']}) {row['accounting']}: "
+            f"runs={row['runs']} orders={row['orders']} "
             f"fills={row['fills']} trades={row['trades']} net={row['net_usd']} fees={row['fees_usd']} "
             f"worst_run_dd={row['max_drawdown_usd']} ioc_fills={row['ioc_fills']} "
             f"ioc_canceled={row['ioc_canceled']} ttl_expired={row['ttl_expired']} "

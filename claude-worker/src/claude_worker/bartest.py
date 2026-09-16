@@ -9,7 +9,9 @@ it 1-24 hours and closes it has no runner in this repo. This is that
 runner, and it is deliberately the SMALLEST bridge that keeps the result
 inside our existing automation:
 
-* it emits the **frozen audit-pnl contract** (``audit_pnl_version`` 1,
+* it emits the **frozen audit-pnl contract** (``audit_pnl_version`` 2 —
+  bumped by plan §6.4, which added the required ``origin`` byte to every
+  ``strategies`` row; the row shape moved and so did this claim,
   the same ``strategies`` row shape), so ``pnl_report.merge_reports``
   folds it unchanged and the P&L review lane is the existing one;
 * fees come from ``~/multivenue/fees.toml`` -- the same D2-AMEND tiers
@@ -49,11 +51,13 @@ import random
 import sqlite3
 import typing
 
+import claude_worker.fill_origin
+
 MS_1M: int = 60_000
 MS_1H: int = 3_600_000
 
 #: The audit-pnl stdout contract this module emits (pnl_report accepts 1).
-AUDIT_PNL_VERSION: int = 1
+AUDIT_PNL_VERSION: int = 2
 
 DEFAULT_DB: str = "~/multivenue/worker/candles.db"
 DEFAULT_FEES: str = "~/multivenue/fees.toml"
@@ -531,6 +535,12 @@ def to_audit_pnl(
             {
                 "strategy_id": int(strategy_id),
                 "label": label,
+                # Which ACCOUNTING this row is (plan §6.4). A bar
+                # REPLAY models every trade it reports — there is no
+                # venue here and there never can be — so this is a fact
+                # about the producer, stamped rather than left for the
+                # merge to default.
+                "origin": claude_worker.fill_origin.PAPER,
                 "orders": 2 * res.n_trades,
                 "fills": 2 * res.n_trades,
                 "trades": res.n_trades,

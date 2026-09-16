@@ -115,7 +115,7 @@ def _worker_dir(tmp_path: pathlib.Path) -> claude_worker.dashboard.Inputs:
     (reports / "pnl-2026-09-04.json").write_text(
         json.dumps(
             {
-                "audit_pnl_version": 1,
+                "audit_pnl_version": 2,
                 "day": "2026-09-04",
                 "runs": 2,
                 "paper": {"fills": 7, "net_usd": "-1.500000"},

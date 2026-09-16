@@ -25,13 +25,14 @@ import tests.craft
 import claude_worker.backtest
 import claude_worker.cli
 import claude_worker.pmlr
+import claude_worker.fill_origin
 import claude_worker.pnl_report
 
 _RUNNER = typer.testing.CliRunner()
 
 GOOD_JSON = (
-    '{"audit_pnl_version":1,"runs":2,"paper":{"fills":0,"net_usd":"0.0"},'
-    '"strategies":[{"strategy_id":0,"label":"latency-arb"}],'
+    '{"audit_pnl_version":2,"runs":2,"paper":{"fills":0,"net_usd":"0.0"},'
+    '"strategies":[{"strategy_id":0,"label":"latency-arb","origin":1}],'
     '"vm_by_ruleset":[],"vm_orders_no_hash":0}'
 )
 NOW_MS = 1_787_500_000_000  # fixed test clock
@@ -68,20 +69,20 @@ def test_run_once_writes_the_report_pair(tmp_path):
     day = day_of(NOW_MS)
     json_path = reports / f"pnl-{day}.json"
     summary_path = reports / f"pnl-{day}.summary.txt"
-    assert json.loads(json_path.read_text())["audit_pnl_version"] == 1
+    assert json.loads(json_path.read_text())["audit_pnl_version"] == 2
     assert summary_path.read_text() == "audit-pnl: summary line\n"
     assert any("strategies=1" in l and "runs=2" in l for l in lines)
 
 
 RUN_JSON = (
-    '{"audit_pnl_version":1,"runs":1,"window":{"wall_first_ns":%d,"wall_last_ns":%d,"utc_days":1},'
+    '{"audit_pnl_version":2,"runs":1,"window":{"wall_first_ns":%d,"wall_last_ns":%d,"utc_days":1},'
     '"paper":{"fills":0,"net_usd":"0.0"},'
-    '"strategies":[{"strategy_id":6,"label":"icdp","orders":%d,"fills":%d,"trades":%d,'
+    '"strategies":[{"strategy_id":6,"label":"icdp","origin":1,"orders":%d,"fills":%d,"trades":%d,'
     '"trading_days":1,"net_usd":"%s","realized_usd":"0.0","fees_usd":"0.01",'
     '"markout_usd":"0.0","max_drawdown_usd":"%s","canceled_end":0,"rejected_caps":0,'
     '"unroutable":0,"ioc_fills":%d,"ioc_canceled":1,"ttl_expired":0,'
     '"fee_ladder_net_usd":["1.0","0.5","0.0"],"per_day_net_usd":[{"day":0,"net_usd":"%s"}]}],'
-    '"vm_by_ruleset":[{"hash128":"ab","orders":2,"trades":1,"net_usd":"0.25","max_drawdown_usd":"0.5"}],'
+    '"vm_by_ruleset":[{"hash128":"ab","origin":1,"orders":2,"trades":1,"net_usd":"0.25","max_drawdown_usd":"0.5"}],'
     '"vm_orders_no_hash":0}'
 )
 
@@ -124,7 +125,7 @@ def test_day_mode_audits_each_run_of_the_closed_day_with_the_fee_tier_and_merges
     assert rc == 0, lines
     assert [pathlib.Path(a[3]).name for a in seen] == [f"run-{e}" for e in runs]
     obj = json.loads((tmp_path / "reports" / f"pnl-{day}.json").read_text())
-    assert obj["audit_pnl_version"] == 1 and obj["day"] == day and obj["runs"] == 2
+    assert obj["audit_pnl_version"] == 2 and obj["day"] == day and obj["runs"] == 2
     assert obj["failed_runs"] == [f"run-{runs[1]}"]
     row = obj["strategies"][0]
     assert row["strategy_id"] == 6 and row["label"] == "icdp" and row["runs"] == 2
@@ -132,7 +133,7 @@ def test_day_mode_audits_each_run_of_the_closed_day_with_the_fee_tier_and_merges
     assert row["net_usd"] == "3.000000" and row["fees_usd"] == "0.020000"
     assert row["max_drawdown_usd"] == "0.750000", "worst single run, not a sum"
     assert row["fee_ladder_net_usd"] == ["2.000000", "1.000000", "0.000000"]
-    assert obj["vm_by_ruleset"] == [{"hash128": "ab", "orders": 4, "trades": 2, "net_usd": "0.500000", "max_drawdown_usd": "0.500000"}]
+    assert obj["vm_by_ruleset"] == [{"hash128": "ab", "origin": 1, "accounting": "PAPER", "orders": 4, "trades": 2, "net_usd": "0.500000", "max_drawdown_usd": "0.500000"}]
     assert obj["window"]["wall_first_ns"] == runs[0] and obj["window"]["wall_last_ns"] == runs[2] + 10
     assert len(obj["runs_detail"]) == 2
     summary = (tmp_path / "reports" / f"pnl-{day}.summary.txt").read_text()
@@ -159,8 +160,10 @@ def _regime_section(mode: str, fast_words: list[tuple[str, str, int, list[dict]]
     }
 
 
-def _regime_row(sid: int, label: str, fills: int, net: str, ladder: list[str]) -> dict:
-    return {"strategy_id": sid, "label": label, "orders": fills * 2, "fills": fills, "trades": fills // 2,
+def _regime_row(sid: int, label: str, fills: int, net: str, ladder: list[str],
+                origin: int = claude_worker.fill_origin.PAPER) -> dict:
+    return {"strategy_id": sid, "label": label, "origin": origin,
+            "orders": fills * 2, "fills": fills, "trades": fills // 2,
             "net_usd": net, "fee_ladder_net_usd": ladder}
 
 
@@ -187,7 +190,8 @@ def test_merge_folds_the_per_regime_section_across_runs_and_tolerates_pre_rg3_re
     fast = reg["profiles"][0]["words"]
     assert [(w["word"], w["minutes"]) for w in fast] == [("trend=bull shape=trend", 110), ("trend=bear shape=chop", 30)]
     vm_bull = fast[0]["strategies"]
-    assert vm_bull == [{"strategy_id": 5, "label": "vm", "orders": 12, "fills": 6, "trades": 3,
+    assert vm_bull == [{"strategy_id": 5, "origin": 1, "accounting": "PAPER",
+                        "label": "vm", "orders": 12, "fills": 6, "trades": 3,
                         "net_usd": "2.000000", "fee_ladder_net_usd": ["3.000000", "1.500000", "0.500000"]}]
     assert [s["strategy_id"] for s in fast[1]["strategies"]] == [5, 6]
     assert reg["profiles"][1]["words"] == []
@@ -292,7 +296,7 @@ def test_run_once_fails_loudly_on_nonzero_exit(tmp_path):
 
 
 def test_run_once_refuses_empty_or_bad_or_wrong_version_stdout(tmp_path):
-    for out in ("", "not json", '{"audit_pnl_version":2}'):
+    for out in ("", "not json", '{"audit_pnl_version":1}'):
         rc, _, reports = run_once(tmp_path, lambda argv, o=out: (0, o, ""))
         assert rc == 1
         assert not (reports / f"pnl-{day_of(NOW_MS)}.json").exists()
@@ -393,7 +397,7 @@ def test_real_binary_end_to_end(tmp_path):
     assert rc == 0
     body = (tmp_path / "reports" / f"pnl-{day_of(NOW_MS)}.json").read_text()
     obj = json.loads(body)
-    assert obj["audit_pnl_version"] == 1
+    assert obj["audit_pnl_version"] == 2
     assert obj["strategies"][0]["strategy_id"] == 0
     assert obj["strategies"][0]["fills"] == 1
 
@@ -402,10 +406,10 @@ def test_latest_report_regimes_reads_the_merged_profiles(tmp_path):
     reports = tmp_path / "reports"
     assert claude_worker.pnl_report.latest_report_regimes(reports) == []
     reports.mkdir()
-    (reports / "pnl-2026-09-04.json").write_text('{"audit_pnl_version":1}\n')
+    (reports / "pnl-2026-09-04.json").write_text('{"audit_pnl_version":2}\n')
     assert claude_worker.pnl_report.latest_report_regimes(reports) == [], "pre-RG5 report: no section"
     (reports / "pnl-2026-09-05.json").write_text(
-        json.dumps({"audit_pnl_version": 1, "regime": {"profiles": [{"profile": "fast", "words": []}, "junk"]}})
+        json.dumps({"audit_pnl_version": 2, "regime": {"profiles": [{"profile": "fast", "words": []}, "junk"]}})
     )
     assert claude_worker.pnl_report.latest_report_regimes(reports) == [{"profile": "fast", "words": []}]
     (reports / "pnl-2026-09-06.json").write_text("{not json")
@@ -556,3 +560,127 @@ def test_an_undigested_count_is_carried_so_the_check_is_not_claimed_clean() -> N
     merged = claude_worker.pnl_report.merge_reports("2026-09-13", [("a", unit)])
     assert merged["binary_fills"]["undigested"] == 7
 
+
+def _srow(sid: int, origin: int, net: str) -> dict:
+    return {
+        "strategy_id": sid, "label": "bin15", "origin": origin,
+        "orders": 4, "fills": 2, "trades": 2, "net_usd": net,
+        "realized_usd": net, "fees_usd": "0.0", "markout_usd": "0.0",
+        "max_drawdown_usd": "0.0", "canceled_end": 0, "rejected_caps": 0,
+        "unroutable": 0, "ioc_fills": 0, "ioc_canceled": 0,
+        "ttl_expired": 0, "opt_settled": 0,
+        "fee_ladder_net_usd": ["0.0", "0.0", "0.0"],
+    }
+
+
+def _rep(rows: list[dict]) -> dict:
+    return {"audit_pnl_version": 1, "runs": 1,
+            "paper": {"fills": 0, "net_usd": "0.0"},
+            "strategies": rows, "vm_by_ruleset": [], "vm_orders_no_hash": 0}
+
+
+def test_two_accountings_never_merge_into_one_strategy_row() -> None:
+    """§6.4, enforced in the MERGE KEY rather than asked of a caller.
+
+    A PAPER number and a VENUE number are two facts about one strategy.
+    Keyed on the strategy id alone they would sum, and the result would
+    look exactly like every other row in the report — which is what
+    makes a mixed total dangerous rather than merely wrong."""
+    paper = _rep([_srow(3, claude_worker.fill_origin.PAPER, "10.0")])
+    venue = _rep([_srow(3, claude_worker.fill_origin.VENUE, "-4.0")])
+    merged = claude_worker.pnl_report.merge_reports(
+        "2026-09-16", [("a", paper), ("b", venue)]
+    )
+    rows = [r for r in merged["strategies"] if int(r["strategy_id"]) == 3]
+    assert len(rows) == 2, "one row per accounting, never a sum"
+    by = {r["accounting"]: r for r in rows}
+    assert set(by) == {"PAPER", "VENUE"}
+    assert float(by["PAPER"]["net_usd"]) == 10.0
+    assert float(by["VENUE"]["net_usd"]) == -4.0
+    # The combined number §6.4 forbids appears nowhere.
+    assert not any(abs(float(r["net_usd"]) - 6.0) < 1e-9 for r in rows)
+
+    # Same accounting across two runs still sums, exactly as before.
+    both = claude_worker.pnl_report.merge_reports(
+        "2026-09-16", [("a", paper), ("b", paper)]
+    )
+    only = [r for r in both["strategies"] if int(r["strategy_id"]) == 3]
+    assert len(only) == 1 and float(only[0]["net_usd"]) == 20.0
+
+
+def test_a_report_without_an_origin_is_refused_not_defaulted() -> None:
+    """`audit-pnl` and `bartest` both stamp it. A report without it came
+    from a binary predating §6.4, and defaulting it would make the
+    nightly line claim an accounting it never measured."""
+    row = _srow(3, claude_worker.fill_origin.PAPER, "1.0")
+    del row["origin"]
+    with pytest.raises(ValueError, match="predates"):
+        claude_worker.pnl_report.merge_reports("2026-09-16", [("a", _rep([row]))])
+
+
+def test_the_nightly_line_says_which_accounting_it_is() -> None:
+    """The lane's reading law: never quote a BIN15 dollar figure without
+    saying PAPER or VENUE. The word sits between the label and the
+    numbers so that quoting a figure off this line without it takes
+    effort."""
+    merged = claude_worker.pnl_report.merge_reports(
+        "2026-09-16",
+        [("a", _rep([_srow(3, claude_worker.fill_origin.PAPER, "10.0"),
+                     _srow(3, claude_worker.fill_origin.VENUE, "-4.0")]))],
+    )
+    lines = [
+        f"strategy {r['strategy_id']} ({r['label']}) {r['accounting']}: net={r['net_usd']}"
+        for r in merged["strategies"]
+    ]
+    assert any(l.startswith("strategy 3 (bin15) PAPER:") for l in lines), lines
+    assert any(l.startswith("strategy 3 (bin15) VENUE:") for l in lines), lines
+
+
+def test_the_per_regime_pnl_splits_by_accounting_too() -> None:
+    """The gap the last review found: `merge_reports` was split and
+    `_merge_regime` was not — the SAME dollars, broken down by regime
+    word instead of merged flat, two functions away in the same file and
+    rendered into the same document. For the slot that arms first."""
+    word = ("trend=bull shape=trend", "0000000000000104", 60, [
+        _regime_row(3, "bin15", 4, "10.0", ["0.0", "0.0", "0.0"],
+                    origin=claude_worker.fill_origin.PAPER),
+        _regime_row(3, "bin15", 4, "-4.0", ["0.0", "0.0", "0.0"],
+                    origin=claude_worker.fill_origin.VENUE),
+    ])
+    base = json.loads(_day_run_json(1, 4, "1.5", "0.75"))
+    merged = claude_worker.pnl_report.merge_reports(
+        "2026-09-16", [("run-1", {**base, "regime": _regime_section("artifact", [word])})]
+    )
+    rows = merged["regime"]["profiles"][0]["words"][0]["strategies"]
+    rows3 = [r for r in rows if r["strategy_id"] == 3]
+    assert len(rows3) == 2, "one row per accounting, never a sum"
+    by = {r["accounting"]: r for r in rows3}
+    assert float(by["PAPER"]["net_usd"]) == 10.0
+    assert float(by["VENUE"]["net_usd"]) == -4.0
+    assert not any(abs(float(r["net_usd"]) - 6.0) < 1e-9 for r in rows3)
+
+
+def test_the_ruleset_rollup_splits_by_accounting_too() -> None:
+    """`vm_by_ruleset` is dollars merged by ruleset hash across runs.
+    Before the producer stamped the byte a caller could not have split
+    these even if it wanted to."""
+    base = json.loads(_day_run_json(1, 4, "1.5", "0.75"))
+    paper = {**base, "vm_by_ruleset": [
+        {"hash128": "ab", "origin": 1, "orders": 2, "trades": 1,
+         "net_usd": "1.0", "max_drawdown_usd": "0.0"}]}
+    venue = {**base, "vm_by_ruleset": [
+        {"hash128": "ab", "origin": 0, "orders": 2, "trades": 1,
+         "net_usd": "-0.5", "max_drawdown_usd": "0.0"}]}
+    merged = claude_worker.pnl_report.merge_reports(
+        "2026-09-16", [("a", paper), ("b", venue)])
+    rows = merged["vm_by_ruleset"]
+    assert len(rows) == 2, "one row per accounting"
+    by = {r["accounting"]: r for r in rows}
+    assert float(by["PAPER"]["net_usd"]) == 1.0
+    assert float(by["VENUE"]["net_usd"]) == -0.5
+
+    row = dict(paper["vm_by_ruleset"][0])
+    del row["origin"]
+    with pytest.raises(ValueError, match="predates"):
+        claude_worker.pnl_report.merge_reports(
+            "2026-09-16", [("a", {**base, "vm_by_ruleset": [row]})])

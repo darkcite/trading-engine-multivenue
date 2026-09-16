@@ -177,10 +177,23 @@ fn golden_modeled_fill_attribution_and_markout() {
         &[order(2_000, 42, Side::Bid, 500_000, 10_000_000, 7, 0)],
     );
     let (json, lines) = run_report(&root);
-    assert!(json.contains("\"audit_pnl_version\":1"));
+    // 2 since §6.4: `origin` is required on every strategy and
+    // ruleset row, not tolerated when absent like `regime` and
+    // `binary_fills` were, so the version has to say so.
+    assert!(json.contains("\"audit_pnl_version\":2"));
+    // §6.4: the accounting word rides between the label and the
+    // numbers, so a consumer cannot read a figure off this row without
+    // also reading which accounting produced it. `audit-pnl` REPLAYS,
+    // so it is always PAPER here — pinned because the Python reader
+    // (`claude_worker.pnl_report`) now REFUSES a row without it, and
+    // this string is the only thing connecting the two.
     assert!(json.contains(
-        "\"strategy_id\":0,\"label\":\"latency-arb\",\"orders\":1,\"fills\":1,\"trades\":1"
+        "\"strategy_id\":0,\"label\":\"latency-arb\",\"origin\":1,\"orders\":1,\"fills\":1,\"trades\":1"
     ));
+    assert!(
+        !json.contains("\"origin\":0"),
+        "a replay cannot produce a VENUE row: {json}"
+    );
     assert!(json.contains("\"net_usd\":\"1.0\""), "json: {json}");
     // Per-sym human row carries the DESCRIPTOR, never the bare sym.
     assert!(lines.iter().any(|l| l.contains("PMTOK: fills=1")));
@@ -317,7 +330,7 @@ fn stale_tick_neither_fills_nor_marks_in_audit_pnl_and_is_reported() {
     );
     let (json, lines) = run_report(&root);
     assert!(
-        json.contains("\"strategy_id\":0,\"label\":\"latency-arb\",\"orders\":1,\"fills\":0,"),
+        json.contains("\"strategy_id\":0,\"label\":\"latency-arb\",\"origin\":1,\"orders\":1,\"fills\":0,"),
         "json: {json}"
     );
     assert!(
@@ -367,10 +380,10 @@ fn vm_hash_timeline_buckets_orders_after_commit_only() {
         ],
     );
     let (json, _lines) = run_report(&root);
-    assert!(json.contains("\"strategy_id\":5,\"label\":\"vm\",\"orders\":2"));
+    assert!(json.contains("\"strategy_id\":5,\"label\":\"vm\",\"origin\":1,\"orders\":2"));
     let hex = "ab".repeat(16);
     assert!(
-        json.contains(&format!("\"hash128\":\"{hex}\",\"orders\":1")),
+        json.contains(&format!("\"hash128\":\"{hex}\",\"origin\":1,\"orders\":1")),
         "json: {json}"
     );
     assert!(json.contains("\"vm_orders_no_hash\":1"));
@@ -850,7 +863,7 @@ fn a_binary_held_through_expiry_settles_at_the_payout_not_the_last_book() {
     // The P&L: 100 contracts at 0.40 settling at 1.0 = +$60. A
     // mark-out against that last 0.21 mid would have been −$19.
     assert!(
-        json.contains("\"strategy_id\":3,\"label\":\"bin15\",\"orders\":1,\"fills\":1"),
+        json.contains("\"strategy_id\":3,\"label\":\"bin15\",\"origin\":1,\"orders\":1,\"fills\":1"),
         "json: {json}"
     );
     assert!(json.contains("\"net_usd\":\"60.0\""), "json: {json}");

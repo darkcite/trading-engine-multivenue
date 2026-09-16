@@ -1221,6 +1221,80 @@ Two venue constraints fell out of it:
   (see the BIN15 intraday note). Measured, per plan §6.5 — not read
   from a doc.
 
+### PAPER and VENUE are two numbers, never one
+
+Plan §6.4. The moment one fill carries `origin = VENUE`, every reader of
+`strategy 3 (bin15) net=` is reading a number whose meaning changed
+underneath it. A total that mixes a modelled fill with a real one is not
+approximately right — it is meaningless, because the two answer
+different questions and nothing in the figure says which.
+
+`Fill.origin` is the byte (`core_types::FILL_ORIGIN_VENUE` = 0,
+`FILL_ORIGIN_PAPER` = 1; `claude_worker.fill_origin` is the one Python
+mirror of those two integers). The split is enforced in three places,
+and in each of them it is **structural rather than a discipline asked of
+a caller**:
+
+- **The merge key.** `bin15_accrue.merge_entries` dedupes by
+  `(outcome, origin)`, not by `outcome`. One instance can legitimately
+  carry a PAPER entry — what the model would have done, from a replay of
+  that day — and a VENUE entry, what the account actually did. Two facts
+  about one market. Keyed on the outcome alone, whichever merged second
+  would silently replace the other.
+  `pnl_report.merge_reports` does the same with `(strategy_id, origin)`.
+- **The renderer refuses.** `bin15_accrue.render` raises on a mixed
+  sequence rather than averaging it. Every figure it produces — hit
+  rate, cost, payout, the Wilson interval — is a sum over what it was
+  handed, and a modelled fill averaged with a real one produces a number
+  that looks exactly like the ones that are true. `by_origin` is how a
+  caller splits a store; the report prints one block per accounting,
+  headed by the word.
+- **The nightly line carries the word.** `strategy 3 (bin15) PAPER
+  net=…` and `strategy 3 (bin15) VENUE net=…`, one line per accounting.
+  **There is no combined line**, because the combined number is the one
+  §6.4 forbids. This breaks any reader matching the old exact shape,
+  deliberately.
+- **Every OTHER dollar aggregation in the same file, too.** The first
+  version of this split fixed `merge_reports` and left two neighbours
+  summing the same dollars: `_merge_regime` (the §5.1 per-regime P&L —
+  the same figures broken down by regime word instead of merged flat)
+  and `vm_by_ruleset` (merged by ruleset hash across runs). Both now key
+  on `(…, origin)` and both producers stamp the byte. Worth recording
+  *how* that was missed: `bin15_accrue` got a GUARD as well as a split
+  key, and a guard fails loudly wherever it is reached, while a key only
+  protects the dictionary it is the key of. Counting aggregations is not
+  optional when the protection is structural.
+
+**Producers stamp; readers refuse.** `Bin15EntryRow::origin`, the
+`audit-pnl` strategy row and `bartest.to_audit_pnl` all write the byte
+explicitly, and all three are `PAPER` today for the same reason: a
+REPLAY models every fill, so there is no venue number in them and there
+never can be. That is precisely why it is written down. A reader that
+DEFAULTED an absent field would inherit "paper" in silence on the first
+live day — so `entries_from_sidecar` and `merge_reports` both raise on a
+missing `origin` and name the fix (rebuild the binary). The failure mode
+being designed against is not a wrong number; it is a right-looking one.
+
+**`audit_pnl_version` moved to 2, and the reason is not "the shape
+changed".** `regime` and `binary_fills` both rode at version 1 because
+they are emitted CONDITIONALLY and tolerated when absent. `origin` is
+unconditional and the reader REFUSES a row without it, so a v1 document
+would pass the version gate and fail several frames deeper with a
+different error — a version field sitting directly in front of a shape
+change, saying nothing. Archived nightly JSONs embed raw per-run objects
+(`runs_detail`), so both shapes exist on disk under the old number.
+
+**The store migrates rather than restarts.** An 11-column entries row
+predates the split and reads as PAPER — not as a default, but because
+the harness models every fill and no live path had written there when
+those rows were produced. 11 and 12 are the only widths accepted; a
+reader that guesses at a column count produces a number nobody can
+defend.
+
+**The lane's reading law extends**: never quote a BIN15 dollar figure
+without saying which accounting it is, without the window t-stat, and
+from now on without saying **PAPER or VENUE**.
+
 ### Reconciliation — the one check that believes nothing
 
 §6.2 calls this "the single most valuable safety net in the plan", and

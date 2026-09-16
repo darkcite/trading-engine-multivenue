@@ -419,6 +419,17 @@ struct Bin15EntryRow {
     px_1e6: i64,
     qty_1e6: i64,
     p_hat_1e6: i64,
+    /// Which ACCOUNTING this entry belongs to —
+    /// [`core_types::FILL_ORIGIN_PAPER`] or
+    /// [`core_types::FILL_ORIGIN_VENUE`] (plan §6.4).
+    ///
+    /// Stamped here rather than defaulted by the reader. The harness
+    /// MODELS every fill, so a replay cannot produce a venue entry and
+    /// this is always `PAPER` today — which is exactly why it has to be
+    /// written down. A reader that defaults an absent field inherits
+    /// "paper" silently on the first day a live path feeds this store,
+    /// and a mixed total is the one number §6.4 calls meaningless.
+    origin: u8,
 }
 
 /// The `bin15_entries` block of the detail sidecar.
@@ -439,7 +450,7 @@ fn render_bin15_entries(
         s.push_str(&format!(
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
              \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
-             \"qty_1e6\":{},\"p_hat_1e6\":{},\"y\":{}}}",
+             \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -450,6 +461,7 @@ fn render_bin15_entries(
             r.px_1e6,
             r.qty_1e6,
             r.p_hat_1e6,
+            r.origin,
             y
         ));
     }
@@ -1057,6 +1069,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                                     px_1e6: fam.pend_take.px_1e6,
                                     qty_1e6: fam.pend_take.qty_1e6,
                                     p_hat_1e6: fam.p_hat_1e6,
+                                    // A REPLAY models its fills. There
+                                    // is no venue here and there never
+                                    // can be, so this is a fact about
+                                    // the harness, not a default.
+                                    origin: core_types::FILL_ORIGIN_PAPER,
                                 });
                             }
                             cov_ref[f] = fam.covered;
@@ -1428,5 +1445,43 @@ mod tests {
         // fallback variant by construction.
         assert!(MemberKind::parse("VRP").is_none());
         assert!(MemberKind::parse("cross-arb").is_none());
+    }
+    /// **The `origin` stamp, exercised rather than asserted.** The
+    /// whole `bin15_entries` block had no test at all, so "the harness
+    /// stamps PAPER" was a claim about source code — and the reader on
+    /// the other side (`claude_worker.bin15_accrue`) now REFUSES a row
+    /// without it, which makes this the wire between two crates that
+    /// cannot see each other.
+    #[test]
+    fn a_replay_entry_is_stamped_paper_in_the_sidecar() {
+        let row = Bin15EntryRow {
+            ts_ns: 1_000,
+            family: 0,
+            outcome: 7,
+            start_ns: 100,
+            expiry_ns: 900_000_000_100,
+            is_yes: 1,
+            px_1e6: 640_000,
+            qty_1e6: 78_000_000,
+            p_hat_1e6: 700_000,
+            origin: core_types::FILL_ORIGIN_PAPER,
+        };
+        let mut y = BTreeMap::new();
+        y.insert(7u32, 1_000_000i64);
+        let s = render_bin15_entries(&[row], &y);
+
+        assert!(s.contains("\"origin\":1"), "{s}");
+        assert!(s.contains("\"y\":1000000"), "{s}");
+        // PAPER is 1 and VENUE is 0 — pinned here because the Python
+        // reader mirrors those two integers and nothing else connects
+        // them.
+        assert_eq!(core_types::FILL_ORIGIN_PAPER, 1);
+        assert_eq!(core_types::FILL_ORIGIN_VENUE, 0);
+
+        // An unsettled row still carries the stamp: `y` being null is
+        // about the payout, never about which accounting it belongs to.
+        let s2 = render_bin15_entries(&[row], &BTreeMap::new());
+        assert!(s2.contains("\"origin\":1"), "{s2}");
+        assert!(s2.contains("\"y\":null"), "{s2}");
     }
 }

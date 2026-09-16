@@ -104,8 +104,19 @@ use crate::options_manifest::{INSTRUMENT_MANIFEST_FILE, OPTIONS_MANIFEST_FILE};
 
 /// Report schema version (stdout JSON `audit_pnl_version`). RG3 added
 /// the `regime` section ADDITIVELY — every pre-RG3 key is unchanged, so
-/// the version stays 1 (the nightly merge reads by key).
-pub const AUDIT_PNL_VERSION: u32 = 1;
+/// the version stayed 1 (the nightly merge reads by key).
+///
+/// **2 since plan §6.4**, and the distinction is the reason. `regime`
+/// and `binary_fills` are emitted CONDITIONALLY and tolerated when
+/// absent, which is what let them ride at version 1. `origin` is on
+/// every strategy and ruleset row unconditionally, and the reader
+/// (`claude_worker.pnl_report`) REFUSES a row without it. A version
+/// field whose job is to say "this shape changed" must not sit in front
+/// of a shape change saying nothing — a v1 document would otherwise
+/// pass the version gate and fail several frames deeper with a
+/// different error. Archived nightly JSONs embed raw per-run objects,
+/// so both shapes exist on disk under the old number.
+pub const AUDIT_PNL_VERSION: u32 = 2;
 
 /// `Order.strategy_id` display names (strategy-set slot order; the
 /// wire slots are pinned in core-types / strategy-set).
@@ -1776,7 +1787,8 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         }
         let o = &row.outcome;
         json.push_str(&format!(
-            "{{\"strategy_id\":{sid},\"label\":\"{}\",\"orders\":{},\"fills\":{},\"trades\":{},\
+            "{{\"strategy_id\":{sid},\"label\":\"{}\",\"origin\":{},\"orders\":{},\"fills\":{},\
+             \"trades\":{},\
              \"trading_days\":{},\"net_usd\":\"{}\",\"realized_usd\":\"{}\",\"fees_usd\":\"{}\",\
              \"markout_usd\":\"{}\",\"max_drawdown_usd\":\"{}\",\"canceled_end\":{},\
              \"rejected_caps\":{},\"unroutable\":{},\"ioc_fills\":{},\"ioc_canceled\":{},\
@@ -1784,6 +1796,14 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
              \"fee_ladder_net_usd\":[\"{}\",\"{}\",\"{}\"],\
              \"per_day_net_usd\":[",
             row.label,
+            // Which ACCOUNTING this row is (plan §6.4). `audit-pnl`
+            // REPLAYS: every fill it counts was modelled by the
+            // harness's own matcher, so there is no venue number here
+            // and there never can be. Stamped rather than left for the
+            // reader to default, because a nightly line that inherits
+            // "paper" in silence on the first live day is exactly the
+            // mixed total §6.4 calls meaningless.
+            core_types::FILL_ORIGIN_PAPER,
             o.orders_is + o.orders_oos,
             o.fills_total,
             o.oos_trades,
@@ -1821,8 +1841,13 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             json.push(',');
         }
         json.push_str(&format!(
-            "{{\"hash128\":\"{hex}\",\"orders\":{},\"trades\":{},\"net_usd\":\"{}\",\
+            "{{\"hash128\":\"{hex}\",\"origin\":{},\"orders\":{},\"trades\":{},\
+             \"net_usd\":\"{}\",\
              \"max_drawdown_usd\":\"{}\"}}",
+            // §6.4 again: dollars, merged by hash across runs. Without
+            // the byte a caller could not split these even if it
+            // wanted to.
+            core_types::FILL_ORIGIN_PAPER,
             o.orders_is + o.orders_oos,
             o.oos_trades,
             fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_1e12)),
@@ -1892,9 +1917,17 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 }
                 first = false;
                 json.push_str(&format!(
-                    "{{\"strategy_id\":{sid},\"label\":\"{}\",\"orders\":{orders},\"fills\":{},\
+                    "{{\"strategy_id\":{sid},\"label\":\"{}\",\"origin\":{},\
+                     \"orders\":{orders},\"fills\":{},\
                      \"trades\":{},\"net_usd\":\"{}\",\"fee_ladder_net_usd\":[\"{}\",\"{}\",\"{}\"]}}",
                     strategy_label(*sid),
+                    // §6.4 — the SAME dollars as the top-level rows,
+                    // broken down by regime word instead of merged
+                    // flat. A split that stopped at the top level
+                    // would leave this one summing a modelled fill
+                    // with a real one, in the same document, for the
+                    // slot that arms first.
+                    core_types::FILL_ORIGIN_PAPER,
                     o.fills_total,
                     o.oos_trades,
                     fmt_usd_1e6(usd_1e12_to_1e6_floor(o.oos_net_1e12)),

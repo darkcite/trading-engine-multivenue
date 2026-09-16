@@ -176,7 +176,7 @@ def test_disabled_report_has_no_data_source_key(tmp_path: pathlib.Path) -> None:
     lines: list[str] = []
 
     def fake_run(argv: list[str]) -> tuple[int, str, str]:
-        return 0, json.dumps({"audit_pnl_version": 1}), ""
+        return 0, json.dumps({"audit_pnl_version": 2}), ""
 
     claude_worker.pnl_report.run_day(
         logs, reports, "2026-09-01", lines.append, run_fn=fake_run
@@ -200,7 +200,7 @@ def test_report_data_source_block_matches_where(tmp_path: pathlib.Path) -> None:
     lines: list[str] = []
 
     def fake_run(argv: list[str]) -> tuple[int, str, str]:
-        return 0, json.dumps({"audit_pnl_version": 1}), ""
+        return 0, json.dumps({"audit_pnl_version": 2}), ""
 
     claude_worker.pnl_report.run_day(
         logs, reports, day, lines.append, run_fn=fake_run, source=source
@@ -225,7 +225,7 @@ def test_report_still_carries_every_pre_existing_key(tmp_path: pathlib.Path) -> 
     reports = tmp_path / "reports"
 
     def fake_run(argv: list[str]) -> tuple[int, str, str]:
-        return 0, json.dumps({"audit_pnl_version": 1}), ""
+        return 0, json.dumps({"audit_pnl_version": 2}), ""
 
     claude_worker.pnl_report.run_day(
         logs, reports, day, lambda _s: None, run_fn=fake_run, source=source
@@ -245,7 +245,7 @@ def test_report_still_carries_every_pre_existing_key(tmp_path: pathlib.Path) -> 
         "fee_flags",
     ):
         assert key in body, key
-    assert body["audit_pnl_version"] == 1
+    assert body["audit_pnl_version"] == 2
 
 
 def test_list_row_shape_is_what_the_agent_reads(tmp_path: pathlib.Path) -> None:
