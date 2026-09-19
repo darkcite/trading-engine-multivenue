@@ -76,7 +76,7 @@
 use core_fill::{Touch, ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_time::{BarClock, NsTs};
 use core_types::{
-    AiCmdKind, Order, Price, Qty, Side, SymbolId, Tick, VenueId, SYMBOL_ID_NONE,
+    AiCmdKind, CancelReq, Order, Price, Qty, Side, SymbolId, Tick, VenueId, SYMBOL_ID_NONE,
 };
 use strategy_core::{
     Bin15Counters, Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr,
@@ -236,7 +236,27 @@ pub struct PendingLeg {
     pub side: u8,
     /// Explicit padding — always zero.
     pub _pad: [u8; 6],
+    /// **E5: the client id this leg carried BEFORE its last modify**,
+    /// or 0 if it has never moved.
+    ///
+    /// ONE generation, deliberately. A reprice is a MODIFY that gives
+    /// the replacement a fresh cloid (ruling O-E5b), so a fill the
+    /// venue was already answering under the old id arrives after the
+    /// member has stopped listening for it — and lands in
+    /// `unknown_fills`, moving no position, leaving the member
+    /// believing it holds less than it does. That is the F7 shape
+    /// again: absence read as evidence.
+    ///
+    /// One generation and not a list, because the window is one
+    /// round trip: a second reprice means the first replacement was
+    /// itself acknowledged, so anything still outstanding under the
+    /// id before THAT is a venue that has lost two messages, which is
+    /// a reconciliation problem and not a bookkeeping one.
+    pub prev_oid: u64,
 }
+
+// One cache line, so the family's scan touches one line per leg.
+const _: () = assert!(::core::mem::size_of::<PendingLeg>() == 64);
 
 impl PendingLeg {
     /// Whether this slot holds a live order.
@@ -1233,11 +1253,28 @@ impl Bin15Strategy {
     /// Room left under both notional caps ×1e6, at `px_1e6` per
     /// contract. `0` = no room.
     fn cap_room_1e6(&self, idx: usize, px_1e6: i64) -> i64 {
+        self.cap_room_excluding_1e6(idx, px_1e6, 0)
+    }
+
+    /// The same room, with `exclude_1e6` of already-booked notional
+    /// treated as free.
+    ///
+    /// **E5.** A MODIFY replaces a resting quote whose reservation is
+    /// still standing, so sizing the replacement against the caps as
+    /// they are would refuse room the quote itself is holding — a
+    /// reprice would shrink every time until it hit zero. The
+    /// exclusion is only ever the leg being replaced, and the
+    /// booking is corrected (credit the old, book the new) after the
+    /// venue takes the modify, never before: crediting first and then
+    /// being refused would free room for an order that is still
+    /// resting.
+    fn cap_room_excluding_1e6(&self, idx: usize, px_1e6: i64, exclude_1e6: i64) -> i64 {
         if px_1e6 <= 0 {
             return 0;
         }
-        let inst = self.params.cap_instance_usd_1e6 - self.fam[idx].notional_instance_1e6;
-        let day = self.params.cap_day_usd_1e6 - self.day_notional_1e6;
+        let inst = self.params.cap_instance_usd_1e6
+            - (self.fam[idx].notional_instance_1e6 - exclude_1e6).max(0);
+        let day = self.params.cap_day_usd_1e6 - (self.day_notional_1e6 - exclude_1e6).max(0);
         let usd = inst.min(day);
         if usd <= 0 {
             return 0;
@@ -1247,6 +1284,49 @@ impl Bin15Strategy {
         let qty = (usd as i128 * 1_000_000) / px_1e6 as i128;
         let qty = i64::try_from(qty).unwrap_or(i64::MAX);
         qty - qty.rem_euclid(GRID_LOT_1E6)
+    }
+
+    /// Yes contracts ×1e6 a resting ASK may offer.
+    ///
+    /// The short rule. BIN15 P4b (F3): the mirror of the closing
+    /// take's reservation — an in-flight closing SELL has already
+    /// committed part of the holding, so the resting ask may only
+    /// offer what is left. A HIP-4 position cannot go negative and
+    /// the venue refuses the sell outright, so an ask larger than
+    /// this is an order that cannot execute live while the paper
+    /// matcher fills it happily.
+    fn ask_free_1e6(&self, idx: usize) -> i64 {
+        let in_flight = if self.fam[idx].pend_take.live()
+            && self.fam[idx].pend_take.is_yes == 1
+            && self.fam[idx].pend_take.side == Side::Ask as u8
+        {
+            (self.fam[idx].pend_take.qty_1e6 - self.fam[idx].pend_take.filled_1e6).max(0)
+        } else {
+            0
+        };
+        (self.fam[idx].pos_yes_1e6 - in_flight).max(0)
+    }
+
+    /// **E5: is the resting ASK offering more than we can prove we
+    /// hold?**
+    ///
+    /// A closing take commits part of the holding the moment it is
+    /// sent, so an ask that was correctly sized when it was placed
+    /// becomes oversized without the fair value moving at all.
+    /// Before E5 it rested that way until its TTL — a window in which
+    /// the live venue refuses any fill past the free amount while the
+    /// paper matcher takes it, which is one of the few places the
+    /// model is OPTIMISTIC against live. A MODIFY down to the free
+    /// amount closes it.
+    ///
+    /// Bid side: always false. A bid is bounded by the caps, and the
+    /// caps only move when the member itself books something.
+    fn ask_is_oversized(&self, idx: usize, side_idx: usize) -> bool {
+        if side_idx == 0 {
+            return false;
+        }
+        let leg = self.fam[idx].pend_quote[side_idx];
+        leg.live() && leg.qty_1e6.saturating_sub(leg.filled_1e6) > self.ask_free_1e6(idx)
     }
 
     /// Whether a price and size are on the venue's grid. The harness
@@ -1442,30 +1522,84 @@ impl Bin15Strategy {
         let mut side_idx = 0usize;
         while side_idx < QUOTE_SIDES {
             let is_bid = side_idx == 0;
-            // TWO gates, and both are load-bearing.
-            //
-            // The first is forced: this member has no cancel path
-            // (Stage-3), so a live quote can only be replaced by
-            // letting it expire. `requote_ttl_ns` is therefore the
-            // replace cadence, not a nicety.
-            //
-            // The second is the one that stops a re-quote loop. A
-            // quote that reached its TTL unfilled has just told us that
-            // price does not fill in this book; re-offering the SAME
-            // price a second later adds no information and would emit
-            // once per TTL forever. So after an expiry we quote again
-            // only when the fair value has actually moved by
-            // `requote_thr_1e6` (or when we have never quoted this
-            // side, where `last_quote_p` is 0 and the test passes).
-            if self.fam[idx].pend_quote[side_idx].live() {
-                side_idx += 1;
-                continue;
+            // **E5 (LAW E-8), the member's half.** The venue has no
+            // server-side TTL on a Gtc/Alo order, so a quote nobody
+            // cancels rests forever. Before E5 this member simply
+            // forgot a lapsed leg — correct against a paper matcher
+            // that runs its own TTL law, and a stranded quote live.
+            // The 1 s timer sweep is the backstop; this is the pass
+            // that usually gets there first, because it runs on every
+            // mark and every touch.
+            if self.fam[idx].pend_quote[side_idx].live()
+                && now >= self.fam[idx].pend_quote[side_idx].deadline_ns
+            {
+                self.cancel_quote(ctx, idx, side_idx, now);
             }
+            // ONE gate now, where there used to be two.
+            //
+            // The first used to be forced: with no cancel path a live
+            // quote could only be replaced by letting it expire, so
+            // `requote_ttl_ns` was the replace cadence rather than a
+            // nicety. **LAW E-7 lifts it** — a live quote moves with a
+            // MODIFY, one request, no round trip through nothing.
+            //
+            // The gate that remains is the one that stops a re-quote
+            // loop. A quote that reached its TTL unfilled has just
+            // told us that price does not fill in this book;
+            // re-offering the SAME price a second later adds no
+            // information and would emit once per TTL forever. So we
+            // quote — or move — only when the fair value has actually
+            // travelled `requote_thr_1e6` (or when we have never
+            // quoted this side, where `last_quote_p` is 0 and the test
+            // passes).
             let last = self.fam[idx].last_quote_p_1e6[side_idx];
-            if last != 0 && (centre - last).abs() < self.params.requote_thr_1e6 {
+            let moved = last == 0 || (centre - last).abs() >= self.params.requote_thr_1e6;
+            let live = self.fam[idx].pend_quote[side_idx].live();
+            if live && !moved && !self.ask_is_oversized(idx, side_idx) {
                 side_idx += 1;
                 continue;
             }
+            if !live && !moved {
+                side_idx += 1;
+                continue;
+            }
+            // **An oversized ask is never left resting.** Now that
+            // the member has a cancel verb, an ask offering inventory
+            // we cannot prove we hold must not survive to its TTL:
+            // the live venue refuses any fill past the free amount
+            // while the paper matcher takes it, which is the one
+            // direction of modelling error that matters. Where the
+            // replacement cannot be emitted — nothing free to offer,
+            // a size under the venue's lot or minimum notional, or a
+            // partial fill that makes a safe resize impossible — the
+            // quote is PULLED instead.
+            let oversized = live && self.ask_is_oversized(idx, side_idx);
+            // **A partially-filled quote is otherwise left alone.** A
+            // modify replaces the venue's remaining size wholesale, so
+            // moving one means the member's `filled_1e6`/`qty_1e6`
+            // pair and the venue's remainder have to agree across a
+            // race. That is where double-count bugs live, and a quote
+            // that is already working does not need the help — its TTL
+            // will end it.
+            if live && self.fam[idx].pend_quote[side_idx].filled_1e6 != 0 {
+                if oversized {
+                    self.cancel_quote(ctx, idx, side_idx, now);
+                } else {
+                    self.counters.skipped_partial =
+                        self.counters.skipped_partial.wrapping_add(1);
+                }
+                side_idx += 1;
+                continue;
+            }
+            // E5: a MODIFY replaces a reservation that is still
+            // standing, so the replacement must be sized against the
+            // caps with that reservation excluded — otherwise every
+            // reprice shrinks until it reaches zero.
+            let held = if live {
+                self.fam[idx].pend_quote[side_idx].booked_notional_1e6
+            } else {
+                0
+            };
             let px = if is_bid {
                 // Never cross the touch: a maker that crosses is a
                 // taker paying the spread it meant to earn.
@@ -1474,25 +1608,10 @@ impl Bin15Strategy {
                 price::ceil_grid_1e6(centre + h, GRID_TICK_1E6).max(yes.touch.ask_1e6)
             };
             let qty = if is_bid {
-                let room = self.cap_room_1e6(idx, px);
+                let room = self.cap_room_excluding_1e6(idx, px, held);
                 self.params.clip_qty_1e6.min(room)
             } else {
-                // The short rule. BIN15 P4b (F3): and the mirror of the
-                // closing take's reservation — an in-flight closing
-                // SELL has already committed part of the holding, so
-                // the resting ask may only offer what is left.
-                let in_flight = if self.fam[idx].pend_take.live()
-                    && self.fam[idx].pend_take.is_yes == 1
-                    && self.fam[idx].pend_take.side == Side::Ask as u8
-                {
-                    (self.fam[idx].pend_take.qty_1e6
-                        - self.fam[idx].pend_take.filled_1e6)
-                        .max(0)
-                } else {
-                    0
-                };
-                let free = (self.fam[idx].pos_yes_1e6 - in_flight).max(0);
-                self.params.clip_qty_1e6.min(free)
+                self.params.clip_qty_1e6.min(self.ask_free_1e6(idx))
             };
             if qty <= 0 {
                 if is_bid {
@@ -1501,11 +1620,26 @@ impl Bin15Strategy {
                     self.counters.skipped_inventory =
                         self.counters.skipped_inventory.wrapping_add(1);
                 }
+                if oversized {
+                    self.cancel_quote(ctx, idx, side_idx, now);
+                }
                 side_idx += 1;
                 continue;
             }
             let side = if is_bid { Side::Bid } else { Side::Ask };
-            self.emit_quote(ctx, idx, side_idx, side, px, qty, centre, now);
+            let prev_oid = if live {
+                self.fam[idx].pend_quote[side_idx].oid
+            } else {
+                0
+            };
+            if !self.emit_quote(ctx, idx, side_idx, side, px, qty, centre, now, prev_oid, held)
+                && oversized
+            {
+                // The replacement did not reach the venue — refused,
+                // or off the grid. The old ask is still there, still
+                // offering what we do not hold.
+                self.cancel_quote(ctx, idx, side_idx, now);
+            }
             side_idx += 1;
         }
     }
@@ -1635,6 +1769,8 @@ impl Bin15Strategy {
             notional
         };
         self.fam[idx].pend_take = PendingLeg {
+            // Arm A is an IoC and is never modified: it has no history.
+            prev_oid: 0,
             oid,
             deadline_ns: now.saturating_add(self.params.requote_ttl_ns),
             px_1e6,
@@ -1647,7 +1783,23 @@ impl Bin15Strategy {
         };
     }
 
-    /// Emit one Arm B resting quote.
+    /// Emit one Arm B resting quote — as a PLACE, or, when
+    /// `prev_oid != 0`, as the **MODIFY that moves one** (LAW E-7).
+    ///
+    /// `held` is the cap notional the order being replaced is still
+    /// reserving; it is credited back only after the venue takes the
+    /// modify, so a refusal leaves both the quote and its reservation
+    /// exactly where they were.
+    ///
+    /// **The deadline is NOT extended by a modify.** A reprice
+    /// inherits the original quote's `deadline_ns`, so an Arm B that
+    /// moved every 333 ms could not hold a quote past the TTL its
+    /// ruleset gave it. The dispatcher enforces the same rule on its
+    /// own open table; this is the member keeping its book agreeing
+    /// with it rather than trusting it.
+    ///
+    /// `true` iff the venue took it — the caller uses that to decide
+    /// whether an oversized ask it meant to shrink is still resting.
     #[allow(clippy::too_many_arguments)]
     fn emit_quote<C: Ctx>(
         &mut self,
@@ -1659,16 +1811,34 @@ impl Bin15Strategy {
         qty_1e6: i64,
         centre_1e6: i64,
         now: NsTs,
-    ) {
+        prev_oid: u64,
+        held: i64,
+    ) -> bool {
         let qty = qty_1e6 - qty_1e6.rem_euclid(GRID_LOT_1E6);
         if !Self::on_grid(px_1e6, qty) {
             self.counters.skipped_grid = self.counters.skipped_grid.wrapping_add(1);
-            return;
+            return false;
         }
         let sym = self.fam[idx].sym_yes;
         let oid = self.next_oid(idx, true);
-        if !self.submit(ctx, sym, side, ORDER_KIND_MAKER, px_1e6, qty, oid, now) {
-            return;
+        let moving = prev_oid != 0;
+        let old = self.fam[idx].pend_quote[side_idx];
+        // The caller's partial gate is what makes `held` (which sized
+        // this replacement) and the credit below the same number: with
+        // nothing filled, `credit_unfilled` returns the whole booked
+        // notional. Modifying a partially-filled leg would make the
+        // two disagree, so the gate is an invariant here, not a
+        // preference there.
+        debug_assert!(!moving || old.filled_1e6 == 0);
+        debug_assert!(!moving || old.booked_notional_1e6 == held);
+        if !self.send_quote(ctx, sym, side, px_1e6, qty, oid, now, prev_oid) {
+            return false;
+        }
+        if moving {
+            // The venue took it. Only now does the old reservation go
+            // back — crediting before the attempt would free room for
+            // an order that is still resting if the modify is refused.
+            self.credit_unfilled(idx, &old);
         }
         // BIN15 P2 (F2): a resting BID reserves cap room; an ASK is
         // sold against inventory already paid for and reserves nothing.
@@ -1683,7 +1853,13 @@ impl Bin15Strategy {
         };
         self.fam[idx].pend_quote[side_idx] = PendingLeg {
             oid,
-            deadline_ns: now.saturating_add(self.params.requote_ttl_ns),
+            // A reprice inherits the original deadline; a fresh quote
+            // starts its own.
+            deadline_ns: if moving {
+                old.deadline_ns
+            } else {
+                now.saturating_add(self.params.requote_ttl_ns)
+            },
             px_1e6,
             qty_1e6: qty,
             filled_1e6: 0,
@@ -1691,9 +1867,119 @@ impl Bin15Strategy {
             is_yes: 1,
             side: side as u8,
             _pad: [0; 6],
+            // ONE generation: a fill the venue was already answering
+            // under the old id still books. See the field's own doc.
+            prev_oid,
         };
         self.fam[idx].last_quote_p_1e6[side_idx] = centre_1e6;
-        self.counters.quotes_submitted = self.counters.quotes_submitted.wrapping_add(1);
+        if moving {
+            self.counters.quotes_modified = self.counters.quotes_modified.wrapping_add(1);
+        } else {
+            self.counters.quotes_submitted =
+                self.counters.quotes_submitted.wrapping_add(1);
+        }
+        true
+    }
+
+    /// Send one Arm B quote — `ctx.submit` for a fresh one,
+    /// `ctx.modify` for a reprice. `true` iff the dispatcher took it.
+    ///
+    /// The two verbs share this so the order is built once. `kind`
+    /// really is part of `OrderIdentity`, so a replacement that
+    /// disagreed about it would be refused by the dispatcher and the
+    /// failure would read as a venue problem. `ttl_ns` is NOT —
+    /// nothing reads it on a modify, since the modified leg inherits
+    /// the original's expiry on both books — but it is set here
+    /// anyway so the two verbs cannot drift into building different
+    /// orders.
+    #[allow(clippy::too_many_arguments)]
+    fn send_quote<C: Ctx>(
+        &mut self,
+        ctx: &mut C,
+        sym: SymbolId,
+        side: Side,
+        px_1e6: i64,
+        qty_1e6: i64,
+        oid: u64,
+        now: NsTs,
+        prev_oid: u64,
+    ) -> bool {
+        if prev_oid == 0 {
+            return self.submit(ctx, sym, side, ORDER_KIND_MAKER, px_1e6, qty_1e6, oid, now);
+        }
+        debug_assert!(px_1e6 > 0 && qty_1e6 > 0);
+        let order = Order::new(
+            now,
+            VenueId::Hyperliquid,
+            sym,
+            side,
+            ORDER_KIND_MAKER,
+            Price::from_raw(px_1e6),
+            Qty::from_raw(qty_1e6),
+            oid,
+        )
+        .with_ttl_ns(self.params.requote_ttl_ns);
+        match ctx.modify(prev_oid, order) {
+            Ok(()) => {
+                self.orders_emitted = self.orders_emitted.wrapping_add(1);
+                true
+            }
+            // Every refusal leaves the resting quote where it was, at
+            // its old price, still reserving its room. `NoSuchOrder`
+            // is the common one and is not a defect — a fill or a TTL
+            // beat the reprice, and the fill lane is what says which.
+            Err(
+                SubmitErr::RingFull
+                | SubmitErr::Unsupported
+                | SubmitErr::NoSuchOrder
+                | SubmitErr::Refused,
+            ) => {
+                self.counters.quotes_modify_refused =
+                    self.counters.quotes_modify_refused.wrapping_add(1);
+                self.orders_dropped = self.orders_dropped.wrapping_add(1);
+                false
+            }
+        }
+    }
+
+    /// **E5, LAW E-8's member half — take back one lapsed quote.**
+    ///
+    /// The venue has no server-side TTL on a Gtc/Alo order, so a
+    /// quote nobody cancels rests forever. Before E5 this member
+    /// simply forgot a lapsed leg, which was correct against a paper
+    /// matcher running its own TTL law and would have stranded a live
+    /// quote at the venue.
+    ///
+    /// **The leg is cleared and its room credited either way**, as it
+    /// always has been: the member's own deadline is what governs its
+    /// book, and keeping a pending alive because a cancel failed
+    /// would leak one forever. A refusal that is not `NoSuchOrder` is
+    /// counted instead — that is a quote the member has stopped
+    /// tracking and the venue may still hold, which is what E6's
+    /// reconciliation exists to find.
+    fn cancel_quote<C: Ctx>(&mut self, ctx: &mut C, idx: usize, side_idx: usize, now: NsTs) {
+        let leg = self.fam[idx].pend_quote[side_idx];
+        debug_assert!(leg.live());
+        let req = CancelReq::new(now, VenueId::Hyperliquid, self.fam[idx].sym_yes, leg.oid);
+        match ctx.cancel(req) {
+            Ok(()) => {
+                self.counters.quotes_cancelled =
+                    self.counters.quotes_cancelled.wrapping_add(1);
+            }
+            Err(SubmitErr::NoSuchOrder) => {
+                // Already gone — filled, or swept by a dispatcher that
+                // runs its own TTL. Exactly what was wanted.
+            }
+            Err(SubmitErr::RingFull | SubmitErr::Unsupported | SubmitErr::Refused) => {
+                self.counters.quotes_cancel_refused =
+                    self.counters.quotes_cancel_refused.wrapping_add(1);
+            }
+        }
+        self.fam[idx].pend_quote[side_idx] = PendingLeg::default();
+        self.credit_unfilled(idx, &leg);
+        if leg.filled_1e6 == 0 {
+            self.counters.quotes_expired = self.counters.quotes_expired.wrapping_add(1);
+        }
     }
 
     /// Book one fill against the pending it belongs to.
@@ -1762,6 +2048,19 @@ impl Bin15Strategy {
             }
             let mut sidx = 0usize;
             while sidx < QUOTE_SIDES {
+                // E5: the id the leg carries now, OR the one it
+                // carried before its last modify. A fill the venue
+                // was already answering under the old cloid arrives
+                // after the reprice and would otherwise land in
+                // `unknown_fills`, moving no position — the member
+                // would believe it held less than it does, which is
+                // the F7 shape: absence read as evidence.
+                let raced = self.fam[i].pend_quote[sidx].prev_oid != 0
+                    && self.fam[i].pend_quote[sidx].prev_oid == fill.order_id;
+                if raced {
+                    self.book_raced_fill(i, sidx, fill, qty);
+                    return;
+                }
                 if self.fam[i].pend_quote[sidx].oid == fill.order_id {
                     let buy = self.fam[i].pend_quote[sidx].side == Side::Bid as u8;
                     let first = self.fam[i].pend_quote[sidx].filled_1e6 == 0;
@@ -1787,6 +2086,50 @@ impl Bin15Strategy {
             i += 1;
         }
         self.counters.unknown_fills = self.counters.unknown_fills.wrapping_add(1);
+    }
+
+    /// **E5: book a fill that raced a reprice.**
+    ///
+    /// The fill belongs to the order that was REPLACED. The
+    /// replacement is a different order and is still resting at the
+    /// venue at its full size, so this must move the POSITION and
+    /// nothing else about the replacement's bookkeeping.
+    ///
+    /// **Why `filled_1e6` is not touched.** `(qty_1e6, filled_1e6)`
+    /// on a quote leg is the member's statement of what the venue is
+    /// resting, and it is the whole of the short rule: `arm_take`
+    /// sizes a closing take as `pos − (ask.qty − ask.filled)`, and
+    /// `ask_free_1e6` reads the same pair. Crediting a raced fill to
+    /// the replacement's `filled_1e6` moves BOTH sides of that
+    /// subtraction by the same amount, so the oversize it creates
+    /// becomes algebraically invisible — the resting ask and a
+    /// closing take would then size against the same inventory, which
+    /// is precisely the "two sells of the same holding" BIN15 P4b
+    /// (F3) exists to prevent.
+    ///
+    /// It is also how the replacement gets closed by someone else's
+    /// fill: a reprice may SHRINK a quote (the oversized-ask pull does
+    /// exactly that), so a raced quantity between the new size and the
+    /// old one would mark a still-resting order full, clear it, and
+    /// send every later fill of that order into `unknown_fills`.
+    ///
+    /// **The cap room, on the other hand, must come back.** The old
+    /// leg's whole reservation was credited when the modify was
+    /// taken, because nothing had filled at that moment. This fill
+    /// says part of it was in fact spent, so a BUY re-books what was
+    /// actually paid — the fill's own price, not the order's, because
+    /// that is the cash that left.
+    fn book_raced_fill(&mut self, idx: usize, sidx: usize, fill: &core_types::Fill, qty: i64) {
+        let buy = self.fam[idx].pend_quote[sidx].side == Side::Bid as u8;
+        self.apply_position(idx, true, buy, qty);
+        if buy {
+            let notional = ((fill.px.raw() as i128 * qty as i128) / 1_000_000) as i64;
+            self.fam[idx].notional_instance_1e6 =
+                self.fam[idx].notional_instance_1e6.saturating_add(notional);
+            self.day_notional_1e6 = self.day_notional_1e6.saturating_add(notional);
+        }
+        self.counters.quotes_raced = self.counters.quotes_raced.wrapping_add(1);
+        self.counters.fills = self.counters.fills.wrapping_add(1);
     }
 
     /// BIN15 P2 (F2): give back the cap room a leg no longer occupies.
@@ -1853,7 +2196,7 @@ impl Bin15Strategy {
     /// decision. Without this the member would hold a pending forever
     /// and never re-price that leg — which reads, from the outside,
     /// exactly like a member that has stopped working.
-    fn sweep_pendings(&mut self, now: NsTs) {
+    fn sweep_pendings<C: Ctx>(&mut self, ctx: &mut C, now: NsTs) {
         let mut i = 0usize;
         while i < self.params.n_families {
             if self.fam[i].pend_take.live() && now >= self.fam[i].pend_take.deadline_ns {
@@ -1871,13 +2214,14 @@ impl Bin15Strategy {
             while s < QUOTE_SIDES {
                 if self.fam[i].pend_quote[s].live() && now >= self.fam[i].pend_quote[s].deadline_ns
                 {
-                    let leg = self.fam[i].pend_quote[s];
-                    self.fam[i].pend_quote[s] = PendingLeg::default();
-                    self.credit_unfilled(i, &leg);
-                    if leg.filled_1e6 == 0 {
-                        self.counters.quotes_expired =
-                            self.counters.quotes_expired.wrapping_add(1);
-                    }
+                    // **E5, LAW E-8's member half — the BACKSTOP.**
+                    // The requote pass cancels a lapsed quote too, and
+                    // usually gets there first because it runs on
+                    // every mark and every touch. This one runs on a
+                    // clock, so a family whose book has gone quiet —
+                    // which is exactly when a stale quote is most
+                    // dangerous — still has its quote taken back.
+                    self.cancel_quote(ctx, i, s, now);
                 }
                 s += 1;
             }
@@ -2037,11 +2381,13 @@ impl Strategy for Bin15Strategy {
     /// The 1 s cadence: deadlines, the day-cap epoch, the dormant
     /// level. NOT a re-price — a re-price with no new evidence returns
     /// the same number.
-    fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, _ctx: &mut C) {
+    fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
         if self.configured == 0 {
             return;
         }
-        self.sweep_pendings(now_ns);
+        // E5: the sweep now SENDS — LAW E-8's member half needs a ctx
+        // to cancel through, where it used to only forget.
+        self.sweep_pendings(ctx, now_ns);
         self.roll_day(self.bar.anchor.wall_of(now_ns));
         self.refresh_dormant();
     }
@@ -2102,6 +2448,14 @@ mod tests {
     struct RecCtx {
         orders: Vec<Order>,
         full: bool,
+        /// E5: `(prev_client_oid, replacement)` per accepted modify.
+        modifies: Vec<(u64, Order)>,
+        /// E5: `client_oid` per accepted cancel.
+        cancels: Vec<u64>,
+        /// E5: when set, every lifecycle verb is refused with this —
+        /// the `Unsupported` a ctx that never heard of them returns,
+        /// or the `NoSuchOrder` a fill that won the race produces.
+        lifecycle_err: Option<SubmitErr>,
     }
     impl Ctx for RecCtx {
         fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
@@ -2109,6 +2463,20 @@ mod tests {
                 return Err(SubmitErr::RingFull);
             }
             self.orders.push(order);
+            Ok(())
+        }
+        fn cancel(&mut self, req: core_types::CancelReq) -> Result<(), SubmitErr> {
+            if let Some(e) = self.lifecycle_err {
+                return Err(e);
+            }
+            self.cancels.push(req.client_oid);
+            Ok(())
+        }
+        fn modify(&mut self, prev_client_oid: u64, order: Order) -> Result<(), SubmitErr> {
+            if let Some(e) = self.lifecycle_err {
+                return Err(e);
+            }
+            self.modifies.push((prev_client_oid, order));
             Ok(())
         }
         fn now_ns(&self) -> NsTs {
@@ -2119,6 +2487,9 @@ mod tests {
         RecCtx {
             orders: Vec::new(),
             full: false,
+            modifies: Vec::new(),
+            cancels: Vec::new(),
+            lifecycle_err: None,
         }
     }
 
@@ -2256,6 +2627,11 @@ mod tests {
     /// An expiry `secs` after the anchor, in WALL ns.
     const fn expiry(secs: u64) -> u64 {
         WALL0 + secs * 1_000_000_000
+    }
+
+    /// The Yes leg family 0 quotes on.
+    fn first_sym(m: &Bin15Strategy) -> SymbolId {
+        m.family(0).expect("f").sym_yes
     }
 
     /// Drive one family to a priced state: warm, bind, mark, book.
@@ -2507,6 +2883,514 @@ mod tests {
         assert_eq!(makers[0].px.raw() % GRID_TICK_1E6, 0, "on the 1e-4 grid");
         assert!(makers[0].px.raw() <= 490_000, "never crossing the touch");
         assert!(m.counters().skipped_inventory > 0, "and the ask side says why");
+    }
+
+    // ---------------- E5: Arm B moves and pulls its own quotes ------
+
+    /// **LAW E-7, and the gate that was forced open.**
+    ///
+    /// Until E5 the first gate in `arm_quote` was "a live quote is
+    /// skipped", because this member had no cancel path: a resting
+    /// quote could only be replaced by letting its TTL run out, so
+    /// `requote_ttl_ns` was the replace cadence rather than a nicety.
+    /// A move of the fair value now becomes ONE modify — not a wait,
+    /// and not a cancel plus a place.
+    #[test]
+    fn a_fair_value_move_reprices_the_resting_bid_with_one_modify() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let first = m.family(0).expect("f").pend_quote[0];
+        assert!(first.live(), "a bid is resting");
+        // Arm A reprices on the same event and may fire its own IoC,
+        // so only MAKER intents are the claim here.
+        let makers_before = c.orders.iter().filter(|o| o.kind == ORDER_KIND_MAKER).count();
+
+        // The centre moves — and it is the BOOK that moves it here,
+        // because these families run the null arm, which quotes around
+        // the venue's own mid rather than the model's `p̂`. Inside the
+        // resting quote's TTL, so this is a reprice and not a lapse.
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
+            &mut c,
+        );
+
+        assert_eq!(
+            c.orders.iter().filter(|o| o.kind == ORDER_KIND_MAKER).count(),
+            makers_before,
+            "a reprice is a MODIFY, never a second place"
+        );
+        assert_eq!(
+            c.modifies.len(),
+            1,
+            "DEBUG p_hat={} last_q={} reprices={} thr={} live={} skipped_partial={}",
+            m.family(0).expect("f").p_hat_1e6,
+            m.family(0).expect("f").last_quote_p_1e6[0],
+            m.counters().reprices,
+            5_000,
+            m.family(0).expect("f").pend_quote[0].live(),
+            m.counters().skipped_partial
+        );
+        assert_eq!(c.modifies[0].0, first.oid, "addressed by the resting id");
+        let repl = c.modifies[0].1;
+        assert_ne!(repl.client_oid, first.oid, "a FRESH cloid (ruling O-E5b)");
+        assert_eq!(repl.sym, first_sym(&m), "the same leg");
+        assert_eq!(repl.side, Side::Bid);
+        assert_eq!(repl.kind, ORDER_KIND_MAKER);
+
+        let now = m.family(0).expect("f").pend_quote[0];
+        assert_eq!(now.oid, repl.client_oid, "the member tracks the new id");
+        assert_eq!(now.prev_oid, first.oid, "and remembers the old one");
+        assert_eq!(now.px_1e6, repl.px.raw());
+        assert_eq!(m.counters().quotes_modified, 1);
+        assert_eq!(
+            m.counters().quotes_submitted,
+            1,
+            "a move is not a new quote"
+        );
+    }
+
+    /// **The raced fill, which is why one generation is remembered.**
+    ///
+    /// A reprice gives the replacement a fresh cloid, so a fill the
+    /// venue was already answering under the OLD id arrives after the
+    /// member has stopped listening for it. Without the memory it
+    /// lands in `unknown_fills`, moves no position, and the member
+    /// believes it holds less than it does — the F7 shape, absence
+    /// read as evidence.
+    #[test]
+    fn a_fill_that_raced_the_reprice_still_books_under_the_previous_id() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let old_oid = m.family(0).expect("f").pend_quote[0].oid;
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
+            &mut c,
+        );
+        assert_eq!(m.counters().quotes_modified, 1);
+        let new_oid = m.family(0).expect("f").pend_quote[0].oid;
+        assert_ne!(old_oid, new_oid);
+
+        // The venue answers the OLD id.
+        m.on_fill(
+            &Fill::new(
+                at(62) + 700_000_000,
+                first_sym(&m),
+                Side::Bid,
+                Price::from_raw(480_000),
+                Qty::from_raw(10_000_000),
+                old_oid,
+            ),
+            &mut c,
+        );
+        assert_eq!(
+            m.family(0).expect("f").pos_yes_1e6,
+            10_000_000,
+            "the position moved — the whole point"
+        );
+        assert_eq!(m.counters().quotes_raced, 1);
+        assert_eq!(
+            m.counters().unknown_fills,
+            0,
+            "it is NOT a book disagreement"
+        );
+    }
+
+    /// A refused modify changes nothing: the old quote is still
+    /// resting at its old price and still reserving its room.
+    /// Crediting the reservation before the venue took the modify
+    /// would free cap room for an order that never moved.
+    #[test]
+    fn a_refused_modify_leaves_the_quote_and_its_reservation_alone() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let before = m.family(0).expect("f").pend_quote[0];
+        let reserved_before = m.family(0).expect("f").notional_instance_1e6;
+        let orders_before = c.orders.len();
+
+        c.lifecycle_err = Some(SubmitErr::NoSuchOrder);
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
+            &mut c,
+        );
+
+        let after = m.family(0).expect("f").pend_quote[0];
+        assert_eq!(after.oid, before.oid, "still the same resting order");
+        assert_eq!(after.px_1e6, before.px_1e6, "at the same price");
+        assert_eq!(after.prev_oid, 0, "and it never moved");
+        assert_eq!(
+            after.booked_notional_1e6, before.booked_notional_1e6,
+            "the leg still holds the room it reserved"
+        );
+        // EXACT, not `>=`. Arm A reprices on the same event and may
+        // book an opening take, so its contribution is measured and
+        // subtracted rather than waved at — a `>=` would also pass if
+        // the code credited the reservation and Arm A happened to
+        // book at least as much on the same tick, which is the shape
+        // of assertion this lane keeps having to tighten.
+        let arm_a: i64 = c.orders[orders_before..]
+            .iter()
+            .filter(|o| o.kind != ORDER_KIND_MAKER && o.side == Side::Bid)
+            .map(|o| ((o.px.raw() as i128 * o.qty.raw() as i128) / 1_000_000) as i64)
+            .sum();
+        assert_eq!(
+            m.family(0).expect("f").notional_instance_1e6,
+            reserved_before + arm_a,
+            "a refused modify must credit nothing and book nothing"
+        );
+        assert_eq!(m.counters().quotes_modified, 0);
+        assert_eq!(m.counters().quotes_modify_refused, 1);
+    }
+
+    /// **The MODEL arm, where `p̂` really is the centre.**
+    ///
+    /// Every other reprice test here runs the NULL arm, which quotes
+    /// around the venue's own mid — so a mark move cannot move their
+    /// centre, and none of them shows that a FAIR-VALUE move produces
+    /// a modify. That is the arm the lane will run live, and its
+    /// centre also carries the inventory skew, so its reprice rate is
+    /// not the null arm's. Pinned separately for both reasons.
+    #[test]
+    fn a_mark_move_reprices_the_model_arms_quote() {
+        let mut p = params_1(FAMILY_OUT_15M);
+        p.null_arm = 0; // every instance is the model arm
+        let mut m = Bin15Strategy::new();
+        m.configure(p, ramp_luts(), core_time::WallAnchor::new(MONO0, WALL0))
+            .expect("configure");
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        assert_eq!(m.family(0).expect("f").arm, ARM_MODEL, "the model arm");
+        let before = m.family(0).expect("f").pend_quote[0];
+        assert!(before.live(), "a bid is resting");
+
+        // A mark move — the model arm's centre IS `p̂`, so this is
+        // what moves it. Inside the resting quote's TTL.
+        m.on_venue_event(
+            &mark_event(79_000_100_000, at(62) + 500_000_000),
+            &mut c,
+        );
+
+        assert_eq!(m.counters().quotes_modified, 1, "one modify, no new place");
+        assert_eq!(c.modifies.len(), 1);
+        assert_eq!(c.modifies[0].0, before.oid);
+        let after = m.family(0).expect("f").pend_quote[0];
+        assert_eq!(after.prev_oid, before.oid);
+        assert_ne!(after.px_1e6, before.px_1e6, "and it really moved the price");
+    }
+
+    /// **A reprice does not extend a quote's life.** The modified leg
+    /// inherits the ORIGINAL deadline, so an Arm B moving every
+    /// 333 ms cannot hold a quote past the TTL its ruleset gave it —
+    /// the TTL would stop being a bound. The dispatcher enforces the
+    /// same rule on its own open table; this is the member's book
+    /// agreeing with it rather than trusting it.
+    #[test]
+    fn a_reprice_inherits_the_original_deadline() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let before = m.family(0).expect("f").pend_quote[0];
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 500_000_000, false),
+            &mut c,
+        );
+        let after = m.family(0).expect("f").pend_quote[0];
+        assert_eq!(m.counters().quotes_modified, 1, "it really moved");
+        assert_ne!(after.oid, before.oid);
+        assert_eq!(
+            after.deadline_ns, before.deadline_ns,
+            "a reprice must not buy the quote more time"
+        );
+    }
+
+    /// **The oversized ask — one of the few places the paper model is
+    /// OPTIMISTIC against live.**
+    ///
+    /// Arm B's ask may only offer inventory we can prove we hold: a
+    /// HIP-4 position cannot go negative and the venue refuses the
+    /// sell outright. A resting ask bigger than the holding is an
+    /// order the live venue will not fill and the paper matcher
+    /// takes happily — the one direction of modelling error that
+    /// matters.
+    ///
+    /// **The reachable way in is a raced fill on the ASK.** A closing
+    /// take cannot do it (`arm_take` already subtracts the resting
+    /// ask's remaining before sizing) and a settlement cannot
+    /// (`clear_instance` zeroes the position and the quotes
+    /// together). What can is a sell the venue answered under the id
+    /// the ask carried BEFORE a reprice: the holding drops, the
+    /// replacement keeps its size, and the two no longer agree. That
+    /// is exactly the state this test builds, through `on_fill` and
+    /// nothing else.
+    ///
+    /// The pull fires with the centre standing still — the trigger is
+    /// the inventory, not the price.
+    #[test]
+    fn a_resting_ask_is_pulled_down_when_a_raced_fill_takes_the_inventory() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let bid = m.family(0).expect("f").pend_quote[0];
+
+        // Inventory, from a fill on our own resting bid.
+        m.on_fill(
+            &Fill::new(
+                at(62) + 100_000_000,
+                yes_sym(0),
+                Side::Bid,
+                Price::from_raw(bid.px_1e6),
+                Qty::from_raw(100_000_000),
+                bid.oid,
+            ),
+            &mut c,
+        );
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 100_000_000);
+
+        // One reprice: now there IS something to offer, so the ask
+        // quotes for the first time — sized at the whole holding.
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 200_000_000, false),
+            &mut c,
+        );
+        let ask1 = m.family(0).expect("f").pend_quote[1];
+        assert!(ask1.live(), "the ask is resting");
+        assert_eq!(ask1.qty_1e6, 100_000_000, "all of it is offered");
+
+        // The centre moves, so the ask is repriced — fresh cloid, old
+        // one remembered for one generation.
+        m.on_tick(
+            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 300_000_000, false),
+            &mut c,
+        );
+        let ask2 = m.family(0).expect("f").pend_quote[1];
+        assert_eq!(ask2.prev_oid, ask1.oid, "the reprice happened");
+        assert_eq!(ask2.qty_1e6, 100_000_000, "still offering the whole holding");
+        let modifies_before = c.modifies.len();
+
+        // The venue answers the OLD ask id: 60 contracts sold. The
+        // holding drops; the replacement's size does not.
+        m.on_fill(
+            &Fill::new(
+                at(62) + 350_000_000,
+                yes_sym(0),
+                Side::Ask,
+                Price::from_raw(ask1.px_1e6),
+                Qty::from_raw(60_000_000),
+                ask1.oid,
+            ),
+            &mut c,
+        );
+        assert_eq!(m.counters().quotes_raced, 1);
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 40_000_000);
+        assert_eq!(
+            m.family(0).expect("f").pend_quote[1].filled_1e6,
+            0,
+            "the raced fill belongs to the RETIRED order, not this one"
+        );
+
+        // Same book, so the centre has not moved. The ask is pulled
+        // down anyway.
+        m.on_tick(
+            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 400_000_000, false),
+            &mut c,
+        );
+        assert_eq!(
+            c.modifies.len(),
+            modifies_before + 1,
+            "the ask must be pulled down even though nothing repriced"
+        );
+        let (prev, repl) = c.modifies[modifies_before];
+        assert_eq!(prev, ask2.oid, "addressed by the resting ask");
+        assert_eq!(repl.side, Side::Ask);
+        assert_eq!(
+            repl.qty.raw(),
+            40_000_000,
+            "down to what we can prove we hold"
+        );
+        assert_eq!(m.family(0).expect("f").pend_quote[1].qty_1e6, 40_000_000);
+    }
+
+    /// **When there is nothing left to offer, the ask is PULLED.**
+    ///
+    /// The remedy for an oversized ask is normally a modify down to
+    /// the free amount — but at free = 0 there is no replacement to
+    /// send, and before the cancel verb the member's only option was
+    /// a counter and a shrug while the ask rested to its TTL. An ask
+    /// offering inventory we do not hold at all must not survive that
+    /// long: the live venue refuses every fill of it and the paper
+    /// matcher takes them.
+    #[test]
+    fn an_ask_with_nothing_left_behind_it_is_cancelled_not_counted() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let bid = m.family(0).expect("f").pend_quote[0];
+        m.on_fill(
+            &Fill::new(
+                at(62) + 100_000_000,
+                yes_sym(0),
+                Side::Bid,
+                Price::from_raw(bid.px_1e6),
+                Qty::from_raw(100_000_000),
+                bid.oid,
+            ),
+            &mut c,
+        );
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 200_000_000, false),
+            &mut c,
+        );
+        let ask1 = m.family(0).expect("f").pend_quote[1];
+        m.on_tick(
+            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 300_000_000, false),
+            &mut c,
+        );
+        let ask2 = m.family(0).expect("f").pend_quote[1];
+        assert!(ask2.live());
+
+        // The raced fill takes the WHOLE holding.
+        m.on_fill(
+            &Fill::new(
+                at(62) + 350_000_000,
+                yes_sym(0),
+                Side::Ask,
+                Price::from_raw(ask1.px_1e6),
+                Qty::from_raw(100_000_000),
+                ask1.oid,
+            ),
+            &mut c,
+        );
+        assert_eq!(m.family(0).expect("f").pos_yes_1e6, 0, "nothing left");
+
+        let cancels_before = c.cancels.len();
+        m.on_tick(
+            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 400_000_000, false),
+            &mut c,
+        );
+        assert_eq!(
+            c.cancels.len(),
+            cancels_before + 1,
+            "the ask must be taken back, not merely counted"
+        );
+        assert_eq!(c.cancels[cancels_before], ask2.oid);
+        assert!(
+            !m.family(0).expect("f").pend_quote[1].live(),
+            "and the member stops tracking it"
+        );
+        assert_eq!(m.counters().quotes_cancelled, 1);
+    }
+
+    /// **`arm_take` and the resting ask must never size against the
+    /// same contracts** (BIN15 P4b, F3). A raced fill folded into the
+    /// replacement's `filled_1e6` would move BOTH sides of
+    /// `pos − (ask.qty − ask.filled)` by the same amount, making the
+    /// oversize algebraically invisible and letting a closing take be
+    /// sized past the holding. This pins the pair against the venue's
+    /// truth instead.
+    #[test]
+    fn a_raced_fill_does_not_make_the_resting_ask_look_smaller_than_it_is() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let bid = m.family(0).expect("f").pend_quote[0];
+        m.on_fill(
+            &Fill::new(
+                at(62) + 100_000_000,
+                yes_sym(0),
+                Side::Bid,
+                Price::from_raw(bid.px_1e6),
+                Qty::from_raw(100_000_000),
+                bid.oid,
+            ),
+            &mut c,
+        );
+        m.on_tick(
+            &tick(yes_sym(0), 460_000, 480_000, 1_000_000_000, at(62) + 200_000_000, false),
+            &mut c,
+        );
+        let ask1 = m.family(0).expect("f").pend_quote[1];
+        m.on_tick(
+            &tick(yes_sym(0), 430_000, 450_000, 1_000_000_000, at(62) + 300_000_000, false),
+            &mut c,
+        );
+        let ask2 = m.family(0).expect("f").pend_quote[1];
+        m.on_fill(
+            &Fill::new(
+                at(62) + 350_000_000,
+                yes_sym(0),
+                Side::Ask,
+                Price::from_raw(ask1.px_1e6),
+                Qty::from_raw(60_000_000),
+                ask1.oid,
+            ),
+            &mut c,
+        );
+
+        let f = *m.family(0).expect("f");
+        let reserved = f.pend_quote[1].qty_1e6 - f.pend_quote[1].filled_1e6;
+        assert_eq!(reserved, ask2.qty_1e6, "the venue still rests all of it");
+        assert!(
+            reserved > f.pos_yes_1e6,
+            "and it now offers more than we hold — which must be VISIBLE"
+        );
+        assert_eq!(
+            f.pos_yes_1e6 - reserved,
+            -60_000_000,
+            "a closing take sized on this would be a second sell of the same 60"
+        );
+    }
+
+    /// **LAW E-8's member half.** The venue has no server-side TTL on    /// **LAW E-8's member half.** The venue has no server-side TTL on
+    /// a Gtc/Alo order, so a quote nobody cancels rests forever.
+    /// Before E5 the member simply forgot a lapsed leg — correct
+    /// against a paper matcher running its own TTL law, and a
+    /// stranded quote live.
+    #[test]
+    fn a_lapsed_quote_is_cancelled_and_not_merely_forgotten() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let leg = m.family(0).expect("f").pend_quote[0];
+        assert!(leg.live());
+
+        // The 1 s timer, well past the quote's TTL.
+        m.on_timer(leg.deadline_ns + 1, &mut c);
+
+        assert_eq!(c.cancels, vec![leg.oid], "the venue was told");
+        assert!(!m.family(0).expect("f").pend_quote[0].live());
+        assert_eq!(m.counters().quotes_cancelled, 1);
+        assert_eq!(m.counters().quotes_expired, 1);
+    }
+
+    /// The member's own deadline governs its book either way — a
+    /// pending kept alive because a cancel failed would leak forever.
+    /// A refusal that is NOT `NoSuchOrder` is a quote the member has
+    /// stopped tracking and the venue may still hold, so it gets its
+    /// own counter rather than being lost in the expiry count.
+    #[test]
+    fn a_refused_cancel_still_clears_the_book_and_is_counted_apart() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let leg = m.family(0).expect("f").pend_quote[0];
+        c.lifecycle_err = Some(SubmitErr::Refused);
+        m.on_timer(leg.deadline_ns + 1, &mut c);
+
+        assert!(!m.family(0).expect("f").pend_quote[0].live(), "book cleared");
+        assert_eq!(m.counters().quotes_cancel_refused, 1);
+        assert_eq!(m.counters().quotes_cancelled, 0);
+
+        // `NoSuchOrder` is NOT counted there: the order really is
+        // gone, which is what the member wanted.
+        let mut m2 = member(FAMILY_OUT_15M);
+        let mut c2 = ctx();
+        live_family(&mut m2, &mut c2, 490_000, 510_000);
+        let leg2 = m2.family(0).expect("f").pend_quote[0];
+        c2.lifecycle_err = Some(SubmitErr::NoSuchOrder);
+        m2.on_timer(leg2.deadline_ns + 1, &mut c2);
+        assert_eq!(m2.counters().quotes_cancel_refused, 0);
     }
 
     /// **A settlement is not "a fill the engine did not order".**

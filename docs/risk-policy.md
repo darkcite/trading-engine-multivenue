@@ -2158,3 +2158,150 @@ order either way; not harmless the moment a strategy must tell "retry
 later" from "that order is already gone". The mapping is now an
 exhaustive match with no `_` arm, so a new `DispatchError` variant is
 a compile error rather than a silent re-merge.
+
+### E5 commit 4b — Arm B moves and pulls its own quotes (2026-09-19)
+
+bin15's maker had no cancel path, and its own code said so: *"this
+member has no cancel path (Stage-3), so a live quote can only be
+replaced by letting it expire. `requote_ttl_ns` is therefore the
+replace cadence, not a nicety."* LAW E-7 lifts that gate.
+
+#### A reprice is one MODIFY, not a wait and not a cancel plus a place
+
+A live quote whose centre has travelled `requote_thr_1e6` now moves
+with one request. At 333 reprices per instance the difference between
+one request and two is the difference between fitting inside the
+address budget and not (§7).
+
+The re-quote-loop gate stays exactly as it was: a quote that reached
+its TTL unfilled told us that price does not fill in this book, and
+re-offering the same price a second later adds no information. Nothing
+moves unless the fair value moved.
+
+#### A partially-filled quote is left alone — unless it is an oversized ask
+
+A modify replaces the venue's remaining size wholesale, so moving one
+means the member's `filled_1e6`/`qty_1e6` pair and the venue's
+remainder have to agree across a race — which is where double-count
+bugs live. A quote that is already working does not need the help; its
+TTL will end it. Counted as `skipped_partial`.
+
+**The oversize pull outranks it.** A partially-filled ask that offers
+more than the holding cannot be safely resized, so it is CANCELLED
+rather than left: the gate that protects the bookkeeping must not
+protect a short the venue will refuse.
+
+#### The previous client id is remembered for ONE generation
+
+A reprice gives the replacement a fresh cloid (ruling O-E5b), so a
+fill the venue was already answering under the old id arrives after
+the member has stopped listening for it. Without the memory it lands
+in `unknown_fills`, moves no position, and the member believes it
+holds less than it does — **the F7 shape again: absence read as
+evidence.** `quotes_raced` counts them.
+
+One generation and not a list, because the window is one round trip: a
+second reprice means the first replacement was acknowledged, so
+anything still outstanding under the id before that is a venue that
+has lost two messages — a reconciliation problem, not a bookkeeping
+one.
+
+#### A refused modify changes NOTHING
+
+The old quote is still resting at its old price and still reserving
+its cap room. The reservation is credited and the replacement booked
+only **after** the venue takes the modify: crediting first and then
+being refused would free room for an order that never moved. The
+replacement is sized with `cap_room_excluding_1e6`, because sizing it
+against the caps as they stand would refuse room the quote itself is
+holding and every reprice would shrink until it hit zero.
+
+#### A reprice does not extend a quote's life
+
+The modified leg inherits the ORIGINAL `deadline_ns`. The dispatcher
+enforces the same rule on its own open table; this is the member's
+book agreeing with it rather than trusting it.
+
+#### A raced fill belongs to the RETIRED order, not the replacement
+
+The first cut of this credited a `prev_oid`-matched fill to the
+replacement's `filled_1e6`, and two independent reviews caught it.
+`(qty_1e6, filled_1e6)` on a quote leg is the member's statement of
+what the VENUE is resting, and it is the whole of the short rule —
+`arm_take` sizes a closing take as `pos − (ask.qty − ask.filled)` and
+`ask_free_1e6` reads the same pair. Crediting a raced fill there moves
+both sides of that subtraction by the same amount, so the oversize it
+creates becomes **algebraically invisible**: the resting ask and a
+closing take would size against the same contracts, which is exactly
+the "two sells of the same holding" BIN15 P4b (F3) exists to prevent.
+
+It was also how the replacement got closed by someone else's fill. A
+reprice may SHRINK a quote — the oversized-ask pull does exactly that
+— so a raced quantity between the new size and the old one would mark
+a still-resting order full, clear it, and send every later fill of
+that order into `unknown_fills`. The F7 shape, reopened by the fix for
+the F7 shape.
+
+So a raced fill moves the POSITION and nothing else about the
+replacement. It does re-book cap room: the old leg's whole reservation
+was credited when the modify was taken, because nothing had filled at
+that moment, and this fill says part of it was in fact spent. A BUY
+re-books at the FILL's price, because that is the cash that left.
+
+#### LAW E-8's member half — a lapsed quote is CANCELLED
+
+The venue has no server-side TTL on a Gtc/Alo order, so a quote nobody
+cancels rests forever. Before E5 the member simply forgot a lapsed
+leg: correct against a paper matcher running its own TTL law, and a
+stranded quote live.
+
+**Two call sites, on purpose.** The requote pass usually gets there
+first because it runs on every mark and every touch; the 1 s timer
+sweep is the backstop, and it runs on a clock, so a family whose book
+has gone quiet — exactly when a stale quote is most dangerous — still
+has its quote taken back.
+
+**The leg is cleared and its room credited either way**, as it always
+has been: the member's own deadline governs its book, and keeping a
+pending alive because a cancel failed would leak one forever. A
+refusal that is not `NoSuchOrder` is counted as
+`quotes_cancel_refused` — that is a quote the member has stopped
+tracking and the venue may still hold, which is what E6's
+reconciliation exists to find. `NoSuchOrder` is excluded deliberately:
+there the order really is gone, which is what the member wanted.
+
+#### The oversized ask, and the only way into it
+
+Arm B's ask may only offer inventory we can prove we hold — a HIP-4
+position cannot go negative and the venue refuses the sell outright.
+An ask larger than the holding is an order the live venue will not
+fill and the paper matcher takes happily: one of the few places the
+model is OPTIMISTIC against live, which is the direction that matters.
+
+**The reachable trigger is a raced fill on the ASK**, and only that.
+A closing take cannot create the state — `arm_take` already subtracts
+the resting ask's remaining before sizing — and a settlement cannot
+either, because `clear_instance` zeroes the position and the quotes
+together. What can is a sell the venue answered under the id the ask
+carried BEFORE a reprice: the holding drops and the replacement keeps
+its size. (An earlier draft of this section named the closing take and
+the settlement; both were wrong, and the test that went with them
+reached the state through a private method no engine path can drive.)
+
+The ask is modified down to the free amount, and the trigger is the
+inventory rather than the price — it fires with the centre standing
+still. **Where the replacement cannot be sent** — nothing free to
+offer, a size under the venue's lot or minimum notional, a partial
+fill, or a refused modify — the quote is CANCELLED instead. Now that
+the member has a cancel verb, an ask offering what we do not hold must
+not survive to its TTL on any path.
+
+#### What this commit changes about the standing engine
+
+bin15 is slot 3 of the live `--paper` boot, so from the next release
+build this member emits MODIFY and CANCEL into `PaperDispatcher`, and
+`engine-orders.pmlr` starts carrying verb records (commit 4a is what
+made that legible). `backtest --member bin15` will likewise produce
+different numbers than before — the maker no longer waits out a TTL to
+move — so **bin15 gate numbers measured before this commit are not
+comparable with ones measured after it.**
