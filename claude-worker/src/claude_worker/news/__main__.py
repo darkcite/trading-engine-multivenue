@@ -30,6 +30,7 @@ exceed ``sources.FIXTURE_MAX_BYTES``.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -47,6 +48,7 @@ import claude_worker.news.cascade
 import claude_worker.news.cycle
 import claude_worker.news.detect
 import claude_worker.news.filter
+import claude_worker.news.local_llm
 import claude_worker.news.resolve
 import claude_worker.news.session
 import claude_worker.news.sources
@@ -152,6 +154,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "proposals", parents=[common], help="the universe/xsd proposals not yet applied"
     )
 
+    llm = lanes.add_parser(
+        "llm-args", parents=[common], help="verify llm.toml and print the llama-server argv"
+    )
+    llm.add_argument(
+        "--fallback",
+        action="store_true",
+        help="render the fallback model instead of the primary (doc 03 §5's downsize)",
+    )
+    llm.add_argument(
+        "--skip-sha",
+        action="store_true",
+        help="print the argv without hashing the weights (a 5 GB shasum is ~10 s)",
+    )
+
+    lanes.add_parser(
+        "llm-health", parents=[common], help="what the local sidecar reports about itself"
+    )
+
     prompts = lanes.add_parser(
         "prompts", parents=[common], help="write one tier's pending prompts as NDJSON (§14)"
     )
@@ -253,6 +273,8 @@ def _cycle(args: argparse.Namespace) -> int:
         paths.market_map_path, paths.replay_dir, registry.keywords
     )
     ctx = claude_worker.news.detect.context_from(paths)
+    policy = _policy(paths)
+    state = claude_worker.state.State(paths.state_db_path)
     with claude_worker.news.store.Store(paths.db_path) as store:
         claude_worker.news.cycle.register_sources(store, registry)
         recent, used = claude_worker.news.cycle.load_recent(store, registry, now_ts)
@@ -274,6 +296,21 @@ def _cycle(args: argparse.Namespace) -> int:
                 take_until_ns=take_until,
                 ctx=ctx,
             )
+        # doc 03 §4: the local tiers, after the aggregator. Bounded to
+        # `tier1_batch_max` + `tier2_batch_max` per invocation and skipped
+        # entirely unless `llm.toml` exists AND the policy routes a tier at
+        # `local:…` AND the sidecar is up and serving the pinned model. Every
+        # one of those is a counted refusal to ask, never a failure.
+        llm = claude_worker.news.local_llm.run_local_tiers(
+            state=state,
+            store=store,
+            registry=registry,
+            policy=policy,
+            cfg=claude_worker.news.local_llm.load_config(paths.llm_path),
+            markets=_markets(paths),
+            vocab=vocab,
+            now_ts=now_ts,
+        )
         # §12: the cycle also scores what has come due and rewrites the
         # scorecard. It costs no model call and no network — the prices come
         # from the 1 m candles lane — and it is what keeps `scorecard.json`
@@ -281,16 +318,19 @@ def _cycle(args: argparse.Namespace) -> int:
         resolved = claude_worker.news.resolve.resolve_due(store, paths, now_ts, args.max_resolve)
         claude_worker.news.resolve.write_scorecard(
             paths.file(claude_worker.news.SCORECARD_FILE),
-            claude_worker.news.resolve.build_scorecard(store, now_ts, _policy(paths).ceilings),
+            claude_worker.news.resolve.build_scorecard(store, now_ts, policy.ceilings),
         )
         pruned = store.prune(
             now_ts,
             registry.settings.items_retention_days,
             registry.settings.snapshots_retention_days,
         )
+    state.close()
     stats.resolved = resolved.resolved
     sys.stdout.write(stats.line() + "\n")
     sys.stdout.write(stats.detail() + f" pruned_items={pruned['items']}\n")
+    if llm.healthy or llm.calls or llm.tier1 or llm.tier2:
+        sys.stdout.write("  " + llm.line() + "\n")
     return EXIT_OK
 
 
@@ -849,6 +889,95 @@ def _replay(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------- the local sidecar
+
+
+def _llm_args(args: argparse.Namespace) -> int:
+    """The `llama-server` argv, after verifying the weights.
+
+    `scripts/llm-serve.sh` execs what this prints, so the shell script carries
+    no model path and no tuning number: the operator's `llm.toml` is the only
+    source, and a weight file that does not match its pinned sha256 is a
+    REFUSAL here rather than a model silently swapped under a tag the
+    scorecard splits on.
+    """
+    paths = claude_worker.news.paths_from_env()
+    cfg = claude_worker.news.local_llm.load_config(paths.llm_path)
+    if not cfg.present:
+        sys.stderr.write(f"llm-args: no config at {paths.llm_path}\n")
+        return EXIT_REFUSED
+    if not cfg.valid:
+        sys.stderr.write(f"llm-args: {paths.llm_path} is not a valid llm.toml\n")
+        return EXIT_TOO_BIG
+    model = cfg.fallback_model_path if args.fallback else cfg.model_path
+    want = cfg.fallback_sha256 if args.fallback else cfg.sha256
+    if not model.is_file():
+        sys.stderr.write(f"llm-args: no weights at {model}\n")
+        return EXIT_TOO_BIG
+    if want and not args.skip_sha:
+        got = _sha256_of(model)
+        if got != want:
+            sys.stderr.write(
+                f"llm-args: {model.name} is sha256 {got[:16]}…, "
+                f"llm.toml pins {want[:16]}… — REFUSING\n"
+            )
+            return EXIT_TOO_BIG
+    argv = claude_worker.news.local_llm.server_argv(cfg)
+    if args.fallback:
+        for i in range(len(argv)):
+            if argv[i] == "-m":
+                argv[i + 1] = str(model)
+    sys.stdout.write(" ".join(argv) + "\n")
+    return EXIT_OK
+
+
+def _sha256_of(path: pathlib.Path, chunk: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _llm_health(args: argparse.Namespace) -> int:
+    """What the sidecar says about itself, and whether it is the pinned model.
+
+    Exit 1 when it is down or serving something else — so a wrapper or a
+    scheduled check can act on it — but never a traceback: a sidecar that is
+    not there is a lane that does less, not a lane that breaks.
+    """
+    del args
+    paths = claude_worker.news.paths_from_env()
+    cfg = claude_worker.news.local_llm.load_config(paths.llm_path)
+    if not cfg.present:
+        sys.stdout.write(f"llm health: no config at {paths.llm_path} — no local tiers\n")
+        return EXIT_OK
+    with claude_worker.news.local_llm.LocalClient(cfg.base_url) as client:
+        up = client.health()
+        props = client.props() if up else {}
+        metrics = client.metrics() if up else {}
+    stem = claude_worker.news.local_llm.props_model_stem(props)
+    pinned = cfg.model_path.name.removesuffix(".gguf").lower()
+    sys.stdout.write(
+        f"llm health: {'up' if up else 'DOWN'} at {cfg.base_url} tag={cfg.model_tag}\n"
+        f"  serving={stem or '(unreported)'} pinned={pinned} "
+        f"match={'yes' if (not stem or stem == pinned) else 'NO'}\n"
+    )
+    if metrics:
+        keys = sorted(metrics)
+        shown: list[str] = []
+        for i in range(len(keys)):
+            if "llamacpp" in keys[i] or "prompt" in keys[i] or "tokens" in keys[i]:
+                shown.append(f"{keys[i]}={metrics[keys[i]]:.0f}")
+        sys.stdout.write("  metrics: " + (" ".join(shown[:10]) or "(none)") + "\n")
+    if not up or (stem and stem != pinned):
+        return EXIT_REFUSED
+    return EXIT_OK
+
+
 _LANES: dict[str, typing.Callable[[argparse.Namespace], int]] = {
     "cycle": _cycle,
     "health": _health,
@@ -856,6 +985,8 @@ _LANES: dict[str, typing.Callable[[argparse.Namespace], int]] = {
     "migrate-feeds": _migrate_feeds,
     "report": _report,
     "proposals": _proposals,
+    "llm-args": _llm_args,
+    "llm-health": _llm_health,
     "prompts": _prompts,
     "ingest": _ingest,
     "actions": _actions,

@@ -1,0 +1,40 @@
+# Local LLM sidecar for the NEWS cascade's tiers 1-2 (doc 03).
+# Copy to ~/multivenue/llm.toml and edit. ABSENT means no local tiers at all:
+# every lane skips them and says so, exactly as an absent news.toml skips the
+# whole lane. This file grants NO capability — routing a tier at a local model
+# is done in news-policy.toml's [models], and even then the rows are candidate
+# rows until the operator promotes the tier.
+#
+# The weights are NOT in this repo and never will be: they live under
+# ~/multivenue/models/ with their sha256 pinned here. Apache-2.0 / MIT weights
+# only (doc 03 R4), and the licence line goes in the lane's vault log.
+#
+# `python -m claude_worker.news llm-args` reads this, verifies the sha256 and
+# prints the llama-server argv; scripts/llm-serve.sh execs that. The shell
+# script therefore carries no model path and no tuning number.
+
+[server]
+host = "127.0.0.1"                       # loopback only; nothing here is reachable off the box
+port = 9393
+model = "~/multivenue/models/Qwen3.5-9B-Q4_K_M.gguf"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+ctx_size = 4096                          # our prompts are <= 2 k; a bigger window is KV we do not use
+threads = 4                              # the GPU does the work; four threads keep the engine's P-cores free
+gpu_layers = 99                          # every layer on Metal
+parallel = 1                             # one slot: bounded KV, serialized requests, and the cycle sends one at a time
+cache_reuse = 256                        # the static prefix (schema + vocabulary) stays in KV; per item only the item prefills
+
+[tags]
+# The provenance string. It reaches `cascade.complete_cached` as the model, so
+# it becomes the prompt_cache PK and the triage.model / labels.model column —
+# which is what keeps this brain's rows out of the same bucket as
+# claude-haiku-4-5's, `session`'s, and any other local model's in the
+# scorecard's by_model split. Derived from the gguf stem when omitted.
+model_tag = "local:qwen3.5-9b-q4_k_m"
+
+[fallback]
+# doc 03 §5's downsize: if the memory gate trips, `llm-args --fallback` renders
+# this one instead. Its own tag, so promoted numbers never silently change model.
+model = "~/multivenue/models/Qwen3.5-4B-Q6_K.gguf"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+model_tag = "local:qwen3.5-4b-q6_k"

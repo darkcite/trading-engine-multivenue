@@ -158,7 +158,8 @@ Worker env keys (`.env.example` documents all): `AI_INGRESS_SOCK`,
 `CLAUDE_WORKER_DB`, `CLAUDE_WORKER_FEATURES_DIR`,
 `CLAUDE_WORKER_MARKET_MAP`, `RSS_FEEDS` (worker-only), the NEWS lane's
 `NEWS_TOML` (default `~/multivenue/news.toml`), `NEWS_POLICY_TOML`
-(default `~/multivenue/news-policy.toml`) and `CLAUDE_WORKER_NEWS_DIR`
+(default `~/multivenue/news-policy.toml`), `NEWS_LLM_TOML` (default
+`~/multivenue/llm.toml`) and `CLAUDE_WORKER_NEWS_DIR`
 (default `~/multivenue/worker/news`), and the 8h
 research-loop keys `CLAUDE_WORKER_STRATEGIST_INTERVAL_S`,
 `CLAUDE_WORKER_STRATEGIST_DAILY_CAP`,
@@ -360,6 +361,34 @@ Operational laws:
   pre-weighted 0.3). `news-policy.toml` (copy
   `news-policy.toml.example`) governs what may ever be SENT; absent
   file or unknown key = every action mode `off`.
+- **Local LLM sidecar** for the NEWS cascade's tiers 1-2 (doc 03;
+  `com.multivenue.llm` via `scripts/llm-serve.sh`, `KeepAlive`). OPTIONAL
+  and inert by default: absent `~/multivenue/llm.toml` means no local
+  tiers at all, and even with one present a tier is only asked of the
+  sidecar when `news-policy.toml` routes it there
+  (`[models] tier1 = "local:<gguf-stem>"`). Routing is the grant —
+  `llm.toml` alone grants nothing, and the rows a local tier writes are
+  CANDIDATE rows under their own model tag that feed no story, action or
+  digest until the operator promotes the tier.
+  Install: `brew install llama.cpp`; put Apache-2.0/MIT GGUF weights
+  under `~/multivenue/models/` (NEVER in the repo); `shasum -a 256` them
+  and pin that in `llm.toml` (copy `llm.toml.example`). The shell script
+  parses nothing — `uv run python -m claude_worker.news llm-args` reads
+  `llm.toml`, verifies the sha256 and prints the `llama-server` argv,
+  which the script execs behind `nice -n 10 taskpolicy -c utility`; a
+  weight file that does not match its pin is a refusal, not a silently
+  swapped brain. `… llm-health` reports up/down, which model is actually
+  being served versus which is pinned, and the server's own throughput
+  counters. Env: `NEWS_LLM_TOML` (default `~/multivenue/llm.toml`).
+  The sidecar binds 127.0.0.1 only, holds no key of any kind, and its
+  argv carries no `claude_worker`, so it is invisible to the global
+  worker guard and may be resident indefinitely. Local calls get their
+  OWN `budget` rows (`tier1_local`, …) bounded by
+  `[budget] local_calls_per_day`, never charged to the paid ceilings.
+  **Do NOT run `scripts/install-launchd.sh` to add this label** while a
+  live-armed engine stands — it restarts every agent including the
+  engine, and it now refuses to do so (see that script's header for the
+  by-hand, one-label recipe).
 - **xsd lane** (XSD-4, statarb doc 08 §3.7; `claude_worker.xsd_author`
   MODULE — never a verb: `candles.db` in, TSVs out, no `state.db` /
   `ai.sock` / seq namespace). The slot-2 cross-sectional member boots

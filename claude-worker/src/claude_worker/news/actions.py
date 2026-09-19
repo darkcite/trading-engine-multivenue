@@ -116,6 +116,15 @@ SECONDS_PER_HOUR: int = 3_600
 #: a half-life measured in minutes to hours — so re-emitting it would put a
 #: stale view on the wire.
 DRAIN_WINDOW_S: int = 24 * 3_600
+#: Local calls are NOT counted against the paid ceilings — those bound money,
+#: and a local call costs none. This bounds a RUNAWAY LOOP instead, which is
+#: the only failure a free call can have.
+DEFAULT_LOCAL_CALLS_PER_DAY: int = 5_000
+#: Local triages and labels per cycle invocation (doc 03 §4). Eight triages at
+#: ~1-2 s each with the static prefix in KV is ~15 s, inside the 30 s wall
+#: budget with the aggregator's own work.
+DEFAULT_TIER1_BATCH_MAX: int = 8
+DEFAULT_TIER2_BATCH_MAX: int = 2
 MIN_DECLARE_TTL_S: int = 60
 PX_QTY_SCALE: float = 1e6
 BPS: float = 1e4
@@ -161,10 +170,27 @@ class NewsPolicy:
     paper_allow: tuple[int, ...] = ()
     halt_allow: int = 0
     valid: bool = True
+    #: Which brain answers which tier (doc 03 amendment b). Empty means the
+    #: landed default: the pinned Anthropic models, which before Stage 3
+    #: means nothing answers automatically at all.
+    models: dict[str, str] = dataclasses.field(default_factory=dict)
+    local_calls_per_day: int = DEFAULT_LOCAL_CALLS_PER_DAY
+    tier1_batch_max: int = DEFAULT_TIER1_BATCH_MAX
+    tier2_batch_max: int = DEFAULT_TIER2_BATCH_MAX
 
     def mode(self, kind: str) -> str:
         """The mode for an action kind; `off` for anything unnamed."""
         return self.modes.get(kind, MODE_OFF)
+
+    def route(self, tier: str) -> str:
+        """The model string for a tier, or ``""`` when the policy says
+        nothing — which the caller reads as "the landed default"."""
+        return self.models.get(tier, "")
+
+    def routes_local(self, tier: str) -> bool:
+        """Whether this tier is routed at the local sidecar. A tier that is
+        NOT routed local is never asked of it, whatever is resident."""
+        return self.route(tier).startswith(MODEL_ROUTE_PREFIX_LOCAL)
 
 
 def _safe_policy(valid: bool = False) -> NewsPolicy:
@@ -193,12 +219,32 @@ _LIMIT_KEYS: frozenset[str] = frozenset(
 _INTENT_KEYS: frozenset[str] = frozenset(
     ("qty_usd_cap", "px_offset_bps_max", "ttl_max_s", "per_market_per_hour", "mid_max_age_s")
 )
+#: Where each tier's answer comes from (doc 03 amendment b). The value is
+#: opaque to the policy — `cascade.complete_cached` takes a model string and
+#: the `prompt_cache` PK separates brains by it — so this is routing, NOT a
+#: capability grant: a tier routed at a local model still produces candidate
+#: rows that feed nothing until the operator says otherwise.
+MODEL_SESSION: str = "session"
+MODEL_ROUTE_PREFIX_ANTHROPIC: str = "anthropic:"
+MODEL_ROUTE_PREFIX_LOCAL: str = "local:"
+_MODEL_KEYS: frozenset[str] = frozenset(("tier1", "tier2", "tier3"))
+
 _BUDGET_KEYS: frozenset[str] = frozenset(
-    ("tier1_calls_per_day", "tier2_calls_per_day", "tier3_calls_per_day")
+    (
+        "tier1_calls_per_day",
+        "tier2_calls_per_day",
+        "tier3_calls_per_day",
+        "local_calls_per_day",
+        "tier1_batch_max",
+        "tier2_batch_max",
+    )
 )
+
 _SLOT_KEYS: frozenset[str] = frozenset(("paper_allow",))
 _HALT_KEYS: frozenset[str] = frozenset(("allow",))
-_TOP_KEYS: frozenset[str] = frozenset(("mode", "limits", "budget", "intent", "slots", "halt"))
+_TOP_KEYS: frozenset[str] = frozenset(
+    ("mode", "limits", "budget", "intent", "slots", "halt", "models")
+)
 
 _TIER_OF_KEY: dict[str, str] = {
     "tier1_calls_per_day": claude_worker.news.cascade.TIER1,
@@ -245,6 +291,8 @@ def _policy_from(doc: typing.Mapping[str, object]) -> NewsPolicy:
     _reject_unknown("[slots]", slots_table, _SLOT_KEYS)
     halt_table = typing.cast(dict[str, object], doc.get("halt", {}))
     _reject_unknown("[halt]", halt_table, _HALT_KEYS)
+    models_table = typing.cast(dict[str, object], doc.get("models", {}))
+    _reject_unknown("[models]", models_table, _MODEL_KEYS)
     base = Limits()
     intent_base = IntentLimits()
     return NewsPolicy(
@@ -299,7 +347,46 @@ def _policy_from(doc: typing.Mapping[str, object]) -> NewsPolicy:
         paper_allow=_slots_from(slots_table),
         halt_allow=int(typing.cast(int, halt_table.get("allow", 0))),
         valid=True,
+        models=_models_from(models_table),
+        local_calls_per_day=int(
+            typing.cast(
+                int, budget_table.get("local_calls_per_day", DEFAULT_LOCAL_CALLS_PER_DAY)
+            )
+        ),
+        tier1_batch_max=int(
+            typing.cast(int, budget_table.get("tier1_batch_max", DEFAULT_TIER1_BATCH_MAX))
+        ),
+        tier2_batch_max=int(
+            typing.cast(int, budget_table.get("tier2_batch_max", DEFAULT_TIER2_BATCH_MAX))
+        ),
     )
+
+
+def _models_from(table: typing.Mapping[str, object]) -> dict[str, str]:
+    """`[models]`, validated by SHAPE not by contents (doc 03 amendment b).
+
+    A route must name a known brain family — `local:`, `anthropic:` or
+    `session` — because a typo that silently fell through to the landed
+    default would be the operator believing a tier is local when it is not.
+    WHICH local model or WHICH Anthropic model is not this file's business:
+    `llm.toml` pins the first and `config.py` pins the second, and both are
+    checked where they are used.
+    """
+    out: dict[str, str] = {}
+    for tier in sorted(_MODEL_KEYS):
+        value = table.get(tier)
+        if value is None:
+            continue
+        text = str(value)
+        known = (
+            text == MODEL_SESSION
+            or text.startswith(MODEL_ROUTE_PREFIX_LOCAL)
+            or text.startswith(MODEL_ROUTE_PREFIX_ANTHROPIC)
+        )
+        if not known:
+            raise ValueError(f"[models] {tier}: unknown route {text!r}")
+        out[tier] = text
+    return out
 
 
 def _modes_from(table: typing.Mapping[str, object]) -> dict[str, str]:

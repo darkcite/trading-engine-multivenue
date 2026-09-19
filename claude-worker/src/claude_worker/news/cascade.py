@@ -965,6 +965,7 @@ class NewsQueueWatcher:
         min_origins: int = DEFAULT_MIN_ORIGINS,
         max_assessments: int = DEFAULT_MAX_ASSESSMENTS,
         ids: typing.AbstractSet[str] | None = None,
+        budget_suffix: str = "",
     ) -> None:
         self._state = state
         self._store = store
@@ -985,7 +986,17 @@ class NewsQueueWatcher:
         # would be cached under `model = "session"` forever. `None` means
         # "everything due", which is what `serve` and every landed test want.
         self._ids: frozenset[str] | None = None if ids is None else frozenset(ids)
+        # Which `budget` rows this pass spends. A FREE brain must not add to
+        # the counter that means money: `complete_cached` writes
+        # `(day, tier)`, so the local sidecar passes `"_local"` here and gets
+        # `tier1_local` rows of its own, which is what keeps the scorecard's
+        # `cost_24h` honest without a schema change (doc 03 §4).
+        self._budget_suffix = budget_suffix
         self.stats: CascadeStats = CascadeStats()
+
+    def budget_tier(self, tier: str) -> str:
+        """The `budget` row this pass charges for ``tier``."""
+        return tier + self._budget_suffix
 
     # ---- tier 1 --------------------------------------------------------
 
@@ -1010,7 +1021,7 @@ class NewsQueueWatcher:
             self._state,
             self._store,
             self._ceilings,
-            TIER1,
+            self.budget_tier(TIER1),
             self._models.tier1,
             claude_worker.labeling.TRIAGE_PROMPT_VERSION_V2,
             prompt,
@@ -1181,7 +1192,7 @@ class NewsQueueWatcher:
             self._state,
             self._store,
             self._ceilings,
-            TIER2,
+            self.budget_tier(TIER2),
             self._models.tier2,
             claude_worker.labeling.LABEL_PROMPT_VERSION_V2,
             prompt,

@@ -55,6 +55,7 @@ import claude_worker.news
 import claude_worker.news.actions
 import claude_worker.news.cascade
 import claude_worker.news.cycle
+import claude_worker.news.local_llm
 import claude_worker.news.resolve
 import claude_worker.news.store
 import claude_worker.pnl_report
@@ -106,6 +107,10 @@ class Inputs:
     #: reader take a path from it that `worker_payload` never resolved.
     #: Defaulted so the two pre-NEWS call sites keep working.
     news_policy_path: pathlib.Path = pathlib.Path(claude_worker.news.DEFAULT_POLICY_TOML)
+    #: The local sidecar's artifact (doc 03 amendment d). Defaulted like
+    #: `news_policy_path`, and never DIALLED from a test: `llm_section` only
+    #: reaches the server when the config says one exists.
+    news_llm_path: pathlib.Path = pathlib.Path(claude_worker.news.DEFAULT_LLM_TOML)
     engine_url: str = ""
 
 
@@ -127,6 +132,7 @@ def inputs_from_env(env: typing.Mapping[str, str] | None = None) -> Inputs:
         ).expanduser(),
         news_dir=claude_worker.news.paths_from_env(e).news_dir,
         news_policy_path=claude_worker.news.paths_from_env(e).policy_path,
+        news_llm_path=claude_worker.news.paths_from_env(e).llm_path,
         engine_url=(e.get(ENGINE_URL_ENV, "") or ENGINE_URL_DEFAULT).rstrip("/"),
     )
 
@@ -440,6 +446,75 @@ def _news_red_rules(
     return out
 
 
+#: How long the page waits on the sidecar. The panel is a 10 s-cadence read;
+#: a model still loading must not hold it.
+NEWS_LLM_TIMEOUT_S: float = 1.5
+
+
+def llm_section(
+    inputs: Inputs, store: claude_worker.news.store.Store | None
+) -> dict[str, object]:
+    """The local sidecar's block (doc 03 amendment d).
+
+    Fail-soft like every other section, with one extra rule: an absent
+    `llm.toml` does NOT dial anything. A page that probed 127.0.0.1:9393 on
+    every refresh of a box with no sidecar would be a 10 s-cadence connection
+    error in the operator's log forever.
+    """
+    cfg = claude_worker.news.local_llm.load_config(inputs.news_llm_path)
+    out: dict[str, object] = {
+        "path": str(inputs.news_llm_path),
+        "present": cfg.present,
+        "valid": cfg.valid,
+        "model": cfg.model_tag,
+        "url": cfg.base_url if cfg.present else "",
+        "health": False,
+        "serving": "",
+        "match": None,
+        "metrics": {},
+        "calls_24h": 0,
+        "counters": {},
+    }
+    if store is not None:
+        counters = store.counters()
+        picked: dict[str, int] = {}
+        for name in sorted(counters):
+            if name.startswith("llm_"):
+                picked[name] = counters[name]
+        out["counters"] = picked
+        spent = 0
+        for tier in claude_worker.news.cascade.TIERS:
+            spent += store.budget_today(
+                claude_worker.news.local_llm.local_tier(tier), now_ts=None
+            )["calls"]
+        out["calls_24h"] = spent
+    if not cfg.present or not cfg.valid:
+        return out
+    try:
+        client = claude_worker.news.local_llm.LocalClient(
+            cfg.base_url, timeout_s=NEWS_LLM_TIMEOUT_S
+        )
+    except (OSError, ValueError):
+        return out
+    try:
+        out["health"] = client.health()
+        if not out["health"]:
+            return out
+        serving = claude_worker.news.local_llm.props_model_stem(client.props())
+        pinned = cfg.model_path.name.removesuffix(".gguf").lower()
+        out["serving"] = serving
+        out["match"] = None if not serving else serving == pinned
+        metrics = client.metrics()
+        keep: dict[str, float] = {}
+        for name in sorted(metrics):
+            if "llamacpp" in name:
+                keep[name] = metrics[name]
+        out["metrics"] = keep
+    finally:
+        client.close()
+    return out
+
+
 def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
     """The NEWS lane panel (NEWS spec §15).
 
@@ -466,7 +541,9 @@ def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
         "timeline_24h": [],
         "red_rules": [],
         "policy": {"path": str(inputs.news_policy_path), "valid": False, "modes": {}},
+        "llm": {},
     }
+    payload["llm"] = llm_section(inputs, None)
     policy = claude_worker.news.actions.load_policy(inputs.news_policy_path)
     payload["policy"] = {
         "path": str(inputs.news_policy_path),
@@ -501,6 +578,7 @@ def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
         payload["budget_today"] = _news_budget(store, policy.ceilings, now_ms // 1000)
         payload["timeline_24h"] = _news_timeline(store, since)
         payload["red_rules"] = _news_red_rules(payload, policy, registry_ok=True)
+        payload["llm"] = llm_section(inputs, store)
     except sqlite3.Error:
         pass
     finally:

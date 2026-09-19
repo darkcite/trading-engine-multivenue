@@ -41,6 +41,8 @@ TOML_ENV: str = "NEWS_TOML"
 DEFAULT_TOML: str = "~/multivenue/news.toml"
 POLICY_TOML_ENV: str = "NEWS_POLICY_TOML"
 DEFAULT_POLICY_TOML: str = "~/multivenue/news-policy.toml"
+LLM_TOML_ENV: str = "NEWS_LLM_TOML"
+DEFAULT_LLM_TOML: str = "~/multivenue/llm.toml"
 NEWS_DIR_ENV: str = "CLAUDE_WORKER_NEWS_DIR"
 DEFAULT_NEWS_DIR: str = "~/multivenue/worker/news"
 STATE_DB_ENV: str = "CLAUDE_WORKER_DB"
@@ -75,6 +77,10 @@ class NewsPaths:
 
     toml_path: pathlib.Path
     policy_path: pathlib.Path
+    #: The local-model sidecar's artifact (doc 03 §7). Absent means no local
+    #: tiers, which is the same honest no-op an absent `news.toml` gives the
+    #: whole lane.
+    llm_path: pathlib.Path
     news_dir: pathlib.Path
     db_path: pathlib.Path
     state_db_path: pathlib.Path
@@ -112,6 +118,7 @@ def paths_from_env(env: typing.Mapping[str, str] | None = None) -> NewsPaths:
     return NewsPaths(
         toml_path=_path_from(source, TOML_ENV, DEFAULT_TOML),
         policy_path=_path_from(source, POLICY_TOML_ENV, DEFAULT_POLICY_TOML),
+        llm_path=_path_from(source, LLM_TOML_ENV, DEFAULT_LLM_TOML),
         news_dir=news_dir,
         db_path=news_dir / DB_FILENAME,
         state_db_path=state_db,

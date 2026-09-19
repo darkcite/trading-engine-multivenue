@@ -165,6 +165,7 @@ def _worker_dir(tmp_path: pathlib.Path) -> claude_worker.dashboard.Inputs:
         multivenue_dir=mv,
         news_dir=worker / "news",
         news_policy_path=mv / "news-policy.toml",
+        news_llm_path=mv / "llm.toml",
         engine_url="http://127.0.0.1:1",  # nothing listens here — the proxy must 502
     )
 
@@ -235,6 +236,7 @@ def test_worker_payload_without_a_db_is_empty_not_an_error(tmp_path: pathlib.Pat
         multivenue_dir=tmp_path / "mv",
         news_dir=tmp_path / "news",
         news_policy_path=tmp_path / "news-policy.toml",
+        news_llm_path=tmp_path / "llm.toml",
         engine_url="http://127.0.0.1:1",
     )
     doc = claude_worker.dashboard.worker_payload(inputs, now_ms=0)
@@ -376,6 +378,11 @@ def test_the_news_panel_renders_without_a_store(tmp_path: pathlib.Path) -> None:
     assert news["stories_open"] == [] and news["actions_24h"] == []
     assert news["budget_today"] == {} and news["timeline_24h"] == []
     assert news["red_rules"] == []
+    # An absent llm.toml means no sidecar and, crucially, NOTHING DIALLED: a
+    # page that probed 127.0.0.1:9393 every 10 s on a box with no sidecar
+    # would be a connection error in the operator's log forever.
+    assert news["llm"]["present"] is False
+    assert news["llm"]["health"] is False and news["llm"]["url"] == ""
     # An absent policy is the SHIPPED state: every mode off, and VALID —
     # "the operator has not configured this" is a different thing from
     # "the operator's file has a mistake in it", and only the second is a

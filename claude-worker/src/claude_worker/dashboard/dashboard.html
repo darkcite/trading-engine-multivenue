@@ -339,6 +339,7 @@ function renderNews() {
   const keys = Object.keys(C).sort();
   if (keys.length) html += `<div class="muted" style="margin-top:6px">counters: ${keys.map(k => `${esc(k)}=${n(C[k], 0)}`).join(' · ')}</div>`;
   html += renderNewsPolicy(N);
+  html += renderNewsLlm(N);
   html += renderNewsStories(N);
   html += renderNewsScorecard(N);
   html += renderNewsMarkers(N);
@@ -379,6 +380,34 @@ function renderNewsPolicy(N) {
   out += `<div>budget today</div><div>${budget || '<span class="dim">none</span>'}</div>`;
   const A = N.actions_24h || [];
   out += `<div>actions 24 h</div><div>${A.length ? A.map(a => `${esc(a.kind)}/<span class="${cls(a.mode)}">${esc(a.mode)}</span> ${n(a.count, 0)}`).join('  ') : '<span class="dim">none</span>'}</div></div>`;
+  return out;
+}
+
+// The local model sidecar (doc 03 amendment d). Absent is silent: a box with
+// no llm.toml should not carry a row saying so on every refresh.
+function renderNewsLlm(N) {
+  const L = N.llm;
+  if (!L || !L.present) return '';
+  const cls = !L.valid ? 'bad' : !L.health ? 'warn' : L.match === false ? 'bad' : 'ok';
+  const state = !L.valid ? 'INVALID CONFIG' : !L.health ? 'down' : L.match === false ? 'WRONG MODEL' : 'up';
+  const M = L.metrics || {};
+  const pick = k => M[k] === undefined ? null : M[k];
+  const kv = [];
+  const pp = pick('llamacpp:prompt_tokens_total'), pt = pick('llamacpp:tokens_predicted_total');
+  if (pp !== null) kv.push(`prompt tok ${n(pp, 0)}`);
+  if (pt !== null) kv.push(`predicted tok ${n(pt, 0)}`);
+  const ps = pick('llamacpp:prompt_seconds_total'), gs = pick('llamacpp:tokens_predicted_seconds_total');
+  if (ps !== null && pp) kv.push(`prefill ${n(pp / Math.max(ps, 1e-9), 0)} tok/s`);
+  if (gs !== null && pt) kv.push(`decode ${n(pt / Math.max(gs, 1e-9), 1)} tok/s`);
+  const C = L.counters || {};
+  const ck = Object.keys(C).sort();
+  let out = `<div class="muted" style="margin-top:6px">local model — <span class="${cls}">${esc(state)}</span></div>`;
+  out += `<div class="kv"><div>model</div><div>${esc(L.model || '—')} <span class="dim">${esc(L.url)}</span>`;
+  if (L.serving && L.match === false) out += ` <span class="bad">serving ${esc(L.serving)}</span>`;
+  out += `</div><div>calls today</div><div>${n(L.calls_24h, 0)} <span class="dim">(own budget rows; never charged to the paid ceilings)</span></div>`;
+  if (kv.length) out += `<div>throughput</div><div>${kv.join('  ')}</div>`;
+  if (ck.length) out += `<div>counters</div><div>${ck.map(k => `${esc(k.replace(/^llm_/, ''))}=${n(C[k], 0)}`).join('  ')}</div>`;
+  out += '</div>';
   return out;
 }
 
