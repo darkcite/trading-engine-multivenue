@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- NEWS aggregation cycle (TEMPLATE — rendered by install-launchd.sh;
+     NEWS spec §12): every 60 s the worker fetches every DUE source,
+     parses it, runs tier 0 and stores the result under
+     ~/multivenue/worker/news/. Per-source due times mean most slots
+     fetch only a handful. No model is reached here. Absent
+     ~/multivenue/news.toml = no-op; any live worker invocation
+     (including serve) makes the slot skip. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.multivenue.news</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@REPO@/scripts/news-cycle.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/news.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/news.log</string>
+</dict>
+</plist>

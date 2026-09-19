@@ -156,7 +156,10 @@ Worker env keys (`.env.example` documents all): `AI_INGRESS_SOCK`,
 `AI_INGRESS_HMAC_KEY`, `AI_RULESET_DIR`, `CLAUDE_WORKER_REPLAY_DIR`
 (required — point at the engine `MULTIVENUE_LOG_DIR`),
 `CLAUDE_WORKER_DB`, `CLAUDE_WORKER_FEATURES_DIR`,
-`CLAUDE_WORKER_MARKET_MAP`, `RSS_FEEDS` (worker-only), and the 8h
+`CLAUDE_WORKER_MARKET_MAP`, `RSS_FEEDS` (worker-only), the NEWS lane's
+`NEWS_TOML` (default `~/multivenue/news.toml`), `NEWS_POLICY_TOML`
+(default `~/multivenue/news-policy.toml`) and `CLAUDE_WORKER_NEWS_DIR`
+(default `~/multivenue/worker/news`), and the 8h
 research-loop keys `CLAUDE_WORKER_STRATEGIST_INTERVAL_S`,
 `CLAUDE_WORKER_STRATEGIST_DAILY_CAP`,
 `CLAUDE_WORKER_REST_BUDGET_PER_H` (design §7.5; the REST budget is
@@ -329,6 +332,31 @@ Operational laws:
   1 m candles (≈ 1.5 s, one page per instrument) right before every
   boot so the seed reaches the boot minute — the fast profile no longer
   spends its first hour UNKNOWN after a restart.
+- **NEWS lane** (NEWS spec §12; `claude_worker.news` MODULE — never a
+  verb; 60-second `com.multivenue.news` agent via
+  `scripts/news-cycle.sh`, installed by the same installer): honest
+  no-op until `~/multivenue/news.toml` exists (copy
+  `news.toml.example`, set `[news] user_agent` to something carrying a
+  real contact — the SEC refuses a browser UA — and fill
+  `[calendar] bls_releases` from the BLS schedule). Each cycle fetches
+  every DUE source (per-source `poll_s`, so a 60 s slot usually fetches
+  a handful), parses it, runs tier 0 and stores items, snapshots and
+  series under `~/multivenue/worker/news/news.db`. **No model is
+  reached by the cycle** — tier 0 is free, and the Haiku → Sonnet →
+  Opus cascade runs inside `serve` (Stage 3) or from the operator's own
+  session lanes. Per-source budgets, a one-hop same-origin redirect
+  rule and a hard origin check make an impersonated feed a counted
+  refusal rather than an input. Operator lanes:
+  `uv run python -m claude_worker.news health` (per-source ok/total and
+  error streaks; exit 1 when an enabled source is 10 failures deep),
+  `… report [--hours 24]` (the funnel: items by tier-0 verdict, passes
+  per source, events), `… probe --source <name> [--record]` (one fetch
+  of one source; `--record` writes that kind's test fixture — the keyed
+  fields only, ≤ 32 KB) and `… migrate-feeds` (turns the process
+  environment's `RSS_FEEDS` into `sources` stanzas to paste, mills
+  pre-weighted 0.3). `news-policy.toml` (copy
+  `news-policy.toml.example`) governs what may ever be SENT; absent
+  file or unknown key = every action mode `off`.
 - **xsd lane** (XSD-4, statarb doc 08 §3.7; `claude_worker.xsd_author`
   MODULE — never a verb: `candles.db` in, TSVs out, no `state.db` /
   `ai.sock` / seq namespace). The slot-2 cross-sectional member boots

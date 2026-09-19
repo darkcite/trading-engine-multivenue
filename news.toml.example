@@ -1,0 +1,137 @@
+# NEWS lane registry — copy to ~/multivenue/news.toml and edit `user_agent`
+# (SEC refuses a browser UA and asks for a contact) plus `[calendar]
+# bls_releases` (BLS publishes the year's schedule; no keyless JSON serves
+# it). Read ONCE per lane run; an edit applies at the next `cycle`.
+#
+# Every URL here answered 200 from the operator's Mac on 2026-09-19 and every
+# stanza was confirmed by `python -m claude_worker.news probe --source <name>`.
+# A source that stops answering is COUNTED, never alerted: see `health`.
+
+[news]
+poll_default_s   = 60      # per-source default; each source may override
+text_cap         = 2000    # chars of item text kept and shown to a model
+story_window_s   = 21600   # 6 h clustering window
+near_dup_jaccard = 0.6     # tier-0 title-token Jaccard threshold
+near_dup_window_s = 21600
+user_agent       = "multivenue-news/1 (+contact: operator@example.invalid)"
+items_retention_days     = 14
+snapshots_retention_days = 30
+
+[keywords]
+# Tier-0 vocabulary EXTENSION. Asset and venue names are DERIVED from
+# market-map.json and the newest run's instrument manifest — never listed
+# here. Matching is word-boundary on BOTH sides, so a stem like "insolven"
+# would match nothing: spell each form you mean.
+event = ["listing", "listings", "delist", "delisting", "delistings", "maintenance",
+         "downtime", "exploit", "hack", "hacked", "drained", "insolvency", "insolvent",
+         "halt", "halted", "withdrawals", "SEC", "CFTC", "ETF", "ETFs", "FOMC",
+         "rate decision", "CPI", "nonfarm", "payrolls", "stablecoin", "depeg",
+         "liquidation", "liquidations", "upgrade", "hard fork"]
+
+[calendar]
+# Operator-maintained. Fill bls_releases from the BLS schedule page.
+bls_releases = []
+fixed_daily  = [{ kind = "pm_daily_resolve", at = "16:00" }, { kind = "hip4_daily_settle", at = "00:00" },
+                { kind = "engine_restart", at = "00:10" }, { kind = "engine_restart", at = "08:30" },
+                { kind = "engine_restart", at = "16:05" }]
+
+[registry]
+# ONE inline table per source, ONE LINE each: an array of inline tables is
+# valid TOML, a one-line `[[source]] k=v k=v` is not, and an inline table may
+# neither span lines nor carry a comment inside its braces.
+sources = [
+  # ---- class A: instrument sets ----
+  { name = "bn-usdm-instruments", kind = "instruments-bn-usdm", url = "https://fapi.binance.com/fapi/v1/exchangeInfo", origin = "fapi.binance.com", class = "A", venue = "binance", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "okx-instruments-swap", kind = "instruments-okx", url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP", origin = "www.okx.com", class = "A", venue = "okx", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "okx-instruments-spot", kind = "instruments-okx", url = "https://www.okx.com/api/v5/public/instruments?instType=SPOT", origin = "www.okx.com", class = "A", venue = "okx", poll_s = 600, weight = 1.0, enabled = 1 },
+  { name = "deribit-instruments-btc-future", kind = "instruments-deribit", url = "https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=future", origin = "www.deribit.com", class = "A", venue = "deribit", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "deribit-instruments-any-future", kind = "instruments-deribit", url = "https://www.deribit.com/api/v2/public/get_instruments?currency=any&kind=future", origin = "www.deribit.com", class = "A", venue = "deribit", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "deribit-instruments-btc-option", kind = "instruments-deribit", url = "https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=option", origin = "www.deribit.com", class = "A", venue = "deribit", poll_s = 900, weight = 1.0, enabled = 1 },
+  { name = "coinbase-products", kind = "instruments-coinbase", url = "https://api.exchange.coinbase.com/products", origin = "api.exchange.coinbase.com", class = "A", venue = "coinbase", poll_s = 600, weight = 1.0, enabled = 1 },
+
+  # ---- class A: venue status ----
+  { name = "okx-status", kind = "status-okx", url = "https://www.okx.com/api/v5/system/status", origin = "www.okx.com", class = "A", venue = "okx", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "deribit-status", kind = "status-deribit", url = "https://www.deribit.com/api/v2/public/status", origin = "www.deribit.com", class = "A", venue = "deribit", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "bybit-status", kind = "status-bybit", url = "https://api.bybit.com/v5/system/status", origin = "api.bybit.com", class = "A", venue = "bybit", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "kraken-status", kind = "status-kraken", url = "https://api.kraken.com/0/public/SystemStatus", origin = "api.kraken.com", class = "A", venue = "kraken", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "binance-ping", kind = "ping-binance", url = "https://api.binance.com/api/v3/ping", origin = "api.binance.com", class = "A", venue = "binance", poll_s = 60, weight = 1.0, enabled = 1 },
+
+  # ---- class A: calendars ----
+  { name = "fed-calendar", kind = "calendar-fed", url = "https://www.federalreserve.gov/json/calendar.json", origin = "www.federalreserve.gov", class = "A", poll_s = 3600, weight = 1.0, enabled = 1 },
+
+  # ---- class B: venue announcements ----
+  { name = "okx-announcements", kind = "json-okx-ann", url = "https://www.okx.com/api/v5/support/announcements", origin = "www.okx.com", class = "B", venue = "okx", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "deribit-announcements", kind = "json-deribit-ann", url = "https://www.deribit.com/api/v2/public/get_announcements", origin = "www.deribit.com", class = "B", venue = "deribit", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "bybit-announcements", kind = "json-bybit-ann", url = "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=20", origin = "api.bybit.com", class = "B", venue = "bybit", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "binance-cms-listings", kind = "json-binance-cms", url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=48&pageNo=1&pageSize=20", origin = "www.binance.com", class = "B", venue = "binance", poll_s = 120, weight = 1.0, enabled = 1 },
+
+  # ---- class C: venue-origin blogs and status feeds (pass tier 0 unconditionally) ----
+  { name = "deribit-insights", kind = "rss", url = "https://insights.deribit.com/feed/", origin = "insights.deribit.com", class = "C", venue = "deribit", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "kraken-blog", kind = "rss", url = "https://blog.kraken.com/feed", origin = "blog.kraken.com", class = "C", venue = "kraken", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "hyperliquid-medium", kind = "rss", url = "https://medium.com/feed/@hyperliquid", origin = "medium.com", class = "C", venue = "hyperliquid", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "kraken-status-rss", kind = "rss", url = "https://status.kraken.com/history.rss", origin = "status.kraken.com", class = "C", venue = "kraken", poll_s = 120, weight = 1.0, enabled = 1, allow_statuspage = 1 },
+  { name = "coinbase-status-rss", kind = "rss", url = "https://status.coinbase.com/history.rss", origin = "status.coinbase.com", class = "C", venue = "coinbase", poll_s = 120, weight = 1.0, enabled = 1, allow_statuspage = 1 },
+
+  # ---- class C: crypto press ----
+  { name = "cointelegraph", kind = "rss", url = "https://cointelegraph.com/rss", origin = "cointelegraph.com", class = "C", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "theblock", kind = "rss", url = "https://www.theblock.co/rss.xml", origin = "www.theblock.co", class = "C", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "thedefiant", kind = "rss", url = "https://thedefiant.io/feed", origin = "thedefiant.io", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "blockworks", kind = "rss", url = "https://blockworks.com/feed", origin = "blockworks.com", class = "C", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "dlnews", kind = "rss", url = "https://www.dlnews.com/arc/outboundfeeds/rss/", origin = "www.dlnews.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "decrypt", kind = "rss", url = "https://decrypt.co/feed", origin = "decrypt.co", class = "C", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "coindesk", kind = "rss", url = "https://www.coindesk.com/arc/outboundfeeds/rss/", origin = "www.coindesk.com", class = "C", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "cryptobriefing", kind = "rss", url = "https://cryptobriefing.com/feed/", origin = "cryptobriefing.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "beincrypto", kind = "rss", url = "https://beincrypto.com/feed/", origin = "beincrypto.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "bitcoinmagazine", kind = "rss", url = "https://bitcoinmagazine.com/.rss/full/", origin = "bitcoinmagazine.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "cryptoslate", kind = "rss", url = "https://cryptoslate.com/feed/", origin = "cryptoslate.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "bitcoin-com", kind = "rss", url = "https://news.bitcoin.com/feed/", origin = "news.bitcoin.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "protos", kind = "rss", url = "https://protos.com/feed/", origin = "protos.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "unchained", kind = "rss", url = "https://unchainedcrypto.com/feed/", origin = "unchainedcrypto.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+
+  # ---- class C: the SEO mills — weight 0.3, never an independent origin ----
+  { name = "cryptopotato", kind = "rss", url = "https://cryptopotato.com/feed/", origin = "cryptopotato.com", class = "C", poll_s = 600, weight = 0.3, enabled = 1 },
+  { name = "cryptonews", kind = "rss", url = "https://cryptonews.com/news/feed/", origin = "cryptonews.com", class = "C", poll_s = 600, weight = 0.3, enabled = 1 },
+  { name = "utoday", kind = "rss", url = "https://u.today/rss", origin = "u.today", class = "C", poll_s = 600, weight = 0.3, enabled = 1 },
+  { name = "ambcrypto", kind = "rss", url = "https://ambcrypto.com/feed/", origin = "ambcrypto.com", class = "C", poll_s = 600, weight = 0.3, enabled = 1 },
+  { name = "newsbtc", kind = "rss", url = "https://www.newsbtc.com/feed/", origin = "www.newsbtc.com", class = "C", poll_s = 600, weight = 0.3, enabled = 1 },
+  { name = "bitcoinist", kind = "rss", url = "https://bitcoinist.com/feed/", origin = "bitcoinist.com", class = "C", poll_s = 600, weight = 0.3, enabled = 1 },
+
+  # ---- class C: macro / official ----
+  { name = "sec-press", kind = "rss", url = "https://www.sec.gov/news/pressreleases.rss", origin = "www.sec.gov", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "sec-speeches", kind = "rss", url = "https://www.sec.gov/news/speeches-statements.rss", origin = "www.sec.gov", class = "C", poll_s = 600, weight = 1.0, enabled = 1 },
+  { name = "cftc-press", kind = "rss", url = "https://www.cftc.gov/RSS/RSSGP/rssgp.xml", origin = "www.cftc.gov", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "fed-press-all", kind = "rss", url = "https://www.federalreserve.gov/feeds/press_all.xml", origin = "www.federalreserve.gov", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "fed-monetary", kind = "rss", url = "https://www.federalreserve.gov/feeds/press_monetary.xml", origin = "www.federalreserve.gov", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "yahoo-top", kind = "rss", url = "https://finance.yahoo.com/rss/topstories", origin = "finance.yahoo.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "cnbc-top", kind = "rss", url = "https://www.cnbc.com/id/100003114/device/rss/rss.html", origin = "www.cnbc.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+
+  # ---- class C: query primitives ----
+  # gdelt-crypto, hn-newest and arxiv-qfin-tr each failed a probe on
+  # 2026-09-19 from the operator's network: GDELT alternates a 429
+  # rate-limit notice with a bare `{}`, hnrss.org intermittently 502s, and
+  # export.arxiv.org answers 406 to every User-Agent tried. The URLs
+  # themselves are right (all three have answered 200 here or in the
+  # survey), so the stanzas ship and their failures are COUNTED, never
+  # alerted — `health` is where you look.
+  { name = "gnews-venues", kind = "google-news", url = "", query = "hyperliquid OR deribit OR okx OR bybit OR binance", origin = "news.google.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "gnews-macro", kind = "google-news", url = "", query = "bitcoin ETF OR crypto SEC OR stablecoin", origin = "news.google.com", class = "C", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "gdelt-crypto", kind = "gdelt", url = "", query = "(bitcoin OR ethereum OR crypto exchange)", origin = "api.gdeltproject.org", class = "C", poll_s = 3600, weight = 1.0, rate = "1/5s", enabled = 1 },
+  { name = "hn-newest", kind = "hnrss", url = "", query = "crypto OR bitcoin", origin = "hnrss.org", class = "C", poll_s = 600, weight = 1.0, enabled = 1 },
+  { name = "reddit-cc", kind = "reddit-rss", url = "https://www.reddit.com/r/CryptoCurrency/new/.rss", origin = "www.reddit.com", class = "C", poll_s = 300, weight = 0.5, enabled = 1 },
+  { name = "4chan-biz", kind = "json-4chan-catalog", url = "https://a.4cdn.org/biz/catalog.json", origin = "a.4cdn.org", class = "C", poll_s = 900, weight = 0.3, enabled = 1 },
+  { name = "arxiv-qfin-tr", kind = "arxiv-api", url = "http://export.arxiv.org/api/query?search_query=cat:q-fin.TR&sortBy=submittedDate&max_results=25", origin = "export.arxiv.org", class = "C", poll_s = 3600, weight = 1.0, enabled = 1 },
+
+  # ---- class D: numeric series (no events, no model) ----
+  { name = "bn-ls-global", kind = "series-bn-ls", url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=5m&limit=1", origin = "fapi.binance.com", class = "D", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "bn-ls-top", kind = "series-bn-top-ls", url = "https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=BTCUSDT&period=5m&limit=1", origin = "fapi.binance.com", class = "D", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "bn-taker", kind = "series-bn-taker", url = "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=5m&limit=1", origin = "fapi.binance.com", class = "D", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "bn-oi", kind = "series-bn-oi", url = "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=1", origin = "fapi.binance.com", class = "D", poll_s = 300, weight = 1.0, enabled = 1 },
+  { name = "deribit-dvol", kind = "series-dvol", url = "https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=3600&start_timestamp=1767225600000&end_timestamp=4070908800000", origin = "www.deribit.com", class = "D", poll_s = 3600, weight = 1.0, enabled = 1 },
+  { name = "cftc-cot", kind = "series-cftc-cot", url = "https://publicreporting.cftc.gov/resource/6dca-aqww.json?$limit=5&$q=BITCOIN&$order=report_date_as_yyyy_mm_dd%20DESC", origin = "publicreporting.cftc.gov", class = "D", poll_s = 86400, weight = 1.0, enabled = 1 },
+  { name = "fng", kind = "series-fng", url = "https://api.alternative.me/fng/?limit=1", origin = "api.alternative.me", class = "D", poll_s = 3600, weight = 1.0, enabled = 1 },
+  { name = "defillama-stables", kind = "series-defillama-stables", url = "https://stablecoins.llama.fi/stablecoins", origin = "stablecoins.llama.fi", class = "D", poll_s = 3600, weight = 1.0, enabled = 1 },
+  { name = "mempool-fees", kind = "series-mempool-fees", url = "https://mempool.space/api/v1/fees/recommended", origin = "mempool.space", class = "D", poll_s = 600, weight = 1.0, enabled = 1 },
+  { name = "blockchain-stats", kind = "series-blockchain-stats", url = "https://api.blockchain.info/stats", origin = "api.blockchain.info", class = "D", poll_s = 3600, weight = 1.0, enabled = 1 },
+  { name = "kalshi-markets", kind = "series-kalshi", url = "https://api.elections.kalshi.com/trade-api/v2/markets?limit=100", origin = "api.elections.kalshi.com", class = "D", poll_s = 600, weight = 1.0, enabled = 1 },
+  { name = "manifold-markets", kind = "series-manifold", url = "https://api.manifold.markets/v0/markets?limit=100", origin = "api.manifold.markets", class = "D", poll_s = 600, weight = 1.0, enabled = 1 },
+]

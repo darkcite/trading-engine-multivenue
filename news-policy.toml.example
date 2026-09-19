@@ -1,0 +1,61 @@
+# NEWS action policy — copy to ~/multivenue/news-policy.toml.
+#
+# This file is the ONLY thing standing between a model's opinion and a frame
+# on the wire, so it is read fresh at every lane run and every serve tick: an
+# edit takes effect without a restart, and a mode can be pulled back to
+# `off` in the time it takes to save.
+#
+# ABSENT FILE => every mode `off` (shadow-only, nothing is ever sent).
+# UNKNOWN KEY => every mode `off` and `policy_invalid` counted on the
+# dashboard — a typo silences the lane rather than half-configuring it.
+
+[mode]                        # off | shadow | live, per action kind
+# `shadow` records exactly what WOULD have been sent, with the frame fields
+# filled in, and sends nothing. That is how a claim earns the right to go
+# live: the N4 gate reads the shadow record against the tape.
+set_bias           = "shadow"  # live only after the N4 direction gate
+declare_vol_high   = "shadow"  # live only after 8 windows of confirmed vol calls
+order_intent       = "shadow"  # live only after N4 AND 8 windows of clean intents
+disable_paper_slot = "off"     # Q4: v1 alerts, it does not disable
+propose            = "live"    # universe / xsd proposals are FILES; always safe
+alert              = "live"    # writing ALERT touches no venue
+
+[limits]
+min_origins                = 2      # class-C corroboration; weight < 1.0 never counts
+min_confidence_bias        = 0.7    # commander.Policy.min_confidence stays the floor
+bias_scale_1e6             = 20000
+ttl_cap_s                  = 14400  # 4 h — the HORIZON law: a vol word carries
+                                    # nothing below 1-4 h, so a longer TTL is a
+                                    # claim the measurement cannot support
+regime_cooldown_s          = 3600   # per profile, between declarations
+max_live_actions_per_hour  = 4      # per kind
+story_max_assessments      = 2      # initial + one update when origins grow
+
+[budget]                      # daily ceilings in CALLS; the cascade SKIPS and
+                              # counts when one is hit — it never waits
+tier1_calls_per_day = 600     # Haiku triage
+tier2_calls_per_day = 120     # Sonnet story labels
+tier3_calls_per_day = 24      # Opus 5 analyst
+
+[intent]                      # Q11 — paper OrderIntent clamps, applied BEFORE
+                              # the engine's own caps, never instead of them
+qty_usd_cap         = 1000.0  # per intent
+px_offset_bps_max   = 50      # |offset| from the current mid an intent may name
+ttl_max_s           = 900
+per_market_per_hour = 2
+mid_max_age_s       = 120     # the newest capture tick for the sym must be
+                              # younger than this, else the intent is refused
+                              # (`no_fresh_mid`) — an intent priced off a stale
+                              # mid is a worse trade than no trade
+
+[slots]
+# Slots the maintenance path MAY disable when its mode is not `off`. A slot
+# that exec.toml names LIVE is refused regardless of what is listed here:
+# a live slot never falls back to paper (LAW E-1).
+paper_allow = [1, 2, 4, 5, 6]
+
+[halt]
+# Q5: `halt` is not in the assessment grammar and is not honoured in v1 even
+# when this is 1. `venue_risk = critical` produces a RED ALERT, not a halt.
+# Kept so the file's shape is future-proof.
+allow = 0
