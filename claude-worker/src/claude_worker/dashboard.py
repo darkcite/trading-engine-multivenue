@@ -52,6 +52,10 @@ import claude_worker.features
 import claude_worker.frames
 import claude_worker.library
 import claude_worker.news
+import claude_worker.news.actions
+import claude_worker.news.cascade
+import claude_worker.news.cycle
+import claude_worker.news.resolve
 import claude_worker.news.store
 import claude_worker.pnl_report
 import claude_worker.regime
@@ -96,7 +100,13 @@ class Inputs:
     replay_dir: pathlib.Path
     multivenue_dir: pathlib.Path
     news_dir: pathlib.Path
-    engine_url: str
+    #: The NEWS action policy. Its own field beside `news_dir` rather than a
+    #: whole `NewsPaths` (the shape §15 names): this class is the ONE place
+    #: the page's inputs are resolved, and a nested record here would let a
+    #: reader take a path from it that `worker_payload` never resolved.
+    #: Defaulted so the two pre-NEWS call sites keep working.
+    news_policy_path: pathlib.Path = pathlib.Path(claude_worker.news.DEFAULT_POLICY_TOML)
+    engine_url: str = ""
 
 
 def inputs_from_env(env: typing.Mapping[str, str] | None = None) -> Inputs:
@@ -116,6 +126,7 @@ def inputs_from_env(env: typing.Mapping[str, str] | None = None) -> Inputs:
             e.get(MULTIVENUE_DIR_ENV, "") or MULTIVENUE_DIR_DEFAULT
         ).expanduser(),
         news_dir=claude_worker.news.paths_from_env(e).news_dir,
+        news_policy_path=claude_worker.news.paths_from_env(e).policy_path,
         engine_url=(e.get(ENGINE_URL_ENV, "") or ENGINE_URL_DEFAULT).rstrip("/"),
     )
 
@@ -233,6 +244,12 @@ NEWS_WINDOW_S: int = 86_400
 NEWS_EVENTS_MAX: int = 20
 #: Instruments named inside a collapsed events row.
 NEWS_EVENT_SAMPLE: int = 3
+#: Open stories the board shows (spec §15).
+NEWS_STORIES_MAX: int = 20
+#: Markers drawn onto the regime timeline (spec §15).
+NEWS_TIMELINE_MAX: int = 200
+#: Chars of a story title carried into a timeline marker.
+NEWS_TITLE_MAX: int = 120
 
 
 def _news_events(
@@ -250,41 +267,14 @@ def _news_events(
     for days and hide every listing, delisting and maintenance event
     behind them. Events sharing (kind, venue, at_ts) therefore collapse to
     one row naming the count, exactly as `calendar.json` does.
+
+    The rule itself lives in `store.recent_events`, because the tier-3
+    analyst's context block wants the same tail and was wrong in the same
+    two ways before it shared this one (2026-09-20).
     """
-    rows = store.events_since(since_ts)
-    groups: dict[tuple[str, str, int], list[dict[str, object]]] = {}
-    for i in range(len(rows)):
-        row = rows[i]
-        key = (str(row["kind"]), str(row["venue"]), int(typing.cast(int, row["at_ts"])))
-        groups.setdefault(key, []).append(row)
-    collapsed: list[dict[str, object]] = []
-    for members in groups.values():
-        collapsed.append(_collapse_events(members))
-    collapsed.sort(key=lambda row: int(typing.cast(int, row["id"])))
-    return collapsed[-limit:]
-
-
-def _collapse_events(members: list[dict[str, object]]) -> dict[str, object]:
-    """One row for a group of events that share a kind, a venue and an
-    instant. A group of one is returned untouched."""
-    if len(members) == 1:
-        return members[0]
-    members.sort(key=lambda row: str(row["instrument"]))
-    names: list[str] = []
-    for i in range(len(members)):
-        names.append(str(members[i]["instrument"]))
-    newest = dict(members[len(members) - 1])
-    for i in range(len(members)):
-        newest["id"] = max(
-            int(typing.cast(int, newest["id"])), int(typing.cast(int, members[i]["id"]))
-        )
-    shown = ", ".join(names[:NEWS_EVENT_SAMPLE])
-    extra = len(names) - NEWS_EVENT_SAMPLE
-    newest["instrument"] = ""
-    newest["detail"] = (
-        f"{len(names)} instruments ({shown}" + (f", +{extra} more)" if extra > 0 else ")")
+    return claude_worker.news.store.recent_events(
+        store, since_ts, limit, NEWS_EVENT_SAMPLE
     )
-    return newest
 
 
 def _news_funnel(
@@ -297,6 +287,157 @@ def _news_funnel(
         verdict = str(rows[i]["tier0"])
         by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
     return by_verdict, len(rows)
+
+
+def _news_stories(
+    store: claude_worker.news.store.Store, since_ts: int
+) -> list[dict[str, object]]:
+    """The stories board (spec §15): one row per open story with its label,
+    the resolution that will judge it, and the policy's verdict.
+
+    Three tables joined in Python rather than SQL because each is a
+    one-row lookup by primary key and the board is capped at twenty — and
+    because a LEFT JOIN across labels, resolutions and actions would make
+    a missing row indistinguishable from an empty one, which is exactly
+    the distinction the operator is reading for.
+    """
+    out: list[dict[str, object]] = []
+    stories = store.stories_open(since_ts)
+    start = max(0, len(stories) - NEWS_STORIES_MAX)
+    verdicts = _news_verdicts(store, since_ts)
+    for i in range(start, len(stories)):
+        story = stories[i]
+        story_id = str(story["story_id"])
+        row = dict(story)
+        row["label"] = store.label(story_id)
+        row["resolution"] = store.resolution(
+            claude_worker.news.resolve.SUBJECT_LABEL, story_id
+        )
+        row["verdict"] = verdicts.get(story_id)
+        out.append(row)
+    return out
+
+
+def _news_verdicts(
+    store: claude_worker.news.store.Store, since_ts: int
+) -> dict[str, dict[str, object]]:
+    """The NEWEST bias verdict per story. A story whose label was refused
+    and later emitted should read as emitted, not as both."""
+    out: dict[str, dict[str, object]] = {}
+    rows = store.actions_since(since_ts)
+    for i in range(len(rows)):
+        row = rows[i]
+        if str(row["kind"]) != claude_worker.news.actions.KIND_SET_BIAS:
+            continue
+        out[str(row["story_id"])] = {
+            "mode": row["mode"],
+            "refused_reason": row["refused_reason"],
+            "ts": row["ts"],
+            "seq": row["seq"],
+        }
+    return out
+
+
+def _news_actions(
+    store: claude_worker.news.store.Store, since_ts: int
+) -> list[dict[str, object]]:
+    """Actions of the window counted by (kind, mode) — the whole record of
+    what the policy let through, and what it did not."""
+    counts: dict[tuple[str, str], int] = {}
+    rows = store.actions_since(since_ts)
+    for i in range(len(rows)):
+        key = (str(rows[i]["kind"]), str(rows[i]["mode"]))
+        counts[key] = counts.get(key, 0) + 1
+    out: list[dict[str, object]] = []
+    for kind, mode in sorted(counts):
+        out.append({"kind": kind, "mode": mode, "count": counts[(kind, mode)]})
+    return out
+
+
+def _news_budget(
+    store: claude_worker.news.store.Store, ceilings: typing.Mapping[str, int], now_ts: int
+) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for i in range(len(claude_worker.news.cascade.TIERS)):
+        tier = claude_worker.news.cascade.TIERS[i]
+        spent = store.budget_today(tier, now_ts)
+        out[tier] = {
+            "calls": spent["calls"],
+            "skipped": spent["skipped"],
+            "ceiling": int(ceilings.get(tier, 0)),
+        }
+    return out
+
+
+def _news_timeline(
+    store: claude_worker.news.store.Store, since_ts: int
+) -> list[dict[str, object]]:
+    """Markers for the existing regime timeline (spec §15).
+
+    A marker is a CLAIM with what became of it: the arrow is its direction,
+    the bar its horizon, the colour whether it is still pending, hit or
+    missed. Claims with no direction are carried too — they are real
+    answers about vol, and leaving them out would make the timeline look
+    more directional than the lane is.
+    """
+    out: list[dict[str, object]] = []
+    rows = store.resolutions_since(since_ts)
+    for i in range(len(rows)):
+        row = rows[i]
+        kind = str(row["subject_kind"])
+        marker: dict[str, object] = {
+            "ts": int(typing.cast(int, row["t0"])) * 1000,
+            "kind": kind,
+            "story_id": row["subject_id"],
+            "descriptor": row["descriptor"],
+            "direction": row["direction"],
+            "confidence": row["confidence"],
+            "horizon_s": row["horizon_s"],
+            "state": row["state"],
+            "hit": row["hit"],
+            "signed_bps": row["signed_bps"],
+            "vol_reached_high": row["vol_reached_high"],
+        }
+        if kind == claude_worker.news.resolve.SUBJECT_LABEL:
+            story = store.story(str(row["subject_id"]))
+            if story is not None:
+                marker["event_type"] = story["event_type"]
+                marker["assets"] = story["assets"]
+                items = store.story_items(str(row["subject_id"]), 1)
+                if items:
+                    marker["title"] = str(items[0]["title"])[:NEWS_TITLE_MAX]
+        out.append(marker)
+    return out[-NEWS_TIMELINE_MAX:]
+
+
+def _news_red_rules(
+    payload: typing.Mapping[str, object],
+    policy: claude_worker.news.actions.NewsPolicy,
+    registry_ok: bool,
+) -> list[str]:
+    """The four §15 red rules, as sentences the page prints verbatim.
+
+    The maintenance rule is NOT recomputed here: `detect.maintenance_alerts`
+    owns it and writes the ALERT file, which the panel already shows. Two
+    implementations of "a member is enabled on a venue under maintenance"
+    would eventually disagree, and the one on the page is the one the
+    operator would trust.
+    """
+    out: list[str] = []
+    if not policy.valid:
+        out.append("policy invalid — every action mode is off")
+    if not registry_ok:
+        out.append("registry invalid — the lane is not aggregating")
+    rows = payload.get("sources")
+    if isinstance(rows, list):
+        for i in range(len(rows)):
+            row = rows[i]
+            if not isinstance(row, dict) or not int(row.get("enabled") or 0):
+                continue
+            streak = int(row.get("err_streak") or 0)
+            if streak >= claude_worker.news.cycle.ERR_STREAK_ALERT:
+                out.append(f"source {row.get('name')} dead {streak} polls")
+    return out
 
 
 def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
@@ -319,6 +460,19 @@ def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
         "alert": None,
         "calendar": None,
         "scorecard": None,
+        "stories_open": [],
+        "actions_24h": [],
+        "budget_today": {},
+        "timeline_24h": [],
+        "red_rules": [],
+        "policy": {"path": str(inputs.news_policy_path), "valid": False, "modes": {}},
+    }
+    policy = claude_worker.news.actions.load_policy(inputs.news_policy_path)
+    payload["policy"] = {
+        "path": str(inputs.news_policy_path),
+        "present": inputs.news_policy_path.is_file(),
+        "valid": policy.valid,
+        "modes": dict(policy.modes),
     }
     alert = inputs.news_dir / claude_worker.news.ALERT_FILE
     if alert.is_file():
@@ -342,6 +496,11 @@ def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
         payload["items_24h"] = total
         payload["events"] = _news_events(store, since)
         payload["counters"] = store.counters()
+        payload["stories_open"] = _news_stories(store, since)
+        payload["actions_24h"] = _news_actions(store, since)
+        payload["budget_today"] = _news_budget(store, policy.ceilings, now_ms // 1000)
+        payload["timeline_24h"] = _news_timeline(store, since)
+        payload["red_rules"] = _news_red_rules(payload, policy, registry_ok=True)
     except sqlite3.Error:
         pass
     finally:

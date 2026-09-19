@@ -39,6 +39,11 @@
   .tl span { flex:1 1 0; min-width:1px; }
   .lg { display:flex; gap:10px; flex-wrap:wrap; color:var(--dim); }
   .lg i { display:inline-block; width:10px; height:10px; vertical-align:-1px; margin-right:3px; }
+  .mk { position:relative; height:26px; border:1px solid var(--line); border-radius:3px; margin:2px 0 6px; overflow:hidden; }
+  .mk i { position:absolute; top:3px; height:20px; border-radius:2px; opacity:.85; }
+  .mk i span { position:absolute; left:1px; top:2px; font-size:10px; line-height:1; }
+  .rel { display:flex; gap:4px; }
+  .rel div { flex:1; border:1px solid var(--line); border-radius:3px; padding:2px 4px; text-align:center; }
   .hash { color:var(--acc); }
   .muted { color:var(--dim); }
   #err { color:var(--bad); }
@@ -296,7 +301,10 @@ function renderNews() {
   set('news-sub', `${enabled.length}/${S.length} enabled · ${n(N.items_24h, 0)} items/24h · ${sick ? `<span class="bad">${sick} failing</span>` : '<span class="ok">all polling</span>'} · refused ${refused ? `<span class="bad">${refused}</span>` : '0'}`);
 
   let html = '';
+  // (1) red rules and the open alert — what the operator acts on first.
+  for (const r of (N.red_rules || [])) html += `<div class="bad">RED ${esc(r)}</div>`;
   if (N.alert) html += `<div class="bad" style="margin-bottom:6px">ALERT ${esc(N.alert)}</div>`;
+  html += renderNewsCalendar(N);
 
   const F = N.funnel_24h || {};
   const order = ['pass', 'drop_dup', 'drop_vocab', 'drop_weight', 'drop_cap'];
@@ -330,8 +338,153 @@ function renderNews() {
   const C = N.counters || {};
   const keys = Object.keys(C).sort();
   if (keys.length) html += `<div class="muted" style="margin-top:6px">counters: ${keys.map(k => `${esc(k)}=${n(C[k], 0)}`).join(' · ')}</div>`;
-  if (N.scorecard) html += `<div class="muted" style="margin-top:6px">scorecard generated ${tsLocal(Number(N.scorecard.generated_ts) * 1000)}</div>`;
+  html += renderNewsPolicy(N);
+  html += renderNewsStories(N);
+  html += renderNewsScorecard(N);
+  html += renderNewsMarkers(N);
   set('news', html);
+}
+
+// (2) the next-48 h calendar strip with time-to-event.
+function renderNewsCalendar(N) {
+  const C = N.calendar;
+  if (!C || !Array.isArray(C.events) || !C.events.length) return '';
+  const now = Date.now() / 1000;
+  const soon = C.events.filter(e => Number(e.at_ts) >= now - 3600 && Number(e.at_ts) <= now + 172800)
+                       .sort((a, b) => Number(a.at_ts) - Number(b.at_ts));
+  if (!soon.length) return '';
+  return '<div class="muted" style="margin-top:6px">calendar — next 48 h</div>' + table(
+    ['in', 'at', 'kind', 'detail', 'source'],
+    soon.map(e => {
+      const dt = Number(e.at_ts) - now;
+      return [`<span class="${dt < 3600 ? 'warn' : ''}">${dt < 0 ? 'now' : age(Math.round(dt))}</span>`,
+              tsLocal(Number(e.at_ts) * 1000), esc(e.kind), esc(String(e.detail || '').slice(0, 80)),
+              esc(e.source || '')];
+    }), [0]);
+}
+
+function renderNewsPolicy(N) {
+  const P = N.policy || {};
+  const modes = P.modes || {};
+  const keys = Object.keys(modes).sort();
+  const cls = m => m === 'live' ? 'bad' : m === 'shadow' ? 'warn' : 'dim';
+  const B = N.budget_today || {};
+  const budget = Object.keys(B).sort().map(t => {
+    const b = B[t];
+    const over = b.ceiling && b.calls >= b.ceiling;
+    return `${esc(t)}=<span class="${over ? 'bad' : 'ok'}">${n(b.calls, 0)}</span><span class="dim">/${n(b.ceiling, 0)}${b.skipped ? ` skip ${n(b.skipped, 0)}` : ''}</span>`;
+  }).join('  ');
+  let out = `<div class="muted" style="margin-top:6px">policy ${P.present ? '' : '<span class="dim">(absent — every mode off)</span>'}${P.valid ? '' : ' <span class="bad">INVALID</span>'}</div>`;
+  out += `<div class="kv"><div>modes</div><div>${keys.length ? keys.map(k => `${esc(k)}=<span class="${cls(modes[k])}">${esc(modes[k])}</span>`).join('  ') : '<span class="dim">none</span>'}</div>`;
+  out += `<div>budget today</div><div>${budget || '<span class="dim">none</span>'}</div>`;
+  const A = N.actions_24h || [];
+  out += `<div>actions 24 h</div><div>${A.length ? A.map(a => `${esc(a.kind)}/<span class="${cls(a.mode)}">${esc(a.mode)}</span> ${n(a.count, 0)}`).join('  ') : '<span class="dim">none</span>'}</div></div>`;
+  return out;
+}
+
+// (3) the stories board — one row per open story, with the verdict.
+function renderNewsStories(N) {
+  const S = N.stories_open || [];
+  if (!S.length) return '';
+  const verdictCls = m => m === 'live' ? 'ok' : m === 'shadow' ? 'warn' : 'bad';
+  const rows = S.slice().reverse().map(st => {
+    const L = st.label, R = st.resolution, V = st.verdict;
+    const label = L
+      ? `${esc(L.market || '—')} · <b class="${L.direction === 'up' ? 'ok' : L.direction === 'down' ? 'bad' : 'dim'}">${esc(L.direction)}</b>`
+        + ` ${n(L.confidence, 2)} · ${age(Math.round(Number(L.half_life_s)))} · vol ${esc(L.vol)} · liq ${esc(L.liquidity)}`
+        + ` <span class="dim">[${esc(L.model)}]</span>`
+      : '<span class="dim">unlabeled</span>';
+    const res = R
+      ? (R.state === 'resolved'
+          ? `<span class="${Number(R.hit) ? 'ok' : 'bad'}">${Number(R.hit) ? 'hit' : 'miss'}</span> ${n(R.signed_bps, 1)} bps${Number(R.vol_reached_high) ? ' <span class="warn">vol-high</span>' : ''}`
+          : `<span class="dim">${esc(R.state)}</span>`)
+      : '<span class="dim">—</span>';
+    const verdict = V
+      ? `<span class="${verdictCls(V.mode)}">${esc(V.mode)}</span>${V.refused_reason ? ` <span class="dim">${esc(V.refused_reason)}</span>` : ''}`
+      : '<span class="dim">not emitted</span>';
+    return [tsLocal(Number(st.first_ts) * 1000), esc(st.event_type), esc(String(st.assets || '')),
+            esc(String(st.venues || '')), n(st.origins, 0) + (Number(st.venue_origin) ? '<span class="ok">+v</span>' : ''),
+            esc(st.max_impact), label, res, verdict];
+  });
+  return '<div class="muted" style="margin-top:6px">open stories</div>' + table(
+    ['first', 'event', 'assets', 'venues', 'orig', 'impact',
+     'label (market · dir · conf · half-life · vol · liq)', 'resolution', 'verdict'],
+    rows, [4]);
+}
+
+// (4) the scorecard, with the legend that lives IN the file.
+function renderNewsScorecard(N) {
+  const SC = N.scorecard;
+  if (!SC || !SC.windows) return `<div class="muted" style="margin-top:6px">scorecard <span class="dim">not built yet — run \`news resolve\`</span></div>`;
+  let out = `<div class="muted" style="margin-top:8px">scorecard — generated ${tsLocal(Number(SC.generated_ts) * 1000)} · pending ${n(SC.pending, 0)} · unresolvable ${n((SC.unresolvable || {}).n, 0)}</div>`;
+  const wins = Object.keys(SC.windows);
+  out += table(
+    ['window', 'dir n', 'hit_rate [wilson]', 'base_rate', 'edge?', 'median bps',
+     'vol n', 'vol precision', 'rv ratio', 'intents n', 'fill rate', 'markout bps'],
+    wins.map(w => {
+      const D = SC.windows[w].direction || {}, V = SC.windows[w].vol || {}, I = SC.windows[w].intents || {};
+      // The gate's own reading: a lower bound above the direction-agnostic
+      // base rate. hit_rate alone is never edge — the legend says so too.
+      const edge = D.n >= 100 && Number(D.wilson_lo) > Number(D.base_rate);
+      return [`<b>${esc(w)}</b>`, n(D.n, 0),
+              `${n(D.hit_rate, 3)} <span class="dim">[${n(D.wilson_lo, 3)}–${n(D.wilson_hi, 3)}]</span>`,
+              n(D.base_rate, 3),
+              edge ? '<span class="ok">yes</span>' : `<span class="dim">no${D.n < 100 ? ` (n&lt;100)` : ''}</span>`,
+              n(D.median_signed_bps, 1),
+              n(V.n, 0), n(V.precision, 3), n(V.median_rv_ratio, 2),
+              n(I.n, 0), n(I.fill_rate, 3), `${n(I.mean_markout_bps, 1)} <span class="dim">approx</span>`];
+    }), [1, 2, 3, 5, 6, 7, 8, 9, 10, 11]);
+  const R = SC.reliability || [];
+  if (R.length) {
+    out += '<div class="muted" style="margin-top:4px">reliability — does a 0.9 beat a 0.7?</div>';
+    out += '<div class="rel">' + R.map(b =>
+      `<div>${n(b.lo, 1)}–${n(b.hi, 1)}<br><b class="${b.n ? '' : 'dim'}">${b.n ? n(b.hit_rate, 2) : '—'}</b><br><span class="dim">n=${n(b.n, 0)}</span></div>`).join('') + '</div>';
+  }
+  const LT = SC.lead_time || {};
+  out += `<div class="kv" style="margin-top:4px"><div>lead time</div><div>${Object.keys(LT).length ? Object.keys(LT).sort().map(k => `${esc(k)}=${n(LT[k], 1)}`).join('  ') : '<span class="dim">none</span>'}</div></div>`;
+  const SRC = SC.sources || [];
+  if (SRC.length) {
+    const ranked = SRC.slice().sort((a, b) => (b.stories_first - a.stories_first) || (b.items_24h - a.items_24h)).slice(0, 12);
+    out += '<div class="muted" style="margin-top:4px">per-source value — first to a story, and how often anyone confirmed it</div>' + table(
+      ['source', 'items 24h', 'pass rate', 'stories first', 'corroborated first'],
+      ranked.map(r => [esc(r.source), n(r.items_24h, 0), n(r.pass_rate, 2),
+                       n(r.stories_first, 0), n(r.corroborated_first, 0)]), [1, 2, 3, 4]);
+  }
+  const C = SC.cost_24h || {};
+  const cost = Object.keys(C).sort().map(t => `${esc(t)}: ${n(C[t].calls, 0)}/${n(C[t].ceiling, 0)} calls, ${n(C[t].input_tokens, 0)}in/${n(C[t].output_tokens, 0)}out, skipped ${n(C[t].skipped, 0)}`).join(' · ');
+  out += `<div class="muted" style="margin-top:4px">cost 24 h — ${cost || 'none'}</div>`;
+  const U = SC.unresolvable || {};
+  if (Array.isArray(U.reasons) && U.reasons.length) {
+    out += `<div class="muted">unresolvable: ${U.reasons.map(r => `${esc(r.detail)} ×${n(r.n, 0)}`).join(' · ')}</div>`;
+  }
+  out += `<div class="muted" style="margin-top:4px">legend — ${esc(SC.legend || '')}</div>`;
+  return out;
+}
+
+// (5) the story markers, on their own strip under the regime timeline's
+// 24 h span so the two read against the same clock.
+function renderNewsMarkers(N) {
+  const T = N.timeline_24h || [];
+  if (!T.length) return '';
+  // The page's own clock, not the browser's: a marker has to line up with
+  // the regime timeline above it, which is drawn from the same payload.
+  const end = Number((W && W.now_ms) || Date.now());
+  const start = end - 86400000;
+  const span = end - start;
+  const bars = T.filter(m => Number(m.ts) >= start).map(m => {
+    const left = 100 * (Number(m.ts) - start) / span;
+    const width = Math.max(0.4, Math.min(100 - left, 100 * (Number(m.horizon_s) * 1000) / span));
+    const colour = m.state !== 'resolved' ? 'var(--dim)' : Number(m.hit) ? 'var(--ok)' : 'var(--bad)';
+    const arrow = m.direction === 'up' ? '▲' : m.direction === 'down' ? '▼' : '·';
+    const h = 6 + Math.round(14 * Math.min(1, Number(m.confidence) || 0));
+    const tip = `${tsLocal(Number(m.ts))} ${m.kind} ${m.direction || 'none'} conf ${n(m.confidence, 2)} horizon ${age(Number(m.horizon_s))} ${m.state}`
+              + (m.state === 'resolved' ? ` ${Number(m.hit) ? 'hit' : 'miss'} ${n(m.signed_bps, 1)} bps` : '')
+              + (m.title ? ` — ${m.title}` : '');
+    return `<i style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%;height:${h}px;background:${colour}" title="${esc(tip)}"><span>${arrow}</span></i>`;
+  }).join('');
+  return `<div class="muted" style="margin-top:8px">claims, last 24 h — arrow = direction, height = confidence, bar = horizon, colour = pending / hit / miss (${T.length})</div>`
+       + `<div class="mk">${bars}</div>`
+       + `<div class="lg"><span><i style="background:var(--dim)"></i>pending</span><span><i style="background:var(--ok)"></i>hit</span><span><i style="background:var(--bad)"></i>miss</span></div>`;
 }
 
 // ---- recent trades ----

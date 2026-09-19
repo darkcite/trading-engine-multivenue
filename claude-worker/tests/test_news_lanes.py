@@ -26,6 +26,8 @@ import pytest
 import claude_worker.llm
 import claude_worker.news
 import claude_worker.news.__main__
+import claude_worker.news.actions
+import claude_worker.news.cascade
 import claude_worker.news.cycle
 import claude_worker.news.filter
 import claude_worker.news.sources
@@ -117,8 +119,29 @@ def test_every_lane_is_an_honest_no_op_without_a_registry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _env(monkeypatch, tmp_path, None)
-    for argv in (["cycle"], ["health"], ["report"]):
-        assert claude_worker.news.__main__.main(argv) == claude_worker.news.__main__.EXIT_OK, argv
+    registry_lanes = (
+        ["cycle"],
+        ["health"],
+        ["report"],
+        ["prompts", "--tier", "1"],
+        ["ingest", "--tier", "1", "--answers", str(tmp_path / "absent.ndjson")],
+        ["actions"],
+    )
+    store_lanes = (
+        ["resolve"],
+        ["scorecard"],
+        ["proposals"],
+        ["replay", "--since", "2026-09-01T00:00:00Z", "--out", str(tmp_path / "r.tsv")],
+    )
+    for argv in registry_lanes + store_lanes:
+        # Every lane, including the six §14/§12 ones, answers the absent
+        # registry the same way: one printed line and exit 0. The registry
+        # question comes FIRST, before a lane looks at its own arguments —
+        # an `ingest` whose answers file is also missing still exits 0,
+        # because there is nothing here to ingest into.
+        assert claude_worker.news.__main__.main(argv) == (
+            claude_worker.news.__main__.EXIT_OK
+        ), argv
     out = capsys.readouterr().out
     assert "nothing to do" in out
     assert "no store" in out
@@ -462,8 +485,112 @@ def test_no_lane_can_reach_a_model(
         raise AssertionError("a lane constructed an Anthropic client")
 
     monkeypatch.setattr(claude_worker.llm, "make_client", forbidden)
+    monkeypatch.setattr(claude_worker.news.__main__.claude_worker.llm, "make_client", forbidden)
     _env(monkeypatch, tmp_path, _TOML)
     _install_transport(monkeypatch)
-    for argv in (["cycle"], ["health"], ["report"], ["migrate-feeds"]):
+    for argv in (
+        ["cycle"],
+        ["health"],
+        ["report"],
+        ["migrate-feeds"],
+        ["proposals"],
+        ["prompts", "--tier", "1", "--out", str(tmp_path / "p1.ndjson")],
+        ["prompts", "--tier", "2", "--out", str(tmp_path / "p2.ndjson")],
+        ["prompts", "--tier", "3", "--out", str(tmp_path / "p3.ndjson")],
+        ["actions"],
+        ["actions", "--dry-run"],
+        ["resolve"],
+        ["scorecard"],
+    ):
         assert claude_worker.news.__main__.main(argv) == 0, argv
     capsys.readouterr()
+
+
+def test_the_session_lanes_round_trip_through_the_real_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§14 end to end on the lane surface: cycle, prompts, answer, ingest.
+
+    This is the test that would catch a prompt the `ingest` lane cannot find
+    an answer for — the two lanes build the text independently, minutes
+    apart, and the prompt cache keys on it.
+    """
+    _env(monkeypatch, tmp_path, _TOML)
+    _install_transport(monkeypatch)
+    assert claude_worker.news.__main__.main(["cycle"]) == 0
+    out_path = tmp_path / "p1.ndjson"
+    assert claude_worker.news.__main__.main(
+        ["prompts", "--tier", "1", "--limit", "5", "--out", str(out_path)]
+    ) == 0
+    lines = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert lines, "the cycle stored a tier-0 survivor, so tier 1 has a question"
+    answer = json.dumps(
+        {
+            "family": "crypto",
+            "impact": "high",
+            "reason": "the venue is delisting a perp",
+            "event_type": "delisting",
+            "entities": {"venues": ["okx"], "assets": []},
+        }
+    )
+    answers_path = tmp_path / "a1.ndjson"
+    answers_path.write_text(
+        "\n".join(json.dumps({"id": line["id"], "response": answer}) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    assert claude_worker.news.__main__.main(
+        ["ingest", "--tier", "1", "--answers", str(answers_path)]
+    ) == 0
+    printed = capsys.readouterr().out
+    assert "news ingest: tier=1" in printed
+    assert f"matched={len(lines)}" in printed
+    assert "rejected=0" in printed
+    with _store(tmp_path) as store:
+        rows = store._rows("SELECT * FROM triage", ())
+        assert len(rows) == len(lines)
+        for i in range(len(rows)):
+            assert rows[i]["model"] == claude_worker.news.cascade.MODEL_SESSION
+        # Clustering ran: a story exists and the item is attached to it.
+        # It is already CLOSED, not open — the fixture's item is dated
+        # 2026-09-19 and `close_stale_stories` retires a story with no item
+        # for a whole window, which is the right answer for a replayed
+        # fixture and is why this asserts the table, not the open queue.
+        stories = store._rows("SELECT * FROM stories", ())
+        assert len(stories) == 1
+        assert int(typing.cast(int, stories[0]["item_count"])) == len(lines)
+        for i in range(len(lines)):
+            source, guid = str(lines[i]["id"]).split("|", 1)
+            item = store.item(source, guid)
+            assert item is not None and item["story_id"] == stories[0]["story_id"]
+
+
+def test_actions_dry_run_forces_shadow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--dry-run` downgrades LIVE to shadow and leaves OFF alone.
+
+    Forcing an `off` kind to shadow would write a row into the `actions`
+    table that no policy ever stood behind, and that table is evidence.
+    """
+    policy = tmp_path / "news-policy.toml"
+    policy.write_text(
+        "[mode]\nset_bias = \"live\"\nalert = \"live\"\ndeclare_vol_high = \"off\"\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NEWS_POLICY_TOML", str(policy))
+    _env(monkeypatch, tmp_path, _TOML)
+    loaded = claude_worker.news.actions.load_policy(policy)
+    assert loaded.valid
+    assert loaded.mode(claude_worker.news.actions.KIND_SET_BIAS) == "live"
+    dry = claude_worker.news.actions.shadow_only(loaded)
+    assert dry.mode(claude_worker.news.actions.KIND_SET_BIAS) == "shadow"
+    assert dry.mode(claude_worker.news.actions.KIND_ALERT) == "shadow"
+    assert dry.mode(claude_worker.news.actions.KIND_DECLARE_VOL_HIGH) == "off"
+    # Everything else about the policy is untouched.
+    assert dry.limits == loaded.limits and dry.ceilings == loaded.ceilings
+    assert claude_worker.news.__main__.main(["actions", "--dry-run"]) == 0
+    assert "(dry-run)" in capsys.readouterr().out

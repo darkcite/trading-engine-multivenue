@@ -50,6 +50,7 @@ import typing
 
 import claude_worker.features
 import claude_worker.frames
+import claude_worker.labeling
 import claude_worker.news
 import claude_worker.news.cascade
 import claude_worker.news.detect
@@ -69,6 +70,10 @@ MODES: tuple[str, ...] = (MODE_OFF, MODE_SHADOW, MODE_LIVE)
 #: `actions.mode` also records the two outcomes that are not modes.
 RECORD_REFUSED: str = "refused"
 RECORD_PENDING: str = "pending"
+#: The [`KIND_ASSESSMENT`] marker's mode. Not a decision — a record that
+#: this answer was processed, so the dashboard shows `assessment/read`
+#: beside the decisions it produced.
+RECORD_READ: str = "read"
 
 #: Action kinds the policy switches on (spec §4.2 `[mode]`).
 KIND_SET_BIAS: str = claude_worker.news.cascade.ACTION_SET_BIAS
@@ -76,6 +81,11 @@ KIND_DECLARE_VOL_HIGH: str = claude_worker.news.cascade.ACTION_DECLARE_VOL_HIGH
 KIND_ORDER_INTENT: str = claude_worker.news.cascade.ACTION_ORDER_INTENT
 KIND_DISABLE_SLOT: str = claude_worker.news.cascade.ACTION_DISABLE_SLOT
 KIND_PROPOSE: str = "propose"
+#: NOT a policy kind: the marker row the `actions` drain writes when it has
+#: READ one analyst assessment. An assessment whose only action is `none`
+#: produces no other row — "nothing should change" is a real answer — so
+#: without this marker the drain would re-read it on every run forever.
+KIND_ASSESSMENT: str = "assessment"
 KIND_ALERT: str = claude_worker.news.cascade.ACTION_ALERT
 POLICY_KINDS: tuple[str, ...] = (
     KIND_SET_BIAS,
@@ -101,6 +111,11 @@ REFUSED_DISCONNECTED: str = "disconnected"
 REFUSED_SEND_FAILED: str = "send_failed"
 
 SECONDS_PER_HOUR: int = 3_600
+#: How far back [`Emitter.run`] looks for claims it has not emitted yet. A
+#: claim older than this has expired on its own — every one of them carries
+#: a half-life measured in minutes to hours — so re-emitting it would put a
+#: stale view on the wire.
+DRAIN_WINDOW_S: int = 24 * 3_600
 MIN_DECLARE_TTL_S: int = 60
 PX_QTY_SCALE: float = 1e6
 BPS: float = 1e4
@@ -321,6 +336,21 @@ def _slots_from(table: typing.Mapping[str, object]) -> tuple[int, ...]:
 # ------------------------------------------------------------ §10.3 the word
 
 
+def shadow_only(policy: NewsPolicy) -> NewsPolicy:
+    """The policy with every LIVE mode downgraded to SHADOW (`--dry-run`).
+
+    An `off` mode STAYS off. The `actions` table is evidence, and a dry run
+    that manufactured shadow rows for kinds the operator has switched off
+    would be writing a claim into the record that no policy ever stood
+    behind — exactly the kind of row that later reads as a result.
+    """
+    modes: dict[str, str] = {}
+    for kind in policy.modes:
+        mode = policy.modes[kind]
+        modes[kind] = MODE_SHADOW if mode == MODE_LIVE else mode
+    return dataclasses.replace(policy, modes=modes)
+
+
 def compose_vol_high(effective: int | None) -> int:
     """A declared regime word that says `vol:high` and NOTHING ELSE new.
 
@@ -364,6 +394,8 @@ class EmitStats:
     dropped: int = 0
     alerts: int = 0
     proposals: int = 0
+    #: Analyst answers the drain has read — a marker, never a decision.
+    read: int = 0
 
 
 class Frame(typing.NamedTuple):
@@ -486,6 +518,11 @@ class Emitter:
             self.stats.live += 1
         elif mode == MODE_SHADOW:
             self.stats.shadow += 1
+        elif mode == RECORD_READ:
+            # A marker is not a decision, so it is not a refusal either.
+            # Counting it as one made `news actions` print `refused=10` for
+            # 7 refusals and 3 assessments read (measured 2026-09-20).
+            self.stats.read += 1
         else:
             self.stats.refused += 1
         return self._store.record_action(row)
@@ -986,6 +1023,121 @@ class Emitter:
             detail=f"{action.kind} {action.descriptor} written={written}", now_ts=now_ts,
         )
         return Outcome(mode=mode, row_id=row_id)
+
+    # ---- the drain (§12, the `actions` lane) ----------------------------
+
+    def _drained(self, since_ts: int) -> tuple[frozenset[tuple[str, str]], dict[str, int]]:
+        """What the `actions` table already says, two ways: the
+        ``(story_id, kind)`` pairs it holds, and the newest action ts per
+        story. The first answers "was this label emitted"; the second
+        answers "was this assessment read", for the case where reading it
+        produced no row of its own."""
+        pairs: set[tuple[str, str]] = set()
+        newest: dict[str, int] = {}
+        rows = self._store.actions_since(since_ts)
+        for i in range(len(rows)):
+            row = rows[i]
+            story_id = str(row["story_id"])
+            pairs.add((story_id, str(row["kind"])))
+            ts = int(typing.cast(int, row["ts"]))
+            if ts > newest.get(story_id, 0):
+                newest[story_id] = ts
+        return frozenset(pairs), newest
+
+    def _label_of(self, row: typing.Mapping[str, object]) -> claude_worker.labeling.Label:
+        """A stored `labels` row back as the NamedTuple the emitters read.
+        Reconstructed rather than re-queried through the cascade: the row IS
+        the claim, and a label that has since been overwritten is not the
+        one that was made."""
+        return claude_worker.labeling.Label(
+            sym=int(typing.cast(int, row["sym"])),
+            direction=str(row["direction"]),
+            confidence=float(typing.cast(float, row["confidence"])),
+            half_life_s=float(typing.cast(float, row["half_life_s"])),
+            vol=str(row["vol"]),
+            liquidity=str(row["liquidity"]),
+        )
+
+    def _assessment_of(
+        self, row: typing.Mapping[str, object], descriptors: typing.Sequence[str]
+    ) -> claude_worker.news.cascade.Assessment | None:
+        """A stored `assessments.body` back through the SAME strict parser
+        that admitted it.
+
+        Re-parsing rather than trusting the column is the point: the body is
+        canonical JSON written by `cascade.canonical_json`, so a row that no
+        longer parses means the grammar moved under us, and acting on a
+        half-understood assessment is worse than skipping it.
+        """
+        story_id = str(row["story_id"])
+        items = self._store.story_items(story_id, claude_worker.news.cascade.ANALYST_ITEMS)
+        ids: list[str] = []
+        for i in range(len(items)):
+            ids.append(claude_worker.news.cascade.item_id(items[i]))
+        return claude_worker.news.cascade.parse_assessment(
+            str(row["body"]), sorted(self._market_map), descriptors, ids
+        )
+
+    def run(
+        self,
+        now_ts: int,
+        *,
+        now_ns: int = 0,
+        since_ts: int = 0,
+        effective: int | None = None,
+        descriptors: typing.Sequence[str] | None = None,
+    ) -> EmitStats:
+        """Emit every claim in the window that has no `actions` row yet.
+
+        Order is deliberate: labels first, then assessments. A label is one
+        market's direction and cheap to gate; an assessment may propose up
+        to six actions and may raise the red alert that the operator reads
+        first. Alerts are flushed once at the end, so a run that raises two
+        writes the newest one — `detect.write_alert`'s rule, not a second
+        copy of it.
+
+        Nothing here decides anything: every candidate goes through the same
+        `gate` the serve path uses, so a lane run with no client records
+        shadow and refusals and touches no venue by construction.
+        """
+        since = since_ts if since_ts > 0 else now_ts - DRAIN_WINDOW_S
+        known = descriptors
+        if known is None:
+            known = () if self._ctx is None else sorted(self._ctx.manifest)
+        pairs, newest = self._drained(since)
+        labels = self._store.labels_since(since)
+        for i in range(len(labels)):
+            row = labels[i]
+            story_id = str(row["story_id"])
+            if (story_id, KIND_SET_BIAS) in pairs:
+                continue
+            self.emit_label(self._label_of(row), self._store.story(story_id), now_ts)
+        rows = self._store.assessments_since(since)
+        for i in range(len(rows)):
+            row = rows[i]
+            story_id = str(row["story_id"])
+            ts = int(typing.cast(int, row["ts"]))
+            if newest.get(story_id, 0) >= ts:
+                continue
+            assessment = self._assessment_of(row, known)
+            detail = "unparseable"
+            if assessment is not None:
+                self.emit_assessment(
+                    self._store.story(story_id),
+                    assessment,
+                    now_ts,
+                    now_ns=now_ns,
+                    effective=effective,
+                )
+                detail = f"actions={len(assessment.actions)} {assessment.mechanism}"
+            # The marker LAST: every row this assessment produced is already
+            # in the table, so a crash between them re-reads the assessment
+            # rather than losing it.
+            self._record(
+                KIND_ASSESSMENT, RECORD_READ, story_id=story_id, detail=detail, now_ts=now_ts
+            )
+        self.stats.alerts += self.flush_alerts(now_ts)
+        return self.stats
 
     def _write_proposal(
         self, action: claude_worker.news.cascade.Action, now_ts: int

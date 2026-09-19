@@ -964,6 +964,7 @@ class NewsQueueWatcher:
         now_fn: typing.Callable[[], int] = lambda: 0,
         min_origins: int = DEFAULT_MIN_ORIGINS,
         max_assessments: int = DEFAULT_MAX_ASSESSMENTS,
+        ids: typing.AbstractSet[str] | None = None,
     ) -> None:
         self._state = state
         self._store = store
@@ -977,16 +978,34 @@ class NewsQueueWatcher:
         self._now_fn = now_fn
         self._min_origins = min_origins
         self._max_assessments = max_assessments
+        # §14: a session's answers arrive as a FILE, so a pass driven by one
+        # must touch EXACTLY the ids that file answers. Anything else would
+        # reach `complete_fn` with a prompt the file has no answer for, and
+        # `state.cached_complete` stores whatever that returns — a sentinel
+        # would be cached under `model = "session"` forever. `None` means
+        # "everything due", which is what `serve` and every landed test want.
+        self._ids: frozenset[str] | None = None if ids is None else frozenset(ids)
         self.stats: CascadeStats = CascadeStats()
 
     # ---- tier 1 --------------------------------------------------------
 
+    def triage_prompt(self, row: typing.Mapping[str, object]) -> str:
+        """The EXACT tier-1 prompt for one item.
+
+        Public because the session path (§14) writes prompts to a file and
+        reads the answers back through the prompt cache, whose key IS this
+        text. One builder means the file and the model can never be asked
+        different questions — a duplicated f-string here would be a silent
+        cache miss and a wasted human pass.
+        """
+        return claude_worker.labeling.build_triage_prompt_v2(
+            str(row["title"]), str(row["text"]), self._vocab
+        )
+
     def _triage_one(
         self, row: dict[str, object], poll: claude_worker.feeds.PollStats, now_ts: int
     ) -> claude_worker.labeling.TriageV2 | None:
-        prompt = claude_worker.labeling.build_triage_prompt_v2(
-            str(row["title"]), str(row["text"]), self._vocab
-        )
+        prompt = self.triage_prompt(row)
         answer = complete_cached(
             self._state,
             self._store,
@@ -1022,7 +1041,10 @@ class NewsQueueWatcher:
     def _run_triage(self, poll: claude_worker.feeds.PollStats, now_ts: int) -> list[str]:
         """Tier 1 over the oldest pending survivors. Returns the ids of the
         items that reached a clusterable impact."""
-        rows = self._store.items_pending_triage(TRIAGE_BATCH)
+        if self._ids is None:
+            rows = self._store.items_pending_triage(TRIAGE_BATCH)
+        else:
+            rows = self._store.items_pending_ids(sorted(self._ids))
         escalated: list[str] = []
         for i in range(len(rows)):
             row = rows[i]
@@ -1137,17 +1159,24 @@ class NewsQueueWatcher:
 
     # ---- §9.3 tier 2 ---------------------------------------------------
 
+    def label_prompt(self, story: typing.Mapping[str, object]) -> str:
+        """The EXACT tier-2 prompt for one story, or ``""`` when nothing is
+        attached to it yet. Public for the reason [`triage_prompt`] is."""
+        items = self._store.story_items(str(story["story_id"]), LABEL_ITEMS)
+        if not items:
+            return ""
+        ordered = _distinct_origins_first(items)
+        return claude_worker.labeling.build_label_prompt_v2(
+            str(ordered[0]["title"]), build_story_text(items), sorted(self._symbol_map)
+        )
+
     def _label_one(
         self, story: dict[str, object], poll: claude_worker.feeds.PollStats, now_ts: int
     ) -> None:
         story_id = str(story["story_id"])
-        items = self._store.story_items(story_id, LABEL_ITEMS)
-        if not items:
+        prompt = self.label_prompt(story)
+        if not prompt:
             return
-        ordered = _distinct_origins_first(items)
-        prompt = claude_worker.labeling.build_label_prompt_v2(
-            str(ordered[0]["title"]), build_story_text(items), sorted(self._symbol_map)
-        )
         answer = complete_cached(
             self._state,
             self._store,
@@ -1242,22 +1271,37 @@ class NewsQueueWatcher:
 
     # ---- the pass ------------------------------------------------------
 
-    def poll_once(self, now_ns: int | None = None) -> claude_worker.feeds.PollStats:
+    def poll_once(
+        self, now_ns: int | None = None, *, tiers: typing.Sequence[str] = TIERS
+    ) -> claude_worker.feeds.PollStats:
         """One cascade pass: tier 1, clustering, tier 2.
 
         Returns `feeds.PollStats` so `daemon._emit_labels` consumes it
         unchanged — the legacy watcher and this one are interchangeable to
         the loop that drives them, which is what keeps the Stage-3 switch
         a one-line change rather than a rewrite.
+
+        ``tiers`` narrows the pass. The default runs both, which is what
+        `serve` wants; the session path (§14) ingests ONE tier at a time
+        because its answers file answers one tier's prompts, and a tier
+        whose prompts were never written has no answers to find.
+        Clustering belongs to tier 1: it consumes what tier 1 escalated,
+        and it is deliberately NOT restricted by ``ids`` — an item
+        escalated by an earlier pass should still reach a story.
         """
         del now_ns
         now_ts = self._now_fn()
         poll = claude_worker.feeds.PollStats()
-        self._run_triage(poll, now_ts)
-        self._run_cluster(now_ts)
+        if TIER1 in tiers:
+            self._run_triage(poll, now_ts)
+            self._run_cluster(now_ts)
+        if TIER2 not in tiers:
+            return poll
         window = self._registry.settings.story_window_s
         stories = self._store.stories_unlabeled(now_ts - window)
         for i in range(len(stories)):
+            if self._ids is not None and str(stories[i]["story_id"]) not in self._ids:
+                continue
             self._label_one(stories[i], poll, now_ts)
         return poll
 

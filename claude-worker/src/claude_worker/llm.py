@@ -36,6 +36,15 @@ LLM_MAX_TOKENS: int = 1024
 # only, model `config.MODEL_STRATEGIST`.
 STRATEGIST_MAX_TOKENS: int = 4096
 
+# The NEWS analyst's response budget (NEWS spec §13/§14). One structured
+# assessment: a thesis, three channels, up to six actions, a falsifier and
+# an evidence list. Measured against the grammar in
+# `news.cascade.ANALYST_SYSTEM`, 2048 is roughly 4x the longest valid
+# answer — enough that a truncation is a defect rather than a budget, and
+# small enough that a runaway answer stops instead of billing. Consumers:
+# serve's analyst job and the §14 session path.
+ANALYST_MAX_TOKENS: int = 2048
+
 
 class Completion(typing.NamedTuple):
     """One completion + its ``message.usage`` accounting (§7.5 ledger

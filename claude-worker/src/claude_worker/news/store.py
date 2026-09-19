@@ -289,6 +289,12 @@ _PRUNABLE_STATES: tuple[str, ...] = (STATE_SKIPPED, STATE_TRIAGED)
 
 SECONDS_PER_DAY: int = 86_400
 
+#: Bound parameters per statement in [`Store.items_pending_ids`]. SQLite's
+#: own limit is far higher on this build, but a query whose parameter count
+#: is driven by a file the operator wrote gets an explicit bound here
+#: rather than an error at some other version's limit.
+_ID_CHUNK: int = 500
+
 #: Named counters (spec §4.3 "policy_invalid, registry_invalid, …").
 COUNTER_POLICY_INVALID: str = "policy_invalid"
 COUNTER_REGISTRY_INVALID: str = "registry_invalid"
@@ -521,6 +527,30 @@ class Store:
             (STATE_NEW, TIER0_PASS, limit),
         )
 
+    def items_pending_ids(self, ids: typing.Sequence[str]) -> list[dict[str, object]]:
+        """Tier-0 survivors no model has seen yet, restricted to these
+        ``source|guid`` ids, OLDEST first.
+
+        The session path (§14) answers an EXPLICIT list of prompts written
+        to a file minutes earlier, so its pass must touch exactly that
+        list — not the newest N of a queue the 120 s aggregator has moved
+        on since. Chunked because SQLite bounds the number of bound
+        parameters in one statement and an answers file is not bounded by
+        anything this module controls.
+        """
+        out: list[dict[str, object]] = []
+        for start in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[start : start + _ID_CHUNK]
+            marks = ",".join("?" for _ in range(len(chunk)))
+            out.extend(
+                self._rows(
+                    "SELECT * FROM items WHERE triage_state = ? AND tier0 = ? "
+                    f"AND source || '|' || guid IN ({marks}) ORDER BY ts",
+                    (STATE_NEW, TIER0_PASS, *chunk),
+                )
+            )
+        return out
+
     def items_to_cluster(self, limit: int) -> list[dict[str, object]]:
         """Triaged items that reached a clusterable impact and have not
         been attached to a story yet, with their triage joined on.
@@ -667,6 +697,22 @@ class Store:
     def events_since(self, since_ts: int) -> list[dict[str, object]]:
         return self._rows("SELECT * FROM events WHERE at_ts >= ? ORDER BY at_ts", (since_ts,))
 
+    def events_recent(self, since_ts: int, limit: int) -> list[dict[str, object]]:
+        """Events of a window ordered by what was RECORDED last, newest
+        first, capped.
+
+        NOT `events_since`, which orders by ``at_ts``: one poll of the
+        Deribit option chain records ~190 expiries dated 18-72 h out, so a
+        tail taken from that query is 190 rows of the furthest FUTURE and
+        hides every listing, delisting and maintenance behind them
+        (measured 2026-09-19). ``id`` is insertion order, which is the
+        order a reader means by "recent".
+        """
+        return self._rows(
+            "SELECT * FROM events WHERE created_ts >= ? ORDER BY id DESC LIMIT ?",
+            (since_ts, max(1, limit)),
+        )
+
     def open_events(
         self, kind: str, venue: str, instrument: str = ""
     ) -> list[dict[str, object]]:
@@ -724,6 +770,17 @@ class Store:
     def put_label(self, row: typing.Mapping[str, object]) -> None:
         self._insert_mapping("labels", row, replace=True)
 
+    def labels_since(self, since_ts: int) -> list[dict[str, object]]:
+        """Labels written in a window, oldest first — the `actions` lane's
+        queue. The window bounds it; the lane decides what it has already
+        emitted from the `actions` table itself."""
+        return self._rows("SELECT * FROM labels WHERE ts >= ? ORDER BY ts", (since_ts,))
+
+    def assessments_since(self, since_ts: int) -> list[dict[str, object]]:
+        """Assessments written in a window, oldest first — the same queue,
+        for the analyst's action lists."""
+        return self._rows("SELECT * FROM assessments WHERE ts >= ? ORDER BY id", (since_ts,))
+
     def label(self, story_id: str) -> dict[str, object] | None:
         rows = self._rows("SELECT * FROM labels WHERE story_id = ?", (story_id,))
         return rows[0] if rows else None
@@ -753,6 +810,25 @@ class Store:
             "SELECT * FROM resolutions WHERE state = ? AND t1 <= ? ORDER BY t1",
             (state, now_ts),
         )
+
+    def resolution(self, subject_kind: str, subject_id: str) -> dict[str, object] | None:
+        """One resolution by its primary key, pending or not."""
+        rows = self._rows(
+            "SELECT * FROM resolutions WHERE subject_kind = ? AND subject_id = ?",
+            (subject_kind, subject_id),
+        )
+        return rows[0] if rows else None
+
+    def resolutions_since(self, since_ts: int) -> list[dict[str, object]]:
+        """Every resolution OPENED in a window, oldest first — PENDING ones
+        included.
+
+        The dashboard's timeline draws claims, not only judged claims: a
+        pending marker is the honest picture of a claim whose horizon has
+        not elapsed yet, and leaving it out until it resolves would make
+        the lane look quieter than it is.
+        """
+        return self._rows("SELECT * FROM resolutions WHERE t0 >= ? ORDER BY t0", (since_ts,))
 
     def resolutions_resolved(self, since_ts: int) -> list[dict[str, object]]:
         """Resolved rows in a window, with the label's model joined on.
@@ -964,3 +1040,101 @@ class Store:
                 f"{verb} INTO {table} ({columns}) VALUES ({marks})", tuple(values)
             )
         return int(typing.cast(int, cursor.lastrowid))
+
+# ---------------------------------------------------------- readers' views
+
+# One poll of the Deribit BTC option chain writes ~190 event rows for ONE
+# fact about the world, and it writes them dated 18-72 h ahead. That is a
+# property of THIS table's shape, so the module that writes those rows is
+# the one that says how a reader should read them back — rather than each
+# reader discovering it separately, which is exactly what happened to the
+# dashboard's panel (fixed 2026-09-19) and then to the tier-3 analyst's
+# context block (fixed 2026-09-20).
+
+
+def _iso(ts: int) -> str:
+    """UTC seconds as the ISO stamp this lane's file outputs use. A local
+    copy so the store depends on nothing above it."""
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+#: Events named in one collapsed row, and rows a reader is handed.
+EVENT_SAMPLE: int = 3
+EVENTS_SCAN: int = 400
+
+
+def collapse_events(
+    members: list[dict[str, object]], sample: int = EVENT_SAMPLE
+) -> dict[str, object]:
+    """One row for a group of events sharing a kind, a venue and an instant.
+
+    A group of one is returned untouched. A group of 62 option strikes
+    expiring in the same second is ONE fact about the world, and spelling
+    it out 62 times is how a reader — the operator's panel or the tier-3
+    analyst — ends up seeing nothing else.
+    """
+    if len(members) == 1:
+        return members[0]
+    members.sort(key=lambda row: str(row["instrument"]))
+    names: list[str] = []
+    for i in range(len(members)):
+        names.append(str(members[i]["instrument"]))
+    newest = dict(members[len(members) - 1])
+    for i in range(len(members)):
+        newest["id"] = max(
+            int(typing.cast(int, newest["id"])), int(typing.cast(int, members[i]["id"]))
+        )
+    shown = ", ".join(names[:sample])
+    extra = len(names) - sample
+    newest["instrument"] = ""
+    newest["detail"] = f"{len(names)} instruments ({shown}" + (
+        f", +{extra} more)" if extra > 0 else ")"
+    )
+    return newest
+
+
+def recent_events(
+    store: Store,
+    since_ts: int,
+    limit: int,
+    sample: int = EVENT_SAMPLE,
+) -> list[dict[str, object]]:
+    """The events tail every reader should use: recorded-last order, with
+    same-instant groups collapsed, oldest of the kept rows first.
+
+    ONE implementation on purpose. Two readers want this — the dashboard's
+    panel and the analyst's context block — and both of them were wrong in
+    the same two ways before it existed (`at_ts` order returns the furthest
+    future, and 190 Deribit expiries fill any tail). A second copy of the
+    rule would drift from this one.
+    """
+    rows = store.events_recent(since_ts, EVENTS_SCAN)
+    groups: dict[tuple[str, str, int], list[dict[str, object]]] = {}
+    order: list[tuple[str, str, int]] = []
+    for i in range(len(rows)):
+        row = rows[i]
+        key = (str(row["kind"]), str(row["venue"]), int(typing.cast(int, row["at_ts"])))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+    out: list[dict[str, object]] = []
+    for i in range(min(limit, len(order))):
+        out.append(collapse_events(groups[order[i]], sample))
+    out.sort(key=lambda row: int(typing.cast(int, row["id"])))
+    return out
+
+
+def event_lines(rows: list[dict[str, object]]) -> list[str]:
+    """Collapsed event rows as one line each — the tier-3 context block."""
+    out: list[str] = []
+    for i in range(len(rows)):
+        row = rows[i]
+        detail = str(row["instrument"]) or str(row["detail"])
+        out.append(
+            f"{_iso(int(typing.cast(int, row['at_ts'])))} "
+            f"{row['kind']} {row['venue']} {detail}"
+        )
+    return out

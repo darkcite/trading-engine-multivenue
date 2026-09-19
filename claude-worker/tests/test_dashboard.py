@@ -17,6 +17,9 @@ import threading
 import pytest
 
 import claude_worker.dashboard
+import claude_worker.news.actions
+import claude_worker.news.cascade
+import claude_worker.news.resolve
 import claude_worker.news.store
 import claude_worker.pnl_report
 import claude_worker.state
@@ -161,6 +164,7 @@ def _worker_dir(tmp_path: pathlib.Path) -> claude_worker.dashboard.Inputs:
         replay_dir=replay,
         multivenue_dir=mv,
         news_dir=worker / "news",
+        news_policy_path=mv / "news-policy.toml",
         engine_url="http://127.0.0.1:1",  # nothing listens here — the proxy must 502
     )
 
@@ -230,6 +234,7 @@ def test_worker_payload_without_a_db_is_empty_not_an_error(tmp_path: pathlib.Pat
         replay_dir=tmp_path / "logs",
         multivenue_dir=tmp_path / "mv",
         news_dir=tmp_path / "news",
+        news_policy_path=tmp_path / "news-policy.toml",
         engine_url="http://127.0.0.1:1",
     )
     doc = claude_worker.dashboard.worker_payload(inputs, now_ms=0)
@@ -366,6 +371,21 @@ def test_the_news_panel_renders_without_a_store(tmp_path: pathlib.Path) -> None:
     assert news["sources"] == [] and news["events"] == []
     assert news["funnel_24h"] == {} and news["items_24h"] == 0
     assert news["alert"] is None and news["calendar"] is None and news["scorecard"] is None
+    # §15's later additions are empty, not absent: the page reads them
+    # unconditionally, and a missing key is a JS exception, not a blank row.
+    assert news["stories_open"] == [] and news["actions_24h"] == []
+    assert news["budget_today"] == {} and news["timeline_24h"] == []
+    assert news["red_rules"] == []
+    # An absent policy is the SHIPPED state: every mode off, and VALID —
+    # "the operator has not configured this" is a different thing from
+    # "the operator's file has a mistake in it", and only the second is a
+    # red rule. Both refuse every action.
+    assert news["policy"]["present"] is False
+    assert news["policy"]["valid"] is True
+    assert set(news["policy"]["modes"].values()) == {
+        claude_worker.news.actions.MODE_OFF
+    }
+    assert news["red_rules"] == []
 
 
 def test_the_news_panel_reports_the_funnel_health_and_events(tmp_path: pathlib.Path) -> None:
@@ -462,3 +482,240 @@ def test_the_news_panel_is_wired_into_the_page() -> None:
     assert 'id="s-news"' in html and 'id="news"' in html
     assert "function renderNews()" in html
     assert "renderNews();" in html
+
+
+# ---- NEWS §15: the scorecard, the stories board and the timeline ----------
+
+
+def _seed_news_claims(inputs: claude_worker.dashboard.Inputs) -> str:
+    """A story with a label, a RESOLVED resolution, an emitted action and a
+    pending claim — the four things the board and the markers read."""
+    now = _NEWS_NOW_MS // 1000
+    db = inputs.news_dir / claude_worker.news.DB_FILENAME
+    story_id = "st1"
+    with claude_worker.news.store.Store(db) as store:
+        store.upsert_story(
+            {
+                "story_id": story_id,
+                "family": "crypto",
+                "event_type": "delisting",
+                "venues": '["okx"]',
+                "assets": '["BTC"]',
+                "first_ts": now - 600,
+                "last_ts": now - 60,
+                "item_count": 2,
+                "origins": 2,
+                "venue_origin": 1,
+                "max_impact": "high",
+                "state": claude_worker.news.store.STORY_LABELED,
+                "assessments": 1,
+            }
+        )
+        store.put_label(
+            {
+                "story_id": story_id,
+                "model": claude_worker.news.cascade.MODEL_SESSION,
+                "prompt_version": "label-v2",
+                "cache_hit": 0,
+                "market": "BTC-UP",
+                "sym": 7,
+                "descriptor": "BTC-UP",
+                "venue": 0,
+                "direction": "down",
+                "confidence": 0.8,
+                "half_life_s": 900.0,
+                "vol": "up",
+                "liquidity": "none",
+                "ts": now - 600,
+            }
+        )
+        store.put_resolution(
+            {
+                "subject_kind": claude_worker.news.resolve.SUBJECT_LABEL,
+                "subject_id": story_id,
+                "t0": now - 600,
+                "t1": now - 60,
+                "horizon_s": 540,
+                "state": claude_worker.news.resolve.STATE_RESOLVED,
+                "descriptor": "BTC-UP",
+                "direction": "down",
+                "confidence": 0.8,
+                "hit": 1,
+                "signed_bps": 12.5,
+                "fwd_bps": -12.5,
+                "vol_claimed": 1,
+                "vol_reached_high": 1,
+                "rv_ratio": 1.4,
+                "resolved_ts": now - 30,
+            }
+        )
+        store.put_resolution(
+            {
+                "subject_kind": claude_worker.news.resolve.SUBJECT_DECLARE,
+                "subject_id": "d1",
+                "t0": now - 300,
+                "t1": now + 3600,
+                "horizon_s": 3900,
+                "state": claude_worker.news.resolve.STATE_PENDING,
+                "descriptor": "BTC-UP",
+                "vol_claimed": 1,
+            }
+        )
+        store.record_action(
+            {
+                "ts": now - 590,
+                "story_id": story_id,
+                "kind": claude_worker.news.actions.KIND_SET_BIAS,
+                "mode": claude_worker.news.actions.MODE_SHADOW,
+                "detail": "",
+            }
+        )
+        store.record_action(
+            {
+                "ts": now - 580,
+                "story_id": story_id,
+                "kind": claude_worker.news.actions.KIND_DECLARE_VOL_HIGH,
+                "mode": claude_worker.news.actions.RECORD_REFUSED,
+                "refused_reason": claude_worker.news.actions.REFUSED_MODE_OFF,
+            }
+        )
+        store.budget_add(
+            claude_worker.news.store.day_of(now),
+            claude_worker.news.cascade.TIER1,
+            calls=11,
+            skipped=2,
+        )
+    return story_id
+
+
+def test_news_section_carries_the_stories_board_and_the_verdicts(
+    tmp_path: pathlib.Path,
+) -> None:
+    """§15 item 3: one row per open story with its label, the resolution
+    that will judge it, and the policy's verdict — the three things the
+    operator needs to decide whether the lane is earning anything."""
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    story_id = _seed_news_claims(inputs)
+    news = claude_worker.dashboard.news_section(inputs, _NEWS_NOW_MS)
+    board = news["stories_open"]
+    assert isinstance(board, list) and len(board) == 1
+    row = board[0]
+    assert row["story_id"] == story_id
+    assert row["event_type"] == "delisting"
+    assert row["label"]["direction"] == "down"
+    assert row["label"]["model"] == claude_worker.news.cascade.MODEL_SESSION
+    assert row["resolution"]["state"] == claude_worker.news.resolve.STATE_RESOLVED
+    assert row["resolution"]["hit"] == 1
+    # The NEWEST bias verdict, so a refusal followed by an emission reads
+    # as emitted rather than as both.
+    assert row["verdict"]["mode"] == claude_worker.news.actions.MODE_SHADOW
+
+
+def test_news_section_counts_actions_and_the_budget(tmp_path: pathlib.Path) -> None:
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    _seed_news_claims(inputs)
+    news = claude_worker.dashboard.news_section(inputs, _NEWS_NOW_MS)
+    counted = {(row["kind"], row["mode"]): row["count"] for row in news["actions_24h"]}
+    assert counted[
+        (claude_worker.news.actions.KIND_SET_BIAS, claude_worker.news.actions.MODE_SHADOW)
+    ] == 1
+    assert counted[
+        (
+            claude_worker.news.actions.KIND_DECLARE_VOL_HIGH,
+            claude_worker.news.actions.RECORD_REFUSED,
+        )
+    ] == 1
+    budget = news["budget_today"]
+    assert budget[claude_worker.news.cascade.TIER1]["calls"] == 11
+    assert budget[claude_worker.news.cascade.TIER1]["skipped"] == 2
+    # The ceiling comes from the POLICY, and the safe policy an absent file
+    # produces carries the DEFAULT ceilings — so the page shows the limit
+    # that is actually in force rather than an unbounded 0.
+    assert budget[claude_worker.news.cascade.TIER1]["ceiling"] == (
+        claude_worker.news.cascade.DEFAULT_CEILINGS[claude_worker.news.cascade.TIER1]
+    )
+
+
+def test_news_section_timeline_carries_pending_and_judged_claims(
+    tmp_path: pathlib.Path,
+) -> None:
+    """§15 item 5. A PENDING claim is a marker too: leaving it out until it
+    resolves would make the lane look quieter than it is, and would hide a
+    claim whose horizon is still running."""
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    story_id = _seed_news_claims(inputs)
+    news = claude_worker.dashboard.news_section(inputs, _NEWS_NOW_MS)
+    markers = news["timeline_24h"]
+    assert isinstance(markers, list) and len(markers) == 2
+    by_kind = {str(m["kind"]): m for m in markers}
+    label = by_kind[claude_worker.news.resolve.SUBJECT_LABEL]
+    assert label["story_id"] == story_id
+    assert label["state"] == claude_worker.news.resolve.STATE_RESOLVED
+    assert label["hit"] == 1 and label["signed_bps"] == 12.5
+    assert label["event_type"] == "delisting"
+    assert label["ts"] == (_NEWS_NOW_MS // 1000 - 600) * 1000, "ms, like every other ts"
+    declare = by_kind[claude_worker.news.resolve.SUBJECT_DECLARE]
+    assert declare["state"] == claude_worker.news.resolve.STATE_PENDING
+    assert declare["hit"] == 0
+
+
+def test_news_section_reads_the_scorecard_file_and_never_recomputes_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The dashboard READS `scorecard.json`, so the number the operator sees
+    and the number the N4 gate reads are the same number. A file that is
+    not there is `None`, not a recomputation."""
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    assert claude_worker.dashboard.news_section(inputs, _NEWS_NOW_MS)["scorecard"] is None
+    now = _NEWS_NOW_MS // 1000
+    _seed_news_claims(inputs)
+    db = inputs.news_dir / claude_worker.news.DB_FILENAME
+    with claude_worker.news.store.Store(db) as store:
+        doc = claude_worker.news.resolve.build_scorecard(store, now)
+        assert claude_worker.news.resolve.write_scorecard(
+            inputs.news_dir / claude_worker.news.SCORECARD_FILE, doc
+        )
+    news = claude_worker.dashboard.news_section(inputs, _NEWS_NOW_MS)
+    card = news["scorecard"]
+    assert isinstance(card, dict)
+    assert card["generated_ts"] == now
+    assert card["windows"]["all"]["direction"]["n"] == 1
+    assert card["windows"]["all"]["direction"]["hits"] == 1
+    # The legend lives IN the file so the page's text and the gate's rule
+    # cannot drift apart — the page must not carry its own copy.
+    assert "wilson_lo > base_rate" in str(card["legend"])
+    html = (
+        pathlib.Path(claude_worker.dashboard.__file__).parent
+        / "dashboard"
+        / "dashboard.html"
+    ).read_text(encoding="utf-8")
+    assert "renderNewsScorecard" in html and "SC.legend" in html
+    assert "renderNewsMarkers" in html and "timeline_24h" in html
+
+
+def test_news_red_rules_name_a_dead_source_and_an_invalid_policy(
+    tmp_path: pathlib.Path,
+) -> None:
+    """§15 item 1. The maintenance rule is deliberately NOT here: it lives
+    in `detect.maintenance_alerts`, which writes the ALERT file the panel
+    already shows, and two implementations would eventually disagree."""
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    inputs.news_policy_path.write_text("[mode]\nnot_a_kind = 'live'\n", encoding="utf-8")
+    news = claude_worker.dashboard.news_section(inputs, _NEWS_NOW_MS)
+    rules = news["red_rules"]
+    assert isinstance(rules, list)
+    joined = " · ".join(str(r) for r in rules)
+    assert "policy invalid" in joined
+    # `mill` failed 12 polls in `_seed_news` and then had one refused by the
+    # origin check — a refusal is not an OK poll, so the streak is 13.
+    assert "source mill dead 13 polls" in joined
+    # An unknown key means EVERY mode off — a typo silences the lane rather
+    # than half-configuring it.
+    assert news["policy"]["valid"] is False
+    modes = news["policy"]["modes"]
+    assert set(modes.values()) == {claude_worker.news.actions.MODE_OFF}

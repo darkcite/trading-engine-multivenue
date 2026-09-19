@@ -641,3 +641,228 @@ def test_a_proposal_is_a_file_and_touches_no_venue(tmp_path: pathlib.Path) -> No
     finally:
         store.close()
         state.close()
+
+
+# ---- §12 the `actions` drain ----------------------------------------------
+
+
+def _full_story(store: claude_worker.news.store.Store, story_id: str = "s1") -> None:
+    """One story with one item, so the drain has something to read back."""
+    store.upsert_story(
+        {
+            "story_id": story_id,
+            "family": "crypto",
+            "event_type": "delisting",
+            "venues": '["okx"]',
+            "assets": '["BTC"]',
+            "first_ts": NOW,
+            "last_ts": NOW,
+            "item_count": 1,
+            "origins": 2,
+            "venue_origin": 0,
+            "max_impact": "high",
+            "state": claude_worker.news.store.STORY_OPEN,
+            "assessments": 0,
+        }
+    )
+    store.upsert_item(
+        source="press", guid="g1", ts=NOW, fetched_ts=NOW,
+        title="OKX will delist the BTC perpetual swap", link="l",
+        text="body", origin="p.example", class_="C", weight=1.0,
+    )
+    store.set_triage_state(
+        "press", "g1", claude_worker.news.store.STATE_ESCALATED, story_id
+    )
+
+
+def _stored_label(store: claude_worker.news.store.Store, story_id: str = "s1") -> None:
+    store.put_label(
+        {
+            "story_id": story_id,
+            "model": claude_worker.news.cascade.MODEL_SESSION,
+            "prompt_version": "label-v2",
+            "cache_hit": 0,
+            "market": "BTC-UP",
+            "sym": MARKET_MAP["BTC-UP"],
+            "descriptor": "BTC-UP",
+            "venue": 0,
+            "direction": "down",
+            "confidence": 0.8,
+            "half_life_s": 900.0,
+            "vol": "up",
+            "liquidity": "none",
+            "ts": NOW,
+        }
+    )
+
+
+def test_the_drain_emits_a_stored_label_once(tmp_path: pathlib.Path) -> None:
+    """The lane's whole job: a label written by the cascade becomes exactly
+    one recorded action, and a second run adds nothing.
+
+    Idempotence is the property that matters. At Stage 3 a second emission
+    is a second FRAME, so "emit every label in the window" has to mean
+    "every label with no action row", and this is what proves it does.
+    """
+    emitter, store, state = _emitter(tmp_path)
+    try:
+        _full_story(store)
+        _stored_label(store)
+        stats = emitter.run(NOW)
+        assert stats.shadow == 1 and stats.live == 0
+        rows = store.actions_since(0)
+        assert len(rows) == 1
+        assert rows[0]["kind"] == claude_worker.news.actions.KIND_SET_BIAS
+        assert rows[0]["mode"] == claude_worker.news.actions.MODE_SHADOW
+        assert rows[0]["story_id"] == "s1"
+        # The frame was computed in full even though nothing was sent.
+        assert int(typing.cast(int, rows[0]["sym"])) == MARKET_MAP["BTC-UP"]
+        assert int(typing.cast(int, rows[0]["px"])) < 0, "a down bias is a negative px"
+        assert int(typing.cast(int, rows[0]["ttl_ns"])) > 0
+        again = emitter.run(NOW + 60)
+        assert len(store.actions_since(0)) == 1, "a second run re-emitted the label"
+        assert again.recorded == 1, "stats accumulate on the emitter, not the run"
+    finally:
+        store.close()
+        state.close()
+
+
+def test_the_drain_reads_an_assessment_once_even_with_no_actions(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An assessment whose only action is `none` records NO decision row.
+
+    Without the `assessment/read` marker the drain would find it un-emitted
+    on every run and re-read it forever — so the marker is what makes
+    "nothing should change" a terminal answer rather than a loop.
+    """
+    emitter, store, state = _emitter(tmp_path)
+    try:
+        _full_story(store)
+        assessment = claude_worker.news.cascade.parse_assessment(
+            json.dumps(
+                {
+                    "thesis": "Nothing here warrants a change.",
+                    "mechanism": "other",
+                    "channels": {
+                        "direction": {"market": None, "dir": "none", "confidence": 0.1},
+                        "vol": {
+                            "profile": "none", "level": "none",
+                            "confidence": 0.1, "ttl_s": 0,
+                        },
+                        "venue_risk": {"venue": None, "severity": "info"},
+                    },
+                    "affected_descriptors": [],
+                    "actions": [{"kind": "none"}],
+                    "half_life_s": 600,
+                    "falsifier": "A venue confirms an outage.",
+                    "evidence": ["press|g1"],
+                }
+            ),
+            sorted(MARKET_MAP),
+            (),
+            ("press|g1",),
+        )
+        assert assessment is not None
+        store.insert_assessment(
+            {
+                "story_id": "s1",
+                "model": claude_worker.news.cascade.MODEL_SESSION,
+                "prompt_version": claude_worker.news.cascade.ANALYST_PROMPT_VERSION,
+                "cache_hit": 0,
+                "body": claude_worker.news.cascade.canonical_json(assessment),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "ts": NOW,
+            }
+        )
+        emitter.run(NOW)
+        rows = store.actions_since(0)
+        kinds = [str(row["kind"]) for row in rows]
+        assert kinds == [claude_worker.news.actions.KIND_ASSESSMENT]
+        assert rows[0]["mode"] == claude_worker.news.actions.RECORD_READ
+        assert "actions=1" in str(rows[0]["detail"])
+        # A marker is not a refusal: counting it as one made the lane print
+        # `refused=10` for 7 refusals and 3 assessments read.
+        assert emitter.stats.read == 1 and emitter.stats.refused == 0
+        emitter.run(NOW + 60)
+        assert len(store.actions_since(0)) == 1, "the assessment was read twice"
+    finally:
+        store.close()
+        state.close()
+
+
+def test_the_drain_reparses_the_stored_body_through_the_strict_parser(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A body the parser no longer admits is recorded as unparseable and
+    acted on in NO way. Trusting the column instead would mean acting on a
+    half-understood assessment, which is worse than skipping it."""
+    emitter, store, state = _emitter(tmp_path)
+    try:
+        _full_story(store)
+        store.insert_assessment(
+            {
+                "story_id": "s1",
+                "model": claude_worker.news.cascade.MODEL_SESSION,
+                "prompt_version": claude_worker.news.cascade.ANALYST_PROMPT_VERSION,
+                "cache_hit": 0,
+                "body": '{"thesis": "truncated"',
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "ts": NOW,
+            }
+        )
+        emitter.run(NOW)
+        rows = store.actions_since(0)
+        assert len(rows) == 1
+        assert rows[0]["kind"] == claude_worker.news.actions.KIND_ASSESSMENT
+        assert rows[0]["detail"] == "unparseable"
+    finally:
+        store.close()
+        state.close()
+
+
+def test_the_drain_ignores_a_claim_older_than_its_window(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A day-old label has outlived every half-life this lane writes.
+    Emitting it would put a stale view on the wire."""
+    emitter, store, state = _emitter(tmp_path)
+    try:
+        _full_story(store)
+        _stored_label(store)
+        stats = emitter.run(NOW + claude_worker.news.actions.DRAIN_WINDOW_S + 1)
+        assert stats.recorded == 0
+        assert store.actions_since(0) == []
+    finally:
+        store.close()
+        state.close()
+
+
+def test_a_drain_with_no_client_records_and_sends_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The lane path has no client at all, so a `live` policy still reaches
+    no venue — it records `refused (disconnected)` instead (LAW E-1's
+    direction: never a silent downgrade to a send)."""
+    modes: dict[str, str] = {}
+    for i in range(len(claude_worker.news.actions.POLICY_KINDS)):
+        modes[claude_worker.news.actions.POLICY_KINDS[i]] = (
+            claude_worker.news.actions.MODE_LIVE
+        )
+    emitter, store, state = _emitter(
+        tmp_path, policy=_policy(modes=modes), client=None
+    )
+    try:
+        _full_story(store)
+        _stored_label(store)
+        emitter.run(NOW)
+        rows = store.actions_since(0)
+        assert len(rows) == 1
+        assert rows[0]["mode"] == claude_worker.news.actions.RECORD_REFUSED
+        assert rows[0]["refused_reason"] == claude_worker.news.actions.REFUSED_DISCONNECTED
+        assert int(typing.cast(int, rows[0]["seq"])) == 0
+    finally:
+        store.close()
+        state.close()

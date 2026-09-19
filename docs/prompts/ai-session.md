@@ -210,6 +210,16 @@ The scripted test executes exactly this sequence.
 
 ## 5. News/labeling recipe
 
+Two paths, and they do not mix. **5a** is the original verb path: you read
+raw feed items and push frames yourself. **5b** is the NEWS lane: the
+aggregator has already filtered a thousand items to a few hundred, you
+answer its prompts as the tagger, and a POLICY decides what — if anything
+— reaches the engine. Prefer 5b whenever `~/multivenue/news.toml` exists;
+it is measured (every claim opens a resolution and lands in the
+scorecard), 5a is not.
+
+### 5a. The verb path (unchanged)
+
 1. `claude-worker fetch --news` — mechanical pull + dedupe; read the
    printed NDJSON (`{id, feed, ts, title, link, text}` per line).
 2. Reason: family (crypto/politics/sports/macro/other), impact,
@@ -224,6 +234,76 @@ The scripted test executes exactly this sequence.
    your state TTLs out — **that is the §5.4 fail-safe, not a bug**.
    Re-push to refresh a view you still hold. `--expire-on-silence` ties
    the entry to heartbeat liveness on top of its TTL.
+
+### 5b. The NEWS lane — you are the model (spec §14)
+
+No API key exists yet, so the cascade's three tiers have no `complete_fn`.
+You are it. Every lane below is a MODULE lane run from `claude-worker/`,
+never a verb; the 8-verb surface is frozen.
+
+The contract is strict on purpose: your answers go through the SAME
+parsers a model's would (`parse_triage_v2`, `parse_label_v2`,
+`parse_assessment`), are counted in the same `*_malformed` counters, spend
+the same daily ceilings, and open the same resolutions. They land under
+`model = "session"`, which is the only thing separating them from an
+automated answer in the scorecard — so an answer that does not obey its
+schema is a wasted pass, not a near miss.
+
+```sh
+cd claude-worker
+set -a; source ../.env; set +a          # never read or print .env yourself
+pgrep -f 'claude[-_]worke[r]'           # MUST print nothing before each lane
+
+uv run python -m claude_worker.news cycle          # no model; may be skipped (launchd runs it)
+uv run python -m claude_worker.news prompts --tier 1 --limit 60 --out /tmp/p1.ndjson
+#   -> one line per question: {"id": "<source|guid>", "tier": 1, "prompt": "<exact text>"}
+#      Answer EVERY line with the JSON object its prompt asks for, and write
+#      /tmp/a1.ndjson as one line per answer: {"id": "<same id>", "response": "<the JSON as text>"}
+uv run python -m claude_worker.news ingest  --tier 1 --answers /tmp/a1.ndjson
+uv run python -m claude_worker.news prompts --tier 2 --limit 40 --out /tmp/p2.ndjson
+uv run python -m claude_worker.news ingest  --tier 2 --answers /tmp/a2.ndjson
+uv run python -m claude_worker.news prompts --tier 3 --limit 8  --out /tmp/p3.ndjson
+uv run python -m claude_worker.news ingest  --tier 3 --answers /tmp/a3.ndjson
+uv run python -m claude_worker.news actions                     # policy decides; add --dry-run to preview
+uv run python -m claude_worker.news report --hours 4
+```
+
+What each tier asks of you:
+
+- **Tier 1 (triage).** One item, in or out. `impact` is `high` ONLY for an
+  event that changes what can be traded or how a venue operates within
+  24 h. `entities.venues` and `entities.assets` are CLOSED lists printed in
+  the prompt — naming anything outside them rejects the whole answer.
+  Class-B items the venue already typed are not in the file: they cost
+  nothing and are answered without you.
+- **Tier 2 (label).** One story, one market from the printed list, one
+  direction. `"none"` is a real and usually correct answer: this desk has
+  measured no directional edge from any conditioning signal, and a
+  directionless label is still stored and still scored on its `vol` call.
+- **Tier 3 (analyst).** The prompt line carries a `system` field — that is
+  the grammar, and it is the authority, not this page. Read it in full.
+  You cannot halt, cannot disable a live slot, cannot name an instrument
+  outside the provided list; those kinds do not exist. Prefer `{"kind":
+  "none"}` unless the mechanism is concrete (a delisting unwind, an ETF
+  creation, a liquidation cascade). Every `evidence` id must be one of the
+  story's own items.
+
+Rules for the whole path:
+
+- You never push a frame. `news actions` applies
+  `~/multivenue/news-policy.toml`; while that file is absent every mode is
+  `off` and the lane records refusals only. Do not create it — that is an
+  operator ruling.
+- Never edit `news.toml`, `news-policy.toml`, `universe.toml`, or any file
+  under `news_dir`. The proposals are the operator's to apply (`news
+  proposals` prints them).
+- `news report --hours 4` is your output. If a red ALERT is in force, say
+  so in the first line.
+- Run one lane at a time. `prompts` and `ingest` open `state.db`, and the
+  seq allocator is a single namespace.
+- `ingest` exits 1 when anything was rejected or a line was unusable. That
+  is information, not a crash: re-read the offending prompt's schema and
+  answer it again — an item stays pending until an answer is accepted.
 
 ## 6. Safety rails
 
