@@ -192,6 +192,27 @@ def test_every_item_carries_a_guid_and_the_sources_own_metadata() -> None:
             assert len(item.text) <= claude_worker.news.sources.NewsSettings().text_cap
 
 
+def test_status_kraken_snapshot_omits_the_polling_timestamp() -> None:
+    """MEASURED 2026-09-19: Kraken answers its own `timestamp` on every
+    poll, so a body carrying it has a fresh sha256 every 60 s and the §8.1
+    "an unchanged snapshot is not stored again" rule could never fire for
+    this source — it was the one class-A source of thirteen that stored a
+    second snapshot row across two live cycles. WHEN the state was read is
+    already `taken_ts`; the body is the venue's STATE."""
+    payload = _read("status-kraken")
+    assert "timestamp" in payload, "the recorded fixture still carries it"
+    snapshot = _parse("status-kraken", payload).snapshot
+    assert snapshot is not None
+    assert json.loads(snapshot.body) == {"status": "online"}
+    # Two polls a minute apart therefore hash the same.
+    later = claude_worker.news.sources.parse(
+        _source_for("status-kraken"), payload, NOW + 60
+    ).snapshot
+    assert later is not None
+    assert later.sha256 == snapshot.sha256
+    assert later.taken_ts != snapshot.taken_ts
+
+
 def test_every_snapshot_is_canonical_and_hashes_its_own_body() -> None:
     for kind in claude_worker.news.sources.KINDS:
         if _SHAPE[kind] != "snapshot":

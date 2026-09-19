@@ -231,6 +231,60 @@ def regime_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
 NEWS_WINDOW_S: int = 86_400
 #: Rows the NEWS panel shows at most.
 NEWS_EVENTS_MAX: int = 20
+#: Instruments named inside a collapsed events row.
+NEWS_EVENT_SAMPLE: int = 3
+
+
+def _news_events(
+    store: claude_worker.news.store.Store,
+    since_ts: int,
+    limit: int = NEWS_EVENTS_MAX,
+) -> list[dict[str, object]]:
+    """The events tail, newest RECORDED last (the panel reverses it).
+
+    Two corrections over a plain slice of `events_since`, both measured
+    2026-09-19 on live payloads: that query orders by `at_ts`, so taking
+    the last N returned the FURTHEST-FUTURE events rather than the newest
+    ones; and one poll of the Deribit BTC option chain records 190 expiry
+    events dated 18-72 h out, which would hold every row of a 20-row tail
+    for days and hide every listing, delisting and maintenance event
+    behind them. Events sharing (kind, venue, at_ts) therefore collapse to
+    one row naming the count, exactly as `calendar.json` does.
+    """
+    rows = store.events_since(since_ts)
+    groups: dict[tuple[str, str, int], list[dict[str, object]]] = {}
+    for i in range(len(rows)):
+        row = rows[i]
+        key = (str(row["kind"]), str(row["venue"]), int(typing.cast(int, row["at_ts"])))
+        groups.setdefault(key, []).append(row)
+    collapsed: list[dict[str, object]] = []
+    for members in groups.values():
+        collapsed.append(_collapse_events(members))
+    collapsed.sort(key=lambda row: int(typing.cast(int, row["id"])))
+    return collapsed[-limit:]
+
+
+def _collapse_events(members: list[dict[str, object]]) -> dict[str, object]:
+    """One row for a group of events that share a kind, a venue and an
+    instant. A group of one is returned untouched."""
+    if len(members) == 1:
+        return members[0]
+    members.sort(key=lambda row: str(row["instrument"]))
+    names: list[str] = []
+    for i in range(len(members)):
+        names.append(str(members[i]["instrument"]))
+    newest = dict(members[len(members) - 1])
+    for i in range(len(members)):
+        newest["id"] = max(
+            int(typing.cast(int, newest["id"])), int(typing.cast(int, members[i]["id"]))
+        )
+    shown = ", ".join(names[:NEWS_EVENT_SAMPLE])
+    extra = len(names) - NEWS_EVENT_SAMPLE
+    newest["instrument"] = ""
+    newest["detail"] = (
+        f"{len(names)} instruments ({shown}" + (f", +{extra} more)" if extra > 0 else ")")
+    )
+    return newest
 
 
 def _news_funnel(
@@ -286,7 +340,7 @@ def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
         by_verdict, total = _news_funnel(store, since)
         payload["funnel_24h"] = by_verdict
         payload["items_24h"] = total
-        payload["events"] = store.events_since(since)[-NEWS_EVENTS_MAX:]
+        payload["events"] = _news_events(store, since)
         payload["counters"] = store.counters()
     except sqlite3.Error:
         pass

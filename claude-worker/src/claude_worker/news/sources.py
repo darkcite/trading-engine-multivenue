@@ -1215,7 +1215,14 @@ def _parse_status_kraken(source: Source, payload: str, fetched_ts: int, cap: int
     result = _at(_obj(payload), "result")
     if not isinstance(result, dict) or "status" not in result:
         raise ValueError("kraken status: no status")
-    body: dict[str, object] = {"status": result.get("status"), "timestamp": result.get("timestamp")}
+    # The venue's own `timestamp` is DELIBERATELY not kept: it changes on
+    # every poll, so a body carrying it has a fresh sha256 every 60 s and
+    # the §8.1 "unchanged snapshot is not stored again" rule could never
+    # fire for this source (measured 2026-09-19 — kraken-status was the one
+    # class-A source of thirteen that stored a second row across two
+    # cycles). The snapshot is the venue's STATE; when it was read is
+    # already `taken_ts`.
+    body: dict[str, object] = {"status": result.get("status")}
     return Parsed([], _snapshot(source, fetched_ts, body), [])
 
 

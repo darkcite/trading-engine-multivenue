@@ -388,6 +388,46 @@ def test_the_news_panel_reports_the_funnel_health_and_events(tmp_path: pathlib.P
     assert news["counters"][claude_worker.news.store.COUNTER_PARSE_EMPTY] == 3
 
 
+def test_the_news_panel_tail_survives_an_expiry_swarm(tmp_path: pathlib.Path) -> None:
+    """MEASURED 2026-09-19: one poll of the live Deribit BTC option chain
+    records 190 expiry events dated 18-72 h out. Ordered by `at_ts`, those
+    hold every row of a 20-row tail for days and the one event an operator
+    needs to see — a delisting — is invisible behind them. The tail is
+    therefore ordered by what was RECORDED last, and events sharing a kind,
+    a venue and an instant collapse to one row naming the count."""
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    now = _NEWS_NOW_MS // 1000
+    expiry_at = now + 18 * 3_600
+    with claude_worker.news.store.Store(
+        inputs.news_dir / claude_worker.news.DB_FILENAME
+    ) as store:
+        for i in range(60):
+            store.insert_event(
+                kind="expiry",
+                venue="deribit",
+                at_ts=expiry_at,
+                source="deribit-instruments-btc-option",
+                detail="active option",
+                created_ts=now,
+                instrument=f"BTC-20SEP26-{100000 + i}-C",
+            )
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=_NEWS_NOW_MS)
+    news = doc["news"]
+    assert isinstance(news, dict)
+    events = news["events"]
+    assert isinstance(events, list)
+    # 60 expiries + the seeded delisting = 2 rows, not 61.
+    assert len(events) == 2
+    by_kind = {str(row["kind"]): row for row in events}
+    assert by_kind["delisting"]["instrument"] == "FOO-USDT-SWAP"
+    assert str(by_kind["expiry"]["detail"]).startswith("60 instruments (")
+    assert "+57 more" in str(by_kind["expiry"]["detail"])
+    assert by_kind["expiry"]["instrument"] == ""
+    # The panel reverses the list, so the newest RECORDED row is last here.
+    assert events[len(events) - 1]["kind"] == "expiry"
+
+
 def test_the_news_panel_surfaces_a_red_alert_and_the_calendar(tmp_path: pathlib.Path) -> None:
     inputs = _worker_dir(tmp_path)
     _seed_news(inputs)
