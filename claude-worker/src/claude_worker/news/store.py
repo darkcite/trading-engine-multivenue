@@ -754,6 +754,91 @@ class Store:
             (state, now_ts),
         )
 
+    def resolutions_resolved(self, since_ts: int) -> list[dict[str, object]]:
+        """Resolved rows in a window, with the label's model joined on.
+
+        The join is what keeps `by_model` honest: the `session` brain and
+        the automated one are never pooled silently, and a resolution
+        whose claim came from neither carries an empty model rather than
+        being attributed to one.
+        """
+        return self._rows(
+            """
+            SELECT r.*, COALESCE(l.model, '') AS model
+            FROM resolutions AS r
+            LEFT JOIN labels AS l
+              ON l.story_id = r.subject_id AND r.subject_kind = 'label'
+            WHERE r.state = 'resolved' AND r.resolved_ts >= ?
+            ORDER BY r.resolved_ts
+            """,
+            (since_ts,),
+        )
+
+    def resolution_states(self) -> dict[str, int]:
+        cursor = self._conn.execute(
+            "SELECT state, COUNT(*) FROM resolutions GROUP BY state"
+        )
+        rows = cursor.fetchall()
+        out: dict[str, int] = {}
+        for i in range(len(rows)):
+            out[str(rows[i][0])] = int(rows[i][1])
+        return out
+
+    def unresolvable_reasons(self, limit: int = 3) -> list[tuple[str, int]]:
+        cursor = self._conn.execute(
+            """
+            SELECT detail, COUNT(*) AS n FROM resolutions
+            WHERE state = 'unresolvable' GROUP BY detail ORDER BY n DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        out: list[tuple[str, int]] = []
+        for i in range(len(rows)):
+            out.append((str(rows[i][0]), int(rows[i][1])))
+        return out
+
+    def funnel_since(self, since_ts: int) -> dict[str, int]:
+        """Tier-0 verdict counts in a window — the funnel, in one pass."""
+        cursor = self._conn.execute(
+            "SELECT tier0, COUNT(*) FROM items WHERE ts >= ? GROUP BY tier0", (since_ts,)
+        )
+        rows = cursor.fetchall()
+        out: dict[str, int] = {}
+        for i in range(len(rows)):
+            out[str(rows[i][0])] = int(rows[i][1])
+        return out
+
+    def source_funnel_since(self, since_ts: int) -> list[dict[str, object]]:
+        """Per-source item counts and pass rate in a window."""
+        return self._rows(
+            """
+            SELECT source,
+                   COUNT(*) AS items,
+                   SUM(CASE WHEN tier0 = ? THEN 1 ELSE 0 END) AS passed
+            FROM items WHERE ts >= ? GROUP BY source ORDER BY source
+            """,
+            (TIER0_PASS, since_ts),
+        )
+
+    def story_first_sources(self, since_ts: int) -> list[dict[str, object]]:
+        """For each story, the source of its EARLIEST full-weight item, and
+        whether the story later reached two independent origins.
+
+        This is the number that says which sources are worth their poll:
+        being first matters only if somebody else confirms it.
+        """
+        return self._rows(
+            """
+            SELECT s.story_id AS story_id, s.origins AS origins,
+                   (SELECT i.source FROM items AS i
+                    WHERE i.story_id = s.story_id AND i.weight >= 1.0
+                    ORDER BY i.ts LIMIT 1) AS first_source
+            FROM stories AS s WHERE s.first_ts >= ?
+            """,
+            (since_ts,),
+        )
+
     # ---- budget / counters ---------------------------------------------
 
     def budget_add(  # noqa: PLR0913

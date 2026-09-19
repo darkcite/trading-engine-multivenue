@@ -44,6 +44,7 @@ import claude_worker.feeds
 import claude_worker.labeling
 import claude_worker.news
 import claude_worker.news.detect
+import claude_worker.news.resolve
 import claude_worker.news.sources
 import claude_worker.news.store
 import claude_worker.state
@@ -1209,6 +1210,23 @@ class NewsQueueWatcher:
             }
         )
         self.stats.labels_stored += 1
+        if not descriptor:
+            return
+        # The writer of the claim opens its resolution, so no claim
+        # escapes measurement (spec §9.6). The descriptor is copied from
+        # label time: a SymbolId is meaningless across boots.
+        claude_worker.news.resolve.open_resolution(
+            self._store,
+            claude_worker.news.resolve.SUBJECT_LABEL,
+            story_id,
+            t0=now_ts,
+            horizon_s=int(label.half_life_s),
+            descriptor=descriptor,
+            venue=venue,
+            direction=label.direction,
+            confidence=label.confidence,
+            vol_claimed=1 if label.vol == "up" else 0,
+        )
 
     # ---- the pass ------------------------------------------------------
 

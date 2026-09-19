@@ -53,6 +53,7 @@ import claude_worker.frames
 import claude_worker.news
 import claude_worker.news.cascade
 import claude_worker.news.detect
+import claude_worker.news.resolve
 import claude_worker.news.store
 import claude_worker.pmlr
 import claude_worker.regime
@@ -620,9 +621,22 @@ class Emitter:
         def send(sent: Frame, sent_ts: int) -> tuple[int, str]:
             return self._declare(sent, sent_ts, profile_name, ttl_s, story_id, effective)
 
-        return self._dispatch(
+        outcome = self._dispatch(
             KIND_DECLARE_VOL_HIGH, frame, story_id, now_ts, detail=action.profile, send_fn=send
         )
+        # Shadow OR live: a declaration is a claim about the next hours
+        # either way, and the shadow ones are exactly what the 8-window
+        # gate reads before this channel may go live.
+        if outcome.mode in (MODE_SHADOW, MODE_LIVE):
+            claude_worker.news.resolve.open_resolution(
+                self._store,
+                claude_worker.news.resolve.SUBJECT_DECLARE,
+                str(outcome.row_id),
+                t0=now_ts,
+                horizon_s=ttl_s,
+                detail=f"profile {profile_name}",
+            )
+        return outcome
 
     def _declare(  # noqa: PLR0913, PLR0917 — the declaration's own send path
         self,
@@ -746,7 +760,21 @@ class Emitter:
         frame = self.intent_frame(action, sym, quote)
         if frame is None:
             return self._refuse(KIND_ORDER_INTENT, REFUSED_NO_FRESH_MID, story_id, now_ts)
-        return self._dispatch(KIND_ORDER_INTENT, frame, story_id, now_ts, detail=action.market)
+        outcome = self._dispatch(
+            KIND_ORDER_INTENT, frame, story_id, now_ts, detail=action.market
+        )
+        if outcome.mode in (MODE_SHADOW, MODE_LIVE):
+            claude_worker.news.resolve.open_resolution(
+                self._store,
+                claude_worker.news.resolve.SUBJECT_INTENT,
+                str(outcome.row_id),
+                t0=now_ts,
+                horizon_s=frame.ttl_ns // 1_000_000_000,
+                descriptor=action.market,
+                venue=frame.venue,
+                detail=f"{action.side} @ {frame.px}",
+            )
+        return outcome
 
     def intent_frame(
         self, action: claude_worker.news.cascade.Action, sym: int, quote: "Quote"

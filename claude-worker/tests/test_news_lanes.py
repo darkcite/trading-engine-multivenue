@@ -430,11 +430,24 @@ def test_a_cycle_is_invisible_to_every_other_lanes_overlap_guard() -> None:
     assert "SPDX-License-Identifier: Apache-2.0" in runner.read_text(encoding="utf-8")
 
     package = REPO_ROOT / "claude-worker" / "src" / "claude_worker" / "news"
-    holders: list[str] = []
+    writers: list[str] = []
+    readers: list[str] = []
     for path in sorted(package.glob("*.py")):
-        if "sqlite3.connect" in path.read_text(encoding="utf-8"):
-            holders.append(path.name)
-    assert holders == ["store.py"], "the news lane opened a second database"
+        text = path.read_text(encoding="utf-8")
+        if "sqlite3.connect" not in text:
+            continue
+        if "mode=ro" in text:
+            readers.append(path.name)
+        else:
+            writers.append(path.name)
+    # A second WRITER would break the premise outright: the law exists to
+    # protect a single seq writer, and this lane may have exactly one
+    # database of its own.
+    assert writers == ["store.py"], "the news lane opened a second database for writing"
+    # A read-only connection cannot corrupt anything, so it is allowed —
+    # but which files take one is recorded here, because "read-only" is a
+    # claim that has to keep being true.
+    assert readers == ["resolve.py"], "record every read-only opener deliberately"
 
 
 def test_no_lane_can_reach_a_model(
