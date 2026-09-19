@@ -28,6 +28,7 @@ tiers live in ``cascade.py`` and are reached only from ``serve``.
 
 import dataclasses
 import datetime
+import email.utils
 import hashlib
 import html
 import json
@@ -42,8 +43,8 @@ import xml.sax.saxutils
 
 import httpx
 
-import claude_worker.feeds
 import claude_worker.features
+import claude_worker.feeds
 
 # ---------------------------------------------------------------- constants
 
@@ -115,6 +116,10 @@ FETCH_STATUS_HTTP: str = "http"
 FETCH_STATUS_REFUSED_ORIGIN: str = "refused_origin"
 FETCH_STATUS_BUDGET: str = "budget"
 FETCH_STATUS_PACED: str = "paced"
+#: A 429 is the host pacing US, so it is reported as ``paced`` and not as a
+#: generic HTTP failure — GDELT answers one with a plain-text body (§5.2),
+#: and counting it as an error would fail an otherwise healthy source.
+HTTP_TOO_MANY_REQUESTS: int = 429
 
 #: Same wall as ``feeds._FETCH_TIMEOUT_S`` — one slow host may not stall a
 #: cycle (the ``cycle`` p99 gate is 30 s over every due source).
@@ -135,6 +140,7 @@ ORIGIN_WEIGHT_MIN: float = 1.0
 
 RATE_RE: typing.Final[re.Pattern[str]] = re.compile(r"^(\d+)/(\d+)s$")
 NS_PER_S: int = 1_000_000_000
+NS_PER_MS: int = 1_000_000
 MS_PER_S: int = 1_000
 BUDGET_WINDOW_NS: int = 3_600 * NS_PER_S
 BUDGET_MIN_CALLS: int = 60
@@ -150,6 +156,10 @@ TITLE_CAP: int = 300
 #: 4chan: threads quieter than this are noise by construction (Appendix A).
 FOURCHAN_MIN_REPLIES: int = 20
 FOURCHAN_TITLE_CAP: int = 80
+#: A Deribit DVOL row is ``[ts_ms, open, high, low, close]``.
+OHLC_ROW_LEN: int = 5
+#: Index of ``close`` in that row.
+OHLC_CLOSE_IDX: int = 4
 
 #: Fixture recording (Appendix B): the reduction keeps the keyed fields only
 #: and refuses to write more than this.
@@ -160,6 +170,11 @@ _TAG_RE: typing.Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 _URL_RE: typing.Final[re.Pattern[str]] = re.compile(r"https?://\S+")
 _WS_RE: typing.Final[re.Pattern[str]] = re.compile(r"\s+")
 _GDELT_TS_FMT: str = "%Y%m%dT%H%M%SZ"
+#: Some publishers serve a UTF-8 BOM ahead of the document (measured
+#: 2026-09-19 on www.federalreserve.gov/json/calendar.json). ``json.loads``
+#: refuses it outright and ElementTree chokes on it, so it is stripped once
+#: at the door rather than in every parser.
+_BOM: str = "\ufeff"
 
 
 # ------------------------------------------------------------------ records
@@ -347,6 +362,9 @@ _NEWS_KEYS: frozenset[str] = frozenset(
     )
 )
 _TOP_KEYS: frozenset[str] = frozenset(("news", "keywords", "calendar", "registry"))
+_CALENDAR_KEYS: frozenset[str] = frozenset(("bls_releases", "fixed_daily"))
+_FIXED_DAILY_KEYS: frozenset[str] = frozenset(("kind", "at"))
+_REQUIRED_SOURCE_KEYS: tuple[str, ...] = ("name", "kind", "url", "origin", "class")
 
 
 def _reject_unknown(where: str, table: typing.Mapping[str, object], known: frozenset[str]) -> None:
@@ -363,9 +381,9 @@ def _is_statuspage(origin: str) -> bool:
     """A host that publishes a venue's status is impersonation-adjacent
     (survey §13): anyone can host ``status.<venue>.example``, so the
     operator must name it explicitly."""
-    return origin.startswith("status.") or origin == "statuspage.io" or origin.endswith(
-        ".statuspage.io"
-    )
+    if origin.startswith("status."):
+        return True
+    return origin == "statuspage.io" or origin.endswith(".statuspage.io")
 
 
 def rate_interval_ns(rate: str) -> int:
@@ -423,15 +441,19 @@ def _validate_numbers(source: Source) -> None:
     rate_interval_ns(source.rate)
 
 
+def _validate_query_kind(source: Source, fixed_host: str) -> None:
+    if source.url:
+        raise ValueError(f"{source.name}: kind {source.kind} builds its URL — url must be ''")
+    if not source.query:
+        raise ValueError(f"{source.name}: kind {source.kind} requires a non-empty query")
+    if source.origin != fixed_host:
+        raise ValueError(f"{source.name}: origin must be {fixed_host!r} for {source.kind}")
+
+
 def _validate_origin(source: Source) -> None:
     fixed_host = QUERY_KIND_HOSTS.get(source.kind, "")
     if fixed_host:
-        if source.url:
-            raise ValueError(f"{source.name}: kind {source.kind} builds its URL — url must be ''")
-        if not source.query:
-            raise ValueError(f"{source.name}: kind {source.kind} requires a non-empty query")
-        if source.origin != fixed_host:
-            raise ValueError(f"{source.name}: origin must be {fixed_host!r} for {source.kind}")
+        _validate_query_kind(source, fixed_host)
         return
     if not source.url:
         raise ValueError(f"{source.name}: url is required for kind {source.kind}")
@@ -449,7 +471,8 @@ def _validate_origin(source: Source) -> None:
 
 def _source_from_table(table: typing.Mapping[str, object], default_poll_s: int) -> Source:
     _reject_unknown("[registry].sources entry", table, _SOURCE_KEYS)
-    for key in ("name", "kind", "url", "origin", "class"):
+    for i in range(len(_REQUIRED_SOURCE_KEYS)):
+        key = _REQUIRED_SOURCE_KEYS[i]
         if key not in table:
             raise ValueError(f"[registry].sources entry is missing required key {key!r}")
     source = Source(
@@ -497,18 +520,18 @@ def _settings_from(table: typing.Mapping[str, object]) -> NewsSettings:
 
 
 def _calendar_from(table: typing.Mapping[str, object]) -> Calendar:
-    _reject_unknown("[calendar]", table, frozenset(("bls_releases", "fixed_daily")))
+    _reject_unknown("[calendar]", table, _CALENDAR_KEYS)
     raw_daily = typing.cast(list[dict[str, object]], table.get("fixed_daily", []))
     daily: list[FixedDaily] = []
     for i in range(len(raw_daily)):
         entry = raw_daily[i]
-        _reject_unknown("[calendar].fixed_daily entry", entry, frozenset(("kind", "at")))
+        _reject_unknown("[calendar].fixed_daily entry", entry, _FIXED_DAILY_KEYS)
         daily.append(FixedDaily(kind=str(entry["kind"]), at=str(entry["at"])))
     releases = typing.cast(list[str], table.get("bls_releases", []))
-    return Calendar(
-        bls_releases=tuple(str(releases[i]) for i in range(len(releases))),
-        fixed_daily=tuple(daily),
-    )
+    out: list[str] = []
+    for i in range(len(releases)):
+        out.append(str(releases[i]))
+    return Calendar(bls_releases=tuple(out), fixed_daily=tuple(daily))
 
 
 def load_registry(path: pathlib.Path) -> Registry:
@@ -519,13 +542,15 @@ def load_registry(path: pathlib.Path) -> Registry:
     registry, because a half-read source list would silently stop polling
     the sources it dropped.
     """
-    raw = path.read_bytes()
-    doc = tomllib.loads(raw.decode("utf-8"))
+    doc = tomllib.loads(path.read_bytes().decode("utf-8"))
     _reject_unknown(str(path), doc, _TOP_KEYS)
     settings = _settings_from(typing.cast(dict[str, object], doc.get("news", {})))
     keywords_table = typing.cast(dict[str, object], doc.get("keywords", {}))
     _reject_unknown("[keywords]", keywords_table, frozenset(("event",)))
     raw_keywords = typing.cast(list[str], keywords_table.get("event", []))
+    keywords: list[str] = []
+    for i in range(len(raw_keywords)):
+        keywords.append(str(raw_keywords[i]))
     calendar = _calendar_from(typing.cast(dict[str, object], doc.get("calendar", {})))
 
     registry_table = typing.cast(dict[str, object], doc.get("registry", {}))
@@ -541,7 +566,7 @@ def load_registry(path: pathlib.Path) -> Registry:
         sources.append(source)
     return Registry(
         settings=settings,
-        keywords=tuple(str(raw_keywords[i]) for i in range(len(raw_keywords))),
+        keywords=tuple(keywords),
         calendar=calendar,
         sources=tuple(sources),
     )
@@ -554,7 +579,7 @@ def build_budgets(
     sources: typing.Sequence[Source],
     clock_ns: typing.Callable[[], int] = time.monotonic_ns,
 ) -> dict[str, claude_worker.features.RestBudget]:
-    """One hourly [`RestBudget`] per ORIGIN host (spec §5.1).
+    """One hourly ``RestBudget`` per ORIGIN host (spec §5.1).
 
     The ceiling is twice what the configured cadence can legitimately spend
     in an hour, floored at 60 — generous enough that a normal cycle never
@@ -565,17 +590,36 @@ def build_budgets(
     for i in range(len(sources)):
         per_host.setdefault(sources[i].origin, []).append(sources[i])
     out: dict[str, claude_worker.features.RestBudget] = {}
-    for host in per_host:
-        group = per_host[host]
-        min_poll_s = POLL_MIN_S
+    for host, group in per_host.items():
+        min_poll_s = group[0].poll_s
         for i in range(len(group)):
-            if i == 0 or group[i].poll_s < min_poll_s:
-                min_poll_s = group[i].poll_s
+            min_poll_s = min(min_poll_s, group[i].poll_s)
         max_calls = max(BUDGET_MIN_CALLS, 2 * len(group) * SECONDS_PER_HOUR // max(min_poll_s, 1))
         out[host] = claude_worker.features.RestBudget(
             max_calls=max_calls, window_ns=BUDGET_WINDOW_NS, clock_ns=clock_ns
         )
     return out
+
+
+#: A document answer starts with one of these. A rate-limited host that
+#: answers prose instead is pacing us, whatever status it attached: GDELT
+#: serves its "Please limit requests to one every 5 seconds" notice with a
+#: 429 AND, under load, with a 200 (measured 2026-09-19). Counting that as a
+#: successful poll would feed the parser prose and read as a wire reshape.
+_DOCUMENT_STARTS: tuple[str, ...] = ("{", "[", "<")
+
+
+def _is_document(payload: str | None) -> bool:
+    return bool(payload) and str(payload).lstrip().startswith(_DOCUMENT_STARTS)
+
+
+def _status_refusal(response: httpx.Response, elapsed_ms: int) -> FetchResult | None:
+    """The non-OK verdicts, so ``Fetcher._get`` keeps one return per outcome."""
+    if response.status_code == HTTP_TOO_MANY_REQUESTS:
+        return FetchResult(FETCH_STATUS_PACED, None, response.status_code, elapsed_ms)
+    if response.status_code != httpx.codes.OK:
+        return FetchResult(FETCH_STATUS_HTTP, None, response.status_code, elapsed_ms)
+    return None
 
 
 class Fetcher:
@@ -598,8 +642,11 @@ class Fetcher:
         )
         self._rng: random.Random = random.Random() if rng is None else rng
         # First poll of every source is due immediately; jitter starts after.
-        self._next_due_ns: dict[str, int] = {s.name: 0 for s in self._sources}
-        self._next_allowed_ns: dict[str, int] = {s.name: 0 for s in self._sources}
+        self._next_due_ns: dict[str, int] = {}
+        self._next_allowed_ns: dict[str, int] = {}
+        for i in range(len(self._sources)):
+            self._next_due_ns[self._sources[i].name] = 0
+            self._next_allowed_ns[self._sources[i].name] = 0
 
     @property
     def budgets(self) -> dict[str, claude_worker.features.RestBudget]:
@@ -625,10 +672,7 @@ class Fetcher:
         self._next_due_ns[source.name] = now_ns + int(base * (1.0 + jitter))
 
     def _headers(self) -> dict[str, str]:
-        return {
-            "User-Agent": self._registry.settings.user_agent,
-            "Accept": ACCEPT_HEADER,
-        }
+        return {"User-Agent": self._registry.settings.user_agent, "Accept": ACCEPT_HEADER}
 
     def _redirect_target(self, response: httpx.Response, source: Source) -> str | None:
         """The ONE hop we allow: a 3xx whose ``Location`` stays on the
@@ -645,46 +689,41 @@ class Fetcher:
         on its own cadence instead of being retried inside the same cycle."""
         self.reschedule(source, now_ns)
         interval = rate_interval_ns(source.rate)
-        if interval and now_ns < self._next_allowed_ns[source.name]:
+        if interval and now_ns < self._next_allowed_ns.get(source.name, 0):
             return FetchResult(FETCH_STATUS_PACED, None, 0, 0)
         budget = self._budgets.get(source.origin)
         if budget is not None and not budget.try_acquire():
             return FetchResult(FETCH_STATUS_BUDGET, None, 0, 0)
         if interval:
             self._next_allowed_ns[source.name] = now_ns + interval
-        return self._get(source, request_url(source), allow_hop=True)
+        result = self._get(source, request_url(source), allow_hop=True)
+        if result.status == FETCH_STATUS_OK and interval and not _is_document(result.payload):
+            return FetchResult(FETCH_STATUS_PACED, None, result.http_status, result.elapsed_ms)
+        return result
 
     def _get(self, source: Source, url: str, *, allow_hop: bool) -> FetchResult:
         started = self._clock()
         try:
             response = self._http.get(
-                url,
-                timeout=FETCH_TIMEOUT_S,
-                headers=self._headers(),
-                follow_redirects=False,
+                url, timeout=FETCH_TIMEOUT_S, headers=self._headers(), follow_redirects=False
             )
         except httpx.HTTPError:
             return FetchResult(FETCH_STATUS_TRANSPORT, None, 0, self._elapsed_ms(started))
         elapsed = self._elapsed_ms(started)
         if response.is_redirect:
-            if not allow_hop:
-                return FetchResult(
-                    FETCH_STATUS_REFUSED_ORIGIN, None, response.status_code, elapsed
-                )
-            target = self._redirect_target(response, source)
+            target = self._redirect_target(response, source) if allow_hop else None
             if target is None:
-                return FetchResult(
-                    FETCH_STATUS_REFUSED_ORIGIN, None, response.status_code, elapsed
-                )
+                return FetchResult(FETCH_STATUS_REFUSED_ORIGIN, None, response.status_code, elapsed)
             return self._get(source, target, allow_hop=False)
-        if response.status_code != httpx.codes.OK:
-            return FetchResult(FETCH_STATUS_HTTP, None, response.status_code, elapsed)
+        refused = _status_refusal(response, elapsed)
+        if refused is not None:
+            return refused
         if _host_of(str(response.request.url)) != source.origin:
             return FetchResult(FETCH_STATUS_REFUSED_ORIGIN, None, response.status_code, elapsed)
         return FetchResult(FETCH_STATUS_OK, response.text, response.status_code, elapsed)
 
     def _elapsed_ms(self, started_ns: int) -> int:
-        return max(0, (self._clock() - started_ns) // 1_000_000)
+        return max(0, (self._clock() - started_ns) // NS_PER_MS)
 
 
 # ------------------------------------------------------------------ parsers
@@ -700,6 +739,11 @@ def strip_text(text: str, cap: int) -> str:
     out = html.unescape(out)
     out = _URL_RE.sub("", out)
     return _WS_RE.sub(" ", out).strip()[:cap]
+
+
+def strip_bom(payload: str) -> str:
+    """Drop one leading UTF-8 BOM. Idempotent and cheap."""
+    return payload[1:] if payload.startswith(_BOM) else payload
 
 
 def _number(value: object) -> float | None:
@@ -723,7 +767,7 @@ def _epoch_s(value: object, *, unit_ms: bool) -> int:
     return int(number) // MS_PER_S if unit_ms else int(number)
 
 
-def _mk(
+def _mk(  # noqa: PLR0913
     source: Source,
     *,
     guid: str,
@@ -735,6 +779,11 @@ def _mk(
     origin: str = "",
     hint: str = "",
 ) -> Item:
+    """Build one [`Item`], carrying the source's class/weight/venue with it.
+
+    Wide on purpose: every field is wire data a parser has just extracted,
+    and the alternative (a mutable builder) would let a parser forget one.
+    """
     return Item(
         source=source.name,
         guid=guid,
@@ -826,6 +875,8 @@ def _parse_feedlike(
                 cap=cap,
             )
         )
+    if not items:
+        raise ValueError("feed: no usable entries")
     return Parsed(items, None, [])
 
 
@@ -873,12 +924,15 @@ def _parse_gdelt(source: Source, payload: str, fetched_ts: int, cap: int) -> Par
                 origin=str(row.get("domain", "")).lower() or source.origin,
             )
         )
+    if not items:
+        raise ValueError("gdelt: no articles")
     return Parsed(items, None, [])
 
 
-# -- venue announcements (class B) -----------------------------------------
+# -- venue announcements (class B) ------------------------------------------
 
 
+HINT_OTHER: str = "other"
 _OKX_ANN_HINTS: dict[str, str] = {
     "announcements-delistings": "delisting",
     "announcements-new-listings": "listing",
@@ -904,9 +958,11 @@ def _parse_okx_ann(source: Source, payload: str, fetched_ts: int, cap: int) -> P
                 link=url,
                 text=title,
                 cap=cap,
-                hint=_OKX_ANN_HINTS.get(str(row.get("annType", "")), "other"),
+                hint=_OKX_ANN_HINTS.get(str(row.get("annType", "")), HINT_OTHER),
             )
         )
+    if not items:
+        raise ValueError("okx announcements: no details")
     return Parsed(items, None, [])
 
 
@@ -930,6 +986,8 @@ def _parse_deribit_ann(source: Source, payload: str, fetched_ts: int, cap: int) 
                 cap=cap,
             )
         )
+    if not items:
+        raise ValueError("deribit announcements: no rows")
     return Parsed(items, None, [])
 
 
@@ -955,7 +1013,7 @@ def _bybit_hint(row: typing.Mapping[str, object]) -> str:
             hint = _BYBIT_HINTS.get(str(tags[i]), "")
             if hint:
                 return hint
-    return "other"
+    return HINT_OTHER
 
 
 def _parse_bybit_ann(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
@@ -979,6 +1037,8 @@ def _parse_bybit_ann(source: Source, payload: str, fetched_ts: int, cap: int) ->
                 hint=_bybit_hint(row),
             )
         )
+    if not items:
+        raise ValueError("bybit announcements: no rows")
     return Parsed(items, None, [])
 
 
@@ -989,7 +1049,9 @@ def _binance_cms_rows(doc: dict[str, object]) -> list[dict[str, object]]:
     """The endpoint is undocumented and has been seen in two shapes; both
     are accepted rather than letting a silent reshape stop the source."""
     data = _at(doc, "data")
-    if isinstance(data, dict) and "catalogs" in data:
+    if not isinstance(data, dict):
+        raise ValueError("binance cms: no data object")
+    if "catalogs" in data:
         catalogs = _dicts(data["catalogs"])
         out: list[dict[str, object]] = []
         for i in range(len(catalogs)):
@@ -997,9 +1059,7 @@ def _binance_cms_rows(doc: dict[str, object]) -> list[dict[str, object]]:
             if isinstance(articles, list):
                 out.extend(_dicts(articles))
         return out
-    if isinstance(data, dict):
-        return _dicts(data.get("articles"))
-    raise ValueError("binance cms: no data object")
+    return _dicts(data.get("articles"))
 
 
 def _parse_binance_cms(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
@@ -1023,10 +1083,12 @@ def _parse_binance_cms(source: Source, payload: str, fetched_ts: int, cap: int) 
                 cap=cap,
             )
         )
+    if not items:
+        raise ValueError("binance cms: no articles")
     return Parsed(items, None, [])
 
 
-# -- class A: instrument sets ----------------------------------------------
+# -- class A: instrument sets -----------------------------------------------
 
 
 def _keyed_snapshot(
@@ -1051,35 +1113,53 @@ def _keyed_snapshot(
     return Parsed([], _snapshot(source, fetched_ts, body), [])
 
 
+_BN_USDM_KEYS: tuple[str, ...] = ("status", "contractType", "onboardDate", "deliveryDate")
+_OKX_INST_KEYS: tuple[str, ...] = (
+    "instType",
+    "state",
+    "listTime",
+    "expTime",
+    "preMktSwTime",
+    "contTdSwTime",
+)
+_DERIBIT_INST_KEYS: tuple[str, ...] = (
+    "kind",
+    "instrument_type",
+    "is_active",
+    "creation_timestamp",
+    "expiration_timestamp",
+)
+_COINBASE_KEYS: tuple[str, ...] = ("status", "trading_disabled")
+
+
 def _parse_instruments_bn_usdm(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
     rows = _dicts(_at(_obj(payload), "symbols"))
-    keys = ("status", "contractType", "onboardDate", "deliveryDate")
-    return _keyed_snapshot(source, fetched_ts, rows, "symbol", keys)
+    return _keyed_snapshot(source, fetched_ts, rows, "symbol", _BN_USDM_KEYS)
 
 
 def _parse_instruments_okx(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
     rows = _dicts(_at(_obj(payload), "data"))
-    keys = ("instType", "state", "listTime", "expTime", "preMktSwTime", "contTdSwTime")
-    return _keyed_snapshot(source, fetched_ts, rows, "instId", keys)
+    return _keyed_snapshot(source, fetched_ts, rows, "instId", _OKX_INST_KEYS)
 
 
 def _parse_instruments_deribit(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
     rows = _dicts(_at(_obj(payload), "result"))
-    keys = ("kind", "instrument_type", "is_active", "creation_timestamp", "expiration_timestamp")
-    return _keyed_snapshot(source, fetched_ts, rows, "instrument_name", keys)
+    return _keyed_snapshot(source, fetched_ts, rows, "instrument_name", _DERIBIT_INST_KEYS)
 
 
 def _parse_instruments_coinbase(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
-    return _keyed_snapshot(
-        source, fetched_ts, _dicts(_arr(payload)), "id", ("status", "trading_disabled")
-    )
+    return _keyed_snapshot(source, fetched_ts, _dicts(_arr(payload)), "id", _COINBASE_KEYS)
 
 
-# -- class A: venue status -------------------------------------------------
+# -- class A: venue status --------------------------------------------------
+
+
+def _window_key(row: typing.Mapping[str, object]) -> str:
+    return f"{row.get('title', '')}|{row.get('begin', '')}"
 
 
 def _parse_status_okx(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
@@ -1088,8 +1168,7 @@ def _parse_status_okx(source: Source, payload: str, fetched_ts: int, cap: int) -
     body: dict[str, object] = {}
     for i in range(len(rows)):
         row = rows[i]
-        key = f"{row.get('title', '')}|{row.get('begin', '')}"
-        body[key] = [
+        body[_window_key(row)] = [
             row.get("state"),
             row.get("begin"),
             row.get("end"),
@@ -1104,8 +1183,8 @@ def _parse_status_okx(source: Source, payload: str, fetched_ts: int, cap: int) -
 def _parse_status_deribit(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
     result = _at(_obj(payload), "result")
-    if not isinstance(result, dict):
-        raise ValueError("deribit status: result is not an object")
+    if not isinstance(result, dict) or "locked" not in result:
+        raise ValueError("deribit status: no locked field")
     body: dict[str, object] = {
         "locked": result.get("locked"),
         "locked_indices": result.get("locked_indices", []),
@@ -1120,8 +1199,7 @@ def _parse_status_bybit(source: Source, payload: str, fetched_ts: int, cap: int)
     body: dict[str, object] = {}
     for i in range(len(rows)):
         row = rows[i]
-        key = f"{row.get('title', '')}|{row.get('begin', '')}"
-        body[key] = [
+        body[_window_key(row)] = [
             row.get("state"),
             row.get("begin"),
             row.get("end"),
@@ -1137,10 +1215,7 @@ def _parse_status_kraken(source: Source, payload: str, fetched_ts: int, cap: int
     result = _at(_obj(payload), "result")
     if not isinstance(result, dict) or "status" not in result:
         raise ValueError("kraken status: no status")
-    body: dict[str, object] = {
-        "status": result.get("status"),
-        "timestamp": result.get("timestamp"),
-    }
+    body: dict[str, object] = {"status": result.get("status"), "timestamp": result.get("timestamp")}
     return Parsed([], _snapshot(source, fetched_ts, body), [])
 
 
@@ -1158,21 +1233,46 @@ def _parse_ping_binance(source: Source, payload: str, fetched_ts: int, cap: int)
 # -- class A: calendars -----------------------------------------------------
 
 
-_FED_EVENT_KEYS: tuple[str, ...] = ("date", "time", "type", "title", "days", "sessionDates")
+_FED_EVENT_KEYS: tuple[str, ...] = ("month", "days", "time", "type", "title", "description")
+#: Envelope keys tried in order before falling back to the longest array of
+#: objects. Measured 2026-09-19: the live key is ``events`` and the document
+#: ALSO carries a shorter ``announcement`` array, so "the first array wins"
+#: would pick the wrong one.
+_FED_ENVELOPE_KEYS: tuple[str, ...] = ("events", "mtgs")
+
+
+def _longest_object_array(doc: dict[str, object]) -> list[dict[str, object]]:
+    best: list[dict[str, object]] = []
+    for key in sorted(doc):
+        node = doc[key]
+        if isinstance(node, list) and node and isinstance(node[0], dict):
+            rows = _dicts(node)
+            if len(rows) > len(best):
+                best = rows
+    return best
 
 
 def _fed_events(doc: object) -> list[dict[str, object]]:
-    """The Fed publishes one array of meeting/event objects; its envelope key
-    has moved before, so the first list-of-objects in the document wins."""
+    """The Fed's event array. Its envelope key has moved before, so the known
+    names are tried first and the longest array of objects is the fallback."""
     if isinstance(doc, list):
         return _dicts(doc)
     if not isinstance(doc, dict):
         raise ValueError("fed calendar: not a list or object")
-    for key in sorted(doc):
-        node = doc[key]
-        if isinstance(node, list) and node and isinstance(node[0], dict):
+    for i in range(len(_FED_ENVELOPE_KEYS)):
+        node = doc.get(_FED_ENVELOPE_KEYS[i])
+        if isinstance(node, list) and node:
             return _dicts(node)
-    raise ValueError("fed calendar: no event array")
+    rows = _longest_object_array(doc)
+    if not rows:
+        raise ValueError("fed calendar: no event array")
+    return rows
+
+
+def _fed_key(row: typing.Mapping[str, object], index: int) -> str:
+    stamp = f"{row.get('month', '')}-{row.get('days', '')}T{row.get('time', '')}"
+    title = str(row.get("title", ""))
+    return f"{stamp}|{title}" if title else f"{stamp}|#{index}"
 
 
 def _parse_calendar_fed(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
@@ -1186,7 +1286,7 @@ def _parse_calendar_fed(source: Source, payload: str, fetched_ts: int, cap: int)
             key = _FED_EVENT_KEYS[j]
             if key in row:
                 kept[key] = row[key]
-        body[str(i)] = kept
+        body[_fed_key(row, i)] = kept
     if not body:
         raise ValueError("fed calendar: empty")
     return Parsed([], _snapshot(source, fetched_ts, body), [])
@@ -1210,13 +1310,12 @@ def _parse_4chan(source: Source, payload: str, fetched_ts: int, cap: int) -> Par
             if replies < FOURCHAN_MIN_REPLIES:
                 continue
             com = strip_text(str(row.get("com", "")), cap)
-            title = str(row.get("sub", "")) or com[:FOURCHAN_TITLE_CAP]
             items.append(
                 _mk(
                     source,
                     guid=str(row.get("no", "")),
                     ts=_epoch_s(row.get("time"), unit_ms=False),
-                    title=title,
+                    title=str(row.get("sub", "")) or com[:FOURCHAN_TITLE_CAP],
                     link="",
                     text=com,
                     cap=cap,
@@ -1230,16 +1329,11 @@ def _parse_4chan(source: Source, payload: str, fetched_ts: int, cap: int) -> Par
 # -- class D: numeric series ------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _BinanceSeries:
-    key: str
-
-
-_BINANCE_SERIES: dict[str, _BinanceSeries] = {
-    "series-bn-ls": _BinanceSeries("longShortRatio"),
-    "series-bn-top-ls": _BinanceSeries("longShortRatio"),
-    "series-bn-taker": _BinanceSeries("buySellRatio"),
-    "series-bn-oi": _BinanceSeries("sumOpenInterestValue"),
+_BINANCE_SERIES_KEYS: dict[str, str] = {
+    "series-bn-ls": "longShortRatio",
+    "series-bn-top-ls": "longShortRatio",
+    "series-bn-taker": "buySellRatio",
+    "series-bn-oi": "sumOpenInterestValue",
 }
 
 
@@ -1249,16 +1343,16 @@ def _one(key: str, ts: int, value: float) -> list[tuple[str, int, float]]:
 
 def _parse_binance_series(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
-    spec = _BINANCE_SERIES[source.kind]
+    key = _BINANCE_SERIES_KEYS[source.kind]
     rows = _dicts(_arr(payload))
     if not rows:
         raise ValueError("binance series: empty")
     row = rows[-1]
-    value = _number(row.get(spec.key))
+    value = _number(row.get(key))
     if value is None:
-        raise ValueError(f"binance series: no {spec.key}")
+        raise ValueError(f"binance series: no {key}")
     ts = _epoch_s(row.get("timestamp"), unit_ms=True) or fetched_ts
-    return Parsed([], None, _one(spec.key, ts, value))
+    return Parsed([], None, _one(key, ts, value))
 
 
 def _parse_dvol(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
@@ -1267,9 +1361,9 @@ def _parse_dvol(source: Source, payload: str, fetched_ts: int, cap: int) -> Pars
     if not isinstance(rows, list) or not rows:
         raise ValueError("dvol: empty data")
     row = rows[-1]
-    if not isinstance(row, list) or len(row) < 5:  # noqa: PLR2004 — OHLC row width
+    if not isinstance(row, list) or len(row) < OHLC_ROW_LEN:
         raise ValueError("dvol: row is not [ts, o, h, l, c]")
-    close = _number(row[4])
+    close = _number(row[OHLC_CLOSE_IDX])
     if close is None:
         raise ValueError("dvol: no close")
     return Parsed([], None, _one("dvol", _epoch_s(row[0], unit_ms=True) or fetched_ts, close))
@@ -1280,19 +1374,32 @@ _COT_LONG: str = "noncomm_positions_long_all"
 _COT_SHORT: str = "noncomm_positions_short_all"
 
 
+def _cot_net(row: typing.Mapping[str, object]) -> float | None:
+    long_side = _number(row.get(_COT_LONG))
+    short_side = _number(row.get(_COT_SHORT))
+    return None if long_side is None or short_side is None else long_side - short_side
+
+
 def _parse_cot(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
     del cap
     rows = _dicts(_arr(payload))
+    fallback: float | None = None
     for i in range(len(rows)):
-        row = rows[i]
-        if _COT_NEEDLE not in str(row.get("market_and_exchange_names", "")).lower():
+        name = str(rows[i].get("market_and_exchange_names", "")).lower()
+        if _COT_NEEDLE not in name:
             continue
-        long_side = _number(row.get(_COT_LONG))
-        short_side = _number(row.get(_COT_SHORT))
-        if long_side is None or short_side is None:
+        net = _cot_net(rows[i])
+        if net is None:
             continue
-        return Parsed([], None, _one("noncomm_net", fetched_ts, long_side - short_side))
-    raise ValueError("cot: no bitcoin row")
+        # "MICRO BITCOIN - CHICAGO MERCANTILE EXCHANGE" carries the needle too;
+        # the full-size contract is the one the series means.
+        if name.startswith(_COT_NEEDLE):
+            return Parsed([], None, _one("noncomm_net", fetched_ts, net))
+        if fallback is None:
+            fallback = net
+    if fallback is None:
+        raise ValueError("cot: no bitcoin row")
+    return Parsed([], None, _one("noncomm_net", fetched_ts, fallback))
 
 
 def _parse_fng(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
@@ -1413,12 +1520,12 @@ def parse(
     if parser is None:
         return _EMPTY
     try:
-        return parser(source, payload, fetched_ts, text_cap)
-    except (ValueError, TypeError, KeyError, IndexError, AttributeError, json.JSONDecodeError):
+        return parser(source, strip_bom(payload), fetched_ts, text_cap)
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError):
         return _EMPTY
 
 
-# ------------------------------------------------- fixture reduction (App. B)
+# ------------------------------------------------ fixture reduction (App. B)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1439,6 +1546,34 @@ class _Reduction:
 
 
 _FEED: _Reduction = _Reduction("feed")
+_GDELT_KEYS: tuple[str, ...] = ("url", "title", "seendate", "domain", "language", "sourcecountry")
+_BYBIT_ANN_KEYS: tuple[str, ...] = (
+    "title",
+    "description",
+    "type",
+    "tags",
+    "url",
+    "dateTimestamp",
+    "publishTime",
+    "startDateTimestamp",
+    "endDateTimestamp",
+)
+_STATUS_OKX_KEYS: tuple[str, ...] = ("title", "state", "begin", "end", "serviceType", "system")
+_STATUS_BYBIT_KEYS: tuple[str, ...] = (
+    "title",
+    "state",
+    "begin",
+    "end",
+    "serviceTypes",
+    "product",
+    "maintainType",
+)
+_COT_KEYS: tuple[str, ...] = (
+    "market_and_exchange_names",
+    _COT_LONG,
+    _COT_SHORT,
+    "report_date_as_yyyy_mm_dd",
+)
 
 _REDUCTIONS: dict[str, _Reduction] = {
     "rss": _FEED,
@@ -1446,74 +1581,33 @@ _REDUCTIONS: dict[str, _Reduction] = {
     "hnrss": _FEED,
     "reddit-rss": _FEED,
     "arxiv-api": _FEED,
-    "gdelt": _Reduction(
-        "list",
-        ((("articles"),),),
-        ("url", "title", "seendate", "domain", "language", "sourcecountry"),
-    ),
+    "gdelt": _Reduction("list", (("articles",),), _GDELT_KEYS),
     "json-okx-ann": _Reduction(
-        "list", ((("data"), 0, "details"),), ("annType", "title", "url", "pTime")
+        "list", (("data", 0, "details"),), ("annType", "title", "url", "pTime")
     ),
     "json-deribit-ann": _Reduction(
-        "list", ((("result"),),), ("id", "title", "body", "publication_timestamp")
+        "list", (("result",),), ("id", "title", "body", "publication_timestamp")
     ),
-    "json-bybit-ann": _Reduction(
-        "list",
-        ((("result"), "list"),),
-        (
-            "title",
-            "description",
-            "type",
-            "tags",
-            "url",
-            "dateTimestamp",
-            "publishTime",
-            "startDateTimestamp",
-            "endDateTimestamp",
-        ),
-    ),
+    "json-bybit-ann": _Reduction("list", (("result", "list"),), _BYBIT_ANN_KEYS),
     "json-binance-cms": _Reduction(
         "list",
-        ((("data"), "catalogs", 0, "articles"), (("data"), "articles")),
+        (("data", "catalogs", 0, "articles"), ("data", "articles")),
         ("title", "code", "releaseDate"),
     ),
-    "instruments-bn-usdm": _Reduction(
-        "list",
-        ((("symbols"),),),
-        ("symbol", "status", "contractType", "onboardDate", "deliveryDate"),
-    ),
-    "instruments-okx": _Reduction(
-        "list",
-        ((("data"),),),
-        ("instId", "instType", "state", "listTime", "expTime", "preMktSwTime", "contTdSwTime"),
-    ),
+    "instruments-bn-usdm": _Reduction("list", (("symbols",),), ("symbol", *_BN_USDM_KEYS)),
+    "instruments-okx": _Reduction("list", (("data",),), ("instId", *_OKX_INST_KEYS)),
     "instruments-deribit": _Reduction(
-        "list",
-        ((("result"),),),
-        (
-            "instrument_name",
-            "kind",
-            "instrument_type",
-            "is_active",
-            "creation_timestamp",
-            "expiration_timestamp",
-        ),
+        "list", (("result",),), ("instrument_name", *_DERIBIT_INST_KEYS)
     ),
-    "instruments-coinbase": _Reduction("list", ((),), ("id", "status", "trading_disabled")),
-    "status-okx": _Reduction(
-        "list", ((("data"),),), ("title", "state", "begin", "end", "serviceType", "system")
-    ),
+    "instruments-coinbase": _Reduction("list", ((),), ("id", *_COINBASE_KEYS)),
+    "status-okx": _Reduction("list", (("data",),), _STATUS_OKX_KEYS),
     "status-deribit": _Reduction(
-        "object", ((("result"),),), ("locked", "locked_indices", "locked_currencies")
+        "object", (("result",),), ("locked", "locked_indices", "locked_currencies")
     ),
-    "status-bybit": _Reduction(
-        "list",
-        ((("result"), "list"),),
-        ("title", "state", "begin", "end", "serviceTypes", "product", "maintainType"),
-    ),
-    "status-kraken": _Reduction("object", ((("result"),),), ("status", "timestamp")),
+    "status-bybit": _Reduction("list", (("result", "list"),), _STATUS_BYBIT_KEYS),
+    "status-kraken": _Reduction("object", (("result",),), ("status", "timestamp")),
     "ping-binance": _Reduction("object", ((),), ()),
-    "calendar-fed": _Reduction("list", ((("mtgs"),), ()), _FED_EVENT_KEYS),
+    "calendar-fed": _Reduction("list", (("events",), ("mtgs",), ()), _FED_EVENT_KEYS),
     "json-4chan-catalog": _Reduction(
         "list", ((0, "threads"),), ("no", "sub", "com", "time", "replies")
     ),
@@ -1521,26 +1615,15 @@ _REDUCTIONS: dict[str, _Reduction] = {
     "series-bn-top-ls": _Reduction("list", ((),), ("longShortRatio", "timestamp"), max_rows=1),
     "series-bn-taker": _Reduction("list", ((),), ("buySellRatio", "timestamp"), max_rows=1),
     "series-bn-oi": _Reduction("list", ((),), ("sumOpenInterestValue", "timestamp"), max_rows=1),
-    "series-dvol": _Reduction("list", ((("result"), "data"),), (), max_rows=3),
-    "series-cftc-cot": _Reduction(
-        "list",
-        ((),),
-        (
-            "market_and_exchange_names",
-            _COT_LONG,
-            _COT_SHORT,
-            "report_date_as_yyyy_mm_dd",
-        ),
-        max_rows=3,
-        select=_COT_NEEDLE,
-    ),
-    "series-fng": _Reduction("list", ((("data"),),), ("value", "timestamp"), max_rows=1),
+    "series-dvol": _Reduction("list", (("result", "data"),), (), max_rows=3),
+    "series-cftc-cot": _Reduction("list", ((),), _COT_KEYS, max_rows=3, select=_COT_NEEDLE),
+    "series-fng": _Reduction("list", (("data",),), ("value", "timestamp"), max_rows=1),
     "series-defillama-stables": _Reduction(
-        "list", ((("peggedAssets"),),), ("name", "circulating"), max_rows=5
+        "list", (("peggedAssets",),), ("name", "circulating"), max_rows=5
     ),
     "series-mempool-fees": _Reduction("object", ((),), ("fastestFee",)),
     "series-blockchain-stats": _Reduction("object", ((),), ("hash_rate",)),
-    "series-kalshi": _Reduction("list", ((("markets"),),), ("ticker",)),
+    "series-kalshi": _Reduction("list", (("markets",),), ("ticker",)),
     "series-manifold": _Reduction("list", ((),), ("id",)),
 }
 
@@ -1555,6 +1638,11 @@ def _reduce_feed(payload: str, cap: int) -> str:
 
     ``parse_feed_xml`` reads RSS and Atom alike, so one shape serves all five
     feed kinds and the reduced fixture yields the same items as the original.
+
+    Text is stripped before it is escaped: ``parse_feed_xml`` cuts at
+    ``TEXT_CAP`` and its reader strips, so a cut that lands on whitespace
+    would make the reduction lose a trailing space on the NEXT pass — i.e.
+    not a fixed point, which is what proves a fixture is fully reduced.
     """
     entries = claude_worker.feeds.parse_feed_xml("", payload)[:FIXTURE_MAX_ROWS]
     parts: list[str] = ['<?xml version="1.0" encoding="UTF-8"?>', '<rss version="2.0"><channel>']
@@ -1563,14 +1651,14 @@ def _reduce_feed(payload: str, cap: int) -> str:
         stamp = ""
         if entry.ts:
             moment = datetime.datetime.fromtimestamp(entry.ts, tz=datetime.UTC)
-            stamp = moment.strftime("%a, %d %b %Y %H:%M:%S +0000")
+            stamp = email.utils.format_datetime(moment)
         parts.append(
             "<item>"
             f"<guid>{xml.sax.saxutils.escape(entry.guid)}</guid>"
             f"<link>{xml.sax.saxutils.escape(entry.link)}</link>"
             f"<title>{xml.sax.saxutils.escape(entry.title)}</title>"
             f"<pubDate>{stamp}</pubDate>"
-            f"<description>{xml.sax.saxutils.escape(entry.text[:cap])}</description>"
+            f"<description>{xml.sax.saxutils.escape(entry.text[:cap].strip())}</description>"
             "</item>"
         )
     parts.append("</channel></rss>")
@@ -1594,9 +1682,18 @@ def _navigate(doc: object, path: tuple[object, ...]) -> object | None:
 
 def _rebuild(path: tuple[object, ...], node: object) -> object:
     for i in range(len(path) - 1, -1, -1):
-        key = path[i]
-        node = [node] if isinstance(key, int) else {str(key): node}
+        node = [node] if isinstance(path[i], int) else {str(path[i]): node}
     return node
+
+
+def _keep(row: object, keys: tuple[str, ...]) -> object:
+    if not keys or not isinstance(row, dict):
+        return row
+    kept: dict[str, object] = {}
+    for j in range(len(keys)):
+        if keys[j] in row:
+            kept[keys[j]] = row[keys[j]]
+    return kept
 
 
 def _select_rows(rows: list[object], red: _Reduction) -> list[object]:
@@ -1605,25 +1702,28 @@ def _select_rows(rows: list[object], red: _Reduction) -> list[object]:
         first: list[object] = []
         rest: list[object] = []
         for i in range(len(ordered)):
-            hit = red.select in json.dumps(ordered[i], default=str).lower()
-            (first if hit else rest).append(ordered[i])
+            if red.select in json.dumps(ordered[i], default=str).lower():
+                first.append(ordered[i])
+            else:
+                rest.append(ordered[i])
         ordered = first + rest
     ordered = ordered[: red.max_rows]
-    if not red.keys:
-        return ordered
     out: list[object] = []
     for i in range(len(ordered)):
-        row = ordered[i]
-        if not isinstance(row, dict):
-            out.append(row)
-            continue
-        kept: dict[str, object] = {}
-        for j in range(len(red.keys)):
-            key = red.keys[j]
-            if key in row:
-                kept[key] = row[key]
-        out.append(kept)
+        out.append(_keep(ordered[i], red.keys))
     return out
+
+
+def _reduce_at(node: object, path: tuple[object, ...], red: _Reduction) -> str | None:
+    if red.mode == "object":
+        if not isinstance(node, dict):
+            return None
+        kept = _keep(node, red.keys) if red.keys else node
+        return json.dumps(_rebuild(path, kept), separators=(",", ":"), sort_keys=True)
+    if not isinstance(node, list):
+        return None
+    rows = _select_rows(node, red)
+    return json.dumps(_rebuild(path, rows), separators=(",", ":"), sort_keys=True)
 
 
 def reduce_payload(kind: str, payload: str, cap: int = claude_worker.feeds.TEXT_CAP) -> str:
@@ -1636,27 +1736,14 @@ def reduce_payload(kind: str, payload: str, cap: int = claude_worker.feeds.TEXT_
     if red is None:
         raise ValueError(f"no reduction for kind {kind!r}")
     if red.mode == "feed":
-        return _reduce_feed(payload, cap)
-    doc = json.loads(payload)
+        return _reduce_feed(strip_bom(payload), cap)
+    doc = json.loads(strip_bom(payload))
     for i in range(len(red.paths)):
         path = red.paths[i]
         node = _navigate(doc, path)
         if node is None:
             continue
-        if red.mode == "object":
-            if not isinstance(node, dict):
-                continue
-            kept: dict[str, object] = {}
-            if red.keys:
-                for j in range(len(red.keys)):
-                    key = red.keys[j]
-                    if key in node:
-                        kept[key] = node[key]
-            else:
-                kept = node
-            return json.dumps(_rebuild(path, kept), separators=(",", ":"), sort_keys=True)
-        if not isinstance(node, list):
-            continue
-        rows = _select_rows(node, red)
-        return json.dumps(_rebuild(path, rows), separators=(",", ":"), sort_keys=True)
+        out = _reduce_at(node, path, red)
+        if out is not None:
+            return out
     raise ValueError(f"reduce_payload: no candidate path matched for kind {kind!r}")

@@ -1,0 +1,12 @@
+# SYNTHETIC — replace at the first real observation (NEWS spec Appendix B).
+# status-okx / status-bybit: the live endpoints answer an empty maintenance
+#   list outside a real window, so the populated mapping is unverified.
+#   Replace during the first real maintenance window, before N2's gate.
+# arxiv-api: export.arxiv.org answered 406 to every User-Agent tried from
+#   this network on 2026-09-19 (the survey measured it 200 elsewhere).
+# gdelt: api.gdeltproject.org alternated a 429 rate-limit notice with a bare
+#   `{}` for timespan=1h across 14 spaced attempts on 2026-09-19.
+status-okx
+status-bybit
+arxiv-api
+gdelt
