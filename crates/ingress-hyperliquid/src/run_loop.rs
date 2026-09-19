@@ -254,6 +254,9 @@ pub struct Driver {
     sub_ack_budget_ns: u64,
     /// `now_ns` at the upgrade→Steady edge (ack-deadline anchor).
     steady_since_ns: u64,
+    /// BIN15 O2 / E7 R0: the boot-bound families have been announced
+    /// (see [`emit_boot_rolls`]). Once per process, never on reconnect.
+    boot_rolls_emitted: bool,
     /// Set once the post-upgrade subscribe frames have been queued.
     subscribed: bool,
     /// Set once `found == expected` (staleness armed at that edge).
@@ -304,6 +307,7 @@ impl Driver {
             staleness: HlStaleness::new(staleness_budget_ns),
             sub_ack_budget_ns,
             steady_since_ns: 0,
+            boot_rolls_emitted: false,
             subscribed: false,
             verified: false,
             feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
@@ -446,6 +450,7 @@ pub fn drive_one<T: Transport, C: Capture>(
             advance_ws_upgrade(drv, status)?;
             if drv.state == State::Steady {
                 queue_subscribe_all(drv)?;
+                emit_boot_rolls(drv, event_tx, event_mask, status, capture);
             }
         }
         State::Steady => {
@@ -601,6 +606,68 @@ fn queue_roll_subscribes(drv: &mut Driver, coin: &[u8]) -> io::Result<()> {
         c += 1;
     }
     Ok(())
+}
+
+/// BIN15 O2 / E7 R0 (2026-09-19): announce the families the BOOT bound.
+///
+/// `HlFamilyTable::bind_live` runs in the cli before this thread exists
+/// and binds each family's live instance straight into the coin table,
+/// so the first `Steady` subscribes it like any coin — but no
+/// `InstrumentRoll` event was ever written for it, and that event is
+/// the ONLY way the member (and the exec arm's asset table) learn which
+/// instance a slot means. Every consumer therefore stayed dormant until
+/// the venue's next `outcomeCreated` push: at most 15 min for the
+/// 15-minute family, up to a whole day for a daily one — and with three
+/// restarts a day the dailies were live for the member ~2.5 h in 24
+/// (zero daily-family fills across six paper days, doc 21).
+///
+/// Emitted ONCE per process, at the first `Steady`, before any position
+/// can exist: `Bin15Strategy::bind` flattens the instance it rebinds, so
+/// repeating this on a reconnect would not be safe and is not done. The
+/// event is byte-identical in shape to [`perform_roll`]'s step (e) —
+/// same channel, same packed identity, `settled = false` — so every
+/// offline reader (`claude_worker.hip4.instance_at` takes the newest
+/// created roll at or before an instant) reads it as what it is.
+fn emit_boot_rolls<C: Capture>(
+    drv: &mut Driver,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) {
+    if drv.boot_rolls_emitted {
+        return;
+    }
+    drv.boot_rolls_emitted = true;
+    let now = now_ns();
+    let mut f = 0usize;
+    while f < drv.families.len() {
+        let Some(row) = drv.families.get(f) else {
+            break;
+        };
+        if row.dormant || row.live.outcome == 0 {
+            f += 1;
+            continue;
+        }
+        let spec = row.live;
+        let ev = ChannelEvent::new(
+            now,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            row.sym[0],
+            pack_roll_seq(spec.outcome, spec.twap_s, f, false),
+            0,
+            spec.strike_1e6,
+            spec.expiry_ns as i64,
+        );
+        capture.event(&ev);
+        if event_mask & core_types::event_lane_bit(ChannelId::InstrumentRoll) != 0
+            && event_tx.try_push(ev).is_err()
+        {
+            status.inc_event_ring_drops();
+        }
+        f += 1;
+    }
 }
 
 /// BIN15 O2: adopt a family's new instance, or record that its
@@ -2550,6 +2617,62 @@ mod tests {
         assert_eq!(ev.venue_seq as i64, -317_740, "premium ×1e9, sign intact");
         assert_eq!(ev.v0, 12_500, "funding unchanged in v0");
         assert_eq!(ev.v1, 2_000_000, "OI unchanged in v1");
+    }
+
+    /// BIN15 O2 / E7 R0: a family the BOOT bound is announced to the
+    /// engine with one created `InstrumentRoll` at the first Steady —
+    /// once per process — and a dormant family is not.
+    #[test]
+    fn boot_bound_families_are_announced_once_and_dormant_ones_are_not() {
+        use crate::family::{rolling_sym, HlFamilyKind};
+
+        let mut fams = HlFamilyTable::new();
+        fams.push(HlFamilyKind::Out15m, b"BTC", 900, [0, 1], [rolling_sym(0, 0), rolling_sym(0, 1)])
+            .expect("family 0");
+        fams.push(HlFamilyKind::NativeDaily, b"ETH", 86_400, [2, 3], [rolling_sym(1, 0), rolling_sym(1, 1)])
+            .expect("family 1");
+        let mut coins = crate::HlCoinTable::new();
+        for f in 0..2usize {
+            coins.reserve(rolling_sym(f, 0)).unwrap();
+            coins.reserve(rolling_sym(f, 1)).unwrap();
+        }
+        let spec = parse_outcome_spec(
+            2649,
+            b"perp:BTC|priceDescription:x|seconds:60|threshold:77177|time:20260912-0630",
+        );
+        fams.bind(0, &spec, &mut coins).expect("bind family 0");
+        assert!(fams.get(1).unwrap().dormant, "family 1 stays dormant");
+
+        let mut d = new_driver();
+        d.set_families(fams, Arc::new(HlRollStatus::new()), WallAnchor::now());
+        let status = IngressStatus::new();
+        let (mut etx, mut erx) = event_ring_pair();
+        let mut cap = EventRecCap::default();
+        let mask = core_types::event_lane_bit(ChannelId::InstrumentRoll);
+
+        emit_boot_rolls(&mut d, &mut etx, mask, &status, &mut cap);
+        let rolls: Vec<&ChannelEvent> = cap
+            .events
+            .iter()
+            .filter(|e| e.channel == ChannelId::InstrumentRoll as u8)
+            .collect();
+        assert_eq!(rolls.len(), 1, "one boot roll: the bound family, not the dormant one");
+        let ev = rolls[0];
+        assert_eq!(ev.sym, rolling_sym(0, 0), "keyed on the family's YES slot");
+        let (outcome, twap_s, family, settled) = core_types::unpack_roll_seq(ev.venue_seq);
+        assert_eq!((outcome, twap_s, family, settled), (2649, 60, 0, false));
+        assert_eq!(ev.v0, 77_177_000_000, "strike ×1e6");
+        assert_eq!(ev.v1 as u64, spec.expiry_ns, "expiry ns");
+        assert!(erx.try_pop().is_some(), "and it rode the event ring");
+        assert!(erx.try_pop().is_none());
+
+        // Once per process: a second Steady (reconnect) announces nothing.
+        emit_boot_rolls(&mut d, &mut etx, mask, &status, &mut cap);
+        assert_eq!(
+            cap.events.iter().filter(|e| e.channel == ChannelId::InstrumentRoll as u8).count(),
+            1
+        );
+        assert_eq!(status.event_ring_drops_total(), 0);
     }
 
     #[test]

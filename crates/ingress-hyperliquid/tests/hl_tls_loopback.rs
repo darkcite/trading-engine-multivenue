@@ -961,28 +961,38 @@ fn a_roll_rebinds_unsubscribes_subscribes_and_emits_the_event() {
         "then the incoming one is subscribed"
     );
 
-    // Two InstrumentRoll events, settled then created, with the exact
-    // payload packing.
+    // Three InstrumentRoll events with the exact payload packing: the
+    // BOOT announcement of the instance `bind_live` bound (E7 R0,
+    // 2026-09-19 — a created roll for 2649 at the first Steady, so the
+    // member and the exec arm learn the slot without waiting for the
+    // venue's next push), then the venue's own settled 2649 and
+    // created 2650.
     let rolls: Vec<_> = recorder
         .events
         .iter()
         .filter(|e| e.channel == core_types::ChannelId::InstrumentRoll as u8)
         .collect();
-    assert_eq!(rolls.len(), 2, "one settled, one created");
+    assert_eq!(rolls.len(), 3, "boot-created, then settled, then created");
 
     let (id, twap, fam, settled) = unpack_roll_seq(rolls[0].venue_seq);
-    assert_eq!((id, twap, fam, settled), (2649, 60, 0, true));
+    assert_eq!((id, twap, fam, settled), (2649, 60, 0, false), "the boot announcement");
     assert_eq!(rolls[0].sym, rolling_sym(0, 0), "the Yes slot names the family");
     assert_eq!(rolls[0].v0, 77_177_000_000, "strike x1e6");
     assert_eq!(rolls[0].v1, 1_789_194_600_000_000_000, "expiry ns");
-    assert_eq!(rolls[0].venue_time_ms, 0, "the venue push carries no time");
 
     let (id, twap, fam, settled) = unpack_roll_seq(rolls[1].venue_seq);
+    assert_eq!((id, twap, fam, settled), (2649, 60, 0, true));
+    assert_eq!(rolls[1].sym, rolling_sym(0, 0), "the Yes slot names the family");
+    assert_eq!(rolls[1].v0, 77_177_000_000, "strike x1e6");
+    assert_eq!(rolls[1].v1, 1_789_194_600_000_000_000, "expiry ns");
+    assert_eq!(rolls[1].venue_time_ms, 0, "the venue push carries no time");
+
+    let (id, twap, fam, settled) = unpack_roll_seq(rolls[2].venue_seq);
     assert_eq!((id, twap, fam, settled), (2650, 60, 0, false));
-    assert_eq!(rolls[1].sym, rolling_sym(0, 0));
-    assert_eq!(rolls[1].v0, 77_201_000_000);
+    assert_eq!(rolls[2].sym, rolling_sym(0, 0));
+    assert_eq!(rolls[2].v0, 77_201_000_000);
     // One 15-minute period later than 2649.
-    assert_eq!(rolls[1].v1 - rolls[0].v1, 900 * 1_000_000_000);
+    assert_eq!(rolls[2].v1 - rolls[1].v1, 900 * 1_000_000_000);
 
     // The push for the NEW coin arrived on the family's stable slot.
     let tick = cons.try_pop().expect("a tick for the rolled slot");
