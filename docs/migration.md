@@ -6,6 +6,29 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — Deribit spot rows subscribe `quote` + `book` only (no `trades`); capture carries no Trade rows for `BTC_USDC`
+
+**No wire-format change, no file-layout change, no config change.** The
+Deribit subscribe batch and its verification mask drop the `trades.<spot>.100ms`
+channel for static SPOT rows (a configured name with no `-`, i.e. `BTC_USDC`).
+Futures/perps keep quote/ticker/trades/book; options keep quote + ticker; combos
+keep quote. The one law is `ingress_deribit::row_wants_channel`.
+
+Why: on 2026-09-17 ~16:00Z Deribit made its USDC spot pairs Coinbase-routed —
+`trades.BTC_USDC.100ms` is accepted by `public/subscribe` and silently absent
+from the echo (REST `get_last_trades_by_instrument` answers `11060
+not_supported_for_coinbase_routed_spot`). Under the boot fail-fast that one
+absent name refused every Deribit session for two days (1,539 reconnects in one
+run, `ticks 0`), and slot 1 (vrp) saw no option summary. Record:
+`docs/arch/deribit-spot-trades-outage-2026-09-19.md`.
+
+Ripple: from the first boot on the fixed binary, `deribit-events.pmlr` holds no
+`channel=0` (Trade) rows for the spot sym — there have been none since 09-17
+anyway. Nothing in the engine, the harness or the worker reads a Deribit spot
+print; the spot row exists for its BBO (`quote`) and `book` capture (WS6).
+Offline surfaces that counted Deribit event rows by channel see the spot Trade
+series end at 2026-09-17T16:07Z.
+
 ## 2026-09-19 — `bin15.toml` gains an OPTIONAL `entry_min_px_1e6` (the coverage entry's price floor); `BIN15_KEYS` 24 → 25 (BIN15 R0)
 
 **No wire change, no artifact re-cut required.** A `bin15.toml` without

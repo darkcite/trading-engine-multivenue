@@ -820,7 +820,7 @@ fn is_tail_row(symbols: &DeribitSymbolTable, idx: usize) -> bool {
 /// sets it only when EVERY wanted channel was acknowledged, so the
 /// u128 stays exactly 64 static-channel bits + 64 tail-row bits.
 /// Static rows use per-channel bits at the fixed channel index
-/// (spot rows simply never occupy the ticker bit —
+/// (spot rows simply never occupy the ticker or trades bits —
 /// [`row_wants_channel`]).
 #[inline]
 fn row_bit(symbols: &DeribitSymbolTable, idx: usize, ch: usize) -> u128 {
@@ -3260,11 +3260,13 @@ mod tests {
     }
 
     #[test]
-    fn spot_row_verification_and_registration_skip_ticker() {
-        // WS6: a spot static row (no `-` in the name) wants
-        // quote + trades only — the subscribe echo without a spot
-        // ticker passes FULL verification and arms the WS2
-        // discriminator.
+    fn spot_row_verification_and_registration_skip_ticker_and_trades() {
+        // WS6 + 2026-09-19: a spot static row (no `-` in the name)
+        // wants quote only without depth — the subscribe echo without
+        // a spot ticker AND without a spot trades channel (exactly
+        // what Deribit echoes for Coinbase-routed spot) passes FULL
+        // verification and arms the WS2 discriminator. Before the
+        // law change this echo shape refused every session at boot.
         let mut symbols = DeribitSymbolTable::new();
         symbols.insert(b"BTC-PERPETUAL", SYM_BTC).unwrap();
         symbols.insert(b"BTC_USDC", (3 << 24) | 2).unwrap();
@@ -3278,7 +3280,7 @@ mod tests {
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
 
-        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.BTC_USDC","trades.BTC_USDC.100ms"],"testnet":false}"#;
+        let result = br#"{"jsonrpc":"2.0","id":2,"result":["quote.BTC-PERPETUAL","ticker.BTC-PERPETUAL.100ms","trades.BTC-PERPETUAL.100ms","quote.BTC_USDC"],"testnet":false}"#;
         inject_text(&mut t, result);
         drive_one(
             &mut t,
@@ -3289,12 +3291,12 @@ mod tests {
             &status,
             &mut NullCapture,
         )
-        .expect("spot echo without ticker is a FULL verification");
+        .expect("spot echo without ticker or trades is a FULL verification");
         assert!(
             d.subs_ever_confirmed,
             "full verification armed the discriminator"
         );
-        assert_eq!(d.sub_count(), 5, "3 perp + 2 spot channels registered");
+        assert_eq!(d.sub_count(), 4, "3 perp + 1 spot channel registered");
         assert_eq!(status.sub_drops_total(), 0);
         // Spot quote flows as a Tick like any static row.
         let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC_USDC","data":{"timestamp":1550658624149,"instrument_name":"BTC_USDC","best_bid_price":64000.5,"best_bid_amount":1.0,"best_ask_price":64001.0,"best_ask_amount":2.0}}}"#;

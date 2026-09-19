@@ -22,6 +22,7 @@ provenance) — never for orientation; the live doc set is `CLAUDE.md` +
 | `m3-progress.md` | M3 progress log (launchd fleet C1–C5, C6 calendar phase, the remediation-era ops entries) | C6 CLOSED by operator blessing 2026-08-29 (exit entry last; streak 6 ≥ 3, 37/37 runs harness-clean) |
 | `m4-progress.md` | M4 progress log (shadow-P&L attribution, D1–D3 rulings) | M4 closed 2026-08-23 |
 | `capture-continuity-outage-2026-08-27.md` | Defect A/B/C findings (settlement deaths, PM dark, unnamed errors) | remediated via the plan below; WS2 live-proven 2026-08-29 |
+| `deribit-spot-trades-outage-2026-09-19.md` | Deribit made USDC spot Coinbase-routed (2026-09-17 16:00Z): `trades.BTC_USDC.100ms` vanished from the subscribe echo, the boot fail-fast refused every session, slot 1 (vrp) blind for two days | fixed 2026-09-19 — spot rows want quote + book only (`row_wants_channel`) |
 | `capture-remediation-plan-2026-08-28.md` | remediation plan (T1/T2/D-lanes/#7a/#7b) | folded into `docs/stage2-finish-plan.md` WS0–WS13; live-proven 2026-08-29 |
 | `remediation-run-phase.md` | remediation run-phase prompt (was `docs/prompts/`) | folded into WS13; superseded |
 | `venue-instrument-support-gaps.md` | venue/instrument gap audit | §1 folded into stage2-finish-plan WS2–WS12 (coded 2026-08-29); §2+ = Stage-3+ material |

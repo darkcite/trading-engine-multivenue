@@ -197,9 +197,25 @@ impl DeribitChannel {
 /// | row class      | quote | ticker | trades | book (w/ depth) |
 /// |----------------|-------|--------|--------|-----------------|
 /// | static future  |  yes  |  yes   |  yes   |  yes            |
-/// | static SPOT    |  yes  |  —     |  yes   |  yes            |
+/// | static SPOT    |  yes  |  —     |  —     |  yes            |
 /// | option         |  yes  |  yes   |  —     |  —              |
 /// | combo (WS6)    |  yes  |  —     |  —     |  —              |
+///
+/// **Spot rows want NO trades channel (2026-09-19).** On 2026-09-17
+/// ~16:00Z Deribit made its USDC spot pairs "Coinbase-routed":
+/// `trades.BTC_USDC.100ms` is accepted by `public/subscribe` and then
+/// silently ABSENT from the echo (`result` lists every other channel),
+/// and `public/get_last_trades_by_instrument` answers
+/// `11060 not_supported_for_coinbase_routed_spot`. Under the boot
+/// fail-fast (a first-ever echo missing a configured channel is a
+/// misconfiguration) that one absent name refused every Deribit
+/// session for two days — 1,539 reconnects in one run, `ticks 0`, and
+/// slot 1 (vrp) never saw an option summary. Nothing consumes a spot
+/// print (the spot row exists for its BBO capture, WS6), so the law
+/// drops the channel rather than teaching the verifier to tolerate a
+/// missing one: the fail-fast stays exact for every channel a member
+/// depends on. Reproduced from the host before the change
+/// (`docs/arch/deribit-spot-trades-outage-2026-09-19.md`).
 #[inline]
 pub fn row_wants_channel(
     symbols: &DeribitSymbolTable,
@@ -214,8 +230,8 @@ pub fn row_wants_channel(
         return ch_idx <= 1;
     }
     match ch_idx {
-        0 | 2 => true,
-        1 => !symbols.is_spot_row(idx),
+        0 => true,
+        1 | 2 => !symbols.is_spot_row(idx),
         3 => depth_enabled,
         _ => false,
     }
@@ -948,7 +964,7 @@ pub enum SymbolTableErr {
 /// (M2.1, WS6): rows `[0..static_len)` are configured instruments
 /// (full channel set; a static row whose name carries NO `-` is a
 /// SPOT instrument — `BTC_USDC` vs `BTC-PERPETUAL`/`BTC-27MAR26` —
-/// and skips the ticker channel), rows `[static_len..combo_start)`
+/// and takes quote + book only), rows `[static_len..combo_start)`
 /// are discovered capped-chain options (quote + ticker), rows
 /// `[combo_start..len)` are configured option COMBOS (WS6 —
 /// quote-only BBO capture; combo ORDERS stay Stage-3). Options and
@@ -1086,7 +1102,9 @@ impl DeribitSymbolTable {
     /// name-shape law from the crate docs: spot names carry NO `-`
     /// (`BTC_USDC`), every future/perp does (`BTC-PERPETUAL`,
     /// `BTC_USDC-PERPETUAL`, `BTC-27MAR26`). Spot rows skip the
-    /// ticker channel (no funding/OI/mark analytics on spot).
+    /// ticker channel (no funding/OI/mark analytics on spot) and,
+    /// since 2026-09-19, the trades channel (Coinbase-routed spot
+    /// publishes none — see [`row_wants_channel`]).
     #[inline]
     pub fn is_spot_row(&self, idx: usize) -> bool {
         if idx >= self.static_len {
@@ -1387,8 +1405,9 @@ pub type DvolName = (u8, [u8; 16]);
 /// Serialize the single batched `public/subscribe` covering every
 /// configured `(channel × instrument)` pair per the
 /// [`row_wants_channel`] policy (static futures: quote/ticker/trades
-/// +book with depth; static SPOT: no ticker — WS6; options: quote +
-/// ticker — M2.3; combos: quote only — WS6), PLUS one
+/// +book with depth; static SPOT: quote + book only — WS6, and no
+/// trades since 2026-09-19; options: quote + ticker — M2.3; combos:
+/// quote only — WS6), PLUS one
 /// `deribit_volatility_index.{index}` channel per configured DVOL
 /// index (WS6 — OUTSIDE the verification mask: an absent echo shows
 /// up as a missing capture series, never a session verdict).
@@ -1841,7 +1860,8 @@ mod tests {
     #[test]
     fn subscribe_all_spot_combo_and_dvol_channel_policy() {
         // WS6: the row_wants_channel law end-to-end — spot rows skip
-        // the ticker, combo rows are quote-only, DVOL channels append
+        // the ticker AND (2026-09-19, Coinbase-routed spot) the trades
+        // channel, combo rows are quote-only, DVOL channels append
         // after every instrument channel.
         let mut t = DeribitSymbolTable::new();
         t.insert(b"BTC-PERPETUAL", 1).unwrap();
@@ -1865,9 +1885,11 @@ mod tests {
         let mut buf = [0u8; 4096];
         let n = write_subscribe_all(&mut buf, 5, &t, true, &dvol).expect("fits");
         let s = core::str::from_utf8(&buf[..n]).unwrap();
-        // Spot: quote + trades + book — NO ticker.
+        // Spot: quote + book — NO ticker, NO trades. The trades name
+        // is the one Deribit stopped echoing for Coinbase-routed spot;
+        // asking for it refuses the whole session at boot.
         assert!(s.contains("\"quote.BTC_USDC\""));
-        assert!(s.contains("\"trades.BTC_USDC.100ms\""));
+        assert!(!s.contains("trades.BTC_USDC"));
         assert!(s.contains("\"book.BTC_USDC.100ms\""));
         assert!(!s.contains("ticker.BTC_USDC"));
         // Combo: quote ONLY.
