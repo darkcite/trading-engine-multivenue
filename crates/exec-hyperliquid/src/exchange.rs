@@ -116,6 +116,11 @@ pub struct HlExecCounters {
     pub submitted: u64,
     /// Orders the venue refused.
     pub rejected: u64,
+    /// IoCs the venue UNDERSTOOD and could not match (E7-F2). Not in
+    /// [`Self::rejected`] and not in the reject streak: the order was
+    /// priced against the book and found no counterparty, which is
+    /// the coverage entry's ordinary outcome, not the venue saying no.
+    pub ioc_missed: u64,
     /// Submits refused locally, before any packet left.
     pub refused_local: u64,
     /// **Actions that reached the wire and whose answer we never
@@ -325,6 +330,18 @@ pub struct HlExecCounters {
 ///
 /// Cancels still COUNT against the address (`on_action_sent` fires for
 /// every action, cancels included). They are never REFUSED by it.
+/// Where the budget the arm booted with came from (E7-F1).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetSource {
+    /// `/info userRateLimit` answered at boot — the venue's own figures.
+    Venue,
+    /// The venue did not answer; the state file did.
+    File,
+    /// Neither — the cold assumption (remaining 0, under any floor).
+    Cold,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spend {
     /// Anything that can open or move exposure. Refused at the floor.
@@ -517,6 +534,8 @@ pub struct HlExchange<const FILL_N: usize> {
     network: Network,
     nonce: Nonce,
     budget: AddressBudget,
+    /// Where `budget` came from at boot — for the boot tell.
+    budget_source: BudgetSource,
     seen: TidRing<SNAPSHOT_RING>,
     assets: AssetTable,
     fills: Producer<Fill, FILL_N>,
@@ -624,6 +643,11 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let ws = UserWs::new(&cfg.host, 443, tls, &cfg.master_addr)
             .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
         let budget = budget::load(&budget_path, cfg.master_addr, floor);
+        let budget_source = if budget == AddressBudget::cold(cfg.master_addr, floor) {
+            BudgetSource::Cold
+        } else {
+            BudgetSource::File
+        };
         Ok(Self {
             http,
             ws,
@@ -631,6 +655,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             network: cfg.network,
             nonce: Nonce::new(),
             budget,
+            budget_source,
             seen: TidRing::new(),
             assets: AssetTable::default(),
             fills,
@@ -689,6 +714,40 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     #[must_use]
     pub fn budget_remaining(&self) -> i64 {
         self.budget.remaining()
+    }
+
+    /// Where the boot budget came from (E7-F1) — for the boot tell.
+    #[inline]
+    #[must_use]
+    pub const fn budget_source(&self) -> BudgetSource {
+        self.budget_source
+    }
+
+    /// E7-F1: replace the boot budget with the venue's own figures.
+    ///
+    /// One blocking `/info userRateLimit` round trip, on the same
+    /// connection the first order will use. Called by the BOOT, once,
+    /// after `new` and before the arm is announced — never from `new`
+    /// itself, so building an arm in a test reaches no socket. When
+    /// the venue does not answer, or answers half (`scan_rate_limit`),
+    /// the budget `new` loaded stands — the file, else cold — and the
+    /// returned source says which.
+    pub fn seed_budget_from_venue(&mut self) -> BudgetSource {
+        let mut req = [0u8; budget::MAX_RATE_REQ];
+        if let Ok(n) = budget::rate_limit_request(&mut req, &self.master_addr) {
+            if let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) {
+                if let Some((used, vlm_1e6)) = budget::scan_rate_limit(&self.http.resp()[range]) {
+                    self.budget = AddressBudget::from_venue(
+                        self.master_addr,
+                        self.budget.floor(),
+                        used,
+                        vlm_1e6,
+                    );
+                    self.budget_source = BudgetSource::Venue;
+                }
+            }
+        }
+        self.budget_source
     }
 
     /// Map the engine's order kind onto the venue's TIF.
@@ -1279,13 +1338,23 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             DispatchError::Disconnected
         })?;
 
-        let resp = self.http.resp();
-        let slice = &resp[range];
+        let scanned = scan(&self.http.resp()[range]);
+        self.judge(spend, scanned)
+    }
+
+    /// The verdict on a venue answer, and what it does to the streaks.
+    /// Split from `send_action` so the four outcomes can be pinned
+    /// without a socket (E7-F2).
+    fn judge(
+        &mut self,
+        spend: Spend,
+        scanned: Result<HlResponse, crate::response::ScanErr>,
+    ) -> Result<HlOk, DispatchError> {
         let outcome_seen = |ok: &HlOk| match spend {
             Spend::Submit => ok.any_resting || ok.any_filled,
             Spend::Cancel => ok.any_success,
         };
-        match scan(slice) {
+        match scanned {
             Ok(HlResponse::Ok(ok)) if ok.accepted() && outcome_seen(&ok) => {
                 // An acceptance ends both streaks. They are
                 // CONSECUTIVE counts: a venue refusing every order is
@@ -1294,6 +1363,17 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 self.reject_streak = 0;
                 self.asset_refusal_streak = 0;
                 Ok(ok)
+            }
+            // E7-F2: an IoC that found nothing to match. The venue
+            // understood the order and it did not trade — the caller
+            // still gets an error (nothing rests, nothing filled), but
+            // NEITHER streak moves and `rejected` does not count it.
+            // The first mainnet hour (2026-09-19) counted two of these
+            // as venue rejections; five in a row — routine for a 1 s
+            // IoC against a 6 s book — would have halted the arm.
+            Ok(HlResponse::Ok(ok)) if spend == Spend::Submit && ok.missed() => {
+                self.counters.ioc_missed = self.counters.ioc_missed.wrapping_add(1);
+                Err(DispatchError::Http(200))
             }
             // The venue understood us and said NO. Distinct from an
             // answer we could not read: E6's `halt_on_reject_streak`
@@ -1828,7 +1908,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     /// reason.
     fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
         let c = &self.counters;
-        // COPY: 208 B POD (25 × u64 + i64) composed here and returned by
+        // COPY: 216 B POD (26 × u64 + i64) composed here and returned by
         // value — cold (1 Hz /state, 0.2 Hz /metrics); it is BUILT from
         // two sources (`counters`, `budget`) so there is nothing to
         // borrow — rejected: an out-param, for one struct read twice a
@@ -1836,6 +1916,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         clob_dispatcher::LiveArmCounters {
             submitted: c.submitted,
             rejected: c.rejected,
+            ioc_missed: c.ioc_missed,
             refused_local: c.refused_local,
             refused_stale: c.refused_stale,
             sent_unanswered: c.sent_unanswered,
@@ -2553,8 +2634,8 @@ mod tests {
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
             320,
-            "HlExecCounters changed size — 34 eight-byte counters (272 B) \
-             rounded up to five 64-byte lines, with room for six more \
+            "HlExecCounters changed size — 35 eight-byte counters (280 B) \
+             rounded up to five 64-byte lines, with room for five more \
              before it grows. The message used to say 40 u64, which is \
              why adding one looked like it would cross a line and did not."
         );
@@ -2709,6 +2790,77 @@ mod tests {
             "a request that never left must not be charged to the address"
         );
         assert_eq!(x.counters.sent_unanswered, 0, "and nothing is in doubt");
+    }
+
+    /// E7-F1: with nobody listening, the venue seed changes nothing —
+    /// the budget `new` loaded (cold, for a fresh state path) stands
+    /// and the source says so. The venue half is pinned by the
+    /// `scan_rate_limit` / `from_venue` tests in `budget`.
+    #[test]
+    fn a_venue_that_does_not_answer_leaves_the_boot_budget_alone() {
+        let mut x = exchange_at("127.0.0.1");
+        assert_eq!(x.budget_source(), BudgetSource::Cold);
+        let before = x.budget;
+        assert_eq!(x.seed_budget_from_venue(), BudgetSource::Cold);
+        assert_eq!(x.budget, before, "no answer, no change");
+        assert!(x.budget_remaining() <= 0, "and cold still refuses");
+    }
+
+    /// E7-F2: the venue's IoC miss is neither an acceptance nor a
+    /// rejection. It is counted on its own, the caller still sees an
+    /// error, and the reject streak — which is the operator's
+    /// "the venue keeps saying NO" kill switch — does not move.
+    #[test]
+    fn an_ioc_miss_is_counted_apart_and_moves_no_streak() {
+        let mut x = exchange_at("127.0.0.1");
+        x.reject_streak = 2;
+        let miss = HlOk {
+            statuses: 1,
+            errors: 1,
+            ioc_misses: 1,
+            ..HlOk::default()
+        };
+        let r = x.judge(Spend::Submit, Ok(HlResponse::Ok(miss)));
+        assert!(matches!(r, Err(DispatchError::Http(200))), "nothing traded: {r:?}");
+        assert_eq!(x.counters.ioc_missed, 1);
+        assert_eq!(x.counters.rejected, 0, "a miss is not a refusal");
+        assert_eq!(x.reject_streak, 2, "and it neither bumps nor resets the streak");
+
+        // The same wording on a CANCEL is not a miss — there is no
+        // such thing as a cancel that found no counterparty.
+        let r = x.judge(Spend::Cancel, Ok(HlResponse::Ok(miss)));
+        assert!(matches!(r, Err(DispatchError::Http(200))));
+        assert_eq!(x.counters.rejected, 1);
+        assert_eq!(x.reject_streak, 3);
+
+        // A genuine refusal still counts and still climbs.
+        let refusal = HlOk {
+            statuses: 1,
+            errors: 1,
+            ..HlOk::default()
+        };
+        let r = x.judge(Spend::Submit, Ok(HlResponse::Ok(refusal)));
+        assert!(matches!(r, Err(DispatchError::Http(200))));
+        assert_eq!(x.counters.rejected, 2);
+        assert_eq!(x.reject_streak, 4);
+        assert_eq!(x.counters.ioc_missed, 1, "unchanged");
+
+        // A fill ends the streak, as before.
+        let filled = HlOk {
+            statuses: 1,
+            any_filled: true,
+            oid: 42,
+            ..HlOk::default()
+        };
+        let ok = x.judge(Spend::Submit, Ok(HlResponse::Ok(filled))).expect("filled");
+        assert_eq!(ok.oid, 42);
+        assert_eq!(x.reject_streak, 0);
+
+        // An unreadable answer is a rejection AND a malformed error.
+        let r = x.judge(Spend::Submit, Err(crate::response::ScanErr::Malformed));
+        assert!(matches!(r, Err(DispatchError::JsonMalformed)));
+        assert_eq!(x.counters.rejected, 3);
+        assert_eq!(x.reject_streak, 1);
     }
 
     /// **A REPEAT of the live roll retires nothing.** The venue

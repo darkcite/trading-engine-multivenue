@@ -4330,6 +4330,63 @@ Gates stay in orders/instances, never hours (the ≤ 2 h window law
 governs any replay used to judge). Mainnet is a NEW operator ruling
 after R2 on testnet, with the §11 shopping list done.
 
+### E7 — MAINNET R0, ARMED 2026-09-19 13:04:39Z (operator ruling "lets go mainnet")
+
+Testnet R0 could not run — the venue has no rolling 15-minute BTC
+family there (vault docs 21/22) — so the operator ruled mainnet
+directly after the testnet exec battery (vault doc 23, 12/12) with the
+bankroll that was there: **9.8 USDC spot**. Shape (`~/multivenue/`):
+`bin15.toml` entry $2 at ask ≥ 0.70 and ≤ p̂ − 2c, `cap_instance $2`,
+`cap_day $8`, maker 0, `e_take 0.9`; `exec.toml` slot 3 live, order $2,
+open 2, day $8, instance $2, drift halt $2, floor 2000, the other halts
+as tested; `strategy.conf` + `EXEC_TOML`/`ARM_LIVE=3`. Credentials: the
+four `Scope::Live` keys in the REPO `.env` (the launchd engine's file);
+agent `bin15` approved on mainnet **until 2026-10-19** (30 days).
+
+The first hour, as it happened:
+
+* **13:00:40Z — sticky halt `budget-floor` before the first order.**
+  `exec-hyperliquid::budget` started an address with no state file
+  COLD (remaining 0 < floor 2000) "until the engine has watched itself
+  trade" — which it cannot, because the floor refuses the submits that
+  would earn it. The premise ("the venue exposes no lifetime figure")
+  was wrong: `/info userRateLimit` answers `nRequestsUsed` /
+  `nRequestsCap` / `cumVlm`. Fixed by hand for the second boot (state
+  file seeded with the venue's figures, `exec.HALT` removed) and in code
+  as **E7-F1**: `HlExchange::seed_budget_from_venue` at boot, the cold
+  budget now the fallback for a venue that does not answer; the ARMED
+  tell prints `budget_source` and `budget_remaining`.
+* **13:07:05Z / 13:07:06Z — two IoC entries missed the book**
+  (`iocCancelRejected`, "Order could not immediately match against any
+  resting orders.") and were counted as VENUE REJECTIONS into
+  `halt_on_reject_streak` (5). Five misses in a row are routine for a
+  1 s IoC against a 6 s book (vault, the fill model), so the arm would
+  have halted sticky on orders that were never refused. **E7-F2**: the
+  scanner classifies the venue's miss wording (`HlOk::ioc_misses`,
+  `missed()`), the arm counts `ioc_missed` (`/metrics
+  engine_exec_hl_ioc_missed_total`) and moves NEITHER streak; the caller
+  still sees the error and the member still retries. A batch with one
+  genuine refusal is still a refusal; a cancel is never a "miss".
+* **13:08:59Z — the first fill: BUY 2 @ 0.89 `#42681`** (the No leg of
+  the 13:00 instance), $1.78, `fee 0.0`, cloid slot 3 / id 7, on
+  `userFills` within the second, six reconciliations agreeing, drift 0.
+* **13:15:09Z — settlement at 1.0 × 2 = $2.00 with `fee 0.002688`
+  USDC.** HIP-4's fee is charged on SETTLEMENT, not on the trade:
+  0.1344 % of the payout on this row. The 2026-09-15 "fees are zero on
+  the wire" finding was true of the TRADE row only. MEASURED, per the
+  fee law — `fees.toml`'s prediction row and `pnl_report` must carry a
+  settlement-side term (open item).
+* 13:17:19Z — the next entry, BUY 2 @ 0.75 `#42700` (Yes, 13:15
+  instance), $1.50. USDC 8.517312 = 9.8 − 1.78 + 2.00 − 0.002688 − 1.50
+  to the cent.
+
+The interlock, the caps, the seeding, the sweep on a real roll, the fill
+on the stream, the reconciliation and the settlement booking all did
+what E1–E7 said they would; the two findings are both in the arm's
+bookkeeping, and both are fixed above. R0's bar (≥ 96 entries, ≥ 1
+fill, recon agreeing, `unknown_fills = 0`) is being measured on
+mainnet; R1/R2 remain operator rulings.
+
 ### Gates run at the close of the pass (2026-09-19, Mac)
 
 * `cargo check --workspace --all-targets` — clean

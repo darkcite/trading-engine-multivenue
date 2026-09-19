@@ -33,21 +33,25 @@
 //! predict the venue's own accounting, and the engine's beliefs are
 //! precisely what reconciliation exists to doubt.
 //!
-//! ## Why it owns its own persistence
+//! ## Where the figures come from (E7-F1, 2026-09-19)
 //!
-//! ⛏ §0.1-8: `userFees.dailyUserVlm` is a **daily** figure, not
-//! cumulative-since-inception, and the venue exposes no "lifetime
-//! volume" query. So the allowance cannot be recomputed from the
-//! venue at boot — it has to be remembered. The state file is two
-//! integers and the address they belong to.
+//! **The venue states them.** `/info {"type":"userRateLimit"}` answers
+//! `{"cumVlm":"<USDC>","nRequestsUsed":N,"nRequestsCap":10000+cumVlm,
+//! …}` for the master address — the two integers this governor models,
+//! from the accounting it exists to predict. The arm reads them once at
+//! boot ([`rate_limit_request`] / [`scan_rate_limit`]) and starts from
+//! [`AddressBudget::from_venue`].
 //!
-//! **A cold boot assumes the worst.** With no state file, or one
-//! written for a different address, the governor starts at
-//! `spent = initial_buffer` — i.e. `remaining() == traded`, which is
-//! zero until venue fills accumulate. That refuses submits until the
-//! engine has watched itself trade. The alternative, assuming the full
-//! 10,000, would hand a fresh boot the whole allowance on the strength
-//! of a missing file.
+//! The first cut believed the opposite (⛏ §0.1-8: `userFees.dailyUserVlm`
+//! is daily, "the venue exposes no lifetime figure") and so started
+//! every unknown address COLD — `spent = initial_buffer`, remaining 0 —
+//! "until the engine has watched itself trade". A fresh address can
+//! never earn that way, because a remaining of 0 is under any floor
+//! and the floor refuses the very submits that would earn it: the first
+//! mainnet boot (2026-09-19 13:00:40Z) halted `budget-floor` before its
+//! first order. The cold budget remains the FALLBACK for a venue that
+//! does not answer at boot, and the state file remains the persistence
+//! between reads — it is two integers and the address they belong to.
 
 /// Hyperliquid's starting allowance for a fresh address.
 pub const INITIAL_BUFFER: u64 = 10_000;
@@ -101,6 +105,14 @@ impl AddressBudget {
             address,
             _pad: [0; 12],
         }
+    }
+
+    /// The budget as the VENUE states it: `nRequestsUsed` spent,
+    /// `cumVlm` traded. `remaining()` is then exactly the venue's
+    /// `nRequestsCap − nRequestsUsed`.
+    #[must_use]
+    pub fn from_venue(address: [u8; 20], floor: u64, used: u64, cum_vlm_1e6: i64) -> Self {
+        Self::restored(address, floor, used, cum_vlm_1e6)
     }
 
     /// A budget restored from known figures.
@@ -258,6 +270,34 @@ impl AddressBudget {
 /// Default location of the budget's own state file.
 pub const DEFAULT_STATE_PATH: &str = "exec-budget.state";
 
+/// Bytes a `userRateLimit` request needs.
+pub const MAX_RATE_REQ: usize = 80;
+
+/// Render `{"type":"userRateLimit","user":"0x<40 hex>"}`.
+///
+/// # Errors
+/// `out` is shorter than [`MAX_RATE_REQ`].
+pub fn rate_limit_request(
+    out: &mut [u8],
+    master: &[u8; 20],
+) -> Result<usize, crate::response::ScanErr> {
+    crate::recon::user_info_request(out, br#"{"type":"userRateLimit","user":"0x"#, master)
+}
+
+/// Scan a `userRateLimit` answer into `(nRequestsUsed, cumVlm × 1e6)`.
+///
+/// Both fields are REQUIRED: an answer missing either is refused, and
+/// the caller lands on the file or the cold budget — never on a
+/// half-read figure that could authorise spending the venue did not
+/// grant. `cumVlm` is a decimal string of USDC.
+#[must_use]
+pub fn scan_rate_limit(body: &[u8]) -> Option<(u64, i64)> {
+    let used = crate::json::u64_field(body, b"\"nRequestsUsed\"")?;
+    // `decimal_field` is ×1e8; the governor keeps USDC ×1e6.
+    let vlm_1e6 = crate::json::decimal_field(body, b"\"cumVlm\"")? / 100;
+    Some((used, vlm_1e6))
+}
+
 /// Read the budget for `address` from `path`.
 ///
 /// **Every failure returns a COLD budget**, which is the conservative
@@ -329,7 +369,44 @@ mod tests {
         assert_eq!(b.remaining(), 10_005);
     }
 
-    /// **A cold boot must not hand itself the allowance.**
+    /// E7-F1: the venue's own answer, verbatim from mainnet and
+    /// testnet on 2026-09-19, becomes the budget the arm starts from —
+    /// and `remaining()` reproduces the venue's `cap − used`.
+    #[test]
+    fn the_venue_states_the_budget_and_remaining_is_its_own_arithmetic() {
+        const MAINNET: &[u8] =
+            br#"{"cumVlm":"0.0","nRequestsUsed":5,"nRequestsCap":10000,"nRequestsSurplus":0}"#;
+        const TESTNET: &[u8] =
+            br#"{"cumVlm":"42.0","nRequestsUsed":95,"nRequestsCap":10042,"nRequestsSurplus":0}"#;
+        let (used, vlm) = scan_rate_limit(MAINNET).expect("mainnet shape");
+        assert_eq!((used, vlm), (5, 0));
+        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm);
+        assert_eq!(b.remaining(), 10_000 - 5);
+        assert!(b.may_submit().is_ok(), "9 995 is over any sane floor");
+
+        let (used, vlm) = scan_rate_limit(TESTNET).expect("testnet shape");
+        assert_eq!((used, vlm), (95, 42_000_000));
+        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm);
+        assert_eq!(b.remaining(), 10_042 - 95, "cap − used, as the venue says");
+
+        // Half an answer is no answer.
+        assert!(scan_rate_limit(br#"{"nRequestsUsed":5}"#).is_none());
+        assert!(scan_rate_limit(br#"{"cumVlm":"1.0"}"#).is_none());
+        assert!(scan_rate_limit(b"[]").is_none());
+
+        // The request the figures come from.
+        let mut buf = [0u8; MAX_RATE_REQ];
+        let n = rate_limit_request(&mut buf, &ADDR).expect("fits");
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"userRateLimit","user":"0xabababababababababababababababababababab"}"#
+        );
+        let mut tiny = [0u8; 8];
+        assert!(rate_limit_request(&mut tiny, &ADDR).is_err());
+    }
+
+    /// **A cold boot must not hand itself the allowance** — the
+    /// FALLBACK when the venue does not answer at boot (E7-F1).
     #[test]
     fn a_cold_boot_assumes_the_worst() {
         let b = AddressBudget::cold(ADDR, 100);

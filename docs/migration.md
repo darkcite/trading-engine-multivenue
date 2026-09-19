@@ -6,6 +6,32 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — Exec arm: `ioc_missed` counter (E7-F2) and the budget seeded from `userRateLimit` (E7-F1)
+
+**No wire-format change, no file-layout change, no config key change.**
+Two `/metrics` surfaces move:
+
+- `engine_exec_hl_ioc_missed_total` is NEW (`LiveArmCounters.ioc_missed`,
+  `LIVE_ARM_COUNTER_NAMES` 24 → 25). An IoC the venue understood and
+  could not match (`"Order could not immediately match…"`,
+  `historicalOrders` status `iocCancelRejected`) now counts here and NOT
+  in `engine_exec_hl_rejected_total`, and moves neither `reject_streak`
+  nor `asset_refusal_streak`. Before this entry every miss was a
+  "venue rejection" and fed `halt_on_reject_streak` — two of them did
+  in the first mainnet hour. A dashboard summing `rejected` for
+  "orders that did not trade" must add `ioc_missed`.
+- The ARMED boot tell gains `budget_source` (`Venue` / `File` / `Cold`)
+  and `budget_remaining`. `HlExchange::seed_budget_from_venue` (called
+  by the boot, never by `new`) replaces the loaded budget with the
+  venue's `nRequestsUsed` / `cumVlm`; the state file `exec-budget.state`
+  is the fallback and the persistence between reads, the cold assumption
+  the fallback for a venue that does not answer at boot. A fresh address
+  no longer boots into a `budget-floor` halt.
+
+Ripple: `HlExecCounters` 34 → 35 counters (still 320 B), `LiveArmCounters`
+208 → 216 B. `recon.rs`'s two `/info` renderers collapse into
+`user_info_request` (the third caller is `budget::rate_limit_request`).
+
 ## 2026-09-19 — HIP-4 minimum order notional: $10 → **1 USDC** in `GRID_MIN_NOTIONAL_1E6` and `PREDICTION_MIN_NOTIONAL_1E6`
 
 **No wire-format change, no file-layout change, no config key change.**

@@ -372,17 +372,34 @@ pub const MAX_OPEN_ORDERS_REQ: usize = 96;
 /// # Errors
 /// `out` is too small.
 pub fn open_orders_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
-    const HEAD: &[u8] = br#"{"type":"frontendOpenOrders","user":"0x"#;
+    user_info_request(out, br#"{"type":"frontendOpenOrders","user":"0x"#, master)
+}
+
+/// Render one `/info` request of the shape `<head><40 hex>"}` — every
+/// per-user query this crate makes (`spotClearinghouseState`,
+/// `frontendOpenOrders`, `userRateLimit`) is this one render with a
+/// different head. ONE copy of the address rendering: the E7-F1 pass
+/// found it written out twice already, which is two places for the
+/// hex table or the closing literal to drift.
+///
+/// # Errors
+/// `out` is too small.
+pub(crate) fn user_info_request(
+    out: &mut [u8],
+    head: &[u8],
+    master: &[u8; 20],
+) -> Result<usize, ScanErr> {
     const TAIL: &[u8] = br#""}"#;
-    let n = HEAD.len() + 40 + TAIL.len();
+    let n = head.len() + 40 + TAIL.len();
     if out.len() < n {
         return Err(ScanErr::Malformed);
     }
     // COPY: ≤ 64 B request literal + 40 hex chars into the caller's
     // boot-owned body — the RENDER of the `/info` request (once per
-    // reconcile / sweep, ≥ seconds apart); the body must exist once.
-    out[..HEAD.len()].copy_from_slice(HEAD);
-    let mut i = HEAD.len();
+    // reconcile / sweep / boot, ≥ seconds apart); the body must exist
+    // once.
+    out[..head.len()].copy_from_slice(head);
+    let mut i = head.len();
     for b in master {
         out[i] = HEX[usize::from(b >> 4)];
         out[i + 1] = HEX[usize::from(b & 0x0F)];
@@ -545,25 +562,7 @@ pub const MAX_STATE_REQ: usize = 96;
 /// # Errors
 /// The buffer is shorter than [`MAX_STATE_REQ`].
 pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
-    const HEAD: &[u8] = br#"{"type":"spotClearinghouseState","user":"0x"#;
-    const TAIL: &[u8] = br#""}"#;
-    let n = HEAD.len() + 40 + TAIL.len();
-    if out.len() < n {
-        return Err(ScanErr::Malformed);
-    }
-    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's
-    // boot-owned body — the RENDER of the `/info` request (once per
-    // reconcile / sweep, ≥ seconds apart); the body must exist once.
-    out[..HEAD.len()].copy_from_slice(HEAD);
-    let mut i = HEAD.len();
-    for b in master {
-        out[i] = HEX[usize::from(b >> 4)];
-        out[i + 1] = HEX[usize::from(b & 0x0F)];
-        i += 2;
-    }
-    // COPY: the 2 B closing literal of the same render.
-    out[i..i + TAIL.len()].copy_from_slice(TAIL);
-    Ok(n)
+    user_info_request(out, br#"{"type":"spotClearinghouseState","user":"0x"#, master)
 }
 
 const HEX: [u8; 16] = *b"0123456789abcdef";

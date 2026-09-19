@@ -126,6 +126,16 @@ pub struct HlOk {
     /// How many of them were `{"error":…}`. **Non-zero means the
     /// action was refused**, whatever the envelope's `status` said.
     pub errors: u16,
+    /// The subset of [`Self::errors`] that were the venue's IoC MISS
+    /// (`"Order could not immediately match against any resting
+    /// orders."`, [`IOC_MISS_PREFIX`]): the order was understood,
+    /// priced and simply found no counterparty. **Not a rejection.**
+    /// The first mainnet hour (2026-09-19, E7-F2) counted two of
+    /// these into `halt_on_reject_streak`, whose whole meaning is
+    /// "the venue keeps saying NO" — five misses in a row, which the
+    /// coverage entry's 1 s IoC produces routinely, would have halted
+    /// the arm sticky on orders that were never refused.
+    pub ioc_misses: u16,
     /// The first `oid` seen, from `resting` or `filled`. `0` when the
     /// action carried none (a cancel, or an all-error batch).
     pub oid: u64,
@@ -146,7 +156,24 @@ impl HlOk {
     pub fn accepted(&self) -> bool {
         self.errors == 0 && self.statuses > 0
     }
+
+    /// Every error item was an IoC miss and nothing rested or filled:
+    /// the venue processed the order and it did not trade. Distinct
+    /// from [`Self::accepted`] (nothing traded) and from a refusal
+    /// (the venue said no).
+    #[inline]
+    #[must_use]
+    pub fn missed(&self) -> bool {
+        self.errors > 0
+            && self.ioc_misses == self.errors
+            && !self.any_resting
+            && !self.any_filled
+    }
 }
+
+/// The venue's IoC-miss message, by prefix — the wording after it
+/// ("against any resting orders.") is the venue's to change.
+pub const IOC_MISS_PREFIX: &[u8] = b"Order could not immediately match";
 
 /// The parsed envelope.
 #[repr(C)]
@@ -324,9 +351,12 @@ pub fn scan(body: &[u8]) -> Result<HlResponse, ScanErr> {
                 } else if word == b"error" {
                     out.statuses = out.statuses.saturating_add(1);
                     out.errors = out.errors.saturating_add(1);
-                    if out.first_error.is_empty() {
-                        if let Some(v) = after_colon(body, next).and_then(|p| read_string(body, p)) {
-                            out.first_error = v.0;
+                    if let Some((v, _)) = after_colon(body, next).and_then(|p| read_string(body, p)) {
+                        if v.of(body).starts_with(IOC_MISS_PREFIX) {
+                            out.ioc_misses = out.ioc_misses.saturating_add(1);
+                        }
+                        if out.first_error.is_empty() {
+                            out.first_error = v;
                         }
                     }
                 } else if word == b"resting" {
@@ -369,6 +399,11 @@ mod tests {
     const RESTING: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77738308}}]}}}"#;
     const FILLED: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.02","avgPx":"1891.4","oid":77747314}}]}}}"#;
     const ITEM_ERR: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order must have minimum value of $10."}]}}}"#;
+    /// The venue's answer to an IoC that found no counterparty —
+    /// verbatim from mainnet, 2026-09-19 13:07:05Z (`historicalOrders`
+    /// status `iocCancelRejected`).
+    const IOC_MISS: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order could not immediately match against any resting orders."}]}}}"#;
+    const IOC_MISS_AND_REFUSAL: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order could not immediately match against any resting orders."},{"error":"Order must have minimum value of 1 USDC."}]}}}"#;
     const CANCEL_OK: &[u8] =
         br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#;
     const CANCEL_ERR: &[u8] = br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"error":"Order was never placed, already canceled, or filled."}]}}}"#;
@@ -400,6 +435,28 @@ mod tests {
             b"Order must have minimum value of $10."
         );
         assert_eq!(o.oid, 0);
+        assert_eq!(o.ioc_misses, 0, "a real refusal is not a miss");
+        assert!(!o.missed());
+    }
+
+    /// E7-F2: the IoC miss is told apart from a refusal — by the
+    /// venue's own wording, and only when NOTHING else happened.
+    #[test]
+    fn an_ioc_miss_is_understood_not_refused() {
+        let HlResponse::Ok(o) = scan(IOC_MISS).unwrap() else {
+            panic!("expected Ok envelope")
+        };
+        assert_eq!((o.statuses, o.errors, o.ioc_misses), (1, 1, 1));
+        assert!(!o.accepted(), "it did not trade");
+        assert!(o.missed(), "and it was not refused either");
+        assert!(o.first_error.of(IOC_MISS).starts_with(IOC_MISS_PREFIX));
+
+        // One miss plus one REAL refusal in a batch is a refusal.
+        let HlResponse::Ok(o) = scan(IOC_MISS_AND_REFUSAL).unwrap() else {
+            panic!("expected Ok envelope")
+        };
+        assert_eq!((o.statuses, o.errors, o.ioc_misses), (2, 2, 1));
+        assert!(!o.missed(), "a batch with a genuine refusal is refused");
     }
 
     #[test]

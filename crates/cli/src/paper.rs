@@ -4695,9 +4695,10 @@ const LEDGER_COUNTER_NAMES: [&str; 6] = [
 /// order — one per `clob_dispatcher::LiveArmCounters` counter field,
 /// mirrored by [`live_arm_counter_values`], which is what pins the two
 /// together.
-const LIVE_ARM_COUNTER_NAMES: [&str; 24] = [
+const LIVE_ARM_COUNTER_NAMES: [&str; 25] = [
     "engine_exec_hl_submitted_total",
     "engine_exec_hl_rejected_total",
+    "engine_exec_hl_ioc_missed_total",
     "engine_exec_hl_refused_local_total",
     "engine_exec_hl_refused_stale_total",
     "engine_exec_hl_sent_unanswered_total",
@@ -4727,15 +4728,16 @@ const LIVE_ARM_COUNTER_NAMES: [&str; 24] = [
 /// the last reconciliation, mirrored as monotonic counters like the
 /// bin15 dormant-families level is — a rising series means the
 /// comparisons keep disagreeing, and `/state` carries the level.
-// COPY: [u64; 24] (192 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 25] (200 B) returned by value — cold, the 5 s /metrics
 // mirror; the struct's fields are visited once in the metric name order
 // and the array is what the registry's delta loop indexes — rejected:
-// an out-param, for 192 B five times a minute.
+// an out-param, for 200 B five times a minute.
 #[inline]
-fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 24] {
+fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 25] {
     [
         a.submitted,
         a.rejected,
+        a.ioc_missed,
         a.refused_local,
         a.refused_stale,
         a.sent_unanswered,

@@ -3823,7 +3823,7 @@ fn run(args: RunArgs) -> ExitCode {
                             join_reverse(handles);
                             return ExitCode::from(1);
                         };
-                        let arm = match exec_hyperliquid::HlExchange::new(
+                        let mut arm = match exec_hyperliquid::HlExchange::new(
                             &hl_cfg,
                             TlsTransport::default_client_config(),
                             f3p,
@@ -3837,12 +3837,19 @@ fn run(args: RunArgs) -> ExitCode {
                                 return ExitCode::from(1);
                             }
                         };
+                        // E7-F1: the address budget is the venue's
+                        // number, read once here; the cold assumption
+                        // halted the first mainnet boot before its
+                        // first order (2026-09-19).
+                        arm.seed_budget_from_venue();
                         info!(
                             host = %hl_cfg.host,
                             network = if ex_testnet { "testnet" } else { "MAINNET" },
                             agent = %exec_hyperliquid::config::hex20(&hl_cfg.agent_addr),
                             master = %exec_hyperliquid::config::hex20(&hl_cfg.master_addr),
                             budget_floor = floor,
+                            budget_source = ?arm.budget_source(),
+                            budget_remaining = arm.budget_remaining(),
                             budget_state = %budget_path.display(),
                             "exec: hyperliquid arm ARMED"
                         );

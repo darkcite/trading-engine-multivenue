@@ -70,18 +70,28 @@ in the script; `ai` = 48 is the floor every name includes).
   a market-data host and an exchange host on different networks refuse the
   boot. `halt_on_recon_stale_ms` is REQUIRED on every live slot. Record:
   `docs/risk-policy.md` "E6" + "E7".
-- **NEXT = E7 R0 on TESTNET (operator's hand):** `.env` with all three
-  `HYPERLIQUID_{WS,API,EXCHANGE}_HOST` on `api.hyperliquid-testnet.xyz`,
-  `HYPERLIQUID_SOURCE=b`, the testnet agent key + master address;
-  `~/multivenue/exec.toml` from the example with slot 3 live and every cap +
-  `halt_on_*` key; `bin15.toml` at the R0 ablation; one restart with
-  `--exec … --arm-live 3`. Bars R0–R3 and the tells: risk-policy "E7".
-  **Mainnet is a separate, later operator ruling.**
+- **LIVE ON MAINNET since 2026-09-19 13:04Z — E7 R0, slot 3 (bin15)
+  armed** (operator ruling; testnet has no 15-minute family, so R0 ran
+  there only as the exec battery, vault doc 23). The launchd engine
+  boots `STRATEGY=ai+vrp+xsd+bin15` with `EXEC_TOML`/`ARM_LIVE=3` from
+  `~/multivenue/strategy.conf`; `~/multivenue/exec.toml` (order $2, open
+  2, day $8, instance $2) and `bin15.toml` (entry $2 at ask ≥ 0.70,
+  cap_instance $2, cap_day $8, maker off) size a 9.8 USDC spot bankroll.
+  The four `Scope::Live` keys live in the REPO `.env`; the mainnet agent
+  approval EXPIRES 2026-10-19. The venue's HIP-4 minimum order is
+  **1 USDC** (measured; `GRID_MIN_NOTIONAL_1E6`) and its fee is charged
+  on SETTLEMENT (~13.4 bps of payout, measured 13:15Z), not on the
+  trade. Record + the first hour's two findings (E7-F1 budget seed,
+  E7-F2 IoC-miss classification): `docs/risk-policy.md` "E7 — MAINNET
+  R0". Bars R0–R3: risk-policy "E7". Every restart of an armed engine
+  passes `scripts/exec-smoke.sh` first (daily-restart does it itself).
 - **Gates at HEAD:** nextest 2585 (1 skipped) · alloc 62/62 at 0 B/op ·
   clippy clean · `make license-check` OK · `make copy-audit` new=0 ·
   worker pytest 1153 (3 skipped) · fuzz `hl_*` 3 × 300 s clean. Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
-  `scrape_hammer_all_succeed_without_conn_errors`, the worker's UDS-fixture
+  `scrape_hammer_all_succeed_without_conn_errors`,
+  `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
+  (red under parallel load, green alone), the worker's UDS-fixture
   family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file`)
   — rerun in isolation before believing a red. `make py-lint` (ruff) is
   RED at HEAD and has been for weeks; `make lint` means clippy.

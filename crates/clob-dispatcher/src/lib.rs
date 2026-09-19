@@ -695,6 +695,9 @@ pub struct LiveArmCounters {
     pub submitted: u64,
     /// Orders the venue understood and refused.
     pub rejected: u64,
+    /// IoCs the venue understood and could not match (E7-F2) — not
+    /// refusals, not in the reject streak.
+    pub ioc_missed: u64,
     /// Submits refused locally before any packet left.
     pub refused_local: u64,
     /// The LAW E-4 subset of `refused_local`: the order named an
