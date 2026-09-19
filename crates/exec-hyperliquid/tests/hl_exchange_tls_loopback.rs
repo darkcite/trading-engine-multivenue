@@ -291,7 +291,16 @@ fn a_mid_body_disconnect_is_an_error_not_a_short_read() {
         Err(e) => e,
         Ok((s, r)) => panic!("a truncated body must not succeed: {s} {r:?}"),
     };
-    assert_eq!(e, HttpErr::Disconnected);
+    assert_eq!(e.err, HttpErr::Disconnected);
+    // **The load-bearing half.** The server read our request and then
+    // died on its answer, so the venue HAS the action — it may have
+    // placed an order. The address-rate governor must count it, and
+    // it can only know to from this flag: `Disconnected` alone is
+    // also what a failed connect returns, where nothing left at all.
+    assert!(
+        e.left_host,
+        "a request the server already read must report that it left"
+    );
     assert!(
         !c.is_connected(),
         "a failed cycle must drop the connection, or the next order reads this one's leftovers"
@@ -314,7 +323,11 @@ fn a_stalled_server_is_bounded_by_the_deadline() {
         Ok(_) => panic!("a silent server must not look like a reply"),
     };
     let waited = t0.elapsed();
-    assert_eq!(e, HttpErr::Timeout);
+    assert_eq!(e.err, HttpErr::Timeout);
+    assert!(
+        e.left_host,
+        "a stalled server is one that already has our request"
+    );
     assert!(
         waited < REQ_DEADLINE + Duration::from_secs(3),
         "gave up after {waited:?}, which is not bounded by REQ_DEADLINE {REQ_DEADLINE:?}"

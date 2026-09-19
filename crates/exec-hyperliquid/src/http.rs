@@ -104,6 +104,67 @@ impl core::fmt::Display for HttpErr {
 
 impl std::error::Error for HttpErr {}
 
+/// A failed request, **and whether any of it reached the wire.**
+///
+/// ## Why this is a struct and not another `HttpErr` variant
+///
+/// The caller that matters — `HlExchange::send_action` — has to
+/// decide whether the venue's address-rate governor should count the
+/// action. Counting only successful posts makes the governor drift
+/// OPTIMISTIC, which `AddressBudget::on_action_sent` names as the
+/// wrong direction: under-counting means exceeding the venue's real
+/// limit and then reading the rate-limit answer as a transport
+/// problem.
+///
+/// That decision cannot be made from the [`HttpErr`] variant. A
+/// `Disconnected` is both "the connect failed" (nothing left) and
+/// "the peer went away mid-response" (everything left); a `Timeout`
+/// covers the whole cycle. A classifier over the variants would be a
+/// name describing a stronger property than its condition tests.
+///
+/// So the fact is recorded where it is known — inside the cycle, at
+/// the moment the write is attempted — and returned in a struct the
+/// caller must destructure. No call site can ignore it by accident.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct PostErr {
+    /// What went wrong.
+    pub err: HttpErr,
+    /// **Any byte of this request may have reached the socket.**
+    ///
+    /// Deliberately set BEFORE the write is attempted rather than
+    /// after it succeeds, so a torn write counts too. We cannot tell
+    /// a write that died on its first byte from one that died on its
+    /// last, and of the two ways to be wrong, sending fewer actions
+    /// than the venue allows is the recoverable one.
+    pub left_host: bool,
+}
+
+impl PostErr {
+    /// A failure that happened before anything could be written —
+    /// DNS, the TLS handshake, or a request that did not fit its
+    /// buffer.
+    #[inline]
+    #[must_use]
+    pub const fn before_send(err: HttpErr) -> Self {
+        Self {
+            err,
+            left_host: false,
+        }
+    }
+}
+
+impl core::fmt::Display for PostErr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.left_host {
+            write!(f, "{} (the request had already left the host)", self.err)
+        } else {
+            write!(f, "{}", self.err)
+        }
+    }
+}
+
+impl std::error::Error for PostErr {}
+
 /// A keep-alive HTTPS connection to one Hyperliquid API host.
 pub struct HlHttp {
     host: String,
@@ -171,7 +232,7 @@ impl HlHttp {
     ///
     /// Returns `(http_status, body_range)` into [`Self::resp`]. **The
     /// status is not a verdict** — see the module note.
-    pub fn post(&mut self, body: &[u8]) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
+    pub fn post(&mut self, body: &[u8]) -> Result<(u16, core::ops::Range<usize>), PostErr> {
         self.post_to(EXCHANGE_PATH, body)
     }
 
@@ -184,22 +245,24 @@ impl HlHttp {
         &mut self,
         path: &'static [u8],
         body: &[u8],
-    ) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
+    ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
         debug_assert!(
             path == EXCHANGE_PATH || path == INFO_PATH,
             "this client knows two APIs and no others"
         );
         let deadline = Instant::now() + REQ_DEADLINE;
-        self.ensure_connected(deadline)?;
-        match self.cycle(path, body, deadline) {
+        self.ensure_connected(deadline)
+            .map_err(PostErr::before_send)?;
+        let mut left_host = false;
+        match self.cycle(path, body, deadline, &mut left_host) {
             Ok(v) => Ok(v),
-            Err(e) => {
+            Err(err) => {
                 // Any failure closes the connection. A half-read
                 // response left in the buffer would be read as the
                 // NEXT order's answer, which is how a fill gets
                 // attributed to the wrong order.
                 self.close();
-                Err(e)
+                Err(PostErr { err, left_host })
             }
         }
     }
@@ -211,11 +274,15 @@ impl HlHttp {
         &self.resp_buf[..self.resp_len]
     }
 
+    /// `left_host` is set the instant a write is ATTEMPTED — see
+    /// [`PostErr::left_host`] for why that is the conservative moment
+    /// rather than after the write returns.
     fn cycle(
         &mut self,
         path: &'static [u8],
         body: &[u8],
         deadline: Instant,
+        left_host: &mut bool,
     ) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
         let header_len = self.write_header(path, body.len())?;
         {
@@ -223,6 +290,7 @@ impl HlHttp {
             // Header and body as one logical frame: a partial write
             // under TLS backpressure resumes at the same offset.
             let segments: [&[u8]; 2] = [&self.req_header[..header_len], body];
+            *left_host = true;
             write_segments(t, &segments, deadline)?;
         }
         self.read_response(deadline)

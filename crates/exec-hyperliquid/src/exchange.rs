@@ -118,6 +118,17 @@ pub struct HlExecCounters {
     pub rejected: u64,
     /// Submits refused locally, before any packet left.
     pub refused_local: u64,
+    /// **Actions that reached the wire and whose answer we never
+    /// read.** The budget counted them — it must, or the governor
+    /// drifts optimistic — but nothing in this process knows what the
+    /// venue did with them.
+    ///
+    /// A non-zero value means there may be an order resting at the
+    /// venue that no local book has an id for. It is the single most
+    /// direct reason to run E6's reconciliation, and before E5 it was
+    /// invisible: the same failure silently under-counted the budget
+    /// instead.
+    pub sent_unanswered: u64,
     /// The subset of [`Self::refused_local`] that were LAW E-4
     /// staleness refusals — the order named an instance the table has
     /// rolled past. **The most important refusal this module makes**,
@@ -839,6 +850,92 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// price that will not scale — belongs above this call, so a local
     /// refusal never reaches the budget at all.
     ///
+    /// Everything [`Self::send_action`] does BEFORE the socket:
+    /// nonce, EIP-712 signature, HTTP envelope.
+    ///
+    /// Split out so it can be MEASURED. Gate 59 split `compare` for
+    /// the same reason and stated it plainly: a path that has only
+    /// ever run behind an HTTPS round trip is a claim about source
+    /// code, and this lane has already made that claim wrongly three
+    /// times. This is the half of every submit, cancel and requote
+    /// that runs on the engine thread and must not allocate.
+    ///
+    /// Returns the request length in `body`.
+    ///
+    /// # Errors
+    /// `SignerRejected` if the key refuses; `EncodeOverflow` if the
+    /// envelope does not fit.
+    pub fn seal(
+        &mut self,
+        mp: &[u8],
+        aj: &[u8],
+        body: &mut [u8; MAX_REQ_BODY],
+    ) -> Result<usize, DispatchError> {
+        let nonce = self.nonce.next(now_ms());
+        let sig =
+            sign_action(&self.sk, mp, nonce, Vault::None, None, self.network).map_err(|_| {
+                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+                DispatchError::SignerRejected
+            })?;
+        envelope(body, aj, nonce, &sig, None, None).map_err(|_| {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            DispatchError::EncodeOverflow
+        })
+    }
+
+    /// POST one signed action **and count it against the address.**
+    ///
+    /// The counting lives here, on the only path that reaches the
+    /// socket, because it used to live in `send_action` after the
+    /// `?` — so a request the venue received and answered unreadably
+    /// was never counted at all, and the governor drifted OPTIMISTIC.
+    /// `AddressBudget::on_action_sent` names that the wrong
+    /// direction: under-counting means exceeding the venue's real
+    /// limit and then reading the rate-limit answer as a transport
+    /// problem.
+    ///
+    /// [`crate::http::PostErr::left_host`] is the fact, recorded
+    /// inside the HTTP cycle where it is known. It cannot be derived
+    /// from the error variant — `Disconnected` is both "the connect
+    /// failed" and "the peer went away mid-response" — and it is
+    /// deliberately conservative about a torn write.
+    fn post_counted(
+        &mut self,
+        body: &[u8],
+    ) -> Result<(u16, core::ops::Range<usize>), crate::http::PostErr> {
+        let posted = self.http.post(body);
+        self.count_post(&posted);
+        posted
+    }
+
+    /// Charge `posted` to the address if it may have left the host.
+    ///
+    /// Separated from the post itself so the wiring — predicate to
+    /// governor — can be asserted without a socket. The only link
+    /// this leaves untested is the call one line above, which is why
+    /// it is one line above.
+    #[inline]
+    fn count_post(&mut self, posted: &Result<(u16, core::ops::Range<usize>), crate::http::PostErr>) {
+        if Self::counts_against_address(posted) {
+            self.budget.on_action_sent();
+        }
+    }
+
+    /// Does this outcome count against the address-rate governor?
+    ///
+    /// A success obviously did leave. A failure did iff any byte
+    /// reached the socket. Named and separated so the rule can be
+    /// asserted without a network.
+    #[inline]
+    fn counts_against_address(
+        posted: &Result<(u16, core::ops::Range<usize>), crate::http::PostErr>,
+    ) -> bool {
+        match posted {
+            Ok(_) => true,
+            Err(e) => e.left_host,
+        }
+    }
+
     /// Returns the venue's ACK (LAW E-5: an ACK, never a fill).
     fn send_action(&mut self, mp: &[u8], aj: &[u8], spend: Spend) -> Result<HlOk, DispatchError> {
         // `Spend`, not the verb's name: see its docs. A cancel is an
@@ -853,24 +950,21 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return Err(DispatchError::SlotDisabled);
         }
         let mut body = [0u8; MAX_REQ_BODY];
-        let nonce = self.nonce.next(now_ms());
-        let sig =
-            sign_action(&self.sk, mp, nonce, Vault::None, None, self.network).map_err(|_| {
-                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                DispatchError::SignerRejected
-            })?;
-        let n = envelope(&mut body, aj, nonce, &sig, None, None).map_err(|_| {
-            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-            DispatchError::EncodeOverflow
-        })?;
-
-        let (_status, range) = self.http.post(&body[..n]).map_err(|_| {
+        let n = self.seal(mp, aj, &mut body)?;
+        let posted = self.post_counted(&body[..n]);
+        let (_status, range) = posted.map_err(|e| {
             self.counters.rejected = self.counters.rejected.wrapping_add(1);
+            if e.left_host {
+                // The venue has it and we do not know what it did.
+                // Distinct from a request that never left: this one
+                // may have placed an order nothing in this process
+                // knows the id of, which is what E6's reconciliation
+                // is for.
+                self.counters.sent_unanswered =
+                    self.counters.sent_unanswered.wrapping_add(1);
+            }
             DispatchError::Disconnected
         })?;
-        // Every action that left the host counts against the address,
-        // whatever the venue said about it.
-        self.budget.on_action_sent();
 
         let resp = self.http.resp();
         let slice = &resp[range];
@@ -1503,15 +1597,19 @@ mod tests {
     const KEY: [u8; 32] = [0x21; 32];
     const ADDR: [u8; 20] = [0x22; 20];
 
-    fn cfg() -> HlConfig {
-        HlConfig::new(Scope::Testnet, HOST_TESTNET, 'b', KEY, ADDR).expect("cfg")
+    fn exchange() -> HlExchange<64> {
+        exchange_at(HOST_TESTNET)
     }
 
-    fn exchange() -> HlExchange<64> {
+    /// The same, against `host`. Tests that must not touch the
+    /// network pass a loopback address: `HlHttp` resolves at
+    /// construction and connects lazily, so nothing leaves until a
+    /// post is attempted.
+    fn exchange_at(host: &str) -> HlExchange<64> {
         let (p, _c) = Ring::<Fill, 64>::new().split();
         let tls = core_net::TlsTransport::default_client_config();
         HlExchange::new(
-            &cfg(),
+            &HlConfig::new(Scope::Testnet, host, 'b', KEY, ADDR).expect("cfg"),
             tls,
             p,
             std::env::temp_dir().join(format!("mv-hlx-{}.state", std::process::id())),
@@ -1763,13 +1861,14 @@ mod tests {
         assert_eq!(core::mem::align_of::<HlExecCounters>(), 64);
         // Pinned, not merely aligned. The block is copied whole on
         // every `/metrics` publish, and it has grown from two cache
-        // lines to three and now to FOUR — E5's cancel, modify and
-        // sweep counters. Each growth is meant to be a decision rather
-        // than a surprise, which is what this assertion is for.
+        // lines to three, to FOUR for E5's cancel, modify and sweep
+        // counters, and now to FIVE for `sent_unanswered`. Each growth
+        // is meant to be a decision rather than a surprise, which is
+        // what this assertion is for.
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
-            256,
-            "HlExecCounters changed size — 32 u64 in four 64-byte lines"
+            320,
+            "HlExecCounters changed size — 40 u64 in five 64-byte lines"
         );
     }
 
@@ -1805,6 +1904,109 @@ mod tests {
         // the venue's own rows without deriving a name from an id.
         assert!(x.sweeps[0].coin_len > 1, "a real name, not an empty one");
         assert_eq!(x.sweeps[0].coin[0], b'#', "the FILL namespace, not `+`");
+    }
+
+    // ---------- E5: the budget counts what left the host ----------
+
+    /// **The rule, stated once and asserted once.**
+    ///
+    /// Before E5 the counting sat after the `?` in `send_action`, so
+    /// only a SUCCESSFUL post was counted. A request the venue
+    /// received and answered unreadably — a stalled server, a
+    /// connection that died mid-response — was never counted, and the
+    /// governor drifted optimistic. `budget.rs` names that the wrong
+    /// direction: under-counting means exceeding the venue's real
+    /// address limit and then reading the rate-limit answer as a
+    /// transport problem.
+    #[test]
+    fn every_request_that_may_have_left_the_host_counts_against_the_address() {
+        type R = Result<(u16, core::ops::Range<usize>), crate::http::PostErr>;
+        let ok: R = Ok((200, 0..1));
+        assert!(
+            HlExchange::<64>::counts_against_address(&ok),
+            "a success obviously left"
+        );
+
+        let after: R = Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Timeout,
+            left_host: true,
+        });
+        assert!(
+            HlExchange::<64>::counts_against_address(&after),
+            "THE case this exists for: the venue has it, we do not know what it did"
+        );
+
+        let before: R = Err(crate::http::PostErr::before_send(
+            crate::http::HttpErr::Dns,
+        ));
+        assert!(
+            !HlExchange::<64>::counts_against_address(&before),
+            "a request that never reached a socket is not an action"
+        );
+        // And the two are NOT distinguishable by the error variant,
+        // which is why the flag exists: `Disconnected` is both.
+        let d_before: R = Err(crate::http::PostErr::before_send(
+            crate::http::HttpErr::Disconnected,
+        ));
+        let d_after: R = Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Disconnected,
+            left_host: true,
+        });
+        assert!(!HlExchange::<64>::counts_against_address(&d_before));
+        assert!(HlExchange::<64>::counts_against_address(&d_after));
+    }
+
+    /// The predicate reaching the governor. Asserted here rather than
+    /// only through a socket, because the failure this guards is a
+    /// silent one: the budget simply reads lower than the venue's own
+    /// count, and nothing says so until a rate-limit answer arrives
+    /// looking like a transport problem.
+    #[test]
+    fn a_post_that_left_the_host_spends_budget_even_when_it_failed() {
+        let mut x = exchange_at("127.0.0.1");
+        let before = x.budget.spent();
+
+        x.count_post(&Err(crate::http::PostErr::before_send(
+            crate::http::HttpErr::Dns,
+        )));
+        assert_eq!(x.budget.spent(), before, "nothing left, nothing spent");
+
+        x.count_post(&Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Timeout,
+            left_host: true,
+        }));
+        assert_eq!(
+            x.budget.spent(),
+            before + 1,
+            "the venue has it — it is spent whether or not we read the answer"
+        );
+
+        x.count_post(&Ok((200, 0..1)));
+        assert_eq!(x.budget.spent(), before + 2);
+    }
+
+    /// The other half, end to end through `send_action`: a submit
+    /// that could not reach a socket at all spends nothing.
+    ///
+    /// Driven at a port with no listener, so the connect fails before
+    /// any byte is written — the one failure shape reachable without
+    /// a server. The post-write half is pinned by the TLS loopback
+    /// suite (`a_mid_body_disconnect_…`, `a_stalled_server_…`), which
+    /// asserts `left_host` on a server that has already read the
+    /// request.
+    #[test]
+    fn a_submit_that_never_reached_a_socket_spends_no_budget() {
+        let mut x = exchange_at("127.0.0.1");
+        x.assets.bind(7, 100_000_001, 1, b"#1").expect("bind");
+        let before = x.budget.spent();
+        let e = x.submit(&order(7, core_fill::ORDER_KIND_IOC));
+        assert!(e.is_err(), "nothing is listening, so nothing was sent");
+        assert_eq!(
+            x.budget.spent(),
+            before,
+            "a request that never left must not be charged to the address"
+        );
+        assert_eq!(x.counters.sent_unanswered, 0, "and nothing is in doubt");
     }
 
     /// **A REPEAT of the live roll retires nothing.** The venue

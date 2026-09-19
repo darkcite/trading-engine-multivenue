@@ -1544,15 +1544,19 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
             println!(
                 "{{\"old_cloid\":\"{old}\",\"new_cloid\":\"{new}\",\"placed_oid\":{},\
                  \"modified_oid\":{},\"old_cancel_refused\":{},\"new_cancel_succeeded\":{},\
-                 \"unswept_old\":{},\"unswept_new\":{},\"stopped\":{},\"passed\":{}}}",
+                 \"unswept_old\":{},\"unswept_new\":{},\"new_resting\":{},\"old_resting\":{},\
+                 \"readback_failed\":{},\"stopped\":{},\"passed\":{}}}",
                 r.placed_oid,
                 r.modified_oid,
                 r.old_cancel_refused,
                 r.new_cancel_succeeded,
                 r.unswept_old,
                 r.unswept_new,
+                r.new_resting,
+                r.old_resting,
+                r.readback_failed,
                 r.stopped.is_some(),
-                r.passed()
+                r.passed() && r.confirmed_by_venue()
             );
             if r.has_unswept() {
                 error!(
@@ -1585,6 +1589,41 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
                     "exec-smoke: PHASE F — the modify consumed the old order and left NOTHING \
                      under the new id. A requote that can lose the quote is worse than a cancel \
                      plus a place."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            // §7.1's own evidence, ahead of the catch-all: the two
+            // cancel outcomes above are INFERENCES about what was
+            // resting, and this is what the venue actually said.
+            if r.readback_failed {
+                error!(
+                    old = %old,
+                    new = %new,
+                    "exec-smoke: PHASE F — the orders were swept, but `frontendOpenOrders` \
+                     could not be read, so nothing observed the resting state directly. \
+                     Fail-closed: an unreadable answer is not a pass."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.new_resting || r.old_resting {
+                error!(
+                    old = %old,
+                    new = %new,
+                    new_resting = r.new_resting,
+                    old_resting = r.old_resting,
+                    "exec-smoke: PHASE F — the venue's own book disagrees with the cancels. \
+                     Exactly one order must rest, under the NEW id."
+                );
+                return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
+            }
+            if !r.confirmed_by_venue() {
+                error!(
+                    old = %old,
+                    new = %new,
+                    new_resting = r.new_resting,
+                    old_resting = r.old_resting,
+                    "exec-smoke: PHASE F — the cancels agree but the venue's own book does \
+                     not confirm it"
                 );
                 return ExitCode::from(exec_hyperliquid::EXIT_LIFECYCLE as u8);
             }

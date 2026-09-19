@@ -2305,3 +2305,93 @@ made that legible). `backtest --member bin15` will likewise produce
 different numbers than before — the maker no longer waits out a TTL to
 move — so **bin15 gate numbers measured before this commit are not
 comparable with ones measured after it.**
+
+### E5 — the budget counts what LEFT the host (2026-09-19)
+
+Carried forward from commit 2 and closed here. `send_action` called
+`on_action_sent()` **after** the `?` on `http.post`, so a request the
+venue received and answered unreadably — a stalled server, a
+connection that died mid-response — was never counted at all. The
+governor drifted OPTIMISTIC, which `budget.rs` names as the wrong
+direction: under-counting means exceeding the venue's real address
+limit and then reading the rate-limit answer as a transport problem.
+
+#### The fact lives where it is known, and the caller must look at it
+
+`HlHttp::post` now returns `PostErr { err, left_host }`. `left_host`
+cannot be derived from the `HttpErr` variant — `Disconnected` is both
+"the connect failed" (nothing left) and "the peer went away
+mid-response" (everything left), and `Timeout` covers the whole cycle.
+A classifier over the variants would have been a name describing a
+stronger property than its condition tests. So it is recorded inside
+the HTTP cycle at the moment the write is attempted, and returned in a
+struct every one of the fifteen call sites must destructure.
+
+#### A torn write COUNTS
+
+`left_host` is set before the write is attempted rather than after it
+returns. We cannot tell a write that died on its first byte from one
+that died on its last, and of the two ways to be wrong, sending fewer
+actions than the venue allows is the recoverable one. **This half is a
+documented choice rather than a tested one**: the TLS loopback cannot
+reliably produce a torn write — a small request fits in the kernel
+buffer and "succeeds" even into a dead socket — and a flaky gate is
+worse than a stated assumption.
+
+The two post-write failures that CAN be produced are tested:
+`a_mid_body_disconnect_…` and `a_stalled_server_…` both assert
+`left_host`.
+
+#### `sent_unanswered`
+
+New counter, and the most direct reason to run E6's reconciliation: an
+action reached the wire and nothing in this process knows what the
+venue did with it. There may be an order resting under an id no local
+book holds. Before this commit the same failure was invisible — it
+silently under-counted the budget instead. `HlExecCounters` grew from
+four cache lines to five to carry it.
+
+### E5 §7.1 — the two exit-gate items (2026-09-19)
+
+#### The alloc gate: `hl_exchange_requote_path_is_zero_alloc`
+
+Gate 60 drives `HlExchange::modify` — the arm's own verb, not the raw
+encoders — with the budget floor at `u64::MAX`, so `send_action`
+refuses at its barrier before any network work and only the encode
+half runs. `seal` (the nonce/signature/envelope half of `send_action`,
+split out for this) is driven beside it. Between them that is every
+instruction a requote executes on the engine thread; the socket is the
+only thing not covered, and gate 59 split `compare` for exactly the
+same reason.
+
+**`cancel_by_cloid` is deliberately not driven there.** It spends
+`Spend::Cancel`, and `may_cancel()` is unconditionally true — a halted
+engine must be able to flatten — so no budget setting can bar it. The
+first cut of this gate did drive it, and would have opened two
+thousand sockets to the live testnet; it was caught by the run
+hanging. The gate now asserts `modifies_sent == 0` and
+`refused_local >= 2000`, so the barrier holding is a fact the test
+states rather than one it assumes.
+
+#### Phase F asks the venue what is resting
+
+§7.1 asks for the resting order's final state from `orderUpdates`.
+Nothing parses those frames (the engine receives and skips them), so
+the evidence comes from `frontendOpenOrders` instead — the endpoint
+that echoes the cloid, which plain `openOrders` does not, and
+therefore the only one that can tell our order from a stranger's. It
+is read between the modify and the cancels, because a cancel destroys
+the thing being observed.
+
+**`confirmed_by_venue()` is a separate verdict from `passed()`**, and
+deliberately so. `passed()` is the LAW E-7 asymmetry as the two
+cancels show it, and a scripted loopback can produce those answers.
+The readback needs a book containing our own timestamp-derived cloid,
+which only a real run has. One predicate covering both would have had
+to be satisfiable offline, and would have stopped meaning what its
+name says. `exec-smoke --requote` requires both.
+
+`new_resting` is required as a POSITIVE sighting. `!old_resting` alone
+would also hold for a readback that found nothing at all — the
+"agreement over an empty set" this lane shipped once already in E4's
+reconciliation, and the loopback now pins it with an empty book.

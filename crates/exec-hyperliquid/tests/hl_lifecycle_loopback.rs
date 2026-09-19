@@ -42,6 +42,18 @@ const MODIFIED: &[u8] =
 const CANCELLED: &[u8] =
     br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#;
 const ALREADY_GONE: &[u8] = br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"error":"Order was never placed, already canceled, or filled."}]}}}"#;
+/// §7.1's readback, as this loopback can answer it: a book holding
+/// somebody else's order.
+///
+/// It CANNOT hold ours. `run_requote_on` derives both cloids from a
+/// millisecond nobody typed, so a canned body has no way to name
+/// them — which is exactly why `confirmed_by_venue` is a separate
+/// verdict from `passed` and why only a real testnet run can satisfy
+/// it. What this fixture does pin is the half that matters offline:
+/// a stranger's resting order is never mistaken for ours.
+const OPEN_STRANGER: &[u8] =
+    br##"[{"coin":"#32530","oid":99,"cloid":"0xabababababababababababababababab"}]"##;
+
 const FILLED: &[u8] =
     br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"oid":999,"totalSz":"10","avgPx":"0.5"}}]}}}"#;
 const REJECTED: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order could not immediately match against any resting orders."}]}}}"#;
@@ -551,7 +563,7 @@ fn every_request_carries_a_distinct_nonce() {
 /// requests: place, modify, and two cancels that ARE the assertion.
 #[test]
 fn a_requote_passes_only_when_the_order_actually_moved() {
-    let (port, tls, served) = boot(&[PLACED, MODIFIED, ALREADY_GONE, CANCELLED]);
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, OPEN_STRANGER, ALREADY_GONE, CANCELLED]);
     let mut http = client(port, tls);
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("requote");
 
@@ -559,7 +571,21 @@ fn a_requote_passes_only_when_the_order_actually_moved() {
     assert!(r.old_cancel_refused, "cancelling the old id was refused");
     assert!(r.new_cancel_succeeded, "cancelling the new id succeeded");
     assert_eq!(r.placed_oid, 424242);
-    assert_eq!(served.load(Ordering::SeqCst), 4, "place, modify, verify, cleanup");
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        5,
+        "place, modify, READBACK, verify, cleanup"
+    );
+    // §7.1's readback ran, and found a stranger's order rather than
+    // ours — which is all a canned body CAN hold, since both cloids
+    // come from a millisecond nobody typed. So the venue-confirmation
+    // verdict is false here, and it is a SEPARATE verdict from
+    // `passed` precisely so that this test can still assert the LAW
+    // E-7 asymmetry it is named for.
+    assert!(!r.readback_failed, "the book was read");
+    assert!(!r.new_resting, "a stranger's cloid is not ours");
+    assert!(!r.old_resting);
+    assert!(!r.confirmed_by_venue(), "only a real venue can confirm it");
 }
 
 /// **A modify that left BOTH orders resting is a leak, not a requote.**
@@ -568,7 +594,7 @@ fn a_requote_passes_only_when_the_order_actually_moved() {
 /// pass while two quotes sat on the book under one intent.
 #[test]
 fn a_modify_that_left_both_orders_resting_is_not_a_requote() {
-    let (port, tls, served) = boot(&[PLACED, MODIFIED, CANCELLED, CANCELLED]);
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, OPEN_STRANGER, CANCELLED, CANCELLED]);
     let mut http = client(port, tls);
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("the venue answered");
 
@@ -577,7 +603,7 @@ fn a_modify_that_left_both_orders_resting_is_not_a_requote() {
     assert!(!r.passed());
     // And BOTH were still swept: the cancels are the cleanup, so the
     // failing path does not strand the very order it just found.
-    assert_eq!(served.load(Ordering::SeqCst), 4);
+    assert_eq!(served.load(Ordering::SeqCst), 5);
 }
 
 /// **A modify that killed the old order and created nothing** is the
@@ -585,7 +611,7 @@ fn a_modify_that_left_both_orders_resting_is_not_a_requote() {
 /// looks exactly like success — but nothing answers to the new one.
 #[test]
 fn a_modify_that_created_nothing_is_not_a_requote_either() {
-    let (port, tls, _) = boot(&[PLACED, MODIFIED, ALREADY_GONE, ALREADY_GONE]);
+    let (port, tls, _) = boot(&[PLACED, MODIFIED, OPEN_STRANGER, ALREADY_GONE, ALREADY_GONE]);
     let mut http = client(port, tls);
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("the venue answered");
 
@@ -626,7 +652,7 @@ fn a_requote_that_fills_sweeps_both_ids_rather_than_only_the_old_one() {
 #[test]
 fn a_cancel_that_never_answers_is_reported_with_the_id_to_go_and_find() {
     // Three bodies for four requests: the last cancel gets no answer.
-    let (port, tls, served) = boot(&[PLACED, MODIFIED, ALREADY_GONE]);
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, OPEN_STRANGER, ALREADY_GONE]);
     let mut http = client(port, tls);
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
 
@@ -639,7 +665,7 @@ fn a_cancel_that_never_answers_is_reported_with_the_id_to_go_and_find() {
     // And the id is IN the report, which is the whole recovery path.
     assert_eq!(r.new_cloid.len(), 16);
     assert_ne!(r.new_cloid, r.old_cloid, "two distinct ids, both named");
-    assert_eq!(served.load(Ordering::SeqCst), 3);
+    assert_eq!(served.load(Ordering::SeqCst), 4, "the readback runs first");
 }
 
 /// The mainnet guard, on this seam too — checked rather than assumed
@@ -654,7 +680,7 @@ fn a_cancel_that_never_answers_is_reported_with_the_id_to_go_and_find() {
 /// case answers the third request.
 #[test]
 fn both_ids_go_unswept_when_the_socket_dies_before_either_cancel() {
-    let (port, tls, served) = boot(&[PLACED, MODIFIED]);
+    let (port, tls, served) = boot(&[PLACED, MODIFIED, OPEN_EMPTY]);
     let mut http = client(port, tls);
     let r = run_requote_on(&cfg(), &mut http, spec()).expect("a stop is not an Err");
 
@@ -667,7 +693,13 @@ fn both_ids_go_unswept_when_the_socket_dies_before_either_cancel() {
     // Both ids are named, which is the entire recovery path.
     assert_ne!(r.old_cloid, r.new_cloid);
     assert_eq!(r.old_cloid[0], 0xE3, "a probe id, not one of ours");
-    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert_eq!(served.load(Ordering::SeqCst), 3, "place, modify, readback");
+    // An EMPTY book is not confirmation of anything. `!old_resting`
+    // alone would have read as success here — the "agreement over an
+    // empty set" E4's reconciliation shipped once already.
+    assert!(!r.new_resting);
+    assert!(!r.old_resting);
+    assert!(!r.confirmed_by_venue());
 }
 
 /// A place whose answer never comes back cannot tell whether the order

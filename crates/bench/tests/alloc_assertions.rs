@@ -6481,6 +6481,191 @@ fn hl_exchange_roll_hook_is_zero_alloc() {
     assert_eq!(x.counters().rolls_refused, 0);
 }
 
+/// **E5 gate 60 — the per-REQUOTE path through the exchange arm.**
+///
+/// §7.1's exit gate asks for a modify entry at 0 B/op.
+/// `hl_action_encode_sign` already pins the raw encoders; this one
+/// goes through `HlExchange`'s OWN `modify` and `cancel_by_cloid`,
+/// which is what actually runs when Arm B reprices — asset lookup,
+/// the scale guards, the cloid builder, the wire structs, msgpack and
+/// JSON — plus `seal`, the nonce/signature/envelope half of
+/// `send_action`.
+///
+/// **It cannot cross the socket**, and neither could gate 59, which
+/// split `compare` out for exactly this reason and said why: a path
+/// that has only ever run behind an HTTPS round trip is a claim about
+/// source code. So the two halves either side of the socket are
+/// driven directly:
+///
+/// * `modify` runs with the budget's floor at `u64::MAX`, so
+///   `send_action` refuses at its barrier BEFORE any network work —
+///   the encode half runs, the post does not;
+/// * `seal` is called on its own with the bytes that verb produces.
+///
+/// Between them that is every instruction a requote executes on the
+/// engine thread.
+///
+/// **`cancel_by_cloid` is deliberately NOT driven here.** It spends
+/// `Spend::Cancel`, and `may_cancel()` is unconditionally true —
+/// a halted engine must be able to flatten — so no budget setting can
+/// bar it, and driving it would have this gate open two thousand
+/// sockets to the live testnet. Its encode half is pinned by
+/// `hl_action_encode_sign`, which drives `encode_cancel_by_cloid`
+/// through `sign_action` directly. The assertion below that the
+/// barrier really held is what keeps this gate honest about it.
+#[test]
+fn hl_exchange_requote_path_is_zero_alloc() {
+    use clob_dispatcher::OrderDispatch;
+    use core_ring::Ring;
+    use core_types::{ChannelEvent, ChannelId, Fill, Order, Price, Qty, Side, VenueId};
+    use exec_hyperliquid::config::{HlConfig, Scope};
+    use exec_hyperliquid::exchange::HlExchange;
+
+    const OUTCOME: u32 = 19_418;
+    const SYM: u32 = 4096;
+
+    fn roll(outcome: u32, sym: u32) -> ChannelEvent {
+        let seq = u64::from(outcome) | (60u64 << 32);
+        ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym,
+            seq,
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+
+    fn quote(px: i64, oid_seq: u64) -> Order {
+        // The instance rides the low 32 bits (`OID_INSTANCE_MASK`), so
+        // the asset lookup can refuse an order naming a retired one —
+        // LAW E-4. A requote's id must carry the LIVE instance.
+        let client_oid = (oid_seq << 32) | u64::from(OUTCOME);
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            SYM,
+            Side::Bid,
+            0, // ORDER_KIND_MAKER
+            Price::from_raw(px),
+            Qty::from_raw(25_000_000),
+            client_oid,
+        );
+        o.strategy_id = 3;
+        o
+    }
+
+    let cfg = HlConfig::new(
+        Scope::Testnet,
+        exec_hyperliquid::config::HOST_TESTNET,
+        'b',
+        [0x57; 32],
+        [0x58; 20],
+    )
+    .expect("cfg");
+    let (p, _c) = Ring::<Fill, 64>::new().split();
+    let mut x = HlExchange::<64>::new(
+        &cfg,
+        core_net::TlsTransport::default_client_config(),
+        p,
+        std::env::temp_dir().join(format!("mv-gate60-{}.state", std::process::id())),
+        // The floor at the ceiling: every SUBMIT-spending verb is
+        // refused at the barrier, so nothing reaches a socket. The
+        // encode half still runs, which is the half being measured.
+        u64::MAX,
+    )
+    .expect("build");
+    x.on_venue_event(&roll(OUTCOME, SYM));
+
+    // Prime: the first pass through the signing context and the
+    // EIP-712 domain separator is boot, not the hot path.
+    let mut body = [0u8; exec_hyperliquid::http::MAX_REQ_BODY];
+    let _ = x.modify(1 << 32 | u64::from(OUTCOME), &quote(470_000, 1));
+    {
+        let mut mp = [0u8; exec_hyperliquid::action::MAX_ACTION];
+        let n = exec_hyperliquid::action::encode_order(
+            &mut mp,
+            &[exec_hyperliquid::action::OrderWire::new(
+                100_000_000,
+                true,
+                47_000_000,
+                100_000_000,
+                exec_hyperliquid::action::Tif::Alo,
+            )],
+            b"na",
+        )
+        .expect("warm encode");
+        let _ = x.seal(&mp[..n], b"{}", &mut body).expect("warm seal");
+    }
+
+    let mut mp = [0u8; exec_hyperliquid::action::MAX_ACTION];
+    let mpn = exec_hyperliquid::action::encode_order(
+        &mut mp,
+        &[exec_hyperliquid::action::OrderWire::new(
+            100_000_000,
+            true,
+            47_000_000,
+            100_000_000,
+            exec_hyperliquid::action::Tif::Alo,
+        )],
+        b"na",
+    )
+    .expect("encode");
+
+    let g = AllocGuard::new();
+    let mut sealed: u64 = 0;
+    let mut i = 1u64;
+    while i <= 2_000 {
+        let prev = (i << 32) | u64::from(OUTCOME);
+        // LAW E-7: the requote itself, through the arm's own verb.
+        let _ = x.modify(prev, &quote(470_000 + (i as i64 % 50) * 100, i + 1));
+        // And the half `send_action` does after it, before the post.
+        let n = x.seal(&mp[..mpn], b"{}", &mut body).expect("seal");
+        sealed = sealed.wrapping_add(n as u64);
+        i += 1;
+    }
+    std::hint::black_box((sealed, x.counters()));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "hl exchange requote path allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hl exchange requote path bytes: saw {bytes}");
+    assert!(sealed > 0, "the envelope half must actually have run");
+    // And the verbs must really have reached their encode, not bounced
+    // off the asset table — a gate over a lookup failure would measure
+    // an early return and call it a requote.
+    assert_eq!(
+        x.counters().rolls_bound, 1,
+        "the leg must be bound, or `modify` refuses before it encodes"
+    );
+    assert_eq!(
+        x.counters().refused_stale, 0,
+        "and the instance must be the live one"
+    );
+    // **THE assertion that keeps this gate off the network.** The
+    // barrier is what stops `modify` before the socket, and it is a
+    // property of `Spend::Submit` meeting a floor — not of anything
+    // this test can see directly. If a future change routed the
+    // requote through `Spend::Cancel`, which `may_cancel()` permits
+    // unconditionally, this gate would quietly start opening two
+    // thousand sockets to the live testnet. It would still pass on
+    // allocations. So the refusal is counted, not assumed.
+    assert_eq!(
+        x.counters().modifies_sent,
+        0,
+        "nothing may reach the venue from an allocation gate"
+    );
+    assert!(
+        x.counters().refused_local >= 2_000,
+        "the budget barrier must have refused every one: {}",
+        x.counters().refused_local
+    );
+}
+
 /// E4 gate 59 — the reconciler's COMPARISON allocates nothing.
 ///
 /// `reconcile()` itself needs a socket, so what is measured here is the

@@ -421,7 +421,7 @@ fn post(
     let mut body = [0u8; MAX_REQ_BODY];
     let n = envelope(&mut body, action_json, nonce, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(SmokeErr::Http)?;
+    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     match scan(slice).map_err(|_| SmokeErr::Unreadable)? {
@@ -928,6 +928,25 @@ pub struct RequoteReport {
     pub unswept_old: bool,
     /// The NEW id's cancel never got an answer. Same.
     pub unswept_new: bool,
+    /// **The venue's own answer.** `frontendOpenOrders`, read after
+    /// the modify and before either cancel, showed an order resting
+    /// under the NEW cloid.
+    ///
+    /// This is the §7.1 evidence: the resting order's state asked of
+    /// the venue rather than inferred from what two cancels did.
+    /// `frontendOpenOrders` is the endpoint that echoes the cloid —
+    /// plain `openOrders` does not — so it is the only one that can
+    /// tell our order from a stranger's.
+    pub new_resting: bool,
+    /// The same readback showed an order still under the OLD cloid.
+    /// **Must be false**: the modify consumed it.
+    pub old_resting: bool,
+    /// The readback itself could not be made or could not be read, so
+    /// neither field above is evidence of anything. Kept apart from
+    /// "nothing was resting" on purpose — an empty answer read as a
+    /// clean result is the failure E4's reconciliation already made
+    /// once.
+    pub readback_failed: bool,
     /// Why the run stopped short, if it did. `Err` from
     /// [`run_requote_on`] means **nothing was placed**; once there is an
     /// order on the book the failure rides here, with the report that
@@ -946,6 +965,30 @@ impl RequoteReport {
             && !self.unswept_old
             && !self.unswept_new
             && self.stopped.is_none()
+    }
+
+    /// **§7.1's own evidence: the VENUE's book, not our inferences.**
+    ///
+    /// Exactly one order resting, under the NEW cloid, as
+    /// `frontendOpenOrders` reported it between the modify and the
+    /// cancels.
+    ///
+    /// Kept apart from [`Self::passed`] because the two test
+    /// different things and only one of them can be tested without a
+    /// venue: `passed` is the LAW E-7 asymmetry as the two cancels
+    /// show it, and a scripted loopback can produce those answers.
+    /// This one needs a book with our own timestamp-derived cloid in
+    /// it, which only a real run has. A single predicate covering
+    /// both would have had to be satisfiable offline, and would have
+    /// stopped meaning what its name says.
+    ///
+    /// `new_resting` is required as a POSITIVE sighting. `!old_resting`
+    /// on its own would also hold for a readback that found nothing at
+    /// all — the "agreement over an empty set" this lane has already
+    /// shipped once, in E4's reconciliation.
+    #[must_use]
+    pub const fn confirmed_by_venue(&self) -> bool {
+        self.new_resting && !self.old_resting && !self.readback_failed
     }
 
     /// An id whose cancel went unanswered — go and look for it.
@@ -1059,6 +1102,9 @@ pub fn run_requote_on(
         new_cancel_succeeded: false,
         unswept_old: false,
         unswept_new: false,
+        new_resting: false,
+        old_resting: false,
+        readback_failed: false,
         stopped: None,
     };
 
@@ -1128,6 +1174,36 @@ pub fn run_requote_on(
         match modify_to_cloid(http, &sk, cfg, &mut nonces, spec, old, new) {
             Ok(oid) => rep.modified_oid = oid,
             Err(e) => rep.stopped = Some(e),
+        }
+    }
+
+    // ---- §7.1: ASK THE VENUE what is resting ------------------------
+    //
+    // Before either cancel, because a cancel destroys the thing being
+    // observed. The two cancel outcomes below are indirect — the
+    // report's own field docs say so — and this is the direct answer:
+    // `frontendOpenOrders` echoes the cloid, so it can name OUR order.
+    //
+    // A failure here is recorded and does NOT stop the run: the sweep
+    // below is what takes the orders back, and skipping it over a
+    // failed read would strand them.
+    if rep.stopped.is_none() {
+        let mut rows = [crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS];
+        match enumerate(http, cfg, &mut rows) {
+            Ok((k, _body)) => {
+                let mut i = 0usize;
+                while i < k {
+                    if let Some(c) = rows[i].cloid {
+                        if c == new {
+                            rep.new_resting = true;
+                        } else if c == old {
+                            rep.old_resting = true;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            Err(_) => rep.readback_failed = true,
         }
     }
 
@@ -1536,7 +1612,7 @@ fn enumerate(
         .map_err(|_| SmokeErr::Encode)?;
     let (_status, range) = http
         .post_to(crate::http::INFO_PATH, &req[..n])
-        .map_err(SmokeErr::Http)?;
+        .map_err(|e| SmokeErr::Http(e.err))?;
     let body = http.resp()[range].to_vec();
     // Fail-closed: an unreadable answer is NOT "nothing is resting".
     let k = crate::recon::scan_open_orders(&body, rows).map_err(|_| SmokeErr::Unreadable)?;
@@ -1911,7 +1987,7 @@ pub fn run_recon(
         .map_err(|_| SmokeErr::Encode)?;
     let (_status, range) = http
         .post_to(crate::http::INFO_PATH, &req[..n])
-        .map_err(SmokeErr::Http)?;
+        .map_err(|e| SmokeErr::Http(e.err))?;
     let body = &http.resp()[range];
     let mut bal = vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES];
     let rows = crate::recon::scan_spot_state(body, &mut bal).map_err(|_| SmokeErr::Unreadable)?;

@@ -354,7 +354,7 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let mut body = [0u8; MAX_REQ_BODY];
     let n = envelope(&mut body, &aj[..aj_n], nonce_a, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(SmokeErr::Http)?;
+    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     let agent_hex = crate::config::hex20(&cfg.agent_addr);
@@ -391,7 +391,7 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     bad[40] ^= 0x01;
     let n = envelope(&mut body, &aj[..aj_n], nonce_b, &bad, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(SmokeErr::Http)?;
+    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     let (corruption_rejected, corruption_message) =
