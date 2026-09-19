@@ -180,10 +180,32 @@ class Bars(typing.NamedTuple):
 
 
 def _open_candles(path: pathlib.Path) -> sqlite3.Connection | None:
+    """Open `candles.db` for reading, and REFUSE to write to it.
+
+    Not ``?mode=ro``. MEASURED on the operator's live databases
+    2026-09-20: a read-only URI connection cannot open a WAL database that
+    has un-checkpointed content and no live ``-shm``, because attaching to
+    the WAL means creating that shared-memory file and a read-only
+    connection may not. It fails with "unable to open database file" —
+    intermittently, depending on whether a writer happens to be holding
+    the database at that instant.
+
+    That failure is silent in the worst way: `bars_for` would return None,
+    every resolution would stay pending, and after 48 h the whole
+    scorecard would quietly become `unresolvable`. It was invisible in
+    tests because a tmp database built by `sqlite3.connect` uses a
+    rollback journal, not WAL.
+
+    ``PRAGMA query_only`` is the stronger guarantee anyway: SQLite itself
+    refuses a write on this connection ("attempt to write a readonly
+    database"), and it works whatever the journal mode.
+    """
     try:
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA query_only = 1")
     except sqlite3.Error:
         return None
+    return conn
 
 
 def close_at(

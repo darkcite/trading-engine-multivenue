@@ -284,6 +284,55 @@ def test_intent_fill_strict_cross_candle_proxy(tmp_path: pathlib.Path) -> None:
         conn.close()
 
 
+def test_resolution_reads_a_WAL_candles_db(tmp_path: pathlib.Path) -> None:
+    """MEASURED on the operator's live databases 2026-09-20, and the reason
+    this test exists: `candles.db` runs in WAL, and a `?mode=ro` URI
+    connection CANNOT open a WAL database that has un-checkpointed content
+    and no live `-shm` — it fails with "unable to open database file",
+    intermittently, depending on whether a writer happens to be holding it.
+
+    The failure was silent in the worst direction: no bars, every
+    resolution pending, the whole scorecard quietly `unresolvable` after
+    48 h. It was invisible to every other test in this file because a tmp
+    database built by `sqlite3.connect` uses a rollback journal, not WAL.
+    So this one builds a real WAL database with un-checkpointed content,
+    the way the operator's actually looks.
+    """
+    _candles(tmp_path, _flat_then(35.0))
+    path = tmp_path / "worker" / "candles.db"
+    writer = sqlite3.connect(str(path))
+    assert writer.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    writer.execute(
+        "INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (VENUE, DESCRIPTOR, "1m", (NOW + 2000) * 1000, 1.0, 1.0, 1.0, 1.0, 0.0, 1, "t", 0),
+    )
+    writer.commit()
+    # The writer stays OPEN across the resolve — which is both what holds
+    # un-checkpointed content in the WAL and what the hourly candles cycle
+    # actually looks like from here.
+    try:
+        assert (path.parent / (path.name + "-wal")).exists(), "un-checkpointed WAL content"
+        with _store(tmp_path) as store:
+            _open_label(store, "up")
+            stats = claude_worker.news.resolve.resolve_due(store, _paths(tmp_path), NOW + 3600)
+            assert stats.resolved == 1, "a WAL candles.db must still resolve"
+            row = store.resolutions_resolved(0)[0]
+            assert int(typing.cast(int, row["hit"])) == 1
+    finally:
+        writer.close()
+
+    # ...and the connection SQLite hands back refuses writes itself.
+    conn = claude_worker.news.resolve._open_candles(path)
+    assert conn is not None
+    try:
+        conn.execute("DELETE FROM candles WHERE 0")
+        raise AssertionError("the read connection allowed a write")
+    except sqlite3.OperationalError as error:
+        assert "readonly" in str(error)
+    finally:
+        conn.close()
+
+
 # ---- the scorecard --------------------------------------------------------
 
 
