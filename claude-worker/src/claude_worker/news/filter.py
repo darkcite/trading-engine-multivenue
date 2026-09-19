@@ -175,15 +175,27 @@ class Vocabulary:
     #: offering "delist" as an asset would be a prompt that lies. Defaulted
     #: so a test may build a vocabulary with no assets at all.
     #:
-    #: Quote-suffixed duplicates are dropped (`BTCUSDT` when `BTC` is
-    #: present). Measured 2026-09-20 on the operator's real universe: 281
-    #: entries, of which 122 were a base asset repeated with `USDT` — 43 %
-    #: of a list that rides every tier-1 prompt, and an ambiguity for a
-    #: model asked to name "the asset" while offered both. `base_asset`
-    #: already strips the quote on the manifest path; the market-map path
-    #: does not, and this is where the two are reconciled without touching
-    #: the tier-0 patterns (whose measured 48 % pass rate depends on
-    #: `entries` staying exactly as it is).
+    #: Derived from the INSTRUMENT MANIFEST only, in ticker form, sorted,
+    #: without the quote-suffixed duplicate of a base asset already present.
+    #:
+    #: Manifest-only is the load-bearing part. `entries` also derives from the
+    #: market map, which carries whole Polymarket QUESTION TITLES — measured
+    #: 2026-09-20 on the operator's real universe, offering `entries` as the
+    #: tier-1 asset list put `BITCOIN UP OR DOWN ON AUGUST 22?` and the bare
+    #: words `AFTER`, `AUGUST`, `DECREASE`, `MEETING`, `RATES` into a closed
+    #: list of ASSETS — and `parse_triage_v2` would have accepted `AUGUST` as
+    #: one, after which it becomes part of a story KEY and stories cluster on
+    #: it. The manifest is where `base_asset` already strips properly: 130
+    #: clean tickers instead of 159 entries of which 11 were sentences.
+    #:
+    #: Market-map names stay in `entries` and both patterns, untouched: tier 0
+    #: SHOULD pass an item about the Fed, and that is what those titles buy.
+    #: Quote-suffixed duplicates are dropped too (`BTCUSDT` when `BTC` is
+    #: present): 122 of the first 281 entries were a base asset repeated with
+    #: `USDT`, an ambiguity for a model asked to name "the asset" while
+    #: offered both. A quote-suffixed name whose stem is too short to be
+    #: derived at all (`ARUSDT`, stem `ar`) STAYS — it is the engine's only
+    #: spelling for that market.
     assets: tuple[str, ...] = ()
 
     def hits(self, text: str) -> int:
@@ -231,6 +243,7 @@ def build_vocabulary(
     """Assemble the vocabulary from the three derived sources plus the
     operator's event keywords (spec §7.4)."""
     derived: set[str] = set()
+    tradable: set[str] = set()
     words: set[str] = set()
     for name in market_names:
         for part in _SPLIT_RE.split(str(name).strip().lower()):
@@ -239,6 +252,7 @@ def build_vocabulary(
     for descriptor in descriptors:
         if _keep_derived(base_asset(str(descriptor))):
             derived.add(base_asset(str(descriptor)))
+            tradable.add(base_asset(str(descriptor)))
     for i in range(len(VENUE_WORDS)):
         words.add(VENUE_WORDS[i])
     for keyword in keywords:
@@ -248,11 +262,12 @@ def build_vocabulary(
     # A name that is BOTH a venue and a derived token stays a word: the venue
     # is what an article means by it.
     derived -= words
+    tradable -= words
     return Vocabulary(
         entries=frozenset(derived | words),
         pattern=_alternation(words, upper=False),
         ticker_pattern=_alternation(derived, upper=True),
-        assets=asset_list(derived),
+        assets=asset_list(tradable),
     )
 
 

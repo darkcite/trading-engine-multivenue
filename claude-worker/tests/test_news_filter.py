@@ -300,16 +300,48 @@ def test_the_asset_list_is_tickers_only_and_drops_quote_duplicates() -> None:
     the asset while offered both `AAVE` and `AAVEUSDT`.
     """
     vocab = claude_worker.news.filter.build_vocabulary(
-        ("binance-usdm:btcusdt", "okx:ETH-USDT-SWAP", "SOLUSDC"),
-        ("binance-usdm:btcusdt", "deribit:BTC-PERPETUAL"),
-        ("delist", "insolvency"),
+        market_names=(
+            "binance-usdm:btcusdt",
+            "okx:ETH-USDT-SWAP",
+            "Bitcoin up or down on August 22?",
+        ),
+        descriptors=(
+            "binance-usdm:btcusdt",
+            "okx:ETH-USDT-SWAP",
+            "binance-usdm:arusdt",
+            "deribit:BTC-PERPETUAL",
+        ),
+        keywords=("delist", "insolvency"),
     )
     assert "BTC" in vocab.assets
     assert "BTCUSDT" not in vocab.assets, "the base asset is already there"
     assert "ETH" in vocab.assets
-    # A quote-suffixed name whose stem is NOT derived stays: it is the only
-    # spelling the engine has for that market.
-    assert "SOLUSDC" in vocab.assets
+    # A quote-suffixed name whose stem is too short to be derived at all
+    # (`ar`) stays: it is the only spelling the engine has for that market.
+    assert "ARUSDT" in vocab.assets
+    # THE one that matters. The market map carries whole Polymarket question
+    # titles; offering them — or the words inside them — as ASSETS would let
+    # `parse_triage_v2` accept `AUGUST` as an asset, after which it becomes
+    # part of a story key and stories cluster on it.
+    for noise in ("BITCOIN UP OR DOWN ON AUGUST 22?", "AUGUST", "DOWN", "BITCOIN"):
+        assert noise not in vocab.assets, noise
+    assert not [a for a in vocab.assets if " " in a or "?" in a]
+    # ...but tier 0's vocabulary still CARRIES all of it, which is the point
+    # of the split: `entries` is unchanged, so nothing about tier 0's measured
+    # behaviour moves.
+    assert "bitcoin up or down on august 22?" in vocab.entries
+    # Worth recording what that entry is actually WORTH, since it is the
+    # reason the noise was in the asset list at all: a derived entry matches in
+    # ticker form only (the D8 two-pattern rule) AND the alternation is
+    # `\b`-anchored on both sides, so an entry ending in `?` can never match
+    # anything. A market-map question title therefore contributes nothing to
+    # tier 0 either. That is a separate question from this one and is NOT
+    # changed here — but it means dropping these from the asset list costs
+    # the lane nothing at all.
+    assert vocab.hits("Bitcoin up or down on August 22?") == 0
+    assert vocab.hits("BITCOIN UP OR DOWN ON AUGUST 22?") == 0
+    # The tokens that DO earn tier-0 hits are the tickers and the venue words.
+    assert vocab.hits("BTC and ETH halted on Binance after a delist notice") >= 4
     # Venue words and the operator's keywords are vocabulary, not assets.
     for word in ("BINANCE", "OKX", "DERIBIT", "DELIST", "INSOLVENCY"):
         assert word not in vocab.assets, word
