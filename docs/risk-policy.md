@@ -4298,9 +4298,10 @@ testnet outcome 20182, so the family existed there on 2026-09-19).
 Bars — the same shape as §9, on testnet:
 
 * **R0 (plumbing)** — `maker_enabled = 0`, `e_take_1e6 = 900000`,
-  `entry_usd_1e6 = 12000000` (NOT $10: the grid floors the size to
-  whole contracts and then refuses notional under $10, so a $10 entry
-  is `skipped_grid` at almost every ask — vault doc 21 §2.2), and, per
+  `entry_usd_1e6 = 12000000` (chosen 2026-09-19 under the then-believed
+  $10 venue floor; the floor is **1 USDC** — see "E4 phase D" above and
+  the 2026-09-19 migration entry — so `$2` is the smallest entry that
+  survives whole-contract flooring at every ask ≥ 0.50), and, per
   the operator's 2026-09-19 ruling for the testnet account (1,000 USDC,
   trade within 500, as many winning bids as possible even if small):
   `cap_day_usd_1e6 = 500000000`, `cap_instance_usd_1e6 = 20000000`,

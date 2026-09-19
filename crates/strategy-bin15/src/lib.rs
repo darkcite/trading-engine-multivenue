@@ -126,8 +126,12 @@ pub const GRID_PX_MIN_1E6: i64 = 1_000;
 /// Highest quotable binary price ×1e6 (0.999).
 pub const GRID_PX_MAX_1E6: i64 = 999_000;
 
-/// Minimum order notional ×1e6 ($10).
-pub const GRID_MIN_NOTIONAL_1E6: i128 = 10_000_000;
+/// Minimum order notional ×1e6 ($1). MEASURED, not read from a doc:
+/// the venue refuses `Order must have minimum value of 1 USDC.` (testnet,
+/// 2026-09-15 size 1 @ 0.68 and 2026-09-19 3 @ 0.30; 4 @ 0.30 = $1.20
+/// rests). The $10 this carried until 2026-09-19 was the PERPS rule
+/// copied from third-party docs — `docs/risk-policy.md` "E4 phase D".
+pub const GRID_MIN_NOTIONAL_1E6: i128 = 1_000_000;
 
 /// One whole payout ×1e6 — a binary settles at 0 or at this.
 pub const ONE_1E6: i64 = 1_000_000;
@@ -3850,7 +3854,7 @@ mod tests {
         // room does not produce a tiny order, it produces NO order.
         // Either guard may be the proximate refusal — the CAP when the
         // room reaches zero, the GRID when the residual buys fewer
-        // contracts than the venue's $10 minimum (the interaction O3
+        // contracts than the venue's $1 minimum (the interaction O3
         // documented in the harness). What must never happen is a
         // rounded-up order.
         //

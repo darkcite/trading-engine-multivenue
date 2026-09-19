@@ -645,7 +645,7 @@ pub struct ModelOutcome {
     pub settled_sym_orders_canceled: u64,
     /// BIN15 O3: orders refused because they missed the HIP-4 venue
     /// grid — off the 1e-4 price tick, a fractional contract, outside
-    /// the `[0.001, 0.999]` band, or under the 10 USDC minimum. The
+    /// the `[0.001, 0.999]` band, or under the 1 USDC minimum. The
     /// venue would have rejected them, so scoring them as fills would
     /// invent P&L the strategy could never have had. Prediction-class
     /// syms only; every other class is untouched.
@@ -698,8 +698,10 @@ pub const PREDICTION_LOT_1E6: i64 = 1_000_000;
 pub const PREDICTION_PX_MIN_1E6: i64 = 1_000;
 /// Upper end of the band.
 pub const PREDICTION_PX_MAX_1E6: i64 = 999_000;
-/// Minimum order notional: 10 USDC, ×1e6.
-pub const PREDICTION_MIN_NOTIONAL_1E6: i64 = 10_000_000;
+/// Minimum order notional: 1 USDC, ×1e6 — the venue's measured refusal
+/// `Order must have minimum value of 1 USDC.` (2026-09-15/19; was $10,
+/// the perps rule, until 2026-09-19 — see `docs/migration.md`).
+pub const PREDICTION_MIN_NOTIONAL_1E6: i64 = 1_000_000;
 
 /// One instance's settlement schedule on a ROLLING slot.
 ///
@@ -2594,13 +2596,14 @@ mod tests {
         let sym = hl_slot_sym();
         let mut e = binary_engine();
         // Off the 1e-4 tick; a fractional contract; below the band;
-        // above the band; under the 10 USDC minimum.
+        // above the band; under the 1 USDC minimum ($0.50, then $0.99).
         for (px, qty) in [
             (500_050i64, 100_000_000i64),
             (500_000, 100_500_000),
             (900, 100_000_000),
             (999_100, 100_000_000),
             (500_000, 1_000_000),
+            (330_000, 3_000_000),
         ] {
             e.intake(&order(sym, Side::Bid, px, qty, 1), 1);
         }
@@ -2608,18 +2611,18 @@ mod tests {
         e.on_record(&crossing_tick(), 10, 1, &mut out);
         assert!(out.is_empty(), "nothing off-grid may fill");
         let o = e.finish();
-        assert_eq!(o.prediction_grid_refused, 5);
+        assert_eq!(o.prediction_grid_refused, 6);
         assert_eq!(o.fills_total, 0);
 
         // The band's edges and the exact minimum are LEGAL — and the
-        // two constraints INTERACT: at 0.001 the 10 USDC floor takes
-        // 10 000 contracts, so a 100-lot order at the bottom of the
+        // two constraints INTERACT: at 0.001 the 1 USDC floor takes
+        // 1 000 contracts, so a 100-lot order at the bottom of the
         // band is refused for its notional, not for its price.
         let mut e = binary_engine();
         e.intake(&order(sym, Side::Bid, 999_000, 100_000_000, 1), 1);
-        e.intake(&order(sym, Side::Bid, 1_000, 10_000_000_000, 2), 2);
-        // 0.50 x 20 contracts = exactly $10.
-        e.intake(&order(sym, Side::Bid, 500_000, 20_000_000, 3), 3);
+        e.intake(&order(sym, Side::Bid, 1_000, 1_000_000_000, 2), 2);
+        // 0.50 x 2 contracts = exactly $1.
+        e.intake(&order(sym, Side::Bid, 500_000, 2_000_000, 3), 3);
         assert_eq!(e.finish().prediction_grid_refused, 0);
         let mut e = binary_engine();
         e.intake(&order(sym, Side::Bid, 1_000, 100_000_000, 1), 1);

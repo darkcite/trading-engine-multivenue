@@ -6,6 +6,39 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — HIP-4 minimum order notional: $10 → **1 USDC** in `GRID_MIN_NOTIONAL_1E6` and `PREDICTION_MIN_NOTIONAL_1E6`
+
+**No wire-format change, no file-layout change, no config key change.**
+Two constants move: `strategy_bin15::GRID_MIN_NOTIONAL_1E6` (the member's
+`on_grid` check) and `cli::backtest::fill::PREDICTION_MIN_NOTIONAL_1E6`
+(the harness's O3 grid refusal), both `10_000_000` → `1_000_000`.
+
+Why: the venue's floor was MEASURED at 1 USDC twice — 2026-09-15 (E4
+phase D: size 1 @ 0.68 = $0.68 refused `Order must have minimum value of
+1 USDC.`, 2 @ 0.68 filled) and 2026-09-19 (testnet 15415: 4 @ 0.30 =
+$1.20 placed/modified/cancelled, 3 @ 0.30 = $0.90 refused with the same
+string). The $10 came from third-party docs on 2026-09-12 (the PERPS
+rule) and survived the measurement because the measurement was recorded
+in `docs/risk-policy.md` and never carried into the constants.
+
+Ripple — the member: `emit_take` still floors the size to whole
+contracts, then `on_grid` requires notional ≥ $1. The smallest
+`entry_usd_1e6` that survives at EVERY ask ≥ 0.50 is now **$2**
+(`2000000`: the floored order lands in [$1.33, $2.00]); `$1` itself
+breaches the floor at every ask that does not divide it (0.51 → 1
+contract = $0.51, refused). The R0 artifact's `$12` was sized for the
+wrong floor and is a ceiling, not a requirement.
+
+Ripple — the harness: a prediction-class order with notional in
+[$1, $10) that was `prediction_grid_refused` before now fills (subject
+to every other law). `backtest` / `audit-pnl` numbers on a root that
+contains such orders differ from any report produced before this entry;
+every BIN15 artifact run to date sized entries at ≥ $12, so the
+recorded reports should be unchanged in practice (verify on a bounded
+window before quoting one). Every existing root still
+replays byte for byte — the capture is untouched; only the scorer's
+refusal threshold moved.
+
 ## 2026-09-19 — Deribit spot rows subscribe `quote` + `book` only (no `trades`); capture carries no Trade rows for `BTC_USDC`
 
 **No wire-format change, no file-layout change, no config change.** The
@@ -28,6 +61,28 @@ anyway. Nothing in the engine, the harness or the worker reads a Deribit spot
 print; the spot row exists for its BBO (`quote`) and `book` capture (WS6).
 Offline surfaces that counted Deribit event rows by channel see the spot Trade
 series end at 2026-09-17T16:07Z.
+
+## 2026-09-19 — the Hyperliquid ingress announces BOOT-bound rolling families with one created `InstrumentRoll` at the first Steady (E7 R0)
+
+**No wire or format change; one more record per boot.** `bind_live`
+binds each family's live instance into the coin table before the ingress
+thread starts, but no `InstrumentRoll` event was ever written for it —
+and that event is the only way the bin15 member and the exec arm's
+asset table learn which instance a slot means. They stayed dormant until
+the venue's next `outcomeCreated` push: ≤ 15 min for the 15-minute
+family, up to a day for a daily one, so with three restarts a day the
+daily families were live for the member ~2.5 h in 24 (zero daily-family
+fills across six paper days, vault doc 21).
+
+Now `run_loop::emit_boot_rolls` writes, ONCE per process at the first
+Steady (never on a reconnect — `Bin15Strategy::bind` flattens the
+instance it rebinds), a created roll per non-dormant family, in exactly
+the shape `perform_roll` writes. Offline readers already take "the newest
+created roll at or before the instant" (`claude_worker.hip4.instance_at`),
+so a boot roll for an instance the previous run also announced is read as
+what it is. `hl-events.pmlr` of a run therefore starts with up to eight
+roll rows; `rolls_total` (the ingress counter) does NOT count them — it
+still counts venue rolls only.
 
 ## 2026-09-19 — `bin15.toml` gains an OPTIONAL `entry_min_px_1e6` (the coverage entry's price floor); `BIN15_KEYS` 24 → 25 (BIN15 R0)
 
@@ -54,12 +109,12 @@ law (`entry=every-15m@$12<=p_hat-2c&ask>=50c`; unchanged at 0),
 was re-rendered — one added line). `bin15_ref` / the parity fixture are
 untouched: the pricer did not change.
 
-Also recorded here because it bites at R0: `entry_usd_1e6 = 10000000`
-($10) would submit almost nothing — `emit_take` floors the size to whole
-contracts and `on_grid` then requires notional ≥ $10, so at every ask
-that does not divide $10 exactly the floored order is under the venue
-minimum and is `skipped_grid`. The smallest entry that survives the
-floor at every price is $11; the R0 artifact uses $12.
+Also recorded here because it bites at R0: `emit_take` floors the size
+to whole contracts and `on_grid` then requires notional ≥
+`GRID_MIN_NOTIONAL_1E6`, so an entry that does not divide the floor
+exactly can land under it and be `skipped_grid`. (Written on 2026-09-19
+against a $10 floor, which was wrong — the venue's floor is 1 USDC; the
+corrected arithmetic is in the next entry.)
 
 ## 2026-09-19 — Real-execution lane E5–E7: `Order.verb`@42 + `prev_client_oid`@56, `Fill.flags`@15, `HaltSignal` 32 → 40 B, `ExecCounters` grows, `/state` `exec` gains `ledger_*`/`arm_*`, `exec.toml` gains a REQUIRED `halt_on_recon_stale_ms`, `core-metrics::MAX_COUNTERS` 256 → 512
 
