@@ -3237,6 +3237,197 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------
+// HIP-4: the roll `venue_seq` codec, and the netting rule
+// ---------------------------------------------------------------
+//
+// Both of these had FOUR writers between them before E6. The codec
+// was restated in `ingress_hyperliquid::family`, `exec_hyperliquid`,
+// `cli::backtest::binary` and `strategy_bin15`, each one carrying a
+// comment explaining that it could not import the others: §6.1 forbids
+// the execution crates depending on the market-data crate, and the
+// harness must not depend on an ingress crate at all. Every one of
+// those reasons is a reason to live HERE — this crate has no
+// dependencies and every one of those four already depends on it.
+//
+// `exec_router` needing the same two in E6 would have made a FIFTH
+// copy. The risk review's ruling on `net_exposure_1e8` — reuse it,
+// do not restate it — is what this section is.
+
+/// `venue_seq` bit 56..64 for an instance the ingress says was CREATED.
+pub const ROLL_KIND_CREATED: u8 = 0;
+/// `venue_seq` bit 56..64 for an instance the ingress says SETTLED.
+pub const ROLL_KIND_SETTLED: u8 = 1;
+
+/// Pack a `ChannelId::InstrumentRoll` event's `venue_seq`.
+///
+/// Bits 0..32 the **outcome id** (NOT `enc` — a consumer that does the
+/// `× 10 + side` itself would name a real other market if handed
+/// `enc`), 32..48 TWAP seconds, 48..56 family index, 56..64 the kind
+/// byte ([`ROLL_KIND_CREATED`] / [`ROLL_KIND_SETTLED`]).
+///
+/// The ingress is the only writer. `claude_worker.hip4` reads the same
+/// layout from Python and is a FROZEN surface, so this table is a wire
+/// fact: changing it breaks a reader this workspace cannot recompile.
+#[inline]
+#[must_use]
+pub const fn pack_roll_seq(outcome: u32, twap_s: u32, family_idx: usize, settled: bool) -> u64 {
+    (outcome as u64)
+        | ((twap_s as u64 & 0xFFFF) << 32)
+        | ((family_idx as u64 & 0xFF) << 48)
+        | ((settled as u64) << 56)
+}
+
+/// Inverse of [`pack_roll_seq`] — `(outcome, twap_s, family_idx, settled)`.
+///
+/// **`settled` is the kind byte masked to its low bit**, which is what
+/// three of the four pre-E6 copies did. It cannot distinguish "the
+/// ingress said settled" from "the top byte holds something no packer
+/// of ours writes"; a caller that must tell those apart reads
+/// [`roll_kind`] instead and refuses the third case. See
+/// `the_two_readings_of_the_kind_byte_agree_only_where_the_packer_writes`.
+#[inline]
+#[must_use]
+pub const fn unpack_roll_seq(seq: u64) -> (u32, u32, usize, bool) {
+    (
+        (seq & 0xFFFF_FFFF) as u32,
+        ((seq >> 32) & 0xFFFF) as u32,
+        ((seq >> 48) & 0xFF) as usize,
+        ((seq >> 56) & 1) != 0,
+    )
+}
+
+/// The WHOLE kind byte of a roll `venue_seq`, unmasked.
+///
+/// [`pack_roll_seq`] only ever writes [`ROLL_KIND_CREATED`] or
+/// [`ROLL_KIND_SETTLED`] here, so any other value came from something
+/// that is not our ingress. Returning the raw byte rather than a
+/// `bool` is what lets a caller REFUSE that frame instead of guessing
+/// which of the two it meant — and guessing is what the low-bit mask
+/// in [`unpack_roll_seq`] does.
+#[inline]
+#[must_use]
+pub const fn roll_kind(seq: u64) -> u8 {
+    ((seq >> 56) & 0xFF) as u8
+}
+
+/// HIP-4 exposure for one outcome: `|yes − no|`.
+///
+/// Equal legs are riskless collateral — one pays $1 and the other $0
+/// whichever way the instance settles — so they net to nothing. Every
+/// risk gate that spells "how much is at stake on this outcome" must
+/// call THIS, so that two gates can never disagree about what a
+/// position is worth.
+///
+/// Scale-agnostic: the name says 1e8 because that is the venue's own
+/// quantity scale and the reconciler's, but the arithmetic is a
+/// subtract and an absolute value, so 1e6 engine quantities net
+/// identically. `exec_router`'s ledger passes 1e6.
+#[inline(always)]
+#[must_use]
+pub const fn net_exposure_1e8(yes_1e8: i64, no_1e8: i64) -> i64 {
+    yes_1e8.saturating_sub(no_1e8).saturating_abs()
+}
+
+#[cfg(test)]
+mod roll_codec_tests {
+    use super::*;
+
+    #[test]
+    fn the_codec_round_trips_every_field() {
+        let seq = pack_roll_seq(20_182, 60, 3, true);
+        assert_eq!(unpack_roll_seq(seq), (20_182, 60, 3, true));
+        let seq = pack_roll_seq(2649, 900, 0, false);
+        assert_eq!(unpack_roll_seq(seq), (2649, 900, 0, false));
+    }
+
+    #[test]
+    fn the_fields_do_not_bleed_into_each_other() {
+        // Every field at its maximum AT ONCE. A shift or mask that is
+        // one bit wide in the wrong place shows up here and nowhere
+        // else — a round trip of one field at a time passes happily
+        // while the outcome eats the TWAP.
+        let seq = pack_roll_seq(u32::MAX, 0xFFFF, 0xFF, true);
+        assert_eq!(unpack_roll_seq(seq), (u32::MAX, 0xFFFF, 0xFF, true));
+        assert_eq!(roll_kind(seq), ROLL_KIND_SETTLED);
+    }
+
+    #[test]
+    fn the_packer_writes_only_the_two_defined_kinds() {
+        // The premise the strict reading rests on. If the packer could
+        // put anything else in the top byte, `roll_kind`'s refusal
+        // would be refusing our own ingress.
+        for settled in [false, true] {
+            let seq = pack_roll_seq(u32::MAX, 0xFFFF, 0xFF, settled);
+            let k = roll_kind(seq);
+            assert!(
+                k == ROLL_KIND_CREATED || k == ROLL_KIND_SETTLED,
+                "packer wrote kind byte {k}"
+            );
+        }
+    }
+
+    /// The divergence that four copies hid, stated as a fact.
+    ///
+    /// `unpack_roll_seq` masks the kind byte to its low bit;
+    /// `strategy_bin15::on_roll` compares the WHOLE byte against 1.
+    /// Over everything [`pack_roll_seq`] can produce the two agree —
+    /// which is why nothing has ever caught fire. They part company on
+    /// a top byte no packer of ours writes, and there the masking
+    /// reading calls `0x03` "settled" while the whole-byte reading
+    /// calls it "created". Neither is right: the frame is malformed,
+    /// and [`roll_kind`] is what lets a caller say so.
+    #[test]
+    fn the_two_readings_of_the_kind_byte_agree_only_where_the_packer_writes() {
+        // Agreement, over the packer's whole range.
+        for settled in [false, true] {
+            let seq = pack_roll_seq(7, 60, 1, settled);
+            let masked = unpack_roll_seq(seq).3;
+            let whole = roll_kind(seq) == ROLL_KIND_SETTLED;
+            assert_eq!(masked, whole, "readings differ inside the packer's range");
+        }
+        // Disagreement, immediately outside it. Asserting the
+        // disagreement rather than assuming it: if a later change made
+        // the two readings identical everywhere, this test must fail
+        // and take its own docs with it.
+        let bad = pack_roll_seq(7, 60, 1, false) | (0x03u64 << 56);
+        assert!(unpack_roll_seq(bad).3, "low-bit reading calls 0x03 settled");
+        assert_ne!(
+            roll_kind(bad),
+            ROLL_KIND_SETTLED,
+            "whole-byte reading does not call 0x03 settled"
+        );
+        assert_ne!(
+            roll_kind(bad),
+            ROLL_KIND_CREATED,
+            "and does not call it created either — it is neither"
+        );
+    }
+
+    #[test]
+    fn equal_legs_are_riskless() {
+        assert_eq!(net_exposure_1e8(10, 10), 0);
+        assert_eq!(net_exposure_1e8(0, 0), 0);
+    }
+
+    #[test]
+    fn netting_ignores_which_leg_is_longer() {
+        assert_eq!(net_exposure_1e8(10, 4), 6);
+        assert_eq!(net_exposure_1e8(4, 10), 6);
+    }
+
+    #[test]
+    fn netting_saturates_rather_than_wrapping() {
+        // `i64::MIN - i64::MAX` is not representable, and `-i64::MIN`
+        // is not either. A wrapping subtract here yields a SMALL
+        // magnitude for the largest possible disagreement, which is a
+        // risk gate reporting nothing at stake at the worst moment.
+        assert_eq!(net_exposure_1e8(i64::MIN, i64::MAX), i64::MAX);
+        assert_eq!(net_exposure_1e8(i64::MAX, i64::MIN), i64::MAX);
+        assert_eq!(net_exposure_1e8(i64::MIN, 0), i64::MAX);
+    }
+}
+
+// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 

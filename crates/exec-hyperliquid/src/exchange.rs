@@ -1558,18 +1558,25 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
 
 /// The `InstrumentRoll` `venue_seq` layout, bits 0..32 and 56.
 ///
-/// **Duplicated from `ingress_hyperliquid::family::pack_roll_seq`, not
-/// imported** — §6.1 forbids this crate depending on the market-data
-/// crate, and `strategy_bin15` re-writes the same unpack for the same
-/// reason. `a_hand_built_roll_seq_unpacks_the_way_the_ingress_packs_it`
-/// is what keeps the three in agreement.
+/// E6: no longer duplicated. §6.1 forbids this crate depending on the
+/// market-data crate, which is why the unpack was restated here — but
+/// the codec now lives in `core_types`, which this crate already
+/// depends on, so the restatement is gone and this is the projection
+/// onto the two fields the asset binding needs.
 ///
 /// Bits 0..32 are the **outcome id**, NOT `enc`. `AssetTable::asset_id`
 /// and `outcome_coin` do the `× 10 + side` themselves, so feeding them
 /// `enc` would be a silent tenfold error naming a real other market.
+///
+/// `settled` is `core_types::unpack_roll_seq`'s low-bit reading,
+/// BIT-IDENTICAL to what this function did before the move. Widening
+/// it to refuse a malformed kind byte (`core_types::roll_kind`) is a
+/// live-arm behaviour change and is deliberately NOT smuggled into a
+/// commit about the exposure ledger.
 #[inline]
 const fn unpack_roll(seq: u64) -> (u32, bool) {
-    ((seq & 0xFFFF_FFFF) as u32, (seq >> 56) & 1 == 1)
+    let (outcome, _twap_s, _family, settled) = core_types::unpack_roll_seq(seq);
+    (outcome, settled)
 }
 
 /// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.

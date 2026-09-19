@@ -430,6 +430,7 @@ mod tests {
 
     #[test]
     fn ai_ingress_sock_defaults_under_home() {
+        let _env = env_guard();
         // SAFETY: test-only env mutation; same pattern as the
         // expand_tilde tests below.
         unsafe {
@@ -445,6 +446,7 @@ mod tests {
 
     #[test]
     fn ai_ruleset_dir_defaults_under_home() {
+        let _env = env_guard();
         // SAFETY: test-only env mutation (module convention).
         unsafe {
             std::env::set_var("HOME", "/Users/testhome");
@@ -459,6 +461,7 @@ mod tests {
 
     #[test]
     fn ai_ruleset_dir_env_override_passes_through() {
+        let _env = env_guard();
         // SAFETY: test-only env mutation (module convention).
         unsafe {
             std::env::set_var("AI_RULESET_DIR", "/tmp/stage2-ai-test/rulesets");
@@ -472,6 +475,7 @@ mod tests {
 
     #[test]
     fn ai_ingress_sock_env_override_passes_through() {
+        let _env = env_guard();
         // SAFETY: test-only env mutation (module convention).
         unsafe {
             std::env::set_var("AI_INGRESS_SOCK", "/tmp/stage2-ai-test/ai.sock");
@@ -508,6 +512,7 @@ mod tests {
 
     #[test]
     fn expand_tilde_happy_path_uses_home() {
+        let _env = env_guard();
         // SAFETY: test-only env mutation; see module note above.
         unsafe {
             std::env::set_var("HOME", "/Users/testhome");
@@ -522,6 +527,7 @@ mod tests {
 
     #[test]
     fn expand_tilde_without_home_is_missing_error() {
+        let _env = env_guard();
         let saved = std::env::var("HOME").ok();
         // SAFETY: test-only env mutation; see module note above.
         unsafe {
@@ -551,6 +557,30 @@ mod tests {
     // Phase-8e per-venue host fields
     // -----------------------------------------------------------
 
+    /// **Serialises every test in this module that mutates process
+    /// env.**
+    ///
+    /// `std::env` is process-global and `cargo test` runs a module's
+    /// tests on many threads, so two tests touching the same variable
+    /// race: `phase_8e_host_fields_use_defaults_when_unset` REMOVES
+    /// `OKX_WS_PUBLIC_HOST` while `..._honor_env_overrides` SETS it,
+    /// and whichever lands second decides what both of them read.
+    ///
+    /// The pair has always raced; it surfaced when an unrelated commit
+    /// added two tests to a sibling module and changed the schedule.
+    /// A flaky gate is worse than a missing one — it teaches an
+    /// operator to re-run until green — so the lock is taken by every
+    /// env-mutating test here rather than by the two that happened to
+    /// collide. Poisoning is ignored: a panicking test has already
+    /// failed, and refusing the lock afterwards would turn one failure
+    /// into every failure.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`ENV_LOCK`] for the rest of the calling test.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Set the four vars `Config::load` requires, for tests that don't
     /// care about their values.
     fn set_required_env() {
@@ -566,6 +596,7 @@ mod tests {
 
     #[test]
     fn phase_8e_host_fields_use_defaults_when_unset() {
+        let _env = env_guard();
         set_required_env();
         // SAFETY: test-only env mutation; see module note above.
         unsafe {
@@ -587,6 +618,7 @@ mod tests {
 
     #[test]
     fn phase_8e_host_fields_honor_env_overrides() {
+        let _env = env_guard();
         set_required_env();
         // SAFETY: test-only env mutation; see module note above.
         unsafe {

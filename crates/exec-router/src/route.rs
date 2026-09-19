@@ -80,6 +80,76 @@ impl core::fmt::Display for ExecRouteErr {
 
 impl std::error::Error for ExecRouteErr {}
 
+/// One slot's operator-set clamps, as a named group.
+///
+/// A struct rather than four more positional arguments to
+/// [`ExecRoute::set_slot`]. Three of the four are `i64` USD ×1e6 and
+/// the call sites sit in config plumbing where the values are read out
+/// of a parsed table in whatever order the struct happens to list
+/// them: transposing `cap_day` and `cap_instance` at a call site would
+/// compile, and the resulting engine would clamp a whole day's
+/// turnover at one instance's number without a single test noticing.
+/// Named fields make that transposition unwriteable.
+///
+/// `0` means UNSET for every field, which is what `exec.toml` means by
+/// omitting the key, and what an all-paper table carries. **Unset is
+/// not "unlimited"** — see [`ExecRoute::max_order_usd_1e6_at`] and the
+/// refusal it drives: a live slot with no cap refuses, because a cap
+/// the operator never wrote is not permission.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlotCaps {
+    /// Single-order notional clamp, USD ×1e6.
+    pub max_order_usd_1e6: i64,
+    /// **E6** — per-instance clamp, USD ×1e6, measured as NET
+    /// EXPOSURE (`|yes − no|` × $1 a contract), not as turnover.
+    pub cap_instance_usd_1e6: i64,
+    /// **E6** — day clamp, USD ×1e6, measured as filled BUY TURNOVER
+    /// and reset at 00:00Z. Cumulative within the day: unlike the
+    /// instance cap it does not fall as positions net off, because a
+    /// day cap that a member could churn under is not a day cap.
+    pub cap_day_usd_1e6: i64,
+    /// Open-order clamp, orders.
+    pub max_open_orders: u32,
+    /// Explicit tail padding, so the struct is 32 B and a future
+    /// `u32` clamp costs nothing.
+    _pad: u32,
+}
+
+impl SlotCaps {
+    /// Every clamp unset. Same as `Default`, but usable in `const`.
+    #[inline]
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            max_order_usd_1e6: 0,
+            cap_instance_usd_1e6: 0,
+            cap_day_usd_1e6: 0,
+            max_open_orders: 0,
+            _pad: 0,
+        }
+    }
+
+    /// Build a set of clamps. `const` so a boot table can be a
+    /// constant and a test can spell one inline.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        max_order_usd_1e6: i64,
+        cap_instance_usd_1e6: i64,
+        cap_day_usd_1e6: i64,
+        max_open_orders: u32,
+    ) -> Self {
+        Self {
+            max_order_usd_1e6,
+            cap_instance_usd_1e6,
+            cap_day_usd_1e6,
+            max_open_orders,
+            _pad: 0,
+        }
+    }
+}
+
 /// The per-slot routing decision, fixed at boot and never mutated
 /// afterwards (E6's kill switches flip counters and a halt flag, not
 /// this table — a halted slot refuses, it does not silently re-route).
@@ -96,11 +166,21 @@ pub struct ExecRoute {
     /// for the boot tell and `/state`; **enforced in E6** (the risk
     /// gate), which is the phase that owns clamping.
     max_order_usd_1e6: [i64; EXEC_SLOTS],
-    /// Per-slot open-order clamp. Same status as above.
+    /// Per-slot open-order clamp. Same status as above — **enforced
+    /// in E6** against the router's own resting count.
     max_open_orders: [u32; EXEC_SLOTS],
-    /// Pad to exactly two cache lines (128 B). Reserved for E6's
-    /// clamps; keeping the size fixed now means adding them later
-    /// does not move the hot arrays off line 0.
+    /// **E6** — per-slot per-instance clamp, USD x1e6, net exposure.
+    cap_instance_usd_1e6: [i64; EXEC_SLOTS],
+    /// **E6** — per-slot day clamp, USD x1e6, filled buy turnover.
+    cap_day_usd_1e6: [i64; EXEC_SLOTS],
+    /// Pad to exactly FOUR cache lines (256 B). E1 reserved 16 B here
+    /// "for E6's clamps"; E6 needs 128 B, so the struct grew by two
+    /// lines. What the reservation actually bought is what it was for:
+    /// the hot arrays did not move. `modes` and `venue_mask` are still
+    /// at offsets 0 and 8, so the per-submit lookup still costs ONE
+    /// line, and the E6 clamps — read only on the live arm, after the
+    /// mode branch has already resolved — sit on lines 2 and 3 where
+    /// a paper boot never touches them.
     _pad: [u8; 16],
 }
 
@@ -123,6 +203,8 @@ impl ExecRoute {
             venue_mask: [0u8; EXEC_SLOTS],
             max_order_usd_1e6: [0i64; EXEC_SLOTS],
             max_open_orders: [0u32; EXEC_SLOTS],
+            cap_instance_usd_1e6: [0i64; EXEC_SLOTS],
+            cap_day_usd_1e6: [0i64; EXEC_SLOTS],
             _pad: [0u8; 16],
         }
     }
@@ -140,8 +222,7 @@ impl ExecRoute {
         slot: usize,
         mode: ExecMode,
         venues: &[u8],
-        max_order_usd_1e6: i64,
-        max_open_orders: u32,
+        caps: SlotCaps,
     ) -> Result<(), ExecRouteErr> {
         if slot >= EXEC_SLOTS {
             return Err(ExecRouteErr::SlotOutOfRange(slot));
@@ -158,8 +239,10 @@ impl ExecRoute {
         }
         self.modes[slot] = mode.as_u8();
         self.venue_mask[slot] = mask;
-        self.max_order_usd_1e6[slot] = max_order_usd_1e6;
-        self.max_open_orders[slot] = max_open_orders;
+        self.max_order_usd_1e6[slot] = caps.max_order_usd_1e6;
+        self.max_open_orders[slot] = caps.max_open_orders;
+        self.cap_instance_usd_1e6[slot] = caps.cap_instance_usd_1e6;
+        self.cap_day_usd_1e6[slot] = caps.cap_day_usd_1e6;
         Ok(())
     }
 
@@ -274,6 +357,45 @@ impl ExecRoute {
         Some(self.max_open_orders[slot])
     }
 
+    /// **E6** — the slot's per-instance NET EXPOSURE clamp (USD x1e6).
+    /// Cold: read once per live submit, on the refusal path's side of
+    /// the mode branch.
+    #[inline]
+    #[must_use]
+    pub fn cap_instance_usd_1e6_at(&self, slot: usize) -> Option<i64> {
+        if slot >= EXEC_SLOTS {
+            return None;
+        }
+        Some(self.cap_instance_usd_1e6[slot])
+    }
+
+    /// **E6** — the slot's day TURNOVER clamp (USD x1e6). Cold.
+    #[inline]
+    #[must_use]
+    pub fn cap_day_usd_1e6_at(&self, slot: usize) -> Option<i64> {
+        if slot >= EXEC_SLOTS {
+            return None;
+        }
+        Some(self.cap_day_usd_1e6[slot])
+    }
+
+    /// All four of a slot's clamps at once. Cold; the boot tell and
+    /// `/state` want them together.
+    #[inline]
+    #[must_use]
+    pub fn caps_at(&self, slot: usize) -> Option<SlotCaps> {
+        if slot >= EXEC_SLOTS {
+            return None;
+        }
+        Some(SlotCaps {
+            max_order_usd_1e6: self.max_order_usd_1e6[slot],
+            cap_instance_usd_1e6: self.cap_instance_usd_1e6[slot],
+            cap_day_usd_1e6: self.cap_day_usd_1e6[slot],
+            max_open_orders: self.max_open_orders[slot],
+            _pad: 0,
+        })
+    }
+
     /// Is any slot live? Cold; decides whether the engine needs a live
     /// arm at all.
     #[inline]
@@ -289,8 +411,9 @@ mod tests {
     use core_types::{STRATEGY_ID_NONE, STRATEGY_SLOT_BIN15};
 
     #[test]
-    fn layout_is_two_cache_lines_with_the_hot_arrays_first() {
-        assert_eq!(core::mem::size_of::<ExecRoute>(), 128, "two cache lines");
+    fn layout_is_four_cache_lines_with_the_hot_arrays_first() {
+        assert_eq!(core::mem::size_of::<ExecRoute>(), 256, "four cache lines");
+        assert_eq!(core::mem::size_of::<SlotCaps>(), 32, "SlotCaps is 32 B");
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
         // The hot arrays must sit inside the FIRST cache line, or the
         // per-submit lookup costs two lines instead of one.
@@ -319,7 +442,7 @@ mod tests {
         // un-stamped order would inherit slot 7's mode — this is the
         // exact aliasing the `in_range` multiply exists to kill.
         let mut r = ExecRoute::all_paper();
-        r.set_slot(7, ExecMode::Live, &[4], 0, 0).unwrap();
+        r.set_slot(7, ExecMode::Live, &[4], SlotCaps::none()).unwrap();
         assert_eq!(r.mode(7), ExecMode::Live);
         assert_eq!(r.mode(STRATEGY_ID_NONE), ExecMode::Paper);
         assert!(!r.venue_allowed(STRATEGY_ID_NONE, 4));
@@ -329,7 +452,12 @@ mod tests {
     fn every_out_of_range_id_is_paper_whatever_the_table_says() {
         let mut r = ExecRoute::all_paper();
         for s in 0..EXEC_SLOTS {
-            r.set_slot(s, ExecMode::Live, &[0, 1, 2, 3, 4, 5, 6], i64::MAX, u32::MAX)
+            r.set_slot(
+                s,
+                ExecMode::Live,
+                &[0, 1, 2, 3, 4, 5, 6],
+                SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, u32::MAX),
+            )
                 .unwrap();
         }
         for id in 0u8..=255 {
@@ -347,7 +475,13 @@ mod tests {
         let mut r = ExecRoute::all_paper();
         let slot = STRATEGY_SLOT_BIN15 as usize;
         assert_eq!(slot, 3, "the plan's slot map");
-        r.set_slot(slot, ExecMode::Live, &[4], 100_000_000, 64).unwrap();
+        r.set_slot(
+            slot,
+            ExecMode::Live,
+            &[4],
+            SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+        )
+        .unwrap();
 
         assert_eq!(r.mode(3), ExecMode::Live);
         assert!(r.venue_allowed(3, 4), "hyperliquid");
@@ -369,7 +503,7 @@ mod tests {
     #[test]
     fn a_wild_venue_byte_never_panics_and_never_allows() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(3, ExecMode::Live, &[4], 0, 0).unwrap();
+        r.set_slot(3, ExecMode::Live, &[4], SlotCaps::none()).unwrap();
         // Bit 4 is set; without the `venue_ok` term, venue 12
         // (12 & 7 == 4) would alias onto it.
         for v in EXEC_VENUES..=255 {
@@ -380,7 +514,7 @@ mod tests {
     #[test]
     fn off_is_distinct_from_paper() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(6, ExecMode::Off, &[], 0, 0).unwrap();
+        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none()).unwrap();
         assert_eq!(r.mode(6), ExecMode::Off);
         assert_eq!(r.off_mask(), 0b0100_0000);
         assert_eq!(r.live_mask(), 0);
@@ -391,11 +525,11 @@ mod tests {
     fn out_of_range_writes_are_refused_not_wrapped() {
         let mut r = ExecRoute::all_paper();
         assert_eq!(
-            r.set_slot(EXEC_SLOTS, ExecMode::Live, &[4], 0, 0),
+            r.set_slot(EXEC_SLOTS, ExecMode::Live, &[4], SlotCaps::none()),
             Err(ExecRouteErr::SlotOutOfRange(EXEC_SLOTS))
         );
         assert_eq!(
-            r.set_slot(3, ExecMode::Live, &[EXEC_VENUES], 0, 0),
+            r.set_slot(3, ExecMode::Live, &[EXEC_VENUES], SlotCaps::none()),
             Err(ExecRouteErr::VenueOutOfRange(EXEC_VENUES))
         );
         // A refused write leaves the table untouched.
@@ -405,11 +539,30 @@ mod tests {
     #[test]
     fn caps_and_masks_round_trip_through_the_cold_accessors() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(3, ExecMode::Live, &[4, 6], 100_000_000, 64).unwrap();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[4, 6],
+            SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+        )
+        .unwrap();
         assert_eq!(r.mode_at(3), Some(ExecMode::Live));
         assert_eq!(r.venue_mask_at(3), Some(0b0101_0000));
         assert_eq!(r.max_order_usd_1e6_at(3), Some(100_000_000));
         assert_eq!(r.max_open_orders_at(3), Some(64));
+        // E6's two, which E1 parsed and carried nowhere.
+        assert_eq!(r.cap_instance_usd_1e6_at(3), Some(1_000_000_000));
+        assert_eq!(r.cap_day_usd_1e6_at(3), Some(30_000_000_000));
+        // And all four together, in the order `SlotCaps` names them —
+        // the point of the struct is that this line cannot silently
+        // transpose the two `i64` caps.
+        assert_eq!(
+            r.caps_at(3),
+            Some(SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64))
+        );
+        assert_eq!(r.cap_instance_usd_1e6_at(EXEC_SLOTS), None);
+        assert_eq!(r.cap_day_usd_1e6_at(EXEC_SLOTS), None);
+        assert_eq!(r.caps_at(EXEC_SLOTS), None);
         assert_eq!(r.mode_at(EXEC_SLOTS), None);
         assert_eq!(r.venue_mask_at(EXEC_SLOTS), None);
         assert_eq!(r.max_order_usd_1e6_at(EXEC_SLOTS), None);

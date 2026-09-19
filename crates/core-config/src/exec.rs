@@ -206,6 +206,23 @@ impl ExecSlot {
     }
 }
 
+/// `exec_router::LEDGER_RESTING`, mirrored.
+///
+/// The execution router holds every live slot's resting orders in one
+/// shared fixed array of this size. Duplicated rather than imported —
+/// `exec-router` depends on this crate, so the dependency cannot run
+/// the other way — and `cli::exec_boot` const-asserts the two agree,
+/// that crate being the one that depends on both.
+pub const LEDGER_RESTING_MIRROR: usize = 512;
+
+/// The most `max_open_orders` a single live slot may claim.
+///
+/// One slot's equal share of [`LEDGER_RESTING_MIRROR`]. Equal shares
+/// rather than a sum check because the slots are validated one at a
+/// time and independently: a sum rule would make a legal slot's
+/// legality depend on a later section of the file.
+pub const MAX_OPEN_ORDERS_PER_SLOT: usize = LEDGER_RESTING_MIRROR / EXEC_SLOTS;
+
 /// `exec.toml` as parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecFile {
@@ -419,6 +436,48 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
              `cap_instance_usd_1e6` — `0` means UNSET here, never \"unlimited\""
         )));
     }
+    // E6: the other two joined the rule when they stopped being
+    // decoration. Before E6 they were parsed and carried and read by
+    // nothing, so a live slot could omit them harmlessly; now they are
+    // clamps, and `exec_router::RoutedDispatcher::risk_check` refuses
+    // everything under a cap of 0 exactly as it does for the two
+    // above. A live slot that omitted one would therefore boot and
+    // then refuse every order it tried to place — which is safe, but
+    // it is a failure at the wrong end of the day. Refused at boot
+    // instead, where an operator is present.
+    if s.is_live() && s.cap_day_usd_1e6 == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` needs a non-zero \
+             `cap_day_usd_1e6` — `0` means UNSET here, never \"unlimited\""
+        )));
+    }
+    if s.is_live() && s.max_open_orders == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` needs a non-zero \
+             `max_open_orders` — `0` means UNSET here, never \"unlimited\""
+        )));
+    }
+    // E6: and it must fit the table the clamp is counted in.
+    //
+    // `exec_router::LEDGER_RESTING` holds every live slot's resting
+    // orders in ONE shared array. A slot allowed more than its share
+    // can fill that table, and a full table is a table that stops
+    // tracking — the clamp would be switched off by the very thing it
+    // depends on. The ledger fails closed when it happens, but the
+    // honest place to catch it is here, where the number is written.
+    //
+    // Restated rather than imported: `core-config` must not depend on
+    // `exec-router` (the dependency runs the other way).
+    // `cli::exec_boot` const-asserts the two in agreement.
+    if s.is_live() && s.max_open_orders as usize > MAX_OPEN_ORDERS_PER_SLOT {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `max_open_orders = {}` exceeds \
+             {MAX_OPEN_ORDERS_PER_SLOT}, this slot's share of the execution \
+             router's {LEDGER_RESTING_MIRROR}-row resting table. Past it the \
+             table fills and the clamp stops counting.",
+            s.max_open_orders
+        )));
+    }
 
     Ok(s)
 }
@@ -550,9 +609,14 @@ mode = "paper"
 "#;
 
     /// The smallest artifact that legally arms slot 3.
+    /// The smallest artifact that arms a live slot. **Every clamp is
+    /// here because every clamp is required** — E6 made the last two
+    /// enforceable, and `0` has always meant UNSET rather than
+    /// "unlimited".
     const MINIMAL_LIVE: &str = "[exec]\n[exec.slot.3]\nmode = \"live\"\nname = \"bin15\"\n\
          venues = [\"hyperliquid\"]\nmax_order_usd_1e6 = 100000000\n\
-         cap_instance_usd_1e6 = 1000000000\n";
+         cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
+         max_open_orders = 64\n";
 
     fn expect_err(src: &str, needle: &str) {
         let e = parse(src).expect_err("must refuse");
@@ -611,15 +675,33 @@ mode = "paper"
              max_order_usd_1e6 = 100000000\n",
             "needs a non-zero `cap_instance_usd_1e6`",
         );
+        // E6: the other two joined the rule when they became clamps.
+        // Before E6 a live slot could omit them and boot; now omitting
+        // one would boot a slot that refuses every order it places,
+        // which is safe but discovers itself at the wrong end of the
+        // day.
+        expect_err(
+            "[exec]\n[exec.slot.3]\nmode = \"live\"\nname = \"bin15\"\nvenues = [\"hyperliquid\"]\n\
+             max_order_usd_1e6 = 100000000\ncap_instance_usd_1e6 = 1000000000\n",
+            "needs a non-zero `cap_day_usd_1e6`",
+        );
+        expect_err(
+            "[exec]\n[exec.slot.3]\nmode = \"live\"\nname = \"bin15\"\nvenues = [\"hyperliquid\"]\n\
+             max_order_usd_1e6 = 100000000\ncap_instance_usd_1e6 = 1000000000\n\
+             cap_day_usd_1e6 = 30000000000\n",
+            "needs a non-zero `max_open_orders`",
+        );
         // A PAPER slot needs none of it.
         let f = parse("[exec]\n[exec.slot.3]\nmode = \"paper\"\n").unwrap();
         assert_eq!(f.slot(3).mode, "paper");
         assert!(f.slot(3).name.is_empty());
-        // The minimal legal live artifact carries all three.
+        // The minimal legal live artifact carries ALL FOUR.
         let f = parse(MINIMAL_LIVE).unwrap();
         assert_eq!(f.slot(3).name, "bin15");
         assert_eq!(f.slot(3).max_order_usd_1e6, 100_000_000);
         assert_eq!(f.slot(3).cap_instance_usd_1e6, 1_000_000_000);
+        assert_eq!(f.slot(3).cap_day_usd_1e6, 30_000_000_000);
+        assert_eq!(f.slot(3).max_open_orders, 64);
     }
 
     #[test]

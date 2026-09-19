@@ -738,6 +738,7 @@ name = "exec-router"
 version = "0.1.0"
 dependencies = [
  "clob-dispatcher",
+ "core-time",
  "core-types",
 ]
 

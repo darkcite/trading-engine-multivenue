@@ -141,21 +141,12 @@ pub fn instances_from_events(merged: &[MergedRec]) -> Vec<BinaryInstance> {
     out
 }
 
-/// `venue_seq` → `(outcome, twap_s, family, settled)`.
-///
-/// Restated here rather than imported from `ingress_hyperliquid`: the
-/// harness must not depend on an ingress crate, and the layout is the
-/// `ChannelId::InstrumentRoll` doc's table. `crates/cli/tests` pins
-/// the pair against the ingress packer.
-#[must_use]
-pub const fn unpack_roll_seq(seq: u64) -> (u32, u32, usize, bool) {
-    (
-        (seq & 0xFFFF_FFFF) as u32,
-        ((seq >> 32) & 0xFFFF) as u32,
-        ((seq >> 48) & 0xFF) as usize,
-        ((seq >> 56) & 1) != 0,
-    )
-}
+// E6: was restated here because the harness must not depend on an
+// ingress crate. It now lives in `core_types`, which the harness
+// already depends on, so the reason to copy is gone and the copy with
+// it. `crates/cli/tests` still pins the pair — against one function
+// now, which is the point.
+pub use core_types::unpack_roll_seq;
 
 /// Every Hyperliquid `Mark` row in the capture, per sym, wall-stamped
 /// and in file order.

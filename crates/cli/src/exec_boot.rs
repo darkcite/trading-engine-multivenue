@@ -41,7 +41,35 @@
 
 use std::path::{Path, PathBuf};
 
-use exec_router::{ExecMode, ExecRoute, EXEC_SLOTS};
+use exec_router::{ExecMode, ExecRoute, SlotCaps, EXEC_SLOTS};
+
+/// **E6 — the mirrored constants, held in agreement.**
+///
+/// `core_config::exec` refuses a live slot whose `max_open_orders`
+/// exceeds its share of `exec_router`'s shared resting table, and it
+/// has to restate that table's size: `exec-router` depends on
+/// `core-config`, so the dependency cannot run the other way.
+///
+/// This crate depends on BOTH, which makes it the one place the
+/// restatement can be checked. It matters in one direction
+/// especially: if `LEDGER_RESTING` were ever REDUCED, `core_config`
+/// would go on admitting eight slots of sixty-four into a smaller
+/// table and every one of them would ratchet into permanent refusal
+/// through the ledger's fail-closed path.
+///
+/// An earlier draft of the `core_config` comment claimed
+/// `exec_router::route::tests` already asserted this. It did not —
+/// which is worse than no check, because a false claim of coverage
+/// stops the next reader adding one.
+const _: () = assert!(
+    core_config::exec::LEDGER_RESTING_MIRROR == exec_router::LEDGER_RESTING,
+    "core_config::exec::LEDGER_RESTING_MIRROR is out of step with exec_router::LEDGER_RESTING"
+);
+const _: () = assert!(
+    core_config::exec::MAX_OPEN_ORDERS_PER_SLOT
+        == exec_router::LEDGER_RESTING / EXEC_SLOTS,
+    "the per-slot open-order share no longer divides the resting table"
+);
 use tracing::info;
 
 /// Venues this binary can actually dispatch to live.
@@ -264,13 +292,17 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                 slot,
                 mode,
                 &s.venues,
-                s.max_order_usd_1e6,
-                s.max_open_orders,
+                SlotCaps::new(
+                    s.max_order_usd_1e6,
+                    s.cap_instance_usd_1e6,
+                    s.cap_day_usd_1e6,
+                    s.max_open_orders,
+                ),
             )
             .map_err(|e| format!("exec: slot {slot}: {e}"))?;
-        // Keep every parsed number, not just the two the hot table
+        // Keep every parsed number, not just the FOUR the hot table
         // holds — the boot tell publishes all of them, and E4's budget
-        // governor and E6's risk gate read them from here.
+        // governor and E6's halt machine read the rest from here.
         slots.push(s);
     }
 
@@ -571,7 +603,12 @@ mod tests {
         // have executed before the day it mattered.
         let mut route = ExecRoute::all_paper();
         route
-            .set_slot(3, ExecMode::Live, &[4], 100_000_000, 64)
+            .set_slot(
+                3,
+                ExecMode::Live,
+                &[4],
+                SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+            )
             .unwrap();
         let mut slot = core_config::exec::ExecSlot::paper_default(3);
         slot.mode = String::from("live");

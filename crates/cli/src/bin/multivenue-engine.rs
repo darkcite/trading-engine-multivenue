@@ -3644,10 +3644,27 @@ fn run(args: RunArgs) -> ExitCode {
                     engine_loop_set_full(
                         cons,
                         engine_cfg,
+                        // E6: the anchor the venue-fill ledger's
+                        // 00:00Z day epoch needs. Taken HERE, at boot,
+                        // because an `Order`'s `ts_ns` is
+                        // `CLOCK_MONOTONIC_RAW` and the day cap is a
+                        // wall-clock fact; `strategy_bin15` anchors its
+                        // own day cap the same way.
+                        //
+                        // The ledger is deliberately left UNSEEDED: it
+                        // has not been reconciled against the venue, so
+                        // every live PLACE is refused until E6 commit 3
+                        // wires the reconciler to
+                        // `mark_ledger_seeded`. An `--exec` boot with a
+                        // live slot therefore trades nothing yet, and
+                        // says so on the first order rather than
+                        // clamping against a position it has never
+                        // seen.
                         exec_router::RoutedDispatcher::new(
                             eb.route,
                             clob_dispatcher::PaperDispatcher::new(),
                             exec_router::NullLiveDispatcher::new(),
+                            core_time::WallAnchor::now(),
                         ),
                         obs,
                         requested,

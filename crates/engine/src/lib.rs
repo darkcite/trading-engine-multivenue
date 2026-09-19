@@ -488,6 +488,20 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                             cap.append(&f);
                         }
                         self.recent_fills.push(f);
+                        // E6: THE DISPATCHER FIRST, for the reason the
+                        // venue-event drain below carries. A member
+                        // handed a fill may submit in the same call,
+                        // and the router's exposure ledger has to have
+                        // booked that fill before it judges the order
+                        // it causes — otherwise the first order after
+                        // a cap-filling trade is sized against the
+                        // position as it was BEFORE the trade, which
+                        // is exactly the order the cap exists to stop.
+                        //
+                        // This is also the ONLY way a venue fill
+                        // reaches the router at all: lane 3 is drained
+                        // here, not through `try_next_fill`.
+                        self.disp.on_fill_booked(&f);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
@@ -524,6 +538,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         cap.append(&f);
                     }
                     self.recent_fills.push(f);
+                    // E6: the pump's fills go through the same hook as
+                    // the lanes'. A PAPER fill is what comes out here,
+                    // and the ledger ignores it — but the filtering is
+                    // the ledger's single decision, made in one place,
+                    // rather than an omission at one of two call sites
+                    // that would read as "paper fills do not exist".
+                    self.disp.on_fill_booked(&f);
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
@@ -1992,6 +2013,9 @@ mod tests {
         fn on_venue_event(&mut self, _e: &ChannelEvent) {
             self.log.borrow_mut().push("dispatcher");
         }
+        fn on_fill_booked(&mut self, _f: &Fill) {
+            self.log.borrow_mut().push("dispatcher");
+        }
     }
 
     /// A member that SUBMITS on a roll — the case the ordering exists
@@ -2026,6 +2050,168 @@ mod tests {
             );
             let _ = ctx.submit(o);
         }
+    }
+
+    /// A member that SUBMITS on a fill — the case E6's fill-hook
+    /// ordering exists for.
+    struct SubmitsOnFill {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+    impl strategy_core::StrategyCounters for SubmitsOnFill {}
+    impl Strategy for SubmitsOnFill {
+        fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
+            Ok(())
+        }
+        fn on_tick<C: Ctx>(&mut self, _t: &Tick, _ctx: &mut C) {}
+        fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {}
+        fn on_timer<C: Ctx>(&mut self, _now: NsTs, _ctx: &mut C) {}
+        fn timer_period_ns(&self) -> u64 {
+            0
+        }
+        fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+        fn on_venue_event<C: Ctx>(&mut self, _e: &ChannelEvent, _ctx: &mut C) {}
+        fn on_fill<C: Ctx>(&mut self, _f: &Fill, ctx: &mut C) {
+            self.log.borrow_mut().push("strategy");
+            let o = Order::new(
+                1,
+                VenueId::Hyperliquid,
+                4096,
+                Side::Bid,
+                0,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                19_418,
+            );
+            let _ = ctx.submit(o);
+        }
+    }
+
+    /// **E6 — the same ordering property, for fills.**
+    ///
+    /// A fill changes what a slot has at stake, and the member handed
+    /// that fill may submit in the same call. If the strategy ran
+    /// first, the router's exposure ledger would size the refusal
+    /// against the position as it was BEFORE the trade — which is
+    /// exactly the order the cap exists to stop. Book, then act.
+    ///
+    /// Driven through fill LANE 3, which is the only path a venue fill
+    /// takes: `try_next_fill` carries the paper arm alone, so without
+    /// this hook a live fill reaches the router never.
+    #[test]
+    fn a_fill_is_booked_before_the_strategy_can_act_on_it() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (mut fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitsOnFill {
+                log: std::rc::Rc::clone(&log),
+            },
+            OrderWitness {
+                log: std::rc::Rc::clone(&log),
+            },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+
+        let f = Fill::new(10, 4096, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
+        fp[fill_lane_of(VenueId::Hyperliquid).unwrap()]
+            .try_push(f)
+            .unwrap();
+        eng.tick(16);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["dispatcher", "strategy", "submit"],
+            "the ledger must hold the fill BEFORE the member can trade on it"
+        );
+    }
+
+    /// The dispatcher's fill PUMP goes through the same hook.
+    ///
+    /// Not a duplicate of the test above: it is the other of the two
+    /// call sites, and an omission at one of them would read as
+    /// "paper fills do not exist" rather than as the deliberate
+    /// filtering the router does in one place.
+    #[test]
+    fn the_dispatcher_fill_pump_also_books_before_the_strategy_acts() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        /// A dispatcher that hands out exactly one fill from its own
+        /// pump, and logs both the pump hook and any submit.
+        struct PumpWitness {
+            log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+            left: usize,
+        }
+        impl OrderDispatch for PumpWitness {
+            fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+                self.log.borrow_mut().push("submit");
+                Ok(())
+            }
+            fn try_next_fill(&mut self) -> Option<Fill> {
+                if self.left == 0 {
+                    return None;
+                }
+                self.left -= 1;
+                Some(Fill::new(
+                    10,
+                    4096,
+                    Side::Bid,
+                    Price::from_raw(1),
+                    Qty::from_raw(1),
+                    7,
+                ))
+            }
+            fn stats(&self) -> DispatchStats {
+                DispatchStats::default()
+            }
+            fn on_fill_booked(&mut self, _f: &Fill) {
+                self.log.borrow_mut().push("dispatcher");
+            }
+        }
+
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitsOnFill {
+                log: std::rc::Rc::clone(&log),
+            },
+            PumpWitness {
+                log: std::rc::Rc::clone(&log),
+                left: 1,
+            },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        eng.tick(16);
+        assert_eq!(*log.borrow(), vec!["dispatcher", "strategy", "submit"]);
     }
 
     /// **The property the roll handler's whole design rests on.**

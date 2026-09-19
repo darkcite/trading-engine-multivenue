@@ -508,29 +508,12 @@ impl Default for HlFamilyTable {
     }
 }
 
-/// Pack a roll event's `venue_seq`: outcome id, TWAP seconds, family
-/// index, and whether the instance was created (0) or settled (1).
-/// The layout is the `ChannelId::InstrumentRoll` doc's table.
-#[inline]
-#[must_use]
-pub const fn pack_roll_seq(outcome: u32, twap_s: u32, family_idx: usize, settled: bool) -> u64 {
-    (outcome as u64)
-        | ((twap_s as u64 & 0xFFFF) << 32)
-        | ((family_idx as u64 & 0xFF) << 48)
-        | ((settled as u64) << 56)
-}
-
-/// Inverse of [`pack_roll_seq`] — `(outcome, twap_s, family_idx, settled)`.
-#[inline]
-#[must_use]
-pub const fn unpack_roll_seq(seq: u64) -> (u32, u32, usize, bool) {
-    (
-        (seq & 0xFFFF_FFFF) as u32,
-        ((seq >> 32) & 0xFFFF) as u32,
-        ((seq >> 48) & 0xFF) as usize,
-        ((seq >> 56) & 1) != 0,
-    )
-}
+// E6: the roll `venue_seq` codec moved to `core_types`, which has no
+// dependencies and which every crate that had restated it already
+// depends on. Re-exported under the names this crate has always
+// published, so no caller changes and the ingress is still the
+// obvious place to look for "how does a roll go on the wire".
+pub use core_types::{pack_roll_seq, unpack_roll_seq};
 
 #[cfg(test)]
 mod tests {

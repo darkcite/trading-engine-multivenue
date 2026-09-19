@@ -129,6 +129,21 @@ fn boot(bodies: &'static [&'static [u8]]) -> (u16, Arc<ClientConfig>, Arc<Atomic
                 total += n;
             }
 
+            // **Counted BEFORE the response goes out.** The request
+            // has been read in full by here, which is what "served"
+            // means; counting after the flush lets the CLIENT read the
+            // body, finish the test and assert on the counter before
+            // this thread gets to increment it.
+            //
+            // That is a real race and it fired: under a full-workspace
+            // run `the_whole_round_trip_passes_and_takes_exactly_four_requests`
+            // read 3 after asserting `verified_gone`, which can only be
+            // true if the fourth response had already arrived. A flaky
+            // gate is worse than a missing one — it teaches an operator
+            // to re-run until green — and this one would have been
+            // blamed on whatever commit happened to be in flight.
+            served_srv.fetch_add(1, Ordering::SeqCst);
+
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                 body.len()
@@ -137,7 +152,6 @@ fn boot(bodies: &'static [&'static [u8]]) -> (u16, Arc<ClientConfig>, Arc<Atomic
                 return;
             }
             let _ = stream.flush();
-            served_srv.fetch_add(1, Ordering::SeqCst);
         }
 
         // Hold the connection open until the CLIENT is finished with

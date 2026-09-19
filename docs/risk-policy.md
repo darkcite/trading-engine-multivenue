@@ -2491,3 +2491,602 @@ sixty-fourth order of a boot would be worse than no clamp: it would be
 a check whose name says "too many open" while its condition says
 "sixty-four have been sent", which is the defect shape this lane keeps
 finding.
+
+### E6 commit 2 — the venue-fill exposure ledger (2026-09-19)
+
+Commit 1 could enforce `max_order_usd` because a single order's
+notional is entirely contained in the request: nothing has to be
+remembered to judge it. The other three clamps are not like that.
+`cap_instance_usd`, `cap_day_usd` and `max_open_orders` all ask a
+question about the PAST, and the router had no memory of one.
+
+`exec_router::ledger` is that memory, and this commit gives all three
+a number to check against.
+
+#### The router could not see a live fill at all
+
+This is the fact the whole commit turns on, and it was not obvious.
+`OrderDispatch::on_venue_event` carries a `ChannelEvent` — market
+data, never a fill. `OrderDispatch::try_next_fill` carries the PAPER
+arm's fills only: `RoutedDispatcher` forwards it to `self.paper` and
+nothing else, because the live arm pushes into the engine's own fill
+lane 3 and the engine drains that lane directly (the "Where live fills
+come from" note in `exec_router::routed`).
+
+So the component that refuses orders against an exposure cap sat
+downstream of nothing that could tell it a position had changed. A new
+trait hook, `OrderDispatch::on_fill_booked`, closes that: the engine
+calls it from the fill-lane drain and from the dispatcher fill pump,
+in both cases **before** the strategy sees the same fill.
+
+That ordering is load-bearing, exactly as the roll handler's is. A
+member handed a fill may submit in the same call, and a ledger that
+had not yet booked it would size the refusal against the position as
+it was BEFORE the trade — which is precisely the order the cap exists
+to stop. `engine::tests::a_fill_is_booked_before_the_strategy_can_act_on_it`
+and its fill-pump twin pin it.
+
+#### A row is a FAMILY, not an outcome — and that was nearly wrong
+
+The first cut of this ledger keyed its rows on the **outcome id**. It
+would have failed open inside half an hour of live running, and the
+review that caught it raised the point as a *question* rather than a
+finding: "please state as a fact whether the outcome id is stable
+across instances; the whole sizing argument rests on it."
+
+It is not. `ingress_hyperliquid::run_loop::perform_roll` rebinds a
+**family** to a brand-new `HlOutcomeSpec` on every roll — new outcome
+id, new coins, new symbols. A BIN15 family rolls every fifteen
+minutes. So a table keyed on outcome id consumes a fresh row each
+roll and, with eight families and sixteen rows, is full after two of
+them. Then every bind is refused, every fill lands as
+`fills_unbound`, and `cap_instance` silently stops seeing the
+position it exists to bound.
+
+Keyed on the family index — which is the ingress's, shared across
+members, and is exactly what `strategy_bin15::on_roll` keys on — a
+roll REPLACES the row it already owns and the table never grows.
+`successive_instances_of_a_family_reuse_one_row` drives a hundred
+rolls of eight families and asserts `binds_refused == 0`.
+
+A **settled** roll is different from a created one here: it drops the
+resting orders (LAW E-8) and marks the row settled, but **keeps the
+binding and leaves the position alone**.
+
+The binding is kept because the ingress keeps the coins bound and
+subscribed on a settle for the same reason, and the venue reports
+SETTLEMENT down `userFills` like any other fill — a freed row would
+leave that fill counting as `fills_unbound`, a counter meaning "a
+position the router is not tracking", on the one event guaranteed to
+end every instance.
+
+The position is left alone because the contracts ARE still held until
+the settlement cash arrives, so zeroing would report a flat book over
+a real one for the length of that window. It would also make every
+settlement fill land on a zero leg and trip `sells_below_zero` —
+eight families rolling four times an hour is on the order of 768 a
+day — burying the one signal that counter was added to carry. The
+settlement fill reduces the position naturally; the successor's
+CREATED roll clears any residue if that fill never arrives.
+
+`book_fill` reads the `settled` flag for two more things: a floored
+sell on a settled row is not counted as a disagreement with the
+venue, and a settled row never charges the day cap, because a
+settlement is the venue paying out rather than the member committing
+capital.
+
+A settle frame naming **outcome 0** is REFUSED into
+`settles_unmatched` rather than falling back to the family key. That
+fallback would clear whatever the family currently holds, which after
+a reordered frame is the successor's live position — the very thing
+the outcome-first search exists to prevent. A duplicate settle is a
+no-op.
+
+The row's key is **(venue, family)**, not the family byte alone. A
+family index is only unique within the ingress that issued it, so two
+venues' family 0 would otherwise land on one row and the second bind
+would retire the first venue's live position — a fail-open from a key
+collision that no number of rows fixes.
+
+#### Three ledgers, deliberately not one
+
+| ledger | question | fed by | reset |
+|---|---|---|---|
+| exposure | how much is at stake right now | fills | the instance's roll |
+| turnover | how much has been bought today | fills | 00:00Z |
+| resting | how many orders are working | submit/cancel/modify **and** fills | the instance's roll |
+
+**The first two are computed from fills ALONE and never consult the
+resting table.** That separation is load-bearing rather than tidy: the
+resting table is the only part that has to match orders to fills by
+`client_oid`, which is the one place a key can be ambiguous. Keeping
+exposure and turnover off that path means a defect in open-order
+tracking degrades `max_open_orders` loudly — into
+`resting_ambiguous` — and cannot silently corrupt the number the money
+caps are judged against.
+`an_ambiguous_key_does_not_stop_the_money_ledgers` asserts it.
+
+#### Two clocks, one day epoch — the other near miss
+
+`core_time::now_ns` is `CLOCK_MONOTONIC_RAW`: nanoseconds since an
+arbitrary origin, **not** since the Unix epoch. That is what stamps an
+`Order`. A VENUE `Fill` is stamped by the Hyperliquid arm from
+`SystemTime` and is Unix time. The two differ by decades.
+
+The first cut fed both to one `wall_ns / DAY_NS` field. Every
+alternation between an order and a fill would have looked like a
+midnight crossing and zeroed the day's turnover — `cap_day` disabled
+outright, failing open, with nothing to show for it but a climbing
+`day_rollovers`.
+
+`strategy_bin15` already solves this with `core_time::WallAnchor`
+(`self.bar.anchor.wall_of(now_ns)`), so the ledger uses the same
+mechanism rather than a second one: `Ledger::new` takes the boot
+anchor, `observe_mono_clock` converts, and `roll_day` only ever sees
+wall nanoseconds. `Ledger` has **no `Default`** any more — a zeroed
+anchor maps every engine timestamp to 1970, which is one fixed epoch
+and looks exactly like a day cap that never rolls, so forgetting the
+anchor is now a compile error.
+
+No test could have caught it: every one of them built both stamps
+from a single constant. `the_two_clocks_do_not_thrash_the_day_epoch`
+builds the anchor the way boot does, with an eleven-day monotonic
+origin, and alternates the two sources across sixty-four minutes.
+
+#### An unreconciled ledger refuses — the restart hole
+
+A fresh `Ledger` reads zero exposure, zero turnover and zero resting
+orders. After a **restart** that is not the truth: the venue still
+holds whatever the previous boot left. All three ledger-fed clamps
+would fail OPEN — a whole `cap_instance` addable on top of an
+existing position, a fresh `cap_day` on top of the day's real spend,
+and `max_open_orders` more orders on top of the ones already working.
+CLAUDE.md documents a scheduled daily restart, so this is routine,
+not exotic.
+
+So a live PLACE is refused until something has reconciled the ledger
+against the venue. **Nothing does yet** — the reconciler wiring is
+commit 3 — which means a live slot armed on this commit alone
+refuses every order it tries to place. That is the intended reading:
+a risk gate with no memory of the venue must not pass orders, and a
+slot that refuses loudly in its first second is a better failure than
+a cap that was never really there.
+
+**Both verbs.** The first cut exempted a MODIFY, reasoning that
+refusing one would strand a quote at the venue with no way to move or
+shrink it. That reasoning was simply false: `cancel` is never
+risk-checked at all, so a member always has a way to take a quote
+back, and waiting for the reconciler is not being stranded. What the
+exemption actually bought was the one thing the interlock exists to
+stop — a modify RAISES price and size, the venue holds pre-boot
+orders across our restarts, and the exempted verb would have been
+judged against a ledger reading zero. Commit 1's own note names that
+hole in those words: "a clamp on `submit` alone leaves the cap
+reachable by repricing upward."
+
+A cancel stays open, and that is the escape hatch.
+
+The refusal has **its own counter**, `refused_unseeded`, rather than a
+share of `refused_cap_instance`. Nothing calls `mark_ledger_seeded` in
+production on this commit, so on a live boot *every* refusal is this
+one; folded into the exposure counter it would send an operator to
+look at a `cap_instance_usd` number that has nothing to do with why
+their orders are being refused — the same defect as `refused_risk`'s
+changed meaning, made twice.
+
+#### The keying: `(client_oid, slot)`, never the oid alone
+
+Every member counts its own `client_oid`s from 1, so two slots share
+oid 11 routinely. Keying on the oid alone is the exact defect the E5
+commit-3 review found in the paper matcher's `find_resting`, where a
+member's correct cancel found another member's order. The same lesson,
+applied before it could be made twice.
+
+#### What each cap MEANS here, and where it differs from bin15's
+
+bin15's own `cap_instance`/`cap_day` count **reserved entry
+notional**: booked at submit, credited back on the unfilled part,
+buys only. The router's count **what the venue actually filled**.
+Those are different quantities, deliberately:
+
+* `cap_day_usd` — filled BUY turnover, cumulative within the day,
+  reset at 00:00Z on the same `DAY_NS` epoch bin15 uses so the two
+  roll at the same instant. Sells are not counted: the day cap asks
+  how much was committed, and selling a position back does not
+  un-commit it. A ledger that netted sells off would let a member
+  round-trip an unbounded notional under a fixed cap.
+* `cap_instance_usd` — NET EXPOSURE, `|yes − no|` per outcome, summed
+  across outcomes. Money actually at stake rather than money spent.
+
+So **a gap between the router's `cap_instance` and bin15's is not
+automatically an alarm** the way a `max_order_usd` refusal is. A
+member can sit well inside its own turnover cap while holding a
+one-sided position this clamp refuses to add to, and that is the clamp
+working. `refused_max_order` is the field that means "the two ledgers
+disagreed"; the other three mean "the operator's ceiling was reached".
+The `refused_risk` aggregate commit 1 shipped is kept as their sum, so
+a dashboard built against it keeps parsing. **Its MEANING changed
+while its name did not**, which is the more dangerous half: in commit
+1 a non-zero value was an alarm, and three of its four contributors
+now mean "the operator's ceiling was reached", which is the clamp
+working. An alert wired to `engine_exec_refused_risk_total` should be
+re-pointed at `refused_max_order`, the one field that still carries
+the commit-1 meaning. **A non-zero `refused_cap_instance`,
+`refused_cap_day` or `refused_open_orders` is not an alarm.**
+
+#### Netting is per outcome, and then SUMMED
+
+HIP-4 pays $1 to one leg of an outcome and $0 to the other, so equal
+Yes and No is riskless collateral. That is
+`core_types::net_exposure_1e8` — the reconciler's own rule, and now
+the only copy of it (see below).
+
+Two DIFFERENT outcomes do not net. They settle on independent events,
+and a member long Yes on one and long No on another is exposed to
+both. So the slot's number is `Σ over outcomes |yes − no|`, never
+`|Σ yes − Σ no|` — the latter would report a flat book over real risk.
+`two_outcomes_do_not_net_against_each_other` holds it, and breaking
+the sum is one of this commit's break-and-watch runs.
+
+#### The clamp PROJECTS, and it never blocks a reduction
+
+A slot flat at zero passes any test on its *current* exposure, so a
+cap read off the position would never refuse a slot's first order
+however large — it would start biting only on the second, which is one
+order too late.
+
+So `cap_instance` is checked against what the order would LEAVE, and
+the projection is exact wherever the leg is bound: buying the shorter
+leg of an outcome *reduces* `|yes − no|`.
+
+The condition is two tests, and the second is not redundant:
+
+```rust
+if projected > cap && projected > current { refuse }
+```
+
+**Over the cap is not enough — the order must also INCREASE exposure.**
+A slot can be over its cap without having asked to be (the operator
+lowered the number, or fills landed past what any projection could
+have known), and the only way out of a position is to send an order. A
+clamp testing `projected > cap` alone refuses exactly that order and
+TRAPS the member inside the exposure the cap exists to bound, with no
+path back but an operator cancelling by hand.
+
+This was written wrong first. The test
+`the_instance_cap_never_refuses_an_order_that_does_not_raise_exposure`
+was written to state the property and failed against the code, which
+is the only reason the trap door is not in this commit. There is no
+way to nibble upward: any increase at all fails the second test once
+the first is failing.
+
+`cap_day` needs no such guard (a sell adds no turnover, so selling is
+always possible) and neither does `max_open_orders` (cancels and
+modifies always pass).
+
+#### `max_open_orders`, finally honest
+
+Commit 1 left it out because the router saw dispatches but not
+retirements. It now sees all four events that change the count:
+
+| event | effect |
+|---|---|
+| accepted submit | +1 |
+| accepted cancel | −1 |
+| accepted modify | 0 — LAW E-7 replaces in place; the id and size move |
+| fill taking remaining to ≤0 | −1 |
+| roll of the instance | drop every order on its two legs |
+
+**Only ACCEPTANCE counts.** An order the arm refused is not working at
+the venue, and counting it would leak the count upward until the clamp
+refused a slot holding nothing.
+
+Dropping a rolled instance's orders is not a guess about the venue:
+LAW E-8 says the roll sends a real cancel-all, so an order on a
+retired leg is gone. Keeping them would leak one instance's quotes
+every roll — the exact failure that kept this clamp out of commit 1.
+
+A MODIFY is exempt from the clamp itself. Testing it would refuse the
+requote of a slot sitting exactly at its cap, which is the slot that
+most needs to be able to move its quotes.
+
+**The blind spots, stated in full** — and "in full" is the point: an
+earlier draft named only the first of these and read as if the list
+were complete.
+
+| blind spot | direction | where it goes |
+|---|---|---|
+| a venue-side reject AFTER the HTTP ACK | CLOSED, count one high | a halt trigger in commit 3 |
+| a restart with live state at the venue | was OPEN | closed by the seeding interlock above |
+| the shared resting table filling | was OPEN | closed both ways — see below |
+| a fill on a leg whose bind was refused | OPEN for exposure, CLOSED for turnover | `fills_unbound`, a halt trigger in commit 3 |
+
+#### The shared table can no longer switch the clamp off
+
+`max_open_orders` is counted out of one 512-row array shared by every
+live slot. When that array filled, the first cut bumped
+`resting_full` and returned **without incrementing the slot's
+count** — so the count froze and every later order passed. A clamp
+switched off by the table it depends on, failing open, for the rest
+of the boot.
+
+Closed from both ends:
+
+* `on_submit` now increments the count even when no row was taken.
+  The order IS working at the venue — the same reading
+  `on_modify`'s unmatched branch takes — so the slot ratchets toward
+  refusing everything instead of toward passing everything. Fail
+  closed.
+* `core_config::exec` refuses at boot any live slot whose
+  `max_open_orders` exceeds its equal share of the table
+  (`LEDGER_RESTING / EXEC_SLOTS` = 64, which is what the shipped
+  template asks for). Equal shares rather than a sum, because slots
+  are validated independently and a sum rule would make one slot's
+  legality depend on a later section of the file.
+
+That boot check bounds the SUBMIT path. It does **not** make the
+fail-closed path unreachable, and an earlier draft claimed it did: a
+modify is exempt from `max_open_orders` under LAW E-7, and an
+unmatched modify tracks its replacement, so the count is not bounded
+by the clamp. Reaching the table's end needs a stream of modifies
+naming orders the ledger never saw — a disagreement with the venue,
+which `resting_full` is now the tell for, not a configuration error.
+
+`core_config` has to restate `LEDGER_RESTING` (`exec-router` depends
+on it, so the dependency cannot run the other way). An earlier draft
+of that comment said `exec_router::route::tests` asserted the two
+agree. **It did not** — which is worse than no check, because a false
+claim of coverage stops the next reader adding one. `cli::exec_boot`,
+the one crate that depends on both, now const-asserts it.
+
+#### A modify of an order the ledger is not holding
+
+`on_modify` tracks the replacement — it IS working at the venue — but
+the first cut recorded it with `SYMBOL_ID_NONE`. A row with no symbol
+matches no leg, so `drop_resting_on` could never release it and no
+roll, no LAW E-8 cancel-all, would ever retire it: one place leaked
+out of the shared table per unmatched modify, for the life of the
+boot. The condition that makes the table fill, caused by the branch
+that handles the table being unreliable. The replacement's real `sym`
+is carried now.
+
+The same branch also fired on an AMBIGUOUS key, because it asked a
+function returning `Option` a question with three answers. Two rows
+under one key are already a guess; adding a third under the same key
+is the opposite of the ruling `consume_resting` follows and is proud
+of. `find` returns `One`/`None`/`Many` now, and `Many` leaves the
+table alone and counts.
+
+#### Fixed tables, and they refuse rather than evict
+
+`LEDGER_ROWS = 16` (twice one ingress's `HL_MAX_FAMILIES`, with the
+venue byte in the key so a second venue's family table cannot evict
+the first's) and
+`LEDGER_RESTING = 512` (`EXEC_SLOTS × max_open_orders` at the shipped
+64 — sized TO the clamp, so filling up is not reachable while the
+clamp is doing its job). Past either, the request is refused into
+`binds_refused` / `resting_full` rather than overwriting a live row.
+An overwritten binding books a real position against the wrong
+outcome; if `resting_full` is ever non-zero, either the clamps are
+unset or something is not retiring, and both are operator-visible
+facts rather than silent truncation.
+
+#### What `cap_instance` does NOT bound
+
+It is computed from FILLS. A slot's own resting orders are not in the
+projection, so N orders in flight are each judged against the same
+unchanged position and all N can pass. **The worst case with every
+quote working is `cap_instance_usd + max_open_orders × max_order_usd`,
+not `cap_instance_usd`.** The three numbers multiply, and an operator
+setting them needs to know that.
+
+This is a stated bound rather than an oversight: projecting resting
+notional too would mean assuming both sides of a two-sided quote
+fill, which cannot happen, and it would strangle the maker. bin15's
+own ledger reserves notional at submit and self-limits in the healthy
+case; this gate's job is the unhealthy one, and there it bounds
+exposure at that product.
+
+Two related shapes, both by design and both worth an operator
+knowing:
+
+* **Alternating legs.** `buy yes 10`, `buy no 20`, `buy yes 20`, …
+  pins `|yes − no|` at the cap while gross position grows without
+  bound. `cap_instance` is a NET measure; `cap_day` is what bounds
+  capital committed.
+* **Flip-ratcheting.** From over the cap, an order that reduces net
+  exposure passes even if it lands far on the other side. Net
+  exposure never rises — the "no way to nibble upward" claim holds
+  literally — but a slot over its cap is never forced down and can
+  churn gross indefinitely.
+
+#### `0` means UNSET for all four now, and the boot says so
+
+`core_config::exec` already refused a live slot that left
+`max_order_usd_1e6` or `cap_instance_usd_1e6` at zero — "`0` means
+UNSET here, never `unlimited`". `cap_day_usd_1e6` and
+`max_open_orders` join that rule in this commit, because they stopped
+being decoration. A live slot that omitted one would otherwise boot
+and then refuse every order it placed: safe, but discovered at the
+wrong end of the day. Refused at boot instead, where an operator is
+present. No `exec.toml` exists on the engine host today (the standing
+instance runs all-paper, no `--exec`), so nothing in service changes.
+
+#### One copy of the two shared primitives
+
+The risk review's E5 ruling was that E6 must **use**
+`net_exposure_1e8` rather than restate it. `exec_router` cannot depend
+on `exec_hyperliquid` — that would drag rustls, mio and secp256k1 into
+the routing crate — so the honest reading of the ruling was to move
+the function somewhere both can reach.
+
+`core_types` has no dependencies and every arm already depends on it.
+It now owns `net_exposure_1e8` and the `InstrumentRoll` `venue_seq`
+codec; `exec_hyperliquid::recon`, `ingress_hyperliquid::family` and
+`cli::backtest::binary` re-export theirs, so no caller changed and the
+copies are gone. The roll codec had **four** writers, each carrying a
+comment explaining why it could not import the others — every one of
+those reasons is a reason to live in the zero-dependency crate.
+
+**A divergence those four copies hid.** Three masked the kind byte to
+its low bit; `strategy_bin15::on_roll` compares the WHOLE byte against
+1. Over everything the packer can produce they agree, which is why
+nothing ever caught fire. On a top byte no packer of ours writes they
+part company: the masking reading calls `0x03` "settled", the
+whole-byte reading calls it "created". Neither is right — the frame is
+malformed. `core_types::roll_kind` returns the raw byte so a caller
+can refuse it, and
+`the_two_readings_of_the_kind_byte_agree_only_where_the_packer_writes`
+states the divergence as a tested fact.
+
+`exec_hyperliquid`'s reading is bit-identical to what it did before
+the move. **Widening it to refuse a malformed kind byte is a live-arm
+behaviour change and is deliberately not smuggled into a commit about
+the exposure ledger**; the same goes for bin15's. Named here for the
+risk review to rule on.
+
+#### Two flaky gates, found and fixed
+
+Neither is this commit's doing; both surfaced because a bigger test
+suite changes scheduling, and both are the same shape — a gate that
+teaches an operator to re-run until green.
+
+**`exec_hyperliquid`'s loopback harness** bumped its request counter
+AFTER flushing the response, so the client could read the body,
+finish the test and assert on the counter before the server thread
+incremented it. `the_whole_round_trip_passes_and_takes_exactly_four_requests`
+read 3 while simultaneously asserting `verified_gone`, which can only
+be true if the fourth response had already arrived. Counted before
+the write now — the request is fully read by then, which is what
+"served" means.
+
+**`core_config`'s** `phase_8e_host_fields_use_defaults_when_unset` REMOVES
+`OKX_WS_PUBLIC_HOST` while `..._honor_env_overrides` SETS it, on
+process-global `std::env`, under `cargo test`'s thread pool. The pair
+has always raced; adding two validation tests to a sibling module
+changed the schedule and surfaced it. An `ENV_LOCK` now serialises every env-mutating test in that module, not
+just the two that happened to collide.
+
+#### Gates
+
+`cargo test --workspace --exclude bench --no-fail-fast`: **2434
+passed, 0 failed**. **80 tests added by this commit, none removed** —
+47 in the new `exec_router::ledger`, 33 across the existing suites.
+**61/61 alloc assertions**: gate 61 drives the ledger's fill,
+lifecycle, roll and read paths against a FULL binding table and
+asserts every outcome actually fired, so the zero is not agreement
+over an empty set. Clippy clean under `-D warnings`. Licence OK (391
+source files — `ledger.rs` is the one new file and carries its
+two-line SPDX header).
+
+**Seventeen break-and-watch runs**, each caught by the tests that name
+the mechanism and no others. Five on the first cut:
+
+| break | caught by |
+|---|---|
+| drop the "does not raise exposure" guard | `the_instance_cap_never_refuses_an_order_that_does_not_raise_exposure` |
+| sum exposure as `\|Σ yes − Σ no\|` | `two_outcomes_do_not_net_against_each_other` |
+| a roll stops dropping the instance's resting orders | `a_roll_drops_the_orders_resting_on_the_instance_that_ended`, `a_roll_leaves_another_outcomes_orders_alone` |
+| the engine books the fill AFTER the member acts | `a_fill_is_booked_before_the_strategy_can_act_on_it` |
+| the ledger stops filtering paper fills | `a_paper_fill_never_reaches_a_live_ledger`, `a_paper_fill_does_not_move_a_live_slots_ledger` |
+
+And six more, on the behaviours the review repaired — those are the
+ones that were wrong once already, so they get the tightest proof:
+
+| break | caught by |
+|---|---|
+| rows keyed on the instance, not the family | `successive_instances_of_a_family_reuse_one_row`, `a_new_instance_of_a_family_does_not_inherit_the_old_position` |
+| the modify exemption from the seeding interlock restored | `a_live_place_is_refused_until_the_ledger_has_been_reconciled` |
+| the unseeded refusal counted as a `cap_instance` breach | `a_live_place_is_refused_until_the_ledger_has_been_reconciled` |
+| `settle` zeroes the position again | `a_settle_drops_the_resting_orders_and_leaves_the_position_to_the_fill`, `a_settle_and_then_its_successor_clear_the_instance_through_the_same_path` |
+| the day cap stops reading `settled` | `a_settlement_never_charges_the_day_cap` |
+| the sell floor stops reporting on a settled row | `a_settlement_that_sells_more_than_we_booked_is_reported` |
+| the venue byte dropped from the family key | `two_venues_do_not_share_a_family_row` |
+| the unstamped-clock guard removed | `an_unstamped_order_clock_does_not_roll_the_day` |
+| `settle`'s outcome-0 fallback to the family key restored | `a_settle_naming_no_outcome_is_refused_rather_than_clearing_a_successor` |
+| the duplicate-settle gate removed | `a_duplicate_settle_is_a_no_op` |
+| the mirrored resting-table size drifts | `cli::exec_boot`'s const assertion (compile error) |
+| the order's monotonic stamp fed straight to the wall epoch | `the_two_clocks_do_not_thrash_the_day_epoch` |
+| the unreconciled-ledger interlock removed | `a_live_place_is_refused_until_the_ledger_has_been_reconciled` |
+| a full resting table stops counting | `a_full_resting_table_still_counts_the_order_that_did_not_fit`, `the_resting_table_refuses_rather_than_overwriting_when_full` |
+| a tracked replacement recorded with no symbol | `a_tracked_replacement_is_still_droppable_by_a_roll` |
+| the roll kind byte read with the permissive mask | `a_malformed_roll_kind_byte_is_refused_rather_than_read_as_settled` |
+
+#### What the SECOND review round changed
+
+The corrected diff went back to the same reviewer. It blocked again,
+and again it was right. Three blocks and six smaller findings, and
+the reviewer named the pattern better than I can:
+
+> "of the three blocks here, two are prose asserting a guarantee the
+> code does not implement … The code is careful; the claims about it
+> are running ahead of it."
+
+| finding | disposition |
+|---|---|
+| the seeding interlock exempted MODIFY on a premise (`cancel` would strand a quote) that is simply false | exemption dropped; both verbs refused, cancel is the escape hatch |
+| `settle` zeroed the position, so every settlement tripped `sells_below_zero` ~768×/day | `settle` no longer zeroes; the settlement fill reduces naturally |
+| `core_config`'s mirror constant claimed an agreement test that did not exist | `cli::exec_boot` const-asserts it; both comments corrected |
+| the unseeded refusal was counted as `refused_cap_instance` | its own `RiskRefusal::Unseeded` / `refused_unseeded` |
+| two venues collide on one family row, and the doc claimed they could not | the key is `(venue, family)` |
+| `observe_mono_clock` lost `roll_day`'s zero guard — `wall_of(0)` is a plausible wall time in another epoch | guarded on the input |
+| the `resting_full` unreachability claim was false | corrected; modify is exempt from the clamp, so the bound does not hold |
+| `settle`'s `outcome == 0` fallback re-opened the reordering hazard | refused into `settles_unmatched` |
+| a duplicate settle double-counted `instances_cleared` | gated on `settled == 0` |
+| `settled` was write-only | read on both the fill path and the settle path |
+
+One more came from break-and-watch rather than from either review.
+The reviewer asked for the settlement floor to stop counting
+`sells_below_zero`, on the premise that `settle` zeroed the position.
+Not zeroing was the better of the two fixes and **both were
+applied** — so the suppression had nothing left to suppress.
+Break-and-watch removed it and **not one test failed**, which is how
+an unreachable guard announces itself. It was also actively harmful:
+a settlement selling MORE than the ledger booked is precisely the
+router disagreeing with the venue, and the guard would have swallowed
+exactly that. Removed, with a test
+(`a_settlement_that_sells_more_than_we_booked_is_reported`).
+
+#### What the FIRST review round changed
+
+Both project review agents ran. `alloc-auditor` returned **PASS**.
+`risk-reviewer` returned **BLOCK**, and it was right to: four of its
+findings were real fail-open defects, and one of its *questions* —
+whether outcome ids are stable across instances — turned out to be
+the most serious defect in the commit. Everything it verified
+mechanically (the netting, the per-outcome sum, the exact projection,
+the `i128` notional, the paper-fill filter, the fill-before-strategy
+ordering, the acceptance-only counting, the bit-identity of the
+`core_types` move) it confirmed correct; the objection was entirely
+to **the set of states the ledger could not represent**, which is the
+harder thing to see from inside the change.
+
+| finding | disposition |
+|---|---|
+| outcome ids are not stable across instances (raised as a question) | rows re-keyed on family |
+| two clocks in one day epoch (raised as non-blocking) | `WallAnchor`; `Default` removed |
+| a restart fails all three clamps open | seeding interlock; live PLACE refused until reconciled |
+| the shared table switches `max_open_orders` off | fail-closed count **and** a boot bound |
+| `on_modify` creates undroppable phantom rows, and fires on the ambiguous case | carries `sym`; `find` is three-valued |
+| `cap_instance` bounds filled-only exposure | stated, with the multiplying bound |
+| the new roll reading inherited the permissive kind-byte mask | uses `roll_kind`, refuses a malformed byte |
+| `refused_risk`'s meaning changed under its name | documented, with the alert to re-point |
+| the sell-to-zero floor absorbs errors silently | `sells_below_zero` counter |
+| a settle for an unheld family is silent | `settles_unmatched` counter |
+
+Two of those — the family keying and the two clocks — were defects
+**no test in this commit could have caught**, because the tests built
+the world the code assumed. That is the same shape this lane keeps
+finding, one level up: not a check whose condition is weaker than its
+name, but a test whose fixture is narrower than its claim.
+
+#### Still ahead in E6
+
+Commit 3 — the sticky halt state machine (N consecutive venue
+rejects, budget floor breached, reconciliation drift, WS user-stream
+gap, asset-id refusal streak, day cap reached; halt ⇒ cancel-all ⇒
+refuse every submit ⇒ operator restart, never self-clearing,
+per-slot refusal with venue-wide cancel). Commit 4 — the `exec.HALT`
+file switch polled in `HlExchange::on_idle`, the
+`engine_exec_halted{slot}` gauge, the `/state` field and the loud boot
+tell.

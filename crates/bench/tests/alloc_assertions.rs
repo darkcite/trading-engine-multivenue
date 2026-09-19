@@ -5753,7 +5753,7 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
 fn routed_dispatch_steady_state() {
     use clob_dispatcher::{DispatchError, OrderDispatch, PaperDispatcher};
     use core_types::{Price, Qty, Side, Tick, VenueId, STRATEGY_ID_NONE};
-    use exec_router::{ExecMode, ExecRoute, NullLiveDispatcher, RoutedDispatcher};
+    use exec_router::{ExecMode, ExecRoute, NullLiveDispatcher, RoutedDispatcher, SlotCaps};
 
     const SYM: core_types::SymbolId = 42;
 
@@ -5765,15 +5765,23 @@ fn routed_dispatch_steady_state() {
             3,
             ExecMode::Live,
             &[VenueId::Hyperliquid.to_u8()],
-            100_000_000,
-            64,
+            // The shipped template's numbers. E6's clamps refuse a
+            // zero cap, and a gate whose submits were all refused
+            // would measure the refusal path, not the dispatch path.
+            SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
         )
         .expect("boot: slot 3 live");
     route
-        .set_slot(6, ExecMode::Off, &[], 0, 0)
+        .set_slot(6, ExecMode::Off, &[], SlotCaps::none())
         .expect("boot: slot 6 off");
 
-    let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), NullLiveDispatcher::new());
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        NullLiveDispatcher::new(),
+        core_time::WallAnchor::now(),
+    );
+    d.mark_ledger_seeded();
 
     // Warm the paper matcher's open table so `observe_tick` has real
     // work to do inside the guard rather than walking an empty list.
@@ -6738,4 +6746,237 @@ fn hl_exchange_reconcile_compare_is_zero_alloc() {
     let (legs, worst) = HlExchange::<64>::compare(&assets, &bal[..n], &sheet);
     assert_eq!(legs, 8, "every leg disagrees: booked 1.0, venue says 2.0");
     assert_eq!(worst, 1_000_000);
+}
+
+/// **E6 gate 61 — the venue-fill exposure ledger, end to end.**
+///
+/// E6 commit 2 put a memory behind the risk gate: an exposure ledger,
+/// a day-turnover counter and a resting-order table, fed by
+/// `OrderDispatch::on_fill_booked` and by the `InstrumentRoll` events
+/// the router already forwards. **All three run on the engine
+/// thread** — `on_fill_booked` is called from the engine's fill-lane
+/// drain, once per venue fill, before the member sees it — so every
+/// one of them is a hot path and none may allocate.
+///
+/// What this drives inside the guard:
+///
+/// * `on_fill_booked` on a BOUND leg (the position moves, the
+///   turnover moves, a resting order is decremented);
+/// * `on_fill_booked` on an UNBOUND leg (the whole table is walked
+///   and nothing matches — the worst case for the scan);
+/// * `submit` under all four clamps, including refusals, so the two
+///   ledger walks the gate does per order are measured;
+/// * `cancel` and `modify`, which search the resting table;
+/// * `on_venue_event` with created AND settled rolls, which bind,
+///   clear an instance and drop that instance's resting orders;
+/// * `slot_exposure_1e6` / `slot_day_turnover_1e6` / `slot_resting`,
+///   which `/state` reads.
+///
+/// Every outcome is counted and asserted non-zero at the end. A gate
+/// whose refusal path never fired would be asserting zero allocations
+/// over a branch that never ran — which is how a zero-allocation
+/// claim becomes agreement over an empty set.
+#[test]
+fn routed_ledger_steady_state() {
+    use clob_dispatcher::{DispatchError, OrderDispatch, PaperDispatcher};
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, Order, Price, Qty, Side, VenueId,
+        FILL_ORIGIN_PAPER, FILL_ORIGIN_VENUE,
+    };
+    use exec_router::{ExecMode, ExecRoute, RoutedDispatcher, SlotCaps};
+
+    const SLOT: u8 = 3;
+    /// Hyperliquid namespace. Yes legs are even ordinals, No odd.
+    const fn sym(ord: u32) -> core_types::SymbolId {
+        (4u32 << 24) | ord
+    }
+    /// 2026-09-19T00:00:01Z.
+    const T0: u64 = 1_789_776_001_000_000_000;
+
+    /// A live arm that ACCEPTS, so the ledger's lifecycle hooks are
+    /// reached. `NullLiveDispatcher` refuses everything, which would
+    /// leave the resting table empty and the fill matcher measuring
+    /// nothing.
+    struct Yes;
+    impl OrderDispatch for Yes {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+    }
+
+    let roll = |family: usize, outcome: u32, sym_yes: core_types::SymbolId, settled: bool| {
+        ChannelEvent::new(
+            T0,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym_yes,
+            core_types::pack_roll_seq(outcome, 60, family, settled),
+            0,
+            0,
+            0,
+        )
+    };
+
+    // Boot-time construction — outside the window, as the engine's is.
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            // Tight enough that the refusal paths really fire, loose
+            // enough that the accepting paths do too.
+            SlotCaps::new(100_000_000, 40_000_000, 200_000_000, 32),
+        )
+        .expect("boot: slot 3 live");
+    // The identity anchor: this gate stamps orders and fills from one
+    // `T0`, so mapping it to itself keeps both in one day epoch. The
+    // conversion itself is held by `exec_router`'s own tests.
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        Yes,
+        core_time::WallAnchor::new(T0, T0),
+    );
+    // What E6 commit 3's reconciler will do at boot: without it every
+    // live PLACE is refused and the gate would be measuring the
+    // interlock rather than the ledger.
+    d.mark_ledger_seeded();
+
+    // Fill the binding table, so every scan walks a FULL table rather
+    // than bailing on the first free row.
+    let mut o = 0u32;
+    while o < exec_router::LEDGER_ROWS as u32 {
+        d.on_venue_event(&roll(o as usize, 1_000 + o, sym(100 + o * 2), false));
+        o += 1;
+    }
+
+    let g = AllocGuard::new();
+
+    let mut placed = 0u64;
+    let mut refused = 0u64;
+    let mut cancelled = 0u64;
+    let mut modified = 0u64;
+    let mut booked = 0u64;
+    let mut acc = 0i64;
+
+    let mut i = 0u64;
+    while i < 10_000 {
+        let k = (i % exec_router::LEDGER_ROWS as u64) as u32;
+        let outcome = 1_000 + k;
+        let yes = sym(100 + k * 2);
+        let no = yes + 1;
+        let oid = 1_000_000 + i;
+
+        // ---- a place ------------------------------------------------
+        let mut ord = Order::new(
+            T0 + i,
+            VenueId::Hyperliquid,
+            if i & 1 == 0 { yes } else { no },
+            if i & 2 == 0 { Side::Bid } else { Side::Ask },
+            0,
+            Price::from_raw(400_000 + (i as i64 % 1_000)),
+            Qty::from_raw(1_000_000),
+            oid,
+        );
+        ord.strategy_id = SLOT;
+        match d.submit(&ord) {
+            Ok(()) => placed += 1,
+            Err(DispatchError::RiskRefused) => refused += 1,
+            Err(e) => panic!("unexpected dispatch error {e:?}"),
+        }
+
+        // ---- a venue fill on a BOUND leg ----------------------------
+        let f = Fill::new(
+            T0 + i,
+            ord.sym,
+            ord.side,
+            Price::from_raw(400_000),
+            Qty::from_raw(500_000),
+            oid,
+        )
+        .with_attribution(SLOT, FILL_ORIGIN_VENUE);
+        d.on_fill_booked(&f);
+        booked += 1;
+
+        // ---- a fill on an UNBOUND leg: the full-table scan ----------
+        if i % 8 == 0 {
+            let stray = Fill::new(
+                T0 + i,
+                sym(900_000 + (i as u32 & 7)),
+                Side::Bid,
+                Price::from_raw(400_000),
+                Qty::from_raw(100_000),
+                oid,
+            )
+            .with_attribution(SLOT, FILL_ORIGIN_VENUE);
+            d.on_fill_booked(&stray);
+        }
+
+        // ---- a PAPER fill: the filter the ledger makes in one place -
+        if i % 16 == 0 {
+            let p = f.with_attribution(SLOT, FILL_ORIGIN_PAPER);
+            d.on_fill_booked(&p);
+        }
+
+        // ---- a modify, then a cancel --------------------------------
+        if i % 4 == 0 {
+            let mut rep = ord;
+            rep.client_oid = oid + 500_000_000;
+            rep.px = Price::from_raw(410_000);
+            if d.modify(&ModifyReq::new(oid, rep)).is_ok() {
+                modified += 1;
+            }
+            if d.cancel(&CancelReq::of(&rep, T0 + i)).is_ok() {
+                cancelled += 1;
+            }
+        }
+
+        // ---- a roll: bind, settle, and drop what was resting --------
+        if i % 64 == 0 {
+            // A settle, then the successor's create — a NEW outcome id
+            // on the same family, which is what a real roll carries.
+            d.on_venue_event(&roll(k as usize, outcome, yes, true));
+            d.on_venue_event(&roll(k as usize, outcome + 500_000, yes, false));
+        }
+
+        // ---- what `/state` reads ------------------------------------
+        acc = acc
+            .wrapping_add(d.ledger().slot_exposure_1e6(SLOT as usize))
+            .wrapping_add(d.ledger().slot_day_turnover_1e6(SLOT as usize))
+            .wrapping_add(i64::from(d.ledger().slot_resting(SLOT as usize)));
+        i += 1;
+    }
+    std::hint::black_box((placed, refused, cancelled, modified, booked, acc));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+
+    // ---- the premises, asserted rather than assumed -----------------
+    let c = d.ledger().counters();
+    assert!(placed > 0, "no order was ever accepted");
+    assert!(refused > 0, "the risk gate never refused — the clamps never ran");
+    assert!(cancelled > 0, "the cancel path never ran");
+    assert!(modified > 0, "the modify path never ran");
+    assert!(c.fills_booked > 0, "no venue fill was booked");
+    assert!(c.fills_unbound > 0, "the full-table miss scan never ran");
+    assert!(c.binds > 0, "no roll ever bound");
+    assert!(c.instances_cleared > 0, "no instance was ever retired");
+
+    assert_eq!(
+        allocs, 0,
+        "the venue-fill ledger allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "ledger hot bytes should be zero: saw {bytes}");
 }

@@ -547,6 +547,44 @@ pub trait OrderDispatch {
     #[inline]
     fn on_venue_event(&mut self, _event: &core_types::ChannelEvent) {}
 
+    /// **E6 — a fill was BOOKED into the engine.**
+    ///
+    /// Defaulted to a no-op like every other hook here. The one
+    /// implementor is `exec_router::RoutedDispatcher`, whose exposure
+    /// ledger has to count what the venue actually filled.
+    ///
+    /// ## Why this hook has to exist at all
+    ///
+    /// The router cannot learn about a live fill any other way.
+    /// [`Self::on_venue_event`] carries a `ChannelEvent`, which is
+    /// market data and never a fill. [`Self::try_next_fill`] carries
+    /// the PAPER arm's fills only — a venue fill never passes through
+    /// it, because the live arm pushes into the engine's own fill lane
+    /// 3 and the engine drains that lane directly (see
+    /// `exec_router::routed`'s module note, "Where live fills come
+    /// from"). So the component that refuses orders against an
+    /// exposure cap sat downstream of nothing that could tell it a
+    /// position had changed.
+    ///
+    /// ## What the caller must guarantee
+    ///
+    /// **Called once per fill, on the engine thread, BEFORE the
+    /// strategy sees the same fill** — the same ordering
+    /// [`Self::observe_tick`] and [`Self::on_venue_event`] have, and
+    /// load-bearing for the same reason: a member handed a fill may
+    /// submit in the same call, and a ledger that had not yet booked
+    /// it would size the refusal against a stale position. `engine`
+    /// pins the order with a test.
+    ///
+    /// **Both drains, both origins.** The engine calls this from the
+    /// fill-lane drain AND from the dispatcher fill pump, and passes
+    /// paper fills as readily as venue ones. Filtering on
+    /// [`core_types::FILL_ORIGIN_VENUE`] is the LEDGER's job and is
+    /// done in one place there, so that a paper fill which somehow
+    /// reached lane 3 cannot inflate a live exposure number.
+    #[inline]
+    fn on_fill_booked(&mut self, _fill: &Fill) {}
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly

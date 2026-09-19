@@ -11,3 +11,7 @@ description  = "Per-strategy execution routing (E1): the boot-fixed slot -> pape
 [dependencies]
 clob-dispatcher = { workspace = true }
 core-types      = { workspace = true }
+# E6: `WallAnchor`. The day cap's 00:00Z epoch is a WALL-clock fact and
+# the engine stamps orders with `CLOCK_MONOTONIC_RAW`; this is the same
+# conversion `strategy_bin15` uses, not a second one.
+core-time       = { workspace = true }

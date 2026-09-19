@@ -236,15 +236,13 @@ fn decimal_field(b: &[u8], key: &[u8]) -> Option<i64> {
     scan_price_1e8(b, i).map(|(v, _)| v)
 }
 
-/// HIP-4 exposure for one outcome: `|yes − no|`.
-///
-/// Equal legs are riskless collateral, so they net to nothing. See the
-/// module docs — the risk gate must agree with this exactly.
-#[inline(always)]
-#[must_use]
-pub fn net_exposure_1e8(yes_1e8: i64, no_1e8: i64) -> i64 {
-    yes_1e8.saturating_sub(no_1e8).saturating_abs()
-}
+// E6: `|yes − no|` moved to `core_types`. The risk gate in
+// `exec_router` must agree with the reconciler EXACTLY, and
+// `exec_router` cannot depend on this crate (it would drag rustls,
+// mio and secp256k1 into the routing crate). One copy, in the crate
+// with no dependencies; re-exported here because this is where the
+// reconciler's readers look for it.
+pub use core_types::net_exposure_1e8;
 
 /// Drift between what the engine believes and what the venue says,
 /// as an absolute magnitude in the same scale as the inputs.
