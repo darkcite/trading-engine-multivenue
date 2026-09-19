@@ -4,6 +4,10 @@
 //! The binary certifying its own signing chain, offline, before it
 //! talks to anyone.
 //!
+//! COPY-DOCTRINE: a boot self-test over 25 embedded vectors, run once
+//! before the arm exists and never again; every copy in it is cold.
+//! `scripts/copy-audit.sh` skips this module on that line.
+//!
 //! ## The gap this closes
 //!
 //! [`crate::smoke`] proves the venue verifies a signature this binary
@@ -70,9 +74,12 @@ const TEST_KEY: [u8; 32] = [
 /// sends, not a round number that would hide an arithmetic bug.
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 
-/// Fewer rows than this means the fixture was truncated, not that the
-/// gate got easier.
-const MIN_ROWS: u32 = 20;
+/// The fixture's row count, EXACTLY. The header says "all 25", so the
+/// gate asserts 25 — a `>= 20` (the first cut) let five rows vanish
+/// with both gates still green, which is a claim the code did not
+/// test. Regenerating the fixture with more vectors moves this number
+/// on purpose.
+pub const VECTOR_ROWS: u32 = 25;
 
 /// Why the binary failed to certify itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,8 +205,8 @@ pub fn run() -> Result<SelfTestReport, SelfTestErr> {
         rows += 1;
     }
 
-    if rows < MIN_ROWS {
-        return Err(SelfTestErr::Fixture("fewer vectors than the gate requires"));
+    if rows != VECTOR_ROWS {
+        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 25 vectors"));
     }
 
     let encoders = check_encoders()?;
@@ -322,7 +329,7 @@ mod tests {
     #[test]
     fn this_binary_certifies_itself() {
         let r = run().expect("the embedded vectors must reproduce");
-        assert!(r.rows >= MIN_ROWS, "{r:?}");
+        assert_eq!(r.rows, VECTOR_ROWS, "{r:?}");
         assert_eq!(r.encoders, 4, "one case per action type, no fewer");
     }
 

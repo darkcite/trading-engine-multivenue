@@ -35,9 +35,12 @@
 //! ## Doctrine
 //!
 //! Zero allocation on the encode/sign path: every action is built into
-//! a caller-owned `[u8; MAX_ACTION]`, prices and sizes render through a
+//! the arm's boot-owned msgpack buffer, the request body is rendered IN
+//! PLACE (envelope head, action JSON, signature tail — one buffer, one
+//! write per byte, no staging copy), prices and sizes render through a
 //! stack `[u8; 24]`, and there is no `String`, no `Vec`, no `format!`
-//! and no map anywhere in it. POD structs are `#[repr(C)]` + `Copy`.
+//! and no map anywhere on that path. POD structs are `#[repr(C)]` +
+//! `Copy`. (`wire::WireNum`'s `Debug` impl uses `write!` — cold.)
 //!
 //! Fail-fast: an encode overflow is an error, never a truncation. A
 //! half-written action that reached the signer would be a valid
@@ -53,26 +56,23 @@
 //! [`response::tests`] fuzzes it against arbitrary bytes to prove it
 //! never panics and never invents an acceptance.
 //!
+//! ## Where the arm is driven from
+//!
+//! On the `--exec` path the engine loop itself drives
+//! `OrderDispatch::on_idle` (E6 commit 3a, `cli::paper::IdlePacer`):
+//! every idle moment pumps the user-event socket, runs the LAW E-8
+//! sweep, the reconciler and the budget persist — on the ENGINE thread,
+//! with every step bounded (see `exchange`'s constants). E7 wires a
+//! real [`exchange::HlExchange`] behind the router and hands it fill
+//! lane 3's producer; the roll handler ([`exchange`]'s
+//! `on_venue_event`) binds legs from real `outcomeCreated` events.
+//!
 //! ## What is deliberately NOT here
 //!
-//! * The **dispatcher worker wiring** on the `--exec` path. [`exchange`]
-//!   implements `OrderDispatch::on_idle`, and `RoutedDispatcher`
-//!   forwards it — but that path hands its dispatcher straight to the
-//!   engine loop with no `DispatcherWorker`, so nothing calls the hook
-//!   there yet. Wiring it changes the arming path and belongs to E7.
-//! * The **roll handler** that calls [`asset::AssetTable::bind`].
-//!   The coin → `SymbolId` resolution itself IS built —
-//!   [`asset::AssetTable::sym_of_coin`] answers by comparing bytes
-//!   against what a roll bound, never by parsing `+<enc>` — but
-//!   nothing in this workspace yet binds a leg from a real
-//!   `outcomeCreated` event, so in production the table is empty and
-//!   every fill is still counted `fills_unresolved`. That is the
-//!   correct state: a guessed symbol moves a position the member never
-//!   took, silently and permanently, while a missing fill is caught by
-//!   reconciliation inside a minute.
-//! * The **reconciliation timer** (§6.2) and the **tape write** for a
-//!   foreign fill (§6.1). Both are recorded as open in
-//!   `docs/risk-policy.md`.
+//! * The **tape write** for a foreign fill (§6.1): a `userFills` row
+//!   whose cloid is not ours is counted (`fills_foreign`) and never
+//!   admitted to the lane, but it is not written to the capture.
+//!   Recorded as open in `docs/risk-policy.md`.
 //! * **Settlement booking.** The venue delivers settlement down
 //!   `userFills` (`dir: "Settlement"`, px 1.0 or 0.0) with NO cloid,
 //!   so it takes the foreign arm: counted, never booked. The operator
@@ -101,6 +101,7 @@ pub mod cloid;
 pub mod config;
 pub mod exchange;
 pub mod http;
+mod json;
 pub mod lifecycle;
 pub mod msgpack;
 pub mod nonce;
@@ -119,7 +120,7 @@ pub use action::{
     CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 pub use asset::{AssetError, AssetTable, ASSET_SLOTS};
-pub use budget::{AddressBudget, BudgetErr, BudgetGauge, INITIAL_BUFFER};
+pub use budget::{AddressBudget, BudgetErr, INITIAL_BUFFER};
 pub use cloid::{decode as decode_cloid, encode as encode_cloid, Owner, MAGIC as CLOID_MAGIC};
 pub use config::{
     ConfigErr, HlConfig, Scope, ENV_AGENT_KEY, ENV_HOST, ENV_MASTER_ADDR, ENV_SOURCE,

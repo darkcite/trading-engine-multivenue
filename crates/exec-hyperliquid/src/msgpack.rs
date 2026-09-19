@@ -107,6 +107,11 @@ impl<'a> Writer<'a> {
         if end > self.buf.len() {
             return Err(MsgPackErr::Overflow);
         }
+        // COPY: the serialiser's own write — caller literals (keys,
+        // ≤ COIN_MAX coin names, 32 B cloid hex) into the boot-owned
+        // action buffer that is keccak'd and sent. The wire bytes have
+        // to exist contiguously somewhere; this is that place, written
+        // once. There is no second buffer downstream of it.
         self.buf[self.len..end].copy_from_slice(bytes);
         self.len = end;
         Ok(())

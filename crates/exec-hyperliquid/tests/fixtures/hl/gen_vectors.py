@@ -17,6 +17,7 @@ value that exists so a signature is reproducible. It has never held
 anything and must never be used for anything.
 """
 
+import importlib.metadata
 import json
 import hyperliquid.utils.signing as signing
 import eth_account
@@ -34,22 +35,45 @@ def limit(tif):
 
 
 def wire(asset, is_buy, px, sz, reduce_only, tif, cloid=None):
-    """Mirror `order_request_to_order_wire`'s KEY ORDER exactly."""
-    w = {
-        "a": asset,
-        "b": is_buy,
-        "p": signing.float_to_wire(px),
-        "s": signing.float_to_wire(sz),
-        "r": reduce_only,
-        "t": limit(tif),
+    """The SDK's OWN order wire — `order_request_to_order_wire` — never a
+    hand-written mirror of its key order.
+
+    LAW E-3 is about exactly that key order, and the first cut of this
+    script wrote the dict by hand "mirroring" the SDK, which meant the
+    fixture's authority stopped one function short of its header's
+    claim (E7 review, 2026-09-19). The SDK builds it now; if the SDK
+    ever changes the order, regeneration shows it as a diff.
+    """
+    req = {
+        "coin": "",  # unused by the wire builder; the asset id is passed
+        "is_buy": is_buy,
+        "sz": sz,
+        "limit_px": px,
+        "order_type": limit(tif),
+        "reduce_only": reduce_only,
     }
     if cloid is not None:
-        w["c"] = cloid
-    return w
+        req["cloid"] = _Cloid(cloid)
+    return signing.order_request_to_order_wire(req, asset)
+
+
+class _Cloid:
+    """The SDK's `Cloid` duck: `to_raw()` returns the 0x-hex string."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def to_raw(self):
+        return self._raw
 
 
 def order_action(wires, grouping="na"):
-    return {"type": "order", "orders": wires, "grouping": grouping}
+    # The SDK hardcodes `grouping = "na"`; the key is overwritten in
+    # place, which keeps its position (dict insertion order), so the
+    # msgpack key order stays the SDK's.
+    action = signing.order_wires_to_order_action(wires)
+    action["grouping"] = grouping
+    return action
 
 
 # HIP-4 asset ids: 100_000_000 + enc, enc = 10 * outcome_id + side.
@@ -210,6 +234,7 @@ lines = [
     "# LAW E-3: msgpack key order is part of the signature. These rows are the",
     "# only thing that validates it — the docs cannot.",
     "#",
+    f"# hyperliquid-python-sdk: {importlib.metadata.version('hyperliquid-python-sdk')}",
     f"# signing key (TEST ONLY, worthless, published): {TEST_KEY}",
     f"# address: {WALLET.address}",
     f"# vault used where a vault is exercised: {VAULT}",

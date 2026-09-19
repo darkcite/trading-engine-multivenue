@@ -87,6 +87,24 @@ pub trait Transport {
     /// bytes accepted into the outbound buffer. Caller is responsible
     /// for retrying on short writes.
     fn write(&mut self, src: &[u8]) -> io::Result<usize>;
+
+    /// Push whatever [`write`](Self::write) buffered towards the
+    /// socket NOW, without waiting for the next readiness event.
+    ///
+    /// Never blocks: a socket that cannot take the bytes leaves them
+    /// buffered and the next [`pump`](Self::pump) on a WRITABLE event
+    /// finishes the job — which is why a caller that flushes must
+    /// still [`reregister`](Self::reregister) afterwards. Exists for
+    /// request/response callers (the exchange arm) whose next act is
+    /// to wait for the peer's answer: without it the request sits in
+    /// the TLS buffer until a poll TIMEOUT arms the writable edge,
+    /// which cost every `/exchange` POST one `POLL_TIMEOUT` before its
+    /// first byte left the host (E7 review, 2026-09-19). A streaming
+    /// caller that pumps continuously does not need it; the default
+    /// is a no-op.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------
@@ -184,9 +202,18 @@ impl TlsTransport {
         // `process_new_packets` as `InvalidData` — both stay fatal.
         if self.conn.wants_read() {
             loop {
+                // COPY: ciphertext kernel → rustls deframer, ≤ one
+                // socket read (a 16 KiB rustls wave) — the read(2)
+                // boundary — rejected: a registered-buffer socket API
+                // (io_uring/DPDK) is outside the no-async doctrine.
                 match self.conn.read_tls(&mut self.sock) {
                     Ok(0) => return Ok(Status::Closed),
                     Ok(_) => {
+                        // COPY: ciphertext → plaintext, ≤ 16 KiB
+                        // (DEFAULT_RECEIVED_PLAINTEXT_LIMIT) per wave —
+                        // AEAD decryption must land where the deframer
+                        // can reuse the record — rejected: rustls has
+                        // no in-place plaintext borrow.
                         self.conn
                             .process_new_packets()
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -200,6 +227,8 @@ impl TlsTransport {
 
         // Push ciphertext from rustls into the socket.
         while self.conn.wants_write() {
+            // COPY: ciphertext user → kernel, ≤ rustls sendable_tls —
+            // the write(2) boundary — rejected: as in `flush`.
             match self.conn.write_tls(&mut self.sock) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -246,6 +275,11 @@ impl Transport for TlsTransport {
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         // Fast path: rustls decrypted plaintext already buffered.
         {
+            // COPY: rustls plaintext → the caller's rx buffer, ≤ one
+            // 16 KiB wave — the stream rx-buffer fill; every scanner
+            // downstream works on offsets into `dst` and copies nothing
+            // — rejected: borrowing rustls' reader across the parse
+            // would hold `&mut conn` for the whole cycle.
             let mut reader = self.conn.reader();
             match io::Read::read(&mut reader, dst) {
                 Ok(n) => return Ok(n),
@@ -265,6 +299,9 @@ impl Transport for TlsTransport {
         // Same buffers, same copy count as before — no allocation.
         loop {
             let mut pulled = false;
+            // COPY: ciphertext kernel → deframer on the pull-through
+            // path, ≤ one socket read — same read(2) boundary as
+            // `drive_tls` — rejected: as above.
             match self.conn.read_tls(&mut self.sock) {
                 // EOF with no buffered plaintext (checked above /
                 // drained below): clean close, surfaced as Ok(0)
@@ -284,9 +321,13 @@ impl Transport for TlsTransport {
                 Err(ref e) if e.kind() == io::ErrorKind::Other => {}
                 Err(e) => return Err(e),
             }
+            // COPY: ciphertext → plaintext (pull-through), ≤ 16 KiB
+            // per wave — rejected: as in `drive_tls`.
             self.conn
                 .process_new_packets()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // COPY: plaintext → `dst` (pull-through) — the same rx
+            // fill as the fast path above.
             let mut reader = self.conn.reader();
             match io::Read::read(&mut reader, dst) {
                 Ok(n) => return Ok(n),
@@ -308,8 +349,29 @@ impl Transport for TlsTransport {
     fn write(&mut self, src: &[u8]) -> io::Result<usize> {
         // rustls plaintext writer; buffers internally until we call
         // write_tls() on the next pump.
+        // COPY: plaintext → rustls sendable_tls, ≤ the caller's request
+        // (17 KiB for the exchange arm) — rustls encrypts out of its own
+        // buffer and exposes no borrowed-plaintext write API — rejected:
+        // none available; this is the TLS boundary copy.
         let mut writer = self.conn.writer();
         io::Write::write(&mut writer, src)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Same loop `drive_tls` runs after a WRITABLE event, invoked
+        // by the caller that knows it has just queued a request. Stops
+        // at WouldBlock; the remainder goes out on the next pump.
+        while self.conn.wants_write() {
+            // COPY: ciphertext user → kernel, ≤ rustls sendable_tls —
+            // the write(2) boundary — rejected: a registered-buffer
+            // API (io_uring/DPDK) is outside the no-async doctrine.
+            match self.conn.write_tls(&mut self.sock) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 

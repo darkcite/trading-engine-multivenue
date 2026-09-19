@@ -1903,6 +1903,84 @@ fn print_config(args: ConfigArgs) -> ExitCode {
 /// Boot a [`LiveDispatcher`] from the loaded config + secrets.
 /// Returns a static error message on any boot-time failure so the
 /// caller can surface a clean `EngineLoopResult::Failed`.
+/// **E6 commit 3/4 — the halt machine, wired.** Shared by both
+/// `--exec` arms (the real Hyperliquid arm and the refusing stub), so
+/// the halt file, the boot read-back and `--halt-slot` behave the same
+/// whatever sits behind the router.
+///
+/// `set_halt_path` before any halt can fire: the writer is a no-op
+/// without it, and a halt that leaves no file is cleared by the 00:10Z
+/// restart and resumes trading into whatever tripped it, unattended.
+fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
+    exec_dispatcher: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    eb: &cli::exec_boot::ExecBoot,
+    halt_mask: u8,
+) {
+    exec_dispatcher.set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
+    // **E6 commit 4 — read back what the last run halted.** Before
+    // anything else touches the table: a slot the last run stopped
+    // must not quote once while the boot is still talking.
+    let adopted = exec_dispatcher.adopt_halt_file();
+    if adopted == 0 && exec_dispatcher.halt_file_present() {
+        // **A halt file that halted nothing.** A mistyped slot, a slot
+        // that is not live, a line this binary could not parse — or,
+        // since the E7 review, a file that exists and could not be
+        // READ (permissions, over 512 B, not a regular file). Silence
+        // here would be the inverse of the failure below and strictly
+        // worse: an operator who asked for a halt, got a clean boot
+        // log, and an engine that trades.
+        error!(
+            file = %cli::exec_boot::halt_file_path(&eb.path).display(),
+            "exec: exec.HALT IS PRESENT BUT HALTED NOTHING — check that it is a plain \
+             file under 512 B this process can read, that the slot numbers are right \
+             (a line is `slot=<n> reason=<word>`, or a bare number) and that those \
+             slots are LIVE. The engine is trading."
+        );
+    }
+    if adopted > 0 {
+        // Deliberately loud, and deliberately an error rather than a
+        // warning. The failure this guards against is an operator
+        // reading a clean boot log, assuming the halt cleared, and
+        // waiting for quotes that are never coming.
+        error!(
+            slots = adopted,
+            file = %cli::exec_boot::halt_file_path(&eb.path).display(),
+            "exec: STARTED HALTED — a previous run left exec.HALT and those slots will \
+             refuse every order. Investigate the recorded reason, then DELETE the file \
+             and restart to clear."
+        );
+        for slot in 0..exec_router::EXEC_SLOTS {
+            let why = exec_dispatcher.halt().reason(slot);
+            if why.is_halted() {
+                error!(slot, reason = why.as_str(), "exec: slot halted");
+            }
+        }
+    }
+    if halt_mask != 0 {
+        // Live slots only — `halt_slot` refuses the rest, and says so
+        // here rather than claiming a paper slot will refuse orders it
+        // never routes through the latch.
+        let mut halted = 0u8;
+        for slot in 0..exec_router::EXEC_SLOTS {
+            if halt_mask & (1u8 << slot) == 0 {
+                continue;
+            }
+            if exec_dispatcher.halt_slot(slot, exec_router::HaltReason::Operator) {
+                halted |= 1u8 << slot;
+            } else {
+                warn!(slot, "--halt-slot: slot is not LIVE — nothing to halt, flag ignored for it");
+            }
+        }
+        if halted != 0 {
+            warn!(
+                halted = %cli::exec_boot::render_slot_mask(halted),
+                "--halt-slot: booting with LIVE slots already HALTED — they will refuse \
+                 every submit and modify until restarted without the flag"
+            );
+        }
+    }
+}
+
 fn boot_live_dispatcher(
     cfg: &Config,
     tls_config: std::sync::Arc<rustls::ClientConfig>,
@@ -2501,12 +2579,16 @@ fn run(args: RunArgs) -> ExitCode {
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
     let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
-    let fill_lane_cons = {
+    // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
+    // producer — the live arm's user-event pump. Until E7 every lane's
+    // producer was dropped here, so the E6 exposure ledger and the
+    // `on_fill_booked` ordering were reachable only from tests.
+    let (mut hl_fill_prod, fill_lane_cons) = {
         let (_f0p, f0) = rings.fill[0].clone().split();
         let (_f1p, f1) = rings.fill[1].clone().split();
         let (_f2p, f2) = rings.fill[2].clone().split();
-        let (_f3p, f3) = rings.fill[3].clone().split();
-        [f0, f1, f2, f3]
+        let (f3p, f3) = rings.fill[3].clone().split();
+        (Some(f3p), [f0, f1, f2, f3])
     };
     // AI command lane (Phase 8f). The producer half feeds the
     // `ingress-ai` thread (spawned below, gated on
@@ -3673,97 +3755,143 @@ fn run(args: RunArgs) -> ExitCode {
                 // rather than by care.
                 Some(eb) => {
                     cli::exec_boot::log_boot_tell(&eb);
-                    // **E6 commit 3 — the halt machine, wired.**
+                    // **E7 — the live arm.** A route table with
+                    // Hyperliquid live gets a real `HlExchange` behind
+                    // the router, fed by fill lane 3's producer and
+                    // configured from the `HYPERLIQUID_*` variables the
+                    // wrapper sourced from `.env`. Anything else keeps
+                    // the refusing stub, so LAW E-1 stays true by
+                    // construction on a boot that armed nothing.
                     //
-                    // `set_halt_path` before any halt can fire: the
-                    // writer is a no-op without it, and a halt that
-                    // leaves no file is cleared by the 00:10Z restart
-                    // and resumes trading into whatever tripped it,
-                    // unattended.
-                    let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
-                        eb.route,
-                        clob_dispatcher::PaperDispatcher::new(),
-                        exec_router::NullLiveDispatcher::new(),
-                        core_time::WallAnchor::now(),
-                    );
-                    exec_dispatcher
-                        .set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
-                    // **E6 commit 4 — read back what the last run
-                    // halted.** Before anything else touches the
-                    // table: a slot the last run stopped must not
-                    // quote once while the boot is still talking.
-                    let adopted = exec_dispatcher.adopt_halt_file();
-                    if adopted == 0 && exec_dispatcher.halt_file_present() {
-                        // **A halt file that halted nothing.** A
-                        // mistyped slot, a slot that is not live, or a
-                        // line this binary could not parse. Silence
-                        // here would be the inverse of the failure
-                        // below and strictly worse: an operator who
-                        // asked for a halt, got a clean boot log, and
-                        // an engine that trades.
-                        error!(
-                            file = %cli::exec_boot::halt_file_path(&eb.path).display(),
-                            "exec: exec.HALT IS PRESENT BUT HALTED NOTHING — check the \
-                             slot numbers (a line is `slot=<n> reason=<word>`, or a bare \
-                             number) and that those slots are LIVE. The engine is \
-                             trading."
-                        );
-                    }
-                    if adopted > 0 {
-                        // Deliberately loud, and deliberately an
-                        // error rather than a warning. The failure
-                        // this guards against is an operator reading
-                        // a clean boot log, assuming the halt
-                        // cleared, and waiting for quotes that are
-                        // never coming.
-                        error!(
-                            slots = adopted,
-                            file = %cli::exec_boot::halt_file_path(&eb.path).display(),
-                            "exec: STARTED HALTED — a previous run left exec.HALT \
-                             and those slots will refuse every order. Investigate \
-                             the recorded reason, then DELETE the file and restart \
-                             to clear."
-                        );
-                        for slot in 0..exec_router::EXEC_SLOTS {
-                            let why = exec_dispatcher.halt().reason(slot);
-                            if why.is_halted() {
-                                error!(slot, reason = why.as_str(), "exec: slot halted");
+                    // The two dispatcher types cannot share one binding
+                    // (the loop is monomorphised over `D`), so the halt
+                    // wiring below is a generic helper and the loop is
+                    // entered from two arms.
+                    if eb.route.venue_live(core_types::VenueId::Hyperliquid.to_u8()) {
+                        let hl_cfg = match exec_hyperliquid::HlConfig::from_env(
+                            exec_hyperliquid::Scope::Live,
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "exec: slot(s) LIVE on hyperliquid but the arm cannot be \
+                                     configured — boot aborted"
+                                );
+                                join_reverse(handles);
+                                return ExitCode::from(1);
                             }
+                        };
+                        // **LAW E-4's precondition.** The asset ids the
+                        // arm binds come from the MARKET-DATA ingress's
+                        // roll events; the orders go to the EXCHANGE
+                        // host. A testnet id is a mainnet stranger's
+                        // market and vice versa, so both hosts must be
+                        // on the same network or the boot refuses.
+                        let md_testnet = cfg.hyperliquid_ws_host.contains("testnet");
+                        let ex_testnet = hl_cfg.network == exec_hyperliquid::Network::Testnet;
+                        if md_testnet != ex_testnet {
+                            error!(
+                                market_data = %cfg.hyperliquid_ws_host,
+                                exchange = %hl_cfg.host,
+                                "exec: HYPERLIQUID_WS_HOST and HYPERLIQUID_EXCHANGE_HOST are on \
+                                 different networks — the roll events that bind asset ids \
+                                 would name another network's markets (LAW E-4). Point both \
+                                 at testnet or both at mainnet. Boot aborted."
+                            );
+                            join_reverse(handles);
+                            return ExitCode::from(1);
                         }
-                    }
-                    if halt_mask != 0 {
-                        warn!(
-                            halted = %cli::exec_boot::render_slot_mask(halt_mask),
-                            "--halt-slot: booting with slots already HALTED \
-                             — they will refuse every order until restarted \
-                             without the flag"
-                        );
-                        for slot in 0..exec_router::EXEC_SLOTS {
-                            if halt_mask & (1u8 << slot) != 0 {
-                                exec_dispatcher
-                                    .halt_slot(slot, exec_router::HaltReason::Operator);
+                        // The tightest floor across the live HL slots:
+                        // the budget is a property of the ADDRESS.
+                        let floor = eb
+                            .slots
+                            .iter()
+                            .filter(|s| s.is_live() && s.request_budget_floor > 0)
+                            .map(|s| s.request_budget_floor)
+                            .min()
+                            .and_then(|f| u64::try_from(f).ok())
+                            .unwrap_or(0);
+                        let budget_path = eb
+                            .path
+                            .parent()
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or_default()
+                            .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH);
+                        let Some(f3p) = hl_fill_prod.take() else {
+                            error!("exec: fill lane 3 producer already taken — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        };
+                        let arm = match exec_hyperliquid::HlExchange::new(
+                            &hl_cfg,
+                            TlsTransport::default_client_config(),
+                            f3p,
+                            budget_path.clone(),
+                            floor,
+                        ) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                error!(error = %e, "exec: hyperliquid arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
                             }
-                        }
-                    }
-                    if eb.any_live() {
+                        };
+                        info!(
+                            host = %hl_cfg.host,
+                            network = if ex_testnet { "testnet" } else { "MAINNET" },
+                            agent = %exec_hyperliquid::config::hex20(&hl_cfg.agent_addr),
+                            master = %exec_hyperliquid::config::hex20(&hl_cfg.master_addr),
+                            budget_floor = floor,
+                            budget_state = %budget_path.display(),
+                            "exec: hyperliquid arm ARMED"
+                        );
+                        let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
+                            eb.route,
+                            clob_dispatcher::PaperDispatcher::new(),
+                            arm,
+                            core_time::WallAnchor::now(),
+                        );
+                        wire_exec_halts(&mut exec_dispatcher, &eb, halt_mask);
                         info!(
                             live = %cli::exec_boot::render_slot_mask(eb.live_mask),
+                            network = if ex_testnet { "testnet" } else { "MAINNET" },
                             "running strategy-set with LIVE slots — real orders will be submitted"
                         );
+                        engine_loop_set_full(
+                            cons,
+                            engine_cfg,
+                            exec_dispatcher,
+                            obs,
+                            requested,
+                            vrp_boot.as_ref(),
+                            xsd_boot.as_ref(),
+                            bin15_boot.as_ref(),
+                            icdp_params.as_ref(),
+                            regime_boot.as_ref(),
+                        )
                     } else {
-                        info!(
-                            "running strategy-set PAPER (exec artifact present, nothing armed)                              — no orders will be submitted"
+                        // Nothing armed: the refusing stub, so a live
+                        // slot on a venue with no arm cannot exist here
+                        // (already refused by `exec_boot::resolve`).
+                        let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
+                            eb.route,
+                            clob_dispatcher::PaperDispatcher::new(),
+                            exec_router::NullLiveDispatcher::new(),
+                            core_time::WallAnchor::now(),
                         );
-                    }
-                    engine_loop_set_full(
-                        cons,
-                        engine_cfg,
-                        // E6: the anchor the venue-fill ledger's
-                        // 00:00Z day epoch needs. Taken HERE, at boot,
-                        // because an `Order`'s `ts_ns` is
-                        // `CLOCK_MONOTONIC_RAW` and the day cap is a
-                        // wall-clock fact; `strategy_bin15` anchors its
-                        // own day cap the same way.
+                        wire_exec_halts(&mut exec_dispatcher, &eb, halt_mask);
+                        info!(
+                            "running strategy-set PAPER (exec artifact present, nothing armed) \
+                             — no orders will be submitted"
+                        );
+                        // E6: `WallAnchor::now()` above is the anchor
+                        // the venue-fill ledger's 00:00Z day epoch
+                        // needs. Taken HERE, at boot, because an
+                        // `Order`'s `ts_ns` is `CLOCK_MONOTONIC_RAW` and
+                        // the day cap is a wall-clock fact;
+                        // `strategy_bin15` anchors its own day cap the
+                        // same way.
                         //
                         // The ledger is deliberately left UNSEEDED: it
                         // has not been reconciled against the venue, so
@@ -3773,16 +3901,20 @@ fn run(args: RunArgs) -> ExitCode {
                         // idle path. An `--exec` boot with a live slot
                         // therefore trades nothing until it has seen
                         // the venue, rather than clamping against a
-                        // position it has never seen.
-                        exec_dispatcher,
-                        obs,
-                        requested,
-                        vrp_boot.as_ref(),
-                        xsd_boot.as_ref(),
-                        bin15_boot.as_ref(),
-                        icdp_params.as_ref(),
-                        regime_boot.as_ref(),
-                    )
+                        // position it has never seen. (Both arms.)
+                        engine_loop_set_full(
+                            cons,
+                            engine_cfg,
+                            exec_dispatcher,
+                            obs,
+                            requested,
+                            vrp_boot.as_ref(),
+                            xsd_boot.as_ref(),
+                            bin15_boot.as_ref(),
+                            icdp_params.as_ref(),
+                            regime_boot.as_ref(),
+                        )
+                    }
                 }
             }
         }

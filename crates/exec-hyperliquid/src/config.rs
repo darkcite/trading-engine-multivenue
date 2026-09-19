@@ -259,6 +259,8 @@ impl HlConfig {
         if let Some(expected) = expected {
             if expected != source {
                 return Err(ConfigErr::HostSourceMismatch {
+                    // COPY: the host name into the boot-refusal error
+                    // (cold; the process is about to exit on it).
                     host: host.to_owned(),
                     source,
                     expected,
@@ -275,6 +277,9 @@ impl HlConfig {
             _ => ConfigErr::BadKey,
         })?;
         Ok(Self {
+            // COPY: ≤ 64 B host name into the config, ONCE at boot —
+            // the env var's storage is not ours to borrow for the
+            // process lifetime.
             host: host.to_owned(),
             network,
             agent_key,
@@ -292,6 +297,8 @@ impl HlConfig {
     pub fn from_env(scope: Scope) -> Result<Self, ConfigErr> {
         // Only the TESTNET scope defaults. The live arm states its
         // host and its source out loud or it does not boot.
+        // COPY: the two testnet DEFAULTS materialised as Strings at
+        // boot so both arms of the match own their value (cold, once).
         let host = match (std::env::var(scope.host_var()).ok(), scope) {
             (Some(h), _) => h,
             (None, Scope::Testnet) => HOST_TESTNET.to_owned(),
@@ -299,6 +306,7 @@ impl HlConfig {
         };
         let source_s = match (std::env::var(scope.source_var()).ok(), scope) {
             (Some(s), _) => s,
+            // COPY: as above, the 1 B source default (cold, once).
             (None, Scope::Testnet) => "b".to_owned(),
             (None, Scope::Live) => return Err(ConfigErr::Missing(scope.source_var())),
         };

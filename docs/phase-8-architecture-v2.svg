@@ -1,0 +1,627 @@
+<svg viewBox="0 0 1680 1472" width="1680" height="1472" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" xmlns:c2pa="http://c2pa.org/manifest"><metadata><c2pa:manifest>AAAWgmp1bWIAAAAeanVtZGMycGEAEQAQgAAAqgA4m3EDYzJwYQAAABZcanVtYgAAAEdqdW1kYzJtYQARABCAAACqADibcQN1cm46YzJwYTo4NjU4ZGY5OS0yOWQ4LTRjMmItOTgxMi00ZjJlODc2NTBkYjUAAAADl2p1bWIAAAApanVtZGMyYXMAEQAQgAAAqgA4m3EDYzJwYS5hc3NlcnRpb25zAAAAALxqdW1iAAAARGp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuaW5ncmVkaWVudC52MwAAAAAYYzJzaMKyN/yfjmfpA78p9oNP96sAAABwY2JvcqNpZGM6Zm9ybWF0bWltYWdlL3N2Zyt4bWxqaW5zdGFuY2VJRHgseG1wOmlpZDpjODQzYmIzMS0zOWZiLTQ5ZmEtYTk2Yi0xYTc1MmVhNDdkNThscmVsYXRpb25zaGlwaHBhcmVudE9mAAAB4mp1bWIAAABBanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5hY3Rpb25zLnYyAAAAABhjMnNo2YflUZ7vGVqGNGSDogzvKwAAAZljYm9yomdhY3Rpb25zgqJmYWN0aW9ua2MycGEub3BlbmVkanBhcmFtZXRlcnOha2luZ3JlZGllbnRzgaJjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFggn+sRkQZe01xDf3E5mcQyhdf2+aJG9NfswWUm0RLlXiKkZmFjdGlvbngdY29tLmFudGhyb3BpYy5jbGF1ZGUucHJvdmlkZWRqcGFyYW1ldGVyc6F4H2NvbS5hbnRocm9waWMub3JpZ2luLWNvbmZpZGVuY2VndW5rbm93bmtkZXNjcmlwdGlvbnhmQ2xhdWRlIHByb3ZpZGVkIHRoaXMgZmlsZSBhdCB0aGUgcmVxdWVzdCBvZiBhIHVzZXIgYW5kIG1heSBoYXZlIGNyZWF0ZWQgb3IgbW9kaWZpZWQgdGhlIGZpbGUgY29udGVudHMubXNvZnR3YXJlQWdlbnShZG5hbWVmQ2xhdWRlcmFsbEFjdGlvbnNJbmNsdWRlZPUAAADIanVtYgAAAEBqdW1kY2JvcgARABCAAACqADibcRNjMnBhLmhhc2guZGF0YQAAAAAYYzJzaNjBV+idpFzJznzT27EswTwAAACAY2JvcqVjYWxnZnNoYTI1NmNwYWRMAAAAAAAAAAAAAAAAZGhhc2hYIC47qjPI+9pvjd6LX8HjXbGzeJRPdD8WJLTRKuXlujEeZG5hbWVuanVtYmYgbWFuaWZlc3RqZXhjbHVzaW9uc4GiZXN0YXJ0GQELZmxlbmd0aBkeBAAAAj5qdW1iAAAAJ2p1bWRjMmNsABEAEIAAAKoAOJtxA2MycGEuY2xhaW0udjIAAAACD2Nib3KlY2FsZ2ZzaGEyNTZpc2lnbmF0dXJleE1zZWxmI2p1bWJmPS9jMnBhL3VybjpjMnBhOjg2NThkZjk5LTI5ZDgtNGMyYi05ODEyLTRmMmU4NzY1MGRiNS9jMnBhLnNpZ25hdHVyZWppbnN0YW5jZUlEeCx4bXA6aWlkOjNjYTZlOWVkLWMyNzYtNDE5Yy1hMjMxLTM1OGJlZTdlNjk2YXJjcmVhdGVkX2Fzc2VydGlvbnODomN1cmx4LXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaW5ncmVkaWVudC52M2RoYXNoWCCf6xGRBl7TXEN/cTmZxDKF1/b5okb01+zBZSbREuVeIqJjdXJseCpzZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmFjdGlvbnMudjJkaGFzaFggh3l68upJxNcMBx95lwRJl1KnaC6xFPgab+oxeoUyXq6iY3VybHgpc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5oYXNoLmRhdGFkaGFzaFggDTmo5mqcox//CXVg25ni0Rc75K1/+guuveNppOf0/SZ0Y2xhaW1fZ2VuZXJhdG9yX2luZm+jZG5hbWVvQW50aHJvcGljIEZpbGVzZ3ZlcnNpb25lMS4wLjBrc3BlY1ZlcnNpb25lMi40LjAAABA4anVtYgAAAChqdW1kYzJjcwARABCAAACqADibcQNjMnBhLnNpZ25hdHVyZQAAABAIY2JvctKEWQISogEmGCFZAgowggIGMIIBjaADAgECAhRA5aAK7sI50L64g/oGQgU9Z1UTADAKBggqhkjOPQQDAzBJMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEuMCwGA1UEAxMlQW50aHJvcGljIENvbnRlbnQgQ3JlZGVudGlhbHMgUm9vdCBDQTAeFw0yNjA4MDcxODQzNTZaFw0yODA4MDYxOTQzNTZaMEQxFzAVBgNVBAoTDkFudGhyb3BpYywgUEJDMSkwJwYDVQQDEyBBbnRocm9waWMgQ2xhdWRlIENvbnRlbnQgU2lnbmluZzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJh6CmvLUBgFFNU0vUKlOVtE6djd17L5SuwX0LemFisBM3dkd/3cyjxFA3Qo5S46fX0/ihY0VZ7mfb9KF703t5OjWDBWMA4GA1UdDwEB/wQEAwIHgDAVBgNVHSUEDjAMBgorBgEEAYPoXgIBMAwGA1UdEwEB/wQCMAAwHwYDVR0jBBgwFoAUzlHiBIFOZFsj+OPEz5o+nMHXXMIwCgYIKoZIzj0EAwMDZwAwZAIwMXMdFJ4BetLLVY7ORuE9noqbbAZOZn/aArXyTwFAZfKrPzxF2vPoJNf1+UCdg1XGAjBwX1zd9WGqYkqmL5SFqw1QySjr1zJfpJM9+1rdDwSPLMOPOjKuiXjoU/pUUeG9RwmhY3BhZFkNngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPZYQJyWuWrxhjO0qfnHFFJAntlyrPfw2RKFS36WCM2Ed7hayadZy81o3+O1r/Nkhzkxzt5iuj/coQ7Eq2HOKPIMVK8=</c2pa:manifest></metadata>
+<title id="ttl">Multivenue engine — live architecture, 2026-09-19</title>
+<desc id="dsc">Seven venues stream into a single-writer Rust engine over SPSC rings; eight strategy slots evaluate in-line on the engine thread; every record is appended to PMLR capture; an out-of-process model sidecar bay plugs in over an 82-byte HMAC&#x27;d Unix-socket frame through two doors — live fair values into slot 4, or a compiled 256-row ruleset into slot 5. The live-execution arm is built and dark.</desc>
+<!-- Live architecture one-pager. Actualized 2026-09-19 at HEAD 1225651. Supersedes docs/arch/phase-8-architecture.svg (2026-08-29) which is kept unmodified as the Stage-2-FINISH record. Every constant here was read from crates/ at that HEAD; file:line citations inline. -->
+<defs>
+<marker id="aI" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#3f4a5a"/></marker>
+<marker id="aB" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#1d4ed8"/></marker>
+<marker id="aG" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#047857"/></marker>
+<marker id="aP" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#6d28d9"/></marker>
+<marker id="aA" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#b45309"/></marker>
+<marker id="aR" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#b91c1c"/></marker>
+<marker id="aS" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#94a3b8"/></marker>
+<marker id="aT" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#0e7490"/></marker>
+</defs>
+<style>
+text{dominant-baseline:auto}
+.m{fill:#7c8798}.f{fill:#9aa5b4}.i{fill:#14181f}.i2{fill:#3f4a5a}
+</style>
+<rect x="0" y="0" width="1680" height="1472" fill="#ffffff"/>
+<text x="36" y="32" font-size="19" font-weight="700" fill="#14181f">Multivenue engine — live architecture</text>
+<text x="36" y="50" font-size="8.6" fill="#3f4a5a"><tspan font-weight="700" fill="#3f4a5a">actualized 2026-09-19 at the E7 review commit (E1–E7 on top of 49d155d)</tspan><tspan fill="#7c8798">   ·   supersedes </tspan><tspan font-weight="700" fill="#7c8798">docs/arch/phase-8-architecture.svg</tspan><tspan fill="#7c8798"> (2026-08-29, Stage-2 FINISH), which is kept unmodified as that record</tspan></text>
+<text x="36" y="64" font-size="8.6" fill="#3f4a5a"><tspan font-weight="700" fill="#047857">Everything trades PAPER until the operator arms a slot. </tspan><tspan fill="#7c8798">The live-execution arm (E1–E6, reviewed + re-tested in E7) is built and REACHABLE: </tspan><tspan font-weight="700" fill="#b45309">--exec exec.toml --arm-live 3</tspan><tspan fill="#7c8798"> builds a real HlExchange behind the router (LIVE_ARM_VENUES = [Hyperliquid]); E7 = the TESTNET ramp, mainnet a later ruling.</tspan></text>
+<rect x="1096" y="23" width="15" height="10.5" rx="2.5" fill="rgba(4,120,87,0.06)" stroke="#047857" stroke-width="1.1"/>
+<text x="1116" y="32" font-size="7.6" fill="#7c8798">live in paper</text>
+<rect x="1192.5" y="23" width="15" height="10.5" rx="2.5" fill="rgba(180,83,9,0.055)" stroke="#b45309" stroke-width="1.1" stroke-dasharray="4 2.5"/>
+<text x="1212.5" y="32" font-size="7.6" fill="#7c8798">built · armed by --exec</text>
+<rect x="1325.0" y="23" width="15" height="10.5" rx="2.5" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="1.1" stroke-dasharray="5 3"/>
+<text x="1345.0" y="32" font-size="7.6" fill="#7c8798">operator-gated</text>
+<rect x="1426.0" y="23" width="15" height="10.5" rx="2.5" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.1"/>
+<text x="1446.0" y="32" font-size="7.6" fill="#7c8798">AI / model plane</text>
+<line x1="36" y1="78" x2="1644" y2="78" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.5"/>
+<rect x="36" y="92" width="1608" height="112" rx="9" fill="rgba(148,163,184,0.045)" stroke="#94a3b8" stroke-width="1.15"/>
+<text x="49" y="109" font-size="9.4" font-weight="700" fill="#94a3b8">VENUES — 7 VenueId bytes (core-types/src/lib.rs:55-70) · TLS 1.3 via rustls · WebSocket de-framed and unmasked in place</text>
+<rect x="48.0" y="117" width="218.5" height="70" rx="6" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="58.0" y="132" font-size="9.6" font-weight="700" fill="#14181f">Polymarket</text>
+<rect x="239.5" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#94a3b8" stroke-width="0.9"/>
+<text x="248.744" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#94a3b8">0</text>
+<text x="58.0" y="145.0" font-size="6.9" fill="#7c8798">CLOB WSS book + price_change</text>
+<text x="58.0" y="154.2" font-size="6.9" fill="#7c8798">YES/NO pairs · Gamma discovery</text>
+<text x="58.0" y="163.4" font-size="6.9" fill="#7c8798">BTC up/down dailies (16:00Z)</text>
+<rect x="271.7" y="117" width="218.5" height="70" rx="6" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="281.7" y="132" font-size="9.6" font-weight="700" fill="#14181f">Binance</text>
+<rect x="463.2" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#94a3b8" stroke-width="0.9"/>
+<text x="472.44399999999996" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#94a3b8">1</text>
+<text x="281.7" y="145.0" font-size="6.9" fill="#7c8798">spot ×N · USDS-M · dated</text>
+<text x="281.7" y="154.2" font-size="6.9" fill="#7c8798">ONE socket + ONE thread per symbol</text>
+<text x="281.7" y="163.4" font-size="6.9" fill="#7c8798">254 sockets at the 09-12 mark</text>
+<rect x="495.4" y="117" width="218.5" height="70" rx="6" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="505.4" y="132" font-size="9.6" font-weight="700" fill="#14181f">OKX</text>
+<rect x="686.9" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#94a3b8" stroke-width="0.9"/>
+<text x="696.144" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#94a3b8">2</text>
+<text x="505.4" y="145.0" font-size="6.9" fill="#7c8798">v5: spot · swap · futures · OPTION</text>
+<text x="505.4" y="154.2" font-size="6.9" fill="#7c8798">bbo-tbt · trades · funding</text>
+<text x="505.4" y="163.4" font-size="6.9" fill="#7c8798">books L2 → DepthTopK · opt-summary</text>
+<rect x="719.0999999999999" y="117" width="218.5" height="70" rx="6" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="729.0999999999999" y="132" font-size="9.6" font-weight="700" fill="#14181f">Deribit</text>
+<rect x="910.5999999999999" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#94a3b8" stroke-width="0.9"/>
+<text x="919.8439999999999" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#94a3b8">3</text>
+<text x="729.0999999999999" y="145.0" font-size="6.9" fill="#7c8798">JSON-RPC: perps · options · spot</text>
+<text x="729.0999999999999" y="154.2" font-size="6.9" fill="#7c8798">change_id chain · book.100ms L2</text>
+<text x="729.0999999999999" y="163.4" font-size="6.9" fill="#7c8798">ticker + funding · DVOL</text>
+<rect x="942.8" y="117" width="218.5" height="70" rx="6" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="952.8" y="132" font-size="9.6" font-weight="700" fill="#14181f">Hyperliquid</text>
+<rect x="1134.3" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#94a3b8" stroke-width="0.9"/>
+<text x="1143.5439999999999" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#94a3b8">4</text>
+<text x="952.8" y="145.0" font-size="6.9" fill="#7c8798">bbo · l2Book · activeAssetCtx</text>
+<text x="952.8" y="154.2" font-size="6.9" fill="#7c8798">perps · spot @idx · HIP-3/4 #enc</text>
+<text x="952.8" y="163.4" font-size="6.9" fill="#7c8798">outcomeMeta pass-through</text>
+<rect x="1166.5" y="117" width="218.5" height="70" rx="6" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1176.5" y="132" font-size="9.6" font-weight="700" fill="#6d28d9">Ai</text>
+<rect x="1358.0" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1367.244" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">5</text>
+<text x="1176.5" y="145.0" font-size="6.9" fill="#7c8798">not a market feed — the byte the</text>
+<text x="1176.5" y="154.2" font-size="6.9" fill="#7c8798">AI command plane owns</text>
+<text x="1176.5" y="163.4" font-size="6.9" fill="#7c8798">UDS, never a network socket</text>
+<rect x="1390.1999999999998" y="117" width="218.5" height="70" rx="6" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="1400.1999999999998" y="132" font-size="9.6" font-weight="700" fill="#14181f">Bybit</text>
+<rect x="1581.6999999999998" y="123" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#94a3b8" stroke-width="0.9"/>
+<text x="1590.9439999999997" y="131.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#94a3b8">6</text>
+<text x="1400.1999999999998" y="145.0" font-size="6.9" fill="#7c8798">v5 WS spot + linear</text>
+<text x="1400.1999999999998" y="154.2" font-size="6.9" fill="#7c8798">data-only sixth venue</text>
+<text x="1400.1999999999998" y="163.4" font-size="6.9" fill="#7c8798">1e-9 px law · truncate rule</text>
+<text x="48" y="197" font-size="7.1" fill="#9aa5b4">Alchemy RPC rides its own thread and emits Signal, not Tick — it holds no VenueId byte and no tick lane.  ·  Venue REST (keyless, RestBudget 60 req/venue/h) is worker-only and never touches the engine.</text>
+<rect x="36" y="218" width="1024" height="130" rx="9" fill="rgba(29,78,216,0.055)" stroke="#1d4ed8" stroke-width="1.15"/>
+<text x="49" y="235" font-size="9.4" font-weight="700" fill="#1d4ed8">INGRESS THREADS — mio + rustls · handwritten byte scanners · no tokio, no serde_json, no allocation after boot</text>
+<rect x="49.0" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="109.625" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">polymarket</text>
+<text x="109.625" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 1</text>
+<text x="109.625" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 64 KiB</text>
+<rect x="174.25" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="234.875" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">binance</text>
+<text x="234.875" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 2</text>
+<text x="234.875" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 64 KiB ×N</text>
+<rect x="299.5" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="360.125" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">okx</text>
+<text x="360.125" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 5</text>
+<text x="360.125" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 4 MiB</text>
+<rect x="424.75" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="485.375" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">deribit</text>
+<text x="485.375" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 6</text>
+<text x="485.375" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 4 MiB</text>
+<rect x="550.0" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="610.625" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">hyperliquid</text>
+<text x="610.625" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 7</text>
+<text x="610.625" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 256 KiB</text>
+<rect x="675.25" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="735.875" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">bybit</text>
+<text x="735.875" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 8</text>
+<text x="735.875" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 256 KiB</text>
+<rect x="800.5" y="244" width="121.25" height="40" rx="5" fill="rgba(29,78,216,0.07)" stroke="#1d4ed8" stroke-width="1.0"/>
+<text x="861.125" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#1d4ed8">rpc</text>
+<text x="861.125" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 3</text>
+<text x="861.125" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">RX 64 KiB</text>
+<rect x="925.75" y="244" width="121.25" height="40" rx="5" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="986.375" y="258" font-size="8.2" font-weight="700" text-anchor="middle" fill="#6d28d9">ai</text>
+<text x="986.375" y="271" font-size="6.9" text-anchor="middle" fill="#7c8798">core 4</text>
+<text x="986.375" y="280" font-size="6.3" text-anchor="middle" fill="#9aa5b4">UDS 4 KiB</text>
+<rect x="49" y="291" width="998" height="60.199999999999996" rx="6" fill="rgba(185,28,28,0.055)" stroke="#b91c1c" stroke-width="1.05"/>
+<text x="59" y="308.4" font-size="8.4" font-weight="700" fill="#b91c1c">the core map is advisory on the live deployment</text>
+<text x="59" y="321.29999999999995" font-size="7.2" fill="#3f4a5a">sched_setaffinity(2) on Linux is real and kernel-enforced.  On macOS — the machine this actually runs on — pin_impl() returns Err(Unsupported) and logs one warning:</text>
+<text x="59" y="331.09999999999997" font-size="7.2" fill="#3f4a5a">every &quot;pinned&quot; thread below floats under the Darwin scheduler (cli/src/pinning.rs:92-99).  The engine&#x27;s own hot loop is never pinned on any platform, on purpose or otherwise.</text>
+<rect x="36" y="360" width="1024" height="236" rx="9" fill="rgba(29,78,216,0.035)" stroke="#1d4ed8" stroke-width="1.15"/>
+<text x="49" y="377" font-size="9.4" font-weight="700" fill="#1d4ed8">SPSC RINGS — core-ring::Ring&lt;T,N&gt;, the only ring primitive in the tree · N a power of two · head and tail each own a full 64 B cache line</text>
+<text x="56" y="398" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">ring · element</text>
+<text x="245.0" y="398" font-size="6.9" font-weight="700" text-anchor="middle" letter-spacing="0.2" fill="#7c8798">lanes</text>
+<text x="324" y="398" font-size="6.9" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">cap / lane</text>
+<text x="368" y="398" font-size="6.9" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">slot</text>
+<text x="434" y="398" font-size="6.9" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">total</text>
+<text x="438" y="398" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">producer</text>
+<text x="648" y="398" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">on full</text>
+<text x="804" y="398" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">where</text>
+<line x1="54" y1="401.6" x2="990" y2="401.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="56" y="411.1" font-size="7.15" font-weight="700" fill="#14181f">Tick</text>
+<text x="245.0" y="411.1" font-size="7.15" text-anchor="middle" fill="#3f4a5a">6</text>
+<text x="324" y="411.1" font-size="7.15" text-anchor="end" fill="#3f4a5a">16 384</text>
+<text x="368" y="411.1" font-size="7.15" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="434" y="411.1" font-size="7.15" font-weight="700" text-anchor="end" fill="#14181f">6.00 MiB</text>
+<text x="438" y="411.1" font-size="7.15" fill="#3f4a5a">one ingress thread per venue</text>
+<text x="648" y="411.1" font-size="7.15" fill="#3f4a5a">drop + count, never block</text>
+<text x="804" y="411.1" font-size="7.15" fill="#3f4a5a">engine/src/lib.rs:67,81</text>
+<rect x="52" y="415.9" width="942" height="12.9" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="424.0" font-size="7.15" font-weight="700" fill="#14181f">ChannelEvent</text>
+<text x="245.0" y="424.0" font-size="7.15" text-anchor="middle" fill="#3f4a5a">6</text>
+<text x="324" y="424.0" font-size="7.15" text-anchor="end" fill="#3f4a5a">1 024</text>
+<text x="368" y="424.0" font-size="7.15" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="434" y="424.0" font-size="7.15" text-anchor="end" fill="#3f4a5a">384.8 KiB</text>
+<text x="438" y="424.0" font-size="7.15" fill="#b45309">lane 0 (PM) has no producer</text>
+<text x="648" y="424.0" font-size="7.15" fill="#3f4a5a">drop + count</text>
+<text x="804" y="424.0" font-size="7.15" fill="#3f4a5a">core-types:1685</text>
+<text x="56" y="436.9" font-size="7.15" font-weight="700" fill="#14181f">DepthTopK</text>
+<text x="245.0" y="436.9" font-size="7.15" text-anchor="middle" fill="#3f4a5a">2</text>
+<text x="324" y="436.9" font-size="7.15" text-anchor="end" fill="#3f4a5a">4 096</text>
+<text x="368" y="436.9" font-size="7.15" font-weight="700" text-anchor="end" fill="#b45309">192 B</text>
+<text x="434" y="436.9" font-size="7.15" text-anchor="end" fill="#3f4a5a">1.50 MiB</text>
+<text x="438" y="436.9" font-size="7.15" fill="#3f4a5a">okx · deribit book walkers</text>
+<text x="648" y="436.9" font-size="7.15" fill="#3f4a5a">drop + count</text>
+<text x="804" y="436.9" font-size="7.15" fill="#3f4a5a">core-types:1449</text>
+<rect x="52" y="441.69999999999993" width="942" height="12.9" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="449.79999999999995" font-size="7.15" font-weight="700" fill="#14181f">OptSummary</text>
+<text x="245.0" y="449.79999999999995" font-size="7.15" text-anchor="middle" fill="#3f4a5a">3</text>
+<text x="324" y="449.79999999999995" font-size="7.15" text-anchor="end" fill="#3f4a5a">4 096</text>
+<text x="368" y="449.79999999999995" font-size="7.15" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="434" y="449.79999999999995" font-size="7.15" text-anchor="end" fill="#3f4a5a">768.0 KiB</text>
+<text x="438" y="449.79999999999995" font-size="7.15" fill="#b45309">lane 2 (bn eapi) venue-dark</text>
+<text x="648" y="449.79999999999995" font-size="7.15" fill="#3f4a5a">drop + count</text>
+<text x="804" y="449.79999999999995" font-size="7.15" fill="#3f4a5a">core-types:1715</text>
+<text x="56" y="462.69999999999993" font-size="7.15" font-weight="700" fill="#14181f">Signal</text>
+<text x="245.0" y="462.69999999999993" font-size="7.15" text-anchor="middle" fill="#3f4a5a">1</text>
+<text x="324" y="462.69999999999993" font-size="7.15" text-anchor="end" fill="#3f4a5a">1 024</text>
+<text x="368" y="462.69999999999993" font-size="7.15" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="434" y="462.69999999999993" font-size="7.15" text-anchor="end" fill="#3f4a5a">64.1 KiB</text>
+<text x="438" y="462.69999999999993" font-size="7.15" fill="#3f4a5a">ingress-rpc newHeads</text>
+<text x="648" y="462.69999999999993" font-size="7.15" fill="#3f4a5a">drop + count</text>
+<text x="804" y="462.69999999999993" font-size="7.15" fill="#3f4a5a">engine/src/lib.rs:71</text>
+<rect x="52" y="467.4999999999999" width="942" height="12.9" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="475.5999999999999" font-size="7.15" font-weight="700" fill="#14181f">AiCmd</text>
+<text x="245.0" y="475.5999999999999" font-size="7.15" text-anchor="middle" fill="#3f4a5a">1</text>
+<text x="324" y="475.5999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">1 024</text>
+<text x="368" y="475.5999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="434" y="475.5999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">64.1 KiB</text>
+<text x="438" y="475.5999999999999" font-size="7.15" font-weight="700" fill="#6d28d9">ingress-ai — the model door</text>
+<text x="648" y="475.5999999999999" font-size="7.15" fill="#3f4a5a">drop + count</text>
+<text x="804" y="475.5999999999999" font-size="7.15" fill="#3f4a5a">core-types:1678</text>
+<text x="56" y="488.4999999999999" font-size="7.15" font-weight="700" fill="#14181f">RuleTableSlot</text>
+<text x="245.0" y="488.4999999999999" font-size="7.15" text-anchor="middle" fill="#3f4a5a">1</text>
+<text x="324" y="488.4999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">2</text>
+<text x="368" y="488.4999999999999" font-size="7.15" font-weight="700" text-anchor="end" fill="#6d28d9">32 832 B</text>
+<text x="434" y="488.4999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">64.3 KiB</text>
+<text x="438" y="488.4999999999999" font-size="7.15" fill="#6d28d9">ingress-ai validator, by value</text>
+<text x="648" y="488.4999999999999" font-size="7.15" fill="#3f4a5a">operator cadence, not per tick</text>
+<text x="804" y="488.4999999999999" font-size="7.15" fill="#3f4a5a">core-types:2460</text>
+<rect x="52" y="493.29999999999984" width="942" height="12.9" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="501.39999999999986" font-size="7.15" font-weight="700" fill="#b91c1c">Fill</text>
+<text x="245.0" y="501.39999999999986" font-size="7.15" text-anchor="middle" fill="#b91c1c">4</text>
+<text x="324" y="501.39999999999986" font-size="7.15" text-anchor="end" fill="#b91c1c">1 024</text>
+<text x="368" y="501.39999999999986" font-size="7.15" text-anchor="end" fill="#b91c1c">64 B</text>
+<text x="434" y="501.39999999999986" font-size="7.15" text-anchor="end" fill="#b91c1c">256.5 KiB</text>
+<text x="438" y="501.39999999999986" font-size="7.15" font-weight="700" fill="#b45309">lane 3 = the HL arm's userFills pump (--exec)</text>
+<text x="648" y="501.39999999999986" font-size="7.15" fill="#b91c1c">drained empty every pass</text>
+<text x="804" y="501.39999999999986" font-size="7.15" fill="#b91c1c">multivenue-engine.rs:2492</text>
+<text x="56" y="514.2999999999998" font-size="7.15" font-weight="700" fill="#14181f">Order (exec hop)</text>
+<text x="245.0" y="514.2999999999998" font-size="7.15" text-anchor="middle" fill="#3f4a5a">1</text>
+<text x="324" y="514.2999999999998" font-size="7.15" text-anchor="end" fill="#3f4a5a">1 024</text>
+<text x="368" y="514.2999999999998" font-size="7.15" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="434" y="514.2999999999998" font-size="7.15" text-anchor="end" fill="#3f4a5a">64.1 KiB</text>
+<text x="438" y="514.2999999999998" font-size="7.15" fill="#3f4a5a">engine thread → clob-dispatcher</text>
+<text x="648" y="514.2999999999998" font-size="7.15" fill="#3f4a5a">backpressure to caller</text>
+<text x="804" y="514.2999999999998" font-size="7.15" fill="#3f4a5a">clob-dispatcher/queued.rs:61</text>
+<line x1="52" y1="522.6999999999998" x2="1044" y2="522.6999999999998" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
+<text x="56" y="535.6999999999998" font-size="7.5" fill="#3f4a5a"><tspan font-size="9.4" font-weight="700" fill="#1d4ed8">9.07 MiB</tspan><tspan fill="#3f4a5a">  of ring memory total, allocated once at boot and never resized.  </tspan><tspan font-weight="700" fill="#14181f">Ring&lt;T,N&gt; is SPSC only</tspan><tspan fill="#3f4a5a"> — no MPSC type exists anywhere in the workspace; every multi-producer need is</tspan></text>
+<text x="56" y="546.6999999999998" font-size="7.2" fill="#7c8798">solved with one dedicated ring per venue lane.  try_push returns Err(value) on a full ring: the ring itself never drops — the ingress caller drops the value and bumps engine_ingress_&lt;venue&gt;_ring_drops_total.</text>
+<text x="56" y="558.1999999999998" font-size="7.0" fill="#9aa5b4">Not core-ring rings, don&#x27;t conflate: RecentRing&lt;Order|Fill,64&gt; (overwrite-on-wrap, feeds /state + TUI) and TidRing&lt;4096&gt; (Hyperliquid trade-id dedupe inside HlExchange — O(1) since the E7 review).</text>
+<rect x="36" y="610" width="1024" height="152" rx="9" fill="rgba(4,120,87,0.06)" stroke="#047857" stroke-width="1.15"/>
+<text x="49" y="627" font-size="9.4" font-weight="700" fill="#047857">THE HOT LOOP — Engine::tick(DRAIN_BATCH=256) on the single, unpinned main thread · generic over Strategy, monomorphized, no dyn</text>
+<rect x="49.0" y="638" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="56.0" y="644" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="65.244" y="652.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">1</text>
+<text x="80.488" y="653" font-size="7.9" font-weight="700" fill="#14181f">tick lanes 0–5</text>
+<text x="56.0" y="667.0" font-size="6.6" fill="#7c8798">fixed VenueId order · disp.observe_tick() fires</text>
+<text x="56.0" y="675.7" font-size="6.6" fill="#7c8798">BEFORE strat.on_tick()</text>
+<rect x="248.6" y="638" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="255.6" y="644" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="264.844" y="652.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">2</text>
+<text x="280.08799999999997" y="653" font-size="7.9" font-weight="700" fill="#14181f">signal lane</text>
+<text x="255.6" y="667.0" font-size="6.6" fill="#7c8798">→ on_signal</text>
+<rect x="448.2" y="638" width="194.6" height="46" rx="5" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="1.0"/>
+<rect x="455.2" y="644" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#b45309" stroke-width="0.9"/>
+<text x="464.44399999999996" y="652.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#b45309">3</text>
+<text x="479.688" y="653" font-size="7.9" font-weight="700" fill="#14181f">fill lanes 0–3</text>
+<text x="455.2" y="667.0" font-size="6.6" fill="#7c8798">capture BEFORE callback · lane 3 carries venue fills on --exec</text>
+<rect x="647.8" y="638" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="654.8" y="644" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="664.044" y="652.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">4</text>
+<text x="679.288" y="653" font-size="7.9" font-weight="700" fill="#14181f">dispatcher fill pump</text>
+<text x="654.8" y="667.0" font-size="6.6" fill="#7c8798">disp.try_next_fill() — the ONLY live fill source</text>
+<text x="654.8" y="675.7" font-size="6.6" fill="#7c8798">(paper matcher)</text>
+<rect x="847.4" y="638" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="854.4" y="644" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="863.644" y="652.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">5</text>
+<text x="878.8879999999999" y="653" font-size="7.9" font-weight="700" fill="#14181f">venue-event lanes 0–5</text>
+<text x="854.4" y="667.0" font-size="6.6" fill="#7c8798">disp.on_venue_event() first: a roll tells the</text>
+<text x="854.4" y="675.7" font-size="6.6" fill="#7c8798">live arm how to route</text>
+<rect x="49.0" y="690" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="56.0" y="696" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="65.244" y="704.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">6</text>
+<text x="80.488" y="705" font-size="7.9" font-weight="700" fill="#14181f">depth lanes 0–1</text>
+<text x="56.0" y="719.0" font-size="6.6" fill="#7c8798">okx · deribit → on_depth (the ruleset VM only)</text>
+<rect x="248.6" y="690" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="255.6" y="696" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="264.844" y="704.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">7</text>
+<text x="280.08799999999997" y="705" font-size="7.9" font-weight="700" fill="#14181f">opt-summary lanes 0–2</text>
+<text x="255.6" y="719.0" font-size="6.6" fill="#7c8798">→ on_opt_summary (the VM and one coded member)</text>
+<rect x="448.2" y="690" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="455.2" y="696" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="464.44399999999996" y="704.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">8</text>
+<text x="479.688" y="705" font-size="7.9" font-weight="700" fill="#14181f">ruleset-table lane</text>
+<text x="455.2" y="719.0" font-size="6.6" fill="#7c8798">drained TO EMPTY, every pass, immediately before</text>
+<text x="455.2" y="727.7" font-size="6.6" fill="#7c8798">the AI drain</text>
+<rect x="647.8" y="690" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="654.8" y="696" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="664.044" y="704.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">9</text>
+<text x="679.288" y="705" font-size="7.9" font-weight="700" fill="#14181f">AiCmd lane</text>
+<text x="654.8" y="719.0" font-size="6.6" fill="#7c8798">budget 8/pass · TTL re-checked on pop, then shape</text>
+<text x="654.8" y="727.7" font-size="6.6" fill="#7c8798">re-checked, then on_ai</text>
+<rect x="847.4" y="690" width="194.6" height="46" rx="5" fill="rgba(4,120,87,0.055)" stroke="#047857" stroke-width="1.0"/>
+<rect x="854.4" y="696" width="23.0" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="865.8879999999999" y="704.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">10</text>
+<text x="883.376" y="705" font-size="7.9" font-weight="700" fill="#14181f">timer</text>
+<text x="854.4" y="719.0" font-size="6.6" fill="#7c8798">fires when now − last ≥ strat.timer_period_ns()</text>
+<text x="49" y="752" font-size="7.1" fill="#7c8798">Strategy members are struct fields, not threads: slots 0–6 all evaluate in-line, in slot order, inside this one call.  StampCtx stamps Order.strategy_id per slot before EngineCtx::submit — that byte is what the exec router reads later.</text>
+<rect x="36" y="774" width="1024" height="196" rx="9" fill="rgba(4,120,87,0.035)" stroke="#047857" stroke-width="1.15"/>
+<text x="49" y="791" font-size="9.4" font-weight="700" fill="#047857">STRATEGY SLOTS — StrategySet, one u8 enable mask, MAX 8 · BUILT_MASK = 127 (strategy-set/src/lib.rs:178)</text>
+<text x="73.0" y="812" font-size="6.9" font-weight="700" text-anchor="middle" letter-spacing="0.2" fill="#7c8798">slot</text>
+<text x="118" y="812" font-size="6.9" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">bit</text>
+<text x="122" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">carrier</text>
+<text x="314" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">what the engine does with it</text>
+<text x="714" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">state today</text>
+<text x="904" y="812" font-size="6.9" font-weight="700" letter-spacing="0.2" fill="#7c8798">tenancy</text>
+<line x1="54" y1="815.6" x2="1046" y2="815.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="73.0" y="825.6" font-size="7.15" text-anchor="middle" fill="#7c8798">0</text>
+<text x="118" y="825.6" font-size="7.15" text-anchor="end" fill="#7c8798">1</text>
+<text x="122" y="825.6" font-size="7.15" fill="#7c8798">coded member</text>
+<text x="314" y="825.6" font-size="7.15" fill="#7c8798">the first member ever written; still composed into the set</text>
+<text x="714" y="825.6" font-size="7.15" fill="#b45309">built, OFF in every wrapper mask</text>
+<text x="904" y="825.6" font-size="7.15" fill="#9aa5b4">original</text>
+<rect x="52" y="830.4" width="998" height="13.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="73.0" y="839.0" font-size="7.15" font-weight="700" text-anchor="middle" fill="#14181f">1</text>
+<text x="118" y="839.0" font-size="7.15" text-anchor="end" fill="#3f4a5a">2</text>
+<text x="122" y="839.0" font-size="7.15" font-weight="700" fill="#14181f">coded member</text>
+<text x="314" y="839.0" font-size="7.15" fill="#3f4a5a">evaluated in-line on the engine thread, every tick, from its own crate</text>
+<text x="714" y="839.0" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
+<text x="904" y="839.0" font-size="7.15" fill="#9aa5b4">displaced its predecessor, 09-10</text>
+<text x="73.0" y="852.4" font-size="7.15" font-weight="700" text-anchor="middle" fill="#14181f">2</text>
+<text x="118" y="852.4" font-size="7.15" text-anchor="end" fill="#3f4a5a">4</text>
+<text x="122" y="852.4" font-size="7.15" font-weight="700" fill="#14181f">coded member</text>
+<text x="314" y="852.4" font-size="7.15" fill="#3f4a5a">evaluated in-line on the engine thread, every tick, from its own crate</text>
+<text x="714" y="852.4" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
+<text x="904" y="852.4" font-size="7.15" fill="#9aa5b4">displaced its predecessor, 09-12</text>
+<rect x="52" y="857.1999999999999" width="998" height="13.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="73.0" y="865.8" font-size="7.15" font-weight="700" text-anchor="middle" fill="#14181f">3</text>
+<text x="118" y="865.8" font-size="7.15" text-anchor="end" fill="#3f4a5a">8</text>
+<text x="122" y="865.8" font-size="7.15" font-weight="700" fill="#14181f">coded member</text>
+<text x="314" y="865.8" font-size="7.15" fill="#3f4a5a">evaluated in-line on the engine thread, every tick, from its own crate</text>
+<text x="714" y="865.8" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
+<text x="904" y="865.8" font-size="7.15" fill="#9aa5b4">displaced its predecessor, 09-12</text>
+<text x="73.0" y="879.1999999999999" font-size="7.15" font-weight="700" text-anchor="middle" fill="#6d28d9">4</text>
+<text x="118" y="879.1999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">16</text>
+<text x="122" y="879.1999999999999" font-size="7.15" font-weight="700" fill="#6d28d9">intent carrier</text>
+<text x="314" y="879.1999999999999" font-size="7.15" fill="#3f4a5a">quotes the fair value / bias a sidecar pushed; honours paper-only OrderIntent</text>
+<text x="714" y="879.1999999999999" font-size="7.15" font-weight="700" fill="#6d28d9">live in paper — AI DOOR 1</text>
+<text x="904" y="879.1999999999999" font-size="7.15" fill="#9aa5b4">original</text>
+<rect x="52" y="883.9999999999999" width="998" height="13.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="73.0" y="892.5999999999999" font-size="7.15" font-weight="700" text-anchor="middle" fill="#6d28d9">5</text>
+<text x="118" y="892.5999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">32</text>
+<text x="122" y="892.5999999999999" font-size="7.15" font-weight="700" fill="#6d28d9">ruleset VM</text>
+<text x="314" y="892.5999999999999" font-size="7.15" fill="#3f4a5a">evaluates the committed ≤256-row table every tick, with no AI in the loop</text>
+<text x="714" y="892.5999999999999" font-size="7.15" font-weight="700" fill="#6d28d9">live in paper — AI DOOR 2</text>
+<text x="904" y="892.5999999999999" font-size="7.15" fill="#9aa5b4">original</text>
+<text x="73.0" y="905.9999999999999" font-size="7.15" font-weight="700" text-anchor="middle" fill="#14181f">6</text>
+<text x="118" y="905.9999999999999" font-size="7.15" text-anchor="end" fill="#3f4a5a">64</text>
+<text x="122" y="905.9999999999999" font-size="7.15" font-weight="700" fill="#14181f">coded member</text>
+<text x="314" y="905.9999999999999" font-size="7.15" fill="#3f4a5a">evaluated in-line on the engine thread, every tick, from its own crate</text>
+<text x="714" y="905.9999999999999" font-size="7.15" font-weight="700" fill="#047857">live in paper</text>
+<text x="904" y="905.9999999999999" font-size="7.15" fill="#9aa5b4">took a free slot</text>
+<rect x="52" y="910.7999999999998" width="998" height="13.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="73.0" y="919.3999999999999" font-size="7.15" text-anchor="middle" fill="#9aa5b4">7</text>
+<text x="118" y="919.3999999999999" font-size="7.15" text-anchor="end" fill="#9aa5b4">128</text>
+<text x="122" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">— open —</text>
+<text x="314" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">the next coded member claims it the way the last four each did</text>
+<text x="714" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">reserved, unbuilt</text>
+<text x="904" y="919.3999999999999" font-size="7.15" fill="#9aa5b4">—</text>
+<text x="56" y="939.7999999999998" font-size="7.4" fill="#3f4a5a"><tspan font-weight="700" fill="#7c8798">the mask is one bit per slot</tspan><tspan fill="#3f4a5a"> — the AI pair alone is 48; with one coded member alongside it, 50, 52 or 56; with all three, 62; every built member at once is BUILT_MASK = 127.</tspan></text>
+<text x="56" y="951.2999999999998" font-size="7.0" fill="#9aa5b4">Which named combinations the wrapper permits is a deployment detail, not an architectural one: scripts/engine-wrapper.sh allow-lists 13 of them, never the first member and never all, and it always passes --paper and never --exec.  Two displaced members still boot as standalone arms outside the set; a third has no reachable boot path at all.</text>
+<rect x="36" y="984" width="1024" height="134" rx="9" fill="rgba(180,83,9,0.055)" stroke="#b45309" stroke-width="1.15" stroke-dasharray="6 3.5"/>
+<text x="49" y="1001" font-size="9.4" font-weight="700" fill="#b45309">EXECUTION — per-slot routing, the E6 risk gate and the live arm, armed only by the two-switch interlock</text>
+<rect x="51" y="1010" width="300" height="98" rx="7" fill="rgba(63,74,90,0.05)" stroke="#3f4a5a" stroke-width="1.0"/>
+<text x="62" y="1025" font-size="8.4" font-weight="700" fill="#3f4a5a">ExecRoute — per slot, not per process</text>
+<text x="62" y="1037.5" font-size="6.9" fill="#7c8798">ExecMode: Paper 0 (default + fail-safe) · Live 1 · Off 2</text>
+<text x="62" y="1046.9" font-size="6.9" fill="#7c8798">unknown byte ⇒ Paper.  8 slots × 8 venues, boot-fixed.</text>
+<text x="62" y="1056.3" font-size="6.9" fill="#7c8798">LAW E-1: a live slot whose venue bit is clear gets</text>
+<text x="62" y="1065.7" font-size="6.9" fill="#7c8798">NoLiveRoute — it NEVER silently falls back to paper.</text>
+<text x="62" y="1075.1" font-size="6.9" fill="#7c8798">RoutedDispatcher branches on Order.strategy_id.</text>
+<text x="62" y="1084.5" font-size="6.9" fill="#7c8798">exec-router/src/{mode,route,routed}.rs</text>
+<rect x="359" y="1010" width="300" height="98" rx="7" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="1.0"/>
+<text x="370" y="1025" font-size="8.4" font-weight="700" fill="#b45309">the two-switch interlock</text>
+<text x="370" y="1037.5" font-size="6.9" fill="#7c8798">exec.toml (--exec) and --arm-live &lt;slots&gt; must name the</text>
+<text x="370" y="1046.9" font-size="6.9" fill="#7c8798">EXACT same live set or the boot refuses.</text>
+<text x="370" y="1056.3" font-size="6.9" fill="#7c8798">The artifact alone arms nothing; the flag alone arms nothing.</text>
+<text x="370" y="1065.7" font-size="6.9" fill="#7c8798">--exec is refused for the three standalone non-set arms —</text>
+<text x="370" y="1075.1" font-size="6.9" fill="#7c8798">only the composed set arm builds a RoutedDispatcher at all.</text>
+<text x="370" y="1084.5" font-size="6.9" fill="#7c8798">cli/src/exec_boot.rs:5-38</text>
+<rect x="667" y="1010" width="378" height="98" rx="7" fill="rgba(180,83,9,0.05)" stroke="#b45309" stroke-width="1.0" stroke-dasharray="5 3"/>
+<text x="678" y="1025" font-size="8.4" font-weight="700" fill="#b45309">what stands between a live order and the venue</text>
+<text x="678" y="1037.5" font-size="6.9" fill="#7c8798">LIVE_ARM_VENUES = [Hyperliquid] (exec_boot.rs) — a live slot on any other</text>
+<text x="678" y="1046.9" font-size="6.9" fill="#7c8798">venue still refuses the boot.  On --exec the bin builds HlExchange</text>
+<text x="678" y="1056.3" font-size="6.9" fill="#7c8798">behind RoutedDispatcher, hands it fill lane 3's producer, and refuses</text>
+<text x="678" y="1065.7" font-size="6.9" fill="#7c8798">a market-data host and an exchange host on different networks (LAW E-4).</text>
+<text x="678" y="1075.1" font-size="6.9" fill="#7c8798">E6: per-order / open / day / instance caps clamp every live submit AND</text>
+<text x="678" y="1084.5" font-size="6.9" fill="#7c8798">modify; six sticky halts (reject streak, asset refusals, budget floor,</text>
+<text x="678" y="1093.9" font-size="6.9" fill="#7c8798">recon drift, recon STALE, ws gap) cancel-all + write exec.HALT; the arm</text>
+<text x="678" y="1103.3" font-size="6.9" fill="#7c8798">runs on the engine thread from on_idle (2 ms pacer), never a worker.</text>
+<rect x="36" y="1130" width="1024" height="144" rx="9" fill="rgba(14,116,144,0.06)" stroke="#0e7490" stroke-width="1.15"/>
+<text x="49" y="1147" font-size="9.4" font-weight="700" fill="#0e7490">CAPTURE — PMLR v3, one run-&lt;epoch_ns&gt;/ per boot · append-only · torn-tail tolerant · §6.5: capture IS the product, an open failure is a fatal boot error</text>
+<rect x="51.0" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="59.0" y="1170" font-size="6.7" fill="#7c8798">kind 0</text>
+<text x="59.0" y="1181" font-size="8.1" font-weight="700" fill="#14181f">Tick</text>
+<text x="59.0" y="1192" font-size="6.4" fill="#9aa5b4">64 B · &lt;venue&gt;-ticks</text>
+<rect x="175.25" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="183.25" y="1170" font-size="6.7" fill="#7c8798">kind 1</text>
+<text x="183.25" y="1181" font-size="8.1" font-weight="700" fill="#14181f">Signal</text>
+<text x="183.25" y="1192" font-size="6.4" fill="#9aa5b4">64 B · &lt;venue&gt;-signals</text>
+<rect x="299.5" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="307.5" y="1170" font-size="6.7" fill="#7c8798">kind 2</text>
+<text x="307.5" y="1181" font-size="8.1" font-weight="700" fill="#14181f">Fill</text>
+<text x="307.5" y="1192" font-size="6.4" fill="#9aa5b4">64 B · engine-fills</text>
+<rect x="423.75" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="431.75" y="1170" font-size="6.7" fill="#7c8798">kind 3</text>
+<text x="431.75" y="1181" font-size="8.1" font-weight="700" fill="#14181f">Order</text>
+<text x="431.75" y="1192" font-size="6.4" fill="#9aa5b4">64 B · engine-orders</text>
+<rect x="548.0" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="556.0" y="1170" font-size="6.7" fill="#7c8798">kind 4</text>
+<text x="556.0" y="1181" font-size="8.1" font-weight="700" fill="#14181f">AiCmd</text>
+<text x="556.0" y="1192" font-size="6.4" fill="#9aa5b4">64 B · ai-cmds</text>
+<rect x="672.25" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="680.25" y="1170" font-size="6.7" fill="#7c8798">kind 5</text>
+<text x="680.25" y="1181" font-size="8.1" font-weight="700" fill="#14181f">ChannelEvent</text>
+<text x="680.25" y="1192" font-size="6.4" fill="#9aa5b4">64 B · &lt;venue&gt;-events</text>
+<rect x="796.5" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="804.5" y="1170" font-size="6.7" fill="#7c8798">kind 6</text>
+<text x="804.5" y="1181" font-size="8.1" font-weight="700" fill="#14181f">OptSummary</text>
+<text x="804.5" y="1192" font-size="6.4" fill="#9aa5b4">64 B · &lt;venue&gt;-opt-summary</text>
+<rect x="920.75" y="1157" width="119.25" height="44" rx="5" fill="rgba(14,116,144,0.05)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="928.75" y="1170" font-size="6.7" fill="#7c8798">kind 7</text>
+<text x="928.75" y="1181" font-size="8.1" font-weight="700" fill="#14181f">DepthTopK</text>
+<text x="928.75" y="1192" font-size="6.4" fill="#b45309">192 B · &lt;venue&gt;-depth</text>
+<text x="51" y="1218" font-size="7.4" fill="#3f4a5a"><tspan font-weight="700" fill="#14181f">the writer is write(2), not mmap</tspan><tspan fill="#3f4a5a"> — PmlrWriter stages each record into a 64 KiB PreallocatedWriter buffer and write_all()s on buffer-full (core-io/src/lib.rs:87-110).  </tspan><tspan font-weight="700" fill="#14181f">the reader is mmap</tspan><tspan fill="#3f4a5a"> —</tspan></text>
+<text x="51" y="1229.5" font-size="7.1" fill="#7c8798">raw libc mmap(PROT_READ, MAP_PRIVATE) with a pointer cast over the mapping, genuinely zero-copy, used by audit-replay / backtest / audit-pnl (core-io/src/pmlr_reader.rs).  Header: 64 B, magic PMLR, VERSION 3 since the 09-03 VT1 venue-time fields; v1/v2 still readable.</text>
+<text x="51" y="1242" font-size="7.1" fill="#b45309">instrument-manifest.tsv is rewritten EVERY boot and is load-bearing: option and PM-daily ordinals reshuffle per boot by design, so every offline consumer joins by DESCRIPTOR string, never a bare SymbolId.</text>
+<text x="51" y="1254" font-size="7.1" fill="#7c8798">SymbolId is a u32 bit-pack — venue byte in bits 31..24, per-venue ordinal in 23..0, allocated once at boot from REST discovery, never parsed on the hot path (core-types/src/lib.rs:130-175).</text>
+<text x="51" y="1266" font-size="7.1" fill="#7c8798">engine-fills.pmlr and engine-orders.pmlr are written by the engine thread itself; every other file is written by its own ingress thread, capture BEFORE the ring push — a ring-dropped tick must still reach the replay log.</text>
+<rect x="1096" y="218" width="548" height="322" rx="9" fill="rgba(109,40,217,0.035)" stroke="#6d28d9" stroke-width="1.15"/>
+<text x="1109" y="236" font-size="10.4" font-weight="700" fill="#6d28d9">MODEL SIDECAR BAY — pluggable, out of process</text>
+<text x="1109" y="248" font-size="7.2" fill="#7c8798">the engine never links a model runtime, never links Python, and never blocks on a model</text>
+<rect x="1109.0" y="256" width="170.0" height="126" rx="6" fill="rgba(109,40,217,0.05)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1118.0" y="271" font-size="9.4" font-weight="700" fill="#6d28d9">sidecar lane A</text>
+<text x="1118.0" y="282.0" font-size="6.5" fill="#9aa5b4">a discrete-token autoregressive model over</text>
+<text x="1118.0" y="290.4" font-size="6.5" fill="#9aa5b4">candles</text>
+<text x="1118.0" y="302.0" font-size="6.5" fill="#7c8798">adapter package in the worker</text>
+<text x="1118.0" y="310.8" font-size="6.5" fill="#7c8798">weights pinned by hash, vendored</text>
+<text x="1118.0" y="319.6" font-size="6.5" fill="#7c8798">outside git · the engine never links it</text>
+<rect x="1118.0" y="326" width="103.8" height="12.5" rx="6.25" fill="#ffffff" stroke="#b91c1c" stroke-width="0.9"/>
+<text x="1169.88" y="334.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#b91c1c">CLOSED — NEVER WIRED</text>
+<text x="1118.0" y="350.0" font-size="6.2" fill="#9aa5b4">Every live path it proposed died at a gate.</text>
+<text x="1118.0" y="358.2" font-size="6.2" fill="#9aa5b4">One lost to a far simpler in-engine</text>
+<text x="1118.0" y="366.4" font-size="6.2" fill="#9aa5b4">estimator at identical significance; the</text>
+<text x="1118.0" y="374.6" font-size="6.2" fill="#9aa5b4">other failed its first gate outright.</text>
+<rect x="1285.0" y="256" width="170.0" height="126" rx="6" fill="rgba(109,40,217,0.05)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1294.0" y="271" font-size="9.4" font-weight="700" fill="#6d28d9">sidecar lane B</text>
+<text x="1294.0" y="282.0" font-size="6.5" fill="#9aa5b4">a zero-shot forecaster on a lighter</text>
+<text x="1294.0" y="290.4" font-size="6.5" fill="#9aa5b4">runtime</text>
+<text x="1294.0" y="302.0" font-size="6.5" fill="#7c8798">same adapter shape, independently</text>
+<text x="1294.0" y="310.8" font-size="6.5" fill="#7c8798">arrived at · licence law enforced</text>
+<text x="1294.0" y="319.6" font-size="6.5" fill="#7c8798">in code, not in a comment</text>
+<rect x="1294.0" y="326" width="76.8" height="12.5" rx="6.25" fill="#ffffff" stroke="#b91c1c" stroke-width="0.9"/>
+<text x="1332.416" y="334.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#b91c1c">CODE WITHDRAWN</text>
+<text x="1294.0" y="350.0" font-size="6.2" fill="#9aa5b4">Hundreds of thousands of forecasts across</text>
+<text x="1294.0" y="358.2" font-size="6.2" fill="#9aa5b4">ten data cells and seventeen shapes, and no</text>
+<text x="1294.0" y="366.4" font-size="6.2" fill="#9aa5b4">arm clearing the cheapest round-trip fee.</text>
+<text x="1294.0" y="374.6" font-size="6.2" fill="#9aa5b4">Nothing was ever committed.</text>
+<rect x="1461.0" y="256" width="170.0" height="126" rx="6" fill="rgba(4,120,87,0.06)" stroke="#047857" stroke-width="1.0" stroke-dasharray="5 3"/>
+<text x="1470.0" y="271" font-size="9.4" font-weight="700" fill="#047857">your next model</text>
+<text x="1470.0" y="282.0" font-size="6.5" fill="#9aa5b4">the bay is the reusable part, not the</text>
+<text x="1470.0" y="290.4" font-size="6.5" fill="#9aa5b4">tenants</text>
+<text x="1470.0" y="302.0" font-size="6.5" fill="#7c8798">reads the same three inputs</text>
+<text x="1470.0" y="310.8" font-size="6.5" fill="#7c8798">passes the same gate ladder</text>
+<text x="1470.0" y="319.6" font-size="6.5" fill="#7c8798">speaks the same 82-byte frame</text>
+<rect x="1470.0" y="326" width="32.0" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="1485.976" y="334.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">OPEN</text>
+<text x="1470.0" y="350.0" font-size="6.2" fill="#9aa5b4">Slot 7 is free. Generic: everything on the</text>
+<text x="1470.0" y="358.2" font-size="6.2" fill="#9aa5b4">rail below. Per-model: channel construction,</text>
+<text x="1470.0" y="366.4" font-size="6.2" fill="#9aa5b4">the payload choice, the pass/fail numbers.</text>
+<rect x="1109" y="394" width="522" height="136" rx="6" fill="rgba(109,40,217,0.07)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1118" y="409" font-size="8.2" font-weight="700" fill="#6d28d9">THE RAIL — what every sidecar shares (the P-laws, extracted from both lanes)</text>
+<text x="1118" y="424" font-size="6.8" font-weight="700" letter-spacing="0.4" fill="#6d28d9">READS</text>
+<text x="1182" y="424.0" font-size="6.7" fill="#7c8798">candles.db (SQLite WAL) — OHLCV, funding, iv_digest, depth_digest, refdata</text>
+<text x="1182" y="433.0" font-size="6.7" fill="#7c8798">PMLR capture by mmap — claude_worker/pmlr.py, read-only, zero-copy</text>
+<text x="1182" y="442.0" font-size="6.7" fill="#7c8798">features/&lt;run&gt;/*.json — files only, never a socket</text>
+<text x="1118" y="457.0" font-size="6.8" font-weight="700" letter-spacing="0.4" fill="#6d28d9">IS BOUND BY</text>
+<text x="1182" y="457.0" font-size="6.7" fill="#7c8798">P1 upstream pinned by hash, vendored OUTSIDE git, recorded in NOTICE</text>
+<text x="1182" y="466.0" font-size="6.7" fill="#7c8798">P2 repo code is a thin adapter; upstream is never modified</text>
+<text x="1182" y="475.0" font-size="6.7" fill="#7c8798">P5 calibrate before any build · P6 pre-registered baseline + a NULL arm</text>
+<text x="1182" y="484.0" font-size="6.7" fill="#7c8798">P7 the model never sets the sign — only σ̂, size and gates</text>
+<text x="1182" y="493.0" font-size="6.7" fill="#7c8798">P8 fee-first: every cell reports against its own break-even bps</text>
+<text x="1118" y="508.0" font-size="6.8" font-weight="700" letter-spacing="0.4" fill="#6d28d9">EMITS</text>
+<text x="1182" y="508.0" font-size="6.7" fill="#7c8798">P9 the sidecar delivers a NUMBER over the wire; the engine never links Python</text>
+<rect x="1096" y="550" width="548" height="116" rx="9" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.15"/>
+<text x="1109" y="567" font-size="9.8" font-weight="700" fill="#6d28d9">THE DOOR — one 82-byte frame, inbound only</text>
+<rect x="1114" y="580" width="96" height="24" rx="4" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="1162.0" y="596" font-size="7.6" font-weight="700" text-anchor="middle" fill="#94a3b8">len u16 = 80</text>
+<rect x="1214" y="580" width="274" height="24" rx="4" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1351.0" y="596" font-size="7.6" font-weight="700" text-anchor="middle" fill="#6d28d9">AiCmd — 64 B POD</text>
+<rect x="1492" y="580" width="130" height="24" rx="4" fill="rgba(4,120,87,0.06)" stroke="#047857" stroke-width="1.0"/>
+<text x="1557.0" y="596" font-size="7.6" font-weight="700" text-anchor="middle" fill="#047857">HMAC tag 16 B</text>
+<text x="1114" y="618.0" font-size="6.75" fill="#7c8798">~/multivenue/run/ai.sock · dir 0700, socket 0600, stale socket unlinked at bind · peer euid must equal ours</text>
+<text x="1114" y="627.0" font-size="6.75" fill="#7c8798">HMAC-SHA256 over the 64 raw cmd bytes, truncated to 16, constant-time compare · key from .env, never logged</text>
+<text x="1114" y="636.0" font-size="6.75" fill="#7c8798">accept order, load-bearing:  len == 80  →  HMAC (fail ⇒ drop the connection)  →  shape validate (fail ⇒ discard</text>
+<text x="1114" y="645.0" font-size="6.75" fill="#7c8798">the frame, keep the connection)  →  seq policy  →  ts_ns REWRITTEN to engine time  →  ai-cmds.pmlr  →  try_push</text>
+<text x="1114" y="654.0" font-size="6.75" fill="#7c8798">seq ≤ last ⇒ Regress, discarded; a forward jump ⇒ AcceptGap, counted, not fatal · seq lives in SQLite, so it</text>
+<text x="1114" y="663.0" font-size="6.75" fill="#7c8798">survives worker reconnects · TTL is checked TWICE — at ingress, then again on pop, because the clock changed</text>
+<rect x="1096" y="676" width="548" height="184" rx="9" fill="rgba(109,40,217,0.035)" stroke="#6d28d9" stroke-width="1.15"/>
+<text x="1109" y="693" font-size="9.6" font-weight="700" fill="#6d28d9">TWO DOORS INTO THE ENGINE — and they are not the same kind of thing</text>
+<rect x="1110" y="702" width="257.0" height="148" rx="7" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1121" y="717" font-size="8.3" font-weight="700" fill="#6d28d9">DOOR 1 · the intent lane → slot 4</text>
+<text x="1121" y="729.5" font-size="6.7" fill="#7c8798">SetFairValue · SetBias · SetParam · OrderIntent</text>
+<text x="1121" y="747.7" font-size="6.7" fill="#7c8798">The sidecar decides LIVE. ai-exec keeps a 64-entry</text>
+<text x="1121" y="756.8" font-size="6.7" fill="#7c8798">open-addressed fair table + MultiBook&lt;64&gt; + a</text>
+<text x="1121" y="765.9" font-size="6.7" fill="#7c8798">cooldown gate, and quotes when |mid − (fair+bias)|</text>
+<text x="1121" y="775.0" font-size="6.7" fill="#7c8798">≥ edge.  An OrderIntent is submitted verbatim at the</text>
+<text x="1121" y="784.1" font-size="6.7" fill="#7c8798">sidecar&#x27;s own px/qty — always POST-ONLY, resting.</text>
+<text x="1121" y="802.3" font-size="6.7" fill="#7c8798">Fail-safe: AI_STALENESS_NS = 15 s, compile-time.</text>
+<text x="1121" y="811.4" font-size="6.7" fill="#7c8798">Stale ⇒ quotes pulled, intents refused and counted.</text>
+<text x="1121" y="829.6" font-size="6.7" fill="#7c8798">No statistical gate. Wire shape + staleness + regime</text>
+<text x="1121" y="838.7" font-size="6.7" fill="#7c8798">are all that stand between a frame and an order.</text>
+<rect x="1377.0" y="702" width="257.0" height="148" rx="7" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="1.0"/>
+<text x="1388.0" y="717" font-size="8.3" font-weight="700" fill="#6d28d9">DOOR 2 · the table lane → slot 5</text>
+<text x="1388.0" y="729.5" font-size="6.7" fill="#7c8798">RulesetStage · RulesetCommit</text>
+<text x="1388.0" y="747.7" font-size="6.7" fill="#7c8798">The sidecar COMPILES an artifact; the engine runs it</text>
+<text x="1388.0" y="756.8" font-size="6.7" fill="#7c8798">with no AI in the loop.  ≤256 rows × 128 B, 17</text>
+<text x="1388.0" y="765.9" font-size="6.7" fill="#7c8798">features, 4 combine ops, 32 832 B per table.</text>
+<text x="1388.0" y="784.1" font-size="6.7" fill="#7c8798">Only the hash128 travels — the first 16 bytes of the</text>
+<text x="1388.0" y="793.2" font-size="6.7" fill="#7c8798">artifact&#x27;s SHA-256.  Stage resolves the file on disk,</text>
+<text x="1388.0" y="802.3" font-size="6.7" fill="#7c8798">runs an 11-rule single-pass byte validator, and ferries</text>
+<text x="1388.0" y="811.4" font-size="6.7" fill="#7c8798">the table by value.  Commit flips a ping-pong index</text>
+<text x="1388.0" y="820.5" font-size="6.7" fill="#7c8798">— no copy at the flip.</text>
+<text x="1388.0" y="838.7" font-size="6.7" fill="#7c8798">The gate binds here: stage-ruleset refuses unless the</text>
+<text x="1388.0" y="847.8" font-size="6.7" fill="#7c8798">worker&#x27;s own backtest report matches that exact hash,</text>
+<text x="1388.0" y="856.9" font-size="6.7" fill="#7c8798">is schema-1, and gates.all_passed.  No override exists.</text>
+<rect x="1096" y="872" width="548" height="190" rx="9" fill="rgba(109,40,217,0.03)" stroke="#6d28d9" stroke-width="1.15"/>
+<text x="1109" y="889" font-size="9.2" font-weight="700" fill="#6d28d9">AiCmd — 64 B, #[repr(C, align(64))], 14 kinds (core-types/src/lib.rs:1566-1643)</text>
+<rect x="1112.0" y="903" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1121.244" y="911.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">0</text>
+<text x="1136.488" y="912" font-size="7.5" font-weight="700" fill="#14181f">Heartbeat</text>
+<text x="1136.488" y="921" font-size="6.4" fill="#9aa5b4">liveness — must precede any payload</text>
+<rect x="1370.0" y="903" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1379.244" y="911.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">1</text>
+<text x="1394.488" y="912" font-size="7.5" font-weight="700" fill="#14181f">EnableStrategy</text>
+<text x="1394.488" y="921" font-size="6.4" fill="#9aa5b4">set a slot&#x27;s enable bit</text>
+<rect x="1112.0" y="924" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1121.244" y="932.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">2</text>
+<text x="1136.488" y="933" font-size="7.5" font-weight="700" fill="#14181f">DisableStrategy</text>
+<text x="1136.488" y="942" font-size="6.4" fill="#9aa5b4">clear a slot&#x27;s enable bit</text>
+<rect x="1370.0" y="924" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="1379.244" y="932.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">3</text>
+<text x="1394.488" y="933" font-size="7.5" font-weight="700" fill="#14181f">SetFairValue</text>
+<text x="1394.488" y="942" font-size="6.4" fill="#9aa5b4">TTL&#x27;d fair value for one sym → slot 4</text>
+<rect x="1112.0" y="945" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="1121.244" y="953.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">4</text>
+<text x="1136.488" y="954" font-size="7.5" font-weight="700" fill="#14181f">SetBias</text>
+<text x="1136.488" y="963" font-size="6.4" fill="#9aa5b4">TTL&#x27;d signed bias for one sym → slot 4</text>
+<rect x="1370.0" y="945" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1379.244" y="953.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">5</text>
+<text x="1394.488" y="954" font-size="7.5" font-weight="700" fill="#14181f">SetParam</text>
+<text x="1394.488" y="963" font-size="6.4" fill="#9aa5b4">per-strategy numeric param, param_id selects</text>
+<rect x="1112.0" y="966" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="1121.244" y="974.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">6</text>
+<text x="1136.488" y="975" font-size="7.5" font-weight="700" fill="#14181f">OrderIntent</text>
+<text x="1136.488" y="984" font-size="6.4" fill="#9aa5b4">paper-only intent · strategy_id MUST be 4</text>
+<rect x="1370.0" y="966" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="1379.244" y="974.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">7</text>
+<text x="1394.488" y="975" font-size="7.5" font-weight="700" fill="#14181f">RulesetStage</text>
+<text x="1394.488" y="984" font-size="6.4" fill="#9aa5b4">stage a validated table by content hash → slot 5</text>
+<rect x="1112.0" y="987" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#047857" stroke-width="0.9"/>
+<text x="1121.244" y="995.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#047857">8</text>
+<text x="1136.488" y="996" font-size="7.5" font-weight="700" fill="#14181f">RulesetCommit</text>
+<text x="1136.488" y="1005" font-size="6.4" fill="#9aa5b4">commit a staged hash — flips the ping-pong</text>
+<rect x="1370.0" y="987" width="18.5" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1379.244" y="995.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">9</text>
+<text x="1394.488" y="996" font-size="7.5" font-weight="700" fill="#14181f">HaltRequest</text>
+<text x="1394.488" y="1005" font-size="6.4" fill="#9aa5b4">sticky halt · there is no resume on the wire</text>
+<rect x="1112.0" y="1008" width="23.0" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1123.488" y="1016.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">10</text>
+<text x="1140.976" y="1017" font-size="7.5" font-weight="700" fill="#14181f">FundingSeed</text>
+<text x="1140.976" y="1026" font-size="6.4" fill="#9aa5b4">one historical funding print, window seeding</text>
+<rect x="1370.0" y="1008" width="23.0" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1381.488" y="1016.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">11</text>
+<text x="1398.976" y="1017" font-size="7.5" font-weight="700" fill="#14181f">PositionSeed</text>
+<text x="1398.976" y="1026" font-size="6.4" fill="#9aa5b4">restore one VM row&#x27;s position at boot</text>
+<rect x="1112.0" y="1029" width="23.0" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1123.488" y="1037.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">12</text>
+<text x="1140.976" y="1038" font-size="7.5" font-weight="700" fill="#14181f">SetRegime</text>
+<text x="1140.976" y="1047" font-size="6.4" fill="#9aa5b4">declare one horizon profile&#x27;s regime word</text>
+<rect x="1370.0" y="1029" width="23.0" height="12.5" rx="6.25" fill="#ffffff" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="1381.488" y="1037.9" font-size="6.8" font-weight="700" text-anchor="middle" fill="#6d28d9">13</text>
+<text x="1398.976" y="1038" font-size="7.5" font-weight="700" fill="#14181f">SetBinarySpec</text>
+<text x="1398.976" y="1047" font-size="6.4" fill="#9aa5b4">bind a rolling-family instance — one slot only</text>
+<rect x="1096" y="1072" width="548" height="202" rx="9" fill="rgba(14,116,144,0.035)" stroke="#0e7490" stroke-width="1.15"/>
+<text x="1109" y="1089" font-size="9.6" font-weight="700" fill="#0e7490">THE OFFLINE PLANE — worker, Python, globally serialized, never the hot path</text>
+<rect x="1110" y="1098" width="257.0" height="84" rx="7" fill="rgba(14,116,144,0.06)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="1121" y="1113" font-size="8.2" font-weight="700" fill="#0e7490">8 frozen verbs</text>
+<text x="1121" y="1125.5" font-size="6.7" fill="#7c8798">serve · fetch · backtest · push · positions</text>
+<text x="1121" y="1134.6" font-size="6.7" fill="#7c8798">stage-ruleset · commit-ruleset · pnl</text>
+<text x="1121" y="1152.8" font-size="6.7" fill="#7c8798">exit 0 ok · 2 usage · 3 GATE REFUSED</text>
+<text x="1121" y="1161.9" font-size="6.7" fill="#7c8798">4 transport · 5 state · 1 unexpected</text>
+<text x="1121" y="1171.0" font-size="6.7" fill="#7c8798">serve is PARKED — no Anthropic key until</text>
+<text x="1121" y="1180.1" font-size="6.7" fill="#7c8798">the Stage-3 entry gate opens.</text>
+<rect x="1377.0" y="1098" width="257.0" height="84" rx="7" fill="rgba(14,116,144,0.06)" stroke="#0e7490" stroke-width="1.0"/>
+<text x="1388.0" y="1113" font-size="8.2" font-weight="700" fill="#0e7490">47 modules, never verbs</text>
+<text x="1388.0" y="1125.5" font-size="6.7" fill="#7c8798">candles · funding · iv_digest · depth_digest</text>
+<text x="1388.0" y="1134.6" font-size="6.7" fill="#7c8798">refdata · channel_map · coverage_audit</text>
+<text x="1388.0" y="1143.7" font-size="6.7" fill="#7c8798">regime · library · compose · dashboard</text>
+<text x="1388.0" y="1152.8" font-size="6.7" fill="#7c8798">archive · authoring helpers · latency_probe · …</text>
+<text x="1388.0" y="1171.0" font-size="6.7" fill="#7c8798">every launchd script does pgrep -f</text>
+<text x="1388.0" y="1180.1" font-size="6.7" fill="#7c8798">&#x27;claude[-_]worke[r]&#x27; first — one seq namespace.</text>
+<text x="1116" y="1196" font-size="6.6" font-weight="700" letter-spacing="0.2" fill="#7c8798">launchd job</text>
+<text x="1326" y="1196" font-size="6.6" font-weight="700" letter-spacing="0.2" fill="#7c8798">cadence</text>
+<text x="1476" y="1196" font-size="6.6" font-weight="700" letter-spacing="0.2" fill="#7c8798"></text>
+<line x1="1114" y1="1199.6" x2="1616" y2="1199.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="1116" y="1206.8999999999999" font-size="6.85" fill="#3f4a5a">com.multivenue.engine</text>
+<text x="1326" y="1206.8999999999999" font-size="6.85" fill="#3f4a5a">persistent, KeepAlive</text>
+<text x="1476" y="1206.8999999999999" font-size="6.85" fill="#3f4a5a">the one-engine law</text>
+<rect x="1112" y="1211.7" width="508" height="10.7" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="1116" y="1217.6" font-size="6.85" fill="#3f4a5a">com.multivenue.candles</text>
+<text x="1326" y="1217.6" font-size="6.85" fill="#3f4a5a">StartInterval 3600</text>
+<text x="1476" y="1217.6" font-size="6.85" fill="#3f4a5a">hourly, off the top of the hour</text>
+<text x="1116" y="1228.3" font-size="6.85" fill="#3f4a5a">com.multivenue.regime</text>
+<text x="1326" y="1228.3" font-size="6.85" fill="#3f4a5a">StartInterval 300</text>
+<text x="1476" y="1228.3" font-size="6.85" fill="#3f4a5a">the regime word</text>
+<rect x="1112" y="1233.1000000000001" width="508" height="10.7" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="1116" y="1239.0" font-size="6.85" fill="#3f4a5a">com.multivenue.daily-restart</text>
+<text x="1326" y="1239.0" font-size="6.85" fill="#3f4a5a">StartInterval 60</text>
+<text x="1476" y="1239.0" font-size="6.85" fill="#3f4a5a">internal UTC-day gate</text>
+<text x="1116" y="1249.7" font-size="6.85" fill="#3f4a5a">com.multivenue.archive</text>
+<text x="1326" y="1249.7" font-size="6.85" fill="#3f4a5a">04:30 local</text>
+<text x="1476" y="1249.7" font-size="6.85" fill="#3f4a5a">S3 / Hetzner cold archive</text>
+<rect x="1112" y="1254.5000000000002" width="508" height="10.7" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="1116" y="1260.4" font-size="6.85" fill="#3f4a5a">com.multivenue.dashboard</text>
+<text x="1326" y="1260.4" font-size="6.85" fill="#3f4a5a">persistent</text>
+<text x="1476" y="1260.4" font-size="6.85" fill="#3f4a5a">read-only server</text>
+<text x="1116" y="1271.1000000000001" font-size="6.85" fill="#3f4a5a">com.multivenue.caffeinate</text>
+<text x="1326" y="1271.1000000000001" font-size="6.85" fill="#3f4a5a">persistent, -s</text>
+<text x="1476" y="1271.1000000000001" font-size="6.85" fill="#3f4a5a">keep the Mac awake</text>
+<path d="M1096,602 L1084,602 Q1077,602 1077,595 L1077,271 Q1077,264 1070,264 L1053,264" fill="none" stroke="#6d28d9" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5 3" marker-end="url(#aP)"/>
+<text transform="translate(1073,500) rotate(-90)" font-size="6.9" font-weight="700" fill="#6d28d9" text-anchor="start">82-byte HMAC frame → ingress-ai, core 4</text>
+<line x1="36" y1="1286" x2="1644" y2="1286" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.5"/>
+<text x="36" y="1302" font-size="9.2" font-weight="700" letter-spacing="0.5" fill="#14181f">WHAT CHANGED SINCE THE 2026-08-29 SHEET</text>
+<rect x="36.0" y="1310" width="396.0" height="74" rx="5" fill="rgba(148,163,184,0.05)" stroke="#047857" stroke-width="1.05"/>
+<text x="46.0" y="1325" font-size="7.8" font-weight="700" fill="#047857">slots 1, 2 and 3 all changed tenant</text>
+<text x="46.0" y="1338.0" font-size="6.6" fill="#7c8798">Three coded members were displaced by three new ones between 09-10 and 09-12, each on an explicit</text>
+<text x="46.0" y="1346.8" font-size="6.6" fill="#7c8798">operator ruling. The wire slot numbers did not move, so attribution reads straight through the change.</text>
+<rect x="440.0" y="1310" width="396.0" height="74" rx="5" fill="rgba(148,163,184,0.05)" stroke="#b45309" stroke-width="1.05"/>
+<text x="450.0" y="1325" font-size="7.8" font-weight="700" fill="#b45309">an execution lane appeared, was reviewed, and can be armed</text>
+<text x="450.0" y="1338.0" font-size="6.6" fill="#7c8798">exec-router + exec-hyperliquid landed E1–E6, then four Opus-5 review agents closed 20 blocking findings and a</text>
+<text x="450.0" y="1346.8" font-size="6.6" fill="#7c8798">zero-copy pass (in-place request body, keccak256_parts, an rx cursor) — RX 3 / TX 2 copies, the house targets.</text>
+<text x="450.0" y="1355.6" font-size="6.6" fill="#7c8798">E7 = the testnet ramp (docs/risk-policy.md "E7"); it is armed by --exec + --arm-live, never by default.</text>
+<rect x="844.0" y="1310" width="396.0" height="74" rx="5" fill="rgba(148,163,184,0.05)" stroke="#b45309" stroke-width="1.05"/>
+<text x="854.0" y="1325" font-size="7.8" font-weight="700" fill="#b45309">a sixth and seventh ring family</text>
+<text x="854.0" y="1338.0" font-size="6.6" fill="#7c8798">DepthTopK ×2 lanes at 192 B and OptSummary ×3 lanes joined the geometry; NUM_TICK_LANES went to 6 with</text>
+<text x="854.0" y="1346.8" font-size="6.6" fill="#7c8798">Bybit. The in-file comment still says five rings.</text>
+<rect x="1248.0" y="1310" width="396.0" height="74" rx="5" fill="rgba(148,163,184,0.05)" stroke="#6d28d9" stroke-width="1.05"/>
+<text x="1258.0" y="1325" font-size="7.8" font-weight="700" fill="#6d28d9">two model sidecars were tried and neither shipped</text>
+<text x="1258.0" y="1338.0" font-size="6.6" fill="#7c8798">Both cleared the adapter pattern and both died at the numbers gate. The bay they proved out is the</text>
+<text x="1258.0" y="1346.8" font-size="6.6" fill="#7c8798">reusable asset; the tenants are not, and their identities are not on this sheet.</text>
+<line x1="36" y1="1398" x2="1644" y2="1398" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
+<text x="36" y="1414" font-size="8.0" fill="#3f4a5a"><tspan font-size="8.2" font-weight="700" fill="#b45309">read the two amber notes as load-bearing, not cosmetic. </tspan><tspan font-size="7.6" fill="#3f4a5a">(1) CPU pinning is wired through every ingress spawn and does nothing on the macOS deployment — the core map on this sheet describes intent, not the running process. </tspan></text>
+<text x="36" y="1426" font-size="7.6" fill="#3f4a5a">(2) Fill lanes 0–2 are drained empty on every pass of the hot loop (no producer exists for them); lane 3 is fed by the Hyperliquid arm&#x27;s userFills pump ONLY on an --exec boot with slot 3 live. On the default paper boot the only fill source is the paper matcher&#x27;s own pump.  Neither is a bug — but a reader who assumes otherwise will misread the whole sheet.</text>
+<text x="36" y="1440" font-size="7.1" fill="#9aa5b4">Every constant on this page was read from crates/ at HEAD 1225651 on 2026-09-19 and re-checked against the E7 review tree the same day.  Where a doc comment in the tree disagreed with the code, the code is what is drawn here, and the disagreement is called out.  ~/multivenue/strategy.conf is gitignored, so the enabled mask that is live right now cannot be read from source — what the wrapper permits is drawn instead.</text>
+</svg>

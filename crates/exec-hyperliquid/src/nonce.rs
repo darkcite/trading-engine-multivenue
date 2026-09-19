@@ -56,9 +56,35 @@ impl Nonce {
     }
 }
 
+/// The wall clock in milliseconds since the Unix epoch — the value the
+/// venue window `(T − 2 days, T + 1 day)` is measured against.
+///
+/// Returns **0 when the clock is before the epoch**, which no caller
+/// may feed to [`Nonce::next`] as a real time: `exchange::seal`
+/// refuses to sign on a zero clock rather than emit a nonce the venue
+/// would reject as ancient. One definition for the arm, the smoke and
+/// the lifecycle gate, so all three read the same clock.
+#[inline]
+#[must_use]
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wall_clock_is_after_the_epoch_and_in_milliseconds() {
+        let ms = now_ms();
+        // 2020-01-01T00:00:00Z — any real clock on a build host is past it.
+        assert!(ms > 1_577_836_800_000, "clock reads {ms} ms");
+        // and not in nanoseconds / seconds by mistake (year 2100 bound).
+        assert!(ms < 4_102_444_800_000, "clock reads {ms} ms");
+    }
 
     #[test]
     fn it_takes_the_clock_when_the_clock_moves() {

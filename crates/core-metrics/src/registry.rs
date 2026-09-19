@@ -9,7 +9,12 @@ use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// 64 → 256 in Phase 8a: five venues × the §6.4 loss-accounting
 /// counter set (msgs/bytes/parse_errors/gaps/resubscribes/
 /// reconnects/ring_drops) plus dispatcher counters need the room.
-pub const MAX_COUNTERS: usize = 256;
+/// 256 → 512 at E7 (2026-09-19): the live engine sat at ≈243 with
+/// one exec slot armed, and the exec lane's ledger + live-arm rows
+/// (the numbers the E7 ramp's bars are stated in) needed ~30 more.
+/// A `RegErr::Full` is a refused boot, and the place to discover it
+/// is not the first live boot. 16 KiB more of boot-time zero-init.
+pub const MAX_COUNTERS: usize = 512;
 /// Maximum number of gauges per registry. 128 → 384 in Phase 8a:
 /// per-bucket tick-age gauges (one per `engine::SYM_BUCKETS`),
 /// per-venue ingress state + coverage gauges, and headroom for the
@@ -136,7 +141,8 @@ pub struct MetricsRegistry {
 }
 
 impl MetricsRegistry {
-    /// Build an empty registry. ~8 KiB of zero-init data.
+    /// Build an empty registry. ~56 KiB of zero-init data (512 counters
+    /// + 384 gauges, one cache line each).
     pub fn new() -> Self {
         // We can't use `[Counter::empty(); 64]` because `Counter`
         // contains an `AtomicU64` which is `!Copy`. Fall back to

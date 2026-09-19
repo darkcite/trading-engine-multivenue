@@ -974,16 +974,25 @@ impl Bin15Strategy {
     /// but it is bounds-checked, because trusting a wire byte to index
     /// an array is how a malformed frame becomes a panic.
     fn on_roll(&mut self, event: &core_types::ChannelEvent) {
+        // ONE codec — `core_types::unpack_roll_seq` — and ONE reading
+        // of the kind byte, the strict one. This function used to
+        // restate the layout inline and compare the whole byte to 1,
+        // so a kind byte no packer of ours writes (`0x03`) read as
+        // CREATED and `bind()` flattened a live instance, while the
+        // exchange arm read the same frame as SETTLED (E7 review,
+        // 2026-09-19). A malformed frame is refused, not guessed.
         let seq = event.venue_seq;
-        let outcome = (seq & 0xFFFF_FFFF) as u32;
-        let twap_s = (seq >> 32) & 0xFFFF;
-        let family = ((seq >> 48) & 0xFF) as usize;
-        let settled = ((seq >> 56) & 0xFF) as u8;
+        let (outcome, twap_s, family, _masked) = core_types::unpack_roll_seq(seq);
+        let twap_s = u64::from(twap_s);
+        let Some(settled) = core_types::roll_kind_strict(seq) else {
+            self.counters.spec_refused = self.counters.spec_refused.wrapping_add(1);
+            return;
+        };
         if family >= self.params.n_families {
             self.counters.spec_refused = self.counters.spec_refused.wrapping_add(1);
             return;
         }
-        if settled == 1 {
+        if settled {
             // The settled row names the instance that is ENDING, and
             // the OUTCOME ID is the stronger identity: the family byte
             // is this member's boot ordering agreeing with the

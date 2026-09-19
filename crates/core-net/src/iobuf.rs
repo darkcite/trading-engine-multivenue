@@ -66,6 +66,11 @@ impl IoBuf {
     #[inline]
     pub fn free_mut(&mut self) -> &mut [u8] {
         if self.tail == self.data.len() && self.head > 0 {
+            // COPY: unread-tail compaction, ≤ capacity, only when the
+            // tail is pinned at capacity with dead bytes in front —
+            // amortised to zero on the parse-everything-you-read cycle
+            // — rejected: a ring buffer, which splits a frame across the
+            // wrap and costs every scanner a wrap branch.
             self.data.copy_within(self.head..self.tail, 0);
             self.tail -= self.head;
             self.head = 0;

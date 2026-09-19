@@ -3,6 +3,11 @@
 
 //! Phase C — the order lifecycle round-trip (plan §5.1).
 //!
+//! COPY-DOCTRINE: an operator tool (`exec-smoke --lifecycle`), run by
+//! a person against testnet, never reachable from the engine loop.
+//! Its report is `String`s by design and every byte copy in it is
+//! cold; `scripts/copy-audit.sh` skips this module on that line.
+//!
 //! Phases A and B in [`crate::smoke`] prove the venue verifies our
 //! SIGNATURE. They prove nothing about the venue's order state
 //! machine, because they never create an order. Phase C does:
@@ -215,7 +220,6 @@ pub fn run_on(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The three actions a run would send, built and shown but not sent.
 ///
 /// Phase C is the one thing in this lane that can create state on a
@@ -338,6 +342,7 @@ fn modify(
     Ok(if ok.oid == 0 { oid } else { ok.oid })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cancel(
     http: &mut HlHttp,
     sk: &secp256k1::SecretKey,
@@ -379,9 +384,6 @@ fn cleanup(
     }
 }
 
-/// Sign, send, scan. Every stage goes through here so that the
-/// fail-closed reading of the venue's answer is stated once.
-#[allow(clippy::too_many_arguments)]
 /// Whether a PER-ITEM error in an `ok` envelope is a failure or the
 /// answer being asked for.
 ///
@@ -405,6 +407,9 @@ enum ItemErrors {
     AreData,
 }
 
+/// Sign, send, scan. Every stage goes through here so that the
+/// fail-closed reading of the venue's answer is stated once.
+#[allow(clippy::too_many_arguments)]
 fn post(
     http: &mut HlHttp,
     sk: &secp256k1::SecretKey,
@@ -415,7 +420,7 @@ fn post(
     stage: &'static str,
     items: ItemErrors,
 ) -> Result<HlOk, SmokeErr> {
-    let nonce = nonces.next(crate::smoke::now_ms());
+    let nonce = nonces.next(crate::nonce::now_ms());
     let sig = sign_action(sk, action_mp, nonce, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
     let mut body = [0u8; MAX_REQ_BODY];
@@ -445,12 +450,6 @@ fn post(
     }
 }
 
-/// A cloid unique to this run.
-///
-/// LAW E-9 puts the slot in the cloid; this probe is not a slot, so
-/// the high bytes are a fixed marker that says "exec-smoke placed
-/// this" — an order found resting on the account can be traced back
-/// here rather than guessed at.
 /// The largest notional phase D will send, 1e8-scaled: **$100**.
 ///
 /// Not a risk limit — it is a TYPO limit. Every cap that matters lives
@@ -1190,7 +1189,7 @@ pub fn run_requote_on(
     if rep.stopped.is_none() {
         let mut rows = [crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS];
         match enumerate(http, cfg, &mut rows) {
-            Ok((k, _body)) => {
+            Ok((k, _range)) => {
                 let mut i = 0usize;
                 while i < k {
                     if let Some(c) = rows[i].cloid {
@@ -1496,22 +1495,32 @@ pub fn run_sweep_on(
     }
 
     // ---- enumerate, and let the ARM'S OWN selection decide ----------
-    let mut rows = vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS];
+    // The same stack row buffer the requote probe uses — one shape for
+    // one job (the first cut heap-allocated 256 rows here).
+    let mut rows = [crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS];
     match enumerate(http, cfg, &mut rows) {
-        Ok((n, body)) => {
+        Ok((n, range)) => {
+            // Borrowed from the response buffer — nothing below this
+            // block touches `http`, so no owned copy is needed (the
+            // first cut `to_vec`'d up to 16 KiB here).
+            let body = &http.resp()[range];
             // The row carrying OUR cloid names the leg. Taking the name
             // from the venue rather than deriving it from the asset id
             // is the point.
             let mut i = 0usize;
             while i < n {
-                let r = rows[i];
+                let r = &rows[i];
                 i += 1;
                 if r.cloid != Some(cloid) {
                     continue;
                 }
                 rep.listed = true;
-                let c = r.coin.of(&body);
+                let c = r.coin.of(body);
                 let k = c.len().min(crate::asset::COIN_MAX);
+                // COPY: the leg name from the venue's own row, ≤ COIN_MAX
+                // (20 B), once per probe — the span borrows the response
+                // body, which the next request overwrites — rejected:
+                // holding the body, which is the to_vec this replaced.
                 rep.coin[..k].copy_from_slice(&c[..k]);
                 rep.coin_len = u8::try_from(k).unwrap_or(0);
                 break;
@@ -1520,7 +1529,7 @@ pub fn run_sweep_on(
                 let mut oids = [0u64; crate::recon::MAX_OPEN_ORDERS];
                 let picked = crate::recon::ours_on_leg(
                     &rows[..n],
-                    &body,
+                    body,
                     &rep.coin[..rep.coin_len as usize],
                     &mut oids,
                 );
@@ -1571,8 +1580,7 @@ pub fn run_sweep_on(
     // ---- enumerate again: it must be GONE --------------------------
     if rep.cancelled {
         match enumerate(http, cfg, &mut rows) {
-            Ok((n, body)) => {
-                let _ = &body;
+            Ok((n, _range)) => {
                 let mut still = false;
                 let mut i = 0usize;
                 while i < n {
@@ -1600,23 +1608,23 @@ pub fn run_sweep_on(
 }
 
 /// One `frontendOpenOrders` round trip, scanned. Returns the row count
-/// and an OWNED copy of the body, because the caller reads spans out of
-/// it across a later borrow of `http`.
+/// and the body's range in `http.resp()`; the caller borrows the body
+/// from there and reads the rows' spans against it.
 fn enumerate(
     http: &mut HlHttp,
     cfg: &HlConfig,
     rows: &mut [crate::recon::OpenOrder],
-) -> Result<(usize, Vec<u8>), SmokeErr> {
+) -> Result<(usize, core::ops::Range<usize>), SmokeErr> {
     let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
     let n = crate::recon::open_orders_request(&mut req, &cfg.master_addr)
         .map_err(|_| SmokeErr::Encode)?;
     let (_status, range) = http
         .post_to(crate::http::INFO_PATH, &req[..n])
         .map_err(|e| SmokeErr::Http(e.err))?;
-    let body = http.resp()[range].to_vec();
     // Fail-closed: an unreadable answer is NOT "nothing is resting".
-    let k = crate::recon::scan_open_orders(&body, rows).map_err(|_| SmokeErr::Unreadable)?;
-    Ok((k, body))
+    let k = crate::recon::scan_open_orders(&http.resp()[range.clone()], rows)
+        .map_err(|_| SmokeErr::Unreadable)?;
+    Ok((k, range))
 }
 
 /// Best-effort cancel-by-cloid so a failed probe leaves nothing on the
@@ -2017,11 +2025,17 @@ pub fn run_recon(
 /// low ones a timestamp, and `cloid::decode` reads it as `Foreign`.
 /// [`FillSpec`] is the opposite case: it carries the REAL magic
 /// precisely so the echo decodes to a slot.
+/// A cloid unique to this run.
+///
+/// LAW E-9 puts the slot in the cloid; this probe is not a slot, so
+/// the high bytes are a fixed marker that says "exec-smoke placed
+/// this" — an order found resting on the account can be traced back
+/// here rather than guessed at.
 fn fresh_cloid() -> [u8; 16] {
     let mut c = [0u8; 16];
     c[0] = 0xE3; // the phase that placed it
     c[1] = 0x5C; // "smoke"
-    let ms = crate::smoke::now_ms().to_be_bytes();
+    let ms = crate::nonce::now_ms().to_be_bytes();
     c[8..16].copy_from_slice(&ms);
     c
 }

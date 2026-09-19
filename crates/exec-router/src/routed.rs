@@ -54,6 +54,18 @@ use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, Tick};
 /// thread does one `stat` per second rather than five hundred.
 const HALT_POLL_EVERY_NS: u64 = 1_000_000_000;
 
+/// What [`RoutedDispatcher::read_halt_file`] found.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HaltFileRead {
+    /// No file. The normal case.
+    Absent,
+    /// A file exists and could not be read as a halt file. Present
+    /// and inert — never silent.
+    Refused,
+    /// `n` bytes read into the caller's buffer.
+    Read(usize),
+}
+
 /// Routes each order to the paper matcher or the live arm according to
 /// the boot-fixed [`ExecRoute`].
 ///
@@ -195,35 +207,57 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// Zero allocation: the path goes to `stat`/`open` through std's
     /// stack fast path for short paths, and the bytes land in the
     /// caller's buffer.
-    fn read_halt_file(path: &std::path::Path, buf: &mut [u8; crate::halt::HALT_FILE_MAX]) -> Option<usize> {
+    ///
+    /// **Three answers, not two.** `Absent` is the normal case. `Refused`
+    /// is a file that EXISTS and could not be read as a halt file — not
+    /// regular, over `HALT_FILE_MAX`, unopenable, unreadable, or (the
+    /// caller's check) not UTF-8. The first cut folded the second into
+    /// the first, so an operator who wrote a halt file with the wrong
+    /// permissions, or appended notes past 512 B, got a clean boot log
+    /// and a trading engine: the kill switch silently disarmed, which
+    /// commit 4's own prose called "strictly worse" than a loud
+    /// refusal (E7 review, 2026-09-19). A refused file now counts as
+    /// PRESENT and INERT, so the boot and the runtime poll both say so.
+    fn read_halt_file(
+        path: &std::path::Path,
+        buf: &mut [u8; crate::halt::HALT_FILE_MAX],
+    ) -> HaltFileRead {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        let md = std::fs::metadata(path).ok()?;
+        let Ok(md) = std::fs::metadata(path) else {
+            return HaltFileRead::Absent;
+        };
         if !md.is_file() {
-            return None;
+            return HaltFileRead::Refused;
         }
         if md.len() > crate::halt::HALT_FILE_MAX as u64 {
-            return None;
+            return HaltFileRead::Refused;
         }
-        let mut f = std::fs::OpenOptions::new()
+        let Ok(mut f) = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
-            .ok()?;
+        else {
+            return HaltFileRead::Refused;
+        };
         let mut n = 0usize;
         while n < buf.len() {
+            // COPY: kernel → user read of exec.HALT, ≤ 512 B, at most
+            // once a second behind the mtime gate — the read(2)
+            // boundary, straight into the caller's fixed buffer —
+            // rejected: mmap, which brings back the blocking and
+            // unbounded hazards O_NONBLOCK + the stat guard remove.
             match f.read(&mut buf[n..]) {
                 Ok(0) => break,
                 Ok(k) => n += k,
                 // `O_NONBLOCK` can answer EAGAIN on an exotic file we
                 // should not have reached anyway. Give up rather than
-                // spin: a halt file we cannot read halts nothing, and
-                // the next poll will try again.
-                Err(_) => return None,
+                // spin; the caller counts it and the next poll retries.
+                Err(_) => return HaltFileRead::Refused,
             }
         }
-        Some(n)
+        HaltFileRead::Read(n)
     }
 
     /// **E6 commit 4 — read `exec.HALT` back.**
@@ -244,7 +278,9 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// denial of service on an engine that might be needed to flatten
     /// a position.
     pub fn adopt_halt_file(&mut self) -> u32 {
-        let Some(path) = self.halt_path.clone() else {
+        // Borrowed, not cloned: a `PathBuf` clone is a heap allocation
+        // for nothing, and the runtime twin already borrows.
+        let Some(path) = self.halt_path.take() else {
             return 0;
         };
         // The baseline for the runtime poll is taken whether or not
@@ -252,14 +288,25 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         // seen as a change.
         self.halt_file_seen = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let mut buf = [0u8; crate::halt::HALT_FILE_MAX];
-        let Some(n) = Self::read_halt_file(&path, &mut buf) else {
-            return 0;
+        let adopted = match Self::read_halt_file(&path, &mut buf) {
+            HaltFileRead::Absent => 0,
+            HaltFileRead::Refused => {
+                self.halt_file_present = true;
+                self.halt_file_inert = self.halt_file_inert.saturating_add(1);
+                0
+            }
+            HaltFileRead::Read(n) => {
+                self.halt_file_present = true;
+                match core::str::from_utf8(&buf[..n]) {
+                    Ok(text) => self.latch_all(&crate::halt::parse_halt_file(text)),
+                    Err(_) => {
+                        self.halt_file_inert = self.halt_file_inert.saturating_add(1);
+                        0
+                    }
+                }
+            }
         };
-        self.halt_file_present = true;
-        let Ok(text) = core::str::from_utf8(&buf[..n]) else {
-            return 0;
-        };
-        let adopted = self.latch_all(&crate::halt::parse_halt_file(text));
+        self.halt_path = Some(path);
         self.halt_file_adopted = adopted;
         adopted
     }
@@ -286,10 +333,12 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         self.halt_file_polls
     }
 
-    /// Was a readable `exec.HALT` seen? `true` with
+    /// Was ANYTHING seen at the halt path? `true` with
     /// [`Self::halt_file_adopted`] at zero means an operator wrote a
-    /// halt file that halted NOTHING — a typo, or a slot that is not
-    /// live — which the boot must say out loud.
+    /// halt file that halted NOTHING — a typo, a slot that is not
+    /// live, or a file the engine could not read at all (a FIFO, a
+    /// directory, a non-UTF-8 body: `halt_file_inert` counts those) —
+    /// which the boot must say out loud either way (E7 review).
     #[inline]
     #[must_use]
     pub const fn halt_file_present(&self) -> bool {
@@ -374,14 +423,24 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         if self.halt_file_seen == Some(mtime) {
             return;
         }
-        self.halt_file_seen = Some(mtime);
         self.halt_file_reads = self.halt_file_reads.saturating_add(1);
         let mut buf = [0u8; crate::halt::HALT_FILE_MAX];
-        let Some(n) = Self::read_halt_file(path, &mut buf) else {
-            return;
+        // The baseline moves only on a SUCCESSFUL read. A refused file
+        // stays "unseen", so the next second retries it — the first cut
+        // advanced the baseline before reading and never came back.
+        let n = match Self::read_halt_file(path, &mut buf) {
+            HaltFileRead::Absent => return,
+            HaltFileRead::Refused => {
+                self.halt_file_present = true;
+                self.halt_file_inert = self.halt_file_inert.saturating_add(1);
+                return;
+            }
+            HaltFileRead::Read(n) => n,
         };
+        self.halt_file_seen = Some(mtime);
         self.halt_file_present = true;
         let Ok(text) = core::str::from_utf8(&buf[..n]) else {
+            self.halt_file_inert = self.halt_file_inert.saturating_add(1);
             return;
         };
         let reasons = crate::halt::parse_halt_file(text);
@@ -398,7 +457,18 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     ///
     /// The same latch every trigger uses, so an operator halt is
     /// exactly as sticky and cancels exactly as hard.
-    pub fn halt_slot(&mut self, slot: usize, why: HaltReason) {
+    ///
+    /// **LIVE slots only**, the same filter `latch_all` carries and
+    /// for the same reason: the edge fires a VENUE-WIDE cancel, so
+    /// `--halt-slot <paper slot>` would have pulled the live arm's
+    /// real quotes for nothing, written an `exec.HALT` the next boot
+    /// refuses to adopt, and halted nothing (a paper submit never
+    /// consults the latch). Returns whether the slot was halted, so
+    /// the cli can say which slots it actually stopped.
+    pub fn halt_slot(&mut self, slot: usize, why: HaltReason) -> bool {
+        if !matches!(self.route.mode_at(slot), Some(ExecMode::Live)) {
+            return false;
+        }
         if self.halt.latch(slot, why) {
             self.on_halt_edge();
             // An operator halt does not wait for the next idle poll.
@@ -407,7 +477,9 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             // last run left behind — where the idle driver has not
             // started and might never, depending on the boot mode.
             self.try_cancel_all();
+            return true;
         }
+        false
     }
 
     /// A slot has just halted: write the file that makes the halt
@@ -452,6 +524,16 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             CancelPhase::None => return,
             // Latched but never asked. Ask, below.
             CancelPhase::Wanted => self.halt.cancel_requested(),
+            // A request did not land. Ask again, below — unless the
+            // arm is still draining what the failed request DID
+            // queue, in which case there is no room for the rest yet
+            // and asking would fail again, 500 times a second.
+            CancelPhase::Retry => {
+                if matches!(self.live.cancel_all_state(), CancelAllState::Working) {
+                    return;
+                }
+                self.halt.cancel_requested();
+            }
             CancelPhase::Asked => match self.live.cancel_all_state() {
                 // The venue said it holds nothing of ours, so every
                 // slot's resting count is now TRUTHFULLY zero —
@@ -536,32 +618,27 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// the truth, and would fail all three clamps OPEN against
     /// whatever the previous boot left working.
     ///
-    /// **Nothing in production calls this yet.** The reconciler
-    /// wiring is E6 commit 3, so a live slot armed on this commit
-    /// alone refuses every order. That is the intended reading: a risk
-    /// gate with no memory of the venue must not pass orders, and a
-    /// slot that refuses loudly in its first second is a better
-    /// failure than a cap that was never really there.
+    /// **Production seeds through `on_idle`** (E6 commit 3: the first
+    /// `halt_signal().reconciled` the arm reports). This is the door
+    /// the tests and the alloc gates use to start from a seeded
+    /// ledger without a venue — it is the same `Ledger::mark_seeded`
+    /// call, so there is one interlock and two callers of it.
     #[inline]
     pub fn mark_ledger_seeded(&mut self) {
         self.ledger.mark_seeded();
     }
 
-    /// The table in force. Cold; boot tell, `/state`.
+    /// What the router did. Cold; tests and the alloc gates — the
+    /// production surface is `exec_counters()` through the trait. By
+    /// reference: four cache lines.
     #[inline]
     #[must_use]
-    pub fn route(&self) -> &ExecRoute {
-        &self.route
+    pub const fn counters(&self) -> &RouteCounters {
+        &self.counters
     }
 
-    /// What the router did. Cold; the 5 s metrics tick.
-    #[inline]
-    #[must_use]
-    pub fn counters(&self) -> RouteCounters {
-        self.counters
-    }
-
-    /// The paper arm, for tests and for the cli's `/state` assembly.
+    /// The paper arm. Tests and the alloc gates; production reaches it
+    /// only through the trait.
     #[inline]
     pub fn paper(&self) -> &P {
         &self.paper
@@ -633,11 +710,13 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     ///
     /// `px` and `qty` are both ×1e6, so their product over 1e6 is USD
     /// ×1e6, the same scale the caps are stated in. Done in `i128`
-    /// because the product overflows `i64` at ~9.2e12 — a $92 000
-    /// order of a $1 contract reaches it, which is inside the range a
-    /// fat-fingered `exec.toml` could ask for, and a saturating
-    /// product would clamp to a POSITIVE `i64::MAX` and sail past a
-    /// cap rather than into it.
+    /// because the raw product overflows `i64` at ~9.2e18 — about
+    /// $9.2 M of notional (a $4 M price and three contracts), which is
+    /// inside the range a fat-fingered `exec.toml` could ask for — and
+    /// a saturating product would clamp to a POSITIVE `i64::MAX` and
+    /// sail past a cap rather than into it. The narrow back to `i64`
+    /// SATURATES too: an `as i64` cast would wrap the same product
+    /// negative and re-open the hole the `i128` closed.
     ///
     /// ## A cap of 0
     ///
@@ -672,9 +751,13 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             // No such slot. The caller's own `mode()` lookup masks the
             // id into range, so this is unreachable — and it refuses
             // rather than passing, because a clamp that cannot find
-            // its number must not wave the order through.
+            // its number must not wave the order through. Counted as
+            // UNSEEDED, "the gate has nothing to judge this against",
+            // never as `MaxOrder`, which is the one field an alert is
+            // wired to and means "the member and the operator
+            // disagreed".
             self.counters
-                .on_refused_risk(order.strategy_id, RiskRefusal::MaxOrder);
+                .on_refused_risk(order.strategy_id, RiskRefusal::Unseeded);
             return Err(DispatchError::RiskRefused);
         };
 
@@ -723,7 +806,9 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         let px = order.px.raw();
         let qty = order.qty.raw();
         let buy = order.side == Side::Bid;
-        let notional_1e6 = ((px as i128).saturating_mul(qty as i128) / 1_000_000) as i64;
+        let notional_1e6 =
+            i64::try_from((px as i128).saturating_mul(qty as i128) / 1_000_000)
+                .unwrap_or(i64::MAX);
 
         // ---- 1. this one order ---------------------------------------
         if notional_1e6 > caps.max_order_usd_1e6 {
@@ -879,9 +964,30 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
         match self.route.mode(req.strategy_id) {
             ExecMode::Paper => self.paper.cancel(req),
+            // **A cancel passes on an `Off` slot** (E7 review ruling,
+            // 2026-09-19). `off` stops PLACING. A cancel can only
+            // reduce risk, the halt machine's own law is "a cancel is
+            // the only way to get flat and must never be blocked",
+            // and refusing it here left a slot flipped live → off
+            // across a restart with orders resting at the venue and
+            // no in-engine path to take them back — the trigger loop
+            // and `latch_all` both skip non-live slots, so not even
+            // the venue-wide sweep could reach them. Routed by the
+            // slot's venue mask exactly as a live cancel is; an `off`
+            // slot whose artifact names no venue has nowhere to send
+            // it and is refused as before.
             ExecMode::Off => {
-                self.counters.on_refused_off(req.strategy_id);
-                Err(DispatchError::SlotDisabled)
+                if !self.route.venue_allowed(req.strategy_id, req.venue) {
+                    self.counters.on_refused_off(req.strategy_id);
+                    return Err(DispatchError::SlotDisabled);
+                }
+                self.counters.on_cancel_on_off();
+                let r = self.live.cancel(req);
+                if r.is_ok() {
+                    self.ledger
+                        .on_cancel(req.client_oid, req.strategy_id as usize);
+                }
+                r
             }
             ExecMode::Live => {
                 if !self.route.venue_allowed(req.strategy_id, req.venue) {
@@ -1010,6 +1116,13 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             self.ledger.mark_seeded();
         }
 
+        // ONE edge per poll, however many slots latch in it — the file
+        // names every halted slot and the cancel is venue-wide, so N
+        // `write_atomic` calls (N allocations, N fsyncs on the engine
+        // thread) for one incident would be N−1 too many. `latch_all`
+        // already did it this way; the trigger loop caught up (E7
+        // review, 2026-09-19).
+        let mut latched = 0u32;
         let mut slot = 0usize;
         while slot < EXEC_SLOTS {
             let here = slot;
@@ -1022,10 +1135,12 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             };
             let why = trigger_for(&sig, &lim);
             if self.halt.latch(here, why) {
-                self.on_halt_edge();
+                latched += 1;
             }
         }
-
+        if latched > 0 {
+            self.on_halt_edge();
+        }
 
         // The operator's file, after the triggers: a slot the
         // operator halted and a slot a trigger halted are the same
@@ -1117,6 +1232,14 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         for (slot, h) in halted.iter_mut().enumerate() {
             *h = self.halt.reason(slot) as u8;
         }
+        let l = self.ledger.counters();
+        // COPY: ExecCounters (≈ 504 B by repr(C) layout — the 208 B
+        // LiveArmCounters ride inside) returned by value across the
+        // OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics —
+        // it is COMPOSED here from the router, the halt state, the
+        // ledger and the live arm, so there is nothing to borrow —
+        // rejected: an out-param, which trades the copy for a second
+        // borrow of the same `&mut self` the publish path holds.
         ExecCounters {
             configured: 1,
             modes,
@@ -1125,6 +1248,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             refused_off: c.refused_off,
             refused_no_route: c.refused_no_route,
             refused_risk: c.refused_risk,
+            cancel_on_off: c.cancel_on_off,
             refused_halted: c.refused_halted,
             refused_unseeded: c.refused_unseeded,
             halts: self.halt.halts,
@@ -1136,7 +1260,19 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             halted,
             live_submits_by_slot: c.live_submits_by_slot,
             refused_by_slot: c.refused_by_slot,
+            ledger_fills_unbound: l.fills_unbound,
+            ledger_sells_below_zero: l.sells_below_zero,
+            ledger_binds_refused: l.binds_refused,
+            ledger_resting_full: l.resting_full,
+            ledger_resting_ambiguous: l.resting_ambiguous,
+            ledger_settles_unmatched: l.settles_unmatched,
+            arm: self.live.arm_counters(),
         }
+    }
+
+    #[inline]
+    fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
+        self.live.arm_counters()
     }
 }
 
@@ -1487,24 +1623,51 @@ mod tests {
         assert_eq!(d.paper().matcher_counters().cancels, 1);
     }
 
+    /// `off` stops PLACING. A modify is a place; a cancel is not, and
+    /// it is the one path that can take back an order a previous boot
+    /// left at the venue — so it reaches the live arm on the slot's
+    /// venue mask (E7 review ruling, 2026-09-19).
     #[test]
-    fn an_off_slots_cancel_and_modify_are_refused_by_both_arms() {
+    fn an_off_slot_refuses_a_modify_and_lets_a_cancel_through_to_the_arm() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            6,
+            ExecMode::Off,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default(), test_anchor());
+        d.mark_ledger_seeded();
+        let o = order(6, VenueId::Hyperliquid, 5);
+        assert_eq!(
+            d.modify(&ModifyReq::new(4, o)),
+            Err(DispatchError::SlotDisabled)
+        );
+        assert!(d.live().modified.is_empty());
+        assert_eq!(d.cancel(&cancel_of(&o)), Ok(()));
+        assert_eq!(d.live().cancelled, vec![5], "the cancel reached the arm");
+        assert_eq!(d.paper().matcher_counters().cancels, 0, "never the paper matcher");
+        assert_eq!(d.counters().refused_off, 1, "the modify");
+        assert_eq!(d.counters().cancel_on_off, 1, "the cancel, counted not refused");
+        assert_eq!(d.exec_counters().cancel_on_off, 1);
+    }
+
+    /// An `off` slot whose artifact names NO venue has nowhere to send
+    /// a cancel. Refused, as before — never routed to paper.
+    #[test]
+    fn an_off_slot_with_no_venue_still_refuses_a_cancel() {
         let mut r = ExecRoute::all_paper();
         r.set_slot(6, ExecMode::Off, &[], SlotCaps::none(), HaltLimits::none()).unwrap();
         let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default(), test_anchor());
         d.mark_ledger_seeded();
         let o = order(6, VenueId::Hyperliquid, 5);
         assert_eq!(d.cancel(&cancel_of(&o)), Err(DispatchError::SlotDisabled));
-        assert_eq!(
-            d.modify(&ModifyReq::new(4, o)),
-            Err(DispatchError::SlotDisabled)
-        );
         assert!(d.live().cancelled.is_empty());
-        assert!(d.live().modified.is_empty());
         assert_eq!(d.paper().matcher_counters().cancels, 0);
-        assert_eq!(d.paper().matcher_counters().no_such_order, 0);
-        assert_eq!(d.paper().matcher_counters().identity_mismatch, 0);
-        assert_eq!(d.counters().refused_off, 2);
+        assert_eq!(d.counters().refused_off, 1);
+        assert_eq!(d.counters().cancel_on_off, 0);
     }
 
     /// The stub live arm must refuse a lifecycle verb exactly as it
@@ -2238,7 +2401,7 @@ mod tests {
 
     /// The thresholds every halt test uses.
     fn halt_limits() -> crate::route::HaltLimits {
-        crate::route::HaltLimits::new(5, 5_000_000, 30_000, 3)
+        crate::route::HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000)
     }
 
     /// A live slot 3 with real caps AND real halt thresholds, plus a
@@ -2260,7 +2423,7 @@ mod tests {
             test_anchor(),
         );
         // A healthy, reconciled arm to start from.
-        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true);
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000);
         d.on_idle();
         d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
         d
@@ -2367,7 +2530,7 @@ mod tests {
             SpyHalt::default(),
             test_anchor(),
         );
-        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true);
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000);
         d.on_idle();
         d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
 
@@ -2471,7 +2634,7 @@ mod tests {
         d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
 
         // An arm that has not reconciled: every live place refused.
-        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, false);
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, false, 0);
         d.on_idle();
         assert!(!d.ledger().is_seeded());
         assert_eq!(
@@ -2588,9 +2751,15 @@ mod tests {
         d.set_halt_path(path);
         // If this ever blocks, the test hangs rather than fails —
         // which is exactly what the production bug did.
-        assert_eq!(d.adopt_halt_file(), 0, "a FIFO is not a halt file");
+        assert_eq!(d.adopt_halt_file(), 0, "a FIFO halts nothing");
         assert!(!d.halt().any_halted());
-        assert!(!d.halt_file_present(), "and it was not counted as one");
+        // But it is NOT silent (E7 review): something sits at the halt
+        // path that the engine could not read, and a boot that said
+        // nothing about it would be the silent-halt-file failure with
+        // the sign flipped. Present + inert is what the boot tell
+        // prints for it.
+        assert!(d.halt_file_present(), "something is at the halt path, and the boot must say so");
+        assert_eq!(d.halt_file_inert(), 1, "counted as an unreadable/inert read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2816,7 +2985,7 @@ mod tests {
         );
 
         // One signal, read by both slots on the same poll.
-        d.live_mut().sig = clob_dispatcher::HaltSignal::new(30_000_000_000, 0, 0, 0, false, true);
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(30_000_000_000, 0, 0, 0, false, true, 1_000_000);
         d.on_idle();
 
         assert!(d.halt().is_halted(a));

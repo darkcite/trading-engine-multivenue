@@ -116,7 +116,11 @@ fn load() -> std::collections::HashMap<String, Row> {
             },
         );
     }
-    assert!(out.len() >= 20, "the gate wants >= 20 vectors, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        exec_hyperliquid::selftest::VECTOR_ROWS as usize,
+        "the fixture holds exactly the advertised vector count"
+    );
     out
 }
 
@@ -163,38 +167,37 @@ fn order(name: &str, rows: &std::collections::HashMap<String, Row>, wires: &[Ord
 fn every_vector_reproduces_byte_for_byte() {
     let r = load();
     let mut seen: Vec<&str> = Vec::new();
-    let mut hit = |n: &'static str| seen.push(n);
 
     // --- the three tifs, both sides, with and without cloid ---------
     order("order_gtc_buy", &r, &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Gtc)], b"na");
-    hit("order_gtc_buy");
+    seen.push("order_gtc_buy");
     order("order_ioc_buy", &r, &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Ioc)], b"na");
-    hit("order_ioc_buy");
+    seen.push("order_ioc_buy");
     order("order_alo_buy", &r, &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo)], b"na");
-    hit("order_alo_buy");
+    seen.push("order_alo_buy");
     order("order_gtc_sell", &r, &[OrderWire::new(0, false, 50_000_000, 1_000_000_000, Tif::Gtc)], b"na");
-    hit("order_gtc_sell");
+    seen.push("order_gtc_sell");
     order(
         "order_ioc_cloid",
         &r,
         &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Ioc).with_cloid(cloid_a())],
         b"na",
     );
-    hit("order_ioc_cloid");
+    seen.push("order_ioc_cloid");
     order(
         "order_alo_cloid_testnet",
         &r,
         &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo).with_cloid(cloid_b())],
         b"na",
     );
-    hit("order_alo_cloid_testnet");
+    seen.push("order_alo_cloid_testnet");
     order(
         "order_reduce_only",
         &r,
         &[OrderWire::new(0, false, 50_000_000, 1_000_000_000, Tif::Gtc).reduce_only()],
         b"na",
     );
-    hit("order_reduce_only");
+    seen.push("order_reduce_only");
 
     // --- HIP-4: the asset ids and 4dp prices this lane actually sends
     order(
@@ -203,13 +206,13 @@ fn every_vector_reproduces_byte_for_byte() {
         &[OrderWire::new(HIP4_YES, true, 45_670_000, 2_500_000_000, Tif::Ioc).with_cloid(cloid_b())],
         b"na",
     );
-    hit("hip4_yes_ioc");
+    seen.push("hip4_yes_ioc");
     order("hip4_no_alo", &r, &[OrderWire::new(HIP4_NO, false, 99_900_000, 100_000_000, Tif::Alo)], b"na");
-    hit("hip4_no_alo");
+    seen.push("hip4_no_alo");
     order("hip4_min_px", &r, &[OrderWire::new(HIP4_YES, true, 100_000, 1_000_000_000, Tif::Ioc)], b"na");
-    hit("hip4_min_px");
+    seen.push("hip4_min_px");
     order("hip4_max_px", &r, &[OrderWire::new(HIP4_YES, true, 99_900_000, 1_000_000_000, Tif::Ioc)], b"na");
-    hit("hip4_max_px");
+    seen.push("hip4_max_px");
     // 0.5000 must render "0.5" — the trailing-zero law, inside a signature.
     order(
         "hip4_trailing_zero_px",
@@ -217,7 +220,7 @@ fn every_vector_reproduces_byte_for_byte() {
         &[OrderWire::new(HIP4_YES, true, 50_000_000, 10_000_000_000, Tif::Gtc)],
         b"na",
     );
-    hit("hip4_trailing_zero_px");
+    seen.push("hip4_trailing_zero_px");
 
     // --- batches ----------------------------------------------------
     order(
@@ -229,7 +232,7 @@ fn every_vector_reproduces_byte_for_byte() {
         ],
         b"na",
     );
-    hit("order_batch_2");
+    seen.push("order_batch_2");
     order(
         "order_batch_3_mixed",
         &r,
@@ -240,14 +243,14 @@ fn every_vector_reproduces_byte_for_byte() {
         ],
         b"na",
     );
-    hit("order_batch_3_mixed");
+    seen.push("order_batch_3_mixed");
     order(
         "order_grouping_tpsl",
         &r,
         &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Gtc)],
         b"normalTpsl",
     );
-    hit("order_grouping_tpsl");
+    seen.push("order_grouping_tpsl");
 
     // --- the two tail bytes of the action hash -----------------------
     for (name, vault, exp) in [

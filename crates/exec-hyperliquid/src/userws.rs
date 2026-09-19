@@ -51,10 +51,11 @@
 //! zero-quantity fill is a trade that reports as having happened and
 //! moved nothing.
 
-use core_parse::{find_field, scan_price_1e8, scan_u64, skip_ws};
+use core_parse::skip_ws;
 use core_types::{Fill, NsTs, Price, Qty, Side, SymbolId, FILL_ORIGIN_VENUE, STRATEGY_ID_NONE};
 
 use crate::cloid::{decode as decode_cloid, from_hex, Owner};
+use crate::json::{array_start, bool_field, decimal_field, object_end, string_field, u64_field};
 use crate::response::{ScanErr, Span};
 
 /// Venue 1e8 → engine 1e6.
@@ -175,7 +176,11 @@ impl Routed {
     }
 
     /// The fill IF it may enter fill lane 3, and `None` otherwise.
-    /// The only sanctioned way to reach the lane.
+    /// The containment is in the VARIANTS: the production path
+    /// (`HlExchange::route_frame`) matches `Routed::Slot` directly and
+    /// a `TapeOnly` can never be pushed into the lane by any
+    /// spelling; this accessor is what the tests, the bench and the
+    /// fuzz target use.
     #[inline]
     #[must_use]
     pub const fn for_lane(&self) -> Option<&Fill> {
@@ -195,6 +200,7 @@ impl Routed {
 /// Attribution comes from the cloid alone. A foreign or absent cloid
 /// yields `strategy_id = STRATEGY_ID_NONE` — the fill is still
 /// returned, because it must still reach the tape.
+#[inline]
 pub fn to_fill(f: &UserFill, sym: SymbolId, now_ns: NsTs) -> Result<Routed, ConvertErr> {
     // Sign first: a negative size would pass the zero check below and
     // arrive as a negative `Qty`. Direction is carried by `side`.
@@ -275,6 +281,7 @@ pub fn to_fill(f: &UserFill, sym: SymbolId, now_ns: NsTs) -> Result<Routed, Conv
 /// As [`to_fill`], plus [`ConvertErr::NotSettlement`] for a row this
 /// may not attribute and [`ConvertErr::NoSlot`] for the fan-out
 /// sentinel — both refused in EVERY profile.
+#[inline]
 pub fn to_fill_as(
     f: &UserFill,
     sym: SymbolId,
@@ -437,7 +444,8 @@ pub fn is_user_fills(payload: &[u8]) -> bool {
     }
 }
 
-/// A ring of recently-seen venue trade ids.
+/// A ring of recently-seen venue trade ids, with an O(1) membership
+/// index.
 ///
 /// **It must outlive the socket.** Hyperliquid answers every fresh
 /// subscription with a snapshot of recent fills, so a dedupe that
@@ -453,9 +461,23 @@ pub fn is_user_fills(payload: &[u8]) -> bool {
 /// them. That is double-counting at exactly the moment LAW E-5 exists
 /// to prevent. [`SNAPSHOT_RING`] is the production size; do not
 /// instantiate a smaller one outside tests.
+///
+/// ## Why an index
+///
+/// `admit` used to be a linear scan of the whole ring — 4,096 `u64`
+/// compares per fill once warm, ~8 million compares per reconnect
+/// snapshot, on the engine thread (E7 review, 2026-09-19). The index
+/// is an open-addressed table of `2N` slots (`[[u32; 2]; N]`, because
+/// `[u32; 2 * N]` needs a feature stable Rust does not have), linear
+/// probing, load ≤ ½, backward-shift deletion on eviction. Same
+/// fixed memory shape, same POD, no allocation; `admit` is O(1)
+/// expected and bounded by `2N` probes in the worst case.
 #[repr(C, align(64))]
 pub struct TidRing<const N: usize> {
+    /// The ids in insertion order; `next` is the eviction cursor.
     tids: [u64; N],
+    /// Slot value = ring position + 1; `0` = empty. `2N` slots.
+    idx: [[u32; 2]; N],
     next: usize,
     len: usize,
 }
@@ -471,29 +493,137 @@ impl<const N: usize> TidRing<N> {
     #[must_use]
     pub const fn new() -> Self {
         const { assert!(N.is_power_of_two(), "TidRing capacity must be a power of two") };
+        const { assert!(N >= 2, "TidRing needs at least two rows") };
         Self {
             tids: [0u64; N],
+            idx: [[0u32; 2]; N],
             next: 0,
             len: 0,
         }
+    }
+
+    /// Number of index slots (`2N`) and its mask.
+    const SLOTS: usize = 2 * N;
+    const MASK: usize = 2 * N - 1;
+
+    #[inline(always)]
+    fn hash(tid: u64) -> usize {
+        // Fibonacci hashing: the top bits of the product are the
+        // well-mixed ones, so shift them down to the slot width.
+        let shift = 64 - Self::SLOTS.trailing_zeros();
+        (tid.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+    }
+
+    #[inline(always)]
+    fn slot(&self, h: usize) -> u32 {
+        self.idx[h >> 1][h & 1]
+    }
+
+    #[inline(always)]
+    fn set_slot(&mut self, h: usize, v: u32) {
+        self.idx[h >> 1][h & 1] = v;
     }
 
     /// Record `tid`, returning `true` if it is NEW (i.e. book it) and
     /// `false` if it has been seen (i.e. drop it).
     #[inline]
     pub fn admit(&mut self, tid: u64) -> bool {
-        for k in 0..self.len {
-            // SAFETY-free: `k < self.len <= N`, and `tids` is `[u64; N]`.
-            if self.tids[k] == tid {
+        // ---- lookup ---------------------------------------------------
+        let mut h = Self::hash(tid);
+        let mut probes = 0usize;
+        while probes < Self::SLOTS {
+            let v = self.slot(h);
+            if v == 0 {
+                break;
+            }
+            // `v - 1 < N` by construction: only `pos + 1` for `pos < N`
+            // is ever written.
+            if self.tids[(v - 1) as usize] == tid {
                 return false;
             }
+            h = (h + 1) & Self::MASK;
+            probes += 1;
         }
-        self.tids[self.next] = tid;
+        // ---- evict the oldest when full ------------------------------
+        if self.len == N {
+            let old = self.tids[self.next];
+            self.remove(old, self.next);
+        }
+        // ---- insert ---------------------------------------------------
+        let pos = self.next;
+        self.tids[pos] = tid;
+        let mut h = Self::hash(tid);
+        let mut probes = 0usize;
+        while probes < Self::SLOTS {
+            if self.slot(h) == 0 {
+                break;
+            }
+            h = (h + 1) & Self::MASK;
+            probes += 1;
+        }
+        // Unreachable at load ≤ ½ — the table always has an empty
+        // slot — but a full-table write is refused rather than
+        // corrupting an occupied one.
+        debug_assert!(probes < Self::SLOTS, "TidRing index has no empty slot");
+        if probes < Self::SLOTS {
+            self.set_slot(h, (pos + 1) as u32);
+        }
         self.next = (self.next + 1) & (N - 1);
         if self.len < N {
             self.len += 1;
         }
         true
+    }
+
+    /// Drop the index entry for `tid` sitting at ring position `pos`,
+    /// backward-shifting the probe chain so later lookups still find
+    /// what they should.
+    #[inline]
+    fn remove(&mut self, tid: u64, pos: usize) {
+        let want = (pos + 1) as u32;
+        let mut h = Self::hash(tid);
+        let mut probes = 0usize;
+        while probes < Self::SLOTS {
+            let v = self.slot(h);
+            if v == 0 {
+                // Not indexed — cannot happen for a live row, but a
+                // missing entry must not turn into a corrupted table.
+                debug_assert!(false, "TidRing row not in its index");
+                return;
+            }
+            if v == want {
+                break;
+            }
+            h = (h + 1) & Self::MASK;
+            probes += 1;
+        }
+        // Backward-shift deletion (Knuth 6.4 algorithm R): pull each
+        // later entry of the same probe chain back into the hole if
+        // its home slot lies on the far side of it.
+        let mut hole = h;
+        let mut j = (h + 1) & Self::MASK;
+        let mut probes = 0usize;
+        while probes < Self::SLOTS {
+            let v = self.slot(j);
+            if v == 0 {
+                break;
+            }
+            let home = Self::hash(self.tids[(v - 1) as usize]);
+            // Is `home` cyclically in (hole, j]? Then `v` is reachable
+            // from its home without passing the hole; leave it.
+            let in_range = if hole <= j {
+                home > hole && home <= j
+            } else {
+                home > hole || home <= j
+            };
+            if !in_range {
+                self.set_slot(hole, v);
+                hole = j;
+            }
+            j = (j + 1) & Self::MASK;
+            probes += 1;
+        }
+        self.set_slot(hole, 0);
     }
 
     /// How many ids are remembered.
@@ -508,123 +638,6 @@ impl<const N: usize> TidRing<N> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
-    }
-}
-
-// ---- small JSON helpers, ingress house style ------------------------
-
-fn array_start(b: &[u8], key: &[u8]) -> Option<usize> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if i >= b.len() || b[i] != b'[' {
-        return None;
-    }
-    Some(i + 1)
-}
-
-fn object_end(b: &[u8], start: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut i = start;
-    let mut in_str = false;
-    let mut esc = false;
-    while i < b.len() {
-        let c = b[i];
-        if in_str {
-            if esc {
-                esc = false;
-            } else if c == b'\\' {
-                esc = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-        } else {
-            match c {
-                b'"' => in_str = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn string_field(b: &[u8], key: &[u8]) -> Option<Span> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if i >= b.len() || b[i] != b'"' {
-        return None;
-    }
-    i += 1;
-    let start = i;
-    while i < b.len() && b[i] != b'"' {
-        if b[i] == b'\\' {
-            i += 1;
-        }
-        i += 1;
-    }
-    if i >= b.len() {
-        return None;
-    }
-    Some(Span {
-        start: start as u32,
-        end: i as u32,
-    })
-}
-
-fn decimal_field(b: &[u8], key: &[u8]) -> Option<i64> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if i < b.len() && b[i] == b'"' {
-        i += 1;
-    }
-    scan_price_1e8(b, i).map(|(v, _)| v)
-}
-
-fn u64_field(b: &[u8], key: &[u8]) -> Option<u64> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if i < b.len() && b[i] == b'"' {
-        i += 1;
-    }
-    scan_u64(b, i).map(|(v, _)| v)
-}
-
-fn bool_field(b: &[u8], key: &[u8]) -> Option<bool> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if b[i..].starts_with(b"true") {
-        Some(true)
-    } else if b[i..].starts_with(b"false") {
-        Some(false)
-    } else {
-        None
     }
 }
 
@@ -791,6 +804,37 @@ mod tests {
         assert!(ring.admit(5));
         assert_eq!(ring.len(), 4);
         assert!(ring.admit(1), "1 was evicted, so it is new again");
+        assert!(!ring.admit(5), "5 is remembered");
+        assert!(ring.admit(2), "2 was evicted by the re-admitted 1");
+    }
+
+    /// The index must agree with a plain FIFO over every churn
+    /// pattern — including colliding hashes and evictions inside a
+    /// probe chain, which is where backward-shift deletion earns its
+    /// keep. A million admits against a reference model.
+    #[test]
+    fn the_index_agrees_with_a_linear_fifo_under_churn() {
+        const N: usize = 64;
+        let mut ring: TidRing<N> = TidRing::new();
+        let mut fifo: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..1_000_000u64 {
+            // xorshift; a small key space so repeats and evictions
+            // are frequent, and multiples of 2N so hashes collide.
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let tid = if i % 3 == 0 { (x % 200) * 128 } else { x % 300 };
+            let expect_new = !fifo.contains(&tid);
+            assert_eq!(ring.admit(tid), expect_new, "at {i} tid {tid}");
+            if expect_new {
+                if fifo.len() == N {
+                    fifo.pop_front();
+                }
+                fifo.push_back(tid);
+            }
+            assert_eq!(ring.len(), fifo.len());
+        }
     }
 
     #[test]

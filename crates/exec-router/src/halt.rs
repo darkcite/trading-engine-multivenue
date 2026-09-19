@@ -3,17 +3,18 @@
 
 //! **E6 commit 3 — the sticky halt.**
 //!
-//! Five triggers, one latch per slot, and no way out but an operator.
+//! Six triggers, one latch per slot, and no way out but an operator.
 //!
-//! ## What halts, and why each one
+//! ## What halts, and why each one (in `trigger_for`'s order)
 //!
 //! | trigger | threshold | what it means |
 //! |---|---|---|
 //! | consecutive venue rejects | `halt_on_reject_streak` | the venue understands us and keeps saying no |
+//! | asset-id refusal streak | `halt_on_asset_refusal_streak` | LAW E-4 — a member quoting an instance that has rolled |
 //! | request budget floor | `request_budget_floor` (E4) | the address allowance is spent; the next order may not go |
 //! | reconciliation drift | `halt_on_recon_drift_usd_1e6` | our position and the venue's disagree by real money |
+//! | reconciliation stale | `halt_on_recon_stale_ms` | the reconciler has not AGREED with the venue for this long — the safety net is dark |
 //! | user-event stream gap | `halt_on_ws_gap_ms` | LAW E-5 — the WS is the FILL, so a gap is trading blind |
-//! | asset-id refusal streak | `halt_on_asset_refusal_streak` | LAW E-4 — a member quoting an instance that has rolled |
 //!
 //! **The day cap is NOT here**, and the plan listed it. Reaching
 //! `cap_day_usd` is the clamp working, and it clears itself at
@@ -76,6 +77,9 @@ pub enum HaltReason {
     /// The operator asked for it — `exec.HALT`, or a future control
     /// path. Never decided by a trigger.
     Operator = 6,
+    /// No reconciliation has AGREED with the venue for
+    /// `halt_on_recon_stale_ms`.
+    ReconStale = 7,
 }
 
 impl HaltReason {
@@ -90,6 +94,7 @@ impl HaltReason {
             HaltReason::WsGap => "ws-gap",
             HaltReason::AssetRefusals => "asset-refusals",
             HaltReason::Operator => "operator",
+            HaltReason::ReconStale => "recon-stale",
         }
     }
 
@@ -110,6 +115,7 @@ impl HaltReason {
             "recon-drift" => HaltReason::ReconDrift,
             "ws-gap" => HaltReason::WsGap,
             "asset-refusals" => HaltReason::AssetRefusals,
+            "recon-stale" => HaltReason::ReconStale,
             _ => HaltReason::Operator,
         }
     }
@@ -134,9 +140,9 @@ pub const HALT_FILE_MAX: usize = 512;
 ///
 /// `128` is the two header lines (125 B today). `30` is the longest
 /// line: `slot=` (5) + two digits (2) + ` reason=` (8) +
-/// `asset-refusals` (14) + `\n` (1). Written out rather than named,
-/// because a `const` used only by a `const _` assert reads as dead
-/// code to the lint.
+/// `asset-refusals` (14) + `\n` (1); `recon-stale` is shorter.
+/// Written out rather than named, because a `const` used only by a
+/// `const _` assert reads as dead code to the lint.
 const _: () = assert!(128 + EXEC_SLOTS * 30 <= HALT_FILE_MAX);
 
 /// **Render the whole halt state.**
@@ -154,6 +160,9 @@ pub fn render_halt_file(buf: &mut [u8; HALT_FILE_MAX], reasons: &[HaltReason; EX
         let mut put = |bytes: &[u8]| {
             let room = buf.len().saturating_sub(n);
             let take = bytes.len().min(room);
+            // COPY: ≤ HALT_FILE_MAX B of literals + reason words into
+            // the file image — the RENDER of `exec.HALT`, once per halt
+            // edge (cold); the bytes must be contiguous for one write.
             buf[n..n + take].copy_from_slice(&bytes[..take]);
             n += take;
         };
@@ -251,6 +260,16 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     if lim.recon_drift_usd_1e6 > 0 && sig.recon_drift_usd_1e6 >= lim.recon_drift_usd_1e6 {
         return HaltReason::ReconDrift;
     }
+    // `recon_age_ns == 0` is "never agreed", which the seeding
+    // interlock already refuses on — the same sentinel rule as
+    // `ws_gap_ns`. Once it HAS agreed, silence from the reconciler is
+    // the safety net going dark and is measured here.
+    if lim.recon_stale_ms > 0 && sig.recon_age_ns > 0 {
+        let age_ms = (sig.recon_age_ns / 1_000_000) as i64;
+        if age_ms >= lim.recon_stale_ms {
+            return HaltReason::ReconStale;
+        }
+    }
     // `ws_gap_ns == 0` is "no observation", not "no gap": an arm that
     // has never connected is not an arm that has gone quiet, and
     // halting before the first connect would make the engine
@@ -270,6 +289,9 @@ const CANCEL_NONE: u8 = 0;
 const CANCEL_WANTED: u8 = 1;
 /// Asked; awaiting the venue's confirmation.
 const CANCEL_ASKED: u8 = 2;
+/// Asked, and the request was refused or only partly queued. Ask
+/// again — once the arm has room.
+const CANCEL_RETRY: u8 = 3;
 
 /// **What the router owes the live arm on this poll.**
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -280,6 +302,11 @@ pub enum CancelPhase {
     Wanted,
     /// Already asked; poll for confirmation.
     Asked,
+    /// A request did not land. Ask again — but a request the arm
+    /// refused for want of sweep-table room would be refused again
+    /// while it is still draining, so the router waits out `Working`
+    /// first rather than asking 500 times a second.
+    Retry,
 }
 
 /// **The per-slot latch.**
@@ -429,7 +456,7 @@ impl HaltState {
     pub fn cancel_requested(&mut self) {
         let mut i = 0usize;
         while i < EXEC_SLOTS {
-            if self.pending_cancel[i] == CANCEL_WANTED {
+            if self.pending_cancel[i] == CANCEL_WANTED || self.pending_cancel[i] == CANCEL_RETRY {
                 self.pending_cancel[i] = CANCEL_ASKED;
             }
             i += 1;
@@ -438,37 +465,55 @@ impl HaltState {
 
     /// **What the caller owes the arm right now.**
     ///
-    /// `Wanted` beats `Asked`: a slot that halted while another
-    /// slot's sweep was already draining needs its own legs
+    /// `Wanted` beats `Retry` beats `Asked`: a slot that halted while
+    /// another slot's sweep was already draining needs its own legs
     /// requested, and a cancel-all is venue-wide, so one fresh
     /// request covers both.
     #[inline]
     #[must_use]
     pub fn cancel_phase(&self) -> CancelPhase {
         let mut asked = false;
+        let mut retry = false;
         let mut i = 0usize;
         while i < EXEC_SLOTS {
             match self.pending_cancel[i] {
                 CANCEL_WANTED => return CancelPhase::Wanted,
+                CANCEL_RETRY => retry = true,
                 CANCEL_ASKED => asked = true,
                 _ => {}
             }
             i += 1;
         }
-        if asked {
+        if retry {
+            CancelPhase::Retry
+        } else if asked {
             CancelPhase::Asked
         } else {
             CancelPhase::None
         }
     }
 
-    /// A `cancel_all` REQUEST did not land. It stays `ASKED`: the
-    /// poll that follows reports `Stranded` and asks again, so the
-    /// retry has one shape whether the request errored or the sweep
-    /// was abandoned.
+    /// A `cancel_all` REQUEST did not land (refused outright, or only
+    /// partially queued). Every slot that was `ASKED` goes back to
+    /// `WANTED`, so the NEXT poll asks again rather than confirming.
+    ///
+    /// The first cut left them `ASKED` on the premise that the next
+    /// poll would read `Stranded` and re-ask — but the arm reported
+    /// `Clear` once the legs it DID queue drained, and the router then
+    /// zeroed every slot's resting count over quotes still live at the
+    /// venue: the commit-3 fail-open, back through the `QueueFull`
+    /// door (E7 review, 2026-09-19). A refused request is re-requested
+    /// by construction now, whatever the arm's state machine says.
     #[inline]
     pub fn cancel_failed(&mut self) {
         self.cancel_all_failures = self.cancel_all_failures.saturating_add(1);
+        let mut i = 0usize;
+        while i < EXEC_SLOTS {
+            if self.pending_cancel[i] == CANCEL_ASKED {
+                self.pending_cancel[i] = CANCEL_RETRY;
+            }
+            i += 1;
+        }
     }
 
     /// The arm reported it had stopped with the venue unconfirmed.
@@ -489,11 +534,11 @@ mod tests {
 
     /// Thresholds an operator might really write.
     fn lim() -> HaltLimits {
-        HaltLimits::new(5, 5_000_000, 30_000, 3)
+        HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000)
     }
 
     fn healthy() -> HaltSignal {
-        HaltSignal::new(1_000_000, 0, 0, 0, false, true)
+        HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
     }
 
     // -----------------------------------------------------------------
@@ -523,6 +568,18 @@ mod tests {
         assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
         s.recon_drift_usd_1e6 = 5_000_000;
         assert_eq!(trigger_for(&s, &lim()), HaltReason::ReconDrift);
+    }
+
+    #[test]
+    fn a_stale_reconciliation_halts_only_after_it_has_agreed_once() {
+        let mut s = healthy();
+        s.recon_age_ns = 0; // never agreed: the interlock's case, not this trigger's
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
+        s.recon_age_ns = 299_999_000_000;
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
+        s.recon_age_ns = 300_000_000_000;
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::ReconStale);
+        assert_eq!(HaltReason::from_word("recon-stale"), HaltReason::ReconStale);
     }
 
     #[test]
@@ -570,7 +627,7 @@ mod tests {
     #[test]
     fn an_unset_threshold_never_fires() {
         let none = HaltLimits::none();
-        let s = HaltSignal::new(u64::MAX, i64::MAX, u32::MAX, u32::MAX, false, true);
+        let s = HaltSignal::new(u64::MAX, i64::MAX, u32::MAX, u32::MAX, false, true, u64::MAX);
         assert_eq!(trigger_for(&s, &none), HaltReason::None);
     }
 
@@ -593,8 +650,8 @@ mod tests {
         // signal, two answers.
         let mut s = healthy();
         s.reject_streak = 3;
-        let tight = HaltLimits::new(3, 5_000_000, 30_000, 3);
-        let loose = HaltLimits::new(50, 5_000_000, 30_000, 3);
+        let tight = HaltLimits::new(3, 5_000_000, 30_000, 3, 300_000);
+        let loose = HaltLimits::new(50, 5_000_000, 30_000, 3, 300_000);
         assert_eq!(trigger_for(&s, &tight), HaltReason::RejectStreak);
         assert_eq!(trigger_for(&s, &loose), HaltReason::None);
     }

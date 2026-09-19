@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 12] = [
+const SLOT_KEYS: [&str; 13] = [
     "mode",
     "name",
     "venues",
@@ -91,6 +91,7 @@ const SLOT_KEYS: [&str; 12] = [
     "halt_on_recon_drift_usd_1e6",
     "halt_on_ws_gap_ms",
     "halt_on_asset_refusal_streak",
+    "halt_on_recon_stale_ms",
 ];
 
 /// Venue spellings the `venues` array accepts, and the `VenueId` byte
@@ -191,6 +192,16 @@ pub struct ExecSlot {
     /// someone else's market, and one is a race with a roll. A STREAK
     /// is a member quoting an instance that no longer exists.
     pub halt_on_asset_refusal_streak: i64,
+    /// **E6 (E7 review)** — milliseconds since the last reconciliation
+    /// that AGREED with the venue, before a sticky halt. `0` = unset.
+    ///
+    /// The reconciler is the one check independent of every belief
+    /// the engine holds. A `/info` endpoint that starts failing, or a
+    /// comparison that keeps disagreeing, leaves it dark — and without
+    /// this key nothing measured that. The reconciler runs every 60 s,
+    /// so a value of a few minutes tolerates a hiccup and halts an
+    /// outage.
+    pub halt_on_recon_stale_ms: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
 }
@@ -213,6 +224,7 @@ impl ExecSlot {
             halt_on_recon_drift_usd_1e6: 0,
             halt_on_ws_gap_ms: 0,
             halt_on_asset_refusal_streak: 0,
+            halt_on_recon_stale_ms: 0,
             line: 0,
         }
     }
@@ -414,6 +426,7 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         halt_on_ws_gap_ms: opt_int(kv, "halt_on_ws_gap_ms", 0)?,
         halt_on_asset_refusal_streak: opt_int(kv, "halt_on_asset_refusal_streak", 0)?,
         halt_on_recon_drift_usd_1e6: opt_int(kv, "halt_on_recon_drift_usd_1e6", 0)?,
+        halt_on_recon_stale_ms: opt_int(kv, "halt_on_recon_stale_ms", 0)?,
         line,
     };
 
@@ -491,6 +504,7 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
             ("halt_on_recon_drift_usd_1e6", s.halt_on_recon_drift_usd_1e6),
             ("halt_on_ws_gap_ms", s.halt_on_ws_gap_ms),
             ("halt_on_asset_refusal_streak", s.halt_on_asset_refusal_streak),
+            ("halt_on_recon_stale_ms", s.halt_on_recon_stale_ms),
             // Not a threshold the router compares against — the ARM
             // owns this one, and reports a flag. It is required for
             // the same reason all the same: at `0` the budget trigger
@@ -657,6 +671,7 @@ halt_on_reject_streak = 5
 halt_on_recon_drift_usd_1e6 = 5000000
 halt_on_ws_gap_ms = 30000
 halt_on_asset_refusal_streak = 3
+halt_on_recon_stale_ms = 300000
 
 [exec.slot.1]
 mode = "paper"
@@ -672,7 +687,7 @@ mode = "paper"
          max_open_orders = 64\nrequest_budget_floor = 2000\n\
          halt_on_reject_streak = 5\n\
          halt_on_recon_drift_usd_1e6 = 5000000\nhalt_on_ws_gap_ms = 30000\n\
-         halt_on_asset_refusal_streak = 3\n";
+         halt_on_asset_refusal_streak = 3\nhalt_on_recon_stale_ms = 300000\n";
 
     fn expect_err(src: &str, needle: &str) {
         let e = parse(src).expect_err("must refuse");
@@ -700,6 +715,7 @@ mode = "paper"
         assert_eq!(s3.halt_on_recon_drift_usd_1e6, 5_000_000);
         assert_eq!(s3.halt_on_ws_gap_ms, 30_000);
         assert_eq!(s3.halt_on_asset_refusal_streak, 3);
+        assert_eq!(s3.halt_on_recon_stale_ms, 300_000);
         assert_eq!(f.slot(1).mode, "paper");
         assert_eq!(f.live_mask(), 0b0000_1000);
     }

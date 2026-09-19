@@ -52,7 +52,7 @@ use crate::cloid::encode as encode_cloid;
 use crate::config::HlConfig;
 use crate::http::{HlHttp, MAX_REQ_BODY};
 use crate::nonce::Nonce;
-use crate::request::{envelope, order_json};
+use crate::request::{envelope_close, envelope_open, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
 use crate::userws::{scan_user_fills, to_fill, to_fill_as, Routed, TidRing, UserFill, SNAPSHOT_RING};
@@ -180,6 +180,16 @@ pub struct HlExecCounters {
     /// check independent of every belief the engine holds — the
     /// comparison is against what we BOOKED, not what a member thinks.
     pub recon_drift_legs: u64,
+    /// Outcome legs the VENUE holds with a non-zero balance that no
+    /// bound leg matched at the last reconciliation — the comparison's
+    /// blind spot, measured from the side that can see it
+    /// (`recon::unreconciled_venue_legs`). Non-zero after a restart
+    /// until the retired instance settles; non-zero at any other time
+    /// is a position this arm is not tracking, and `reconciled` stays
+    /// false while it is.
+    pub recon_unseen_legs: u32,
+    /// Explicit padding after the one `u32` in this struct.
+    pub _pad_recon: u32,
     /// The largest single-leg disagreement seen, as a **CONTRACT
     /// QUANTITY**, 1e6. Not a running total: a drift that appears and
     /// is corrected still leaves its mark here.
@@ -546,10 +556,6 @@ pub struct HlExchange<const FILL_N: usize> {
     /// The MASTER account reconciliation asks about — the agent signs
     /// on its behalf and the venue reports balances under it.
     master_addr: [u8; 20],
-    /// Scratch for one `spotClearinghouseState` answer. Boxed and
-    /// sized for the venue's full reply, which is NOT the number of
-    /// coins we hold — a one-coin account came back with fourteen
-    /// rows.
     /// Legs whose instance has ENDED and whose resting orders have not
     /// been swept yet (LAW E-8).
     sweeps: [PendingSweep; MAX_PENDING_SWEEPS],
@@ -562,9 +568,37 @@ pub struct HlExchange<const FILL_N: usize> {
     /// `cancel_all_state` able to say `Stranded` instead of quietly
     /// reporting an empty table as a clear venue.
     cancel_all_mark: u64,
+    /// `cancel_all_unqueued` as it stood when the last cancel-all was
+    /// REQUESTED. A leg the request could not queue is a leg nobody
+    /// is sweeping; the first cut's `cancel_all_state` was blind to
+    /// it and reported `Clear` once the legs it DID queue drained,
+    /// so the router zeroed every slot's resting count over quotes
+    /// still live at the venue (E7 review, 2026-09-19).
+    cancel_all_unqueued_mark: u64,
+    /// When a reconciliation last COMPLETED a comparison the arm was
+    /// willing to stand behind. `None` = never. `last_recon` stamps
+    /// the attempt; this stamps the success, and the gap between them
+    /// is the `recon_age_ns` halt trigger — without it a reconciler
+    /// failing every cycle was indistinguishable from a healthy one.
+    last_recon_ok: Option<Instant>,
     /// Scratch for one sweep's `frontendOpenOrders` answer.
     open: Box<[crate::recon::OpenOrder]>,
+    /// The oids `ours_on_leg` selects from `open`, once per sweep call.
+    oids: Box<[u64]>,
+    /// Scratch for one `spotClearinghouseState` answer. Boxed and
+    /// sized for the venue's full reply, which is NOT the number of
+    /// coins we hold — a one-coin account came back with fourteen
+    /// rows.
     bal: Box<[crate::recon::SpotBalance]>,
+    /// The msgpack of the action being sent — the SIGNER's input.
+    /// Preallocated at boot (plan §4.2), never on the stack: the first
+    /// cut zeroed 4 KiB of it per action, and re-declared it inside
+    /// the sweep loop.
+    mp: Box<[u8]>,
+    /// The request body, built IN PLACE: envelope head, then the
+    /// action JSON rendered straight into it, then the signature
+    /// tail. One buffer, one write per byte, no staging copy.
+    req: Box<[u8]>,
     /// Scratch for one frame's fills. **Boxed and sized for the
     /// venue's SNAPSHOT**, not for a steady-state frame — see
     /// [`HlExchange::pump_user_events`].
@@ -615,10 +649,15 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             sweeps: [PendingSweep::EMPTY; MAX_PENDING_SWEEPS],
             sweeps_n: 0,
             cancel_all_mark: 0,
+            cancel_all_unqueued_mark: 0,
+            last_recon_ok: None,
             open: vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS]
                 .into_boxed_slice(),
+            oids: vec![0u64; crate::recon::MAX_OPEN_ORDERS].into_boxed_slice(),
             bal: vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES]
                 .into_boxed_slice(),
+            mp: vec![0u8; MAX_ACTION].into_boxed_slice(),
+            req: vec![0u8; MAX_REQ_BODY].into_boxed_slice(),
         })
     }
 
@@ -637,11 +676,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         &self.assets
     }
 
-    /// Operator counters.
+    /// Operator counters. By reference: the struct is five cache lines
+    /// and the `/state` mirror reads a handful of fields.
     #[inline]
     #[must_use]
-    pub fn counters(&self) -> HlExecCounters {
-        self.counters
+    pub fn counters(&self) -> &HlExecCounters {
+        &self.counters
     }
 
     /// Requests believed to remain before the venue's cliff.
@@ -771,14 +811,22 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         // read inside the frame that actually scanned.
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
-            let f = scratch[i];
+            // A reference, not a copy: `UserFill` is 88 bytes and a
+            // reconnect snapshot is ~2,000 rows on the engine thread.
+            let f = &scratch[i];
             // LAW E-5: the venue's tid is the dedupe key, and the ring
             // outlives the socket precisely so a reconnect snapshot
             // cannot re-book.
             if !seen.admit(f.tid) {
                 continue;
             }
-            if !is_snapshot {
+            // The address budget is credited ONLY from a row the arm
+            // would book: a row whose sign or scale fails `to_fill`'s
+            // refusal below must not manufacture request headroom
+            // (the first cut credited every admitted row before
+            // validating it — one malformed `px` defeated the floor
+            // until the next cold boot; E7 review, 2026-09-19).
+            if !is_snapshot && f.px_1e8 >= 0 && f.sz_1e8 > 0 {
                 budget.on_venue_fill(f.notional_usdc_1e6());
             }
             if f.is_settlement {
@@ -826,16 +874,21 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // the VENUE ACCEPTED — never from the fill, and never from
             // a submit that was merely attempted. A leg nothing has
             // traded still books nothing.
+            //
+            // COPY (both `try_push` below): one `Fill` POD (≤ 128 B)
+            // by value into lane 3's ring slot — the ring publish IS
+            // the ownership transfer to the engine thread (§7); the
+            // frame's bytes in `rx` are compacted away after the pump.
             if f.is_settlement && f.cloid.is_none() {
                 match assets.owner_of_sym(sym) {
-                    Some(slot) => match to_fill_as(&f, sym, ts, slot) {
+                    Some(slot) => match to_fill_as(f, sym, ts, slot) {
                         Ok(fill) => {
                             if fills.try_push(fill).is_err() {
                                 counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
                             } else {
                                 counters.fills_booked = counters.fills_booked.wrapping_add(1);
                                 if current {
-                                    assets.book_qty(sym, signed_qty_1e6(&f, &fill));
+                                    assets.book_qty(sym, signed_qty_1e6(f, &fill));
                                 }
                                 booked += 1;
                             }
@@ -853,7 +906,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 }
                 continue;
             }
-            match to_fill(&f, sym, ts) {
+            match to_fill(f, sym, ts) {
                 Ok(Routed::Slot(fill)) => {
                     if fills.try_push(fill).is_err() {
                         // A dropped fill is a position the engine does
@@ -869,7 +922,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                         // lane — a dropped or refused fill is not a
                         // position.
                         if current {
-                            assets.book_qty(sym, signed_qty_1e6(&f, &fill));
+                            assets.book_qty(sym, signed_qty_1e6(f, &fill));
                         }
                         booked += 1;
                     }
@@ -1007,15 +1060,33 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         };
         self.counters.recon_ok = self.counters.recon_ok.wrapping_add(1);
         let (legs, worst) = Self::compare(&self.assets, &self.bal[..rows], body);
+        let unseen = crate::recon::unreconciled_venue_legs(&self.assets, &self.bal[..rows], body);
+        self.counters.recon_drift_legs = legs;
+        self.counters.recon_unseen_legs = unseen;
+        if worst > self.counters.recon_drift_max_qty_1e6 {
+            self.counters.recon_drift_max_qty_1e6 = worst;
+        }
         // E6 commit 3: the arm has compared itself against the venue.
         // The router reads this to stop refusing every live place —
         // see the seeding interlock, which exists because a ledger
         // that has never been reconciled reads zero exposure after a
         // restart and would fail every clamp OPEN.
-        self.reconciled = true;
-        self.counters.recon_drift_legs = legs;
-        if worst > self.counters.recon_drift_max_qty_1e6 {
-            self.counters.recon_drift_max_qty_1e6 = worst;
+        //
+        // **Only when the comparison AGREED and covered everything the
+        // venue holds** — the same three-clause verdict the phase E
+        // probe's `agreed()` requires. The first cut set this on the
+        // parse succeeding: after a restart the asset table is empty
+        // until the next roll, `compare` walks zero legs, and "zero
+        // legs disagreed" unlocked the interlock over a venue holding
+        // the previous boot's real position — the exact hazard the
+        // interlock exists for, reached through it. `unseen` is the
+        // venue-side count of outcome legs with a non-zero holding
+        // that no bound leg matched; a flat account seeds at once, an
+        // account still holding a retired instance waits for its
+        // settlement. (E7 review, 2026-09-19.)
+        if legs == 0 && unseen == 0 {
+            self.reconciled = true;
+            self.last_recon_ok = Some(Instant::now());
         }
     }
 
@@ -1061,24 +1132,40 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// times. This is the half of every submit, cancel and requote
     /// that runs on the engine thread and must not allocate.
     ///
-    /// Returns the request length in `body`.
+    /// The msgpack is `self.mp[..mp_n]`; the action JSON already sits
+    /// in `self.req[..action_end]` behind the envelope head
+    /// ([`Self::open_action`]). Returns the finished body length in
+    /// `self.req`.
     ///
     /// # Errors
-    /// `SignerRejected` if the key refuses; `EncodeOverflow` if the
-    /// envelope does not fit.
-    pub fn seal(
-        &mut self,
-        mp: &[u8],
-        aj: &[u8],
-        body: &mut [u8; MAX_REQ_BODY],
-    ) -> Result<usize, DispatchError> {
-        let nonce = self.nonce.next(now_ms());
-        let sig =
-            sign_action(&self.sk, mp, nonce, Vault::None, None, self.network).map_err(|_| {
+    /// `SignerRejected` if the key refuses — or if the wall clock reads
+    /// zero, because a nonce of 1 is a signed order stamped 1970 and a
+    /// clock that far wrong is not one to sign with; `EncodeOverflow`
+    /// if the envelope does not fit.
+    pub fn seal(&mut self, mp_n: usize, action_end: usize) -> Result<usize, DispatchError> {
+        let ms = crate::nonce::now_ms();
+        if ms == 0 {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            return Err(DispatchError::SignerRejected);
+        }
+        let nonce = self.nonce.next(ms);
+        let sig = sign_action(&self.sk, &self.mp[..mp_n], nonce, Vault::None, None, self.network)
+            .map_err(|_| {
                 self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
                 DispatchError::SignerRejected
             })?;
-        envelope(body, aj, nonce, &sig, None, None).map_err(|_| {
+        envelope_close(&mut self.req, action_end, nonce, &sig, None, None).map_err(|_| {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            DispatchError::EncodeOverflow
+        })
+    }
+
+    /// Write the envelope head into `self.req` and return the offset
+    /// the caller renders the action JSON at. See
+    /// [`crate::request::envelope_open`].
+    #[inline(always)]
+    fn open_action(&mut self) -> Result<usize, DispatchError> {
+        envelope_open(&mut self.req).map_err(|_| {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             DispatchError::EncodeOverflow
         })
@@ -1102,23 +1189,29 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// deliberately conservative about a torn write.
     fn post_counted(
         &mut self,
-        body: &[u8],
+        n: usize,
+        items: u32,
     ) -> Result<(u16, core::ops::Range<usize>), crate::http::PostErr> {
-        let posted = self.http.post(body);
-        self.count_post(&posted);
+        let posted = self.http.post(&self.req[..n]);
+        self.count_post(&posted, items);
         posted
     }
 
-    /// Charge `posted` to the address if it may have left the host.
+    /// Charge `posted` to the address if it may have left the host —
+    /// `items` address requests for a batch of `items` (§2.2).
     ///
     /// Separated from the post itself so the wiring — predicate to
     /// governor — can be asserted without a socket. The only link
     /// this leaves untested is the call one line above, which is why
     /// it is one line above.
     #[inline]
-    fn count_post(&mut self, posted: &Result<(u16, core::ops::Range<usize>), crate::http::PostErr>) {
+    fn count_post(
+        &mut self,
+        posted: &Result<(u16, core::ops::Range<usize>), crate::http::PostErr>,
+        items: u32,
+    ) {
         if Self::counts_against_address(posted) {
-            self.budget.on_action_sent();
+            self.budget.on_action_sent(items);
         }
     }
 
@@ -1138,7 +1231,27 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     }
 
     /// Returns the venue's ACK (LAW E-5: an ACK, never a fill).
-    fn send_action(&mut self, mp: &[u8], aj: &[u8], spend: Spend) -> Result<HlOk, DispatchError> {
+    ///
+    /// `mp_n` / `action_end` locate the msgpack and the in-place
+    /// action JSON (see [`Self::seal`]); `items` is the batch size the
+    /// address is charged for.
+    ///
+    /// **The acceptance predicate is `Spend`-aware.** `HlOk::accepted`
+    /// only says "no item errored"; a place or a requote is accepted
+    /// when the venue reports it RESTING or FILLED, a cancel when it
+    /// reports `success`. The first cut accepted on `accepted()`
+    /// alone, so an ok envelope with no outcome at all — the shape a
+    /// truncated answer takes — counted as a placed order, bound the
+    /// slot to the leg, and left an `oid == 0` order the sweep could
+    /// not see (E7 review, 2026-09-19). The stricter check existed in
+    /// the operator probe and not on the path that trades.
+    fn send_action(
+        &mut self,
+        mp_n: usize,
+        action_end: usize,
+        items: u32,
+        spend: Spend,
+    ) -> Result<HlOk, DispatchError> {
         // `Spend`, not the verb's name: see its docs. A cancel is an
         // EXIT and a cap that can stop a position being closed is not a
         // risk control.
@@ -1150,9 +1263,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
             return Err(DispatchError::SlotDisabled);
         }
-        let mut body = [0u8; MAX_REQ_BODY];
-        let n = self.seal(mp, aj, &mut body)?;
-        let posted = self.post_counted(&body[..n]);
+        let n = self.seal(mp_n, action_end)?;
+        let posted = self.post_counted(n, items);
         let (_status, range) = posted.map_err(|e| {
             self.counters.rejected = self.counters.rejected.wrapping_add(1);
             if e.left_host {
@@ -1169,8 +1281,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
 
         let resp = self.http.resp();
         let slice = &resp[range];
+        let outcome_seen = |ok: &HlOk| match spend {
+            Spend::Submit => ok.any_resting || ok.any_filled,
+            Spend::Cancel => ok.any_success,
+        };
         match scan(slice) {
-            Ok(HlResponse::Ok(ok)) if ok.accepted() => {
+            Ok(HlResponse::Ok(ok)) if ok.accepted() && outcome_seen(&ok) => {
                 // An acceptance ends both streaks. They are
                 // CONSECUTIVE counts: a venue refusing every order is
                 // a different fact from one that has refused a few
@@ -1282,13 +1398,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
 
         // ---- which of them are ours, on THIS leg --------------------
         // Collected first: the cancel below borrows `self` mutably,
-        // and the rows borrow the response buffer.
-        let mut oids = [0u64; crate::recon::MAX_OPEN_ORDERS];
+        // and the rows borrow the response buffer. `oids` is a boot
+        // buffer, not 2 KiB of stack zeroed every 2 ms while a sweep
+        // is pending.
         let k = crate::recon::ours_on_leg(
             &self.open[..rows],
             body,
             &e.coin[..e.coin_len as usize],
-            &mut oids,
+            &mut self.oids,
         );
         if k == 0 {
             // Nothing of ours resting on a retired leg is the normal
@@ -1301,7 +1418,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         // MAX_OPEN_ORDERS like the row buffer — and the entry is kept
         // pending anyway, because the alternative is cancelling a
         // prefix and reporting the leg clean.
-        let truncated = k == oids.len();
+        let truncated = k == self.oids.len();
 
         // ---- cancel them, by oid ------------------------------------
         //
@@ -1322,23 +1439,23 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let (budget, deferred) = sweep_plan(k);
         let mut j = 0usize;
         while j < budget {
-            let oid = oids[j];
+            let oid = self.oids[j];
             j += 1;
             let c = [crate::action::CancelWire { asset: e.asset, oid }];
-            let mut mp = [0u8; MAX_ACTION];
-            let mut aj = [0u8; MAX_ACTION];
-            let (Ok(mp_n), Ok(aj_n)) = (
-                crate::action::encode_cancel(&mut mp, &c),
-                crate::request::cancel_json(&mut aj, &c),
+            let (Ok(mp_n), Ok(head)) = (
+                crate::action::encode_cancel(&mut self.mp, &c),
+                envelope_open(&mut self.req),
             ) else {
                 self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
                 failed += 1;
                 continue;
             };
-            if self
-                .send_action(&mp[..mp_n], &aj[..aj_n], Spend::Cancel)
-                .is_ok()
-            {
+            let Ok(aj_n) = crate::request::cancel_json(&mut self.req[head..], &c) else {
+                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+                failed += 1;
+                continue;
+            };
+            if self.send_action(mp_n, head + aj_n, 1, Spend::Cancel).is_ok() {
                 self.counters.sweep_cancelled = self.counters.sweep_cancelled.wrapping_add(1);
             } else {
                 failed += 1;
@@ -1433,17 +1550,20 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             asset,
             cloid: encode_cloid(strategy_id, client_oid),
         }];
-        let mut mp = [0u8; MAX_ACTION];
-        let mut aj = [0u8; MAX_ACTION];
-        let (Ok(mp_n), Ok(aj_n)) = (
-            crate::action::encode_cancel_by_cloid(&mut mp, &c),
-            crate::request::cancel_by_cloid_json(&mut aj, &c),
+        let (Ok(mp_n), Ok(head)) = (
+            crate::action::encode_cancel_by_cloid(&mut self.mp, &c),
+            envelope_open(&mut self.req),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
         };
-        match self.send_action(&mp[..mp_n], &aj[..aj_n], Spend::Cancel) {
+        let Ok(aj_n) = crate::request::cancel_by_cloid_json(&mut self.req[head..], &c) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        match self.send_action(mp_n, head + aj_n, 1, Spend::Cancel) {
             Ok(_) => {
                 self.counters.cancels_sent = self.counters.cancels_sent.wrapping_add(1);
                 Ok(())
@@ -1455,23 +1575,26 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// **LAW E-7 — replace a resting order with a new one.**
+    /// The ENCODE half of [`Self::modify`]: asset lookup, the scale
+    /// guards, the cloid builder, the wire structs, msgpack into
+    /// `self.mp` and the action JSON in place behind the envelope head
+    /// in `self.req`. Returns `(mp_n, action_end)` for
+    /// [`Self::seal`] / `send_action`. Touches no socket and spends no
+    /// budget.
     ///
-    /// One request, not a cancel plus a place. At Arm B's ~333
-    /// reprices per instance that is the difference between fitting
-    /// inside the address budget and not.
-    ///
-    /// The resting order is addressed BY CLOID and the replacement
-    /// carries a DIFFERENT one, so every `userFills` row maps to
-    /// exactly one quote. Both halves were measured against testnet
-    /// before this existed (phase F, `exec-smoke --requote`) — the
-    /// venue does not have to accept a modify that changes the id, and
-    /// nothing in this repo could say that it did until it was asked.
+    /// Public for the same reason `seal` and `compare` are: so bench
+    /// gate 60 can drive the exact bytes a requote signs, in the exact
+    /// buffers, without a venue — and without a staging copy of them.
     ///
     /// # Errors
-    /// As [`Self::cancel_by_cloid`], plus a price or size that will not
-    /// scale and an order kind with no TIF.
-    pub fn modify(&mut self, prev_client_oid: u64, order: &Order) -> Result<(), DispatchError> {
+    /// As [`Self::modify`]'s local refusals. Every one is counted here
+    /// (`refused_local` / `modifies_refused` / `encode_failures`), so
+    /// the caller adds nothing on `Err`.
+    pub fn stage_modify(
+        &mut self,
+        prev_client_oid: u64,
+        order: &Order,
+    ) -> Result<(usize, usize), DispatchError> {
         let asset = self
             .assets
             .lookup(order.sym, core_types::instance_of(order.client_oid))
@@ -1517,20 +1640,44 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             oid_cloid: encode_cloid(order.strategy_id, prev_client_oid),
             oid_is_cloid: true,
         }];
-        let mut mp = [0u8; MAX_ACTION];
-        let mut aj = [0u8; MAX_ACTION];
-        let (Ok(mp_n), Ok(aj_n)) = (
-            crate::action::encode_batch_modify(&mut mp, &m),
-            crate::request::batch_modify_json(&mut aj, &m),
+        let (Ok(mp_n), Ok(head)) = (
+            crate::action::encode_batch_modify(&mut self.mp, &m),
+            envelope_open(&mut self.req),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
         };
+        let Ok(aj_n) = crate::request::batch_modify_json(&mut self.req[head..], &m) else {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
+            return Err(DispatchError::EncodeOverflow);
+        };
+        Ok((mp_n, head + aj_n))
+    }
+
+    /// **LAW E-7 — replace a resting order with a new one.**
+    ///
+    /// One request, not a cancel plus a place. At Arm B's ~333
+    /// reprices per instance that is the difference between fitting
+    /// inside the address budget and not.
+    ///
+    /// The resting order is addressed BY CLOID and the replacement
+    /// carries a DIFFERENT one, so every `userFills` row maps to
+    /// exactly one quote. Both halves were measured against testnet
+    /// before this existed (phase F, `exec-smoke --requote`) — the
+    /// venue does not have to accept a modify that changes the id, and
+    /// nothing in this repo could say that it did until it was asked.
+    ///
+    /// # Errors
+    /// As [`Self::cancel_by_cloid`], plus a price or size that will not
+    /// scale and an order kind with no TIF.
+    pub fn modify(&mut self, prev_client_oid: u64, order: &Order) -> Result<(), DispatchError> {
+        let (mp_n, action_end) = self.stage_modify(prev_client_oid, order)?;
         // A modify can MOVE exposure, so it answers to the submit rule
         // rather than the exit one — LAW E-7 makes it the requote path,
         // not a way around the governor.
-        match self.send_action(&mp[..mp_n], &aj[..aj_n], Spend::Submit) {
+        match self.send_action(mp_n, action_end, 1, Spend::Submit) {
             Ok(_) => {
                 self.counters.modifies_sent = self.counters.modifies_sent.wrapping_add(1);
                 // The member has traded this leg — recorded on the same
@@ -1629,8 +1776,6 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         // that they are invisible: `stats()` reports nothing for this
         // arm, so an encode that silently refused every order would
         // look exactly like an engine that emitted none.
-        let mut mp = [0u8; MAX_ACTION];
-        let mut aj = [0u8; MAX_ACTION];
         let enc = |r: Result<usize, crate::msgpack::MsgPackErr>,
                        c: &mut HlExecCounters|
          -> Result<usize, DispatchError> {
@@ -1639,14 +1784,15 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                 DispatchError::EncodeOverflow
             })
         };
-        let mp_n = enc(encode_order(&mut mp, &[wire], b"na"), &mut self.counters)?;
-        let aj_n = enc(order_json(&mut aj, &[wire], b"na"), &mut self.counters)?;
+        let mp_n = enc(encode_order(&mut self.mp, &[wire], b"na"), &mut self.counters)?;
+        let head = self.open_action()?;
+        let aj_n = enc(order_json(&mut self.req[head..], &[wire], b"na"), &mut self.counters)?;
 
         // The nonce is taken LAST among the things that can fail, so a
         // local refusal cannot burn one. (HL only requires strictly
         // increasing nonces, so a gap is harmless — but not burning
         // one at all is simpler to reason about.)
-        self.send_action(&mp[..mp_n], &aj[..aj_n], Spend::Submit)?;
+        self.send_action(mp_n, head + aj_n, 1, Spend::Submit)?;
         self.counters.submitted = self.counters.submitted.wrapping_add(1);
         // WHO trades this leg — recorded on ACCEPTANCE, not on intent.
         // The venue settles a binary with a cloid-less fill, so
@@ -1674,6 +1820,46 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
 
     fn stats(&self) -> DispatchStats {
         DispatchStats::default()
+    }
+
+    /// **E7 — the arm's numbers, finally on a surface.** Every field
+    /// here used to be a unit-test fact; four of the five blocking
+    /// findings of the E7 review were invisible for exactly that
+    /// reason.
+    fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
+        let c = &self.counters;
+        // COPY: 208 B POD (25 × u64 + i64) composed here and returned by
+        // value — cold (1 Hz /state, 0.2 Hz /metrics); it is BUILT from
+        // two sources (`counters`, `budget`) so there is nothing to
+        // borrow — rejected: an out-param, for one struct read twice a
+        // second.
+        clob_dispatcher::LiveArmCounters {
+            submitted: c.submitted,
+            rejected: c.rejected,
+            refused_local: c.refused_local,
+            refused_stale: c.refused_stale,
+            sent_unanswered: c.sent_unanswered,
+            fills_booked: c.fills_booked,
+            fills_unresolved: c.fills_unresolved,
+            fills_foreign: c.fills_foreign,
+            fills_dropped: c.fills_dropped,
+            fills_refused: c.fills_refused,
+            fills_scan_failed: c.fills_scan_failed,
+            fills_unowned: c.fills_unowned,
+            recon_ok: c.recon_ok,
+            recon_failed: c.recon_failed,
+            recon_drift_legs: c.recon_drift_legs,
+            recon_unseen_legs: u64::from(c.recon_unseen_legs),
+            sweep_left: c.sweep_left,
+            sweep_stalled: c.sweep_stalled,
+            cancel_all_unqueued: c.cancel_all_unqueued,
+            ws_reconnects: c.ws_reconnects,
+            ws_connect_failures: c.ws_connect_failures,
+            rolls_bound: c.rolls_bound,
+            rolls_refused: c.rolls_refused,
+            owner_contested: c.owner_contested,
+            budget_remaining: self.budget.remaining(),
+        }
     }
 
     /// A live dispatcher invents nothing from a book.
@@ -1704,7 +1890,12 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         if event.venue != VenueId::Hyperliquid as u8 {
             return;
         }
-        let (outcome, settled) = unpack_roll(event.venue_seq);
+        let Some((outcome, settled)) = unpack_roll(event.venue_seq) else {
+            // A kind byte no packer of ours writes. Neither created nor
+            // settled — refused, never guessed (core_types::roll_kind_strict).
+            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+            return;
+        };
         if settled {
             self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
             return;
@@ -1839,6 +2030,13 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             self.asset_refusal_streak,
             self.budget.may_submit().is_err(),
             self.reconciled,
+            // Age of the last reconciliation that AGREED. 0 = never,
+            // which the interlock already covers; once it has agreed
+            // once, a reconciler that stops agreeing (or stops
+            // answering) is measured here and halts at
+            // `halt_on_recon_stale_ms`.
+            self.last_recon_ok
+                .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
         )
     }
 
@@ -1874,6 +2072,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         // we were asked is not this cancel-all's business; one
         // abandoned after it is the whole point.
         self.cancel_all_mark = self.counters.sweep_left;
+        self.cancel_all_unqueued_mark = self.counters.cancel_all_unqueued;
 
         // Collected first: `queue_sweep` borrows `self` mutably and
         // `for_each_live` borrows it immutably.
@@ -1937,7 +2136,13 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         if self.sweeps_n > 0 {
             return clob_dispatcher::CancelAllState::Working;
         }
-        if self.counters.sweep_left != self.cancel_all_mark {
+        // A leg the request could NOT queue is not clear either: nobody
+        // is sweeping it. Reported as `Stranded` so the router asks
+        // again, and a fresh request queues it into the space the
+        // drained sweeps freed.
+        if self.counters.sweep_left != self.cancel_all_mark
+            || self.counters.cancel_all_unqueued != self.cancel_all_unqueued_mark
+        {
             return clob_dispatcher::CancelAllState::Stranded;
         }
         clob_dispatcher::CancelAllState::Clear
@@ -1968,15 +2173,19 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
 /// and `outcome_coin` do the `× 10 + side` themselves, so feeding them
 /// `enc` would be a silent tenfold error naming a real other market.
 ///
-/// `settled` is `core_types::unpack_roll_seq`'s low-bit reading,
-/// BIT-IDENTICAL to what this function did before the move. Widening
-/// it to refuse a malformed kind byte (`core_types::roll_kind`) is a
-/// live-arm behaviour change and is deliberately NOT smuggled into a
-/// commit about the exposure ledger.
+/// `settled` is the STRICT reading (`core_types::roll_kind_strict`):
+/// `None` for a kind byte no packer of ours writes, which the caller
+/// refuses. The low-bit mask this used before read `0x03` as settled
+/// while `strategy_bin15` read it as created — one frame, two answers
+/// (E7 review, 2026-09-19); all three live readers share the strict
+/// one now.
 #[inline]
-const fn unpack_roll(seq: u64) -> (u32, bool) {
-    let (outcome, _twap_s, _family, settled) = core_types::unpack_roll_seq(seq);
-    (outcome, settled)
+const fn unpack_roll(seq: u64) -> Option<(u32, bool)> {
+    let (outcome, _twap_s, _family, _masked) = core_types::unpack_roll_seq(seq);
+    match core_types::roll_kind_strict(seq) {
+        Some(settled) => Some((outcome, settled)),
+        None => None,
+    }
 }
 
 /// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.
@@ -1984,13 +2193,6 @@ fn now_ns() -> NsTs {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos().min(u128::from(NsTs::MAX)) as NsTs)
-        .unwrap_or(0)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -2452,23 +2654,37 @@ mod tests {
         let mut x = exchange_at("127.0.0.1");
         let before = x.budget.spent();
 
-        x.count_post(&Err(crate::http::PostErr::before_send(
-            crate::http::HttpErr::Dns,
-        )));
+        x.count_post(
+            &Err(crate::http::PostErr::before_send(
+                crate::http::HttpErr::Dns,
+            )),
+            1,
+        );
         assert_eq!(x.budget.spent(), before, "nothing left, nothing spent");
 
-        x.count_post(&Err(crate::http::PostErr {
-            err: crate::http::HttpErr::Timeout,
-            left_host: true,
-        }));
+        x.count_post(
+            &Err(crate::http::PostErr {
+                err: crate::http::HttpErr::Timeout,
+                left_host: true,
+            }),
+            1,
+        );
         assert_eq!(
             x.budget.spent(),
             before + 1,
             "the venue has it — it is spent whether or not we read the answer"
         );
 
-        x.count_post(&Ok((200, 0..1)));
+        x.count_post(&Ok((200, 0..1)), 1);
         assert_eq!(x.budget.spent(), before + 2);
+
+        // A BATCH is charged per item (§2.2: one address request per
+        // order in the action), and a zero-item batch still costs the
+        // one request it was.
+        x.count_post(&Ok((200, 0..1)), 3);
+        assert_eq!(x.budget.spent(), before + 5, "three orders, three requests");
+        x.count_post(&Ok((200, 0..1)), 0);
+        assert_eq!(x.budget.spent(), before + 6, "never less than the request itself");
     }
 
     /// The other half, end to end through `send_action`: a submit
@@ -2535,7 +2751,7 @@ mod tests {
         let mut x = exchange();
         // Spend it down to the floor.
         while x.budget.may_submit().is_ok() {
-            x.budget.on_action_sent();
+            x.budget.on_action_sent(1);
         }
         assert!(x.budget.may_submit().is_err(), "the floor is reached");
         assert!(x.budget.may_cancel(), "and an exit is still permitted");
@@ -2634,15 +2850,22 @@ mod tests {
     fn a_hand_built_roll_seq_unpacks_the_way_the_ingress_packs_it() {
         // The ingress's own pinned vector: pack_roll_seq(2649, 60, 0, false).
         let seq = 2649u64 | (60u64 << 32);
-        assert_eq!(unpack_roll(seq), (2649, false));
+        assert_eq!(unpack_roll(seq), Some((2649, false)));
         // The settled bit is bit 56, and the family byte must not leak
         // into the outcome id.
         let seq = 19_418u64 | (60u64 << 32) | (7u64 << 48) | (1u64 << 56);
-        assert_eq!(unpack_roll(seq), (19_418, true));
+        assert_eq!(unpack_roll(seq), Some((19_418, true)));
         // Bits 0..32 are the OUTCOME ID, not `enc`. Confusing them is a
         // silent tenfold error naming a real other market.
-        let (o, _) = unpack_roll(u64::from(u32::MAX));
+        let Some((o, _)) = unpack_roll(u64::from(u32::MAX)) else {
+            panic!("a CREATED frame with a full outcome id must unpack");
+        };
         assert_eq!(o, u32::MAX);
+        // A kind byte no packer of ours writes is REFUSED, not read as
+        // either kind — `0x03` used to mask to "settled" here while
+        // `strategy_bin15` read it as "created" (E7 review).
+        let seq = 2649u64 | (60u64 << 32) | (3u64 << 56);
+        assert_eq!(unpack_roll(seq), None, "an unknown roll kind binds nothing");
     }
 
     /// LAW E-4's writer. One roll binds BOTH legs, and the No leg is

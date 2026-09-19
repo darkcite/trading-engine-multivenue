@@ -53,9 +53,18 @@ fuzz_target!(|data: &[u8]| {
                 "accepted bytes with no status field"
             );
             // `accepted()` is what callers branch on, so it must never
-            // be true without a status entry behind it.
+            // be true without a status entry behind it — and a status
+            // entry means the `"statuses"` array or the one no-status
+            // shape the venue emits. The first cut asserted only
+            // `"status"`, which every truncated ok envelope satisfies:
+            // a name stronger than its predicate (E7 review).
             if ok.accepted() {
                 assert!(ok.statuses > 0 && ok.errors == 0, "{ok:?}");
+                assert!(
+                    contains(data, b"\"statuses\"")
+                        || contains(data, b"\"type\":\"default\""),
+                    "accepted an ok envelope with neither statuses nor type:default"
+                );
             }
         }
         Ok(HlResponse::Err { msg }) => span_is_safe(msg, data),

@@ -1,258 +1,376 @@
 # CLAUDE.md — Multivenue Trading Engine
 
 This file front-loads context for any Claude session working in this repo.
-It is deliberately self-sufficient: a fresh session should be able to start
-from **this file + the current phase's design/progress docs** without
-rereading the whole doc set. `PLAN.md` remains the architectural deep-dive.
+It is deliberately self-sufficient: a fresh session starts from **this file +
+the current lane's docs** and nothing else. It carries the CURRENT state and
+the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 
 ## What this is
 
-A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that executes systematic strategies across a multivenue universe (Binance spot/USDM, OKX, Deribit, Hyperliquid, Bybit, Polymarket CLOB, Polygon RPC + an options ladder). Strategies are composed at boot from a slot set and may trade **any subset** of that universe — **Polymarket is one venue among several, not the target**. The original PM latency-arb strategy still exists in-tree but is DISABLED at boot (operator ruling 2026-09-02; the live mask is `ai` = 48). v1 runs locally on a MacBook Pro M4 using only free-tier external APIs. Claude (via the `claude-worker` Python process) acts as an offline strategy researcher — never in the hot path.
+A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
+executes systematic strategies across a multivenue universe — Binance
+spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
+Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder. Strategies
+are composed at boot from an 8-slot set and may trade **any subset** of that
+universe; **Polymarket is one venue among several, not the target**. v1 runs
+on a MacBook Pro M4 on free-tier APIs. Claude (via the `claude-worker` Python
+process, and in-session) is an **offline strategy researcher** — never in the
+hot path.
 
-## CURRENT STATE (updated 2026-09-02 — MVP COMPLETE; keep this section current at every phase boundary)
+Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
+0 latency-arb (the original PM strategy, OFF in every wrapper mask) · 1 vrp ·
+2 xsd · 3 bin15 · 4 ai-exec (AI door 1, intents) · 5 ruleset VM (AI door 2,
+tables) · 6 icdp · 7 open. The engine boots the mask named in
+`~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
+in the script; `ai` = 48 is the floor every name includes).
 
-- **ALL STAGES/PHASES THROUGH M6 ARE CLOSED. MVP COMPLETE (operator ruling 2026-09-02).** Stage 1 (8a–8e, G1 blessed) · Stage 2 (8f/8g/8h, H6b-SEMI) · Stage-2 finish WS0–WS13 (gates + live phase green, §5.4 rustls-backpressure root-cause fixed + live-proven) · M1–M4 · M5 (closed at the 2026-09-02 bootout) · VM2 ruleset-VM v2 V0–V9 · M6 (closed by operator ruling at the VM2 boundary; close entry = last of `docs/arch/mvp-progress.md`). **The 2026-09-02 docs pass archived every closed plan/log to `docs/arch/` (see its README index): `stage2-finish-plan.md`, `mvp-completion-plan.md`, `vm2-plan.md`, `m5-runbook-notes.md`, `binance-stocks-plan.md`; second wave on operator order: `license-audit-2026-08-27.md` + `research-tools-exclusion-plan.md` (both REMAIN standing authorities from the archive — the Makefile gates cite them there), `architecture.md`+`.svg`, `options-support-plan.md`.** For any closed-phase archaeology start at `docs/arch/README.md`.
-- **ICDP I1–I7 LANDED 2026-09-03 (operator lifted the G1 gate — vault plan D6; commits `d60c29f` I1 · `b78bd5a` I2–I5 · `3de36a7` I6 · the I7 close commit). LIVE since 09:01:55Z: `--strategy ai+icdp` = mask 112 (ai-exec + vm + icdp) through `~/multivenue/strategy.conf` (`STRATEGY=ai+icdp`; wrapper default `ai`), artifact `~/multivenue/icdp.toml` sha256 `407e064b…` (8 majors, 15 s δ 25 %, fitted on the v2 arrays — D6 interim; regenerate from the v3 pool when G1's windows exist). Boot tells: `icdp: artifact configured hash=… instruments=8`, `strategy-set: composed mask=112`. What landed: I1 IoC taker fill law + `Order.ttl_ns` (offset 48, wire-additive) + fee ladder (0/1/2 bps) in `backtest::fill` (detail_version 3; audit-pnl JSON additive `ioc_fills/ioc_canceled/ttl_expired/fee_ladder_net_usd`); I2 `core_time::{WallAnchor, BarClock}`; I3 `crates/strategy-icdp` (slot 6: bar machine, integer feature law mirrored by the vault Python reference, ridge composite, IoC entry at open+δ / exit at the roll with `ttl_ns` = bar remaining, stale rules, caps, 0 B/op — bench gate 40); I4 slot 6 in `strategy-set` (`icdp`, `ai+icdp`), `engine_icdp_*_total` metrics, audit-pnl label 6=icdp, wrapper `strategy.conf` (paper only); I5 `core-config::icdp` integer-TOML parser + `--icdp <path>` + the vault params one-shot; I6 the nightly pnl lane REVIVED (`pnl_report --closed-day`: per-run ≤ 2 h windows via `claude_worker.window_root`, tier from `~/multivenue/fees.toml` (D2-AMEND 2026-09-04 — see below; `fees.toml.example`), merged day pair with ladder + IoC counters + stale lines; root cause of the dead timer = launchd PATH without `multivenue-engine` — fixed in `daily-restart.sh`). First numbers: 2026-09-03 day report — VM xv row +$27.97 @0 bps / −$38 @1 / −$104 @tier (positive at zero fee only); icdp's first 2.5 min: 5 IoC fills, −$1.22 @0 / −$19.40 @tier. **OPEN: G2 = 5 paper days at the operator tier (vault plan §5; nightly reports accumulate from 2026-09-04) — NOTE the tier CHANGED under G2 on 2026-09-04 (D2-AMEND below), so day 1 is 2026-09-04, not 09-03; G1 = still a report (N ≥ 4 windows, vault `lowo`). TUI per-strategy row + hit-rate/null-arm in the day report DEFERRED.** Not Stage-3 work (paper only; no dispatcher/signer/RiskGate).
-- **FEE TIER D2-AMEND (operator ruling 2026-09-04) — `~/multivenue/fees.toml` + `fees.toml.example` re-derived PER VENUE; D2's blanket `2:5` is SUPERSEDED.** New tier: `pm = "0:350"` · `bn = "10:10"` · `okx = "8:10"` · `deribit = "2:5"` · `hl = "2:5"` · `bybit = "2:6"`. Three laws written into the file header: **L1** one `fee_bps` slot per `VenueId` ⇒ a venue whose STRATEGIES take both spot and perp legs carries the DEARER number (under-charging a spot leg flatters P&L; over-charging a perp leg only understates it); **L2** TRADED legs decide, not `universe.toml` — capture-only instruments (bybit spot) do not pull a venue up; **L3** round UP to the whole bp (parser is integer-only). Verified against each venue's published regular/base tier: BN spot 0.100 %/0.100 % (binds over usdm ≈2/5) · OKX Lv1 spot 0.08 %/0.10 % (binds over the 2/5 swap) · Deribit Standard spot 2/5 bps (binds over perp 1.5/3.5; spot fees are WAIVED pending Coinbase spot routing — the unwaived rate is carried deliberately) · HL tier-0 perp 0.015 %/0.045 % → 2/5 · Bybit VIP0 linear 0.0200 %/0.0550 % → 2/6 (its spot 10/10 does NOT bind — capture-only). **BIGGEST CHANGE — Polymarket is NO LONGER FEE-FREE: the CLOB charges takers `C × 0.07 × p × (1−p)` on crypto markets = 0.07·(1−p) OF NOTIONAL (makers 0, geopolitics 0). That is 350 bps at p = 0.50, ~70 bps at p = 0.90, ~560 bps at p = 0.20 — the harness charges a FLAT bps, so `0:350` is the p ≈ 0.50 point and every PM row in a report is an approximation until `backtest::fill` learns the p-dependent law (OPEN follow-up).** The anchor-id-7 quirk that would have leaked the pm column onto `binance:btcusdt` is FIXED (`3ee1b8b` `model_venue_byte`) and present in the linked release binary. G2's 5 paper days restart at 2026-09-04 (the tier moved under the gate). Old file kept at `~/multivenue/fees.toml.bak-20260904T045409Z`.
-- **XSD LANE (statarb doc 08 v2, operator rulings 2026-09-12; record `docs/research/statarb/09-…`): R1 = BUILD — the execution cost on the 70 illiquid F7 targets is 6.95 bps/leg all-in (fee included; p95 9.84; measured on `data.binance.vision` aggTrades + bookDepth at the research's own fill hours because the fridge never held those names). XSD-1 LIVE since 2026-09-12 04:40Z: `universe.toml` carries 124 usdm (the 102 research perps appended, capture-only until the member exists) = 254 Binance sockets; capture ≈ +5.7 GiB/day; `~/multivenue/candles.toml` (NEW, worker-only base-timeframe policy, `candles.toml.example`) fetches the 102 at 1h + 1d only. INCIDENT + LAW: a launchd agent is born with a 256-fd SOFT limit — the 254-socket boot half-killed the engine (`Too many open files`, ai.sock could not bind) for 2.5 min; `scripts/engine-wrapper.sh` now runs `ulimit -S -n 8192` before the exec (tell `engine-wrapper: fd soft limit 8192`). XSD-F LANDED (uncommitted): fees per venue × `core_types::InstrumentClass` (spot/perp/dated/option/prediction) — `ModelParams::fee_bps[[..;5];7]`, `--fee-bps <venue>[.<class>]:m:t` (bare = all five, bit-identical), the DESCRIPTOR LAW `core_config::instrument_class` mirrored in `claude_worker.instrument_class` under one shared fixture, `fees.toml` v2 (`[fees.<venue>]` class tables + `option_cap`; every class derived and sourced in `fees.toml.example`; installed live, old file `fees.toml.bak-20260912T051052Z`), detail sidecar v7 + additive audit-pnl `fee_classes`; **D2-AMEND L1 is RETIRED** (L2/L3 stand). Gate: bit-identical legacy reproduction on 3 live windows, the deribit perp hedge moving 5 → 4 bps under v2. TIER-3 ARM LANDED: `backtest --member icdp [--icdp <toml>]` drives a coded member on the WALL clock through the frozen fill law (`crates/cli/src/backtest/member.rs`; icdp's first offline backtest ever: 769 IoC fills / 135 RT / −$3,834 at tier, +$404 at 0 bps on run-1789161401966181000 — the nightly picture, reproducible in 40 s); `--member vrp` = the VRP lane's P2 on the same arm. Gates 2026-09-12 ~05:50Z: nextest workspace 1770 pass (1 skip) · release alloc 45/45 0 B/op (fresh `Compiling bench`) · `make lint` green · `make license-check` OK (306) · worker pytest 1067 · `claude-worker fetch` refreshed the map (124 usdm names; the 128 unresolved are the option syms, as before). **COMMITTED 2026-09-12 (operator "commit current stage"; CLAUDE.md + `docs/migration.md` deliberately left out — they carry another lane's hunks): `2553fc6` XSD-F · `184848d` Tier-3 arm · `bb3fe67` XSD-1 ops · `9ff4072` XSD-S.** **R3 RULED = SLOT 2 (XSD-S, `9ff4072`): `strategy-cross-arb` UNLINKED from the set + cli (crate stays, the strategy-ev precedent); `SLOT_XSD = 2` / `BIT_XSD = 4` reserved OUTSIDE `BUILT_MASK` until the member is wired; `--strategy cross-arb` = boot refusal; `[labels.cross_arb]` and `[labels.xsd]` refused at the grammar until XSD-3; labels `xsd` in audit-pnl / engine-snapshot / dashboard / wire-format; `all` 127 → 123, `ai` 48 / `ai+vrp` 50 / `ai+icdp` 112 unchanged; the `xsd`/`ai+xsd`/`ai+vrp+xsd` NAMES land with the member.** **XSD-2 LANDED (UNCOMMITTED, 2026-09-12 ~13:50Z): `crates/strategy-xsd` UNWIRED (slot 2) — integer `ln1e9` (Q60 atanh series, |Δ| ≤ 1 unit pinned), floor-divided spread + rolling-z law (`min_count = max(30, W/4)`), hourly roll on a 1 s timer over ONE boot box (256 sym rings × 2160 h ≈ 4.6 MiB; buckets hold `ln1e9(close)`, 0 = empty), the doc 07 §3.4 decision table (ENTER by consensus, EXIT max-hold → stop → revert in the research's precedence, grid ADD, HOLD on absent z), own caps, seed / restore / `state_epoch` + `positions_view` API, regime soft/hard; `core-config::xsd` (`xsd.toml` integer parser) + `xsd.toml.example`; `claude_worker/xsd_ref.py` = the integer MIRROR; `strategy-core` gained `XsdCounters` / `XsdPositionView` + trait defaults. TWO LAWS FIXED BY PARITY: a pending intent is CARRIED across rolls until a fresh tick prices it (the research fills at the next executable bar — never expired), and cooldown counts from the exit FILL hour (`t = x + 1`). PARITY: (i) Rust ↔ Python fixture `claude-worker/tests/fixtures/xsd/parity-1.*` (synthetic, generated by `gen_parity_input.py`; regenerate ONLY via `XSD_PARITY_WRITE=1 cargo nextest run -p strategy-xsd --test parity`, then `uv run pytest tests/test_xsd_ref.py`) — 1,501 lines bit-identical; (ii) the mirror vs the RESEARCH trade log on `matrix_1h.npz` (vault `bin/xsd_parity_research.py`): **529/529 trades identical (entry bar, exit bar, side, reason) on 200 random fold×target tasks at grid_n 1 AND 3**. Gates: nextest 1799 (1 skip; `deribit_parsers_are_zero_alloc` red once under the parallel debug run, 3/3 green in isolation — the known debug-profile family) · release alloc **46/46** 0 B/op (gate 46 = 128 targets × 3 partners × 720 h rolls + ticks + a regime flip) · lint · license-check · worker pytest +7. FINDING: 22 research syms close below $0.01 (HOT $0.00029 → 290 raw ×1e6 units) — the engine's ×1e6 `Price` quantises their logs at the venue tick; parity held anyway in this sample. XSD-2 COMMITTED `abec669`.** **XSD-3 LANDED 2026-09-12 ~14:20Z (slot 2 WIRED; uncommitted at the time of writing): `BIT_XSD` in `BUILT_MASK` (`all` 127), names `xsd` 4 / `ai+xsd` 52 / `ai+vrp+xsd` 54; `StrategySet` slot-2 member with the full fan-out + `xsd_mut()`/`xsd()`; `crates/cli/src/xsd_boot.rs` = the four artifacts' laws (`xsd.toml` absent ⇒ bit unset; `xsd-table.tsv` unresolvable rows dropped + counted, zero usable ⇒ refuse, sha256 = table identity; `xsd-seed.tsv` rows at/after the boot hour dropped; `xsd-state.tsv` `V/H/P` rows restored under the same hash else FLATTENED, an orphan descriptor REFUSES the boot); `--xsd/--xsd-table/--xsd-seed/--xsd-state` on `run`; boot tells `xsd: artifact configured hash=… table_hash=… targets= pairs= syms= rows_dropped= seed_rows= seed_dropped=` + `xsd: no state|state restored|state discarded`; epoch-gated state writer (descriptors, atomic rename) in the 5 s block; `engine_xsd_*` 18 counters + `engine_xsd_pairs_warm`/`engine_xsd_positions` gauges; `[labels.xsd]`; RG8 slot list; wrapper allow-list `ai+xsd|ai+vrp+xsd|xsd`; `backtest --member xsd [--xsd-table] [--xsd-seed]` on the Tier-3 arm (seed rows before the replay's first hour, no state). `/state` dedicated xsd block + TUI row DEFERRED (the generic slot row shows it; `"v": 1` untouched). OFFLINE SMOKE on the 8-window pool with a hand-cut table (vault `bin/xsd_smoke_artifacts.py`, NOT the screen): 101.7 M records, 20 rolls, 12/12 pairs warm from the seed, 0 entries, ≈ 90 s. Gates: nextest 1805 (1 skip) · alloc 46/46 · lint · license-check · release relinked 14:20 local (`5f0e628`). **XSD-4 LANDED 2026-09-12 ~15:00 local (operator round-5 rulings: $1,000/unit · grid 1 · 82 positions; universe = the research's 110 names with the screen's laws on top; rotation AUTOMATIC monthly at the 00:10Z restart; go-live = one manual restart as soon as done):** `claude_worker.xsd_author` MODULE (never a verb — candles.db in, TSVs out): `author` = `sa_screen.py`'s arithmetic verbatim (OLS β on log closes, batched EG-ADF, |corr| ≥ 0.30 · HL 2–240 h · σ ≥ 25 bps · ¼ ≤ |β| ≤ 4 · median $vol ≥ $5M/24 per bar, K = 3) + three engine laws (every name closes ≥ $0.005 over the whole 2160 h window — ×1e6 quantisation; a target with < K partners is OUT; ≤ 3 missing bars gap-filled, more = OUT); header carries window + knobs but NO timestamp; **the file's sha256 IS the table identity**; NEVER writes an empty table (exit 3, old file stays). `seed-out` = 800 trailing complete hours of the table's descriptors. `status` = age/rows/hash/`rotation_due` (30 d). `tests/test_xsd_author.py` (9). Hooks: `engine-wrapper.sh` runs `seed-out` before every boot when a table exists; `daily-restart.sh` at the 0010 slot BEFORE the drain runs `status` → `author` when `rotation_due=yes|table absent` (the new hash flattens held positions = the research's fold end; next due 2026-10-12). `numpy>=2.5` is a BASE worker dep now (HOST LAW: plain `uv sync` DROPS the kronos group — re-run `uv sync --group kronos`). Vault `bin/xsd_universe_export.py` → `~/multivenue/xsd-universe.tsv` (110/110 captured). FIRST LIVE TABLE (07:54Z, hash `25ff43ef…`): universe 110 → alive 52 / **targets 46 / rows 138 / 48 names** — price law 18 (GALA $0.0013, RSR $0.001, VET, JASMY … fell under $0.005 since the research window), liquidity 40 (53/110 sit under $208k/h on the last 90 d: a thin Sep-2026 alt tape), fewer-than-K 6, gap-filled 8 (the w–z names' backfill started one hour late), holes 0; seed 48 × 800 = 38,400 rows; `~/multivenue/xsd.toml` installed from the example; `strategy.conf` = `ai+vrp+xsd` (54). Worker pytest 1042 green. The 82 cap is not binding — the tape is; R6 waits for the first `pnl_report` with xsd rows. `pnl_report` per-strategy xsd row + TUI/`/state` xsd block DEFERRED. NEXT = XSD-5 go-live restart (outside 07:00–08:00Z) + the 09 doc §3.8 record.**
-- **`docs/arch/venue-time-capture-plan.md` (archived 2026-09-07) VT0–VT6 — CLOSED 2026-09-03 (all six phases landed the same day; close entry = last of its §9; its §6.1 ≤ 2 h capture-window law STANDS).** Record of the phase — Tick v3 venue time + staleness gate (capture is stale-blind: Binance feed 8.9 % of messages > 500 ms stale; see `docs/venue-latency.md`). **VT0 + VT1 + VT2 code-complete 2026-09-03** (Tick v3 `flags`@49 / `venue_time_ms`@56, `Tick::new_stamped`, PMLR VERSION 3, cli acceptance `MIN_PMLR_VERSION..=VERSION`, `pmlr.py` v3 + `ticks_v3.pmlr` fixture; `core_time::FeedClock` per-connection estimator, `VenueId::default_stale_after_ms`, `--stale-after-ms <venue>:<ms>`, `engine_ingress_<venue>_{stale_ticks_total,feed_delay_ema_ms}`; all 6 venues stamp + judge — OKX/Deribit/HL/PM/Bybit/BN-USDM directly, BN-spot through the aggTrade sentinel on the same socket (bit1), which also captures Binance spot prints as `ChannelId::Trade` rows). **VT3 landed (`e486de1`: VM Mid/Bid/Ask ABSENT on a stale tick; worker `collect_marks` skips stale on v3). VT4 landed 2026-09-03 (harness stale law): `cli::backtest::stale::StaleJudge` re-judges every v3 tick from `venue_time_ms` per (venue, sym) per run — a threshold change is a REPLAY; `fill.rs` neither fills nor marks on a stale tick; `--stale-after-ms <venue>:<ms>` on `backtest` + `audit-pnl` (`ModelParams::stale_after_ms`); stderr `stale: pm=1/4 (4285bps)` / `stale-blind(v2)` per run; `--emit-detail` sidecar is `detail_version` 2 (schema-1 stdout frozen, unchanged); capture-catalog `stale_captured` per lane. **VT2 LIVE SMOKE PASSED 2026-09-03 (`fcf76b5`): relinked + rebooted on the operator's "do all by yourself" (pid 63755, 06:34Z, first v3 run `run-1788417289611943000`); Δp50 engine−probe within ±7 ms on 5 venues; live verdict = offline re-judge 100 % after the sentinel-latch fix in `cli::backtest::stale` (a repeated bit1 stamp latches its print's verdict); `engine_ingress_binance_stale_ticks_total` seen moving in a live episode (0 → 58 876 in 25 min). VT5 IN PROGRESS: first ≤ 2 h window W1 of the v3 run — the harness on/off delta is live-proven on the VM row's one round trip (+$1.07 stale-blind vs −$4.87 judged); the xv sweep on W1 is DEGENERATE (0 fires in a quiet 25 min — re-cut when the run holds more); the ICDP I0 pipeline (`--stale-gate`, LOWO `lowo` verb, measured-Δ taker columns — vault one-shots) is validated end-to-end, G1 = NOT YET (N=1 window; needs N ≥ 4 from later runs). Findings in the vault (`docs/research/vt5-stale-gate-2026-09-03.md`).** Not Stage-3 work. Every backtest/audit-pnl on a v2 root prints `stale-blind(v2)` and is an upper bound; only a v3 root (post-relink) is judged. Operator rulings D1–D4 (IoC model pre-Stage-3, fee tier — SUPERSEDED by D2-AMEND 2026-09-04, PROTECT_DAYS 5 — **SUPERSEDED 2026-09-05 by PROTECT_DAYS 1 when the S3 archive went live**, 8-major 15 s/1 m universe) are recorded in the research vault's merged ICDP×VT plan. **CAPTURE-WINDOW LAW (operator ruling 2026-09-03, absolute; VT plan §6.1): NO capture window or data gate may exceed 2 HOURS.** "24 h"/"≥ 48 h of v3 capture" wording anywhere is VOID. A window = a ≤ 2 h `ts_ns` slice of one run, cut into a bounded symlink root; need more data ⇒ pool DISJOINT ≤ 2 h windows that ALREADY EXIST (single-run pools admissible) — never schedule a wait. Gates are stated in per-window fills/ticks/bars + a window count N, never hours (VT5 xv on/off: ≥ 30 gate-off fills/window; ICDP G1: N ≥ 4 windows, leave-one-window-out, 15 s gates / 1 m reports — substance in the vault).
-- **REGIME + DASHBOARD LANE (pre-Stage-3, operator-ordered 2026-09-03) — `docs/regime-and-dashboard-plan.md` RG0–RG7; RG0–RG2 COMMITTED (`77f5ea5`); RG3 COMMITTED (`81ed263`, 2026-09-05); RG5 COMMITTED (`8defc26` + `61b9ab8`, 2026-09-05); **RG2+RG3+RG5 LIVE SMOKE PASSED 2026-09-05 (plan §12 entry — every §7 tell observed): `~/multivenue/regime.toml` INSTALLED (6 usdm majors as breadth, percentiles worker-refreshed), `com.multivenue.regime` INSTALLED (5-min cycle live, daily refresh at the first slot of the UTC day), engine `regime: artifact configured hash=8be4364c… members=6 seed_rows=10332`, `engine_regime_configured 1`, minutes judged 1/min, `declare` proven (seq 39422/39430/39432/39434), and the LABELLED TABLE `fde6f733…` (two disjoint `vol:` variants of the live xv row, gates PASS on an 11 × 2 h seeded pooled root) IS THE ACTIVE ROW (`vm_rows_active 2`, `table_epoch 2`, `engine_vm_regime_blocked_total` climbing; a declaration flip re-judged the gate with NO table flip). Carried findings: the seed hole after every restart (fast profile UNKNOWN ~1 h/restart until live minutes cover the windows — fix = refresh the candles tail before `seed-out`), FUND dims UNKNOWN on this host (ops debt d), `stage-ruleset` does NOT install the artifact (`cp` to `<hash128>.json` first; a missing-artifact stage is dropped silently). OPERATOR RULING 2026-09-05: KEEP `fde6f733…` live.** **RG4 CODE-COMPLETE 2026-09-05 (library + composer, Python only, uncommitted — operator commits; plan §12 entry + RESUME POINT):** `state.db` additive tables `library`/`library_evidence`/`compositions`; `python -m claude_worker.library` lanes (`add`, `import-catalog` — ONLY the active table validated (operator ruling), everything else candidate —, `list --regime current|"<decl>"`, `label`, `validate|retire|candidate`, `evidence` = the harness on one ≤ 2 h seeded window via the ADDITIVE `backtest.run_harness_extra` path: `0/100` split + tier fees + `--emit-detail`; `member_id` = sha256 of canonical rows — a single-member table's hash IS the member id); `python -m claude_worker.compose` (fit = word | Hamming-1 neighbourhood | ANY | evidence → rule-5/rule-8-mirror/caps admission in evidence order → canonical emit → gate on the standing window POOL `~/multivenue/worker/windows/` = the newest K = 8 complete ≤ 2 h seeded v3 windows pruned by COUNT: the frozen pooled `backtest` (binding report) + `--regime off` delta ≥ 0 + leave-one-window-out, every run under a 2 h WALL BUDGET (fail, never wait) → `--promote` only on a hash change (canonical rows == the live table = no-op) and only without the `compositions/FREEZE` pin); `ai-session.md` §4 0a–0c + §8 LIBRARY with the pinned scripted test extended. **OPERATOR LAW 2026-09-05 (verbatim): "in any scenario any test time / soak time / protect time MUST NOT EVER BE MORE THAN 2 hours"** — retention by window count, gate wall budget ≤ 2 h, soaks are N ≤ 2 h windows never "days" (RG7 / ICDP G2 wording must be restated when touched). **RG4 LIVE run:** import → 6 members (live rows validated; smoke-era candidates retired), carry legs added as candidate `cvfc-carry` @ $2,500/leg; pool of 8; the xv member's evidence on all 8 windows (fills 16–283, zero-fee Σ ≈ −$97, okx-tier Σ ≈ −$1,343); pooled frozen gate PASS (+$4.09, 76 legs, RT 13) BUT `--regime off` = +$4.46 (on−off −$0.36: the vol labels earn nothing) and LOWO fails on two windows (−$8.86 / −$0.70) ⇒ composer verdict FAIL in 838 s — the live labelled table is not confirmed by its own gate (operator: keep `fde6f733…` as the soak shape, or re-commit `bfbc5349…`). **FINDING: a funding-carry member cannot be evidenced under the 2 h law — `apr24` warm-up is table-global (24 h), one 2 h window = 0 orders; fix = a per-window FUNDING seed (window_root + `crates/cli --funding-seed`), out of RG4 scope; the "≥ 2 members committed live" exit tell stays OPEN.** Worker pytest 709 (frozen 202 inside), license-check OK (252). **OPERATOR RULINGS after RG4 (2026-09-05): keep `fde6f733…` live (soak shape); NEXT = RG6 (dashboard); the harness funding seed (carry blocker) is the alternative the operator may order first.** **RG6 COMMITTED `ef75c91` 2026-09-05 (engine `/state` + TUI + worker page; the RG4 worker set stays uncommitted/unstaged — operator's): new crate `crates/engine-snapshot` = `EngineSnapshot` (≈ 21 KB `#[repr(C, align(64))]` POD: boot / counters / latency / regime words+rel / slots / vm rows / icdp / ai / ingress / capture / last 64 orders + 64 fills) + the generic seqlock `SnapshotCell<T>` (moved out of `tui`) + `RecentRing` + the zero-alloc `encode_state_json` (§6.1 "As landed" = the `/state` contract, `"v": 1`, byte-exact-pinned); `GET /state` on 9191 (`application/json`; `core-metrics` stays dependency-free — the writer is an `FnMut` the cli hands in; 404 without one, 500 on overflow, never truncated; `RESP_BUF_SIZE` 256 KiB); the engine loop publishes every 1 s (`SNAPSHOT_PERIOD_NS`, a second gate before the 5 s report; the T1(c) tick-age stamps live there now); `StrategyCounters` gained `is_halted`/`slot_counters`/`vm_*hash128`/`vm_rows_view`/`icdp_params_hash`/`icdp_instruments`/`regime_rel_view` (set overrides, everything else default-empty); `Engine` keeps `recent_orders`/`recent_fills` rings; `crates/cli/build.rs` records `MULTIVENUE_GIT_SHA` (soft); `BootInfo` carries pid / wall anchor / binary mtime (pitfall-18 tell) / run dir / masks / regime hash. TUI rewritten over the same snapshot (`DashboardState` + its 5 s publish DELETED; `--tui` reads `obs.state`). Gates: nextest 1593, alloc 42/42 0 B/op (gate 43 = full snapshot publish+read+encode), lint + license-check green, release relinked 14:57 local (sha `61b9ab865ab4` embedded). LIVE since the operator-approved restart 2026-09-05 08:02Z (pid 75758): `metrics: HTTP server starting … state=true`, `/state` shows the masks, both regime profiles measured, `vm fde6f733…` rows 2 with PER-ROW GATE BYTES (row 0 `vol:low` open, row 1 `vol:!low` soft-closed), icdp decisions climbing, all six WS venues up. WORKER PAGE (§6.2) CODE-COMPLETE + LIVE-CHECKED 08:16Z: `python -m claude_worker.dashboard` (stdlib `http.server` 127.0.0.1:9292, read-only, `/api/worker` + same-origin proxies to 9191, one `dashboard.html` no CDN; pytest 713), `scripts/dashboard.sh` + `launchd/com.multivenue.dashboard.plist` + installer; **CMDLINE LAW: a long-running server must never match the lanes' guard `pgrep -f 'claude[-_]worke[r]'` (it would block the boot recommit forever) — the wrapper execs `~/multivenue/venv/bin/python3 scripts/dashboard-serve.py` (venv dir-symlink alias + repo-root launcher), verified.** Frozen live record in the vault `docs/research/regime/rg6-dashboard-live-2026-09-05/`. `com.multivenue.dashboard` BOOTSTRAPPED 08:19Z (operator-approved; pid 77305). **RG6 CLOSED by operator ruling 2026-09-05.** **RG7 CLOSED 2026-09-08 by operator ruling on a soak PASS (plan §7.1 + the §12 close entry).** The judge landed 2026-09-05 (`2ca05e1`): the soak = N ≥ 8 complete ≤ 2 h windows of regime-gated runs (never a calendar span), per-window flip bound ≤ 2 per profile × market dim from the ENGINE's own counters (the 5-min regime cycle samples `/state` — pid, flips, minutes judged — into `history.ndjson`), ≥ 20 samples/window, gating live throughout; judge = `python -m claude_worker.regime soak [--since <ISO|ms>]` (from `claude-worker/`, `.env` sourced; **exit 0 only on PASS**, `INSUFFICIENT` never waits). **Verdict 2026-09-08 04:27Z: `PASS (windows 8, counted 8, failed 0, need 8; flips ≤ 2 per profile x dim per window; history 268 samples / 24 h)`, exit 0 — every window `src=engine` + `hard_exits=0`, worst flip 0–2 against the bound of 2 (three windows sit exactly ON the bound), slow profile flat at zero; record `~/multivenue/worker/regime/soak-20260908T042655Z.json` (worker state, never git).** The seed-hole fix is in (`seed-out --refresh-tail` in the wrapper: 7 descriptors, 1.5 s, seed lag 1 min instead of 60); RG7 docs landed (`ai-strategy-pipeline.md` §7b + svg, `research-universe.md`, `risk-policy.md` regime section, `local-setup.md`). **TWO FINDINGS RECORDED AT THE CLOSE (plan §12): (i) §7.1's per-regime-P&L condition is REPORTED by `judge_window` (`pnl_regime=yes|no` per window) but never enters the verdict branch (`short` → `ungated` → flips → PASS) — doc and code disagree; it did not change this verdict (the six 09-07 windows are `yes`; the two 09-08 windows read `no` only because that day's report cannot exist before the 00:20Z slot on 09-09), and which side moves is the operator's call. (ii) THE EVIDENCE IS PERISHABLE — `soak_windows_from_runs` enumerates LIVE run dirs and retention is `PROTECT_DAYS=1` sweeping at 04:30 local (= 21:30Z, host UTC+7), so after 21:30Z 2026-09-08 a re-run returns `INSUFFICIENT (counted 5)`: the deleted `run-1788769873673140000` alone carried three counted windows. The JSON record + the §12 entry ARE the durable evidence — a later `INSUFFICIENT` is NOT a regression and must not be read as one.** **RG4 + RG8 + FUNDING SEED COMMITTED `b246069` 2026-09-05 (operator: "commit everything except s3-archive-plan.md"; the S3 lane's `docs/arch/s3-archive-plan.md` + `claude-worker/tests/fixtures/sigv4/` stay untracked). RG8 LABEL ENFORCEMENT (operator ruling "everything incl. coded members"; plan §7.2 = the law):** three layers — AI paths (`strategist` prompt **v5** + `parse_proposal(require_labels=True)` refuse a proposal with ONE unlabelled row; `library` validate/import refuse unlabelled `validated` (an unlabelled ACTIVE table imports as candidate); `compose` excludes ANY members unless `--include-any`), the earned-label 6th gate (`backtest.py`: a labelled artifact runs the frozen argv AND `--regime off`, `net_on − net_off ≥ GateThresholds.min_regime_delta_usd` (0) folded into `pnl_positive`, additive report `regime` block; unlabelled = the single frozen run bit for bit), and the engine (`regime.toml` `[labels] require = 1` ⇒ boot REFUSES an enabled signal-carrying coded member (slots 0–3, 6) with an ANY label; ai-exec exempt; absent/0 = unchanged). **NOT flipped live** — `require = 1` would refuse the `ai+icdp` boot until icdp is labelled (needs per-regime evidence first; §7.2). **HARNESS FUNDING SEED LANDED 2026-09-05 (operator "Funding seed next"; in `b246069`):** `crates/cli/src/backtest/funding.rs` + `backtest --funding-seed <path>` (default = the window's own `funding-seed.tsv`) replays settled prints through the vm's live `FundingSeed` path before the first record; warm-up drops apr24/apr72 when seeded (`funding: … warmup=seeded|table` summary line); `window_root.cut_run` writes the file from `candles.db` (the boot seed lane's 73 h law, `seeds.funding_seed_rows`), `pool_ensure` back-fills reused cuts; `docs/migration.md` entry. LIVE: pool of 8 back-filled (≈1,550–1,600 prints × 52 descriptors), `cvfc-carry` EVIDENCED on all 8 (`warmup=seeded` verified): 0 fills on 7, one pair entry on 1 (−$0.83 zero-fee / −$3.83 tier, RT 0). **FINDINGS: (1) carry rows carry `min_hold_s` 96 h ⇒ no ≤ 2 h window or 16 h pool can hold a round trip — per-window evidence = entry cost + mark; the carry accrual is structurally invisible to the 2 h law (operator's call: a carry-specific law or dark); (2) the funding-history lane (`python -m claude_worker.funding`) was DEAD since 2026-09-02 14:00Z — it rode ONLY the deleted `com.multivenue.carry` cron; the `funding` table froze (boot FundingSeed frames, regime FUND dims = ops debt d, per-window seed all read it); FIXED in `scripts/candles-cycle.sh` (hourly, best-effort) + two hand runs refreshed all 5 venues to 2026-09-05 09:00Z.** RG4's "≥ 2 members committed live" tell stays OPEN. **RG-LANE LANDING STATUS (2026-09-08 04:27Z): THE WHOLE RG LANE IS DOWN — RG0–RG8 + the funding seed ALL LANDED, RG0–RG6 CLOSED, and RG7 CLOSED 2026-09-08 on the soak PASS (8/8, exit 0; the RG7 entry above carries the verdict + its two findings).** The hysteresis fix is what closed it: the FIRST soak (2026-09-07 06:38Z) FAILED 7 of 9 windows on FAST-profile flicker (`shape` 3–7 and `trend` 3–6 flips per 2 h window; slow ≤ 1) — root cause: §3.5 bands existed for SHAPE only (TREND/VOL/STRETCH were single thresholds) and `confirm_min = 3` was global/thin for a 60-min horizon; offline replay (vault `docs/research/regime/rg7-soak-flicker-2026-09-07.md`) predicted bands + per-profile confirm 10 → 1/9 failures (a genuine vol=high night). **FIX LANDED + LIVE 2026-09-07 07:04:07Z (operator pick "build the hysteresis fix", bound stays 2; COMMITTED `d5108e9`): `core-regime` per-profile `confirm_min` + `trend_exit_bps_1e9` / `rv_exit_frac_1e9` / `stretch_exit_k_1e9` (all optional, 0 = the RG1 law bit for bit — parity fixture 1 byte-identical, new fixture `parity-2` under the keys), `core-config` optional keys, `regime.toml.example` fast = confirm 10 / trend exit 20 bps / vol ±10 % / stretch 1.5 / ER exits 0.40-0.50, worker mirror + `regime soak --since <ISO|ms>` (the soak RESET law, §7.1); live `~/multivenue/regime.toml` carries the fast keys (hash `e80d77ef…`). Post-fix the prediction held: every counted window 0–2 against the bound, slow profile never flipping, and the wild vol=high night did not recur inside the soak — so the close is a PASS AT the bound, not with headroom.** STILL OPEN in the lane, none of it gating: RG3b (`FeatId::RegimeRel`) deliberately optional, not built; `[labels] require = 1` NOT flipped live (operator's lever — with the `ai` mask it would pass, with `ai+icdp` it refuses until icdp is labelled); RG4's "≥ 2 members committed live" tell (carry IS evidenced on all 8 pool windows but its `min_hold_s` 96 h is structurally invisible to the 2 h law).** **RG5 facts (worker only, no Rust change):** `claude_worker.regime` lanes `report` / `history` / `refresh-params` (rewrites ONLY the six percentile lines, `.bak`) / `declare --fast|--slow "<decl>|measured" --ttl --source` (persist `declared.json` first, then `SetRegime` per profile, `qty` = the measured audit word) / `cycle` (5-min launchd `com.multivenue.regime` via `scripts/regime-cycle.sh`: measure + 24 h history + daily refresh; NEVER declares) / `repush` (post-boot, each profile with ITS remaining TTL; `recommit` calls it after the re-commit, best-effort); `measure()` judges at the LAST minute candles.db holds (`age_min` = the hourly lane's lag, normal); state under `~/multivenue/worker/regime/` (`regime_dir_for(db_path)` for config callers); label mirror `label_masks`/`regime_allows` + `lane_gate()` = the coded lanes' ENTRY gate (`xv_signal`/`carry_signal` `REGIME_LABEL`, default empty = ANY = bit-identical; exits never gated; `run_cycle(regime_words=)` for tests); `pnl_report` merges the harness `regime` section (`regime` key: modes + counters + per profile × word minutes + per-strategy rows; `regime …` summary lines; `latest_report_regimes`); `serve`: `ResearchCycle(regime_inputs=)` + the `_REGIME` phase before fetch (`serve_regime_step`: measure → history → auto-confirm as source `serve-measured` unless a fresher operator/strategist ruling is in force; events `regime_measured`/`regime_verdict`; `ResearchStats.regime_*`), digest REGIME section (`build_digest(regime=)`), prompt **v4** (`strategist-v4`: optional `"regime": {"fast": "<decl>|measured", …}` verdict → `Proposal.regime` → declared with source `strategist` right after the parse, gate-independent). A test that injects `research_env` gets NO regime phase unless it passes `research_regime_inputs` — no test measures the operator's files. RG3 facts: ruleset grammar **v2.1** row keys `regimes` (string array, §3.3 grammar, `fast:`/`slow:` prefixes, `rel:` terms), `regime_off` (`soft`|`hard`), `rel` (sugar) → the `RuleRowV2` tail via `RegimeLabelBuilder` in `ingress-ai` (0 B/op); validator **rule 11** (`RulesetReject::Regime`) + the **rule-8 amendment** (identity-tuple duplicates only when `RegimeTerm::intersects` — disjoint variants of one signal admit); `RegimeLabel::LABELLED_ANY` = a REL-only profile's fill; **vm row gate**: `core_regime::RegimeView` (`RegimeState::view()`) pushed by `StrategySet::push_vm_regime_view` on configure/seed/every minute roll/effective change/declaration → `VmStrategy::set_regime_view` re-judges every active row into one gate byte (`row_gate`, also on every flip); hot path = one byte load per evaluated row — entry blocked (`regime_blocked`), HARD-closed position rows flatten after the age-out check and before min-hold (`regime_hard_exits`), soft rows drain by their own law; `engine_vm_regime_{blocked,hard_exits}_total`; **harness**: `backtest`/`audit-pnl` `--regime <path>|off` + `--regime-seed <path>` (`cli::backtest::regime`: absent flag = the default artifact when it resolves on the root else regime-blind with a stderr tell — the frozen worker argv never fails on it; `off` strips tails = the on/off delta; the engine's own `RegimeState` replays ticks + funding + the window's `SetRegime` frames from `ai-cmds.pmlr`, pre-anchor frames clamped with the TTL shortened; `cli::regime_boot` = the one resolver engine boot + harness share; `--emit-detail` = detail_version 4 with an additive `regime` block; audit-pnl JSON gains the additive `regime` section — per profile minutes-per-word + per (word, strategy) fill-model rows, `audit_pnl_version` stays 1); **worker**: `window_root.cut_run` cuts `ai-cmds.pmlr` and carries the pre-window `SetRegime` still in force (latest per profile), writes the window's own `regime-seed.tsv` when `seed=(regime.toml, candles.db)` (pnl_report day mode passes the defaults); `strategist` prompt **v3** (`strategist-v3`) teaches the keys/gate law/variants and asks for `regimes` on every row (parser accepts them structurally, `regime_term_ok`/`regime_rel_ok`); bench **gate 42**; fuzz `ruleset_json` reaches the keys via the gitignored local corpus seeds `rg3-seed-*` (≥ 300 s run recorded in §12). Not done by design: pnl_report per-regime MERGE (RG5), TUI words (RG6), `FeatId::RegimeRel` (RG3b). RG2 facts: `StrategySet` owns the detector (`configure_regime`/`seed_regime`/`set_regime_label`; 1 s `REGIME_TIMER_NS` timer only when configured; `SetRegime` consumed at set level; edge-triggered `on_regime` to ENABLED members, re-synced on Enable; labelled members fail-closed until the regime is known), ai-exec refuses intents while closed, icdp blocks decisions + HARD-close flattens; boot flags `--regime`/`--regime-seed`; wrapper exports the seed via `python -m claude_worker.regime seed-out`; `engine_regime_*` ≈ 50 metric names. RG1 facts: `core_regime::RegimeState` (boot-boxed ≈ 400 KB, `on_tick` one compare + one store, `on_timer` rolls/judges per wall minute, `seed()` warm replay), the pure law as free fns mirrored in `claude_worker/regime.py`, the shared parity fixture `claude-worker/tests/fixtures/regime/parity-1.*` (regenerate ONLY via `REGIME_PARITY_WRITE=1 cargo nextest run -p core-regime --test parity`, then rerun pytest `test_regime.py`), bench gate 41; `ret_bps_1e9`/`isqrt_i128` now live in `core_regime::math` (icdp re-exports, vm imports).** Operator rulings D1–D4 in the plan header (measured-in-engine + AI-declared; row-level per-profile masks in `RuleRowV2` @88/@96 so a regime change never flips a table; per-strategy `off = soft|hard`; web page + TUI); §11 Q1–Q10 run on their defaults until overridden. Wire facts since RG0: `AiCmdKind::SetRegime = 12` (first unassigned byte 13), `core_types::regime` byte map (one byte per dimension, one-hot; label gate `label == 0 || (w & label) == w`; `UNKNOWN = 1 << 50` fails closed for labelled rows), `RuleRowV2` tail `regime_fast/regime_slow/regime_off/regime_rel` (+22 B reserved), `regime.toml.example` = the RG2 parser's contract, golden frames now cover kinds 0..=12. Laws: regime is a GATE not a signal; exits are never gated; every existing artifact/coded strategy is bit-identical (both masks 0 = unconstrained); regime warm-up comes from a `candles.db` seed, never a capture window > 2 h. Not Stage-3 work.
-- **S3 ARCHIVE LANE S0–S7 LANDED 2026-09-05 (`docs/arch/s3-archive-plan.md`, closed; operator approved the S-DOCTRINE amendment, lifted the RG7 hold, and ruled Q7 = `~/multivenue/s3.env`).** A cold second tier for capture: closed run dirs go to object storage BEFORE retention may delete them, and any consumer that takes a run-dir path keeps taking one. **Zero Rust — `git diff` over `crates/ Cargo.toml Cargo.lock` is empty for every commit of this lane; the engine was never restarted or relinked.** New: `claude_worker.{objstore,archive_config,archive,data_source}`, `scripts/{archive-run.py,archive-cycle.sh}`, `launchd/com.multivenue.archive.plist`, `s3.env.example`, second console script `multivenue-archive`. Laws that matter: **the index object `v1/index/<host>/<run>.json` is the ONLY completeness truth** (data → manifest → index; a torn upload is invisible and resumable); **retention deletes only after `verify` exits 0**, and `break`s on the first unverified run; **the client has no `delete_object` at all** — `abort_multipart` is the only DELETE it can send. **LIVE-PROVEN 2026-09-05:** one real 475 MB run pushed and verified against the bucket (25 files → 87.38 MB stored, **ratio 5.4×**, 908 s, 33 parts), `multivenue-archive status` = `archive: enabled bucket=market-data-qu host=mbp-m4 runs_remote=1`, and `pgrep -f 'claude[-_]worke[r]'` stayed EMPTY throughout (the CMDLINE LAW holds). **ARMED AND LIVE 2026-09-05.** Operator requirement: **keep the last 24 h locally, older on demand** — so `PROTECT_DAYS` 5 → **1**, which **SUPERSEDES standing ruling D3**, and `~/multivenue/retention.conf` is now a FIXED-WINDOW sweep (`MIN/TARGET_FREE_GIB=999999` so it runs nightly rather than only under pressure, `ARCHIVE_MODE="s3"`, `S3_CYCLE_BUDGET_S=3600`, `S3_NICE_NETWORK=0`; old conf at `retention.conf.bak-*`). `com.multivenue.archive` BOOTSTRAPPED (04:30 local; one label, `install-launchd.sh` never run). **Backfill done: 49/50 runs + all 40 legacy tarballs = 16.99 GiB stored** (the 50th is the live capture, excluded by S-LAW 4). **First sweep: 37 runs deleted, 0 refused**, stopping cleanly at the protect boundary — **free space 22 → 75 GiB**, log root 72 → 18 GiB. Engine untouched throughout (pid 85953 before and after, `vm_rows_active 2`). Tarball pull proven on real data (17/17 files byte-identical vs a local `tar -xzf`). **THROUGHPUT — earlier note RETRACTED:** the 0.096 MiB/s was macOS's BACKGROUND traffic class (`taskpolicy -b`), which a 4 MiB burst cannot detect but which throttles sustained transfers ~13×; `sample` showed the process blocked in `_ssl__SSLSocket_write → poll` while an unthrottled probe on the same link got 5.76 MiB/s. Off it, real runs upload at **4.7–5.6 MiB/s** (≈6 min for a day's 1.8 GiB). Cost, measured: feed-delivery EMAs rise transiently (binance 2 → 210 ms) and okx staleness runs hot while it uploads — `S3_NICE_NETWORK=1` restores the background class. **Capture is 9.6 GiB/day raw, ~2× the plan's §9 estimate.** **STILL OPEN, operator-only: (a) bucket versioning + the `AbortIncompleteMultipartUpload` rule are NOT set — the permission classifier refused twice, and until versioning is on S-LAW 11 has no backstop against an accidental overwrite; (b) the credential pair in `~/multivenue/s3.env` was sent in plaintext chat — rotate when convenient.** Watch the first unattended 04:30 cycle (`~/multivenue/logs/launchd/archive.log`) and that the 0020Z pnl slot still fires. Not Stage-3 work.
-- **THE ONLY STAGE-3 GATE LEFT: the Stage-3 ENTRY GATE — `docs/arch/mvp-completion-plan.md` §7, FORWARD-BINDING from the archive (as is its §9 data-pipeline law).** It is the operator's to open: `ANTHROPIC_API_KEY` provisioned → one keyed Fable-5 `serve` cycle with §8.1 auto-promotion observed live + one §8.3 monitor-triggered §8.5 rollback observed live — BEFORE any executor/risk/dispatcher/live-ramp work. **Do NOT start ANY Stage-3 work (code, plans, or designs) without the operator's explicit confirmation.** Until then: NO `serve`, NO Anthropic API calls; everything semi-manual via the ai-session §4 verbs (`docs/prompts/ai-session.md`, pinned).
-- **LIVE OPERATION (engine-only since the 2026-09-02 bootout; AI+VRP MASK since the 2026-09-10 operator ruling):** the engine boots the mask named in `~/multivenue/strategy.conf` (**`STRATEGY=ai` = mask 48 since 2026-09-05 09:53Z** — operator-ordered "boot in ai only mode" at the `b246069` release; the RG7 hysteresis fix went live at the 2026-09-07 07:04:07Z restart (pid 73804), and the 2026-09-08 00:00Z T2 restart carried it forward — **live now: `STRATEGY=ai+vrp` = mask 50 since 2026-09-10 15:23Z (operator: "I expect to see strategy running in engine"); pid 20075, run `run-1789056444864502000`, `vm_rows_active 2` (`fde6f733…`), the whole `engine_vrp_*` family registered, all six WS venues up. VRP operator files: `~/multivenue/vrp.toml` (tau 8 h, theta 0.10, qty 1 contract, both descriptors `deribit:BTC-PERPETUAL`), `vrp-seed.tsv` (90 pairs, worker-cut), `vrp-state.tsv` (written by the engine, read at boot). Boot tells: `vrp: artifact configured hash=f64b2c29… chain_rows=32 chain_rows_refused=32`, `vrp: state restored`, `composed mask=50 vrp=true`. ONE campaign per UTC day: select 23:50Z, decide 00:00Z, hourly rebalance, unwind 07:55Z, settle 08:00Z**; icdp OFF (`engine_icdp_decisions_total 0`); the 09-03→09-05 `ai+icdp` = mask 112 period is over, old conf kept at `~/multivenue/strategy.conf.bak-20260905T095205Z`; absent ⇒ `ai` = mask 48) — **ALL Rust-coded legacy strategies (latency-arb) DISABLED at boot**; the AI lanes run (wrapper `scripts/engine-wrapper.sh`; boot-log tell: `composed mask=50 latency_arb=false vrp=true`, `regime: artifact configured … require_labels=false`, `vm_rows_active 2` = `fde6f733…` recommitted). Drop back to `ai` by rewriting the conf + the restart lever. launchd fleet = `com.multivenue.engine` + caffeinate + daily-restart (T2 **00:10**/08:30/16:05Z — the day-boundary slot moved 00:00 -> 00:10 on 2026-09-10 by operator ruling: E-tau for the VRP member IS 00:00Z, and a drain on that second cost the entry a dark window and re-decided a HOLD) + hourly candles+iv + retention + **`com.multivenue.archive` (04:30 local, S3 uploads — added 2026-09-05)**. Retention is now a FIXED-WINDOW sweep: **`PROTECT_DAYS 1`** (keep 24 h locally; older is in object storage and pulled on demand) with `MIN/TARGET_FREE_GIB=999999` so it runs nightly rather than only under pressure, and `ARCHIVE_MODE="s3"` so every deletion is gated on `verify` — **this SUPERSEDES ruling D3's PROTECT_DAYS 5**. `com.multivenue.carry`/`com.multivenue.xv` crons are DELETED. The VM carries xv (`bfbc5349…`, okx-only 3.0/1.0 bps $3,000/leg; the hl pair ruled dead). **Carry is DARK** — revisit shape: regate merged candidate `b9883c1a…` (carry legs $2,750 under the Rule-7 leg-counted $100k table cap) on a healthy root (Aug-29→31), then stage/commit; §6 stage law refuses failing reports, NO override. Paper mode everywhere; PM ≤6 tokens (M1 cap: token 7 collides with anchor id 7); universe dailies expire 16:00Z (T2 refreshes). **After ANY restart verify `vm_rows_active 1`** (the #7b recommit now retries the stale-sock race — fixed + live-proven 2026-09-02). Restart-lane revive lever: `echo 19700101 > ~/multivenue/state/last-restart-utc-0010`.
-- **STAY-GREENS (2026-09-07 ~14:00 local, RG7 hysteresis-fix battery on top of HEAD `4b80b7f` — the Rust side IS re-verified now): nextest 1602 (1 skipped) · release alloc 42/42 0 B/op (fresh `Compiling bench`) · worker pytest 901 (3 skipped; frozen 202 inside) · `make lint` (clippy) green · `make license-check` green (281) · release `cli` relinked 14:01 local and again after the commit (`d5108e9` embedded — and the 2026-09-08 00:00Z T2 restart picked it up, so the live pid 35409 now reports `d5108e9c7fb9`).** **The RG7 close (2026-09-08) changed NO code and re-ran NO gate — the soak lane is read-only, so these numbers are `d5108e9`'s, untouched BY the close but NOT re-verified at HEAD: the commits after it (`15c7103`, `eca8e2e`, `eef59b3`, `851742e` — the Kronos K1 + candles lanes) are other lanes' and carry their own gate records.** **STAY-GREENS — worker side re-measured 2026-09-07 at the S3-lane close: worker pytest 898 (3 skipped; frozen 202 inside) · `make license-check` green (281 source files) · `uv run mypy --strict` clean on the four archive modules. RUST SIDE UNVERIFIED SINCE `b246069` (the S3 lane ran no cargo command by design — nextest 1599 / alloc 42/42 are that commit's numbers, not re-run).** **CORRECTION: `make py-lint` is NOT green and was not before this lane — 696 ruff errors across committed files at HEAD (`test_compose.py` 75, `test_library.py` 63, `compose.py` 62, `library.py` 43, …). The old "make lint green" claim covered clippy only; the Python side has been red for some time.** Earlier baseline for reference (2026-09-05, RG8 + funding-seed, commit `b246069`): nextest 1599 (1 skipped) · release alloc 42/42 0 B/op (fresh `Compiling bench`; gate 43 = the `/state` snapshot path) · worker pytest 723 · `make lint` green · release workspace build 2026-09-05 16:51 local AFTER the commit (`/state` `boot.git_sha` = `b2460691c821`).** Fuzz = VM2-V4's standing ≥300 s record + the RG3 `ruleset_json` ≥ 300 s run over the v2.1 seeds (§12). Three known test flakes (isolation-disproven): `ai_exec_on_ai_is_zero_alloc` (debug profile), `scrape_hammer_all_succeed_without_conn_errors`, and the worker's UDS-fixture family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file` — `Connection refused` on the fake `ai.sock`) — rerun in isolation before believing a red.
-- **OPS DEBTS (standing, non-gating):** (a) **disk headroom** — the Data volume ran 100 % full Sep-2 (capture ENOSPC-wedged all lanes; writers do NOT retry after ENOSPC — engine restart is the recovery); ~360 GB non-project data is the operator's lever; (b) ~~the 00:20Z nightly pnl timer is DEAD since Aug-23~~ REVIVED 2026-09-03 (ICDP I6: launchd PATH fix + per-run ≤ 2 h windows; first day report `pnl-2026-09-03` written by hand-run, the 00:20Z slot takes over from 2026-09-04 — verify `~/multivenue/worker/reports/pnl-2026-09-04.json` exists); (c) whole-root audit-pnl/backtest OOM at ~27–44 GB roots — bounded symlink roots are the working shape (17 GB ≈ 8 GB RSS), streaming mode is the fix-shape; (d) BN markPrice/eapi-WS venue-side unreachable from this network — activation = `BINANCE_EAPI_WS_HOST` in `.env` + restart, no code change.
-- **STANDING OPERATOR RULINGS + LAWS (survive all archival):** the frozen worker contract — `claude-worker/src/claude_worker/backtest.py` argv `multivenue-engine backtest --ruleset R --replay-dir D --split 70/30`, schema-1 JSON, GateThresholds (`min_trading_days` 1 since the MVP-tempo amendment); the harness conforms to the worker, never vice versa; the frozen 202 pytest pin. `AI_INGRESS_HMAC_KEY` permanent in `.env` (worker shells need `set -a; source .env; set +a` + the release dir on PATH — the H6b wrapper pattern; NEVER read/print `.env`). Post-rollback procedure = enable + re-commit (Commit is mask-gated at the vm member). Detached/long runs on the Mac: `launchctl submit` jobs — **NOT one-shots: launchd relaunches the job every time it exits until `launchctl remove <label>`, so the wrapper's LAST line must remove its own label** (two overlapping relaunches corrupted a research root on 2026-09-02); nohup children of MCP terminals die with the window; `python -m claude_worker.cli` is a silent no-op — use the `claude-worker` console script.
-- **LICENCE PASS standing (2026-08-27, authority `docs/arch/license-audit-2026-08-27.md`):** per-file SPDX enforced by `make license-check`; `make license-deps` on any dependency change; `THIRD-PARTY-NOTICES.md` committed. `make lint` is green as of 2026-09-02 and stays a gate.
-- **Pushes are the OPERATOR's, done manually.** `origin/main` advancing without any session having pushed is NORMAL. (The old "push anomaly KNOWN / origin-main divergence" note was a misreading — operator-corrected 2026-08-27. `origin/main`'s reflog is full of `update by push` because the operator pushes by hand.) Sessions still NEVER push: that rule is unchanged.
-- **Git discipline:** NO push, NO rebase, NO history rewrite, NO new branches, NO git ops without operator ask. Do NOT touch `.env`.
-- If context runs short: write interim state + exact resume point + relaunch prompt to the active work's log doc (post-MVP: a dated session-notes doc in `docs/`), then tell the operator.
+## Where to look — and where not to
 
-## Parallel M2/M3 session protocol (BOTH CLOSED — C6 closed 2026-08-29; the M2/M3 OWNERSHIP SPLIT IS DISSOLVED. The one-engine law, the serialized-worker-verbs law, and explicit-path staging remain STANDING LAWS for every session; the rest of this section is historical record)
+- **Current docs (read as needed):** `PLAN.md` (architecture deep-dive),
+  `docs/risk-policy.md` (caps, kill switches, LAWS E-1..E-9, the exec lane's
+  record), `docs/wire-format.md`, `docs/migration.md`, `docs/local-setup.md`,
+  `docs/venue-latency.md`, `docs/hot-path-latency.md`,
+  `docs/research-universe.md`, `docs/ai-strategy-pipeline.md` + the three
+  sheets `docs/{ai-strategy-pipeline,phase-8-architecture-v2,engine-memory-cpu}.svg`,
+  `docs/prompts/ai-session.md` (pinned by a worker test — never move it),
+  `exec.toml.example` and the other `*.toml.example` files (each is its
+  parser's contract).
+- **`docs/arch/` is HISTORY and `docs/research/` is the git-excluded research
+  vault. Read either ONLY when the operator explicitly asks for it** (a
+  closed phase, a ruling's provenance, a research finding). Never as part of
+  orientation, never to "check for context". The few archived documents that
+  are still standing authorities are named where they bind (the Licensing
+  rules, the S3 archive's S-LAWs, the ≤ 2 h window law) — cite them from
+  there; do not go reading around them.
+- Working notes for a lane: a dated log in the vault (`docs/research/…`) —
+  never in git, never in this file.
 
-Two Claude sessions shared this ONE checkout during M2/M3. (Standing inheritance for every session since: the one-engine law, the worker serialization law, and explicit-path staging.)
+## CURRENT STATE (2026-09-19)
 
-- **Git staging is explicit-path ONLY.** `git add <your owned paths>` — NEVER `git add -A`/`-u`. Check `git status` first; the other lane's dirty files are NOT yours to stage, commit, or clean. Commit messages prefixed `M2:` / `M3:`. Commits remain operator-authorized (checkpoint pattern).
-- **Ownership.** M2 owns: `crates/ingress-deribit`, `crates/ingress-okx`, `crates/ingress-binance` (eapi), their tests + fuzz targets, `docs/wire-format.md` + `docs/migration.md` (M2.3), `docs/m2-progress.md`. M3 owns: the cli capture-catalog module + bin arm, `claude-worker` (candles.db, refresh automation), `docs/local-setup.md` runbook additions, `~/Library/LaunchAgents` plist, `docs/m3-progress.md`. SHARED — small additive edits, sequential commits, note in your log: `crates/cli` (bin + paper.rs), `crates/core-config`, `crates/core-io`, `universe.toml.example`, `.env.example`, `docs/mvp-progress.md`.
-- **ONE ENGINE EVER** (9191 + ai.sock are singletons). Once M3 installs the launchd instance, it is THE standing engine; any smoke boot first `pgrep -f multivenue-engine`, stops the standing instance (`launchctl`), and restarts it after. G0 relink law applies per boot; a relink under a running engine takes effect at its next restart.
-- **Worker verbs globally serialized** (one SQLite seq namespace across sessions): `pgrep -f claude-worker` before any verb; never overlap fetch/push/stage/commit with the other session.
-- **Cargo shares one target dir** — concurrent builds/tests BLOCK on the file lock. Wait; never kill the other session's build. Long-runners: nohup with per-lane prefixes (`/tmp/m2-*`, `/tmp/m3-*`).
-- **Sequencing pin:** M2.3 (mark/IV wire-format migration) starts only AFTER M3's capture-catalog first commit lands (M2's ladder order makes this natural). Whichever side lands second extends the other (the catalog gains the new channel's row).
+- **MVP complete; every pre-execution lane closed** (Stage 1–2, M1–M6, VM2,
+  VT, regime + dashboard, S3 archive, ICDP, XSD, VRP, BIN15). Their closing
+  records are in `docs/arch/` and the vault; nothing there is open work.
+- **Live operation:** one launchd engine (`com.multivenue.engine`) in PAPER,
+  restarted at 00:10/08:30/16:05Z by `daily-restart`, plus `caffeinate`,
+  hourly `candles`, 5-min `regime`, nightly `retention` (PROTECT_DAYS 1,
+  every delete gated on S3 `verify`), `archive` (04:30 local) and the
+  read-only `dashboard`. The live mask is whatever `strategy.conf` names;
+  slots 1–3 and 6 have all run in paper. After ANY restart verify
+  `vm_rows_active ≥ 1` on `/state`.
+- **Real-execution lane E1–E6 LANDED, reviewed and re-tested in E7
+  (2026-09-19).** `crates/exec-router` (per-slot `ExecMode` on
+  `Order.strategy_id`, `RoutedDispatcher`, the E6 risk gate: per-order /
+  open-orders / day / instance caps, the venue-fill ledger, six sticky halts
+  incl. recon-STALE, `exec.HALT`) + `crates/exec-hyperliquid` (msgpack +
+  EIP-712 `Agent` signing pinned by 25 SDK vectors, mio+rustls `/exchange`
+  arm with the request body rendered in place, `userFills` WS pumped from
+  `on_idle` on the engine thread, reconciliation, address-budget governor,
+  LAW E-8 sweeps). Armed ONLY by the two-switch interlock `--exec
+  ~/multivenue/exec.toml --arm-live <slot>`; `LIVE_ARM_VENUES = [Hyperliquid]`;
+  a market-data host and an exchange host on different networks refuse the
+  boot. `halt_on_recon_stale_ms` is REQUIRED on every live slot. Record:
+  `docs/risk-policy.md` "E6" + "E7".
+- **NEXT = E7 R0 on TESTNET (operator's hand):** `.env` with all three
+  `HYPERLIQUID_{WS,API,EXCHANGE}_HOST` on `api.hyperliquid-testnet.xyz`,
+  `HYPERLIQUID_SOURCE=b`, the testnet agent key + master address;
+  `~/multivenue/exec.toml` from the example with slot 3 live and every cap +
+  `halt_on_*` key; `bin15.toml` at the R0 ablation; one restart with
+  `--exec … --arm-live 3`. Bars R0–R3 and the tells: risk-policy "E7".
+  **Mainnet is a separate, later operator ruling.**
+- **Gates at HEAD:** nextest 2585 (1 skipped) · alloc 62/62 at 0 B/op ·
+  clippy clean · `make license-check` OK · `make copy-audit` new=0 ·
+  worker pytest 1153 (3 skipped) · fuzz `hl_*` 3 × 300 s clean. Known
+  isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
+  `scrape_hammer_all_succeed_without_conn_errors`, the worker's UDS-fixture
+  family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file`)
+  — rerun in isolation before believing a red. `make py-lint` (ruff) is
+  RED at HEAD and has been for weeks; `make lint` means clippy.
+- **Open operator items (non-gating):** S3 bucket versioning +
+  `AbortIncompleteMultipartUpload` not set; the `s3.env` credential pair was
+  once pasted in chat — rotate; disk headroom on the Data volume is the
+  operator's lever (writers do not retry after ENOSPC — restart is the
+  recovery); whole-root `audit-pnl`/`backtest` OOMs above ~27 GB — use
+  bounded ≤ 2 h window roots; BN eapi-WS is unreachable from this network
+  (`BINANCE_EAPI_WS_HOST` in `.env` + restart activates it); `regime.toml
+  [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
+  names `claude-opus-4-6` as the session model (the three review agents are
+  pinned to `claude-opus-5`).
+
+## Standing operator laws (survive every archival)
+
+- **Git:** NO push, NO rebase, NO history rewrite, NO branches, NO git
+  operation without the operator's ask. Pushes are the operator's, by hand
+  (`origin/main` moving without a session push is normal). Staging is
+  **explicit-path only** — never `git add -A`/`-u`; another lane's dirty
+  file is not yours to stage. Never `cargo fmt --all` (HEAD was never
+  fmt-clean). Git write-ops run ON THE MAC (RustRover terminal), never
+  through the Cowork mount (it leaves stale `.git` locks).
+- **Secrets:** `.env` only, `chmod 600`, git-ignored, never read, printed or
+  edited by a session. `AI_INGRESS_HMAC_KEY` lives there permanently; worker
+  shells need `set -a; source .env; set +a` + the release dir on PATH.
+- **ONE ENGINE EVER** (9191 + `ai.sock` are singletons): the launchd instance
+  IS the engine; any smoke boot stops it via `launchctl` and restarts it
+  after. G0: test gates never relink the release binary — `cargo build
+  --release -p cli` before any live boot, and check `stat -f '%Sm'
+  target/release/multivenue-engine` against the last `crates/cli` change
+  before trusting a harness number.
+- **Worker verbs and pytest are globally serialized:** `pgrep -f
+  'claude[-_]worke[r]'` / `pgrep -f pytes[t]` first; one SQLite seq
+  namespace, one writer. The CMDLINE LAW: a long-running process must never
+  match that guard in its argv (the dashboard execs a venv alias for this
+  reason).
+- **The frozen worker contract:** `claude-worker/src/claude_worker/backtest.py`
+  argv `multivenue-engine backtest --ruleset R --replay-dir D --split 70/30`,
+  schema-1 JSON on stdout, the 8 verbs, the 202 frozen pytest pin — the
+  harness conforms to the worker, never vice versa.
+- **The ≤ 2 h law (2026-09-03/05, absolute):** no capture window, data gate,
+  test, soak or protect time may exceed 2 hours. A window is a ≤ 2 h `ts_ns`
+  slice of one run cut into a bounded symlink root; more data ⇒ pool
+  DISJOINT windows that already exist, never schedule a wait. Gates are
+  stated in fills/ticks/windows, never hours or days.
+- **Research never enters git (2026-09-02, absolute):** data, strategy
+  research, backtest/P&L reports, any doc ABOUT a researched strategy live in
+  `docs/research/` (git-excluded) or the G8 external vault. `make
+  license-check` refuses a tracked file there; no `git add -f`. A plan may
+  record a ruling or a law; the substance stays out. Research one-shots are
+  `claude-worker/tools_*.py` (git-excluded, never named in a tracked doc).
+- **The Stage-3 entry gate** (`docs/arch/mvp-completion-plan.md` §7, forward
+  binding): no AI-promoted member goes live before one keyed `serve` cycle
+  with auto-promotion and one monitor-triggered rollback are observed live.
+  **Waived for BIN15 only** (O-E1, 2026-09-15: hand-coded, no AI promotion
+  path). No `serve`, no Anthropic API calls until the operator opens it.
+- **Execution laws:** a live slot never falls back to paper (E-1); every live
+  submit AND modify passes the risk gate, a cancel is never blocked by a cap;
+  the HTTP response is the ACK, the `userFills` stream is the FILL (E-5); a
+  requote is a MODIFY (E-7); the roll takes its own quotes back (E-8); the
+  cloid encodes the slot (E-9); caps stay exactly paper's (O-E4); fees are
+  MEASURED from `userFills.fee`, never read from a doc. Full text:
+  `docs/risk-policy.md`.
+- **Venue latency is measured, never assumed** — per host AND per location
+  (`python -m claude_worker.latency_probe` → `docs/venue-latency.md` → the
+  harness Δ table) before trusting any backtest number on a new box.
+- **Retention:** PROTECT_DAYS 1 (24 h local, older in object storage on
+  demand), every delete gated on `multivenue-archive verify`. **S-DOCTRINE:**
+  the no-cloud rule binds the TRADING PATH; the cold archive lives entirely
+  outside the engine (handwritten SigV4, no SDK, no `delete_object` verb).
+- **Detached runs on the Mac:** `launchctl submit` relaunches on exit until
+  `launchctl remove` — a wrapper's LAST line removes its own label; nohup
+  children of MCP terminals die with the window.
+- **If context runs short:** write interim state + the exact resume point +
+  a relaunch prompt to the lane's vault log, then tell the operator.
 
 ## Build / test / run
 
 ```sh
-# build (debug)
-cargo build --workspace
+cargo build --workspace                       # debug
+cargo build --release --workspace             # release — what we deploy
+cargo nextest run --workspace                 # unit + proptest + integration
+make test-fast                                # skip fuzz/bench compile
 
-# build (release — what we actually deploy)
-cargo build --release --workspace
+# fuzz: `+nightly` is REQUIRED on this host (the 1.88 pin has no -Z)
+cargo +nightly fuzz run polymarket_clob_frame -- -max_total_time=300
 
-# run the full test suite (unit + proptest + integration)
-cargo nextest run --workspace
-
-# run only fast tests (skip fuzz/bench compile)
-make test-fast
-
-# run fuzz targets for 5 minutes each (CI default)
-cargo fuzz run polymarket_clob_frame -- -max_total_time=300
-# cargo-fuzz v0.13.2 installed; runs `+nightly`; in-repo `cargo install`
-# trips the 1.88.0 toolchain pin — install `+stable` from $HOME if needed.
-
-# run allocation assertions — this MUST show 0 B/op on hot paths
-# --test-threads=1 is REQUIRED: CountingAllocator is process-global;
-# parallel threads pollute each other's AllocGuard deltas (or use `make alloc-assert`)
-# False-green guard: confirm a fresh `Compiling bench` in the log, or
-# `cargo clean -p bench --release` and rerun (H2 correction: plain
-# `-p bench` does NOT remove the release test bin on this toolchain).
+# allocation assertions — MUST show 0 B/op; --test-threads=1 is REQUIRED
+# (CountingAllocator is process-global). False-green guard: the log must
+# show a fresh `Compiling bench`, else `cargo clean -p bench --release`.
 cargo test -p bench --test alloc_assertions --release -- --test-threads=1
 
-# criterion benches
-cargo bench --workspace
+cargo bench --workspace                       # criterion
+cd claude-worker && uv run pytest             # worker (serialize with pgrep first)
 
-# python claude-worker tests
-cd claude-worker && uv run pytest
+make lint             # clippy --all-targets -D warnings (a gate)
+make license-check    # SPDX + LICENSE/NOTICE + the research-in-git guard (a gate)
+make copy-audit       # zero-copy ratchet vs scripts/copy-audit-baseline.txt (a gate)
+make license-deps     # ONLY when a dependency changed (cargo-deny + cargo-about)
 
-# licence gates — run license-check before every commit (offline, ~1 s:
-# SPDX coverage on all tracked .rs/.py/.sh, claude-worker LICENSE/NOTICE
-# drift, the fuzz manifest's non-inheritable license key).
-make license-check
-# only when a dependency changed (needs cargo-deny + cargo-about installed);
-# regenerates THIRD-PARTY-NOTICES.md, which is COMMITTED, not release-time.
-make license-deps
-
-# start the engine locally (paper mode)
-# G0 law: test gates build rlibs/test bins but NEVER relink the release
-# binary — ALWAYS `cargo build --release -p cli` before any live boot.
-# M1: the universe comes from ~/multivenue/universe.toml (zero flags);
-# legacy fallback: no config file ⇒ --polymarket-asset-id is REQUIRED
-# (boot refuses venue-blind). DEPLOYED FLAG since 2026-09-02:
-# --strategy ai (mask 48 = ai-exec + vm; Rust-coded strategies
-# disabled by operator ruling). --strategy all (mask 49) re-adds
-# latency-arb; bare latency-arb can't express AI toggles.
+# engine, paper (the universe comes from ~/multivenue/universe.toml)
 cargo build --release -p cli
 cargo run --release -p cli -- run --paper --strategy ai
-# legacy (no universe.toml):
-cargo run --release -p cli -- run --paper --polymarket-asset-id <TOKEN_ID>
-
-# audit a capture run (every run writes PMLR capture to
-# <MULTIVENUE_LOG_DIR>/run-<epoch_ns>/ — per-venue ticks/events/signals
-# + optional --raw-tap payload tap)
-cargo run --release -p cli -- audit-replay --dir ~/multivenue/logs/run-<ns>
+# armed (E7, TESTNET): the two-switch interlock, both switches or a refusal
+cargo run --release -p cli -- run --strategy ai+vrp+xsd+bin15 \
+  --exec ~/multivenue/exec.toml --arm-live 3
+# offline consumers (MAY allocate): audit-replay / capture-catalog /
+# backtest --ruleset R --replay-dir D --split 70/30 / audit-pnl / exec-smoke
 ```
 
-## Universe config — adding markets/instruments (M1 runbook)
+## Universe config (`~/multivenue/universe.toml`)
 
-- The boot universe lives in `~/multivenue/universe.toml` (TOML subset; grammar documented in `universe.toml.example` + `core-config::universe`; `--universe <path>` overrides; file absent ⇒ legacy flag boot). Read ONCE at boot — **changes apply on restart** (brief capture gap, one new run dir; M3 automates the cadence).
-- **Polymarket** (crypto up/down binaries only — M1-R1): resolve `clobTokenIds` via the Gamma lane (`https://gamma-api.polymarket.com/markets?slug=<slug>`), append `"<yes>:<no>"` (pair) or `"<token>"` (single leg) to `[polymarket] markets`. Caps: 64 market entries / 128 tokens. Latency-arb wiring: `[pairs] map = ["P:B"]` (market index × `binance.spot` index, 0-based file order).
-- **Append, never reorder.** SymbolIds are file-order ordinals (PM token[0]→42, BN spot[0]→7, everything else `make_symbol_id(venue, ordinal)`; USDM base 512). Reordering a still-listed instrument re-syms it next boot, and the worker map keeps the OLD sym by design (conflict reported on every fetch until the stale `market-map.json` entry is pruned). Wholesale replacement is clean — the daily up/down refresh (markets expire 16:00Z) drops old ids from the observed universe (dead map names are harmless) and adds fresh ones.
-- **Binance**: append to `spot` / `usdm` (lowercase stream symbols) — the multi-connection lane grows one conn; the exchangeInfo audit validates at boot. **OKX/Deribit/HL**: append to their instrument/coin lists; 8e discovery validates.
-- After restart, run `claude-worker fetch` once — the `CLAUDE_WORKER_UNIVERSE_FILE` seam seeds map names (§9.4 descriptors), Gamma meta and YES/NO pairs; `unresolved=0` in the fetch output is the done-tell.
-- One-off boots without editing the file: the per-venue CLI flags still override (`--polymarket-asset-id X` etc.).
+Read ONCE at boot; changes apply on restart (the daily-restart lane refreshes
+the PM dailies, which expire 16:00Z). Grammar: `universe.toml.example` +
+`core-config::universe`. **Append, never reorder** — `SymbolId`s are file-order
+ordinals; the worker map keeps the OLD sym for a reordered name by design.
+Polymarket: `clobTokenIds` from the Gamma lane, `"<yes>:<no>"` pairs, ≤ 6
+tokens (token 7 collides with anchor id 7). Binance: lowercase stream
+symbols, one socket per symbol (254 at the current universe — the wrapper
+raises the launchd fd soft limit to 8192). After a restart run
+`claude-worker fetch` once; `unresolved=0` is the done-tell.
 
-## Hard architectural rules (do not violate — the build will fail if you do)
+## Hard architectural rules (do not violate — the gates will fail)
 
 ### Rust
-- **Zero allocations in hot paths.** No `Vec::push`, no `format!`, no `to_string`, no `Box::new`, no `Vec::from`. Preallocate at boot, reuse forever. Enforced by `core-alloc::CountingAllocator` in tests.
-- **No `dyn Trait` in hot paths.** Strategies are monomorphized via `Engine<S: Strategy>`. Generic dispatch, not virtual.
-- **No `tokio` on hot path.** Tokio allocates and is cooperative-scheduled. Bootstrap only, if at all.
-- **No `serde_json` on hot path.** Every WS/HTTP parser is a handwritten byte scanner over `&[u8]`.
-- **No `ethers` / `alloy` full stacks.** We use `secp256k1` + `tiny-keccak` directly.
-- **No `async-std`, no `reqwest`.** Hyper + rustls only for HTTP/2.
-- **No `foreach`/iterator overhead in hot loops.** Raw indices, `get_unchecked` inside safe wrappers.
-- **No bounds checks in hot loops.** Hot loops use `unsafe` blocks with `// SAFETY:` comments; safe wrappers uphold invariants.
-- **No panics in release hot paths.** Use `debug_assert!`. Release builds have `panic = "abort"`.
-- **Every POD struct in hot path is `#[repr(C)]` + `#[derive(Copy, Clone)]`.**
-- **Every ring / cache-sensitive struct is `#[repr(align(64))]`.**
-- **Strategies implement the `Strategy` trait from `strategy-core`.** No exceptions.
-- **Every ingress parser has a property test + a fuzz target.** See §21.3 and §21.4 of PLAN.md.
-- **Every public function has at least one happy-path and one failure-mode unit test.**
-- **Offline paths (audit-replay, backtest) MAY allocate** — they are not hot paths; each such module carries a doctrine header saying so.
+- **Zero allocations in hot paths.** No `Vec::push`, `format!`, `to_string`,
+  `Box::new`, `Vec::from`. Preallocate at boot, reuse forever. Enforced by
+  `core-alloc::CountingAllocator` (`make alloc-assert`).
+- **Zero-copy (operator ruling 2026-09-19).** Everything that CAN be done
+  zero-copy IS: scanners borrow the rx buffer and return offsets, encoders
+  render into the FINAL wire buffer, signers hash in place
+  (`keccak256_parts`), PODs move once into their ring slot. A copy that
+  cannot be avoided carries, within the eight lines above it,
+  `// COPY: <what> <bound> — <why unavoidable> — <alternative rejected>` —
+  the way `unsafe` carries `// SAFETY:`. Designed copies: kernel↔user,
+  rustls' plaintext window, rx-tail compaction, the ring-slot publish,
+  ≤ 64 B PODs by value. Enforced by `make copy-audit` (a RATCHET against
+  `scripts/copy-audit-baseline.txt`; only the operator grows the baseline)
+  and the `zero-copy-auditor` agent. A cold operator module may opt out with
+  a `//! COPY-DOCTRINE:` header — never anything the engine loop reaches.
+- **No `dyn Trait` in hot paths.** `Engine<S: Strategy, D: OrderDispatch>` is
+  monomorphized.
+- **No `tokio`, `serde_json`, `reqwest`, `async-std`, `ethers`, `alloy` on
+  the hot path** — mio + rustls + handwritten byte scanners; `secp256k1` +
+  `tiny-keccak` directly. `.claude/hooks/no-forbidden-crates.sh` blocks the
+  edit.
+- **No iterators/`foreach` and no bounds checks in hot loops** — raw indices,
+  `get_unchecked` inside safe wrappers with `// SAFETY:`.
+- **No panics in release hot paths** — `debug_assert!`; release is
+  `panic = "abort"`. Fail-fast beats graceful recovery on the trading path.
+- **Every hot POD is `#[repr(C)]` + `Copy`; every ring / cache-sensitive
+  struct is `#[repr(align(64))]` and size-asserted.**
+- **Strategies implement `strategy-core::Strategy`**; every ingress parser has
+  a proptest AND a cargo-fuzz target; every public fn has a happy-path and a
+  failure-mode test.
+- **Offline paths (audit-replay, backtest, the operator tools) MAY
+  allocate** — each such module says so in a doctrine header.
 
 ### Python (`claude-worker/`)
-- **Full `import x` only. Never `from x import y`.** This is a codebase-wide preference.
-- **No live Anthropic API calls in tests.** Mock at the SDK boundary.
-- Anthropic SDK is constructed inside `serve` only; strategist model is `MODEL_STRATEGIST = "claude-fable-5"`.
+- **Full `import x` only. Never `from x import y`.** (ruff + a pytest enforce it.)
+- No live Anthropic API calls in tests; the SDK is constructed inside `serve`
+  only. Model constants live in `config.py` and are pinned by `test_config.py`.
 
-### Licensing — EVERY new file (enforced by `make license-check`)
-- **Every new `.rs`, `.py` and `.sh` file MUST carry the two-line SPDX record as its first lines.** No exceptions — tests, fuzz targets, one-off scripts, throwaway harnesses. Adding a file without it fails `make license-check`, which is a gate, not advice.
-  ```rust
-  // SPDX-License-Identifier: Apache-2.0
-  // Copyright 2026 Anton (darkcite)
-  ```
-  ```python
-  # SPDX-License-Identifier: Apache-2.0
-  # Copyright 2026 Anton (darkcite)
-  ```
-- **Placement is exact:** Rust — above the `//!` inner-doc block and above any `#![...]` inner attribute (comments may legally precede both). Python — above the module docstring (`__doc__` still resolves). Shell — **after** the shebang, never before it.
-- **Every new crate's `Cargo.toml` gets `license.workspace = true`.** The one manifest that cannot inherit is `fuzz/Cargo.toml` (workspace-`exclude`d by cargo-fuzz convention) — it carries a literal `license = "Apache-2.0"`; keep the two in sync.
-- **Adding/changing/removing a dependency changes the license surface of the shipped binary.** Run `make license-deps` (cargo-deny + cargo-about) and commit the regenerated `THIRD-PARTY-NOTICES.md` with that change. If `cargo deny check licenses` rejects a new license, that is a deliberate decision in `deny.toml` — read what the license obliges before appending a line, never rubber-stamp it.
-- **RESEARCH-IN-GIT LAW (operator ruling 2026-09-02, absolute): researched data, strategy research, backtest/P&L reports, and ANY docs about researched strategies NEVER enter git.** They live in the git-excluded research vaults: `docs/research/` for engine-generated output (reports, trade lists, research findings); the external-material vault per `docs/arch/license-audit-2026-08-27.md` G8 for third-party strategy material. Both are gitignored; `make license-check` refuses any tracked file under `docs/research/`, and the G8 naming gate already polices the external vault. No `git add -f`, no exceptions — a plan/progress log may record decisions and laws, but the research substance itself stays out.
-- **Never vendor third-party source into this tree.** Deps are unmodified crates.io/PyPI packages, which is what makes the `NOTICE` claim true. If material of any provenance must land in-tree, record it in `NOTICE` first.
-- **No binary leaves the build host without `LICENSE` + `NOTICE` + `THIRD-PARTY-NOTICES.md` beside it.** Stage-3 / Phase-7 gate.
-- **Repo-wide file rewrites: verify `git diff --summary` is empty of mode changes.** A `> tmp && mv` pass creates new inodes at the umask and silently strips exec bits — it did exactly that to the five `scripts/*.sh` launchd scripts on 2026-08-27. `--numstat` does NOT show mode changes and will not catch it.
-- Authority: `docs/arch/license-audit-2026-08-27.md`. Contributor-facing copy: `CONTRIBUTING.md`.
-
-### Secrets
-- **`.env` file only.** No macOS Keychain, no AWS KMS, no Vault, no Secrets Manager.
-- **`.env` is `chmod 600` and in `.gitignore`. `.env.example` is committed.**
-- **Signing key loaded into an `mlock`'d page, zeroized on drop.**
+### Licensing (enforced by `make license-check`)
+- Every new `.rs` / `.py` / `.sh` starts with the two-line SPDX record
+  (`// SPDX-License-Identifier: Apache-2.0` / `// Copyright 2026 Anton
+  (darkcite)`; Python `#`; shell AFTER the shebang). Every new crate:
+  `license.workspace = true` (`fuzz/Cargo.toml` carries the literal).
+- A dependency change ⇒ `make license-deps` and commit the regenerated
+  `THIRD-PARTY-NOTICES.md`. Never vendor third-party source. No binary leaves
+  the host without `LICENSE` + `NOTICE` + `THIRD-PARTY-NOTICES.md`.
+- Repo-wide rewrites: `git diff --summary` must show no mode changes (a
+  `> tmp && mv` pass strips exec bits).
+- Authority (standing, archived): `docs/arch/license-audit-2026-08-27.md`;
+  contributor copy `CONTRIBUTING.md`.
 
 ### Deployment
-- **No cloud services, at any phase.** Even Phase 7 EC2 is a plain Linux VM — no KMS, no SSM, no CloudWatch, no Terraform, no Ansible.
-- **S-DOCTRINE (operator ruling, 2026-09-05):** the no-cloud rule binds the *trading path* — the engine binary, its dependency graph, and anything the engine loads, links, or calls at runtime. A **cold data archive that lives entirely outside the engine**, is reachable only from offline Python and two ops shell scripts, is optional at every layer, and whose absence changes no engine behaviour, is permitted. No cloud SDK enters the Cargo graph or `pyproject.toml` — the ban list in `.claude/hooks/no-forbidden-crates.sh` stands unchanged; the S3 client is handwritten SigV4 over `hmac`/`hashlib`/`httpx`. No cloud service may ever be on a path the engine can block on.
-- **No observability stack.** TUI (`ratatui`) + log files + a trivial `/metrics` endpoint on `127.0.0.1`. No Prometheus, no Grafana.
-- **Venue latency is measured, never assumed — per deployment AND per location.** The harness's activation-Δ table (`crates/cli/src/backtest.rs` `ModelParams::default()`) is a measurement of the current host + network; on any new box/region/ISP/VPN run `python -m claude_worker.latency_probe` and re-derive it per `docs/venue-latency.md` before trusting any backtest/audit-pnl number there. Receive-time lead-lag between venues on this host is dominated by feed delivery (Binance p90 ≈ 1.3 s tail, 2026-09-03) — check cross-venue signals in venue time first.
+- **No cloud services on the trading path, no observability stack** — TUI +
+  log files + `/metrics` and `/state` on `127.0.0.1:9191`. Phase 7 is a plain
+  Linux VM.
+- **Signing keys** load into an `mlock`'d page and zeroize on drop.
 
 ## Directory guide
 
-- `PLAN.md` — full architecture, phased roadmap, testing strategy.
-- `docs/arch/mvp-completion-plan.md` — ARCHIVED at MVP close, but **§7 (Stage-3 ENTRY GATE) and §9 (data-pipeline law) remain FORWARD-BINDING** from there.
-- `docs/research-universe.md` — the research catalog. `docs/ai-strategy-pipeline.md` (+ `.svg`) — the pipeline explainer.
-- OPEN research items (scalping plan DRAFT awaiting the operator's §13 ruling; ICDP research awaiting operator review) live OUTSIDE git in the git-excluded research vaults — see the research-in-git law below.
-- `docs/prompts/ai-session.md` — semi-manual AI-session prompt (pinned by `claude-worker/tests/test_session_scripted.py` — do not move or drift it).
-- `docs/wire-format.md` — PMLR v2 ring-slot/replay-log formats. `docs/migration.md` — format/schema migration log.
-- `docs/risk-policy.md` — kill-switch and cap rules.
-- `docs/arch/s3-archive-plan.md` — the object-storage archive lane (S0–S7, CLOSED 2026-09-05). Its S-LAWs remain the standing authority for that subsystem; `s3.env.example` is the config contract.
-- `docs/arch/license-audit-2026-08-27.md` — Apache-2.0 compliance audit + application record; the authority for the "Licensing" hard rules. `CONTRIBUTING.md` — the contributor-facing copy. `deny.toml` / `about.toml` / `about.hbs` — the dependency licence gate.
-- `docs/local-setup.md` — Mac toolchain setup. `docs/hot-path-latency.md` — standing latency audit (referenced by PLAN.md + bench).
-- `docs/arch/` — **CLOSED history** (phase 1–6 plans, Stage-1 progress, 8f/8g/8h design+progress, Stage-2 parent plan, M1/M2/M4 logs, the Aug-27/28 outage+remediation docs, WS10 design, archived prompts). See its README index. Never write there; read only for archaeology.
-- `crates/core-*/` — OS-agnostic primitives (rings, time, config, alloc, io, net, parse, simd, crypto).
-- `crates/core-crypto/` — handwritten SHA-256 / HMAC-SHA256 / base64 (RFC 4648); no external crypto stacks.
-- `crates/core-io/` — PMLR replay log writer/reader + `PmlrCapture` (per-ingress §6.5 capture sink) + raw tap (`PMRT`).
-- `crates/ingress-*/src/discovery.rs` — per-venue boot REST discovery (8e): instrument universes, tick/lot metadata, coverage audit.
-- `crates/ingress-*/` — one per external source (polymarket, binance, okx, deribit, hyperliquid, rpc). `crates/ingress-ai/` — AI command plane (UDS+HMAC, ruleset validate/stage/commit).
-- `crates/strategy-*/` — strategies implementing the `Strategy` trait; `strategy-vm` — the 8g ruleset VM; `strategy-icdp` — slot 6, the intrabar candle-direction member (ICDP I3; params from `~/multivenue/icdp.toml`, parser `core-config::icdp`); `strategy-set` — composed strategy set (slots 0–6, compose-if-configured; `ai` = 48, `ai+icdp` = 112, `all` = 113).
-- `crates/signer-eip712/` — audited-C-backed signer; do not replace with `ethers`.
-- `crates/clob-dispatcher/` — persistent H/2 client; preallocated buffers.
-- `crates/cli/` — the main binary (`multivenue-engine`: run / audit-replay / backtest-in-progress).
-- `crates/tui/` — read-only dashboard; snapshot-page driven.
-- `crates/bench/` — criterion + dhat; allocation assertions live here too. `#[global_allocator]` CountingAllocator is process-global — keep new tests of other crates OUT of the bench crate.
-- Integration tests live per-crate under each crate's `tests/` directory. No workspace-level `tests/` is used.
-- `fuzz/` — cargo-fuzz targets.
-- `claude-worker/src/claude_worker/{objstore,archive_config,archive,data_source}.py` + `scripts/{archive-run.py,archive-cycle.sh}` + `launchd/com.multivenue.archive.plist` — the object-storage archive (S-DOCTRINE above). Handwritten SigV4, **no `delete_object` verb at all**, index-object-last commit, verify-before-delete. Second console script `multivenue-archive`; long runs go through `scripts/archive-run.py` under `~/multivenue/venv/bin/python3` (the CMDLINE LAW — the name `claude-worker` would trip every worker lane's `pgrep` guard).
-- `claude-worker/` — Python 3.14 worker: `serve` daemon + operator verbs (fetch/backtest/push/positions/stage-ruleset/commit-ruleset); Anthropic SDK constructed inside `serve` only; never in the hot path. `pnl_report` (nightly day-mode P&L in ≤ 2 h windows via `window_root`, tier from `~/multivenue/fees.toml`) + the thin `pnl` reader verb. **Research one-shots (`claude-worker/tools_*.py`) are deliberately git-excluded** — `tools_` is a reserved prefix there; findings go to `docs/research/` (git-excluded), outputs are the sha256-named artifacts in `~/multivenue/artifacts/rulesets`, and anything that earns a caller moves into `src/claude_worker/`. Authority: `docs/arch/research-tools-exclusion-plan.md`.
-- `.claude/` — subagents, slash commands, settings.
+- `crates/core-*` — primitives: ring (SPSC only), time, config (every
+  `*.toml` parser), alloc, io (PMLR writer/reader, `PmlrCapture`, atomic
+  state files), net (mio + rustls transport, WS framing, `IoBuf`,
+  `Keepalive`), parse (byte scanners), simd, crypto (SHA-256/HMAC/base64),
+  types (wire PODs, `SymbolId`, `VenueId`), regime, vol, fill, latency,
+  metrics (fixed registry, 512 counters).
+- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,rpc}` —
+  one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
+  the UDS+HMAC command plane and the ruleset validator.
+- `crates/strategy-{set,core,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed
+  set and its members; `strategy-{latency-arb,cross-arb,ev,rule-tree}` are
+  in-tree but unlinked/off. `book-builder`, `opt-registry`,
+  `options-select`, `research-artifacts`.
+- `crates/engine` — the single-threaded loop; `crates/engine-snapshot` —
+  the seqlock `/state` snapshot; `crates/tui`.
+- `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
+  + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
+- `crates/cli` — `multivenue-engine` (run / audit-replay / capture-catalog /
+  backtest / audit-pnl / exec-smoke …); `paper.rs` = the boot + metrics
+  assembly; `exec_boot.rs` = the arming interlock.
+- `crates/bench` — criterion + the alloc assertions (its `CountingAllocator`
+  is process-global; keep other crates' tests out). `fuzz/` — targets.
+- `claude-worker/` — the Python 3.14 worker: 8 frozen verbs + the modules
+  (candles, funding, regime, pnl_report, window_root, library/compose,
+  archive/objstore, dashboard, xsd_author, bin15_*, …). Integration tests
+  live per crate under `tests/`.
+- `scripts/` + `launchd/` — the wrapper, daily-restart, candles/regime/
+  archive/retention cycles, `exec-smoke.sh`, `copy-audit.sh`.
+- `.claude/` — agents (`alloc-auditor`, `zero-copy-auditor`,
+  `risk-reviewer`, `parser-property-tester`, all Opus 5), commands, hooks.
+- `docs/arch/` — history (index in its README). `docs/research/` — the vault.
 
 ## Common pitfalls — if you're about to do one of these, stop
 
-1. **Adding `tokio` to any `crates/core-*` or `crates/ingress-*`.** Use `mio` + handwritten state machines.
-2. **Adding `serde_json` to an ingress parser.** Write a byte scanner; see `core-parse`.
-3. **Adding `.collect::<Vec<_>>()` in a hot loop.** Preallocate a fixed-size array or InlineArray-equivalent.
-4. **Using `String` in a hot path.** Symbols are `type SymbolId = u32;`. News payloads are `&[u8]`.
-5. **Using `async fn` on anything the engine loop touches.** Hot path is synchronous.
-6. **Adding a `from x import y` in `claude-worker/`.** Full `import x` only.
-7. **Proposing to add Prometheus, Grafana, Terraform, AWS SDK, or any cloud service.** Deliberately excluded.
-8. **Proposing to add paid API integrations (X, Benzinga, Blocknative) before Phase 6.** Gated on demonstrated P&L.
-9. **Proposing to skip tests "because it's a small change".** Zero-alloc assertions exist because small changes have regressed them before.
-10. **Trusting `cargo` runs inside the Cowork Linux sandbox.** The mounted-repo fingerprints go stale and produce FALSE GREENS (observed 2026-08-15). Compile and test on the Mac only. Corollary on the Mac: impossible-looking unresolved-import errors right after file edits = stale rmeta — `cargo clean -p <touched crates>` and retry.
-11. **Trusting probe fixtures over live boots.** Venue wire drifts (OKX `preopen` empties, 27-byte XPERP ids, Deribit starbase reorder + sci-notation floats were all caught LIVE in 8e). New parsers get a live smoke run before being declared done; `--raw-tap` exists for exactly this.
-12. **Long commands through the RustRover MCP terminal.** `execute_terminal_command` executeInShell=true has a ≤45 s window — long runs: `nohup … > /tmp/log &` then poll. zsh eats bare `===` in echo.
-13. **Modifying the worker's frozen surfaces.** `backtest.py` argv/schema-1 and the verb surface are FROZEN; the harness conforms to the worker. The 202 pytest baseline stays untouched-green.
-14. **Creating a new `.rs`/`.py`/`.sh` without the SPDX header, or a new crate without `license.workspace = true`.** See "Licensing" above. `make license-check` fails on it, and a header-less file lifted out of the repo carries no license signal at all — §4(c) obliges downstream to retain notices that then do not exist. Write the two lines when you create the file, not later.
-15. **Adding a dependency without re-running `make license-deps`.** A new crate changes what the shipped binary must attribute. `THIRD-PARTY-NOTICES.md` is committed, not generated at release time, precisely so it cannot be missing when a binary ships.
-16b. **Committing ANY research material — backtest records, P&L reports, strategy research docs, trade lists.** The research-in-git law (Licensing section) is absolute: the substance lives in the git-excluded vaults (`docs/research/`, or the G8 external vault), never in git — the 2026-09-02 history purge of two tracked backtest records is the precedent.
-16. **Committing a `claude-worker/tools_*.py` research one-shot — or naming a specific one in a permanent doc.** The class is git-excluded by policy, and `make license-check` fails on BOTH: a tracked one-shot (`git add -f` is the only way one comes back), and any tracked file that names a concrete one-shot, or the external research corpus, outside that class's owning authority doc. Naming the class pattern to state the law is fine; naming a file you do not ship is how a permanent doc comes to point at nothing — cite the owner doc instead (`docs/arch/research-tools-exclusion-plan.md`; external corpus → `docs/arch/license-audit-2026-08-27.md` G8). If a one-shot genuinely needs tracking it becomes a module in `src/claude_worker/` with tests, not a forced add.
-17. **Trusting a backtest / audit-pnl number from a v2 root — it is STALE-BLIND.** v2 ticks carry no venue time, so the harness replays every stale book as current and books mid-to-mid gains that were never available (the xv family looked profitable exactly this way; on the first v3 run the live VM row's single round trip was +$1.07 stale-blind vs −$4.87 judged). The harness prints `stale-blind(v2)` per run — treat that number as an UPPER BOUND, never a result. Judged numbers need a v3 root (post 2026-09-03 relink) and a ≤ 2 h window (VT plan §6.1). Also: a windowed root must be cut by `ts_ns` with the events file cut too — a symlinked whole events file drags out-of-window rows into the merge.
-18. **Trusting harness numbers from a release binary older than the last `crates/cli` change.** `cargo nextest`/`cargo build` never relink `target/release/multivenue-engine` (G0). Twice on 2026-09-03 a stale release harness printed pre-fix numbers (1 347 false-stale ticks; a zero fee ladder). Before any audit-pnl/backtest that matters: `cargo build --release -p cli` and check `stat -f '%Sm' target/release/multivenue-engine` against the last cli commit.
+1. Adding `tokio` / `serde_json` / a cloud SDK anywhere near the hot path.
+2. `.collect::<Vec<_>>()`, `String`, or `async fn` on anything the engine
+   loop touches.
+3. `from x import y` in `claude-worker/`.
+4. Proposing Prometheus/Grafana/Terraform, or paid API integrations before
+   demonstrated P&L.
+5. Skipping tests "because it's a small change" — the alloc and copy gates
+   exist because small changes regressed them.
+6. **Trusting `cargo` inside the Cowork Linux sandbox** — stale fingerprints
+   give FALSE GREENS. Compile and test on the Mac only. On the Mac,
+   impossible unresolved-import errors right after edits = stale rmeta —
+   `cargo clean -p <crate>` and retry.
+7. Trusting probe fixtures over live boots — venue wire drifts were only ever
+   caught LIVE; new parsers get a live smoke (`--raw-tap`).
+8. Long commands through the RustRover terminal — it is ~45 s regardless of
+   the timeout; `nohup … > <log> 2>&1 &` then poll. A REUSED terminal can
+   return stale mixed output; use `reuseExistingTerminalWindow=false` for
+   evidence.
+9. Modifying the worker's frozen surfaces (`backtest.py` argv/schema-1, the
+   verb surface, the 202 pytest pin).
+10. A new `.rs`/`.py`/`.sh` without the SPDX header, a new crate without
+    `license.workspace = true`, a dependency without `make license-deps`.
+11. Committing ANY research material or a `tools_*.py` one-shot, or naming a
+    concrete one-shot in a tracked doc (cite the owner doc instead).
+12. Trusting a backtest / audit-pnl number from a v2 (pre-2026-09-03) root —
+    it is STALE-BLIND and an upper bound; judged numbers need a v3 root and a
+    ≤ 2 h window cut by `ts_ns` with the events file cut too.
+13. Trusting harness numbers from a release binary older than the last
+    `crates/cli` change — `cargo build --release -p cli` first (G0).
+14. **Re-sending a file through the Cowork file bridge after a first send of
+    the same path** — it reports `written` and changes nothing (a cached
+    upload). A file goes through the bridge ONCE; every later change is an
+    in-place edit on the mount (`device_bash` python/sed) verified by
+    `sha256sum` on both sides. `.claude/` is refused by the bridge — edit it
+    on the mount. A file under the container's `/mnt/user-data/outputs/` is
+    snapshotted at its first write — stage each version under a new name, or
+    carry the bytes in a base64 python script.
+15. `pkill -f <pattern>` can match your own polling shell — bracket one letter
+    (`multivenue-engin[e]`).
 
-## macOS session facts (hard-won)
+## macOS session facts
 
-- AF_UNIX `sun_path` length cap bites long socket paths.
-- `SO_RCVTIMEO` returns EINVAL on peer-closed UDS.
-- `std::thread::scope` panic hangs without a StopOnDrop guard.
-- `sample <pid>` is the go-to for diagnosing hangs.
-- RustRover MCP must attach (`get_project_modules`) against the main checkout FIRST; if it won't attach, stop.
-- A REUSED RustRover MCP terminal can return STALE/MIXED output from earlier commands (burned two M2.3 investigation loops on phantom lines that were in no file). Evidence-critical reads: `reuseExistingTerminalWindow=false`; files are the only ground truth.
-- The RustRover MCP terminal window is ~45 s REGARDLESS of the requested timeout — long runs: `nohup … > /tmp/<lane>-*.log 2>&1 &` then poll the log file.
-- Concurrent pytest runs across sessions COLLIDE (shared socket/tmp fixtures; twice-observed in M2). Treat pytest like a serialized worker verb: `pgrep -f pytest` first, never overlap lanes.
-- `tests/test_recommit.py::test_recommit_restages_and_recommits_active_row` is INTERMITTENTLY FLAKY under the full suite — observed once on 2026-08-30 as `len(fake_uds.frames) == 0` (no frame reached the `FakeUdsServer`), i.e. the UDS fixture, not the assertion under test. Characterized immediately: 6/6 green in isolation, 598/598 green on the two full reruns that followed. Same family as the AF_UNIX/`SO_RCVTIMEO` facts above. Re-run before believing it; a single red here is not a regression signal.
-- `pkill -f <pattern>` can match a POLLING shell that quotes the same string (cosmetic exit 143) — bracket one letter of the pattern (`multivenue-engin[e]`).
+- AF_UNIX `sun_path` length cap bites long socket paths; `SO_RCVTIMEO` returns
+  EINVAL on a peer-closed UDS; Darwin's pthread mutex heap-allocates on first
+  lock (which is why `SnapshotCell` is a seqlock).
+- `std::thread::scope` panic hangs without a StopOnDrop guard; `sample <pid>`
+  diagnoses hangs.
+- A launchd agent is born with a 256-fd SOFT limit — the wrapper raises it.
+- CPU pinning (`sched_setaffinity`) does nothing on macOS; every "pinned"
+  thread floats — the core map in the sheets is intent.
+- RustRover MCP must attach (`get_project_modules`) against the main checkout
+  first; if it won't attach, stop.
 
-## Preferred Claude models for tasks in this repo
+## Preferred Claude models
 
-- **Bulk artifact generation** (topic tagging): Haiku 4.5 (`MODEL_BULK = "claude-haiku-4-5"`).
-- **Reasoning** (rule parsing, news labeling): Sonnet 5 (`MODEL_REASONING = "claude-sonnet-5"`).
-- **Strategy proposals** (`claude-worker` serve strategist, ruleset drafts): Fable 5.1 (`MODEL_STRATEGIST = "claude-fable-5-1"`) — **requires `anthropic >= 1.4.0`**.
-- **Hard work** (backtest review, architectural changes): Opus 5.
-
-**These are not just labels.** `MODEL_BULK` / `MODEL_REASONING` / `MODEL_STRATEGIST` live in `claude-worker/src/claude_worker/config.py`, are consumed by `feeds.py`, `strategist.py` and `daemon.py`, and are pinned by `tests/test_config.py`. Change the doc and the constant together, or a lane will call a model string that does not exist.
-
-**Verify against the SDK, not against a version number.** The installed `anthropic` enumerates every accepted identifier in `anthropic/types/model.py` — that list is the authority, and a model string absent from it fails at the first keyed `serve` cycle, which IS the Stage-3 entry gate, so nothing earlier catches it:
-
-```sh
-cd claude-worker && uv run python -c \
-  "import anthropic, re, pathlib, anthropic.types.model as m; \
-   print(anthropic.__version__, sorted(set(re.findall(r'\"(claude-[a-z0-9.-]+)\"', pathlib.Path(m.__file__).read_text()))))"
-```
-
-**SDK floor is `anthropic >= 1.4.0` (bumped 2026-09-07 from 0.122.0) because `MODEL_STRATEGIST = "claude-fable-5-1"` needs it** — 0.122.0 knew the Fable family as `claude-fable-5` alone. The model string and the floor in `pyproject.toml` move together. The 0.x → 1.x major bump is safe here because the worker touches exactly two SDK names, `anthropic.Anthropic` and `anthropic.types.TextBlock`, both unchanged; it pulls in `httpx2`/`httpcore2`/`truststore` alongside the existing `httpx`, which the archive lane keeps using. `THIRD-PARTY-NOTICES.md` is generated by cargo-about from the **Cargo** graph and contains no Python packages, so a Python-side bump does not require `make license-deps`.
+- Bulk artifact generation: `MODEL_BULK = "claude-haiku-4-5"`. Reasoning:
+  `MODEL_REASONING = "claude-sonnet-5"`. Strategy proposals (`serve`
+  strategist): `MODEL_STRATEGIST = "claude-fable-5-1"` (needs `anthropic >=
+  1.4.0`). Hard work — reviews, architecture, the three review agents:
+  Opus 5 (`claude-opus-5`).
+- These are constants in `claude-worker/src/claude_worker/config.py`, pinned
+  by `tests/test_config.py` — change the doc and the constant together, and
+  verify a model id against the installed SDK's `anthropic/types/model.py`
+  (a wrong string fails at the first keyed `serve` cycle, which IS the
+  Stage-3 gate). `THIRD-PARTY-NOTICES.md` covers the Cargo graph only; a
+  Python SDK bump needs no `make license-deps`.
 
 ## When in doubt, read (in this order)
 
-1. This file's CURRENT STATE section — where we are, what's next.
-2. `docs/arch/mvp-completion-plan.md` §7 + §9 — the Stage-3 entry gate and the binding data law (forward-binding from the archive).
-3. `PLAN.md` — everything architectural.
-4. `docs/wire-format.md` — ring slot layouts, replay log format.
-5. `docs/risk-policy.md` — kill-switch and cap rules.
-6. `docs/arch/README.md` — the index to ALL closed plans/logs (everything through M6/VM2).
+1. This file — CURRENT STATE and the standing laws.
+2. `docs/risk-policy.md` — the execution laws and the E6/E7 record.
+3. `PLAN.md` — everything architectural; `docs/wire-format.md` for bytes.
+4. The lane's own vault log, if the operator points you at one.

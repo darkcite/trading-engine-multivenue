@@ -4,6 +4,11 @@
 //! The testnet smoke — proof that this binary can sign something the
 //! venue actually verifies.
 //!
+//! COPY-DOCTRINE: an operator/restart-lane gate (`exec-smoke`) that
+//! sends one cancel to testnet and reports; never reachable from the
+//! engine loop, every copy in it cold. `scripts/copy-audit.sh` skips
+//! this module on that line.
+//!
 //! O-E3 makes testnet a **permanent CI target, not a phase that ends**:
 //! a relinked binary that cannot sign a testnet order must never be
 //! allowed to sign a mainnet one. So this runs before every armed
@@ -60,6 +65,7 @@ use std::sync::Arc;
 use crate::action::{encode_cancel, CancelWire, MAX_ACTION};
 use crate::config::HlConfig;
 use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::nonce::now_ms;
 use crate::request::{cancel_json, envelope};
 use crate::response::{scan, HlResponse};
 use crate::sign::{sign_action, Vault};
@@ -453,13 +459,6 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
         }
     }
     false
-}
-
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

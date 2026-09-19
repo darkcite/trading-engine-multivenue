@@ -274,8 +274,6 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative options records dispatched to `on_opt_summary`
     /// (VM2 V2, all opt lanes combined).
     pub opts_dispatched: u64,
-    /// Ruleset-table slots popped and handed to the member (8g §6).
-    pub tables_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
     //
@@ -360,7 +358,6 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             events_dispatched: 0,
             depths_dispatched: 0,
             opts_dispatched: 0,
-            tables_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
             decide_lat: LatencyTracker::new(),
             ack_lat: LatencyTracker::new(),
@@ -704,13 +701,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         // that is documented copy #2 (§6), operator cadence, bytes
         // not heap.
         while let Some(t) = self.table_cons.try_pop() {
+            // The loop's "did we do work" answer is `consumed`; the
+            // member's own `table_epoch` is the operator-facing count
+            // of tables it took, so no second counter lives here (a
+            // `tables_dispatched` that nothing read was removed at
+            // the E7 review).
             consumed += 1;
             self.strat.on_ruleset_table(&t);
-            // E6 commit 3a: the one drained lane that had no counter
-            // of its own. The loop's "did we do work" answer is
-            // `consumed` above; this is the operator-facing number,
-            // beside every other lane's.
-            self.tables_dispatched = self.tables_dispatched.wrapping_add(1);
         }
 
         // --- AI command lane (Phase 8f §4.3) ---
@@ -1148,16 +1145,6 @@ impl LifecycleCounters {
             modifies_err: 0,
         }
     }
-
-    /// Verbs this boot performed, of either kind.
-    ///
-    /// Counts the `_ok` halves only: a refused verb changed nothing
-    /// and appended nothing.
-    #[inline]
-    #[must_use]
-    pub const fn performed(&self) -> u64 {
-        self.cancels_ok.saturating_add(self.modifies_ok)
-    }
 }
 
 /// Map a dispatcher error onto the strategy-facing one.
@@ -1236,6 +1223,10 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
         match self.disp.cancel(&req) {
             Ok(()) => {
                 self.lifecycle.cancels_ok = self.lifecycle.cancels_ok.wrapping_add(1);
+                // COPY: a 64 B Order synthesised from a 24 B CancelReq —
+                // there is no Order to borrow; the record does not
+                // exist until this builds it. Then the two designed
+                // slot copies: the capture stage and the /state ring.
                 let rec = req.as_record();
                 if let Some(cap) = self.order_capture.as_deref_mut() {
                     cap.append(&rec);
@@ -1264,11 +1255,15 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
         match self.disp.modify(&req) {
             Ok(()) => {
                 self.lifecycle.modifies_ok = self.lifecycle.modifies_ok.wrapping_add(1);
-                let rec = req.as_record();
+                // The replacement IS the record (the verb and the
+                // previous id are stamped on it): borrowed straight
+                // into the capture, no intermediate `Order` copy.
+                // COPY: one 64 B POD into the capture stage and the
+                // /state ring — the designed publish copies.
                 if let Some(cap) = self.order_capture.as_deref_mut() {
-                    cap.append(&rec);
+                    cap.append(req.order());
                 }
-                self.recent_orders.push(rec);
+                self.recent_orders.push(*req.order());
                 Ok(())
             }
             Err(e) => {
@@ -3038,7 +3033,6 @@ mod tests {
         assert_eq!(lc.modifies_err, 1);
         assert_eq!(lc.cancels_ok, 0);
         assert_eq!(lc.modifies_ok, 0);
-        assert_eq!(lc.performed(), 0);
         assert_eq!(recent.total, 0, "nothing happened, so nothing is recorded");
     }
 

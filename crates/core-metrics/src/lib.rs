@@ -20,7 +20,7 @@
 //!
 //! ## Capacity
 //!
-//! `MAX_COUNTERS = 256` / `MAX_GAUGES = 384` (Phase 8a headroom for
+//! `MAX_COUNTERS = 512` / `MAX_GAUGES = 384` (Phase 8a headroom for
 //! five venues' loss-accounting counters and per-bucket gauges).
 //! Still fixed arrays, still lock-free; raising further is a const
 //! change + recompile.

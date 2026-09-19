@@ -107,3 +107,5 @@ claude-worker/tools_*.sh
 # by `make license-deps` but must be committed: it has to ship beside every
 # distributed binary, and an ignored file is one that can be missing at
 # release time. Regenerate it, never hand-edit it.
+
+Claude outputs

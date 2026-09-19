@@ -3925,7 +3925,7 @@ pub struct EngineCounters {
 /// E1: the execution router's metric family. Boot-only.
 ///
 /// `core-metrics` registers FIXED names — there is no label mechanism
-/// (`MAX_COUNTERS = 256`, `MAX_GAUGES = 384`, `NAME_MAX = 63`), so the
+/// (`MAX_COUNTERS = 512` since E7 — 256 before —, `MAX_GAUGES = 384`, `NAME_MAX = 63`), so the
 /// per-slot names are generated as whole strings at boot, one
 /// `register_counter` call each, and never formatted again. The
 /// per-slot family is registered for LIVE slots ONLY: an all-paper
@@ -3942,12 +3942,17 @@ pub struct ExecMetricIds {
     /// `engine_exec_refused_off_total`
     pub refused_off: core_metrics::CounterId,
     /// `engine_exec_refused_risk_total` (E6) — requests the RISK GATE
-    /// refused: the notional exceeded the slot's operator-set
-    /// `max_order_usd`. **Should stay 0** — bin15 sizes against its
-    /// own caps, so a non-zero value means the member's ledger and
-    /// the operator's number disagreed, which is the alarm this gate
-    /// exists to raise.
+    /// refused, ALL six reasons summed (max_order, cap_instance,
+    /// cap_day, open_orders, unseeded, halted). Only the max_order
+    /// share means "the member's ledger and the operator's number
+    /// disagreed"; the rest are the clamp working. An alert belongs on
+    /// the router's `refused_max_order` (in `/state`), not here.
     pub refused_risk: core_metrics::CounterId,
+    /// `engine_exec_cancel_on_off_total` (E7) — cancels that reached
+    /// the live arm from an `Off` slot. Not a refusal; an `off` slot
+    /// that is cancelling is an `off` slot that still had orders at
+    /// the venue.
+    pub cancel_on_off: core_metrics::CounterId,
     /// `engine_exec_refused_no_route_total` — **the LAW E-1 counter.**
     /// A live slot's order that named a venue with no route. Must stay
     /// 0; anything else is a routing bug, and the order was refused
@@ -3975,6 +3980,23 @@ pub struct ExecMetricIds {
     /// been reconciled. A boot stuck at 0 is a boot not trading, and
     /// nothing else says so in one glance.
     pub seeded: GaugeId,
+    /// **E7 — the ledger's alarms**, `engine_exec_ledger_*_total`. All
+    /// six should stay 0: `fills_unbound` = the risk gate stopped
+    /// seeing a real position; `sells_below_zero` = the router and the
+    /// venue disagree; `resting_full` = `max_open_orders` ratcheting
+    /// toward permanent refusal; `resting_ambiguous` = open-order
+    /// tracking broke; `binds_refused` / `settles_unmatched` = a roll
+    /// the ledger could not take.
+    pub ledger: [core_metrics::CounterId; 6],
+    /// **E7 — the live arm**, `engine_exec_hl_*`. Counters in the
+    /// order of [`LIVE_ARM_COUNTER_NAMES`]; `budget_remaining` is the
+    /// one gauge (`engine_exec_hl_budget_remaining`).
+    pub arm: [core_metrics::CounterId; LIVE_ARM_COUNTER_NAMES.len()],
+    /// `engine_exec_hl_budget_remaining` (gauge) — the address request
+    /// budget's headroom. At or below `request_budget_floor` the arm
+    /// refuses every submit and the halt machine latches
+    /// `budget-floor`.
+    pub budget_remaining: GaugeId,
     /// Index = slot. `Some` only for LIVE slots — a paper or off slot
     /// costs no metric names at all (plan §3.5).
     ///
@@ -4587,10 +4609,11 @@ pub struct PaperMatcherMetricIds {
     /// answers to. **Must stay 0**: it means a member reused a client
     /// id while the first order was still resting.
     pub ambiguous_order: core_metrics::CounterId,
-    /// `engine_lifecycle_cancels_ok_total` (E5). **Non-zero means
-    /// this boot's `engine-orders.pmlr` is no longer replayable** —
-    /// the capture has no record type for a cancel. Same for
-    /// `modifies_ok`.
+    /// `engine_lifecycle_cancels_ok_total` (E5). Cancels ARE on the
+    /// tape since E5 commit 4a: every lifecycle verb is captured as an
+    /// `Order` row with `Order.verb` set (`docs/migration.md`), so a
+    /// non-zero count here is a normal event, not a replay hazard.
+    /// Same for `modifies_ok`.
     pub lifecycle_cancels_ok: core_metrics::CounterId,
     /// `engine_lifecycle_cancels_err_total` (E5).
     pub lifecycle_cancels_err: core_metrics::CounterId,
@@ -4657,6 +4680,87 @@ fn register_paper_matcher_metrics(
 /// no label mechanism, so `engine_exec_slot3_mode` is a whole name
 /// registered once, not `engine_exec_slot_mode{slot="3"}`. Only LIVE
 /// slots get a per-slot family (plan §3.5): today that is at most one.
+/// The ledger rows of the exec family, in `ExecMetricIds::ledger`
+/// order.
+const LEDGER_COUNTER_NAMES: [&str; 6] = [
+    "engine_exec_ledger_fills_unbound_total",
+    "engine_exec_ledger_sells_below_zero_total",
+    "engine_exec_ledger_binds_refused_total",
+    "engine_exec_ledger_resting_full_total",
+    "engine_exec_ledger_resting_ambiguous_total",
+    "engine_exec_ledger_settles_unmatched_total",
+];
+
+/// The live-arm rows of the exec family, in `ExecMetricIds::arm`
+/// order — one per `clob_dispatcher::LiveArmCounters` counter field,
+/// mirrored by [`live_arm_counter_values`], which is what pins the two
+/// together.
+const LIVE_ARM_COUNTER_NAMES: [&str; 24] = [
+    "engine_exec_hl_submitted_total",
+    "engine_exec_hl_rejected_total",
+    "engine_exec_hl_refused_local_total",
+    "engine_exec_hl_refused_stale_total",
+    "engine_exec_hl_sent_unanswered_total",
+    "engine_exec_hl_fills_booked_total",
+    "engine_exec_hl_fills_unresolved_total",
+    "engine_exec_hl_fills_foreign_total",
+    "engine_exec_hl_fills_dropped_total",
+    "engine_exec_hl_fills_refused_total",
+    "engine_exec_hl_fills_scan_failed_total",
+    "engine_exec_hl_fills_unowned_total",
+    "engine_exec_hl_recon_ok_total",
+    "engine_exec_hl_recon_failed_total",
+    "engine_exec_hl_recon_drift_legs_total",
+    "engine_exec_hl_recon_unseen_legs_total",
+    "engine_exec_hl_sweep_left_total",
+    "engine_exec_hl_sweep_stalled_total",
+    "engine_exec_hl_cancel_all_unqueued_total",
+    "engine_exec_hl_ws_reconnects_total",
+    "engine_exec_hl_ws_connect_failures_total",
+    "engine_exec_hl_rolls_bound_total",
+    "engine_exec_hl_rolls_refused_total",
+    "engine_exec_hl_owner_contested_total",
+];
+
+/// `LiveArmCounters`' counter fields in [`LIVE_ARM_COUNTER_NAMES`]
+/// order. `recon_drift_legs` and `recon_unseen_legs` are LEVELS at
+/// the last reconciliation, mirrored as monotonic counters like the
+/// bin15 dormant-families level is — a rising series means the
+/// comparisons keep disagreeing, and `/state` carries the level.
+// COPY: [u64; 24] (192 B) returned by value — cold, the 5 s /metrics
+// mirror; the struct's fields are visited once in the metric name order
+// and the array is what the registry's delta loop indexes — rejected:
+// an out-param, for 192 B five times a minute.
+#[inline]
+fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 24] {
+    [
+        a.submitted,
+        a.rejected,
+        a.refused_local,
+        a.refused_stale,
+        a.sent_unanswered,
+        a.fills_booked,
+        a.fills_unresolved,
+        a.fills_foreign,
+        a.fills_dropped,
+        a.fills_refused,
+        a.fills_scan_failed,
+        a.fills_unowned,
+        a.recon_ok,
+        a.recon_failed,
+        a.recon_drift_legs,
+        a.recon_unseen_legs,
+        a.sweep_left,
+        a.sweep_stalled,
+        a.cancel_all_unqueued,
+        a.ws_reconnects,
+        a.ws_connect_failures,
+        a.rolls_bound,
+        a.rolls_refused,
+        a.owner_contested,
+    ]
+}
+
 fn register_exec_metrics(
     reg: &mut core_metrics::MetricsRegistry,
     modes: &[u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
@@ -4677,9 +4781,21 @@ fn register_exec_metrics(
     let halts = one("engine_exec_halts_total")?;
     let cancel_all_failures = one("engine_exec_cancel_all_failures_total")?;
     let cancel_all_stranded = one("engine_exec_cancel_all_stranded_total")?;
+    let cancel_on_off = one("engine_exec_cancel_on_off_total")?;
+    let mut ledger = [core_metrics::CounterId::default(); 6];
+    for (i, name) in LEDGER_COUNTER_NAMES.iter().enumerate() {
+        ledger[i] = one(name)?;
+    }
+    let mut arm = [core_metrics::CounterId::default(); LIVE_ARM_COUNTER_NAMES.len()];
+    for (i, name) in LIVE_ARM_COUNTER_NAMES.iter().enumerate() {
+        arm[i] = one(name)?;
+    }
     let seeded = reg
         .register_gauge("engine_exec_seeded")
         .map_err(|_| "register engine_exec_seeded")?;
+    let budget_remaining = reg
+        .register_gauge("engine_exec_hl_budget_remaining")
+        .map_err(|_| "register engine_exec_hl_budget_remaining")?;
 
     let mut slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS] =
         [None; clob_dispatcher::EXEC_COUNTER_SLOTS];
@@ -4715,7 +4831,11 @@ fn register_exec_metrics(
         halts,
         cancel_all_failures,
         cancel_all_stranded,
+        cancel_on_off,
+        ledger,
+        arm,
         seeded,
+        budget_remaining,
         slots,
     })
 }
@@ -4749,6 +4869,33 @@ fn mirror_exec_metrics(
         .inc(cur.cancel_all_failures.saturating_sub(last.cancel_all_failures));
     reg.counter(ids.cancel_all_stranded)
         .inc(cur.cancel_all_stranded.saturating_sub(last.cancel_all_stranded));
+    reg.counter(ids.cancel_on_off)
+        .inc(cur.cancel_on_off.saturating_sub(last.cancel_on_off));
+    let led_cur = [
+        cur.ledger_fills_unbound,
+        cur.ledger_sells_below_zero,
+        cur.ledger_binds_refused,
+        cur.ledger_resting_full,
+        cur.ledger_resting_ambiguous,
+        cur.ledger_settles_unmatched,
+    ];
+    let led_last = [
+        last.ledger_fills_unbound,
+        last.ledger_sells_below_zero,
+        last.ledger_binds_refused,
+        last.ledger_resting_full,
+        last.ledger_resting_ambiguous,
+        last.ledger_settles_unmatched,
+    ];
+    for i in 0..6 {
+        reg.counter(ids.ledger[i]).inc(led_cur[i].saturating_sub(led_last[i]));
+    }
+    let arm_cur = live_arm_counter_values(&cur.arm);
+    let arm_last = live_arm_counter_values(&last.arm);
+    for i in 0..LIVE_ARM_COUNTER_NAMES.len() {
+        reg.counter(ids.arm[i]).inc(arm_cur[i].saturating_sub(arm_last[i]));
+    }
+    reg.gauge(ids.budget_remaining).set(cur.arm.budget_remaining);
     reg.gauge(ids.seeded).set(i64::from(cur.seeded));
     for (s, slot) in ids.slots.iter().enumerate() {
         let Some(slot) = slot else { continue };
@@ -5975,6 +6122,22 @@ fn fill_snapshot<S, D>(
     ex.cancel_all_failures = ec.cancel_all_failures;
     ex.cancel_all_stranded = ec.cancel_all_stranded;
     ex.halted = ec.halted;
+    // E7: the ledger's alarms and the live arm's numbers reach the
+    // surface an operator actually reads.
+    ex.ledger_fills_unbound = ec.ledger_fills_unbound;
+    ex.ledger_sells_below_zero = ec.ledger_sells_below_zero;
+    ex.ledger_resting_full = ec.ledger_resting_full;
+    ex.ledger_resting_ambiguous = ec.ledger_resting_ambiguous;
+    ex.arm_fills_booked = ec.arm.fills_booked;
+    ex.arm_fills_dropped = ec.arm.fills_dropped;
+    ex.arm_fills_unresolved = ec.arm.fills_unresolved;
+    ex.arm_sent_unanswered = ec.arm.sent_unanswered;
+    ex.arm_recon_ok = ec.arm.recon_ok;
+    ex.arm_recon_failed = ec.arm.recon_failed;
+    ex.arm_recon_drift_legs = ec.arm.recon_drift_legs;
+    ex.arm_recon_unseen_legs = ec.arm.recon_unseen_legs;
+    ex.arm_sweep_left = ec.arm.sweep_left;
+    ex.arm_budget_remaining = ec.arm.budget_remaining;
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -8851,6 +9014,13 @@ mod tests {
     /// registry's own `MAX_COUNTERS` assertion is what actually
     /// guards it; `Observability::build` panicking in every boot test
     /// is what would catch an overflow.
+    ///
+    /// E7 (2026-09-19): the exec family grew its ledger and live-arm
+    /// rows (≈ +30 counters) and `MAX_COUNTERS` went 256 → 512 rather
+    /// than land `RegErr::Full` on the first live boot. The
+    /// `the_exec_family_size_is_pinned` test in `exec_boot` counts
+    /// that family; the registry-wide number is re-measured on the
+    /// host at every ramp step.
     #[test]
     fn the_bin15_family_is_31_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();

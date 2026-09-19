@@ -417,8 +417,8 @@ impl Ledger {
     /// What the ledger had to refuse. Cold; `/metrics` and `/state`.
     #[inline]
     #[must_use]
-    pub const fn counters(&self) -> LedgerCounters {
-        self.counters
+    pub const fn counters(&self) -> &LedgerCounters {
+        &self.counters
     }
 
     // -----------------------------------------------------------------
@@ -616,7 +616,7 @@ impl Ledger {
         } else if epoch != self.day_epoch {
             self.day_epoch = epoch;
             self.day_turnover_1e6 = [0; EXEC_SLOTS];
-            self.counters.day_rollovers = self.counters.day_rollovers.wrapping_add(1);
+            self.counters.day_rollovers = self.counters.day_rollovers.saturating_add(1);
         }
     }
 
@@ -657,7 +657,7 @@ impl Ledger {
     /// binding table can use. Counted with the other refused binds.
     #[inline]
     pub fn refuse_roll(&mut self) {
-        self.counters.binds_refused = self.counters.binds_refused.wrapping_add(1);
+        self.counters.binds_refused = self.counters.binds_refused.saturating_add(1);
     }
 
     /// **LAW E-4 — bind a family's new instance from a roll event.**
@@ -680,12 +680,12 @@ impl Ledger {
     /// in another venue's namespace.
     pub fn bind(&mut self, venue: u8, family: usize, outcome: u32, sym_yes: SymbolId) {
         if outcome == 0 || sym_yes == SYMBOL_ID_NONE || family >= LEDGER_ROWS {
-            self.counters.binds_refused = self.counters.binds_refused.wrapping_add(1);
+            self.counters.binds_refused = self.counters.binds_refused.saturating_add(1);
             return;
         }
         let ord = core_types::symbol_ordinal(sym_yes);
         if ord >= core_types::SYMBOL_ORDINAL_MASK {
-            self.counters.binds_refused = self.counters.binds_refused.wrapping_add(1);
+            self.counters.binds_refused = self.counters.binds_refused.saturating_add(1);
             return;
         }
         let sym_no = sym_yes + 1;
@@ -697,6 +697,18 @@ impl Ledger {
         while i < LEDGER_ROWS {
             if self.rows[i].is_bound() {
                 if self.rows[i].family as usize == family && self.rows[i].venue == venue {
+                    // A REPEAT of the roll that is already live binds
+                    // nothing: the venue re-sends `outcomeCreated` on
+                    // a reconnect and the ingress dedups it, but this
+                    // ledger is the risk gate's memory and does not
+                    // get to rely on a layer above — retiring the row
+                    // here would zero a real position and drop its
+                    // resting orders under a flat reading (the guard
+                    // `settle` already has, applied to `bind`; E7
+                    // review 2026-09-19).
+                    if self.rows[i].outcome == outcome && self.rows[i].settled == 0 {
+                        return;
+                    }
                     self.retire_row(i, outcome, sym_yes, sym_no);
                     return;
                 }
@@ -706,7 +718,7 @@ impl Ledger {
             i += 1;
         }
         if free == LEDGER_ROWS {
-            self.counters.binds_refused = self.counters.binds_refused.wrapping_add(1);
+            self.counters.binds_refused = self.counters.binds_refused.saturating_add(1);
             return;
         }
         self.rows[free] = FamilyRow {
@@ -721,7 +733,7 @@ impl Ledger {
             pos_no_1e6: [0; EXEC_SLOTS],
             _pad: [0; 48],
         };
-        self.counters.binds = self.counters.binds.wrapping_add(1);
+        self.counters.binds = self.counters.binds.saturating_add(1);
     }
 
     /// **The instance this family held has SETTLED.**
@@ -762,8 +774,7 @@ impl Ledger {
     pub fn settle(&mut self, venue: u8, family: usize, outcome: u32) {
         let _ = family;
         if outcome == 0 {
-            self.counters.settles_unmatched =
-                self.counters.settles_unmatched.wrapping_add(1);
+            self.counters.settles_unmatched = self.counters.settles_unmatched.saturating_add(1);
             return;
         }
         let mut target = LEDGER_ROWS;
@@ -777,8 +788,7 @@ impl Ledger {
             i += 1;
         }
         if target == LEDGER_ROWS {
-            self.counters.settles_unmatched =
-                self.counters.settles_unmatched.wrapping_add(1);
+            self.counters.settles_unmatched = self.counters.settles_unmatched.saturating_add(1);
             return;
         }
         if self.rows[target].settled == 1 {
@@ -787,7 +797,7 @@ impl Ledger {
         let (y, n) = (self.rows[target].sym_yes, self.rows[target].sym_no);
         self.drop_resting_on(y, n);
         self.rows[target].settled = 1;
-        self.counters.instances_cleared = self.counters.instances_cleared.wrapping_add(1);
+        self.counters.instances_cleared = self.counters.instances_cleared.saturating_add(1);
     }
 
     /// Re-point a bound row at a new instance's legs, clearing what
@@ -807,16 +817,18 @@ impl Ledger {
         self.rows[i].settled = 0;
         self.rows[i].pos_yes_1e6 = [0; EXEC_SLOTS];
         self.rows[i].pos_no_1e6 = [0; EXEC_SLOTS];
-        self.counters.instances_cleared = self.counters.instances_cleared.wrapping_add(1);
-        self.counters.binds = self.counters.binds.wrapping_add(1);
+        self.counters.instances_cleared = self.counters.instances_cleared.saturating_add(1);
+        self.counters.binds = self.counters.binds.saturating_add(1);
     }
 
     fn drop_resting_on(&mut self, sym_yes: SymbolId, sym_no: SymbolId) {
         let mut j = 0usize;
         while j < LEDGER_RESTING {
-            let r = self.resting[j];
+            // Three fields read before `release` mutates the row — a
+            // reference would hold `self` across that call.
+            let (live, sym) = (self.resting[j].live, self.resting[j].sym);
             j += 1;
-            if r.live == 0 || (r.sym != sym_yes && r.sym != sym_no) {
+            if live == 0 || (sym != sym_yes && sym != sym_no) {
                 continue;
             }
             self.release(j - 1);
@@ -842,8 +854,7 @@ impl Ledger {
 
         let slot = fill.strategy_id as usize;
         if slot >= EXEC_SLOTS {
-            self.counters.fills_unattributed =
-                self.counters.fills_unattributed.wrapping_add(1);
+            self.counters.fills_unattributed = self.counters.fills_unattributed.saturating_add(1);
             return;
         }
         let qty = fill.qty.raw();
@@ -884,7 +895,7 @@ impl Ledger {
             break;
         }
         if !placed {
-            self.counters.fills_unbound = self.counters.fills_unbound.wrapping_add(1);
+            self.counters.fills_unbound = self.counters.fills_unbound.saturating_add(1);
         }
         // **Counted on a settled row too**, and that is deliberate.
         //
@@ -904,8 +915,7 @@ impl Ledger {
         // it is the single most informative moment to hear about it.
         // The guard would have swallowed exactly that.
         if below_zero {
-            self.counters.sells_below_zero =
-                self.counters.sells_below_zero.wrapping_add(1);
+            self.counters.sells_below_zero = self.counters.sells_below_zero.saturating_add(1);
         }
 
         // ---- turnover -------------------------------------------------
@@ -924,13 +934,18 @@ impl Ledger {
         // reachable for one — which is exactly why it is guarded
         // rather than assumed.
         if buy && !on_settled_row {
-            let notional_1e6 =
-                ((fill.px.raw() as i128).saturating_mul(qty as i128) / 1_000_000) as i64;
+            // `i128` product, then a SATURATING narrow — `as i64` would
+            // wrap a product past ~9.2e18 negative and let the day cap
+            // read a spend as a refund.
+            let notional_1e6 = i64::try_from(
+                (fill.px.raw() as i128).saturating_mul(qty as i128) / 1_000_000,
+            )
+            .unwrap_or(i64::MAX);
             self.day_turnover_1e6[slot] =
                 self.day_turnover_1e6[slot].saturating_add(notional_1e6);
         }
 
-        self.counters.fills_booked = self.counters.fills_booked.wrapping_add(1);
+        self.counters.fills_booked = self.counters.fills_booked.saturating_add(1);
 
         // ---- resting --------------------------------------------------
         self.consume_resting(fill.order_id, slot, qty);
@@ -939,32 +954,19 @@ impl Ledger {
     /// Decrement the resting order this fill belongs to, retiring it
     /// when nothing is left.
     fn consume_resting(&mut self, client_oid: u64, slot: usize, qty: i64) {
-        let mut found = LEDGER_RESTING;
-        let mut n = 0usize;
-        let mut i = 0usize;
-        while i < LEDGER_RESTING {
-            let r = self.resting[i];
-            if r.live == 1 && r.client_oid == client_oid && r.slot as usize == slot {
-                n += 1;
-                if found == LEDGER_RESTING {
-                    found = i;
-                }
+        // ONE lookup rule — `find` — not a second copy of the scan.
+        // Two rows under one key is a guess, and a guess that retires
+        // the wrong order makes the NEXT fill unmatched too: `find`
+        // counts it and this leaves the table alone.
+        let found = match self.find(client_oid, slot) {
+            Found::None => {
+                self.counters.resting_unmatched =
+                    self.counters.resting_unmatched.saturating_add(1);
+                return;
             }
-            i += 1;
-        }
-        if n == 0 {
-            self.counters.resting_unmatched =
-                self.counters.resting_unmatched.wrapping_add(1);
-            return;
-        }
-        if n > 1 {
-            // Two rows under one key. Decrementing an arbitrary one is
-            // a guess, and a guess that retires the wrong order makes
-            // the NEXT fill unmatched too. Left alone and counted.
-            self.counters.resting_ambiguous =
-                self.counters.resting_ambiguous.wrapping_add(1);
-            return;
-        }
+            Found::Many => return,
+            Found::One(i) => i,
+        };
         let rem = self.resting[found].remaining_1e6.saturating_sub(qty);
         if rem <= 0 {
             self.release(found);
@@ -1014,7 +1016,7 @@ impl Ledger {
             // orders this ledger never saw, which is a disagreement
             // with the venue that `resting_full` is now the tell
             // for — not a configuration error.
-            self.counters.resting_full = self.counters.resting_full.wrapping_add(1);
+            self.counters.resting_full = self.counters.resting_full.saturating_add(1);
             self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
             return;
         }
@@ -1112,7 +1114,9 @@ impl Ledger {
         let mut n = 0usize;
         let mut i = 0usize;
         while i < LEDGER_RESTING {
-            let r = self.resting[i];
+            // By reference: 24 B × 512 rows per venue fill would be a
+            // 12 KiB memcpy for a three-field compare.
+            let r = &self.resting[i];
             if r.live == 1 && r.client_oid == client_oid && r.slot as usize == slot {
                 n += 1;
                 if found == LEDGER_RESTING {
@@ -1123,7 +1127,7 @@ impl Ledger {
         }
         if n > 1 {
             self.counters.resting_ambiguous =
-                self.counters.resting_ambiguous.wrapping_add(1);
+                self.counters.resting_ambiguous.saturating_add(1);
             return Found::Many;
         }
         if n == 0 {
@@ -1297,6 +1301,24 @@ mod tests {
             "cap_instance means THIS instance"
         );
         assert_eq!(l.counters().instances_cleared, 1);
+    }
+
+    /// **A repeated CREATED frame for the LIVE instance binds nothing.**
+    /// The venue re-sends `outcomeCreated` on a reconnect; the ledger
+    /// must not zero a real position on it.
+    #[test]
+    fn a_repeated_created_frame_for_the_live_instance_keeps_the_position() {
+        let mut l = bound();
+        l.book_fill(&fill(T0, sym(100), true, 900_000, 5_000_000, 1));
+        assert_eq!(l.slot_exposure_1e6(SLOT), 5_000_000);
+        let cleared = l.counters().instances_cleared;
+        l.bind(VENUE, FAM, 20_182, sym(100));
+        assert_eq!(l.slot_exposure_1e6(SLOT), 5_000_000, "a repeat is not a roll");
+        assert_eq!(l.counters().instances_cleared, cleared);
+        // The SUCCESSOR still rolls the row.
+        l.bind(VENUE, FAM, 20_183, sym(200));
+        assert_eq!(l.slot_exposure_1e6(SLOT), 0);
+        assert_eq!(l.counters().instances_cleared, cleared + 1);
     }
 
     /// **A settle drops the orders and keeps everything else.**

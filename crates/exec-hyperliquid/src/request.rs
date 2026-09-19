@@ -45,6 +45,13 @@ impl<'a> Json<'a> {
         Self { buf, len: 0 }
     }
 
+    /// Continue writing at `len` — bytes before it are already the
+    /// caller's and are not touched.
+    #[inline(always)]
+    fn at(buf: &'a mut [u8], len: usize) -> Self {
+        Self { buf, len }
+    }
+
     #[inline(always)]
     fn put(&mut self, bytes: &[u8]) -> Result<(), MsgPackErr> {
         let end = self
@@ -54,6 +61,11 @@ impl<'a> Json<'a> {
         if end > self.buf.len() {
             return Err(MsgPackErr::Overflow);
         }
+        // COPY: the JSON renderer's own write — literals and ≤ 24 B
+        // rendered numbers into the request body IN PLACE (behind the
+        // envelope head, `envelope_open`). As with `msgpack::put_all`,
+        // the body must exist contiguously once; it is written here
+        // and read by the TLS layer, with no staging buffer between.
         self.buf[self.len..end].copy_from_slice(bytes);
         self.len = end;
         Ok(())
@@ -203,21 +215,39 @@ pub fn batch_modify_json(dst: &mut [u8], modifies: &[ModifyWire]) -> Result<usiz
     Ok(j.len)
 }
 
-/// Wrap an already-encoded JSON action with its nonce and signature.
+/// **Open the request envelope in place.** Writes `{"action":` at the
+/// start of `dst` and returns the offset at which the caller renders
+/// the action JSON DIRECTLY into `dst` (`order_json(&mut dst[n..], …)`
+/// and friends), so the body is built once. The first cut rendered
+/// the action into a 4 KiB scratch and copied it into the body — a
+/// staging copy on every order, cancel and requote (E7 zero-copy
+/// review, 2026-09-19). Close with [`envelope_close`].
+#[inline(always)]
+pub fn envelope_open(dst: &mut [u8]) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"action\":")?;
+    Ok(j.len)
+}
+
+/// **Close the envelope.** The action JSON occupies
+/// `dst[..action_end]` (head included); this appends the nonce, the
+/// signature and the optional siblings and returns the body length.
 ///
-/// `action_json` must describe the SAME action whose msgpack was
-/// signed — see the module note on why.
-pub fn envelope(
+/// The action rendered into `dst` must describe the SAME action whose
+/// msgpack was signed — see the module note on why.
+#[inline(always)]
+pub fn envelope_close(
     dst: &mut [u8],
-    action_json: &[u8],
+    action_end: usize,
     nonce: u64,
     sig: &[u8; 65],
     vault: Option<&[u8; 20]>,
     expires_after: Option<u64>,
 ) -> Result<usize, MsgPackErr> {
-    let mut j = Json::new(dst);
-    j.put(b"{\"action\":")?;
-    j.put(action_json)?;
+    if action_end > dst.len() {
+        return Err(MsgPackErr::Overflow);
+    }
+    let mut j = Json::at(dst, action_end);
     j.put(b",\"nonce\":")?;
     j.u64(nonce)?;
     j.put(b",\"signature\":{\"r\":")?;
@@ -241,6 +271,34 @@ pub fn envelope(
     }
     j.put(b"}")?;
     Ok(j.len)
+}
+
+/// Wrap an ALREADY-RENDERED JSON action with its nonce and signature.
+///
+/// The cold form for the operator probes (`exec-smoke`, `lifecycle`)
+/// and the vector self-test, which hold the action bytes separately
+/// to compare them. The live arm never calls this: it renders in place
+/// through [`envelope_open`] / [`envelope_close`]. One implementation —
+/// this is those two with a copy between them.
+pub fn envelope(
+    dst: &mut [u8],
+    action_json: &[u8],
+    nonce: u64,
+    sig: &[u8; 65],
+    vault: Option<&[u8; 20]>,
+    expires_after: Option<u64>,
+) -> Result<usize, MsgPackErr> {
+    let head = envelope_open(dst)?;
+    let end = head.checked_add(action_json.len()).ok_or(MsgPackErr::Overflow)?;
+    if end > dst.len() {
+        return Err(MsgPackErr::Overflow);
+    }
+    // COPY: the pre-rendered action JSON, ≤ MAX_ACTION, into the body —
+    // cold (probes and the offline self-test only); the live arm
+    // renders in place — rejected: nothing; the probes need the
+    // action bytes on their own to print and compare.
+    dst[head..end].copy_from_slice(action_json);
+    envelope_close(dst, end, nonce, sig, vault, expires_after)
 }
 
 #[cfg(test)]
@@ -377,5 +435,34 @@ mod tests {
             envelope(&mut tiny, b"{}", 1, &[0u8; 65], None, None),
             Err(MsgPackErr::Overflow)
         );
+        assert_eq!(
+            envelope_close(&mut tiny, 9, 1, &[0u8; 65], None, None),
+            Err(MsgPackErr::Overflow),
+            "an action_end past the buffer is a caller bug, refused"
+        );
+    }
+
+    /// The live arm's in-place render and the probes' copy-in form must
+    /// produce the same bytes — one envelope law, two entry points.
+    #[test]
+    fn the_in_place_envelope_is_byte_identical_to_the_copy_in_one() {
+        let mut sig = [0u8; 65];
+        sig[0] = 0xab;
+        sig[64] = 27;
+        let o = OrderWire::new(100_032_530, true, 45_670_000, 2_500_000_000, Tif::Ioc);
+        let vault = [0x12u8; 20];
+
+        let mut a = [0u8; MAX_ACTION];
+        let head = envelope_open(&mut a).unwrap();
+        let n = order_json(&mut a[head..], &[o], b"na").unwrap();
+        let a_len = envelope_close(&mut a, head + n, 7, &sig, Some(&vault), Some(9)).unwrap();
+
+        let mut aj = [0u8; MAX_ACTION];
+        let aj_n = order_json(&mut aj, &[o], b"na").unwrap();
+        let mut b = [0u8; MAX_ACTION];
+        let b_len = envelope(&mut b, &aj[..aj_n], 7, &sig, Some(&vault), Some(9)).unwrap();
+
+        assert_eq!(&a[..a_len], &b[..b_len]);
+        assert!(a[..a_len].starts_with(b"{\"action\":{\"type\":\"order\""));
     }
 }

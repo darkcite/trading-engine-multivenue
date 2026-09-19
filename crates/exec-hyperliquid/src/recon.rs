@@ -3,9 +3,12 @@
 
 //! Reconciliation against the venue's own books (plan §6.2).
 //!
-//! Once a minute the worker asks the venue what it thinks we hold, and
-//! compares that against what the engine believes. Drift beyond
-//! `halt_on_recon_drift_usd_1e6` halts the lane.
+//! Once a minute the arm asks the venue what it thinks we hold, and
+//! compares that against what it BOOKED. Drift is REPORTED — the worst
+//! magnitude, the leg count, and the venue-held legs the comparison
+//! never looked at — and the router's `halt_on_recon_drift_usd_1e6` /
+//! `halt_on_recon_stale_ms` decide what it is worth; a halt inferred
+//! here would be a policy this file invented.
 //!
 //! **This is the single most valuable safety net in the plan**, and
 //! the reason is structural rather than clever: it is the only check
@@ -40,7 +43,7 @@
 //! rather than a truncation: a position the caller never saw is a
 //! position that reconciles by not being there.
 
-use core_parse::{find_field, scan_price_1e8, skip_ws};
+use core_parse::{find_field, skip_ws};
 
 /// How many balance rows the reconciler must be able to hold.
 ///
@@ -62,6 +65,7 @@ pub const MAX_SPOT_BALANCES: usize = 256;
 // that must fail the build rather than a test run.
 const _: () = assert!(MAX_SPOT_BALANCES >= 14 * 4);
 
+use crate::json::{decimal_field, object_end, string_field};
 use crate::response::{ScanErr, Span};
 
 /// One row of the venue's spot balance sheet.
@@ -157,83 +161,6 @@ pub fn scan_spot_state(body: &[u8], out: &mut [SpotBalance]) -> Result<usize, Sc
         n += 1;
         i = obj_end;
     }
-}
-
-/// Find the byte just past the object starting at `start`.
-fn object_end(b: &[u8], start: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut i = start;
-    let mut in_str = false;
-    let mut esc = false;
-    while i < b.len() {
-        let c = b[i];
-        if in_str {
-            if esc {
-                esc = false;
-            } else if c == b'\\' {
-                esc = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-        } else {
-            match c {
-                b'"' => in_str = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// `"key":"value"` → the span of `value`.
-fn string_field(b: &[u8], key: &[u8]) -> Option<Span> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if i >= b.len() || b[i] != b'"' {
-        return None;
-    }
-    i += 1;
-    let start = i;
-    while i < b.len() && b[i] != b'"' {
-        if b[i] == b'\\' {
-            i += 1;
-        }
-        i += 1;
-    }
-    if i >= b.len() {
-        return None;
-    }
-    Some(Span {
-        start: start as u32,
-        end: i as u32,
-    })
-}
-
-/// `"key":"12.34"` → `1_234_000_000`. The venue quotes numbers as
-/// STRINGS; a bare number is accepted too rather than refused.
-fn decimal_field(b: &[u8], key: &[u8]) -> Option<i64> {
-    let p = find_field(b, key)?;
-    let mut i = skip_ws(b, p);
-    if i >= b.len() || b[i] != b':' {
-        return None;
-    }
-    i = skip_ws(b, i + 1);
-    if i < b.len() && b[i] == b'"' {
-        i += 1;
-    }
-    scan_price_1e8(b, i).map(|(v, _)| v)
 }
 
 // E6: `|yes − no|` moved to `core_types`. The risk gate in
@@ -451,6 +378,9 @@ pub fn open_orders_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, S
     if out.len() < n {
         return Err(ScanErr::Malformed);
     }
+    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's
+    // boot-owned body — the RENDER of the `/info` request (once per
+    // reconcile / sweep, ≥ seconds apart); the body must exist once.
     out[..HEAD.len()].copy_from_slice(HEAD);
     let mut i = HEAD.len();
     for b in master {
@@ -458,6 +388,7 @@ pub fn open_orders_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, S
         out[i + 1] = HEX[usize::from(b & 0x0F)];
         i += 2;
     }
+    // COPY: the 2 B closing literal of the same render.
     out[i..i + TAIL.len()].copy_from_slice(TAIL);
     Ok(n)
 }
@@ -620,6 +551,9 @@ pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, Sc
     if out.len() < n {
         return Err(ScanErr::Malformed);
     }
+    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's
+    // boot-owned body — the RENDER of the `/info` request (once per
+    // reconcile / sweep, ≥ seconds apart); the body must exist once.
     out[..HEAD.len()].copy_from_slice(HEAD);
     let mut i = HEAD.len();
     for b in master {
@@ -627,6 +561,7 @@ pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, Sc
         out[i + 1] = HEX[usize::from(b & 0x0F)];
         i += 2;
     }
+    // COPY: the 2 B closing literal of the same render.
     out[i..i + TAIL.len()].copy_from_slice(TAIL);
     Ok(n)
 }

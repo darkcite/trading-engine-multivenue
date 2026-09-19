@@ -6076,7 +6076,12 @@ fn hl_action_encode_sign() {
     );
 }
 
-/// Gate 54 (E3): the Hyperliquid exchange arm's per-order cycle.
+/// Gate 58 (E3): the Hyperliquid exchange arm's per-order cycle.
+///
+/// (Numbered 58 at the E7 review: the E3 session labelled this gate 54
+/// — a duplicate of E2's — and E4 then numbered its own 55–57 on top,
+/// so 58 was the label the sequence 53..62 was missing. The E3/E4
+/// session logs keep their original numbers; they are history.)
 ///
 /// `HlHttp::post` cannot be driven here without a server, and the TLS
 /// loopback test covers its behaviour. What CAN be pinned — and what
@@ -6209,7 +6214,7 @@ fn hl_user_fill_lane_is_zero_alloc() {
             }
             acc = acc.wrapping_add(f.coin.of(FILLS).len() as i64);
         }
-        budget.on_action_sent();
+        budget.on_action_sent(1);
         acc = acc.wrapping_add(budget.remaining());
 
         let n = scan_spot_state(STATE, &mut bal).unwrap();
@@ -6509,7 +6514,12 @@ fn hl_exchange_roll_hook_is_zero_alloc() {
 /// * `modify` runs with the budget's floor at `u64::MAX`, so
 ///   `send_action` refuses at its barrier BEFORE any network work —
 ///   the encode half runs, the post does not;
-/// * `seal` is called on its own with the bytes that verb produces.
+/// * `stage_modify` + `seal` then run the SAME encode half again and
+///   sign the bytes it produced, in the arm's own boot buffers. Since
+///   the E7 zero-copy pass the request body is rendered in place
+///   (`envelope_open` / action JSON / `envelope_close`), so there is
+///   no caller-side body buffer to hand in — and nothing here is a
+///   lookalike of the path that trades.
 ///
 /// Between them that is every instruction a requote executes on the
 /// engine thread.
@@ -6590,48 +6600,27 @@ fn hl_exchange_requote_path_is_zero_alloc() {
 
     // Prime: the first pass through the signing context and the
     // EIP-712 domain separator is boot, not the hot path.
-    let mut body = [0u8; exec_hyperliquid::http::MAX_REQ_BODY];
     let _ = x.modify(1 << 32 | u64::from(OUTCOME), &quote(470_000, 1));
     {
-        let mut mp = [0u8; exec_hyperliquid::action::MAX_ACTION];
-        let n = exec_hyperliquid::action::encode_order(
-            &mut mp,
-            &[exec_hyperliquid::action::OrderWire::new(
-                100_000_000,
-                true,
-                47_000_000,
-                100_000_000,
-                exec_hyperliquid::action::Tif::Alo,
-            )],
-            b"na",
-        )
-        .expect("warm encode");
-        let _ = x.seal(&mp[..n], b"{}", &mut body).expect("warm seal");
+        let (mp_n, end) = x
+            .stage_modify(1 << 32 | u64::from(OUTCOME), &quote(470_000, 1))
+            .expect("warm stage");
+        let _ = x.seal(mp_n, end).expect("warm seal");
     }
-
-    let mut mp = [0u8; exec_hyperliquid::action::MAX_ACTION];
-    let mpn = exec_hyperliquid::action::encode_order(
-        &mut mp,
-        &[exec_hyperliquid::action::OrderWire::new(
-            100_000_000,
-            true,
-            47_000_000,
-            100_000_000,
-            exec_hyperliquid::action::Tif::Alo,
-        )],
-        b"na",
-    )
-    .expect("encode");
 
     let g = AllocGuard::new();
     let mut sealed: u64 = 0;
     let mut i = 1u64;
     while i <= 2_000 {
         let prev = (i << 32) | u64::from(OUTCOME);
-        // LAW E-7: the requote itself, through the arm's own verb.
-        let _ = x.modify(prev, &quote(470_000 + (i as i64 % 50) * 100, i + 1));
-        // And the half `send_action` does after it, before the post.
-        let n = x.seal(&mp[..mpn], b"{}", &mut body).expect("seal");
+        let q = quote(470_000 + (i as i64 % 50) * 100, i + 1);
+        // LAW E-7: the requote itself, through the arm's own verb —
+        // refused at the budget barrier, after the encode half.
+        let _ = x.modify(prev, &q);
+        // And the half `send_action` does after the barrier, before
+        // the post: sign the bytes the encode half just rendered.
+        let (mp_n, end) = x.stage_modify(prev, &q).expect("stage");
+        let n = x.seal(mp_n, end).expect("seal");
         sealed = sealed.wrapping_add(n as u64);
         i += 1;
     }
@@ -7062,7 +7051,7 @@ fn routed_halt_idle_steady_state() {
             // router reads this, so `polls == TRIP_AT` is still the
             // last healthy poll of the steady-state window.
             let streak = if self.polls > TRIP_AT { 5 } else { 0 };
-            HaltSignal::new(1_000_000, 0, streak, 0, false, true)
+            HaltSignal::new(1_000_000, 0, streak, 0, false, true, 1_000_000)
         }
         fn cancel_all(&mut self) -> Result<(), DispatchError> {
             self.cancels += 1;
@@ -7091,7 +7080,7 @@ fn routed_halt_idle_steady_state() {
             ExecMode::Live,
             &[core_types::VenueId::Hyperliquid.to_u8()],
             SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
-            HaltLimits::new(5, 5_000_000, 30_000, 3),
+            HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
         )
         .expect("boot: slot 3 live");
     let mut d = RoutedDispatcher::new(

@@ -347,6 +347,9 @@ impl AssetTable {
                 s.prev_coin = s.coin;
                 s.prev_coin_len = s.coin_len;
                 s.coin = [0; COIN_MAX];
+                // COPY: ≤ COIN_MAX B coin name into the slot it will be
+                // matched from — the roll event's bytes die with the
+                // frame; the table is the owner. Once per roll (cold).
                 s.coin[..coin.len()].copy_from_slice(coin);
                 s.coin_len = coin.len() as u8;
                 s.asset = asset;
@@ -370,6 +373,7 @@ impl AssetTable {
                 s.sym = sym;
                 s.asset = asset;
                 s.instance = instance;
+                // COPY: as above — the first bind of a fresh slot.
                 s.coin[..coin.len()].copy_from_slice(coin);
                 s.coin_len = coin.len() as u8;
                 s.live = true;

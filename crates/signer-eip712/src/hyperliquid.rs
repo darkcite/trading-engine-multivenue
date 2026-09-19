@@ -37,7 +37,7 @@
 //! when set. That ordering is not guessable; it is mirrored from the
 //! SDK and pinned by the vectors in `crates/exec-hyperliquid`.
 
-use crate::{keccak256, SignError};
+use crate::{keccak256, keccak256_parts, SignError};
 
 /// EIP-712 domain name. Not Hyperliquid's brand — the literal string
 /// the venue's own signer uses.
@@ -63,51 +63,86 @@ const HL_DOMAIN_TYPE: &str =
 
 /// The domain separator. All inputs are compile-time constants, so the
 /// keccak is too — cached once, exactly as the Polymarket separator is.
+///
+/// Absorbed as PARTS (`keccak256_parts`): the five 32-byte words go
+/// into the sponge straight from where they already are, so there is
+/// no 160-byte preimage buffer to assemble first. Once per process
+/// either way; the shape is the point, because `agent_struct_hash`
+/// and `agent_eip712_hash` below are per-signature and use it too.
 #[inline]
 pub fn hl_domain_separator() -> [u8; 32] {
     static DS: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     *DS.get_or_init(|| {
-        let mut buf = [0u8; 32 * 5];
-        buf[0..32].copy_from_slice(&keccak256(HL_DOMAIN_TYPE.as_bytes()));
-        buf[32..64].copy_from_slice(&keccak256(HL_DOMAIN_NAME.as_bytes()));
-        buf[64..96].copy_from_slice(&keccak256(HL_DOMAIN_VERSION.as_bytes()));
-        // uint256 chainId, big-endian right-aligned in 32 bytes.
-        buf[96..128].fill(0);
-        buf[120..128].copy_from_slice(&HL_CHAIN_ID.to_be_bytes());
-        // address, right-aligned in 32 bytes.
-        buf[128..160].fill(0);
-        buf[172 - 32..160].copy_from_slice(&HL_VERIFYING_CONTRACT);
-        keccak256(&buf)
+        // uint256 chainId, big-endian right-aligned in 32 bytes;
+        // address, right-aligned in 32 bytes (the low 20 of the 32).
+        // COPY: 8 B + 20 B into two zero-padded 32 B EIP-712 words —
+        // the encoding IS the padding; once per process (cached).
+        let mut chain = [0u8; 32];
+        chain[24..32].copy_from_slice(&HL_CHAIN_ID.to_be_bytes());
+        let mut contract = [0u8; 32];
+        contract[12..32].copy_from_slice(&HL_VERIFYING_CONTRACT);
+        keccak256_parts(&[
+            &keccak256(HL_DOMAIN_TYPE.as_bytes()),
+            &keccak256(HL_DOMAIN_NAME.as_bytes()),
+            &keccak256(HL_DOMAIN_VERSION.as_bytes()),
+            &chain,
+            &contract,
+        ])
     })
 }
 
-/// `hashStruct(Agent)` = keccak(typehash ‖ keccak(source) ‖ connectionId).
+/// `keccak(HL_AGENT_TYPE)` — a constant, hashed once. The first cut
+/// recomputed it on EVERY signature (one full keccak permutation per
+/// order for a value that never changes).
 #[inline]
-pub fn agent_struct_hash(source: &[u8], connection_id: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 32 * 3];
-    buf[0..32].copy_from_slice(&keccak256(HL_AGENT_TYPE.as_bytes()));
-    // `string` is encoded as the keccak of its bytes.
-    buf[32..64].copy_from_slice(&keccak256(source));
-    // `bytes32` is encoded verbatim.
-    buf[64..96].copy_from_slice(connection_id);
-    keccak256(&buf)
+fn hl_agent_typehash() -> &'static [u8; 32] {
+    static T: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    T.get_or_init(|| keccak256(HL_AGENT_TYPE.as_bytes()))
 }
 
-/// The digest Hyperliquid expects a signature over.
+/// `keccak(source)` for the two sources that exist, hashed once each
+/// — the same per-signature saving as [`hl_agent_typehash`]. Any other
+/// `source` (tests) is hashed on the spot, so the function stays total
+/// and the vectors stay the authority on what a digest is.
+#[inline]
+fn hl_source_hash(source: &[u8]) -> [u8; 32] {
+    static A: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    static B: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    if source == HL_SOURCE_MAINNET {
+        *A.get_or_init(|| keccak256(HL_SOURCE_MAINNET))
+    } else if source == HL_SOURCE_TESTNET {
+        *B.get_or_init(|| keccak256(HL_SOURCE_TESTNET))
+    } else {
+        keccak256(source)
+    }
+}
+
+/// `hashStruct(Agent)` = keccak(typehash ‖ keccak(source) ‖ connectionId).
+///
+/// Per signature. Zero-copy: the three words are absorbed from where
+/// they live (a cached static, a cached static, the caller's array) —
+/// no 96-byte preimage is assembled.
+#[inline]
+pub fn agent_struct_hash(source: &[u8], connection_id: &[u8; 32]) -> [u8; 32] {
+    // `string` is encoded as the keccak of its bytes; `bytes32`
+    // verbatim.
+    keccak256_parts(&[hl_agent_typehash(), &hl_source_hash(source), connection_id])
+}
+
+/// The digest Hyperliquid expects a signature over:
+/// `keccak(0x19 0x01 ‖ domainSeparator ‖ hashStruct(Agent))`.
 ///
 /// `source` is [`HL_SOURCE_MAINNET`] or [`HL_SOURCE_TESTNET`] — a
 /// parameter, never a default, because the wrong one rejects every
 /// order.
+///
+/// Per signature, zero-copy as [`agent_struct_hash`]: the 2-byte
+/// prefix is a literal and the two hashes are absorbed in place.
 #[inline]
 pub fn agent_eip712_hash(source: &[u8], connection_id: &[u8; 32]) -> [u8; 32] {
     let ds = hl_domain_separator();
     let sh = agent_struct_hash(source, connection_id);
-    let mut buf = [0u8; 2 + 32 + 32];
-    buf[0] = 0x19;
-    buf[1] = 0x01;
-    buf[2..34].copy_from_slice(&ds);
-    buf[34..66].copy_from_slice(&sh);
-    keccak256(&buf)
+    keccak256_parts(&[&[0x19, 0x01], &ds, &sh])
 }
 
 /// One-shot: digest + sign, returning the 65-byte `r‖s‖v`.

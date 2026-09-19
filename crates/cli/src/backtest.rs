@@ -1492,6 +1492,16 @@ impl BacktestCtx {
     pub fn max_order_notional_1e6(&self) -> i64 {
         self.max_order_notional_1e6
     }
+
+    /// Fold one order's notional into the running max.
+    /// notional = px × qty / 1e6, exact in i128, floored like the vm's
+    /// own sizing arithmetic.
+    fn note_notional(&mut self, order: &Order) {
+        let notional_1e6 = ((order.px.raw() as i128 * order.qty.raw() as i128) / 1_000_000) as i64;
+        if notional_1e6 > self.max_order_notional_1e6 {
+            self.max_order_notional_1e6 = notional_1e6;
+        }
+    }
 }
 
 impl Default for BacktestCtx {
@@ -1502,12 +1512,7 @@ impl Default for BacktestCtx {
 
 impl Ctx for BacktestCtx {
     fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
-        // notional = px × qty / 1e6, exact in i128, floored like the
-        // vm's own sizing arithmetic.
-        let notional_1e6 = ((order.px.raw() as i128 * order.qty.raw() as i128) / 1_000_000) as i64;
-        if notional_1e6 > self.max_order_notional_1e6 {
-            self.max_order_notional_1e6 = notional_1e6;
-        }
+        self.note_notional(&order);
         self.orders.push(order);
         self.places += 1;
         Ok(())
@@ -1535,12 +1540,17 @@ impl Ctx for BacktestCtx {
     /// E5, LAW E-7. Same contract as `cancel`; the record is the
     /// stamped replacement, never a second place.
     ///
-    /// Does NOT move `max_order_notional_1e6`: that bound is about
-    /// how much the member ever put at risk in one order, and a
-    /// reprice of a resting order is the same order at a new price,
-    /// not an additional one. A modify that RAISES size is the case
-    /// to revisit if that bound is ever load-bearing for a gate.
+    /// DOES move `max_order_notional_1e6` (E7 review): that bound is
+    /// "the most the member ever put at risk in ONE order", and a
+    /// modify that raises price or size puts more at risk in that
+    /// order than the place did. The live risk gate (E6) clamps every
+    /// modify against `max_order_notional` exactly as it clamps a
+    /// place; a harness that measured only places would report a
+    /// bound the gate would then refuse. It is a max, so a modify that
+    /// shrinks the order moves nothing, and `places` is untouched — a
+    /// reprice is not an additional order.
     fn modify(&mut self, prev_client_oid: u64, order: Order) -> Result<(), SubmitErr> {
+        self.note_notional(&order);
         self.orders
             .push(core_types::ModifyReq::new(prev_client_oid, order).as_record());
         Ok(())
@@ -3609,5 +3619,39 @@ mod tests {
         ctx.submit(o(500_000, 10_000_000)).unwrap(); // $5
         assert_eq!(ctx.max_order_notional_1e6(), 50_000_000);
         assert_eq!(ctx.orders().len(), 2);
+        assert_eq!(ctx.places(), 2);
+    }
+
+    /// A requote that RAISES what one order puts at risk moves the
+    /// bound the live risk gate clamps against; one that shrinks it,
+    /// and a cancel, move nothing — and neither is a place.
+    #[test]
+    fn ctx_max_order_notional_follows_a_raising_modify_only() {
+        let mut ctx = BacktestCtx::new();
+        let o = |px: i64, qty: i64, oid: u64| {
+            Order::new(
+                VIRT_T0,
+                VenueId::Polymarket,
+                42,
+                core_types::Side::Bid,
+                0,
+                Price::from_raw(px),
+                Qty::from_raw(qty),
+                oid,
+            )
+        };
+        ctx.submit(o(500_000, 100_000_000, 1)).unwrap(); // $50
+        // Shrink: same price, a tenth of the size — no move.
+        ctx.modify(1, o(500_000, 10_000_000, 2)).unwrap(); // $5
+        assert_eq!(ctx.max_order_notional_1e6(), 50_000_000);
+        // Raise: twice the size at the same price — the bound follows.
+        ctx.modify(2, o(500_000, 200_000_000, 3)).unwrap(); // $100
+        assert_eq!(ctx.max_order_notional_1e6(), 100_000_000);
+        // A cancel carries no price or size and moves nothing.
+        ctx.cancel(core_types::CancelReq::new(VIRT_T0, VenueId::Polymarket, 42, 3))
+            .unwrap();
+        assert_eq!(ctx.max_order_notional_1e6(), 100_000_000);
+        assert_eq!(ctx.orders().len(), 4, "place + 2 modifies + cancel, one stream");
+        assert_eq!(ctx.places(), 1, "a reprice is not an additional order");
     }
 }

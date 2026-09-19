@@ -37,7 +37,10 @@ pub const MAX_ACTION: usize = 4096;
 /// Most orders in one batched action. The venue counts a batch of `n`
 /// as ONE IP request but `n` ADDRESS requests (§2.2), so batching
 /// helps the IP limit and not the address budget — there is no reason
-/// to make this large.
+/// to make this large. ENFORCED by every batch encoder (`Overflow`
+/// past it); the first cut declared it and read it nowhere, so the
+/// only bound on a batch was the 4 KiB buffer while the budget
+/// governor charged one request per POST.
 pub const MAX_ORDERS: usize = 16;
 
 /// Time-in-force. The mapping to `Order.kind` is fixed and exhaustive:
@@ -140,18 +143,13 @@ impl OrderWire {
 }
 
 /// Render a 16-byte cloid as `0x` + 32 lowercase hex, the venue's
-/// `Cloid.to_raw()` form.
+/// `Cloid.to_raw()` form. ONE renderer — [`crate::cloid::to_hex`] —
+/// for the signed msgpack and for the JSON body: the first cut carried
+/// a byte-for-byte duplicate here, the copy that ran inside the
+/// signature, so a fix to `to_hex` would not have reached it.
 #[inline(always)]
 fn render_cloid(raw: &[u8; 16], out: &mut [u8; 34]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    out[0] = b'0';
-    out[1] = b'x';
-    let mut i = 0usize;
-    while i < 16 {
-        out[2 + i * 2] = HEX[(raw[i] >> 4) as usize];
-        out[3 + i * 2] = HEX[(raw[i] & 0x0f) as usize];
-        i += 1;
-    }
+    let _ = crate::cloid::to_hex(raw, out);
 }
 
 /// Write one order wire. Keys: `a b p s r t [c]`.
@@ -195,6 +193,9 @@ pub fn encode_order(
     orders: &[OrderWire],
     grouping: &[u8],
 ) -> Result<usize, MsgPackErr> {
+    if orders.len() > MAX_ORDERS {
+        return Err(MsgPackErr::Overflow);
+    }
     let mut w = Writer::new(dst);
     w.map_header(3)?;
     w.str_bytes(b"type")?;
@@ -222,6 +223,9 @@ pub struct CancelWire {
 /// `{"type":"cancel","cancels":[{"a":…,"o":…}]}`
 #[inline]
 pub fn encode_cancel(dst: &mut [u8], cancels: &[CancelWire]) -> Result<usize, MsgPackErr> {
+    if cancels.len() > MAX_ORDERS {
+        return Err(MsgPackErr::Overflow);
+    }
     let mut w = Writer::new(dst);
     w.map_header(2)?;
     w.str_bytes(b"type")?;
@@ -256,6 +260,9 @@ pub fn encode_cancel_by_cloid(
     dst: &mut [u8],
     cancels: &[CancelByCloidWire],
 ) -> Result<usize, MsgPackErr> {
+    if cancels.len() > MAX_ORDERS {
+        return Err(MsgPackErr::Overflow);
+    }
     let mut w = Writer::new(dst);
     w.map_header(2)?;
     w.str_bytes(b"type")?;
@@ -299,6 +306,9 @@ pub struct ModifyWire {
 /// is the difference between fitting inside the address budget and not.
 #[inline]
 pub fn encode_batch_modify(dst: &mut [u8], modifies: &[ModifyWire]) -> Result<usize, MsgPackErr> {
+    if modifies.len() > MAX_ORDERS {
+        return Err(MsgPackErr::Overflow);
+    }
     let mut w = Writer::new(dst);
     w.map_header(2)?;
     w.str_bytes(b"type")?;
@@ -353,6 +363,18 @@ mod tests {
             core::str::from_utf8(&out).unwrap(),
             "0x4d56030000000000000000000000002a"
         );
+    }
+
+    #[test]
+    fn a_batch_past_max_orders_is_refused_not_encoded() {
+        let o = OrderWire::new(1, true, 50_000_000, 100_000_000, Tif::Gtc);
+        let ok = [o; MAX_ORDERS];
+        let over = [o; MAX_ORDERS + 1];
+        let mut dst = [0u8; MAX_ACTION];
+        assert!(encode_order(&mut dst, &ok, b"na").is_ok());
+        assert_eq!(encode_order(&mut dst, &over, b"na"), Err(MsgPackErr::Overflow));
+        let c = [CancelWire { asset: 1, oid: 2 }; MAX_ORDERS + 1];
+        assert_eq!(encode_cancel(&mut dst, &c), Err(MsgPackErr::Overflow));
     }
 
     #[test]

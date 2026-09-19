@@ -66,6 +66,8 @@ pub fn encode(strategy_id: u8, client_oid: u64) -> [u8; 16] {
     c[SLOT_BYTE] = strategy_id & (EXEC_SLOTS as u8 - 1);
     // Bytes 3..8 stay zero: reserved, and a non-zero one in a row we
     // receive is a cloid we did not write.
+    // COPY: 8 B big-endian oid into the 16 B cloid — POD assembly on
+    // the stack, one register move; the cloid is a value, not a view.
     c[OID_OFF..].copy_from_slice(&client_oid.to_be_bytes());
     c
 }
@@ -110,6 +112,8 @@ pub fn decode(cloid: &[u8; 16]) -> Owner {
         return Owner::Foreign;
     }
     let mut oid = [0u8; 8];
+    // COPY: 8 B out of the 16 B cloid for `from_be_bytes` — a register
+    // load; the alternative (`try_into`) is the same copy with a check.
     oid.copy_from_slice(&cloid[OID_OFF..]);
     Owner::Ours {
         strategy_id: slot,

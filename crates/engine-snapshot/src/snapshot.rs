@@ -444,7 +444,7 @@ impl<T: Copy, const N: usize> RecentRing<T, N> {
 /// `cli` sees both and pins them together — a silent divergence here
 /// would make `/state` name the wrong reason for a halt, which is the
 /// one field an operator reads it for.
-pub const HALT_REASON_WORDS: [&str; 7] = [
+pub const HALT_REASON_WORDS: [&str; 8] = [
     "none",
     "reject-streak",
     "budget-floor",
@@ -452,6 +452,7 @@ pub const HALT_REASON_WORDS: [&str; 7] = [
     "ws-gap",
     "asset-refusals",
     "operator",
+    "recon-stale",
 ];
 
 /// The word for a `HaltReason` byte, or `"unknown"` for one this
@@ -502,6 +503,40 @@ pub struct ExecSnapshot {
     /// **The stranded-quote number** (LAW E-8): polls on which the
     /// arm reported it had given up with the venue unconfirmed.
     pub cancel_all_stranded: u64,
+    /// **E7 — the ledger's alarms.** `fills_unbound` = the risk gate
+    /// stopped seeing a real position; `sells_below_zero` = the router
+    /// and the venue disagree; `resting_full` / `resting_ambiguous` =
+    /// open-order tracking is degrading. All four should read 0.
+    pub ledger_fills_unbound: u64,
+    /// See [`Self::ledger_fills_unbound`].
+    pub ledger_sells_below_zero: u64,
+    /// See [`Self::ledger_fills_unbound`].
+    pub ledger_resting_full: u64,
+    /// See [`Self::ledger_fills_unbound`].
+    pub ledger_resting_ambiguous: u64,
+    /// **E7 — the live arm.** Fills that reached the lane.
+    pub arm_fills_booked: u64,
+    /// Fills the lane could not take — a position the engine does
+    /// not know it has.
+    pub arm_fills_dropped: u64,
+    /// Fills whose coin no roll had bound.
+    pub arm_fills_unresolved: u64,
+    /// Actions that reached the wire and were never answered.
+    pub arm_sent_unanswered: u64,
+    /// Reconciliations that parsed / that did not.
+    pub arm_recon_ok: u64,
+    /// See [`Self::arm_recon_ok`].
+    pub arm_recon_failed: u64,
+    /// Legs that DISAGREED at the last reconciliation — a level.
+    pub arm_recon_drift_legs: u64,
+    /// Venue-held legs the last reconciliation never looked at — a
+    /// level; non-zero keeps `seeded` at 0.
+    pub arm_recon_unseen_legs: u64,
+    /// LAW E-8 sweeps abandoned with orders possibly resting.
+    pub arm_sweep_left: u64,
+    /// The address budget's remaining headroom (negative = past the
+    /// venue's cliff).
+    pub arm_budget_remaining: i64,
 }
 
 /// The whole snapshot — see the module docs and plan §6.1.

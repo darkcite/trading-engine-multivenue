@@ -6,6 +6,103 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — Real-execution lane E5–E7: `Order.verb`@42 + `prev_client_oid`@56, `Fill.flags`@15, `HaltSignal` 32 → 40 B, `ExecCounters` grows, `/state` `exec` gains `ledger_*`/`arm_*`, `exec.toml` gains a REQUIRED `halt_on_recon_stale_ms`, `core-metrics::MAX_COUNTERS` 256 → 512
+
+Recorded at the E7 review (2026-09-19); the E5/E6 phases landed the wire
+changes without an entry here. **No PMLR version bump** — every field is
+wire-additive into bytes that were explicit zeroed padding, and 0 is the
+meaning every pre-existing record already had.
+
+**What changed — on-disk (`engine-orders.pmlr`, `engine-fills.pmlr`)**
+
+- `Order.verb` at offset 42 (`u8`; E5 commit 4a): `0` PLACE / `1`
+  CANCEL / `2` MODIFY. Every Order captured before E5 reads `0`, which
+  is what every one of them was. `Order.prev_client_oid` at offset 56
+  (`u64`): the resting order a CANCEL / MODIFY acts on, `0` for a place.
+  A CANCEL record carries `px`, `qty`, `side`, `kind`, `client_oid` all
+  zero. **The capture IS replayable with cancels in it** — the harness
+  (`BacktestCtx`, `FillEngine`, `PaperMatcher`) consumes all three verbs
+  from ONE stream; a `cli/src/paper.rs` doc claiming otherwise was
+  corrected in this pass. `docs/wire-format.md` carries the byte map.
+- `Fill.flags` at offset 15 (`u8`; E4): bit 0 = `FILL_FLAG_SETTLEMENT`
+  (a venue settlement print, px 1.0 / 0.0). Pre-E4 fills read `0` = no
+  flags. `Fill.origin` (offset 14, `FILL_ORIGIN_VENUE` = 0) is unchanged.
+
+**What changed — in-process ABI (no file)**
+
+- `clob_dispatcher::HaltSignal` 32 → **40 B**: `recon_age_ns: u64`
+  appended (0 = no successful reconciliation yet — the "0 = no
+  observation" rule `ws_gap_ns` uses). `HaltSignal::new` takes 7 args.
+- `clob_dispatcher::ExecCounters` gains `cancel_on_off`, six
+  `ledger_*` counters and `arm: LiveArmCounters` (24 `u64` + a
+  `budget_remaining: i64`). `OrderDispatch::arm_counters()` is a new
+  trait method with a default (zeros); only `HlExchange` implements it.
+- `core_net::Transport::flush()` is a new trait method with a default
+  no-op; `TlsTransport` drains `write_tls` to `WouldBlock`.
+- `exec_router::HaltLimits::new` takes 5 args (`recon_stale_ms` last);
+  `HaltReason::ReconStale = 7` (`"recon-stale"` in `exec.HALT` and the
+  snapshot's `HALT_REASON_WORDS[7]`). `ExecRoute` stays 512 B (halts at
+  offset 256).
+- `core_metrics::MAX_COUNTERS` 256 → 512 (the fixed registry; the arm's
+  24 + the ledger's 6 counters did not fit).
+- `core_types::roll_kind_strict(seq) -> Option<bool>` — the ONE reader
+  of the roll kind byte; `0x03` and every other unknown kind is `None`
+  and refused by all three live consumers.
+
+**What changed — operator surfaces**
+
+- `~/multivenue/exec.toml`: `halt_on_recon_stale_ms` is a NEW key,
+  **REQUIRED non-zero on every `mode = "live"` slot** (example 300000).
+  A live slot without it REFUSES the boot — deliberate: an arm whose
+  reconciliation has gone stale must halt, and a config that cannot say
+  when is a config that never halts. `off` slots now let CANCELS through
+  to the arm (`cancel_on_off` counted); submits/modifies stay refused.
+- `/metrics`: `engine_exec_ledger_{fills_unbound,sells_below_zero,binds_refused,resting_full,resting_ambiguous,settles_unmatched}_total`;
+  `engine_exec_hl_{submitted,rejected,refused_local,refused_stale,sent_unanswered,fills_booked,fills_unresolved,fills_foreign,fills_dropped,fills_refused,fills_scan_failed,fills_unowned,recon_ok,recon_failed,recon_drift_legs,recon_unseen_legs,sweep_left,sweep_stalled,cancel_all_unqueued,ws_reconnects,ws_connect_failures,rolls_bound,rolls_refused,owner_contested}_total`;
+  gauge `engine_exec_hl_budget_remaining`.
+- `/state` `exec` object (additive, `"v": 1` untouched): `ledger_fills_unbound`,
+  `ledger_sells_below_zero`, `ledger_resting_full`, `ledger_resting_ambiguous`,
+  `arm_fills_booked`, `arm_fills_dropped`, `arm_fills_unresolved`,
+  `arm_sent_unanswered`, `arm_recon_ok`, `arm_recon_failed`,
+  `arm_recon_drift_legs`, `arm_recon_unseen_legs`, `arm_sweep_left`,
+  `arm_budget_remaining`.
+- Boot tells: `caps-ENFORCED order=$… open=… day=$… instance=$…` and
+  `HALTS reject_streak=… asset_refusals=… recon_drift=$… recon_stale_ms=… ws_gap_ms=… budget_floor=… halt_file=…`
+  (pinned); `exec: hyperliquid arm ARMED host=… network=testnet|MAINNET …`;
+  a boot with `HYPERLIQUID_WS_HOST` and `HYPERLIQUID_EXCHANGE_HOST` on
+  different networks is REFUSED (LAW E-4's precondition).
+- New gate: `make copy-audit` (`scripts/copy-audit.sh` +
+  `scripts/copy-audit-baseline.txt`); new command `/copy-check`; new
+  agent `.claude/agents/zero-copy-auditor`.
+
+**Why**
+
+- E5 needed the verbs on the tape (one stream, so a cancel can never be
+  replayed before its own place); E6 needed the arm's counters and the
+  ledger's alarms on a surface; the E7 review found `reconciled` could
+  latch on a parse and never un-latch, which is what `recon_age_ns` +
+  the required key close.
+
+**Impact / migration steps**
+
+1. Pre-E5 captures replay unchanged (every new field reads 0 = place /
+   no flags). No tool needs a flag.
+2. Before the first `--exec` boot with a live slot: add
+   `halt_on_recon_stale_ms = 300000` (or the operator's number) to every
+   live `[exec.slot.<n>]`, or the boot refuses with the key named.
+3. Dashboards reading `/state.exec` gain keys; nothing was renamed.
+
+**Rollback**
+
+- A binary before E5 reads `verb`/`prev_client_oid` as padding and
+  replays every record as a PLACE — a capture with cancels in it is
+  therefore NOT correctly replayable by a pre-E5 binary (it would see
+  the cancel's zero-priced record as a place of nothing). Keep the
+  post-E5 binary for post-E5 captures.
+- `exec.toml` files with `halt_on_recon_stale_ms` are refused by a pre-E7
+  binary as an unknown key (law 1: every key is KNOWN); remove the line
+  to boot an older binary.
+
 ## 2026-09-12 — `audit-pnl` settles HIP-4 binaries; the calibration ledger; the boot seed hook (BIN15 O5)
 
 **No wire change, no schema bump, no restart.** `audit_pnl_version` stays
@@ -2836,7 +2933,7 @@ sym's first underlying print + 132 one-sided books = 196).
 
 **Why**
 
-- `docs/regime-and-dashboard-plan.md` RG3: rows gate themselves on the
+- `docs/arch/regime-and-dashboard-plan.md` RG3: rows gate themselves on the
   regime (D2 — no table flip on a regime change), and every backtest /
   nightly report shows the per-regime P&L and the on/off delta.
 
@@ -2899,7 +2996,7 @@ sym's first underlying print + 132 one-sided books = 196).
 
 **Why**
 
-- `docs/regime-and-dashboard-plan.md` RG1–RG2 (operator decisions
+- `docs/arch/regime-and-dashboard-plan.md` RG1–RG2 (operator decisions
   D1–D4): the engine measures the regime itself, the AI declares, the
   effective word gates members without a table flip.
 
@@ -2964,7 +3061,7 @@ sym's first underlying print + 132 one-sided books = 196).
 
 **Why**
 
-- `docs/regime-and-dashboard-plan.md` (operator decisions D1–D4): the
+- `docs/arch/regime-and-dashboard-plan.md` (operator decisions D1–D4): the
   regime is a gate; VM rows carry their own per-profile masks so a
   regime change never flips a table; the AI declares a word per
   profile through the existing AI plane.

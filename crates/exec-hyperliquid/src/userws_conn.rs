@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use core_net::{
     read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult,
-    TlsTransport, Transport, WsOpcode, WsReadResult,
+    ws_mask_from_counter, ws_read_frame, ws_write_pong, HandshakeResult, Keepalive,
+    KeepaliveAction, KeepaliveCfg, TlsTransport, Transport, WsOpcode, WsReadResult,
 };
 use mio::{Events, Poll, Token};
 use rustls::pki_types::ServerName;
@@ -63,10 +63,35 @@ const _: () = assert!(MAX_WS_BUF >= 1 << 20);
 const TX_BUF: usize = 512;
 
 const MIO_TOKEN: Token = Token(0);
+/// How long ONE poll may block while the HANDSHAKE is in flight. The
+/// steady-state pump never blocks at all (see [`UserWs::pump`]).
 const POLL_SLICE: Duration = Duration::from_millis(50);
 
-/// Handshake must complete inside this or the connection is abandoned.
+/// Handshake — TLS, upgrade AND both subscribes — must complete inside
+/// this or the connection is abandoned. ONE deadline for the whole
+/// establishment: the first cut minted a fresh 10 s inside each
+/// subscribe on top of the handshake's own, so a reconnect could hold
+/// the engine thread for 30 s (E7 review, 2026-09-19).
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Consecutive connect failures between DNS re-resolutions — the
+/// address is cached at boot and the venue is CDN-fronted.
+const RERESOLVE_AFTER: u32 = 3;
+
+/// The venue cuts a `/ws` connection idle for 60 s
+/// (`ingress_hyperliquid::PING_PAYLOAD`'s doc); the market-data
+/// socket pings at 50 s for exactly that reason and this socket — the
+/// one that carries the FILLS — sent nothing, ever, so a quiet account
+/// (the normal state between quarter-hour instances) was cut and
+/// redialled every minute, re-delivering the snapshot each time and
+/// never growing `ws_gap_ns` enough to halt (E7 review, 2026-09-19).
+const KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 50_000_000_000,
+    idle_timeout_ns: 75_000_000_000,
+};
+/// `{"method":"ping"}` — the venue's application-level ping, answered
+/// with `{"channel":"pong"}`. Same bytes as the ingress crate's.
+const PING_PAYLOAD: &[u8] = b"{\"method\":\"ping\"}";
 
 /// Why the user-event socket failed.
 #[repr(u8)]
@@ -115,9 +140,27 @@ pub struct UserWs {
     events: Events,
 
     rx: Box<[u8]>,
+    /// Bytes `rx[..rx_head]` are consumed frames not yet reclaimed;
+    /// `rx[rx_head..rx_len]` is unread. A CURSOR, not a compaction:
+    /// the first cut `copy_within`'d the whole unread tail after
+    /// EVERY frame — O(k²) bytes over a k-frame burst, on the engine
+    /// thread (zero-copy audit, 2026-09-19). Now a drained buffer
+    /// resets to 0 for free and a compaction happens only when the
+    /// buffer is FULL with a partial frame at the end — the
+    /// `core_net::IoBuf` shape.
+    rx_head: usize,
     rx_len: usize,
     tx: Box<[u8]>,
     mask_ctr: u64,
+    /// Consecutive `connect` failures; see [`RERESOLVE_AFTER`].
+    connect_fail_streak: u32,
+    port: u16,
+    /// Monotonic origin for the keepalive's nanosecond clock.
+    epoch: Instant,
+    keepalive: Keepalive,
+    /// Last inbound byte, ns since `epoch`; the session start until
+    /// the first byte arrives.
+    last_activity_ns: u64,
 }
 
 /// Hand-written so the 1 MiB receive buffer never reaches a log line,
@@ -133,7 +176,7 @@ impl core::fmt::Debug for UserWs {
             .field("host", &self.host)
             .field("master", &self.master_hex)
             .field("connected", &self.transport.is_some())
-            .field("rx_buffered", &self.rx_len)
+            .field("rx_unread", &(self.rx_len - self.rx_head))
             .finish()
     }
 }
@@ -156,6 +199,8 @@ impl UserWs {
         let server_name =
             TlsTransport::server_name_from_host(host).map_err(|_| WsErr::BadServerName)?;
         Ok(Self {
+            // COPY: ≤ 64 B host name for re-resolve on reconnect, ONCE
+            // at boot (as `HlHttp::new`).
             host: host.to_owned(),
             addr,
             server_name,
@@ -165,10 +210,22 @@ impl UserWs {
             poll: Poll::new().map_err(|_| WsErr::Disconnected)?,
             events: Events::with_capacity(8),
             rx: vec![0u8; MAX_WS_BUF].into_boxed_slice(),
+            rx_head: 0,
             rx_len: 0,
             tx: vec![0u8; TX_BUF].into_boxed_slice(),
             mask_ctr: 0,
+            connect_fail_streak: 0,
+            port,
+            epoch: Instant::now(),
+            keepalive: Keepalive::new(KEEPALIVE),
+            last_activity_ns: 0,
         })
+    }
+
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        // Never 0: the keepalive reads 0 as "nothing yet".
+        (self.epoch.elapsed().as_nanos() as u64).max(1)
     }
 
     /// Is the socket up?
@@ -185,6 +242,16 @@ impl UserWs {
         &self.master_hex
     }
 
+    /// Replace the keepalive law ([`KEEPALIVE`] by default). Boot-only.
+    ///
+    /// Exists so the loopback test can drive a 50 s / 75 s law in
+    /// milliseconds against a scripted server; the engine never calls
+    /// it. Takes effect from the next `connect` (the timer is reset
+    /// there).
+    pub fn set_keepalive(&mut self, cfg: KeepaliveCfg) {
+        self.keepalive = Keepalive::new(cfg);
+    }
+
     /// Connect, upgrade, and send both subscriptions.
     ///
     /// Idempotent: returns immediately if already connected.
@@ -192,6 +259,34 @@ impl UserWs {
         if self.transport.is_some() {
             return Ok(());
         }
+        match self.dial() {
+            Ok(()) => {
+                self.connect_fail_streak = 0;
+                Ok(())
+            }
+            Err(e) => {
+                self.transport = None;
+                self.rx_head = 0;
+                self.rx_len = 0;
+                self.connect_fail_streak = self.connect_fail_streak.saturating_add(1);
+                if self.connect_fail_streak % RERESOLVE_AFTER == 0 {
+                    // Blocking DNS on the FAILURE path only; best
+                    // effort — an unresolvable host keeps the old
+                    // address.
+                    if let Some(a) = (self.host.as_str(), self.port)
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut it| it.next())
+                    {
+                        self.addr = a;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn dial(&mut self) -> Result<(), WsErr> {
         let deadline = Instant::now() + HANDSHAKE_DEADLINE;
         let mut t = TlsTransport::connect(self.addr, self.server_name.clone(), self.tls.clone())
             .map_err(|_| WsErr::Disconnected)?;
@@ -229,6 +324,7 @@ impl UserWs {
             .map_err(|_| WsErr::Upgrade)?;
         write_all_t(&mut t, &self.tx[..n], deadline)?;
 
+        self.rx_head = 0;
         self.rx_len = 0;
         loop {
             if Instant::now() >= deadline {
@@ -239,29 +335,33 @@ impl UserWs {
                     // Anything after the header block is already frame
                     // bytes — the venue can pack the first message into
                     // the same TCP segment as the 101. Dropping it
-                    // would lose the snapshot.
-                    self.rx.copy_within(header_end..self.rx_len, 0);
-                    self.rx_len -= header_end;
+                    // would lose the snapshot. Zero-copy: the cursor
+                    // simply starts after the header block.
+                    self.rx_head = header_end;
                     break;
                 }
                 HandshakeResult::Incomplete => {}
                 _ => return Err(WsErr::Upgrade),
             }
-            self.fill_rx(&mut t, deadline)?;
+            self.fill_rx(&mut t, deadline, POLL_SLICE)?;
         }
 
         self.transport = Some(t);
 
         // --- subscribe ------------------------------------------------
-        // `user` is the MASTER. See the module docs.
-        self.send_subscribe(b"userFills")?;
-        self.send_subscribe(b"orderUpdates")?;
+        // `user` is the MASTER. See the module docs. Same deadline as
+        // the handshake: establishment is ONE bounded act.
+        self.send_subscribe(b"userFills", deadline)?;
+        self.send_subscribe(b"orderUpdates", deadline)?;
+        self.keepalive.reset();
+        self.last_activity_ns = self.now_ns();
         Ok(())
     }
 
     /// Drop the socket. The next [`UserWs::connect`] redials.
     pub fn disconnect(&mut self) {
         self.transport = None;
+        self.rx_head = 0;
         self.rx_len = 0;
     }
 
@@ -271,6 +371,17 @@ impl UserWs {
     /// Returns how many messages were delivered. Control frames are
     /// handled here: a Ping is answered, a Close is a disconnect.
     ///
+    /// **Never blocks.** This runs on the ENGINE THREAD from
+    /// `on_idle`, at least every 2 ms; it is a readiness CHECK, and
+    /// the engine loop's own pacing is the wait. The first cut polled
+    /// with a 50 ms slice here, which on a quiet fill socket — the
+    /// normal state — would have parked the single-writer thread for
+    /// 50 ms out of every 52 (E7 review, 2026-09-19). `budget` bounds
+    /// the DRAIN of a burst that has already arrived, not a wait.
+    ///
+    /// Also the keepalive's clock: a ping goes out after 50 s of
+    /// silence and 75 s without an inbound byte is a dead session.
+    ///
     /// Zero-alloc: payloads are borrowed slices of the receive buffer.
     pub fn pump<F>(&mut self, budget: Duration, mut on_payload: F) -> Result<usize, WsErr>
     where
@@ -278,7 +389,9 @@ impl UserWs {
     {
         let deadline = Instant::now() + budget;
         let mut t = self.transport.take().ok_or(WsErr::Disconnected)?;
-        let r = self.pump_inner(&mut t, deadline, &mut on_payload);
+        let r = self
+            .maintain(&mut t, deadline)
+            .and_then(|()| self.pump_inner(&mut t, deadline, &mut on_payload));
         match r {
             Ok(n) => {
                 self.transport = Some(t);
@@ -287,6 +400,7 @@ impl UserWs {
             Err(e) => {
                 // Any failure closes the socket, so the next message
                 // can never be read out of this one's leftovers.
+                self.rx_head = 0;
                 self.rx_len = 0;
                 Err(e)
             }
@@ -303,26 +417,29 @@ impl UserWs {
         F: FnMut(&[u8]),
     {
         let mut delivered = 0usize;
-        // One read, then drain every frame it completed.
-        self.fill_rx(t, deadline)?;
+        // One non-blocking read, then drain every frame it completed.
+        self.fill_rx(t, deadline, Duration::ZERO)?;
         loop {
-            let (header, span) = match ws_read_frame(&self.rx[..self.rx_len]) {
-                WsReadResult::Incomplete => return Ok(delivered),
+            let head = self.rx_head;
+            let (header, span) = match ws_read_frame(&self.rx[head..self.rx_len]) {
+                WsReadResult::Incomplete => return Ok(self.settle(delivered)),
                 WsReadResult::Malformed => return Err(WsErr::BadFrame),
                 WsReadResult::Frame { header, payload } => (header, payload),
             };
             let total = header.header_len as usize + (header.payload_len as usize);
-            if total > self.rx_len {
-                return Ok(delivered);
+            if head + total > self.rx_len {
+                return Ok(self.settle(delivered));
             }
             if header.masked {
                 // Server frames are never masked (RFC 6455 §5.1).
                 return Err(WsErr::BadFrame);
             }
+            // The span is relative to the unread slice.
+            let (p0, p1) = (head + span.start, head + span.end);
             match header.opcode {
                 WsOpcode::Text | WsOpcode::Binary => {
                     if header.fin {
-                        on_payload(&self.rx[span.start..span.end]);
+                        on_payload(&self.rx[p0..p1]);
                         delivered += 1;
                     } else {
                         // The venue does not fragment its JSON, and a
@@ -334,14 +451,18 @@ impl UserWs {
                 }
                 WsOpcode::Ping => {
                     let mask = self.next_mask();
-                    let payload_len = span.end - span.start;
+                    let payload_len = p1 - p0;
                     if payload_len > 125 {
                         return Err(WsErr::BadFrame);
                     }
-                    // Copy out before writing: the pong borrows `tx`
-                    // mutably while the payload borrows `rx`.
+                    // COPY: a Ping payload, ≤ 125 B (RFC 6455), copied
+                    // out before writing — the pong borrows `tx`
+                    // mutably while the payload borrows `rx`, both
+                    // fields of one struct — rejected: splitting rx/tx
+                    // into separate owners buys 125 B at the cost of
+                    // the pump's single-borrow shape.
                     let mut echo = [0u8; 125];
-                    echo[..payload_len].copy_from_slice(&self.rx[span.start..span.end]);
+                    echo[..payload_len].copy_from_slice(&self.rx[p0..p1]);
                     let n = ws_write_pong(&mut self.tx, &echo[..payload_len], mask)
                         .map_err(|_| WsErr::BadFrame)?;
                     write_all_t(t, &self.tx[..n], deadline)?;
@@ -349,18 +470,52 @@ impl UserWs {
                 WsOpcode::Close => return Err(WsErr::Disconnected),
                 WsOpcode::Pong | WsOpcode::Continuation => {}
             }
-            self.rx.copy_within(total..self.rx_len, 0);
-            self.rx_len -= total;
+            // Consumed: advance the cursor. No bytes move.
+            self.rx_head = head + total;
         }
     }
 
-    fn send_subscribe(&mut self, channel: &[u8]) -> Result<(), WsErr> {
+    /// End of a drain: a fully consumed buffer is reclaimed for free
+    /// (both indices to 0). A partial frame at the tail stays where it
+    /// is behind the cursor; `fill_rx` compacts it only if the buffer
+    /// fills up around it.
+    #[inline(always)]
+    fn settle(&mut self, delivered: usize) -> usize {
+        if self.rx_head == self.rx_len {
+            self.rx_head = 0;
+            self.rx_len = 0;
+        }
+        delivered
+    }
+
+    /// The keepalive step: ping when quiet, give up when dead.
+    fn maintain(&mut self, t: &mut TlsTransport, deadline: Instant) -> Result<(), WsErr> {
+        let now = self.now_ns();
+        match self.keepalive.poll(now, self.last_activity_ns) {
+            KeepaliveAction::None => Ok(()),
+            KeepaliveAction::SendPing => {
+                let mask = self.next_mask();
+                let n = core_net::ws_write_text_frame(&mut self.tx, PING_PAYLOAD, mask)
+                    .map_err(|_| WsErr::BadFrame)?;
+                write_all_t(t, &self.tx[..n], deadline)?;
+                self.keepalive.mark_ping_sent(now);
+                Ok(())
+            }
+            KeepaliveAction::Reconnect => Err(WsErr::Disconnected),
+        }
+    }
+
+    fn send_subscribe(&mut self, channel: &[u8], deadline: Instant) -> Result<(), WsErr> {
         let mut body = [0u8; 256];
         let mut n = 0usize;
         let mut put = |b: &[u8], n: &mut usize| -> Result<(), WsErr> {
             if *n + b.len() > body.len() {
                 return Err(WsErr::BadFrame);
             }
+            // COPY: subscribe-frame literals + the 42 B master hex,
+            // ≤ 256 B, twice per connect — building the JSON body from
+            // fixed parts IS its construction, and the masked frame
+            // writer needs it contiguous; cold, once per socket.
             body[*n..*n + b.len()].copy_from_slice(b);
             *n += b.len();
             Ok(())
@@ -374,7 +529,6 @@ impl UserWs {
         let mask = self.next_mask();
         let frame_len = core_net::ws_write_text_frame(&mut self.tx, &body[..n], mask)
             .map_err(|_| WsErr::BadFrame)?;
-        let deadline = Instant::now() + HANDSHAKE_DEADLINE;
         let t = self.transport.as_mut().ok_or(WsErr::Disconnected)?;
         write_all_t(t, &self.tx[..frame_len], deadline)?;
         Ok(())
@@ -385,17 +539,34 @@ impl UserWs {
         ws_mask_from_counter(self.mask_ctr)
     }
 
-    /// One poll-and-read into the receive buffer.
-    fn fill_rx(&mut self, t: &mut TlsTransport, deadline: Instant) -> Result<(), WsErr> {
+    /// One poll-and-read into the receive buffer. `wait` is how long
+    /// the poll may block: [`POLL_SLICE`] during the handshake,
+    /// `Duration::ZERO` on the steady-state pump.
+    fn fill_rx(
+        &mut self,
+        t: &mut TlsTransport,
+        deadline: Instant,
+        wait: Duration,
+    ) -> Result<(), WsErr> {
         if self.rx_len >= self.rx.len() {
-            // A frame bigger than the buffer can never complete.
-            return Err(WsErr::BadFrame);
+            if self.rx_head == 0 {
+                // A frame bigger than the buffer can never complete.
+                return Err(WsErr::BadFrame);
+            }
+            // COPY: the ONE compaction — a partial frame at the tail
+            // of a FULL buffer, ≤ MAX_WS_BUF, only when the consumed
+            // prefix is the room it needs (`core_net::IoBuf::free_mut`'s
+            // law) — rejected: a ring buffer, which splits the frame
+            // across the wrap and pays the copy at the parse instead.
+            self.rx.copy_within(self.rx_head..self.rx_len, 0);
+            self.rx_len -= self.rx_head;
+            self.rx_head = 0;
         }
         if Instant::now() >= deadline {
             return Ok(());
         }
         self.poll
-            .poll(&mut self.events, Some(POLL_SLICE))
+            .poll(&mut self.events, Some(wait))
             .map_err(|_| WsErr::Disconnected)?;
         let mut readable = false;
         for ev in self.events.iter() {
@@ -423,28 +594,37 @@ impl UserWs {
         // handshake's own traffic had already spent the edge.
         loop {
             if self.rx_len >= self.rx.len() {
-                return Err(WsErr::BadFrame);
+                // Full again inside one drain: either a frame that
+                // cannot fit (head 0) or bytes to reclaim first — let
+                // the next call decide; the parse loop runs in between.
+                return if self.rx_head == 0 {
+                    Err(WsErr::BadFrame)
+                } else {
+                    Ok(())
+                };
             }
             match t.read(&mut self.rx[self.rx_len..]) {
                 Ok(0) => return Err(WsErr::Disconnected),
-                Ok(n) => self.rx_len += n,
+                Ok(n) => {
+                    self.rx_len += n;
+                    self.last_activity_ns = self.now_ns();
+                }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(_) => return Err(WsErr::Disconnected),
             }
         }
     }
-
-    /// The `ws_unmask_in_place` re-export exists so a caller that
-    /// receives a masked frame from a TEST double can unmask it with
-    /// the same routine this client uses.
-    #[doc(hidden)]
-    pub fn unmask(buf: &mut [u8], mask: [u8; 4]) {
-        ws_unmask_in_place(buf, mask);
-    }
 }
 
-/// Write every byte, retrying short writes. The transport trait's
-/// `write` accepts what it can and leaves the rest to the caller.
+/// Write every byte, retrying short writes, then push them to the
+/// socket. The transport trait's `write` only QUEUES into rustls;
+/// `flush` is what makes the frame leave now rather than on the next
+/// readiness event.
+///
+/// No sleeping: a TLS transport never returns `WouldBlock` from
+/// `write` (it buffers), and a transport that did has nowhere to park
+/// the bytes — the first cut slept 1 ms per retry on the engine
+/// thread.
 fn write_all_t<T: Transport>(t: &mut T, buf: &[u8], deadline: Instant) -> Result<(), WsErr> {
     let mut off = 0usize;
     while off < buf.len() {
@@ -455,12 +635,12 @@ fn write_all_t<T: Transport>(t: &mut T, buf: &[u8], deadline: Instant) -> Result
             Ok(0) => return Err(WsErr::Disconnected),
             Ok(n) => off += n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
+                return Err(WsErr::Disconnected)
             }
             Err(_) => return Err(WsErr::Disconnected),
         }
     }
-    Ok(())
+    t.flush().map_err(|_| WsErr::Disconnected)
 }
 
 fn seed_from_clock() -> u64 {

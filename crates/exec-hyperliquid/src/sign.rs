@@ -28,12 +28,7 @@
 //! useful error.
 
 use signer_eip712::hyperliquid as hl;
-use signer_eip712::{keccak256, SignError};
-
-/// Scratch for `msgpack ‖ nonce ‖ vault ‖ expiry`. The action itself is
-/// capped at [`crate::action::MAX_ACTION`]; the tail is at most
-/// 8 + 1 + 20 + 1 + 8 = 38 bytes.
-pub const MAX_HASH_INPUT: usize = crate::action::MAX_ACTION + 64;
+use signer_eip712::{keccak256_parts, SignError};
 
 /// Whether an action carries a vault, and which.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -49,6 +44,16 @@ pub enum Vault {
 /// `action` is the msgpack bytes from an `encode_*` in
 /// [`crate::action`]. Nothing here inspects them — the encoder owns
 /// LAW E-3, this owns the envelope.
+///
+/// ZERO COPY: the preimage `action ‖ nonce ‖ vault ‖ [expiry]` is
+/// absorbed part by part; only the ≤ 30-byte tail is built on the
+/// stack. The first cut staged the whole action into a 4 KiB buffer
+/// to hash one slice.
+///
+/// # Errors
+/// Never, today: the tail is fixed-size and the action is taken as
+/// is. Kept as a `Result` so the signature stays the one every caller
+/// already handles.
 #[inline]
 pub fn connection_id(
     action: &[u8],
@@ -56,54 +61,43 @@ pub fn connection_id(
     vault: Vault,
     expires_after: Option<u64>,
 ) -> Result<[u8; 32], SignError> {
-    let mut buf = [0u8; MAX_HASH_INPUT];
+    // nonce (8) ‖ vault marker (1 | 21) ‖ expiry (0 | 9)
+    let mut tail = [0u8; 8 + 21 + 9];
     let mut n = 0usize;
 
-    if action.len() > buf.len() {
-        return Err(SignError::InvalidKey);
-    }
-    buf[..action.len()].copy_from_slice(action);
-    n += action.len();
-
     // nonce, big-endian u64
-    if n + 8 > buf.len() {
-        return Err(SignError::InvalidKey);
-    }
-    buf[n..n + 8].copy_from_slice(&nonce.to_be_bytes());
+    // COPY: 8 B nonce into the ≤ 38 B stack tail that keccak absorbs
+    // right after the action (`keccak256_parts`) — the hash input is
+    // action ‖ tail and the tail does not exist anywhere else; the
+    // action itself is NOT copied.
+    tail[n..n + 8].copy_from_slice(&nonce.to_be_bytes());
     n += 8;
 
     // vault marker — ALWAYS written
     match vault {
         Vault::None => {
-            if n + 1 > buf.len() {
-                return Err(SignError::InvalidKey);
-            }
-            buf[n] = 0x00;
+            tail[n] = 0x00;
             n += 1;
         }
         Vault::Address(addr) => {
-            if n + 21 > buf.len() {
-                return Err(SignError::InvalidKey);
-            }
-            buf[n] = 0x01;
+            tail[n] = 0x01;
             n += 1;
-            buf[n..n + 20].copy_from_slice(&addr);
+            // COPY: 20 B vault address into the same stack tail.
+            tail[n..n + 20].copy_from_slice(&addr);
             n += 20;
         }
     }
 
     // expiry tail — only when set, and AFTER the vault byte
     if let Some(exp) = expires_after {
-        if n + 9 > buf.len() {
-            return Err(SignError::InvalidKey);
-        }
-        buf[n] = 0x00;
+        tail[n] = 0x00;
         n += 1;
-        buf[n..n + 8].copy_from_slice(&exp.to_be_bytes());
+        // COPY: 8 B expiry into the same stack tail.
+        tail[n..n + 8].copy_from_slice(&exp.to_be_bytes());
         n += 8;
     }
 
-    Ok(keccak256(&buf[..n]))
+    Ok(keccak256_parts(&[action, &tail[..n]]))
 }
 
 /// Which network the signature is for. **A parameter, never a
@@ -172,10 +166,38 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// The preimage is hashed part by part; it must equal the one-slice
+    /// hash of the concatenation, for every tail shape.
     #[test]
-    fn an_oversized_action_is_refused_not_truncated() {
-        let huge = vec![0u8; MAX_HASH_INPUT + 1];
-        assert!(connection_id(&huge, 1, Vault::None, None).is_err());
+    fn the_incremental_hash_equals_the_concatenated_one() {
+        let action = [0x83u8, 0xa4, b't', b'y', b'p', b'e', 0xa5, 1, 2, 3, 4, 5];
+        let nonce = 0x0102_0304_0506_0708u64;
+        let vault = [0x77u8; 20];
+        for (v, exp) in [
+            (Vault::None, None),
+            (Vault::Address(vault), None),
+            (Vault::None, Some(9u64)),
+            (Vault::Address(vault), Some(0u64)),
+        ] {
+            let mut flat = Vec::new();
+            flat.extend_from_slice(&action);
+            flat.extend_from_slice(&nonce.to_be_bytes());
+            match v {
+                Vault::None => flat.push(0),
+                Vault::Address(a) => {
+                    flat.push(1);
+                    flat.extend_from_slice(&a);
+                }
+            }
+            if let Some(e) = exp {
+                flat.push(0);
+                flat.extend_from_slice(&e.to_be_bytes());
+            }
+            assert_eq!(
+                connection_id(&action, nonce, v, exp).unwrap(),
+                signer_eip712::keccak256(&flat)
+            );
+        }
     }
 
     #[test]

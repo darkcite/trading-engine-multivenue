@@ -1041,11 +1041,13 @@ impl CancelReq {
 ///
 /// ## Layout
 ///
-/// [`Order`] is `align(64)`, so this is two cache lines: the previous
-/// id on the first, the replacement on the second. The gap between
-/// them is compiler-inserted padding, which is why this type is NOT
-/// [`AsBytes`] and never reaches a replay log — it crosses a call,
-/// not a wire.
+/// ONE field — the replacement `Order`, 64 B, one cache line — so a
+/// `ModifyReq` IS its record and `as_record` returns it by value with
+/// nothing to build. (An earlier design carried the previous id beside
+/// the order, which made it two lines with padding between; the id
+/// now rides inside the order's own `prev_client_oid` slot.) It is
+/// still NOT [`AsBytes`]: it crosses a call, not a wire — the capture
+/// writes the inner `Order`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ModifyReq {
@@ -3310,6 +3312,27 @@ pub const fn roll_kind(seq: u64) -> u8 {
     ((seq >> 56) & 0xFF) as u8
 }
 
+/// **The one strict reading of the kind byte.** `Some(true)` for
+/// [`ROLL_KIND_SETTLED`], `Some(false)` for [`ROLL_KIND_CREATED`],
+/// `None` for anything else — a frame no packer of ours wrote, which
+/// every LIVE consumer must refuse rather than read.
+///
+/// Before this existed the three live readers disagreed on exactly
+/// that case: the exchange arm masked the low bit (`0x03` → settled),
+/// `strategy_bin15::on_roll` compared the whole byte to 1 (`0x03` →
+/// CREATED, and `bind()` flattened a live instance), and the router
+/// refused it. Three readers, three answers, one frame (E7 review,
+/// 2026-09-19). All three read this now.
+#[inline]
+#[must_use]
+pub const fn roll_kind_strict(seq: u64) -> Option<bool> {
+    match roll_kind(seq) {
+        ROLL_KIND_SETTLED => Some(true),
+        ROLL_KIND_CREATED => Some(false),
+        _ => None,
+    }
+}
+
 /// HIP-4 exposure for one outcome: `|yes − no|`.
 ///
 /// Equal legs are riskless collateral — one pays $1 and the other $0
@@ -3401,6 +3424,10 @@ mod roll_codec_tests {
             ROLL_KIND_CREATED,
             "and does not call it created either — it is neither"
         );
+        // The strict reading every live consumer uses.
+        assert_eq!(roll_kind_strict(bad), None);
+        assert_eq!(roll_kind_strict(pack_roll_seq(7, 60, 1, true)), Some(true));
+        assert_eq!(roll_kind_strict(pack_roll_seq(7, 60, 1, false)), Some(false));
     }
 
     #[test]

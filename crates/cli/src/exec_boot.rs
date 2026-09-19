@@ -74,29 +74,21 @@ use tracing::info;
 
 /// Venues this binary can actually dispatch to live.
 ///
-/// **E1: deliberately empty.** E3 adds `VenueId::Hyperliquid` here when
-/// `exec-hyperliquid` can sign and POST; nothing else in this module
-/// changes when it does.
-pub const LIVE_ARM_VENUES: &[u8] = &[];
-
-/// The barrier that makes "E1 cannot place a real order" true, pinned at
-/// COMPILE time rather than by a test.
-///
-/// Today `NullLiveDispatcher` backstops this const — it refuses every
-/// order whatever the route table says. The day E3 swaps in a real
-/// Hyperliquid arm, that backstop disappears and this const becomes the
-/// WHOLE barrier between a configuration file and a real order. A
-/// compile-time assertion means widening it is a deliberate edit to this
-/// line, which fails the BUILD until someone changes it on purpose —
-/// not a test that could be skipped, filtered or left red.
-///
-/// **E3 deletes this assertion. That deletion is the moment the engine
-/// becomes capable of trading real money, and it should be reviewed as
-/// such.**
-const _: () = assert!(
-    LIVE_ARM_VENUES.is_empty(),
-    "E1 ships with NO live execution arm — see E2/E3"
-);
+/// **E7 (2026-09-19): `VenueId::Hyperliquid`.** E1 shipped this empty
+/// with a compile-time assertion that it stayed empty — the whole
+/// barrier between a configuration file and a real order. Deleting
+/// that assertion is the moment the engine became capable of trading
+/// real money, and it was reviewed as such: the four E7 review
+/// reports under `Claude outputs/review-e1e6/` are the record. The
+/// barriers that remain are the ones E6 built — the two-switch
+/// interlock (`--arm-live` must agree with the artifact), the seeding
+/// interlock (no live PLACE until the arm has reconciled and agreed),
+/// the four clamps, the six halt triggers and `exec.HALT` — plus the
+/// network interlock in the boot (`HYPERLIQUID_WS_HOST` and
+/// `HYPERLIQUID_EXCHANGE_HOST` on the same network, or no boot), and
+/// the `.env` itself: a boot with no `HYPERLIQUID_*` variables refuses
+/// before any socket opens.
+pub const LIVE_ARM_VENUES: &[u8] = &[core_types::VenueId::Hyperliquid as u8];
 
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
@@ -136,12 +128,11 @@ pub struct ExecBoot {
     pub live_mask: u8,
     /// The slots the artifact named, as parsed.
     ///
-    /// The hot [`ExecRoute`] carries only the two clamps that fit its
-    /// two-cache-line layout; the other five — `cap_day_usd_1e6`,
-    /// `cap_instance_usd_1e6`, `request_budget_floor`,
-    /// `halt_on_reject_streak`, `halt_on_recon_drift_usd_1e6` — live
-    /// here so the boot tell can publish every number the operator
-    /// wrote and E4/E6 can consume them without re-parsing. Cold; a
+    /// The hot [`ExecRoute`] carries the four clamps and the halt
+    /// thresholds; what it does not carry — `request_budget_floor`,
+    /// the slot's name, the venue list as written — lives here so the
+    /// boot tell can publish every number the operator wrote and the
+    /// arm can read the budget floor without re-parsing. Cold; a
     /// `Vec` is fine at boot.
     pub slots: Vec<core_config::exec::ExecSlot>,
 }
@@ -330,9 +321,9 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     let vname = core_config::exec::venue_name_from_id(*v).unwrap_or("?");
                     return Err(format!(
                         "exec: slot {slot} ({slot_name}) is marked live for venue `{vname}`, \
-                         but this binary has NO live execution arm for it. The Hyperliquid arm \
-                         lands in E2 (signing) + E3 (HTTP); until then slot {slot} can only be \
-                         \"paper\" or \"off\". Refusing the boot rather than trading it on \
+                         but this binary has NO live execution arm for it (the only arm \
+                         compiled in is hyperliquid). Slot {slot} can only be \"paper\" or \
+                         \"off\" on that venue. Refusing the boot rather than trading it on \
                          paper under a live label."
                     ));
                 }
@@ -358,6 +349,7 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     s.halt_on_recon_drift_usd_1e6,
                     s.halt_on_ws_gap_ms,
                     u32::try_from(s.halt_on_asset_refusal_streak).unwrap_or(u32::MAX),
+                    s.halt_on_recon_stale_ms,
                 ),
             )
             .map_err(|e| format!("exec: slot {slot}: {e}"))?;
@@ -399,19 +391,15 @@ fn describe_slots(mask: u8) -> String {
 /// Line 1 names the artifact and the whole partition, so one line tells
 /// an operator every slot's disposition.
 ///
-/// A LIVE slot then gets TWO more lines, and the second one matters as
-/// much as the first. E1 parses the caps, bounds-checks them and prints
-/// them — and **enforces none of them**; the risk gate is E6. A line
-/// reading `caps order=$100 open=64` is indistinguishable from a line
-/// describing a clamp that is actually in force, and an operator who
-/// believes a clamp exists when it does not is exactly the failure this
-/// whole phase is supposed to make impossible. So the caps are labelled
-/// `caps-DECLARED-NOT-ENFORCED` and followed by a WARNING line that says
-/// what IS in force instead.
-///
-/// When E6 lands, the token becomes `caps-ENFORCED` and the WARNING
-/// line is deleted. That one-word diff is itself the tell that
-/// enforcement arrived.
+/// A LIVE slot then gets two more lines: the clamps, labelled
+/// `caps-ENFORCED` because since E6 every live submit and modify
+/// passes `RoutedDispatcher::risk_check` against them, and the halt
+/// thresholds, every one of them. E1 printed the same numbers under
+/// `caps-DECLARED-NOT-ENFORCED` with a WARNING line saying no clamp
+/// existed — and that text was still what a live boot printed after
+/// E6 had made it false, pinned by a test that asserted the false
+/// text (E7 review, 2026-09-19). The last line an operator reads
+/// before real money must say what the code does.
 #[must_use]
 pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
     let mut hex = String::with_capacity(64);
@@ -451,17 +439,21 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         let drift = s.map_or(0, |s| s.halt_on_recon_drift_usd_1e6) / 1_000_000;
         lines.push(format!(
             "exec: slot {slot} LIVE name={slot_name} venue={venues} \
-             caps-DECLARED-NOT-ENFORCED order=${} open={} day=${day} instance=${inst} \
-             reject_streak={} recon_drift=${drift} budget_floor={}",
+             caps-ENFORCED order=${} open={} day=${day} instance=${inst} \
+             (the risk gate clamps every live submit and modify; \
+             worst case with every quote working = instance + open x order)",
             boot.route.max_order_usd_1e6_at(slot).unwrap_or(0) / 1_000_000,
             boot.route.max_open_orders_at(slot).unwrap_or(0),
-            s.map_or(0, |s| s.halt_on_reject_streak),
-            s.map_or(0, |s| s.request_budget_floor),
         ));
         lines.push(format!(
-            "exec: slot {slot} WARNING no risk gate is compiled in (E6). The caps above are \
-             the ARTIFACT'S DECLARATION — no order is clamped to them. The only limits in \
-             force on this slot are strategy-{slot_name}'s own, from its member artifact."
+            "exec: slot {slot} HALTS reject_streak={} asset_refusals={} recon_drift=${drift} \
+             recon_stale_ms={} ws_gap_ms={} budget_floor={} halt_file={}",
+            s.map_or(0, |s| s.halt_on_reject_streak),
+            s.map_or(0, |s| s.halt_on_asset_refusal_streak),
+            s.map_or(0, |s| s.halt_on_recon_stale_ms),
+            s.map_or(0, |s| s.halt_on_ws_gap_ms),
+            s.map_or(0, |s| s.request_budget_floor),
+            halt_file_path(&boot.path).display(),
         ));
     }
     lines
@@ -509,6 +501,8 @@ mod tests {
             ("halt_on_recon_drift_usd_1e6", s3.halt_on_recon_drift_usd_1e6),
             ("halt_on_ws_gap_ms", s3.halt_on_ws_gap_ms),
             ("halt_on_asset_refusal_streak", s3.halt_on_asset_refusal_streak),
+            ("halt_on_recon_stale_ms", s3.halt_on_recon_stale_ms),
+            ("request_budget_floor", s3.request_budget_floor),
         ] {
             assert!(v > 0, "template leaves `{key}` unset — the boot refuses");
         }
@@ -548,7 +542,8 @@ mod tests {
          cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
          max_open_orders = 64\nrequest_budget_floor = 2000\n\
          halt_on_reject_streak = 5\nhalt_on_recon_drift_usd_1e6 = 5000000\n\
-         halt_on_ws_gap_ms = 30000\nhalt_on_asset_refusal_streak = 3\n";
+         halt_on_ws_gap_ms = 30000\nhalt_on_asset_refusal_streak = 3\n\
+         halt_on_recon_stale_ms = 300000\n";
 
     /// A directory of this test's own.
     ///
@@ -625,23 +620,29 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// E1 has no live arm — a live slot must refuse loudly and name
-    /// the phase that will supply one.
+    /// A live slot on a venue with no compiled arm must refuse loudly
+    /// and never boot inert. Since E7 the Hyperliquid arm exists, so
+    /// the refusal is asserted on a venue that has none (okx) and the
+    /// hyperliquid slot is asserted to RESOLVE — with the two switches
+    /// agreeing, which is the whole interlock.
     #[test]
-    fn a_live_slot_refuses_the_boot_while_no_arm_is_compiled() {
+    fn a_live_slot_refuses_the_boot_on_a_venue_with_no_arm_and_resolves_on_hyperliquid() {
         let d = tmp();
-        let p = write(&d, "exec.toml", MINIMAL_LIVE);
-        // Switches AGREE — so the only thing left to refuse it is the
-        // missing arm, which is exactly what this asserts.
+        let p = write(&d, "exec.toml", &MINIMAL_LIVE.replace("hyperliquid", "okx"));
         let e = resolve(Some(&p), Some("3")).unwrap_err();
         assert!(e.contains("NO live execution arm"), "{e}");
-        assert!(e.contains("E2"), "must name the phase: {e}");
-        assert!(e.contains("E3"), "{e}");
         assert!(e.contains("bin15"), "must name the slot: {e}");
+        assert!(e.contains("okx"), "must name the venue: {e}");
         assert!(
             e.contains("Refusing the boot"),
             "must not downgrade silently: {e}"
         );
+        let p = write(&d, "exec-hl.toml", MINIMAL_LIVE);
+        let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+        assert!(b.any_live());
+        assert!(b.route.venue_live(core_types::VenueId::Hyperliquid as u8));
+        assert!(!b.route.venue_live(core_types::VenueId::Okx as u8));
+        assert_eq!(LIVE_ARM_VENUES, &[core_types::VenueId::Hyperliquid as u8]);
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -673,11 +674,6 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// The barrier that makes "E1 cannot place a real order" true.
-    ///
-    /// Once E3 swaps `NullLiveDispatcher` for a real arm, this const is
-    /// the WHOLE barrier — so widening it must require a deliberate
-    /// edit to this test, not just to the const.
     /// This module keeps its own copy of the slot map (the dependency
     /// graph puts `engine-snapshot` out of reach of a const assert), so
     /// pin it against the one `/state` publishes. A silent divergence
@@ -715,6 +711,7 @@ mod tests {
             R::WsGap,
             R::AssetRefusals,
             R::Operator,
+            R::ReconStale,
         ];
         assert_eq!(
             all.len(),
@@ -778,6 +775,9 @@ mod tests {
         slot.request_budget_floor = 2_000;
         slot.halt_on_reject_streak = 5;
         slot.halt_on_recon_drift_usd_1e6 = 5_000_000;
+        slot.halt_on_ws_gap_ms = 30_000;
+        slot.halt_on_asset_refusal_streak = 3;
+        slot.halt_on_recon_stale_ms = 300_000;
         let boot = ExecBoot {
             route,
             hash: [0u8; 32],
@@ -787,23 +787,31 @@ mod tests {
             slots: vec![slot],
         };
         let lines = render_boot_tell(&boot);
-        assert_eq!(lines.len(), 3, "header + caps + warning");
+        assert_eq!(lines.len(), 3, "header + caps + halts");
         assert_eq!(
             lines[1],
             "exec: slot 3 LIVE name=bin15 venue=hyperliquid \
-             caps-DECLARED-NOT-ENFORCED order=$100 open=64 day=$30000 instance=$1000 \
-             reject_streak=5 recon_drift=$5 budget_floor=2000"
+             caps-ENFORCED order=$100 open=64 day=$30000 instance=$1000 \
+             (the risk gate clamps every live submit and modify; \
+             worst case with every quote working = instance + open x order)"
         );
         assert_eq!(
             lines[2],
-            "exec: slot 3 WARNING no risk gate is compiled in (E6). The caps above are \
-             the ARTIFACT'S DECLARATION — no order is clamped to them. The only limits in \
-             force on this slot are strategy-bin15's own, from its member artifact."
+            "exec: slot 3 HALTS reject_streak=5 asset_refusals=3 recon_drift=$5 \
+             recon_stale_ms=300000 ws_gap_ms=30000 budget_floor=2000 halt_file=/tmp/exec.HALT"
         );
-        // Every declared number reaches the line — the whole point of
-        // keeping the parsed slots on ExecBoot.
-        for n in ["$100", "64", "$30000", "$1000", "5", "$5", "2000"] {
+        // The stale E1 wording must never come back: it described a
+        // clamp that did not exist, and after E6 it described one
+        // that did as if it did not.
+        for line in &lines {
+            assert!(!line.contains("DECLARED-NOT-ENFORCED"), "{line}");
+            assert!(!line.contains("no risk gate"), "{line}");
+        }
+        for n in ["$100", "64", "$30000", "$1000"] {
             assert!(lines[1].contains(n), "missing {n} in: {}", lines[1]);
+        }
+        for n in ["reject_streak=5", "asset_refusals=3", "$5", "300000", "30000", "2000"] {
+            assert!(lines[2].contains(n), "missing {n} in: {}", lines[2]);
         }
     }
 

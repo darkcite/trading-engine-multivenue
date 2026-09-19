@@ -1,35 +1,28 @@
 # Multivenue Trading Engine — Architecture & Plan
 
-**Version:** 0.5 (`.env` secrets, no observability stack, testing pyramid added)
+**Version:** 0.6 (doctrine document; the roadmap became history)
 **Author:** Anton
-**Date:** 2026-04-19 (initial); refreshed 2026-05-20
+**Date:** 2026-04-19 (initial); refreshed 2026-05-20; re-scoped 2026-09-19
 
 ---
 
-## Status snapshot (2026-05-20)
+## What this document is now (2026-09-19)
 
-* Phases 0–6 + Phase 7-prep all landed; live-test gates being closed.
-* **All four strategies shipped + CLI-selectable** via `--strategy {latency-arb|ev|cross-arb|rule-tree}`.
-* `QueuedDispatcher` + worker thread = engine never blocks on network.
-* Top-5 hot-path bottleneck fixes landed (signer ctx cache, keep-alive POST,
-  yield_now-replaces-sleep, RxBuf cursor pair, conditional `reregister`).
-* MEDIUM-priority hot-path follow-ups landed: pre-parsed `SecretKey`,
-  lock-free `DispatchStatsAtomic`, per-item `now_ns()` in engine drain,
-  `MultiBook::apply_at(idx, tick)`, tight ingress drain loop, hashed
-  `SymbolMap` lookups.
-* Tests: 432+ across 36 binaries, 23 alloc assertions, 10 fuzz targets,
-  criterion `hot_path` baseline showing ~38 ns/tick warm.
-* See `docs/hot-path-latency.md` for the full audit + bench history.
+This is the **architecture deep-dive and doctrine** — the reasoning behind
+the zero-alloc / zero-copy / single-writer / lock-free rules, the strategy
+abstraction, the risk model, the local-deployment posture and the testing
+pyramid. Those sections (§2, §6, §9, §11–§14, §17–§22) are standing.
 
----
-
-**Primary edge (v1):** Strategy B — Latency / Information Arbitrage, constrained to free data sources
-**Staged edges (v2+):** A (true-probability mispricing), C (cross-market arb), D (resolution-structure exploitation)
-**Stack:** Pure Rust (single process, compile-time `Strategy` trait, monomorphized)
-**Deploy target (v1):** Local only — MacBook Pro M4 (Apple Silicon, arm64, 500 GB SSD)
-**Cloud / colo:** deferred to Phase 7 (migration plan in §20)
-**Paid data feeds:** deferred to Phase 6 (X filtered stream, Benzinga Pro, Blocknative mempool)
-**AI role:** Claude as *strategy researcher* — offline/out-of-band only; never in hot path
+Its **status, edge thesis and roadmap are historical**: §3, §4, §7–§8 and
+§15 describe the April-2026 Polymarket-centric v1 (RSS, rule-tree, the
+latency-arb primary edge) which was built, measured and then displaced. The
+engine is now a multivenue slot set (Binance, OKX, Deribit, Hyperliquid incl.
+HIP-4, Bybit, Polymarket, Polygon RPC) with an eight-slot strategy set and a
+per-slot live-execution lane. **The current picture is:** `CLAUDE.md`
+(state + laws), `docs/risk-policy.md` (execution laws and record), and the
+three sheets `docs/phase-8-architecture-v2.svg`, `docs/engine-memory-cpu.svg`,
+`docs/ai-strategy-pipeline.svg`. Every closed phase's plan and log is in
+`docs/arch/` (read on request only).
 
 ---
 
@@ -784,6 +777,16 @@ Unchanged:
 ---
 
 ## 15. Phased Roadmap (reshaped for local + free tier)
+
+> **Historical (2026-09-19).** This roadmap was executed and superseded:
+> Phases 0–6 landed (2026-05), then Stage 1 (8a–8e), Stage 2 (8f–8h, the AI
+> research loop), the M-phases (universe, options, launchd fleet, shadow
+> P&L, MVP soak), VM2, venue time, regime, the S3 archive, the coded
+> members (ICDP, XSD, VRP, BIN15) and the real-execution lane E1–E7. The
+> per-phase plans and logs are in `docs/arch/`; the standing gate that
+> remains from this roadmap is the Stage-3 entry gate
+> (`docs/arch/mvp-completion-plan.md` §7). Phase 7 (a plain Linux box) is
+> still the migration posture and is still unscheduled.
 
 ### Phase 0 — Local scaffold (1–2 weeks)
 - Rust workspace, `rust-toolchain`, cargo config.

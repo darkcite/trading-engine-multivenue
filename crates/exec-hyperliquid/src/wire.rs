@@ -131,6 +131,9 @@ impl WireNum {
 
 impl core::fmt::Debug for WireNum {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // COPY: `Debug` only (test failure messages) — the bytes are
+        // ASCII digits so `from_utf8_lossy` borrows and copies nothing
+        // in practice; nothing on a trading path formats a `WireNum`.
         write!(f, "{}", String::from_utf8_lossy(self.as_bytes()))
     }
 }

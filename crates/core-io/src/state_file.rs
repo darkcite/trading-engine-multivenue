@@ -20,8 +20,14 @@
 //! function whose entire point is one easily-forgotten `sync_all` is
 //! how that bug comes back.
 //!
-//! BOOT/OFFLINE DOCTRINE: this runs on the 5 s observability cadence
-//! and at shutdown, never on the tick path. Allocation is fine here.
+//! BOOT/OFFLINE DOCTRINE: this runs on the 5 s observability cadence,
+//! at shutdown — and, since E6 commit 3, on the execution router's
+//! HALT EDGE from the engine thread: once per halt incident, never per
+//! poll. The `sync_all` can stall that thread for the length of one
+//! disk sync; a halt is a one-shot event and that is accepted.
+//! Allocation is fine here, and `exec-router`'s alloc gate 62 measures
+//! the edge in its own window so that "once per incident" cannot
+//! silently become "once per poll".
 
 use std::io::Write as _;
 use std::path::Path;

@@ -1,5 +1,5 @@
 .PHONY: help build build-release test test-fast nextest fmt lint \
-	check alloc-assert fuzz-quick bench bench-check coverage \
+	check alloc-assert copy-audit fuzz-quick bench bench-check coverage \
 	run-paper clean py-test py-lint \
 	license-check sync-license license-deps
 
@@ -14,6 +14,7 @@ help:
 	@echo "  lint            cargo clippy --workspace --all-targets -- -D warnings"
 	@echo "  check           cargo check --workspace --all-targets"
 	@echo "  alloc-assert    cargo test --test alloc_assertions --release"
+	@echo "  copy-audit      zero-copy ratchet: scripts/copy-audit.sh vs its baseline (offline, fast)"
 	@echo "  fuzz-quick      cargo fuzz run polymarket_clob_frame -- -max_total_time=60"
 	@echo "  bench           cargo bench --workspace"
 	@echo "  bench-check     diff criterion output against crates/bench/baselines/*.json"
@@ -55,6 +56,15 @@ alloc-assert:
 	# other's AllocGuard delta. Serial execution gives us per-test
 	# isolation without turning the allocator into a TLS-tracked beast.
 	cargo test -p bench --test alloc_assertions --release -- --nocapture --test-threads=1
+
+copy-audit:
+	# Offline, ~1 s. The zero-COPY gate beside the zero-ALLOCATION one
+	# (operator ruling 2026-09-19): every byte-copy verb in the exec lane
+	# + core-net either carries a `// COPY:` justification within the
+	# eight lines above it, or is in scripts/copy-audit-baseline.txt
+	# (pre-E1 legacy debt, may only shrink). A NEW unmarked copy fails.
+	# Judged by the `zero-copy-auditor` agent; this is the mechanical half.
+	bash scripts/copy-audit.sh
 
 fuzz-quick:
 	cargo fuzz run polymarket_clob_frame -- -max_total_time=60

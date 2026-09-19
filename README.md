@@ -24,31 +24,31 @@ Claude (via the `claude-worker` Python process) is an **offline strategy
 researcher** — it proposes rulesets, backtests them and stages them
 through an HMAC'd UDS command plane. It is never in the hot path.
 
-## Status
+## Status (2026-09-19)
 
-| Phase | State |
+| Lane | State |
 |---|---|
-| Stage 1 (8a–8e) | **CLOSED** — G1 soak blessed |
-| Stage 2 (8f–8h) | **CLOSED** — autonomous research loop code-complete, E2E-proven semi-manual |
-| M1 — universe config + venue breadth | **CLOSED** |
-| M2 — options ingestion (Deribit / OKX / IV channel) | **CLOSED** |
-| M3 — continuous data ops (launchd fleet) | **COMPLETE**, calendar-waiting C6 |
-| M4 — shadow-P&L attribution | **CLOSED** |
-| M5 — research loop on the full universe | **NEXT**, on explicit operator go |
-| M6 — MVP soak + sign-off | pending |
-| Stage 3 — executor / live ramp | **GATED** — see `docs/mvp-completion-plan.md` §7 |
+| Engine + capture (Stage 1–2, M1–M6, VM2, venue-time v3) | **CLOSED** — MVP complete 2026-09-02 |
+| Regime + dashboard, S3 cold archive, ICDP, XSD, VRP, BIN15 lanes | **CLOSED / live in paper** |
+| Real execution E1–E6 (per-slot routing, HL signer + arm, risk gate, kill switches) | **LANDED, reviewed + re-tested in E7 (2026-09-19)** |
+| E7 — the ramp | **TESTNET first** (operator-gated R0); mainnet is a later ruling |
+| Stage 3 — AI-promoted members live | **GATED** on the Stage-3 entry gate (waived for BIN15 only) |
 
-Stay-green baselines: **1240** nextest · **38** alloc assertions at 0 B/op ·
-**439** worker pytest. `CLAUDE.md` carries the authoritative CURRENT STATE
-section; the per-phase progress logs under `docs/` carry the latest word.
+Gates at HEAD: **2585** nextest · **62/62** alloc assertions at 0 B/op ·
+clippy clean · `make copy-audit` new=0 · **1153** worker pytest.
+`CLAUDE.md` carries the authoritative CURRENT STATE and the standing laws.
 
 ## Start here
 
-- [CLAUDE.md](./CLAUDE.md) — front-loaded context + CURRENT STATE. Read this first.
-- [docs/mvp-completion-plan.md](./docs/mvp-completion-plan.md) — the M-phase authority (§9 data storage is binding).
-- [PLAN.md](./PLAN.md) — full architecture, phased roadmap, testing strategy.
+- [CLAUDE.md](./CLAUDE.md) — current state, standing laws, hard rules. Read this first.
+- [docs/risk-policy.md](./docs/risk-policy.md) — caps, kill switches, LAWS E-1..E-9, the execution lane's record.
+- [PLAN.md](./PLAN.md) — the architecture deep-dive and doctrine (its roadmap section is historical).
+- The three sheets: [docs/phase-8-architecture-v2.svg](./docs/phase-8-architecture-v2.svg) (live architecture),
+  [docs/engine-memory-cpu.svg](./docs/engine-memory-cpu.svg) (memory, cores, the copy ledger),
+  [docs/ai-strategy-pipeline.svg](./docs/ai-strategy-pipeline.svg) (+ [.md](./docs/ai-strategy-pipeline.md)).
 - [AGENTS.md](./AGENTS.md) — tool-agnostic brief for any AI coding agent.
-- [docs/](./docs/) — wire format, risk policy, local setup, migration notes, per-phase design/progress logs. Closed history lives in [docs/arch/](./docs/arch/).
+- [docs/](./docs/) — wire format, migration notes, local setup, venue latency. History lives in
+  [docs/arch/](./docs/arch/) and research in the git-excluded `docs/research/` — both read only on request.
 
 ## Quick start
 
@@ -71,7 +71,7 @@ cargo test -p bench --test alloc_assertions --release -- --test-threads=1   # MU
 cd claude-worker && uv run pytest
 
 # 5. Paper-mode run — zero flags, universe comes from the file
-cargo run --release -p cli -- run --paper --strategy all
+cargo run --release -p cli -- run --paper --strategy ai
 ```
 
 Polymarket crypto up/down dailies **expire 16:00Z** — refresh
@@ -86,12 +86,14 @@ Boot refuses to start venue-blind.
 ## Engine subcommands
 
 ```sh
-multivenue-engine run --paper --strategy all        # spawn ingress + engine, drain until SIGINT
+multivenue-engine run --paper --strategy ai         # spawn ingress + engine, drain until SIGINT
+multivenue-engine run --strategy ai+vrp+xsd+bin15 --exec ~/multivenue/exec.toml --arm-live 3   # E7: arm ONE slot (testnet first)
 multivenue-engine print-config --env-file ./.env    # resolved non-secret config; smoke-tests the loader
 multivenue-engine audit-replay  --dir <run dir>     # per-symbol rates, cadence bands, integrity, venue×channel matrix
 multivenue-engine capture-catalog --dir <log root>  # per-run spans, UTC-day continuity, gap map, backtest/monitor views
 multivenue-engine backtest --ruleset R --replay-dir D --split 70/30   # deterministic VM replay; schema-1 JSON on stdout
-multivenue-engine audit-pnl --dir <log root>        # M4 shadow P&L: logged intents through the strict-cross fill model
+multivenue-engine audit-pnl --dir <log root>        # shadow P&L: logged intents through the strict-cross fill model
+multivenue-engine exec-smoke [--lifecycle]          # the TESTNET-only signing gate (never mainnet, by construction)
 ```
 
 Every ingress thread writes **PMLR** replay capture (per-venue tick /

@@ -100,30 +100,38 @@ enabled = 1
 #           told otherwise.
 #   live  — orders go to the venue. Needs `venues`, needs --arm-live to
 #           name this slot, and needs a compiled live arm.
-#   off   — the slot may not trade at all; every order is refused and
-#           counted. Not the same as paper: `off` is "stop", paper is
-#           "model it". Use it to silence a member without rebuilding
-#           the strategy mask.
+#   off   — the slot may not PLACE at all; every submit and modify is
+#           refused and counted. Not the same as paper: `off` is
+#           "stop", paper is "model it". Use it to silence a member
+#           without rebuilding the strategy mask.
 #
 #           *** USE `off` ONLY ON A FLAT SLOT. ***
 #
-#           `off` refuses EVERY order — entries and EXITS alike. An
-#           Order carries no reduce-only bit today, so the dispatcher
-#           cannot tell an exit from an entry. It also does NOT cancel
-#           orders already resting.
+#           `off` refuses every submit and modify — entries and EXITS
+#           alike. An Order carries no reduce-only bit, so the
+#           dispatcher cannot tell an exit from an entry.
 #
-#           This is a deliberate, documented exception to the standing
-#           law in docs/risk-policy.md that "a cap never blocks an
-#           EXIT": `off` is not a cap, it is an operator stop, and it
-#           is the only control in this file that can strand a
-#           position. Worse, members clear their logical position when
-#           they submit an exit whether or not the submit succeeded, so
-#           flipping a holding slot to `off` silently desynchronises
-#           the member from the book.
+#           A CANCEL passes (E7 review ruling, 2026-09-19): it is the
+#           only verb that can only reduce risk, and the halt machine's
+#           own law — "a cancel is the only way to get flat and must
+#           never be blocked" — holds for `off` too. Before this, a slot
+#           flipped live → off across a restart still had its orders
+#           resting at the venue and NO in-engine path to take them
+#           back (the halt sweep skips non-live slots). Now the member's
+#           own cancel path reaches the live arm on an `off` slot,
+#           counted `cancel_on_off`.
+#
+#           `off` is still a deliberate, documented exception to the
+#           standing law in docs/risk-policy.md that "a cap never blocks
+#           an EXIT": `off` is not a cap, it is an operator stop, and it
+#           can strand a POSITION (not a resting order). Members clear
+#           their logical position when they submit an exit whether or
+#           not the submit succeeded, so flipping a holding slot to
+#           `off` silently desynchronises the member from the book.
 #
 #           To stop a slot that HOLDS a position, set it to `paper`
 #           (or stop the engine) and let the member's own exit law
-#           unwind. The reduce-only exemption lands with E6.
+#           unwind. There is NO reduce-only exemption; E6 shipped none.
 mode = "paper"
 
 # name: which member the operator believes occupies this slot.
@@ -155,22 +163,27 @@ venues = ["hyperliquid"]
 # fills rather than from what the member believes. A member bug that
 # forgets its own cap still cannot spend more than these say.
 #
-# *** IN E1 THESE CAPS ARE A DECLARATION. NOTHING CLAMPS TO THEM. ***
+# *** ENFORCED SINCE E6 (2026-09-19). *** Every live submit and modify
+# passes `RoutedDispatcher::risk_check` against all four clamps before
+# it can leave the host, plus the seeding interlock (no live PLACE until
+# the arm has reconciled against the venue) and the sticky halt latch.
+# The boot tell prints `caps-ENFORCED` on a live slot. The member's own
+# caps (bin15.toml's cap_instance_usd_1e6 / cap_day_usd_1e6) stay in
+# force on the SIZING path; these are the second opinion on the
+# DISPATCH path, and a non-zero `refused_max_order` means the two
+# disagreed — that disagreement is the alarm.
 #
-# They are parsed, bounds-checked and published in the boot tell — and
-# enforced by nothing. The risk gate is E6. Until it ships, the only
-# limits in force on a slot are the MEMBER's own, from its own artifact
-# (bin15.toml's cap_instance_usd_1e6 / cap_day_usd_1e6 carry the same
-# numbers and ARE enforced by the member).
-#
-# The boot tell says so out loud — it prints `caps-DECLARED-NOT-ENFORCED`
-# and a WARNING line — precisely so that nobody reads a cap here and
-# believes a clamp exists. When E6 lands the token becomes
-# `caps-ENFORCED` and the warning goes away.
+# What the ledger-fed clamps cannot bound, stated plainly: they are
+# computed from FILLS, so N orders in flight are each judged against the
+# same position. The worst case with every quote working is
+# cap_instance_usd + max_open_orders × max_order_usd, not
+# cap_instance_usd. The three numbers multiply — set them together.
 #
 # These caps are PER SLOT, not global. `max_open_orders = 64` here is
-# not risk-policy.md's global "max total open orders 64": eight slots at
-# 64 is 512. The global line still binds.
+# eight slots at 64 = 512 live orders across the table (that is what
+# LEDGER_RESTING is sized to). risk-policy.md's "max total open orders
+# 64" line is the PAPER model's (cli::backtest::fill); the engine
+# enforces the per-slot number.
 #
 # `0` means UNSET, and unset must NEVER come to mean "unlimited" — the
 # same ruling risk-policy.md already made for the Deribit coin caps. A
@@ -209,7 +222,7 @@ request_budget_floor = 2000
 
 # ---- the kill switches (E6) -----------------------------------------
 #
-# All four are REQUIRED NON-ZERO on a live slot and the boot refuses
+# All five are REQUIRED NON-ZERO on a live slot and the boot refuses
 # without them, naming the key. `0` means UNSET here, never
 # "unlimited": a halt trigger with no threshold never fires, so a
 # missing key would be a kill switch that silently does not exist.
@@ -236,6 +249,13 @@ halt_on_ws_gap_ms = 30000
 # bound by a roll event (LAW E-4). A streak means our view of the
 # instrument has diverged from the venue's.
 halt_on_asset_refusal_streak = 3
+
+# Milliseconds since the last reconciliation that AGREED with the venue
+# before a halt. The reconciler runs every 60 s and is the one check
+# independent of every belief the engine holds; when it stops answering
+# (or stops agreeing) the safety net is dark, and this is what notices.
+# 300000 = 5 min tolerates a hiccup and halts an outage.
+halt_on_recon_stale_ms = 300000
 
 
 # Slot 1 — vrp. Explicit is better than default: writing it down means

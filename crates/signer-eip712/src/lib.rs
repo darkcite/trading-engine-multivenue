@@ -90,6 +90,26 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
     out
 }
 
+/// keccak256 over the CONCATENATION of `parts`, without concatenating.
+///
+/// The sponge absorbs each slice in turn, so a preimage made of an
+/// action, a nonce and a marker tail is hashed straight from the
+/// caller's buffers — the exchange arm used to stage all of it into a
+/// 4 KiB scratch to hand [`keccak256`] one slice, a copy and a memset
+/// per order that this removes (E7 zero-copy review, 2026-09-19).
+#[inline]
+pub fn keccak256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Keccak::v256();
+    let mut i = 0usize;
+    while i < parts.len() {
+        h.update(parts[i]);
+        i += 1;
+    }
+    let mut out = [0u8; 32];
+    h.finalize(&mut out);
+    out
+}
+
 // -----------------------------------------------------------------
 // Signing primitive
 // -----------------------------------------------------------------
@@ -112,6 +132,10 @@ pub fn sign_digest_with_key(sk: &SecretKey, digest: &[u8; 32]) -> Result<[u8; 65
     let sig = secp.sign_ecdsa_recoverable(&msg, sk);
     let (rec_id, data) = sig.serialize_compact();
     let mut out = [0u8; 65];
+    // COPY: the 64 B `r‖s` secp256k1 hands back BY VALUE into the
+    // 65 B Ethereum layout that adds `v` — per signature; the library
+    // has no API that serialises into a caller slice, and the 65 B
+    // form is what the wire carries.
     out[..64].copy_from_slice(&data);
     // Ethereum convention: v = recid + 27.
     out[64] = 27u8.saturating_add(rec_id.to_i32() as u8);
@@ -428,6 +452,8 @@ pub fn address_from_private_key(key: &[u8; 32]) -> Result<[u8; 20], SignError> {
     let serialized = pk.serialize_uncompressed();
     let hash = keccak256(&serialized[1..]); // drop the 0x04 prefix
     let mut out = [0u8; 20];
+    // COPY: the low 20 B of the pubkey hash into the address — boot
+    // (key derivation) and tests only; a `[u8; 20]` is a value.
     out.copy_from_slice(&hash[12..32]);
     Ok(out)
 }

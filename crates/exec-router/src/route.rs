@@ -29,9 +29,11 @@
 //!
 //! ## Layout
 //!
-//! `#[repr(C, align(64))]`, 128 bytes = exactly two cache lines, with
+//! `#[repr(C, align(64))]`, 512 bytes = eight cache lines, with
 //! **both hot arrays in the first 16 bytes** so the per-submit lookup
-//! touches one line and never pointer-chases.
+//! touches one line and never pointer-chases; the E6 clamps sit on
+//! lines 2–4 and the halt thresholds on lines 5–8, none of which a
+//! paper submit ever reads.
 
 use crate::mode::ExecMode;
 
@@ -173,6 +175,10 @@ pub struct HaltLimits {
     pub recon_drift_usd_1e6: i64,
     /// Milliseconds without the venue's user-event stream.
     pub ws_gap_ms: i64,
+    /// Milliseconds since the last reconciliation that AGREED. A
+    /// reconciler that stops answering — or stops agreeing — is the
+    /// safety net going dark, and the first cut could not see it.
+    pub recon_stale_ms: i64,
     /// Consecutive venue rejections.
     pub reject_streak: u32,
     /// Consecutive LAW E-4 refusals (an order naming a rolled
@@ -188,6 +194,7 @@ impl HaltLimits {
         Self {
             recon_drift_usd_1e6: 0,
             ws_gap_ms: 0,
+            recon_stale_ms: 0,
             reject_streak: 0,
             asset_refusal_streak: 0,
         }
@@ -201,10 +208,12 @@ impl HaltLimits {
         recon_drift_usd_1e6: i64,
         ws_gap_ms: i64,
         asset_refusal_streak: u32,
+        recon_stale_ms: i64,
     ) -> Self {
         Self {
             recon_drift_usd_1e6,
             ws_gap_ms,
+            recon_stale_ms,
             reject_streak,
             asset_refusal_streak,
         }
@@ -234,11 +243,11 @@ pub struct ExecRoute {
     cap_instance_usd_1e6: [i64; EXEC_SLOTS],
     /// **E6** — per-slot day clamp, USD x1e6, filled buy turnover.
     cap_day_usd_1e6: [i64; EXEC_SLOTS],
-    /// **E6 commit 3** — per-slot halt thresholds.
-    halts: [HaltLimits; EXEC_SLOTS],
-    /// Pad the pre-E6-commit-3 fields to a whole number of lines
+    /// Pad the clamp fields (240 B) to a whole number of lines
     /// (256 B, four of them), so the halt table that follows starts
-    /// on a line boundary. E1 reserved 16 B here
+    /// on a line boundary — which this field only achieves by sitting
+    /// BEFORE `halts`; an earlier layout declared it after and the
+    /// comment was describing tail padding. E1 reserved 16 B here
     /// "for E6's clamps"; E6 needs 128 B, so the struct grew by two
     /// lines. What the reservation actually bought is what it was for:
     /// the hot arrays did not move. `modes` and `venue_mask` are still
@@ -247,6 +256,9 @@ pub struct ExecRoute {
     /// mode branch has already resolved — sit on lines 2 and 3 where
     /// a paper boot never touches them.
     _pad: [u8; 16],
+    /// **E6 commit 3** — per-slot halt thresholds. 32 B each, eight
+    /// of them: lines 5–8.
+    halts: [HaltLimits; EXEC_SLOTS],
 }
 
 impl Default for ExecRoute {
@@ -395,6 +407,24 @@ impl ExecRoute {
         m
     }
 
+    /// Is any LIVE slot routed to `venue`? Cold; the boot decides
+    /// from this whether to construct a real arm for that venue.
+    #[inline]
+    #[must_use]
+    pub fn venue_live(&self, venue: u8) -> bool {
+        if venue >= EXEC_VENUES {
+            return false;
+        }
+        let mut i = 0usize;
+        while i < EXEC_SLOTS {
+            if self.modes[i] == ExecMode::Live as u8 && self.venue_mask[i] & (1u8 << venue) != 0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// The slot's venue bitmask. Cold; boot tell + `/state`.
     #[inline]
     #[must_use]
@@ -489,11 +519,16 @@ mod tests {
     use core_types::{STRATEGY_ID_NONE, STRATEGY_SLOT_BIN15};
 
     #[test]
-    fn layout_is_seven_cache_lines_with_the_hot_arrays_first() {
-        assert_eq!(core::mem::size_of::<ExecRoute>(), 448, "seven cache lines");
-        assert_eq!(core::mem::size_of::<HaltLimits>(), 24, "HaltLimits is 24 B");
+    fn layout_is_eight_cache_lines_with_the_hot_arrays_first() {
+        assert_eq!(core::mem::size_of::<ExecRoute>(), 512, "eight cache lines");
+        assert_eq!(core::mem::size_of::<HaltLimits>(), 32, "HaltLimits is 32 B");
         assert_eq!(core::mem::size_of::<SlotCaps>(), 32, "SlotCaps is 32 B");
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
+        assert_eq!(
+            core::mem::offset_of!(ExecRoute, halts),
+            256,
+            "the halt table starts on a line boundary — that is what `_pad` is for"
+        );
         // The hot arrays must sit inside the FIRST cache line, or the
         // per-submit lookup costs two lines instead of one.
         let r = ExecRoute::all_paper();

@@ -333,8 +333,9 @@ pub struct DispatchStats {
 
 impl DispatchStats {
     /// Increment the per-category counter for `e` and bump the
-    /// aggregate `rejected`. Used by both `PaperDispatcher` (only
-    /// QueueFull reachable) and `LiveDispatcher` (every variant).
+    /// aggregate `rejected`. Used by `PaperDispatcher` (QueueFull on a
+    /// submit; the lifecycle variants on a cancel or modify the matcher
+    /// refused) and `LiveDispatcher` (every variant).
     #[inline]
     pub fn record_rejection(&mut self, e: DispatchError) {
         match e {
@@ -510,15 +511,15 @@ pub trait OrderDispatch {
     /// lock on the fill path — but the idle wait is no longer tens of
     /// microseconds, and a caller that needs a bound must impose one.
     ///
-    /// **WHERE IT DOES NOT REACH, TODAY.** `DispatcherWorker` is
-    /// constructed in exactly one production place: the legacy
-    /// Polymarket `--live` path. The `--exec` path hands its
-    /// `RoutedDispatcher` straight to the engine loop, so nothing
-    /// calls this hook there — which is the one path that can arm
-    /// Hyperliquid. `RoutedDispatcher` forwards `on_idle` to both arms
-    /// so the plumbing is ready, but the worker that would drive it is
-    /// not wired on that path, and wiring it is an arming-path change
-    /// that belongs with E7 rather than being inferred here.
+    /// **WHO DRIVES IT.** Two drivers, one per boot mode, never both:
+    /// the legacy Polymarket `--live` path through `DispatcherWorker`
+    /// on its own thread, and — since E6 commit 3a — the engine loop
+    /// itself (`Engine::drive_dispatcher_idle`, paced by
+    /// `cli::paper::IdlePacer` at "a quiet tick, or 2 ms") on the
+    /// `--exec` path, where `RoutedDispatcher` forwards it to both
+    /// arms. An earlier version of this doc said nothing called it on
+    /// `--exec`; that was true until 3a and is a safety claim now, so
+    /// it is corrected rather than left.
     ///
     /// Returns whether it did any work.
     #[inline]
@@ -667,6 +668,84 @@ pub trait OrderDispatch {
     fn exec_counters(&self) -> ExecCounters {
         ExecCounters::default()
     }
+
+    /// **E7: what the LIVE ARM did**, when there is one.
+    ///
+    /// The exchange arm's own counters — fills booked and refused,
+    /// reconciliations, sweeps, the address budget's headroom — used
+    /// to reach nothing: `stats()` returned a default and every one
+    /// of them was a unit-test fact. Four of the five blocking
+    /// findings of the E7 review were invisible for exactly that
+    /// reason. The router forwards its live arm's answer; a paper
+    /// dispatcher reports the zero set.
+    #[inline]
+    fn arm_counters(&self) -> LiveArmCounters {
+        LiveArmCounters::default()
+    }
+}
+
+/// **E7 — the live arm's operator numbers**, carried across the
+/// `OrderDispatch` boundary the same way [`ExecCounters`] is. A
+/// zeroed set means "no live arm". Cold: read once a second for
+/// `/state` and every 5 s for `/metrics`, so it crosses by value.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveArmCounters {
+    /// Orders the venue accepted (resting or filled).
+    pub submitted: u64,
+    /// Orders the venue understood and refused.
+    pub rejected: u64,
+    /// Submits refused locally before any packet left.
+    pub refused_local: u64,
+    /// The LAW E-4 subset of `refused_local`: the order named an
+    /// instance the table has rolled past.
+    pub refused_stale: u64,
+    /// Actions that reached the wire and whose answer was never read.
+    /// Non-zero = there may be an order at the venue no local book
+    /// has an id for; reconciliation is what finds it.
+    pub sent_unanswered: u64,
+    /// Fills that reached fill lane 3.
+    pub fills_booked: u64,
+    /// Fills whose coin no roll had bound (LAW E-4 on the fill path).
+    pub fills_unresolved: u64,
+    /// Fills whose cloid was not ours.
+    pub fills_foreign: u64,
+    /// Fills the lane could not take. **A position the engine does
+    /// not know it has.**
+    pub fills_dropped: u64,
+    /// Rows refused by the converter (sign, scale).
+    pub fills_refused: u64,
+    /// `userFills` frames that did not scan — a dropped snapshot.
+    pub fills_scan_failed: u64,
+    /// Settlements on a leg no member traded.
+    pub fills_unowned: u64,
+    /// Reconciliations that parsed.
+    pub recon_ok: u64,
+    /// Reconciliations that did not (transport or parse).
+    pub recon_failed: u64,
+    /// Legs that disagreed at the last comparison.
+    pub recon_drift_legs: u64,
+    /// Venue-held outcome legs the last comparison never looked at.
+    pub recon_unseen_legs: u64,
+    /// LAW E-8 sweeps abandoned with orders possibly still resting.
+    pub sweep_left: u64,
+    /// Sweeps that stopped shrinking and were force-terminated.
+    pub sweep_stalled: u64,
+    /// Legs a cancel-all could not queue.
+    pub cancel_all_unqueued: u64,
+    /// User-event socket reconnects.
+    pub ws_reconnects: u64,
+    /// User-event socket connect failures.
+    pub ws_connect_failures: u64,
+    /// Roll events that bound both legs.
+    pub rolls_bound: u64,
+    /// Roll events refused (malformed, no room, no outcome).
+    pub rolls_refused: u64,
+    /// Symbols two slots both traded — a configuration error.
+    pub owner_contested: u64,
+    /// The address request budget's remaining headroom, per the
+    /// governor. Negative = past the venue's cliff.
+    pub budget_remaining: i64,
 }
 
 /// **What the venue has told us about a requested cancel-all.**
@@ -733,15 +812,25 @@ pub struct HaltSignal {
     /// `1` when the address request budget is at or below its floor.
     pub budget_floor_breached: u8,
     /// `1` once the arm has reconciled against the venue at least
-    /// once since boot.
+    /// once since boot AND that reconciliation agreed on every leg it
+    /// looked at and covered every leg the venue holds.
     ///
     /// Not a halt trigger — the opposite. It is what lets the router
     /// call `Ledger::mark_seeded` and stop refusing every live place,
     /// and it rides here because it is the same question ("what does
     /// the arm know about the venue?") answered by the same poll.
     pub reconciled: u8,
-    /// Explicit tail padding.
+    /// Explicit padding.
     _pad: [u8; 6],
+    /// Nanoseconds since the last reconciliation that AGREED. `0` =
+    /// never (the seeding interlock already refuses that case). Once
+    /// an arm has agreed with the venue, a reconciler that stops
+    /// answering or stops agreeing is measured here — the first cut
+    /// had no such term, so a `/info` endpoint that started failing
+    /// left "the single most valuable safety net in the plan"
+    /// silently disabled while the arm kept trading (E7 review,
+    /// 2026-09-19). Compared against `halt_on_recon_stale_ms`.
+    pub recon_age_ns: u64,
 }
 
 impl HaltSignal {
@@ -755,6 +844,7 @@ impl HaltSignal {
         asset_refusal_streak: u32,
         budget_floor_breached: bool,
         reconciled: bool,
+        recon_age_ns: u64,
     ) -> Self {
         Self {
             ws_gap_ns,
@@ -764,11 +854,12 @@ impl HaltSignal {
             budget_floor_breached: budget_floor_breached as u8,
             reconciled: reconciled as u8,
             _pad: [0; 6],
+            recon_age_ns,
         }
     }
 }
 
-const _: () = assert!(core::mem::size_of::<HaltSignal>() == 32);
+const _: () = assert!(core::mem::size_of::<HaltSignal>() == 40);
 
 /// Strategy slots [`ExecCounters`] reports on. Mirrors
 /// `exec_router::EXEC_SLOTS`; the two are asserted equal in
@@ -801,11 +892,19 @@ pub struct ExecCounters {
     /// Refused because a live slot named a venue it has no route to
     /// (LAW E-1 — refused, never downgraded to paper).
     pub refused_no_route: u64,
-    /// **E6: refused by the risk gate** — the request's notional
-    /// exceeded the slot's operator-set `max_order_usd`. A second
-    /// opinion over the member's own caps; a non-zero value means the
-    /// two disagreed.
+    /// **E6: refused by the risk gate** — the SUM of every clamp's
+    /// refusals (`max_order_usd`, `cap_instance_usd`, `cap_day_usd`,
+    /// `max_open_orders`, the seeding interlock, the halt latch).
+    /// Only the `max_order_usd` share still means "the member and the
+    /// operator disagreed"; the rest mean the operator's ceiling was
+    /// reached, which is the clamp working. An alert belongs on
+    /// `exec_router::RouteCounters::refused_max_order`, not here.
     pub refused_risk: u64,
+    /// **E7 review ruling** — cancels that reached the live arm on an
+    /// `Off` slot. Off refuses every PLACE; a cancel can only reduce
+    /// risk and is the one path that can take back an order a
+    /// previous boot left resting, so it passes and is counted.
+    pub cancel_on_off: u64,
     /// **E6 commit 4: refused because the slot is HALTED.** A
     /// subset of `refused_risk`, broken out because a halt is the one
     /// refusal reason an operator must not have to infer.
@@ -836,8 +935,29 @@ pub struct ExecCounters {
     pub halted: [u8; EXEC_COUNTER_SLOTS],
     /// Per-slot live submits.
     pub live_submits_by_slot: [u64; EXEC_COUNTER_SLOTS],
-    /// Per-slot refusals (off + no-route).
+    /// Per-slot refusals — every reason (off, no-route, and the risk
+    /// gate's six).
     pub refused_by_slot: [u64; EXEC_COUNTER_SLOTS],
+    /// **E7 — the venue-fill ledger's own alarms**, which reached no
+    /// surface at all in E6 (the module called them operator-visible;
+    /// they were unit-test-visible). A venue fill on a leg whose bind
+    /// was refused: **the risk gate has stopped seeing a real
+    /// position.**
+    pub ledger_fills_unbound: u64,
+    /// A sell that took a leg below zero: the router and the venue
+    /// disagree and cannot self-heal.
+    pub ledger_sells_below_zero: u64,
+    /// Roll binds refused for want of a row.
+    pub ledger_binds_refused: u64,
+    /// Resting-table rows that could not be taken — the
+    /// `max_open_orders` count ratchets toward permanent refusal.
+    pub ledger_resting_full: u64,
+    /// Two rows under one `(client_oid, slot)` key.
+    pub ledger_resting_ambiguous: u64,
+    /// Settle frames that matched no bound row.
+    pub ledger_settles_unmatched: u64,
+    /// The live arm's own numbers. Zeroed when there is no arm.
+    pub arm: LiveArmCounters,
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as
@@ -1426,7 +1546,15 @@ impl OrderDispatch for PaperDispatcher {
     /// pulled.
     #[inline]
     fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
-        self.matcher.cancel(req)
+        // A refusal is recorded here, on the same `DispatchStats` the
+        // 5 s tick mirrors. `rejected_lifecycle` had no production
+        // writer at all until the E7 review — a documented operator
+        // surface that read a permanent zero.
+        let r = self.matcher.cancel(req);
+        if let Err(e) = r {
+            self.stats.record_rejection(e);
+        }
+        r
     }
 
     /// E5 — likewise. A modify replaces an order rather than adding
@@ -1449,7 +1577,11 @@ impl OrderDispatch for PaperDispatcher {
     /// timestamp is easy to write.
     #[inline]
     fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
-        self.matcher.modify(req, req.order().ts_ns)
+        let r = self.matcher.modify(req, req.order().ts_ns);
+        if let Err(e) = r {
+            self.stats.record_rejection(e);
+        }
+        r
     }
 
     fn try_next_fill(&mut self) -> Option<Fill> {

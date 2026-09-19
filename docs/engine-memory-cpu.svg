@@ -1,0 +1,748 @@
+<svg viewBox="0 0 1680 2272" width="1680" height="2272" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" xmlns:c2pa="http://c2pa.org/manifest"><metadata><c2pa:manifest>AAAWgmp1bWIAAAAeanVtZGMycGEAEQAQgAAAqgA4m3EDYzJwYQAAABZcanVtYgAAAEdqdW1kYzJtYQARABCAAACqADibcQN1cm46YzJwYToyMGFkMjY2OS02MzM4LTQ5MjItOTBlYS05ZWFlZGFkZTVlNGYAAAADl2p1bWIAAAApanVtZGMyYXMAEQAQgAAAqgA4m3EDYzJwYS5hc3NlcnRpb25zAAAAALxqdW1iAAAARGp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuaW5ncmVkaWVudC52MwAAAAAYYzJzaCR8jOqDWYWulxRkp+OT9zMAAABwY2JvcqNpZGM6Zm9ybWF0bWltYWdlL3N2Zyt4bWxqaW5zdGFuY2VJRHgseG1wOmlpZDoxY2IyM2VkMy0wOTJkLTQyODYtOTU5Ni02YTAzYmIzMGRlMGNscmVsYXRpb25zaGlwaHBhcmVudE9mAAAB4mp1bWIAAABBanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5hY3Rpb25zLnYyAAAAABhjMnNoNgjm11cNOxGReyDtbJLkiwAAAZljYm9yomdhY3Rpb25zgqJmYWN0aW9ua2MycGEub3BlbmVkanBhcmFtZXRlcnOha2luZ3JlZGllbnRzgaJjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFgg/+04dgQM0hgEuvr0jF7Q47oyr6/Ztp8+Wq7Y0odhwv2kZmFjdGlvbngdY29tLmFudGhyb3BpYy5jbGF1ZGUucHJvdmlkZWRqcGFyYW1ldGVyc6F4H2NvbS5hbnRocm9waWMub3JpZ2luLWNvbmZpZGVuY2VndW5rbm93bmtkZXNjcmlwdGlvbnhmQ2xhdWRlIHByb3ZpZGVkIHRoaXMgZmlsZSBhdCB0aGUgcmVxdWVzdCBvZiBhIHVzZXIgYW5kIG1heSBoYXZlIGNyZWF0ZWQgb3IgbW9kaWZpZWQgdGhlIGZpbGUgY29udGVudHMubXNvZnR3YXJlQWdlbnShZG5hbWVmQ2xhdWRlcmFsbEFjdGlvbnNJbmNsdWRlZPUAAADIanVtYgAAAEBqdW1kY2JvcgARABCAAACqADibcRNjMnBhLmhhc2guZGF0YQAAAAAYYzJzaJTkC0+N2mhflGmtHIXb6YoAAACAY2JvcqVjYWxnZnNoYTI1NmNwYWRMAAAAAAAAAAAAAAAAZGhhc2hYIH0lsElrXJVOz3Jc3eBNYYDrUOhD2Kszpvj5NfxDtx5rZG5hbWVuanVtYmYgbWFuaWZlc3RqZXhjbHVzaW9uc4GiZXN0YXJ0GQELZmxlbmd0aBkeBAAAAj5qdW1iAAAAJ2p1bWRjMmNsABEAEIAAAKoAOJtxA2MycGEuY2xhaW0udjIAAAACD2Nib3KlY2FsZ2ZzaGEyNTZpc2lnbmF0dXJleE1zZWxmI2p1bWJmPS9jMnBhL3VybjpjMnBhOjIwYWQyNjY5LTYzMzgtNDkyMi05MGVhLTllYWVkYWRlNWU0Zi9jMnBhLnNpZ25hdHVyZWppbnN0YW5jZUlEeCx4bXA6aWlkOjVmOTY5ODk5LWE2M2EtNDRhYS04MWUwLTEwYTNjZWIxMDNkM3JjcmVhdGVkX2Fzc2VydGlvbnODomN1cmx4LXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaW5ncmVkaWVudC52M2RoYXNoWCD/7Th2BAzSGAS6+vSMXtDjujKvr9m2nz5artjSh2HC/aJjdXJseCpzZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmFjdGlvbnMudjJkaGFzaFgg7LVn8SaukArRj4CvgmhhptnicOKz6IU9XEkbBCbi/kaiY3VybHgpc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5oYXNoLmRhdGFkaGFzaFggo0kvOOGsczWzlAI9hL08XMoBpd1brOA+JfV1xcDxSS50Y2xhaW1fZ2VuZXJhdG9yX2luZm+jZG5hbWVvQW50aHJvcGljIEZpbGVzZ3ZlcnNpb25lMS4wLjBrc3BlY1ZlcnNpb25lMi40LjAAABA4anVtYgAAAChqdW1kYzJjcwARABCAAACqADibcQNjMnBhLnNpZ25hdHVyZQAAABAIY2JvctKEWQISogEmGCFZAgowggIGMIIBjaADAgECAhRA5aAK7sI50L64g/oGQgU9Z1UTADAKBggqhkjOPQQDAzBJMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEuMCwGA1UEAxMlQW50aHJvcGljIENvbnRlbnQgQ3JlZGVudGlhbHMgUm9vdCBDQTAeFw0yNjA4MDcxODQzNTZaFw0yODA4MDYxOTQzNTZaMEQxFzAVBgNVBAoTDkFudGhyb3BpYywgUEJDMSkwJwYDVQQDEyBBbnRocm9waWMgQ2xhdWRlIENvbnRlbnQgU2lnbmluZzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJh6CmvLUBgFFNU0vUKlOVtE6djd17L5SuwX0LemFisBM3dkd/3cyjxFA3Qo5S46fX0/ihY0VZ7mfb9KF703t5OjWDBWMA4GA1UdDwEB/wQEAwIHgDAVBgNVHSUEDjAMBgorBgEEAYPoXgIBMAwGA1UdEwEB/wQCMAAwHwYDVR0jBBgwFoAUzlHiBIFOZFsj+OPEz5o+nMHXXMIwCgYIKoZIzj0EAwMDZwAwZAIwMXMdFJ4BetLLVY7ORuE9noqbbAZOZn/aArXyTwFAZfKrPzxF2vPoJNf1+UCdg1XGAjBwX1zd9WGqYkqmL5SFqw1QySjr1zJfpJM9+1rdDwSPLMOPOjKuiXjoU/pUUeG9RwmhY3BhZFkNngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPZYQHB2SGWkM/CQ2VvqsOA+P11eWZ7gD5YNEbWRSdH4nogpeTNw4x6nMQUTzaxN55XI1wdixmKjfDby/Pg1Ion9d14=</c2pa:manifest></metadata>
+<title id="ttl">Engine memory, cores and the copy ledger — 2026-09-19</title>
+<desc id="dsc">An audit sheet: every thread and the core it claims, every copy the bytes of one tick undergo from NIC to strategy callback, the resident memory map, the cache-line layout of the POD types, and the build profile. It contradicts the one-copy-per-event doctrine printed on the older architecture sheet: counting every full-record memcpy, a tick costs three and a depth snapshot four. The E7 addendum at the foot carries the exec lane's own TX/RX ledger after the 2026-09-19 zero-copy pass.</desc>
+<!-- Memory / CPU / zero-copy audit. Generated 2026-09-19 at HEAD 1225651. Every copy verdict below was established by reading the code, not the comments; file:line is given for each. Where a doc comment in the tree claims otherwise, the code is what is drawn. -->
+<defs>
+<marker id="aI" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#3f4a5a"/></marker>
+<marker id="aB" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#1d4ed8"/></marker>
+<marker id="aG" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#047857"/></marker>
+<marker id="aP" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#6d28d9"/></marker>
+<marker id="aA" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#b45309"/></marker>
+<marker id="aR" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#b91c1c"/></marker>
+<marker id="aS" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#94a3b8"/></marker>
+<marker id="aT" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6.4" markerHeight="6.4" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#0e7490"/></marker>
+</defs>
+<style>
+text{dominant-baseline:auto}
+.m{fill:#7c8798}.f{fill:#9aa5b4}.i{fill:#14181f}.i2{fill:#3f4a5a}
+</style>
+<rect x="0" y="0" width="1680" height="1944" fill="#ffffff"/>
+<text x="36" y="32" font-size="19" font-weight="700" fill="#14181f">Memory, cores and the copy ledger</text>
+<text x="36" y="50" font-size="8.6" fill="#3f4a5a"><tspan font-weight="700" fill="#3f4a5a">what the engine actually does with RAM and CPU</tspan><tspan fill="#7c8798">   ·   read from crates/ at HEAD 1225651, 2026-09-19; the exec-lane addendum at the foot re-read at the E7 review   ·   companion to </tspan><tspan font-weight="700" fill="#7c8798">docs/phase-8-architecture-v2.svg</tspan></text>
+<text x="36" y="66" font-size="8.6" fill="#3f4a5a"><tspan font-weight="700" fill="#b91c1c">This sheet contradicts the doctrine line on the 2026-08-29 architecture sheet. </tspan><tspan fill="#3f4a5a">“one unavoidable copy per event” is not what the code does — counting every full-record memcpy, a tick costs three and a depth snapshot four.</tspan></text>
+<rect x="1104" y="23" width="15" height="10.5" rx="2.5" fill="#04785718" stroke="#047857" stroke-width="1.1"/>
+<text x="1124" y="32" font-size="7.5" fill="#7c8798">zero-copy — verified</text>
+<rect x="1227.0" y="23" width="15" height="10.5" rx="2.5" fill="#b4530918" stroke="#b45309" stroke-width="1.1"/>
+<text x="1247.0" y="32" font-size="7.5" fill="#7c8798">a real copy</text>
+<rect x="1310.85" y="23" width="15" height="10.5" rx="2.5" fill="#b91c1c18" stroke="#b91c1c" stroke-width="1.1"/>
+<text x="1330.85" y="32" font-size="7.5" fill="#7c8798">more copies than claimed</text>
+<rect x="1451.25" y="23" width="15" height="10.5" rx="2.5" fill="#94a3b818" stroke="#94a3b8" stroke-width="1.1"/>
+<text x="1471.25" y="32" font-size="7.5" fill="#7c8798">unverifiable here</text>
+<line x1="36" y1="80" x2="1644" y2="80" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.5"/>
+<rect x="36" y="94" width="1608" height="342" rx="9" fill="rgba(63,74,90,0.03)" stroke="#3f4a5a" stroke-width="1.15"/>
+<text x="50" y="113" font-size="11.2" font-weight="700" fill="#3f4a5a">THE PATH OF ONE TICK — every hop the bytes take, and what happens to them there</text>
+<text x="50" y="127" font-size="7.8" fill="#7c8798">Nine hops from the wire to a strategy callback.  Four of them move no bytes at all.  One is inside rustls and cannot be checked from here.  The rest copy — and every one of those is unconditional.</text>
+<rect x="50.0" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(148,163,184,0.06)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="59.0" y="154" font-size="8.7" font-weight="700" fill="#14181f">kernel socket</text>
+<text x="59.0" y="165.0" font-size="6.4" fill="#9aa5b4">rustls read_tls(&amp;mut sock)</text>
+<text x="59.0" y="189.0" font-size="6.7" fill="#7c8798">ciphertext into rustls&#x27;</text>
+<text x="59.0" y="198.0" font-size="6.7" fill="#7c8798">own buffers</text>
+<rect x="57.0" y="222" width="154.44444444444446" height="15" rx="4" fill="#ffffff" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="134.22222222222223" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#94a3b8">OUTSIDE OUR CODE</text>
+<text x="59.0" y="251.0" font-size="6.1" fill="#9aa5b4">core-net/transport.rs:187</text>
+<line x1="219.44444444444446" y1="204" x2="224.94444444444446" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="226.44444444444446" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(180,83,9,0.05)" stroke="#b45309" stroke-width="1.0"/>
+<text x="235.44444444444446" y="154" font-size="8.7" font-weight="700" fill="#14181f">TLS decrypt</text>
+<text x="235.44444444444446" y="165.0" font-size="6.4" fill="#9aa5b4">rustls 0.23, io::Read</text>
+<text x="235.44444444444446" y="189.0" font-size="6.7" fill="#7c8798">plaintext lands DIRECTLY</text>
+<text x="235.44444444444446" y="198.0" font-size="6.7" fill="#7c8798">in our IoBuf — no</text>
+<text x="235.44444444444446" y="207.0" font-size="6.7" fill="#7c8798">intermediate buffer</text>
+<rect x="233.44444444444446" y="222" width="154.44444444444446" height="15" rx="4" fill="#ffffff" stroke="#b45309" stroke-width="1.0"/>
+<text x="310.6666666666667" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#b45309">COPY · unavoidable</text>
+<text x="235.44444444444446" y="251.0" font-size="6.1" fill="#9aa5b4">transport.rs:246-306</text>
+<line x1="395.8888888888889" y1="204" x2="401.3888888888889" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="402.8888888888889" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(4,120,87,0.05)" stroke="#047857" stroke-width="1.0"/>
+<text x="411.8888888888889" y="154" font-size="8.7" font-weight="700" fill="#14181f">IoBuf</text>
+<text x="411.8888888888889" y="165.0" font-size="6.4" fill="#9aa5b4">per-connection, preallocated</text>
+<text x="411.8888888888889" y="189.0" font-size="6.7" fill="#7c8798">64 KiB → 4 MiB by venue</text>
+<text x="411.8888888888889" y="198.0" font-size="6.7" fill="#7c8798">compaction copies only</text>
+<text x="411.8888888888889" y="207.0" font-size="6.7" fill="#7c8798">when the tail pins full</text>
+<rect x="409.8888888888889" y="222" width="154.44444444444446" height="15" rx="4" fill="#ffffff" stroke="#047857" stroke-width="1.0"/>
+<text x="487.11111111111114" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#047857">ZERO-COPY · amortised</text>
+<text x="411.8888888888889" y="251.0" font-size="6.1" fill="#9aa5b4">core-net/iobuf.rs:67-69</text>
+<line x1="572.3333333333334" y1="204" x2="577.8333333333334" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="579.3333333333334" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(4,120,87,0.05)" stroke="#047857" stroke-width="1.0"/>
+<text x="588.3333333333334" y="154" font-size="8.7" font-weight="700" fill="#14181f">WS de-frame</text>
+<text x="588.3333333333334" y="165.0" font-size="6.4" fill="#9aa5b4">XOR unmask IN PLACE</text>
+<text x="588.3333333333334" y="189.0" font-size="6.7" fill="#7c8798">read_unaligned /</text>
+<text x="588.3333333333334" y="198.0" font-size="6.7" fill="#7c8798">write_unaligned over the</text>
+<text x="588.3333333333334" y="207.0" font-size="6.7" fill="#7c8798">same bytes</text>
+<rect x="586.3333333333334" y="222" width="154.44444444444446" height="15" rx="4" fill="#ffffff" stroke="#047857" stroke-width="1.0"/>
+<text x="663.5555555555557" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#047857">ZERO-COPY</text>
+<text x="588.3333333333334" y="251.0" font-size="6.1" fill="#9aa5b4">ws_frame.rs:291-325</text>
+<line x1="748.7777777777778" y1="204" x2="754.2777777777778" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="755.7777777777778" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(4,120,87,0.05)" stroke="#047857" stroke-width="1.0"/>
+<text x="764.7777777777778" y="154" font-size="8.7" font-weight="700" fill="#14181f">payload slice</text>
+<text x="764.7777777777778" y="165.0" font-size="6.4" fill="#9aa5b4">&amp;rx.filled()[range]</text>
+<text x="764.7777777777778" y="189.0" font-size="6.7" fill="#7c8798">a borrowed slice, never</text>
+<text x="764.7777777777778" y="198.0" font-size="6.7" fill="#7c8798">a Vec · no reassembly</text>
+<text x="764.7777777777778" y="207.0" font-size="6.7" fill="#7c8798">buffer exists at all</text>
+<rect x="762.7777777777778" y="222" width="154.44444444444446" height="15" rx="4" fill="#ffffff" stroke="#047857" stroke-width="1.0"/>
+<text x="840.0" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#047857">ZERO-COPY</text>
+<text x="764.7777777777778" y="251.0" font-size="6.1" fill="#9aa5b4">6 ingress run_loops</text>
+<line x1="925.2222222222223" y1="204" x2="930.7222222222223" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="932.2222222222223" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(4,120,87,0.05)" stroke="#047857" stroke-width="1.0"/>
+<text x="941.2222222222223" y="154" font-size="8.7" font-weight="700" fill="#14181f">byte-scan parse</text>
+<text x="941.2222222222223" y="165.0" font-size="6.4" fill="#9aa5b4">no serde_json, no String</text>
+<text x="941.2222222222223" y="189.0" font-size="6.7" fill="#7c8798">scan_u64 / scan_price_1e6</text>
+<text x="941.2222222222223" y="198.0" font-size="6.7" fill="#7c8798">write straight into the</text>
+<text x="941.2222222222223" y="207.0" font-size="6.7" fill="#7c8798">Tick&#x27;s own fields</text>
+<rect x="939.2222222222223" y="222" width="154.44444444444446" height="15" rx="4" fill="#ffffff" stroke="#047857" stroke-width="1.0"/>
+<text x="1016.4444444444446" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#047857">ZERO-COPY · ZERO-ALLOC</text>
+<text x="941.2222222222223" y="251.0" font-size="6.1" fill="#9aa5b4">core-parse/src/lib.rs:41-89</text>
+<line x1="1101.6666666666667" y1="204" x2="1107.1666666666667" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="1108.6666666666667" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(185,28,28,0.05)" stroke="#b91c1c" stroke-width="1.15"/>
+<text x="1117.6666666666667" y="154" font-size="8.7" font-weight="700" fill="#14181f">capture</text>
+<text x="1117.6666666666667" y="165.0" font-size="6.4" fill="#9aa5b4">capture.tick(&amp;tick) FIRST</text>
+<text x="1117.6666666666667" y="189.0" font-size="6.7" fill="#7c8798">copy_from_slice into a</text>
+<text x="1117.6666666666667" y="198.0" font-size="6.7" fill="#7c8798">64 KiB staging buffer,</text>
+<text x="1117.6666666666667" y="207.0" font-size="6.7" fill="#7c8798">then write_all on full</text>
+<rect x="1115.6666666666667" y="222" width="154.44444444444446" height="15" rx="4" fill="rgba(185,28,28,0.10)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="1192.888888888889" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#b91c1c">COPY 1 · ALWAYS ON</text>
+<text x="1117.6666666666667" y="251.0" font-size="6.1" fill="#9aa5b4">core-io/src/lib.rs:87-99</text>
+<line x1="1278.1111111111113" y1="204" x2="1283.6111111111113" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="1285.1111111111113" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(185,28,28,0.05)" stroke="#b91c1c" stroke-width="1.15"/>
+<text x="1294.1111111111113" y="154" font-size="8.7" font-weight="700" fill="#14181f">ring push</text>
+<text x="1294.1111111111113" y="165.0" font-size="6.4" fill="#9aa5b4">Producer::try_push</text>
+<text x="1294.1111111111113" y="189.0" font-size="6.7" fill="#7c8798">one ptr::write of the</text>
+<text x="1294.1111111111113" y="198.0" font-size="6.7" fill="#7c8798">POD into the slot ·</text>
+<text x="1294.1111111111113" y="207.0" font-size="6.7" fill="#7c8798">get_unchecked, no bounds</text>
+<rect x="1292.1111111111113" y="222" width="154.44444444444446" height="15" rx="4" fill="rgba(185,28,28,0.10)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="1369.3333333333335" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#b91c1c">COPY 2</text>
+<text x="1294.1111111111113" y="251.0" font-size="6.1" fill="#9aa5b4">core-ring/src/lib.rs:214</text>
+<line x1="1454.5555555555557" y1="204" x2="1460.0555555555557" y2="204" stroke="#94a3b8" stroke-width="1.2" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="1461.5555555555557" y="138" width="168.44444444444446" height="132" rx="6" fill="rgba(185,28,28,0.05)" stroke="#b91c1c" stroke-width="1.15"/>
+<text x="1470.5555555555557" y="154" font-size="8.7" font-weight="700" fill="#14181f">ring pop → callback</text>
+<text x="1470.5555555555557" y="165.0" font-size="6.4" fill="#9aa5b4">Consumer::try_pop</text>
+<text x="1470.5555555555557" y="189.0" font-size="6.7" fill="#7c8798">ptr::read out, then the</text>
+<text x="1470.5555555555557" y="198.0" font-size="6.7" fill="#7c8798">strategy is handed &amp;Tick</text>
+<text x="1470.5555555555557" y="207.0" font-size="6.7" fill="#7c8798">— the callback is free</text>
+<rect x="1468.5555555555557" y="222" width="154.44444444444446" height="15" rx="4" fill="rgba(185,28,28,0.10)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="1545.7777777777778" y="232.5" font-size="6.5" font-weight="700" text-anchor="middle" fill="#b91c1c">COPY 3 · then zero</text>
+<text x="1470.5555555555557" y="251.0" font-size="6.1" fill="#9aa5b4">engine/src/lib.rs:442</text>
+<rect x="50" y="284" width="1580" height="42" rx="6" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="1.0" stroke-dasharray="5 3"/>
+<text x="60" y="300" font-size="8.0" fill="#3f4a5a"><tspan font-size="8.4" font-weight="700" fill="#b45309">the depth detour  —  a DepthTopK costs FOUR full-record copies, not one.</tspan><tspan font-size="7.4" fill="#3f4a5a">   The L2 ladder is mutated in place from the wire delta (zero-copy), but </tspan><tspan font-size="7.4" font-weight="700" fill="#14181f">LadderSide::top_k()</tspan><tspan font-size="7.4" fill="#3f4a5a"> then materialises</tspan></text>
+<text x="60" y="314" font-size="7.4" fill="#3f4a5a">the 192-byte snapshot out of those arrays (book-builder/src/ladder.rs:166-221) — copy #1 — before capture stages it (#2), the ring push takes it (#3) and the pop moves it again (#4).  The older sheet&#x27;s phrase “depth snapshots 192 B” reads as one copy of 192 bytes.</text>
+<text x="50" y="340" font-size="9.2" font-weight="700" letter-spacing="0.3" fill="#3f4a5a">AND ON THE WAY OUT — the doctrine line never mentioned this path at all</text>
+<rect x="50.0" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(4,120,87,0.05)" stroke="#047857" stroke-width="1.0"/>
+<text x="58.0" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">strategy → EngineCtx::submit</text>
+<text x="58.0" y="379" font-size="6.6" font-weight="700" fill="#047857">—</text>
+<text x="58.0" y="388.0" font-size="6.1" fill="#9aa5b4">decide latency recorded</text>
+<line x1="271.07142857142856" y1="370" x2="275.57142857142856" y2="370" stroke="#94a3b8" stroke-width="1.1" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="276.57142857142856" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(185,28,28,0.05)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="284.57142857142856" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">engine-orders.pmlr capture</text>
+<text x="284.57142857142856" y="379" font-size="6.6" font-weight="700" fill="#b91c1c">COPY</text>
+<text x="284.57142857142856" y="388.0" font-size="6.1" fill="#9aa5b4">SlotCapture → same 64 KiB stage</text>
+<line x1="497.6428571428571" y1="370" x2="502.1428571428571" y2="370" stroke="#94a3b8" stroke-width="1.1" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="503.14285714285717" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(180,83,9,0.05)" stroke="#b45309" stroke-width="1.0"/>
+<text x="511.14285714285717" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">RecentRing&lt;Order,64&gt;</text>
+<text x="511.14285714285717" y="379" font-size="6.6" font-weight="700" fill="#b45309">COPY</text>
+<text x="511.14285714285717" y="388.0" font-size="6.1" fill="#9aa5b4">observability only — /state + TUI</text>
+<line x1="724.2142857142858" y1="370" x2="728.7142857142858" y2="370" stroke="#94a3b8" stroke-width="1.1" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="729.7142857142858" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(180,83,9,0.05)" stroke="#b45309" stroke-width="1.0"/>
+<text x="737.7142857142858" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">QueuedDispatcher ring push</text>
+<text x="737.7142857142858" y="379" font-size="6.6" font-weight="700" fill="#b45309">COPY</text>
+<text x="737.7142857142858" y="388.0" font-size="6.1" fill="#9aa5b4">PM live path only — the HL arm runs in on_idle</text>
+<line x1="950.7857142857143" y1="370" x2="955.2857142857143" y2="370" stroke="#94a3b8" stroke-width="1.1" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="956.2857142857143" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(180,83,9,0.05)" stroke="#b45309" stroke-width="1.0"/>
+<text x="964.2857142857143" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">worker try_pop</text>
+<text x="964.2857142857143" y="379" font-size="6.6" font-weight="700" fill="#b45309">COPY</text>
+<text x="964.2857142857143" y="388.0" font-size="6.1" fill="#9aa5b4">… and back out of the ring</text>
+<line x1="1177.357142857143" y1="370" x2="1181.857142857143" y2="370" stroke="#94a3b8" stroke-width="1.1" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="1182.857142857143" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(4,120,87,0.05)" stroke="#047857" stroke-width="1.0"/>
+<text x="1190.857142857143" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">HTTP body encode</text>
+<text x="1190.857142857143" y="379" font-size="6.6" font-weight="700" fill="#047857">zero-alloc</text>
+<text x="1190.857142857143" y="388.0" font-size="6.1" fill="#9aa5b4">handwritten cursor, no serde, no format!</text>
+<line x1="1403.9285714285716" y1="370" x2="1408.4285714285716" y2="370" stroke="#94a3b8" stroke-width="1.1" stroke-linecap="round" marker-end="url(#aS)"/>
+<rect x="1409.4285714285716" y="348" width="220.57142857142858" height="44" rx="5" fill="rgba(185,28,28,0.05)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="1417.4285714285716" y="360.0" font-size="7.3" font-weight="700" fill="#14181f">EIP-712 sign</text>
+<text x="1417.4285714285716" y="379" font-size="6.6" font-weight="700" fill="#b91c1c">~208 B HEAP</text>
+<text x="1417.4285714285716" y="388.0" font-size="6.1" fill="#9aa5b4">PM signer; the HL Agent signature is 0 B/op (gate 54)</text>
+<rect x="36" y="448" width="1030" height="468" rx="9" fill="rgba(63,74,90,0.025)" stroke="#3f4a5a" stroke-width="1.15"/>
+<text x="50" y="466" font-size="10.6" font-weight="700" fill="#3f4a5a">THE COPY LEDGER — every copy of the payload bytes, counted</text>
+<text x="56" y="490" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">#</text>
+<text x="78" y="490" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">hop</text>
+<text x="350" y="490" font-size="6.8" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">bytes</text>
+<text x="381.0" y="490" font-size="6.8" font-weight="700" text-anchor="middle" letter-spacing="0.2" fill="#7c8798">copy?</text>
+<text x="408" y="490" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">avoidable?</text>
+<text x="524" y="490" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">evidence</text>
+<text x="770" y="490" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">note</text>
+<line x1="54" y1="493.6" x2="1038" y2="493.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="56" y="502.80000000000007" font-size="7.0" fill="#3f4a5a">1</text>
+<text x="78" y="502.80000000000007" font-size="7.0" fill="#3f4a5a">kernel → rustls ciphertext</text>
+<text x="350" y="502.80000000000007" font-size="7.0" text-anchor="end" fill="#3f4a5a">burst</text>
+<text x="381.0" y="502.80000000000007" font-size="7.0" font-weight="700" text-anchor="middle" fill="#94a3b8">?</text>
+<text x="408" y="502.80000000000007" font-size="7.0" fill="#94a3b8">not from our code</text>
+<text x="524" y="502.80000000000007" font-size="7.0" fill="#94a3b8">core-net/transport.rs:187</text>
+<text x="770" y="502.80000000000007" font-size="7.0" fill="#94a3b8">external crate — UNVERIFIED here</text>
+<rect x="52" y="507.6" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="515.4000000000001" font-size="7.0" fill="#3f4a5a">2</text>
+<text x="78" y="515.4000000000001" font-size="7.0" fill="#3f4a5a">rustls plaintext → IoBuf</text>
+<text x="350" y="515.4000000000001" font-size="7.0" text-anchor="end" fill="#3f4a5a">frame</text>
+<text x="381.0" y="515.4000000000001" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b45309">YES</text>
+<text x="408" y="515.4000000000001" font-size="7.0" fill="#3f4a5a">no — io::Read is the only API</text>
+<text x="524" y="515.4000000000001" font-size="7.0" fill="#3f4a5a">transport.rs:246-306</text>
+<text x="770" y="515.4000000000001" font-size="7.0" fill="#3f4a5a">the one copy our code controls in hops 1–2</text>
+<text x="56" y="528.0000000000001" font-size="7.0" fill="#3f4a5a">3</text>
+<text x="78" y="528.0000000000001" font-size="7.0" fill="#3f4a5a">IoBuf compaction</text>
+<text x="350" y="528.0000000000001" font-size="7.0" text-anchor="end" fill="#3f4a5a">≤ buf</text>
+<text x="381.0" y="528.0000000000001" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b45309">rare</text>
+<text x="408" y="528.0000000000001" font-size="7.0" fill="#3f4a5a">already minimal</text>
+<text x="524" y="528.0000000000001" font-size="7.0" fill="#3f4a5a">core-net/iobuf.rs:67-69</text>
+<text x="770" y="528.0000000000001" font-size="7.0" fill="#3f4a5a">only when the tail pins full with dead head bytes</text>
+<rect x="52" y="532.8000000000001" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="540.6000000000001" font-size="7.0" fill="#3f4a5a">4</text>
+<text x="78" y="540.6000000000001" font-size="7.0" fill="#3f4a5a">WS unmask</text>
+<text x="350" y="540.6000000000001" font-size="7.0" text-anchor="end" fill="#3f4a5a">payload</text>
+<text x="381.0" y="540.6000000000001" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="540.6000000000001" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="540.6000000000001" font-size="7.0" fill="#3f4a5a">ws_frame.rs:291-325</text>
+<text x="770" y="540.6000000000001" font-size="7.0" fill="#047857">XOR in place over the same bytes</text>
+<text x="56" y="553.2000000000002" font-size="7.0" fill="#3f4a5a">5</text>
+<text x="78" y="553.2000000000002" font-size="7.0" fill="#3f4a5a">payload → parser</text>
+<text x="350" y="553.2000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">payload</text>
+<text x="381.0" y="553.2000000000002" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="553.2000000000002" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="553.2000000000002" font-size="7.0" fill="#3f4a5a">all 6 ingress run_loops</text>
+<text x="770" y="553.2000000000002" font-size="7.0" fill="#047857">borrowed slice · no reassembly buffer exists</text>
+<rect x="52" y="558.0000000000001" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="565.8000000000002" font-size="7.0" fill="#3f4a5a">6</text>
+<text x="78" y="565.8000000000002" font-size="7.0" fill="#3f4a5a">byte-scan → Tick fields</text>
+<text x="350" y="565.8000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">—</text>
+<text x="381.0" y="565.8000000000002" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="565.8000000000002" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="565.8000000000002" font-size="7.0" fill="#3f4a5a">core-parse/src/lib.rs:41-89</text>
+<text x="770" y="565.8000000000002" font-size="7.0" fill="#047857">no serde_json, no String, no Vec anywhere</text>
+<text x="56" y="578.4000000000002" font-size="7.0" fill="#3f4a5a">7</text>
+<text x="78" y="578.4000000000002" font-size="7.0" fill="#3f4a5a">symbol resolution</text>
+<text x="350" y="578.4000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">—</text>
+<text x="381.0" y="578.4000000000002" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="578.4000000000002" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="578.4000000000002" font-size="7.0" fill="#3f4a5a">SymbolMap::lookup</text>
+<text x="770" y="578.4000000000002" font-size="7.0" fill="#047857">boot-built table · the lookup is alloc-free</text>
+<rect x="52" y="583.2000000000002" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="591.0000000000002" font-size="7.0" fill="#3f4a5a">8</text>
+<text x="78" y="591.0000000000002" font-size="7.0" fill="#3f4a5a">ladder → DepthTopK</text>
+<text x="350" y="591.0000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">192 B</text>
+<text x="381.0" y="591.0000000000002" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b91c1c">YES</text>
+<text x="408" y="591.0000000000002" font-size="7.0" fill="#3f4a5a">needs a resident book</text>
+<text x="524" y="591.0000000000002" font-size="7.0" fill="#3f4a5a">book-builder/ladder.rs:166-221</text>
+<text x="770" y="591.0000000000002" font-size="7.0" fill="#b91c1c">depth only · NOT in the doctrine sentence</text>
+<text x="56" y="603.6000000000003" font-size="7.0" fill="#3f4a5a">9</text>
+<text x="78" y="603.6000000000003" font-size="7.0" font-weight="700" fill="#14181f">capture → PMLR 64 KiB stage</text>
+<text x="350" y="603.6000000000003" font-size="7.0" font-weight="700" text-anchor="end" fill="#14181f">64 / 192</text>
+<text x="381.0" y="603.6000000000003" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b91c1c">YES</text>
+<text x="408" y="603.6000000000003" font-size="7.0" fill="#3f4a5a">vectored I/O could, untried</text>
+<text x="524" y="603.6000000000003" font-size="7.0" fill="#3f4a5a">core-io/src/lib.rs:87-99</text>
+<text x="770" y="603.6000000000003" font-size="7.0" font-weight="700" fill="#b91c1c">ALWAYS ON · runs BEFORE the ring push</text>
+<rect x="52" y="608.4000000000002" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="616.2000000000003" font-size="7.0" fill="#3f4a5a">10</text>
+<text x="78" y="616.2000000000003" font-size="7.0" font-weight="700" fill="#14181f">ring push — ptr::write</text>
+<text x="350" y="616.2000000000003" font-size="7.0" font-weight="700" text-anchor="end" fill="#14181f">64 / 192</text>
+<text x="381.0" y="616.2000000000003" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b91c1c">YES</text>
+<text x="408" y="616.2000000000003" font-size="7.0" fill="#3f4a5a">no — genuinely minimal</text>
+<text x="524" y="616.2000000000003" font-size="7.0" fill="#3f4a5a">core-ring/src/lib.rs:214</text>
+<text x="770" y="616.2000000000003" font-size="7.0" font-weight="700" fill="#b91c1c">this is the ONLY copy the doctrine names</text>
+<text x="56" y="628.8000000000003" font-size="7.0" fill="#3f4a5a">11</text>
+<text x="78" y="628.8000000000003" font-size="7.0" fill="#3f4a5a">ring pop — ptr::read</text>
+<text x="350" y="628.8000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 / 192</text>
+<text x="381.0" y="628.8000000000003" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b45309">YES</text>
+<text x="408" y="628.8000000000003" font-size="7.0" fill="#3f4a5a">required by wraparound reuse</text>
+<text x="524" y="628.8000000000003" font-size="7.0" fill="#3f4a5a">core-ring/src/lib.rs:287</text>
+<text x="770" y="628.8000000000003" font-size="7.0" fill="#3f4a5a">also unmentioned</text>
+<rect x="52" y="633.6000000000003" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="641.4000000000003" font-size="7.0" fill="#3f4a5a">12</text>
+<text x="78" y="641.4000000000003" font-size="7.0" fill="#3f4a5a">strategy callback</text>
+<text x="350" y="641.4000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">—</text>
+<text x="381.0" y="641.4000000000003" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="641.4000000000003" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="641.4000000000003" font-size="7.0" fill="#3f4a5a">engine/src/lib.rs:442</text>
+<text x="770" y="641.4000000000003" font-size="7.0" fill="#047857">on_tick(&amp;Tick) — by reference</text>
+<text x="56" y="654.0000000000003" font-size="7.0" fill="#3f4a5a">13</text>
+<text x="78" y="654.0000000000003" font-size="7.0" fill="#3f4a5a">Order → capture + RecentRing</text>
+<text x="350" y="654.0000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 × 2</text>
+<text x="381.0" y="654.0000000000003" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b45309">YES ×2</text>
+<text x="408" y="654.0000000000003" font-size="7.0" fill="#3f4a5a">audit trail + /state feed</text>
+<text x="524" y="654.0000000000003" font-size="7.0" fill="#3f4a5a">slot_capture.rs:76 · snapshot.rs:409</text>
+<text x="770" y="654.0000000000003" font-size="7.0" fill="#3f4a5a">outbound path, unaddressed by the doctrine</text>
+<rect x="52" y="658.8000000000003" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="666.6000000000004" font-size="7.0" fill="#3f4a5a">14</text>
+<text x="78" y="666.6000000000004" font-size="7.0" fill="#3f4a5a">Order → dispatcher hop-ring</text>
+<text x="350" y="666.6000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 × 2</text>
+<text x="381.0" y="666.6000000000004" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b45309">YES ×2</text>
+<text x="408" y="666.6000000000004" font-size="7.0" fill="#3f4a5a">by design — decouples the loop</text>
+<text x="524" y="666.6000000000004" font-size="7.0" fill="#3f4a5a">clob-dispatcher/queued.rs:114,146</text>
+<text x="770" y="666.6000000000004" font-size="7.0" fill="#3f4a5a">the Polymarket path only — the HL arm never crosses it</text>
+<text x="56" y="679.2000000000004" font-size="7.0" fill="#3f4a5a">15</text>
+<text x="78" y="679.2000000000004" font-size="7.0" fill="#3f4a5a">outbound HTTP encode</text>
+<text x="350" y="679.2000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">body</text>
+<text x="381.0" y="679.2000000000004" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="679.2000000000004" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="679.2000000000004" font-size="7.0" fill="#3f4a5a">json_encoder.rs:33,59-90</text>
+<text x="770" y="679.2000000000004" font-size="7.0" fill="#047857">one pass, no heap, no format!</text>
+<rect x="52" y="684.0000000000003" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="691.8000000000004" font-size="7.0" fill="#3f4a5a">16</text>
+<text x="78" y="691.8000000000004" font-size="7.0" fill="#3f4a5a">EIP-712 signing</text>
+<text x="350" y="691.8000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">~208 B</text>
+<text x="381.0" y="691.8000000000004" font-size="7.0" font-weight="700" text-anchor="middle" fill="#b91c1c">HEAP</text>
+<text x="408" y="691.8000000000004" font-size="7.0" fill="#3f4a5a">libsecp256k1 internal</text>
+<text x="524" y="691.8000000000004" font-size="7.0" fill="#3f4a5a">bench/tests/alloc_assertions.rs:886</text>
+<text x="770" y="691.8000000000004" font-size="7.0" fill="#b91c1c">a budget test, not a 0 B/op assertion</text>
+<text x="56" y="704.4000000000004" font-size="7.0" fill="#3f4a5a">17</text>
+<text x="78" y="704.4000000000004" font-size="7.0" fill="#3f4a5a">RuleTable #0 file → heap</text>
+<text x="350" y="704.4000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">file</text>
+<text x="381.0" y="704.4000000000004" font-size="7.0" font-weight="700" text-anchor="middle" fill="#6d28d9">YES</text>
+<text x="408" y="704.4000000000004" font-size="7.0" fill="#3f4a5a">it is a file read</text>
+<text x="524" y="704.4000000000004" font-size="7.0" fill="#3f4a5a">ingress-ai/ruleset.rs:69-73</text>
+<text x="770" y="704.4000000000004" font-size="7.0" fill="#3f4a5a">operator cadence, never per tick</text>
+<rect x="52" y="709.2000000000004" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="717.0000000000005" font-size="7.0" fill="#3f4a5a">18</text>
+<text x="78" y="717.0000000000005" font-size="7.0" fill="#3f4a5a">RuleTable #1 scratch → ring</text>
+<text x="350" y="717.0000000000005" font-size="7.0" text-anchor="end" fill="#3f4a5a">32 832</text>
+<text x="381.0" y="717.0000000000005" font-size="7.0" font-weight="700" text-anchor="middle" fill="#6d28d9">YES</text>
+<text x="408" y="717.0000000000005" font-size="7.0" fill="#3f4a5a">no</text>
+<text x="524" y="717.0000000000005" font-size="7.0" fill="#3f4a5a">ingress-ai/ruleset.rs:1802</text>
+<text x="770" y="717.0000000000005" font-size="7.0" fill="#047857">documented in the source, and correct</text>
+<text x="56" y="729.6000000000005" font-size="7.0" fill="#3f4a5a">19</text>
+<text x="78" y="729.6000000000005" font-size="7.0" fill="#3f4a5a">RuleTable #2 ring → VM slot</text>
+<text x="350" y="729.6000000000005" font-size="7.0" text-anchor="end" fill="#3f4a5a">32 832</text>
+<text x="381.0" y="729.6000000000005" font-size="7.0" font-weight="700" text-anchor="middle" fill="#6d28d9">YES</text>
+<text x="408" y="729.6000000000005" font-size="7.0" fill="#3f4a5a">no</text>
+<text x="524" y="729.6000000000005" font-size="7.0" fill="#3f4a5a">&lt;slot-5 crate&gt;/src/lib.rs:429-441</text>
+<text x="770" y="729.6000000000005" font-size="7.0" fill="#047857">documented in the source, and correct</text>
+<rect x="52" y="734.4000000000004" width="990" height="12.6" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="742.2000000000005" font-size="7.0" fill="#3f4a5a">20</text>
+<text x="78" y="742.2000000000005" font-size="7.0" fill="#3f4a5a">offline replay — PMLR mmap</text>
+<text x="350" y="742.2000000000005" font-size="7.0" text-anchor="end" fill="#3f4a5a">—</text>
+<text x="381.0" y="742.2000000000005" font-size="7.0" font-weight="700" text-anchor="middle" fill="#047857">no</text>
+<text x="408" y="742.2000000000005" font-size="7.0" fill="#9aa5b4">—</text>
+<text x="524" y="742.2000000000005" font-size="7.0" fill="#3f4a5a">core-io/pmlr_reader.rs:311</text>
+<text x="770" y="742.2000000000005" font-size="7.0" fill="#047857">pointer cast over the mapping</text>
+<line x1="52" y1="751.6000000000005" x2="1050" y2="751.6000000000005" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
+<text x="56" y="765.6000000000005" font-size="7.3" fill="#3f4a5a">Nothing on the ingest path touches the heap after boot — every copy above lands in storage that was allocated once, at startup, and is reused forever.  That is the claim the code actually supports.</text>
+<rect x="56" y="777.6000000000005" width="990" height="96" rx="6" fill="rgba(63,74,90,0.045)" stroke="#3f4a5a" stroke-width="1.0"/>
+<text x="68" y="794.6000000000005" font-size="8.4" font-weight="700" letter-spacing="0.4" fill="#14181f">HOW THESE ARE COUNTED</text>
+<text x="68" y="808.6000000000005" font-size="7.2" fill="#3f4a5a">One copy = one full-record memcpy the process performs.  A ring transfer is therefore TWO — the producer&#x27;s ptr::write and the consumer&#x27;s ptr::read — because the slot is reused on wraparound and cannot be handed out by reference.</text>
+<text x="68" y="822.6000000000005" font-size="7.1" font-weight="700" fill="#14181f">a Tick</text>
+<text x="166" y="822.6000000000005" font-size="7.1" font-weight="700" fill="#b91c1c">3</text>
+<text x="298" y="822.6000000000005" font-size="7.1" fill="#7c8798">capture stage  →  ring push  →  ring pop</text>
+<text x="68" y="835.0000000000005" font-size="7.1" font-weight="700" fill="#14181f">a DepthTopK</text>
+<text x="166" y="835.0000000000005" font-size="7.1" font-weight="700" fill="#b91c1c">4</text>
+<text x="298" y="835.0000000000005" font-size="7.1" fill="#7c8798">ladder snapshot  →  capture stage  →  ring push  →  ring pop</text>
+<text x="68" y="847.4000000000004" font-size="7.1" font-weight="700" fill="#14181f">an Order</text>
+<text x="166" y="847.4000000000004" font-size="7.1" font-weight="700" fill="#b45309">2 — paper and --exec alike</text>
+<text x="298" y="847.4000000000004" font-size="7.1" fill="#7c8798">capture + RecentRing; the HL arm renders from &amp;Order in place on the engine thread — no hop-ring (see the foot)</text>
+<text x="68" y="859.8000000000005" font-size="7.1" font-weight="700" fill="#14181f">a RuleTable</text>
+<text x="166" y="859.8000000000005" font-size="7.1" font-weight="700" fill="#b45309">3, at operator cadence</text>
+<text x="298" y="859.8000000000005" font-size="7.1" fill="#7c8798">file read  →  validator scratch  →  ring  →  VM ping-pong slot</text>
+<text x="68" y="867.6000000000005" font-size="6.9" fill="#9aa5b4">The TLS plaintext copy sits underneath all of these: it is per-read, not per-record, and it is the only one our code could not remove even in principle.</text>
+<rect x="1104" y="448" width="540" height="214" rx="9" fill="rgba(185,28,28,0.045)" stroke="#b91c1c" stroke-width="1.15" stroke-dasharray="6 3.5"/>
+<text x="1118" y="467" font-size="10.6" font-weight="700" fill="#b91c1c">THE VERDICT ON THE DOCTRINE LINE</text>
+<text x="1118" y="484" font-size="7.2" fill="#7c8798">printed on the 2026-08-29 sheet:</text>
+<rect x="1118" y="490" width="512" height="30" rx="5" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="1126" y="503.0" font-size="7.1" fill="#7c8798">“one unavoidable copy per event — the slot into the ring</text>
+<text x="1126" y="512.6" font-size="7.1" fill="#7c8798">(64 B; depth snapshots 192 B; RuleTable ferries by value…)”</text>
+<line x1="1124" y1="500.5" x2="1620" y2="500.5" stroke="#b91c1c" stroke-width="1.1" stroke-linecap="round" opacity="0.6"/>
+<line x1="1124" y1="510" x2="1620" y2="510" stroke="#b91c1c" stroke-width="1.1" stroke-linecap="round" opacity="0.6"/>
+<text x="1118" y="540" font-size="7.2" fill="#7c8798">what the code does:</text>
+<rect x="1118" y="546" width="512" height="104" rx="5" fill="#ffffff" stroke="#b91c1c" stroke-width="1.2"/>
+<text x="1126" y="560.0" font-size="7.05" font-weight="700" fill="#14181f">A tick makes THREE full-record copies, not one</text>
+<text x="1126" y="569.9" font-size="7.05" fill="#3f4a5a">— the capture staging buffer, the ring push, and the ring pop.</text>
+<text x="1126" y="579.8" font-size="7.05" fill="#3f4a5a">Capture and the ring are independent destinations and capture</text>
+<text x="1126" y="589.7" font-size="7.05" fill="#3f4a5a">is unconditional.  A depth snapshot costs four.</text>
+<text x="1126" y="609.5" font-size="7.05" font-weight="700" fill="#047857">The RuleTable clause is the honest part</text>
+<text x="1126" y="619.4" font-size="7.05" fill="#3f4a5a">— two copies, at operator cadence, and the source says so</text>
+<text x="1126" y="629.3" font-size="7.05" fill="#3f4a5a">itself in the same words.  Everything inbound is understated</text>
+<text x="1126" y="639.2" font-size="7.05" fill="#3f4a5a">by 3–4×; the outbound path is not described at all.</text>
+<rect x="1104" y="674" width="540" height="242" rx="9" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="1.15"/>
+<text x="1118" y="693" font-size="10.6" font-weight="700" fill="#b45309">WHAT THE 0 B/op GATES ACTUALLY PROVE</text>
+<text x="1120" y="712.0" font-size="7.1" fill="#3f4a5a">core_alloc::CountingAllocator wraps std::alloc::System and counts</text>
+<text x="1120" y="721.6" font-size="7.1" fill="#7c8798">alloc / dealloc calls and bytes.  AllocGuard asserts the delta is zero</text>
+<text x="1120" y="731.2" font-size="7.1" fill="#7c8798">around a region.  62 such tests run under --test-threads=1.</text>
+<rect x="1118" y="744" width="512" height="60" rx="5" fill="rgba(185,28,28,0.06)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="1126" y="758.0" font-size="7.05" font-weight="700" fill="#b91c1c">they measure HEAP ALLOCATION, not memcpy volume.</text>
+<text x="1126" y="767.7" font-size="7.05" fill="#7c8798">A function that performs five copy_from_slice calls into</text>
+<text x="1126" y="777.4" font-size="7.05" fill="#7c8798">boot-allocated buffers reports 0 B/op, correctly.  The suite</text>
+<text x="1126" y="787.1" font-size="7.05" fill="#7c8798">cannot be cited for or against “one copy per event” — it</text>
+<text x="1126" y="796.8" font-size="7.05" fill="#7c8798">answers a different question entirely.</text>
+<text x="1120" y="818.0" font-size="7.05" font-weight="700" fill="#14181f">what IS covered</text>
+<text x="1120" y="827.6" font-size="7.05" fill="#7c8798">six per-venue run-loop steady-state tests drive the real Driver</text>
+<text x="1120" y="837.2" font-size="7.05" fill="#7c8798">over scripted wire bytes — parse, capture and ring push are all</text>
+<text x="1120" y="846.8" font-size="7.05" fill="#7c8798">exercised for zero heap alloc, including OKX&#x27;s DepthTopK path.</text>
+<text x="1120" y="856.4" font-size="7.05" fill="#7c8798">ruleset_table_handoff drives both RuleTable copies end to end.</text>
+<rect x="1118" y="868" width="512" height="36" rx="5" fill="#ffffff" stroke="#b45309" stroke-width="1.0"/>
+<text x="1126" y="882.0" font-size="7.05" font-weight="700" fill="#b45309">gap: Bybit has no alloc-gate coverage at all.</text>
+<text x="1126" y="891.7" font-size="7.05" fill="#7c8798">bench/Cargo.toml lists 7 ingress crates and omits ingress-bybit.</text>
+<text x="1118" y="910" font-size="6.6" fill="#9aa5b4">No clippy lint enforces any of this — clippy.toml has no disallowed-methods list.  The discipline is a runtime test, not a static gate.</text>
+<rect x="36" y="928" width="1608" height="268" rx="9" fill="rgba(29,78,216,0.055)" stroke="#1d4ed8" stroke-width="1.15"/>
+<text x="50" y="947" font-size="10.8" font-weight="700" fill="#1d4ed8">THREADS AND CORES — what the process actually schedules</text>
+<text x="56" y="972" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">thread</text>
+<text x="274.0" y="972" font-size="6.8" font-weight="700" text-anchor="middle" letter-spacing="0.2" fill="#7c8798">core</text>
+<text x="296" y="972" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">pinned in practice</text>
+<text x="428" y="972" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">what it owns</text>
+<text x="728" y="972" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">RX / TX buffers</text>
+<text x="876" y="972" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">spawn site</text>
+<line x1="54" y1="975.6" x2="1090" y2="975.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="56" y="984.4000000000001" font-size="7.05" font-weight="700" fill="#14181f">main (the engine)</text>
+<text x="274.0" y="984.4000000000001" font-size="7.05" text-anchor="middle" fill="#9aa5b4">—</text>
+<text x="296" y="984.4000000000001" font-size="7.05" font-weight="700" fill="#b91c1c">never, any platform</text>
+<text x="428" y="984.4000000000001" font-size="7.05" fill="#3f4a5a">Engine::tick(256) · all 7 strategy slots evaluate in-line here</text>
+<text x="728" y="984.4000000000001" font-size="7.05" fill="#9aa5b4">—</text>
+<text x="876" y="984.4000000000001" font-size="7.05" fill="#3f4a5a">multivenue-engine.rs:817 (no spawn)</text>
+<rect x="52" y="989.2" width="1042" height="12.2" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="996.6000000000001" font-size="7.05" fill="#3f4a5a">ingress-polymarket</text>
+<text x="274.0" y="996.6000000000001" font-size="7.05" text-anchor="middle" fill="#3f4a5a">1</text>
+<text x="296" y="996.6000000000001" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="996.6000000000001" font-size="7.05" fill="#3f4a5a">PM CLOB WSS book + price_change</text>
+<text x="728" y="996.6000000000001" font-size="7.05" fill="#3f4a5a">64 KiB / 16 KiB</text>
+<text x="876" y="996.6000000000001" font-size="7.05" fill="#3f4a5a">paper.rs:399</text>
+<text x="56" y="1008.8000000000002" font-size="7.05" font-weight="700" fill="#14181f">ingress-binance-{sym} ×N</text>
+<text x="274.0" y="1008.8000000000002" font-size="7.05" text-anchor="middle" fill="#3f4a5a">2</text>
+<text x="296" y="1008.8000000000002" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1008.8000000000002" font-size="7.05" font-weight="700" fill="#b91c1c">ONE THREAD AND ONE SOCKET PER SYMBOL — 254 at the 09-12 mark</text>
+<text x="728" y="1008.8000000000002" font-size="7.05" fill="#b91c1c">64 KiB / 4 KiB each</text>
+<text x="876" y="1008.8000000000002" font-size="7.05" fill="#3f4a5a">paper.rs:512, 664</text>
+<rect x="52" y="1013.6000000000001" width="1042" height="12.2" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="1021.0000000000001" font-size="7.05" fill="#3f4a5a">ingress-okx</text>
+<text x="274.0" y="1021.0000000000001" font-size="7.05" text-anchor="middle" fill="#3f4a5a">5</text>
+<text x="296" y="1021.0000000000001" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1021.0000000000001" font-size="7.05" fill="#3f4a5a">OKX v5 public WSS + L2 book walk</text>
+<text x="728" y="1021.0000000000001" font-size="7.05" fill="#b45309">4 MiB / 16 KiB</text>
+<text x="876" y="1021.0000000000001" font-size="7.05" fill="#3f4a5a">paper.rs:1043</text>
+<text x="56" y="1033.2" font-size="7.05" fill="#3f4a5a">ingress-deribit</text>
+<text x="274.0" y="1033.2" font-size="7.05" text-anchor="middle" fill="#3f4a5a">6</text>
+<text x="296" y="1033.2" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1033.2" font-size="7.05" fill="#3f4a5a">Deribit JSON-RPC WSS + L2 book walk</text>
+<text x="728" y="1033.2" font-size="7.05" fill="#b45309">4 MiB / 24 KiB</text>
+<text x="876" y="1033.2" font-size="7.05" fill="#3f4a5a">paper.rs:1331</text>
+<rect x="52" y="1038.0000000000002" width="1042" height="12.2" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="1045.4" font-size="7.05" fill="#3f4a5a">ingress-hyperliquid</text>
+<text x="274.0" y="1045.4" font-size="7.05" text-anchor="middle" fill="#3f4a5a">7</text>
+<text x="296" y="1045.4" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1045.4" font-size="7.05" fill="#3f4a5a">HL public WSS — market data; the userFills socket lives on the ENGINE thread</text>
+<text x="728" y="1045.4" font-size="7.05" fill="#3f4a5a">256 KiB / 64 KiB</text>
+<text x="876" y="1045.4" font-size="7.05" fill="#3f4a5a">paper.rs:1569</text>
+<text x="56" y="1057.6000000000001" font-size="7.05" fill="#3f4a5a">ingress-bybit-x{N}</text>
+<text x="274.0" y="1057.6000000000001" font-size="7.05" text-anchor="middle" fill="#3f4a5a">8</text>
+<text x="296" y="1057.6000000000001" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1057.6000000000001" font-size="7.05" fill="#3f4a5a">Bybit v5 public WSS, multiplexed</text>
+<text x="728" y="1057.6000000000001" font-size="7.05" fill="#3f4a5a">256 KiB / 16 KiB</text>
+<text x="876" y="1057.6000000000001" font-size="7.05" fill="#3f4a5a">paper.rs:807</text>
+<rect x="52" y="1062.4000000000003" width="1042" height="12.2" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="1069.8000000000002" font-size="7.05" fill="#3f4a5a">ingress-rpc</text>
+<text x="274.0" y="1069.8000000000002" font-size="7.05" text-anchor="middle" fill="#3f4a5a">3</text>
+<text x="296" y="1069.8000000000002" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1069.8000000000002" font-size="7.05" fill="#3f4a5a">Polygon newHeads → Signal ring</text>
+<text x="728" y="1069.8000000000002" font-size="7.05" fill="#3f4a5a">64 KiB / 4 KiB</text>
+<text x="876" y="1069.8000000000002" font-size="7.05" fill="#3f4a5a">paper.rs:1710</text>
+<text x="56" y="1082.0000000000002" font-size="7.05" font-weight="700" fill="#6d28d9">ingress-ai</text>
+<text x="274.0" y="1082.0000000000002" font-size="7.05" text-anchor="middle" fill="#3f4a5a">4</text>
+<text x="296" y="1082.0000000000002" font-size="7.05" fill="#b45309">Linux only</text>
+<text x="428" y="1082.0000000000002" font-size="7.05" fill="#6d28d9">the AI command plane — UDS listener, HMAC, seq, ruleset validator</text>
+<text x="728" y="1082.0000000000002" font-size="7.05" fill="#6d28d9">4 KiB (UDS)</text>
+<text x="876" y="1082.0000000000002" font-size="7.05" fill="#3f4a5a">paper.rs:1934</text>
+<rect x="52" y="1086.8000000000004" width="1042" height="12.2" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="1094.2000000000003" font-size="7.05" fill="#3f4a5a">clob-dispatcher</text>
+<text x="274.0" y="1094.2000000000003" font-size="7.05" text-anchor="middle" fill="#9aa5b4">—</text>
+<text x="296" y="1094.2000000000003" font-size="7.05" fill="#7c8798">not pinned</text>
+<text x="428" y="1094.2000000000003" font-size="7.05" fill="#3f4a5a">pops the Order ring, calls the real dispatcher</text>
+<text x="728" y="1094.2000000000003" font-size="7.05" fill="#9aa5b4">—</text>
+<text x="876" y="1094.2000000000003" font-size="7.05" fill="#3f4a5a">multivenue-engine.rs:1906</text>
+<text x="56" y="1106.4000000000003" font-size="7.05" fill="#3f4a5a">metrics-http</text>
+<text x="274.0" y="1106.4000000000003" font-size="7.05" text-anchor="middle" fill="#9aa5b4">—</text>
+<text x="296" y="1106.4000000000003" font-size="7.05" fill="#7c8798">not pinned</text>
+<text x="428" y="1106.4000000000003" font-size="7.05" fill="#3f4a5a">serves /metrics + /state on 127.0.0.1:9191</text>
+<text x="728" y="1106.4000000000003" font-size="7.05" fill="#9aa5b4">—</text>
+<text x="876" y="1106.4000000000003" font-size="7.05" fill="#3f4a5a">multivenue-engine.rs:3213</text>
+<rect x="52" y="1111.2000000000005" width="1042" height="12.2" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="56" y="1118.6000000000004" font-size="7.05" fill="#3f4a5a">tui-render</text>
+<text x="274.0" y="1118.6000000000004" font-size="7.05" text-anchor="middle" fill="#9aa5b4">—</text>
+<text x="296" y="1118.6000000000004" font-size="7.05" fill="#7c8798">not pinned</text>
+<text x="428" y="1118.6000000000004" font-size="7.05" fill="#3f4a5a">ratatui dashboard, reads the same snapshot cell</text>
+<text x="728" y="1118.6000000000004" font-size="7.05" fill="#9aa5b4">—</text>
+<text x="876" y="1118.6000000000004" font-size="7.05" fill="#3f4a5a">multivenue-engine.rs:3255</text>
+<rect x="56" y="1132.0000000000005" width="1568" height="59.85" rx="6" fill="rgba(185,28,28,0.055)" stroke="#b91c1c" stroke-width="1.05"/>
+<text x="66" y="1149.4000000000005" font-size="8.4" font-weight="700" fill="#b91c1c">the core map above describes intent; on the M4 deployment none of it binds</text>
+<text x="66" y="1162.3000000000006" font-size="7.05" fill="#3f4a5a">pin_current_thread_to_core() calls sched_setaffinity(2) on Linux and is kernel-enforced.  On macOS pin_impl() is #[cfg(not(target_os = &quot;linux&quot;))] and returns Err(Unsupported) — one warning is logged and the thread floats (cli/src/pinning.rs:92-99).</text>
+<text x="66" y="1172.0000000000007" font-size="7.05" fill="#3f4a5a">No thread anywhere sets .stack_size(), so every one takes Rust&#x27;s 2 MiB default.  At the 254-socket mark that is ~265 threads reserving ~530 MiB of VIRTUAL address space; resident stack pages will be far smaller, and I could not measure them from source — that needs vmmap on the live process.</text>
+<rect x="36" y="1208" width="1608" height="268" rx="9" fill="rgba(4,120,87,0.03)" stroke="#047857" stroke-width="1.15"/>
+<text x="50" y="1227" font-size="10.8" font-weight="700" fill="#047857">RESIDENT MEMORY — where the bytes live, allocated once at boot and never resized</text>
+<rect x="58.0" y="1256" width="499.4" height="40" fill="rgba(4,120,87,0.75)" stroke="#ffffff" stroke-width="1.4" rx="2"/>
+<text x="67" y="1273" font-size="7.6" font-weight="700" fill="#ffffff">strategy state, boxed at boot</text>
+<text x="67" y="1286" font-size="7.4" fill="rgba(255,255,255,0.88)">17.11 MiB   ·   32%</text>
+<rect x="557.4" y="1256" width="264.8" height="40" fill="rgba(29,78,216,0.72)" stroke="#ffffff" stroke-width="1.4" rx="2"/>
+<text x="566.4408361328855" y="1273" font-size="7.6" font-weight="700" fill="#ffffff">SPSC rings</text>
+<text x="566.4408361328855" y="1286" font-size="7.4" fill="rgba(255,255,255,0.88)">9.07 MiB   ·   17%</text>
+<rect x="822.2" y="1256" width="761.9" height="40" fill="rgba(180,83,9,0.72)" stroke="#ffffff" stroke-width="1.4" rx="2"/>
+<text x="831.194102276969" y="1273" font-size="7.6" font-weight="700" fill="#ffffff">network RX / TX buffers</text>
+<text x="831.194102276969" y="1286" font-size="7.4" fill="rgba(255,255,255,0.88)">26.10 MiB   ·   49%</text>
+<rect x="1584.1" y="1256" width="37.9" height="40" fill="rgba(14,116,144,0.72)" stroke="#ffffff" stroke-width="1.4" rx="2"/>
+<line x1="1603.0265024262785" y1="1296" x2="1603.0265024262785" y2="1306" stroke="#0e7490" stroke-width="0.9" stroke-linecap="round"/>
+<text x="1597.0265024262785" y="1316" font-size="7.1" font-weight="700" text-anchor="end" fill="#0e7490">capture staging  ≈ 1.30 MiB  ·  2%  →</text>
+<text x="58" y="1249" font-size="8.0" font-weight="700" fill="#14181f">≈ 53.6 MiB of clearly attributable heap at the 254-Binance-socket mark</text>
+<text x="1622" y="1249" font-size="7.1" text-anchor="end" fill="#7c8798">network buffers are the volatile half: with a majors-only universe the total falls to ≈ 36 MiB</text>
+<text x="58" y="1342" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">boxed / inline structure</text>
+<text x="340" y="1342" font-size="6.8" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">size</text>
+<text x="344" y="1342" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">how</text>
+<text x="520" y="1342" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">where</text>
+<line x1="56" y1="1345.6" x2="720" y2="1345.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="58" y="1354.6" font-size="7.0" font-weight="700" fill="#14181f">slot 5 · VM feature state</text>
+<text x="340" y="1354.6" font-size="7.0" font-weight="700" text-anchor="end" fill="#14181f">12.00 MiB</text>
+<text x="344" y="1354.6" font-size="7.0" fill="#3f4a5a">Box, alloc_zeroed at boot</text>
+<text x="520" y="1354.6" font-size="7.0" fill="#3f4a5a">&lt;slot-5 crate&gt;/src/features.rs:15</text>
+<rect x="54" y="1359.4" width="670" height="12.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="58" y="1367.0" font-size="7.0" font-weight="700" fill="#14181f">slot 2 · member state</text>
+<text x="340" y="1367.0" font-size="7.0" font-weight="700" text-anchor="end" fill="#14181f">4.60 MiB</text>
+<text x="344" y="1367.0" font-size="7.0" fill="#3f4a5a">Box · 128 targets × K=3 → 384 pairs</text>
+<text x="520" y="1367.0" font-size="7.0" fill="#3f4a5a">&lt;slot-2 crate&gt;/src/lib.rs:65</text>
+<text x="58" y="1379.4" font-size="7.0" fill="#3f4a5a">regime state</text>
+<text x="340" y="1379.4" font-size="7.0" text-anchor="end" fill="#3f4a5a">≈ 390 KiB</text>
+<text x="344" y="1379.4" font-size="7.0" fill="#3f4a5a">Box · 32 syms × 1536-deep ring</text>
+<text x="520" y="1379.4" font-size="7.0" fill="#3f4a5a">core-regime:665,2317 (&lt;450 KiB)</text>
+<rect x="54" y="1384.2000000000003" width="670" height="12.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="58" y="1391.8000000000002" font-size="7.0" fill="#3f4a5a">slot 5 · VM inline</text>
+<text x="340" y="1391.8000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">78.5 KiB</text>
+<text x="344" y="1391.8000000000002" font-size="7.0" fill="#3f4a5a">2 × RuleTableV2 ping-pong + positions</text>
+<text x="520" y="1391.8000000000002" font-size="7.0" fill="#3f4a5a">&lt;slot-5 crate&gt;/src/lib.rs:205</text>
+<text x="58" y="1404.2000000000003" font-size="7.0" fill="#3f4a5a">vol engine (one slot)</text>
+<text x="340" y="1404.2000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">≈ 28 KiB</text>
+<text x="344" y="1404.2000000000003" font-size="7.0" fill="#3f4a5a">HAR windows 15/60/240/1440 + rings</text>
+<text x="520" y="1404.2000000000003" font-size="7.0" fill="#3f4a5a">core-vol/src/lib.rs:238</text>
+<rect x="54" y="1409.0000000000005" width="670" height="12.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="58" y="1416.6000000000004" font-size="7.0" fill="#3f4a5a">slot 4 · quote state</text>
+<text x="340" y="1416.6000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">7.4 KiB</text>
+<text x="344" y="1416.6000000000004" font-size="7.0" fill="#3f4a5a">fair table + MultiBook&lt;64&gt; + gate</text>
+<text x="520" y="1416.6000000000004" font-size="7.0" fill="#3f4a5a">&lt;slot-4 crate&gt;/src/lib.rs</text>
+<text x="58" y="1429.0000000000005" font-size="7.0" fill="#3f4a5a">3 × LatencyTracker&lt;24&gt;</text>
+<text x="340" y="1429.0000000000005" font-size="7.0" text-anchor="end" fill="#3f4a5a">36.9 KiB</text>
+<text x="344" y="1429.0000000000005" font-size="7.0" fill="#3f4a5a">ingest / decide / ack histograms</text>
+<text x="520" y="1429.0000000000005" font-size="7.0" fill="#3f4a5a">engine/src/lib.rs:290-292</text>
+<text x="684" y="1342" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">ring</text>
+<text x="894" y="1342" font-size="6.8" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">lanes × cap</text>
+<text x="944" y="1342" font-size="6.8" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">slot</text>
+<text x="1022" y="1342" font-size="6.8" font-weight="700" text-anchor="end" letter-spacing="0.2" fill="#7c8798">bytes</text>
+<line x1="682" y1="1345.6" x2="1026" y2="1345.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="684" y="1354.6" font-size="7.0" fill="#3f4a5a">Tick</text>
+<text x="894" y="1354.6" font-size="7.0" text-anchor="end" fill="#3f4a5a">6 × 16 384</text>
+<text x="944" y="1354.6" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="1022" y="1354.6" font-size="7.0" font-weight="700" text-anchor="end" fill="#14181f">6.00 MiB</text>
+<rect x="680" y="1359.4" width="350" height="12.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="684" y="1367.0" font-size="7.0" fill="#3f4a5a">DepthTopK</text>
+<text x="894" y="1367.0" font-size="7.0" text-anchor="end" fill="#3f4a5a">2 × 4 096</text>
+<text x="944" y="1367.0" font-size="7.0" text-anchor="end" fill="#b45309">192 B</text>
+<text x="1022" y="1367.0" font-size="7.0" text-anchor="end" fill="#3f4a5a">1.50 MiB</text>
+<text x="684" y="1379.4" font-size="7.0" fill="#3f4a5a">OptSummary</text>
+<text x="894" y="1379.4" font-size="7.0" text-anchor="end" fill="#3f4a5a">3 × 4 096</text>
+<text x="944" y="1379.4" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="1022" y="1379.4" font-size="7.0" text-anchor="end" fill="#3f4a5a">768 KiB</text>
+<rect x="680" y="1384.2000000000003" width="350" height="12.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="684" y="1391.8000000000002" font-size="7.0" fill="#3f4a5a">ChannelEvent</text>
+<text x="894" y="1391.8000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">6 × 1 024</text>
+<text x="944" y="1391.8000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="1022" y="1391.8000000000002" font-size="7.0" text-anchor="end" fill="#3f4a5a">385 KiB</text>
+<text x="684" y="1404.2000000000003" font-size="7.0" fill="#3f4a5a">Fill</text>
+<text x="894" y="1404.2000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">4 × 1 024</text>
+<text x="944" y="1404.2000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="1022" y="1404.2000000000003" font-size="7.0" text-anchor="end" fill="#3f4a5a">256 KiB</text>
+<rect x="680" y="1409.0000000000005" width="350" height="12.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="684" y="1416.6000000000004" font-size="7.0" fill="#3f4a5a">Signal · AiCmd · Order</text>
+<text x="894" y="1416.6000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">1 × 1 024 ea</text>
+<text x="944" y="1416.6000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 B</text>
+<text x="1022" y="1416.6000000000004" font-size="7.0" text-anchor="end" fill="#3f4a5a">192 KiB</text>
+<text x="684" y="1429.0000000000005" font-size="7.0" fill="#3f4a5a">RuleTableSlot</text>
+<text x="894" y="1429.0000000000005" font-size="7.0" text-anchor="end" fill="#3f4a5a">1 × 2</text>
+<text x="944" y="1429.0000000000005" font-size="7.0" text-anchor="end" fill="#6d28d9">32 832 B</text>
+<text x="1022" y="1429.0000000000005" font-size="7.0" text-anchor="end" fill="#3f4a5a">64 KiB</text>
+<text x="684" y="1440.0" font-size="6.9" fill="#7c8798">9.07 MiB total.  Ring&lt;T,N&gt; head and tail each own a full</text>
+<text x="684" y="1449.4" font-size="6.9" fill="#7c8798">64 B cache line, so the producer and the consumer never</text>
+<text x="684" y="1458.8" font-size="6.9" fill="#7c8798">false-share.</text>
+<text x="58" y="1440.0" font-size="6.9" fill="#9aa5b4">capture staging is the one ESTIMATED figure on this bar — roughly 20 PmlrCapture</text>
+<text x="58" y="1449.4" font-size="6.9" fill="#9aa5b4">instances × a 64 KiB buffer each; the exact instance count was not enumerated.</text>
+<rect x="1082" y="1326" width="548" height="148" rx="7" fill="rgba(148,163,184,0.07)" stroke="#94a3b8" stroke-width="1.0"/>
+<text x="1093" y="1341" font-size="8.6" font-weight="700" fill="#14181f">what is NOT in that 53.6 MiB</text>
+<text x="1093" y="1353.5" font-size="6.95" fill="#7c8798">thread stacks  —  ~265 threads × 2 MiB default reservation ≈ 530 MiB of</text>
+<text x="1093" y="1363.1" font-size="6.95" fill="#7c8798">VIRTUAL address space.  Resident pages are lazily committed and almost</text>
+<text x="1093" y="1372.7" font-size="6.95" fill="#7c8798">certainly far smaller, but nothing in the source can tell you how much.</text>
+<text x="1093" y="1391.9" font-size="6.95" fill="#7c8798">the binary  —  5.22 MiB on disk, stripped of debuginfo.</text>
+<text x="1093" y="1411.1" font-size="6.95" fill="#7c8798">rustls internals  —  a 16 KiB received-plaintext cap per connection that</text>
+<text x="1093" y="1420.7" font-size="6.95" fill="#7c8798">this codebase never sets itself; its ciphertext buffering is session-managed</text>
+<text x="1093" y="1430.3" font-size="6.95" fill="#7c8798">and not a fixed allocation.  The §5.4 backpressure incident lives here.</text>
+<text x="1093" y="1449.5" font-size="6.95" fill="#7c8798">production runs the platform default allocator — no jemalloc, no mimalloc,</text>
+<text x="1093" y="1459.1" font-size="6.95" fill="#7c8798">and CountingAllocator is installed in the bench test binary ONLY.</text>
+<rect x="36" y="1500" width="1030" height="278" rx="9" fill="rgba(109,40,217,0.03)" stroke="#6d28d9" stroke-width="1.15"/>
+<text x="50" y="1519" font-size="10.4" font-weight="700" fill="#6d28d9">CACHE-LINE LAYOUT — every hot type is #[repr(C, align(64))] and size-asserted at compile time</text>
+<text x="58" y="1544" font-size="8.2" font-weight="700" fill="#14181f">Tick</text>
+<text x="184" y="1544" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="226" y="1535" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="58" y="1555" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="388" y="1544" font-size="8.2" font-weight="700" fill="#14181f">Signal</text>
+<text x="514" y="1544" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="556" y="1535" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="388" y="1555" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="718" y="1544" font-size="8.2" font-weight="700" fill="#14181f">Fill</text>
+<text x="844" y="1544" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="886" y="1535" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="718" y="1555" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="58" y="1588" font-size="8.2" font-weight="700" fill="#14181f">Order</text>
+<text x="184" y="1588" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="226" y="1579" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="58" y="1599" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="388" y="1588" font-size="8.2" font-weight="700" fill="#14181f">AiCmd</text>
+<text x="514" y="1588" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="556" y="1579" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="388" y="1599" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="718" y="1588" font-size="8.2" font-weight="700" fill="#14181f">ChannelEvent</text>
+<text x="844" y="1588" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="886" y="1579" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="718" y="1599" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="58" y="1632" font-size="8.2" font-weight="700" fill="#14181f">OptSummary</text>
+<text x="184" y="1632" font-size="7.4" font-weight="700" fill="#3f4a5a">64 B</text>
+<rect x="226" y="1623" width="42" height="12" rx="2" fill="rgba(109,40,217,0.055)" stroke="#6d28d9" stroke-width="0.9"/>
+<text x="58" y="1643" font-size="6.5" fill="#9aa5b4">one cache line</text>
+<text x="388" y="1632" font-size="8.2" font-weight="700" fill="#14181f">DepthTopK</text>
+<text x="514" y="1632" font-size="7.4" font-weight="700" fill="#b45309">192 B</text>
+<rect x="556" y="1623" width="42" height="12" rx="2" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="0.9"/>
+<rect x="602" y="1623" width="42" height="12" rx="2" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="0.9"/>
+<rect x="648" y="1623" width="42" height="12" rx="2" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="0.9"/>
+<text x="388" y="1643" font-size="6.5" fill="#9aa5b4">3 cache lines</text>
+<text x="718" y="1632" font-size="8.2" font-weight="700" fill="#14181f">RuleRowV2</text>
+<text x="844" y="1632" font-size="7.4" font-weight="700" fill="#b45309">128 B</text>
+<rect x="886" y="1623" width="42" height="12" rx="2" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="0.9"/>
+<rect x="932" y="1623" width="42" height="12" rx="2" fill="rgba(180,83,9,0.06)" stroke="#b45309" stroke-width="0.9"/>
+<text x="718" y="1643" font-size="6.5" fill="#9aa5b4">2 cache lines</text>
+<text x="58" y="1664" font-size="7.1" fill="#3f4a5a">RuleTableV2 = 256 rows × 128 B + one metadata line = 32 832 B · 513 cache lines.  Deliberately NOT AsBytes: it is built in memory by the validator and never parsed from wire bytes.</text>
+<text x="58" y="1684.0" font-size="7.0" font-weight="700" fill="#14181f">padding that exists to stop false sharing, not to round a number:</text>
+<text x="58" y="1693.7" font-size="7.0" fill="#7c8798">core_ring::Padded — head and tail each get their own 64 B line (core-ring/src/lib.rs:66-77)</text>
+<text x="58" y="1703.4" font-size="7.0" fill="#7c8798">engine_snapshot::SnapshotCell — the seq counter sits on its own line ahead of the payload, so a polling reader never false-shares with the writer (cell.rs:32-39)</text>
+<text x="58" y="1713.1" font-size="7.0" fill="#7c8798">core_metrics::Counter — every metric counter is align(64), used pervasively across the engine_* families</text>
+<text x="58" y="1734" font-size="6.9" fill="#7c8798">SnapshotCell is a single-writer seqlock rather than a Mutex for a specific reason: Darwin&#x27;s pthread mutex lazily heap-allocates pthread_mutex_t on first lock, which broke the zero-alloc gate on macOS.</text>
+<text x="58" y="1750" font-size="6.9" fill="#9aa5b4">repr(align(64)) appears in 34 files across the workspace — the convention is repo-wide, not per-crate.</text>
+<rect x="1104" y="1500" width="540" height="278" rx="9" fill="rgba(14,116,144,0.03)" stroke="#0e7490" stroke-width="1.15"/>
+<text x="1118" y="1519" font-size="10.4" font-weight="700" fill="#0e7490">CPU, CLOCK AND BUILD</text>
+<text x="1120" y="1538.0" font-size="7.05" font-weight="700" fill="#14181f">clock</text>
+<text x="1120" y="1547.7" font-size="7.05" fill="#7c8798">clock_gettime(CLOCK_MONOTONIC_RAW) — chosen so NTP slew cannot move it.</text>
+<text x="1120" y="1557.4" font-size="7.05" fill="#7c8798">Read once per parsed inbound frame to stamp ts_ns, not once per loop pass.</text>
+<text x="1120" y="1567.1" font-size="7.05" font-weight="700" fill="#14181f">latency</text>
+<text x="1120" y="1576.8" font-size="7.05" fill="#7c8798">LatencyTracker&lt;24&gt; ×3 — 1 536 log-linear buckets each, one atomic fetch_add</text>
+<text x="1120" y="1586.5" font-size="7.05" fill="#7c8798">per record, percentile by cumulative scan.  Lock-free and allocation-free.</text>
+<rect x="1118" y="1604" width="512" height="46" rx="5" fill="rgba(185,28,28,0.06)" stroke="#b91c1c" stroke-width="1.0"/>
+<text x="1126" y="1618.0" font-size="7.0" font-weight="700" fill="#b91c1c">core-simd does no SIMD.</text>
+<text x="1126" y="1627.6" font-size="7.0" fill="#7c8798">The whole crate is one scalar byte_sum() plus two tests, and nothing</text>
+<text x="1126" y="1637.2" font-size="7.0" fill="#7c8798">outside the crate references it.  No AVX2 or NEON kernel exists; the</text>
+<text x="1126" y="1646.8" font-size="7.0" fill="#7c8798">target-cpu flags below let LLVM auto-vectorise, and that is all.</text>
+<text x="1120" y="1662.0" font-size="7.0" font-weight="700" fill="#b45309">no prefetch instructions exist anywhere in the tree.</text>
+<text x="1120" y="1671.6" font-size="7.0" fill="#7c8798">Branchless patterns that do exist: TopOfBook::apply&#x27;s gap count, head &amp; (N-1)</text>
+<text x="1120" y="1681.2" font-size="7.0" fill="#7c8798">in place of head % N, and symbol_bucket_mix&#x27;s XOR fold.  get_unchecked in the</text>
+<text x="1120" y="1690.8" font-size="7.0" fill="#7c8798">ring&#x27;s push and pop removes the bounds checks on the hot path.</text>
+<text x="1124" y="1708" font-size="6.7" font-weight="700" letter-spacing="0.2" fill="#7c8798">release profile</text>
+<text x="1276" y="1708" font-size="6.7" font-weight="700" letter-spacing="0.2" fill="#7c8798"></text>
+<text x="1400" y="1708" font-size="6.7" font-weight="700" letter-spacing="0.2" fill="#7c8798">toolchain</text>
+<text x="1496" y="1708" font-size="6.7" font-weight="700" letter-spacing="0.2" fill="#7c8798"></text>
+<line x1="1122" y1="1711.6" x2="1636" y2="1711.6" stroke="#94a3b8" stroke-width="0.8" stroke-linecap="round" opacity="0.55"/>
+<text x="1124" y="1719.6" font-size="6.95" fill="#3f4a5a">panic</text>
+<text x="1276" y="1719.6" font-size="6.95" font-weight="700" fill="#14181f">abort</text>
+<text x="1400" y="1719.6" font-size="6.95" fill="#3f4a5a">channel</text>
+<text x="1496" y="1719.6" font-size="6.95" font-weight="700" fill="#14181f">1.88.0 pinned</text>
+<rect x="1120" y="1724.4" width="520" height="11.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="1124" y="1731.0" font-size="6.95" fill="#3f4a5a">lto</text>
+<text x="1276" y="1731.0" font-size="6.95" font-weight="700" fill="#14181f">fat</text>
+<text x="1400" y="1731.0" font-size="6.95" fill="#3f4a5a">aarch64</text>
+<text x="1496" y="1731.0" font-size="6.95" fill="#3f4a5a">target-cpu=apple-m1</text>
+<text x="1124" y="1742.4" font-size="6.95" fill="#3f4a5a">codegen-units</text>
+<text x="1276" y="1742.4" font-size="6.95" font-weight="700" fill="#14181f">1</text>
+<text x="1400" y="1742.4" font-size="6.95" fill="#3f4a5a">x86_64</text>
+<text x="1496" y="1742.4" font-size="6.95" fill="#3f4a5a">target-cpu=znver3</text>
+<rect x="1120" y="1747.2000000000003" width="520" height="11.4" fill="rgba(148,163,184,0.07)" rx="2.5"/>
+<text x="1124" y="1753.8000000000002" font-size="6.95" fill="#3f4a5a">opt-level</text>
+<text x="1276" y="1753.8000000000002" font-size="6.95" fill="#3f4a5a">3</text>
+<text x="1400" y="1753.8000000000002" font-size="6.95" fill="#3f4a5a">incremental</text>
+<text x="1496" y="1753.8000000000002" font-size="6.95" fill="#3f4a5a">false</text>
+<text x="1124" y="1765.2000000000003" font-size="6.95" fill="#3f4a5a">overflow-checks</text>
+<text x="1276" y="1765.2000000000003" font-size="6.95" fill="#b45309">false</text>
+<text x="1400" y="1765.2000000000003" font-size="6.95" fill="#3f4a5a">strip</text>
+<text x="1496" y="1765.2000000000003" font-size="6.95" fill="#3f4a5a">debuginfo (debug=1 kept)</text>
+<line x1="36" y1="1796" x2="1644" y2="1796" stroke="#94a3b8" stroke-width="0.9" stroke-linecap="round" opacity="0.5"/>
+<text x="36" y="1816" font-size="9.2" font-weight="700" letter-spacing="0.5" fill="#14181f">HOW TO READ THIS SHEET</text>
+<text x="36" y="1834" font-size="8.0" fill="#3f4a5a"><tspan font-size="8.0" fill="#3f4a5a">The engine&#x27;s real claim is not zero copies — it is </tspan><tspan font-size="8.0" font-weight="700" fill="#14181f">zero heap allocation after boot, and a bounded, counted number of copies into storage that was sized once</tspan><tspan font-size="8.0" fill="#3f4a5a">.  That claim survives the audit intact.</tspan></text>
+<text x="36" y="1848" font-size="7.6" fill="#3f4a5a">What does not survive is the arithmetic: capture and the ring are two independent, unconditional destinations; the ring transfer is itself two moves; and a depth snapshot is materialised out of the ladder before any of that happens.  The honest sentence, for whoever writes the next doctrine line:</text>
+<rect x="36" y="1856" width="1608" height="34" rx="5" fill="rgba(4,120,87,0.06)" stroke="#047857" stroke-width="1.0"/>
+<text x="50" y="1870" font-size="7.6" font-weight="700" fill="#047857">“Counting every full-record memcpy: a tick costs three — the PMLR capture stage, the ring push and the ring pop — with capture and the ring being independent, unconditional destinations.  A depth event costs four, an order two</text>
+<text x="50" y="1883" font-size="7.6" font-weight="700" fill="#047857">on either path (the HL arm signs and sends from the engine thread, with no hop-ring), and a RuleTable three at operator cadence.  All of them land in boot-preallocated fixed-capacity storage; nothing on the ingest path touches the heap after startup.  The Polymarket signer is the one exception, at ~208 B per signature — budgeted, not eliminated; the Hyperliquid Agent signature is 0 B/op.”</text>
+<text x="36" y="1908" font-size="7.0" fill="#9aa5b4">Every verdict above was established by reading the code, not the comments.  Three stale comments were found and are worth fixing at the source: engine/src/lib.rs:64 says “five rings = 5 MiB” when NUM_TICK_LANES is 6 seventeen lines below; engine/src/lib.rs:690 calls the RuleTable slot “16 KiB” when it is 32 832 B; and cli/src/paper.rs:27 says cores 0..=7 are pinned when Bybit takes core 8.</text>
+<rect x="36" y="1962" width="1608" height="292" rx="9" fill="rgba(180,83,9,0.035)" stroke="#b45309" stroke-width="1.15"/>
+<text x="50" y="1981" font-size="10.8" font-weight="700" fill="#b45309">E7 ADDENDUM — THE EXEC LANE'S OWN COPY LEDGER (read after the 2026-09-19 review + zero-copy pass)</text>
+<text x="50" y="1995" font-size="7.2" fill="#3f4a5a">The live arm (exec-hyperliquid) is driven from OrderDispatch::on_idle on the engine thread — not through the QueuedDispatcher hop-ring, which is the Polymarket path. The rule it was audited against: everything that can be zero-copy is; every remaining copy carries a <tspan font-weight="700">// COPY:</tspan> line; <tspan font-weight="700">make copy-audit</tspan> ratchets the exec lane + core-net against a 33-entry pre-E1 baseline.</text>
+<text x="56" y="2014" font-size="8.2" font-weight="700" fill="#14181f">TX — one live order · copies of the action / body bytes: 2 (TLS + kernel), the house target, plus the serialiser's one tolerated write</text>
+<text x="56" y="2028" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">hop</text>
+<text x="300" y="2028" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">where</text>
+<text x="560" y="2028" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">bytes</text>
+<text x="640" y="2028" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">copy?</text>
+<text x="1000" y="2028" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">note</text>
+<text x="56" y="2040" font-size="6.6" fill="#3f4a5a">msgpack encode → self.mp</text>
+<text x="300" y="2040" font-size="6.6" fill="#3f4a5a">exec-hyperliquid/msgpack.rs put_all</text>
+<text x="560" y="2040" font-size="6.6" fill="#3f4a5a">≤ 4 KiB</text>
+<text x="640" y="2040" font-size="6.6" fill="#047857">render</text>
+<text x="1000" y="2040" font-size="6.6" fill="#3f4a5a">the serialiser's own write into the FINAL action buffer — keccak'd in place, never staged again</text>
+<text x="56" y="2051.5" font-size="6.6" fill="#3f4a5a">envelope head + action JSON → self.req</text>
+<text x="300" y="2051.5" font-size="6.6" fill="#3f4a5a">request.rs envelope_open / Json::put</text>
+<text x="560" y="2051.5" font-size="6.6" fill="#3f4a5a">≤ 16 KiB</text>
+<text x="640" y="2051.5" font-size="6.6" fill="#047857">render</text>
+<text x="1000" y="2051.5" font-size="6.6" fill="#3f4a5a">IN PLACE behind the head; the old envelope() copied the whole action JSON out of a scratch buffer per order — gone</text>
+<text x="56" y="2063.0" font-size="6.6" fill="#3f4a5a">connection id</text>
+<text x="300" y="2063.0" font-size="6.6" fill="#3f4a5a">sign.rs connection_id → keccak256_parts</text>
+<text x="560" y="2063.0" font-size="6.6" fill="#3f4a5a">≤ 38 B tail</text>
+<text x="640" y="2063.0" font-size="6.6" fill="#047857">no</text>
+<text x="1000" y="2063.0" font-size="6.6" fill="#3f4a5a">action absorbed part by part; only the 8 B nonce + vault + expiry tail is built on the stack</text>
+<text x="56" y="2074.5" font-size="6.6" fill="#3f4a5a">EIP-712 digest + signature</text>
+<text x="300" y="2074.5" font-size="6.6" fill="#3f4a5a">signer-eip712/hyperliquid.rs · lib.rs:135</text>
+<text x="560" y="2074.5" font-size="6.6" fill="#3f4a5a">32 B · 64 B</text>
+<text x="640" y="2074.5" font-size="6.6" fill="#b45309">no · 64 B</text>
+<text x="1000" y="2074.5" font-size="6.6" fill="#3f4a5a">typehash and keccak(source) cached; the 64 B r‖s secp256k1 hands back by value is the one copy (no serialise-into-slice API)</text>
+<text x="56" y="2086.0" font-size="6.6" fill="#3f4a5a">envelope_close → self.req</text>
+<text x="300" y="2086.0" font-size="6.6" fill="#3f4a5a">request.rs envelope_close</text>
+<text x="560" y="2086.0" font-size="6.6" fill="#3f4a5a">≤ 200 B</text>
+<text x="640" y="2086.0" font-size="6.6" fill="#047857">render</text>
+<text x="1000" y="2086.0" font-size="6.6" fill="#3f4a5a">nonce + signature appended after the action; the body is complete in one buffer</text>
+<text x="56" y="2097.5" font-size="6.6" fill="#3f4a5a">header + body → rustls → kernel</text>
+<text x="300" y="2097.5" font-size="6.6" fill="#3f4a5a">http.rs write_segments · core-net/transport.rs</text>
+<text x="560" y="2097.5" font-size="6.6" fill="#3f4a5a">body</text>
+<text x="640" y="2097.5" font-size="6.6" fill="#b45309">YES ×2</text>
+<text x="1000" y="2097.5" font-size="6.6" fill="#3f4a5a">two TLS segments (no body byte enters the header buffer); rustls plaintext → ciphertext, ciphertext → kernel — the two the doctrine allows</text>
+<text x="56" y="2121.0" font-size="8.2" font-weight="700" fill="#14181f">RX — one venue fill · copies: 3 (kernel + TLS + ring slot), the house target; the tail compaction is now a CURSOR</text>
+<text x="56" y="2135.0" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">hop</text>
+<text x="300" y="2135.0" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">where</text>
+<text x="560" y="2135.0" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">bytes</text>
+<text x="640" y="2135.0" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">copy?</text>
+<text x="1000" y="2135.0" font-size="6.8" font-weight="700" letter-spacing="0.2" fill="#7c8798">note</text>
+<text x="56" y="2147.0" font-size="6.6" fill="#3f4a5a">kernel → rustls → self.rx</text>
+<text x="300" y="2147.0" font-size="6.6" fill="#3f4a5a">core-net/transport.rs · userws_conn.rs fill_rx</text>
+<text x="560" y="2147.0" font-size="6.6" fill="#3f4a5a">frame</text>
+<text x="640" y="2147.0" font-size="6.6" fill="#b91c1c">YES ×2</text>
+<text x="1000" y="2147.0" font-size="6.6" fill="#3f4a5a">the same two boundary copies as every ingress socket; drained to WouldBlock (mio is edge-triggered)</text>
+<text x="56" y="2158.5" font-size="6.6" fill="#3f4a5a">frame → payload span</text>
+<text x="300" y="2158.5" font-size="6.6" fill="#3f4a5a">ws_read_frame over &amp;rx[rx_head..rx_len]</text>
+<text x="560" y="2158.5" font-size="6.6" fill="#3f4a5a">—</text>
+<text x="640" y="2158.5" font-size="6.6" fill="#047857">no</text>
+<text x="1000" y="2158.5" font-size="6.6" fill="#3f4a5a">a consumed frame ADVANCES rx_head — the first cut copy_within'd the unread tail after EVERY frame (O(k²) on a burst; the auditor caught it)</text>
+<text x="56" y="2170.0" font-size="6.6" fill="#3f4a5a">payload → UserFill (scratch)</text>
+<text x="300" y="2170.0" font-size="6.6" fill="#3f4a5a">userws.rs scan_user_fills → json.rs spans</text>
+<text x="560" y="2170.0" font-size="6.6" fill="#3f4a5a">88 B POD</text>
+<text x="640" y="2170.0" font-size="6.6" fill="#047857">no</text>
+<text x="1000" y="2170.0" font-size="6.6" fill="#3f4a5a">coin is a Span into rx, resolved by bytes against the roll-bound table — never a String, never parsed back into an asset id</text>
+<text x="56" y="2181.5" font-size="6.6" fill="#3f4a5a">UserFill → Fill → lane-3 ring</text>
+<text x="300" y="2181.5" font-size="6.6" fill="#3f4a5a">exchange.rs route_frame → Producer::try_push</text>
+<text x="560" y="2181.5" font-size="6.6" fill="#3f4a5a">64 B</text>
+<text x="640" y="2181.5" font-size="6.6" fill="#b91c1c">YES</text>
+<text x="1000" y="2181.5" font-size="6.6" fill="#3f4a5a">the designed ring publish — the ONLY byte move the fill makes on its way to the engine loop</text>
+<text x="56" y="2193.0" font-size="6.6" fill="#3f4a5a">ring pop → engine-fills.pmlr → on_fill</text>
+<text x="300" y="2193.0" font-size="6.6" fill="#3f4a5a">engine/src/lib.rs</text>
+<text x="560" y="2193.0" font-size="6.6" fill="#3f4a5a">64 B ×2</text>
+<text x="640" y="2193.0" font-size="6.6" fill="#b91c1c">YES ×2</text>
+<text x="1000" y="2193.0" font-size="6.6" fill="#3f4a5a">the pop and the capture stage, exactly as a tick; then &amp;Fill by reference into the ledger and the strategy</text>
+<text x="56" y="2204.5" font-size="6.6" fill="#3f4a5a">compaction</text>
+<text x="300" y="2204.5" font-size="6.6" fill="#3f4a5a">userws_conn.rs fill_rx</text>
+<text x="560" y="2204.5" font-size="6.6" fill="#3f4a5a">≤ 1 MiB</text>
+<text x="640" y="2204.5" font-size="6.6" fill="#b45309">rare</text>
+<text x="1000" y="2204.5" font-size="6.6" fill="#3f4a5a">only when the buffer is FULL with a partial frame behind consumed bytes (core_net::IoBuf's law); a fully drained buffer resets to 0 for free</text>
+<text x="56" y="2222.0" font-size="6.9" fill="#9aa5b4">Gates that pin this: bench gate 54 (encode + sign, 0 B/op), gate 58 (encode → envelope → scan), gate 60 (stage_modify + seal in the arm's own buffers), tests/hl_userws_loopback.rs (four scripted WS servers), make copy-audit (hits=33 baselined=33 new=0), and the zero-copy-auditor agent's own FAIL→fix on this sheet's rx cursor. Not on this sheet: strategy identities (never-in-git law).</text>
+</svg>

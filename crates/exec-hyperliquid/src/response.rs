@@ -271,11 +271,19 @@ pub fn scan(body: &[u8]) -> Result<HlResponse, ScanErr> {
     let Some(sts) = find(body, b"\"statuses\"", 0) else {
         // `{"status":"ok","response":{"type":"default"}}` — some
         // actions carry no statuses at all. Accepted, nothing to
-        // report, no oid.
-        return Ok(HlResponse::Ok(HlOk {
-            statuses: 1,
-            ..HlOk::default()
-        }));
+        // report, no oid — but ONLY on that exact shape. The first
+        // cut fired this branch on the mere ABSENCE of the token, so
+        // `{"status":"ok"}` and every ok envelope truncated before
+        // `"statuses"` read as an acceptance: a fail-open in the one
+        // function whose header says "an unrecognised envelope is
+        // never an acceptance" (E7 review, 2026-09-19).
+        if find(body, b"\"type\":\"default\"", 0).is_some() {
+            return Ok(HlResponse::Ok(HlOk {
+                statuses: 1,
+                ..HlOk::default()
+            }));
+        }
+        return Err(ScanErr::Malformed);
     };
     let mut i = after_colon(body, sts + b"\"statuses\"".len()).ok_or(ScanErr::Malformed)?;
     if i >= body.len() || body[i] != b'[' {
@@ -462,6 +470,12 @@ mod tests {
             // malformed request — captured live.
             b"Failed to deserialize the JSON body into the target type",
             br#"{"status":"maybe"}"#,
+            // An ok envelope with NO statuses and NO `type:default` —
+            // the shape a truncated answer takes. The first cut
+            // accepted all three of these.
+            br#"{"status":"ok"}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statu"#,
+            br#"{"status":"ok","response":{"type":"order"}}"#,
             br#"{"status":"ok","response":{"data":{"statuses":[]}}}"#,
             br#"{"status":"ok","response":{"data":{"statuses":"#,
             br#"{"status":"ok","response":{"data":{"statuses":{}}}}"#,

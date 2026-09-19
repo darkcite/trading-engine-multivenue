@@ -94,14 +94,14 @@ come from a single day's regime — the old floor was the
 single-regime-overfit guard. **Superseded 2026-09-05 by the ≤ 2 h
 law + the regime lane:** evidence is now a COUNT of disjoint complete
 ≤ 2 h windows pooled and judged leave-one-window-out (never days —
-`docs/regime-and-dashboard-plan.md` §7.1), and the single-regime
+`docs/arch/regime-and-dashboard-plan.md` §7.1), and the single-regime
 overfit is guarded by the regime GATE itself: a labelled row trades
 only in the words it was evidenced in, UNKNOWN fails it closed, and
 its label must earn the `--regime off` delta.
 
 ## Regime gate (RG0–RG7, 2026-09-03 →) — a gate, never a signal
 
-`docs/regime-and-dashboard-plan.md` §2 is the doctrine; the risk-relevant
+`docs/arch/regime-and-dashboard-plan.md` §2 is the doctrine; the risk-relevant
 laws, enforced in `crates/core-regime` (the detector), `crates/strategy-set`
 (per-member gates), `crates/strategy-vm` (per-row gate bytes) and
 `ingress-ai::ruleset` (validator rule 11 + the rule-8 amendment):
@@ -4110,3 +4110,248 @@ wrote from one an operator wrote, so an adopted halt always reports
 the recorded reason rather than "adopted". `request_budget_floor` is
 required non-zero but is the arm's number, not a router threshold.
 And the exit-75 flake above.
+
+## E7 — the E1–E6 review, the zero-copy law, and the TESTNET ramp (2026-09-19)
+
+### Operator rulings (2026-09-19, verbatim intent)
+
+1. **Review everything Opus 5 wrote in E1–E6 before E7**, "for being
+   proper written", and **retest everything**.
+2. **E7 trades on TESTNET, not mainnet.** Outcome (HIP-4) exists there
+   too. The mainnet ramp of plan §9 is deferred to a separate, later
+   ruling; every bar in §9 is re-stated below as a testnet bar.
+3. **THE ZERO-COPY RULE:** everything that can be done zero-copy is
+   done zero-copy; a copy that cannot be avoided carries a comment.
+   Enforced by a new `zero-copy-auditor` agent, the same way
+   `alloc-auditor` / `risk-reviewer` are enforced — and **all three
+   review agents run on Opus 5** (`model: claude-opus-5`).
+
+### What the review was
+
+Four Opus-5 review agents, each with the full E1–E6 diff (`94d3eaf..49d155d`,
+41 k lines) and a brief that demanded file:line citations and a
+failure scenario per finding. A: the wire layer (encode/sign/send/scan,
+signer, core-net transport). B: the arm's lifecycle (fills,
+reconciliation, sweep, budget, WS). C: the router, ledger, halt machine
+and boot. D: the engine loop, E5 verbs, capture, alloc gates. Their
+reports are in the vault (`Claude outputs/review-e1e6/{A,B,C,D}-*.md`,
+git-excluded). All four returned **BLOCK** on risk. The top findings
+were re-verified by hand against the code before anything was changed;
+none was a false positive.
+
+### The blocking findings, and what closed each
+
+| # | where | the hole | the fix |
+|---|---|---|---|
+| 1 | `http.rs` read_response | a chunked or close-delimited `/exchange` answer was returned as soon as ANY bytes arrived — a truncated `{"status":"ok","response":{"type":"order","data":{"statu` reached the scanner | `Chunked ⇒ Err(BadHttp)`; `CloseDelimited` only once `peer_closed`; `ContentLength` waits for `body_end` |
+| 2 | `response.rs` scan | the no-`"statuses"` branch ACCEPTED on the mere absence of the token (fail-open, against the module's own doctrine) | accepted only when `"type":"default"` is present, else `Malformed`; fuzz invariant strengthened (`hl_exchange_response.rs` now requires `statuses` or `type:default` on any accept) |
+| 3 | `exchange.rs` send_action | the live submit accepted on `ok.accepted()` alone — no resting/filled outcome required, `oid == 0` bound the slot to a leg the sweep could not see; the stricter predicate lived only in the operator probe | acceptance is `Spend`-aware: Submit ⇒ `any_resting ‖ any_filled`, Cancel ⇒ `any_success`; anything else takes the reject-streak branch |
+| 4 | `http.rs` post | polled 50 ms BEFORE flushing rustls, so every request waited a slice before its ciphertext left the host | `Transport::flush()` (new trait method; `TlsTransport` drains `write_tls` to `WouldBlock`) + `reregister` before `read_response`; `write_segments` `Ok(0)`/`WouldBlock` ⇒ `Overflow`, no sleep |
+| 5 | `exchange.rs` reconcile | `reconciled = true` on the PARSE succeeding — an empty asset table "agreed" with a venue holding 40 contracts and unlocked the seeding interlock through the interlock | `reconciled` (and the new `last_recon_ok`) only when `drift_legs == 0 && unreconciled_venue_legs == 0` (`recon::unreconciled_venue_legs`, already written for the probe, now wired) |
+| 6 | `userws_conn.rs` | no client keepalive on the fill socket: the venue cuts a 60 s-idle `/ws`, so a quiet account was redialled every ~61 s, each redial re-delivering the snapshot on the engine thread with up to 30 s of fresh handshake deadlines, and `ws_gap` never fired | `core_net::Keepalive` 50 s ping / 75 s idle (the ingress crate's law), ONE `HANDSHAKE_DEADLINE` through connect + both subscribes, re-resolve every 3rd connect failure |
+| 7 | `exchange.rs` cancel_all_state | `Clear` reachable over legs `cancel_all` never queued (`MAX_PENDING_SWEEPS` 16 < 2×8 families) — the router stopped retrying and every healthy slot got its `max_open_orders` back | `cancel_all_unqueued_mark` beside `cancel_all_mark`; `Stranded` while `cancel_all_unqueued != mark` |
+| 8 | `exchange.rs` + `halt.rs` | nothing halted on reconciliation going STALE: `recon_failed` climbed, `reconciled` stayed latched, the arm traded with the safety net silently disabled | `HaltSignal.recon_age_ns` (from `last_recon_ok`), `HaltReason::ReconStale = 7`, `HaltLimits.recon_stale_ms`, **`halt_on_recon_stale_ms` is a REQUIRED live key** (`exec.toml.example` 300000) |
+| 9 | `exchange.rs` route_frame | the address budget was credited from a `userFills` row BEFORE its sign/scale were validated — one hostile `px` manufactured request headroom until the next cold boot | credited only when `px_1e8 >= 0 && sz_1e8 > 0`, i.e. only from a row the arm would book |
+| 10 | `exchange.rs` post | the budget was charged after the `?` — a request the venue answered unreadably was never counted (governor drifting OPTIMISTIC) | `post_counted` charges on `left_host` regardless of the answer; `on_action_sent(items)` charges a batch per item (§2.2) |
+| 11 | `routed.rs` halt file | an unreadable `exec.HALT` (FIFO, directory, non-UTF-8) booted SILENTLY; `poll_halt_file` moved the mtime baseline even on a failed read | `HaltFileRead::{Absent,Refused,Read}`; Refused ⇒ present + inert (the boot tell says so); baseline moves only after a successful read |
+| 12 | `routed.rs` halt_slot | `--halt-slot` had no live-slot filter — a typo fired a venue-wide cancel for nothing | `halt_slot() -> bool`, live-only, per-slot warn |
+| 13 | `exec_boot.rs` | the live boot tell still printed `caps-DECLARED-NOT-ENFORCED` after E6 enforced them | tell rewritten (`caps-ENFORCED … worst case with every quote working = instance + open × order`) + the HALTS line, pinned |
+| 14 | `ledger.rs` | `LedgerCounters` reached no surface; `bind` on a repeated CREATED frame flattened a live position | exported through `ExecCounters`, mirrored to `engine_exec_ledger_*` + `/state`; repeat-frame guard |
+| 15 | `strategy-bin15` + `exchange.rs` + `routed.rs` | THREE readers of the roll kind byte, three answers for `0x03` (masked ⇒ settled; `== 1` ⇒ created; refused) | one `core_types::roll_kind_strict` ⇒ `Option<bool>`; all three refuse an unknown kind |
+| 16 | `routed.rs` cancel on `Off` | an `Off` slot refused CANCELS (an exit) | cancels pass to the live arm when the venue is allowed (`cancel_on_off` counted); submit/modify still refused |
+| 17 | `cli/src/bin` | fill lane 3's producer was DROPPED at boot — the E6 exposure ledger and `on_fill_booked` were reachable only from tests | the producer is handed to `HlExchange::new` on the `--exec` path; a real arm is built when a slot is live on Hyperliquid |
+| 18 | `cli/src/paper.rs` | `HlExecCounters` (24 arm counters) reached no gauge — `ws_reconnects`, `recon_failed`, `sweep_left` were invisible | `LiveArmCounters` crosses the trait by value (cold, 1 Hz), mirrored to `engine_exec_hl_*_total` + `engine_exec_hl_budget_remaining` + `/state` `exec.arm_*`; `MAX_COUNTERS` 256 → 512 |
+| 19 | `userws.rs` TidRing | O(N) dedupe over a 2,000-row snapshot on the engine thread | open-addressed index (2N slots, Fibonacci hash, backward-shift delete), O(1), 1 M-admit parity test vs a FIFO reference |
+| 20 | `userws_conn.rs` | NO loopback test of any kind on the fill socket | `tests/hl_userws_loopback.rs`: 101+first-frame in one segment, split frame, two frames in one read, Ping echo, Close, keepalive ping + idle reconnect, refused upgrade, oversize frame |
+
+Smaller items closed in the same pass: `libc` literal dep in
+`exec-router` — **NOT a finding**: `libc = "0.2"` per crate is the
+repo's existing convention (cli, core-config, core-io, core-time all do
+it; there is no workspace `libc`); `gen_vectors.py` now drives the SDK's
+own `order_request_to_order_wire` / `order_wires_to_order_action` and
+records the SDK version; `selftest` pins the vector count (25);
+`MAX_ORDERS` enforced in all four batch encoders; `BudgetGauge` removed;
+`cancel_by_cloid` / `modify` render into the boot-owned `mp` / `req`
+buffers (no 16 KiB stack arrays on the engine thread); `POLL_SLICE`
+removed from the steady-state pump (it parked the single-writer thread
+50 ms out of every 52); `Order.verb` doc corrected (`paper.rs` said the
+tape was "no longer replayable" after a cancel — false since E5 4a);
+`BacktestCtx::modify` now moves `max_order_notional` (the live gate
+clamps modifies; the harness measured only places); `ModifyReq` layout
+doc; `core-io::state_file` doctrine header; bench gate labels (the E3
+gate was a duplicate "54" — now 58, so 53..62 is complete).
+
+### The zero-copy pass
+
+The rule, as now written into `CLAUDE.md`'s hard rules and enforced by
+`make copy-audit` (`scripts/copy-audit.sh` + `scripts/copy-audit-baseline.txt`)
+and the `zero-copy-auditor` agent:
+
+> Everything that can be done zero-copy is done zero-copy. A copy that
+> cannot be avoided carries, within the eight lines above it,
+> `// COPY: <what> <bound> — <why unavoidable> — <alternative rejected>`,
+> the way an `unsafe` block carries `// SAFETY:`.
+
+What the pass CHANGED (copies removed, not commented):
+
+* the request body is rendered **in place**: `envelope_open` writes the
+  head into the arm's `req`, the action JSON is rendered directly
+  behind it, `envelope_close` appends nonce/signature — the old
+  `envelope()` copied a ≤ 16 KiB action JSON out of a scratch buffer on
+  every order (kept only as a helper, byte-identical by test);
+* the connection id is `keccak256_parts(&[action, &tail[..n]])` — the
+  old path copied the whole msgpack action (≤ 4 KiB) into a stack
+  buffer just to append a ≤ 38 B tail;
+* the Agent EIP-712 digest is absorbed as parts (`keccak256_parts`),
+  with the typehash and the two `keccak(source)` values cached — the
+  old path assembled a 96 B and a 66 B preimage AND recomputed two
+  constant keccaks per signature;
+* the sweep probe's open-order rows are read in place from the
+  response buffer; the selection buffer (`oids`) is boot-owned.
+
+What the pass COMMENTED (designed copies, each with its `// COPY:`):
+kernel↔user reads and rustls' plaintext window (`core-net`), the
+rx-tail compaction after each frame, the first frame packed into the
+101's segment, the ≤ 125 B Ping echo, the serialisers' own writes into
+the final wire buffer (`msgpack::put_all`, `request::Json::put`), the
+`/info` request renders, ≤ 64 B host `String`s at boot, the 8 B/20 B
+POD word assemblies (cloid, connection-id tail, EIP-712 padding), the
+64 B `r‖s` secp256k1 hands back by value, and the `Fill` POD into the
+lane-3 ring slot (the designed ring copy). Three operator/boot modules
+carry a `COPY-DOCTRINE:` header instead (`smoke`, `lifecycle`,
+`selftest` — never reachable from the engine loop).
+
+The baseline: **33 legacy sites** (pre-E1: the Polymarket signer's
+EIP-712 assembly, the PM dispatcher, `core-net`), listed in
+`scripts/copy-audit-baseline.txt`. The script is a ratchet — a NEW
+unmarked copy fails, a paid entry is dropped with `--update-baseline`,
+and only the operator grows it. Gate at the close: `hits=33 baselined=33
+new=0 paid=0` on the exec lane + core-net.
+
+### The auditor's own verdict on the pass
+
+The new `zero-copy-auditor` (Opus 5) was then run over the pass itself
+— the honest test of an agent is whether it catches its author. It did:
+**FAIL**, one hot finding. `UserWs::pump_inner` compacted the unread
+tail after EVERY frame (`copy_within`, ≤ 1 MiB), and because `fill_rx`
+drains to `WouldBlock` one poll can leave k frames in the buffer — so
+a 50-frame burst moved ≈ 1.2 MB on the engine thread, O(k²), while the
+`// COPY:` line I had written called it "amortised to one frame's
+remainder" and rejected the wrong alternative (a ring) instead of the
+right one (`core_net::IoBuf`'s head cursor, already in a crate the
+file imports). Fixed: `rx_head` cursor; a drained buffer resets for
+free; the ONE compaction happens only when the buffer is full with a
+partial frame behind consumed bytes; the handshake's first-frame copy
+is gone too (the cursor simply starts after the 101's header block).
+RX copies: kernel + TLS + ring slot = 3, the target. TX: TLS + kernel =
+2, the target, plus the serialiser's single tolerated write. Also
+taken from the report: `#[inline]` on `to_fill`/`to_fill_as` (128 B
+`Result<Routed>` by value — structural, not hopeful), the two cold
+by-value counter structs got their `// COPY:` lines, and the
+`ExecCounters` bound in its comment was corrected (≈ 504 B, not ~440).
+Left as the auditor recorded it: `crates/cli` and `crates/engine` are
+outside the script's default remit — whether they join the ratchet
+with their own baseline is the operator's call.
+
+### Rulings this pass made that the operator may want to reverse
+
+* **Cancels pass on an `Off` slot** (they were refused). Matches the
+  halt law — an exit is never blocked. `exec.toml.example` says so.
+* **`halt_on_recon_stale_ms` is REQUIRED non-zero on every live slot**
+  (new key; example 300000). An `exec.toml` that predates this refuses
+  to boot a live slot until the key is added — deliberate.
+* **`reconciled` requires `drift_legs == 0 && unreconciled_venue_legs == 0`**
+  — a flat account seeds immediately; an account still holding a leg of
+  a RETIRED instance (unbound after the roll) waits until it settles.
+  That is the safe reading; the alternative was the hole in row 5.
+* **`MAX_COUNTERS` 256 → 512** in `core-metrics` (the arm's 24 counters
+  + 6 ledger counters would have overflowed the fixed registry).
+* **An unreadable `exec.HALT` is present + inert, not absent.**
+
+### E7 — the TESTNET ramp (plan §9 restated; the mainnet ramp is deferred)
+
+The network interlock (LAW E-4's precondition, new in `cli/src/bin`):
+`HYPERLIQUID_WS_HOST` (market data — where the asset ids come from) and
+`HYPERLIQUID_EXCHANGE_HOST` (the arm) must be on the SAME network or
+the boot refuses. A testnet id is a mainnet stranger's market.
+
+Env shape for E7 (operator's `.env`, never read by a session):
+`HYPERLIQUID_WS_HOST=api.hyperliquid-testnet.xyz`,
+`HYPERLIQUID_API_HOST=api.hyperliquid-testnet.xyz`,
+`HYPERLIQUID_EXCHANGE_HOST=api.hyperliquid-testnet.xyz`,
+`HYPERLIQUID_SOURCE=b`, the testnet agent key + master address in
+`HYPERLIQUID_AGENT_KEY` / `HYPERLIQUID_MASTER_ADDR` (the `Scope::Live`
+variables — "live" here means "the arm", not "mainnet"; the smoke's
+disjoint `HYPERLIQUID_TESTNET_*` set is unchanged).
+`~/multivenue/exec.toml`: slot 3 `mode = "live"`, `venues = ["hyperliquid"]`,
+every cap and every `halt_on_*` key present (incl. `halt_on_recon_stale_ms`),
+then `--exec ~/multivenue/exec.toml --arm-live 3` on the run line.
+Boot tells to expect: `exec: hyperliquid arm ARMED network=testnet …`,
+`caps-ENFORCED …`, `HALTS … recon_stale_ms=300000 …`,
+`running strategy-set with LIVE slots — real orders will be submitted`
+(testnet USDC, but the code path is the real one).
+
+Plan §2.3 still stands as a precondition: confirm from `/state` that
+the 15-minute family binds live instances ON TESTNET (E5 §7.1 used
+testnet outcome 20182, so the family existed there on 2026-09-19).
+
+Bars — the same shape as §9, on testnet:
+
+* **R0 (plumbing)** — `maker_enabled = 0`, `e_take_1e6 = 900000`,
+  `entry_usd_1e6 = 10000000`. Bar: ≥ 96 submitted entries, ≥ 1 venue
+  fill, `engine_exec_hl_recon_ok_total` climbing with
+  `recon_drift_legs = 0` and `recon_unseen_legs = 0`,
+  `unknown_fills = 0`, `refused_no_route = 0`, `fills_unowned = 0`,
+  `ws_reconnects` flat over the window, the nightly VENUE line agreeing
+  with the venue's own fill list order for order. Proves the loop.
+* **R1 (Arm A)** — `e_take_1e6 = 30000`. Bar: ≥ 300 IoCs, the LIVE
+  fill rate with a binomial interval, `engine_exec_hl_budget_remaining`
+  never at the floor. Testnet liquidity is not mainnet liquidity, so
+  this number is a MECHANISM check, not the plan's "number the lane has
+  been waiting for" — that one still needs mainnet.
+* **R2 (Arm B)** — `maker_enabled = 1`. Bar: requests/day under
+  `budget_growth/day`; every requote a MODIFY (`modifies_sent` ≫
+  `cancels_sent`); LAW E-8 sweeps clean at every roll (`sweep_left = 0`).
+* **R3** — the eight families, only if they have live testnet
+  instances.
+
+Gates stay in orders/instances, never hours (the ≤ 2 h window law
+governs any replay used to judge). Mainnet is a NEW operator ruling
+after R2 on testnet, with the §11 shopping list done.
+
+### Gates run at the close of the pass (2026-09-19, Mac)
+
+* `cargo check --workspace --all-targets` — clean
+* `cargo clippy --workspace --all-targets -- -D warnings` — clean
+* `cargo nextest run --workspace` — **2585 passed, 1 skipped** (the
+  first full run was 2580/2581: the one red was the FIFO test's old
+  expectation, updated to the present-and-inert ruling; the four
+  `hl_userws_loopback` scripts are new and green on first run)
+* `make alloc-assert` — **62/62 at 0 B/op**, fresh `Compiling bench`
+  (gate 60 re-cut over `stage_modify` + `seal` in the arm's own
+  buffers; gate 58 is E3's, relabelled from its duplicate "54")
+* `make copy-audit` — `hits=33 baselined=33 new=0 paid=0`
+* `make license-check` — OK (392 tracked source files; the three new
+  files carry the header and join the count at commit)
+* `cargo build --release -p cli` — relinked 16:23 local; the running
+  engine picks it up at its next restart (G0)
+* fuzz `hl_exchange_response` / `hl_msgpack_encode` / `hl_user_events`
+  — 300 s each (`cargo +nightly fuzz run`), 25.5 M / 24.4 M / 24.1 M
+  runs, no crash
+* `cd claude-worker && uv run pytest -q` — 1153 passed, 3 skipped
+* the whole battery was re-run after the cursor fix — the session log
+  §4b carries the second set of numbers
+
+### Known and deliberately open after this pass
+
+* `THIRD-PARTY-NOTICES.md` — no dependency changed (the `libc` item was
+  not a change), so `make license-deps` was not required; `cargo-about`
+  / `cargo-deny` are not installed on this host in any case.
+* The chunked `/exchange` answer is REFUSED, not dechunked. If the venue
+  ever moves behind an edge that chunks, `core_net::http1::dechunk_in_place`
+  exists; the refusal is the fail-fast reading of `lib.rs`'s doctrine.
+* The foreign-fill tape write and the settlement attribution (E4's
+  "deliberately not here") are unchanged.
+* `.claude/settings.json` still names `claude-opus-4-6` as the SESSION
+  model; only the three review agents were pinned to `claude-opus-5`
+  (the ruling was about the agents). Operator's call.

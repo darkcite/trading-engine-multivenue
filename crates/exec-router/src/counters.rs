@@ -114,6 +114,13 @@ pub struct RouteCounters {
     /// contributes: it does not go through the risk gate at all, so a
     /// halted slot can always get flat.
     pub refused_halted: u64,
+    /// **E7 review ruling** — cancels routed to the live arm from an
+    /// `Off` slot. Not a refusal: `off` stops PLACING, and a cancel is
+    /// the one verb that can only reduce risk, so it passes (the halt
+    /// machine's own law, applied to `off`). Counted because an `off`
+    /// slot that is cancelling is an `off` slot that still had orders
+    /// at the venue, which is worth knowing.
+    pub cancel_on_off: u64,
     /// Per-slot live submits. Index = `strategy_id`.
     pub live_submits_by_slot: [u64; EXEC_SLOTS],
     /// Per-slot refusals — EVERY reason (off, no-route, and E6's risk
@@ -142,6 +149,7 @@ impl RouteCounters {
             refused_open_orders: 0,
             refused_unseeded: 0,
             refused_halted: 0,
+            cancel_on_off: 0,
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
         }
@@ -178,6 +186,12 @@ impl RouteCounters {
     pub fn on_refused_off(&mut self, strategy_id: u8) {
         self.refused_off = self.refused_off.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);
+    }
+
+    /// Record a cancel that went through on an `Off` slot.
+    #[inline(always)]
+    pub fn on_cancel_on_off(&mut self) {
+        self.cancel_on_off = self.cancel_on_off.saturating_add(1);
     }
 
     /// Record a refusal because the live slot has no route to the
@@ -237,6 +251,9 @@ mod tests {
     #[test]
     fn counters_are_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<RouteCounters>(), 64);
+        // Four lines: 12 aggregates + two per-slot arrays of 8 = 28
+        // u64 = 224 B, rounded up. Growing past 256 is a decision.
+        assert_eq!(core::mem::size_of::<RouteCounters>(), 256);
     }
 
     #[test]

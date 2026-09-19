@@ -1,11 +1,15 @@
 # The AI-strategy pipeline
 
-**Status:** current as of 2026-09-05 (regime lane RG0–RG6 live — `docs/regime-and-dashboard-plan.md`;
-the AI-only mask `ai+icdp` = 112 since 2026-09-03; the labelled table `fde6f733…` committed). Sections
-written on 2026-08-30 keep their numbers (the xv-v2 walk-through, the parity window) as the record of
-that state; §7b is the regime-lane addendum and §12 the "live today" list.
-**Companion diagram:** `docs/ai-strategy-pipeline.svg`.
-**Authority above this file:** `docs/vm2-plan.md` §8/§9 → `docs/stage2-finish-plan.md` → `docs/mvp-completion-plan.md` (§7 gate, §9 data law) → `CLAUDE.md`.
+**Status:** current as of 2026-09-19. The pipeline described here (capture → derive → author → gate →
+promote → execute → observe) is what runs; since 2026-09-05 the strategist has also authored four coded
+Rust members alongside ruleset tables (see the v2 sheet), and the execute stage gained a per-slot
+live-execution lane (E1–E7, `docs/risk-policy.md`) that is armed only by `--exec` + `--arm-live`
+— testnet first. Sections written on 2026-08-30 keep their numbers as the record of that state; §7b is
+the regime-lane addendum and §12 the "live today" list.
+**Companion diagram:** `docs/ai-strategy-pipeline.svg` (v2.1, 2026-09-19).
+**Authority above this file:** `CLAUDE.md` → `docs/risk-policy.md` → the archived plans in `docs/arch/`
+(`vm2-plan.md` §8/§9, `stage2-finish-plan.md`, `mvp-completion-plan.md` §7 gate + §9 data law,
+`regime-and-dashboard-plan.md`) — read those only when asked.
 This file is descriptive, not normative — where it disagrees with those, they win.
 
 ---
@@ -436,7 +440,7 @@ clamped by a second independent per-order cap that mirrors the validator's.
 
 ## 7b. The regime gate (RG0–RG7, 2026-09-03 →)
 
-`docs/regime-and-dashboard-plan.md` is the owner; this is the map. **A regime is a GATE, never a
+`docs/arch/regime-and-dashboard-plan.md` is the owner; this is the map. **A regime is a GATE, never a
 signal.** It decides which strategies (and which VM rows) may ENTER; it never closes a position by
 itself unless the row's own `off = hard` law says so, and it never flips a table.
 
@@ -602,7 +606,7 @@ through the frozen verbs · the VM executing `xv-v2` on the tick path · the see
 `pnl_report`, `parity`, `audit-replay` · semi-manual promotion **and** the §8.5-shaped rollback, both
 demonstrated live.
 
-**Deferred to the Stage-3 entry gate (`docs/mvp-completion-plan.md` §7):**
+**Deferred to the Stage-3 entry gate (`docs/arch/mvp-completion-plan.md` §7):**
 
 - `ANTHROPIC_API_KEY` provisioning — and therefore `serve`, `strategist.py`, and Fable-5 authoring.
 - **§8.1 auto-promotion** — `serve` installing into `$AI_RULESET_DIR` then calling
@@ -726,7 +730,7 @@ compile and test on the Mac, never in the sandbox.
 
 ## 16. Read next
 
-`docs/regime-and-dashboard-plan.md` (the regime lane: §3 model, §4 engine, §5 worker, §6 dashboard,
+`docs/arch/regime-and-dashboard-plan.md` (the regime lane: §3 model, §4 engine, §5 worker, §6 dashboard,
 §7/§7.1 phases + the ≤ 2 h soak law, §12 log) → `docs/arch/vm2-plan.md` (§8 log, §9 runbook) →
 `docs/research-universe.md` (grammar §6 incl. the v2.1 regime keys, the authoring catalog) →
 `docs/prompts/ai-session.md` (the verb-by-verb cookbook, §4 0a–0c library steps) →

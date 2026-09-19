@@ -49,8 +49,6 @@
 //! 10,000, would hand a fresh boot the whole allowance on the strength
 //! of a missing file.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 /// Hyperliquid's starting allowance for a fresh address.
 pub const INITIAL_BUFFER: u64 = 10_000;
 
@@ -164,13 +162,18 @@ impl AddressBudget {
         true
     }
 
-    /// One L1 action left the host. Call for EVERY action, cancels
-    /// included — the venue counts them even where it grants them a
-    /// separate allowance, and a governor that undercounted would
-    /// drift optimistic, which is the wrong direction.
+    /// One L1 action left the host carrying `items` orders. Call for
+    /// EVERY action, cancels included — the venue counts them even
+    /// where it grants them a separate allowance, and a governor that
+    /// undercounted would drift optimistic, which is the wrong
+    /// direction. **A batch of `n` is `n` address requests** (§2.2):
+    /// the first cut charged one per POST, which was right only
+    /// because every caller happened to send one-element batches.
     #[inline(always)]
-    pub fn on_action_sent(&mut self) {
-        self.spent_requests = self.spent_requests.saturating_add(1);
+    pub fn on_action_sent(&mut self, items: u32) {
+        self.spent_requests = self
+            .spent_requests
+            .saturating_add(u64::from(items.max(1)));
     }
 
     /// A venue fill was observed. `notional_usdc_1e6` must come from
@@ -252,39 +255,6 @@ impl AddressBudget {
     }
 }
 
-/// A cross-thread mirror of [`AddressBudget::remaining`] for the
-/// `/metrics` gauge and the `/state` section.
-///
-/// The worker writes it in its cold block; the metrics scrape reads
-/// it. Relaxed both ways: a gauge that is one cold block stale is
-/// fine, and making it stronger would put an ordering constraint on
-/// the worker's hot loop to serve a reader that does not need one.
-#[derive(Debug, Default)]
-pub struct BudgetGauge(AtomicU64);
-
-impl BudgetGauge {
-    /// A gauge reading zero.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self(AtomicU64::new(0))
-    }
-
-    /// Publish the current headroom. Negative headroom publishes as
-    /// zero: a gauge is unsigned, and "below zero" and "at zero" call
-    /// for the same alarm.
-    #[inline]
-    pub fn publish(&self, remaining: i64) {
-        self.0.store(remaining.max(0) as u64, Ordering::Relaxed);
-    }
-
-    /// Read the last published headroom.
-    #[inline]
-    #[must_use]
-    pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
 /// Default location of the budget's own state file.
 pub const DEFAULT_STATE_PATH: &str = "exec-budget.state";
 
@@ -299,6 +269,8 @@ pub const DEFAULT_STATE_PATH: &str = "exec-budget.state";
 /// it exists to prevent.
 #[must_use]
 pub fn load(path: &std::path::Path, address: [u8; 20], floor: u64) -> AddressBudget {
+    // COPY: one ≤ 100 B state line read into a String at BOOT — the
+    // restore path, once per process; never the tick path.
     std::fs::read_to_string(path)
         .ok()
         .and_then(|t| AddressBudget::from_line(&t, address, floor))
@@ -329,7 +301,7 @@ mod tests {
         let mut b = AddressBudget::restored(ADDR, 100, 0, 0);
         assert_eq!(b.remaining(), 10_000);
 
-        b.on_action_sent();
+        b.on_action_sent(1);
         assert_eq!(b.remaining(), 9_999, "an action costs one");
 
         // $1 of venue volume earns exactly one request.
@@ -395,10 +367,6 @@ mod tests {
         let b = AddressBudget::restored(ADDR, 0, 11_000, 0);
         assert_eq!(b.remaining(), -1_000);
         assert_eq!(b.may_submit(), Err(BudgetErr::Floor));
-        // The gauge, which is unsigned, shows zero.
-        let g = BudgetGauge::new();
-        g.publish(b.remaining());
-        assert_eq!(g.get(), 0);
     }
 
     /// **A state file for a different address is not this address's
@@ -517,7 +485,7 @@ mod tests {
         );
         assert_eq!(b.may_submit(), Err(BudgetErr::Floor));
         let mut b = b;
-        b.on_action_sent();
+        b.on_action_sent(1);
         assert_eq!(b.spent(), u64::MAX);
         assert!(b.remaining() <= 0);
 

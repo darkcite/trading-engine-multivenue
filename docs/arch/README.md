@@ -1,8 +1,10 @@
 # docs/arch/ — closed historical documents
 
-Everything here is **CLOSED**: superseded plans and finished progress logs.
-Nothing in this folder receives further entries. Read only for archaeology;
-the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
+Everything here is **CLOSED**: superseded plans, finished progress logs and
+lifted-out state text. Nothing in this folder receives further entries.
+**Read only when the operator explicitly asks** (a closed phase, a ruling's
+provenance) — never for orientation; the live doc set is `CLAUDE.md` +
+`docs/risk-policy.md` + `PLAN.md` + the three sheets in `docs/`.
 
 | file | what it was | closed |
 |---|---|---|
@@ -36,9 +38,12 @@ the live doc set is `docs/` + `PLAN.md` + `CLAUDE.md`.
 | `s3-archive-plan.md` | object-storage archive lane S0–S7 (cold tier for capture) | CLOSED 2026-09-05, **LIVE 2026-09-05, first unattended cycles reviewed 2026-09-07**; its S-LAWs REMAIN the standing authority for that subsystem — index-object-last, verify-before-delete, no `delete_object`. §16 carries the measurements (throughput, compression, the background-QoS trap) and the one open operator item: bucket versioning |
 | `venue-time-capture-plan.md` | VT0–VT6, Tick v3 venue time + the staleness gate | archived 2026-09-07 (closed 2026-09-03). **Its §6.1 ≤ 2 h CAPTURE-WINDOW LAW REMAINS a standing absolute** — it is cited from `crates/**` and the worker at its pre-move path by design |
 | `phase-8-architecture.svg` | phase-8 architecture picture | archived 2026-09-07; superseded by `architecture.svg` in this directory |
+| `regime-and-dashboard-plan.md` | RG0–RG8 regime detection + labels + dashboard + funding seed | CLOSED 2026-09-08 (RG7 soak PASS); archived 2026-09-19. Its RG laws (regime is a GATE, exits never gated, the ≤ 2 h soak law) are restated in `docs/risk-policy.md` |
+| `ai-strategy-pipeline.svg` | the 2026-09-05 (v1) pipeline sheet | superseded by `docs/ai-strategy-pipeline.svg` v2 (2026-09-19); kept unmodified as that record |
+| `claude-md-state-log-2026-09-19.md` | the CURRENT STATE bullets + the M2/M3 protocol lifted out of `CLAUDE.md` | archived 2026-09-19 when CLAUDE.md was cut to state + laws |
 
-Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02). In-tree doc
+Note: this archive grew in waves (2026-08-16, 2026-08-29, 2026-09-02, 2026-09-19). In-tree doc
 comments and older docs cite pre-move paths (`docs/phase-8-plan.md`,
 `docs/phase-8h-*`, `docs/prompts/8h-kickoff.md`,
-`docs/capture-remediation-plan-2026-08-28.md`, …) — those are historical
+`docs/capture-remediation-plan-2026-08-28.md`, `docs/regime-and-dashboard-plan.md`, …) — those are historical
 citations, left as written BY DESIGN; any such reference resolves here.
