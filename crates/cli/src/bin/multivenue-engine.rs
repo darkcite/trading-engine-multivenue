@@ -374,9 +374,12 @@ struct AuditPnlArgs {
     /// --replay-dir`.
     #[arg(long)]
     dir: PathBuf,
-    /// Repeatable `--fee-bps <venue>[.<class>]:<maker>:<taker>` overrides
-    /// (same grammar as the backtest arm; XSD-F: a bare venue sets every
-    /// class, `<venue>.<class>` one of spot|perp|dated|option|prediction).
+    /// Repeatable `--fee-bps <venue>[.<class>[.open|.settle]]:<maker>:<taker>`
+    /// overrides (same grammar as the backtest arm; XSD-F: a bare venue
+    /// sets every class, `<venue>.<class>` one of
+    /// spot|perp|dated|option|prediction; BIN15 `.open` = the
+    /// charge-once opening pair; E7 `.settle` = the pair charged on a
+    /// binary settlement's payout).
     #[arg(long)]
     fee_bps: Vec<String>,
     /// Global activation-Δ override, ns (same as backtest).
@@ -465,10 +468,11 @@ struct BacktestArgs {
     /// verbatim into the schema-1 report.
     #[arg(long)]
     split: String,
-    /// §4.3 fee override `<venue>[.<class>]:<maker_bps>:<taker_bps>`,
+    /// §4.3 fee override `<venue>[.<class>[.open|.settle]]:<maker_bps>:<taker_bps>`,
     /// repeatable (venues: pm|bn|okx|deribit|hl|bybit; XSD-F classes:
-    /// spot|perp|dated|option|prediction — a bare venue sets all five).
-    /// Defaults all 0/0.
+    /// spot|perp|dated|option|prediction — a bare venue sets all five;
+    /// `.open` the charge-once opening pair, `.settle` the pair charged
+    /// on a binary settlement's payout). Defaults all 0/0.
     #[arg(long)]
     fee_bps: Vec<String>,
     /// §4.4 global latency-penalty override in ns (default per-venue:

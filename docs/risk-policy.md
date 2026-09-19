@@ -4372,10 +4372,13 @@ The first hour, as it happened:
   `userFills` within the second, six reconciliations agreeing, drift 0.
 * **13:15:09Z — settlement at 1.0 × 2 = $2.00 with `fee 0.002688`
   USDC.** HIP-4's fee is charged on SETTLEMENT, not on the trade:
-  0.1344 % of the payout on this row. The 2026-09-15 "fees are zero on
-  the wire" finding was true of the TRADE row only. MEASURED, per the
-  fee law — `fees.toml`'s prediction row and `pnl_report` must carry a
-  settlement-side term (open item).
+  0.1344 % of the payout on this row — 14 bps before the account's 4 %
+  referral discount, and the 13:30:06Z LOSING settlement (payout 0)
+  charged 0. The 2026-09-15 "fees are zero on the wire" finding was
+  true of the TRADE row only. MEASURED, per the fee law — and carried
+  the same day: `fees.toml` `[fees.hl] prediction_settle = "14:14"` →
+  `--fee-bps hl.prediction.settle:14:14` → `FillEngine::settle_binary`
+  charges it on the payout (migration entry of 2026-09-19).
 * 13:17:19Z — the next entry, BUY 2 @ 0.75 `#42700` (Yes, 13:15
   instance), $1.50. USDC 8.517312 = 9.8 − 1.78 + 2.00 − 0.002688 − 1.50
   to the cent.

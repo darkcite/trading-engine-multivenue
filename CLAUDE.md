@@ -80,8 +80,9 @@ in the script; `ai` = 48 is the floor every name includes).
   The four `Scope::Live` keys live in the REPO `.env`; the mainnet agent
   approval EXPIRES 2026-10-19. The venue's HIP-4 minimum order is
   **1 USDC** (measured; `GRID_MIN_NOTIONAL_1E6`) and its fee is charged
-  on SETTLEMENT (~13.4 bps of payout, measured 13:15Z), not on the
-  trade. Record + the first hour's two findings (E7-F1 budget seed,
+  on SETTLEMENT (14 bps of the payout, 13.44 with the referral discount,
+  measured 13:15Z; the trade is free) — `fees.toml`'s
+  `prediction_settle` key, `--fee-bps hl.prediction.settle`. Record + the first hour's two findings (E7-F1 budget seed,
   E7-F2 IoC-miss classification): `docs/risk-policy.md` "E7 — MAINNET
   R0". Bars R0–R3: risk-policy "E7". Every restart of an armed engine
   passes `scripts/exec-smoke.sh` first (daily-restart does it itself).

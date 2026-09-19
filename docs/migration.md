@@ -6,6 +6,38 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — `fees.toml` gains `<class>_settle` → `--fee-bps <venue>.<class>.settle:<m>:<t>` (the HIP-4 settlement fee, measured)
+
+**No wire-format change, no file-layout change.** One config key and
+one harness flag form are NEW; every existing file and flag reads as
+before.
+
+Why: the first mainnet settlement (2026-09-19 13:15:09Z, `userFills`)
+charged **0.002688 USDC on a $2.00 payout** while both trade rows and
+the losing settlement charged 0 — 14 bps of the payout (13.44 with the
+account's 4 % referral discount), on the payout only. The fee model had
+two legs per class (`prediction` for closing fills and settlement,
+`prediction_open` for opening fills) and could not say "the trade is
+free, the payout pays": setting the ordinary pair would also charge a
+closing trade on the book, which the venue does not.
+
+What changed: `ModelParams.fee_settle_bps[venue][class]: Option<(m, t)>`,
+set by `--fee-bps <venue>.<class>.settle:<m>:<t>`; `FillEngine::settle_binary`
+charges its second number on `payout × contracts` when present and the
+class's ordinary taker number when absent (bit-identical for every venue
+and class without one — every settlement charged before this entry).
+`claude_worker.pnl_report.load_fee_flags` emits it from
+`[fees.<venue>] <class>_settle = "<m>:<t>"`; `fees.toml.example`'s
+`[fees.hl]` carries `prediction_settle = "14:14"` and the four measured
+rows. `audit-pnl` passes the table through like the open pair.
+
+Ripple: a report on a root with BIN15 settlements changes by the
+settlement fee once the operator's `~/multivenue/fees.toml` carries the
+key (the nightly `pnl_report --closed-day` reads that file; a fees file
+without the key charges the old 0). A worker or binary OLDER than this
+entry refuses a fees file that carries `<class>_settle` (an unknown key
+is fatal by the grammar's own law) — relink before adding the line.
+
 ## 2026-09-19 — Exec arm: `ioc_missed` counter (E7-F2) and the budget seeded from `userRateLimit` (E7-F1)
 
 **No wire-format change, no file-layout change, no config key change.**

@@ -348,6 +348,23 @@ pub struct ModelParams {
     /// `--fee-bps <venue>.<class>.open:<m>:<t>` sets it; a bare
     /// `<venue>` or `<venue>.<class>` flag never does.
     pub fee_open_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; 7],
+    /// E7 (2026-09-19, MEASURED on mainnet): the pair charged when a
+    /// binary instance SETTLES, on the payout notional (`payout ×
+    /// contracts`, so a losing leg pays nothing), per venue × class;
+    /// `None` = "same as the class's ordinary pair", which is what every
+    /// settlement charged before this field existed (bit-identical).
+    ///
+    /// HIP-4 charges nothing on the trade — open or close — and
+    /// 14 bps of the payout at settlement (0.002688 USDC on a $2.00
+    /// payout with the account's 4 % referral discount, `userFills`
+    /// 2026-09-19 13:15:09Z; the losing settlement's row is 0). Neither
+    /// the ordinary pair (a closing TRADE on the book is free) nor the
+    /// open pair can say that, so settlement carries its own.
+    /// `--fee-bps <venue>.<class>.settle:<m>:<t>` sets it; the harness
+    /// charges the second (taker) number — a settlement is a crossing
+    /// by definition — and the pair shape is kept so every `m:t` reader
+    /// of the fee grammar still parses the line.
+    pub fee_settle_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; 7],
     /// Activation penalty Δ ns per venue (§4.4). **A MEASUREMENT of the
     /// deployment host + network, not a constant** — see
     /// `docs/venue-latency.md` and the provenance on [`Default`].
@@ -382,11 +399,24 @@ pub struct ModelParams {
 /// ladder rung.
 pub const OPT_SPREAD_FRAC_MAX: u32 = 1_000_000;
 
+/// Which pair a `--fee-bps <venue>.<class>[.open|.settle]` flag names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeeLeg {
+    /// The class's ordinary pair (closing trades, and every venue that
+    /// knows no other).
+    Ordinary,
+    /// The charge-once OPENING pair (BIN15 O1).
+    Open,
+    /// The pair charged when a binary instance settles (E7).
+    Settle,
+}
+
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
             fee_bps: [[(0, 0); INSTRUMENT_CLASSES]; 7],
             fee_open_bps: [[None; INSTRUMENT_CLASSES]; 7],
+            fee_settle_bps: [[None; INSTRUMENT_CLASSES]; 7],
             // VRP V3: the ladder's optimistic rung — the D-7 floor
             // alone. Widening is opt-in and one-way.
             opt_spread_frac_1e6: 0,
@@ -558,7 +588,7 @@ pub fn parse_model_params(
             (Some(vc), Some(mk), Some(tk), None) => (vc, mk, tk),
             _ => {
                 return Err(HarnessError::Usage(format!(
-                    "bad --fee-bps {spec:?}: want <venue>[.<class>[.open]]:<maker_bps>:<taker_bps>"
+                    "bad --fee-bps {spec:?}: want <venue>[.<class>[.open|.settle]]:<maker_bps>:<taker_bps>"
                 )))
             }
         };
@@ -567,22 +597,27 @@ pub fn parse_model_params(
         // so `bn:10:10 bn.perp:2:5` reads as "spot tier everywhere on
         // Binance except perps".
         // BIN15 O1: a trailing `.open` names the OPENING pair of that
-        // class (the charge-once law) instead of its ordinary pair. It
-        // requires a class — `<venue>.open` reads as an unknown class,
-        // which is the error the operator wants to see.
-        let (v, class, opening) = match vc.split_once('.') {
-            None => (vc, None, false),
+        // class (the charge-once law) instead of its ordinary pair;
+        // E7: a trailing `.settle` names the pair charged when a binary
+        // instance settles. Both require a class — `<venue>.open` reads
+        // as an unknown class, which is the error the operator wants to
+        // see.
+        let (v, class, leg) = match vc.split_once('.') {
+            None => (vc, None, FeeLeg::Ordinary),
             Some((v, rest)) => {
-                let (c, opening) = match rest.strip_suffix(".open") {
-                    Some(c) => (c, true),
-                    None => (rest, false),
+                let (c, leg) = if let Some(c) = rest.strip_suffix(".open") {
+                    (c, FeeLeg::Open)
+                } else if let Some(c) = rest.strip_suffix(".settle") {
+                    (c, FeeLeg::Settle)
+                } else {
+                    (rest, FeeLeg::Ordinary)
                 };
                 let class = InstrumentClass::parse_label(c).ok_or_else(|| {
                     HarnessError::Usage(format!(
                         "bad --fee-bps {spec:?}: unknown class {c:?} (spot|perp|dated|option|prediction)"
                     ))
                 })?;
-                (v, Some(class), opening)
+                (v, Some(class), leg)
             }
         };
         let vi = model_venue(v).ok_or_else(|| {
@@ -594,10 +629,11 @@ pub fn parse_model_params(
         let tk: u32 = tk.parse().map_err(|_| {
             HarnessError::Usage(format!("bad --fee-bps {spec:?}: unparseable taker bps"))
         })?;
-        match (class, opening) {
+        match (class, leg) {
             (None, _) => p.fee_bps[vi] = [(mk, tk); INSTRUMENT_CLASSES],
-            (Some(c), false) => p.fee_bps[vi][c.index()] = (mk, tk),
-            (Some(c), true) => p.fee_open_bps[vi][c.index()] = Some((mk, tk)),
+            (Some(c), FeeLeg::Ordinary) => p.fee_bps[vi][c.index()] = (mk, tk),
+            (Some(c), FeeLeg::Open) => p.fee_open_bps[vi][c.index()] = Some((mk, tk)),
+            (Some(c), FeeLeg::Settle) => p.fee_settle_bps[vi][c.index()] = Some((mk, tk)),
         }
     }
     for spec in opt_fee_specs {
@@ -3335,9 +3371,36 @@ mod tests {
             ModelParams::default().fee_open_bps,
             [[None; INSTRUMENT_CLASSES]; 7]
         );
-        // `.open` needs a class; the report renderers are untouched
-        // (schema-1 stdout is frozen).
-        for bad in ["hl.open:0:0", "hl.prediction.opened:0:0", "hl.prediction.open.open:0:0"] {
+        // E7: `.settle` sets the SETTLEMENT pair and nothing else, the
+        // same way.
+        let s = parse_model_params(
+            &["hl.prediction:0:0".to_owned(), "hl.prediction.settle:14:14".to_owned()],
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.fee_bps[hl][pred], (0, 0), "ordinary pair untouched");
+        assert_eq!(s.fee_open_bps[hl][pred], None, "and no open pair appeared");
+        assert_eq!(s.fee_settle_bps[hl][pred], Some((14, 14)));
+        assert_eq!(s.fee_settle_bps[hl][InstrumentClass::Perp.index()], None);
+        assert_eq!(bare.fee_settle_bps[hl], [None; INSTRUMENT_CLASSES]);
+        assert_eq!(
+            ModelParams::default().fee_settle_bps,
+            [[None; INSTRUMENT_CLASSES]; 7]
+        );
+        // `.open` / `.settle` need a class; the report renderers are
+        // untouched (schema-1 stdout is frozen).
+        for bad in [
+            "hl.open:0:0",
+            "hl.prediction.opened:0:0",
+            "hl.prediction.open.open:0:0",
+            "hl.settle:14:14",
+            "hl.prediction.settled:14:14",
+            "hl.prediction.settle.open:14:14",
+        ] {
             assert!(
                 parse_model_params(&[bad.to_owned()], None, &[], &[], &[], None).is_err(),
                 "{bad}"
@@ -3346,6 +3409,7 @@ mod tests {
         assert_eq!(render_fee_table_json(&p), render_fee_table_json(&{
             let mut q = p;
             q.fee_open_bps = [[None; INSTRUMENT_CLASSES]; 7];
+            q.fee_settle_bps = [[None; INSTRUMENT_CLASSES]; 7];
             q
         }));
     }

@@ -475,7 +475,8 @@ def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
         "[fees.hl]\n"
         'perp = "2:5"\n'
         'prediction = "2:5"\n'
-        'prediction_open = "0:0"\n',
+        'prediction_open = "0:0"\n'
+        'prediction_settle = "14:14"\n',
         encoding="utf-8",
     )
     assert claude_worker.pnl_report.load_fee_flags(fees) == [
@@ -483,16 +484,18 @@ def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
         "--fee-bps", "hl.perp:2:5",
         "--fee-bps", "hl.prediction:2:5",
         "--fee-bps", "hl.prediction.open:0:0",
+        "--fee-bps", "hl.prediction.settle:14:14",
     ]
     # The shipped example parses, and carries the charge-once pair.
     example = pathlib.Path(__file__).resolve().parents[2] / "fees.toml.example"
     flags = claude_worker.pnl_report.load_fee_flags(example)
     assert "--fee-bps" in flags
-    # HIP-4 fees are ZERO (2026-09-14, venue docs) -- the example
-    # carries 0:0 on both legs, and the charge-once PAIR is still
-    # emitted so the grammar stays exercised.
+    # HIP-4 charges the TRADE nothing (both legs 0:0) and the PAYOUT
+    # 14 bps at settlement (E7, measured on mainnet 2026-09-19) -- the
+    # example carries all three so the grammar stays exercised.
     assert "hl.prediction:0:0" in flags
     assert "hl.prediction.open:0:0" in flags
+    assert "hl.prediction.settle:14:14" in flags
     # Absent `_open` keys: nothing about the rendering changes.
     fees.write_text('[fees]\nhl = "2:5"\n[fees.hl]\nprediction = "2:5"\n', encoding="utf-8")
     assert claude_worker.pnl_report.load_fee_flags(fees) == [
@@ -503,6 +506,10 @@ def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
         '[fees.hl]\npredictions_open = "0:0"\n',
         '[fees.hl]\n_open = "0:0"\n',
         '[fees.hl]\nprediction_open = "0"\n',
+        '[fees.hl]\npredictions_settle = "14:14"\n',
+        '[fees.hl]\n_settle = "14:14"\n',
+        '[fees.hl]\nprediction_settle = "14"\n',
+        '[fees.hl]\nprediction_settle_open = "14:14"\n',
     ):
         fees.write_text(bad, encoding="utf-8")
         with pytest.raises(ValueError):

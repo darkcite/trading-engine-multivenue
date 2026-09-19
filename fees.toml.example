@@ -119,8 +119,8 @@
 #                         12.5 % of premium; settlement 0.015 %             the harness's DERIBIT constant (VRP V2b/VX)
 #   hl       spot         0.040 % / 0.070 % tier 0                   4:7   hyperliquid docs /trading/fees (2026-09-12)
 #   hl       perp         0.015 % / 0.045 % tier 0                   2:5   hyperliquid docs /trading/fees
-#   hl       prediction   ZERO while HIP-4 is in initial testing       0:0   hyperliquid docs HIP-4 (2026-09-14);
-#                         (builder fee only, with a builder code)             QuickNode HIP-4 guide. WATCH: testing-only
+#   hl       prediction   trade 0 / 0 (open and close); SETTLEMENT     0:0   MEASURED on mainnet 2026-09-19 (E7 R0):
+#                         14 bps of the PAYOUT (13.44 with 4 % referral) +settle 14  `userFills` rows below; builder fee separate
 #   bybit    spot         0.1000 % / 0.1000 % non-VIP               10:10  help "Trading-Fee-Structure" (2026-09-12)
 #   bybit    perp         0.0200 % / 0.0550 % non-VIP                2:6   help "Trading-Fee-Structure"
 #   bybit    dated        futures 0.0200 % / 0.0550 % non-VIP        2:6   help "Trading-Fee-Structure"
@@ -165,57 +165,37 @@ option_cap = "3:1250"
 [fees.hl]
 spot = "4:7"
 perp = "2:5"
-# HIP-4 outcome markets (BIN15): **FEES ARE ZERO.**
+# HIP-4 outcome markets (BIN15): THE TRADE IS FREE, THE PAYOUT PAYS 14 bps.
 #
-#   "Fees are currently zero for outcome markets for initial testing."
-#       -- Hyperliquid docs, HIP-4: Outcome markets
-#   "Unlike perps and spot, HIP-4 charges no fee to open a position
-#    (the builder fee still applies)."
-#       -- QuickNode, HIP-4 trading guide
+# MEASURED ON MAINNET 2026-09-19 (E7 R0, master 0x4479...5644, `userFills`):
 #
-# VERIFIED against both, 2026-09-14. This SUPERSEDES the 2:5 pair that
-# stood here from BIN15 O5 (2026-09-12). That pair was derived from the
-# PERP tier (0.015 %/0.045 %) on the assumption that outcome markets ride
-# the same schedule; they do not, and ruling O-Q8 already flagged it
-# UNVERIFIED. It was never measured -- and it could not have been: every
-# BIN15 fill in existence is PAPER (`origin = 1`), because the member
-# builds no signer, cancel or dispatch path (Stage-3). A paper fill
-# cannot verify a fee.
+#   13:08:59Z  Buy 2 @ 0.89 #42681 ...................... "fee": "0.0"
+#   13:15:09Z  Settlement #42681 at 1.0, payout $2.00 ... "fee": "0.002688"
+#   13:17:19Z  Buy 2 @ 0.75 #42700 ...................... "fee": "0.0"
+#   13:30:06Z  Settlement #42700 at 0.0, payout $0 ...... "fee": "0.0"
 #
-# MEASURED 2026-09-15, and this row is now the only one in this file
-# that is. `exec-smoke --fill` bought 2 of a live HIP-4 outcome leg at
-# 0.68 on testnet -- a CROSSING (taker) fill, the expensive side -- and
-# the venue reported:
+#   0.002688 / 2.00 = 13.44 bps of the PAYOUT, with the account's 4 %
+#   referral discount active (`userFees.activeReferralDiscount`); the
+#   undiscounted rate is 0.0014 = 14 bps EXACTLY (= 2 x the spot taker
+#   tier, 0.07 %). The losing leg's payout is 0, so it pays 0 - one rule,
+#   no "winners only" clause needed. L3 (round UP, and an account without
+#   the referral pays the full rate): 14.
 #
-#       "fee": "0.0",  "feeToken": "USDC"
+# This agrees with the venue's own wording - "zero-fee opening trades,
+# charges applied only at settlement" - and CORRECTS the 2026-09-14/15
+# reading of it, which took the testnet trade row's "fee": "0.0" as
+# "fees are zero": it is the TRADE that is free. A closing trade on the
+# book has not been measured on mainnet (R0 runs entries only; the docs
+# say only settlement is charged), so `prediction` stays 0:0 with that
+# caveat. The BUILDER fee is separate and only for an order carrying a
+# builder code; ours do not.
 #
-# So the row does not change: it was already 0:0, corrected from the
-# docs the day before. What changes is its standing. Plan SS6.5 says
-# MEASURE, do not read, and until this fill there was nothing in the
-# repo that could measure a fee at all. Two documents agreeing is
-# weaker evidence than one fill, and the pair they replaced was itself
-# a plausible-sounding inference from a neighbouring schedule.
-#
-# Caveat kept deliberately: this is TESTNET. It agrees with both
-# published sources, which is why it is recorded as confirmation
-# rather than as a new value -- but a mainnet HIP-4 fill has still
-# never been measured by anything here.
-#
-# The BUILDER fee is the one charge that survives, and only for an order
-# carrying a builder code. Ours do not.
-#
-# WATCH THIS ROW. "currently ... for initial testing" is a launch
-# condition with a date on it. Any strategy sized on zero fees must
-# re-clear its bar the day a schedule appears.
-#
-# Both rows are KEPT at 0:0 rather than deleted: without them a bin15
-# fill falls to the venue's DEAREST known class (spot 4:7) on BOTH legs
-# and `fee_class_unknown_fills` counts it. `<class>_open` is the
-# CHARGE-ONCE key -- it becomes `--fee-bps hl.prediction.open:<m>:<t>`,
-# and keeping the structure means only ONE number moves if a fee ever
-# lands.
-prediction = "0:0"        # closing fills and settlement -- zero (testing)
-prediction_open = "0:0"   # opening fills -- HIP-4 charges nothing to open
+# Three keys, three legs (the harness charges the second number of the
+# settle pair on `payout x contracts`, and the pair shape is kept so a
+# section-blind `key = "m:t"` reader never trips):
+prediction = "0:0"        # closing fills on the book -- unmeasured on mainnet; the docs say free
+prediction_open = "0:0"   # opening fills -- measured 0.0 on mainnet (two rows)
+prediction_settle = "14:14"  # SETTLEMENT, on the payout -- measured 14 bps (13.44 with the 4 % referral)
 
 [fees.bybit]
 spot = "10:10"

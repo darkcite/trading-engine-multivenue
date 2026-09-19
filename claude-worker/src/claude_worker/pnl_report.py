@@ -179,6 +179,22 @@ def _pair(val: str, where: str) -> tuple[int, int]:
     return int(maker), int(taker)
 
 
+def _class_and_leg(key: str) -> tuple[str, str]:
+    """A ``[fees.<venue>]`` key -> ``(class, leg)``.
+
+    ``prediction`` -> ``("prediction", "")``; ``prediction_open`` ->
+    ``("prediction", "open")`` (the charge-once opening pair);
+    ``prediction_settle`` -> ``("prediction", "settle")`` (the pair charged
+    on a binary settlement's payout). The leg is the flag's trailing
+    ``.open`` / ``.settle``.
+    """
+    for leg in ("open", "settle"):
+        suffix = "_" + leg
+        if key.endswith(suffix):
+            return key[: -len(suffix)], leg
+    return key, ""
+
+
 def load_fee_flags(path: pathlib.Path) -> list[str]:
     """``fees.toml`` → the harness's repeatable fee argv.
 
@@ -202,6 +218,15 @@ def load_fee_flags(path: pathlib.Path) -> list[str]:
     Absent, the class charges its ordinary pair on both legs and the
     harness is bit-identical to every pre-BIN15 run. Shaped ``"m:t"`` like
     every other tier so a section-blind reader never trips on it.
+    E7 (2026-09-19, MEASURED on mainnet): a key ``<class>_settle`` carries
+    the pair charged when a binary instance SETTLES, on the payout ->
+    ``--fee-bps <venue>.<class>.settle:<m>:<t>``. HIP-4 charges the trade
+    nothing either way and 14 bps of the payout at settlement, which
+    neither the ordinary pair (a closing trade is free) nor the open pair
+    can say. The harness charges the second number on ``payout x
+    contracts`` (a losing leg pays 0); the pair shape is kept for the same
+    section-blind reason. Absent, a settlement charges the class's
+    ordinary pair, as every settlement did before.
 
     Bare lines are emitted FIRST, class lines after, so a class overrides
     its venue's bare pair in argv order (the harness's later-wins law); a
@@ -250,17 +275,15 @@ def load_fee_flags(path: pathlib.Path) -> list[str]:
             index_bps, prem_bps = _pair(val, where)
             classes.extend(("--opt-fee", f"{section}:{index_bps}:{prem_bps}"))
             continue
-        if key.endswith("_open"):
-            cls = key[: -len("_open")]
-            if cls not in FEE_CLASSES:
-                raise ValueError(f"{where}: unknown class {cls!r} in {key!r} (want one of {FEE_CLASSES})")
-            maker, taker = _pair(val, where)
-            classes.extend(("--fee-bps", f"{section}.{cls}.open:{maker}:{taker}"))
-            continue
-        if key not in FEE_CLASSES:
-            raise ValueError(f"{where}: unknown class {key!r} (want one of {FEE_CLASSES}, <class>_open or option_cap)")
+        cls, leg = _class_and_leg(key)
+        if cls not in FEE_CLASSES:
+            raise ValueError(
+                f"{where}: unknown class {cls!r} in {key!r} "
+                f"(want one of {FEE_CLASSES}, <class>_open, <class>_settle or option_cap)"
+            )
         maker, taker = _pair(val, where)
-        classes.extend(("--fee-bps", f"{section}.{key}:{maker}:{taker}"))
+        flag = f"{section}.{cls}.{leg}" if leg else f"{section}.{cls}"
+        classes.extend(("--fee-bps", f"{flag}:{maker}:{taker}"))
     return bare + classes
 
 

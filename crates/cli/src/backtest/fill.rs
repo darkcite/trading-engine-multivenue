@@ -1561,6 +1561,25 @@ impl FillEngine {
         }
     }
 
+    /// E7: the TAKER number charged on a binary settlement — the
+    /// class's settlement pair when the operator wrote one
+    /// (`--fee-bps <venue>.<class>.settle`), else exactly what
+    /// [`Self::fee_rate_for`] charges a closing fill, which is what
+    /// every settlement paid before the pair existed. Same
+    /// known-class rule as the open pair: the dearest-class fallback
+    /// never reads a settlement pair.
+    #[inline]
+    fn fee_settle_rate(&mut self, venue: u8, sym: u32) -> u32 {
+        let ordinary = self.fee_rate_for(venue, sym, false).1;
+        let Some(class) = self.sym_class.get(&sym).copied() else {
+            return ordinary;
+        };
+        match self.params.fee_settle_bps[venue as usize][class.index()] {
+            Some(pair) => pair.1,
+            None => ordinary,
+        }
+    }
+
     /// BIN15 O3: whether an order misses the HIP-4 grid.
     ///
     /// Keyed on the KNOWN class, like [`Self::fee_rate_for`]: a sym
@@ -1711,9 +1730,13 @@ impl FillEngine {
             return;
         }
         // Settlement is a CLOSING fill by definition (§3.4) — the
-        // charge-once law's `prediction` pair, never `prediction_open`.
+        // charge-once law's `prediction` pair, never `prediction_open`
+        // — unless the class carries its own SETTLEMENT pair (E7: HIP-4
+        // charges the trade nothing and the payout 14 bps), in which
+        // case that pair's taker number is charged on the payout
+        // notional. A losing leg's payout is 0, so it pays 0 either way.
         let venue = model_venue_byte(sym);
-        let taker = self.fee_rate_for(venue, sym, false).1;
+        let taker = self.fee_settle_rate(venue, sym);
         if qty_full != 0 {
             let n = value as i128 * i128::from(qty_full.unsigned_abs());
             let fee = self.fee_for(sym, n, qty_full.abs(), taker, s.settle_ns);
@@ -2586,6 +2609,87 @@ mod tests {
         assert!(o.full_fees_1e12 > 0, "the closing legs paid");
         // Nothing is left open: every instance closed at its payout.
         assert_eq!(o.full_unreal_1e12, 0);
+    }
+
+    /// E7 (2026-09-19, mainnet): the venue charges the TRADE nothing
+    /// and the PAYOUT 14 bps at settlement. The settlement pair says
+    /// exactly that: a winning instance pays 14 bps of `payout ×
+    /// contracts`, a losing one pays nothing (its payout is 0), a
+    /// closing TRADE on the book still charges the ordinary pair, and
+    /// a class without a settlement pair charges what it always did.
+    #[test]
+    fn a_settlement_pair_is_charged_on_the_payout_and_only_there() {
+        let sym = hl_slot_sym();
+        let hl = VenueId::Hyperliquid as usize;
+        let pred = InstrumentClass::Prediction.index();
+        let mut e = binary_engine();
+        // The venue's measured schedule: 0:0 to trade either way, 14
+        // on the payout.
+        e.params.fee_bps[hl][pred] = (0, 0);
+        e.params.fee_settle_bps[hl][pred] = Some((14, 14));
+        for (i, value) in [(1u64, 1_000_000i64), (2, 0)] {
+            e.set_binary_settle(
+                sym,
+                BinarySettle {
+                    halt_ns: i * 1_000_000_000,
+                    settle_ns: i * 1_000_000_000 + 60_000_000,
+                    value_1e6: value,
+                },
+            );
+        }
+        let mut out = Vec::new();
+        // Instance 1: 100 @ 0.50, settles at 1.0 → payout $100, fee
+        // ceil(100 × 14 bps) = $0.14.
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, 500_000_000, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].fee_1e12, 0, "the trade is free");
+        e.on_record(&crossing_tick(), 40, 1_070_000_000, &mut out);
+        let fee_win_1e12: i128 = 140_000_000_000; // $0.14
+        assert_eq!(e.full.fees_sum_1e12, fee_win_1e12, "14 bps of the $100 payout");
+        // Instance 2: 100 @ 0.50, settles at 0 → payout 0, fee 0.
+        e.intake(&grid_bid(2), 50);
+        e.on_record(&crossing_tick(), 60, 1_500_000_000, &mut out);
+        assert_eq!(out.len(), 1, "the second instance filled");
+        e.on_record(&crossing_tick(), 70, 2_070_000_000, &mut out);
+        assert_eq!(e.full.fees_sum_1e12, fee_win_1e12, "a losing leg pays nothing");
+        let o = e.finish();
+        assert_eq!(o.binary_settled, 2);
+        assert_eq!(o.full_fees_1e12, fee_win_1e12);
+
+        // The same tape through an engine WITHOUT a settlement pair
+        // charges the ordinary taker number (2/5 in `binary_engine`)
+        // on both payouts — what every settlement paid before E7.
+        let mut e = binary_engine();
+        for (i, value) in [(1u64, 1_000_000i64), (2, 0)] {
+            e.set_binary_settle(
+                sym,
+                BinarySettle {
+                    halt_ns: i * 1_000_000_000,
+                    settle_ns: i * 1_000_000_000 + 60_000_000,
+                    value_1e6: value,
+                },
+            );
+        }
+        let mut out = Vec::new();
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, 500_000_000, &mut out);
+        e.on_record(&crossing_tick(), 40, 1_070_000_000, &mut out);
+        assert_eq!(e.full.fees_sum_1e12, 50_000_000_000, "5 bps of $100, as before");
+
+        // A closing TRADE on the book charges the ordinary pair, never
+        // the settlement pair: sell 100 @ 0.60 as a taker under
+        // 0:0 / settle 14 → fee 0.
+        let mut e = binary_engine();
+        e.params.fee_bps[hl][pred] = (0, 0);
+        e.params.fee_settle_bps[hl][pred] = Some((14, 14));
+        let mut out = Vec::new();
+        e.intake(&grid_bid(1), 1);
+        e.on_record(&crossing_tick(), 10, 500_000_000, &mut out);
+        e.intake(&order(sym, Side::Ask, 400_000, 100_000_000, 2), 20);
+        e.on_record(&tick(sym, 600_000, 500_000_000, 700_000, 500_000_000), 30, 600_000_000, &mut out);
+        assert_eq!(out.len(), 1, "the close filled");
+        assert_eq!(out[0].fee_1e12, 0, "a closing trade is not a settlement");
     }
 
     /// The venue refuses these outright, so filling them would invent

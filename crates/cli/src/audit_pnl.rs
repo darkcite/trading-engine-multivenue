@@ -1317,6 +1317,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 // BIN15 O1: audit-pnl charges the same charge-once
                 // pairs `--fee-bps <venue>.<class>.open` sets.
                 fee_open_bps: params.fee_open_bps,
+                fee_settle_bps: params.fee_settle_bps,
                 latency_ns: params.latency_ns,
                 stale_after_ms: params.stale_after_ms,
                 opt_fee: params.opt_fee,
