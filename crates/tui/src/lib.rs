@@ -366,6 +366,18 @@ fn render_strategies(f: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, s:
     f.render_widget(t, area);
 }
 
+/// E5: the lifecycle verb of one captured intent, for the `recent
+/// orders` panel. An unknown byte renders as `?` rather than as
+/// "place" — the panel must not claim to know what a record means.
+fn verb_name(v: u8) -> &'static str {
+    match v {
+        core_types::ORDER_VERB_PLACE => "place",
+        core_types::ORDER_VERB_CANCEL => "cancel",
+        core_types::ORDER_VERB_MODIFY => "modify",
+        _ => "?",
+    }
+}
+
 fn render_recent_orders(
     f: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -375,6 +387,7 @@ fn render_recent_orders(
 
     let header = Row::new(vec![
         Cell::from("age"),
+        Cell::from("verb"),
         Cell::from("slot"),
         Cell::from("venue"),
         Cell::from("sym"),
@@ -390,21 +403,30 @@ fn render_recent_orders(
         .rev()
         .filter_map(|k| ring.oldest_first(k))
         .map(|o| {
+            // E5: a CANCEL record carries no side, price or size —
+            // it asserts nothing about them. Rendering its zeroes as
+            // numbers would show an operator a zero-priced bid the
+            // member never emitted, which is a phantom worth
+            // half an hour of someone's evening.
+            let blank = o.verb == core_types::ORDER_VERB_CANCEL;
+            let dash = |t: String| if blank { "-".to_string() } else { t };
             Row::new(vec![
                 Cell::from(format_dur_s(
                     s.mono_ns.saturating_sub(o.ts_ns) / 1_000_000_000,
                 )),
+                Cell::from(verb_name(o.verb)),
                 Cell::from(format!("{}", o.strategy_id)),
                 Cell::from(format!("{}", o.venue)),
                 Cell::from(format!("{}", o.sym)),
-                Cell::from(side_name(o.side as u8)),
-                Cell::from(format_px(o.px.raw())),
-                Cell::from(format_px(o.qty.raw())),
+                Cell::from(dash(side_name(o.side as u8).to_string())),
+                Cell::from(dash(format_px(o.px.raw()))),
+                Cell::from(dash(format_px(o.qty.raw()))),
             ])
         })
         .collect();
     let widths = [
         Constraint::Length(7),
+        Constraint::Length(6),
         Constraint::Length(4),
         Constraint::Length(5),
         Constraint::Length(10),

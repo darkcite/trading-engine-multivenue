@@ -1451,7 +1451,15 @@ const ORDER_LOG_CAPACITY: usize = 1 << 16;
 /// orders for ANY venue byte (door-closer §16.3.6).
 pub struct BacktestCtx {
     now_ns: u64,
+    /// Every intent the member emitted, **in emission order** —
+    /// places and E5 lifecycle verbs in ONE stream, exactly as
+    /// `engine-orders.pmlr` holds them. Two vectors would let a
+    /// cancel be replayed before its own place.
     orders: Vec<Order>,
+    /// Places only. `orders.len()` counts verbs too, and the
+    /// harness's `orders_emitted` has always meant "orders the member
+    /// placed".
+    places: usize,
     /// Running max of emitted-order notional (×1e6 USD) — §4.6
     /// `bounds.max_order_notional_usd`, full window by design.
     max_order_notional_1e6: i64,
@@ -1463,13 +1471,21 @@ impl BacktestCtx {
         Self {
             now_ns: VIRT_T0,
             orders: Vec::with_capacity(ORDER_LOG_CAPACITY),
+            places: 0,
             max_order_notional_1e6: 0,
         }
     }
 
-    /// Orders captured so far.
+    /// Intents captured so far — places and E5 verbs, in order.
     pub fn orders(&self) -> &[Order] {
         &self.orders
+    }
+
+    /// How many of them are PLACES. This is what "orders emitted"
+    /// has always meant in the report and in the VM's own counter, so
+    /// a reprice must not inflate it.
+    pub fn places(&self) -> usize {
+        self.places
     }
 
     /// Observed max emitted-order notional, ×1e6 USD.
@@ -1493,6 +1509,40 @@ impl Ctx for BacktestCtx {
             self.max_order_notional_1e6 = notional_1e6;
         }
         self.orders.push(order);
+        self.places += 1;
+        Ok(())
+    }
+
+    /// **E5 — the harness learns the verbs.**
+    ///
+    /// Until this existed, `BacktestCtx` took the `Unsupported`
+    /// default, so the same member that repriced successfully in the
+    /// live paper engine had every reprice refused here and counted
+    /// as a dropped order. Every gate, OOS verdict and pin runs
+    /// through this harness, so that divergence would have been
+    /// measured as strategy behaviour.
+    ///
+    /// `Ok(())` unconditionally, like `submit`: this context records
+    /// INTENT, and the fill model downstream is what decides whether
+    /// the named order was still resting. Answering `NoSuchOrder`
+    /// here would make the member branch on the harness's table
+    /// rather than on the venue's.
+    fn cancel(&mut self, req: core_types::CancelReq) -> Result<(), SubmitErr> {
+        self.orders.push(req.as_record());
+        Ok(())
+    }
+
+    /// E5, LAW E-7. Same contract as `cancel`; the record is the
+    /// stamped replacement, never a second place.
+    ///
+    /// Does NOT move `max_order_notional_1e6`: that bound is about
+    /// how much the member ever put at risk in one order, and a
+    /// reprice of a resting order is the same order at a new price,
+    /// not an additional one. A modify that RAISES size is the case
+    /// to revisit if that bound is ever load-bearing for a gate.
+    fn modify(&mut self, prev_client_oid: u64, order: Order) -> Result<(), SubmitErr> {
+        self.orders
+            .push(core_types::ModifyReq::new(prev_client_oid, order).as_record());
         Ok(())
     }
 
@@ -2353,7 +2403,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
             .map(|r| r.seed_source.clone())
             .unwrap_or_else(|| "absent".to_owned()),
     };
-    debug_assert_eq!(stats.vm_orders_emitted as usize, ctx.orders().len());
+    debug_assert_eq!(stats.vm_orders_emitted as usize, ctx.places());
     debug_assert_eq!(
         outcome.orders_is
             + outcome.orders_oos

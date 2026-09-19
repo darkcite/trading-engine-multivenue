@@ -163,15 +163,15 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     /// (a modify may not change either — [`core_types::OrderIdentity`]).
     #[inline]
     fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
-        match self.route.mode(req.order.strategy_id) {
+        match self.route.mode(req.order().strategy_id) {
             ExecMode::Paper => self.paper.modify(req),
             ExecMode::Off => {
-                self.counters.on_refused_off(req.order.strategy_id);
+                self.counters.on_refused_off(req.order().strategy_id);
                 Err(DispatchError::SlotDisabled)
             }
             ExecMode::Live => {
-                if !self.route.venue_allowed(req.order.strategy_id, req.order.venue) {
-                    self.counters.on_refused_no_route(req.order.strategy_id);
+                if !self.route.venue_allowed(req.order().strategy_id, req.order().venue) {
+                    self.counters.on_refused_no_route(req.order().strategy_id);
                     return Err(DispatchError::NoLiveRoute);
                 }
                 self.live.modify(req)
@@ -306,7 +306,7 @@ mod tests {
             Ok(())
         }
         fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
-            self.modified.push((req.prev_client_oid, req.order.client_oid));
+            self.modified.push((req.prev_client_oid(), req.order().client_oid));
             Ok(())
         }
         fn try_next_fill(&mut self) -> Option<Fill> {

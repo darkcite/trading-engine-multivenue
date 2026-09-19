@@ -218,6 +218,16 @@ pub struct OpenOrder {
     pub remaining_1e6: i64,
     /// The vm's idempotency key — echoed into synthesized fills.
     pub client_oid: u64,
+    /// E5: the emitting strategy slot, so a lifecycle verb can find
+    /// its OWN order.
+    ///
+    /// A `client_oid` is unique only inside the member that issued
+    /// it — every member counts from 1 — and `audit-pnl` replays one
+    /// capture holding every member's intents through ONE of these
+    /// tables. Without the slot, one member's cancel would find
+    /// another member's order. `backtest --member` runs a single
+    /// member and would not have noticed.
+    pub strategy_id: u8,
 }
 
 const EMPTY_OPEN: OpenOrder = OpenOrder {
@@ -232,6 +242,7 @@ const EMPTY_OPEN: OpenOrder = OpenOrder {
     px_1e6: 0,
     remaining_1e6: 0,
     client_oid: 0,
+    strategy_id: core_types::STRATEGY_ID_NONE,
 };
 
 /// D-7 half-spread FLOOR (VM2 V5): `max(0.5% of mark, 1 tick)` ×1e6 —
@@ -827,6 +838,44 @@ pub struct FillEngine {
     ioc_fills: u64,
     ioc_canceled: u64,
     ttl_expired: u64,
+    /// E5 lifecycle replay — see [`FillEngine::lifecycle`].
+    lifecycle: LifecycleReplay,
+}
+
+/// E5: what replaying the capture's lifecycle verbs did to this
+/// table.
+///
+/// Deliberately NOT in [`ModelOutcome`], and therefore not in the
+/// frozen schema-1 line: these are a property of the CAPTURE, not of
+/// the strategy's economics, and the schema is a contract with the
+/// worker. They reach a human through the stderr summary, and only
+/// when one of them is non-zero.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleReplay {
+    /// Cancel records that removed a resting order.
+    pub cancels: u64,
+    /// Modify records that repriced one.
+    pub modifies: u64,
+    /// Verbs naming an order this table does not hold, or that two of
+    /// the slot's orders answer to.
+    ///
+    /// **Expected to be non-zero** and not an error: the engine
+    /// cancels an order the model may already have filled or expired,
+    /// because the model's fill law and the venue's are not the same
+    /// law. A LARGE number relative to `cancels + modifies` means the
+    /// two have drifted far enough apart to be worth looking at.
+    pub missed: u64,
+    /// Modify records whose replacement described a different order,
+    /// or carried a non-positive price or size. **Must stay 0** — the
+    /// engine refuses those before they are ever captured, so one
+    /// here means the capture and this reader disagree about the
+    /// record's layout.
+    pub refused: u64,
+    /// Records carrying a verb this build does not know. **Must stay
+    /// 0** for a capture written by this version; non-zero means a
+    /// newer engine wrote it, and every such record was DROPPED
+    /// rather than guessed at.
+    pub unknown_verb: u64,
 }
 
 impl FillEngine {
@@ -853,6 +902,7 @@ impl FillEngine {
             binary_settle: BTreeMap::new(),
             binary_due_ns: u64::MAX,
             binary_halted: BTreeSet::new(),
+            lifecycle: LifecycleReplay::default(),
             prediction_grid_refused: 0,
             prediction_short_refused_1e6: 0,
             prediction_short_refused_fills: 0,
@@ -884,6 +934,12 @@ impl FillEngine {
         }
     }
 
+    /// E5: what replaying the capture's lifecycle verbs did here.
+    #[must_use]
+    pub const fn lifecycle(&self) -> LifecycleReplay {
+        self.lifecycle
+    }
+
     /// Open orders currently resting (test/inspection surface).
     pub fn open_orders(&self) -> &[OpenOrder] {
         &self.open[..self.open_len]
@@ -899,12 +955,110 @@ impl FillEngine {
         self.oos.equity_1e12()
     }
 
+    /// §4.1 intake of one captured intent at `emit_virt`.
+    ///
+    /// **E5 — the verb dispatch lives HERE, not at the call sites.**
+    /// There are eight `intake` callers across `backtest`,
+    /// `backtest::member` and `audit_pnl`, and a replay that applied
+    /// a cancel at seven of them would be silently wrong at the
+    /// eighth. One dispatch, one law, and a new caller cannot forget
+    /// it.
+    pub fn intake(&mut self, order: &Order, emit_virt: u64) {
+        match order.verb {
+            core_types::ORDER_VERB_CANCEL => self.intake_cancel(order),
+            core_types::ORDER_VERB_MODIFY => self.intake_modify(order, emit_virt),
+            // PLACE, and anything a future wire version adds that
+            // this build does not know. An unknown verb is NOT
+            // treated as a place — that would apply a record whose
+            // meaning we do not have. It is counted and dropped.
+            core_types::ORDER_VERB_PLACE => self.intake_place(order, emit_virt),
+            _ => {
+                self.lifecycle.unknown_verb += 1;
+            }
+        }
+    }
+
+    /// E5: take back the order named by `prev_client_oid`, within the
+    /// emitting slot.
+    ///
+    /// Mirrors `clob_dispatcher::PaperMatcher::cancel` — same key,
+    /// same ambiguity rule — because the E5 exit gate is that the
+    /// paper arm and this one agree under the same replay. Refusals
+    /// are COUNTED and not surfaced: this function replays a verb the
+    /// engine already performed, so there is no caller to tell.
+    fn intake_cancel(&mut self, order: &Order) {
+        match self.find_resting(order.prev_client_oid, order.strategy_id) {
+            Some(i) => {
+                self.remove_open(i);
+                self.lifecycle.cancels += 1;
+            }
+            None => self.lifecycle.missed += 1,
+        }
+    }
+
+    /// E5, LAW E-7: replace the order named by `prev_client_oid`.
+    ///
+    /// Price, size and client id change; identity does not; the
+    /// ORIGINAL expiry is kept (a reprice cannot extend a quote's
+    /// life) and the activation delta is re-armed from `emit_virt`
+    /// (the new price is not at the venue for one Δ). Every one of
+    /// those is the paper matcher's rule, restated here against this
+    /// table's own fields.
+    fn intake_modify(&mut self, order: &Order, emit_virt: u64) {
+        let Some(i) = self.find_resting(order.prev_client_oid, order.strategy_id) else {
+            self.lifecycle.missed += 1;
+            return;
+        };
+        let px = order.px.raw();
+        let qty = order.qty.raw();
+        let o = self.open[i];
+        if o.sym != order.sym
+            || o.side != order.side
+            || o.kind != order.kind
+            || o.venue != model_venue_byte(order.sym)
+            || px <= 0
+            || qty <= 0
+        {
+            self.lifecycle.refused += 1;
+            return;
+        }
+        self.open[i].px_1e6 = px;
+        self.open[i].remaining_1e6 = qty;
+        self.open[i].client_oid = order.client_oid;
+        self.open[i].t_active_ns =
+            emit_virt.saturating_add(self.params.latency_ns[o.venue as usize]);
+        self.lifecycle.modifies += 1;
+    }
+
+    /// E5: index of `strategy_id`'s resting order carrying
+    /// `client_oid`, if exactly one does.
+    ///
+    /// `None` on zero AND on more than one: a client id two of a
+    /// slot's own orders answer to names neither of them, and
+    /// resolving it FIFO would take back a quote the caller did not
+    /// mean.
+    fn find_resting(&self, client_oid: u64, strategy_id: u8) -> Option<usize> {
+        let mut found: Option<usize> = None;
+        let mut i = 0usize;
+        while i < self.open_len {
+            let o = self.open[i];
+            if o.client_oid == client_oid && o.strategy_id == strategy_id {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(i);
+            }
+            i += 1;
+        }
+        found
+    }
+
     /// §4.1 intake of one vm-emitted order at `emit_virt`. Applies the
     /// venue routability check, the 4/32 caps (per-sym first, then
     /// total — the risk-policy table order), tags the §3.4 bucket and
     /// stamps `t_active = emit + Δ_venue`. Rejections are counted,
     /// never surfaced to the vm (module docs: the vm sees `Ok`).
-    pub fn intake(&mut self, order: &Order, emit_virt: u64) {
+    fn intake_place(&mut self, order: &Order, emit_virt: u64) {
         debug_assert_eq!(
             order.venue,
             symbol_venue_byte(order.sym),
@@ -980,6 +1134,7 @@ impl FillEngine {
             px_1e6: px,
             remaining_1e6: qty,
             client_oid: order.client_oid,
+            strategy_id: order.strategy_id,
         };
         self.seq_next += 1;
         self.open_len += 1;
@@ -4095,5 +4250,136 @@ mod tests {
                 "realized − fees + unrealized == cash − fees + Σ pos×mark"
             );
         }
+    }
+
+    // ---------------- E5: the harness replays the verbs ------------
+
+    /// Until E5 the harness had no cancel: the same member that
+    /// repriced successfully in the live paper engine had every
+    /// reprice refused here and counted as a dropped order. Every
+    /// gate and OOS verdict runs through this model, so that
+    /// divergence would have been measured as strategy behaviour.
+    #[test]
+    fn a_cancel_record_takes_the_resting_order_out_of_the_model() {
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        e.intake(&order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1), 1_000);
+        assert_eq!(e.open_orders().len(), 1);
+
+        let req = core_types::CancelReq::of(&order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1), 2_000);
+        e.intake(&req.as_record(), 2_000);
+        assert_eq!(e.open_orders().len(), 0, "it is gone from the book");
+        assert_eq!(e.lifecycle().cancels, 1);
+        assert_eq!(e.lifecycle().missed, 0);
+    }
+
+    /// A modify changes price, size and id in place — one resting
+    /// order, not two — and keeps the ORIGINAL expiry, so a reprice
+    /// cannot extend a quote's life past the TTL its ruleset gave it.
+    #[test]
+    fn a_modify_record_reprices_in_place_and_keeps_the_original_expiry() {
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        let mut first = order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1);
+        first.ttl_ns = 400_000_000;
+        e.intake(&first, 1_000);
+        let expiry_before = e.open_orders()[0].expiry_ns;
+
+        let mut repl = order(PM_SYM, Side::Bid, 470_000, 2_000_000, 2);
+        repl.ttl_ns = 3_600_000_000_000; // an hour, and it must be ignored
+        e.intake(&core_types::ModifyReq::new(1, repl).as_record(), 900_000_000);
+
+        assert_eq!(e.open_orders().len(), 1, "replaced, not added");
+        let o = e.open_orders()[0];
+        assert_eq!(o.px_1e6, 470_000);
+        assert_eq!(o.remaining_1e6, 2_000_000);
+        assert_eq!(o.client_oid, 2, "the fresh id (ruling O-E5b)");
+        assert_eq!(o.expiry_ns, expiry_before, "the ORIGINAL expiry stands");
+        assert_eq!(e.lifecycle().modifies, 1);
+        assert_eq!(e.lifecycle().refused, 0);
+    }
+
+    /// The new price is an instruction like any other and is not at
+    /// the venue for one Δ. Preserving the original activation would
+    /// fill at a price the venue had not been told about.
+    #[test]
+    fn a_modify_record_re_arms_the_activation_delta() {
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        e.intake(&order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1), 1_000);
+        let active_before = e.open_orders()[0].t_active_ns;
+        e.intake(
+            &core_types::ModifyReq::new(1, order(PM_SYM, Side::Bid, 470_000, 1_000_000, 2))
+                .as_record(),
+            5_000_000_000,
+        );
+        assert!(
+            e.open_orders()[0].t_active_ns > active_before,
+            "the reprice cannot be live before the venue could know it"
+        );
+    }
+
+    /// `audit-pnl` replays ONE capture holding every member's
+    /// intents through ONE of these tables, and every member counts
+    /// its `client_oid` from 1. Without the slot in the key, one
+    /// member's cancel would take back another's order.
+    #[test]
+    fn a_cancel_record_cannot_reach_another_slots_order_of_the_same_id() {
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        let mut a = order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1);
+        a.strategy_id = 0;
+        let mut b = order(PM_SYM, Side::Bid, 510_000, 1_000_000, 1); // SAME id
+        b.strategy_id = 5;
+        e.intake(&a, 1_000);
+        e.intake(&b, 1_000);
+        assert_eq!(e.open_orders().len(), 2);
+
+        e.intake(&core_types::CancelReq::of(&b, 2_000).as_record(), 2_000);
+        assert_eq!(e.open_orders().len(), 1);
+        assert_eq!(
+            e.open_orders()[0].strategy_id, 0,
+            "the WRONG member's order was taken back"
+        );
+    }
+
+    /// A verb naming an order the model no longer holds is COUNTED,
+    /// not applied to something else and not fatal: the engine and
+    /// the model do not share a fill law, so the engine can honestly
+    /// cancel an order this table already filled.
+    #[test]
+    fn a_verb_naming_nothing_is_counted_and_changes_no_other_order() {
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        e.intake(&order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1), 1_000);
+        let mut other = order(PM_SYM, Side::Bid, 500_000, 1_000_000, 99);
+        other.strategy_id = 0;
+        e.intake(&core_types::CancelReq::of(&other, 2_000).as_record(), 2_000);
+        assert_eq!(e.open_orders().len(), 1, "the resting order is untouched");
+        assert_eq!(e.lifecycle().missed, 1);
+        assert_eq!(e.lifecycle().cancels, 0);
+    }
+
+    /// A verb byte this build does not know is DROPPED, never
+    /// treated as a place. Applying a record whose meaning we do not
+    /// have is how a newer engine's capture silently becomes a
+    /// different backtest.
+    #[test]
+    fn an_unknown_verb_is_dropped_rather_than_read_as_a_place() {
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        let mut weird = order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1);
+        weird.verb = 7;
+        e.intake(&weird, 1_000);
+        assert_eq!(e.open_orders().len(), 0);
+        assert_eq!(e.lifecycle().unknown_verb, 1);
+    }
+
+    /// Every Order this codebase has ever captured carries verb 0,
+    /// because the byte was zeroed padding — so an old capture still
+    /// replays as places and nothing else.
+    #[test]
+    fn a_pre_e5_order_slot_reads_as_a_place() {
+        let o = order(PM_SYM, Side::Bid, 500_000, 1_000_000, 1);
+        assert_eq!(o.verb, core_types::ORDER_VERB_PLACE);
+        assert_eq!(o.prev_client_oid, 0);
+        let mut e = FillEngine::new(ModelParams::default(), u64::MAX);
+        e.intake(&o, 1_000);
+        assert_eq!(e.open_orders().len(), 1);
+        assert_eq!(e.lifecycle(), LifecycleReplay::default());
     }
 }

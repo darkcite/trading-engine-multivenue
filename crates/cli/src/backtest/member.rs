@@ -301,7 +301,7 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
         consumed += 1;
     }
     DriveOutcome {
-        orders_emitted: ctx.orders().len() as u64,
+        orders_emitted: ctx.places() as u64,
         round_trips: rts.total,
         rt_at_boundary: rt_at_boundary.unwrap_or(rts.total),
         timer_calls,

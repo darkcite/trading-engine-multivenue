@@ -433,7 +433,7 @@ pub trait OrderDispatch {
     ///
     /// Price, size and client id may change; the five fields of
     /// [`core_types::OrderIdentity`] may not, and
-    /// `req.order.ts_ns`/`ttl_ns` are ignored (the modified order
+    /// `req.order().ts_ns`/`ttl_ns` are ignored (the modified order
     /// keeps the original's expiry). Defaulted like `cancel`, for the
     /// same reason.
     #[inline]
@@ -918,8 +918,8 @@ impl PaperMatcher {
     /// lose or gain. `expiry_ns` because **a reprice must not extend a
     /// quote's life**: an Arm B that repriced every 333 ms could
     /// otherwise hold a quote forever past the TTL its ruleset set.
-    /// `req.order.ttl_ns` is therefore read for nothing — but
-    /// `req.order.ts_ns` is the caller's decision clock and IS read,
+    /// `req.order().ttl_ns` is therefore read for nothing — but
+    /// `req.order().ts_ns` is the caller's decision clock and IS read,
     /// by [`PaperDispatcher::modify`], as this function's `now_ns`.
     ///
     /// Re-armed: `t_active_ns`, to `now + Δ_venue`.
@@ -939,7 +939,7 @@ impl PaperMatcher {
     /// fill either — so the model under-fills a modify by at most one
     /// Δ. Under-filling is recoverable; inventing a fill is not.
     pub fn modify(&mut self, req: &ModifyReq, now_ns: NsTs) -> Result<(), DispatchError> {
-        let i = match self.find_resting(req.prev_client_oid, req.order.strategy_id) {
+        let i = match self.find_resting(req.prev_client_oid(), req.order().strategy_id) {
             Resting::One(i) => i,
             Resting::None => {
                 self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
@@ -954,8 +954,8 @@ impl PaperMatcher {
             self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
             return Err(DispatchError::IdentityMismatch);
         }
-        let px = req.order.px.raw();
-        let qty = req.order.qty.raw();
+        let px = req.order().px.raw();
+        let qty = req.order().qty.raw();
         if px <= 0 || qty <= 0 {
             // Same bar as `submit`: a non-positive price or size is
             // not modellable. Same counter, same name — but returned
@@ -968,7 +968,7 @@ impl PaperMatcher {
         let venue = self.open[i].model_venue;
         self.open[i].px_1e6 = px;
         self.open[i].remaining_1e6 = qty;
-        self.open[i].client_oid = req.order.client_oid;
+        self.open[i].client_oid = req.order().client_oid;
         self.open[i].t_active_ns = now_ns.saturating_add(self.activation_ns[venue as usize]);
         self.counters.modifies = self.counters.modifies.wrapping_add(1);
         Ok(())
@@ -1190,7 +1190,7 @@ impl OrderDispatch for PaperDispatcher {
     /// timestamp is easy to write.
     #[inline]
     fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
-        self.matcher.modify(req, req.order.ts_ns)
+        self.matcher.modify(req, req.order().ts_ns)
     }
 
     fn try_next_fill(&mut self) -> Option<Fill> {
@@ -1892,7 +1892,7 @@ mod tests {
         m.submit(&old, 1_000);
         let mut new = maker(97_000_000, 1_000_000, 2, 0);
         new.ts_ns = 0; // the mistake this test exists to make visible
-        // The dispatcher passes `req.order.ts_ns` as the clock.
+        // The dispatcher passes `req.order().ts_ns` as the clock.
         assert_eq!(m.modify(&ModifyReq::new(1, new), new.ts_ns), Ok(()));
         // 0 + Δ is long past, so the reprice is live immediately.
         m.observe_tick(&crossing_tick(96_000_000), AFTER_DELTA);

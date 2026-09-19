@@ -974,11 +974,9 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         &self.recent_fills
     }
 
-    /// E5: what this boot did to orders it had already sent.
-    ///
-    /// Read it to answer one question before trusting a replay of
-    /// this boot's `engine-orders.pmlr`:
-    /// [`LifecycleCounters::capture_is_incomplete`].
+    /// E5: what this boot did to orders it had already sent. Both
+    /// verbs are in `engine-orders.pmlr` beside the places, so this
+    /// is observability rather than a caveat on the capture.
     #[inline]
     #[must_use]
     pub const fn lifecycle_counters(&self) -> LifecycleCounters {
@@ -1023,27 +1021,22 @@ struct EngineCtx<'a, D: OrderDispatch> {
     now: NsTs,
 }
 
-/// **E5 — what the strategy did to orders it had already sent, and
-/// the capture gap that fact opens.**
+/// **E5 — what the strategy did to orders it had already sent.**
 ///
-/// `engine-orders.pmlr` is a log of SUBMITTED INTENTS. It has one
-/// record type — [`Order`] — and no way to say "and then I pulled
-/// that one" or "and then I moved it to 0.47". So the moment a boot
-/// performs a cancel or a modify, the capture stops describing it:
-/// an offline replay of that capture models an order the engine had
-/// already taken back, or fills the old price of one it had moved.
+/// E5 commit 3 left these as the alarm on a real gap:
+/// `engine-orders.pmlr` had one record type and no way to say "and
+/// then I pulled that one", so a boot that cancelled produced a
+/// capture that no longer described it. **That gap is closed** —
+/// [`Order::verb`] and [`Order::prev_client_oid`] came out of the
+/// slot's explicit padding, and a performed verb is appended to the
+/// capture exactly as a submit is, in the same stream and therefore
+/// in the same order.
 ///
-/// That divergence is silent by nature, which is why it is a counter.
-/// **`cancels_ok + modifies_ok > 0` means the capture for this boot
-/// is not replayable.** Nothing in the tree emits either verb yet
-/// (E5 commit 3 adds the plumbing only), so the honest reading today
-/// is: these must be zero, and the commit that makes them non-zero
-/// owes the capture a lifecycle record type first.
-///
-/// The `_err` halves are not part of that gap — a refused verb
-/// changed nothing — but they are counted beside their successes so
-/// an operator reading a non-zero `ok` can see how many attempts it
-/// took.
+/// What is left is the ordinary reason to count something: an
+/// operator reading `/metrics` can see how much of a boot's
+/// behaviour is reprice rather than place, and how often a verb was
+/// refused — the `_err` halves are almost entirely races lost to a
+/// fill, which is normal and worth watching the rate of.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LifecycleCounters {
@@ -1071,15 +1064,14 @@ impl LifecycleCounters {
         }
     }
 
-    /// Did this boot do anything the intent capture cannot express?
+    /// Verbs this boot performed, of either kind.
     ///
-    /// Reads the two `_ok` fields and NOT the `_err` fields: a
-    /// refused verb left the book exactly as the capture describes
-    /// it, so it does not make the capture wrong.
+    /// Counts the `_ok` halves only: a refused verb changed nothing
+    /// and appended nothing.
     #[inline]
     #[must_use]
-    pub const fn capture_is_incomplete(&self) -> bool {
-        self.cancels_ok > 0 || self.modifies_ok > 0
+    pub const fn performed(&self) -> u64 {
+        self.cancels_ok.saturating_add(self.modifies_ok)
     }
 }
 
@@ -1137,21 +1129,32 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
 
     /// **E5 — take one resting order back.**
     ///
-    /// No capture append and no `recent_orders` push: both rings hold
-    /// [`Order`]s, and there is no Order to hold. See
-    /// [`LifecycleCounters`] for what that costs and how it is made
-    /// visible.
+    /// Captured like a submit, and for the same reason: the capture
+    /// is what an offline replay reconstructs the boot from, and a
+    /// replay that never learns the quote was pulled fills an order
+    /// the engine no longer had. `CancelReq::as_record` is the one
+    /// place that builds the slot.
     ///
-    /// No decide-latency record either — `decide_lat` measures the
-    /// time a strategy spent between `ctx.now_ns()` and its submit,
-    /// and a `CancelReq`'s `ts_ns` is bookkeeping the strategy is
-    /// free to set from anywhere. Recording it would fold a made-up
-    /// number into the histogram operators read.
+    /// **Captured only on success**, exactly as a submit is staged
+    /// only after the dispatcher takes it — capture-what-was-accepted.
+    /// A refused cancel left the book alone, so a record of it would
+    /// describe something that did not happen.
+    ///
+    /// No decide-latency record — `decide_lat` measures the time a
+    /// strategy spent between `ctx.now_ns()` and its submit, and a
+    /// `CancelReq`'s `ts_ns` is bookkeeping the strategy is free to
+    /// set from anywhere. Recording it would fold a made-up number
+    /// into the histogram operators read.
     #[inline(always)]
     fn cancel(&mut self, req: CancelReq) -> Result<(), SubmitErr> {
         match self.disp.cancel(&req) {
             Ok(()) => {
                 self.lifecycle.cancels_ok = self.lifecycle.cancels_ok.wrapping_add(1);
+                let rec = req.as_record();
+                if let Some(cap) = self.order_capture.as_deref_mut() {
+                    cap.append(&rec);
+                }
+                self.recent_orders.push(rec);
                 Ok(())
             }
             Err(e) => {
@@ -1163,17 +1166,23 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
 
     /// **E5, LAW E-7 — replace a resting order in place.**
     ///
-    /// Same capture note as `cancel`: the replacement Order is
-    /// deliberately NOT appended to `engine-orders.pmlr`. Appending
-    /// it would be worse than the gap, not better — a replay would
-    /// then see two submits and model two resting orders where the
-    /// engine had one that moved.
+    /// Captured like a submit — but as a MODIFY record, never as a
+    /// second place. A replay that saw two places would model two
+    /// resting orders where the engine had one that moved, which is
+    /// worse than seeing nothing at all. `ModifyReq` stamps the verb
+    /// and the previous id at construction, so the record cannot be
+    /// built untagged.
     #[inline(always)]
     fn modify(&mut self, prev_client_oid: u64, order: Order) -> Result<(), SubmitErr> {
         let req = ModifyReq::new(prev_client_oid, order);
         match self.disp.modify(&req) {
             Ok(()) => {
                 self.lifecycle.modifies_ok = self.lifecycle.modifies_ok.wrapping_add(1);
+                let rec = req.as_record();
+                if let Some(cap) = self.order_capture.as_deref_mut() {
+                    cap.append(&rec);
+                }
+                self.recent_orders.push(rec);
                 Ok(())
             }
             Err(e) => {
@@ -2468,14 +2477,14 @@ mod tests {
         )
     }
 
-    /// **The capture gap, made into a number.**
+    /// **The capture gap, closed.**
     ///
-    /// `engine-orders.pmlr` has one record type and cannot say "and
-    /// then I pulled that one". A boot that performs either verb has
-    /// a capture that no longer describes it, and an offline replay
-    /// of that capture is wrong in a way nothing else would reveal.
+    /// A performed verb is appended to the same ordered stream the
+    /// places go into, carrying the verb tag and the id of the order
+    /// it acted on — so a replay of the capture can apply it, and
+    /// cannot apply it before the place it refers to.
     #[test]
-    fn a_performed_lifecycle_verb_marks_the_intent_capture_incomplete() {
+    fn a_performed_lifecycle_verb_is_appended_to_the_intent_capture() {
         let lat = LatencyTracker::<24>::new();
         let mut recent = RecentRing::new(ZERO_ORDER);
         let mut lc = LifecycleCounters::new();
@@ -2483,29 +2492,39 @@ mod tests {
             cancel_ok: true,
             modify_ok: true,
         };
-        assert!(!lc.capture_is_incomplete(), "a fresh boot is replayable");
         {
             let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
             assert_eq!(ctx.cancel(a_cancel()), Ok(()));
-        }
-        assert_eq!(lc.cancels_ok, 1);
-        assert!(lc.capture_is_incomplete());
-
-        let mut lc2 = LifecycleCounters::new();
-        {
-            let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc2);
             assert_eq!(ctx.modify(7, an_order()), Ok(()));
         }
-        assert_eq!(lc2.modifies_ok, 1);
-        assert!(lc2.capture_is_incomplete());
+        assert_eq!(lc.cancels_ok, 1);
+        assert_eq!(lc.modifies_ok, 1);
+        assert_eq!(recent.total, 2, "one record per performed verb");
+
+        let c = *recent.oldest_first(0).expect("the cancel record");
+        assert_eq!(c.verb, core_types::ORDER_VERB_CANCEL);
+        assert_eq!(c.prev_client_oid, 7, "the order it took back");
+        assert_eq!(
+            c.client_oid, 0,
+            "a cancel creates no order, so it has no id of its own"
+        );
+        assert_eq!(c.px.raw(), 0, "and asserts no price");
+        assert_eq!(c.sym, 42);
+        assert_eq!(c.venue, VenueId::Hyperliquid as u8);
+
+        let m = *recent.oldest_first(1).expect("the modify record");
+        assert_eq!(m.verb, core_types::ORDER_VERB_MODIFY);
+        assert_eq!(m.prev_client_oid, 7, "the order it replaced");
+        assert_eq!(m.client_oid, 8, "and the id the replacement carries");
+        assert_eq!(m.px.raw(), 500_000);
     }
 
     /// The other half, and the one that is easy to get wrong: a
-    /// REFUSED verb changed nothing, so it does not make the capture
-    /// wrong. A `capture_is_incomplete` that read the `_err` fields
-    /// too would condemn every boot that ever lost a race to a fill.
+    /// REFUSED verb changed nothing at the dispatcher, so a record of
+    /// it would describe something that did not happen. Same
+    /// capture-what-was-accepted law a refused submit obeys.
     #[test]
-    fn a_refused_lifecycle_verb_leaves_the_capture_replayable() {
+    fn a_refused_lifecycle_verb_appends_nothing() {
         let lat = LatencyTracker::<24>::new();
         let mut recent = RecentRing::new(ZERO_ORDER);
         let mut lc = LifecycleCounters::new();
@@ -2522,18 +2541,17 @@ mod tests {
         assert_eq!(lc.modifies_err, 1);
         assert_eq!(lc.cancels_ok, 0);
         assert_eq!(lc.modifies_ok, 0);
-        assert!(
-            !lc.capture_is_incomplete(),
-            "nothing happened, so the capture still describes the boot"
-        );
+        assert_eq!(lc.performed(), 0);
+        assert_eq!(recent.total, 0, "nothing happened, so nothing is recorded");
     }
 
-    /// Neither verb touches the `recent` ring — it holds `Order`s and
-    /// there is no accepted Order to hold. Pinned so a later edit
-    /// that "helpfully" pushes the replacement does not quietly make
-    /// `/state` show two quotes where one moved.
+    /// A modify is recorded as a MODIFY and never as a second place.
+    /// A replay that saw two places would model two resting orders
+    /// where the engine had one that moved — worse than seeing
+    /// nothing, which is why this is pinned rather than left to the
+    /// constructor's good intentions.
     #[test]
-    fn a_lifecycle_verb_does_not_push_onto_the_recent_orders_ring() {
+    fn a_modify_is_never_recorded_as_a_second_place() {
         let lat = LatencyTracker::<24>::new();
         let mut recent = RecentRing::new(ZERO_ORDER);
         let mut lc = LifecycleCounters::new();
@@ -2541,13 +2559,21 @@ mod tests {
             cancel_ok: true,
             modify_ok: true,
         };
-        let before = recent.total;
         {
             let mut ctx = lifecycle_ctx(&mut d, &lat, &mut recent, &mut lc);
-            assert_eq!(ctx.cancel(a_cancel()), Ok(()));
-            assert_eq!(ctx.modify(7, an_order()), Ok(()));
+            assert_eq!(ctx.submit(an_order()), Ok(()));
+            assert_eq!(ctx.modify(8, an_order()), Ok(()));
         }
-        assert_eq!(recent.total, before);
+        assert_eq!(recent.total, 2);
+        let place = *recent.oldest_first(0).unwrap();
+        let modify = *recent.oldest_first(1).unwrap();
+        assert_eq!(place.verb, core_types::ORDER_VERB_PLACE);
+        assert_eq!(place.prev_client_oid, 0, "a place acts on nothing");
+        assert_eq!(modify.verb, core_types::ORDER_VERB_MODIFY);
+        assert_ne!(
+            modify.verb, place.verb,
+            "the two must be distinguishable in the stream"
+        );
     }
 
     /// A `Ctx` that never heard of the verbs answers `Unsupported`,

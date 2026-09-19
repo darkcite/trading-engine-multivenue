@@ -2073,41 +2073,69 @@ downstream can detect the difference. `StampCtx` stamps a cancel's
 cancel would route by slot `0xFF & 7` — a member able to pull another
 member's quote.
 
-#### THE OPEN GAP: `engine-orders.pmlr` cannot express either verb
+#### The capture gap — opened by commit 3, CLOSED by commit 4a (2026-09-19)
 
-The intent capture has one record type, `Order`, and no way to say
-"and then I pulled that one" or "and then I moved it to 0.47". The
-moment a boot performs a cancel or a modify, **the capture stops
-describing it**: an offline replay models an order the engine had
-already taken back, or fills the old price of one it had moved.
+E5 commit 3 left a real hole: the intent capture had one record type,
+`Order`, and no way to say "and then I pulled that one" or "and then I
+moved it to 0.47". A boot that performed either verb produced a
+capture that no longer described it, and an offline replay of that
+capture modelled an order the engine had already taken back.
 
-Appending the replacement Order would be worse, not better — a replay
-would then see two submits and model two resting orders where the
-engine had one that moved. So nothing is appended, and the gap is a
-number instead: `engine::LifecycleCounters::capture_is_incomplete()`,
-mirrored as `engine_lifecycle_cancels_ok_total` and
-`engine_lifecycle_modifies_ok_total`. It reads the `_ok` fields and
-not the `_err` fields, because a refused verb changed nothing and
-leaves the capture correct.
+**`Order.verb` and `Order.prev_client_oid` close it**, both taken out
+of the slot's own explicit zeroed padding, so every Order ever
+captured reads as `verb = PLACE` / `prev_client_oid = 0` — which is
+what every one of them was. `EngineCtx::{cancel, modify}` append the
+record on success, under the same capture-what-was-accepted law a
+submit obeys: a refused verb changed nothing and records nothing.
 
-**The gate is manual today.** `capture_is_incomplete()` has no
-non-test caller: what actually reaches an operator is the two
-metrics, and no replay, backtest or audit path consults either. The
-Arm B commit owes it a real consumer.
+**Why the verb rides the `Order` slot** rather than a second file: a
+capture is a log of intents in the order they happened, and a cancel
+is meaningless apart from the place it refers to. Two streams would
+let a replay apply a cancel before its own place; one stream cannot.
+That is the identical argument §7 of the exec plan gives for the
+`ExecCmd` union ring, and the field meanings are deliberately the
+same — `prev_client_oid` is the TARGET (0 for a place), `client_oid`
+is the id the record's own order carries (0 for a cancel, which
+creates no order).
 
-**The offline harness is the same gap from the other side.**
-`cli::backtest::BacktestCtx` implements neither verb, so it takes the
-`Unsupported` default: the same member that cancels successfully in
-the live paper engine gets `Refused` → `orders_dropped` in the
-harness. Fail-closed, and therefore safe today — but every gate, OOS
-verdict and pin runs through that harness, so the Arm B commit owes
-it the verbs as well as the capture.
+**A modify is never recorded as a second place.** A replay that saw
+two places would model two resting orders where the engine had one
+that moved — worse than seeing nothing at all.
 
-**Nothing in the tree emits either verb yet.** E5 commit 3 is
-plumbing behind trait defaults. The commit that makes these counters
-non-zero — bin15's Arm B requote — owes the capture a lifecycle
-record type first, or owes an explicit decision that its boots are
-not replay sources.
+**A reader that does not know a verb byte DROPS the record.** It does
+not fall back to "place". Applying a record whose meaning you do not
+have is how a newer engine's capture quietly becomes a different
+backtest; `FillEngine`'s `lifecycle.unknown_verb` counts them.
+
+#### The offline harness replays them too
+
+`cli::backtest::BacktestCtx` implemented neither verb, so it took the
+`Unsupported` default: the same member that repriced successfully in
+the live paper engine had every reprice refused there and counted as
+a dropped order. Every gate, OOS verdict and pin runs through that
+harness, so the divergence would have been measured as strategy
+behaviour.
+
+It now records both into the SAME ordered stream as its places, and
+`FillEngine::intake` dispatches on the verb **inside itself** — there
+are eight `intake` call sites across `backtest`, `backtest::member`
+and `audit_pnl`, and a replay that applied a cancel at seven of them
+would be silently wrong at the eighth.
+
+`FillEngine`'s open table gained `strategy_id` for the same reason the
+paper matcher's lookup is slot-scoped: `audit-pnl` replays ONE capture
+holding every member's intents through ONE table, and every member
+counts its `client_oid` from 1. `backtest --member` runs a single
+member and would never have noticed.
+
+`LifecycleReplay` is deliberately NOT in `ModelOutcome` and therefore
+not in the frozen schema-1 line: it is a property of the CAPTURE, not
+of the strategy's economics, and the schema is a contract with the
+worker.
+
+**Still true: nothing in the tree emits either verb yet.** Commits 3
+and 4a are plumbing; bin15's Arm B requote is what will make these
+numbers move.
 
 #### The parity gate
 

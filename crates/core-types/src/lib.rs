@@ -819,8 +819,27 @@ pub struct Order {
     /// single-strategy boots, tests). Wire-additive pre-first-capture
     /// — no Order slot was ever persisted before `engine-orders.pmlr`.
     pub strategy_id: u8,
+    /// **E5 — which LIFECYCLE verb this record is.**
+    /// [`ORDER_VERB_PLACE`] (0) / [`ORDER_VERB_CANCEL`] /
+    /// [`ORDER_VERB_MODIFY`].
+    ///
+    /// Wire-additive: every Order persisted before E5 carries 0 here
+    /// (the byte was explicit zeroed padding), and 0 is PLACE — which
+    /// is what every one of them was.
+    ///
+    /// **Why the verb rides the Order slot rather than a second file
+    /// or a second ring.** A capture is a log of intents in the order
+    /// they happened, and a cancel is meaningless apart from the
+    /// place it refers to. Two streams would let a cancel be replayed
+    /// before its own place; one stream cannot. This is the same
+    /// reason §7 gives for the `ExecCmd` union ring, applied to the
+    /// capture — and the field meanings are deliberately the same:
+    /// `prev_client_oid` is the TARGET (0 for a place), `client_oid`
+    /// is the id the record's own order carries (0 for a cancel,
+    /// which creates no order).
+    pub verb: u8,
     /// Reserved.
-    _pad1: [u8; 6],
+    _pad1: [u8; 5],
     /// Time-to-live relative to `ts_ns`; 0 = none (I1, 2026-09-03 —
     /// docs/wire-format.md). A MODEL field: the offline fill law
     /// cancels the order at the first record of its sym at/after
@@ -830,9 +849,25 @@ pub struct Order {
     /// Wire-additive: every Order persisted before I1 carries 0 here
     /// (the byte range was explicit zeroed padding).
     pub ttl_ns: u64,
-    /// Explicit tail padding (see [`AsBytes`]). Always zero.
-    _pad2: [u8; 8],
+    /// **E5 — the resting order this record acts on**, for
+    /// [`ORDER_VERB_CANCEL`] and [`ORDER_VERB_MODIFY`]; `0` for a
+    /// place, which acts on nothing.
+    ///
+    /// Wire-additive for the same reason as `verb`: the bytes were
+    /// explicit zeroed padding, and 0 is exactly what a place carries.
+    pub prev_client_oid: u64,
 }
+
+/// [`Order::verb`] — a new order. Every Order captured before E5
+/// carries this value, because the byte was zeroed padding.
+pub const ORDER_VERB_PLACE: u8 = 0;
+/// [`Order::verb`] — take back the order named by
+/// [`Order::prev_client_oid`]. Carries no price, size or side of its
+/// own: a cancel asserts nothing about them.
+pub const ORDER_VERB_CANCEL: u8 = 1;
+/// [`Order::verb`] — replace the order named by
+/// [`Order::prev_client_oid`] with this one. LAW E-7.
+pub const ORDER_VERB_MODIFY: u8 = 2;
 
 /// `Order.strategy_id` value meaning "no strategy attribution".
 pub const STRATEGY_ID_NONE: u8 = 0xFF;
@@ -863,9 +898,10 @@ impl Order {
             client_oid,
             venue: venue as u8,
             strategy_id: STRATEGY_ID_NONE,
-            _pad1: [0; 6],
+            verb: ORDER_VERB_PLACE,
+            _pad1: [0; 5],
             ttl_ns: 0,
-            _pad2: [0; 8],
+            prev_client_oid: 0,
         }
     }
 
@@ -950,6 +986,35 @@ impl CancelReq {
             _pad: [0; 2],
         }
     }
+
+    /// This cancel as one capture record — an [`Order`] slot carrying
+    /// [`ORDER_VERB_CANCEL`].
+    ///
+    /// `client_oid` is **0**: a cancel creates no order, so it has no
+    /// id of its own, and the order it names is in
+    /// `prev_client_oid`. `px`, `qty`, `side` and `kind` are zero for
+    /// the same reason — a `CancelReq` asserts nothing about them,
+    /// and a reader that found a price here would be reading a number
+    /// nobody wrote.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_record(&self) -> Order {
+        let mut o = Order::new(
+            self.ts_ns,
+            VenueId::Polymarket, // overwritten by the byte below
+            self.sym,
+            Side::Bid,
+            0,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            0,
+        );
+        o.venue = self.venue;
+        o.strategy_id = self.strategy_id;
+        o.verb = ORDER_VERB_CANCEL;
+        o.prev_client_oid = self.client_oid;
+        o
+    }
 }
 
 /// Replace one resting order in place — **LAW E-7: a live requote is
@@ -984,25 +1049,52 @@ impl CancelReq {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ModifyReq {
-    /// The client id of the resting order being replaced.
-    pub prev_client_oid: u64,
-    /// The replacement: new `px`, new `qty`, new `client_oid`, and
-    /// the identity fields which must equal the resting order's.
-    pub order: Order,
+    /// The replacement, ALREADY STAMPED: `verb = ORDER_VERB_MODIFY`
+    /// and `prev_client_oid` = the order it replaces. Private so that
+    /// the stamping cannot be skipped, and so the previous id lives
+    /// in exactly one place — a `ModifyReq` that carried its own copy
+    /// beside the order's would be two numbers for one fact, which is
+    /// how they come to disagree.
+    order: Order,
 }
 
-const _: () = assert!(core::mem::size_of::<ModifyReq>() == 128);
-const _: () = assert!(core::mem::align_of::<ModifyReq>() == 64);
+const _: () = assert!(core::mem::size_of::<ModifyReq>() == 64);
 
 impl ModifyReq {
     /// Replace the order resting under `prev_client_oid` with
     /// `order`.
+    ///
+    /// Stamps the replacement, so the `Order` inside a `ModifyReq`
+    /// *is* the capture record — [`Self::as_record`] is a copy and
+    /// nothing has to remember to tag it later.
     #[inline(always)]
+    #[must_use]
     pub const fn new(prev_client_oid: u64, order: Order) -> Self {
-        Self {
-            prev_client_oid,
-            order,
-        }
+        let mut o = order;
+        o.verb = ORDER_VERB_MODIFY;
+        o.prev_client_oid = prev_client_oid;
+        Self { order: o }
+    }
+
+    /// The resting order this replaces.
+    #[inline(always)]
+    #[must_use]
+    pub const fn prev_client_oid(&self) -> u64 {
+        self.order.prev_client_oid
+    }
+
+    /// The replacement.
+    #[inline(always)]
+    #[must_use]
+    pub const fn order(&self) -> &Order {
+        &self.order
+    }
+
+    /// This modify as one capture record.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_record(&self) -> Order {
+        self.order
     }
 
     /// The identity the replacement claims. Compare it with the
@@ -3397,7 +3489,9 @@ mod tests {
         // Signal: 8+4+1+1+2+40+8 = 64.
         // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin;
         //       E4: +flags, which took the last explicit pad byte).
-        // Order: 8+4+1+1+2+8+8+8+1+1+14+8 = 64 (M4.1: +strategy_id).
+        // Order: 8+4+1+1+2+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
+        //        +strategy_id; E5: +verb, +prev_client_oid, both out
+        //        of the explicit padding).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
         assert_eq!(::core::mem::size_of::<Signal>(), 64);
         assert_eq!(::core::mem::size_of::<Fill>(), 64);
