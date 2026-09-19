@@ -195,6 +195,16 @@ _OKX_DEAD: tuple[str, ...] = ("suspend", "expired")
 _CB_ONLINE: str = "online"
 _CB_DEAD: tuple[str, ...] = ("delisted", "offline")
 _SECTION_INSTRUMENTS: str = "instruments"
+#: Deribit's `kind` for an option, and the shape of an option NAME
+#: (`BTC-23SEP26-84500-C`). An option reaches the engine through
+#: `[deribit] options_underlyings` and a DISCOVERED chain, never by
+#: naming a strike — and Deribit adds strikes continuously as spot moves,
+#: so proposing each one would hand the operator a file to apply by hand
+#: that grows every hour. The listing EVENT is still recorded: the venue
+#: really did list something, and the expiry detector needs the row.
+_DERIBIT_OPTION_KIND: str = "option"
+_OPTION_NAME_PARTS: int = 4
+_OPTION_SUFFIXES: tuple[str, ...] = ("C", "P")
 
 #: OKX publishes a maintenance state per window; Bybit publishes one that
 #: is ``completed`` once the window is over (spec §8.2).
@@ -444,6 +454,7 @@ def _inst_deribit(ident: str, values: object, now_ts: int) -> _Inst:
     pending = not active and start > now_ts
     kind = _text(_field(values, _DERIBIT_KIND))
     inst_type = _text(_field(values, _DERIBIT_TYPE))
+    option = kind == _DERIBIT_OPTION_KIND
     return _Inst(
         trading=active,
         pending=pending,
@@ -451,8 +462,10 @@ def _inst_deribit(ident: str, values: object, now_ts: int) -> _Inst:
         start_ts=start,
         end_ts=_epoch_s(_field(values, _DERIBIT_EXPIRES)),
         descriptor=f"deribit:{ident}",
-        section=_SECTION_INSTRUMENTS,
-        value=ident,
+        # An option carries no universe coordinates: the event is real and
+        # is recorded, but a strike is never proposed for `instruments`.
+        section="" if option else _SECTION_INSTRUMENTS,
+        value="" if option else ident,
         detail=f"{'active' if active else 'inactive'} {kind} {inst_type}".strip(),
     )
 
@@ -893,6 +906,19 @@ def write_universe_proposals(
     return len(additions)
 
 
+def is_option_name(value: str) -> bool:
+    """A Deribit option, by the shape of its name: four dash-separated
+    parts ending in C or P (`BTC-23SEP26-84500-C`). A future is two
+    (`BTC-20SEP26`) and a perpetual is `BTC-PERPETUAL`.
+
+    Used where only the descriptor is in hand — the instrument-set
+    detector reads the venue's own `kind` field instead, which is better
+    evidence when it is available.
+    """
+    parts = value.split("-")
+    return len(parts) == _OPTION_NAME_PARTS and parts[-1].upper() in _OPTION_SUFFIXES
+
+
 def proposal_from_descriptor(descriptor: str, at_ts: int = 0) -> Event | None:
     """The `universe.toml` coordinates a descriptor names, or ``None``.
 
@@ -911,6 +937,8 @@ def proposal_from_descriptor(descriptor: str, at_ts: int = 0) -> Event | None:
         # exactly what separates the class from a perpetual.
         section = _BN_SECTION_DATED if "_" in value else _BN_SECTION_PERP
     elif prefix in ("okx", "deribit"):
+        if prefix == "deribit" and is_option_name(value):
+            return None
         venue = prefix
         section = _SECTION_INSTRUMENTS
     else:

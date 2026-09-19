@@ -333,6 +333,56 @@ def test_expiry_within_72h_once(tmp_path: pathlib.Path) -> None:
         assert len(store.events_since(0)) == 1
 
 
+def test_a_new_option_strike_is_an_event_but_never_a_proposal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """OBSERVED LIVE 2026-09-19 18:07Z: Deribit listed BTC-23SEP26-84500-C
+    and -P, the detector caught both, and both were proposed for
+    `[deribit] instruments`. That is wrong twice over — an option reaches
+    the engine through `options_underlyings` and a DISCOVERED chain, never
+    by naming a strike, and Deribit adds strikes continuously as spot
+    moves, so the operator's hand-applied file would grow every hour.
+
+    The EVENT stays: the venue really did list something, the events tail
+    should show it, and the expiry detector needs the row."""
+    source = _source("deribit-instruments-btc-option", "instruments-deribit", "deribit")
+    recorded = _recorded(
+        _source("deribit-instruments-btc-future", "instruments-deribit", "deribit")
+    )
+    strike = "BTC-23SEP26-84500-C"
+
+    def prev(body: dict[str, object]) -> None:
+        _only(body, "BTC-PERPETUAL")
+
+    def cur(body: dict[str, object]) -> None:
+        _only(body, "BTC-PERPETUAL")
+        body[strike] = ["option", "reversed", True, (NOW - HOUR_S) * 1_000, 0]
+
+    events = claude_worker.news.detect.diff_instruments(
+        source, _edit(recorded, prev), _edit(recorded, cur), NOW
+    )
+    assert _kinds(events) == [claude_worker.news.detect.EVENT_LISTING_LIVE]
+    assert events[0].instrument == strike
+    assert events[0].descriptor == f"deribit:{strike}", "the descriptor survives"
+    assert events[0].section == "" and events[0].value == "", "but not as a candidate"
+
+    store = _store(tmp_path)
+    ctx = _ctx(tmp_path)
+    try:
+        stored, _ = claude_worker.news.detect.apply_events(store, events, NOW)
+        assert len(stored) == 1, "the event is recorded"
+        assert claude_worker.news.detect.write_universe_proposals(ctx, stored, NOW) == 0
+    finally:
+        store.close()
+    assert not ctx.file(claude_worker.news.UNIVERSE_PROPOSALS_FILE).exists()
+    # A future on the same venue still proposes normally.
+    assert claude_worker.news.detect.is_option_name("BTC-23SEP26-84500-C") is True
+    assert claude_worker.news.detect.is_option_name("BTC-20SEP26") is False
+    assert claude_worker.news.detect.is_option_name("BTC-PERPETUAL") is False
+    assert claude_worker.news.detect.proposal_from_descriptor(f"deribit:{strike}") is None
+    assert claude_worker.news.detect.proposal_from_descriptor("deribit:BTC-20SEP26") is not None
+
+
 def test_an_expiry_beyond_the_horizon_is_not_announced() -> None:
     source = _source("deribit-instruments-btc-future", "instruments-deribit", "deribit")
     recorded = _recorded(source)
