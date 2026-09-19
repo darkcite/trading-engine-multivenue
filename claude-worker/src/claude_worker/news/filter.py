@@ -168,6 +168,23 @@ class Vocabulary:
     entries: frozenset[str]
     pattern: re.Pattern[str] | None
     ticker_pattern: re.Pattern[str] | None
+    #: The DERIVED names in ticker form, sorted — the closed asset list the
+    #: tier-1 prompt offers a model and `parse_triage_v2` validates its
+    #: answer against (spec §9.1). Deliberately NOT ``entries``: that also
+    #: carries the venue words and the operator's event keywords, and
+    #: offering "delist" as an asset would be a prompt that lies. Defaulted
+    #: so a test may build a vocabulary with no assets at all.
+    #:
+    #: Quote-suffixed duplicates are dropped (`BTCUSDT` when `BTC` is
+    #: present). Measured 2026-09-20 on the operator's real universe: 281
+    #: entries, of which 122 were a base asset repeated with `USDT` — 43 %
+    #: of a list that rides every tier-1 prompt, and an ambiguity for a
+    #: model asked to name "the asset" while offered both. `base_asset`
+    #: already strips the quote on the manifest path; the market-map path
+    #: does not, and this is where the two are reconciled without touching
+    #: the tier-0 patterns (whose measured 48 % pass rate depends on
+    #: `entries` staying exactly as it is).
+    assets: tuple[str, ...] = ()
 
     def hits(self, text: str) -> int:
         """Distinct vocabulary entries in ``text``. Word-boundary on BOTH
@@ -235,7 +252,24 @@ def build_vocabulary(
         entries=frozenset(derived | words),
         pattern=_alternation(words, upper=False),
         ticker_pattern=_alternation(derived, upper=True),
+        assets=asset_list(derived),
     )
+
+
+def asset_list(derived: typing.AbstractSet[str]) -> tuple[str, ...]:
+    """[`Vocabulary.assets`] from the derived tokens: ticker form, sorted,
+    without the quote-suffixed duplicate of a base asset already present."""
+    out: list[str] = []
+    for entry in sorted(derived):
+        keep = True
+        for i in range(len(_QUOTES)):
+            quote = _QUOTES[i]
+            stem = entry[: -len(quote)]
+            if entry.endswith(quote) and len(stem) >= VOCAB_MIN_LEN and stem in derived:
+                keep = False
+        if keep:
+            out.append(entry.upper())
+    return tuple(out)
 
 
 def vocabulary_from(

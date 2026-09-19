@@ -286,3 +286,36 @@ def test_the_vocabulary_survives_missing_operator_files(tmp_path: pathlib.Path) 
     # Narrowed to the venues plus the keyword — never an exception.
     assert "delist" in vocab.entries
     assert "binance" in vocab.entries
+
+
+def test_the_asset_list_is_tickers_only_and_drops_quote_duplicates() -> None:
+    """`Vocabulary.assets` is the closed list tier 1 offers a model.
+
+    Two things it must not be. It must not carry the venue words or the
+    operator's event keywords — offering "delist" as an asset is a prompt
+    that lies about its own grammar. And it must not carry a base asset
+    twice: measured 2026-09-20 on the real universe, 122 of 281 entries
+    were a base asset repeated with `USDT`, which is 43 % of a list that
+    rides EVERY tier-1 prompt and an ambiguity for a model asked to name
+    the asset while offered both `AAVE` and `AAVEUSDT`.
+    """
+    vocab = claude_worker.news.filter.build_vocabulary(
+        ("binance-usdm:btcusdt", "okx:ETH-USDT-SWAP", "SOLUSDC"),
+        ("binance-usdm:btcusdt", "deribit:BTC-PERPETUAL"),
+        ("delist", "insolvency"),
+    )
+    assert "BTC" in vocab.assets
+    assert "BTCUSDT" not in vocab.assets, "the base asset is already there"
+    assert "ETH" in vocab.assets
+    # A quote-suffixed name whose stem is NOT derived stays: it is the only
+    # spelling the engine has for that market.
+    assert "SOLUSDC" in vocab.assets
+    # Venue words and the operator's keywords are vocabulary, not assets.
+    for word in ("BINANCE", "OKX", "DERIBIT", "DELIST", "INSOLVENCY"):
+        assert word not in vocab.assets, word
+    # ...but they are still in `entries`, so tier 0 is untouched.
+    assert "binance" in vocab.entries and "delist" in vocab.entries
+    assert vocab.hits("LINK halted on Binance after a delist notice") >= 2
+    # Sorted and unique, so the prompt text is deterministic and the cache
+    # key for one item does not move between cycles.
+    assert list(vocab.assets) == sorted(set(vocab.assets))
