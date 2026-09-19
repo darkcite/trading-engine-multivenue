@@ -437,6 +437,73 @@ impl<T: Copy, const N: usize> RecentRing<T, N> {
     }
 }
 
+/// **The word for each `HaltReason` discriminant**, index = the `u8`.
+///
+/// A copy of `exec_router::HaltReason::as_str`, because the
+/// dependency runs the other way and this crate cannot import it.
+/// `cli` sees both and pins them together — a silent divergence here
+/// would make `/state` name the wrong reason for a halt, which is the
+/// one field an operator reads it for.
+pub const HALT_REASON_WORDS: [&str; 7] = [
+    "none",
+    "reject-streak",
+    "budget-floor",
+    "recon-drift",
+    "ws-gap",
+    "asset-refusals",
+    "operator",
+];
+
+/// The word for a `HaltReason` byte, or `"unknown"` for one this
+/// binary does not have. Never a panic and never an empty string: a
+/// reason we cannot name is still a halt.
+#[must_use]
+pub fn halt_reason_word(v: u8) -> &'static str {
+    let i = v as usize;
+    if i < HALT_REASON_WORDS.len() {
+        HALT_REASON_WORDS[i]
+    } else {
+        "unknown"
+    }
+}
+
+/// **E6 commit 4 — what the execution router is refusing, and why.**
+///
+/// `/metrics` answers this for a monitoring system; this answers it
+/// for the human reading `/state` at 3 a.m., in one object, with the
+/// reason spelled rather than numbered.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecSnapshot {
+    /// `1` when a route table is in force. Everything else here is
+    /// meaningless at `0`.
+    pub configured: u8,
+    /// `1` once the ledger has been reconciled against the venue.
+    /// **A live boot stuck at `0` is refusing every order**, and
+    /// nothing else in `/state` says so.
+    pub seeded: u8,
+    /// Slots halted by reading `exec.HALT` at boot rather than by a
+    /// trigger in this process.
+    pub adopted: u8,
+    /// `1` when a readable `exec.HALT` was seen at all. Set with
+    /// `adopted == 0` it means an operator's halt file halted
+    /// NOTHING — a typo, or a slot that is not live.
+    pub file_present: u8,
+    /// Per-slot `HaltReason as u8`; `0` = running.
+    pub halted: [u8; SNAPSHOT_SLOTS],
+    /// Halt edges since boot.
+    pub halts: u64,
+    /// Requests refused because their slot is halted.
+    pub refused_halted: u64,
+    /// Requests refused because the ledger is unseeded.
+    pub refused_unseeded: u64,
+    /// Cancel-all requests the arm would not accept.
+    pub cancel_all_failures: u64,
+    /// **The stranded-quote number** (LAW E-8): polls on which the
+    /// arm reported it had given up with the venue unconfirmed.
+    pub cancel_all_stranded: u64,
+}
+
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
 #[repr(C, align(64))]
@@ -477,6 +544,8 @@ pub struct EngineSnapshot {
     pub icdp: IcdpSnapshot,
     /// The VRP member.
     pub vrp: VrpSnapshot,
+    /// **E6: the execution router's kill switches.**
+    pub exec: ExecSnapshot,
     /// The AI plane.
     pub ai: AiSnapshot,
     /// Per-venue ingress health (order = [`VENUE_NAMES`]).
@@ -513,6 +582,7 @@ impl EngineSnapshot {
             vm: VmSnapshot::empty(),
             icdp: IcdpSnapshot::default(),
             vrp: VrpSnapshot::default(),
+            exec: ExecSnapshot::default(),
             ai: AiSnapshot::default(),
             ingress: [IngressSnapshot::default(); SNAPSHOT_VENUES],
             capture: CaptureSnapshot::default(),

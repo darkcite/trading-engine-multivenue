@@ -6982,3 +6982,221 @@ fn routed_ledger_steady_state() {
     );
     assert_eq!(bytes, 0, "ledger hot bytes should be zero: saw {bytes}");
 }
+
+/// **E6 gate 62 — the halt machine's idle poll.**
+///
+/// E6 commit 3 gave the router a hook that runs on the ENGINE THREAD
+/// every 2 ms whether or not anything is trading: `on_idle` reads the
+/// arm's `halt_signal`, evaluates five triggers per live slot,
+/// latches, and drives the cancel-all request/confirm cycle. Commit 4
+/// added a file poll to the same hook.
+///
+/// None of that appeared in gates 53 or 61 — neither drives
+/// `on_idle` — so the busiest path this lane added was the one path
+/// with no zero-allocation gate at all. That gap is what this closes.
+///
+/// What runs inside the window:
+///
+/// * `on_idle` with a HEALTHY signal, the steady state — 500 times,
+///   which is one second of real pacing and therefore includes the
+///   halt file's `stat` and the one read it permits;
+/// * the seeding edge, where `reconciled` first turns the restart
+///   interlock off;
+/// * `trigger_for` against every threshold on a live slot;
+/// * the halt EDGE itself: latch, `exec.HALT` write, and the
+///   venue-wide cancel request;
+/// * `cancel_all_state` polling through `Working` to `Clear`, which
+///   is where `clear_resting` walks the table;
+/// * `exec_counters`, which `/state` and `/metrics` both read and
+///   which now copies a per-slot halt array.
+///
+/// The halt file is deliberately CONFIGURED: `write_atomic` allocates
+/// (a `PathBuf` for the `.tmp` sibling), and it runs on the engine
+/// thread on the halt edge. That allocation is real, it is bounded to
+/// one per halt incident rather than per poll, and this gate measures
+/// the steady state separately from the edge so the distinction is
+/// enforced rather than asserted in a comment.
+#[test]
+fn routed_halt_idle_steady_state() {
+    use clob_dispatcher::{
+        CancelAllState, DispatchError, HaltSignal, OrderDispatch, PaperDispatcher,
+    };
+    use core_types::{CancelReq, Fill, ModifyReq, Order};
+    use exec_router::{ExecMode, ExecRoute, HaltLimits, HaltReason, RoutedDispatcher, SlotCaps};
+
+    const SLOT: u8 = 3;
+
+    /// An arm whose signal the gate drives, and whose cancel-all
+    /// sweeps for a few polls before confirming — the real shape.
+    struct Arm {
+        polls: u64,
+        sweeping: u32,
+        cancels: u64,
+    }
+    /// The poll on which the arm starts reporting a reject streak.
+    /// The arm trips ITSELF rather than being poked, because
+    /// `live_mut` is test-only and widening it for a benchmark would
+    /// put a mutable handle on the live arm into the public API.
+    const TRIP_AT: u64 = 500;
+    impl OrderDispatch for Arm {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            // Healthy until TRIP_AT, then a reject streak at the
+            // threshold. Reconciled throughout, so the seeding edge
+            // happens on the first poll.
+            // `>` not `>=`: the arm's `on_idle` runs BEFORE the
+            // router reads this, so `polls == TRIP_AT` is still the
+            // last healthy poll of the steady-state window.
+            let streak = if self.polls > TRIP_AT { 5 } else { 0 };
+            HaltSignal::new(1_000_000, 0, streak, 0, false, true)
+        }
+        fn cancel_all(&mut self) -> Result<(), DispatchError> {
+            self.cancels += 1;
+            self.sweeping = 3;
+            Ok(())
+        }
+        fn cancel_all_state(&self) -> CancelAllState {
+            if self.sweeping > 0 {
+                CancelAllState::Working
+            } else {
+                CancelAllState::Clear
+            }
+        }
+        fn on_idle(&mut self) -> bool {
+            self.polls += 1;
+            self.sweeping = self.sweeping.saturating_sub(1);
+            false
+        }
+    }
+
+    // Boot-time construction — outside the window, as the engine's is.
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[core_types::VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            HaltLimits::new(5, 5_000_000, 30_000, 3),
+        )
+        .expect("boot: slot 3 live");
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        Arm {
+            polls: 0,
+            sweeping: 0,
+            cancels: 0,
+        },
+        core_time::WallAnchor::new(1_789_776_001_000_000_000, 1_789_776_001_000_000_000),
+    );
+    let dir = std::env::temp_dir().join(format!("mv-gate62-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("gate 62 tmp dir");
+    let halt_file = dir.join("exec.HALT");
+    // **The file EXISTS for the whole window**, and says nothing is
+    // halted. That is the steady state an operator actually leaves
+    // behind — and the case where the poll does real work rather
+    // than failing at the first `stat`. Measuring with no file would
+    // measure the early return.
+    std::fs::write(&halt_file, "# nothing halted\n").expect("gate 62 halt file");
+    d.set_halt_path(halt_file.clone());
+    // The boot read-back, outside the window: it is a boot step.
+    let _ = d.adopt_halt_file();
+    // **Now CHANGE it**, so the one poll the cadence lets through
+    // inside the window takes the READ branch and not the
+    // mtime-unchanged early return.
+    //
+    // Without this the gate measured the early return and called it
+    // the read — and passed while `read_to_string` (as it then was)
+    // allocated a `String` on the engine thread. A gate whose subject
+    // never runs reports the same `ok` as a gate that holds.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&halt_file, "# still nothing halted\n").expect("gate 62 touch");
+
+    // ---- the steady state -------------------------------------------
+    let g = AllocGuard::new();
+    let mut idles = 0u64;
+    let mut i = 0u64;
+    while i < TRIP_AT {
+        std::hint::black_box(d.on_idle());
+        idles += 1;
+        std::hint::black_box(d.exec_counters().refused_halted);
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    std::hint::black_box(idles);
+
+    assert!(d.ledger().is_seeded(), "the seeding edge must have run");
+    assert_eq!(
+        d.halt_file_polls(),
+        1,
+        "the cadence must have let exactly one stat through — an upper \
+         bound here would let a poll that never ran pass"
+    );
+    assert_eq!(
+        d.halt_file_reads(),
+        1,
+        "and that poll must have READ, or this window is measuring the \
+         mtime early return rather than the read it claims"
+    );
+    assert_eq!(
+        d.halt_file_inert(),
+        1,
+        "the file it read halts nothing, by construction"
+    );
+    assert!(
+        !d.halt().any_halted(),
+        "a healthy signal must not halt — this gate would then be \
+         measuring the edge rather than the steady state"
+    );
+    assert_eq!(
+        allocs, 0,
+        "the halt machine's idle poll allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "idle-poll hot bytes should be zero: saw {bytes}");
+
+    // ---- the halt EDGE, measured on its own --------------------------
+    //
+    // Not folded into the window above: the edge writes `exec.HALT`,
+    // and `core_io::write_atomic` builds a `.tmp` sibling path. That
+    // allocation is deliberate and is bounded to one per incident —
+    // what must never happen is it recurring on every poll. The arm
+    // has reached TRIP_AT, so the next poll IS the edge.
+    d.on_idle();
+    assert!(d.halt().is_halted(SLOT as usize), "the edge must have fired");
+    assert_eq!(d.halt().reason(SLOT as usize), HaltReason::RejectStreak);
+
+    let g = AllocGuard::new();
+    let mut j = 0usize;
+    while j < 500 {
+        std::hint::black_box(d.on_idle());
+        j += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert!(
+        !d.halt().cancel_outstanding(),
+        "the cancel must have confirmed inside the window"
+    );
+    assert_eq!(
+        allocs, 0,
+        "a HALTED slot's idle poll allocated {allocs} times ({bytes} B) — \
+         the edge is once per incident, the poll is every 2 ms"
+    );
+    assert_eq!(bytes, 0, "halted idle-poll bytes should be zero: saw {bytes}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

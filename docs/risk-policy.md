@@ -3816,3 +3816,297 @@ and the halt state exported through `ExecCounters`, the halt state and
 with a halt file already present. With the read-back comes the fix for
 `exec.HALT` recording only the last slot to halt, and an alloc gate
 that drives `on_idle` under `AllocGuard`.
+
+### E6 commit 4 — the halt file, read as well as written (2026-09-19)
+
+Commit 3 built the kill switches and wrote `exec.HALT`. Nothing read
+it. This commit closes that loop and puts the halt state where an
+operator can see it.
+
+#### The file names EVERY halted slot, not the last one
+
+The writer took a slot and a reason and rendered one line. With two
+slots halted the file named one — so the read-back this commit adds
+would have resumed the other, silently, which is the precise failure
+the file exists to prevent.
+
+`render_halt_file` now takes the whole `[HaltReason; EXEC_SLOTS]` and
+writes a line per halted slot, and `on_halt_edge` takes **no slot
+argument at all**. That is deliberate: everything the edge does is a
+function of the whole halt state — the file names every halted slot,
+the cancel is venue-wide — so a per-slot argument would be a standing
+invitation to write per-slot behaviour that is wrong by construction.
+
+The format is engine-written and hand-writable:
+
+```
+# exec.HALT - engine-written. Delete it and restart to clear.
+slot=3 reason=ws-gap
+slot=5 reason=operator
+```
+
+`parse_halt_file` also accepts a bare number, because an operator
+reaching for a kill switch in a hurry types `echo 3 > exec.HALT` and
+that has to mean something. Three readings are deliberate:
+
+* **An unknown reason still halts.** A word this binary does not
+  recognise parses as `Operator`, never `None` — "I cannot tell why"
+  reads as *stay stopped*.
+* **A bad line does not discard the good ones.** One unparseable line
+  must not throw away the halts that parsed.
+* **A corrupt file is not a boot refusal.** Refusing to start would
+  make a mangled file a denial of service on an engine that might be
+  needed to flatten a position.
+
+And the fourth reading, which the first draft of this commit got
+badly wrong — see *The file is an INPUT* below.
+
+#### The file is an INPUT, and the first draft did not treat it as one
+
+`exec.HALT` is now read from the engine thread — the thread that
+pumps the live arm's socket, drains the cancel-all sweep and
+evaluates the triggers every 2 ms. The first draft read it with
+`std::fs::read_to_string`, which is three hazards at once:
+
+1. **It allocates.** A `String`, on the 2 ms thread, every time the
+   file changes.
+2. **It is unbounded.** A multi-gigabyte file is a multi-gigabyte
+   `String`.
+3. **It blocks.** `open` on a FIFO waits for a writer — for ever,
+   with no timeout and no log. Put a FIFO where `exec.HALT` goes and
+   the engine stops, silently, at boot or mid-session.
+
+(3) is the one that matters. This section already said *"a corrupt
+file is not a boot refusal… refusing to start would make a mangled
+file a denial of service on an engine that might be needed to flatten
+a position."* A FIFO **is** that denial of service, and worse than a
+refusal, because a refusal at least prints something.
+
+`read_halt_file` replaces it:
+
+* `stat` first and refuse anything that is not a **regular file** —
+  a directory, a device, a socket, a FIFO, and a symlink to any of
+  them, since `metadata` follows;
+* refuse anything larger than a file we would have written
+  (`HALT_FILE_MAX`, 512 B);
+* open with **`O_NONBLOCK`**, so even a FIFO swapped in between the
+  `stat` and the `open` returns instead of hanging;
+* read into the caller's fixed buffer — **zero allocation**, since
+  std takes a stack fast path for short paths in both `stat` and
+  `open`.
+
+Each of those is pinned by a test. The FIFO one is worth naming: its
+break-and-watch does not fail, it **hangs** — the run had to be killed
+after 60 s. A test that hangs on the broken code is the right test for
+a bug whose symptom is an engine that stops answering.
+
+#### And a halt file that halts NOTHING
+
+A mistyped slot number, a line this binary cannot parse, or a slot
+that is not live: the file is there, and no slot is halted.
+
+Silence here is the inverse of the loud boot tell below, and strictly
+worse — an operator who asked for a halt, got a clean boot log, and an
+engine that is trading. So `halt_file_present` is tracked separately
+from `halt_file_adopted`, the boot logs at error level when a file was
+present and adopted nothing, and the runtime path counts
+`halt_file_inert`.
+
+**`latch_all` is LIVE slots only**, exactly like the trigger loop. A
+paper or off slot cannot reach a venue, so halting one changes nothing
+it does — but `on_halt_edge` fires a VENUE-WIDE cancel, so
+`echo 1 > exec.HALT` with slot 1 on paper would have pulled the live
+arm's real quotes off the book for nothing. It is now an inert read
+instead, which is what the operator needs to be told.
+
+#### Boot: adopt, and say so in a way nobody can miss
+
+`adopt_halt_file` runs once at boot and latches every slot the file
+names, with the reason the *last* run recorded. The boot then logs at
+**error** level, not warning, and names each halted slot.
+
+The failure being guarded against is not subtle: an operator reads a
+clean boot log, assumes the halt cleared, and waits for quotes that
+are never coming.
+
+#### Runtime: the operator's kill switch, without a restart
+
+`poll_halt_file` runs from `on_idle`. An operator writes the file and
+the slot stops inside a second — no restart, no control socket, no
+new listener to secure.
+
+Two costs are held down deliberately, and each has its own counter
+because one number could not have caught both:
+
+| counter | what it counts | what holds it down |
+|---|---|---|
+| `halt_file_polls` | `stat` calls | the 1 s cadence |
+| `halt_file_reads` | `read` calls | the mtime check |
+
+Both are internal instrumentation, pinned by a unit test and by alloc
+gate 62 — not an operator surface. An earlier draft of this section
+presented them as numbers an operator watches, which they are not; the
+operator surfaces are the boot tell and `/state`'s `exec` object.
+
+Without the cadence the engine thread would `stat` five hundred times
+a second; without the mtime check it would *read* once a second for
+ever. **The read count would not have noticed the cadence breaking**
+— removing the cadence leaves reads at 1 while syscalls go to 500/s —
+which is exactly why they are two numbers and not one.
+
+The router's own writes refresh the mtime baseline, so a halt edge
+does not make the next poll re-read what it just wrote.
+
+**One direction only.** A halt found in the file is adopted; a halt
+*absent* from it is not cleared. Deleting the file un-halts nothing in
+a running process — it only stops the next boot adopting it. A halt is
+sticky, and clearing one is a restart-level decision.
+
+#### Observability: `/metrics` and `/state`
+
+`ExecCounters` — which already crosses the trait boundary — gained
+`refused_halted`, `refused_unseeded`, `halts`,
+`cancel_all_failures`, `cancel_all_stranded`, `seeded` and a per-slot
+`halted` array. `refused_halted` had been counted since commit 3 and
+exported nowhere, so a halt reached `/metrics` only folded into
+`refused_risk`.
+
+New rows, live slots only as before:
+
+```
+engine_exec_refused_halted_total
+engine_exec_refused_unseeded_total
+engine_exec_halts_total
+engine_exec_cancel_all_failures_total
+engine_exec_cancel_all_stranded_total
+engine_exec_seeded                    (gauge)
+engine_exec_slot<N>_halted            (gauge: HaltReason as u8)
+```
+
+`engine_exec_slot<N>_halted` is a gauge rather than a counter because
+the operator's question is *"is it halted now, and why"*, not *"how
+many times"*.
+
+`/state` gained an `exec` object — including `adopted_from_file` and
+`halt_file_present`, which took a review round to get right: the first
+draft declared and rendered `adopted_from_file` and never assigned it,
+so the surface built to answer *"did this engine start halted?"*
+answered `0` always. Two fields now carry it through `ExecCounters`,
+and the distinction between them is the point: `present` without
+`adopted` is the typo case above. It spells the reason as a word,
+because `"slot 3 stopped on ws-gap"` is the whole answer and a number
+would send the reader to a table. The word table has to be duplicated
+in `engine-snapshot` — the dependency runs the other way — so `cli`,
+which sees both, pins them together. A silent divergence there would
+make `/state` name the wrong reason for a halt, which is the one field
+it would be read for.
+
+#### Gate 62: the busiest path in this lane had no alloc gate
+
+`on_idle` runs on the engine thread every 2 ms whether or not anything
+is trading. Gates 53 and 61 drive `submit`, `cancel`, `modify` and the
+ledger — neither drives `on_idle`. So the hook this lane added, and
+then added a *file poll* to, was the one path with no zero-allocation
+gate at all.
+
+Gate 62 drives 500 idle moments — one second of real pacing — then
+the seeding edge, the five triggers, the halt edge, and
+`cancel_all_state` polling through `Working` to `Clear`.
+
+The halt file exists for the whole window **and is modified just
+before it**, so the one poll the cadence lets through takes the READ
+branch rather than the mtime early return. The gate asserts
+`halt_file_polls() == 1` and `halt_file_reads() == 1` — equalities,
+not upper bounds, because `reads <= 1` is satisfied by a poll that
+never ran at all.
+
+**Two windows, not one.** The steady state and the halt EDGE are
+measured separately, because the edge writes `exec.HALT` and
+`core_io::write_atomic` allocates a `.tmp` sibling path. That
+allocation is real and deliberate; what must never happen is it
+recurring per poll. Splitting the windows enforces the distinction
+instead of asserting it in a comment.
+
+**And the gate nearly measured nothing — twice.**
+
+First it did not create a halt file at all, so every poll failed at
+the first `stat` and returned early; breaking the mtime check changed
+nothing and the gate still passed.
+
+Then, with a file, it still never took the read branch, because
+`adopt_halt_file` ran before the guard and left the mtime baseline
+matching — and the assertion was `reads <= 1`, which cannot tell one
+read from none. So the gate reported `ok` over the one new allocating
+call in the commit. Both review agents found this independently, and
+the fix — touch the file, assert equalities — makes the gate fail by
+exactly 1 allocation and 23 bytes when `read_to_string` is put back.
+
+A gate whose subject never runs reports the same `ok` as a gate that
+holds. **Three times in this lane now**, which is enough to state the
+rule: a new gate is not finished until the thing it measures has been
+broken and seen to fail.
+
+#### The exit-75 flake: one lead down
+
+§E6 3a recorded a lead — exit 75 is `EX_TEMPFAIL`, this host has an
+fd-exhaustion incident on record, so compare `ulimit -n`.
+
+**Measured: `ulimit -n` is 1,048,576 soft, unlimited hard.** The fd
+hypothesis is dead. The flake still reproduces at roughly 1 run in 6
+of `cargo test -p cli --lib`, and one further observation is worth
+recording: when it fires, **no `test result` line is printed at all**
+— the process dies before the harness prints its summary, rather than
+after. Still open, still not this lane's doing.
+
+#### Gates
+
+* `cargo test --workspace --exclude bench --no-fail-fast` — **2510
+  passed, 0 failed**
+* `cargo test --release --test alloc_assertions -- --test-threads=1` —
+  **62/62** (gate 62 is new)
+* `cargo clippy --workspace --all-targets -- -D warnings` — clean
+* `make license-check` — OK, 392 source files
+
+#### What the review round changed
+
+Both agents ran against the working tree with this section already
+written, which is what made the prose auditable. The alloc audit
+passed; the risk review returned `BLOCK`, correctly.
+
+Taken and fixed here:
+
+1. **The uncapped, untyped, blocking read** — the FIFO hang above.
+   Both agents reached it from different directions: the risk review
+   by treating the file as an attacker-controlled input, the alloc
+   audit by tracing what allocates on the 2 ms thread.
+2. **Gate 62 did not measure the read** it claimed to, and `<= 1`
+   hid it.
+3. **`/state`'s `adopted_from_file` was hard-wired to `0`** — a field
+   declared, documented and rendered, and never assigned. The third
+   instance in two commits of *an accessor documented as feeding a
+   surface, with no caller*.
+4. **A present-but-inert halt file booted silently.**
+5. **`latch_all` had no live-slot filter**, so a mistyped slot number
+   would fire a venue-wide cancel for nothing.
+6. Prose: the two counters are not operator surfaces; the render's
+   truncation bound is now a compile-time assertion rather than a
+   happens-to-fit; a misplaced comment in `on_idle`.
+
+Recorded and NOT fixed here: `core-io/src/state_file.rs`'s doctrine
+header still says `write_atomic` runs "never on the tick path", which
+has been stale since commit 3 put it on the halt edge. It is a comment
+on another crate's invariant and belongs in its own change.
+
+#### E6 is complete
+
+Commit 1 the per-order clamp · commit 2 the venue-fill ledger ·
+commit 3a the idle thread · commit 3 the kill switches and the
+request/confirm cancel · commit 4 the halt file, read as well as
+written.
+
+Known and deliberately open: `exec.HALT` records the halt REASON per
+slot but the boot read-back cannot distinguish a halt the engine
+wrote from one an operator wrote, so an adopted halt always reports
+the recorded reason rather than "adopted". `request_budget_floor` is
+required non-zero but is the arm's number, not a router threshold.
+And the exit-75 flake above.

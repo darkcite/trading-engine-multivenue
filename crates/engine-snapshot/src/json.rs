@@ -261,6 +261,43 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(cnt.regime_exits);
     c.put(b"}");
 
+    // --- exec (E6 c4) ---
+    //
+    // Additive. `halted` is an ARRAY of reason words rather than a
+    // count, because "slot 3 stopped on ws-gap" is the whole answer
+    // and a number would send the reader to a table.
+    let ex = &s.exec;
+    c.key("exec");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(ex.configured));
+    c.key("seeded");
+    c.u64(u64::from(ex.seeded));
+    c.key("adopted_from_file");
+    c.u64(u64::from(ex.adopted));
+    c.key("halt_file_present");
+    c.u64(u64::from(ex.file_present));
+    c.key("halts");
+    c.u64(ex.halts);
+    c.key("refused_halted");
+    c.u64(ex.refused_halted);
+    c.key("refused_unseeded");
+    c.u64(ex.refused_unseeded);
+    c.key("cancel_all_failures");
+    c.u64(ex.cancel_all_failures);
+    c.key("cancel_all_stranded");
+    c.u64(ex.cancel_all_stranded);
+    c.key("halted");
+    c.put(b"[");
+    let mut i = 0usize;
+    while i < crate::SNAPSHOT_SLOTS {
+        if i > 0 {
+            c.put(b",");
+        }
+        c.quoted(crate::halt_reason_word(ex.halted[i]).as_bytes());
+        i += 1;
+    }
+    c.put(b"]}");
+
     // --- vrp (P6) ---
     //
     // Additive: `"v":1` stays. The campaign object is what the counters

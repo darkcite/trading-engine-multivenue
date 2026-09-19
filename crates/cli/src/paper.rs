@@ -3953,6 +3953,28 @@ pub struct ExecMetricIds {
     /// 0; anything else is a routing bug, and the order was refused
     /// rather than quietly modelled.
     pub refused_no_route: core_metrics::CounterId,
+    /// `engine_exec_refused_halted_total` (E6 c4) — requests refused
+    /// because their slot is HALTED. The one refusal reason an
+    /// operator must not have to infer from a total.
+    pub refused_halted: core_metrics::CounterId,
+    /// `engine_exec_refused_unseeded_total` (E6 c4) — refused because
+    /// the ledger has never been reconciled. Expected non-zero for a
+    /// few seconds after a boot and zero after; still climbing means
+    /// the arm never reached the venue.
+    pub refused_unseeded: core_metrics::CounterId,
+    /// `engine_exec_halts_total` (E6 c4) — halt EDGES. **The alarm.**
+    pub halts: core_metrics::CounterId,
+    /// `engine_exec_cancel_all_failures_total` (E6 c4) — cancel-all
+    /// requests the arm would not accept.
+    pub cancel_all_failures: core_metrics::CounterId,
+    /// `engine_exec_cancel_all_stranded_total` (E6 c4) — polls on
+    /// which the arm reported it had given up with the venue
+    /// unconfirmed. **The stranded-quote number** (LAW E-8).
+    pub cancel_all_stranded: core_metrics::CounterId,
+    /// `engine_exec_seeded` (gauge, E6 c4) — 1 once the ledger has
+    /// been reconciled. A boot stuck at 0 is a boot not trading, and
+    /// nothing else says so in one glance.
+    pub seeded: GaugeId,
     /// Index = slot. `Some` only for LIVE slots — a paper or off slot
     /// costs no metric names at all (plan §3.5).
     ///
@@ -3982,6 +4004,12 @@ pub struct ExecSlotMetricIds {
     pub live_submits: core_metrics::CounterId,
     /// `engine_exec_slot<N>_refused_total`
     pub refused: core_metrics::CounterId,
+    /// `engine_exec_slot<N>_halted` (E6 c4) — `HaltReason as u8`;
+    /// 0 running, 1 reject-streak, 2 budget-floor, 3 recon-drift,
+    /// 4 ws-gap, 5 asset-refusals, 6 operator. A gauge rather than a
+    /// counter because an operator's question is "is it halted NOW,
+    /// and why", not "how many times".
+    pub halted: GaugeId,
 }
 
 /// Registry counter handles for one ingress thread's §6.4 loss
@@ -4644,6 +4672,14 @@ fn register_exec_metrics(
     let refused_off = one("engine_exec_refused_off_total")?;
     let refused_no_route = one("engine_exec_refused_no_route_total")?;
     let refused_risk = one("engine_exec_refused_risk_total")?;
+    let refused_halted = one("engine_exec_refused_halted_total")?;
+    let refused_unseeded = one("engine_exec_refused_unseeded_total")?;
+    let halts = one("engine_exec_halts_total")?;
+    let cancel_all_failures = one("engine_exec_cancel_all_failures_total")?;
+    let cancel_all_stranded = one("engine_exec_cancel_all_stranded_total")?;
+    let seeded = reg
+        .register_gauge("engine_exec_seeded")
+        .map_err(|_| "register engine_exec_seeded")?;
 
     let mut slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS] =
         [None; clob_dispatcher::EXEC_COUNTER_SLOTS];
@@ -4662,6 +4698,9 @@ fn register_exec_metrics(
             refused: reg
                 .register_counter(&format!("engine_exec_slot{slot}_refused_total"))
                 .map_err(|_| "register exec slot counter")?,
+            halted: reg
+                .register_gauge(&format!("engine_exec_slot{slot}_halted"))
+                .map_err(|_| "register exec slot gauge")?,
         });
     }
     Ok(ExecMetricIds {
@@ -4671,6 +4710,12 @@ fn register_exec_metrics(
         refused_off,
         refused_no_route,
         refused_risk,
+        refused_halted,
+        refused_unseeded,
+        halts,
+        cancel_all_failures,
+        cancel_all_stranded,
+        seeded,
         slots,
     })
 }
@@ -4694,9 +4739,21 @@ fn mirror_exec_metrics(
         .inc(cur.refused_no_route.saturating_sub(last.refused_no_route));
     reg.counter(ids.refused_risk)
         .inc(cur.refused_risk.saturating_sub(last.refused_risk));
+    reg.counter(ids.refused_halted)
+        .inc(cur.refused_halted.saturating_sub(last.refused_halted));
+    reg.counter(ids.refused_unseeded)
+        .inc(cur.refused_unseeded.saturating_sub(last.refused_unseeded));
+    reg.counter(ids.halts)
+        .inc(cur.halts.saturating_sub(last.halts));
+    reg.counter(ids.cancel_all_failures)
+        .inc(cur.cancel_all_failures.saturating_sub(last.cancel_all_failures));
+    reg.counter(ids.cancel_all_stranded)
+        .inc(cur.cancel_all_stranded.saturating_sub(last.cancel_all_stranded));
+    reg.gauge(ids.seeded).set(i64::from(cur.seeded));
     for (s, slot) in ids.slots.iter().enumerate() {
         let Some(slot) = slot else { continue };
         reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
+        reg.gauge(slot.halted).set(i64::from(cur.halted[s]));
         reg.counter(slot.live_submits).inc(
             cur.live_submits_by_slot[s].saturating_sub(last.live_submits_by_slot[s]),
         );
@@ -5902,6 +5959,22 @@ fn fill_snapshot<S, D>(
     // strike and the position held against it can never disagree.
     out.vrp.counters = Sc::vrp_counters(strat);
     out.vrp.view = Sc::vrp_snapshot_view(strat);
+
+    // E6 c4: the router's kill switches. Read through the trait, from
+    // the same publish instant as everything else, so a halted slot
+    // and the refusals it produced can never disagree.
+    let ec = clob_dispatcher::OrderDispatch::exec_counters(eng.dispatcher());
+    let ex = &mut out.exec;
+    ex.configured = ec.configured;
+    ex.seeded = ec.seeded;
+    ex.adopted = ec.halt_file_adopted;
+    ex.file_present = ec.halt_file_present;
+    ex.halts = ec.halts;
+    ex.refused_halted = ec.refused_halted;
+    ex.refused_unseeded = ec.refused_unseeded;
+    ex.cancel_all_failures = ec.cancel_all_failures;
+    ex.cancel_all_stranded = ec.cancel_all_stranded;
+    ex.halted = ec.halted;
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -9803,9 +9876,17 @@ mod tests {
             "engine_exec_refused_off_total",
             "engine_exec_refused_no_route_total",
             "engine_exec_refused_risk_total",
+            // E6 commit 4 — the halt family.
+            "engine_exec_refused_halted_total",
+            "engine_exec_refused_unseeded_total",
+            "engine_exec_halts_total",
+            "engine_exec_cancel_all_failures_total",
+            "engine_exec_cancel_all_stranded_total",
+            "engine_exec_seeded",
             "engine_exec_slot3_mode",
             "engine_exec_slot3_live_submits_total",
             "engine_exec_slot3_refused_total",
+            "engine_exec_slot3_halted",
         ] {
             assert!(text.contains(name), "missing exec row {name}");
         }
@@ -9815,6 +9896,7 @@ mod tests {
             "engine_exec_slot1_mode",
             "engine_exec_slot6_mode",
             "engine_exec_slot6_refused_total",
+            "engine_exec_slot6_halted",
         ] {
             assert!(!text.contains(absent), "must NOT register {absent}");
         }
@@ -9828,6 +9910,7 @@ mod tests {
                 format!("engine_exec_slot{slot}_mode"),
                 format!("engine_exec_slot{slot}_live_submits_total"),
                 format!("engine_exec_slot{slot}_refused_total"),
+                format!("engine_exec_slot{slot}_halted"),
             ] {
                 assert!(n.len() <= core_metrics::NAME_MAX, "{n} is {} bytes", n.len());
             }
@@ -9839,6 +9922,12 @@ mod tests {
             "engine_exec_refused_off_total",
             "engine_exec_refused_no_route_total",
             "engine_exec_refused_risk_total",
+            "engine_exec_refused_halted_total",
+            "engine_exec_refused_unseeded_total",
+            "engine_exec_halts_total",
+            "engine_exec_cancel_all_failures_total",
+            "engine_exec_cancel_all_stranded_total",
+            "engine_exec_seeded",
         ] {
             assert!(n.len() <= core_metrics::NAME_MAX);
         }

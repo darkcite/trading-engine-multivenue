@@ -3688,6 +3688,49 @@ fn run(args: RunArgs) -> ExitCode {
                     );
                     exec_dispatcher
                         .set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
+                    // **E6 commit 4 — read back what the last run
+                    // halted.** Before anything else touches the
+                    // table: a slot the last run stopped must not
+                    // quote once while the boot is still talking.
+                    let adopted = exec_dispatcher.adopt_halt_file();
+                    if adopted == 0 && exec_dispatcher.halt_file_present() {
+                        // **A halt file that halted nothing.** A
+                        // mistyped slot, a slot that is not live, or a
+                        // line this binary could not parse. Silence
+                        // here would be the inverse of the failure
+                        // below and strictly worse: an operator who
+                        // asked for a halt, got a clean boot log, and
+                        // an engine that trades.
+                        error!(
+                            file = %cli::exec_boot::halt_file_path(&eb.path).display(),
+                            "exec: exec.HALT IS PRESENT BUT HALTED NOTHING — check the \
+                             slot numbers (a line is `slot=<n> reason=<word>`, or a bare \
+                             number) and that those slots are LIVE. The engine is \
+                             trading."
+                        );
+                    }
+                    if adopted > 0 {
+                        // Deliberately loud, and deliberately an
+                        // error rather than a warning. The failure
+                        // this guards against is an operator reading
+                        // a clean boot log, assuming the halt
+                        // cleared, and waiting for quotes that are
+                        // never coming.
+                        error!(
+                            slots = adopted,
+                            file = %cli::exec_boot::halt_file_path(&eb.path).display(),
+                            "exec: STARTED HALTED — a previous run left exec.HALT \
+                             and those slots will refuse every order. Investigate \
+                             the recorded reason, then DELETE the file and restart \
+                             to clear."
+                        );
+                        for slot in 0..exec_router::EXEC_SLOTS {
+                            let why = exec_dispatcher.halt().reason(slot);
+                            if why.is_halted() {
+                                error!(slot, reason = why.as_str(), "exec: slot halted");
+                            }
+                        }
+                    }
                     if halt_mask != 0 {
                         warn!(
                             halted = %cli::exec_boot::render_slot_mask(halt_mask),

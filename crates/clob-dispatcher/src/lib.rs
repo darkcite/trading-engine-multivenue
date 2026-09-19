@@ -806,6 +806,34 @@ pub struct ExecCounters {
     /// opinion over the member's own caps; a non-zero value means the
     /// two disagreed.
     pub refused_risk: u64,
+    /// **E6 commit 4: refused because the slot is HALTED.** A
+    /// subset of `refused_risk`, broken out because a halt is the one
+    /// refusal reason an operator must not have to infer.
+    pub refused_halted: u64,
+    /// **E6 commit 4: refused because the ledger has never been
+    /// reconciled.** Expected non-zero for a few seconds after every
+    /// boot and zero thereafter; a value that keeps climbing means
+    /// the arm never reached the venue.
+    pub refused_unseeded: u64,
+    /// Halt edges — slots that went from running to halted.
+    pub halts: u64,
+    /// Cancel-all requests the arm would not accept.
+    pub cancel_all_failures: u64,
+    /// Polls on which the arm reported it had given up with the venue
+    /// unconfirmed. **The stranded-quote number.**
+    pub cancel_all_stranded: u64,
+    /// Slots halted by reading `exec.HALT` at boot rather than by a
+    /// trigger in this process. `0` with `halt_file_present` set
+    /// means an operator wrote a halt file that halted NOTHING.
+    pub halt_file_adopted: u8,
+    /// `1` when a readable `exec.HALT` was seen at all.
+    pub halt_file_present: u8,
+    /// `1` once the ledger has been reconciled against the venue.
+    /// Until then every live PLACE is refused, so a boot stuck at `0`
+    /// is a boot that is not trading.
+    pub seeded: u8,
+    /// Per-slot `HaltReason as u8`; `0` = running.
+    pub halted: [u8; EXEC_COUNTER_SLOTS],
     /// Per-slot live submits.
     pub live_submits_by_slot: [u64; EXEC_COUNTER_SLOTS],
     /// Per-slot refusals (off + no-route).

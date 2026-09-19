@@ -741,6 +741,7 @@ dependencies = [
  "core-io",
  "core-time",
  "core-types",
+ "libc",
 ]
 
 [[package]]

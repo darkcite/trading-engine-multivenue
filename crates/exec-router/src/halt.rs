@@ -93,11 +93,128 @@ impl HaltReason {
         }
     }
 
+    /// The inverse of [`Self::as_str`]. Named `from_word` rather than
+    /// `from_str` so it cannot be confused with `std::str::FromStr`,
+    /// which it deliberately is not: that trait returns a `Result`,
+    /// and this must never have a failure case.
+    ///
+    /// An unrecognised word is
+    /// `Operator`, not `None`: a halt file naming a reason this
+    /// binary does not know is still a halt, and the safe reading of
+    /// "I cannot tell why" is "stay stopped".
+    #[must_use]
+    pub fn from_word(word: &str) -> Self {
+        match word {
+            "reject-streak" => HaltReason::RejectStreak,
+            "budget-floor" => HaltReason::BudgetFloor,
+            "recon-drift" => HaltReason::ReconDrift,
+            "ws-gap" => HaltReason::WsGap,
+            "asset-refusals" => HaltReason::AssetRefusals,
+            _ => HaltReason::Operator,
+        }
+    }
+
+    /// Anything but [`HaltReason::None`].
     #[inline]
     #[must_use]
-    const fn is_halted(self) -> bool {
+    pub const fn is_halted(self) -> bool {
         !matches!(self, HaltReason::None)
     }
+}
+
+/// Bytes a rendered halt file can take: the two header lines plus one
+/// `slot=NN reason=<longest word>` line per slot.
+pub const HALT_FILE_MAX: usize = 512;
+
+/// **The render must not be able to truncate.** `put` clamps to the
+/// buffer, so a table that outgrew it would silently write a SHORT
+/// halt file — naming some halted slots and not others, which is the
+/// exact defect commit 4 exists to fix. Growing `EXEC_SLOTS` past
+/// what fits is a compile error instead.
+///
+/// `128` is the two header lines (125 B today). `30` is the longest
+/// line: `slot=` (5) + two digits (2) + ` reason=` (8) +
+/// `asset-refusals` (14) + `\n` (1). Written out rather than named,
+/// because a `const` used only by a `const _` assert reads as dead
+/// code to the lint.
+const _: () = assert!(128 + EXEC_SLOTS * 30 <= HALT_FILE_MAX);
+
+/// **Render the whole halt state.**
+///
+/// Every halted slot, not just the last one to trip. The single-slot
+/// version this replaces would have made the boot read-back resume a
+/// slot that was halted, because the file only ever named the most
+/// recent — and the read-back is the entire reason the file exists.
+///
+/// Returns the used length of `buf`. ASCII by construction: digits,
+/// two literals and [`HaltReason::as_str`].
+pub fn render_halt_file(buf: &mut [u8; HALT_FILE_MAX], reasons: &[HaltReason; EXEC_SLOTS]) -> usize {
+    let mut n = 0usize;
+    {
+        let mut put = |bytes: &[u8]| {
+            let room = buf.len().saturating_sub(n);
+            let take = bytes.len().min(room);
+            buf[n..n + take].copy_from_slice(&bytes[..take]);
+            n += take;
+        };
+        put(b"# exec.HALT - engine-written. Delete it and restart to clear.\n");
+        put(b"# A line is `slot=<n> reason=<word>`; a bare number works too.\n");
+        let mut slot = 0usize;
+        while slot < EXEC_SLOTS {
+            let why = reasons[slot];
+            if why.is_halted() {
+                put(b"slot=");
+                if slot >= 10 {
+                    put(&[b'0' + (slot / 10) as u8]);
+                }
+                put(&[b'0' + (slot % 10) as u8]);
+                put(b" reason=");
+                put(why.as_str().as_bytes());
+                put(b"\n");
+            }
+            slot += 1;
+        }
+    }
+    n
+}
+
+/// **Parse a halt file — engine-written or hand-written.**
+///
+/// Ignores blank lines and `#` comments. A line may be
+/// `slot=<n> reason=<word>` or a bare slot number, because an
+/// operator reaching for this in a hurry should be able to write
+/// `echo 3 > exec.HALT` and have it mean something.
+///
+/// A slot out of range is skipped rather than refusing the file: one
+/// unreadable line must not discard the halts that parsed, and this
+/// is the direction where discarding is the dangerous outcome.
+#[must_use]
+pub fn parse_halt_file(text: &str) -> [HaltReason; EXEC_SLOTS] {
+    let mut out = [HaltReason::None; EXEC_SLOTS];
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut slot: Option<usize> = None;
+        let mut why = HaltReason::Operator;
+        for field in line.split_whitespace() {
+            if let Some(v) = field.strip_prefix("slot=") {
+                slot = v.parse().ok();
+            } else if let Some(v) = field.strip_prefix("reason=") {
+                why = HaltReason::from_word(v);
+            } else if slot.is_none() {
+                // A bare number, hand-written.
+                slot = field.parse().ok();
+            }
+        }
+        if let Some(i) = slot {
+            if i < EXEC_SLOTS {
+                out[i] = why;
+            }
+        }
+    }
+    out
 }
 
 /// **Which trigger, if any, fires for one slot.**
@@ -234,6 +351,13 @@ impl HaltState {
             return HaltReason::None;
         }
         self.reasons[slot]
+    }
+
+    /// Every slot's reason, for the halt file and `/state`.
+    #[inline]
+    #[must_use]
+    pub const fn reasons(&self) -> &[HaltReason; EXEC_SLOTS] {
+        &self.reasons
     }
 
     /// Is this slot halted?
@@ -539,6 +663,75 @@ mod tests {
         assert!(!h.is_halted(EXEC_SLOTS));
         assert_eq!(h.reason(EXEC_SLOTS), HaltReason::None);
         assert_eq!(h.halts, 0);
+    }
+
+    /// The property the boot read-back rests on: what the engine
+    /// wrote is what the next boot reads.
+    #[test]
+    fn the_halt_file_round_trips_every_halted_slot() {
+        let mut reasons = [HaltReason::None; EXEC_SLOTS];
+        reasons[3] = HaltReason::WsGap;
+        reasons[5] = HaltReason::Operator;
+        reasons[7] = HaltReason::ReconDrift;
+
+        let mut buf = [0u8; HALT_FILE_MAX];
+        let n = render_halt_file(&mut buf, &reasons);
+        let text = core::str::from_utf8(&buf[..n]).expect("ascii by construction");
+        assert_eq!(
+            parse_halt_file(text),
+            reasons,
+            "three halted slots, three read back — not just the last\n{text}"
+        );
+    }
+
+    /// The single-slot writer this replaced would have let the boot
+    /// resume a slot that was halted.
+    #[test]
+    fn a_second_halted_slot_is_not_lost_to_the_first() {
+        let mut reasons = [HaltReason::None; EXEC_SLOTS];
+        reasons[0] = HaltReason::RejectStreak;
+        reasons[1] = HaltReason::BudgetFloor;
+        let mut buf = [0u8; HALT_FILE_MAX];
+        let n = render_halt_file(&mut buf, &reasons);
+        let back = parse_halt_file(core::str::from_utf8(&buf[..n]).unwrap());
+        assert!(back[0].is_halted() && back[1].is_halted());
+    }
+
+    #[test]
+    fn nothing_halted_renders_a_file_that_halts_nothing() {
+        let mut buf = [0u8; HALT_FILE_MAX];
+        let n = render_halt_file(&mut buf, &[HaltReason::None; EXEC_SLOTS]);
+        let back = parse_halt_file(core::str::from_utf8(&buf[..n]).unwrap());
+        assert_eq!(back, [HaltReason::None; EXEC_SLOTS], "comments only");
+    }
+
+    /// An operator reaching for this in a hurry writes the shortest
+    /// thing that could work, and it has to work.
+    #[test]
+    fn a_hand_written_halt_file_is_understood() {
+        let back = parse_halt_file("3\n");
+        assert_eq!(back[3], HaltReason::Operator);
+        assert_eq!(back[2], HaltReason::None);
+
+        // With whitespace, comments and blank lines around it.
+        let back = parse_halt_file("# stop bin15\n\n  5  \n");
+        assert_eq!(back[5], HaltReason::Operator);
+    }
+
+    /// A reason this binary does not know still halts. "I cannot tell
+    /// why" reads as "stay stopped", never as "carry on".
+    #[test]
+    fn an_unknown_reason_still_halts() {
+        let back = parse_halt_file("slot=3 reason=something-from-the-future\n");
+        assert!(back[3].is_halted());
+        assert_eq!(back[3], HaltReason::Operator);
+    }
+
+    /// One unreadable line must not discard the halts that parsed.
+    #[test]
+    fn a_bad_line_does_not_throw_away_the_good_ones() {
+        let back = parse_halt_file("slot=99 reason=ws-gap\nnonsense\nslot=3 reason=ws-gap\n");
+        assert_eq!(back[3], HaltReason::WsGap, "the readable line survived");
     }
 
     #[test]

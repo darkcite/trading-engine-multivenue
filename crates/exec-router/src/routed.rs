@@ -49,6 +49,11 @@ use clob_dispatcher::{
 };
 use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, Tick};
 
+/// How often `exec.HALT` is checked on the idle path. One second: an
+/// operator reaching for a kill switch waits a second, and the engine
+/// thread does one `stat` per second rather than five hundred.
+const HALT_POLL_EVERY_NS: u64 = 1_000_000_000;
+
 /// Routes each order to the paper matcher or the live arm according to
 /// the boot-fixed [`ExecRoute`].
 ///
@@ -71,6 +76,43 @@ pub struct RoutedDispatcher<P: OrderDispatch, L: OrderDispatch> {
     /// at 00:10Z and resume trading into whatever tripped it,
     /// unattended.
     halt_path: Option<std::path::PathBuf>,
+    /// The mtime of `exec.HALT` as this router last saw it. The
+    /// runtime poll reads the file only when this moves, so the
+    /// steady-state cost is one `stat` a second rather than a read.
+    ///
+    /// Refreshed after the router's OWN writes too, so a halt edge
+    /// does not make the next poll re-read what it just wrote.
+    halt_file_seen: Option<std::time::SystemTime>,
+    /// `core_time::now_ns()` at the last poll. The cadence is in
+    /// here rather than a counter because `on_idle`'s rate is a
+    /// property of how busy the engine is, and "once a second" should
+    /// not mean "more often when quiet".
+    halt_poll_last_ns: u64,
+    /// Times the cadence let a poll through to a `stat`. This is the
+    /// number the cadence exists to hold down — a syscall on the
+    /// engine thread — and it is counted separately from the reads
+    /// because removing the cadence would leave the READ count at 1
+    /// while the syscall rate went to five hundred a second.
+    ///
+    /// Internal instrumentation, not an operator surface: it exists
+    /// so the cadence and the mtime check can each be pinned by a
+    /// test and by alloc gate 62. What an operator reads is the boot
+    /// tell and `/state`'s `exec` object.
+    halt_file_polls: u64,
+    /// Times `exec.HALT` was actually READ, as opposed to `stat`ed
+    /// and found unchanged. Internal, as above.
+    halt_file_reads: u64,
+    /// Has a readable `exec.HALT` been seen at all? Distinguishes
+    /// "no file" from "a file that halted nothing", which is the
+    /// difference between a normal boot and an operator's kill switch
+    /// silently doing nothing.
+    halt_file_present: bool,
+    /// Reads that parsed to no new halt. **The typo counter.**
+    halt_file_inert: u64,
+    /// Slots halted by reading the file rather than by a trigger.
+    /// Reported at boot so an operator is told, loudly, that this
+    /// engine started already stopped.
+    halt_file_adopted: u32,
     /// **E6** — what the venue has actually done, as the router sees
     /// it. Boxed because it is ~14 KiB of tables and `RoutedDispatcher`
     /// is moved by value into the engine at boot; the engine's own
@@ -96,6 +138,13 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             counters: RouteCounters::new(),
             halt: HaltState::new(),
             halt_path: None,
+            halt_file_seen: None,
+            halt_poll_last_ns: 0,
+            halt_file_polls: 0,
+            halt_file_reads: 0,
+            halt_file_present: false,
+            halt_file_inert: 0,
+            halt_file_adopted: 0,
             ledger: Box::new(Ledger::new(anchor)),
         }
     }
@@ -118,13 +167,240 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         self.halt_path = Some(path);
     }
 
+    /// **Read `exec.HALT` into a fixed buffer.** `None` when there is
+    /// nothing to read, or nothing we are willing to read.
+    ///
+    /// `exec.HALT` is an OPERATOR-WRITABLE INPUT consumed from the
+    /// engine thread, so it gets treated as one. `read_to_string`,
+    /// which this replaces, was three hazards at once:
+    ///
+    /// * **it allocates** — on the 2 ms thread, every time the file
+    ///   changes;
+    /// * **it is unbounded** — a multi-gigabyte file is a
+    ///   multi-gigabyte `String`;
+    /// * **it blocks** — `open` on a FIFO waits for a writer, for
+    ///   ever, with no timeout and no log. That is a silent denial of
+    ///   service on the one engine that might be needed to flatten a
+    ///   position, and it is the exact opposite of the "a corrupt
+    ///   file must not stop the boot" reading this file is meant to
+    ///   have.
+    ///
+    /// So: `stat` first and refuse anything that is not a REGULAR
+    /// FILE (a directory, a device, a socket, a FIFO — and a symlink
+    /// to any of them, because `metadata` follows); refuse anything
+    /// larger than a file we would have written; and open with
+    /// `O_NONBLOCK` so that even a FIFO swapped in between the `stat`
+    /// and the `open` returns instead of hanging.
+    ///
+    /// Zero allocation: the path goes to `stat`/`open` through std's
+    /// stack fast path for short paths, and the bytes land in the
+    /// caller's buffer.
+    fn read_halt_file(path: &std::path::Path, buf: &mut [u8; crate::halt::HALT_FILE_MAX]) -> Option<usize> {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let md = std::fs::metadata(path).ok()?;
+        if !md.is_file() {
+            return None;
+        }
+        if md.len() > crate::halt::HALT_FILE_MAX as u64 {
+            return None;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let mut n = 0usize;
+        while n < buf.len() {
+            match f.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                // `O_NONBLOCK` can answer EAGAIN on an exotic file we
+                // should not have reached anyway. Give up rather than
+                // spin: a halt file we cannot read halts nothing, and
+                // the next poll will try again.
+                Err(_) => return None,
+            }
+        }
+        Some(n)
+    }
+
+    /// **E6 commit 4 — read `exec.HALT` back.**
+    ///
+    /// Called once at boot, after [`Self::set_halt_path`]. Every slot
+    /// the file names is latched with the reason it names, exactly as
+    /// though the trigger had fired in this process.
+    ///
+    /// Returns how many slots it halted, so the boot can say so
+    /// loudly. **An engine that starts already stopped must be
+    /// impossible to miss**: the failure this guards against is an
+    /// operator seeing a clean boot log, assuming the halt cleared,
+    /// and waiting for quotes that are never coming.
+    ///
+    /// A missing file is the normal case and halts nothing. An
+    /// unreadable one halts nothing either and is NOT an error — the
+    /// alternative, refusing the boot, would make a corrupt file a
+    /// denial of service on an engine that might be needed to flatten
+    /// a position.
+    pub fn adopt_halt_file(&mut self) -> u32 {
+        let Some(path) = self.halt_path.clone() else {
+            return 0;
+        };
+        // The baseline for the runtime poll is taken whether or not
+        // there is anything to adopt, so a file that appears later is
+        // seen as a change.
+        self.halt_file_seen = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut buf = [0u8; crate::halt::HALT_FILE_MAX];
+        let Some(n) = Self::read_halt_file(&path, &mut buf) else {
+            return 0;
+        };
+        self.halt_file_present = true;
+        let Ok(text) = core::str::from_utf8(&buf[..n]) else {
+            return 0;
+        };
+        let adopted = self.latch_all(&crate::halt::parse_halt_file(text));
+        self.halt_file_adopted = adopted;
+        adopted
+    }
+
+    /// How many slots the boot's `exec.HALT` halted. Cold; the boot
+    /// tell and `/state`.
+    #[inline]
+    #[must_use]
+    pub const fn halt_file_adopted(&self) -> u32 {
+        self.halt_file_adopted
+    }
+
+    /// Times the halt file was read rather than merely `stat`ed.
+    #[inline]
+    #[must_use]
+    pub const fn halt_file_reads(&self) -> u64 {
+        self.halt_file_reads
+    }
+
+    /// Times the cadence let a poll through to a `stat`.
+    #[inline]
+    #[must_use]
+    pub const fn halt_file_polls(&self) -> u64 {
+        self.halt_file_polls
+    }
+
+    /// Was a readable `exec.HALT` seen? `true` with
+    /// [`Self::halt_file_adopted`] at zero means an operator wrote a
+    /// halt file that halted NOTHING — a typo, or a slot that is not
+    /// live — which the boot must say out loud.
+    #[inline]
+    #[must_use]
+    pub const fn halt_file_present(&self) -> bool {
+        self.halt_file_present
+    }
+
+    /// Runtime reads that parsed to no new halt.
+    #[inline]
+    #[must_use]
+    pub const fn halt_file_inert(&self) -> u64 {
+        self.halt_file_inert
+    }
+
+    /// Make the next `on_idle` poll the halt file regardless of when
+    /// the last one ran. **Tests only** — production paces itself off
+    /// the monotonic clock, which a test cannot advance.
+    #[cfg(test)]
+    #[inline]
+    pub fn force_halt_poll(&mut self) {
+        self.halt_poll_last_ns = 0;
+    }
+
+    /// Latch every halted slot in `reasons`, returning how many were
+    /// NEW. Shared by the boot read-back and the runtime poll.
+    ///
+    /// **LIVE slots only**, exactly like the trigger loop. A paper or
+    /// off slot cannot reach a venue, so halting one changes nothing
+    /// it does — but `on_halt_edge` fires a VENUE-WIDE cancel, so a
+    /// mistyped slot number in a hand-written halt file would pull
+    /// the live arm's real quotes off the book. The skip is counted
+    /// by the caller as an inert read.
+    fn latch_all(&mut self, reasons: &[HaltReason; EXEC_SLOTS]) -> u32 {
+        let mut n = 0u32;
+        let mut slot = 0usize;
+        while slot < EXEC_SLOTS {
+            let here = slot;
+            slot += 1;
+            if !reasons[here].is_halted() {
+                continue;
+            }
+            if !matches!(self.route.mode_at(here), Some(ExecMode::Live)) {
+                continue;
+            }
+            if self.halt.latch(here, reasons[here]) {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.on_halt_edge();
+        }
+        n
+    }
+
+    /// **E6 commit 4 — the operator's runtime kill switch.**
+    ///
+    /// Polled from `on_idle`, at most once a second and with a `stat`
+    /// rather than a read unless the file has actually changed. An
+    /// operator writes `echo 3 > exec.HALT` and slot 3 stops inside a
+    /// second, without a restart and without a control socket.
+    ///
+    /// **One direction only.** A halt found in the file is adopted; a
+    /// halt *absent* from the file is NOT cleared, because a halt is
+    /// sticky and clearing one is a restart-level decision. Deleting
+    /// the file un-halts nothing in the running process — it only
+    /// stops the NEXT boot from adopting it.
+    fn poll_halt_file(&mut self) {
+        let Some(path) = self.halt_path.as_ref() else {
+            return;
+        };
+        let now = core_time::now_ns();
+        // `now_ns` is monotonic, so this only fails to fire early.
+        if now.saturating_sub(self.halt_poll_last_ns) < HALT_POLL_EVERY_NS {
+            return;
+        }
+        self.halt_poll_last_ns = now;
+        self.halt_file_polls = self.halt_file_polls.saturating_add(1);
+        let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            // Gone, or unreadable. Nothing to adopt, and nothing is
+            // un-halted by a missing file.
+            return;
+        };
+        if self.halt_file_seen == Some(mtime) {
+            return;
+        }
+        self.halt_file_seen = Some(mtime);
+        self.halt_file_reads = self.halt_file_reads.saturating_add(1);
+        let mut buf = [0u8; crate::halt::HALT_FILE_MAX];
+        let Some(n) = Self::read_halt_file(path, &mut buf) else {
+            return;
+        };
+        self.halt_file_present = true;
+        let Ok(text) = core::str::from_utf8(&buf[..n]) else {
+            return;
+        };
+        let reasons = crate::halt::parse_halt_file(text);
+        if self.latch_all(&reasons) == 0 {
+            // Read, and nothing came of it. Counted, because a halt
+            // file an operator wrote that halts nothing is the
+            // failure the loud boot tell exists to prevent — arriving
+            // by the other door.
+            self.halt_file_inert = self.halt_file_inert.saturating_add(1);
+        }
+    }
+
     /// **E6 commit 3** — halt a slot on the operator's say-so.
     ///
     /// The same latch every trigger uses, so an operator halt is
     /// exactly as sticky and cancels exactly as hard.
     pub fn halt_slot(&mut self, slot: usize, why: HaltReason) {
         if self.halt.latch(slot, why) {
-            self.on_halt_edge(slot, why);
+            self.on_halt_edge();
             // An operator halt does not wait for the next idle poll.
             // It is usually a human reacting to something, and this
             // path is also reachable at boot — from a halt file the
@@ -134,10 +410,15 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         }
     }
 
-    /// One slot has just halted: clear what the ledger thinks is
-    /// resting, and write the file that makes the halt survive a
-    /// restart.
-    fn on_halt_edge(&mut self, slot: usize, why: HaltReason) {
+    /// A slot has just halted: write the file that makes the halt
+    /// survive a restart.
+    ///
+    /// Takes no slot, deliberately. Everything it does is a function
+    /// of the WHOLE halt state — the file names every halted slot,
+    /// and the cancel below is venue-wide — so a per-slot argument
+    /// here would be an invitation to write per-slot behaviour that
+    /// is wrong by construction.
+    fn on_halt_edge(&mut self) {
         // **The venue-wide cancel is not fired here.** `latch` marked
         // it pending and the caller performs it through
         // `try_cancel_all` — the single place that ever calls the
@@ -147,7 +428,7 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         //
         // The same holds when two slots halt on one poll: cancel-all
         // is venue-wide, so one call answers both edges.
-        self.write_halt_file(slot, why);
+        self.write_halt_file();
     }
 
     /// **The only place that calls the live arm's `cancel_all`.**
@@ -212,41 +493,31 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// Write `exec.HALT`, once per halt edge. Best effort: a halt
     /// that could not be persisted is still a halt, and refusing to
     /// halt because a file write failed would be the wrong direction.
-    fn write_halt_file(&mut self, slot: usize, why: HaltReason) {
+    ///
+    /// **The WHOLE state, every time.** An earlier version wrote only
+    /// the slot that had just tripped, so with two slots halted the
+    /// file named one — and the boot read-back would have resumed the
+    /// other, which is the exact failure the file exists to prevent.
+    fn write_halt_file(&mut self) {
         let Some(path) = self.halt_path.as_ref() else {
             return;
         };
-        // Fixed buffer, no `format!`: this runs on the engine
-        // thread. `write_atomic` takes `&str`, and every byte written
-        // here is ASCII by construction — the digits, the two
-        // literals and `HaltReason::as_str` — so the conversion
-        // cannot fail and is refused rather than unwrapped if it ever
-        // could.
-        let mut buf = [0u8; 64];
-        let mut n = 0usize;
-        {
-            let mut put = |bytes: &[u8]| {
-                let room = buf.len().saturating_sub(n);
-                let take = bytes.len().min(room);
-                buf[n..n + take].copy_from_slice(&bytes[..take]);
-                n += take;
-            };
-            put(b"slot=");
-            // Two digits, not one. `EXEC_SLOTS` is 8 today, so a
-            // single digit is correct today — and would silently
-            // mod-10 wrap the slot number in the one file an operator
-            // reads after an incident the moment the table grew.
-            if slot >= 10 {
-                put(&[b'0' + (slot / 10) as u8]);
-            }
-            put(&[b'0' + (slot % 10) as u8]);
-            put(b" reason=");
-            put(why.as_str().as_bytes());
-            put(b"\n");
-        }
+        // Fixed buffer, no `format!`: this runs on the engine thread.
+        // `write_atomic` takes `&str`, and every byte rendered is
+        // ASCII by construction, so the conversion cannot fail and is
+        // refused rather than unwrapped if it ever could.
+        let mut buf = [0u8; crate::halt::HALT_FILE_MAX];
+        let n = crate::halt::render_halt_file(&mut buf, self.halt.reasons());
         if let Ok(text) = core::str::from_utf8(&buf[..n]) {
             let _ = core_io::write_atomic(path, text);
         }
+        // Our own write is not an operator edit. Without this the next
+        // poll would re-read the file the edge just produced, every
+        // time.
+        self.halt_file_seen = self
+            .halt_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     }
 
     /// **E6** — the venue-fill ledger. Cold; `/state`, `/metrics`
@@ -751,14 +1022,24 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             };
             let why = trigger_for(&sig, &lim);
             if self.halt.latch(here, why) {
-                self.on_halt_edge(here, why);
+                self.on_halt_edge();
             }
         }
+
+
+        // The operator's file, after the triggers: a slot the
+        // operator halted and a slot a trigger halted are the same
+        // state, and a trigger firing in the same poll should keep
+        // its more specific reason.
+        self.poll_halt_file();
 
         // The venue was not cleared on the edge. Retried here rather
         // than once, because a halted slot with live orders is the
         // state LAW E-8's machinery exists to avoid, and one failed
-        // attempt during a blip would leave it there for ever.
+        // attempt during a blip would leave it there for ever. Runs
+        // AFTER the file poll, so a halt adopted from the file gets
+        // its cancel in the same poll rather than the next.
+
         self.try_cancel_all();
         a | b
     }
@@ -832,6 +1113,10 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 .unwrap_or(ExecMode::Paper)
                 .as_u8();
         }
+        let mut halted = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        for (slot, h) in halted.iter_mut().enumerate() {
+            *h = self.halt.reason(slot) as u8;
+        }
         ExecCounters {
             configured: 1,
             modes,
@@ -840,6 +1125,15 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             refused_off: c.refused_off,
             refused_no_route: c.refused_no_route,
             refused_risk: c.refused_risk,
+            refused_halted: c.refused_halted,
+            refused_unseeded: c.refused_unseeded,
+            halts: self.halt.halts,
+            cancel_all_failures: self.halt.cancel_all_failures,
+            cancel_all_stranded: self.halt.cancel_all_stranded,
+            halt_file_adopted: u8::try_from(self.halt_file_adopted).unwrap_or(u8::MAX),
+            halt_file_present: u8::from(self.halt_file_present),
+            seeded: u8::from(self.ledger.is_seeded()),
+            halted,
             live_submits_by_slot: c.live_submits_by_slot,
             refused_by_slot: c.refused_by_slot,
         }
@@ -2207,14 +2501,261 @@ mod tests {
         assert!(d.halt().is_halted(slot), "and nothing clears it");
     }
 
+    /// A directory of this test's own. Counted, not clocked — see
+    /// `cli::exec_boot::tmp` for the flaky gate that taught this.
+    fn halt_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "e6-halt-{}-{}",
+            std::process::id(),
+            core_types::fnv1a_64(tag.as_bytes())
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("tmp dir");
+        d
+    }
+
+    /// **The restart hole, closed.** A halt the last run wrote is a
+    /// halt this run starts with — otherwise the 00:10Z restart
+    /// resumes trading into whatever tripped it, unattended.
+    #[test]
+    fn a_halt_file_left_by_the_last_run_halts_the_slot_at_boot() {
+        let dir = halt_dir("adopt_at_boot");
+        let path = dir.join("exec.HALT");
+        std::fs::write(&path, "slot=3 reason=recon-drift\n").unwrap();
+
+        let mut d = haltable();
+        d.set_halt_path(path.clone());
+        assert_eq!(d.adopt_halt_file(), 1, "one slot adopted");
+        assert_eq!(d.halt_file_adopted(), 1);
+
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        assert!(d.halt().is_halted(slot));
+        assert_eq!(
+            d.halt().reason(slot),
+            crate::halt::HaltReason::ReconDrift,
+            "and with the reason the LAST run recorded"
+        );
+        assert_eq!(
+            d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused),
+            "exactly as refusing as a triggered halt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_halt_file_adopts_nothing_and_is_the_normal_boot() {
+        let dir = halt_dir("no_file");
+        let mut d = haltable();
+        d.set_halt_path(dir.join("exec.HALT"));
+        assert_eq!(d.adopt_halt_file(), 0);
+        assert!(!d.halt().any_halted());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt file must not be a denial of service on an engine
+    /// that might be needed to flatten a position.
+    #[test]
+    fn a_corrupt_halt_file_is_not_a_boot_refusal() {
+        let dir = halt_dir("corrupt");
+        let path = dir.join("exec.HALT");
+        // Not UTF-8: `read_to_string` itself fails.
+        std::fs::write(&path, [0xffu8, 0xfe, 0xfd, 0x00]).unwrap();
+        let mut d = haltable();
+        d.set_halt_path(path);
+        assert_eq!(d.adopt_halt_file(), 0, "nothing adopted, nothing thrown");
+        assert!(!d.halt().any_halted());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A FIFO must not hang the engine thread.**
+    ///
+    /// `read_to_string`, which this replaces, blocks in `open` on a
+    /// FIFO with no writer — for ever, with no timeout and no log, on
+    /// the thread that pumps the live arm. A halt file we will not
+    /// read halts nothing; a halt file we cannot stop reading stops
+    /// everything.
+    #[test]
+    fn a_fifo_in_place_of_the_halt_file_does_not_hang_the_boot() {
+        let dir = halt_dir("fifo");
+        let path = dir.join("exec.HALT");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a path in this test's own fresh temp directory.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let mut d = haltable();
+        d.set_halt_path(path);
+        // If this ever blocks, the test hangs rather than fails —
+        // which is exactly what the production bug did.
+        assert_eq!(d.adopt_halt_file(), 0, "a FIFO is not a halt file");
+        assert!(!d.halt().any_halted());
+        assert!(!d.halt_file_present(), "and it was not counted as one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory, a device, and a file too large to be one we wrote
+    /// are all refused — and none of them halts anything.
+    #[test]
+    fn only_a_regular_file_of_a_sane_size_is_read() {
+        let dir = halt_dir("not_a_file");
+
+        // A directory where the file should be.
+        let as_dir = dir.join("exec.HALT");
+        std::fs::create_dir(&as_dir).unwrap();
+        let mut d = haltable();
+        d.set_halt_path(as_dir);
+        assert_eq!(d.adopt_halt_file(), 0, "a directory is not a halt file");
+
+        // A file larger than anything we would have written.
+        let dir2 = halt_dir("too_big");
+        let big = dir2.join("exec.HALT");
+        let mut body = String::from("slot=3 reason=ws-gap\n");
+        while body.len() <= crate::halt::HALT_FILE_MAX {
+            body.push_str("# padding to push this past the cap\n");
+        }
+        std::fs::write(&big, &body).unwrap();
+        let mut d2 = haltable();
+        d2.set_halt_path(big);
+        assert_eq!(
+            d2.adopt_halt_file(),
+            0,
+            "a halt file bigger than one we could have written is refused, \
+             not read into an unbounded String"
+        );
+        assert!(!d2.halt().any_halted());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// **A halt file that halts nothing must be visible.** A mistyped
+    /// slot number, or a slot that is not live, is an operator who
+    /// asked for a halt and did not get one.
+    #[test]
+    fn a_halt_file_that_halts_nothing_is_still_reported_as_present() {
+        let dir = halt_dir("inert");
+        let path = dir.join("exec.HALT");
+        // Slot 1 is PAPER in `haltable()` — it cannot reach a venue,
+        // so halting it would mean nothing except a venue-wide cancel.
+        std::fs::write(&path, "slot=1 reason=operator\n").unwrap();
+
+        let mut d = haltable();
+        d.set_halt_path(path);
+        assert_eq!(d.adopt_halt_file(), 0, "a paper slot is not halted");
+        assert!(
+            d.halt_file_present(),
+            "but the boot must be able to say a file was there"
+        );
+        assert!(!d.halt().any_halted());
+        assert_eq!(d.live().cancel_all_calls, 0, "and nothing was cancelled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same at runtime, counted rather than logged.
+    #[test]
+    fn an_inert_runtime_read_is_counted() {
+        let dir = halt_dir("inert_runtime");
+        let path = dir.join("exec.HALT");
+        let mut d = haltable();
+        d.set_halt_path(path.clone());
+        std::fs::write(&path, "slot=1 reason=operator\n").unwrap();
+        d.force_halt_poll();
+        d.on_idle();
+        assert_eq!(d.halt_file_reads(), 1);
+        assert_eq!(d.halt_file_inert(), 1, "read, and nothing came of it");
+        assert!(!d.halt().any_halted());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The operator's runtime kill switch.** `echo 3 > exec.HALT`
+    /// and the slot stops, with no restart and no control socket.
+    #[test]
+    fn an_operator_writing_the_file_halts_the_slot_from_the_idle_path() {
+        let dir = halt_dir("runtime_poll");
+        let path = dir.join("exec.HALT");
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+
+        let mut d = haltable();
+        d.set_halt_path(path.clone());
+        d.on_idle();
+        assert!(!d.halt().is_halted(slot), "healthy to start");
+
+        // The shortest thing an operator would type.
+        std::fs::write(&path, "3\n").unwrap();
+        d.force_halt_poll();
+        d.on_idle();
+
+        assert!(d.halt().is_halted(slot), "halted from the file alone");
+        assert_eq!(d.halt().reason(slot), crate::halt::HaltReason::Operator);
+        assert!(d.live().cancel_all_calls > 0, "and it cancelled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The cadence is what keeps this off the hot path.** Without
+    /// it the engine thread would `stat` and read a file five hundred
+    /// times a second to answer a question that changes when a human
+    /// types.
+    #[test]
+    fn the_halt_file_is_polled_once_a_second_not_once_a_tick() {
+        let dir = halt_dir("poll_cadence");
+        let path = dir.join("exec.HALT");
+        std::fs::write(&path, "# nothing halted\n").unwrap();
+
+        let mut d = haltable();
+        d.set_halt_path(path);
+        for _ in 0..500 {
+            d.on_idle();
+        }
+        assert_eq!(
+            d.halt_file_polls(),
+            1,
+            "500 idle moments inside one second is ONE syscall — \
+             without the cadence this is 500, and the READ count \
+             below would not notice"
+        );
+        assert_eq!(
+            d.halt_file_reads(),
+            1,
+            "and the one poll that ran did read, since nothing had \
+             seen this file before"
+        );
+
+        // And the next second reads again, so a change is not missed.
+        d.force_halt_poll();
+        d.on_idle();
+        assert_eq!(d.halt_file_polls(), 2, "the next second stats again");
+        assert_eq!(d.halt_file_reads(), 1, "unchanged: stat only, no read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting the file un-halts nothing in the running process. A
+    /// halt is sticky, and clearing one is a restart-level decision.
+    #[test]
+    fn deleting_the_halt_file_does_not_un_halt_a_running_engine() {
+        let dir = halt_dir("delete_does_not_clear");
+        let path = dir.join("exec.HALT");
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+
+        let mut d = haltable();
+        d.set_halt_path(path.clone());
+        std::fs::write(&path, "slot=3 reason=ws-gap\n").unwrap();
+        d.force_halt_poll();
+        d.on_idle();
+        assert!(d.halt().is_halted(slot));
+
+        std::fs::remove_file(&path).unwrap();
+        for _ in 0..50 {
+            d.force_halt_poll();
+            d.on_idle();
+        }
+        assert!(d.halt().is_halted(slot), "still halted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_halt_writes_the_file_that_survives_a_restart() {
-        let dir = std::env::temp_dir().join(format!(
-            "e6c3-halt-{}-{}",
-            std::process::id(),
-            core_types::fnv1a_64(b"a_halt_writes_the_file")
-        ));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let dir = halt_dir("a_halt_writes_the_file");
         let path = dir.join("exec.HALT");
 
         let mut d = haltable();

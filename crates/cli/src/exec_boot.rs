@@ -699,6 +699,40 @@ mod tests {
         }
     }
 
+    /// **E6 c4:** `/state` spells the halt reason from its own copy of
+    /// the word table, because the dependency runs the wrong way for
+    /// it to import `HaltReason`. A silent divergence would make
+    /// `/state` name the wrong reason for a halt — the one field an
+    /// operator reads it for. This module sees both, so it pins them.
+    #[test]
+    fn the_halt_reason_words_match_the_ones_state_publishes() {
+        use exec_router::HaltReason as R;
+        let all = [
+            R::None,
+            R::RejectStreak,
+            R::BudgetFloor,
+            R::ReconDrift,
+            R::WsGap,
+            R::AssetRefusals,
+            R::Operator,
+        ];
+        assert_eq!(
+            all.len(),
+            engine_snapshot::HALT_REASON_WORDS.len(),
+            "a reason was added without a word"
+        );
+        for why in all {
+            assert_eq!(
+                engine_snapshot::halt_reason_word(why as u8),
+                why.as_str(),
+                "`/state` and the router disagree about {why:?}"
+            );
+        }
+        // A byte from a newer binary is named, not panicked on and not
+        // silently rendered as `none`.
+        assert_eq!(engine_snapshot::halt_reason_word(200), "unknown");
+    }
+
     /// Slot numbers get reassigned; a stale artifact must not arm the
     /// member that inherited the number.
     #[test]

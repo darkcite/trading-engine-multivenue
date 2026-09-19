@@ -19,3 +19,9 @@ core-time       = { workspace = true }
 # `exec.HALT`. An auto-halt that did not survive the scheduled daily
 # restart would resume trading into whatever tripped it, unattended.
 core-io         = { workspace = true }
+# E6 commit 4: `O_NONBLOCK` for the halt-file read. `exec.HALT` is an
+# OPERATOR-WRITABLE input read from the engine thread, and opening a
+# FIFO without it blocks that thread for ever — a silent denial of
+# service on the one engine that might be needed to flatten a
+# position.
+libc            = "0.2"
