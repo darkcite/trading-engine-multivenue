@@ -753,13 +753,25 @@ def canonical_json(assessment: Assessment) -> str:
         for j in range(len(keys)):
             fields[keys[j]] = getattr(action, keys[j])
         actions.append(fields)
+    # The two `_nullable` fields go back out as JSON null, not as "".
+    # `_nullable` maps null -> "" on the way in, and "" is NOT a member of
+    # either closed list — so emitting "" would produce a body this module's
+    # own parser refuses, and the `actions` drain (which re-parses the
+    # stored body before acting on it) could never act on an assessment
+    # with no named market. Which is the COMMON case: the analyst is told
+    # to prefer no direction. Found 2026-09-20 by the drain's round-trip
+    # test; the contract in this docstring was the thing that was wrong.
+    direction = assessment.channels.direction._asdict()
+    direction["market"] = direction["market"] or None
+    venue_risk = assessment.channels.venue_risk._asdict()
+    venue_risk["venue"] = venue_risk["venue"] or None
     doc: dict[str, object] = {
         "thesis": assessment.thesis,
         "mechanism": assessment.mechanism,
         "channels": {
-            "direction": assessment.channels.direction._asdict(),
+            "direction": direction,
             "vol": assessment.channels.vol._asdict(),
-            "venue_risk": assessment.channels.venue_risk._asdict(),
+            "venue_risk": venue_risk,
         },
         "affected_descriptors": list(assessment.affected_descriptors),
         "actions": actions,

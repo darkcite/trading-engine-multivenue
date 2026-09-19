@@ -560,3 +560,34 @@ def test_spend_of_tolerates_a_double_without_usage() -> None:
         output_tokens = 22
 
     assert claude_worker.news.cascade.spend_of(_Usage()) == (11, 22)
+
+
+def test_canonical_json_round_trips_a_null_market_and_venue() -> None:
+    """`canonical_json` -> `parse_assessment` must be the identity.
+
+    `_nullable` maps JSON null to "" on the way in, and "" is not a member
+    of either closed list, so a body that emitted "" would be refused by
+    this module's own parser. The `actions` drain re-parses the stored body
+    before acting on it, and an assessment with NO named market is the
+    common case — the analyst is told to prefer no direction — so this was
+    the difference between a drain that works and one that silently reads
+    every analyst answer as unparseable.
+    """
+    raw = _assessment_json(
+        channels={
+            "direction": {"market": None, "dir": "none", "confidence": 0.2},
+            "vol": {"profile": "none", "level": "none", "confidence": 0.1, "ttl_s": 0},
+            "venue_risk": {"venue": None, "severity": "info"},
+        },
+        actions=[{"kind": "none"}],
+    )
+    first = _parse(raw)
+    assert first is not None
+    assert first.channels.direction.market == ""
+    assert first.channels.venue_risk.venue == ""
+    body = claude_worker.news.cascade.canonical_json(first)
+    assert '"market":null' in body and '"venue":null' in body
+    second = _parse(body)
+    assert second == first, "the stored body is not the parsed one"
+    # ...and it is a FIXED POINT, so a re-store cannot drift either.
+    assert claude_worker.news.cascade.canonical_json(second) == body
